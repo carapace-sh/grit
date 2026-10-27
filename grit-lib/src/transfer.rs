@@ -2268,6 +2268,11 @@ pub(crate) fn push_local_from(
             relay_hook_output(progress, &mut remote_messages, &update);
             if !update.is_ok() {
                 d.refuse(&crate::serve::RefUpdateRefusal::UpdateHookDeclined);
+                // receive-pack names the declined ref to the pusher.
+                // hygiene: Git wire-compatible remote message, relayed like receive-pack's
+                let line = format!("error: hook declined to update {}", d.result.remote_ref);
+                progress.message(format!("{line}\n").as_bytes());
+                remote_messages.push(line);
             }
         }
         if opts.atomic && decisions.iter().any(|d| d.result.status.is_error()) {
