@@ -63,6 +63,11 @@ pub struct StructuredJsonError {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(skip_serializing_if = "Option::is_none")]
     pub commit: Option<String>,
+    /// Other branches (full ref names) whose replay onto the rewritten history conflicted,
+    /// when `kind == "conflict"` comes from a history rewrite or rebase.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(skip_serializing_if = "Option::is_none")]
+    pub refs: Option<Vec<String>>,
     /// Overwrite details when `kind == "would_overwrite"`.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(skip_serializing_if = "Option::is_none")]
@@ -99,6 +104,7 @@ impl StructuredJsonError {
             kind,
             conflicts: None,
             commit: None,
+            refs: None,
             would_overwrite: None,
             oid: None,
             hook: None,
@@ -167,26 +173,46 @@ impl fmt::Display for StructuredCliError {
 
 impl StdError for StructuredCliError {}
 
-/// Build an error for a merge, pick, or rebase that would introduce conflicts.
-pub fn operation_conflict(
+/// Build an error for a history rewrite or rebase that stopped because replaying `commit`
+/// conflicts.
+///
+/// `refs` lists other branches whose replay failed; when non-empty the message names them and
+/// the hint points at `--update-refs head`, which rewrites only the current branch.
+pub fn replay_conflict(
     operation: &str,
+    commit: ObjectId,
+    subject: &str,
     mut paths: Vec<String>,
-    commit: Option<ObjectId>,
+    refs: Vec<String>,
 ) -> Error {
     paths.sort();
     paths.dedup();
-    let list = paths.join("\n  ");
-    let commit_line = commit
-        .as_ref()
-        .map(|oid| format!("\n  commit {}", &oid.to_hex()[..7.min(oid.to_hex().len())]))
-        .unwrap_or_default();
+    let hex = commit.to_hex();
+    let short = &hex[..7.min(hex.len())];
+    let header = if refs.is_empty() {
+        format!("{operation} has conflicts in:")
+    } else {
+        format!(
+            "{operation} has conflicts moving {} onto the new history:",
+            refs.join(", ")
+        )
+    };
+    let commit_line = format!("commit {short} {subject}");
     let human = format!(
-        "{operation} has conflicts in:{commit_line}\n  {list}\n\nNothing was changed. grit can't resolve conflicts yet."
+        "{header}\n  {}\n  {}\n\nNothing was changed. grit can't resolve conflicts yet.",
+        commit_line.trim_end(),
+        paths.join("\n  ")
     );
+    let hint = (!refs.is_empty()).then(|| {
+        "pass --update-refs head to rewrite only the current branch and leave the others as they are"
+            .to_owned()
+    });
     Error::new(StructuredCliError {
         payload: StructuredJsonError {
             conflicts: Some(paths),
-            commit: commit.map(|oid| oid.to_hex()),
+            commit: Some(hex),
+            refs: (!refs.is_empty()).then_some(refs),
+            hint,
             ..StructuredJsonError::new(format!("{operation} has conflicts"), ErrorKind::Conflict)
         },
         human,

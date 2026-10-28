@@ -27,7 +27,7 @@ grit history undo [--dry-run]
 
 Shared behavior for every subcommand:
 
-- **Conflicts abort** — if replaying a descendant would conflict, nothing is applied (planned objects may already exist in the ODB from planning).
+- **Conflicts abort** — if replaying a descendant would conflict, nothing is applied (planned objects may already exist in the ODB from planning). The error names the commit that could not be replayed. When that commit is only on another branch that `--update-refs branches` would move (a branch built on top of the edited commit), the error also names that branch and hints at `--update-refs head`, which rewrites only the current branch and leaves the others where they are.
 - **`--dry-run`** — print which refs would move; refs, the index, and the worktree stay unchanged. New commit objects are still written during planning, matching Git’s `git history --dry-run` model. Commit signing is skipped during dry-run planning (no `gpg` / `ssh-keygen` invocation); a full run signs replacement commits when [`commit.gpgsign`](../commit/) is enabled, like [`grit commit`](../commit/).
 - **`--update-refs`** — `branches` (default) updates every local branch whose tip descends from the edited commit, except other branches at the same commit as `HEAD` (a `backup` branch made before the edit keeps the old history); `head` updates only the commit `HEAD` points at.
 
@@ -315,7 +315,26 @@ Example:
 }
 ```
 
-History rewrite commands other than `rebase` report planning conflicts as structured errors (`kind: "conflict"`). `grit history rebase` uses the same stop/resume JSON as [`grit rebase`](rebase.md) (`result: "conflicts"`, exit **1**).
+History rewrite commands other than `rebase` report planning conflicts as structured errors (`kind: "conflict"`) with `conflicts` (paths) and `commit` (the commit that could not be replayed). When that commit is only on other branches the rewrite would move, `refs` lists them and `hint` suggests `--update-refs head`. `grit history rebase` uses the same stop/resume JSON as [`grit rebase`](rebase.md) (`result: "conflicts"`, exit **1**).
+
+Here `other` was built on `topic` and edits the line that `c2` added, so dropping `c2` from `topic` cannot move `other`:
+
+```console
+$ grit history drop topic~1
+error: history drop has conflicts moving refs/heads/other onto the new history:
+  commit 78d765c o1
+  a.txt
+
+Nothing was changed. grit can't resolve conflicts yet.
+hint: pass --update-refs head to rewrite only the current branch and leave the others as they are
+$ grit history drop topic~1 --json
+{"commit":"78d765caa49114094c4779be2dc3e505979ba6c4","conflicts":["a.txt"],"error":"history drop has conflicts","hint":"pass --update-refs head to rewrite only the current branch and leave the others as they are","kind":"conflict","refs":["refs/heads/other"]}
+$ grit history drop topic~1 --update-refs head
+Dropped 1 commit, replayed 2 descendant commit(s)
+  commit e8de07f → (dropped) (c2)
+  commit a8a77a4 → 844233b (c3)
+  refs/heads/topic a8a77a4 → 844233b
+```
 
 ## Markdown output
 

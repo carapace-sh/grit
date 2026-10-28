@@ -24,7 +24,7 @@ use crate::state::resolve_head_for_repository;
 use crate::worktree::{find_worktree_with_branch_checked_out, worktree_admin_dir};
 
 use super::error::HistoryError;
-use super::subject::subject_for_rewrite_row;
+use super::subject::{commit_message_subject_line, subject_for_rewrite_row};
 use super::types::{
     CommitEdit, EmptyPolicy, HeadEffect, HistoryEdits, PlannedRefUpdate, RefScope, RewriteOptions,
     RewritePlan, RewrittenCommit,
@@ -190,6 +190,7 @@ pub fn plan_rewrite(
 /// Turn a replay conflict during resumable planning into partial progress; other errors pass through.
 #[allow(clippy::too_many_arguments)]
 fn finish_plan_rewrite_on_replay_error(
+    repo: &Repository,
     err: HistoryError,
     mapping: HashMap<ObjectId, ObjectId>,
     rewritten: Vec<RewrittenCommit>,
@@ -215,7 +216,7 @@ fn finish_plan_rewrite_on_replay_error(
             )));
         }
     }
-    Err(err)
+    Err(attribute_conflict_to_refs(repo, err, &scoped_refs))
 }
 
 /// Like [`plan_rewrite_with_order`], but may stop on the first replay conflict and return partial progress.
@@ -633,6 +634,7 @@ fn plan_rewrite_with_order_impl(
             Ok(v) => v,
             Err(err) => {
                 return finish_plan_rewrite_on_replay_error(
+                    repo,
                     err,
                     mapping,
                     rewritten,
@@ -1560,15 +1562,72 @@ fn transplant_tree_across_parent_move(
     .map_err(library_err)?;
 
     if crate::operation::tree_merge_has_conflicts(&merge) {
-        let conflicts = crate::operation::conflicts_from_tree_merge(&merge);
+        let err = conflict_error(repo, commit, &merge);
         if REPLAY_STOP_COMMIT.with(|c| c.get()) == Some(commit) {
             if let Some(replayed_parent) = REPLAY_STOP_PARENT.with(|p| p.get()) {
                 note_resumable_conflict(commit, replayed_parent, merge);
             }
         }
-        return Err(HistoryError::Conflict { commit, conflicts });
+        return Err(err);
     }
     Ok(merge.result_tree)
+}
+
+/// [`HistoryError::Conflict`] for `commit` from a conflicted tree merge, with no refs attributed.
+pub(crate) fn conflict_error(
+    repo: &Repository,
+    commit: ObjectId,
+    merge: &TreeMergeOutput,
+) -> HistoryError {
+    // The conflict is the error worth reporting; an unreadable subject only leaves it blank.
+    let subject = load_commit(repo, commit)
+        .map(|c| commit_message_subject_line(&c.message))
+        .unwrap_or_default();
+    HistoryError::Conflict {
+        commit,
+        subject,
+        conflicts: crate::operation::conflicts_from_tree_merge(merge),
+        refs: Vec::new(),
+    }
+}
+
+/// Names the scoped branches containing a conflicting commit that is not on `HEAD`'s history,
+/// so the failure points at the branch that could not be moved. Other errors pass through.
+fn attribute_conflict_to_refs(
+    repo: &Repository,
+    err: HistoryError,
+    scoped_refs: &[(String, ObjectId)],
+) -> HistoryError {
+    let HistoryError::Conflict {
+        commit,
+        subject,
+        conflicts,
+        refs: _,
+    } = err
+    else {
+        return err;
+    };
+    let on_head = repo
+        .head_commit()
+        .ok()
+        .is_none_or(|head| is_ancestor(repo, commit, head).unwrap_or(true));
+    let mut refs: Vec<String> = if on_head {
+        Vec::new()
+    } else {
+        scoped_refs
+            .iter()
+            .filter(|(_, tip)| is_ancestor(repo, commit, *tip).unwrap_or(false))
+            .map(|(name, _)| name.clone())
+            .collect()
+    };
+    refs.sort();
+    refs.dedup();
+    HistoryError::Conflict {
+        commit,
+        subject,
+        conflicts,
+        refs,
+    }
 }
 
 fn commit_tree(repo: &Repository, commit: ObjectId) -> Result<ObjectId, HistoryError> {

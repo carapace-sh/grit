@@ -252,6 +252,7 @@ Schema: [rebase.check v1](/schemas/rebase.check/v1.json)
 | `commits` | array of strings | Replacement commit OIDs when `result` is `clean`. |
 | `conflicts` | array | `{path, kind}` entries when `result` is `conflicts`, with the [conflict kind](../status/#conflict-kinds) the replay would leave. |
 | `commit` | string | Original commit OID when `result` is `conflicts`. |
+| `refs` | array of strings | Present when the conflicting commit is only on other branches that `--update-refs branches` would move: their full names. Rebasing with `--update-refs head` leaves them alone. |
 
 Exit code is **0** for `up_to_date` and `clean`, **1** for `conflicts`.
 

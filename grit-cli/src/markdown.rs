@@ -1353,7 +1353,17 @@ pub fn print_rebase_check_outcome(
             outln!(w, "- Would rebase {n} commit(s) cleanly");
         }
         RebaseCheckResult::Conflicts => {
-            outln!(w, "- Would conflict during rebase");
+            match &outcome.refs {
+                Some(refs) => {
+                    let refs: Vec<String> = refs.iter().map(|r| format!("`{r}`")).collect();
+                    outln!(
+                        w,
+                        "- Would conflict moving {} onto the rebased history",
+                        refs.join(", ")
+                    );
+                }
+                None => outln!(w, "- Would conflict during rebase"),
+            }
             if let Some(conflicts) = &outcome.conflicts {
                 for c in conflicts {
                     outln!(w, "- `{}` ({})", c.path, c.kind);

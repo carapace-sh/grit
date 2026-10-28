@@ -35,7 +35,7 @@ $ grit push --json
 
 | Slug | When |
 | --- | --- |
-| `conflict` | Merge, pick, rebase, or similar would introduce conflicts (`conflicts`, optional `commit`). |
+| `conflict` | Merge, pick, rebase, or similar would introduce conflicts (`conflicts`, optional `commit`). A `grit history` rewrite or `grit rebase` that fails replaying another branch it would move also sets `refs` (full branch names) and a `hint` to pass `--update-refs head`. |
 | `hash_collision` | Refusing to store content that triggers SHA-1 collision detection (`oid`). |
 | `would_overwrite` | Checkout / switch would overwrite local or untracked files (`would_overwrite.reason`, `would_overwrite.paths`). The hint suggests `grit commit` or `grit stash` for local changes. |
 | `operation_in_progress` | `grit switch` refused while a merge, rebase, pick or revert is paused (grit's or one `git` started); finish or abort it first. |

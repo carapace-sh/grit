@@ -5,7 +5,7 @@ use std::fs;
 use super::absorb::remaining_index_blob_for_path;
 use super::apply::{apply_fixup_rewrite_then, apply_index_to_worktree_delta};
 use super::error::HistoryError;
-use super::plan::plan_rewrite;
+use super::plan::{conflict_error, plan_rewrite};
 use super::reword::normalize_rewrite_message;
 use super::types::{AppliedRewrite, ApplyOptions};
 use super::types::{CommitEdit, EmptyPolicy, HistoryEdits, RewriteOptions, RewritePlan};
@@ -93,10 +93,7 @@ pub fn fixup(
     .map_err(library_err)?;
 
     if crate::operation::tree_merge_has_conflicts(&merge) {
-        return Err(HistoryError::Conflict {
-            commit: target,
-            conflicts: crate::operation::conflicts_from_tree_merge(&merge),
-        });
+        return Err(conflict_error(repo, target, &merge));
     }
 
     let merged_tree = merge.result_tree;

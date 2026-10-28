@@ -23,7 +23,7 @@ use crate::state::{resolve_head_for_repository, HeadState};
 use super::error::HistoryError;
 use super::fixup::staged_fixup_paths;
 use super::message::commit_subject_single_line;
-use super::plan::plan_rewrite;
+use super::plan::{conflict_error, plan_rewrite};
 use super::types::{CommitEdit, HistoryEdits, RewriteOptions, RewritePlan};
 
 /// Default maximum number of commits considered when `--base` is omitted.
@@ -896,10 +896,7 @@ fn merged_tree_for_target_with_trees(
     .map_err(library_err)?;
 
     if crate::operation::tree_merge_has_conflicts(&merge) {
-        return Err(HistoryError::Conflict {
-            commit: target,
-            conflicts: crate::operation::conflicts_from_tree_merge(&merge),
-        });
+        return Err(conflict_error(repo, target, &merge));
     }
     Ok(merge.result_tree)
 }

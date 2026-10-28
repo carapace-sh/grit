@@ -426,6 +426,16 @@
             "null"
           ]
         },
+        "refs": {
+          "description": "Other branches (full ref names) whose replay onto the rewritten history conflicted, when `kind == \"conflict\"` comes from a history rewrite or rebase.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
         "would_overwrite": {
           "anyOf": [
             {

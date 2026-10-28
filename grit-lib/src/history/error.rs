@@ -66,13 +66,21 @@ pub enum HistoryError {
         commit: ObjectId,
     },
 
-    /// A three-way replay produced unmerged paths.
+    /// A three-way replay produced unmerged paths. Nothing was written to refs.
     #[error("replay of commit {commit} produced conflicts")]
     Conflict {
         /// Original commit that could not be replayed cleanly.
         commit: ObjectId,
+        /// First line of that commit's message.
+        subject: String,
         /// Conflicted paths and how they conflicted, sorted by path.
         conflicts: Vec<Conflict>,
+        /// Full names of the scoped branches whose replay failed, sorted, when `commit` is not
+        /// on `HEAD`'s history: under [`RefScope::Branches`](super::RefScope::Branches) another
+        /// branch built on the edited commits could not be moved onto the new history, and
+        /// [`RefScope::Head`](super::RefScope::Head) would rewrite only the current branch.
+        /// Empty when the conflict is on the checked-out history itself.
+        refs: Vec<String>,
     },
 
     /// A merge commit cannot be dropped, reordered, or otherwise edited in an unsupported way.

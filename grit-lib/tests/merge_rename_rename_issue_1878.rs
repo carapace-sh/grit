@@ -303,10 +303,17 @@ fn rebase_onto_the_other_rename_conflicts() {
     });
     let err = rebase_onto(&fx.repo, fx.base, fx.topic, &[fx.main], &opts)
         .expect_err("rebase must stop on the rename/rename conflict");
-    let HistoryError::Conflict { commit, conflicts } = err else {
+    let HistoryError::Conflict {
+        commit,
+        conflicts,
+        refs,
+        ..
+    } = err
+    else {
         panic!("expected a conflict, got {err:?}");
     };
     assert_eq!(commit, fx.main);
+    assert!(refs.is_empty(), "the conflict is on the rebased branch");
     let paths: Vec<&str> = conflicts.iter().map(|c| c.path.as_str()).collect();
     assert_eq!(paths, vec!["a", "b", "c"]);
     // Replaying main onto topic: "ours" is topic's name for the file, "theirs" is main's.

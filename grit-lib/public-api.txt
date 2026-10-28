@@ -26077,6 +26077,8 @@ pub grit_lib::revwalk::history::HistoryError::BranchCheckedOutElsewhere::worktre
 pub grit_lib::revwalk::history::HistoryError::Conflict
 pub grit_lib::revwalk::history::HistoryError::Conflict::commit: grit_lib::objects::ObjectId
 pub grit_lib::revwalk::history::HistoryError::Conflict::conflicts: alloc::vec::Vec<grit_lib::operation::Conflict>
+pub grit_lib::revwalk::history::HistoryError::Conflict::refs: alloc::vec::Vec<alloc::string::String>
+pub grit_lib::revwalk::history::HistoryError::Conflict::subject: alloc::string::String
 pub grit_lib::revwalk::history::HistoryError::DivergentBranch
 pub grit_lib::revwalk::history::HistoryError::DivergentBranch::name: alloc::string::String
 pub grit_lib::revwalk::history::HistoryError::EmptyMessage
@@ -26200,6 +26202,8 @@ pub grit_lib::revwalk::history::RebaseCheckPlan::Clean::commits: alloc::vec::Vec
 pub grit_lib::revwalk::history::RebaseCheckPlan::Conflict
 pub grit_lib::revwalk::history::RebaseCheckPlan::Conflict::commit: grit_lib::objects::ObjectId
 pub grit_lib::revwalk::history::RebaseCheckPlan::Conflict::conflicts: alloc::vec::Vec<grit_lib::operation::Conflict>
+pub grit_lib::revwalk::history::RebaseCheckPlan::Conflict::refs: alloc::vec::Vec<alloc::string::String>
+pub grit_lib::revwalk::history::RebaseCheckPlan::Conflict::subject: alloc::string::String
 pub grit_lib::revwalk::history::RebaseCheckPlan::UpToDate
 impl core::clone::Clone for grit_lib::revwalk::history::RebaseCheckPlan
 pub fn grit_lib::revwalk::history::RebaseCheckPlan::clone(&self) -> Self
@@ -26245,6 +26249,8 @@ pub enum grit_lib::revwalk::history::RebasePlan
 pub grit_lib::revwalk::history::RebasePlan::Conflict
 pub grit_lib::revwalk::history::RebasePlan::Conflict::commit: grit_lib::objects::ObjectId
 pub grit_lib::revwalk::history::RebasePlan::Conflict::conflicts: alloc::vec::Vec<grit_lib::operation::Conflict>
+pub grit_lib::revwalk::history::RebasePlan::Conflict::refs: alloc::vec::Vec<alloc::string::String>
+pub grit_lib::revwalk::history::RebasePlan::Conflict::subject: alloc::string::String
 pub grit_lib::revwalk::history::RebasePlan::Plan(grit_lib::revwalk::history::RewritePlan)
 pub grit_lib::revwalk::history::RebasePlan::UpToDate
 impl core::clone::Clone for grit_lib::revwalk::history::RebasePlan

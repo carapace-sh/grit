@@ -265,9 +265,102 @@ fn drop_conflict_changes_nothing() {
     write_ref(grit.git_dir(), "refs/heads/main", &c).expect("ref");
     let before = resolve_ref(grit.git_dir(), "refs/heads/main").expect("resolve");
     let err = history_drop(&grit, b, &opts(5)).expect_err("conflict");
-    assert!(matches!(err, HistoryError::Conflict { .. }));
+    let HistoryError::Conflict {
+        commit,
+        subject,
+        refs,
+        ..
+    } = err
+    else {
+        panic!("expected a conflict, got {err:?}");
+    };
+    assert_eq!(commit, c);
+    assert_eq!(subject, "c");
+    assert!(refs.is_empty(), "a conflict on HEAD's history names no ref");
     let after = resolve_ref(grit.git_dir(), "refs/heads/main").expect("resolve");
     assert_eq!(before, after);
+}
+
+/// `topic` is base, c1 (b.txt), c2 (appends to a.txt), c3 (b.txt) and is checked out; `other`
+/// is built on `topic` with o1 editing the line c2 added (issue #2204).
+struct SiblingConflict {
+    repo: HistoryRepo,
+    c2: ObjectId,
+    topic: ObjectId,
+    o1: ObjectId,
+}
+
+fn sibling_conflict_repo() -> SiblingConflict {
+    let repo = HistoryRepo::init();
+    let wt = repo.worktree();
+    commit_file(wt, "a.txt", "1\n", "base");
+    git(wt, &["switch", "-q", "-c", "topic"]);
+    commit_file(wt, "b.txt", "b1\n", "c1");
+    let c2 = commit_file(wt, "a.txt", "1\nx\n", "c2");
+    let topic = commit_file(wt, "b.txt", "b3\n", "c3");
+    git(wt, &["switch", "-q", "-c", "other"]);
+    let o1 = commit_file(wt, "a.txt", "1\nxy\n", "o1");
+    git(wt, &["switch", "-q", "topic"]);
+    SiblingConflict {
+        repo,
+        c2,
+        topic,
+        o1,
+    }
+}
+
+#[test]
+fn drop_conflict_in_sibling_branch_names_that_branch() {
+    let fx = sibling_conflict_repo();
+    let wt = fx.repo.worktree();
+    let grit = open_grit(wt);
+    let err = history_drop(&grit, fx.c2, &opts(10)).expect_err("other cannot be replayed");
+    let HistoryError::Conflict {
+        commit,
+        subject,
+        conflicts,
+        refs,
+    } = err
+    else {
+        panic!("expected a conflict, got {err:?}");
+    };
+    assert_eq!(commit, fx.o1);
+    assert_eq!(subject, "o1");
+    let paths: Vec<&str> = conflicts.iter().map(|c| c.path.as_str()).collect();
+    assert_eq!(paths, vec!["a.txt"]);
+    assert_eq!(refs, vec!["refs/heads/other".to_owned()]);
+    assert_eq!(git_rev_parse(wt, "refs/heads/topic"), Some(fx.topic));
+    assert_eq!(git_rev_parse(wt, "refs/heads/other"), Some(fx.o1));
+}
+
+#[test]
+fn drop_with_head_scope_leaves_conflicting_sibling_alone() {
+    let fx = sibling_conflict_repo();
+    let wt = fx.repo.worktree();
+    let grit = open_grit(wt);
+    let plan = history_drop(
+        &grit,
+        fx.c2,
+        &RewriteOptions {
+            scope: RefScope::Head,
+            ..opts(11)
+        },
+    )
+    .expect("HEAD's branch replays cleanly");
+    apply_rewrite(
+        &grit,
+        &plan,
+        &apply_opts(),
+        &mut grit_lib::progress::NullProgress,
+        &grit_lib::progress::NeverCancel,
+    )
+    .expect("apply");
+    assert_eq!(git_rev_parse(wt, "refs/heads/other"), Some(fx.o1));
+    assert_ne!(git_rev_parse(wt, "refs/heads/topic"), Some(fx.topic));
+    assert_eq!(git(wt, &["show", "topic:a.txt"]), "1\n");
+    assert_eq!(git(wt, &["show", "topic:b.txt"]), "b3\n");
+    assert_eq!(fs::read_to_string(wt.join("a.txt")).expect("a.txt"), "1\n");
+    git_fsck_strict(wt);
 }
 
 #[test]

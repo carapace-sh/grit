@@ -321,7 +321,7 @@ mod tests {
     use crate::error_kind::ErrorKind;
     use crate::json_error::{
         hash_collision, incompatible_output_flags, invalid_commit_filter, invalid_pickaxe,
-        operation_conflict, would_overwrite_error,
+        replay_conflict, would_overwrite_error,
     };
     use grit_lib::command_runner::hooks::{HookError, HookOutput};
     use grit_lib::error::OverwriteReason;
@@ -335,7 +335,7 @@ mod tests {
         let structured: &[(ErrorKind, anyhow::Error, ExitStatus)] = &[
             (
                 ErrorKind::Conflict,
-                operation_conflict("merge", vec!["f.txt".into()], None),
+                replay_conflict("rebase", oid, "subject", vec!["f.txt".into()], Vec::new()),
                 ExitStatus::Failure,
             ),
             (

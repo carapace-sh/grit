@@ -1023,6 +1023,50 @@ fn rebase_check_reports_conflict_without_side_effects() {
     }
 }
 
+#[test]
+fn rebase_check_names_sibling_branch_whose_replay_conflicts() {
+    let repo = HistoryRepo::init();
+    let wt = repo.worktree();
+    commit_file(wt, "a.txt", "1\n2\n3\n", "base");
+    git(wt, &["switch", "-q", "-c", "topic"]);
+    let t1 = commit_file(wt, "b.txt", "b\n", "t1");
+    git(wt, &["switch", "-q", "-c", "other"]);
+    let o1 = commit_file(wt, "a.txt", "1o\n2\n3\n", "o1");
+    git(wt, &["switch", "-q", "main"]);
+    let m1 = commit_file(wt, "a.txt", "1m\n2\n3\n", "m1");
+    git(wt, &["switch", "-q", "topic"]);
+    let grit = open_grit(wt);
+    let request = RebaseRequest {
+        upstream: m1,
+        onto: None,
+        branch_tip: t1,
+    };
+
+    let opts = rebase_opts(RefScope::Branches, EmptyPolicy::Drop, true);
+    match plan_rebase_check(&grit, &request, &opts).expect("check") {
+        RebaseCheckPlan::Conflict {
+            commit,
+            subject,
+            conflicts,
+            refs,
+        } => {
+            assert_eq!(commit, o1);
+            assert_eq!(subject, "o1");
+            assert!(conflicts.iter().any(|c| c.path == "a.txt"));
+            assert_eq!(refs, vec!["refs/heads/other".to_owned()]);
+        }
+        other => panic!("expected conflict prediction, got {other:?}"),
+    }
+
+    let head_only = rebase_opts(RefScope::Head, EmptyPolicy::Drop, true);
+    assert!(matches!(
+        plan_rebase_check(&grit, &request, &head_only).expect("check"),
+        RebaseCheckPlan::Clean { .. }
+    ));
+    assert_eq!(git_rev_parse(wt, "refs/heads/other"), o1);
+    assert_eq!(git_rev_parse(wt, "refs/heads/topic"), t1);
+}
+
 fn flatten_opts() -> RebaseOntoOptions {
     let mut opts = rebase_opts(RefScope::Head, EmptyPolicy::Drop, true);
     opts.flatten_leaf_merges = true;

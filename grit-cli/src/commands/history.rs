@@ -111,6 +111,11 @@ pub struct RebaseCheckOutcome {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(skip_serializing_if = "Option::is_none")]
     pub commit: Option<String>,
+    /// Other branches whose replay would conflict; absent when the conflict is on the
+    /// rebased branch itself.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(skip_serializing_if = "Option::is_none")]
+    pub refs: Option<Vec<String>>,
 }
 
 /// Outcome category for [`RebaseCheckOutcome`].
@@ -131,6 +136,7 @@ impl RebaseCheckOutcome {
             commits: None,
             conflicts: None,
             commit: None,
+            refs: None,
         }
     }
 
@@ -142,10 +148,11 @@ impl RebaseCheckOutcome {
             commits: Some(commits.iter().map(ObjectId::to_hex).collect()),
             conflicts: None,
             commit: None,
+            refs: None,
         }
     }
 
-    fn conflicts(commit: ObjectId, conflicts: &[Conflict]) -> Self {
+    fn conflicts(commit: ObjectId, conflicts: &[Conflict], refs: Vec<String>) -> Self {
         let conflicts = Some(conflicts.iter().map(|c| conflict_json(c, None)).collect());
         Self {
             operation: "rebase".into(),
@@ -154,6 +161,7 @@ impl RebaseCheckOutcome {
             commits: None,
             conflicts,
             commit: Some(commit.to_hex()),
+            refs: (!refs.is_empty()).then_some(refs),
         }
     }
 }
@@ -167,7 +175,14 @@ impl HumanRender for RebaseCheckOutcome {
                 outln!(w, "Would rebase {n} commit(s) cleanly");
             }
             RebaseCheckResult::Conflicts => {
-                outln!(w, "Would conflict during rebase");
+                match &self.refs {
+                    Some(refs) => outln!(
+                        w,
+                        "Would conflict moving {} onto the rebased history",
+                        refs.join(", ")
+                    ),
+                    None => outln!(w, "Would conflict during rebase"),
+                }
                 if let Some(conflicts) = &self.conflicts {
                     render_conflicts_human(conflicts, w)?;
                 }
@@ -1212,10 +1227,17 @@ fn run_rebase_with_exec(
         RebasePlan::UpToDate => Ok(RebaseRunOutcome::Rebase(RebaseCliOutcome::from_rewrite(
             HistoryRewriteOutcome::up_to_date("rebase", false),
         ))),
-        RebasePlan::Conflict { commit, conflicts } => Err(json_error::operation_conflict(
+        RebasePlan::Conflict {
+            commit,
+            subject,
+            conflicts,
+            refs,
+        } => Err(json_error::replay_conflict(
             "rebase",
+            commit,
+            &subject,
             conflict_paths(conflicts),
-            Some(commit),
+            refs,
         )),
         RebasePlan::Plan(mut plan) => {
             verify_rewrite_plan(&rewrite.repo, &plan).map_err(on_err)?;
@@ -1426,10 +1448,17 @@ pub fn run_rebase(opts: &RebaseRunOptions<'_>) -> Result<RebaseRunOutcome> {
             RebasePlan::UpToDate => Ok(RebaseRunOutcome::Rebase(RebaseCliOutcome::from_rewrite(
                 HistoryRewriteOutcome::up_to_date("rebase", shared.dry_run),
             ))),
-            RebasePlan::Conflict { commit, conflicts } => Err(json_error::operation_conflict(
+            RebasePlan::Conflict {
+                commit,
+                subject,
+                conflicts,
+                refs,
+            } => Err(json_error::replay_conflict(
                 "rebase",
+                commit,
+                &subject,
                 conflict_paths(conflicts),
-                Some(commit),
+                refs,
             )),
             RebasePlan::Plan(plan) => {
                 verify_rewrite_plan(&rewrite.repo, &plan).map_err(on_err)?;
@@ -1567,9 +1596,14 @@ fn run_rebase_check(
         RebaseCheckPlan::Clean { commits } => {
             Ok(RebaseRunOutcome::Check(RebaseCheckOutcome::clean(commits)))
         }
-        RebaseCheckPlan::Conflict { commit, conflicts } => Ok(RebaseRunOutcome::Check(
-            RebaseCheckOutcome::conflicts(commit, &conflicts),
-        )),
+        RebaseCheckPlan::Conflict {
+            commit,
+            conflicts,
+            refs,
+            ..
+        } => Ok(RebaseRunOutcome::Check(RebaseCheckOutcome::conflicts(
+            commit, &conflicts, refs,
+        ))),
     }
 }
 
@@ -1700,9 +1734,18 @@ fn map_history_error(err: HistoryError, operation: &str) -> anyhow::Error {
             let short = &commit.to_hex()[..7];
             anyhow::anyhow!("{operation} makes commit {short} empty")
         }
-        HistoryError::Conflict { conflicts, .. } => {
-            json_error::operation_conflict(operation, conflict_paths(conflicts), None)
-        }
+        HistoryError::Conflict {
+            commit,
+            subject,
+            conflicts,
+            refs,
+        } => json_error::replay_conflict(
+            operation,
+            commit,
+            &subject,
+            conflict_paths(conflicts),
+            refs,
+        ),
         HistoryError::Planning { message } => {
             anyhow::anyhow!("history rewrite planning failed: {message}")
         }

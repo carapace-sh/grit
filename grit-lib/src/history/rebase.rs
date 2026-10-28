@@ -65,8 +65,13 @@ pub enum RebasePlan {
     Conflict {
         /// Original commit that could not be replayed cleanly.
         commit: ObjectId,
+        /// First line of that commit's message.
+        subject: String,
         /// Conflicted paths and how they conflicted, sorted by path.
         conflicts: Vec<Conflict>,
+        /// Full names of the other branches whose replay failed, sorted; empty when the
+        /// commit is on the branch being rebased. See [`HistoryError::Conflict`].
+        refs: Vec<String>,
     },
 }
 
@@ -130,8 +135,13 @@ pub enum RebaseCheckPlan {
     Conflict {
         /// Original commit that could not be replayed cleanly.
         commit: ObjectId,
+        /// First line of that commit's message.
+        subject: String,
         /// Conflicted paths and how they conflicted, sorted by path.
         conflicts: Vec<Conflict>,
+        /// Full names of the other branches whose replay failed, sorted; empty when the
+        /// commit is on the branch being rebased. See [`HistoryError::Conflict`].
+        refs: Vec<String>,
     },
 }
 
@@ -150,9 +160,17 @@ pub fn plan_rebase_check(
 ) -> Result<RebaseCheckPlan, HistoryError> {
     match plan_rebase(repo, request, opts)? {
         RebasePlan::UpToDate => Ok(RebaseCheckPlan::UpToDate),
-        RebasePlan::Conflict { commit, conflicts } => {
-            Ok(RebaseCheckPlan::Conflict { commit, conflicts })
-        }
+        RebasePlan::Conflict {
+            commit,
+            subject,
+            conflicts,
+            refs,
+        } => Ok(RebaseCheckPlan::Conflict {
+            commit,
+            subject,
+            conflicts,
+            refs,
+        }),
         RebasePlan::Plan(plan) => {
             let commits = plan.commits.iter().filter_map(|row| row.new).collect();
             Ok(RebaseCheckPlan::Clean { commits })
@@ -208,9 +226,17 @@ pub fn plan_rebase(
         Some(&range),
     ) {
         Ok(plan) => Ok(RebasePlan::Plan(plan)),
-        Err(HistoryError::Conflict { commit, conflicts }) => {
-            Ok(RebasePlan::Conflict { commit, conflicts })
-        }
+        Err(HistoryError::Conflict {
+            commit,
+            subject,
+            conflicts,
+            refs,
+        }) => Ok(RebasePlan::Conflict {
+            commit,
+            subject,
+            conflicts,
+            refs,
+        }),
         Err(other) => Err(other),
     }
 }
