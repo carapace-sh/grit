@@ -26,7 +26,8 @@ use crate::porcelain::merge::{
     IntegrateBranchOptions, IntegrateBranchOutcome, MergePrediction, MergePredictionOptions,
 };
 use crate::porcelain::stash::{
-    apply_operation_autostash, push_operation_autostash, restore_operation_autostash,
+    apply_operation_autostash, push_operation_autostash, record_merge_autostash,
+    restore_operation_autostash,
 };
 use crate::porcelain::switch::checkout_tree_transition_allow_local_reset;
 use crate::porcelain::worktree_guard::prepare_tree_checkout;
@@ -36,9 +37,9 @@ use crate::remote::transfer::{resolve_fetch_prune, FetchOptions, TagMode, Transf
 use crate::remote::{HttpClientFactory, RemoteError};
 use crate::repo::Repository;
 use crate::revwalk::history::{
-    plan_rebase_check, start_rebase, ApplyOptions, EmptyPolicy, HistoryError, RebaseCheckPlan,
-    RebaseOntoOptions, RebaseOutcome, RebaseRequest, RebaseSessionError, RefScope, RewriteOptions,
-    StartRebaseOptions,
+    plan_rebase_check, start_rebase, ApplyOptions, EmptyPolicy, HistoryError, PreRebase,
+    RebaseCheckPlan, RebaseOntoOptions, RebaseOutcome, RebaseRequest, RebaseSessionError, RefScope,
+    RewriteOptions, StartRebaseOptions,
 };
 use crate::state::{resolve_head_for_repository, HeadState};
 use thiserror::Error;
@@ -498,6 +499,9 @@ where
         && !options.check
         && !fetch_dry_run;
 
+    let merge_in_progress =
+        || crate::state::read_merge_heads(repo.git_dir()).is_ok_and(|heads| !heads.is_empty());
+    let merge_was_in_progress = merge_in_progress();
     let stash_oid = if autostash {
         push_operation_autostash(repo, &checkout_reflog_identity(repo))
             .map_err(PullError::Repository)?
@@ -573,7 +577,14 @@ where
 
     match core {
         Err(err) => {
-            restore_autostash_after_abort(repo, stash_oid.as_ref());
+            // A hook that refused the merge commit leaves the merge in progress. The stash then
+            // waits in MERGE_AUTOSTASH, as with Git, so `merge --continue` does not auto-stage it.
+            match stash_oid.as_ref() {
+                Some(oid) if !merge_was_in_progress && merge_in_progress() => {
+                    record_merge_autostash(repo, oid).map_err(PullError::Repository)?;
+                }
+                _ => restore_autostash_after_abort(repo, stash_oid.as_ref()),
+            }
             Err(err)
         }
         Ok(outcome) => {
@@ -909,6 +920,10 @@ fn rebase_fetched_upstream(
     let mut rebase = pull_rebase_options(repo)?;
     // The upstream already has these commits: they are its copies of local ones.
     rebase.drop = copies.to_vec();
+    // Git's pull hands rebase the fork point (or the fetched tip) as a commit id.
+    let pre_rebase = PreRebase::Run {
+        upstream: Some(request.upstream.to_hex()),
+    };
     let start = StartRebaseOptions {
         request,
         rebase,
@@ -920,6 +935,7 @@ fn rebase_fetched_upstream(
             record_operation: Some("rebase".into()),
             hooks: crate::hooks::PostOperationHooks::Run,
         },
+        pre_rebase,
     };
     match start_rebase(repo, &start, progress, cancel).map_err(map_rebase_session_error)? {
         RebaseOutcome::Stopped(stop) if stop_on_conflict => Ok(PullOutcome {

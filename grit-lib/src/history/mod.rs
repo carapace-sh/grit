@@ -86,8 +86,8 @@ pub use plan::plan_rewrite;
 pub use plan::{test_merge_tree_call_count, test_reset_merge_tree_call_count};
 pub use r#move::{move_commit, Placement};
 pub use rebase::{
-    plan_rebase, plan_rebase_check, rebase_onto, RebaseCheckPlan, RebaseOntoOptions, RebasePlan,
-    RebaseRequest,
+    plan_rebase, plan_rebase_check, plan_rebase_with_hook, rebase_onto, PreRebase, RebaseCheckPlan,
+    RebaseOntoOptions, RebasePlan, RebaseRequest,
 };
 #[cfg(any(test, feature = "unstable-bench-helpers"))]
 pub use rebase::{test_patch_id_compute_call_count, test_reset_patch_id_compute_call_count};

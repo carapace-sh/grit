@@ -18,6 +18,7 @@ use grit_lib::config::ident_resolve::IdentRole;
 use grit_lib::error::Error;
 use grit_lib::objects::ObjectId;
 use grit_lib::operation::Conflict;
+use grit_lib::porcelain::commit::HookPolicy;
 use grit_lib::porcelain::merge::{
     abort_branch_merge, continue_merge, integrate_branch_with, plan_branch_merge, predict_merge,
     resolve_merge_source, ContinueOptions, FastForwardPolicy, IntegrateBranchOutcome,
@@ -38,6 +39,7 @@ pub struct MergeRunOptions {
     pub no_commit: bool,
     pub squash: bool,
     pub allow_unrelated_histories: bool,
+    pub no_verify: bool,
     pub strategy: MergeStrategyArgs,
     pub message: MessageInputArgs,
 }
@@ -577,6 +579,11 @@ fn build_merge_options(run: &MergeRunOptions) -> Result<MergeOptions> {
         conflict_style,
         allow_unrelated: run.allow_unrelated_histories,
         hooks: grit_lib::PostOperationHooks::Run,
+        verify: if run.no_verify {
+            HookPolicy::SkipVerify
+        } else {
+            HookPolicy::Run
+        },
         directory_renames: None,
     })
 }

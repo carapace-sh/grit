@@ -384,14 +384,14 @@ fn build_commit_request(
         None
     };
 
-    let message = resolve_commit_message(
-        repo,
-        message,
-        message_file,
-        amend,
-        reuse_message_from.is_some(),
-    )?;
-    if message.is_none() && !amend && reuse_message_from.is_none() {
+    let message =
+        resolve_commit_message(message, message_file, amend, reuse_message_from.is_some())?;
+    let has_pending_message = || -> Result<bool> {
+        Ok(pending_commit_message(repo)
+            .context("could not read pending commit message")?
+            .is_some_and(|m| !m.trim().is_empty()))
+    };
+    if message.is_none() && !amend && reuse_message_from.is_none() && !has_pending_message()? {
         bail!("provide a commit message, e.g. grit commit \"what changed\"");
     }
     let message_text = message.as_deref().unwrap_or("");
@@ -523,9 +523,9 @@ fn finish_commit_outcome(
     })
 }
 
-/// Resolve the commit message from CLI input, pending merge/squash state, or amend reuse.
+/// Resolve the commit message from CLI input. `None` leaves the message to the library: the
+/// pending merge or squash message, or the amended or reused commit's.
 fn resolve_commit_message(
-    repo: &grit_lib::repo::Repository,
     message: Option<String>,
     message_file: Option<String>,
     amend: bool,
@@ -563,9 +563,7 @@ fn resolve_commit_message(
             }
             Ok(Some(contents))
         }
-        (None, None) => Ok(pending_commit_message(repo)
-            .context("could not read pending commit message")?
-            .filter(|m| !m.trim().is_empty())),
+        (None, None) => Ok(None),
         (Some(_), Some(_)) => unreachable!("clap rejects message and message-file together"),
     }
 }

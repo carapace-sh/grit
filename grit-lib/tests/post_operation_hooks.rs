@@ -488,6 +488,7 @@ fn rebase_onto(upstream: ObjectId, tip: ObjectId) -> StartRebaseOptions {
         },
         rebase: RebaseOntoOptions::new(rewrite_options()),
         apply: apply_options(None),
+        pre_rebase: grit_lib::revwalk::history::PreRebase::Skip,
     }
 }
 

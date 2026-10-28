@@ -484,6 +484,7 @@ fn pull_rebase_conflict_stops_like_git_and_continues() {
             record_operation: None,
             hooks: grit_lib::PostOperationHooks::Skip,
         },
+        pre_rebase: grit_lib::revwalk::history::PreRebase::Skip,
     };
     let done = continue_rebase(
         &open(&grit_dir),
