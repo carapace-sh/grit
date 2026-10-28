@@ -209,7 +209,7 @@
       "type": "integer"
     },
     "partial": {
-      "description": "True when `--blobs` configured a promisor partial clone.",
+      "description": "True when the server applied the `--blobs` filter on the initial fetch.",
       "type": "boolean"
     },
     "path": {

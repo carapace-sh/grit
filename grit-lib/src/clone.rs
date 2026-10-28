@@ -275,6 +275,8 @@ pub struct CloneOutcome {
     /// Whether a bundle from the server's `bundle-uri` seeded the clone.
     /// [`Self::transfer`] includes what the bundle brought.
     pub bundle: crate::bundle_uri::BundleSeed,
+    /// True when the initial fetch sent an object filter and the server applied it.
+    pub filter_sent: bool,
 }
 
 /// Derive a destination directory from a clone URL (Git [`git_url_basename`]).
@@ -662,6 +664,7 @@ fn clone_after_claim(
         submodule_paths,
         bare,
         bundle,
+        filter_sent: fetch_outcome.filter_sent,
     })
 }
 

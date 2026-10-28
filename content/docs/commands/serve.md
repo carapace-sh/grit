@@ -56,6 +56,16 @@ Fetches over protocol v2 see the `bundle-uri` command in the server's capabiliti
 
 `--no-bundles` turns this off: nothing is built and nothing is advertised.
 
+### Partial clone filters
+
+[`grit clone --blobs`](../clone/) and filtered fetches need the server to advertise Git's `filter` capability. On each served bare repository, enable it the same way as with `git upload-pack`:
+
+```console
+$ git -C /path/to/root/project.git config uploadpack.allowFilter true
+```
+
+Filter support is off by default (matching stock `git upload-pack`). Without it, clients that pass `--blobs` or `--filter` still connect, but the server sends a full pack; grit warns when that happens.
+
 ### Resumable pushes
 
 The push advertisement carries a `pushBundle=/push` capability: a [TUS](https://tus.io/protocols/resumable-upload) upload endpoint at `http://<host>:<port>/<name>/push`. [`grit push`](../push/) sends a large push there as a bundle, in chunks that survive a dropped connection, then posts the usual ref updates to `…/push/<id>/receive`. The server applies them exactly as for a normal push (the same checks, policy and hooks) and answers with the usual push report. Uploading needs write access, and an upload belongs to the user who started it. Unfinished uploads are deleted after a week. Git clients ignore the capability and push the usual way.

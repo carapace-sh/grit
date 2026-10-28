@@ -537,6 +537,9 @@ pub struct FetchOutcome {
     pub new_unshallow: Vec<ObjectId>,
     /// Objects and pack bytes ingested during this fetch.
     pub transfer: TransferStats,
+    /// True when an object filter from [`FetchOptions::filter`] was sent on the wire
+    /// and the server advertised filter support.
+    pub filter_sent: bool,
 }
 
 impl FetchOutcome {
@@ -2078,6 +2081,7 @@ pub(crate) fn fetch_local_into(
         new_shallow,
         new_unshallow: shallow_unshallow,
         transfer,
+        filter_sent: false,
     })
 }
 

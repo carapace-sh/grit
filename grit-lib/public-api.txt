@@ -20256,6 +20256,7 @@ pub grit_lib::remote::clone::CloneOutcome::bundle: grit_lib::remote::bundle_uri:
 pub grit_lib::remote::clone::CloneOutcome::checkout: grit_lib::remote::clone::CloneCheckout
 pub grit_lib::remote::clone::CloneOutcome::checkout_oid: grit_lib::objects::ObjectId
 pub grit_lib::remote::clone::CloneOutcome::files: u64
+pub grit_lib::remote::clone::CloneOutcome::filter_sent: bool
 pub grit_lib::remote::clone::CloneOutcome::head: grit_lib::remote::clone::CloneHead
 pub grit_lib::remote::clone::CloneOutcome::path: std::path::PathBuf
 pub grit_lib::remote::clone::CloneOutcome::path_collisions: alloc::vec::Vec<alloc::string::String>
@@ -23605,6 +23606,7 @@ impl !core::panic::unwind_safe::RefUnwindSafe for grit_lib::remote::transfer::Fe
 impl !core::panic::unwind_safe::UnwindSafe for grit_lib::remote::transfer::FetchOptions
 pub struct grit_lib::remote::transfer::FetchOutcome
 pub grit_lib::remote::transfer::FetchOutcome::default_branch: core::option::Option<alloc::string::String>
+pub grit_lib::remote::transfer::FetchOutcome::filter_sent: bool
 pub grit_lib::remote::transfer::FetchOutcome::new_shallow: alloc::vec::Vec<grit_lib::objects::ObjectId>
 pub grit_lib::remote::transfer::FetchOutcome::new_unshallow: alloc::vec::Vec<grit_lib::objects::ObjectId>
 pub grit_lib::remote::transfer::FetchOutcome::transfer: grit_lib::remote::transfer::TransferStats

@@ -169,7 +169,7 @@ pub struct CloneOutcome {
     /// Partial-clone blob filter when `--blobs` was used (`"none"` or a byte limit).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub blobs: Option<CloneBlobsJson>,
-    /// True when `--blobs` configured a promisor partial clone.
+    /// True when the server applied the `--blobs` filter on the initial fetch.
     #[serde(default, skip_serializing_if = "CloneOutcome::partial_not_set")]
     #[schemars(default)]
     pub partial: bool,
@@ -699,6 +699,12 @@ fn clone_into(
     let elapsed = started.elapsed();
     let transfer = TransferSummary::new(outcome.transfer, term_progress.phases().to_vec(), elapsed);
 
+    if filter.is_some() && !outcome.filter_sent {
+        eprintln!(
+            "warning: the server did not advertise filter support; fetched all objects without applying --blobs"
+        );
+    }
+
     let (branch, detached, tag) = match &outcome.head {
         CloneHead::Branch(name) => (Some(name.clone()), false, None),
         CloneHead::Detached { tag, .. } => (None, true, Some(tag.clone())),
@@ -715,7 +721,7 @@ fn clone_into(
         tag,
         depth: run.depth,
         blobs: filter.map(CloneBlobsJson::from_spec),
-        partial: filter.is_some(),
+        partial: outcome.filter_sent,
         objects: outcome.transfer.objects,
         bytes: outcome.transfer.bytes,
         branches: outcome.branches,
