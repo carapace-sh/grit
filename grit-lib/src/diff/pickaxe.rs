@@ -288,10 +288,7 @@ impl Pickaxe {
                 let Some(regex) = self.ere.as_ref().filter(|_| !binary) else {
                     return Ok(false);
                 };
-                Ok(bytes
-                    .text()
-                    .split_inclusive('\n')
-                    .any(|line| regex.is_match(line.as_bytes())))
+                Ok(regex.is_match(&bytes.data))
             }
         }
     }
@@ -327,9 +324,14 @@ impl Pickaxe {
                 let Some(regex) = self.ere.as_ref() else {
                     return Ok(false);
                 };
+                // Under REG_NEWLINE a match within one line is also a match within its whole
+                // blob, so a pair where neither side matches has no matching changed line.
+                if !regex.is_match(&old_bytes.data) && !regex.is_match(&new_bytes.data) {
+                    return Ok(false);
+                }
                 Ok(line_grep_match(
-                    old_bytes.text().as_str(),
-                    new_bytes.text().as_str(),
+                    &String::from_utf8_lossy(&old_bytes.data),
+                    &String::from_utf8_lossy(&new_bytes.data),
                     regex,
                 ))
             }

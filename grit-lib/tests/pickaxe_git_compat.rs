@@ -475,6 +475,33 @@ fn pickaxe_rename_that_changes_matches_is_listed_matches_git() {
 }
 
 #[test]
+fn pickaxe_g_line_anchors_on_modified_files_matches_git() {
+    let repo = HistoryRepo::init();
+    let worktree = repo.worktree();
+    commit_file(worktree, "f.txt", "alpha\nbeta\n", "base");
+    commit_file(worktree, "f.txt", "alpha\nxneedle\nbeta\n", "unanchored");
+    commit_file(
+        worktree,
+        "f.txt",
+        "alpha\nxneedle\nneedle\nbeta\n",
+        "anchored",
+    );
+    commit_file(
+        worktree,
+        "f.txt",
+        "alpha\nxneedle\nneedle\nbeta\nlast two",
+        "no-eol",
+    );
+    commit_file(worktree, "g.txt", "needle\n", "other-file");
+    for pattern in ["^needle$", "needle", "^x", "two$", "a$", "^beta"] {
+        let pickaxe = Pickaxe::line_grep(pattern, false)
+            .expect("grep")
+            .into_shared();
+        assert_pickaxe_matches_git(worktree, &["-G", pattern], pickaxe, None, &["f.txt"]);
+    }
+}
+
+#[test]
 fn pickaxe_matches_commit_pairs_renames_per_policy() {
     let repo = HistoryRepo::init();
     let worktree = repo.worktree();
