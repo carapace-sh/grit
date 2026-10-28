@@ -352,6 +352,9 @@ impl Bundle {
     /// no temporary file is created. A filtered (v3 `filter`) bundle is then not marked
     /// as a promisor pack, since there is no pack to mark.
     ///
+    /// Pack integrity is checked while building the pack index (object hashes and the
+    /// pack trailer); there is no second full read of the pack after indexing.
+    ///
     /// # Errors
     ///
     /// Returns [`BundleError`] or ingest failures wrapped as [`BundleError::Io`].
@@ -458,6 +461,9 @@ impl Bundle {
         crate::progress::poll_cancel(progress, cancel).map_err(bundle_ingest_error)?;
         let opts = IngestPackOptions {
             fix_thin: true,
+            // Indexing hashes every object and the trailer is checked while
+            // installing, so a second full read of the pack proves nothing.
+            skip_post_index_verify: true,
             ..Default::default()
         };
         ingest_received_pack_path_with_progress(

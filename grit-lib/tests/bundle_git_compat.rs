@@ -210,6 +210,34 @@ fn git_created_bundles_parse_verify_unbundle_fsck() {
 }
 
 #[test]
+fn git_full_bundle_unbundle_rejects_corrupt_pack_trailer() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let src = tmp.path();
+    init_repo_with_two_commits(src);
+    let full = src.join("git-full.bundle");
+    git_ok(src, &["bundle", "create", full.to_str().unwrap(), "--all"]);
+    let mut bytes = std::fs::read(&full).expect("read bundle");
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0x55;
+    let corrupt = src.join("corrupt.bundle");
+    std::fs::write(&corrupt, &bytes).expect("write corrupt bundle");
+
+    let consumer = tempfile::tempdir().expect("consumer");
+    git_ok(
+        consumer.path(),
+        &["init", "-q", "--bare", "-b", "main", "."],
+    );
+    let bare = grit_repo(consumer.path());
+    let bundle = Bundle::open(&corrupt).expect("open corrupt bundle");
+    let err = bundle.unbundle(&bare).expect_err("corrupt pack trailer");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("checksum") || msg.contains("mismatch") || msg.contains("corrupt"),
+        "unexpected error: {msg}"
+    );
+}
+
+#[test]
 fn git_v3_sha256_bundle_round_trips_when_supported() {
     let probe_dir = tempfile::tempdir().expect("probe dir");
     let probe = Command::new("git")
