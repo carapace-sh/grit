@@ -149,6 +149,12 @@ pub fn format_warning_message(w: &Warning) -> String {
         Warning::ReflogNotWritten { refname, detail } => {
             format!("{refname} was updated, but its reflog could not be written: {detail}")
         }
+        Warning::ReflogDateBeforeOldestEntry {
+            ref_display,
+            cutoff_sec,
+        } => format!(
+            "reflog date for '{ref_display}' is older than every recorded entry (cutoff {cutoff_sec}); using the oldest entry"
+        ),
         Warning::NonExecutableHookIgnored {
             hook_name,
             hook_path,
@@ -223,6 +229,7 @@ fn warning_kind(w: &Warning) -> String {
         Warning::IndexVersionConfigInvalid { .. } => "index_version_config_invalid".into(),
         Warning::MailmapUnreadable { .. } => "mailmap_unreadable".into(),
         Warning::ReflogNotWritten { .. } => "reflog_not_written".into(),
+        Warning::ReflogDateBeforeOldestEntry { .. } => "reflog_date_before_oldest".into(),
         Warning::NonExecutableHookIgnored { .. } => "non_executable_hook_ignored".into(),
         Warning::HookNotRun { .. } => "hook_not_run".into(),
         Warning::MidxChecksumMismatch => "midx_checksum_mismatch".into(),

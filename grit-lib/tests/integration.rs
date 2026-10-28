@@ -1554,6 +1554,9 @@ mod rev_parse_exercise;
 #[path = "rev_parse_line_coverage.rs"]
 mod rev_parse_line_coverage;
 #[cfg(feature = "full-tests")]
+#[path = "rev_parse_reflog_date_git_compat.rs"]
+mod rev_parse_reflog_date_git_compat;
+#[cfg(feature = "full-tests")]
 #[path = "rev_parse_resolve_sweep.rs"]
 mod rev_parse_resolve_sweep;
 #[path = "rev_parse_rev_list_errors.rs"]

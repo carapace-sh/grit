@@ -133,6 +133,13 @@ pub enum RevParseError {
         available: usize,
     },
 
+    /// Reflog `@{date}` inner text could not be parsed as a date.
+    #[error("invalid reflog date '{date}'")]
+    ReflogDateUnparseable {
+        /// Text inside `@{...}` that was treated as a date selector.
+        date: String,
+    },
+
     /// Tree path exists at `HEAD` but not at the requested revision.
     #[error("path '{path}' exists on disk, but not in '{revision}'")]
     PathOnDiskNotInRevision {

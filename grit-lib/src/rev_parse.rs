@@ -2895,20 +2895,30 @@ enum AtStep {
     Now,
 }
 
-fn try_parse_at_step_inner(inner: &str, now_sec: i64) -> Option<AtStep> {
+fn try_parse_at_step_inner(
+    inner: &str,
+    now_sec: i64,
+) -> std::result::Result<AtStep, RevParseError> {
     if inner.eq_ignore_ascii_case("u") || inner.eq_ignore_ascii_case("upstream") {
-        return Some(AtStep::Upstream);
+        return Ok(AtStep::Upstream);
     }
     if inner.eq_ignore_ascii_case("push") {
-        return Some(AtStep::Push);
+        return Ok(AtStep::Push);
     }
     if inner.eq_ignore_ascii_case("now") {
-        return Some(AtStep::Now);
+        return Ok(AtStep::Now);
     }
     if let Ok(n) = inner.parse::<usize>() {
-        return Some(AtStep::Index(n));
+        return Ok(AtStep::Index(n));
     }
-    approxidate_at(inner, now_sec).map(AtStep::Date)
+    approxidate_at(inner, now_sec).map_or_else(
+        || {
+            Err(RevParseError::ReflogDateUnparseable {
+                date: inner.to_owned(),
+            })
+        },
+        |ts| Ok(AtStep::Date(ts)),
+    )
 }
 
 fn next_reflog_at_open(spec: &str, mut from: usize) -> Option<usize> {
@@ -2928,30 +2938,35 @@ fn next_reflog_at_open(spec: &str, mut from: usize) -> Option<usize> {
 }
 
 /// Split `spec` into a ref prefix and a chain of `@{...}` steps (empty chain → not a reflog form).
-fn split_reflog_at_chain(spec: &str, now_sec: i64) -> Option<(String, Vec<AtStep>)> {
-    let at = next_reflog_at_open(spec, 0)?;
+fn split_reflog_at_chain(spec: &str, now_sec: i64) -> Result<Option<(String, Vec<AtStep>)>> {
+    let Some(at) = next_reflog_at_open(spec, 0) else {
+        return Ok(None);
+    };
     let prefix = spec[..at].to_owned();
     let mut steps = Vec::new();
     let mut pos = at;
     while pos < spec.len() {
         let rest = &spec[pos..];
         if !rest.starts_with("@{") {
-            return None;
+            return Ok(None);
         }
         if rest.as_bytes().get(2) == Some(&b'-') {
-            return None;
+            return Ok(None);
         }
         let inner_start = pos + 2;
-        let close = spec[inner_start..].find('}').map(|i| inner_start + i)?;
+        let Some(close_rel) = spec[inner_start..].find('}') else {
+            return Ok(None);
+        };
+        let close = inner_start + close_rel;
         let inner = &spec[inner_start..close];
-        let step = try_parse_at_step_inner(inner, now_sec)?;
+        let step = try_parse_at_step_inner(inner, now_sec).map_err(Error::from)?;
         steps.push(step);
         pos = close + 1;
     }
     if steps.is_empty() {
-        return None;
+        return Ok(None);
     }
-    Some((prefix, steps))
+    Ok(Some((prefix, steps)))
 }
 
 fn dwim_refname(repo: &Repository, raw: &str) -> String {
@@ -3064,7 +3079,17 @@ fn resolve_reflog_oid(
                     }
                 }
             }
-            Ok(entries[0].new_oid)
+            let oldest = &entries[0];
+            let oid = if oldest.old_oid.is_zero() {
+                oldest.new_oid
+            } else {
+                oldest.old_oid
+            };
+            repo.warn(crate::diagnostics::Warning::ReflogDateBeforeOldestEntry {
+                ref_display: display.clone(),
+                cutoff_sec: target_ts,
+            });
+            Ok(oid)
         }
     }
 }
@@ -3088,7 +3113,7 @@ fn resolve_at_minus_token_to_branch(repo: &Repository, token: &str) -> Result<Op
 /// Returns `None` when `spec` is not a reflog-chain form (no `@{` step after the prefix).
 pub fn reflog_walk_refname(repo: &Repository, spec: &str) -> Result<Option<String>> {
     let now_sec = repo.wall_clock_epoch();
-    let Some((prefix, steps)) = split_reflog_at_chain(spec, now_sec) else {
+    let Some((prefix, steps)) = split_reflog_at_chain(spec, now_sec)? else {
         return Ok(None);
     };
 
@@ -3172,7 +3197,7 @@ pub fn resolve_reflog_walk_log_ref(repo: &Repository, r: &str) -> Result<String>
 /// Try to resolve `ref@{...}` with optional chained `@{...}` steps (e.g. `other@{u}@{1}`).
 fn try_resolve_reflog_index(repo: &Repository, spec: &str) -> Result<Option<ObjectId>> {
     let now_sec = repo.wall_clock_epoch();
-    let Some((prefix, steps)) = split_reflog_at_chain(spec, now_sec) else {
+    let Some((prefix, steps)) = split_reflog_at_chain(spec, now_sec)? else {
         return Ok(None);
     };
 
@@ -3285,11 +3310,10 @@ pub fn reflog_date_selector_timestamp_at(s: &str, now_sec: i64) -> Option<i64> {
     approxidate_at(s, now_sec)
 }
 
-/// Simple approximate date parser for reflog date lookups.
-/// Handles formats like "2001-09-17", "3.hot.dogs.on.2001-09-17", etc.
+/// Approximate date parser for reflog `@{date}` selectors (same grammar as `--since` / `--until`).
 fn approxidate_at(s: &str, now_ts: i64) -> Option<i64> {
-    let lower = s.trim().to_ascii_lowercase();
-    if lower.split_whitespace().next() == Some("now") {
+    let trimmed = s.trim();
+    if trimmed.eq_ignore_ascii_case("now") {
         // Match Git's test harness: `test_tick` sets GIT_COMMITTER_DATE; `@{now}` must use that
         // clock, not wall time (t1507 `log -g other@{u}@{now}`).
         if let Some(raw) = crate::environment::Environment::empty()
@@ -3303,71 +3327,7 @@ fn approxidate_at(s: &str, now_ts: i64) -> Option<i64> {
         }
         return Some(now_ts);
     }
-    if let Ok((ts, _offset)) = crate::git_date::parse::parse_date_basic(s.trim()) {
-        return Some(ts as i64);
-    }
-    // Handle relative time: "N.unit.ago" or "N unit ago"
-    // e.g. "1.year.ago", "2.weeks.ago", "3 hours ago"
-    let relative = lower.replace('.', " ");
-    let parts: Vec<&str> = relative.split_whitespace().collect();
-    if parts.len() >= 2 {
-        // Try to parse "N unit ago" or just "N unit". Both are past-relative: git's
-        // approxidate treats a bare "N unit" the same as "N unit ago" (it parses times for
-        // --since/--until), so the result is always `now - N*unit`.
-        let (n_str, unit) = if (parts.len() >= 3 && parts[2] == "ago") || parts.len() == 2 {
-            (parts[0], parts[1])
-        } else {
-            ("", "")
-        };
-        if !n_str.is_empty() {
-            if let Ok(n) = n_str.parse::<i64>() {
-                let secs: Option<i64> = match unit.trim_end_matches('s') {
-                    "second" => Some(n),
-                    "minute" => Some(n * 60),
-                    "hour" => Some(n * 3600),
-                    "day" => Some(n * 86400),
-                    "week" => Some(n * 604800),
-                    "month" => Some(n * 2592000),
-                    "year" => Some(n * 31536000),
-                    _ => None,
-                };
-                if let Some(s) = secs {
-                    return Some(now_ts - s);
-                }
-            }
-        }
-    }
-    // Try to extract a YYYY-MM-DD pattern from the string
-    let re_like = |input: &str| -> Option<i64> {
-        // Scan for 4-digit year followed by -MM-DD
-        for (i, _) in input.char_indices() {
-            let rest = &input[i..];
-            if rest.len() >= 10 {
-                let bytes = rest.as_bytes();
-                if bytes[4] == b'-'
-                    && bytes[7] == b'-'
-                    && bytes[0..4].iter().all(|b| b.is_ascii_digit())
-                    && bytes[5..7].iter().all(|b| b.is_ascii_digit())
-                    && bytes[8..10].iter().all(|b| b.is_ascii_digit())
-                {
-                    let year: i32 = rest[0..4].parse().ok()?;
-                    let month: u8 = rest[5..7].parse().ok()?;
-                    let day: u8 = rest[8..10].parse().ok()?;
-                    let date = time::Date::from_calendar_date(
-                        year,
-                        time::Month::try_from(month).ok()?,
-                        day,
-                    )
-                    .ok()?;
-                    let dt = date.with_hms(0, 0, 0).ok()?;
-                    let odt = dt.assume_utc();
-                    return Some(odt.unix_timestamp());
-                }
-            }
-        }
-        None
-    };
-    re_like(s)
+    crate::git_date::parse_date_cutoff(trimmed, now_ts).ok()
 }
 
 fn head_tree_oid(repo: &Repository) -> Result<ObjectId> {
@@ -4225,6 +4185,9 @@ mod line_coverage_tests {
         assert_eq!(steps.len(), 2);
         assert!(find_parent_shorthand("main^!").is_some());
         assert!(reflog_date_selector_timestamp_at("1.day.ago", 1_700_000_000).is_some());
+        assert!(reflog_date_selector_timestamp_at("yesterday", 1_700_000_000).is_some());
+        assert!(reflog_date_selector_timestamp_at("last week", 1_700_000_000).is_some());
+        assert!(reflog_date_selector_timestamp_at("noon yesterday", 1_700_000_000).is_some());
         assert!(next_reflog_at_open("main@{1}@{0}", 0).is_some());
     }
 
@@ -4473,9 +4436,21 @@ mod line_coverage_tests {
 
     #[test]
     fn reflog_chain_and_at_step_parsers() {
-        assert!(try_parse_at_step_inner("0", 1_700_000_000).is_some());
-        assert!(try_parse_at_step_inner("now", 1_700_000_000).is_some());
-        assert!(split_reflog_at_chain("main@{1}@{0}", 1_700_000_000).is_some());
+        assert!(matches!(
+            try_parse_at_step_inner("0", 1_700_000_000),
+            Ok(AtStep::Index(0))
+        ));
+        assert!(matches!(
+            try_parse_at_step_inner("now", 1_700_000_000),
+            Ok(AtStep::Now)
+        ));
+        assert!(matches!(
+            try_parse_at_step_inner("yesterday", 1_700_000_000),
+            Ok(AtStep::Date(_))
+        ));
+        assert!(split_reflog_at_chain("main@{1}@{0}", 1_700_000_000)
+            .unwrap()
+            .is_some());
         assert!(next_reflog_at_open("HEAD@{2}", 0).is_some());
         let (root, steps) = parse_nav_steps("HEAD~2^2^1");
         assert_eq!(root, "HEAD");

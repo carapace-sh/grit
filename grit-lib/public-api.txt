@@ -3194,6 +3194,9 @@ pub grit_lib::diagnostics::Warning::NonExecutableHookIgnored::hook_path: core::o
 pub grit_lib::diagnostics::Warning::PackBitmapIgnored
 pub grit_lib::diagnostics::Warning::PackBitmapIgnored::path: std::path::PathBuf
 pub grit_lib::diagnostics::Warning::PackBitmapIgnored::reason: alloc::string::String
+pub grit_lib::diagnostics::Warning::ReflogDateBeforeOldestEntry
+pub grit_lib::diagnostics::Warning::ReflogDateBeforeOldestEntry::cutoff_sec: i64
+pub grit_lib::diagnostics::Warning::ReflogDateBeforeOldestEntry::ref_display: alloc::string::String
 pub grit_lib::diagnostics::Warning::ReflogNotWritten
 pub grit_lib::diagnostics::Warning::ReflogNotWritten::detail: alloc::string::String
 pub grit_lib::diagnostics::Warning::ReflogNotWritten::refname: alloc::string::String
@@ -16849,6 +16852,9 @@ pub grit_lib::prelude::Warning::NonExecutableHookIgnored::hook_path: core::optio
 pub grit_lib::prelude::Warning::PackBitmapIgnored
 pub grit_lib::prelude::Warning::PackBitmapIgnored::path: std::path::PathBuf
 pub grit_lib::prelude::Warning::PackBitmapIgnored::reason: alloc::string::String
+pub grit_lib::prelude::Warning::ReflogDateBeforeOldestEntry
+pub grit_lib::prelude::Warning::ReflogDateBeforeOldestEntry::cutoff_sec: i64
+pub grit_lib::prelude::Warning::ReflogDateBeforeOldestEntry::ref_display: alloc::string::String
 pub grit_lib::prelude::Warning::ReflogNotWritten
 pub grit_lib::prelude::Warning::ReflogNotWritten::detail: alloc::string::String
 pub grit_lib::prelude::Warning::ReflogNotWritten::refname: alloc::string::String
@@ -28039,6 +28045,8 @@ pub grit_lib::revwalk::rev_parse_error::RevParseError::PushDefaultSimpleMismatch
 pub grit_lib::revwalk::rev_parse_error::RevParseError::PushRefspecMissing
 pub grit_lib::revwalk::rev_parse_error::RevParseError::PushRefspecMissing::branch: alloc::string::String
 pub grit_lib::revwalk::rev_parse_error::RevParseError::PushRefspecMissing::remote: alloc::string::String
+pub grit_lib::revwalk::rev_parse_error::RevParseError::ReflogDateUnparseable
+pub grit_lib::revwalk::rev_parse_error::RevParseError::ReflogDateUnparseable::date: alloc::string::String
 pub grit_lib::revwalk::rev_parse_error::RevParseError::ReflogEmpty
 pub grit_lib::revwalk::rev_parse_error::RevParseError::ReflogEmpty::ref_display: alloc::string::String
 pub grit_lib::revwalk::rev_parse_error::RevParseError::ReflogInsufficientEntries

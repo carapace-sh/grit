@@ -31,6 +31,9 @@ pub fn map_lib_revision_error(err: &LibError) -> Option<String> {
         LibError::RevParse(RevParseError::AmbiguousArgument { spec }) => {
             Some(format!("revision '{spec}' not found"))
         }
+        LibError::RevParse(RevParseError::ReflogDateUnparseable { date }) => {
+            Some(format!("invalid reflog date '{date}'"))
+        }
         LibError::ObjectNotFound(spec) => Some(format!("revision '{spec}' not found")),
         _ => None,
     }
