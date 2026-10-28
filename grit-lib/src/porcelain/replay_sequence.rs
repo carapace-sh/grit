@@ -19,7 +19,7 @@ use crate::error::{Error, Result};
 use crate::merge_file::{ConflictStyle, MergeFavor};
 use crate::merge_trees::{
     merge_trees_three_way, merge_trees_three_way_cached, DirectoryRenameMode, MergeTreeCache,
-    TreeMergeConflictPresentation, WhitespaceMergeOptions,
+    ReplayConflictLabels, TreeMergeConflictPresentation, WhitespaceMergeOptions,
 };
 use crate::objects::{parse_commit, CommitData, ObjectId, ObjectKind};
 use crate::operation::Conflict;
@@ -817,22 +817,15 @@ enum PredictStepResult {
 }
 
 fn replay_step_presentation<'a>(
-    entry: &TodoEntry,
+    labels: &'a ReplayConflictLabels,
     head_oid: ObjectId,
     source_oid: ObjectId,
     opts: &ReplayOptions,
-    theirs_label: &'a mut String,
-    base_label: &'a mut String,
 ) -> TreeMergeConflictPresentation<'a> {
-    *theirs_label = format!("{} ({})", abbrev_oid(source_oid), entry.subject);
-    *base_label = format!("parent of {theirs_label}");
     TreeMergeConflictPresentation {
-        label_theirs: crate::merge_trees::TheirsConflictLabel::Fixed(theirs_label),
-        label_base: base_label,
-        style: opts.conflict_style,
         df_directory_ours_commit: Some(head_oid),
         df_directory_theirs_commit: Some(source_oid),
-        ..TreeMergeConflictPresentation::default()
+        ..labels.presentation(opts.conflict_style)
     }
 }
 
@@ -893,16 +886,8 @@ fn predict_one_step(
         };
     }
 
-    let mut theirs_label = String::new();
-    let mut base_label = String::new();
-    let presentation = replay_step_presentation(
-        entry,
-        *head_commit,
-        source_oid,
-        opts,
-        &mut theirs_label,
-        &mut base_label,
-    );
+    let labels = ReplayConflictLabels::new(source_oid, &entry.subject);
+    let presentation = replay_step_presentation(&labels, *head_commit, source_oid, opts);
     let merged = merge_trees_three_way(
         repo,
         base_tree,
@@ -1012,16 +997,8 @@ fn apply_one_step(
         };
     }
 
-    let mut theirs_label = String::new();
-    let mut base_label = String::new();
-    let presentation = replay_step_presentation(
-        entry,
-        *head,
-        source_oid,
-        opts,
-        &mut theirs_label,
-        &mut base_label,
-    );
+    let labels = ReplayConflictLabels::new(source_oid, &entry.subject);
+    let presentation = replay_step_presentation(&labels, *head, source_oid, opts);
     let merged = merge_trees_three_way_cached(
         repo,
         merge_cache,

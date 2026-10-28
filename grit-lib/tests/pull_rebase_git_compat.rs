@@ -404,8 +404,13 @@ fn assert_stopped_rebase(dir: &Path) {
         "HEAD must be detached during the stop"
     );
     let body = fs::read_to_string(dir.join("conflict.txt")).expect("conflict.txt");
-    assert!(
-        body.contains("<<<<<<<") && body.contains(">>>>>>>"),
+    assert!(body.contains("<<<<<<<"), "{body}");
+    // The incoming side names the replayed local commit, not the path.
+    let replayed = rev(dir, "refs/heads/main").to_hex();
+    let incoming = body.lines().find(|line| line.starts_with(">>>>>>>"));
+    assert_eq!(
+        incoming,
+        Some(format!(">>>>>>> {} (local)", &replayed[..7]).as_str()),
         "{body}"
     );
     // Added on both sides: stages 2 and 3 only (add/add).
