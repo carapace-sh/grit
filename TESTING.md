@@ -615,7 +615,7 @@ Shared harness: [`grit-lib/tests/support/diff_harness.rs`](grit-lib/tests/suppor
 | t2404-worktree-config.sh | `extensions.worktreeConfig` + `config.worktree` via `copy_filtered_worktree_config` | `worktree_git_compat.rs` (`t2404_worktree_config_matches_git`) | covered |
 | t2401 worktree remove | linked worktree removal vs git | `grit-lib/tests/worktree_git_compat.rs` (`t2401_remove_linked_worktree_matches_git`) | covered (library `remove_linked_worktree`; no grit `worktree remove` CLI yet) |
 | t2403/t2406/t2407 worktree | move/repair/prune/exclusive heads | — | gap (no grit `worktree move/repair/prune` yet; branch exclusivity covered in `worktree_extended_git_compat.rs`) |
-| t4204-patch-id.sh | `PatchIdMode` stable/unstable/verbatim vs `git patch-id`; ODB `compute_patch_id` | `grit-lib/src/patch_ids.rs` (`t4204_patch_id_modes_match_git`, `stable_patch_ids_match_git_patch_id_on_log_p`) | covered |
+| t4204-patch-id.sh | `PatchIdMode` stable/unstable/verbatim vs `git patch-id`; ODB `compute_patch_id`, including header-only entries (empty files, mode changes, pure renames) in multi-file commits | `grit-lib/src/patch_ids.rs` (`t4204_patch_id_modes_match_git`, `stable_patch_ids_match_git_patch_id_on_log_p`, `empty_file_add_and_delete_patch_ids_match_git`) | covered |
 | — | per-worktree refs `main-worktree/` / `worktrees/<id>/` storage | `worktree_git_compat.rs` (`per_worktree_refs_resolve_like_git`); `worktree_ref.rs` unit tests | covered |
 | — | stash apply/pop conflicts keep entry | `stash_git_compat.rs` (`pop_keeps_entry_on_conflict`); `stash_apply_git_compat.rs` | covered |
 

@@ -525,26 +525,19 @@ fn compute_patch_id_filtered(
     }
 
     let mut result = [0u8; PATCH_ID_DIGEST_MAX];
-    let mut rolling_ctx = ChecksumHasher::new(algo);
-
+    let mut ctx = ChecksumHasher::new(algo);
+    // Stable IDs split only where a file's hunks or binary line end, so a
+    // header-only entry (empty file, mode change, pure rename) shares one
+    // digest with the entry that follows it.
+    let mut ended_with_body = false;
     for entry in &diffs {
-        if per_file_flush {
-            let mut ctx = ChecksumHasher::new(algo);
-            patch_id_hash_diff_entry(odb, entry, &mut ctx)?;
+        if per_file_flush && ended_with_body {
             text_flush_one_hunk(&mut result[..digest_len], digest_len, &mut ctx, algo);
-        } else {
-            patch_id_hash_diff_entry(odb, entry, &mut rolling_ctx)?;
         }
+        patch_id_hash_diff_entry(odb, entry, &mut ctx)?;
+        ended_with_body = patch_id_has_content_diff(entry);
     }
-
-    if !per_file_flush {
-        text_flush_one_hunk(
-            &mut result[..digest_len],
-            digest_len,
-            &mut rolling_ctx,
-            algo,
-        );
-    }
+    text_flush_one_hunk(&mut result[..digest_len], digest_len, &mut ctx, algo);
 
     if result.iter().take(digest_len).all(|&b| b == 0) {
         return Ok(None);
@@ -692,7 +685,7 @@ fn patch_id_append_git_show_entry(odb: &Odb, entry: &DiffEntry, out: &mut Vec<u8
         ),
     );
 
-    if entry.old_oid == entry.new_oid {
+    if !patch_id_has_content_diff(entry) {
         return Ok(());
     }
 
@@ -734,6 +727,16 @@ fn patch_id_append_git_show_entry(odb: &Odb, entry: &DiffEntry, out: &mut Vec<u8
     );
     out.extend_from_slice(unified.as_bytes());
     Ok(())
+}
+
+/// Whether `git show` prints `---`/`+++` lines and a body for `entry`.
+///
+/// Git prints only the header block when the content is unchanged or when
+/// both sides are empty (adding or deleting an empty file), and that
+/// header block is all the patch ID covers.
+fn patch_id_has_content_diff(entry: &DiffEntry) -> bool {
+    let empty = |oid: &ObjectId| oid.is_zero() || oid.is_empty_blob();
+    entry.old_oid != entry.new_oid && !(empty(&entry.old_oid) && empty(&entry.new_oid))
 }
 
 /// Hash one tree diff entry into `ctx` (rename or regular file).
@@ -791,7 +794,7 @@ fn patch_id_hash_file_entry_into_ctx(
         patch_id_add_mode(ctx, new_mode);
     }
 
-    if entry.old_oid == entry.new_oid {
+    if !patch_id_has_content_diff(entry) {
         return Ok(());
     }
 
@@ -1328,5 +1331,98 @@ mod tests {
                 .expect("merge")
                 .is_none()
         );
+    }
+
+    fn git_show_patch_id(dir: &std::path::Path, commit: &str, mode_flag: &str) -> ObjectId {
+        use std::io::Write;
+        let show = git_in(dir, &["show", commit]);
+        let mut child = Command::new("git")
+            .current_dir(dir)
+            .args(["patch-id", mode_flag])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn git patch-id");
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(show.as_bytes())
+            .expect("write show");
+        let out = child.wait_with_output().expect("wait");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let hex = stdout.split_whitespace().next().expect("patch id");
+        ObjectId::from_hex(hex).expect("patch hex")
+    }
+
+    #[cfg_attr(
+        not(feature = "full-tests"),
+        ignore = "starts system git or is heavy; run with --features full-tests"
+    )]
+    #[test]
+    fn empty_file_add_and_delete_patch_ids_match_git() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path();
+        git_in(path, &["init", "-q", "--initial-branch=main", "."]);
+        std::fs::write(path.join("a"), b"a\n").unwrap();
+        git_in(path, &["add", "a"]);
+        git_in(path, &["commit", "-q", "-m", "c1"]);
+
+        let mut commits = Vec::new();
+        let mut commit = |label: &str| {
+            git_in(path, &["commit", "-q", "-m", label]);
+            commits.push((label.to_owned(), git_in(path, &["rev-parse", "HEAD"])));
+        };
+        std::fs::write(path.join("empty"), b"").unwrap();
+        git_in(path, &["add", "empty"]);
+        commit("add empty");
+        git_in(path, &["rm", "-q", "empty"]);
+        commit("delete empty");
+        std::fs::write(path.join("run"), b"").unwrap();
+        git_in(path, &["add", "--chmod=+x", "run"]);
+        commit("add empty executable");
+        std::fs::write(path.join("a"), b"a\nb\n").unwrap();
+        std::fs::write(path.join("z-empty"), b"").unwrap();
+        git_in(path, &["add", "a", "z-empty"]);
+        commit("edit and add empty");
+        std::fs::write(path.join("0-empty"), b"").unwrap();
+        std::fs::write(path.join("a"), b"a\nb\nc\n").unwrap();
+        git_in(path, &["add", "0-empty", "a"]);
+        commit("add empty before edit");
+        git_in(path, &["rm", "-q", "0-empty", "z-empty"]);
+        std::fs::write(path.join("b"), b"b\n").unwrap();
+        git_in(path, &["add", "b"]);
+        commit("delete empties around add");
+        git_in(path, &["update-index", "--chmod=+x", "a"]);
+        std::fs::write(path.join("b"), b"b\nc\n").unwrap();
+        git_in(path, &["add", "b"]);
+        commit("mode change before edit");
+        git_in(path, &["mv", "a", "0-moved"]);
+        std::fs::write(path.join("b"), b"b\nc\nd\n").unwrap();
+        git_in(path, &["add", "b"]);
+        commit("pure rename before edit");
+        std::fs::write(path.join("b"), b"").unwrap();
+        git_in(path, &["add", "b"]);
+        commit("truncate to empty");
+
+        let repo = crate::repo::Repository::open(
+            &path.join(".git"),
+            &RepositoryOptions::empty().with_work_tree(path),
+        )
+        .unwrap();
+        for (label, hex) in &commits {
+            let oid: ObjectId = hex.trim().parse().expect("commit oid");
+            for (mode, flag) in [
+                (PatchIdMode::Stable, "--stable"),
+                (PatchIdMode::Unstable, "--unstable"),
+                (PatchIdMode::Verbatim, "--verbatim"),
+            ] {
+                let grit = compute_patch_id(HashAlgo::Sha1, &repo.odb(), &oid, mode)
+                    .expect("patch id")
+                    .expect("non-merge commit");
+                let git = git_show_patch_id(path, hex.trim(), flag);
+                assert_eq!(grit, git, "{label} {flag}");
+            }
+        }
     }
 }
