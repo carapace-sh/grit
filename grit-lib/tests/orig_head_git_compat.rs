@@ -5,6 +5,7 @@ use crate::support;
 
 use std::path::Path;
 
+use grit_lib::command_runner::system_command_runner;
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::error::Error;
 use grit_lib::index::write_tree::{write_tree_update_index, WriteTreeFlags};
@@ -17,8 +18,9 @@ use grit_lib::porcelain::reset::{reset_to_commit, ResetMode, ResetOptions};
 use grit_lib::progress::{NeverCancel, NullProgress};
 use grit_lib::repo::{InitOptions, Repository};
 use grit_lib::revwalk::history::{
-    abort_rebase, continue_rebase, start_rebase, ApplyOptions, EmptyPolicy, RebaseOntoOptions,
-    RebaseOutcome, RebaseRequest, RefScope, RewriteOptions, StartRebaseOptions,
+    abort_rebase, continue_rebase, start_rebase, start_rebase_with_exec, ApplyOptions, EmptyPolicy,
+    ExecSpec, HistoryError, PreRebase, RebaseOntoOptions, RebaseOutcome, RebaseRequest,
+    RebaseSessionError, RefScope, RewriteOptions, StartRebaseOptions,
 };
 use grit_lib::revwalk::rev_parse::resolve_revision;
 use grit_lib::state::{read_orig_head_for_repository, write_orig_head};
@@ -245,7 +247,7 @@ fn fast_forward_squash_and_up_to_date_merges_record_orig_head() {
 #[test]
 fn refused_ff_only_merge_still_records_orig_head_like_git() {
     let (git_tmp, git_main, _) = issue_repo();
-    git_cmd(&["merge", "--ff-only", "topic"])
+    let _ = git_cmd(&["merge", "--ff-only", "topic"])
         .in_dir(git_tmp.path())
         .with_status(128);
     assert_eq!(git_orig_head(git_tmp.path()), Some(git_main));
@@ -319,6 +321,7 @@ fn rebase_opts(upstream: ObjectId, tip: ObjectId) -> StartRebaseOptions {
             record_operation: None,
             hooks: grit_lib::PostOperationHooks::Skip,
         },
+        pre_rebase: PreRebase::Skip,
     }
 }
 
@@ -358,6 +361,170 @@ fn up_to_date_rebase_leaves_orig_head_untouched() {
     let stale = set_stale_orig_head(dir);
     rebase(dir, rev(dir, "main~1"), main);
     assert_eq!(git_orig_head(dir), Some(stale));
+}
+
+fn rebase_with_exec(
+    dir: &Path,
+    upstream: ObjectId,
+    tip: ObjectId,
+    command: &str,
+) -> Result<RebaseOutcome, RebaseSessionError> {
+    start_rebase_with_exec(
+        &open(dir),
+        &rebase_opts(upstream, tip),
+        &ExecSpec {
+            commands: vec![command.to_owned()],
+        },
+        system_command_runner().as_ref(),
+        &mut NullProgress,
+        &NeverCancel,
+    )
+}
+
+#[test]
+fn exec_rebase_records_orig_head_like_git() {
+    let (git_tmp, _, git_topic) = issue_repo();
+    git(git_tmp.path(), &["switch", "-q", "topic"]);
+    git(git_tmp.path(), &["rebase", "-q", "main", "--exec", "true"]);
+    assert_eq!(git_orig_head(git_tmp.path()), Some(git_topic));
+
+    let (tmp, main, topic) = issue_repo();
+    let dir = tmp.path();
+    git(dir, &["switch", "-q", "topic"]);
+    set_stale_orig_head(dir);
+    let outcome = rebase_with_exec(dir, main, topic, "true").expect("exec rebase");
+    assert!(
+        matches!(outcome, RebaseOutcome::ExecDone { .. }),
+        "{outcome:?}"
+    );
+    assert_ne!(rev(dir, "HEAD"), topic);
+    assert_orig_head_undoes(dir, topic);
+}
+
+#[test]
+fn exec_rebase_stop_records_orig_head_and_failure_leaves_it_alone() {
+    let (tmp, main, topic) = issue_repo();
+    let dir = tmp.path();
+    git(dir, &["switch", "-q", "topic"]);
+    let err = rebase_with_exec(dir, main, topic, "exit 7").expect_err("command fails");
+    assert!(
+        matches!(
+            err,
+            RebaseSessionError::History(HistoryError::ExecFailed { .. })
+        ),
+        "{err:?}"
+    );
+    assert_eq!(
+        git_orig_head(dir),
+        None,
+        "a rolled-back exec rebase records nothing"
+    );
+    assert_eq!(rev(dir, "HEAD"), topic);
+
+    set_stale_orig_head(dir);
+    let err = rebase_with_exec(dir, main, topic, "echo edit >> t").expect_err("dirty stop");
+    assert!(
+        matches!(
+            err,
+            RebaseSessionError::History(HistoryError::ExecDirty { .. })
+        ),
+        "{err:?}"
+    );
+    assert_eq!(git_orig_head(dir), Some(topic), "exec stop");
+    abort_rebase(&open(dir), &ident()).expect("abort");
+    assert_eq!(rev(dir, "HEAD"), topic);
+    assert_eq!(git_orig_head(dir), Some(topic), "after abort");
+    git(dir, &["fsck", "--strict"]);
+}
+
+/// `issue_repo` where `topic` and `main` both edit `f1`, checked out on `topic`.
+fn conflicting_topic_repo() -> (TempDir, ObjectId, ObjectId) {
+    let (tmp, _, _) = issue_repo();
+    let dir = tmp.path();
+    let main = commit(dir, "f1", "main side\n", "main edits f1");
+    git(dir, &["switch", "-q", "topic"]);
+    let topic = commit(dir, "f1", "topic side\n", "topic edits f1");
+    (tmp, main, topic)
+}
+
+#[test]
+fn favored_rebase_records_orig_head_like_git() {
+    let (git_tmp, git_main, git_topic) = conflicting_topic_repo();
+    git(
+        git_tmp.path(),
+        &["rebase", "-q", "-X", "ours", &git_main.to_hex()],
+    );
+    assert_eq!(git_orig_head(git_tmp.path()), Some(git_topic));
+
+    let (tmp, main, topic) = conflicting_topic_repo();
+    let dir = tmp.path();
+    set_stale_orig_head(dir);
+    let mut opts = rebase_opts(main, topic);
+    opts.rebase.favor = grit_lib::diff::merge_file::MergeFavor::Ours;
+    let outcome =
+        start_rebase(&open(dir), &opts, &mut NullProgress, &NeverCancel).expect("favored rebase");
+    assert!(matches!(outcome, RebaseOutcome::Done { .. }), "{outcome:?}");
+    assert_eq!(
+        git(dir, &["show", "HEAD:f1"]),
+        git(git_tmp.path(), &["show", "HEAD:f1"]),
+        "-X ours keeps the upstream side, as git does"
+    );
+    assert_orig_head_undoes(dir, topic);
+}
+
+/// `topic` first deletes `f1`, which `main` modified (a conflict `-X` cannot resolve), then
+/// edits `g`, which `main` also edited. Checked out on `topic`; returns `(main, topic)`.
+fn favor_then_continue_repo() -> (TempDir, ObjectId, ObjectId) {
+    let tmp = TempDir::new().expect("tempdir");
+    let dir = tmp.path();
+    git(dir, &["init", "-q", "-b", "main"]);
+    git(dir, &["config", "user.name", "T"]);
+    git(dir, &["config", "user.email", "t@e.c"]);
+    std::fs::write(dir.join("g"), "base g\n").expect("write g");
+    commit(dir, "f1", "base\n", "base");
+    git(dir, &["add", "g"]);
+    git(dir, &["commit", "-qm", "base g"]);
+    git(dir, &["switch", "-q", "-c", "topic"]);
+    git(dir, &["rm", "-q", "f1"]);
+    git(dir, &["commit", "-qm", "topic drops f1"]);
+    let topic = commit(dir, "g", "topic g\n", "topic edits g");
+    git(dir, &["switch", "-q", "main"]);
+    commit(dir, "f1", "main f1\n", "main edits f1");
+    let main = commit(dir, "g", "main g\n", "main edits g");
+    git(dir, &["switch", "-q", "topic"]);
+    (tmp, main, topic)
+}
+
+#[test]
+fn favored_rebase_stops_on_unresolvable_conflict_and_continue_keeps_the_favor() {
+    let (git_tmp, git_main, git_topic) = favor_then_continue_repo();
+    let git_dir = git_tmp.path();
+    let _ = git_cmd(&["rebase", "-q", "-X", "ours", &git_main.to_hex()])
+        .in_dir(git_dir)
+        .with_status(1);
+    git(git_dir, &["rm", "-q", "f1"]);
+    git_cmd(&["-c", "core.editor=true", "rebase", "--continue"])
+        .in_dir(git_dir)
+        .suc();
+    assert_eq!(git_orig_head(git_dir), Some(git_topic));
+
+    let (tmp, main, topic) = favor_then_continue_repo();
+    let dir = tmp.path();
+    let mut opts = rebase_opts(main, topic);
+    opts.rebase.favor = grit_lib::diff::merge_file::MergeFavor::Ours;
+    let repo = open(dir);
+    let outcome = start_rebase(&repo, &opts, &mut NullProgress, &NeverCancel).expect("start");
+    assert!(matches!(outcome, RebaseOutcome::Stopped(_)), "{outcome:?}");
+    assert_eq!(git_orig_head(dir), Some(topic));
+    git(dir, &["rm", "-q", "f1"]);
+    let done = continue_rebase(&repo, &opts, &mut NullProgress, &NeverCancel).expect("continue");
+    assert!(matches!(done, RebaseOutcome::Done { .. }), "{done:?}");
+    assert_eq!(
+        git(dir, &["show", "HEAD:g"]),
+        git(git_dir, &["show", "HEAD:g"])
+    );
+    assert_eq!(git(dir, &["show", "HEAD:g"]), "main g\n");
+    assert_orig_head_undoes(dir, topic);
 }
 
 #[test]

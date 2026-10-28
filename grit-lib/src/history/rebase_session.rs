@@ -83,13 +83,15 @@ pub enum RebaseOutcome {
         /// `HEAD`. Unlike [`RewritePlan::head_change`], this covers the entire session call.
         head_change: Option<(ObjectId, ObjectId)>,
     },
-    /// An exec stop was resumed to completion and the atomic plan was applied.
+    /// `--exec` commands ran at every replayed commit (from [`start_rebase_with_exec`], or a
+    /// resumed exec stop) and the atomic plan was applied.
     ExecDone {
         /// Ref movements performed on completion.
         applied: AppliedRewrite,
         /// Final rewrite plan; boxed to keep the outcome small.
         plan: Box<RewritePlan>,
-        /// Invocations captured during this continue/skip call.
+        /// Invocations captured during this call ([`start_rebase_with_exec`], or a
+        /// continue/skip that resumed an exec stop).
         exec: super::ExecReport,
     },
     /// Replay stopped on conflicts; `.git/rebase-merge/` and grit state were written.
@@ -244,19 +246,7 @@ pub fn start_rebase(
     let plan = plan_rebase_resumable(repo, &opts.request, &opts.rebase, &opts.pre_rebase)?;
     poll_cancel(progress, cancel).map_err(map_lib)?;
     match plan {
-        Err(RebasePlan::UpToDate) => Ok(RebaseOutcome::Done {
-            head_change: None,
-            applied: AppliedRewrite {
-                ref_updates: Vec::new(),
-                head: orig_head,
-                hooks_run: Vec::new(),
-            },
-            plan: Box::new(RewritePlan {
-                commits: Vec::new(),
-                ref_updates: Vec::new(),
-                head: super::types::HeadEffect::default(),
-            }),
-        }),
+        Err(RebasePlan::UpToDate) => Ok(up_to_date_outcome(orig_head)),
         Err(RebasePlan::Plan(_) | RebasePlan::Conflict { .. }) => Err(HistoryError::Planning {
             message: "unexpected non-resumable rebase plan".into(),
         }
@@ -292,6 +282,96 @@ pub fn start_rebase(
             }
             Ok(RebaseOutcome::Stopped(stop))
         }
+    }
+}
+
+/// Rebase like [`start_rebase`], running `spec.commands` at each replayed commit before any
+/// ref moves (`grit rebase --exec`).
+///
+/// [`StartRebaseOptions::pre_rebase`] runs before anything is replayed, as for [`start_rebase`].
+///
+/// The commands run through [`verify_rebase_with_exec`](super::verify_rebase_with_exec); when
+/// they all succeed, the (possibly amended) plan is applied atomically and the pre-rebase tip
+/// `opts.request.branch_tip` is recorded as `ORIG_HEAD`. A branch that is already up to date
+/// returns [`RebaseOutcome::Done`] with no `head_change`, runs nothing, and leaves `ORIG_HEAD`
+/// untouched. Unlike [`start_rebase`], a replay conflict before any command runs is reported
+/// as an error and nothing changes.
+///
+/// # Errors
+///
+/// Returns [`RebaseSessionError::History`] wrapping [`HistoryError::Conflict`] when planning
+/// conflicts, and the `--exec` errors of
+/// [`verify_rebase_with_exec`](super::verify_rebase_with_exec)
+/// ([`HistoryError::ExecFailed`], [`HistoryError::ExecDirty`],
+/// [`HistoryError::ExecConflict`], …). The two that save a resumable stop
+/// ([`HistoryError::ExecDirty`] and [`HistoryError::ExecConflict`]) record `ORIG_HEAD` first;
+/// the others roll back and leave it alone. Planning, work-tree and apply failures propagate
+/// as for [`start_rebase`].
+pub fn start_rebase_with_exec(
+    repo: &Repository,
+    opts: &StartRebaseOptions,
+    spec: &super::ExecSpec,
+    runner: &dyn crate::command_runner::CommandRunner,
+    progress: &mut dyn ProgressSink,
+    cancel: &dyn Cancel,
+) -> Result<RebaseOutcome, RebaseSessionError> {
+    super::ensure_rewrite_apply_ready(repo)?;
+    let orig_head = opts.request.branch_tip;
+    let mut plan = match super::rebase::plan_rebase_with_hook(
+        repo,
+        &opts.request,
+        &opts.rebase,
+        &opts.pre_rebase,
+    )? {
+        RebasePlan::UpToDate => return Ok(up_to_date_outcome(orig_head)),
+        RebasePlan::Conflict {
+            commit,
+            subject,
+            conflicts,
+            refs,
+        } => {
+            return Err(HistoryError::Conflict {
+                commit,
+                subject,
+                conflicts,
+                refs,
+            }
+            .into());
+        }
+        RebasePlan::Plan(plan) => plan,
+    };
+    super::apply::verify_rewrite_plan(repo, &plan)?;
+    let exec =
+        match super::verify_rebase_with_exec(repo, &mut plan, spec, &opts.rebase.rewrite, runner) {
+            Ok(exec) => exec,
+            Err(stop @ (HistoryError::ExecDirty { .. } | HistoryError::ExecConflict { .. })) => {
+                write_orig_head(repo, orig_head).map_err(map_lib)?;
+                return Err(stop.into());
+            }
+            Err(err) => return Err(err.into()),
+        };
+    let applied = apply_rewrite(repo, &plan, &opts.apply, progress, cancel)?;
+    write_orig_head(repo, orig_head).map_err(map_lib)?;
+    Ok(RebaseOutcome::ExecDone {
+        applied,
+        plan: Box::new(plan),
+        exec,
+    })
+}
+
+fn up_to_date_outcome(head: ObjectId) -> RebaseOutcome {
+    RebaseOutcome::Done {
+        head_change: None,
+        applied: AppliedRewrite {
+            ref_updates: Vec::new(),
+            head,
+            hooks_run: Vec::new(),
+        },
+        plan: Box::new(RewritePlan {
+            commits: Vec::new(),
+            ref_updates: Vec::new(),
+            head: super::types::HeadEffect::default(),
+        }),
     }
 }
 

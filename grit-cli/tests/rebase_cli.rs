@@ -516,6 +516,7 @@ fn rebase_x_theirs_json() -> TestResult {
     let dir = scratch.path();
     let (upstream, onto) = init_rebase_conflict_fixture(dir)?;
     gs(dir, ["config", "grit.changeIds", "false"])?;
+    let tip = git(dir, &["rev-parse", "HEAD"])?.trim().to_owned();
     let out = gs(
         dir,
         [
@@ -523,6 +524,11 @@ fn rebase_x_theirs_json() -> TestResult {
         ],
     )?;
     assert!(out.success(), "{}\n{}", out.stdout, out.stderr);
+    assert_ne!(git(dir, &["rev-parse", "HEAD"])?.trim(), tip);
+    assert_eq!(
+        git(dir, &["rev-parse", "--verify", "ORIG_HEAD"])?.trim(),
+        tip
+    );
     let json = parse_json(&out.stdout)?;
     assert_eq!(json["operation"], "rebase");
     assert!(json["rewritten"].as_array().is_some_and(|a| !a.is_empty()));
@@ -549,6 +555,10 @@ fn rebase_exec_true_moves_refs() -> TestResult {
     let exec = json["exec"].as_array().ok_or("exec array")?;
     assert!(!exec.is_empty());
     assert_ne!(git(dir, &["rev-parse", "HEAD"])?.trim(), tip);
+    assert_eq!(
+        git(dir, &["rev-parse", "--verify", "ORIG_HEAD"])?.trim(),
+        tip
+    );
     git_fsck_strict(dir)?;
     Ok(())
 }
@@ -567,6 +577,10 @@ fn rebase_exec_failure_emits_single_error_line() -> TestResult {
     )?;
     assert_eq!(out.status, Some(7), "stderr:\n{}", out.stderr);
     assert_eq!(git(dir, &["rev-parse", "HEAD"])?.trim(), tip);
+    assert!(
+        git(dir, &["rev-parse", "--verify", "-q", "ORIG_HEAD"]).is_err(),
+        "a rolled-back exec rebase records no ORIG_HEAD"
+    );
     let marker = "rebase --exec command failed";
     let count = out.stderr.matches(marker).count() + out.stdout.matches(marker).count();
     assert_eq!(
@@ -596,6 +610,10 @@ fn rebase_exec_failure_restores_unchanged_tracked_file() -> TestResult {
     )?;
     assert_eq!(out.status, Some(7), "stderr:\n{}", out.stderr);
     assert_eq!(git(dir, &["rev-parse", "HEAD"])?.trim(), tip);
+    assert!(
+        git(dir, &["rev-parse", "--verify", "-q", "ORIG_HEAD"]).is_err(),
+        "a rolled-back exec rebase records no ORIG_HEAD"
+    );
     assert_eq!(
         fs::read_to_string(dir.join("stable.txt"))?,
         "stable\n",
@@ -623,6 +641,10 @@ fn rebase_exec_failure_exit_code_and_refs_unchanged() -> TestResult {
     )?;
     assert_eq!(out.status, Some(7), "stderr:\n{}", out.stderr);
     assert_eq!(git(dir, &["rev-parse", "HEAD"])?.trim(), tip);
+    assert!(
+        git(dir, &["rev-parse", "--verify", "-q", "ORIG_HEAD"]).is_err(),
+        "a rolled-back exec rebase records no ORIG_HEAD"
+    );
     git_fsck_strict(dir)?;
     Ok(())
 }
@@ -649,6 +671,10 @@ fn rebase_exec_forwards_stdout_and_stderr() -> TestResult {
     )?;
     assert_eq!(out.status, Some(7), "stderr:\n{}", out.stderr);
     assert_eq!(git(dir, &["rev-parse", "HEAD"])?.trim(), tip);
+    assert!(
+        git(dir, &["rev-parse", "--verify", "-q", "ORIG_HEAD"]).is_err(),
+        "a rolled-back exec rebase records no ORIG_HEAD"
+    );
     assert!(
         out.stderr.contains("EXEC_STDOUT"),
         "stdout from successful --exec must be forwarded: {}",

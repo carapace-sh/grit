@@ -14,8 +14,8 @@ use grit_lib::repo::Repository;
 use grit_lib::revwalk::history::{
     abort_rebase, absorb, apply_absorb_rewrite, apply_fixup_hunk_selection, apply_fixup_rewrite,
     apply_rewrite, continue_rebase, drop as history_drop, fixup, format_hunk_range_header,
-    move_commit, plan_rebase, plan_rebase_check, plan_rebase_with_hook, reword_with, skip_rebase,
-    split, squash, staged_fixup_paths, start_rebase, undo_last_rewrite, verify_rebase_with_exec,
+    move_commit, plan_rebase, plan_rebase_check, reword_with, skip_rebase, split, squash,
+    staged_fixup_paths, start_rebase, start_rebase_with_exec, undo_last_rewrite,
     verify_rewrite_plan, AbsorbOptions, ApplyOptions, EmptyPolicy, ExecRunRecord, ExecSpec,
     FixupOptions, HistoryError, HunkAssignment, HunkRange, Placement, PreRebase, RebaseCheckPlan,
     RebaseOntoOptions, RebaseOutcome, RebasePlan, RebaseRequest, RebaseSessionError, RefScope,
@@ -1228,99 +1228,69 @@ fn exec_failure_error(
     RebaseExecExit { code: exit_code }.into()
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run_rebase_with_exec(
-    rewrite: &Rewrite,
-    request: &RebaseRequest,
-    rebase_opts: RebaseOntoOptions,
-    pre_rebase: &PreRebase,
-    upstream_oid: ObjectId,
-    onto_oid: Option<ObjectId>,
+    repo: &Repository,
+    start: &StartRebaseOptions,
     exec: &[String],
-    on_err: impl Fn(HistoryError) -> anyhow::Error + Copy,
 ) -> Result<RebaseRunOutcome> {
-    let plan =
-        plan_rebase_with_hook(&rewrite.repo, request, &rebase_opts, pre_rebase).map_err(on_err)?;
-    match plan {
-        RebasePlan::UpToDate => Ok(RebaseRunOutcome::Rebase(RebaseCliOutcome::from_rewrite(
-            HistoryRewriteOutcome::up_to_date("rebase", false),
-        ))),
-        RebasePlan::Conflict {
+    let spec = ExecSpec {
+        commands: exec.to_vec(),
+    };
+    let runner = system_command_runner();
+    let outcome = match start_rebase_with_exec(
+        repo,
+        start,
+        &spec,
+        runner.as_ref(),
+        &mut grit_lib::progress::NullProgress,
+        &grit_lib::progress::NeverCancel,
+    ) {
+        Ok(RebaseOutcome::Done { .. }) => {
+            RebaseCliOutcome::from_rewrite(HistoryRewriteOutcome::up_to_date("rebase", false))
+        }
+        Ok(outcome) => map_rebase_outcome(outcome)?,
+        Err(RebaseSessionError::History(HistoryError::Conflict {
             commit,
             subject,
             conflicts,
             refs,
-        } => Err(json_error::replay_conflict(
-            "rebase",
-            commit,
-            &subject,
-            conflict_paths(conflicts),
-            refs,
-        )),
-        RebasePlan::Plan(mut plan) => {
-            verify_rewrite_plan(&rewrite.repo, &plan).map_err(on_err)?;
-            let spec = ExecSpec {
-                commands: exec.to_vec(),
-            };
-            let runner = system_command_runner();
-            let exec_json = match verify_rebase_with_exec(
-                &rewrite.repo,
-                &mut plan,
-                &spec,
-                &rebase_opts.rewrite,
-                runner.as_ref(),
-            ) {
-                Ok(report) => exec_rows(&report.runs),
-                Err(HistoryError::ExecDirty {
-                    commit,
-                    command,
-                    paths,
-                    runs,
-                }) => {
-                    return Ok(RebaseRunOutcome::Rebase(RebaseCliOutcome::from_exec_dirty(
-                        commit, command, paths, runs,
-                    )));
-                }
-                Err(HistoryError::ExecConflict {
-                    commit,
-                    conflicts,
-                    runs,
-                }) => {
-                    return Ok(RebaseRunOutcome::Rebase(
-                        RebaseCliOutcome::from_exec_conflict(commit, &conflicts, &runs),
-                    ));
-                }
-                Err(HistoryError::ExecFailed {
-                    exit_code,
-                    stdout,
-                    stderr,
-                    completed_runs,
-                    ..
-                }) => {
-                    return Err(exec_failure_error(
-                        exit_code,
-                        &stdout,
-                        &stderr,
-                        &completed_runs,
-                    ));
-                }
-                Err(other) => return Err(on_err(other)),
-            };
-            let effective_onto = onto_oid.unwrap_or(upstream_oid);
-            let message = format!("rebase: onto {}", short(&effective_onto.to_hex()));
-            apply_rewrite(
-                &rewrite.repo,
-                &plan,
-                &rewrite.apply_options("rebase", message)?,
-                &mut grit_lib::progress::NullProgress,
-                &grit_lib::progress::NeverCancel,
-            )
-            .map_err(on_err)?;
-            Ok(RebaseRunOutcome::Rebase(RebaseCliOutcome::from_rewrite(
-                HistoryRewriteOutcome::new("rebase", &plan, false).with_exec(exec_json),
-            )))
+        })) => {
+            return Err(json_error::replay_conflict(
+                "rebase",
+                commit,
+                &subject,
+                conflict_paths(conflicts),
+                refs,
+            ));
         }
-    }
+        Err(RebaseSessionError::History(HistoryError::ExecDirty {
+            commit,
+            command,
+            paths,
+            runs,
+        })) => RebaseCliOutcome::from_exec_dirty(commit, command, paths, runs),
+        Err(RebaseSessionError::History(HistoryError::ExecConflict {
+            commit,
+            conflicts,
+            runs,
+        })) => RebaseCliOutcome::from_exec_conflict(commit, &conflicts, &runs),
+        Err(RebaseSessionError::History(HistoryError::ExecFailed {
+            exit_code,
+            stdout,
+            stderr,
+            completed_runs,
+            ..
+        })) => {
+            return Err(exec_failure_error(
+                exit_code,
+                &stdout,
+                &stderr,
+                &completed_runs,
+            ));
+        }
+        Err(other) => return Err(map_rebase_session_error(other)),
+    };
+    Ok(RebaseRunOutcome::Rebase(outcome))
 }
 
 /// Replay local commits onto a new base (`grit rebase` / `grit history rebase`).
@@ -1451,61 +1421,6 @@ pub fn run_rebase(opts: &RebaseRunOptions<'_>) -> Result<RebaseRunOutcome> {
         if flags.strategy.is_some() {
             bail!("--exec cannot be used with -X");
         }
-        return run_rebase_with_exec(
-            &rewrite,
-            &request,
-            rebase_opts,
-            &pre_rebase,
-            upstream_oid,
-            onto_oid,
-            &flags.exec,
-            on_err,
-        );
-    }
-
-    if flags.strategy.is_some() {
-        let hook = if shared.dry_run {
-            &PreRebase::Skip
-        } else {
-            &pre_rebase
-        };
-        let plan =
-            plan_rebase_with_hook(&rewrite.repo, &request, &rebase_opts, hook).map_err(on_err)?;
-        return match plan {
-            RebasePlan::UpToDate => Ok(RebaseRunOutcome::Rebase(RebaseCliOutcome::from_rewrite(
-                HistoryRewriteOutcome::up_to_date("rebase", shared.dry_run),
-            ))),
-            RebasePlan::Conflict {
-                commit,
-                subject,
-                conflicts,
-                refs,
-            } => Err(json_error::replay_conflict(
-                "rebase",
-                commit,
-                &subject,
-                conflict_paths(conflicts),
-                refs,
-            )),
-            RebasePlan::Plan(plan) => {
-                verify_rewrite_plan(&rewrite.repo, &plan).map_err(on_err)?;
-                if !shared.dry_run {
-                    let effective_onto = onto_oid.unwrap_or(upstream_oid);
-                    let message = format!("rebase: onto {}", short(&effective_onto.to_hex()));
-                    apply_rewrite(
-                        &rewrite.repo,
-                        &plan,
-                        &rewrite.apply_options("rebase", message)?,
-                        &mut grit_lib::progress::NullProgress,
-                        &grit_lib::progress::NeverCancel,
-                    )
-                    .map_err(on_err)?;
-                }
-                Ok(RebaseRunOutcome::Rebase(RebaseCliOutcome::from_rewrite(
-                    HistoryRewriteOutcome::new("rebase", &plan, shared.dry_run),
-                )))
-            }
-        };
     }
 
     let effective_onto = onto_oid.unwrap_or(upstream_oid);
@@ -1516,6 +1431,10 @@ pub fn run_rebase(opts: &RebaseRunOptions<'_>) -> Result<RebaseRunOutcome> {
         apply: rewrite.apply_options("rebase", apply_message)?,
         pre_rebase,
     };
+
+    if !flags.exec.is_empty() {
+        return run_rebase_with_exec(&rewrite.repo, &start_opts, &flags.exec);
+    }
 
     if shared.dry_run {
         let plan = plan_rebase(&rewrite.repo, &start_opts.request, &rebase_opts).map_err(on_err)?;

@@ -42,13 +42,13 @@ Stopping resets the index and worktree to the replayed commits, so grit only sto
 
 The conflict stop state is complete enough for `git` to take over: `git rebase --continue`, `--skip` and `--abort` all work on a rebase grit started (grit writes `author-script`, `stopped-sha` and the current pick in `done`, as git does).
 
-A rebase that replays commits, whether it finishes or stops on conflicts, records the branch's pre-rebase tip in `ORIG_HEAD`, as `git rebase` does. It stays there after the rebase finishes, `--continue`, `--skip` or `--abort`, so `grit reset --hard ORIG_HEAD` undoes a finished rebase. When there is nothing to replay (`Already up to date`), `--check` and `--dry-run`, `ORIG_HEAD` is left alone.
+A rebase that replays commits records the branch's pre-rebase tip in `ORIG_HEAD`, as `git rebase` does. That includes `-X ours|theirs`, `--exec`, a rebase that stops on conflicts, and an `--exec` stop (`exec_dirty` or a replay conflict after an amending command); an `--exec` command that fails rolls everything back and leaves `ORIG_HEAD` alone. It stays there after the rebase finishes, `--continue`, `--skip` or `--abort`, so `grit reset --hard ORIG_HEAD` undoes a finished rebase. When there is nothing to replay (`Already up to date`), `--check` and `--dry-run`, `ORIG_HEAD` is left alone.
 
 A rebase that `git` started (`.git/rebase-merge/` or `.git/rebase-apply/` without `grit-plan`) blocks `grit rebase <upstream>` and [`grit switch`](switch.md). `grit rebase --abort` cancels it: `HEAD` is re-attached to the rebased branch at `orig-head`, the index and worktree are reset, git's state directory is removed, and unresolved rerere records for the abandoned conflict (`MERGE_RR`) are cleared, as `git rebase --abort` does. When git recorded an autostash, grit leaves the rebase alone and asks you to run `git rebase --abort`. `grit rebase --continue` and `--skip` refuse with a pointer to `git rebase --continue` / `--skip`, since only git can resume its own todo list.
 
 `--check` predicts success or conflicts without touching refs, the index, or the worktree (exit **1** when conflicts are predicted, like [`grit merge --check`](merge.md)). It does not start a rebase session.
 
-`-X ours` and `-X theirs` auto-resolve replay conflicts the way `git rebase -X` does. During replay, **ours** is the onto (upstream) side and **theirs** is the commit being replayed — the opposite of everyday merge wording where “ours” is your checked-out branch.
+`-X ours` and `-X theirs` auto-resolve replay conflicts the way `git rebase -X` does. During replay, **ours** is the onto (upstream) side and **theirs** is the commit being replayed — the opposite of everyday merge wording where “ours” is your checked-out branch. A conflict that `-X` cannot resolve (for example a file deleted on one side and modified on the other) stops the rebase like any other conflict, and `--continue` keeps replaying with the same `-X` side.
 
 `--dry-run` still uses the stateless planner only: it lists ref updates without starting a session and without writing objects for a real rebase.
 
