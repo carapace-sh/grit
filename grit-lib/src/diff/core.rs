@@ -4850,6 +4850,8 @@ fn diff_index_to_worktree_inner(
         .get_bool("core.ignorecase")
         .and_then(|r| r.ok())
         .unwrap_or(false);
+    let icase_collisions = ignorecase
+        .then(|| crate::path_icase::IcaseCheckoutCollisionMap::from_index(work_tree, index, true));
     let hash_blobs_without_write = options.hash_blobs_without_write;
 
     let mut result = Vec::new();
@@ -5087,6 +5089,12 @@ fn diff_index_to_worktree_inner(
     poll_diff_cancel_watch(cancel_watch)?;
     visit_blob_lookup_batches(blob_stat_batches, |entry_index, lookup| {
         poll_diff_cancel_watch(cancel_watch)?;
+        if icase_collisions
+            .as_ref()
+            .is_some_and(|map| map.is_auto_stage_loser(&index.entries[entry_index].path))
+        {
+            return Ok(());
+        }
         let path_owned = crate::repo_relpath::storage_string(&index.entries[entry_index].path);
         let path_str_ref = path_owned.as_str();
         if use_fsmonitor_stat_skip {

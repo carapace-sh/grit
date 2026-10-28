@@ -24,7 +24,8 @@ use crate::index::{
 use crate::objects::FileMode;
 use crate::objects::ObjectId;
 use crate::path_icase::{
-    paths_equal, DentrySpellingCache, IcaseIndexCollisionGroups, Stage0IcasePathMap,
+    paths_equal, DentrySpellingCache, IcaseCheckoutCollisionMap, IcaseIndexCollisionGroups,
+    Stage0IcasePathMap,
 };
 use crate::path_validate::{validate_path, EntryMode, PathValidationKind, ProtectOptions};
 use crate::pathspec::{
@@ -435,6 +436,8 @@ fn stage_inner_on_index(
         .get_bool("core.ignorecase")
         .and_then(|r| r.ok())
         .unwrap_or(false);
+    let icase_collisions =
+        ignorecase.then(|| IcaseCheckoutCollisionMap::from_index(work_tree, index, true));
     let mut icase_map = Stage0IcasePathMap::from_index(index, ignorecase);
 
     let staging_pathspecs = normalized_staging_pathspecs(&opts.pathspecs);
@@ -624,6 +627,12 @@ fn stage_inner_on_index(
             {
                 continue;
             }
+            if icase_collisions
+                .as_ref()
+                .is_some_and(|map| map.is_auto_stage_loser(path.as_bytes()))
+            {
+                continue;
+            }
             if plan.remove {
                 if dry_run_list_only {
                     outcome.removed.push(path);
@@ -657,10 +666,11 @@ fn stage_inner_on_index(
         }
     }
 
-    if ignorecase {
+    if let Some(ref icase_collisions) = icase_collisions {
         outcome.modified.extend(stage_ignorecase_spelling_updates(
             work_tree,
             &icase_map,
+            icase_collisions.collision_groups(),
             &matches,
             index,
             dry_run,
@@ -1049,12 +1059,12 @@ fn apply_tracked_stage_plan(
 fn stage_ignorecase_spelling_updates(
     work_tree: &Path,
     icase_map: &Stage0IcasePathMap,
+    collision_groups: &IcaseIndexCollisionGroups,
     matches: &impl Fn(&str) -> bool,
     index: &mut Index,
     dry_run: bool,
     threads: std::num::NonZeroUsize,
 ) -> Result<Vec<String>> {
-    let collision_groups = IcaseIndexCollisionGroups::from_index(index, true);
     let candidates: Vec<&str> = index
         .entries
         .iter()
