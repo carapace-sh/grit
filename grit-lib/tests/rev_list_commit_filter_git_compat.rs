@@ -974,6 +974,11 @@ fn bounded_filter_since_until_matches_git() {
             "main",
         ],
     );
+    assert_rev_list_filter_matches_git(
+        wt,
+        &repo,
+        &["--count", "-n", "0", "--author=Alice", "--since=@0", "main"],
+    );
 }
 
 fn commit_with_committer_timestamps(

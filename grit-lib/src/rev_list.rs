@@ -6839,6 +6839,14 @@ fn try_bounded_commit_filter_limit_list(
         return Ok(None);
     }
     let max_count = options.max_count;
+    if max_count == Some(0) {
+        if options.count {
+            let mut result = rev_list_result_from_commits(Vec::new());
+            result.reachable_commit_count = Some(0);
+            return Ok(Some(result));
+        }
+        return Ok(Some(rev_list_result_from_commits(Vec::new())));
+    }
 
     let mut commit_data = if options.retain_commit_data {
         crate::objects::oid_hash_map_with_capacity(max_count.unwrap_or(64).min(64))
