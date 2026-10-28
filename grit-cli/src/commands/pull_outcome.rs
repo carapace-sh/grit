@@ -204,7 +204,7 @@ fn map_check(check: LibPullCheck) -> PullCheckJson {
 
 impl PullOutcome {
     /// A pull with nothing but `result` and `branch` set.
-    fn bare(result: PullResult, branch: String) -> Self {
+    pub(crate) fn bare(result: PullResult, branch: String) -> Self {
         Self {
             result,
             branch,

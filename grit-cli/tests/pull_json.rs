@@ -16,6 +16,7 @@ const GRIT: &str = env!("CARGO_BIN_EXE_grit");
 
 struct CmdOutput {
     ok: bool,
+    code: i32,
     stdout: String,
     stderr: String,
 }
@@ -30,6 +31,7 @@ fn grit_cmd(dir: &Path, args: &[&str]) -> CmdOutput {
         .expect("spawn grit");
     CmdOutput {
         ok: out.status.success(),
+        code: out.status.code().unwrap_or(-1),
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
     }
@@ -81,7 +83,7 @@ fn pull_json_fast_forward_exit_zero() -> TestResult {
 }
 
 #[test]
-fn pull_json_refused_not_ff_exit_one() -> TestResult {
+fn pull_json_refused_not_ff_exit_128() -> TestResult {
     let root = unique_tmp("pull-json", "refused");
     let upstream = root.join("upstream");
     fs::create_dir_all(&upstream)?;
@@ -95,12 +97,29 @@ fn pull_json_refused_not_ff_exit_one() -> TestResult {
     commit(&client, "b", "local");
     commit(&upstream, "a", "remote");
     git(&client, &["fetch", "-q"]);
+    let head_before = git(&client, &["rev-parse", "HEAD"]);
     let out = grit_cmd(&client, &["--json", "pull", "--ff-only"]);
-    assert!(!out.ok, "ff-only refused must exit 1");
+    assert_eq!(out.code, 128, "ff-only refusal exits 128: {}", out.stderr);
     let json: Value = serde_json::from_str(&out.stdout)?;
     assert_eq!(json["result"], "refused_not_ff");
-    assert!(json["ahead"].as_u64().is_some());
-    assert!(json["behind"].as_u64().is_some());
+    assert_eq!(json["ahead"], 1);
+    assert_eq!(json["behind"], 1);
+    assert_eq!(git(&client, &["rev-parse", "HEAD"]), head_before);
+
+    git(&client, &["config", "pull.ff", "only"]);
+    let out = grit_cmd(&client, &["--json", "pull"]);
+    assert_eq!(
+        out.code, 128,
+        "pull.ff=only refusal exits 128: {}",
+        out.stderr
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&out.stdout)?["result"],
+        "refused_not_ff"
+    );
+
+    let out = grit_cmd(&client, &["pull", "--ff-only"]);
+    assert_eq!(out.code, 128, "human output exits 128 too: {}", out.stderr);
     Ok(())
 }
 
@@ -162,7 +181,7 @@ fn pull_json_conflicts_exit_one() -> TestResult {
     );
     git(&client, &["fetch", "-q"]);
     let out = grit_cmd(&client, &["--json", "pull"]);
-    assert!(!out.ok, "conflicts must exit 1");
+    assert_eq!(out.code, 1, "conflicts must exit 1");
     let json: Value = serde_json::from_str(&out.stdout)?;
     assert_eq!(json["result"], "conflicts");
     assert!(json["conflicts"].as_array().is_some());
@@ -319,7 +338,7 @@ fn pull_rebase_conflict_stops_for_rebase_continue() -> TestResult {
     let local_tip = git(&client, &["rev-parse", "HEAD"]);
 
     let out = grit_cmd(&client, &["--json", "pull", "--rebase"]);
-    assert!(!out.ok, "rebase conflicts must exit 1");
+    assert_eq!(out.code, 1, "rebase conflicts must exit 1");
     let json: Value = serde_json::from_str(&out.stdout)?;
     assert_eq!(json["result"], "conflicts");
     assert_eq!(json["operation"], "rebase");

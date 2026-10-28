@@ -350,21 +350,3 @@ fn refresh_error(err: CheckoutError) -> anyhow::Error {
         other => other.into(),
     }
 }
-
-/// Exit code for `grit pull --check` (0 when up-to-date or fast-forward is possible).
-#[must_use]
-pub fn pull_check_exit_code(outcome: &PullOutcome) -> i32 {
-    if let Some(check) = &outcome.check {
-        if check.fast_forward_possible {
-            return 0;
-        }
-        return 1;
-    }
-    match outcome.result {
-        PullResult::Conflicts
-        | PullResult::RefusedNotFf
-        | PullResult::AutostashConflict
-        | PullResult::RebaseStopped => 1,
-        _ => 0,
-    }
-}
