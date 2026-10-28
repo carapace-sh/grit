@@ -14,6 +14,7 @@ use crate::config::ConfigSet;
 use crate::environment::RepositoryOptions;
 use crate::error::{Error, Result};
 use crate::git_path::{absolute_path_for_gitfile_stored_path, path_for_disk_compare};
+use crate::hooks::run_post_checkout;
 use crate::porcelain::branch::{resolve_create_tracking, TrackMode};
 use crate::porcelain::branch_error::BranchError;
 use crate::porcelain::checkout::checkout_between_trees;
@@ -571,6 +572,10 @@ pub struct PrunedWorktreeEntry {
 /// with discovery placeholders in the admin directory. `no_checkout` still creates
 /// this ref metadata, but leaves the index and tracked files absent.
 ///
+/// After a successful add with checkout, runs the `post-checkout` hook from the
+/// new worktree with a null old object id, the start commit, and flag `1` (same as
+/// Git `worktree add`). The hook is advisory: failures do not roll back the worktree.
+///
 /// # Errors
 ///
 /// Fails when the repository is bare, the path is occupied, the branch is already
@@ -693,6 +698,12 @@ pub fn add_linked_worktree(
             }
             if let Some(mut rollback) = branch_rollback {
                 rollback.commit();
+            }
+            if !opts.no_checkout {
+                if let Some(oid) = start_oid {
+                    let linked = repo.open_linked_worktree(&admin, &wt_path)?;
+                    run_post_checkout(&linked, None, oid, true);
+                }
             }
             Ok(entry)
         }
