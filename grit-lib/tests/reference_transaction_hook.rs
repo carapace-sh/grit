@@ -8,11 +8,11 @@ use std::path::Path;
 use std::process::Command;
 
 use grit_lib::config::environment::RepositoryOptions;
+use grit_lib::error::Error;
+use grit_lib::objects::{HashAlgo, ObjectId};
 use grit_lib::porcelain::add::stage_for_commit;
 use grit_lib::porcelain::commit::{create_commit, CommitRequest};
 use grit_lib::progress::NullProgress;
-use grit_lib::error::Error;
-use grit_lib::objects::{HashAlgo, ObjectId};
 use grit_lib::refs::store::{Expected, RawRef, RefUpdate, RefUpdateFlags};
 use grit_lib::refs::{
     commit_ref_update_on_store, update_branch_for_commit_on_store, BranchCommitRefUpdate,
@@ -181,12 +181,7 @@ fn sha256_initial_commit_hook_uses_wide_null_old_id() {
     install_reference_transaction_hook(&repo, &log, false);
 
     fs::write(&log, "").expect("clear log");
-    stage_for_commit(
-        &repo,
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("stage");
+    stage_for_commit(&repo, &mut NullProgress, &grit_lib::progress::NeverCancel).expect("stage");
     let ident = "T <t@e.x> 1700000000 +0000".to_string();
     create_commit(
         &repo,
@@ -209,7 +204,10 @@ fn sha256_initial_commit_hook_uses_wide_null_old_id() {
         text.contains(&format!("{null} ")),
         "expected 64-hex null old id in hook stdin, got: {text}"
     );
-    assert!(text.contains(" HEAD|") || text.contains(" HEAD\n"), "{text}");
+    assert!(
+        text.contains(" HEAD|") || text.contains(" HEAD\n"),
+        "{text}"
+    );
 }
 
 #[test]
@@ -279,7 +277,10 @@ fn git_output(repo_dir: &Path, args: &[&str]) -> String {
         .output()
         .expect("git");
     assert!(out.status.success(), "git {args:?} failed");
-    String::from_utf8(out.stdout).expect("utf8").trim().to_owned()
+    String::from_utf8(out.stdout)
+        .expect("utf8")
+        .trim()
+        .to_owned()
 }
 
 #[test]
@@ -295,7 +296,10 @@ fn core_hooks_path_is_honored() {
     fs::create_dir_all(&hooks).expect("hooks");
     let log = root.join("rt.log");
     git(&work, &["config", "core.hooksPath", "../alt-hooks"]);
-    let script = format!("#!/bin/sh\n echo \"$1 prepared\" >> {}\n exit 0\n", log.display());
+    let script = format!(
+        "#!/bin/sh\n echo \"$1 prepared\" >> {}\n exit 0\n",
+        log.display()
+    );
     let hook = hooks.join("reference-transaction");
     fs::write(&hook, script).expect("hook");
     fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).expect("chmod");

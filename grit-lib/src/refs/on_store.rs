@@ -7,7 +7,6 @@
 //! [`crate::refs::store::RefTransaction`] with compare-and-swap expectations and reflog entries.
 
 use crate::config::ConfigSet;
-use crate::diff::zero_oid;
 use crate::error::{Error, Result};
 use crate::lockfile::LockWait;
 use crate::objects::ObjectId;

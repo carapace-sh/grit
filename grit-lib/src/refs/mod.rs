@@ -4112,6 +4112,7 @@ impl Drop for DetachedHeadRefLock {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn update_detached_head_for_commit_files_with_reference_transaction_hooks(
     git_dir: &Path,
     expected_old: Option<ObjectId>,
@@ -4128,7 +4129,14 @@ pub(crate) fn update_detached_head_for_commit_files_with_reference_transaction_h
     let lock = DetachedHeadRefLock::acquire(git_dir, expected_old)?;
     if lines.is_empty() {
         let reflog_old = expected_old.unwrap_or_else(crate::diff::zero_oid);
-        return lock.commit(git_dir, new_oid, &reflog_old, identity, reflog_message, config);
+        return lock.commit(
+            git_dir,
+            new_oid,
+            &reflog_old,
+            identity,
+            reflog_message,
+            config,
+        );
     }
     let stdin = stdin_from_lines(lines);
     ctx.run_reference_transaction(ReferenceTransactionPhase::Prepared, &stdin)
