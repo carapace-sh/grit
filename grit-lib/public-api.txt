@@ -1363,6 +1363,16 @@ impl core::marker::Unpin for grit_lib::command_runner::hooks::PrePushRef
 impl core::marker::UnsafeUnpin for grit_lib::command_runner::hooks::PrePushRef
 impl core::panic::unwind_safe::RefUnwindSafe for grit_lib::command_runner::hooks::PrePushRef
 impl core::panic::unwind_safe::UnwindSafe for grit_lib::command_runner::hooks::PrePushRef
+pub struct grit_lib::command_runner::hooks::RefHookContext
+impl core::clone::Clone for grit_lib::command_runner::hooks::RefHookContext
+pub fn grit_lib::command_runner::hooks::RefHookContext::clone(&self) -> Self
+impl core::marker::Freeze for grit_lib::command_runner::hooks::RefHookContext
+impl core::marker::Send for grit_lib::command_runner::hooks::RefHookContext
+impl core::marker::Sync for grit_lib::command_runner::hooks::RefHookContext
+impl core::marker::Unpin for grit_lib::command_runner::hooks::RefHookContext
+impl core::marker::UnsafeUnpin for grit_lib::command_runner::hooks::RefHookContext
+impl !core::panic::unwind_safe::RefUnwindSafe for grit_lib::command_runner::hooks::RefHookContext
+impl !core::panic::unwind_safe::UnwindSafe for grit_lib::command_runner::hooks::RefHookContext
 pub struct grit_lib::command_runner::hooks::RunHookOptions<'a>
 pub grit_lib::command_runner::hooks::RunHookOptions::commit_env: core::option::Option<&'a grit_lib::command_runner::hooks::CommitHookEnv<'a>>
 pub grit_lib::command_runner::hooks::RunHookOptions::cwd: core::option::Option<&'a std::path::Path>
@@ -19351,6 +19361,7 @@ pub grit_lib::refs::store::RefStoreError::GitDirPathIo
 pub grit_lib::refs::store::RefStoreError::GitDirPathIo::operation: grit_lib::error::GitDirPathOperation
 pub grit_lib::refs::store::RefStoreError::GitDirPathIo::os_error: i32
 pub grit_lib::refs::store::RefStoreError::GitDirPathIo::path: alloc::string::String
+pub grit_lib::refs::store::RefStoreError::Hook(grit_lib::refs::store::error::ReferenceTransactionHookErr)
 pub grit_lib::refs::store::RefStoreError::InvalidRefName
 pub grit_lib::refs::store::RefStoreError::InvalidRefName::name: alloc::string::String
 pub grit_lib::refs::store::RefStoreError::InvalidReflog(grit_lib::ident::SignatureError)
