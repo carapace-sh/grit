@@ -64,7 +64,7 @@ With `--allow-empty`, grit records a new commit whose tree matches the parent ev
 
 When a merge is in progress (`MERGE_HEAD` is present) and every conflict is resolved in the index, `grit commit` records a **merge commit** with two parents (your branch tip and the merged tip) and clears merge state the same way Git does after `git commit`.
 
-`pre-commit` and `commit-msg` hooks run before the commit object is written when they are installed (config `hook.*` entries or scripts under the hooks directory). Pass `--no-verify` to skip both; `post-commit` still runs afterward, matching Git. A `pre-commit` or `commit-msg` hook that exits non-zero or cannot be started aborts the commit, and the error names the hook and its exit status (or the OS error). In human mode the hook's output appears on stderr as it runs, followed by the error. With `--json` the failure is a structured error with `kind: "hook_failed"` and a `hook` object carrying `name`, `status`, and the hook's captured `stdout` and `stderr`; `--markdown` prints the error followed by the captured output in `text` blocks. `post-commit` never changes the result: the commit is already written, so a non-zero exit is ignored, and a hook that cannot be started prints a warning on stderr (`hook_not_run`). With `--amend`, grit then runs `post-rewrite amend` with `<old commit> <new commit>` on stdin, as Git does (library callers can skip it with `CommitRequest::post_rewrite`); like `post-commit`, its outcome never changes the result. Dry-run skips all hooks. See [`grit hooks`](hooks.md).
+`pre-commit`, `prepare-commit-msg` and `commit-msg` hooks run, in that order, before the commit object is written when they are installed (config `hook.*` entries or scripts under the hooks directory). `prepare-commit-msg` gets `.git/COMMIT_EDITMSG` and where the message came from: `message` for `-m`, `-F` or the argument, `commit <oid>` when `--amend` or a reused message keeps a commit's message, `merge` when finishing a merge with its `MERGE_MSG`, and `squash` after `grit merge --squash`. Both message hooks may edit the file, and the commit records what they leave. Pass `--no-verify` to skip `pre-commit` and `commit-msg`; `prepare-commit-msg` and `post-commit` still run, matching Git. A `pre-commit`, `prepare-commit-msg` or `commit-msg` hook that exits non-zero or cannot be started aborts the commit, and the error names the hook and its exit status (or the OS error). In human mode the hook's output appears on stderr as it runs, followed by the error. With `--json` the failure is a structured error with `kind: "hook_failed"` and a `hook` object carrying `name`, `status`, and the hook's captured `stdout` and `stderr`; `--markdown` prints the error followed by the captured output in `text` blocks. `post-commit` never changes the result: the commit is already written, so a non-zero exit is ignored, and a hook that cannot be started prints a warning on stderr (`hook_not_run`). With `--amend`, grit then runs `post-rewrite amend` with `<old commit> <new commit>` on stdin, as Git does (library callers can skip it with `CommitRequest::post_rewrite`); like `post-commit`, its outcome never changes the result. Dry-run skips all hooks. See [`grit hooks`](hooks.md).
 
 After a successful commit (not `--dry-run`), grit checks `gc.auto` and `gc.autoPackLimit` like `git commit` does and, once loose objects or packs pile up, starts background maintenance with one stderr line in human mode. See [Automatic maintenance](gc.md#automatic-maintenance).
 
@@ -98,7 +98,7 @@ On an interactive terminal (human output, not `--json`, `--markdown` or `-q`), a
 | `-m`, `--message <message>` | The commit message, as an option. Use either this, the argument, or `--message-file`, not more than one. Optional with `--amend` (keeps the previous message). |
 | `-F`, `--message-file <file\|->` | Read the commit message from a file, or from stdin when the path is `-`. |
 | `--author <ident>` | Author for this commit (`Name <email>` or bare email). Committer unchanged. |
-| `--no-verify` | Skip `pre-commit` and `commit-msg` hooks. |
+| `--no-verify` | Skip `pre-commit` and `commit-msg` hooks (`prepare-commit-msg` still runs). |
 | `--dry-run` | Preview the commit; no objects, refs, hooks, or on-disk index changes. |
 | `-a`, `--all` | Stage every change first, then commit. Conflicts with `--staged` and path arguments. |
 | `--staged` | Commit only what is already in the index (no auto-stage). Conflicts with `-a` and path arguments. |
@@ -111,7 +111,7 @@ On an interactive terminal (human output, not `--json`, `--markdown` or `-q`), a
 | `--dry-run` | Compute the commit tree and file list without writing objects, updating refs, or running hooks. |
 | `-F`, `--message-file <path>` | Read the commit message from a file; use `-` for stdin (same body rules as `-m`). |
 | `--author <author>` | Override the author line (`Name <email>`); committer identity is unchanged unless you also set `GIT_COMMITTER_*`. |
-| `--no-verify` | Skip `pre-commit` and `commit-msg` hooks; `post-commit` still runs on a real commit. |
+| `--no-verify` | Skip `pre-commit` and `commit-msg` hooks; `prepare-commit-msg` and `post-commit` still run on a real commit. |
 
 ## Examples
 
@@ -195,7 +195,7 @@ Pass `--json` for stable, scripting-friendly output:
 | `change_id` | string or null | Stored `change-id` header on the new commit, or null when absent or dry-run (see [Change ids](../library/change-ids/)) |
 | `parents` | array of strings | Parent commit OIDs that would be stored |
 | `author` | object | `name`, `email`, and `date` (RFC 3339, same shape as [`grit log`](../log/) / [`grit show`](../show/)) |
-| `hooks_run` | array of strings | Hook names that ran (`pre-commit`, `commit-msg`, `post-commit`, and `post-rewrite` after `--amend`); empty on dry-run |
+| `hooks_run` | array of strings | Hook names that ran, in order (`pre-commit`, `prepare-commit-msg`, `commit-msg`, `post-commit`, and `post-rewrite` after `--amend`); empty on dry-run |
 
 Example:
 
@@ -287,7 +287,7 @@ $ grit commit -m "fix" --json -- f1.txt
 {"error":"another process holds /work/repo/.git/index.lock; if none is running, remove the stale lock and retry","kind":"lock_held","lock":{"path":"/work/repo/.git/index.lock"}}
 ```
 
-Several `grit commit` processes can run in one checkout at once, for example parallel jobs each committing their own `-- paths`. The index lock serializes them: each one either records a commit with its own message and only its own paths, or fails with `lock_held` and changes nothing. The message always comes from `-m`, `-F` or the positional argument; `.git/COMMIT_EDITMSG` is read back only after a `commit-msg` hook ran, so one process never records another's message. A commit is built on the `HEAD` it read first: if another tool moves the branch before the commit lands, `grit commit` fails with `ref 'refs/heads/<branch>' did not match expected state` (exit `1`) instead of recording a commit that would undo the other change.
+Several `grit commit` processes can run in one checkout at once, for example parallel jobs each committing their own `-- paths`. The index lock serializes them: each one either records a commit with its own message and only its own paths, or fails with `lock_held` and changes nothing. The message always comes from `-m`, `-F` or the positional argument; `.git/COMMIT_EDITMSG` is read back only after a `prepare-commit-msg` or `commit-msg` hook ran, so one process never records another's message. A commit is built on the `HEAD` it read first: if another tool moves the branch before the commit lands, `grit commit` fails with `ref 'refs/heads/<branch>' did not match expected state` (exit `1`) instead of recording a commit that would undo the other change.
 
 
 ## See also

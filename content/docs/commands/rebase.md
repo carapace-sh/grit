@@ -12,12 +12,23 @@ grit rebase [<upstream>]
 grit rebase [--onto <rev>] [<upstream>]
 grit rebase --continue | --abort | --skip
 grit history rebase [<upstream>]
-grit rebase|history rebase … [--check] [-X ours|theirs] [--dry-run] [--exec <cmd>]… [--update-refs=(branches|head)] [--empty=(drop|keep|abort)] [--keep-committer]
+grit rebase|history rebase … [--check] [-X ours|theirs] [--dry-run] [--exec <cmd>]… [--update-refs=(branches|head)] [--empty=(drop|keep|abort)] [--keep-committer] [--no-verify]
 ```
 
 ## Description
 
 `grit rebase` replays commits reachable from `HEAD` but not from `<upstream>` onto `<upstream>` (or onto `--onto` when set). It uses the same history engine as [`grit history`](history.md). When every commit replays cleanly, grit writes new commit objects and updates refs in one batch.
+
+Before it replays anything, grit runs the `pre-rebase` hook with the upstream as you typed it (`pre-rebase main`), or the configured upstream's full ref name (`pre-rebase refs/remotes/origin/main`) when you omitted it, as Git does. It runs once there is something to replay and before any commit is replayed, so a refusal comes before a replay conflict on every path (`-X` and `--exec` included): not when the branch is already up to date, and not for `--check`, `--dry-run`, `--continue`, `--skip` or `--abort`. When the hook exits non-zero, the rebase stops with exit **1** and a `hook_failed` error, and nothing changes. `--no-verify` skips it.
+
+```console
+$ grit rebase main
+error: hook pre-rebase failed with exit status 1
+$ grit rebase main --no-verify
+Rebased 1 commit(s)
+  commit 9c1f2d3 → 4e5a6b7 (feature work)
+  refs/heads/feature 9c1f2d3 → 4e5a6b7
+```
 
 When the rebase moves the branch, grit runs the `post-checkout` hook with Git's arguments, `<old tip> <onto> 1`: Git checks out the onto commit before replaying, and the hook names that commit even though grit applies the rebase in one step. This also happens when a rebase stops on conflicts. When the rebase finishes, grit runs `post-rewrite rebase` with one `<old> <new>` line per replayed commit on stdin, oldest first. Dropped commits, commits already upstream, and fast-forwards are not listed, so a fast-forward rebase runs only `post-checkout`. Unlike Git, grit does not run `post-commit` for each replayed commit. Hook exit statuses never change the result. See [`grit hooks`](hooks.md).
 
@@ -157,6 +168,7 @@ the moved tip and `new` the restored one. An abort of an unmoved branch has no `
 | `--exec` | After each replayed commit is checked out, run `CMD` via `sh -c` in the worktree (repeatable; runs in order at every commit). Requires a clean index and worktree. Incompatible with `--dry-run`, `--check`, and `-X`. Command output goes to stderr. On nonzero command exit, grit restores `HEAD`, the index, and the worktree without moving refs; exit code is the command's exit code. A successful command may amend the replayed commit or add commits on top of it; later commits are replayed onto the result. A successful command that leaves tracked edits stops with `exec_dirty` and preserves them for recovery. |
 | `--check` | Predict success or conflicts without changing refs, index, or worktree (conflicts with `--dry-run`). |
 | `-X ours\|theirs` | Auto-resolve replay conflicts in favor of the onto side (`ours`) or replayed commits (`theirs`). |
+| `--no-verify` | Skip the `pre-rebase` hook. |
 
 ## Examples
 
@@ -277,7 +289,7 @@ On a branch with no commits yet, rebase onto any upstream fails with `branch_no_
 | Code | Meaning |
 | ---: | --- |
 | `0` | Rebase completed, `--check` predicts success, or `--dry-run`. |
-| `1` | Conflicts, successful exec with tracked edits, or other failure. |
+| `1` | Conflicts, successful exec with tracked edits, `pre-rebase` refused (`kind: hook_failed`), or other failure. |
 | `2` | Invalid flags ([`usage`](../exit-codes/)). |
 | *varies* | `--exec` command failure ([`custom`](../exit-codes/)). |
 
