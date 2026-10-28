@@ -2038,6 +2038,7 @@ impl ConfigSet {
             lookup_table: self.pack_write_bitmap_lookup_table(),
             prefer_bitmap_tips: self.pack_prefer_bitmap_tips(),
             verify_reachability_closure: true,
+            reachability_roots: None,
         }
     }
 

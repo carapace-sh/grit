@@ -45,7 +45,7 @@ use crate::objects::{
 };
 use crate::odb::Odb;
 use crate::odb::UnreachablePackRetention;
-use crate::pack_bitmap::{PackBitmapWriteOptions, PackBitmapWriter};
+use crate::pack_bitmap::{PackBitmapWriteError, PackBitmapWriteOptions, PackBitmapWriter};
 use crate::pack_delta::{pack_delta_search_parallel_options, pack_write_parallel_options};
 use crate::pack_name_hash::pack_name_hash_child;
 use crate::pack_object_select::{
@@ -964,6 +964,11 @@ fn repack_detail(repo: &Repository, opts: &RepackOptions) -> Result<RepackDetail
         });
     }
 
+    let pre_repack_packs = if run_incremental {
+        HashSet::new()
+    } else {
+        pack_paths_in_dir(&pack_dir)?
+    };
     let retained_packs = if run_incremental {
         HashSet::new()
     } else {
@@ -1053,13 +1058,23 @@ fn repack_detail(repo: &Repository, opts: &RepackOptions) -> Result<RepackDetail
                 let WriteMultiPackIndexResult { bitmap: _ } =
                     write_multi_pack_index_with_options(&pack_dir, &midx_opts)?;
             } else {
-                let bitmap_opts = PackBitmapWriteOptions::default();
+                let bitmap_opts = PackBitmapWriteOptions {
+                    reachability_roots: Some(roots.clone()),
+                    ..PackBitmapWriteOptions::default()
+                };
                 let now = opts
                     .now
                     .map(offset_to_system_time)
                     .unwrap_or(SystemTime::UNIX_EPOCH);
-                PackBitmapWriter::write(repo, &idx_path, &bitmap_opts, now)
-                    .map_err(|e| Error::CorruptObject(e.to_string()))?;
+                test_inject_repack_pause_before_bitmap(repo.git_dir());
+                match PackBitmapWriter::write(repo, &idx_path, &bitmap_opts, now) {
+                    Ok(_) => {}
+                    Err(PackBitmapWriteError::NotClosed { .. }) => {
+                        // Pack was built from an earlier root snapshot; live tips moved on
+                        // (concurrent receive-pack). Skip the bitmap this run.
+                    }
+                    Err(e) => return Err(Error::CorruptObject(e.to_string())),
+                }
             }
         }
 
@@ -1078,6 +1093,7 @@ fn repack_detail(repo: &Repository, opts: &RepackOptions) -> Result<RepackDetail
                 &reachable,
                 retention,
                 &retained_packs,
+                &pre_repack_packs,
             )?;
         }
 
@@ -1087,7 +1103,12 @@ fn repack_detail(repo: &Repository, opts: &RepackOptions) -> Result<RepackDetail
         report.packs_removed = if opts.incremental {
             0
         } else {
-            remove_superseded_pack_files_retaining(&pack_dir, &pack_path, &retained_packs)?
+            remove_superseded_pack_files_retaining(
+                &pack_dir,
+                &pack_path,
+                &retained_packs,
+                &pre_repack_packs,
+            )?
         };
 
         prune_packed_loose =
@@ -2030,6 +2051,21 @@ fn append_repack_unreachable_retention(
     Ok(())
 }
 
+/// Pack file paths present under `pack_dir` (`.pack` files only).
+fn pack_paths_in_dir(pack_dir: &Path) -> Result<HashSet<PathBuf>> {
+    let Ok(entries) = fs::read_dir(pack_dir) else {
+        return Ok(HashSet::new());
+    };
+    let mut out = HashSet::new();
+    for entry in entries.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if path.extension().is_some_and(|e| e == "pack") {
+            out.insert(path);
+        }
+    }
+    Ok(out)
+}
+
 /// Packs in `pack_dir` without a `.keep` marker, from a single directory read.
 fn count_pack_files(pack_dir: &Path) -> usize {
     let Ok(entries) = fs::read_dir(pack_dir) else {
@@ -2086,6 +2122,7 @@ fn remove_superseded_pack_files_retaining(
     pack_dir: &Path,
     keep_pack: &Path,
     retained_packs: &HashSet<PathBuf>,
+    pre_repack_packs: &HashSet<PathBuf>,
 ) -> Result<usize> {
     let git_dir = crate::git_dir::io_error::git_dir_from_pack_dir(pack_dir);
     let keep_stem = keep_pack
@@ -2120,6 +2157,13 @@ fn remove_superseded_pack_files_retaining(
         }
         let path = entry.path();
         if path.is_file() {
+            let artifact_pack = pack_path_for_sidecar(&path);
+            if artifact_pack
+                .as_ref()
+                .is_none_or(|p| !pre_repack_packs.contains(p))
+            {
+                continue;
+            }
             if pack_has_keep_marker(pack_dir, &path)
                 || path.with_extension("promisor").is_file()
                 || retained_packs.contains(&path.with_extension("pack"))
@@ -2136,6 +2180,18 @@ fn remove_superseded_pack_files_retaining(
         }
     }
     Ok(removed)
+}
+
+fn pack_path_for_sidecar(path: &Path) -> Option<PathBuf> {
+    let name = path.file_name()?.to_str()?;
+    if !(name.starts_with("pack-") || name.starts_with(".pack-")) {
+        return None;
+    }
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("pack") => Some(path.to_path_buf()),
+        Some("idx" | "rev" | "bitmap") => Some(path.with_extension("pack")),
+        _ => None,
+    }
 }
 
 fn pack_has_keep_marker(pack_dir: &Path, path: &Path) -> bool {
@@ -2204,6 +2260,63 @@ pub mod fsck {
 pub mod repository_fsck {
     pub use crate::fsck::*;
 }
+
+#[cfg(test)]
+mod repack_bitmap_pause_inject {
+    use std::sync::{Condvar, Mutex, OnceLock};
+
+    pub struct PauseGate {
+        pub wait: Mutex<bool>,
+        pub cv: Condvar,
+    }
+
+    static PAUSE_BEFORE_BITMAP: OnceLock<Mutex<Option<std::sync::Arc<PauseGate>>>> =
+        OnceLock::new();
+
+    pub fn pause_slot() -> &'static Mutex<Option<std::sync::Arc<PauseGate>>> {
+        PAUSE_BEFORE_BITMAP.get_or_init(|| Mutex::new(None))
+    }
+}
+
+/// Test-only synchronization gate for [`set_test_inject_repack_pause_before_bitmap`].
+#[cfg(test)]
+pub type RepackBitmapPauseGate = std::sync::Arc<repack_bitmap_pause_inject::PauseGate>;
+
+/// Test-only: build a gate for repack bitmap pause injection.
+#[cfg(test)]
+pub fn new_repack_pause_before_bitmap_gate() -> RepackBitmapPauseGate {
+    std::sync::Arc::new(repack_bitmap_pause_inject::PauseGate {
+        wait: std::sync::Mutex::new(false),
+        cv: std::sync::Condvar::new(),
+    })
+}
+
+/// Test-only: pause full repack after installing the new pack, before writing its bitmap.
+#[cfg(test)]
+pub fn set_test_inject_repack_pause_before_bitmap(gate: Option<RepackBitmapPauseGate>) {
+    *repack_bitmap_pause_inject::pause_slot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = gate;
+}
+
+#[cfg(test)]
+fn test_inject_repack_pause_before_bitmap(_git_dir: &Path) {
+    let gate = repack_bitmap_pause_inject::pause_slot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    if let Some(gate) = gate {
+        let mut wait = gate.wait.lock().unwrap_or_else(|e| e.into_inner());
+        *wait = true;
+        gate.cv.notify_all();
+        while *wait {
+            wait = gate.cv.wait(wait).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
+#[cfg(not(test))]
+fn test_inject_repack_pause_before_bitmap(_git_dir: &Path) {}
 
 #[cfg(test)]
 mod tests {
@@ -2740,5 +2853,107 @@ mod tests {
             "full gc must time repack and run pack-refs + commit-graph, got {t:?}"
         );
         assert!(stats.prune_ran, "full gc should run unreachable prune");
+    }
+
+    #[test]
+    fn full_repack_with_bitmap_tolerates_concurrent_push_pack() {
+        use std::io::Write;
+        use std::sync::Arc;
+        use std::thread;
+
+        use crate::environment::RepositoryOptions;
+
+        let tmp = TempDir::new().unwrap();
+        let bare = tmp.path().join("srv.git");
+        git_cmd(tmp.path(), &["init", "--bare", "-b", "main", "srv.git"]);
+        let wt = tmp.path().join("wt");
+        git_cmd(tmp.path(), &["clone", "-q", bare.to_str().unwrap(), "wt"]);
+        git_cmd(&wt, &["commit", "--allow-empty", "-q", "-m", "c1"]);
+        git_cmd(&wt, &["commit", "--allow-empty", "-q", "-m", "c2"]);
+        git_cmd(&wt, &["push", "-q", "origin", "main"]);
+        git_cmd(&bare, &["repack", "-a", "-d"]);
+
+        let gate = new_repack_pause_before_bitmap_gate();
+        set_test_inject_repack_pause_before_bitmap(Some(Arc::clone(&gate)));
+
+        let bare_thread = bare.clone();
+        let worker = thread::spawn(move || {
+            let repo = Repository::discover(Some(&bare_thread), &RepositoryOptions::empty())
+                .expect("open");
+            repack_all(
+                &repo,
+                &RepackOptions {
+                    write_bitmap: true,
+                    keep_unreachable: false,
+                    ..RepackOptions::default()
+                },
+            )
+        });
+
+        let mut paused = gate.wait.lock().unwrap();
+        while !*paused {
+            paused = gate.cv.wait(paused).unwrap();
+        }
+
+        git_cmd(&wt, &["commit", "--allow-empty", "-q", "-m", "concurrent"]);
+        git_cmd(
+            &wt,
+            &[
+                "push",
+                "-q",
+                bare.to_str().unwrap(),
+                "HEAD:refs/heads/concurrent",
+            ],
+        );
+        let oid_hex = std::process::Command::new("git")
+            .current_dir(&wt)
+            .args(["rev-parse", "HEAD"])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .expect("rev-parse")
+            .stdout;
+        let oid_hex = String::from_utf8(oid_hex).expect("utf8").trim().to_string();
+        let pack_prefix = bare.join("objects/pack/push-layer");
+        let mut pack_cmd = std::process::Command::new("git")
+            .current_dir(&bare)
+            .args(["pack-objects", pack_prefix.to_str().expect("utf8 prefix")])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .spawn()
+            .expect("pack-objects");
+        pack_cmd
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(format!("{oid_hex}\n").as_bytes())
+            .expect("write oid");
+        let pack_out = pack_cmd.wait_with_output().expect("pack-objects wait");
+        assert!(
+            pack_out.status.success(),
+            "pack-objects: {:?}",
+            pack_out.stderr
+        );
+        git_cmd(&bare, &["update-ref", "refs/heads/concurrent", &oid_hex]);
+
+        *paused = false;
+        gate.cv.notify_all();
+        drop(paused);
+
+        worker
+            .join()
+            .unwrap()
+            .expect("repack after concurrent push");
+        set_test_inject_repack_pause_before_bitmap(None);
+
+        let pack_dir = bare.join("objects/pack");
+        assert!(
+            count_pack_files(&pack_dir) >= 2,
+            "concurrent receive-pack pack must survive gc repack"
+        );
+        let repo = Repository::discover(Some(&bare), &RepositoryOptions::empty()).expect("open");
+        assert_fsck_clean(&repo);
     }
 }

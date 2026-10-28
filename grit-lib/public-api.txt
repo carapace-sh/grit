@@ -8917,6 +8917,7 @@ pub grit_lib::objects::bitmap::PackBitmapWriteOptions::hash_cache: bool
 pub grit_lib::objects::bitmap::PackBitmapWriteOptions::lookup_table: bool
 pub grit_lib::objects::bitmap::PackBitmapWriteOptions::prefer_bitmap_tips: alloc::vec::Vec<alloc::string::String>
 pub grit_lib::objects::bitmap::PackBitmapWriteOptions::verify_reachability_closure: bool
+pub grit_lib::objects::bitmap::PackBitmapWriteOptions::reachability_roots: core::option::Option<alloc::vec::Vec<grit_lib::objects::ObjectId>>
 impl core::clone::Clone for grit_lib::objects::bitmap::PackBitmapWriteOptions
 pub fn grit_lib::objects::bitmap::PackBitmapWriteOptions::clone(&self) -> Self
 impl core::cmp::Eq for grit_lib::objects::bitmap::PackBitmapWriteOptions
