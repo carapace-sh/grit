@@ -660,6 +660,18 @@ fn patch_id_keeps_insertion_off_final_line_without_newline() {
 }
 
 #[test]
+fn patch_id_hashes_form_feed_and_vertical_tab() {
+    let dir = TempDir::new().unwrap();
+    git_in(dir.path(), &["init", "-q", "-b", "main"]);
+    std::fs::write(dir.path().join("f"), "keep\n8 | 4\x0c+\nv\x0bt\n").unwrap();
+    git_in(dir.path(), &["add", "f"]);
+    git_in(dir.path(), &["commit", "-qm", "base"]);
+    std::fs::write(dir.path().join("f"), "keep\n8 | 4\u{240c}+\nvt\n").unwrap();
+    git_in(dir.path(), &["commit", "-qam", "visible control pictures"]);
+    assert_patch_id_matches_normal_patch(dir.path(), &[], "form feed and vertical tab");
+}
+
+#[test]
 fn patch_id_equivalence_ignores_distant_context_but_keeps_nearby_context() {
     let mut ids = Vec::new();
     for (distant, nearby) in [

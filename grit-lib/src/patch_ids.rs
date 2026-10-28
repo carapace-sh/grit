@@ -291,11 +291,19 @@ fn text_flush_one_hunk(
     }
 }
 
-/// Hash `raw` bytes into `ctx`, skipping ASCII whitespace.
+/// Whether patch-ID hashing drops `b`: space, tab, LF and CR only.
 ///
-/// Returns the number of non-whitespace bytes fed to the hasher.
+/// Form feed and vertical tab are kept, so a line differing only by one hashes differently,
+/// as in `git patch-id`.
+fn is_patch_id_space(b: &u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | b'\r')
+}
+
+/// Hash `raw` bytes into `ctx`, skipping [`is_patch_id_space`] bytes.
+///
+/// Returns the number of bytes fed to the hasher.
 fn hash_without_whitespace(ctx: &mut ChecksumHasher, raw: &[u8]) -> usize {
-    raw.split(u8::is_ascii_whitespace)
+    raw.split(is_patch_id_space)
         .filter(|run| !run.is_empty())
         .map(|run| {
             ctx.update(run);
@@ -892,14 +900,14 @@ fn patch_id_hash_text_hunks(ctx: &mut ChecksumHasher, old_str: &str, new_str: &s
     }
 }
 
-/// Strip ASCII whitespace in-place; returns new length (prefix of `buf` is valid).
+/// Strip [`is_patch_id_space`] bytes in-place; returns new length (prefix of `buf` is valid).
 fn remove_space_bytes(buf: &mut [u8]) -> usize {
     let mut dst = 0usize;
     let mut src = 0usize;
     while src < buf.len() {
         let c = buf[src];
         src += 1;
-        if !c.is_ascii_whitespace() {
+        if !is_patch_id_space(&c) {
             buf[dst] = c;
             dst += 1;
         }
@@ -1020,6 +1028,19 @@ mod tests {
         let mut ctx = ChecksumHasher::new(HashAlgo::Sha1);
         assert_eq!(hash_without_whitespace(&mut ctx, b" \t+a b\r\nc  \n"), 4);
         assert_eq!(ctx.finalize(), HashAlgo::Sha1.checksum_digest(b"+abc"));
+    }
+
+    #[test]
+    fn hash_without_whitespace_keeps_form_feed_and_vertical_tab() {
+        let mut ctx = ChecksumHasher::new(HashAlgo::Sha1);
+        assert_eq!(hash_without_whitespace(&mut ctx, b"+4\x0c+ \x0b\n"), 5);
+        assert_eq!(
+            ctx.finalize(),
+            HashAlgo::Sha1.checksum_digest(b"+4\x0c+\x0b")
+        );
+        let mut path = *b"a/\x0cf b";
+        assert_eq!(remove_space_bytes(&mut path), 5);
+        assert_eq!(&path[..5], b"a/\x0cfb");
     }
 
     #[cfg_attr(

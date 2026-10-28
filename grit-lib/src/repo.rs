@@ -1248,7 +1248,9 @@ impl Repository {
     /// and the indent heuristic, three context lines on each side), matching
     /// `git show --format= --no-ext-diff` piped to `git patch-id` in the
     /// selected mode, including where an ambiguous insertion or deletion is
-    /// placed. Only context inside those hunks contributes to the ID.
+    /// placed. Only context inside those hunks contributes to the ID. Stable
+    /// and unstable modes drop spaces, tabs, CR and LF before hashing; form
+    /// feed and vertical tab still count.
     ///
     /// # Errors
     ///
