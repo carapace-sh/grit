@@ -953,10 +953,17 @@ fn index_matches_target_tree_entry(
         .is_some_and(|entry| entry.oid == target.oid && entry.mode == target.mode)
 }
 
-/// True when a gitlink worktree's checked-out HEAD already matches the branch being switched to.
-fn gitlink_worktree_head_matches_target(entry: &DiffEntry, target: TargetTreeEntry) -> bool {
-    use crate::index::MODE_GITLINK;
-    target.mode == MODE_GITLINK && entry.new_oid == target.oid
+/// True when `entry` is a submodule directory that drifted from its index gitlink (another
+/// commit checked out, dirty files, or files inside an uninitialized submodule) and the target
+/// tree still has a gitlink there.
+///
+/// Like Git, such drift is not a local edit the transition would overwrite: the index gitlink
+/// still advances to the target commit, and checkout leaves the directory as it is.
+fn gitlink_drift_survives_gitlink_target(entry: &DiffEntry, target: TargetTreeEntry) -> bool {
+    target.mode == MODE_GITLINK
+        && entry.status == DiffStatus::Modified
+        && entry.old_mode.bits() == MODE_GITLINK
+        && entry.new_mode.bits() == MODE_GITLINK
 }
 
 /// Failure while verifying a tree transition without overwriting local edits.
@@ -1222,10 +1229,11 @@ pub(crate) fn ensure_local_changes_compatible_with_switch(
             }
         }
         if let Some(target) = target_by_path.get(path) {
-            if index_matches_target_tree_entry(index, path, *target)
-                || gitlink_worktree_head_matches_target(entry, *target)
-            {
+            if index_matches_target_tree_entry(index, path, *target) {
                 preserve_worktree_paths.insert(path.to_owned());
+                continue;
+            }
+            if gitlink_drift_survives_gitlink_target(entry, *target) {
                 continue;
             }
         }
@@ -1259,6 +1267,75 @@ mod tests {
         let repo = init_repository(dir.path(), false, "main", None, RefStorageFormat::Files)
             .expect("init");
         (dir, repo)
+    }
+
+    #[test]
+    fn gitlink_drift_advances_index_but_typechange_and_staged_drift_block() {
+        use crate::objects::FileMode;
+
+        let oid = |byte: u8| ObjectId::from_bytes(&[byte; 20]).expect("oid");
+        let entry = |status, old_mode, new_mode, old_oid, new_oid| DiffEntry {
+            status,
+            old_path: Some("sub".into()),
+            new_path: Some("sub".into()),
+            old_mode,
+            new_mode,
+            old_oid,
+            new_oid,
+            score: None,
+        };
+        let bump = entry(
+            DiffStatus::Modified,
+            FileMode::GITLINK,
+            FileMode::GITLINK,
+            oid(1),
+            oid(2),
+        );
+        let work_tree = std::path::Path::new("/nonexistent");
+        let index = Index::default();
+        let check = |staged: &[DiffEntry], unstaged: &[DiffEntry]| {
+            ensure_local_changes_compatible_with_switch(
+                work_tree,
+                &index,
+                staged,
+                unstaged,
+                std::slice::from_ref(&bump),
+                &HashSet::new(),
+            )
+        };
+
+        for checked_out in [oid(2), oid(3), ObjectId::zero()] {
+            let drift = entry(
+                DiffStatus::Modified,
+                FileMode::GITLINK,
+                FileMode::GITLINK,
+                oid(1),
+                checked_out,
+            );
+            let preserved = check(&[], &[drift]).expect("gitlink drift must not block");
+            assert!(
+                preserved.is_empty(),
+                "the index gitlink must still advance, so the path is not preserved"
+            );
+        }
+
+        let typechange = entry(
+            DiffStatus::TypeChanged,
+            FileMode::GITLINK,
+            FileMode::REGULAR,
+            oid(1),
+            oid(4),
+        );
+        assert_eq!(check(&[], &[typechange]), Err(vec!["sub".to_owned()]));
+
+        let staged = entry(
+            DiffStatus::Modified,
+            FileMode::GITLINK,
+            FileMode::GITLINK,
+            oid(1),
+            oid(3),
+        );
+        assert_eq!(check(&[staged], &[]), Err(vec!["sub".to_owned()]));
     }
 
     #[test]
