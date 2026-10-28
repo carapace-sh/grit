@@ -425,17 +425,7 @@ fn count_substr(haystack: &[u8], needle: &[u8]) -> usize {
     if needle.is_empty() {
         return 0;
     }
-    let mut count = 0usize;
-    let mut start = 0usize;
-    while start + needle.len() <= haystack.len() {
-        if haystack[start..].starts_with(needle) {
-            count += 1;
-            start += needle.len();
-        } else {
-            start += 1;
-        }
-    }
-    count
+    memchr::memmem::find_iter(haystack, needle).count()
 }
 
 fn blob_side(odb: &crate::odb::Odb, mode: FileMode, oid: &ObjectId) -> Result<(SideBytes, bool)> {
@@ -469,4 +459,27 @@ fn line_grep_match(old_text: &str, new_text: &str, regex: &PosixEre) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn literal_counts_do_not_overlap() {
+        assert_eq!(count_occurrences(b"aaaa", "aa", false, None), 2);
+        assert_eq!(count_occurrences(b"aaa", "aa", false, None), 1);
+        assert_eq!(count_occurrences(b"abcabc", "abc", false, None), 2);
+        assert_eq!(count_occurrences(b"abc", "", false, None), 0);
+        assert_eq!(count_occurrences(b"", "a", false, None), 0);
+    }
+
+    #[test]
+    fn ignore_case_counts_fold_both_sides() {
+        assert_eq!(count_occurrences(b"Needle NEEDLE", "needle", true, None), 2);
+        assert_eq!(
+            count_occurrences(b"Needle NEEDLE", "needle", false, None),
+            0
+        );
+    }
 }
