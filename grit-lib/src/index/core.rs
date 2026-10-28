@@ -25,7 +25,7 @@ use crate::hash::verify_trailer;
 
 use crate::config::ConfigSet;
 use crate::error::{Error, Result};
-use crate::lockfile::pid_path_for_lock;
+use crate::lockfile::{grit_lockfile_pid_enabled, pid_path_for_lock};
 use crate::objects::{parse_tree, HashAlgo, ObjectId, ObjectKind, TreeEntry};
 use crate::odb::Odb;
 use crate::repo::Repository;
@@ -1591,21 +1591,22 @@ impl Index {
 
         let tmp_path = path.with_extension("lock");
         let pid_path = pid_path_for_lock(&tmp_path);
-        let lockfile_pid_enabled = lockfile_pid_enabled(path, config);
+        let lockfile_pid_enabled = grit_lockfile_pid_enabled(config, path.parent());
 
         use crate::lockfile::{LockFile, LockWait};
         let wait = LockWait::files_ref_lock(config);
-        let (tmp_path, mut lock_file) =
-            LockFile::acquire(&tmp_path, wait).and_then(LockFile::into_open_file)?;
-
-        let mut wrote_pid_file = false;
+        let mut lock_file = LockFile::acquire(&tmp_path, wait).map_err(Error::from)?;
         if lockfile_pid_enabled {
-            if let Err(e) = write_lock_pid_file(&pid_path) {
-                let _ = fs::remove_file(&tmp_path);
-                return Err(Error::Io(e));
+            if let Err(e) = lock_file
+                .write_holder_pid()
+                .map_err(crate::error::Error::from)
+            {
+                lock_file.rollback();
+                return Err(e);
             }
-            wrote_pid_file = true;
         }
+        let wrote_pid_file = lockfile_pid_enabled;
+        let (tmp_path, mut lock_file) = lock_file.into_open_file()?;
 
         if let Err(e) =
             write_index_body_and_trailer(&mut lock_file, self.hash_algo, skip_hash, &body)
@@ -3810,36 +3811,6 @@ fn flatten_tree_blobs(
     Ok(out)
 }
 
-fn lockfile_pid_enabled(index_path: &Path, config: Option<&ConfigSet>) -> bool {
-    let git_dir = match index_path.parent() {
-        Some(dir) => dir,
-        None => return false,
-    };
-
-    let cfg = config.cloned().unwrap_or_else(|| {
-        ConfigSet::load(
-            &crate::environment::Environment::empty(),
-            Some(git_dir),
-            true,
-        )
-        .unwrap_or_default()
-    });
-    cfg.get_bool("core.lockfilepid")
-        .and_then(|res| res.ok())
-        .unwrap_or(false)
-}
-
-fn write_lock_pid_file(pid_path: &Path) -> io::Result<()> {
-    use std::io::Write as _;
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(pid_path)?;
-    writeln!(file, "pid {}", std::process::id())?;
-    Ok(())
-}
-
 /// Exclusive `.git/index.lock` held for a mutating porcelain operation.
 ///
 /// Acquire with [`Self::acquire`] before changing the working tree; persist the index with
@@ -3890,21 +3861,22 @@ impl IndexLock {
     pub fn acquire(index_path: &Path, config: Option<&ConfigSet>) -> Result<Self> {
         let lock_path = index_path.with_extension("lock");
         let pid_path = pid_path_for_lock(&lock_path);
-        let lockfile_pid_enabled = lockfile_pid_enabled(index_path, config);
+        let lockfile_pid_enabled = grit_lockfile_pid_enabled(config, index_path.parent());
 
         use crate::lockfile::{LockFile, LockWait};
         let wait = LockWait::files_ref_lock(config);
-        let (lock_path, file) =
-            LockFile::acquire(&lock_path, wait).and_then(LockFile::into_open_file)?;
-
-        let mut wrote_pid = false;
+        let mut lock_file = LockFile::acquire(&lock_path, wait).map_err(Error::from)?;
         if lockfile_pid_enabled {
-            write_lock_pid_file(&pid_path).map_err(|e| {
-                let _ = fs::remove_file(&lock_path);
-                Error::Io(e)
-            })?;
-            wrote_pid = true;
+            if let Err(e) = lock_file
+                .write_holder_pid()
+                .map_err(crate::error::Error::from)
+            {
+                lock_file.rollback();
+                return Err(e);
+            }
         }
+        let wrote_pid = lockfile_pid_enabled;
+        let (lock_path, file) = lock_file.into_open_file()?;
 
         Ok(Self {
             index_path: index_path.to_path_buf(),

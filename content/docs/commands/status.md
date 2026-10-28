@@ -55,7 +55,7 @@ A `grit rebase` or `grit history` edit that is killed after moving branches but 
 
 - **Finished the checkout.** The branches had already moved, so status puts back the files the interrupted checkout was writing and checks out the rewritten commit again. The rebase stands. Unrelated local edits are kept.
 - **Rolled back.** When that checkout cannot finish (or for an interrupted `history fixup` or `absorb`), branches, index and files go back to where they were before the command. Status still succeeds.
-- **Pending.** Another process holds `.git/index.lock`, so nothing is touched yet. If the lock belongs to a process that no longer runs (recorded with `core.lockfilePid`), status removes it and recovers. Otherwise, run `grit status` again after that process exits, or delete the lock when you know nothing owns it.
+- **Pending.** Another process holds `.git/index.lock`, so nothing is touched yet. When grit wrote a pid sidecar for that lock (default for grit-owned locks) and the recorded process has exited, the next status removes the stale lock and recovers. When no sidecar exists (for example `core.lockfilePid=false` or a foreign Git lock), the message notes the lock may be stale; run status again after the holder exits, or remove the lock only when nothing else is using the repository.
 
 `--json` reports the outcome in `interrupted_rewrite`. The line and the field appear only on the run that finished or rolled back the work, and on every run while it is pending.
 

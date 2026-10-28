@@ -183,6 +183,7 @@ pub struct LockFile {
     commit_path: Option<PathBuf>,
     file: Option<File>,
     committed: bool,
+    wrote_holder_pid: bool,
 }
 
 impl LockFile {
@@ -253,6 +254,7 @@ impl LockFile {
             commit_path: None,
             file: Some(file),
             committed: false,
+            wrote_holder_pid: false,
         })
     }
 
@@ -340,7 +342,24 @@ impl LockFile {
             path: self.lock_path.clone(),
             source,
         })?;
+        self.remove_holder_pid_sidecar();
         self.committed = true;
+        Ok(())
+    }
+
+    /// Record this process as the holder of [`Self::lock_path`] in a Git-compatible pid sidecar.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LockError::Io`] when the sidecar cannot be written.
+    pub fn write_holder_pid(&mut self) -> Result<(), LockError> {
+        write_lock_pid_file(&pid_path_for_lock(&self.lock_path)).map_err(|source| {
+            LockError::Io {
+                path: self.lock_path.clone(),
+                source,
+            }
+        })?;
+        self.wrote_holder_pid = true;
         Ok(())
     }
 
@@ -351,7 +370,14 @@ impl LockFile {
         }
         drop(self.file.take());
         let _ = fs::remove_file(&self.lock_path);
+        self.remove_holder_pid_sidecar();
         self.committed = true;
+    }
+
+    fn remove_holder_pid_sidecar(&self) {
+        if self.wrote_holder_pid {
+            let _ = fs::remove_file(pid_path_for_lock(&self.lock_path));
+        }
     }
 
     /// Close this handle but leave the lock file on disk (mutex-only locks).
@@ -389,6 +415,7 @@ impl Drop for LockFile {
         }
         drop(self.file.take());
         let _ = fs::remove_file(&self.lock_path);
+        self.remove_holder_pid_sidecar();
     }
 }
 
@@ -479,16 +506,86 @@ impl LockHolder {
             running: is_process_running(pid),
         })
     }
+
+    /// Remove `lock_path` and its pid sidecar when [`Self::read`] reports a dead holder.
+    ///
+    /// Returns `true` when both files were removed (or were already absent after the lock).
+    /// Returns `false` when there is no sidecar, the holder is still running, or the sidecar
+    /// looks left over from an earlier holder (lock file newer than the sidecar).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::Error`] when metadata or removal fails for reasons other than
+    /// [`io::ErrorKind::NotFound`].
+    pub fn remove_if_stale(lock_path: &Path) -> io::Result<bool> {
+        let Some(holder) = Self::read(lock_path) else {
+            return Ok(false);
+        };
+        if holder.running {
+            return Ok(false);
+        }
+        let pid_path = pid_path_for_lock(lock_path);
+        if lock_path.is_file() && pid_path.is_file() {
+            let lock_mtime = fs::metadata(lock_path)?.modified()?;
+            let pid_mtime = fs::metadata(&pid_path)?.modified()?;
+            if lock_mtime > pid_mtime {
+                return Ok(false);
+            }
+        }
+        for path in [lock_path, &pid_path] {
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(true)
+    }
+}
+
+/// Whether grit writes pid sidecars for locks it creates.
+///
+/// Honors an explicit `core.lockfilePid=false`. When unset, grit defaults to `true` so crash
+/// recovery can detect stale index locks without requiring Git's opt-in.
+///
+/// When `config` is `None`, values are loaded from `git_dir` when provided.
+#[must_use]
+pub fn grit_lockfile_pid_enabled(config: Option<&ConfigSet>, git_dir: Option<&Path>) -> bool {
+    fn from_config(cfg: &ConfigSet) -> bool {
+        match cfg.get_bool("core.lockfilepid") {
+            Some(Ok(false)) => false,
+            Some(Ok(true)) | Some(Err(_)) | None => true,
+        }
+    }
+    if let Some(cfg) = config {
+        return from_config(cfg);
+    }
+    if let Some(dir) = git_dir {
+        if let Ok(cfg) = ConfigSet::load(&Environment::empty(), Some(dir), true) {
+            return from_config(&cfg);
+        }
+    }
+    true
 }
 
 /// Path of the pid sidecar for `lock_path` (`name.lock` → `name~pid.lock`).
-pub(crate) fn pid_path_for_lock(lock_path: &Path) -> PathBuf {
+pub fn pid_path_for_lock(lock_path: &Path) -> PathBuf {
     let file_name = lock_path
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "index.lock".to_owned());
     let base = file_name.strip_suffix(".lock").unwrap_or(&file_name);
     lock_path.with_file_name(format!("{base}~pid.lock"))
+}
+
+pub(crate) fn write_lock_pid_file(pid_path: &Path) -> io::Result<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(pid_path)?;
+    writeln!(file, "pid {}", std::process::id())?;
+    Ok(())
 }
 
 fn read_lock_pid(pid_path: &Path) -> Option<u64> {
@@ -646,6 +743,24 @@ mod tests {
             pid_path_for_lock(Path::new("/r/odd")),
             Path::new("/r/odd~pid.lock")
         );
+    }
+
+    #[test]
+    fn remove_if_stale_skips_when_lock_is_newer_than_sidecar() {
+        use std::thread;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("index.lock");
+        fs::write(&lock_path, b"").unwrap();
+        let pid_path = pid_path_for_lock(&lock_path);
+        fs::write(&pid_path, "pid 999999999\n").unwrap();
+        thread::sleep(Duration::from_millis(20));
+        fs::write(&lock_path, b"replaced").unwrap();
+
+        assert!(!LockHolder::remove_if_stale(&lock_path).unwrap());
+        assert!(lock_path.is_file());
+        assert!(pid_path.is_file());
     }
 
     #[test]

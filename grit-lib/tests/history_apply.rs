@@ -998,6 +998,49 @@ fn status_finishes_interrupted_rewrite_apply_and_reports_it() {
 }
 
 #[test]
+fn interrupted_rewrite_apply_recovers_after_simulated_kill9_with_default_pid_sidecar() {
+    let (repo, plan) = interrupted_partial_checkout();
+    let wt = repo.worktree();
+    let grit = open_grit(wt);
+    let index_path = wt.join(".git/index");
+    let lock = grit_lib::index::IndexLock::acquire(&index_path, None)
+        .expect("simulate grit holding index.lock mid-checkout");
+    std::mem::forget(lock);
+    assert!(wt.join(".git/index.lock").is_file());
+    assert!(wt.join(".git/index~pid.lock").is_file());
+    // kill -9 leaves the lock and sidecar but the holder is gone.
+    fs::write(wt.join(".git/index~pid.lock"), "pid 999999999\n").expect("dead holder");
+
+    let recovery = recover_interrupted_rewrite_apply(&grit)
+        .expect("recover")
+        .expect("recovery outcome");
+    assert_eq!(
+        recovery,
+        grit_lib::revwalk::history::RewriteApplyRecovery::FinishedCheckout
+    );
+    assert_finished_partial_checkout(wt, &plan);
+}
+
+#[test]
+fn interrupted_rewrite_apply_with_lockfile_pid_disabled_leaves_foreign_lock() {
+    let (repo, plan) = interrupted_partial_checkout();
+    let wt = repo.worktree();
+    git(wt, &["config", "core.lockfilePid", "false"]);
+    fs::write(wt.join(".git/index.lock"), "").expect("lock without sidecar");
+    let grit = open_grit(wt);
+    let err = recover_interrupted_rewrite_apply(&grit).expect_err("foreign lock");
+    let grit_lib::revwalk::history::HistoryError::Library(inner) = &err else {
+        panic!("unexpected error {err:?}");
+    };
+    assert!(matches!(&**inner, grit_lib::error::Error::LockHeld { .. }));
+    assert_eq!(
+        git_rev_parse(wt, "refs/heads/main"),
+        Some(plan.ref_updates[0].new)
+    );
+    assert!(wt.join(".git/index.lock").exists());
+}
+
+#[test]
 fn interrupted_rewrite_apply_removes_stale_index_lock_of_dead_holder() {
     let (repo, plan) = interrupted_partial_checkout();
     let wt = repo.worktree();

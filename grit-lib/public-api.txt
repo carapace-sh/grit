@@ -7596,6 +7596,7 @@ pub fn grit_lib::lockfile::LockFile::detach(self)
 pub fn grit_lib::lockfile::LockFile::lock_path(&self) -> &std::path::Path
 pub fn grit_lib::lockfile::LockFile::rollback(self)
 pub fn grit_lib::lockfile::LockFile::with_commit_target(self, &std::path::Path) -> Self
+pub fn grit_lib::lockfile::LockFile::write_holder_pid(&mut self) -> core::result::Result<(), grit_lib::lockfile::LockError>
 impl core::io::write::Write for grit_lib::lockfile::LockFile
 pub fn grit_lib::lockfile::LockFile::flush(&mut self) -> core::io::error::Result<()>
 pub fn grit_lib::lockfile::LockFile::write(&mut self, &[u8]) -> core::io::error::Result<usize>
@@ -7613,6 +7614,7 @@ pub grit_lib::lockfile::LockHolder::pid: u64
 pub grit_lib::lockfile::LockHolder::running: bool
 impl grit_lib::lockfile::LockHolder
 pub fn grit_lib::lockfile::LockHolder::read(&std::path::Path) -> core::option::Option<Self>
+pub fn grit_lib::lockfile::LockHolder::remove_if_stale(&std::path::Path) -> core::io::error::Result<bool>
 impl core::clone::Clone for grit_lib::lockfile::LockHolder
 pub fn grit_lib::lockfile::LockHolder::clone(&self) -> Self
 impl core::cmp::Eq for grit_lib::lockfile::LockHolder
@@ -7629,6 +7631,8 @@ impl core::marker::Unpin for grit_lib::lockfile::LockHolder
 impl core::marker::UnsafeUnpin for grit_lib::lockfile::LockHolder
 impl core::panic::unwind_safe::RefUnwindSafe for grit_lib::lockfile::LockHolder
 impl core::panic::unwind_safe::UnwindSafe for grit_lib::lockfile::LockHolder
+pub fn grit_lib::lockfile::grit_lockfile_pid_enabled(core::option::Option<&grit_lib::config::ConfigSet>, core::option::Option<&std::path::Path>) -> bool
+pub fn grit_lib::lockfile::pid_path_for_lock(&std::path::Path) -> std::path::PathBuf
 pub struct grit_lib::lockfile::SystemLockClock
 impl core::clone::Clone for grit_lib::lockfile::SystemLockClock
 pub fn grit_lib::lockfile::SystemLockClock::clone(&self) -> Self

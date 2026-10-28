@@ -21,6 +21,7 @@ use serde::Serialize;
 use std::io::Write;
 
 use crate::context::{self, CommitSummary};
+use crate::json_error::LockHolderJson;
 use crate::markdown;
 use crate::output::{
     change_json, outln, ChangeJson, CommitJson, HumanRender, MarkdownRender, RenderContext,
@@ -141,6 +142,9 @@ pub struct StatusOutcome {
     #[serde(skip)]
     #[schemars(skip)]
     short_lines: Vec<String>,
+    #[serde(skip)]
+    #[schemars(skip)]
+    interrupted_rewrite_lock_holder: Option<LockHolderJson>,
 }
 
 /// Recovery of an interrupted rebase or history edit, in `--json` output.
@@ -167,13 +171,23 @@ impl From<InterruptedRewrite> for InterruptedRewriteJson {
 
 impl InterruptedRewriteJson {
     /// One line for human and Markdown output; `lock` is how the index lock path is shown.
-    fn sentence(self, lock: &str) -> String {
+    fn sentence(self, lock: &str, holder: Option<&LockHolderJson>) -> String {
         match self {
             Self::FinishedCheckout => "Finished the checkout of an interrupted rebase or history edit; HEAD stays on the rewritten commits.".to_owned(),
             Self::RolledBack => "Rolled back an interrupted rebase or history edit; refs, index and files are back to where they were.".to_owned(),
-            Self::Pending => format!(
-                "An interrupted rebase or history edit is pending: another process holds {lock}. Run grit status again once it exits."
-            ),
+            Self::Pending => match holder {
+                Some(h) if h.running => format!(
+                    "An interrupted rebase or history edit is pending: process {} holds {lock}. Run grit status again once it exits.",
+                    h.pid
+                ),
+                Some(h) => format!(
+                    "An interrupted rebase or history edit is pending: {lock} is held but process {} has exited; run grit status again to recover.",
+                    h.pid
+                ),
+                None => format!(
+                    "An interrupted rebase or history edit is pending: {lock} is held and no grit process id was recorded; the lock may be stale (another tool or core.lockfilePid=false). Run grit status again once nothing else is using the repository."
+                ),
+            },
         }
     }
 }
@@ -215,7 +229,14 @@ impl HumanRender for StatusOutcome {
             return Ok(());
         }
         if let Some(outcome) = self.interrupted_rewrite {
-            outln!(w, "{}", outcome.sentence(".git/index.lock"));
+            outln!(
+                w,
+                "{}",
+                outcome.sentence(
+                    ".git/index.lock",
+                    self.interrupted_rewrite_lock_holder.as_ref()
+                )
+            );
             outln!(w);
         }
         self.render_header(w, ctx)?;
@@ -233,7 +254,14 @@ impl MarkdownRender for StatusOutcome {
             return Ok(());
         }
         if let Some(outcome) = self.interrupted_rewrite {
-            outln!(w, "> {}", outcome.sentence("`.git/index.lock`"));
+            outln!(
+                w,
+                "> {}",
+                outcome.sentence(
+                    "`.git/index.lock`",
+                    self.interrupted_rewrite_lock_holder.as_ref()
+                )
+            );
             outln!(w);
         }
         self.render_markdown_header(w, ctx)?;
@@ -851,6 +879,17 @@ pub fn run(args: &StatusCliArgs) -> Result<StatusOutcome> {
     let integration_hint = standing.branch.as_deref().and_then(|branch| {
         grit_lib::refs::branch_tracking::status_integration_hint(&standing, Some((&repo, branch)))
     });
+    let interrupted_rewrite_lock_holder = model
+        .interrupted_rewrite
+        .as_ref()
+        .filter(|outcome| matches!(outcome, InterruptedRewrite::Pending))
+        .and_then(|_| {
+            let lock_path = repo.git_dir().join("index.lock");
+            grit_lib::lockfile::LockHolder::read(&lock_path).map(|h| LockHolderJson {
+                pid: h.pid,
+                running: h.running,
+            })
+        });
     Ok(StatusOutcome {
         branch,
         detached: matches!(model.head, HeadState::Detached { .. }),
@@ -883,6 +922,7 @@ pub fn run(args: &StatusCliArgs) -> Result<StatusOutcome> {
         integration_hint,
         short_format: args.short,
         short_lines,
+        interrupted_rewrite_lock_holder,
     })
 }
 

@@ -11,7 +11,7 @@ use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 
 use crate::index::IndexLock;
-use crate::lockfile::{pid_path_for_lock, LockFile, LockHolder, LockWait};
+use crate::lockfile::{LockFile, LockHolder, LockWait};
 use crate::objects::ObjectId;
 use crate::repo::Repository;
 
@@ -270,26 +270,15 @@ fn finish_checkout_from_journal(
 /// Take `index.lock` for recovery, removing it first when its recorded holder has exited.
 fn lock_index_for_recovery(repo: &Repository) -> Result<IndexLock, HistoryError> {
     match repo.begin_index_update() {
-        Err(crate::error::Error::LockHeld {
-            path,
-            holder: Some(LockHolder { running: false, .. }),
-        }) => {
-            remove_stale_lock(&path)?;
-            repo.begin_index_update().map_err(Into::into)
+        Err(crate::error::Error::LockHeld { path, holder }) => {
+            if LockHolder::remove_if_stale(&path).map_err(crate::error::Error::Io)? {
+                repo.begin_index_update().map_err(Into::into)
+            } else {
+                Err(crate::error::Error::LockHeld { path, holder }.into())
+            }
         }
         other => other.map_err(Into::into),
     }
-}
-
-fn remove_stale_lock(lock_path: &Path) -> Result<(), HistoryError> {
-    for path in [lock_path.to_path_buf(), pid_path_for_lock(lock_path)] {
-        match fs::remove_file(&path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(crate::error::Error::Io(e).into()),
-        }
-    }
-    Ok(())
 }
 
 fn remove_journal_without_meta(repo: &Repository) -> Result<(), HistoryError> {
