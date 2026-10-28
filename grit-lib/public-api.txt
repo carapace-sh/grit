@@ -3991,7 +3991,7 @@ pub fn grit_lib::diff::pickaxe::Pickaxe::ignore_case(self, bool) -> Self
 pub fn grit_lib::diff::pickaxe::Pickaxe::into_shared(self) -> alloc::rcs::arc::Arc<Self>
 pub fn grit_lib::diff::pickaxe::Pickaxe::is_active(&self) -> bool
 pub fn grit_lib::diff::pickaxe::Pickaxe::line_grep(&str, bool) -> core::result::Result<Self, grit_lib::diff::pickaxe::PickaxeError>
-pub fn grit_lib::diff::pickaxe::Pickaxe::matches_commit(&self, &grit_lib::repo::Repository, grit_lib::objects::ObjectId, &[alloc::string::String]) -> grit_lib::error::Result<bool>
+pub fn grit_lib::diff::pickaxe::Pickaxe::matches_commit(&self, &grit_lib::repo::Repository, grit_lib::objects::ObjectId, &[alloc::string::String], grit_lib::diff::RenameDetection, &grit_lib::config::ConfigSet) -> grit_lib::error::Result<bool>
 pub fn grit_lib::diff::pickaxe::Pickaxe::occurrences(impl core::convert::Into<alloc::string::String>) -> Self
 pub fn grit_lib::diff::pickaxe::Pickaxe::pickaxe_regex(self, bool) -> Self
 impl core::clone::Clone for grit_lib::diff::pickaxe::Pickaxe
@@ -5190,7 +5190,7 @@ pub fn grit_lib::diff::pickaxe::Pickaxe::ignore_case(self, bool) -> Self
 pub fn grit_lib::diff::pickaxe::Pickaxe::into_shared(self) -> alloc::rcs::arc::Arc<Self>
 pub fn grit_lib::diff::pickaxe::Pickaxe::is_active(&self) -> bool
 pub fn grit_lib::diff::pickaxe::Pickaxe::line_grep(&str, bool) -> core::result::Result<Self, grit_lib::diff::pickaxe::PickaxeError>
-pub fn grit_lib::diff::pickaxe::Pickaxe::matches_commit(&self, &grit_lib::repo::Repository, grit_lib::objects::ObjectId, &[alloc::string::String]) -> grit_lib::error::Result<bool>
+pub fn grit_lib::diff::pickaxe::Pickaxe::matches_commit(&self, &grit_lib::repo::Repository, grit_lib::objects::ObjectId, &[alloc::string::String], grit_lib::diff::RenameDetection, &grit_lib::config::ConfigSet) -> grit_lib::error::Result<bool>
 pub fn grit_lib::diff::pickaxe::Pickaxe::occurrences(impl core::convert::Into<alloc::string::String>) -> Self
 pub fn grit_lib::diff::pickaxe::Pickaxe::pickaxe_regex(self, bool) -> Self
 impl core::clone::Clone for grit_lib::diff::pickaxe::Pickaxe
@@ -28422,7 +28422,7 @@ pub fn grit_lib::diff::pickaxe::Pickaxe::ignore_case(self, bool) -> Self
 pub fn grit_lib::diff::pickaxe::Pickaxe::into_shared(self) -> alloc::rcs::arc::Arc<Self>
 pub fn grit_lib::diff::pickaxe::Pickaxe::is_active(&self) -> bool
 pub fn grit_lib::diff::pickaxe::Pickaxe::line_grep(&str, bool) -> core::result::Result<Self, grit_lib::diff::pickaxe::PickaxeError>
-pub fn grit_lib::diff::pickaxe::Pickaxe::matches_commit(&self, &grit_lib::repo::Repository, grit_lib::objects::ObjectId, &[alloc::string::String]) -> grit_lib::error::Result<bool>
+pub fn grit_lib::diff::pickaxe::Pickaxe::matches_commit(&self, &grit_lib::repo::Repository, grit_lib::objects::ObjectId, &[alloc::string::String], grit_lib::diff::RenameDetection, &grit_lib::config::ConfigSet) -> grit_lib::error::Result<bool>
 pub fn grit_lib::diff::pickaxe::Pickaxe::occurrences(impl core::convert::Into<alloc::string::String>) -> Self
 pub fn grit_lib::diff::pickaxe::Pickaxe::pickaxe_regex(self, bool) -> Self
 impl core::clone::Clone for grit_lib::diff::pickaxe::Pickaxe

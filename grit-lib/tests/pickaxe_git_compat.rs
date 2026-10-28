@@ -6,7 +6,8 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 
-use grit_lib::diff::Pickaxe;
+use grit_lib::config::ConfigSet;
+use grit_lib::diff::{Pickaxe, RenameDetection};
 use grit_lib::revwalk::rev_list::{rev_list, RevListOptions};
 
 use support::{commit_file, git, open_grit_repo, HistoryRepo};
@@ -471,6 +472,32 @@ fn pickaxe_rename_that_changes_matches_is_listed_matches_git() {
         let g = assert_pickaxe_matches_git(worktree, &["-G", "needle"], needle_g(), max_count, &[]);
         assert_eq!(g, vec![needle.clone(), rename.clone(), add.clone()]);
     }
+}
+
+#[test]
+fn pickaxe_matches_commit_pairs_renames_per_policy() {
+    let repo = HistoryRepo::init();
+    let worktree = repo.worktree();
+    let [add, rename, needle] = rename_history(worktree, "a.txt", "sub/b.txt", "extra line\n");
+    let grit = open_grit_repo(worktree);
+    let config = ConfigSet::new();
+    let pickaxe = Pickaxe::occurrences("needle");
+    let matches = |oid: &str, paths: &[&str], renames: RenameDetection| {
+        let paths: Vec<String> = paths.iter().map(|p| (*p).to_owned()).collect();
+        pickaxe
+            .matches_commit(&grit, oid.parse().expect("oid"), &paths, renames, &config)
+            .expect("pickaxe")
+    };
+    let on = RenameDetection::default();
+    assert!(matches(&add, &[], on));
+    assert!(matches(&needle, &[], on));
+    assert!(!matches(&rename, &[], on));
+    assert!(matches(&rename, &[], RenameDetection::Off));
+    assert!(
+        matches(&rename, &["sub"], on),
+        "moved in from outside the pathspec"
+    );
+    assert!(!matches(&rename, &["nowhere"], on));
 }
 
 #[test]
