@@ -230,11 +230,14 @@ fn branch_lock_held_during_prepared_blocks_nested_ref_update() {
     fs::create_dir_all(&hooks).expect("hooks");
     let script = format!(
         "#!/bin/sh\n\
-         echo \"$1: $(cat | tr '\\n' '|')\" >> {log}\n\
+         stdin=$(mktemp)\n\
+         cat > \"$stdin\"\n\
+         echo \"$1: $(tr '\\n' '|' < \"$stdin\")\" >> {log}\n\
          if [ \"$1\" = prepared ]; then\n\
-           read -r o n r || exit 0\n\
+           read -r o n r < \"$stdin\" || exit 0\n\
            git update-ref \"$r\" \"$o\" 2>/dev/null || true\n\
          fi\n\
+         rm -f \"$stdin\"\n\
          exit 0\n",
         log = log.display()
     );

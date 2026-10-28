@@ -332,6 +332,7 @@ mod tests {
 
     use super::*;
     use crate::config::{ConfigFile, ConfigScope};
+    use crate::diff::zero_oid;
     use crate::refs::store::{MemoryRefStore, RefStoreError};
 
     const IDENT: &str = "T <t@e.x> 1700000000 +0000";
