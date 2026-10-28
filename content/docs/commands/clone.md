@@ -327,13 +327,13 @@ Markdown uses headings, bullet lists, and fenced blocks; pipe characters inside 
 | `1` | Destination not empty, checkout failure, or other error. Missing or refused credentials are `kind` `auth_required` / `auth_rejected` with a `hint` in `--json` and on the human `hint:` line. HTTPS credentials come from your credential helper (`grit auth <url> --username <user> --token <token>` saves one for any host), then an askpass program (`GIT_ASKPASS`, `core.askPass`, `SSH_ASKPASS`); see [Credentials](../agents/#credentials-https). |
 | `2` | Invalid flags ([`usage`](../exit-codes/)). |
 | `128` | Could not reach or read the source: missing path, DNS or connection failure, HTTP error status ([`remote_unreadable`](../exit-codes/)); a `404` adds a hint to check the URL. |
-| `130` | Interrupted with Ctrl-C ([`interrupted`](../exit-codes/)). The error is `operation cancelled` (`{"error":"operation cancelled"}` with `--json`). |
+| `130` | Interrupted with Ctrl-C, `SIGTERM`, or `SIGHUP` ([`interrupted`](../exit-codes/)). The error is `operation cancelled` (`{"error":"operation cancelled"}` with `--json`). |
 
 See [Exit codes](../exit-codes/).
 
 ### Interrupting a clone
 
-Ctrl-C stops a clone at any point: while it downloads, copies objects or checks out files. The first Ctrl-C asks the clone to stop; grit then rolls back the checkout, removes the destination directory it created (or empties one that already existed empty) and exits `130`. Nothing is left in the way, so the same `grit clone` command can simply be run again, and a bundle download carries on where it stopped. A duplicate signal that arrives with the first (`timeout -s INT` signals both the process and its group) is ignored; pressing Ctrl-C again later ends grit at once, without the cleanup. In a Windows console Ctrl-C and Ctrl-Break behave the same way. Closing the console window, or killing the process outright, gives grit no chance to clean up, so delete the leftover directory by hand before you clone again.
+Ctrl-C, `SIGTERM`, and `SIGHUP` stop a clone at any point: while it downloads, copies objects or checks out files. The first signal asks the clone to stop; grit then rolls back the checkout, removes the destination directory it created (or empties one that already existed empty) and exits `130`. Nothing is left in the way, so the same `grit clone` command can simply be run again, and a bundle download carries on where it stopped. A duplicate signal that arrives with the first (`timeout -s INT` or `timeout -s TERM` signals both the process and its group) is ignored; sending the same signal again later ends grit at once, without the cleanup. Only an uncatchable `SIGKILL` (or that second signal after the duplicate window) skips rollback. In a Windows console Ctrl-C and Ctrl-Break behave the same way. Closing the console window still gives grit no chance to clean up, so delete the leftover directory by hand before you clone again.
 
 ```console
 $ grit clone ../git git

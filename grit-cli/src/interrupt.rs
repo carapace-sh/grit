@@ -1,12 +1,12 @@
-//! Ctrl+C as a library [`Cancel`] signal.
+//! Cancel signals as a library [`Cancel`] signal.
 //!
-//! Without a handler Ctrl+C (`SIGINT` on Unix, `CTRL_C_EVENT` or `CTRL_BREAK_EVENT` on a
-//! Windows console) kills the process mid-write, so library rollbacks never run. While an
-//! [`InterruptCancel`] is installed the first interrupt only asks the running operation to
-//! stop (it then undoes its partial work and returns `Error::Cancelled`). A second Ctrl+C
-//! terminates the process as usual, unless it arrives within [`DUPLICATE_WINDOW_NS`] of the
-//! first: tools such as `timeout` signal both the child and its process group, and that
-//! duplicate must not cut the rollback short.
+//! Without handlers, `SIGINT`, `SIGTERM`, and `SIGHUP` on Unix (or `CTRL_C_EVENT` /
+//! `CTRL_BREAK_EVENT` on a Windows console) kill the process mid-write, so library rollbacks
+//! never run. While an [`InterruptCancel`] is installed the first such signal only asks the
+//! running operation to stop (it then undoes its partial work and returns `Error::Cancelled`).
+//! A second signal terminates the process as usual, unless it arrives within
+//! [`DUPLICATE_WINDOW_NS`] of the first: tools such as `timeout` signal both the child and
+//! its process group, and that duplicate must not cut the rollback short.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -20,11 +20,14 @@ static FIRST_INTERRUPT_NS: AtomicU64 = AtomicU64::new(0);
 /// A further interrupt this soon after the first is the same interrupt delivered twice.
 const DUPLICATE_WINDOW_NS: u64 = 100_000_000;
 
-/// Cancels the running library operation on the first Ctrl+C; restores the previous handler
+#[cfg(unix)]
+const HANDLED_SIGNALS: [libc::c_int; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
+
+/// Cancels the running library operation on the first interrupt; restores the previous handlers
 /// when dropped.
 pub struct InterruptCancel {
     #[cfg(unix)]
-    previous: libc::sigaction,
+    previous: [libc::sigaction; 3],
 }
 
 /// Record an interrupt at monotonic time `now_ns` (only touches atomics, so it is
@@ -64,15 +67,15 @@ fn monotonic_ns() -> u64 {
 }
 
 #[cfg(unix)]
-extern "C" fn on_interrupt(_signal: libc::c_int) {
+extern "C" fn on_interrupt(signal: libc::c_int) {
     if absorb_interrupt(monotonic_ns()) {
         return;
     }
-    // SAFETY: `signal` and `raise` are async-signal-safe. SIGINT stays blocked until this
+    // SAFETY: `signal` and `raise` are async-signal-safe. The signal stays blocked until this
     // handler returns, so the default action then terminates the process.
     unsafe {
-        libc::signal(libc::SIGINT, libc::SIG_DFL);
-        libc::raise(libc::SIGINT);
+        libc::signal(signal, libc::SIG_DFL);
+        libc::raise(signal);
     }
 }
 
@@ -87,7 +90,8 @@ extern "system" fn on_console_ctrl(ctrl_type: u32) -> windows_sys::core::BOOL {
 }
 
 impl InterruptCancel {
-    /// Route the next `SIGINT` to [`Cancel::is_cancelled`] instead of terminating.
+    /// Route the next `SIGINT`, `SIGTERM`, or `SIGHUP` to [`Cancel::is_cancelled`] instead of
+    /// terminating.
     #[cfg(unix)]
     pub fn install() -> Self {
         INTERRUPTED.store(false, Ordering::Relaxed);
@@ -97,8 +101,13 @@ impl InterruptCancel {
             let mut action: libc::sigaction = std::mem::zeroed();
             action.sa_sigaction = on_interrupt as extern "C" fn(libc::c_int) as libc::sighandler_t;
             libc::sigemptyset(&mut action.sa_mask);
-            let mut previous: libc::sigaction = std::mem::zeroed();
-            libc::sigaction(libc::SIGINT, &action, &mut previous);
+            for sig in HANDLED_SIGNALS {
+                libc::sigaddset(&mut action.sa_mask, sig);
+            }
+            let mut previous = [std::mem::zeroed(); 3];
+            for (sig, slot) in HANDLED_SIGNALS.iter().zip(previous.iter_mut()) {
+                libc::sigaction(*sig, &action, slot);
+            }
             Self { previous }
         }
     }
@@ -119,7 +128,7 @@ impl InterruptCancel {
         Self {}
     }
 
-    /// Ctrl+C keeps its default meaning on platforms without interrupt handling here.
+    /// Interrupt signals keep their default meaning on platforms without handling here.
     #[cfg(not(any(unix, windows)))]
     pub fn install() -> Self {
         Self {}
@@ -135,9 +144,11 @@ impl Cancel for InterruptCancel {
 impl Drop for InterruptCancel {
     fn drop(&mut self) {
         #[cfg(unix)]
-        // SAFETY: restores the action saved by `install`.
+        // SAFETY: restores the actions saved by `install`.
         unsafe {
-            libc::sigaction(libc::SIGINT, &self.previous, std::ptr::null_mut());
+            for (sig, previous) in HANDLED_SIGNALS.iter().zip(self.previous.iter()) {
+                libc::sigaction(*sig, previous, std::ptr::null_mut());
+            }
         }
         #[cfg(windows)]
         // SAFETY: removes the handler registered by `install`.
@@ -173,40 +184,57 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn current_sigint_handler() -> libc::sighandler_t {
+    fn current_handler(signal: libc::c_int) -> libc::sighandler_t {
         // SAFETY: querying the current action with a null new action.
         unsafe {
             let mut current: libc::sigaction = std::mem::zeroed();
-            libc::sigaction(libc::SIGINT, std::ptr::null(), &mut current);
+            libc::sigaction(signal, std::ptr::null(), &mut current);
             current.sa_sigaction
         }
     }
 
     #[cfg(unix)]
-    #[test]
-    fn first_sigint_cancels_a_duplicate_is_absorbed_and_drop_restores_the_handler() {
+    fn first_signal_cancels_a_duplicate_is_absorbed_and_drop_restores(signal: libc::c_int) {
         let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-        let before = current_sigint_handler();
+        let before = current_handler(signal);
         let cancel = InterruptCancel::install();
         assert!(!cancel.is_cancelled());
-        // SAFETY: the installed handler only sets atomic flags for these two signals.
+        // SAFETY: the installed handler only sets atomic flags for these signals.
         unsafe {
-            libc::raise(libc::SIGINT);
+            libc::raise(signal);
         }
         assert!(cancel.is_cancelled());
         // SAFETY: as above; a duplicate right after the first is absorbed.
         unsafe {
-            libc::raise(libc::SIGINT);
+            libc::raise(signal);
         }
         assert!(cancel.is_cancelled());
         let ours = on_interrupt as extern "C" fn(libc::c_int) as libc::sighandler_t;
         assert_eq!(
-            current_sigint_handler(),
+            current_handler(signal),
             ours,
-            "the handler stays installed so a later Ctrl+C can terminate"
+            "the handler stays installed so a later signal can terminate"
         );
         drop(cancel);
-        assert_eq!(current_sigint_handler(), before);
+        assert_eq!(current_handler(signal), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn first_sigint_cancels_a_duplicate_is_absorbed_and_drop_restores_the_handler() {
+        first_signal_cancels_a_duplicate_is_absorbed_and_drop_restores(libc::SIGINT);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn first_sigterm_cancels_a_duplicate_is_absorbed_and_drop_restores_the_handler() {
+        first_signal_cancels_a_duplicate_is_absorbed_and_drop_restores(libc::SIGTERM);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn first_sighup_cancels_a_duplicate_is_absorbed_and_drop_restores_the_handler() {
+        first_signal_cancels_a_duplicate_is_absorbed_and_drop_restores(libc::SIGHUP);
     }
 
     #[cfg(windows)]
