@@ -47,7 +47,8 @@ use crate::worktree_rules::WorktreeRules;
 
 use super::rename_lines::RenameLineTable;
 use super::unified_emit::{
-    emit_unified_body_from_edits, line_ending_only_edits, EditSpan, LineSide, UnifiedEmitOptions,
+    emit_unified_body_from_edits, line_ending_only_edits, EditSpan, LineEnding, LineSide,
+    UnifiedEmitOptions,
 };
 
 /// Comparison keys for every line of `side`, which must be [`LineSide::from_text`] of `text`.
@@ -70,16 +71,17 @@ fn line_compare_keys<'a>(
         );
         return normalized.iter().map(Cow::as_ref).collect();
     }
-    let mut keys = Vec::with_capacity(side.len());
-    let mut rest = text;
-    while !rest.is_empty() {
-        let end = memchr::memchr(b'\n', rest.as_bytes()).map_or(rest.len(), |nl| nl + 1);
-        let (line, tail) = rest.split_at(end);
-        keys.push(line);
-        rest = tail;
-    }
-    debug_assert_eq!(keys.len(), side.len());
-    keys
+    // Each body is a subslice of `text` that stops just before its `\n`, so the key is the body
+    // widened by that one byte.
+    let base = text.as_ptr() as usize;
+    side.lines
+        .iter()
+        .map(|line| {
+            let start = line.body.as_ptr() as usize - base;
+            let end = start + line.body.len() + usize::from(line.ending != LineEnding::Missing);
+            &text[start..end]
+        })
+        .collect()
 }
 
 #[path = "../structured_diff.rs"]

@@ -458,15 +458,12 @@ fn side_text(bytes: &SideBytes) -> Cow<'_, str> {
 }
 
 fn line_count(text: &str) -> usize {
-    if text.is_empty() {
-        return 0;
+    let newlines = memchr::memchr_iter(b'\n', text.as_bytes()).count();
+    if text.is_empty() || text.ends_with('\n') {
+        newlines
+    } else {
+        newlines + 1
     }
-    let ends_nl = text.ends_with('\n');
-    let mut parts = text.split('\n').count();
-    if ends_nl {
-        parts = parts.saturating_sub(1);
-    }
-    parts
 }
 
 type UnifiedHunkResolve = (Vec<FilePatch>, Option<Vec<HunkId>>, HashSet<HunkId>);

@@ -1216,7 +1216,7 @@ fn new_side_bytes(
             index_entry,
             Some(&rules),
         )?;
-        Ok(bytes_for_diff(&data))
+        Ok(bytes_for_diff(data))
     } else {
         blob_bytes(odb, &e.new_oid)
     }
@@ -1255,14 +1255,14 @@ fn blob_bytes(odb: &Odb, oid: &ObjectId) -> Result<(SideBytes, bool)> {
         return Ok((SideBytes::from_bytes(Vec::new()), false));
     }
     let data = odb.read(oid)?.data;
-    Ok(bytes_for_diff(&data))
+    Ok(bytes_for_diff(data))
 }
 
-fn bytes_for_diff(data: &[u8]) -> (SideBytes, bool) {
+fn bytes_for_diff(data: Vec<u8>) -> (SideBytes, bool) {
     if data.iter().take(8000).any(|&b| b == 0) {
         (SideBytes::from_bytes(Vec::new()), true)
     } else {
-        (SideBytes::from_bytes(data.to_vec()), false)
+        (SideBytes::from_bytes(data), false)
     }
 }
 
