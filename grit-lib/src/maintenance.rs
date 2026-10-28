@@ -880,12 +880,6 @@ fn repack_detail(repo: &Repository, opts: &RepackOptions) -> Result<RepackDetail
     #[cfg(test)]
     gc_test_hooks::run(gc_test_hooks::GcPausePoint::AfterInventoryBeforeRoots);
 
-    let pre_repack_packs = if opts.incremental {
-        HashSet::new()
-    } else {
-        pack_paths_in_dir(&pack_dir)?
-    };
-    test_inject_repack_pause(repo.git_dir(), RepackPausePhase::AfterInventoryBeforeRoots);
     let roots = collect_maintenance_object_roots(repo)?;
 
     #[cfg(test)]
@@ -1074,7 +1068,6 @@ fn repack_detail(repo: &Repository, opts: &RepackOptions) -> Result<RepackDetail
                     .now
                     .map(offset_to_system_time)
                     .unwrap_or(SystemTime::UNIX_EPOCH);
-                test_inject_repack_pause(repo.git_dir(), RepackPausePhase::BeforeBitmap);
                 match PackBitmapWriter::write(repo, &idx_path, &bitmap_opts, now) {
                     Ok(_) => {}
                     Err(PackBitmapWriteError::NotClosed { .. }) => {

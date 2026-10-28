@@ -295,7 +295,7 @@ fn remove_quarantine_dir(path: &Path) -> Result<()> {
 
 fn migrate_tree(src: &Path, dst: &Path, guards: &mut Vec<MigratedPackKeepGuard>) -> Result<()> {
     if !src.is_dir() {
-        return Ok(Vec::new());
+        return Ok(());
     }
     fs::create_dir_all(dst).map_err(Error::Io)?;
     let mut names: Vec<String> = fs::read_dir(src)
@@ -304,7 +304,6 @@ fn migrate_tree(src: &Path, dst: &Path, guards: &mut Vec<MigratedPackKeepGuard>)
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .collect();
     names.sort_by_key(|name| pack_copy_priority(name));
-    let mut keep_markers = Vec::new();
     for name in names {
         let from = src.join(&name);
         let to = dst.join(&name);
@@ -319,16 +318,7 @@ fn migrate_tree(src: &Path, dst: &Path, guards: &mut Vec<MigratedPackKeepGuard>)
             migrate_file(&from, &to)?;
         }
     }
-    Ok(keep_markers)
-}
-
-fn keep_marker_for_newly_migrated_pack(pack_path: &Path) -> Option<PathBuf> {
-    let name = pack_path.file_name()?.to_str()?;
-    if !(name.starts_with("pack-") && name.ends_with(".pack")) {
-        return None;
-    }
-    let stem = pack_path.file_stem()?.to_str()?;
-    Some(pack_path.with_file_name(format!("{stem}.keep")))
+    Ok(())
 }
 
 fn pack_copy_priority(name: &str) -> u8 {
@@ -382,7 +372,7 @@ fn migrate_file(from: &Path, to: &Path) -> Result<()> {
         fs::copy(from, to).map_err(Error::Io)?;
         fs::remove_file(from).map_err(Error::Io)?;
     }
-    Ok(true)
+    Ok(())
 }
 
 #[cfg(test)]
