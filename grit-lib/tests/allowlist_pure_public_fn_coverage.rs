@@ -11,9 +11,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 use grit_lib::blame::build_fuzzy_line_map;
-use grit_lib::command_runner::hooks::{
-    resolve_hooks_dir, run_hook, run_reference_transaction_committed_for_head_update,
-};
+use grit_lib::command_runner::hooks::{resolve_hooks_dir, run_hook};
 use grit_lib::command_runner::{run_program, CommandStdin, CommandStdio, RecordingRunner};
 use grit_lib::config::config_file_display_for_error;
 use grit_lib::config::dotfile::is_ntfs_dot_gitignore;
@@ -444,7 +442,10 @@ fn hooks_helpers_with_repo() {
     let _ = resolve_hooks_dir(&repo);
     let _ = repo.hooks().list(None);
     let _ = run_hook(&repo, "pre-commit", &[], None);
-    let head = grit_lib::state::resolve_head(repo.git_dir()).expect("head");
-    let zero = ObjectId::zero();
-    let _ = run_reference_transaction_committed_for_head_update(&repo, &head, None, zero);
+    let _ = run_hook(
+        &repo,
+        "reference-transaction",
+        &["committed"],
+        Some(b"0000000000000000000000000000000000000000 0000000000000000000000000000000000000000 HEAD\n"),
+    );
 }

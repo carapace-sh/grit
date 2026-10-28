@@ -57,6 +57,20 @@ Other commands run the hooks Git runs after them, with Git's arguments:
 
 These hooks run after the operation is complete, so their exit status never changes the result, and a hook that cannot be started is a `hook_not_run` warning. `--dry-run` and `--check` run no hooks. [`grit switch`](switch.md) and [`grit commit`](commit.md) list the hooks that ran in their JSON `hooks_run` field.
 
+### `reference-transaction`
+
+Grit runs the [`reference-transaction`](https://git-scm.com/docs/githooks#_reference_transaction) hook for every ref-store transaction that changes direct object ids (create, update, delete, or reflog-only oid lines on `HEAD`). Pure symbolic updates (for example switching between two existing branches without moving a tip) do not run the hook, matching Git 2.43.
+
+| Phase | When | Exit status |
+| --- | --- | --- |
+| `prepared` | After locks are taken, before any ref or reflog is written | Non-zero aborts the whole batch; grit then runs `aborted` (exit ignored) |
+| `committed` | After the transaction commits successfully | Ignored |
+| `aborted` | After `prepared` refused or the batch was aborted without writing | Ignored |
+
+Stdin is one line per ref update, sorted by ref name: `<old-hex> <new-hex> <ref>\n`. Old and new ids use the repository hash width; absent refs or deletions use the null object id. Attached commits on the files backend emit the same `HEAD` and branch lines Git does (same old and new commit ids, `HEAD` first lexicographically).
+
+This hook is **not** skipped by `--no-verify` on commands that honor `--no-verify` for other hooks. Configured `hook.reference-transaction.*` entries and `core.hooksPath` apply the same way as for other hooks.
+
 ## Options
 
 ### `grit hooks list`

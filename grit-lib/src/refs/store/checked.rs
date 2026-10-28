@@ -6,6 +6,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::error::Result;
+use crate::hooks::RefHookContext;
 use crate::objects::ObjectId;
 use crate::odb::Odb;
 use crate::reflog::ReflogEntry;
@@ -13,6 +14,7 @@ use crate::reflog::ReflogEntry;
 type StoreResult<T> = std::result::Result<T, RefStoreError>;
 
 use super::backend::verify_direct_targets;
+use super::reference_transaction::prepare_with_reference_transaction_hooks;
 use super::{
     FilesRefStore, PreparedRefTransaction, RawRef, RefEntry, RefStorageFormat, RefStore,
     RefStoreError, RefTransaction, RefUpdate,
@@ -53,17 +55,36 @@ pub(crate) fn open_checked_ref_store(git_dir: &Path) -> Result<ObjectCheckedRefS
 pub(crate) struct ObjectCheckedRefStore {
     inner: Arc<dyn RefStore>,
     odb: Odb,
+    hooks: Option<Arc<RefHookContext>>,
 }
 
 impl ObjectCheckedRefStore {
     /// Wrap `inner`, checking transactions against `odb`.
     pub(crate) fn new(inner: Arc<dyn RefStore>, odb: Odb) -> Self {
-        Self { inner, odb }
+        Self {
+            inner,
+            odb,
+            hooks: None,
+        }
+    }
+
+    /// Install hook context for [`super::reference_transaction`] events.
+    pub(crate) fn with_ref_hooks(mut self, hooks: Arc<RefHookContext>) -> Self {
+        self.hooks = Some(hooks);
+        self
     }
 
     /// The wrapped backend.
     pub(crate) fn inner(&self) -> &Arc<dyn RefStore> {
         &self.inner
+    }
+
+    /// Hash algorithm for null oids in hook stdin.
+    pub(crate) fn null_oid(&self) -> ObjectId {
+        self.hooks
+            .as_ref()
+            .map(|ctx| ctx.null_oid())
+            .unwrap_or_else(|| ObjectId::null(self.odb.hash_algo()))
     }
 }
 
@@ -100,10 +121,15 @@ impl RefStore for ObjectCheckedRefStore {
         &self,
         txn: RefTransaction,
     ) -> StoreResult<Box<dyn PreparedRefTransaction + Send + '_>> {
-        // Malformed names and null ids keep their own errors, ahead of any object lookup.
         txn.validate()?;
         self.verify_update_targets(txn.updates())?;
-        self.inner.prepare(txn)
+        prepare_with_reference_transaction_hooks(
+            self,
+            self.inner.as_ref(),
+            self.hooks.as_ref(),
+            self.null_oid(),
+            txn,
+        )
     }
 
     fn verify_update_targets(&self, updates: &[RefUpdate]) -> StoreResult<()> {
@@ -141,5 +167,13 @@ impl RefStore for ObjectCheckedRefStore {
 
     fn as_files(&self) -> Option<&FilesRefStore> {
         self.inner.as_files()
+    }
+
+    fn ref_hook_context(&self) -> Option<&RefHookContext> {
+        self.hooks.as_deref()
+    }
+
+    fn reference_transaction_null_oid(&self) -> ObjectId {
+        self.null_oid()
     }
 }

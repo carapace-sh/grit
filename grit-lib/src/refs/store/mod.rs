@@ -17,6 +17,7 @@ mod linked_worktree;
 mod memory;
 mod open;
 pub mod paths;
+pub(crate) mod reference_transaction;
 mod reftable;
 mod routing;
 mod semantics;
@@ -196,6 +197,19 @@ pub trait RefStore: Send + Sync + Debug {
     fn verify_update_targets(&self, updates: &[RefUpdate]) -> StoreResult<()> {
         let _ = updates;
         Ok(())
+    }
+
+    /// Hook context when this store runs `reference-transaction` hooks.
+    #[doc(hidden)]
+    fn ref_hook_context(&self) -> Option<&crate::hooks::RefHookContext> {
+        let _ = self;
+        None
+    }
+
+    /// Null object id width for `reference-transaction` stdin on this store.
+    #[doc(hidden)]
+    fn reference_transaction_null_oid(&self) -> ObjectId {
+        crate::diff::zero_oid()
     }
 
     /// Whether a reflog is present for `name`.

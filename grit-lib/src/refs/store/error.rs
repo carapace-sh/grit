@@ -147,6 +147,70 @@ pub enum RefStoreError {
     /// Built-in backends never return this; their I/O failures stay typed elsewhere.
     #[error(transparent)]
     Backend(BackendError),
+
+    /// A `reference-transaction` hook refused or could not run on the `prepared` phase.
+    #[error(transparent)]
+    Hook(ReferenceTransactionHookErr),
+}
+
+/// [`RefStoreError::Hook`] payload ( [`crate::hooks::HookError`] is not `Clone`).
+#[derive(Clone, Debug)]
+pub struct ReferenceTransactionHookErr(Arc<crate::hooks::HookError>);
+
+impl PartialEq for ReferenceTransactionHookErr {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.to_string() == other.0.to_string()
+    }
+}
+
+impl Eq for ReferenceTransactionHookErr {}
+
+impl From<crate::hooks::HookError> for ReferenceTransactionHookErr {
+    fn from(value: crate::hooks::HookError) -> Self {
+        Self(Arc::new(value))
+    }
+}
+
+impl ReferenceTransactionHookErr {
+    pub(crate) fn into_hook_error(self) -> crate::hooks::HookError {
+        Arc::try_unwrap(self.0).unwrap_or_else(|arc| match arc.as_ref() {
+            crate::hooks::HookError::Failed {
+                hook_name,
+                status,
+                output,
+            } => crate::hooks::HookError::Failed {
+                hook_name: hook_name.clone(),
+                status: *status,
+                output: output.clone(),
+            },
+            crate::hooks::HookError::Spawn {
+                hook_name,
+                path,
+                source,
+                output,
+            } => crate::hooks::HookError::Spawn {
+                hook_name: hook_name.clone(),
+                path: path.clone(),
+                source: std::io::Error::new(source.kind(), source.to_string()),
+                output: output.clone(),
+            },
+            crate::hooks::HookError::Internal(msg) => {
+                crate::hooks::HookError::Internal(msg.clone())
+            }
+        })
+    }
+}
+
+impl std::fmt::Display for ReferenceTransactionHookErr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for ReferenceTransactionHookErr {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref())
+    }
 }
 
 impl RefStoreError {

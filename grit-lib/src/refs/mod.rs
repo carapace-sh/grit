@@ -3990,6 +3990,177 @@ pub(crate) fn update_branch_for_commit_files(
     lock.commit(git_dir, update, reflog_old, config)
 }
 
+/// Like [`update_branch_for_commit_files`], but runs `reference-transaction` after the branch
+/// ref lock is held and before any reflog or ref write.
+pub(crate) fn update_branch_for_commit_files_with_reference_transaction_hooks(
+    git_dir: &Path,
+    update: &BranchCommitRefUpdate<'_>,
+    reflog_old: &ObjectId,
+    config: &ConfigSet,
+    ctx: &crate::hooks::RefHookContext,
+    lines: &[store::reference_transaction::ReferenceTransactionLine],
+) -> Result<()> {
+    use crate::hooks::ReferenceTransactionPhase;
+    use store::reference_transaction::stdin_from_lines;
+
+    let lock = BranchCommitRefLock::acquire(git_dir, update.branch_ref, update.expected_old)?;
+    if lines.is_empty() {
+        return lock.commit(git_dir, update, reflog_old, config);
+    }
+    let stdin = stdin_from_lines(lines);
+    ctx.run_reference_transaction(ReferenceTransactionPhase::Prepared, &stdin)
+        .map_err(Error::Hook)?;
+    match lock.commit(git_dir, update, reflog_old, config) {
+        Ok(()) => {
+            let _ = ctx.run_reference_transaction(ReferenceTransactionPhase::Committed, &stdin);
+            Ok(())
+        }
+        Err(err) => {
+            let _ = ctx.run_reference_transaction(ReferenceTransactionPhase::Aborted, &stdin);
+            Err(err)
+        }
+    }
+}
+
+/// Loose `HEAD` lock held between CAS validation and updating a detached `HEAD`.
+pub(crate) struct DetachedHeadRefLock {
+    lock: Option<crate::lockfile::LockFile>,
+    disarmed: bool,
+}
+
+impl DetachedHeadRefLock {
+    fn acquire(git_dir: &Path, expected_old: Option<ObjectId>) -> Result<Self> {
+        let current = resolve_ref(git_dir, "HEAD").ok();
+        verify_branch_cas(expected_old, current, "HEAD")?;
+        let path = git_dir.join("HEAD");
+        let lock_path = lock_path_for_ref(&path);
+        use crate::lockfile::{LockError, LockFile, LockWait};
+        let wait = LockWait::files_ref_lock_for_git_dir(git_dir);
+        let lock = LockFile::acquire(&lock_path, wait).map_err(|err| match err {
+            held @ LockError::Held { .. } => Error::from(held),
+            LockError::Io { source, path } => crate::git_dir::io_error::map_git_dir_io(
+                git_dir,
+                path.as_path(),
+                crate::git_dir::GitDirPathOperation::UpdateRef,
+                source,
+            ),
+        })?;
+        Ok(Self {
+            lock: Some(lock),
+            disarmed: false,
+        })
+    }
+
+    fn commit(
+        mut self,
+        git_dir: &Path,
+        new_oid: ObjectId,
+        reflog_old: &ObjectId,
+        identity: &str,
+        reflog_message: &str,
+        config: &ConfigSet,
+    ) -> Result<()> {
+        let path = git_dir.join("HEAD");
+        let content = format!("{new_oid}\n");
+        use crate::lockfile::LockError;
+        use std::io::Write as _;
+        let mut file_lock = self
+            .lock
+            .take()
+            .ok_or_else(|| Error::Message("HEAD ref lock already released".into()))?;
+        crate::git_dir::io_error::io_with_git_path(
+            git_dir,
+            &path,
+            crate::git_dir::GitDirPathOperation::UpdateRef,
+            file_lock.write_all(content.as_bytes()),
+        )?;
+        file_lock.commit_to(&path).map_err(|err| match err {
+            LockError::Io {
+                source,
+                path: lock_path,
+            } => crate::git_dir::io_error::map_git_dir_io(
+                git_dir,
+                lock_path.as_path(),
+                crate::git_dir::GitDirPathOperation::UpdateRef,
+                source,
+            ),
+            held @ LockError::Held { .. } => Error::from(held),
+        })?;
+        if should_autocreate_reflog_with_config(config, git_dir, "HEAD") {
+            if let Err(err) = append_reflog_with_config(
+                git_dir,
+                "HEAD",
+                reflog_old,
+                &new_oid,
+                identity,
+                reflog_message,
+                false,
+                Some(config),
+            ) {
+                let _ = write_ref_cas(git_dir, "HEAD", reflog_old, new_oid);
+                return Err(err);
+            }
+        }
+        self.disarmed = true;
+        Ok(())
+    }
+}
+
+impl Drop for DetachedHeadRefLock {
+    fn drop(&mut self) {
+        drop(self.lock.take());
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn update_detached_head_for_commit_files_with_reference_transaction_hooks(
+    git_dir: &Path,
+    expected_old: Option<ObjectId>,
+    new_oid: ObjectId,
+    identity: &str,
+    reflog_message: &str,
+    config: &ConfigSet,
+    ctx: &crate::hooks::RefHookContext,
+    lines: &[store::reference_transaction::ReferenceTransactionLine],
+) -> Result<()> {
+    use crate::hooks::ReferenceTransactionPhase;
+    use store::reference_transaction::stdin_from_lines;
+
+    let lock = DetachedHeadRefLock::acquire(git_dir, expected_old)?;
+    if lines.is_empty() {
+        let reflog_old = expected_old.unwrap_or_else(crate::diff::zero_oid);
+        return lock.commit(
+            git_dir,
+            new_oid,
+            &reflog_old,
+            identity,
+            reflog_message,
+            config,
+        );
+    }
+    let stdin = stdin_from_lines(lines);
+    ctx.run_reference_transaction(ReferenceTransactionPhase::Prepared, &stdin)
+        .map_err(Error::Hook)?;
+    let reflog_old = expected_old.unwrap_or_else(|| ctx.null_oid());
+    match lock.commit(
+        git_dir,
+        new_oid,
+        &reflog_old,
+        identity,
+        reflog_message,
+        config,
+    ) {
+        Ok(()) => {
+            let _ = ctx.run_reference_transaction(ReferenceTransactionPhase::Committed, &stdin);
+            Ok(())
+        }
+        Err(err) => {
+            let _ = ctx.run_reference_transaction(ReferenceTransactionPhase::Aborted, &stdin);
+            Err(err)
+        }
+    }
+}
+
 /// Apply [`BranchCommitRefUpdate`]: branch CAS, ref write, branch + `HEAD` reflogs.
 ///
 /// Opens the ref store for `git_dir`; prefer [`update_branch_for_commit_on_store`] with

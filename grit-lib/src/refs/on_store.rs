@@ -7,11 +7,13 @@
 //! [`crate::refs::store::RefTransaction`] with compare-and-swap expectations and reflog entries.
 
 use crate::config::ConfigSet;
-use crate::diff::zero_oid;
 use crate::error::{Error, Result};
 use crate::lockfile::LockWait;
 use crate::objects::ObjectId;
 
+use super::store::reference_transaction::{
+    branch_commit_reference_transaction_lines, detached_head_commit_reference_transaction_lines,
+};
 use super::store::{Expected, RawRef, RefStore, RefUpdate, RefUpdateFlags, ReflogUpdate};
 use super::{
     append_reflog_with_config, commit_ref_update_on_store, commit_ref_update_on_store_with_wait,
@@ -92,9 +94,26 @@ pub fn update_branch_for_commit_on_store(
             )))
         }
     }
-    let reflog_old = update.expected_old.unwrap_or_else(zero_oid);
+    let null_oid = store.reference_transaction_null_oid();
+    let reflog_old = update.expected_old.unwrap_or(null_oid);
     if let Some(files) = store.as_files() {
         verify_new_tip(store, update.branch_ref, update.new_oid)?;
+        if let Some(ctx) = store.ref_hook_context() {
+            let hook_old = update.expected_old.unwrap_or_else(|| ctx.null_oid());
+            let lines = branch_commit_reference_transaction_lines(
+                update.branch_ref,
+                hook_old,
+                update.new_oid,
+            );
+            return super::update_branch_for_commit_files_with_reference_transaction_hooks(
+                files.git_dir(),
+                update,
+                &reflog_old,
+                config,
+                ctx,
+                &lines,
+            );
+        }
         return super::update_branch_for_commit_files(files.git_dir(), update, &reflog_old, config);
     }
 
@@ -156,6 +175,20 @@ pub(crate) fn update_detached_head_for_commit_on_store(
     }
     if let Some(files) = store.as_files() {
         verify_new_tip(store, "HEAD", new_oid)?;
+        if let Some(ctx) = store.ref_hook_context() {
+            let hook_old = expected_old.unwrap_or_else(|| ctx.null_oid());
+            let lines = detached_head_commit_reference_transaction_lines(hook_old, new_oid);
+            return super::update_detached_head_for_commit_files_with_reference_transaction_hooks(
+                files.git_dir(),
+                expected_old,
+                new_oid,
+                identity,
+                reflog_message,
+                config,
+                ctx,
+                &lines,
+            );
+        }
         return super::update_detached_head_for_commit_files(
             files.git_dir(),
             expected_old,
@@ -165,7 +198,7 @@ pub(crate) fn update_detached_head_for_commit_on_store(
             config,
         );
     }
-    let reflog_old = expected_old.unwrap_or_else(zero_oid);
+    let reflog_old = expected_old.unwrap_or_else(|| store.reference_transaction_null_oid());
     let reflog = reflog_wanted(store, config, "HEAD")?
         .then(|| explicit_reflog(identity, reflog_message, reflog_old, new_oid));
     commit_ref_update_on_store_with_wait(
@@ -268,7 +301,9 @@ pub(crate) fn write_symbolic_ref_on_store(
 /// Fails when the ref does not exist; propagates invalid refname, backend and I/O failures.
 pub(crate) fn delete_ref_on_store(store: &dyn RefStore, refname: &str) -> Result<()> {
     if let Some(files) = store.as_files() {
-        return super::delete_ref(files.git_dir(), refname);
+        if store.ref_hook_context().is_none() {
+            return super::delete_ref(files.git_dir(), refname);
+        }
     }
     ensure_refname_safe_for_storage(refname)?;
     commit_ref_update_on_store(
@@ -297,6 +332,7 @@ mod tests {
 
     use super::*;
     use crate::config::{ConfigFile, ConfigScope};
+    use crate::diff::zero_oid;
     use crate::refs::store::{MemoryRefStore, RefStoreError};
 
     const IDENT: &str = "T <t@e.x> 1700000000 +0000";

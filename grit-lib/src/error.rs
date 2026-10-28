@@ -2253,6 +2253,7 @@ impl From<crate::refs::store::RefStoreError> for Error {
                 operation,
                 source: crate::refs::store::RefStoreError::git_dir_io_source(os_error),
             },
+            crate::refs::store::RefStoreError::Hook(hook) => Error::Hook(hook.into_hook_error()),
             other => Error::RefStore(other),
         }
     }
