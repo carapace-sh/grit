@@ -477,6 +477,9 @@ mod remote_set_url_cli;
 #[path = "remote_show_cli.rs"]
 mod remote_show_cli;
 #[cfg(feature = "full-tests")]
+#[path = "reset_interrupt.rs"]
+mod reset_interrupt;
+#[cfg(feature = "full-tests")]
 #[path = "reset_sparse_checkout_cli.rs"]
 mod reset_sparse_checkout_cli;
 #[cfg(feature = "full-tests")]
@@ -492,6 +495,9 @@ mod resolve_ref_modes_cli;
 mod resolve_verify_quiet_cli;
 #[path = "restore_hunks.rs"]
 mod restore_hunks;
+#[cfg(feature = "full-tests")]
+#[path = "restore_interrupt.rs"]
+mod restore_interrupt;
 #[cfg(feature = "full-tests")]
 #[path = "restore_ours_theirs_cli.rs"]
 mod restore_ours_theirs_cli;

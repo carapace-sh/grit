@@ -191,11 +191,12 @@ pub fn run(
         remerge,
     };
 
+    let interrupt = crate::interrupt::InterruptCancel::install();
     let outcome = restore_paths(
         &repo,
         &opts,
         &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
+        &interrupt,
     )
     .map_err(map_restore_error)?;
     Ok(outcome.into())

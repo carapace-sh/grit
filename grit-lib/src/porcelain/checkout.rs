@@ -47,7 +47,8 @@ use crate::worktree_rules::WorktreeRules;
 mod checkout_journal;
 #[path = "checkout_parallel.rs"]
 mod checkout_parallel;
-use checkout_journal::{CheckoutJournal, SharedCheckoutDeleteRollback};
+pub(crate) use checkout_journal::CheckoutJournal;
+use checkout_journal::SharedCheckoutDeleteRollback;
 pub(crate) use checkout_parallel::is_eligible_for_parallel_checkout;
 use checkout_parallel::{
     cancellable_chunks, execute_write_jobs, paths_needing_serial_checkout, CheckoutPlanSlot,

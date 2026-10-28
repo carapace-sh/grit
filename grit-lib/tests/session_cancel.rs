@@ -771,9 +771,18 @@ fn restore_stops_when_the_sink_asks() {
         remerge: None,
     };
     let mut sink = CancelAfter::new(ProgressPhase::CheckingOutFiles, 5);
+    let before_index = index_bytes(&repo);
     assert_cancelled(restore_paths(&repo, &opts, &mut sink, &NeverCancel));
     let last = fs::read_to_string(tmp.path().join("d/f0299.txt")).expect("read");
-    assert_eq!(last, "changed 299\n", "restore stopped early");
+    assert_eq!(
+        last, "changed 299\n",
+        "cancelled restore must roll back the work tree"
+    );
+    assert_eq!(
+        index_bytes(&repo),
+        before_index,
+        "index must stay unchanged"
+    );
 
     restore_paths(&repo, &opts, &mut NullProgress, &NeverCancel).expect("restore");
     let last = fs::read_to_string(tmp.path().join("d/f0299.txt")).expect("read");

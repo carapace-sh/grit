@@ -19,7 +19,7 @@ use crate::pathspec::{
 };
 use crate::porcelain::checkout::{
     remove_empty_parent_dirs, write_blob_to_worktree, write_smudged_blob_to_worktree,
-    LeadingDirCache,
+    CheckoutJournal, LeadingDirCache,
 };
 use crate::porcelain::index_from_tree::refresh_stage0_index_stats_for_paths;
 use crate::porcelain::stash::{flat_tree_lookup, flatten_tree_full, FlatTreeEntry};
@@ -98,8 +98,8 @@ pub struct RestoreOutcome {
 /// the requested checkout. [`Error::LockHeld`] means another process holds `index.lock`;
 /// the lock is taken before the index is read, so nothing was changed. [`Error::Cancelled`]
 /// means `cancel` (or [`ProgressSink::should_cancel`]) fired while restoring the work tree:
-/// files already written stay, but the index is not written. Other failures are I/O or
-/// object-store errors.
+/// every work-tree change is rolled back (see [`CheckoutJournal`]), and the index is not
+/// written. Other failures are I/O or object-store errors.
 ///
 /// Work-tree writes report [`crate::progress::ProgressPhase::CheckingOutFiles`] to `progress`.
 pub fn restore_paths(
@@ -666,6 +666,17 @@ struct WorktreeRestoreContext<'a> {
 }
 
 fn apply_worktree_restore(ctx: WorktreeRestoreContext<'_>) -> Result<()> {
+    let repo = ctx.repo;
+    let work_tree = ctx.work_tree;
+    let mut journal = CheckoutJournal::new(work_tree)?;
+    let result = apply_worktree_restore_inner(ctx, &mut journal);
+    journal.finish(repo, result)
+}
+
+fn apply_worktree_restore_inner(
+    ctx: WorktreeRestoreContext<'_>,
+    journal: &mut CheckoutJournal,
+) -> Result<()> {
     let WorktreeRestoreContext {
         repo,
         work_tree,
@@ -725,6 +736,7 @@ fn apply_worktree_restore(ctx: WorktreeRestoreContext<'_>) -> Result<()> {
                 mode,
                 &rules,
                 &mut dir_cache,
+                journal,
                 index_out,
                 outcome,
                 index_dirty,
@@ -746,8 +758,7 @@ fn apply_worktree_restore(ctx: WorktreeRestoreContext<'_>) -> Result<()> {
             if meta.is_dir() && !meta.file_type().is_symlink() {
                 continue;
             }
-            if fs::remove_file(&abs).is_ok() {
-                remove_empty_parent_dirs(work_tree, &abs);
+            if remove_worktree_path_for_restore(work_tree, path, journal)? {
                 outcome.removed.push(path.clone());
             }
         }
@@ -762,7 +773,6 @@ fn apply_worktree_restore(ctx: WorktreeRestoreContext<'_>) -> Result<()> {
         let src = tree_source
             .and_then(|entries| flat_tree_lookup(entries, path))
             .cloned();
-        let abs = work_tree.join(path);
         match src {
             Some(entry) => {
                 let existing = index_out.get(path.as_bytes(), 0).cloned();
@@ -775,6 +785,7 @@ fn apply_worktree_restore(ctx: WorktreeRestoreContext<'_>) -> Result<()> {
                     true,
                     &rules,
                     &mut dir_cache,
+                    journal,
                     index_out,
                     outcome,
                     index_dirty,
@@ -784,14 +795,7 @@ fn apply_worktree_restore(ctx: WorktreeRestoreContext<'_>) -> Result<()> {
                 if !tracked_for_worktree_deletion.contains(path.as_bytes()) {
                     continue;
                 }
-                let Ok(meta) = fs::symlink_metadata(&abs) else {
-                    continue;
-                };
-                if meta.is_dir() && !meta.file_type().is_symlink() {
-                    continue;
-                }
-                if fs::remove_file(&abs).is_ok() {
-                    remove_empty_parent_dirs(work_tree, &abs);
+                if remove_worktree_path_for_restore(work_tree, path, journal)? {
                     outcome.removed.push(path.clone());
                 }
             }
@@ -800,6 +804,24 @@ fn apply_worktree_restore(ctx: WorktreeRestoreContext<'_>) -> Result<()> {
     progress.finish();
 
     Ok(())
+}
+
+/// Spool a tracked file out of the work tree for restore; returns whether a file was removed.
+fn remove_worktree_path_for_restore(
+    work_tree: &Path,
+    path: &str,
+    journal: &CheckoutJournal,
+) -> Result<bool> {
+    let abs = work_tree.join(path);
+    let Ok(meta) = fs::symlink_metadata(&abs) else {
+        return Ok(false);
+    };
+    if meta.is_dir() && !meta.file_type().is_symlink() {
+        return Ok(false);
+    }
+    journal.spool_remove(path)?;
+    remove_empty_parent_dirs(work_tree, &abs);
+    Ok(true)
 }
 
 fn worktree_index_entry_up_to_date(
@@ -868,6 +890,7 @@ fn restore_worktree_blob_from_index(
     mode: u32,
     rules: &WorktreeRules,
     dir_cache: &mut LeadingDirCache,
+    journal: &mut CheckoutJournal,
     index_out: &mut Index,
     outcome: &mut RestoreOutcome,
     index_dirty: &mut bool,
@@ -875,6 +898,7 @@ fn restore_worktree_blob_from_index(
     if mode == MODE_GITLINK {
         return Ok(());
     }
+    journal.preserve_before_write(path)?;
     let meta = restore_blob_to_worktree(repo, rules, work_tree, path, &oid, mode, dir_cache)?;
     let index_path = crate::repo_relpath::storage_bytes(path);
     index_out.add_or_replace(entry_from_metadata(&meta, index_path.as_ref(), oid, mode));
@@ -893,6 +917,7 @@ fn restore_worktree_entry(
     worktree_from_tree: bool,
     rules: &WorktreeRules,
     dir_cache: &mut LeadingDirCache,
+    journal: &mut CheckoutJournal,
     index_out: &mut Index,
     outcome: &mut RestoreOutcome,
     index_dirty: &mut bool,
@@ -900,6 +925,7 @@ fn restore_worktree_entry(
     if entry.mode == MODE_GITLINK {
         return Ok(());
     }
+    journal.preserve_before_write(path)?;
     let meta = restore_blob_to_worktree(
         repo, rules, work_tree, path, &entry.oid, entry.mode, dir_cache,
     )?;
