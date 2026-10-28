@@ -1396,7 +1396,6 @@ pub fn grit_lib::command_runner::hooks::run_post_merge(&grit_lib::repo::Reposito
 pub fn grit_lib::command_runner::hooks::run_post_rewrite(&grit_lib::repo::Repository, grit_lib::command_runner::hooks::RewriteKind, &[(grit_lib::objects::ObjectId, grit_lib::objects::ObjectId)]) -> bool
 pub fn grit_lib::command_runner::hooks::run_pre_push_hook(&grit_lib::repo::Repository, &str, &str, &[grit_lib::command_runner::hooks::PrePushRef]) -> core::result::Result<grit_lib::command_runner::hooks::HookOutput, grit_lib::command_runner::hooks::HookError>
 pub fn grit_lib::command_runner::hooks::run_pre_rebase(&grit_lib::repo::Repository, core::option::Option<&str>) -> core::result::Result<bool, grit_lib::command_runner::hooks::HookError>
-pub fn grit_lib::command_runner::hooks::run_reference_transaction_committed_for_head_update(&grit_lib::repo::Repository, &grit_lib::state::HeadState, core::option::Option<grit_lib::objects::ObjectId>, grit_lib::objects::ObjectId) -> core::result::Result<grit_lib::command_runner::hooks::HookResult, grit_lib::command_runner::hooks::HookError>
 pub enum grit_lib::command_runner::CommandStdin
 pub grit_lib::command_runner::CommandStdin::Inherit
 pub grit_lib::command_runner::CommandStdin::Null

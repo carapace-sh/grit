@@ -9,11 +9,12 @@ use crate::command_runner::{
     ShellInvocation,
 };
 use crate::config::{parse_path, ConfigSet};
+use crate::environment::Environment;
 use crate::git_path::path_without_verbatim_prefix;
 use crate::git_path::CanonicalizeExt;
+use crate::objects::HashAlgo;
 use crate::objects::ObjectId;
 use crate::repo::Repository;
-use crate::state::HeadState;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
 use std::fs;
@@ -1344,46 +1345,326 @@ pub fn run_pre_push_hook(
     Ok(output)
 }
 
-/// `reference-transaction` hook with phase `committed` after updating `HEAD` and (on a branch)
-/// the branch ref to `new_oid`.
-///
-/// `old_head_commit` is the commit OID `HEAD` pointed at before the update, or `None` for an
-/// unborn branch (null old OID in hook stdin).
-///
-/// # Errors
-///
-/// Same as [`run_hook`].
-pub fn run_reference_transaction_committed_for_head_update(
-    repo: &Repository,
-    head: &HeadState,
-    old_head_commit: Option<ObjectId>,
-    new_oid: ObjectId,
-) -> Result<HookResult, HookError> {
-    let zero = ObjectId::zero();
-    let old_oid = old_head_commit.unwrap_or(zero);
-    let old_hex = if old_oid == zero {
-        "0000000000000000000000000000000000000000".to_owned()
-    } else {
-        old_oid.to_hex()
-    };
-    let new_hex = new_oid.to_hex();
-    let mut stdin = String::new();
-    match head {
-        HeadState::Branch { refname, .. } => {
-            // Git sorts ref updates lexicographically; `HEAD` precedes `refs/...`.
-            stdin.push_str(&format!("{old_hex} {new_hex} HEAD\n"));
-            stdin.push_str(&format!("{old_hex} {new_hex} {refname}\n"));
-        }
-        _ => {
-            stdin.push_str(&format!("{old_hex} {new_hex} HEAD\n"));
+/// Phase argument for the [`reference-transaction`](https://git-scm.com/docs/githooks#_reference_transaction) hook.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReferenceTransactionPhase {
+    /// Before any ref write in the transaction; non-zero exit aborts the batch.
+    Prepared,
+    /// After refs were written successfully.
+    Committed,
+    /// After the transaction was aborted without writing (or after `prepared` refused).
+    Aborted,
+}
+
+impl ReferenceTransactionPhase {
+    fn as_arg(self) -> &'static str {
+        match self {
+            Self::Prepared => "prepared",
+            Self::Committed => "committed",
+            Self::Aborted => "aborted",
         }
     }
-    run_hook(
-        repo,
-        "reference-transaction",
-        &["committed"],
-        Some(stdin.as_bytes()),
-    )
+}
+
+/// Cached hook execution context for ref-store transactions (no full [`Repository`] handle).
+#[derive(Clone)]
+pub struct RefHookContext {
+    git_dir: PathBuf,
+    work_tree: Option<PathBuf>,
+    environment: Arc<Environment>,
+    command_runner: Arc<dyn CommandRunner>,
+    hook_stdio: HookStdio,
+    diagnostics: crate::diagnostics::DiagnosticsHandle,
+    hash_algo: HashAlgo,
+}
+
+impl RefHookContext {
+    /// Build hook context for a repository being opened.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        git_dir: PathBuf,
+        work_tree: Option<PathBuf>,
+        environment: Arc<Environment>,
+        command_runner: Arc<dyn CommandRunner>,
+        hook_stdio: HookStdio,
+        diagnostics: crate::diagnostics::DiagnosticsHandle,
+        hash_algo: HashAlgo,
+    ) -> Self {
+        Self {
+            git_dir,
+            work_tree,
+            environment,
+            command_runner,
+            hook_stdio,
+            diagnostics,
+            hash_algo,
+        }
+    }
+
+    /// Null object id for this repository's hash algorithm.
+    #[must_use]
+    pub(crate) fn null_oid(&self) -> ObjectId {
+        ObjectId::null(self.hash_algo)
+    }
+
+    fn hook_run_dir(&self) -> &Path {
+        self.work_tree.as_deref().unwrap_or(&self.git_dir)
+    }
+
+    fn load_config(&self) -> Result<Arc<crate::config::ConfigSet>, HookError> {
+        crate::config::ConfigSet::load(&self.environment, Some(&self.git_dir), true)
+            .map(Arc::new)
+            .map_err(|e| HookError::Internal(e.to_string()))
+    }
+
+    /// Run the `reference-transaction` hook for one phase and stdin payload.
+    ///
+    /// A failure on [`ReferenceTransactionPhase::Prepared`] is returned as [`HookError::Failed`]
+    /// or [`HookError::Spawn`]; `committed` and `aborted` ignore hook failures.
+    pub(crate) fn run_reference_transaction(
+        &self,
+        phase: ReferenceTransactionPhase,
+        stdin: &[u8],
+    ) -> Result<(), HookError> {
+        if stdin.is_empty() {
+            return Ok(());
+        }
+        let config = self.load_config()?;
+        let result = run_hook_opts_for_ref_context(
+            self,
+            "reference-transaction",
+            &[phase.as_arg()],
+            config.as_ref(),
+            RunHookOptions {
+                stdin_data: Some(stdin),
+                stdout_to_stderr: true,
+                stdio: self.hook_stdio,
+                ..RunHookOptions::default()
+            },
+        )?;
+        if phase == ReferenceTransactionPhase::Prepared {
+            result.check("reference-transaction")?;
+        }
+        Ok(())
+    }
+}
+
+fn resolve_hooks_dir_for_ref(ctx: &RefHookContext, config: &ConfigSet) -> PathBuf {
+    let dir = match config.get("core.hooksPath") {
+        Some(hooks_path) => {
+            let p = PathBuf::from(parse_path(ctx.environment.as_ref(), &hooks_path));
+            if p.is_absolute() {
+                p
+            } else {
+                ctx.hook_run_dir().join(p)
+            }
+        }
+        None => crate::repo::common_git_dir_for_config(&ctx.git_dir).join("hooks"),
+    };
+    path_without_verbatim_prefix(&dir).into_owned()
+}
+
+fn hook_argv0_for_ref(
+    ctx: &RefHookContext,
+    hooks_dir: &Path,
+    hook_name: &str,
+    cwd: &Path,
+) -> PathBuf {
+    let default_hooks_dir = ctx.git_dir.join("hooks");
+    if same_dir(hooks_dir, &default_hooks_dir) {
+        if cwd == ctx.git_dir.as_path() {
+            return PathBuf::from("hooks").join(hook_name);
+        }
+        if let Some(work_tree) = &ctx.work_tree {
+            if cwd == work_tree.as_path() && same_dir(&ctx.git_dir, &work_tree.join(".git")) {
+                return PathBuf::from(".git").join("hooks").join(hook_name);
+            }
+        }
+    }
+    hooks_dir.join(hook_name)
+}
+
+fn resolve_hook_sequence_for_ref(
+    ctx: &RefHookContext,
+    hook_name: &str,
+    config: &ConfigSet,
+) -> Result<Vec<ResolvedHook>, String> {
+    let tables = HookConfigTables::from_config(config);
+    let mut seq = Vec::new();
+    for (_friendly, command) in tables.hooks_for_event(hook_name)? {
+        seq.push(ResolvedHook::Configured { command });
+    }
+    let hooks_dir = resolve_hooks_dir_for_ref(ctx, config);
+    if let Some(path) = traditional_hook_candidate_for_ref(ctx, &hooks_dir, hook_name) {
+        let argv0 = hook_argv0_for_ref(ctx, &hooks_dir, hook_name, ctx.hook_run_dir());
+        seq.push(ResolvedHook::Traditional { path, argv0 });
+    }
+    Ok(seq)
+}
+
+#[cfg_attr(not(unix), allow(unused_variables))]
+fn traditional_hook_candidate_for_ref(
+    ctx: &RefHookContext,
+    hooks_dir: &Path,
+    hook_name: &str,
+) -> Option<PathBuf> {
+    let path = hooks_dir.join(hook_name);
+    if !path.exists() {
+        return None;
+    }
+    let meta = fs::metadata(&path).ok()?;
+    #[cfg(unix)]
+    if meta.permissions().mode() & 0o111 == 0 {
+        let show_warning = ctx
+            .load_config()
+            .ok()
+            .and_then(|c| c.get("advice.ignoredHook"))
+            .map(|v| !matches!(v.to_lowercase().as_str(), "false" | "no" | "off" | "0"))
+            .unwrap_or(true);
+        if show_warning {
+            ctx.diagnostics
+                .warn(crate::diagnostics::Warning::NonExecutableHookIgnored {
+                    hook_name: hook_name.to_string(),
+                    hook_path: Some(path.clone()),
+                });
+        }
+        return None;
+    }
+    Some(path)
+}
+
+fn run_hook_opts_for_ref_context(
+    ctx: &RefHookContext,
+    hook_name: &str,
+    args: &[&str],
+    config: &ConfigSet,
+    opts: RunHookOptions<'_>,
+) -> Result<HookResult, HookError> {
+    let seq = resolve_hook_sequence_for_ref(ctx, hook_name, config)?;
+    if seq.is_empty() {
+        return Ok(HookResult::NotFound);
+    }
+
+    let work_dir = opts
+        .cwd
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| ctx.hook_run_dir().to_path_buf());
+    let work_dir = work_dir.as_path();
+    let runner = ctx.command_runner.as_ref();
+
+    let merged_env: Vec<(String, String)> = opts
+        .env_vars
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+        .collect();
+
+    let mut hook_env =
+        CommandEnvironment::from_repository_environment(ctx.environment.as_ref(), &merged_env);
+    if cfg!(windows) {
+        strip_verbatim_prefix_from_path_vars(&mut hook_env.set);
+    }
+    hook_env.set.push((
+        OsString::from("GIT_DIR"),
+        ctx.git_dir.as_os_str().to_os_string(),
+    ));
+
+    let capture = opts.stdio == HookStdio::Capture;
+    let (stdout, stderr) = match opts.stdio {
+        HookStdio::Capture => (CommandStdio::Pipe, CommandStdio::Pipe),
+        HookStdio::Inherit if opts.stdout_to_stderr => {
+            (CommandStdio::ParentStderr, CommandStdio::Inherit)
+        }
+        HookStdio::Inherit => (CommandStdio::Inherit, CommandStdio::Inherit),
+    };
+    let mut output = HookOutput::default();
+
+    for h in &seq {
+        let (stdin_piped, stdin_file) = match opts.path_to_stdin {
+            Some(p) => (true, Some(p.to_path_buf())),
+            None => (opts.stdin_data.is_some(), None),
+        };
+
+        let hook_ctx = HookSpawnContext {
+            runner,
+            cwd: work_dir,
+            env: &hook_env,
+            stdin_piped,
+            stdout,
+            stderr,
+        };
+        let spawned = match h {
+            ResolvedHook::Traditional { path, argv0 } => {
+                let effective_argv0 = path
+                    .parent()
+                    .map(|hooks_dir| hook_argv0_for_ref(ctx, hooks_dir, hook_name, work_dir))
+                    .unwrap_or_else(|| argv0.clone());
+                hook_ctx.spawn_traditional(hook_name, path, &effective_argv0, args)
+            }
+            ResolvedHook::Configured { command } => {
+                hook_ctx.spawn_configured(hook_name, command, args)
+            }
+        };
+        let mut child = match spawned {
+            Ok(child) => child,
+            Err(HookError::Spawn {
+                hook_name,
+                path,
+                source,
+                ..
+            }) => {
+                return Err(HookError::Spawn {
+                    hook_name,
+                    path,
+                    source,
+                    output,
+                })
+            }
+            Err(other) => return Err(other),
+        };
+
+        if let Some(ref path) = stdin_file {
+            let file = match fs::File::open(path) {
+                Ok(f) => f,
+                Err(_e) => {
+                    return Ok(HookResult::Failed { status: 1, output });
+                }
+            };
+            if let Some(stdin) = child.stdin_mut() {
+                let mut file = file;
+                let _ = std::io::copy(&mut file, stdin);
+            }
+        } else if let Some(data) = opts.stdin_data {
+            if let Some(stdin) = child.stdin_mut() {
+                let _ = stdin.write_all(data);
+            }
+        }
+        if stdin_piped {
+            child.close_stdin();
+        }
+
+        let waited = if capture {
+            child.wait_with_output().map(|o| {
+                output.stdout.extend_from_slice(&o.stdout);
+                output.stderr.extend_from_slice(&o.stderr);
+                o.status
+            })
+        } else {
+            child.wait()
+        };
+        let exit = match waited {
+            Ok(exit) => exit,
+            Err(_) => return Ok(HookResult::Failed { status: 1, output }),
+        };
+
+        if !exit.success {
+            return Ok(HookResult::Failed {
+                status: exit.code.unwrap_or(1),
+                output,
+            });
+        }
+    }
+
+    Ok(HookResult::Success { output })
 }
 
 #[cfg(test)]

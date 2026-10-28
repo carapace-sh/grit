@@ -522,6 +522,29 @@ impl ConfigSessionValidation {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn checked_ref_store_with_hooks(
+    inner: Arc<dyn crate::refs::store::RefStore>,
+    odb: crate::odb::Odb,
+    git_dir: &Path,
+    work_tree: Option<&Path>,
+    environment: &Arc<Environment>,
+    command_runner: &Arc<dyn CommandRunner>,
+    hook_stdio: crate::hooks::HookStdio,
+    diagnostics: &crate::diagnostics::DiagnosticsHandle,
+) -> crate::refs::store::ObjectCheckedRefStore {
+    let hooks = Arc::new(crate::hooks::RefHookContext::new(
+        git_dir.to_path_buf(),
+        work_tree.map(Path::to_path_buf),
+        Arc::clone(environment),
+        Arc::clone(command_runner),
+        hook_stdio,
+        Arc::clone(diagnostics),
+        odb.hash_algo(),
+    ));
+    crate::refs::store::ObjectCheckedRefStore::new(inner, odb).with_ref_hooks(hooks)
+}
+
 impl Repository {
     fn config_load_options(&self, include_system: bool) -> LoadConfigOptions {
         LoadConfigOptions {
@@ -595,9 +618,15 @@ impl Repository {
             .as_ref()
             .and_then(|wt| compute_git_prefix(environment.as_ref(), wt));
 
-        let ref_store = crate::refs::store::ObjectCheckedRefStore::new(
+        let ref_store = checked_ref_store_with_hooks(
             open_or_install_ref_store(&caches, &git_dir, &environment, injected_refs)?,
             odb.clone(),
+            &git_dir,
+            work_tree.as_deref(),
+            &environment,
+            &command_runner,
+            options.hook_stdio,
+            &options.diagnostics,
         );
         caches.configure_filter_subprocess(&environment, &git_dir, work_tree.as_deref());
 
@@ -847,7 +876,16 @@ impl Repository {
             caches.install_ref_store(&git_dir, Arc::clone(&view));
             view
         };
-        let ref_store = crate::refs::store::ObjectCheckedRefStore::new(ref_store, self.odb.clone());
+        let ref_store = checked_ref_store_with_hooks(
+            ref_store,
+            self.odb.clone(),
+            &git_dir,
+            Some(work_tree.as_path()),
+            &environment,
+            &self.command_runner,
+            self.hook_stdio,
+            &self.diagnostics,
+        );
         let repo = Self {
             git_prefix: compute_git_prefix(&environment, &work_tree),
             git_dir,
@@ -1348,7 +1386,16 @@ impl Repository {
         let store = linked_worktree_view(&self.git_dir, store);
         self.caches
             .install_ref_store(&self.git_dir, Arc::clone(&store));
-        self.ref_store = crate::refs::store::ObjectCheckedRefStore::new(store, self.odb.clone());
+        self.ref_store = checked_ref_store_with_hooks(
+            store,
+            self.odb.clone(),
+            self.git_dir(),
+            self.work_tree().map(Path::as_ref),
+            &self.environment,
+            &self.command_runner,
+            self.hook_stdio,
+            &self.diagnostics,
+        );
         self
     }
 
@@ -1808,9 +1855,15 @@ impl Repository {
             .as_ref()
             .and_then(|wt| compute_git_prefix(environment.as_ref(), wt));
 
-        let ref_store = crate::refs::store::ObjectCheckedRefStore::new(
+        let ref_store = checked_ref_store_with_hooks(
             open_or_install_ref_store(&caches, &git_dir, &environment, injected_refs)?,
             odb.clone(),
+            &git_dir,
+            work_tree.as_deref(),
+            &environment,
+            &command_runner,
+            options.hook_stdio,
+            &options.diagnostics,
         );
         caches.configure_filter_subprocess(&environment, &git_dir, work_tree.as_deref());
 
