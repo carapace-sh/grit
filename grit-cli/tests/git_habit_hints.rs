@@ -128,7 +128,7 @@ fn reset_head_path_suggests_restore_staged() {
     fs::write(repo.path().join("n"), "n\n").expect("write n");
     ok(repo.path(), home.path(), &["add", "n"]);
     let failure = fails(repo.path(), home.path(), &["reset", "HEAD", "n"]);
-    failure.assert_usage_hint("grit restore --staged n");
+    failure.assert_usage_hint("unstage paths with `grit restore --staged n`");
 }
 
 #[test]
@@ -157,6 +157,157 @@ fn markdown_usage_hint_for_checkout_dash_b() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("**Hint:**"));
     assert!(stdout.contains("grit switch -c feature"));
+}
+
+#[test]
+fn status_dash_s_succeeds() {
+    let (repo, home) = fresh_repo();
+    ok(repo.path(), home.path(), &["status", "-s"]);
+}
+
+#[test]
+fn log_dash_one_succeeds() {
+    let (repo, home) = fresh_repo();
+    ok(repo.path(), home.path(), &["log", "-1"]);
+    ok(
+        repo.path(),
+        home.path(),
+        &["log", "--graph", "--oneline", "-3"],
+    );
+}
+
+#[test]
+fn tag_dash_a_with_message_succeeds() {
+    let (repo, home) = fresh_repo();
+    ok(repo.path(), home.path(), &["tag", "-a", "v3", "-m", "x"]);
+}
+
+#[test]
+fn tag_annotate_without_message_is_usage() {
+    let (repo, home) = fresh_repo();
+    for args in [
+        &["tag", "-a", "review-no-message", "--dry-run"][..],
+        &["tag", "-a"][..],
+    ] {
+        let failure = fails(repo.path(), home.path(), args);
+        assert!(
+            failure.stderr.contains("annotated tag requires a message"),
+            "{}",
+            failure.stderr
+        );
+        assert_eq!(failure.json["kind"], "usage", "{}", failure.json);
+    }
+    let json_only = grit(
+        repo.path(),
+        home.path(),
+        &["--json", "tag", "-a", "review-no-message", "--dry-run"],
+    );
+    assert_eq!(json_only.status.code(), Some(2));
+    let body: serde_json::Value = serde_json::from_slice(&json_only.stdout).expect("usage json");
+    assert_eq!(body["kind"], "usage");
+}
+
+#[test]
+fn restore_dash_s_source_succeeds() {
+    let (repo, home) = fresh_repo();
+    fs::write(repo.path().join("a"), "2\n").expect("write");
+    ok(repo.path(), home.path(), &["commit", "-m", "two"]);
+    fs::write(repo.path().join("a"), "3\n").expect("write");
+    ok(repo.path(), home.path(), &["restore", "-s", "HEAD~1", "a"]);
+}
+
+#[test]
+fn commit_repeated_m_joins_paragraphs() {
+    let (repo, home) = fresh_repo();
+    fs::write(repo.path().join("b"), "b\n").expect("write");
+    ok(
+        repo.path(),
+        home.path(),
+        &["commit", "-m", "title", "-m", "body"],
+    );
+    let log = grit(repo.path(), home.path(), &["log", "-n", "1", "--json"]);
+    assert!(log.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&log.stdout).expect("json");
+    assert_eq!(json["commits"][0]["message"], "title\n\nbody");
+}
+
+#[test]
+fn commit_amend_no_edit_hint() {
+    let (repo, home) = fresh_repo();
+    let failure = fails(
+        repo.path(),
+        home.path(),
+        &["commit", "--amend", "--no-edit"],
+    );
+    failure.assert_usage_hint("does not open an editor");
+    assert!(!failure.stderr.contains("as text"));
+}
+
+#[test]
+fn clean_fd_hint() {
+    let (repo, home) = fresh_repo();
+    let failure = fails(repo.path(), home.path(), &["clean", "-fd"]);
+    failure.assert_usage_hint("grit clean -f");
+    assert!(!failure.stderr.contains("tip: to pass"));
+}
+
+#[test]
+fn stash_save_hint() {
+    let (repo, home) = fresh_repo();
+    let failure = fails(repo.path(), home.path(), &["stash", "save", "wip"]);
+    failure.assert_usage_hint("stash push -m wip");
+}
+
+#[test]
+fn cherry_pick_points_at_pick() {
+    let (repo, home) = fresh_repo();
+    let failure = fails(repo.path(), home.path(), &["cherry-pick", "HEAD"]);
+    failure.assert_usage_hint("grit pick");
+    assert!(!failure.stderr.contains("receive-pack"));
+}
+
+#[test]
+fn rev_parse_points_at_resolve() {
+    let (repo, home) = fresh_repo();
+    let failure = fails(repo.path(), home.path(), &["rev-parse", "HEAD"]);
+    failure.assert_usage_hint("grit resolve");
+}
+
+#[test]
+fn cat_file_points_at_cat_and_resolve() {
+    let (repo, home) = fresh_repo();
+    let failure = fails(repo.path(), home.path(), &["cat-file", "-p", "HEAD"]);
+    failure.assert_usage_hint("grit cat");
+    assert!(failure.json["hint"]
+        .as_str()
+        .unwrap()
+        .contains("grit resolve"));
+}
+
+#[test]
+fn ls_files_points_at_status_json() {
+    let (repo, home) = fresh_repo();
+    let failure = fails(repo.path(), home.path(), &["ls-files"]);
+    failure.assert_usage_hint("grit status --json");
+}
+
+#[test]
+fn describe_points_at_log_and_tag_contains() {
+    let (repo, home) = fresh_repo();
+    let failure = fails(repo.path(), home.path(), &["describe"]);
+    failure.assert_usage_hint("grit log -n 1 --decorate");
+    assert!(failure.json["hint"]
+        .as_str()
+        .unwrap()
+        .contains("tag --contains"));
+}
+
+#[test]
+fn grep_points_at_log_grep_not_repack() {
+    let (repo, home) = fresh_repo();
+    let failure = fails(repo.path(), home.path(), &["grep", "foo"]);
+    failure.assert_usage_hint("grit log --grep");
+    assert!(!failure.stderr.contains("repack"));
 }
 
 #[test]

@@ -36,7 +36,7 @@ Discards local changes for tracked paths you name. By default, `grit restore` re
 | `--hunks` | Discard or unstage only the listed hunk ids (comma-separated, repeatable). |
 | `--lines` | Discard or unstage only new-side line ranges (`path:start-end`, repeatable). Mix with `--hunks`. |
 | `--dry-run` | With `--hunks` or `--lines`, report paths that would change without writing. |
-| `--source` | Commit or tree to restore from. |
+| `-s`, `--source` | Commit or tree to restore from. |
 | `--ours` | Unmerged paths only: check out our side (stage 2) in the worktree. |
 | `--theirs` | Unmerged paths only: check out their side (stage 3) in the worktree. |
 | `--merge` | Unmerged paths only: recreate conflict markers in the worktree (default style from `merge.conflictStyle`). |

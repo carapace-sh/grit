@@ -82,6 +82,13 @@ impl ExitStatus {
         {
             return Self::Usage;
         }
+        if err.chain().any(|cause| {
+            cause
+                .downcast_ref::<commands::tag::TagUsageError>()
+                .is_some()
+        }) {
+            return Self::Usage;
+        }
         if err
             .chain()
             .any(|cause| cause.downcast_ref::<BlameUsageError>().is_some())

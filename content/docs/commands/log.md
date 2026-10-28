@@ -46,7 +46,7 @@ With `--graph`, human output draws a commit graph in the left margin (Unicode bo
 | Option | Description |
 | --- | --- |
 | `<REV>…` | Tips and ranges to walk (default `HEAD`). |
-| `-n`, `--limit <N>` | Stop after `N` commits. On the default walk, this is the page size (including when continuing with `--cursor`). With path filters, caps how many matching commits are returned; omit it to list all matches. A one-shot `-n` without `--cursor` and without paths lists `N` commits with no `next` cursor. `--max-count` is Git’s well-known alias. |
+| `-n`, `--limit <N>` | Stop after `N` commits. On the default walk, this is the page size (including when continuing with `--cursor`). With path filters, caps how many matching commits are returned; omit it to list all matches. A one-shot `-n` without `--cursor` and without paths lists `N` commits with no `next` cursor. `--max-count` is Git’s well-known alias. Git’s `-1` / `-3` shorthand (for example `grit log -1` or `grit log --graph --oneline -3`) is accepted as `-n`. |
 | `--cursor [<token>]` | With `token`, continue a paged walk using `next` from `--json` or the `→ more` line (short `lw1.s.` tokens are stored under `.git/grit/log-walk/`; long `lw1.` base64 tokens still work). With no value, include the short continuation token on the `→ more` line for this page. The cursor encodes the original revision selection, date cutoffs, and walk queue—when resuming, pass `--cursor=<token>` alone (optional `-n` for page size). Revision operands, date filters, and ref-set flags are rejected when continuing. Cannot be combined with path operands. |
 | `--before <date>` | Alias for `--until` (date cutoff on committer date). |
 | `--skip <N>` | Skip `N` commits after ordering (cursor walks do not support `--skip`). |

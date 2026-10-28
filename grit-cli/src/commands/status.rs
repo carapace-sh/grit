@@ -803,7 +803,7 @@ pub struct StatusCliArgs {
     #[arg(long)]
     pub ignored: bool,
     /// One line per path: two-letter index/worktree code plus path (`??` / `!!` for untracked / ignored).
-    #[arg(long)]
+    #[arg(short = 's', long)]
     pub short: bool,
     #[command(flatten)]
     pub pathspecs: PathspecArgs,

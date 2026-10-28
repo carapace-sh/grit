@@ -69,6 +69,13 @@ pub fn eprint_clap_trailer(argv: &[OsString], err: &clap::Error) {
 }
 
 fn migration_hint(argv: &[OsString], err: &clap::Error) -> Option<String> {
+    if let Some(hint) = invalid_subcommand_hint(err) {
+        return Some(hint);
+    }
+    if let Some(hint) = too_many_values_hint(argv, err) {
+        return Some(hint);
+    }
+
     match err.kind() {
         ErrorKind::UnknownArgument => {}
         ErrorKind::TooManyValues => {}
@@ -101,6 +108,99 @@ fn migration_hint(argv: &[OsString], err: &clap::Error) -> Option<String> {
         return reset_unstage_hint(argv, &bad);
     }
 
+    if sub == "commit" && bad == "--no-edit" {
+        return Some(
+            "grit does not open an editor; `grit commit --amend` already keeps the previous message"
+                .to_owned(),
+        );
+    }
+
+    if sub == "clean" && matches!(bad.as_str(), "-d" | "-fd") {
+        return Some(
+            "untracked directories are already removed; use `grit clean -f` (drop `-d`)".to_owned(),
+        );
+    }
+
+    if sub == "stash" && bad == "save" {
+        let msg = stash_save_message(argv);
+        return Some(if let Some(text) = msg {
+            format!("use `grit stash push -m {text}` (or `grit stash -m {text}`)")
+        } else {
+            "use `grit stash push -m <msg>` (or `grit stash -m <msg>`)".to_owned()
+        });
+    }
+
+    if sub == "tag" && matches!(bad.as_str(), "-a" | "--annotate") {
+        return Some(
+            "`-m` or `-F` / `--message-file` already creates an annotated tag (no editor)"
+                .to_owned(),
+        );
+    }
+
+    None
+}
+
+fn invalid_subcommand_hint(err: &clap::Error) -> Option<String> {
+    if !matches!(err.kind(), ErrorKind::InvalidSubcommand) {
+        return None;
+    }
+    let name = unrecognized_subcommand(err)?;
+    Some(match name.as_str() {
+        "cherry-pick" => "apply commits with `grit pick`".to_owned(),
+        "rev-parse" => "resolve refs and commits with `grit resolve`".to_owned(),
+        "cat-file" => {
+            "show object contents with `grit cat`; resolve ids and types with `grit resolve`"
+                .to_owned()
+        }
+        "ls-files" => "there is no full index listing; use `grit status --json` for changed paths (not every tracked file)".to_owned(),
+        "describe" => {
+            "no describe command; nearest decorated commit is `grit log -n 1 --decorate`; tags containing HEAD are `grit tag --contains`".to_owned()
+        }
+        "grep" => "no worktree grep; search commit messages with `grit log --grep <pattern>`"
+            .to_owned(),
+        _ => return None,
+    })
+}
+
+fn too_many_values_hint(_argv: &[OsString], err: &clap::Error) -> Option<String> {
+    if !matches!(err.kind(), ErrorKind::TooManyValues) {
+        return None;
+    }
+    let rendered = err.to_string();
+    if rendered.contains("--message") && rendered.contains("multiple times") {
+        return Some(
+            "repeat `-m` for multiple paragraphs, or put a blank line in one `-m` / use `-F`"
+                .to_owned(),
+        );
+    }
+    None
+}
+
+fn unrecognized_subcommand(err: &clap::Error) -> Option<String> {
+    let rendered = err.to_string();
+    let first = rendered.lines().next()?;
+    let rest = first.strip_prefix("error:")?.trim();
+    let rest = rest.strip_prefix("unrecognized subcommand ")?;
+    let quoted = rest.strip_prefix('\'')?;
+    let (name, _) = quoted.split_once('\'')?;
+    Some(name.to_owned())
+}
+
+fn stash_save_message(argv: &[OsString]) -> Option<String> {
+    let mut after_save = false;
+    for arg in argv.iter().skip(1) {
+        if arg == "stash" {
+            after_save = false;
+            continue;
+        }
+        if arg == "save" {
+            after_save = true;
+            continue;
+        }
+        if after_save {
+            return arg.to_str().map(shell_word);
+        }
+    }
     None
 }
 
@@ -125,7 +225,7 @@ fn clap_human_message(err: &clap::Error, hint: Option<&str>) -> String {
         .filter(|line| !line.is_empty())
         .map(str::to_owned)
         .collect();
-    lines.retain(|line| !is_generic_pass_as_value_tip(line));
+    lines.retain(|line| !is_misleading_clap_tip(line));
     if lines.is_empty() {
         return "invalid arguments".to_owned();
     }
@@ -159,9 +259,11 @@ fn rewrite_usage_line(argv: &[OsString], line: &str) -> String {
         .replace("Usage: grit checkout", &format!("Usage: grit {display}"))
 }
 
-fn is_generic_pass_as_value_tip(line: &str) -> bool {
+fn is_misleading_clap_tip(line: &str) -> bool {
     let trimmed = line.trim_start();
-    trimmed.starts_with("tip:") && trimmed.contains("to pass") && trimmed.contains("use '--")
+    (trimmed.starts_with("tip:") && trimmed.contains("to pass") && trimmed.contains("use '--"))
+        || (trimmed.starts_with("tip:") && trimmed.contains("as text"))
+        || (trimmed.starts_with("tip:") && trimmed.contains("similar subcommand"))
 }
 
 fn unexpected_argument(err: &clap::Error) -> Option<String> {
@@ -260,6 +362,15 @@ mod tests {
         Init {
             path: Option<String>,
         },
+        Commit {
+            #[arg(long = "amend")]
+            amend: bool,
+        },
+        Clean {
+            #[arg(short, long)]
+            force: bool,
+        },
+        Stash {},
     }
 
     fn parse_err(argv: &[&str]) -> clap::Error {
@@ -310,7 +421,7 @@ mod tests {
     #[test]
     fn reset_head_path_points_at_restore_staged() {
         let hint = hint_for(&["grit", "reset", "HEAD", "n"]);
-        assert!(hint.contains("grit restore --staged n"));
+        assert_eq!(hint, "unstage paths with `grit restore --staged n`");
     }
 
     #[test]
@@ -336,5 +447,24 @@ mod tests {
         ]);
         let hint = checkout_restore_hint("a").expect("hint");
         assert!(hint.contains("grit restore a"));
+    }
+
+    #[test]
+    fn commit_no_edit_points_at_amend() {
+        let hint = hint_for(&["grit", "commit", "--amend", "--no-edit"]);
+        assert!(hint.contains("does not open an editor"));
+    }
+
+    #[test]
+    fn clean_d_says_drop_d_flag() {
+        let hint = hint_for(&["grit", "clean", "-fd"]);
+        assert!(hint.contains("grit clean -f"));
+        assert!(hint.contains("drop `-d`"));
+    }
+
+    #[test]
+    fn stash_save_suggests_push() {
+        let hint = hint_for(&["grit", "stash", "save", "wip"]);
+        assert!(hint.contains("stash push -m wip"));
     }
 }
