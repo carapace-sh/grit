@@ -7088,6 +7088,109 @@ mod cached_lookup_tests {
         git(dir, &["repack", "-a", "-d"]);
     }
 
+    fn git_stdout(dir: &Path, args: &[&str], stdin: Option<&str>) -> String {
+        use std::io::Write;
+        let mut child = Command::new("git") // hygiene: git fixture comparison in cfg(test) module
+            .current_dir(dir)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn git");
+        if let Some(input) = stdin {
+            child
+                .stdin
+                .as_mut()
+                .expect("stdin")
+                .write_all(input.as_bytes())
+                .expect("write stdin");
+        }
+        let out = child.wait_with_output().expect("git output");
+        assert!(out.status.success(), "git {args:?}");
+        String::from_utf8(out.stdout)
+            .expect("utf-8")
+            .trim()
+            .to_owned()
+    }
+
+    fn oid_of(dir: &Path, rev: &str) -> ObjectId {
+        ObjectId::from_hex(&git_stdout(dir, &["rev-parse", rev], None)).expect("oid")
+    }
+
+    #[cfg_attr(
+        not(feature = "full-tests"),
+        ignore = "starts system git or is heavy; run with --features full-tests"
+    )]
+    #[test]
+    fn packed_commit_header_block_parses_like_the_whole_commit() {
+        let _guard = pack_cache_test_guard();
+        clear_pack_cache();
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        git(root, &["init", "-q"]);
+        fs::write(root.join("f"), "one\n").unwrap();
+        git(root, &["add", "f"]);
+        git(root, &["commit", "-qm", "first"]);
+        fs::write(root.join("f"), "two\n").unwrap();
+        let long_message = format!("second\n\n{}", "a long body line\n".repeat(200));
+        git(root, &["commit", "-qam", &long_message]);
+        git(root, &["tag", "-a", "-m", "annotated", "v1"]);
+        let signature: String = (0..60)
+            .map(|i| format!(" signature line {i:03} with some padding text\n"))
+            .collect();
+        let signed_body = format!(
+            "tree {}\nparent {}\nauthor t <t@example.com> 1 +0000\n\
+             committer t <t@example.com> 2 +0000\ngpgsig -----BEGIN-----\n{signature} \
+             -----END-----\n\nsigned\n",
+            oid_of(root, "HEAD^{tree}"),
+            oid_of(root, "HEAD"),
+        );
+        let signed = git_stdout(
+            root,
+            &["hash-object", "-t", "commit", "-w", "--stdin"],
+            Some(&signed_body),
+        );
+        git(root, &["update-ref", "refs/heads/signed", &signed]);
+        git(root, &["repack", "-a", "-d", "--window=0"]);
+        fs::write(root.join("f"), "three\n").unwrap();
+        git(root, &["commit", "-qam", "second pack"]);
+        git(root, &["repack", "-d", "--window=0"]);
+        fs::write(root.join("f"), "four\n").unwrap();
+        git(root, &["commit", "-qam", "loose"]);
+
+        let objects = root.join(".git/objects");
+        let mut buf = Vec::new();
+        for rev in ["HEAD~3", "HEAD~2", "HEAD~1"] {
+            let oid = oid_of(root, rev);
+            assert!(
+                read_packed_commit_header_block_into(&objects, &oid, &mut buf).unwrap(),
+                "{rev} is a whole packed commit"
+            );
+            assert!(buf.ends_with(b"\n\n"), "{rev} ends at the blank line");
+            let whole = git_stdout(root, &["cat-file", "commit", rev], None);
+            let whole = crate::objects::CommitRef::parse(whole.as_bytes()).unwrap();
+            let header = crate::objects::CommitRef::parse(&buf).unwrap();
+            assert_eq!(header.tree(), whole.tree(), "{rev}");
+            assert_eq!(header.parents(), whole.parents(), "{rev}");
+            assert_eq!(header.committer_raw(), whole.committer_raw(), "{rev}");
+            assert!(header.message_bytes().is_empty(), "{rev}");
+        }
+        let signed = ObjectId::from_hex(&signed).unwrap();
+        for (oid, why) in [
+            (signed, "headers longer than the inflate budget"),
+            (oid_of(root, "v1"), "an annotated tag"),
+            (oid_of(root, "HEAD~1^{tree}"), "a packed tree"),
+            (oid_of(root, "HEAD"), "a loose commit"),
+        ] {
+            assert!(
+                !read_packed_commit_header_block_into(&objects, &oid, &mut buf).unwrap(),
+                "{why}"
+            );
+        }
+    }
+
     fn init_repo_with_pack(dir: &Path) -> ObjectId {
         git(dir, &["init", "-q"]);
         std::fs::write(dir.join("blob.txt"), b"pack cached lookup fixture\n").unwrap();

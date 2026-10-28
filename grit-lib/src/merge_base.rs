@@ -4849,4 +4849,220 @@ mod tests {
         assert_eq!(newest, vec![chain[29], chain[28], chain[27]]);
         Ok(())
     }
+
+    /// Point `refs` at their commits, pack everything they reach with whole objects (no
+    /// deltas), and reopen the repository so reads go through the pack.
+    fn packed_over_refs(
+        dir: &tempfile::TempDir,
+        repo: Repository,
+        refs: &[(String, ObjectId)],
+    ) -> Result<Repository> {
+        for (name, oid) in refs {
+            crate::refs::write_ref(repo.git_dir(), name, oid)?;
+        }
+        let opts = crate::maintenance::RepackOptions {
+            pack_build: Some(crate::pack_objects::PackBuildOptions {
+                delta: false,
+                window: 0,
+                max_depth: 0,
+                ..crate::pack_objects::PackBuildOptions::for_local_copy(None)
+            }),
+            ..crate::maintenance::RepackOptions::default()
+        };
+        crate::maintenance::repack(&repo, &opts)?;
+        drop(repo);
+        Repository::open(dir.path(), &RepositoryOptions::empty())
+    }
+
+    /// A trunk with one old tagged side commit per tag, every tag older than the trunk tip.
+    struct ManyTags {
+        trunk: Vec<ObjectId>,
+        tags: Vec<ObjectId>,
+        refs: Vec<(String, ObjectId)>,
+    }
+
+    fn write_many_tags(repo: &Repository, count: usize) -> Result<ManyTags> {
+        const HOUR: i64 = 3_600;
+        let trunk = write_chain(repo, count + 10, |i| 1_000_000 + HOUR * i as i64)?;
+        let mut tags = Vec::with_capacity(count);
+        let mut refs = vec![("refs/heads/main".to_owned(), trunk[count + 9])];
+        for i in 0..count {
+            let tag = write_commit_same_time(
+                &repo.odb(),
+                &[trunk[i]],
+                &format!("release {i}\n\nA longer message body for release {i}."),
+                1_000_000 + HOUR * i as i64 + 60,
+            )?;
+            refs.push((format!("refs/tags/v{i}"), tag));
+            tags.push(tag);
+        }
+        Ok(ManyTags { trunk, tags, refs })
+    }
+
+    #[test]
+    fn prime_tips_records_the_linkage_a_full_read_records() -> Result<()> {
+        let dir = tempdir().map_err(Error::Io)?;
+        let repo = open_test_bare(&dir)?;
+        let history = write_many_tags(&repo, PRIME_TIPS_MIN + 16)?;
+        let repo = packed_over_refs(&dir, repo, &history.refs)?;
+
+        let mut expected = Vec::new();
+        clear_commit_linkage(&repo);
+        let mut full = CommitGraphCache::new(&repo);
+        for &tag in &history.tags {
+            expected.push((full.parents_of(tag)?, full.commit_time(tag)?));
+        }
+
+        clear_commit_linkage(&repo);
+        let mut primed = CommitGraphCache::new(&repo);
+        primed.prime_tips(&history.tags);
+        assert_eq!(primed.header_primed.len(), history.tags.len());
+        for (&tag, want) in history.tags.iter().zip(&expected) {
+            assert_eq!(primed.peel_tip(tag)?, Some(tag));
+            let recorded = primed.with_linkage(|link| {
+                (
+                    link.parents.get(&tag).cloned(),
+                    link.times.get(&tag).copied(),
+                )
+            });
+            assert_eq!(recorded, (Some(want.0.clone()), Some(want.1)), "{tag}");
+        }
+
+        clear_commit_linkage(&repo);
+        let mut few = CommitGraphCache::new(&repo);
+        few.prime_tips(&history.tags[..PRIME_TIPS_MIN - 1]);
+        assert!(
+            few.header_primed.is_empty(),
+            "a paint with few tips keeps the plain reads"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn prime_tips_leaves_loose_commits_and_tags_to_the_full_peel() -> Result<()> {
+        use crate::objects::{serialize_tag, TagData};
+
+        let dir = tempdir().map_err(Error::Io)?;
+        let repo = open_test_bare(&dir)?;
+        let history = write_many_tags(&repo, PRIME_TIPS_MIN)?;
+        let repo = packed_over_refs(&dir, repo, &history.refs)?;
+        let loose = write_commit_same_time(&repo.odb(), &[history.tags[0]], "loose", 9_999_999)?;
+        let tag_bytes = serialize_tag(&TagData {
+            object: history.tags[1],
+            object_type: "commit".into(),
+            tag: "annotated".into(),
+            tagger: Some("T <t@e.com> 1 +0000".into()),
+            message: "annotated\n".into(),
+            extra_headers: Vec::new(),
+        });
+        let annotated = repo.odb().write(ObjectKind::Tag, &tag_bytes)?;
+        let mut tips = history.tags.clone();
+        tips.extend([loose, annotated]);
+
+        clear_commit_linkage(&repo);
+        let mut cache = CommitGraphCache::new(&repo);
+        cache.prime_tips(&tips);
+        assert_eq!(cache.header_primed.len(), history.tags.len());
+        assert!(!cache.header_primed.contains(&loose));
+        assert!(!cache.header_primed.contains(&annotated));
+        assert_eq!(cache.peel_tip(loose)?, Some(loose));
+        assert_eq!(cache.peel_tip(annotated)?, Some(history.tags[1]));
+        Ok(())
+    }
+
+    #[test]
+    fn left_behind_walk_over_many_packed_tags_matches_the_exhaustive_walk() -> Result<()> {
+        let dir = tempdir().map_err(Error::Io)?;
+        let repo = open_test_bare(&dir)?;
+        let history = write_many_tags(&repo, 2 * PRIME_TIPS_MIN)?;
+        let tip = *history.trunk.last().expect("trunk");
+        let repo = packed_over_refs(&dir, repo, &history.refs)?;
+        let wip = write_commit_same_time(&repo.odb(), &[tip], "wip", 9_000_000)?;
+        let mut hide: Vec<ObjectId> = history.refs.iter().map(|(_, oid)| *oid).collect();
+
+        for expected in [(1, vec![wip]), (0, Vec::new())] {
+            clear_commit_linkage(&repo);
+            let exhaustive = walk_commits_reachable_excluding_ancestors_of(
+                &repo,
+                &[wip],
+                &hide,
+                ReachableWalkLimit::CountAllRetainNewest(20),
+            )?;
+            clear_commit_linkage(&repo);
+            let bounded = count_commits_left_behind(&repo, &[wip], &hide, 20)?;
+            assert_eq!(bounded, expected);
+            assert_eq!(bounded, exhaustive);
+            // A ref on a descendant of `wip` keeps it reachable.
+            let child = write_commit_same_time(&repo.odb(), &[wip], "child", 9_000_100)?;
+            hide.push(child);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn rewound_ref_is_not_an_ancestor_without_the_slop_walk() -> Result<()> {
+        use super::intersect_walk_test_hooks::{
+            commit_parent_lookups, reset_commit_parent_lookups,
+        };
+
+        const HOUR: i64 = 3_600;
+        let dir = tempdir().map_err(Error::Io)?;
+        let repo = open_test_bare(&dir)?;
+        let trunk = write_chain(&repo, 400, |i| 1_000_000 + HOUR * i as i64)?;
+        let wip = write_commit_same_time(&repo.odb(), &[trunk[399]], "wip", 9_000_000)?;
+        let side = write_commit_same_time(&repo.odb(), &[trunk[200]], "side", 9_000_000)?;
+
+        for (ancestor, descendant) in [
+            (wip, trunk[399]),
+            (wip, trunk[396]),
+            (trunk[396], wip),
+            (side, trunk[399]),
+            (trunk[100], side),
+            (trunk[399], trunk[399]),
+        ] {
+            clear_commit_linkage(&repo);
+            let expected = is_ancestor(&repo, ancestor, descendant)?;
+            clear_commit_linkage(&repo);
+            assert_eq!(
+                is_ancestor_unless_rewound(&repo, ancestor, descendant)?,
+                expected,
+                "{ancestor} -> {descendant}"
+            );
+        }
+
+        clear_commit_linkage(&repo);
+        reset_commit_parent_lookups();
+        assert!(is_ancestor(&repo, wip, trunk[396]).is_ok_and(|a| !a));
+        let slop_lookups = commit_parent_lookups();
+        clear_commit_linkage(&repo);
+        reset_commit_parent_lookups();
+        assert!(!is_ancestor_unless_rewound(&repo, wip, trunk[396])?);
+        let lookups = commit_parent_lookups();
+        assert!(slop_lookups >= 100, "the date-slop walk ({slop_lookups})");
+        // The target, then `wip` and the three commits down the chain to it.
+        assert!(lookups <= 5, "HEAD~3 is found on the chain ({lookups})");
+        Ok(())
+    }
+
+    #[test]
+    fn rewound_check_defers_to_the_full_walk_when_grafts_rewrite_parents() -> Result<()> {
+        let dir = tempdir().map_err(Error::Io)?;
+        let repo = open_test_bare(&dir)?;
+        let base = write_commit_same_time(&repo.odb(), &[], "base", 100)?;
+        let tip = write_commit_same_time(&repo.odb(), &[base], "tip", 200)?;
+        // The graft makes `base` a child of `tip`: each reaches the other.
+        fs::create_dir_all(repo.git_dir().join("info"))?;
+        fs::write(
+            repo.git_dir().join("info/grafts"),
+            format!("{base} {tip}\n"),
+        )?;
+        let repo = Repository::open(dir.path(), &RepositoryOptions::empty())?;
+
+        clear_commit_linkage(&repo);
+        let expected = is_ancestor(&repo, tip, base)?;
+        clear_commit_linkage(&repo);
+        assert_eq!(is_ancestor_unless_rewound(&repo, tip, base)?, expected);
+        assert!(expected, "the graft makes {tip} an ancestor of {base}");
+        Ok(())
+    }
 }
