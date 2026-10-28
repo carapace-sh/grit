@@ -4125,7 +4125,7 @@ pub struct DiffIndexToWorktreeOptions {
     /// Status-only shortcuts (default `false`).
     ///
     /// When true, a tracked file whose size differs from its index entry is reported as
-    /// modified without reading it, with the *index* blob as `new_oid`, and intent-to-add
+    /// modified without reading it, with a null worktree `new_oid`, and intent-to-add
     /// entries are not hashed. Content diffs must leave this off so a content change always
     /// carries a null worktree `new_oid` (`old_oid != new_oid`).
     pub for_status: bool,
@@ -4331,7 +4331,7 @@ fn status_size_change_proves_modified(
 }
 
 /// Report `ie` modified when [`status_size_change_proves_modified`] holds; returns whether it
-/// did. The worktree side keeps the index oid because the file was not hashed.
+/// did. The worktree side uses the null OID because the file was not hashed.
 #[must_use]
 fn try_push_status_modified_on_size_mismatch(
     ie: &IndexEntry,
@@ -4349,7 +4349,7 @@ fn try_push_status_modified_on_size_mismatch(
         ie,
         path_str_ref,
         worktree_mode,
-        ie.oid,
+        zero_oid(),
     ));
     true
 }
@@ -7183,8 +7183,8 @@ pub fn diff_tree_to_worktree_with_git_dir_and_rules(
                     repository_git_dir: Some(repository_git_dir.to_path_buf()),
                     refresh_index_stat_in_pass: false,
                     // Tree↔worktree raw lines use a null worktree OID when content differs; the
-                    // status fast path (`for_status`) may report size-only drift with both sides
-                    // set to the index blob (see `status_size_change_proves_modified`).
+                    // status fast path (`for_status`) uses the same null OID for size-only drift
+                    // without hashing (see `status_size_change_proves_modified`).
                     for_status: false,
                     config: config.cloned().map(std::sync::Arc::new),
                     ..DiffIndexToWorktreeOptions::default()
@@ -13354,6 +13354,8 @@ mod smudge_racily_clean_tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].status, super::DiffStatus::Modified);
         assert_eq!(entries[0].path(), rel);
+        assert_eq!(entries[0].old_oid, index.entries[0].oid);
+        assert_eq!(entries[0].new_oid, super::zero_oid());
         assert_eq!(
             metrics.blob_content_reads(),
             0,
