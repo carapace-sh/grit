@@ -323,6 +323,52 @@ fn rebase_onto_moves_stacked_merge_with_unrelated_second_parent() {
 }
 
 #[test]
+fn rebase_onto_moves_stacked_merge_with_unrelated_first_parent() {
+    let repo = HistoryRepo::init();
+    let wt = repo.worktree();
+    let oids = build_commit_dag(
+        wt,
+        &[
+            ("base", "r"),
+            ("main_m", "base"),
+            ("a1", "base"),
+            ("a2", "a1"),
+            ("side", "r"),
+            ("b_merge", "side"),
+            ("b_merge", "a2"),
+        ],
+        &[
+            ("main_m", "refs/heads/main"),
+            ("a2", "refs/heads/a"),
+            ("b_merge", "refs/heads/b"),
+        ],
+    );
+    git(wt, &["checkout", "a"]);
+    let grit = open_grit(wt);
+    let plan = match plan_rebase(
+        &grit,
+        &rebase_request(oids["main_m"], None, oids["a2"]),
+        &rebase_opts(RefScope::Branches, EmptyPolicy::Drop, true),
+    )
+    .expect("plan")
+    {
+        RebasePlan::Plan(plan) => plan,
+        other => panic!("expected plan, got {other:?}"),
+    };
+    assert!(
+        plan.ref_updates.iter().any(|u| u.name.ends_with("b")),
+        "{:?}",
+        plan.ref_updates
+    );
+    apply_plan(&grit, &plan);
+    let merge =
+        parse_commit(&grit.odb().read(&git_rev_parse(wt, "b")).expect("read").data).expect("parse");
+    assert_eq!(merge.parents.len(), 2);
+    assert_eq!(merge.parents[0], oids["side"]);
+    assert_git_fsck_strict(wt);
+}
+
+#[test]
 fn rebase_onto_moves_stacked_branches() {
     let repo = HistoryRepo::init();
     let wt = repo.worktree();

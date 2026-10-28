@@ -634,10 +634,10 @@ fn extend_rebase_replay_order(
     Ok(order)
 }
 
-/// Commits on the first-parent chain from `tip` down to the rebase range, excluding the range.
+/// Commits reachable from `tip` that descend from the rewritten range but are not part of it.
 ///
-/// Merge commits keep out-of-range second parents out of the replay order; those parents stay
-/// unmapped when the merge is replayed.
+/// Unrelated parents of a stacked merge (orphan roots, etc.) are excluded even when they appear
+/// first in the parent list; those parents stay unmapped when the merge is replayed.
 fn stacked_commits_above_range(
     repo: &Repository,
     tip: ObjectId,
@@ -645,20 +645,20 @@ fn stacked_commits_above_range(
     fork: ObjectId,
     skip_map: &HashMap<ObjectId, ObjectId>,
 ) -> Result<Vec<ObjectId>, HistoryError> {
-    let mut out = Vec::new();
-    let mut current = tip;
-    while current != fork && !range_set.contains(&current) {
-        if skip_map.contains_key(&current) {
-            break;
-        }
-        out.push(current);
-        let parents = commit_parents(repo, current)?;
-        let Some(&first_parent) = parents.first() else {
-            break;
-        };
-        current = first_parent;
-    }
-    Ok(out)
+    let mut reachable = commits_reachable_excluding_ancestors_of(repo, &[tip], &[fork], None)?;
+    reachable.retain(|oid| *oid != fork && !range_set.contains(oid) && !skip_map.contains_key(oid));
+    reachable.retain(|oid| descends_from_rewritten_range(repo, *oid, range_set));
+    Ok(reachable)
+}
+
+fn descends_from_rewritten_range(
+    repo: &Repository,
+    commit: ObjectId,
+    range_set: &HashSet<ObjectId>,
+) -> bool {
+    range_set
+        .iter()
+        .any(|&range_commit| is_ancestor(repo, range_commit, commit).unwrap_or(false))
 }
 
 /// When `commit` is the tip of a side branch merged into the range, return the first parent
