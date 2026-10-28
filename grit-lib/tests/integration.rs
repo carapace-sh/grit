@@ -375,6 +375,9 @@ mod commit_identity_create_git_compat;
 #[path = "commit_merge_state_git_compat.rs"]
 mod commit_merge_state_git_compat;
 #[cfg(feature = "full-tests")]
+#[path = "commit_message_hooks.rs"]
+mod commit_message_hooks;
+#[cfg(feature = "full-tests")]
 #[path = "commit_message_source.rs"]
 mod commit_message_source;
 #[cfg(feature = "full-tests")]

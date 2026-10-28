@@ -595,6 +595,7 @@ fn rebase_start(upstream: ObjectId, tip: ObjectId) -> StartRebaseOptions {
             record_operation: None,
             hooks: grit_lib::PostOperationHooks::Skip,
         },
+        pre_rebase: grit_lib::revwalk::history::PreRebase::Skip,
     }
 }
 

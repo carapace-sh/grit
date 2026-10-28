@@ -79,9 +79,11 @@ use crate::state::{clear_merge_state, read_merge_heads, read_merge_msg, read_ori
 use crate::stripspace::{process as stripspace_process, Mode as StripspaceMode};
 use thiserror::Error;
 
+use crate::hooks::{run_commit_hook, CommitHookEnv, HookName};
 use crate::porcelain::add::stage_for_commit_on_index;
 use crate::porcelain::commit::{
-    create_commit_with_loaded_index, default_commit_scope_from_config, CommitRequest, CommitScope,
+    create_commit_with_loaded_index, default_commit_scope_from_config, run_commit_message_hooks,
+    CommitRequest, CommitScope, HookPolicy, MessageSource,
 };
 use crate::worktree_rules::WorktreeRules;
 use crate::write_tree::write_tree_from_index;
@@ -290,6 +292,10 @@ pub struct MergeOptions {
     pub allow_unrelated: bool,
     /// Whether to run `post-merge` after a fast-forward, merge commit or squash.
     pub hooks: PostOperationHooks,
+    /// Whether `pre-merge-commit` and `commit-msg` run before a merge commit is recorded
+    /// ([`HookPolicy::SkipVerify`] is `--no-verify`). `prepare-commit-msg` runs either way, and
+    /// `post-merge` follows [`Self::hooks`].
+    pub verify: HookPolicy,
     /// Whether files the merged branch added inside a directory the current branch renamed
     /// (or the reverse) follow the rename; when unset, `merge.directoryRenames` decides
     /// ([`DirectoryRenameMode::from_repo`]).
@@ -867,6 +873,13 @@ pub fn integrate_branch(
 
 /// Integrate `other_oid` into the branch at `into_ref` with explicit merge options.
 ///
+/// Before a clean merge records its commit, runs `pre-merge-commit`, then
+/// `prepare-commit-msg .git/MERGE_MSG merge` and `commit-msg .git/MERGE_MSG` with `MERGE_HEAD`
+/// recorded, as Git does ([`MergeOptions::verify`] skips `pre-merge-commit` and `commit-msg`).
+/// A message hook may rewrite the message, and `pre-merge-commit` may stage changes that the
+/// commit then includes. None of these run for a fast-forward, a squash, conflicts or
+/// [`MergeCommitMode::NoCommit`].
+///
 /// After a fast-forward or merge commit, runs `post-merge 0`; after a squash, `post-merge 1`
 /// (unless [`MergeOptions::hooks`] is [`PostOperationHooks::Skip`]). Like Git, the hook does not
 /// run when the branch is already up to date, when the merge stops on conflicts, or for
@@ -875,7 +888,10 @@ pub fn integrate_branch(
 /// # Errors
 ///
 /// Same as [`integrate_branch`], plus [`Error::NotFastForward`] when
-/// [`FastForwardPolicy::Only`] cannot fast-forward.
+/// [`FastForwardPolicy::Only`] cannot fast-forward, and [`Error::Hook`] when
+/// `pre-merge-commit`, `prepare-commit-msg` or `commit-msg` refuses. A refused merge leaves the
+/// merged index and work tree with `MERGE_HEAD`, `ORIG_HEAD` and `MERGE_MSG` recorded and the
+/// branch unchanged: finish it with a commit ([`continue_merge`]) or [`abort_branch_merge`].
 #[allow(clippy::too_many_arguments)]
 pub fn integrate_branch_with(
     repo: &Repository,
@@ -902,6 +918,10 @@ pub fn integrate_branch_with(
             | IntegrateBranchOutcome::Conflicts { .. }
             | IntegrateBranchOutcome::Stopped => {}
         }
+    }
+    // Like Git, `post-merge` still sees the merge state the message hooks saw.
+    if matches!(outcome, IntegrateBranchOutcome::Merged { .. }) {
+        clear_merge_state(repo.git_dir())?;
     }
     Ok(outcome)
 }
@@ -1054,25 +1074,40 @@ fn integrate_branch_without_hooks(
             Ok(IntegrateBranchOutcome::Stopped)
         }
         MergeCommitMode::Commit => {
+            drop(lock);
             let preflight = commit_preflight
                 .ok_or_else(|| Error::Message("merge commit preflight missing".into()))?;
             let config = preflight.config;
+            let (tree, message) = run_merge_commit_hooks(
+                repo,
+                options.verify,
+                into_oid,
+                other_oid,
+                merged.result_tree,
+                merge_message_text(label, options.message.as_deref()),
+            )?;
             let mut commit = CommitData {
-                tree: merged.result_tree,
+                tree,
                 parents: vec![into_oid, other_oid],
                 author: preflight.author,
                 committer: preflight.committer,
                 author_raw: Vec::new(),
                 committer_raw: Vec::new(),
                 encoding: None,
-                message: merge_message_text(label, options.message.as_deref()),
+                message,
                 raw_message: None,
                 extra_headers: Vec::new(),
             };
             let policy = ChangeIdPolicy::from_config(config.as_ref());
-            stamp_change_id_on_new_commit(repo, &policy, &mut commit)?;
-            let oid = write_commit_object(repo, &commit, None)?;
-            move_branch(repo, into_ref, into_oid, oid, &format!("merge {label}"))?;
+            let oid = stamp_change_id_on_new_commit(repo, &policy, &mut commit)
+                .and_then(|()| write_commit_object(repo, &commit, None))
+                .and_then(|oid| {
+                    move_branch(repo, into_ref, into_oid, oid, &format!("merge {label}"))
+                        .map(|()| oid)
+                })
+                .inspect_err(|_| {
+                    let _ = clear_merge_state(repo.git_dir());
+                })?;
             Ok(IntegrateBranchOutcome::Merged {
                 oid,
                 change_id: change_id(&commit),
@@ -1345,6 +1380,7 @@ pub fn continue_merge(
     let message = resolve_continue_merge_message(repo.git_dir(), options.message.as_deref())?;
     let req = CommitRequest {
         message,
+        message_from_merge: options.message.is_none(),
         author: options.author.clone(),
         committer: options.committer.clone(),
         allow_empty: false,
@@ -1436,6 +1472,9 @@ fn resolved_not_staged_paths(repo: &Repository, index: &Index, unmerged: &[Strin
 
 /// Abort an in-progress merge, restoring index and worktree to [`read_orig_head`].
 ///
+/// A merge autostash recorded in `MERGE_AUTOSTASH` (left by a pull whose merge commit a hook
+/// refused) is applied again afterwards, as `git merge --abort` does.
+///
 /// # Errors
 ///
 /// Returns [`Error::Message`] when no merge is in progress, or propagates checkout and I/O errors.
@@ -1481,7 +1520,15 @@ fn restore_pre_merge_state(repo: &Repository) -> Result<()> {
             }
         }
     }
+    let autostash = fs::read_to_string(repo.git_dir().join("MERGE_AUTOSTASH")).ok();
     clear_merge_state(repo.git_dir())?;
+    if let Some(oid) = autostash
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        crate::porcelain::stash::restore_operation_autostash(repo, &ObjectId::from_hex(oid)?)?;
+    }
     Ok(())
 }
 
@@ -1642,6 +1689,68 @@ fn record_merge_in_progress(
     write_orig_head(git_dir, into_oid)?;
     fs::write(git_dir.join("MERGE_MSG"), merge_msg).map_err(Error::Io)?;
     Ok(())
+}
+
+/// Run the hooks Git runs before a clean merge records its commit, after the merged index and
+/// work tree are written: `pre-merge-commit` (unless `verify` skips it), then, with the merge
+/// state recorded, `prepare-commit-msg <MERGE_MSG> merge` and `commit-msg <MERGE_MSG>` (unless
+/// `verify` skips it).
+///
+/// Returns the tree to commit, rebuilt from the index when `pre-merge-commit` ran (it may have
+/// staged changes), and the message, read back from `MERGE_MSG` when a message hook ran.
+///
+/// # Errors
+///
+/// [`Error::Hook`] when a hook refuses or cannot start, [`Error::IndexUnmerged`] when
+/// `pre-merge-commit` left conflict stages, and I/O errors. On any error the merge state
+/// (`MERGE_HEAD`, `ORIG_HEAD`, `MERGE_MSG` with `message`) is left recorded and the branch is
+/// unchanged, so the merge can be finished with a commit or abandoned with an abort.
+fn run_merge_commit_hooks(
+    repo: &Repository,
+    verify: HookPolicy,
+    into_oid: ObjectId,
+    other_oid: ObjectId,
+    tree: ObjectId,
+    message: String,
+) -> Result<(ObjectId, String)> {
+    let git_dir = repo.git_dir();
+    let index_path = repo.index_path();
+    let env = CommitHookEnv {
+        index_file: Some(&index_path),
+        git_editor: Some(":"),
+        git_prefix: None,
+        extra_env: &[],
+    };
+    let run = || -> Result<(ObjectId, String)> {
+        let mut tree = tree;
+        if verify != HookPolicy::SkipVerify {
+            let name = HookName::PreMergeCommit.as_str();
+            if run_commit_hook(repo, name, &[], None, &env)?.check(name)? {
+                let index = repo.load_index()?;
+                if index.has_unmerged_entries() {
+                    return Err(Error::IndexUnmerged);
+                }
+                tree = write_tree_from_index(repo.odb(), &index, "")?;
+            }
+        }
+        record_merge_in_progress(git_dir, into_oid, other_oid, message.clone())?;
+        let edited = run_commit_message_hooks(
+            repo,
+            &git_dir.join("MERGE_MSG"),
+            MessageSource::Merge,
+            verify,
+            &env,
+            &mut Vec::new(),
+        )?;
+        Ok((tree, edited.unwrap_or_else(|| message.clone())))
+    };
+    match run() {
+        Ok(result) => Ok(result),
+        Err(err) => {
+            record_merge_in_progress(git_dir, into_oid, other_oid, message)?;
+            Err(err)
+        }
+    }
 }
 
 fn strict_commit_identity(repo: &Repository, role: IdentRole) -> Result<String> {

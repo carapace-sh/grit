@@ -63,6 +63,7 @@ fn start_opts(upstream: ObjectId, onto: Option<ObjectId>, tip: ObjectId) -> Star
             record_operation: None,
             hooks: grit_lib::PostOperationHooks::Run,
         },
+        pre_rebase: grit_lib::revwalk::history::PreRebase::Skip,
     }
 }
 
@@ -927,6 +928,7 @@ fn stacked_branches_move_atomically_after_continue() {
             record_operation: None,
             hooks: grit_lib::PostOperationHooks::Run,
         },
+        pre_rebase: grit_lib::revwalk::history::PreRebase::Skip,
     };
     let main_before = resolve_ref(grit.git_dir(), "refs/heads/main").unwrap();
     let stacked_before = resolve_ref(grit.git_dir(), "refs/heads/stacked").unwrap();

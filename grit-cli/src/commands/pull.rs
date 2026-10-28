@@ -134,6 +134,16 @@ pub fn run(args: &PullRunArgs, mode: OutputMode) -> Result<PullOutcome> {
         Err(other) => {
             return Err(match other {
                 PullError::Remote(remote) => map_remote_error(remote),
+                PullError::Repository(hook @ grit_lib::error::Error::Hook(_)) => {
+                    if repo.git_dir().join("MERGE_HEAD").is_file() {
+                        crate::json_error::hook_failed_with_hint(
+                            hook,
+                            "the merge is still in progress: run `grit merge --continue` to commit it, or `grit merge --abort` to cancel; autostashed edits come back either way",
+                        )
+                    } else {
+                        anyhow::Error::new(hook)
+                    }
+                }
                 rest => anyhow::Error::new(rest),
             });
         }

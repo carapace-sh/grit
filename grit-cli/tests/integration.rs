@@ -363,6 +363,9 @@ mod merge_missing_identity;
 #[path = "merge_options.rs"]
 mod merge_options;
 #[cfg(feature = "full-tests")]
+#[path = "merge_rebase_verify_hooks.rs"]
+mod merge_rebase_verify_hooks;
+#[cfg(feature = "full-tests")]
 #[path = "merge_rename_rename_cli.rs"]
 mod merge_rename_rename_cli;
 #[cfg(feature = "full-tests")]

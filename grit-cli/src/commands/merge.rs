@@ -5,6 +5,7 @@
 //! markers in the worktree.
 
 use crate::context;
+use crate::json_error;
 use crate::markdown;
 use crate::merge_strategy_args::MergeStrategyArgs;
 use crate::message_input::{read_message_input, MessageInputArgs};
@@ -18,6 +19,7 @@ use grit_lib::config::ident_resolve::IdentRole;
 use grit_lib::error::Error;
 use grit_lib::objects::ObjectId;
 use grit_lib::operation::Conflict;
+use grit_lib::porcelain::commit::HookPolicy;
 use grit_lib::porcelain::merge::{
     abort_branch_merge, continue_merge, integrate_branch_with, plan_branch_merge, predict_merge,
     resolve_merge_source, ContinueOptions, FastForwardPolicy, IntegrateBranchOutcome,
@@ -38,6 +40,7 @@ pub struct MergeRunOptions {
     pub no_commit: bool,
     pub squash: bool,
     pub allow_unrelated_histories: bool,
+    pub no_verify: bool,
     pub strategy: MergeStrategyArgs,
     pub message: MessageInputArgs,
 }
@@ -577,6 +580,11 @@ fn build_merge_options(run: &MergeRunOptions) -> Result<MergeOptions> {
         conflict_style,
         allow_unrelated: run.allow_unrelated_histories,
         hooks: grit_lib::PostOperationHooks::Run,
+        verify: if run.no_verify {
+            HookPolicy::SkipVerify
+        } else {
+            HookPolicy::Run
+        },
         directory_renames: None,
     })
 }
@@ -699,6 +707,10 @@ fn integrate_with_options(
     ) {
         Ok(outcome) => Ok(map_integrate_outcome(outcome, label, head_short)),
         Err(Error::NotFastForward) => Ok(MergeOutcome::refused_not_ff(label)),
+        Err(err @ Error::Hook(_)) => Err(json_error::hook_failed_with_hint(
+            err,
+            "the merge is still in progress: run `grit merge --continue` to commit it, or `grit merge --abort` to cancel",
+        )),
         Err(err) => Err(err.into()),
     }
 }

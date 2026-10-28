@@ -289,6 +289,7 @@ fn clean_start_rebase_on_memory_backends_moves_the_branch_in_the_store() {
                 ..rewrite_opts()
             }),
             apply: apply_opts("rebase", Some("rebase")),
+            pre_rebase: grit_lib::revwalk::history::PreRebase::Skip,
         },
         &mut NullProgress,
         &NeverCancel,

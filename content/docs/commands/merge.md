@@ -13,7 +13,7 @@ grit merge --check <rev>
 grit merge --dry-run <rev>
 grit merge --continue [-m <message>]
 grit merge --abort
-grit merge [--ff-only | --no-ff] [--squash | --no-commit] [-X ours|theirs] [--conflict diff3|zdiff3|merge] [--allow-unrelated-histories] [-m <message> | -F / --message-file <path|->] <rev>
+grit merge [--ff-only | --no-ff] [--squash | --no-commit] [-X ours|theirs] [--conflict diff3|zdiff3|merge] [--allow-unrelated-histories] [--no-verify] [-m <message> | -F / --message-file <path|->] <rev>
 ```
 
 ## Description
@@ -25,6 +25,33 @@ Brings the commits from `<rev>` into the current branch:
 - Otherwise both sides are merged. When there are no overlapping edits, a merge commit is recorded with the message `Merge <rev>`, using `<rev>` as you typed it. That commit gets a new `change-id` header like [`grit commit`](../commit/). When `commit.gpgsign` is enabled, that merge commit is signed like [`grit commit`](../commit/).
 - When the same lines were changed on both sides, `grit merge` stops with conflicts: it updates the index and working tree, writes conflict markers around each conflicting hunk, records merge-in-progress state (`MERGE_HEAD`, `ORIG_HEAD`, `MERGE_MSG`), and leaves the branch ref unchanged. Fix conflicts, then run `grit merge --continue` to create the two-parent merge commit (message from `MERGE_MSG` with comment lines stripped, or `-m` to override). When `commit.autoStage` is true (the default), `--continue` stages resolved paths from the work tree the same way [`grit commit`](../commit/) does, so you do not need `grit add` after editing away conflict markers. With `commit.autoStage=false`, stage resolved paths with `grit add` before `--continue`. [`grit commit`](../commit/) can also finish a resolved merge. Run `grit merge --abort` to discard the in-progress merge and restore the pre-merge branch, index, and working tree.
 - After a merge with `--no-commit` (when supported), run `grit merge --continue` to record the merge commit without re-running the three-way merge.
+
+Before a clean merge records its commit, grit runs the same hooks as Git, in Git's order: `pre-merge-commit` (no arguments), then `prepare-commit-msg .git/MERGE_MSG merge` and `commit-msg .git/MERGE_MSG`, which see `MERGE_HEAD` and may rewrite the message (the commit records what they leave). Files a `pre-merge-commit` hook stages go into the merge commit. When one of them exits non-zero, the merge stops with exit **1** and a `hook_failed` error (as for [`grit commit`](../commit/)): the merged files stay in the work tree and index, `MERGE_HEAD`, `ORIG_HEAD` and `MERGE_MSG` are recorded, and the branch does not move. Finish with `grit merge --continue` (which runs `pre-commit` like `grit commit`, as Git does) or cancel with `grit merge --abort`; edits a [`grit pull --autostash`](../pull/) stashed come back either way. `--no-verify` skips `pre-merge-commit` and `commit-msg`; `prepare-commit-msg` and `post-merge` still run. None of these run for a fast-forward, `--squash`, `--no-commit`, conflicts, `--check` or `--dry-run`.
+
+```console
+$ grit merge topic -m 'WIP merge'
+pre-merge-commit: blocked
+error: hook pre-merge-commit failed with exit status 1
+hint: the merge is still in progress: run `grit merge --continue` to commit it, or `grit merge --abort` to cancel
+$ grit merge --abort
+Merge aborted.
+```
+
+With `--json` the error carries the hook's output and the same `hint`:
+
+```json
+{
+  "error": "hook pre-merge-commit failed with exit status 1",
+  "hint": "the merge is still in progress: run `grit merge --continue` to commit it, or `grit merge --abort` to cancel",
+  "hook": {
+    "name": "pre-merge-commit",
+    "status": 1,
+    "stderr": "pre-merge-commit: blocked\n",
+    "stdout": ""
+  },
+  "kind": "hook_failed"
+}
+```
 
 After a fast-forward or a merge commit, grit runs the `post-merge` hook with `0`; after `--squash` it passes `1`, as Git does. The hook does not run when the branch is already up to date, when the merge stops on conflicts, with `--no-commit`, or for `--check` and `--dry-run`. `grit merge --continue` runs `post-commit` like [`grit commit`](../commit/), not `post-merge` (Git behaves the same). The hook's exit status never changes the result. See [`grit hooks`](../hooks/).
 
@@ -91,6 +118,7 @@ Merged theirs into the current branch (06e1c12)
 | `-X ours\|theirs` | Prefer one side on overlapping edits (same as Git `-X`). |
 | `--conflict` | Marker style: `merge`, `diff3`, or `zdiff3`. |
 | `--allow-unrelated-histories` | Merge with no common ancestor (empty-tree base). |
+| `--no-verify` | Skip the `pre-merge-commit` and `commit-msg` hooks (`prepare-commit-msg` and `post-merge` still run). Not with `--continue`, `--abort`, `--check` or `--dry-run`. |
 
 ## Examples
 
@@ -308,7 +336,7 @@ When the merge stops on conflicts (exit code 1), stdout still carries structured
 | Code | Meaning |
 | ---: | --- |
 | `0` | Merge completed, `--check` predicts success, or `--dry-run` preview. |
-| `1` | Conflicts (`result: conflicts`), `<rev>` names nothing (`kind: revision_not_found`), or other failure ([`failure`](../exit-codes/)). |
+| `1` | Conflicts (`result: conflicts`), `<rev>` names nothing (`kind: revision_not_found`), a hook refused the merge commit (`kind: hook_failed`), or other failure ([`failure`](../exit-codes/)). |
 | `2` | Invalid flags ([`usage`](../exit-codes/)). |
 | `128` | `--ff-only` when not fast-forward ([`refused_not_ff`](../exit-codes/)). |
 

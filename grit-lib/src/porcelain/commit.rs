@@ -67,14 +67,88 @@ use std::process;
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
-/// Whether commit hooks run before the object is written.
+/// Whether the verifying hooks run before a commit object is written.
+///
+/// The verifying hooks are `pre-commit` (or `pre-merge-commit` for a merge) and `commit-msg`.
+/// `prepare-commit-msg` and the `post-*` hooks run under either policy, as in Git.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum HookPolicy {
-    /// Run `pre-commit` and `commit-msg` when installed (default).
+    /// Run the verifying hooks when installed (default).
     #[default]
     Run,
-    /// Skip `pre-commit` and `commit-msg` (`--no-verify`); `post-commit` still runs.
+    /// Skip the verifying hooks (`--no-verify`).
     SkipVerify,
+}
+
+/// Where a commit message came from, as `prepare-commit-msg` is told in its second (and third)
+/// argument.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MessageSource {
+    /// Given by the caller (`-m`, `-F`).
+    Message,
+    /// Reused from this commit (`--amend`, `-C`).
+    Commit(ObjectId),
+    /// The merge message in `MERGE_MSG`.
+    Merge,
+    /// The squash message in `SQUASH_MSG`.
+    Squash,
+}
+
+/// Run `prepare-commit-msg` and then, unless `verify` is [`HookPolicy::SkipVerify`],
+/// `commit-msg` on the message file at `msg_path`, appending each hook that ran to `hooks_run`.
+///
+/// Returns the file's contents (with a trailing newline) when either hook ran, since a hook
+/// may have rewritten it, and `None` when neither is installed.
+///
+/// # Errors
+///
+/// [`Error::Hook`] when a hook fails or cannot start, [`Error::Io`] when the file cannot be
+/// read back, and [`Error::EmptyCommitMessage`] when a hook left it empty.
+pub(crate) fn run_commit_message_hooks(
+    repo: &Repository,
+    msg_path: &Path,
+    source: MessageSource,
+    verify: HookPolicy,
+    commit_env: &CommitHookEnv<'_>,
+    hooks_run: &mut Vec<HookName>,
+) -> Result<Option<String>> {
+    let path_arg = commit_editmsg_hook_argument(repo, msg_path);
+    let source_oid;
+    let prepare_args: Vec<&str> = match source {
+        MessageSource::Message => vec![&path_arg, "message"],
+        MessageSource::Commit(oid) => {
+            source_oid = oid.to_hex();
+            vec![&path_arg, "commit", &source_oid]
+        }
+        MessageSource::Merge => vec![&path_arg, "merge"],
+        MessageSource::Squash => vec![&path_arg, "squash"],
+    };
+    let ran_before = hooks_run.len();
+    if run_commit_hook_recorded(
+        repo,
+        HookName::PrepareCommitMsg,
+        &prepare_args,
+        None,
+        commit_env,
+    )? {
+        hooks_run.push(HookName::PrepareCommitMsg);
+    }
+    if verify != HookPolicy::SkipVerify
+        && run_commit_hook_recorded(repo, HookName::CommitMsg, &[&path_arg], None, commit_env)?
+    {
+        hooks_run.push(HookName::CommitMsg);
+    }
+    if hooks_run.len() == ran_before {
+        return Ok(None);
+    }
+    let mut message = fs::read_to_string(msg_path).map_err(Error::Io)?;
+    if message.trim().is_empty() {
+        return Err(Error::EmptyCommitMessage);
+    }
+    if !message.ends_with('\n') {
+        message.push('\n');
+    }
+    Ok(Some(message))
 }
 
 /// Author name, email, and date suffix from a written commit header line.
@@ -103,10 +177,14 @@ fn guard_incomplete_rewrite_apply(repo: &Repository) -> Result<()> {
 pub struct CommitRequest {
     /// Commit message body (first line becomes the subject). A trailing newline is added when missing.
     ///
-    /// The message is also written to `.git/COMMIT_EDITMSG` for the `commit-msg` hook. The file is
-    /// read back only when that hook ran, so concurrent committers sharing the file never record
-    /// each other's message.
+    /// The message is also written to `.git/COMMIT_EDITMSG` for the `prepare-commit-msg` and
+    /// `commit-msg` hooks. The file is read back only when one of them ran, so concurrent
+    /// committers sharing the file never record each other's message.
     pub message: String,
+    /// Tell `prepare-commit-msg` that [`Self::message`] is the in-progress merge's `MERGE_MSG`
+    /// (source `merge` instead of `message`), as when finishing a merge.
+    #[doc(hidden)]
+    pub message_from_merge: bool,
     /// Author to record. `None` keeps the replaced commit's author for [`Self::amend`] and the
     /// source commit's author for [`Self::reuse_message_from`]; otherwise the repository's
     /// author identity ([`Repository::identity`]) is used. [`Self::author_date`] and
@@ -136,7 +214,8 @@ pub struct CommitRequest {
     /// [`CommitOutcome::changes`] (issue #1064).
     #[doc(hidden)]
     pub staged_change_count: Option<usize>,
-    /// Hook execution policy for `pre-commit` and `commit-msg`.
+    /// Hook execution policy for `pre-commit` and `commit-msg`; `prepare-commit-msg` runs either
+    /// way.
     #[doc(alias = "no-verify")]
     pub hooks: HookPolicy,
     /// Author timestamp suffix (`<unix> <+HHMM>`) replacing the author line date when set.
@@ -771,8 +850,9 @@ pub struct CommitOutcome {
     pub parents: Vec<ObjectId>,
     /// Author recorded on the commit object.
     pub author: CommitAuthorInfo,
-    /// Hooks that were installed and ran during this commit: `pre-commit`, `commit-msg`,
-    /// `post-commit`, and `post-rewrite` (with `amend`) when [`CommitRequest::amend`] is set.
+    /// Hooks that were installed and ran during this commit, in order: `pre-commit`,
+    /// `prepare-commit-msg`, `commit-msg`, `post-commit`, and `post-rewrite` (with `amend`) when
+    /// [`CommitRequest::amend`] is set.
     pub hooks_run: Vec<HookName>,
     /// Number of path-level changes between the parent commit tree and this commit's tree.
     pub changes: usize,
@@ -1060,6 +1140,8 @@ fn finish_commit_dry_run(
         reuse_msg
     } else if req_amend {
         amend_default_message.unwrap_or_default()
+    } else if let Some(pending) = pending_commit_message(repo)? {
+        normalize_commit_message(&pending)?
     } else {
         return Err(Error::EmptyCommitMessage);
     };
@@ -1380,6 +1462,17 @@ fn create_commit_with_index(
         }
     }
 
+    let message_source = if req.message_from_merge {
+        MessageSource::Merge
+    } else if !req.message.trim().is_empty() {
+        MessageSource::Message
+    } else if let Some(oid) = req.reuse_message_from.or(replaced_tip) {
+        MessageSource::Commit(oid)
+    } else if repo.git_dir().join("SQUASH_MSG").is_file() {
+        MessageSource::Squash
+    } else {
+        MessageSource::Merge
+    };
     let mut message = if !req.message.trim().is_empty() {
         normalize_commit_message(&req.message)?
     } else if let Some(reuse_msg) = reuse_message {
@@ -1387,7 +1480,7 @@ fn create_commit_with_index(
     } else if req.amend {
         amend_default_message.unwrap_or_default()
     } else if let Some(pending) = pending_commit_message(repo)? {
-        pending
+        normalize_commit_message(&pending)?
     } else {
         return Err(Error::EmptyCommitMessage);
     };
@@ -1410,26 +1503,17 @@ fn create_commit_with_index(
     )?;
     let editmsg_path = repo.git_dir().join("COMMIT_EDITMSG");
     fs::write(&editmsg_path, &message).map_err(Error::Io)?;
-    let editmsg_arg = commit_editmsg_hook_argument(repo, &editmsg_path);
-    if req.hooks != HookPolicy::SkipVerify
-        && run_commit_hook_recorded(
-            repo,
-            HookName::CommitMsg,
-            &[editmsg_arg.as_str()],
-            None,
-            &commit_env,
-        )?
-    {
-        hooks_run.push(HookName::CommitMsg);
-        // COMMIT_EDITMSG is shared by every committer in the repository, so it is only
-        // read back when a hook may have edited it; otherwise the in-memory message wins.
-        message = fs::read_to_string(&editmsg_path).map_err(Error::Io)?;
-        if message.trim().is_empty() {
-            return Err(Error::EmptyCommitMessage);
-        }
-        if !message.ends_with('\n') {
-            message.push('\n');
-        }
+    // COMMIT_EDITMSG is shared by every committer in the repository, so it is only read back
+    // when a hook may have edited it; otherwise the in-memory message wins.
+    if let Some(edited) = run_commit_message_hooks(
+        repo,
+        &editmsg_path,
+        message_source,
+        req.hooks,
+        &commit_env,
+        &mut hooks_run,
+    )? {
+        message = edited;
     }
 
     let (author, author_raw) = resolve_author_for_commit(
@@ -3362,7 +3446,7 @@ mod tests {
         let repo = init_repo(root);
         std::fs::write(
             repo.git_dir().join("config"),
-            "[core]\n\trepositoryformatversion = 0\n\tbare = false\n\tlogAllRefUpdates = true\n[hook \"hc\"]\n\tcommand = true\n\tevent = pre-commit\n[hook \"hc2\"]\n\tcommand = true\n\tevent = commit-msg\n[hook \"hc3\"]\n\tcommand = true\n\tevent = post-commit\n",
+            "[core]\n\trepositoryformatversion = 0\n\tbare = false\n\tlogAllRefUpdates = true\n[hook \"hc\"]\n\tcommand = true\n\tevent = pre-commit\n[hook \"hc2\"]\n\tcommand = true\n\tevent = commit-msg\n[hook \"hc3\"]\n\tcommand = true\n\tevent = post-commit\n[hook \"hp\"]\n\tcommand = echo \"prepared $2\" >>$1\n\tevent = prepare-commit-msg\n",
         )
         .unwrap();
         fs::write(root.join("a.txt"), b"1\n").unwrap();
@@ -3384,9 +3468,34 @@ mod tests {
             outcome.hooks_run,
             vec![
                 HookName::PreCommit,
+                HookName::PrepareCommitMsg,
                 HookName::CommitMsg,
                 HookName::PostCommit
             ]
+        );
+        let commit = parse_commit(&repo.odb().read(&outcome.oid).unwrap().data).unwrap();
+        assert_eq!(commit.message, "hooks\nprepared message\n");
+
+        fs::write(root.join("a.txt"), b"2\n").unwrap();
+        stage(
+            &repo,
+            &StageOptions::default(),
+            &mut NullProgress,
+            &crate::progress::NeverCancel,
+        )
+        .unwrap();
+        let mut req = commit_req("skip verify");
+        req.hooks = HookPolicy::SkipVerify;
+        let outcome = create_commit(
+            &repo,
+            &req,
+            &mut NullProgress,
+            &crate::progress::NeverCancel,
+        )
+        .unwrap();
+        assert_eq!(
+            outcome.hooks_run,
+            vec![HookName::PrepareCommitMsg, HookName::PostCommit]
         );
     }
 

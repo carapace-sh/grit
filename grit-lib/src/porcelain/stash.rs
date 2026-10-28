@@ -3092,6 +3092,20 @@ pub(crate) fn save_merge_autostash_ref(repo: &Repository, identity: &str) -> Res
     Ok(())
 }
 
+/// Record `stash_oid` as the merge autostash (`MERGE_AUTOSTASH`) of a merge left in progress,
+/// so finishing it ([`apply_merge_autostash`]) or aborting it puts the stashed edits back.
+///
+/// # Errors
+///
+/// [`Error::Io`] when the file cannot be written.
+pub(crate) fn record_merge_autostash(repo: &Repository, stash_oid: &ObjectId) -> Result<()> {
+    fs::write(
+        repo.git_dir().join("MERGE_AUTOSTASH"),
+        format!("{}\n", stash_oid.to_hex()),
+    )
+    .map_err(Error::Io)
+}
+
 /// Apply and drop the merge autostash recorded in `MERGE_AUTOSTASH`, matching `git commit` after
 /// `git merge --autostash`.
 ///

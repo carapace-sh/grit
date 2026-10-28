@@ -1185,6 +1185,9 @@ pub grit_lib::command_runner::hooks::HookName::PostCommit
 pub grit_lib::command_runner::hooks::HookName::PostMerge
 pub grit_lib::command_runner::hooks::HookName::PostRewrite
 pub grit_lib::command_runner::hooks::HookName::PreCommit
+pub grit_lib::command_runner::hooks::HookName::PreMergeCommit
+pub grit_lib::command_runner::hooks::HookName::PreRebase
+pub grit_lib::command_runner::hooks::HookName::PrepareCommitMsg
 impl grit_lib::command_runner::hooks::HookName
 pub const fn grit_lib::command_runner::hooks::HookName::as_str(self) -> &'static str
 impl core::clone::Clone for grit_lib::command_runner::hooks::HookName
@@ -1392,6 +1395,7 @@ pub fn grit_lib::command_runner::hooks::run_post_checkout(&grit_lib::repo::Repos
 pub fn grit_lib::command_runner::hooks::run_post_merge(&grit_lib::repo::Repository, bool) -> bool
 pub fn grit_lib::command_runner::hooks::run_post_rewrite(&grit_lib::repo::Repository, grit_lib::command_runner::hooks::RewriteKind, &[(grit_lib::objects::ObjectId, grit_lib::objects::ObjectId)]) -> bool
 pub fn grit_lib::command_runner::hooks::run_pre_push_hook(&grit_lib::repo::Repository, &str, &str, &[grit_lib::command_runner::hooks::PrePushRef]) -> core::result::Result<grit_lib::command_runner::hooks::HookOutput, grit_lib::command_runner::hooks::HookError>
+pub fn grit_lib::command_runner::hooks::run_pre_rebase(&grit_lib::repo::Repository, core::option::Option<&str>) -> core::result::Result<bool, grit_lib::command_runner::hooks::HookError>
 pub fn grit_lib::command_runner::hooks::run_reference_transaction_committed_for_head_update(&grit_lib::repo::Repository, &grit_lib::state::HeadState, core::option::Option<grit_lib::objects::ObjectId>, grit_lib::objects::ObjectId) -> core::result::Result<grit_lib::command_runner::hooks::HookResult, grit_lib::command_runner::hooks::HookError>
 pub enum grit_lib::command_runner::CommandStdin
 pub grit_lib::command_runner::CommandStdin::Inherit
@@ -14537,6 +14541,7 @@ pub grit_lib::porcelain::merge::MergeOptions::fast_forward: grit_lib::porcelain:
 pub grit_lib::porcelain::merge::MergeOptions::favor: grit_lib::diff::merge_file::MergeFavor
 pub grit_lib::porcelain::merge::MergeOptions::hooks: grit_lib::command_runner::hooks::PostOperationHooks
 pub grit_lib::porcelain::merge::MergeOptions::message: core::option::Option<alloc::string::String>
+pub grit_lib::porcelain::merge::MergeOptions::verify: grit_lib::porcelain::commit::HookPolicy
 impl core::clone::Clone for grit_lib::porcelain::merge::MergeOptions
 pub fn grit_lib::porcelain::merge::MergeOptions::clone(&self) -> Self
 impl core::cmp::Eq for grit_lib::porcelain::merge::MergeOptions
@@ -26197,6 +26202,25 @@ impl core::marker::Unpin for grit_lib::revwalk::history::Placement
 impl core::marker::UnsafeUnpin for grit_lib::revwalk::history::Placement
 impl core::panic::unwind_safe::RefUnwindSafe for grit_lib::revwalk::history::Placement
 impl core::panic::unwind_safe::UnwindSafe for grit_lib::revwalk::history::Placement
+pub enum grit_lib::revwalk::history::PreRebase
+pub grit_lib::revwalk::history::PreRebase::Run
+pub grit_lib::revwalk::history::PreRebase::Run::upstream: core::option::Option<alloc::string::String>
+pub grit_lib::revwalk::history::PreRebase::Skip
+impl core::clone::Clone for grit_lib::revwalk::history::PreRebase
+pub fn grit_lib::revwalk::history::PreRebase::clone(&self) -> Self
+impl core::cmp::Eq for grit_lib::revwalk::history::PreRebase
+impl core::cmp::PartialEq for grit_lib::revwalk::history::PreRebase
+pub fn grit_lib::revwalk::history::PreRebase::eq(&self, &Self) -> bool
+impl core::fmt::Debug for grit_lib::revwalk::history::PreRebase
+pub fn grit_lib::revwalk::history::PreRebase::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for grit_lib::revwalk::history::PreRebase
+impl core::marker::Freeze for grit_lib::revwalk::history::PreRebase
+impl core::marker::Send for grit_lib::revwalk::history::PreRebase
+impl core::marker::Sync for grit_lib::revwalk::history::PreRebase
+impl core::marker::Unpin for grit_lib::revwalk::history::PreRebase
+impl core::marker::UnsafeUnpin for grit_lib::revwalk::history::PreRebase
+impl core::panic::unwind_safe::RefUnwindSafe for grit_lib::revwalk::history::PreRebase
+impl core::panic::unwind_safe::UnwindSafe for grit_lib::revwalk::history::PreRebase
 pub enum grit_lib::revwalk::history::RebaseCheckPlan
 pub grit_lib::revwalk::history::RebaseCheckPlan::Clean
 pub grit_lib::revwalk::history::RebaseCheckPlan::Clean::commits: alloc::vec::Vec<grit_lib::objects::ObjectId>
@@ -26901,6 +26925,7 @@ impl core::panic::unwind_safe::RefUnwindSafe for grit_lib::revwalk::history::Squ
 impl core::panic::unwind_safe::UnwindSafe for grit_lib::revwalk::history::SquashOptions
 pub struct grit_lib::revwalk::history::StartRebaseOptions
 pub grit_lib::revwalk::history::StartRebaseOptions::apply: grit_lib::revwalk::history::ApplyOptions
+pub grit_lib::revwalk::history::StartRebaseOptions::pre_rebase: grit_lib::revwalk::history::PreRebase
 pub grit_lib::revwalk::history::StartRebaseOptions::rebase: grit_lib::revwalk::history::RebaseOntoOptions
 pub grit_lib::revwalk::history::StartRebaseOptions::request: grit_lib::revwalk::history::RebaseRequest
 impl core::clone::Clone for grit_lib::revwalk::history::StartRebaseOptions
@@ -26979,6 +27004,7 @@ pub fn grit_lib::revwalk::history::move_commit(&grit_lib::repo::Repository, grit
 pub fn grit_lib::revwalk::history::normalize_rewrite_message(&str) -> core::result::Result<alloc::string::String, grit_lib::revwalk::history::HistoryError>
 pub fn grit_lib::revwalk::history::plan_rebase(&grit_lib::repo::Repository, &grit_lib::revwalk::history::RebaseRequest, &grit_lib::revwalk::history::RebaseOntoOptions) -> core::result::Result<grit_lib::revwalk::history::RebasePlan, grit_lib::revwalk::history::HistoryError>
 pub fn grit_lib::revwalk::history::plan_rebase_check(&grit_lib::repo::Repository, &grit_lib::revwalk::history::RebaseRequest, &grit_lib::revwalk::history::RebaseOntoOptions) -> core::result::Result<grit_lib::revwalk::history::RebaseCheckPlan, grit_lib::revwalk::history::HistoryError>
+pub fn grit_lib::revwalk::history::plan_rebase_with_hook(&grit_lib::repo::Repository, &grit_lib::revwalk::history::RebaseRequest, &grit_lib::revwalk::history::RebaseOntoOptions, &grit_lib::revwalk::history::PreRebase) -> core::result::Result<grit_lib::revwalk::history::RebasePlan, grit_lib::revwalk::history::HistoryError>
 pub fn grit_lib::revwalk::history::plan_rewrite(&grit_lib::repo::Repository, &grit_lib::revwalk::history::HistoryEdits, &grit_lib::revwalk::history::RewriteOptions) -> core::result::Result<grit_lib::revwalk::history::RewritePlan, grit_lib::revwalk::history::HistoryError>
 pub fn grit_lib::revwalk::history::read_history_last(&grit_lib::repo::Repository) -> core::result::Result<core::option::Option<grit_lib::revwalk::history::HistoryLastRecord>, grit_lib::revwalk::history::HistoryError>
 pub fn grit_lib::revwalk::history::rebase_onto(&grit_lib::repo::Repository, grit_lib::objects::ObjectId, grit_lib::objects::ObjectId, &[grit_lib::objects::ObjectId], &grit_lib::revwalk::history::RebaseOntoOptions) -> core::result::Result<grit_lib::revwalk::history::RewritePlan, grit_lib::revwalk::history::HistoryError>
@@ -30396,6 +30422,9 @@ pub grit_lib::HookName::PostCommit
 pub grit_lib::HookName::PostMerge
 pub grit_lib::HookName::PostRewrite
 pub grit_lib::HookName::PreCommit
+pub grit_lib::HookName::PreMergeCommit
+pub grit_lib::HookName::PreRebase
+pub grit_lib::HookName::PrepareCommitMsg
 impl grit_lib::command_runner::hooks::HookName
 pub const fn grit_lib::command_runner::hooks::HookName::as_str(self) -> &'static str
 impl core::clone::Clone for grit_lib::command_runner::hooks::HookName

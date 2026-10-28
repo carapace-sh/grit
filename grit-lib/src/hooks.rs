@@ -641,6 +641,11 @@ impl HookSpawnContext<'_> {
 pub enum HookName {
     /// `.git/hooks/pre-commit` or `hook.pre-commit.*`.
     PreCommit,
+    /// `.git/hooks/pre-merge-commit`, run before a clean merge records its commit.
+    PreMergeCommit,
+    /// `.git/hooks/prepare-commit-msg`, run on the message file before `commit-msg`; not skipped
+    /// by `--no-verify`.
+    PrepareCommitMsg,
     /// `.git/hooks/commit-msg` or `hook.commit-msg.*`.
     CommitMsg,
     /// `.git/hooks/post-commit` or `hook.post-commit.*`.
@@ -651,6 +656,9 @@ pub enum HookName {
     PostMerge,
     /// `.git/hooks/post-rewrite`, run after amend or a history rewrite replaces commits.
     PostRewrite,
+    /// `.git/hooks/pre-rebase`, run before a rebase rewrites anything; a non-zero exit refuses
+    /// the rebase.
+    PreRebase,
 }
 
 impl HookName {
@@ -659,6 +667,9 @@ impl HookName {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::PreCommit => "pre-commit",
+            Self::PreMergeCommit => "pre-merge-commit",
+            Self::PrepareCommitMsg => "prepare-commit-msg",
+            Self::PreRebase => "pre-rebase",
             Self::CommitMsg => "commit-msg",
             Self::PostCommit => "post-commit",
             Self::PostCheckout => "post-checkout",
@@ -789,6 +800,39 @@ pub fn run_post_merge(repo: &Repository, squash: bool) -> bool {
         None,
         None,
     )
+}
+
+/// Run `pre-rebase <upstream>` before a rebase of the checked-out branch rewrites anything.
+///
+/// `upstream` is the upstream exactly as the user named it (Git passes the argument, not the
+/// resolved commit). `None` means the branch's configured upstream, which the hook receives as
+/// its full ref name (`refs/remotes/origin/main`), as Git does. The hook gets no second
+/// argument because the branch being rebased is the current one.
+///
+/// Returns whether a hook ran.
+///
+/// # Errors
+///
+/// [`HookError::Failed`] when the hook exits non-zero, which refuses the rebase;
+/// [`HookError::Spawn`] / [`HookError::Internal`] as for [`run_hook`].
+pub fn run_pre_rebase(repo: &Repository, upstream: Option<&str>) -> Result<bool, HookError> {
+    let configured;
+    let upstream_arg = match upstream {
+        Some(arg) => arg,
+        None => {
+            configured = crate::state::resolve_head_for_repository(repo)
+                .ok()
+                .and_then(|head| {
+                    head.branch_name().and_then(|branch| {
+                        crate::branch_tracking::upstream_tracking_full_ref(repo, branch)
+                    })
+                })
+                .unwrap_or_else(|| "@{upstream}".to_owned());
+            configured.as_str()
+        }
+    };
+    let name = HookName::PreRebase.as_str();
+    run_hook(repo, name, &[upstream_arg], None)?.check(name)
 }
 
 /// Bytes fed to `post-rewrite` on stdin: one `<old> <new>` line per rewritten commit.
@@ -1122,14 +1166,12 @@ pub fn run_commit_hook(
 ) -> Result<HookResult, HookError> {
     let config = repo
         .config()
-        .map_err(|e| HookError::Internal(e.to_string()))?
-        .as_ref()
-        .clone();
+        .map_err(|e| HookError::Internal(e.to_string()))?;
     run_hook_opts(
         Some(repo),
         hook_name,
         args,
-        &config,
+        config.as_ref(),
         RunHookOptions {
             stdin_data,
             commit_env: Some(commit_env),
@@ -1431,6 +1473,9 @@ mod tests {
         assert_eq!(HookName::PostCheckout.as_str(), "post-checkout");
         assert_eq!(HookName::PostMerge.as_str(), "post-merge");
         assert_eq!(HookName::PostRewrite.as_str(), "post-rewrite");
+        assert_eq!(HookName::PreMergeCommit.as_str(), "pre-merge-commit");
+        assert_eq!(HookName::PrepareCommitMsg.as_str(), "prepare-commit-msg");
+        assert_eq!(HookName::PreRebase.as_str(), "pre-rebase");
         assert_eq!(RewriteKind::Amend.as_str(), "amend");
         assert_eq!(RewriteKind::Rebase.as_str(), "rebase");
         assert!(PostOperationHooks::default().enabled());

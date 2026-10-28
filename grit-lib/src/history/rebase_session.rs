@@ -27,7 +27,9 @@ use crate::write_tree::{write_tree_update_index, WriteTreeFlags};
 use super::apply::{apply_rewrite, log_head_move};
 use super::error::HistoryError;
 use super::plan::{plan_rewrite_with_order_resumable_seeded, ResumablePlanOutcome};
-use super::rebase::{plan_rebase_resumable, RebaseOntoOptions, RebasePlan, RebaseRequest};
+use super::rebase::{
+    plan_rebase_resumable, PreRebase, RebaseOntoOptions, RebasePlan, RebaseRequest,
+};
 use super::types::{
     AppliedRewrite, ApplyOptions, CommitEdit, HistoryEdits, PlannedRefUpdate, RewriteOptions,
     RewritePlan, RewrittenCommit,
@@ -43,6 +45,9 @@ pub struct StartRebaseOptions {
     pub rebase: RebaseOntoOptions,
     /// Reflog identity and message used when the rebase finishes with [`apply_rewrite`].
     pub apply: ApplyOptions,
+    /// Whether [`start_rebase`] runs the `pre-rebase` hook. [`continue_rebase`] and
+    /// [`skip_rebase`] never run it.
+    pub pre_rebase: PreRebase,
 }
 
 /// Snapshot when a resumable rebase stops on conflicts.
@@ -197,6 +202,11 @@ impl RebaseSessionError {
 
 /// Start a resumable rebase of `opts.request.branch_tip` onto the effective onto commit.
 ///
+/// Unless the branch is already up to date, runs `pre-rebase` before any commit is replayed
+/// (see [`StartRebaseOptions::pre_rebase`]); a refusal returns [`RebaseSessionError::History`]
+/// wrapping [`HistoryError::Library`] with [`Error::Hook`](crate::error::Error::Hook), and
+/// nothing is changed or written.
+///
 /// On a clean replay, applies the plan atomically and returns [`RebaseOutcome::Done`].
 /// On conflict, writes Git-compatible rebase state and returns [`RebaseOutcome::Stopped`]
 /// without moving the branch ref away from its pre-rebase tip.
@@ -229,7 +239,7 @@ pub fn start_rebase(
         return Err(RebaseSessionError::RebaseAlreadyInProgress);
     }
     let (head_ref, orig_head) = branch_head(repo)?;
-    let plan = plan_rebase_resumable(repo, &opts.request, &opts.rebase)?;
+    let plan = plan_rebase_resumable(repo, &opts.request, &opts.rebase, &opts.pre_rebase)?;
     poll_cancel(progress, cancel).map_err(map_lib)?;
     match plan {
         Err(RebasePlan::UpToDate) => Ok(RebaseOutcome::Done {

@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::cell::Cell;
 
 use crate::diff::diff_trees;
+use crate::hooks::run_pre_rebase;
 use crate::merge_base::{
     commits_reachable_excluding_ancestors_of, is_ancestor, merge_bases_first_vs_rest,
 };
@@ -178,6 +179,36 @@ pub fn plan_rebase_check(
     }
 }
 
+/// Whether a rebase runs the `pre-rebase` hook before it rewrites anything, and what the hook
+/// is told.
+///
+/// The hook runs once the rebase is known to have work to do (never when the branch is already
+/// up to date) and before any commit is replayed, so a refusal leaves nothing written. A
+/// non-zero exit refuses the rebase.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreRebase {
+    /// Run the hook (Git's default).
+    Run {
+        /// The upstream exactly as the user named it (Git passes the argument, not the resolved
+        /// commit); `None` when the branch's configured upstream was used, which the hook
+        /// receives as its full ref name.
+        upstream: Option<String>,
+    },
+    /// Do not run the hook (`--no-verify`).
+    Skip,
+}
+
+impl PreRebase {
+    fn run(&self, repo: &Repository) -> Result<(), HistoryError> {
+        match self {
+            Self::Run { upstream } => run_pre_rebase(repo, upstream.as_deref())
+                .map(drop)
+                .map_err(|err| HistoryError::from(crate::error::Error::Hook(err))),
+            Self::Skip => Ok(()),
+        }
+    }
+}
+
 /// Plan a rebase with fork-point detection and bounded cherry patch-id lookup.
 ///
 /// The replayed range is `merge-base(upstream, branch_tip)..branch_tip`, applied onto
@@ -192,6 +223,23 @@ pub fn plan_rebase(
     request: &RebaseRequest,
     opts: &RebaseOntoOptions,
 ) -> Result<RebasePlan, HistoryError> {
+    plan_rebase_with_hook(repo, request, opts, &PreRebase::Skip)
+}
+
+/// [`plan_rebase`] for a rebase that is about to be applied: runs `pre_rebase` once the branch
+/// is known not to be up to date, before any commit is replayed (Git's order), so a refusal
+/// happens before a replay conflict is found or a new object is written.
+///
+/// # Errors
+///
+/// Same as [`plan_rebase`], plus [`HistoryError::Library`] wrapping
+/// [`crate::error::Error::Hook`] when the hook refuses the rebase or cannot start.
+pub fn plan_rebase_with_hook(
+    repo: &Repository,
+    request: &RebaseRequest,
+    opts: &RebaseOntoOptions,
+    pre_rebase: &PreRebase,
+) -> Result<RebasePlan, HistoryError> {
     let fork = rebase_fork(repo, request.upstream, request.branch_tip)?;
     let effective_onto = request.onto.unwrap_or(request.upstream);
     if request.branch_tip == effective_onto {
@@ -199,6 +247,7 @@ pub fn plan_rebase(
     }
     let range = commits_in_rebase_range(repo, fork, &[request.branch_tip])?;
     if range.is_empty() && is_ancestor(repo, request.branch_tip, effective_onto)? {
+        pre_rebase.run(repo)?;
         return Ok(RebasePlan::Plan(plan_rebase_fast_forward(
             repo,
             request.branch_tip,
@@ -217,6 +266,7 @@ pub fn plan_rebase(
     )? {
         return Ok(RebasePlan::UpToDate);
     }
+    pre_rebase.run(repo)?;
     match rebase_onto_impl(
         repo,
         fork,
@@ -485,11 +535,12 @@ fn rebase_onto_impl(
     Ok(plan)
 }
 
-/// Like [`plan_rebase`], but resumable planning may stop on the first replay conflict.
+/// Like [`plan_rebase_with_hook`], but resumable planning may stop on the first replay conflict.
 pub(crate) fn plan_rebase_resumable(
     repo: &Repository,
     request: &RebaseRequest,
     opts: &RebaseOntoOptions,
+    pre_rebase: &PreRebase,
 ) -> Result<Result<ResumablePlanOutcome, RebasePlan>, HistoryError> {
     let fork = rebase_fork(repo, request.upstream, request.branch_tip)?;
     let effective_onto = request.onto.unwrap_or(request.upstream);
@@ -498,6 +549,7 @@ pub(crate) fn plan_rebase_resumable(
     }
     let range = commits_in_rebase_range(repo, fork, &[request.branch_tip])?;
     if range.is_empty() && is_ancestor(repo, request.branch_tip, effective_onto)? {
+        pre_rebase.run(repo)?;
         let plan = plan_rebase_fast_forward(repo, request.branch_tip, effective_onto, opts)?;
         return Ok(Ok(ResumablePlanOutcome::Complete(Box::new(plan))));
     }
@@ -512,6 +564,7 @@ pub(crate) fn plan_rebase_resumable(
     )? {
         return Ok(Err(RebasePlan::UpToDate));
     }
+    pre_rebase.run(repo)?;
     let tips = [request.branch_tip];
     let (edits, replay_order, range) =
         build_rebase_rewrite_inputs(repo, fork, effective_onto, &tips, opts, Some(&range))?;

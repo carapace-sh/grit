@@ -14,10 +14,10 @@ use grit_lib::repo::Repository;
 use grit_lib::revwalk::history::{
     abort_rebase, absorb, apply_absorb_rewrite, apply_fixup_hunk_selection, apply_fixup_rewrite,
     apply_rewrite, continue_rebase, drop as history_drop, fixup, format_hunk_range_header,
-    move_commit, plan_rebase, plan_rebase_check, reword_with, skip_rebase, split, squash,
-    staged_fixup_paths, start_rebase, undo_last_rewrite, verify_rebase_with_exec,
+    move_commit, plan_rebase, plan_rebase_check, plan_rebase_with_hook, reword_with, skip_rebase,
+    split, squash, staged_fixup_paths, start_rebase, undo_last_rewrite, verify_rebase_with_exec,
     verify_rewrite_plan, AbsorbOptions, ApplyOptions, EmptyPolicy, ExecRunRecord, ExecSpec,
-    FixupOptions, HistoryError, HunkAssignment, HunkRange, Placement, RebaseCheckPlan,
+    FixupOptions, HistoryError, HunkAssignment, HunkRange, Placement, PreRebase, RebaseCheckPlan,
     RebaseOntoOptions, RebaseOutcome, RebasePlan, RebaseRequest, RebaseSessionError, RefScope,
     RewordOptions, RewriteOptions, RewritePlan, SplitOptions, SquashMessage, SquashOptions,
     StartRebaseOptions, UnassignedHunk,
@@ -94,6 +94,21 @@ pub struct RebaseRunFlags {
     /// Run a shell command after each replayed commit is checked out (repeatable; incompatible with `--dry-run` and `--check`).
     #[arg(long = "exec", value_name = "CMD", conflicts_with = "dry_run")]
     pub exec: Vec<String>,
+    /// Skip the `pre-rebase` hook.
+    #[arg(long = "no-verify")]
+    pub no_verify: bool,
+}
+
+impl RebaseRunFlags {
+    fn pre_rebase(&self, upstream: Option<&str>) -> PreRebase {
+        if self.no_verify {
+            PreRebase::Skip
+        } else {
+            PreRebase::Run {
+                upstream: upstream.map(str::to_owned),
+            }
+        }
+    }
 }
 
 /// Result of `grit rebase --check`.
@@ -1213,16 +1228,19 @@ fn exec_failure_error(
     RebaseExecExit { code: exit_code }.into()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_rebase_with_exec(
     rewrite: &Rewrite,
     request: &RebaseRequest,
     rebase_opts: RebaseOntoOptions,
+    pre_rebase: &PreRebase,
     upstream_oid: ObjectId,
     onto_oid: Option<ObjectId>,
     exec: &[String],
     on_err: impl Fn(HistoryError) -> anyhow::Error + Copy,
 ) -> Result<RebaseRunOutcome> {
-    let plan = plan_rebase(&rewrite.repo, request, &rebase_opts).map_err(on_err)?;
+    let plan =
+        plan_rebase_with_hook(&rewrite.repo, request, &rebase_opts, pre_rebase).map_err(on_err)?;
     match plan {
         RebasePlan::UpToDate => Ok(RebaseRunOutcome::Rebase(RebaseCliOutcome::from_rewrite(
             HistoryRewriteOutcome::up_to_date("rebase", false),
@@ -1353,6 +1371,7 @@ pub fn run_rebase(opts: &RebaseRunOptions<'_>) -> Result<RebaseRunOutcome> {
             },
             rebase: RebaseOntoOptions::new(rewrite.options.clone()),
             apply: resume_apply,
+            pre_rebase: PreRebase::Skip,
         };
         let outcome = if opts.continue_rebase {
             continue_rebase(
@@ -1423,6 +1442,7 @@ pub fn run_rebase(opts: &RebaseRunOptions<'_>) -> Result<RebaseRunOutcome> {
     if flags.check {
         return run_rebase_check(&rewrite.repo, &request, &rebase_opts, on_err);
     }
+    let pre_rebase = flags.pre_rebase(opts.upstream.as_deref());
 
     if !flags.exec.is_empty() {
         if shared.dry_run {
@@ -1435,6 +1455,7 @@ pub fn run_rebase(opts: &RebaseRunOptions<'_>) -> Result<RebaseRunOutcome> {
             &rewrite,
             &request,
             rebase_opts,
+            &pre_rebase,
             upstream_oid,
             onto_oid,
             &flags.exec,
@@ -1443,7 +1464,13 @@ pub fn run_rebase(opts: &RebaseRunOptions<'_>) -> Result<RebaseRunOutcome> {
     }
 
     if flags.strategy.is_some() {
-        let plan = plan_rebase(&rewrite.repo, &request, &rebase_opts).map_err(on_err)?;
+        let hook = if shared.dry_run {
+            &PreRebase::Skip
+        } else {
+            &pre_rebase
+        };
+        let plan =
+            plan_rebase_with_hook(&rewrite.repo, &request, &rebase_opts, hook).map_err(on_err)?;
         return match plan {
             RebasePlan::UpToDate => Ok(RebaseRunOutcome::Rebase(RebaseCliOutcome::from_rewrite(
                 HistoryRewriteOutcome::up_to_date("rebase", shared.dry_run),
@@ -1487,6 +1514,7 @@ pub fn run_rebase(opts: &RebaseRunOptions<'_>) -> Result<RebaseRunOutcome> {
         request,
         rebase: rebase_opts.clone(),
         apply: rewrite.apply_options("rebase", apply_message)?,
+        pre_rebase,
     };
 
     if shared.dry_run {
@@ -1719,6 +1747,7 @@ pub(crate) fn history_error(
 
 fn map_history_error(err: HistoryError, operation: &str) -> anyhow::Error {
     match err {
+        HistoryError::Library(lib) if matches!(*lib, LibError::Hook(_)) => anyhow::Error::new(*lib),
         HistoryError::EmptyMessage => anyhow::anyhow!("commit message cannot be empty"),
         HistoryError::NothingToReword => {
             anyhow::anyhow!("reword requires a new message or author")

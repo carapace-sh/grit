@@ -1517,6 +1517,12 @@ enum Command {
         /// Merge histories that share no commits (uses the empty tree as merge base).
         #[arg(long = "allow-unrelated-histories")]
         allow_unrelated_histories: bool,
+        /// Skip the `pre-merge-commit` and `commit-msg` hooks (`prepare-commit-msg` and `post-merge` still run).
+        #[arg(
+            long = "no-verify",
+            conflicts_with_all = ["abort", "continue_merge", "check", "dry_run"]
+        )]
+        no_verify: bool,
         #[command(flatten)]
         strategy: merge_strategy_args::MergeStrategyArgs,
         #[command(flatten)]
@@ -3645,6 +3651,7 @@ fn dispatch(
             no_commit,
             squash,
             allow_unrelated_histories,
+            no_verify,
             strategy,
             message,
         } => {
@@ -3660,6 +3667,7 @@ fn dispatch(
                     no_commit,
                     squash,
                     allow_unrelated_histories,
+                    no_verify,
                     strategy,
                     message,
                 },
