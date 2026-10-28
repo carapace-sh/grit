@@ -67,6 +67,13 @@ impl ReceiveQuarantine {
         odb
     }
 
+    /// Quarantine `objects/` root (for tests and pack staging).
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// Environment pairs for hook subprocesses (absolute paths when possible).
     #[must_use]
     pub fn hook_env(&self) -> Vec<(String, String)> {
@@ -81,14 +88,42 @@ impl ReceiveQuarantine {
 
     /// Move loose objects and packfiles from the quarantine into the main object store.
     ///
+    /// Newly installed `pack-*` files get an empty sibling `.keep` marker so concurrent
+    /// maintenance cannot delete them before ref updates from this push are published.
+    /// Drop the returned [`MigratedPackKeepGuard`] after ref publication (or push failure
+    /// handling) to remove those markers.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::Io`] when migration fails.
-    pub fn migrate(&mut self) -> Result<()> {
-        migrate_tree(&self.path, &self.main_objects)?;
+    pub fn migrate(&mut self) -> Result<MigratedPackKeepGuard> {
+        let keep_markers = migrate_tree(&self.path, &self.main_objects)?;
         self.migrated = true;
         remove_quarantine_dir(&self.path)?;
-        Ok(())
+        Ok(MigratedPackKeepGuard { keep_markers })
+    }
+}
+
+/// Temporary `.keep` markers on packs migrated out of a receive quarantine.
+///
+/// While held, garbage collection and repack treat those packs as pinned. Drop after
+/// ref updates from the push are committed.
+pub(crate) struct MigratedPackKeepGuard {
+    keep_markers: Vec<PathBuf>,
+}
+
+impl MigratedPackKeepGuard {
+    fn clear_keeps(&mut self) {
+        for keep in &self.keep_markers {
+            let _ = fs::remove_file(keep);
+        }
+        self.keep_markers.clear();
+    }
+}
+
+impl Drop for MigratedPackKeepGuard {
+    fn drop(&mut self) {
+        self.clear_keeps();
     }
 }
 
@@ -144,9 +179,9 @@ fn remove_quarantine_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn migrate_tree(src: &Path, dst: &Path) -> Result<()> {
+fn migrate_tree(src: &Path, dst: &Path) -> Result<Vec<PathBuf>> {
     if !src.is_dir() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     fs::create_dir_all(dst).map_err(Error::Io)?;
     let mut names: Vec<String> = fs::read_dir(src)
@@ -155,17 +190,30 @@ fn migrate_tree(src: &Path, dst: &Path) -> Result<()> {
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .collect();
     names.sort_by_key(|name| pack_copy_priority(name));
+    let mut keep_markers = Vec::new();
     for name in names {
         let from = src.join(&name);
         let to = dst.join(&name);
         let meta = fs::symlink_metadata(&from).map_err(Error::Io)?;
         if meta.is_dir() {
-            migrate_tree(&from, &to)?;
-        } else {
-            migrate_file(&from, &to)?;
+            keep_markers.extend(migrate_tree(&from, &to)?);
+        } else if migrate_file(&from, &to)? {
+            if let Some(keep) = keep_marker_for_newly_migrated_pack(&to) {
+                fs::write(&keep, b"").map_err(Error::Io)?;
+                keep_markers.push(keep);
+            }
         }
     }
-    Ok(())
+    Ok(keep_markers)
+}
+
+fn keep_marker_for_newly_migrated_pack(pack_path: &Path) -> Option<PathBuf> {
+    let name = pack_path.file_name()?.to_str()?;
+    if !(name.starts_with("pack-") && name.ends_with(".pack")) {
+        return None;
+    }
+    let stem = pack_path.file_stem()?.to_str()?;
+    Some(pack_path.with_file_name(format!("{stem}.keep")))
 }
 
 fn pack_copy_priority(name: &str) -> u8 {
@@ -185,18 +233,18 @@ fn pack_copy_priority(name: &str) -> u8 {
     }
 }
 
-fn migrate_file(from: &Path, to: &Path) -> Result<()> {
+fn migrate_file(from: &Path, to: &Path) -> Result<bool> {
     if let Some(parent) = to.parent() {
         fs::create_dir_all(parent).map_err(Error::Io)?;
     }
     if to.exists() {
-        return Ok(());
+        return Ok(false);
     }
     if fs::rename(from, to).is_err() {
         fs::copy(from, to).map_err(Error::Io)?;
         fs::remove_file(from).map_err(Error::Io)?;
     }
-    Ok(())
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -219,8 +267,33 @@ mod tests {
             .expect("write");
         assert!(q.odb().exists(&oid));
         assert!(!Odb::new(&main).exists(&oid));
-        q.migrate().expect("migrate");
+        let _keeps = q.migrate().expect("migrate");
         assert!(Odb::new(&main).exists(&oid));
+    }
+
+    #[test]
+    fn migrate_creates_keep_marker_for_new_pack() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let main = tmp.path().join("objects");
+        fs::create_dir_all(main.join("pack")).unwrap();
+        let git_dir = tmp.path().join(".git");
+        std::fs::create_dir_all(&git_dir).unwrap();
+        let main_odb = Odb::new(&main);
+        let mut q = ReceiveQuarantine::create(&main_odb, &git_dir).expect("quarantine");
+        let pack_body = b"mock pack bytes";
+        let pack_path = q.path().join("pack/pack-deadbeef.pack");
+        fs::write(&pack_path, pack_body).unwrap();
+        let guard = q.migrate().expect("migrate");
+        let keep = main.join("pack/pack-deadbeef.keep");
+        assert!(
+            keep.is_file(),
+            "migrate must pin new pack until guard drops"
+        );
+        drop(guard);
+        assert!(
+            !keep.is_file(),
+            "keep marker must be removed when guard drops"
+        );
     }
 
     #[cfg_attr(
