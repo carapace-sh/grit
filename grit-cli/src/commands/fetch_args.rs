@@ -1,5 +1,6 @@
 //! Shared fetch flags for `grit fetch` and `grit pull`.
 
+use carapace_rs_clap::completer;
 use clap::Args;
 
 /// Options shared by fetch-like commands.
@@ -14,6 +15,7 @@ pub struct FetchArgs {
     pub all: bool,
     /// Remote to fetch from (defaults to the current branch's remote, else `origin`).
     #[arg(value_name = "REMOTE")]
+    #[arg(add = completer!(crate::completions::actions::remotes()))]
     pub remote: Option<String>,
     /// Refspecs selecting refs to fetch (`main`, `+refs/heads/x:refs/heads/y`, …).
     #[arg(value_name = "REFSPEC", num_args = 0..)]

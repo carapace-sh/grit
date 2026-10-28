@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
+use carapace_rs_clap::completer;
 use clap::Args;
 use grit_lib::config::environment::Environment;
 use grit_lib::config::mailmap::load_mailmap_table;
@@ -26,7 +27,10 @@ const LOG_CURSOR_PREFIX: &str = "lw1.";
 #[derive(Debug, Args, Clone)]
 pub struct RevSelectArgs {
     /// Revision tips and ranges (`A..B`, `A...B`, `^tip`, plain tips).
-    #[arg(value_name = "REV")]
+    #[arg(
+        value_name = "REV",
+        add = completer!(crate::completions::actions::revision_ranges())
+    )]
     pub revs: Vec<String>,
 
     #[command(flatten)]
@@ -77,7 +81,8 @@ pub struct RevSelectArgs {
         long = "branches",
         value_name = "GLOB",
         num_args = 0..=1,
-        default_missing_value = ""
+        default_missing_value = "",
+        add = completer!(crate::completions::actions::local_branches())
     )]
     pub branches: Option<String>,
 
@@ -86,7 +91,8 @@ pub struct RevSelectArgs {
         long = "tags",
         value_name = "GLOB",
         num_args = 0..=1,
-        default_missing_value = ""
+        default_missing_value = "",
+        add = completer!(crate::completions::actions::tags())
     )]
     pub tags: Option<String>,
 
@@ -95,7 +101,8 @@ pub struct RevSelectArgs {
         long = "remotes",
         value_name = "GLOB",
         num_args = 0..=1,
-        default_missing_value = ""
+        default_missing_value = "",
+        add = completer!(crate::completions::actions::remotes())
     )]
     pub remotes: Option<String>,
 

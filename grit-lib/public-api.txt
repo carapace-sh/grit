@@ -14600,6 +14600,29 @@ pub fn grit_lib::porcelain::quote_path::format_diff_path_with_prefix(&str, &str,
 pub fn grit_lib::porcelain::quote_path::quote_c_style(&str, bool) -> alloc::string::String
 pub fn grit_lib::porcelain::quote_path::quote_c_style_bytes(&[u8], bool) -> alloc::string::String
 pub fn grit_lib::porcelain::quote_path::quote_path_for_display(&str, bool) -> alloc::string::String
+pub mod grit_lib::porcelain::ref_summaries
+pub struct grit_lib::porcelain::ref_summaries::RefSummary
+pub grit_lib::porcelain::ref_summaries::RefSummary::full_name: alloc::string::String
+pub grit_lib::porcelain::ref_summaries::RefSummary::kind: grit_lib::refs::listing::RefKind
+pub grit_lib::porcelain::ref_summaries::RefSummary::name: alloc::string::String
+pub grit_lib::porcelain::ref_summaries::RefSummary::oid: grit_lib::objects::ObjectId
+pub grit_lib::porcelain::ref_summaries::RefSummary::subject: core::option::Option<alloc::string::String>
+impl core::clone::Clone for grit_lib::porcelain::ref_summaries::RefSummary
+pub fn grit_lib::porcelain::ref_summaries::RefSummary::clone(&self) -> Self
+impl core::cmp::Eq for grit_lib::porcelain::ref_summaries::RefSummary
+impl core::cmp::PartialEq for grit_lib::porcelain::ref_summaries::RefSummary
+pub fn grit_lib::porcelain::ref_summaries::RefSummary::eq(&self, &Self) -> bool
+impl core::fmt::Debug for grit_lib::porcelain::ref_summaries::RefSummary
+pub fn grit_lib::porcelain::ref_summaries::RefSummary::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for grit_lib::porcelain::ref_summaries::RefSummary
+impl core::marker::Freeze for grit_lib::porcelain::ref_summaries::RefSummary
+impl core::marker::Send for grit_lib::porcelain::ref_summaries::RefSummary
+impl core::marker::Sync for grit_lib::porcelain::ref_summaries::RefSummary
+impl core::marker::Unpin for grit_lib::porcelain::ref_summaries::RefSummary
+impl core::marker::UnsafeUnpin for grit_lib::porcelain::ref_summaries::RefSummary
+impl core::panic::unwind_safe::RefUnwindSafe for grit_lib::porcelain::ref_summaries::RefSummary
+impl core::panic::unwind_safe::UnwindSafe for grit_lib::porcelain::ref_summaries::RefSummary
+pub fn grit_lib::porcelain::ref_summaries::list_ref_summaries(&grit_lib::repo::Repository, &[grit_lib::refs::listing::RefNamespace]) -> grit_lib::error::Result<alloc::vec::Vec<grit_lib::porcelain::ref_summaries::RefSummary>>
 pub mod grit_lib::porcelain::replay
 pub enum grit_lib::porcelain::replay::ReplayDirection
 pub grit_lib::porcelain::replay::ReplayDirection::Pick

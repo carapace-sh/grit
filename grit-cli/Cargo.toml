@@ -28,7 +28,8 @@ expect_used = "deny"
 anyhow.workspace = true
 base64.workspace = true
 clap.workspace = true
-clap_complete.workspace = true
+carapace-rs.workspace = true
+carapace-rs-clap.workspace = true
 grit-lib = { version = "0.5", path = "../grit-lib", features = ["http-ureq", "tracing"] }
 grit-http-server = { version = "0.5", path = "../grit-http-server" }
 grit-protocol = { version = "0.5", path = "../grit-protocol" }

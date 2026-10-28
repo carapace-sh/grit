@@ -1,68 +1,40 @@
-//! `grit completions` — emit shell completion scripts for the current CLI.
+//! `grit completions` — emit the shell integration script for dynamic completion.
 
-use anyhow::Result;
-use clap_complete::{generate, Shell};
+use anyhow::{anyhow, Result};
 
-/// Write a completion script for `shell` to stdout.
-pub fn run(shell: Shell) -> Result<()> {
-    generate(
-        shell,
-        &mut crate::cli_command::full_cli_command("grit"),
-        "grit",
-        &mut std::io::stdout(),
-    );
+use crate::completions;
+
+/// Write the completion script for `shell` to stdout.
+///
+/// The script registers a shell function that asks `grit _carapace` for
+/// candidates, so completion covers branch names, tags, remotes, paths and
+/// flags without regenerating anything after a `grit` upgrade.
+pub fn run(shell: &str) -> Result<()> {
+    let shell = completions::parse_shell(shell).map_err(|error| anyhow!(error))?;
+    print!("{}", completions::snippet(shell));
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
+    use carapace_rs::shell::Shell;
 
-    const COMPLETION_TEST_STACK: usize = 32 * 1024 * 1024;
-
-    fn script_for(shell: Shell) -> String {
-        std::thread::Builder::new()
-            .stack_size(COMPLETION_TEST_STACK)
-            .spawn(move || {
-                let mut buf = Cursor::new(Vec::new());
-                generate(
-                    shell,
-                    &mut crate::cli_command::build_cli_command(),
-                    "grit",
-                    &mut buf,
-                );
-                String::from_utf8(buf.into_inner()).expect("completion script is utf-8")
-            })
-            .ok()
-            .and_then(|handle| handle.join().ok())
-            .unwrap_or_else(|| panic!("completion generator thread failed"))
+    #[test]
+    fn unknown_shell_is_rejected() {
+        let error = run("nushell-but-not-quite").expect_err("unknown shell");
+        assert!(error.to_string().contains("unknown shell"), "{error}");
     }
 
     #[test]
-    fn bash_includes_core_commands_and_json_flag() {
-        let script = script_for(Shell::Bash);
-        assert!(script.contains("status"));
-        assert!(script.contains("commit"));
-        assert!(script.contains("fetch"));
-        assert!(script.contains("--json"));
+    fn export_is_not_a_shell() {
+        assert!(run("export").is_err());
     }
 
     #[test]
-    fn zsh_includes_core_commands_and_json_flag() {
-        let script = script_for(Shell::Zsh);
-        assert!(script.contains("status"));
-        assert!(script.contains("commit"));
-        assert!(script.contains("fetch"));
-        assert!(script.contains("--json"));
-    }
-
-    #[test]
-    fn fish_includes_core_commands_and_json_flag() {
-        let script = script_for(Shell::Fish);
-        assert!(script.contains("status"));
-        assert!(script.contains("commit"));
-        assert!(script.contains("fetch"));
-        assert!(script.contains("--json"));
+    fn known_shells_have_scripts() {
+        for shell in completions::shell_names() {
+            assert!(Shell::parse(shell).is_some(), "{shell}");
+        }
     }
 }

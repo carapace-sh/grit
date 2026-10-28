@@ -1,6 +1,7 @@
 //! `grit shortlog` — the commits on this branch that aren't on the target yet.
 
 use anyhow::{Context, Result};
+use carapace_rs_clap::completer;
 use clap::Args;
 use grit_lib::objects::{CommitData, OidHashMap};
 use grit_lib::refs::branch_tracking::{
@@ -27,6 +28,7 @@ use crate::ui;
 pub struct ShortlogCliArgs {
     /// Compare against this ref or revision instead of the discovered target branch.
     #[arg(long = "target", value_name = "REF")]
+    #[arg(add = completer!(crate::completions::actions::revisions()))]
     pub target: Option<String>,
     /// Maximum commits to list on each side (`ahead`, and with `--behind` the behind list too).
     #[arg(short = 'n', long = "max-count", default_value = "100")]

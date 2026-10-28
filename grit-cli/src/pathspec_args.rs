@@ -1,6 +1,7 @@
 //! Shared `--pathspec-from-file` / trailing path arguments for porcelain commands.
 
 use anyhow::{bail, Context, Result};
+use carapace_rs_clap::completer;
 use clap::Args;
 use grit_lib::error::PathspecFromFileParseError;
 use grit_lib::repo::Repository;
@@ -15,13 +16,17 @@ static PATHSPEC_STDIN_BYTES: OnceLock<Vec<u8>> = OnceLock::new();
 #[derive(Debug, Clone, Default, Args)]
 pub struct PathspecArgs {
     /// Files or directories to limit the command to.
-    #[arg(value_name = "PATH")]
+    #[arg(
+        value_name = "PATH",
+        add = completer!(crate::completions::actions::paths())
+    )]
     pub paths: Vec<String>,
     /// Read pathspecs from a file (`-` for stdin) instead of or in addition to argv paths.
     #[arg(
         long = "pathspec-from-file",
         value_name = "FILE|-",
-        allow_hyphen_values = true
+        allow_hyphen_values = true,
+        add = completer!(crate::completions::actions::files())
     )]
     pub pathspec_from_file: Option<String>,
     /// `--pathspec-from-file` entries are NUL-separated.
@@ -33,7 +38,12 @@ pub struct PathspecArgs {
 #[derive(Debug, Clone, Default, Args)]
 pub struct TrailingPathspecArgs {
     /// Limit the command to these paths (after `--`).
-    #[arg(value_name = "PATH", last = true, allow_hyphen_values = true)]
+    #[arg(
+        value_name = "PATH",
+        last = true,
+        allow_hyphen_values = true,
+        add = completer!(crate::completions::actions::paths())
+    )]
     pub paths: Vec<String>,
     /// Read pathspecs from a file (`-` for stdin) instead of or in addition to argv paths.
     #[arg(

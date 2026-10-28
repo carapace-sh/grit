@@ -76,6 +76,7 @@ pub(crate) mod orphans;
 pub mod paths;
 pub mod pathspec_match;
 pub mod pull;
+pub mod ref_summaries;
 pub mod replay;
 pub mod replay_sequence;
 pub mod reset;

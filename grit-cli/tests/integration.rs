@@ -36,6 +36,7 @@ mod ambiguous_ref_warning;
 #[cfg(feature = "full-tests")]
 #[path = "auth_logout_cli.rs"]
 mod auth_logout_cli;
+#[cfg(feature = "full-tests")]
 #[path = "auth_server_cli.rs"]
 mod auth_server_cli;
 #[cfg(feature = "full-tests")]

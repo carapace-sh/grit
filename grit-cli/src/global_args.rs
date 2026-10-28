@@ -5,6 +5,7 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+use carapace_rs_clap::completer;
 use clap::builder::TypedValueParser as _;
 use clap::Args;
 use grit_lib::config::environment::ConfigOverride;
@@ -19,21 +20,31 @@ pub struct GlobalRepoArgs {
     #[arg(
         short = 'C',
         value_name = "DIR",
-        value_parser = clap::builder::OsStringValueParser::new().map(PathBuf::from)
+        value_parser = clap::builder::OsStringValueParser::new().map(PathBuf::from),
+        add = completer!(carapace_rs::Action::directories())
     )]
     pub dirs: Vec<PathBuf>,
     /// Set a config value for this invocation only (repeatable; a bare KEY means true).
     #[arg(
         short = 'c',
         value_name = "KEY=VALUE",
-        value_parser = parse_config_override
+        value_parser = parse_config_override,
+        add = completer!(crate::completions::actions::config_overrides())
     )]
     pub config: Vec<ConfigOverride>,
     /// Use this repository directory instead of discovering one (same as `GIT_DIR`).
-    #[arg(long = "git-dir", value_name = "PATH")]
+    #[arg(
+        long = "git-dir",
+        value_name = "PATH",
+        add = completer!(carapace_rs::Action::directories())
+    )]
     pub git_dir: Option<PathBuf>,
     /// Use this directory as the work tree root (same as `GIT_WORK_TREE`).
-    #[arg(long = "work-tree", value_name = "PATH")]
+    #[arg(
+        long = "work-tree",
+        value_name = "PATH",
+        add = completer!(carapace_rs::Action::directories())
+    )]
     pub work_tree: Option<PathBuf>,
 }
 

@@ -43,7 +43,7 @@ other systems.
 
 ## Shell completions
 
-Tab completion helps you discover `grit`'s subcommands and flags. Generate a script with [`grit completions`](../completions/) and load it from your shell config, or copy the pre-generated files from a release tarball's `completions/` directory.
+Tab completion covers more than flags: branches, tags, remotes, stashes, and paths are completed from the repository you are in, alongside every subcommand and flag. Generate a script with [`grit completions`](../completions/) and load it from your shell config, or copy the pre-generated files from a release tarball's `completions/` directory.
 
 **bash** — add to `~/.bashrc`:
 
@@ -70,7 +70,17 @@ mkdir -p ~/.config/fish/completions
 grit completions fish > ~/.config/fish/completions/grit.fish
 ```
 
-After [`grit update`](../update/), regenerate completions so new commands appear.
+**nushell** — write a completion file and source it from `config.nu`:
+
+```bash
+grit completions nushell | save -f ~/.config/nushell/grit.nu
+```
+
+```text
+source ~/.config/nushell/grit.nu
+```
+
+The script asks the installed `grit` for candidates, so it stays current across [`grit update`](../update/) without regenerating.
 
 ## Nightly builds
 

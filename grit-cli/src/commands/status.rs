@@ -27,6 +27,7 @@ use crate::output::{
 };
 use crate::pathspec_args::PathspecArgs;
 use crate::ui::{self, PathDisplayOptions};
+use carapace_rs_clap::completer;
 use clap::Args;
 
 /// Maximum number of commits to list in the status shortlog before summarizing.
@@ -764,6 +765,7 @@ pub struct StatusCliArgs {
     /// directories; `all` lists every file; `no` omits untracked paths. When omitted,
     /// uses `status.showUntrackedFiles` from config.
     #[arg(long = "untracked", value_name = "MODE")]
+    #[arg(add = completer!(crate::completions::actions::untracked_modes()))]
     pub untracked: Option<UntrackedListing>,
     /// Skip ahead/behind rev-list walks (also when `status.aheadBehind=false`).
     #[arg(long = "no-ahead-behind")]
