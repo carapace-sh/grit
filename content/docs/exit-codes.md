@@ -14,7 +14,7 @@ Grit uses a small set of exit codes. Command-specific yes/no checks (for example
 | `usage` | 2 | Invalid flags or arguments. With `--json`, stdout is still `{"error":"…"}` (clap usage errors and subcommand usage such as `grit branch`). Hunk selection mistakes (`add` / `commit` / `stash` / `restore` with unknown or stale `--hunks` ids) also exit 2. `grit diff --exit-code` / `--quiet` uses 2 when diff itself errors. |
 | `remote_unreadable` | 128 | `clone`, `fetch`, `pull`, `push`, or `remote refs` could not reach or read the remote: a missing repository path, a DNS, refused-connection, TLS, or timeout failure, an HTTP error status, or a transport that never spoke Git. With `--json`, stdout is `{"error":"…","kind":"remote_unreadable"}`. Rejected pushes and authentication failures are not in this class (they exit 1). |
 | `missing_prerequisite` | 128 | `grit bundle unbundle` when the repository lacks prerequisite commits. |
-| `refused_not_ff` | 128 | `grit merge --ff-only` when a fast-forward is not possible. |
+| `refused_not_ff` | 128 | `grit merge --ff-only` or `grit pull --ff-only` when a fast-forward is not possible. |
 | `invalid_commit_filter` | 129 | Invalid `--author`, `--grep`, or pickaxe pattern on `grit log`, `grit revs`, or related commands (`kind`: `invalid_pattern`). |
 | `interrupted` | 130 | `grit clone` stopped by Ctrl-C (or Ctrl-Break on Windows). The partial clone has already been removed, so the same command can be run again. With `--json`, stdout is `{"error":"operation cancelled"}`. |
 | `custom` | *varies* | Passthrough from `grit hooks run` (hook exit code) or `grit rebase --exec` when a command fails. |

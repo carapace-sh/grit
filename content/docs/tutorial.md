@@ -169,7 +169,7 @@ $ grit pull --rebase
 Rebased onto origin/main (c4f1a9b)
 ```
 
-Use [`grit pull --ff-only`](../pull/) in scripts that must refuse merge commits (exit **1** with `refused_not_ff` when histories diverged).
+Use [`grit pull --ff-only`](../pull/) in scripts that must refuse merge commits (exit **128** with `refused_not_ff` when histories diverged).
 
 If someone pushed before you, a normal `grit push` is rejected:
 

@@ -186,7 +186,7 @@ Schema: [v2](/schemas/pull/v2.json) · [v1](/schemas/pull/v1.json)
 
 Pass `--json` for stable, scripting-friendly output:
 
-Exit codes (also apply to default human output): **0** on success (`up_to_date`, `fast_forward`, `merged`, `rebased`, `set_upstream`, `detached`, `landed`, or `created`) and on `--check` when `check.fast_forward_possible` is true; **1** when `--ff-only` refuses diverged history (`refused_not_ff`), integration stops with conflicts (`conflicts`, with `operation` `merge` or `rebase` in progress), a snapshot checkout's refresh stops in a rebase (`rebase_stopped`), `--check` when a merge or rebase would be required, or `autostash_conflict`.
+Exit codes (also apply to default human output): **0** on success (`up_to_date`, `fast_forward`, `merged`, `rebased`, `set_upstream`, `detached`, `landed`, or `created`) and on `--check` when `check.fast_forward_possible` is true; **128** when `--ff-only` (or `pull.ff=only`) refuses diverged history (`refused_not_ff`; the branch is unchanged), as with `grit merge --ff-only`; **1** when integration stops with conflicts (`conflicts`, with `operation` `merge` or `rebase` in progress), a snapshot checkout's refresh stops in a rebase (`rebase_stopped`), `--check` when a merge or rebase would be required, or `autostash_conflict`.
 
 | Field | Type | Meaning |
 | ----- | ---- | ------- |
@@ -375,7 +375,7 @@ In a snapshot checkout, the refresh comes first, and branches it moved or left b
 | `0` | Success (`up_to_date`, `fast_forward`, `merged`, `rebased`, `set_upstream`, `detached`, `landed`, `created`) or `--check` when fast-forward is possible. |
 | `1` | Conflicts, refused merge/rebase, a snapshot checkout's rebase stopped in progress (`rebase_stopped`), a refresh refused while a rebase or merge is in progress, `--check` when integration would be required, `autostash_conflict`, or a server branch `grit pull <branch>` can't take (the server has none, or it is already on the target or older than the checkout's first snapshot). |
 | `2` | Invalid flags ([`usage`](../exit-codes/)). |
-| `128` | `--ff-only` when history diverged ([`refused_not_ff`](../exit-codes/)). |
+| `128` | `--ff-only` or `pull.ff=only` when history diverged ([`refused_not_ff`](../exit-codes/)). |
 | `128` | The fetch could not reach or read the remote ([`remote_unreadable`](../exit-codes/)). |
 
 See [Exit codes](../exit-codes/).
