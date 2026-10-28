@@ -268,6 +268,26 @@ fn repository_flags_select_the_completed_repository() {
 }
 
 #[test]
+fn git_dir_flag_selects_the_completed_repository() {
+    let (_tmp, dir) = sample_repo();
+    let elsewhere = dir.join("elsewhere");
+    std::fs::create_dir(&elsewhere).expect("create sibling dir");
+    let git_dir = dir.join(".git");
+
+    let payload = export(
+        &elsewhere,
+        &[
+            "--git-dir",
+            git_dir.to_str().expect("utf-8 path"),
+            "branch",
+            "",
+        ],
+    );
+
+    assert!(has_value(&payload, "feature-x"), "{:?}", values(&payload));
+}
+
+#[test]
 fn repository_flag_completes_directories_only() {
     let (_tmp, dir) = sample_repo();
     std::fs::create_dir(dir.join("nested")).expect("create nested dir");
@@ -286,6 +306,175 @@ fn repository_flag_completes_directories_only() {
             .iter()
             .any(|candidate| candidate.0 == "tracked.txt"),
         "a path-valued flag must not fall back to clap's file hint: {candidates:?}"
+    );
+}
+
+/// Write a loose remote-tracking ref without contacting the remote.
+fn write_tracking_ref(dir: &Path, remote: &str, branch: &str, oid: &str) {
+    let path = format!(".git/refs/remotes/{remote}/{branch}");
+    std::fs::create_dir_all(dir.join(format!(".git/refs/remotes/{remote}")))
+        .expect("create ref dir");
+    write_file(dir, &path, &format!("{oid}\n"));
+}
+
+/// The tip oid recorded in a loose branch ref.
+fn branch_oid(dir: &Path, branch: &str) -> String {
+    std::fs::read_to_string(dir.join(format!(".git/refs/heads/{branch}")))
+        .expect("read branch ref")
+        .trim()
+        .to_owned()
+}
+
+#[test]
+fn fetch_refspecs_complete_remote_branches_and_local_destinations() {
+    let (_tmp, dir) = sample_repo();
+    write_tracking_ref(&dir, "origin", "main", &branch_oid(&dir, "main"));
+
+    let payload = export(&dir, &["fetch", "origin", ""]);
+    let candidates = values(&payload);
+    assert!(
+        candidates
+            .iter()
+            .any(|candidate| candidate.0 == "main" && candidate.2 == "remote branches"),
+        "{candidates:?}"
+    );
+    assert!(
+        !candidates
+            .iter()
+            .any(|candidate| candidate.0 == "origin/main"),
+        "a refspec source names the branch on the remote: {candidates:?}"
+    );
+
+    let payload = export(&dir, &["fetch", "origin", "main:"]);
+    let candidates = values(&payload);
+    assert!(
+        candidates
+            .iter()
+            .any(|candidate| candidate.0 == "main:feature-x" && candidate.2 == "local branches"),
+        "{candidates:?}"
+    );
+}
+
+#[test]
+fn remote_set_head_completes_short_branch_names() {
+    let (_tmp, dir) = sample_repo();
+    write_tracking_ref(&dir, "origin", "main", &branch_oid(&dir, "main"));
+
+    let payload = export(&dir, &["remote", "set-head", "origin", ""]);
+    let candidates = values(&payload);
+
+    assert!(
+        candidates
+            .iter()
+            .any(|candidate| candidate.0 == "main" && candidate.1 == "first commit"),
+        "{candidates:?}"
+    );
+    assert!(
+        !candidates
+            .iter()
+            .any(|candidate| candidate.0 == "origin/main"),
+        "set-head takes the branch name inside the remote: {candidates:?}"
+    );
+}
+
+#[test]
+fn hunk_ids_match_the_diff_report() {
+    let (_tmp, dir) = sample_repo();
+    write_file(&dir, "tracked.txt", "one\ntwo\n");
+
+    let id = diff_hunk_id(&dir, &[]);
+    let payload = export(&dir, &["add", "--hunks", ""]);
+    let candidates = values(&payload);
+
+    assert!(
+        candidates.iter().any(|candidate| candidate.0 == id
+            && candidate.1.starts_with("tracked.txt ")
+            && candidate.2 == "unstaged hunks"),
+        "{candidates:?}"
+    );
+
+    let narrow = diff_hunk_id(&dir, &["-U", "0"]);
+    assert_ne!(narrow, id, "context lines change the hunk id");
+    let payload = export(&dir, &["add", "-U", "0", "--hunks", ""]);
+    let candidates = values(&payload);
+    assert!(
+        candidates.iter().any(|candidate| candidate.0 == narrow),
+        "{candidates:?}"
+    );
+}
+
+/// The first unstaged hunk id `grit diff --json` reports, with extra flags.
+fn diff_hunk_id(dir: &Path, flags: &[&str]) -> String {
+    let mut args = vec!["diff", "--unstaged"];
+    args.extend_from_slice(flags);
+    args.push("--json");
+    let stdout = grit_cmd(&args).in_dir(dir).suc().stdout;
+    let diff: Value = serde_json::from_str(&stdout).expect("diff json");
+    diff["files"][0]["hunks"][0]["id"]
+        .as_str()
+        .expect("hunk id")
+        .to_owned()
+}
+
+#[test]
+fn line_ranges_complete_paths_and_hunk_ranges() {
+    let (_tmp, dir) = sample_repo();
+    write_file(&dir, "tracked.txt", "one\ntwo\n");
+
+    let payload = export(&dir, &["add", "--lines", "tracked.txt:"]);
+    let candidates = values(&payload);
+
+    assert!(
+        candidates
+            .iter()
+            .any(|candidate| candidate.0 == "tracked.txt:1-2" && candidate.2 == "line ranges"),
+        "{candidates:?}"
+    );
+}
+
+#[test]
+fn staged_hunks_are_offered_to_staged_restore_only() {
+    let (_tmp, dir) = sample_repo();
+    write_file(&dir, "staged.txt", "content\n");
+    grit_cmd(&["add", "staged.txt"]).in_dir(&dir).suc();
+
+    let payload = export(&dir, &["restore", "--staged", "--hunks", ""]);
+    let candidates = values(&payload);
+    assert!(
+        candidates.iter().any(
+            |candidate| candidate.1.starts_with("staged.txt ") && candidate.2 == "staged hunks"
+        ),
+        "{candidates:?}"
+    );
+
+    let payload = export(&dir, &["add", "--hunks", ""]);
+    assert!(
+        !values(&payload)
+            .iter()
+            .any(|candidate| candidate.1.starts_with("staged.txt ")),
+        "unstaged hunk ids must not include staged changes"
+    );
+}
+
+#[test]
+fn reflog_selectors_complete_existing_entries() {
+    let (_tmp, dir) = sample_repo();
+
+    let payload = export(&dir, &["reflog", "delete", ""]);
+    let candidates = values(&payload);
+
+    assert!(
+        candidates
+            .iter()
+            .any(|candidate| candidate.0 == "HEAD@{0}" && candidate.2 == "reflog entries"),
+        "{candidates:?}"
+    );
+    assert!(
+        candidates
+            .iter()
+            .any(|candidate| candidate.0 == "feature-x@{0}"
+                && candidate.1 == "branch: Created from main"),
+        "{candidates:?}"
     );
 }
 

@@ -19,6 +19,7 @@ pub struct FetchArgs {
     pub remote: Option<String>,
     /// Refspecs selecting refs to fetch (`main`, `+refs/heads/x:refs/heads/y`, …).
     #[arg(value_name = "REFSPEC", num_args = 0..)]
+    #[arg(add = completer!(crate::completions::actions::fetch_refspecs()))]
     pub refspecs: Vec<String>,
     /// Fetch all tags from the remote (`git fetch --tags`).
     #[arg(long = "tags")]

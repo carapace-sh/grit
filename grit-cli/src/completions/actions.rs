@@ -6,14 +6,18 @@
 //! uses for Git itself, so branches, tags, stashes, and remotes read alike
 //! across both tools.
 
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use carapace_rs::{batch, Action, Context, InvokedAction};
 use grit_lib::config::environment::{Environment, RepositoryOptions};
+use grit_lib::diff::structured::StructuredHunk;
+use grit_lib::diff::{hunk_diff_bundle, hunk_ids_with_duplicate_peers, DiffOptions, DiffSide};
 use grit_lib::porcelain::ref_summaries::{list_ref_summaries, RefSummary};
 use grit_lib::refs::listing::RefNamespace;
 use grit_lib::repo::Repository;
+use grit_lib::repo_handles::ReflogQuery;
 use grit_lib::worktree::worktree_rules::WorktreeRules;
 
 /// Style for local and remote branch names (carapace-bin `styles.Git.Branch`).
@@ -26,6 +30,13 @@ const HEAD_STYLE: &str = "bold";
 const STASH_STYLE: &str = "green";
 /// Style for notes refs (carapace-bin `styles.Git.Note`).
 const NOTE_STYLE: &str = "cyan";
+/// Style for hunk ids (carapace-bin has no hunk style; magenta matches commit ids).
+const HUNK_STYLE: &str = "magenta";
+
+/// Refs whose reflog is listed for `ref@{n}` completion.
+const REFLOG_REF_LIMIT: usize = 50;
+/// Newest entries listed per ref for `ref@{n}` completion.
+const REFLOG_ENTRY_LIMIT: usize = 10;
 
 /// Pseudo refs Git understands besides `refs/*` (see `gitrevisions(7)`).
 const PSEUDO_REFS: &[&str] = &[
@@ -174,6 +185,48 @@ pub(crate) fn branch_targets() -> Action {
     batch(vec![remote_branches(), local_branches()])
 }
 
+/// Reflog selectors (`main@{0}`, `HEAD@{2}`, …), described by the entry message.
+///
+/// Only refs that actually have a reflog are offered, newest entries first, so
+/// `grit reflog delete` can only be pointed at entries that exist. The list is
+/// capped because every ref with a reflog contributes its own entries.
+pub(crate) fn reflog_selectors() -> Action {
+    Action::callback(|context| {
+        let Some(repo) = repository(context) else {
+            return Action::default();
+        };
+        let refs = repo.reflogs().refs().unwrap_or_default();
+        let query = ReflogQuery {
+            limit: Some(REFLOG_ENTRY_LIMIT),
+            ..ReflogQuery::default()
+        };
+        let mut values = Vec::new();
+        for refname in refs.iter().take(REFLOG_REF_LIMIT) {
+            let Ok(page) = repo.reflogs().query(refname, &query) else {
+                continue;
+            };
+            let short = short_refname(refname.as_str());
+            values.extend(
+                page.entries
+                    .into_iter()
+                    .map(|entry| (format!("{short}@{{{}}}", entry.index), entry.entry.message)),
+            );
+        }
+        Action::values_described(values)
+            .style(BRANCH_STYLE)
+            .tag("reflog entries")
+    })
+}
+
+/// `refs/heads/main` and `HEAD` as the names reflog selectors are written with.
+fn short_refname(refname: &str) -> &str {
+    refname
+        .strip_prefix("refs/heads/")
+        .or_else(|| refname.strip_prefix("refs/remotes/"))
+        .or_else(|| refname.strip_prefix("refs/"))
+        .unwrap_or(refname)
+}
+
 /// Every revision name a user is likely to type: branches, tags, stashes, and
 /// the pseudo refs.
 pub(crate) fn revisions() -> Action {
@@ -216,6 +269,68 @@ pub(crate) fn remotes() -> Action {
         )
         .tag("remotes")
     })
+}
+
+/// Branch names as they exist on the remote named in the previous positional.
+///
+/// `grit remote set-head` names a branch inside the remote, so `origin/main`
+/// from the remote-tracking refs is trimmed to `main`; without a remote yet
+/// typed, every remote's branches are offered.
+pub(crate) fn remote_branch_names() -> Action {
+    Action::callback(|context| {
+        let Some(repo) = repository(context) else {
+            return Action::default();
+        };
+        Action::values_described(remote_branch_summaries(
+            &repo,
+            context.args.first().map(String::as_str),
+        ))
+        .style(BRANCH_STYLE)
+        .tag("remote branches")
+    })
+}
+
+/// Refspecs `fetch` accepts: a remote branch (or tag) source and a local
+/// destination, as in `main:incoming`.
+pub(crate) fn fetch_refspecs() -> Action {
+    Action::multiparts_n(":", 2, |context| {
+        if !context.parts.is_empty() {
+            return local_branches();
+        }
+        let Some(repo) = repository(context) else {
+            return Action::default();
+        };
+        let branches = remote_branch_summaries(&repo, context.args.first().map(String::as_str));
+        batch(vec![
+            Action::values_described(branches)
+                .style(BRANCH_STYLE)
+                .tag("remote branches"),
+            tags(),
+        ])
+    })
+}
+
+/// Remote-tracking branches as `(name on the remote, tip subject)`.
+///
+/// A refspec source and `remote set-head` both name the branch the way the
+/// remote does, so the tracking ref's remote component is dropped.
+fn remote_branch_summaries(repo: &Repository, remote: Option<&str>) -> Vec<(String, String)> {
+    let prefix = remote.map(|remote| format!("{remote}/"));
+    list_ref_summaries(repo, &[RefNamespace::Remotes])
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|summary| {
+            let name = match &prefix {
+                Some(prefix) => summary.name.strip_prefix(prefix.as_str())?.to_owned(),
+                None => summary
+                    .name
+                    .split_once('/')
+                    .map(|(_, name)| name)?
+                    .to_owned(),
+            };
+            Some((name, summary.subject.unwrap_or_default()))
+        })
+        .collect()
 }
 
 /// Notes refs, as the short names `grit notes --ref` accepts.
@@ -436,6 +551,174 @@ fn indexed_paths() -> Action {
             .collect();
         Action::values(paths).tag("tracked paths")
     })
+}
+
+/// One hunk of the change the current command acts on.
+struct HunkCandidate {
+    path: String,
+    start: usize,
+    end: usize,
+    id: String,
+}
+
+impl HunkCandidate {
+    /// `path start-end`, or `path start` when the hunk covers one line.
+    fn label(&self) -> String {
+        if self.start == self.end {
+            format!("{} {}", self.path, self.start)
+        } else {
+            format!("{} {}-{}", self.path, self.start, self.end)
+        }
+    }
+
+    /// The new-side range the way `--lines` writes it (`3-7`, or `3`).
+    fn range(&self) -> String {
+        if self.start == self.end {
+            self.start.to_string()
+        } else {
+            format!("{}-{}", self.start, self.end)
+        }
+    }
+}
+
+/// Hunk ids `--hunks` accepts, described with their path and new-side range.
+///
+/// The side follows `--staged`, so `grit restore --staged --hunks` is offered
+/// index hunks and every other command is offered unstaged ones.
+pub(crate) fn hunks() -> Action {
+    Action::callback(|context| {
+        let side = selected_side(context);
+        let values = hunk_candidates(context, side).into_iter().map(|hunk| {
+            let label = hunk.label();
+            (hunk.id, label)
+        });
+        Action::values_described(values)
+            .style(HUNK_STYLE)
+            .tag(hunk_tag(side))
+    })
+    .list(",")
+}
+
+/// Line ranges `--lines` accepts: a path, then the new-side range of one hunk.
+pub(crate) fn line_ranges() -> Action {
+    Action::multiparts_n(":", 2, |context| {
+        if context.parts.is_empty() {
+            return paths();
+        }
+        let path = context.parts[0].clone();
+        let side = selected_side(context);
+        let ranges: Vec<String> = hunk_candidates(context, side)
+            .into_iter()
+            .filter(|hunk| hunk.path == path)
+            .map(|hunk| hunk.range())
+            .collect();
+        Action::values(ranges).tag("line ranges")
+    })
+}
+
+/// The side `--hunks` / `--lines` resolve against, following `--staged`.
+fn selected_side(context: &Context) -> DiffSide {
+    let staged = context
+        .parsed_flags
+        .iter()
+        .any(|(flag, _)| flag == "staged");
+    if staged {
+        DiffSide::Staged
+    } else {
+        DiffSide::Unstaged
+    }
+}
+
+fn hunk_tag(side: DiffSide) -> &'static str {
+    match side {
+        DiffSide::Staged => "staged hunks",
+        _ => "unstaged hunks",
+    }
+}
+
+/// Hunks of the current changes, with the ids `grit diff --json` assigns them.
+///
+/// The unstaged side is diffed against the index and the staged side against
+/// `HEAD`; each side keeps the other side's hunks as peers so a hunk body that
+/// appears twice gets the same disambiguated id the diff command reports.
+fn hunk_candidates(context: &Context, side: DiffSide) -> Vec<HunkCandidate> {
+    let Some(repo) = repository(context) else {
+        return Vec::new();
+    };
+    let Ok(config) = repo.config() else {
+        return Vec::new();
+    };
+    let mut options = DiffOptions::from_config(config.as_ref());
+    if let Some(lines) = unified_context(context) {
+        options.context_lines = lines;
+    }
+    let Ok(bundle) = hunk_diff_bundle(&repo, &[], options) else {
+        return Vec::new();
+    };
+    let mut candidates = Vec::new();
+    match side {
+        DiffSide::Staged => {
+            let unstaged: HashMap<&str, &[StructuredHunk]> = bundle
+                .unstaged
+                .iter()
+                .map(|file| (file.path.as_str(), file.hunks.as_slice()))
+                .collect();
+            for (path, hunks) in &bundle.peer_hunks {
+                let peers = unstaged.get(path.as_str()).copied().unwrap_or_default();
+                candidates.extend(describe_hunks(side, path, hunks, peers));
+            }
+        }
+        _ => {
+            for file in &bundle.unstaged {
+                let peers: &[StructuredHunk] = bundle
+                    .peer_hunks
+                    .get(&file.path)
+                    .map_or(&[][..], Vec::as_slice);
+                candidates.extend(describe_hunks(side, &file.path, &file.hunks, peers));
+            }
+        }
+    }
+    candidates.sort_by(|left, right| {
+        (left.path.as_str(), left.start).cmp(&(right.path.as_str(), right.start))
+    });
+    candidates
+}
+
+fn describe_hunks(
+    side: DiffSide,
+    path: &str,
+    hunks: &[StructuredHunk],
+    peers: &[StructuredHunk],
+) -> Vec<HunkCandidate> {
+    let ids = hunk_ids_with_duplicate_peers(side, path, hunks, peers);
+    hunks
+        .iter()
+        .zip(ids)
+        .map(|(hunk, id)| {
+            let start = hunk.new_start;
+            let end = if hunk.new_lines == 0 {
+                start
+            } else {
+                start + hunk.new_lines - 1
+            };
+            HunkCandidate {
+                path: path.to_owned(),
+                start,
+                end,
+                id: id.to_string(),
+            }
+        })
+        .collect()
+}
+
+/// Unified context lines from `-U` / `--unified`, when the command set one.
+fn unified_context(context: &Context) -> Option<usize> {
+    context
+        .parsed_flags
+        .iter()
+        .filter(|(flag, _)| flag == "unified_context")
+        .flat_map(|(_, values)| values.iter().rev())
+        .find_map(|value| value.parse().ok())
 }
 
 /// A ref listing action for `namespaces`.

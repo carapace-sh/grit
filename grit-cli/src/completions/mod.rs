@@ -146,6 +146,8 @@ const GROUPS: &[(&str, &[&str])] = &[
 
 fn repository_context(context: &Context, action: Action) -> Action {
     let mut context = context.clone();
+    // Flag keys are clap argument ids (the field names), not the long flag
+    // names: `--work-tree` arrives as `work_tree`.
     let flags = |name: &str| -> Vec<String> {
         context
             .parsed_flags
@@ -155,8 +157,8 @@ fn repository_context(context: &Context, action: Action) -> Action {
             .collect()
     };
     let dirs = flags("dirs");
-    let work_tree = flags("work-tree").pop();
-    let git_dir = flags("git-dir").pop();
+    let work_tree = flags("work_tree").pop();
+    let git_dir = flags("git_dir").pop();
     let overrides = flags("config");
     for dir in dirs {
         let path = context.dir.join(dir);

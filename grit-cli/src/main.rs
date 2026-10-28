@@ -161,7 +161,7 @@ enum RemoteAction {
         #[arg(add = completer!(crate::completions::actions::remotes()))]
         name: String,
         /// Short branch name (sets HEAD to `refs/remotes/<name>/<branch>`).
-        #[arg(add = completer!(crate::completions::actions::remote_branches()))]
+        #[arg(add = completer!(crate::completions::actions::remote_branch_names()))]
         branch: Option<String>,
         /// Query the remote and set HEAD from its default branch.
         #[arg(long, conflicts_with_all = ["branch", "delete"])]
@@ -239,6 +239,7 @@ enum ReflogAction {
     Delete {
         /// Reflog selectors (`main@{1}`, `HEAD@{0}`, …).
         #[arg(required = true, value_name = "REF@{N}")]
+        #[arg(add = completer!(crate::completions::actions::reflog_selectors()))]
         specs: Vec<String>,
     },
     /// Drop reflog entries older than configured or explicit cutoffs.
@@ -347,6 +348,7 @@ enum StashAction {
             action = clap::ArgAction::Append,
             conflicts_with = "include_untracked"
         )]
+        #[arg(add = completer!(crate::completions::actions::hunks()))]
         hunks: Vec<String>,
         /// Stash only unstaged line ranges (`path:start-end`).
         #[arg(
@@ -355,6 +357,7 @@ enum StashAction {
             action = clap::ArgAction::Append,
             conflicts_with = "include_untracked"
         )]
+        #[arg(add = completer!(crate::completions::actions::line_ranges()))]
         lines: Vec<String>,
         /// Preview stash without updating refs, index, or worktree.
         #[arg(long = "dry-run")]
@@ -483,9 +486,11 @@ enum HistoryAction {
         message: message_input::MessageInputArgs,
         /// Unstaged hunk ids to fold (`grit diff --unstaged --json`, comma-separated or repeated).
         #[arg(long = "hunks", value_name = "ID,...", action = clap::ArgAction::Append)]
+        #[arg(add = completer!(crate::completions::actions::hunks()))]
         hunks: Vec<String>,
         /// Unstaged new-side line ranges to fold (`path:start-end` or `path:line`, comma-separated or repeated).
         #[arg(long = "lines", value_name = "PATH:START-END", action = clap::ArgAction::Append)]
+        #[arg(add = completer!(crate::completions::actions::line_ranges()))]
         lines: Vec<String>,
         #[command(flatten)]
         pathspecs: crate::pathspec_args::TrailingPathspecArgs,
@@ -1201,9 +1206,11 @@ enum Command {
         patch_file: Option<String>,
         /// Stage only the listed hunk ids from `grit diff --json` (comma-separated, repeatable).
         #[arg(long = "hunks", value_name = "ID,...", action = clap::ArgAction::Append)]
+        #[arg(add = completer!(crate::completions::actions::hunks()))]
         hunks: Vec<String>,
         /// Stage only new-side line ranges from `grit diff --json` (`path:start-end`, repeatable).
         #[arg(long = "lines", value_name = "PATH:START-END", action = clap::ArgAction::Append)]
+        #[arg(add = completer!(crate::completions::actions::line_ranges()))]
         lines: Vec<String>,
         /// Unified context lines when resolving `--hunks` / `--lines` (match `grit diff -U`; default 3).
         #[arg(short = 'U', long = "unified", value_name = "N")]
@@ -1455,6 +1462,7 @@ enum Command {
             action = clap::ArgAction::Append,
             conflicts_with_all = ["patch_file", "all", "staged"]
         )]
+        #[arg(add = completer!(crate::completions::actions::hunks()))]
         hunks: Vec<String>,
         /// Commit only line ranges from the unstaged diff (same format as `grit add --lines`).
         #[arg(
@@ -1463,6 +1471,7 @@ enum Command {
             action = clap::ArgAction::Append,
             conflicts_with_all = ["patch_file", "all", "staged"]
         )]
+        #[arg(add = completer!(crate::completions::actions::line_ranges()))]
         lines: Vec<String>,
         #[command(flatten)]
         paths: crate::pathspec_args::TrailingPathspecArgs,
@@ -1803,9 +1812,11 @@ enum Command {
         conflict_style: Option<conflict_style::ConflictStyleArg>,
         /// Discard only the listed unstaged hunk ids (`grit diff --unstaged --json`) or unstage staged ids (`--staged`).
         #[arg(long = "hunks", value_name = "ID,...", action = clap::ArgAction::Append)]
+        #[arg(add = completer!(crate::completions::actions::hunks()))]
         hunks: Vec<String>,
         /// Discard or unstage only new-side line ranges (`path:start-end` from `grit diff --json`).
         #[arg(long = "lines", value_name = "PATH:START-END", action = clap::ArgAction::Append)]
+        #[arg(add = completer!(crate::completions::actions::line_ranges()))]
         lines: Vec<String>,
         /// Report paths that would change without writing the worktree or index.
         #[arg(long = "dry-run")]

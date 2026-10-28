@@ -49,7 +49,8 @@ pub struct TrailingPathspecArgs {
     #[arg(
         long = "pathspec-from-file",
         value_name = "FILE|-",
-        allow_hyphen_values = true
+        allow_hyphen_values = true,
+        add = completer!(carapace_rs::Action::files([]))
     )]
     pub pathspec_from_file: Option<String>,
     /// `--pathspec-from-file` entries are NUL-separated.

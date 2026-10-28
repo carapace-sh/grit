@@ -22,11 +22,15 @@ What completion offers:
 | Revisions (`log`, `show`, `diff`, `merge`, `reset`, …) | Local and remote branches and tags, described with the subject of the commit they point at; stashes, described with the message they were created with; `HEAD` and the other pseudo refs; plus `A..B` / `A...B` ranges and `^` negation |
 | Paths (`add`, `rm`, `restore`, `status`, …) | Files and directories in the worktree below the current directory, ignoring paths excluded by `.gitignore`, plus tracked paths whose file was deleted |
 | Remotes (`fetch`, `pull`, `push`, `remote`, …) | Configured remotes, described with their URL |
+| Refspecs (`fetch`) | The source side offers branch names as they exist on the remote (tags included), the destination side local branches, as in `main:incoming` |
+| Hunk ids and line ranges (`add`, `commit`, `restore`, `stash`, `history fixup`) | The ids `grit diff --json` assigns to the hunks of the current changes, described with their path and new-side range; `--lines` completes the path first, then the ranges of that path's hunks. `grit restore --staged` is offered staged hunks, every other command unstaged ones, and `-U` is honored |
+| Reflog selectors (`reflog delete`) | `ref@{n}` selectors for refs that have a reflog, described with the entry message |
+| Remote branches (`remote set-head`) | Branch names inside the remote, without the remote-name prefix |
 | Stashes, hooks, worktrees, notes refs | The entries of the current repository |
 | Config keys and values (`config`, `-c`) | Keys already present in the effective configuration, common keys, and the values set for a key |
 | Shells | The shells this command accepts |
 
-Candidates are styled like Git completions elsewhere: branches blue, tags yellow, pseudo refs bold, stashes green, notes cyan, with each kind in its own group in the menu.
+Candidates are styled like Git completions elsewhere: branches blue, tags yellow, pseudo refs bold, stashes green, notes cyan, hunk ids magenta, with each kind in its own group in the menu.
 
 The global [`-C`](../global-options/), [`--git-dir`](../global-options/), [`--work-tree`](../global-options/), and [`-c`](../global-options/) flags apply to completion too, so `grit -C ../other branch <TAB>` lists the branches of `../other`.
 
