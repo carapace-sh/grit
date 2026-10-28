@@ -1210,9 +1210,44 @@ fn read_oid_head_file_optional(path: &Path) -> Result<Option<ObjectId>> {
     }
 }
 
-/// Read ORIG_HEAD.
+/// Read the loose `$GIT_DIR/ORIG_HEAD` file.
+///
+/// Only sees a files-backend `ORIG_HEAD`; use [`read_orig_head_for_repository`] to read it
+/// through the repository's ref store (reftable or injected stores).
+///
+/// # Errors
+///
+/// Returns [`Error::Io`] when the file cannot be read and an object id parse error when it
+/// does not hold one.
 pub fn read_orig_head(git_dir: &Path) -> Result<Option<ObjectId>> {
     read_single_oid_file(&git_dir.join("ORIG_HEAD"))
+}
+
+/// Read `ORIG_HEAD` through `repo`'s ref store.
+///
+/// # Returns
+///
+/// The commit `ORIG_HEAD` resolves to, or `None` when it is not set.
+///
+/// # Errors
+///
+/// Propagates ref store read and resolution failures.
+pub fn read_orig_head_for_repository(repo: &Repository) -> Result<Option<ObjectId>> {
+    repo.references().resolve_if_exists("ORIG_HEAD")
+}
+
+/// Record `oid` as `ORIG_HEAD`, the `HEAD` an operation started from.
+///
+/// Reset, merge and rebase call this so `ORIG_HEAD` names the pre-operation commit and
+/// `reset --hard ORIG_HEAD` undoes them. The value goes through `repo`'s ref store (the loose
+/// `$GIT_DIR/ORIG_HEAD` file on the files backend, the reftable stack otherwise), overwrites
+/// any previous value, and writes no reflog, as Git does.
+///
+/// # Errors
+///
+/// Propagates ref store write failures (for example a held lock).
+pub fn write_orig_head(repo: &Repository, oid: ObjectId) -> Result<()> {
+    crate::refs::update_direct_ref_on_store(repo.refs(), repo.git_dir(), "ORIG_HEAD", &oid)
 }
 
 /// Read a file that contains a single OID on its first line.

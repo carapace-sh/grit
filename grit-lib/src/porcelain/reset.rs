@@ -15,7 +15,9 @@ use crate::porcelain::worktree_guard::{load_worktree_snapshot, local_change_diff
 use crate::refs;
 use crate::refs::store::{Expected, RawRef, RefUpdate, RefUpdateFlags, ReflogUpdate};
 use crate::repo::Repository;
-use crate::state::{clear_merge_state, clear_replay_state, resolve_head_for_repository, HeadState};
+use crate::state::{
+    clear_merge_state, clear_replay_state, resolve_head_for_repository, write_orig_head, HeadState,
+};
 
 pub use crate::porcelain::orphans::{OrphanedCommitSummary, DEFAULT_ORPHAN_LIMIT};
 
@@ -155,7 +157,9 @@ pub fn preview_reset(repo: &Repository, opts: &ResetOptions) -> Result<ResetPrev
 
 /// Move `HEAD` to `opts.target` according to `opts.mode`.
 ///
-/// Index and worktree updates run before the branch or detached `HEAD` moves.
+/// Index and worktree updates run before the branch or detached `HEAD` moves. After a
+/// successful reset (including one to the current `HEAD`), `ORIG_HEAD` names the previous
+/// `HEAD` commit, so resetting to `ORIG_HEAD` undoes it; a dry run leaves it alone.
 /// Hard and keep resets take `index.lock` before reading the index or touching the
 /// worktree. When [`ResetOptions::dry_run`] is true, nothing is written and the returned
 /// [`ResetOutcome::target`] is still the requested commit.
@@ -219,6 +223,7 @@ pub fn reset_to_commit(
     } else {
         ref_label
     };
+    write_orig_head(repo, previous)?;
 
     Ok(ResetOutcome {
         mode: opts.mode,

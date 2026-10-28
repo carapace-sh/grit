@@ -42,8 +42,8 @@ use crate::rev_list::{rev_list, OrderingMode, RevListOptions};
 use crate::rev_parse::{resolve_revision_as_commit, try_parse_double_dot_log_range};
 use crate::state::clear_replay_state;
 use crate::state::{
-    read_cherry_pick_head, read_merge_msg, read_orig_head, read_revert_head,
-    resolve_head_for_repository, HeadState,
+    read_cherry_pick_head, read_merge_msg, read_orig_head_for_repository, read_revert_head,
+    resolve_head_for_repository, write_orig_head, HeadState,
 };
 use crate::stripspace::{process as stripspace_process, Mode as StripspaceMode};
 use crate::write_tree::{write_tree_update_index, WriteTreeFlags};
@@ -486,7 +486,7 @@ pub fn abort_replay_sequence(repo: &Repository) -> Result<()> {
         return Err(Error::ReplayAbortHeadMoved);
     }
     let restore_oid = read_sequencer_head(repo.git_dir())
-        .or(read_orig_head(repo.git_dir()).ok().flatten())
+        .or(read_orig_head_for_repository(repo).ok().flatten())
         .unwrap_or(active.abort_safety);
     hard_reset_branch(repo, &refname, restore_oid)?;
     clear_replay_state(repo.git_dir())?;
@@ -1345,7 +1345,7 @@ fn record_replay_stop(
     let source = parse_commit(&source_obj.data)?;
     let config = repo.config()?;
     let message = replay_message(&config, opts, direction, &source, source_oid, committer)?;
-    write_orig_head_if_absent(git_dir, orig_head)?;
+    write_orig_head_if_absent(repo, orig_head)?;
     fs::write(git_dir.join("MERGE_MSG"), &message).map_err(Error::Io)?;
     let head_name = match direction {
         ReplayDirection::Pick => "CHERRY_PICK_HEAD",
@@ -1492,7 +1492,7 @@ fn load_active_replay(repo: &Repository) -> Result<ActiveReplay> {
         return Err(Error::NoReplayInProgress);
     };
     let abort_safety = read_sequencer_abort_safety(git_dir)
-        .or_else(|| read_orig_head(git_dir).ok().flatten())
+        .or_else(|| read_orig_head_for_repository(repo).ok().flatten())
         .or_else(|| {
             resolve_head_for_repository(repo)
                 .ok()
@@ -1685,12 +1685,12 @@ fn resolve_continue_replay_message(git_dir: &Path) -> Result<String> {
     Ok(message)
 }
 
-fn write_orig_head_if_absent(git_dir: &Path, oid: ObjectId) -> Result<()> {
-    let path = git_dir.join("ORIG_HEAD");
-    if path.exists() {
+/// Pick and revert keep an `ORIG_HEAD` left by an earlier reset, merge or rebase.
+fn write_orig_head_if_absent(repo: &Repository, oid: ObjectId) -> Result<()> {
+    if !matches!(repo.refs().read_raw("ORIG_HEAD"), Ok(None)) {
         return Ok(());
     }
-    fs::write(path, format!("{}\n", oid.to_hex())).map_err(Error::Io)
+    write_orig_head(repo, oid)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1742,7 +1742,7 @@ fn write_sequence_bootstrap(
     todo: &[TodoEntry],
     req: &ReplaySequenceRequest,
 ) -> Result<()> {
-    write_orig_head_if_absent(repo.git_dir(), head_oid)?;
+    write_orig_head_if_absent(repo, head_oid)?;
     write_sequencer_state(
         repo,
         head_oid,

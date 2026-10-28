@@ -75,7 +75,10 @@ use crate::refs;
 use crate::refs::store::{Expected, RawRef, RefUpdate, RefUpdateFlags};
 use crate::repo::Repository;
 use crate::rev_parse_error::RevParseError;
-use crate::state::{clear_merge_state, read_merge_heads, read_merge_msg, read_orig_head};
+use crate::state::{
+    clear_merge_state, read_merge_heads, read_merge_msg, read_orig_head_for_repository,
+    write_orig_head,
+};
 use crate::stripspace::{process as stripspace_process, Mode as StripspaceMode};
 use thiserror::Error;
 
@@ -938,10 +941,14 @@ fn integrate_branch_without_hooks(
     cancel: &dyn Cancel,
 ) -> Result<IntegrateBranchOutcome> {
     if into_oid == other_oid || is_ancestor(repo, other_oid, into_oid)? {
+        write_orig_head(repo, into_oid)?;
         return Ok(IntegrateBranchOutcome::UpToDate);
     }
     ensure_branch_tip(repo, into_ref, Some(into_oid))?;
     poll_cancel(progress, cancel)?;
+    // Like Git, every merge attempt past this point records where it started, including a
+    // refused fast-forward-only merge and one that stops on conflicts.
+    write_orig_head(repo, into_oid)?;
 
     let into_tree = repo.odb().commit_tree(&into_oid)?;
     let other_tree = repo.odb().commit_tree(&other_oid)?;
@@ -1024,10 +1031,9 @@ fn integrate_branch_without_hooks(
         let merge_msg = merge_message_text(label, options.message.as_deref());
         if matches!(options.commit, MergeCommitMode::Squash) {
             write_squash_msg_file(repo, into_oid, other_oid)?;
-            write_orig_head(repo.git_dir(), into_oid)?;
             write_squash_conflict_merge_msg(repo.git_dir(), &paths, options.message.as_deref())?;
         } else {
-            record_merge_in_progress(repo.git_dir(), into_oid, other_oid, merge_msg)?;
+            record_merge_in_progress(repo.git_dir(), other_oid, merge_msg)?;
         }
         return Ok(IntegrateBranchOutcome::Conflicts { paths, details });
     }
@@ -1063,7 +1069,6 @@ fn integrate_branch_without_hooks(
         MergeCommitMode::NoCommit => {
             record_merge_in_progress(
                 repo.git_dir(),
-                into_oid,
                 other_oid,
                 merge_message_text(label, options.message.as_deref()),
             )?;
@@ -1081,7 +1086,6 @@ fn integrate_branch_without_hooks(
             let (tree, message) = run_merge_commit_hooks(
                 repo,
                 options.verify,
-                into_oid,
                 other_oid,
                 merged.result_tree,
                 merge_message_text(label, options.message.as_deref()),
@@ -1492,7 +1496,7 @@ pub fn abort_branch_merge(repo: &Repository) -> Result<()> {
 }
 
 fn restore_pre_merge_state(repo: &Repository) -> Result<()> {
-    let orig = read_orig_head(repo.git_dir())?
+    let orig = read_orig_head_for_repository(repo)?
         .ok_or_else(|| Error::Message("merge in progress but ORIG_HEAD is missing".into()))?;
     let head_tree = repo.odb().commit_tree(&orig)?;
 
@@ -1667,26 +1671,12 @@ pub(crate) fn apply_conflict_merge_worktree(
     Ok(())
 }
 
-fn write_orig_head(git_dir: &Path, into_oid: ObjectId) -> Result<()> {
-    fs::write(
-        git_dir.join("ORIG_HEAD"),
-        format!("{}\n", into_oid.to_hex()),
-    )
-    .map_err(Error::Io)
-}
-
-fn record_merge_in_progress(
-    git_dir: &Path,
-    into_oid: ObjectId,
-    other_oid: ObjectId,
-    merge_msg: String,
-) -> Result<()> {
+fn record_merge_in_progress(git_dir: &Path, other_oid: ObjectId, merge_msg: String) -> Result<()> {
     fs::write(
         git_dir.join("MERGE_HEAD"),
         format!("{}\n", other_oid.to_hex()),
     )
     .map_err(Error::Io)?;
-    write_orig_head(git_dir, into_oid)?;
     fs::write(git_dir.join("MERGE_MSG"), merge_msg).map_err(Error::Io)?;
     Ok(())
 }
@@ -1708,7 +1698,6 @@ fn record_merge_in_progress(
 fn run_merge_commit_hooks(
     repo: &Repository,
     verify: HookPolicy,
-    into_oid: ObjectId,
     other_oid: ObjectId,
     tree: ObjectId,
     message: String,
@@ -1733,7 +1722,7 @@ fn run_merge_commit_hooks(
                 tree = write_tree_from_index(repo.odb(), &index, "")?;
             }
         }
-        record_merge_in_progress(git_dir, into_oid, other_oid, message.clone())?;
+        record_merge_in_progress(git_dir, other_oid, message.clone())?;
         let edited = run_commit_message_hooks(
             repo,
             &git_dir.join("MERGE_MSG"),
@@ -1747,7 +1736,7 @@ fn run_merge_commit_hooks(
     match run() {
         Ok(result) => Ok(result),
         Err(err) => {
-            record_merge_in_progress(git_dir, into_oid, other_oid, message)?;
+            record_merge_in_progress(git_dir, other_oid, message)?;
             Err(err)
         }
     }

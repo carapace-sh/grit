@@ -1032,6 +1032,7 @@ fn move_landed_branch(
         upstream_oid,
         &format!("pull: move to {label}, which has the branch's commits"),
     )?;
+    crate::state::write_orig_head(repo, head_oid)?;
     Ok(PullOutcome::at_commit(
         PullResult::Landed,
         label,
@@ -1614,6 +1615,7 @@ mod tests {
         let predicted = pull(&repo, &check, &mut NoProgress, &NeverCancel, None).expect("check");
         assert_eq!(predicted.check.map(|c| c.would), Some(PullResult::Landed));
 
+        git(&clone, &["update-ref", "-d", "ORIG_HEAD"]);
         let landed = pull(
             &repo,
             &landed_options(&repo, upstream, tip, true),
@@ -1625,6 +1627,7 @@ mod tests {
         assert_eq!(landed.result, PullResult::Landed);
         assert_eq!(landed.oid, Some(upstream));
         assert_eq!(git(&clone, &["rev-parse", "main"]), upstream.to_hex());
+        assert_eq!(git(&clone, &["rev-parse", "ORIG_HEAD"]), tip.to_hex());
         assert_eq!(
             git(&clone, &["status", "--porcelain"]),
             "M b.txt\n?? draft.txt"

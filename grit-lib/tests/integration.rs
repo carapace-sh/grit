@@ -1102,6 +1102,9 @@ mod odb_with_stream;
 #[path = "oid_hashtable_api.rs"]
 mod oid_hashtable_api;
 #[cfg(feature = "full-tests")]
+#[path = "orig_head_git_compat.rs"]
+mod orig_head_git_compat;
+#[cfg(feature = "full-tests")]
 #[path = "pack_bitmap_read_git_compat.rs"]
 mod pack_bitmap_read_git_compat;
 #[cfg(feature = "full-tests")]

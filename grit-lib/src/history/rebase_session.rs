@@ -21,7 +21,7 @@ use crate::progress::{
 };
 use crate::refs;
 use crate::repo::Repository;
-use crate::state::{resolve_head_for_repository, HeadState};
+use crate::state::{resolve_head_for_repository, write_orig_head, HeadState};
 use crate::write_tree::{write_tree_update_index, WriteTreeFlags};
 
 use super::apply::{apply_rewrite, log_head_move};
@@ -209,7 +209,9 @@ impl RebaseSessionError {
 ///
 /// On a clean replay, applies the plan atomically and returns [`RebaseOutcome::Done`].
 /// On conflict, writes Git-compatible rebase state and returns [`RebaseOutcome::Stopped`]
-/// without moving the branch ref away from its pre-rebase tip.
+/// without moving the branch ref away from its pre-rebase tip. Both record the pre-rebase tip
+/// as `ORIG_HEAD`, which finishing or aborting the rebase leaves in place; an up-to-date branch
+/// leaves `ORIG_HEAD` untouched.
 ///
 /// # Errors
 ///
@@ -261,6 +263,7 @@ pub fn start_rebase(
         .into()),
         Ok(ResumablePlanOutcome::Complete(plan)) => {
             let applied = apply_rewrite(repo, &plan, &opts.apply, progress, cancel)?;
+            write_orig_head(repo, orig_head).map_err(map_lib)?;
             Ok(RebaseOutcome::Done {
                 head_change: (orig_head != applied.head).then_some((orig_head, applied.head)),
                 applied,
@@ -282,6 +285,7 @@ pub fn start_rebase(
                 progress,
                 cancel,
             )?;
+            write_orig_head(repo, orig_head).map_err(map_lib)?;
             if opts.apply.hooks.enabled() {
                 let onto = opts.request.onto.unwrap_or(opts.request.upstream);
                 run_post_checkout(repo, Some(orig_head), onto, true);
@@ -1055,11 +1059,6 @@ fn write_git_rebase_merge_files(
         None => remove_if_exists(&dir.join("author-script"))?,
     }
     fs::write(dir.join("message"), commit.message).map_err(map_lib)?;
-    fs::write(
-        repo.git_dir().join("ORIG_HEAD"),
-        format!("{}\n", orig_head.to_hex()),
-    )
-    .map_err(map_lib)?;
     Ok(())
 }
 
@@ -1092,12 +1091,7 @@ fn author_script(author: &str) -> Option<String> {
 }
 
 pub(super) fn clear_rebase_state(git_dir: &Path) -> Result<(), RebaseSessionError> {
-    for name in ["ORIG_HEAD", "MERGE_MSG"] {
-        let path = git_dir.join(name);
-        if path.exists() {
-            fs::remove_file(&path).map_err(map_lib)?;
-        }
-    }
+    remove_if_exists(&git_dir.join("MERGE_MSG"))?;
     let dir = git_dir.join("rebase-merge");
     if dir.is_dir() {
         fs::remove_dir_all(&dir).map_err(map_lib)?;
