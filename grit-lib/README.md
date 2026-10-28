@@ -11,6 +11,16 @@ agents, or services without shelling out to the `git` binary.
 Crate-level documentation (architecture, features, and a compiling example) lives
 in the [rustdoc](https://docs.rs/grit-lib) for `grit_lib`.
 
+## Toolchain
+
+**MSRV:** Rust **1.95** or newer. Cargo reports this via the crate's
+`rust-version` field when your toolchain is too old.
+
+Building the Grit repository itself uses the contributor pin in
+[`rust-toolchain.toml`](../rust-toolchain.toml) (currently **1.99.0** with
+`rustfmt` and `clippy`); that file is not shipped on crates.io and does not
+apply to path or registry dependencies outside a full Grit checkout.
+
 ## Design philosophy
 
 - **Correctness first.** Behavior is validated with Rust tests cross-checked

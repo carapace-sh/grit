@@ -22,6 +22,12 @@ grit-lib = "0.5.0"
 
 Use the [latest version on crates.io](https://crates.io/crates/grit-lib) if the number above is stale.
 
+`grit-lib` requires **Rust 1.95** or newer (`rust-version` in the crate manifest).
+That applies when you add the dependency from crates.io or a path outside the Grit
+workspace. Building inside the Grit repository uses the contributor toolchain pin
+in [`rust-toolchain.toml`](https://github.com/gitbutlerapp/grit/blob/main/rust-toolchain.toml)
+(currently **1.99.0**), which does not propagate to downstream crates.
+
 ## Example program
 
 Save as `src/main.rs` (or copy from `grit-examples` in the Grit repo):

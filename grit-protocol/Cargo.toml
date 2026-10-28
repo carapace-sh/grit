@@ -2,6 +2,7 @@
 name = "grit-protocol"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 autotests = false
 license = "MIT"
 description = "Git smart protocol handlers for the grit implementation"

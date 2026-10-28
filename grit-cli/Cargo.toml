@@ -2,6 +2,7 @@
 name = "grit-cli"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 autotests = false
 license = "MIT"
 description = "A simplified alternative CLI for Grit"

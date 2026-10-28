@@ -292,7 +292,7 @@ Agents version-control with **GitButler (`but`)** and **GitButler Mesh**. Nothin
 
 ## Cursor cloud specific instructions
 
-- **Rust toolchain**: Ensure stable ≥ 1.85 (`rustup update stable && rustup default stable`) for edition 2024 workspace deps.
+- **Rust toolchain**: Contributors use the pin in `rust-toolchain.toml` (**1.99.0**). Published crates declare **MSRV 1.95** via `rust-version` in `[workspace.package]` (inherited by `grit-lib`, `grit-cli`, `grit-protocol`, `grit-http-server`).
 - **No external services**: Build and test via Cargo.
 - **Pre-integration gate**: **`make gate`** (`scripts/gate.sh`: fmt, clippy with **`-D warnings`**, **`cargo test --workspace`**).
 - **Unit tests**: `cargo test -p grit-lib --lib` during development; the gate runs the full workspace suite.

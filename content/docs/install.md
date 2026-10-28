@@ -118,6 +118,8 @@ The binary is `target/release/grit`. You can copy it anywhere on your `PATH`, or
 
 ### Toolchain
 
-The workspace pins a Rust version in [`rust-toolchain.toml`](https://github.com/gitbutlerapp/grit/blob/main/rust-toolchain.toml) (currently **1.99.0** with `rustfmt` and `clippy`). `rustup` picks this up automatically when you build in the repo.
+**Contributors** building this repository: the workspace pins **1.99.0** in [`rust-toolchain.toml`](https://github.com/gitbutlerapp/grit/blob/main/rust-toolchain.toml) (with `rustfmt` and `clippy`). `rustup` picks that up automatically when you build in the repo.
 
-To use `grit-lib` in your own crate, add it from [crates.io](https://crates.io/crates/grit-lib) — see the [library quick start](../library-quickstart/).
+**Library and CLI consumers** (your own crate depending on `grit-lib` or `grit-cli` from [crates.io](https://crates.io/crates/grit-lib), without this repo's `rust-toolchain.toml`): the published crates require **Rust 1.95** or newer. Cargo prints that requirement before compiling if your toolchain is too old.
+
+To use `grit-lib` in your own project, see the [library quick start](../library-quickstart/).
