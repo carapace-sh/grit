@@ -50,6 +50,29 @@ fn push(source: &Path, remote: &Path, refspecs: &[&str]) -> TestResult {
     Ok(())
 }
 
+/// Issue #2216: high `receive.unpackLimit` forces loose unpack; peak memory must stay bounded.
+#[test]
+fn git_push_with_high_unpack_limit_is_fsck_clean() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let source = tmp.path().join("src");
+    std::fs::create_dir_all(&source)?;
+    git(&source, &["init", "-q", "-b", "main", "."])?;
+    for batch in 0..8 {
+        commit_files(&source, batch * 25, batch * 25 + 25)?;
+    }
+    let remote = tmp.path().join("remote.git");
+    std::fs::create_dir_all(&remote)?;
+    git(&remote, &["init", "-q", "--bare", "."])?;
+    git(&remote, &["config", "receive.unpackLimit", "1000000"])?;
+    push(&source, &remote, &["main"])?;
+    git(&remote, &["fsck", "--strict", "--no-progress"])?;
+    assert_eq!(
+        git(&remote, &["rev-parse", "main"])?,
+        git(&source, &["rev-parse", "main"])?
+    );
+    Ok(())
+}
+
 /// A first push large enough to be indexed as a pack, then an incremental
 /// (thin) push small enough to be stored loose, then a branch deletion.
 #[test]
