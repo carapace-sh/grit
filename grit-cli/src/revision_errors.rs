@@ -70,6 +70,9 @@ pub fn map_resolve_error(spec: &str, err: ResolveError) -> anyhow::Error {
         ResolveError::PathNotInTree { path, revision } => {
             anyhow::anyhow!("path '{path}' does not exist in '{revision}'")
         }
+        ResolveError::ReflogDateUnparseable { date } => {
+            anyhow::anyhow!("invalid reflog date '{date}'")
+        }
         ResolveError::UnknownRevision { .. } => anyhow::anyhow!("unknown revision '{spec}'"),
         ResolveError::RevisionRange { .. } => {
             anyhow::anyhow!("revision range or set '{spec}' is not a single object")

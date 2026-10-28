@@ -95,6 +95,13 @@ pub enum ResolveError {
         /// Kind the caller required.
         expected: ObjectKind,
     },
+
+    /// Reflog `@{date}` inner text could not be parsed as a date.
+    #[error("invalid reflog date '{date}'")]
+    ReflogDateUnparseable {
+        /// Text inside `@{...}` that was treated as a date selector.
+        date: String,
+    },
 }
 
 impl From<RevParseError> for ResolveError {
@@ -112,6 +119,9 @@ impl From<RevParseError> for ResolveError {
                     spec: prefix,
                     candidates,
                 }
+            }
+            RevParseError::ReflogDateUnparseable { date } => {
+                ResolveError::ReflogDateUnparseable { date }
             }
             other => ResolveError::UnknownRevision {
                 spec: other.to_string(),

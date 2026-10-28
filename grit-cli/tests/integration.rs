@@ -491,6 +491,9 @@ mod reset_without_identity;
 #[path = "resolve_ref_modes_cli.rs"]
 mod resolve_ref_modes_cli;
 #[cfg(feature = "full-tests")]
+#[path = "resolve_reflog_invalid_date_cli.rs"]
+mod resolve_reflog_invalid_date_cli;
+#[cfg(feature = "full-tests")]
 #[path = "resolve_verify_quiet_cli.rs"]
 mod resolve_verify_quiet_cli;
 #[path = "restore_hunks.rs"]
