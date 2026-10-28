@@ -2924,8 +2924,15 @@ fn apply_tree_changes(
                         continue;
                     }
                 }
-                journal.record_write(change);
-                materialize_gitlink_worktree(work_tree, path, &mut dir_cache)?;
+                // Moving a gitlink to another commit never touches the submodule directory,
+                // populated or not: files inside an uninitialized one are kept.
+                let keep_existing_dir = change.status == DiffStatus::Modified
+                    && change.old_mode.bits() == MODE_GITLINK
+                    && fs::symlink_metadata(&abs).is_ok_and(|meta| meta.is_dir());
+                if !keep_existing_dir {
+                    journal.record_write(change);
+                    materialize_gitlink_worktree(work_tree, path, &mut dir_cache)?;
+                }
                 let mut entry = entry_from_stat(&abs, &index_path, change.new_oid, MODE_GITLINK)?;
                 entry.size = 0;
                 plan.push(CheckoutPlanSlot::Ready(entry));
