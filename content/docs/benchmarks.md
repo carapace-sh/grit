@@ -257,6 +257,44 @@ window. Severe clock skew can make its count inaccurate; it is advisory and
 never controls repository writes. See [reset](commands/reset.md) and
 [switch](commands/switch.md).
 
+## Undoing a commit with many tags (2026-10-28)
+
+`reset/undo-commit@git-git` was still about 6× slower than Git, and used about 5.4× its
+memory. The orphaned-commit report paints from every ref, and on the `v2.47.0` fixture
+(954 tags, no commit-graph) it had to learn the date of each tip commit before taking a
+step. Each tip cost a commit-graph existence probe, a header probe, and then a full read
+and inflate through the pack mapping. Kernel fault-around on those scattered reads left
+about 20 MB of the pack resident. The ancestry pre-check also walked a hundred commits
+below the undone commit's date.
+
+Now a paint with 64 or more tips on one side reads each packed tip commit's header block
+with one positioned read, on scoped worker threads, and records its parents and date
+before painting. Tags, loose or deltified commits and unusually long headers keep the full
+read. The pre-check first looks for the target on the undone commit's first-parent chain,
+which settles `HEAD~n` without the date-slop walk. The counts are unchanged.
+
+Factory VM, four vCPUs, Rust 1.99.0, `release` profile, system Git 2.43.0. Main is
+`e91d222f6`. Median of 20 runs per tool; the target was measured in two interleaved
+rounds:
+
+| Tool | Round 1 (ms / MiB) | Round 2 (ms / MiB) |
+| --- | ---: | ---: |
+| System Git | 2.13 / 8.2 | 2.01 / 8.1 |
+| Main | 12.06 / 46.3 | 11.96 / 46.2 |
+| Branch | 6.58 / 29.2 | 6.93 / 29.2 |
+
+The committed `daily-reset-undo-commit-5128-before.json` (main) and
+`daily-reset-undo-commit-5128-after.json` (branch) cover every `reset/*` and
+`switch/*` scenario. They also cover the fetch, push, log, branch, merge-base, ahead and
+range-count scenarios that paint against many refs (10 runs each). Apart from the
+target, every scenario stays within run-to-run noise. Repeated interleaved runs of the
+largest apparent moves (`branch/merged`, `log/json-n10-loose-tags`, `switch/branch` and
+`reset/hard`) flipped sign between rounds.
+
+Without tags the same reset takes about 3 ms. Of the remaining gap to Git, roughly 0.45 ms
+lists the 954 refs, the parallel header reads take 1.6 to 1.9 ms (mostly per-stream inflate
+setup), and process start-up and the ref and reflog update take the rest.
+
 ## Tree metadata diff (2026-10-27)
 
 Issue [#2083](https://github.com/gitbutlerapp/grit/issues/2083) exposed a second,
