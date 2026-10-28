@@ -1103,7 +1103,9 @@ pub struct RestoreHunksOutcome {
 /// Discard or unstage the hunks in `selection`.
 ///
 /// With `restore_worktree` (default when `restore_staged` is false), reverse-applies unstaged
-/// hunks onto the worktree using clean diff bytes and checkout smudge rules. With
+/// hunks onto the worktree using clean diff bytes and checkout smudge rules. Unless `dry_run`,
+/// this holds the index lock throughout but writes the index only when the stat refresh of a
+/// restored path changes its entry (for example once the file matches the index again). With
 /// `restore_staged`, reverse-applies staged hunks onto the index. Validates every patch before
 /// writing anything.
 ///
