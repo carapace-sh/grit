@@ -859,6 +859,9 @@ enum Command {
         url: Option<String>,
     },
     /// Copy a remote repository into a new directory.
+    ///
+    /// Submodule gitlinks are checked out as empty directories only; grit does not fetch submodule
+    /// repositories or provide a `submodule` command.
     Clone {
         /// The repository to clone (URL or local path).
         url: String,

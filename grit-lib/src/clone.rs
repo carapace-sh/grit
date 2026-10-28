@@ -268,6 +268,8 @@ pub struct CloneOutcome {
     pub worktree_bytes: u64,
     /// Index paths that collided on a case-insensitive filesystem during checkout.
     pub path_collisions: Vec<String>,
+    /// Gitlink paths materialized during checkout (submodules grit does not fetch).
+    pub submodule_paths: Vec<String>,
     /// Whether the destination is a bare repository.
     pub bare: bool,
     /// Whether a bundle from the server's `bundle-uri` seeded the clone.
@@ -632,9 +634,10 @@ fn clone_after_claim(
     let mut files = 0;
     let mut worktree_bytes = 0;
     let mut path_collisions = Vec::new();
+    let mut submodule_paths = Vec::new();
     if opts.checkout && !bare {
         if let CloneCheckout::CheckedOut(checkout_oid) = checkout {
-            (files, worktree_bytes, path_collisions) =
+            (files, worktree_bytes, path_collisions, submodule_paths) =
                 perform_clone_checkout(&repo, checkout_oid, progress, cancel)
                     .map_err(CloneError::Library)?;
         }
@@ -656,9 +659,19 @@ fn clone_after_claim(
         files,
         worktree_bytes,
         path_collisions,
+        submodule_paths,
         bare,
         bundle,
     })
+}
+
+fn gitlink_paths_in_index(index: &crate::index::Index) -> Vec<String> {
+    index
+        .entries
+        .iter()
+        .filter(|e| e.stage() == 0 && e.mode == crate::index::MODE_GITLINK)
+        .map(|e| String::from_utf8_lossy(&e.path).into_owned())
+        .collect()
 }
 
 fn perform_clone_checkout(
@@ -666,7 +679,7 @@ fn perform_clone_checkout(
     commit: ObjectId,
     progress: &mut dyn Progress,
     cancel: &dyn Cancel,
-) -> Result<(u64, u64, Vec<String>)> {
+) -> Result<(u64, u64, Vec<String>, Vec<String>)> {
     let tree = crate::diff::tree_oid_of_commit_in_repo(repo, &commit)?;
     let checkout = crate::porcelain::checkout::checkout_between_trees_with_progress(
         repo, None, &tree, progress, cancel,
@@ -679,7 +692,13 @@ fn perform_clone_checkout(
         .unwrap_or(false);
     let (files, worktree_bytes) =
         crate::path_icase::icase_worktree_file_stats(&index, repo.work_tree(), ignorecase);
-    Ok((files, worktree_bytes, checkout.path_collisions))
+    let submodule_paths = gitlink_paths_in_index(&index);
+    Ok((
+        files,
+        worktree_bytes,
+        checkout.path_collisions,
+        submodule_paths,
+    ))
 }
 
 fn local_branch_names_with_commits(repo: &Repository) -> Vec<String> {

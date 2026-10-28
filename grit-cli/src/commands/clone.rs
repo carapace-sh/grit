@@ -203,6 +203,9 @@ pub struct CloneOutcome {
     /// Index paths that collided on a case-insensitive filesystem during checkout.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub path_collisions: Vec<String>,
+    /// Gitlink paths in the checked-out tree (submodules grit does not fetch).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub submodule_paths: Vec<String>,
     /// The server's prebuilt bundle the clone started from, when it offered
     /// one. `objects` and `bytes` include what it brought.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -397,6 +400,12 @@ impl MarkdownRender for CloneOutcome {
                 outln!(w, "  - `{path}`");
             }
         }
+        if !self.submodule_paths.is_empty() {
+            outln!(w, "- **submodule paths** (not fetched):");
+            for path in &self.submodule_paths {
+                outln!(w, "  - `{path}`");
+            }
+        }
         outln!(
             w,
             "- **worktree bytes**: {} ({})",
@@ -420,6 +429,32 @@ impl MarkdownRender for CloneOutcome {
             }
         }
         Ok(())
+    }
+}
+
+fn emit_submodule_note(mode: OutputMode, paths: &[String]) {
+    if paths.is_empty() {
+        return;
+    }
+    let count = paths.len();
+    let list = paths.join(", ");
+    let noun = if count == 1 {
+        "submodule"
+    } else {
+        "submodules"
+    };
+    match mode {
+        OutputMode::Human => {
+            eprintln!(
+                "note: this repository has {count} {noun} ({list}); grit does not fetch submodules"
+            );
+        }
+        OutputMode::Markdown => {
+            eprintln!(
+                "> **Note:** this repository has {count} {noun} (`{list}`); grit does not fetch submodules."
+            );
+        }
+        OutputMode::Json => {}
     }
 }
 
@@ -636,7 +671,9 @@ fn clone_into(
     let files = outcome.files;
     let worktree_bytes = outcome.worktree_bytes;
     let path_collisions = outcome.path_collisions.clone();
+    let submodule_paths = outcome.submodule_paths.clone();
     emit_path_collision_warning(run.mode, &path_collisions);
+    emit_submodule_note(run.mode, &submodule_paths);
     let (no_checkout_reason, branches_with_commits) = match outcome.checkout {
         CloneCheckout::CheckedOut(_) => (None, None),
         CloneCheckout::Skipped => {
@@ -701,6 +738,7 @@ fn clone_into(
         no_checkout_reason,
         branches_with_commits,
         path_collisions,
+        submodule_paths,
         bare: outcome.bare,
         bundle,
     })
@@ -783,6 +821,7 @@ mod tests {
             no_checkout_reason: None,
             branches_with_commits: None,
             path_collisions: Vec::new(),
+            submodule_paths: Vec::new(),
             bundle: None,
             bare: false,
         }
