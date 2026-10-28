@@ -46,6 +46,8 @@ After the clone, stdout gets a summary: total time with a bar showing where it w
 
 On a case-insensitive filesystem (`core.ignorecase`), when the repository contains paths that differ only by case (or other spellings that map to one on-disk file), grit prints a **warning** on **stderr** (human mode only) listing every colliding index path. Only one path from each group exists on disk; the summary **files** and **worktree_bytes** counts reflect distinct on-disk files, not the number of index entries. With `commit.autoStage` (the default), grit does not auto-stage collision losers — their index blobs stay as recorded in the tree even though the work tree shows them as modified.
 
+When the checked-out tree contains **submodule gitlinks** (mode `160000`), grit creates an empty directory at each path and does **not** fetch the nested repository. There is no `grit submodule` command and no `--recurse-submodules` flag. After a successful checkout, human and `--markdown` output print a one-line **note** on stderr listing how many gitlinks were found; `--json` includes a `submodule_paths` array (omitted when empty). Use the system `git` command if you need submodule checkout or updates.
+
 ### Starting from the server's bundle
 
 When an HTTP(S) server offers a prebuilt bundle through Git's `bundle-uri` protocol command (as [`grit serve`](../serve/) does), clone downloads that bundle first, unpacks it, and then fetches only what is newer than it. A bundle is a plain file, so the download resumes instead of starting over:
@@ -189,6 +191,7 @@ Pass `--json` for stable, scripting-friendly output:
 | `tags` | integer | Remote tags fetched. |
 | `files` | integer | Working-tree files checked out (distinct on-disk paths when `core.ignorecase` collapsed spellings). |
 | `path_collisions` | array of strings | Index paths that collided during checkout on a case-insensitive filesystem. Omitted when empty. |
+| `submodule_paths` | array of strings | Gitlink paths in the checked-out tree. Grit does not fetch submodule repositories. Omitted when empty. |
 | `object_types` | object or null | Objects received by type: `commits`, `trees`, `blobs` and `tags` (annotated tag objects). Populated when grit indexed the received pack or can tally every object in the transfer. `null` when a local pack link installed more objects than the transfer summary tracks individually (typical for a single linked pack on clone). |
 | `worktree_bytes` | integer | Total size of the checked-out files. |
 | `seconds` | number | Wall-clock seconds for the whole clone. |

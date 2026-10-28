@@ -4660,16 +4660,12 @@ fn worktree_diff_pass1_index_entry(
         let ref_matches = if let Some(oid) = sub_head_oid {
             oid == ie.oid
         } else {
-            let is_placeholder = submodule_worktree_is_unpopulated_placeholder(&sub_dir);
-            if error_on_broken_gitlinks
-                && !is_placeholder
-                && submodule_embedded_git_dir(&sub_dir).is_some()
-            {
+            if error_on_broken_gitlinks && submodule_embedded_git_dir(&sub_dir).is_some() {
                 return Err(Error::Config(
                     format!("could not read submodule HEAD for '{path_str_ref}'").into(),
                 ));
             }
-            is_placeholder
+            uninitialized_gitlink_worktree_matches_index(&sub_dir)
         };
         if simplify_gitlinks {
             if !ref_matches {
@@ -5725,7 +5721,7 @@ impl<'a> WorktreeEntryComparer<'a> {
             let sub_head_oid = read_submodule_head(&file_path);
             let ref_matches = match sub_head_oid {
                 Some(oid) => oid == ie.oid,
-                None => submodule_worktree_is_unpopulated_placeholder(&file_path),
+                None => uninitialized_gitlink_worktree_matches_index(&file_path),
             };
             let mut flags = submodule_porcelain_flags(work_tree, path_str_ref.as_ref(), ie.oid);
             if ignore_submodule_untracked {
@@ -7386,7 +7382,7 @@ pub fn diff_tree_to_worktree_with_git_dir_and_rules(
                     let ref_matches = if let Some(head) = sub_head {
                         head == te.oid
                     } else {
-                        submodule_worktree_is_unpopulated_placeholder(&sub_dir)
+                        uninitialized_gitlink_worktree_matches_index(&sub_dir)
                     };
                     let index_matches_tree = index_gitlink_oid.is_some_and(|oid| oid == te.oid);
                     // Default tree↔worktree diff matches Git: untracked-only paths inside a
@@ -11249,14 +11245,11 @@ pub fn submodule_commit_subject_line(c: &CommitData) -> String {
     c.message.lines().next().unwrap_or("").trim().to_owned()
 }
 
-/// True when `sub_dir` is an empty directory (or missing), i.e. the placeholder left by
-/// `git apply --index` before `git submodule update`.
-fn submodule_worktree_is_unpopulated_placeholder(sub_dir: &Path) -> bool {
-    match fs::read_dir(sub_dir) {
-        Ok(mut it) => it.next().is_none(),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
-        Err(_) => false,
-    }
+/// True when a gitlink directory has no initialized submodule (no embedded `.git`), so the
+/// recorded index OID is treated as the worktree reference (Git `ce_compare_gitlink` when
+/// `resolve_gitlink_ref` fails).
+fn uninitialized_gitlink_worktree_matches_index(sub_dir: &Path) -> bool {
+    submodule_embedded_git_dir(sub_dir).is_none()
 }
 
 fn read_submodule_head(sub_dir: &Path) -> Option<ObjectId> {
@@ -12641,6 +12634,81 @@ mod gitlink_tree_worktree_tests {
         assert!(
             entries.is_empty(),
             "clean uninitialized gitlink should not appear in tree→worktree diff: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn unpopulated_gitlink_with_stray_file_produces_no_diff_entry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let work_tree = dir.path();
+        let sub = work_tree.join("sub");
+        fs::create_dir(&sub).expect("sub placeholder");
+        fs::write(sub.join("x.txt"), b"stray\n").expect("stray file");
+
+        let repo = init_repository(
+            work_tree,
+            false,
+            "main",
+            None,
+            crate::RefStorageFormat::Files,
+        )
+        .expect("init");
+        let gitlink: ObjectId = "855827c583bc30645ba427885caa40c5b81764d2"
+            .parse()
+            .expect("gitlink oid");
+        let tree_oid = repo
+            .odb()
+            .write(ObjectKind::Tree, &encode_tree_gitlink("sub", &gitlink))
+            .expect("write tree");
+
+        let path = b"sub".to_vec();
+        let mut index = Index::new();
+        index.add_or_replace(IndexEntry {
+            ctime_sec: 0,
+            ctime_nsec: 0,
+            mtime_sec: 0,
+            mtime_nsec: 0,
+            dev: 0,
+            ino: 0,
+            mode: MODE_GITLINK,
+            uid: 0,
+            gid: 0,
+            size: 0,
+            oid: gitlink,
+            flags: (path.len().min(0xfff)) as u16,
+            flags_extended: None,
+            path,
+            base_index_pos: 0,
+        });
+
+        let tree_entries = diff_tree_to_worktree(&repo.odb(), Some(&tree_oid), work_tree, &index)
+            .expect("diff_tree_to_worktree");
+        assert!(
+            tree_entries.is_empty(),
+            "uninitialized gitlink with stray files should not diff: {tree_entries:?}"
+        );
+
+        let wt_entries =
+            super::diff_index_to_worktree(&repo.odb(), &mut index.clone(), work_tree, false, true)
+                .expect("diff_index_to_worktree");
+        assert!(
+            wt_entries.is_empty(),
+            "uninitialized gitlink with stray files should not diff: {wt_entries:?}"
+        );
+
+        let ie = index.entries()[0].clone();
+        assert!(
+            !super::worktree_differs_from_index_entry(
+                repo.odb(),
+                repo.git_dir(),
+                work_tree,
+                &ie,
+                false,
+                None,
+                None,
+            )
+            .expect("differs"),
+            "stray files in uninitialized submodule should not differ from index"
         );
     }
 

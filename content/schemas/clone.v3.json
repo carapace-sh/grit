@@ -243,6 +243,13 @@
       "description": "Whether only one branch was fetched (`git clone --single-branch` semantics).",
       "type": "boolean"
     },
+    "submodule_paths": {
+      "description": "Gitlink paths in the checked-out tree (submodules grit does not fetch).",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
     "tag": {
       "description": "Tag name when `-b` named a tag; omitted on branch checkout.",
       "type": [

@@ -962,8 +962,8 @@ fn index_matches_target_tree_entry(
 }
 
 /// True when `entry` is a submodule directory that drifted from its index gitlink (another
-/// commit checked out, dirty files, or files inside an uninitialized submodule) and the target
-/// tree still has a gitlink there.
+/// commit checked out or dirty files in an initialized submodule) and the target tree still has
+/// a gitlink there.
 ///
 /// Like Git, such drift is not a local edit the transition would overwrite: the index gitlink
 /// still advances to the target commit, and checkout leaves the directory as it is.
