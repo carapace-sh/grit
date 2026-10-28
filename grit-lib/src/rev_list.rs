@@ -6704,11 +6704,10 @@ pub(crate) fn try_bitmap_reachable_commit_set_for_specs(
 }
 
 /// When `--max-count` (plus `--skip`) is at least this large, prefer the commit-graph
-/// rev-list path and truncate after ordering instead of the per-commit bounded walk.
+/// rev-list path and truncate after ordering instead of the per-commit bounded topo walk.
 ///
-/// The bounded walks that test exclusions per commit get slower than one up-front closure
-/// as the limit grows. [`try_bounded_limit_list`] is exempt: its walks stop early at any
-/// limit, or at the hide frontier, and cost no more per commit than the full path.
+/// Filtered and path-limited date walks stop at `--since` frontiers and at `-n`, so they
+/// are exempt. Plain bounded limit lists without cutoffs also stop early at any limit.
 const BOUNDED_LIMIT_LIST_EARLY_STOP_MAX: usize = 4096;
 
 fn bounded_limit_list_need(options: &RevListOptions) -> usize {
@@ -6737,6 +6736,10 @@ enum WalkControl {
     Stop,
 }
 
+fn date_heap_past_since_frontier(heap: &BinaryHeap<CommitDateKey>, since: i64) -> bool {
+    heap.is_empty() || heap.iter().all(|pending| pending.date < since)
+}
+
 /// Visit commits reachable from `include` in Git's default `rev-list` order, until `visit`
 /// returns [`WalkControl::Stop`].
 ///
@@ -6745,11 +6748,16 @@ enum WalkControl {
 /// going to the earlier discovery. Nothing waits for a commit's other children, so under
 /// clock skew or equal timestamps a parent can come out before one of its children, as in
 /// Git. Commits in `excluded` are neither visited nor traversed.
+///
+/// When `since_cutoff` is set and the heap uses committer dates (`author_dates` is false),
+/// the walk stops once every queued commit is older than the cutoff, matching Git's
+/// `--since` frontier after parents of the last in-window commit are enqueued.
 fn streaming_date_walk<'r>(
     graph: &mut CommitGraph<'r>,
     include: &[ObjectId],
     excluded: &HashSet<ObjectId>,
     author_dates: bool,
+    since_cutoff: Option<i64>,
     mut visit: impl FnMut(&mut CommitGraph<'r>, ObjectId) -> Result<WalkControl>,
 ) -> Result<()> {
     let mut heap = BinaryHeap::new();
@@ -6766,7 +6774,7 @@ fn streaming_date_walk<'r>(
         });
         next_seq += 1;
     }
-    while let Some(CommitDateKey { oid, .. }) = heap.pop() {
+    while let Some(CommitDateKey { oid, date, .. }) = heap.pop() {
         if visit(graph, oid)? == WalkControl::Stop {
             break;
         }
@@ -6781,6 +6789,13 @@ fn streaming_date_walk<'r>(
             });
             next_seq += 1;
         }
+        if !author_dates {
+            if let Some(since) = since_cutoff {
+                if date < since && date_heap_past_since_frontier(&heap, since) {
+                    break;
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -6792,13 +6807,16 @@ fn can_use_bounded_commit_filter_list(options: &RevListOptions) -> bool {
         .is_some_and(|f| f.is_active())
         || options.pickaxe.is_some();
     output_filter
-        && (options.max_count.is_some() || options.skip > 0)
-        && within_bounded_limit_list_cap(options)
-        && can_use_bounded_limit_list(&RevListOptions {
-            commit_filter: None,
-            pickaxe: None,
-            ..options.clone()
-        })
+        && (options.max_count.is_some() || options.skip > 0 || options.count)
+        && options.ordering == OrderingMode::Default
+        && plain_commit_walk(
+            &RevListOptions {
+                commit_filter: None,
+                pickaxe: None,
+                ..options.clone()
+            },
+            false,
+        )
 }
 
 fn try_bounded_commit_filter_limit_list(
@@ -6817,98 +6835,132 @@ fn try_bounded_commit_filter_limit_list(
     if include.is_empty() || !can_use_bounded_commit_filter_list(options) {
         return Ok(None);
     }
-    let Some(max_count) = options.max_count else {
+    if !options.count && options.max_count.is_none() && options.skip == 0 {
         return Ok(None);
-    };
+    }
+    let max_count = options.max_count;
+    if max_count == Some(0) {
+        if options.count {
+            let mut result = rev_list_result_from_commits(Vec::new());
+            result.reachable_commit_count = Some(0);
+            return Ok(Some(result));
+        }
+        return Ok(Some(rev_list_result_from_commits(Vec::new())));
+    }
 
     let mut commit_data = if options.retain_commit_data {
-        crate::objects::oid_hash_map_with_capacity(max_count.min(64))
+        crate::objects::oid_hash_map_with_capacity(max_count.unwrap_or(64).min(64))
     } else {
         oid_hash_map()
     };
-    let mut ordered = repo
-        .odb()
-        .with_pack_read_context(|| -> Result<Vec<ObjectId>> {
-            let mut graph = CommitGraph::with_commit_graph(
-                repo,
-                options.first_parent,
-                options.use_commit_graph,
-            );
-            let excluded = if exclude.is_empty() {
-                HashSet::new()
-            } else {
-                walk_closure(&mut graph, exclude)?
-            };
-            // Reuse traversal bytes for filters and output, without keeping every
-            // nonmatching commit when a selective filter scans a long history.
-            graph.keep_unreleased_commit_bytes();
+    let (mut ordered, filtered_count) =
+        repo.odb()
+            .with_pack_read_context(|| -> Result<(Vec<ObjectId>, Option<usize>)> {
+                let mut graph = CommitGraph::with_commit_graph(
+                    repo,
+                    options.first_parent,
+                    options.use_commit_graph,
+                );
+                let excluded = if exclude.is_empty() {
+                    HashSet::new()
+                } else {
+                    walk_closure(&mut graph, exclude)?
+                };
+                // Reuse traversal bytes for filters and output, without keeping every
+                // nonmatching commit when a selective filter scans a long history.
+                graph.keep_unreleased_commit_bytes();
 
-            let author_dates = options.ordering == OrderingMode::AuthorDateWalk;
-            let mut matched_seen = 0usize;
-            let mut ordered = Vec::with_capacity(max_count.min(64));
-            let mut pickaxe_blob_cache = HashMap::new();
-            let since = options.since_cutoff;
-            let until = options.until_cutoff;
-            streaming_date_walk(
-                &mut graph,
-                include,
-                &excluded,
-                author_dates,
-                |graph, oid| {
-                    let mut consider = true;
-                    if since.is_some() || until.is_some() {
-                        let ts = graph.committer_time(oid);
-                        if until.is_some_and(|u| ts > u) || since.is_some_and(|s| ts < s) {
-                            consider = false;
-                        }
-                    }
-
-                    if consider {
-                        let mut passes = true;
-                        if let Some(filter) = filter {
-                            passes = filter.matches_bytes(graph.commit_bytes(oid)?);
-                        }
-                        if passes {
-                            if let Some(px) = pickaxe {
-                                passes = pickaxe_matches_commit_with_graph(
-                                    repo,
-                                    graph,
-                                    px,
-                                    oid,
-                                    &options.paths,
-                                    pickaxe_renames,
-                                    &mut pickaxe_blob_cache,
-                                )?;
+                let author_dates = options.ordering == OrderingMode::AuthorDateWalk;
+                let mut matched_seen = 0usize;
+                let mut match_count = 0usize;
+                let mut ordered = Vec::with_capacity(max_count.unwrap_or(64).min(64));
+                let mut pickaxe_blob_cache = HashMap::new();
+                let since = options.since_cutoff;
+                let until = options.until_cutoff;
+                let since_frontier = if author_dates { None } else { since };
+                streaming_date_walk(
+                    &mut graph,
+                    include,
+                    &excluded,
+                    author_dates,
+                    since_frontier,
+                    |graph, oid| {
+                        let mut consider = true;
+                        if since.is_some() || until.is_some() {
+                            let ts = graph.committer_time(oid);
+                            if until.is_some_and(|u| ts > u) || since.is_some_and(|s| ts < s) {
+                                consider = false;
                             }
                         }
-                        if passes {
-                            matched_seen += 1;
-                            if matched_seen > options.skip && ordered.len() < max_count {
-                                ordered.push(oid);
-                                if options.retain_commit_data {
-                                    commit_data
-                                        .insert(oid, parse_commit(graph.commit_bytes(oid)?)?);
+
+                        if consider {
+                            let mut passes = true;
+                            if let Some(filter) = filter {
+                                passes = filter.matches_bytes(graph.commit_bytes(oid)?);
+                            }
+                            if passes {
+                                if let Some(px) = pickaxe {
+                                    passes = pickaxe_matches_commit_with_graph(
+                                        repo,
+                                        graph,
+                                        px,
+                                        oid,
+                                        &options.paths,
+                                        pickaxe_renames,
+                                        &mut pickaxe_blob_cache,
+                                    )?;
+                                }
+                            }
+                            if passes {
+                                matched_seen += 1;
+                                if matched_seen > options.skip {
+                                    if options.count {
+                                        match_count += 1;
+                                    } else if max_count.is_none_or(|m| ordered.len() < m) {
+                                        ordered.push(oid);
+                                        if options.retain_commit_data {
+                                            commit_data.insert(
+                                                oid,
+                                                parse_commit(graph.commit_bytes(oid)?)?,
+                                            );
+                                        }
+                                    }
                                 }
                             }
                         }
-                    }
-                    graph.release_commit_bytes(oid);
+                        graph.release_commit_bytes(oid);
 
-                    Ok(if ordered.len() >= max_count {
-                        WalkControl::Stop
-                    } else {
-                        WalkControl::Continue
-                    })
-                },
-            )?;
+                        Ok(if options.count {
+                            if max_count.is_some_and(|m| match_count >= m) {
+                                WalkControl::Stop
+                            } else {
+                                WalkControl::Continue
+                            }
+                        } else if max_count.is_some_and(|m| ordered.len() >= m) {
+                            WalkControl::Stop
+                        } else {
+                            WalkControl::Continue
+                        })
+                    },
+                )?;
 
-            Ok(ordered)
-        })?;
+                if options.count {
+                    Ok((Vec::new(), Some(match_count)))
+                } else {
+                    Ok((ordered, None))
+                }
+            })?;
 
     if options.reverse {
         ordered.reverse();
     }
-    let mut result = rev_list_result_from_commits(ordered);
+    let mut result = if let Some(n) = filtered_count {
+        let mut result = rev_list_result_from_commits(Vec::new());
+        result.reachable_commit_count = Some(n);
+        result
+    } else {
+        rev_list_result_from_commits(ordered)
+    };
     result.commit_data = commit_data;
     Ok(Some(result))
 }
@@ -7242,17 +7294,24 @@ fn streaming_default_order_list(
                 ));
             }
             let mut seen = 0usize;
-            streaming_date_walk(&mut graph, include, &HashSet::new(), false, |_, oid| {
-                seen += 1;
-                if seen > options.skip {
-                    ordered.push(oid);
-                }
-                Ok(if ordered.len() >= max_count {
-                    WalkControl::Stop
-                } else {
-                    WalkControl::Continue
-                })
-            })?;
+            streaming_date_walk(
+                &mut graph,
+                include,
+                &HashSet::new(),
+                false,
+                None,
+                |_, oid| {
+                    seen += 1;
+                    if seen > options.skip {
+                        ordered.push(oid);
+                    }
+                    Ok(if ordered.len() >= max_count {
+                        WalkControl::Stop
+                    } else {
+                        WalkControl::Continue
+                    })
+                },
+            )?;
             commit_data = graph.take_retained_commits(&ordered);
             Ok(())
         })?;
@@ -7273,7 +7332,6 @@ fn can_use_bounded_path_limit_list(options: &RevListOptions) -> bool {
         && !options.simplify_merges
         && !options.sparse
         && !options.count
-        && within_bounded_limit_list_cap(options)
         && can_use_bounded_limit_list(&RevListOptions {
             paths: Vec::new(),
             pickaxe: None,
@@ -7366,6 +7424,11 @@ fn try_bounded_path_limit_list(
     };
 
     let author_dates = options.ordering == OrderingMode::AuthorDateWalk;
+    let since_frontier = if author_dates {
+        None
+    } else {
+        options.since_cutoff
+    };
     let paths = &options.paths;
     let mut heap = BinaryHeap::new();
     let mut queued = HashSet::new();
@@ -7444,6 +7507,12 @@ fn try_bounded_path_limit_list(
                 seq: next_seq,
             });
             next_seq += 1;
+        }
+
+        if let Some(since) = since_frontier {
+            if item.date < since && date_heap_past_since_frontier(&heap, since) {
+                break;
+            }
         }
     }
 

@@ -10,7 +10,7 @@ use grit_lib::config::mailmap::load_mailmap_table;
 use grit_lib::objects::ObjectId;
 use grit_lib::repo::Repository;
 use grit_lib::revwalk::filter::{CommitFilter, CommitFilterBuilder};
-use grit_lib::revwalk::rev_list::{rev_list, RevListOptions};
+use grit_lib::revwalk::rev_list::{rev_list, MissingAction, RevListOptions};
 use support::{
     commit_file, git, git_commit_graph_write, git_rev_list, open_grit_repo, HistoryRepo,
 };
@@ -939,6 +939,289 @@ fn bounded_filter_since_until_matches_git() {
             "--author=Alice",
             "--since=1970-01-01 00:41:40 +0000",
             "main",
+        ],
+    );
+    assert_rev_list_filter_matches_git(
+        wt,
+        &repo,
+        &[
+            "-n",
+            "5000",
+            "--author=Alice",
+            "--since=1970-01-01 00:41:40 +0000",
+            "main",
+        ],
+    );
+    assert_rev_list_filter_matches_git(
+        wt,
+        &repo,
+        &[
+            "--count",
+            "--author=Alice",
+            "--since=1970-01-01 00:41:40 +0000",
+            "main",
+        ],
+    );
+    assert_rev_list_filter_matches_git(
+        wt,
+        &repo,
+        &[
+            "--count",
+            "-n",
+            "2",
+            "--author=Alice",
+            "--since=1970-01-01 00:41:40 +0000",
+            "main",
+        ],
+    );
+    assert_rev_list_filter_matches_git(
+        wt,
+        &repo,
+        &["--count", "-n", "0", "--author=Alice", "--since=@0", "main"],
+    );
+}
+
+fn commit_with_committer_timestamps(
+    worktree: &Path,
+    label: &str,
+    parents: &[ObjectId],
+    author: (&str, &str),
+    committer_ts: i64,
+    message: &str,
+) -> ObjectId {
+    let tree = git(worktree, &["mktree"]).trim().to_string();
+    let mut args: Vec<String> = vec!["commit-tree".into(), tree, "-m".into(), message.into()];
+    for p in parents {
+        args.push("-p".into());
+        args.push(p.to_hex());
+    }
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let ts = format!("@{committer_ts} +0000");
+    let out = Command::new("git")
+        .current_dir(worktree)
+        .args(&arg_refs)
+        .env("GIT_AUTHOR_NAME", author.0)
+        .env("GIT_AUTHOR_EMAIL", author.1)
+        .env("GIT_COMMITTER_NAME", author.0)
+        .env("GIT_COMMITTER_EMAIL", author.1)
+        .env("GIT_AUTHOR_DATE", &ts)
+        .env("GIT_COMMITTER_DATE", &ts)
+        .env("GIT_CONFIG_GLOBAL", support::null_device_for_tests())
+        .env("GIT_CONFIG_SYSTEM", support::null_device_for_tests())
+        .output()
+        .expect("commit-tree");
+    assert!(
+        out.status.success(),
+        "commit-tree: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let commit = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    git(
+        worktree,
+        &["update-ref", &format!("refs/history/{label}"), &commit],
+    );
+    commit.parse().expect("oid")
+}
+
+fn remove_loose_object(worktree: &Path, oid: ObjectId) {
+    let path = worktree
+        .join(".git/objects")
+        .join(oid.loose_prefix())
+        .join(oid.loose_suffix());
+    std::fs::remove_file(path).expect("remove loose object");
+}
+
+#[test]
+fn bounded_filter_since_frontier_avoids_missing_ancestor() {
+    let hist = HistoryRepo::init();
+    let wt = hist.worktree();
+    let c0 =
+        commit_with_committer_timestamps(wt, "c0", &[], ("Alice", "a@x.com"), 1000, "old root");
+    let c1 = commit_with_committer_timestamps(
+        wt,
+        "c1",
+        &[c0],
+        ("Alice", "a@x.com"),
+        2000,
+        "past cutoff",
+    );
+    remove_loose_object(wt, c0);
+    let c2 = commit_with_committer_timestamps(wt, "c2", &[c1], ("Alice", "a@x.com"), 4000, "tip");
+    git(wt, &["update-ref", "refs/heads/main", &c2.to_hex()]);
+    let repo = open_grit_repo(wt);
+    let git_oids = git_rev_list(
+        wt,
+        &[
+            "-n",
+            "5000",
+            "--author=Alice",
+            "--since=1970-01-01 00:41:40 +0000",
+            "main",
+        ],
+    );
+    let parsed = parse_rev_list_cli(&[
+        "-n",
+        "5000",
+        "--author=Alice",
+        "--since=1970-01-01 00:41:40 +0000",
+        "main",
+    ]);
+    let (positive, negative) = support::expand_revision_tokens(
+        &parsed
+            .rev_args
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+    );
+    let opts = RevListOptions {
+        max_count: parsed.max_count,
+        since_cutoff: parsed.since_cutoff,
+        commit_filter: parsed.filter,
+        use_commit_graph: false,
+        ..RevListOptions::default()
+    };
+    let result = rev_list(&repo, &positive, &negative, &opts).expect("rev_list");
+    assert_eq!(result.commits, git_oids);
+
+    let parsed_count = parse_rev_list_cli(&[
+        "--count",
+        "--author=Alice",
+        "--since=1970-01-01 00:41:40 +0000",
+        "main",
+    ]);
+    let (positive, negative) = support::expand_revision_tokens(
+        &parsed_count
+            .rev_args
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+    );
+    let opts = RevListOptions {
+        count: true,
+        since_cutoff: parsed_count.since_cutoff,
+        commit_filter: parsed_count.filter,
+        use_commit_graph: false,
+        ..RevListOptions::default()
+    };
+    let git_n = git_rev_list_count(
+        wt,
+        &[
+            "--count",
+            "--author=Alice",
+            "--since=1970-01-01 00:41:40 +0000",
+            "main",
+        ],
+    );
+    let grit_n = rev_list(&repo, &positive, &negative, &opts)
+        .expect("count rev_list")
+        .commit_count();
+    assert_eq!(grit_n, git_n);
+
+    let list_filter = CommitFilterBuilder::new()
+        .author("Alice")
+        .build()
+        .expect("filter");
+    let opts = RevListOptions {
+        max_count: Some(5000),
+        commit_filter: Some(Arc::new(list_filter)),
+        missing_action: MissingAction::Error,
+        use_commit_graph: true,
+        ..RevListOptions::default()
+    };
+    assert!(
+        rev_list(&repo, &["main".to_owned()], &[], &opts).is_err(),
+        "unbounded walk must read the missing grandparent"
+    );
+    let count_filter = CommitFilterBuilder::new()
+        .author("Alice")
+        .build()
+        .expect("filter");
+    let opts = RevListOptions {
+        count: true,
+        commit_filter: Some(Arc::new(count_filter)),
+        missing_action: MissingAction::Error,
+        use_commit_graph: false,
+        ..RevListOptions::default()
+    };
+    assert!(
+        rev_list(&repo, &["main".to_owned()], &[], &opts).is_err(),
+        "count without --since must read the missing grandparent"
+    );
+}
+
+#[test]
+fn bounded_filter_since_skew_with_author_matches_git() {
+    let hist = HistoryRepo::init();
+    let wt = hist.worktree();
+    let old = support::commit_labeled_with_dates(
+        wt,
+        "old",
+        &[],
+        "@1000000000 +0000",
+        "@1000000000 +0000",
+    );
+    let skewed = support::commit_labeled_with_dates(
+        wt,
+        "skewed",
+        &[old],
+        "@2000000000 +0000",
+        "@2000000000 +0000",
+    );
+    git(wt, &["update-ref", "refs/heads/main", &skewed.to_hex()]);
+    let repo = open_grit_repo(wt);
+    assert_rev_list_filter_matches_git(
+        wt,
+        &repo,
+        &[
+            "-n",
+            "5000",
+            "--author=Refs Harness Author",
+            "--since=1500000000",
+            "main",
+        ],
+    );
+    commit_file(wt, "skew-path.txt", "v1", "skew path");
+    let repo = open_grit_repo(wt);
+    assert_rev_list_filter_matches_git(
+        wt,
+        &repo,
+        &[
+            "-n",
+            "5000",
+            "--author=Refs Harness Author",
+            "--since=1500000000",
+            "main",
+            "--",
+            "skew-path.txt",
+        ],
+    );
+}
+
+#[test]
+fn bounded_path_since_with_large_limit_matches_git() {
+    let hist = HistoryRepo::init();
+    let wt = hist.worktree();
+    let root = commit_tree_with_identities(
+        wt,
+        "root",
+        &[],
+        ("Bob", "b@x.com"),
+        ("Bob", "b@x.com"),
+        "root",
+    );
+    git(wt, &["update-ref", "refs/heads/main", &root.to_hex()]);
+    commit_file(wt, "path.txt", "v1", "touch path");
+    let repo = open_grit_repo(wt);
+    assert_rev_list_filter_matches_git(
+        wt,
+        &repo,
+        &[
+            "-n",
+            "5000",
+            "--since=1970-01-01 00:41:40 +0000",
+            "main",
+            "--",
+            "path.txt",
         ],
     );
 }
