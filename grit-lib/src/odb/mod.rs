@@ -79,6 +79,12 @@ pub(crate) enum UnreachablePackRetention {
     DropAll,
 }
 
+/// Pack paths and `.keep` status captured once at repack inventory.
+pub(crate) struct RepackPackInventorySnapshot {
+    pub pack_paths: HashSet<PathBuf>,
+    pub kept_at_inventory: HashSet<PathBuf>,
+}
+
 type MemOdbOverlayStore = Arc<RwLock<Option<Arc<MemoryStore>>>>;
 
 /// Cached alternate [`CompositeStore`] keyed by file/env/submodule alternate state.
@@ -1403,7 +1409,7 @@ impl Odb {
         reachable: &crate::gc::LazyReachable<'_>,
         retention: UnreachablePackRetention,
         retained_packs: &HashSet<PathBuf>,
-        inventory_packs: &HashSet<PathBuf>,
+        inventory: &RepackPackInventorySnapshot,
     ) -> Result<usize> {
         if matches!(retention, UnreachablePackRetention::DropAll) {
             return Ok(0);
@@ -1415,10 +1421,11 @@ impl Odb {
         } else {
             HashSet::new()
         };
-        let kept_pack_oids = oids_in_marker_kept_packs(pack_dir, keep_pack)?;
+        let kept_pack_oids =
+            oids_in_inventory_kept_packs(pack_dir, keep_pack, &inventory.kept_at_inventory)?;
         let mut loosened = 0usize;
         for (idx_path, pack_mtime) in
-            superseded_pack_indexes(pack_dir, keep_pack, retained_packs, inventory_packs)?
+            superseded_pack_indexes(pack_dir, keep_pack, retained_packs, inventory)?
         {
             let oids = PackedObjects::object_ids_from_index_path(&idx_path)?;
             for oid in oids {
@@ -3745,7 +3752,7 @@ fn superseded_pack_indexes(
     pack_dir: &Path,
     keep_pack: &Path,
     retained_packs: &HashSet<PathBuf>,
-    inventory_packs: &HashSet<PathBuf>,
+    inventory: &RepackPackInventorySnapshot,
 ) -> Result<Vec<(PathBuf, std::time::SystemTime)>> {
     let keep_stem = keep_pack
         .file_stem()
@@ -3775,11 +3782,10 @@ fn superseded_pack_indexes(
         if !pack_path.is_file() {
             continue;
         }
-        if !pre_repack_packs.contains(&pack_path)
-            || superseded_pack_has_keep_marker(pack_dir, &pack_path)
+        if inventory.kept_at_inventory.contains(&pack_path)
             || pack_path.with_extension("promisor").is_file()
             || retained_packs.contains(&pack_path)
-            || !inventory_packs.contains(&pack_path)
+            || !inventory.pack_paths.contains(&pack_path)
         {
             continue;
         }
@@ -3791,32 +3797,21 @@ fn superseded_pack_indexes(
     Ok(out)
 }
 
-fn superseded_pack_has_keep_marker(pack_dir: &Path, pack_path: &Path) -> bool {
-    let Some(stem) = pack_path.file_stem().and_then(|s| s.to_str()) else {
-        return false;
-    };
-    pack_dir.join(format!("{stem}.keep")).is_file()
-}
-
-fn oids_in_marker_kept_packs(pack_dir: &Path, keep_pack: &Path) -> Result<OidHashSet> {
+fn oids_in_inventory_kept_packs(
+    pack_dir: &Path,
+    keep_pack: &Path,
+    inventory_kept_packs: &HashSet<PathBuf>,
+) -> Result<OidHashSet> {
     let keep_stem = keep_pack.file_stem().and_then(|s| s.to_str()).unwrap_or("");
     let mut oids = oid_hash_set();
-    if !pack_dir.is_dir() {
-        return Ok(oids);
-    }
-    for entry in fs::read_dir(pack_dir).map_err(Error::Io)? {
-        let entry = entry.map_err(Error::Io)?;
-        let pack_path = entry.path();
-        if pack_path.extension().is_none_or(|e| e != "pack") {
-            continue;
-        }
+    for pack_path in inventory_kept_packs {
         let Some(stem) = pack_path.file_stem().and_then(|s| s.to_str()) else {
             continue;
         };
         if stem == keep_stem {
             continue;
         }
-        if !superseded_pack_has_keep_marker(pack_dir, &pack_path) {
+        if pack_path.parent().is_some_and(|p| p != pack_dir) {
             continue;
         }
         let idx_path = pack_path.with_extension("idx");

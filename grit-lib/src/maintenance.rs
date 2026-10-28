@@ -875,7 +875,7 @@ fn repack_detail(repo: &Repository, opts: &RepackOptions) -> Result<RepackDetail
     let mut report = RepackReport::default();
     let loose_before = count_loose_objects(odb)?;
     let packs_before = count_pack_files(&pack_dir);
-    let pre_repack_packs = local_pack_paths(&pack_dir);
+    let pack_inventory = pack_repack_inventory(&pack_dir);
 
     #[cfg(test)]
     gc_test_hooks::run(gc_test_hooks::GcPausePoint::AfterInventoryBeforeRoots);
@@ -887,6 +887,9 @@ fn repack_detail(repo: &Repository, opts: &RepackOptions) -> Result<RepackDetail
     };
     test_inject_repack_pause(repo.git_dir(), RepackPausePhase::AfterInventoryBeforeRoots);
     let roots = collect_maintenance_object_roots(repo)?;
+
+    #[cfg(test)]
+    gc_test_hooks::run(gc_test_hooks::GcPausePoint::AfterRootsBeforeDropAll);
     if roots.is_empty() && loose_before == 0 && packs_before == 0 {
         return Ok(RepackDetail {
             report,
@@ -1098,7 +1101,7 @@ fn repack_detail(repo: &Repository, opts: &RepackOptions) -> Result<RepackDetail
                 &reachable,
                 retention,
                 &retained_packs,
-                &pre_repack_packs,
+                &pack_inventory,
             )?;
         }
 
@@ -1112,7 +1115,7 @@ fn repack_detail(repo: &Repository, opts: &RepackOptions) -> Result<RepackDetail
                 &pack_dir,
                 &pack_path,
                 &retained_packs,
-                &pre_repack_packs,
+                &pack_inventory,
             )?
         };
 
@@ -2056,6 +2059,19 @@ fn append_repack_unreachable_retention(
     Ok(())
 }
 
+fn pack_repack_inventory(pack_dir: &Path) -> crate::odb::RepackPackInventorySnapshot {
+    let pack_paths = local_pack_paths(pack_dir);
+    let kept_at_inventory = pack_paths
+        .iter()
+        .filter(|pack_path| pack_has_keep_marker(pack_dir, pack_path))
+        .cloned()
+        .collect();
+    crate::odb::RepackPackInventorySnapshot {
+        pack_paths,
+        kept_at_inventory,
+    }
+}
+
 /// Every local `.pack` path under `pack_dir` at inventory time.
 fn local_pack_paths(pack_dir: &Path) -> HashSet<PathBuf> {
     let Ok(entries) = fs::read_dir(pack_dir) else {
@@ -2124,7 +2140,7 @@ fn remove_superseded_pack_files_retaining(
     pack_dir: &Path,
     keep_pack: &Path,
     retained_packs: &HashSet<PathBuf>,
-    inventory_packs: &HashSet<PathBuf>,
+    inventory: &crate::odb::RepackPackInventorySnapshot,
 ) -> Result<usize> {
     let git_dir = crate::git_dir::io_error::git_dir_from_pack_dir(pack_dir);
     let keep_stem = keep_pack
@@ -2160,10 +2176,10 @@ fn remove_superseded_pack_files_retaining(
         let path = entry.path();
         if path.is_file() {
             let pack_path = path.with_extension("pack");
-            if pack_has_keep_marker(pack_dir, &path)
+            if inventory.kept_at_inventory.contains(&pack_path)
                 || path.with_extension("promisor").is_file()
                 || retained_packs.contains(&pack_path)
-                || !inventory_packs.contains(&pack_path)
+                || !inventory.pack_paths.contains(&pack_path)
             {
                 continue;
             }
@@ -2179,20 +2195,8 @@ fn remove_superseded_pack_files_retaining(
     Ok(removed)
 }
 
-fn pack_path_for_sidecar(path: &Path) -> Option<PathBuf> {
-    let name = path.file_name()?.to_str()?;
-    if !(name.starts_with("pack-") || name.starts_with(".pack-")) {
-        return None;
-    }
-    match path.extension().and_then(|e| e.to_str()) {
-        Some("pack") => Some(path.to_path_buf()),
-        Some("idx" | "rev" | "bitmap") => Some(path.with_extension("pack")),
-        _ => None,
-    }
-}
-
-fn pack_has_keep_marker(pack_dir: &Path, path: &Path) -> bool {
-    let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+fn pack_has_keep_marker(pack_dir: &Path, pack_path: &Path) -> bool {
+    let Some(stem) = pack_path.file_stem().and_then(|s| s.to_str()) else {
         return false;
     };
     pack_dir.join(format!("{stem}.keep")).is_file()
@@ -2267,6 +2271,8 @@ pub(crate) mod gc_test_hooks {
     pub enum GcPausePoint {
         /// After pack inventory is recorded and before maintenance roots are collected.
         AfterInventoryBeforeRoots,
+        /// After maintenance roots are collected and before superseded packs are dropped.
+        AfterRootsBeforeDropAll,
     }
 
     type GcHook = (GcPausePoint, Box<dyn FnOnce() + Send>);
@@ -2951,5 +2957,138 @@ mod tests {
             !repo.odb().exists(&orphan),
             "without .keep protection gc may drop an unreachable migrated loose object"
         );
+    }
+
+    #[cfg_attr(
+        not(feature = "full-tests"),
+        ignore = "starts system git or is heavy; run with --features full-tests"
+    )]
+    #[test]
+    fn repack_retains_inventory_kept_pack_after_ref_publish_and_guard_drop() {
+        use crate::receive_quarantine::ReceiveQuarantine;
+        use std::process::Command;
+        use std::sync::{Arc, Mutex};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let remote = tmp.path().join("remote.git");
+        let wt = tmp.path().join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::create_dir_all(&remote).unwrap();
+        let git = |dir: &Path, args: &[&str]| {
+            assert!(Command::new("git")
+                .current_dir(dir)
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .status()
+                .expect("git")
+                .success());
+        };
+        git(&remote, &["init", "-q", "--bare", "-b", "main"]);
+        git(&wt, &["init", "-q", "-b", "main"]);
+        std::fs::write(wt.join("payload.txt"), b"v1\n").unwrap();
+        git(&wt, &["add", "payload.txt"]);
+        git(&wt, &["commit", "-qm", "base"]);
+        git(&wt, &["push", "-q", remote.to_str().unwrap(), "main"]);
+        git(&remote, &["repack", "-a", "-d"]);
+        std::fs::write(wt.join("payload.txt"), b"v2\n").unwrap();
+        git(&wt, &["add", "payload.txt"]);
+        git(&wt, &["commit", "-qm", "incoming"]);
+        git(&wt, &["repack", "-a", "-d"]);
+        let incoming_hex = String::from_utf8(
+            Command::new("git")
+                .current_dir(&wt)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .expect("rev-parse")
+                .stdout,
+        )
+        .expect("utf8")
+        .trim()
+        .to_owned();
+        let incoming = ObjectId::from_hex(&incoming_hex).expect("incoming tip");
+
+        let repo = Repository::open(&remote, &crate::environment::RepositoryOptions::empty())
+            .expect("open remote");
+        let mut q = ReceiveQuarantine::create(repo.odb(), repo.git_dir()).expect("quarantine");
+        let q_root = PathBuf::from(
+            q.hook_env()
+                .into_iter()
+                .find(|(k, _)| k == "GIT_QUARANTINE_PATH")
+                .map(|(_, v)| v)
+                .expect("quarantine path"),
+        );
+        let q_pack_dir = q_root.join("pack");
+        fs::create_dir_all(&q_pack_dir).unwrap();
+        let wt_pack_dir = wt.join(".git/objects/pack");
+        let wt_pack = fs::read_dir(&wt_pack_dir)
+            .expect("wt pack dir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|p| p.extension().is_some_and(|ext| ext == "pack"))
+            .expect("wt repack pack");
+        for ext in ["pack", "idx", "rev"] {
+            let src = wt_pack.with_extension(ext);
+            if src.is_file() {
+                fs::copy(&src, q_pack_dir.join(format!("pack-incoming.{ext}"))).unwrap();
+            }
+        }
+        assert!(
+            q_pack_dir.join("pack-incoming.pack").is_file(),
+            "incoming pack sidecar"
+        );
+
+        let pack_dir = repo.git_dir().join("objects/pack");
+        let incoming_keep = pack_dir.join("pack-incoming.keep");
+        let guards_slot = Arc::new(Mutex::new(None));
+        let guards = q.migrate().expect("migrate");
+        *guards_slot.lock().expect("lock") = Some(guards);
+        assert!(incoming_keep.is_file());
+
+        let remote_for_hook = remote.clone();
+        let incoming_for_hook = incoming_hex.clone();
+        let incoming_keep_for_hook = incoming_keep.clone();
+        let guards_for_hook = Arc::clone(&guards_slot);
+        super::gc_test_hooks::on_next_gc(
+            super::gc_test_hooks::GcPausePoint::AfterRootsBeforeDropAll,
+            move || {
+                assert!(Command::new("git")
+                    .current_dir(&remote_for_hook)
+                    .args(["update-ref", "refs/heads/main", &incoming_for_hook,])
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                    .status()
+                    .expect("update-ref")
+                    .success());
+                drop(guards_for_hook.lock().expect("lock").take());
+                assert!(
+                    !incoming_keep_for_hook.exists(),
+                    "receive path drops live keep markers after publication"
+                );
+            },
+        );
+
+        repack_all(
+            &repo,
+            &RepackOptions {
+                auto_skip: false,
+                write_bitmap: false,
+                ..RepackOptions::default()
+            },
+        )
+        .expect("repack");
+
+        assert!(
+            repo.odb().exists(&incoming),
+            "inventory-time keep must protect the pack after live markers are dropped"
+        );
+        assert!(Command::new("git")
+            .current_dir(&remote)
+            .args(["fsck", "--strict"])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .status()
+            .expect("fsck")
+            .success());
     }
 }

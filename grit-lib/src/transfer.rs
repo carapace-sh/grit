@@ -4151,8 +4151,3 @@ mod tests {
         assert!(FetchOutcome::default().reported_updates().next().is_none());
     }
 }
-
-#[cfg(test)]
-pub(crate) mod push_test_hooks {
-    pub(crate) use super::tests::{on_next_push, PushHookPoint};
-}

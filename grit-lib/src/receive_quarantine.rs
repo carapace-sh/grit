@@ -14,50 +14,132 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::{Error, Result};
+use crate::lockfile::{LockError, LockFile, LockWait};
 use crate::odb::Odb;
 
 static QUARANTINE_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// How dropping a guard affects the on-disk `.keep` marker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeepMarkerRelease {
+    /// This guard incremented a grit-managed decimal refcount in the marker file.
+    GritRefcount,
+    /// The marker predates this guard (empty or non-numeric); never unlink on drop.
+    External,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeepMarkerState {
+    Absent,
+    External,
+    Grit(u32),
+}
+
+fn keep_serialization_lock_path(keep_path: &Path) -> PathBuf {
+    let name = keep_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "pack.keep".to_owned());
+    keep_path
+        .parent()
+        .map(|dir| dir.join(format!("{name}.lock")))
+        .unwrap_or_else(|| PathBuf::from(format!("{name}.lock")))
+}
+
+fn lock_keep_marker(keep_path: &Path) -> std::result::Result<LockFile, Error> {
+    LockFile::acquire(
+        &keep_serialization_lock_path(keep_path),
+        LockWait::Indefinitely,
+    )
+    .map_err(|err| match err {
+        LockError::Io { source, .. } => Error::Io(source),
+        LockError::Held { .. } => Error::Io(io::Error::other("pack keep lock held")),
+    })
+}
+
+fn read_keep_marker_state(keep_path: &Path) -> io::Result<KeepMarkerState> {
+    if !keep_path.is_file() {
+        return Ok(KeepMarkerState::Absent);
+    }
+    let bytes = fs::read(keep_path)?;
+    let text = String::from_utf8_lossy(&bytes);
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Ok(KeepMarkerState::External);
+    }
+    match trimmed.parse::<u32>() {
+        Ok(0) => Ok(KeepMarkerState::External),
+        Ok(count) => Ok(KeepMarkerState::Grit(count)),
+        Err(_) => Ok(KeepMarkerState::External),
+    }
+}
+
+fn write_grit_keep_refcount(keep_path: &Path, count: u32) -> io::Result<()> {
+    fs::write(keep_path, count.to_string())
+}
+
+fn acquire_keep_marker(keep_path: &Path) -> Result<KeepMarkerRelease> {
+    if let Some(parent) = keep_path.parent() {
+        fs::create_dir_all(parent).map_err(Error::Io)?;
+    }
+    let _lock = lock_keep_marker(keep_path)?;
+    match read_keep_marker_state(keep_path)? {
+        KeepMarkerState::Absent => {
+            write_grit_keep_refcount(keep_path, 1).map_err(Error::Io)?;
+            Ok(KeepMarkerRelease::GritRefcount)
+        }
+        KeepMarkerState::External => Ok(KeepMarkerRelease::External),
+        KeepMarkerState::Grit(count) => {
+            write_grit_keep_refcount(keep_path, count.saturating_add(1)).map_err(Error::Io)?;
+            Ok(KeepMarkerRelease::GritRefcount)
+        }
+    }
+}
+
+fn release_keep_marker(keep_path: &Path, release: KeepMarkerRelease) {
+    if release == KeepMarkerRelease::External {
+        return;
+    }
+    let Ok(_lock) = lock_keep_marker(keep_path) else {
+        return;
+    };
+    let Ok(state) = read_keep_marker_state(keep_path) else {
+        return;
+    };
+    match state {
+        KeepMarkerState::Grit(1) => {
+            let _ = fs::remove_file(keep_path);
+        }
+        KeepMarkerState::Grit(count) => {
+            let _ = write_grit_keep_refcount(keep_path, count - 1);
+        }
+        KeepMarkerState::Absent | KeepMarkerState::External => {}
+    }
+}
+
 /// Keeps a pack reachable while refs that name its objects are still being published.
 ///
 /// A sibling `.keep` marker is created before the pack file is visible in the main object
-/// store and removed on drop unless [`Self::disarm`] was called.
+/// store. Grit-managed markers store a decimal refcount in the file and serialize updates
+/// with a `{name}.keep.lock` file so separate receive-pack processes cannot unlink a marker
+/// another process still holds. Pre-existing empty or non-numeric markers are left on disk.
 pub struct MigratedPackKeepGuard {
     keep_path: PathBuf,
-    armed: bool,
+    release: KeepMarkerRelease,
 }
 
 impl MigratedPackKeepGuard {
-    /// Create `{stem}.keep` next to `pack_path` if it does not exist yet.
+    /// Create or join the `{stem}.keep` marker next to `pack_path`.
     fn install_for_pack(pack_path: &Path) -> Result<Self> {
         let keep_path = pack_keep_path(pack_path);
-        if let Some(parent) = keep_path.parent() {
-            fs::create_dir_all(parent).map_err(Error::Io)?;
-        }
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&keep_path)
-        {
-            Ok(_) => Ok(Self {
-                keep_path,
-                armed: true,
-            }),
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(Self {
-                keep_path,
-                armed: false,
-            }),
-            Err(e) => Err(Error::Io(e)),
-        }
+        let release = acquire_keep_marker(&keep_path)?;
+        Ok(Self { keep_path, release })
     }
-
 }
 
 impl Drop for MigratedPackKeepGuard {
     fn drop(&mut self) {
-        if self.armed {
-            let _ = fs::remove_file(&self.keep_path);
-        }
+        release_keep_marker(&self.keep_path, self.release);
     }
 }
 
@@ -363,6 +445,124 @@ mod tests {
         assert_eq!(guards.len(), 1);
         assert!(pack_dir.join("pack-dup.keep").is_file());
         drop(guards);
+    }
+
+    #[test]
+    fn overlapping_migrations_retain_keep_until_last_guard_drops() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let main = tmp.path().join("objects");
+        let pack_dir = main.join("pack");
+        fs::create_dir_all(&pack_dir).unwrap();
+        let git_dir = tmp.path().join(".git");
+        fs::create_dir_all(&git_dir).unwrap();
+        let main_odb = Odb::new(&main);
+        let mut first = ReceiveQuarantine::create(&main_odb, &git_dir).expect("quarantine");
+        fs::write(first.path.join("pack/pack-same.pack"), b"first").unwrap();
+        let mut second = ReceiveQuarantine::create(&main_odb, &git_dir).expect("quarantine");
+        fs::write(second.path.join("pack/pack-same.pack"), b"second").unwrap();
+        let first_guards = first.migrate().expect("first migrate");
+        let second_guards = second.migrate().expect("second migrate");
+        assert!(pack_dir.join("pack-same.keep").is_file());
+        drop(first_guards);
+        assert!(
+            pack_dir.join("pack-same.keep").is_file(),
+            "second live migration guard lost protection when first guard dropped"
+        );
+        drop(second_guards);
+        assert!(!pack_dir.join("pack-same.keep").is_file());
+    }
+
+    #[test]
+    fn migration_preserves_preexisting_external_keep_marker() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let main = tmp.path().join("objects");
+        let pack_dir = main.join("pack");
+        fs::create_dir_all(&pack_dir).unwrap();
+        fs::write(pack_dir.join("pack-dup.pack"), b"existing").unwrap();
+        fs::write(pack_dir.join("pack-dup.keep"), b"").unwrap();
+        let git_dir = tmp.path().join(".git");
+        fs::create_dir_all(&git_dir).unwrap();
+        let main_odb = Odb::new(&main);
+        let mut q = ReceiveQuarantine::create(&main_odb, &git_dir).expect("quarantine");
+        fs::write(q.path.join("pack/pack-dup.pack"), b"incoming").unwrap();
+        let guards = q.migrate().expect("migrate");
+        assert!(pack_dir.join("pack-dup.keep").is_file());
+        drop(guards);
+        assert!(
+            pack_dir.join("pack-dup.keep").is_file(),
+            "external keep marker must survive guard drop"
+        );
+    }
+
+    const KEEP_CROSS_PROCESS_CHILD: &str = "GRIT_RECEIVE_KEEP_CROSS_PROCESS_CHILD";
+
+    #[test]
+    fn keep_marker_cross_process_child_holds_first_guard() {
+        let Some(work) = std::env::var_os(KEEP_CROSS_PROCESS_CHILD) else {
+            return;
+        };
+        let work = PathBuf::from(work);
+        let main = work.join("objects");
+        let git_dir = work.join(".git");
+        let main_odb = Odb::new(&main);
+        let mut q = ReceiveQuarantine::create(&main_odb, &git_dir).expect("quarantine");
+        fs::write(q.path.join("pack/pack-same.pack"), b"first").unwrap();
+        let guards = q.migrate().expect("migrate");
+        fs::write(work.join("child-ready"), b"ok").unwrap();
+        let mut line = String::new();
+        let _ = std::io::stdin().read_line(&mut line);
+        drop(guards);
+    }
+
+    #[test]
+    fn keep_markers_outlive_first_process_while_second_holds_guard() {
+        if std::env::var_os(KEEP_CROSS_PROCESS_CHILD).is_some() {
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let main = tmp.path().join("objects");
+        let pack_dir = main.join("pack");
+        fs::create_dir_all(&pack_dir).unwrap();
+        let git_dir = tmp.path().join(".git");
+        fs::create_dir_all(&git_dir).unwrap();
+        let exe = std::env::current_exe().expect("test binary");
+        let mut child = std::process::Command::new(&exe)
+            .args([
+                "receive_quarantine::tests::keep_marker_cross_process_child_holds_first_guard",
+                "--exact",
+                "--nocapture",
+            ])
+            .env(KEEP_CROSS_PROCESS_CHILD, tmp.path())
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn child receive");
+        let ready = tmp.path().join("child-ready");
+        for _ in 0..500 {
+            if ready.is_file() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(ready.is_file(), "child did not install keep marker");
+        assert!(pack_dir.join("pack-same.keep").is_file());
+        let main_odb = Odb::new(&main);
+        let mut second = ReceiveQuarantine::create(&main_odb, &git_dir).expect("quarantine");
+        fs::write(second.path.join("pack/pack-same.pack"), b"second").unwrap();
+        let second_guards = second.migrate().expect("second migrate");
+        if let Some(mut stdin) = child.stdin.take() {
+            use std::io::Write;
+            writeln!(stdin, "release").expect("signal child");
+        }
+        assert!(
+            child.wait().expect("wait child").success(),
+            "child receive failed"
+        );
+        assert!(
+            pack_dir.join("pack-same.keep").is_file(),
+            "second process lost keep protection when first process exited"
+        );
+        drop(second_guards);
+        assert!(!pack_dir.join("pack-same.keep").is_file());
     }
 
     #[cfg_attr(
