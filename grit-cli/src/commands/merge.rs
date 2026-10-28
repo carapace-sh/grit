@@ -5,6 +5,7 @@
 //! markers in the worktree.
 
 use crate::context;
+use crate::json_error;
 use crate::markdown;
 use crate::merge_strategy_args::MergeStrategyArgs;
 use crate::message_input::{read_message_input, MessageInputArgs};
@@ -706,6 +707,10 @@ fn integrate_with_options(
     ) {
         Ok(outcome) => Ok(map_integrate_outcome(outcome, label, head_short)),
         Err(Error::NotFastForward) => Ok(MergeOutcome::refused_not_ff(label)),
+        Err(err @ Error::Hook(_)) => Err(json_error::hook_failed_with_hint(
+            err,
+            "the merge is still in progress: run `grit merge --continue` to commit it, or `grit merge --abort` to cancel",
+        )),
         Err(err) => Err(err.into()),
     }
 }

@@ -137,6 +137,18 @@ pub fn hook_error_from_chain(err: &Error) -> Option<&HookError> {
         })
 }
 
+/// A failed hook with the next step as `hint`. The [`LibError::Hook`] stays in the chain, so
+/// the hook's captured output is still rendered.
+pub fn hook_failed_with_hint(err: LibError, hint: &str) -> Error {
+    let err = Error::new(err);
+    let Some(mut payload) = hook_failure_payload(&err) else {
+        return err;
+    };
+    payload.hint = Some(hint.to_owned());
+    let human = payload.error.clone();
+    err.context(StructuredCliError { payload, human })
+}
+
 fn hook_failure_payload(err: &Error) -> Option<StructuredJsonError> {
     let hook = hook_error_from_chain(err)?;
     let HookError::Failed {

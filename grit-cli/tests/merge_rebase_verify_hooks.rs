@@ -94,6 +94,12 @@ fn refused_merge_keeps_the_branch_and_records_the_merge() {
     assert_eq!(err["kind"], "hook_failed");
     assert_eq!(err["hook"]["name"], "pre-merge-commit");
     assert_eq!(err["hook"]["stderr"], "blocked\n");
+    assert!(
+        err["hint"]
+            .as_str()
+            .is_some_and(|hint| hint.contains("grit merge --continue")),
+        "{err}"
+    );
     assert_eq!(git(dir, &["rev-parse", "main"]), main);
     assert_eq!(
         git(dir, &["rev-parse", "MERGE_HEAD"]),
