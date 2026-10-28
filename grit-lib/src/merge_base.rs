@@ -231,6 +231,57 @@ pub fn is_ancestor(repo: &Repository, ancestor: ObjectId, descendant: ObjectId) 
     cache.is_ancestor(ancestor, descendant)
 }
 
+/// [`is_ancestor`] that first looks for `descendant` on `ancestor`'s first-parent chain, the
+/// shape of a ref moved back with `HEAD~n`.
+///
+/// Finding it proves `descendant` is a strict ancestor of `ancestor`, so the answer is `false`
+/// (history has no cycles) without [`is_ancestor`]'s date-slop walk, which would otherwise read
+/// a hundred commits below `ancestor`'s date. The chain walk stops at the first commit dated
+/// before `descendant`, so a ref that moved anywhere else costs only the few commits newer
+/// than `descendant`; [`is_ancestor`] then decides. Grafts and replace refs can make ancestry
+/// cyclic, so with either present the chain is not consulted.
+///
+/// # Errors
+///
+/// Propagates commit read and parse errors.
+pub(crate) fn is_ancestor_unless_rewound(
+    repo: &Repository,
+    ancestor: ObjectId,
+    descendant: ObjectId,
+) -> Result<bool> {
+    if ancestor == descendant {
+        return Ok(true);
+    }
+    let mut cache = CommitGraphCache::new(repo);
+    if !cache.has_parent_rewrites()?
+        && first_parent_chain_reaches_newer(&mut cache, ancestor, descendant).unwrap_or(false)
+    {
+        return Ok(false);
+    }
+    cache.is_ancestor(ancestor, descendant)
+}
+
+/// Whether `target` lies on `from`'s first-parent chain, walking only commits dated at or
+/// after `target`.
+fn first_parent_chain_reaches_newer(
+    cache: &mut CommitGraphCache<'_>,
+    from: ObjectId,
+    target: ObjectId,
+) -> Result<bool> {
+    let target_time = cache.commit_time(target)?;
+    let mut cur = from;
+    while cache.commit_time(cur)? >= target_time {
+        let Some(&parent) = cache.parents_of(cur)?.first() else {
+            return Ok(false);
+        };
+        if parent == target {
+            return Ok(true);
+        }
+        cur = parent;
+    }
+    Ok(false)
+}
+
 /// Whether the acknowledged haves of a fetch negotiation cover every wanted
 /// commit, so upload-pack may answer `ready` and send the pack.
 ///
@@ -2079,9 +2130,11 @@ impl SidePaint {
         right: &[ObjectId],
         mut walk: PaintWalk,
     ) -> Result<Self> {
+        cache.prime_tips(left);
+        cache.prime_tips(right);
         for (tips, side) in [(left, PAINT_LEFT), (right, PAINT_RIGHT)] {
             for &tip in tips {
-                let Some(tip) = try_peel_to_commit_for_merge_base(cache.repo, tip)? else {
+                let Some(tip) = cache.peel_tip(tip)? else {
                     continue;
                 };
                 walk.mark(cache, tip, side)?;
@@ -2458,6 +2511,10 @@ fn reduce_to_best(
     Ok(best.into_iter().collect())
 }
 
+/// Fewest tips on one side of a paint for [`CommitGraphCache::prime_tips`] to read them up
+/// front; merge-base and range walks start from one or two tips and keep the plain reads.
+const PRIME_TIPS_MIN: usize = 64;
+
 struct CommitGraphCache<'r> {
     repo: &'r Repository,
     closures: OidHashMap<OidHashSet>,
@@ -2481,6 +2538,8 @@ struct CommitGraphCache<'r> {
     /// [`Self::retained`] keep what the walk needs, so a per-commit allocation (and the
     /// object database's session copy of every walked commit) would only be thrown away.
     read_buf: Vec<u8>,
+    /// Plain commits whose linkage [`Self::prime_tips`] recorded from their header blocks.
+    header_primed: OidHashSet,
 }
 
 impl<'r> CommitGraphCache<'r> {
@@ -2524,6 +2583,7 @@ impl<'r> CommitGraphCache<'r> {
             retained: None,
             retain_reads: false,
             read_buf: Vec::new(),
+            header_primed: oid_hash_set(),
         }
     }
 
@@ -2694,6 +2754,18 @@ impl<'r> CommitGraphCache<'r> {
                 retained.insert(oid, buf);
             }
         }
+        Ok(self.record_linkage(oid, commit_oid, time, &parsed_parents))
+    }
+
+    /// Record `oid`'s committer time and its parents, read from `commit_oid` (the commit
+    /// `oid` peels to), after shallow, promisor and graft rewrites. Returns those parents.
+    fn record_linkage(
+        &mut self,
+        oid: ObjectId,
+        commit_oid: ObjectId,
+        time: i64,
+        parsed_parents: &[ObjectId],
+    ) -> Vec<ObjectId> {
         let parents: Vec<ObjectId> = if self.shallow_boundaries.contains(&commit_oid) {
             Vec::new()
         } else {
@@ -2708,7 +2780,74 @@ impl<'r> CommitGraphCache<'r> {
             link.times.insert(oid, time);
             link.parents.insert(oid, parents.clone());
         });
-        Ok(parents)
+        parents
+    }
+
+    /// Whether `oid` names itself: no replace ref, promisor stop or shallow boundary rewrites it.
+    fn is_plain_tip(&self, oid: &ObjectId) -> bool {
+        self.repo.object_id_after_replace(oid) == *oid
+            && !self.promisor_stop.contains(oid)
+            && !self.shallow_boundaries.contains(oid)
+    }
+
+    fn graph_lists(&self, oid: &ObjectId) -> bool {
+        self.graph
+            .as_ref()
+            .is_some_and(|graph| graph.find_commit(oid).is_some())
+    }
+
+    /// Record the linkage of every plain packed commit among `tips` from its header block
+    /// ([`crate::odb::Odb::read_packed_commit_header_block_into`]), reading them in parallel.
+    ///
+    /// Hide sets hold every ref in the repository, so a walk can start from hundreds of
+    /// scattered tips whose dates it needs before taking a single step. Their reads are
+    /// independent, and each one only needs the headers. Commits the commit-graph lists need
+    /// no read. Tips this cannot prime (tags, loose or deltified commits, unparsable headers,
+    /// read errors) are left to [`Self::peel_tip`] and the regular object reads, which report
+    /// any error. Sides with fewer than [`PRIME_TIPS_MIN`] tips are left alone too.
+    fn prime_tips(&mut self, tips: &[ObjectId]) {
+        if tips.len() < PRIME_TIPS_MIN {
+            return;
+        }
+        let pending: Vec<ObjectId> = tips
+            .iter()
+            .filter(|oid| {
+                !self.header_primed.contains(*oid)
+                    && self.is_plain_tip(oid)
+                    && !self.graph_lists(oid)
+            })
+            .copied()
+            .collect();
+        let repo = self.repo;
+        let read_linkage = |oid: &ObjectId| -> Option<(i64, Vec<ObjectId>)> {
+            let mut buf = Vec::new();
+            if !repo
+                .odb()
+                .read_packed_commit_header_block_into(oid, &mut buf)
+                .ok()?
+            {
+                return None;
+            }
+            let commit = CommitRef::parse(&buf).ok()?;
+            Some((commit.committer_timestamp(), commit.parents().to_vec()))
+        };
+        let read = crate::rev_list::map_commits_in_parallel(&pending, read_linkage);
+        for (oid, linkage) in pending.into_iter().zip(read) {
+            if let Some((time, parents)) = linkage {
+                self.record_linkage(oid, oid, time, &parents);
+                self.header_primed.insert(oid);
+            }
+        }
+    }
+
+    /// Peel a walk tip to its commit, like [`try_peel_to_commit_for_merge_base`], without a read
+    /// for tips [`Self::prime_tips`] recorded or the commit-graph lists.
+    fn peel_tip(&mut self, oid: ObjectId) -> Result<Option<ObjectId>> {
+        if self.header_primed.contains(&oid) || (self.is_plain_tip(&oid) && self.graph_lists(&oid))
+        {
+            return Ok(Some(oid));
+        }
+        try_peel_to_commit_for_merge_base(self.repo, oid)
     }
 
     /// Committer timestamp (unix seconds) for `oid`, peeling tags to their commit.

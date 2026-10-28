@@ -6,7 +6,7 @@
 use crate::change_id::resolved_change_id;
 use crate::error::Result;
 use crate::git_path::path_for_disk_compare;
-use crate::merge_base::{count_commits_left_behind, is_ancestor};
+use crate::merge_base::{count_commits_left_behind, is_ancestor_unless_rewound};
 use crate::objects::{parse_commit, read_commit_subject_line, ObjectId};
 use crate::refs;
 use crate::repo::Repository;
@@ -60,7 +60,7 @@ pub(crate) fn compute_orphan_info(
     target: ObjectId,
     limit: usize,
 ) -> Result<OrphanComputation> {
-    if previous == target || is_ancestor(repo, previous, target)? {
+    if previous == target || is_ancestor_unless_rewound(repo, previous, target)? {
         return Ok(OrphanComputation::default());
     }
     let hide = orphan_hide_tips(repo, head, target)?;

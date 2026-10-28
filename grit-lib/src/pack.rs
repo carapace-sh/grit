@@ -468,19 +468,24 @@ pub(crate) mod pack_cache {
         })
     }
 
+    /// The pack that served the last lookup in `objects_dir` ([`remember_pack_hit`]), when
+    /// the active pack store reads that directory.
+    pub(crate) fn hinted_pack_index(objects_dir: &Path) -> Option<Arc<PackIndex>> {
+        if !crate::pack_store::PackStore::read_context_matches_objects_dir(objects_dir) {
+            return None;
+        }
+        PACK_HIT_INDEX.with(|cell| {
+            cell.borrow()
+                .as_ref()
+                .and_then(|(dir, idx)| (dir == objects_dir).then(|| Arc::clone(idx)))
+        })
+    }
+
     pub(crate) fn try_read_from_hinted_pack(
         objects_dir: &Path,
         oid: &crate::objects::ObjectId,
     ) -> Result<Option<crate::objects::Object>> {
-        if !crate::pack_store::PackStore::read_context_matches_objects_dir(objects_dir) {
-            return Ok(None);
-        }
-        let idx = PACK_HIT_INDEX.with(|cell| {
-            cell.borrow()
-                .as_ref()
-                .and_then(|(dir, idx)| (dir == objects_dir).then(|| Arc::clone(idx)))
-        });
-        let Some(idx) = idx else {
+        let Some(idx) = hinted_pack_index(objects_dir) else {
             return Ok(None);
         };
         let Some(offset) = find_offset_in_pack_read_context(objects_dir, &idx, oid)? else {
@@ -499,15 +504,7 @@ pub(crate) mod pack_cache {
         populate_delta_lru: bool,
         buf: &mut Vec<u8>,
     ) -> Result<Option<crate::objects::ObjectKind>> {
-        if !crate::pack_store::PackStore::read_context_matches_objects_dir(objects_dir) {
-            return Ok(None);
-        }
-        let idx = PACK_HIT_INDEX.with(|cell| {
-            cell.borrow()
-                .as_ref()
-                .and_then(|(dir, idx)| (dir == objects_dir).then(|| Arc::clone(idx)))
-        });
-        let Some(idx) = idx else {
+        let Some(idx) = hinted_pack_index(objects_dir) else {
             return Ok(None);
         };
         let Some(offset) = find_offset_in_pack_read_context(objects_dir, &idx, oid)? else {
@@ -524,15 +521,7 @@ pub(crate) mod pack_cache {
         objects_dir: &Path,
         oid: &crate::objects::ObjectId,
     ) -> Result<Option<crate::objects::ObjectInfo>> {
-        if !crate::pack_store::PackStore::read_context_matches_objects_dir(objects_dir) {
-            return Ok(None);
-        }
-        let idx = PACK_HIT_INDEX.with(|cell| {
-            cell.borrow()
-                .as_ref()
-                .and_then(|(dir, idx)| (dir == objects_dir).then(|| Arc::clone(idx)))
-        });
-        let Some(idx) = idx else {
+        let Some(idx) = hinted_pack_index(objects_dir) else {
             return Ok(None);
         };
         let Some(offset) = idx.find_offset(oid)? else {
@@ -3586,6 +3575,86 @@ pub fn read_object_info_from_pack_at_offset(idx: &PackIndex, offset: u64) -> Res
         }
     }
     unreachable!("at most two read attempts")
+}
+
+/// Compressed bytes [`read_packed_commit_header_block_into`] fetches with one positioned read.
+const COMMIT_HEADER_BLOCK_WINDOW: usize = 4096;
+
+/// Most commit bytes [`read_packed_commit_header_block_into`] inflates looking for the blank
+/// line that ends the headers. Covers ordinary headers; long signatures take the whole read.
+const COMMIT_HEADER_BLOCK_MAX: usize = 1024;
+
+/// Inflate the header block of commit `oid`, stored whole in a local pack, into `out`.
+///
+/// On success `out` holds the headers through the blank line that ends them, so it parses as
+/// the same commit with an empty message. The entry is fetched with one positioned read rather
+/// than through the pack mapping: walks seeded from every ref read hundreds of scattered tip
+/// commits, and each mapped read would leave a fault-around window of the pack resident.
+///
+/// Returns `false`, leaving `out` unspecified, when no local pack index lists `oid`, the entry
+/// is not a whole commit, the header block exceeds [`COMMIT_HEADER_BLOCK_MAX`], or the
+/// positioned read or the inflate fails. Callers then read the whole object, which reports
+/// any corruption.
+///
+/// # Errors
+///
+/// Propagates pack directory listing and pack index lookup errors.
+pub(crate) fn read_packed_commit_header_block_into(
+    objects_dir: &Path,
+    oid: &ObjectId,
+    out: &mut Vec<u8>,
+) -> Result<bool> {
+    if crate::pack_store::PackStore::read_context_matches_objects_dir(objects_dir) {
+        pack_cache::sync_thread_local_with_store(&crate::pack_store::PackStore::active_for_reads());
+    }
+    if let Some(idx) = pack_cache::hinted_pack_index(objects_dir) {
+        if let Some(offset) = idx.find_offset(oid)? {
+            return Ok(read_commit_header_block_at(&idx, offset, out));
+        }
+    }
+    for idx in pack_indexes_for_lookup(objects_dir, PackLookupOptions::ALL_LOCAL_PACKS)? {
+        if let Some(offset) = idx.find_offset(oid)? {
+            pack_cache::remember_pack_hit(objects_dir, &idx);
+            return Ok(read_commit_header_block_at(&idx, offset, out));
+        }
+    }
+    Ok(false)
+}
+
+fn read_commit_header_block_at(idx: &PackIndex, offset: u64, out: &mut Vec<u8>) -> bool {
+    let Ok(pack_bytes) = read_pack_bytes_cached(&idx.pack_path) else {
+        return false;
+    };
+    if !pack_cache::pack_object_count_validated(&idx.pack_path) {
+        if validate_pack_index_object_count(&pack_bytes, idx).is_err() {
+            return false;
+        }
+        pack_cache::mark_pack_object_count_validated(&idx.pack_path);
+    }
+    let mut window = [0u8; COMMIT_HEADER_BLOCK_WINDOW];
+    let Some(len) = pack_bytes.read_sparse(offset, &mut window) else {
+        return false;
+    };
+    let window = &window[..len];
+    let mut pos = 0usize;
+    let Ok((PackedType::Commit, size)) = parse_pack_object_header(window, &mut pos) else {
+        return false;
+    };
+    let want = usize::try_from(size).map_or(COMMIT_HEADER_BLOCK_MAX, |size| {
+        size.min(COMMIT_HEADER_BLOCK_MAX)
+    });
+    let inflated = WHOLE_OBJECT_ZLIB.with(|slot| {
+        slot.borrow_mut()
+            .decompress_prefix_into(&window[pos..], want, out)
+    });
+    if inflated.is_err() || out.len() != want {
+        return false;
+    }
+    let Some(blank) = out.windows(2).position(|pair| pair == b"\n\n") else {
+        return false;
+    };
+    out.truncate(blank + 2);
+    true
 }
 
 fn read_object_info_from_pack_at_offset_with_bytes(

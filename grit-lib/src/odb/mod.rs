@@ -2452,6 +2452,32 @@ impl Odb {
         Ok(object.kind)
     }
 
+    /// Read only the header block of commit `oid` into `buf` when a local pack stores it whole.
+    ///
+    /// `buf` then ends with the blank line that closes the headers: it parses as the commit
+    /// with an empty message, giving its tree, parents and dates without inflating the message.
+    /// The entry is fetched with a positioned read, so walks that touch many scattered commits
+    /// do not keep pack pages resident. Returns `false` when this shortcut does not apply (a
+    /// custom primary store, a loose or deltified commit, an object that is not a commit, very
+    /// long headers); read the whole object instead.
+    ///
+    /// # Errors
+    ///
+    /// Propagates pack directory listing and pack index lookup errors.
+    pub(crate) fn read_packed_commit_header_block_into(
+        &self,
+        oid: &ObjectId,
+        buf: &mut Vec<u8>,
+    ) -> Result<bool> {
+        if self.custom_primary.is_some() {
+            return Ok(false);
+        }
+        let Ok(files) = self.primary() else {
+            return Ok(false);
+        };
+        files.read_packed_commit_header_block_into(oid, buf)
+    }
+
     #[cold]
     #[inline(never)]
     fn read_into_after_promisor_miss(
