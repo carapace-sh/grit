@@ -89,6 +89,17 @@ The Windows version also comes with `grit manager` which works as an interface t
 
 All code and crates in this repository, including `grit-lib` and `grit-cli`, are MIT licensed.
 
+## Toolchain
+
+**Library consumers:** `grit-lib`, `grit-cli`, `grit-protocol`, and
+`grit-http-server` declare **Rust 1.95** as the minimum supported version
+(`rust-version` in each crate's manifest). Older toolchains fail at `cargo
+build` with Cargo's MSRV message instead of obscure compiler errors.
+
+**Contributors:** the workspace pins **1.99.0** in [`rust-toolchain.toml`](rust-toolchain.toml)
+(with `rustfmt` and `clippy`). `rustup` applies that pin when you build inside
+this repository; it does not affect crates.io dependents.
+
 ## Testing
 
 ```sh

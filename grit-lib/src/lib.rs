@@ -4,6 +4,15 @@
 
 //! grit-lib — fast, linkable Git engine for Rust.
 //!
+//! # Minimum Rust version
+//!
+//! The published crate requires **Rust 1.95** or newer (`rust-version` in
+//! [`Cargo.toml`](https://github.com/gitbutlerapp/grit/blob/main/grit-lib/Cargo.toml)).
+//! Contributors building the Grit workspace use the pinned toolchain in
+//! [`rust-toolchain.toml`](https://github.com/gitbutlerapp/grit/blob/main/rust-toolchain.toml)
+//! (currently 1.99.0); that pin does not apply when you depend on `grit-lib`
+//! from crates.io outside the repo.
+//!
 //! Grit reimplements Git's on-disk formats and wire protocols in idiomatic Rust
 //! so embedders can open repositories, walk history, diff, merge, fetch, and push
 //! without shelling out to the `git` binary. The [`grit`](https://github.com/gitbutlerapp/grit)
