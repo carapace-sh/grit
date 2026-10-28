@@ -7631,8 +7631,6 @@ impl core::marker::Unpin for grit_lib::lockfile::LockHolder
 impl core::marker::UnsafeUnpin for grit_lib::lockfile::LockHolder
 impl core::panic::unwind_safe::RefUnwindSafe for grit_lib::lockfile::LockHolder
 impl core::panic::unwind_safe::UnwindSafe for grit_lib::lockfile::LockHolder
-pub fn grit_lib::lockfile::grit_lockfile_pid_enabled(core::option::Option<&grit_lib::config::ConfigSet>, core::option::Option<&std::path::Path>) -> bool
-pub fn grit_lib::lockfile::pid_path_for_lock(&std::path::Path) -> std::path::PathBuf
 pub struct grit_lib::lockfile::SystemLockClock
 impl core::clone::Clone for grit_lib::lockfile::SystemLockClock
 pub fn grit_lib::lockfile::SystemLockClock::clone(&self) -> Self
@@ -7678,6 +7676,8 @@ pub trait grit_lib::lockfile::LockJitter: core::marker::Send + core::marker::Syn
 pub fn grit_lib::lockfile::LockJitter::fraction(&self, &std::path::Path, u32) -> f64
 impl grit_lib::lockfile::LockJitter for grit_lib::lockfile::SystemLockJitter
 pub fn grit_lib::lockfile::SystemLockJitter::fraction(&self, &std::path::Path, u32) -> f64
+pub fn grit_lib::lockfile::grit_lockfile_pid_enabled(core::option::Option<&grit_lib::config::ConfigSet>, core::option::Option<&std::path::Path>) -> bool
+pub fn grit_lib::lockfile::pid_path_for_lock(&std::path::Path) -> std::path::PathBuf
 pub mod grit_lib::maintenance
 pub mod grit_lib::maintenance::fsck
 pub enum grit_lib::maintenance::fsck::FsckMsgLevel
@@ -8924,8 +8924,8 @@ pub grit_lib::objects::bitmap::PackBitmapWriteOptions::full_dag: bool
 pub grit_lib::objects::bitmap::PackBitmapWriteOptions::hash_cache: bool
 pub grit_lib::objects::bitmap::PackBitmapWriteOptions::lookup_table: bool
 pub grit_lib::objects::bitmap::PackBitmapWriteOptions::prefer_bitmap_tips: alloc::vec::Vec<alloc::string::String>
-pub grit_lib::objects::bitmap::PackBitmapWriteOptions::verify_reachability_closure: bool
 pub grit_lib::objects::bitmap::PackBitmapWriteOptions::reachability_roots: core::option::Option<alloc::vec::Vec<grit_lib::objects::ObjectId>>
+pub grit_lib::objects::bitmap::PackBitmapWriteOptions::verify_reachability_closure: bool
 impl core::clone::Clone for grit_lib::objects::bitmap::PackBitmapWriteOptions
 pub fn grit_lib::objects::bitmap::PackBitmapWriteOptions::clone(&self) -> Self
 impl core::cmp::Eq for grit_lib::objects::bitmap::PackBitmapWriteOptions
