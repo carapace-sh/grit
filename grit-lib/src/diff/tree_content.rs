@@ -339,7 +339,9 @@ fn load_new_side(
     blob_bytes(odb, &e.new_oid, blob_reads)
 }
 
-fn gitlink_line(oid: &ObjectId) -> String {
+/// Text a gitlink side contributes to a patch: `Subproject commit <hex>\n`,
+/// or nothing for the zero id (an absent side).
+pub(crate) fn gitlink_line(oid: &ObjectId) -> String {
     if *oid == ObjectId::zero() {
         return String::new();
     }

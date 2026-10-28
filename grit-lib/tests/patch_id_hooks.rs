@@ -705,3 +705,108 @@ fn patch_id_equivalence_ignores_distant_context_but_keeps_nearby_context() {
         "nearby unchanged lines are part of the patch"
     );
 }
+
+fn git_patch_id_of_commit(dir: &std::path::Path, commit: &ObjectId, flag: &str) -> ObjectId {
+    let show_p = git_in(dir, &["show", "-p", &commit.to_hex()]);
+    git_patch_id_from_text(dir, show_p.as_bytes(), flag)
+}
+
+#[test]
+fn patch_id_hashes_gitlink_changes_without_reading_the_submodule_commit() {
+    let dir = TempDir::new().unwrap();
+    let missing_a = "13299d28f69f8009be8e08e453a9b0024f153a60";
+    let missing_b = "23299d28f69f8009be8e08e453a9b0024f153a60";
+    git_in(dir.path(), &["init", "-q", "-b", "main"]);
+    std::fs::write(dir.path().join("a"), "a\n").unwrap();
+    git_in(dir.path(), &["add", "a"]);
+    git_in(dir.path(), &["commit", "-qm", "base"]);
+    let cacheinfo = |oid: &str, path: &str| format!("160000,{oid},{path}");
+    let mut commits = Vec::new();
+    let mut commit = |message: &str| {
+        git_in(dir.path(), &["commit", "-qm", message]);
+        let oid: ObjectId = git_in(dir.path(), &["rev-parse", "HEAD"])
+            .trim()
+            .parse()
+            .unwrap();
+        commits.push(oid);
+    };
+
+    git_in(
+        dir.path(),
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &cacheinfo(missing_a, "sub"),
+        ],
+    );
+    commit("add gitlink");
+    git_in(
+        dir.path(),
+        &["update-index", "--cacheinfo", &cacheinfo(missing_b, "sub")],
+    );
+    commit("bump gitlink");
+    git_in(
+        dir.path(),
+        &["update-index", "--cacheinfo", &cacheinfo(missing_a, "sub")],
+    );
+    std::fs::write(dir.path().join("a"), "a\nb\n").unwrap();
+    git_in(dir.path(), &["add", "a"]);
+    commit("bump gitlink and edit a file");
+    git_in(dir.path(), &["update-index", "--force-remove", "sub"]);
+    commit("delete gitlink");
+    git_in(dir.path(), &["rm", "-q", "--cached", "a"]);
+    git_in(
+        dir.path(),
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &cacheinfo(missing_b, "a"),
+        ],
+    );
+    commit("replace a file with a gitlink");
+    std::fs::write(dir.path().join("f"), "f\n").unwrap();
+    git_in(dir.path(), &["add", "f"]);
+    commit("add a file");
+    std::fs::remove_file(dir.path().join("f")).unwrap();
+    std::os::unix::fs::symlink("target", dir.path().join("f")).unwrap();
+    git_in(dir.path(), &["add", "f"]);
+    commit("replace a file with a symlink");
+
+    for missing in [missing_a, missing_b] {
+        let probe = Command::new("git")
+            .current_dir(dir.path())
+            .args(["cat-file", "-t", missing])
+            .output()
+            .unwrap();
+        assert!(!probe.status.success(), "{missing} must not be an object");
+    }
+
+    let repo = Repository::open(
+        &dir.path().join(".git"),
+        &RepositoryOptions::empty().with_work_tree(dir.path()),
+    )
+    .unwrap();
+    for (mode, flag) in [
+        (PatchIdMode::Stable, "--stable"),
+        (PatchIdMode::Unstable, "--unstable"),
+        (PatchIdMode::Verbatim, "--verbatim"),
+    ] {
+        let expected: Vec<(ObjectId, ObjectId)> = commits
+            .iter()
+            .map(|c| (git_patch_id_of_commit(dir.path(), c, flag), *c))
+            .collect();
+        for (patch_id, commit) in &expected {
+            assert_eq!(
+                repo.patch_id(commit, mode).unwrap(),
+                Some(*patch_id),
+                "git show {commit} | git patch-id {flag}"
+            );
+        }
+        let range = format!("main~{}..main", commits.len());
+        let mut from_range = repo.patch_ids_for_revs(&[&range], mode).unwrap();
+        from_range.reverse();
+        assert_eq!(from_range, expected, "range {flag}");
+    }
+}

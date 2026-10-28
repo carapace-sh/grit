@@ -16,13 +16,13 @@
 //!   behaviour of `git patch-id`.
 
 use crate::diff::{
-    diff_trees_with_renames, unified_diff_with_prefix_and_funcname,
+    diff_trees_with_renames, gitlink_line, unified_diff_with_prefix_and_funcname,
     unified_hunk_body_for_diff_options, zero_oid, DiffEntry, DiffOptions, DiffStatus,
 };
 use crate::error::Result;
 use crate::hash::ChecksumHasher;
 use crate::merge_file;
-use crate::objects::{CommitRef, HashAlgo, ObjectId, ObjectKind};
+use crate::objects::{CommitRef, FileMode, HashAlgo, ObjectId, ObjectKind};
 use crate::odb::Odb;
 
 const PATCH_ID_DIGEST_MAX: usize = 32;
@@ -414,7 +414,9 @@ fn split_lines_with_nl(input: &[u8]) -> Vec<&[u8]> {
 /// lines on each side), so the ID matches `git show --format= --no-ext-diff`
 /// piped to `git patch-id` in the corresponding mode, including where an
 /// ambiguous insertion or deletion is placed. Unchanged lines outside those
-/// hunks do not contribute to the ID.
+/// hunks do not contribute to the ID. A gitlink side is hashed as its
+/// `Subproject commit <oid>` line without reading the submodule commit, and a
+/// type change is hashed as a deletion followed by an addition.
 ///
 /// # Parameters
 ///
@@ -499,8 +501,10 @@ fn compute_patch_id_filtered(
     if diffs.is_empty() {
         return Ok(None);
     }
+    let mut diffs = split_type_changes(diffs);
 
     // Sort by primary path (lexicographic), matching diffcore_std ordering.
+    // The sort is stable, so a split type change keeps its deletion first.
     diffs.sort_by(|a, b| a.path().cmp(b.path()));
 
     if mode == PatchIdMode::Verbatim {
@@ -512,8 +516,7 @@ fn compute_patch_id_filtered(
     if diffs.len() == 1 {
         let entry = &diffs[0];
         if entry.old_oid != entry.new_oid {
-            let old_bytes = read_blob(odb, &entry.old_oid)?;
-            let new_bytes = read_blob(odb, &entry.new_oid)?;
+            let (old_bytes, new_bytes) = read_sides(odb, entry)?;
             if merge_file::is_binary(&old_bytes) || merge_file::is_binary(&new_bytes) {
                 let mut patch = Vec::new();
                 patch_id_write_line(&mut patch, &format!("commit {}", commit_oid.to_hex()));
@@ -543,6 +546,37 @@ fn compute_patch_id_filtered(
         return Ok(None);
     }
     ObjectId::from_bytes(&result[..digest_len]).map(Some)
+}
+
+/// Replace each type change (e.g. file to symlink or gitlink) with a deletion
+/// followed by an addition of the same path, the two file diffs `git show`
+/// prints for it.
+fn split_type_changes(diffs: Vec<DiffEntry>) -> Vec<DiffEntry> {
+    if diffs.iter().all(|e| e.status != DiffStatus::TypeChanged) {
+        return diffs;
+    }
+    let mut out = Vec::with_capacity(diffs.len());
+    for entry in diffs {
+        if entry.status != DiffStatus::TypeChanged {
+            out.push(entry);
+            continue;
+        }
+        out.push(DiffEntry {
+            status: DiffStatus::Deleted,
+            new_path: None,
+            new_mode: FileMode::ABSENT,
+            new_oid: zero_oid(),
+            ..entry.clone()
+        });
+        out.push(DiffEntry {
+            status: DiffStatus::Added,
+            old_path: None,
+            old_mode: FileMode::ABSENT,
+            old_oid: zero_oid(),
+            ..entry
+        });
+    }
+    out
 }
 
 fn diff_entry_matches_paths(entry: &DiffEntry, paths: &[String]) -> bool {
@@ -689,8 +723,7 @@ fn patch_id_append_git_show_entry(odb: &Odb, entry: &DiffEntry, out: &mut Vec<u8
         return Ok(());
     }
 
-    let old_bytes = read_blob(odb, &entry.old_oid)?;
-    let new_bytes = read_blob(odb, &entry.new_oid)?;
+    let (old_bytes, new_bytes) = read_sides(odb, entry)?;
 
     if merge_file::is_binary(&old_bytes) || merge_file::is_binary(&new_bytes) {
         let old_side = if old_mode == 0 {
@@ -798,8 +831,7 @@ fn patch_id_hash_file_entry_into_ctx(
         return Ok(());
     }
 
-    let old_bytes = read_blob(odb, &entry.old_oid)?;
-    let new_bytes = read_blob(odb, &entry.new_oid)?;
+    let (old_bytes, new_bytes) = read_sides(odb, entry)?;
 
     if merge_file::is_binary(&old_bytes) || merge_file::is_binary(&new_bytes) {
         let a = patch_id_index_oid(&entry.old_oid);
@@ -868,8 +900,7 @@ fn patch_id_hash_rename_entry_into_ctx(
     }
 
     if entry.old_oid != entry.new_oid {
-        let old_bytes = read_blob(odb, &entry.old_oid)?;
-        let new_bytes = read_blob(odb, &entry.new_oid)?;
+        let (old_bytes, new_bytes) = read_sides(odb, entry)?;
         if merge_file::is_binary(&old_bytes) || merge_file::is_binary(&new_bytes) {
             let a = entry.old_oid.to_hex();
             let b = entry.new_oid.to_hex();
@@ -918,15 +949,25 @@ fn remove_space_bytes(buf: &mut [u8]) -> usize {
     dst
 }
 
-/// Read a blob's raw bytes from the ODB.
+/// The content each side of `entry` contributes to its patch, as `(old, new)`.
 ///
-/// Returns an empty `Vec` for the zero OID (representing an absent file).
-fn read_blob(odb: &Odb, oid: &ObjectId) -> Result<Vec<u8>> {
-    if *oid == zero_oid() {
-        return Ok(Vec::new());
-    }
-    let obj = odb.read(oid)?;
-    Ok(obj.data)
+/// A blob side is read from the ODB and the zero OID (an absent side) is empty.
+/// A gitlink side is its `Subproject commit` line, never an object read: the
+/// submodule's commit lives in another repository.
+fn read_sides(odb: &Odb, entry: &DiffEntry) -> Result<(Vec<u8>, Vec<u8>)> {
+    let read_side = |mode: FileMode, oid: &ObjectId| -> Result<Vec<u8>> {
+        if mode == FileMode::GITLINK {
+            return Ok(gitlink_line(oid).into_bytes());
+        }
+        if *oid == zero_oid() {
+            return Ok(Vec::new());
+        }
+        Ok(odb.read(oid)?.data)
+    };
+    Ok((
+        read_side(entry.old_mode, &entry.old_oid)?,
+        read_side(entry.new_mode, &entry.new_oid)?,
+    ))
 }
 
 #[cfg(test)]

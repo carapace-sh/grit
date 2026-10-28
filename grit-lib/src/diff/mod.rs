@@ -34,6 +34,7 @@ pub(crate) use core::is_func_line;
 pub(crate) use posix_ere::PosixBre;
 mod targets;
 mod tree_content;
+pub(crate) use tree_content::gitlink_line;
 mod unified_emit;
 mod whitespace_mode;
 
