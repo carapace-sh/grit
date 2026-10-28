@@ -445,6 +445,9 @@ mod rebase_cli;
 #[cfg(feature = "full-tests")]
 #[path = "rebase_conflicts_cli.rs"]
 mod rebase_conflicts_cli;
+#[cfg(unix)]
+#[path = "rebase_exec_interrupt.rs"]
+mod rebase_exec_interrupt;
 #[cfg(feature = "full-tests")]
 #[path = "receive_pack_deny_non_ff.rs"]
 mod receive_pack_deny_non_ff;

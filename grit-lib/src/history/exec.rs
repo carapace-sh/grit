@@ -111,9 +111,16 @@ impl ExecDetachedSession<'_> {
 
 fn fail_exec_session(session: &mut ExecDetachedSession<'_>, err: HistoryError) -> HistoryError {
     match session.restore() {
-        Ok(()) => err,
+        Ok(()) => {
+            let _ = super::rebase_session::clear_rebase_state(session.repo.git_dir());
+            err
+        }
         Err(restore_err) => restore_err,
     }
+}
+
+fn exec_command_signaled(output: &CommandOutput) -> bool {
+    !output.status.success && output.status.code.is_none()
 }
 
 /// How exec commands and the replays after them changed a plan.
@@ -420,6 +427,23 @@ fn execute_plan(
             continue;
         };
         let mut tip_tree = commit_tree_for_apply(repo, tip)?;
+        let first_command = if row == start.row { start.command } else { 0 };
+        store_exec_stop(
+            session,
+            plan,
+            rewrites,
+            spec,
+            rewrite,
+            ExecStop {
+                cursor: ExecCursor {
+                    row,
+                    command: first_command,
+                    head: None,
+                },
+                head: tip,
+                pending_pick: false,
+            },
+        )?;
         update_direct_ref_on_store(repo.refs(), repo.git_dir(), "HEAD", &tip).map_err(|e| {
             HistoryError::WorktreeApply {
                 message: e.to_string(),
@@ -432,12 +456,28 @@ fn execute_plan(
         }
         session.current_tree = tip_tree;
 
-        let first_command = if row == start.row { start.command } else { 0 };
         for (command_index, command) in spec.commands.iter().enumerate().skip(first_command) {
+            store_exec_stop(
+                session,
+                plan,
+                rewrites,
+                spec,
+                rewrite,
+                ExecStop {
+                    cursor: ExecCursor {
+                        row,
+                        command: command_index,
+                        head: None,
+                    },
+                    head: tip,
+                    pending_pick: false,
+                },
+            )?;
             let output = match run_exec_command(runner, command, worktree) {
                 Ok(output) => output,
                 Err(err) => return Err(fail_exec_session(session, err)),
             };
+            let signaled = exec_command_signaled(&output);
             let exit_code = output.status.code.unwrap_or(1);
             let stdout = output.stdout;
             let stderr = output.stderr;
@@ -462,6 +502,10 @@ fn execute_plan(
                     stderr,
                     completed_runs,
                 };
+                if signaled {
+                    session.active = false;
+                    return Err(exec_err);
+                }
                 return Err(fail_exec_session(session, exec_err));
             }
             match adopt_exec_head(repo, plan, rewrites, row, tip) {
@@ -524,11 +568,32 @@ fn execute_plan(
                     other => exec_io(other),
                 });
             }
+            store_exec_stop(
+                session,
+                plan,
+                rewrites,
+                spec,
+                rewrite,
+                ExecStop {
+                    cursor: ExecCursor {
+                        row,
+                        command: command_index + 1,
+                        head: None,
+                    },
+                    head: tip,
+                    pending_pick: false,
+                },
+            )?;
         }
     }
 
     rewrites.finish(repo, plan)?;
     session.restore()?;
+    super::rebase_session::clear_rebase_state(repo.git_dir()).map_err(|e| {
+        HistoryError::WorktreeApply {
+            message: e.to_string(),
+        }
+    })?;
     Ok(ExecReport { runs })
 }
 
@@ -989,7 +1054,19 @@ pub(super) fn resume_exec_rebase(
     let expected = ObjectId::from_hex(&state.head).map_err(HistoryError::from)?;
     let head = resolve_head_for_repository(repo).map_err(exec_io)?;
     if head != (HeadState::Detached { oid: expected }) {
-        return Err(super::RebaseSessionError::ExecHeadChanged { expected });
+        let still_on_branch = match &prestate.head {
+            SavedHead::Symbolic(_) => head.oid() == Some(&prestate.head_commit),
+            SavedHead::Detached(_) => false,
+        };
+        if still_on_branch {
+            let tip_tree = commit_tree_for_apply(repo, expected)?;
+            update_direct_ref_on_store(repo.refs(), repo.git_dir(), "HEAD", &expected)
+                .map_err(exec_io)?;
+            checkout_exec_tree_transition(repo, None, &tip_tree)
+                .map_err(super::RebaseSessionError::History)?;
+        } else {
+            return Err(super::RebaseSessionError::ExecHeadChanged { expected });
+        }
     }
     let row = state.row;
     let (cursor, current_tree) = if state.pending_pick {
@@ -1591,6 +1668,10 @@ mod tests {
         let a_entry = restored.get(b"a.txt", 0).expect("a.txt still tracked");
         assert!(a_entry.assume_unchanged());
         assert_eq!(fs::read(&a_path).expect("worktree a.txt"), a_contents);
+        assert!(
+            !repo.git_dir().join("rebase-merge").exists(),
+            "failed exec must not leave recovery state"
+        );
     }
 
     #[cfg_attr(
@@ -1853,6 +1934,89 @@ mod tests {
         assert_eq!(
             resolve_ref(repo.git_dir(), "refs/heads/main").expect("main"),
             update.new
+        );
+    }
+
+    #[cfg_attr(
+        not(feature = "full-tests"),
+        ignore = "starts system git or is heavy; run with --features full-tests"
+    )]
+    #[test]
+    fn exec_checkpoints_grit_exec_while_command_is_in_flight() {
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        struct PausedRunner {
+            started: mpsc::Sender<()>,
+            release: Arc<std::sync::Mutex<mpsc::Receiver<()>>>,
+        }
+
+        impl CommandRunner for PausedRunner {
+            fn spawn(&self, spec: &CommandSpec) -> io::Result<RunningCommand> {
+                self.started.send(()).ok();
+                self.release
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .recv()
+                    .ok();
+                RecordingRunner::always_success().spawn(spec)
+            }
+        }
+
+        let (dir, repo) = init_repo();
+        let root = commit_file(&repo, "main", "a.txt", b"1\n", "root\n", None);
+        let tip = commit_file(&repo, "main", "b.txt", b"2\n", "tip\n", Some(root));
+        let main_before = resolve_ref(repo.git_dir(), "refs/heads/main").expect("main");
+        let tip_tree = parse_commit(&repo.odb().read(&tip).expect("read").data)
+            .expect("parse")
+            .tree;
+        let mut edits = HistoryEdits::new();
+        edits.insert(
+            tip,
+            CommitEdit::Rewrite {
+                tree: Some(tip_tree),
+                message: Some("tip'\n".into()),
+                author: None,
+                parents: None,
+            },
+        );
+        let mut plan = plan_rewrite(&repo, &edits, &test_rewrite()).expect("plan");
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let runner = Arc::new(PausedRunner {
+            started: started_tx,
+            release: Arc::new(std::sync::Mutex::new(release_rx)),
+        });
+        let merge = dir.path().join(".git/rebase-merge");
+        let spec = ExecSpec {
+            commands: vec!["true".into()],
+        };
+        thread::scope(|scope| {
+            let handle = scope.spawn(|| {
+                verify_rebase_with_exec(&repo, &mut plan, &spec, &test_rewrite(), runner.as_ref())
+            });
+            started_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("exec command should start");
+            assert!(merge.join("grit-exec").is_file(), "grit-exec must exist");
+            assert_ne!(
+                resolve_ref(repo.git_dir(), "HEAD").expect("head"),
+                tip,
+                "HEAD should be detached at the replay tip while the command runs"
+            );
+            assert_eq!(
+                resolve_ref(repo.git_dir(), "refs/heads/main").expect("main"),
+                main_before,
+                "branch ref must stay at the pre-rebase tip during exec"
+            );
+            release_tx.send(()).expect("release command");
+            handle.join().expect("join")
+        })
+        .expect("exec completes");
+        assert!(
+            !merge.exists(),
+            "successful exec must clear rebase-merge after restore"
         );
     }
 
