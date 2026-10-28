@@ -21,11 +21,12 @@ use crate::diff::structured::{
 use crate::diff::{
     collect_files_for_target, hunk_diff_bundle, imara_unified_hunk_slices,
     read_worktree_side_bytes_for_diff, unified_hunk_body_for_diff_options,
-    unstaged_file_diffs_with_peer_hunks, unstaged_raw_changes_with_peer_hunks, DiffOptions,
-    DiffStatus, DiffTarget, FileChange, FileDiff,
+    unstaged_file_diffs_with_peer_hunks, unstaged_raw_changes_with_peer_hunks,
+    unstaged_raw_changes_with_peer_hunks_in, DiffOptions, DiffStatus, DiffTarget, FileChange,
+    FileDiff,
 };
 use crate::error::{ApplyError, Error};
-use crate::index::{MODE_EXECUTABLE, MODE_GITLINK, MODE_REGULAR};
+use crate::index::{Index, IndexLock, MODE_EXECUTABLE, MODE_GITLINK, MODE_REGULAR};
 use crate::objects::FileMode;
 use crate::objects::{parse_commit, ObjectId, ObjectKind};
 use crate::porcelain::checkout::{
@@ -307,6 +308,19 @@ fn resolve_selection_with_staged(
     pathspecs: &[String],
     diff_options: DiffOptions,
 ) -> std::result::Result<ResolvedSelection, HunkSelectError> {
+    resolve_selection_in(repo, None, side, selection, pathspecs, diff_options)
+}
+
+/// [`resolve_selection_with_staged`], resolving unstaged hunk ids against `index` when the
+/// caller already holds the repository's index (it is loaded otherwise).
+fn resolve_selection_in(
+    repo: &Repository,
+    index: Option<&mut Index>,
+    side: DiffSide,
+    selection: &HunkSelection,
+    pathspecs: &[String],
+    diff_options: DiffOptions,
+) -> std::result::Result<ResolvedSelection, HunkSelectError> {
     if selection.ids.is_empty() && selection.ranges.is_empty() {
         return Ok(ResolvedSelection::default());
     }
@@ -318,7 +332,7 @@ fn resolve_selection_with_staged(
             let mut resolved = if requested.is_empty() {
                 ResolvedSelection::default()
             } else {
-                resolve_unstaged(repo, pathspecs, opts.clone(), &requested)?
+                resolve_unstaged(repo, index, pathspecs, opts.clone(), &requested)?
             };
             if !selection.ranges.is_empty() {
                 let line_part =
@@ -357,12 +371,17 @@ fn resolve_staged(
 
 fn resolve_unstaged(
     repo: &Repository,
+    index: Option<&mut Index>,
     pathspecs: &[String],
     opts: DiffOptions,
     requested: &HashSet<HunkId>,
 ) -> std::result::Result<ResolvedSelection, HunkSelectError> {
-    let (changes, peer_hunks) =
-        unstaged_raw_changes_with_peer_hunks(repo, pathspecs, opts.clone())?;
+    let (changes, peer_hunks) = match index {
+        Some(index) => {
+            unstaged_raw_changes_with_peer_hunks_in(repo, index, pathspecs, opts.clone())?
+        }
+        None => unstaged_raw_changes_with_peer_hunks(repo, pathspecs, opts.clone())?,
+    };
     let mut patches = Vec::new();
     let mut staged_hunks = BTreeMap::new();
     let mut found = HashSet::new();
@@ -1130,19 +1149,30 @@ pub fn restore_hunks(
         outcome.restored_lines = resolved.selected_lines;
     }
     if restore_worktree {
-        let resolved = resolve_selection_with_staged(
+        // One index read serves the diff, the plan and the stat refresh; taking the lock first
+        // keeps that read current for the (rare) refresh that has to be written.
+        let handle = repo.index_handle();
+        let lock = if dry_run {
+            None
+        } else {
+            Some(handle.begin_update()?)
+        };
+        let mut index = handle.load()?;
+        let resolved = resolve_selection_in(
             repo,
+            Some(&mut index),
             DiffSide::Unstaged,
             selection,
             pathspecs,
             diff_opts,
         )?;
-        let planned = plan_worktree_reverse(repo, &resolved.patches)?;
-        if !dry_run {
-            commit_worktree_reverse(repo, &planned, &mut outcome)?;
-        } else {
-            for plan in &planned {
-                push_restored_path(&mut outcome.restored, &plan.path);
+        let planned = plan_worktree_reverse(repo, &index, &resolved.patches)?;
+        match lock {
+            Some(lock) => commit_worktree_reverse(repo, lock, index, &planned, &mut outcome)?,
+            None => {
+                for plan in &planned {
+                    push_restored_path(&mut outcome.restored, &plan.path);
+                }
             }
         }
         merge_restored_maps(&mut outcome.restored_hunks, resolved.selected_hunks);
@@ -1183,11 +1213,11 @@ struct WorktreeReversePlan {
 
 fn plan_worktree_reverse(
     repo: &Repository,
+    index: &Index,
     patches: &[FilePatch],
 ) -> std::result::Result<Vec<WorktreeReversePlan>, HunkSelectError> {
     let work_tree = repo.work_tree().ok_or(Error::RequiresWorkTree)?;
-    let index = repo.index_handle().load().map_err(HunkSelectError::from)?;
-    let rules = WorktreeRules::from_repository(repo, &index).map_err(HunkSelectError::from)?;
+    let rules = WorktreeRules::from_repository(repo, index).map_err(HunkSelectError::from)?;
     let config = repo.config().map_err(HunkSelectError::from)?;
     let mut out = Vec::with_capacity(patches.len());
     for patch in patches {
@@ -1229,15 +1259,19 @@ fn plan_worktree_reverse(
     Ok(out)
 }
 
+/// Write the planned worktree files, then refresh their index stat data.
+///
+/// `index` must have been loaded while holding `lock`. It is only written when the refresh
+/// changed an entry (a restore that leaves the file different from the index changes nothing,
+/// as with `git apply`); otherwise the lock is released untouched.
 fn commit_worktree_reverse(
     repo: &Repository,
+    mut lock: IndexLock,
+    mut index: Index,
     planned: &[WorktreeReversePlan],
     outcome: &mut RestoreHunksOutcome,
 ) -> std::result::Result<(), HunkSelectError> {
     let work_tree = repo.work_tree().ok_or(Error::RequiresWorkTree)?;
-    let handle = repo.index_handle();
-    let mut lock = handle.begin_update().map_err(HunkSelectError::from)?;
-    let mut index = handle.load().map_err(HunkSelectError::from)?;
     let rules = WorktreeRules::from_repository(repo, &index).map_err(HunkSelectError::from)?;
     let mut dir_cache = LeadingDirCache::new();
     for plan in planned {
@@ -1266,8 +1300,10 @@ fn commit_worktree_reverse(
         )?;
         push_restored_path(&mut outcome.restored, &plan.path);
     }
-    refresh_partial_restore_index_stats(repo, work_tree, &mut index, &outcome.restored)?;
-    handle.commit_update(&mut lock, &mut index, false)?;
+    if refresh_partial_restore_index_stats(repo, work_tree, &mut index, &outcome.restored)? {
+        repo.index_handle()
+            .commit_update(&mut lock, &mut index, false)?;
+    }
     Ok(())
 }
 
@@ -1283,15 +1319,17 @@ fn head_tree_oid(repo: &Repository) -> std::result::Result<Option<ObjectId>, Hun
     }
 }
 
+/// Returns whether any index entry changed.
 fn refresh_partial_restore_index_stats(
     repo: &Repository,
     work_tree: &StdPath,
-    index: &mut crate::index::Index,
+    index: &mut Index,
     restored: &[String],
-) -> std::result::Result<(), HunkSelectError> {
+) -> std::result::Result<bool, HunkSelectError> {
     let touched: BTreeSet<&str> = restored.iter().map(String::as_str).collect();
-    refresh_stage0_index_stats_for_paths(repo, work_tree, index, &touched)?;
-    Ok(())
+    Ok(refresh_stage0_index_stats_for_paths(
+        repo, work_tree, index, &touched,
+    )?)
 }
 
 /// Options for [`reverse_apply_patches_to_worktree`].
@@ -1975,7 +2013,7 @@ mod tests {
             },
         )
         .unwrap();
-        let err = plan_worktree_reverse(&repo, &[one_line_patch("f.txt")])
+        let err = plan_worktree_reverse(&repo, &Index::new(), &[one_line_patch("f.txt")])
             .err()
             .unwrap();
         match err {
@@ -1993,7 +2031,9 @@ mod tests {
 
         let mut gitlink = one_line_patch("sub");
         gitlink.new_mode = Some("160000".into());
-        let err = plan_worktree_reverse(&repo, &[gitlink]).err().unwrap();
+        let err = plan_worktree_reverse(&repo, &Index::new(), &[gitlink])
+            .err()
+            .unwrap();
         assert!(
             matches!(&err, HunkSelectError::Gitlink { path } if path == "sub"),
             "{err:?}"
@@ -2002,7 +2042,9 @@ mod tests {
         let mut pathless = one_line_patch("f.txt");
         pathless.old_path = None;
         pathless.new_path = None;
-        let err = plan_worktree_reverse(&repo, &[pathless]).err().unwrap();
+        let err = plan_worktree_reverse(&repo, &Index::new(), &[pathless])
+            .err()
+            .unwrap();
         assert!(matches!(err, HunkSelectError::MissingPath), "{err:?}");
     }
 

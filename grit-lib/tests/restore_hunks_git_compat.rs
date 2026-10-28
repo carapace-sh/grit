@@ -170,3 +170,133 @@ fn ident_expansion_uses_the_restored_content_id_without_storing_it() {
         "1\t1\tid.txt"
     );
 }
+
+fn commit_with_edits(root: &Path, path: &str, lines: usize, every: usize) -> (String, String) {
+    let original: String = (0..lines).map(|i| format!("line{i}\n")).collect();
+    fs::write(root.join(path), &original).unwrap();
+    git(root, &["add", path]);
+    git(root, &["commit", "-qm", "base"]);
+    let edited: String = (0..lines)
+        .map(|i| {
+            if i % every == 0 {
+                format!("LINE{i}\n")
+            } else {
+                format!("line{i}\n")
+            }
+        })
+        .collect();
+    fs::write(root.join(path), &edited).unwrap();
+    (original, edited)
+}
+
+/// `(size, mtime seconds)` git records for `path` in the index, read without a refresh.
+fn index_stat(root: &Path, path: &str) -> (u64, u64) {
+    let debug = git(root, &["ls-files", "--debug", "--", path]);
+    let field = |name: &str| -> u64 {
+        let line = debug
+            .lines()
+            .map(str::trim)
+            .find(|l| l.starts_with(name))
+            .unwrap_or_else(|| panic!("{name} in {debug}"));
+        let value = line[name.len()..].trim();
+        value
+            .split(|c: char| c == ':' || c.is_whitespace())
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap()
+    };
+    (field("size:"), field("mtime:"))
+}
+
+#[test]
+fn partial_restore_leaves_the_index_file_untouched() {
+    let dir = init_repo();
+    let root = dir.path();
+    commit_with_edits(root, "f.txt", 400, 50);
+    // Restore in a later second than the commit so the entry is not racily clean: a racy entry
+    // whose stat still matches is invalidated, and that change is written.
+    std::thread::sleep(std::time::Duration::from_millis(1_100));
+    let index_path = root.join(".git/index");
+    let index_before = fs::read(&index_path).unwrap();
+    let inode_before = fs::metadata(&index_path).unwrap();
+
+    let repo = open(root);
+    let ids = unstaged_ids(&repo, "f.txt");
+    assert_eq!(ids.len(), 8);
+    restore(&repo, ids[..4].to_vec(), "f.txt");
+
+    assert_eq!(fs::read(&index_path).unwrap(), index_before);
+    let inode_after = fs::metadata(&index_path).unwrap();
+    assert_eq!(
+        inode_after.modified().unwrap(),
+        inode_before.modified().unwrap(),
+        "a restore that leaves the file modified must not rewrite the index"
+    );
+    assert!(!root.join(".git/index.lock").exists());
+    assert_eq!(
+        git(root, &["diff", "--numstat", "--", "f.txt"]).trim(),
+        "4\t4\tf.txt"
+    );
+    let (fsck_ok, _) = git_status_ok(root, &["fsck", "--strict"], None);
+    assert!(fsck_ok, "git fsck --strict");
+}
+
+#[test]
+fn full_restore_writes_refreshed_stat_data_git_reads() {
+    let dir = init_repo();
+    let root = dir.path();
+    let (original, _) = commit_with_edits(root, "f.txt", 400, 50);
+    // Make the recorded stat data stale even for an identical size.
+    std::thread::sleep(std::time::Duration::from_millis(1_100));
+
+    let repo = open(root);
+    let ids = unstaged_ids(&repo, "f.txt");
+    restore(&repo, ids, "f.txt");
+
+    assert_eq!(fs::read_to_string(root.join("f.txt")).unwrap(), original);
+    let meta = fs::metadata(root.join("f.txt")).unwrap();
+    let mtime = meta
+        .modified()
+        .unwrap()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    assert_eq!(index_stat(root, "f.txt"), (meta.len(), mtime));
+    assert!(!root.join(".git/index.lock").exists());
+    assert_eq!(git(root, &["diff-files", "--name-only"]).trim(), "");
+}
+
+#[test]
+fn held_index_lock_fails_before_touching_the_worktree() {
+    let dir = init_repo();
+    let root = dir.path();
+    let (_, edited) = commit_with_edits(root, "f.txt", 200, 50);
+    let repo = open(root);
+    let ids = unstaged_ids(&repo, "f.txt");
+    fs::write(root.join(".git/index.lock"), b"").unwrap();
+
+    let selection = HunkSelection {
+        ids: ids[..1].to_vec(),
+        ranges: Vec::new(),
+    };
+    let result = restore_hunks(
+        &repo,
+        &selection,
+        &["f.txt".to_string()],
+        false,
+        true,
+        false,
+    );
+    assert!(result.is_err(), "restore must not run under a held lock");
+    assert_eq!(fs::read_to_string(root.join("f.txt")).unwrap(), edited);
+    assert!(
+        root.join(".git/index.lock").exists(),
+        "another writer's lock is left in place"
+    );
+
+    let dry = restore_hunks(&repo, &selection, &["f.txt".to_string()], false, true, true)
+        .expect("dry run needs no lock");
+    assert_eq!(dry.restored, vec!["f.txt".to_string()]);
+    assert_eq!(fs::read_to_string(root.join("f.txt")).unwrap(), edited);
+}
