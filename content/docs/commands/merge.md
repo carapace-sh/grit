@@ -55,6 +55,8 @@ With `--json` the error carries the hook's output and the same `hint`:
 
 After a fast-forward or a merge commit, grit runs the `post-merge` hook with `0`; after `--squash` it passes `1`, as Git does. The hook does not run when the branch is already up to date, when the merge stops on conflicts, with `--no-commit`, or for `--check` and `--dry-run`. `grit merge --continue` runs `post-commit` like [`grit commit`](../commit/), not `post-merge` (Git behaves the same). The hook's exit status never changes the result. See [`grit hooks`](../hooks/).
 
+Every merge records the commit the branch was on in `ORIG_HEAD`, as `git merge` does: an up-to-date merge, a fast-forward, a merge commit, `--squash`, `--no-commit`, a merge that stops on conflicts, and a `--ff-only` merge refused because it cannot fast-forward. It replaces any earlier value and stays after the merge finishes, `--continue` or `--abort`, so `grit reset --hard ORIG_HEAD` undoes a merge you regret. `--check` and `--dry-run` leave it alone.
+
 `<rev>` can be any branch, tag or commit: a local branch, a remote-tracking branch such as `origin/main`, a tag such as `v1.2` (annotated tags merge the commit they point at), a full or abbreviated commit id, or a revision expression such as `topic~2`, `origin/main^` or `ORIG_HEAD`. A name is looked up as a local branch first, then a remote-tracking branch, then a tag, then as a revision. Ranges (`a..b`, `a...b`) and trees or blobs are refused.
 
 Literal braces are allowed in ref names: `grit merge 'foo{bar'` merges that branch, while `grit merge 'foo{bar...main'` refuses the range without moving HEAD. Dots within selectors, such as `main^{/release..candidate}`, remain part of a single revision.

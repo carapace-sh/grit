@@ -36,6 +36,8 @@ In a sparse checkout (`git sparse-checkout`), `--hard` and `--mixed` keep paths 
 
 A successful reset (any mode except `--dry-run`) ends an in-progress merge, cherry-pick, or revert the same way Git's `reset` does: operation sentinel files such as `MERGE_HEAD` and `CHERRY_PICK_HEAD` are removed.
 
+Every successful reset, in any mode and also to the commit `HEAD` is already on, records the commit `HEAD` was on before it in `ORIG_HEAD` (as `git reset` does, with no reflog), replacing any earlier value. `grit reset ORIG_HEAD` with the same mode undoes the reset, and `grit reset --hard ORIG_HEAD` is the usual way to undo a merge, rebase or pull, which record `ORIG_HEAD` too. `--dry-run` and a refused reset leave `ORIG_HEAD` alone.
+
 When resetting backward, grit lists commits that would become unreachable (not reachable from `<rev>` or any other ref, including branches, tags, remotes, stash, and other worktrees). A warning is printed when any would be orphaned. The check usually stays near the commits being left behind, so undoing the last commit stays fast on deep repositories; annotated tags are peeled from `packed-refs` when it records their targets, and without a commit-graph the tip commits of hundreds of refs are read in parallel, headers only. With a commit-graph the count is exact. Without one, the walk ends by commit date like Git's `git rev-list <previous> --not <refs>`, so under heavy clock skew (a ref that reaches a commit through history dated more than a day before it) the count can be wrong.
 
 `<rev>` is any revision Grit understands: branch name, `HEAD~1`, full or abbreviated commit id, and so on.

@@ -1474,7 +1474,8 @@ fn resolved_not_staged_paths(repo: &Repository, index: &Index, unmerged: &[Strin
     resolved
 }
 
-/// Abort an in-progress merge, restoring index and worktree to [`read_orig_head`].
+/// Abort an in-progress merge, restoring index and worktree to
+/// [`read_orig_head_for_repository`].
 ///
 /// A merge autostash recorded in `MERGE_AUTOSTASH` (left by a pull whose merge commit a hook
 /// refused) is applied again afterwards, as `git merge --abort` does.
