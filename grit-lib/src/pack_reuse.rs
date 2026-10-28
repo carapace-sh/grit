@@ -18,7 +18,9 @@ use crate::pack::{
 };
 use crate::pack_index::PackIndex;
 use crate::pack_map::PackData;
-use crate::pack_object_select::try_bitmap_reachable_for_upload;
+use crate::pack_object_select::{
+    included_tag_chains, try_bitmap_reachable_for_upload, TagCandidate,
+};
 use crate::pack_objects::{write_delta_pack_stream, PackBuildOptions, PackProgress, PackStats};
 use crate::repo::Repository;
 use crate::rev_list::ObjectFilter;
@@ -134,6 +136,38 @@ pub fn try_write_streaming_pack(
     progress: &mut dyn FnMut(PackProgress),
     w: &mut dyn Write,
 ) -> Result<Option<PackStats>> {
+    try_write_streaming_pack_including_tags(
+        repo,
+        wants,
+        haves,
+        source_shallow,
+        have_shallow,
+        filter,
+        &[],
+        opts,
+        progress,
+        w,
+    )
+}
+
+/// [`try_write_streaming_pack`] that also packs each of `include_tags` whose peeled
+/// object the bitmap send set holds (`include-tag`).
+///
+/// Added tags are planned like any object outside the reuse bitmap, so they are
+/// written whole and never duplicate an object the client asked for.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_write_streaming_pack_including_tags(
+    repo: &Repository,
+    wants: &[ObjectId],
+    haves: &[ObjectId],
+    source_shallow: &HashSet<ObjectId>,
+    have_shallow: &HashSet<ObjectId>,
+    filter: Option<&ObjectFilter>,
+    include_tags: &[TagCandidate],
+    opts: &PackBuildOptions,
+    progress: &mut dyn FnMut(PackProgress),
+    w: &mut dyn Write,
+) -> Result<Option<PackStats>> {
     if !source_shallow.is_empty() || !have_shallow.is_empty() {
         return Ok(None);
     }
@@ -152,7 +186,10 @@ pub fn try_write_streaming_pack(
     let Some(pack) = packs.into_iter().next() else {
         return Ok(None);
     };
-    let send: Vec<ObjectId> = send_set.iter_grouped_by_kind().collect();
+    let mut send: Vec<ObjectId> = send_set.iter_grouped_by_kind().collect();
+    send.extend(included_tag_chains(repo.odb(), include_tags, |oid| {
+        send_set.contains(oid)
+    })?);
     progress(PackProgress::Enumerated { total: send.len() });
 
     let send_bits = send_set.reuse_send_bits();

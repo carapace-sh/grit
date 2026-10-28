@@ -20,7 +20,7 @@ use crate::objects::{
     parse_tag, HashAlgo, ObjectId, ObjectInfo, ObjectKind, OidHashMap, OidHashSet, TreeRefIter,
 };
 use crate::odb::Odb;
-use crate::pack_object_select::{HaveBoundary, NameTrees};
+use crate::pack_object_select::{append_included_tags, HaveBoundary, NameTrees, TagCandidate};
 use crate::parallel::{try_par_map_force, ParallelHashError};
 use crate::progress::CancelSignal;
 use crate::repo::Repository;
@@ -485,6 +485,7 @@ pub(crate) fn write_pack_for_push_with_cancel(
             None,
             opts,
             HaveBoundary::TipsOnly,
+            &[],
             w,
             stop,
         )
@@ -537,13 +538,15 @@ fn build_pack_with_shallow_filter_and_boundary(
         filter,
         opts,
         have_boundary,
+        &[],
         &mut pack,
         &CancelSignal::never(),
     )?;
     Ok(pack)
 }
 
-/// Streaming form of [`build_pack_with_shallow_and_filter`].
+/// Streaming form of [`build_pack_with_shallow_and_filter`]; `include_tags` are added
+/// when the objects they peel to are selected.
 #[allow(clippy::too_many_arguments)]
 fn write_pack_with_shallow_and_filter(
     odb: &Odb,
@@ -554,10 +557,11 @@ fn write_pack_with_shallow_and_filter(
     filter: Option<&ObjectFilter>,
     opts: &PackBuildOptions,
     have_boundary: HaveBoundary,
+    include_tags: &[TagCandidate],
     w: &mut dyn Write,
     stop: &CancelSignal<'_>,
 ) -> Result<PackStats> {
-    let selection = crate::pack_object_select::enumerate_pack_objects_naming(
+    let mut selection = crate::pack_object_select::enumerate_pack_objects_naming(
         odb,
         wants,
         haves,
@@ -573,6 +577,7 @@ fn write_pack_with_shallow_and_filter(
         NameTrees::for_delta_search(opts),
         stop,
     )?;
+    append_included_tags(odb, &mut selection.send, include_tags)?;
     if !opts.delta {
         let bytes = serialize_pack(odb, &selection.send, opts)?;
         stop.poll()?;
@@ -623,6 +628,7 @@ pub fn write_upload_pack_stream(
         source_shallow,
         have_shallow,
         filter,
+        &[],
         opts,
         progress,
         w,
@@ -630,7 +636,9 @@ pub fn write_upload_pack_stream(
     )
 }
 
-/// [`write_upload_pack_stream`], stopping object enumeration when `stop` fires.
+/// [`write_upload_pack_stream`], stopping object enumeration when `stop` fires, that
+/// also packs each of `include_tags` whose peeled object is among the objects sent
+/// (`include-tag`), on the walk and reuse paths alike.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn write_upload_pack_stream_with_cancel(
     repo: &Repository,
@@ -639,6 +647,7 @@ pub(crate) fn write_upload_pack_stream_with_cancel(
     source_shallow: &HashSet<ObjectId>,
     have_shallow: &HashSet<ObjectId>,
     filter: Option<&ObjectFilter>,
+    include_tags: &[TagCandidate],
     opts: &PackBuildOptions,
     progress: &mut dyn FnMut(PackProgress),
     w: &mut dyn Write,
@@ -652,6 +661,7 @@ pub(crate) fn write_upload_pack_stream_with_cancel(
             source_shallow,
             have_shallow,
             filter,
+            include_tags,
             opts,
             progress,
             w,
@@ -668,19 +678,21 @@ fn write_upload_pack_stream_in_context(
     source_shallow: &HashSet<ObjectId>,
     have_shallow: &HashSet<ObjectId>,
     filter: Option<&ObjectFilter>,
+    include_tags: &[TagCandidate],
     opts: &PackBuildOptions,
     progress: &mut dyn FnMut(PackProgress),
     w: &mut dyn Write,
     stop: &CancelSignal<'_>,
 ) -> Result<PackStats> {
     if opts.use_bitmaps && filter.is_none() {
-        if let Some(stats) = crate::pack_reuse::try_write_streaming_pack(
+        if let Some(stats) = crate::pack_reuse::try_write_streaming_pack_including_tags(
             repo,
             wants,
             haves,
             source_shallow,
             have_shallow,
             filter,
+            include_tags,
             opts,
             progress,
             w,
@@ -699,6 +711,7 @@ fn write_upload_pack_stream_in_context(
         filter,
         opts,
         HaveBoundary::TipsOnly,
+        include_tags,
         w,
         stop,
     )

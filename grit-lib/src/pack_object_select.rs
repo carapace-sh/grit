@@ -7,10 +7,10 @@ use std::sync::Arc;
 use crate::bitmap_walk::{BitmapWalkError, ReachabilityQuery, ReachableSet};
 use crate::commit_graph_file::{CommitGraphChain, UNRANKED_GENERATION};
 use crate::environment::RepositoryOptions;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::objects::{
-    oid_hash_map, oid_hash_set, parse_tag, tag_object_line_oid, CommitRef, Object, ObjectId,
-    ObjectKind, OidHashMap, OidHashSet, TreeRefIter,
+    oid_hash_map, oid_hash_set, oid_hash_set_with_capacity, parse_tag, tag_object_line_oid,
+    CommitRef, Object, ObjectId, ObjectKind, OidHashMap, OidHashSet, TreeRefIter,
 };
 use crate::odb::Odb;
 use crate::pack_bitmap::BitmapIndex;
@@ -310,6 +310,105 @@ fn walk_enumeration(
         peer_held,
         name_hashes,
     })
+}
+
+/// An annotated tag ref that `include-tag` may add to a fetch pack.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TagCandidate {
+    /// The tag object the ref names.
+    pub(crate) tag: ObjectId,
+    /// The non-tag object the tag chain ends at (the advertised `^{}` value).
+    pub(crate) peeled: ObjectId,
+}
+
+/// Append to `send` every candidate tag whose peeled object `send` already holds,
+/// with each tag object of its chain, the way `pack-objects --include-tag` does.
+///
+/// Cost follows the size of `send` and the number of candidates, never the history
+/// behind them: `send` is scanned once (a second time only when a chain passes
+/// through a tag no candidate names) and only the added tags are read.
+///
+/// # Parameters
+///
+/// - `odb`: the database the added tag objects are read from.
+/// - `send`: the objects the pack holds; added tags are appended after them.
+/// - `candidates`: the annotated tag refs the client may follow.
+///
+/// # Errors
+///
+/// [`Error::ObjectNotFound`] or [`Error::CorruptObject`] for an unreadable tag in a
+/// chain that is added.
+pub(crate) fn append_included_tags(
+    odb: &Odb,
+    send: &mut Vec<ObjectId>,
+    candidates: &[TagCandidate],
+) -> Result<()> {
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    let mut named = oid_hash_set_with_capacity(candidates.len() * 2);
+    for c in candidates {
+        named.insert(c.tag);
+        named.insert(c.peeled);
+    }
+    let present: OidHashSet = send
+        .iter()
+        .filter(|o| named.contains(*o))
+        .copied()
+        .collect();
+    let mut added = included_tag_chains(odb, candidates, |oid| present.contains(oid))?;
+    let unnamed: OidHashSet = added
+        .iter()
+        .filter(|o| !named.contains(*o))
+        .copied()
+        .collect();
+    if !unnamed.is_empty() {
+        let already_sent: OidHashSet = send
+            .iter()
+            .filter(|o| unnamed.contains(*o))
+            .copied()
+            .collect();
+        added.retain(|oid| !already_sent.contains(oid));
+    }
+    send.extend(added);
+    Ok(())
+}
+
+/// The tag objects `include-tag` adds for `candidates` to a pack whose membership
+/// `in_pack` answers.
+///
+/// A candidate qualifies when its peeled object is in the pack and its tag is not;
+/// its whole chain (tag of a tag) is then returned, minus objects already packed.
+/// `in_pack` must be exact for candidate tags and peeled ids; for unnamed chain
+/// tags a `false` only means the caller has to deduplicate them.
+///
+/// # Errors
+///
+/// [`Error::ObjectNotFound`] or [`Error::CorruptObject`] for an unreadable tag in a
+/// qualifying chain.
+pub(crate) fn included_tag_chains(
+    odb: &Odb,
+    candidates: &[TagCandidate],
+    in_pack: impl Fn(&ObjectId) -> bool,
+) -> Result<Vec<ObjectId>> {
+    let mut seen = oid_hash_set();
+    let mut out = Vec::new();
+    for c in candidates {
+        if !in_pack(&c.peeled) || in_pack(&c.tag) {
+            continue;
+        }
+        let mut current = c.tag;
+        while current != c.peeled && seen.insert(current) {
+            if !in_pack(&current) {
+                out.push(current);
+            }
+            let tag = odb.read(&current)?;
+            current = tag_object_line_oid(&tag.data).ok_or_else(|| {
+                Error::CorruptObject(format!("tag {current} has no valid object header"))
+            })?;
+        }
+    }
+    Ok(out)
 }
 
 const SEND_PACK_REACH_WANT: u8 = 1;

@@ -11,12 +11,13 @@ use super::{
 };
 use crate::config::ConfigSet;
 use crate::objects::{ObjectId, ObjectKind};
-use crate::pack_objects::{write_upload_pack_stream, PackProgress};
+use crate::pack_object_select::TagCandidate;
+use crate::pack_objects::{write_upload_pack_stream_with_cancel, PackProgress};
 use crate::pkt_line::SidebandChannel1Writer;
 use crate::repo::Repository;
 use crate::rev_list::ObjectFilter;
 use crate::transfer::PackBuildOptions;
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
 use std::io::{Read, Write};
 
 /// Capabilities offered in a v0/v1 advertisement, before the per-repository ones.
@@ -913,13 +914,11 @@ fn write_response_pack(
     output: &mut dyn Write,
     sideband: bool,
 ) -> Result<()> {
-    let mut pack_wants = input.wants.to_vec();
-    if input.caps.contains("include-tag") {
-        pack_wants.extend(included_tags(&input)?);
-    }
-    pack_wants.sort();
-    pack_wants.dedup();
-
+    let include_tags = if input.caps.contains("include-tag") {
+        tag_candidates(input.refs)
+    } else {
+        Vec::new()
+    };
     let cfg = input.repo.config().ok();
     let pack_opts = PackBuildOptions::for_serve(
         cfg.as_deref(),
@@ -928,16 +927,18 @@ fn write_response_pack(
     );
     let mut progress = |_ev: PackProgress| {};
     let mut write = |w: &mut dyn Write| {
-        write_upload_pack_stream(
+        write_upload_pack_stream_with_cancel(
             input.repo,
-            &pack_wants,
+            input.wants,
             input.common,
             input.source_shallow,
             input.have_shallow,
             input.filter,
+            &include_tags,
             &pack_opts,
             &mut progress,
             w,
+            &crate::progress::CancelSignal::never(),
         )
     };
     if !sideband {
@@ -950,67 +951,16 @@ fn write_response_pack(
     write_flush(output)
 }
 
-/// Annotated tags the client did not ask for but whose target commit is being
-/// sent, so the client can follow tags without a second request.
+/// The annotated tags under `refs/tags/` that `include-tag` may add to the pack.
 ///
-/// Only tags that peel to commits are considered. Both walks honor the shallow
-/// grafts of their side, so a shallow fetch only picks up tags on the commits
-/// it actually sends.
-fn included_tags(input: &ResponsePackInput<'_>) -> Result<Vec<ObjectId>> {
-    let repo = input.repo;
-    let want_set: HashSet<ObjectId> = input.wants.iter().copied().collect();
-    let candidates: Vec<&AdvertisedRef> = input
-        .refs
-        .iter()
-        .filter(|r| r.name.starts_with("refs/tags/") && r.peeled.is_some())
-        .filter(|r| !want_set.contains(&r.oid))
-        .collect();
-    if candidates.is_empty() {
-        return Ok(Vec::new());
-    }
-    let have_commits = commit_closure(repo, input.common, &HashSet::new(), input.have_shallow)?;
-    let sent_commits = commit_closure(repo, input.wants, &have_commits, input.source_shallow)?;
-    Ok(candidates
-        .into_iter()
-        .filter(|r| r.peeled.is_some_and(|p| sent_commits.contains(&p)))
-        .map(|r| r.oid)
-        .collect())
-}
-
-/// Commits reachable from `tips` (peeling tags), not descending into `stop`.
-/// Commits in `grafts` are included but their parents are not walked.
-fn commit_closure(
-    repo: &Repository,
-    tips: &[ObjectId],
-    stop: &HashSet<ObjectId>,
-    grafts: &HashSet<ObjectId>,
-) -> Result<HashSet<ObjectId>> {
-    let mut seen = HashSet::new();
-    let mut queue: VecDeque<ObjectId> = VecDeque::new();
-    for tip in tips {
-        let Ok(oid) = repo.odb().peel_tags(*tip).map(|(p, _)| p) else {
-            continue;
-        };
-        queue.push_back(oid);
-    }
-    while let Some(oid) = queue.pop_front() {
-        if stop.contains(&oid) || !seen.insert(oid) {
-            continue;
-        }
-        let Ok(obj) = repo.odb().read(&oid) else {
-            continue;
-        };
-        if obj.kind != ObjectKind::Commit {
-            seen.remove(&oid);
-            continue;
-        }
-        if grafts.contains(&oid) {
-            continue;
-        }
-        let commit = crate::objects::parse_commit(&obj.data)?;
-        queue.extend(commit.parents);
-    }
-    Ok(seen)
+/// The pack writer adds a tag only when the object it peels to (a commit, tree or
+/// blob) is among the objects being sent, so tags on history the client already has
+/// or beyond a shallow boundary stay out, and no history is walked to decide it.
+fn tag_candidates(refs: &[AdvertisedRef]) -> Vec<TagCandidate> {
+    refs.iter()
+        .filter(|r| r.name.starts_with("refs/tags/"))
+        .filter_map(|r| r.peeled.map(|peeled| TagCandidate { tag: r.oid, peeled }))
+        .collect()
 }
 
 #[cfg(test)]
@@ -1033,10 +983,23 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         Repository::init(dir.path(), &InitOptions::new().with_bare(true)).unwrap();
         let repo = Repository::open(dir.path(), &RepositoryOptions::empty()).unwrap();
-        let tree = repo
-            .odb()
-            .write_loose_materialize(ObjectKind::Tree, b"")
-            .unwrap();
+        let (commits, tags) = write_history(&repo, n, tagged);
+        Fixture {
+            _dir: dir,
+            repo,
+            commits,
+            tags,
+        }
+    }
+
+    /// Write `n` linear commits and the annotated tags `t<i>` for `tagged` into `repo`.
+    fn write_history(
+        repo: &Repository,
+        n: usize,
+        tagged: &[usize],
+    ) -> (Vec<ObjectId>, Vec<AdvertisedRef>) {
+        let odb = repo.odb();
+        let tree = odb.write(ObjectKind::Tree, b"").unwrap();
         let mut commits: Vec<ObjectId> = Vec::new();
         for i in 0..n {
             let parent = commits
@@ -1046,11 +1009,7 @@ mod tests {
             let body = format!(
                 "tree {tree}\n{parent}author T <t@x> {i} +0000\ncommitter T <t@x> {i} +0000\n\nc{i}\n"
             );
-            commits.push(
-                repo.odb()
-                    .write_loose_materialize(ObjectKind::Commit, body.as_bytes())
-                    .unwrap(),
-            );
+            commits.push(odb.write(ObjectKind::Commit, body.as_bytes()).unwrap());
         }
         let tags = tagged
             .iter()
@@ -1061,20 +1020,35 @@ mod tests {
                 );
                 AdvertisedRef {
                     name: format!("refs/tags/t{i}"),
-                    oid: repo
-                        .odb()
-                        .write_loose_materialize(ObjectKind::Tag, body.as_bytes())
-                        .unwrap(),
+                    oid: odb.write(ObjectKind::Tag, body.as_bytes()).unwrap(),
                     peeled: Some(commits[i]),
                 }
             })
             .collect();
-        Fixture {
-            _dir: dir,
-            repo,
-            commits,
-            tags,
-        }
+        (commits, tags)
+    }
+
+    /// Answer `input` with `include-tag` and return the tags of `input.refs` the
+    /// pack holds, sorted.
+    fn packed_tags(input: ResponsePackInput<'_>) -> Vec<ObjectId> {
+        let refs = input.refs;
+        let mut pack = Vec::new();
+        write_response_pack(input, &mut pack, false).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let unpacked = crate::odb::Odb::new(dir.path());
+        crate::unpack_objects::unpack_objects(
+            &mut pack.as_slice(),
+            &unpacked,
+            &crate::unpack_objects::UnpackOptions::default(),
+        )
+        .unwrap();
+        let mut tags: Vec<ObjectId> = refs
+            .iter()
+            .map(|r| r.oid)
+            .filter(|oid| unpacked.contains(oid).unwrap())
+            .collect();
+        tags.sort();
+        tags
     }
 
     fn depth_request(depth: u32) -> ShallowRequest {
@@ -1134,7 +1108,7 @@ mod tests {
         let tip = fx.commits[5];
         let resp = compute_shallow_response(&fx.repo, &[tip], &depth_request(3)).unwrap();
         let caps = HashSet::from(["include-tag".to_owned()]);
-        let tags = included_tags(&ResponsePackInput {
+        let tags = packed_tags(ResponsePackInput {
             repo: &fx.repo,
             refs: &fx.tags,
             wants: &[tip],
@@ -1143,12 +1117,9 @@ mod tests {
             filter: None,
             have_shallow: &HashSet::new(),
             source_shallow: &resp.pack_shallow_grafts,
-        })
-        .unwrap();
+        });
         let mut expected = vec![fx.tags[1].oid, fx.tags[2].oid];
         expected.sort();
-        let mut tags = tags;
-        tags.sort();
         assert_eq!(tags, expected, "t1 lies beyond the depth-3 cut");
     }
 
@@ -1160,7 +1131,7 @@ mod tests {
     fn included_tags_skip_history_the_client_already_has() {
         let fx = fixture(6, &[1, 3, 5]);
         let caps = HashSet::from(["include-tag".to_owned()]);
-        let tags = included_tags(&ResponsePackInput {
+        let tags = packed_tags(ResponsePackInput {
             repo: &fx.repo,
             refs: &fx.tags,
             wants: &[fx.commits[5]],
@@ -1169,9 +1140,145 @@ mod tests {
             filter: None,
             have_shallow: &HashSet::new(),
             source_shallow: &HashSet::new(),
-        })
-        .unwrap();
+        });
         assert_eq!(tags, vec![fx.tags[2].oid]);
+    }
+
+    #[test]
+    fn include_tag_reads_follow_the_fetch_not_the_history() {
+        let store = crate::odb::store::flaky::FlakyStore::new();
+        let dir = tempfile::tempdir().unwrap();
+        let git_dir = dir.path().join("repo.git");
+        let repo = crate::repo::RepositoryBuilder::new(RepositoryOptions::empty())
+            .odb_builder(
+                crate::odb::OdbBuilder::files(git_dir.join("objects"))
+                    .primary(store.clone())
+                    .alternates(false),
+            )
+            .ref_store(std::sync::Arc::new(
+                crate::refs::store::MemoryRefStore::new(),
+            ))
+            .open(&git_dir, None)
+            .unwrap();
+        let n = 3000;
+        let (commits, tags) = write_history(&repo, n, &[5, n - 1]);
+        let caps = HashSet::from(["include-tag".to_owned()]);
+        let before = store.reads();
+        let packed = packed_tags(ResponsePackInput {
+            repo: &repo,
+            refs: &tags,
+            wants: &[commits[n - 1]],
+            common: &[commits[n - 3]],
+            caps: &caps,
+            filter: None,
+            have_shallow: &HashSet::new(),
+            source_shallow: &HashSet::new(),
+        });
+        let reads = store.reads() - before;
+        assert_eq!(packed, vec![tags[1].oid], "only the tag on a sent commit");
+        assert!(
+            reads < 50,
+            "a two-commit fetch read {reads} objects from a {n}-commit history"
+        );
+    }
+
+    #[test]
+    fn include_tag_follows_tag_chains_and_non_commit_targets() {
+        let fx = fixture(3, &[2]);
+        let odb = fx.repo.odb();
+        let tag = |target: ObjectId, kind: &str, name: &str| {
+            let body =
+                format!("object {target}\ntype {kind}\ntag {name}\ntagger T <t@x> 0 +0000\n\nt\n");
+            odb.write(ObjectKind::Tag, body.as_bytes()).unwrap()
+        };
+        let inner = fx.tags[0].oid;
+        let outer = tag(inner, "tag", "outer");
+        let blob = odb.write(ObjectKind::Blob, b"new\n").unwrap();
+        let mut tree_body = b"100644 f\0".to_vec();
+        tree_body.extend_from_slice(blob.as_bytes());
+        let tree = odb.write(ObjectKind::Tree, &tree_body).unwrap();
+        let tip = odb
+            .write(
+                ObjectKind::Commit,
+                format!(
+                    "tree {tree}\nparent {}\nauthor T <t@x> 3 +0000\ncommitter T <t@x> 3 +0000\n\nc3\n",
+                    fx.commits[2]
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        let blob_tag = tag(blob, "blob", "blob");
+        let old_tag = tag(fx.commits[0], "commit", "old");
+        let refs = vec![
+            AdvertisedRef {
+                name: "refs/tags/outer".to_owned(),
+                oid: outer,
+                peeled: Some(fx.commits[2]),
+            },
+            AdvertisedRef {
+                name: "refs/tags/blob".to_owned(),
+                oid: blob_tag,
+                peeled: Some(blob),
+            },
+            AdvertisedRef {
+                name: "refs/tags/old".to_owned(),
+                oid: old_tag,
+                peeled: Some(fx.commits[0]),
+            },
+        ];
+        let caps = HashSet::from(["include-tag".to_owned()]);
+        let fetch = |wants: &[ObjectId]| {
+            let mut pack = Vec::new();
+            write_response_pack(
+                ResponsePackInput {
+                    repo: &fx.repo,
+                    refs: &refs,
+                    wants,
+                    common: &[fx.commits[1]],
+                    caps: &caps,
+                    filter: None,
+                    have_shallow: &HashSet::new(),
+                    source_shallow: &HashSet::new(),
+                },
+                &mut pack,
+                false,
+            )
+            .unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let unpacked = crate::odb::Odb::new(dir.path());
+            let count = crate::unpack_objects::unpack_objects(
+                &mut pack.as_slice(),
+                &unpacked,
+                &crate::unpack_objects::UnpackOptions::default(),
+            )
+            .unwrap();
+            (dir, unpacked, count)
+        };
+
+        let (_dir, unpacked, count) = fetch(&[tip]);
+        for (oid, what) in [
+            (outer, "the followed tag"),
+            (inner, "the tag it names"),
+            (blob_tag, "a tag of a sent blob"),
+        ] {
+            assert!(unpacked.contains(&oid).unwrap(), "{what} is packed");
+        }
+        assert!(
+            !unpacked.contains(&old_tag).unwrap(),
+            "a tag on history the client has is not packed"
+        );
+        assert_eq!(
+            count, 7,
+            "two commits, tree, blob, both chain tags, blob tag"
+        );
+
+        let (_dir, unpacked, count) = fetch(&[inner]);
+        assert!(unpacked.contains(&outer).unwrap());
+        assert!(
+            !unpacked.contains(&blob_tag).unwrap(),
+            "its blob is not sent"
+        );
+        assert_eq!(count, 3, "the wanted inner tag is packed once");
     }
 
     /// Write a commit with an empty tree, `parents`, and committer time `time`.

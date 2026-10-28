@@ -280,6 +280,42 @@ fn depth_reaching_a_tagged_commit_includes_that_tag() {
     assert_eq!(count_kind(&objects, " tag"), 2, "v30 and v20");
 }
 
+/// An incremental fetch only gets the tags on the commits it is sent: `v30` and a
+/// tag of it, plus a tag of a blob that commit introduces, never `v10`/`v20` on
+/// history the client has. Checked with and without pack bitmaps, since bitmap
+/// fetches stream through verbatim pack reuse.
+#[test]
+fn incremental_fetch_includes_only_tags_on_sent_objects() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bare = tagged_bare_repo(tmp.path());
+    git(&bare, &["tag", "-a", "-m", "nested", "v30-nested", "v30"]);
+    git(&bare, &["tag", "-a", "-m", "blob", "f30-blob", "main:f30"]);
+    git(
+        &bare,
+        &["tag", "-a", "-m", "old blob", "f1-blob", "main:f1"],
+    );
+    let body = v2_fetch_body(
+        &[rev_parse(&bare, "main")],
+        &[&format!("have {}", rev_parse(&bare, "main~2"))],
+    );
+    for bitmaps in [false, true] {
+        if bitmaps {
+            git(&bare, &["repack", "-adbq"]);
+        }
+        let label = if bitmaps { "incr-bitmap" } else { "incr" };
+        let (_, objects) = assert_matches_git(tmp.path(), &bare, label, &body);
+        let tags: Vec<String> = ["v30", "v30-nested", "f30-blob"]
+            .iter()
+            .map(|t| format!("{} tag", rev_parse(&bare, &format!("refs/tags/{t}"))))
+            .collect();
+        for tag in &tags {
+            assert!(objects.contains(tag), "{label}: {tag} missing");
+        }
+        assert_eq!(count_kind(&objects, " tag"), 3, "{label}: {objects:?}");
+        assert_eq!(count_kind(&objects, " commit"), 2, "{label}");
+    }
+}
+
 fn ref_path(name: &str) -> String {
     if name == "main" {
         "heads/main".to_owned()
