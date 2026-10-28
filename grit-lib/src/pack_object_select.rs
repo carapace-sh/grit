@@ -278,7 +278,7 @@ fn walk_enumeration(
     let (send, name_hashes, edges) = match opts.filter {
         Some(filter) if filter.uses_paths() => {
             let (send, name_hashes) =
-                rev_list_filtered_objects(odb, wants, haves, filter, &have_commits)?;
+                rev_list_filtered_objects(odb, wants, haves, filter, &have_commits, stop)?;
             (send, name_hashes, None)
         }
         filter => {
@@ -695,8 +695,10 @@ fn rev_list_filtered_objects(
     haves: &[ObjectId],
     filter: &ObjectFilter,
     have_commits: &HashSet<ObjectId>,
+    stop: &CancelSignal<'_>,
 ) -> Result<(Vec<ObjectId>, HashMap<ObjectId, u32>)> {
     let _ = have_commits;
+    stop.poll()?;
     let Some(git_dir) = odb.config_git_dir() else {
         return Ok((Vec::new(), HashMap::new()));
     };
@@ -708,9 +710,11 @@ fn rev_list_filtered_objects(
         no_object_names: true,
         quiet: true,
         filter: Some(filter.clone()),
+        cancel_watch: Some(stop.watch_arc()),
         ..Default::default()
     };
     let result = crate::rev_list::rev_list(&repo, &wants, &haves, &opts)?;
+    stop.poll()?;
     let mut ordered = Vec::new();
     let mut seen = HashSet::new();
     for oid in result

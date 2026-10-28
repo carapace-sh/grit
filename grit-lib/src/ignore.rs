@@ -1265,16 +1265,14 @@ fn sparse_pattern_matches(p: &SparsePattern, pathname: &str, as_directory: bool)
     // paths only (`dir/c`, not `a`). When walking parents (`as_directory`), Git still matches this
     // pattern against directory paths like `dir` so `dir/c` can be excluded (t7817).
     if p.directory_only && p.anchored && !p.has_slash && p.body == "*" {
+        // Git `match_pathname` for MUSTBEDIR `/*` / `!/*/`: only top-level directory names
+        // (no `/` in the pathname), including on the parent-directory pass — not every
+        // `as_directory` path (dir.c / filter_sparse).
         let trimmed = pathname.trim_end_matches('/');
-        return trimmed.contains('/') || as_directory;
+        return !trimmed.contains('/');
     }
     if !p.has_slash && !p.anchored {
-        let pat = p.body.as_bytes();
         sparse_unanchored_basename_matches(&p.body, pathname)
-            || wildmatch(pat, pathname.as_bytes(), WM_PATHNAME)
-            || pathname
-                .split('/')
-                .any(|comp| wildmatch(pat, comp.as_bytes(), 0))
     } else if p.anchored && !p.has_slash && p.body == "*" && !p.directory_only {
         // Sparse line `/*`: include only top-level paths (one segment). `WM_PATHNAME` keeps `*`
         // from matching `/`, but we match against the bare pathname; require no `/` so `dir/c` is
@@ -1398,16 +1396,7 @@ pub fn path_matches_sparse_pattern_list(pathname: &str, lines: &[String]) -> Opt
 
 fn sparse_unanchored_basename_matches(pat: &str, path: &str) -> bool {
     let basename = path.rsplit('/').next().unwrap_or(path);
-    if basename == pat {
-        return true;
-    }
-    if let Some(rest) = basename.strip_prefix(pat) {
-        return rest.starts_with('.') || rest.starts_with('/');
-    }
-    if path == pat {
-        return true;
-    }
-    path.starts_with(&format!("{pat}/"))
+    wildmatch(pat.as_bytes(), basename.as_bytes(), 0)
 }
 
 /// Returns the submodule path if `repo_rel_path` names something inside a gitlink entry.
@@ -1537,6 +1526,23 @@ mod sparse_checkout_tests {
         assert!(path_in_sparse_checkout("folder1/a", &lines, None));
         assert!(path_in_sparse_checkout("folder2/a", &lines, None));
         assert!(!path_in_sparse_checkout("deep/a", &lines, None));
+    }
+
+    #[test]
+    fn non_cone_src_nested_under_included_dir_with_negated_slash_slash() {
+        let lines = vec!["/*".into(), "!/*/".into(), "/src/".into()];
+        assert!(path_in_sparse_checkout("a.txt", &lines, None));
+        assert!(path_in_sparse_checkout("src/z", &lines, None));
+        assert!(path_in_sparse_checkout("src/deep/w", &lines, None));
+        assert!(!path_in_sparse_checkout("d1/x", &lines, None));
+        assert!(!path_in_sparse_checkout("d1/sub/y", &lines, None));
+    }
+
+    #[test]
+    fn unanchored_star_with_negated_other_includes_other_slash_q() {
+        let lines = vec!["*".into(), "!other".into()];
+        assert!(path_in_sparse_checkout("other/q", &lines, None));
+        assert!(!path_in_sparse_checkout("other", &lines, None));
     }
 }
 

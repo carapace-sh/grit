@@ -9,6 +9,7 @@ use std::cmp::{Ordering, Reverse};
 use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use crate::bitmap_walk::{bitmap_filter_supported, BitmapWalkError, PeeledTips, ReachableSet};
@@ -17,7 +18,7 @@ use crate::config::ConfigSet;
 use crate::diff::zero_oid;
 use crate::error::{Error, Result};
 use crate::ident::{committer_unix_seconds_for_ordering, parse_signature_times};
-use crate::ignore::{parse_sparse_patterns_from_blob, path_in_sparse_checkout};
+use crate::ignore::{parse_sparse_patterns_from_blob, ParsedSparsePatterns};
 use crate::index::{CacheTreeNode, Index, MODE_GITLINK, MODE_TREE};
 use crate::merge_base::{
     commits_reachable_excluding_ancestors_of_with_graph, ReachableWalkCommitterCutoffs,
@@ -29,6 +30,7 @@ use crate::objects::{
 use crate::odb::store::ObjectStore;
 use crate::pack_bitmap::BitmapIndex;
 use crate::patch_ids::{compute_patch_id, compute_patch_id_for_paths};
+use crate::progress::poll_watch;
 use crate::ref_exclusions::{git_namespace_prefix, strip_git_namespace, RefExclusions};
 use crate::reflog::{list_reflog_refs, read_reflog};
 use crate::refs;
@@ -604,6 +606,9 @@ pub struct RevListOptions {
     /// Keep the commits a walk parses anyway in [`RevListResult::commit_data`], so callers that
     /// render the listed commits do not read and inflate them a second time.
     pub retain_commit_data: bool,
+    /// When set, filtered object walks poll this flag and stop with [`Error::Cancelled`].
+    #[doc(hidden)]
+    pub cancel_watch: Option<Arc<AtomicBool>>,
 }
 
 impl RevListOptions {
@@ -713,6 +718,7 @@ impl Default for RevListOptions {
             commit_filter: None,
             pickaxe: None,
             retain_commit_data: false,
+            cancel_watch: None,
         }
     }
 }
@@ -1890,7 +1896,7 @@ pub fn rev_list(
         Vec::new()
     };
 
-    let sparse_lines = sparse_oid_lines_from_filter(repo, options.filter.as_ref())?;
+    let sparse_patterns = sparse_oid_lines_from_filter(repo, options.filter.as_ref())?;
     let skip_trees = skip_tree_descent_for_object_type_filter(options.filter.as_ref());
     let walk_cfg = repo_config.as_ref().clone();
     let promisor_repo = crate::promisor::repo_treats_promisor_packs(repo.git_dir(), &walk_cfg);
@@ -1920,10 +1926,11 @@ pub fn rev_list(
                     repo,
                     &negative_object_roots,
                     object_walk_missing_action,
-                    sparse_lines.as_deref(),
+                    sparse_patterns.as_ref(),
                     skip_trees,
                     omit_object_paths,
                     collect_tree_omits,
+                    options.cancel_watch.clone(),
                 )?;
                 let filter_provided = options.filter_provided_objects;
                 let (mut objs, mut omit, mut miss, mut counts, mut segments) =
@@ -1937,11 +1944,12 @@ pub fn rev_list(
                             options.filter.as_ref(),
                             filter_provided,
                             object_walk_missing_action,
-                            sparse_lines.as_deref(),
+                            sparse_patterns.as_ref(),
                             skip_trees,
                             omit_object_paths,
                             packed_set.as_ref(),
                             collect_tree_omits,
+                            options.cancel_watch.clone(),
                         )?;
                         (o, om, mi, c, Vec::<Vec<(ObjectId, String)>>::new())
                     } else {
@@ -1954,11 +1962,12 @@ pub fn rev_list(
                             options.filter.as_ref(),
                             filter_provided,
                             object_walk_missing_action,
-                            sparse_lines.as_deref(),
+                            sparse_patterns.as_ref(),
                             skip_trees,
                             omit_object_paths,
                             packed_set.as_ref(),
                             collect_tree_omits,
+                            options.cancel_watch.clone(),
                         )?;
                         (o, om, mi, Vec::new(), segments)
                     };
@@ -3344,17 +3353,17 @@ fn skip_tree_descent_for_object_type_filter(filter: Option<&ObjectFilter>) -> bo
 fn sparse_filter_includes_path(
     repo: &Repository,
     path: &str,
-    sparse_lines: Option<&[String]>,
+    sparse_patterns: Option<&ParsedSparsePatterns>,
 ) -> bool {
-    sparse_lines
-        .map(|lines| path_in_sparse_checkout(path, lines, repo.work_tree()))
+    sparse_patterns
+        .map(|patterns| patterns.includes(path, repo.work_tree()))
         .unwrap_or(true)
 }
 
 fn sparse_oid_lines_from_filter(
     repo: &Repository,
     filter: Option<&ObjectFilter>,
-) -> Result<Option<Vec<String>>> {
+) -> Result<Option<ParsedSparsePatterns>> {
     let Some(f) = filter else {
         return Ok(None);
     };
@@ -3395,7 +3404,9 @@ fn sparse_oid_lines_from_filter(
                     object_id: blob_oid.to_hex(),
                 })
             })?;
-            Ok(Some(parse_sparse_patterns_from_blob(text)))
+            Ok(Some(ParsedSparsePatterns::parse(
+                &parse_sparse_patterns_from_blob(text),
+            )))
         }
         ObjectFilter::Combine(parts) => {
             for p in parts {
@@ -6447,6 +6458,7 @@ fn try_rev_list_accelerated(
         skip_trees,
         true,
         false,
+        None,
     )?;
 
     let (commit_count, non_commit_count) = if excluded_object_ids.is_empty() {
@@ -6574,6 +6586,7 @@ where
         skip_trees,
         true,
         false,
+        None,
     )?;
 
     for oid in reachable.iter_by_kind(ObjectKind::Commit) {
@@ -6654,6 +6667,7 @@ pub(crate) fn try_bitmap_reachable_commit_set_for_specs(
         skip_trees,
         true,
         false,
+        None,
     )?;
     if !excluded_object_ids.is_empty() {
         return Ok(None);
@@ -8718,11 +8732,27 @@ struct TreeWalkState {
     tree_blobs: HashMap<ObjectId, Arc<Vec<u8>>>,
     oid_len: Option<usize>,
     tree_read_buf: Vec<u8>,
+    cancel_watch: Option<Arc<AtomicBool>>,
+    cancel_poll_counter: u32,
 }
 
 impl TreeWalkState {
-    fn new() -> Self {
-        Self::default()
+    fn new(cancel_watch: Option<Arc<AtomicBool>>) -> Self {
+        Self {
+            cancel_watch,
+            ..Self::default()
+        }
+    }
+
+    fn poll_cancel(&mut self) -> Result<()> {
+        let Some(flag) = self.cancel_watch.as_ref() else {
+            return Ok(());
+        };
+        self.cancel_poll_counter = self.cancel_poll_counter.wrapping_add(1);
+        if self.cancel_poll_counter & 0x3f == 0 {
+            poll_watch(flag)?;
+        }
+        Ok(())
     }
 
     fn oid_len(&mut self, repo: &Repository) -> usize {
@@ -8763,26 +8793,28 @@ impl TreeWalkState {
 
 fn object_walk_needs_child_read_info(
     filter: Option<&ObjectFilter>,
-    sparse_lines: Option<&[String]>,
+    sparse_patterns: Option<&ParsedSparsePatterns>,
     missing_action: MissingAction,
 ) -> bool {
-    filter.is_some() || sparse_lines.is_some() || missing_action != MissingAction::Error
+    filter.is_some() || sparse_patterns.is_some() || missing_action != MissingAction::Error
 }
 
+#[expect(clippy::too_many_arguments)]
 fn excluded_object_root_ids(
     repo: &Repository,
     object_roots: &[RootObject],
     missing_action: MissingAction,
-    sparse_lines: Option<&[String]>,
+    sparse_patterns: Option<&ParsedSparsePatterns>,
     skip_trees_for_type_filter: bool,
     omit_object_paths: bool,
     collect_tree_omits: bool,
+    cancel_watch: Option<Arc<AtomicBool>>,
 ) -> Result<HashSet<ObjectId>> {
     if object_roots.is_empty() {
         return Ok(HashSet::new());
     }
 
-    let mut tree_state = TreeWalkState::new();
+    let mut tree_state = TreeWalkState::new(cancel_watch);
     let mut emitted = HashSet::new();
     let mut objects = Vec::new();
     let mut omitted = Vec::new();
@@ -8804,7 +8836,7 @@ fn excluded_object_root_ids(
             None,
             false,
             missing_action,
-            sparse_lines,
+            sparse_patterns,
             skip_trees_for_type_filter,
             omit_object_paths,
             None,
@@ -8906,11 +8938,12 @@ fn collect_reachable_objects_segmented(
     filter: Option<&ObjectFilter>,
     filter_provided: bool,
     missing_action: MissingAction,
-    sparse_lines: Option<&[String]>,
+    sparse_patterns: Option<&ParsedSparsePatterns>,
     skip_trees_for_type_filter: bool,
     omit_object_paths: bool,
     packed_set: Option<&HashSet<ObjectId>>,
     collect_tree_omits: bool,
+    cancel_watch: Option<Arc<AtomicBool>>,
 ) -> Result<ReachableObjectsSegmented> {
     let mut emitted = HashSet::new();
     let mut result = Vec::new();
@@ -8918,10 +8951,11 @@ fn collect_reachable_objects_segmented(
     let mut missing = Vec::new();
     let mut missing_seen = HashSet::new();
     let mut segments: Vec<Vec<(ObjectId, String)>> = Vec::with_capacity(commits.len() + 1);
-    let mut tree_state = TreeWalkState::new();
+    let mut tree_state = TreeWalkState::new(cancel_watch.clone());
     let mut top_tree_omit =
         walk_needs_top_tree_omit_set(filter, collect_tree_omits).then(HashSet::<ObjectId>::new);
-    let mut combine_states = CombineSubState::prepare_sub_states(filter, collect_tree_omits);
+    let mut combine_states =
+        CombineSubState::prepare_sub_states(filter, collect_tree_omits, cancel_watch);
 
     for &commit_oid in commits {
         let start = result.len();
@@ -8976,7 +9010,7 @@ fn collect_reachable_objects_segmented(
             filter,
             filter_provided,
             missing_action,
-            sparse_lines,
+            sparse_patterns,
             skip_trees_for_type_filter,
             omit_object_paths,
             packed_set,
@@ -9001,7 +9035,7 @@ fn collect_reachable_objects_segmented(
             filter,
             filter_provided,
             missing_action,
-            sparse_lines,
+            sparse_patterns,
             skip_trees_for_type_filter,
             omit_object_paths,
             packed_set,
@@ -9268,10 +9302,14 @@ struct CombineSubState {
 }
 
 impl CombineSubState {
-    fn new(parts_len: usize, collect_omits: bool) -> Vec<Self> {
+    fn new(
+        parts_len: usize,
+        collect_omits: bool,
+        cancel_watch: Option<Arc<AtomicBool>>,
+    ) -> Vec<Self> {
         (0..parts_len)
             .map(|_| Self {
-                tree_state: TreeWalkState::new(),
+                tree_state: TreeWalkState::new(cancel_watch.clone()),
                 tree_omit_set: collect_omits.then(HashSet::new),
                 is_skipping_tree: false,
                 skip_tree_oid: None,
@@ -9282,11 +9320,14 @@ impl CombineSubState {
     fn prepare_sub_states(
         filter: Option<&ObjectFilter>,
         collect_omits: bool,
+        cancel_watch: Option<Arc<AtomicBool>>,
     ) -> Option<Vec<CombineSubState>> {
         match filter {
-            Some(ObjectFilter::Combine(parts)) => {
-                Some(CombineSubState::new(parts.len(), collect_omits))
-            }
+            Some(ObjectFilter::Combine(parts)) => Some(CombineSubState::new(
+                parts.len(),
+                collect_omits,
+                cancel_watch,
+            )),
             _ => None,
         }
     }
@@ -9310,7 +9351,7 @@ fn collect_tree_objects_filtered(
     filter: Option<&ObjectFilter>,
     filter_provided: bool,
     missing_action: MissingAction,
-    sparse_lines: Option<&[String]>,
+    sparse_patterns: Option<&ParsedSparsePatterns>,
     skip_trees_for_type_filter: bool,
     omit_object_paths: bool,
     packed_set: Option<&HashSet<ObjectId>>,
@@ -9318,6 +9359,7 @@ fn collect_tree_objects_filtered(
     tree_omit_set: &mut Option<HashSet<ObjectId>>,
     combine_states: &mut Option<Vec<CombineSubState>>,
 ) -> Result<()> {
+    tree_state.poll_cancel()?;
     if !explicit_root {
         if let Some(parents) = parent_commit_trees {
             if subtree_unchanged_in_all_parents(repo, tree_state, parents, prefix, tree_oid)? {
@@ -9410,9 +9452,10 @@ fn collect_tree_objects_filtered(
     }
 
     let needs_child_read_info =
-        object_walk_needs_child_read_info(filter, sparse_lines, missing_action);
+        object_walk_needs_child_read_info(filter, sparse_patterns, missing_action);
     let mut parent_dirs: Option<ParentDirEntries> = None;
     for entry in TreeRefIter::with_oid_len(tree_blob.as_slice(), oid_len) {
+        tree_state.poll_cancel()?;
         let entry = entry?;
         if entry.mode == 0o160000 {
             continue;
@@ -9472,7 +9515,7 @@ fn collect_tree_objects_filtered(
                 filter,
                 filter_provided,
                 missing_action,
-                sparse_lines,
+                sparse_patterns,
                 skip_trees_for_type_filter,
                 omit_object_paths,
                 packed_set,
@@ -9508,7 +9551,7 @@ fn collect_tree_objects_filtered(
                     Err(err) => return Err(err),
                 };
                 if child_info.kind == ObjectKind::Blob {
-                    let sparse_blob = sparse_filter_includes_path(repo, &path, sparse_lines);
+                    let sparse_blob = sparse_filter_includes_path(repo, &path, sparse_patterns);
                     let blob_bits = match filter {
                         None => ListFilterBits {
                             mark_seen: true,
@@ -9633,7 +9676,7 @@ fn collect_root_object(
     filter: Option<&ObjectFilter>,
     filter_provided: bool,
     missing_action: MissingAction,
-    sparse_lines: Option<&[String]>,
+    sparse_patterns: Option<&ParsedSparsePatterns>,
     skip_trees_for_type_filter: bool,
     omit_object_paths: bool,
     packed_set: Option<&HashSet<ObjectId>>,
@@ -9720,7 +9763,7 @@ fn collect_root_object(
                 filter,
                 filter_provided,
                 missing_action,
-                sparse_lines,
+                sparse_patterns,
                 skip_trees_for_type_filter,
                 omit_object_paths,
                 packed_set,
@@ -9748,7 +9791,7 @@ fn collect_root_object(
                 filter,
                 filter_provided,
                 missing_action,
-                sparse_lines,
+                sparse_patterns,
                 skip_trees_for_type_filter,
                 omit_object_paths,
                 packed_set,
@@ -9759,7 +9802,7 @@ fn collect_root_object(
         }
         ObjectKind::Blob => {
             let path_for_sparse = root.root_path.as_deref().unwrap_or("");
-            let sparse_blob = sparse_filter_includes_path(repo, path_for_sparse, sparse_lines);
+            let sparse_blob = sparse_filter_includes_path(repo, path_for_sparse, sparse_patterns);
             let blob_bits = match filter {
                 None => ListFilterBits {
                     mark_seen: true,
@@ -9845,7 +9888,7 @@ fn collect_root_object(
                 filter,
                 filter_provided,
                 missing_action,
-                sparse_lines,
+                sparse_patterns,
                 skip_trees_for_type_filter,
                 omit_object_paths,
                 packed_set,
@@ -9872,16 +9915,18 @@ fn collect_reachable_objects_in_commit_order(
     filter: Option<&ObjectFilter>,
     filter_provided: bool,
     missing_action: MissingAction,
-    sparse_lines: Option<&[String]>,
+    sparse_patterns: Option<&ParsedSparsePatterns>,
     skip_trees_for_type_filter: bool,
     omit_object_paths: bool,
     packed_set: Option<&HashSet<ObjectId>>,
     collect_tree_omits: bool,
+    cancel_watch: Option<Arc<AtomicBool>>,
 ) -> Result<ReachableObjectsInOrder> {
-    let mut tree_state = TreeWalkState::new();
+    let mut tree_state = TreeWalkState::new(cancel_watch.clone());
     let mut top_tree_omit =
         walk_needs_top_tree_omit_set(filter, collect_tree_omits).then(HashSet::<ObjectId>::new);
-    let mut combine_states = CombineSubState::prepare_sub_states(filter, collect_tree_omits);
+    let mut combine_states =
+        CombineSubState::prepare_sub_states(filter, collect_tree_omits, cancel_watch);
     let mut emitted = HashSet::new();
     let mut result = Vec::new();
     let mut omitted = Vec::new();
@@ -9926,7 +9971,7 @@ fn collect_reachable_objects_in_commit_order(
             filter,
             filter_provided,
             missing_action,
-            sparse_lines,
+            sparse_patterns,
             skip_trees_for_type_filter,
             omit_object_paths,
             packed_set,
@@ -9950,7 +9995,7 @@ fn collect_reachable_objects_in_commit_order(
             filter,
             filter_provided,
             missing_action,
-            sparse_lines,
+            sparse_patterns,
             skip_trees_for_type_filter,
             omit_object_paths,
             packed_set,

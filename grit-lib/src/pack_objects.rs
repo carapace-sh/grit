@@ -616,6 +616,34 @@ pub fn write_upload_pack_stream(
     progress: &mut dyn FnMut(PackProgress),
     w: &mut dyn Write,
 ) -> Result<PackStats> {
+    write_upload_pack_stream_with_cancel(
+        repo,
+        wants,
+        haves,
+        source_shallow,
+        have_shallow,
+        filter,
+        opts,
+        progress,
+        w,
+        &CancelSignal::never(),
+    )
+}
+
+/// [`write_upload_pack_stream`], stopping object enumeration when `stop` fires.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn write_upload_pack_stream_with_cancel(
+    repo: &Repository,
+    wants: &[ObjectId],
+    haves: &[ObjectId],
+    source_shallow: &HashSet<ObjectId>,
+    have_shallow: &HashSet<ObjectId>,
+    filter: Option<&ObjectFilter>,
+    opts: &PackBuildOptions,
+    progress: &mut dyn FnMut(PackProgress),
+    w: &mut dyn Write,
+    stop: &CancelSignal<'_>,
+) -> Result<PackStats> {
     repo.odb().with_pack_read_context(|| {
         write_upload_pack_stream_in_context(
             repo,
@@ -627,6 +655,7 @@ pub fn write_upload_pack_stream(
             opts,
             progress,
             w,
+            stop,
         )
     })
 }
@@ -642,6 +671,7 @@ fn write_upload_pack_stream_in_context(
     opts: &PackBuildOptions,
     progress: &mut dyn FnMut(PackProgress),
     w: &mut dyn Write,
+    stop: &CancelSignal<'_>,
 ) -> Result<PackStats> {
     if opts.use_bitmaps && filter.is_none() {
         if let Some(stats) = crate::pack_reuse::try_write_streaming_pack(
@@ -670,7 +700,7 @@ fn write_upload_pack_stream_in_context(
         opts,
         HaveBoundary::TipsOnly,
         w,
-        &CancelSignal::never(),
+        stop,
     )
 }
 

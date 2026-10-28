@@ -417,6 +417,7 @@ mod config_file_api_coverage;
 mod config_file_roundtrip;
 #[path = "config_include_gitdir_coverage.rs"]
 mod config_include_gitdir_coverage;
+#[cfg(feature = "full-tests")]
 #[path = "config_include_if_coverage.rs"]
 mod config_include_if_coverage;
 #[cfg(feature = "full-tests")]
@@ -1655,6 +1656,9 @@ mod sparse_checkout_git_compat;
 #[cfg(feature = "full-tests")]
 #[path = "sparse_index_collapse_git_compat.rs"]
 mod sparse_index_collapse_git_compat;
+#[cfg(feature = "full-tests")]
+#[path = "sparse_oid_filter_git_compat.rs"]
+mod sparse_oid_filter_git_compat;
 #[cfg(feature = "full-tests")]
 #[path = "split_index_git_compat.rs"]
 mod split_index_git_compat;
