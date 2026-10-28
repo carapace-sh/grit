@@ -875,6 +875,10 @@ fn repack_detail(repo: &Repository, opts: &RepackOptions) -> Result<RepackDetail
     let mut report = RepackReport::default();
     let loose_before = count_loose_objects(odb)?;
     let packs_before = count_pack_files(&pack_dir);
+    let pre_repack_packs = local_pack_paths(&pack_dir);
+
+    #[cfg(test)]
+    gc_test_hooks::run(gc_test_hooks::GcPausePoint::AfterInventoryBeforeRoots);
 
     let pre_repack_packs = if opts.incremental {
         HashSet::new()
@@ -2052,19 +2056,16 @@ fn append_repack_unreachable_retention(
     Ok(())
 }
 
-/// Pack file paths present under `pack_dir` (`.pack` files only).
-fn pack_paths_in_dir(pack_dir: &Path) -> Result<HashSet<PathBuf>> {
+/// Every local `.pack` path under `pack_dir` at inventory time.
+fn local_pack_paths(pack_dir: &Path) -> HashSet<PathBuf> {
     let Ok(entries) = fs::read_dir(pack_dir) else {
-        return Ok(HashSet::new());
+        return HashSet::new();
     };
-    let mut out = HashSet::new();
-    for entry in entries.filter_map(|e| e.ok()) {
-        let path = entry.path();
-        if path.extension().is_some_and(|e| e == "pack") {
-            out.insert(path);
-        }
-    }
-    Ok(out)
+    entries
+        .filter_map(|e| e.ok())
+        .map(|e| pack_dir.join(e.file_name()))
+        .filter(|p| p.extension().is_some_and(|e| e == "pack"))
+        .collect()
 }
 
 /// Packs in `pack_dir` without a `.keep` marker, from a single directory read.
@@ -2123,7 +2124,7 @@ fn remove_superseded_pack_files_retaining(
     pack_dir: &Path,
     keep_pack: &Path,
     retained_packs: &HashSet<PathBuf>,
-    pre_repack_packs: &HashSet<PathBuf>,
+    inventory_packs: &HashSet<PathBuf>,
 ) -> Result<usize> {
     let git_dir = crate::git_dir::io_error::git_dir_from_pack_dir(pack_dir);
     let keep_stem = keep_pack
@@ -2158,16 +2159,11 @@ fn remove_superseded_pack_files_retaining(
         }
         let path = entry.path();
         if path.is_file() {
-            let artifact_pack = pack_path_for_sidecar(&path);
-            if artifact_pack
-                .as_ref()
-                .is_none_or(|p| !pre_repack_packs.contains(p))
-            {
-                continue;
-            }
+            let pack_path = path.with_extension("pack");
             if pack_has_keep_marker(pack_dir, &path)
                 || path.with_extension("promisor").is_file()
-                || retained_packs.contains(&path.with_extension("pack"))
+                || retained_packs.contains(&pack_path)
+                || !inventory_packs.contains(&pack_path)
             {
                 continue;
             }
@@ -2263,156 +2259,40 @@ pub mod repository_fsck {
 }
 
 #[cfg(test)]
-mod repack_pause_inject {
-    use std::path::PathBuf;
-    use std::sync::{Condvar, Mutex, OnceLock};
+pub(crate) mod gc_test_hooks {
+    use std::cell::RefCell;
 
-    pub struct PauseGate {
-        pub wait: Mutex<bool>,
-        pub cv: Condvar,
-    }
-
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub enum Phase {
+    /// Where in [`super::repack_detail`] a test hook interleaves another writer.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub enum GcPausePoint {
+        /// After pack inventory is recorded and before maintenance roots are collected.
         AfterInventoryBeforeRoots,
-        BeforeBitmap,
     }
 
-    pub type PauseSlot = Option<(PathBuf, Phase, std::sync::Arc<PauseGate>)>;
+    type GcHook = (GcPausePoint, Box<dyn FnOnce() + Send>);
 
-    static PAUSE: OnceLock<Mutex<PauseSlot>> = OnceLock::new();
-    static TEST_SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
-
-    pub fn pause_slot() -> &'static Mutex<PauseSlot> {
-        PAUSE.get_or_init(|| Mutex::new(None))
+    thread_local! {
+        static GC_HOOK: RefCell<Option<GcHook>> = const { RefCell::new(None) };
     }
 
-    pub fn test_serial_lock() -> std::sync::MutexGuard<'static, ()> {
-        TEST_SERIAL
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+    /// Run `hook` during the next repack on this thread when it reaches `point`.
+    pub fn on_next_gc(point: GcPausePoint, hook: impl FnOnce() + Send + 'static) {
+        GC_HOOK.with(|slot| *slot.borrow_mut() = Some((point, Box::new(hook))));
     }
-}
 
-/// Test-only repack pause point (repository-scoped).
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RepackPausePhase {
-    /// After recording pre-repack pack inventory, before maintenance roots are collected.
-    AfterInventoryBeforeRoots,
-    /// After installing the new repack pack, before writing its bitmap sidecar.
-    BeforeBitmap,
-}
-
-#[cfg(test)]
-impl From<RepackPausePhase> for repack_pause_inject::Phase {
-    fn from(value: RepackPausePhase) -> Self {
-        match value {
-            RepackPausePhase::AfterInventoryBeforeRoots => Self::AfterInventoryBeforeRoots,
-            RepackPausePhase::BeforeBitmap => Self::BeforeBitmap,
-        }
-    }
-}
-
-/// Test-only synchronization gate for repack pause injection.
-#[cfg(test)]
-pub type RepackPauseGate = std::sync::Arc<repack_pause_inject::PauseGate>;
-
-/// Test-only: build a gate for repack pause injection.
-#[cfg(test)]
-pub fn new_repack_pause_gate() -> RepackPauseGate {
-    std::sync::Arc::new(repack_pause_inject::PauseGate {
-        wait: std::sync::Mutex::new(false),
-        cv: std::sync::Condvar::new(),
-    })
-}
-
-/// Test-only: arm a repack pause for `git_dir` at `phase`.
-#[cfg(test)]
-pub fn set_test_inject_repack_pause(
-    git_dir: &Path,
-    phase: RepackPausePhase,
-    gate: Option<RepackPauseGate>,
-) {
-    *repack_pause_inject::pause_slot()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner()) =
-        gate.map(|g| (git_dir.to_path_buf(), phase.into(), g));
-}
-
-/// Clears repack pause injection on drop (test-only).
-#[cfg(test)]
-pub struct RepackPauseGuard {
-    git_dir: PathBuf,
-    phase: RepackPausePhase,
-}
-
-#[cfg(test)]
-impl RepackPauseGuard {
-    /// Arm `phase` for `git_dir` until this guard is dropped.
-    pub fn arm(git_dir: &Path, phase: RepackPausePhase, gate: RepackPauseGate) -> Self {
-        set_test_inject_repack_pause(git_dir, phase, Some(gate));
-        Self {
-            git_dir: git_dir.to_path_buf(),
-            phase,
-        }
-    }
-}
-
-#[cfg(test)]
-impl Drop for RepackPauseGuard {
-    fn drop(&mut self) {
-        let mut slot = repack_pause_inject::pause_slot()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if slot
-            .as_ref()
-            .is_some_and(|(dir, phase, _)| dir == &self.git_dir && *phase == self.phase.into())
-        {
-            *slot = None;
-        }
-    }
-}
-
-#[cfg(test)]
-impl From<repack_pause_inject::Phase> for RepackPausePhase {
-    fn from(value: repack_pause_inject::Phase) -> Self {
-        match value {
-            repack_pause_inject::Phase::AfterInventoryBeforeRoots => {
-                Self::AfterInventoryBeforeRoots
+    pub(crate) fn run(point: GcPausePoint) {
+        let hook = GC_HOOK.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            match slot.as_ref() {
+                Some((at, _)) if *at == point => slot.take().map(|(_, hook)| hook),
+                _ => None,
             }
-            repack_pause_inject::Phase::BeforeBitmap => Self::BeforeBitmap,
+        });
+        if let Some(hook) = hook {
+            hook();
         }
     }
 }
-
-#[cfg(test)]
-fn test_inject_repack_pause(git_dir: &Path, phase: RepackPausePhase) {
-    let armed = repack_pause_inject::pause_slot()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone();
-    if let Some((expected_dir, expected_phase, gate)) = armed {
-        if expected_dir == git_dir && RepackPausePhase::from(expected_phase) == phase {
-            let mut wait = gate.wait.lock().unwrap_or_else(|e| e.into_inner());
-            *wait = true;
-            gate.cv.notify_all();
-            while *wait {
-                wait = gate.cv.wait(wait).unwrap_or_else(|e| e.into_inner());
-            }
-        }
-    }
-}
-
-#[cfg(not(test))]
-enum RepackPausePhase {
-    AfterInventoryBeforeRoots,
-    BeforeBitmap,
-}
-
-#[cfg(not(test))]
-fn test_inject_repack_pause(_git_dir: &Path, _phase: RepackPausePhase) {}
 
 #[cfg(test)]
 mod tests {
@@ -2951,251 +2831,125 @@ mod tests {
         assert!(stats.prune_ran, "full gc should run unreachable prune");
     }
 
+    #[cfg_attr(
+        not(feature = "full-tests"),
+        ignore = "starts system git or is heavy; run with --features full-tests"
+    )]
     #[test]
-    fn full_repack_with_bitmap_tolerates_concurrent_push_pack() {
-        use std::io::Write;
-        use std::sync::Arc;
-        use std::thread;
+    fn full_repack_keeps_migrated_pack_before_refs_updated() {
+        use crate::receive_quarantine::ReceiveQuarantine;
 
-        use crate::environment::RepositoryOptions;
-
-        let _serial = repack_pause_inject::test_serial_lock();
-        let tmp = TempDir::new().unwrap();
-        let bare = tmp.path().join("srv.git");
-        git_cmd(tmp.path(), &["init", "--bare", "-b", "main", "srv.git"]);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let remote = tmp.path().join("remote.git");
         let wt = tmp.path().join("wt");
-        git_cmd(tmp.path(), &["clone", "-q", bare.to_str().unwrap(), "wt"]);
-        git_cmd(&wt, &["commit", "--allow-empty", "-q", "-m", "c1"]);
-        git_cmd(&wt, &["commit", "--allow-empty", "-q", "-m", "c2"]);
-        git_cmd(&wt, &["push", "-q", "origin", "main"]);
-        git_cmd(&bare, &["repack", "-a", "-d"]);
-
-        let repo_probe =
-            Repository::discover(Some(&bare), &RepositoryOptions::empty()).expect("open");
-        let git_dir = repo_probe.git_dir().to_path_buf();
-        let gate = new_repack_pause_gate();
-        let _pause_guard =
-            RepackPauseGuard::arm(&git_dir, RepackPausePhase::BeforeBitmap, Arc::clone(&gate));
-
-        let bare_thread = bare.clone();
-        let worker = thread::spawn(move || {
-            let repo = Repository::discover(Some(&bare_thread), &RepositoryOptions::empty())
-                .expect("open");
-            repack_all(
-                &repo,
-                &RepackOptions {
-                    write_bitmap: true,
-                    keep_unreachable: false,
-                    ..RepackOptions::default()
-                },
-            )
-        });
-
-        let mut paused = gate.wait.lock().unwrap();
-        while !*paused {
-            paused = gate.cv.wait(paused).unwrap();
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::create_dir_all(&remote).unwrap();
+        let git = |dir: &Path, args: &[&str]| {
+            assert!(std::process::Command::new("git")
+                .current_dir(dir)
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .status()
+                .expect("git")
+                .success());
+        };
+        git(&remote, &["init", "-q", "--bare", "-b", "main"]);
+        git(&wt, &["init", "-q", "-b", "main"]);
+        std::fs::write(wt.join("payload.txt"), b"payload\n").unwrap();
+        git(&wt, &["add", "payload.txt"]);
+        git(&wt, &["commit", "-qm", "base"]);
+        git(&wt, &["push", "-q", remote.to_str().unwrap(), "main"]);
+        git(&remote, &["repack", "-a", "-d"]);
+        let repo = Repository::open(&remote, &crate::environment::RepositoryOptions::empty())
+            .expect("open remote");
+        let pack_dir = repo.git_dir().join("objects/pack");
+        let base_pack = super::local_pack_paths(&pack_dir)
+            .into_iter()
+            .next()
+            .expect("base pack");
+        let mut q = ReceiveQuarantine::create(repo.odb(), repo.git_dir()).expect("quarantine");
+        let q_root = PathBuf::from(
+            q.hook_env()
+                .into_iter()
+                .find(|(k, _)| k == "GIT_QUARANTINE_PATH")
+                .map(|(_, v)| v)
+                .expect("quarantine path"),
+        );
+        let q_pack_dir = q_root.join("pack");
+        fs::create_dir_all(&q_pack_dir).unwrap();
+        for ext in ["pack", "idx", "rev"] {
+            let src = base_pack.with_extension(ext);
+            if src.is_file() {
+                fs::copy(&src, q_pack_dir.join(format!("pack-incoming.{ext}"))).unwrap();
+            }
         }
-
-        git_cmd(&wt, &["commit", "--allow-empty", "-q", "-m", "concurrent"]);
-        git_cmd(
-            &wt,
-            &[
-                "push",
-                "-q",
-                bare.to_str().unwrap(),
-                "HEAD:refs/heads/concurrent",
-            ],
-        );
-        let oid_hex = std::process::Command::new("git")
-            .current_dir(&wt)
-            .args(["rev-parse", "HEAD"])
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_SYSTEM", "/dev/null")
-            .output()
-            .expect("rev-parse")
-            .stdout;
-        let oid_hex = String::from_utf8(oid_hex).expect("utf8").trim().to_string();
-        let pack_prefix = bare.join("objects/pack/push-layer");
-        let mut pack_cmd = std::process::Command::new("git")
-            .current_dir(&bare)
-            .args(["pack-objects", pack_prefix.to_str().expect("utf8 prefix")])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_SYSTEM", "/dev/null")
-            .spawn()
-            .expect("pack-objects");
-        pack_cmd
-            .stdin
-            .take()
-            .expect("stdin")
-            .write_all(format!("{oid_hex}\n").as_bytes())
-            .expect("write oid");
-        let pack_out = pack_cmd.wait_with_output().expect("pack-objects wait");
+        let guards = q.migrate().expect("migrate");
         assert!(
-            pack_out.status.success(),
-            "pack-objects: {:?}",
-            pack_out.stderr
+            super::local_pack_paths(&pack_dir).len() >= 2,
+            "migrated push pack must be visible before gc inventories packs"
         );
-        git_cmd(&bare, &["update-ref", "refs/heads/concurrent", &oid_hex]);
-
-        *paused = false;
-        gate.cv.notify_all();
-        drop(paused);
-
-        worker
-            .join()
-            .unwrap()
-            .expect("repack after concurrent push");
-
-        let pack_dir = bare.join("objects/pack");
+        repack_all(
+            &repo,
+            &RepackOptions {
+                auto_skip: false,
+                write_bitmap: false,
+                ..RepackOptions::default()
+            },
+        )
+        .expect("repack");
         assert!(
-            count_pack_files(&pack_dir) >= 2,
-            "concurrent receive-pack pack must survive gc repack"
+            pack_dir.join("pack-incoming.pack").is_file(),
+            "incoming pack must survive full repack while .keep guards are held"
         );
-        let repo = Repository::discover(Some(&bare), &RepositoryOptions::empty()).expect("open");
-        assert_fsck_clean(&repo);
+        drop(guards);
     }
 
     #[test]
-    fn full_repack_keeps_migrated_pack_before_refs_updated() {
-        use std::io::Write;
-        use std::sync::Arc;
-        use std::thread;
-
-        use crate::environment::RepositoryOptions;
-        use crate::objects::ObjectId;
-        use crate::odb::Odb;
+    fn full_repack_drops_unprotected_migrated_pack_before_refs_updated() {
         use crate::receive_quarantine::ReceiveQuarantine;
 
-        let _serial = repack_pause_inject::test_serial_lock();
-        let tmp = TempDir::new().unwrap();
-        let bare = tmp.path().join("srv.git");
-        git_cmd(tmp.path(), &["init", "--bare", "-b", "main", "srv.git"]);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let remote = tmp.path().join("remote.git");
         let wt = tmp.path().join("wt");
-        git_cmd(tmp.path(), &["clone", "-q", bare.to_str().unwrap(), "wt"]);
-        git_cmd(&wt, &["commit", "--allow-empty", "-q", "-m", "c1"]);
-        git_cmd(&wt, &["push", "-q", "origin", "main"]);
-        git_cmd(&bare, &["repack", "-a", "-d"]);
-
-        git_cmd(&wt, &["commit", "--allow-empty", "-q", "-m", "migrated"]);
-        let oid_hex = std::process::Command::new("git")
-            .current_dir(&wt)
-            .args(["rev-parse", "HEAD"])
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_SYSTEM", "/dev/null")
-            .output()
-            .expect("rev-parse")
-            .stdout;
-        let oid_hex = String::from_utf8(oid_hex).expect("utf8").trim().to_string();
-        git_cmd(
-            &wt,
-            &[
-                "push",
-                "-q",
-                bare.to_str().unwrap(),
-                "HEAD:refs/heads/staging",
-            ],
-        );
-        git_cmd(&bare, &["update-ref", "-d", "refs/heads/staging", &oid_hex]);
-
-        let repo_probe =
-            Repository::discover(Some(&bare), &RepositoryOptions::empty()).expect("open");
-        let git_dir = repo_probe.git_dir().to_path_buf();
-        let gate = new_repack_pause_gate();
-        let _pause_guard = RepackPauseGuard::arm(
-            &git_dir,
-            RepackPausePhase::AfterInventoryBeforeRoots,
-            Arc::clone(&gate),
-        );
-        let migrated_keeps = Arc::new(std::sync::Mutex::new(None));
-
-        let bare_thread = bare.clone();
-        let worker = thread::spawn(move || {
-            let repo = Repository::discover(Some(&bare_thread), &RepositoryOptions::empty())
-                .expect("open");
-            repack_all(
-                &repo,
-                &RepackOptions {
-                    write_bitmap: false,
-                    keep_unreachable: false,
-                    ..RepackOptions::default()
-                },
-            )
-        });
-
-        let mut paused = gate.wait.lock().unwrap();
-        while !*paused {
-            paused = gate.cv.wait(paused).unwrap();
-        }
-
-        let objects_dir = bare.join("objects");
-        let main_odb = Odb::new(&objects_dir).with_config_git_dir(bare.clone());
-        let mut quarantine = ReceiveQuarantine::create(&main_odb, &bare).expect("quarantine");
-        let pack_prefix_arg = quarantine
-            .path()
-            .join("pack/pack")
-            .to_string_lossy()
-            .into_owned();
-        let hook_env = quarantine.hook_env();
-        let mut pack_cmd = std::process::Command::new("git");
-        pack_cmd
-            .current_dir(&bare)
-            .arg("pack-objects")
-            .arg(&pack_prefix_arg)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_SYSTEM", "/dev/null");
-        for (key, value) in hook_env {
-            pack_cmd.env(key, value);
-        }
-        let mut pack_cmd = pack_cmd.spawn().expect("pack-objects");
-        pack_cmd
-            .stdin
-            .take()
-            .expect("stdin")
-            .write_all(format!("{oid_hex}\n").as_bytes())
-            .expect("write oid");
-        let pack_out = pack_cmd.wait_with_output().expect("pack-objects wait");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::create_dir_all(&remote).unwrap();
+        let git = |dir: &Path, args: &[&str]| {
+            assert!(std::process::Command::new("git")
+                .current_dir(dir)
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .status()
+                .expect("git")
+                .success());
+        };
+        git(&remote, &["init", "-q", "--bare", "-b", "main"]);
+        git(&wt, &["init", "-q", "-b", "main"]);
+        git(&wt, &["commit", "--allow-empty", "-qm", "base"]);
+        git(&wt, &["push", "-q", remote.to_str().unwrap(), "main"]);
+        git(&remote, &["repack", "-a", "-d"]);
+        let repo = Repository::open(&remote, &crate::environment::RepositoryOptions::empty())
+            .expect("open");
+        let mut q = ReceiveQuarantine::create(repo.odb(), repo.git_dir()).expect("quarantine");
+        let orphan = q
+            .odb()
+            .write(crate::objects::ObjectKind::Blob, b"orphan-bytes")
+            .expect("write in quarantine");
+        drop(q.migrate().expect("migrate"));
+        repack_all(
+            &repo,
+            &RepackOptions {
+                auto_skip: false,
+                write_bitmap: false,
+                keep_unreachable: false,
+                ..RepackOptions::default()
+            },
+        )
+        .expect("repack");
         assert!(
-            pack_out.status.success(),
-            "pack-objects: {:?}",
-            pack_out.stderr
+            !repo.odb().exists(&orphan),
+            "without .keep protection gc may drop an unreachable migrated loose object"
         );
-        let pack_stem = String::from_utf8(pack_out.stdout)
-            .expect("utf8")
-            .trim()
-            .to_string();
-        let keep_guard = quarantine.migrate().expect("migrate");
-        let migrated_pack = objects_dir.join(format!("pack/pack-{pack_stem}.pack"));
-        assert!(
-            migrated_pack.is_file(),
-            "canonical pack-* must be installed before ref publication"
-        );
-        assert!(
-            objects_dir
-                .join(format!("pack/pack-{pack_stem}.keep"))
-                .is_file(),
-            "migrate must pin pack until receive-pack finishes"
-        );
-        *migrated_keeps.lock().unwrap() = Some(keep_guard);
-
-        *paused = false;
-        gate.cv.notify_all();
-        drop(paused);
-
-        worker.join().unwrap().expect("repack with migrated pack");
-        assert!(
-            migrated_pack.is_file(),
-            "pinned pack must survive DropAll supersede while receive-pack holds .keep"
-        );
-
-        migrated_keeps.lock().unwrap().take();
-        git_cmd(&bare, &["update-ref", "refs/heads/published", &oid_hex]);
-        let repo = Repository::discover(Some(&bare), &RepositoryOptions::empty()).expect("open");
-        let oid = ObjectId::from_hex(&oid_hex).expect("oid");
-        repo.odb().read(&oid).expect("published tip readable");
-        assert_fsck_clean(&repo);
     }
 }

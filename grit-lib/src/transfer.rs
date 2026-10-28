@@ -2302,10 +2302,10 @@ pub(crate) fn push_local_from(
             }
         }
     }
-    let mut _migrated_pack_keeps = None;
+    let mut migrated_pack_keeps = Vec::new();
     if decisions.iter().any(|d| d.apply) && !opts.dry_run {
         if let Some((mut q, _)) = quarantine.take() {
-            _migrated_pack_keeps = Some(q.migrate()?);
+            migrated_pack_keeps = q.migrate()?;
             remote_repo.odb().invalidate_packs();
         }
         for d in decisions.iter_mut().filter(|d| d.apply) {
@@ -2395,6 +2395,8 @@ pub(crate) fn push_local_from(
             crate::branch_tracking::apply_push_remote_tracking_updates_in(local, remote, &results)?;
         }
     }
+
+    drop(migrated_pack_keeps);
 
     Ok(PushOutcome {
         results,
@@ -3696,7 +3698,7 @@ mod tests {
 
     /// Where in [`push_local_from`] a test hook interleaves another writer.
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-    pub(super) enum PushHookPoint {
+    pub(crate) enum PushHookPoint {
         /// After every update is decided and its objects copied, before the remote's
         /// `receive.*` policy rechecks each update against the remote refs.
         BeforeReceivePolicy,
@@ -3727,7 +3729,7 @@ mod tests {
     }
 
     /// Run `hook` inside the next local push on this thread when it reaches `point`.
-    fn on_next_push(point: PushHookPoint, hook: impl FnOnce() + 'static) {
+    pub(crate) fn on_next_push(point: PushHookPoint, hook: impl FnOnce() + 'static) {
         PUSH_HOOK.with(|slot| *slot.borrow_mut() = Some((point, Box::new(hook))));
     }
 
@@ -4148,4 +4150,9 @@ mod tests {
         assert_eq!(rejected.reported_updates().count(), 1);
         assert!(FetchOutcome::default().reported_updates().next().is_none());
     }
+}
+
+#[cfg(test)]
+pub(crate) mod push_test_hooks {
+    pub(crate) use super::tests::{on_next_push, PushHookPoint};
 }

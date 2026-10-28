@@ -102,9 +102,10 @@ pub struct PackBitmapWriteOptions {
     pub prefer_bitmap_tips: Vec<String>,
     /// When true, every object reachable from ref tips must appear in the bitmap order.
     pub verify_reachability_closure: bool,
-    /// Ref and maintenance roots frozen at repack start. When set, closure is validated
-    /// against this snapshot instead of re-reading live refs (concurrent pushes must not
-    /// fail bitmap generation on an already-built pack).
+    /// When set, validate reachability against these roots instead of re-reading refs.
+    ///
+    /// Maintenance passes the same roots it used to build a repack pack so a concurrent ref
+    /// update cannot make bitmap validation fail spuriously mid-gc.
     pub reachability_roots: Option<Vec<crate::objects::ObjectId>>,
 }
 
@@ -272,11 +273,10 @@ fn write_bitmap_for_order_in_context(
     bitmap_path: &Path,
     options: &PackBitmapWriteOptions,
 ) -> Result<PathBuf, PackBitmapWriteError> {
-    let roots = if let Some(roots) = options.reachability_roots.as_deref() {
-        roots.to_vec()
-    } else {
-        collect_referenced_object_roots(repo.git_dir())
-            .map_err(|e| PackBitmapWriteError::Object(e.to_string()))?
+    let roots = match &options.reachability_roots {
+        Some(roots) => roots.clone(),
+        None => collect_referenced_object_roots(repo.git_dir())
+            .map_err(|e| PackBitmapWriteError::Object(e.to_string()))?,
     };
     let strict = options.verify_reachability_closure;
     // Shallow boundary commits have no parents for reachability, as in Git.

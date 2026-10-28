@@ -1403,7 +1403,7 @@ impl Odb {
         reachable: &crate::gc::LazyReachable<'_>,
         retention: UnreachablePackRetention,
         retained_packs: &HashSet<PathBuf>,
-        pre_repack_packs: &HashSet<PathBuf>,
+        inventory_packs: &HashSet<PathBuf>,
     ) -> Result<usize> {
         if matches!(retention, UnreachablePackRetention::DropAll) {
             return Ok(0);
@@ -1418,7 +1418,7 @@ impl Odb {
         let kept_pack_oids = oids_in_marker_kept_packs(pack_dir, keep_pack)?;
         let mut loosened = 0usize;
         for (idx_path, pack_mtime) in
-            superseded_pack_indexes(pack_dir, keep_pack, retained_packs, pre_repack_packs)?
+            superseded_pack_indexes(pack_dir, keep_pack, retained_packs, inventory_packs)?
         {
             let oids = PackedObjects::object_ids_from_index_path(&idx_path)?;
             for oid in oids {
@@ -3745,7 +3745,7 @@ fn superseded_pack_indexes(
     pack_dir: &Path,
     keep_pack: &Path,
     retained_packs: &HashSet<PathBuf>,
-    pre_repack_packs: &HashSet<PathBuf>,
+    inventory_packs: &HashSet<PathBuf>,
 ) -> Result<Vec<(PathBuf, std::time::SystemTime)>> {
     let keep_stem = keep_pack
         .file_stem()
@@ -3779,6 +3779,7 @@ fn superseded_pack_indexes(
             || superseded_pack_has_keep_marker(pack_dir, &pack_path)
             || pack_path.with_extension("promisor").is_file()
             || retained_packs.contains(&pack_path)
+            || !inventory_packs.contains(&pack_path)
         {
             continue;
         }

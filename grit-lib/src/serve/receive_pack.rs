@@ -937,14 +937,11 @@ fn apply_commands_with_hooks(
         return Ok(results);
     }
 
-    let _migrated_pack_keeps = match quarantine {
-        Some(q) => {
-            let keeps = q.migrate().map_err(ServeError::Repository)?;
-            repo.odb().invalidate_packs();
-            Some(keeps)
-        }
-        None => None,
-    };
+    let mut migrated_pack_keeps = Vec::new();
+    if let Some(q) = quarantine {
+        migrated_pack_keeps = q.migrate().map_err(ServeError::Repository)?;
+        repo.odb().invalidate_packs();
+    }
 
     for (cmd, result) in request.commands.iter().zip(results.iter_mut()) {
         if result.error.is_some() {
@@ -1030,6 +1027,8 @@ fn apply_commands_with_hooks(
         relay_hook_sideband(&mut sideband_out, &pu_result)?;
         hook_records.push(hook_record("post-update", &pu_result));
     }
+
+    drop(migrated_pack_keeps);
 
     Ok(results)
 }

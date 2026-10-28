@@ -243,6 +243,7 @@ fn lookup_table_and_hash_cache_variants() {
                 lookup_table: lookup,
                 prefer_bitmap_tips: Vec::new(),
                 verify_reachability_closure: true,
+                reachability_roots: None,
             },
         );
         let out = Command::new("git")
