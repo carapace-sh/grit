@@ -952,6 +952,28 @@ fn bounded_filter_since_until_matches_git() {
             "main",
         ],
     );
+    assert_rev_list_filter_matches_git(
+        wt,
+        &repo,
+        &[
+            "--count",
+            "--author=Alice",
+            "--since=1970-01-01 00:41:40 +0000",
+            "main",
+        ],
+    );
+    assert_rev_list_filter_matches_git(
+        wt,
+        &repo,
+        &[
+            "--count",
+            "-n",
+            "2",
+            "--author=Alice",
+            "--since=1970-01-01 00:41:40 +0000",
+            "main",
+        ],
+    );
 }
 
 fn commit_with_committer_timestamps(
@@ -1056,13 +1078,47 @@ fn bounded_filter_since_frontier_avoids_missing_ancestor() {
     let result = rev_list(&repo, &positive, &negative, &opts).expect("rev_list");
     assert_eq!(result.commits, git_oids);
 
-    let filter = CommitFilterBuilder::new()
+    let parsed_count = parse_rev_list_cli(&[
+        "--count",
+        "--author=Alice",
+        "--since=1970-01-01 00:41:40 +0000",
+        "main",
+    ]);
+    let (positive, negative) = support::expand_revision_tokens(
+        &parsed_count
+            .rev_args
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+    );
+    let opts = RevListOptions {
+        count: true,
+        since_cutoff: parsed_count.since_cutoff,
+        commit_filter: parsed_count.filter,
+        use_commit_graph: false,
+        ..RevListOptions::default()
+    };
+    let git_n = git_rev_list_count(
+        wt,
+        &[
+            "--count",
+            "--author=Alice",
+            "--since=1970-01-01 00:41:40 +0000",
+            "main",
+        ],
+    );
+    let grit_n = rev_list(&repo, &positive, &negative, &opts)
+        .expect("count rev_list")
+        .commit_count();
+    assert_eq!(grit_n, git_n);
+
+    let list_filter = CommitFilterBuilder::new()
         .author("Alice")
         .build()
         .expect("filter");
     let opts = RevListOptions {
         max_count: Some(5000),
-        commit_filter: Some(Arc::new(filter)),
+        commit_filter: Some(Arc::new(list_filter)),
         missing_action: MissingAction::Error,
         use_commit_graph: true,
         ..RevListOptions::default()
@@ -1070,6 +1126,21 @@ fn bounded_filter_since_frontier_avoids_missing_ancestor() {
     assert!(
         rev_list(&repo, &["main".to_owned()], &[], &opts).is_err(),
         "unbounded walk must read the missing grandparent"
+    );
+    let count_filter = CommitFilterBuilder::new()
+        .author("Alice")
+        .build()
+        .expect("filter");
+    let opts = RevListOptions {
+        count: true,
+        commit_filter: Some(Arc::new(count_filter)),
+        missing_action: MissingAction::Error,
+        use_commit_graph: false,
+        ..RevListOptions::default()
+    };
+    assert!(
+        rev_list(&repo, &["main".to_owned()], &[], &opts).is_err(),
+        "count without --since must read the missing grandparent"
     );
 }
 

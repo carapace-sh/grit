@@ -6808,11 +6808,15 @@ fn can_use_bounded_commit_filter_list(options: &RevListOptions) -> bool {
         || options.pickaxe.is_some();
     output_filter
         && (options.max_count.is_some() || options.skip > 0 || options.count)
-        && can_use_bounded_limit_list(&RevListOptions {
-            commit_filter: None,
-            pickaxe: None,
-            ..options.clone()
-        })
+        && options.ordering == OrderingMode::Default
+        && plain_commit_walk(
+            &RevListOptions {
+                commit_filter: None,
+                pickaxe: None,
+                ..options.clone()
+            },
+            false,
+        )
 }
 
 fn try_bounded_commit_filter_limit_list(
@@ -6831,14 +6835,10 @@ fn try_bounded_commit_filter_limit_list(
     if include.is_empty() || !can_use_bounded_commit_filter_list(options) {
         return Ok(None);
     }
-    let max_count = if options.count {
-        None
-    } else {
-        let Some(max_count) = options.max_count else {
-            return Ok(None);
-        };
-        Some(max_count)
-    };
+    if !options.count && options.max_count.is_none() && options.skip == 0 {
+        return Ok(None);
+    }
+    let max_count = options.max_count;
 
     let mut commit_data = if options.retain_commit_data {
         crate::objects::oid_hash_map_with_capacity(max_count.unwrap_or(64).min(64))
@@ -6904,13 +6904,11 @@ fn try_bounded_commit_filter_limit_list(
                                 }
                             }
                             if passes {
-                                if options.count {
-                                    match_count += 1;
-                                } else {
-                                    matched_seen += 1;
-                                    if matched_seen > options.skip
-                                        && ordered.len() < max_count.unwrap_or(0)
-                                    {
+                                matched_seen += 1;
+                                if matched_seen > options.skip {
+                                    if options.count {
+                                        match_count += 1;
+                                    } else if max_count.is_none_or(|m| ordered.len() < m) {
                                         ordered.push(oid);
                                         if options.retain_commit_data {
                                             commit_data.insert(
@@ -6924,13 +6922,17 @@ fn try_bounded_commit_filter_limit_list(
                         }
                         graph.release_commit_bytes(oid);
 
-                        Ok(
-                            if !options.count && ordered.len() >= max_count.unwrap_or(0) {
+                        Ok(if options.count {
+                            if max_count.is_some_and(|m| match_count >= m) {
                                 WalkControl::Stop
                             } else {
                                 WalkControl::Continue
-                            },
-                        )
+                            }
+                        } else if max_count.is_some_and(|m| ordered.len() >= m) {
+                            WalkControl::Stop
+                        } else {
+                            WalkControl::Continue
+                        })
                     },
                 )?;
 
