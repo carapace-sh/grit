@@ -27310,6 +27310,8 @@ pub grit_lib::revwalk::object_inspect::ResolveError::AmbiguousShortObject::spec:
 pub grit_lib::revwalk::object_inspect::ResolveError::PathNotInTree
 pub grit_lib::revwalk::object_inspect::ResolveError::PathNotInTree::path: alloc::string::String
 pub grit_lib::revwalk::object_inspect::ResolveError::PathNotInTree::revision: alloc::string::String
+pub grit_lib::revwalk::object_inspect::ResolveError::ReflogDateUnparseable
+pub grit_lib::revwalk::object_inspect::ResolveError::ReflogDateUnparseable::date: alloc::string::String
 pub grit_lib::revwalk::object_inspect::ResolveError::RevisionRange
 pub grit_lib::revwalk::object_inspect::ResolveError::RevisionRange::spec: alloc::string::String
 pub grit_lib::revwalk::object_inspect::ResolveError::UnknownRevision
