@@ -570,17 +570,28 @@ pub fn parse_untracked_extension(data: &[u8]) -> Option<UntrackedCache> {
     Some(uc)
 }
 
-/// `untracked_cache_ident` function.
+/// UNTR extension identity string written at the start of the cache payload.
+///
+/// Must match system Git byte-for-byte (including the trailing NUL) so Git can reuse or
+/// invalidate the cache without printing *untracked cache is disabled*. The location is the
+/// work tree path normalized like `git rev-parse --show-toplevel` (`user_display_path`: no
+/// `\\?\` prefix, forward slashes, no trailing slash). The system name is `uname().sysname`
+/// on Unix and `Windows` on Windows (Git's own uname, not MSYS `MINGW64_NT-…`).
 pub fn untracked_cache_ident(work_tree: &Path) -> Vec<u8> {
     #[cfg(unix)]
     let sysname = match nix::sys::utsname::uname() {
         Ok(uts) => uts.sysname().to_string_lossy().into_owned(),
         Err(_) => "unknown".to_string(),
     };
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    let sysname = "Windows".to_string();
+    #[cfg(not(any(unix, windows)))]
     let sysname = "unknown".to_string();
 
-    let loc = work_tree.display().to_string();
+    let mut loc = crate::git_path::user_display_path(work_tree);
+    while loc.len() > 1 && loc.ends_with('/') {
+        loc.pop();
+    }
     let mut s = format!("Location {loc}, system {sysname}");
     s.push('\0');
     s.into_bytes()
@@ -2056,6 +2067,15 @@ mod tests {
         let ident = untracked_cache_ident(dir.path());
         assert!(ident.ends_with(&[0]));
         assert!(ident.len() > 1);
+        let text = std::str::from_utf8(&ident[..ident.len() - 1]).expect("utf8");
+        assert!(text.starts_with("Location "));
+        assert!(
+            !text.contains('\\'),
+            "ident location must use forward slashes"
+        );
+        assert!(text.contains(", system "));
+        #[cfg(windows)]
+        assert!(text.ends_with(", system Windows"));
     }
 
     #[test]
