@@ -1163,6 +1163,61 @@ fn apply_rewrite_journal_accepts_git_path_with_double_dot_in_name() {
 }
 
 #[test]
+fn rewrite_apply_journal_stores_from_tree_manifest_for_wide_clean_transition() {
+    let repo = HistoryRepo::init();
+    let wt = repo.worktree();
+    build_commit_dag(wt, &[("b", "a")], &[("b", "refs/heads/main")]);
+    for i in 0..40 {
+        commit_file(
+            wt,
+            &format!("wide/{i}.txt"),
+            &format!("base {i}\n"),
+            &format!("track {i}"),
+        );
+    }
+    let tip = git_rev_parse(wt, "HEAD").expect("tip");
+    let edits: Vec<(String, Vec<u8>)> = (0..40)
+        .map(|i| (format!("wide/{i}.txt"), format!("next {i}\n").into_bytes()))
+        .collect();
+    let edit_refs: Vec<(&str, &[u8])> = edits
+        .iter()
+        .map(|(path, bytes)| (path.as_str(), bytes.as_slice()))
+        .collect();
+    let plan = plan_tip_tree_edits(wt, tip, &edit_refs);
+    let grit = open_grit(wt);
+    grit_lib::repo::set_test_inject_rewrite_apply_abort_after_refs(true);
+    apply_rewrite(
+        &grit,
+        &plan,
+        &apply_opts(),
+        &mut grit_lib::progress::NullProgress,
+        &mut grit_lib::progress::NeverCancel,
+    )
+    .expect_err("injected abort");
+    grit_lib::repo::set_test_inject_rewrite_apply_abort_after_refs(false);
+    let worktree_dir = wt.join(".git/grit/rewrite-apply/worktree");
+    let file_count = fs::read_dir(&worktree_dir)
+        .expect("journal worktree dir")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_file())
+        .count();
+    assert_eq!(
+        file_count, 1,
+        "wide clean tree transitions must not write one journal payload file per path"
+    );
+    grit_lib::revwalk::history::abort_interrupted_rewrite_apply(&grit).expect("abort");
+    for i in 0..40 {
+        let path = wt.join(format!("wide/{i}.txt"));
+        assert_eq!(
+            fs::read_to_string(&path).expect("read"),
+            format!("base {i}\n"),
+            "rollback must rebuild clean paths from the old tree"
+        );
+    }
+    git_fsck_strict(wt);
+}
+
+#[test]
 fn interrupted_rewrite_apply_abort_restores_empty_tracked_file() {
     let repo = HistoryRepo::init();
     let wt = repo.worktree();

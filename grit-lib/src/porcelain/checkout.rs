@@ -3475,7 +3475,7 @@ fn remove_uninitialized_gitlink_worktree(abs: &Path) {
 }
 
 /// Create an empty directory for an uninitialized gitlink, replacing conflicting paths.
-fn materialize_gitlink_worktree(
+pub(crate) fn materialize_gitlink_worktree(
     work_tree: &Path,
     rel_path: &str,
     dir_cache: &mut LeadingDirCache,

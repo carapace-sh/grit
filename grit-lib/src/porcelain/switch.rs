@@ -162,6 +162,14 @@ impl PreparedSwitch {
     pub(crate) fn preserve_worktree_paths(&self) -> &HashSet<String> {
         &self.preserve_worktree_paths
     }
+
+    pub(crate) fn tree_changes(&self) -> &[crate::diff::DiffEntry] {
+        &self.plan.tree_changes
+    }
+
+    pub(crate) fn index(&self) -> &crate::index::Index {
+        &self.index
+    }
 }
 
 /// Resolve `-c <branch> [<start-point>]`.

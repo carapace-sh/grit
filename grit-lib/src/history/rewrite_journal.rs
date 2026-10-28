@@ -26,6 +26,7 @@ const FORMAT_VERSION: u32 = 1;
 const META: &str = "meta";
 const INDEX_BEFORE: &str = "index-before";
 const WORKTREE_DIR: &str = "worktree";
+const WORKTREE_FROM_TREE: &str = "from-tree";
 
 /// Which apply path created a pending journal (controls recovery).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,8 +99,16 @@ pub fn write_rewrite_apply_journal(
     index_before
         .restore_to(&dir.join(INDEX_BEFORE))
         .map_err(journal_write_err)?;
+    let mut from_tree_paths: Vec<(&str, &WorktreePathSnapshot)> = Vec::new();
     for (path, snap) in worktree_before {
-        write_worktree_snapshot_file(&worktree_dir, path, snap)?;
+        if snap.from_old_tree {
+            from_tree_paths.push((path.as_str(), snap));
+        } else {
+            write_worktree_snapshot_file(&worktree_dir, path, snap)?;
+        }
+    }
+    if !from_tree_paths.is_empty() {
+        write_worktree_from_tree_manifest(&worktree_dir, &from_tree_paths)?;
     }
 
     let body = serialize_meta(plan, opts, apply_kind);
@@ -235,6 +244,7 @@ fn finish_checkout_from_journal(
 ) -> Result<RewriteApplyRecovery, HistoryError> {
     let checkout = restore_worktree_after_failed_apply(
         repo,
+        Some(old_tree),
         record.index_before.as_ref(),
         record.worktree_before.as_ref(),
     )
@@ -306,6 +316,7 @@ fn rollback_from_journal(
     rollback_ref_updates(repo, &record.ref_updates, &record.apply_options)?;
     restore_worktree_after_failed_apply(
         repo,
+        record.head_old_tree.as_ref(),
         record.index_before.as_ref(),
         record.worktree_before.as_ref(),
     )?;
@@ -567,6 +578,9 @@ fn decode_snapshot_path_legacy(raw: &str) -> Result<String, HistoryError> {
 }
 
 fn payload_kind_line(snap: &WorktreePathSnapshot) -> &'static str {
+    if snap.from_old_tree {
+        return "payload: from-tree";
+    }
     match snap.kind {
         WorktreePathKind::Absent | WorktreePathKind::Directory => "payload: none",
         WorktreePathKind::Regular | WorktreePathKind::Symlink => match snap.bytes.as_ref() {
@@ -575,6 +589,75 @@ fn payload_kind_line(snap: &WorktreePathSnapshot) -> &'static str {
             Some(_) => "payload: data",
         },
     }
+}
+
+fn worktree_kind_label(kind: WorktreePathKind) -> &'static str {
+    match kind {
+        WorktreePathKind::Absent => "absent",
+        WorktreePathKind::Directory => "directory",
+        WorktreePathKind::Regular => "regular",
+        WorktreePathKind::Symlink => "symlink",
+    }
+}
+
+fn write_worktree_from_tree_manifest(
+    dir: &Path,
+    paths: &[(&str, &WorktreePathSnapshot)],
+) -> Result<(), HistoryError> {
+    let mut body = String::from("from-tree-manifest 1\n");
+    for (path, snap) in paths {
+        body.push_str(&format!(
+            "{} {}\n",
+            worktree_kind_label(snap.kind),
+            encode_snapshot_path(path)?
+        ));
+    }
+    fs::write(dir.join(WORKTREE_FROM_TREE), body).map_err(journal_write_err)
+}
+
+fn read_worktree_from_tree_manifest(
+    dir: &Path,
+) -> Result<HashMap<String, WorktreePathSnapshot>, HistoryError> {
+    let path = dir.join(WORKTREE_FROM_TREE);
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(e) => return Err(journal_read_err(e)),
+    };
+    let mut out = HashMap::new();
+    let mut lines = text.lines();
+    let header = lines.next().unwrap_or_default().trim();
+    if header != "from-tree-manifest 1" {
+        return Err(HistoryError::UndoRecordRead {
+            message: format!("unsupported from-tree manifest header {header:?}"),
+        });
+    }
+    for (line_no, line) in lines.enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.splitn(2, ' ');
+        let kind_label = parts.next().unwrap_or_default();
+        let path_hex = parts
+            .next()
+            .ok_or_else(|| parse_err(line_no + 1, "missing path in from-tree manifest"))?;
+        let repo_path = decode_snapshot_path_hex(path_hex)?;
+        let kind = match kind_label {
+            "absent" => WorktreePathKind::Absent,
+            "directory" => WorktreePathKind::Directory,
+            "regular" => WorktreePathKind::Regular,
+            "symlink" => WorktreePathKind::Symlink,
+            other => {
+                return Err(parse_err(
+                    line_no + 1,
+                    &format!("unknown from-tree kind {other:?}"),
+                ));
+            }
+        };
+        out.insert(repo_path, WorktreePathSnapshot::from_old_tree(kind));
+    }
+    Ok(out)
 }
 
 fn write_worktree_snapshot_file(
@@ -614,10 +697,17 @@ fn read_worktree_snapshot_dir(
     if !dir.is_dir() {
         return Ok(out);
     }
+    out.extend(read_worktree_from_tree_manifest(dir)?);
     for entry in fs::read_dir(dir).map_err(journal_read_err)? {
         let entry = entry.map_err(journal_read_err)?;
         let path = entry.path();
         if !path.is_file() {
+            continue;
+        }
+        if path
+            .file_name()
+            .is_some_and(|name| name == WORKTREE_FROM_TREE)
+        {
             continue;
         }
         let bytes = fs::read(&path).map_err(journal_read_err)?;
@@ -692,14 +782,20 @@ fn parse_worktree_snapshot_file(
     let kind = kind.ok_or_else(|| HistoryError::UndoRecordRead {
         message: format!("worktree snapshot for {path} missing kind"),
     })?;
-    let bytes = match payload_kind {
-        Some("empty") => Some(Vec::new()),
-        Some("data") => Some(payload),
-        Some("none") | None => None,
-        Some(other) => {
-            return Err(HistoryError::UndoRecordRead {
-                message: format!("unknown payload kind {other:?} for {path}"),
-            });
+    let from_old_tree = payload_kind == Some("from-tree");
+    let bytes = if from_old_tree {
+        None
+    } else {
+        match payload_kind {
+            Some("empty") => Some(Vec::new()),
+            Some("data") => Some(payload),
+            Some("none") | None => None,
+            Some("from-tree") => None,
+            Some(other) => {
+                return Err(HistoryError::UndoRecordRead {
+                    message: format!("unknown payload kind {other:?} for {path}"),
+                });
+            }
         }
     };
     Ok((
@@ -707,6 +803,7 @@ fn parse_worktree_snapshot_file(
         WorktreePathSnapshot {
             kind,
             bytes,
+            from_old_tree,
             #[cfg(unix)]
             mode,
         },
@@ -743,6 +840,7 @@ mod tests {
             WorktreePathSnapshot {
                 kind: WorktreePathKind::Regular,
                 bytes: Some(b"hello".to_vec()),
+                from_old_tree: false,
                 #[cfg(unix)]
                 mode: 0o644,
             },
@@ -788,6 +886,7 @@ mod tests {
             WorktreePathSnapshot {
                 kind: WorktreePathKind::Regular,
                 bytes: Some(Vec::new()),
+                from_old_tree: false,
                 #[cfg(unix)]
                 mode: 0o644,
             },
@@ -835,6 +934,7 @@ mod tests {
             WorktreePathSnapshot {
                 kind: WorktreePathKind::Regular,
                 bytes: Some(b"file".to_vec()),
+                from_old_tree: false,
                 #[cfg(unix)]
                 mode: 0o644,
             },
@@ -844,6 +944,7 @@ mod tests {
             WorktreePathSnapshot {
                 kind: WorktreePathKind::Regular,
                 bytes: Some(b"nested".to_vec()),
+                from_old_tree: false,
                 #[cfg(unix)]
                 mode: 0o644,
             },
@@ -894,6 +995,7 @@ mod tests {
             WorktreePathSnapshot {
                 kind: WorktreePathKind::Regular,
                 bytes: Some(b"payload".to_vec()),
+                from_old_tree: false,
                 #[cfg(unix)]
                 mode: 0o644,
             },
@@ -927,6 +1029,62 @@ mod tests {
             restored.get(path).and_then(|s| s.bytes.as_deref()),
             Some(b"payload" as &[u8])
         );
+        clear_rewrite_apply_journal(&repo).expect("clear");
+    }
+
+    #[test]
+    fn from_tree_manifest_roundtrip_many_paths() {
+        let (_dir, repo) = temp_repo();
+        let mut snaps = HashMap::new();
+        for i in 0..50 {
+            snaps.insert(
+                format!("path/{i}.txt"),
+                WorktreePathSnapshot::from_old_tree(WorktreePathKind::Regular),
+            );
+        }
+        snaps.insert(
+            "gone.txt".into(),
+            WorktreePathSnapshot::from_old_tree(WorktreePathKind::Absent),
+        );
+        let plan = RewritePlan {
+            commits: Vec::new(),
+            ref_updates: Vec::new(),
+            head: HeadEffect::default(),
+        };
+        let opts = ApplyOptions {
+            identity: test_apply_identity(),
+            reflog_message: "test".into(),
+            record_operation: None,
+            hooks: Default::default(),
+        };
+        write_rewrite_apply_journal(
+            &repo,
+            &plan,
+            &opts,
+            RewriteApplyKind::Standard,
+            &IndexSnapshot {
+                bytes: b"INDEX".to_vec(),
+                mtime: None,
+            },
+            &snaps,
+        )
+        .expect("write");
+        let worktree_dir = journal_dir(repo.git_dir()).join(WORKTREE_DIR);
+        let snapshot_files = fs::read_dir(&worktree_dir)
+            .expect("read dir")
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_file())
+            .count();
+        assert_eq!(
+            snapshot_files, 1,
+            "clean transitions must use one from-tree manifest, not one file per path"
+        );
+        let record = read_rewrite_apply_journal(&repo).expect("read");
+        let restored = record.worktree_before.expect("snapshots");
+        assert_eq!(restored.len(), 51);
+        assert!(restored
+            .get("path/0.txt")
+            .is_some_and(|s| s.from_old_tree && s.bytes.is_none()));
         clear_rewrite_apply_journal(&repo).expect("clear");
     }
 }
