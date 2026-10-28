@@ -30,7 +30,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use grit_lib::config::ConfigSet;
-use grit_lib::error::{AuthFailure, Error, Result as GritResult};
+use grit_lib::error::{AuthFailure, Error, RemoteUnreadableReason, Result as GritResult};
 use grit_lib::objects::odb::Odb;
 use grit_lib::refs::resolve_ref;
 use grit_lib::remote::credentials::{Credential, CredentialProvider, HelperCredentialProvider};
@@ -409,6 +409,92 @@ fn fetch_over_authed_http_succeeds_with_right_credentials_and_fails_typed_otherw
         fsck.status.success(),
         "git fsck failed after authed fetch: {}",
         String::from_utf8_lossy(&fsck.stderr)
+    );
+}
+
+/// Authenticated discovery against a missing repository must not erase credentials:
+/// Git runs `credential reject` only on 401, not on 404/403/5xx.
+#[test]
+fn fetch_missing_repo_with_valid_credentials_does_not_reject_them() {
+    if find_binary("grit-http-server").is_none() {
+        eprintln!("SKIP: `grit-http-server` binary not found (build it first)");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let work = tmp.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    build_source(&work);
+
+    let root = tmp.path().join("srv");
+    mirror_bare(&work, &root, "repo.git");
+
+    let Some((_guard, port)) = start_authed_server(&root) else {
+        eprintln!("SKIP: could not start authed grit-http-server");
+        return;
+    };
+    let good_url = format!("http://127.0.0.1:{port}/repo.git");
+    let typo_url = format!("http://127.0.0.1:{port}/repo-typo.git");
+
+    let mut opts = FetchOptions {
+        refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()],
+        tags: TagMode::All,
+        ..Default::default()
+    };
+
+    let provider = SharedProvider(Arc::new(StaticCredentialProvider::new(USER, PASS)));
+    let client = http_client_arc(
+        UreqHttpClient::with_credentials(Box::new(provider.clone())).with_git_protocol("version=2"),
+    );
+
+    let local = tmp.path().join("typo");
+    std::fs::create_dir_all(&local).unwrap();
+    git(&local, &["init", "-q", "-b", "main", "."]);
+    let local_git = local.join(".git");
+
+    let err = http_fetch(
+        client.clone(),
+        &local_git,
+        &typo_url,
+        &mut opts,
+        &mut NoProgress,
+    )
+    .expect_err("fetch of a missing repo must fail");
+    assert!(
+        matches!(
+            err,
+            Error::RemoteUnreadable {
+                reason: RemoteUnreadableReason::HttpStatus { status: 404 },
+                ..
+            }
+        ),
+        "expected HTTP 404 remote_unreadable, got: {err:?}"
+    );
+    assert_eq!(
+        provider.0.rejects.load(Ordering::SeqCst),
+        0,
+        "404 must not reject stored credentials"
+    );
+    assert_eq!(
+        provider.0.approves.load(Ordering::SeqCst),
+        0,
+        "404 must not approve credentials either"
+    );
+
+    let local_ok = tmp.path().join("ok");
+    std::fs::create_dir_all(&local_ok).unwrap();
+    git(&local_ok, &["init", "-q", "-b", "main", "."]);
+    let local_ok_git = local_ok.join(".git");
+    http_fetch(client, &local_ok_git, &good_url, &mut opts, &mut NoProgress)
+        .expect("fetch of the real repo must still work with the same provider");
+    assert!(
+        provider.0.approves.load(Ordering::SeqCst) >= 1,
+        "correct credentials should be approved after a successful fetch"
+    );
+    assert_eq!(
+        provider.0.rejects.load(Ordering::SeqCst),
+        0,
+        "credentials must still not be rejected"
     );
 }
 

@@ -6,8 +6,12 @@
 //! `User-Agent` / `Content-Type` / `Accept` headers, and reading the response
 //! body into a `Vec<u8>` — and adds optional HTTP basic auth driven by a
 //! [`CredentialProvider`]: on a `401` it parses `WWW-Authenticate`, fills a
-//! credential, and retries once, then `approve`/`reject`s the credential per the
-//! retry status (Git's `credential_approve` / `credential_reject`).
+//! credential, and retries once. On the retry, `reject` runs only when the
+//! server still answers `401` (Git's `credential_reject`); a working credential
+//! that gets 403, 404, 429 or 5xx is left alone — neither `approve` nor
+//! `reject` — and the request fails with [`Error::RemoteUnreadable`].
+//! Successful retries call `approve` and cache the auth header (Git's
+//! `credential_approve`).
 //!
 //! When authentication is required but cannot be satisfied — no provider wired,
 //! the provider cannot supply a usable username/password, an unsupported auth
@@ -814,8 +818,6 @@ impl UreqHttpClient {
             return Err(auth_error(url, AuthFailure::Rejected));
         }
         if retry_head.status >= 400 {
-            let _ = provider.reject(&cred);
-            self.clear_auth_header();
             drain_response_body(retry_reader);
             return Err(http_status_error(url, retry_head.status));
         }
@@ -1015,8 +1017,6 @@ impl UreqHttpClient {
             return Err(auth_error(url, AuthFailure::Rejected));
         }
         if retry.status >= 400 {
-            let _ = provider.reject(&cred);
-            self.clear_auth_header();
             return Err(http_status_error(url, retry.status));
         }
         // Success: approve + cache the working auth header for this origin only.
