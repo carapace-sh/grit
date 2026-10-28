@@ -700,7 +700,7 @@ enum BundleAction {
     /// Write a bundle file from revision specs.
     Create {
         /// Output bundle path.
-        #[arg(add = completer!(crate::completions::actions::files()))]
+        #[arg(add = completer!(carapace_rs::Action::files([])))]
         file: String,
         /// Commits or ref ranges to include (same rules as `grit log`).
         #[arg(value_name = "REV", conflicts_with = "all")]
@@ -716,13 +716,13 @@ enum BundleAction {
     /// Check that a bundle file is well-formed.
     Verify {
         /// Bundle file to verify.
-        #[arg(add = completer!(crate::completions::actions::files()))]
+        #[arg(add = completer!(carapace_rs::Action::files([])))]
         file: String,
     },
     /// List refs recorded in a bundle header.
     List {
         /// Bundle file to read.
-        #[arg(add = completer!(crate::completions::actions::files()))]
+        #[arg(add = completer!(carapace_rs::Action::files([])))]
         file: String,
         #[command(flatten)]
         limit: limit_args::LimitArgs,
@@ -730,7 +730,7 @@ enum BundleAction {
     /// Ingest a bundle pack into the current repository.
     Unbundle {
         /// Bundle file to read.
-        #[arg(add = completer!(crate::completions::actions::files()))]
+        #[arg(add = completer!(carapace_rs::Action::files([])))]
         file: String,
         /// Verify and list ref updates without ingesting objects or writing refs.
         #[arg(long = "dry-run")]
@@ -1075,7 +1075,7 @@ enum Command {
         rev_pos: Option<String>,
         /// File to blame (repository-relative).
         #[arg(value_name = "FILE", last = true, allow_hyphen_values = true)]
-        #[arg(add = completer!(crate::completions::actions::files()))]
+        #[arg(add = completer!(carapace_rs::Action::files([])))]
         file: Option<String>,
         /// Blame at this revision instead of `HEAD`.
         #[arg(long)]
@@ -1098,7 +1098,7 @@ enum Command {
         ignore_rev: Vec<String>,
         /// Read revision oids to ignore from a file (repeatable; `""` clears prior entries).
         #[arg(long = "ignore-revs-file", value_name = "FILE")]
-        #[arg(add = completer!(crate::completions::actions::files()))]
+        #[arg(add = completer!(carapace_rs::Action::files([])))]
         ignore_revs_file: Vec<String>,
         /// With `--json`, emit grouped `hunks[]` instead of per-line `lines[]`.
         #[arg(long)]
@@ -1197,7 +1197,7 @@ enum Command {
         non_executable: bool,
         /// Apply a unified diff to the index (`git apply --cached`). Use `-` for stdin.
         #[arg(long = "patch-file", value_name = "FILE|-")]
-        #[arg(add = completer!(crate::completions::actions::files()))]
+        #[arg(add = completer!(carapace_rs::Action::files([])))]
         patch_file: Option<String>,
         /// Stage only the listed hunk ids from `grit diff --json` (comma-separated, repeatable).
         #[arg(long = "hunks", value_name = "ID,...", action = clap::ArgAction::Append)]
@@ -1446,7 +1446,7 @@ enum Command {
             value_name = "FILE|-",
             conflicts_with_all = ["hunks", "lines", "all", "staged", "paths", "pathspec_from_file"]
         )]
-        #[arg(add = completer!(crate::completions::actions::files()))]
+        #[arg(add = completer!(carapace_rs::Action::files([])))]
         patch_file: Option<String>,
         /// Commit only the listed hunk ids from `grit diff --json` (comma-separated, repeatable).
         #[arg(
@@ -1989,7 +1989,7 @@ enum Command {
             conflicts_with_all = ["message", "message_file"],
             allow_hyphen_values = true
         )]
-        #[arg(add = completer!(crate::completions::actions::files()))]
+        #[arg(add = completer!(carapace_rs::Action::files([])))]
         legacy_message_file: Option<String>,
         /// Object to tag (revision). Defaults to `HEAD`.
         #[arg(
@@ -2107,7 +2107,7 @@ enum Command {
             value_name = "PATH",
             conflicts_with_all = ["global", "local", "system", "worktree"]
         )]
-        #[arg(add = completer!(crate::completions::actions::files()))]
+        #[arg(add = completer!(carapace_rs::Action::files([])))]
         file: Option<std::path::PathBuf>,
         /// List configuration values (optional `<prefix>` filters keys).
         #[arg(
@@ -2280,7 +2280,7 @@ enum Command {
         root: std::path::PathBuf,
         /// The user database (default: `grit-serve.db` in the root, or in its `.git`).
         #[arg(long, global = true, value_name = "FILE")]
-        #[arg(add = completer!(crate::completions::actions::files()))]
+        #[arg(add = completer!(carapace_rs::Action::files([])))]
         db: Option<std::path::PathBuf>,
         /// Address to listen on.
         #[arg(long, value_name = "HOST:PORT", default_value = "127.0.0.1:8080")]

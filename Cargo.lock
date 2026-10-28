@@ -296,9 +296,9 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
 name = "carapace-rs"
-version = "0.0.5"
+version = "0.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e18fdbd89bdeec367d5ca09719737426eed0197d65fd26712ae6c5fb32573726"
+checksum = "cbb4e42385b66739398e5af172ff10d983f0f27716091a81448f308fe0a92914"
 dependencies = [
  "carapace-rs-shlex",
  "dirs",
@@ -311,9 +311,9 @@ dependencies = [
 
 [[package]]
 name = "carapace-rs-clap"
-version = "0.0.5"
+version = "0.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "313e9ca60d7339ae5e0bbce359f548263e4d0c0d5d2febe9c07c0a8fdffa7176"
+checksum = "7a57bd9857863fc171d5493643cd974b9369d5f30b15943c24f1b5b1b8c1ac44"
 dependencies = [
  "carapace-rs",
  "carapace-rs-spec",
@@ -323,15 +323,15 @@ dependencies = [
 
 [[package]]
 name = "carapace-rs-shlex"
-version = "0.0.5"
+version = "0.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef1c3723edc02b1395b36043d9c506a2fa6a8c0cb398a9e6b04c57710f2bea27"
+checksum = "75e161c1f8b1291e1d1e41ee1add0fa30db297de00f75ec5cc266ea8db1bd78c"
 
 [[package]]
 name = "carapace-rs-spec"
-version = "0.0.5"
+version = "0.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eba44738ba59c5c318f87966e283c4a5d927979edff6d7bd2b6c171d7bab493f"
+checksum = "298d09dd28c95538fede8bce594d8454ea1a16bc6f36f3e93b71c2b2f109df04"
 dependencies = [
  "carapace-rs",
  "carapace-rs-shlex",

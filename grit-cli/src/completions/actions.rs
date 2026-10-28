@@ -365,7 +365,7 @@ pub(crate) fn paths() -> Action {
 
 /// Worktree entries below the current directory, minus ignored paths.
 fn worktree_files(context: &Context) -> InvokedAction {
-    let files = files().invoke(context);
+    let files = Action::files([]).invoke(context);
     let Some(repo) = repository(context) else {
         return files;
     };
@@ -410,14 +410,6 @@ fn repo_relative(work_tree: &Path, context: &Context, value: &str) -> Option<Str
         path.push_str(part);
     }
     Some(path)
-}
-
-/// Every file in the worktree below the current directory.
-///
-/// `Action::files` takes a suffix filter, which has to spell out its iterator
-/// type when empty; this names the common "no filter" case.
-pub(crate) fn files() -> Action {
-    Action::files(Vec::<String>::new())
 }
 
 /// Index paths, truncated to the current directory when it is a subdirectory.

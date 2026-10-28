@@ -26,7 +26,7 @@ pub struct PathspecArgs {
         long = "pathspec-from-file",
         value_name = "FILE|-",
         allow_hyphen_values = true,
-        add = completer!(crate::completions::actions::files())
+        add = completer!(carapace_rs::Action::files([]))
     )]
     pub pathspec_from_file: Option<String>,
     /// `--pathspec-from-file` entries are NUL-separated.

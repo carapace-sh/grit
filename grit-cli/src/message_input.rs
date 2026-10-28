@@ -35,7 +35,7 @@ pub struct MessageInputArgs {
         value_name = "PATH|-",
         conflicts_with = "message",
         allow_hyphen_values = true,
-        add = completer!(crate::completions::actions::files())
+        add = completer!(carapace_rs::Action::files([]))
     )]
     pub message_file: Option<String>,
 }
