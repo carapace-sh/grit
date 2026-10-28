@@ -13,8 +13,7 @@ use crate::lockfile::LockWait;
 use crate::objects::ObjectId;
 
 use super::store::reference_transaction::{
-    apply_with_reference_transaction_hooks, branch_commit_reference_transaction_lines,
-    detached_head_commit_reference_transaction_lines,
+    branch_commit_reference_transaction_lines, detached_head_commit_reference_transaction_lines,
 };
 use super::store::{Expected, RawRef, RefStore, RefUpdate, RefUpdateFlags, ReflogUpdate};
 use super::{
@@ -96,20 +95,27 @@ pub fn update_branch_for_commit_on_store(
             )))
         }
     }
-    let reflog_old = update.expected_old.unwrap_or_else(zero_oid);
+    let null_oid = store.reference_transaction_null_oid();
+    let reflog_old = update.expected_old.unwrap_or(null_oid);
     if let Some(files) = store.as_files() {
         verify_new_tip(store, update.branch_ref, update.new_oid)?;
-        let apply =
-            || super::update_branch_for_commit_files(files.git_dir(), update, &reflog_old, config);
         if let Some(ctx) = store.ref_hook_context() {
+            let hook_old = update.expected_old.unwrap_or_else(|| ctx.null_oid());
             let lines = branch_commit_reference_transaction_lines(
                 update.branch_ref,
-                reflog_old,
+                hook_old,
                 update.new_oid,
             );
-            return apply_with_reference_transaction_hooks(ctx, &lines, apply);
+            return super::update_branch_for_commit_files_with_reference_transaction_hooks(
+                files.git_dir(),
+                update,
+                &reflog_old,
+                config,
+                ctx,
+                &lines,
+            );
         }
-        return apply();
+        return super::update_branch_for_commit_files(files.git_dir(), update, &reflog_old, config);
     }
 
     ensure_refname_safe_for_storage(update.branch_ref)?;
@@ -170,24 +176,30 @@ pub(crate) fn update_detached_head_for_commit_on_store(
     }
     if let Some(files) = store.as_files() {
         verify_new_tip(store, "HEAD", new_oid)?;
-        let apply = || {
-            super::update_detached_head_for_commit_files(
+        if let Some(ctx) = store.ref_hook_context() {
+            let hook_old = expected_old.unwrap_or_else(|| ctx.null_oid());
+            let lines = detached_head_commit_reference_transaction_lines(hook_old, new_oid);
+            return super::update_detached_head_for_commit_files_with_reference_transaction_hooks(
                 files.git_dir(),
                 expected_old,
                 new_oid,
                 identity,
                 reflog_message,
                 config,
-            )
-        };
-        if let Some(ctx) = store.ref_hook_context() {
-            let reflog_old = expected_old.unwrap_or_else(zero_oid);
-            let lines = detached_head_commit_reference_transaction_lines(reflog_old, new_oid);
-            return apply_with_reference_transaction_hooks(ctx, &lines, apply);
+                ctx,
+                &lines,
+            );
         }
-        return apply();
+        return super::update_detached_head_for_commit_files(
+            files.git_dir(),
+            expected_old,
+            new_oid,
+            identity,
+            reflog_message,
+            config,
+        );
     }
-    let reflog_old = expected_old.unwrap_or_else(zero_oid);
+    let reflog_old = expected_old.unwrap_or_else(|| store.reference_transaction_null_oid());
     let reflog = reflog_wanted(store, config, "HEAD")?
         .then(|| explicit_reflog(identity, reflog_message, reflog_old, new_oid));
     commit_ref_update_on_store_with_wait(

@@ -172,4 +172,8 @@ impl RefStore for ObjectCheckedRefStore {
     fn ref_hook_context(&self) -> Option<&RefHookContext> {
         self.hooks.as_deref()
     }
+
+    fn reference_transaction_null_oid(&self) -> ObjectId {
+        self.null_oid()
+    }
 }

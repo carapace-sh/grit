@@ -206,6 +206,12 @@ pub trait RefStore: Send + Sync + Debug {
         None
     }
 
+    /// Null object id width for `reference-transaction` stdin on this store.
+    #[doc(hidden)]
+    fn reference_transaction_null_oid(&self) -> ObjectId {
+        crate::diff::zero_oid()
+    }
+
     /// Whether a reflog is present for `name`.
     fn reflog_exists(&self, name: &str) -> Result<bool>;
 

@@ -118,30 +118,6 @@ pub(crate) fn run_reference_transaction_phase(
         .map_err(|e| RefStoreError::Hook(e.into()))
 }
 
-/// Run `prepared`, then `apply`; on success run `committed`, on failure run `aborted`.
-pub(crate) fn apply_with_reference_transaction_hooks(
-    ctx: &RefHookContext,
-    lines: &[ReferenceTransactionLine],
-    apply: impl FnOnce() -> crate::error::Result<()>,
-) -> crate::error::Result<()> {
-    if lines.is_empty() {
-        return apply();
-    }
-    let stdin = stdin_from_lines(lines);
-    ctx.run_reference_transaction(ReferenceTransactionPhase::Prepared, &stdin)
-        .map_err(crate::error::Error::Hook)?;
-    match apply() {
-        Ok(()) => {
-            let _ = ctx.run_reference_transaction(ReferenceTransactionPhase::Committed, &stdin);
-            Ok(())
-        }
-        Err(err) => {
-            let _ = ctx.run_reference_transaction(ReferenceTransactionPhase::Aborted, &stdin);
-            Err(err)
-        }
-    }
-}
-
 /// Prepared batch with optional hook phases after the backend locks.
 pub(crate) struct HookWrappedPrepared<'a> {
     inner: Option<Box<dyn PreparedRefTransaction + Send + 'a>>,
