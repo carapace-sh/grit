@@ -5,15 +5,18 @@ use crate::support;
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
+use std::process::Command;
 
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::config::ConfigSet;
+use grit_lib::index::untracked_cache::AUTO_UNTRACKED_CACHE_MIN_ENTRIES;
 use grit_lib::index::untracked_cache::{
     collect_untracked_from_cache, dir_flags_from_config, parse_untracked_extension,
     refresh_untracked_cache_for_status, try_untracked_from_valid_cache, untracked_cache_ident,
     UntrackedCache, UntrackedIgnoredMode, DIR_HIDE_EMPTY_DIRECTORIES, DIR_SHOW_OTHER_DIRECTORIES,
 };
 use grit_lib::porcelain::add::stage_for_commit;
+use grit_lib::porcelain::commit::{create_commit, CommitRequest};
 use grit_lib::porcelain::status::{status, StatusOptions, UntrackedMode};
 use grit_lib::progress::NeverCancel;
 use grit_lib::progress::NullProgress;
@@ -22,7 +25,8 @@ use grit_lib::repo::Repository;
 use support::{
     append_git_config, entry_from_worktree_path, extension_payload, fsck_strict, git,
     git_porcelain_untracked, git_status_porcelain_normal, git_status_porcelain_normal_with_trace,
-    git_update_index_untracked_cache, read_index_bytes, trace2_read_directory_counter,
+    git_update_index_untracked_cache, index_contains_extension, read_index_bytes,
+    trace2_read_directory_counter,
 };
 
 fn init_repo(root: &Path) {
@@ -241,6 +245,75 @@ fn issue_1227_new_file_in_git_warmed_cached_dir() {
     assert!(
         outcome.added.len() >= 1,
         "commit staging must include new untracked file, got {outcome:?}"
+    );
+    fsck_strict(root);
+}
+
+#[test]
+fn grit_untr_ident_matches_system_git() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    init_repo(root);
+    fs::write(root.join("a.txt"), "a\n").expect("write");
+    git(root, &["add", "a.txt"]);
+    git(root, &["commit", "-qm", "c"]);
+    git_update_index_untracked_cache(root);
+
+    let repo = Repository::discover(Some(root), &RepositoryOptions::empty()).expect("open");
+    let wt = repo.work_tree().expect("wt");
+    let grit_ident = untracked_cache_ident(wt);
+
+    let payload = extension_payload(&read_index_bytes(&repo), b"UNTR").expect("UNTR");
+    let git_uc = parse_untracked_extension(&payload).expect("parse git UNTR");
+    assert_eq!(
+        git_uc.ident, grit_ident,
+        "grit ident must match system git UNTR ident byte-for-byte"
+    );
+}
+
+#[test]
+fn grit_auto_untr_shell_accepted_by_git_status_without_warning() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    git(root, &["init", "-q", "-b", "main", "."]);
+    git(root, &["config", "user.email", "t@example.com"]);
+    git(root, &["config", "user.name", "Test"]);
+
+    let n = AUTO_UNTRACKED_CACHE_MIN_ENTRIES;
+    for i in 0..n {
+        let rel = format!("d{i:04}/f.txt");
+        let path = root.join(&rel);
+        fs::create_dir_all(path.parent().unwrap()).expect("mkdir");
+        fs::write(&path, format!("{i}\n")).expect("write");
+    }
+
+    let repo = Repository::discover(Some(root), &RepositoryOptions::empty()).expect("open");
+    stage_for_commit(&repo, &mut NullProgress, &NeverCancel).expect("stage");
+    let req = CommitRequest {
+        message: "fill".to_owned(),
+        author: Some("Test <t@example.com> 1 +0000".parse().expect("sig")),
+        committer: Some("Test <t@example.com> 1 +0000".parse().expect("sig")),
+        skip_pre_commit_tree_match: true,
+        ..Default::default()
+    };
+    create_commit(&repo, &req, &mut NullProgress, &NeverCancel).expect("commit");
+
+    let index_bytes = fs::read(root.join(".git/index")).expect("read index");
+    assert!(
+        index_contains_extension(&index_bytes, b"UNTR"),
+        "large grit commit must persist auto UNTR shell"
+    );
+
+    let out = Command::new("git")
+        .args(["status"])
+        .current_dir(root)
+        .output()
+        .expect("git status");
+    assert!(out.status.success(), "git status failed");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("untracked cache is disabled"),
+        "git must accept grit UNTR ident without warning, stderr:\n{stderr}"
     );
     fsck_strict(root);
 }
