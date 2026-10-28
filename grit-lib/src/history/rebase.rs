@@ -611,10 +611,9 @@ fn extend_rebase_replay_order(
         if skip_map.contains_key(tip) || range_set.contains(tip) {
             continue;
         }
-        let mut reachable = commits_reachable_excluding_ancestors_of(repo, &[*tip], &[fork], None)?;
-        reachable
-            .retain(|oid| *oid != fork && !range_set.contains(oid) && !skip_map.contains_key(oid));
-        extra.extend(reachable);
+        extra.extend(stacked_commits_above_range(
+            repo, *tip, &range_set, fork, skip_map,
+        )?);
     }
 
     if extra.is_empty() {
@@ -633,6 +632,33 @@ fn extend_rebase_replay_order(
         }
     }
     Ok(order)
+}
+
+/// Commits on the first-parent chain from `tip` down to the rebase range, excluding the range.
+///
+/// Merge commits keep out-of-range second parents out of the replay order; those parents stay
+/// unmapped when the merge is replayed.
+fn stacked_commits_above_range(
+    repo: &Repository,
+    tip: ObjectId,
+    range_set: &HashSet<ObjectId>,
+    fork: ObjectId,
+    skip_map: &HashMap<ObjectId, ObjectId>,
+) -> Result<Vec<ObjectId>, HistoryError> {
+    let mut out = Vec::new();
+    let mut current = tip;
+    while current != fork && !range_set.contains(&current) {
+        if skip_map.contains_key(&current) {
+            break;
+        }
+        out.push(current);
+        let parents = commit_parents(repo, current)?;
+        let Some(&first_parent) = parents.first() else {
+            break;
+        };
+        current = first_parent;
+    }
+    Ok(out)
 }
 
 /// When `commit` is the tip of a side branch merged into the range, return the first parent
