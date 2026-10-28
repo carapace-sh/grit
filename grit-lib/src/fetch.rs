@@ -1556,7 +1556,7 @@ pub(crate) fn fetch_remote_into(
     } else {
         None
     };
-    let (wire_filter, _filter_sent) = crate::partial_clone::wire_filter_for_capabilities(
+    let (wire_filter, filter_sent) = crate::partial_clone::wire_filter_for_capabilities(
         opts.filter.as_ref(),
         v2_caps.as_deref(),
         v0_caps.as_deref(),
@@ -1621,6 +1621,7 @@ pub(crate) fn fetch_remote_into(
                     new_shallow: crate::shallow::dedupe_shallow_list(shallow_update.shallow),
                     new_unshallow: shallow_update.unshallow,
                     transfer: crate::transfer::TransferStats::default(),
+                    filter_sent,
                 });
             }
             let pack_config =
@@ -1894,6 +1895,7 @@ pub(crate) fn fetch_remote_into(
         new_shallow: crate::shallow::dedupe_shallow_list(shallow_update.shallow),
         new_unshallow: shallow_update.unshallow,
         transfer,
+        filter_sent,
     })
 }
 
@@ -1918,6 +1920,7 @@ fn fetch_remote_object_wants(
             new_shallow: Vec::new(),
             new_unshallow: Vec::new(),
             transfer: crate::transfer::TransferStats::default(),
+            filter_sent: false,
         });
     }
 
@@ -1931,7 +1934,7 @@ fn fetch_remote_object_wants(
     } else {
         None
     };
-    let (wire_filter, _filter_sent) = crate::partial_clone::wire_filter_for_capabilities(
+    let (wire_filter, filter_sent) = crate::partial_clone::wire_filter_for_capabilities(
         opts.filter.as_ref(),
         v2_caps.as_deref(),
         v0_caps.as_deref(),
@@ -2024,6 +2027,7 @@ fn fetch_remote_object_wants(
         new_shallow: crate::shallow::dedupe_shallow_list(shallow_update.shallow),
         new_unshallow: shallow_update.unshallow,
         transfer,
+        filter_sent,
     })
 }
 

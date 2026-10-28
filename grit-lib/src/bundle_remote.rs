@@ -523,6 +523,7 @@ fn complete_bundle_fetch(
         new_shallow,
         new_unshallow: Vec::new(),
         transfer,
+        filter_sent: false,
     })
 }
 

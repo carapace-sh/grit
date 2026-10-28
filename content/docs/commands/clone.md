@@ -82,6 +82,8 @@ Pass `--depth <N>` for the same result as `git clone --depth`: only one ref is f
 
 Partial clone trades disk and bandwidth on the first fetch for extra round-trips when something needs blob bytes (for example `git log -p` or reading a large file). It works with `--depth`, `-b` / `--branch`, and the other clone options. The server must allow filter requests (`uploadpack.allowFilter` on bare repos served over smart HTTP or `file://`).
 
+When you pass `--blobs` but the server does not advertise filter support, grit warns on stderr (even with `-q`), fetches an unfiltered pack, and does not treat the clone as partial in human output or `--json` (`partial` is omitted or false). Promisor configuration is still written, matching `git clone --filter` when the server ignores the filter, so later commands may warn about a promisor remote even though every blob arrived in the first pack.
+
 `--bare` creates a bare repository at the destination (the directory itself is the git directory, named with a `.git` suffix when the URL is derived automatically), fetches `refs/heads/*` and tags directly, and configures only `remote.<name>.url` — matching `git clone --bare`. `--no-checkout` fetches and sets `HEAD` to the default branch without writing the index or work tree files, matching `git clone --no-checkout`.
 
 After `--no-checkout`, use [`grit switch`](../switch/) to materialize the revision you need, for example `grit -C client switch --detach HEAD~1 --json`. The first switch writes the entire destination tree, including when you select the current branch or `HEAD`. Files you created at destination paths are protected by the usual untracked-file collision checks. `switch --dry-run` previews how many paths will be written without creating an index or changing files or refs.
@@ -184,7 +186,7 @@ Pass `--json` for stable, scripting-friendly output:
 | `tag` | string or omitted | Tag name when `-b` named a tag. |
 | `depth` | integer or omitted | Shallow depth when `--depth` or `--shallow` was used. |
 | `blobs` | string or integer or omitted | `"none"` or a byte limit when `--blobs` was used. |
-| `partial` | boolean or omitted | `true` when `--blobs` configured a promisor partial clone. |
+| `partial` | boolean or omitted | `true` when the server applied the `--blobs` filter on the initial fetch. Omitted or false when the server lacks filter support (see warning above). |
 | `objects` | integer | Objects installed during fetch: for network clones, objects in the received pack; for local-path clones, objects in newly linked pack indexes plus any reachable loose objects hardlinked from the source. |
 | `bytes` | integer | On-disk payload bytes installed during fetch: for network clones, the received `.pack` size; for local-path clones, the sum of newly linked `.pack` files plus reachable loose object files (same bytes as hardlinked/copied object store data). |
 | `branches` | integer | Remote branches fetched. |
