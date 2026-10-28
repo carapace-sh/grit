@@ -936,14 +936,15 @@ pub fn commit_worktree(
     guard_incomplete_rewrite_apply(repo)?;
     let head = resolve_head_for_repository(repo)?;
     let mut index = repo.load_index()?;
-    let staged_count = crate::porcelain::add::stage_for_commit_on_index(
+    let staged = crate::porcelain::add::stage_for_commit_on_index(
         repo,
         &mut index,
         progress,
         cancel,
         req.dry_run,
-    )?
-    .total();
+    )?;
+    let staged_count = staged.total();
+    let stat_refreshed = staged.stat_refreshed;
     if index.has_unmerged_entries() {
         return Err(Error::IndexUnmerged);
     }
@@ -953,7 +954,10 @@ pub fn commit_worktree(
         req.staged_change_count = Some(staged_count);
     }
     let result = create_commit_with_index(repo, head, &mut index, &req, progress, cancel, None);
-    if matches!(result, Err(Error::NothingToCommit)) && !req.dry_run && staged_count > 0 {
+    if matches!(result, Err(Error::NothingToCommit))
+        && !req.dry_run
+        && (staged_count > 0 || stat_refreshed)
+    {
         repo.write_index(&mut index)?;
     }
     result
