@@ -3065,6 +3065,8 @@ mod tests {
 
         use crate::environment::RepositoryOptions;
         use crate::objects::ObjectId;
+        use crate::odb::Odb;
+        use crate::receive_quarantine::ReceiveQuarantine;
 
         let _serial = repack_pause_inject::test_serial_lock();
         let tmp = TempDir::new().unwrap();
@@ -3086,6 +3088,16 @@ mod tests {
             .expect("rev-parse")
             .stdout;
         let oid_hex = String::from_utf8(oid_hex).expect("utf8").trim().to_string();
+        git_cmd(
+            &wt,
+            &[
+                "push",
+                "-q",
+                bare.to_str().unwrap(),
+                "HEAD:refs/heads/staging",
+            ],
+        );
+        git_cmd(&bare, &["update-ref", "-d", "refs/heads/staging", &oid_hex]);
 
         let repo_probe =
             Repository::discover(Some(&bare), &RepositoryOptions::empty()).expect("open");
@@ -3096,6 +3108,7 @@ mod tests {
             RepackPausePhase::AfterInventoryBeforeRoots,
             Arc::clone(&gate),
         );
+        let migrated_keeps = Arc::new(std::sync::Mutex::new(None));
 
         let bare_thread = bare.clone();
         let worker = thread::spawn(move || {
@@ -3116,26 +3129,28 @@ mod tests {
             paused = gate.cv.wait(paused).unwrap();
         }
 
-        git_cmd(
-            &wt,
-            &[
-                "push",
-                "-q",
-                bare.to_str().unwrap(),
-                "HEAD:refs/heads/staging",
-            ],
-        );
-        git_cmd(&bare, &["update-ref", "-d", "refs/heads/staging", &oid_hex]);
-        let pack_prefix = bare.join("objects/pack/inbound");
-        let mut pack_cmd = std::process::Command::new("git")
+        let objects_dir = bare.join("objects");
+        let main_odb = Odb::new(&objects_dir).with_config_git_dir(bare.clone());
+        let mut quarantine = ReceiveQuarantine::create(&main_odb, &bare).expect("quarantine");
+        let pack_prefix_arg = quarantine
+            .path()
+            .join("pack/pack")
+            .to_string_lossy()
+            .into_owned();
+        let hook_env = quarantine.hook_env();
+        let mut pack_cmd = std::process::Command::new("git");
+        pack_cmd
             .current_dir(&bare)
-            .args(["pack-objects", pack_prefix.to_str().expect("utf8 prefix")])
+            .arg("pack-objects")
+            .arg(&pack_prefix_arg)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_SYSTEM", "/dev/null")
-            .spawn()
-            .expect("pack-objects");
+            .env("GIT_CONFIG_SYSTEM", "/dev/null");
+        for (key, value) in hook_env {
+            pack_cmd.env(key, value);
+        }
+        let mut pack_cmd = pack_cmd.spawn().expect("pack-objects");
         pack_cmd
             .stdin
             .take()
@@ -3148,12 +3163,23 @@ mod tests {
             "pack-objects: {:?}",
             pack_out.stderr
         );
-        let inbound_pack_stem = String::from_utf8(pack_out.stdout)
+        let pack_stem = String::from_utf8(pack_out.stdout)
             .expect("utf8")
             .trim()
             .to_string();
-        let inbound_pack = bare.join(format!("objects/pack/inbound-{inbound_pack_stem}.pack"));
-        assert!(inbound_pack.is_file(), "migrated pack must exist");
+        let keep_guard = quarantine.migrate().expect("migrate");
+        let migrated_pack = objects_dir.join(format!("pack/pack-{pack_stem}.pack"));
+        assert!(
+            migrated_pack.is_file(),
+            "canonical pack-* must be installed before ref publication"
+        );
+        assert!(
+            objects_dir
+                .join(format!("pack/pack-{pack_stem}.keep"))
+                .is_file(),
+            "migrate must pin pack until receive-pack finishes"
+        );
+        *migrated_keeps.lock().unwrap() = Some(keep_guard);
 
         *paused = false;
         gate.cv.notify_all();
@@ -3161,10 +3187,11 @@ mod tests {
 
         worker.join().unwrap().expect("repack with migrated pack");
         assert!(
-            inbound_pack.is_file(),
-            "receive-pack pack must survive repack (DropAll supersede path)"
+            migrated_pack.is_file(),
+            "pinned pack must survive DropAll supersede while receive-pack holds .keep"
         );
 
+        migrated_keeps.lock().unwrap().take();
         git_cmd(&bare, &["update-ref", "refs/heads/published", &oid_hex]);
         let repo = Repository::discover(Some(&bare), &RepositoryOptions::empty()).expect("open");
         let oid = ObjectId::from_hex(&oid_hex).expect("oid");

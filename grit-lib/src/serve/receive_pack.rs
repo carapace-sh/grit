@@ -937,10 +937,14 @@ fn apply_commands_with_hooks(
         return Ok(results);
     }
 
-    if let Some(q) = quarantine {
-        q.migrate().map_err(ServeError::Repository)?;
-        repo.odb().invalidate_packs();
-    }
+    let _migrated_pack_keeps = match quarantine {
+        Some(q) => {
+            let keeps = q.migrate().map_err(ServeError::Repository)?;
+            repo.odb().invalidate_packs();
+            Some(keeps)
+        }
+        None => None,
+    };
 
     for (cmd, result) in request.commands.iter().zip(results.iter_mut()) {
         if result.error.is_some() {

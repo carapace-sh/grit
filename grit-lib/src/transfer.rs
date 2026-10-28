@@ -2255,9 +2255,10 @@ pub(crate) fn push_local_from(
             }
         }
     }
+    let mut _migrated_pack_keeps = None;
     if decisions.iter().any(|d| d.apply) && !opts.dry_run {
         if let Some((mut q, _)) = quarantine.take() {
-            q.migrate()?;
+            _migrated_pack_keeps = Some(q.migrate()?);
             remote_repo.odb().invalidate_packs();
         }
         for d in decisions.iter_mut().filter(|d| d.apply) {
