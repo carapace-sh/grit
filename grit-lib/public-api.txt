@@ -20278,8 +20278,8 @@ pub grit_lib::remote::clone::CloneOutcome::filter_sent: bool
 pub grit_lib::remote::clone::CloneOutcome::head: grit_lib::remote::clone::CloneHead
 pub grit_lib::remote::clone::CloneOutcome::path: std::path::PathBuf
 pub grit_lib::remote::clone::CloneOutcome::path_collisions: alloc::vec::Vec<alloc::string::String>
-pub grit_lib::remote::clone::CloneOutcome::submodule_paths: alloc::vec::Vec<alloc::string::String>
 pub grit_lib::remote::clone::CloneOutcome::repo: grit_lib::repo::Repository
+pub grit_lib::remote::clone::CloneOutcome::submodule_paths: alloc::vec::Vec<alloc::string::String>
 pub grit_lib::remote::clone::CloneOutcome::tags: u64
 pub grit_lib::remote::clone::CloneOutcome::transfer: grit_lib::remote::transfer::TransferStats
 pub grit_lib::remote::clone::CloneOutcome::url: alloc::string::String
