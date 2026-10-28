@@ -4209,6 +4209,59 @@ mod status_op_tests {
         ignore = "starts system git or is heavy; run with --features full-tests"
     )]
     #[test]
+    fn status_unstaged_modified_uses_null_worktree_oid_on_size_drift() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        grit_test_support::git(root, &["init", "-q", "-b", "main", "."]);
+        grit_test_support::git(root, &["config", "user.email", "t@example.com"]);
+        grit_test_support::git(root, &["config", "user.name", "Test"]);
+        fs::write(root.join("a"), b"a\n").unwrap();
+        grit_test_support::git(root, &["add", "a"]);
+        grit_test_support::git(root, &["commit", "-qm", "c"]);
+        let index_oid = {
+            use std::str::FromStr;
+            crate::objects::ObjectId::from_str(
+                grit_test_support::git(root, &["rev-parse", "HEAD:a"]).trim(),
+            )
+            .unwrap()
+        };
+        let mut content = fs::read(root.join("a")).unwrap();
+        content.extend_from_slice(b"more");
+        fs::write(root.join("a"), content).unwrap();
+
+        let git_raw = grit_test_support::git(root, &["diff-files", "--raw"]);
+        assert!(
+            git_raw.contains(&format!(
+                "{index_oid} 0000000000000000000000000000000000000000"
+            )),
+            "git diff-files --raw must use null worktree oid: {git_raw}"
+        );
+
+        let repo = Repository::open(
+            &root.join(".git"),
+            &RepositoryOptions::empty().with_work_tree(root),
+        )
+        .unwrap();
+        let model = status(
+            &repo,
+            &StatusOptions::default(),
+            &mut NullProgress,
+            &NeverCancel,
+        )
+        .unwrap();
+        assert_eq!(model.unstaged.len(), 1, "{:?}", model.unstaged);
+        let e = &model.unstaged[0];
+        assert_eq!(e.status, crate::diff::DiffStatus::Modified);
+        assert_eq!(e.path(), "a");
+        assert_eq!(e.old_oid, index_oid);
+        assert_eq!(e.new_oid, crate::diff::zero_oid());
+    }
+
+    #[cfg_attr(
+        not(feature = "full-tests"),
+        ignore = "starts system git or is heavy; run with --features full-tests"
+    )]
+    #[test]
     fn status_unstaged_delete_and_untracked_add_not_rename() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
