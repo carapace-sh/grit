@@ -255,6 +255,35 @@ impl Default for TreeMergeConflictPresentation<'_> {
     }
 }
 
+/// Conflict-marker labels for replaying one commit onto a new base (pick and rebase).
+///
+/// The incoming side is named `"<abbrev> (<subject>)"` and the diff3 base
+/// `"parent of <abbrev> (<subject>)"`, the labels Git uses for the same replays, so each
+/// stop of a multi-commit replay names the commit it came from. Ours stays `HEAD`.
+pub(crate) struct ReplayConflictLabels {
+    theirs: String,
+    base: String,
+}
+
+impl ReplayConflictLabels {
+    /// Labels for replaying `commit`, whose message subject line is `subject`.
+    pub(crate) fn new(commit: ObjectId, subject: &str) -> Self {
+        let theirs = format!("{} ({subject})", &commit.to_hex()[..7]);
+        let base = format!("parent of {theirs}");
+        Self { theirs, base }
+    }
+
+    /// Presentation using these labels with marker `style`; other fields keep their defaults.
+    pub(crate) fn presentation(&self, style: ConflictStyle) -> TreeMergeConflictPresentation<'_> {
+        TreeMergeConflictPresentation {
+            label_theirs: TheirsConflictLabel::Fixed(&self.theirs),
+            label_base: &self.base,
+            style,
+            ..TreeMergeConflictPresentation::default()
+        }
+    }
+}
+
 #[expect(clippy::too_many_arguments)]
 /// Merge `base` + `ours` + `their` trees (by OID) into an index using rename detection.
 ///

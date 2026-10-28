@@ -11,9 +11,9 @@ use crate::commit::signing::extra_headers_without_commit_signatures;
 use crate::commit_encoding::identity_raw_for_serialized_commit;
 use crate::error::Error;
 use crate::merge_base::is_ancestor;
-use crate::merge_file::MergeFavor;
+use crate::merge_file::{ConflictStyle, MergeFavor};
 use crate::merge_trees::{
-    merge_trees_three_way, DirectoryRenameMode, TreeMergeConflictPresentation, TreeMergeOutput,
+    merge_trees_three_way, DirectoryRenameMode, ReplayConflictLabels, TreeMergeOutput,
     WhitespaceMergeOptions,
 };
 use crate::objects::{serialize_commit, CommitData, HashAlgo, ObjectId, ObjectKind};
@@ -24,7 +24,9 @@ use crate::state::resolve_head_for_repository;
 use crate::worktree::{find_worktree_with_branch_checked_out, worktree_admin_dir};
 
 use super::error::HistoryError;
-use super::subject::{commit_message_subject_line, subject_for_rewrite_row};
+use super::subject::{
+    commit_message_subject_line, replay_conflict_labels, subject_for_rewrite_row,
+};
 use super::types::{
     CommitEdit, EmptyPolicy, HeadEffect, HistoryEdits, PlannedRefUpdate, RefScope, RewriteOptions,
     RewritePlan, RewrittenCommit,
@@ -1361,6 +1363,7 @@ fn replay_merge_tree(
         });
     }
 
+    let labels = replay_conflict_labels(old_oid, old);
     let mut result_tree = old.tree;
     for (&old_parent, &new_parent) in old.parents.iter().zip(new_parents.iter()) {
         if old_parent == new_parent {
@@ -1371,6 +1374,7 @@ fn replay_merge_tree(
         result_tree = transplant_tree_across_parent_move(
             repo,
             old_oid,
+            &labels,
             result_tree,
             old_parent_tree,
             new_parent_tree,
@@ -1533,6 +1537,7 @@ fn compute_replayed_tree(
     transplant_tree_across_parent_move(
         repo,
         old_oid,
+        &replay_conflict_labels(old_oid, old),
         old.tree,
         old_parent_tree,
         new_parent_tree,
@@ -1540,9 +1545,13 @@ fn compute_replayed_tree(
     )
 }
 
+/// Three-way merge `subject_tree` from `old_parent_tree` onto `new_parent_tree`, labelling
+/// conflict markers with `labels` for the replayed `commit`.
+#[allow(clippy::too_many_arguments)]
 fn transplant_tree_across_parent_move(
     repo: &Repository,
     commit: ObjectId,
+    labels: &ReplayConflictLabels,
     subject_tree: ObjectId,
     old_parent_tree: ObjectId,
     new_parent_tree: ObjectId,
@@ -1560,7 +1569,7 @@ fn transplant_tree_across_parent_move(
         merge_favor,
         WhitespaceMergeOptions::default(),
         None,
-        TreeMergeConflictPresentation::default(),
+        labels.presentation(ConflictStyle::Merge),
         DirectoryRenameMode::from_repo(repo).map_err(library_err)?,
     )
     .map_err(library_err)?;

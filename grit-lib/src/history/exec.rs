@@ -8,11 +8,8 @@ use crate::command_runner::{
     run_sh_dash_c, CommandOutput, CommandRunner, CommandStdin, CommandStdio,
 };
 use crate::error::Error;
-use crate::merge_file::MergeFavor;
-use crate::merge_trees::{
-    merge_trees_three_way, DirectoryRenameMode, TreeMergeConflictPresentation,
-    WhitespaceMergeOptions,
-};
+use crate::merge_file::{ConflictStyle, MergeFavor};
+use crate::merge_trees::{merge_trees_three_way, DirectoryRenameMode, WhitespaceMergeOptions};
 use crate::objects::ObjectId;
 use crate::porcelain::checkout::checkout_hard_to_tree_from_head_tree;
 use crate::porcelain::merge::apply_conflict_merge_worktree;
@@ -31,6 +28,7 @@ use crate::state::{resolve_head_for_repository, HeadState};
 use super::apply::commit_tree_for_apply;
 use super::error::HistoryError;
 use super::plan::{commit_parents, replay_commit_onto_mapping, write_resolved_replay};
+use super::subject::replay_conflict_labels;
 use super::types::{RewriteOptions, RewritePlan};
 
 /// Shell commands to run at each replayed commit during `rebase --exec`.
@@ -606,7 +604,7 @@ fn stop_on_replay_conflict(
             MergeFavor::default(),
             WhitespaceMergeOptions::default(),
             None,
-            TreeMergeConflictPresentation::default(),
+            replay_conflict_labels(plan.commits[row].old, &data).presentation(ConflictStyle::Merge),
             DirectoryRenameMode::from_repo(repo)?,
         )?;
         apply_conflict_merge_worktree(

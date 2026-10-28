@@ -194,6 +194,23 @@ fn rebase_stops_on_conflict_json() -> TestResult {
 }
 
 #[test]
+fn rebase_conflict_marker_names_replayed_commit() -> TestResult {
+    let scratch = Scratch::new("marker-label")?;
+    let dir = scratch.path();
+    let (upstream, onto, topic_tip, file) = init_conflict_rebase(dir)?;
+    let out = gs(dir, ["rebase", "--onto", &onto, &upstream, "--json"])?;
+    assert_eq!(out.status, Some(1), "{}\n{}", out.stdout, out.stderr);
+    let body = fs::read_to_string(dir.join(&file))?;
+    let incoming = body.lines().find(|line| line.starts_with(">>>>>>>"));
+    assert_eq!(
+        incoming,
+        Some(format!(">>>>>>> {} (topic change)", &topic_tip[..7]).as_str()),
+        "{body}"
+    );
+    Ok(())
+}
+
+#[test]
 fn rebase_continue_finishes_and_moves_refs() -> TestResult {
     for command in [&["rebase"][..], &["history", "rebase"][..]] {
         for output in ["--json", "--markdown"] {

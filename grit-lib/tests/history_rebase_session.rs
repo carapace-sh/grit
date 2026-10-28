@@ -624,6 +624,110 @@ fn continue_after_resolution_matches_git_rebase_continue() {
     assert_git_fsck_strict(wt_r);
 }
 
+/// Run one `git rebase` step in `wt`; returns whether it finished without stopping.
+fn git_rebase_step(wt: &std::path::Path, args: &[&str]) -> bool {
+    std::process::Command::new("git")
+        .current_dir(wt)
+        .arg("rebase")
+        .args(args)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_EDITOR", ":")
+        .output()
+        .expect("git rebase")
+        .status
+        .success()
+}
+
+#[test]
+fn conflict_markers_name_each_replayed_commit_like_git_rebase() {
+    let repo = HistoryRepo::init();
+    let wt = repo.worktree();
+    commit_file(wt, "f.txt", "base\n", "base f");
+    commit_file(wt, "g.txt", "base\n", "base g");
+    let upstream = git_oid(wt, "HEAD");
+    git(wt, &["switch", "-c", "topic"]);
+    commit_file(wt, "f.txt", "topic f\n", "first replayed");
+    let first = git_oid(wt, "HEAD");
+    commit_file(wt, "g.txt", "topic g\n", "second replayed");
+    let tip = git_oid(wt, "HEAD");
+    git(wt, &["switch", "main"]);
+    commit_file(wt, "f.txt", "main f\n", "main f");
+    commit_file(wt, "g.txt", "main g\n", "main g");
+    let onto = git_oid(wt, "HEAD");
+    git(wt, &["switch", "topic"]);
+
+    let git_copy = tempfile::tempdir().expect("git copy");
+    let git_wt = git_copy.path();
+    let copied = std::process::Command::new("cp")
+        .args([
+            "-a",
+            &format!("{}/.", wt.display()),
+            &git_wt.to_string_lossy(),
+        ])
+        .status()
+        .expect("cp");
+    assert!(copied.success());
+
+    let incoming_marker = |body: &str| {
+        body.lines()
+            .find(|line| line.starts_with(">>>>>>>"))
+            .unwrap_or_else(|| panic!("no incoming marker in {body:?}"))
+            .to_owned()
+    };
+
+    let opts = start_opts(upstream, Some(onto), tip);
+    let RebaseOutcome::Stopped(stop) = start_rebase(
+        &open_grit(wt),
+        &opts,
+        &mut grit_lib::progress::NullProgress,
+        &grit_lib::progress::NeverCancel,
+    )
+    .expect("start") else {
+        panic!("expected the first replayed commit to stop");
+    };
+    assert_eq!(stop.commit, first);
+    assert!(!git_rebase_step(git_wt, &["main"]), "git should stop too");
+    let grit_f = std::fs::read_to_string(wt.join("f.txt")).expect("f.txt");
+    assert_eq!(
+        grit_f,
+        std::fs::read_to_string(git_wt.join("f.txt")).expect("git f.txt")
+    );
+    assert_eq!(
+        incoming_marker(&grit_f),
+        format!(">>>>>>> {} (first replayed)", &first.to_hex()[..7])
+    );
+
+    for dir in [wt, git_wt] {
+        std::fs::write(dir.join("f.txt"), "resolved f\n").expect("resolve f");
+        git(dir, &["add", "f.txt"]);
+    }
+    let RebaseOutcome::Stopped(stop) = continue_rebase(
+        &open_grit(wt),
+        &opts,
+        &mut grit_lib::progress::NullProgress,
+        &grit_lib::progress::NeverCancel,
+    )
+    .expect("continue") else {
+        panic!("expected the second replayed commit to stop");
+    };
+    assert_eq!(stop.commit, tip);
+    assert!(
+        !git_rebase_step(git_wt, &["--continue"]),
+        "git should stop on the second commit"
+    );
+    let grit_g = std::fs::read_to_string(wt.join("g.txt")).expect("g.txt");
+    assert_eq!(
+        grit_g,
+        std::fs::read_to_string(git_wt.join("g.txt")).expect("git g.txt")
+    );
+    assert_eq!(
+        incoming_marker(&grit_g),
+        format!(">>>>>>> {} (second replayed)", &tip.to_hex()[..7])
+    );
+    assert_git_fsck_strict(wt);
+}
+
 #[test]
 fn conflict_stop_detaches_head_at_onto_not_upstream() {
     let (repo, upstream, onto, tip, _) = conflict_rebase_fixture();
@@ -2715,9 +2819,15 @@ fn exec_amend_conflicting_with_next_commit_stops_resumably_and_matches_git() {
     let amended = git_oid(wt, "HEAD");
     assert_eq!(git(wt, &["show", "HEAD:two"]), "amended\n");
     assert_eq!(git_oid(wt, "HEAD~1"), opts.request.onto.unwrap());
-    assert!(std::fs::read_to_string(wt.join("two"))
-        .unwrap()
-        .contains("<<<<<<<"));
+    let two = std::fs::read_to_string(wt.join("two")).unwrap();
+    assert!(two.contains("<<<<<<<"));
+    assert!(
+        two.contains(&format!(
+            "\n>>>>>>> {} (two)\n",
+            &second_original.to_hex()[..7]
+        )),
+        "{two}"
+    );
     assert_eq!(git_oid(wt, "topic"), opts.request.branch_tip);
 
     let repo = open_grit(wt);
