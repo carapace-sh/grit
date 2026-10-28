@@ -1002,6 +1002,20 @@ mod tests {
     }
 
     #[test]
+    fn text_hunks_do_not_slide_across_missing_final_newline() {
+        let mut ctx = ChecksumHasher::new(HashAlgo::Sha1);
+        patch_id_hash_text_hunks(
+            &mut ctx,
+            "{\n  \"a\": 1\n}\n",
+            "{\n  \"a\": 2\n}\n{\n  \"b\": 2\n}",
+        );
+        assert_eq!(
+            ctx.finalize(),
+            HashAlgo::Sha1.checksum_digest(b"{-\"a\":1+\"a\":2}+{+\"b\":2+}")
+        );
+    }
+
+    #[test]
     fn hash_without_whitespace_skips_every_ascii_space() {
         let mut ctx = ChecksumHasher::new(HashAlgo::Sha1);
         assert_eq!(hash_without_whitespace(&mut ctx, b" \t+a b\r\nc  \n"), 4);

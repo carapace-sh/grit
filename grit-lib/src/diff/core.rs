@@ -122,8 +122,14 @@ pub(crate) fn histogram_compacted_line_ops(
     let raw = changed_flags_to_ops(&changed1, &changed2, old_len, new_len);
     diff_indent_heuristic::apply_change_compact_to_ops_with_ws_histogram(
         &raw,
-        &old_lines,
-        &new_lines,
+        diff_indent_heuristic::CompactSide {
+            lines: &old_lines,
+            keys: &old_compare,
+        },
+        diff_indent_heuristic::CompactSide {
+            lines: &new_lines,
+            keys: &new_compare,
+        },
         indent_heuristic,
         ws,
         true,
@@ -296,8 +302,14 @@ pub(crate) fn git_xdiff_compacted_line_ops(
     diff_indent_heuristic::apply_change_compact_to_masks(
         changed1,
         changed2,
-        old_lines,
-        new_lines,
+        diff_indent_heuristic::CompactSide {
+            lines: old_lines,
+            keys: old_compare,
+        },
+        diff_indent_heuristic::CompactSide {
+            lines: new_lines,
+            keys: new_compare,
+        },
         indent_heuristic,
     )
 }
@@ -452,22 +464,20 @@ where
     let new_compare = line_compare_keys(new_content, &after, ws, &mut new_normalized);
     let (changed1, changed2) = git_xdiff::patience_changed_flags(&old_compare, &new_compare);
     let raw = changed_flags_to_ops(&changed1, &changed2, old_refs.len(), new_refs.len());
-    let ops = if ws.normalizes_line_compare() {
-        diff_indent_heuristic::apply_change_compact_to_ops_with_ws(
-            &raw,
-            &old_refs,
-            &new_refs,
-            indent_heuristic,
-            ws,
-        )
-    } else {
-        diff_indent_heuristic::apply_change_compact_to_ops(
-            &raw,
-            &old_refs,
-            &new_refs,
-            indent_heuristic,
-        )
-    };
+    let ops = diff_indent_heuristic::apply_change_compact_to_ops_with_ws_histogram(
+        &raw,
+        diff_indent_heuristic::CompactSide {
+            lines: &old_refs,
+            keys: &old_compare,
+        },
+        diff_indent_heuristic::CompactSide {
+            lines: &new_refs,
+            keys: &new_compare,
+        },
+        indent_heuristic,
+        ws,
+        false,
+    );
     let mut edits = if let Some(is_ignorable) = is_ignorable_change {
         diff_ops_to_ignorable_edit_spans(&ops, &old_refs, &new_refs, is_ignorable)
     } else {
@@ -674,11 +684,19 @@ fn git_patience_unified_body_raw(
     let new_compare = line_compare_keys(new_content, &after, ws, &mut new_normalized);
     let (changed1, changed2) = git_xdiff::patience_changed_flags(&old_compare, &new_compare);
     let raw = changed_flags_to_ops(&changed1, &changed2, old_refs.len(), new_refs.len());
-    let ops = diff_indent_heuristic::apply_change_compact_to_ops(
+    let ops = diff_indent_heuristic::apply_change_compact_to_ops_with_ws_histogram(
         &raw,
-        &old_refs,
-        &new_refs,
+        diff_indent_heuristic::CompactSide {
+            lines: &old_refs,
+            keys: &old_compare,
+        },
+        diff_indent_heuristic::CompactSide {
+            lines: &new_refs,
+            keys: &new_compare,
+        },
         indent_heuristic,
+        ws,
+        false,
     );
     let mut edits = diff_ops_to_edit_spans(&ops);
     if edits.is_empty() {
@@ -14239,6 +14257,34 @@ mod blob_diff_algorithm_smoke {
             2,
             "git 2.55+ splits u0 minimal hunks at repeated anchors: {body}"
         );
+    }
+
+    #[test]
+    fn hunks_do_not_slide_onto_final_line_without_newline() {
+        use crate::diff::options::{DiffAlgorithm, DiffOptions};
+
+        let old = "{\n  \"a\": 1\n}\n";
+        let new = "{\n  \"a\": 2\n}\n{\n  \"b\": 2\n}";
+        let expected = "@@ -1,3 +1,6 @@\n {\n-  \"a\": 1\n+  \"a\": 2\n }\n+{\n+  \"b\": 2\n+}\n\\ No newline at end of file\n";
+        for algorithm in [
+            DiffAlgorithm::Myers,
+            DiffAlgorithm::Minimal,
+            DiffAlgorithm::Patience,
+            DiffAlgorithm::Histogram,
+        ] {
+            for indent_heuristic in [true, false] {
+                let options = DiffOptions {
+                    algorithm,
+                    indent_heuristic,
+                    ..DiffOptions::default()
+                };
+                assert_eq!(
+                    unified_hunk_body_for_diff_options(old, new, &options),
+                    expected,
+                    "{algorithm:?}, indent heuristic {indent_heuristic}"
+                );
+            }
+        }
     }
 
     #[test]

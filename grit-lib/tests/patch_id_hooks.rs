@@ -642,6 +642,24 @@ fn patch_id_places_slidable_insertion_like_git_diff() {
 }
 
 #[test]
+fn patch_id_keeps_insertion_off_final_line_without_newline() {
+    let dir = TempDir::new().unwrap();
+    git_in(dir.path(), &["init", "-q", "-b", "main"]);
+    std::fs::write(dir.path().join("f.json"), "{\n  \"a\": 1\n}\n").unwrap();
+    git_in(dir.path(), &["add", "f.json"]);
+    git_in(dir.path(), &["commit", "-qm", "base"]);
+    // The new last line `}` has no newline, so it is not the old `}\n`: the
+    // appended object must not slide up to absorb the old closing brace.
+    std::fs::write(
+        dir.path().join("f.json"),
+        "{\n  \"a\": 2\n}\n{\n  \"b\": 2\n}",
+    )
+    .unwrap();
+    git_in(dir.path(), &["commit", "-qam", "append"]);
+    assert_patch_id_matches_normal_patch(dir.path(), &[], "insertion before missing newline");
+}
+
+#[test]
 fn patch_id_equivalence_ignores_distant_context_but_keeps_nearby_context() {
     let mut ids = Vec::new();
     for (distant, nearby) in [
