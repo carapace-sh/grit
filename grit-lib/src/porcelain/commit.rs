@@ -3446,7 +3446,7 @@ mod tests {
         let repo = init_repo(root);
         std::fs::write(
             repo.git_dir().join("config"),
-            "[core]\n\trepositoryformatversion = 0\n\tbare = false\n\tlogAllRefUpdates = true\n[hook \"hc\"]\n\tcommand = true\n\tevent = pre-commit\n[hook \"hc2\"]\n\tcommand = true\n\tevent = commit-msg\n[hook \"hc3\"]\n\tcommand = true\n\tevent = post-commit\n",
+            "[core]\n\trepositoryformatversion = 0\n\tbare = false\n\tlogAllRefUpdates = true\n[hook \"hc\"]\n\tcommand = true\n\tevent = pre-commit\n[hook \"hc2\"]\n\tcommand = true\n\tevent = commit-msg\n[hook \"hc3\"]\n\tcommand = true\n\tevent = post-commit\n[hook \"hp\"]\n\tcommand = echo \"prepared $2\" >>$1\n\tevent = prepare-commit-msg\n",
         )
         .unwrap();
         fs::write(root.join("a.txt"), b"1\n").unwrap();
@@ -3468,9 +3468,34 @@ mod tests {
             outcome.hooks_run,
             vec![
                 HookName::PreCommit,
+                HookName::PrepareCommitMsg,
                 HookName::CommitMsg,
                 HookName::PostCommit
             ]
+        );
+        let commit = parse_commit(&repo.odb().read(&outcome.oid).unwrap().data).unwrap();
+        assert_eq!(commit.message, "hooks\nprepared message\n");
+
+        fs::write(root.join("a.txt"), b"2\n").unwrap();
+        stage(
+            &repo,
+            &StageOptions::default(),
+            &mut NullProgress,
+            &crate::progress::NeverCancel,
+        )
+        .unwrap();
+        let mut req = commit_req("skip verify");
+        req.hooks = HookPolicy::SkipVerify;
+        let outcome = create_commit(
+            &repo,
+            &req,
+            &mut NullProgress,
+            &crate::progress::NeverCancel,
+        )
+        .unwrap();
+        assert_eq!(
+            outcome.hooks_run,
+            vec![HookName::PrepareCommitMsg, HookName::PostCommit]
         );
     }
 
