@@ -85,12 +85,17 @@ fn checking_out(repo: &Path) -> bool {
 }
 
 #[cfg(unix)]
-fn interrupt(child: &Child) {
+fn interrupt(child: &Child, sig: libc::c_int) {
     let pid = libc::pid_t::try_from(child.id()).expect("pid");
     // SAFETY: `pid` is our own child, not yet reaped.
     unsafe {
-        libc::kill(pid, libc::SIGINT);
+        libc::kill(pid, sig);
     }
+}
+
+#[cfg(unix)]
+fn sigint(child: &Child) {
+    interrupt(child, libc::SIGINT);
 }
 
 #[cfg(windows)]
@@ -176,7 +181,7 @@ fn ctrl_c_during_switch_leaves_head_index_and_worktree_unchanged() {
             std::thread::sleep(Duration::from_micros(200));
         };
         if !finished_early {
-            interrupt(&child);
+            sigint(&child);
         }
         let out = child.wait_with_output().expect("wait");
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -212,5 +217,51 @@ fn ctrl_c_during_switch_leaves_head_index_and_worktree_unchanged() {
 
     grit_cmd(&["switch", "--detach", &new]).in_dir(&repo).suc();
     assert_eq!(head_oid(&repo), new);
+    assert_status_clean(&repo);
+}
+
+#[cfg(unix)]
+#[test]
+fn sigterm_during_switch_leaves_head_index_and_worktree_unchanged() {
+    let base = tempfile::tempdir().expect("tempdir");
+    let (repo, new) = fixture(base.path());
+    let old = head_oid(&repo);
+
+    let index_before = fs::read(repo.join(".git/index")).expect("read index");
+    let mut child = spawn_switch(&repo, &new);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if child.try_wait().expect("wait").is_some() {
+            panic!("switch finished before checkout started");
+        }
+        if checking_out(&repo) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "switch never started checking out"
+        );
+        std::thread::sleep(Duration::from_micros(200));
+    }
+    interrupt(&child, libc::SIGTERM);
+    let out = child.wait_with_output().expect("wait");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !repo.join(".git/index.lock").exists(),
+        "interrupted switch left .git/index.lock ({:?}): {stderr}",
+        out.status
+    );
+    assert!(
+        stderr.contains("operation cancelled"),
+        "interrupted switch exited {:?}: {stderr}",
+        out.status
+    );
+    assert_eq!(head_oid(&repo), old, "HEAD moved");
+    assert_eq!(
+        fs::read(repo.join(".git/index")).expect("read index"),
+        index_before,
+        "index changed"
+    );
+    assert_worktree_is_old(&repo);
     assert_status_clean(&repo);
 }
