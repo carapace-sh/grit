@@ -402,7 +402,13 @@ fn update_hook_declines_only_its_ref() {
             Some("hook declined".to_owned())
         )
     );
-    assert_eq!(outcome.remote_messages, ["no refs/heads/feature"]);
+    assert_eq!(
+        outcome.remote_messages,
+        [
+            "no refs/heads/feature",
+            "error: hook declined to update refs/heads/feature"
+        ]
+    );
     let head = fx.head();
     assert_eq!(
         Fixture::remote_ref(&fx.bare, "refs/heads/main").as_deref(),
@@ -411,8 +417,12 @@ fn update_hook_declines_only_its_ref() {
     assert_eq!(Fixture::remote_ref(&fx.bare, "refs/heads/feature"), None);
     git(&fx.bare, &["fsck", "--strict"]);
 
-    let (ok, _) = fx.git_push(&["gitside", "main", "feature"]);
+    let (ok, stderr) = fx.git_push(&["gitside", "main", "feature"]);
     assert!(!ok, "git reports the declined ref");
+    assert!(
+        stderr.contains("remote: error: hook declined to update refs/heads/feature"),
+        "{stderr}"
+    );
     assert_eq!(
         Fixture::log(&fx.bare),
         Fixture::log(&fx.git_bare),
