@@ -103,6 +103,8 @@ pub struct StageOutcome {
     pub removed: Vec<String>,
     /// Paths recorded with the intent-to-add bit (`git add -N`).
     pub intent_to_add: Vec<String>,
+    /// Index stat cache refreshed without staging new content (not counted in [`Self::total`]).
+    pub(crate) stat_refreshed: bool,
 }
 
 impl StageOutcome {
@@ -616,6 +618,7 @@ fn stage_inner_on_index(
         for raw in &summary.removed {
             outcome.removed.push(index_path_to_string(raw));
         }
+        outcome.stat_refreshed = summary.stat_refreshed;
     } else {
         let worktree_updates = collect_tracked_stage_plans(&unstaged, &matches);
         for (path, plan) in worktree_updates {
@@ -738,7 +741,7 @@ fn stage_inner_on_index(
         sort_outcome_paths_in_index_order(&mut outcome, index);
     }
 
-    if outcome.total() > 0 && !dry_run {
+    if (outcome.total() > 0 || outcome.stat_refreshed) && !dry_run {
         if let Some(summary) = &tracked_scan_summary {
             replay_deferred_untracked_invalidations(index, summary);
         }
@@ -3941,6 +3944,7 @@ mod tests {
             modified: vec![valid_display.clone(), invalid_display.clone()],
             removed: Vec::new(),
             intent_to_add: Vec::new(),
+            stat_refreshed: false,
         };
         sort_outcome_paths_in_index_order(&mut outcome, &index);
         assert_eq!(
@@ -3968,6 +3972,7 @@ mod tests {
             modified,
             removed: Vec::new(),
             intent_to_add: Vec::new(),
+            stat_refreshed: false,
         };
 
         let start = std::time::Instant::now();
