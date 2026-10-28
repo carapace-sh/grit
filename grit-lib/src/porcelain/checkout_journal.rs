@@ -42,6 +42,14 @@ struct SpooledCheckoutDelete {
     kind: SpooledPathKind,
 }
 
+/// A work-tree directory moved aside so a file could be written at the same path (untracked
+/// contents included).
+#[derive(Debug)]
+struct SpooledDirectoryReplace {
+    rel: String,
+    stash: PathBuf,
+}
+
 /// Worktree files removed during checkout, moved into a spool so a later failure can restore them.
 struct CheckoutDeleteSpool {
     spool: tempfile::TempDir,
@@ -61,6 +69,17 @@ impl CheckoutDeleteSpool {
             entries: Vec::new(),
             keep: false,
         })
+    }
+
+    /// Move the directory at `rel_path` (and everything under it) into the spool.
+    fn spool_directory_tree(&mut self, work_tree: &Path, rel_path: &str) -> Result<PathBuf> {
+        let abs = crate::repo_relpath::worktree_abs(work_tree, rel_path);
+        let stash = self
+            .spool
+            .path()
+            .join(spool_entry_name(&format!("dir/{rel_path}")));
+        move_directory_tree(&abs, &stash).map_err(Error::Io)?;
+        Ok(stash)
     }
 
     /// Move `rel_path` out of the worktree into the spool, or no-op when absent.
@@ -181,6 +200,8 @@ pub(crate) struct CheckoutJournal {
     removed_gitlinks: Vec<String>,
     /// Paths never written whose leading directories the checkout may already have created.
     unwritten: Vec<String>,
+    /// Directories removed so a regular file or symlink could be written at the same path.
+    spooled_directories: Vec<SpooledDirectoryReplace>,
     committed: bool,
 }
 
@@ -195,6 +216,7 @@ impl CheckoutJournal {
             removed_dirs: BTreeSet::new(),
             removed_gitlinks: Vec::new(),
             unwritten: Vec::new(),
+            spooled_directories: Vec::new(),
             committed: false,
         })
     }
@@ -256,11 +278,14 @@ impl CheckoutJournal {
     }
 
     /// Before overwriting `rel_path`, keep its current bytes for rollback: spool an existing
-    /// file or symlink, or remember that the path is new.
+    /// file or symlink, move aside an existing directory (including untracked contents), or
+    /// remember that the path is new.
     pub(crate) fn preserve_before_write(&mut self, rel_path: &str) -> Result<()> {
         let abs = crate::repo_relpath::worktree_abs(&self.work_tree, rel_path);
         match fs::symlink_metadata(&abs) {
-            Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => Ok(()),
+            Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {
+                self.spool_directory_at_path(rel_path)
+            }
             Ok(_) => self.spool_remove(rel_path),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 self.record_created(rel_path);
@@ -268,6 +293,20 @@ impl CheckoutJournal {
             }
             Err(e) => io_with_path(rel_path, WorktreePathOperation::Replace, Err(e)),
         }
+    }
+
+    /// Move the directory at `rel_path` into the delete spool so rollback can put it back.
+    fn spool_directory_at_path(&mut self, rel_path: &str) -> Result<()> {
+        let stash = self
+            .spool
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .spool_directory_tree(&self.work_tree, rel_path)?;
+        self.spooled_directories.push(SpooledDirectoryReplace {
+            rel: rel_path.to_owned(),
+            stash,
+        });
+        Ok(())
     }
 
     /// The checkout's index is on disk: keep every change and drop the spool.
@@ -278,6 +317,9 @@ impl CheckoutJournal {
         self.removed_dirs = BTreeSet::new();
         self.removed_gitlinks = Vec::new();
         self.unwritten = Vec::new();
+        for entry in self.spooled_directories.drain(..) {
+            let _ = fs::remove_dir_all(&entry.stash);
+        }
         self.spool
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -344,6 +386,12 @@ impl CheckoutJournal {
             unrestored.extend(spool.restore_all(&self.work_tree));
             spooled
         };
+
+        for entry in self.spooled_directories.drain(..).rev() {
+            if restore_spooled_directory(&self.work_tree, &entry).is_err() {
+                unrestored.push(entry.rel);
+            }
+        }
 
         let replaced = std::mem::take(&mut self.replaced);
         let removed_gitlinks = std::mem::take(&mut self.removed_gitlinks);
@@ -502,6 +550,78 @@ fn spool_entry_name(rel: &str) -> String {
         start += 1;
     }
     format!("{}_{seq}_{}", std::process::id(), &file_name[start..])
+}
+
+fn move_directory_tree(from: &Path, to: &Path) -> std::io::Result<()> {
+    if let Some(parent) = to.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    match fs::rename(from, to) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::CrossesDevices => {
+            copy_directory_tree(from, to)?;
+            fs::remove_dir_all(from)?;
+            Ok(())
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn copy_directory_tree(from: &Path, to: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(to)?;
+    for entry in fs::read_dir(from)? {
+        let entry = entry?;
+        let src = entry.path();
+        let dest = to.join(entry.file_name());
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::symlink;
+                symlink(fs::read_link(&src)?, &dest)?;
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::{symlink_dir, symlink_file};
+                let target = fs::read_link(&src)?;
+                if target.is_dir() {
+                    symlink_dir(&target, &dest)?;
+                } else {
+                    symlink_file(&target, &dest)?;
+                }
+            }
+        } else if file_type.is_dir() {
+            copy_directory_tree(&src, &dest)?;
+        } else {
+            fs::copy(&src, &dest)?;
+        }
+    }
+    Ok(())
+}
+
+fn remove_path_for_replace(abs: &Path) -> std::io::Result<()> {
+    let meta = match fs::symlink_metadata(abs) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    if meta.file_type().is_symlink() {
+        fs::remove_file(abs)
+    } else if meta.is_dir() {
+        fs::remove_dir_all(abs)
+    } else {
+        fs::remove_file(abs)
+    }
+}
+
+fn restore_spooled_directory(
+    work_tree: &Path,
+    entry: &SpooledDirectoryReplace,
+) -> std::io::Result<()> {
+    let abs = crate::repo_relpath::worktree_abs(work_tree, &entry.rel);
+    remove_path_for_replace(&abs)?;
+    move_directory_tree(&entry.stash, &abs)?;
+    Ok(())
 }
 
 fn move_worktree_entry_to_spool(

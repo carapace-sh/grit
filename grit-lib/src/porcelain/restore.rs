@@ -98,8 +98,8 @@ pub struct RestoreOutcome {
 /// the requested checkout. [`Error::LockHeld`] means another process holds `index.lock`;
 /// the lock is taken before the index is read, so nothing was changed. [`Error::Cancelled`]
 /// means `cancel` (or [`ProgressSink::should_cancel`]) fired while restoring the work tree:
-/// every work-tree change is rolled back (see [`CheckoutJournal`]), and the index is not
-/// written. Other failures are I/O or object-store errors.
+/// every work-tree change is rolled back (including directories replaced by files), and the
+/// index is not written. Other failures are I/O or object-store errors.
 ///
 /// Work-tree writes report [`crate::progress::ProgressPhase::CheckingOutFiles`] to `progress`.
 pub fn restore_paths(

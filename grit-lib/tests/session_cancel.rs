@@ -788,3 +788,57 @@ fn restore_stops_when_the_sink_asks() {
     let last = fs::read_to_string(tmp.path().join("d/f0299.txt")).expect("read");
     assert_eq!(last, "base 299\n");
 }
+
+#[test]
+fn restore_source_cancel_restores_directory_replacing_tracked_file() {
+    let (tmp, repo) = init_repo();
+    let wt = tmp.path();
+    let victim = "0000-victim";
+    fs::write(wt.join(victim), "old victim\n").expect("victim");
+    write_files(wt, "bulk", "seed");
+    commit_all(&repo, "old");
+    fs::write(wt.join(victim), "new victim\n").expect("rewrite victim");
+    write_files(wt, "bulk", "changed");
+    commit_all(&repo, "new");
+
+    fs::remove_file(wt.join(victim)).expect("rm victim file");
+    fs::create_dir_all(wt.join(victim)).expect("mkdir victim");
+    fs::write(wt.join(victim).join("sentinel.txt"), "keep me\n").expect("sentinel");
+
+    let old_commit = grit_lib::revwalk::rev_parse::resolve_revision_as_commit_without_index_dwim(
+        &repo, "HEAD~1",
+    )
+    .expect("old commit");
+    let old_obj = repo.odb().read(&old_commit).expect("read commit");
+    let old_tree = grit_lib::objects::parse_commit(&old_obj.data)
+        .expect("parse")
+        .tree;
+
+    let opts = RestoreOptions {
+        pathspecs: vec![".".to_owned()],
+        pathspec_sources: vec![".".to_owned()],
+        source: RestoreSource::Tree(old_tree),
+        staged: false,
+        worktree: true,
+        stage: None,
+        remerge: None,
+    };
+    let before_index = index_bytes(&repo);
+    let mut sink = CancelAfter::new(ProgressPhase::CheckingOutFiles, 1);
+    assert_cancelled(restore_paths(&repo, &opts, &mut sink, &NeverCancel));
+
+    let victim_meta = fs::symlink_metadata(wt.join(victim)).expect("victim metadata");
+    assert!(
+        victim_meta.is_dir() && !victim_meta.file_type().is_symlink(),
+        "victim must remain a directory after cancel"
+    );
+    assert!(
+        wt.join(victim).join("sentinel.txt").is_file(),
+        "untracked sentinel must survive cancel rollback"
+    );
+    assert_index_untouched(&repo, &before_index);
+    assert!(
+        !wt.join(victim).is_file(),
+        "cancel must not leave a regular file at the victim path"
+    );
+}
