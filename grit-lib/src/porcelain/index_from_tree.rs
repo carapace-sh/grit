@@ -59,26 +59,34 @@ pub(crate) fn refresh_stage0_index_stats_from_worktree(
 /// For callers that just wrote those files (restore, partial restore, history undo): an entry
 /// whose cleaned worktree content (autocrlf, eol, ident, filters) matches its OID takes the
 /// file's stat data; any other entry keeps the stat fields it had.
+///
+/// Returns whether any entry changed, so a caller that has nothing else to write can leave the
+/// index file alone.
 pub(crate) fn refresh_stage0_index_stats_for_paths(
     repo: &Repository,
     work_tree: &Path,
     index: &mut Index,
     paths: &BTreeSet<&str>,
-) -> Result<()> {
-    if paths.is_empty() {
-        return Ok(());
+) -> Result<bool> {
+    let entries: Vec<_> = paths
+        .iter()
+        .filter_map(|path| index.get(path.as_bytes(), 0))
+        .cloned()
+        .collect();
+    if entries.is_empty() {
+        return Ok(false);
     }
-    let mut subset = index.clone();
-    subset
-        .entries
-        .retain(|e| e.stage() == 0 && paths.contains(String::from_utf8_lossy(&e.path).as_ref()));
-    if subset.entries.is_empty() {
-        return Ok(());
-    }
+    let mut subset = Index {
+        version: index.version,
+        hash_algo: index.hash_algo,
+        source_mtime: index.source_mtime,
+        ..Index::new()
+    };
+    subset.entries = entries;
     let index_mtime = index_file_mtime(&repo.index_path());
     let rules = WorktreeRules::from_repository(repo, index).ok();
     let rules_arc = rules.map(|r| std::sync::Arc::new(std::sync::Mutex::new(r)));
-    let _ = refresh_index_stat_content_verified_with_rules(
+    let changed = refresh_index_stat_content_verified_with_rules(
         repo.odb(),
         repo.git_dir(),
         &mut subset,
@@ -88,10 +96,12 @@ pub(crate) fn refresh_stage0_index_stats_for_paths(
         None,
         rules_arc.as_ref(),
     )?;
-    for entry in subset.entries {
-        index.stage_file(entry);
+    if changed {
+        for entry in subset.entries {
+            index.stage_file(entry);
+        }
     }
-    Ok(())
+    Ok(changed)
 }
 
 /// Like [`index_from_tree`], then refresh stat caches from the worktree when a work tree exists.
@@ -744,6 +754,60 @@ mod tests {
         crate::objects::parse_commit(&commit.data)
             .expect("parse")
             .tree
+    }
+
+    #[test]
+    fn path_refresh_reports_whether_an_entry_changed() {
+        let dir = TempDir::new().expect("tempdir");
+        crate::repo::init_repository(
+            dir.path(),
+            false,
+            "main",
+            None,
+            crate::RefStorageFormat::Files,
+        )
+        .expect("init");
+        let repo =
+            Repository::discover(Some(dir.path()), &RepositoryOptions::empty()).expect("repo");
+        commit_files(&repo, &[("a.txt", "one\n"), ("b.txt", "two\n")]);
+        let work_tree = repo.work_tree().expect("work tree").to_path_buf();
+        let mut index = repo.load_index().expect("index");
+
+        let mut stale = index.get(b"a.txt", 0).expect("a.txt").clone();
+        stale.mtime_sec = 1;
+        stale.mtime_nsec = 0;
+        index.stage_file(stale);
+        fs::write(work_tree.join("b.txt"), "changed\n").expect("modify");
+        let b_before = index.get(b"b.txt", 0).expect("b.txt").clone();
+
+        let modified = BTreeSet::from(["b.txt", "missing.txt"]);
+        assert!(
+            !refresh_stage0_index_stats_for_paths(&repo, &work_tree, &mut index, &modified)
+                .expect("refresh")
+        );
+        assert_eq!(index.get(b"b.txt", 0), Some(&b_before));
+
+        let unchanged = BTreeSet::from(["a.txt"]);
+        assert!(
+            refresh_stage0_index_stats_for_paths(&repo, &work_tree, &mut index, &unchanged)
+                .expect("refresh")
+        );
+        let meta = fs::metadata(work_tree.join("a.txt")).expect("stat");
+        let mtime = meta
+            .modified()
+            .expect("mtime")
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("epoch")
+            .as_secs();
+        assert_eq!(
+            u64::from(index.get(b"a.txt", 0).expect("a.txt").mtime_sec),
+            mtime
+        );
+        assert!(
+            !refresh_stage0_index_stats_for_paths(&repo, &work_tree, &mut index, &unchanged)
+                .expect("refresh"),
+            "an entry that already holds the file's stat is left alone"
+        );
     }
 
     /// Repository with commit `t1` (`a/x`, `a/b/y`, `c/z`, `top`) followed by commit `t2`, which

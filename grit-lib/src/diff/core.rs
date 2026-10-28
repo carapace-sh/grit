@@ -47,7 +47,8 @@ use crate::worktree_rules::WorktreeRules;
 
 use super::rename_lines::RenameLineTable;
 use super::unified_emit::{
-    emit_unified_body_from_edits, line_ending_only_edits, EditSpan, LineSide, UnifiedEmitOptions,
+    emit_unified_body_from_edits, line_ending_only_edits, EditSpan, LineEnding, LineSide,
+    UnifiedEmitOptions,
 };
 
 /// Comparison keys for every line of `side`, which must be [`LineSide::from_text`] of `text`.
@@ -70,16 +71,17 @@ fn line_compare_keys<'a>(
         );
         return normalized.iter().map(Cow::as_ref).collect();
     }
-    let mut keys = Vec::with_capacity(side.len());
-    let mut rest = text;
-    while !rest.is_empty() {
-        let end = memchr::memchr(b'\n', rest.as_bytes()).map_or(rest.len(), |nl| nl + 1);
-        let (line, tail) = rest.split_at(end);
-        keys.push(line);
-        rest = tail;
-    }
-    debug_assert_eq!(keys.len(), side.len());
-    keys
+    // Each body is a subslice of `text` that stops just before its `\n`, so the key is the body
+    // widened by that one byte.
+    let base = text.as_ptr() as usize;
+    side.lines
+        .iter()
+        .map(|line| {
+            let start = line.body.as_ptr() as usize - base;
+            let end = start + line.body.len() + usize::from(line.ending != LineEnding::Missing);
+            &text[start..end]
+        })
+        .collect()
 }
 
 #[path = "../structured_diff.rs"]
@@ -285,29 +287,40 @@ where
     )
 }
 
+/// Line bodies of `side`, as the change compaction reads them.
+fn line_bodies<'a>(side: &LineSide<'a>) -> Vec<&'a str> {
+    side.lines.iter().map(|l| l.body).collect()
+}
+
 pub(crate) fn git_xdiff_compacted_line_ops(
     old_compare: &[&str],
     new_compare: &[&str],
-    old_lines: &[&str],
-    new_lines: &[&str],
+    before: &LineSide<'_>,
+    after: &LineSide<'_>,
     indent_heuristic: bool,
     need_min: bool,
 ) -> Vec<similar::DiffOp> {
     use crate::line_interner::LineInterner;
 
-    let mut interner = LineInterner::with_capacity(old_compare.len() + new_compare.len());
-    let ids1 = interner.intern_all(old_compare);
-    let ids2 = interner.intern_all(new_compare);
-    let (changed1, changed2) = git_xdiff::changed_flags(&ids1, &ids2, need_min);
+    // The interned ids are only needed by the alignment, and the line bodies only by the
+    // compaction; keeping the two apart lowers the peak on large files.
+    let (changed1, changed2) = {
+        let mut interner = LineInterner::with_capacity(old_compare.len() + new_compare.len());
+        let ids1 = interner.intern_all(old_compare);
+        let ids2 = interner.intern_all(new_compare);
+        git_xdiff::changed_flags(&ids1, &ids2, need_min)
+    };
+    let old_lines = line_bodies(before);
+    let new_lines = line_bodies(after);
     diff_indent_heuristic::apply_change_compact_to_masks(
         changed1,
         changed2,
         diff_indent_heuristic::CompactSide {
-            lines: old_lines,
+            lines: &old_lines,
             keys: old_compare,
         },
         diff_indent_heuristic::CompactSide {
-            lines: new_lines,
+            lines: &new_lines,
             keys: new_compare,
         },
         indent_heuristic,
@@ -400,21 +413,24 @@ where
     if before.is_empty() && after.is_empty() {
         return String::new();
     }
-    let old_refs: Vec<&str> = before.lines.iter().map(|l| l.body).collect();
-    let new_refs: Vec<&str> = after.lines.iter().map(|l| l.body).collect();
     let (mut old_normalized, mut new_normalized) = (Vec::new(), Vec::new());
     let old_compare = line_compare_keys(old_content, &before, ws, &mut old_normalized);
     let new_compare = line_compare_keys(new_content, &after, ws, &mut new_normalized);
     let ops = git_xdiff_compacted_line_ops(
         &old_compare,
         &new_compare,
-        &old_refs,
-        &new_refs,
+        &before,
+        &after,
         indent_heuristic,
         need_min,
     );
     let mut edits = if let Some(is_ignorable) = is_ignorable_change {
-        diff_ops_to_ignorable_edit_spans(&ops, &old_refs, &new_refs, is_ignorable)
+        diff_ops_to_ignorable_edit_spans(
+            &ops,
+            &line_bodies(&before),
+            &line_bodies(&after),
+            is_ignorable,
+        )
     } else {
         diff_ops_to_edit_spans(&ops)
     };

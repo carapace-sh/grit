@@ -82,7 +82,7 @@ pub use targets::hunk_diff_bundle;
 pub use targets::HunkDiffBundle;
 pub(crate) use targets::{
     collect_files_for_target, unstaged_file_diffs_with_peer_hunks,
-    unstaged_raw_changes_with_peer_hunks, FileChange,
+    unstaged_raw_changes_with_peer_hunks, unstaged_raw_changes_with_peer_hunks_in, FileChange,
 };
 pub use targets::{
     resolve_commit_diff_pathspecs, resolve_diff_arguments, resolve_diff_request, DiffArguments,

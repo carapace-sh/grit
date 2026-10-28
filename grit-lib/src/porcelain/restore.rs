@@ -957,7 +957,7 @@ fn refresh_restored_index_stats(
         .chain(outcome.removed.iter())
         .map(String::as_str)
         .collect();
-    refresh_stage0_index_stats_for_paths(repo, work_tree, index, &touched)
+    refresh_stage0_index_stats_for_paths(repo, work_tree, index, &touched).map(|_| ())
 }
 
 fn blob_index_size(repo: &Repository, entry: &FlatTreeEntry) -> Result<u32> {
