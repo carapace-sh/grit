@@ -226,6 +226,7 @@ pub(crate) fn plan_rewrite_with_order_resumable(
     opts: &RewriteOptions,
     replay_order: Option<&[ObjectId]>,
     linearize_onto: Option<ObjectId>,
+    merge_favor: MergeFavor,
 ) -> Result<ResumablePlanOutcome, HistoryError> {
     plan_rewrite_with_order_resumable_seeded(
         repo,
@@ -233,18 +234,21 @@ pub(crate) fn plan_rewrite_with_order_resumable(
         opts,
         replay_order,
         linearize_onto,
+        merge_favor,
         None,
         None,
     )
 }
 
 /// Resumable planning with an existing partial mapping (continue/skip after a stop).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn plan_rewrite_with_order_resumable_seeded(
     repo: &Repository,
     edits: &HistoryEdits,
     opts: &RewriteOptions,
     replay_order: Option<&[ObjectId]>,
     linearize_onto: Option<ObjectId>,
+    merge_favor: MergeFavor,
     seed: Option<(HashMap<ObjectId, ObjectId>, Vec<RewrittenCommit>)>,
     scoped_refs: Option<Vec<(String, ObjectId)>>,
 ) -> Result<ResumablePlanOutcome, HistoryError> {
@@ -255,7 +259,7 @@ pub(crate) fn plan_rewrite_with_order_resumable_seeded(
             opts,
             replay_order,
             linearize_onto,
-            MergeFavor::default(),
+            merge_favor,
             seed,
             scoped_refs,
         )

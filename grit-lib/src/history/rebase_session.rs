@@ -363,6 +363,7 @@ pub fn continue_rebase(
         &rewrite,
         Some(&state.replay_order),
         state.flatten_leaf_merges.then_some(state.onto),
+        state.rebase.favor,
         Some(seed),
         Some(state.scoped_refs.clone()),
     )?;
@@ -427,6 +428,7 @@ pub fn skip_rebase(
         &rewrite,
         Some(&state.replay_order),
         state.flatten_leaf_merges.then_some(state.onto),
+        state.rebase.favor,
         Some((mapping, rewritten)),
         Some(state.scoped_refs.clone()),
     )?;

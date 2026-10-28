@@ -577,6 +577,7 @@ pub(crate) fn plan_rebase_resumable(
         &opts.rewrite,
         Some(&replay_order),
         opts.flatten_leaf_merges.then_some(effective_onto),
+        opts.favor,
     )?;
     if let ResumablePlanOutcome::Complete(plan) = &mut outcome {
         plan.head.checkout_onto = Some(effective_onto);
