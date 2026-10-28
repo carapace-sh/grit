@@ -307,6 +307,11 @@ impl<'a> CancelSignal<'a> {
     pub(crate) fn flag(&self) -> &std::sync::atomic::AtomicBool {
         &self.flag
     }
+
+    /// Shared flag for long walks on other threads or modules.
+    pub(crate) fn watch_arc(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        std::sync::Arc::clone(&self.flag)
+    }
 }
 
 /// [`ProgressSink`] adapter that mirrors [`ProgressSink::should_cancel`] into `watch`.
