@@ -306,3 +306,198 @@ fn pickaxe_with_paths_and_max_count_matches_git() {
     assert_eq!(git_oids, grit_oids);
     assert_eq!(git_oids.len(), 1);
 }
+
+const NEEDLE_FILE: &str = "filler line 1\nfiller line 2\nfiller line 3\nfiller line 4\n\
+filler line 5\nfiller line 6\nfiller line 7\nfiller line 8\nfiller line 9\nfiller line 10\n\
+filler line 11\nfiller line 12\nfiller line 13\nfiller line 14\nfiller line 15\n\
+needle one\nneedle two\n";
+
+/// Add `from` with two needles, rename it to `to` while appending `rename_extra`, then add a
+/// third needle (issue #2203). Returns the three commit ids, oldest first.
+fn rename_history(worktree: &Path, from: &str, to: &str, rename_extra: &str) -> [String; 3] {
+    let add = commit_file(worktree, from, NEEDLE_FILE, "add").to_hex();
+    if let Some(parent) = worktree.join(to).parent() {
+        std::fs::create_dir_all(parent).expect("mkdir");
+    }
+    git(worktree, &["mv", from, to]);
+    let renamed = format!("{NEEDLE_FILE}{rename_extra}");
+    let rename = commit_file(worktree, to, &renamed, "rename").to_hex();
+    let needle = commit_file(worktree, to, &format!("{renamed}needle three\n"), "needle").to_hex();
+    [add, rename, needle]
+}
+
+fn assert_pickaxe_matches_git(
+    worktree: &Path,
+    git_args: &[&str],
+    pickaxe: Arc<Pickaxe>,
+    max_count: Option<usize>,
+    paths: &[&str],
+) -> Vec<String> {
+    let mut argv: Vec<&str> = git_args.to_vec();
+    let max_arg = max_count.map(|n| n.to_string());
+    if let Some(n) = max_arg.as_deref() {
+        argv.extend(["-n", n]);
+    }
+    if !paths.is_empty() {
+        argv.push("--");
+        argv.extend(paths);
+    }
+    let git_oids = git_log_pickaxe(worktree, &argv);
+    let grit_oids = grit_pickaxe_log(
+        worktree,
+        pickaxe,
+        max_count,
+        paths.iter().map(|p| (*p).to_owned()).collect(),
+    );
+    assert_eq!(grit_oids, git_oids, "git log {argv:?}");
+    git_oids
+}
+
+fn needle_s() -> Arc<Pickaxe> {
+    Pickaxe::occurrences("needle").into_shared()
+}
+
+fn needle_g() -> Arc<Pickaxe> {
+    Pickaxe::line_grep("needle", false)
+        .expect("grep")
+        .into_shared()
+}
+
+#[test]
+fn pickaxe_pure_rename_is_not_a_change_matches_git() {
+    let repo = HistoryRepo::init();
+    let worktree = repo.worktree();
+    let [add, _rename, needle] = rename_history(worktree, "a.txt", "b.txt", "extra line\n");
+    for max_count in [None, Some(10)] {
+        let s = assert_pickaxe_matches_git(worktree, &["-S", "needle"], needle_s(), max_count, &[]);
+        assert_eq!(s, vec![needle.clone(), add.clone()]);
+        let g = assert_pickaxe_matches_git(worktree, &["-G", "needle"], needle_g(), max_count, &[]);
+        assert_eq!(g, vec![needle.clone(), add.clone()]);
+    }
+}
+
+#[test]
+fn pickaxe_rename_with_renames_disabled_matches_git() {
+    let repo = HistoryRepo::init();
+    let worktree = repo.worktree();
+    let [add, rename, needle] = rename_history(worktree, "a.txt", "b.txt", "extra line\n");
+    git(worktree, &["config", "diff.renames", "false"]);
+    for max_count in [None, Some(10)] {
+        let s = assert_pickaxe_matches_git(worktree, &["-S", "needle"], needle_s(), max_count, &[]);
+        assert_eq!(s, vec![needle.clone(), rename.clone(), add.clone()]);
+        let g = assert_pickaxe_matches_git(worktree, &["-G", "needle"], needle_g(), max_count, &[]);
+        assert_eq!(g.len(), 3);
+    }
+}
+
+#[test]
+fn pickaxe_rename_with_pathspec_on_new_path_only_matches_git() {
+    let repo = HistoryRepo::init();
+    let worktree = repo.worktree();
+    let [_add, rename, needle] = rename_history(worktree, "a.txt", "b.txt", "extra line\n");
+    for max_count in [None, Some(10)] {
+        let s = assert_pickaxe_matches_git(
+            worktree,
+            &["-S", "needle"],
+            needle_s(),
+            max_count,
+            &["b.txt"],
+        );
+        assert_eq!(s, vec![needle.clone(), rename.clone()]);
+        assert_pickaxe_matches_git(
+            worktree,
+            &["-G", "needle"],
+            needle_g(),
+            max_count,
+            &["b.txt"],
+        );
+    }
+}
+
+#[test]
+fn pickaxe_move_into_pathspec_directory_matches_git() {
+    let repo = HistoryRepo::init();
+    let worktree = repo.worktree();
+    let [_add, rename, needle] = rename_history(worktree, "a.txt", "sub/a.txt", "extra line\n");
+    for max_count in [None, Some(10)] {
+        let s = assert_pickaxe_matches_git(
+            worktree,
+            &["-S", "needle"],
+            needle_s(),
+            max_count,
+            &["sub"],
+        );
+        assert_eq!(s, vec![needle.clone(), rename.clone()]);
+        assert_pickaxe_matches_git(worktree, &["-G", "needle"], needle_g(), max_count, &["sub"]);
+    }
+}
+
+#[test]
+fn pickaxe_rename_within_pathspec_directory_matches_git() {
+    let repo = HistoryRepo::init();
+    let worktree = repo.worktree();
+    commit_file(worktree, "other/x.txt", "needle elsewhere\n", "other");
+    let [add, _rename, needle] = rename_history(worktree, "sub/a.c", "sub/b.c", "extra line\n");
+    for max_count in [None, Some(10)] {
+        for spec in ["sub", "sub/", "sub/*.c"] {
+            let s = assert_pickaxe_matches_git(
+                worktree,
+                &["-S", "needle"],
+                needle_s(),
+                max_count,
+                &[spec],
+            );
+            assert_eq!(s, vec![needle.clone(), add.clone()], "pathspec {spec}");
+            let g = assert_pickaxe_matches_git(
+                worktree,
+                &["-G", "needle"],
+                needle_g(),
+                max_count,
+                &[spec],
+            );
+            assert_eq!(g, vec![needle.clone(), add.clone()], "pathspec {spec}");
+        }
+    }
+}
+
+#[test]
+fn pickaxe_rename_that_changes_matches_is_listed_matches_git() {
+    let repo = HistoryRepo::init();
+    let worktree = repo.worktree();
+    let [add, rename, needle] = rename_history(worktree, "a.txt", "b.txt", "needle extra\n");
+    for max_count in [None, Some(10)] {
+        let s = assert_pickaxe_matches_git(worktree, &["-S", "needle"], needle_s(), max_count, &[]);
+        assert_eq!(s, vec![needle.clone(), rename.clone(), add.clone()]);
+        let g = assert_pickaxe_matches_git(worktree, &["-G", "needle"], needle_g(), max_count, &[]);
+        assert_eq!(g, vec![needle.clone(), rename.clone(), add.clone()]);
+    }
+}
+
+#[test]
+fn pickaxe_first_parent_diffs_merges_against_first_parent_matches_git() {
+    let repo = HistoryRepo::init();
+    let worktree = repo.worktree();
+    commit_file(worktree, "f.txt", "root\n", "root");
+    git(worktree, &["checkout", "-b", "side"]);
+    commit_file(worktree, "f.txt", "root\nneedle\n", "side-needle");
+    git(worktree, &["checkout", "main"]);
+    commit_file(worktree, "g.txt", "x\n", "main-touch");
+    git(worktree, &["merge", "side", "-m", "merge side"]);
+    let merge = git(worktree, &["rev-parse", "HEAD"]).trim().to_owned();
+    let git_oids = git_log_pickaxe(worktree, &["--first-parent", "-S", "needle"]);
+    assert_eq!(git_oids, vec![merge]);
+    let repo = open_grit_repo(worktree);
+    let opts = RevListOptions {
+        first_parent: true,
+        pickaxe: Some(needle_s()),
+        use_commit_graph: true,
+        ..RevListOptions::default()
+    };
+    let grit_oids: Vec<String> = rev_list(&repo, &["HEAD".into()], &[], &opts)
+        .expect("rev-list")
+        .commits
+        .into_iter()
+        .map(|oid| oid.to_hex())
+        .collect();
+    assert_eq!(grit_oids, git_oids);
+}

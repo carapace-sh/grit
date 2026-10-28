@@ -8,13 +8,40 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::config::ConfigSet;
+use crate::diff::core::diff_trees_for_pathspecs;
 use crate::diff::posix_ere::PosixEre;
 use crate::diff::structured::SideBytes;
-use crate::diff::{diff_trees, DiffEntry};
+use crate::diff::{
+    detect_renames_with_policy, renames_from_config, DiffEntry, DiffStatus, RenameDetection,
+};
 use crate::error::{Error, Result};
 use crate::objects::{parse_commit, FileMode, ObjectId};
-use crate::pathspec::matches_pathspec_list;
+use crate::parallel::ThreadPolicy;
 use crate::repo::Repository;
+
+/// Rename pairing a pickaxe applies to added and deleted paths before matching them.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PickaxeRenames<'a> {
+    /// Similarity percent, or `None` when renames are not detected.
+    threshold: Option<u32>,
+    /// Source of `diff.renameLimit` and rename-scoring thread settings.
+    config: &'a ConfigSet,
+}
+
+impl<'a> PickaxeRenames<'a> {
+    pub(crate) fn new(detection: RenameDetection, config: &'a ConfigSet) -> Self {
+        Self {
+            threshold: detection.threshold_percent(),
+            config,
+        }
+    }
+
+    /// Git's `log` default: `diff.renames` from `config`, at the default similarity.
+    pub(crate) fn from_config(config: &'a ConfigSet) -> Self {
+        Self::new(renames_from_config(config), config)
+    }
+}
 
 /// Which pickaxe mode is active (`-S` or `-G`).
 #[derive(Debug, Clone)]
@@ -115,9 +142,22 @@ impl Pickaxe {
 
     /// Returns true when `commit` would be kept by `git log` with this pickaxe vs its first parent.
     ///
+    /// Matches Git's order of work: the tree diff is limited to `paths` first, then deleted and
+    /// added paths are paired as renames per `renames`, and only then is each file pair tested.
+    /// A rename whose old and new file hold the same number of matches (`-S`), or whose diff
+    /// changes no matching line (`-G`), is therefore not a change. A file moved into the
+    /// pathspec from outside it is an addition, since its old path was never diffed.
+    ///
     /// Merge commits are skipped (Git default without combined merge diffs). Non-merge commits
-    /// compare to the first parent only. Pathspecs limit which tree entries are considered.
-    /// Binary files are skipped for `-G`; `-S` searches binary blobs.
+    /// compare to the first parent only. Binary files are skipped for `-G`; `-S` searches binary
+    /// blobs.
+    ///
+    /// # Parameters
+    ///
+    /// - `paths` — repository-relative pathspecs limiting the diff; empty means the whole tree.
+    /// - `renames` — rename pairing; callers following Git use
+    ///   [`renames_from_config`] (`diff.renames`).
+    /// - `config` — supplies `diff.renameLimit` and rename-scoring thread settings.
     ///
     /// # Errors
     ///
@@ -127,6 +167,8 @@ impl Pickaxe {
         repo: &Repository,
         commit_oid: ObjectId,
         paths: &[String],
+        renames: RenameDetection,
+        config: &ConfigSet,
     ) -> Result<bool> {
         let data = repo.odb().read(&commit_oid)?.data;
         let commit = parse_commit(&data)?;
@@ -143,63 +185,138 @@ impl Pickaxe {
         } else {
             None
         };
-        self.matches_trees(repo, parent_tree.as_ref(), &commit.tree, paths, None)
+        let renames = PickaxeRenames::new(renames, config);
+        self.matches_trees(
+            repo,
+            parent_tree.as_ref(),
+            &commit.tree,
+            paths,
+            renames,
+            &mut HashMap::new(),
+        )
     }
 
     /// Pickaxe match using pre-resolved parent and commit trees (avoids re-reading commits).
     ///
     /// `parent_tree` is `None` for root commits. Merge commits must be filtered out by the caller.
+    /// `blob_occurrence_cache` memoizes literal `-S` counts per blob across calls.
     pub(crate) fn matches_trees(
         &self,
         repo: &Repository,
         parent_tree: Option<&ObjectId>,
         commit_tree: &ObjectId,
         paths: &[String],
-        mut blob_occurrence_cache: Option<&mut HashMap<ObjectId, usize>>,
+        renames: PickaxeRenames<'_>,
+        blob_occurrence_cache: &mut HashMap<ObjectId, usize>,
     ) -> Result<bool> {
-        let entries = diff_trees(repo.odb(), parent_tree, Some(commit_tree), "")?;
         let odb = repo.odb();
+        let entries = diff_trees_for_pathspecs(odb, parent_tree, Some(commit_tree), paths)?;
+        // Rename pairing only ever combines an added path with a deleted one, so every other
+        // entry can be tested (and can end the search) before paying for it.
+        let mut unpaired = Vec::new();
         for entry in entries {
-            if !entry_matches_pathspecs(&entry, paths) {
-                continue;
+            if matches!(entry.status, DiffStatus::Added | DiffStatus::Deleted) {
+                unpaired.push(entry);
+            } else if self.changed_filepair_matches(odb, &entry, blob_occurrence_cache)? {
+                return Ok(true);
             }
-            if entry.old_oid == entry.new_oid && entry.old_mode == entry.new_mode {
-                continue;
+        }
+        if unpaired.is_empty() {
+            return Ok(false);
+        }
+        // Any pair or lone side that matches has a side that matches on its own.
+        let mut any_side_matches = false;
+        for entry in &unpaired {
+            if self.side_may_match(odb, entry, blob_occurrence_cache)? {
+                any_side_matches = true;
+                break;
             }
-            if self.filepair_matches(odb, &entry, &mut blob_occurrence_cache)? {
+        }
+        if !any_side_matches {
+            return Ok(false);
+        }
+        let pairs = match renames.threshold {
+            Some(threshold) => detect_renames_with_policy(
+                odb,
+                None,
+                unpaired,
+                threshold,
+                renames.config,
+                &ThreadPolicy::default(),
+                None,
+            )?,
+            None => unpaired,
+        };
+        for entry in &pairs {
+            if self.changed_filepair_matches(odb, entry, blob_occurrence_cache)? {
                 return Ok(true);
             }
         }
         Ok(false)
     }
 
+    fn changed_filepair_matches(
+        &self,
+        odb: &crate::odb::Odb,
+        entry: &DiffEntry,
+        blob_occurrence_cache: &mut HashMap<ObjectId, usize>,
+    ) -> Result<bool> {
+        if entry.old_oid == entry.new_oid && entry.old_mode == entry.new_mode {
+            return Ok(false);
+        }
+        self.filepair_matches(odb, entry, blob_occurrence_cache)
+    }
+
+    /// Whether the one present side of an added or deleted `entry` holds a match by itself.
+    fn side_may_match(
+        &self,
+        odb: &crate::odb::Odb,
+        entry: &DiffEntry,
+        blob_occurrence_cache: &mut HashMap<ObjectId, usize>,
+    ) -> Result<bool> {
+        let (oid, mode) = if entry.status == DiffStatus::Deleted {
+            (&entry.old_oid, entry.old_mode)
+        } else {
+            (&entry.new_oid, entry.new_mode)
+        };
+        match &self.kind {
+            PickaxeKind::Occurrences { .. } => {
+                Ok(self.occurrences_in(odb, oid, mode, blob_occurrence_cache)? > 0)
+            }
+            PickaxeKind::LineGrep => {
+                let (bytes, binary) = blob_side(odb, mode, oid)?;
+                let Some(regex) = self.ere.as_ref().filter(|_| !binary) else {
+                    return Ok(false);
+                };
+                Ok(bytes
+                    .text()
+                    .split_inclusive('\n')
+                    .any(|line| regex.is_match(line.as_bytes())))
+            }
+        }
+    }
+
     fn filepair_matches(
         &self,
         odb: &crate::odb::Odb,
         entry: &DiffEntry,
-        blob_occurrence_cache: &mut Option<&mut HashMap<ObjectId, usize>>,
+        blob_occurrence_cache: &mut HashMap<ObjectId, usize>,
     ) -> Result<bool> {
         match &self.kind {
-            PickaxeKind::Occurrences { needle } => {
-                let c1 = blob_occurrence_count(
+            PickaxeKind::Occurrences { .. } => {
+                let old = self.occurrences_in(
                     odb,
                     &entry.old_oid,
                     entry.old_mode,
-                    needle,
-                    self.ignore_case,
-                    self.ere.as_ref(),
-                    blob_occurrence_cache.as_deref_mut(),
+                    blob_occurrence_cache,
                 )?;
-                let c2 = blob_occurrence_count(
+                let new = self.occurrences_in(
                     odb,
                     &entry.new_oid,
                     entry.new_mode,
-                    needle,
-                    self.ignore_case,
-                    self.ere.as_ref(),
-                    blob_occurrence_cache.as_deref_mut(),
+                    blob_occurrence_cache,
                 )?;
-                Ok(c1 != c2)
+                Ok(old != new)
             }
             PickaxeKind::LineGrep => {
                 let (old_bytes, old_bin) = blob_side(odb, entry.old_mode, &entry.old_oid)?;
@@ -218,47 +335,36 @@ impl Pickaxe {
             }
         }
     }
-}
 
-fn blob_occurrence_count(
-    odb: &crate::odb::Odb,
-    oid: &ObjectId,
-    mode: FileMode,
-    needle: &str,
-    ignore_case: bool,
-    ere: Option<&PosixEre>,
-    cache: Option<&mut HashMap<ObjectId, usize>>,
-) -> Result<usize> {
-    if mode.is_absent() || *oid == ObjectId::zero() {
-        return Ok(0);
-    }
-    if mode == FileMode::GITLINK {
-        let (bytes, _) = blob_side(odb, mode, oid)?;
-        return Ok(count_occurrences(
-            bytes.data.as_slice(),
-            needle,
-            ignore_case,
-            ere,
-        ));
-    }
-    if let Some(cache) = cache {
-        if ere.is_none() && !ignore_case {
-            if let Some(&count) = cache.get(oid) {
-                return Ok(count);
-            }
-            let data = odb.read(oid)?.data;
-            let count = count_occurrences(&data, needle, false, None);
-            cache.insert(*oid, count);
+    /// `-S` match count in one side of a file pair, memoized per blob in `cache`.
+    ///
+    /// The cache is only valid for this pickaxe: counts depend on the needle and its flags.
+    fn occurrences_in(
+        &self,
+        odb: &crate::odb::Odb,
+        oid: &ObjectId,
+        mode: FileMode,
+        cache: &mut HashMap<ObjectId, usize>,
+    ) -> Result<usize> {
+        let PickaxeKind::Occurrences { needle } = &self.kind else {
+            return Ok(0);
+        };
+        if mode.is_absent() || *oid == ObjectId::zero() {
+            return Ok(0);
+        }
+        let count_in =
+            |bytes: &[u8]| count_occurrences(bytes, needle, self.ignore_case, self.ere.as_ref());
+        if mode == FileMode::GITLINK {
+            let (bytes, _) = blob_side(odb, mode, oid)?;
+            return Ok(count_in(bytes.data.as_slice()));
+        }
+        if let Some(&count) = cache.get(oid) {
             return Ok(count);
         }
+        let count = count_in(&odb.read(oid)?.data);
+        cache.insert(*oid, count);
+        Ok(count)
     }
-    let (bytes, _) = blob_side(odb, mode, oid)?;
-    Ok(count_occurrences(
-        bytes.data.as_slice(),
-        needle,
-        ignore_case,
-        ere,
-    ))
 }
 
 /// Invalid pickaxe pattern.
@@ -293,17 +399,6 @@ fn compile_pickaxe_ere(
         pattern: pattern.to_owned(),
         detail,
     })
-}
-
-fn entry_matches_pathspecs(entry: &DiffEntry, paths: &[String]) -> bool {
-    if paths.is_empty() {
-        return true;
-    }
-    let path = entry.path();
-    if path.is_empty() {
-        return false;
-    }
-    matches_pathspec_list(path, paths)
 }
 
 fn count_occurrences(

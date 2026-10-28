@@ -15,6 +15,7 @@ use std::sync::Arc;
 use crate::bitmap_walk::{bitmap_filter_supported, BitmapWalkError, PeeledTips, ReachableSet};
 use crate::commit_graph_file::{BloomPrecheck, BloomWalkStatsHandle, CommitGraphChain};
 use crate::config::ConfigSet;
+use crate::diff::pickaxe::PickaxeRenames;
 use crate::diff::zero_oid;
 use crate::error::{Error, Result};
 use crate::ident::{committer_unix_seconds_for_ordering, parse_signature_times};
@@ -30,6 +31,7 @@ use crate::objects::{
 use crate::odb::store::ObjectStore;
 use crate::pack_bitmap::BitmapIndex;
 use crate::patch_ids::{compute_patch_id, compute_patch_id_for_paths};
+use crate::pathspec::pathspec_entry_is_relevant;
 use crate::progress::poll_watch;
 use crate::ref_exclusions::{git_namespace_prefix, strip_git_namespace, RefExclusions};
 use crate::reflog::{list_reflog_refs, read_reflog};
@@ -1266,7 +1268,9 @@ pub fn rev_list(
         HashSet::new()
     };
 
-    if let Some(result) = try_bounded_commit_filter_limit_list(repo, &include, &exclude, options)? {
+    if let Some(result) =
+        try_bounded_commit_filter_limit_list(repo, &include, &exclude, options, &repo_config)?
+    {
         return Ok(result);
     }
 
@@ -1520,7 +1524,14 @@ pub fn rev_list(
     }
     if let Some(pickaxe) = options.pickaxe.as_ref() {
         repo.odb().with_pack_read_context(|| {
-            retain_included_by_pickaxe(repo, &mut included, pickaxe, &options.paths)
+            retain_included_by_pickaxe(
+                repo,
+                &mut graph,
+                &mut included,
+                pickaxe,
+                &options.paths,
+                &repo_config,
+            )
         })?;
     }
 
@@ -5376,13 +5387,25 @@ fn record_literal_tree_diff(
 /// Plain normalized literal pathspec safe for [`trees_differ_at_literal_path`].
 fn retain_included_by_pickaxe(
     repo: &Repository,
+    graph: &mut CommitGraph<'_>,
     included: &mut HashSet<ObjectId>,
     pickaxe: &crate::diff::Pickaxe,
     paths: &[String],
+    repo_config: &ConfigSet,
 ) -> Result<()> {
+    let renames = PickaxeRenames::from_config(repo_config);
+    let mut blob_occurrence_cache = HashMap::new();
     let mut drop = Vec::new();
     for &oid in included.iter() {
-        if !pickaxe.matches_commit(repo, oid, paths)? {
+        if !pickaxe_matches_commit_with_graph(
+            repo,
+            graph,
+            pickaxe,
+            oid,
+            paths,
+            renames,
+            &mut blob_occurrence_cache,
+        )? {
             drop.push(oid);
         }
     }
@@ -5392,13 +5415,16 @@ fn retain_included_by_pickaxe(
     Ok(())
 }
 
+/// Pickaxe match of `commit_oid` against its parents in `graph`, which carries
+/// `--first-parent` truncation and grafts the way the walk sees them.
 fn pickaxe_matches_commit_with_graph(
     repo: &Repository,
     graph: &mut CommitGraph<'_>,
     pickaxe: &crate::diff::Pickaxe,
     commit_oid: ObjectId,
     paths: &[String],
-    blob_occurrence_cache: Option<&mut HashMap<ObjectId, usize>>,
+    renames: PickaxeRenames<'_>,
+    blob_occurrence_cache: &mut HashMap<ObjectId, usize>,
 ) -> Result<bool> {
     let parents = graph.parents_of(commit_oid)?;
     if parents.len() > 1 {
@@ -5419,6 +5445,7 @@ fn pickaxe_matches_commit_with_graph(
         parent_tree.as_ref(),
         &commit_tree,
         paths,
+        renames,
         blob_occurrence_cache,
     )
 }
@@ -5475,12 +5502,6 @@ fn dense_path_limited_count_from_included(
     included: &mut HashSet<ObjectId>,
     options: &RevListOptions,
 ) -> Result<usize> {
-    if let Some(filter) = options.commit_filter.as_ref().filter(|f| f.is_active()) {
-        included.retain(|oid| filter.matches(repo, *oid).unwrap_or(false));
-    }
-    if let Some(pickaxe) = options.pickaxe.as_ref() {
-        retain_included_by_pickaxe(repo, &mut *included, pickaxe, &options.paths)?;
-    }
     if options.until_cutoff.is_some() || options.since_cutoff.is_some() {
         let until = options.until_cutoff;
         let since = options.since_cutoff;
@@ -5717,16 +5738,6 @@ fn path_differs_for_specs(
 
 fn is_tree_mode(mode: u32) -> bool {
     mode == 0o040000
-}
-
-fn pathspec_entry_is_relevant(path: &str, is_tree: bool, pathspecs: &[String]) -> bool {
-    if crate::pathspec::matches_pathspec_list(path, pathspecs) {
-        return true;
-    }
-    if is_tree {
-        return crate::pathspec::pathspec_wants_descent_for_rev_tree(path, pathspecs);
-    }
-    false
 }
 
 fn read_parsed_tree(repo: &Repository, tree_oid: ObjectId) -> Result<Vec<TreeEntry>> {
@@ -6795,9 +6806,11 @@ fn try_bounded_commit_filter_limit_list(
     include: &[ObjectId],
     exclude: &[ObjectId],
     options: &RevListOptions,
+    repo_config: &ConfigSet,
 ) -> Result<Option<RevListResult>> {
     let filter = options.commit_filter.as_ref().filter(|f| f.is_active());
     let pickaxe = options.pickaxe.as_ref();
+    let pickaxe_renames = PickaxeRenames::from_config(repo_config);
     if filter.is_none() && pickaxe.is_none() {
         return Ok(None);
     }
@@ -6863,7 +6876,8 @@ fn try_bounded_commit_filter_limit_list(
                                     px,
                                     oid,
                                     &options.paths,
-                                    Some(&mut pickaxe_blob_cache),
+                                    pickaxe_renames,
+                                    &mut pickaxe_blob_cache,
                                 )?;
                             }
                         }
@@ -7262,6 +7276,7 @@ fn can_use_bounded_path_limit_list(options: &RevListOptions) -> bool {
         && within_bounded_limit_list_cap(options)
         && can_use_bounded_limit_list(&RevListOptions {
             paths: Vec::new(),
+            pickaxe: None,
             ..options.clone()
         })
 }
@@ -7368,6 +7383,8 @@ fn try_bounded_path_limit_list(
     }
 
     let mut cache = DenseWalkCache::default();
+    let pickaxe_renames = PickaxeRenames::from_config(repo_config);
+    let mut pickaxe_blob_cache = HashMap::new();
     let mut visible_seen = 0usize;
     let mut ordered = Vec::with_capacity(max_count.min(64));
     while let Some(item) = heap.pop() {
@@ -7394,7 +7411,19 @@ fn try_bounded_path_limit_list(
             .map(|f| f.matches(repo, oid))
             .transpose()?
             .unwrap_or(true);
-        if action.visible && filter_ok {
+        let pickaxe_ok = match options.pickaxe.as_ref() {
+            Some(pickaxe) if action.visible && filter_ok => pickaxe_matches_commit_with_graph(
+                repo,
+                &mut graph,
+                pickaxe,
+                oid,
+                paths,
+                pickaxe_renames,
+                &mut pickaxe_blob_cache,
+            )?,
+            _ => true,
+        };
+        if action.visible && filter_ok && pickaxe_ok {
             visible_seen += 1;
             if visible_seen > options.skip && ordered.len() < max_count {
                 ordered.push(oid);

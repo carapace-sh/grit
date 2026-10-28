@@ -806,6 +806,13 @@ pub fn pathspec_wants_descent_for_rev_tree(path: &str, specs: &[String]) -> bool
     !specs.iter().any(|s| !pathspec_is_exclude(s))
 }
 
+/// Whether a path-limited tree walk must look at entry `path`: it matches `specs`, or it is a
+/// directory that [`pathspec_wants_descent_for_rev_tree`] says may hold a match.
+pub(crate) fn pathspec_entry_is_relevant(path: &str, is_tree: bool, specs: &[String]) -> bool {
+    matches_pathspec_list(path, specs)
+        || (is_tree && pathspec_wants_descent_for_rev_tree(path, specs))
+}
+
 /// Whether tree-walking should recurse into directory `full_name` for pathspec `spec` without
 /// `-r` (Git `read_tree` / `show_recursive` “interesting” descent).
 ///

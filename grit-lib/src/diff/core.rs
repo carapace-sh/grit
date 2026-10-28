@@ -2448,10 +2448,10 @@ pub(crate) fn diff_trees_with_index(
         && old_tree_oid.is_some()
         && index.entries_sorted
         && !index.entries.iter().any(|e| e.stage() != 0))
-    .then_some(DiffTreesIndexHint {
-        index,
+    .then_some(DiffTreesWalkHint {
+        index: Some(index),
         old_tree_matches: true,
-        skip_sparse_directories: false,
+        ..DiffTreesWalkHint::default()
     });
     diff_trees_opts(
         odb,
@@ -2475,34 +2475,70 @@ pub(crate) fn diff_trees_outside_sparse_directories(
     crate::trace::trace_span!("grit.diff.tree");
     let hint = index
         .has_sparse_directory_placeholders()
-        .then_some(DiffTreesIndexHint {
-            index,
-            old_tree_matches: false,
+        .then_some(DiffTreesWalkHint {
+            index: Some(index),
             skip_sparse_directories: true,
+            ..DiffTreesWalkHint::default()
         });
     diff_trees_opts(odb, old_tree_oid, new_tree_oid, "", false, hint.as_ref())
 }
 
-#[derive(Clone, Copy)]
-struct DiffTreesIndexHint<'a> {
-    index: &'a Index,
+/// Like [`diff_trees`], but only paths `pathspecs` select (Git's pathspec-limited tree diff).
+///
+/// Directories no pathspec can reach are not read. An empty list selects every path.
+pub(crate) fn diff_trees_for_pathspecs(
+    odb: &Odb,
+    old_tree_oid: Option<&ObjectId>,
+    new_tree_oid: Option<&ObjectId>,
+    pathspecs: &[String],
+) -> Result<Vec<DiffEntry>> {
+    if pathspecs.is_empty() {
+        return diff_trees(odb, old_tree_oid, new_tree_oid, "");
+    }
+    crate::trace::trace_span!("grit.diff.tree");
+    let hint = DiffTreesWalkHint {
+        pathspecs,
+        ..DiffTreesWalkHint::default()
+    };
+    let mut entries = diff_trees_opts(odb, old_tree_oid, new_tree_oid, "", false, Some(&hint))?;
+    entries.retain(|entry| {
+        let path = entry.path();
+        !path.is_empty() && crate::pathspec::matches_pathspec_list(path, pathspecs)
+    });
+    Ok(entries)
+}
+
+/// Directories a tree diff may skip, and an index that can stand in for the old tree.
+#[derive(Clone, Copy, Default)]
+struct DiffTreesWalkHint<'a> {
+    index: Option<&'a Index>,
     /// `index` holds exactly the old tree's entries, so deleted subtrees may be listed from it.
     old_tree_matches: bool,
     /// Do not descend into directories `index` holds as sparse-directory rows.
     skip_sparse_directories: bool,
+    /// When non-empty, do not descend into directories these pathspecs cannot match inside.
+    pathspecs: &'a [String],
 }
 
-impl DiffTreesIndexHint<'_> {
+impl DiffTreesWalkHint<'_> {
     /// Whether the walk must not enter directory `dir` (stored form, no trailing slash).
     fn skips(&self, dir: &str) -> bool {
-        if !self.skip_sparse_directories || dir.is_empty() {
+        if dir.is_empty() {
             return false;
         }
+        if !self.pathspecs.is_empty()
+            && !crate::pathspec::pathspec_entry_is_relevant(dir, true, self.pathspecs)
+        {
+            return true;
+        }
+        let Some(index) = self.index.filter(|_| self.skip_sparse_directories) else {
+            return false;
+        };
         let mut row = crate::repo_relpath::storage_bytes(dir).into_owned();
         row.push(b'/');
-        self.index
+        index
             .find_entry_pos(&row, 0)
-            .is_some_and(|pos| self.index.entries[pos].is_sparse_directory_placeholder())
+            .is_some_and(|pos| index.entries[pos].is_sparse_directory_placeholder())
     }
 }
 
@@ -2702,7 +2738,7 @@ fn diff_subtrees_in_place(
     new_tree_oid: Option<&ObjectId>,
     prefix: &str,
     show_trees: bool,
-    index_hint: Option<&DiffTreesIndexHint<'_>>,
+    index_hint: Option<&DiffTreesWalkHint<'_>>,
     result: &mut Vec<DiffEntry>,
 ) -> Result<()> {
     if index_hint.is_some_and(|hint| hint.skips(prefix)) {
@@ -2770,7 +2806,7 @@ fn diff_trees_opts(
     new_tree_oid: Option<&ObjectId>,
     prefix: &str,
     show_trees: bool,
-    index_hint: Option<&DiffTreesIndexHint<'_>>,
+    index_hint: Option<&DiffTreesWalkHint<'_>>,
 ) -> Result<Vec<DiffEntry>> {
     let mut result = Vec::new();
     diff_subtrees_in_place(
@@ -2931,7 +2967,7 @@ fn diff_tree_entries_opts(
     mut new: WalkEntries<'_>,
     prefix: &str,
     show_trees: bool,
-    index_hint: Option<&DiffTreesIndexHint<'_>>,
+    index_hint: Option<&DiffTreesWalkHint<'_>>,
     result: &mut Vec<DiffEntry>,
 ) -> Result<()> {
     let mut old_entry = old.next_entry()?;
@@ -3099,7 +3135,7 @@ fn emit_deleted_opts(
     entry: &TreeEntryRef<'_>,
     prefix: &str,
     show_trees: bool,
-    index_hint: Option<&DiffTreesIndexHint<'_>>,
+    index_hint: Option<&DiffTreesWalkHint<'_>>,
     result: &mut Vec<DiffEntry>,
 ) -> Result<()> {
     let path = crate::repo_relpath::format_path_stored(prefix, entry.name);
@@ -3116,10 +3152,12 @@ fn emit_deleted_opts(
                 score: None,
             });
         }
-        if let Some(hint) = index_hint
-            .filter(|hint| hint.old_tree_matches && !hint.index.has_sparse_directory_placeholders())
+        if let Some(index) = index_hint
+            .filter(|hint| hint.old_tree_matches)
+            .and_then(|hint| hint.index)
+            .filter(|index| !index.has_sparse_directory_placeholders())
         {
-            emit_deleted_tree_from_index(hint.index, &path, result);
+            emit_deleted_tree_from_index(index, &path, result);
             return Ok(());
         }
         diff_subtrees_in_place(
@@ -3151,7 +3189,7 @@ fn emit_added_opts(
     entry: &TreeEntryRef<'_>,
     prefix: &str,
     show_trees: bool,
-    index_hint: Option<&DiffTreesIndexHint<'_>>,
+    index_hint: Option<&DiffTreesWalkHint<'_>>,
     result: &mut Vec<DiffEntry>,
 ) -> Result<()> {
     let path = crate::repo_relpath::format_path_stored(prefix, entry.name);
