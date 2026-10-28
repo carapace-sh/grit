@@ -406,6 +406,41 @@ fn rebase_updates_stacked_branches() -> TestResult {
 }
 
 #[test]
+fn rebase_main_moves_deep_stacked_branches_json() -> TestResult {
+    let scratch = Scratch::new("deep-stack")?;
+    let dir = scratch.path();
+    init_repo(dir)?;
+    git(dir, &["commit", "-m", "base", "--allow-empty"])?;
+    for branch in ["a", "b", "c"] {
+        git(dir, &["switch", "-q", "-c", branch])?;
+        for n in 1..=2 {
+            git(
+                dir,
+                &["commit", "-m", &format!("{branch}{n}"), "--allow-empty"],
+            )?;
+        }
+    }
+    git(dir, &["switch", "-q", "main"])?;
+    git(dir, &["commit", "-m", "main advances", "--allow-empty"])?;
+    git(dir, &["switch", "-q", "a"])?;
+    gs(dir, ["config", "grit.changeIds", "false"])?;
+    let out = gs(dir, ["rebase", "main", "--json"])?;
+    assert!(out.success(), "{}\n{}", out.stdout, out.stderr);
+    let json = parse_json(&out.stdout)?;
+    let refs: Vec<&str> = json["refs"]
+        .as_array()
+        .ok_or("refs")?
+        .iter()
+        .filter_map(|r| r["ref"].as_str())
+        .collect();
+    for name in ["refs/heads/a", "refs/heads/b", "refs/heads/c"] {
+        assert!(refs.contains(&name), "missing {name} in {json}");
+    }
+    git_fsck_strict(dir)?;
+    Ok(())
+}
+
+#[test]
 fn rebase_keeps_backup_branch_at_old_tip() -> TestResult {
     let scratch = Scratch::new("backup")?;
     let dir = scratch.path();

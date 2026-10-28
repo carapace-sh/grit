@@ -143,6 +143,139 @@ fn rebase_onto_replays_range_and_moves_branch() {
     assert_git_fsck_strict(wt);
 }
 
+fn branch_tip_label(branch: char, count: usize) -> &'static str {
+    match (branch, count) {
+        ('a', 1) => "a1",
+        ('a', 2) => "a2",
+        ('b', 1) => "b1",
+        ('b', 2) => "b2",
+        ('c', 1) => "c1",
+        ('c', 2) => "c2",
+        _ => panic!("unsupported stack depth"),
+    }
+}
+
+fn init_issue_2213_stack(
+    wt: &std::path::Path,
+    per_branch: [usize; 3],
+) -> std::collections::HashMap<String, ObjectId> {
+    assert!(per_branch.iter().all(|&n| n == 1 || n == 2));
+    let mut edges: Vec<(&str, &str)> = vec![("base", "r"), ("main_m", "base")];
+    let mut parent = "base";
+    for (branch, count) in [
+        ('a', per_branch[0]),
+        ('b', per_branch[1]),
+        ('c', per_branch[2]),
+    ] {
+        for n in 1..=count {
+            let label = branch_tip_label(branch, n);
+            edges.push((label, parent));
+            parent = label;
+        }
+    }
+    build_commit_dag(
+        wt,
+        &edges,
+        &[
+            ("main_m", "refs/heads/main"),
+            (branch_tip_label('a', per_branch[0]), "refs/heads/a"),
+            (branch_tip_label('b', per_branch[1]), "refs/heads/b"),
+            (branch_tip_label('c', per_branch[2]), "refs/heads/c"),
+        ],
+    )
+}
+
+fn assert_rebase_moves_stacked_abc(
+    wt: &std::path::Path,
+    oids: &std::collections::HashMap<String, ObjectId>,
+) {
+    git(wt, &["checkout", "a"]);
+    let grit = open_grit(wt);
+    let request = rebase_request(oids["main_m"], None, git_rev_parse(wt, "a"));
+    let opts = rebase_opts(RefScope::Branches, EmptyPolicy::Drop, true);
+    let plan = match plan_rebase(&grit, &request, &opts).expect("plan") {
+        RebasePlan::Plan(plan) => plan,
+        other => panic!("expected plan, got {other:?}"),
+    };
+    let moved: Vec<&str> = plan.ref_updates.iter().map(|u| u.name.as_str()).collect();
+    for name in ["refs/heads/a", "refs/heads/b", "refs/heads/c"] {
+        assert!(moved.contains(&name), "{moved:?}");
+    }
+    apply_plan(&grit, &plan);
+    assert!(git_merge_base_is_ancestor(wt, "main", "a"));
+    assert!(git_merge_base_is_ancestor(wt, "a", "b"));
+    assert!(git_merge_base_is_ancestor(wt, "b", "c"));
+    assert_git_fsck_strict(wt);
+}
+
+#[test]
+fn rebase_onto_moves_multi_commit_stacked_branches() {
+    let repo = HistoryRepo::init();
+    let wt = repo.worktree();
+    let oids = init_issue_2213_stack(wt, [2, 2, 2]);
+    assert_rebase_moves_stacked_abc(wt, &oids);
+}
+
+#[test]
+fn rebase_onto_moves_stacked_branches_one_one_two() {
+    let repo = HistoryRepo::init();
+    let wt = repo.worktree();
+    let oids = init_issue_2213_stack(wt, [1, 1, 2]);
+    assert_rebase_moves_stacked_abc(wt, &oids);
+}
+
+#[test]
+fn rebase_onto_moves_stacked_branches_one_two_one() {
+    let repo = HistoryRepo::init();
+    let wt = repo.worktree();
+    let oids = init_issue_2213_stack(wt, [1, 2, 1]);
+    assert_rebase_moves_stacked_abc(wt, &oids);
+}
+
+#[test]
+fn rebase_onto_moves_branch_forked_from_middle_of_range() {
+    let repo = HistoryRepo::init();
+    let wt = repo.worktree();
+    let oids = build_commit_dag(
+        wt,
+        &[
+            ("base", "r"),
+            ("main_m", "base"),
+            ("a1", "base"),
+            ("a2", "a1"),
+            ("side1", "a1"),
+            ("side2", "side1"),
+        ],
+        &[
+            ("main_m", "refs/heads/main"),
+            ("a2", "refs/heads/a"),
+            ("side2", "refs/heads/side"),
+        ],
+    );
+    git(wt, &["checkout", "a"]);
+    let grit = open_grit(wt);
+    let plan = match plan_rebase(
+        &grit,
+        &rebase_request(oids["main_m"], None, oids["a2"]),
+        &rebase_opts(RefScope::Branches, EmptyPolicy::Drop, true),
+    )
+    .expect("plan")
+    {
+        RebasePlan::Plan(plan) => plan,
+        other => panic!("expected plan, got {other:?}"),
+    };
+    assert!(
+        plan.ref_updates.iter().any(|u| u.name.ends_with("side")),
+        "{:?}",
+        plan.ref_updates
+    );
+    apply_plan(&grit, &plan);
+    assert!(git_merge_base_is_ancestor(wt, "main", "side"));
+    assert!(git_merge_base_is_ancestor(wt, "a~1", "side"));
+    assert!(!git_merge_base_is_ancestor(wt, "a", "side"));
+    assert_git_fsck_strict(wt);
+}
+
 #[test]
 fn rebase_onto_moves_stacked_branches() {
     let repo = HistoryRepo::init();

@@ -585,7 +585,10 @@ pub(crate) fn plan_rebase_resumable(
     Ok(Ok(outcome))
 }
 
-/// Include sibling branch tips (same parent in the rebase range) when updating all descendant refs.
+/// Append commits on scoped branch tips that descend from the rebase range but are not in it.
+///
+/// Stacked branches often carry more than one commit above the checked-out branch; those commits
+/// must replay after the primary range so ref updates stay on the rewritten tips.
 fn extend_rebase_replay_order(
     repo: &Repository,
     fork: ObjectId,
@@ -599,26 +602,34 @@ fn extend_rebase_replay_order(
     if matches!(opts.scope, RefScope::Head) {
         return Ok(range.to_vec());
     }
-    let mut order = range.to_vec();
-    let mut in_order: HashSet<ObjectId> = order.iter().copied().collect();
+    let range_set: HashSet<ObjectId> = range.iter().copied().collect();
     let oldest = range[0];
     let scoped = collect_scoped_refs(repo, opts, oldest)?;
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for (_, tip) in &scoped {
-            if in_order.contains(tip) || skip_map.contains_key(tip) {
-                continue;
-            }
-            let parents = commit_parents(repo, *tip)?;
-            if parents
-                .iter()
-                .all(|parent| *parent == fork || in_order.contains(parent))
-            {
-                order.push(*tip);
-                in_order.insert(*tip);
-                changed = true;
-            }
+
+    let mut extra = HashSet::new();
+    for (_, tip) in &scoped {
+        if skip_map.contains_key(tip) || range_set.contains(tip) {
+            continue;
+        }
+        let mut reachable = commits_reachable_excluding_ancestors_of(repo, &[*tip], &[fork], None)?;
+        reachable
+            .retain(|oid| *oid != fork && !range_set.contains(oid) && !skip_map.contains_key(oid));
+        extra.extend(reachable);
+    }
+
+    if extra.is_empty() {
+        return Ok(range.to_vec());
+    }
+
+    let extra_vec: Vec<ObjectId> = extra.into_iter().collect();
+    let mut appended = topo_order_commit_subset(repo, &extra_vec, true)?;
+    appended.reverse();
+
+    let mut order = range.to_vec();
+    let mut in_order = range_set;
+    for oid in appended {
+        if in_order.insert(oid) {
+            order.push(oid);
         }
     }
     Ok(order)
