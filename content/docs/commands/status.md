@@ -104,7 +104,7 @@ On Unix, explicit path operands must be valid UTF-8. An operand containing inval
 | `--pathspec-from-file <FILE\|->` | Read pathspecs from a file (`-` for stdin), in addition to any `PATH` arguments. |
 | `--pathspec-file-nul` | `--pathspec-from-file` entries are NUL-separated (requires `--pathspec-from-file`). |
 | `--ignored` | List ignored paths (traditional mode; same `!!` set as `git status --ignored --porcelain`). |
-| `--short` | Compact one-line-per-path output for humans only (two-letter staged/unstaged codes; JSON unchanged). |
+| `-s`, `--short` | Compact one-line-per-path output for humans only (two-letter staged/unstaged codes; JSON unchanged). |
 
 Rename detection is on by default (Git’s `status.renames` / `diff.renames`; disable with `status.renames=false`). Human output shows renames as `old → new`; `--json` adds `old_path` on rename and copy entries.
 

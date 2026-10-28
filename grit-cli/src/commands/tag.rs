@@ -1,10 +1,12 @@
 //! `grit tag` — list tags, or create / delete one.
 
 use crate::context;
+use crate::error_kind::ErrorKind;
+use crate::json_error::{StructuredCliError, StructuredJsonError};
 use crate::markdown;
 use crate::output::{outln, HumanRender, MarkdownRender, Person, RenderContext};
 use crate::ref_name_messages::tag_short_name_error_message;
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Context, Error as AnyhowError, Result};
 use grit_lib::commit::signing::{should_sign_tag, GpgConfig, TrustLevel};
 use grit_lib::config::ident_resolve::IdentRole;
 use grit_lib::error::Error;
@@ -22,6 +24,8 @@ use grit_lib::tree_sha256::{
 };
 use schemars::JsonSchema;
 use serde::Serialize;
+use std::error::Error as StdError;
+use std::fmt;
 use std::io::{self, Read, Write};
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
@@ -332,6 +336,8 @@ pub struct TagRunOptions {
     pub message: Option<String>,
     /// `-F` message file.
     pub message_file: Option<String>,
+    /// `-a` / `--annotate` without `-m` (requires a message; no editor).
+    pub annotate: bool,
     /// `-f` replace existing tag.
     pub force: bool,
     /// Preview without writing refs.
@@ -368,8 +374,39 @@ pub struct TagRunOptions {
     pub list_detail: TagDetail,
 }
 
+/// Usage mistakes specific to `grit tag` (exit code 2).
+#[derive(Debug)]
+pub struct TagUsageError;
+
+impl fmt::Display for TagUsageError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("invalid tag arguments")
+    }
+}
+
+impl StdError for TagUsageError {}
+
+fn tag_usage(message: impl Into<String>) -> AnyhowError {
+    let human = message.into();
+    AnyhowError::new(StructuredCliError {
+        payload: StructuredJsonError::new(human.clone(), ErrorKind::Usage),
+        human,
+    })
+    .context(TagUsageError)
+}
+
+fn validate_annotate_message(opts: &TagRunOptions) -> Result<()> {
+    if opts.annotate && opts.message.is_none() && opts.message_file.is_none() {
+        return Err(tag_usage(
+            "annotated tag requires a message; use `-m` or `-F` / `--message-file` (grit does not open an editor)",
+        ));
+    }
+    Ok(())
+}
+
 /// Run `grit tag` with the parsed CLI arguments.
 pub fn run(opts: TagRunOptions) -> Result<TagOutcome> {
+    validate_annotate_message(&opts)?;
     let repo = context::discover()?;
     if opts.verify {
         return verify(&repo, &opts);

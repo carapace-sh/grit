@@ -1694,7 +1694,7 @@ enum Command {
         #[arg(short = 'W', long = "worktree")]
         worktree: bool,
         /// Tree or commit to restore from.
-        #[arg(long)]
+        #[arg(short = 's', long = "source")]
         source: Option<String>,
         /// For unmerged paths, write our side (index stage 2) into the worktree.
         #[arg(long = "ours", conflicts_with_all = ["theirs", "merge", "conflict_style"])]
@@ -1876,6 +1876,13 @@ enum Command {
         delete: bool,
         #[command(flatten)]
         message: message_input::MessageInputArgs,
+        /// Git habit: `-m` / `-F` already write an annotated tag; ignored when a message is set.
+        #[arg(
+            short = 'a',
+            long = "annotate",
+            conflicts_with_all = ["delete", "verify"]
+        )]
+        annotate: bool,
         /// Deprecated alias for `--message-file`.
         #[arg(
             long = "file",
@@ -2220,6 +2227,37 @@ fn tag_verify_subarg_takes_value(arg: &str) -> bool {
     matches!(arg, "--filter" | "--threads")
 }
 
+/// Rewrite `log -1` / `log -3` (Git habit) into `-n` / `--limit`.
+fn normalize_log_limit_argv(args: Vec<OsString>) -> Vec<OsString> {
+    let Some(log_idx) = diff_args::subcommand_index(&args).filter(|&i| args[i] == "log") else {
+        return args;
+    };
+    let sub = &args[log_idx + 1..];
+    if sub.iter().any(|a| a == "-n" || a == "--limit") {
+        return args;
+    }
+    let mut out = args[..=log_idx].to_vec();
+    let mut i = log_idx + 1;
+    while i < args.len() {
+        if args[i] == "--" {
+            out.extend_from_slice(&args[i..]);
+            break;
+        }
+        if let Some(t) = args[i].to_str() {
+            if t.len() > 1 && t.starts_with('-') && t[1..].chars().all(|c| c.is_ascii_digit()) {
+                out.push("-n".into());
+                out.push(t[1..].into());
+            } else {
+                out.push(args[i].clone());
+            }
+        } else {
+            out.push(args[i].clone());
+        }
+        i += 1;
+    }
+    out
+}
+
 /// Route verify tag names to `verify_names` by inserting `--` before bare arguments.
 fn normalize_tag_verify_argv(mut args: Vec<OsString>) -> Vec<OsString> {
     let Some(tag_idx) = diff_args::subcommand_index(&args).filter(|&i| args[i] == "tag") else {
@@ -2279,8 +2317,8 @@ fn main() {
 }
 
 fn run() -> Result<ExitStatus, anyhow::Error> {
-    let parse_argv = normalize_tag_verify_argv(diff_args::normalize_diff_argv(
-        std::env::args_os().collect(),
+    let parse_argv = normalize_tag_verify_argv(normalize_log_limit_argv(
+        diff_args::normalize_diff_argv(std::env::args_os().collect()),
     ));
     let cli = match Cli::try_parse_from(&parse_argv).and_then(|cli| {
         validate_cli(&cli)?;
@@ -3311,7 +3349,7 @@ fn dispatch(
             lines,
             paths,
         } => {
-            let message_flag = message_input.message.clone();
+            let message_flag = message_input::joined_message_from_flags(&message_input.message);
             let message_file = message_input.message_file.clone();
             let author_override = author.author.clone();
             let message = commit_message;
@@ -3506,6 +3544,7 @@ fn dispatch(
             limit,
             delete,
             message,
+            annotate,
             legacy_message_file,
             object,
             force,
@@ -3527,7 +3566,7 @@ fn dispatch(
                 None
             };
             let message = message_input::merge_tag_legacy_file(message, legacy_message_file);
-            let message_flag = message.message.clone();
+            let message_flag = message_input::joined_message_from_flags(&message.message);
             let message_file = message.message_file.clone();
             let outcome = commands::tag::run(commands::tag::TagRunOptions {
                 name,
@@ -3536,6 +3575,7 @@ fn dispatch(
                 delete,
                 message: message_flag,
                 message_file,
+                annotate,
                 force,
                 dry_run,
                 sign: sign_override,
@@ -5333,6 +5373,30 @@ The keys are `initialized`, `path`, `bare`, `branch`, `object_format`, and optio
                 raw,
             ]
         );
+    }
+
+    #[test]
+    fn normalize_log_limit_argv_rewrites_dash_n() {
+        let out = super::normalize_log_limit_argv(vec![
+            "grit".into(),
+            "log".into(),
+            "--graph".into(),
+            "--oneline".into(),
+            "-3".into(),
+        ]);
+        assert_eq!(out, vec!["grit", "log", "--graph", "--oneline", "-n", "3"]);
+    }
+
+    #[test]
+    fn normalize_log_limit_argv_skips_when_limit_present() {
+        let args = vec![
+            "grit".into(),
+            "log".into(),
+            "-n".into(),
+            "2".into(),
+            "-1".into(),
+        ];
+        assert_eq!(super::normalize_log_limit_argv(args.clone()), args);
     }
 
     #[test]

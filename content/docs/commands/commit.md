@@ -95,7 +95,7 @@ On an interactive terminal (human output, not `--json`, `--markdown` or `-q`), a
 | --- | --- |
 | `<message>` | The commit message. A single hyphen-leading word is rejected as an unknown flag; use `-m` for it. |
 | `-q`, `--quiet` | Print nothing on success in human mode. `--json` and `--markdown` output is unchanged; errors still go to stderr. |
-| `-m`, `--message <message>` | The commit message, as an option. Use either this, the argument, or `--message-file`, not more than one. Optional with `--amend` (keeps the previous message). |
+| `-m`, `--message <message>` | The commit message, as an option (repeatable; each `-m` starts a new paragraph separated by a blank line, like Git). Do not combine with `-F` / `--message-file` or a positional message. Optional with `--amend` (keeps the previous message when omitted). |
 | `-F`, `--message-file <file\|->` | Read the commit message from a file, or from stdin when the path is `-`. |
 | `--author <ident>` | Author for this commit (`Name <email>` or bare email). Committer unchanged. |
 | `--no-verify` | Skip `pre-commit` and `commit-msg` hooks (`prepare-commit-msg` still runs). |

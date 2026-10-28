@@ -24,9 +24,10 @@ pub struct MessageInputArgs {
         short = 'm',
         long = "message",
         conflicts_with = "message_file",
-        allow_hyphen_values = true
+        allow_hyphen_values = true,
+        action = clap::ArgAction::Append
     )]
-    pub message: Option<String>,
+    pub message: Vec<String>,
     /// Read the message from a file (`-` for stdin).
     #[arg(
         short = 'F',
@@ -78,10 +79,19 @@ pub fn parse_author_cli(raw: &str) -> Result<AuthorContact> {
     parse_author_arg(raw).map_err(|e| usage_error(format!("{e}")))
 }
 
+/// Join repeated `-m` / `--message` flags the way Git does (blank line between paragraphs).
+pub fn joined_message_from_flags(parts: &[String]) -> Option<String> {
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\n\n"))
+    }
+}
+
 /// Resolve a message from CLI flags; returns `None` when neither flag was passed.
 pub fn read_message_input(args: &MessageInputArgs) -> Result<Option<String>> {
-    match (&args.message, &args.message_file) {
-        (Some(message), _) => Ok(Some(message.clone())),
+    match (joined_message_from_flags(&args.message), &args.message_file) {
+        (Some(message), _) => Ok(Some(message)),
         (None, None) => Ok(None),
         (None, Some(path)) if path == "-" => {
             let mut buf = String::new();
