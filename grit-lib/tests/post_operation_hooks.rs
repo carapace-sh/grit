@@ -25,6 +25,7 @@ use grit_lib::revwalk::history::{
     undo_last_rewrite, ApplyOptions, EmptyPolicy, RebaseOntoOptions, RebaseOutcome, RebaseRequest,
     RefScope, RewordOptions, RewriteOptions, StartRebaseOptions,
 };
+use grit_lib::worktree::{add_linked_worktree, AddLinkedWorktreeOptions, WorktreeBranch};
 use grit_lib::{HookName, PostOperationHooks};
 
 const IDENT: &str = "Hook Tester <hooks@grit.test> 1700000000 +0000";
@@ -61,6 +62,16 @@ impl Fixture {
 
     fn wt(&self) -> &Path {
         self.dir.path()
+    }
+
+    fn write_hook_with_pwd(&self, name: &str) {
+        self.write_hook(
+            name,
+            &format!(
+                "#!/bin/sh\necho \"{name} $* in $(pwd)\" >> '{log}'\n",
+                log = self.log.display()
+            ),
+        );
     }
 
     fn write_hook(&self, name: &str, body: &str) {
@@ -206,6 +217,175 @@ fn switch_to_current_branch_or_commit_still_runs_post_checkout() {
         },
     );
     assert_eq!(fx.take_log(), vec![checkout_line(c1, c1)]);
+}
+
+#[test]
+fn worktree_add_runs_post_checkout_from_linked_worktree() {
+    let fx = Fixture::new();
+    let head = fx.commit("f", "1\n", "c1");
+    fx.write_hook_with_pwd("post-checkout");
+    let repo = fx.repo();
+    let linked_path = fx.wt().join("linked");
+
+    add_linked_worktree(
+        &repo,
+        &AddLinkedWorktreeOptions {
+            path: linked_path.clone(),
+            branch: Some(WorktreeBranch::Create("wt".into())),
+            start_point: Some("HEAD".into()),
+            force: false,
+            lock: None,
+            no_checkout: false,
+            track: false,
+        },
+    )
+    .expect("add worktree");
+    let null = "0".repeat(40);
+    let canonical = linked_path.canonicalize().expect("canonical");
+    assert_eq!(
+        fx.take_log(),
+        vec![format!(
+            "post-checkout {null} {} 1 in {}",
+            head.to_hex(),
+            canonical.display()
+        )]
+    );
+
+    let detached = fx.wt().join("detached");
+    add_linked_worktree(
+        &repo,
+        &AddLinkedWorktreeOptions {
+            path: detached.clone(),
+            branch: Some(WorktreeBranch::Detach),
+            start_point: Some("HEAD".into()),
+            force: false,
+            lock: None,
+            no_checkout: false,
+            track: false,
+        },
+    )
+    .expect("detach worktree");
+    let detached_canonical = detached.canonicalize().expect("canonical");
+    assert_eq!(
+        fx.take_log(),
+        vec![format!(
+            "post-checkout {null} {} 1 in {}",
+            head.to_hex(),
+            detached_canonical.display()
+        )]
+    );
+}
+
+#[test]
+fn worktree_add_no_checkout_or_orphan_skips_post_checkout() {
+    let fx = Fixture::new();
+    fx.commit("f", "1\n", "c1");
+    fx.write_hook_with_pwd("post-checkout");
+    let repo = fx.repo();
+
+    add_linked_worktree(
+        &repo,
+        &AddLinkedWorktreeOptions {
+            path: fx.wt().join("bare-tree"),
+            branch: Some(WorktreeBranch::Create("nc".into())),
+            start_point: Some("HEAD".into()),
+            force: false,
+            lock: None,
+            no_checkout: true,
+            track: false,
+        },
+    )
+    .expect("no checkout");
+    assert!(fx.take_log().is_empty());
+
+    add_linked_worktree(
+        &repo,
+        &AddLinkedWorktreeOptions {
+            path: fx.wt().join("orphan"),
+            branch: Some(WorktreeBranch::Orphan("empty".into())),
+            start_point: None,
+            force: false,
+            lock: None,
+            no_checkout: false,
+            track: false,
+        },
+    )
+    .expect("orphan");
+    assert!(fx.take_log().is_empty());
+}
+
+#[test]
+fn worktree_add_failing_post_checkout_still_succeeds() {
+    let fx = Fixture::new();
+    fx.commit("f", "1\n", "c1");
+    fx.write_hook("post-checkout", "#!/bin/sh\nexit 1\n");
+    let repo = fx.repo();
+    let linked_path = fx.wt().join("linked");
+
+    add_linked_worktree(
+        &repo,
+        &AddLinkedWorktreeOptions {
+            path: linked_path.clone(),
+            branch: Some(WorktreeBranch::Create("wt".into())),
+            start_point: Some("HEAD".into()),
+            force: false,
+            lock: None,
+            no_checkout: false,
+            track: false,
+        },
+    )
+    .expect("add despite hook failure");
+    assert!(linked_path.join("f").is_file());
+}
+
+#[test]
+fn worktree_add_post_checkout_matches_git() {
+    let fx = Fixture::new();
+    let head = fx.commit("f", "1\n", "c1");
+    fx.write_hook_with_pwd("post-checkout");
+    let repo = fx.repo();
+
+    let grit_path = fx.wt().join("grit-wt");
+    add_linked_worktree(
+        &repo,
+        &AddLinkedWorktreeOptions {
+            path: grit_path.clone(),
+            branch: Some(WorktreeBranch::Create("grit-branch".into())),
+            start_point: Some("HEAD".into()),
+            force: false,
+            lock: None,
+            no_checkout: false,
+            track: false,
+        },
+    )
+    .expect("grit add");
+    let grit_line = fx.take_log().pop().expect("grit hook line");
+
+    let git_path = fx.wt().join("git-wt");
+    let git_out = Command::new("git")
+        .args([
+            "worktree",
+            "add",
+            git_path.to_str().expect("utf8"),
+            "-b",
+            "git-branch",
+        ])
+        .current_dir(fx.wt())
+        .output()
+        .expect("git worktree add");
+    assert!(
+        git_out.status.success(),
+        "git worktree add: {}",
+        String::from_utf8_lossy(&git_out.stderr)
+    );
+    let git_line = fx.take_log().pop().expect("git hook line");
+
+    let null = "0".repeat(40);
+    let expected = format!("post-checkout {null} {} 1", head.to_hex());
+    assert!(grit_line.starts_with(&expected));
+    assert!(git_line.starts_with(&expected));
+    assert!(grit_line.contains("grit-wt"));
+    assert!(git_line.contains("git-wt"));
 }
 
 #[test]

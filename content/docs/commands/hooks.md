@@ -51,7 +51,7 @@ Other commands run the hooks Git runs after them, with Git's arguments:
 
 | Hook | Run by | Arguments and stdin |
 | --- | --- | --- |
-| `post-checkout` | [`grit switch`](switch.md), [`grit rebase`](rebase.md) and [`grit history`](history.md) rewrites that change `HEAD`'s tree | `<old HEAD> <new HEAD> 1` (all-zero old id from an unborn branch); for a rebase, `<old tip> <onto> 1` like Git |
+| `post-checkout` | [`grit switch`](switch.md), [`grit worktree add`](worktree.md) (after checkout), [`grit rebase`](rebase.md) and [`grit history`](history.md) rewrites that change `HEAD`'s tree | `<old HEAD> <new HEAD> 1` (all-zero old id from an unborn branch or a new linked worktree); for a rebase, `<old tip> <onto> 1` like Git |
 | `post-merge` | [`grit merge`](merge.md) and [`grit pull`](pull.md) after a fast-forward or merge commit (`0`) or a squash (`1`) | `0` or `1` |
 | `post-rewrite` | `grit commit --amend` (`amend`), `grit rebase` and `grit history` rewrites (`rebase`) | `amend` or `rebase`; stdin has one `<old> <new>` line per rewritten commit |
 
