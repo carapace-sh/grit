@@ -1623,7 +1623,11 @@ fn conflicting_start_refuses_to_overwrite_untracked_file() {
     assert!(
         matches!(
             &err,
-            RebaseSessionError::Library(grit_lib::error::Error::Message(msg)) if msg.contains("added.txt")
+            RebaseSessionError::Library(grit_lib::error::Error::WouldOverwrite {
+                reason: grit_lib::error::OverwriteReason::Untracked,
+                paths,
+                ..
+            }) if paths == &["added.txt".to_owned()]
         ),
         "unexpected {err:?}"
     );

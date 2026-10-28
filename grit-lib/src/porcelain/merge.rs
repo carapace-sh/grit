@@ -36,7 +36,7 @@ use crate::change_id::{change_id, ChangeId, ChangeIdPolicy};
 use crate::config::ConfigSet;
 use crate::diagnostics::Warning;
 use crate::diff::diff_trees;
-use crate::error::{Error, Result};
+use crate::error::{Error, OverwriteReason, Result};
 use crate::hooks::{run_post_merge, PostOperationHooks};
 use crate::ident::{parse_signature_times, Signature};
 use crate::ident_resolve::{resolve_loose_committer_identity_with, IdentRole};
@@ -848,9 +848,12 @@ pub enum IntegrateBranchOutcome {
 ///
 /// # Errors
 ///
-/// Propagates merge, checkout, ref, and I/O failures. Returns [`Error::Message`] when
-/// the histories are unrelated, the worktree is not clean, or `into_ref` no longer points
-/// at `into_oid` (checked before the worktree is touched, and again when the ref moves).
+/// Propagates merge, checkout, ref, and I/O failures. Returns [`Error::WouldOverwrite`]
+/// when local or untracked paths would be overwritten by the merge tree, and
+/// [`Error::DirtyWorktree`] when the worktree is not clean but no specific paths were
+/// collected. Returns [`Error::Message`] when the histories are unrelated or `into_ref`
+/// no longer points at `into_oid` (checked before the worktree is touched, and again
+/// when the ref moves).
 /// Returns [`Error::Cancelled`] when cancelled; the branch, `HEAD`, the index and the merge
 /// state are unchanged, and a cancel during the checkout rolls the work tree back.
 pub fn integrate_branch(
@@ -1540,16 +1543,15 @@ fn restore_pre_merge_state(repo: &Repository) -> Result<()> {
 fn merge_overwrite_error_message(paths: &[String]) -> Error {
     if paths.is_empty() {
         Error::dirty_worktree(crate::error::WorktreeOperation::Merge, Vec::new())
-    } else if paths.len() == 1 {
-        Error::Message(format!(
-            "local changes to '{}' would be overwritten by merge",
-            paths[0]
-        ))
     } else {
-        Error::Message(format!(
-            "local changes would be overwritten by merge:\n  {}",
-            paths.join("\n  ")
-        ))
+        let mut paths = paths.to_vec();
+        paths.sort();
+        paths.dedup();
+        Error::WouldOverwrite {
+            reason: OverwriteReason::LocalChanges,
+            paths,
+            message: "local changes would be overwritten by merge".into(),
+        }
     }
 }
 

@@ -15,7 +15,7 @@ use crate::diff::{
     diff_index_to_tree, diff_index_to_worktree_with_options, diff_trees, entry_is_racy_with_policy,
     index_mtime_for_diff, DiffEntry, DiffStatus,
 };
-use crate::error::{Error, Result, WorktreeOperation};
+use crate::error::{Error, OverwriteReason, Result, WorktreeOperation};
 use crate::index::StatMatchPolicy;
 use crate::index::{index_file_mtime, Index, IndexEntry};
 use crate::objects::FileMode;
@@ -1545,16 +1545,18 @@ pub fn untracked_would_be_overwritten_by_tree_changes(
 ///
 /// # Errors
 ///
-/// Returns [`Error::Message`] naming the first colliding path (same wording as `grit switch`).
+/// Returns [`Error::WouldOverwrite`] with [`OverwriteReason::Untracked`] and every
+/// colliding path (same display wording as `grit switch`).
 pub fn ensure_no_untracked_overwrite(
     untracked_paths: &[String],
     tree_changes: &[DiffEntry],
 ) -> Result<()> {
     let collisions = untracked_would_be_overwritten_by_tree_changes(untracked_paths, tree_changes);
-    if let Some(path) = collisions.first() {
-        return Err(Error::Message(format!(
-            "untracked file '{path}' would be overwritten — move or remove it first"
-        )));
+    if !collisions.is_empty() {
+        return Err(Error::would_overwrite(
+            OverwriteReason::Untracked,
+            collisions,
+        ));
     }
     Ok(())
 }
@@ -1567,7 +1569,8 @@ pub fn ensure_no_untracked_overwrite(
 ///
 /// # Errors
 ///
-/// Returns [`Error::Message`] when an untracked path would be overwritten, or on I/O/ODB failures.
+/// Returns [`Error::WouldOverwrite`] when an untracked path would be overwritten, or on
+/// I/O/ODB failures.
 pub fn prepare_tree_checkout(
     repo: &Repository,
     from_tree: Option<&ObjectId>,
@@ -1581,7 +1584,7 @@ pub fn prepare_tree_checkout(
 ///
 /// # Errors
 ///
-/// Returns [`Error::Message`] when an untracked path would be overwritten.
+/// Returns [`Error::WouldOverwrite`] when an untracked path would be overwritten.
 pub(crate) fn prepare_tree_checkout_with_changes(
     repo: &Repository,
     tree_changes: &[DiffEntry],
@@ -1722,8 +1725,13 @@ mod tests {
         let err = ensure_no_untracked_overwrite(&["x.txt".into()], &[added_entry("x.txt")])
             .expect_err("collision");
         match err {
-            Error::Message(msg) => {
-                assert!(msg.contains("untracked file 'x.txt' would be overwritten"));
+            Error::WouldOverwrite {
+                reason: OverwriteReason::Untracked,
+                paths,
+                message,
+            } => {
+                assert_eq!(paths, vec!["x.txt".to_owned()]);
+                assert!(message.contains("untracked file 'x.txt' would be overwritten"));
             }
             other => panic!("unexpected {other:?}"),
         }

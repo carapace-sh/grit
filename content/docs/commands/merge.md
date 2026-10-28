@@ -221,6 +221,14 @@ error: you still have unmerged paths: notes.txt
 hint: resolve the conflict markers in notes.txt, then run `grit merge --continue` (or `grit merge --abort` to start over)
 ```
 
+When local edits on a path the merge would update would be overwritten:
+
+```console
+$ grit merge feature
+error: local changes would be overwritten by merge
+  a.txt
+```
+
 When an untracked file would be overwritten:
 
 ```console
@@ -311,7 +319,7 @@ When `<rev>` names nothing, the command exits **1** with `{"error":"no branch, t
 
 When `--continue` finds unresolved conflicts, it exits **1** with `kind` `unmerged_paths`, the files in `paths` and the next step in `hint` (with `commit.autoStage=false`, files that are resolved but not staged get a `grit add` hint instead), for example `{"error":"you still have unmerged paths: notes.txt","hint":"…","kind":"unmerged_paths","paths":["notes.txt"]}`.
 
-Uncommitted changes that block a merge are `kind` `dirty_worktree` with `paths`.
+On overwrite refusal with `--json`, stdout is a single object with `kind` `would_overwrite` and `would_overwrite.reason` (`local_changes` or `untracked`) plus a sorted `paths` array, and a `hint` — the same shape as [`grit switch`](../switch/). For example `{"error":"local changes would be overwritten by merge","hint":"…","kind":"would_overwrite","would_overwrite":{"paths":["a.txt"],"reason":"local_changes"}}`. See the [error schema](/schemas/error/v1.json).
 
 ## Markdown output
 

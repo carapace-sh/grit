@@ -1343,13 +1343,8 @@ fn verify_worktree_ready_for_head_tree_change(
 }
 
 fn map_prepare_checkout_error(err: crate::error::Error) -> HistoryError {
-    if let Some(path) = err.to_string().strip_prefix("untracked file '") {
-        if let Some(path) = path.strip_suffix("' would be overwritten — move or remove it first")
-        {
-            return HistoryError::LocalChangesWouldBeOverwritten {
-                paths: vec![path.to_owned()],
-            };
-        }
+    if let crate::error::Error::WouldOverwrite { paths, .. } = err {
+        return HistoryError::LocalChangesWouldBeOverwritten { paths };
     }
     HistoryError::WorktreeApply {
         message: err.to_string(),

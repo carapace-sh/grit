@@ -3,7 +3,7 @@
 use std::process::Command;
 
 use grit_lib::config::environment::RepositoryOptions;
-use grit_lib::error::Error;
+use grit_lib::error::{Error, OverwriteReason};
 use grit_lib::objects::ObjectId;
 use grit_lib::porcelain::merge::{integrate_branch, IntegrateBranchOutcome};
 use grit_lib::repo::Repository;
@@ -128,11 +128,12 @@ fn merge_refuses_dirty_overlapping_path() {
     )
     .expect_err("merge must refuse overlapping dirty path");
     match err {
-        Error::Message(msg) => {
-            assert!(
-                msg.contains("a.txt") || msg.contains("uncommitted changes"),
-                "expected overwrite/uncommitted error, got: {msg}"
-            );
+        Error::WouldOverwrite {
+            reason: OverwriteReason::LocalChanges,
+            paths,
+            ..
+        } => {
+            assert_eq!(paths, vec!["a.txt".to_owned()]);
         }
         other => panic!("unexpected error: {other:?}"),
     }
@@ -144,6 +145,59 @@ fn merge_refuses_dirty_overlapping_path() {
         std::fs::read_to_string(tmp.path().join("a.txt")).expect("dirty preserved"),
         "a dirty\n"
     );
+}
+
+#[test]
+fn merge_refuses_dirty_overlapping_paths_sorted() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    git(tmp.path(), &["init", "-q", "-b", "main"]);
+    git(tmp.path(), &["config", "user.email", "t@example.com"]);
+    git(tmp.path(), &["config", "user.name", "Test"]);
+
+    std::fs::write(tmp.path().join("a.txt"), "a\n").expect("write a");
+    std::fs::write(tmp.path().join("b.txt"), "b\n").expect("write b");
+    git(tmp.path(), &["add", "a.txt", "b.txt"]);
+    git(tmp.path(), &["commit", "-m", "base"]);
+    let main_oid: ObjectId = git(tmp.path(), &["rev-parse", "HEAD"])
+        .trim()
+        .parse()
+        .expect("main");
+
+    git(tmp.path(), &["switch", "-c", "side"]);
+    std::fs::write(tmp.path().join("a.txt"), "a-side\n").expect("write a side");
+    std::fs::write(tmp.path().join("b.txt"), "b-side\n").expect("write b side");
+    git(tmp.path(), &["add", "a.txt", "b.txt"]);
+    git(tmp.path(), &["commit", "-m", "side"]);
+    let side_oid: ObjectId = git(tmp.path(), &["rev-parse", "HEAD"])
+        .trim()
+        .parse()
+        .expect("side");
+
+    git(tmp.path(), &["switch", "main"]);
+    std::fs::write(tmp.path().join("b.txt"), "b dirty\n").expect("dirty b");
+    std::fs::write(tmp.path().join("a.txt"), "a dirty\n").expect("dirty a");
+
+    let repo = grit_repo(&tmp);
+    let err = integrate_branch(
+        &repo,
+        "refs/heads/main",
+        main_oid,
+        side_oid,
+        "side",
+        &mut grit_lib::progress::NullProgress,
+        &grit_lib::progress::NeverCancel,
+    )
+    .expect_err("merge must refuse overlapping dirty paths");
+    match err {
+        Error::WouldOverwrite {
+            reason: OverwriteReason::LocalChanges,
+            paths,
+            ..
+        } => {
+            assert_eq!(paths, vec!["a.txt".to_owned(), "b.txt".to_owned()]);
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
 }
 
 #[test]
