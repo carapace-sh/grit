@@ -2,9 +2,11 @@
 //!
 //! Every action is lazy: it opens the repository only when the shell asks for
 //! candidates, and reports an empty list rather than an error when there is no
-//! repository to open. Styles and group tags follow the layout carapace-bin
-//! uses for Git itself, so branches, tags, stashes, and remotes read alike
-//! across both tools.
+//! repository to open. Styles, group tags, and `git://` uids follow the layout
+//! carapace-bin uses for Git itself, so branches, tags, stashes, and remotes
+//! read alike across both tools. Carapace emits the uids only in its
+//! experimental tabdance mode; they name the kind and the repository a value
+//! came from, so two repositories' branches stay apart.
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -14,8 +16,9 @@ use carapace_rs::{batch, Action, Context, InvokedAction};
 use grit_lib::config::environment::{Environment, RepositoryOptions};
 use grit_lib::diff::structured::StructuredHunk;
 use grit_lib::diff::{hunk_diff_bundle, hunk_ids_with_duplicate_peers, DiffOptions, DiffSide};
+use grit_lib::index::Index;
 use grit_lib::porcelain::ref_summaries::{list_ref_summaries, RefSummary};
-use grit_lib::refs::listing::RefNamespace;
+use grit_lib::refs::listing::{RefKind, RefNamespace};
 use grit_lib::repo::Repository;
 use grit_lib::repo_handles::ReflogQuery;
 use grit_lib::worktree::worktree_rules::WorktreeRules;
@@ -85,6 +88,20 @@ const CONFIG_KEYS: &[&str] = &[
     "user.name",
 ];
 
+/// Uid options that scope a `git://` uid to `repo`: the work tree, and the git
+/// directory when it is not the work tree's `.git` (a bare repository or a
+/// separate git directory), the way carapace-bin scopes its git uids.
+fn repository_uid_opts(repo: &Repository) -> Vec<(&'static str, String)> {
+    let Some(work_tree) = repo.work_tree() else {
+        return vec![("GIT_DIR", repo.git_dir().to_string_lossy().into_owned())];
+    };
+    let mut options = vec![("GIT_WORK_TREE", work_tree.to_string_lossy().into_owned())];
+    if repo.git_dir() != work_tree.join(".git") {
+        options.push(("GIT_DIR", repo.git_dir().to_string_lossy().into_owned()));
+    }
+    options
+}
+
 /// Object hash formats `grit init --object-format` accepts.
 pub(crate) fn object_formats() -> Action {
     Action::values(["sha1", "sha256"]).tag("object formats")
@@ -95,19 +112,15 @@ pub(crate) fn ref_formats() -> Action {
     Action::values(["files", "reftable"]).tag("ref formats")
 }
 
-/// Diff algorithms `--diff-algorithm` accepts.
+/// Diff algorithms `--diff-algorithm` accepts (`default` is another spelling of
+/// `myers`).
 pub(crate) fn diff_algorithms() -> Action {
-    Action::values(["histogram", "myers", "patience"]).tag("diff algorithms")
+    Action::values(["histogram", "minimal", "myers", "patience"]).tag("diff algorithms")
 }
 
 /// Merge-diff modes `grit show --diff-merges` accepts.
 pub(crate) fn diff_merges() -> Action {
-    Action::values(["combined", "first-parent"]).tag("diff merge modes")
-}
-
-/// Value types `grit config --type` accepts.
-pub(crate) fn config_value_types() -> Action {
-    Action::values(["bool", "int", "path"]).tag("value types")
+    Action::values(["combined", "dense-combined", "first-parent"]).tag("diff merge modes")
 }
 
 /// Credential-helper operations `grit manager` accepts.
@@ -120,7 +133,7 @@ pub(crate) fn untracked_modes() -> Action {
     Action::values(["all", "no", "normal"]).tag("untracked modes")
 }
 
-/// Sort keys the ref listings accept.
+/// Sort keys the branch listing accepts.
 pub(crate) fn sort_keys() -> Action {
     Action::values(["date", "name", "version"]).tag("sort keys")
 }
@@ -145,44 +158,83 @@ pub(crate) fn shells() -> Action {
 
 /// Local branches (`refs/heads/*`) with the subject of their tip commit.
 pub(crate) fn local_branches() -> Action {
-    refs([RefNamespace::Heads], "local branches", BRANCH_STYLE)
-}
-
-/// Remote-tracking branches (`refs/remotes/*`) with their tip subject.
-pub(crate) fn remote_branches() -> Action {
-    refs([RefNamespace::Remotes], "remote branches", BRANCH_STYLE)
-}
-
-/// Tags (`refs/tags/*`) with the subject of the commit they peel to.
-pub(crate) fn tags() -> Action {
-    refs([RefNamespace::Tags], "tags", TAG_STYLE)
-}
-
-/// The pseudo refs that name the tip of the current operation.
-pub(crate) fn heads() -> Action {
-    Action::styled_values(PSEUDO_REFS.iter().map(|name| (*name, HEAD_STYLE))).tag("revisions")
-}
-
-/// Stash entries (`stash@{N}`) with the message they were created with.
-pub(crate) fn stashes() -> Action {
     Action::callback(|context| {
         let Some(repo) = repository(context) else {
             return Action::default();
         };
-        let entries = repo.stash().list().unwrap_or_default();
-        Action::values_described(
-            entries
-                .into_iter()
-                .map(|entry| (format!("stash@{{{}}}", entry.index), entry.message)),
-        )
-        .style(STASH_STYLE)
-        .tag("stashes")
+        let summaries = list_ref_summaries(&repo, &[RefNamespace::Heads]).unwrap_or_default();
+        Action::values_described(described(summaries.iter()))
+            .style(BRANCH_STYLE)
+            .tag("local branches")
+            .uid("git", "local-branch", repository_uid_opts(&repo))
+    })
+}
+
+/// Remote-tracking branches (`refs/remotes/*`) with their tip subject.
+pub(crate) fn remote_branches() -> Action {
+    Action::callback(|context| {
+        let Some(repo) = repository(context) else {
+            return Action::default();
+        };
+        let summaries = list_ref_summaries(&repo, &[RefNamespace::Remotes]).unwrap_or_default();
+        Action::values_described(described(summaries.iter()))
+            .style(BRANCH_STYLE)
+            .tag("remote branches")
+            .uid("git", "remote-branch", repository_uid_opts(&repo))
+    })
+}
+
+/// Tags (`refs/tags/*`) with the subject of the commit they peel to.
+pub(crate) fn tags() -> Action {
+    Action::callback(|context| {
+        let Some(repo) = repository(context) else {
+            return Action::default();
+        };
+        let summaries = list_ref_summaries(&repo, &[RefNamespace::Tags]).unwrap_or_default();
+        Action::values_described(described(summaries.iter()))
+            .style(TAG_STYLE)
+            .tag("tags")
+            .uid("git", "tag", repository_uid_opts(&repo))
     })
 }
 
 /// Local and remote branch names, as `switch` accepts them.
 pub(crate) fn branch_targets() -> Action {
     batch(vec![remote_branches(), local_branches()])
+}
+
+/// The pseudo refs that name a tip right now: `HEAD`, and the operation refs
+/// such as `MERGE_HEAD` that exist only while that operation is in progress.
+fn pseudo_refs(repo: &Repository) -> Action {
+    let git_dir = repo.git_dir();
+    let existing = PSEUDO_REFS
+        .iter()
+        .copied()
+        .filter(|name| git_dir.join(name).exists());
+    Action::values(existing)
+        .style(HEAD_STYLE)
+        .tag("pseudo refs")
+        .uid("git", "ref", repository_uid_opts(repo))
+}
+
+/// Stash entries (`stash@{N}`) with the message they were created with.
+pub(crate) fn stashes() -> Action {
+    Action::callback(|context| match repository(context) {
+        Some(repo) => stash_entries(&repo),
+        None => Action::default(),
+    })
+}
+
+fn stash_entries(repo: &Repository) -> Action {
+    let entries = repo.stash().list().unwrap_or_default();
+    Action::values_described(
+        entries
+            .into_iter()
+            .map(|entry| (format!("stash@{{{}}}", entry.index), entry.message)),
+    )
+    .style(STASH_STYLE)
+    .tag("stashes")
+    .uid("git", "stash", repository_uid_opts(repo))
 }
 
 /// Reflog selectors (`main@{0}`, `HEAD@{2}`, …), described by the entry message.
@@ -215,6 +267,7 @@ pub(crate) fn reflog_selectors() -> Action {
         Action::values_described(values)
             .style(BRANCH_STYLE)
             .tag("reflog entries")
+            .uid("git", "reflog", repository_uid_opts(&repo))
     })
 }
 
@@ -229,29 +282,73 @@ fn short_refname(refname: &str) -> &str {
 
 /// Every revision name a user is likely to type: branches, tags, stashes, and
 /// the pseudo refs.
+///
+/// One repository open and one ref listing feed all of it; the kinds still read
+/// apart in the menu.
 pub(crate) fn revisions() -> Action {
-    batch(vec![
-        local_branches(),
-        remote_branches(),
-        tags(),
-        stashes(),
-        heads(),
-    ])
+    Action::callback(|context| {
+        let Some(repo) = repository(context) else {
+            return Action::default();
+        };
+        let summaries = list_ref_summaries(
+            &repo,
+            &[
+                RefNamespace::Heads,
+                RefNamespace::Remotes,
+                RefNamespace::Tags,
+            ],
+        )
+        .unwrap_or_default();
+        let uid = repository_uid_opts(&repo);
+        batch(vec![
+            Action::values_described(described(
+                summaries
+                    .iter()
+                    .filter(|summary| summary.kind == RefKind::Head),
+            ))
+            .style(BRANCH_STYLE)
+            .tag("local branches")
+            .uid("git", "local-branch", uid.clone()),
+            Action::values_described(described(
+                summaries
+                    .iter()
+                    .filter(|summary| summary.kind == RefKind::Remote),
+            ))
+            .style(BRANCH_STYLE)
+            .tag("remote branches")
+            .uid("git", "remote-branch", uid.clone()),
+            Action::values_described(described(
+                summaries
+                    .iter()
+                    .filter(|summary| summary.kind == RefKind::Tag),
+            ))
+            .style(TAG_STYLE)
+            .tag("tags")
+            .uid("git", "tag", uid),
+            stash_entries(&repo),
+            pseudo_refs(&repo),
+        ])
+    })
 }
 
 /// Revisions plus range syntax: `A..B`, `A...B`, and `^A`.
 pub(crate) fn revision_ranges() -> Action {
     Action::callback(|context| {
         if context.value.starts_with('^') {
-            return revisions().nospace([]).prefix("^");
+            return revisions().prefix("^");
         }
-        let delimiter = if context.value.matches("..").count() == 1 && context.value.contains("...")
-        {
+        let delimiter = if context.value.contains("...") {
             "..."
         } else {
             ".."
         };
-        Action::multiparts_n(delimiter, 2, |_| revisions().nospace([]))
+        let Some(index) = context.value.find(delimiter) else {
+            return revisions();
+        };
+        let start = context.value[..index].to_owned();
+        let range = context.value[..index + delimiter.len()].to_owned();
+        // the end of a range is another revision, but not the one it starts at
+        revisions().filter([start]).prefix(range)
     })
 }
 
@@ -268,6 +365,7 @@ pub(crate) fn remotes() -> Action {
                 .map(|remote| (remote.name, remote.url.unwrap_or_default())),
         )
         .tag("remotes")
+        .uid("git", "remote", repository_uid_opts(&repo))
     })
 }
 
@@ -281,12 +379,14 @@ pub(crate) fn remote_branch_names() -> Action {
         let Some(repo) = repository(context) else {
             return Action::default();
         };
-        Action::values_described(remote_branch_summaries(
-            &repo,
+        let summaries = list_ref_summaries(&repo, &[RefNamespace::Remotes]).unwrap_or_default();
+        Action::values_described(remote_branch_values(
+            &summaries,
             context.args.first().map(String::as_str),
         ))
         .style(BRANCH_STYLE)
         .tag("remote branches")
+        .uid("git", "remote-branch", repository_uid_opts(&repo))
     })
 }
 
@@ -300,25 +400,38 @@ pub(crate) fn fetch_refspecs() -> Action {
         let Some(repo) = repository(context) else {
             return Action::default();
         };
-        let branches = remote_branch_summaries(&repo, context.args.first().map(String::as_str));
+        let summaries = list_ref_summaries(&repo, &[RefNamespace::Remotes, RefNamespace::Tags])
+            .unwrap_or_default();
+        let uid = repository_uid_opts(&repo);
         batch(vec![
-            Action::values_described(branches)
-                .style(BRANCH_STYLE)
-                .tag("remote branches"),
-            tags(),
+            Action::values_described(remote_branch_values(
+                &summaries,
+                context.args.first().map(String::as_str),
+            ))
+            .style(BRANCH_STYLE)
+            .tag("remote branches")
+            .uid("git", "remote-branch", uid.clone()),
+            Action::values_described(described(
+                summaries
+                    .iter()
+                    .filter(|summary| summary.kind == RefKind::Tag),
+            ))
+            .style(TAG_STYLE)
+            .tag("tags")
+            .uid("git", "tag", uid),
         ])
     })
 }
 
-/// Remote-tracking branches as `(name on the remote, tip subject)`.
+/// Remote-tracking branches in `summaries` as `(name on the remote, tip subject)`.
 ///
 /// A refspec source and `remote set-head` both name the branch the way the
 /// remote does, so the tracking ref's remote component is dropped.
-fn remote_branch_summaries(repo: &Repository, remote: Option<&str>) -> Vec<(String, String)> {
+fn remote_branch_values(summaries: &[RefSummary], remote: Option<&str>) -> Vec<(String, String)> {
     let prefix = remote.map(|remote| format!("{remote}/"));
-    list_ref_summaries(repo, &[RefNamespace::Remotes])
-        .unwrap_or_default()
-        .into_iter()
+    summaries
+        .iter()
+        .filter(|summary| summary.kind == RefKind::Remote)
         .filter_map(|summary| {
             let name = match &prefix {
                 Some(prefix) => summary.name.strip_prefix(prefix.as_str())?.to_owned(),
@@ -328,7 +441,7 @@ fn remote_branch_summaries(repo: &Repository, remote: Option<&str>) -> Vec<(Stri
                     .map(|(_, name)| name)?
                     .to_owned(),
             };
-            Some((name, summary.subject.unwrap_or_default()))
+            Some((name, summary.subject.clone().unwrap_or_default()))
         })
         .collect()
 }
@@ -348,7 +461,10 @@ pub(crate) fn notes_refs() -> Action {
             .collect();
         names.sort();
         names.dedup();
-        Action::values(names).style(NOTE_STYLE).tag("notes refs")
+        Action::values(names)
+            .style(NOTE_STYLE)
+            .tag("notes refs")
+            .uid("git", "note", repository_uid_opts(&repo))
     })
 }
 
@@ -369,6 +485,7 @@ pub(crate) fn worktrees() -> Action {
             )
         }))
         .tag("worktrees")
+        .uid("git", "worktree", repository_uid_opts(&repo))
     })
 }
 
@@ -392,6 +509,7 @@ pub(crate) fn hooks() -> Action {
             (hook.name, description.to_owned())
         }))
         .tag("hooks")
+        .uid("git", "hook", repository_uid_opts(&repo))
     })
 }
 
@@ -409,7 +527,9 @@ pub(crate) fn config_keys() -> Action {
         keys.extend(CONFIG_KEYS.iter().map(|key| (*key).to_owned()));
         keys.sort();
         keys.dedup();
-        Action::values(keys).tag("config keys")
+        Action::values(keys)
+            .tag("config keys")
+            .uid("git", "config", repository_uid_opts(&repo))
     })
 }
 
@@ -424,7 +544,11 @@ pub(crate) fn config_values(key: &str) -> Action {
             .config()
             .map(|config| config.get_all(&key))
             .unwrap_or_default();
-        Action::values(values).tag("config values")
+        Action::values(values).tag("config values").uid(
+            "git",
+            "config-value",
+            repository_uid_opts(&repo),
+        )
     })
 }
 
@@ -437,6 +561,7 @@ pub(crate) fn trailers() -> Action {
         "Reviewed-by",
         "Signed-off-by",
     ])
+    .tag("trailers")
     .suffix("=")
     .nospace(['='])
 }
@@ -452,45 +577,37 @@ pub(crate) fn config_overrides() -> Action {
 /// Paths a pathspec can name.
 ///
 /// The worktree below the current directory supplies every file and directory a
-/// user can see, ignored paths excepted; the index adds the tracked paths whose
-/// file is gone, which no directory listing can show. Index entries are merged
-/// first and worktree entries second, so a path that exists on disk keeps the
-/// worktree rendering (LS_COLORS style) and only a deleted path carries the
-/// `tracked paths` tag.
+/// user can see, ignored paths excepted. The index adds the tracked paths whose
+/// file is gone, which no directory listing can show; a path that still exists
+/// keeps the worktree rendering (LS_COLORS style), so `tracked paths` means
+/// deleted.
 pub(crate) fn paths() -> Action {
     Action::callback(|context| {
-        let worktree = worktree_files(context);
-        let on_disk: std::collections::HashSet<String> = worktree
-            .to_export()
-            .to_raw_values()
-            .into_iter()
-            .map(|value| value.value)
-            .collect();
-        let indexed = indexed_paths().invoke(context);
-        let keep: Vec<String> = indexed
-            .to_export()
-            .to_raw_values()
-            .into_iter()
-            .map(|value| value.value)
-            .filter(|value| !on_disk.contains(value))
-            .collect();
-        indexed.retain(keep).merge([worktree]).to_action()
+        let files = Action::files([]).invoke(context);
+        let Some(repo) = repository(context) else {
+            return files.to_action();
+        };
+        let Some(work_tree) = repo.work_tree() else {
+            return files.to_action();
+        };
+        let Ok(index) = repo.index_handle().load() else {
+            return files.to_action();
+        };
+        let files = without_ignored(&repo, &index, work_tree, context, files);
+        let deleted = deleted_paths(&repo, &index, work_tree).invoke(context);
+        files.merge([deleted]).to_action()
     })
 }
 
-/// Worktree entries below the current directory, minus ignored paths.
-fn worktree_files(context: &Context) -> InvokedAction {
-    let files = Action::files([]).invoke(context);
-    let Some(repo) = repository(context) else {
-        return files;
-    };
-    let Ok(index) = repo.index_handle().load() else {
-        return files;
-    };
-    let Ok(rules) = WorktreeRules::from_repository(&repo, &index) else {
-        return files;
-    };
-    let Some(work_tree) = repo.work_tree() else {
+/// `files` without the entries the ignore rules exclude.
+fn without_ignored(
+    repo: &Repository,
+    index: &Index,
+    work_tree: &Path,
+    context: &Context,
+    files: InvokedAction,
+) -> InvokedAction {
+    let Ok(rules) = WorktreeRules::from_repository(repo, index) else {
         return files;
     };
     let keep: Vec<String> = files
@@ -504,7 +621,7 @@ fn worktree_files(context: &Context) -> InvokedAction {
             let is_dir = value.nospace == Some(true);
             !rules
                 .ignore_mut()
-                .is_path_ignored(&repo, Some(&index), &relative, is_dir)
+                .is_path_ignored(repo, Some(index), &relative, is_dir)
                 .unwrap_or(false)
         })
         .map(|value| value.value)
@@ -527,30 +644,31 @@ fn repo_relative(work_tree: &Path, context: &Context, value: &str) -> Option<Str
     Some(path)
 }
 
-/// Index paths, truncated to the current directory when it is a subdirectory.
-fn indexed_paths() -> Action {
-    Action::callback(|context| {
-        let Some(repo) = repository(context) else {
-            return Action::default();
-        };
-        let Ok(index) = repo.index_handle().load() else {
-            return Action::default();
-        };
-        let prefix = repo
-            .pathspec_cwd_prefix()
-            .map(|prefix| format!("{prefix}/"))
-            .unwrap_or_default();
-        let paths: Vec<String> = index
-            .entries()
-            .iter()
-            .filter_map(|entry| {
-                let path = String::from_utf8_lossy(&entry.path);
-                let relative = path.strip_prefix(prefix.as_str())?;
-                (!relative.is_empty()).then(|| relative.to_owned())
-            })
-            .collect();
-        Action::values(paths).tag("tracked paths")
-    })
+/// Index paths below the current directory whose file is gone from the worktree.
+fn deleted_paths(repo: &Repository, index: &Index, work_tree: &Path) -> Action {
+    let prefix = repo
+        .pathspec_cwd_prefix()
+        .map(|prefix| format!("{prefix}/"))
+        .unwrap_or_default();
+    let paths: Vec<String> = index
+        .entries()
+        .iter()
+        .filter_map(|entry| {
+            let path = String::from_utf8_lossy(&entry.path);
+            let relative = path.strip_prefix(prefix.as_str())?;
+            if relative.is_empty() {
+                return None;
+            }
+            work_tree
+                .join(path.as_ref())
+                .symlink_metadata()
+                .is_err()
+                .then(|| relative.to_owned())
+        })
+        .collect();
+    Action::values(paths)
+        .tag("tracked paths")
+        .uid("git", "tracked-path", repository_uid_opts(repo))
 }
 
 /// One hunk of the change the current command acts on.
@@ -587,14 +705,18 @@ impl HunkCandidate {
 /// index hunks and every other command is offered unstaged ones.
 pub(crate) fn hunks() -> Action {
     Action::callback(|context| {
+        let Some(repo) = repository(context) else {
+            return Action::default();
+        };
         let side = selected_side(context);
-        let values = hunk_candidates(context, side).into_iter().map(|hunk| {
+        let candidates = hunk_candidates(&repo, context, side);
+        Action::values_described(candidates.into_iter().map(|hunk| {
             let label = hunk.label();
             (hunk.id, label)
-        });
-        Action::values_described(values)
-            .style(HUNK_STYLE)
-            .tag(hunk_tag(side))
+        }))
+        .style(HUNK_STYLE)
+        .tag(hunk_tag(side))
+        .uid("git", "hunk", repository_uid_opts(&repo))
     })
     .list(",")
 }
@@ -605,9 +727,12 @@ pub(crate) fn line_ranges() -> Action {
         if context.parts.is_empty() {
             return paths();
         }
+        let Some(repo) = repository(context) else {
+            return Action::default();
+        };
         let path = context.parts[0].clone();
         let side = selected_side(context);
-        let ranges: Vec<String> = hunk_candidates(context, side)
+        let ranges: Vec<String> = hunk_candidates(&repo, context, side)
             .into_iter()
             .filter(|hunk| hunk.path == path)
             .map(|hunk| hunk.range())
@@ -641,10 +766,7 @@ fn hunk_tag(side: DiffSide) -> &'static str {
 /// The unstaged side is diffed against the index and the staged side against
 /// `HEAD`; each side keeps the other side's hunks as peers so a hunk body that
 /// appears twice gets the same disambiguated id the diff command reports.
-fn hunk_candidates(context: &Context, side: DiffSide) -> Vec<HunkCandidate> {
-    let Some(repo) = repository(context) else {
-        return Vec::new();
-    };
+fn hunk_candidates(repo: &Repository, context: &Context, side: DiffSide) -> Vec<HunkCandidate> {
     let Ok(config) = repo.config() else {
         return Vec::new();
     };
@@ -652,7 +774,7 @@ fn hunk_candidates(context: &Context, side: DiffSide) -> Vec<HunkCandidate> {
     if let Some(lines) = unified_context(context) {
         options.context_lines = lines;
     }
-    let Ok(bundle) = hunk_diff_bundle(&repo, &[], options) else {
+    let Ok(bundle) = hunk_diff_bundle(repo, &[], options) else {
         return Vec::new();
     };
     let mut candidates = Vec::new();
@@ -721,28 +843,17 @@ fn unified_context(context: &Context) -> Option<usize> {
         .find_map(|value| value.parse().ok())
 }
 
-/// A ref listing action for `namespaces`.
-fn refs(
-    namespaces: impl IntoIterator<Item = RefNamespace>,
-    tag: &'static str,
-    style: &'static str,
-) -> Action {
-    let namespaces: Vec<RefNamespace> = namespaces.into_iter().collect();
-    Action::callback(move |context| {
-        let Some(repo) = repository(context) else {
-            return Action::default();
-        };
-        let summaries = list_ref_summaries(&repo, &namespaces).unwrap_or_default();
-        described(summaries).style(style).tag(tag)
-    })
-}
-
-fn described(summaries: Vec<RefSummary>) -> Action {
-    Action::values_described(
-        summaries
-            .into_iter()
-            .map(|summary| (summary.name, summary.subject.unwrap_or_default())),
-    )
+/// `(name, tip subject)` pairs for `summaries`.
+fn described<'a>(summaries: impl IntoIterator<Item = &'a RefSummary>) -> Vec<(String, String)> {
+    summaries
+        .into_iter()
+        .map(|summary| {
+            (
+                summary.name.clone(),
+                summary.subject.clone().unwrap_or_default(),
+            )
+        })
+        .collect()
 }
 
 /// Open the repository the completion request runs in.

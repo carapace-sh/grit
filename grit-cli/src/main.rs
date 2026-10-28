@@ -113,11 +113,11 @@ pub(crate) struct Cli {
 #[derive(Debug, Subcommand)]
 enum RemoteAction {
     /// Add a new remote.
-    #[command(add = carapace_rs_clap::DashAnyCompleter::new(crate::completions::actions::paths()))]
     Add {
         /// Short name for the remote (e.g. origin).
         name: String,
         /// The remote's URL or path.
+        #[arg(add = completer!(carapace_rs::Action::files([])))]
         url: String,
         /// Fetch from the remote after adding it.
         #[arg(long)]
@@ -129,6 +129,7 @@ enum RemoteAction {
         #[arg(add = completer!(crate::completions::actions::remotes()))]
         name: String,
         /// New URL or path.
+        #[arg(add = completer!(carapace_rs::Action::files([])))]
         url: String,
         /// Update `pushurl` instead of `url`.
         #[arg(long)]
@@ -209,7 +210,6 @@ enum RemoteAction {
         tags: bool,
         /// Sort refs by `name` or `version` (`git ls-remote --sort=version:refname`).
         #[arg(long = "sort", value_name = "KEY", default_value = "name")]
-        #[arg(add = completer!(crate::completions::actions::sort_keys()))]
         sort: RemoteRefSortArg,
         /// Reverse sort order (`git ls-remote --sort=-…`).
         #[arg(long)]
@@ -2241,7 +2241,6 @@ enum Command {
                 "remove_section"
             ]
         )]
-        #[arg(add = completer!(crate::completions::actions::config_value_types()))]
         value_type: Option<commands::config::ConfigTypeArg>,
         /// When reading, use this value if the key is unset.
         #[arg(

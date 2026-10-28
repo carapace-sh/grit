@@ -68,6 +68,17 @@ fn has_value(payload: &Value, value: &str) -> bool {
     values(payload).iter().any(|candidate| candidate.0 == value)
 }
 
+/// `uid` of one candidate, when the export carries uids.
+fn uid_of(payload: &Value, value: &str) -> Option<String> {
+    payload["values"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|candidate| candidate["value"] == value)
+        .and_then(|candidate| candidate["uid"].as_str())
+        .map(str::to_owned)
+}
+
 #[test]
 fn bash_completions_install_a_completion_function() {
     let script = script("bash");
@@ -488,5 +499,99 @@ fn unknown_shell_is_reported() {
         output.stderr.contains("unknown shell"),
         "{}",
         output.dump("completions")
+    );
+}
+
+#[test]
+fn pseudo_refs_are_offered_only_when_they_exist() {
+    let (_tmp, dir) = sample_repo();
+
+    let payload = export(&dir, &["log", ""]);
+    let candidates = values(&payload);
+
+    assert!(
+        candidates
+            .iter()
+            .any(|candidate| candidate.0 == "HEAD" && candidate.2 == "pseudo refs"),
+        "{candidates:?}"
+    );
+    assert!(
+        !candidates
+            .iter()
+            .any(|candidate| candidate.0 == "MERGE_HEAD"),
+        "a pseudo ref that names no tip must not be offered: {candidates:?}"
+    );
+}
+
+#[test]
+fn tracked_paths_are_tagged_only_when_the_file_is_gone() {
+    let (_tmp, dir) = sample_repo();
+
+    let payload = export(&dir, &["add", ""]);
+    let candidates = values(&payload);
+    assert!(
+        candidates
+            .iter()
+            .any(|candidate| candidate.0 == "tracked.txt" && candidate.2 == "files"),
+        "an existing tracked file is a worktree entry, not a deleted path: {candidates:?}"
+    );
+
+    std::fs::remove_file(dir.join("tracked.txt")).expect("delete tracked file");
+    let payload = export(&dir, &["add", ""]);
+    let candidates = values(&payload);
+    assert!(
+        candidates
+            .iter()
+            .any(|candidate| candidate.0 == "tracked.txt" && candidate.2 == "tracked paths"),
+        "{candidates:?}"
+    );
+}
+
+#[test]
+fn sort_keys_of_the_branch_listing_are_grouped() {
+    let (_tmp, dir) = sample_repo();
+
+    let payload = export(&dir, &["branch", "--sort", ""]);
+    let candidates = values(&payload);
+
+    for key in ["date", "name", "version"] {
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.0 == key && candidate.2 == "sort keys"),
+            "{key} missing: {candidates:?}"
+        );
+    }
+}
+
+/// An export request with uids kept: carapace strips them unless its
+/// experimental tabdance mode is on, which needs the flag and a `tabdance`
+/// on `PATH`.
+fn export_with_uids(dir: &Path, words: &[&str]) -> Value {
+    let stub = tempfile::tempdir().expect("tempdir");
+    write_file(stub.path(), "tabdance", "");
+    let path = std::env::var("PATH").unwrap_or_default();
+    let path = format!("{}:{path}", stub.path().display());
+    let mut args = vec!["_carapace", "export", "grit"];
+    args.extend_from_slice(words);
+    let output = grit_cmd(&args)
+        .in_dir(dir)
+        .env("CARAPACE_EXPERIMENTAL", "1")
+        .env("PATH", path)
+        .suc();
+    serde_json::from_str(output.stdout.trim()).expect("export json")
+}
+
+#[test]
+fn repository_values_carry_scoped_uids() {
+    let (_tmp, dir) = sample_repo();
+
+    let payload = export_with_uids(&dir, &["log", ""]);
+    let uid = uid_of(&payload, "main").expect("branch uid");
+
+    assert!(uid.starts_with("git://local-branch/main?"), "{uid}");
+    assert!(
+        uid.contains("GIT_WORK_TREE=") && uid.contains("project"),
+        "a uid names the repository it came from: {uid}"
     );
 }

@@ -53,7 +53,7 @@ pub struct BranchListArgs {
     #[arg(
         long = "sort",
         value_name = "KEY",
-        add = completer!(carapace_rs::Action::values(["date", "name", "version"]))
+        add = completer!(crate::completions::actions::sort_keys())
     )]
     pub sort: Option<String>,
     /// Reverse sort order.

@@ -19,8 +19,8 @@ What completion offers:
 
 | Argument | Candidates |
 | -------- | ---------- |
-| Revisions (`log`, `show`, `diff`, `merge`, `reset`, …) | Local and remote branches and tags, described with the subject of the commit they point at; stashes, described with the message they were created with; `HEAD` and the other pseudo refs; plus `A..B` / `A...B` ranges and `^` negation |
-| Paths (`add`, `rm`, `restore`, `status`, …) | Files and directories in the worktree below the current directory, ignoring paths excluded by `.gitignore`, plus tracked paths whose file was deleted |
+| Revisions (`log`, `show`, `diff`, `merge`, `reset`, …) | Local and remote branches and tags, described with the subject of the commit they point at; stashes, described with the message they were created with; `HEAD` and the pseudo refs that exist right now (`MERGE_HEAD` only while a merge is in progress); plus `A..B` / `A...B` ranges and `^` negation |
+| Paths (`add`, `rm`, `restore`, `status`, …) | Files and directories in the worktree below the current directory, ignoring paths excluded by `.gitignore`, plus tracked paths whose file is deleted |
 | Remotes (`fetch`, `pull`, `push`, `remote`, …) | Configured remotes, described with their URL |
 | Refspecs (`fetch`) | The source side offers branch names as they exist on the remote (tags included), the destination side local branches, as in `main:incoming` |
 | Hunk ids and line ranges (`add`, `commit`, `restore`, `stash`, `history fixup`) | The ids `grit diff --json` assigns to the hunks of the current changes, described with their path and new-side range; `--lines` completes the path first, then the ranges of that path's hunks. `grit restore --staged` is offered staged hunks, every other command unstaged ones, and `-U` is honored |
@@ -30,7 +30,9 @@ What completion offers:
 | Config keys and values (`config`, `-c`) | Keys already present in the effective configuration, common keys, and the values set for a key |
 | Shells | The shells this command accepts |
 
-Candidates are styled like Git completions elsewhere: branches blue, tags yellow, pseudo refs bold, stashes green, notes cyan, hunk ids magenta, with each kind in its own group in the menu.
+Candidates are styled like Git completions elsewhere: branches blue, tags yellow, pseudo refs bold, stashes green, notes cyan, hunk ids magenta, with each kind in its own group in the menu. Subcommands are grouped too, the way this documentation groups them, so the menu separates everyday commands from plumbing.
+
+Values that come from the repository also carry a `git://` identifier naming the kind and the repository they belong to (`git://local-branch/main?GIT_WORK_TREE=…`), following the layout carapace uses for Git. Carapace emits those identifiers only in its experimental tabdance mode; other shells see grouped and styled values.
 
 The global [`-C`](../global-options/), [`--git-dir`](../global-options/), [`--work-tree`](../global-options/), and [`-c`](../global-options/) flags apply to completion too, so `grit -C ../other branch <TAB>` lists the branches of `../other`.
 

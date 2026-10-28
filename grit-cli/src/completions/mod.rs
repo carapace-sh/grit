@@ -68,10 +68,14 @@ pub fn snippet(shell: Shell) -> String {
 }
 
 /// Top-level commands grouped the way the documentation groups them; the group
-/// becomes the completion tag, so related commands sit together in the menu.
+/// becomes the completion tag and picks the highlight style, so related commands
+/// sit together in the menu. Nested subcommands keep carapace's own group: a
+/// subcommand list is short enough to scan without headings.
 ///
 /// This is command metadata rather than argument completion, which is why it is
-/// applied here instead of at a definition.
+/// applied here instead of at a definition. Every visible top-level command but
+/// `help` belongs to exactly one group, which `every_command_belongs_to_one_group`
+/// checks.
 const GROUPS: &[(&str, &[&str])] = &[
     (
         "Getting started",
@@ -229,6 +233,42 @@ mod tests {
         let output = complete(Shell::Bash, &["remote", ""]);
         for subcommand in ["add", "remove", "set-url", "refs"] {
             assert!(output.contains(subcommand), "{output}");
+        }
+    }
+
+    #[test]
+    fn every_command_belongs_to_one_group() {
+        let grouped: Vec<&str> = GROUPS
+            .iter()
+            .flat_map(|(_, commands)| commands.iter().copied())
+            .collect();
+        let ungrouped: Vec<String> = crate::cli_test_stack::run(|| {
+            command()
+                .get_subcommands()
+                .map(|sub| sub.get_name().to_owned())
+                .filter(|name| name != "help")
+                .collect()
+        });
+        for name in &ungrouped {
+            let groups = grouped.iter().filter(|grouped| *grouped == name).count();
+            assert_eq!(
+                groups, 1,
+                "`{name}` must appear in exactly one completion group"
+            );
+        }
+        assert_eq!(
+            grouped.len(),
+            ungrouped.len(),
+            "a completion group names a command that does not exist"
+        );
+    }
+
+    #[test]
+    fn every_listed_shell_prints_a_script() {
+        for name in shell_names() {
+            let shell = Shell::parse(name).expect("listed shell parses");
+            let script = crate::cli_test_stack::run(move || snippet(shell));
+            assert!(!script.is_empty(), "{name} prints no script");
         }
     }
 
