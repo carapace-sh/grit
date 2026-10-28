@@ -508,6 +508,10 @@ impl IcaseCheckoutCollisionMap {
     pub(crate) fn preserve_missing_collision_loser(&self, raw_path: &[u8]) -> bool {
         self.is_auto_stage_loser(raw_path)
     }
+
+    pub(crate) fn collision_groups(&self) -> &IcaseIndexCollisionGroups {
+        &self.groups
+    }
 }
 
 fn stage0_blob_paths(index: &Index) -> Vec<&str> {

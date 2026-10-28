@@ -3,14 +3,17 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use grit_lib::error::Error;
 use grit_lib::index::write_tree::{write_tree_update_index, WriteTreeFlags};
 use grit_lib::index::{entry_from_stat, Index, MODE_REGULAR};
 use grit_lib::objects::ObjectKind;
 use grit_lib::porcelain::checkout::checkout_between_trees_with_progress;
 use grit_lib::porcelain::commit::{commit_with_scope, CommitRequest, CommitScope};
 use grit_lib::porcelain::stage_tracked::stage_tracked_modifications;
+use grit_lib::porcelain::status::{status, StatusOptions};
 use grit_lib::progress::{NeverCancel, NullProgress};
 use grit_lib::repo::{InitOptions, Repository};
+use grit_lib::worktree::pathspec::ResolvedPathspecs;
 use grit_lib::RefStorageFormat;
 
 fn enable_ignorecase(repo: &Repository, root: &Path) {
@@ -244,5 +247,117 @@ fn deleting_dentry_winner_stages_removal_and_keeps_losers() {
     assert_eq!(
         mid.get(b"Dir/a.txt", 0).expect("Dir/a.txt").oid,
         dir_loser_oid
+    );
+}
+
+fn collision_clone_worktree(fx: &TestRepo) {
+    checkout_collision_tree(&fx.repo, &fx.dest);
+    keep_one_spelling_per_collision_group(&fx.dest);
+    let pre = fx.repo.index_handle().load().expect("index");
+    assert!(
+        pre.get(b"File.txt", 0).is_some() && pre.get(b"file.txt", 0).is_some(),
+        "checkout index must keep both collision spellings"
+    );
+    commit_with_scope(
+        &fx.repo,
+        &commit_request("base"),
+        CommitScope::Staged,
+        &mut NullProgress,
+        &NeverCancel,
+    )
+    .expect("seed HEAD from collision index");
+}
+
+fn commit_request(message: &str) -> CommitRequest {
+    let id = "Tester <t@example.com> 1700000000 +0000".to_owned();
+    CommitRequest {
+        message: message.to_owned(),
+        author: Some(id.parse().expect("sig")),
+        committer: Some(id.parse().expect("sig")),
+        allow_empty: false,
+        ..Default::default()
+    }
+}
+
+fn head_oid(repo: &Repository) -> grit_lib::objects::ObjectId {
+    grit_lib::refs::resolve_ref(repo.git_dir(), "HEAD").expect("head")
+}
+
+#[test]
+fn collision_loser_path_commit_leaves_index_and_head_unchanged() {
+    let fx = init_collision_repo();
+    collision_clone_worktree(&fx);
+
+    let before = fx.repo.index_handle().load().expect("index");
+    assert!(before.get(b"file.txt", 0).is_some(), "pre: file.txt");
+    let file_loser_oid = before.get(b"File.txt", 0).expect("File.txt").oid;
+    let head_before = head_oid(&fx.repo);
+
+    let err = commit_with_scope(
+        &fx.repo,
+        &commit_request("e"),
+        CommitScope::Paths(ResolvedPathspecs {
+            specs: vec!["File.txt".into()],
+            sources: vec!["File.txt".into()],
+            scoped: true,
+        }),
+        &mut NullProgress,
+        &NeverCancel,
+    )
+    .expect_err("path commit must not delete collision loser");
+    assert!(matches!(err, Error::NothingToCommit), "{err:?}");
+
+    assert_eq!(head_oid(&fx.repo), head_before);
+    let after = fx.repo.index_handle().load().expect("index after");
+    assert_eq!(
+        after.get(b"File.txt", 0).expect("File.txt").oid,
+        file_loser_oid
+    );
+    assert!(after.get(b"file.txt", 0).is_some());
+}
+
+#[test]
+fn collision_loser_auto_stage_commit_is_noop() {
+    let fx = init_collision_repo();
+    collision_clone_worktree(&fx);
+
+    let before = fx.repo.index_handle().load().expect("index");
+    let file_loser_oid = before.get(b"File.txt", 0).expect("File.txt").oid;
+    let head_before = head_oid(&fx.repo);
+
+    let err = commit_with_scope(
+        &fx.repo,
+        &commit_request("e"),
+        CommitScope::AutoStage,
+        &mut NullProgress,
+        &NeverCancel,
+    )
+    .expect_err("auto-stage must not commit phantom loser changes");
+    assert!(matches!(err, Error::NothingToCommit), "{err:?}");
+
+    assert_eq!(head_oid(&fx.repo), head_before);
+    let after = fx.repo.index_handle().load().expect("index after");
+    assert_eq!(
+        after.get(b"File.txt", 0).expect("File.txt").oid,
+        file_loser_oid
+    );
+}
+
+#[test]
+fn collision_loser_omitted_from_status_unstaged() {
+    let fx = init_collision_repo();
+    collision_clone_worktree(&fx);
+
+    let model = status(
+        &fx.repo,
+        &StatusOptions::default(),
+        &mut NullProgress,
+        &NeverCancel,
+    )
+    .expect("status");
+    assert!(
+        !model.unstaged.iter().any(|e| e.path() == "File.txt"),
+        "collision loser must not appear as unstaged: {:?}",
+        model.unstaged.iter().map(|e| e.path()).collect::<Vec<_>>()
     );
 }
