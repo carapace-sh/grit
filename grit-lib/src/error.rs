@@ -94,11 +94,14 @@ pub enum RemoteUnreadableReason {
     /// The transport ran, but the remote never completed the Git protocol handshake (for
     /// example `ssh` exited, or a `git://` peer closed, before any ref advertisement).
     NoHandshake,
+    /// The remote ended a fetch response before sending the pack it was asked for (the
+    /// stream closed before the `packfile` section).
+    ResponseTruncated,
 }
 
 impl RemoteUnreadableReason {
     /// Stable snake-case name for machine-readable output (`repository_not_found`,
-    /// `transport`, `http_status`, `not_git_server`, `no_handshake`).
+    /// `transport`, `http_status`, `not_git_server`, `no_handshake`, `response_truncated`).
     #[must_use]
     pub fn slug(&self) -> &'static str {
         match self {
@@ -107,6 +110,7 @@ impl RemoteUnreadableReason {
             Self::HttpStatus { .. } => "http_status",
             Self::NotGitServer { .. } => "not_git_server",
             Self::NoHandshake => "no_handshake",
+            Self::ResponseTruncated => "response_truncated",
         }
     }
 }
@@ -141,6 +145,9 @@ fn remote_unreadable_message(url: Option<&str>, reason: &RemoteUnreadableReason)
         RemoteUnreadableReason::NoHandshake => {
             format!("could not read from {target}: no Git protocol response")
         }
+        RemoteUnreadableReason::ResponseTruncated => {
+            format!("{target} closed the connection before sending the pack")
+        }
     }
 }
 
@@ -158,6 +165,10 @@ pub enum AuthFailure {
         /// The provider's explanation (for example that no helper has credentials and
         /// prompting is disabled).
         detail: String,
+        /// The `credential.helper` programs the provider asked, when it reported them
+        /// (see [`Error::CredentialsUnavailable`]); empty when none is configured or
+        /// the provider is not helper-based.
+        helpers: Vec<String>,
     },
     /// The provider answered without a usable username and password.
     #[error("the credential helper returned no usable username and password")]
@@ -181,6 +192,25 @@ impl AuthFailure {
     #[must_use]
     pub fn is_rejected(&self) -> bool {
         matches!(self, Self::Rejected)
+    }
+
+    /// The failure an HTTP client reports when a credential provider's
+    /// [`fill`](crate::credentials::CredentialProvider::fill) fails with `err`.
+    ///
+    /// Always [`AuthFailure::CredentialsUnavailable`]: `detail` is `err`'s message,
+    /// and `helpers` is the list an [`Error::CredentialsUnavailable`] carries (empty
+    /// for any other error). Custom [`HttpClient`](crate::transport::http::HttpClient)
+    /// implementations use it to report fill failures the way the built-in client does.
+    #[must_use]
+    pub fn from_fill_error(err: Error) -> Self {
+        let helpers = match &err {
+            Error::CredentialsUnavailable { helpers } => helpers.clone(),
+            _ => Vec::new(),
+        };
+        Self::CredentialsUnavailable {
+            detail: err.to_string(),
+            helpers,
+        }
     }
 }
 
@@ -301,7 +331,9 @@ pub enum ConfigError {
         key: String,
     },
 
-    /// `includeIf.hasconfig:remote.*.url` cannot pull remote URLs from included files.
+    /// A `remote.<name>.url` is set in a file reached through a conditional include while
+    /// `includeIf.hasconfig:remote.*.url` conditions are evaluated (such URLs could change
+    /// which conditions hold).
     #[error(
         "remote URLs cannot be configured in file directly or indirectly included by includeIf.hasconfig:remote.*.url"
     )]
@@ -319,6 +351,16 @@ pub enum ConfigError {
     /// Generic config error with free-form detail (legacy call sites).
     #[error("{0}")]
     Other(String),
+
+    /// A config value that must be a date (an approxidate such as `2.weeks.ago`) is
+    /// not one.
+    #[error("'{value}' is not a date for '{key}'")]
+    InvalidDate {
+        /// Config key name that failed validation.
+        key: String,
+        /// Raw config value that could not be parsed.
+        value: String,
+    },
 
     /// The config file could not be written because a `.lock` file is already present.
     #[error("could not lock config file {path}: File exists")]
@@ -356,6 +398,15 @@ pub enum ConfigError {
         "invalid value '{value}' for 'status.showUntrackedFiles' (expected no, normal, all, boolean words, or integer 0 vs nonzero)"
     )]
     InvalidUntrackedFilesMode {
+        /// Raw config value that could not be parsed.
+        value: String,
+    },
+
+    /// `merge.directoryRenames` must be `conflict` or a Git boolean.
+    #[error(
+        "invalid value '{value}' for 'merge.directoryRenames' (expected true, false or conflict)"
+    )]
+    InvalidDirectoryRenames {
         /// Raw config value that could not be parsed.
         value: String,
     },
@@ -610,18 +661,6 @@ pub enum ApplyError {
     Cancelled,
 }
 
-/// Path lookup failures while formatting a diff.
-#[derive(Debug, Error, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum DiffPathError {
-    /// The requested path is not part of the diff being formatted.
-    #[error("No such path '{path}' in the diff")]
-    NoSuchPathInDiff {
-        /// Path that was requested from the diff.
-        path: String,
-    },
-}
-
 /// `--pathspec-from-file` / `--pathspec-file-nul` parse failure.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -857,6 +896,18 @@ pub enum Error {
     #[error("promised object not available locally: {0}")]
     PromisedObjectMissing(crate::objects::ObjectId),
 
+    /// Promised objects could not be fetched: every promisor remote was asked, and some
+    /// failed. [`Self::PromisedObjectMissing`] is used instead when every remote answered
+    /// but none had the object.
+    #[error("{}", promisor_fetch_failed_message(missing, failures))]
+    PromisorFetchFailed {
+        /// The first object still missing after every remote was tried.
+        missing: crate::objects::ObjectId,
+        /// One entry per remote that failed, in the order they were tried: the remote's
+        /// name and its first error.
+        failures: Vec<(String, Error)>,
+    },
+
     /// An object's stored data is corrupt or malformed.
     #[error("corrupt object: {0}")]
     CorruptObject(String),
@@ -880,6 +931,17 @@ pub enum Error {
     UnresolvedDeltas {
         /// Number of deltas left unresolved.
         count: u64,
+    },
+
+    /// A pack being written that is not thin reached a delta before its base: the base
+    /// is missing from the pack, or the planned deltas form a cycle. The receiver could
+    /// not resolve that delta, so the pack was abandoned.
+    #[error("pack delta for {target} comes before its base {base}")]
+    PackDeltaBaseNotWritten {
+        /// The object that would have been stored as a delta.
+        target: crate::objects::ObjectId,
+        /// Its delta base, not written ahead of it.
+        base: crate::objects::ObjectId,
     },
 
     /// [`crate::objects::Objects::write`] refused a payload that `git fsck` would reject;
@@ -962,7 +1024,7 @@ pub enum Error {
     /// The lock file belongs to whoever created it and is never removed. Retry once the other
     /// process finishes, or delete `path` when no process owns it (a `holder` with
     /// `running: false` means the lock is stale).
-    #[error("lock file {} already exists", path.display())]
+    #[error("lock file {} already exists", crate::git_path::user_display_path(.path))]
     LockHeld {
         /// The lock file that could not be created.
         path: std::path::PathBuf,
@@ -1046,7 +1108,11 @@ pub enum Error {
         holder: crate::maintenance::GcLockHolder,
     },
 
-    /// Explicit [`crate::porcelain::add::stage`] refused paths that still contain conflict markers.
+    /// Staging ([`crate::porcelain::add::stage`] with explicit paths, or the auto-stage pass of
+    /// [`crate::porcelain::commit::commit_worktree`]) refused paths that still contain conflict
+    /// markers: either they are unmerged, or their conflict stages were dropped (the index keeps
+    /// a resolve-undo record) and at least one marker block is not in the `HEAD` version. A dropped-stage
+    /// path stops the whole staging pass before the index is written.
     #[error("unmerged paths still have conflict markers")]
     UnmergedConflictMarkers {
         /// Repository-relative paths that were not staged because markers remain.
@@ -1146,10 +1212,6 @@ pub enum Error {
     #[error(transparent)]
     Apply(#[from] ApplyError),
 
-    /// Diff path selection failure.
-    #[error(transparent)]
-    DiffPath(#[from] DiffPathError),
-
     /// Path resolves outside the repository.
     #[error(transparent)]
     PathOutsideRepo(#[from] PathOutsideRepoError),
@@ -1173,6 +1235,19 @@ pub enum Error {
         url: String,
         /// What went wrong.
         reason: AuthFailure,
+    },
+
+    /// A credential provider could not supply a complete username and password:
+    /// no helper had them and no askpass program could be asked.
+    ///
+    /// Returned by [`HelperCredentialProvider`](crate::credentials::HelperCredentialProvider)
+    /// instead of prompting on a terminal; transports surface it as
+    /// [`AuthFailure::CredentialsUnavailable`].
+    #[error("{}", crate::credentials::NON_INTERACTIVE_MESSAGE)]
+    CredentialsUnavailable {
+        /// The `credential.helper` programs that were asked, in order (empty when none
+        /// is configured for the URL).
+        helpers: Vec<String>,
     },
 
     /// An atomic wire push was requested, but the remote did not advertise the
@@ -1285,6 +1360,18 @@ pub enum Error {
     /// [`crate::porcelain::commit::CommitScope::Paths`] was used while a merge is in progress.
     #[error("cannot do a partial commit during a merge")]
     PartialCommitDuringMerge,
+
+    /// Partial commit, amend, or patch commit while a cherry-pick or revert is in progress.
+    #[error("cannot do a partial commit during a cherry-pick or revert")]
+    PartialCommitDuringReplay,
+
+    /// [`continue_replay_sequence`](crate::porcelain::replay_sequence::continue_replay_sequence) with a dirty index after the step was already committed.
+    #[error("cannot continue replay: index differs from HEAD after the step was committed")]
+    ReplayContinueDirtyIndex,
+
+    /// [`skip_replay_step`](crate::porcelain::replay_sequence::skip_replay_step) when the current step was already committed on a moved branch tip.
+    #[error("nothing to skip: current step already committed; run continue instead")]
+    ReplaySkipAlreadyCommitted,
 
     /// Explicit [`crate::porcelain::add::stage`] pathspecs name paths excluded by ignore rules.
     #[error("the following paths are ignored:\n{}", paths.join("\n"))]
@@ -1403,6 +1490,16 @@ pub enum Error {
         /// What went wrong.
         reason: RemoteUnreadableReason,
     },
+
+    /// The upload-pack serving a local path or `file://` URL in this process failed
+    /// (for example it was asked for an object it does not have). Repository errors
+    /// of the served side are returned as themselves instead.
+    #[error("local upload-pack: {0}")]
+    LocalUploadPack(Box<crate::serve::ServeError>),
+
+    /// The thread serving a local path or `file://` URL panicked.
+    #[error("local upload-pack stopped unexpectedly")]
+    LocalUploadPackPanicked,
 
     /// A resumable bundle download or upload failed.
     #[error(transparent)]
@@ -1534,7 +1631,9 @@ pub enum Error {
         command: String,
     },
 
-    /// [`abort_replay_sequence`](crate::porcelain::replay_sequence::abort_replay_sequence) refuses when `HEAD` moved since the replay started.
+    /// Legacy: abort no longer fails when `HEAD` moved;
+    /// [`abort_replay_sequence`](crate::porcelain::replay_sequence::abort_replay_sequence) returns
+    /// [`ReplayAbortOutcome::ClearedInPlace`](crate::porcelain::replay_sequence::ReplayAbortOutcome::ClearedInPlace) instead.
     #[error("cannot abort replay: HEAD moved since replay started")]
     ReplayAbortHeadMoved,
 
@@ -1545,6 +1644,10 @@ pub enum Error {
     /// No cherry-pick or revert sequence is in progress.
     #[error("no cherry-pick or revert in progress")]
     NoReplayInProgress,
+
+    /// [`crate::porcelain::merge::abort_branch_merge`] was called with no merge in progress.
+    #[error("there is no merge in progress")]
+    NoMergeInProgress,
 
     /// The command would move `HEAD` while a paused operation still depends on it
     /// (see [`operation_blocking_switch`](crate::state::operation_blocking_switch)).
@@ -1654,6 +1757,10 @@ pub enum Error {
     #[error("cannot stash in a bare repository")]
     StashBareRepository,
 
+    /// [`crate::blame::BlameFinalSource::Worktree`] was requested in a bare repository.
+    #[error("cannot blame the working tree of a bare repository")]
+    BlameWorktreeBareRepository,
+
     /// [`crate::repo_handles::RepositoryStash::apply`] with `restore_index` could
     /// not merge the current index with the stashed index parent.
     #[error("conflicts in index while applying stash with --index")]
@@ -1755,6 +1862,11 @@ pub enum Error {
     #[error(transparent)]
     Midx(#[from] MidxError),
 
+    /// Offloading blobs to a large-object promisor was refused
+    /// ([`crate::maintenance::offload_blobs`]).
+    #[error(transparent)]
+    Offload(#[from] crate::offload::OffloadError),
+
     /// Revision parsing failed ([`crate::rev_parse_error::RevParseError`]).
     #[error(transparent)]
     RevParse(#[from] crate::rev_parse_error::RevParseError),
@@ -1777,6 +1889,24 @@ pub enum Error {
     #[error("{operation} requires the files-backed object store; it is not supported with a custom primary")]
     UnsupportedObjectStore {
         /// Operation that was refused (for example `"fetch"`, `"push"`, `"gc"`).
+        operation: &'static str,
+    },
+
+    /// The operation fetches objects back from a promisor remote, and the repository
+    /// has none: no `remote.<name>.promisor = true` and no `extensions.partialClone`.
+    /// Nothing was changed.
+    #[error("{operation} needs a promisor remote to fetch objects back from")]
+    NoPromisorRemote {
+        /// Operation that was refused (for example `"drop-large-blobs"`).
+        operation: &'static str,
+    },
+
+    /// The operation would delete objects, and `extensions.preciousObjects` says this
+    /// repository never loses any (it may be shared as an alternate). Nothing was
+    /// changed.
+    #[error("{operation} deletes objects, which extensions.preciousObjects forbids here")]
+    PreciousObjectsRepository {
+        /// Operation that was refused (for example `"drop-large-blobs"`).
         operation: &'static str,
     },
 
@@ -1911,9 +2041,11 @@ impl Error {
             Self::ObjectNotFound(..) => "object_not_found",
             Self::RevisionNotFound(..) => "revision_not_found",
             Self::PromisedObjectMissing(..) => "promised_object_missing",
+            Self::PromisorFetchFailed { .. } => "promisor_fetch_failed",
             Self::CorruptObject(..) => "corrupt_object",
             Self::PackIndexChecksumMismatch { .. } => "pack_index_checksum_mismatch",
             Self::UnresolvedDeltas { .. } => "unresolved_deltas",
+            Self::PackDeltaBaseNotWritten { .. } => "pack_delta_base_not_written",
             Self::InvalidObject { .. } => "invalid_object",
             Self::InvalidTreeEntry(..) => "invalid_tree_entry",
             Self::InvalidSignature(..) => "invalid_signature",
@@ -1953,10 +2085,10 @@ impl Error {
             Self::Reftable(..) => "reftable",
             Self::Filter(..) => "filter",
             Self::Apply(..) => "apply",
-            Self::DiffPath(..) => "diff_path",
             Self::PathOutsideRepo(..) => "path_outside_repo",
             Self::Signing(..) => "signing",
             Self::Auth { .. } => "auth",
+            Self::CredentialsUnavailable { .. } => "credentials_unavailable",
             Self::PushAtomicUnsupported => "push_atomic_unsupported",
             Self::PushOptionsUnsupported => "push_options_unsupported",
             Self::FetchUnshallowNotShallow => "fetch_unshallow_not_shallow",
@@ -1974,6 +2106,9 @@ impl Error {
             Self::RestorePathUnmerged { .. } => "restore_path_unmerged",
             Self::PathspecBeyondSymlink { .. } => "pathspec_beyond_symlink",
             Self::PartialCommitDuringMerge => "partial_commit_during_merge",
+            Self::PartialCommitDuringReplay => "partial_commit_during_replay",
+            Self::ReplayContinueDirtyIndex => "replay_continue_dirty_index",
+            Self::ReplaySkipAlreadyCommitted => "replay_skip_already_committed",
             Self::PathspecIgnored { .. } => "pathspec_ignored",
             Self::RemoveBlocked { .. } => "remove_blocked",
             Self::NotRemovingRecursively(..) => "not_removing_recursively",
@@ -1990,6 +2125,8 @@ impl Error {
             Self::MoveBadSource { .. } => "move_bad_source",
             Self::MoveMissingIndexEntry { .. } => "move_missing_index_entry",
             Self::RemoteUnreadable { .. } => "remote_unreadable",
+            Self::LocalUploadPack(..) => "local_upload_pack",
+            Self::LocalUploadPackPanicked => "local_upload_pack_panicked",
             Self::Resumable(..) => "resumable",
             Self::FetchRefspec(..) => "fetch_refspec",
             Self::FetchNonFastForward { .. } => "fetch_non_fast_forward",
@@ -2015,6 +2152,7 @@ impl Error {
             Self::ReplayAbortHeadMoved => "replay_abort_head_moved",
             Self::ReplayContinueUnmerged => "replay_continue_unmerged",
             Self::NoReplayInProgress => "no_replay_in_progress",
+            Self::NoMergeInProgress => "no_merge_in_progress",
             Self::OperationInProgress(..) => "operation_in_progress",
             Self::BranchCheckedOutInWorktree { .. } => "branch_checked_out_in_worktree",
             Self::BranchNotFound { .. } => "branch_not_found",
@@ -2032,6 +2170,7 @@ impl Error {
             Self::ReflogIndexOutOfRange { .. } => "reflog_index_out_of_range",
             Self::StashNoInitialCommit => "stash_no_initial_commit",
             Self::StashBareRepository => "stash_bare_repository",
+            Self::BlameWorktreeBareRepository => "blame_worktree_bare_repository",
             Self::StashIndexConflict => "stash_index_conflict",
             Self::StashOptionConflict(..) => "stash_option_conflict",
             Self::HunkSelection(..) => "hunk_selection",
@@ -2048,11 +2187,14 @@ impl Error {
             Self::NotesMergeBothEmpty { .. } => "notes_merge_both_empty",
             Self::NotesMergeInProgress { .. } => "notes_merge_in_progress",
             Self::Midx(..) => "midx",
+            Self::Offload(..) => "offload",
             Self::RevParse(..) => "rev_parse",
             Self::RevList(..) => "rev_list",
             Self::Hook(..) => "hook",
             Self::History(..) => "history",
             Self::UnsupportedObjectStore { .. } => "unsupported_object_store",
+            Self::NoPromisorRemote { .. } => "no_promisor_remote",
+            Self::PreciousObjectsRepository { .. } => "precious_objects_repository",
             Self::OdbObjectsDirMismatch { .. } => "odb_objects_dir_mismatch",
             Self::TreeSha256InvalidHex => "tree_sha256_invalid_hex",
             Self::TreeSha256InvalidRevision { .. } => "tree_sha256_invalid_revision",
@@ -2113,6 +2255,28 @@ impl Error {
         matches!(self, Self::RemoteUnreadable { .. })
     }
 
+    /// Whether this is [`Error::WorktreePathIo`] caused by another process holding the file
+    /// open (a Windows sharing or lock violation, `EBUSY`, or would-block), so retrying after
+    /// closing that program can succeed.
+    #[must_use]
+    pub fn is_worktree_file_in_use(&self) -> bool {
+        matches!(self, Self::WorktreePathIo { source, .. } if crate::worktree::io_error::is_file_in_use(source))
+    }
+
+    /// Whether this is [`Error::GitDirPathIo`] caused by another process holding a git-dir file
+    /// open (Windows sharing or access-denied during replace, `EBUSY`, …).
+    #[must_use]
+    pub fn is_git_dir_file_in_use(&self) -> bool {
+        matches!(
+            self,
+            Self::GitDirPathIo {
+                source,
+                operation,
+                ..
+            } if crate::git_dir::io_error::is_git_dir_transient_contention(*operation, source)
+        )
+    }
+
     /// Whether this is [`Error::Cancelled`] or a nested history failure that was cancelled.
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
@@ -2141,11 +2305,7 @@ impl Error {
     pub fn wants_fatal_prefix(&self) -> bool {
         matches!(
             self,
-            Error::Config(_)
-                | Error::RefLock(_)
-                | Error::Filter(_)
-                | Error::PathOutsideRepo(_)
-                | Error::DiffPath(_)
+            Error::Config(_) | Error::RefLock(_) | Error::Filter(_) | Error::PathOutsideRepo(_)
         )
     }
 
@@ -2176,6 +2336,7 @@ impl From<crate::refs::store::RefStoreError> for Error {
                 operation,
                 source: crate::refs::store::RefStoreError::git_dir_io_source(os_error),
             },
+            crate::refs::store::RefStoreError::Hook(hook) => Error::Hook(hook.into_hook_error()),
             other => Error::RefStore(other),
         }
     }
@@ -2200,6 +2361,18 @@ impl From<crate::lockfile::LockError> for Error {
 /// Convenience alias for `Result<T, Error>`.
 pub type Result<T> = std::result::Result<T, Error>;
 
+fn promisor_fetch_failed_message(
+    missing: &crate::objects::ObjectId,
+    failures: &[(String, Error)],
+) -> String {
+    let causes = failures
+        .iter()
+        .map(|(remote, err)| format!("{remote}: {err}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!("could not fetch promised object {missing} ({causes})")
+}
+
 /// Serializes as `{"kind": <Error::kind_name>, "message": <Display text>}`.
 #[cfg(feature = "serde-models")]
 impl serde::Serialize for Error {
@@ -2209,9 +2382,66 @@ impl serde::Serialize for Error {
     {
         use serde::ser::SerializeStruct;
 
-        let mut out = serializer.serialize_struct("Error", 2)?;
-        out.serialize_field("kind", self.kind_name())?;
-        out.serialize_field("message", &self.to_string())?;
-        out.end()
+        match self {
+            Self::LockHeld { path, holder } => {
+                let mut out = serializer.serialize_struct("Error", 3)?;
+                out.serialize_field("kind", self.kind_name())?;
+                out.serialize_field("message", &self.to_string())?;
+                out.serialize_field("path", &crate::git_path::user_display_path(path.as_path()))?;
+                if let Some(holder) = holder {
+                    out.serialize_field(
+                        "holder",
+                        &LockHolderSerde {
+                            pid: holder.pid,
+                            running: holder.running,
+                        },
+                    )?;
+                }
+                out.end()
+            }
+            Self::WouldOverwrite { reason, paths, .. } => {
+                let mut out = serializer.serialize_struct("Error", 4)?;
+                out.serialize_field("kind", self.kind_name())?;
+                out.serialize_field("message", &self.to_string())?;
+                out.serialize_field("reason", &reason.to_string())?;
+                out.serialize_field("paths", paths)?;
+                out.end()
+            }
+            Self::StashCouldNotRestoreUntracked { path } => {
+                let mut out = serializer.serialize_struct("Error", 3)?;
+                out.serialize_field("kind", self.kind_name())?;
+                out.serialize_field("message", &self.to_string())?;
+                out.serialize_field("path", path)?;
+                out.end()
+            }
+            Self::DirtyWorktree { operation, paths } => {
+                let mut out = serializer.serialize_struct("Error", 4)?;
+                out.serialize_field("kind", self.kind_name())?;
+                out.serialize_field("message", &self.to_string())?;
+                out.serialize_field("operation", &operation.to_string())?;
+                out.serialize_field("paths", paths)?;
+                out.end()
+            }
+            Self::UnmergedConflictMarkers { paths } => {
+                let mut out = serializer.serialize_struct("Error", 3)?;
+                out.serialize_field("kind", self.kind_name())?;
+                out.serialize_field("message", &self.to_string())?;
+                out.serialize_field("paths", paths)?;
+                out.end()
+            }
+            _ => {
+                let mut out = serializer.serialize_struct("Error", 2)?;
+                out.serialize_field("kind", self.kind_name())?;
+                out.serialize_field("message", &self.to_string())?;
+                out.end()
+            }
+        }
     }
+}
+
+#[cfg(feature = "serde-models")]
+#[derive(serde::Serialize)]
+struct LockHolderSerde {
+    pid: u64,
+    running: bool,
 }

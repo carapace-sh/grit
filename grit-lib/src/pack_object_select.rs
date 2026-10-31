@@ -4,17 +4,20 @@ use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::sync::Arc;
 
+use crate::alternate_boundary::AlternateSources;
 use crate::bitmap_walk::{BitmapWalkError, ReachabilityQuery, ReachableSet};
 use crate::commit_graph_file::{CommitGraphChain, UNRANKED_GENERATION};
 use crate::environment::RepositoryOptions;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::objects::{
-    oid_hash_map, oid_hash_set, parse_tag, tag_object_line_oid, CommitRef, Object, ObjectId,
-    ObjectKind, OidHashMap, OidHashSet, TreeRefIter,
+    oid_hash_map, oid_hash_set, oid_hash_set_with_capacity, parse_tag, tag_object_line_oid,
+    CommitRef, Object, ObjectId, ObjectKind, OidHashMap, OidHashSet, TreeRefIter,
 };
+use crate::odb::store::{CompositeStore, ObjectStore};
 use crate::odb::Odb;
 use crate::pack_bitmap::BitmapIndex;
 use crate::pack_name_hash::pack_name_hash;
+use crate::progress::CancelSignal;
 use crate::repo::Repository;
 use crate::rev_list::{MissingAction, ObjectFilter};
 
@@ -77,7 +80,9 @@ pub struct PackEnumerateOptions<'a> {
     /// skipped and the object walk is used.
     pub shallow_grafts: &'a HashSet<ObjectId>,
     /// Shallow graft boundaries when walking client `haves` to build the peer
-    /// closure. Defaults to [`Self::shallow_grafts`] when unset.
+    /// closure. Defaults to [`Self::shallow_grafts`] when unset. When non-empty,
+    /// bitmaps are not used: a bitmap closure of a `have` runs past the client's
+    /// shallow boundary into history the client does not hold.
     pub have_shallow_grafts: Option<&'a HashSet<ObjectId>>,
     /// When false, always use the object walk even if bitmaps exist.
     pub use_bitmaps: bool,
@@ -87,6 +92,14 @@ pub struct PackEnumerateOptions<'a> {
     pub peer_odb: Option<&'a Odb>,
     /// Whether `haves` are expanded to a full commit closure before the want walk.
     pub have_boundary: HaveBoundary,
+}
+
+impl PackEnumerateOptions<'_> {
+    /// Whether any shallow graft bounds either side of the walk, which rules out
+    /// bitmap reachability (bitmaps record full, ungrafted closures).
+    fn has_shallow_grafts(&self) -> bool {
+        !self.shallow_grafts.is_empty() || self.have_shallow_grafts.is_some_and(|g| !g.is_empty())
+    }
 }
 
 /// Select pack objects using bitmap reachability when possible, otherwise the object walk.
@@ -100,7 +113,15 @@ pub fn enumerate_pack_objects(
     haves: &[ObjectId],
     opts: &PackEnumerateOptions<'_>,
 ) -> Result<PackObjectSelection> {
-    enumerate_pack_objects_naming(odb, wants, haves, opts, NameTrees::No)
+    enumerate_pack_objects_naming(
+        odb,
+        wants,
+        haves,
+        opts,
+        NameTrees::No,
+        false,
+        &CancelSignal::never(),
+    )
 }
 
 /// Whether the object walk records name hashes for trees as well as blobs.
@@ -124,20 +145,90 @@ impl NameTrees {
     }
 }
 
-/// Like [`enumerate_pack_objects`], choosing whether the walk names trees.
+/// Like [`enumerate_pack_objects`], choosing whether the walk names trees and
+/// stopping with [`crate::error::Error::Cancelled`] once `stop` fires (polled for
+/// every commit and object the walk reads).
 pub(crate) fn enumerate_pack_objects_naming(
     odb: &Odb,
     wants: &[ObjectId],
     haves: &[ObjectId],
     opts: &PackEnumerateOptions<'_>,
     name_trees: NameTrees,
+    local_only: bool,
+    stop: &CancelSignal<'_>,
 ) -> Result<PackObjectSelection> {
-    if opts.use_bitmaps {
+    stop.poll()?;
+    if !local_only && opts.use_bitmaps {
         if let Some(sel) = try_bitmap_enumeration(odb, wants, haves, opts)? {
+            stop.poll()?;
             return Ok(sel);
         }
     }
-    walk_enumeration(odb, wants, haves, opts, name_trees)
+    let alternate_sources = if local_only {
+        AlternateSources::load(odb)?.composite()
+    } else {
+        None
+    };
+    walk_enumeration(
+        odb,
+        wants,
+        haves,
+        opts,
+        name_trees,
+        alternate_sources,
+        MissingBlobMode::Fail,
+        stop,
+    )
+    .map(|(selection, _)| selection)
+}
+
+/// What the object walk does with a blob the repository does not store.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MissingBlobMode {
+    /// List it anyway; the pack writer fails when it reads it (the plain walk).
+    Fail,
+    /// Check that every blob it would list is stored, and set the missing ones
+    /// aside as [`MissingBlob`]s instead of listing them.
+    Probe,
+}
+
+/// A blob the walk would have sent but the repository does not store.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MissingBlob {
+    /// The missing blob.
+    pub(crate) oid: ObjectId,
+    /// The tree the walk found it in, when known.
+    pub(crate) referrer: Option<ObjectId>,
+}
+
+/// Like [`enumerate_pack_objects_naming`] with [`MissingBlobMode::Probe`]: the object
+/// walk always runs (bitmaps cannot see missing objects), and blobs the repository
+/// lacks come back separately instead of being listed.
+///
+/// Missing commits, trees and tags still fail the walk.
+pub(crate) fn enumerate_pack_objects_probing(
+    odb: &Odb,
+    wants: &[ObjectId],
+    haves: &[ObjectId],
+    opts: &PackEnumerateOptions<'_>,
+    name_trees: NameTrees,
+    stop: &CancelSignal<'_>,
+) -> Result<(PackObjectSelection, Vec<MissingBlob>)> {
+    stop.poll()?;
+    let opts = PackEnumerateOptions {
+        use_bitmaps: false,
+        ..*opts
+    };
+    walk_enumeration(
+        odb,
+        wants,
+        haves,
+        &opts,
+        name_trees,
+        None,
+        MissingBlobMode::Probe,
+        stop,
+    )
 }
 
 /// Bitmap reachability for upload-pack when shallow grafts and filters allow it.
@@ -197,6 +288,9 @@ fn try_bitmap_enumeration(
     haves: &[ObjectId],
     opts: &PackEnumerateOptions<'_>,
 ) -> Result<Option<PackObjectSelection>> {
+    if opts.has_shallow_grafts() {
+        return Ok(None);
+    }
     let Some((send_set, peer_held)) =
         try_bitmap_reachable_for_upload(odb, wants, haves, opts.filter, opts.shallow_grafts)?
     else {
@@ -239,45 +333,67 @@ fn name_hashes_from_bitmap(
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn walk_enumeration(
     odb: &Odb,
     wants: &[ObjectId],
     haves: &[ObjectId],
     opts: &PackEnumerateOptions<'_>,
     name_trees: NameTrees,
-) -> Result<PackObjectSelection> {
+    alternate_sources: Option<Arc<CompositeStore>>,
+    missing_mode: MissingBlobMode,
+    stop: &CancelSignal<'_>,
+) -> Result<(PackObjectSelection, Vec<MissingBlob>)> {
     let have_shallow = opts.have_shallow_grafts.unwrap_or(opts.shallow_grafts);
     let have_commits = match opts.have_boundary {
         HaveBoundary::CommitClosure => {
-            commits_reachable_from_haves(odb, haves, have_shallow, true)?
+            commits_reachable_from_haves(odb, haves, have_shallow, true, stop)?
         }
-        HaveBoundary::TipsOnly => send_pack_uninteresting_commits(odb, wants, haves, have_shallow)?,
+        HaveBoundary::TipsOnly => {
+            send_pack_uninteresting_commits(odb, wants, haves, have_shallow, stop)?
+        }
     };
     let mut boundary: HashSet<ObjectId> = HashSet::new();
     if let Some(extra) = opts.exclude_objects {
         boundary.extend(extra.iter().copied());
     }
     let peer_held = try_peer_held_bitmap(odb, haves, opts)?;
+    stop.poll()?;
+    let mut missing = Vec::new();
     let (send, name_hashes, edges) = match opts.filter {
         Some(filter) if filter.uses_paths() => {
-            let (send, name_hashes) =
-                rev_list_filtered_objects(odb, wants, haves, filter, &have_commits)?;
+            let (mut send, name_hashes) = rev_list_filtered_objects(
+                odb,
+                wants,
+                haves,
+                filter,
+                &have_commits,
+                missing_mode,
+                stop,
+            )?;
+            if missing_mode == MissingBlobMode::Probe {
+                missing = take_unstored_blobs(odb, &mut send)?;
+            }
             (send, name_hashes, None)
         }
         filter => {
-            let (send, name_hashes, edges) = collect_reachable_excluding_with_name_hashes(
+            let walked = collect_reachable_excluding_with_name_hashes(
                 odb,
                 wants,
                 &HashSet::new(),
                 &mut boundary,
                 &have_commits,
                 opts.peer_odb,
+                alternate_sources,
                 false,
                 opts.shallow_grafts,
                 filter,
                 name_trees,
+                missing_mode,
+                stop,
             )?;
-            (send, name_hashes, Some(edges))
+            missing = walked.missing;
+            (walked.send, walked.name_hashes, Some(walked.edges))
         }
     };
     // Thin bases come only from the edge commits where the walk met the peer's
@@ -286,12 +402,134 @@ fn walk_enumeration(
         Some(edges) => edges,
         None => haves.iter().copied().collect(),
     };
-    Ok(PackObjectSelection {
-        send,
-        have_closure,
-        peer_held,
-        name_hashes,
-    })
+    Ok((
+        PackObjectSelection {
+            send,
+            have_closure,
+            peer_held,
+            name_hashes,
+        },
+        missing,
+    ))
+}
+
+/// Remove the objects `send` lists that the repository does not store and return
+/// them as missing blobs. Path-filtered walks (`sparse:oid`) only ever list
+/// commits and trees the walk has read, so anything absent is a blob.
+fn take_unstored_blobs(odb: &Odb, send: &mut Vec<ObjectId>) -> Result<Vec<MissingBlob>> {
+    let present = odb.contains_many(send)?;
+    let mut missing = Vec::new();
+    let mut present = present.into_iter();
+    send.retain(|oid| {
+        let keep = present.next().unwrap_or(true);
+        if !keep {
+            missing.push(MissingBlob {
+                oid: *oid,
+                referrer: None,
+            });
+        }
+        keep
+    });
+    Ok(missing)
+}
+
+/// An annotated tag ref that `include-tag` may add to a fetch pack.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TagCandidate {
+    /// The tag object the ref names.
+    pub(crate) tag: ObjectId,
+    /// The non-tag object the tag chain ends at (the advertised `^{}` value).
+    pub(crate) peeled: ObjectId,
+}
+
+/// Append to `send` every candidate tag whose peeled object `send` already holds,
+/// with each tag object of its chain, the way `pack-objects --include-tag` does.
+///
+/// Cost follows the size of `send` and the number of candidates, never the history
+/// behind them: `send` is scanned once (a second time only when a chain passes
+/// through a tag no candidate names) and only the added tags are read.
+///
+/// # Parameters
+///
+/// - `odb`: the database the added tag objects are read from.
+/// - `send`: the objects the pack holds; added tags are appended after them.
+/// - `candidates`: the annotated tag refs the client may follow.
+///
+/// # Errors
+///
+/// [`Error::ObjectNotFound`] or [`Error::CorruptObject`] for an unreadable tag in a
+/// chain that is added.
+pub(crate) fn append_included_tags(
+    odb: &Odb,
+    send: &mut Vec<ObjectId>,
+    candidates: &[TagCandidate],
+) -> Result<()> {
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    let mut named = oid_hash_set_with_capacity(candidates.len() * 2);
+    for c in candidates {
+        named.insert(c.tag);
+        named.insert(c.peeled);
+    }
+    let present: OidHashSet = send
+        .iter()
+        .filter(|o| named.contains(*o))
+        .copied()
+        .collect();
+    let mut added = included_tag_chains(odb, candidates, |oid| present.contains(oid))?;
+    let unnamed: OidHashSet = added
+        .iter()
+        .filter(|o| !named.contains(*o))
+        .copied()
+        .collect();
+    if !unnamed.is_empty() {
+        let already_sent: OidHashSet = send
+            .iter()
+            .filter(|o| unnamed.contains(*o))
+            .copied()
+            .collect();
+        added.retain(|oid| !already_sent.contains(oid));
+    }
+    send.extend(added);
+    Ok(())
+}
+
+/// The tag objects `include-tag` adds for `candidates` to a pack whose membership
+/// `in_pack` answers.
+///
+/// A candidate qualifies when its peeled object is in the pack and its tag is not;
+/// its whole chain (tag of a tag) is then returned, minus objects already packed.
+/// `in_pack` must be exact for candidate tags and peeled ids; for unnamed chain
+/// tags a `false` only means the caller has to deduplicate them.
+///
+/// # Errors
+///
+/// [`Error::ObjectNotFound`] or [`Error::CorruptObject`] for an unreadable tag in a
+/// qualifying chain.
+pub(crate) fn included_tag_chains(
+    odb: &Odb,
+    candidates: &[TagCandidate],
+    in_pack: impl Fn(&ObjectId) -> bool,
+) -> Result<Vec<ObjectId>> {
+    let mut seen = oid_hash_set();
+    let mut out = Vec::new();
+    for c in candidates {
+        if !in_pack(&c.peeled) || in_pack(&c.tag) {
+            continue;
+        }
+        let mut current = c.tag;
+        while current != c.peeled && seen.insert(current) {
+            if !in_pack(&current) {
+                out.push(current);
+            }
+            let tag = odb.read(&current)?;
+            current = tag_object_line_oid(&tag.data).ok_or_else(|| {
+                Error::CorruptObject(format!("tag {current} has no valid object header"))
+            })?;
+        }
+    }
+    Ok(out)
 }
 
 const SEND_PACK_REACH_WANT: u8 = 1;
@@ -336,6 +574,7 @@ fn send_pack_uninteresting_commits(
     wants: &[ObjectId],
     haves: &[ObjectId],
     shallow_grafts: &HashSet<ObjectId>,
+    stop: &CancelSignal<'_>,
 ) -> Result<HashSet<ObjectId>> {
     struct SendPackRevWalk<'a> {
         odb: &'a Odb,
@@ -412,6 +651,12 @@ fn send_pack_uninteresting_commits(
                         self.queue_from_graph(oid);
                     }
                     return Ok(());
+                }
+                // A want is often a blob (a lazy fetch names thousands): the header
+                // says so without inflating it.
+                match self.odb.read_info(&oid) {
+                    Ok(info) if matches!(info.kind, ObjectKind::Commit | ObjectKind::Tag) => {}
+                    _ => return Ok(()),
                 }
                 let Ok(obj) = self.odb.read(&oid) else {
                     return Ok(());
@@ -518,6 +763,7 @@ fn send_pack_uninteresting_commits(
     }
 
     while let Some(commit) = walk.heap.pop() {
+        stop.poll()?;
         walk.on_heap.remove(&commit.oid);
         if send_pack_reach_interesting(*walk.reach.get(&commit.oid).unwrap_or(&0)) {
             walk.interesting_on_heap -= 1;
@@ -552,10 +798,12 @@ fn commits_reachable_from_haves(
     haves: &[ObjectId],
     shallow_grafts: &HashSet<ObjectId>,
     skip_missing: bool,
+    stop: &CancelSignal<'_>,
 ) -> Result<HashSet<ObjectId>> {
     let mut seen = HashSet::new();
     let mut queue: VecDeque<ObjectId> = haves.iter().copied().collect();
     while let Some(oid) = queue.pop_front() {
+        stop.poll()?;
         if !seen.insert(oid) {
             continue;
         }
@@ -622,7 +870,7 @@ fn try_peer_held_bitmap(
     haves: &[ObjectId],
     opts: &PackEnumerateOptions<'_>,
 ) -> Result<Option<Arc<ReachableSet>>> {
-    if haves.is_empty() || !opts.use_bitmaps {
+    if haves.is_empty() || !opts.use_bitmaps || opts.has_shallow_grafts() {
         return Ok(None);
     }
     let Some(peer) = try_bitmap_peer_held(odb, haves, opts.shallow_grafts)? else {
@@ -673,8 +921,11 @@ fn rev_list_filtered_objects(
     haves: &[ObjectId],
     filter: &ObjectFilter,
     have_commits: &HashSet<ObjectId>,
+    missing_mode: MissingBlobMode,
+    stop: &CancelSignal<'_>,
 ) -> Result<(Vec<ObjectId>, HashMap<ObjectId, u32>)> {
     let _ = have_commits;
+    stop.poll()?;
     let Some(git_dir) = odb.config_git_dir() else {
         return Ok((Vec::new(), HashMap::new()));
     };
@@ -683,12 +934,18 @@ fn rev_list_filtered_objects(
     let haves: Vec<String> = haves.iter().map(ObjectId::to_hex).collect();
     let opts = crate::rev_list::RevListOptions {
         objects: true,
-        no_object_names: true,
+        no_object_names: false,
         quiet: true,
         filter: Some(filter.clone()),
+        cancel_watch: Some(stop.watch_arc()),
+        missing_action: match missing_mode {
+            MissingBlobMode::Fail => MissingAction::Error,
+            MissingBlobMode::Probe => MissingAction::Allow,
+        },
         ..Default::default()
     };
     let result = crate::rev_list::rev_list(&repo, &wants, &haves, &opts)?;
+    stop.poll()?;
     let mut ordered = Vec::new();
     let mut seen = HashSet::new();
     for oid in result
@@ -700,7 +957,15 @@ fn rev_list_filtered_objects(
             ordered.push(*oid);
         }
     }
-    Ok((ordered, HashMap::new()))
+    let mut name_hashes = HashMap::new();
+    for (oid, path) in &result.objects {
+        if !path.is_empty() {
+            name_hashes
+                .entry(*oid)
+                .or_insert_with(|| pack_name_hash(path));
+        }
+    }
+    Ok((ordered, name_hashes))
 }
 
 /// Walk objects reachable from `roots`, with the path name hash of every blob
@@ -721,7 +986,9 @@ fn rev_list_filtered_objects(
 /// tree. Trees whose entries cannot pass are not read, and blob sizes are only looked
 /// up for `blob:limit`.
 ///
-#[allow(clippy::type_complexity, clippy::too_many_arguments)]
+/// With [`MissingBlobMode::Probe`], blobs the repository does not store are not
+/// listed but returned in [`WalkedObjects::missing`].
+#[allow(clippy::too_many_arguments)]
 fn collect_reachable_excluding_with_name_hashes(
     odb: &Odb,
     roots: &[ObjectId],
@@ -729,11 +996,14 @@ fn collect_reachable_excluding_with_name_hashes(
     boundary: &mut HashSet<ObjectId>,
     have_commits: &HashSet<ObjectId>,
     peer_odb: Option<&Odb>,
+    alternate_sources: Option<Arc<CompositeStore>>,
     skip_missing: bool,
     shallow_grafts: &HashSet<ObjectId>,
     filter: Option<&ObjectFilter>,
     name_trees: NameTrees,
-) -> Result<(Vec<ObjectId>, HashMap<ObjectId, u32>, HashSet<ObjectId>)> {
+    missing_mode: MissingBlobMode,
+    stop: &CancelSignal<'_>,
+) -> Result<WalkedObjects> {
     let oid_len = odb.hash_algo().len();
     let mut walk = EnumerationWalk {
         odb,
@@ -741,6 +1011,7 @@ fn collect_reachable_excluding_with_name_hashes(
         boundary,
         have_commits,
         peer_odb,
+        alternate_sources,
         skip_missing,
         filter,
         depth_sensitive: filter.is_some_and(ObjectFilter::is_depth_sensitive),
@@ -754,6 +1025,7 @@ fn collect_reachable_excluding_with_name_hashes(
         queue: VecDeque::new(),
         name_hashes: HashMap::new(),
         edges: HashSet::new(),
+        missing: (missing_mode == MissingBlobMode::Probe).then(Vec::new),
     };
     // Commit root trees the filter drops, even where a root or tag names them.
     let mut dropped_root_trees: Option<OidHashSet> = filter
@@ -772,6 +1044,7 @@ fn collect_reachable_excluding_with_name_hashes(
     let mut path_less_roots = path_less_roots.into_iter();
 
     loop {
+        stop.poll()?;
         if let Some(commit) = walk.commits.pop() {
             if !shallow_grafts.contains(&commit.oid) {
                 for parent in commit.parents {
@@ -793,6 +1066,14 @@ fn collect_reachable_excluding_with_name_hashes(
                 None => break,
             }
         };
+        // Queued blobs are wanted directly (a lazy fetch names thousands); the
+        // header says there is nothing to walk without inflating them.
+        match odb.read_info(&oid) {
+            Ok(info) if info.kind == ObjectKind::Blob => continue,
+            Ok(_) => {}
+            Err(_) if skip_missing => continue,
+            Err(e) => return Err(e),
+        }
         let obj = match odb.read(&oid) {
             Ok(o) => o,
             Err(_) if skip_missing => continue,
@@ -816,9 +1097,9 @@ fn collect_reachable_excluding_with_name_hashes(
                     // non-canonical permission bits, is read so the object's own
                     // kind decides whether it is walked.
                     match entry.mode & 0o170000 {
-                        0o120000 => walk.push_blob(entry.oid, None, depth)?,
+                        0o120000 => walk.push_blob(entry.oid, None, oid, depth)?,
                         0o100000 => {
-                            walk.push_blob(entry.oid, Some((&path, entry.name)), depth)?;
+                            walk.push_blob(entry.oid, Some((&path, entry.name)), oid, depth)?;
                         }
                         file_type => {
                             let child_path = child_path(&path, entry.name);
@@ -842,7 +1123,24 @@ fn collect_reachable_excluding_with_name_hashes(
     if let Some(dropped) = dropped_root_trees.filter(|d| !d.is_empty()) {
         walk.ordered.retain(|oid| !dropped.contains(oid));
     }
-    Ok((walk.ordered, walk.name_hashes, walk.edges))
+    Ok(WalkedObjects {
+        send: walk.ordered,
+        name_hashes: walk.name_hashes,
+        edges: walk.edges,
+        missing: walk.missing.unwrap_or_default(),
+    })
+}
+
+/// Result of [`collect_reachable_excluding_with_name_hashes`].
+struct WalkedObjects {
+    /// Objects to send, in pack order.
+    send: Vec<ObjectId>,
+    /// Pack name hash of each named object.
+    name_hashes: HashMap<ObjectId, u32>,
+    /// Have-side commits the walk stopped at.
+    edges: HashSet<ObjectId>,
+    /// Blobs left out because they are not stored ([`MissingBlobMode::Probe`] only).
+    missing: Vec<MissingBlob>,
 }
 
 fn child_path(parent: &str, name: &[u8]) -> String {
@@ -864,6 +1162,8 @@ struct EnumerationWalk<'a> {
     have_commits: &'a HashSet<ObjectId>,
     /// Objects already on the peer (local fetch): stop without listing.
     peer_odb: Option<&'a Odb>,
+    /// Alternate object directories (`repack -l` / `pack-objects --local`).
+    alternate_sources: Option<Arc<CompositeStore>>,
     skip_missing: bool,
     filter: Option<&'a ObjectFilter>,
     /// The filter's verdict for trees and blobs depends on where they are met.
@@ -888,6 +1188,8 @@ struct EnumerationWalk<'a> {
     name_hashes: HashMap<ObjectId, u32>,
     /// Have-side commits the walk stopped at (Git's edge commits).
     edges: HashSet<ObjectId>,
+    /// With [`MissingBlobMode::Probe`], blobs that would be listed but are not stored.
+    missing: Option<Vec<MissingBlob>>,
 }
 
 /// A commit waiting in [`EnumerationWalk::commits`], ordered newest first and,
@@ -934,6 +1236,13 @@ impl<'a> EnumerationWalk<'a> {
     }
 
     fn at_object_boundary(&self, oid: ObjectId) -> bool {
+        if self
+            .alternate_sources
+            .as_ref()
+            .is_some_and(|s| s.contains(&oid).unwrap_or(false))
+        {
+            return true;
+        }
         self.boundary.contains(&oid)
             || self
                 .peer_odb
@@ -989,6 +1298,17 @@ impl<'a> EnumerationWalk<'a> {
             return Ok(());
         }
         self.list(oid);
+        // Only a commit is read now; anything else (a blob want, say) is read, if at
+        // all, when the queue reaches it.
+        match self.odb.read_info(&oid) {
+            Ok(info) if info.kind != ObjectKind::Commit => {
+                self.queue.push_back((oid, String::new(), 0));
+                return Ok(());
+            }
+            Ok(_) => {}
+            Err(_) if self.skip_missing => return Ok(()),
+            Err(e) => return Err(e),
+        }
         match self.read(&oid)? {
             Some(obj) if obj.kind == ObjectKind::Commit => self.queue_commit(oid, obj),
             Some(_) => {
@@ -1105,6 +1425,7 @@ impl<'a> EnumerationWalk<'a> {
         &mut self,
         oid: ObjectId,
         name: Option<(&str, &[u8])>,
+        referrer: ObjectId,
         tree_depth: u64,
     ) -> Result<()> {
         if self.at_object_boundary(oid) {
@@ -1116,8 +1437,22 @@ impl<'a> EnumerationWalk<'a> {
         }
         let (passes, size_checked) = match self.filter {
             None => (true, false),
-            Some(filter) => self.blob_passes(filter, &oid, tree_depth)?,
+            // Missing (probe mode only): as in Git's filters, an object whose size
+            // cannot be read is not filtered out but reported missing.
+            Some(filter) => self
+                .blob_passes(filter, &oid, tree_depth)?
+                .unwrap_or((true, true)),
         };
+        if passes && self.missing.is_some() && !self.odb.contains(&oid)? {
+            self.visited.insert(oid);
+            if let Some(missing) = self.missing.as_mut() {
+                missing.push(MissingBlob {
+                    oid,
+                    referrer: Some(referrer),
+                });
+            }
+            return Ok(());
+        }
         if passes {
             self.visited.insert(oid);
             self.list(oid);
@@ -1133,22 +1468,38 @@ impl<'a> EnumerationWalk<'a> {
     }
 
     /// Whether the blob passes `filter`, and whether its size had to be looked up.
+    ///
+    /// `None` when the size was needed but the blob is not stored, which only
+    /// happens with [`MissingBlobMode::Probe`] (the size is read without a lazy
+    /// fetch there); otherwise a missing blob is an error, or with `skip_missing`
+    /// filtered out.
     fn blob_passes(
         &self,
         filter: &ObjectFilter,
         oid: &ObjectId,
         tree_depth: u64,
-    ) -> Result<(bool, bool)> {
+    ) -> Result<Option<(bool, bool)>> {
         // A smaller blob never fares worse, so the size only matters between the extremes.
         if !filter.includes_blob_under_tree(0, tree_depth) {
-            return Ok((false, false));
+            return Ok(Some((false, false)));
         }
         if filter.includes_blob_under_tree(u64::MAX, tree_depth) {
-            return Ok((true, false));
+            return Ok(Some((true, false)));
         }
-        match self.odb.read_info(oid) {
-            Ok(info) => Ok((filter.includes_blob_under_tree(info.size, tree_depth), true)),
-            Err(_) if self.skip_missing => Ok((false, true)),
+        let info = if self.missing.is_some() {
+            match self.odb.read_info_without_fetch(oid) {
+                Err(crate::error::Error::ObjectNotFound(_)) => return Ok(None),
+                other => other,
+            }
+        } else {
+            self.odb.read_info(oid)
+        };
+        match info {
+            Ok(info) => Ok(Some((
+                filter.includes_blob_under_tree(info.size, tree_depth),
+                true,
+            ))),
+            Err(_) if self.skip_missing => Ok(Some((false, true))),
             Err(e) => Err(e),
         }
     }
@@ -1179,6 +1530,8 @@ mod tests {
                 have_boundary: HaveBoundary::CommitClosure,
             },
             name_trees,
+            false,
+            &CancelSignal::never(),
         )
         .expect("walk")
     }
@@ -1338,6 +1691,7 @@ mod tests {
             &[new_tip],
             &[tip, tagged],
             &HashSet::new(),
+            &CancelSignal::never(),
         )
         .unwrap();
         assert!(hidden.contains(&tip));
@@ -1366,9 +1720,14 @@ mod tests {
             tip = write_commit(&repo, tree, &[tip], time);
         }
         reset_commit_reads();
-        let hidden =
-            send_pack_uninteresting_commits(repo.odb(), &[tip, tip], &[tip, tip], &HashSet::new())
-                .unwrap();
+        let hidden = send_pack_uninteresting_commits(
+            repo.odb(),
+            &[tip, tip],
+            &[tip, tip],
+            &HashSet::new(),
+            &CancelSignal::never(),
+        )
+        .unwrap();
         assert!(hidden.contains(&tip));
         assert!(
             commit_reads() <= 2,
@@ -1482,6 +1841,7 @@ mod tests {
             &[new_tip],
             &[direct_parent, near_root],
             &empty,
+            &CancelSignal::never(),
         )
         .expect("send-pack have walk");
         assert!(have_commits.contains(&direct_parent));
@@ -1714,6 +2074,7 @@ mod tests {
             &[new_tip],
             &[nested, tag, tree_tag, blob_tag, missing],
             &HashSet::new(),
+            &CancelSignal::never(),
         )
         .unwrap();
         assert!(hidden.contains(&tip), "tags peel to the commit they name");

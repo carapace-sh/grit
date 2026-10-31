@@ -3,14 +3,18 @@
 use crate::config::ConfigSet;
 use crate::diff_rename_parallel::parallel_map_indices;
 use crate::error::{Error, Result};
+use crate::merge_diff::{diff_attr_forces_text, diff_driver_forces_text, diff_textconv_active};
 use crate::objects::pack_store::PackReadContextGuard;
 use crate::objects::FileMode;
 use crate::objects::ObjectId;
+use crate::objects::ObjectKind;
+use crate::objects::OidHashSet;
 use crate::odb::Odb;
 use crate::parallel::run_ordered_batches;
 use crate::parallel::{try_par_map_with_local, ParallelHashError};
 use crate::parallel::{ParallelOp, ParallelOptions, ThreadPolicy};
 use std::num::NonZeroUsize;
+use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -23,6 +27,32 @@ fn note_blob_read(counter: Option<&AtomicUsize>) {
     if let Some(c) = counter {
         c.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+fn collect_tree_diff_blob_oids(entries: &[DiffEntry]) -> Vec<ObjectId> {
+    let mut set = OidHashSet::default();
+    for entry in entries {
+        if entry.old_mode != FileMode::GITLINK
+            && entry.old_mode != FileMode::ABSENT
+            && !entry.old_oid.is_zero()
+        {
+            set.insert(entry.old_oid);
+        }
+        if entry.new_mode != FileMode::GITLINK
+            && entry.new_mode != FileMode::ABSENT
+            && !entry.new_oid.is_zero()
+        {
+            set.insert(entry.new_oid);
+        }
+    }
+    set.into_iter().collect()
+}
+
+pub(crate) fn prefetch_tree_diff_blobs(odb: &Odb, entries: &[DiffEntry]) -> Result<()> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    odb.prefetch_promisor_read_batch(collect_tree_diff_blob_oids(entries))
 }
 
 /// Pool options for per-entry content work that should fan out whenever it can.
@@ -91,6 +121,7 @@ pub fn tree_diff_contents_parallel(
     if entries.is_empty() {
         return Ok(Vec::new());
     }
+    prefetch_tree_diff_blobs(odb, &entries)?;
     let mut par_opts = thread_policy.resolve(ParallelOp::DiffContent, config);
     par_opts.min_items = par_opts.min_items.min(8);
     let est_bytes = entries.len().saturating_mul(8192);
@@ -123,6 +154,7 @@ pub fn tree_diff_stat_parallel(
     if entries.is_empty() {
         return Ok(Vec::new());
     }
+    prefetch_tree_diff_blobs(odb, &entries)?;
     let par_opts = per_entry_parallel_options(thread_policy, config, entries.len());
     let line_diff_opts = diff_options;
     let blob_counter = line_diff_opts.blob_read_counter.clone();
@@ -247,6 +279,7 @@ pub fn for_each_tree_diff_structured(
     if entries.is_empty() {
         return Ok(());
     }
+    prefetch_tree_diff_blobs(odb, entries)?;
     let diff_options = diff_options.cap_word_level_inline_for_changed_files(entries.len());
     let par_opts = per_entry_parallel_options(thread_policy, config, entries.len());
     let n_workers = par_opts.threads.get();
@@ -288,6 +321,7 @@ pub fn tree_diff_structured_parallel(
     if entries.is_empty() {
         return Ok(Vec::new());
     }
+    prefetch_tree_diff_blobs(odb, &entries)?;
     let diff_options = diff_options.cap_word_level_inline_for_changed_files(entries.len());
     let par_opts = per_entry_parallel_options(thread_policy, config, entries.len());
     let line_diff_opts = diff_options;
@@ -305,7 +339,7 @@ pub fn tree_diff_structured_parallel(
     }
 }
 
-fn load_old_side(
+pub(crate) fn load_old_side(
     odb: &Odb,
     e: &DiffEntry,
     blob_reads: Option<&AtomicUsize>,
@@ -319,10 +353,11 @@ fn load_old_side(
     if e.old_mode == FileMode::ABSENT {
         return Ok((SideBytes::from_bytes(Vec::new()), false));
     }
-    blob_bytes(odb, &e.old_oid, blob_reads)
+    let path = e.old_path.as_deref().or(e.new_path.as_deref());
+    load_odb_blob_side_for_diff(odb, &e.old_oid, path, blob_reads, false)
 }
 
-fn load_new_side(
+pub(crate) fn load_new_side(
     odb: &Odb,
     e: &DiffEntry,
     blob_reads: Option<&AtomicUsize>,
@@ -336,30 +371,119 @@ fn load_new_side(
     if e.new_mode == FileMode::ABSENT {
         return Ok((SideBytes::from_bytes(Vec::new()), false));
     }
-    blob_bytes(odb, &e.new_oid, blob_reads)
+    let path = e.new_path.as_deref().or(e.old_path.as_deref());
+    load_odb_blob_side_for_diff(odb, &e.new_oid, path, blob_reads, false)
 }
 
-fn gitlink_line(oid: &ObjectId) -> String {
+/// Text a gitlink side contributes to a patch: `Subproject commit <hex>\n`,
+/// or nothing for the zero id (an absent side).
+pub(crate) fn gitlink_line(oid: &ObjectId) -> String {
     if *oid == ObjectId::zero() {
         return String::new();
     }
     format!("Subproject commit {}\n", oid.to_hex())
 }
 
-fn blob_bytes(
+fn git_dir_for_diff(odb: &Odb) -> Option<&Path> {
+    odb.config_git_dir().or_else(|| odb.objects_dir().parent())
+}
+
+/// True when a path's attributes or textconv require reading a blob above
+/// [`Odb::big_file_threshold`](crate::objects::odb::Odb::big_file_threshold).
+fn diff_side_must_read_large_blob(odb: &Odb, path: &str) -> Result<bool> {
+    let Some(git_dir) = git_dir_for_diff(odb) else {
+        return Ok(false);
+    };
+    if diff_attr_forces_text(git_dir, path) {
+        return Ok(true);
+    }
+    let config = crate::config::ConfigSet::load(
+        &crate::environment::Environment::empty(),
+        Some(git_dir),
+        true,
+    )?;
+    if diff_textconv_active(git_dir, &config, path) {
+        return Ok(true);
+    }
+    Ok(diff_driver_forces_text(git_dir, &config, path))
+}
+
+/// Whether a blob/worktree side at `size` bytes should be treated as binary without reading
+/// content (Git `diff_populate_filespec`; strict `>` on `core.bigFileThreshold`).
+pub(crate) fn treat_side_as_binary_without_reading(
+    odb: &Odb,
+    size: u64,
+    path: Option<&str>,
+    force_read_content: bool,
+) -> Result<bool> {
+    if force_read_content || size == 0 {
+        return Ok(false);
+    }
+    let threshold = odb.big_file_threshold()?;
+    if size <= threshold {
+        return Ok(false);
+    }
+    if let Some(path) = path {
+        if diff_side_must_read_large_blob(odb, path)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Classify blob bytes for diffing after inflation.
+///
+/// When `retain_binary_payload` is false, binary sides drop payload bytes (line diffs stay lean).
+/// When true (patch-text / `--binary` emission), payload is kept and `binary` is still set.
+pub(crate) fn side_bytes_after_blob_read(
+    data: Vec<u8>,
+    retain_binary_payload: bool,
+) -> (SideBytes, bool) {
+    let binary = data.iter().take(8000).any(|&b| b == 0);
+    if binary && !retain_binary_payload {
+        (SideBytes::from_bytes(Vec::new()), true)
+    } else {
+        (SideBytes::from_bytes(data), binary)
+    }
+}
+
+/// Load ODB blob bytes for diffing, skipping inflation when over `core.bigFileThreshold`.
+///
+/// Returns empty [`SideBytes`] with `binary = true` when content is not read. When
+/// `force_read_content` is true, large blobs are inflated and binary payload bytes are retained
+/// (for `GIT binary patch` / `git apply`).
+///
+/// # Errors
+///
+/// Propagates object database and config errors.
+pub fn load_odb_blob_side_for_diff(
     odb: &Odb,
     oid: &ObjectId,
+    path: Option<&str>,
     blob_reads: Option<&AtomicUsize>,
+    force_read_content: bool,
 ) -> Result<(SideBytes, bool)> {
     if *oid == ObjectId::zero() {
         return Ok((SideBytes::from_bytes(Vec::new()), false));
     }
+    if !force_read_content {
+        let info = odb.read_info(oid)?;
+        if info.kind == ObjectKind::Blob
+            && treat_side_as_binary_without_reading(odb, info.size, path, false)?
+        {
+            return Ok((SideBytes::from_bytes(Vec::new()), true));
+        }
+    }
     note_blob_read(blob_reads);
+    #[cfg(test)]
+    odb.hot_path_metrics().record_blob_content_read();
     let data = odb.read(oid)?.data;
-    Ok(bytes_for_diff(data))
+    Ok(side_bytes_after_blob_read(data, force_read_content))
 }
 
-fn bytes_for_diff(data: Vec<u8>) -> (SideBytes, bool) {
+/// Classify raw blob bytes for line diffs (NUL in the first 8 KiB ⇒ binary).
+#[must_use]
+pub fn bytes_for_diff(data: Vec<u8>) -> (SideBytes, bool) {
     if data.iter().take(8000).any(|&b| b == 0) {
         (SideBytes::from_bytes(Vec::new()), true)
     } else {
@@ -379,6 +503,13 @@ mod tests {
     fn init_repo() -> (tempfile::TempDir, Repository) {
         let dir = tempfile::tempdir().expect("tempdir");
         let repo = Repository::init(dir.path(), &InitOptions::default()).expect("init");
+        (dir, repo)
+    }
+
+    fn init_repo_with_core_config(snippet: &str) -> (tempfile::TempDir, Repository) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = Repository::init(dir.path(), &InitOptions::default()).expect("init");
+        std::fs::write(repo.git_dir().join("config"), snippet).expect("config");
         (dir, repo)
     }
 
@@ -493,6 +624,198 @@ mod tests {
             opts.threads,
             policy.resolve(ParallelOp::DiffContent, &config).threads
         );
+    }
+
+    #[test]
+    fn big_file_threshold_honors_diff_driver_binary_false() -> Result<()> {
+        let (dir, repo) = init_repo_with_core_config(
+            "[core]\n\tbigFileThreshold = 4k\n\n[diff \"foo\"]\n\tbinary = false\n",
+        );
+        std::fs::write(dir.path().join(".gitattributes"), "*.bin diff=foo\n")?;
+        let odb = repo.odb();
+        let mut old_body = vec![b'a'; 100];
+        old_body.extend(std::iter::repeat_n(b'x', 4900));
+        assert_eq!(old_body.len(), 5000);
+        let mut new_body = old_body.clone();
+        new_body[0] = b'b';
+        let old_oid = odb.write(ObjectKind::Blob, &old_body)?;
+        let new_oid = odb.write(ObjectKind::Blob, &new_body)?;
+        let tree_old = odb.write(
+            ObjectKind::Tree,
+            &serialize_tree(&[TreeEntry {
+                mode: 0o100644,
+                name: b"a.bin".to_vec(),
+                oid: old_oid,
+            }]),
+        )?;
+        let tree_new = odb.write(
+            ObjectKind::Tree,
+            &serialize_tree(&[TreeEntry {
+                mode: 0o100644,
+                name: b"a.bin".to_vec(),
+                oid: new_oid,
+            }]),
+        )?;
+        let entries = diff_trees(odb, Some(&tree_old), Some(&tree_new), "")?;
+        assert_eq!(entries.len(), 1);
+        let metrics = odb.hot_path_metrics();
+        metrics.set_blob_counting(true);
+        metrics.reset_blob_content_reads();
+        let structured = tree_diff_structured_entry(odb, &entries[0], &DiffOptions::default())?;
+        metrics.set_blob_counting(false);
+        assert!(
+            !structured.binary,
+            "diff.foo.binary=false must force a textual diff"
+        );
+        assert!(
+            !structured.structured.hunks.is_empty(),
+            "expected unified hunks, not binary short-circuit"
+        );
+        assert!(
+            metrics.blob_content_reads() >= 2,
+            "both sides must be read for a line diff"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn tree_diff_skips_reading_blobs_over_big_file_threshold() {
+        let (_dir, repo) = init_repo_with_core_config("[core]\n\tbigFileThreshold = 4k\n");
+        let odb = repo.odb();
+
+        let big_a = odb
+            .write(ObjectKind::Blob, &vec![b'a'; 5000])
+            .expect("big blob a");
+        let big_b = odb
+            .write(ObjectKind::Blob, &vec![b'b'; 5001])
+            .expect("big blob b");
+        let tree_old = odb
+            .write(
+                ObjectKind::Tree,
+                &serialize_tree(&[TreeEntry {
+                    mode: 0o100644,
+                    name: b"f.bin".to_vec(),
+                    oid: big_a,
+                }]),
+            )
+            .expect("old tree");
+        let tree_new = odb
+            .write(
+                ObjectKind::Tree,
+                &serialize_tree(&[TreeEntry {
+                    mode: 0o100644,
+                    name: b"f.bin".to_vec(),
+                    oid: big_b,
+                }]),
+            )
+            .expect("new tree");
+        let entries = diff_trees(odb, Some(&tree_old), Some(&tree_new), "").expect("entries");
+        let metrics = odb.hot_path_metrics();
+        metrics.set_blob_counting(true);
+        metrics.reset_blob_content_reads();
+        let config = repo.config().expect("config");
+        let _ = tree_diff_stat_parallel(
+            odb,
+            entries,
+            &config,
+            &ThreadPolicy::default(),
+            DiffOptions::default(),
+        )
+        .expect("stat");
+        metrics.set_blob_counting(false);
+        assert_eq!(metrics.blob_content_reads(), 0);
+    }
+
+    #[test]
+    fn blob_at_exactly_big_file_threshold_is_still_read() {
+        let (_dir, repo) = init_repo_with_core_config("[core]\n\tbigFileThreshold = 4k\n");
+        let odb = repo.odb();
+
+        let at_threshold = odb
+            .write(ObjectKind::Blob, &vec![b'b'; 4096])
+            .expect("at threshold");
+        let other = odb.write(ObjectKind::Blob, b"z\n").expect("other");
+        let tree_old = odb
+            .write(
+                ObjectKind::Tree,
+                &serialize_tree(&[TreeEntry {
+                    mode: 0o100644,
+                    name: b"g.bin".to_vec(),
+                    oid: other,
+                }]),
+            )
+            .expect("old tree");
+        let tree_new = odb
+            .write(
+                ObjectKind::Tree,
+                &serialize_tree(&[TreeEntry {
+                    mode: 0o100644,
+                    name: b"g.bin".to_vec(),
+                    oid: at_threshold,
+                }]),
+            )
+            .expect("new tree");
+        let entries = diff_trees(odb, Some(&tree_old), Some(&tree_new), "").expect("entries");
+        let metrics = odb.hot_path_metrics();
+        metrics.set_blob_counting(true);
+        metrics.reset_blob_content_reads();
+        let config = repo.config().expect("config");
+        let _ = tree_diff_stat_parallel(
+            odb,
+            entries,
+            &config,
+            &ThreadPolicy::default(),
+            DiffOptions::default(),
+        )
+        .expect("stat");
+        metrics.set_blob_counting(false);
+        assert!(metrics.blob_content_reads() >= 1);
+    }
+
+    #[test]
+    fn blob_under_big_file_threshold_is_read_for_stat() {
+        let (_dir, repo) = init_repo_with_core_config("[core]\n\tbigFileThreshold = 4k\n");
+        let odb = repo.odb();
+
+        let under = odb
+            .write(ObjectKind::Blob, &vec![b'c'; 4000])
+            .expect("under");
+        let other = odb.write(ObjectKind::Blob, b"x\n").expect("other");
+        let tree_a = odb
+            .write(
+                ObjectKind::Tree,
+                &serialize_tree(&[TreeEntry {
+                    mode: 0o100644,
+                    name: b"h.bin".to_vec(),
+                    oid: other,
+                }]),
+            )
+            .expect("tree a");
+        let tree_b = odb
+            .write(
+                ObjectKind::Tree,
+                &serialize_tree(&[TreeEntry {
+                    mode: 0o100644,
+                    name: b"h.bin".to_vec(),
+                    oid: under,
+                }]),
+            )
+            .expect("tree b");
+        let entries = diff_trees(odb, Some(&tree_a), Some(&tree_b), "").expect("entries");
+        let metrics = odb.hot_path_metrics();
+        metrics.set_blob_counting(true);
+        metrics.reset_blob_content_reads();
+        let config = repo.config().expect("config");
+        let _ = tree_diff_stat_parallel(
+            odb,
+            entries,
+            &config,
+            &ThreadPolicy::default(),
+            DiffOptions::default(),
+        )
+        .expect("stat");
+        metrics.set_blob_counting(false);
+        assert!(metrics.blob_content_reads() >= 2);
     }
 
     #[test]

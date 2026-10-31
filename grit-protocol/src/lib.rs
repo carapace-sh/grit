@@ -183,7 +183,36 @@ pub(crate) fn run_upload_pack(
     repository_options: &RepositoryOptions,
     extensions: &Extensions,
 ) -> Result<Vec<u8>> {
-    let repo = Repository::open(repo_path, &repository_options.clone().for_serving())?;
+    let mut output = Vec::new();
+    run_upload_pack_to(
+        repo_path,
+        protocol_version,
+        stateless_rpc,
+        advertise_refs,
+        input,
+        repository_options,
+        extensions,
+        &mut output,
+    )?;
+    Ok(output)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_upload_pack_to(
+    repo_path: &Path,
+    protocol_version: Option<u8>,
+    stateless_rpc: bool,
+    advertise_refs: bool,
+    input: &[u8],
+    repository_options: &RepositoryOptions,
+    extensions: &Extensions,
+    output: &mut dyn std::io::Write,
+) -> Result<()> {
+    let without_fetcher = repository_options
+        .clone()
+        .with_promisor_fetcher(None)
+        .for_serving();
+    let repo = Repository::open(repo_path, &without_fetcher)?;
     let config =
         ConfigSet::load(repo.environment(), Some(repo.git_dir()), true).unwrap_or_default();
     let hidden_refs = grit_lib::refs::hide_refs::hide_ref_patterns_uploadpack(&config);
@@ -195,11 +224,14 @@ pub(crate) fn run_upload_pack(
         hidden_refs,
         bundle_list: extensions.bundle_list.clone(),
         push_bundle: None,
+        lazy_fetch: ServeOptions::lazy_fetch_from_environment(repo.environment()),
         ..ServeOptions::default()
     };
-    let mut output = Vec::new();
-    serve::upload_pack(&repo, &mut &*input, &mut output, &mut opts)?;
-    Ok(output)
+    // The promisor fetcher in `repository_options` is used only when this request may
+    // fetch missing promised objects; otherwise the served repository fetches nothing.
+    opts.attach_promisor_fetcher(&repo, &config, repository_options.promisor_fetcher.clone());
+    let _summary = serve::upload_pack(&repo, &mut &*input, output, &mut opts)?;
+    Ok(())
 }
 
 pub(crate) fn run_receive_pack(
@@ -210,7 +242,11 @@ pub(crate) fn run_receive_pack(
     repository_options: &RepositoryOptions,
     extensions: &Extensions,
 ) -> Result<Vec<u8>> {
-    let repo = Repository::open(repo_path, &repository_options.clone().for_serving())?;
+    let options = repository_options
+        .clone()
+        .with_promisor_fetcher(None)
+        .for_serving();
+    let repo = Repository::open(repo_path, &options)?;
     let config =
         ConfigSet::load(repo.environment(), Some(repo.git_dir()), true).unwrap_or_default();
     let hidden_refs = grit_lib::refs::hide_refs::hide_ref_patterns_receive(&config);

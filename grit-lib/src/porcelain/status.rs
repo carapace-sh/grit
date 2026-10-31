@@ -6,19 +6,12 @@
 //! path quoting, and the comment prefix). This is the reference example of the
 //! library/CLI split described on [`crate::porcelain`].
 //!
-//! # Status of the extraction
-//!
-//! This module currently defines the data contract ([`StatusOptions`] in,
-//! [`StatusModel`] out). The computation that produces the model is being moved
-//! out of `grit/src/commands/status.rs::run` in stages; once it lands here as
-//! [`status`], the three CLI formatters (`format_porcelain_v2`, `format_short`,
-//! `format_long`) consume a `&StatusModel` instead of a dozen loose arguments.
-//!
-//! The model's shape is taken directly from the inputs those three formatters
-//! share today: HEAD + its tree, the staged (index-vs-HEAD) and unstaged
-//! (index-vs-worktree) diffs, the untracked and ignored path lists, the
-//! in-progress operation [`state`](crate::state::WtStatusState), the loaded and
-//! sparse-expanded index, and the stash count.
+//! [`status`] computes the model from [`StatusOptions`]: HEAD and its tree, the
+//! staged (index-vs-HEAD) and unstaged (index-vs-worktree) diffs, the untracked
+//! and ignored path lists, the in-progress operation
+//! [`state`](crate::state::WtStatusState), the loaded and sparse-expanded index,
+//! and the stash count. [`short_status_lines`] derives the two-column short form
+//! from it, and [`format_porcelain_v2`] renders Git's porcelain v2 lines.
 
 use crate::git_path::CanonicalizeExt;
 use std::borrow::Cow;
@@ -80,6 +73,19 @@ pub struct RenameDetection {
     pub copies: bool,
 }
 
+/// Test hook type so [`StatusOptions`] stays `Debug`/`Clone`.
+#[derive(Clone)]
+#[doc(hidden)]
+pub struct BeforeOpportunisticIndexWriteHook(
+    #[doc(hidden)] pub std::sync::Arc<dyn Fn() + Send + Sync>,
+);
+
+impl std::fmt::Debug for BeforeOpportunisticIndexWriteHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<before_opportunistic_index_write>")
+    }
+}
+
 /// Inputs that drive **what** `status` computes.
 ///
 /// The CLI translates clap arguments and config (`status.showUntrackedFiles`,
@@ -111,6 +117,14 @@ pub struct StatusOptions {
     pub now_unix_seconds: Option<i64>,
     /// When `true`, count entries on `refs/stash` (reads the stash reflog).
     pub count_stash: bool,
+    /// When `false`, stat refresh and untracked-cache updates stay in memory only: `.git/index`
+    /// is not rewritten and interrupted rewrite recovery is not attempted. Embedders that need
+    /// read-only status (for example when `GIT_OPTIONAL_LOCKS=0`) set this to `false`; the
+    /// default is `true`.
+    pub write_index: bool,
+    /// Test hook invoked immediately before an opportunistic index write (deterministic races).
+    #[doc(hidden)]
+    pub before_opportunistic_index_write: Option<BeforeOpportunisticIndexWriteHook>,
 }
 
 /// Map `status.showUntrackedFiles` to [`UntrackedMode`].
@@ -161,6 +175,8 @@ impl Default for StatusOptions {
             fsmonitor_query_boundary: None,
             now_unix_seconds: None,
             count_stash: false,
+            write_index: true,
+            before_opportunistic_index_write: None,
         }
     }
 }
@@ -240,9 +256,7 @@ fn config_for_status_rename_detection(config: &ConfigSet) -> ConfigSet {
 /// The computed result of `git status`: everything the renderers need, with no
 /// presentation applied.
 ///
-/// Fields mirror what the CLI's `format_porcelain_v2`, `format_short`, and
-/// `format_long` read today, so a renderer can be a pure function of this model
-/// plus the user's chosen output format.
+/// A renderer is a pure function of this model plus the chosen output format.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde-models", derive(serde::Serialize))]
 pub struct StatusModel {
@@ -252,8 +266,8 @@ pub struct StatusModel {
     pub head_tree: Option<ObjectId>,
     /// In-progress operation state (merge, rebase, cherry-pick, bisect, …).
     pub state: WtStatusState,
-    /// The loaded index, with sparse-directory placeholders expanded — the same
-    /// index the renderers query for per-stage entries. Not serialized: the
+    /// The loaded index (sparse-directory placeholders stay collapsed unless a
+    /// pathspec required expanding them). Not serialized: the
     /// per-path results are in the other fields.
     #[cfg_attr(feature = "serde-models", serde(skip))]
     pub index: Index,
@@ -269,7 +283,8 @@ pub struct StatusModel {
     pub conflicts: Vec<String>,
     /// Unmerged paths with a [`ConflictKind`] derived from index stages 1–3.
     ///
-    /// Never [`ConflictKind::RenameRename`]: the index does not record rename pairings.
+    /// Never [`ConflictKind::RenameRename`] or a directory rename kind: the index does not
+    /// record rename pairings.
     pub conflict_details: Vec<Conflict>,
     /// Paused operation and suggested follow-up steps, when any apply.
     pub operation: Option<Operation>,
@@ -516,6 +531,7 @@ pub fn collect_untracked_and_ignored_with_cache(
             sort_paths: true,
             use_untracked_cache,
             cache_miss: UntrackedCacheMissAction::RefreshFull,
+            clean_unit_dirs: None,
         },
         &rules,
         None,
@@ -567,6 +583,7 @@ pub(crate) fn count_unstaged_and_untracked_paths(
             sort_paths: true,
             use_untracked_cache: false,
             cache_miss: UntrackedCacheMissAction::RefreshFull,
+            clean_unit_dirs: None,
         },
         &worktree_rules,
         None,
@@ -576,29 +593,7 @@ pub(crate) fn count_unstaged_and_untracked_paths(
 
 /// Like [`collect_untracked_and_ignored`], reusing an existing
 /// [`crate::worktree_rules::WorktreeRules`] so ignore and attribute files already loaded by the
-/// same operation are not read again.
-pub fn collect_untracked_and_ignored_with_rules(
-    repo: &Repository,
-    index: &mut Index,
-    work_tree: &Path,
-    ignored_mode: IgnoredMode,
-    show_all: bool,
-    pathspecs: &[String],
-    rules: &crate::worktree_rules::WorktreeRules,
-) -> Result<(Vec<String>, Vec<String>, UntrackedCollectMeta)> {
-    collect_untracked_and_ignored_with_rules_and_cancel(
-        repo,
-        index,
-        work_tree,
-        ignored_mode,
-        show_all,
-        pathspecs,
-        rules,
-        None,
-    )
-}
-
-/// Like [`collect_untracked_and_ignored_with_rules`], checking `cancel` during the walk.
+/// same operation are not read again, and checking `cancel_watch` during the walk.
 #[allow(clippy::too_many_arguments)]
 pub fn collect_untracked_and_ignored_with_rules_and_cancel(
     repo: &Repository,
@@ -621,6 +616,7 @@ pub fn collect_untracked_and_ignored_with_rules_and_cancel(
             sort_paths: true,
             use_untracked_cache: true,
             cache_miss: UntrackedCacheMissAction::RefreshFull,
+            clean_unit_dirs: None,
         },
         rules,
         cancel_watch,
@@ -636,7 +632,7 @@ pub(crate) enum UntrackedCacheMissAction {
 }
 
 /// How [`collect_untracked_and_ignored_inner`] walks and reports the work tree.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct UntrackedScan {
     /// Whether (and how) ignored paths are reported.
     pub ignored_mode: IgnoredMode,
@@ -648,18 +644,47 @@ pub(crate) struct UntrackedScan {
     pub use_untracked_cache: bool,
     /// How to recover when [`UntrackedScan::use_untracked_cache`] cannot answer from cache.
     pub cache_miss: UntrackedCacheMissAction,
+    /// When set, collapsed directories safe for `git clean` without rescanning are recorded here.
+    pub clean_unit_dirs: CleanUnitDirHints,
+}
+
+/// Collapsed directory paths (`dir/`) that need no second walk for `clean` dry-run.
+pub(crate) type CleanUnitDirHints = Option<Arc<Mutex<HashSet<String>>>>;
+
+fn record_clean_unit_dir(hints: &CleanUnitDirHints, rel: &str) {
+    let Some(set) = hints else {
+        return;
+    };
+    if rel.is_empty() {
+        return;
+    }
+    if let Ok(mut guard) = set.lock() {
+        guard.insert(if rel.ends_with('/') {
+            rel.to_owned()
+        } else {
+            format!("{rel}/")
+        });
+    }
+}
+
+fn take_clean_unit_dirs(hints: &CleanUnitDirHints) -> HashSet<String> {
+    hints
+        .as_ref()
+        .and_then(|set| set.lock().ok())
+        .map(|guard| guard.clone())
+        .unwrap_or_default()
 }
 
 /// Side effects from an untracked/ignored walk beyond the path lists.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct UntrackedCollectMeta {
     /// The index UNTR extension was rebuilt and should be written to disk.
     pub untracked_cache_refreshed: bool,
+    /// Collapsed untracked/ignored directories removable as a unit by `clean`.
+    pub clean_collapsed_unit: HashSet<String>,
 }
 
-fn poll_untracked_cancel(
-    watch: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
-) -> Result<()> {
+fn poll_untracked_cancel(watch: Option<&std::sync::atomic::AtomicBool>) -> Result<()> {
     if let Some(flag) = watch {
         crate::progress::poll_watch(flag)?;
     }
@@ -676,14 +701,16 @@ pub(crate) fn collect_untracked_and_ignored_inner(
     rules: &crate::worktree_rules::WorktreeRules,
     cancel_watch: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<(Vec<String>, Vec<String>, UntrackedCollectMeta)> {
-    poll_untracked_cancel(cancel_watch.as_ref())?;
+    poll_untracked_cancel(cancel_watch.as_deref())?;
     let UntrackedScan {
         ignored_mode,
         show_all,
         sort_paths,
         use_untracked_cache,
         cache_miss,
+        clean_unit_dirs,
     } = scan;
+    let clean_unit_dirs = &clean_unit_dirs;
     // Keep parity with historical status behavior in tests that rely on broad untracked scans
     // (including detached-HEAD wtstatus cases): when no explicit pathspec is requested, avoid
     // pathspec-based pruning entirely.
@@ -711,7 +738,7 @@ pub(crate) fn collect_untracked_and_ignored_inner(
                     return Ok((untracked, Vec::new(), UntrackedCollectMeta::default()));
                 }
                 if cache_miss == UntrackedCacheMissAction::RefreshFull {
-                    poll_untracked_cancel(cancel_watch.as_ref())?;
+                    poll_untracked_cancel(cancel_watch.as_deref())?;
                     crate::untracked_cache::refresh_untracked_cache_for_status(
                         repo,
                         index,
@@ -722,7 +749,7 @@ pub(crate) fn collect_untracked_and_ignored_inner(
                         ignored_mode_to_untracked_cache(ignored_mode),
                         cancel_watch.as_deref(),
                     )?;
-                    poll_untracked_cancel(cancel_watch.as_ref())?;
+                    poll_untracked_cancel(cancel_watch.as_deref())?;
                     let untracked = crate::untracked_cache::collect_untracked_from_cache(&uc);
                     index.untracked_cache = Some(uc);
                     return Ok((
@@ -730,6 +757,7 @@ pub(crate) fn collect_untracked_and_ignored_inner(
                         Vec::new(),
                         UntrackedCollectMeta {
                             untracked_cache_refreshed: true,
+                            ..UntrackedCollectMeta::default()
                         },
                     ));
                 }
@@ -755,7 +783,7 @@ pub(crate) fn collect_untracked_and_ignored_inner(
         effective_core_precomposeunicode_with_config(Some(repo.git_dir()), Some(rules.config()));
 
     if effective_pathspecs.is_empty() {
-        poll_untracked_cancel(cancel_watch.as_ref())?;
+        poll_untracked_cancel(cancel_watch.as_deref())?;
         let (mut par_untracked, mut par_ignored) = collect_untracked_parallel_top_level(
             repo,
             index,
@@ -768,16 +796,24 @@ pub(crate) fn collect_untracked_and_ignored_inner(
             &rules.ignore(),
             rules.config(),
             effective_pathspecs,
-            cancel_watch.clone(),
+            cancel_watch.as_deref(),
+            clean_unit_dirs,
         )?;
         if sort_paths {
             par_untracked.sort_unstable();
             par_ignored.sort_unstable();
         }
-        return Ok((par_untracked, par_ignored, UntrackedCollectMeta::default()));
+        return Ok((
+            par_untracked,
+            par_ignored,
+            UntrackedCollectMeta {
+                clean_collapsed_unit: take_clean_unit_dirs(clean_unit_dirs),
+                ..UntrackedCollectMeta::default()
+            },
+        ));
     }
 
-    poll_untracked_cancel(cancel_watch.as_ref())?;
+    poll_untracked_cancel(cancel_watch.as_deref())?;
     visit_untracked_node(
         repo,
         index,
@@ -796,14 +832,22 @@ pub(crate) fn collect_untracked_and_ignored_inner(
         Some(rules),
         &mut untracked,
         &mut ignored,
-        cancel_watch,
+        cancel_watch.as_deref(),
+        clean_unit_dirs,
     )?;
 
     if sort_paths {
         untracked.sort();
         ignored.sort();
     }
-    Ok((untracked, ignored, UntrackedCollectMeta::default()))
+    Ok((
+        untracked,
+        ignored,
+        UntrackedCollectMeta {
+            clean_collapsed_unit: take_clean_unit_dirs(clean_unit_dirs),
+            ..UntrackedCollectMeta::default()
+        },
+    ))
 }
 
 /// Expand collapsed untracked directory markers (`dir/`) into concrete file paths for staging.
@@ -883,6 +927,7 @@ pub fn expand_untracked_for_staging_with_rules(
                 &mut expanded,
                 &mut ignored,
                 None,
+                &None,
             )?;
         }
     }
@@ -891,12 +936,12 @@ pub fn expand_untracked_for_staging_with_rules(
     Ok(expanded)
 }
 
-/// Stored paths of the stage-0 gitlink entries in `index`.
+/// Stored paths of gitlink entries in `index` (any conflict stage).
 fn stage0_gitlink_paths(index: &Index) -> HashSet<String> {
     index
         .entries
         .iter()
-        .filter(|e| e.stage() == 0 && e.mode == MODE_GITLINK)
+        .filter(|e| e.mode == MODE_GITLINK)
         .map(|e| crate::repo_relpath::storage_string(&e.path))
         .collect()
 }
@@ -960,9 +1005,10 @@ fn collect_untracked_parallel_top_level(
     matcher_template: &IgnoreMatcher,
     config: &ConfigSet,
     pathspecs: &[String],
-    cancel_watch: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    cancel_watch: Option<&std::sync::atomic::AtomicBool>,
+    clean_unit_dirs: &CleanUnitDirHints,
 ) -> Result<(Vec<String>, Vec<String>)> {
-    poll_untracked_cancel(cancel_watch.as_ref())?;
+    poll_untracked_cancel(cancel_watch)?;
     let entries = named_entries_sorted(fs::read_dir(work_tree).map_err(crate::error::Error::Io)?);
 
     let mut root_files = Vec::new();
@@ -1010,7 +1056,8 @@ fn collect_untracked_parallel_top_level(
                 None,
                 local_untracked,
                 local_ignored,
-                cancel_watch.clone(),
+                cancel_watch,
+                clean_unit_dirs,
             )?;
             Ok::<(), crate::error::Error>(())
         };
@@ -1051,7 +1098,8 @@ fn collect_untracked_parallel_top_level(
                     None,
                     &mut untracked,
                     &mut ignored,
-                    cancel_watch.clone(),
+                    cancel_watch,
+                    clean_unit_dirs,
                 )?;
             }
         }
@@ -1131,7 +1179,8 @@ fn collect_untracked_parallel_top_level(
                 None,
                 &mut local_untracked,
                 &mut local_ignored,
-                cancel_watch.clone(),
+                cancel_watch,
+                clean_unit_dirs,
             )?;
             Ok((local_untracked, local_ignored))
         },
@@ -1284,7 +1333,8 @@ fn visit_untracked_dir_entry(
     rules: Option<&crate::worktree_rules::WorktreeRules>,
     untracked_out: &mut Vec<String>,
     ignored_out: &mut Vec<String>,
-    cancel_watch: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    cancel_watch: Option<&std::sync::atomic::AtomicBool>,
+    clean_unit_dirs: &CleanUnitDirHints,
 ) -> Result<UntrackedWalkStep> {
     if name == b".git" {
         return Ok(UntrackedWalkStep::Continue);
@@ -1336,6 +1386,7 @@ fn visit_untracked_dir_entry(
             untracked_out,
             ignored_out,
             cancel_watch,
+            clean_unit_dirs,
         )?;
         if check_only && visible_out.is_some_and(|out| out.get()) {
             return Ok(UntrackedWalkStep::Stop);
@@ -1383,10 +1434,11 @@ fn visit_untracked_read_dir_lazy(
     rules: Option<&crate::worktree_rules::WorktreeRules>,
     untracked_out: &mut Vec<String>,
     ignored_out: &mut Vec<String>,
-    cancel_watch: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    cancel_watch: Option<&std::sync::atomic::AtomicBool>,
+    clean_unit_dirs: &CleanUnitDirHints,
 ) -> Result<()> {
     for entry in entries {
-        poll_untracked_cancel(cancel_watch.as_ref())?;
+        poll_untracked_cancel(cancel_watch)?;
         if visible_out.is_some_and(|out| out.get()) {
             return Ok(());
         }
@@ -1417,7 +1469,8 @@ fn visit_untracked_read_dir_lazy(
                 rules,
                 untracked_out,
                 ignored_out,
-                cancel_watch.clone(),
+                cancel_watch,
+                clean_unit_dirs,
             )?,
             UntrackedWalkStep::Stop
         ) {
@@ -1446,7 +1499,8 @@ fn visit_untracked_node(
     rules: Option<&crate::worktree_rules::WorktreeRules>,
     untracked_out: &mut Vec<String>,
     ignored_out: &mut Vec<String>,
-    cancel_watch: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    cancel_watch: Option<&std::sync::atomic::AtomicBool>,
+    clean_unit_dirs: &CleanUnitDirHints,
 ) -> Result<()> {
     if check_only && visible_out.is_some_and(|out| out.get()) {
         return Ok(());
@@ -1479,21 +1533,21 @@ fn visit_untracked_node(
             untracked_out,
             ignored_out,
             cancel_watch,
+            clean_unit_dirs,
         );
     }
 
-    let named = named_entries_sorted(entries);
-    // The listing shows whether `.git` exists, so most directories skip the submodule probe.
-    if tracked_subdir
-        && named
-            .iter()
-            .any(|(name, _)| name.eq_ignore_ascii_case(b".git"))
-        && dir_is_nested_submodule_worktree(repo.git_dir(), abs)
-    {
-        return Ok(());
-    }
-
     if check_only {
+        let named = named_entries_sorted(entries);
+        // The listing shows whether `.git` exists, so most directories skip the submodule probe.
+        if tracked_subdir
+            && named
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case(b".git"))
+            && dir_is_nested_submodule_worktree(repo.git_dir(), abs)
+        {
+            return Ok(());
+        }
         return visit_untracked_read_dir_lazy(
             named.into_iter().map(|(_, entry)| Ok(entry)),
             repo,
@@ -1512,11 +1566,20 @@ fn visit_untracked_node(
             untracked_out,
             ignored_out,
             cancel_watch,
+            clean_unit_dirs,
         );
     }
 
-    for (name, entry) in &named {
-        poll_untracked_cancel(cancel_watch.as_ref())?;
+    let listing = untracked_candidates_sorted(entries, index, rel, precompose_unicode);
+    if tracked_subdir
+        && listing.has_dot_git
+        && dir_is_nested_submodule_worktree(repo.git_dir(), abs)
+    {
+        return Ok(());
+    }
+
+    for (name, entry) in &listing.candidates {
+        poll_untracked_cancel(cancel_watch)?;
         if matches!(
             visit_untracked_dir_entry(
                 repo,
@@ -1537,7 +1600,8 @@ fn visit_untracked_node(
                 rules,
                 untracked_out,
                 ignored_out,
-                cancel_watch.clone(),
+                cancel_watch,
+                clean_unit_dirs,
             )?,
             UntrackedWalkStep::Stop
         ) {
@@ -1546,6 +1610,53 @@ fn visit_untracked_node(
     }
 
     Ok(())
+}
+
+/// One directory's listing for the untracked walk, see [`untracked_candidates_sorted`].
+struct UntrackedListing {
+    /// Entries that still need [`visit_untracked_dir_entry`], ordered by name bytes.
+    candidates: Vec<(Vec<u8>, DirEntry)>,
+    /// Whether any entry (left out or not) is named `.git` in any ASCII case.
+    has_dot_git: bool,
+}
+
+/// Read the directory stored as `rel`, leaving out non-directories tracked at exactly
+/// `rel/<name>` (any stage).
+///
+/// The walk reports nothing for those, and they are nearly every entry of a typical
+/// directory: dropping them while reading spares building their path, looking it up in
+/// [`crate::path_icase::Stage0TrackedPaths`], and keeping and sorting them. Names are matched
+/// against the directory's run of index entries; when the index is not known to be sorted,
+/// or a name needs precomposing first, the entry is kept and [`visit_untracked_dir_entry`]
+/// settles it as before.
+fn untracked_candidates_sorted(
+    entries: ReadDir,
+    index: &Index,
+    rel: &str,
+    precompose_unicode: bool,
+) -> UntrackedListing {
+    let dir = crate::repo_relpath::storage_bytes(rel);
+    let tracked = index.sorted_entries_under(&dir).unwrap_or_default();
+    let prefix_len = if dir.is_empty() { 0 } else { dir.len() + 1 };
+    let mut has_dot_git = false;
+    let mut candidates = Vec::new();
+    for entry in entries.filter_map(|e| e.ok()) {
+        let name = dir_entry_name_bytes(&entry);
+        has_dot_git |= name.eq_ignore_ascii_case(b".git");
+        let tracked_file = !(precompose_unicode && !name.is_ascii())
+            && tracked
+                .binary_search_by(|e| e.path[prefix_len..].cmp(name.as_slice()))
+                .is_ok()
+            && !crate::read_dir_kind::entry_is_dir(&entry).unwrap_or(false);
+        if !tracked_file {
+            candidates.push((name, entry));
+        }
+    }
+    candidates.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    UntrackedListing {
+        candidates,
+        has_dot_git,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1567,9 +1678,10 @@ fn visit_untracked_directory(
     rules: Option<&crate::worktree_rules::WorktreeRules>,
     untracked_out: &mut Vec<String>,
     ignored_out: &mut Vec<String>,
-    cancel_watch: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    cancel_watch: Option<&std::sync::atomic::AtomicBool>,
+    clean_unit_dirs: &CleanUnitDirHints,
 ) -> Result<()> {
-    let _ = matcher.note_directory_entered(repo, Some(index), rel);
+    matcher.note_directory_known(rel);
 
     if has_tracked_under(index, gitlinks, tracked_paths, rel) {
         visit_untracked_node(
@@ -1590,7 +1702,8 @@ fn visit_untracked_directory(
             rules,
             untracked_out,
             ignored_out,
-            cancel_watch.clone(),
+            cancel_watch,
+            clean_unit_dirs,
         )?;
         return Ok(());
     }
@@ -1606,22 +1719,16 @@ fn visit_untracked_directory(
         return Ok(());
     }
 
-    // Git `dir.c`: with `--ignored=matching` and full untracked listing, an excluded
-    // directory is reported as a single path without enumerating children (unless
-    // tracked files force a full walk — handled above).
-    if ignored_mode == IgnoredMode::Matching
-        && show_all
-        && matcher.is_path_ignored(repo, Some(index), rel, true)?
-    {
-        ignored_out.push(format!("{rel}/"));
-        return Ok(());
-    }
-
+    // An excluded directory cannot re-include descendants; report it once when listing ignored
+    // paths in normal mode without enumerating every child (issue #2242). With
+    // `--untracked-files=all`, Git lists individual ignored files instead.
     if ignored_mode != IgnoredMode::No
-        && dir_is_nested_submodule_worktree(repo.git_dir(), abs)
+        && !show_all
+        && !rel.is_empty()
         && matcher.is_path_ignored(repo, Some(index), rel, true)?
     {
         ignored_out.push(format!("{rel}/"));
+        record_clean_unit_dir(clean_unit_dirs, rel);
         return Ok(());
     }
 
@@ -1656,7 +1763,8 @@ fn visit_untracked_directory(
             rules,
             untracked_out,
             ignored_out,
-            cancel_watch.clone(),
+            cancel_watch,
+            clean_unit_dirs,
         )?;
         return Ok(());
     }
@@ -1686,7 +1794,8 @@ fn visit_untracked_directory(
             rules,
             untracked_out,
             ignored_out,
-            cancel_watch.clone(),
+            cancel_watch,
+            clean_unit_dirs,
         )?;
         if found.get() {
             if !rel.is_empty() {
@@ -1720,7 +1829,8 @@ fn visit_untracked_directory(
         rules,
         &mut sub_untracked,
         &mut sub_ignored,
-        cancel_watch.clone(),
+        cancel_watch,
+        clean_unit_dirs,
     )?;
 
     if show_all {
@@ -2130,6 +2240,14 @@ use crate::progress::ProgressSink;
 /// untracked cache, and trace2 emission — are intentionally *not* part of this;
 /// they wrap the call in the binary. A library consumer that just wants the
 /// status of a repository calls this directly.
+///
+/// When [`StatusOptions::write_index`] is `true` and the repository
+/// [`Environment`](crate::environment::Environment) allows optional locks, this function may
+/// rewrite `.git/index` after refreshing cached stat data (and may finish an interrupted rewrite
+/// apply). If another command updates the index after this call loaded it (for example a
+/// concurrent commit), the opportunistic write is skipped so the fresher on-disk index is kept.
+/// Set `write_index` to `false` or capture `GIT_OPTIONAL_LOCKS=0` in the environment for
+/// read-only status that leaves the index file untouched.
 pub fn status(
     repo: &Repository,
     opts: &StatusOptions,
@@ -2137,14 +2255,21 @@ pub fn status(
     cancel: &dyn crate::progress::Cancel,
 ) -> Result<StatusModel> {
     crate::trace::trace_span!("grit.status.scan");
-    let interrupted_rewrite = match crate::history::recover_interrupted_rewrite_apply(repo) {
-        Ok(recovery) => recovery.map(InterruptedRewrite::from),
-        Err(crate::history::HistoryError::Library(err))
-            if matches!(*err, crate::error::Error::LockHeld { .. }) =>
-        {
-            Some(InterruptedRewrite::Pending)
+    let persist_index_to_disk = opts.write_index && repo.environment().git_optional_locks;
+    let interrupted_rewrite = if persist_index_to_disk {
+        match crate::history::recover_interrupted_rewrite_apply(repo) {
+            Ok(recovery) => recovery.map(InterruptedRewrite::from),
+            Err(crate::history::HistoryError::Library(err))
+                if matches!(*err, crate::error::Error::LockHeld { .. }) =>
+            {
+                Some(InterruptedRewrite::Pending)
+            }
+            Err(err) => return Err(crate::error::Error::History(err)),
         }
-        Err(err) => return Err(crate::error::Error::History(err)),
+    } else if crate::history::rewrite_apply_journal_active(repo.git_dir()) {
+        Some(InterruptedRewrite::Pending)
+    } else {
+        None
     };
     let watch = crate::progress::cancel_watch_arc(cancel);
     let mut progress = crate::progress::WatchProgress::new(progress, std::sync::Arc::clone(&watch));
@@ -2157,15 +2282,14 @@ pub fn status(
     let state = crate::state::wt_status_get_state(repo.git_dir(), &head, true)?;
     let repo_config = repo.config().ok();
 
-    // Load the index (including split-index merge and GIT_INDEX_FILE), remembering
-    // whether it was sparse on disk, then expand sparse-directory placeholders
-    // so the diffs see real entries.
+    // Load without expanding sparse-directory placeholders; expand only directories
+    // a pathspec may reach so read-mostly status stays on Git's sparse index shape.
     let index_path = repo.index_path_for_env()?;
-    let mut index = repo.load_index_at(&index_path)?;
+    let mut index = repo.load_index_at_preserving_sparse(
+        &index_path,
+        crate::index::IndexParseContext::from_policy(repo.thread_policy()),
+    )?;
     let index_mtime = index.source_mtime;
-    let worktree_rules = Arc::new(Mutex::new(
-        crate::worktree_rules::WorktreeRules::from_repository(repo, &index)?,
-    ));
     let sparse_directory_prefixes: Vec<Vec<u8>> = index
         .entries
         .iter()
@@ -2174,11 +2298,19 @@ pub fn status(
         .collect();
     let index_sparse_on_disk =
         index.sparse_directories || index.has_sparse_directory_placeholders();
-    let protect = repo_config
-        .as_deref()
-        .map(crate::path_validate::ProtectOptions::from_config)
-        .unwrap_or_default();
-    let _ = index.expand_sparse_directory_placeholders(repo.odb(), protect);
+    if !opts.pathspecs.is_empty() {
+        crate::porcelain::index_from_tree::expand_sparse_for_pathspecs(
+            repo,
+            &mut index,
+            &opts.pathspecs,
+        )?;
+    }
+    if let Some(cfg) = repo_config.as_deref() {
+        repo.clear_present_skip_worktree(&mut index, cfg);
+    }
+    let worktree_rules = Arc::new(Mutex::new(
+        crate::worktree_rules::WorktreeRules::from_repository(repo, &index)?,
+    ));
 
     let head_tree = match head.oid() {
         Some(oid) => {
@@ -2220,8 +2352,12 @@ pub fn status(
             && i64::from(e.mtime_sec) < now_unix_seconds
     });
     crate::progress::poll_cancel_watch(&mut progress, cancel, &watch)?;
+    let cancel_poll = std::sync::Arc::new(crate::progress::StackCancelPoll::new(
+        &mut progress,
+        std::sync::Arc::clone(&watch),
+    ));
     let (unstaged_raw, index_stat_refresh_changed) =
-        crate::diff::diff_index_to_worktree_with_options(
+        crate::diff::diff_index_to_worktree_with_owner_poll(
             repo.odb(),
             &mut index,
             work_tree,
@@ -2240,8 +2376,11 @@ pub fn status(
                 cancel_watch: Some(std::sync::Arc::clone(&watch)),
                 ..Default::default()
             },
+            Some(cancel_poll),
         )?;
-    let mut persist_index = index_stat_refresh_changed || rewrite_clears_racy_entries;
+    let mut persist_index = index_stat_refresh_changed
+        || rewrite_clears_racy_entries
+        || index.entry_modes_repaired_on_load;
     let mut unstaged: Vec<DiffEntry> = unstaged_raw
         .into_iter()
         .filter(|e| status_diff_entry_matches_pathspec(e, &opts.pathspecs))
@@ -2307,15 +2446,19 @@ pub fn status(
             (untracked, ignored)
         };
 
-    if persist_index {
+    if persist_index && persist_index_to_disk {
         // The refresh pass already re-hashed every racily clean entry and invalidated the
         // ones whose content changed, so the write must not hash them a second time.
         index.skip_racy_smudge_on_write = true;
+        if let Some(hook) = &opts.before_opportunistic_index_write {
+            (hook.0)();
+        }
         let written = repo.try_write_index_at(&index_path, &mut index);
         index.skip_racy_smudge_on_write = false;
         if written? {
             crate::index::advance_index_file_mtime_past_entries(&index, &index_path, None)?;
             index.source_mtime = crate::index::index_file_mtime(&index_path);
+            index.entry_modes_repaired_on_load = false;
         }
     }
 
@@ -2714,17 +2857,6 @@ fn short_status_line_sort_key(line: &StatusShortLine) -> String {
     line.render_with(|p| p.to_owned())
 }
 
-/// Render [`StatusModel`] as compact two-column status lines (repository-relative paths).
-///
-/// Prefer [`short_status_lines`] when paths need cwd-relative display or quoting.
-#[must_use]
-pub fn format_short(model: &StatusModel) -> Vec<String> {
-    short_status_lines(model)
-        .into_iter()
-        .map(|line| line.render_with(|p| p.to_owned()))
-        .collect()
-}
-
 fn short_status_path(
     staged: Option<&DiffEntry>,
     unstaged: Option<&DiffEntry>,
@@ -2769,7 +2901,13 @@ fn porcelain_v2_unmerged_xy(stagemask: u8) -> (char, char) {
         Some(ConflictKind::AddedByThem) => "UA",
         Some(ConflictKind::DeletedByUs) => "DU",
         Some(ConflictKind::BothAdded) => "AA",
-        Some(ConflictKind::BothModified | ConflictKind::RenameRename(_)) => "UU",
+        Some(
+            ConflictKind::BothModified
+            | ConflictKind::RenameRename(_)
+            | ConflictKind::DirectoryRenameMoved(_)
+            | ConflictKind::DirectoryRenameSplit
+            | ConflictKind::DirectoryRenameBlocked(_),
+        ) => "UU",
         None => {
             debug_assert!(false, "unexpected unmerged stagemask {stagemask:#x}");
             "UU"
@@ -3347,6 +3485,94 @@ mod status_op_tests {
     }
 
     #[test]
+    fn unmerged_gitlink_is_conflict_not_untracked() {
+        use crate::index::{Index, IndexEntry, MODE_GITLINK};
+        use crate::objects::ObjectKind;
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        init_min_repo(root);
+        let sub = root.join("vendor/lib");
+        fs::create_dir_all(&sub).unwrap();
+        let git = sub.join(".git");
+        fs::create_dir_all(git.join("objects")).unwrap();
+        fs::create_dir_all(git.join("refs/heads")).unwrap();
+        fs::write(git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        fs::write(
+            git.join("config"),
+            "[core]\n\trepositoryformatversion = 0\n\tbare = false\n",
+        )
+        .unwrap();
+        fs::write(sub.join("f.txt"), b"sub\n").unwrap();
+        let sub_repo =
+            Repository::open(&git, &RepositoryOptions::empty().with_work_tree(&sub)).unwrap();
+        let blob = sub_repo.odb().write(ObjectKind::Blob, b"sub\n").unwrap();
+        let tree = sub_repo
+            .odb()
+            .write(
+                ObjectKind::Tree,
+                format!("100644 {blob}\tf.txt\n").as_bytes(),
+            )
+            .unwrap();
+        let commit = sub_repo
+            .odb()
+            .write(
+                ObjectKind::Commit,
+                format!("tree {tree}\nauthor t <t@t> 0 +0000\ncommitter t <t@t> 0 +0000\n\nm\n")
+                    .as_bytes(),
+            )
+            .unwrap();
+        crate::refs::write_ref(&git, "refs/heads/main", &commit).unwrap();
+
+        let gitlink = commit;
+        let mut index = Index::new();
+        for stage in 1..=3u8 {
+            index.entries.push(IndexEntry {
+                ctime_sec: 0,
+                ctime_nsec: 0,
+                mtime_sec: 0,
+                mtime_nsec: 0,
+                dev: 0,
+                ino: 0,
+                mode: MODE_GITLINK,
+                uid: 0,
+                gid: 0,
+                size: 0,
+                oid: gitlink,
+                flags: (b"vendor/lib".len() as u16) | ((stage as u16) << 12),
+                flags_extended: None,
+                path: b"vendor/lib".to_vec(),
+                base_index_pos: 0,
+            });
+        }
+        index.sort();
+        let repo = Repository::open(
+            &root.join(".git"),
+            &RepositoryOptions::empty().with_work_tree(root),
+        )
+        .unwrap();
+        repo.write_index(&mut index).unwrap();
+
+        let model = status(
+            &repo,
+            &StatusOptions::default(),
+            &mut NullProgress,
+            &NeverCancel,
+        )
+        .unwrap();
+        assert!(
+            model.conflicts.iter().any(|p| p == "vendor/lib"),
+            "conflicts: {:?}",
+            model.conflicts
+        );
+        assert!(
+            !model.untracked.iter().any(|p| p.starts_with("vendor/lib")),
+            "untracked must not list conflicted submodule: {:?}",
+            model.untracked
+        );
+    }
+
+    #[test]
     fn expand_untracked_for_staging_walks_each_collapsed_dir_once() {
         const DIRS: u32 = 200;
         let tmp = TempDir::new().unwrap();
@@ -3408,6 +3634,135 @@ mod status_op_tests {
         );
     }
 
+    fn listing_entry(path: &str, stage: u8) -> crate::index::IndexEntry {
+        let mut entry = crate::index::IndexEntry {
+            ctime_sec: 0,
+            ctime_nsec: 0,
+            mtime_sec: 0,
+            mtime_nsec: 0,
+            dev: 0,
+            ino: 0,
+            mode: crate::index::MODE_REGULAR,
+            uid: 0,
+            gid: 0,
+            size: 0,
+            oid: ObjectId::from_bytes(&[0u8; 20]).unwrap(),
+            flags: 0,
+            flags_extended: None,
+            path: path.as_bytes().to_vec(),
+            base_index_pos: 0,
+        };
+        entry.set_stage(stage);
+        entry
+    }
+
+    fn listing_names(listing: &UntrackedListing) -> Vec<&str> {
+        listing
+            .candidates
+            .iter()
+            .map(|(name, _)| std::str::from_utf8(name).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn untracked_listing_drops_only_tracked_files() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("sub");
+        for name in ["z.txt", "a.txt", "both.txt", "new.txt", "A.TXT"] {
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join(name), name).unwrap();
+        }
+        fs::create_dir_all(dir.join("tracked-dir")).unwrap();
+        fs::create_dir_all(dir.join(".git")).unwrap();
+        let mut index = Index::new();
+        index.entries = vec![
+            listing_entry("sub/a.txt", 0),
+            listing_entry("sub/both.txt", 2),
+            listing_entry("sub/both.txt", 3),
+            listing_entry("sub/tracked-dir", 0),
+            listing_entry("sub/tracked-dir/x", 0),
+            listing_entry("sub/z.txt", 0),
+            listing_entry("subz.txt", 0),
+        ];
+        index.sort();
+
+        let listing =
+            untracked_candidates_sorted(fs::read_dir(&dir).unwrap(), &index, "sub", false);
+        assert_eq!(
+            listing_names(&listing),
+            vec![".git", "A.TXT", "new.txt", "tracked-dir"],
+            "tracked files (any stage) are dropped; directories, case variants and \
+             untracked files stay, ordered by name bytes"
+        );
+        assert!(listing.has_dot_git);
+
+        index.mark_entries_unsorted();
+        let unsorted =
+            untracked_candidates_sorted(fs::read_dir(&dir).unwrap(), &index, "sub", false);
+        assert_eq!(
+            listing_names(&unsorted),
+            vec![
+                ".git",
+                "A.TXT",
+                "a.txt",
+                "both.txt",
+                "new.txt",
+                "tracked-dir",
+                "z.txt"
+            ],
+            "an index not known to be sorted keeps every entry for the full check"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn untracked_listing_matches_raw_bytes_of_a_non_utf8_directory() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let tmp = TempDir::new().unwrap();
+        let raw_dir: &[u8] = b"raw-\xff";
+        let dir = tmp.path().join(std::ffi::OsStr::from_bytes(raw_dir));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("t.txt"), b"x").unwrap();
+        fs::write(dir.join("u.txt"), b"x").unwrap();
+        let mut index = Index::new();
+        let mut tracked = listing_entry("t.txt", 0);
+        tracked.path = [raw_dir, b"/t.txt"].concat();
+        index.entries = vec![tracked];
+        index.sort();
+
+        let rel = crate::repo_relpath::storage_string(raw_dir);
+        assert_ne!(rel.as_bytes(), raw_dir, "the directory is stored encoded");
+        let listing = untracked_candidates_sorted(fs::read_dir(&dir).unwrap(), &index, &rel, false);
+        assert_eq!(listing_names(&listing), vec!["u.txt"]);
+    }
+
+    #[test]
+    fn untracked_listing_at_root_and_with_precompose() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("top.txt"), b"x").unwrap();
+        fs::write(root.join("caf\u{e9}.txt"), b"x").unwrap();
+        fs::write(root.join("new.txt"), b"x").unwrap();
+        let mut index = Index::new();
+        index.entries = vec![
+            listing_entry("caf\u{e9}.txt", 0),
+            listing_entry("top.txt", 0),
+        ];
+        index.sort();
+
+        let plain = untracked_candidates_sorted(fs::read_dir(root).unwrap(), &index, "", false);
+        assert_eq!(listing_names(&plain), vec!["new.txt"]);
+        assert!(!plain.has_dot_git);
+
+        let precompose = untracked_candidates_sorted(fs::read_dir(root).unwrap(), &index, "", true);
+        assert_eq!(
+            listing_names(&precompose),
+            vec!["caf\u{e9}.txt", "new.txt"],
+            "non-ASCII names are left to the precomposing check"
+        );
+    }
+
     #[test]
     fn status_collapses_large_untracked_directory_without_full_walk() {
         let tmp = TempDir::new().unwrap();
@@ -3443,6 +3798,48 @@ mod status_op_tests {
             entries_read <= 8,
             "check-only probe must stop at the first visible entry, not scan all \
              3000 files (read {entries_read} directory entries during probe)"
+        );
+    }
+
+    #[test]
+    fn status_ignored_collapses_directory_exclude_without_full_walk() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        init_min_repo(root);
+        fs::write(root.join(".gitignore"), "node_modules/\n").unwrap();
+        let nm = root.join("node_modules");
+        fs::create_dir_all(nm.join("p0/m0")).unwrap();
+        for i in 0..500 {
+            fs::write(nm.join(format!("p0/m0/f{i}.txt")), b"x\n").unwrap();
+        }
+
+        let repo = Repository::open(
+            &root.join(".git"),
+            &RepositoryOptions::empty().with_work_tree(root),
+        )
+        .unwrap();
+        untracked_walk_probe::reset();
+        let model = status(
+            &repo,
+            &StatusOptions {
+                ignored: IgnoredMode::Traditional,
+                ..StatusOptions::default()
+            },
+            &mut NullProgress,
+            &NeverCancel,
+        )
+        .unwrap();
+
+        assert_eq!(
+            model.ignored,
+            vec!["node_modules/".to_owned()],
+            "directory exclude must collapse to a single ignored path"
+        );
+        let dirs_read = untracked_walk_probe::dirs_read();
+        assert!(
+            dirs_read <= 4,
+            "ignored directory exclude must not read every nested directory \
+             (listed {dirs_read} directories)"
         );
     }
 
@@ -4202,6 +4599,59 @@ mod status_op_tests {
         ignore = "starts system git or is heavy; run with --features full-tests"
     )]
     #[test]
+    fn status_unstaged_modified_uses_null_worktree_oid_on_size_drift() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        grit_test_support::git(root, &["init", "-q", "-b", "main", "."]);
+        grit_test_support::git(root, &["config", "user.email", "t@example.com"]);
+        grit_test_support::git(root, &["config", "user.name", "Test"]);
+        fs::write(root.join("a"), b"a\n").unwrap();
+        grit_test_support::git(root, &["add", "a"]);
+        grit_test_support::git(root, &["commit", "-qm", "c"]);
+        let index_oid = {
+            use std::str::FromStr;
+            crate::objects::ObjectId::from_str(
+                grit_test_support::git(root, &["rev-parse", "HEAD:a"]).trim(),
+            )
+            .unwrap()
+        };
+        let mut content = fs::read(root.join("a")).unwrap();
+        content.extend_from_slice(b"more");
+        fs::write(root.join("a"), content).unwrap();
+
+        let git_raw = grit_test_support::git(root, &["diff-files", "--raw"]);
+        assert!(
+            git_raw.contains(&format!(
+                "{index_oid} 0000000000000000000000000000000000000000"
+            )),
+            "git diff-files --raw must use null worktree oid: {git_raw}"
+        );
+
+        let repo = Repository::open(
+            &root.join(".git"),
+            &RepositoryOptions::empty().with_work_tree(root),
+        )
+        .unwrap();
+        let model = status(
+            &repo,
+            &StatusOptions::default(),
+            &mut NullProgress,
+            &NeverCancel,
+        )
+        .unwrap();
+        assert_eq!(model.unstaged.len(), 1, "{:?}", model.unstaged);
+        let e = &model.unstaged[0];
+        assert_eq!(e.status, crate::diff::DiffStatus::Modified);
+        assert_eq!(e.path(), "a");
+        assert_eq!(e.old_oid, index_oid);
+        assert_eq!(e.new_oid, crate::diff::zero_oid());
+    }
+
+    #[cfg_attr(
+        not(feature = "full-tests"),
+        ignore = "starts system git or is heavy; run with --features full-tests"
+    )]
+    #[test]
     fn status_unstaged_delete_and_untracked_add_not_rename() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
@@ -4249,6 +4699,12 @@ mod status_op_tests {
             model.unstaged
         );
     }
+
+    #[cfg_attr(
+        not(feature = "full-tests"),
+        ignore = "starts system git or is heavy; run with --features full-tests"
+    )]
+    #[test]
     fn warm_status_after_git_status_reuses_untr_without_rescanning() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();

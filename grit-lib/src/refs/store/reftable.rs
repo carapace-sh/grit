@@ -8,17 +8,19 @@ use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use crate::environment::Environment;
 use crate::error::{Error, Result};
 use crate::objects::ObjectId;
 use crate::reflog::ReflogEntry;
 use crate::reftable::{
-    read_write_options, reftable_storage_location, LogRecord, RefValue, ReftableError,
-    ReftableStack, ReftableTransactionUpdate, TablesListLock, WriteOptions,
+    read_write_options, read_write_options_with_environment, reftable_storage_location, LogRecord,
+    RefValue, ReftableError, ReftableStack, ReftableTransactionUpdate, TablesListLock,
+    WriteOptions,
 };
 use crate::repo::init_repository;
 
 use super::apply::{apply_reflog_rename, RefBatchState};
-use super::backend::check_transaction_updates;
+use super::backend::{check_transaction_updates, partition_updates_allowing_failures};
 use super::error::RefStoreError;
 use super::semantics::{
     apply_update_to_map, deref_reflog_target, format_reflog_identity, reflog_new_oid_before,
@@ -52,6 +54,7 @@ type StoreResult<T> = std::result::Result<T, RefStoreError>;
 /// resolves to it through the symbolic ref, and only `HEAD`'s own reflog line is missing.
 pub struct ReftableRefStore {
     git_dir: PathBuf,
+    environment: Environment,
     _keepalive: Option<tempfile::TempDir>,
     prepared: Mutex<Option<PreparedReftableBatch>>,
 }
@@ -84,13 +87,25 @@ impl ReftableRefStore {
     ///
     /// Returns [`Error::Io`] when the reftable stack cannot be read.
     pub fn open(git_dir: PathBuf) -> Result<Self> {
+        Self::open_with_environment(git_dir, Environment::empty())
+    }
+
+    pub(crate) fn open_with_environment(
+        git_dir: PathBuf,
+        environment: Environment,
+    ) -> Result<Self> {
         let store_git_dir = stack_root(&git_dir);
         let _ = ReftableStack::open(&store_git_dir)?;
         Ok(Self {
             git_dir,
+            environment,
             _keepalive: None,
             prepared: Mutex::new(None),
         })
+    }
+
+    fn write_options_for(&self, store_git_dir: &Path) -> WriteOptions {
+        read_write_options_with_environment(store_git_dir, &self.environment)
     }
 
     /// Create a new ephemeral reftable repository (tests).
@@ -110,6 +125,7 @@ impl ReftableRefStore {
         let git_dir = root.path().join(".git");
         let store = Self {
             git_dir: git_dir.clone(),
+            environment: Environment::empty(),
             _keepalive: Some(root),
             prepared: Mutex::new(None),
         };
@@ -123,6 +139,7 @@ impl ReftableRefStore {
                 flags: super::RefUpdateFlags {
                     no_deref: true,
                     log_only: false,
+                    ..Default::default()
                 },
             })
             .map_err(|e| Error::Message(e.to_string()))?;
@@ -159,7 +176,7 @@ impl ReftableRefStore {
         for (store_git_dir, group) in grouped {
             let mut stack = ReftableStack::open(&store_git_dir)
                 .map_err(|e| RefStoreError::Corrupt(e.to_string()))?;
-            let opts = read_write_options(&store_git_dir);
+            let opts = self.write_options_for(&store_git_dir);
             stack
                 .write_transaction(group, &opts)
                 .map_err(map_reftable_err)?;
@@ -228,6 +245,7 @@ impl ReftableRefStore {
                 flags: super::RefUpdateFlags {
                     log_only: true,
                     no_deref: true,
+                    ..Default::default()
                 },
             });
             out.push(RefUpdate {
@@ -238,6 +256,7 @@ impl ReftableRefStore {
                 flags: super::RefUpdateFlags {
                     log_only: update.flags.log_only,
                     no_deref: true,
+                    ..Default::default()
                 },
             });
         }
@@ -480,21 +499,16 @@ fn build_reftable_updates_for_stack(
     Ok(out)
 }
 
-impl RefStore for ReftableRefStore {
-    fn format(&self) -> RefStorageFormat {
-        RefStorageFormat::Reftable
-    }
-
-    fn read_raw(&self, name: &str) -> Result<Option<RawRef>> {
-        self.read_raw_at(name)
-    }
-
-    fn for_each_ref(
+impl ReftableRefStore {
+    fn for_each_refs_in_stack_dir(
         &self,
+        stack_git_dir: &Path,
         prefix: &str,
         f: &mut dyn FnMut(&RefEntry) -> ControlFlow<()>,
     ) -> Result<()> {
-        if "HEAD".starts_with(prefix) {
+        let prefix = if prefix.is_empty() { "refs/" } else { prefix };
+        let (head_stack, _) = reftable_storage_location(&self.git_dir, "HEAD");
+        if head_stack == stack_git_dir && "HEAD".starts_with(prefix) {
             if let Some(value) = read_head_raw(&self.git_dir)? {
                 let peeled = match &value {
                     RawRef::Direct(_) => None,
@@ -510,42 +524,56 @@ impl RefStore for ReftableRefStore {
                 }
             }
         }
-        let store_git_dir = stack_root(&self.git_dir);
-        let stack = ReftableStack::open(&store_git_dir)?;
-        let mut names: Vec<String> = stack
-            .read_refs()?
-            .into_iter()
-            .filter_map(|rec| {
-                if rec.name != "HEAD"
-                    && record_to_raw(&rec).is_some()
-                    && (rec.name.starts_with(prefix)
-                        || (prefix.ends_with('/') && rec.name == prefix.trim_end_matches('/')))
-                {
-                    Some(rec.name)
-                } else {
-                    None
-                }
-            })
-            .collect();
-        names.sort();
-        for name in names {
-            let Some(value) = self.read_raw_at(&name)? else {
-                continue;
+        let stack = ReftableStack::open(stack_git_dir)?;
+        stack.for_each_merged_ref_under_prefix(prefix, |rec| {
+            if rec.name == "HEAD" {
+                return ControlFlow::Continue(());
+            }
+            let Some(value) = record_to_raw(rec) else {
+                return ControlFlow::Continue(());
             };
+            if !rec.name.starts_with(prefix)
+                && !(prefix.ends_with('/') && rec.name == prefix.trim_end_matches('/'))
+            {
+                return ControlFlow::Continue(());
+            }
             let peeled = match &value {
                 RawRef::Direct(_) => None,
-                RawRef::Symbolic(_) => self.resolve(&name).ok(),
+                RawRef::Symbolic(_) => self.resolve(&rec.name).ok(),
             };
             let entry = RefEntry {
-                name,
+                name: rec.name.clone(),
                 value,
                 peeled,
             };
-            if f(&entry).is_break() {
-                break;
-            }
-        }
-        Ok(())
+            f(&entry)
+        })
+    }
+}
+
+impl RefStore for ReftableRefStore {
+    fn format(&self) -> RefStorageFormat {
+        RefStorageFormat::Reftable
+    }
+
+    fn read_raw(&self, name: &str) -> Result<Option<RawRef>> {
+        self.read_raw_at(name)
+    }
+
+    fn for_each_ref(
+        &self,
+        prefix: &str,
+        f: &mut dyn FnMut(&RefEntry) -> ControlFlow<()>,
+    ) -> Result<()> {
+        self.for_each_refs_in_stack_dir(&stack_root(&self.git_dir), prefix, f)
+    }
+
+    fn for_each_physical_stack_ref(
+        &self,
+        prefix: &str,
+        f: &mut dyn FnMut(&RefEntry) -> ControlFlow<()>,
+    ) -> Result<()> {
+        self.for_each_refs_in_stack_dir(&self.git_dir, prefix, f)
     }
 
     fn prepare(
@@ -553,13 +581,14 @@ impl RefStore for ReftableRefStore {
         txn: RefTransaction,
     ) -> StoreResult<Box<dyn PreparedRefTransaction + Send + '_>> {
         txn.validate()?;
-        let (updates, reflog_renames, _case_only_renames) = txn.into_parts();
         let mut guard_state = self.prepared.lock().unwrap_or_else(|e| e.into_inner());
         if guard_state.is_some() {
             return Err(RefStoreError::LockHeld {
-                name: "refs".to_owned(),
+                name: txn.lock_name(),
             });
         }
+        let allow_failures = txn.allows_failures();
+        let (updates, reflog_renames, _case_only_renames) = txn.into_parts();
 
         let updates = self.split_cross_stack_symref_updates(updates)?;
         let mut grouped: BTreeMap<PathBuf, Vec<RefUpdate>> = BTreeMap::new();
@@ -569,6 +598,7 @@ impl RefStore for ReftableRefStore {
         }
 
         let mut stacks = Vec::new();
+        let mut rejections = Vec::new();
         for (store_git_dir, group) in grouped {
             let mut stack = ReftableStack::open(&store_git_dir)
                 .map_err(|e| RefStoreError::Corrupt(e.to_string()))?;
@@ -582,10 +612,18 @@ impl RefStore for ReftableRefStore {
                 refs,
                 reflogs: BTreeMap::new(),
             };
-            check_transaction_updates(&snapshot, &group)?;
+            let group = if allow_failures {
+                let (accepted, group_rejections) =
+                    partition_updates_allowing_failures(&snapshot, group)?;
+                rejections.extend(group_rejections);
+                accepted
+            } else {
+                check_transaction_updates(&snapshot, &group)?;
+                group
+            };
             let refs = snapshot.refs;
             let rt_updates = build_reftable_updates_for_stack(&self.git_dir, &refs, &group)?;
-            let opts = read_write_options(&store_git_dir);
+            let opts = self.write_options_for(&store_git_dir);
             stacks.push(LockedStackBatch {
                 _store_git_dir: store_git_dir,
                 stack,
@@ -603,6 +641,7 @@ impl RefStore for ReftableRefStore {
         Ok(Box::new(ReftablePrepared {
             store: self,
             committed: false,
+            rejections,
         }))
     }
 
@@ -655,16 +694,29 @@ impl RefStore for ReftableRefStore {
     }
 
     fn replace_reflog(&self, name: &str, entries: Vec<ReflogEntry>) -> Result<()> {
+        self.rewrite_reflog(name, &mut |_| Ok(entries.clone()))
+    }
+
+    fn rewrite_reflog(
+        &self,
+        name: &str,
+        transform: &mut dyn FnMut(Vec<ReflogEntry>) -> Result<Vec<ReflogEntry>>,
+    ) -> Result<()> {
         let (store_git_dir, storage_refname) = reftable_storage_location(&self.git_dir, name);
+        let mut stack = ReftableStack::open(&store_git_dir)?;
+        let mut empty = false;
+        stack.rewrite_logs_for_ref(&storage_refname, &mut |current| {
+            let rewritten = transform(current)?;
+            empty = rewritten.is_empty();
+            Ok(rewritten)
+        })?;
         let mut markers = read_empty_reflog_markers(&store_git_dir);
-        if entries.is_empty() {
-            markers.insert(storage_refname.clone());
+        if empty {
+            markers.insert(storage_refname);
         } else {
             markers.remove(&storage_refname);
         }
-        write_empty_reflog_markers(&store_git_dir, &markers)?;
-        let mut stack = ReftableStack::open(&store_git_dir)?;
-        stack.replace_logs_for_ref(&storage_refname, &entries)
+        write_empty_reflog_markers(&store_git_dir, &markers)
     }
 
     fn for_each_reflog_ref(&self, f: &mut dyn FnMut(&str) -> ControlFlow<()>) -> Result<()> {
@@ -709,9 +761,14 @@ fn commit_reflog_rename_on_stack(
 struct ReftablePrepared<'a> {
     store: &'a ReftableRefStore,
     committed: bool,
+    rejections: Vec<(String, RefStoreError)>,
 }
 
 impl PreparedRefTransaction for ReftablePrepared<'_> {
+    fn rejected_updates(&self) -> &[(String, RefStoreError)] {
+        &self.rejections
+    }
+
     fn commit(mut self: Box<Self>) -> StoreResult<()> {
         let mut guard_state = self
             .store
@@ -730,6 +787,10 @@ impl PreparedRefTransaction for ReftablePrepared<'_> {
                         stack_batch.updates,
                         &stack_batch.opts,
                     )
+                    .map_err(map_reftable_err)?;
+                stack_batch
+                    .stack
+                    .maybe_auto_compact(&stack_batch.opts)
                     .map_err(map_reftable_err)?;
             }
             for rename in &batch.reflog_renames {
@@ -771,6 +832,7 @@ impl Drop for ReftablePrepared<'_> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::RefUpdateFlags;
     use super::*;
 
     #[test]
@@ -809,6 +871,48 @@ mod tests {
         let corrupt = map_reftable_err(ReftableError::BadMagic.into());
         assert!(matches!(corrupt, RefStoreError::Corrupt(msg) if msg.contains("bad magic")));
     }
+    fn cas_update_oid(n: u32) -> ObjectId {
+        let mut b = [0u8; 20];
+        b[..4].copy_from_slice(&(n + 1).to_be_bytes());
+        ObjectId::from_bytes(&b).expect("oid")
+    }
+
+    #[test]
+    fn prepared_commit_runs_geometric_auto_compaction() {
+        let store = ReftableRefStore::open_ephemeral().expect("store");
+        const UPDATES: u32 = 100;
+        for i in 0..UPDATES {
+            let txn = RefTransaction::new()
+                .update(RefUpdate {
+                    name: "refs/heads/hot".into(),
+                    new_value: Some(RawRef::Direct(cas_update_oid(i))),
+                    expected: if i == 0 {
+                        Expected::Missing
+                    } else {
+                        Expected::Oid(cas_update_oid(i - 1))
+                    },
+                    reflog: None,
+                    flags: RefUpdateFlags::default(),
+                })
+                .expect("txn");
+            store
+                .prepare(txn)
+                .expect("prepare")
+                .commit()
+                .expect("commit");
+        }
+        let stack = ReftableStack::open(&store.git_dir).expect("stack");
+        assert!(
+            stack.table_names().len() <= 8,
+            "expected bounded reftable stack, got {} tables",
+            stack.table_names().len()
+        );
+        assert_eq!(
+            store.read_raw("refs/heads/hot").expect("read"),
+            Some(RawRef::Direct(cas_update_oid(UPDATES - 1)))
+        );
+    }
+
     #[test]
     fn head_values_use_stack_transactions_and_ignore_loose_files() {
         let store = ReftableRefStore::open_ephemeral().expect("store");
@@ -822,6 +926,7 @@ mod tests {
                     flags: super::super::RefUpdateFlags {
                         no_deref: true,
                         log_only: false,
+                        ..Default::default()
                     },
                 })
                 .expect("transaction")
@@ -835,14 +940,18 @@ mod tests {
         let stub = fs::read(store.git_dir.join("HEAD")).expect("stub");
         assert_eq!(stub, b"ref: refs/heads/.invalid\n");
         assert_eq!(store.read_raw("HEAD").expect("read"), Some(symbolic));
-        let mut names = Vec::new();
-        store
-            .for_each_ref("", &mut |entry| {
-                names.push(entry.name.clone());
-                ControlFlow::Continue(())
-            })
-            .expect("list");
-        assert_eq!(names, ["HEAD"]);
+        let names_with_prefix = |prefix: &str| {
+            let mut names = Vec::new();
+            store
+                .for_each_ref(prefix, &mut |entry| {
+                    names.push(entry.name.clone());
+                    ControlFlow::Continue(())
+                })
+                .expect("list");
+            names
+        };
+        assert!(names_with_prefix("").is_empty());
+        assert_eq!(names_with_prefix("HEAD"), ["HEAD"]);
         let oid = ObjectId::from_bytes(&[0x31; 20]).expect("oid");
         let detached = RawRef::Direct(oid);
         let txn = update(

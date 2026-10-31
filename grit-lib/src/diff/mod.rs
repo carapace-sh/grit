@@ -12,6 +12,7 @@
 //! # Ok(())
 //! # }
 //! ```
+mod changes;
 mod commit_files_many;
 mod core;
 pub(crate) use core::myers_rediff_changed_masks_for_region;
@@ -29,13 +30,17 @@ mod patch_log;
 pub mod pickaxe;
 mod posix_ere;
 mod rename_lines;
+mod stat;
 pub(crate) use core::is_func_line;
 pub(crate) use posix_ere::PosixBre;
 mod targets;
 mod tree_content;
+pub(crate) use tree_content::gitlink_line;
+pub use tree_content::{bytes_for_diff, load_odb_blob_side_for_diff};
 mod unified_emit;
 mod whitespace_mode;
 
+pub use changes::{load_object_changes, FileChange, UncommittedDiff};
 pub use commit_files_many::{CommitFilesManyInput, CommitFilesManyOptions, CommitFilesResult};
 pub use core::*;
 pub use detail::FileDiff as ListedFileDiff;
@@ -75,11 +80,12 @@ pub use patch_log::{
     PatchTextOptions,
 };
 pub use pickaxe::{Pickaxe, PickaxeError, PickaxeKind};
+pub use stat::{DiffStat, FileStat, StatBar};
 pub use targets::hunk_diff_bundle;
 pub use targets::HunkDiffBundle;
 pub(crate) use targets::{
-    collect_files_for_target, unstaged_file_diffs_with_peer_hunks,
-    unstaged_raw_changes_with_peer_hunks, FileChange,
+    collect_files_for_target, include_file_in_diff, unstaged_file_diffs_with_peer_hunks,
+    unstaged_raw_changes_with_peer_hunks, unstaged_raw_changes_with_peer_hunks_in,
 };
 pub use targets::{
     resolve_commit_diff_pathspecs, resolve_diff_arguments, resolve_diff_request, DiffArguments,
@@ -101,10 +107,6 @@ pub mod combined_diff_patch {
 pub mod combined_tree_diff {
     //! combined_tree_diff API (re-exported at this path).
     pub use crate::combined_tree_diff::*;
-}
-pub mod diffstat {
-    //! diffstat API (re-exported at this path).
-    pub use crate::diffstat::*;
 }
 pub mod patch_ids {
     //! patch_ids API (re-exported at this path).

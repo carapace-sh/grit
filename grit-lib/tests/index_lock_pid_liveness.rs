@@ -10,7 +10,7 @@ use std::process::Command;
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::error::Error;
 use grit_lib::index::IndexLock;
-use grit_lib::lockfile::LockHolder;
+use grit_lib::lockfile::{grit_lockfile_pid_enabled, pid_path_for_lock, LockHolder};
 use grit_lib::porcelain::add::{stage, StageOptions};
 use grit_lib::progress::NullProgress;
 use grit_lib::repo::Repository;
@@ -43,6 +43,64 @@ fn expect_lock_held(err: Error) -> (std::path::PathBuf, Option<LockHolder>) {
         Error::LockHeld { path, holder } => (path, holder),
         other => panic!("expected Error::LockHeld, got {other:?}"),
     }
+}
+
+#[test]
+fn index_lock_acquire_writes_pid_sidecar_by_default() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let index_path = tmp.path().join("index");
+    fs::write(&index_path, b"").expect("touch index");
+    let lock_path = index_path.with_extension("lock");
+    let lock = IndexLock::acquire(&index_path, None).expect("acquire");
+    let pid_path = pid_path_for_lock(&lock_path);
+    assert_eq!(
+        fs::read_to_string(&pid_path).expect("sidecar"),
+        format!("pid {}\n", std::process::id())
+    );
+    drop(lock);
+    assert!(!lock_path.exists());
+    assert!(!pid_path.exists());
+}
+
+#[test]
+fn index_lock_acquire_skips_pid_sidecar_when_lockfile_pid_disabled() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let git_dir = tmp.path();
+    fs::write(git_dir.join("config"), "[core]\n\tlockfilePid = false\n").expect("config");
+    let index_path = git_dir.join("index");
+    fs::write(&index_path, b"").expect("touch index");
+    assert!(!grit_lockfile_pid_enabled(None, Some(git_dir)));
+    let lock = IndexLock::acquire(&index_path, None).expect("acquire");
+    assert!(!pid_path_for_lock(&index_path.with_extension("lock")).exists());
+    drop(lock);
+}
+
+#[test]
+fn lock_holder_remove_if_stale_unlinks_dead_holder() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let lock_path = tmp.path().join("index.lock");
+    hold_lock(&lock_path, Some(DEAD_PID));
+    assert!(LockHolder::remove_if_stale(&lock_path).expect("remove"));
+    assert!(!lock_path.exists());
+    assert!(!tmp.path().join("index~pid.lock").exists());
+}
+
+#[test]
+fn lock_holder_remove_if_stale_keeps_live_holder() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let lock_path = tmp.path().join("index.lock");
+    hold_lock(&lock_path, Some(u64::from(std::process::id())));
+    assert!(!LockHolder::remove_if_stale(&lock_path).expect("probe"));
+    assert!(lock_path.exists());
+}
+
+#[test]
+fn lock_holder_remove_if_stale_without_sidecar_is_noop() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let lock_path = tmp.path().join("index.lock");
+    hold_lock(&lock_path, None);
+    assert!(!LockHolder::remove_if_stale(&lock_path).expect("probe"));
+    assert!(lock_path.exists());
 }
 
 #[test]

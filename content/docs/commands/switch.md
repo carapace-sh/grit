@@ -30,7 +30,7 @@ Use `--dry-run` to run the same overwrite checks and report how many paths would
 
 On the first switch after `clone --no-checkout`, the dry-run count includes every path to materialize, including files unchanged between the old and new commits.
 
-A switch either completes or changes nothing. Pressing Ctrl+C while files are being checked out stops the switch with `error: operation cancelled`; `HEAD`, the index and the work tree are left exactly as they were, so `grit status` stays clean and the same switch can simply be run again. A second Ctrl+C terminates grit at once, without that cleanup. In the rare case that a path cannot be put back (for example a directory that became read-only), the error has kind `checkout_incomplete` and lists those paths in `paths`; `HEAD` and the index still did not move.
+A switch either completes or changes nothing. Pressing Ctrl+C, or sending `SIGTERM` or `SIGHUP` on Unix, while files are being checked out stops the switch with `error: operation cancelled`; `HEAD`, the index and the work tree are left exactly as they were, so `grit status` stays clean, no `.git/index.lock` is left behind and the same switch can simply be run again. This works the same in a Windows console, where Ctrl+Break counts as Ctrl+C. A second interrupt terminates grit at once, without that cleanup; only `SIGKILL` or closing the console window skips rollback. In the rare case that a path cannot be put back (for example a directory that became read-only), the error has kind `checkout_incomplete` and lists those paths in `paths`; `HEAD` and the index still did not move.
 
 Switching is refused while a merge, rebase, pick, revert or `am` is paused, whether grit or `git` started it: those operations finish by committing onto the current `HEAD`, so moving it would land their result on the wrong branch. When grit knows how the operation finishes or is cancelled (merge, rebase, pick, revert), the error names those commands. `--dry-run` is refused too. A bisect does not block a switch.
 
@@ -152,6 +152,9 @@ Pass `--json` for stable, scripting-friendly output:
 | `stranded_commits` | array | Commits only the previous detached `HEAD` reached, newest first, at most 20. Each has `oid`, `change_id` and `subject`. Omitted when nothing is left behind. |
 | `stranded_total` | integer | Advisory count of commits left behind (may exceed the length of `stranded_commits`). Without a commit-graph, severe clock skew can make this inaccurate; it never controls the switch. Omitted when zero. |
 | `stranded_truncated` | boolean | `true` when `stranded_commits` was capped (omitted when false). |
+| `path_collisions` | array of strings | Index paths that collided during checkout on a case-insensitive filesystem. Omitted when empty. |
+
+On a case-insensitive filesystem (`core.ignorecase`), when the destination tree contains paths that differ only by case (or other spellings that map to one on-disk file), grit prints a **warning** on **stderr** in human mode listing every colliding index path, the same message as [`grit clone`](clone/). Only one path from each group exists on disk; status and diff treat index rows whose blob does not match the shared dentry as modified.
 
 Example (branch switch):
 

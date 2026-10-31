@@ -66,6 +66,16 @@
     "operation": {
       "type": "string"
     },
+    "refs": {
+      "description": "Other branches whose replay would conflict; absent when the conflict is on the rebased branch itself.",
+      "items": {
+        "type": "string"
+      },
+      "type": [
+        "array",
+        "null"
+      ]
+    },
     "result": {
       "$ref": "#/definitions/RebaseCheckResult"
     }

@@ -2,6 +2,7 @@
 name = "grit-http-server"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 autotests = false
 license = "MIT"
 description = "Git smart HTTP server powered by grit"

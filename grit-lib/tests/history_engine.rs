@@ -421,7 +421,23 @@ fn plan_rewrite_non_commit_tip_returns_planning_error() {
         .odb()
         .write(ObjectKind::Blob, b"not a commit")
         .expect("blob");
-    grit_lib::refs::write_ref(grit.git_dir(), "refs/heads/main", &blob).expect("ref");
+    // A corrupt branch on purpose: ref writes refuse a branch at a blob unless told not to check.
+    let corrupt = grit_lib::refs::store::RefTransaction::new()
+        .update(grit_lib::refs::store::RefUpdate {
+            name: "refs/heads/main".to_owned(),
+            new_value: Some(grit_lib::refs::store::RawRef::Direct(blob)),
+            expected: grit_lib::refs::store::Expected::Any,
+            reflog: None,
+            flags: grit_lib::refs::store::RefUpdateFlags {
+                skip_oid_verification: true,
+                ..Default::default()
+            },
+        })
+        .expect("txn");
+    grit.refs()
+        .prepare(corrupt)
+        .and_then(|prepared| prepared.commit())
+        .expect("ref");
     let mut edits = HistoryEdits::new();
     edits.insert(
         blob,
@@ -904,9 +920,11 @@ fn plan_rewrite_empty_policy_drop_keep_abort() {
 fn plan_rewrite_rejects_branch_checked_out_in_other_worktree() {
     let repo = HistoryRepo::init();
     let wt = repo.worktree();
-    let oids = build_commit_dag(wt, &[("b", "a")], &[("b", "refs/heads/main")]);
-    git(wt, &["branch", "feature"]);
-    let feature_tip = git_rev_parse(wt, "feature").expect("feature");
+    let oids = build_commit_dag(
+        wt,
+        &[("b", "a"), ("c", "b")],
+        &[("b", "refs/heads/main"), ("c", "refs/heads/feature")],
+    );
     let linked = tempfile::tempdir().expect("linked wt dir");
     git(
         wt,
@@ -945,7 +963,50 @@ fn plan_rewrite_rejects_branch_checked_out_in_other_worktree() {
         err,
         grit_lib::revwalk::history::HistoryError::BranchCheckedOutElsewhere { .. }
     ));
-    let _ = feature_tip;
+}
+
+#[test]
+fn plan_rewrite_skips_same_tip_branch_checked_out_in_other_worktree() {
+    let repo = HistoryRepo::init();
+    let wt = repo.worktree();
+    let oids = build_commit_dag(wt, &[("b", "a")], &[("b", "refs/heads/main")]);
+    git(wt, &["branch", "feature"]);
+    let linked = tempfile::tempdir().expect("linked wt dir");
+    git(
+        wt,
+        &[
+            "worktree",
+            "add",
+            linked.path().to_str().expect("utf8"),
+            "feature",
+        ],
+    );
+
+    let grit = open_grit(wt);
+    let mut edits = HistoryEdits::new();
+    edits.insert(
+        oids["a"],
+        CommitEdit::Rewrite {
+            tree: None,
+            message: Some("reword\n".into()),
+            author: None,
+            parents: None,
+        },
+    );
+    let plan = plan_rewrite(
+        &grit,
+        &edits,
+        &RewriteOptions {
+            scope: RefScope::Branches,
+            empty: EmptyPolicy::Drop,
+            committer: committer(11).parse().expect("signature"),
+            preserve_committer: false,
+            sign: true,
+        },
+    )
+    .expect("same-tip branch is out of scope");
+    let moved: Vec<&str> = plan.ref_updates.iter().map(|u| u.name.as_str()).collect();
+    assert_eq!(moved, ["refs/heads/main"]);
 }
 
 #[test]

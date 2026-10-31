@@ -1,5 +1,5 @@
-//! `grit auth` — sign in to GitHub with the OAuth **Device Flow** and store the
-//! resulting token in Git's credential store.
+//! `grit auth` — sign in to grithub or GitHub (with the OAuth **Device Flow**)
+//! and store the resulting token in Git's credential store.
 //!
 //! The protocol lives in [`grit_lib::remote::github_auth`]: `grit` asks GitHub
 //! for a device code, tells you to enter the short user code at
@@ -10,6 +10,13 @@
 //!
 //! There is no intermediate service: every request goes straight to github.com.
 //!
+//! ## Which host
+//!
+//! Without a URL, `grit auth` signs in to GitHub only when the current
+//! repository's `origin` is on github.com; everywhere else it signs in to
+//! grithub ([`GRITHUB_URL`]), a `grit serve`-style host, as below
+//! ([`default_host`]). `grit auth https://github.com` always means GitHub.
+//!
 //! ## `grit serve` hosts
 //!
 //! `grit auth <url>` (or `grit login <url>`) signs in to a `grit serve` host
@@ -19,6 +26,16 @@
 //! for the URL's scheme and host with the same credential helper (see
 //! [`grit_lib::remote::grit_server_auth`]). `--token` stores a token an admin
 //! made with `grit serve token` instead, after checking it with the server.
+//!
+//! ## Any other HTTPS host
+//!
+//! `grit auth <url> --username <user> --token <token>` stores a user name and
+//! token (or password) for the URL (its scheme and host, plus the path under
+//! `credential.useHttpPath`) with the same credential
+//! helper, without contacting the server: grit never prompts for a password,
+//! so this is how a person saves one for GitLab, Gitea, Bitbucket or any other
+//! Basic-auth host. The next push or fetch sends it, and a host that refuses it
+//! has it erased.
 //!
 //! ## Credential helper
 //!
@@ -36,7 +53,9 @@
 
 use std::io::{IsTerminal, Write};
 
-use anyhow::{anyhow, bail, Context, Result};
+#[cfg(not(windows))]
+use anyhow::bail;
+use anyhow::{anyhow, Context, Result};
 use grit_lib::config::ConfigSet;
 use grit_lib::remote::credentials::Credential;
 use grit_lib::remote::credentials::{CredentialProvider, HelperCredentialProvider};
@@ -45,7 +64,8 @@ use grit_lib::remote::github_auth::{
     SystemPollClock, GITHUB_HOST,
 };
 use grit_lib::remote::grit_server_auth::{
-    fetch_identity, LoginFlow, ServerAuthError, ServerUrl, TokenCredentialProvider,
+    credential_for_url, fetch_identity, LoginFlow, ServerAuthError, ServerUrl,
+    TokenCredentialProvider,
 };
 use grit_lib::remote::http_client::UreqHttpClient;
 use grit_lib::repo::Repository;
@@ -64,15 +84,24 @@ fn is_false(value: &bool) -> bool {
 pub struct AuthOutcome {
     pub authenticated: bool,
     pub host: String,
-    /// The user the token belongs to on a `grit serve` host (absent for GitHub).
+    /// The user the token belongs to on a `grit serve` host, or the `--username`
+    /// it was stored for (absent for GitHub).
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
+    /// Whether the host confirmed the token. `false` for `--username`/`--token`,
+    /// which stores it without contacting the host.
+    pub verified: bool,
 }
 
 impl HumanRender for AuthOutcome {
     fn render_human(&self, w: &mut dyn Write, _ctx: &RenderContext) -> Result<()> {
         match &self.user {
+            Some(user) if !self.verified => outln!(
+                w,
+                "✓ Stored the token for {user} on {} — the next push or fetch uses it.",
+                self.host
+            ),
             Some(user) => outln!(w, "✓ Signed in to {} as {user} — token stored.", self.host),
             None => outln!(
                 w,
@@ -168,6 +197,60 @@ impl MarkdownRender for LogoutOutcome {
 /// `grit.githubClientId` config key.
 const DEFAULT_GITHUB_CLIENT_ID: &str = "Ov23lin6WOpOsGuXSupZ";
 
+/// The host `grit auth` signs in to when no URL is given: grithub.
+pub const GRITHUB_URL: &str = "https://grithub.dev";
+
+/// Where `grit auth` (or `grit auth logout`) without a URL goes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DefaultHost {
+    /// GitHub, with its device flow: the current repository's `origin` is on github.com.
+    GitHub,
+    /// A grit server: grithub, or `$GRIT_DEFAULT_HOST` when set.
+    Grit(ServerUrl),
+}
+
+/// Pick the host for `grit auth` without a URL: GitHub when the current
+/// repository's `origin` is a github.com URL, otherwise grithub
+/// ([`GRITHUB_URL`], or the `GRIT_DEFAULT_HOST` environment variable).
+///
+/// # Errors
+///
+/// Fails when `GRIT_DEFAULT_HOST` is not an `http`/`https` URL.
+pub fn default_host() -> Result<DefaultHost> {
+    let config = load_config();
+    if config
+        .get("remote.origin.url")
+        .is_some_and(|url| is_github_url(&url))
+    {
+        return Ok(DefaultHost::GitHub);
+    }
+    match grit_server(&default_grit_host_url())? {
+        Some(server) => Ok(DefaultHost::Grit(server)),
+        None => Ok(DefaultHost::GitHub),
+    }
+}
+
+/// The grit server used when none is named: `$GRIT_DEFAULT_HOST`, else [`GRITHUB_URL`].
+pub fn default_grit_host_url() -> String {
+    crate::context::environment()
+        .var("GRIT_DEFAULT_HOST")
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| GRITHUB_URL.to_owned())
+}
+
+/// Whether `url` (HTTPS, `ssh://` or scp-style `git@github.com:owner/repo`) is on github.com.
+fn is_github_url(url: &str) -> bool {
+    if is_github_https_url(url) {
+        return true;
+    }
+    let rest = url.strip_prefix("ssh://").unwrap_or(url);
+    let authority = rest.split(['/', ':']).next().unwrap_or_default();
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    host.eq_ignore_ascii_case(GITHUB_HOST) || host.eq_ignore_ascii_case("www.github.com")
+}
+
 /// Run the interactive `grit auth` device flow and store the token.
 pub fn run() -> Result<AuthOutcome> {
     let mut config = load_config();
@@ -204,6 +287,7 @@ pub fn run() -> Result<AuthOutcome> {
         authenticated: true,
         host: GITHUB_HOST.to_owned(),
         user: None,
+        verified: true,
     })
 }
 
@@ -231,10 +315,11 @@ pub fn grit_server(url: &str) -> Result<Option<ServerUrl>> {
 /// Fails when no credential helper can be set up, the server cannot be
 /// reached or is not a grit server, the user declines, or the code expires.
 pub fn run_server_login(server: &ServerUrl) -> Result<AuthOutcome> {
-    let config = credential_config(server)?;
-    let http = UreqHttpClient::from_config(&config).context("could not set up HTTP client")?;
+    let http =
+        UreqHttpClient::from_config(&load_config()).context("could not set up HTTP client")?;
     let flow = LoginFlow::new(&http, server);
     let login = flow.start().map_err(|e| server_error(server, e))?;
+    let config = credential_config(server)?;
     let url = server.authorize_url(&login.user_code);
 
     // Like the GitHub flow, the instructions are interactive UX: stderr only.
@@ -258,6 +343,7 @@ pub fn run_server_login(server: &ServerUrl) -> Result<AuthOutcome> {
         authenticated: true,
         host: server.host().to_owned(),
         user: Some(grant.email),
+        verified: true,
     })
 }
 
@@ -269,13 +355,12 @@ pub fn run_server_login(server: &ServerUrl) -> Result<AuthOutcome> {
 /// Fails when no credential helper can be set up, the server rejects the
 /// token or cannot be reached, or the helper cannot store it.
 pub fn run_server_token(server: &ServerUrl, token: &str) -> Result<AuthOutcome> {
-    let config = credential_config(server)?;
-    let http = UreqHttpClient::from_config(&config)
+    let http = UreqHttpClient::from_config(&load_config())
         .context("could not set up HTTP client")?
         .with_credential_provider(Box::new(TokenCredentialProvider::new(token)));
     let identity = fetch_identity(&http, server).map_err(|e| server_error(server, e))?;
 
-    HelperCredentialProvider::new(config)
+    HelperCredentialProvider::new(credential_config(server)?)
         .approve(&server.credential(Some(&identity.email), Some(token)))
         .context("storing the token with your credential helper")?;
 
@@ -283,6 +368,38 @@ pub fn run_server_token(server: &ServerUrl, token: &str) -> Result<AuthOutcome> 
         authenticated: true,
         host: server.host().to_owned(),
         user: Some(identity.email),
+        verified: true,
+    })
+}
+
+/// Run `grit auth <url> --username <user> --token <token>`: store `token` as
+/// `username`'s password for `url` with the credential helper, keyed the way a
+/// fetch or push to `url` looks it up (see [`credential_for_url`]), setting up
+/// a helper first when there is none. Works for any HTTP(S) host; nothing is
+/// sent to it.
+///
+/// # Errors
+///
+/// Fails when `url` is not an `http`/`https` URL with a host, or no credential
+/// helper can be set up or store the token.
+pub fn store_token(url: &str, username: &str, token: &str) -> Result<AuthOutcome> {
+    let to_store = |config: &ConfigSet| {
+        credential_for_url(url, config, username, token).map_err(|e| anyhow!("{e}"))
+    };
+    let mut config = load_config();
+    let mut credential = to_store(&config)?;
+    if !has_token_helper(&config, &credential) {
+        config = ensure_credential_helper()?;
+        credential = to_store(&config)?;
+    }
+    HelperCredentialProvider::new(config)
+        .approve(&credential)
+        .context("storing the token with your credential helper")?;
+    Ok(AuthOutcome {
+        authenticated: true,
+        host: credential.host.unwrap_or_default(),
+        user: Some(username.to_owned()),
+        verified: false,
     })
 }
 
@@ -308,6 +425,12 @@ fn server_error(server: &ServerUrl, err: ServerAuthError) -> anyhow::Error {
         ServerAuthError::LoginExpired => {
             anyhow!("the code expired before you approved it. Run `grit auth {root}` to try again.")
         }
+        ServerAuthError::NotGritServer(_) => anyhow!(
+            "{root} is not a `grit serve` host; `grit auth <url>` signs in only to GitHub and grit serve.\n\
+             Store a user name and token (or password) for it with \
+             `grit auth {root} --username <user> --token <token>`, \
+             or use a credential helper or GIT_ASKPASS."
+        ),
         ServerAuthError::Http(source) => {
             anyhow::Error::new(source).context(format!("signing in to {root}"))
         }
@@ -555,5 +678,31 @@ fn device_flow_error(err: DeviceFlowError) -> anyhow::Error {
             anyhow!("unexpected response from GitHub while polling for the token")
         }
         other => anyhow::Error::new(other),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn github_urls_in_every_form() {
+        for url in [
+            "https://github.com/o/r.git",
+            "https://x-access-token@github.com/o/r",
+            "git@github.com:o/r.git",
+            "ssh://git@github.com/o/r.git",
+            "github.com:o/r",
+        ] {
+            assert!(is_github_url(url), "{url}");
+        }
+        for url in [
+            "https://grithub.dev/o/r.git",
+            "git@gitlab.com:o/r.git",
+            "/srv/repos/r.git",
+            "https://github.com.evil.example/o/r",
+        ] {
+            assert!(!is_github_url(url), "{url}");
+        }
     }
 }

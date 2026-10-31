@@ -105,39 +105,6 @@ fn file_entry_at_path(
     Ok(lookup_index_entry_at_path(cache, odb, tree_oid, path)?.filter(|e| e.mode != MODE_DIR))
 }
 
-pub(crate) fn paths_from_tree_diff(
-    odb: &Odb,
-    base: &ObjectId,
-    other: &ObjectId,
-) -> crate::error::Result<HashSet<Vec<u8>>> {
-    use crate::diff::{diff_trees, DiffStatus};
-    let entries = diff_trees(odb, Some(base), Some(other), "")?;
-    let mut out = HashSet::new();
-    for e in entries {
-        if e.status == DiffStatus::Unmerged {
-            continue;
-        }
-        if let Some(p) = e.old_path {
-            out.insert(crate::repo_relpath::storage_bytes(&p).into_owned());
-        }
-        if let Some(p) = e.new_path {
-            out.insert(crate::repo_relpath::storage_bytes(&p).into_owned());
-        }
-    }
-    Ok(out)
-}
-
-pub(crate) fn collect_touched_merge_paths(
-    odb: &Odb,
-    base_tree: &ObjectId,
-    ours_tree: &ObjectId,
-    theirs_tree: &ObjectId,
-) -> crate::error::Result<HashSet<Vec<u8>>> {
-    let mut touched = paths_from_tree_diff(odb, base_tree, ours_tree)?;
-    touched.extend(paths_from_tree_diff(odb, base_tree, theirs_tree)?);
-    Ok(touched)
-}
-
 type SparseSideMaps = (
     BTreeMap<Vec<u8>, IndexEntry>,
     BTreeMap<Vec<u8>, IndexEntry>,
@@ -665,11 +632,12 @@ pub(crate) fn three_way_on_touched_paths(
     ws: WhitespaceMergeOptions,
     diff_algorithm: Option<&str>,
     presentation: TreeMergeConflictPresentation<'_>,
+    call_depth: usize,
 ) -> crate::error::Result<TreeMergeOutput> {
     use std::collections::HashSet as HSet;
 
     let odb = repo.odb();
-    let ctx = PathMergeContext::new(repo);
+    let ctx = PathMergeContext::new(repo, call_depth);
     let mut out = crate::index::Index::new();
     let mut conflict_content = BTreeMap::new();
     let mut handled_base: HSet<&[u8]> = HSet::new();
@@ -906,6 +874,7 @@ pub(crate) fn three_way_on_touched_paths(
         result_tree: ObjectId::zero(),
         touched_paths: touched.clone(),
         rename_conflicts,
+        directory_rename_conflicts: Vec::new(),
     })
 }
 

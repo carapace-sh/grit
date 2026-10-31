@@ -4,17 +4,13 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use crate::change_id::{
-    change_id, set_change_id, ChangeId, ChangeIdError, ChangeIdGenerator, ChangeIdPolicy,
-};
+use crate::change_id::{change_id, set_change_id, ChangeId, ChangeIdGenerator, ChangeIdPolicy};
 use crate::commit::signing::extra_headers_without_commit_signatures;
 use crate::commit_encoding::identity_raw_for_serialized_commit;
 use crate::error::Error;
 use crate::merge_base::is_ancestor;
 use crate::merge_file::MergeFavor;
-use crate::merge_trees::{
-    merge_trees_three_way, TreeMergeConflictPresentation, TreeMergeOutput, WhitespaceMergeOptions,
-};
+use crate::merge_trees::{ReplayConflictLabels, TreeMergeOutput};
 use crate::objects::{serialize_commit, CommitData, HashAlgo, ObjectId, ObjectKind};
 use crate::porcelain::commit::prepare_commit_bytes;
 use crate::repo::Repository;
@@ -23,16 +19,17 @@ use crate::state::resolve_head_for_repository;
 use crate::worktree::{find_worktree_with_branch_checked_out, worktree_admin_dir};
 
 use super::error::HistoryError;
-use super::subject::subject_for_rewrite_row;
+use super::replay_merge_session::ReplayMergeSession;
+use super::subject::{
+    commit_message_subject_line, replay_conflict_labels, subject_for_rewrite_row,
+};
 use super::types::{
     CommitEdit, EmptyPolicy, HeadEffect, HistoryEdits, PlannedRefUpdate, RefScope, RewriteOptions,
     RewritePlan, RewrittenCommit,
 };
 
-// hygiene: resumable replay control and merge-tree call counter (thread-local for parallel tests)
+// hygiene: resumable replay control (thread-local for parallel tests)
 thread_local! {
-    #[cfg(any(test, feature = "unstable-bench-helpers"))]
-    static MERGE_TREE_CALLS: Cell<usize> = const { Cell::new(0) };
     static RESUMABLE_REPLAY: Cell<bool> = const { Cell::new(false) };
     static REPLAY_STOP_PARENT: Cell<Option<ObjectId>> = const { Cell::new(None) };
     static REPLAY_STOP_COMMIT: Cell<Option<ObjectId>> = const { Cell::new(None) };
@@ -109,34 +106,6 @@ fn take_resumable_conflict() -> Option<PartialReplayConflict> {
     })
 }
 
-/// Test hook: number of three-way tree merges performed by planning.
-#[cfg(any(test, feature = "unstable-bench-helpers"))]
-#[doc(hidden)]
-#[must_use]
-pub fn test_merge_tree_call_count() -> usize {
-    #[cfg(any(test, feature = "unstable-bench-helpers"))]
-    {
-        MERGE_TREE_CALLS.with(|c| c.get())
-    }
-    #[cfg(not(any(test, feature = "unstable-bench-helpers")))]
-    {
-        0
-    }
-}
-
-/// Reset [`test_merge_tree_call_count`].
-#[cfg(any(test, feature = "unstable-bench-helpers"))]
-#[doc(hidden)]
-pub fn test_reset_merge_tree_call_count() {
-    #[cfg(any(test, feature = "unstable-bench-helpers"))]
-    MERGE_TREE_CALLS.with(|c| c.set(0));
-}
-
-fn record_merge_call() {
-    #[cfg(any(test, feature = "unstable-bench-helpers"))]
-    MERGE_TREE_CALLS.with(|c| c.set(c.get() + 1));
-}
-
 struct ChangeIdWriteContext {
     policy: ChangeIdPolicy,
     generator: Arc<dyn ChangeIdGenerator>,
@@ -151,12 +120,6 @@ impl ChangeIdWriteContext {
             generator: repo.change_id_generator(),
             hash_algo: repo.odb().hash_algo(),
         })
-    }
-}
-
-fn change_id_err(err: ChangeIdError) -> HistoryError {
-    HistoryError::Planning {
-        message: err.to_string(),
     }
 }
 
@@ -189,6 +152,7 @@ pub fn plan_rewrite(
 /// Turn a replay conflict during resumable planning into partial progress; other errors pass through.
 #[allow(clippy::too_many_arguments)]
 fn finish_plan_rewrite_on_replay_error(
+    repo: &Repository,
     err: HistoryError,
     mapping: HashMap<ObjectId, ObjectId>,
     rewritten: Vec<RewrittenCommit>,
@@ -214,7 +178,7 @@ fn finish_plan_rewrite_on_replay_error(
             )));
         }
     }
-    Err(err)
+    Err(attribute_conflict_to_refs(repo, err, &scoped_refs))
 }
 
 /// Like [`plan_rewrite_with_order`], but may stop on the first replay conflict and return partial progress.
@@ -224,6 +188,7 @@ pub(crate) fn plan_rewrite_with_order_resumable(
     opts: &RewriteOptions,
     replay_order: Option<&[ObjectId]>,
     linearize_onto: Option<ObjectId>,
+    merge_favor: MergeFavor,
 ) -> Result<ResumablePlanOutcome, HistoryError> {
     plan_rewrite_with_order_resumable_seeded(
         repo,
@@ -231,18 +196,21 @@ pub(crate) fn plan_rewrite_with_order_resumable(
         opts,
         replay_order,
         linearize_onto,
+        merge_favor,
         None,
         None,
     )
 }
 
 /// Resumable planning with an existing partial mapping (continue/skip after a stop).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn plan_rewrite_with_order_resumable_seeded(
     repo: &Repository,
     edits: &HistoryEdits,
     opts: &RewriteOptions,
     replay_order: Option<&[ObjectId]>,
     linearize_onto: Option<ObjectId>,
+    merge_favor: MergeFavor,
     seed: Option<(HashMap<ObjectId, ObjectId>, Vec<RewrittenCommit>)>,
     scoped_refs: Option<Vec<(String, ObjectId)>>,
 ) -> Result<ResumablePlanOutcome, HistoryError> {
@@ -253,7 +221,7 @@ pub(crate) fn plan_rewrite_with_order_resumable_seeded(
             opts,
             replay_order,
             linearize_onto,
-            MergeFavor::default(),
+            merge_favor,
             seed,
             scoped_refs,
         )
@@ -392,6 +360,7 @@ fn plan_rewrite_with_order_impl(
     // Tip of the linear chain built so far when linearizing; every replay-order entry maps to
     // the tip as it stood once that entry was handled.
     let mut linear_tip = linearize_onto;
+    let mut replay_session = ReplayMergeSession::default();
 
     for &old_oid in &commits_to_replay {
         if skip_replayed.contains(&old_oid) {
@@ -413,10 +382,18 @@ fn plan_rewrite_with_order_impl(
 
         if let Some(CommitEdit::Reuse { existing, parent }) = edit {
             // Descendants and refs continue from the replay chain, while the row still names
-            // the upstream commit.
-            let continuation =
-                linear_tip.unwrap_or_else(|| mapping.get(parent).copied().unwrap_or(*parent));
-            mapping.insert(old_oid, continuation);
+            // the upstream commit. When the reused commit is the source itself, keep that OID
+            // in the mapping so refs and `HEAD` stay put (identity `--exec` replay).
+            if *existing == old_oid {
+                mapping.insert(old_oid, *existing);
+                if linear_tip.is_some() {
+                    linear_tip = Some(*existing);
+                }
+            } else {
+                let continuation =
+                    linear_tip.unwrap_or_else(|| mapping.get(parent).copied().unwrap_or(*parent));
+                mapping.insert(old_oid, continuation);
+            }
             rewritten.push(RewrittenCommit {
                 old: old_oid,
                 new: Some(*existing),
@@ -478,7 +455,7 @@ fn plan_rewrite_with_order_impl(
             }
         }
 
-        let replay_step = || -> Result<(ObjectId, Option<ObjectId>), HistoryError> {
+        let mut replay_step = || -> Result<(ObjectId, Option<ObjectId>), HistoryError> {
             match edit {
                 None => {
                     let oid = replay_commit_descendant(
@@ -490,6 +467,7 @@ fn plan_rewrite_with_order_impl(
                         insert_parent,
                         merge_favor,
                         opts,
+                        &mut replay_session,
                     )?;
                     Ok((oid, Some(oid)))
                 }
@@ -503,6 +481,7 @@ fn plan_rewrite_with_order_impl(
                         insert_parent,
                         merge_favor,
                         opts,
+                        &mut replay_session,
                     )?;
                     Ok((oid, Some(oid)))
                 }
@@ -548,6 +527,7 @@ fn plan_rewrite_with_order_impl(
                             merge_favor,
                             opts,
                             Some(&parent_list),
+                            &mut replay_session,
                         )?
                     } else {
                         replay_edited_commit(
@@ -561,6 +541,7 @@ fn plan_rewrite_with_order_impl(
                             &old.message,
                             merge_favor,
                             opts,
+                            &mut replay_session,
                         )?
                     };
                     Ok((oid, Some(oid)))
@@ -618,6 +599,7 @@ fn plan_rewrite_with_order_impl(
                             message,
                             merge_favor,
                             opts,
+                            &mut replay_session,
                         )?
                     };
                     Ok((oid, Some(oid)))
@@ -632,6 +614,7 @@ fn plan_rewrite_with_order_impl(
             Ok(v) => v,
             Err(err) => {
                 return finish_plan_rewrite_on_replay_error(
+                    repo,
                     err,
                     mapping,
                     rewritten,
@@ -732,6 +715,7 @@ pub fn plan_replay_linear_segment(
 
     let mut mapping: HashMap<ObjectId, ObjectId> = HashMap::new();
     let mut parent: Option<ObjectId> = parents_of_oldest.first().copied();
+    let mut replay_session = ReplayMergeSession::default();
 
     for &old_oid in replay_order {
         let old = load_commit(repo, old_oid)?;
@@ -747,6 +731,7 @@ pub fn plan_replay_linear_segment(
             &old.message,
             MergeFavor::default(),
             opts,
+            &mut replay_session,
         )?;
         mapping.insert(old_oid, new_oid);
         parent = Some(new_oid);
@@ -972,8 +957,20 @@ pub(crate) fn collect_scoped_refs(
             }
         },
         RefScope::Branches => {
+            let (checked_out, head_tip) = match &head {
+                crate::state::HeadState::Branch { refname, oid, .. } => {
+                    (Some(refname.as_str()), *oid)
+                }
+                crate::state::HeadState::Detached { oid } => (None, Some(*oid)),
+                crate::state::HeadState::Invalid => (None, None),
+            };
             let branches = repo.references().list("refs/heads/").map_err(library_err)?;
             for (name, oid) in branches {
+                // Another branch at the checked-out tip is a backup of it, not a stacked
+                // branch, so it keeps the pre-rewrite commits.
+                if head_tip == Some(oid) && checked_out != Some(name.as_str()) {
+                    continue;
+                }
                 if is_ancestor(repo, oldest, oid).map_err(library_err)? {
                     out.push((name, oid));
                 }
@@ -1047,6 +1044,7 @@ fn replay_commit_descendant(
     extra_parent: Option<ObjectId>,
     merge_favor: MergeFavor,
     opts: &RewriteOptions,
+    replay_session: &mut ReplayMergeSession,
 ) -> Result<ObjectId, HistoryError> {
     if old.parents.len() > 1 {
         return replay_merge_descendant(
@@ -1059,6 +1057,7 @@ fn replay_commit_descendant(
             merge_favor,
             opts,
             None,
+            replay_session,
         );
     }
     replay_descendant(
@@ -1070,6 +1069,73 @@ fn replay_commit_descendant(
         extra_parent,
         merge_favor,
         opts,
+        replay_session,
+    )
+}
+
+/// Replay `commit` onto the replacements `mapping` records for its parents, keeping its
+/// author, message and change id.
+///
+/// Returns the replacement, or the mapped first parent when the replay became empty and
+/// `opts.empty` is [`EmptyPolicy::Drop`].
+///
+/// # Errors
+///
+/// [`HistoryError::Conflict`] when the tree merge conflicts, [`HistoryError::BecameEmpty`]
+/// under [`EmptyPolicy::Abort`], and object database or signing failures.
+pub(crate) fn replay_commit_onto_mapping(
+    repo: &Repository,
+    mapping: &HashMap<ObjectId, ObjectId>,
+    commit: ObjectId,
+    opts: &RewriteOptions,
+) -> Result<ObjectId, HistoryError> {
+    let change_ids = ChangeIdWriteContext::from_repo(repo)?;
+    let old = load_commit(repo, commit)?;
+    let mut replay_session = ReplayMergeSession::default();
+    replay_commit_descendant(
+        repo,
+        &change_ids,
+        mapping,
+        &old,
+        commit,
+        None,
+        MergeFavor::default(),
+        opts,
+        &mut replay_session,
+    )
+}
+
+/// Write the replacement of `template` with a caller-resolved `tree` on top of `parent`,
+/// keeping its author, message and change id.
+///
+/// # Errors
+///
+/// Object database or signing failures.
+pub(crate) fn write_resolved_replay(
+    repo: &Repository,
+    template: ObjectId,
+    tree: ObjectId,
+    parent: ObjectId,
+    opts: &RewriteOptions,
+) -> Result<ObjectId, HistoryError> {
+    let change_ids = ChangeIdWriteContext::from_repo(repo)?;
+    let old = load_commit(repo, template)?;
+    let committer = if opts.preserve_committer {
+        old.committer.clone()
+    } else {
+        opts.committer_line()?
+    };
+    write_rewritten_commit(
+        repo,
+        opts,
+        &change_ids,
+        &old,
+        template,
+        tree,
+        &[parent],
+        &old.author,
+        &committer,
+        &old.message,
     )
 }
 
@@ -1083,6 +1149,7 @@ fn replay_descendant(
     extra_parent: Option<ObjectId>,
     merge_favor: MergeFavor,
     opts: &RewriteOptions,
+    replay_session: &mut ReplayMergeSession,
 ) -> Result<ObjectId, HistoryError> {
     let committer_line = opts.committer_line()?;
     let (_, new_parent) = replay_parent_pair(repo, old, mapping, extra_parent)?;
@@ -1097,6 +1164,7 @@ fn replay_descendant(
         &old.message,
         merge_favor,
         opts,
+        replay_session,
     )
 }
 
@@ -1111,12 +1179,20 @@ fn replay_merge_descendant(
     merge_favor: MergeFavor,
     opts: &RewriteOptions,
     parent_list_override: Option<&[ObjectId]>,
+    replay_session: &mut ReplayMergeSession,
 ) -> Result<ObjectId, HistoryError> {
     let committer_line = opts.committer_line()?;
     let parent_list = parent_list_override
         .map(<[_]>::to_vec)
         .unwrap_or_else(|| mapped_merge_parents(old, mapping, extra_parent));
-    let result_tree = replay_merge_tree(repo, old, old_oid, &parent_list, merge_favor)?;
+    let result_tree = replay_merge_tree(
+        repo,
+        old,
+        old_oid,
+        &parent_list,
+        merge_favor,
+        replay_session,
+    )?;
 
     let committer = if opts.preserve_committer {
         old.committer.as_str()
@@ -1271,6 +1347,7 @@ fn replay_merge_tree(
     old_oid: ObjectId,
     new_parents: &[ObjectId],
     merge_favor: MergeFavor,
+    replay_session: &mut ReplayMergeSession,
 ) -> Result<ObjectId, HistoryError> {
     if old.parents.len() != new_parents.len() {
         return Err(HistoryError::Planning {
@@ -1278,6 +1355,7 @@ fn replay_merge_tree(
         });
     }
 
+    let labels = replay_conflict_labels(old_oid, old);
     let mut result_tree = old.tree;
     for (&old_parent, &new_parent) in old.parents.iter().zip(new_parents.iter()) {
         if old_parent == new_parent {
@@ -1288,13 +1366,41 @@ fn replay_merge_tree(
         result_tree = transplant_tree_across_parent_move(
             repo,
             old_oid,
+            &labels,
             result_tree,
             old_parent_tree,
             new_parent_tree,
             merge_favor,
+            replay_session,
         )?;
     }
     Ok(result_tree)
+}
+
+/// Write the commit for a staged conflict resolution during [`super::rebase_session::continue_rebase`].
+pub(crate) fn write_rebase_staged_resolution(
+    repo: &Repository,
+    opts: &RewriteOptions,
+    stopped_commit: ObjectId,
+    tree: ObjectId,
+    parents: &[ObjectId],
+) -> Result<ObjectId, HistoryError> {
+    let old = load_commit(repo, stopped_commit)?;
+    let change_ids = ChangeIdWriteContext::from_repo(repo)?;
+    let committer = opts.committer_line()?;
+    write_replacement_commit(
+        repo,
+        opts,
+        &change_ids,
+        &old,
+        stopped_commit,
+        tree,
+        parents,
+        &old.author,
+        &committer,
+        &old.message,
+        false,
+    )
 }
 
 /// Write a replacement commit for `old_oid`, honoring [`RewriteOptions::empty`].
@@ -1375,6 +1481,7 @@ fn replay_edited_commit(
     message: &str,
     merge_favor: MergeFavor,
     opts: &RewriteOptions,
+    replay_session: &mut ReplayMergeSession,
 ) -> Result<ObjectId, HistoryError> {
     let committer = if opts.preserve_committer {
         old.committer.as_str()
@@ -1402,6 +1509,7 @@ fn replay_edited_commit(
         old_parent_tree,
         new_parent_tree,
         merge_favor,
+        replay_session,
     )?;
     write_replacement_commit(
         repo,
@@ -1446,51 +1554,108 @@ fn compute_replayed_tree(
     old_parent_tree: ObjectId,
     new_parent_tree: ObjectId,
     merge_favor: MergeFavor,
+    replay_session: &mut ReplayMergeSession,
 ) -> Result<ObjectId, HistoryError> {
     transplant_tree_across_parent_move(
         repo,
         old_oid,
+        &replay_conflict_labels(old_oid, old),
         old.tree,
         old_parent_tree,
         new_parent_tree,
         merge_favor,
+        replay_session,
     )
 }
 
+/// Three-way merge `subject_tree` from `old_parent_tree` onto `new_parent_tree`, labelling
+/// conflict markers with `labels` for the replayed `commit`.
+#[allow(clippy::too_many_arguments)]
 fn transplant_tree_across_parent_move(
     repo: &Repository,
     commit: ObjectId,
+    labels: &ReplayConflictLabels,
     subject_tree: ObjectId,
     old_parent_tree: ObjectId,
     new_parent_tree: ObjectId,
     merge_favor: MergeFavor,
+    replay_session: &mut ReplayMergeSession,
 ) -> Result<ObjectId, HistoryError> {
-    if old_parent_tree == new_parent_tree {
-        return Ok(subject_tree);
-    }
-    record_merge_call();
-    let merge = merge_trees_three_way(
+    replay_session.transplant_tree(
         repo,
+        commit,
+        labels,
+        subject_tree,
         old_parent_tree,
         new_parent_tree,
-        subject_tree,
         merge_favor,
-        WhitespaceMergeOptions::default(),
-        None,
-        TreeMergeConflictPresentation::default(),
-    )
-    .map_err(library_err)?;
-
-    if merge.index.has_unmerged_entries() || !merge.conflict_content.is_empty() {
-        let conflicts = crate::operation::conflicts_from_tree_merge(&merge);
-        if REPLAY_STOP_COMMIT.with(|c| c.get()) == Some(commit) {
-            if let Some(replayed_parent) = REPLAY_STOP_PARENT.with(|p| p.get()) {
-                note_resumable_conflict(commit, replayed_parent, merge);
+        |commit, merge| {
+            let err = conflict_error(repo, commit, &merge);
+            if REPLAY_STOP_COMMIT.with(|c| c.get()) == Some(commit) {
+                if let Some(replayed_parent) = REPLAY_STOP_PARENT.with(|p| p.get()) {
+                    note_resumable_conflict(commit, replayed_parent, merge);
+                }
             }
-        }
-        return Err(HistoryError::Conflict { commit, conflicts });
+            Err(err)
+        },
+    )
+}
+
+/// [`HistoryError::Conflict`] for `commit` from a conflicted tree merge, with no refs attributed.
+pub(crate) fn conflict_error(
+    repo: &Repository,
+    commit: ObjectId,
+    merge: &TreeMergeOutput,
+) -> HistoryError {
+    // The conflict is the error worth reporting; an unreadable subject only leaves it blank.
+    let subject = load_commit(repo, commit)
+        .map(|c| commit_message_subject_line(&c.message))
+        .unwrap_or_default();
+    HistoryError::Conflict {
+        commit,
+        subject,
+        conflicts: crate::operation::conflicts_from_tree_merge(merge),
+        refs: Vec::new(),
     }
-    Ok(merge.result_tree)
+}
+
+/// Names the scoped branches containing a conflicting commit that is not on `HEAD`'s history,
+/// so the failure points at the branch that could not be moved. Other errors pass through.
+fn attribute_conflict_to_refs(
+    repo: &Repository,
+    err: HistoryError,
+    scoped_refs: &[(String, ObjectId)],
+) -> HistoryError {
+    let HistoryError::Conflict {
+        commit,
+        subject,
+        conflicts,
+        refs: _,
+    } = err
+    else {
+        return err;
+    };
+    let on_head = repo
+        .head_commit()
+        .ok()
+        .is_none_or(|head| is_ancestor(repo, commit, head).unwrap_or(true));
+    let mut refs: Vec<String> = if on_head {
+        Vec::new()
+    } else {
+        scoped_refs
+            .iter()
+            .filter(|(_, tip)| is_ancestor(repo, commit, *tip).unwrap_or(false))
+            .map(|(name, _)| name.clone())
+            .collect()
+    };
+    refs.sort();
+    refs.dedup();
+    HistoryError::Conflict {
+        commit,
+        subject,
+        conflicts,
+        refs,
+    }
 }
 
 fn commit_tree(repo: &Repository, commit: ObjectId) -> Result<ObjectId, HistoryError> {
@@ -1521,11 +1686,11 @@ fn write_new_commit(
         raw_message: None,
         extra_headers: extra_headers.to_vec(),
     };
-    if let Some(id) = change_ids
-        .policy
-        .id_for_new_commit(&data, change_ids.hash_algo, change_ids.generator.as_ref())
-        .map_err(change_id_err)?
-    {
+    if let Some(id) = change_ids.policy.id_for_new_commit(
+        &data,
+        change_ids.hash_algo,
+        change_ids.generator.as_ref(),
+    )? {
         set_change_id(&mut data, &id);
     }
     write_commit_data(repo, opts, &data)
@@ -1795,6 +1960,45 @@ mod merge_call_tests {
         write_tree_from_index(repo.odb(), &index, "")
     }
 
+    fn tree_with_file(
+        repo: &Repository,
+        parent_tree: ObjectId,
+        path: &str,
+        bytes: &[u8],
+    ) -> crate::error::Result<ObjectId> {
+        use crate::porcelain::merge::tree_to_index_entries;
+        let blob = repo.odb().write(ObjectKind::Blob, bytes)?;
+        let mut index = Index::new();
+        index.hash_algo = repo.odb().hash_algo();
+        for mut entry in tree_to_index_entries(repo, &parent_tree, "")? {
+            entry.base_index_pos = 0;
+            index.add_or_replace(entry);
+        }
+        index.add_or_replace(IndexEntry {
+            ctime_sec: 0,
+            ctime_nsec: 0,
+            mtime_sec: 0,
+            mtime_nsec: 0,
+            dev: 0,
+            ino: 0,
+            mode: MODE_REGULAR,
+            uid: 0,
+            gid: 0,
+            size: bytes.len() as u32,
+            oid: blob,
+            flags: path.len().min(0xfff) as u16,
+            flags_extended: None,
+            path: path.as_bytes().to_vec(),
+            base_index_pos: 0,
+        });
+        write_tree_from_index(repo.odb(), &index, "")
+    }
+
+    use super::super::replay_merge_session::{
+        test_merge_tree_call_count, test_reset_merge_tree_call_count,
+        test_reset_upstream_delta_scan_count, test_upstream_delta_scan_count,
+    };
+
     #[test]
     fn reword_parent_only_replay_skips_merge_tree() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1856,5 +2060,619 @@ mod merge_call_tests {
         )
         .expect("plan");
         assert_eq!(test_merge_tree_call_count(), 0);
+    }
+
+    #[test]
+    fn add_only_rebase_stack_skips_three_way_merge() {
+        use crate::objects::{serialize_commit, CommitData};
+        use crate::revwalk::history::{plan_rebase, RebaseOntoOptions, RebaseRequest};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = Repository::init(
+            dir.path(),
+            &crate::repo::InitOptions::new()
+                .with_initial_branch("main".to_owned())
+                .with_ref_storage(crate::RefStorageFormat::Files),
+        )
+        .expect("init");
+        let sig = ident(1);
+        let fork_tree = blob_tree(&repo, "base.txt", b"base\n").expect("tree");
+        let fork_raw = serialize_commit(&CommitData {
+            tree: fork_tree,
+            parents: vec![],
+            author: sig.clone(),
+            committer: sig.clone(),
+            author_raw: Vec::new(),
+            committer_raw: Vec::new(),
+            encoding: None,
+            message: "fork\n".into(),
+            raw_message: None,
+            extra_headers: Vec::new(),
+        });
+        let fork = repo
+            .odb()
+            .write(ObjectKind::Commit, &fork_raw)
+            .expect("fork");
+        let mut parent = fork;
+        let mut onto_tree = fork_tree;
+        for i in 0..80 {
+            let path = format!("wide/n{i}.txt");
+            onto_tree = tree_with_file(&repo, onto_tree, &path, format!("w{i}\n").as_bytes())
+                .expect("onto tree");
+            let raw = serialize_commit(&CommitData {
+                tree: onto_tree,
+                parents: vec![parent],
+                author: sig.clone(),
+                committer: sig.clone(),
+                author_raw: Vec::new(),
+                committer_raw: Vec::new(),
+                encoding: None,
+                message: format!("wide {i}\n"),
+                raw_message: None,
+                extra_headers: Vec::new(),
+            });
+            parent = repo.odb().write(ObjectKind::Commit, &raw).expect("commit");
+        }
+        let onto = parent;
+
+        let mut stack_parent = fork;
+        let mut stack_tree = fork_tree;
+        for i in 0..40 {
+            let path = format!("team/f{i}.txt");
+            stack_tree = tree_with_file(&repo, stack_tree, &path, format!("{i}\n").as_bytes())
+                .expect("tree");
+            let raw = serialize_commit(&CommitData {
+                tree: stack_tree,
+                parents: vec![stack_parent],
+                author: sig.clone(),
+                committer: sig.clone(),
+                author_raw: Vec::new(),
+                committer_raw: Vec::new(),
+                encoding: None,
+                message: format!("feat {i}\n"),
+                raw_message: None,
+                extra_headers: Vec::new(),
+            });
+            stack_parent = repo.odb().write(ObjectKind::Commit, &raw).expect("commit");
+        }
+        let tip = stack_parent;
+        write_ref(repo.git_dir(), "refs/heads/main", &tip).expect("ref");
+        let opts = RebaseOntoOptions::new(RewriteOptions {
+            scope: RefScope::Head,
+            empty: EmptyPolicy::Drop,
+            committer: ident(2).parse().expect("signature"),
+            preserve_committer: false,
+            sign: false,
+        });
+        let request = RebaseRequest {
+            upstream: fork,
+            onto: Some(onto),
+            branch_tip: tip,
+        };
+        test_reset_merge_tree_call_count();
+        plan_rebase(&repo, &request, &opts).expect("plan");
+        assert_eq!(
+            test_merge_tree_call_count(),
+            0,
+            "add-only stack should not call three-way merge per commit"
+        );
+    }
+
+    #[test]
+    fn replay_delete_last_file_in_dir_matches_git_rebase_tree() {
+        use crate::objects::parse_commit;
+        use crate::revwalk::history::{plan_rebase, RebaseOntoOptions, RebasePlan, RebaseRequest};
+        use std::process::Command;
+
+        if Command::new("git").arg("--version").status().is_err() {
+            return;
+        }
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let wt = root.path();
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .current_dir(wt)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "T")
+                .env("GIT_AUTHOR_EMAIL", "t@grit.test")
+                .env("GIT_COMMITTER_NAME", "T")
+                .env("GIT_COMMITTER_EMAIL", "t@grit.test")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .status()
+                .expect("git");
+        };
+        git(&["init", "-b", "main"]);
+        std::fs::write(wt.join("upstream.txt"), "v1\n").expect("write");
+        git(&["add", "upstream.txt"]);
+        git(&["commit", "-m", "root"]);
+        let fork = Command::new("git")
+            .current_dir(wt)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("rev-parse");
+        let fork_hex = String::from_utf8(fork.stdout)
+            .expect("utf8")
+            .trim()
+            .to_owned();
+        git(&["branch", "feat"]);
+        git(&["switch", "main"]);
+        std::fs::write(wt.join("upstream.txt"), "v2\n").expect("write");
+        git(&["add", "upstream.txt"]);
+        git(&["commit", "-m", "main bump"]);
+        let onto_hex = Command::new("git")
+            .current_dir(wt)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("rev-parse");
+        let onto_hex = String::from_utf8(onto_hex.stdout)
+            .expect("utf8")
+            .trim()
+            .to_owned();
+        git(&["switch", "feat"]);
+        std::fs::create_dir_all(wt.join("dir")).expect("dir");
+        std::fs::write(wt.join("dir/only.txt"), "only\n").expect("write");
+        git(&["add", "dir/only.txt"]);
+        git(&["commit", "-m", "add dir"]);
+        std::fs::remove_file(wt.join("dir/only.txt")).expect("rm");
+        git(&["add", "-u"]);
+        git(&["commit", "-m", "drop dir"]);
+        let tip_hex = Command::new("git")
+            .current_dir(wt)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("rev-parse");
+        let tip_hex = String::from_utf8(tip_hex.stdout)
+            .expect("utf8")
+            .trim()
+            .to_owned();
+
+        let fork = ObjectId::from_hex(&fork_hex).expect("fork");
+        let onto = ObjectId::from_hex(&onto_hex).expect("onto");
+        let tip = ObjectId::from_hex(&tip_hex).expect("tip");
+        let repo = Repository::discover(Some(wt), &RepositoryOptions::empty()).expect("open");
+        let opts = RebaseOntoOptions::new(RewriteOptions {
+            scope: RefScope::Head,
+            empty: EmptyPolicy::Drop,
+            committer: ident(2).parse().expect("signature"),
+            preserve_committer: false,
+            sign: false,
+        });
+        let request = RebaseRequest {
+            upstream: fork,
+            onto: Some(onto),
+            branch_tip: tip,
+        };
+        let plan = match plan_rebase(&repo, &request, &opts).expect("plan") {
+            RebasePlan::Plan(plan) => plan,
+            other => panic!("expected plan, got {other:?}"),
+        };
+        let new_tip = plan
+            .commits
+            .last()
+            .and_then(|row| row.new)
+            .expect("rewritten tip");
+        let grit_tree = parse_commit(&repo.odb().read(&new_tip).expect("read").data)
+            .expect("parse")
+            .tree;
+
+        let git_wt = tempfile::tempdir().expect("git wt");
+        Command::new("git")
+            .current_dir(git_wt.path())
+            .args(["clone", wt.to_str().expect("utf8"), "r"])
+            .status()
+            .expect("clone");
+        let clone = git_wt.path().join("r");
+        Command::new("git")
+            .current_dir(&clone)
+            .args(["rebase", "--onto", &onto_hex, &fork_hex, "feat"])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .status()
+            .expect("git rebase");
+        let git_tree_hex = Command::new("git")
+            .current_dir(&clone)
+            .args(["rev-parse", "feat^{tree}"])
+            .output()
+            .expect("tree");
+        let git_tree =
+            ObjectId::from_hex(String::from_utf8(git_tree_hex.stdout).expect("utf8").trim())
+                .expect("parse tree");
+
+        assert_eq!(
+            grit_tree, git_tree,
+            "delete replay tree must match git (no empty dir tree)"
+        );
+    }
+
+    fn rename_friendly_blob(i: usize, tag: &str) -> Vec<u8> {
+        format!(
+            "rename-friendly file {i}\nshared boilerplate alpha beta gamma delta epsilon\n{tag}\n"
+        )
+        .into_bytes()
+    }
+
+    fn wide_rename_fork_onto(
+        repo: &Repository,
+        sig: &str,
+        file_count: usize,
+    ) -> (ObjectId, ObjectId, ObjectId) {
+        wide_rename_fork_onto_inner(repo, sig, file_count, false)
+    }
+
+    fn wide_rename_fork_onto_pure_renames(
+        repo: &Repository,
+        sig: &str,
+        file_count: usize,
+    ) -> (ObjectId, ObjectId, ObjectId) {
+        wide_rename_fork_onto_inner(repo, sig, file_count, true)
+    }
+
+    fn wide_rename_fork_onto_inner(
+        repo: &Repository,
+        sig: &str,
+        file_count: usize,
+        pure_renames: bool,
+    ) -> (ObjectId, ObjectId, ObjectId) {
+        use crate::objects::{serialize_commit, CommitData};
+
+        let mut fork_tree =
+            blob_tree(repo, "shared.toml", b"[package]\nname = \"root\"\n").expect("tree");
+        for i in 0..file_count {
+            let path = format!("dir/f{i}.txt");
+            fork_tree = tree_with_file(&repo, fork_tree, &path, &rename_friendly_blob(i, "fork"))
+                .expect("fork wide");
+        }
+        let fork_raw = serialize_commit(&CommitData {
+            tree: fork_tree,
+            parents: vec![],
+            author: sig.to_owned(),
+            committer: sig.to_owned(),
+            author_raw: Vec::new(),
+            committer_raw: Vec::new(),
+            encoding: None,
+            message: "fork\n".into(),
+            raw_message: None,
+            extra_headers: Vec::new(),
+        });
+        let fork = repo
+            .odb()
+            .write(ObjectKind::Commit, &fork_raw)
+            .expect("fork");
+
+        let mut onto_tree = tree_with_file(
+            repo,
+            fork_tree,
+            "shared.toml",
+            b"[package]\nname = \"root\"\nversion = \"1\"\n",
+        )
+        .expect("onto shared edit");
+        for i in 0..file_count {
+            let old = format!("dir/f{i}.txt");
+            let new = format!("moved/f{i}.txt");
+            let moved_bytes = if pure_renames {
+                rename_friendly_blob(i, "fork")
+            } else {
+                rename_friendly_blob(i, "onto")
+            };
+            onto_tree = tree_with_file(&repo, onto_tree, &new, &moved_bytes).expect("moved add");
+            onto_tree = tree_without_path(&repo, onto_tree, &old).expect("moved rm");
+        }
+        let onto_raw = serialize_commit(&CommitData {
+            tree: onto_tree,
+            parents: vec![fork],
+            author: sig.to_owned(),
+            committer: sig.to_owned(),
+            author_raw: Vec::new(),
+            committer_raw: Vec::new(),
+            encoding: None,
+            message: "onto\n".into(),
+            raw_message: None,
+            extra_headers: Vec::new(),
+        });
+        let onto = repo
+            .odb()
+            .write(ObjectKind::Commit, &onto_raw)
+            .expect("onto");
+        (fork, onto, fork_tree)
+    }
+
+    fn plan_overlap_rebase(
+        repo: &Repository,
+        fork: ObjectId,
+        onto: ObjectId,
+        tip: ObjectId,
+    ) -> ObjectId {
+        use crate::objects::parse_commit;
+        use crate::revwalk::history::{plan_rebase, RebaseOntoOptions, RebasePlan, RebaseRequest};
+
+        let opts = RebaseOntoOptions::new(RewriteOptions {
+            scope: RefScope::Head,
+            empty: EmptyPolicy::Drop,
+            committer: ident(2).parse().expect("signature"),
+            preserve_committer: false,
+            sign: false,
+        });
+        let request = RebaseRequest {
+            upstream: fork,
+            onto: Some(onto),
+            branch_tip: tip,
+        };
+        test_reset_merge_tree_call_count();
+        test_reset_upstream_delta_scan_count();
+        let plan = match plan_rebase(repo, &request, &opts).expect("plan") {
+            RebasePlan::Plan(plan) => plan,
+            other => panic!("expected plan, got {other:?}"),
+        };
+        assert_eq!(
+            test_upstream_delta_scan_count(),
+            1,
+            "fork→onto rename map should be built once per replay session"
+        );
+        assert_eq!(
+            test_merge_tree_call_count(),
+            0,
+            "overlap replay should use cached upstream renames, not full tree merge per commit"
+        );
+        let new_tip = plan
+            .commits
+            .last()
+            .and_then(|row| row.new)
+            .expect("rewritten tip");
+        parse_commit(&repo.odb().read(&new_tip).expect("read").data)
+            .expect("parse")
+            .tree
+    }
+
+    #[test]
+    fn rebase_overlap_upstream_modified_shared_and_add_under_moved() {
+        use crate::objects::{serialize_commit, CommitData};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = Repository::init(
+            dir.path(),
+            &crate::repo::InitOptions::new()
+                .with_initial_branch("main".to_owned())
+                .with_ref_storage(crate::RefStorageFormat::Files),
+        )
+        .expect("init");
+        let sig = ident(1);
+        let (fork, onto, fork_tree) = wide_rename_fork_onto(&repo, &sig, 80);
+
+        let mut stack_parent = fork;
+        let mut stack_tree = fork_tree;
+        for i in 0..12 {
+            let path = format!("moved/extra-shared-{i}.txt");
+            stack_tree =
+                tree_with_file(&repo, stack_tree, &path, format!("layer {i}\n").as_bytes())
+                    .expect("stack add under moved tree");
+            let raw = serialize_commit(&CommitData {
+                tree: stack_tree,
+                parents: vec![stack_parent],
+                author: sig.clone(),
+                committer: sig.clone(),
+                author_raw: Vec::new(),
+                committer_raw: Vec::new(),
+                encoding: None,
+                message: format!("moved extra {i}\n"),
+                raw_message: None,
+                extra_headers: Vec::new(),
+            });
+            stack_parent = repo
+                .odb()
+                .write(ObjectKind::Commit, &raw)
+                .expect("stack commit");
+        }
+        let tip = stack_parent;
+        write_ref(repo.git_dir(), "refs/heads/main", &tip).expect("ref");
+        plan_overlap_rebase(&repo, fork, onto, tip);
+    }
+
+    #[test]
+    fn rebase_overlap_add_under_moved_dir_uses_cached_renames() {
+        use crate::objects::{serialize_commit, CommitData};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = Repository::init(
+            dir.path(),
+            &crate::repo::InitOptions::new()
+                .with_initial_branch("main".to_owned())
+                .with_ref_storage(crate::RefStorageFormat::Files),
+        )
+        .expect("init");
+        let sig = ident(1);
+        let (fork, onto, fork_tree) = wide_rename_fork_onto(&repo, &sig, 80);
+
+        let mut stack_parent = fork;
+        let mut stack_tree = fork_tree;
+        for i in 0..12 {
+            let path = format!("moved/stack-{i}.txt");
+            stack_tree = tree_with_file(&repo, stack_tree, &path, format!("{i}\n").as_bytes())
+                .expect("stack add under moved");
+            let raw = serialize_commit(&CommitData {
+                tree: stack_tree,
+                parents: vec![stack_parent],
+                author: sig.clone(),
+                committer: sig.clone(),
+                author_raw: Vec::new(),
+                committer_raw: Vec::new(),
+                encoding: None,
+                message: format!("moved add {i}\n"),
+                raw_message: None,
+                extra_headers: Vec::new(),
+            });
+            stack_parent = repo
+                .odb()
+                .write(ObjectKind::Commit, &raw)
+                .expect("stack commit");
+        }
+        let tip = stack_parent;
+        write_ref(repo.git_dir(), "refs/heads/main", &tip).expect("ref");
+        plan_overlap_rebase(&repo, fork, onto, tip);
+    }
+
+    #[test]
+    fn rebase_overlap_add_under_renamed_dir_uses_cached_renames() {
+        use crate::objects::{serialize_commit, CommitData};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = Repository::init(
+            dir.path(),
+            &crate::repo::InitOptions::new()
+                .with_initial_branch("main".to_owned())
+                .with_ref_storage(crate::RefStorageFormat::Files),
+        )
+        .expect("init");
+        let sig = ident(1);
+        let (fork, onto, fork_tree) = wide_rename_fork_onto(&repo, &sig, 80);
+
+        let mut stack_parent = fork;
+        let mut stack_tree = fork_tree;
+        for i in 0..12 {
+            let path = format!("dir/feat-{i}.txt");
+            stack_tree = tree_with_file(&repo, stack_tree, &path, format!("new {i}\n").as_bytes())
+                .expect("stack add under dir");
+            let raw = serialize_commit(&CommitData {
+                tree: stack_tree,
+                parents: vec![stack_parent],
+                author: sig.clone(),
+                committer: sig.clone(),
+                author_raw: Vec::new(),
+                committer_raw: Vec::new(),
+                encoding: None,
+                message: format!("under dir {i}\n"),
+                raw_message: None,
+                extra_headers: Vec::new(),
+            });
+            stack_parent = repo
+                .odb()
+                .write(ObjectKind::Commit, &raw)
+                .expect("stack commit");
+        }
+        let tip = stack_parent;
+        write_ref(repo.git_dir(), "refs/heads/main", &tip).expect("ref");
+        plan_overlap_rebase(&repo, fork, onto, tip);
+    }
+
+    #[test]
+    fn rebase_overlap_edit_pre_rename_path_uses_cached_renames() {
+        use crate::objects::{serialize_commit, CommitData};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = Repository::init(
+            dir.path(),
+            &crate::repo::InitOptions::new()
+                .with_initial_branch("main".to_owned())
+                .with_ref_storage(crate::RefStorageFormat::Files),
+        )
+        .expect("init");
+        let sig = ident(1);
+        let (fork, onto, fork_tree) = wide_rename_fork_onto_pure_renames(&repo, &sig, 80);
+
+        let mut stack_parent = fork;
+        let mut stack_tree = fork_tree;
+        for i in 0..12 {
+            let file_idx = i % 80;
+            let path = format!("dir/f{file_idx}.txt");
+            let mut bytes = rename_friendly_blob(file_idx, "fork");
+            bytes.extend_from_slice(format!("# stack note {i}\n").as_bytes());
+            stack_tree = tree_with_file(&repo, stack_tree, &path, &bytes)
+                .expect("stack edit pre-rename path");
+            let raw = serialize_commit(&CommitData {
+                tree: stack_tree,
+                parents: vec![stack_parent],
+                author: sig.clone(),
+                committer: sig.clone(),
+                author_raw: Vec::new(),
+                committer_raw: Vec::new(),
+                encoding: None,
+                message: format!("edit pre-move {i}\n"),
+                raw_message: None,
+                extra_headers: Vec::new(),
+            });
+            stack_parent = repo
+                .odb()
+                .write(ObjectKind::Commit, &raw)
+                .expect("stack commit");
+        }
+        let tip = stack_parent;
+        write_ref(repo.git_dir(), "refs/heads/main", &tip).expect("ref");
+        plan_overlap_rebase(&repo, fork, onto, tip);
+    }
+
+    #[test]
+    #[ignore = "release-profile timing for reviewer fixture (#2271)"]
+    fn rebase_overlap_reviewer_fixture_timing() {
+        use crate::objects::{serialize_commit, CommitData};
+        use std::time::Instant;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = Repository::init(
+            dir.path(),
+            &crate::repo::InitOptions::new()
+                .with_initial_branch("main".to_owned())
+                .with_ref_storage(crate::RefStorageFormat::Files),
+        )
+        .expect("init");
+        let sig = ident(1);
+        let (fork, onto, fork_tree) = wide_rename_fork_onto(&repo, &sig, 500);
+        let mut stack_parent = fork;
+        let mut stack_tree = fork_tree;
+        for i in 0..20 {
+            let path = format!("moved/stack-{i}.txt");
+            stack_tree = tree_with_file(&repo, stack_tree, &path, format!("edit {i}\n").as_bytes())
+                .expect("stack");
+            let raw = serialize_commit(&CommitData {
+                tree: stack_tree,
+                parents: vec![stack_parent],
+                author: sig.clone(),
+                committer: sig.clone(),
+                author_raw: Vec::new(),
+                committer_raw: Vec::new(),
+                encoding: None,
+                message: format!("feat {i}\n"),
+                raw_message: None,
+                extra_headers: Vec::new(),
+            });
+            stack_parent = repo
+                .odb()
+                .write(ObjectKind::Commit, &raw)
+                .expect("stack commit");
+        }
+        let tip = stack_parent;
+        write_ref(repo.git_dir(), "refs/heads/main", &tip).expect("ref");
+        test_reset_merge_tree_call_count();
+        test_reset_upstream_delta_scan_count();
+        let start = Instant::now();
+        plan_overlap_rebase(&repo, fork, onto, tip);
+        eprintln!(
+            "reviewer fixture plan: {:.3}s",
+            start.elapsed().as_secs_f64()
+        );
+        eprintln!(
+            "merge calls {} upstream scans {}",
+            test_merge_tree_call_count(),
+            test_upstream_delta_scan_count()
+        );
+    }
+
+    fn tree_without_path(
+        repo: &Repository,
+        parent_tree: ObjectId,
+        path: &str,
+    ) -> crate::error::Result<ObjectId> {
+        use crate::porcelain::merge::tree_to_index_entries;
+        let mut index = Index::new();
+        index.hash_algo = repo.odb().hash_algo();
+        let path_bytes = path.as_bytes();
+        for mut entry in tree_to_index_entries(repo, &parent_tree, "")? {
+            if entry.path == path_bytes {
+                continue;
+            }
+            entry.base_index_pos = 0;
+            index.add_or_replace(entry);
+        }
+        write_tree_from_index(repo.odb(), &index, "")
     }
 }

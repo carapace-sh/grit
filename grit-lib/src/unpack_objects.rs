@@ -6,9 +6,8 @@
 //! `OFS_DELTA` and `REF_DELTA`) are resolved against already-unpacked objects
 //! or objects already present in the target.
 //!
-//! Large blobs are written to the ODB and dropped from the in-memory maps so
-//! cloning multi-gigabyte repositories does not require holding the full pack
-//! in RAM (streaming read + bounded retention).
+//! Large blobs stream to the ODB without retaining payload bytes; delta bases use a
+//! bounded byte LRU so multi-object unpack stays flat in memory (streaming read).
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -63,6 +62,181 @@ struct PendingDelta {
     base_offset: Option<usize>,
     /// Decompressed delta data.
     delta_data: Vec<u8>,
+}
+
+/// Default cap on unpacked delta-base bytes retained in RAM (`core.deltaBaseCacheLimit`).
+const UNPACK_DELTA_BASE_BYTE_LIMIT: usize = 96 * 1024 * 1024;
+
+/// Byte-bounded LRU of recently resolved object payloads keyed by pack offset (delta bases only).
+struct UnpackBaseByteCache {
+    byte_limit: usize,
+    bytes_used: usize,
+    entries: HashMap<usize, (ObjectKind, Vec<u8>)>,
+    head: Option<usize>,
+    tail: Option<usize>,
+    links: HashMap<usize, (Option<usize>, Option<usize>)>,
+}
+
+impl UnpackBaseByteCache {
+    fn new(byte_limit: usize) -> Self {
+        Self {
+            byte_limit,
+            bytes_used: 0,
+            entries: HashMap::new(),
+            head: None,
+            tail: None,
+            links: HashMap::new(),
+        }
+    }
+
+    fn unlink(&mut self, key: usize) {
+        let Some((prev, next)) = self.links.remove(&key) else {
+            return;
+        };
+        match prev {
+            Some(p) => {
+                if let Some(link) = self.links.get_mut(&p) {
+                    link.1 = next;
+                }
+            }
+            None => self.head = next,
+        }
+        match next {
+            Some(n) => {
+                if let Some(link) = self.links.get_mut(&n) {
+                    link.0 = prev;
+                }
+            }
+            None => self.tail = prev,
+        }
+    }
+
+    fn append_tail(&mut self, key: usize) {
+        let prev = self.tail;
+        self.links.insert(key, (prev, None));
+        if let Some(p) = prev {
+            if let Some(link) = self.links.get_mut(&p) {
+                link.1 = Some(key);
+            }
+        } else {
+            self.head = Some(key);
+        }
+        self.tail = Some(key);
+    }
+
+    fn touch(&mut self, key: usize) {
+        self.unlink(key);
+        self.append_tail(key);
+    }
+
+    fn evict_key(&mut self, key: usize) {
+        self.unlink(key);
+        if let Some((_, data)) = self.entries.remove(&key) {
+            self.bytes_used = self.bytes_used.saturating_sub(data.len());
+        }
+    }
+
+    fn get(&mut self, offset: usize) -> Option<(ObjectKind, Vec<u8>)> {
+        let (kind, data) = self.entries.get(&offset).map(|(k, d)| (*k, d.clone()))?;
+        self.touch(offset);
+        Some((kind, data))
+    }
+
+    fn put(&mut self, offset: usize, kind: ObjectKind, data: Vec<u8>) {
+        if self.byte_limit == 0 {
+            return;
+        }
+        let sz = data.len();
+        if sz > self.byte_limit {
+            return;
+        }
+        use std::collections::hash_map::Entry;
+        match self.entries.entry(offset) {
+            Entry::Occupied(mut slot) => {
+                let old_len = slot.get().1.len();
+                slot.insert((kind, data));
+                self.bytes_used = self.bytes_used.saturating_sub(old_len).saturating_add(sz);
+                self.touch(offset);
+            }
+            Entry::Vacant(slot) => {
+                slot.insert((kind, data));
+                self.bytes_used = self.bytes_used.saturating_add(sz);
+                self.append_tail(offset);
+            }
+        }
+        while self.bytes_used > self.byte_limit {
+            let Some(evict) = self.head else {
+                break;
+            };
+            self.evict_key(evict);
+        }
+        test_note_retained_bytes(self.bytes_used);
+    }
+
+    fn bytes_used(&self) -> usize {
+        self.bytes_used
+    }
+}
+
+#[cfg(test)]
+static TEST_UNPACK_CACHE_BYTE_LIMIT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static TEST_UNPACK_RETAINED_PEAK: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static TEST_UNPACK_RETAIN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn unpack_base_cache_byte_limit() -> usize {
+    #[cfg(test)]
+    {
+        let override_limit =
+            TEST_UNPACK_CACHE_BYTE_LIMIT.load(std::sync::atomic::Ordering::Relaxed);
+        if override_limit != 0 {
+            return override_limit;
+        }
+    }
+    UNPACK_DELTA_BASE_BYTE_LIMIT
+}
+
+#[cfg(test)]
+pub(crate) fn test_set_unpack_base_cache_byte_limit(bytes: usize) {
+    TEST_UNPACK_CACHE_BYTE_LIMIT.store(bytes, std::sync::atomic::Ordering::Relaxed);
+    TEST_UNPACK_RETAINED_PEAK.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(crate) fn test_peak_unpack_retained_bytes() -> usize {
+    TEST_UNPACK_RETAINED_PEAK.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn test_note_retained_bytes(bytes: usize) {
+    #[cfg(test)]
+    {
+        let mut cur = TEST_UNPACK_RETAINED_PEAK.load(std::sync::atomic::Ordering::Relaxed);
+        while cur < bytes {
+            match TEST_UNPACK_RETAINED_PEAK.compare_exchange_weak(
+                cur,
+                bytes,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(v) => cur = v,
+            }
+        }
+    }
+    #[cfg(not(test))]
+    let _ = bytes;
+}
+
+fn test_note_pending_delta_bytes(pending: &[PendingDelta], cache_bytes: usize) {
+    #[cfg(test)]
+    {
+        let pending_bytes: usize = pending.iter().map(|d| d.delta_data.len()).sum();
+        test_note_retained_bytes(cache_bytes.saturating_add(pending_bytes));
+    }
+    let _ = (pending, cache_bytes);
 }
 
 /// Objects a pack stream delivered into an object store, from [`ingest_pack_into`].
@@ -220,7 +394,30 @@ impl UnpackSink for StoreSink<'_> {
 /// - [`Error::Io`] — I/O failure reading from `reader`.
 /// - [`Error::Zlib`] — decompression failure.
 pub fn unpack_objects(reader: &mut dyn Read, odb: &Odb, opts: &UnpackOptions) -> Result<usize> {
-    unpack_into(reader, odb, opts, None, None).map(|unpacked| unpacked.count)
+    unpack_into(reader, odb, opts, None, None, None).map(|unpacked| unpacked.count)
+}
+
+/// Asks whether a reference the pack does not resolve is promised.
+///
+/// Called with the missing object and the object naming it; `Ok(true)` lets the
+/// strict check pass it.
+pub(crate) type PromisedReference<'a> = &'a dyn Fn(&ObjectId, &ObjectId) -> Result<bool>;
+
+/// [`unpack_objects`] for a repository with promisor remotes: under
+/// [`UnpackOptions::strict`], a reference that resolves neither in the pack nor in
+/// `odb` passes when `promised` says a promisor remote has it, as Git's
+/// connectivity check skips promisor objects.
+///
+/// # Errors
+///
+/// As [`unpack_objects`], plus whatever `promised` returns.
+pub(crate) fn unpack_objects_with_promises(
+    reader: &mut dyn Read,
+    odb: &Odb,
+    opts: &UnpackOptions,
+    promised: PromisedReference<'_>,
+) -> Result<usize> {
+    unpack_into(reader, odb, opts, None, None, Some(promised)).map(|unpacked| unpacked.count)
 }
 
 /// Apply a pack stream to any [`WritableObjectStore`], resolving every delta.
@@ -235,14 +432,15 @@ pub fn unpack_objects(reader: &mut dyn Read, odb: &Odb, opts: &UnpackOptions) ->
 /// - `store` receives every object in the pack.
 /// - `bases` resolves `REF_DELTA` bases a *thin* pack leaves out, and answers
 ///   [`UnpackOptions::strict`] connectivity checks. `store` is consulted first, so pass
-///   `store` again when it is the only source, or a repository-wide view (for example a
-///   [`CompositeStore`](crate::odb::store::CompositeStore)) when bases may live elsewhere.
+///   `store` again when it is the only source, or a repository-wide view (a repository's
+///   [`Odb::read_store`], or a [`CompositeStore`](crate::odb::store::CompositeStore)) when
+///   bases may live elsewhere.
 ///
 /// The trailing checksum is verified before any delta is applied. Objects without a
 /// delta are written as they are read, so a failed ingest can leave some objects in
 /// `store`; Git stores tolerate unreferenced objects and later garbage collection
-/// removes them. Objects up to 1 MiB are kept in memory until the pack is resolved
-/// (as delta bases); larger blobs are read back from `store` when a delta needs them.
+/// removes them. Delta bases are bounded by a byte LRU (default 96 MiB, like
+/// `core.deltaBaseCacheLimit`); larger blobs and strict connectivity re-read from `store` on demand.
 ///
 /// Only [`UnpackOptions::dry_run`], [`UnpackOptions::strict`] and its allowances, and
 /// [`UnpackOptions::max_input_bytes`] apply; [`UnpackOptions::quiet`] has no effect.
@@ -313,8 +511,15 @@ pub fn ingest_pack_into_with_progress(
     progress: Option<&mut dyn ProgressSink>,
     cancel: Option<&dyn Cancel>,
 ) -> Result<IngestedObjects> {
-    unpack_into(reader, &StoreSink { store, bases }, opts, progress, cancel)
-        .map(Unpacked::into_ingested)
+    unpack_into(
+        reader,
+        &StoreSink { store, bases },
+        opts,
+        progress,
+        cancel,
+        None,
+    )
+    .map(Unpacked::into_ingested)
 }
 
 /// Like [`ingest_pack_into_with_progress`], writing into `odb` the way [`unpack_objects`]
@@ -326,7 +531,7 @@ pub(crate) fn ingest_pack_into_odb(
     progress: Option<&mut dyn ProgressSink>,
     cancel: Option<&dyn Cancel>,
 ) -> Result<IngestedObjects> {
-    unpack_into(reader, odb, opts, progress, cancel).map(Unpacked::into_ingested)
+    unpack_into(reader, odb, opts, progress, cancel, None).map(Unpacked::into_ingested)
 }
 
 /// Everything [`unpack_into`] resolved.
@@ -366,14 +571,14 @@ fn unpack_into<S: UnpackSink + ?Sized>(
     opts: &UnpackOptions,
     mut progress: Option<&mut dyn ProgressSink>,
     cancel: Option<&dyn Cancel>,
+    promised: Option<PromisedReference<'_>>,
 ) -> Result<Unpacked> {
-    /// Blobs larger than this stay on disk only (after write) so huge packs do
-    /// not retain every blob in RAM. Smaller objects are kept for delta bases
-    /// and `--strict` graph walks without extra ODB reads.
-    const MAX_RETAIN_BYTES: usize = 1024 * 1024;
+    /// Blobs larger than this may stream straight to disk without caching payload bytes.
+    const MAX_STREAM_BLOB_BYTES: usize = 1024 * 1024;
 
     let algo = sink.hash_algo();
     let mut rd = StreamingPackReader::new(reader, opts.max_input_bytes, algo);
+    let mut base_cache = UnpackBaseByteCache::new(unpack_base_cache_byte_limit());
 
     // Validate magic and version.
     let sig = rd.read_exact_n(4)?;
@@ -390,9 +595,7 @@ fn unpack_into<S: UnpackSink + ?Sized>(
     }
     let nr_objects = rd.read_u32_be()? as usize;
 
-    // pack-stream offset → resolved object (see [`PackedObjectEntry`]).
     let mut by_offset: HashMap<usize, PackedObjectEntry> = HashMap::new();
-    // ObjectId → in-pack object for REF_DELTA resolution and strict checks.
     let mut by_oid: HashMap<ObjectId, PackedObjectEntry> = HashMap::new();
 
     let mut pending: Vec<PendingDelta> = Vec::new();
@@ -410,51 +613,108 @@ fn unpack_into<S: UnpackSink + ?Sized>(
         match type_code {
             1..=4 => {
                 let kind = type_code_to_kind(type_code)?;
-                let (oid, entry) = if !opts.dry_run
-                    && size > MAX_RETAIN_BYTES
+                if !opts.dry_run
+                    && size > MAX_STREAM_BLOB_BYTES
                     && kind == ObjectKind::Blob
                     && sink.supports_streaming_inflate()
                 {
                     let oid = sink.write_inflated_from_pack(kind, size, &mut rd, false)?;
-                    (oid, PackedObjectEntry::BlobOnDisk { oid })
+                    let entry = PackedObjectEntry::Stored { kind, oid };
+                    by_offset.insert(obj_offset, entry.clone());
+                    by_oid.insert(oid, entry);
                 } else {
                     let data = rd.decompress(size)?;
                     let oid = sink.write(kind, &data, opts.dry_run)?;
-                    (
+                    record_resolved_object(
+                        &mut by_offset,
+                        &mut by_oid,
+                        obj_offset,
                         oid,
-                        packed_entry_after_write(kind, data, oid, opts, MAX_RETAIN_BYTES),
-                    )
-                };
-                by_offset.insert(obj_offset, entry.clone());
-                by_oid.insert(oid, entry);
+                        kind,
+                        data,
+                        opts,
+                        MAX_STREAM_BLOB_BYTES,
+                        &mut base_cache,
+                    )?;
+                }
                 object_counts.add(kind);
                 count += 1;
             }
             6 => {
-                // OFS_DELTA: base at a negative encoded offset from this object.
                 let neg = rd.read_ofs_neg_offset()?;
                 let base_offset = obj_offset.checked_sub(neg).ok_or_else(|| {
                     Error::CorruptObject("ofs-delta base offset underflow".to_owned())
                 })?;
                 let delta_data = rd.decompress(size)?;
-                pending.push(PendingDelta {
+                let delta = PendingDelta {
                     offset: obj_offset,
                     base_oid: None,
                     base_offset: Some(base_offset),
                     delta_data,
-                });
+                };
+                test_note_pending_delta_bytes(&pending, base_cache.bytes_used());
+                if let Some((oid, kind, data)) = resolve_pending_delta(
+                    &delta,
+                    &by_offset,
+                    &by_oid,
+                    sink,
+                    opts,
+                    MAX_STREAM_BLOB_BYTES,
+                    &mut base_cache,
+                )? {
+                    record_resolved_object(
+                        &mut by_offset,
+                        &mut by_oid,
+                        delta.offset,
+                        oid,
+                        kind,
+                        data,
+                        opts,
+                        MAX_STREAM_BLOB_BYTES,
+                        &mut base_cache,
+                    )?;
+                    object_counts.add(kind);
+                    count += 1;
+                } else {
+                    pending.push(delta);
+                }
             }
             7 => {
-                // REF_DELTA: base identified by its object id (hash-width bytes).
                 let base_bytes = rd.read_exact_n(algo.len())?;
                 let base_oid = ObjectId::from_bytes(&base_bytes)?;
                 let delta_data = rd.decompress(size)?;
-                pending.push(PendingDelta {
+                let delta = PendingDelta {
                     offset: obj_offset,
                     base_oid: Some(base_oid),
                     base_offset: None,
                     delta_data,
-                });
+                };
+                test_note_pending_delta_bytes(&pending, base_cache.bytes_used());
+                if let Some((oid, kind, data)) = resolve_pending_delta(
+                    &delta,
+                    &by_offset,
+                    &by_oid,
+                    sink,
+                    opts,
+                    MAX_STREAM_BLOB_BYTES,
+                    &mut base_cache,
+                )? {
+                    record_resolved_object(
+                        &mut by_offset,
+                        &mut by_oid,
+                        delta.offset,
+                        oid,
+                        kind,
+                        data,
+                        opts,
+                        MAX_STREAM_BLOB_BYTES,
+                        &mut base_cache,
+                    )?;
+                    object_counts.add(kind);
+                    count += 1;
+                } else {
+                    pending.push(delta);
+                }
             }
             other => {
                 return Err(Error::CorruptObject(format!(
@@ -470,7 +730,6 @@ fn unpack_into<S: UnpackSink + ?Sized>(
         p.finish();
     }
 
-    // Trailing pack checksum (hash of all preceding bytes); not included in the hash.
     let digest = rd.finalize_hasher();
     let trailing = rd.read_trailer()?;
     if digest != trailing {
@@ -480,8 +739,6 @@ fn unpack_into<S: UnpackSink + ?Sized>(
     }
     let pack_bytes = rd.stream_pos() as u64;
 
-    // Resolve pending deltas iteratively.  Each pass resolves all deltas whose
-    // base is now known; repeat until none remain or we stall (corrupt pack).
     let mut remaining = pending;
     if let (Some(p), false) = (progress.as_mut(), remaining.is_empty()) {
         p.start(ProgressPhase::ResolvingDeltas, Some(remaining.len() as u64));
@@ -492,44 +749,38 @@ fn unpack_into<S: UnpackSink + ?Sized>(
             break;
         }
         poll_unpack_cancel(&mut progress, cancel)?;
+        test_note_pending_delta_bytes(&remaining, base_cache.bytes_used());
         let before = remaining.len();
         let mut still_pending: Vec<PendingDelta> = Vec::new();
 
         for delta in remaining {
-            let base_res: Option<(ObjectKind, Cow<'_, [u8]>)> =
-                if let Some(base_off) = delta.base_offset {
-                    match by_offset.get(&base_off) {
-                        Some(e) => Some((e.kind(), entry_object_bytes(e, sink)?)),
-                        None => None,
-                    }
-                } else if let Some(ref base_id) = delta.base_oid {
-                    if let Some(e) = by_oid.get(base_id) {
-                        Some((e.kind(), entry_object_bytes(e, sink)?))
-                    } else if !opts.dry_run {
-                        sink.read_stored(base_id)?
-                            .map(|obj| (obj.kind, Cow::Owned(obj.data)))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-
-            match base_res {
-                Some((base_kind, base_data)) => {
-                    let result = apply_delta(base_data.as_ref(), &delta.delta_data)?;
-                    let oid = sink.write(base_kind, &result, opts.dry_run)?;
-                    let new_entry =
-                        packed_entry_after_write(base_kind, result, oid, opts, MAX_RETAIN_BYTES);
-                    by_offset.insert(delta.offset, new_entry.clone());
-                    by_oid.insert(oid, new_entry);
-                    object_counts.add(base_kind);
-                    count += 1;
-                    if let Some(p) = progress.as_mut() {
-                        p.inc(1);
-                    }
+            if let Some((oid, kind, data)) = resolve_pending_delta(
+                &delta,
+                &by_offset,
+                &by_oid,
+                sink,
+                opts,
+                MAX_STREAM_BLOB_BYTES,
+                &mut base_cache,
+            )? {
+                record_resolved_object(
+                    &mut by_offset,
+                    &mut by_oid,
+                    delta.offset,
+                    oid,
+                    kind,
+                    data,
+                    opts,
+                    MAX_STREAM_BLOB_BYTES,
+                    &mut base_cache,
+                )?;
+                object_counts.add(kind);
+                count += 1;
+                if let Some(p) = progress.as_mut() {
+                    p.inc(1);
                 }
-                None => still_pending.push(delta),
+            } else {
+                still_pending.push(delta);
             }
         }
 
@@ -552,6 +803,7 @@ fn unpack_into<S: UnpackSink + ?Sized>(
             &opts.allowed_missing,
             opts.allow_promisor_missing_references,
             &opts.shallow_boundaries,
+            promised,
         )?;
     }
 
@@ -563,20 +815,88 @@ fn unpack_into<S: UnpackSink + ?Sized>(
     })
 }
 
-/// Resolved non-delta object: either full bytes in memory or a large blob on disk.
+/// Slot in the in-pack index: dry-run payloads or a stored object id.
 #[derive(Debug, Clone)]
 enum PackedObjectEntry {
-    InMemory { kind: ObjectKind, data: Vec<u8> },
-    BlobOnDisk { oid: ObjectId },
+    DryRun { kind: ObjectKind, data: Vec<u8> },
+    Stored { kind: ObjectKind, oid: ObjectId },
 }
 
-impl PackedObjectEntry {
-    fn kind(&self) -> ObjectKind {
-        match self {
-            PackedObjectEntry::InMemory { kind, .. } => *kind,
-            PackedObjectEntry::BlobOnDisk { .. } => ObjectKind::Blob,
+fn packed_entry_kind(entry: &PackedObjectEntry) -> ObjectKind {
+    match entry {
+        PackedObjectEntry::DryRun { kind, .. } | PackedObjectEntry::Stored { kind, .. } => *kind,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_resolved_object(
+    by_offset: &mut HashMap<usize, PackedObjectEntry>,
+    by_oid: &mut HashMap<ObjectId, PackedObjectEntry>,
+    pack_offset: usize,
+    oid: ObjectId,
+    kind: ObjectKind,
+    data: Vec<u8>,
+    opts: &UnpackOptions,
+    max_stream_blob: usize,
+    cache: &mut UnpackBaseByteCache,
+) -> Result<()> {
+    let entry =
+        packed_entry_after_write(kind, data, oid, opts, max_stream_blob, pack_offset, cache);
+    by_offset.insert(pack_offset, entry.clone());
+    by_oid.insert(oid, entry);
+    Ok(())
+}
+
+fn resolve_pending_delta<S: UnpackSink + ?Sized>(
+    delta: &PendingDelta,
+    by_offset: &HashMap<usize, PackedObjectEntry>,
+    by_oid: &HashMap<ObjectId, PackedObjectEntry>,
+    sink: &S,
+    opts: &UnpackOptions,
+    max_stream_blob: usize,
+    cache: &mut UnpackBaseByteCache,
+) -> Result<Option<(ObjectId, ObjectKind, Vec<u8>)>> {
+    let Some((base_kind, base_data)) =
+        delta_base_bytes(delta, by_offset, by_oid, sink, opts, cache)?
+    else {
+        return Ok(None);
+    };
+    let result = apply_delta(base_data.as_ref(), &delta.delta_data)?;
+    let oid = sink.write(base_kind, &result, opts.dry_run)?;
+    if !opts.dry_run && (base_kind != ObjectKind::Blob || result.len() <= max_stream_blob) {
+        cache.put(delta.offset, base_kind, result.clone());
+    }
+    Ok(Some((oid, base_kind, result)))
+}
+
+fn delta_base_bytes<'a, S: UnpackSink + ?Sized>(
+    delta: &PendingDelta,
+    by_offset: &'a HashMap<usize, PackedObjectEntry>,
+    by_oid: &'a HashMap<ObjectId, PackedObjectEntry>,
+    sink: &S,
+    opts: &UnpackOptions,
+    cache: &mut UnpackBaseByteCache,
+) -> Result<Option<(ObjectKind, Cow<'a, [u8]>)>> {
+    if let Some(base_off) = delta.base_offset {
+        if let Some((kind, data)) = cache.get(base_off) {
+            return Ok(Some((kind, Cow::Owned(data))));
+        }
+        let Some(entry) = by_offset.get(&base_off) else {
+            return Ok(None);
+        };
+        return entry_object_bytes(entry, sink, Some(base_off), cache).map(Some);
+    }
+    if let Some(ref base_id) = delta.base_oid {
+        if let Some(entry) = by_oid.get(base_id) {
+            return entry_object_bytes(entry, sink, None, cache).map(Some);
+        }
+        if !opts.dry_run {
+            if let Some(obj) = sink.read_stored(base_id)? {
+                return Ok(Some((obj.kind, Cow::Owned(obj.data))));
+            }
         }
     }
+    Ok(None)
 }
 
 fn verify_packed_dot_special_entries<S: UnpackSink + ?Sized>(
@@ -588,17 +908,27 @@ fn verify_packed_dot_special_entries<S: UnpackSink + ?Sized>(
     keys.sort();
     for oid in keys {
         let entry = &by_oid[&oid];
-        let PackedObjectEntry::InMemory { kind, data } = entry else {
+        if matches!(
+            entry,
+            PackedObjectEntry::Stored {
+                kind: ObjectKind::Blob,
+                ..
+            } | PackedObjectEntry::DryRun {
+                kind: ObjectKind::Blob,
+                ..
+            }
+        ) {
             continue;
-        };
-        if *kind == ObjectKind::Tree {
-            for di in tracker.on_tree(&oid, data)? {
+        }
+        let (kind, data) = entry_payload_for_strict(entry, sink, &oid)?;
+        if kind == ObjectKind::Tree {
+            for di in tracker.on_tree(&oid, &data)? {
                 if di.is_error_severity() {
                     return Err(Error::CorruptObject(di.format_line()));
                 }
             }
         }
-        for di in tracker.on_object(&oid, *kind, data) {
+        for di in tracker.on_object(&oid, kind, &data) {
             if di.is_error_severity() {
                 return Err(Error::CorruptObject(di.format_line()));
             }
@@ -661,16 +991,22 @@ fn dot_special_blob_bytes<S: UnpackSink + ?Sized>(
     sink: &S,
     id: &ObjectId,
 ) -> Result<(ObjectKind, Vec<u8>)> {
+    entry_payload_for_strict(entry, sink, id)
+}
+
+fn entry_payload_for_strict<S: UnpackSink + ?Sized>(
+    entry: &PackedObjectEntry,
+    sink: &S,
+    id: &ObjectId,
+) -> Result<(ObjectKind, Vec<u8>)> {
     match entry {
-        PackedObjectEntry::InMemory { kind, data, .. } => Ok((*kind, data.clone())),
-        PackedObjectEntry::BlobOnDisk { oid } => {
+        PackedObjectEntry::DryRun { kind, data } => Ok((*kind, data.clone())),
+        PackedObjectEntry::Stored { kind, oid } => {
             debug_assert_eq!(oid, id);
             let Some(obj) = sink.read_stored(id)? else {
-                return Err(Error::CorruptObject(format!(
-                    "missing .gitmodules/.gitattributes blob {id}"
-                )));
+                return Err(Error::CorruptObject(format!("missing object {id}")));
             };
-            Ok((obj.kind, obj.data))
+            Ok((*kind, obj.data))
         }
     }
 }
@@ -680,25 +1016,39 @@ fn packed_entry_after_write(
     data: Vec<u8>,
     oid: ObjectId,
     opts: &UnpackOptions,
-    max_retain: usize,
+    max_stream_blob: usize,
+    _pack_offset: usize,
+    _cache: &mut UnpackBaseByteCache,
 ) -> PackedObjectEntry {
-    if !opts.dry_run && kind == ObjectKind::Blob && data.len() > max_retain {
-        PackedObjectEntry::BlobOnDisk { oid }
-    } else {
-        PackedObjectEntry::InMemory { kind, data }
+    let _ = max_stream_blob;
+    if opts.dry_run {
+        return PackedObjectEntry::DryRun { kind, data };
     }
+    PackedObjectEntry::Stored { kind, oid }
 }
 
 fn entry_object_bytes<'a, S: UnpackSink + ?Sized>(
     entry: &'a PackedObjectEntry,
     sink: &S,
-) -> Result<Cow<'a, [u8]>> {
+    pack_offset: Option<usize>,
+    cache: &mut UnpackBaseByteCache,
+) -> Result<(ObjectKind, Cow<'a, [u8]>)> {
     match entry {
-        PackedObjectEntry::InMemory { data, .. } => Ok(Cow::Borrowed(data.as_slice())),
-        PackedObjectEntry::BlobOnDisk { oid } => sink
-            .read_stored(oid)?
-            .map(|obj| Cow::Owned(obj.data))
-            .ok_or_else(|| Error::ObjectNotFound(oid.to_hex())),
+        PackedObjectEntry::DryRun { kind, data } => Ok((*kind, Cow::Borrowed(data.as_slice()))),
+        PackedObjectEntry::Stored { kind, oid } => {
+            if let Some(off) = pack_offset {
+                if let Some((k, data)) = cache.get(off) {
+                    return Ok((k, Cow::Owned(data)));
+                }
+            }
+            let obj = sink
+                .read_stored(oid)?
+                .ok_or_else(|| Error::ObjectNotFound(oid.to_hex()))?;
+            if let Some(off) = pack_offset {
+                cache.put(off, *kind, obj.data.clone());
+            }
+            Ok((*kind, Cow::Owned(obj.data)))
+        }
     }
 }
 
@@ -708,86 +1058,77 @@ fn strict_verify_packed_references_map<S: UnpackSink + ?Sized>(
     allowed_missing: &HashSet<ObjectId>,
     allow_promisor_missing_references: bool,
     shallow_boundaries: &HashSet<ObjectId>,
+    promised: Option<PromisedReference<'_>>,
 ) -> Result<()> {
+    let resolves = |target: &ObjectId, referrer: &ObjectId| -> Result<bool> {
+        if strict_ref_resolves_map(
+            target,
+            pack,
+            sink,
+            allowed_missing,
+            allow_promisor_missing_references,
+        )? {
+            return Ok(true);
+        }
+        promised.map_or(Ok(false), |promised| promised(target, referrer))
+    };
     for (oid, entry) in pack {
-        match entry {
-            PackedObjectEntry::BlobOnDisk { .. } => {}
-            PackedObjectEntry::InMemory { kind, data } => match kind {
-                ObjectKind::Tree => {
-                    for e in parse_tree(data)? {
-                        // Gitlink (submodule) entries point at commits that live
-                        // in the submodule repository, not the superproject's
-                        // pack/ODB. Skip them in the connectivity walk, matching
-                        // upstream git (git/fsck.c:374 `if (S_ISGITLINK) continue;`).
-                        if e.mode == MODE_GITLINK {
-                            continue;
-                        }
-                        if !strict_ref_resolves_map(
-                            &e.oid,
-                            pack,
-                            sink,
-                            allowed_missing,
-                            allow_promisor_missing_references,
-                        )? {
-                            return Err(Error::CorruptObject(format!(
-                                "strict: missing object {} referenced by tree",
-                                e.oid.to_hex()
-                            )));
-                        }
-                    }
-                }
-                ObjectKind::Commit => {
-                    let c = parse_commit(data)?;
-                    if !strict_ref_resolves_map(
-                        &c.tree,
-                        pack,
-                        sink,
-                        allowed_missing,
-                        allow_promisor_missing_references,
-                    )? {
-                        return Err(Error::CorruptObject(format!(
-                            "strict: missing tree {} referenced by commit",
-                            c.tree.to_hex()
-                        )));
-                    }
-                    // A commit recorded as a shallow boundary (graft) has its parents intentionally
-                    // absent — skip parent connectivity for it, matching unpack-objects run with a
-                    // `--shallow-file` listing this commit.
-                    if shallow_boundaries.contains(oid) {
+        let kind = packed_entry_kind(entry);
+        if kind == ObjectKind::Blob {
+            continue;
+        }
+        let (_, data) = entry_payload_for_strict(entry, sink, oid)?;
+        match kind {
+            ObjectKind::Tree => {
+                for e in parse_tree(&data)? {
+                    // Gitlink (submodule) entries point at commits that live
+                    // in the submodule repository, not the superproject's
+                    // pack/ODB. Skip them in the connectivity walk, matching
+                    // upstream git (git/fsck.c:374 `if (S_ISGITLINK) continue;`).
+                    if e.mode == MODE_GITLINK {
                         continue;
                     }
-                    for p in &c.parents {
-                        if !strict_ref_resolves_map(
-                            p,
-                            pack,
-                            sink,
-                            allowed_missing,
-                            allow_promisor_missing_references,
-                        )? {
-                            return Err(Error::CorruptObject(format!(
-                                "strict: missing parent {} referenced by commit",
-                                p.to_hex()
-                            )));
-                        }
-                    }
-                }
-                ObjectKind::Tag => {
-                    let t = parse_tag(data)?;
-                    if !strict_ref_resolves_map(
-                        &t.object,
-                        pack,
-                        sink,
-                        allowed_missing,
-                        allow_promisor_missing_references,
-                    )? {
+                    if !resolves(&e.oid, oid)? {
                         return Err(Error::CorruptObject(format!(
-                            "strict: missing object {} referenced by tag",
-                            t.object.to_hex()
+                            "strict: missing object {} referenced by tree",
+                            e.oid.to_hex()
                         )));
                     }
                 }
-                ObjectKind::Blob => {}
-            },
+            }
+            ObjectKind::Commit => {
+                let c = parse_commit(&data)?;
+                if !resolves(&c.tree, oid)? {
+                    return Err(Error::CorruptObject(format!(
+                        "strict: missing tree {} referenced by commit",
+                        c.tree.to_hex()
+                    )));
+                }
+                // A commit recorded as a shallow boundary (graft) has its parents intentionally
+                // absent — skip parent connectivity for it, matching unpack-objects run with a
+                // `--shallow-file` listing this commit.
+                if shallow_boundaries.contains(oid) {
+                    continue;
+                }
+                for p in &c.parents {
+                    if !resolves(p, oid)? {
+                        return Err(Error::CorruptObject(format!(
+                            "strict: missing parent {} referenced by commit",
+                            p.to_hex()
+                        )));
+                    }
+                }
+            }
+            ObjectKind::Tag => {
+                let t = parse_tag(&data)?;
+                if !resolves(&t.object, oid)? {
+                    return Err(Error::CorruptObject(format!(
+                        "strict: missing object {} referenced by tag",
+                        t.object.to_hex()
+                    )));
+                }
+            }
+            ObjectKind::Blob => {}
         }
     }
     Ok(())
@@ -2194,6 +2535,89 @@ mod tests {
     }
 
     #[test]
+    fn unpack_many_objects_does_not_retain_all_payloads() {
+        let _lock = TEST_UNPACK_RETAIN_LOCK.lock().expect("retain lock");
+        const N: usize = 2500;
+        let blobs: Vec<(ObjectKind, Vec<u8>)> = (0..N)
+            .map(|i| (ObjectKind::Blob, format!("blob-{i}\n").into_bytes()))
+            .collect();
+        let blob_refs: Vec<(ObjectKind, &[u8])> =
+            blobs.iter().map(|(k, d)| (*k, d.as_slice())).collect();
+        let pack = make_pack(&blob_refs);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let odb = Odb::new(tmp.path());
+        let cache_budget = 256 * 1024;
+        test_set_unpack_base_cache_byte_limit(cache_budget);
+        let count =
+            unpack_objects(&mut pack.as_slice(), &odb, &UnpackOptions::default()).expect("unpack");
+        assert_eq!(count, N);
+        assert!(
+            test_peak_unpack_retained_bytes() <= cache_budget + 128 * 1024,
+            "peak retained {} exceeds cache budget {}",
+            test_peak_unpack_retained_bytes(),
+            cache_budget
+        );
+        test_set_unpack_base_cache_byte_limit(0);
+    }
+
+    #[test]
+    fn unpack_many_deltified_blobs_respects_base_cache_budget() {
+        let _lock = TEST_UNPACK_RETAIN_LOCK.lock().expect("retain lock");
+        use crate::objects::{serialize_commit, CommitData};
+        use grit_test_support::objects::{HashAlgo as FixtureAlgo, ObjectKind as PK, PackBuilder};
+
+        const N_DELTAS: usize = 350;
+        const BLOB_SIZE: usize = 48 * 1024;
+        let base: Vec<u8> = (0..BLOB_SIZE).map(|i| (i % 251) as u8).collect();
+        let tree_oid = HashAlgo::Sha1
+            .hash_object(ObjectKind::Tree, b"")
+            .expect("hash");
+        let commit = CommitData {
+            tree: tree_oid,
+            parents: vec![],
+            author: "A <a@b.com>".into(),
+            committer: "A <a@b.com>".into(),
+            author_raw: Vec::new(),
+            committer_raw: Vec::new(),
+            encoding: None,
+            message: "m".into(),
+            raw_message: None,
+            extra_headers: Vec::new(),
+        };
+        let commit_data = serialize_commit(&commit);
+
+        let mut pb = PackBuilder::new(FixtureAlgo::Sha1);
+        pb.add_full(PK::Tree, b"");
+        pb.add_full(PK::Commit, &commit_data);
+        let base_idx = pb.add_full(PK::Blob, &base);
+        for i in 0..N_DELTAS {
+            let mut variant = base.clone();
+            variant[BLOB_SIZE - 1] = (i % 256) as u8;
+            let delta = crate::delta_encode::encode_lcp_delta(&base, &variant).expect("delta");
+            pb.add_ofs_delta(base_idx, &delta, delta.len());
+        }
+        let pack = pb.build().bytes;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let odb = Odb::new(tmp.path());
+        let cache_budget = 512 * 1024;
+        test_set_unpack_base_cache_byte_limit(cache_budget);
+        let opts = UnpackOptions {
+            strict: true,
+            ..Default::default()
+        };
+        let count = unpack_objects(&mut pack.as_slice(), &odb, &opts).expect("unpack");
+        assert_eq!(count, N_DELTAS + 3);
+        assert!(
+            test_peak_unpack_retained_bytes() <= cache_budget + 256 * 1024,
+            "peak retained {} exceeds cache budget {}",
+            test_peak_unpack_retained_bytes(),
+            cache_budget
+        );
+        test_set_unpack_base_cache_byte_limit(0);
+    }
+
+    #[test]
     fn pack_index_many_blobs_without_retaining_all_payloads() {
         const N: usize = 1500;
         let blobs: Vec<(ObjectKind, Vec<u8>)> = (0..N)
@@ -2652,10 +3076,16 @@ mod tests {
         }
 
         let mut by_oid = HashMap::new();
-        by_oid.insert(big_oid, PackedObjectEntry::BlobOnDisk { oid: big_oid });
+        by_oid.insert(
+            big_oid,
+            PackedObjectEntry::Stored {
+                kind: ObjectKind::Blob,
+                oid: big_oid,
+            },
+        );
         by_oid.insert(
             tree_oid,
-            PackedObjectEntry::InMemory {
+            PackedObjectEntry::DryRun {
                 kind: ObjectKind::Tree,
                 data: Vec::new(),
             },
@@ -2671,5 +3101,146 @@ mod tests {
             0,
             "must not read streamed blobs back for strict fsck"
         );
+    }
+
+    #[test]
+    fn strict_verify_does_not_reload_streamed_blobs() {
+        use std::cell::Cell;
+
+        use crate::index::MODE_REGULAR;
+        use crate::objects::{serialize_commit, serialize_tree, CommitData, TreeEntry};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let odb = Odb::new(tmp.path());
+        let big: Vec<u8> = vec![b'x'; 2 * 1024 * 1024 + 1];
+        let big_oid = odb.write(ObjectKind::Blob, &big).expect("write blob");
+
+        let tree_data = serialize_tree(&[TreeEntry {
+            mode: MODE_REGULAR,
+            name: b"big.bin".to_vec(),
+            oid: big_oid,
+        }]);
+        let tree_oid = HashAlgo::Sha1
+            .hash_object(ObjectKind::Tree, &tree_data)
+            .expect("hash");
+        let commit = CommitData {
+            tree: tree_oid,
+            parents: vec![],
+            author: "A <a@b.com>".into(),
+            committer: "A <a@b.com>".into(),
+            author_raw: Vec::new(),
+            committer_raw: Vec::new(),
+            encoding: None,
+            message: "m".into(),
+            raw_message: None,
+            extra_headers: Vec::new(),
+        };
+        let commit_data = serialize_commit(&commit);
+        let commit_oid = HashAlgo::Sha1
+            .hash_object(ObjectKind::Commit, &commit_data)
+            .expect("hash");
+
+        struct CountingSink<'a> {
+            inner: &'a Odb,
+            reads: Cell<usize>,
+        }
+
+        impl UnpackSink for CountingSink<'_> {
+            fn hash_algo(&self) -> HashAlgo {
+                Odb::hash_algo(self.inner)
+            }
+
+            fn write(&self, kind: ObjectKind, data: &[u8], dry_run: bool) -> Result<ObjectId> {
+                if dry_run {
+                    return self.inner.hash(kind, data);
+                }
+                self.inner.write(kind, data)
+            }
+
+            fn read_stored(&self, oid: &ObjectId) -> Result<Option<Object>> {
+                self.reads.set(self.reads.get() + 1);
+                self.inner.read_stored(oid)
+            }
+
+            fn contains(&self, oid: &ObjectId) -> Result<bool> {
+                Odb::contains(self.inner, oid)
+            }
+        }
+
+        let mut by_oid = HashMap::new();
+        by_oid.insert(
+            big_oid,
+            PackedObjectEntry::Stored {
+                kind: ObjectKind::Blob,
+                oid: big_oid,
+            },
+        );
+        by_oid.insert(
+            tree_oid,
+            PackedObjectEntry::DryRun {
+                kind: ObjectKind::Tree,
+                data: tree_data,
+            },
+        );
+        by_oid.insert(
+            commit_oid,
+            PackedObjectEntry::DryRun {
+                kind: ObjectKind::Commit,
+                data: commit_data,
+            },
+        );
+
+        let sink = CountingSink {
+            inner: &odb,
+            reads: Cell::new(0),
+        };
+        strict_verify_packed_references_map(
+            &sink,
+            &by_oid,
+            &HashSet::new(),
+            false,
+            &HashSet::new(),
+            None,
+        )
+        .expect("strict connectivity");
+        assert_eq!(
+            sink.reads.get(),
+            0,
+            "strict verify must not read streamed blob payloads"
+        );
+
+        let missing = ObjectId::from_hex(&"ab".repeat(20)).unwrap();
+        let bad_tree = serialize_tree(&[TreeEntry {
+            mode: MODE_REGULAR,
+            name: b"missing".to_vec(),
+            oid: missing,
+        }]);
+        let bad_tree_oid = HashAlgo::Sha1
+            .hash_object(ObjectKind::Tree, &bad_tree)
+            .expect("hash");
+        let mut bad = HashMap::new();
+        bad.insert(
+            bad_tree_oid,
+            PackedObjectEntry::DryRun {
+                kind: ObjectKind::Tree,
+                data: bad_tree,
+            },
+        );
+        let sink2 = CountingSink {
+            inner: &odb,
+            reads: Cell::new(0),
+        };
+        assert!(matches!(
+            strict_verify_packed_references_map(
+                &sink2,
+                &bad,
+                &HashSet::new(),
+                false,
+                &HashSet::new(),
+                None,
+            ),
+            Err(Error::CorruptObject(_))
+        ));
+        assert_eq!(sink2.reads.get(), 0);
     }
 }

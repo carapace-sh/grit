@@ -5,9 +5,13 @@ use std::process::Command;
 
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::diff::{diff_trees, DiffStatus};
+use grit_lib::error::Error;
 use grit_lib::index::MODE_GITLINK;
 use grit_lib::objects::ObjectId;
 use grit_lib::porcelain::checkout::checkout_between_trees;
+use grit_lib::porcelain::commit::{commit_worktree, CommitRequest};
+use grit_lib::porcelain::status::{status, StatusOptions};
+use grit_lib::progress::{NeverCancel, NullProgress};
 use grit_lib::repo::Repository;
 use grit_test_support::git;
 
@@ -94,6 +98,66 @@ fn checkout_uninitialized_gitlink_matches_git_clone() {
         git(&git_ref, &["status", "--porcelain"]).trim(),
         "",
         "reference git clone should also be clean"
+    );
+}
+
+#[test]
+fn stray_files_in_uninitialized_gitlink_match_git_status_and_commit() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    git(root, &["init", "-q", "-b", "main"]);
+    git(root, &["config", "user.email", "a@x"]);
+    git(root, &["config", "user.name", "a"]);
+    git(
+        root,
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("160000,{GITLINK_OID},sub"),
+        ],
+    );
+    git(root, &["commit", "-qm", "add gitlink"]);
+    std::fs::create_dir(root.join("sub")).expect("gitlink placeholder");
+    std::fs::write(root.join("sub/x.txt"), b"more\n").expect("stray");
+
+    assert!(
+        git(root, &["status", "--porcelain"]).trim().is_empty(),
+        "system git should ignore stray files in uninitialized submodule"
+    );
+
+    let repo = Repository::open(
+        &root.join(".git"),
+        &RepositoryOptions::empty().with_work_tree(root),
+    )
+    .expect("open");
+    let model = status(
+        &repo,
+        &StatusOptions::default(),
+        &mut NullProgress,
+        &NeverCancel,
+    )
+    .expect("status");
+    assert!(
+        model.unstaged.is_empty() && model.untracked.is_empty(),
+        "grit status should be clean: unstaged={:?} untracked={:?}",
+        model.unstaged,
+        model.untracked
+    );
+
+    let err = commit_worktree(
+        &repo,
+        &CommitRequest {
+            message: "touch".into(),
+            ..Default::default()
+        },
+        &mut NullProgress,
+        &NeverCancel,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, Error::NothingToCommit),
+        "expected nothing to commit, got {err:?}"
     );
 }
 

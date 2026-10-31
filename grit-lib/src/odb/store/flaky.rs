@@ -3,7 +3,7 @@
 
 use std::io;
 use std::ops::ControlFlow;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use super::{MemoryStore, ObjectStore, WritableObjectStore};
@@ -12,12 +12,13 @@ use crate::objects::{HashAlgo, Object, ObjectId, ObjectInfo, ObjectKind};
 use crate::odb::WriteOptions;
 
 /// In-memory store whose existence probes and/or reads can be switched to fail
-/// with [`Error::Io`] (`ConnectionReset`).
+/// with [`Error::Io`] (`ConnectionReset`), and which counts full object reads.
 #[derive(Debug)]
 pub(crate) struct FlakyStore {
     inner: MemoryStore,
     fail_contains: AtomicBool,
     fail_reads: AtomicBool,
+    reads: AtomicUsize,
 }
 
 impl FlakyStore {
@@ -26,7 +27,13 @@ impl FlakyStore {
             inner: MemoryStore::new(HashAlgo::Sha1),
             fail_contains: AtomicBool::new(false),
             fail_reads: AtomicBool::new(false),
+            reads: AtomicUsize::new(0),
         })
+    }
+
+    /// Full object reads ([`ObjectStore::read`] / [`ObjectStore::read_into`]) so far.
+    pub(crate) fn reads(&self) -> usize {
+        self.reads.load(Ordering::Relaxed)
     }
 
     /// Make `contains` fail (reads keep working, e.g. a separate metadata endpoint is down).
@@ -63,6 +70,7 @@ impl ObjectStore for FlakyStore {
 
     fn read(&self, oid: &ObjectId) -> Result<Option<Object>> {
         Self::check(&self.fail_reads)?;
+        self.reads.fetch_add(1, Ordering::Relaxed);
         self.inner.read(oid)
     }
 

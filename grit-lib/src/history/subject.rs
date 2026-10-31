@@ -1,14 +1,12 @@
 //! Commit subject lines for history rewrite outcomes.
 
+use crate::merge_trees::ReplayConflictLabels;
 use crate::objects::{CommitData, ObjectId};
 use crate::repo::Repository;
 
 use super::error::HistoryError;
+use super::load_commit;
 use super::types::RewrittenCommit;
-
-fn load_commit(repo: &Repository, oid: ObjectId) -> Result<CommitData, HistoryError> {
-    repo.odb().read_commit(&oid).map_err(HistoryError::from)
-}
 
 /// First line of a commit message, without trailing newline on that line.
 ///
@@ -21,6 +19,11 @@ pub fn commit_message_subject_line(message: &str) -> String {
 
 fn message_first_line(message: &str) -> String {
     message.lines().next().unwrap_or("").trim_end().to_string()
+}
+
+/// Conflict-marker labels for replaying `commit` (whose parsed object is `data`) onto a new parent.
+pub(crate) fn replay_conflict_labels(commit: ObjectId, data: &CommitData) -> ReplayConflictLabels {
+    ReplayConflictLabels::new(commit, &message_first_line(&data.message))
 }
 
 /// Subject for one rewritten row while planning: replacement message, or the original when dropped.

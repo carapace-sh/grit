@@ -226,7 +226,15 @@ pub struct RevertRunOptions {
 pub fn run(opts: &RevertRunOptions) -> Result<RevertOutcome> {
     let repo = context::discover()?;
     if opts.abort {
-        abort_replay_sequence(&repo).map_err(map_replay_error)?;
+        use grit_lib::porcelain::replay_sequence::ReplayAbortOutcome;
+        match abort_replay_sequence(&repo).map_err(|e| map_replay_error(&repo, e))? {
+            ReplayAbortOutcome::Rewound => {}
+            ReplayAbortOutcome::ClearedInPlace => {
+                eprintln!(
+                    "warning: branch tip moved during the revert; replay state cleared without moving the branch"
+                );
+            }
+        }
         return Ok(RevertOutcome::new(RevertResult::Aborted));
     }
 
@@ -234,12 +242,17 @@ pub fn run(opts: &RevertRunOptions) -> Result<RevertOutcome> {
     let now = context::wall_clock_now(env);
     let committer = context::signature(&repo, IdentRole::Committer, now)?;
 
+    let interrupt = crate::interrupt::InterruptCancel::install();
+    let mut progress = grit_lib::progress::NullProgress;
+
     if opts.continue_revert {
-        let outcome = continue_replay_sequence(&repo, &committer).map_err(map_replay_error)?;
+        let outcome = continue_replay_sequence(&repo, &committer, &mut progress, &interrupt)
+            .map_err(|e| map_replay_error(&repo, e))?;
         return Ok(map_sequence_outcome(outcome));
     }
     if opts.skip {
-        let outcome = skip_replay_step(&repo, &committer).map_err(map_replay_error)?;
+        let outcome = skip_replay_step(&repo, &committer, &mut progress, &interrupt)
+            .map_err(|e| map_replay_error(&repo, e))?;
         return Ok(map_sequence_outcome(outcome));
     }
 
@@ -273,10 +286,12 @@ pub fn run(opts: &RevertRunOptions) -> Result<RevertOutcome> {
         },
     };
     if opts.check {
-        let prediction = predict_replay_sequence(&repo, &req).map_err(map_replay_error)?;
+        let prediction =
+            predict_replay_sequence(&repo, &req).map_err(|e| map_replay_error(&repo, e))?;
         return Ok(map_prediction_outcome(prediction));
     }
-    let outcome = start_replay_sequence(&repo, &req).map_err(map_replay_error)?;
+    let outcome = start_replay_sequence(&repo, &req, &mut progress, &interrupt)
+        .map_err(|e| map_replay_error(&repo, e))?;
     Ok(map_sequence_outcome(outcome))
 }
 
@@ -347,8 +362,11 @@ fn map_sequence_outcome(outcome: SequenceOutcome) -> RevertOutcome {
     }
 }
 
-fn map_replay_error(err: Error) -> anyhow::Error {
+fn map_replay_error(repo: &grit_lib::repo::Repository, err: Error) -> anyhow::Error {
     match err {
+        Error::OperationInProgress(kind) => {
+            crate::json_error::operation_in_progress_for_repo(repo, "revert", kind)
+        }
         Error::DetachedHead => anyhow::anyhow!("HEAD is detached; grit revert needs a branch"),
         Error::UnbornHead => anyhow::anyhow!("no commits yet on this branch to revert onto"),
         Error::MergeCommit { oid } => {
@@ -369,8 +387,11 @@ fn map_replay_error(err: Error) -> anyhow::Error {
         Error::NoReplayInProgress => {
             anyhow::anyhow!("no revert in progress")
         }
-        Error::ReplayAbortHeadMoved => anyhow::anyhow!(
-            "cannot abort revert: the current branch moved since the revert started"
+        Error::ReplaySkipAlreadyCommitted => anyhow::anyhow!(
+            "nothing to skip: current step already committed; run `grit revert --continue` instead"
+        ),
+        Error::ReplayContinueDirtyIndex => anyhow::anyhow!(
+            "cannot continue revert: index differs from HEAD after the step was committed"
         ),
         Error::Message(msg) => anyhow::anyhow!(msg),
         other => anyhow::Error::new(other),

@@ -20,13 +20,14 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};
 
+use crate::alternate_boundary::AlternateSources;
 use crate::commit_graph_file::CommitGraphChain;
 use crate::commit_graph_write::{
     atomic_replace_commit_graph, build_commit_graph_bytes_from_oid_maps,
     collect_reachable_commit_oids_for_repository, load_commit_graph_commit_info,
     remove_commit_graph_chain_dir, remove_commit_graph_files, BloomWriteStats,
 };
-use crate::config::ConfigSet;
+use crate::config::{canonical_key, parse_bool, ConfigSet};
 use crate::diff::bloom::BloomFilterSettings;
 use crate::environment::Environment;
 use crate::error::{ConfigError, Error, Result};
@@ -45,7 +46,7 @@ use crate::objects::{
 };
 use crate::odb::Odb;
 use crate::odb::UnreachablePackRetention;
-use crate::pack_bitmap::{PackBitmapWriteOptions, PackBitmapWriter};
+use crate::pack_bitmap::{PackBitmapWriteError, PackBitmapWriteOptions, PackBitmapWriter};
 use crate::pack_delta::{pack_delta_search_parallel_options, pack_write_parallel_options};
 use crate::pack_name_hash::pack_name_hash_child;
 use crate::pack_object_select::{
@@ -55,13 +56,25 @@ use crate::pack_objects::{PackBuildOptions, SerializedDeltaPack};
 use crate::pack_rev::write_pack_rev_sidecar_for_index_path;
 use crate::prune_packed::{prune_packed_objects, PrunePackedOptions};
 use crate::reflog::{
-    expire_reflog_git_with_promises, load_gc_reflog_expire_config, reflog_refs_on_store,
-    ReflogExpireParams,
+    expire_reflog_git_with_cache, load_gc_reflog_expire_config, reflog_refs_on_store,
+    ReflogExpireParams, ReflogExpiryCache,
 };
 use crate::repack_pack::{write_repack_pack, RepackPackSettings};
 use crate::repo::Repository;
 use crate::shallow::load_shallow_boundaries;
 use time::OffsetDateTime;
+
+mod drop_blobs;
+
+pub use crate::offload::{
+    offload_blobs, LopReadiness, OffloadConfigChange, OffloadError, OffloadOptions, OffloadPack,
+    OffloadPackRole, OffloadRepo, OffloadReport, LOP_GIT_DIR_KEY, LOP_KEEP_MESSAGE,
+};
+pub use drop_blobs::{
+    drop_large_blobs_enabled, drop_promised_blobs, DropExpiry, DropPromisedBlobsOptions,
+    DropPromisedBlobsReport, DropPromisedBlobsSkip, DroppedBlob, KeptBlobCounts,
+    DEFAULT_DROP_EXPIRE, DEFAULT_DROP_MIN_SIZE, DROP_LARGE_BLOBS_TASK,
+};
 
 /// Options for [`repack_all()`].
 #[derive(Debug, Clone)]
@@ -405,6 +418,12 @@ pub struct GcOptions {
     /// Changed-path Bloom filters are kept when the existing graph has them and are not
     /// added otherwise, matching `git gc`.
     pub write_commit_graph: bool,
+    /// When true (the default), run the drop-large-blobs phase after repack if
+    /// `maintenance.drop-large-blobs.enabled` is set (see [`drop_promised_blobs`]).
+    /// False never runs it. The phase takes its recency cutoff from
+    /// [`Self::now_unix`] and is skipped ([`DropPromisedBlobsSkip::NoCurrentTime`])
+    /// when that is 0.
+    pub drop_large_blobs: bool,
 }
 
 impl Default for GcOptions {
@@ -418,6 +437,7 @@ impl Default for GcOptions {
             now_unix: 0,
             pack_refs: true,
             write_commit_graph: true,
+            drop_large_blobs: true,
         }
     }
 }
@@ -534,6 +554,135 @@ pub(crate) fn commit_graph_writes_generation_data(config: &ConfigSet) -> bool {
         .unwrap_or(true)
 }
 
+/// A commit-graph file built in memory by [`build_commit_graph`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct BuiltCommitGraph {
+    /// The complete file, byte-for-byte what Git reads from `objects/info/commit-graph`.
+    pub bytes: Vec<u8>,
+    /// Commits recorded in the graph.
+    pub commit_count: usize,
+    /// Bloom generation counters when [`CommitGraphOptions::changed_paths`] was set.
+    pub bloom_stats: Option<BloomWriteStats>,
+}
+
+impl BuiltCommitGraph {
+    /// Parse [`Self::bytes`] into a chain for
+    /// [`OdbBuilder::commit_graph`](crate::odb::OdbBuilder::commit_graph).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::CorruptObject`] if the bytes fail verification (see
+    /// [`CommitGraphChain::from_bytes`]).
+    pub fn to_chain(&self) -> Result<CommitGraphChain> {
+        CommitGraphChain::from_bytes(self.bytes.clone())
+    }
+}
+
+/// Outcome of [`build_commit_graph`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommitGraphBuild {
+    /// The graph of every commit reachable from the repository's refs.
+    Built(BuiltCommitGraph),
+    /// The repository rewrites parent lists, so no graph may describe it.
+    Skipped(CommitGraphSkipReason),
+}
+
+/// Build a reachable commit-graph in memory, for any object store.
+///
+/// Reachable commits are discovered from [`Repository::refs`](crate::repo::Repository::refs)
+/// and read through [`Repository::odb`](crate::repo::Repository::odb), so this works for a
+/// custom primary ([`crate::odb::OdbBuilder::primary`]) as well as the files backend. Nothing is
+/// written: a custom store persists [`BuiltCommitGraph::bytes`] in its own storage and attaches
+/// the graph when it next opens the repository, with
+/// [`OdbBuilder::commit_graph`](crate::odb::OdbBuilder::commit_graph) and
+/// [`CommitGraphChain::from_bytes`]. For a files-backed repository [`write_commit_graph`] builds
+/// the same bytes and installs them under `objects/info/`.
+///
+/// With [`CommitGraphOptions::changed_paths`], changed-path Bloom filters are added, reusing
+/// the filters of the graph the repository's walks already use (the attached graph, or the
+/// files backend's on-disk graph) where their settings match.
+/// [`CommitGraphOptions::dry_run`] has no effect. In a shallow repository, with
+/// `info/grafts`, or with enabled replace refs, [`CommitGraphBuild::Skipped`] says why no graph
+/// was built (see [`CommitGraphSkipReason`]).
+///
+/// # Errors
+///
+/// Propagates ref, object read and config errors.
+pub fn build_commit_graph(
+    repo: &Repository,
+    opts: &CommitGraphOptions,
+) -> Result<CommitGraphBuild> {
+    if let Some(reason) = CommitGraphSkipReason::detect_for_repository(repo)? {
+        return Ok(CommitGraphBuild::Skipped(reason));
+    }
+    let odb = repo.odb();
+    let existing = odb.commit_graph_chain();
+    let commits = collect_reachable_commit_oids_for_repository(repo)?;
+    build_commit_graph_for_commits(
+        odb,
+        commits,
+        &*repo.config()?,
+        opts.changed_paths,
+        existing.as_deref(),
+    )
+    .map(CommitGraphBuild::Built)
+}
+
+/// Encode a commit-graph of `commits`, read through `odb`.
+///
+/// Bloom filters and generation data follow `config` (`commitGraph.changedPathsVersion`,
+/// `commitGraph.generationVersion`); with `changed_paths`, filters already in `existing` are
+/// reused where their settings match.
+pub(crate) fn build_commit_graph_for_commits(
+    odb: &Odb,
+    commits: impl IntoIterator<Item = ObjectId>,
+    config: &ConfigSet,
+    changed_paths: bool,
+    existing: Option<&CommitGraphChain>,
+) -> Result<BuiltCommitGraph> {
+    let bloom = bloom_settings_for_commit_graph_write(config, changed_paths);
+    let write_generation = commit_graph_writes_generation_data(config);
+    let mut sorted: Vec<ObjectId> = commits.into_iter().collect();
+    sorted.sort_unstable();
+
+    let mut infos = oid_hash_map();
+    for oid in &sorted {
+        infos.insert(*oid, load_commit_graph_commit_info(odb, *oid)?);
+    }
+
+    let mut existing_filters = oid_hash_map();
+    let mut upgraded_filters = oid_hash_map();
+    if let (true, Some(chain)) = (changed_paths, existing) {
+        for oid in &sorted {
+            if let Some(bytes) = chain.existing_filter_bytes(oid, &bloom) {
+                existing_filters.insert(*oid, bytes);
+            } else if let Some(bytes) = chain.upgradable_filter_bytes(oid, &bloom) {
+                upgraded_filters.insert(*oid, bytes);
+            }
+        }
+    }
+
+    let (bytes, bloom_stats) = build_commit_graph_bytes_from_oid_maps(
+        &sorted,
+        &infos,
+        odb,
+        changed_paths,
+        &bloom,
+        None,
+        &[],
+        None,
+        &existing_filters,
+        &upgraded_filters,
+        write_generation,
+    )?;
+    Ok(BuiltCommitGraph {
+        bytes,
+        commit_count: sorted.len(),
+        bloom_stats: changed_paths.then_some(bloom_stats),
+    })
+}
+
 /// Write a monolithic reachable commit-graph under `objects/info/commit-graph`.
 ///
 /// Reachable commits are discovered from [`Repository::refs`](crate::repo::Repository::refs)
@@ -544,6 +693,9 @@ pub(crate) fn commit_graph_writes_generation_data(config: &ConfigSet) -> bool {
 /// Git only skips the write in that state, but `git fsck` still verifies a graph that is
 /// already there, so an existing graph and split chain are deleted as well (except in
 /// [`CommitGraphOptions::dry_run`]).
+///
+/// Only a files-backed repository has an `objects/info/` directory to install the graph in.
+/// A custom primary builds the same graph with [`build_commit_graph`] and stores it itself.
 ///
 /// # Errors
 ///
@@ -579,69 +731,35 @@ pub fn write_commit_graph(
         });
     }
 
-    let config = repo.config()?;
-    let bloom = bloom_settings_for_commit_graph_write(&config, opts.changed_paths);
-    let write_generation = commit_graph_writes_generation_data(&config);
-
-    let chain = CommitGraphChain::try_load(objects_dir).ok().flatten();
-
     let commits = collect_reachable_commit_oids_for_repository(repo)?;
-    let mut sorted: Vec<ObjectId> = commits.into_iter().collect();
-    sorted.sort();
-    let commit_count = sorted.len();
-
     if opts.dry_run {
         return Ok(CommitGraphWriteReport {
             path,
-            commit_count,
+            commit_count: commits.len(),
             removed_chain: false,
             bloom_stats: opts.changed_paths.then_some(BloomWriteStats::default()),
             skipped: None,
         });
     }
 
-    let mut infos = oid_hash_map();
-    for oid in &sorted {
-        infos.insert(*oid, load_commit_graph_commit_info(odb, *oid)?);
-    }
-
-    let mut existing_filters = oid_hash_map();
-    let mut upgraded_filters = oid_hash_map();
-    if opts.changed_paths {
-        if let Some(ref chain) = chain {
-            for oid in &sorted {
-                if let Some(bytes) = chain.existing_filter_bytes(oid, &bloom) {
-                    existing_filters.insert(*oid, bytes);
-                } else if let Some(bytes) = chain.upgradable_filter_bytes(oid, &bloom) {
-                    upgraded_filters.insert(*oid, bytes);
-                }
-            }
-        }
-    }
-
-    let (bytes, bloom_stats) = build_commit_graph_bytes_from_oid_maps(
-        &sorted,
-        &infos,
+    let existing = CommitGraphChain::try_load(objects_dir).ok().flatten();
+    let built = build_commit_graph_for_commits(
         odb,
+        commits,
+        &*repo.config()?,
         opts.changed_paths,
-        &bloom,
-        None,
-        &[],
-        None,
-        &existing_filters,
-        &upgraded_filters,
-        write_generation,
+        existing.as_ref(),
     )?;
 
-    let written_path = atomic_replace_commit_graph(objects_dir, &bytes)?;
+    let written_path = atomic_replace_commit_graph(objects_dir, &built.bytes)?;
     let removed_chain = remove_commit_graph_chain_dir(objects_dir);
     repo.caches().invalidate_commit_graph_cache();
 
     Ok(CommitGraphWriteReport {
         path: written_path,
-        commit_count,
+        commit_count: built.commit_count,
         removed_chain,
-        bloom_stats: opts.changed_paths.then_some(bloom_stats),
+        bloom_stats: built.bloom_stats,
         skipped: None,
     })
 }
@@ -726,6 +844,8 @@ pub struct GcPhaseTimings {
     pub prune_ms: u64,
     /// Commit-graph write after repack.
     pub commit_graph_ms: u64,
+    /// Drop-large-blobs phase after repack.
+    pub drop_large_blobs_ms: u64,
 }
 
 /// Result of [`gc`].
@@ -743,6 +863,10 @@ pub struct GcStats {
     pub commit_graph: Option<CommitGraphWriteReport>,
     /// Reflog lines removed by expiry during gc.
     pub reflog_entries_pruned: usize,
+    /// The drop-large-blobs phase (`None` when [`GcOptions::drop_large_blobs`] is
+    /// false). Reports [`DropPromisedBlobsSkip::Disabled`] unless
+    /// `maintenance.drop-large-blobs.enabled` is set.
+    pub drop_large_blobs: Option<DropPromisedBlobsReport>,
     /// Per-phase wall times for the gc orchestration.
     pub phase_timings: GcPhaseTimings,
 }
@@ -777,8 +901,15 @@ fn repack_detail(repo: &Repository, opts: &RepackOptions) -> Result<RepackDetail
     let mut report = RepackReport::default();
     let loose_before = count_loose_objects(odb)?;
     let packs_before = count_pack_files(&pack_dir);
+    let pack_inventory = pack_repack_inventory(&pack_dir);
+
+    #[cfg(test)]
+    gc_test_hooks::run(gc_test_hooks::GcPausePoint::AfterInventoryBeforeRoots);
 
     let roots = collect_maintenance_object_roots(repo)?;
+
+    #[cfg(test)]
+    gc_test_hooks::run(gc_test_hooks::GcPausePoint::AfterRootsBeforeDropAll);
     if roots.is_empty() && loose_before == 0 && packs_before == 0 {
         return Ok(RepackDetail {
             report,
@@ -938,7 +1069,7 @@ fn repack_detail(repo: &Repository, opts: &RepackOptions) -> Result<RepackDetail
             write_pack_rev_sidecar_for_index_path(&idx_path)?;
         }
 
-        if opts.write_bitmap && promised.is_empty() {
+        if opts.write_bitmap && promised.is_empty() && !AlternateSources::load(odb)?.in_use() {
             if opts.incremental && packs_before > 0 {
                 // Per-pack bitmaps require reachability closure within one pack; incremental
                 // repack keeps older packs and adds a new layer. Write a multi-pack-index
@@ -955,13 +1086,22 @@ fn repack_detail(repo: &Repository, opts: &RepackOptions) -> Result<RepackDetail
                 let WriteMultiPackIndexResult { bitmap: _ } =
                     write_multi_pack_index_with_options(&pack_dir, &midx_opts)?;
             } else {
-                let bitmap_opts = PackBitmapWriteOptions::default();
+                let bitmap_opts = PackBitmapWriteOptions {
+                    reachability_roots: Some(roots.clone()),
+                    ..PackBitmapWriteOptions::default()
+                };
                 let now = opts
                     .now
                     .map(offset_to_system_time)
                     .unwrap_or(SystemTime::UNIX_EPOCH);
-                PackBitmapWriter::write(repo, &idx_path, &bitmap_opts, now)
-                    .map_err(|e| Error::CorruptObject(e.to_string()))?;
+                match PackBitmapWriter::write(repo, &idx_path, &bitmap_opts, now) {
+                    Ok(_) => {}
+                    Err(PackBitmapWriteError::NotClosed { .. }) => {
+                        // Pack was built from an earlier root snapshot; live tips moved on
+                        // (concurrent receive-pack). Skip the bitmap this run.
+                    }
+                    Err(e) => return Err(Error::CorruptObject(e.to_string())),
+                }
             }
         }
 
@@ -980,6 +1120,7 @@ fn repack_detail(repo: &Repository, opts: &RepackOptions) -> Result<RepackDetail
                 &reachable,
                 retention,
                 &retained_packs,
+                &pack_inventory,
             )?;
         }
 
@@ -989,7 +1130,12 @@ fn repack_detail(repo: &Repository, opts: &RepackOptions) -> Result<RepackDetail
         report.packs_removed = if opts.incremental {
             0
         } else {
-            remove_superseded_pack_files_retaining(&pack_dir, &pack_path, &retained_packs)?
+            remove_superseded_pack_files_retaining(
+                &pack_dir,
+                &pack_path,
+                &retained_packs,
+                &pack_inventory,
+            )?
         };
 
         prune_packed_loose =
@@ -1085,11 +1231,54 @@ fn apply_gc_prune_policy_to_repack(repack: &mut RepackOptions, policy: &GcLooseP
     }
 }
 
-fn gc_repack_writes_bitmap(repo: &Repository, config: &ConfigSet) -> bool {
-    if let Some(Ok(v)) = config.get_bool("repack.writeBitmaps") {
-        return v;
+fn config_bool_or_error(config: &ConfigSet, key: &str) -> Result<Option<bool>> {
+    match config.get_bool(key) {
+        None => Ok(None),
+        Some(Ok(v)) => Ok(Some(v)),
+        Some(Err(e)) => Err(Error::Config(ConfigError::Other(format!(
+            "bad config value for '{key}': {e}"
+        )))),
     }
-    repo.work_tree().is_none()
+}
+
+/// Last `repack.writeBitmaps` or `pack.writeBitmaps` entry in load order (Git synonym).
+fn gc_repack_writes_bitmap(repo: &Repository, config: &ConfigSet) -> Result<bool> {
+    let repack_key = canonical_key("repack.writeBitmaps").ok();
+    let pack_key = canonical_key("pack.writeBitmaps").ok();
+    let mut last: Option<bool> = None;
+    for entry in config.entries() {
+        let key = entry.key.as_str();
+        if repack_key.as_deref() == Some(key) || pack_key.as_deref() == Some(key) {
+            let raw = entry.value.as_deref().unwrap_or("true").trim().to_owned();
+            last = Some(parse_bool(&raw).map_err(|_| {
+                Error::Config(ConfigError::Other(format!(
+                    "bad config value '{raw}' for '{key}'"
+                )))
+            })?);
+        }
+    }
+    Ok(last.unwrap_or_else(|| repo.work_tree().is_none()))
+}
+
+fn gc_should_pack_refs(repo: &Repository, config: &ConfigSet) -> Result<bool> {
+    let Some(spec) = config.get("gc.packRefs") else {
+        return Ok(true);
+    };
+    if spec.eq_ignore_ascii_case("notbare") {
+        return Ok(repo.work_tree().is_some());
+    }
+    parse_bool(&spec).map_err(|e| {
+        Error::Config(ConfigError::Other(format!(
+            "bad config value '{spec}' for 'gc.packRefs': {e}"
+        )))
+    })
+}
+
+fn gc_should_write_commit_graph(config: &ConfigSet) -> Result<bool> {
+    if config_bool_or_error(config, "gc.writeCommitGraph")? == Some(false) {
+        return Ok(false);
+    }
+    Ok(config_bool_or_error(config, "core.commitGraph")? != Some(false))
 }
 
 /// Loose objects reachable from the maintenance roots: what Git's incremental `repack -d`
@@ -1101,10 +1290,13 @@ fn reachable_loose_objects(odb: &Odb, reachable: &LazyReachable<'_>) -> Result<V
     }
     let promised = reachable.promised()?;
     let reachable = reachable.get()?;
+    let alternates = AlternateSources::load(odb)?;
     Ok(loose
         .into_iter()
         .map(|(oid, _)| oid)
-        .filter(|oid| reachable.contains(oid) && !promised.contains(oid))
+        .filter(|oid| {
+            reachable.contains(oid) && !promised.contains(oid) && !alternates.contains(oid)
+        })
         .collect())
 }
 
@@ -1631,9 +1823,15 @@ fn gc_locked(repo: &Repository, opts: &GcOptions, now: i64) -> Result<GcStats> {
     let mut stats = GcStats::default();
     let cfg = repo.config()?;
     let prune_policy = gc_loose_prune_policy(&cfg, now)?;
+    // Settled before any phase, so a bad config value changes nothing.
+    let drop_plan = if opts.drop_large_blobs {
+        Some(drop_blobs::plan_drop_for_gc(&cfg, opts.now_unix)?)
+    } else {
+        None
+    };
     let dry_run = opts.repack.dry_run;
 
-    if opts.pack_refs && !dry_run {
+    if opts.pack_refs && gc_should_pack_refs(repo, &cfg)? && !dry_run {
         let start = Instant::now();
         stats.pack_refs = Some(pack_refs(repo, &PackRefsOptions::with_all(true))?);
         stats.phase_timings.pack_refs_ms = duration_ms(start.elapsed());
@@ -1654,13 +1852,26 @@ fn gc_locked(repo: &Repository, opts: &GcOptions, now: i64) -> Result<GcStats> {
     // Incremental runs skip bitmaps, as Git's `gc --auto` does: a bitmap covers the whole
     // object graph and costs far more than packing the loose objects.
     if !repack_opts.write_bitmap && !repack_opts.incremental {
-        repack_opts.write_bitmap = gc_repack_writes_bitmap(repo, &cfg);
+        repack_opts.write_bitmap = gc_repack_writes_bitmap(repo, &cfg)?;
     }
     let repack_start = Instant::now();
     stats.repack = repack_all(repo, &repack_opts)?;
     let repack_total_ms = duration_ms(repack_start.elapsed());
     stats.phase_timings.prune_ms = stats.repack.unreachable_prune_ms;
     stats.phase_timings.repack_ms = repack_total_ms.saturating_sub(stats.phase_timings.prune_ms);
+
+    // Repack leaves promisor packs as they are, so the drop phase sees them whole.
+    if let Some(plan) = drop_plan {
+        let start = Instant::now();
+        stats.drop_large_blobs = Some(drop_blobs::run_drop_for_gc(
+            repo,
+            &cfg,
+            plan,
+            dry_run,
+            opts.repack.threads,
+        )?);
+        stats.phase_timings.drop_large_blobs_ms = duration_ms(start.elapsed());
+    }
 
     if dry_run {
         return Ok(stats);
@@ -1674,7 +1885,7 @@ fn gc_locked(repo: &Repository, opts: &GcOptions, now: i64) -> Result<GcStats> {
         kept: stats.repack.unreachable_loose_kept,
     };
 
-    if opts.write_commit_graph {
+    if opts.write_commit_graph && gc_should_write_commit_graph(&cfg)? {
         let start = Instant::now();
         stats.commit_graph = Some(write_commit_graph(
             repo,
@@ -1739,9 +1950,9 @@ fn expire_reflogs_for_gc(repo: &Repository, dry_run: bool, now: i64) -> Result<u
         verbose: false,
     };
     let mut total = 0usize;
-    let promises = std::cell::OnceCell::new();
+    let cache = ReflogExpiryCache::default();
     for refname in reflog_refs_on_store(repo.refs())? {
-        let result = expire_reflog_git_with_promises(
+        let result = expire_reflog_git_with_cache(
             repo,
             &refname,
             &params,
@@ -1751,7 +1962,7 @@ fn expire_reflogs_for_gc(repo: &Repository, dry_run: bool, now: i64) -> Result<u
             gc_cfg.global_total,
             gc_cfg.global_unreachable,
             now,
-            &promises,
+            &cache,
         )?;
         total += result.pruned;
     }
@@ -1807,7 +2018,7 @@ fn build_repack_pack(
 ///
 /// Propagates thread-option, object read, and staging-file I/O failures; the staging
 /// file is removed when writing fails.
-fn write_staged_repack_pack(
+pub(crate) fn write_staged_repack_pack(
     odb: &Odb,
     pack_dir: &Path,
     objects: &[ObjectId],
@@ -1887,6 +2098,8 @@ fn repack_object_list(
         .filter(|oid| !promised.contains(oid))
         .collect();
     roots.sort_unstable();
+    let alternates = AlternateSources::load(odb)?;
+    let use_bitmaps = use_bitmaps && promised.is_empty() && !alternates.in_use();
     let mut selection = enumerate_pack_objects_naming(
         odb,
         &roots,
@@ -1895,12 +2108,14 @@ fn repack_object_list(
             filter: None,
             shallow_grafts: shallow,
             have_shallow_grafts: Some(shallow),
-            use_bitmaps: use_bitmaps && promised.is_empty(),
+            use_bitmaps,
             exclude_objects: Some(promised),
             peer_odb: None,
             have_boundary: crate::pack_object_select::HaveBoundary::CommitClosure,
         },
         NameTrees::Yes,
+        true,
+        &crate::progress::CancelSignal::never(),
     )?;
     if keep_unreachable {
         append_repack_unreachable_retention(odb, &mut selection.send, promised)?;
@@ -1914,21 +2129,47 @@ fn append_repack_unreachable_retention(
     send: &mut Vec<ObjectId>,
     promised: &HashSet<ObjectId>,
 ) -> Result<()> {
+    let alternates = AlternateSources::load(odb)?;
     let mut in_send: OidHashSet = send.iter().copied().collect();
     odb.primary()?
         .packed_objects()
         .for_each_removable_pack_object(&mut |oid| {
-            if !promised.contains(oid) && in_send.insert(*oid) {
+            if !promised.contains(oid) && !alternates.contains(oid) && in_send.insert(*oid) {
                 send.push(*oid);
             }
             std::ops::ControlFlow::Continue(())
         })?;
     for (oid, _) in odb.enumerate_local_loose_objects()? {
-        if !promised.contains(&oid) && in_send.insert(oid) {
+        if !promised.contains(&oid) && !alternates.contains(&oid) && in_send.insert(oid) {
             send.push(oid);
         }
     }
     Ok(())
+}
+
+fn pack_repack_inventory(pack_dir: &Path) -> crate::odb::RepackPackInventorySnapshot {
+    let pack_paths = local_pack_paths(pack_dir);
+    let kept_at_inventory = pack_paths
+        .iter()
+        .filter(|pack_path| pack_has_keep_marker(pack_dir, pack_path))
+        .cloned()
+        .collect();
+    crate::odb::RepackPackInventorySnapshot {
+        pack_paths,
+        kept_at_inventory,
+    }
+}
+
+/// Every local `.pack` path under `pack_dir` at inventory time.
+fn local_pack_paths(pack_dir: &Path) -> HashSet<PathBuf> {
+    let Ok(entries) = fs::read_dir(pack_dir) else {
+        return HashSet::new();
+    };
+    entries
+        .filter_map(|e| e.ok())
+        .map(|e| pack_dir.join(e.file_name()))
+        .filter(|p| p.extension().is_some_and(|e| e == "pack"))
+        .collect()
 }
 
 /// Packs in `pack_dir` without a `.keep` marker, from a single directory read.
@@ -1987,6 +2228,7 @@ fn remove_superseded_pack_files_retaining(
     pack_dir: &Path,
     keep_pack: &Path,
     retained_packs: &HashSet<PathBuf>,
+    inventory: &crate::odb::RepackPackInventorySnapshot,
 ) -> Result<usize> {
     let git_dir = crate::git_dir::io_error::git_dir_from_pack_dir(pack_dir);
     let keep_stem = keep_pack
@@ -2021,9 +2263,11 @@ fn remove_superseded_pack_files_retaining(
         }
         let path = entry.path();
         if path.is_file() {
-            if pack_has_keep_marker(pack_dir, &path)
+            let pack_path = path.with_extension("pack");
+            if inventory.kept_at_inventory.contains(&pack_path)
                 || path.with_extension("promisor").is_file()
-                || retained_packs.contains(&path.with_extension("pack"))
+                || retained_packs.contains(&pack_path)
+                || !inventory.pack_paths.contains(&pack_path)
             {
                 continue;
             }
@@ -2039,14 +2283,222 @@ fn remove_superseded_pack_files_retaining(
     Ok(removed)
 }
 
-fn pack_has_keep_marker(pack_dir: &Path, path: &Path) -> bool {
-    let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+/// What [`rewrite_local_objects_without`] did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct PromisorRewrite {
+    /// The promisor pack that now holds the kept objects; `None` when nothing was
+    /// rewritten.
+    pub(crate) pack_path: Option<PathBuf>,
+    /// Objects written into that pack.
+    pub(crate) objects: usize,
+    /// Objects of the drop set that were stored (packed or loose) and are now gone.
+    pub(crate) dropped: usize,
+    /// Pack files (with their sidecars) removed.
+    pub(crate) removed_pack_files: usize,
+}
+
+/// When [`rewrite_local_objects_without`] rewrites.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PromisorRewriteWhen {
+    /// Only when it drops something.
+    Dropping,
+    /// Also to fold every local pack and loose object into one promisor pack.
+    Always,
+}
+
+/// Rewrite the repository's own packs and loose objects into one promisor pack that
+/// leaves out `omit`.
+///
+/// Every object in the local packs without a `.keep` marker, promisor or not, and
+/// every loose object goes into the new pack, except those in `omit`; there is no
+/// reachability walk, so unreachable objects are kept and nothing else can be lost.
+/// The new pack is marked `.promisor`, which makes the dropped objects promised as
+/// long as an object in it refers to them (a tree naming a dropped blob, say).
+/// The kept blobs go into the same pack, though the promisor cannot supply them:
+/// Git counts every object a promisor-pack tree names as promised, and its repack
+/// and `gc` keep only those promised objects that sit in a promisor pack, so a
+/// kept blob in an ordinary pack beside it would be deleted. Maintenance that
+/// drops promised blobs must therefore check the promisor holds each one (see
+/// [`drop_promised_blobs`]). `.keep` packs and alternates are left alone, so
+/// objects stored there stay. That is not enough for an object only an ordinary
+/// (not `.promisor`) `.keep` pack holds when the new pack names it: Git then
+/// counts it as promised and deletes it once the marker goes, and leaves a copy
+/// out of its own promisor repack while the marker stays. Callers must rule that
+/// out first (offload refuses with [`crate::offload::OffloadError::KeptPackObjectPromised`]).
+///
+/// The new pack is installed before anything is removed, and only the packs listed
+/// when the rewrite started are removed afterwards: a pack that arrives meanwhile
+/// (a push) survives. Then loose copies of the dropped objects and loose objects
+/// now packed are deleted. The multi-pack-index is removed; no bitmap is written.
+///
+/// The new pack, its index and markers are flushed to disk before any old pack is
+/// removed, so a crash never leaves an object in neither.
+///
+/// Callers hold the [`GcLock`]. With [`PromisorRewriteWhen::Dropping`], an `omit`
+/// that names nothing stored in the rewritten packs or loose changes nothing. With
+/// [`PromisorRewriteWhen::Always`] the rewrite also runs to fold other packs and
+/// loose objects into one promisor pack, and is skipped only when the local
+/// objects already are exactly one promisor pack (plus `.keep` packs).
+///
+/// # Errors
+///
+/// [`Error::UnsupportedObjectStore`] without a files-backed object store, and pack
+/// read, write and file removal failures.
+pub(crate) fn rewrite_local_objects_without(
+    repo: &Repository,
+    omit: &OidHashSet,
+    opts: &RepackOptions,
+    when: PromisorRewriteWhen,
+) -> Result<PromisorRewrite> {
+    let odb = repo.odb();
+    odb.require_files_primary("promisor rewrite")?;
+    if omit.is_empty() && when == PromisorRewriteWhen::Dropping {
+        return Ok(PromisorRewrite::default());
+    }
+    let objects_dir = odb.objects_dir().to_path_buf();
+    let pack_dir = objects_dir.join("pack");
+    odb.reprepare_local_packs();
+    let snapshot: Vec<_> = odb
+        .local_pack_indexes()?
+        .into_iter()
+        .filter(|idx| !pack_has_keep_marker(&pack_dir, &idx.pack_path))
+        .collect();
+
+    let mut send = Vec::new();
+    let mut seen: OidHashSet = OidHashSet::default();
+    let mut dropped: OidHashSet = OidHashSet::default();
+    let mut take = |oid: ObjectId| {
+        if omit.contains(&oid) {
+            dropped.insert(oid);
+        } else if seen.insert(oid) {
+            send.push(oid);
+        }
+    };
+    for idx in &snapshot {
+        for entry in idx.iter() {
+            take(ObjectId::from_bytes(entry.oid())?);
+        }
+    }
+    let loose = odb.enumerate_local_loose_objects()?;
+    for (oid, _) in &loose {
+        take(*oid);
+    }
+    let folded = loose.is_empty() && snapshot.len() <= 1 && snapshot.iter().all(|i| i.is_promisor);
+    let nothing_to_do = match when {
+        PromisorRewriteWhen::Dropping => dropped.is_empty(),
+        PromisorRewriteWhen::Always => dropped.is_empty() && folded,
+    };
+    if nothing_to_do {
+        return Ok(PromisorRewrite::default());
+    }
+
+    let cfg = opts
+        .merged_config
+        .clone()
+        .or_else(|| repo.config().ok().map(|c| (*c).clone()));
+    let pack_opts = opts
+        .pack_build
+        .unwrap_or_else(|| PackBuildOptions::for_local_copy(cfg.as_ref()));
+    let built = write_staged_repack_pack(
+        odb,
+        &pack_dir,
+        &send,
+        &HashMap::new(),
+        &pack_opts,
+        opts.threads,
+        cfg.as_ref(),
+    )?;
+    clear_pack_midx_state(&pack_dir)?;
+    let mut rewrite = PromisorRewrite {
+        dropped: dropped.len(),
+        ..PromisorRewrite::default()
+    };
+    if let Some(staging) = built.staging_path.as_ref() {
+        let trusted_rows = (!built.index_rows.is_empty()).then_some(built.index_rows);
+        let ingested = install_pack_path(
+            staging,
+            odb,
+            &IngestPackOptions {
+                threads: opts.threads,
+                merged_config: cfg.clone(),
+                environment: opts.environment.clone(),
+                skip_post_index_verify: trusted_rows.is_some(),
+                trusted_index_rows: trusted_rows,
+                mark_promisor_pack: true,
+                ..IngestPackOptions::default()
+            },
+        )?;
+        rewrite.objects = ingested.object_ids.len();
+        if let Some(pack_path) = &ingested.pack_path {
+            if cfg
+                .as_ref()
+                .is_none_or(|c| c.pack_write_reverse_index_default(&opts.environment))
+            {
+                write_pack_rev_sidecar_for_index_path(&pack_path.with_extension("idx"))?;
+            }
+            crate::index_pack::sync_installed_pack(pack_path)?;
+        }
+        rewrite.pack_path = ingested.pack_path;
+    }
+
+    // Drop cached pack mmaps before deleting pack files (Windows).
+    odb.invalidate_packs();
+    let new_stem = rewrite
+        .pack_path
+        .as_deref()
+        .and_then(Path::file_stem)
+        .map(|s| s.to_os_string());
+    let stems: HashSet<std::ffi::OsString> = snapshot
+        .iter()
+        .filter_map(|idx| idx.pack_path.file_stem().map(|s| s.to_os_string()))
+        .filter(|stem| Some(stem) != new_stem.as_ref())
+        .collect();
+    drop(snapshot);
+    rewrite.removed_pack_files = remove_pack_files_with_stems(&pack_dir, &stems)?;
+    for oid in &dropped {
+        odb.remove_local_loose(oid)?;
+    }
+    prune_packed_objects(&objects_dir, PrunePackedOptions::default())?;
+    odb.invalidate_packs();
+    Ok(rewrite)
+}
+
+/// Remove every file in `pack_dir` named `<stem>.<ext>` for one of `stems` (the
+/// pack, its index and every sidecar). A pack that has gained a `.keep` marker since
+/// it was listed is left whole. Returns how many files went.
+fn remove_pack_files_with_stems(
+    pack_dir: &Path,
+    stems: &HashSet<std::ffi::OsString>,
+) -> Result<usize> {
+    if stems.is_empty() {
+        return Ok(0);
+    }
+    let mut removed = 0usize;
+    for entry in fs::read_dir(pack_dir)?.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        let Some(stem) = path.file_stem().filter(|stem| stems.contains(*stem)) else {
+            continue;
+        };
+        if !path.is_file() || pack_dir.join(stem).with_extension("keep").is_file() {
+            continue;
+        }
+        fs::remove_file(&path)?;
+        removed += 1;
+    }
+    Ok(removed)
+}
+
+fn pack_has_keep_marker(pack_dir: &Path, pack_path: &Path) -> bool {
+    let Some(stem) = pack_path.file_stem().and_then(|s| s.to_str()) else {
         return false;
     };
     pack_dir.join(format!("{stem}.keep")).is_file()
 }
 
 /// Pack loose refs into `packed-refs` (files backend) or compact reftable stacks.
+///
+/// With the files backend, directories emptied by removing packed loose refs are
+/// deleted, but `refs/` itself is kept so Git still recognizes the repository.
 ///
 /// # Errors
 ///
@@ -2069,6 +2521,15 @@ impl Repository {
     /// See [`write_commit_graph`].
     pub fn write_commit_graph(&self, opts: &CommitGraphOptions) -> Result<CommitGraphWriteReport> {
         write_commit_graph(self, opts)
+    }
+
+    /// Build a reachable commit-graph in memory, for any object store.
+    ///
+    /// # Errors
+    ///
+    /// See [`build_commit_graph`].
+    pub fn build_commit_graph(&self, opts: &CommitGraphOptions) -> Result<CommitGraphBuild> {
+        build_commit_graph(self, opts)
     }
 
     /// Write or refresh the multi-pack index for this repository's pack directory.
@@ -2095,6 +2556,44 @@ pub mod repository_fsck {
 }
 
 #[cfg(test)]
+pub(crate) mod gc_test_hooks {
+    use std::cell::RefCell;
+
+    /// Where in [`super::repack_detail`] a test hook interleaves another writer.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub enum GcPausePoint {
+        /// After pack inventory is recorded and before maintenance roots are collected.
+        AfterInventoryBeforeRoots,
+        /// After maintenance roots are collected and before superseded packs are dropped.
+        AfterRootsBeforeDropAll,
+    }
+
+    type GcHook = (GcPausePoint, Box<dyn FnOnce() + Send>);
+
+    thread_local! {
+        static GC_HOOK: RefCell<Option<GcHook>> = const { RefCell::new(None) };
+    }
+
+    /// Run `hook` during the next repack on this thread when it reaches `point`.
+    pub fn on_next_gc(point: GcPausePoint, hook: impl FnOnce() + Send + 'static) {
+        GC_HOOK.with(|slot| *slot.borrow_mut() = Some((point, Box::new(hook))));
+    }
+
+    pub(crate) fn run(point: GcPausePoint) {
+        let hook = GC_HOOK.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            match slot.as_ref() {
+                Some((at, _)) if *at == point => slot.take().map(|(_, hook)| hook),
+                _ => None,
+            }
+        });
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -2105,6 +2604,185 @@ mod tests {
     use crate::progress::{NeverCancel, NullProgress};
     use crate::repo::InitOptions;
     use tempfile::TempDir;
+
+    /// Pack `oids` (already stored) into one new pack of `repo`, with a `.keep` marker
+    /// when `keep`; returns the pack path.
+    fn pack_into(repo: &Repository, oids: &[ObjectId], keep: bool) -> PathBuf {
+        let pack = crate::pack_objects::build_pack_from_send_list(
+            repo.odb(),
+            oids,
+            &HashSet::new(),
+            &PackBuildOptions::default(),
+            &HashMap::new(),
+        )
+        .unwrap();
+        install_pack_bytes(
+            pack,
+            repo.odb(),
+            &IngestPackOptions {
+                keep_message: keep.then(|| "pinned".to_owned()),
+                ..IngestPackOptions::default()
+            },
+        )
+        .unwrap()
+        .pack_path
+        .unwrap()
+    }
+
+    #[test]
+    fn promisor_rewrite_drops_only_the_omitted_objects() {
+        let dir = TempDir::new().unwrap();
+        let repo = Repository::init(dir.path(), &InitOptions::new().with_bare(true)).unwrap();
+        let odb = repo.odb();
+        let big = odb.write(ObjectKind::Blob, b"big blob").unwrap();
+        let packed = odb.write(ObjectKind::Blob, b"packed").unwrap();
+        let kept = odb.write(ObjectKind::Blob, b"kept").unwrap();
+        let unreachable = odb.write(ObjectKind::Blob, b"unreachable loose").unwrap();
+        let mut body = b"100644 big\0".to_vec();
+        body.extend_from_slice(big.as_bytes());
+        let tree = odb.write(ObjectKind::Tree, &body).unwrap();
+        let old_pack = pack_into(&repo, &[packed, big, tree], false);
+        let kept_pack = pack_into(&repo, &[kept], true);
+        crate::prune_packed::prune_packed_objects(odb.objects_dir(), Default::default()).unwrap();
+        // A loose copy of an omitted object goes too.
+        odb.write_loose_materialize(ObjectKind::Blob, b"big blob")
+            .unwrap();
+
+        let omit: OidHashSet = [big, kept].into_iter().collect();
+        let rewrite = rewrite_local_objects_without(
+            &repo,
+            &omit,
+            &RepackOptions::default(),
+            PromisorRewriteWhen::Dropping,
+        )
+        .unwrap();
+        assert_eq!(rewrite.dropped, 1, "the kept copy is not ours to drop");
+        assert_eq!(rewrite.objects, 3, "tree + packed + unreachable");
+        let new_pack = rewrite.pack_path.expect("new pack");
+        assert!(new_pack.with_extension("promisor").is_file());
+        // Kept blobs share the promisor pack with the tree, so Git's repack keeps
+        // them (it keeps only the promised objects found in promisor packs).
+        repo.odb().reprepare_local_packs();
+        let indexes = repo.odb().local_pack_indexes().unwrap();
+        let new_idx = indexes
+            .iter()
+            .find(|i| i.pack_path == new_pack)
+            .expect("listed");
+        for oid in [tree, packed, unreachable] {
+            assert!(new_idx.find_position(&oid).is_some(), "{oid}");
+        }
+        assert!(!old_pack.exists());
+        assert!(kept_pack.is_file() && kept_pack.with_extension("keep").is_file());
+        assert!(rewrite.removed_pack_files >= 2, "old .pack and .idx");
+
+        let repo =
+            Repository::open(dir.path(), &crate::environment::RepositoryOptions::empty()).unwrap();
+        let odb = repo.odb();
+        assert!(!odb.exists_stored(&big));
+        assert!(odb.local_loose_file_size(&big).is_none());
+        for oid in [packed, kept, unreachable, tree] {
+            assert!(odb.exists_stored(&oid), "{oid} kept");
+        }
+        assert!(odb.enumerate_local_loose_objects().unwrap().is_empty());
+    }
+
+    #[test]
+    fn promisor_rewrite_without_anything_to_drop_changes_nothing() {
+        let dir = TempDir::new().unwrap();
+        let repo = Repository::init(dir.path(), &InitOptions::new().with_bare(true)).unwrap();
+        let blob = repo.odb().write(ObjectKind::Blob, b"x").unwrap();
+        let absent = ObjectId::from_hex("0123456789abcdef0123456789abcdef01234567").unwrap();
+        for omit in [OidHashSet::default(), [absent].into_iter().collect()] {
+            let rewrite = rewrite_local_objects_without(
+                &repo,
+                &omit,
+                &RepackOptions::default(),
+                PromisorRewriteWhen::Dropping,
+            )
+            .unwrap();
+            assert_eq!(rewrite, PromisorRewrite::default());
+        }
+        assert!(repo.odb().local_loose_file_size(&blob).is_some());
+    }
+
+    #[test]
+    fn promisor_rewrite_always_folds_until_one_promisor_pack_is_left() {
+        let dir = TempDir::new().unwrap();
+        let repo = Repository::init(dir.path(), &InitOptions::new().with_bare(true)).unwrap();
+        let odb = repo.odb();
+        let pushed = odb.write(ObjectKind::Blob, b"pushed").unwrap();
+        let packed = odb.write(ObjectKind::Blob, b"packed").unwrap();
+        let mut body = b"100644 packed\0".to_vec();
+        body.extend_from_slice(packed.as_bytes());
+        let tree = odb.write(ObjectKind::Tree, &body).unwrap();
+        // A promisor pack of the tree and an ordinary pack of its blob: the layout
+        // an earlier offload wrote, which Git's repack loses the blob from.
+        let tree_pack = pack_into(&repo, &[tree], false);
+        fs::write(tree_pack.with_extension("promisor"), b"").unwrap();
+        let blob_pack = pack_into(&repo, &[packed], false);
+        crate::prune_packed::prune_packed_objects(odb.objects_dir(), Default::default()).unwrap();
+        odb.write_loose_materialize(ObjectKind::Blob, b"pushed")
+            .unwrap();
+        let fold = |repo: &Repository| {
+            rewrite_local_objects_without(
+                repo,
+                &OidHashSet::default(),
+                &RepackOptions::default(),
+                PromisorRewriteWhen::Always,
+            )
+            .unwrap()
+        };
+        let first = fold(&repo);
+        assert_eq!(first.dropped, 0);
+        assert_eq!(first.objects, 3);
+        let pack = first.pack_path.expect("folded pack");
+        assert!(pack.with_extension("promisor").is_file());
+        assert!(!tree_pack.exists() && !blob_pack.exists());
+        let repo =
+            Repository::open(dir.path(), &crate::environment::RepositoryOptions::empty()).unwrap();
+        assert!(repo
+            .odb()
+            .enumerate_local_loose_objects()
+            .unwrap()
+            .is_empty());
+        let indexes = repo.odb().local_pack_indexes().unwrap();
+        assert_eq!(indexes.len(), 1);
+        for oid in [pushed, packed, tree] {
+            assert!(indexes[0].find_position(&oid).is_some(), "{oid}");
+        }
+        // One promisor pack and nothing loose: nothing left to fold.
+        assert_eq!(fold(&repo), PromisorRewrite::default());
+        assert!(pack.is_file());
+    }
+
+    #[test]
+    fn pack_removal_spares_unlisted_and_newly_kept_packs() {
+        let dir = TempDir::new().unwrap();
+        for name in [
+            "pack-a.pack",
+            "pack-a.idx",
+            "pack-a.rev",
+            "pack-b.pack",
+            "pack-b.idx",
+            "pack-c.pack",
+            "pack-c.keep",
+        ] {
+            fs::write(dir.path().join(name), b"").unwrap();
+        }
+        let stems: HashSet<std::ffi::OsString> =
+            ["pack-a", "pack-c"].into_iter().map(Into::into).collect();
+        assert_eq!(remove_pack_files_with_stems(dir.path(), &stems).unwrap(), 3);
+        let mut left: Vec<String> = fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            ["pack-b.idx", "pack-b.pack", "pack-c.keep", "pack-c.pack"]
+        );
+    }
 
     #[cfg_attr(
         not(feature = "full-tests"),
@@ -2629,5 +3307,260 @@ mod tests {
             "full gc must time repack and run pack-refs + commit-graph, got {t:?}"
         );
         assert!(stats.prune_ran, "full gc should run unreachable prune");
+    }
+
+    #[cfg_attr(
+        not(feature = "full-tests"),
+        ignore = "starts system git or is heavy; run with --features full-tests"
+    )]
+    #[test]
+    fn full_repack_keeps_migrated_pack_before_refs_updated() {
+        use crate::receive_quarantine::ReceiveQuarantine;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let remote = tmp.path().join("remote.git");
+        let wt = tmp.path().join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::create_dir_all(&remote).unwrap();
+        let git = |dir: &Path, args: &[&str]| {
+            assert!(std::process::Command::new("git")
+                .current_dir(dir)
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .status()
+                .expect("git")
+                .success());
+        };
+        git(&remote, &["init", "-q", "--bare", "-b", "main"]);
+        git(&wt, &["init", "-q", "-b", "main"]);
+        std::fs::write(wt.join("payload.txt"), b"payload\n").unwrap();
+        git(&wt, &["add", "payload.txt"]);
+        git(&wt, &["commit", "-qm", "base"]);
+        git(&wt, &["push", "-q", remote.to_str().unwrap(), "main"]);
+        git(&remote, &["repack", "-a", "-d"]);
+        let repo = Repository::open(&remote, &crate::environment::RepositoryOptions::empty())
+            .expect("open remote");
+        let pack_dir = repo.git_dir().join("objects/pack");
+        let base_pack = super::local_pack_paths(&pack_dir)
+            .into_iter()
+            .next()
+            .expect("base pack");
+        let mut q = ReceiveQuarantine::create(repo.odb(), repo.git_dir()).expect("quarantine");
+        let q_root = PathBuf::from(
+            q.hook_env()
+                .into_iter()
+                .find(|(k, _)| k == "GIT_QUARANTINE_PATH")
+                .map(|(_, v)| v)
+                .expect("quarantine path"),
+        );
+        let q_pack_dir = q_root.join("pack");
+        fs::create_dir_all(&q_pack_dir).unwrap();
+        for ext in ["pack", "idx", "rev"] {
+            let src = base_pack.with_extension(ext);
+            if src.is_file() {
+                fs::copy(&src, q_pack_dir.join(format!("pack-incoming.{ext}"))).unwrap();
+            }
+        }
+        let guards = q.migrate().expect("migrate");
+        assert!(
+            super::local_pack_paths(&pack_dir).len() >= 2,
+            "migrated push pack must be visible before gc inventories packs"
+        );
+        repack_all(
+            &repo,
+            &RepackOptions {
+                auto_skip: false,
+                write_bitmap: false,
+                ..RepackOptions::default()
+            },
+        )
+        .expect("repack");
+        assert!(
+            pack_dir.join("pack-incoming.pack").is_file(),
+            "incoming pack must survive full repack while .keep guards are held"
+        );
+        drop(guards);
+    }
+
+    #[test]
+    fn full_repack_drops_unprotected_migrated_pack_before_refs_updated() {
+        use crate::receive_quarantine::ReceiveQuarantine;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let remote = tmp.path().join("remote.git");
+        let wt = tmp.path().join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::create_dir_all(&remote).unwrap();
+        let git = |dir: &Path, args: &[&str]| {
+            assert!(std::process::Command::new("git")
+                .current_dir(dir)
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .status()
+                .expect("git")
+                .success());
+        };
+        git(&remote, &["init", "-q", "--bare", "-b", "main"]);
+        git(&wt, &["init", "-q", "-b", "main"]);
+        git(&wt, &["commit", "--allow-empty", "-qm", "base"]);
+        git(&wt, &["push", "-q", remote.to_str().unwrap(), "main"]);
+        git(&remote, &["repack", "-a", "-d"]);
+        let repo = Repository::open(&remote, &crate::environment::RepositoryOptions::empty())
+            .expect("open");
+        let mut q = ReceiveQuarantine::create(repo.odb(), repo.git_dir()).expect("quarantine");
+        let orphan = q
+            .odb()
+            .write(crate::objects::ObjectKind::Blob, b"orphan-bytes")
+            .expect("write in quarantine");
+        drop(q.migrate().expect("migrate"));
+        repack_all(
+            &repo,
+            &RepackOptions {
+                auto_skip: false,
+                write_bitmap: false,
+                keep_unreachable: false,
+                ..RepackOptions::default()
+            },
+        )
+        .expect("repack");
+        assert!(
+            !repo.odb().exists(&orphan),
+            "without .keep protection gc may drop an unreachable migrated loose object"
+        );
+    }
+
+    #[cfg_attr(
+        not(feature = "full-tests"),
+        ignore = "starts system git or is heavy; run with --features full-tests"
+    )]
+    #[test]
+    fn repack_retains_inventory_kept_pack_after_ref_publish_and_guard_drop() {
+        use crate::receive_quarantine::ReceiveQuarantine;
+        use std::process::Command;
+        use std::sync::{Arc, Mutex};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let remote = tmp.path().join("remote.git");
+        let wt = tmp.path().join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::create_dir_all(&remote).unwrap();
+        let git = |dir: &Path, args: &[&str]| {
+            assert!(Command::new("git")
+                .current_dir(dir)
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .status()
+                .expect("git")
+                .success());
+        };
+        git(&remote, &["init", "-q", "--bare", "-b", "main"]);
+        git(&wt, &["init", "-q", "-b", "main"]);
+        std::fs::write(wt.join("payload.txt"), b"v1\n").unwrap();
+        git(&wt, &["add", "payload.txt"]);
+        git(&wt, &["commit", "-qm", "base"]);
+        git(&wt, &["push", "-q", remote.to_str().unwrap(), "main"]);
+        git(&remote, &["repack", "-a", "-d"]);
+        std::fs::write(wt.join("payload.txt"), b"v2\n").unwrap();
+        git(&wt, &["add", "payload.txt"]);
+        git(&wt, &["commit", "-qm", "incoming"]);
+        git(&wt, &["repack", "-a", "-d"]);
+        let incoming_hex = String::from_utf8(
+            Command::new("git")
+                .current_dir(&wt)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .expect("rev-parse")
+                .stdout,
+        )
+        .expect("utf8")
+        .trim()
+        .to_owned();
+        let incoming = ObjectId::from_hex(&incoming_hex).expect("incoming tip");
+
+        let repo = Repository::open(&remote, &crate::environment::RepositoryOptions::empty())
+            .expect("open remote");
+        let mut q = ReceiveQuarantine::create(repo.odb(), repo.git_dir()).expect("quarantine");
+        let q_root = PathBuf::from(
+            q.hook_env()
+                .into_iter()
+                .find(|(k, _)| k == "GIT_QUARANTINE_PATH")
+                .map(|(_, v)| v)
+                .expect("quarantine path"),
+        );
+        let q_pack_dir = q_root.join("pack");
+        fs::create_dir_all(&q_pack_dir).unwrap();
+        let wt_pack_dir = wt.join(".git/objects/pack");
+        let wt_pack = fs::read_dir(&wt_pack_dir)
+            .expect("wt pack dir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|p| p.extension().is_some_and(|ext| ext == "pack"))
+            .expect("wt repack pack");
+        for ext in ["pack", "idx", "rev"] {
+            let src = wt_pack.with_extension(ext);
+            if src.is_file() {
+                fs::copy(&src, q_pack_dir.join(format!("pack-incoming.{ext}"))).unwrap();
+            }
+        }
+        assert!(
+            q_pack_dir.join("pack-incoming.pack").is_file(),
+            "incoming pack sidecar"
+        );
+
+        let pack_dir = repo.git_dir().join("objects/pack");
+        let incoming_keep = pack_dir.join("pack-incoming.keep");
+        let guards_slot = Arc::new(Mutex::new(None));
+        let guards = q.migrate().expect("migrate");
+        *guards_slot.lock().expect("lock") = Some(guards);
+        assert!(incoming_keep.is_file());
+
+        let remote_for_hook = remote.clone();
+        let incoming_for_hook = incoming_hex.clone();
+        let incoming_keep_for_hook = incoming_keep.clone();
+        let guards_for_hook = Arc::clone(&guards_slot);
+        super::gc_test_hooks::on_next_gc(
+            super::gc_test_hooks::GcPausePoint::AfterRootsBeforeDropAll,
+            move || {
+                assert!(Command::new("git")
+                    .current_dir(&remote_for_hook)
+                    .args(["update-ref", "refs/heads/main", &incoming_for_hook,])
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                    .status()
+                    .expect("update-ref")
+                    .success());
+                drop(guards_for_hook.lock().expect("lock").take());
+                assert!(
+                    !incoming_keep_for_hook.exists(),
+                    "receive path drops live keep markers after publication"
+                );
+            },
+        );
+
+        repack_all(
+            &repo,
+            &RepackOptions {
+                auto_skip: false,
+                write_bitmap: false,
+                ..RepackOptions::default()
+            },
+        )
+        .expect("repack");
+
+        assert!(
+            repo.odb().exists(&incoming),
+            "inventory-time keep must protect the pack after live markers are dropped"
+        );
+        assert!(Command::new("git")
+            .current_dir(&remote)
+            .args(["fsck", "--strict"])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .status()
+            .expect("fsck")
+            .success());
     }
 }

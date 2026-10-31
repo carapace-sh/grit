@@ -37,6 +37,8 @@ pub use estimate::{OverallEstimate, OverallEstimator, PhaseRates};
 pub enum ProgressPhase {
     /// Receiving a pack or loose objects from a remote or bundle stream.
     ReceivingObjects,
+    /// Walking reachability to decide which objects a local fetch must copy.
+    EnumeratingObjects,
     /// Building or reading a pack index after objects are on disk.
     IndexingObjects,
     /// Applying delta chains inside a pack.
@@ -60,6 +62,7 @@ impl ProgressPhase {
     pub fn default_unit(self) -> ProgressUnit {
         match self {
             Self::ReceivingObjects
+            | Self::EnumeratingObjects
             | Self::IndexingObjects
             | Self::ResolvingDeltas
             | Self::CopyingObjects => ProgressUnit::Objects,
@@ -199,6 +202,33 @@ impl Cancel for NeverCancel {
     }
 }
 
+/// How often long object walks and pack builds report [`ProgressSink::set`].
+pub(crate) const OBJECT_PROGRESS_STRIDE: u64 = 256;
+
+/// How often worktree blob stat scans and similar loops poll [`poll_watch`].
+pub(crate) const CANCEL_POLL_STRIDE: usize = 256;
+
+/// Report monotonic object progress at [`OBJECT_PROGRESS_STRIDE`] boundaries.
+///
+/// `done` is the absolute number of objects processed so far; `last_reported` is
+/// updated to match each emitted `set`.
+pub(crate) fn report_object_progress_stride(
+    sink: &mut dyn ProgressSink,
+    done: u64,
+    last_reported: &mut u64,
+    total: Option<u64>,
+) {
+    let stride = OBJECT_PROGRESS_STRIDE;
+    while done.saturating_sub(*last_reported) >= stride {
+        *last_reported += stride;
+        sink.set(*last_reported);
+    }
+    if total == Some(done) && *last_reported < done {
+        sink.set(done);
+        *last_reported = done;
+    }
+}
+
 /// Shared flag for tests and embedders that flip cancellation mid-operation.
 #[derive(Debug, Clone)]
 pub struct FlagCancel(pub std::sync::Arc<std::sync::atomic::AtomicBool>);
@@ -256,6 +286,59 @@ pub fn poll_watch(watch: &std::sync::atomic::AtomicBool) -> crate::error::Result
     }
 }
 
+/// Poll hook for long [`crate::diff::diff_index_to_worktree_with_options`] scans on the stack
+/// frame that owns `progress`.
+///
+/// [`Self::poll_owner`] must run only on the thread that owns the captured `WatchProgress`.
+pub(crate) struct StackCancelPoll {
+    progress: usize,
+    watch: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl StackCancelPoll {
+    /// Capture `progress` and `watch` for [`Self::poll_owner`].
+    #[must_use]
+    pub(crate) fn new(
+        progress: &mut WatchProgress<'_>,
+        watch: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        Self {
+            progress: std::ptr::from_mut(progress).addr(),
+            watch,
+        }
+    }
+
+    /// Mirror [`ProgressSink::should_cancel`] into `watch`, then [`poll_watch`].
+    pub(crate) fn poll_owner(&self) -> crate::error::Result<()> {
+        // SAFETY: only invoked on the owning thread while the captured `WatchProgress` is live.
+        let progress = unsafe { &mut *(self.progress as *mut WatchProgress<'_>) };
+        if progress.should_cancel() {
+            self.watch.store(true, std::sync::atomic::Ordering::Relaxed);
+            return Err(crate::error::Error::Cancelled);
+        }
+        poll_watch(&self.watch)
+    }
+}
+
+/// Cancellation inputs for worktree stat scans: worker-visible `watch` plus an owner-thread poll hook.
+pub(crate) struct StatScanCancel {
+    pub watch: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    pub owner_poll: Option<std::sync::Arc<StackCancelPoll>>,
+}
+
+impl StatScanCancel {
+    /// Poll owner progress (when present), otherwise the shared watch flag.
+    pub(crate) fn poll(&self) -> crate::error::Result<()> {
+        if let Some(poll) = self.owner_poll.as_ref() {
+            poll.poll_owner()
+        } else if let Some(w) = self.watch.as_ref() {
+            poll_watch(w)
+        } else {
+            Ok(())
+        }
+    }
+}
+
 /// Like [`poll_cancel`], but also records cancellation in `watch` for worker threads.
 #[inline]
 pub fn poll_cancel_watch(
@@ -268,6 +351,50 @@ pub fn poll_cancel_watch(
         return Err(crate::error::Error::Cancelled);
     }
     poll_watch(watch)
+}
+
+/// A [`Cancel`] polled on the calling thread, plus the flag its worker threads read.
+///
+/// [`Self::poll`] records a cancel in [`Self::flag`], so workers also stop for
+/// [`Cancel`] implementations that are not backed by a shared flag (once the calling
+/// thread next polls). For a [`FlagCancel`] the flag is the handle's own, so workers
+/// see a cancel from another thread right away.
+pub(crate) struct CancelSignal<'a> {
+    cancel: &'a dyn Cancel,
+    flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl<'a> CancelSignal<'a> {
+    pub(crate) fn new(cancel: &'a dyn Cancel) -> Self {
+        Self {
+            cancel,
+            flag: cancel_watch_arc(cancel),
+        }
+    }
+
+    /// A signal that never fires, for callers that cannot be interrupted.
+    pub(crate) fn never() -> CancelSignal<'static> {
+        CancelSignal::new(&NeverCancel)
+    }
+
+    /// Returns [`crate::error::Error::Cancelled`] once the signal fired.
+    #[inline]
+    pub(crate) fn poll(&self) -> crate::error::Result<()> {
+        if self.cancel.is_cancelled() {
+            self.flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        poll_watch(&self.flag)
+    }
+
+    /// The flag worker threads check; set once [`Self::poll`] observed a cancel.
+    pub(crate) fn flag(&self) -> &std::sync::atomic::AtomicBool {
+        &self.flag
+    }
+
+    /// Shared flag for long walks on other threads or modules.
+    pub(crate) fn watch_arc(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        std::sync::Arc::clone(&self.flag)
+    }
 }
 
 /// [`ProgressSink`] adapter that mirrors [`ProgressSink::should_cancel`] into `watch`.

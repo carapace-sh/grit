@@ -403,12 +403,8 @@ fn concurrent_reftable_cas_single_winner() {
     )
     .expect("init");
     let git_dir = repo.git_dir().to_path_buf();
-    let c1: ObjectId = "67bf698f3ab735e92fb011a99cff3497c44d30c1"
-        .parse()
-        .expect("c1");
-    let c2: ObjectId = "1111111111111111111111111111111111111111"
-        .parse()
-        .expect("c2");
+    let c1 = support::stored_commit(&git_dir, 1);
+    let c2 = support::stored_commit(&git_dir, 2);
     write_ref(&git_dir, "refs/heads/cas-rt", &c1).expect("seed");
 
     let item = RefTransactionItem {
@@ -609,5 +605,129 @@ fn reftable_transaction_one_table_single_update_index() {
         assert_eq!(indices.len(), 2);
         assert_eq!(indices[0], indices[1]);
         assert_eq!(indices[0], max_idx);
+    });
+}
+
+#[test]
+fn non_atomic_batch_create_one_reftable_table() {
+    use grit_lib::refs::commit_ref_updates_non_atomic;
+    use grit_lib::refs::store::{Expected, RawRef, RefUpdate, RefUpdateFlags};
+
+    each_backend(|backend, repo| {
+        if backend != Backend::Reftable {
+            return;
+        }
+        let git_dir = repo.git_dir();
+        let (_, tip) = two_commit_oids(&repo);
+        let updates: Vec<RefUpdate> = (0..40)
+            .map(|i| RefUpdate {
+                name: format!("refs/heads/batch-{i}"),
+                new_value: Some(RawRef::Direct(tip)),
+                expected: Expected::Any,
+                reflog: None,
+                flags: RefUpdateFlags::default(),
+            })
+            .collect();
+        let (_, count_before) = reftable_tables_snapshot(&git_dir);
+        commit_ref_updates_non_atomic(&git_dir, updates).expect("non-atomic batch");
+        for i in 0..40 {
+            assert_eq!(
+                resolve_ref(&git_dir, &format!("refs/heads/batch-{i}")).ok(),
+                Some(tip)
+            );
+        }
+        let (_, count_after) = reftable_tables_snapshot(&git_dir);
+        assert_eq!(
+            count_after,
+            count_before + 1,
+            "non-atomic multi-ref create must share one reftable table"
+        );
+        assert_fsck_when_git_interop(&repo);
+    });
+}
+
+#[test]
+fn non_atomic_allow_failure_updates_siblings_in_one_table() {
+    use grit_lib::refs::commit_ref_updates_non_atomic;
+    use grit_lib::refs::store::{Expected, RawRef, RefUpdate, RefUpdateFlags};
+
+    each_backend(|backend, repo| {
+        let git_dir = repo.git_dir();
+        let (_, tip) = two_commit_oids(&repo);
+        let updates = vec![
+            RefUpdate {
+                name: "refs/heads/parent".to_owned(),
+                new_value: Some(RawRef::Direct(tip)),
+                expected: Expected::Any,
+                reflog: None,
+                flags: RefUpdateFlags::default(),
+            },
+            RefUpdate {
+                name: "refs/heads/parent/child".to_owned(),
+                new_value: Some(RawRef::Direct(tip)),
+                expected: Expected::Any,
+                reflog: None,
+                flags: RefUpdateFlags::default(),
+            },
+        ];
+        let count_before = if backend == Backend::Reftable {
+            reftable_tables_snapshot(&git_dir).1
+        } else {
+            0
+        };
+        let outcomes = commit_ref_updates_non_atomic(&git_dir, updates).expect("batch");
+        assert!(outcomes[0].result.is_ok());
+        assert!(matches!(
+            outcomes[1].result,
+            Err(grit_lib::refs::store::RefStoreError::NameUnavailable { .. })
+        ));
+        assert_eq!(resolve_ref(&git_dir, "refs/heads/parent").ok(), Some(tip));
+        assert!(resolve_ref(&git_dir, "refs/heads/parent/child").is_err());
+        if backend == Backend::Reftable {
+            let count_after = reftable_tables_snapshot(&git_dir).1;
+            assert_eq!(count_after, count_before + 1);
+        }
+        assert_fsck_when_git_interop(&repo);
+    });
+}
+
+#[test]
+fn non_atomic_delete_then_create_two_reftable_tables() {
+    use grit_lib::refs::commit_ref_updates_non_atomic;
+    use grit_lib::refs::store::{Expected, RawRef, RefUpdate, RefUpdateFlags};
+
+    each_backend(|backend, repo| {
+        if backend != Backend::Reftable {
+            return;
+        }
+        let git_dir = repo.git_dir();
+        let (_, tip) = two_commit_oids(&repo);
+        grit_lib::refs::write_ref(&git_dir, "refs/heads/to-drop", &tip).expect("seed delete");
+        let updates = vec![
+            RefUpdate {
+                name: "refs/heads/to-drop".to_owned(),
+                new_value: None,
+                expected: Expected::Any,
+                reflog: None,
+                flags: RefUpdateFlags::default(),
+            },
+            RefUpdate {
+                name: "refs/heads/fresh".to_owned(),
+                new_value: Some(RawRef::Direct(tip)),
+                expected: Expected::Any,
+                reflog: None,
+                flags: RefUpdateFlags::default(),
+            },
+        ];
+        let (_, count_before) = reftable_tables_snapshot(&git_dir);
+        commit_ref_updates_non_atomic(&git_dir, updates).expect("delete then create");
+        assert!(resolve_ref(&git_dir, "refs/heads/to-drop").is_err());
+        assert_eq!(resolve_ref(&git_dir, "refs/heads/fresh").ok(), Some(tip));
+        let (_, count_after) = reftable_tables_snapshot(&git_dir);
+        assert_eq!(
+            count_after,
+            count_before + 2,
+            "delete phase and create phase must each add one reftable table"
+        );
     });
 }

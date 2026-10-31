@@ -58,10 +58,11 @@ pub trait Progress: ProgressSink {
         false
     }
 
-    /// Objects received so far in the pack being streamed in, reported during
-    /// the [`ReceivingObjects`](crate::progress::ProgressPhase::ReceivingObjects)
-    /// phase when [`Progress::wants_received_objects`] is true. Counts may lag
-    /// the bytes reported through [`ProgressSink::inc`] slightly.
+    /// Objects copied or received so far, reported during
+    /// [`ReceivingObjects`](crate::progress::ProgressPhase::ReceivingObjects) or
+    /// [`CopyingObjects`](crate::progress::ProgressPhase::CopyingObjects) when
+    /// [`Progress::wants_received_objects`] is true. Counts may lag the bytes
+    /// reported through [`ProgressSink::inc`] slightly on network fetch.
     fn received_objects(&mut self, _counts: crate::progress::ReceivedObjects) {}
 
     /// Progress of a resumable bundle download (clone with `bundle-uri`) or
@@ -650,8 +651,9 @@ fn v2_ls_refs(
     local_odb: &crate::odb::Odb,
     tags: crate::transfer::TagMode,
     refspecs: &[String],
+    promisor_reply: Option<&str>,
 ) -> Result<LsRefsAdvertised> {
-    let req = build_v2_ls_refs_request(server_caps, local_odb, tags, refspecs)?;
+    let req = build_v2_ls_refs_request(server_caps, local_odb, tags, refspecs, promisor_reply)?;
     conn.writer().write_all(&req)?;
     conn.writer().flush()?;
     parse_v2_ls_refs_response(conn.reader())
@@ -664,15 +666,17 @@ fn v2_ls_refs(
 /// a duplex socket) and the stateless smart-HTTP transport (which POSTs it as a
 /// request body) share one request builder. `HEAD` is always requested so the
 /// server advertises its `symref-target`; `refs/tags/` is added under `--tags` /
-/// tag-following even when the refspecs name only heads.
+/// tag-following even when the refspecs name only heads. `promisor_reply`, the
+/// accepted promisor remotes, is sent as a `promisor-remote=` capability line.
 pub(crate) fn build_v2_ls_refs_request(
     server_caps: &[String],
     local_odb: &crate::odb::Odb,
     tags: crate::transfer::TagMode,
     refspecs: &[String],
+    promisor_reply: Option<&str>,
 ) -> Result<Vec<u8>> {
     let object_format = v2_object_format(server_caps, local_odb);
-    let cap_echo = protocol_v2::cap_lines_for_command_request(server_caps);
+    let cap_echo = command_cap_echo(server_caps, promisor_reply);
 
     let mut req: Vec<u8> = Vec::new();
     pkt_line::write_line(&mut req, "command=ls-refs")?;
@@ -760,14 +764,6 @@ pub(crate) fn parse_v2_ls_refs_response(reader: &mut dyn Read) -> Result<LsRefsA
     Ok((advertised, head_symref, advertised_peel, head_oid))
 }
 
-/// Build the ordered `have` candidate list for a v2 fetch from the local ref
-/// tips, peeled to commits and excluding the wants, driven
-/// through the [`SkippingNegotiator`]'s skipping schedule.
-///
-/// Shared by the streaming (`negotiate_pack_v2`) and stateless-HTTP v2 fetch
-/// paths so both offer the server the same `have`s in the same order. The wire
-/// rounds (how many haves per request, when to send `done`) are batched by the
-/// caller, which differs between a duplex socket and stateless POSTs.
 /// The ordered local `have` list for a v2 fetch, produced on demand.
 ///
 /// Draining the skipping negotiator walks the whole local history, so only as many haves are
@@ -798,13 +794,21 @@ impl V2LocalHaves<'_> {
     }
 }
 
+/// Build the ordered `have` candidate list for a v2 fetch from the local ref
+/// tips, peeled to commits and skipping those in `exclude`, driven through the
+/// [`SkippingNegotiator`]'s skipping schedule.
+///
+/// `exclude` is normally the wants; a deepen passes none, since the tips it
+/// deepens are already local and are the best haves it has. The wire rounds
+/// (how many haves per request, when to send `done`) are batched by the caller,
+/// which differs between a duplex socket and stateless POSTs.
 pub(crate) fn v2_local_haves<'r>(
     local: &'r Repository,
-    wants: &[ObjectId],
+    exclude: &[ObjectId],
 ) -> Result<V2LocalHaves<'r>> {
-    let want_set: HashSet<ObjectId> = wants.iter().copied().collect();
+    let exclude: HashSet<ObjectId> = exclude.iter().copied().collect();
     let mut negotiator = SkippingNegotiator::new(local);
-    add_negotiation_tips(&mut negotiator, &want_set)?;
+    add_negotiation_tips(&mut negotiator, &exclude)?;
     Ok(V2LocalHaves {
         negotiator,
         taken: Vec::new(),
@@ -852,6 +856,84 @@ fn add_negotiation_tips(
     Ok(())
 }
 
+/// What a v2 `command=fetch` is for, which decides what the request carries.
+#[derive(Clone, Copy)]
+enum V2FetchMode<'a> {
+    /// A ref fetch: offer local haves, and repeat the `promisor-remote` reply
+    /// (if any) so a stateless server sees it on the fetch request too.
+    Refs {
+        /// Accepted promisor remotes, as sent in the `ls-refs` request.
+        promisor_reply: Option<&'a str>,
+    },
+    /// A promisor object-want fetch: no haves (Git's noop negotiator) and no
+    /// promisor reply.
+    ObjectWants,
+}
+
+/// The capability lines echoed on a v2 command request: agent and object-format
+/// from the server's advertisement, plus `promisor-remote=<reply>` when the client
+/// accepted promisor remotes.
+fn command_cap_echo(server_caps: &[String], promisor_reply: Option<&str>) -> Vec<String> {
+    let mut echo = protocol_v2::cap_lines_for_command_request(server_caps);
+    if let Some(reply) = promisor_reply {
+        echo.push(format!(
+            "{}={reply}",
+            protocol_v2::PROMISOR_REMOTE_CAPABILITY
+        ));
+    }
+    echo
+}
+
+/// Run the client side of the `promisor-remote` exchange for a v2 ref fetch.
+///
+/// Returns `None` when the server advertised no promisor remotes. Accepting needs a
+/// partial fetch (a filter, an automatic filter, or a fetch from a remote configured
+/// as a promisor remote): otherwise the server could leave out objects this client
+/// has no way to get again, and the pack, marked promisor because a remote was
+/// accepted, would claim objects no configured promisor can supply. Being a partial
+/// clone of some other remote is not enough.
+/// Stores `promisor.storeFields` values (unless dry-run), and resolves the filter
+/// when [`FetchOptions::auto_filter`] is set.
+fn v2_promisor_handshake(
+    local: &Repository,
+    local_cfg: &crate::config::ConfigSet,
+    server_caps: &[String],
+    opts: &mut FetchOptions,
+) -> Result<Option<crate::promisor_remote::PromisorHandshake>> {
+    use crate::net_trace::net_trace;
+    use crate::promisor_remote::{PromisorAdvertisement, PromisorHandshake};
+    let Some(value) = protocol_v2::server_promisor_remote_info(server_caps) else {
+        return Ok(None);
+    };
+    let advertisement = PromisorAdvertisement::parse(value);
+    if advertisement.remotes.is_empty() {
+        return Ok(None);
+    }
+    let auto_filter = opts.filter.is_none() && opts.auto_filter;
+    let partial_fetch = opts.filter.is_some()
+        || auto_filter
+        || opts
+            .remote_name
+            .as_deref()
+            .is_some_and(|name| crate::promisor_remote::is_promisor_remote(local_cfg, name));
+    let mut handshake =
+        PromisorHandshake::evaluate(local_cfg, &advertisement, partial_fetch, auto_filter);
+    if !opts.dry_run {
+        handshake.store_fields(local.git_dir(), local_cfg)?;
+    }
+    if auto_filter {
+        opts.filter = handshake.resolved_filter;
+    }
+    net_trace!(
+        opts.network_trace,
+        opts.diagnostics.as_ref(),
+        "fetch_remote: server advertised {} promisor remote(s), accepted [{}]",
+        advertisement.remotes.len(),
+        handshake.decision.accepted_names().join(", ")
+    );
+    Ok(Some(handshake))
+}
+
 /// Run a v2 `command=fetch` negotiation over the connection and return the raw
 /// pack bytes for `wants`.
 ///
@@ -876,28 +958,35 @@ fn negotiate_pack_v2(
     wire_filter: Option<&str>,
     progress: &mut dyn Progress,
     cancel: &dyn Cancel,
-    skip_local_haves: bool,
+    mode: V2FetchMode<'_>,
 ) -> Result<(Option<std::path::PathBuf>, ShallowUpdate)> {
     if wants.is_empty() {
         return Ok((None, ShallowUpdate::default()));
     }
+    let (skip_local_haves, promisor_reply) = match mode {
+        V2FetchMode::Refs { promisor_reply } => (false, promisor_reply),
+        V2FetchMode::ObjectWants => (true, None),
+    };
     let local_odb = local.odb();
     let object_format = v2_object_format(server_caps, local_odb);
-    let cap_echo = protocol_v2::cap_lines_for_command_request(server_caps);
+    let cap_echo = command_cap_echo(server_caps, promisor_reply);
     let sideband_all = protocol_v2::fetch_supports_sideband_all(server_caps);
 
-    // A deepen/shallow request does not offer local haves (the local objects
-    // bottom out at grafts and are not a usable negotiation base), forcing the
-    // single-round path so the server sends a `shallow-info` section + pack.
-    let shallow_request = deepen.is_shallow_request();
-
-    // The ordered `have` list is produced lazily from local ref tips. Empty for
-    // a shallow request or promisor object-want fetch (Git
-    // `negotiationAlgorithm=noop`).
-    let mut haves = if shallow_request || skip_local_haves {
+    // The ordered `have` list is produced lazily from local ref tips. Empty for a
+    // promisor object-want fetch (Git `negotiationAlgorithm=noop`). A
+    // deepen/shallow request negotiates too: the walk stops at local shallow
+    // commits, and the server bounds the haves by the `shallow` lines we send, so
+    // a deepen only ships history the client lacks. Its wants are usually already
+    // local (the tips being deepened) and are offered as haves as well.
+    let mut haves = if skip_local_haves {
         None
     } else {
-        Some(v2_local_haves(local, wants)?)
+        let exclude: &[ObjectId] = if deepen.is_shallow_request() {
+            &[]
+        } else {
+            wants
+        };
+        Some(v2_local_haves(local, exclude)?)
     };
 
     let mut pack_receive = crate::pack_receive::TempPackReceive::create(local_odb.objects_dir())?;
@@ -1019,7 +1108,7 @@ impl V2DeepenArgs {
     }
 
     /// Whether any deepen/shallow argument is present (drives `shallow-info`
-    /// handling and the "skip offering haves" decision).
+    /// handling and whether the wanted tips may also be offered as haves).
     pub(crate) fn is_shallow_request(&self) -> bool {
         self.depth.is_some()
             || self.deepen_relative
@@ -1206,6 +1295,9 @@ fn v2_wanted_ref_ad_line(line: &str) -> bool {
 /// sections (`acknowledgments`/`shallow-info`/`wanted-refs`/`packfile-uris`), and demux the
 /// side-band-64k pack from the `packfile` section into `out`. Lifted from the
 /// CLI's `read_v2_fetch_pack_response`, extended to surface shallow updates.
+///
+/// A stream that ends before the `packfile` section is
+/// [`RemoteUnreadableReason::ResponseTruncated`](crate::error::RemoteUnreadableReason::ResponseTruncated).
 pub(crate) fn read_v2_fetch_pack_response(
     reader: &mut dyn Read,
     out: &mut Vec<u8>,
@@ -1225,7 +1317,15 @@ pub(crate) fn read_v2_fetch_pack_response(
                         break line;
                     }
                 }
-                Some(pkt_line::Packet::Flush) | None => return Ok(()),
+                Some(pkt_line::Packet::Flush) => return Ok(()),
+                // A response to a request with wants ends with the packfile section;
+                // a stream that just stops was cut short (a server that died, say).
+                None => {
+                    return Err(Error::RemoteUnreadable {
+                        url: None,
+                        reason: crate::error::RemoteUnreadableReason::ResponseTruncated,
+                    })
+                }
                 Some(pkt_line::Packet::Delim) => continue,
                 Some(other) => {
                     return Err(Error::Message(format!(
@@ -1290,6 +1390,50 @@ fn skip_v2_section_until_boundary(reader: &mut dyn Read, sideband_all: bool) -> 
     }
 }
 
+/// Pack ingest target for network fetch [`FetchOptions::dry_run`]: objects are classified but not published.
+#[allow(clippy::large_enum_variant)]
+enum FetchDryRunIngest {
+    Quarantine(crate::receive_quarantine::ReceiveQuarantine),
+    Memory {
+        objects_dir: std::path::PathBuf,
+        pack: std::sync::Arc<crate::objects::odb::store::MemoryStore>,
+        read: std::sync::Arc<dyn crate::objects::odb::store::ObjectStore>,
+    },
+}
+
+impl FetchDryRunIngest {
+    fn create(local_odb: &crate::odb::Odb, git_dir: &Path) -> Result<Self> {
+        use crate::objects::odb::store::MemoryStore;
+        if local_odb.uses_files_primary() {
+            Ok(Self::Quarantine(
+                crate::receive_quarantine::ReceiveQuarantine::create(local_odb, git_dir)?,
+            ))
+        } else {
+            let pack = std::sync::Arc::new(MemoryStore::new(local_odb.hash_algo()));
+            Ok(Self::Memory {
+                objects_dir: local_odb.objects_dir().to_path_buf(),
+                pack: pack.clone(),
+                read: local_odb.read_store(),
+            })
+        }
+    }
+
+    fn odb(&self) -> crate::odb::Odb {
+        match self {
+            Self::Quarantine(q) => q.odb(),
+            Self::Memory {
+                objects_dir,
+                pack,
+                read,
+            } => crate::odb::OdbBuilder::files(objects_dir)
+                .primary(pack.clone())
+                .push_read_source(read.clone())
+                .alternates(false)
+                .build(),
+        }
+    }
+}
+
 /// Fetch from a remote over a live [`Connection`], driving the upload-pack
 /// negotiation and writing the resulting tracking-ref updates into
 /// `local_git_dir`.
@@ -1331,7 +1475,13 @@ pub(crate) fn open_fetch_target(local_git_dir: &Path, opts: &FetchOptions) -> Re
 }
 
 /// Like [`fetch_remote`], reading and writing objects through `local`'s object store.
-pub(crate) fn fetch_remote_into(
+///
+/// Received packs are ingested into `local`'s primary backend, including a custom
+/// [`OdbBuilder::primary`](crate::odb::OdbBuilder::primary) store. Set
+/// [`FetchOptions::pack_spool_only`](crate::transfer::FetchOptions::pack_spool_only) to keep the
+/// negotiated pack on disk and ingest it with [`crate::index_pack::ingest_received_pack_path`]
+/// or [`crate::unpack_objects::ingest_pack_into`].
+pub fn fetch_remote_into(
     local: &Repository,
     conn: &mut dyn Connection,
     opts: &mut FetchOptions,
@@ -1357,11 +1507,14 @@ pub(crate) fn fetch_remote_into(
     if opts.filter.is_none() {
         if let Some(remote) = opts.remote_name.as_deref() {
             opts.filter = crate::partial_clone::stored_remote_filter(&local_cfg, remote);
+            opts.auto_filter |=
+                crate::partial_clone::stored_remote_filter_is_auto(&local_cfg, remote);
         }
     }
     if !opts.object_wants.is_empty() {
         return fetch_remote_object_wants(local, conn, opts, progress, cancel);
     }
+    let mut promisor_handshake: Option<crate::promisor_remote::PromisorHandshake> = None;
     let local_odb_for_ls = local.odb();
 
     // 1. Remote refs + default branch.
@@ -1375,8 +1528,18 @@ pub(crate) fn fetch_remote_into(
         >= 2
     {
         let caps: Vec<String> = conn.capabilities().to_vec();
-        let (refs, head_symref, peel, head_oid) =
-            v2_ls_refs(conn, &caps, local_odb_for_ls, opts.tags, &opts.refspecs)?;
+        promisor_handshake = v2_promisor_handshake(local, &local_cfg, &caps, opts)?;
+        let promisor_reply = promisor_handshake
+            .as_ref()
+            .and_then(|h| h.decision.reply_value());
+        let (refs, head_symref, peel, head_oid) = v2_ls_refs(
+            conn,
+            &caps,
+            local_odb_for_ls,
+            opts.tags,
+            &opts.refspecs,
+            promisor_reply.as_deref(),
+        )?;
         let default_branch =
             head_symref.map(|t| t.strip_prefix("refs/heads/").unwrap_or(&t).to_owned());
         (refs, default_branch, Some(caps), peel, head_oid)
@@ -1436,6 +1599,11 @@ pub(crate) fn fetch_remote_into(
     let local = reopened.as_ref().unwrap_or(local);
     let local_git_dir = local.git_dir();
     let local_odb = local.odb();
+    if opts.filter.is_some() && !local_odb.uses_files_primary() {
+        return Err(Error::UnsupportedObjectStore {
+            operation: "partial fetch",
+        });
+    }
 
     let crate::transfer::FetchMatchSet {
         mut matched,
@@ -1471,6 +1639,7 @@ pub(crate) fn fetch_remote_into(
         &advertised_peel,
         &negatives,
         &tags_present,
+        opts.force,
         &mut matched,
         &mut matched_oids,
         &mut seen_remote_ref,
@@ -1549,21 +1718,26 @@ pub(crate) fn fetch_remote_into(
         t_begin.elapsed()
     );
 
-    let mut dry_run_quarantine: Option<crate::receive_quarantine::ReceiveQuarantine> = None;
+    let mut dry_run_ingest: Option<FetchDryRunIngest> = None;
 
     let v0_caps = if v2_caps.is_none() {
         Some(conn.capabilities().join(" "))
     } else {
         None
     };
-    let (wire_filter, _filter_sent) = crate::partial_clone::wire_filter_for_capabilities(
+    let (wire_filter, filter_sent) = crate::partial_clone::wire_filter_for_capabilities(
         opts.filter.as_ref(),
         v2_caps.as_deref(),
         v0_caps.as_deref(),
     );
     // Match Git: a requested/stored partial-clone filter marks the received pack
-    // promisor even when the server lacks `filter` and fetches unfiltered.
-    opts.mark_received_pack_promisor = opts.filter.is_some();
+    // promisor even when the server lacks `filter` and fetches unfiltered. So does
+    // accepting a promisor remote: the server may then leave out objects that
+    // remote holds.
+    let promisor_reply = promisor_handshake
+        .as_ref()
+        .and_then(|h| h.decision.reply_value());
+    opts.mark_received_pack_promisor = opts.filter.is_some() || promisor_reply.is_some();
     let wire_filter = wire_filter.as_deref();
 
     if wants.is_empty() {
@@ -1586,7 +1760,9 @@ pub(crate) fn fetch_remote_into(
                 wire_filter,
                 progress,
                 cancel,
-                false,
+                V2FetchMode::Refs {
+                    promisor_reply: promisor_reply.as_deref(),
+                },
             )?
         } else {
             negotiate_pack(
@@ -1621,6 +1797,8 @@ pub(crate) fn fetch_remote_into(
                     new_shallow: crate::shallow::dedupe_shallow_list(shallow_update.shallow),
                     new_unshallow: shallow_update.unshallow,
                     transfer: crate::transfer::TransferStats::default(),
+                    filter_sent,
+                    promisor: promisor_handshake,
                 });
             }
             let pack_config =
@@ -1630,14 +1808,11 @@ pub(crate) fn fetch_remote_into(
                 &pack_config,
                 opts.index_pack_threads,
             )?;
-            if opts.dry_run && dry_run_quarantine.is_none() {
-                dry_run_quarantine = Some(crate::receive_quarantine::ReceiveQuarantine::create(
-                    local_odb,
-                    local_git_dir,
-                )?);
+            if opts.dry_run && dry_run_ingest.is_none() {
+                dry_run_ingest = Some(FetchDryRunIngest::create(local_odb, local_git_dir)?);
             }
-            let ingested = if let Some(q) = dry_run_quarantine.as_ref() {
-                let q_odb = q.odb();
+            let ingested = if let Some(target) = dry_run_ingest.as_ref() {
+                let q_odb = target.odb();
                 crate::index_pack::ingest_received_pack_path_with_progress(
                     path,
                     &q_odb,
@@ -1648,6 +1823,7 @@ pub(crate) fn fetch_remote_into(
                         merged_config: Some(pack_config),
                         environment: opts.environment.clone(),
                         mark_promisor_pack: opts.mark_received_pack_promisor,
+                        keep_message: None,
                         trusted_index_rows: None,
                     },
                     Some(progress),
@@ -1664,6 +1840,7 @@ pub(crate) fn fetch_remote_into(
                         merged_config: Some(pack_config),
                         environment: opts.environment.clone(),
                         mark_promisor_pack: opts.mark_received_pack_promisor,
+                        keep_message: None,
                         trusted_index_rows: None,
                     },
                     Some(progress),
@@ -1699,9 +1876,9 @@ pub(crate) fn fetch_remote_into(
     // objects). All/None already handled; Following kept only when reachable.
     if opts.tags == crate::transfer::TagMode::Following {
         let t = std::time::Instant::now();
-        let tag_odb = dry_run_quarantine
+        let tag_odb = dry_run_ingest
             .as_ref()
-            .map(|q| q.odb())
+            .map(FetchDryRunIngest::odb)
             .unwrap_or_else(|| local_odb.clone());
         retain_following_tags(
             &tag_odb,
@@ -1719,7 +1896,7 @@ pub(crate) fn fetch_remote_into(
 
     // 5. Classify + apply ref updates (ancestry via the now-populated local repo).
     let t_apply = std::time::Instant::now();
-    let classify_odb = dry_run_quarantine.as_ref().map(|q| q.odb());
+    let classify_odb = dry_run_ingest.as_ref().map(FetchDryRunIngest::odb);
     let classify_repo = (!opts.dry_run).then_some(local);
     let d_repo_open = t_apply.elapsed();
 
@@ -1731,7 +1908,8 @@ pub(crate) fn fetch_remote_into(
     }
     let d_prune = t_prune.elapsed();
 
-    let mut store_batch: Vec<crate::refs::store::RefUpdate> = Vec::new();
+    let mut store_batch: Vec<(String, crate::refs::store::RawRef)> =
+        Vec::with_capacity(matched.len());
 
     // Load `packed-refs` once for the whole apply. Resolving each ref's previous
     // value (and the per-write namespace-conflict check) would otherwise re-read
@@ -1817,13 +1995,7 @@ pub(crate) fn fetch_remote_into(
                 });
                 continue;
             }
-            store_batch.push(crate::refs::store::RefUpdate {
-                name: local_ref.clone(),
-                new_value: Some(crate::refs::store::RawRef::Direct(m.oid)),
-                expected: crate::refs::store::Expected::Any,
-                reflog: None,
-                flags: Default::default(),
-            });
+            store_batch.push((local_ref.clone(), crate::refs::store::RawRef::Direct(m.oid)));
             n_written += 1;
         }
 
@@ -1841,7 +2013,7 @@ pub(crate) fn fetch_remote_into(
         let t = std::time::Instant::now();
         crate::transfer::apply_fetch_ref_updates(
             local,
-            &store_batch,
+            store_batch,
             &mut updates,
             crate::transfer::FetchRefRejectHint {
                 prune: opts.prune,
@@ -1849,6 +2021,7 @@ pub(crate) fn fetch_remote_into(
                 remote_refs: &remote_refs,
                 remote_name: opts.remote_name.as_deref(),
             },
+            opts.initial_remote_fetch,
         )?;
         d_write += t.elapsed();
     }
@@ -1898,6 +2071,8 @@ pub(crate) fn fetch_remote_into(
         new_shallow: crate::shallow::dedupe_shallow_list(shallow_update.shallow),
         new_unshallow: shallow_update.unshallow,
         transfer,
+        filter_sent,
+        promisor: promisor_handshake,
     })
 }
 
@@ -1922,6 +2097,8 @@ fn fetch_remote_object_wants(
             new_shallow: Vec::new(),
             new_unshallow: Vec::new(),
             transfer: crate::transfer::TransferStats::default(),
+            filter_sent: false,
+            promisor: None,
         });
     }
 
@@ -1935,7 +2112,7 @@ fn fetch_remote_object_wants(
     } else {
         None
     };
-    let (wire_filter, _filter_sent) = crate::partial_clone::wire_filter_for_capabilities(
+    let (wire_filter, filter_sent) = crate::partial_clone::wire_filter_for_capabilities(
         opts.filter.as_ref(),
         v2_caps.as_deref(),
         v0_caps.as_deref(),
@@ -1969,7 +2146,7 @@ fn fetch_remote_object_wants(
             wire_filter,
             progress,
             cancel,
-            true,
+            V2FetchMode::ObjectWants,
         )?
     } else {
         negotiate_pack(
@@ -2002,6 +2179,7 @@ fn fetch_remote_object_wants(
                 merged_config: Some(pack_config),
                 environment: opts.environment.clone(),
                 mark_promisor_pack: opts.mark_received_pack_promisor,
+                keep_message: None,
                 trusted_index_rows: None,
             },
             Some(progress),
@@ -2028,6 +2206,8 @@ fn fetch_remote_object_wants(
         new_shallow: crate::shallow::dedupe_shallow_list(shallow_update.shallow),
         new_unshallow: shallow_update.unshallow,
         transfer,
+        filter_sent,
+        promisor: None,
     })
 }
 
@@ -2149,7 +2329,7 @@ pub(crate) fn finish_initial_remote_fetch_layout(
 /// [`following_tag_wants_with_local_peel`].
 ///
 /// Under `Following`, tags named in `already_local` (see [`tags_already_local`])
-/// are skipped: the local repository already has them at the advertised value.
+/// are skipped: the local repository already has a ref with that name.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn add_wire_tags(
     mode: crate::transfer::TagMode,
@@ -2157,6 +2337,7 @@ pub(crate) fn add_wire_tags(
     advertised_peel: &std::collections::HashMap<String, ObjectId>,
     negatives: &[RefspecItem],
     already_local: &HashSet<String>,
+    force_all_tags: bool,
     matched: &mut Vec<crate::transfer::MatchedRef>,
     matched_oids: &mut HashSet<ObjectId>,
     seen_remote_ref: &mut HashSet<String>,
@@ -2186,7 +2367,7 @@ pub(crate) fn add_wire_tags(
             remote_ref: name.clone(),
             local_ref: Some(name.clone()),
             oid: *oid,
-            force: false,
+            force: force_all_tags && mode == crate::transfer::TagMode::All,
             is_tag: true,
             auto_followed: mode == crate::transfer::TagMode::Following,
             dest_is_tag: true,
@@ -2414,10 +2595,10 @@ pub(crate) fn retain_following_tags(
 }
 
 /// Names of the remote `refs/tags/*` entries in `remote_refs` that the local
-/// repository already stores under the same name at the same object id.
+/// repository already stores under the same name (any object id).
 ///
 /// Tag-following never needs to consider these: Git's auto-follow skips tags
-/// that already exist locally, and there is nothing to fetch or write for them.
+/// that already exist locally, regardless of where the remote tag now points.
 /// Excluding them up front keeps the reachability walk off the whole history
 /// when the client already has every advertised tag (the common incremental
 /// fetch).
@@ -2436,9 +2617,7 @@ pub(crate) fn tags_already_local(
 ) -> HashSet<String> {
     remote_refs
         .iter()
-        .filter(|(name, oid)| {
-            name.starts_with("refs/tags/") && local_refs.resolve(name).ok() == Some(*oid)
-        })
+        .filter(|(name, _)| name.starts_with("refs/tags/") && local_refs.resolve(name).is_ok())
         .map(|(name, _)| name.clone())
         .collect()
 }
@@ -2640,12 +2819,56 @@ mod fetch_advertised_ref_tests {
 
         let caps = vec!["ls-refs=unborn".to_owned()];
         let odb = Odb::new(std::path::Path::new("/dev/null"));
-        let req = build_v2_ls_refs_request(&caps, &odb, TagMode::None, &[]).unwrap();
+        let req = build_v2_ls_refs_request(&caps, &odb, TagMode::None, &[], None).unwrap();
         let text = String::from_utf8_lossy(&req);
         assert!(
             text.contains("unborn"),
             "request must ask for unborn HEAD:\n{text}"
         );
+        assert!(!text.contains("promisor-remote"), "{text}");
+    }
+
+    #[test]
+    fn v2_fetch_response_cut_before_the_pack_is_truncated() {
+        // An acknowledgments section, then the stream just ends.
+        let mut wire: Vec<u8> = Vec::new();
+        wire.extend_from_slice(b"0014acknowledgments\n");
+        wire.extend_from_slice(b"0008NAK\n");
+        wire.extend_from_slice(b"0001");
+        let err = super::read_v2_fetch_pack_response(
+            &mut wire.as_slice(),
+            &mut Vec::new(),
+            None,
+            &mut super::ShallowUpdate::default(),
+            &mut crate::fetch::NoProgress,
+            &crate::progress::NeverCancel,
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::RemoteUnreadable {
+                    reason: crate::error::RemoteUnreadableReason::ResponseTruncated,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn build_v2_ls_refs_request_carries_promisor_reply_before_args() {
+        use crate::odb::Odb;
+        use crate::transfer::TagMode;
+
+        let caps = vec!["agent=git/2.50".to_owned(), "object-format=sha1".to_owned()];
+        let odb = Odb::new(std::path::Path::new("/dev/null"));
+        let req = build_v2_ls_refs_request(&caps, &odb, TagMode::None, &[], Some("lop")).unwrap();
+        let text = String::from_utf8_lossy(&req);
+        let reply = text.find("promisor-remote=lop\n").expect("reply line");
+        let delim = text.find("0001").expect("delim");
+        assert!(reply < delim, "{text}");
     }
 
     #[test]
@@ -2777,6 +3000,7 @@ mod fetch_advertised_ref_tests {
             &advertised_peel,
             &negatives,
             &HashSet::new(),
+            false,
             &mut matched,
             &mut matched_oids,
             &mut seen,
@@ -3185,8 +3409,12 @@ mod fetch_advertised_ref_tests {
         let present = tags_already_local(store.as_ref(), &remote_refs);
         assert_eq!(
             present,
-            HashSet::from(["refs/tags/loose".to_owned(), "refs/tags/packed".to_owned()]),
-            "only tags stored locally at the advertised oid count as present"
+            HashSet::from([
+                "refs/tags/loose".to_owned(),
+                "refs/tags/packed".to_owned(),
+                "refs/tags/moved".to_owned(),
+            ]),
+            "every local tag name is skipped under Following"
         );
         assert!(tags_already_local(store.as_ref(), &remote_refs[..1]).is_empty());
     }
@@ -3219,6 +3447,7 @@ mod fetch_advertised_ref_tests {
                 &HashMap::new(),
                 &[],
                 &already_local,
+                false,
                 &mut matched,
                 &mut matched_oids,
                 &mut seen,
@@ -3357,7 +3586,9 @@ mod v2_negotiation_tests {
             None,
             &mut NoProgress,
             &NeverCancel,
-            false,
+            V2FetchMode::Refs {
+                promisor_reply: None,
+            },
         );
 
         let last = server.requests.last().unwrap();

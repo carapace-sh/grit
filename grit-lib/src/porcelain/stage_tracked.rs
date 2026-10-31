@@ -58,6 +58,8 @@ pub struct StageTrackedSummary {
     pub removed: Vec<Vec<u8>>,
     /// Per-path UNTR invalidation was deferred during this scan (campaign-scale restage).
     pub untracked_invalidation_deferred: bool,
+    /// Index stat cache was refreshed for at least one path without a blob/mode change.
+    pub stat_refreshed: bool,
 }
 
 impl StageTrackedSummary {
@@ -110,7 +112,7 @@ pub fn stage_tracked_modifications_with_thresholds(
     thresholds: IndexStagingThresholds,
 ) -> Result<StageTrackedSummary> {
     let index_path = repo.index_path_for_env()?;
-    let (mut lock, mut index) = match repo.lock_and_load_index() {
+    let (mut lock, mut index) = match repo.lock_and_load_index_preserving_sparse() {
         Ok(locked) => locked,
         Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
             return Ok(StageTrackedSummary::default());
@@ -129,7 +131,7 @@ pub fn stage_tracked_modifications_with_thresholds(
     if summary.untracked_invalidation_deferred {
         replay_deferred_untracked_invalidations(&mut index, &summary);
     }
-    if summary.change_count() > 0 {
+    if summary.change_count() > 0 || summary.stat_refreshed {
         index.ensure_canonical_order();
         repo.write_index_with_lock(&mut lock, &mut index, false)?;
     }
@@ -318,8 +320,6 @@ fn stage_tracked_modifications_in_index_body(
     } else {
         None
     };
-    let dir_symlinks = SymlinkDirCache::default();
-
     for raw_path in &unmerged_paths {
         if !tracked_scan_includes_path(restrict_to_paths, raw_path) {
             continue;
@@ -440,15 +440,25 @@ fn stage_tracked_modifications_in_index_body(
         &rules_config,
         dir_abs,
         file_abs,
-        |rel_path| {
-            dir_symlinks.has_symlink_in_path_bytes(
-                work_tree,
-                rel_path,
-                precompose_unicode,
-                ignorecase,
-            ) || {
+        || {
+            let mut dir_symlinks = SymlinkDirCache::default();
+            let work_tree_for_symlink = &work_tree_for_symlink;
+            let symlink_parent_cache = &symlink_parent_cache;
+            move |rel_path: &[u8]| {
+                if dir_symlinks.has_symlink_in_path_bytes(
+                    work_tree,
+                    rel_path,
+                    precompose_unicode,
+                    ignorecase,
+                ) {
+                    return true;
+                }
+                // Without case or Unicode resolution both checks probe the same paths.
+                if !precompose_unicode && !ignorecase {
+                    return false;
+                }
                 let abs = crate::diff::index_entry_worktree_abs_bytes(
-                    &work_tree_for_symlink,
+                    work_tree_for_symlink,
                     rel_path,
                     precompose_unicode,
                     ignorecase,
@@ -517,20 +527,24 @@ fn stage_tracked_modifications_in_index_body(
                     icase_collisions: icase_collisions.as_ref(),
                 };
                 let defer = parallel_restage.then_some(&mut deferred_restage);
-                if refresh_present_tracked_path(ctx, stat, defer, entry_index)? {
-                    summary.modified.push(raw_path);
-                    scope.sink().inc(1);
+                match refresh_present_tracked_path(ctx, stat, defer, entry_index)? {
+                    PresentRefresh::Unchanged => {}
+                    PresentRefresh::StatRefreshed => summary.stat_refreshed = true,
+                    PresentRefresh::Restaged => {
+                        summary.modified.push(raw_path);
+                        scope.sink().inc(1);
+                    }
+                    PresentRefresh::Removed => pending_removals.push(raw_path),
                 }
             }
         }
         Ok(())
     })?;
-    for raw_path in pending_removals {
-        if index.remove(&raw_path) {
-            summary.removed.push(raw_path);
-            scope.sink().inc(1);
-        }
-    }
+    // Every queued path is a distinct stage-0 row still in the index: removals wait until
+    // the scan is done, so one compaction pass replaces a tail shift per path.
+    index.remove_paths(pending_removals.iter().map(Vec::as_slice));
+    scope.sink().inc(pending_removals.len() as u64);
+    summary.removed.extend(pending_removals);
 
     if !deferred_restage.is_empty() {
         let restage_ctx = DeferredRestageContext {
@@ -539,7 +553,7 @@ fn stage_tracked_modifications_in_index_body(
             ignorecase,
             icase_collisions: icase_collisions.as_ref(),
         };
-        summary.modified.extend(restage_deferred_jobs(
+        let (deferred_modified, deferred_stat_refreshed) = restage_deferred_jobs(
             repo,
             index,
             rules,
@@ -548,7 +562,11 @@ fn stage_tracked_modifications_in_index_body(
             restage_ctx,
             &deferred_restage,
             scope,
-        )?);
+        )?;
+        summary.modified.extend(deferred_modified);
+        if deferred_stat_refreshed {
+            summary.stat_refreshed = true;
+        }
     }
 
     summary.modified.sort();
@@ -652,8 +670,13 @@ fn symlink_metadata_for_staging(
     }
 }
 
-fn worktree_path_is_missing(err: &std::io::Error) -> bool {
-    matches!(err.kind(), std::io::ErrorKind::NotFound)
+/// Whether a worktree `lstat` failure means the path is gone: either nothing is there, or an
+/// ancestor directory was replaced by a file.
+pub(crate) fn worktree_path_is_missing(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+    )
 }
 
 fn abs_path_for_stage_tracked(
@@ -708,8 +731,15 @@ fn stage_tracked_path_individual(
                 rules,
                 icase_collisions,
             };
-            if refresh_present_tracked_path(ctx, BlobDiskStat::from_metadata(&meta), None, 0)? {
-                summary.modified.push(raw_path.to_vec());
+            match refresh_present_tracked_path(ctx, BlobDiskStat::from_metadata(&meta), None, 0)? {
+                PresentRefresh::Unchanged => {}
+                PresentRefresh::StatRefreshed => summary.stat_refreshed = true,
+                PresentRefresh::Restaged => summary.modified.push(raw_path.to_vec()),
+                PresentRefresh::Removed => {
+                    if index.remove(raw_path) {
+                        summary.removed.push(raw_path.to_vec());
+                    }
+                }
             }
         }
         None if idx_e.skip_worktree() => {}
@@ -745,12 +775,26 @@ fn git_entry_type(mode: u32) -> u32 {
     mode & S_IFMT
 }
 
+/// What refreshing one present tracked worktree path did to its index row.
+enum PresentRefresh {
+    /// The index row already matches the worktree (or the restage was deferred).
+    Unchanged,
+    /// Cached stat fields were updated on an unchanged blob/mode row.
+    StatRefreshed,
+    /// The index row was rewritten in place.
+    Restaged,
+    /// The path is now a plain directory, so its row must be dropped. Removal is left to the
+    /// caller because removing shifts index rows that an in-flight scan still addresses by
+    /// position.
+    Removed,
+}
+
 fn refresh_present_tracked_path(
     ctx: PresentRefreshCtx<'_>,
     stat: BlobDiskStat,
     defer_restage: Option<&mut Vec<DeferredRestageJob>>,
     entry_index: usize,
-) -> Result<bool> {
+) -> Result<PresentRefresh> {
     let PresentRefreshCtx {
         repo,
         index,
@@ -763,36 +807,28 @@ fn refresh_present_tracked_path(
         icase_collisions,
     } = ctx;
     if icase_collisions.is_some_and(|map| map.is_auto_stage_loser(raw_path)) {
-        return Ok(false);
+        return Ok(PresentRefresh::Unchanged);
     }
     let idx_mode = idx_e.mode;
     let idx_intent_to_add = idx_e.intent_to_add();
     let idx_oid = idx_e.oid;
 
-    if idx_mode == 0o160000 && stat.is_dir {
-        return refresh_gitlink(repo, index, raw_path, abs_path, idx_e);
-    }
-    // Gitlink in the index but a non-directory in the work tree (e.g. regular file): stage as blob below.
-
     if stat.is_dir {
-        if abs_path.join(".git").exists() {
-            if let Some(oid) = read_submodule_head_oid(abs_path) {
-                if index
-                    .entries
-                    .iter()
-                    .find(|e| e.path == *raw_path)
-                    .is_some_and(|e| e.oid == oid && e.mode == 0o160000)
-                {
-                    return Ok(false);
-                }
+        let is_gitlink = idx_mode == MODE_GITLINK;
+        if !is_gitlink && !abs_path.join(".git").exists() {
+            return Ok(PresentRefresh::Removed);
+        }
+        match read_submodule_head_oid(abs_path) {
+            Some(oid) if is_gitlink && idx_e.oid == oid => return Ok(PresentRefresh::Unchanged),
+            Some(oid) => {
                 stage_gitlink_from_stat(abs_path, raw_path, oid, index)?;
-                return Ok(true);
+                return Ok(PresentRefresh::Restaged);
             }
-        } else {
-            index.remove(raw_path);
-            return Ok(true);
+            None if is_gitlink => return Ok(PresentRefresh::Unchanged),
+            None => {}
         }
     }
+    // Gitlink in the index but a non-directory in the work tree (e.g. regular file): stage as blob below.
 
     let wt_mode = mode_policy.index_mode_for_worktree(stat.git_mode, Some(idx_mode));
     let type_changed = git_entry_type(wt_mode) != git_entry_type(idx_mode);
@@ -802,13 +838,13 @@ fn refresh_present_tracked_path(
     let racy = entry_is_racy(idx_e, index_mtime);
     if !idx_intent_to_add && idx_e.size != 0 && stat_same && !racy {
         if wt_mode == idx_mode {
-            return Ok(false);
+            return Ok(PresentRefresh::Unchanged);
         }
         // A type change (blob ↔ symlink, etc.) falls through to restage the content.
         if !type_changed {
             let entry = entry_from_stat(abs_path, raw_path, idx_oid, wt_mode)?;
             index.stage_file(entry);
-            return Ok(true);
+            return Ok(PresentRefresh::Restaged);
         }
     }
 
@@ -820,7 +856,7 @@ fn refresh_present_tracked_path(
                     raw_path: raw_path.to_vec(),
                     size: u64::from(stat.fields.index_size()),
                 });
-                return Ok(false);
+                return Ok(PresentRefresh::Unchanged);
             }
             let meta = fs::symlink_metadata(abs_path).map_err(Error::Io)?;
             let file_attrs = rules.file_attrs(rel_path, false);
@@ -875,12 +911,21 @@ fn refresh_present_tracked_path(
             // Stat taken before the read, so a write racing the read is caught next time.
             let entry = entry_from_metadata(&meta, raw_path, staged_oid, wt_mode);
             if !idx_intent_to_add && staged_oid == idx_oid {
-                if wt_mode != idx_mode || stat_fields_differ(&entry, idx_e) {
+                if wt_mode != idx_mode {
                     index.stage_file(entry);
                     index.mark_content_verified(raw_path, staged_oid);
-                    return Ok(true);
+                    return Ok(PresentRefresh::Restaged);
                 }
-                return Ok(false);
+                if stat_fields_differ(&entry, idx_e) {
+                    refresh_index_stat_only(index, raw_path, staged_oid, &entry)?;
+                    return Ok(PresentRefresh::StatRefreshed);
+                }
+                return Ok(PresentRefresh::Unchanged);
+            }
+            if icase_collisions.is_some_and(|map| {
+                map.worktree_oid_is_collision_sibling_blob(raw_path, staged_oid, idx_oid)
+            }) {
+                return Ok(PresentRefresh::Unchanged);
             }
             match payload {
                 RestagePayload::Stored => {}
@@ -899,20 +944,25 @@ fn refresh_present_tracked_path(
             }
             index.stage_file(entry);
             index.mark_content_verified(raw_path, staged_oid);
-            return Ok(true);
+            return Ok(PresentRefresh::Restaged);
         }
         Err(_) => {
             let meta = fs::symlink_metadata(abs_path).map_err(Error::Io)?;
             let oid = read_worktree_blob_oid_raw(repo, abs_path, &meta)?;
             if !idx_intent_to_add && idx_oid == oid && wt_mode == idx_mode {
-                return Ok(false);
+                return Ok(PresentRefresh::Unchanged);
+            }
+            if icase_collisions.is_some_and(|map| {
+                map.worktree_oid_is_collision_sibling_blob(raw_path, oid, idx_oid)
+            }) {
+                return Ok(PresentRefresh::Unchanged);
             }
             oid
         }
     };
     let entry = entry_from_stat(abs_path, raw_path, oid, wt_mode)?;
     index.stage_file(entry);
-    Ok(true)
+    Ok(PresentRefresh::Restaged)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -925,12 +975,13 @@ fn restage_deferred_jobs(
     ctx: DeferredRestageContext<'_>,
     jobs: &[DeferredRestageJob],
     scope: &mut ProgressScope<'_>,
-) -> Result<Vec<Vec<u8>>> {
+) -> Result<(Vec<Vec<u8>>, bool)> {
     let mut modified = Vec::new();
+    let mut stat_refreshed = false;
     let mut loose_dirs_ready = false;
     for chunk in restage_chunks(jobs) {
         scope.poll()?;
-        let replacements = restage_deferred_chunk(
+        let (replacements, chunk_stat_refreshed) = restage_deferred_chunk(
             repo,
             index,
             rules,
@@ -943,12 +994,15 @@ fn restage_deferred_jobs(
             scope.watch(),
         )?;
         scope.sink().inc(chunk.len() as u64);
-        for entry in &replacements {
-            index.mark_content_verified(&entry.path, entry.oid);
+        stat_refreshed |= chunk_stat_refreshed;
+        if !replacements.is_empty() {
+            for entry in &replacements {
+                index.mark_content_verified(&entry.path, entry.oid);
+            }
+            index.overwrite_stage0_entries(replacements);
         }
-        index.overwrite_stage0_entries(replacements);
     }
-    Ok(modified)
+    Ok((modified, stat_refreshed))
 }
 
 /// Split `jobs` into runs of at most [`RESTAGE_CHUNK_MAX_JOBS`] jobs and roughly
@@ -981,7 +1035,7 @@ fn restage_chunks(jobs: &[DeferredRestageJob]) -> Vec<&[DeferredRestageJob]> {
 #[allow(clippy::too_many_arguments)]
 fn restage_deferred_chunk(
     repo: &Repository,
-    index: &Index,
+    index: &mut Index,
     rules: &mut WorktreeRules,
     mode_policy: WorktreeModePolicy,
     parallelism: Parallelism,
@@ -990,8 +1044,9 @@ fn restage_deferred_chunk(
     loose_dirs_ready: &mut bool,
     modified: &mut Vec<Vec<u8>>,
     cancel: &std::sync::atomic::AtomicBool,
-) -> Result<Vec<IndexEntry>> {
+) -> Result<(Vec<IndexEntry>, bool)> {
     let mut replacements = Vec::with_capacity(jobs.len());
+    let mut stat_refreshed = false;
     let &DeferredRestageContext {
         work_tree,
         precompose_unicode,
@@ -1048,10 +1103,15 @@ fn restage_deferred_chunk(
         if icase_collisions.is_some_and(|map| map.is_auto_stage_loser(raw_path)) {
             continue;
         }
+        if icase_collisions.is_some_and(|map| {
+            map.worktree_oid_is_collision_sibling_blob(raw_path, prep.blob.oid, idx_e.oid)
+        }) {
+            continue;
+        }
         if prep.blob.oid == idx_e.oid && mode_for_index == idx_e.mode {
             if stat_fields_differ(&entry, idx_e) {
-                replacements.push(entry);
-                modified.push(raw_path.to_vec());
+                refresh_index_stat_only(index, raw_path, prep.blob.oid, &entry)?;
+                stat_refreshed = true;
             }
             continue;
         }
@@ -1082,7 +1142,22 @@ fn restage_deferred_chunk(
             )?;
         }
     }
-    Ok(replacements)
+    Ok((replacements, stat_refreshed))
+}
+
+/// Refresh cached stat fields on an unchanged stage-0 row (same OID and mode).
+fn refresh_index_stat_only(
+    index: &mut Index,
+    raw_path: &[u8],
+    oid: ObjectId,
+    fresh: &IndexEntry,
+) -> Result<()> {
+    let Some(row) = index.get_mut(raw_path, 0) else {
+        return Ok(());
+    };
+    crate::index::IndexStatFields::of_entry(fresh).store_in(row);
+    index.mark_content_verified(raw_path, oid);
+    Ok(())
 }
 
 /// Whether `entry`'s cached stat fields differ from the index row it would replace.
@@ -1096,29 +1171,6 @@ fn stat_fields_differ(entry: &IndexEntry, idx_e: &IndexEntry) -> bool {
         || entry.dev != idx_e.dev
         || entry.uid != idx_e.uid
         || entry.gid != idx_e.gid
-}
-
-fn refresh_gitlink(
-    _repo: &Repository,
-    index: &mut Index,
-    raw_path: &[u8],
-    abs_path: &Path,
-    idx_e: &IndexEntry,
-) -> Result<bool> {
-    if let Some(oid) = read_submodule_head_oid(abs_path) {
-        if index
-            .entries
-            .iter()
-            .find(|e| e.path == *raw_path)
-            .is_some_and(|e| e.oid == oid && e.mode == 0o160000)
-        {
-            return Ok(false);
-        }
-        stage_gitlink_from_stat(abs_path, raw_path, oid, index)?;
-        return Ok(true);
-    }
-    let _ = idx_e;
-    Ok(false)
 }
 
 fn stage_gitlink_from_stat(
@@ -1557,6 +1609,89 @@ mod tests {
     }
 
     #[test]
+    fn file_replaced_by_directory_before_sibling_is_removed() {
+        let (_dir, repo) = init_repo();
+        let wt = repo.work_tree().unwrap();
+        write_and_index(&repo, b"f", b"f\n");
+        write_and_index(&repo, b"g", b"g\n");
+        fs::remove_file(wt.join("f")).unwrap();
+        fs::create_dir(wt.join("f")).unwrap();
+        fs::write(wt.join("f/i"), b"i\n").unwrap();
+
+        let summary = stage_tracked_modifications(&repo, wt).unwrap();
+        assert_eq!(summary.removed, vec![b"f".to_vec()]);
+        assert!(summary.modified.is_empty());
+        let index = repo.load_index().unwrap();
+        let paths: Vec<_> = index.entries.iter().map(|e| e.path.as_slice()).collect();
+        assert_eq!(paths, [b"g".as_slice()]);
+    }
+
+    #[test]
+    fn file_replaced_by_directory_on_bulk_path_is_recorded_as_removed() {
+        let (_dir, repo) = init_repo();
+        let wt = repo.work_tree().unwrap();
+        write_and_index(&repo, b"f", b"f\n");
+        write_and_index(&repo, b"g", b"g\n");
+        fs::remove_file(wt.join("f")).unwrap();
+        fs::create_dir(wt.join("f")).unwrap();
+
+        let thresholds = IndexStagingThresholds {
+            large_index_restage: 1,
+            parallel_tracked_restage: 1,
+        };
+        let summary = stage_tracked_modifications_with_thresholds(&repo, wt, thresholds).unwrap();
+        assert!(summary.untracked_invalidation_deferred);
+        assert_eq!(summary.removed, vec![b"f".to_vec()]);
+        assert!(summary.modified.is_empty());
+    }
+
+    #[test]
+    fn intent_to_add_file_replaced_by_directory_is_removed() {
+        let (_dir, repo) = init_repo();
+        let wt = repo.work_tree().unwrap();
+        write_and_index(&repo, b"f", b"f\n");
+        write_and_index(&repo, b"g", b"g\n");
+        let mut index = repo.load_index().unwrap();
+        let f = index.entries.iter_mut().find(|e| e.path == b"f").unwrap();
+        f.set_intent_to_add(true);
+        repo.write_index(&mut index).unwrap();
+        fs::remove_file(wt.join("f")).unwrap();
+        fs::create_dir(wt.join("f")).unwrap();
+
+        let summary = stage_tracked_modifications(&repo, wt).unwrap();
+        assert_eq!(summary.removed, vec![b"f".to_vec()]);
+        assert!(summary.modified.is_empty());
+    }
+
+    #[test]
+    fn directory_replaced_by_file_removes_former_children() {
+        let (_dir, repo) = init_repo();
+        let wt = repo.work_tree().unwrap();
+        write_and_index(&repo, b"d/x", b"1\n");
+        write_and_index(&repo, b"d/y", b"2\n");
+        write_and_index(&repo, b"g", b"g\n");
+        fs::remove_dir_all(wt.join("d")).unwrap();
+        fs::write(wt.join("d"), b"n\n").unwrap();
+
+        let summary = stage_tracked_modifications(&repo, wt).unwrap();
+        assert_eq!(summary.removed, vec![b"d/x".to_vec(), b"d/y".to_vec()]);
+        assert!(summary.modified.is_empty());
+    }
+
+    #[test]
+    fn lstat_through_a_file_counts_as_missing() {
+        let (_dir, repo) = init_repo();
+        let wt = repo.work_tree().unwrap();
+        fs::write(wt.join("d"), b"n\n").unwrap();
+        assert_eq!(
+            symlink_metadata_for_staging("d/x", &wt.join("d/x"))
+                .unwrap()
+                .map(|_| ()),
+            None
+        );
+    }
+
+    #[test]
     fn unchanged_tracked_file_is_not_rehashed() {
         let (_dir, repo) = init_repo();
         write_and_index(&repo, b"clean.txt", b"same");
@@ -1569,6 +1704,127 @@ mod tests {
         assert!(summary.modified.is_empty());
         assert!(summary.removed.is_empty());
         assert_eq!(objects_before, objects_after);
+    }
+
+    fn bump_worktree_mtime_only(repo: &Repository, rel: &[u8], delta_sec: u32) {
+        let wt = repo.work_tree().unwrap();
+        let path = worktree_path_from_index_rel(wt, rel);
+        let index = repo.load_index().unwrap();
+        let ie = index.get(rel, 0).expect("tracked path");
+        pin_mtime(&path, ie.mtime_sec.saturating_add(delta_sec), ie.mtime_nsec);
+    }
+
+    fn assert_mtime_only_restage(
+        repo: &Repository,
+        rel: &[u8],
+        thresholds: IndexStagingThresholds,
+    ) {
+        let wt = repo.work_tree().unwrap();
+        let before_index = repo.load_index().unwrap();
+        let oid_before = before_index.get(rel, 0).unwrap().oid;
+        let index_mtime_before = (
+            before_index.get(rel, 0).unwrap().mtime_sec,
+            before_index.get(rel, 0).unwrap().mtime_nsec,
+        );
+
+        bump_worktree_mtime_only(repo, rel, 120);
+        let wt_meta = fs::symlink_metadata(worktree_path_from_index_rel(wt, rel)).unwrap();
+        let objects_before = count_loose_objects(&repo);
+        let summary = stage_tracked_modifications_with_thresholds(&repo, wt, thresholds).unwrap();
+
+        assert!(
+            summary.modified.is_empty(),
+            "mtime-only touch must not count as modified: {summary:?}"
+        );
+        assert_eq!(summary.change_count(), 0);
+        assert!(summary.stat_refreshed);
+        assert_eq!(count_loose_objects(&repo), objects_before);
+        let loaded = repo.load_index().unwrap();
+        let ie = loaded.get(rel, 0).unwrap();
+        assert_eq!(ie.oid, oid_before);
+        assert_ne!(
+            (ie.mtime_sec, ie.mtime_nsec),
+            index_mtime_before,
+            "index row stat must adopt worktree mtime"
+        );
+        assert_eq!(ie.mtime_sec, file_mtime_sec(&wt_meta));
+
+        let again = stage_tracked_modifications_with_thresholds(&repo, wt, thresholds).unwrap();
+        assert!(again.modified.is_empty());
+        assert!(!again.stat_refreshed);
+        assert_eq!(again.change_count(), 0);
+    }
+
+    fn file_mtime_sec(meta: &fs::Metadata) -> u32 {
+        use filetime::FileTime;
+        let ft = FileTime::from_last_modification_time(meta);
+        ft.seconds() as u32
+    }
+
+    #[test]
+    fn mtime_only_touch_is_not_reported_as_modified() {
+        let (_dir, repo) = init_repo();
+        write_and_index(&repo, b"c.txt", b"x");
+        finalize_index_for_stat_trust(&repo);
+        assert_mtime_only_restage(&repo, b"c.txt", IndexStagingThresholds::default());
+    }
+
+    #[test]
+    fn mtime_only_touch_on_empty_file_is_not_reported_as_modified() {
+        let (_dir, repo) = init_repo();
+        write_and_index(&repo, b"empty.txt", b"");
+        finalize_index_for_stat_trust(&repo);
+        assert_mtime_only_restage(&repo, b"empty.txt", IndexStagingThresholds::default());
+    }
+
+    #[test]
+    fn mtime_only_touch_parallel_restage_is_not_reported_as_modified() {
+        let (_dir, repo) = init_repo();
+        write_and_index(&repo, b"c.txt", b"x");
+        write_and_index(&repo, b"d.txt", b"y");
+        finalize_index_for_stat_trust(&repo);
+        let thresholds = IndexStagingThresholds {
+            large_index_restage: 1,
+            parallel_tracked_restage: 1,
+        };
+        assert_mtime_only_restage(&repo, b"c.txt", thresholds);
+    }
+
+    #[cfg_attr(
+        not(feature = "full-tests"),
+        ignore = "starts system git or is heavy; run with --features full-tests"
+    )]
+    #[test]
+    fn mtime_only_touch_git_index_compat() {
+        use std::process::Command;
+
+        if !Command::new("git")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success())
+        {
+            return;
+        }
+        let (dir, repo) = init_repo();
+        let root = dir.path();
+        grit_test_support::git(root, &["config", "user.email", "t@example.com"]);
+        grit_test_support::git(root, &["config", "user.name", "Test"]);
+        write_and_index(&repo, b"c.txt", b"x");
+        grit_test_support::git(root, &["commit", "-m", "baseline"]);
+        finalize_index_for_stat_trust(&repo);
+        let ls_before = grit_test_support::git(root, &["ls-files", "-s", "c.txt"]);
+        bump_worktree_mtime_only(&repo, b"c.txt", 180);
+        let summary = stage_tracked_modifications(&repo, repo.work_tree().unwrap()).unwrap();
+        assert!(summary.modified.is_empty());
+        assert!(summary.stat_refreshed);
+        let cached = grit_test_support::git(root, &["diff", "--cached", "--name-only"]);
+        assert!(
+            cached.trim().is_empty(),
+            "git must see no staged diff after stat-only refresh: {cached:?}"
+        );
+        let ls_after = grit_test_support::git(root, &["ls-files", "-s", "c.txt"]);
+        assert_eq!(ls_before, ls_after);
+        grit_test_support::git(root, &["update-index", "--refresh"]);
     }
 
     fn count_loose_objects(repo: &Repository) -> usize {

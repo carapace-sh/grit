@@ -2,6 +2,7 @@
 name = "grit-lib"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 autotests = false
 license = "MIT"
 description = "Core library for the grit Git implementation"
@@ -58,11 +59,9 @@ hex.workspace = true
 tempfile.workspace = true
 similar = { workspace = true, features = ["inline"] }
 merge3.workspace = true
-imara-diff.workspace = true
 regex.workspace = true
 regex-automata.workspace = true
 libc.workspace = true
-unicode-width.workspace = true
 encoding_rs = "0.8.35"
 icu_normalizer.workspace = true
 url.workspace = true
@@ -95,6 +94,10 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Securit
 
 [[bench]]
 name = "environment"
+harness = false
+
+[[bench]]
+name = "config_parse"
 harness = false
 
 [[bench]]
@@ -280,6 +283,11 @@ name = "integration"
 path = "tests/integration.rs"
 
 [[test]]
+name = "add_bulk_memory"
+path = "tests/add_bulk_memory.rs"
+required-features = ["full-tests"]
+
+[[test]]
 name = "add_pathspec_staging"
 path = "tests/add_pathspec_staging.rs"
 required-features = ["full-tests"]
@@ -380,6 +388,16 @@ path = "tests/status_index_stat_refresh_git_compat.rs"
 required-features = ["full-tests"]
 
 [[test]]
+name = "sparse_index_readonly_porcelain_git_compat"
+path = "tests/sparse_index_readonly_porcelain_git_compat.rs"
+required-features = ["full-tests"]
+
+[[test]]
+name = "status_optional_locks_git_compat"
+path = "tests/status_optional_locks_git_compat.rs"
+required-features = ["full-tests"]
+
+[[test]]
 name = "switch_delete_cross_device_symlink_1968"
 path = "tests/switch_delete_cross_device_symlink_1968.rs"
 required-features = ["full-tests"]
@@ -404,6 +422,26 @@ required-features = ["full-tests"]
 [[test]]
 name = "merge_content_rss"
 path = "tests/merge_content_rss.rs"
+required-features = ["full-tests"]
+
+[[test]]
+name = "merge_conflict_rss"
+path = "tests/merge_conflict_rss.rs"
+required-features = ["full-tests"]
+
+[[test]]
+name = "upload_pack_packed_blob_memory"
+path = "tests/upload_pack_packed_blob_memory.rs"
+required-features = ["full-tests"]
+
+[[test]]
+name = "upload_pack_loose_blob_memory"
+path = "tests/upload_pack_loose_blob_memory.rs"
+required-features = ["full-tests"]
+
+[[test]]
+name = "checkout_wide_tree_rss"
+path = "tests/checkout_wide_tree_rss.rs"
 required-features = ["full-tests"]
 
 [[bench]]

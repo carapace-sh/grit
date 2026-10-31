@@ -3,7 +3,7 @@
 #![allow(clippy::unwrap_used)]
 
 use grit_lib::objects::{ObjectId, ObjectKind};
-use grit_lib::porcelain::commit::{create_commit, CommitRequest};
+use grit_lib::porcelain::commit::create_commit;
 use grit_lib::porcelain::tag::{create_tag, CreateTagRequest};
 use grit_lib::progress::NullProgress;
 use grit_lib::refs::listing::query_listings_on_store;
@@ -87,18 +87,7 @@ fn references_query_peels_annotated_tags() {
     let ident = "T <t@example.com> 1700000000 +0000".to_owned();
     let commit = create_commit(
         &repo,
-        &CommitRequest {
-            message: "c".into(),
-            author: Some(ident.parse().expect("signature")),
-            committer: Some(ident.parse().expect("signature")),
-            allow_empty: true,
-            sign_override: None,
-            amend: false,
-            assume_worktree_synced: false,
-            skip_pre_commit_tree_match: false,
-            staged_change_count: None,
-            ..Default::default()
-        },
+        &grit_test_support::empty_commit_request("c", &ident),
         &mut NullProgress,
         &grit_lib::progress::NeverCancel,
     )
@@ -179,18 +168,7 @@ fn references_query_lightweight_commit_tag_has_no_peel() {
     let ident = "T <t@example.com> 1700000000 +0000".to_owned();
     let commit = create_commit(
         &repo,
-        &CommitRequest {
-            message: "c".into(),
-            author: Some(ident.parse().expect("signature")),
-            committer: Some(ident.parse().expect("signature")),
-            allow_empty: true,
-            sign_override: None,
-            amend: false,
-            assume_worktree_synced: false,
-            skip_pre_commit_tree_match: false,
-            staged_change_count: None,
-            ..Default::default()
-        },
+        &grit_test_support::empty_commit_request("c", &ident),
         &mut NullProgress,
         &grit_lib::progress::NeverCancel,
     )
@@ -234,18 +212,7 @@ fn overlapping_namespaces_deduplicate_by_full_name() {
     let ident = "T <t@example.com> 1700000000 +0000".to_owned();
     let commit = create_commit(
         &repo,
-        &CommitRequest {
-            message: "c".into(),
-            author: Some(ident.parse().expect("signature")),
-            committer: Some(ident.parse().expect("signature")),
-            allow_empty: true,
-            sign_override: None,
-            amend: false,
-            assume_worktree_synced: false,
-            skip_pre_commit_tree_match: false,
-            staged_change_count: None,
-            ..Default::default()
-        },
+        &grit_test_support::empty_commit_request("c", &ident),
         &mut NullProgress,
         &grit_lib::progress::NeverCancel,
     )
@@ -318,18 +285,7 @@ fn date_sort_keeps_refs_with_missing_objects() {
     let ident = "T <t@example.com> 1700000000 +0000".to_owned();
     let commit = create_commit(
         &repo,
-        &CommitRequest {
-            message: "c".into(),
-            author: Some(ident.parse().expect("signature")),
-            committer: Some(ident.parse().expect("signature")),
-            allow_empty: true,
-            sign_override: None,
-            amend: false,
-            assume_worktree_synced: false,
-            skip_pre_commit_tree_match: false,
-            staged_change_count: None,
-            ..Default::default()
-        },
+        &grit_test_support::empty_commit_request("c", &ident),
         &mut NullProgress,
         &grit_lib::progress::NeverCancel,
     )

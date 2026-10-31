@@ -441,6 +441,20 @@ impl FilesSource {
             PackStore::with_context(self.packs.pack_store().clone(), read)
         }
     }
+
+    /// See [`crate::odb::Odb::read_packed_commit_header_block_into`].
+    pub(crate) fn read_packed_commit_header_block_into(
+        &self,
+        oid: &ObjectId,
+        buf: &mut Vec<u8>,
+    ) -> Result<bool> {
+        let mut read = || pack::read_packed_commit_header_block_into(&self.objects_dir, oid, buf);
+        if PackStore::read_context_matches_objects_dir(&self.objects_dir) {
+            read()
+        } else {
+            PackStore::with_context(self.packs.pack_store().clone(), read)
+        }
+    }
 }
 
 impl ObjectStore for FilesSource {

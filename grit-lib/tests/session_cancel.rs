@@ -33,6 +33,8 @@ const FILES: usize = 300;
 struct CancelAfter {
     phase: Option<ProgressPhase>,
     limit: u64,
+    /// When set, cancel as soon as this phase calls [`ProgressSink::finish`].
+    cancel_when_phase_finishes: Option<ProgressPhase>,
     active: Option<ProgressPhase>,
     seen: u64,
     started: Vec<ProgressPhase>,
@@ -45,6 +47,20 @@ impl CancelAfter {
         Self {
             phase: Some(phase),
             limit,
+            cancel_when_phase_finishes: None,
+            active: None,
+            seen: 0,
+            started: Vec::new(),
+            flag: FlagCancel::new(),
+        }
+    }
+
+    /// Cancel at the first [`ProgressSink::finish`] after this phase ran (after checkout).
+    fn cancel_when_phase_finishes(phase: ProgressPhase) -> Self {
+        Self {
+            phase: None,
+            limit: 0,
+            cancel_when_phase_finishes: Some(phase),
             active: None,
             seen: 0,
             started: Vec::new(),
@@ -56,6 +72,7 @@ impl CancelAfter {
     fn recorder() -> Self {
         Self {
             phase: None,
+            cancel_when_phase_finishes: None,
             ..Self::new(ProgressPhase::StagingFiles, 0)
         }
     }
@@ -88,6 +105,14 @@ impl ProgressSink for CancelAfter {
         }
     }
 
+    fn finish(&mut self) {
+        if self.cancel_when_phase_finishes.is_some()
+            && self.cancel_when_phase_finishes == self.active
+        {
+            self.flag.cancel();
+        }
+    }
+
     fn should_cancel(&self) -> bool {
         self.flag.is_cancelled()
     }
@@ -112,12 +137,7 @@ fn init_repo() -> (tempfile::TempDir, Repository) {
 }
 
 fn commit_req(message: &str) -> CommitRequest {
-    CommitRequest {
-        message: message.to_owned(),
-        author: Some(IDENT.parse().expect("signature")),
-        committer: Some(IDENT.parse().expect("signature")),
-        ..Default::default()
-    }
+    grit_test_support::commit_request(message, IDENT)
 }
 
 fn write_files(root: &Path, dir: &str, contents: &str) {
@@ -569,6 +589,49 @@ fn conflicting_merge_cancel_restores_the_index() {
     assert!(repo.git_dir().join("MERGE_HEAD").exists());
 }
 
+#[test]
+fn conflicting_merge_cancel_after_checkout_rolls_back_worktree() {
+    let (tmp, repo) = init_repo();
+    let root = tmp.path();
+    fs::write(root.join("c.txt"), "base\n").expect("write");
+    let base = commit_all(&repo, "base");
+    fs::write(root.join("c.txt"), "side\n").expect("write");
+    write_files(root, "side", "side");
+    let side = commit_all(&repo, "side");
+    reset_to_commit(
+        &repo,
+        &ResetOptions::new(base, ResetMode::Hard, IDENT.parse().expect("sig"), "reset"),
+        &mut NullProgress,
+        &NeverCancel,
+    )
+    .expect("reset");
+    fs::write(root.join("c.txt"), "main\n").expect("write");
+    let main = commit_all(&repo, "main");
+    let before = index_bytes(&repo);
+
+    let mut sink = CancelAfter::cancel_when_phase_finishes(ProgressPhase::CheckingOutFiles);
+    assert_cancelled(integrate_branch(
+        &repo,
+        "refs/heads/main",
+        main,
+        side,
+        "side",
+        &mut sink,
+        &NeverCancel,
+    ));
+    assert_eq!(branch(&repo, "main"), main);
+    assert_index_untouched(&repo, &before);
+    assert!(!repo.git_dir().join("MERGE_HEAD").exists());
+    assert!(
+        !root.join("side/f0299.txt").exists(),
+        "post-checkout cancel must roll back checked-out files"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("c.txt")).expect("read"),
+        "main\n"
+    );
+}
+
 fn rebase_start(upstream: ObjectId, tip: ObjectId) -> StartRebaseOptions {
     StartRebaseOptions {
         request: RebaseRequest {
@@ -595,6 +658,7 @@ fn rebase_start(upstream: ObjectId, tip: ObjectId) -> StartRebaseOptions {
             record_operation: None,
             hooks: grit_lib::PostOperationHooks::Skip,
         },
+        pre_rebase: grit_lib::revwalk::history::PreRebase::Skip,
     }
 }
 
@@ -770,11 +834,74 @@ fn restore_stops_when_the_sink_asks() {
         remerge: None,
     };
     let mut sink = CancelAfter::new(ProgressPhase::CheckingOutFiles, 5);
+    let before_index = index_bytes(&repo);
     assert_cancelled(restore_paths(&repo, &opts, &mut sink, &NeverCancel));
     let last = fs::read_to_string(tmp.path().join("d/f0299.txt")).expect("read");
-    assert_eq!(last, "changed 299\n", "restore stopped early");
+    assert_eq!(
+        last, "changed 299\n",
+        "cancelled restore must roll back the work tree"
+    );
+    assert_eq!(
+        index_bytes(&repo),
+        before_index,
+        "index must stay unchanged"
+    );
 
     restore_paths(&repo, &opts, &mut NullProgress, &NeverCancel).expect("restore");
     let last = fs::read_to_string(tmp.path().join("d/f0299.txt")).expect("read");
     assert_eq!(last, "base 299\n");
+}
+
+#[test]
+fn restore_source_cancel_restores_directory_replacing_tracked_file() {
+    let (tmp, repo) = init_repo();
+    let wt = tmp.path();
+    let victim = "0000-victim";
+    fs::write(wt.join(victim), "old victim\n").expect("victim");
+    write_files(wt, "bulk", "seed");
+    commit_all(&repo, "old");
+    fs::write(wt.join(victim), "new victim\n").expect("rewrite victim");
+    write_files(wt, "bulk", "changed");
+    commit_all(&repo, "new");
+
+    fs::remove_file(wt.join(victim)).expect("rm victim file");
+    fs::create_dir_all(wt.join(victim)).expect("mkdir victim");
+    fs::write(wt.join(victim).join("sentinel.txt"), "keep me\n").expect("sentinel");
+
+    let old_commit = grit_lib::revwalk::rev_parse::resolve_revision_as_commit_without_index_dwim(
+        &repo, "HEAD~1",
+    )
+    .expect("old commit");
+    let old_obj = repo.odb().read(&old_commit).expect("read commit");
+    let old_tree = grit_lib::objects::parse_commit(&old_obj.data)
+        .expect("parse")
+        .tree;
+
+    let opts = RestoreOptions {
+        pathspecs: vec![".".to_owned()],
+        pathspec_sources: vec![".".to_owned()],
+        source: RestoreSource::Tree(old_tree),
+        staged: false,
+        worktree: true,
+        stage: None,
+        remerge: None,
+    };
+    let before_index = index_bytes(&repo);
+    let mut sink = CancelAfter::new(ProgressPhase::CheckingOutFiles, 1);
+    assert_cancelled(restore_paths(&repo, &opts, &mut sink, &NeverCancel));
+
+    let victim_meta = fs::symlink_metadata(wt.join(victim)).expect("victim metadata");
+    assert!(
+        victim_meta.is_dir() && !victim_meta.file_type().is_symlink(),
+        "victim must remain a directory after cancel"
+    );
+    assert!(
+        wt.join(victim).join("sentinel.txt").is_file(),
+        "untracked sentinel must survive cancel rollback"
+    );
+    assert_index_untouched(&repo, &before_index);
+    assert!(
+        !wt.join(victim).is_file(),
+        "cancel must not leave a regular file at the victim path"
+    );
 }

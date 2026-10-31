@@ -271,14 +271,18 @@ fn reachable_closure(
     let mut queue: VecDeque<ObjectId> = VecDeque::new();
     let oid_len = odb.hash_algo().len();
     let mut blobs: Vec<ObjectId> = Vec::new();
+    let alternates = crate::alternate_boundary::AlternateSources::load(odb)?;
 
     for &root in roots {
-        if seen.insert(root) {
+        if seen.insert(root) && !alternates.contains(&root) {
             queue.push_back(root);
         }
     }
 
     while let Some(oid) = queue.pop_front() {
+        if alternates.contains(&oid) {
+            continue;
+        }
         let obj = odb
             .try_read_once(&oid)?
             .ok_or_else(|| Error::ObjectNotFound(oid.to_hex()))?;
@@ -287,12 +291,12 @@ fn reachable_closure(
                 let commit = parse_commit(&obj.data)?;
                 if !shallow.contains(&oid) {
                     for parent in commit.parents {
-                        if seen.insert(parent) {
+                        if seen.insert(parent) && !alternates.contains(&parent) {
                             queue.push_back(parent);
                         }
                     }
                 }
-                if seen.insert(commit.tree) {
+                if seen.insert(commit.tree) && !alternates.contains(&commit.tree) {
                     queue.push_back(commit.tree);
                 }
             }
@@ -306,6 +310,9 @@ fn reachable_closure(
                     if !seen.insert(entry.oid) {
                         continue;
                     }
+                    if alternates.contains(&entry.oid) {
+                        continue;
+                    }
                     // Classify by file type bits, as Git does, so non-canonical directory
                     // modes from old trees still count as trees.
                     if entry.mode & S_IFMT == S_IFDIR {
@@ -317,7 +324,7 @@ fn reachable_closure(
             }
             ObjectKind::Tag => {
                 let tag = parse_tag(&obj.data)?;
-                if seen.insert(tag.object) {
+                if seen.insert(tag.object) && !alternates.contains(&tag.object) {
                     queue.push_back(tag.object);
                 }
             }
@@ -519,8 +526,8 @@ mod update_refs_tests {
         )
         .expect("init");
         let git_dir = repo.git_dir();
-        let c1 = sample_oid("67bf698f3ab735e92fb011a99cff3497c44d30c1");
-        let c2 = sample_oid("1111111111111111111111111111111111111111");
+        let c1 = refs::test_commit(&git_dir, "c1");
+        let c2 = refs::test_commit(&git_dir, "c2");
         refs::write_ref(&git_dir, "refs/heads/cas", &c2).expect("seed");
 
         let err = update_refs(
@@ -552,8 +559,8 @@ mod update_refs_tests {
         )
         .expect("init");
         let git_dir = repo.git_dir();
-        let c1 = sample_oid("67bf698f3ab735e92fb011a99cff3497c44d30c1");
-        let c2 = sample_oid("1111111111111111111111111111111111111111");
+        let c1 = refs::test_commit(&git_dir, "c1");
+        let c2 = refs::test_commit(&git_dir, "c2");
         crate::refs::write_ref(&git_dir, "refs/heads/locked-cas", &c1).expect("seed");
         crate::refs::write_ref(&git_dir, "refs/heads/locked-cas", &c2).expect("advance");
         let err = update_refs(

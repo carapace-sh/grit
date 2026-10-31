@@ -13,7 +13,7 @@
 //! threads, so the chosen deltas are the same on every machine.
 
 use std::cmp::Ordering as CmpOrdering;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use flate2::Compression;
@@ -36,6 +36,12 @@ const CHUNK_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Fewest candidates in a chunk, so a run of huge objects still shares a window.
 const CHUNK_MIN_OBJECTS: usize = 256;
+
+/// [`CHUNK_MIN_OBJECTS`] for blobs whose path is unknown (name hash 0), as in a
+/// fetch of bare object ids. With no path to group by, neighbours are only alike in
+/// size, so a long run of huge objects gains little from sharing a window and is
+/// better spread over the threads.
+const CHUNK_MIN_UNNAMED_OBJECTS: usize = 64;
 
 /// One object that may become a delta target or base.
 #[derive(Clone, Copy, Debug)]
@@ -123,9 +129,12 @@ fn kind_rank(kind: ObjectKind) -> u8 {
 }
 
 /// Split `sorted` into chunks of about [`CHUNK_BYTES`] of payload (at least
-/// [`CHUNK_MIN_OBJECTS`] candidates), moving each cut forward to the next change
+/// [`CHUNK_MIN_OBJECTS`] candidates, or [`CHUNK_MIN_UNNAMED_OBJECTS`] for blobs whose
+/// path is unknown), moving each cut forward to the next change
 /// of kind or path hash so one file's history is not split, as long as the chunk
-/// stays under twice its target.
+/// stays under twice its target. A zero path hash means the path is unknown (a
+/// fetch of bare object ids, or commits), not that the objects share a path, so a
+/// cut is never moved across a run of them.
 fn chunk_bounds(sorted: &[DeltaCandidate]) -> Vec<(usize, usize)> {
     let n = sorted.len();
     let mut out = Vec::new();
@@ -133,7 +142,13 @@ fn chunk_bounds(sorted: &[DeltaCandidate]) -> Vec<(usize, usize)> {
     while start < n {
         let mut end = start;
         let mut bytes = 0u64;
-        while end < n && (bytes < CHUNK_BYTES || end - start < CHUNK_MIN_OBJECTS) {
+        let min_objects = if sorted[start].kind == ObjectKind::Blob && sorted[start].name_hash == 0
+        {
+            CHUNK_MIN_UNNAMED_OBJECTS
+        } else {
+            CHUNK_MIN_OBJECTS
+        };
+        while end < n && (bytes < CHUNK_BYTES || end - start < min_objects) {
             bytes += sorted[end].size;
             end += 1;
         }
@@ -141,6 +156,7 @@ fn chunk_bounds(sorted: &[DeltaCandidate]) -> Vec<(usize, usize)> {
         while end < n
             && bytes < 2 * soft_bytes
             && sorted[end].kind == sorted[end - 1].kind
+            && sorted[end].name_hash != 0
             && sorted[end].name_hash == sorted[end - 1].name_hash
         {
             bytes += sorted[end].size;
@@ -168,14 +184,18 @@ pub(crate) fn any_pair(_target: &ObjectId, _base: &ObjectId) -> bool {
 /// islands, for example). Bases may come after their targets in any caller order,
 /// so the caller must order its output so bases are written first.
 ///
+/// `stop` is checked before each chunk, by every worker.
+///
 /// # Errors
 ///
-/// Propagates object read failures and zlib errors.
+/// Propagates object read failures and zlib errors, and returns
+/// [`Error::Cancelled`] once `stop` is set.
 pub(crate) fn search_deltas(
     odb: &Odb,
     mut candidates: Vec<DeltaCandidate>,
     params: DeltaSearchParams,
     allowed: PairFilter<'_>,
+    stop: &AtomicBool,
 ) -> Result<Vec<FoundDelta>> {
     if params.window == 0 || params.max_depth == 0 {
         return Ok(Vec::new());
@@ -187,6 +207,7 @@ pub(crate) fn search_deltas(
     if workers == 1 {
         let mut out = Vec::new();
         for &(start, end) in &chunks {
+            crate::progress::poll_watch(stop)?;
             search_chunk(odb, &candidates[start..end], params, allowed, &mut out)?;
         }
         return Ok(out);
@@ -204,9 +225,11 @@ pub(crate) fn search_deltas(
                         return;
                     };
                     let mut found = Vec::new();
-                    let res =
-                        search_chunk(odb, &candidates[start..end], params, allowed, &mut found)
-                            .map(|()| found);
+                    let res = crate::progress::poll_watch(stop)
+                        .and_then(|()| {
+                            search_chunk(odb, &candidates[start..end], params, allowed, &mut found)
+                        })
+                        .map(|()| found);
                     let failed = res.is_err();
                     results
                         .lock()
@@ -492,7 +515,14 @@ mod tests {
             c.in_pack = Some(0);
         }
         candidates[0].base_only = true;
-        let found = search_deltas(repo.odb(), candidates, params(50, 1), &any_pair).unwrap();
+        let found = search_deltas(
+            repo.odb(),
+            candidates,
+            params(50, 1),
+            &any_pair,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
         assert!(found.iter().all(|d| d.target != 0), "{found:?}");
         assert!(
             found.iter().any(|d| d.base == 0),
@@ -527,6 +557,28 @@ mod tests {
     }
 
     #[test]
+    fn chunk_bounds_split_blobs_of_unknown_path() {
+        // A fetch of bare blob ids: no names, the largest first. They are not one
+        // path's history, so no cut moves past them, and runs of big blobs are cut
+        // at the smaller minimum so the threads share the work.
+        let mut v: Vec<DeltaCandidate> = (0..300)
+            .map(|i| cand(i, ObjectKind::Blob, 0, 1024 * 1024))
+            .collect();
+        v.extend((300..1000).map(|i| cand(i, ObjectKind::Blob, 0, 1024)));
+        let bounds = chunk_bounds(&v);
+        assert_eq!(bounds[0], (0, CHUNK_MIN_UNNAMED_OBJECTS));
+        assert!(bounds.len() > 4, "{bounds:?}");
+        assert!(bounds.windows(2).all(|w| w[0].1 == w[1].0));
+        assert_eq!(bounds.last().map(|b| b.1), Some(v.len()));
+
+        // Commits have no path either but keep the usual minimum.
+        let commits: Vec<DeltaCandidate> = (0..300)
+            .map(|i| cand(i, ObjectKind::Commit, 0, 1024 * 1024))
+            .collect();
+        assert_eq!(chunk_bounds(&commits)[0], (0, CHUNK_MIN_OBJECTS));
+    }
+
+    #[test]
     fn chunk_bounds_cap_long_histories_and_keep_a_minimum_size() {
         let v: Vec<DeltaCandidate> = (0..20_000)
             .map(|i| cand(i, ObjectKind::Blob, 1, 1024))
@@ -536,8 +588,9 @@ mod tests {
         assert_eq!(bounds.last().map(|b| b.1), Some(v.len()));
         assert!(bounds.windows(2).all(|w| w[0].1 == w[1].0));
 
+        // Distinct named paths (hash 0 would mean an unknown path).
         let huge: Vec<DeltaCandidate> = (0..600)
-            .map(|i| cand(i, ObjectKind::Blob, i, 64 * 1024 * 1024))
+            .map(|i| cand(i, ObjectKind::Blob, i + 1, 64 * 1024 * 1024))
             .collect();
         assert_eq!(chunk_bounds(&huge)[0], (0, CHUNK_MIN_OBJECTS));
     }
@@ -617,7 +670,14 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let repo = Repository::init(dir.path(), &InitOptions::default()).unwrap();
         let candidates = drifting_versions(&repo, 40);
-        let found = search_deltas(repo.odb(), candidates.clone(), params(3, 1), &any_pair).unwrap();
+        let found = search_deltas(
+            repo.odb(),
+            candidates.clone(),
+            params(3, 1),
+            &any_pair,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
         assert!(found.len() >= 30, "only {} deltas", found.len());
 
         let edges: HashMap<u32, u32> = found.iter().map(|d| (d.target, d.base)).collect();
@@ -654,9 +714,22 @@ mod tests {
             v.sort();
             v
         };
-        let one =
-            key(search_deltas(repo.odb(), candidates.clone(), params(50, 1), &any_pair).unwrap());
-        let four = key(search_deltas(repo.odb(), candidates, params(50, 4), &any_pair).unwrap());
+        let one = key(search_deltas(
+            repo.odb(),
+            candidates.clone(),
+            params(50, 1),
+            &any_pair,
+            &AtomicBool::new(false),
+        )
+        .unwrap());
+        let four = key(search_deltas(
+            repo.odb(),
+            candidates,
+            params(50, 4),
+            &any_pair,
+            &AtomicBool::new(false),
+        )
+        .unwrap());
         assert_eq!(one, four);
     }
 
@@ -672,7 +745,14 @@ mod tests {
         // One object from elsewhere (for example a loose object) may still pair.
         candidates[5].whole_in_pack = None;
         candidates[5].in_pack = None;
-        let found = search_deltas(repo.odb(), candidates, params(50, 1), &any_pair).unwrap();
+        let found = search_deltas(
+            repo.odb(),
+            candidates,
+            params(50, 1),
+            &any_pair,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
         assert!(!found.is_empty());
         assert!(
             found.iter().all(|d| d.target == 5 || d.base == 5),
@@ -687,7 +767,14 @@ mod tests {
         let candidates = drifting_versions(&repo, 20);
         let banned = candidates[0].oid;
         let allowed = |target: &ObjectId, base: &ObjectId| *target != banned && *base != banned;
-        let found = search_deltas(repo.odb(), candidates, params(50, 1), &allowed).unwrap();
+        let found = search_deltas(
+            repo.odb(),
+            candidates,
+            params(50, 1),
+            &allowed,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
         assert!(!found.is_empty());
         assert!(
             found.iter().all(|d| d.target != 0 && d.base != 0),
@@ -703,7 +790,38 @@ mod tests {
         for c in &mut candidates {
             c.dependent_depth = 50;
         }
-        let found = search_deltas(repo.odb(), candidates, params(50, 1), &any_pair).unwrap();
+        let found = search_deltas(
+            repo.odb(),
+            candidates,
+            params(50, 1),
+            &any_pair,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
         assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn a_set_stop_flag_cancels_the_search_on_every_thread_count() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let repo = Repository::init(dir.path(), &InitOptions::default()).unwrap();
+        // Enough candidates at distinct paths for several chunks, so several threads
+        // really run.
+        let mut candidates = drifting_versions(&repo, 3 * CHUNK_MIN_OBJECTS);
+        for (i, c) in candidates.iter_mut().enumerate() {
+            c.name_hash = i as u32;
+        }
+        assert!(chunk_bounds(&candidates).len() > 1);
+        for threads in [1, 4] {
+            let err = search_deltas(
+                repo.odb(),
+                candidates.clone(),
+                params(50, threads),
+                &any_pair,
+                &AtomicBool::new(true),
+            )
+            .unwrap_err();
+            assert!(matches!(err, Error::Cancelled), "{err:?}");
+        }
     }
 }

@@ -29,7 +29,9 @@ Positional arguments are applied **oldest first**. Each argument is either:
 - the worktree is **dirty**, `HEAD` is **detached**, or the branch has **no commits**
 - a commit is a **merge** without `--mainline` (not yet exposed on the CLI)
 
-Resolve conflicts, stage with [`grit add`](../add/), then run `grit pick --continue`. Use `grit pick --skip` to drop the current step, or `grit pick --abort` to restore the branch to its pre-pick tip.
+Resolve conflicts, then either run [`grit commit`](../commit/) (auto-stages the worktree and finishes the step, keeping the picked author) or stage with [`grit add`](../add/) and run `grit pick --continue`. Use `grit pick --skip` to drop the current step, or `grit pick --abort` to cancel. If the branch tip moved because you already committed the resolution, `--abort` clears replay state without moving the branch (Git warns and exits 0 in the same situation).
+
+Pick either completes a step, stops for conflicts or an empty commit, or changes nothing. Pressing Ctrl+C, or sending `SIGTERM` or `SIGHUP` on Unix, while files are being checked out stops the pick with `error: operation cancelled`; `HEAD`, the index and the work tree are left as they were before the pick started (no `CHERRY_PICK_HEAD`), no `.git/index.lock` is left behind, and the same pick can simply be run again. This works the same in a Windows console, where Ctrl+Break counts as Ctrl+C. A second interrupt terminates grit at once, without that cleanup; only `SIGKILL` skips rollback.
 
 ## Options
 
@@ -65,6 +67,13 @@ Pick a range of commits:
 $ grit pick main..feature
 Picked a1b2c3d → d4e5f6a First change
 Picked b2c3d4e → e5f6a7b Second change
+```
+
+While a rebase is paused, `grit pick` refuses (it does not treat conflict markers as a dirty worktree):
+
+```console
+$ grit pick main
+error: cannot pick while a rebase is in progress; finish it with `grit rebase --continue` or cancel it with `grit rebase --abort`
 ```
 
 Conflict, then continue:

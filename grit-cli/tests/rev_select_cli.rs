@@ -179,7 +179,7 @@ fn log_before_cursor_rejected() -> TestResult {
         std::process::id()
     ));
     let _ = fs::remove_dir_all(&dir);
-    seed_linear_repo(&dir, 12);
+    seed_linear_repo(&dir, 22);
     let page1 = grit_json(&dir, &["log"]);
     let cursor = page1["next"].as_str().expect("next").to_owned();
     let out = grit_run(&dir, &["log", &format!("--before={cursor}")]);
@@ -201,7 +201,7 @@ fn log_cursor_pages_through_range() -> TestResult {
     let _ = fs::remove_dir_all(&dir);
     seed_linear_repo(&dir, 3);
     assert!(grit_run(&dir, &["branch", "base"]).status.success());
-    for i in 0..12 {
+    for i in 0..22 {
         fs::write(dir.join("f.txt"), format!("main{i}\n")).expect("write");
         assert!(grit_run(&dir, &["add", "f.txt"]).status.success());
         assert!(grit_run(&dir, &["commit", &format!("m{i}")])
@@ -210,7 +210,7 @@ fn log_cursor_pages_through_range() -> TestResult {
     }
     let git = git_oids(&dir, &["base..HEAD"]);
     let page1 = grit_json(&dir, &["log", "base..HEAD"]);
-    assert_eq!(page1["commits"].as_array().expect("commits").len(), 10);
+    assert_eq!(page1["commits"].as_array().expect("commits").len(), 20);
     let cursor = page1["next"].as_str().expect("next cursor for range walk");
     let page2 = grit_json(&dir, &["log", &format!("--cursor={cursor}")]);
     assert!(page2["next"].is_null());
@@ -232,8 +232,8 @@ fn log_cursor_continues_range_with_cursor_only() -> TestResult {
         std::process::id()
     ));
     let _ = fs::remove_dir_all(&dir);
-    seed_linear_repo(&dir, 13);
-    git_branch(&dir, "base", "HEAD~12");
+    seed_linear_repo(&dir, 23);
+    git_branch(&dir, "base", "HEAD~22");
     let page1 = grit_json(&dir, &["log", "base..HEAD"]);
     let cursor = page1["next"].as_str().expect("next").to_owned();
     let page2 = grit_json(&dir, &["log", &format!("--cursor={cursor}")]);
@@ -251,12 +251,12 @@ fn log_cursor_continues_range_with_cursor_only() -> TestResult {
 #[test]
 fn log_cursor_rejects_revision_selection() -> TestResult {
     let dir = std::env::temp_dir().join(format!(
-        "grit-rev-select-cursor-reject-{}",
+        "grit-rev-select-cursor-reject-revs-{}",
         std::process::id()
     ));
     let _ = fs::remove_dir_all(&dir);
-    seed_linear_repo(&dir, 13);
-    git_branch(&dir, "base", "HEAD~12");
+    seed_linear_repo(&dir, 23);
+    git_branch(&dir, "base", "HEAD~22");
     let page1 = grit_json(&dir, &["log", "base..HEAD"]);
     let cursor = page1["next"].as_str().expect("next").to_owned();
     let out = grit_run(&dir, &["log", &format!("--cursor={cursor}"), "base..HEAD"]);
@@ -276,8 +276,8 @@ fn log_cursor_rejects_date_selectors() -> TestResult {
         std::process::id()
     ));
     let _ = fs::remove_dir_all(&dir);
-    seed_linear_repo(&dir, 13);
-    git_branch(&dir, "base", "HEAD~12");
+    seed_linear_repo(&dir, 23);
+    git_branch(&dir, "base", "HEAD~22");
     let page1 = grit_json(&dir, &["log", "base..HEAD"]);
     let cursor = page1["next"].as_str().expect("next").to_owned();
     for extra in [
@@ -304,7 +304,7 @@ fn log_cursor_rejects_ref_set_selectors() -> TestResult {
         std::process::id()
     ));
     let _ = fs::remove_dir_all(&dir);
-    seed_linear_repo(&dir, 12);
+    seed_linear_repo(&dir, 22);
     let page1 = grit_json(&dir, &["log"]);
     let cursor = page1["next"].as_str().expect("next").to_owned();
     for extra in ["--all", "--branches", "--tags", "--remotes"] {
@@ -316,6 +316,177 @@ fn log_cursor_rejects_ref_set_selectors() -> TestResult {
             "stderr for {extra}: {stderr}"
         );
     }
+    Ok(())
+}
+
+fn git_ok(dir: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_CONFIG_GLOBAL", null_device())
+        .env("GIT_CONFIG_SYSTEM", null_device())
+        .env("GIT_AUTHOR_NAME", "T")
+        .env("GIT_AUTHOR_EMAIL", "t@e.x")
+        .env("GIT_COMMITTER_NAME", "T")
+        .env("GIT_COMMITTER_EMAIL", "t@e.x")
+        .output()
+        .expect("spawn git");
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// Issue #2163: `feat` is rebased onto a new `main` commit and `c3` reworded; `old-feat` is
+/// the reviewed version.
+fn seed_rewritten_branch_repo(dir: &Path) {
+    let _ = fs::remove_dir_all(dir);
+    fs::create_dir_all(dir).expect("mkdir");
+    git_ok(dir, &["init", "-q", "-b", "main", "."]);
+    let commit = |path: &str, content: &str, msg: &str| {
+        fs::write(dir.join(path), content).expect("write");
+        git_ok(dir, &["add", path]);
+        git_ok(dir, &["commit", "-q", "-m", msg]);
+    };
+    commit("f", "0\n", "base");
+    git_ok(dir, &["switch", "-q", "-c", "feat"]);
+    for i in 1..=3 {
+        commit(&format!("f{i}"), &format!("{i}\n"), &format!("c{i}"));
+    }
+    git_ok(dir, &["branch", "old-feat"]);
+    git_ok(dir, &["switch", "-q", "main"]);
+    commit("m", "m\n", "m");
+    git_ok(dir, &["switch", "-q", "feat"]);
+    git_ok(dir, &["rebase", "-q", "main"]);
+    git_ok(dir, &["commit", "-q", "--amend", "-m", "c3 reworded"]);
+    commit("f1", "edited\n", "c4 edits f1");
+}
+
+#[test]
+fn revs_cherry_mark_pairs_rewritten_branch_like_git() -> TestResult {
+    let dir = std::env::temp_dir().join(format!("grit-rev-select-cherry-{}", std::process::id()));
+    seed_rewritten_branch_repo(&dir);
+    let range = "old-feat...feat";
+    let git_lines: Vec<(char, String)> =
+        git_ok(&dir, &["rev-list", "--left-right", "--cherry-mark", range])
+            .lines()
+            .map(|l| (l.chars().next().unwrap(), l[1..].trim().to_owned()))
+            .collect();
+
+    let v = grit_json(&dir, &["revs", "--cherry-mark", range]);
+    let commits = v["commits"].as_array().expect("commits");
+    let grit_lines: Vec<(char, String)> = commits
+        .iter()
+        .map(|c| {
+            let marker = match (c["equivalent"].as_bool(), c["side"].as_str()) {
+                (Some(true), _) => '=',
+                (_, Some("left")) => '<',
+                _ => '>',
+            };
+            (marker, c["oid"].as_str().unwrap().to_owned())
+        })
+        .collect();
+    assert_eq!(grit_lines, git_lines);
+
+    let rev = |spec: &str| git_ok(&dir, &["rev-parse", spec]).trim().to_owned();
+    let by_oid = |oid: &str| commits.iter().find(|c| c["oid"] == oid).expect(oid);
+    let old_c3 = by_oid(&rev("old-feat"));
+    assert_eq!(old_c3["side"], "left");
+    assert_eq!(old_c3["equivalent_to"], rev("feat~1"));
+    assert_eq!(old_c3["message_changed"], true);
+    let new_c1 = by_oid(&rev("feat~3"));
+    assert_eq!(new_c1["side"], "right");
+    assert_eq!(new_c1["equivalent_to"], rev("old-feat~2"));
+    assert_eq!(new_c1["message_changed"], false);
+    let c4 = by_oid(&rev("feat"));
+    assert_eq!(c4["equivalent"], false);
+    assert!(c4.get("equivalent_to").is_none());
+
+    let human = grit_run(&dir, &["revs", "--cherry-mark", range]);
+    assert!(human.status.success());
+    let markers: Vec<char> = String::from_utf8_lossy(&human.stdout)
+        .lines()
+        .map(|l| l.chars().next().unwrap())
+        .collect();
+    assert_eq!(
+        markers,
+        git_lines.iter().map(|(m, _)| *m).collect::<Vec<_>>()
+    );
+
+    let lr = grit_json(&dir, &["revs", "--left-right", "-n", "2", range]);
+    assert_eq!(lr["truncated"], true);
+    assert_eq!(lr["commits"][0]["side"], "left");
+    assert!(lr["commits"][0].get("equivalent").is_none());
+
+    let plain = grit_json(&dir, &["revs", "-n", "1", "feat"]);
+    assert!(
+        plain["commits"][0].get("side").is_none(),
+        "plain rows unchanged"
+    );
+
+    for args in [
+        &["revs", "--cherry-mark", "feat"][..],
+        &["revs", "--left-right", "main..feat"],
+        &["revs", "--cherry-mark", "-n", "0", "feat"],
+        &["revs", "--left-right", "-n", "0", "main..feat"],
+        &["revs", "--count", "--left-right", "-n", "0", "feat"],
+    ] {
+        let out = grit_run(&dir, args);
+        assert_eq!(out.status.code(), Some(1), "{args:?}");
+        assert!(!out.stderr.is_empty(), "{args:?} explains the error");
+    }
+    let empty = grit_json(&dir, &["revs", "--cherry-mark", "-n", "0", range]);
+    assert_eq!(empty["commits"].as_array().map(Vec::len), Some(0));
+    let _ = fs::remove_dir_all(&dir);
+    Ok(())
+}
+
+#[test]
+fn patch_id_expands_ranges_like_git() -> TestResult {
+    let dir = std::env::temp_dir().join(format!("grit-patch-id-range-{}", std::process::id()));
+    seed_rewritten_branch_repo(&dir);
+    let mut want = Vec::new();
+    for commit in git_ok(&dir, &["rev-list", "main..old-feat"]).lines() {
+        let show = git_ok(&dir, &["show", commit]);
+        let mut child = Command::new("git")
+            .args(["patch-id", "--stable"])
+            .current_dir(&dir)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()?;
+        std::io::Write::write_all(&mut child.stdin.take().expect("stdin"), show.as_bytes())?;
+        want.push(
+            String::from_utf8(child.wait_with_output()?.stdout)?
+                .trim()
+                .to_owned(),
+        );
+    }
+    assert_eq!(want.len(), 3);
+
+    let v = grit_json(&dir, &["patch-id", "main..old-feat"]);
+    let got: Vec<String> = v["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .map(|e| {
+            format!(
+                "{} {}",
+                e["patch_id"].as_str().unwrap(),
+                e["commit"].as_str().unwrap()
+            )
+        })
+        .collect();
+    assert_eq!(got, want);
+
+    let human = grit_run(&dir, &["patch-id", "main..old-feat"]);
+    assert!(human.status.success());
+    assert_eq!(
+        String::from_utf8(human.stdout)?.lines().collect::<Vec<_>>(),
+        want
+    );
+    let _ = fs::remove_dir_all(&dir);
     Ok(())
 }
 
@@ -407,7 +578,7 @@ fn log_cursor_rejects_mismatched_revision_selection() -> TestResult {
         std::process::id()
     ));
     let _ = fs::remove_dir_all(&dir);
-    seed_linear_repo(&dir, 12);
+    seed_linear_repo(&dir, 22);
     let page1 = grit_json(&dir, &["log"]);
     let cursor = page1["next"].as_str().expect("next").to_owned();
     let out = grit_run(&dir, &["log", "HEAD~3", &format!("--cursor={cursor}")]);
@@ -427,7 +598,7 @@ fn log_cursor_rejects_incompatible_flags() -> TestResult {
         std::process::id()
     ));
     let _ = fs::remove_dir_all(&dir);
-    seed_linear_repo(&dir, 12);
+    seed_linear_repo(&dir, 22);
     let page1 = grit_json(&dir, &["log"]);
     let cursor = page1["next"].as_str().expect("next").to_owned();
     for extra in [
@@ -457,7 +628,7 @@ fn log_cursor_continuation_hint_is_cursor_only_and_runs() -> TestResult {
     let _ = fs::remove_dir_all(&dir);
     seed_linear_repo(&dir, 3);
     assert!(grit_run(&dir, &["branch", "base"]).status.success());
-    for i in 0..12 {
+    for i in 0..22 {
         fs::write(dir.join("f.txt"), format!("main{i}\n")).expect("write");
         assert!(grit_run(&dir, &["add", "f.txt"]).status.success());
         assert!(grit_run(&dir, &["commit", &format!("m{i}")])
@@ -521,10 +692,10 @@ fn chmod_readonly_recursive(path: &Path) {
 }
 
 #[test]
-fn log_default_human_does_not_write_cursor_snapshots() -> TestResult {
+fn log_piped_human_stores_one_cursor_per_page() -> TestResult {
     let dir = std::env::temp_dir().join(format!("grit-log-cursor-no-write-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
-    seed_linear_repo(&dir, 12);
+    seed_linear_repo(&dir, 22);
     let git_dir = dir.join(".git");
     assert_eq!(log_walk_snapshot_count(&git_dir), 0);
     let out = grit_run(&dir, &["log"]);
@@ -535,16 +706,20 @@ fn log_default_human_does_not_write_cursor_snapshots() -> TestResult {
     );
     assert_eq!(
         log_walk_snapshot_count(&git_dir),
-        0,
-        "plain log must not persist cursor files"
+        1,
+        "the next page's cursor is stored for the hint"
     );
-    let out2 = grit_run(&dir, &["log"]);
-    assert!(out2.status.success());
-    assert_eq!(log_walk_snapshot_count(&git_dir), 0);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("→ more: grit log") && !stdout.contains("--cursor="),
+        stdout.contains("→ more: grit log --cursor=lw1.s."),
         "{stdout}"
+    );
+    let out2 = grit_run(&dir, &["log", "-n", "3"]);
+    assert!(out2.status.success());
+    assert_eq!(
+        log_walk_snapshot_count(&git_dir),
+        1,
+        "a one-shot `-n` stores no cursor"
     );
     Ok(())
 }
@@ -554,13 +729,26 @@ fn log_default_human_does_not_write_cursor_snapshots() -> TestResult {
 fn log_default_human_succeeds_with_read_only_git_dir() -> TestResult {
     let dir = std::env::temp_dir().join(format!("grit-log-readonly-git-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
-    seed_linear_repo(&dir, 12);
+    seed_linear_repo(&dir, 22);
     chmod_readonly_recursive(&dir.join(".git"));
     let out = grit_run(&dir, &["log"]);
     assert!(
         out.status.success(),
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
+    );
+    // The cursor cannot be stored, so the hint carries the long self-contained form.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let token = stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("→ more: grit log --cursor="))
+        .expect("continuation with a cursor");
+    assert!(!token.starts_with("lw1.s."), "long token: {token}");
+    let next = grit_run(&dir, &["log", &format!("--cursor={token}")]);
+    assert!(
+        next.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&next.stderr)
     );
     Ok(())
 }
@@ -570,7 +758,7 @@ fn log_cursor_flag_persists_snapshot_for_hint() -> TestResult {
     let dir =
         std::env::temp_dir().join(format!("grit-log-cursor-hint-write-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
-    seed_linear_repo(&dir, 12);
+    seed_linear_repo(&dir, 22);
     let git_dir = dir.join(".git");
     assert_eq!(log_walk_snapshot_count(&git_dir), 0);
     let out = grit_run(&dir, &["log", "--cursor"]);

@@ -14,20 +14,17 @@
 //!
 //! # What this module owns
 //!
-//! - [`reduce_octopus_merge_heads`] — Git's "reduce parents": drop any merge
-//!   head that is an ancestor of another listed head, preserving input order.
 //! - [`compose_fast_forward_index`] — build the post-fast-forward index from the
 //!   target tree, carrying forward staged additions that the fast-forward does
 //!   not touch.
-//! - [`compose_octopus_final_index`] — fold staged paths from before an octopus
-//!   merge back into the merge result.
 //! - [`tree_to_index_entries`] / [`tree_to_map`] — flatten a tree object into a
 //!   recursive list (or path-keyed map) of [`IndexEntry`] values; the shared
-//!   building block the three transforms above (and most of the CLI merge code)
-//!   are written against.
+//!   building block the transform above (and most of the CLI merge code)
+//!   is written against.
 //! - [`resolve_merge_source`] — turn a merge argument (branch, tag, object id or any
 //!   revision expression) into the commit to merge.
 
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::Path;
@@ -35,20 +32,20 @@ use std::path::Path;
 use crate::change_id::{change_id, ChangeId, ChangeIdPolicy};
 use crate::config::ConfigSet;
 use crate::diagnostics::Warning;
-use crate::diff::diff_trees;
-use crate::error::{Error, Result};
+use crate::error::{Error, OverwriteReason, Result};
 use crate::hooks::{run_post_merge, PostOperationHooks};
 use crate::ident::{parse_signature_times, Signature};
 use crate::ident_resolve::{resolve_loose_committer_identity_with, IdentRole};
 use crate::index::{Index, IndexEntry};
 use crate::merge_base::{
-    is_ancestor, merge_bases_first_vs_rest, walk_commits_reachable_excluding_ancestors_of,
-    ReachableWalkLimit,
+    is_ancestor, merge_bases_all, merge_bases_all_vs_union,
+    walk_commits_reachable_excluding_ancestors_of, ReachableWalkLimit,
 };
 use crate::merge_file::{ConflictStyle, MergeFavor};
 use crate::merge_trees::{
-    apply_tree_merge_output_to_index, materialized_merge_result_tree, merge_trees_three_way,
-    TreeMergeConflictPresentation, TreeMergeOutput, WhitespaceMergeOptions,
+    materialized_merge_result_tree, merge_trees_at_depth, merge_trees_three_way,
+    DirectoryRenameMode, MergeTreeCache, TheirsConflictLabel, TreeMergeConflictPresentation,
+    TreeMergeOutput, WhitespaceMergeOptions,
 };
 use crate::objects::{parse_commit, parse_tree, CommitData, ObjectId, ObjectKind};
 use crate::operation::{conflicts_from_tree_merge, tree_merge_has_conflicts, Conflict};
@@ -58,30 +55,34 @@ use crate::porcelain::checkout;
 use crate::porcelain::commit::{
     normalize_commit_message, stamp_change_id_on_new_commit, write_commit_object,
 };
-use crate::porcelain::index_from_tree::{
-    index_from_tree_with_worktree_stats, refresh_stage0_index_stats_from_worktree,
-};
 use crate::porcelain::restore::conflict_style_from_config;
 use crate::porcelain::switch::{
     checkout_prepared_tree_transition_for_merge, prepare_tree_transition_allow_local,
     verify_tree_transition_allow_local, TreeTransitionPrepareError, TreeTransitionVerifyError,
 };
 use crate::porcelain::tree_merge_checkout::{
-    finalize_clean_tree_merge_index, write_index_after_merge_checkout,
+    apply_conflict_tree_merge_to_worktree, finalize_clean_tree_merge_index,
+    write_index_after_merge_checkout,
 };
 use crate::porcelain::worktree_guard::prepare_tree_checkout;
 use crate::progress::{poll_cancel, Cancel, ProgressSink};
 use crate::refs;
 use crate::refs::store::{Expected, RawRef, RefUpdate, RefUpdateFlags};
+use crate::refs::update_detached_head_for_commit_on_store;
 use crate::repo::Repository;
 use crate::rev_parse_error::RevParseError;
-use crate::state::{clear_merge_state, read_merge_heads, read_merge_msg, read_orig_head};
+use crate::state::{
+    clear_merge_state, read_merge_heads, read_merge_msg, read_orig_head_for_repository,
+    write_orig_head,
+};
 use crate::stripspace::{process as stripspace_process, Mode as StripspaceMode};
 use thiserror::Error;
 
+use crate::hooks::{run_commit_hook, CommitHookEnv, HookName};
 use crate::porcelain::add::stage_for_commit_on_index;
 use crate::porcelain::commit::{
-    create_commit_with_loaded_index, default_commit_scope_from_config, CommitRequest, CommitScope,
+    create_commit_with_loaded_index, default_commit_scope_from_config, run_commit_message_hooks,
+    CommitRequest, CommitScope, HookPolicy, MessageSource,
 };
 use crate::worktree_rules::WorktreeRules;
 use crate::write_tree::write_tree_from_index;
@@ -122,7 +123,7 @@ fn tree_to_index_entries_with_protect(
         let path_bytes = crate::repo_relpath::join_rel(prefix, &te.name);
         validate_tree_walk_entry(prefix, &te.name, te.mode, protect)?;
 
-        if te.mode == 0o040000 {
+        if crate::index::is_tree_mode(te.mode) {
             let sub = tree_to_index_entries_with_protect(repo, &te.oid, &path_bytes, protect)?;
             result.extend(sub);
         } else {
@@ -133,7 +134,7 @@ fn tree_to_index_entries_with_protect(
                 mtime_nsec: 0,
                 dev: 0,
                 ino: 0,
-                mode: te.mode,
+                mode: crate::index::canon_mode(te.mode),
                 uid: 0,
                 gid: 0,
                 size: 0,
@@ -199,56 +200,6 @@ pub fn compose_fast_forward_index(
     Ok(index)
 }
 
-/// Preserve staged paths from before an octopus merge that the merge result does not touch
-/// (e.g. unrelated `git add`), matching Git's index composition.
-pub fn compose_octopus_final_index(pre_merge_index: &Index, final_index: &mut Index) {
-    let final_paths: BTreeSet<Vec<u8>> = final_index
-        .entries
-        .iter()
-        .filter(|e| e.stage() == 0)
-        .map(|e| e.path.clone())
-        .collect();
-    for e in &pre_merge_index.entries {
-        if e.stage() != 0 {
-            continue;
-        }
-        if final_paths.contains(&e.path) {
-            continue;
-        }
-        final_index.push_entry_unsorted(e.clone());
-    }
-    final_index.sort();
-}
-
-/// Drop merge heads that are ancestors of another listed head (Git's "reduce parents").
-///
-/// Order of the remaining heads matches the first occurrence in the input (t7603).
-///
-/// # Errors
-///
-/// Returns an error if a commit-graph walk required for an ancestry test fails.
-pub fn reduce_octopus_merge_heads(
-    repo: &Repository,
-    merge_oids: &[ObjectId],
-    merge_names: &[String],
-) -> Result<(Vec<ObjectId>, Vec<String>)> {
-    debug_assert_eq!(merge_oids.len(), merge_names.len());
-    let mut out_oids = Vec::with_capacity(merge_oids.len());
-    let mut out_names = Vec::with_capacity(merge_names.len());
-    for i in 0..merge_oids.len() {
-        let oid = merge_oids[i];
-        let redundant = merge_oids
-            .iter()
-            .enumerate()
-            .any(|(j, &other)| j != i && is_ancestor(repo, oid, other).unwrap_or(false));
-        if !redundant {
-            out_oids.push(oid);
-            out_names.push(merge_names[i].clone());
-        }
-    }
-    Ok((out_oids, out_names))
-}
-
 /// Fast-forward policy for branch integration.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum FastForwardPolicy {
@@ -290,6 +241,14 @@ pub struct MergeOptions {
     pub allow_unrelated: bool,
     /// Whether to run `post-merge` after a fast-forward, merge commit or squash.
     pub hooks: PostOperationHooks,
+    /// Whether `pre-merge-commit` and `commit-msg` run before a merge commit is recorded
+    /// ([`HookPolicy::SkipVerify`] is `--no-verify`). `prepare-commit-msg` runs either way, and
+    /// `post-merge` follows [`Self::hooks`].
+    pub verify: HookPolicy,
+    /// Whether files the merged branch added inside a directory the current branch renamed
+    /// (or the reverse) follow the rename; when unset, `merge.directoryRenames` decides
+    /// ([`DirectoryRenameMode::from_repo`]).
+    pub directory_renames: Option<DirectoryRenameMode>,
 }
 
 /// Resolve conflict marker style: explicit option, then `merge.conflictStyle`, then `merge`.
@@ -299,6 +258,15 @@ pub fn resolve_merge_conflict_style(
     override_style: Option<ConflictStyle>,
 ) -> ConflictStyle {
     override_style.unwrap_or_else(|| conflict_style_from_config(repo))
+}
+
+/// Directory rename handling: explicit option, then `merge.directoryRenames`, then
+/// [`DirectoryRenameMode::Conflict`].
+fn resolve_directory_renames(
+    repo: &Repository,
+    override_mode: Option<DirectoryRenameMode>,
+) -> Result<DirectoryRenameMode> {
+    override_mode.map_or_else(|| DirectoryRenameMode::from_repo(repo), Ok)
 }
 
 /// Options for [`integrate_branch_with_options`] (pull fast-forward toggle).
@@ -337,6 +305,9 @@ pub struct MergePredictionOptions {
     pub ours_label: String,
     /// Label for the incoming side in conflict-marker metadata (presentation only).
     pub theirs_label: String,
+    /// Whether files one side added inside a directory the other side renamed follow the
+    /// rename; when unset, `merge.directoryRenames` decides ([`DirectoryRenameMode::from_repo`]).
+    pub directory_renames: Option<DirectoryRenameMode>,
 }
 
 impl Default for MergePredictionOptions {
@@ -348,6 +319,7 @@ impl Default for MergePredictionOptions {
             whitespace: WhitespaceMergeOptions::default(),
             ours_label: "HEAD".into(),
             theirs_label: "branch".into(),
+            directory_renames: None,
         }
     }
 }
@@ -383,6 +355,8 @@ pub enum MergePrediction {
 /// Object writes from the merge are routed through the ODB in-memory overlay and
 /// discarded before return, so the on-disk object store is unchanged. That includes the
 /// tree reported by [`MergePrediction::Clean`]; call [`write_merge_tree`] to store it.
+/// With several merge bases the prediction merges them into a virtual base first, exactly
+/// as [`write_merge_tree`] and [`integrate_branch`] do, so they cannot disagree.
 ///
 /// # Errors
 ///
@@ -401,13 +375,12 @@ pub fn predict_merge(
         return Ok(MergePrediction::FastForward);
     }
 
-    let Some(base_oid) = first_merge_base(repo, into_oid, other_oid)? else {
+    let _overlay = MemOverlayGuard::enter(repo.odb());
+    let Some(base) = merge_base_for_commits(repo, into_oid, other_oid, options.whitespace, None)?
+    else {
         return Ok(MergePrediction::Unrelated);
     };
-    let base_tree = repo.odb().commit_tree(&base_oid)?;
-
-    let _overlay = MemOverlayGuard::enter(repo.odb());
-    let merged = merge_commit_trees(repo, base_tree, into_oid, other_oid, options)?;
+    let merged = merge_commit_trees(repo, &base, into_oid, other_oid, options)?;
     if tree_merge_has_conflicts(&merged) {
         return Ok(MergePrediction::Conflicts {
             conflicts: conflicts_from_tree_merge(&merged),
@@ -463,7 +436,9 @@ impl WrittenMergeTree {
 ///
 /// A merge is always computed: [`MergePredictionOptions::allow_fast_forward`] is ignored, and
 /// when one commit contains the other the result is the newer commit's tree. With several merge
-/// bases (criss-cross history) the first one is used, as in [`predict_merge`]. When `options`
+/// bases (criss-cross history) they are merged into one virtual base first, as in
+/// [`predict_merge`] and `git merge-tree`; stage 1 entries then come from that virtual base and
+/// its blobs and trees are stored too. When `options`
 /// allows unrelated histories, a missing merge base is treated as the empty tree. If the
 /// repository handle already has an in-memory write overlay active, the new objects stay in
 /// that outer overlay instead of being written to disk.
@@ -486,9 +461,9 @@ pub fn write_merge_tree(
     other_oid: ObjectId,
     options: &MergePredictionOptions,
 ) -> Result<WrittenMergeTree> {
-    let base_tree = match first_merge_base(repo, into_oid, other_oid)? {
-        Some(base_oid) => repo.odb().commit_tree(&base_oid)?,
-        None if options.allow_unrelated_histories => repo.odb().empty_tree_oid()?,
+    let base = match merge_base_for_commits(repo, into_oid, other_oid, options.whitespace, None)? {
+        Some(base) => base,
+        None if options.allow_unrelated_histories => MergeBase::empty(repo)?,
         None => {
             return Err(Error::UnrelatedHistories {
                 ours: into_oid,
@@ -497,7 +472,7 @@ pub fn write_merge_tree(
         }
     };
 
-    let merged = merge_commit_trees(repo, base_tree, into_oid, other_oid, options)?;
+    let merged = merge_commit_trees(repo, &base, into_oid, other_oid, options)?;
     let tree = materialized_merge_result_tree(repo.odb(), &merged)?;
 
     let stages = merged
@@ -519,21 +494,11 @@ pub fn write_merge_tree(
     })
 }
 
-fn first_merge_base(
-    repo: &Repository,
-    into_oid: ObjectId,
-    other_oid: ObjectId,
-) -> Result<Option<ObjectId>> {
-    Ok(merge_bases_first_vs_rest(repo, into_oid, &[other_oid])?
-        .into_iter()
-        .next())
-}
-
-/// Three-way merge the trees of `into_oid` and `other_oid` over `base_tree`, labelling conflicts
+/// Three-way merge the trees of `into_oid` and `other_oid` over `base`, labelling conflicts
 /// from `options`. New objects go wherever the ODB currently writes (disk, or an active overlay).
 fn merge_commit_trees(
     repo: &Repository,
-    base_tree: ObjectId,
+    base: &MergeBase,
     into_oid: ObjectId,
     other_oid: ObjectId,
     options: &MergePredictionOptions,
@@ -543,19 +508,21 @@ fn merge_commit_trees(
     let presentation = TreeMergeConflictPresentation {
         label_ours: &options.ours_label,
         label_theirs: crate::merge_trees::TheirsConflictLabel::Fixed(&options.theirs_label),
+        label_base: &base.label,
         df_directory_ours_commit: Some(into_oid),
         df_directory_theirs_commit: Some(other_oid),
         ..TreeMergeConflictPresentation::default()
     };
     merge_trees_three_way(
         repo,
-        base_tree,
+        base.tree,
         into_tree,
         other_tree,
         options.favor,
         options.whitespace,
         None,
         presentation,
+        resolve_directory_renames(repo, options.directory_renames)?,
     )
 }
 
@@ -622,6 +589,7 @@ pub fn plan_branch_merge(
         favor: options.favor,
         whitespace: WhitespaceMergeOptions::default(),
         theirs_label: label.to_owned(),
+        directory_renames: options.directory_renames,
         ..MergePredictionOptions::default()
     };
     match predict_merge(repo, into_oid, other_oid, &prediction_opts)? {
@@ -691,7 +659,7 @@ pub fn resolve_merge_source(repo: &Repository, spec: &str) -> Result<MergeSource
     ]
     .into_iter()
     .find_map(|(prefix, kind)| {
-        refs::resolve_ref(repo.git_dir(), &format!("{prefix}{spec}"))
+        refs::resolve_ref_in(repo, &format!("{prefix}{spec}"))
             .ok()
             .map(|oid| (oid, kind))
     });
@@ -762,6 +730,111 @@ impl Drop for MemOverlayGuard<'_> {
     }
 }
 
+/// The tree a merge of two commits uses as its base, and the name conflict markers give it.
+pub(crate) struct MergeBase {
+    /// Base tree: the merge base's tree, or a virtual tree when there are several merge bases.
+    pub(crate) tree: ObjectId,
+    /// Ancestor label: the abbreviated merge base, `merged common ancestors` or `empty tree`.
+    pub(crate) label: Cow<'static, str>,
+}
+
+impl MergeBase {
+    /// The empty tree, used when histories are unrelated.
+    fn empty(repo: &Repository) -> Result<Self> {
+        Ok(Self {
+            tree: empty_tree_oid(repo)?,
+            label: Cow::Borrowed("empty tree"),
+        })
+    }
+}
+
+/// Base for merging the commits `ours` and `theirs`, or `None` when they share no history.
+///
+/// One merge base is used as is. Several (criss-cross history) are merged into one virtual
+/// base the way Git's recursive strategies do, so the outcome does not depend on which of the
+/// equally good bases is listed first: the bases are taken oldest first (the reverse of
+/// [`merge_bases_all`]), and each next base is merged into the running result with the merge
+/// bases of the two as its own (recursively virtual) base. Inner merges never apply the
+/// caller's ours/theirs preference; their content conflicts stay in the virtual tree as
+/// markers labelled `Temporary merge branch 1` / `Temporary merge branch 2`, in `style`
+/// (read from config when `None`). Blobs and trees of the virtual base are written to the
+/// object database like any merge result.
+pub(crate) fn merge_base_for_commits(
+    repo: &Repository,
+    ours: ObjectId,
+    theirs: ObjectId,
+    ws: WhitespaceMergeOptions,
+    style: Option<ConflictStyle>,
+) -> Result<Option<MergeBase>> {
+    let mut bases = merge_bases_all(repo, &[ours, theirs])?;
+    match bases.as_slice() {
+        [] => return Ok(None),
+        [single] => return single_merge_base(repo, *single).map(Some),
+        _ => {}
+    }
+    bases.reverse();
+    let style = style.unwrap_or_else(|| conflict_style_from_config(repo));
+    merge_bases_into_one(repo, &bases, 1, ws, style).map(Some)
+}
+
+fn single_merge_base(repo: &Repository, base: ObjectId) -> Result<MergeBase> {
+    Ok(MergeBase {
+        tree: repo.odb().commit_tree(&base)?,
+        label: Cow::Owned(crate::commit_pretty::abbrev_hex(&base, 7)),
+    })
+}
+
+/// Fold `bases` (oldest first) into one base tree; the merges run at `call_depth`.
+fn merge_bases_into_one(
+    repo: &Repository,
+    bases: &[ObjectId],
+    call_depth: usize,
+    ws: WhitespaceMergeOptions,
+    style: ConflictStyle,
+) -> Result<MergeBase> {
+    let Some((&first, rest)) = bases.split_first() else {
+        return MergeBase::empty(repo);
+    };
+    if rest.is_empty() {
+        return single_merge_base(repo, first);
+    }
+    let mut tree = repo.odb().commit_tree(&first)?;
+    // The virtual commit's history is the union of the histories of every base folded so far.
+    let mut folded = vec![first];
+    for &next in rest {
+        let mut inner_bases = merge_bases_all_vs_union(repo, next, &folded)?;
+        inner_bases.reverse();
+        let inner_base = merge_bases_into_one(repo, &inner_bases, call_depth + 1, ws, style)?;
+        let presentation = TreeMergeConflictPresentation {
+            label_ours: "Temporary merge branch 1",
+            label_theirs: TheirsConflictLabel::Fixed("Temporary merge branch 2"),
+            label_base: &inner_base.label,
+            style,
+            ..TreeMergeConflictPresentation::default()
+        };
+        let merged = merge_trees_at_depth(
+            repo,
+            &mut MergeTreeCache::default(),
+            inner_base.tree,
+            tree,
+            repo.odb().commit_tree(&next)?,
+            MergeFavor::None,
+            ws,
+            None,
+            presentation,
+            DirectoryRenameMode::Off,
+            call_depth,
+            None,
+        )?;
+        tree = materialized_merge_result_tree(repo.odb(), &merged)?;
+        folded.push(next);
+    }
+    Ok(MergeBase {
+        tree,
+        label: Cow::Borrowed("merged common ancestors"),
+    })
+}
+
 impl From<IntegrateBranchOptions> for MergeOptions {
     fn from(options: IntegrateBranchOptions) -> Self {
         Self {
@@ -809,9 +882,22 @@ pub enum IntegrateBranchOutcome {
 
 /// Integrate `other_oid` into the branch `into_ref` (currently at `into_oid`).
 ///
+/// `into_ref` is the branch being merged into: either a full ref name (for example
+/// `refs/heads/main`) or a short local branch name (for example `main` or
+/// `feature/nested`, stored as `refs/heads/{into_ref}`). Short names that do not resolve
+/// return [`Error::BranchNotFound`].
+///
+/// `label` names the other side in merge messages and reflogs: the default merge commit
+/// subject is `Merge {label}` (see [`MergeOptions::message`]), and branch reflog lines
+/// use `merge {label}` or `merge {label}: fast-forward` on fast-forward.
+///
 /// On success without conflicts, updates the branch ref, index, and worktree. On
 /// conflicts, records `MERGE_HEAD` / `ORIG_HEAD` / `MERGE_MSG`, writes conflict
 /// markers and a partially merged index, and leaves the branch ref unchanged.
+///
+/// When the commits have several merge bases (criss-cross history), the bases are first
+/// merged into one virtual base, like Git's recursive strategies; stage 1 of a conflicted
+/// path then holds the virtual base's version.
 ///
 /// The work-tree update reports [`crate::progress::ProgressPhase::CheckingOutFiles`] to
 /// `progress`. `cancel` (or [`ProgressSink::should_cancel`]) is checked before the work tree is
@@ -820,9 +906,13 @@ pub enum IntegrateBranchOutcome {
 ///
 /// # Errors
 ///
-/// Propagates merge, checkout, ref, and I/O failures. Returns [`Error::Message`] when
-/// the histories are unrelated, the worktree is not clean, or `into_ref` no longer points
-/// at `into_oid` (checked before the worktree is touched, and again when the ref moves).
+/// Propagates merge, checkout, ref, and I/O failures. Returns [`Error::WouldOverwrite`]
+/// when local or untracked paths would be overwritten by the merge tree, and
+/// [`Error::DirtyWorktree`] when the worktree is not clean but no specific paths were
+/// collected. Returns [`Error::Message`] when the histories are unrelated. Returns
+/// [`Error::RefStore`] with [`crate::refs::store::RefStoreError::ExpectedMismatch`] when
+/// the canonical branch ref no longer points at `into_oid` (checked before the worktree
+/// is touched, and again when the ref moves).
 /// Returns [`Error::Cancelled`] when cancelled; the branch, `HEAD`, the index and the merge
 /// state are unchanged, and a cancel during the checkout rolls the work tree back.
 pub fn integrate_branch(
@@ -848,6 +938,16 @@ pub fn integrate_branch(
 
 /// Integrate `other_oid` into the branch at `into_ref` with explicit merge options.
 ///
+/// `into_ref` accepts a full ref name or a short local branch name; see [`integrate_branch`].
+/// `label` is used for merge messages and reflogs as documented on [`integrate_branch`].
+///
+/// Before a clean merge records its commit, runs `pre-merge-commit`, then
+/// `prepare-commit-msg .git/MERGE_MSG merge` and `commit-msg .git/MERGE_MSG` with `MERGE_HEAD`
+/// recorded, as Git does ([`MergeOptions::verify`] skips `pre-merge-commit` and `commit-msg`).
+/// A message hook may rewrite the message, and `pre-merge-commit` may stage changes that the
+/// commit then includes. None of these run for a fast-forward, a squash, conflicts or
+/// [`MergeCommitMode::NoCommit`].
+///
 /// After a fast-forward or merge commit, runs `post-merge 0`; after a squash, `post-merge 1`
 /// (unless [`MergeOptions::hooks`] is [`PostOperationHooks::Skip`]). Like Git, the hook does not
 /// run when the branch is already up to date, when the merge stops on conflicts, or for
@@ -856,7 +956,10 @@ pub fn integrate_branch(
 /// # Errors
 ///
 /// Same as [`integrate_branch`], plus [`Error::NotFastForward`] when
-/// [`FastForwardPolicy::Only`] cannot fast-forward.
+/// [`FastForwardPolicy::Only`] cannot fast-forward, and [`Error::Hook`] when
+/// `pre-merge-commit`, `prepare-commit-msg` or `commit-msg` refuses. A refused merge leaves the
+/// merged index and work tree with `MERGE_HEAD`, `ORIG_HEAD` and `MERGE_MSG` recorded and the
+/// branch unchanged: finish it with a commit ([`continue_merge`]) or [`abort_branch_merge`].
 #[allow(clippy::too_many_arguments)]
 pub fn integrate_branch_with(
     repo: &Repository,
@@ -884,6 +987,101 @@ pub fn integrate_branch_with(
             | IntegrateBranchOutcome::Stopped => {}
         }
     }
+    // Like Git, `post-merge` still sees the merge state the message hooks saw.
+    if matches!(outcome, IntegrateBranchOutcome::Merged { .. }) {
+        clear_merge_state(repo.git_dir())?;
+    }
+    Ok(outcome)
+}
+
+/// Map `into_ref` to the ref updated by integrate: full `refs/…` names are kept;
+/// otherwise treat as a short local branch under `refs/heads/`.
+fn canonical_integrate_into_ref(repo: &Repository, into_ref: &str) -> Result<String> {
+    if into_ref.starts_with("refs/") {
+        return Ok(into_ref.to_owned());
+    }
+    let canonical = format!("refs/heads/{into_ref}");
+    if repo.refs().resolve(&canonical).is_err() {
+        return Err(Error::BranchNotFound {
+            branch: into_ref.to_owned(),
+        });
+    }
+    Ok(canonical)
+}
+
+/// Where a merge updates the repository tip after a fast-forward or merge commit.
+enum IntegrateTarget {
+    Branch(String),
+    DetachedHead,
+}
+
+/// Integrate `other_oid` into detached `HEAD` (currently at `into_oid`).
+///
+/// Same outcomes, options, hooks, and conflict handling as [`integrate_branch`], but only
+/// `HEAD` moves on success; no branch ref is updated.
+///
+/// # Errors
+///
+/// Same as [`integrate_branch_with`], except branch-not-found and symbolic-HEAD cases do
+/// not apply when `into_oid` matches detached `HEAD`.
+pub fn integrate_detached_head(
+    repo: &Repository,
+    into_oid: ObjectId,
+    other_oid: ObjectId,
+    label: &str,
+    progress: &mut dyn ProgressSink,
+    cancel: &dyn Cancel,
+) -> Result<IntegrateBranchOutcome> {
+    integrate_detached_head_with(
+        repo,
+        into_oid,
+        other_oid,
+        label,
+        &MergeOptions::default(),
+        progress,
+        cancel,
+    )
+}
+
+/// Integrate `other_oid` into detached `HEAD` at `into_oid` with explicit merge options.
+///
+/// See [`integrate_detached_head`] and [`integrate_branch_with`].
+#[allow(clippy::too_many_arguments)]
+pub fn integrate_detached_head_with(
+    repo: &Repository,
+    into_oid: ObjectId,
+    other_oid: ObjectId,
+    label: &str,
+    options: &MergeOptions,
+    progress: &mut dyn ProgressSink,
+    cancel: &dyn Cancel,
+) -> Result<IntegrateBranchOutcome> {
+    let outcome = integrate_at_tip_without_hooks(
+        repo,
+        IntegrateTarget::DetachedHead,
+        into_oid,
+        other_oid,
+        label,
+        options,
+        progress,
+        cancel,
+    )?;
+    if options.hooks.enabled() {
+        match outcome {
+            IntegrateBranchOutcome::FastForward { .. } | IntegrateBranchOutcome::Merged { .. } => {
+                run_post_merge(repo, false);
+            }
+            IntegrateBranchOutcome::Squashed => {
+                run_post_merge(repo, true);
+            }
+            IntegrateBranchOutcome::UpToDate
+            | IntegrateBranchOutcome::Conflicts { .. }
+            | IntegrateBranchOutcome::Stopped => {}
+        }
+    }
+    if matches!(outcome, IntegrateBranchOutcome::Merged { .. }) {
+        clear_merge_state(repo.git_dir())?;
+    }
     Ok(outcome)
 }
 
@@ -898,11 +1096,42 @@ fn integrate_branch_without_hooks(
     progress: &mut dyn ProgressSink,
     cancel: &dyn Cancel,
 ) -> Result<IntegrateBranchOutcome> {
+    let into_ref = canonical_integrate_into_ref(repo, into_ref)?;
+    integrate_at_tip_without_hooks(
+        repo,
+        IntegrateTarget::Branch(into_ref),
+        into_oid,
+        other_oid,
+        label,
+        options,
+        progress,
+        cancel,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn integrate_at_tip_without_hooks(
+    repo: &Repository,
+    target: IntegrateTarget,
+    into_oid: ObjectId,
+    other_oid: ObjectId,
+    label: &str,
+    options: &MergeOptions,
+    progress: &mut dyn ProgressSink,
+    cancel: &dyn Cancel,
+) -> Result<IntegrateBranchOutcome> {
     if into_oid == other_oid || is_ancestor(repo, other_oid, into_oid)? {
+        write_orig_head(repo, into_oid)?;
         return Ok(IntegrateBranchOutcome::UpToDate);
     }
-    ensure_branch_tip(repo, into_ref, Some(into_oid))?;
+    match &target {
+        IntegrateTarget::Branch(into_ref) => ensure_branch_tip(repo, into_ref, Some(into_oid))?,
+        IntegrateTarget::DetachedHead => ensure_detached_head_tip(repo, into_oid)?,
+    };
     poll_cancel(progress, cancel)?;
+    // Like Git, every merge attempt past this point records where it started, including a
+    // refused fast-forward-only merge and one that stops on conflicts.
+    write_orig_head(repo, into_oid)?;
 
     let into_tree = repo.odb().commit_tree(&into_oid)?;
     let other_tree = repo.odb().commit_tree(&other_oid)?;
@@ -925,9 +1154,9 @@ fn integrate_branch_without_hooks(
         }
 
         merge_checkout_tree_transition(repo, Some(&into_tree), &other_tree, progress, cancel)?;
-        move_branch(
+        advance_integrate_tip(
             repo,
-            into_ref,
+            &target,
             into_oid,
             other_oid,
             &format!("merge {label}: fast-forward"),
@@ -938,26 +1167,21 @@ fn integrate_branch_without_hooks(
         });
     }
 
-    let merge_base = merge_bases_first_vs_rest(repo, into_oid, &[other_oid])?;
-    let label_base = if let Some(base_oid) = merge_base.first().copied() {
-        crate::commit_pretty::abbrev_hex(&base_oid, 7)
-    } else if options.allow_unrelated {
-        "empty tree".to_owned()
-    } else {
-        return Err(Error::Message(format!(
-            "'{label}' has no common history with the current branch"
-        )));
-    };
-    let base_tree = if let Some(base_oid) = merge_base.into_iter().next() {
-        repo.odb().commit_tree(&base_oid)?
-    } else {
-        empty_tree_oid(repo)?
+    let style = resolve_merge_conflict_style(repo, options.conflict_style);
+    let ws = WhitespaceMergeOptions::default();
+    let base = match merge_base_for_commits(repo, into_oid, other_oid, ws, Some(style))? {
+        Some(base) => base,
+        None if options.allow_unrelated => MergeBase::empty(repo)?,
+        None => {
+            return Err(Error::Message(format!(
+                "'{label}' has no common history with the current branch"
+            )));
+        }
     };
 
-    let style = resolve_merge_conflict_style(repo, options.conflict_style);
     let presentation = TreeMergeConflictPresentation {
         label_theirs: crate::merge_trees::TheirsConflictLabel::Fixed(label),
-        label_base: &label_base,
+        label_base: &base.label,
         df_directory_ours_commit: Some(into_oid),
         df_directory_theirs_commit: Some(other_oid),
         style,
@@ -965,13 +1189,14 @@ fn integrate_branch_without_hooks(
     };
     let merged = merge_trees_three_way(
         repo,
-        base_tree,
+        base.tree,
         into_tree,
         other_tree,
         options.favor,
-        WhitespaceMergeOptions::default(),
+        ws,
         None,
         presentation,
+        resolve_directory_renames(repo, options.directory_renames)?,
     )?;
     poll_cancel(progress, cancel)?;
 
@@ -980,14 +1205,13 @@ fn integrate_branch_without_hooks(
         let paths: Vec<String> = details.iter().map(|c| c.path.clone()).collect();
         let materialized = materialized_merge_result_tree(repo.odb(), &merged)?;
         ensure_merge_tree_transition_allowed(repo, Some(&into_tree), &materialized)?;
-        apply_conflict_merge_worktree(repo, &into_tree, &merged, progress, cancel)?;
+        apply_conflict_merge_worktree(repo, &into_tree, &merged, &materialized, progress, cancel)?;
         let merge_msg = merge_message_text(label, options.message.as_deref());
         if matches!(options.commit, MergeCommitMode::Squash) {
             write_squash_msg_file(repo, into_oid, other_oid)?;
-            write_orig_head(repo.git_dir(), into_oid)?;
             write_squash_conflict_merge_msg(repo.git_dir(), &paths, options.message.as_deref())?;
         } else {
-            record_merge_in_progress(repo.git_dir(), into_oid, other_oid, merge_msg)?;
+            record_merge_in_progress(repo.git_dir(), other_oid, merge_msg)?;
         }
         return Ok(IntegrateBranchOutcome::Conflicts { paths, details });
     }
@@ -1023,7 +1247,6 @@ fn integrate_branch_without_hooks(
         MergeCommitMode::NoCommit => {
             record_merge_in_progress(
                 repo.git_dir(),
-                into_oid,
                 other_oid,
                 merge_message_text(label, options.message.as_deref()),
             )?;
@@ -1034,25 +1257,39 @@ fn integrate_branch_without_hooks(
             Ok(IntegrateBranchOutcome::Stopped)
         }
         MergeCommitMode::Commit => {
+            drop(lock);
             let preflight = commit_preflight
                 .ok_or_else(|| Error::Message("merge commit preflight missing".into()))?;
             let config = preflight.config;
+            let (tree, message) = run_merge_commit_hooks(
+                repo,
+                options.verify,
+                other_oid,
+                merged.result_tree,
+                merge_message_text(label, options.message.as_deref()),
+            )?;
             let mut commit = CommitData {
-                tree: merged.result_tree,
+                tree,
                 parents: vec![into_oid, other_oid],
                 author: preflight.author,
                 committer: preflight.committer,
                 author_raw: Vec::new(),
                 committer_raw: Vec::new(),
                 encoding: None,
-                message: merge_message_text(label, options.message.as_deref()),
+                message,
                 raw_message: None,
                 extra_headers: Vec::new(),
             };
             let policy = ChangeIdPolicy::from_config(config.as_ref());
-            stamp_change_id_on_new_commit(repo, &policy, &mut commit)?;
-            let oid = write_commit_object(repo, &commit, None)?;
-            move_branch(repo, into_ref, into_oid, oid, &format!("merge {label}"))?;
+            let oid = stamp_change_id_on_new_commit(repo, &policy, &mut commit)
+                .and_then(|()| write_commit_object(repo, &commit, None))
+                .and_then(|oid| {
+                    advance_integrate_tip(repo, &target, into_oid, oid, &format!("merge {label}"))
+                        .map(|()| oid)
+                })
+                .inspect_err(|_| {
+                    let _ = clear_merge_state(repo.git_dir());
+                })?;
             Ok(IntegrateBranchOutcome::Merged {
                 oid,
                 change_id: change_id(&commit),
@@ -1062,6 +1299,8 @@ fn integrate_branch_without_hooks(
 }
 
 /// Like [`integrate_branch`], with explicit fast-forward policy for [`pull`](crate::porcelain::pull).
+///
+/// `into_ref` and `label` follow [`integrate_branch`].
 ///
 /// # Errors
 ///
@@ -1325,6 +1564,7 @@ pub fn continue_merge(
     let message = resolve_continue_merge_message(repo.git_dir(), options.message.as_deref())?;
     let req = CommitRequest {
         message,
+        message_from_merge: options.message.is_none(),
         author: options.author.clone(),
         committer: options.committer.clone(),
         allow_empty: false,
@@ -1414,52 +1654,237 @@ fn resolved_not_staged_paths(repo: &Repository, index: &Index, unmerged: &[Strin
     resolved
 }
 
-/// Abort an in-progress merge, restoring index and worktree to [`read_orig_head`].
+/// Abort an in-progress merge, restoring index and worktree to
+/// [`read_orig_head_for_repository`].
+///
+/// A merge autostash recorded in `MERGE_AUTOSTASH` (left by a pull whose merge commit a hook
+/// refused) is applied again afterwards, as `git merge --abort` does.
 ///
 /// # Errors
 ///
-/// Returns [`Error::Message`] when no merge is in progress, or propagates checkout and I/O errors.
+/// Returns [`Error::NoMergeInProgress`] when no merge is in progress, or propagates checkout and
+/// I/O errors.
 pub fn abort_branch_merge(repo: &Repository) -> Result<()> {
     let git_dir = repo.git_dir();
     let in_merge = !read_merge_heads(git_dir)?.is_empty();
     let squash_conflict =
         git_dir.join("SQUASH_MSG").is_file() && git_dir.join("MERGE_MSG").is_file();
     if !in_merge && !squash_conflict {
-        return Err(Error::Message(
-            "there is no merge in progress — nothing to abort".into(),
-        ));
+        return Err(Error::NoMergeInProgress);
     }
     restore_pre_merge_state(repo)
 }
 
+fn merge_abort_unmerged_paths(index: &Index) -> HashSet<Vec<u8>> {
+    index
+        .entries()
+        .iter()
+        .filter(|entry| entry.stage() != 0)
+        .map(|entry| entry.path.clone())
+        .collect()
+}
+
+/// Stage-0 rows for merge abort checkout diffing: omit paths that still have unmerged stages.
+fn merge_abort_index_for_diff(index: &Index) -> Index {
+    let unmerged = merge_abort_unmerged_paths(index);
+    let mut diff_index = Index {
+        version: index.version,
+        hash_algo: index.hash_algo,
+        source_mtime: index.source_mtime,
+        ..Index::new()
+    };
+    for entry in index.entries() {
+        if entry.stage() != 0 || unmerged.contains(&entry.path) {
+            continue;
+        }
+        diff_index.push_entry_unsorted(entry.clone());
+    }
+    diff_index.sort();
+    diff_index
+}
+
+fn merge_abort_changed_paths(changes: &[crate::diff::DiffEntry]) -> HashSet<Vec<u8>> {
+    changes
+        .iter()
+        .filter_map(|change| {
+            change
+                .new_path
+                .as_deref()
+                .or(change.old_path.as_deref())
+                .map(|path| crate::repo_relpath::storage_bytes(path).into_owned())
+        })
+        .collect()
+}
+
+fn merge_abort_finalize_index_stats(
+    repo: &Repository,
+    old_index: &Index,
+    changes: &[crate::diff::DiffEntry],
+) -> Result<()> {
+    let Some(work_tree) = repo.work_tree() else {
+        return Ok(());
+    };
+    let changed = merge_abort_changed_paths(changes);
+    let mut index = repo.index_handle().load()?;
+    crate::porcelain::index_from_tree::reseed_stage0_stat_data_excluding_paths(
+        &mut index, old_index, &changed,
+    );
+    let unset_paths: Vec<String> = index
+        .entries()
+        .iter()
+        .filter(|entry| {
+            entry.stage() == 0 && entry.stat_cache_unset() && !changed.contains(&entry.path)
+        })
+        .filter_map(|entry| std::str::from_utf8(&entry.path).ok().map(str::to_owned))
+        .collect();
+    if !unset_paths.is_empty() {
+        let unset: BTreeSet<&str> = unset_paths.iter().map(String::as_str).collect();
+        crate::porcelain::index_from_tree::refresh_stage0_index_stats_for_paths(
+            repo, work_tree, &mut index, &unset,
+        )?;
+    }
+    repo.index_handle().write(&mut index)?;
+    Ok(())
+}
+
+fn merge_abort_append_unmerged_tree_checkouts(
+    odb: &crate::odb::Odb,
+    head_tree: &ObjectId,
+    unmerged: &HashSet<Vec<u8>>,
+    changes: &mut Vec<crate::diff::DiffEntry>,
+) -> Result<()> {
+    use crate::diff::{zero_oid, DiffEntry, DiffStatus};
+    use crate::objects::FileMode;
+    let mut seen: HashSet<String> = changes
+        .iter()
+        .filter_map(|change| change.new_path.clone())
+        .collect();
+    for path in unmerged {
+        let Some(entry) = odb.tree_entry_at_path(head_tree, path)? else {
+            continue;
+        };
+        let path_str = crate::repo_relpath::storage_string(path);
+        if !seen.insert(path_str.clone()) {
+            continue;
+        }
+        changes.push(DiffEntry {
+            status: DiffStatus::Modified,
+            old_path: Some(path_str.clone()),
+            new_path: Some(path_str),
+            old_mode: FileMode::new(entry.mode),
+            new_mode: FileMode::new(entry.mode),
+            old_oid: zero_oid(),
+            new_oid: entry.oid,
+            score: None,
+        });
+    }
+    Ok(())
+}
+
 fn restore_pre_merge_state(repo: &Repository) -> Result<()> {
-    let orig = read_orig_head(repo.git_dir())?
+    let orig = read_orig_head_for_repository(repo)?
         .ok_or_else(|| Error::Message("merge in progress but ORIG_HEAD is missing".into()))?;
     let head_tree = repo.odb().commit_tree(&orig)?;
 
     let old_index = repo.load_index()?;
-    let from_tree = write_tree_from_index(repo.odb(), &old_index, "")?;
-    let mut clean_index = index_from_tree_with_worktree_stats(repo, &head_tree)?;
-    repo.write_index(&mut clean_index)?;
-    let changes = diff_trees(repo.odb(), Some(&from_tree), Some(&head_tree), "")?;
-    checkout::checkout_tree_changes(repo, &changes)?;
+    // Paths only introduced by the conflicted merge (absent from the pre-merge tree) must be
+    // removed after the hard reset realigns tracked paths to `head_tree`.
+    let mut conflict_only: Vec<Vec<u8>> = old_index
+        .entries()
+        .iter()
+        .filter(|e| {
+            e.stage() != 0
+                && repo
+                    .odb()
+                    .tree_entry_at_path(&head_tree, &e.path)
+                    .ok()
+                    .flatten()
+                    .is_none()
+        })
+        .map(|e| e.path.clone())
+        .collect();
+    conflict_only.sort();
+    conflict_only.dedup();
+
+    let unmerged = merge_abort_unmerged_paths(&old_index);
+    let diff_source = merge_abort_index_for_diff(&old_index);
+    let mut changes =
+        checkout::checkout_diff_align_index_to_tree(repo.odb(), &diff_source, &head_tree)?;
+    merge_abort_append_unmerged_tree_checkouts(repo.odb(), &head_tree, &unmerged, &mut changes)?;
+    let mut index = crate::porcelain::index_from_tree::index_from_tree_with_seeded_stats(
+        repo, &head_tree, &old_index,
+    )?;
+    crate::porcelain::index_from_tree::prepare_index_for_tree_transition(
+        repo, &head_tree, &mut index,
+    )?;
+    let mut lock = repo.lock_index()?;
+    checkout::checkout_tree_changes_with_index_opts(
+        repo,
+        &changes,
+        &mut index,
+        &mut crate::progress::NullProgress,
+        &crate::progress::NeverCancel,
+        checkout::CheckoutApplyOptions {
+            parallel_prepare_blobs: false,
+            checkout_parallel_threshold: None,
+            checkout_result_tree: Some(head_tree),
+            ..checkout::CheckoutApplyOptions::default()
+        },
+        None,
+        checkout::CheckoutIndexWrite::Commit(&mut lock),
+    )?;
+    merge_abort_finalize_index_stats(repo, &old_index, &changes)?;
+    if let Some(work_tree) = repo.work_tree() {
+        let mut remove_paths = conflict_only;
+        for entry in old_index.entries() {
+            if entry.stage() != 0 {
+                continue;
+            }
+            if repo
+                .odb()
+                .tree_entry_at_path(&head_tree, &entry.path)
+                .ok()
+                .flatten()
+                .is_some()
+            {
+                continue;
+            }
+            remove_paths.push(entry.path.clone());
+        }
+        remove_paths.sort();
+        remove_paths.dedup();
+        for path in remove_paths {
+            let abs = crate::index::worktree_path_from_index_rel(work_tree, &path);
+            if abs.symlink_metadata().is_ok_and(|meta| !meta.is_dir()) {
+                fs::remove_file(&abs)?;
+                checkout::remove_empty_parent_dirs(work_tree, &abs);
+            }
+        }
+    }
+    let autostash = fs::read_to_string(repo.git_dir().join("MERGE_AUTOSTASH")).ok();
     clear_merge_state(repo.git_dir())?;
+    if let Some(oid) = autostash
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        crate::porcelain::stash::restore_operation_autostash(repo, &ObjectId::from_hex(oid)?)?;
+    }
     Ok(())
 }
 
 fn merge_overwrite_error_message(paths: &[String]) -> Error {
     if paths.is_empty() {
         Error::dirty_worktree(crate::error::WorktreeOperation::Merge, Vec::new())
-    } else if paths.len() == 1 {
-        Error::Message(format!(
-            "local changes to '{}' would be overwritten by merge",
-            paths[0]
-        ))
     } else {
-        Error::Message(format!(
-            "local changes would be overwritten by merge:\n  {}",
-            paths.join("\n  ")
-        ))
+        let mut paths = paths.to_vec();
+        paths.sort();
+        paths.dedup();
+        Error::WouldOverwrite {
+            reason: OverwriteReason::LocalChanges,
+            paths,
+            message: "local changes would be overwritten by merge".into(),
+        }
     }
 }
 
@@ -1522,88 +1947,90 @@ pub(crate) fn apply_conflict_merge_worktree(
     repo: &Repository,
     head_tree: &ObjectId,
     merged: &TreeMergeOutput,
+    materialized: &ObjectId,
     progress: &mut dyn ProgressSink,
     cancel: &dyn Cancel,
 ) -> Result<()> {
-    let work_tree = repo
-        .work_tree()
-        .ok_or_else(|| Error::PathError("cannot update a bare repository's working tree".into()))?;
-    let materialized = materialized_merge_result_tree(repo.odb(), merged)?;
-    let prepared =
-        prepare_tree_transition_allow_local(repo, Some(head_tree), &materialized, &HashSet::new())
-            .map_err(map_tree_transition_prepare_error_for_merge)?;
-    let preserve_worktree_paths = prepared.preserve_worktree_paths().clone();
-    let conflict_paths = conflict_path_set(merged);
-    let mut index = repo.load_index()?;
-    apply_tree_merge_output_to_index(&mut index, merged);
-    if index.has_unmerged_entries() {
-        index.clear_cache_tree();
-    }
-    poll_cancel(progress, cancel)?;
-    let index_path = repo.index_path();
-    let previous_index = fs::read(&index_path).ok();
-    repo.write_index(&mut index)?;
-
-    let stage0_tree = write_tree_from_index(repo.odb(), &index, "")?;
-    let changes = diff_trees(repo.odb(), Some(head_tree), Some(&stage0_tree), "")?;
-    let filtered: Vec<_> = changes
-        .into_iter()
-        .filter(|change| {
-            let path = change
-                .new_path
-                .as_deref()
-                .or(change.old_path.as_deref())
-                .unwrap_or("");
-            !conflict_paths.contains(path.as_bytes()) && !preserve_worktree_paths.contains(path)
-        })
-        .collect();
-    if let Err(err) = checkout::checkout_tree_changes_reporting(repo, &filtered, progress, cancel) {
-        if matches!(err, Error::Cancelled) {
-            match &previous_index {
-                Some(bytes) => fs::write(&index_path, bytes)?,
-                None => fs::remove_file(&index_path)?,
-            }
-        }
-        return Err(err);
-    }
-
-    let rules = WorktreeRules::from_repository(repo, &index)?;
-    for (path, oid) in &merged.conflict_content {
-        let mode = index
-            .get(path, 2)
-            .or_else(|| index.get(path, 3))
-            .map(|e| e.mode)
-            .unwrap_or(0o100644);
-        let rel = String::from_utf8_lossy(path);
-        checkout::write_smudged_blob_to_worktree(repo, work_tree, &rules, rel.as_ref(), oid, mode)?;
-    }
-    refresh_stage0_index_stats_from_worktree(repo, work_tree, &mut index)?;
-    repo.write_index(&mut index)?;
-    Ok(())
-}
-
-fn write_orig_head(git_dir: &Path, into_oid: ObjectId) -> Result<()> {
-    fs::write(
-        git_dir.join("ORIG_HEAD"),
-        format!("{}\n", into_oid.to_hex()),
+    apply_conflict_tree_merge_to_worktree(
+        repo,
+        head_tree,
+        merged,
+        materialized,
+        &conflict_path_set(merged),
+        progress,
+        cancel,
     )
-    .map_err(Error::Io)
 }
 
-fn record_merge_in_progress(
-    git_dir: &Path,
-    into_oid: ObjectId,
-    other_oid: ObjectId,
-    merge_msg: String,
-) -> Result<()> {
+fn record_merge_in_progress(git_dir: &Path, other_oid: ObjectId, merge_msg: String) -> Result<()> {
     fs::write(
         git_dir.join("MERGE_HEAD"),
         format!("{}\n", other_oid.to_hex()),
     )
     .map_err(Error::Io)?;
-    write_orig_head(git_dir, into_oid)?;
     fs::write(git_dir.join("MERGE_MSG"), merge_msg).map_err(Error::Io)?;
     Ok(())
+}
+
+/// Run the hooks Git runs before a clean merge records its commit, after the merged index and
+/// work tree are written: `pre-merge-commit` (unless `verify` skips it), then, with the merge
+/// state recorded, `prepare-commit-msg <MERGE_MSG> merge` and `commit-msg <MERGE_MSG>` (unless
+/// `verify` skips it).
+///
+/// Returns the tree to commit, rebuilt from the index when `pre-merge-commit` ran (it may have
+/// staged changes), and the message, read back from `MERGE_MSG` when a message hook ran.
+///
+/// # Errors
+///
+/// [`Error::Hook`] when a hook refuses or cannot start, [`Error::IndexUnmerged`] when
+/// `pre-merge-commit` left conflict stages, and I/O errors. On any error the merge state
+/// (`MERGE_HEAD`, `ORIG_HEAD`, `MERGE_MSG` with `message`) is left recorded and the branch is
+/// unchanged, so the merge can be finished with a commit or abandoned with an abort.
+fn run_merge_commit_hooks(
+    repo: &Repository,
+    verify: HookPolicy,
+    other_oid: ObjectId,
+    tree: ObjectId,
+    message: String,
+) -> Result<(ObjectId, String)> {
+    let git_dir = repo.git_dir();
+    let index_path = repo.index_path();
+    let env = CommitHookEnv {
+        index_file: Some(&index_path),
+        git_editor: Some(":"),
+        git_prefix: None,
+        extra_env: &[],
+    };
+    let run = || -> Result<(ObjectId, String)> {
+        let mut tree = tree;
+        if verify != HookPolicy::SkipVerify {
+            let name = HookName::PreMergeCommit.as_str();
+            if run_commit_hook(repo, name, &[], None, &env)?.check(name)? {
+                let index = repo.load_index()?;
+                if index.has_unmerged_entries() {
+                    return Err(Error::IndexUnmerged);
+                }
+                tree = write_tree_from_index(repo.odb(), &index, "")?;
+            }
+        }
+        record_merge_in_progress(git_dir, other_oid, message.clone())?;
+        let edited = run_commit_message_hooks(
+            repo,
+            &git_dir.join("MERGE_MSG"),
+            MessageSource::Merge,
+            verify,
+            &env,
+            &mut Vec::new(),
+        )?;
+        Ok((tree, edited.unwrap_or_else(|| message.clone())))
+    };
+    match run() {
+        Ok(result) => Ok(result),
+        Err(err) => {
+            record_merge_in_progress(git_dir, other_oid, message)?;
+            Err(err)
+        }
+    }
 }
 
 fn strict_commit_identity(repo: &Repository, role: IdentRole) -> Result<String> {
@@ -1618,6 +2045,47 @@ fn move_branch(
     reason: &str,
 ) -> Result<()> {
     update_checked_out_branch(repo, refname, Some(old), new, reason)
+}
+
+fn advance_integrate_tip(
+    repo: &Repository,
+    target: &IntegrateTarget,
+    old: ObjectId,
+    new: ObjectId,
+    reason: &str,
+) -> Result<()> {
+    match target {
+        IntegrateTarget::Branch(refname) => move_branch(repo, refname, old, new, reason),
+        IntegrateTarget::DetachedHead => move_detached_head(repo, old, new, reason),
+    }
+}
+
+fn move_detached_head(repo: &Repository, old: ObjectId, new: ObjectId, reason: &str) -> Result<()> {
+    let config = repo.config()?;
+    let identity =
+        resolve_loose_committer_identity_with(repo.environment(), &config, repo.identity_now());
+    update_detached_head_for_commit_on_store(
+        repo.refs(),
+        Some(old),
+        new,
+        &identity,
+        reason,
+        config.as_ref(),
+    )
+}
+
+/// Refuse to merge when detached `HEAD` no longer points at `expected`.
+fn ensure_detached_head_tip(repo: &Repository, expected: ObjectId) -> Result<()> {
+    let current = match repo.refs().read_raw("HEAD")? {
+        Some(RawRef::Direct(oid)) => Some(oid),
+        Some(RawRef::Symbolic(_)) => {
+            return Err(Error::Message(
+                "HEAD points at a branch; use integrate_branch".into(),
+            ));
+        }
+        None => None,
+    };
+    refs::verify_branch_commit_cas(Some(expected), current, "HEAD")
 }
 
 /// Refuse to touch the work tree when `branch_ref` no longer points at `expected` (`None`:
@@ -1714,36 +2182,6 @@ mod integrate_tests {
         };
         entry.set_stage(stage);
         entry
-    }
-
-    #[cfg_attr(
-        not(feature = "full-tests"),
-        ignore = "starts system git or is heavy; run with --features full-tests"
-    )]
-    #[test]
-    fn reduce_octopus_merge_heads_drops_ancestor() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        grit_test_support::git(tmp.path(), &["init", "-q"]);
-        let repo =
-            Repository::discover(Some(tmp.path()), &RepositoryOptions::empty()).expect("repo");
-        std::fs::write(tmp.path().join("f.txt"), "a\n").expect("write");
-        grit_test_support::git(tmp.path(), &["add", "f.txt"]);
-        grit_test_support::git(tmp.path(), &["commit", "-m", "a"]);
-        let a: ObjectId = grit_test_support::git(tmp.path(), &["rev-parse", "HEAD"])
-            .trim()
-            .parse()
-            .expect("a");
-        std::fs::write(tmp.path().join("f.txt"), "b\n").expect("write");
-        grit_test_support::git(tmp.path(), &["add", "f.txt"]);
-        grit_test_support::git(tmp.path(), &["commit", "-m", "b"]);
-        let b: ObjectId = grit_test_support::git(tmp.path(), &["rev-parse", "HEAD"])
-            .trim()
-            .parse()
-            .expect("b");
-        let (oids, names) =
-            reduce_octopus_merge_heads(&repo, &[a, b], &["a".into(), "b".into()]).expect("reduce");
-        assert_eq!(oids, vec![b]);
-        assert_eq!(names, vec!["b".to_owned()]);
     }
 
     #[cfg_attr(
@@ -1917,17 +2355,6 @@ mod integrate_tests {
         assert!(matches!(ff, IntegrateBranchOutcome::FastForward { .. }));
     }
 
-    #[test]
-    fn compose_octopus_final_index_carries_staged_paths() {
-        let mut pre = Index::new();
-        pre.add_or_replace(index_entry("staged.txt", 0));
-        let mut final_index = Index::new();
-        final_index.add_or_replace(index_entry("merged.txt", 0));
-        compose_octopus_final_index(&pre, &mut final_index);
-        assert!(final_index.get(b"staged.txt", 0).is_some());
-        assert!(final_index.get(b"merged.txt", 0).is_some());
-    }
-
     #[cfg_attr(
         not(feature = "full-tests"),
         ignore = "starts system git or is heavy; run with --features full-tests"
@@ -1963,6 +2390,7 @@ mod integrate_tests {
             result_tree: crate::diff::zero_oid(),
             touched_paths: HashSet::new(),
             rename_conflicts: Vec::new(),
+            directory_rename_conflicts: Vec::new(),
         };
         let paths: Vec<String> = conflicts_from_tree_merge(&merged)
             .into_iter()
@@ -2022,6 +2450,202 @@ mod integrate_tests {
             .expect("tip");
         assert_eq!(tip, oid);
         grit_test_support::git(tmp.path(), &["fsck", "--strict"]);
+    }
+
+    #[cfg_attr(
+        not(feature = "full-tests"),
+        ignore = "starts system git or is heavy; run with --features full-tests"
+    )]
+    #[test]
+    fn integrate_branch_accepts_short_into_ref() {
+        use crate::error::Error;
+        use crate::refs::store::RefStoreError;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        grit_test_support::git(tmp.path(), &["init", "-q", "-b", "main"]);
+        grit_test_support::git(tmp.path(), &["config", "user.name", "Test"]);
+        grit_test_support::git(tmp.path(), &["config", "user.email", "t@example.com"]);
+        let repo =
+            Repository::discover(Some(tmp.path()), &RepositoryOptions::empty()).expect("repo");
+        std::fs::write(tmp.path().join("a.txt"), "base\n").expect("write");
+        grit_test_support::git(tmp.path(), &["add", "a.txt"]);
+        grit_test_support::git(tmp.path(), &["commit", "-m", "base"]);
+        grit_test_support::git(tmp.path(), &["switch", "-c", "other"]);
+        std::fs::write(tmp.path().join("o.txt"), "other\n").expect("write");
+        grit_test_support::git(tmp.path(), &["add", "o.txt"]);
+        grit_test_support::git(tmp.path(), &["commit", "-m", "other"]);
+        let other: ObjectId = grit_test_support::git(tmp.path(), &["rev-parse", "other"])
+            .trim()
+            .parse()
+            .expect("other");
+        grit_test_support::git(tmp.path(), &["checkout", "main"]);
+        std::fs::write(tmp.path().join("m.txt"), "main\n").expect("write");
+        grit_test_support::git(tmp.path(), &["add", "m.txt"]);
+        grit_test_support::git(tmp.path(), &["commit", "-m", "main"]);
+        let main: ObjectId = grit_test_support::git(tmp.path(), &["rev-parse", "HEAD"])
+            .trim()
+            .parse()
+            .expect("main");
+
+        let outcome = integrate_branch(
+            &repo,
+            "main",
+            main,
+            other,
+            "other",
+            &mut crate::progress::NullProgress,
+            &crate::progress::NeverCancel,
+        )
+        .expect("short into_ref");
+        let IntegrateBranchOutcome::Merged { oid, .. } = outcome else {
+            panic!("expected merge");
+        };
+        let commit = repo.odb().read_commit(&oid).expect("merge commit");
+        assert_eq!(commit.message, "Merge other\n");
+        let tip_short: ObjectId =
+            grit_test_support::git(tmp.path(), &["rev-parse", "refs/heads/main"])
+                .trim()
+                .parse()
+                .expect("main tip");
+        assert_eq!(tip_short, oid);
+
+        let tmp_full = tempfile::tempdir().expect("tempdir");
+        grit_test_support::git(tmp_full.path(), &["init", "-q", "-b", "main"]);
+        grit_test_support::git(tmp_full.path(), &["config", "user.name", "Test"]);
+        grit_test_support::git(tmp_full.path(), &["config", "user.email", "t@example.com"]);
+        let repo_full =
+            Repository::discover(Some(tmp_full.path()), &RepositoryOptions::empty()).expect("repo");
+        std::fs::write(tmp_full.path().join("a.txt"), "base\n").expect("write");
+        grit_test_support::git(tmp_full.path(), &["add", "a.txt"]);
+        grit_test_support::git(tmp_full.path(), &["commit", "-m", "base"]);
+        grit_test_support::git(tmp_full.path(), &["switch", "-c", "other"]);
+        std::fs::write(tmp_full.path().join("o.txt"), "other\n").expect("write");
+        grit_test_support::git(tmp_full.path(), &["add", "o.txt"]);
+        grit_test_support::git(tmp_full.path(), &["commit", "-m", "other"]);
+        let other_full: ObjectId = grit_test_support::git(tmp_full.path(), &["rev-parse", "other"])
+            .trim()
+            .parse()
+            .expect("other");
+        grit_test_support::git(tmp_full.path(), &["checkout", "main"]);
+        std::fs::write(tmp_full.path().join("m.txt"), "main\n").expect("write");
+        grit_test_support::git(tmp_full.path(), &["add", "m.txt"]);
+        grit_test_support::git(tmp_full.path(), &["commit", "-m", "main"]);
+        let main_full: ObjectId = grit_test_support::git(tmp_full.path(), &["rev-parse", "HEAD"])
+            .trim()
+            .parse()
+            .expect("main");
+        let outcome_full = integrate_branch(
+            &repo_full,
+            "refs/heads/main",
+            main_full,
+            other_full,
+            "other",
+            &mut crate::progress::NullProgress,
+            &crate::progress::NeverCancel,
+        )
+        .expect("full into_ref");
+        assert!(matches!(
+            outcome_full,
+            IntegrateBranchOutcome::Merged { .. }
+        ));
+        let IntegrateBranchOutcome::Merged { oid: oid_full, .. } = outcome_full else {
+            unreachable!();
+        };
+        let commit_full = repo_full
+            .odb()
+            .read_commit(&oid_full)
+            .expect("merge commit");
+        assert_eq!(commit_full.message, "Merge other\n");
+
+        grit_test_support::git(tmp.path(), &["switch", "-c", "feature/foo"]);
+        std::fs::write(tmp.path().join("nested.txt"), "feature\n").expect("write");
+        grit_test_support::git(tmp.path(), &["add", "nested.txt"]);
+        grit_test_support::git(tmp.path(), &["commit", "-m", "feature"]);
+        let feature_tip: ObjectId = grit_test_support::git(tmp.path(), &["rev-parse", "HEAD"])
+            .trim()
+            .parse()
+            .expect("feature");
+        grit_test_support::git(tmp.path(), &["checkout", "main"]);
+        std::fs::write(tmp.path().join("main2.txt"), "main2\n").expect("write");
+        grit_test_support::git(tmp.path(), &["add", "main2.txt"]);
+        grit_test_support::git(tmp.path(), &["commit", "-m", "main2"]);
+        let main2: ObjectId = grit_test_support::git(tmp.path(), &["rev-parse", "HEAD"])
+            .trim()
+            .parse()
+            .expect("main2");
+        let merged = integrate_branch(
+            &repo,
+            "feature/foo",
+            feature_tip,
+            main2,
+            "main",
+            &mut crate::progress::NullProgress,
+            &crate::progress::NeverCancel,
+        )
+        .expect("nested short name");
+        let IntegrateBranchOutcome::Merged {
+            oid: feature_merge, ..
+        } = merged
+        else {
+            panic!("expected merge into feature/foo");
+        };
+        let stored: ObjectId =
+            grit_test_support::git(tmp.path(), &["rev-parse", "refs/heads/feature/foo"])
+                .trim()
+                .parse()
+                .expect("feature/foo tip");
+        assert_eq!(stored, feature_merge);
+        assert!(repo.refs().resolve("refs/feature/foo").is_err());
+
+        let tmp_missing = tempfile::tempdir().expect("tempdir");
+        grit_test_support::git(tmp_missing.path(), &["init", "-q", "-b", "main"]);
+        let repo_missing =
+            Repository::discover(Some(tmp_missing.path()), &RepositoryOptions::empty())
+                .expect("repo");
+        std::fs::write(tmp_missing.path().join("f.txt"), "x\n").expect("write");
+        grit_test_support::git(tmp_missing.path(), &["add", "f.txt"]);
+        grit_test_support::git(tmp_missing.path(), &["commit", "-m", "c"]);
+        let head: ObjectId = grit_test_support::git(tmp_missing.path(), &["rev-parse", "HEAD"])
+            .trim()
+            .parse()
+            .expect("head");
+        let err = integrate_branch(
+            &repo_missing,
+            "no-such-branch",
+            head,
+            head,
+            "other",
+            &mut crate::progress::NullProgress,
+            &crate::progress::NeverCancel,
+        )
+        .expect_err("missing branch");
+        assert!(matches!(err, Error::BranchNotFound { branch } if branch == "no-such-branch"));
+        assert!(!tmp_missing.path().join(".git/ORIG_HEAD").exists());
+        let tip: ObjectId = grit_test_support::git(tmp_missing.path(), &["rev-parse", "main"])
+            .trim()
+            .parse()
+            .expect("main tip");
+        assert_eq!(tip, head);
+
+        let stale = main;
+        let err = integrate_branch(
+            &repo,
+            "refs/heads/main",
+            stale,
+            other,
+            "other",
+            &mut crate::progress::NullProgress,
+            &crate::progress::NeverCancel,
+        )
+        .expect_err("stale tip");
+        assert!(
+            matches!(
+                err,
+                Error::RefStore(RefStoreError::ExpectedMismatch { ref name, .. })
+                    if name == "refs/heads/main"
+            ),
+            "unexpected {err:?}"
+        );
     }
 
     #[cfg_attr(

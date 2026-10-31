@@ -243,6 +243,7 @@ fn cancelled_merge_and_rebase_keep_branches_where_git_left_them() {
             record_operation: None,
             hooks: grit_lib::PostOperationHooks::Skip,
         },
+        pre_rebase: grit_lib::revwalk::history::PreRebase::Skip,
     };
     let repo = open_grit_repo(root);
     let mut sink = CancelAfter::new(ProgressPhase::CheckingOutFiles, 5);

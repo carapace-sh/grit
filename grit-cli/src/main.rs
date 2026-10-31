@@ -40,6 +40,7 @@ mod merge_strategy_args;
 mod message_input;
 mod operation_output;
 mod output;
+mod pager;
 mod patch_selection;
 mod pathspec_args;
 mod progress;
@@ -312,6 +313,40 @@ enum GcAction {
         #[arg(long = "older-than", value_name = "DATE")]
         older_than: Option<String>,
         /// Report objects that would be deleted without removing them.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+    },
+    /// Move large blobs to a large-object promisor remote and drop them here.
+    Offload {
+        /// Promisor remote that receives the blobs (`remote.<name>.url`).
+        #[arg(long, value_name = "REMOTE")]
+        to: String,
+        /// Blobs to move: `none` for every blob, or a size such as `1m` (blobs at
+        /// least that big). Defaults to `remote.<REMOTE>.partialCloneFilter`.
+        #[arg(long, value_name = "none|SIZE")]
+        blobs: Option<String>,
+        /// The promisor's git directory, when its URL is not a local path.
+        #[arg(long = "lop-dir", value_name = "PATH")]
+        lop_dir: Option<std::path::PathBuf>,
+        /// Also set `uploadpack.allowFilter` and `uploadpack.allowAnySHA1InWant` in the promisor.
+        #[arg(long = "configure-lop")]
+        configure_lop: bool,
+        /// Report what would move without changing anything.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+    },
+    /// Drop large blobs a promisor remote can supply again and nothing needed recently.
+    #[command(name = "drop-large-blobs")]
+    DropLargeBlobs {
+        /// Drop blobs at least this big, such as `1m` (default:
+        /// `maintenance.drop-large-blobs.minSize`, else the promisor's `blob:limit`, else 1m).
+        #[arg(long = "min-size", value_name = "SIZE")]
+        min_size: Option<String>,
+        /// Keep blobs needed since this date (Git approxidate; `now` keeps none for
+        /// recency). Default: `maintenance.drop-large-blobs.expire`, else `2.weeks.ago`.
+        #[arg(long = "older-than", value_name = "DATE")]
+        older_than: Option<String>,
+        /// List the blobs that would be dropped without changing anything.
         #[arg(long = "dry-run")]
         dry_run: bool,
     },
@@ -771,9 +806,9 @@ enum HooksAction {
 /// Subcommands of `grit auth`.
 #[derive(Debug, Subcommand)]
 enum AuthAction {
-    /// Forget the stored token (sign out) for GitHub, or for a `grit serve` URL.
+    /// Forget the stored token (sign out) for grithub (GitHub inside a github.com repository), or for a `grit serve` URL.
     Logout {
-        /// A `grit serve` host to sign out of instead of GitHub.
+        /// A host to sign out of instead of the default one.
         #[arg(value_name = "URL")]
         url: Option<String>,
         /// Report which stored credential would be removed without erasing it.
@@ -934,6 +969,9 @@ enum Command {
         url: Option<String>,
     },
     /// Copy a remote repository into a new directory.
+    ///
+    /// Submodule gitlinks are checked out as empty directories only; grit does not fetch submodule
+    /// repositories or provide a `submodule` command.
     Clone {
         /// The repository to clone (URL or local path).
         url: String,
@@ -961,9 +999,14 @@ enum Command {
         /// Name for the remote (default `origin`).
         #[arg(short = 'o', long, value_name = "NAME")]
         origin: Option<String>,
-        /// Partial clone: omit blobs (`none`) or blobs at/above a size (`1k`, `512`, …).
-        #[arg(long, value_name = "none|SIZE")]
+        /// Partial clone: omit blobs (`none`), blobs at/above a size (`1k`, `512`, …), or
+        /// what the server's accepted promisor remotes hold (`auto`).
+        #[arg(long, value_name = "none|auto|SIZE")]
         blobs: Option<String>,
+        /// Set a config value in the new repository before fetching (`git clone -c`;
+        /// repeatable). Unlike the global `-c`, it is kept in the clone's config.
+        #[arg(long = "config", value_name = "KEY=VALUE", value_parser = global_args::parse_config_override)]
+        config: Vec<grit_lib::config::environment::ConfigOverride>,
         /// Create a bare repository (`git clone --bare`).
         #[arg(long)]
         bare: bool,
@@ -988,7 +1031,7 @@ enum Command {
         rev: rev_select::RevSelectArgs,
         #[command(flatten)]
         pathspecs: pathspec_args::TrailingPathspecArgs,
-        /// Continue a paged walk (`TOKEN`), or with no value include a short cursor on the `→ more` line.
+        /// Continue a paged walk from the `TOKEN` a previous page printed (an empty value is ignored).
         #[arg(
             long = "cursor",
             value_name = "TOKEN",
@@ -1013,6 +1056,9 @@ enum Command {
         /// Draw a commit graph in human output (implies topological order; Unicode by default).
         #[arg(long)]
         graph: bool,
+        /// Write straight to the terminal instead of through the pager.
+        #[arg(long = "no-pager")]
+        no_pager: bool,
         /// Use ASCII `*|` lane characters in `--graph` output instead of Unicode box-drawing.
         #[arg(long = "graph-ascii")]
         graph_ascii: bool,
@@ -1030,9 +1076,14 @@ enum Command {
         /// Print only the number of reachable commits.
         #[arg(long)]
         count: bool,
-        /// With `--count`, print left/right counts for a symmetric range (`A...B`).
+        /// Mark each commit of a symmetric range (`A...B`) as left or right; with `--count`,
+        /// print left/right counts instead.
         #[arg(long = "left-right")]
         left_right: bool,
+        /// Pair the two sides of a symmetric range (`A...B`) by patch-id and mark
+        /// equivalent commits (implies `--left-right`).
+        #[arg(long = "cherry-mark", conflicts_with = "count")]
+        cherry_mark: bool,
     },
     /// Find merge bases or test whether one commit is an ancestor of another.
     #[command(name = "merge-base")]
@@ -1088,7 +1139,8 @@ enum Command {
         #[arg(value_name = "FILE", last = true, allow_hyphen_values = true)]
         #[arg(add = completer!(Action::files([])))]
         file: Option<String>,
-        /// Blame at this revision instead of `HEAD`.
+        /// Blame the file as committed at this revision. Without a revision the working
+        /// tree file is blamed, with uncommitted lines marked.
         #[arg(long)]
         #[arg(add = completer!(grit::action_revisions()))]
         rev: Option<String>,
@@ -1120,6 +1172,10 @@ enum Command {
         /// Detect lines copied from other files (`git blame -C`; repeat up to three times).
         #[arg(short = 'C', long = "copy-detection", action = clap::ArgAction::Count)]
         copy_detection: u8,
+        /// Blame this file's content (`-` for stdin) instead of the working tree, on top of
+        /// the revision (default `HEAD`); lines not in the revision show as uncommitted.
+        #[arg(long, value_name = "FILE")]
+        contents: Option<String>,
     },
     /// Show changes as a diff. No argument: uncommitted changes; with a commit:
     /// the change that commit introduced; with two commits (or `A..B`) diff their trees.
@@ -1335,10 +1391,11 @@ enum Command {
         #[command(subcommand)]
         action: Option<HooksAction>,
     },
-    /// Print stable patch-IDs for one or more commits.
+    /// Print stable patch-IDs for commits or revision ranges.
     #[command(name = "patch-id")]
     PatchId {
-        /// Commits or revisions to hash (merge commits are skipped).
+        /// Commits or ranges to hash; `A..B` and `A...B` expand to one ID per commit
+        /// (merge commits are skipped).
         #[arg(value_name = "REV")]
         #[arg(add = completer!(grit::action_revision_ranges()))]
         revs: Vec<String>,
@@ -1629,6 +1686,12 @@ enum Command {
         /// Merge histories that share no commits (uses the empty tree as merge base).
         #[arg(long = "allow-unrelated-histories")]
         allow_unrelated_histories: bool,
+        /// Skip the `pre-merge-commit` and `commit-msg` hooks (`prepare-commit-msg` and `post-merge` still run).
+        #[arg(
+            long = "no-verify",
+            conflicts_with_all = ["abort", "continue_merge", "check", "dry_run"]
+        )]
+        no_verify: bool,
         #[command(flatten)]
         strategy: merge_strategy_args::MergeStrategyArgs,
         #[command(flatten)]
@@ -1801,7 +1864,7 @@ enum Command {
         #[arg(short = 'W', long = "worktree")]
         worktree: bool,
         /// Tree or commit to restore from.
-        #[arg(long)]
+        #[arg(short = 's', long = "source")]
         #[arg(add = completer!(grit::action_revisions()))]
         source: Option<String>,
         /// For unmerged paths, write our side (index stage 2) into the worktree.
@@ -2010,6 +2073,13 @@ enum Command {
         delete: bool,
         #[command(flatten)]
         message: message_input::MessageInputArgs,
+        /// Git habit: `-m` / `-F` already write an annotated tag; ignored when a message is set.
+        #[arg(
+            short = 'a',
+            long = "annotate",
+            conflicts_with_all = ["delete", "verify"]
+        )]
+        annotate: bool,
         /// Deprecated alias for `--message-file`.
         #[arg(
             long = "file",
@@ -2092,15 +2162,18 @@ enum Command {
         #[command(subcommand)]
         action: WorktreeAction,
     },
-    /// Sign in to GitHub or a `grit serve` host in the browser, and store a token for push/fetch.
+    /// Sign in to grithub (GitHub inside a github.com repository), a `grit serve` host, or store a username and token for any HTTPS host.
     #[command(args_conflicts_with_subcommands = true, visible_alias = "login")]
     Auth {
-        /// A `grit serve` host (or one of its repository URLs) to sign in to instead of GitHub.
+        /// The host (or one of its repository URLs) to sign in to; without it, grithub.dev, or GitHub when `origin` is on github.com.
         #[arg(value_name = "URL")]
         url: Option<String>,
-        /// Store this access token for a `grit serve` host (from `grit serve token`) instead of signing in in the browser.
-        #[arg(long, value_name = "TOKEN", requires = "url")]
+        /// Store this access token: with `--username`, for any HTTP(S) host; alone, a `grit serve` or grithub token, checked with the server.
+        #[arg(long, value_name = "TOKEN")]
         token: Option<String>,
+        /// Store `--token` for this user name on any HTTP(S) host, without signing in.
+        #[arg(long, value_name = "USER", requires_all = ["url", "token"])]
+        username: Option<String>,
         #[command(subcommand)]
         action: Option<AuthAction>,
     },
@@ -2370,6 +2443,37 @@ fn tag_verify_subarg_takes_value(arg: &str) -> bool {
     matches!(arg, "--filter" | "--threads")
 }
 
+/// Rewrite `log -1` / `log -3` (Git habit) into `-n` / `--limit`.
+fn normalize_log_limit_argv(args: Vec<OsString>) -> Vec<OsString> {
+    let Some(log_idx) = diff_args::subcommand_index(&args).filter(|&i| args[i] == "log") else {
+        return args;
+    };
+    let sub = &args[log_idx + 1..];
+    if sub.iter().any(|a| a == "-n" || a == "--limit") {
+        return args;
+    }
+    let mut out = args[..=log_idx].to_vec();
+    let mut i = log_idx + 1;
+    while i < args.len() {
+        if args[i] == "--" {
+            out.extend_from_slice(&args[i..]);
+            break;
+        }
+        if let Some(t) = args[i].to_str() {
+            if t.len() > 1 && t.starts_with('-') && t[1..].chars().all(|c| c.is_ascii_digit()) {
+                out.push("-n".into());
+                out.push(t[1..].into());
+            } else {
+                out.push(args[i].clone());
+            }
+        } else {
+            out.push(args[i].clone());
+        }
+        i += 1;
+    }
+    out
+}
+
 /// Route verify tag names to `verify_names` by inserting `--` before bare arguments.
 fn normalize_tag_verify_argv(mut args: Vec<OsString>) -> Vec<OsString> {
     let Some(tag_idx) = diff_args::subcommand_index(&args).filter(|&i| args[i] == "tag") else {
@@ -2415,6 +2519,13 @@ fn normalize_tag_verify_argv(mut args: Vec<OsString>) -> Vec<OsString> {
     args
 }
 
+/// [`Cli::try_parse_from`] over [`cli_command::parse_command`]'s tree.
+fn parse_cli(argv: &[OsString]) -> Result<Cli, clap::Error> {
+    use clap::{CommandFactory, FromArgMatches};
+    let mut matches = cli_command::parse_command(argv).try_get_matches_from(argv)?;
+    Cli::from_arg_matches_mut(&mut matches).map_err(|err| err.format(&mut Cli::command()))
+}
+
 fn main() {
     stdio::configure();
     grit_trace::maybe_init_from_env();
@@ -2439,10 +2550,10 @@ fn main() {
 }
 
 fn run() -> Result<ExitStatus, anyhow::Error> {
-    let parse_argv = normalize_tag_verify_argv(diff_args::normalize_diff_argv(
-        std::env::args_os().collect(),
+    let parse_argv = normalize_tag_verify_argv(normalize_log_limit_argv(
+        diff_args::normalize_diff_argv(std::env::args_os().collect()),
     ));
-    let cli = match Cli::try_parse_from(&parse_argv).and_then(|cli| {
+    let cli = match parse_cli(&parse_argv).and_then(|cli| {
         validate_cli(&cli)?;
         Ok(cli)
     }) {
@@ -2531,7 +2642,12 @@ fn run() -> Result<ExitStatus, anyhow::Error> {
         now: context::wall_clock_now(&env),
     };
     let auto_maintenance = cli.command.as_ref().is_some_and(writes_objects);
-    match dispatch(cli, &opts, &render_ctx, &env) {
+    let result = if cli.command.as_ref().is_some_and(talks_to_remotes) {
+        stdio::with_sigpipe_ignored(|| dispatch(cli, &opts, &render_ctx, &env))
+    } else {
+        dispatch(cli, &opts, &render_ctx, &env)
+    };
+    match result {
         Ok(ExitStatus::Success) if auto_maintenance => {
             commands::gc::run_auto_after_command(opts.mode, render_ctx.now);
             Ok(ExitStatus::Success)
@@ -2573,6 +2689,25 @@ fn writes_objects(command: &Command) -> bool {
         }
         _ => false,
     }
+}
+
+/// Commands that may run credential helpers or remote transports. Those children can exit
+/// without reading what grit writes to them, which must fail the write (as in Git) instead
+/// of killing grit with `SIGPIPE`.
+fn talks_to_remotes(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Push { .. }
+            | Command::Fetch { .. }
+            | Command::Pull { .. }
+            | Command::Clone { .. }
+            | Command::Remote { .. }
+            | Command::Auth { .. }
+            | Command::Checkout { .. }
+            | Command::Checkin { .. }
+            | Command::Integrate { .. }
+            | Command::Slice { .. }
+    )
 }
 
 fn history_action_shared(action: &HistoryAction) -> &commands::history::HistoryRewriteArgs {
@@ -2697,6 +2832,15 @@ fn reject_non_human_plumbing(cli: &Cli, opts: &OutputOptions) -> Result<()> {
         _ => return Ok(()),
     };
     bail!("`grit {name}` does not support --json or --markdown");
+}
+
+/// Whether `err` comes from writing to a reader that has gone away (a quit pager).
+fn is_broken_pipe(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|e| e.kind() == std::io::ErrorKind::BrokenPipe)
+    })
 }
 
 fn emit_success<T: output::HumanRender + output::MarkdownRender + serde::Serialize>(
@@ -2841,6 +2985,7 @@ fn dispatch(
             no_tags,
             origin,
             blobs,
+            config,
             bare,
             no_checkout,
             quiet,
@@ -2863,6 +3008,7 @@ fn dispatch(
                 no_tags,
                 origin,
                 blobs,
+                config,
                 bare,
                 no_checkout,
                 quiet,
@@ -2980,10 +3126,15 @@ fn dispatch(
             graph,
             graph_ascii,
             graph_unicode,
+            no_pager,
         } => {
             if count && group_by.is_none() {
                 bail!("`--count` requires `--group-by`");
             }
+            // A person at a terminal gets the whole history through the pager; scripts, agents
+            // and pipes get pages with a `--cursor` token.
+            let terminal = opts.mode == OutputMode::Human
+                && std::io::IsTerminal::is_terminal(&std::io::stdout());
             let graph = graph || graph_unicode;
             let display = commands::log::LogDisplayOptions {
                 oneline,
@@ -2994,23 +3145,65 @@ fn dispatch(
                 group_count_only: count,
                 graph,
                 graph_ascii: graph_ascii && !graph_unicode,
+                line_counts: terminal,
+                columns: None,
             };
             if format.patch_text && opts.mode != OutputMode::Human {
                 bail!("`--patch-text` cannot be used with --json or --markdown");
             }
-            emit_success(
-                &commands::log::run(rev, pathspecs, cursor, format, display, opts.mode)?,
-                opts,
-                ctx,
-            )
+            if !terminal {
+                let page = commands::log::LogPage::Paged;
+                let outcome =
+                    commands::log::run(rev, pathspecs, cursor, format, display, opts.mode, page)?;
+                return emit_success(&outcome, opts, ctx);
+            }
+            // With no `-n` or `--cursor`, the whole history, walked a batch at a time.
+            let view = if cursor.is_none() && rev.max_count().is_none() {
+                commands::log::TerminalLog::Stream(Box::new(commands::log::LogStream::start(
+                    rev, pathspecs, format, display,
+                )?))
+            } else {
+                let page = commands::log::LogPage::Paged;
+                commands::log::TerminalLog::Listing(Box::new(commands::log::run(
+                    rev, pathspecs, cursor, format, display, opts.mode, page,
+                )?))
+            };
+            // Start the pager only once the first batch is walked, so errors and Ctrl-C during
+            // a slow start behave as usual.
+            let mut pager = if no_pager {
+                None
+            } else {
+                pager::Pager::start(context::discover().ok().as_ref())
+            };
+            let stdout = std::io::stdout();
+            let mut stdout = stdout.lock();
+            let w: &mut dyn std::io::Write = match pager.as_mut() {
+                Some(pager) => pager,
+                None => &mut stdout,
+            };
+            let result = stdio::with_sigpipe_ignored(|| view.render(w, ctx));
+            match result {
+                Err(e) if !is_broken_pipe(&e) => Err(e),
+                _ => Ok(ExitStatus::Success),
+            }
         }
         Command::Revs {
             rev,
             pathspecs,
             count,
             left_right,
+            cherry_mark,
         } => emit_success(
-            &commands::revs::run(rev, pathspecs, count, left_right)?,
+            &commands::revs::run(
+                rev,
+                pathspecs,
+                commands::revs::RevsMode {
+                    count,
+                    left_right,
+                    cherry_mark,
+                },
+                opts.mode,
+            )?,
             opts,
             ctx,
         ),
@@ -3080,6 +3273,7 @@ fn dispatch(
             group,
             ignore_all_space,
             copy_detection,
+            contents,
         } => emit_success(
             &commands::blame::run(
                 rev_pos,
@@ -3092,6 +3286,7 @@ fn dispatch(
                 group,
                 ignore_all_space,
                 copy_detection,
+                contents,
                 ctx.now,
             )?,
             opts,
@@ -3333,6 +3528,36 @@ fn dispatch(
                 }) => {
                     commands::gc::run_prune(older_than.as_deref(), dry_run || sub_dry, quiet, mode)?
                 }
+                Some(GcAction::Offload {
+                    to,
+                    blobs,
+                    lop_dir,
+                    configure_lop,
+                    dry_run: sub_dry,
+                }) => commands::gc::run_offload(
+                    commands::gc::OffloadArgs {
+                        remote: to,
+                        blobs,
+                        lop_dir,
+                        configure_lop,
+                        dry_run: dry_run || sub_dry,
+                    },
+                    quiet,
+                    mode,
+                    ctx.now,
+                )?,
+                Some(GcAction::DropLargeBlobs {
+                    min_size,
+                    older_than,
+                    dry_run: sub_dry,
+                }) => commands::gc::run_drop_large_blobs(
+                    min_size.as_deref(),
+                    older_than.as_deref(),
+                    dry_run || sub_dry,
+                    quiet,
+                    mode,
+                    ctx.now,
+                )?,
             };
             emit_success(&outcome, opts, ctx)
         }
@@ -3435,7 +3660,7 @@ fn dispatch(
             lines,
             paths,
         } => {
-            let message_flag = message_input.message.clone();
+            let message_flag = message_input::joined_message_from_flags(&message_input.message);
             let message_file = message_input.message_file.clone();
             let author_override = author.author.clone();
             let message = commit_message;
@@ -3630,6 +3855,7 @@ fn dispatch(
             limit,
             delete,
             message,
+            annotate,
             legacy_message_file,
             object,
             force,
@@ -3651,7 +3877,7 @@ fn dispatch(
                 None
             };
             let message = message_input::merge_tag_legacy_file(message, legacy_message_file);
-            let message_flag = message.message.clone();
+            let message_flag = message_input::joined_message_from_flags(&message.message);
             let message_file = message.message_file.clone();
             let outcome = commands::tag::run(commands::tag::TagRunOptions {
                 name,
@@ -3660,6 +3886,7 @@ fn dispatch(
                 delete,
                 message: message_flag,
                 message_file,
+                annotate,
                 force,
                 dry_run,
                 sign: sign_override,
@@ -3749,11 +3976,11 @@ fn dispatch(
             create,
             detach,
             dry_run,
-        } => emit_success(
-            &commands::switch::run(branch, start_point, create, detach, dry_run)?,
-            opts,
-            ctx,
-        ),
+        } => {
+            let outcome = commands::switch::run(branch, start_point, create, detach, dry_run)?;
+            commands::clone::emit_path_collision_warning(opts.mode, &outcome.path_collisions);
+            emit_success(&outcome, opts, ctx)
+        }
         Command::Reset {
             rev,
             soft,
@@ -3778,6 +4005,7 @@ fn dispatch(
             no_commit,
             squash,
             allow_unrelated_histories,
+            no_verify,
             strategy,
             message,
         } => {
@@ -3793,6 +4021,7 @@ fn dispatch(
                     no_commit,
                     squash,
                     allow_unrelated_histories,
+                    no_verify,
                     strategy,
                     message,
                 },
@@ -4245,38 +4474,61 @@ fn dispatch(
             // push is still a failure, so mirror Git and exit non-zero.
             Ok(ExitStatus::from_push_rejected(outcome.rejected))
         }
-        Command::Auth { url, token, action } => {
-            match action {
-                None => {
+        Command::Auth {
+            url,
+            token,
+            username,
+            action,
+        } => match action {
+            None => {
+                let outcome = if let (Some(url), Some(token), Some(username)) =
+                    (url.as_deref(), token.as_deref(), username.as_deref())
+                {
+                    commands::auth::store_token(url, username, token)?
+                } else {
                     let server = url
                         .as_deref()
                         .map(commands::auth::grit_server)
                         .transpose()?;
-                    let outcome = match (server.flatten(), token) {
+                    match (server.flatten(), token) {
                         (Some(server), Some(token)) => {
                             commands::auth::run_server_token(&server, &token)?
                         }
                         (Some(server), None) => commands::auth::run_server_login(&server)?,
-                        (None, Some(_)) => {
-                            anyhow::bail!("--token is for `grit serve` hosts; GitHub signs in with the browser")
+                        (None, Some(_)) if url.is_some() => {
+                            anyhow::bail!("--token is for `grit serve` hosts; GitHub signs in with the browser, or store a personal access token with `--username <user> --token <token>`")
                         }
-                        (None, None) => commands::auth::run()?,
-                    };
-                    emit_success(&outcome, opts, ctx)
-                }
-                Some(AuthAction::Logout { url, dry_run }) => {
-                    let server = url
-                        .as_deref()
-                        .map(commands::auth::grit_server)
-                        .transpose()?;
-                    emit_success(
-                        &commands::auth::logout(server.flatten().as_ref(), dry_run)?,
-                        opts,
-                        ctx,
-                    )
-                }
+                        (None, token) => match (commands::auth::default_host()?, token) {
+                            (commands::auth::DefaultHost::Grit(server), Some(token)) => {
+                                commands::auth::run_server_token(&server, &token)?
+                            }
+                            (commands::auth::DefaultHost::Grit(server), None) => {
+                                commands::auth::run_server_login(&server)?
+                            }
+                            (commands::auth::DefaultHost::GitHub, Some(_)) => {
+                                anyhow::bail!("--token is for `grit serve` hosts; GitHub signs in with the browser, or store a personal access token with `--username <user> --token <token>`")
+                            }
+                            (commands::auth::DefaultHost::GitHub, None) => commands::auth::run()?,
+                        },
+                    }
+                };
+                emit_success(&outcome, opts, ctx)
             }
-        }
+            Some(AuthAction::Logout { url, dry_run }) => {
+                let server = match url.as_deref() {
+                    Some(url) => commands::auth::grit_server(url)?,
+                    None => match commands::auth::default_host()? {
+                        commands::auth::DefaultHost::Grit(server) => Some(server),
+                        commands::auth::DefaultHost::GitHub => None,
+                    },
+                };
+                emit_success(
+                    &commands::auth::logout(server.as_ref(), dry_run)?,
+                    opts,
+                    ctx,
+                )
+            }
+        },
         Command::Update => emit_success(&commands::update::run(opts.mode)?, opts, ctx),
         Command::Skill => emit_success(&commands::skill::run()?, opts, ctx),
         Command::Completions { shell } => {
@@ -4433,7 +4685,15 @@ mod tests {
 
     /// Options every command accepts; they're documented once on the docs
     /// overview page rather than on each command's page.
-    const GLOBAL_OPTIONS: &[&str] = &["help", "version", "json", "markdown", "filter", "threads"];
+    const GLOBAL_OPTIONS: &[&str] = &[
+        "help",
+        "version",
+        "json",
+        "markdown",
+        "filter",
+        "threads",
+        "no-optional-locks",
+    ];
 
     /// Required `##` sections on every command page, in order. `Markdown output`
     /// may appear after `JSON output` when the command supports `--markdown`.
@@ -5446,6 +5706,30 @@ The keys are `initialized`, `path`, `bare`, `branch`, `object_format`, and optio
                 raw,
             ]
         );
+    }
+
+    #[test]
+    fn normalize_log_limit_argv_rewrites_dash_n() {
+        let out = super::normalize_log_limit_argv(vec![
+            "grit".into(),
+            "log".into(),
+            "--graph".into(),
+            "--oneline".into(),
+            "-3".into(),
+        ]);
+        assert_eq!(out, vec!["grit", "log", "--graph", "--oneline", "-n", "3"]);
+    }
+
+    #[test]
+    fn normalize_log_limit_argv_skips_when_limit_present() {
+        let args = vec![
+            "grit".into(),
+            "log".into(),
+            "-n".into(),
+            "2".into(),
+            "-1".into(),
+        ];
+        assert_eq!(super::normalize_log_limit_argv(args.clone()), args);
     }
 
     #[test]

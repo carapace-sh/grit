@@ -1,5 +1,6 @@
 //! Build stage-0 indexes from tree objects and refresh worktree stat caches.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use crate::diff::refresh_index_stat_content_verified_with_rules;
@@ -51,6 +52,58 @@ pub(crate) fn refresh_stage0_index_stats_from_worktree(
         rules_arc.as_ref(),
     )?;
     Ok(())
+}
+
+/// Like [`refresh_stage0_index_stats_from_worktree`], limited to the stage-0 entries of `paths`.
+///
+/// For callers that just wrote those files (restore, partial restore, history undo): an entry
+/// whose cleaned worktree content (autocrlf, eol, ident, filters) matches its OID takes the
+/// file's stat data; any other entry keeps the stat fields it had.
+///
+/// Returns whether any entry changed, so a caller that has nothing else to write can leave the
+/// index file alone.
+pub(crate) fn refresh_stage0_index_stats_for_paths(
+    repo: &Repository,
+    work_tree: &Path,
+    index: &mut Index,
+    paths: &BTreeSet<&str>,
+) -> Result<bool> {
+    let entries: Vec<_> = paths
+        .iter()
+        .filter_map(|path| index.get(path.as_bytes(), 0))
+        .cloned()
+        .collect();
+    if entries.is_empty() {
+        return Ok(false);
+    }
+    let mut subset = Index {
+        version: index.version,
+        hash_algo: index.hash_algo,
+        source_mtime: index.source_mtime,
+        source_checksum: index.source_checksum.clone(),
+        source_file_len: index.source_file_len,
+        ..Index::new()
+    };
+    subset.entries = entries;
+    let index_mtime = index_file_mtime(&repo.index_path());
+    let rules = WorktreeRules::from_repository(repo, index).ok();
+    let rules_arc = rules.map(|r| std::sync::Arc::new(std::sync::Mutex::new(r)));
+    let changed = refresh_index_stat_content_verified_with_rules(
+        repo.odb(),
+        repo.git_dir(),
+        &mut subset,
+        work_tree,
+        index_mtime,
+        repo.config().ok().as_deref(),
+        None,
+        rules_arc.as_ref(),
+    )?;
+    if changed {
+        for entry in subset.entries {
+            index.stage_file(entry);
+        }
+    }
+    Ok(changed)
 }
 
 /// Like [`index_from_tree`], then refresh stat caches from the worktree when a work tree exists.
@@ -205,23 +258,38 @@ pub(crate) fn index_from_tree_reusing_cache_tree(
     Ok(index)
 }
 
-/// Load a transition seed, keeping matching absent excluded directories opaque. Changed trees,
-/// directories present on disk, and definitions that no longer exclude a directory use the
-/// ordinary expanded representation so overwrite guards and staged-content checks stay precise.
-pub(crate) fn load_index_for_tree_transition(
-    repo: &Repository,
-    target: &ObjectId,
-) -> Result<Index> {
+/// Load the seed of a hard reset to `target`.
+///
+/// Absent excluded directories stay opaque whenever `target` still has a tree at their path, even
+/// a different one: a hard reset discards staged content and never writes excluded paths, so the
+/// sparse-directory row simply takes the target subtree id (as Git's sparse-index reset does).
+/// Retargeted rows drop their cache-tree node. Everything else is prepared as in
+/// [`prepare_index_for_tree_transition`].
+pub(crate) fn load_index_for_hard_reset(repo: &Repository, target: &ObjectId) -> Result<Index> {
     let mut index = repo.load_index_preserving_sparse()?;
-    prepare_index_for_tree_transition(repo, target, &mut index)?;
+    prepare_sparse_rows(repo, target, &mut index, true)?;
     Ok(index)
 }
 
-/// Prepare loaded rows once the transition's target tree has been resolved.
+/// Prepare loaded rows once the transition's target tree has been resolved, keeping matching
+/// absent excluded directories opaque. Changed trees, directories present on disk, and
+/// definitions that no longer exclude a directory use the ordinary expanded representation so
+/// overwrite guards and staged-content checks stay precise.
 pub(crate) fn prepare_index_for_tree_transition(
     repo: &Repository,
     target: &ObjectId,
     index: &mut Index,
+) -> Result<()> {
+    prepare_sparse_rows(repo, target, index, false)
+}
+
+/// Shared body of [`prepare_index_for_tree_transition`] and [`load_index_for_hard_reset`];
+/// `retarget` keeps candidates whose target subtree differs and points them at it.
+fn prepare_sparse_rows(
+    repo: &Repository,
+    target: &ObjectId,
+    index: &mut Index,
+    retarget: bool,
 ) -> Result<()> {
     let config = repo.config()?;
     if !index.has_sparse_directory_placeholders() {
@@ -231,13 +299,14 @@ pub(crate) fn prepare_index_for_tree_transition(
     let protect = ProtectOptions::from_config(config.as_ref());
     let sparse = SparseCheckout::load(repo)?;
     let worktree = repo.work_tree().ok_or(Error::RequiresWorkTree)?;
+    let index_sparse = config
+        .get_bool("index.sparse")
+        .and_then(|v| v.ok())
+        .unwrap_or(false);
     let mut candidates = std::collections::BTreeMap::new();
     for row in &index.entries {
         if row.is_sparse_directory_placeholder()
-            && config
-                .get_bool("index.sparse")
-                .and_then(|v| v.ok())
-                .unwrap_or(false)
+            && index_sparse
             && sparse
                 .as_ref()
                 .is_some_and(|s| s.excludes_directory(&row.path))
@@ -250,22 +319,40 @@ pub(crate) fn prepare_index_for_tree_transition(
             candidates.insert(row.path.clone(), row.oid);
         }
     }
-    let mut keep = std::collections::BTreeSet::new();
+    let mut keep = std::collections::BTreeMap::new();
     if !candidates.is_empty() {
-        matching_sparse_trees(repo, target, b"", &candidates, &mut keep, protect)?;
+        matching_sparse_trees(repo, target, b"", &candidates, retarget, &mut keep, protect)?;
     }
-    index
-        .expand_sparse_directories_matching(repo.odb(), protect, |row| !keep.contains(&row.path))?;
+    index.expand_sparse_directories_matching(repo.odb(), protect, |row| {
+        !keep.contains_key(&row.path)
+    })?;
+    let mut retargeted = Vec::new();
+    for row in &mut index.entries {
+        let Some(&oid) = keep.get(&row.path) else {
+            continue;
+        };
+        if row.is_sparse_directory_placeholder() && row.oid != oid {
+            row.oid = oid;
+            retargeted.push(row.path.clone());
+        }
+    }
+    for path in retargeted {
+        index.invalidate_cache_tree_for_path(path.strip_suffix(b"/").unwrap_or(&path));
+    }
     repo.clear_present_skip_worktree(index, config.as_ref());
     Ok(())
 }
 
+/// Walk `tree` (at directory `prefix`, no trailing slash) and record in `keep` the sparse-directory
+/// `candidates` that stay opaque, with the target subtree id each must record: identical subtrees,
+/// or any subtree when `retarget` is set. Descends only into directories holding candidates.
 fn matching_sparse_trees(
     repo: &Repository,
     tree: &ObjectId,
     prefix: &[u8],
     candidates: &std::collections::BTreeMap<Vec<u8>, ObjectId>,
-    keep: &mut std::collections::BTreeSet<Vec<u8>>,
+    retarget: bool,
+    keep: &mut std::collections::BTreeMap<Vec<u8>, ObjectId>,
     protect: ProtectOptions,
 ) -> Result<()> {
     let obj = repo.odb().read(tree)?;
@@ -284,8 +371,8 @@ fn matching_sparse_trees(
         let mut path = join_rel(prefix, &entry.name);
         path.push(b'/');
         if let Some(oid) = candidates.get(&path) {
-            if *oid == entry.oid {
-                keep.insert(path);
+            if retarget || *oid == entry.oid {
+                keep.insert(path, entry.oid);
             }
         } else if candidates
             .range(path.clone()..)
@@ -293,13 +380,46 @@ fn matching_sparse_trees(
             .is_some_and(|(key, _)| key.starts_with(&path))
         {
             path.pop();
-            matching_sparse_trees(repo, &entry.oid, &path, candidates, keep, protect)?;
+            matching_sparse_trees(repo, &entry.oid, &path, candidates, retarget, keep, protect)?;
         }
     }
     Ok(())
 }
 
 /// Expose rows needed by a tree delta, including a directory/file replacement at its root.
+/// Expand sparse-directory placeholders only when a pathspec may select paths under them.
+pub(crate) fn expand_sparse_for_pathspecs(
+    repo: &Repository,
+    index: &mut Index,
+    pathspecs: &[String],
+) -> Result<()> {
+    if pathspecs.is_empty() || !index.has_sparse_directory_placeholders() {
+        return Ok(());
+    }
+    let paths: Vec<Vec<u8>> = pathspecs
+        .iter()
+        .map(|path| crate::repo_relpath::storage_bytes(path).into_owned())
+        .collect();
+    index.expand_sparse_directories_matching(
+        repo.odb(),
+        ProtectOptions::from_config(&*repo.config()?),
+        |row| sparse_row_touched_by_paths(row, &paths),
+    )
+}
+
+fn sparse_row_touched_by_paths(row: &IndexEntry, paths: &[Vec<u8>]) -> bool {
+    let dir = row.path.strip_suffix(b"/").unwrap_or(&row.path);
+    paths.iter().any(|path| {
+        path.starts_with(&row.path)
+            || path == dir
+            || dir
+                .strip_prefix(path.as_slice())
+                .is_some_and(|tail| tail.is_empty() || tail.starts_with(b"/"))
+            || (path.starts_with(dir)
+                && (path.len() == dir.len() || path.get(dir.len()) == Some(&b'/')))
+    })
+}
+
 pub(crate) fn expand_sparse_for_tree_changes(
     repo: &Repository,
     index: &mut Index,
@@ -320,16 +440,7 @@ pub(crate) fn expand_sparse_for_tree_changes(
     index.expand_sparse_directories_matching(
         repo.odb(),
         ProtectOptions::from_config(&*repo.config()?),
-        |row| {
-            let dir = row.path.strip_suffix(b"/").unwrap_or(&row.path);
-            paths.iter().any(|path| {
-                path.starts_with(&row.path)
-                    || path == dir
-                    || dir
-                        .strip_prefix(path.as_slice())
-                        .is_some_and(|tail| tail.starts_with(b"/"))
-            })
-        },
+        |row| sparse_row_touched_by_paths(row, &paths),
     )
 }
 
@@ -388,13 +499,14 @@ impl TreeIndexWalk<'_> {
         for te in parse_tree(&obj.data)? {
             validate_tree_walk_entry(prefix, &te.name, te.mode, self.protect)?;
             let path = join_rel(prefix, &te.name);
-            if te.mode == MODE_TREE {
+            if crate::index::is_tree_mode(te.mode) {
                 let child_seed = seed_node.and_then(|n| find_child(n, &te.name));
                 let child = self.walk(&te.oid, &path, te.name, child_seed)?;
                 entry_count = entry_count.saturating_add(child.entry_count.max(0));
                 children.push(child);
             } else {
-                self.entries.push(tree_entry(path, te.mode, te.oid));
+                self.entries
+                    .push(tree_entry(path, crate::index::canon_mode(te.mode), te.oid));
                 entry_count = entry_count.saturating_add(1);
             }
         }
@@ -412,7 +524,7 @@ fn tree_entry(path: Vec<u8>, mode: u32, oid: ObjectId) -> IndexEntry {
         mtime_nsec: 0,
         dev: 0,
         ino: 0,
-        mode,
+        mode: crate::index::canon_mode(mode),
         uid: 0,
         gid: 0,
         size: 0,
@@ -460,12 +572,24 @@ fn seed_rows_under<'a>(
 /// stage-0 seed entry. Both indexes must be in canonical `(path, stage)` order; entries that are
 /// not found keep their zeroed stat data.
 fn seed_stage0_stat_data(index: &mut Index, seed: &Index) {
+    reseed_stage0_stat_data_excluding_paths(index, seed, &std::collections::HashSet::new());
+}
+
+/// Like [`seed_stage0_stat_data`], but skips paths in `exclude` (checkout-updated rows).
+pub(crate) fn reseed_stage0_stat_data_excluding_paths(
+    index: &mut Index,
+    seed: &Index,
+    exclude: &std::collections::HashSet<Vec<u8>>,
+) {
     let mut seeds = seed
         .entries
         .iter()
         .filter(|e| e.stage() == 0 && seed_row_stat_reusable(e))
         .peekable();
     for entry in index.entries.iter_mut().filter(|e| e.stage() == 0) {
+        if exclude.contains(&entry.path) {
+            continue;
+        }
         while seeds.next_if(|s| s.path < entry.path).is_some() {}
         let Some(src) = seeds.next_if(|s| s.path == entry.path) else {
             continue;
@@ -593,14 +717,12 @@ mod tests {
         )
         .expect("stage");
         let ident = "T <t@example.com> 1 +0000".to_owned();
+        let mut req = CommitRequest::new("init");
+        req.author = Some(ident.parse().expect("signature"));
+        req.committer = Some(ident.parse().expect("signature"));
         create_commit(
             &repo,
-            &CommitRequest {
-                message: "init".into(),
-                author: Some(ident.parse().expect("signature")),
-                committer: Some(ident.parse().expect("signature")),
-                ..Default::default()
-            },
+            &req,
             &mut NullProgress,
             &crate::progress::NeverCancel,
         )
@@ -652,23 +774,70 @@ mod tests {
         )
         .expect("stage");
         let ident = "T <t@example.com> 1 +0000".to_owned();
-        create_commit(
-            repo,
-            &CommitRequest {
-                message: "c".into(),
-                author: Some(ident.parse().expect("signature")),
-                committer: Some(ident.parse().expect("signature")),
-                ..Default::default()
-            },
-            &mut NullProgress,
-            &crate::progress::NeverCancel,
-        )
-        .expect("commit");
+        let mut req = CommitRequest::new("c");
+        req.author = Some(ident.parse().expect("signature"));
+        req.committer = Some(ident.parse().expect("signature"));
+        create_commit(repo, &req, &mut NullProgress, &crate::progress::NeverCancel)
+            .expect("commit");
         let head = resolve_head_for_repository(repo).expect("head");
         let commit = repo.odb().read(head.oid().expect("oid")).expect("read");
         crate::objects::parse_commit(&commit.data)
             .expect("parse")
             .tree
+    }
+
+    #[test]
+    fn path_refresh_reports_whether_an_entry_changed() {
+        let dir = TempDir::new().expect("tempdir");
+        crate::repo::init_repository(
+            dir.path(),
+            false,
+            "main",
+            None,
+            crate::RefStorageFormat::Files,
+        )
+        .expect("init");
+        let repo =
+            Repository::discover(Some(dir.path()), &RepositoryOptions::empty()).expect("repo");
+        commit_files(&repo, &[("a.txt", "one\n"), ("b.txt", "two\n")]);
+        let work_tree = repo.work_tree().expect("work tree").to_path_buf();
+        let mut index = repo.load_index().expect("index");
+
+        let mut stale = index.get(b"a.txt", 0).expect("a.txt").clone();
+        stale.mtime_sec = 1;
+        stale.mtime_nsec = 0;
+        index.stage_file(stale);
+        fs::write(work_tree.join("b.txt"), "changed\n").expect("modify");
+        let b_before = index.get(b"b.txt", 0).expect("b.txt").clone();
+
+        let modified = BTreeSet::from(["b.txt", "missing.txt"]);
+        assert!(
+            !refresh_stage0_index_stats_for_paths(&repo, &work_tree, &mut index, &modified)
+                .expect("refresh")
+        );
+        assert_eq!(index.get(b"b.txt", 0), Some(&b_before));
+
+        let unchanged = BTreeSet::from(["a.txt"]);
+        assert!(
+            refresh_stage0_index_stats_for_paths(&repo, &work_tree, &mut index, &unchanged)
+                .expect("refresh")
+        );
+        let meta = fs::metadata(work_tree.join("a.txt")).expect("stat");
+        let mtime = meta
+            .modified()
+            .expect("mtime")
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("epoch")
+            .as_secs();
+        assert_eq!(
+            u64::from(index.get(b"a.txt", 0).expect("a.txt").mtime_sec),
+            mtime
+        );
+        assert!(
+            !refresh_stage0_index_stats_for_paths(&repo, &work_tree, &mut index, &unchanged)
+                .expect("refresh"),
+            "an entry that already holds the file's stat is left alone"
+        );
     }
 
     /// Repository with commit `t1` (`a/x`, `a/b/y`, `c/z`, `top`) followed by commit `t2`, which
@@ -842,6 +1011,78 @@ mod tests {
         }
     }
 
+    #[cfg_attr(
+        not(feature = "full-tests"),
+        ignore = "starts system git or is heavy; run with --features full-tests"
+    )]
+    #[test]
+    fn sparse_hard_reset_retargets_changed_excluded_directories_git_compat() {
+        use crate::porcelain::reset::{reset_to_commit, ResetMode, ResetOptions};
+        use crate::progress::NeverCancel;
+        let dir = TempDir::new().expect("tempdir");
+        // Every one of the 400 excluded directories changes between the two commits.
+        grit_test_support::sparse_scale::create(Path::new("git"), dir.path(), 12_000, true, 2_000)
+            .expect("sparse fixture");
+        let git = |args: &[&str]| grit_test_support::git(dir.path(), args);
+        let repo =
+            Repository::discover(Some(dir.path()), &RepositoryOptions::empty()).expect("repo");
+        for name in ["sparse-base", "sparse-edited", "sparse-base"] {
+            let commit: ObjectId = git(&["rev-parse", name]).trim().parse().expect("oid");
+            reset_to_commit(
+                &repo,
+                &ResetOptions::new(
+                    commit,
+                    ResetMode::Hard,
+                    "T <t@example.com> 1700000020 +0000"
+                        .parse()
+                        .expect("signature"),
+                    "reset",
+                ),
+                &mut NullProgress,
+                &NeverCancel,
+            )
+            .expect("reset");
+            assert_eq!(repo.odb().hot_path_metrics().sparse_expanded_rows(), 0);
+            let index = Index::load(&repo.index_path()).expect("raw index");
+            assert_eq!(index.entries.len(), 700);
+            crate::write_tree::verify_cache_tree(&index).expect("sparse cache-tree");
+            let sparse_rows = git(&["ls-files", "--sparse", "-s"]);
+            let placeholders: Vec<&str> = sparse_rows
+                .lines()
+                .filter(|l| l.starts_with("040000 "))
+                .collect();
+            assert_eq!(placeholders.len(), 400);
+            for row in placeholders {
+                let (meta, path) = row.split_once('\t').expect("row");
+                let oid = meta.split(' ').nth(1).expect("oid");
+                let dir_name = path.trim_end_matches('/');
+                assert_eq!(
+                    git(&["rev-parse", &format!("{name}:{dir_name}")]).trim(),
+                    oid,
+                    "{path} must record the target subtree"
+                );
+            }
+            assert_eq!(
+                git(&["write-tree"]).trim(),
+                git(&["rev-parse", &format!("{name}^{{tree}}")]).trim()
+            );
+            assert!(git(&["status", "--porcelain"]).is_empty());
+            assert_eq!(
+                fs::read_to_string(dir.path().join("d000/f000.txt")).expect("visible file"),
+                if name == "sparse-base" {
+                    "same\n"
+                } else {
+                    "edited\n"
+                }
+            );
+            assert!(!dir.path().join("d001").exists());
+        }
+        git(&["fsck", "--strict"]);
+        // Git can keep working on the index grit wrote.
+        git(&["reset", "--hard", "sparse-edited"]);
+        assert_eq!(git(&["ls-files", "--sparse"]).lines().count(), 700);
+    }
+
     #[test]
     fn sparse_tree_walk_keeps_matching_excluded_subtree_opaque() {
         let (dir, repo, t1, _) = two_commit_repo();
@@ -869,6 +1110,177 @@ mod tests {
             target.cache_tree.as_ref().expect("cache tree").entry_count as usize,
             target.entries.len()
         );
+    }
+
+    /// [`two_commit_repo`] turned into a cone-mode sparse-index checkout of the top level only:
+    /// `a/` and `c/` become sparse-directory rows and leave the work tree. Returns the reopened
+    /// repository and the commits of `t1` and `t2`.
+    fn sparse_two_commit_repo() -> (TempDir, Repository, ObjectId, ObjectId, ObjectId, ObjectId) {
+        let (dir, repo, t1, t2) = two_commit_repo();
+        let head = *resolve_head_for_repository(&repo)
+            .expect("head")
+            .oid()
+            .expect("oid");
+        let commit = repo.odb().read(&head).expect("commit");
+        let parent = crate::objects::parse_commit(&commit.data)
+            .expect("parse")
+            .parents[0];
+        let git_dir = repo.git_dir().to_path_buf();
+        drop(repo);
+        let mut config = fs::read_to_string(git_dir.join("config")).expect("config");
+        config.push_str("[core]\n\tsparseCheckout = true\n\tsparseCheckoutCone = true\n");
+        config.push_str("[index]\n\tsparse = true\n");
+        fs::write(git_dir.join("config"), config).expect("write config");
+        fs::create_dir_all(git_dir.join("info")).expect("info");
+        fs::write(git_dir.join("info/sparse-checkout"), "/*\n!/*/\n").expect("patterns");
+        let repo =
+            Repository::discover(Some(dir.path()), &RepositoryOptions::empty()).expect("reopen");
+        let mut index = repo.load_index().expect("index");
+        for entry in &mut index.entries {
+            if entry.path.contains(&b'/') {
+                entry.set_skip_worktree(true);
+            }
+        }
+        fs::remove_dir_all(dir.path().join("a")).expect("rm a");
+        fs::remove_dir_all(dir.path().join("c")).expect("rm c");
+        repo.write_index(&mut index).expect("write sparse index");
+        let raw = Index::load(&repo.index_path()).expect("raw index");
+        let dirs: Vec<&[u8]> = raw
+            .entries
+            .iter()
+            .filter(|e| e.is_sparse_directory_placeholder())
+            .map(|e| e.path.as_slice())
+            .collect();
+        assert_eq!(dirs, [b"a/".as_slice(), b"c/".as_slice()]);
+        (dir, repo, t1, t2, parent, head)
+    }
+
+    #[test]
+    fn hard_reset_load_retargets_changed_absent_sparse_directories() {
+        let (_dir, repo, t1, t2, _, _) = sparse_two_commit_repo();
+        let old_c = subtree_oid(&repo, &t2, b"c");
+        let new_c = subtree_oid(&repo, &t1, b"c");
+        assert_ne!(old_c, new_c);
+
+        let index = load_index_for_hard_reset(&repo, &t1).expect("hard reset seed");
+        let c = index.get(b"c/", 0).expect("c/ stays opaque");
+        assert!(c.is_sparse_directory_placeholder() && c.skip_worktree());
+        assert_eq!(c.oid, new_c);
+        assert_eq!(
+            index.get(b"a/", 0).expect("a/").oid,
+            subtree_oid(&repo, &t1, b"a")
+        );
+        assert!(!index.entries.iter().any(|e| e.path.starts_with(b"c/z")));
+        assert_eq!(
+            index.cache_tree_root, None,
+            "retargeting invalidates the root"
+        );
+
+        // Other transitions keep checking staged content, so a changed tree is still expanded.
+        let mut transition = repo.load_index_preserving_sparse().expect("index");
+        prepare_index_for_tree_transition(&repo, &t1, &mut transition).expect("transition");
+        assert!(transition.get(b"c/", 0).is_none());
+        assert_eq!(
+            transition.get(b"c/z", 0).expect("c/z").oid,
+            repo.odb().write(ObjectKind::Blob, b"z2\n").expect("blob")
+        );
+        assert!(
+            transition.get(b"a/", 0).is_some(),
+            "unchanged a/ stays opaque"
+        );
+    }
+
+    #[test]
+    fn sparse_hard_reset_never_reads_or_expands_changed_excluded_trees() {
+        use crate::porcelain::reset::{reset_to_commit, ResetMode, ResetOptions};
+        use crate::progress::NeverCancel;
+        let (dir, repo, t1, t2, c1, c2) = sparse_two_commit_repo();
+        let tree_c1 = subtree_oid(&repo, &t1, b"c");
+        let tree_c2 = subtree_oid(&repo, &t2, b"c");
+        // Neither side's excluded subtree may be needed by the reset.
+        for oid in [tree_c1, tree_c2] {
+            fs::remove_file(loose_object_path(&repo, &oid)).expect("drop c tree");
+        }
+        drop(repo);
+        let repo =
+            Repository::discover(Some(dir.path()), &RepositoryOptions::empty()).expect("reopen");
+        for (commit, tree, c_tree) in [(c1, t1, tree_c1), (c2, t2, tree_c2), (c1, t1, tree_c1)] {
+            reset_to_commit(
+                &repo,
+                &ResetOptions::new(
+                    commit,
+                    ResetMode::Hard,
+                    "T <t@example.com> 2 +0000".parse().expect("signature"),
+                    "reset",
+                ),
+                &mut NullProgress,
+                &NeverCancel,
+            )
+            .expect("reset");
+            assert_eq!(repo.odb().hot_path_metrics().sparse_expanded_rows(), 0);
+            let raw = Index::load(&repo.index_path()).expect("raw index");
+            let rows: Vec<(&[u8], ObjectId)> = raw
+                .entries
+                .iter()
+                .map(|e| (e.path.as_slice(), e.oid))
+                .collect();
+            assert_eq!(
+                rows,
+                [
+                    (b"a/".as_slice(), subtree_oid(&repo, &tree, b"a")),
+                    (b"c/".as_slice(), c_tree),
+                    (b"top".as_slice(), raw.entries[2].oid),
+                ]
+            );
+            assert!(raw.entries[..2].iter().all(|e| e.skip_worktree()));
+            assert_eq!(raw.cache_tree_root, Some(tree));
+            crate::write_tree::verify_cache_tree(&raw).expect("sparse cache-tree");
+            assert!(!dir.path().join("c").exists());
+            assert_eq!(fs::read(dir.path().join("top")).expect("top"), b"t\n");
+        }
+    }
+
+    #[test]
+    fn sparse_directory_diff_skips_opaque_subtrees_only() {
+        let (dir, repo, t1, t2, _, _) = sparse_two_commit_repo();
+        let index = repo.load_index_preserving_sparse().expect("sparse index");
+        let pruned = crate::diff::diff_trees_outside_sparse_directories(
+            repo.odb(),
+            &index,
+            Some(&t2),
+            Some(&t1),
+        )
+        .expect("pruned diff");
+        assert!(pruned.is_empty(), "only c/z changed, inside c/: {pruned:?}");
+        let full = crate::diff::diff_trees(repo.odb(), Some(&t2), Some(&t1), "").expect("diff");
+        assert_eq!(full.len(), 1);
+        assert_eq!(full[0].new_path.as_deref(), Some("c/z"));
+
+        // A plain index prunes nothing, and the subtree objects are really skipped when opaque.
+        let plain = Index::new();
+        let unpruned = crate::diff::diff_trees_outside_sparse_directories(
+            repo.odb(),
+            &plain,
+            Some(&t2),
+            Some(&t1),
+        )
+        .expect("unpruned");
+        assert_eq!(unpruned, full);
+        for tree in [t1, t2] {
+            fs::remove_file(loose_object_path(&repo, &subtree_oid(&repo, &tree, b"c")))
+                .expect("drop c tree");
+        }
+        drop(repo);
+        let repo =
+            Repository::discover(Some(dir.path()), &RepositoryOptions::empty()).expect("reopen");
+        assert!(crate::diff::diff_trees_outside_sparse_directories(
+            repo.odb(),
+            &index,
+            Some(&t2),
+            Some(&t1),
+        )
+        .expect("no subtree reads")
+        .is_empty());
     }
 
     #[test]

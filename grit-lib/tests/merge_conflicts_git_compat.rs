@@ -25,8 +25,6 @@ fn commit_req(message: &str) -> CommitRequest {
         sign_override: None,
         amend: false,
         assume_worktree_synced: false,
-        skip_pre_commit_tree_match: false,
-        staged_change_count: None,
         ..Default::default()
     }
 }
@@ -440,4 +438,10 @@ fn merge_abort_restores_pre_merge_state() {
     assert_eq!(fs::read_to_string(root.join("a.txt")).expect("a"), a_before);
     assert_eq!(fs::read_to_string(root.join("b.txt")).expect("b"), b_before);
     assert!(!root.join("x.txt").exists());
+    let index = repo.index_handle().load().expect("index after abort");
+    let b_index = index.get(b"b.txt", 0).expect("b.txt tracked");
+    assert!(
+        !b_index.stat_cache_unset(),
+        "unchanged paths must keep seeded stat data after merge abort"
+    );
 }

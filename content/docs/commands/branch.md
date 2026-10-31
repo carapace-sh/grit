@@ -100,6 +100,13 @@ $ grit branch -u origin/main renamed
 Set upstream of renamed to origin/main
 ```
 
+While a rebase is paused and `HEAD` is detached, renaming the branch being rebased is refused:
+
+```console
+$ grit branch -m renamed
+error: cannot rename the branch while a rebase is in progress; finish it with `grit rebase --continue` or cancel it with `grit rebase --abort`
+```
+
 Deleting a branch with unmerged work:
 
 ```console
@@ -109,6 +116,13 @@ If you are sure you want to delete it, run 'grit branch --force-delete spike'
 
 $ grit branch -D spike
 Deleted branch spike (was a7020c2).
+```
+
+A branch name cannot also be a directory of other branches. Creating `rel` while `rel/1.0` exists (loose or packed, or with only its reflog left under `.git/logs/`) names the branch in the way, and `grit switch -c rel` refuses the same way:
+
+```console
+$ grit branch rel
+error: cannot lock ref 'refs/heads/rel': 'refs/heads/rel/1.0' exists; cannot create 'refs/heads/rel'
 ```
 
 ## JSON output
@@ -235,7 +249,7 @@ Markdown lists branches in a table with upstream and worktree columns when prese
 | Code | Meaning |
 | ---: | --- |
 | `0` | Success, including `--dry-run` previews. |
-| `1` | Branch not found, not fully merged, checked out elsewhere, or other operational failure. |
+| `1` | Branch not found, not fully merged, checked out elsewhere, invalid start point (`branch_invalid_start_point`), or other operational failure. |
 | `2` | Usage error (missing arguments, incompatible flags). |
 
 On failure with `--json`, stdout includes `error` and a stable `kind`. See [Exit codes](../exit-codes/).

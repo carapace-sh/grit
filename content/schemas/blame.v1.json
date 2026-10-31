@@ -38,11 +38,26 @@
             "null"
           ]
         },
+        "line_encoding_lossy": {
+          "items": {
+            "type": "boolean"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
         "lines": {
           "items": {
             "type": "string"
           },
           "type": "array"
+        },
+        "not_committed": {
+          "type": [
+            "boolean",
+            "null"
+          ]
         },
         "original_path": {
           "type": "string"
@@ -77,12 +92,21 @@
         "content": {
           "type": "string"
         },
+        "encoding_lossy": {
+          "type": "boolean"
+        },
         "final_line": {
           "format": "uint",
           "minimum": 0.0,
           "type": "integer"
         },
         "ignored": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "not_committed": {
           "type": [
             "boolean",
             "null"

@@ -4,6 +4,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use smallvec::SmallVec;
@@ -61,16 +62,27 @@ fn bucket_has_path<P: AsRef<[u8]>>(bucket: &[P], path: &[u8]) -> bool {
         .any(|candidate| candidate.as_ref().eq_ignore_ascii_case(path))
 }
 
-/// Stage-0 tracked paths for O(1) average lookups during untracked scans.
+/// Stage-0 tracked paths for fast lookups during untracked scans.
 ///
-/// Borrows path bytes from the [`Index`] it was built from, so building the table does not
-/// copy every indexed path.
+/// Borrows from the [`Index`] it was built from, so building the table does not copy every
+/// indexed path.
 #[derive(Debug)]
 pub struct Stage0TrackedPaths<'a> {
-    exact: hashbrown::HashSet<&'a [u8]>,
+    exact: ExactPaths<'a>,
     folded: Option<HashMap<u32, Vec<&'a [u8]>>>,
     /// Leading directories of stage-0 entries, bucketed by case-folded hash (`ignorecase` only).
     folded_dirs: Option<HashMap<u32, Vec<&'a [u8]>>>,
+}
+
+/// Exact-case membership for [`Stage0TrackedPaths`].
+#[derive(Debug)]
+enum ExactPaths<'a> {
+    /// Binary search in the (sorted) index itself: nothing to build before the walk starts.
+    Sorted(&'a Index),
+    /// Hash set over the paths of an index whose entries are not known to be sorted.
+    Hashed(hashbrown::HashSet<&'a [u8]>),
+    /// Case-insensitive tables answer every lookup.
+    Unused,
 }
 
 impl<'a> Stage0TrackedPaths<'a> {
@@ -95,13 +107,18 @@ impl<'a> Stage0TrackedPaths<'a> {
                 folded_dirs.entry(memihash(dir)).or_default().push(dir);
             }
             Self {
-                exact: hashbrown::HashSet::new(),
+                exact: ExactPaths::Unused,
                 folded: Some(folded),
                 folded_dirs: Some(folded_dirs),
             }
         } else {
+            let exact = if index.entries_sorted {
+                ExactPaths::Sorted(index)
+            } else {
+                ExactPaths::Hashed(index.entries.iter().map(|e| e.path.as_slice()).collect())
+            };
             Self {
-                exact: index.entries.iter().map(|e| e.path.as_slice()).collect(),
+                exact,
                 folded: None,
                 folded_dirs: None,
             }
@@ -125,11 +142,14 @@ impl<'a> Stage0TrackedPaths<'a> {
     #[must_use]
     pub fn contains_bytes(&self, path: &[u8]) -> bool {
         if let Some(folded) = &self.folded {
-            folded
+            return folded
                 .get(&memihash(path))
-                .is_some_and(|bucket| bucket_has_path(bucket, path))
-        } else {
-            self.exact.contains(path)
+                .is_some_and(|bucket| bucket_has_path(bucket, path));
+        }
+        match &self.exact {
+            ExactPaths::Sorted(index) => index.sorted_contains_path(path).unwrap_or(false),
+            ExactPaths::Hashed(paths) => paths.contains(path),
+            ExactPaths::Unused => false,
         }
     }
 }
@@ -170,6 +190,137 @@ impl Stage0IcasePathMap {
         }
         removed
     }
+
+    /// Stage-0 path spelling already recorded for a case variant of `path`, if any.
+    #[must_use]
+    pub fn existing_stage0_spelling(&self, index: &Index, path: &str) -> Option<String> {
+        for index_path in self.paths.same_fold_hash(path.as_bytes()) {
+            if index_path.eq_ignore_ascii_case(path.as_bytes())
+                && index.get(index_path, 0).is_some()
+            {
+                return std::str::from_utf8(index_path).ok().map(str::to_owned);
+            }
+        }
+        None
+    }
+}
+
+/// Stage-0 directory prefix spellings for ignorecase staging (first index order wins).
+#[derive(Debug, Default)]
+pub(crate) struct Stage0IcaseDirSpellingMap {
+    by_fold: HashMap<u32, Vec<Vec<u8>>>,
+}
+
+impl Stage0IcaseDirSpellingMap {
+    #[must_use]
+    pub fn from_index(index: &Index, ignorecase: bool) -> Self {
+        let mut by_fold = HashMap::new();
+        if !ignorecase {
+            return Self { by_fold };
+        }
+        for e in index.entries.iter().filter(|e| e.stage() == 0) {
+            let path = &e.path;
+            let mut end = 0usize;
+            while let Some(slash) = path[end..].iter().position(|&b| b == b'/') {
+                end += slash;
+                let prefix = &path[..end];
+                let bucket = by_fold.entry(memihash(prefix)).or_default();
+                if !bucket
+                    .iter()
+                    .any(|existing| existing.eq_ignore_ascii_case(prefix))
+                {
+                    bucket.push(prefix.to_vec());
+                }
+                end += 1;
+            }
+        }
+        Self { by_fold }
+    }
+
+    fn canonical_dir_prefix<'a>(&'a self, prefix: &str) -> Option<&'a [u8]> {
+        self.by_fold
+            .get(&memihash(prefix.as_bytes()))?
+            .iter()
+            .find(|candidate| candidate.eq_ignore_ascii_case(prefix.as_bytes()))
+            .map(|p| p.as_slice())
+    }
+
+    /// Fold directory prefixes of `rel_path` to spellings already in the index.
+    #[must_use]
+    pub fn fold_directory_prefixes(&self, rel_path: &str) -> String {
+        if self.by_fold.is_empty() || rel_path.is_empty() {
+            return rel_path.to_owned();
+        }
+        let parts: Vec<&str> = rel_path.split('/').collect();
+        if parts.is_empty() {
+            return String::new();
+        }
+        let mut prefix = String::new();
+        for (i, comp) in parts.iter().enumerate() {
+            if i > 0 {
+                prefix.push('/');
+            }
+            prefix.push_str(comp);
+            if i + 1 < parts.len() {
+                if let Some(canonical) = self.canonical_dir_prefix(&prefix) {
+                    prefix = String::from_utf8_lossy(canonical).into_owned();
+                }
+            }
+        }
+        prefix
+    }
+}
+
+static FS_PROBE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn unique_fs_probe_basename() -> String {
+    let seq = FS_PROBE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!(".grit-icase-fs-probe-{}-{seq}", std::process::id())
+}
+
+/// True when the work tree volume folds ASCII path case (APFS, NTFS, …).
+///
+/// Creates a uniquely named empty file with [`OpenOptions::create_new`]; neither the lowercase
+/// nor uppercase spelling may already exist. Only a probe file this call created is removed.
+#[must_use]
+pub(crate) fn worktree_filesystem_case_insensitive(work_tree: &Path) -> bool {
+    for _ in 0..32 {
+        let name = unique_fs_probe_basename();
+        let upper_name: String = name.chars().map(|c| c.to_ascii_uppercase()).collect();
+        let lower = work_tree.join(&name);
+        let upper = work_tree.join(&upper_name);
+        if lower.exists() || upper.exists() {
+            continue;
+        }
+        if let Err(e) = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lower)
+        {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                continue;
+            }
+            return false;
+        }
+        let folds = upper.exists();
+        let _ = std::fs::remove_file(&lower);
+        return folds;
+    }
+    false
+}
+
+/// Path to use when staging an untracked or new file under `core.ignorecase`.
+#[must_use]
+pub(crate) fn fold_untracked_staging_path(
+    dir_map: &Stage0IcaseDirSpellingMap,
+    icase_map: &Stage0IcasePathMap,
+    index: &Index,
+    rel_path: &str,
+) -> String {
+    if let Some(existing) = icase_map.existing_stage0_spelling(index, rel_path) {
+        return existing;
+    }
+    dir_map.fold_directory_prefixes(rel_path)
 }
 
 /// Compare two repository-relative paths for identity.
@@ -402,7 +553,11 @@ pub fn worktree_path_for_index_entry(
     ignorecase: bool,
 ) -> PathBuf {
     let direct = work_tree.join(index_rel);
-    if !ignorecase || direct.exists() {
+    if !ignorecase {
+        return direct;
+    }
+    crate::worktree_scan::probe_worktree_path_resolution(&direct);
+    if direct.exists() {
         return direct;
     }
     if let Some(spelling) = worktree_dentry_spelling(work_tree, index_rel) {
@@ -473,21 +628,62 @@ pub(crate) struct IcaseCheckoutCollisionMap {
     groups: IcaseIndexCollisionGroups,
     /// Dentry winner of each group, indexed like `groups.members_by_group`.
     winner_by_group: Vec<String>,
+    /// Stage-0 blob oids for each group member, parallel to `groups.members_by_group`.
+    oids_by_group: Vec<Vec<crate::objects::ObjectId>>,
 }
 
 impl IcaseCheckoutCollisionMap {
     pub(crate) fn from_index(work_tree: &Path, index: &Index, ignorecase: bool) -> Self {
         let groups = IcaseIndexCollisionGroups::from_index(index, ignorecase);
         let mut dentries = DentrySpellingCache::new(work_tree);
-        let winner_by_group = groups
-            .members_by_group
-            .iter()
-            .map(|members| resolve_collision_group_dentry_winner(members, &mut dentries))
-            .collect();
+        let mut winner_by_group = Vec::with_capacity(groups.members_by_group.len());
+        let mut oids_by_group = Vec::with_capacity(groups.members_by_group.len());
+        for members in &groups.members_by_group {
+            winner_by_group.push(resolve_collision_group_dentry_winner(
+                members,
+                &mut dentries,
+            ));
+            let oids: Vec<_> = members
+                .iter()
+                .filter_map(|path| index.get(path.as_bytes(), 0).map(|e| e.oid))
+                .collect();
+            debug_assert_eq!(oids.len(), members.len());
+            oids_by_group.push(oids);
+        }
         Self {
             groups,
             winner_by_group,
+            oids_by_group,
         }
+    }
+
+    /// Worktree bytes match a collision sibling's index blob, not this row's.
+    ///
+    /// On a shared dentry the winner spelling can still hash to a sibling's oid; leave the
+    /// index row unchanged so auto-stage does not rewrite the loser's recorded blob.
+    pub(crate) fn worktree_oid_is_collision_sibling_blob(
+        &self,
+        raw_path: &[u8],
+        worktree_oid: crate::objects::ObjectId,
+        index_oid: crate::objects::ObjectId,
+    ) -> bool {
+        if worktree_oid == index_oid {
+            return false;
+        }
+        let Some(&key) = self.groups.path_to_group.get(raw_path) else {
+            return false;
+        };
+        let members = &self.groups.members_by_group[key];
+        let oids = &self.oids_by_group[key];
+        members
+            .iter()
+            .zip(oids.iter())
+            .any(|(member, oid)| member.as_bytes() != raw_path && *oid == worktree_oid)
+    }
+
+    /// Collision paths must hash worktree content before reporting modified (size alone lies).
+    pub(crate) fn diff_requires_worktree_hash(&self, raw_path: &[u8]) -> bool {
+        self.groups.path_to_group.contains_key(raw_path)
     }
 
     /// Skip auto-stage refresh for collision aliases; the dentry winner is never a loser.
@@ -504,6 +700,79 @@ impl IcaseCheckoutCollisionMap {
     pub(crate) fn preserve_missing_collision_loser(&self, raw_path: &[u8]) -> bool {
         self.is_auto_stage_loser(raw_path)
     }
+
+    pub(crate) fn collision_groups(&self) -> &IcaseIndexCollisionGroups {
+        &self.groups
+    }
+}
+
+/// Clear cached stat on collision index rows whose blob does not match the shared dentry.
+///
+/// After checkout only one spelling exists on disk; entries for sibling paths can inherit
+/// matching stat data while still recording a different oid. Size zero forces the next
+/// status/diff pass to hash worktree content instead of trusting stat alone.
+pub(crate) fn smudge_ignorecase_collision_stat_mismatches(
+    odb: &crate::odb::Odb,
+    work_tree: &Path,
+    index: &mut Index,
+    config: &crate::config::ConfigSet,
+    filter_process: Option<&crate::filter_process::FilterProcessState>,
+) -> bool {
+    let ignorecase = config
+        .get_bool("core.ignorecase")
+        .and_then(|r| r.ok())
+        .unwrap_or(false);
+    if !ignorecase {
+        return false;
+    }
+    let map = IcaseCheckoutCollisionMap::from_index(work_tree, index, true);
+    if map.collision_groups().members_by_group.is_empty() {
+        return false;
+    }
+    let conv = crate::crlf::ConversionConfig::from_config(config);
+    let attrs = crate::crlf::load_gitattributes(work_tree);
+    let mut changed = false;
+    for members in &map.collision_groups().members_by_group {
+        for member in members {
+            let Some(pos) = index.find_entry_pos(member.as_bytes(), 0) else {
+                continue;
+            };
+            let ie = &index.entries[pos];
+            if ie.stage() != 0 || ie.skip_worktree() || ie.assume_unchanged() || ie.intent_to_add()
+            {
+                continue;
+            }
+            if ie.mode != crate::index::MODE_REGULAR && ie.mode != crate::index::MODE_EXECUTABLE {
+                continue;
+            }
+            let abs = worktree_path_for_index_entry(work_tree, member, true);
+            let Ok(meta) = std::fs::symlink_metadata(&abs) else {
+                continue;
+            };
+            if meta.is_dir() {
+                continue;
+            }
+            let file_attrs = crate::crlf::get_file_attrs(&attrs, member, false, config);
+            let content_matches = crate::diff::hash_worktree_file(
+                odb,
+                &abs,
+                &meta,
+                &conv,
+                &file_attrs,
+                member,
+                Some(ie),
+                filter_process,
+            )
+            .map(|oid| oid == ie.oid)
+            .unwrap_or(false);
+            if content_matches {
+                continue;
+            }
+            index.entries[pos].size = 0;
+            changed = true;
+        }
+    }
+    changed
 }
 
 fn stage0_blob_paths(index: &Index) -> Vec<&str> {
@@ -740,6 +1009,67 @@ mod tests {
     use crate::index::IndexEntry;
     use crate::objects::ObjectId;
 
+    #[test]
+    fn fold_untracked_staging_path_uses_index_dir_and_leaf_spelling() {
+        let mut index = Index::default();
+        for path in ["Dir/f.txt", "readme.txt"] {
+            index.add_or_replace(dummy_entry(path));
+        }
+        let icase_map = Stage0IcasePathMap::from_index(&index, true);
+        let dir_map = Stage0IcaseDirSpellingMap::from_index(&index, true);
+        assert_eq!(
+            fold_untracked_staging_path(&dir_map, &icase_map, &index, "dir/g.txt"),
+            "Dir/g.txt"
+        );
+        assert_eq!(
+            fold_untracked_staging_path(&dir_map, &icase_map, &index, "README.txt"),
+            "readme.txt"
+        );
+    }
+
+    #[test]
+    fn dir_spelling_map_does_not_fold_across_memihash_collisions() {
+        assert_eq!(memihash(b"f02398b.txt"), memihash(b"f0688b8.txt"));
+        let mut index = Index::default();
+        index.add_or_replace(dummy_entry("f02398b.txt/x"));
+        let dir_map = Stage0IcaseDirSpellingMap::from_index(&index, true);
+        assert_eq!(
+            dir_map.fold_directory_prefixes("f0688b8.txt/y"),
+            "f0688b8.txt/y"
+        );
+    }
+
+    #[test]
+    fn filesystem_case_probe_does_not_remove_preexisting_paths() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let wt = tmp.path();
+        let user_dir = wt.join(".grit_icase_probe");
+        std::fs::create_dir_all(user_dir.join("sentinel")).expect("user dir");
+        let _ = worktree_filesystem_case_insensitive(wt);
+        assert!(
+            user_dir.join("sentinel").is_dir(),
+            "probe must not delete an existing .grit_icase_probe tree"
+        );
+    }
+
+    #[test]
+    fn filesystem_case_probe_ignores_preexisting_uppercase_decoy() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let wt = tmp.path();
+        if !worktree_has_distinct_icase_dentries(wt) {
+            return;
+        }
+        std::fs::write(wt.join(".GRIT-ICASE-FS-PROBE-00000"), b"decoy").expect("decoy");
+        assert!(
+            !worktree_filesystem_case_insensitive(wt),
+            "a pre-existing uppercase path must not classify the volume as case-folding"
+        );
+        assert!(
+            wt.join(".GRIT-ICASE-FS-PROBE-00000").is_file(),
+            "probe must not remove unrelated paths"
+        );
+    }
+
     fn dummy_entry(path: &str) -> IndexEntry {
         IndexEntry {
             ctime_sec: 0,
@@ -821,6 +1151,29 @@ mod tests {
         }
         let exact = Stage0TrackedPaths::from_index_for_untracked_scan(&index, false);
         assert!(!exact.has_dir_ignoring_case(b"build"));
+    }
+
+    #[test]
+    fn exact_tracked_paths_answer_from_sorted_and_unsorted_indexes() {
+        let mut conflicted = dummy_entry("dir/both.txt");
+        conflicted.set_stage(2);
+        let mut sorted = Index::new();
+        for entry in [dummy_entry("dir/a.txt"), conflicted, dummy_entry("README")] {
+            sorted.push_entry_unsorted(entry);
+        }
+        let mut unsorted = Index::new();
+        unsorted.entries = sorted.entries.clone();
+        unsorted.mark_entries_unsorted();
+        sorted.sort();
+        for index in [&sorted, &unsorted] {
+            let tracked = Stage0TrackedPaths::from_index_for_untracked_scan(index, false);
+            for path in ["dir/a.txt", "dir/both.txt", "README"] {
+                assert!(tracked.contains_bytes(path.as_bytes()), "{path}");
+            }
+            for path in ["dir", "dir/A.txt", "readme", "dir/a", ""] {
+                assert!(!tracked.contains_bytes(path.as_bytes()), "{path}");
+            }
+        }
     }
 
     #[test]
@@ -1082,6 +1435,29 @@ mod tests {
         let map = IcaseCheckoutCollisionMap::from_index(wt, &index, true);
         assert!(!map.is_auto_stage_loser(b"file.txt"));
         assert!(map.is_auto_stage_loser(b"File.txt"));
+    }
+
+    #[test]
+    fn directory_collision_winner_skips_sibling_worktree_bytes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let wt = tmp.path();
+        std::fs::create_dir_all(wt.join("Docs")).expect("mkdir");
+        std::fs::write(wt.join("Docs/guide.md"), b"two\n").expect("write");
+        let one = ObjectId::from_hex("1111111111111111111111111111111111111111").unwrap();
+        let two = ObjectId::from_hex("2222222222222222222222222222222222222222").unwrap();
+        let mut index = Index::new();
+        let mut upper = dummy_entry("Docs/guide.md");
+        upper.oid = one;
+        let mut lower = dummy_entry("docs/guide.md");
+        lower.oid = two;
+        index.push_entry_unsorted(upper);
+        index.push_entry_unsorted(lower);
+        index.sort();
+        let map = IcaseCheckoutCollisionMap::from_index(wt, &index, true);
+        assert!(!map.is_auto_stage_loser(b"Docs/guide.md"));
+        assert!(map.is_auto_stage_loser(b"docs/guide.md"));
+        assert!(map.worktree_oid_is_collision_sibling_blob(b"Docs/guide.md", two, one));
+        assert!(!map.worktree_oid_is_collision_sibling_blob(b"Docs/guide.md", one, one));
     }
 
     #[test]

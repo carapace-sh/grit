@@ -14,6 +14,7 @@ use crate::config::ConfigSet;
 use crate::environment::RepositoryOptions;
 use crate::error::{Error, Result};
 use crate::git_path::{absolute_path_for_gitfile_stored_path, path_for_disk_compare};
+use crate::hooks::run_post_checkout;
 use crate::porcelain::branch::{resolve_create_tracking, TrackMode};
 use crate::porcelain::branch_error::BranchError;
 use crate::porcelain::checkout::checkout_between_trees;
@@ -186,7 +187,8 @@ pub(crate) fn admin_dirs_match(a: &Path, b: &Path) -> bool {
 /// Find a worktree that has `branch_short_name` checked out, optionally skipping one admin dir.
 ///
 /// A worktree has the branch checked out when its `HEAD` is the branch, or when a rebase or
-/// bisect there is working on it (with `HEAD` detached until it ends).
+/// bisect there is working on it (with `HEAD` detached until it ends). Bare repository entries
+/// are skipped: their symbolic `HEAD` is not a checkout (same as Git `wt->is_bare`).
 ///
 /// `exclude_admin_dir` is typically the current worktree's admin dir so a switch to the branch
 /// already checked out here is allowed.
@@ -196,6 +198,9 @@ pub fn find_worktree_with_branch_checked_out(
     exclude_admin_dir: Option<&Path>,
 ) -> Result<Option<BranchWorktreeCheckout>> {
     for entry in list_worktrees(repo)? {
+        if entry.is_bare {
+            continue;
+        }
         if exclude_admin_dir.is_some_and(|ex| admin_dirs_match(&entry.admin_dir, ex)) {
             continue;
         }
@@ -515,6 +520,10 @@ pub enum WorktreeBranch {
     CreateOrReset(String),
     /// Detached HEAD at the start commit.
     Detach,
+    /// `HEAD` on the unborn branch `refs/heads/<name>`, with an empty working tree and
+    /// index (`git worktree add --orphan`). The start point is ignored and the repository
+    /// need not have any commits. Fails when the branch exists.
+    Orphan(String),
 }
 
 /// Options for [`add_linked_worktree`].
@@ -567,18 +576,20 @@ pub struct PrunedWorktreeEntry {
 /// with discovery placeholders in the admin directory. `no_checkout` still creates
 /// this ref metadata, but leaves the index and tracked files absent.
 ///
+/// After a successful add with checkout, runs the `post-checkout` hook from the
+/// new worktree with a null old object id, the start commit, and flag `1` (same as
+/// Git `worktree add`). The hook is advisory: failures do not roll back the worktree.
+///
 /// # Errors
 ///
-/// Fails when the repository is bare, the path is occupied, the branch is already
-/// checked out elsewhere, or checkout cannot complete.
+/// Fails when the path is occupied, the branch is already checked out in a non-bare
+/// worktree, or checkout cannot complete.
 pub fn add_linked_worktree(
     repo: &Repository,
     opts: &AddLinkedWorktreeOptions,
 ) -> Result<WorktreeEntry> {
+    // Like Git, a bare repository can have linked worktrees.
     let common = common_git_dir(repo.git_dir());
-    if repo.is_bare() {
-        return Err(WorktreeError::BareRepository.into());
-    }
 
     let wt_path = if opts.path.exists() {
         path_for_disk_compare(&opts.path)
@@ -588,12 +599,21 @@ pub fn add_linked_worktree(
     let admin_plan = plan_admin_dir_for_add(&common, &wt_path, opts.force)?;
     ensure_empty_or_missing(&wt_path)?;
 
-    let (start_spec, start_oid) = resolve_worktree_start_commit(repo, opts)?;
-    let tree_oid = repo.odb().commit_tree(&start_oid)?;
-
-    let plan = plan_worktree_head(repo, opts, &wt_path, &start_spec, start_oid)?;
+    // An orphan worktree has no start commit: HEAD is the unborn branch and nothing
+    // is checked out.
+    let (start_oid, tree_oid, plan) = if let Some(WorktreeBranch::Orphan(name)) = &opts.branch {
+        (None, None, plan_orphan_worktree_head(repo, name)?)
+    } else {
+        let (start_spec, start_oid) = resolve_worktree_start_commit(repo, opts)?;
+        let tree_oid = repo.odb().commit_tree(&start_oid)?;
+        let plan = plan_worktree_head(repo, opts, &wt_path, &start_spec, start_oid)?;
+        (Some(start_oid), Some(tree_oid), plan)
+    };
     if let Some(ref branch_ref) = plan.head_ref {
-        branch_checked_out_elsewhere(repo, branch_ref)?;
+        let short = branch_ref
+            .strip_prefix("refs/heads/")
+            .unwrap_or(branch_ref.as_str());
+        ensure_branch_not_checked_out_in_any_worktree(repo, short)?;
     }
 
     let admin = admin_plan.admin_dir;
@@ -622,8 +642,8 @@ pub fn add_linked_worktree(
                 bw.force_reset,
             )?;
         }
-        if let Some(ref branch_short) = plan.track_branch {
-            maybe_track_new_branch(repo, opts, branch_short, &start_spec, start_oid)?;
+        if let (Some(branch_short), Some(bw)) = (&plan.track_branch, &plan.branch_write) {
+            maybe_track_new_branch(repo, opts, branch_short, &bw.start_spec, bw.start_oid)?;
         }
 
         fs::create_dir_all(&admin).map_err(Error::Io)?;
@@ -648,12 +668,11 @@ pub fn add_linked_worktree(
         fs::write(admin.join("commondir"), "../..\n").map_err(Error::Io)?;
         fs::write(admin.join("gitdir"), format!("{wt_git_abs}\n")).map_err(Error::Io)?;
 
-        let head = plan
-            .head_ref
-            .as_ref()
-            .map_or(crate::refs::store::RawRef::Direct(start_oid), |target| {
-                crate::refs::store::RawRef::Symbolic(target.clone())
-            });
+        let head = match (&plan.head_ref, start_oid) {
+            (Some(target), _) => crate::refs::store::RawRef::Symbolic(target.clone()),
+            (None, Some(start_oid)) => crate::refs::store::RawRef::Direct(start_oid),
+            (None, None) => unreachable!("an orphan worktree has a HEAD branch"),
+        };
         if repo.refs_on_disk() {
             crate::refs::store::initialize_head(&admin, head)?;
         } else {
@@ -671,7 +690,7 @@ pub fn add_linked_worktree(
             write_admin_lock_file(&admin, lock.reason.as_deref())?;
         }
 
-        if !opts.no_checkout {
+        if let (false, Some(tree_oid)) = (opts.no_checkout, tree_oid) {
             let linked = repo.open_linked_worktree(&admin, &wt_path)?;
             checkout_between_trees(&linked, None, &tree_oid)?;
         }
@@ -686,6 +705,12 @@ pub fn add_linked_worktree(
             }
             if let Some(mut rollback) = branch_rollback {
                 rollback.commit();
+            }
+            if !opts.no_checkout {
+                if let Some(oid) = start_oid {
+                    let linked = repo.open_linked_worktree(&admin, &wt_path)?;
+                    run_post_checkout(&linked, None, oid, true);
+                }
             }
             Ok(entry)
         }
@@ -806,6 +831,23 @@ fn resolve_worktree_start_commit(
     Ok((start_spec, start_oid))
 }
 
+/// HEAD for [`WorktreeBranch::Orphan`]: the unborn branch `refs/heads/<name>`.
+fn plan_orphan_worktree_head(repo: &Repository, name: &str) -> Result<WorktreeHeadPlan> {
+    validate_branch_name(name)?;
+    let branch_ref = format!("refs/heads/{name}");
+    if repo.references().read_existing(&branch_ref)?.is_some() {
+        return Err(BranchError::AlreadyExists {
+            name: name.to_owned(),
+        }
+        .into());
+    }
+    Ok(WorktreeHeadPlan {
+        head_ref: Some(branch_ref),
+        branch_write: None,
+        track_branch: None,
+    })
+}
+
 fn plan_worktree_head(
     repo: &Repository,
     opts: &AddLinkedWorktreeOptions,
@@ -814,6 +856,7 @@ fn plan_worktree_head(
     start_oid: crate::objects::ObjectId,
 ) -> Result<WorktreeHeadPlan> {
     match &opts.branch {
+        Some(WorktreeBranch::Orphan(name)) => plan_orphan_worktree_head(repo, name),
         Some(WorktreeBranch::Detach) => Ok(WorktreeHeadPlan {
             head_ref: None,
             branch_write: None,
@@ -1003,13 +1046,30 @@ fn linked_worktree_prunable_state(
     if admin.join("prunable").is_file() {
         return (true, Some(PrunableReason::ExplicitMarker));
     }
-    if wt_path.exists() {
+    // Like Git's `should_prune_worktree`, a worktree stays while the `.git` file its
+    // `gitdir` names exists, even if the directory around it is still there.
+    if linked_worktree_gitfile(admin).map_or_else(|| wt_path.exists(), |gitfile| gitfile.exists()) {
         return (false, None);
     }
     (
         true,
         Some(linked_worktree_prunable_reason_when_missing(admin)),
     )
+}
+
+/// The worktree's `.git` file named by the admin directory's `gitdir` file.
+fn linked_worktree_gitfile(admin: &Path) -> Option<PathBuf> {
+    let raw = fs::read_to_string(admin.join("gitdir")).ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let gitfile = PathBuf::from(trimmed);
+    Some(if gitfile.is_relative() {
+        admin.join(gitfile)
+    } else {
+        gitfile
+    })
 }
 
 fn linked_worktree_prunable_reason_when_missing(admin: &Path) -> PrunableReason {
@@ -1309,20 +1369,6 @@ fn resolve_existing_branch(repo: &Repository, spec: &str) -> Option<String> {
     };
     repo.resolve_ref_oid(&full).ok()?;
     Some(full)
-}
-
-fn branch_checked_out_elsewhere(repo: &Repository, branch_ref: &str) -> Result<()> {
-    for wt in list_worktrees(repo)? {
-        if let HeadState::Branch { refname, .. } = &wt.head {
-            if refname == branch_ref {
-                return Err(branch_checked_out_error(
-                    branch_ref.strip_prefix("refs/heads/").unwrap_or(branch_ref),
-                    &wt.path,
-                ));
-            }
-        }
-    }
-    Ok(())
 }
 
 fn ensure_empty_or_missing(path: &Path) -> Result<()> {
@@ -1707,7 +1753,7 @@ mod tests {
         ignore = "starts system git or is heavy; run with --features full-tests"
     )]
     #[test]
-    fn add_linked_worktree_rejects_bare_repository() {
+    fn add_linked_worktree_to_bare_repository() {
         let tmp = TempDir::new().unwrap();
         let bare = tmp.path().join("bare.git");
         fs::create_dir_all(bare.join("objects")).unwrap();
@@ -1718,11 +1764,12 @@ mod tests {
         )
         .unwrap();
         let repo = Repository::open(&bare, &RepositoryOptions::empty()).unwrap();
-        let err = add_linked_worktree(
+        let wt = tmp.path().join("wt");
+        let entry = add_linked_worktree(
             &repo,
             &AddLinkedWorktreeOptions {
-                path: tmp.path().join("wt"),
-                branch: Some(WorktreeBranch::Create("wt".into())),
+                path: wt.clone(),
+                branch: Some(WorktreeBranch::Orphan("wt".into())),
                 start_point: None,
                 force: false,
                 lock: None,
@@ -1730,11 +1777,23 @@ mod tests {
                 track: false,
             },
         )
-        .unwrap_err();
-        assert!(matches!(
-            err,
-            Error::Worktree(WorktreeError::BareRepository)
-        ));
+        .unwrap();
+        assert_eq!(
+            entry.admin_dir,
+            fs::canonicalize(&bare)
+                .unwrap()
+                .join("worktrees")
+                .join("wt")
+        );
+        assert_eq!(
+            fs::read_to_string(entry.admin_dir.join("HEAD")).unwrap(),
+            "ref: refs/heads/wt\n"
+        );
+        assert_eq!(
+            fs::read_to_string(entry.admin_dir.join("commondir")).unwrap(),
+            "../..\n"
+        );
+        assert!(wt.join(".git").is_file());
     }
 
     #[cfg_attr(

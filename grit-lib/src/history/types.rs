@@ -80,6 +80,11 @@ pub type HistoryEdits = BTreeMap<ObjectId, CommitEdit>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum RefScope {
     /// Every local branch whose tip descends from the oldest edited commit, plus `HEAD`.
+    ///
+    /// Stacked branches on intermediate or descendant commits move with the rewrite. Other
+    /// branches pointing at the same commit as `HEAD` (the checked-out branch tip, or the
+    /// detached commit) are left alone: they are second names for the pre-rewrite tip, such
+    /// as a backup taken before a rebase.
     #[default]
     Branches,
     /// Only the ref `HEAD` currently points at (symbolic or detached).
@@ -296,6 +301,13 @@ pub struct UndoOutcome {
     pub head: ObjectId,
     /// Previous and new `HEAD` commit OIDs when undo moves `HEAD`'s commit.
     pub head_change: Option<(ObjectId, ObjectId)>,
+    /// Paths whose index entry and work tree file were (or, for a dry run, would be) put back to
+    /// their state before the undone command. Fixup and absorb consume staged or selected edits;
+    /// empty when the undone command left the index and work tree alone.
+    pub restored_paths: Vec<String>,
+    /// Commit that still holds the edits an undone fixup or absorb folded into history, when the
+    /// record was written without restorable state and the edits could not be put back.
+    pub unrestored_edits: Option<ObjectId>,
     /// Whether refs were left unchanged.
     pub dry_run: bool,
 }

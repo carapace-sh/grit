@@ -998,6 +998,49 @@ fn status_finishes_interrupted_rewrite_apply_and_reports_it() {
 }
 
 #[test]
+fn interrupted_rewrite_apply_recovers_after_simulated_kill9_with_default_pid_sidecar() {
+    let (repo, plan) = interrupted_partial_checkout();
+    let wt = repo.worktree();
+    let grit = open_grit(wt);
+    let index_path = wt.join(".git/index");
+    let lock = grit_lib::index::IndexLock::acquire(&index_path, None)
+        .expect("simulate grit holding index.lock mid-checkout");
+    std::mem::forget(lock);
+    assert!(wt.join(".git/index.lock").is_file());
+    assert!(wt.join(".git/index~pid.lock").is_file());
+    // kill -9 leaves the lock and sidecar but the holder is gone.
+    fs::write(wt.join(".git/index~pid.lock"), "pid 999999999\n").expect("dead holder");
+
+    let recovery = recover_interrupted_rewrite_apply(&grit)
+        .expect("recover")
+        .expect("recovery outcome");
+    assert_eq!(
+        recovery,
+        grit_lib::revwalk::history::RewriteApplyRecovery::FinishedCheckout
+    );
+    assert_finished_partial_checkout(wt, &plan);
+}
+
+#[test]
+fn interrupted_rewrite_apply_with_lockfile_pid_disabled_leaves_foreign_lock() {
+    let (repo, plan) = interrupted_partial_checkout();
+    let wt = repo.worktree();
+    git(wt, &["config", "core.lockfilePid", "false"]);
+    fs::write(wt.join(".git/index.lock"), "").expect("lock without sidecar");
+    let grit = open_grit(wt);
+    let err = recover_interrupted_rewrite_apply(&grit).expect_err("foreign lock");
+    let grit_lib::revwalk::history::HistoryError::Library(inner) = &err else {
+        panic!("unexpected error {err:?}");
+    };
+    assert!(matches!(&**inner, grit_lib::error::Error::LockHeld { .. }));
+    assert_eq!(
+        git_rev_parse(wt, "refs/heads/main"),
+        Some(plan.ref_updates[0].new)
+    );
+    assert!(wt.join(".git/index.lock").exists());
+}
+
+#[test]
 fn interrupted_rewrite_apply_removes_stale_index_lock_of_dead_holder() {
     let (repo, plan) = interrupted_partial_checkout();
     let wt = repo.worktree();
@@ -1160,6 +1203,61 @@ fn apply_rewrite_journal_accepts_git_path_with_double_dot_in_name() {
     .expect("apply with a..b present");
     assert!(wt.join("a..b").is_file());
     assert!(wt.join("side.txt").is_file());
+}
+
+#[test]
+fn rewrite_apply_journal_stores_from_tree_manifest_for_wide_clean_transition() {
+    let repo = HistoryRepo::init();
+    let wt = repo.worktree();
+    build_commit_dag(wt, &[("b", "a")], &[("b", "refs/heads/main")]);
+    for i in 0..40 {
+        commit_file(
+            wt,
+            &format!("wide/{i}.txt"),
+            &format!("base {i}\n"),
+            &format!("track {i}"),
+        );
+    }
+    let tip = git_rev_parse(wt, "HEAD").expect("tip");
+    let edits: Vec<(String, Vec<u8>)> = (0..40)
+        .map(|i| (format!("wide/{i}.txt"), format!("next {i}\n").into_bytes()))
+        .collect();
+    let edit_refs: Vec<(&str, &[u8])> = edits
+        .iter()
+        .map(|(path, bytes)| (path.as_str(), bytes.as_slice()))
+        .collect();
+    let plan = plan_tip_tree_edits(wt, tip, &edit_refs);
+    let grit = open_grit(wt);
+    grit_lib::repo::set_test_inject_rewrite_apply_abort_after_refs(true);
+    apply_rewrite(
+        &grit,
+        &plan,
+        &apply_opts(),
+        &mut grit_lib::progress::NullProgress,
+        &mut grit_lib::progress::NeverCancel,
+    )
+    .expect_err("injected abort");
+    grit_lib::repo::set_test_inject_rewrite_apply_abort_after_refs(false);
+    let worktree_dir = wt.join(".git/grit/rewrite-apply/worktree");
+    let file_count = fs::read_dir(&worktree_dir)
+        .expect("journal worktree dir")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_file())
+        .count();
+    assert_eq!(
+        file_count, 1,
+        "wide clean tree transitions must not write one journal payload file per path"
+    );
+    grit_lib::revwalk::history::abort_interrupted_rewrite_apply(&grit).expect("abort");
+    for i in 0..40 {
+        let path = wt.join(format!("wide/{i}.txt"));
+        assert_eq!(
+            fs::read_to_string(&path).expect("read"),
+            format!("base {i}\n"),
+            "rollback must rebuild clean paths from the old tree"
+        );
+    }
+    git_fsck_strict(wt);
 }
 
 #[test]

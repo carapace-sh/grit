@@ -3,6 +3,7 @@
 
 use anyhow::{Context, Result};
 use grit_lib::diff::DiffEntry;
+use grit_lib::gitbutler::GitButlerWorkspace;
 use grit_lib::objects::ObjectId;
 use grit_lib::operation::{Conflict, ConflictKind};
 use grit_lib::porcelain::status::{
@@ -13,7 +14,7 @@ use grit_lib::progress::NeverCancel;
 use grit_lib::progress::NullProgress;
 use grit_lib::refs::branch_tracking::{
     status_ahead_behind_enabled, BranchStanding, Standing, StandingHeader, StandingOptions,
-    StatusHeader, StatusIntegrationAction, StatusIntegrationHint, TrackedComparison,
+    StatusHeader, StatusIntegrationAction, StatusIntegrationHint, TipComparison, TrackedComparison,
 };
 use grit_lib::state::{detect_in_progress, HeadState, InProgressOperation, NextStep};
 use schemars::JsonSchema;
@@ -22,6 +23,7 @@ use std::io::Write;
 
 use crate::completions::grit;
 use crate::context::{self, CommitSummary};
+use crate::json_error::LockHolderJson;
 use crate::markdown;
 use crate::output::{
     change_json, outln, ChangeJson, CommitJson, HumanRender, MarkdownRender, RenderContext,
@@ -105,6 +107,11 @@ pub struct StatusOutcome {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(default)]
     pub interrupted_rewrite: Option<InterruptedRewriteJson>,
+    /// The GitButler workspace `HEAD` is on, when it is on one. `head` is then the workspace
+    /// commit, and `commits` and `ahead` leave it out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(default)]
+    pub gitbutler_workspace: Option<GitButlerWorkspaceJson>,
 
     // Human-only state, not part of the JSON schema.
     #[serde(skip)]
@@ -143,6 +150,36 @@ pub struct StatusOutcome {
     #[serde(skip)]
     #[schemars(skip)]
     short_lines: Vec<String>,
+    #[serde(skip)]
+    #[schemars(skip)]
+    interrupted_rewrite_lock_holder: Option<LockHolderJson>,
+    /// Rows for the workspace's merged heads, in the same order as `gitbutler_workspace.heads`.
+    #[serde(skip)]
+    #[schemars(skip)]
+    workspace_rows: Vec<CommitSummary>,
+}
+
+/// A GitButler workspace in `grit status --json`: GitButler's merge of the applied branches.
+#[derive(Serialize, JsonSchema)]
+pub struct GitButlerWorkspaceJson {
+    /// The workspace commit at the tip of `gitbutler/workspace` (full oid).
+    pub commit: String,
+    /// The heads merged into the workspace, in its parent order.
+    pub heads: Vec<WorkspaceHeadJson>,
+}
+
+/// One head merged into a GitButler workspace.
+#[derive(Serialize, JsonSchema)]
+pub struct WorkspaceHeadJson {
+    /// The head commit (full oid).
+    pub commit: String,
+    /// Local branches that point at it, sorted; empty when none does.
+    pub branches: Vec<String>,
+    /// The head commit's subject.
+    pub subject: String,
+    /// Commits on this head not on `target`, or `null` when counts were skipped or there is no
+    /// target.
+    pub ahead: Option<usize>,
 }
 
 /// Recovery of an interrupted rebase or history edit, in `--json` output.
@@ -169,13 +206,23 @@ impl From<InterruptedRewrite> for InterruptedRewriteJson {
 
 impl InterruptedRewriteJson {
     /// One line for human and Markdown output; `lock` is how the index lock path is shown.
-    fn sentence(self, lock: &str) -> String {
+    fn sentence(self, lock: &str, holder: Option<&LockHolderJson>) -> String {
         match self {
             Self::FinishedCheckout => "Finished the checkout of an interrupted rebase or history edit; HEAD stays on the rewritten commits.".to_owned(),
             Self::RolledBack => "Rolled back an interrupted rebase or history edit; refs, index and files are back to where they were.".to_owned(),
-            Self::Pending => format!(
-                "An interrupted rebase or history edit is pending: another process holds {lock}. Run grit status again once it exits."
-            ),
+            Self::Pending => match holder {
+                Some(h) if h.running => format!(
+                    "An interrupted rebase or history edit is pending: process {} holds {lock}. Run grit status again once it exits.",
+                    h.pid
+                ),
+                Some(h) => format!(
+                    "An interrupted rebase or history edit is pending: {lock} is held but process {} has exited; run grit status again to recover.",
+                    h.pid
+                ),
+                None => format!(
+                    "An interrupted rebase or history edit is pending: {lock} is held and no grit process id was recorded; the lock may be stale (another tool or core.lockfilePid=false). Run grit status again once nothing else is using the repository."
+                ),
+            },
         }
     }
 }
@@ -217,7 +264,14 @@ impl HumanRender for StatusOutcome {
             return Ok(());
         }
         if let Some(outcome) = self.interrupted_rewrite {
-            outln!(w, "{}", outcome.sentence(".git/index.lock"));
+            outln!(
+                w,
+                "{}",
+                outcome.sentence(
+                    ".git/index.lock",
+                    self.interrupted_rewrite_lock_holder.as_ref()
+                )
+            );
             outln!(w);
         }
         self.render_header(w, ctx)?;
@@ -235,7 +289,14 @@ impl MarkdownRender for StatusOutcome {
             return Ok(());
         }
         if let Some(outcome) = self.interrupted_rewrite {
-            outln!(w, "> {}", outcome.sentence("`.git/index.lock`"));
+            outln!(
+                w,
+                "> {}",
+                outcome.sentence(
+                    "`.git/index.lock`",
+                    self.interrupted_rewrite_lock_holder.as_ref()
+                )
+            );
             outln!(w);
         }
         self.render_markdown_header(w, ctx)?;
@@ -327,6 +388,11 @@ impl StatusOutcome {
         let branch = self.branch.as_deref().unwrap_or_default();
         let base = self.header_comparison_name();
         let now = ctx.now.unix_timestamp();
+        if let (Some(workspace), StatusHeader::Branch(_)) =
+            (&self.gitbutler_workspace, &self.header)
+        {
+            return self.render_workspace_human(w, workspace, now);
+        }
         match &self.header {
             StatusHeader::Branch(StandingHeader::Compared(Standing::Ahead)) => {
                 outln!(
@@ -475,6 +541,9 @@ impl StatusOutcome {
                             Some("grit restore <file> to discard worktree changes".to_owned())
                         }
                         StatusAction::Stage => Some("grit add <file> to stage".to_owned()),
+                        StatusAction::Commit if self.gitbutler_workspace.is_some() => {
+                            Some("but commit to commit (GitButler workspace)".to_owned())
+                        }
                         StatusAction::Commit => {
                             Some("grit commit \"message\" to commit".to_owned())
                         }
@@ -489,6 +558,82 @@ impl StatusOutcome {
             }
             StatusGuidance::Actions(_) => {}
         }
+        Ok(())
+    }
+
+    /// The first line of a workspace header: how many branches, and how far behind the target.
+    fn workspace_summary(
+        &self,
+        workspace: &GitButlerWorkspaceJson,
+        code: fn(&str) -> String,
+    ) -> String {
+        let count = workspace.heads.len();
+        let mut line = format!(
+            "{count} branch{} applied",
+            if count == 1 { "" } else { "es" }
+        );
+        if let (Some(behind), Some(target)) = (self.behind.filter(|&n| n > 0), &self.target) {
+            line.push_str(&format!("  ·  {behind} behind {}", code(target)));
+        }
+        line
+    }
+
+    fn render_workspace_human(
+        &self,
+        w: &mut dyn Write,
+        workspace: &GitButlerWorkspaceJson,
+        now: i64,
+    ) -> Result<()> {
+        outln!(
+            w,
+            "On GitButler workspace  ·  {}",
+            self.workspace_summary(workspace, str::to_owned)
+        );
+        outln!(w);
+        let names: Vec<String> = workspace.heads.iter().map(workspace_head_label).collect();
+        let name_w = names.iter().map(|n| n.chars().count()).max().unwrap_or(0);
+        let reserved = vec![name_w + 2; names.len()];
+        let opts = ui::CommitRowOptions {
+            reserved: &reserved,
+            ..ui::CommitRowOptions::default()
+        };
+        for (name, row) in names
+            .iter()
+            .zip(ui::commit_rows_with(&self.workspace_rows, now, &opts))
+        {
+            outln!(w, "  {name:<name_w$}{row}");
+        }
+        outln!(w);
+        Ok(())
+    }
+
+    fn render_workspace_markdown(
+        &self,
+        w: &mut dyn Write,
+        workspace: &GitButlerWorkspaceJson,
+    ) -> Result<()> {
+        let code = |s: &str| format!("`{s}`");
+        outln!(
+            w,
+            "On a **GitButler workspace** · {}",
+            self.workspace_summary(workspace, |s| format!("`{s}`"))
+                .replace("  ·  ", " · ")
+        );
+        outln!(w);
+        for head in &workspace.heads {
+            let ahead = head
+                .ahead
+                .map(|n| format!(" · {n} ahead"))
+                .unwrap_or_default();
+            outln!(
+                w,
+                "- **{}** `{}` {}{ahead}",
+                code(&workspace_head_label(head)),
+                short_hex(&head.commit),
+                head.subject
+            );
+        }
+        outln!(w);
         Ok(())
     }
 
@@ -537,6 +682,9 @@ impl StatusOutcome {
                     .filter_map(|action| match action {
                         StatusAction::DiscardWorktreeChanges => None,
                         StatusAction::Stage => Some("grit add `PATH` to stage".to_owned()),
+                        StatusAction::Commit if self.gitbutler_workspace.is_some() => {
+                            Some("`but commit` to commit (GitButler workspace)".to_owned())
+                        }
                         StatusAction::Commit => {
                             Some("grit commit `\"message\"` to commit".to_owned())
                         }
@@ -556,6 +704,11 @@ impl StatusOutcome {
     fn render_markdown_header(&self, w: &mut dyn Write, ctx: &RenderContext) -> Result<()> {
         let branch = self.branch.as_deref().unwrap_or_default();
         let base = self.header_comparison_name();
+        if let (Some(workspace), StatusHeader::Branch(_)) =
+            (&self.gitbutler_workspace, &self.header)
+        {
+            return self.render_workspace_markdown(w, workspace);
+        }
         match &self.header {
             StatusHeader::Branch(StandingHeader::Compared(Standing::Ahead)) => {
                 outln!(
@@ -718,6 +871,9 @@ fn kind_label(kind: &ConflictKind) -> &'static str {
         ConflictKind::DeletedByUs => "deleted by us",
         ConflictKind::DeletedByThem => "deleted by them",
         ConflictKind::RenameRename(_) => "renamed differently",
+        ConflictKind::DirectoryRenameMoved(_) => "moved with its directory",
+        ConflictKind::DirectoryRenameSplit => "directory split up",
+        ConflictKind::DirectoryRenameBlocked(_) => "directory move blocked",
     }
 }
 
@@ -775,7 +931,7 @@ pub struct StatusCliArgs {
     #[arg(long)]
     pub ignored: bool,
     /// One line per path: two-letter index/worktree code plus path (`??` / `!!` for untracked / ignored).
-    #[arg(long)]
+    #[arg(short = 's', long)]
     pub short: bool,
     #[command(flatten)]
     pub pathspecs: PathspecArgs,
@@ -826,7 +982,26 @@ pub fn run(args: &StatusCliArgs) -> Result<StatusOutcome> {
         .as_ref()
         .map(|t| t.newest_ahead.as_slice())
         .unwrap_or(&[]);
-    let commit_rows = context::commit_summaries(&repo, newest_ahead)?;
+    let mut commit_rows = context::commit_summaries(&repo, newest_ahead)?;
+    // On a GitButler workspace its merge commit is bookkeeping: the applied branches stand in
+    // for it, and it is left out of the commits ahead.
+    let workspace = GitButlerWorkspace::detect(&repo).context("could not read HEAD")?;
+    if let Some(workspace) = &workspace {
+        commit_rows.retain(|c| c.oid != workspace.commit);
+    }
+    let workspace_rows = match &workspace {
+        Some(workspace) => context::commit_summaries(&repo, &workspace.head_commits())?,
+        None => Vec::new(),
+    };
+    let gitbutler_workspace = match &workspace {
+        Some(workspace) => Some(workspace_json(
+            &repo,
+            workspace,
+            &workspace_rows,
+            standing.target.as_ref().filter(|_| show_counts),
+        )?),
+        None => None,
+    };
     let ahead_oids: Vec<_> = commit_rows.iter().map(|c| c.oid).collect();
     let commits = if ahead_oids.is_empty() {
         Vec::new()
@@ -851,12 +1026,30 @@ pub fn run(args: &StatusCliArgs) -> Result<StatusOutcome> {
     let integration_hint = standing.branch.as_deref().and_then(|branch| {
         grit_lib::refs::branch_tracking::status_integration_hint(&standing, Some((&repo, branch)))
     });
+    let interrupted_rewrite_lock_holder = model
+        .interrupted_rewrite
+        .as_ref()
+        .filter(|outcome| matches!(outcome, InterruptedRewrite::Pending))
+        .and_then(|_| {
+            let lock_path = repo.git_dir().join("index.lock");
+            grit_lib::lockfile::LockHolder::read(&lock_path).map(|h| LockHolderJson {
+                pid: h.pid,
+                running: h.running,
+            })
+        });
     Ok(StatusOutcome {
         branch,
         detached: matches!(model.head, HeadState::Detached { .. }),
         head: model.head.oid().map(ObjectId::to_hex),
         target: standing.target.as_ref().map(|t| t.name.clone()),
-        ahead: standing.target.as_ref().and_then(|t| t.ahead),
+        ahead: standing
+            .target
+            .as_ref()
+            .and_then(|t| t.ahead)
+            .map(|n| match &workspace {
+                Some(_) => n.saturating_sub(1),
+                None => n,
+            }),
         behind: standing.target.as_ref().and_then(|t| t.behind),
         upstream: standing.upstream.as_ref().map(tracked_to_upstream_json),
         commits,
@@ -871,6 +1064,7 @@ pub fn run(args: &StatusCliArgs) -> Result<StatusOutcome> {
         ignored: ignored_json,
         stash_count: model.stash_count,
         interrupted_rewrite: model.interrupted_rewrite.map(InterruptedRewriteJson::from),
+        gitbutler_workspace,
         header,
         commit_rows,
         staged_entries: model.staged,
@@ -883,7 +1077,49 @@ pub fn run(args: &StatusCliArgs) -> Result<StatusOutcome> {
         integration_hint,
         short_format: args.short,
         short_lines,
+        interrupted_rewrite_lock_holder,
+        workspace_rows,
     })
+}
+
+/// `grit status --json`'s view of `workspace`; `rows` are its heads' summaries, in order.
+fn workspace_json(
+    repo: &grit_lib::repo::Repository,
+    workspace: &GitButlerWorkspace,
+    rows: &[CommitSummary],
+    target: Option<&TrackedComparison>,
+) -> Result<GitButlerWorkspaceJson> {
+    let heads = workspace
+        .heads
+        .iter()
+        .zip(rows)
+        .map(|(head, row)| {
+            let ahead = target
+                .map(|target| TipComparison::compute(repo, head.commit, target.oid, 0))
+                .transpose()
+                .context("could not compare a workspace branch with the target")?
+                .map(|comparison| comparison.ahead);
+            Ok(WorkspaceHeadJson {
+                commit: head.commit.to_hex(),
+                branches: head.branches.clone(),
+                subject: row.subject.clone(),
+                ahead,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(GitButlerWorkspaceJson {
+        commit: workspace.commit.to_hex(),
+        heads,
+    })
+}
+
+/// The branch names at a workspace head, or `(no branch)` when none points there.
+fn workspace_head_label(head: &WorkspaceHeadJson) -> String {
+    if head.branches.is_empty() {
+        "(no branch)".to_owned()
+    } else {
+        head.branches.join(", ")
+    }
 }
 
 fn integration_hint_command(hint: &StatusIntegrationHint, markdown: bool) -> String {

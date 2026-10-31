@@ -7,11 +7,11 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::diff::{
-    entry_is_racy, hash_worktree_file, index_mtime_for_diff,
-    refresh_index_stat_content_verified_with_rules, stat_matches,
+    entry_is_racy, hash_worktree_file, index_mtime_for_diff, stat_matches,
+    submodule_embedded_git_dir,
 };
+use crate::environment::RepositoryOptions;
 use crate::error::{Error, Result};
-use crate::index::index_file_mtime;
 use crate::index::{
     entry_from_metadata, Index, IndexEntry, IndexLock, MODE_EXECUTABLE, MODE_GITLINK,
 };
@@ -22,9 +22,10 @@ use crate::pathspec::{
     pathspec_is_exclude, sorted_paths_match_pathspec, PathspecListMatcher, PathspecMatchContext,
 };
 use crate::porcelain::checkout::{
-    remove_empty_parent_dirs, write_blob_to_worktree, write_smudged_blob_to_worktree,
-    LeadingDirCache,
+    checkout_between_trees, remove_empty_parent_dirs, write_blob_to_worktree,
+    write_smudged_blob_to_worktree, CheckoutJournal, LeadingDirCache,
 };
+use crate::porcelain::index_from_tree::refresh_stage0_index_stats_for_paths;
 use crate::porcelain::stash::{flat_tree_lookup, flatten_tree_full, FlatTreeEntry};
 use crate::progress::{poll_cancel, Cancel, ProgressPhase, ProgressSink};
 use crate::repo::Repository;
@@ -88,18 +89,21 @@ pub struct RestoreOutcome {
 /// # Errors
 ///
 /// Returns [`Error::PathspecNoMatch`] when a positive pathspec matches nothing, and
-/// [`Error::RestorePathUnmerged`] (before writing anything) when the worktree would be
-/// restored from the index for paths with conflict stages; use [`RestoreOptions::stage`] or
-/// [`RestoreOptions::remerge`] for those. `--staged` and an explicit tree source replace
-/// conflict stages instead. Conflict options ([`RestoreOptions::stage`], [`RestoreOptions::remerge`]) also
+/// [`Error::RestorePathUnmerged`] (before writing anything) when a matched path has conflict
+/// stages and the restore would either write the worktree from the index or, with `--staged`
+/// alone, replace the stages while the worktree keeps its conflict markers. Use
+/// [`RestoreOptions::stage`] or [`RestoreOptions::remerge`] for those paths, or stage the
+/// edited file. `--staged --worktree` replaces the stages and the worktree file together, and
+/// `--source` without `--staged` writes only the worktree, leaving the stages in place.
+/// Conflict options ([`RestoreOptions::stage`], [`RestoreOptions::remerge`]) also
 /// return [`Error::RestoreConflictWithStaged`], [`Error::RestoreConflictWithSource`],
 /// [`Error::RestoreConflictMissingOurs`], [`Error::RestoreConflictMissingTheirs`],
 /// or [`Error::RestoreConflictNotUnmerged`] when the index shape does not allow
 /// the requested checkout. [`Error::LockHeld`] means another process holds `index.lock`;
 /// the lock is taken before the index is read, so nothing was changed. [`Error::Cancelled`]
 /// means `cancel` (or [`ProgressSink::should_cancel`]) fired while restoring the work tree:
-/// files already written stay, but the index is not written. Other failures are I/O or
-/// object-store errors.
+/// every work-tree change is rolled back (including directories replaced by files), and the
+/// index is not written. Other failures are I/O or object-store errors.
 ///
 /// Work-tree writes report [`crate::progress::ProgressPhase::CheckingOutFiles`] to `progress`.
 pub fn restore_paths(
@@ -136,7 +140,11 @@ pub(crate) fn restore_paths_with_lock(
     let work_tree = repo.work_tree().ok_or(Error::RequiresWorkTree)?;
     let pathspec_ctx = repo.pathspec_match_context();
     let restore_staged = opts.staged;
-    if !restore_staged && matches!(opts.source, RestoreSource::Index) {
+    // An index-only restore would collapse the conflict stages while the worktree keeps its
+    // markers, so the next auto-staging commit would record them as the resolution.
+    let index_only = restore_staged && !opts.worktree;
+    let worktree_from_index = !restore_staged && matches!(opts.source, RestoreSource::Index);
+    if index_only || worktree_from_index {
         let unmerged = collect_conflict_matched_paths(&index, &opts.pathspecs, false, pathspec_ctx);
         if !unmerged.is_empty() {
             return Err(Error::RestorePathUnmerged {
@@ -405,10 +413,40 @@ fn restore_conflict_side(
         });
     };
     if entry.mode == MODE_GITLINK {
+        checkout_submodule_worktree_to_commit(&work_tree.join(path), entry.oid)?;
+        outcome.restored.push(path.to_string());
         return Ok(());
     }
     write_smudged_blob_to_worktree(repo, work_tree, rules, path, &entry.oid, entry.mode)?;
     outcome.restored.push(path.to_string());
+    Ok(())
+}
+
+fn checkout_submodule_worktree_to_commit(sub_worktree: &Path, oid: ObjectId) -> Result<()> {
+    let Some(git_dir) = submodule_embedded_git_dir(sub_worktree) else {
+        return Err(Error::Message(format!(
+            "submodule at '{}' is not checked out",
+            sub_worktree.display()
+        )));
+    };
+    let sub_repo = Repository::open(
+        &git_dir,
+        &RepositoryOptions::empty().with_work_tree(sub_worktree),
+    )?;
+    let commit_obj = sub_repo.odb().read(&oid)?;
+    let tree = parse_commit(&commit_obj.data)?.tree;
+    let from_tree = resolve_head_for_repository(&sub_repo)
+        .ok()
+        .and_then(|head| head.oid().copied())
+        .and_then(|head_oid| {
+            sub_repo
+                .odb()
+                .read(&head_oid)
+                .ok()
+                .and_then(|c| parse_commit(&c.data).ok().map(|p| p.tree))
+        });
+    checkout_between_trees(&sub_repo, from_tree.as_ref(), &tree)?;
+    crate::refs::write_ref(&git_dir, "HEAD", &oid)?;
     Ok(())
 }
 
@@ -662,6 +700,17 @@ struct WorktreeRestoreContext<'a> {
 }
 
 fn apply_worktree_restore(ctx: WorktreeRestoreContext<'_>) -> Result<()> {
+    let repo = ctx.repo;
+    let work_tree = ctx.work_tree;
+    let mut journal = CheckoutJournal::new(work_tree)?;
+    let result = apply_worktree_restore_inner(ctx, &mut journal);
+    journal.finish(repo, result)
+}
+
+fn apply_worktree_restore_inner(
+    ctx: WorktreeRestoreContext<'_>,
+    journal: &mut CheckoutJournal,
+) -> Result<()> {
     let WorktreeRestoreContext {
         repo,
         work_tree,
@@ -721,6 +770,7 @@ fn apply_worktree_restore(ctx: WorktreeRestoreContext<'_>) -> Result<()> {
                 mode,
                 &rules,
                 &mut dir_cache,
+                journal,
                 index_out,
                 outcome,
                 index_dirty,
@@ -742,8 +792,7 @@ fn apply_worktree_restore(ctx: WorktreeRestoreContext<'_>) -> Result<()> {
             if meta.is_dir() && !meta.file_type().is_symlink() {
                 continue;
             }
-            if fs::remove_file(&abs).is_ok() {
-                remove_empty_parent_dirs(work_tree, &abs);
+            if remove_worktree_path_for_restore(work_tree, path, journal)? {
                 outcome.removed.push(path.clone());
             }
         }
@@ -758,7 +807,6 @@ fn apply_worktree_restore(ctx: WorktreeRestoreContext<'_>) -> Result<()> {
         let src = tree_source
             .and_then(|entries| flat_tree_lookup(entries, path))
             .cloned();
-        let abs = work_tree.join(path);
         match src {
             Some(entry) => {
                 let existing = index_out.get(path.as_bytes(), 0).cloned();
@@ -771,6 +819,7 @@ fn apply_worktree_restore(ctx: WorktreeRestoreContext<'_>) -> Result<()> {
                     true,
                     &rules,
                     &mut dir_cache,
+                    journal,
                     index_out,
                     outcome,
                     index_dirty,
@@ -780,14 +829,7 @@ fn apply_worktree_restore(ctx: WorktreeRestoreContext<'_>) -> Result<()> {
                 if !tracked_for_worktree_deletion.contains(path.as_bytes()) {
                     continue;
                 }
-                let Ok(meta) = fs::symlink_metadata(&abs) else {
-                    continue;
-                };
-                if meta.is_dir() && !meta.file_type().is_symlink() {
-                    continue;
-                }
-                if fs::remove_file(&abs).is_ok() {
-                    remove_empty_parent_dirs(work_tree, &abs);
+                if remove_worktree_path_for_restore(work_tree, path, journal)? {
                     outcome.removed.push(path.clone());
                 }
             }
@@ -796,6 +838,24 @@ fn apply_worktree_restore(ctx: WorktreeRestoreContext<'_>) -> Result<()> {
     progress.finish();
 
     Ok(())
+}
+
+/// Spool a tracked file out of the work tree for restore; returns whether a file was removed.
+fn remove_worktree_path_for_restore(
+    work_tree: &Path,
+    path: &str,
+    journal: &CheckoutJournal,
+) -> Result<bool> {
+    let abs = work_tree.join(path);
+    let Ok(meta) = fs::symlink_metadata(&abs) else {
+        return Ok(false);
+    };
+    if meta.is_dir() && !meta.file_type().is_symlink() {
+        return Ok(false);
+    }
+    journal.spool_remove(path)?;
+    remove_empty_parent_dirs(work_tree, &abs);
+    Ok(true)
 }
 
 fn worktree_index_entry_up_to_date(
@@ -864,6 +924,7 @@ fn restore_worktree_blob_from_index(
     mode: u32,
     rules: &WorktreeRules,
     dir_cache: &mut LeadingDirCache,
+    journal: &mut CheckoutJournal,
     index_out: &mut Index,
     outcome: &mut RestoreOutcome,
     index_dirty: &mut bool,
@@ -871,6 +932,7 @@ fn restore_worktree_blob_from_index(
     if mode == MODE_GITLINK {
         return Ok(());
     }
+    journal.preserve_before_write(path)?;
     let meta = restore_blob_to_worktree(repo, rules, work_tree, path, &oid, mode, dir_cache)?;
     let index_path = crate::repo_relpath::storage_bytes(path);
     index_out.add_or_replace(entry_from_metadata(&meta, index_path.as_ref(), oid, mode));
@@ -889,6 +951,7 @@ fn restore_worktree_entry(
     worktree_from_tree: bool,
     rules: &WorktreeRules,
     dir_cache: &mut LeadingDirCache,
+    journal: &mut CheckoutJournal,
     index_out: &mut Index,
     outcome: &mut RestoreOutcome,
     index_dirty: &mut bool,
@@ -896,6 +959,7 @@ fn restore_worktree_entry(
     if entry.mode == MODE_GITLINK {
         return Ok(());
     }
+    journal.preserve_before_write(path)?;
     let meta = restore_blob_to_worktree(
         repo, rules, work_tree, path, &entry.oid, entry.mode, dir_cache,
     )?;
@@ -953,33 +1017,7 @@ fn refresh_restored_index_stats(
         .chain(outcome.removed.iter())
         .map(String::as_str)
         .collect();
-    if touched.is_empty() {
-        return Ok(());
-    }
-    let index_mtime = index_file_mtime(&repo.index_path());
-    let rules = WorktreeRules::from_repository(repo, index).ok();
-    let rules_arc = rules.map(|r| std::sync::Arc::new(std::sync::Mutex::new(r)));
-    let mut subset = index.clone();
-    subset
-        .entries
-        .retain(|e| e.stage() == 0 && touched.contains(String::from_utf8_lossy(&e.path).as_ref()));
-    if subset.entries.is_empty() {
-        return Ok(());
-    }
-    let _ = refresh_index_stat_content_verified_with_rules(
-        repo.odb(),
-        repo.git_dir(),
-        &mut subset,
-        work_tree,
-        index_mtime,
-        repo.config().ok().as_deref(),
-        None,
-        rules_arc.as_ref(),
-    )?;
-    for entry in subset.entries {
-        index.stage_file(entry);
-    }
-    Ok(())
+    refresh_stage0_index_stats_for_paths(repo, work_tree, index, &touched).map(|_| ())
 }
 
 fn blob_index_size(repo: &Repository, entry: &FlatTreeEntry) -> Result<u32> {
@@ -1157,6 +1195,36 @@ mod tests {
     }
 
     #[test]
+    fn restore_staged_only_refuses_unmerged_path_and_keeps_stages() {
+        let (dir, repo) = conflicted_repo();
+        for pathspec in ["f", "."] {
+            let err = restore_paths(
+                &repo,
+                &RestoreOptions {
+                    staged: true,
+                    worktree: false,
+                    ..opts(pathspec)
+                },
+                &mut NullProgress,
+                &NeverCancel,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(&err, Error::RestorePathUnmerged { paths } if paths == &["f"]),
+                "{err:?}"
+            );
+        }
+        let index = repo.load_index().expect("index");
+        assert!(index.get(b"f", 0).is_none());
+        assert!((1..=3).all(|stage| index.get(b"f", stage).is_some()));
+        assert!(index.resolve_undo.is_none());
+        assert_eq!(
+            std::fs::read(dir.path().join("f")).expect("f"),
+            b"<<<<<<< ours\n"
+        );
+    }
+
+    #[test]
     fn restore_merged_path_beside_unmerged_one_succeeds() {
         let (dir, repo) = conflicted_repo();
         let outcome =
@@ -1204,5 +1272,101 @@ mod tests {
             paths: vec!["a".into(), "b".into()],
         };
         assert_eq!(err.to_string(), "paths are unmerged: 'a', 'b'");
+    }
+
+    fn gitlink_conflict_entry(path: &str, stage: u16, oid: ObjectId) -> IndexEntry {
+        IndexEntry {
+            ctime_sec: 0,
+            ctime_nsec: 0,
+            mtime_sec: 0,
+            mtime_nsec: 0,
+            dev: 0,
+            ino: 0,
+            mode: MODE_GITLINK,
+            uid: 0,
+            gid: 0,
+            size: 0,
+            oid,
+            flags: (path.len() as u16) | (stage << 12),
+            flags_extended: None,
+            path: path.as_bytes().to_vec(),
+            base_index_pos: 0,
+        }
+    }
+
+    fn commit_in_nested(repo: &Repository, rel: &str, content: &[u8], msg: &str) -> ObjectId {
+        let wt = repo.work_tree().expect("wt");
+        std::fs::write(wt.join(rel), content).expect("write");
+        let blob = repo.odb().write(ObjectKind::Blob, content).expect("blob");
+        let mut tree_body = format!("100644 {rel}\0").into_bytes();
+        tree_body.extend_from_slice(blob.as_bytes());
+        let tree = repo
+            .odb()
+            .write(ObjectKind::Tree, &tree_body)
+            .expect("tree");
+        let commit_body =
+            format!("tree {tree}\nauthor t <t@t> 0 +0000\ncommitter t <t@t> 0 +0000\n\n{msg}\n");
+        repo.odb()
+            .write(ObjectKind::Commit, commit_body.as_bytes())
+            .expect("commit")
+    }
+
+    fn open_nested_repo(nested_root: &std::path::Path) -> Repository {
+        let git = nested_root.join(".git");
+        std::fs::create_dir_all(git.join("objects")).expect("objects");
+        std::fs::create_dir_all(git.join("refs/heads")).expect("refs");
+        std::fs::write(git.join("HEAD"), "ref: refs/heads/main\n").expect("head");
+        std::fs::write(
+            git.join("config"),
+            "[core]\n\trepositoryformatversion = 0\n\tbare = false\n",
+        )
+        .expect("config");
+        Repository::open(
+            &git,
+            &RepositoryOptions::empty().with_work_tree(nested_root),
+        )
+        .expect("open nested")
+    }
+
+    #[test]
+    fn restore_conflict_side_checks_out_submodule_without_clearing_stages() {
+        let (dir, repo) = init_repo();
+        let wt = repo.work_tree().expect("wt");
+        let sub = wt.join("sub");
+        std::fs::create_dir_all(&sub).expect("mkdir sub");
+        let sub_repo = open_nested_repo(&sub);
+        let base = commit_in_nested(&sub_repo, "f.txt", b"base\n", "base");
+        let ours = commit_in_nested(&sub_repo, "f.txt", b"ours\n", "ours");
+        let theirs = commit_in_nested(&sub_repo, "f.txt", b"theirs\n", "theirs");
+        crate::refs::write_ref(&sub_repo.git_dir(), "refs/heads/main", &ours).expect("sub head");
+        crate::refs::write_symbolic_ref(&sub_repo.git_dir(), "HEAD", "refs/heads/main")
+            .expect("sym");
+
+        let mut index = repo.load_index().expect("index");
+        index.entries.push(gitlink_conflict_entry("sub", 1, base));
+        index.entries.push(gitlink_conflict_entry("sub", 2, ours));
+        index.entries.push(gitlink_conflict_entry("sub", 3, theirs));
+        index.sort();
+        repo.write_index(&mut index).expect("write index");
+
+        restore_paths(
+            &repo,
+            &RestoreOptions {
+                stage: Some(ConflictSide::Theirs),
+                ..opts("sub")
+            },
+            &mut NullProgress,
+            &NeverCancel,
+        )
+        .expect("restore theirs");
+
+        let index = repo.load_index().expect("index");
+        assert!(index.get(b"sub", 3).is_some(), "stages stay unmerged");
+        assert_eq!(
+            crate::diff::read_submodule_head_oid(&sub),
+            Some(theirs),
+            "submodule worktree should match stage 3"
+        );
+        let _ = dir;
     }
 }

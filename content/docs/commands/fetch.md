@@ -8,7 +8,7 @@ order: 2
 ## Synopsis
 
 ```text
-grit fetch [<remote>] [<refspec>…] [--all] [--depth N] [--deepen N] [--unshallow] [--tags] [--no-tags] [--prune] [--no-prune] [--dry-run] [-q]
+grit fetch [<remote>] [<refspec>…] [--all] [--depth N] [--deepen N] [--unshallow] [--tags] [--no-tags] [--prune] [--no-prune] [--dry-run] [-f] [-q]
 ```
 
 ## Description
@@ -23,17 +23,19 @@ When the source is a **literal path or URL** (not a configured remote), grit doe
 
 Human output lists each local ref with its remote source and old → new oids. Pruned refs show `deleted`; rejected updates are listed and exit **1** (same as [`grit push`](../push/) rejections). When a stale remote-tracking ref blocks another update (for example `origin/gone/x` still exists locally but the remote now has `gone`), grit still applies every ref it can and reports the blocked ref as rejected; the `reason` field suggests `grit fetch --prune` or `grit remote prune <remote>` when pruning would remove the stale ref.
 
-When the fetch received objects, the ref list is followed by the same transfer summary [`grit clone`](../clone/) prints: a `time` bar splitting the run into connecting, receiving, indexing, resolving deltas and finishing; the `data` received off the wire with its average and peak rate; and the `objects` received by type. Nothing extra is printed when the fetch was already up to date. With `--all`, one summary after the last remote covers the whole run.
+When the fetch received objects, the ref list is followed by the same transfer summary [`grit clone`](../clone/) prints: a `time` bar splitting the run into connecting, receiving, indexing, resolving deltas and finishing; the `data` received off the wire with its average and peak rate; and the `objects` received by type. Local `file://` and plain-path remotes use the same summary shape, with **Enumerating** (reachability walk) and **Copying** (link or pack the send set) instead of network **Receiving**. Nothing extra is printed when the fetch was already up to date. With `--all`, one summary after the last remote covers the whole run.
 
 On a terminal, stderr first shows `Fetching <remote> <url>`, then one live progress line per phase with a throughput graph and, under it, an overall bar with a time-left estimate. Finished phases stay on screen as `✓` lines. When stderr is not a TTY, or with `--json`, `--markdown` or `-q`, no progress is drawn.
 
 By default grit follows tags, fetching every tag (lightweight or annotated) that points into the fetched history. That includes tags on commits, trees and blobs that arrive with the fetch, and tags on trees or blobs you already have. A tag on a commit you already have is followed only when the fetched refs reach that commit; Git also follows it when the commit is unreachable from them. In a partial clone, tag following never downloads missing objects. `--tags` fetches every remote tag, and `--no-tags` disables automatic tags. Tag following costs milliseconds even on large repositories. `remote.<name>.tagOpt` (`--tags` / `--no-tags`) applies when the CLI does not override it.
 
-A refspec that names tags (`refs/tags/rel:refs/tags/rel2`, `refs/tags/*:refs/tags/*`) is honoured like any other refspec, whatever the tag mode. Fetch never moves an existing local tag unless the refspec is forced: when the remote retargets a tag, `grit fetch origin '+refs/tags/rel:refs/tags/rel'` updates it (status `forced`), and without `+` the update is rejected.
+Default tag following never updates a tag you already have locally, even when the remote retargets it — a plain `grit fetch` stays quiet and exits **0**, matching Git. To refresh moved release tags, use `grit fetch --tags` (reports a rejection until you accept the move) or `grit fetch --tags --force`. A refspec that names tags (`refs/tags/rel:refs/tags/rel2`, `refs/tags/*:refs/tags/*`) is honoured like any other refspec; a leading `+` or `--force` on the fetch forces the update (status `forced`).
 
 `--dry-run` negotiates and reports updates without writing refs, objects, or `FETCH_HEAD`. Human output ends with **Would fetch N update(s) from …** when anything would change, or **Already up to date with …** when nothing would.
 
 `--depth`, `--deepen`, and `--unshallow` match Git’s shallow fetch controls (mutually exclusive). `--depth` truncates history on the first shallow fetch; `--deepen` adds commits relative to an existing shallow clone; `--unshallow` fetches the rest and removes `.git/shallow`. `--unshallow` on a complete repository is a typed error. With default tag following, tags on newly fetched history (including annotated tags) arrive in that same operation; a second fetch is unnecessary. Following tags does not extend the requested branch depth. A shallow source can only supply its available history, so boundaries remain when the source is incomplete.
+
+In a partial clone, a fetch takes part in the server's `promisor-remote` exchange (protocol v2) the way [`grit clone`](../clone/#large-object-promisors) does: it accepts the advertised large-object promisors that `promisor.acceptFromServer` allows, tells the server so, and applies `promisor.storeFields`. A remote whose `partialclonefilter` is `auto` (a clone made with `--blobs auto`) picks its filter on every fetch from the accepted remotes' advertised `partialCloneFilter`. A fetch that is neither filtered nor from a promisor remote declines every promisor remote (`not_partial`), because it needs every object from the server; that includes an unfiltered fetch from a second, non-promisor remote of a partial clone, whose pack would otherwise be marked promisor although no promisor remote can give its objects back. The human output adds a `promisor` line per advertised remote, for example `promisor  lop accepted · blob:limit=5k`, and `promisor  stored partialCloneFilter for lop` for each stored field.
 
 `-q` / `--quiet` suppresses progress and human output (JSON and markdown are unchanged).
 
@@ -56,6 +58,7 @@ Local fetches reuse the repository's ref store across tracking refs and tags. An
 | `--depth N` | Shallow fetch: keep at most N commits from each tip. |
 | `--deepen N` | Deepen a shallow clone by N commits (relative). |
 | `--unshallow` | Fetch full history and drop shallow boundaries. |
+| `-f`, `--force` | Force non-fast-forward branch updates and tag moves when combined with `--tags` or a forced refspec. Does not move existing tags on a default fetch. |
 | `-q`, `--quiet` | Suppress progress and human stdout/stderr. |
 
 ## Examples
@@ -132,6 +135,9 @@ Schema: [v1](/schemas/fetch/v1.json)
 | `updates` | array | Per-ref results. Each object has `ref`, `remote_ref`, `status` (`new`, `fast_forward`, `forced`, `pruned`, `rejected`, or `up_to_date`), `old_oid` and `new_oid` (full hex or `null`), and `reason` when `status` is `rejected`. |
 | `updated` | number | Count of refs that actually changed. Always **0** when `dry_run` is true (nothing is written); count pending changes by filtering `updates` where `status` is not `up_to_date`. |
 | `shallow` | object | When present: `added` and `removed` lists of full hex oids for new/removed `.git/shallow` boundaries. |
+| `promisor_remotes` | array | When the server advertised promisor remotes: `name`, `url` (credentials removed), `accepted`, `filter` (advertised `partialCloneFilter` or `null`) and `rejected` (`policy_none`, `unknown_remote`, `url_mismatch`, `field_missing`, `field_mismatch`, `not_partial`, or `null` when accepted). Tokens are never shown. |
+| `stored_fields` | array | When `promisor.storeFields` changed config: `remote` and `field` (`partialCloneFilter` or `token`), never the value. |
+| `promisor_warnings` | array | Promisor config or advertised values that were ignored: `code` is `unknown_accept_value` (`promisor.acceptFromServer` is not a known policy, so nothing is accepted), `unknown_field` (a `promisor.checkFields` / `promisor.storeFields` entry is not a known field), `invalid_advertised_value` (an advertised field was not stored because its value is invalid) or `unusable_auto_filter` (`--blobs auto` cannot use an accepted remote's filter, such as `tree:0`); `key`, `remote`, `field` and `value` say which, when they apply. A rejected advertised value is never shown. Shown as `promisor  warning: …` lines in the human output and `promisor warning` bullets in `--markdown`. |
 
 Example:
 
@@ -223,7 +229,7 @@ Already up to date with `origin`.
 
 See [Exit codes](../exit-codes/) for shared rules and structured `--json` `kind` values.
 
-An HTTPS remote that wants credentials fails with `kind` `auth_required` (none available) or `auth_rejected` (refused). Credentials come from your credential helper, then an askpass program (`GIT_ASKPASS`, `core.askPass`, `SSH_ASKPASS`), as in Git; see [Credentials](../agents/#credentials-https).
+An HTTPS remote that wants credentials fails with `kind` `auth_required` (none available) or `auth_rejected` (refused). Credentials come from your credential helper, then an askpass program (`GIT_ASKPASS`, `core.askPass`, `SSH_ASKPASS`), as in Git; save a user name and token for any host with `grit auth <url> --username <user> --token <token>`. See [Credentials](../agents/#credentials-https).
 
 
 ## See also

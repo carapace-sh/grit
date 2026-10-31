@@ -48,9 +48,12 @@ pub struct GlobalRepoArgs {
         add = completer!(Action::directories())
     )]
     pub work_tree: Option<PathBuf>,
+    /// Skip opportunistic index updates that take optional locks (same as `GIT_OPTIONAL_LOCKS=0`).
+    #[arg(long = "no-optional-locks", global = true)]
+    pub no_optional_locks: bool,
 }
 
-fn parse_config_override(spec: &str) -> Result<ConfigOverride, String> {
+pub(crate) fn parse_config_override(spec: &str) -> Result<ConfigOverride, String> {
     spec.parse()
         .map_err(|err: grit_lib::error::Error| err.to_string())
 }
@@ -89,6 +92,9 @@ impl GlobalRepoArgs {
         }
         if changed_dir {
             std::env::set_var("PWD", cwd);
+        }
+        if self.no_optional_locks {
+            std::env::set_var("GIT_OPTIONAL_LOCKS", "0");
         }
         if self.git_dir.is_none() && self.work_tree.is_none() && self.config.is_empty() {
             return Ok(());

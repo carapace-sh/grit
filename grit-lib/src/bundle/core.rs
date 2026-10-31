@@ -191,6 +191,10 @@ impl From<std::io::Error> for BundleError {
     }
 }
 
+fn io_open_path(path: &Path, source: std::io::Error) -> BundleError {
+    BundleError::Io(format!("could not open '{}': {source}", path.display()))
+}
+
 impl BundleError {
     /// Whether the bundle operation was cancelled.
     #[must_use]
@@ -352,6 +356,9 @@ impl Bundle {
     /// no temporary file is created. A filtered (v3 `filter`) bundle is then not marked
     /// as a promisor pack, since there is no pack to mark.
     ///
+    /// Pack integrity is checked while building the pack index (object hashes and the
+    /// pack trailer); there is no second full read of the pack after indexing.
+    ///
     /// # Errors
     ///
     /// Returns [`BundleError`] or ingest failures wrapped as [`BundleError::Io`].
@@ -458,6 +465,9 @@ impl Bundle {
         crate::progress::poll_cancel(progress, cancel).map_err(bundle_ingest_error)?;
         let opts = IngestPackOptions {
             fix_thin: true,
+            // Indexing hashes every object and the trailer is checked while
+            // installing, so a second full read of the pack proves nothing.
+            skip_post_index_verify: true,
             ..Default::default()
         };
         ingest_received_pack_path_with_progress(
@@ -553,7 +563,7 @@ fn read_header_lines(reader: &mut dyn BufRead) -> std::result::Result<BundleHead
 const HEADER_READ_BUF: usize = 64 * 1024;
 
 fn read_header_from_file(path: &Path) -> std::result::Result<(BundleHeader, u64), BundleError> {
-    let file = File::open(path).map_err(BundleError::from)?;
+    let file = File::open(path).map_err(|e| io_open_path(path, e))?;
     let mut reader = std::io::BufReader::with_capacity(HEADER_READ_BUF, file);
     let header = read_header_lines(&mut reader)?;
     let mut pack_offset = reader.stream_position().map_err(BundleError::from)?;
@@ -1089,10 +1099,8 @@ fn filtered_pack_objects(
     have_closure: &HashSet<ObjectId>,
 ) -> Result<Vec<ObjectId>> {
     let positive: Vec<String> = include.iter().map(ObjectId::to_hex).collect();
-    let negative: Vec<String> = exclude
-        .iter()
-        .map(|oid| format!("^{}", oid.to_hex()))
-        .collect();
+    // `rev_list` takes the excluded tips bare: they are already the negative side.
+    let negative: Vec<String> = exclude.iter().map(ObjectId::to_hex).collect();
     let options = RevListOptions {
         objects: true,
         no_object_names: true,
@@ -1245,6 +1253,17 @@ mod tests {
         let bundle = Bundle::open(file.path()).expect("open");
         assert_eq!(bundle.header().refs.len(), refs);
         assert_eq!(bundle.pack_byte_offset(), (HEADER_READ_BUF - 2) as u64);
+    }
+
+    #[test]
+    fn open_missing_file_names_path() {
+        let path = std::path::Path::new("/no/such/bundle/path.bundle");
+        let err = Bundle::open(path).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("could not open") && msg.contains("path.bundle"),
+            "{msg}"
+        );
     }
 
     #[test]

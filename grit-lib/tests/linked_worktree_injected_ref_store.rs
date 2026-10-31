@@ -13,7 +13,7 @@ use grit_lib::objects::odb::store::MemoryStore;
 use grit_lib::objects::odb::OdbBuilder;
 use grit_lib::objects::{HashAlgo, ObjectId};
 use grit_lib::porcelain::add::{stage, StageOptions};
-use grit_lib::porcelain::commit::{commit_with_scope, CommitRequest, CommitScope};
+use grit_lib::porcelain::commit::{commit_with_scope, CommitScope};
 use grit_lib::porcelain::switch::{switch_repository, SwitchMode, SwitchOptions};
 use grit_lib::progress::{NeverCancel, NullProgress};
 use grit_lib::refs::store::{MemoryRefStore, RawRef, RefStore};
@@ -83,12 +83,7 @@ fn commit_change(repo: &Repository, file: &Path, message: &str) -> ObjectId {
     .expect("stage");
     commit_with_scope(
         repo,
-        &CommitRequest {
-            message: message.into(),
-            author: Some(IDENT_TS.parse().expect("signature")),
-            committer: Some(IDENT_TS.parse().expect("signature")),
-            ..Default::default()
-        },
+        &grit_test_support::commit_request(message, IDENT_TS),
         CommitScope::Staged,
         &mut NullProgress,
         &NeverCancel,

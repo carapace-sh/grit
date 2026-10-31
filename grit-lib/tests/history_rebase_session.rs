@@ -8,8 +8,9 @@ use grit_lib::objects::ObjectId;
 use grit_lib::refs::resolve_ref;
 use grit_lib::repo::Repository;
 use grit_lib::revwalk::history::{
-    abort_rebase, continue_rebase, skip_rebase, start_rebase, EmptyPolicy, RebaseOntoOptions,
-    RebaseOutcome, RebaseRequest, RebaseSessionError, RefScope, RewriteOptions, StartRebaseOptions,
+    abort_rebase, continue_rebase, read_history_last, skip_rebase, start_rebase, undo_last_rewrite,
+    EmptyPolicy, RebaseOntoOptions, RebaseOutcome, RebaseRequest, RebaseSessionError, RefScope,
+    RewriteOptions, StartRebaseOptions,
 };
 use grit_lib::state::resolve_head;
 use grit_lib::state::{detect_in_progress, HeadState, InProgressOperation};
@@ -63,6 +64,7 @@ fn start_opts(upstream: ObjectId, onto: Option<ObjectId>, tip: ObjectId) -> Star
             record_operation: None,
             hooks: grit_lib::PostOperationHooks::Run,
         },
+        pre_rebase: grit_lib::revwalk::history::PreRebase::Skip,
     }
 }
 
@@ -287,6 +289,380 @@ fn rebase_session_conflict_stop_continue_and_abort() {
 }
 
 #[test]
+fn continue_after_commit_during_rebase_conflict() {
+    use grit_lib::change_id::change_id;
+    use grit_lib::porcelain::commit::{commit_with_scope, CommitRequest, CommitScope};
+
+    let repo = HistoryRepo::init();
+    let wt = repo.worktree();
+    commit_file(wt, "f", "1\n2\n3\n", "base");
+    let upstream = git_oid(wt, "HEAD");
+    git(wt, &["switch", "-c", "o"]);
+    commit_file(wt, "f", "1\nO\n3\n", "o1");
+    let o1 = git_oid(wt, "HEAD");
+    let o1_author = git(wt, &["log", "-1", "--format=%an <%ae>", &o1.to_hex()]);
+    let o1_change_id = change_id(&open_grit(wt).odb().read_commit(&o1).expect("o1 commit"));
+    std::fs::write(wt.join("g"), "y\n").expect("g");
+    git(wt, &["add", "g"]);
+    git(wt, &["commit", "-qm", "o2"]);
+    let tip = git_oid(wt, "HEAD");
+    git(wt, &["switch", "main"]);
+    commit_file(wt, "f", "1\nM\n3\n", "m");
+    let onto = git_oid(wt, "HEAD");
+
+    let grit = open_grit(wt);
+    git(wt, &["switch", "o"]);
+    let orig_tip = git_oid(wt, "o");
+    let out = start_rebase(
+        &grit,
+        &start_opts(upstream, Some(onto), tip),
+        &mut grit_lib::progress::NullProgress,
+        &grit_lib::progress::NeverCancel,
+    )
+    .expect("start conflict");
+    assert!(matches!(out, RebaseOutcome::Stopped(_)));
+
+    std::fs::write(wt.join("f"), "1\nR\n3\n").expect("resolve");
+    commit_with_scope(
+        &grit,
+        &CommitRequest {
+            message: "resolved o1\n".into(),
+            committer: Some(IDENT.parse().expect("IDENT")),
+            ..Default::default()
+        },
+        CommitScope::AutoStage,
+        &mut grit_lib::progress::NullProgress,
+        &grit_lib::progress::NeverCancel,
+    )
+    .expect("commit resolution");
+
+    let done = continue_rebase(
+        &grit,
+        &start_opts(upstream, Some(onto), tip),
+        &mut grit_lib::progress::NullProgress,
+        &grit_lib::progress::NeverCancel,
+    )
+    .expect("continue after commit");
+    assert!(matches!(done, RebaseOutcome::Done { .. }));
+    assert!(!grit.git_dir().join("rebase-merge").exists());
+    assert_ne!(git_oid(wt, "o"), orig_tip);
+    assert_eq!(git(wt, &["show", "HEAD:f"]), "1\nR\n3\n");
+    assert_eq!(git(wt, &["show", "HEAD:g"]), "y\n");
+    assert_eq!(
+        git(wt, &["log", "-1", "--format=%s", "HEAD~1"]).trim(),
+        "resolved o1"
+    );
+    assert_eq!(
+        git(wt, &["log", "-1", "--format=%an <%ae>", "HEAD~1"]).trim(),
+        o1_author.trim()
+    );
+    if let Some(expected_id) = o1_change_id {
+        let resolved = git_oid(wt, "HEAD~1");
+        let resolved_id = change_id(&grit.odb().read_commit(&resolved).expect("resolved commit"));
+        assert_eq!(resolved_id, Some(expected_id));
+    }
+    assert_git_fsck_strict(wt);
+}
+
+#[test]
+fn continue_nothing_to_commit_when_index_matches_stop_head() {
+    let repo = HistoryRepo::init();
+    let wt = repo.worktree();
+    commit_file(wt, "f.txt", "base\n", "base");
+    let upstream = git_oid(wt, "HEAD");
+    git(wt, &["switch", "-c", "topic"]);
+    commit_file(wt, "f.txt", "topic change\n", "topic commit");
+    let tip = git_oid(wt, "HEAD");
+    git(wt, &["switch", "main"]);
+    commit_file(wt, "f.txt", "main change\n", "main commit");
+    let onto = git_oid(wt, "HEAD");
+    let grit = open_grit(wt);
+    git(wt, &["switch", "topic"]);
+    let _ = start_rebase(
+        &grit,
+        &start_opts(upstream, Some(onto), tip),
+        &mut grit_lib::progress::NullProgress,
+        &grit_lib::progress::NeverCancel,
+    )
+    .expect("stop");
+    git(wt, &["reset", "--mixed", "HEAD"]);
+    let err = continue_rebase(
+        &grit,
+        &start_opts(upstream, Some(onto), tip),
+        &mut grit_lib::progress::NullProgress,
+        &grit_lib::progress::NeverCancel,
+    )
+    .expect_err("empty resolution continue");
+    assert!(matches!(err, RebaseSessionError::NothingToCommit));
+    assert!(grit.git_dir().join("rebase-merge/grit-plan").is_file());
+}
+
+fn strip_stopped_head_from_grit_plan(git_dir: &std::path::Path) {
+    let path = git_dir.join("rebase-merge/grit-plan");
+    let raw = std::fs::read_to_string(&path).expect("grit-plan");
+    let mut value: serde_json::Value = serde_json::from_str(&raw).expect("json");
+    value
+        .as_object_mut()
+        .expect("object")
+        .remove("stopped_head");
+    std::fs::write(&path, serde_json::to_vec_pretty(&value).expect("encode")).expect("write");
+}
+
+#[test]
+fn continue_after_commit_with_legacy_grit_plan_missing_stopped_head() {
+    use grit_lib::porcelain::commit::{commit_with_scope, CommitRequest, CommitScope};
+
+    let repo = HistoryRepo::init();
+    let wt = repo.worktree();
+    commit_file(wt, "f", "1\n2\n3\n", "base");
+    let upstream = git_oid(wt, "HEAD");
+    git(wt, &["switch", "-c", "o"]);
+    commit_file(wt, "f", "1\nO\n3\n", "o1");
+    std::fs::write(wt.join("g"), "y\n").expect("g");
+    git(wt, &["add", "g"]);
+    git(wt, &["commit", "-qm", "o2"]);
+    let tip = git_oid(wt, "HEAD");
+    git(wt, &["switch", "main"]);
+    commit_file(wt, "f", "1\nM\n3\n", "m");
+    let onto = git_oid(wt, "HEAD");
+    let grit = open_grit(wt);
+    git(wt, &["switch", "o"]);
+    let _ = start_rebase(
+        &grit,
+        &start_opts(upstream, Some(onto), tip),
+        &mut grit_lib::progress::NullProgress,
+        &grit_lib::progress::NeverCancel,
+    )
+    .expect("stop");
+    strip_stopped_head_from_grit_plan(grit.git_dir());
+    std::fs::write(wt.join("f"), "1\nR\n3\n").expect("resolve");
+    commit_with_scope(
+        &grit,
+        &CommitRequest {
+            message: "resolved o1\n".into(),
+            committer: Some(IDENT.parse().expect("IDENT")),
+            ..Default::default()
+        },
+        CommitScope::AutoStage,
+        &mut grit_lib::progress::NullProgress,
+        &grit_lib::progress::NeverCancel,
+    )
+    .expect("commit");
+    let done = continue_rebase(
+        &grit,
+        &start_opts(upstream, Some(onto), tip),
+        &mut grit_lib::progress::NullProgress,
+        &grit_lib::progress::NeverCancel,
+    )
+    .expect("continue");
+    assert!(matches!(done, RebaseOutcome::Done { .. }));
+    assert!(!grit.git_dir().join("rebase-merge").exists());
+}
+
+#[test]
+fn continue_rejects_resolution_merge_with_stop_as_second_parent_only() {
+    let repo = HistoryRepo::init();
+    let wt = repo.worktree();
+    commit_file(wt, "f.txt", "base\n", "base");
+    let upstream = git_oid(wt, "HEAD");
+    git(wt, &["switch", "-c", "topic"]);
+    commit_file(wt, "f.txt", "topic change\n", "topic commit");
+    let topic_tip = git_oid(wt, "topic");
+    let tip = git_oid(wt, "HEAD");
+    git(wt, &["switch", "main"]);
+    commit_file(wt, "f.txt", "main change\n", "main commit");
+    let onto = git_oid(wt, "HEAD");
+    let grit = open_grit(wt);
+    git(wt, &["switch", "topic"]);
+    let _ = start_rebase(
+        &grit,
+        &start_opts(upstream, Some(onto), tip),
+        &mut grit_lib::progress::NullProgress,
+        &grit_lib::progress::NeverCancel,
+    )
+    .expect("stop");
+    std::fs::write(wt.join("f.txt"), "resolved\n").expect("resolve");
+    git(wt, &["add", "f.txt"]);
+    let stopped_head = git_oid(wt, "HEAD");
+    let tree = git(wt, &["write-tree"]).trim().to_string();
+    let bogus = git(
+        wt,
+        &[
+            "commit-tree",
+            &tree,
+            "-p",
+            &topic_tip.to_hex(),
+            "-p",
+            &stopped_head.to_hex(),
+            "-m",
+            "bogus merge resolution",
+        ],
+    )
+    .trim()
+    .to_string();
+    git(wt, &["reset", "--hard", &bogus]);
+    let err = continue_rebase(
+        &grit,
+        &start_opts(upstream, Some(onto), tip),
+        &mut grit_lib::progress::NullProgress,
+        &grit_lib::progress::NeverCancel,
+    )
+    .expect_err("bogus merge continue");
+    assert!(matches!(
+        err,
+        RebaseSessionError::ResolutionHeadChanged { .. }
+    ));
+    assert!(grit.git_dir().join("rebase-merge/grit-plan").is_file());
+}
+
+#[test]
+fn legacy_plan_rejects_merge_with_stop_as_second_parent_only() {
+    let repo = HistoryRepo::init();
+    let wt = repo.worktree();
+    commit_file(wt, "f.txt", "base\n", "base");
+    let upstream = git_oid(wt, "HEAD");
+    git(wt, &["switch", "-c", "topic"]);
+    commit_file(wt, "f.txt", "topic change\n", "topic commit");
+    let topic_tip = git_oid(wt, "topic");
+    let tip = git_oid(wt, "HEAD");
+    git(wt, &["switch", "main"]);
+    commit_file(wt, "f.txt", "main change\n", "main commit");
+    let onto = git_oid(wt, "HEAD");
+    let grit = open_grit(wt);
+    git(wt, &["switch", "topic"]);
+    let _ = start_rebase(
+        &grit,
+        &start_opts(upstream, Some(onto), tip),
+        &mut grit_lib::progress::NullProgress,
+        &grit_lib::progress::NeverCancel,
+    )
+    .expect("stop");
+    strip_stopped_head_from_grit_plan(grit.git_dir());
+    std::fs::write(wt.join("f.txt"), "resolved\n").expect("resolve");
+    git(wt, &["add", "f.txt"]);
+    let stopped_head = git_oid(wt, "HEAD");
+    let tree = git(wt, &["write-tree"]).trim().to_string();
+    let bogus = git(
+        wt,
+        &[
+            "commit-tree",
+            &tree,
+            "-p",
+            &topic_tip.to_hex(),
+            "-p",
+            &stopped_head.to_hex(),
+            "-m",
+            "bogus merge resolution",
+        ],
+    )
+    .trim()
+    .to_string();
+    git(wt, &["reset", "--hard", &bogus]);
+    let err = continue_rebase(
+        &grit,
+        &start_opts(upstream, Some(onto), tip),
+        &mut grit_lib::progress::NullProgress,
+        &grit_lib::progress::NeverCancel,
+    )
+    .expect_err("legacy bogus merge continue");
+    assert!(matches!(
+        err,
+        RebaseSessionError::ResolutionHeadChanged { .. }
+    ));
+    assert!(grit.git_dir().join("rebase-merge/grit-plan").is_file());
+}
+
+#[test]
+fn continue_resolution_head_changed_leaves_rebase_state() {
+    let repo = HistoryRepo::init();
+    let wt = repo.worktree();
+    commit_file(wt, "f.txt", "base\n", "base");
+    let upstream = git_oid(wt, "HEAD");
+    git(wt, &["switch", "-c", "topic"]);
+    commit_file(wt, "f.txt", "topic change\n", "topic commit");
+    let topic_tip = git_oid(wt, "topic");
+    let tip = git_oid(wt, "HEAD");
+    git(wt, &["switch", "main"]);
+    commit_file(wt, "f.txt", "main change\n", "main commit");
+    let onto = git_oid(wt, "HEAD");
+    let grit = open_grit(wt);
+    git(wt, &["switch", "topic"]);
+    let _ = start_rebase(
+        &grit,
+        &start_opts(upstream, Some(onto), tip),
+        &mut grit_lib::progress::NullProgress,
+        &grit_lib::progress::NeverCancel,
+    )
+    .expect("stop");
+    std::fs::write(wt.join("f.txt"), "resolved\n").expect("resolve");
+    git(wt, &["add", "f.txt"]);
+    let stopped_head = git_oid(wt, "HEAD");
+    let tree = git(wt, &["write-tree"]).trim().to_string();
+    let bogus = git(
+        wt,
+        &[
+            "commit-tree",
+            &tree,
+            "-p",
+            &topic_tip.to_hex(),
+            "-p",
+            &stopped_head.to_hex(),
+            "-m",
+            "bogus",
+        ],
+    )
+    .trim()
+    .to_string();
+    git(wt, &["reset", "--hard", &bogus]);
+    let _ = continue_rebase(
+        &grit,
+        &start_opts(upstream, Some(onto), tip),
+        &mut grit_lib::progress::NullProgress,
+        &grit_lib::progress::NeverCancel,
+    )
+    .expect_err("continue");
+    assert!(grit.git_dir().join("rebase-merge/grit-plan").is_file());
+}
+
+#[test]
+fn commit_during_rebase_conflict_uses_merge_msg_without_dash_m() {
+    use grit_lib::porcelain::commit::{commit_with_scope, CommitRequest, CommitScope};
+
+    let repo = HistoryRepo::init();
+    let wt = repo.worktree();
+    commit_file(wt, "f.txt", "base\n", "base");
+    let upstream = git_oid(wt, "HEAD");
+    git(wt, &["switch", "-c", "topic"]);
+    commit_file(wt, "f.txt", "topic change\n", "o1 subject");
+    let tip = git_oid(wt, "HEAD");
+    git(wt, &["switch", "main"]);
+    commit_file(wt, "f.txt", "main change\n", "main commit");
+    let onto = git_oid(wt, "HEAD");
+    let grit = open_grit(wt);
+    git(wt, &["switch", "topic"]);
+    let _ = start_rebase(
+        &grit,
+        &start_opts(upstream, Some(onto), tip),
+        &mut grit_lib::progress::NullProgress,
+        &grit_lib::progress::NeverCancel,
+    )
+    .expect("stop");
+    std::fs::write(wt.join("f.txt"), "resolved\n").expect("resolve");
+    commit_with_scope(
+        &grit,
+        &CommitRequest {
+            committer: Some(IDENT.parse().expect("IDENT")),
+            ..Default::default()
+        },
+        CommitScope::AutoStage,
+        &mut grit_lib::progress::NullProgress,
+        &grit_lib::progress::NeverCancel,
+    )
+    .expect("commit");
+    assert_eq!(git(wt, &["log", "-1", "--format=%s"]).trim(), "o1 subject");
+}
+
+#[test]
 fn skip_drops_conflicting_commit() {
     let repo = HistoryRepo::init();
     let wt = repo.worktree();
@@ -403,6 +779,85 @@ fn start_rebase_refuses_when_session_active() {
     )
     .unwrap_err();
     assert!(matches!(err, RebaseSessionError::RebaseAlreadyInProgress));
+}
+
+#[test]
+fn pull_and_pick_refuse_during_grit_rebase_conflict_stop() {
+    use grit_lib::error::Error;
+    use grit_lib::porcelain::pull::{pull, PullOptions};
+    use grit_lib::porcelain::replay::ReplayDirection;
+    use grit_lib::porcelain::replay_sequence::{
+        start_replay_sequence, ReplayOptions, ReplaySequenceRequest,
+    };
+    use grit_lib::progress::{NeverCancel, NullProgress};
+    use grit_lib::remote::fetch::NoProgress;
+
+    let (repo, upstream, onto, tip, orig_tip) = conflict_rebase_fixture();
+    let wt = repo.worktree();
+    let grit = open_grit(wt);
+    git(wt, &["switch", "topic"]);
+    let _ = start_rebase(
+        &grit,
+        &start_opts(upstream, Some(onto), tip),
+        &mut NullProgress,
+        &NeverCancel,
+    )
+    .expect("stop");
+    let head_before = git_oid(wt, "HEAD");
+    let branch_before = resolve_ref(grit.git_dir(), "refs/heads/topic").unwrap();
+
+    let mut pull_progress = NoProgress;
+    let pull_err = pull(
+        &grit,
+        &PullOptions::default(),
+        &mut pull_progress,
+        &NeverCancel,
+        None,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            pull_err,
+            grit_lib::porcelain::pull::PullError::Repository(Error::OperationInProgress(
+                InProgressOperation::Rebase
+            ))
+        ),
+        "pull: {pull_err:?}"
+    );
+
+    let pick_req = ReplaySequenceRequest {
+        commits: vec![onto],
+        direction: ReplayDirection::Pick,
+        committer: COMMITTER.parse().expect("signature"),
+        options: ReplayOptions::default(),
+    };
+    let pick_err =
+        start_replay_sequence(&grit, &pick_req, &mut NullProgress, &NeverCancel).unwrap_err();
+    assert!(
+        matches!(
+            pick_err,
+            Error::OperationInProgress(InProgressOperation::Rebase)
+        ),
+        "pick: {pick_err:?}"
+    );
+
+    let err = start_rebase(
+        &grit,
+        &start_opts(upstream, Some(onto), tip),
+        &mut NullProgress,
+        &NeverCancel,
+    )
+    .unwrap_err();
+    assert!(matches!(err, RebaseSessionError::RebaseAlreadyInProgress));
+
+    assert_eq!(git_oid(wt, "HEAD"), head_before);
+    assert_eq!(
+        resolve_ref(grit.git_dir(), "refs/heads/topic").unwrap(),
+        branch_before
+    );
+    assert_eq!(branch_before, orig_tip);
+    assert!(wt.join(".git/rebase-merge").is_dir());
+    assert_git_fsck_strict(wt);
 }
 
 fn conflict_rebase_fixture() -> (HistoryRepo, ObjectId, ObjectId, ObjectId, ObjectId) {
@@ -623,6 +1078,110 @@ fn continue_after_resolution_matches_git_rebase_continue() {
     assert_git_fsck_strict(wt_r);
 }
 
+/// Run one `git rebase` step in `wt`; returns whether it finished without stopping.
+fn git_rebase_step(wt: &std::path::Path, args: &[&str]) -> bool {
+    std::process::Command::new("git")
+        .current_dir(wt)
+        .arg("rebase")
+        .args(args)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_EDITOR", ":")
+        .output()
+        .expect("git rebase")
+        .status
+        .success()
+}
+
+#[test]
+fn conflict_markers_name_each_replayed_commit_like_git_rebase() {
+    let repo = HistoryRepo::init();
+    let wt = repo.worktree();
+    commit_file(wt, "f.txt", "base\n", "base f");
+    commit_file(wt, "g.txt", "base\n", "base g");
+    let upstream = git_oid(wt, "HEAD");
+    git(wt, &["switch", "-c", "topic"]);
+    commit_file(wt, "f.txt", "topic f\n", "first replayed");
+    let first = git_oid(wt, "HEAD");
+    commit_file(wt, "g.txt", "topic g\n", "second replayed");
+    let tip = git_oid(wt, "HEAD");
+    git(wt, &["switch", "main"]);
+    commit_file(wt, "f.txt", "main f\n", "main f");
+    commit_file(wt, "g.txt", "main g\n", "main g");
+    let onto = git_oid(wt, "HEAD");
+    git(wt, &["switch", "topic"]);
+
+    let git_copy = tempfile::tempdir().expect("git copy");
+    let git_wt = git_copy.path();
+    let copied = std::process::Command::new("cp")
+        .args([
+            "-a",
+            &format!("{}/.", wt.display()),
+            &git_wt.to_string_lossy(),
+        ])
+        .status()
+        .expect("cp");
+    assert!(copied.success());
+
+    let incoming_marker = |body: &str| {
+        body.lines()
+            .find(|line| line.starts_with(">>>>>>>"))
+            .unwrap_or_else(|| panic!("no incoming marker in {body:?}"))
+            .to_owned()
+    };
+
+    let opts = start_opts(upstream, Some(onto), tip);
+    let RebaseOutcome::Stopped(stop) = start_rebase(
+        &open_grit(wt),
+        &opts,
+        &mut grit_lib::progress::NullProgress,
+        &grit_lib::progress::NeverCancel,
+    )
+    .expect("start") else {
+        panic!("expected the first replayed commit to stop");
+    };
+    assert_eq!(stop.commit, first);
+    assert!(!git_rebase_step(git_wt, &["main"]), "git should stop too");
+    let grit_f = std::fs::read_to_string(wt.join("f.txt")).expect("f.txt");
+    assert_eq!(
+        grit_f,
+        std::fs::read_to_string(git_wt.join("f.txt")).expect("git f.txt")
+    );
+    assert_eq!(
+        incoming_marker(&grit_f),
+        format!(">>>>>>> {} (first replayed)", &first.to_hex()[..7])
+    );
+
+    for dir in [wt, git_wt] {
+        std::fs::write(dir.join("f.txt"), "resolved f\n").expect("resolve f");
+        git(dir, &["add", "f.txt"]);
+    }
+    let RebaseOutcome::Stopped(stop) = continue_rebase(
+        &open_grit(wt),
+        &opts,
+        &mut grit_lib::progress::NullProgress,
+        &grit_lib::progress::NeverCancel,
+    )
+    .expect("continue") else {
+        panic!("expected the second replayed commit to stop");
+    };
+    assert_eq!(stop.commit, tip);
+    assert!(
+        !git_rebase_step(git_wt, &["--continue"]),
+        "git should stop on the second commit"
+    );
+    let grit_g = std::fs::read_to_string(wt.join("g.txt")).expect("g.txt");
+    assert_eq!(
+        grit_g,
+        std::fs::read_to_string(git_wt.join("g.txt")).expect("git g.txt")
+    );
+    assert_eq!(
+        incoming_marker(&grit_g),
+        format!(">>>>>>> {} (second replayed)", &tip.to_hex()[..7])
+    );
+    assert_git_fsck_strict(wt);
+}
+
 #[test]
 fn conflict_stop_detaches_head_at_onto_not_upstream() {
     let (repo, upstream, onto, tip, _) = conflict_rebase_fixture();
@@ -804,7 +1363,14 @@ fn continue_after_stop_chains_past_a_commit_already_upstream() {
     let mut opts = start_opts(upstream, Some(onto), tip);
     opts.rebase.skip_applied = true;
     let grit = open_grit(wt);
-    let stop = match start_rebase(&grit, &opts).expect("start") {
+    let stop = match start_rebase(
+        &grit,
+        &opts,
+        &mut grit_lib::progress::NullProgress,
+        &grit_lib::progress::NeverCancel,
+    )
+    .expect("start")
+    {
         RebaseOutcome::Stopped(stop) => stop,
         other => panic!("expected a stop on the conflicting commit, got {other:?}"),
     };
@@ -813,7 +1379,14 @@ fn continue_after_stop_chains_past_a_commit_already_upstream() {
     std::fs::write(wt.join("f.txt"), "resolved\n").expect("resolve");
     git(wt, &["add", "f.txt"]);
     let grit = open_grit(wt);
-    match continue_rebase(&grit, &opts).expect("continue") {
+    match continue_rebase(
+        &grit,
+        &opts,
+        &mut grit_lib::progress::NullProgress,
+        &grit_lib::progress::NeverCancel,
+    )
+    .expect("continue")
+    {
         RebaseOutcome::Done { .. } => {}
         other => panic!("expected done, got {other:?}"),
     }
@@ -913,6 +1486,7 @@ fn stacked_branches_move_atomically_after_continue() {
             record_operation: None,
             hooks: grit_lib::PostOperationHooks::Run,
         },
+        pre_rebase: grit_lib::revwalk::history::PreRebase::Skip,
     };
     let main_before = resolve_ref(grit.git_dir(), "refs/heads/main").unwrap();
     let stacked_before = resolve_ref(grit.git_dir(), "refs/heads/stacked").unwrap();
@@ -948,6 +1522,152 @@ fn stacked_branches_move_atomically_after_continue() {
     assert_ne!(main_before, main_after);
     assert_ne!(stacked_before, stacked_after);
     assert_git_fsck_strict(wt);
+}
+
+/// Issue #2255: Git's `rebase --continue` must not replay stacked-branch commits grit appended
+/// to the full replay order when `--update-refs=branches` is active.
+#[test]
+fn git_rebase_continue_leaves_stacked_branch_untouched_on_primary_conflict() {
+    let repo = HistoryRepo::init();
+    let wt = repo.worktree();
+    commit_file(wt, "base.txt", "base\n", "base");
+    let upstream = git_oid(wt, "HEAD");
+    git(wt, &["switch", "-c", "a"]);
+    commit_file(wt, "shared.txt", "a1\n", "a: shared");
+    commit_file(wt, "a2.txt", "a2\n", "a: two");
+    let a_tip = git_oid(wt, "HEAD");
+    git(wt, &["switch", "-c", "b"]);
+    commit_file(wt, "b1.txt", "b1\n", "b: one");
+    let b_before = git_oid(wt, "HEAD");
+    git(wt, &["switch", "main"]);
+    commit_file(wt, "shared.txt", "m\n", "main: shared");
+    let onto = git_oid(wt, "HEAD");
+    git(wt, &["switch", "a"]);
+
+    let grit = open_grit(wt);
+    let mut opts = rebase_opts();
+    opts.rewrite.scope = RefScope::Branches;
+    let start = StartRebaseOptions {
+        request: RebaseRequest {
+            upstream,
+            onto: Some(onto),
+            branch_tip: a_tip,
+        },
+        rebase: opts.clone(),
+        apply: grit_lib::revwalk::history::ApplyOptions {
+            identity: test_ident(),
+            reflog_message: "rebase".into(),
+            record_operation: None,
+            hooks: grit_lib::PostOperationHooks::Run,
+        },
+        pre_rebase: grit_lib::revwalk::history::PreRebase::Skip,
+    };
+
+    match start_rebase(
+        &grit,
+        &start,
+        &mut grit_lib::progress::NullProgress,
+        &grit_lib::progress::NeverCancel,
+    )
+    .expect("start")
+    {
+        RebaseOutcome::Stopped(_) => {}
+        other => panic!("expected conflict stop, got {other:?}"),
+    }
+
+    let todo = std::fs::read_to_string(wt.join(".git/rebase-merge/git-rebase-todo")).unwrap();
+    assert!(
+        todo.contains("a: two"),
+        "git todo must include the remaining primary commit: {todo}"
+    );
+    assert!(
+        !todo.contains("b: one"),
+        "git todo must not include stacked branch commits: {todo}"
+    );
+
+    std::fs::write(wt.join("shared.txt"), "resolved\n").expect("resolve");
+    git(wt, &["add", "shared.txt"]);
+    let cont = git_unchecked(wt, &["rebase", "--continue"]);
+    assert!(
+        cont.status.success(),
+        "git rebase --continue: {}",
+        String::from_utf8_lossy(&cont.stderr)
+    );
+
+    assert_eq!(
+        git(wt, &["log", "--format=%s", "main..a"]),
+        "a: two\na: shared\n",
+        "branch a should end on its own commits only"
+    );
+    assert_eq!(
+        git_oid(wt, "b"),
+        b_before,
+        "branch b must stay on old history"
+    );
+    assert_git_fsck_strict(wt);
+}
+
+#[test]
+fn git_rebase_continue_todo_excludes_descendant_merge_commit() {
+    let repo = HistoryRepo::init();
+    let wt = repo.worktree();
+    commit_file(wt, "base.txt", "base\n", "base");
+    let upstream = git_oid(wt, "HEAD");
+    git(wt, &["switch", "-c", "a"]);
+    commit_file(wt, "shared.txt", "a1\n", "a: shared");
+    commit_file(wt, "a2.txt", "a2\n", "a: two");
+    let a_tip = git_oid(wt, "HEAD");
+    git(wt, &["switch", "-c", "side"]);
+    commit_file(wt, "side.txt", "side\n", "side: one");
+    git(wt, &["switch", "a"]);
+    git(wt, &["merge", "--no-ff", "-m", "Merge side into a", "side"]);
+    git(wt, &["switch", "-c", "b"]);
+    commit_file(wt, "b1.txt", "b1\n", "b: one");
+    git(wt, &["switch", "main"]);
+    commit_file(wt, "shared.txt", "m\n", "main: shared");
+    let onto = git_oid(wt, "HEAD");
+    git(wt, &["switch", "a"]);
+
+    let grit = open_grit(wt);
+    let mut opts = rebase_opts();
+    opts.rewrite.scope = RefScope::Branches;
+    let start = StartRebaseOptions {
+        request: RebaseRequest {
+            upstream,
+            onto: Some(onto),
+            branch_tip: a_tip,
+        },
+        rebase: opts,
+        apply: grit_lib::revwalk::history::ApplyOptions {
+            identity: test_ident(),
+            reflog_message: "rebase".into(),
+            record_operation: None,
+            hooks: grit_lib::PostOperationHooks::Run,
+        },
+        pre_rebase: grit_lib::revwalk::history::PreRebase::Skip,
+    };
+
+    match start_rebase(
+        &grit,
+        &start,
+        &mut grit_lib::progress::NullProgress,
+        &grit_lib::progress::NeverCancel,
+    )
+    .expect("start")
+    {
+        RebaseOutcome::Stopped(_) => {}
+        other => panic!("expected conflict stop, got {other:?}"),
+    }
+
+    let todo = std::fs::read_to_string(wt.join(".git/rebase-merge/git-rebase-todo")).unwrap();
+    assert!(
+        !todo.contains("Merge side into a"),
+        "git todo must not replay stacked merge commits: {todo}"
+    );
+    assert!(
+        todo.contains("a: two"),
+        "git todo must still list remaining primary commits: {todo}"
+    );
 }
 
 #[test]
@@ -1180,7 +1900,7 @@ fn continue_and_skip_refuse_git_started_rebase_without_touching_it() {
             &grit_lib::progress::NeverCancel
         )
         .unwrap_err(),
-        RebaseSessionError::RebaseAlreadyInProgress
+        RebaseSessionError::ForeignRebaseInProgress
     ));
     assert!(wt.join(".git/rebase-merge").is_dir());
     assert!(!wt.join(".git/rebase-merge/grit-plan").exists());
@@ -1503,7 +2223,11 @@ fn conflicting_start_refuses_to_overwrite_untracked_file() {
     assert!(
         matches!(
             &err,
-            RebaseSessionError::Library(grit_lib::error::Error::Message(msg)) if msg.contains("added.txt")
+            RebaseSessionError::Library(grit_lib::error::Error::WouldOverwrite {
+                reason: grit_lib::error::OverwriteReason::Untracked,
+                paths,
+                ..
+            }) if paths == &["added.txt".to_owned()]
         ),
         "unexpected {err:?}"
     );
@@ -1703,7 +2427,9 @@ fn failed_head_reflog_append_keeps_rebase_detached_and_abortable() {
     let head_log = wt.join(".git/logs/HEAD");
     let saved_log = std::fs::read(&head_log).expect("HEAD log");
     std::fs::remove_file(&head_log).expect("remove HEAD log");
+    // An empty directory would be cleared like Git does; one holding a file blocks the log.
     std::fs::create_dir(&head_log).expect("block HEAD log");
+    std::fs::write(head_log.join("stray"), "").expect("keep HEAD log blocked");
     continue_rebase(
         &grit,
         &opts,
@@ -1721,7 +2447,7 @@ fn failed_head_reflog_append_keeps_rebase_detached_and_abortable() {
     );
     assert!(grit.git_dir().join("rebase-merge").is_dir());
 
-    std::fs::remove_dir(&head_log).expect("unblock HEAD log");
+    std::fs::remove_dir_all(&head_log).expect("unblock HEAD log");
     std::fs::write(&head_log, saved_log).expect("restore HEAD log");
     abort_rebase(&grit, &test_ident()).expect("abort");
     assert_eq!(git_oid(wt, "topic"), orig_tip);
@@ -1815,21 +2541,29 @@ fn exec_fixture() -> (
     (fixture, opts, plan)
 }
 
-fn run_dirty_exec(
+fn run_exec(
     wt: &std::path::Path,
-    plan: &grit_lib::revwalk::history::RewritePlan,
-    command: &str,
-) -> grit_lib::revwalk::history::HistoryError {
+    plan: &mut grit_lib::revwalk::history::RewritePlan,
+    commands: &[&str],
+) -> Result<grit_lib::revwalk::history::ExecReport, grit_lib::revwalk::history::HistoryError> {
     use grit_lib::revwalk::history::{verify_rebase_with_exec, ExecSpec};
     verify_rebase_with_exec(
         &open_grit(wt),
         plan,
         &ExecSpec {
-            commands: vec![command.into(), "echo later >> exec-log".into()],
+            commands: commands.iter().map(|c| (*c).to_owned()).collect(),
         },
+        &rebase_opts().rewrite,
         grit_lib::command_runner::system_command_runner().as_ref(),
     )
-    .unwrap_err()
+}
+
+fn run_dirty_exec(
+    wt: &std::path::Path,
+    plan: &grit_lib::revwalk::history::RewritePlan,
+    command: &str,
+) -> grit_lib::revwalk::history::HistoryError {
+    run_exec(wt, &mut plan.clone(), &[command, "echo later >> exec-log"]).unwrap_err()
 }
 
 #[test]
@@ -2055,6 +2789,169 @@ fn exec_continue_rejects_moved_head_and_abort_restores_original_branch() {
     assert_git_fsck_strict(wt);
 }
 
+/// Move `refs/heads/topic` the way #2197 did (`git commit-tree` + `git update-ref`) and return
+/// the new tip.
+fn move_topic_behind_the_rebase(wt: &std::path::Path) -> ObjectId {
+    let moved = git(
+        wt,
+        &["commit-tree", "-p", "topic", "-m", "moved", "topic^{tree}"],
+    );
+    git(wt, &["update-ref", "refs/heads/topic", moved.trim()]);
+    git_oid(wt, "topic")
+}
+
+/// `continue_rebase` and `skip_rebase` both refuse with a typed stale-plan error naming the
+/// moved branch, and change nothing.
+fn assert_resume_refuses_stale_plan(
+    wt: &std::path::Path,
+    opts: &StartRebaseOptions,
+    moved: ObjectId,
+) {
+    let head = git_oid(wt, "HEAD");
+    let index = std::fs::read(wt.join(".git/index")).unwrap();
+    let status = git(wt, &["status", "--porcelain"]);
+    for skip in [false, true] {
+        let repo = open_grit(wt);
+        let result = if skip {
+            skip_rebase(
+                &repo,
+                opts,
+                &mut grit_lib::progress::NullProgress,
+                &grit_lib::progress::NeverCancel,
+            )
+        } else {
+            continue_rebase(
+                &repo,
+                opts,
+                &mut grit_lib::progress::NullProgress,
+                &grit_lib::progress::NeverCancel,
+            )
+        };
+        match result {
+            Err(RebaseSessionError::StaleExecPlan {
+                name,
+                expected,
+                actual,
+            }) => {
+                assert_eq!(name, "refs/heads/topic");
+                assert_eq!(expected, opts.request.branch_tip);
+                assert_eq!(actual, Some(moved));
+            }
+            other => panic!("expected a stale exec plan (skip={skip}), got {other:?}"),
+        }
+        assert_eq!(git_oid(wt, "topic"), moved);
+        assert_eq!(git_oid(wt, "HEAD"), head);
+        assert_eq!(std::fs::read(wt.join(".git/index")).unwrap(), index);
+        assert_eq!(git(wt, &["status", "--porcelain"]), status);
+        assert!(wt.join(".git/rebase-merge/grit-exec").is_file());
+    }
+}
+
+/// Abort resets the moved branch to its pre-rebase tip, reports what it overwrote, logs it,
+/// and leaves the exact pre-rebase index and a clean worktree.
+fn assert_abort_restores_moved_branch(
+    wt: &std::path::Path,
+    opts: &StartRebaseOptions,
+    moved: ObjectId,
+    original_index: &[u8],
+) {
+    use grit_lib::revwalk::history::PlannedRefUpdate;
+    let abort = abort_rebase(&open_grit(wt), &test_ident()).expect("abort");
+    assert_eq!(
+        abort.overwritten,
+        [PlannedRefUpdate {
+            name: "refs/heads/topic".into(),
+            old: moved,
+            new: opts.request.branch_tip,
+        }]
+    );
+    assert_eq!(git_oid(wt, "topic"), opts.request.branch_tip);
+    assert_eq!(
+        git(wt, &["symbolic-ref", "HEAD"]).trim(),
+        "refs/heads/topic"
+    );
+    assert_eq!(git_oid(wt, "topic@{1}"), moved, "moved tip stays in reflog");
+    assert_eq!(
+        git(wt, &["reflog", "-1", "--format=%gs", "refs/heads/topic"]).trim(),
+        "rebase (abort)"
+    );
+    assert_eq!(
+        std::fs::read(wt.join(".git/index")).unwrap(),
+        original_index
+    );
+    assert_eq!(git(wt, &["status", "--porcelain"]), "");
+    assert!(!wt.join(".git/rebase-merge").exists());
+    assert_git_fsck_strict(wt);
+}
+
+#[test]
+fn exec_dirty_stop_with_moved_branch_refuses_resume_and_abort_restores_it() {
+    let (fixture, opts, plan) = exec_fixture();
+    let wt = fixture.worktree();
+    let original_index = std::fs::read(wt.join(".git/index")).unwrap();
+    run_dirty_exec(wt, &plan, "echo hook-edit >> f");
+    let moved = move_topic_behind_the_rebase(wt);
+    assert_resume_refuses_stale_plan(wt, &opts, moved);
+    assert_eq!(std::fs::read(wt.join("f")).unwrap(), b"base\nhook-edit\n");
+    // Saving the edits does not make the stale plan resumable either.
+    git(wt, &["stash", "push", "-m", "exec edits"]);
+    assert_resume_refuses_stale_plan(wt, &opts, moved);
+    assert_abort_restores_moved_branch(wt, &opts, moved, &original_index);
+}
+
+#[test]
+fn exec_conflict_stop_with_moved_branch_refuses_resume_and_abort_restores_it() {
+    use grit_lib::revwalk::history::HistoryError;
+    let (fixture, opts, mut plan) = exec_fixture();
+    let wt = fixture.worktree();
+    let original_index = std::fs::read(wt.join(".git/index")).unwrap();
+    let err = run_exec(wt, &mut plan, &[&conflicting_amend()]).unwrap_err();
+    assert!(matches!(err, HistoryError::ExecConflict { .. }), "{err:?}");
+    let moved = move_topic_behind_the_rebase(wt);
+    assert_resume_refuses_stale_plan(wt, &opts, moved);
+    assert_abort_restores_moved_branch(wt, &opts, moved, &original_index);
+}
+
+#[test]
+fn exec_abort_with_unmoved_branch_reports_nothing_overwritten() {
+    let (fixture, opts, plan) = exec_fixture();
+    let wt = fixture.worktree();
+    run_dirty_exec(wt, &plan, "echo hook-edit >> f");
+    let abort = abort_rebase(&open_grit(wt), &test_ident()).expect("abort");
+    assert!(abort.overwritten.is_empty(), "{abort:?}");
+    assert_eq!(git_oid(wt, "topic"), opts.request.branch_tip);
+}
+
+#[test]
+fn conflict_stop_abort_reports_a_branch_moved_during_the_stop() {
+    use grit_lib::revwalk::history::PlannedRefUpdate;
+    let (repo, upstream, onto, tip, orig_tip) = conflict_rebase_fixture();
+    let wt = repo.worktree();
+    git(wt, &["switch", "topic"]);
+    let RebaseOutcome::Stopped(_) = start_rebase(
+        &open_grit(wt),
+        &start_opts(upstream, Some(onto), tip),
+        &mut grit_lib::progress::NullProgress,
+        &grit_lib::progress::NeverCancel,
+    )
+    .expect("stop") else {
+        panic!("expected a conflict stop")
+    };
+    let moved = move_topic_behind_the_rebase(wt);
+    let abort = abort_rebase(&open_grit(wt), &test_ident()).expect("abort");
+    assert_eq!(
+        abort.overwritten,
+        [PlannedRefUpdate {
+            name: "refs/heads/topic".into(),
+            old: moved,
+            new: orig_tip,
+        }]
+    );
+    assert_eq!(git_oid(wt, "topic"), orig_tip);
+    assert!(!wt.join(".git/rebase-merge").exists());
+    assert_git_fsck_strict(wt);
+}
+
 #[test]
 fn exec_abort_removes_staged_addition_and_restores_exact_index() {
     let (fixture, opts, plan) = exec_fixture();
@@ -2073,20 +2970,13 @@ fn exec_abort_removes_staged_addition_and_restores_exact_index() {
 
 #[test]
 fn exec_recovery_can_stop_again_at_next_command_and_final_commit() {
-    use grit_lib::revwalk::history::{verify_rebase_with_exec, ExecSpec, HistoryError};
+    use grit_lib::revwalk::history::HistoryError;
     let (fixture, opts, plan) = exec_fixture();
     let wt = fixture.worktree();
-    let commands = vec!["echo first >> f".into(), "echo second >> f".into()];
-    let mut result = verify_rebase_with_exec(
-        &open_grit(wt),
-        &plan,
-        &ExecSpec {
-            commands: commands.clone(),
-        },
-        grit_lib::command_runner::system_command_runner().as_ref(),
-    )
-    .map(|_| ())
-    .map_err(RebaseSessionError::from);
+    let commands = ["echo first >> f", "echo second >> f"];
+    let mut result = run_exec(wt, &mut plan.clone(), &commands)
+        .map(|_| ())
+        .map_err(RebaseSessionError::from);
     let commits: Vec<_> = plan.commits.iter().filter_map(|r| r.new).collect();
     for (step, expected_commit) in [commits[0], commits[0], commits[1], commits[1]]
         .into_iter()
@@ -2130,20 +3020,14 @@ fn exec_recovery_can_stop_again_at_next_command_and_final_commit() {
 
 #[test]
 fn exec_failure_during_recovery_rolls_back_and_clears_exec_stop() {
-    use grit_lib::revwalk::history::{verify_rebase_with_exec, ExecSpec, HistoryError};
+    use grit_lib::revwalk::history::HistoryError;
     let (fixture, opts, plan) = exec_fixture();
     let wt = fixture.worktree();
     let index = std::fs::read(wt.join(".git/index")).unwrap();
-    let error = verify_rebase_with_exec(
-        &open_grit(wt),
-        &plan,
-        &ExecSpec {
-            commands: vec![
-                "echo edit >> f".into(),
-                "echo captured; echo failed >&2; exit 7".into(),
-            ],
-        },
-        grit_lib::command_runner::system_command_runner().as_ref(),
+    let error = run_exec(
+        wt,
+        &mut plan.clone(),
+        &["echo edit >> f", "echo captured; echo failed >&2; exit 7"],
     )
     .unwrap_err();
     assert!(matches!(error, HistoryError::ExecDirty { .. }));
@@ -2272,5 +3156,842 @@ fn flattened_session_drops_merge_and_chains_commits_after_continue() {
         "topic tree matches git rebase"
     );
     assert_eq!(git_oid(wt, "topic~2"), upstream);
+    assert_git_fsck_strict(wt);
+}
+
+/// `git` with a fixed identity and no user config, for commands run by `--exec`.
+const EXEC_GIT: &str = "env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null \
+    GIT_AUTHOR_NAME=T GIT_AUTHOR_EMAIL=t@example.com GIT_COMMITTER_NAME=T \
+    GIT_COMMITTER_EMAIL=t@example.com GIT_AUTHOR_DATE='1700000500 +0000' \
+    GIT_COMMITTER_DATE='1700000500 +0000' git";
+
+fn amend_command(edit: &str) -> String {
+    format!("{edit} && {EXEC_GIT} commit -qa --amend --no-edit")
+}
+
+/// Run `git rebase --exec` on a fresh [`exec_fixture`]; returns the fixture and the exit code.
+fn git_exec_twin(commands: &[&str]) -> (HistoryRepo, Option<i32>) {
+    let (fixture, opts, _) = exec_fixture();
+    let onto = opts.request.onto.unwrap().to_hex();
+    let upstream = opts.request.upstream.to_hex();
+    let mut args = vec!["rebase", "--onto", onto.as_str(), upstream.as_str()];
+    for command in commands {
+        args.extend(["--exec", command]);
+    }
+    let code = git_hermetic(fixture.worktree(), &args).status.code();
+    (fixture, code)
+}
+
+fn git_hermetic(wt: &std::path::Path, args: &[&str]) -> std::process::Output {
+    std::process::Command::new("git")
+        .args(args)
+        .current_dir(wt)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_EDITOR", ":")
+        .env("GIT_AUTHOR_NAME", "T")
+        .env("GIT_AUTHOR_EMAIL", "t@example.com")
+        .env("GIT_COMMITTER_NAME", "T")
+        .env("GIT_COMMITTER_EMAIL", "t@example.com")
+        .output()
+        .unwrap()
+}
+
+fn apply_exec_plan(
+    wt: &std::path::Path,
+    opts: &StartRebaseOptions,
+    plan: &grit_lib::revwalk::history::RewritePlan,
+) {
+    grit_lib::revwalk::history::apply_rewrite(
+        &open_grit(wt),
+        plan,
+        &opts.apply,
+        &mut grit_lib::progress::NullProgress,
+        &grit_lib::progress::NeverCancel,
+    )
+    .unwrap();
+}
+
+fn subjects(wt: &std::path::Path, rev: &str) -> String {
+    git(wt, &["log", "--format=%s", rev])
+}
+
+#[test]
+fn exec_amend_is_adopted_and_later_commits_replay_onto_it() {
+    let (fixture, opts, mut plan) = exec_fixture();
+    let wt = fixture.worktree();
+    let planned = plan.clone();
+    let command = amend_command("echo fmt >> one");
+    let report = run_exec(wt, &mut plan, &[&command]).expect("amending exec completes");
+    assert_eq!(report.runs.len(), 2);
+    assert_eq!(
+        report.runs[0].commit,
+        planned.commits[0].new.unwrap(),
+        "the first command runs at the planned replay"
+    );
+    assert_ne!(
+        plan, planned,
+        "the amended commits replace the planned ones"
+    );
+    assert_eq!(
+        plan.commits[0].change_id, planned.commits[0].change_id,
+        "git commit --amend keeps the change-id header"
+    );
+    assert_eq!(plan.commits[1].change_id, planned.commits[1].change_id);
+    assert_eq!(
+        git_oid(wt, &format!("{}^", report.runs[1].commit)),
+        plan.commits[0].new.unwrap(),
+        "the second commit is replayed onto the amended first commit before its command"
+    );
+    assert_eq!(git_oid(wt, "topic"), opts.request.branch_tip);
+    apply_exec_plan(wt, &opts, &plan);
+
+    let tip = plan.mapped_tip(opts.request.branch_tip).unwrap();
+    assert_eq!(git_oid(wt, "topic"), tip);
+    assert_eq!(
+        git(wt, &["symbolic-ref", "HEAD"]).trim(),
+        "refs/heads/topic"
+    );
+    assert_eq!(git_oid(wt, "topic~1"), plan.commits[0].new.unwrap());
+    assert_eq!(git_oid(wt, "topic~2"), opts.request.onto.unwrap());
+    assert_eq!(git(wt, &["show", "topic~1:one"]), "one\nfmt\n");
+    assert_eq!(git(wt, &["show", "topic:one"]), "one\nfmt\nfmt\n");
+    assert_eq!(git(wt, &["show", "topic:two"]), "two\n");
+    assert_eq!(subjects(wt, "topic"), "two\none\nmain moves\nbase\n");
+    assert_eq!(git(wt, &["status", "--porcelain"]), "");
+    assert_git_fsck_strict(wt);
+
+    let (twin, code) = git_exec_twin(&[&command]);
+    assert_eq!(code, Some(0));
+    for rev in ["topic^{tree}", "topic~1^{tree}"] {
+        assert_eq!(git_oid(wt, rev), git_oid(twin.worktree(), rev), "{rev}");
+    }
+    assert_eq!(subjects(twin.worktree(), "topic"), subjects(wt, "topic"));
+}
+
+#[test]
+fn exec_message_only_amend_rewords_the_replayed_commit() {
+    let (fixture, opts, mut plan) = exec_fixture();
+    let wt = fixture.worktree();
+    let planned_tip_tree = git_oid(
+        wt,
+        &format!(
+            "{}^{{tree}}",
+            plan.mapped_tip(opts.request.branch_tip).unwrap()
+        ),
+    );
+    let command = format!("if ! test -f two; then {EXEC_GIT} commit -q --amend -m reworded; fi");
+    run_exec(wt, &mut plan, &[&command]).expect("exec");
+    assert_eq!(plan.commits[0].subject.as_deref(), Some("reworded"));
+    apply_exec_plan(wt, &opts, &plan);
+    assert_eq!(subjects(wt, "topic"), "two\nreworded\nmain moves\nbase\n");
+    assert_eq!(git_oid(wt, "topic^{tree}"), planned_tip_tree);
+    assert_git_fsck_strict(wt);
+
+    let (twin, code) = git_exec_twin(&[&command]);
+    assert_eq!(code, Some(0));
+    assert_eq!(subjects(twin.worktree(), "topic"), subjects(wt, "topic"));
+}
+
+#[test]
+fn exec_later_command_sees_the_amended_tree() {
+    let (fixture, opts, mut plan) = exec_fixture();
+    let wt = fixture.worktree();
+    let amend = amend_command("echo fmt >> one");
+    let report = run_exec(wt, &mut plan, &[&amend, "grep -q fmt one"])
+        .expect("the second command sees the amended file");
+    assert_eq!(report.runs.len(), 4);
+    assert_eq!(report.runs[1].commit, plan.commits[0].new.unwrap());
+    assert_eq!(report.runs[3].commit, plan.commits[1].new.unwrap());
+    apply_exec_plan(wt, &opts, &plan);
+    assert_eq!(git(wt, &["show", "topic:one"]), "one\nfmt\nfmt\n");
+    assert_git_fsck_strict(wt);
+}
+
+#[test]
+fn exec_commits_added_on_top_are_kept_below_later_commits() {
+    let (fixture, opts, mut plan) = exec_fixture();
+    let wt = fixture.worktree();
+    let command = format!(
+        "if ! test -f two; then echo lock > lock && {EXEC_GIT} add lock && {EXEC_GIT} commit -qm lockfile; fi"
+    );
+    run_exec(wt, &mut plan, &[&command]).expect("exec");
+    apply_exec_plan(wt, &opts, &plan);
+    assert_eq!(
+        subjects(wt, "topic"),
+        "two\nlockfile\none\nmain moves\nbase\n"
+    );
+    assert_eq!(git_oid(wt, "topic~2"), plan.commits[0].new.unwrap());
+    assert_eq!(git(wt, &["show", "topic:lock"]), "lock\n");
+    assert_git_fsck_strict(wt);
+
+    let (twin, code) = git_exec_twin(&[&command]);
+    assert_eq!(code, Some(0));
+    assert_eq!(subjects(twin.worktree(), "topic"), subjects(wt, "topic"));
+    assert_eq!(
+        git_oid(wt, "topic^{tree}"),
+        git_oid(twin.worktree(), "topic^{tree}")
+    );
+}
+
+#[test]
+fn exec_amend_with_leftover_edits_stops_at_the_amended_commit() {
+    use grit_lib::revwalk::history::HistoryError;
+    let (fixture, opts, mut plan) = exec_fixture();
+    let wt = fixture.worktree();
+    let command = format!(
+        "if ! test -f two; then {} && echo dirt >> f; fi",
+        amend_command("echo fmt >> one")
+    );
+    let err = run_exec(wt, &mut plan, &[&command]).unwrap_err();
+    let HistoryError::ExecDirty { commit, paths, .. } = err else {
+        panic!("expected a dirty stop, got {err:?}")
+    };
+    assert_eq!(paths, ["f"], "the amended file is not reported as dirty");
+    assert_eq!(git_oid(wt, "HEAD"), commit);
+    assert_eq!(git(wt, &["show", "HEAD:one"]), "one\nfmt\n");
+    git(wt, &["stash", "push", "-m", "dirt"]);
+    let RebaseOutcome::ExecDone { plan: done, .. } = continue_rebase(
+        &open_grit(wt),
+        &opts,
+        &mut grit_lib::progress::NullProgress,
+        &grit_lib::progress::NeverCancel,
+    )
+    .expect("continue after saving the edits") else {
+        panic!("done")
+    };
+    assert_eq!(done.commits[0].new, Some(commit));
+    assert_eq!(git_oid(wt, "topic~1"), commit);
+    assert_eq!(git(wt, &["show", "topic:one"]), "one\nfmt\n");
+    assert_eq!(git(wt, &["show", "topic:two"]), "two\n");
+    assert!(!wt.join(".git/rebase-merge").exists());
+    assert_eq!(
+        done.mapped_tip(opts.request.branch_tip),
+        Some(git_oid(wt, "topic"))
+    );
+    assert_git_fsck_strict(wt);
+}
+
+#[test]
+fn exec_moving_head_elsewhere_rolls_back() {
+    use grit_lib::revwalk::history::HistoryError;
+    let (fixture, opts, mut plan) = exec_fixture();
+    let wt = fixture.worktree();
+    let index = std::fs::read(wt.join(".git/index")).unwrap();
+    let err = run_exec(wt, &mut plan, &["git checkout -q --detach HEAD~1"]).unwrap_err();
+    assert!(
+        matches!(err, HistoryError::ExecHeadMoved { head: Some(_), .. }),
+        "{err:?}"
+    );
+    assert_eq!(git_oid(wt, "HEAD"), opts.request.branch_tip);
+    assert_eq!(
+        git(wt, &["symbolic-ref", "HEAD"]).trim(),
+        "refs/heads/topic"
+    );
+    assert_eq!(std::fs::read(wt.join(".git/index")).unwrap(), index);
+    assert_eq!(git(wt, &["status", "--porcelain"]), "");
+    assert!(!wt.join(".git/rebase-merge").exists());
+}
+
+/// An amend at the first commit that adds `two` conflicts with the second commit adding it.
+fn conflicting_amend() -> String {
+    format!(
+        "if ! test -f two; then echo amended > two && {EXEC_GIT} add two && {EXEC_GIT} commit -q --amend --no-edit; fi"
+    )
+}
+
+#[test]
+fn exec_amend_conflicting_with_next_commit_stops_resumably_and_matches_git() {
+    use grit_lib::revwalk::history::HistoryError;
+    let (fixture, opts, mut plan) = exec_fixture();
+    let wt = fixture.worktree();
+    let command = conflicting_amend();
+    let err = run_exec(wt, &mut plan, &[&command, "true"]).unwrap_err();
+    let HistoryError::ExecConflict {
+        commit,
+        conflicts,
+        runs,
+    } = err
+    else {
+        panic!("expected an exec conflict stop, got {err:?}")
+    };
+    let second_original = git_oid(wt, "topic");
+    assert_eq!(commit, second_original);
+    assert_eq!(conflicts.len(), 1);
+    assert_eq!(conflicts[0].path, "two");
+    assert_eq!(runs.len(), 2);
+    let amended = git_oid(wt, "HEAD");
+    assert_eq!(git(wt, &["show", "HEAD:two"]), "amended\n");
+    assert_eq!(git_oid(wt, "HEAD~1"), opts.request.onto.unwrap());
+    let two = std::fs::read_to_string(wt.join("two")).unwrap();
+    assert!(two.contains("<<<<<<<"));
+    assert!(
+        two.contains(&format!(
+            "\n>>>>>>> {} (two)\n",
+            &second_original.to_hex()[..7]
+        )),
+        "{two}"
+    );
+    assert_eq!(git_oid(wt, "topic"), opts.request.branch_tip);
+
+    let repo = open_grit(wt);
+    assert!(matches!(
+        continue_rebase(
+            &repo,
+            &opts,
+            &mut grit_lib::progress::NullProgress,
+            &grit_lib::progress::NeverCancel
+        ),
+        Err(RebaseSessionError::UnmergedPaths)
+    ));
+    std::fs::write(wt.join("two"), "resolved\n").unwrap();
+    git(wt, &["add", "two"]);
+    let RebaseOutcome::ExecDone { exec, plan, .. } = continue_rebase(
+        &open_grit(wt),
+        &opts,
+        &mut grit_lib::progress::NullProgress,
+        &grit_lib::progress::NeverCancel,
+    )
+    .expect("continue") else {
+        panic!("done")
+    };
+    assert_eq!(exec.runs.len(), 2, "commands run at the resolved commit");
+    assert_eq!(plan.commits[0].new, Some(amended));
+    assert_eq!(git_oid(wt, "topic~1"), amended);
+    assert_eq!(git(wt, &["show", "topic:two"]), "resolved\n");
+    assert_eq!(subjects(wt, "topic"), "two\none\nmain moves\nbase\n");
+    assert_eq!(
+        git(wt, &["symbolic-ref", "HEAD"]).trim(),
+        "refs/heads/topic"
+    );
+    assert_eq!(git(wt, &["status", "--porcelain"]), "");
+    assert!(!wt.join(".git/rebase-merge").exists());
+    assert_git_fsck_strict(wt);
+
+    let (twin, code) = git_exec_twin(&[&command]);
+    assert_eq!(code, Some(1), "git stops on the same conflict");
+    let other = twin.worktree();
+    std::fs::write(other.join("two"), "resolved\n").unwrap();
+    git(other, &["add", "two"]);
+    let cont = git_hermetic(other, &["rebase", "--continue"]);
+    assert!(cont.status.success(), "{cont:?}");
+    for rev in ["topic^{tree}", "topic~1^{tree}"] {
+        assert_eq!(git_oid(wt, rev), git_oid(other, rev), "{rev}");
+    }
+    assert_eq!(subjects(other, "topic"), subjects(wt, "topic"));
+}
+
+#[test]
+fn exec_conflict_stop_skip_drops_the_commit_and_abort_restores() {
+    use grit_lib::revwalk::history::HistoryError;
+    for skip in [true, false] {
+        let (fixture, opts, mut plan) = exec_fixture();
+        let wt = fixture.worktree();
+        let index = std::fs::read(wt.join(".git/index")).unwrap();
+        let err = run_exec(wt, &mut plan, &[&conflicting_amend()]).unwrap_err();
+        assert!(matches!(err, HistoryError::ExecConflict { .. }), "{err:?}");
+        let amended = git_oid(wt, "HEAD");
+        if skip {
+            let RebaseOutcome::ExecDone { plan, .. } = skip_rebase(
+                &open_grit(wt),
+                &opts,
+                &mut grit_lib::progress::NullProgress,
+                &grit_lib::progress::NeverCancel,
+            )
+            .expect("skip") else {
+                panic!("done")
+            };
+            assert_eq!(plan.commits[1].new, None);
+            assert_eq!(git_oid(wt, "topic"), amended);
+            assert_eq!(subjects(wt, "topic"), "one\nmain moves\nbase\n");
+        } else {
+            abort_rebase(&open_grit(wt), &test_ident()).unwrap();
+            assert_eq!(git_oid(wt, "topic"), opts.request.branch_tip);
+            assert_eq!(git_oid(wt, "HEAD"), opts.request.branch_tip);
+            assert_eq!(std::fs::read(wt.join(".git/index")).unwrap(), index);
+            assert_eq!(std::fs::read(wt.join("two")).unwrap(), b"two\n");
+        }
+        assert_eq!(git(wt, &["status", "--porcelain"]), "");
+        assert!(!wt.join(".git/rebase-merge").exists());
+        assert_git_fsck_strict(wt);
+    }
+}
+
+#[test]
+fn exec_resume_keeps_the_rewrite_options_the_rebase_started_with() {
+    use grit_lib::revwalk::history::{
+        plan_rebase, verify_rebase_with_exec, ExecSpec, HistoryError, RebasePlan,
+    };
+    let fixture = HistoryRepo::init();
+    let wt = fixture.worktree();
+    commit_file(wt, "f", "base\n", "base");
+    let upstream = git_oid(wt, "HEAD");
+    git(wt, &["switch", "-c", "topic"]);
+    commit_file(wt, "one", "one\n", "one");
+    commit_file(wt, "two", "B\n", "two");
+    commit_file(wt, "two", "C\n", "three");
+    let tip = git_oid(wt, "HEAD");
+    git(wt, &["switch", "main"]);
+    commit_file(wt, "up", "up\n", "up");
+    let onto = git_oid(wt, "HEAD");
+    git(wt, &["switch", "topic"]);
+
+    let resume_opts = start_opts(upstream, Some(onto), tip);
+    let mut keep = resume_opts.clone();
+    keep.rebase.rewrite.empty = EmptyPolicy::Keep;
+    let RebasePlan::Plan(mut plan) =
+        plan_rebase(&open_grit(wt), &keep.request, &keep.rebase).unwrap()
+    else {
+        panic!("replay plan")
+    };
+    let err = verify_rebase_with_exec(
+        &open_grit(wt),
+        &mut plan,
+        &ExecSpec {
+            commands: vec![conflicting_amend()],
+        },
+        &keep.rebase.rewrite,
+        grit_lib::command_runner::system_command_runner().as_ref(),
+    )
+    .unwrap_err();
+    assert!(matches!(err, HistoryError::ExecConflict { .. }), "{err:?}");
+    std::fs::write(wt.join("two"), "C\n").unwrap();
+    git(wt, &["add", "two"]);
+    assert_eq!(resume_opts.rebase.rewrite.empty, EmptyPolicy::Drop);
+    let RebaseOutcome::ExecDone { .. } = continue_rebase(
+        &open_grit(wt),
+        &resume_opts,
+        &mut grit_lib::progress::NullProgress,
+        &grit_lib::progress::NeverCancel,
+    )
+    .expect("continue") else {
+        panic!("done")
+    };
+    assert_eq!(
+        subjects(wt, "topic"),
+        "three\ntwo\none\nup\nbase\n",
+        "the now-empty third commit is kept, as the rebase was started with --empty keep"
+    );
+    assert_eq!(git(wt, &["show", "topic:two"]), "C\n");
+    assert_git_fsck_strict(wt);
+}
+
+#[test]
+fn exec_conflict_skip_runs_the_pending_command_like_git() {
+    use grit_lib::revwalk::history::HistoryError;
+    let logs = tempfile::tempdir().unwrap();
+    let command_logging_to =
+        |log: &std::path::Path| format!("echo run >> '{}'; {}", log.display(), conflicting_amend());
+    let count = |log: &std::path::Path| {
+        std::fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+
+    let grit_log = logs.path().join("grit");
+    let (fixture, opts, mut plan) = exec_fixture();
+    let wt = fixture.worktree();
+    let err = run_exec(wt, &mut plan, &[&command_logging_to(&grit_log)]).unwrap_err();
+    assert!(matches!(err, HistoryError::ExecConflict { .. }), "{err:?}");
+    assert_eq!(count(&grit_log), 1);
+    let amended = git_oid(wt, "HEAD");
+    let RebaseOutcome::ExecDone { exec, plan, .. } = skip_rebase(
+        &open_grit(wt),
+        &opts,
+        &mut grit_lib::progress::NullProgress,
+        &grit_lib::progress::NeverCancel,
+    )
+    .expect("skip") else {
+        panic!("done")
+    };
+    assert_eq!(count(&grit_log), 2, "the skipped pick's command still runs");
+    assert_eq!(exec.runs.len(), 1);
+    assert_eq!(exec.runs[0].commit, amended);
+    assert_eq!(plan.commits[1].new, None);
+    assert_eq!(git_oid(wt, "topic"), amended);
+
+    let git_log = logs.path().join("git");
+    let (twin, code) = git_exec_twin(&[&command_logging_to(&git_log)]);
+    assert_eq!(code, Some(1));
+    assert_eq!(count(&git_log), 1);
+    let skip = git_hermetic(twin.worktree(), &["rebase", "--skip"]);
+    assert!(skip.status.success(), "{skip:?}");
+    assert_eq!(count(&git_log), 2);
+    assert_eq!(subjects(twin.worktree(), "topic"), subjects(wt, "topic"));
+    assert_eq!(
+        git_oid(wt, "topic^{tree}"),
+        git_oid(twin.worktree(), "topic^{tree}")
+    );
+    assert_git_fsck_strict(wt);
+}
+
+#[test]
+fn exec_conflict_recovery_write_failure_rolls_back() {
+    let (fixture, opts, mut plan) = exec_fixture();
+    let wt = fixture.worktree();
+    let index = std::fs::read(wt.join(".git/index")).unwrap();
+    let command = format!(
+        "if ! test -f two; then echo amended > two && {EXEC_GIT} add two && \
+         {EXEC_GIT} commit -q --amend --no-edit && mkdir -p .git/rebase-merge && \
+         touch .git/rebase-merge/grit-exec.lock; fi"
+    );
+    let err = run_exec(wt, &mut plan, &[&command]).unwrap_err();
+    assert!(err.to_string().contains("grit-exec.lock"), "{err}");
+    assert_eq!(
+        git(wt, &["symbolic-ref", "HEAD"]).trim(),
+        "refs/heads/topic"
+    );
+    assert_eq!(git_oid(wt, "topic"), opts.request.branch_tip);
+    assert_eq!(std::fs::read(wt.join(".git/index")).unwrap(), index);
+    assert_eq!(git(wt, &["ls-files", "-u"]), "");
+    assert_eq!(std::fs::read(wt.join("two")).unwrap(), b"two\n");
+    assert_eq!(git(wt, &["status", "--porcelain"]), "");
+    for name in ["grit-exec", "orig-head", "head-name"] {
+        assert!(!wt.join(".git/rebase-merge").join(name).exists(), "{name}");
+    }
+    assert_git_fsck_strict(wt);
+}
+
+#[test]
+fn rebase_merge_replay_one_conflict_keeps_merge_parents_issue_2245() {
+    let repo = HistoryRepo::init();
+    let wt = repo.worktree();
+    git(wt, &["config", "grit.changeIds", "false"]);
+    commit_file(wt, "base.txt", "base\n", "base");
+    git(wt, &["switch", "-qc", "side"]);
+    commit_file(wt, "side.txt", "s\n", "side: a");
+    commit_file(wt, "side.txt", "s\ns2\n", "side: b");
+    git(wt, &["switch", "-qc", "feat", "main"]);
+    commit_file(wt, "shared.txt", "mine\n", "feat: a (shared)");
+    commit_file(wt, "c.txt", "c\n", "feat: c");
+    git(wt, &["merge", "-q", "--no-ff", "-m", "Merge side", "side"]);
+    commit_file(wt, "feat.txt", "f2\n", "feat: b");
+    git(wt, &["switch", "-q", "main"]);
+    commit_file(wt, "shared.txt", "theirs\n", "main: shared");
+    git(wt, &["switch", "-q", "feat"]);
+    let fork = git_oid(wt, "main~1");
+    let onto = git_oid(wt, "main");
+    let tip = git_oid(wt, "feat");
+    let opts = start_opts(fork, Some(onto), tip);
+
+    let RebaseOutcome::Stopped(first) = start_rebase(
+        &open_grit(wt),
+        &opts,
+        &mut grit_lib::progress::NullProgress,
+        &grit_lib::progress::NeverCancel,
+    )
+    .expect("start") else {
+        panic!("expected conflict on feat: a");
+    };
+    assert_eq!(first.conflicts.len(), 1);
+    assert_eq!(first.conflicts[0].path, "shared.txt");
+    assert_eq!(
+        first.done.len(),
+        2,
+        "side branch should replay before feat:a conflict"
+    );
+
+    std::fs::write(wt.join("shared.txt"), "resolved1\n").expect("resolve");
+    git(wt, &["add", "shared.txt"]);
+    let outcome = continue_rebase(
+        &open_grit(wt),
+        &opts,
+        &mut grit_lib::progress::NullProgress,
+        &grit_lib::progress::NeverCancel,
+    )
+    .expect("continue");
+    assert!(
+        matches!(
+            outcome,
+            RebaseOutcome::Done { .. } | RebaseOutcome::ExecDone { .. }
+        ),
+        "expected rebase to finish after one conflict, got {outcome:?}"
+    );
+
+    let merge_oid = git_oid(wt, "feat~1");
+    let merge =
+        grit_lib::objects::parse_commit(&open_grit(wt).odb().read(&merge_oid).expect("read").data)
+            .expect("parse merge");
+    assert_eq!(merge.parents.len(), 2, "Merge side keeps two parents");
+    let tree_listing = git(wt, &["ls-tree", "-r", "--name-only", "HEAD"]);
+    let files: Vec<_> = tree_listing
+        .lines()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    assert!(
+        files.contains(&"side.txt"),
+        "side.txt must remain: {files:?}"
+    );
+    assert!(
+        !git_merge_base_is_ancestor(wt, "feat", "side"),
+        "side ref must not absorb feat commits"
+    );
+    assert_git_fsck_strict(wt);
+}
+
+fn rebase_apply_with_record() -> grit_lib::revwalk::history::ApplyOptions {
+    grit_lib::revwalk::history::ApplyOptions {
+        identity: test_ident(),
+        reflog_message: "rebase".into(),
+        record_operation: Some("rebase".into()),
+        hooks: grit_lib::PostOperationHooks::Run,
+    }
+}
+
+fn undo_opts() -> grit_lib::revwalk::history::ApplyOptions {
+    grit_lib::revwalk::history::ApplyOptions {
+        identity: test_ident(),
+        reflog_message: "history undo".into(),
+        record_operation: None,
+        hooks: grit_lib::PostOperationHooks::Run,
+    }
+}
+
+fn finish_conflict_rebase_with_record(
+    wt: &std::path::Path,
+    start: &StartRebaseOptions,
+) -> (ObjectId, ObjectId) {
+    let orig_tip = git_oid(wt, "HEAD");
+    match start_rebase(
+        &open_grit(wt),
+        start,
+        &mut grit_lib::progress::NullProgress,
+        &grit_lib::progress::NeverCancel,
+    )
+    .expect("start")
+    {
+        RebaseOutcome::Stopped(_) => {}
+        other => panic!("expected conflict stop, got {other:?}"),
+    }
+    std::fs::write(wt.join("f.txt"), "resolved\n").expect("resolve");
+    git(wt, &["add", "f.txt"]);
+    let grit = open_grit(wt);
+    match continue_rebase(
+        &grit,
+        start,
+        &mut grit_lib::progress::NullProgress,
+        &grit_lib::progress::NeverCancel,
+    )
+    .expect("continue")
+    {
+        RebaseOutcome::Done { .. } => {}
+        other => panic!("expected done, got {other:?}"),
+    }
+    (orig_tip, git_oid(wt, "HEAD"))
+}
+
+/// Issue #2274: history-last after `--continue` must describe the reattached branch, not the
+/// detached conflict stop, so `history undo` can invert the rebase.
+#[test]
+fn continue_after_conflict_records_history_last_for_undo_issue_2274() {
+    let repo = HistoryRepo::init();
+    let wt = repo.worktree();
+    commit_file(wt, "f.txt", "base\n", "base");
+    let upstream = git_oid(wt, "HEAD");
+    git(wt, &["switch", "-c", "topic"]);
+    commit_file(wt, "f.txt", "topic change\n", "topic commit");
+    let tip = git_oid(wt, "HEAD");
+    let orig_tip = tip;
+    git(wt, &["switch", "main"]);
+    commit_file(wt, "f.txt", "main change\n", "main commit");
+    let onto = git_oid(wt, "HEAD");
+    git(wt, &["switch", "topic"]);
+
+    let start = StartRebaseOptions {
+        request: RebaseRequest {
+            upstream,
+            onto: Some(onto),
+            branch_tip: tip,
+        },
+        rebase: rebase_opts(),
+        apply: rebase_apply_with_record(),
+        pre_rebase: grit_lib::revwalk::history::PreRebase::Skip,
+    };
+    let (before, after) = finish_conflict_rebase_with_record(wt, &start);
+    assert_eq!(before, orig_tip);
+    assert_ne!(before, after);
+
+    let grit = open_grit(wt);
+    let record = read_history_last(&grit).expect("read").expect("record");
+    assert_eq!(record.operation, "rebase");
+    assert_eq!(record.head_ref.as_deref(), Some("refs/heads/topic"));
+    assert_eq!(record.head_old_commit, Some(orig_tip));
+    assert_eq!(record.head_new_commit, Some(after));
+    assert_ne!(record.head_old_commit, record.head_new_commit);
+
+    undo_last_rewrite(&grit, &undo_opts(), false).expect("undo");
+    assert_eq!(git_oid(wt, "topic"), orig_tip);
+    assert_eq!(
+        git(wt, &["symbolic-ref", "HEAD"]).trim(),
+        "refs/heads/topic"
+    );
+    undo_last_rewrite(&grit, &undo_opts(), false).expect("redo");
+    assert_eq!(git_oid(wt, "topic"), after);
+    assert_git_fsck_strict(wt);
+}
+
+#[test]
+fn skip_after_conflict_records_history_last_for_undo_issue_2274() {
+    let repo = HistoryRepo::init();
+    let wt = repo.worktree();
+    commit_file(wt, "f.txt", "base\n", "base");
+    let upstream = git_oid(wt, "HEAD");
+    git(wt, &["switch", "-c", "topic"]);
+    commit_file(wt, "f.txt", "topic change\n", "topic commit");
+    commit_file(wt, "f2.txt", "second\n", "topic second");
+    let tip = git_oid(wt, "HEAD");
+    let orig_tip = git_oid(wt, "topic");
+    git(wt, &["switch", "main"]);
+    commit_file(wt, "f.txt", "main change\n", "main commit");
+    let onto = git_oid(wt, "HEAD");
+    git(wt, &["switch", "topic"]);
+
+    let start = StartRebaseOptions {
+        request: RebaseRequest {
+            upstream,
+            onto: Some(onto),
+            branch_tip: tip,
+        },
+        rebase: rebase_opts(),
+        apply: rebase_apply_with_record(),
+        pre_rebase: grit_lib::revwalk::history::PreRebase::Skip,
+    };
+    match start_rebase(
+        &open_grit(wt),
+        &start,
+        &mut grit_lib::progress::NullProgress,
+        &grit_lib::progress::NeverCancel,
+    )
+    .expect("start")
+    {
+        RebaseOutcome::Stopped(_) => {}
+        other => panic!("expected stop, got {other:?}"),
+    }
+    let stop_head = git_oid(wt, "HEAD");
+    let grit = open_grit(wt);
+    match skip_rebase(
+        &grit,
+        &start,
+        &mut grit_lib::progress::NullProgress,
+        &grit_lib::progress::NeverCancel,
+    )
+    .expect("skip")
+    {
+        RebaseOutcome::Done { applied, .. } => {
+            let final_tip = git_oid(wt, "topic");
+            assert_ne!(final_tip, stop_head);
+            assert_ne!(final_tip, orig_tip);
+            assert_eq!(applied.head, final_tip);
+        }
+        other => panic!("expected done, got {other:?}"),
+    }
+
+    let grit = open_grit(wt);
+    let record = read_history_last(&grit).expect("read").expect("record");
+    assert_eq!(record.head_ref.as_deref(), Some("refs/heads/topic"));
+    assert_eq!(record.head_old_commit, Some(orig_tip));
+    assert_eq!(record.head_new_commit, Some(git_oid(wt, "topic")));
+
+    undo_last_rewrite(&grit, &undo_opts(), false).expect("undo");
+    assert_eq!(git_oid(wt, "topic"), orig_tip);
+    assert_git_fsck_strict(wt);
+}
+
+#[test]
+fn stacked_continue_after_conflict_undo_restores_all_branch_tips_issue_2274() {
+    let repo = HistoryRepo::init();
+    let wt = repo.worktree();
+    let oids = build_commit_dag(
+        wt,
+        &[("u", "r"), ("a", "u"), ("b", "a"), ("c", "b"), ("d", "b")],
+        &[("c", "refs/heads/main"), ("d", "refs/heads/stacked")],
+    );
+    git(
+        wt,
+        &[
+            "switch",
+            "--detach",
+            &format!("{}^{{commit}}", oids["u"].to_hex()),
+        ],
+    );
+    commit_file(wt, "shared.txt", "main-side\n", "onto shared");
+    let onto = git_oid(wt, "HEAD");
+    git(wt, &["switch", "main"]);
+    commit_file(wt, "shared.txt", "topic-side\n", "topic shared");
+    let branch_tip = git_oid(wt, "HEAD");
+    git(wt, &["switch", "stacked"]);
+
+    let grit = open_grit(wt);
+    let mut opts = rebase_opts();
+    opts.rewrite.scope = RefScope::Branches;
+    let start = StartRebaseOptions {
+        request: RebaseRequest {
+            upstream: oids["u"],
+            onto: Some(onto),
+            branch_tip,
+        },
+        rebase: opts,
+        apply: rebase_apply_with_record(),
+        pre_rebase: grit_lib::revwalk::history::PreRebase::Skip,
+    };
+    let main_before = resolve_ref(grit.git_dir(), "refs/heads/main").unwrap();
+    let stacked_before = resolve_ref(grit.git_dir(), "refs/heads/stacked").unwrap();
+
+    match start_rebase(
+        &grit,
+        &start,
+        &mut grit_lib::progress::NullProgress,
+        &grit_lib::progress::NeverCancel,
+    )
+    .expect("start")
+    {
+        RebaseOutcome::Stopped(_) => {
+            std::fs::write(wt.join("shared.txt"), "resolved shared\n").expect("resolve");
+            git(wt, &["add", "shared.txt"]);
+            let grit = open_grit(wt);
+            match continue_rebase(
+                &grit,
+                &start,
+                &mut grit_lib::progress::NullProgress,
+                &grit_lib::progress::NeverCancel,
+            )
+            .expect("continue")
+            {
+                RebaseOutcome::Done { .. } => {}
+                other => panic!("expected done, got {other:?}"),
+            }
+        }
+        other => panic!("expected conflict stop, got {other:?}"),
+    }
+
+    assert_ne!(
+        resolve_ref(grit.git_dir(), "refs/heads/main").unwrap(),
+        main_before
+    );
+    assert_ne!(
+        resolve_ref(grit.git_dir(), "refs/heads/stacked").unwrap(),
+        stacked_before
+    );
+
+    let grit = open_grit(wt);
+    let record = read_history_last(&grit).expect("read").expect("record");
+    assert_eq!(record.head_ref.as_deref(), Some("refs/heads/stacked"));
+    assert_eq!(record.head_old_commit, Some(stacked_before));
+
+    undo_last_rewrite(&grit, &undo_opts(), false).expect("undo");
+    assert_eq!(
+        resolve_ref(grit.git_dir(), "refs/heads/main").unwrap(),
+        main_before
+    );
+    assert_eq!(
+        resolve_ref(grit.git_dir(), "refs/heads/stacked").unwrap(),
+        stacked_before
+    );
+    assert_eq!(
+        git(wt, &["symbolic-ref", "HEAD"]).trim(),
+        "refs/heads/stacked"
+    );
     assert_git_fsck_strict(wt);
 }

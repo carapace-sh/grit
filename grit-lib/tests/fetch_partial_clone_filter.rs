@@ -118,9 +118,13 @@ fn git_config_value(git_dir: &Path, key: &str) -> Option<String> {
 
 /// `git clone --no-checkout --filter=<filter>`: the clone installs no promisor
 /// fetcher, so a checkout would have to read blobs the filter left on the server.
-fn grit_clone_filtered(url: &str, dest: &Path, filter: ObjectFilterSpec) -> PathBuf {
+fn grit_clone_filtered(
+    url: &str,
+    dest: &Path,
+    filter: ObjectFilterSpec,
+) -> (PathBuf, grit_lib::remote::clone::CloneOutcome) {
     fs::create_dir_all(dest).expect("dest");
-    clone(
+    let outcome = clone(
         CloneOptions {
             url: url.to_owned(),
             dest: dest.to_path_buf(),
@@ -133,7 +137,7 @@ fn grit_clone_filtered(url: &str, dest: &Path, filter: ObjectFilterSpec) -> Path
         None,
     )
     .expect("clone");
-    dest.join(".git")
+    (dest.join(".git"), outcome)
 }
 
 fn assert_partial_clone_config(git_dir: &Path, remote: &str) {
@@ -171,7 +175,11 @@ fn fetch_blob_none_receives_no_blobs() {
     let (_layout, bare) = setup_filtering_bare();
     let url = format!("file://{}", bare.canonicalize().unwrap().display());
     let dest = tempfile::TempDir::new().expect("dest");
-    let git_dir = grit_clone_filtered(&url, dest.path(), ObjectFilterSpec::BlobNone);
+    let (git_dir, outcome) = grit_clone_filtered(&url, dest.path(), ObjectFilterSpec::BlobNone);
+    assert!(
+        outcome.filter_sent,
+        "filter should be sent when server allows it"
+    );
     clear_pack_cache();
 
     let objects = git_dir.join("objects");
@@ -208,7 +216,9 @@ fn fetch_blob_limit_keeps_small_blobs() {
     let (_layout, bare) = setup_filtering_bare();
     let url = format!("file://{}", bare.canonicalize().unwrap().display());
     let dest = tempfile::TempDir::new().expect("dest");
-    let git_dir = grit_clone_filtered(&url, dest.path(), ObjectFilterSpec::BlobLimit(100));
+    let (git_dir, outcome) =
+        grit_clone_filtered(&url, dest.path(), ObjectFilterSpec::BlobLimit(100));
+    assert!(outcome.filter_sent);
     clear_pack_cache();
     let objects = git_dir.join("objects");
     assert!(promisor_sidecar_exists(&objects));
@@ -235,7 +245,11 @@ fn filter_dropped_when_server_lacks_capability() {
     git_in(&bare, &["config", "--unset", "uploadpack.allowFilter"]);
     let url = format!("file://{}", bare.canonicalize().unwrap().display());
     let dest = tempfile::TempDir::new().expect("dest");
-    let git_dir = grit_clone_filtered(&url, dest.path(), ObjectFilterSpec::BlobNone);
+    let (git_dir, outcome) = grit_clone_filtered(&url, dest.path(), ObjectFilterSpec::BlobNone);
+    assert!(
+        !outcome.filter_sent,
+        "filter must not be sent when uploadpack.allowFilter is unset"
+    );
     clear_pack_cache();
     let objects = git_dir.join("objects");
     assert_partial_clone_config(&git_dir, "origin");
@@ -254,7 +268,7 @@ fn refetch_reapplies_stored_filter() {
     let (_layout, bare) = setup_filtering_bare();
     let url = format!("file://{}", bare.canonicalize().unwrap().display());
     let dest = tempfile::TempDir::new().expect("dest");
-    let git_dir = grit_clone_filtered(&url, dest.path(), ObjectFilterSpec::BlobNone);
+    let (git_dir, _outcome) = grit_clone_filtered(&url, dest.path(), ObjectFilterSpec::BlobNone);
     clear_pack_cache();
 
     let wt = bare.parent().unwrap().join("upstream");
@@ -305,7 +319,7 @@ fn fsck_accepts_promised_missing_blobs() {
     let (_layout, bare) = setup_filtering_bare();
     let url = format!("file://{}", bare.canonicalize().unwrap().display());
     let dest = tempfile::TempDir::new().expect("dest");
-    let git_dir = grit_clone_filtered(&url, dest.path(), ObjectFilterSpec::BlobNone);
+    let (git_dir, _outcome) = grit_clone_filtered(&url, dest.path(), ObjectFilterSpec::BlobNone);
     clear_pack_cache();
     let repo = Repository::open(
         &git_dir,
@@ -338,7 +352,7 @@ fn fsck_accepts_promised_missing_blobs_in_index_after_reset() {
     let (_layout, bare) = setup_filtering_bare();
     let url = format!("file://{}", bare.canonicalize().unwrap().display());
     let dest = tempfile::TempDir::new().expect("dest");
-    let git_dir = grit_clone_filtered(&url, dest.path(), ObjectFilterSpec::BlobNone);
+    let (git_dir, _outcome) = grit_clone_filtered(&url, dest.path(), ObjectFilterSpec::BlobNone);
     clear_pack_cache();
     git_in(dest.path(), &["read-tree", "HEAD"]);
     let repo = Repository::open(

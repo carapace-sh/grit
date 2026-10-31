@@ -518,6 +518,7 @@ pub(crate) fn query_refs_peeling(
     let store = repo.refs();
     let namespaces = effective_namespaces(query);
     let linked_worktree = crate::worktree_ref::is_linked_worktree_git_dir(git_dir);
+    let early_limit = early_ref_collection_limit(query, options);
     let mut collected = Vec::new();
     for ns in &namespaces {
         let prefix = ns.prefix();
@@ -528,8 +529,14 @@ pub(crate) fn query_refs_peeling(
                 return ControlFlow::Continue(());
             }
             insert_collected_ref(&mut collected, entry, store, &namespaces, query, options);
+            if early_limit.is_some_and(|limit| collected.len() >= limit) {
+                return ControlFlow::Break(());
+            }
             ControlFlow::Continue(())
         })?;
+        if early_limit.is_some_and(|limit| collected.len() >= limit) {
+            break;
+        }
     }
     finish_query(
         dedup_collected(collected),
@@ -639,6 +646,24 @@ fn query_has_reachability(query: &RefQuery) -> bool {
         || !query.merged.is_empty()
         || !query.no_merged.is_empty()
         || !query.points_at.is_empty()
+}
+
+/// When refs arrive in name order from the store, stop collecting once enough match.
+fn early_ref_collection_limit(query: &RefQuery, options: &RefQueryOptions) -> Option<usize> {
+    let limit = query.limit?;
+    if query.sort.key != SortKey::Name || query.sort.reverse {
+        return None;
+    }
+    if !query.patterns.is_empty() || options.ignore_case {
+        return None;
+    }
+    if query_has_reachability(query) {
+        return None;
+    }
+    if effective_namespaces(query).len() != 1 {
+        return None;
+    }
+    Some(limit)
 }
 
 fn finish_query(
@@ -911,7 +936,7 @@ mod tests {
             )
             .unwrap();
         crate::refs::write_ref(repo.git_dir(), "refs/heads/main", &commit).unwrap();
-        crate::refs::write_ref(repo.git_dir(), "refs/heads/tagged", &tag).unwrap();
+        crate::refs::write_ref(repo.git_dir(), "refs/tags/tagged", &tag).unwrap();
 
         let options = RefQueryOptions::default();
         let peeled = |query: &RefQuery, peel: PeelTips| -> Vec<(String, Option<ObjectId>)> {
@@ -921,7 +946,10 @@ mod tests {
                 .map(|l| (l.short_name, l.peeled))
                 .collect()
         };
-        let all = RefQuery::default();
+        let all = RefQuery {
+            namespaces: vec![RefNamespace::Heads, RefNamespace::Tags],
+            ..RefQuery::default()
+        };
         let both_peeled = vec![
             ("main".to_owned(), None),
             ("tagged".to_owned(), Some(commit)),
@@ -942,13 +970,66 @@ mod tests {
 
         let points_at = RefQuery {
             points_at: vec![commit],
-            ..RefQuery::default()
+            ..all.clone()
         };
         assert_eq!(peeled(&points_at, PeelTips::WhenFiltering), both_peeled);
         let contains = RefQuery {
             contains: vec![commit],
-            ..RefQuery::default()
+            ..all.clone()
         };
         assert_eq!(peeled(&contains, PeelTips::WhenFiltering), both_peeled);
+    }
+
+    #[test]
+    fn limit_one_with_multiple_namespaces_uses_global_name_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = crate::repo::init_repository(
+            dir.path(),
+            false,
+            "main",
+            None,
+            crate::RefStorageFormat::Files,
+        )
+        .unwrap();
+        let tree = repo
+            .odb()
+            .write(crate::objects::ObjectKind::Tree, b"")
+            .unwrap();
+        let commit = repo
+            .odb()
+            .write(
+                crate::objects::ObjectKind::Commit,
+                &crate::objects::serialize_commit(&crate::objects::CommitData {
+                    tree,
+                    parents: Vec::new(),
+                    author: "T <t@example.com> 1 +0000".into(),
+                    committer: "T <t@example.com> 1 +0000".into(),
+                    author_raw: Vec::new(),
+                    committer_raw: Vec::new(),
+                    encoding: None,
+                    message: "m\n".into(),
+                    raw_message: None,
+                    extra_headers: Vec::new(),
+                }),
+            )
+            .unwrap();
+        crate::refs::write_ref(repo.git_dir(), "refs/heads/a", &commit).unwrap();
+        crate::refs::write_ref(repo.git_dir(), "refs/tags/z", &commit).unwrap();
+
+        let query = RefQuery {
+            namespaces: vec![RefNamespace::Tags, RefNamespace::Heads],
+            limit: Some(1),
+            sort: RefSort {
+                key: SortKey::Name,
+                reverse: false,
+            },
+            ..RefQuery::default()
+        };
+        let names: Vec<String> = query_refs(&repo, &query, &RefQueryOptions::default())
+            .unwrap()
+            .into_iter()
+            .map(|l| l.full_name)
+            .collect();
+        assert_eq!(names, vec!["refs/heads/a".to_owned()]);
     }
 }

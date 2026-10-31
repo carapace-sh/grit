@@ -58,6 +58,24 @@ pub struct LeftRightCounts {
     pub right: usize,
 }
 
+/// Options for [`RevWalk::commits_iter`]: lazy commit-only walks without object/cherry tables.
+///
+/// For token lists, ref selections, path limits, or symmetric diff markers, use
+/// [`RevWalkListOptions`] with [`RevWalk::commits`] or [`RevWalk::rev_list_result`].
+#[derive(Debug, Clone, Default)]
+pub struct RevWalkCommitIterOptions {
+    /// Skip this many matching commits before yielding.
+    pub skip: usize,
+    /// Maximum commits to yield (`None` = unbounded).
+    pub limit: Option<usize>,
+    /// Exclude commits with committer date strictly before this Unix timestamp.
+    pub since: Option<i64>,
+    /// Exclude commits with committer date strictly after this Unix timestamp.
+    pub until: Option<i64>,
+    /// Follow only the first parent at merges when walking history.
+    pub first_parent: bool,
+}
+
 /// Options for listing or counting commits through [`RevWalk`].
 ///
 /// This is the high-level, token-based API: pass these to [`RevWalk::commits`],
@@ -81,7 +99,8 @@ pub struct RevWalkListOptions {
     pub reverse: bool,
     /// Additional positive ref tips (`--all`, `--branches`, `--tags`, `--remotes`).
     pub refs: Vec<RefSelection>,
-    /// Follow only the first parent at merges.
+    /// Follow only the first parent at merges when collecting listed commits. Exclusions
+    /// (`^A`, the left side of `A..B`) still hide everything they reach through every parent.
     pub first_parent: bool,
     /// Limit history to commits that touch these paths (same rules as `rev-list --`).
     pub paths: Vec<String>,
@@ -94,6 +113,13 @@ pub struct RevWalkListOptions {
     /// Return the commits the walk parses in [`RevListResult::commit_data`] (see
     /// [`RevListOptions::retain_commit_data`]), for callers that render the listed commits.
     pub retain_commit_data: bool,
+    /// Classify each listed commit as left or right of the symmetric range (`--left-right`)
+    /// in [`RevListResult::left_right_map`]. Requires exactly one `A...B` token.
+    pub left_right: bool,
+    /// Match the two sides of the symmetric range by patch-id (`--cherry-mark`), filling
+    /// [`RevListResult::left_right_map`], [`RevListResult::cherry_equivalent`] and
+    /// [`RevListResult::cherry_matches`]. Requires exactly one `A...B` token.
+    pub cherry_mark: bool,
 }
 
 /// Positive and negative revision specs produced by [`parse_rev_walk_tokens`].
@@ -255,6 +281,8 @@ pub(crate) fn rev_list_options_from_walk(
         commit_filter: walk.commit_filter.clone(),
         pickaxe: walk.pickaxe.clone(),
         retain_commit_data: walk.retain_commit_data,
+        left_right: walk.left_right || walk.cherry_mark,
+        cherry_mark: walk.cherry_mark,
         ..RevListOptions::default()
     })
 }
@@ -322,6 +350,16 @@ pub(crate) fn positive_specs_for_walk(
     let (all_refs, mut positive) = expand_ref_selections(repo, &walk.refs)?;
     positive.extend(parsed.positive.iter().cloned());
     Ok((parsed, positive, all_refs))
+}
+
+fn single_symmetric_range(
+    tokens: &[&str],
+    parsed: &RevWalkParsedSpecs,
+) -> Result<(ObjectId, ObjectId)> {
+    match (tokens, parsed.symmetric_left, parsed.symmetric_right) {
+        ([_], Some(left), Some(right)) => Ok((left, right)),
+        _ => Err(Error::RevList(RevListError::SymmetricRangeRequired)),
+    }
 }
 
 fn commit_count_from_result(result: RevListResult) -> Result<usize> {
@@ -397,21 +435,31 @@ impl<'repo> RevWalk<'repo> {
         Ok(self.rev_list_result(tokens, options)?.commits)
     }
 
-    /// Like [`Self::commits`], but retains bounded `--graph` linkage when available.
+    /// Like [`Self::commits`], but retains bounded `--graph` linkage when available, and the
+    /// side and patch-id pairing of each commit with [`RevWalkListOptions::left_right`] or
+    /// [`RevWalkListOptions::cherry_mark`].
     ///
     /// # Errors
     ///
-    /// Propagates rev-parse and rev-list errors.
+    /// Returns [`RevListError::SymmetricRangeRequired`] when `left_right` or `cherry_mark`
+    /// is set and `tokens` is not exactly one `A...B` range. Propagates rev-parse and
+    /// rev-list errors.
     pub fn rev_list_result(
         &self,
         tokens: &[&str],
         options: &RevWalkListOptions,
     ) -> Result<crate::rev_list::RevListResult> {
         let repo = self.repository();
-        if let Some(result) = try_single_positive_bounded_page(repo, tokens, options)? {
-            return Ok(result);
+        let sides = options.left_right || options.cherry_mark;
+        if !sides {
+            if let Some(result) = try_single_positive_bounded_page(repo, tokens, options)? {
+                return Ok(result);
+            }
         }
         let (parsed, positive, all_refs) = positive_specs_for_walk(repo, tokens, options)?;
+        if sides {
+            single_symmetric_range(tokens, &parsed)?;
+        }
         let opts = rev_list_options_from_walk(repo, options, &parsed, all_refs, false)?;
         rev_list(repo, &positive, &parsed.negative, &opts)
     }
@@ -485,6 +533,24 @@ impl<'repo> RevWalk<'repo> {
         commit_count_from_result(result)
     }
 
+    /// Left and right tips of `tokens` when it is exactly one symmetric range (`A...B`).
+    ///
+    /// The same check [`Self::left_right_counts`] and [`Self::rev_list_result`] (with
+    /// [`RevWalkListOptions::left_right`] or [`RevWalkListOptions::cherry_mark`]) apply, for
+    /// callers that must validate a range without walking it (for example a zero limit).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RevListError::SymmetricRangeRequired`] when `tokens` is not exactly one `A...B`
+    /// range, or rev-parse / merge-base errors from resolving the tips.
+    pub fn symmetric_range_tips(&self, tokens: &[&str]) -> Result<(ObjectId, ObjectId)> {
+        if tokens.len() != 1 {
+            return Err(Error::RevList(RevListError::SymmetricRangeRequired));
+        }
+        let parsed = parse_rev_walk_tokens(self.repository(), tokens)?;
+        single_symmetric_range(tokens, &parsed)
+    }
+
     /// Left/right commit counts for a single symmetric range token (`A...B`).
     ///
     /// Matches `git rev-list --left-right --count` for the same range.
@@ -498,14 +564,9 @@ impl<'repo> RevWalk<'repo> {
         tokens: &[&str],
         options: &RevWalkListOptions,
     ) -> Result<LeftRightCounts> {
-        if tokens.len() != 1 {
-            return Err(Error::RevList(RevListError::SymmetricRangeRequired));
-        }
         let repo = self.repository();
         let (parsed, positive, all_refs) = positive_specs_for_walk(repo, tokens, options)?;
-        let (Some(left), Some(right)) = (parsed.symmetric_left, parsed.symmetric_right) else {
-            return Err(Error::RevList(RevListError::SymmetricRangeRequired));
-        };
+        let (left, right) = single_symmetric_range(tokens, &parsed)?;
 
         if options.paths.is_empty()
             && options.refs.is_empty()

@@ -1,6 +1,7 @@
 //! `receive_pack_with_hook`: typed refusals, in-process policy hooks, streamed
 //! pack storage, and hook environment, checked against the system `git`.
 
+use grit_test_support::{git, rev_parse};
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -17,32 +18,6 @@ use grit_lib::remote::serve::{
 use grit_lib::repo::Repository;
 
 const ZERO: &str = "0000000000000000000000000000000000000000";
-
-fn git(dir: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
-        .current_dir(dir)
-        .args(args)
-        .env("GIT_AUTHOR_NAME", "T")
-        .env("GIT_AUTHOR_EMAIL", "t@example.com")
-        .env("GIT_AUTHOR_DATE", "2005-04-07T22:13:13 +0200")
-        .env("GIT_COMMITTER_NAME", "T")
-        .env("GIT_COMMITTER_EMAIL", "t@example.com")
-        .env("GIT_COMMITTER_DATE", "2005-04-07T22:13:13 +0200")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .output()
-        .expect("run git");
-    assert!(
-        out.status.success(),
-        "git {args:?} failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8(out.stdout).expect("utf8")
-}
-
-fn rev_parse(dir: &Path, rev: &str) -> ObjectId {
-    ObjectId::from_hex(git(dir, &["rev-parse", rev]).trim()).expect("oid")
-}
 
 /// A source repository with `commits` commits on `main`, each adding a file.
 fn source_repo(dir: &Path, commits: usize) -> ObjectId {
@@ -631,6 +606,160 @@ fn shallow_push_body(
     body
 }
 
+fn loose_ref_paths_under(git_dir: &Path, prefix: &str) -> Vec<std::path::PathBuf> {
+    let root = git_dir.join(prefix.trim_start_matches('/'));
+    let mut paths = Vec::new();
+    let mut stack = vec![root];
+    while let Some(dir) = stack.pop() {
+        let Ok(read) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in read.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.is_file() {
+                paths.push(path);
+            }
+        }
+    }
+    paths
+}
+
+/// Issue #2309: many sibling ref creates in one non-atomic push must commit in
+/// one packed-refs transaction, stay git-fsck clean, and scale roughly linearly.
+#[test]
+fn receive_pack_many_sibling_creates_use_one_packed_refs() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let src = tmp.path().join("src");
+    let tip = source_repo(&src, 1);
+    let bare = tmp.path().join("bare.git");
+    let repo = bare_repo(&bare);
+    let count = 2_000usize;
+    let names: Vec<String> = (0..count).map(|i| format!("refs/heads/b/n{i}")).collect();
+    let commands: Vec<(Option<ObjectId>, Option<ObjectId>, &str)> = names
+        .iter()
+        .map(|name| (None, Some(tip), name.as_str()))
+        .collect();
+    let pack = pack_for(&src, &[tip.to_hex()]);
+    let body = push_body(&commands, &pack);
+    let (outcome, report) = serve(&repo, &body, &ReceivePolicy::default(), &());
+    assert!(outcome.unpack_error.is_none(), "{report}");
+    assert!(
+        outcome.updates.iter().all(|u| u.error.is_none()),
+        "first failure: {:?}, report: {report}",
+        outcome.updates.iter().find(|u| u.error.is_some())
+    );
+    assert!(
+        loose_ref_paths_under(&bare, "refs/heads/b").is_empty(),
+        "sibling creates must land in packed-refs, not loose files"
+    );
+    assert!(bare.join("packed-refs").is_file());
+    let listed = git(&bare, &["for-each-ref", "--format=%(refname)"])
+        .lines()
+        .filter(|l| !l.is_empty())
+        .count();
+    assert_eq!(listed, count);
+    fsck(&bare);
+}
+
+#[test]
+fn receive_pack_mass_create_time_scales_near_linear() {
+    use std::time::Instant;
+
+    fn push_n(n: usize) -> std::time::Duration {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let src = tmp.path().join("src");
+        let tip = source_repo(&src, 1);
+        let bare = tmp.path().join("bare.git");
+        let repo = bare_repo(&bare);
+        let names: Vec<String> = (0..n).map(|i| format!("refs/heads/b/n{i}")).collect();
+        let commands: Vec<(Option<ObjectId>, Option<ObjectId>, &str)> = names
+            .iter()
+            .map(|name| (None, Some(tip), name.as_str()))
+            .collect();
+        let pack = pack_for(&src, &[tip.to_hex()]);
+        let body = push_body(&commands, &pack);
+        let start = Instant::now();
+        let (outcome, report) = serve(&repo, &body, &ReceivePolicy::default(), &());
+        assert!(outcome.unpack_error.is_none(), "{report}");
+        assert!(
+            outcome.updates.iter().all(|u| u.error.is_none()),
+            "{report}"
+        );
+        start.elapsed()
+    }
+
+    let t_small = push_n(500);
+    let t_large = push_n(2_000);
+    let ratio = t_large.as_secs_f64() / t_small.as_secs_f64().max(0.001);
+    assert!(
+        ratio < 8.0,
+        "expected near-linear scaling (ratio {ratio:.2} for 500→2000 refs): small={t_small:?} large={t_large:?}"
+    );
+}
+
+#[test]
+fn receive_pack_mixed_create_and_update_falls_back_from_initial_batch() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let src = tmp.path().join("src");
+    let tip = source_repo(&src, 1);
+    let bare = tmp.path().join("bare.git");
+    git(
+        tmp.path(),
+        &[
+            "clone",
+            "-q",
+            "--bare",
+            src.to_str().expect("utf8"),
+            bare.to_str().expect("utf8"),
+        ],
+    );
+    let old_main = resolve_ref(&bare, "refs/heads/main").expect("main");
+    let repo = open(&bare);
+    let commands: Vec<(Option<ObjectId>, Option<ObjectId>, &str)> = vec![
+        (Some(old_main), Some(tip), "refs/heads/main"),
+        (None, Some(tip), "refs/heads/extra/a"),
+        (None, Some(tip), "refs/heads/extra/b"),
+    ];
+    let pack = pack_for(&src, &[tip.to_hex()]);
+    let body = push_body(&commands, &pack);
+    let (outcome, report) = serve(&repo, &body, &ReceivePolicy::default(), &());
+    assert!(outcome.unpack_error.is_none(), "{report}");
+    assert!(
+        outcome.updates.iter().all(|u| u.error.is_none()),
+        "{report}"
+    );
+    assert_eq!(resolve_ref(&bare, "refs/heads/main").expect("main"), tip);
+    assert_eq!(resolve_ref(&bare, "refs/heads/extra/a").expect("a"), tip);
+    fsck(&bare);
+}
+
+#[test]
+fn receive_pack_non_atomic_batch_conflict_still_applies_valid_refs() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let src = tmp.path().join("src");
+    let tip = source_repo(&src, 1);
+    let bare = tmp.path().join("bare.git");
+    let repo = bare_repo(&bare);
+    let commands: Vec<(Option<ObjectId>, Option<ObjectId>, &str)> = vec![
+        (None, Some(tip), "refs/heads/ok"),
+        (None, Some(tip), "refs/heads/ok/nested"),
+    ];
+    let pack = pack_for(&src, &[tip.to_hex()]);
+    let body = push_body(&commands, &pack);
+    let (outcome, report) = serve(&repo, &body, &ReceivePolicy::default(), &());
+    assert!(outcome.unpack_error.is_none(), "{report}");
+    assert_eq!(outcome.updates[0].error, None, "{report}");
+    assert!(
+        outcome.updates[1].error.is_some(),
+        "ancestor conflict must refuse nested ref: {report}"
+    );
+    assert_eq!(resolve_ref(&bare, "refs/heads/ok").expect("ok"), tip);
+    assert!(resolve_ref(&bare, "refs/heads/ok/nested").is_err());
+    fsck(&bare);
+}
+
 /// Issue #2136: the server has the full history, the client is a depth-1
 /// clone. Its `shallow` line must not be a protocol error, and the push needs
 /// no shallow update, so the ref moves and the server stays complete.
@@ -776,5 +905,64 @@ fn shallow_update_records_the_new_boundary_on_both_storage_paths() {
             .filter(|n| n.starts_with("shallow_"))
             .collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+}
+
+#[test]
+fn non_atomic_receive_pack_many_creates_one_reftable_table() {
+    use grit_lib::refs::ref_storage::RefStorageFormat;
+    use grit_lib::repo::InitOptions;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let tip = source_repo(&tmp.path().join("src"), 1);
+    let pack = pack_for(&tmp.path().join("src"), &[tip.to_hex()]);
+    let bare = tmp.path().join("rt.git");
+    std::fs::create_dir_all(&bare).expect("mkdir");
+    Repository::init(
+        &bare,
+        &InitOptions::new()
+            .with_bare(true)
+            .with_initial_branch("main".to_owned())
+            .with_ref_storage(RefStorageFormat::Reftable),
+    )
+    .expect("reftable bare init");
+    let repo = open(&bare);
+    let table_count = |dir: &Path| {
+        std::fs::read_to_string(dir.join("reftable/tables.list"))
+            .map(|s| s.lines().filter(|l| !l.is_empty()).count())
+            .unwrap_or(0)
+    };
+    let before = table_count(&bare);
+
+    let names: Vec<String> = (0..32).map(|i| format!("refs/heads/b{i}")).collect();
+    let commands: Vec<(Option<ObjectId>, Option<ObjectId>, &str)> = names
+        .iter()
+        .map(|name| (None, Some(tip), name.as_str()))
+        .collect();
+    let body = push_body(&commands, &pack);
+    let (outcome, _report) = serve(&repo, &body, &ReceivePolicy::default(), &());
+    assert!(
+        outcome.unpack_error.is_none(),
+        "unpack failed: {:?}",
+        outcome.unpack_error
+    );
+    assert_eq!(
+        outcome.updates.len(),
+        32,
+        "expected one result per ref command"
+    );
+    assert!(outcome.updates.iter().all(|u| u.error.is_none()));
+    let after = table_count(&bare);
+    assert!(
+        after <= before + 1,
+        "non-atomic receive-pack must batch ref updates (before={before} after={after}, \
+         per-ref tables would be >= {})",
+        before + 32
+    );
+    for i in 0..32 {
+        assert_eq!(
+            resolve_ref(&bare, &format!("refs/heads/b{i}")).ok(),
+            Some(tip)
+        );
     }
 }

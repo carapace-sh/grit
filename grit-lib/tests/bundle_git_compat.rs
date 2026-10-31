@@ -1,5 +1,6 @@
 //! Round-trip and compatibility tests for [`grit_lib::bundle`] vs system `git bundle`.
 
+use grit_test_support::rev_parse;
 use std::path::Path;
 use std::process::Command;
 
@@ -37,10 +38,6 @@ fn git(dir: &Path, args: &[&str]) -> String {
 
 fn git_ok(dir: &Path, args: &[&str]) {
     git(dir, args);
-}
-
-fn rev_parse(dir: &Path, rev: &str) -> ObjectId {
-    ObjectId::from_hex(git(dir, &["rev-parse", rev]).trim()).expect("oid")
 }
 
 fn fsck_strict(dir: &Path) {
@@ -210,6 +207,34 @@ fn git_created_bundles_parse_verify_unbundle_fsck() {
     let refs = bundle.unbundle(&bare).expect("unbundle");
     assert!(refs.iter().any(|r| r.name == "refs/heads/main"));
     fsck_strict(consumer);
+}
+
+#[test]
+fn git_full_bundle_unbundle_rejects_corrupt_pack_trailer() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let src = tmp.path();
+    init_repo_with_two_commits(src);
+    let full = src.join("git-full.bundle");
+    git_ok(src, &["bundle", "create", full.to_str().unwrap(), "--all"]);
+    let mut bytes = std::fs::read(&full).expect("read bundle");
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0x55;
+    let corrupt = src.join("corrupt.bundle");
+    std::fs::write(&corrupt, &bytes).expect("write corrupt bundle");
+
+    let consumer = tempfile::tempdir().expect("consumer");
+    git_ok(
+        consumer.path(),
+        &["init", "-q", "--bare", "-b", "main", "."],
+    );
+    let bare = grit_repo(consumer.path());
+    let bundle = Bundle::open(&corrupt).expect("open corrupt bundle");
+    let err = bundle.unbundle(&bare).expect_err("corrupt pack trailer");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("checksum") || msg.contains("mismatch") || msg.contains("corrupt"),
+        "unexpected error: {msg}"
+    );
 }
 
 #[test]
@@ -484,6 +509,125 @@ fn grit_write_filtered_bundle_omits_blobs_from_pack() {
     }
     assert!(saw_commit, "pack should contain a commit");
     assert!(saw_tree, "pack should contain a tree");
+}
+
+#[test]
+fn grit_write_filtered_bundle_with_prerequisites_holds_only_new_small_objects() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let src = tmp.path();
+    git_ok(src, &["init", "-q", "-b", "main", "."]);
+    std::fs::write(src.join("old.txt"), b"old\n").unwrap();
+    git_ok(src, &["add", "old.txt"]);
+    git_ok(src, &["commit", "-q", "-m", "old"]);
+    let base = rev_parse(src, "HEAD");
+    std::fs::write(src.join("new.txt"), b"new\n").unwrap();
+    std::fs::write(src.join("big.bin"), vec![b'b'; 4096]).unwrap();
+    git_ok(src, &["add", "new.txt", "big.bin"]);
+    git_ok(src, &["commit", "-q", "-m", "new"]);
+    let tip = rev_parse(src, "HEAD");
+    let big = rev_parse(src, "HEAD:big.bin");
+    let new_txt = rev_parse(src, "HEAD:new.txt");
+
+    let bundle_path = src.join("incremental.bundle");
+    {
+        let mut f = std::fs::File::create(&bundle_path).expect("create");
+        write_bundle(
+            &grit_repo(src),
+            &BundleSpec {
+                include: vec![(tip, "refs/heads/main".to_owned())],
+                exclude: vec![base],
+                filter: Some(FilterSpec::parse("blob:limit=1024").expect("filter")),
+            },
+            &mut f,
+        )
+        .expect("write filtered bundle with a prerequisite");
+    }
+    let bundle = Bundle::open(&bundle_path).expect("open");
+    assert!(bundle.header().filter.is_some());
+    assert_eq!(
+        bundle
+            .header()
+            .prerequisites
+            .iter()
+            .map(|(oid, _)| *oid)
+            .collect::<Vec<_>>(),
+        [base]
+    );
+    let bytes = std::fs::read(&bundle_path).expect("read");
+    let pack = &bytes[bundle.pack_byte_offset() as usize..];
+    let scratch = tempfile::tempdir().expect("scratch odb");
+    let odb = grit_lib::objects::odb::Odb::new(scratch.path());
+    let ingested = install_pack_bytes(pack.to_vec(), &odb, &IngestPackOptions::default())
+        .expect("index bundle pack");
+    let ids: std::collections::HashSet<ObjectId> = ingested.object_ids.into_iter().collect();
+    assert!(ids.contains(&tip));
+    assert!(ids.contains(&new_txt), "small new blob is in the pack");
+    assert!(!ids.contains(&big), "large blob is filtered out");
+    assert!(!ids.contains(&base), "prerequisite is not in the pack");
+}
+
+#[test]
+fn grit_write_filtered_bundle_in_partial_clone_skips_promised_blobs() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let src = tmp.path().join("src");
+    std::fs::create_dir(&src).unwrap();
+    git_ok(&src, &["init", "-q", "-b", "main", "."]);
+    git_ok(&src, &["config", "uploadpack.allowFilter", "true"]);
+    std::fs::write(src.join("small.txt"), b"small\n").unwrap();
+    std::fs::write(src.join("big.bin"), vec![b'b'; 4096]).unwrap();
+    git_ok(&src, &["add", "small.txt", "big.bin"]);
+    git_ok(&src, &["commit", "-q", "-m", "both"]);
+    let tip = rev_parse(&src, "HEAD");
+    let big = rev_parse(&src, "HEAD:big.bin");
+    let small = rev_parse(&src, "HEAD:small.txt");
+
+    // A partial clone without the large blob, whose promisor is gone, so
+    // nothing can fetch it back.
+    let partial = tmp.path().join("partial.git");
+    let url = format!("file://{}", src.display());
+    git_ok(
+        tmp.path(),
+        &[
+            "clone",
+            "-q",
+            "--bare",
+            "--filter=blob:limit=1024",
+            &url,
+            partial.to_str().expect("utf-8 path"),
+        ],
+    );
+    std::fs::remove_dir_all(&src).unwrap();
+    let repo = grit_repo(&partial);
+    assert!(
+        !repo.odb().exists(&big),
+        "the clone left the large blob out"
+    );
+
+    let bundle_path = tmp.path().join("partial.bundle");
+    {
+        let mut f = std::fs::File::create(&bundle_path).expect("create");
+        write_bundle(
+            &repo,
+            &BundleSpec {
+                include: vec![(tip, "refs/heads/main".to_owned())],
+                filter: Some(FilterSpec::parse("blob:limit=1024").expect("filter")),
+                ..Default::default()
+            },
+            &mut f,
+        )
+        .expect("a filtered bundle needs no promised blob");
+    }
+    let bundle = Bundle::open(&bundle_path).expect("open");
+    let bytes = std::fs::read(&bundle_path).expect("read");
+    let pack = &bytes[bundle.pack_byte_offset() as usize..];
+    let scratch = tempfile::tempdir().expect("scratch odb");
+    let odb = grit_lib::objects::odb::Odb::new(scratch.path());
+    let ingested = install_pack_bytes(pack.to_vec(), &odb, &IngestPackOptions::default())
+        .expect("index bundle pack");
+    let ids: std::collections::HashSet<ObjectId> = ingested.object_ids.into_iter().collect();
+    assert!(ids.contains(&tip));
+    assert!(ids.contains(&small));
+    assert!(!ids.contains(&big));
 }
 
 #[test]

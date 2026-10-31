@@ -9,12 +9,16 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 #[path = "merge_tree_cache.rs"]
 mod merge_tree_cache;
-pub(crate) use merge_tree_cache::MergeTreeCache;
+pub(crate) use merge_tree_cache::{lookup_index_entry_at_path_cached, MergeTreeCache};
+#[path = "merge_dir_renames.rs"]
+mod merge_dir_renames;
 #[path = "merge_trees_walk.rs"]
 mod merge_trees_walk;
 
+use crate::config::ConfigSet;
 use crate::crlf::{DiffAttr, FileAttrs, MergeAttr, TextAttr};
 use crate::diff::{detect_renames, diff_trees, DiffStatus};
+use crate::error::ConfigError;
 use crate::index::{
     entry_from_stat, worktree_path_from_index_rel, Index, IndexEntry, MODE_REGULAR,
 };
@@ -25,6 +29,8 @@ use crate::odb::Odb;
 use crate::repo::Repository;
 use crate::worktree_rules::WorktreeRules;
 use crate::write_tree::write_tree_from_index;
+
+type RenameTriple = (Vec<u8>, Vec<u8>, u32);
 
 /// Result of merging three trees with optional conflict-marker blobs for checkout.
 #[derive(Debug)]
@@ -43,6 +49,143 @@ pub struct TreeMergeOutput {
     /// stage 2 under [`RenameRenameConflict::ours_path`] and stage 3 under
     /// [`RenameRenameConflict::theirs_path`], with the merged content at both destinations.
     pub rename_conflicts: Vec<RenameRenameConflict>,
+    /// Directory renames that need the user's attention, sorted by [`DirectoryRenameConflict::path`].
+    ///
+    /// [`DirectoryRenameConflict::Moved`] paths also have unmerged index rows; split and
+    /// blocked directory renames have none, yet still make the merge conflicted.
+    pub directory_rename_conflicts: Vec<DirectoryRenameConflict>,
+}
+
+/// How a three-way merge treats files one side adds inside a directory the other side renamed.
+///
+/// A directory counts as renamed when one side moved all of its files out of it and most of
+/// them (the destination with the most files, without a tie) into one other directory. Files the
+/// other side added to the old directory, or renamed into it, then most likely belong in the new
+/// one. Read from the `merge.directoryRenames` config with [`Self::from_config`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum DirectoryRenameMode {
+    /// Leave such files where the adding side put them (`merge.directoryRenames=false`).
+    Off,
+    /// Move them into the renamed directory as a clean merge (`true`).
+    Apply,
+    /// Move them, but leave each one unmerged at the adding side's stage so the user confirms
+    /// the new location (`conflict`; Git's default).
+    #[default]
+    Conflict,
+}
+
+impl DirectoryRenameMode {
+    /// Config key holding the mode.
+    pub const CONFIG_KEY: &'static str = "merge.directoryRenames";
+
+    /// Parse a `merge.directoryRenames` value: `conflict` or a Git boolean (`true` applies the
+    /// renames, `false` turns them off).
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::InvalidDirectoryRenames`] for any other value.
+    pub fn from_config_value(value: &str) -> std::result::Result<Self, ConfigError> {
+        if value.eq_ignore_ascii_case("conflict") {
+            return Ok(Self::Conflict);
+        }
+        match crate::config::parse_bool(value) {
+            Ok(true) => Ok(Self::Apply),
+            Ok(false) => Ok(Self::Off),
+            Err(_) => Err(ConfigError::InvalidDirectoryRenames {
+                value: value.to_owned(),
+            }),
+        }
+    }
+
+    /// The mode set by [`Self::CONFIG_KEY`] in `config`, or [`Self::Conflict`] when unset.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::InvalidDirectoryRenames`] when the value is not recognised.
+    pub fn from_config(config: &ConfigSet) -> std::result::Result<Self, ConfigError> {
+        config
+            .get(Self::CONFIG_KEY)
+            .map_or(Ok(Self::default()), |value| Self::from_config_value(&value))
+    }
+
+    /// [`Self::from_config`] for the configuration of `repo`.
+    ///
+    /// # Errors
+    ///
+    /// Config load failures, and [`ConfigError::InvalidDirectoryRenames`].
+    pub fn from_repo(repo: &Repository) -> crate::error::Result<Self> {
+        let config = repo.config()?;
+        Ok(Self::from_config(&config)?)
+    }
+}
+
+/// One side of a three-way merge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MergeSide {
+    /// The side merged into (index stage 2).
+    Ours,
+    /// The side merged in (index stage 3).
+    Theirs,
+}
+
+impl MergeSide {
+    /// Index stage holding this side's version of an unmerged path (2 or 3).
+    #[must_use]
+    pub fn index_stage(self) -> u8 {
+        match self {
+            Self::Ours => 2,
+            Self::Theirs => 3,
+        }
+    }
+}
+
+/// A directory rename that a merge could not settle on its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DirectoryRenameConflict {
+    /// A file was moved into the renamed directory and left unmerged
+    /// ([`DirectoryRenameMode::Conflict`]) so the user can confirm its new location.
+    Moved {
+        /// Path the adding side gave the file, inside the old directory.
+        from: Vec<u8>,
+        /// Path in the renamed directory, where the merge put it.
+        to: Vec<u8>,
+        /// Side that added the file (or renamed it into the old directory).
+        added_by: MergeSide,
+    },
+    /// A side spread a directory's files over several directories with no single most popular
+    /// destination, so nothing added to it on the other side was moved.
+    Split {
+        /// The directory in the merge base.
+        dir: Vec<u8>,
+        /// Side that emptied the directory.
+        renamed_by: MergeSide,
+    },
+    /// New files were not moved into a renamed directory because their destination is taken on
+    /// the side that added them, or claimed by several of them. (A file the base or the renaming
+    /// side has there does not block the move; the moved file is merged with it.)
+    Blocked {
+        /// Destination the directory rename gives the files.
+        path: Vec<u8>,
+        /// The new files that would have moved there, sorted; they stay where they were added.
+        sources: Vec<Vec<u8>>,
+        /// `true` when the adding side already has a file or directory at
+        /// [`Self::Blocked::path`] (or the renaming side has a directory there); `false`
+        /// when several new files would land on it.
+        existing: bool,
+    },
+}
+
+impl DirectoryRenameConflict {
+    /// The path the conflict is reported at: the new location for [`Self::Moved`], the old
+    /// directory for [`Self::Split`] and the blocked destination for [`Self::Blocked`].
+    #[must_use]
+    pub fn path(&self) -> &[u8] {
+        match self {
+            Self::Moved { to, .. } => to,
+            Self::Split { dir, .. } => dir,
+            Self::Blocked { path, .. } => path,
+        }
+    }
 }
 
 /// One base path that each side of a merge renamed to a different destination.
@@ -114,6 +257,35 @@ impl Default for TreeMergeConflictPresentation<'_> {
     }
 }
 
+/// Conflict-marker labels for replaying one commit onto a new base (pick and rebase).
+///
+/// The incoming side is named `"<abbrev> (<subject>)"` and the diff3 base
+/// `"parent of <abbrev> (<subject>)"`, the labels Git uses for the same replays, so each
+/// stop of a multi-commit replay names the commit it came from. Ours stays `HEAD`.
+pub(crate) struct ReplayConflictLabels {
+    theirs: String,
+    base: String,
+}
+
+impl ReplayConflictLabels {
+    /// Labels for replaying `commit`, whose message subject line is `subject`.
+    pub(crate) fn new(commit: ObjectId, subject: &str) -> Self {
+        let theirs = format!("{} ({subject})", &commit.to_hex()[..7]);
+        let base = format!("parent of {theirs}");
+        Self { theirs, base }
+    }
+
+    /// Presentation using these labels with marker `style`; other fields keep their defaults.
+    pub(crate) fn presentation(&self, style: ConflictStyle) -> TreeMergeConflictPresentation<'_> {
+        TreeMergeConflictPresentation {
+            label_theirs: TheirsConflictLabel::Fixed(&self.theirs),
+            label_base: &self.base,
+            style,
+            ..TreeMergeConflictPresentation::default()
+        }
+    }
+}
+
 #[expect(clippy::too_many_arguments)]
 /// Merge `base` + `ours` + `their` trees (by OID) into an index using rename detection.
 ///
@@ -134,6 +306,10 @@ impl Default for TreeMergeConflictPresentation<'_> {
 /// - `favor` / `ws` — merge strategy favour and whitespace options for textual merges.
 /// - `diff_algorithm` — optional line diff algorithm name used for textual merges.
 /// - `presentation` — conflict marker labels and style (`label_base` is the diff3 "base" name).
+/// - `directory_renames` — whether files one side added inside a directory the other side
+///   renamed follow the rename ([`DirectoryRenameMode`]; callers usually pass
+///   [`DirectoryRenameMode::from_repo`]). Conflicts are reported in
+///   [`TreeMergeOutput::directory_rename_conflicts`].
 ///
 /// # Errors
 ///
@@ -147,6 +323,7 @@ pub fn merge_trees_three_way(
     ws: WhitespaceMergeOptions,
     diff_algorithm: Option<&str>,
     presentation: TreeMergeConflictPresentation<'_>,
+    directory_renames: DirectoryRenameMode,
 ) -> crate::error::Result<TreeMergeOutput> {
     merge_trees_three_way_cached(
         repo,
@@ -158,6 +335,7 @@ pub fn merge_trees_three_way(
         ws,
         diff_algorithm,
         presentation,
+        directory_renames,
     )
 }
 
@@ -173,10 +351,196 @@ pub(crate) fn merge_trees_three_way_cached(
     ws: WhitespaceMergeOptions,
     diff_algorithm: Option<&str>,
     presentation: TreeMergeConflictPresentation<'_>,
+    directory_renames: DirectoryRenameMode,
 ) -> crate::error::Result<TreeMergeOutput> {
+    merge_trees_at_depth(
+        repo,
+        cache,
+        base_tree,
+        ours_tree,
+        theirs_tree,
+        favor,
+        ws,
+        diff_algorithm,
+        presentation,
+        directory_renames,
+        0,
+        None,
+    )
+}
+
+/// Precomputed fork→onto file renames for [`merge_trees_replay_transplant`].
+pub(crate) struct ReplayUpstreamRenames<'a> {
+    pub cached_ours_old_to_new: &'a HashMap<Vec<u8>, Vec<u8>>,
+    pub fork_onto_rename_triples: &'a [(Vec<u8>, Vec<u8>, u32)],
+    pub upstream_touched: &'a HashSet<Vec<u8>>,
+    pub commit_theirs_diff: Vec<crate::diff::DiffEntry>,
+}
+
+/// Three-way merge for replay transplant when upstream fork→onto renames are precomputed.
+///
+/// Skips diffing `base_tree`→`ours_tree` (the expensive upstream delta) and reuses
+/// `cached_ours_old_to_new` for rename alignment. `commit_theirs_diff` must be `base_tree`→`theirs_tree`.
+#[expect(clippy::too_many_arguments)]
+pub(crate) fn merge_trees_replay_transplant(
+    repo: &Repository,
+    cache: &mut MergeTreeCache,
+    base_tree: ObjectId,
+    ours_tree: ObjectId,
+    theirs_tree: ObjectId,
+    commit_theirs_diff: Vec<crate::diff::DiffEntry>,
+    cached_ours_old_to_new: &HashMap<Vec<u8>, Vec<u8>>,
+    fork_onto_rename_triples: &[(Vec<u8>, Vec<u8>, u32)],
+    upstream_touched: &HashSet<Vec<u8>>,
+    favor: MergeFavor,
+    ws: WhitespaceMergeOptions,
+    diff_algorithm: Option<&str>,
+    presentation: TreeMergeConflictPresentation<'_>,
+    directory_renames: DirectoryRenameMode,
+) -> crate::error::Result<TreeMergeOutput> {
+    merge_trees_at_depth(
+        repo,
+        cache,
+        base_tree,
+        ours_tree,
+        theirs_tree,
+        favor,
+        ws,
+        diff_algorithm,
+        presentation,
+        directory_renames,
+        0,
+        Some(ReplayUpstreamRenames {
+            cached_ours_old_to_new,
+            fork_onto_rename_triples,
+            upstream_touched,
+            commit_theirs_diff,
+        }),
+    )
+}
+
+fn paths_overlap_for_merge(a: &[u8], b: &[u8]) -> bool {
+    a.starts_with(b) && (a.len() == b.len() || a.get(b.len()) == Some(&b'/'))
+        || b.starts_with(a) && (b.len() == a.len() || b.get(a.len()) == Some(&b'/'))
+}
+
+fn map_path_dir_prefix(path: &[u8], dir_map: &HashMap<Vec<u8>, Vec<u8>>) -> Option<Vec<u8>> {
+    let mut best: Option<(usize, &Vec<u8>, &Vec<u8>)> = None;
+    for (old_dir, new_dir) in dir_map {
+        if path.starts_with(old_dir)
+            && (path.len() == old_dir.len() || path.get(old_dir.len()) == Some(&b'/'))
+        {
+            let len = old_dir.len();
+            if best.is_none_or(|(bl, _, _)| len > bl) {
+                best = Some((len, old_dir, new_dir));
+            }
+        }
+    }
+    best.map(|(len, _old_dir, new_dir)| {
+        let mut out = new_dir.clone();
+        if path.len() > len {
+            if !out.is_empty() {
+                out.push(b'/');
+            }
+            out.extend_from_slice(&path[len + 1..]);
+        }
+        out
+    })
+}
+
+/// Three-way tree merge at recursion level `call_depth` of a multi-base merge.
+///
+/// Level 0 is the merge the caller asked for. Higher levels merge merge bases into a
+/// virtual base, and their result tree (not their conflict state) is what matters: every
+/// conflict is settled to a single stage-0 entry, as Git's recursive merge does. Content
+/// conflicts keep their markers (each level two characters wider, so nested markers stay
+/// distinct), while modify/delete, binary, symlink, submodule and type-change conflicts keep
+/// the base version. `favor` should be [`MergeFavor::None`] for levels above 0, where
+/// directory renames are never applied.
+#[expect(clippy::too_many_arguments)]
+pub(crate) fn merge_trees_at_depth(
+    repo: &Repository,
+    cache: &mut MergeTreeCache,
+    base_tree: ObjectId,
+    ours_tree: ObjectId,
+    theirs_tree: ObjectId,
+    favor: MergeFavor,
+    ws: WhitespaceMergeOptions,
+    diff_algorithm: Option<&str>,
+    presentation: TreeMergeConflictPresentation<'_>,
+    directory_renames: DirectoryRenameMode,
+    call_depth: usize,
+    replay_upstream: Option<ReplayUpstreamRenames<'_>>,
+) -> crate::error::Result<TreeMergeOutput> {
+    use crate::porcelain::cherry_pick::directory_renames_from_file_renames;
+
+    let directory_renames = if call_depth > 0 {
+        DirectoryRenameMode::Off
+    } else {
+        directory_renames
+    };
     let odb = &repo.odb();
-    let mut touched =
-        merge_trees_walk::collect_touched_merge_paths(odb, &base_tree, &ours_tree, &theirs_tree)?;
+
+    let (mut touched, mut ours_old_to_new_pairs, mut theirs_pairs) = if let Some(replay) =
+        replay_upstream
+    {
+        let dir_map = directory_renames_from_file_renames(
+            &replay
+                .cached_ours_old_to_new
+                .iter()
+                .map(|(o, n)| (o.clone(), n.clone()))
+                .collect::<Vec<_>>(),
+        );
+        let mut touched = paths_from_diff_entries(&replay.commit_theirs_diff);
+        for path in touched.clone() {
+            if let Some(new) = replay.cached_ours_old_to_new.get(&path) {
+                touched.insert(new.clone());
+            }
+            if let Some(mapped) = map_path_dir_prefix(&path, &dir_map) {
+                touched.insert(mapped);
+            }
+        }
+        let commit_touched = touched.clone();
+        if commit_touched.iter().any(|p| {
+            replay.upstream_touched.contains(p) && !replay.cached_ours_old_to_new.contains_key(p)
+        }) {
+            touched.extend(replay.cached_ours_old_to_new.keys().cloned());
+            touched.extend(replay.cached_ours_old_to_new.values().cloned());
+            touched.extend(replay.upstream_touched.iter().cloned());
+        } else {
+            for path in replay.upstream_touched.iter() {
+                if touched.iter().any(|t| paths_overlap_for_merge(t, path)) {
+                    touched.insert(path.clone());
+                }
+            }
+        }
+        for (old, new) in replay.cached_ours_old_to_new {
+            if old != new
+                && (touched.contains(old)
+                    || touched.contains(new)
+                    || touched.iter().any(|t| paths_overlap_for_merge(t, old)))
+            {
+                touched.insert(old.clone());
+                touched.insert(new.clone());
+            }
+        }
+        let ours_old_to_new_pairs: Vec<RenameTriple> = replay
+            .fork_onto_rename_triples
+            .iter()
+            .filter(|(old, new, _)| old != new && (touched.contains(old) || touched.contains(new)))
+            .cloned()
+            .collect();
+        let theirs_pairs = rename_pairs_from_diff_entries(odb, replay.commit_theirs_diff)?;
+        (touched, ours_old_to_new_pairs, theirs_pairs)
+    } else {
+        let ours_diff = diff_trees(odb, Some(&base_tree), Some(&ours_tree), "")?;
+        let theirs_diff = diff_trees(odb, Some(&base_tree), Some(&theirs_tree), "")?;
+        let mut touched = paths_from_diff_entries(&ours_diff);
+        touched.extend(paths_from_diff_entries(&theirs_diff));
+        let ours_old_to_new_pairs = rename_pairs_from_diff_entries(odb, ours_diff)?;
+        let theirs_pairs = rename_pairs_from_diff_entries(odb, theirs_diff)?;
+        (touched, ours_old_to_new_pairs, theirs_pairs)
+    };
 
     let (mut base, mut ours, mut theirs) = merge_trees_walk::build_sparse_maps(
         cache,
@@ -187,9 +551,7 @@ pub(crate) fn merge_trees_three_way_cached(
         &touched,
     )?;
 
-    let mut ours_old_to_new_pairs = rename_pairs_base_to_other(odb, &base_tree, &ours_tree)?;
     augment_renames_with_same_blob(&base, &ours, &mut ours_old_to_new_pairs);
-    let mut theirs_pairs = rename_pairs_base_to_other(odb, &base_tree, &theirs_tree)?;
     augment_renames_with_same_blob(&base, &theirs, &mut theirs_pairs);
 
     let mut df_escapes = DfEscapes::default();
@@ -253,6 +615,38 @@ pub(crate) fn merge_trees_three_way_cached(
     }
     let rename_conflicts =
         rename_rename_conflicts(&ours_new_to_old, &theirs_old_to_new, &base, &ours, &theirs);
+    let directory_rename_plan = if directory_renames == DirectoryRenameMode::Off {
+        None
+    } else {
+        let ours_changes = merge_dir_renames::SideChanges {
+            tree: ours_tree,
+            files: &ours,
+            renames: ours_new_to_old
+                .iter()
+                .filter(|(new, old)| new != old)
+                .map(|(new, old)| (old.as_slice(), new.as_slice()))
+                .collect(),
+            new_paths: paths_missing_from(&ours, &base),
+        };
+        let theirs_changes = merge_dir_renames::SideChanges {
+            tree: theirs_tree,
+            files: &theirs,
+            renames: theirs_old_to_new
+                .iter()
+                .filter(|(old, new)| old != new)
+                .map(|(old, new)| (old.as_slice(), new.as_slice()))
+                .collect(),
+            new_paths: paths_missing_from(&theirs, &base),
+        };
+        Some(merge_dir_renames::plan_directory_renames(
+            cache,
+            odb,
+            base_tree,
+            &base,
+            &ours_changes,
+            &theirs_changes,
+        )?)
+    };
 
     drop(ours_old_to_new_pairs);
     let mut output = merge_trees_walk::three_way_on_touched_paths(
@@ -272,6 +666,7 @@ pub(crate) fn merge_trees_three_way_cached(
         ws,
         diff_algorithm,
         presentation,
+        call_depth,
     )?;
     for orig in &df_escapes.relocated_from {
         output.index.remove_path_all_stages(orig);
@@ -300,6 +695,21 @@ pub(crate) fn merge_trees_three_way_cached(
         }
     }
     drop((ours_new_to_old, theirs_old_to_new));
+    if let Some(plan) = directory_rename_plan {
+        merge_dir_renames::apply_directory_rename_plan(
+            &mut output,
+            plan,
+            directory_renames,
+            &mut renamed_away,
+            &merge_dir_renames::DestinationMerge {
+                ctx: &PathMergeContext::new(repo, call_depth),
+                favor,
+                ws,
+                diff_algorithm,
+                presentation,
+            },
+        )?;
+    }
     output.result_tree = merge_trees_walk::finish_merge_result_tree(
         cache,
         odb,
@@ -310,6 +720,17 @@ pub(crate) fn merge_trees_three_way_cached(
         &renamed_away,
     )?;
     Ok(output)
+}
+
+/// Paths of `side` that `base` has no file at.
+fn paths_missing_from<'a>(
+    side: &'a BTreeMap<Vec<u8>, IndexEntry>,
+    base: &BTreeMap<Vec<u8>, IndexEntry>,
+) -> Vec<&'a [u8]> {
+    side.keys()
+        .filter(|path| !base.contains_key(*path))
+        .map(Vec::as_slice)
+        .collect()
 }
 
 fn augment_renames_with_same_blob(
@@ -456,6 +877,9 @@ fn renamed_file_content(
         || binary(ours_path, &ours_obj.data)
         || binary(theirs_path, &theirs_obj.data)
     {
+        if ctx.virtual_base() {
+            return Ok(Some(base.clone()));
+        }
         return Ok(match favor {
             MergeFavor::Ours => Some(ours.clone()),
             MergeFavor::Theirs => Some(theirs.clone()),
@@ -487,7 +911,7 @@ fn renamed_file_content(
         label_theirs: &label_theirs,
         favor,
         style: presentation.style,
-        marker_size: 8,
+        marker_size: 8 + 2 * ctx.call_depth,
         diff_algorithm: diff_algorithm.map(str::to_owned),
         ignore_all_space: ws.ignore_all_space,
         ignore_space_change: ws.ignore_space_change,
@@ -706,13 +1130,28 @@ fn parent_has_file(side: &BTreeMap<Vec<u8>, IndexEntry>, path: &[u8]) -> bool {
 
 type RenamePathPair = (Vec<u8>, Vec<u8>, u32);
 
-fn rename_pairs_base_to_other(
+fn paths_from_diff_entries(entries: &[crate::diff::DiffEntry]) -> HashSet<Vec<u8>> {
+    use crate::diff::DiffStatus;
+    let mut out = HashSet::new();
+    for e in entries {
+        if e.status == DiffStatus::Unmerged {
+            continue;
+        }
+        if let Some(p) = &e.old_path {
+            out.insert(crate::repo_relpath::storage_bytes(p).into_owned());
+        }
+        if let Some(p) = &e.new_path {
+            out.insert(crate::repo_relpath::storage_bytes(p).into_owned());
+        }
+    }
+    out
+}
+
+fn rename_pairs_from_diff_entries(
     odb: &Odb,
-    base_tree: &ObjectId,
-    other_tree: &ObjectId,
+    entries: Vec<crate::diff::DiffEntry>,
 ) -> crate::error::Result<Vec<RenamePathPair>> {
-    let mut entries = diff_trees(odb, Some(base_tree), Some(other_tree), "")?;
-    entries = detect_renames(odb, None, entries, 50);
+    let entries = detect_renames(odb, None, entries, 50);
     let mut out = Vec::new();
     for e in entries {
         if e.status != DiffStatus::Renamed {
@@ -733,6 +1172,7 @@ fn rename_pairs_base_to_other(
     }
     Ok(out)
 }
+
 #[expect(clippy::too_many_arguments)]
 pub(crate) fn merge_one_path(
     ctx: &PathMergeContext<'_>,
@@ -771,7 +1211,9 @@ pub(crate) fn merge_one_path(
                 && oe.mode == te.mode
                 && matches!(be.mode, 0o120000 | 0o160000) =>
         {
-            if same_blob(oe, te) {
+            if ctx.virtual_base() {
+                push_stage0(index, out_path, be);
+            } else if same_blob(oe, te) {
                 let mut e = oe.clone();
                 e.path = out_path.to_vec();
                 e.flags = path_len_flags(out_path);
@@ -847,6 +1289,9 @@ pub(crate) fn merge_one_path(
         (Some(_), None, None) => {}
         (Some(be), Some(oe), None) if same_blob(be, oe) && be.path.as_slice() == out_path => {}
         (Some(be), None, Some(te)) if same_blob(be, te) => {}
+        (Some(be), Some(_), None) | (Some(be), None, Some(_)) if ctx.virtual_base() => {
+            push_stage0(index, out_path, be);
+        }
         (Some(be), Some(oe), None) => {
             stage_entry(index, out_path, be, 1);
             stage_entry(index, out_path, oe, 2);
@@ -868,6 +1313,32 @@ fn path_len_flags(path: &[u8]) -> u16 {
     path.len().min(0xFFF) as u16
 }
 
+/// Record `src` as the merged (stage-0) entry at `path`.
+fn push_stage0(index: &mut Index, path: &[u8], src: &IndexEntry) {
+    let mut e = src.clone();
+    e.path = path.to_vec();
+    e.flags = path_len_flags(path);
+    index.push_entry_unsorted(e);
+}
+
+/// Record merged `content` at `path` as a stage-0 entry with `mode`.
+fn push_merged_blob(
+    repo: &Repository,
+    index: &mut Index,
+    path: &[u8],
+    template: &IndexEntry,
+    mode: u32,
+    content: &[u8],
+) -> crate::error::Result<()> {
+    let mut e = template.clone();
+    e.path = path.to_vec();
+    e.flags = path_len_flags(path);
+    e.oid = repo.odb().write(ObjectKind::Blob, content)?;
+    e.mode = mode;
+    index.push_entry_unsorted(e);
+    Ok(())
+}
+
 fn same_blob(a: &IndexEntry, b: &IndexEntry) -> bool {
     a.oid == b.oid && a.mode == b.mode
 }
@@ -879,13 +1350,36 @@ fn same_blob(a: &IndexEntry, b: &IndexEntry) -> bool {
 pub(crate) struct PathMergeContext<'r> {
     repo: &'r Repository,
     rules: OnceCell<Option<WorktreeRules>>,
+    /// Recursion level of a multi-base merge (see [`merge_trees_at_depth`]); 0 for the real merge.
+    call_depth: usize,
 }
 
 impl<'r> PathMergeContext<'r> {
-    pub(crate) fn new(repo: &'r Repository) -> Self {
+    pub(crate) fn new(repo: &'r Repository, call_depth: usize) -> Self {
         Self {
             repo,
             rules: OnceCell::new(),
+            call_depth,
+        }
+    }
+
+    /// True while building a virtual merge base, where every conflict settles to one entry.
+    fn virtual_base(&self) -> bool {
+        self.call_depth > 0
+    }
+
+    /// Conflict marker width for `attrs`, widened by two per recursion level.
+    fn marker_size(&self, attrs: &FileAttrs) -> usize {
+        attrs.effective_conflict_marker_size() + 2 * self.call_depth
+    }
+
+    /// A virtual base keeps a driver's conflicted output as its content.
+    fn settle_driver_outcome(&self, outcome: MergeDriverOutcome) -> MergeDriverOutcome {
+        match outcome {
+            MergeDriverOutcome::ConflictWithMarkers(content) if self.virtual_base() => {
+                MergeDriverOutcome::Clean(content)
+            }
+            other => other,
         }
     }
 
@@ -999,6 +1493,10 @@ fn content_merge_or_conflict(
         || matches!(ours.mode, 0o120000 | 0o160000)
         || matches!(theirs.mode, 0o120000 | 0o160000)
     {
+        if ctx.virtual_base() {
+            push_stage0(index, path, base);
+            return Ok(());
+        }
         stage_entry(index, path, base, 1);
         stage_entry(index, path, ours, 2);
         stage_entry(index, path, theirs, 3);
@@ -1051,7 +1549,7 @@ fn content_merge_or_conflict(
             Some(base),
             ours,
             theirs,
-            outcome,
+            ctx.settle_driver_outcome(outcome),
         );
     }
 
@@ -1060,6 +1558,10 @@ fn content_merge_or_conflict(
         || is_binary(&ours_obj.data)
         || is_binary(&theirs_obj.data)
     {
+        if ctx.virtual_base() {
+            push_stage0(index, path, base);
+            return Ok(());
+        }
         match favor {
             MergeFavor::Theirs => {
                 let mut e = theirs.clone();
@@ -1093,7 +1595,7 @@ fn content_merge_or_conflict(
         label_theirs: &label_theirs,
         favor,
         style: presentation.style,
-        marker_size: file_attrs.effective_conflict_marker_size(),
+        marker_size: ctx.marker_size(&file_attrs),
         diff_algorithm: diff_algorithm.map(str::to_owned),
         ignore_all_space: ws.ignore_all_space,
         ignore_space_change: ws.ignore_space_change,
@@ -1103,7 +1605,7 @@ fn content_merge_or_conflict(
 
     let result = merge(&input)?;
 
-    if result.conflicts > 0 {
+    if result.conflicts > 0 && !ctx.virtual_base() {
         let conflict_oid = repo.odb().write(ObjectKind::Blob, &result.content)?;
         conflict_content.insert(path.to_vec(), conflict_oid);
         stage_entry(index, path, base, 1);
@@ -1144,8 +1646,12 @@ fn add_add_content_conflict(
     diff_algorithm: Option<&str>,
     presentation: TreeMergeConflictPresentation<'_>,
 ) -> crate::error::Result<()> {
-    // Gitlink add/add: no textual merge is possible; leave unmerged stages.
+    // Gitlink add/add: no textual merge is possible; leave unmerged stages. A virtual base keeps
+    // the (absent) base version, so the path is left out.
     if matches!(ours.mode, 0o120000 | 0o160000) || matches!(theirs.mode, 0o120000 | 0o160000) {
+        if ctx.virtual_base() {
+            return Ok(());
+        }
         stage_entry(index, path, ours, 2);
         stage_entry(index, path, theirs, 3);
         return Ok(());
@@ -1183,7 +1689,8 @@ fn add_add_content_conflict(
         ws.ignore_cr_at_eol,
         driver_labels,
     )? {
-        if add_add_executable_mode_conflict(ours, theirs, favor) {
+        let outcome = ctx.settle_driver_outcome(outcome);
+        if !ctx.virtual_base() && add_add_executable_mode_conflict(ours, theirs, favor) {
             let worktree_bytes = match &outcome {
                 MergeDriverOutcome::Clean(c) | MergeDriverOutcome::ConflictWithMarkers(c) => {
                     c.as_slice()
@@ -1208,11 +1715,15 @@ fn add_add_content_conflict(
         );
     }
 
-    // Binary add/add: honour an explicit favour, else leave unmerged stages.
+    // Binary add/add: honour an explicit favour, else leave unmerged stages. A virtual base
+    // takes the empty base content.
     if attrs_force_binary(attrs.as_ref())
         || is_binary(&ours_obj.data)
         || is_binary(&theirs_obj.data)
     {
+        if ctx.virtual_base() {
+            return push_merged_blob(repo, index, path, ours, ours.mode, b"");
+        }
         match favor {
             MergeFavor::Theirs => {
                 let mut e = theirs.clone();
@@ -1243,7 +1754,7 @@ fn add_add_content_conflict(
         label_theirs: &label_theirs,
         favor,
         style: presentation.style,
-        marker_size: file_attrs.effective_conflict_marker_size(),
+        marker_size: ctx.marker_size(&file_attrs),
         diff_algorithm: diff_algorithm.map(str::to_owned),
         ignore_all_space: ws.ignore_all_space,
         ignore_space_change: ws.ignore_space_change,
@@ -1252,6 +1763,9 @@ fn add_add_content_conflict(
     };
 
     let result = merge(&input)?;
+    if ctx.virtual_base() {
+        return push_merged_blob(repo, index, path, ours, ours.mode, &result.content);
+    }
 
     // Git treats an add/add as a conflict whenever the two sides cannot be reconciled to a single
     // stage-0 entry. With no merge base there is nothing to disambiguate a mode clash, so when both
@@ -1283,15 +1797,13 @@ fn add_add_content_conflict(
 }
 
 /// Merge sparse [`TreeMergeOutput::index`] entries into `index` at [`TreeMergeOutput::touched_paths`].
+///
+/// Removes all stages at each touched path, then merges `merged.index` in one sorted pass via
+/// [`Index::remove_paths_and_insert`] (same semantics as the former remove/push/sort/dedup cycle).
 pub fn apply_tree_merge_output_to_index(index: &mut Index, merged: &TreeMergeOutput) {
-    for path in &merged.touched_paths {
-        index.remove_path_all_stages(path);
-    }
-    for entry in merged.index.entries() {
-        index.push_entry_unsorted(entry.clone());
-    }
-    index.sort();
-    index.dedup_paths_keep_last();
+    let paths: Vec<&[u8]> = merged.touched_paths.iter().map(Vec::as_slice).collect();
+    let replacements: Vec<IndexEntry> = merged.index.entries().to_vec();
+    index.remove_paths_and_insert(paths, replacements);
 }
 
 /// Refresh stage-0 stat cache for sparse merge index rows after a worktree checkout.
@@ -1311,6 +1823,7 @@ pub fn refresh_tree_merge_index_stat_cache(
     let Some(work_tree) = repo.work_tree() else {
         return Ok(());
     };
+    let mut refreshed_rows = Vec::new();
     for entry in merged.index.entries() {
         if entry.stage() != 0 {
             continue;
@@ -1331,14 +1844,17 @@ pub fn refresh_tree_merge_index_stat_cache(
         if !abs.is_file() {
             continue;
         }
-        let refreshed = entry_from_stat(&abs, &entry.path, entry.oid, entry.mode)?;
-        index.add_or_replace(refreshed);
+        refreshed_rows.push(entry_from_stat(&abs, &entry.path, entry.oid, entry.mode)?);
     }
-    index.sort();
+    index.overwrite_stage0_entries(refreshed_rows);
     Ok(())
 }
 
 /// Apply sparse merge index rows and sync stat cache from the work tree when present.
+///
+/// Skips paths whose stage-0 row already matches the merge result (including when only
+/// in-memory extended flags such as fsmonitor-valid differ). Applies the remainder in one
+/// index pass, then patches stat fields in place for any rows that still need refresh.
 ///
 /// # Errors
 ///
@@ -1396,7 +1912,11 @@ fn pending_tree_merge_index_rows(index: &Index, merged: &TreeMergeOutput) -> Tre
                     && existing.oid == row.oid
                     && existing.mode == row.mode
                     && existing.flags == row.flags
-                    && existing.flags_extended == row.flags_extended
+                    && IndexEntry::extended_flags_equal_ignoring_volatile(
+                        existing.flags_extended,
+                        row.flags_extended,
+                    )
+                    && !existing.intent_to_add()
                     && existing.size > 0
                     && (existing.mtime_sec > 0 || existing.ctime_sec > 0)
             }
@@ -1422,6 +1942,7 @@ fn pending_tree_merge_index_rows(index: &Index, merged: &TreeMergeOutput) -> Tre
             .cloned()
             .collect(),
         rename_conflicts: Vec::new(),
+        directory_rename_conflicts: Vec::new(),
     }
 }
 
@@ -1569,6 +2090,7 @@ mod tests {
                 df_directory_theirs_commit: Some(theirs_commit),
                 ..TreeMergeConflictPresentation::default()
             },
+            DirectoryRenameMode::default(),
         )
         .expect("merge");
         assert!(out.index.get(b"dir/foo", 0).is_some());
@@ -1661,6 +2183,7 @@ mod tests {
                 WhitespaceMergeOptions::default(),
                 None,
                 presentation,
+                DirectoryRenameMode::default(),
             )
             .expect("merge")
         }
@@ -1794,6 +2317,7 @@ mod tests {
             WhitespaceMergeOptions::default(),
             None,
             TreeMergeConflictPresentation::default(),
+            DirectoryRenameMode::default(),
         )
         .expect("merge");
         assert!(out.index.get(b"theirs-only.txt", 0).is_some());
@@ -1854,6 +2378,7 @@ mod tests {
             WhitespaceMergeOptions::default(),
             None,
             TreeMergeConflictPresentation::default(),
+            DirectoryRenameMode::default(),
         )
         .expect("merge");
         assert!(out.index.get(b"f.txt", 0).is_some());
@@ -1958,6 +2483,7 @@ mod tests {
             WhitespaceMergeOptions::default(),
             None,
             TreeMergeConflictPresentation::default(),
+            DirectoryRenameMode::default(),
         )
         .expect("merge");
         assert!(out.index.get(b"sub", 1).is_some());
@@ -2019,6 +2545,7 @@ mod tests {
             WhitespaceMergeOptions::default(),
             None,
             TreeMergeConflictPresentation::default(),
+            DirectoryRenameMode::default(),
         )
         .expect("merge");
         let entry = out.index.get(b"bin.dat", 0).expect("stage 0");
@@ -2080,6 +2607,7 @@ mod tests {
             WhitespaceMergeOptions::default(),
             None,
             TreeMergeConflictPresentation::default(),
+            DirectoryRenameMode::default(),
         )
         .expect("merge");
         let entry = out.index.get(b"bin.dat", 0).expect("stage 0");
@@ -2152,6 +2680,7 @@ mod tests {
             WhitespaceMergeOptions::default(),
             None,
             TreeMergeConflictPresentation::default(),
+            DirectoryRenameMode::default(),
         )
         .expect("merge");
         assert!(
@@ -2220,5 +2749,162 @@ mod tests {
         augment_renames_with_same_blob(&base, &side, &mut pairs);
         assert_eq!(pairs.len(), 1);
         assert_eq!(pairs[0].2, 100);
+    }
+
+    fn sparse_merge_test_entry(path: &str, oid: ObjectId, stage: u8) -> IndexEntry {
+        let mut flags = path.len().min(0xFFF) as u16;
+        if stage > 0 {
+            flags |= (stage as u16) << 12;
+        }
+        IndexEntry {
+            ctime_sec: 10,
+            ctime_nsec: 0,
+            mtime_sec: 10,
+            mtime_nsec: 0,
+            dev: 1,
+            ino: 1,
+            mode: MODE_REGULAR,
+            uid: 0,
+            gid: 0,
+            size: 4,
+            oid,
+            flags,
+            flags_extended: None,
+            path: path.as_bytes().to_vec(),
+            base_index_pos: 0,
+        }
+    }
+
+    #[test]
+    fn apply_tree_merge_output_to_index_sparse_updates_keep_sorted() {
+        let oid = zero_oid();
+        let changed_oid =
+            ObjectId::from_hex("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").expect("oid");
+        let mut index = Index::new();
+        for i in 0..800 {
+            index.push_entry_unsorted(sparse_merge_test_entry(
+                &format!("wide/f{i:04}.txt"),
+                oid,
+                0,
+            ));
+        }
+        index.sort();
+        assert!(index.entries_sorted);
+        let before_len = index.entries().len();
+
+        let del_path = b"wide/f0100.txt".to_vec();
+        let conflict_path = b"wide/f0200.txt".to_vec();
+        let update_path = b"wide/f0300.txt".to_vec();
+        let mut merge_index = Index::new();
+        merge_index.push_entry_unsorted(sparse_merge_test_entry("wide/f0200.txt", oid, 2));
+        merge_index.push_entry_unsorted(sparse_merge_test_entry("wide/f0200.txt", changed_oid, 3));
+        merge_index.push_entry_unsorted(sparse_merge_test_entry("wide/f0300.txt", changed_oid, 0));
+        merge_index.sort();
+        let mut touched = HashSet::new();
+        touched.insert(del_path.clone());
+        touched.insert(conflict_path.clone());
+        touched.insert(update_path.clone());
+        let merged = TreeMergeOutput {
+            index: merge_index,
+            conflict_content: BTreeMap::new(),
+            result_tree: oid,
+            touched_paths: touched,
+            rename_conflicts: Vec::new(),
+            directory_rename_conflicts: Vec::new(),
+        };
+
+        apply_tree_merge_output_to_index(&mut index, &merged);
+
+        assert!(index.entries_sorted);
+        assert!(index.get(&del_path, 0).is_none());
+        assert!(index.get(&conflict_path, 2).is_some());
+        assert!(index.get(&conflict_path, 3).is_some());
+        assert_eq!(index.get(&update_path, 0).map(|e| e.oid), Some(changed_oid));
+        assert_eq!(index.entries().len(), before_len);
+    }
+
+    #[test]
+    fn apply_tree_merge_worktree_index_skips_fsmonitor_only_diff() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        grit_test_support::git(dir.path(), &["init", "-q", "-b", "main"]);
+        std::fs::write(dir.path().join("tracked.txt"), "hello\n").expect("write");
+        grit_test_support::git(dir.path(), &["add", "tracked.txt"]);
+        let repo =
+            Repository::discover(Some(dir.path()), &RepositoryOptions::empty()).expect("repo");
+        let mut index = repo.index_handle().load().expect("index");
+        let row = index.get(b"tracked.txt", 0).expect("row").clone();
+        let oid = row.oid;
+        let mut indexed = row.clone();
+        indexed.set_fsmonitor_valid(true);
+        index.overwrite_stage0_entries(vec![indexed]);
+        let entries_before = index.entries().to_vec();
+
+        let mut merge_index = Index::new();
+        merge_index.push_entry_unsorted(IndexEntry {
+            flags_extended: None,
+            size: 0,
+            ctime_sec: 0,
+            ctime_nsec: 0,
+            mtime_sec: 0,
+            mtime_nsec: 0,
+            dev: 0,
+            ino: 0,
+            ..sparse_merge_test_entry("tracked.txt", oid, 0)
+        });
+        merge_index.sort();
+        let mut touched = HashSet::new();
+        touched.insert(b"tracked.txt".to_vec());
+        let merged = TreeMergeOutput {
+            index: merge_index,
+            conflict_content: BTreeMap::new(),
+            result_tree: oid,
+            touched_paths: touched,
+            rename_conflicts: Vec::new(),
+            directory_rename_conflicts: Vec::new(),
+        };
+
+        apply_tree_merge_output_to_worktree_index(&repo, &mut index, &merged).expect("apply");
+
+        assert_eq!(index.entries(), entries_before.as_slice());
+        assert!(index.get(b"tracked.txt", 0).unwrap().fsmonitor_valid());
+    }
+
+    #[test]
+    fn apply_tree_merge_worktree_index_applies_oid_change() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        grit_test_support::git(dir.path(), &["init", "-q", "-b", "main"]);
+        std::fs::write(dir.path().join("tracked.txt"), "hello\n").expect("write");
+        grit_test_support::git(dir.path(), &["add", "tracked.txt"]);
+        let repo =
+            Repository::discover(Some(dir.path()), &RepositoryOptions::empty()).expect("repo");
+        let mut index = repo.index_handle().load().expect("index");
+        let old_oid = index.get(b"tracked.txt", 0).expect("row").oid;
+        let mut indexed = index.get(b"tracked.txt", 0).expect("row").clone();
+        indexed.set_fsmonitor_valid(true);
+        index.overwrite_stage0_entries(vec![indexed]);
+
+        let new_oid = repo
+            .odb()
+            .write(crate::objects::ObjectKind::Blob, b"other\n")
+            .expect("write");
+        assert_ne!(old_oid, new_oid);
+
+        let mut merge_index = Index::new();
+        merge_index.push_entry_unsorted(sparse_merge_test_entry("tracked.txt", new_oid, 0));
+        merge_index.sort();
+        let mut touched = HashSet::new();
+        touched.insert(b"tracked.txt".to_vec());
+        let merged = TreeMergeOutput {
+            index: merge_index,
+            conflict_content: BTreeMap::new(),
+            result_tree: new_oid,
+            touched_paths: touched,
+            rename_conflicts: Vec::new(),
+            directory_rename_conflicts: Vec::new(),
+        };
+
+        apply_tree_merge_output_to_worktree_index(&repo, &mut index, &merged).expect("apply");
+
+        assert_eq!(index.get(b"tracked.txt", 0).map(|e| e.oid), Some(new_oid));
     }
 }

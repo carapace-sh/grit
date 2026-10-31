@@ -9,6 +9,7 @@ order: 4
 
 ```text
 grit push [<remote>] [<refspec>...]
+grit push <owner>/<project> <refspec>...
 grit push --tags
 grit push [<remote>] --delete <ref>...
 grit push --dry-run
@@ -26,9 +27,13 @@ grit push --remote <name>   # hidden alias for one release
 
 Pushes refs to a remote over SSH, smart HTTP, or the `file://` transport. With no refspecs, grit pushes the current branch using the same remote-selection rules as Git (`branch.<name>.pushRemote`, `remote.pushDefault`, `branch.<name>.remote`, then `origin`) and applies `remote.<name>.push` refspecs when configured.
 
+A remote written as `<owner>/<project>` and followed by at least one refspec is a repository on the default grit host: `grit push me/app main` pushes to `https://grithub.dev/me/app.git`, or to that path under `$GRIT_DEFAULT_HOST` when it is set. A configured remote with the same name takes precedence. After a push like this from a repository with no remotes yet, grit saves the URL as `origin`, so later `grit push` and `grit fetch` go there. A lone `<owner>/<project>` argument is still a refspec, so `grit push topic/x` pushes a branch to the default remote.
+
 Incremental SSH and HTTP pushes stop exploring advertised commit history once the new commit frontier is exhausted. A one-commit push does not need to walk every advertised branch and tag back to its root. Annotated tags targeting blobs or trees may be advertised alongside commit refs without preventing a push.
 
 On the remote, `receive.denyNonFastForwards`, `receive.denyDeletes`, and `receive.denyCurrentBranch` are enforced for every transport, including local-path remotes (not only [`grit receive-pack`](../receive-pack/) over HTTP).
+
+A push to a local path or `file://` URL runs the remote repository's `pre-receive`, `update`, `post-receive` and `post-update` hooks just as [`grit receive-pack`](../receive-pack/) and Git do: the pushed objects wait in a quarantine that `pre-receive` can read, a non-zero `pre-receive` refuses every update (`pre-receive hook declined`) and keeps the objects out of the repository, a non-zero `update` refuses its own ref (`hook declined`), and `post-receive` and `post-update` run after the refs are written. Hook output is reported like any remote's messages. `--dry-run` runs none of these hooks, as with Git.
 
 Explicit refspecs follow Git push rules: any revision on the left (`HEAD`, tags, branches), optional `+` for force, `:dst` to delete, and a bare branch name DWIMs to the matching local ref (then through configured push refspecs when present).
 
@@ -44,7 +49,7 @@ With `--delete`, every positional after the remote names a remote branch or tag 
 
 `--atomic` requires every ref update in the push to succeed or none are applied, including when a remote update hook rejects one ref. Over SSH, `git://`, and smart HTTP, the server must advertise the `atomic` capability. If it does not, grit fails before sending ref updates or objects; it never falls back to a non-atomic push. This capability check also applies to `--dry-run`.
 
-`-o` / `--push-option` sends server-side push options (for example `ci.skip`) on smart HTTP; `file://` remotes reject non-empty push options.
+`-o` / `--push-option` sends server-side push options (for example `ci.skip`), which the remote's `pre-receive` and `post-receive` hooks see as `GIT_PUSH_OPTION_COUNT` and `GIT_PUSH_OPTION_<n>`. The remote must accept them: a server advertises the `push-options` capability, and a local-path or `file://` remote must set `receive.advertisePushOptions`. Otherwise the push fails before anything is sent, `--dry-run` included.
 
 `--follow-tags` pushes annotated tags that point to commits reachable from the refs being pushed (lightweight tags and unreachable annotated tags are skipped). The config key `push.followTags` enables the same behavior by default.
 
@@ -79,7 +84,7 @@ For GitHub over HTTPS, if a push fails because you aren't signed in, `grit` offe
 | `--force-with-lease=<rev>` | Same check against `<rev>` (exactly one ref must be pushed). |
 | `-u`, `--set-upstream` | Set upstream config for pushed branches. |
 | `--atomic` | All ref updates succeed or none are applied; fails before sending updates if the server does not support atomic pushes. |
-| `-o`, `--push-option` | Server-side push option (repeatable; smart HTTP only). |
+| `-o`, `--push-option` | Server-side push option (repeatable; the remote must accept push options). |
 | `--follow-tags` | Push annotated tags reachable from the commits being pushed. |
 | `-q`, `--quiet` | Suppress remote messages and the human summary of a successful push. |
 | `--no-verify` | Skip the `pre-push` hook. |
@@ -107,11 +112,11 @@ $ grit push --tags
   pushed refs → origin refs/tags/v0.1
 
 $ grit push --delete v0.1
-  pushed --delete → origin refs/tags/v0.1
+  deleted v0.1 from origin
 
 $ grit push origin --delete old-topic stale-fix
-  pushed --delete → origin refs/heads/old-topic
-  pushed --delete → origin refs/heads/stale-fix
+  deleted old-topic from origin
+  deleted stale-fix from origin
 ```
 
 A refspec next to `--delete` is refused before anything is sent:
@@ -135,6 +140,13 @@ When the remote moved since your last fetch:
 ```console
 $ grit push --force-with-lease
   rejected origin refs/heads/main: stale remote ref — run `grit fetch` and try again
+```
+
+When another push created the same new branch while yours was in flight (each ref update is compare-and-swapped against what the push saw, so the other push's commit is never overwritten, even with `--force`):
+
+```console
+$ grit push origin HEAD:refs/heads/shared
+  rejected origin refs/heads/shared: created on the remote meanwhile — run `grit fetch` and try again
 ```
 
 When the `pre-push` hook refuses the push (nothing is sent):
@@ -170,7 +182,7 @@ error: authentication failed for https://github.com/ada/project.git: credentials
 hint: sign in to GitHub with `grit auth` and try again; if it still fails, check the URL
 ```
 
-For other HTTPS hosts the hint points at a `credential.helper` or `GIT_ASKPASS` instead of `grit auth`. When no helper has the credentials, an askpass program (`GIT_ASKPASS`, `core.askPass`, `SSH_ASKPASS`) is asked for them, as in Git (see [Credentials](../agents/#credentials-https)). With `--json` these failures are `{"error", "kind", "hint"}` objects with `kind` `no_remote`, `remote_not_found`, `remote_no_url`, `auth_required` or `auth_rejected` (see [Exit codes](../exit-codes/)).
+For other HTTPS hosts the hint points at `grit auth <url> --username <user> --token <token>`, which saves a token with your credential helper, or `GIT_ASKPASS`; when a helper is configured but has nothing for the host, the hint names it. A stored credential the server refuses fails with `auth_rejected` (and the helper drops it, as in Git) rather than claiming none exist. When no helper has the credentials, an askpass program (`GIT_ASKPASS`, `core.askPass`, `SSH_ASKPASS`) is asked for them, as in Git (see [Credentials](../agents/#credentials-https)). With `--json` these failures are `{"error", "kind", "hint"}` objects with `kind` `no_remote`, `remote_not_found`, `remote_no_url`, `auth_required` or `auth_rejected` (see [Exit codes](../exit-codes/)).
 
 ## JSON output
 
@@ -184,9 +196,10 @@ Pass `--json` for stable, scripting-friendly output:
 | `kind` | string | `branch`, `tags`, `delete`, or `refspecs`. |
 | `branch` | string or null | Short branch name when `kind` is `branch`, or the deleted branch’s short name when `kind` is `delete` and exactly one branch is deleted. Omitted for tag and other explicit refspec pushes (`kind`: `refspecs`). |
 | `dry_run` | boolean | `true` when `--dry-run` was used (no refs or objects written). |
-| `results` | array | Per-ref outcomes; each object has `ref`, `status` (`ok`, `up_to_date`, or `rejected`), optional `reason` (`stale` for a failed lease, `remote_ref_missing` when `--delete` targets a ref absent on the remote), `old_oid`, `new_oid`, `src`, and `forced`. |
+| `results` | array | Per-ref outcomes; each object has `ref`, `status` (`ok`, `up_to_date`, or `rejected`), optional `reason` (`stale` for a failed lease or a ref another push moved meanwhile, `already_exists` when another push created the new ref first, `remote_ref_missing` when `--delete` targets a ref absent on the remote), optional `deleted` (`true` when the ref was removed), `old_oid`, `new_oid`, `src`, and `forced`. |
 | `rejected` | boolean | `true` if any ref was rejected (exit status is also `1`). |
 | `upstream_set` | array of strings | Branch short names whose upstream config was written (`-u` only; omitted when empty). |
+| `origin_added` | string | URL saved as `origin` after an `<owner>/<project>` push from a repository with no remotes (omitted otherwise). |
 | `remote_messages` | array of strings | Hook and diagnostic text from the remote (same lines as `remote: …` on stderr in human mode; omitted when empty). |
 
 Example:

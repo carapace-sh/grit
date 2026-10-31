@@ -18,8 +18,9 @@ use std::io;
 use std::path::Path;
 
 use crate::diff::{
-    diff_index_to_tree, diff_index_to_worktree_with_options, diff_trees, zero_oid, DiffEntry,
-    DiffIndexToWorktreeOptions, DiffStatus,
+    build_file_diffs, diff_index_to_tree, diff_index_to_worktree_with_options, diff_trees,
+    sort_entries_by_path, zero_oid, DiffDetail, DiffEntry, DiffIndexToWorktreeOptions, DiffOptions,
+    DiffStat, DiffStatus, FileStat,
 };
 use crate::error::{ApplyError, Error, Result};
 use crate::index::{
@@ -28,15 +29,16 @@ use crate::index::{
 use crate::objects::FileMode;
 use crate::worktree::{map_worktree_io, WorktreePathOperation};
 // `MODE_EXECUTABLE` only drives the Unix executable-bit application below.
-use crate::apply::{apply_patch_to_index, FilePatch, IndexApplyOptions};
+use crate::apply::{apply_patch_to_index, IndexApplyOptions};
 use crate::check_ref_format::validate_branch_short_name;
-use crate::diff::hunk_id::DiffSide;
+use crate::diff::hunk_id::HunkId;
 use crate::ident::Signature;
 #[cfg(unix)]
 use crate::index::MODE_EXECUTABLE;
 use crate::merge_file::MergeFavor;
 use crate::merge_trees::{
-    merge_trees_three_way, TreeMergeConflictPresentation, WhitespaceMergeOptions,
+    merge_trees_three_way, DirectoryRenameMode, TreeMergeConflictPresentation,
+    WhitespaceMergeOptions,
 };
 use crate::objects::{parse_tree, CommitData, ObjectId, ObjectKind};
 use crate::odb::Odb;
@@ -51,8 +53,8 @@ use crate::porcelain::checkout::{checkout_between_trees_locked, CheckoutIndexWri
 use crate::porcelain::clean::{is_nested_git_worktree, path_in_nested_git_worktree};
 use crate::porcelain::commit::write_commit_object;
 use crate::porcelain::hunk_select::{
-    diff_options_for_hunk_select, resolve_selection, reverse_apply_patches_to_worktree,
-    HunkSelection, WorktreeReverseApplyOptions,
+    resolve_unstaged_selection, reverse_apply_patches_to_worktree, HunkSelection,
+    ResolvedSelection, WorktreeReverseApplyOptions,
 };
 use crate::porcelain::index_from_tree::{
     index_from_tree_with_seeded_stats, index_from_tree_with_seeded_worktree_stats,
@@ -198,32 +200,21 @@ impl StashTreeDelta {
     }
 }
 
-/// Look up affected paths through the ODB's bounded parsed-tree cache.
+/// The file at `path` in `tree`; a directory in HEAD is not a file at this path.
 fn stash_tree_entry_at_path(
     repo: &Repository,
-    mut tree: ObjectId,
+    tree: ObjectId,
     path: &[u8],
 ) -> Result<Option<StashTreeEntry>> {
-    let mut components = path.split(|&b| b == b'/').peekable();
-    while let Some(name) = components.next() {
-        let entries = repo.odb().cached_tree_entries(&tree)?;
-        let Some(entry) = entries.iter().find(|e| e.name == name) else {
-            return Ok(None);
-        };
-        if components.peek().is_none() {
-            // A directory in HEAD is not a file at this path.
-            return Ok((entry.mode != MODE_TREE).then(|| StashTreeEntry {
-                path: path.to_owned(),
-                mode: entry.mode,
-                oid: entry.oid,
-            }));
-        }
-        if entry.mode != MODE_TREE {
-            return Ok(None);
-        }
-        tree = entry.oid;
-    }
-    Ok(None)
+    Ok(repo
+        .odb()
+        .tree_entry_at_path(&tree, path)?
+        .filter(|entry| entry.mode != MODE_TREE)
+        .map(|entry| StashTreeEntry {
+            path: path.to_owned(),
+            mode: entry.mode,
+            oid: entry.oid,
+        }))
 }
 
 fn load_stash_index(repo: &Repository) -> Result<Index> {
@@ -332,6 +323,12 @@ pub struct StashPreview {
     pub paths: Vec<String>,
     /// Untracked paths that would be included when `include_untracked` is set.
     pub untracked: Vec<String>,
+    /// For a partial push ([`StashPushOptions::selection`]), the hunk ids that would be stashed,
+    /// per repository-relative path. Empty otherwise.
+    pub stashed_hunks: BTreeMap<String, Vec<HunkId>>,
+    /// For a partial push, the requested line range labels (`start` or `start-end`) that would
+    /// be stashed, per path. Empty otherwise.
+    pub stashed_lines: BTreeMap<String, Vec<String>>,
 }
 
 /// Options for [`RepositoryStash::push`](crate::repo_handles::RepositoryStash::push),
@@ -359,6 +356,20 @@ pub struct StashPushOptions {
 }
 
 impl StashPushOptions {
+    /// Push options with only [`Self::identity`] required; other fields match Git defaults.
+    #[must_use]
+    pub fn new(identity: Signature) -> Self {
+        Self {
+            message: None,
+            include_untracked: false,
+            identity,
+            selection: None,
+            pathspecs: Vec::new(),
+            dry_run: false,
+            mode: StashMode::default(),
+        }
+    }
+
     /// Reject flag combinations Git and grit do not support.
     ///
     /// # Errors
@@ -380,6 +391,11 @@ impl StashPushOptions {
         if self.mode == StashMode::KeepIndex && selection_is_active(self) {
             return Err(Error::StashOptionConflict(
                 "cannot combine --keep-index with --hunks or --lines".into(),
+            ));
+        }
+        if self.include_untracked && selection_is_active(self) {
+            return Err(Error::StashOptionConflict(
+                "cannot combine --include-untracked with --hunks or --lines".into(),
             ));
         }
         Ok(())
@@ -434,6 +450,9 @@ impl StashPushOptions {
 pub struct StashApplyOptions {
     /// Restore the stashed index parent instead of keeping the current index at touched paths.
     pub restore_index: bool,
+    /// When true, an existing untracked file blocks restore only if its on-disk bytes differ
+    /// from the stashed untracked parent (Git still refuses in all cases).
+    pub overwrite_identical_untracked: bool,
 }
 
 /// Options for [`RepositoryStash::diff`](crate::repo_handles::RepositoryStash::diff).
@@ -613,6 +632,7 @@ fn has_stashable_changes(
             sort_paths: true,
             use_untracked_cache: false,
             cache_miss: UntrackedCacheMissAction::RefreshFull,
+            clean_unit_dirs: None,
         },
         &worktree_rules,
         None,
@@ -623,7 +643,7 @@ fn has_stashable_changes(
     found(plain.then_some(unstaged))
 }
 
-fn collect_untracked_paths(repo: &Repository, work_tree: &Path) -> Result<Vec<String>> {
+pub(crate) fn collect_untracked_paths(repo: &Repository, work_tree: &Path) -> Result<Vec<String>> {
     let mut index = repo.load_index()?;
     let worktree_rules = crate::worktree_rules::WorktreeRules::from_repository(repo, &index)?;
     let (untracked, _, _) = collect_untracked_and_ignored_inner(
@@ -637,6 +657,7 @@ fn collect_untracked_paths(repo: &Repository, work_tree: &Path) -> Result<Vec<St
             sort_paths: true,
             use_untracked_cache: false,
             cache_miss: UntrackedCacheMissAction::RefreshFull,
+            clean_unit_dirs: None,
         },
         &worktree_rules,
         None,
@@ -919,7 +940,7 @@ struct BuiltStash {
     i_tree: ObjectId,
     message: String,
     untracked_paths: Vec<String>,
-    partial_patches: Option<Vec<FilePatch>>,
+    partial: Option<ResolvedSelection>,
     push_pathspecs: Vec<String>,
     staged_only_paths: Vec<String>,
     mode: StashMode,
@@ -1062,13 +1083,6 @@ fn tracked_stash_preview_paths(
     for path in staged_change_paths_for_options(repo, &index, head_tree, options)? {
         paths.insert(path);
     }
-    if let Some(ref patches) = resolve_partial_stash_patches(repo, options)? {
-        for patch in patches {
-            if let Some(path) = patch.new_path.as_ref().or(patch.old_path.as_ref()) {
-                paths.insert(path.clone());
-            }
-        }
-    }
     Ok(paths.into_iter().collect())
 }
 
@@ -1091,18 +1105,20 @@ pub(crate) fn preview_stash(
     let head_oid = head_commit_oid(&head)?;
     let head_tree = repo.odb().commit_tree(&head_oid)?;
 
-    if selection_is_active(options) {
-        let patches = resolve_partial_stash_patches(repo, options)?.unwrap_or_default();
-        if patches.is_empty() {
+    if let Some(partial) = resolve_partial_stash(repo, options)? {
+        if partial.patches.is_empty() {
             return Ok(None);
         }
-        let paths: Vec<String> = patches
+        let paths: Vec<String> = partial
+            .patches
             .into_iter()
             .filter_map(|p| p.new_path.or(p.old_path))
             .collect();
         return Ok(Some(StashPreview {
             paths,
             untracked: Vec::new(),
+            stashed_hunks: partial.selected_hunks,
+            stashed_lines: partial.selected_lines,
         }));
     }
 
@@ -1123,7 +1139,12 @@ pub(crate) fn preview_stash(
     if paths.is_empty() && untracked.is_empty() {
         return Ok(None);
     }
-    Ok(Some(StashPreview { paths, untracked }))
+    Ok(Some(StashPreview {
+        paths,
+        untracked,
+        stashed_hunks: BTreeMap::new(),
+        stashed_lines: BTreeMap::new(),
+    }))
 }
 
 fn stash_push_pathspecs_active(options: &StashPushOptions) -> bool {
@@ -1361,6 +1382,7 @@ fn merge_stash_index_trees(
             label_base: "Stash base",
             ..TreeMergeConflictPresentation::default()
         },
+        DirectoryRenameMode::Off,
     )?;
     if output.index.entries.iter().any(|entry| entry.stage() != 0) {
         return Err(Error::StashIndexConflict);
@@ -1368,19 +1390,21 @@ fn merge_stash_index_trees(
     Ok(Some(output.result_tree))
 }
 
-fn resolve_partial_stash_patches(
+fn resolve_partial_stash(
     repo: &Repository,
     options: &StashPushOptions,
-) -> Result<Option<Vec<FilePatch>>> {
+) -> Result<Option<ResolvedSelection>> {
     if !selection_is_active(options) {
         return Ok(None);
     }
     let Some(sel) = options.selection.as_ref() else {
         return Ok(None);
     };
-    let diff_opts = diff_options_for_hunk_select(repo)?;
-    let patches = resolve_selection(repo, DiffSide::Unstaged, sel, &options.pathspecs, diff_opts)?;
-    Ok(Some(patches))
+    Ok(Some(resolve_unstaged_selection(
+        repo,
+        sel,
+        &options.pathspecs,
+    )?))
 }
 
 fn build_stash_commit(
@@ -1401,10 +1425,10 @@ fn build_stash_commit(
         validate_stash_push_pathspecs(repo, work_tree, options)?;
     }
 
-    let partial_patches = resolve_partial_stash_patches(repo, options)?;
+    let partial = resolve_partial_stash(repo, options)?;
     let mut reusable_unstaged = None;
-    if let Some(ref patches) = partial_patches {
-        if patches.is_empty() {
+    if let Some(ref partial) = partial {
+        if partial.patches.is_empty() {
             return Ok(None);
         }
     } else if pathspec_push {
@@ -1474,11 +1498,11 @@ fn build_stash_commit(
         // only files whose stat changed, and the primed cache-tree limits the W tree write to
         // the directories those files invalidate.
         let mut w_index = index_from_tree_with_seeded_stats(repo, &i_tree, &index)?;
-        if let Some(ref patches) = partial_patches {
+        if let Some(ref partial) = partial {
             apply_patch_to_index(
                 repo,
                 &mut w_index,
-                patches,
+                &partial.patches,
                 &IndexApplyOptions {
                     dry_run: false,
                     reverse: false,
@@ -1529,7 +1553,7 @@ fn build_stash_commit(
         i_tree,
         message: w_message.trim_end().to_owned(),
         untracked_paths,
-        partial_patches,
+        partial,
         push_pathspecs: if pathspec_push {
             options.pathspecs.clone()
         } else {
@@ -1598,6 +1622,12 @@ pub struct StashPushResult {
     pub message: String,
     /// Tree recorded on the W commit.
     pub w_tree: ObjectId,
+    /// For a partial push ([`StashPushOptions::selection`]), the hunk ids that were stashed, per
+    /// repository-relative path. Empty otherwise.
+    pub stashed_hunks: BTreeMap<String, Vec<HunkId>>,
+    /// For a partial push, the requested line range labels (`start` or `start-end`) that were
+    /// stashed, per path. Empty otherwise.
+    pub stashed_lines: BTreeMap<String, Vec<String>>,
 }
 
 /// Create a stash entry, store it, and reset the worktree and index to `HEAD`.
@@ -1647,10 +1677,16 @@ pub(crate) fn push_stash(
         &options.identity.header_line(),
     )?;
     reset_after_stash_push(repo, work_tree, &built, &mut lock, scope.sink(), cancel)?;
+    let (stashed_hunks, stashed_lines) = built
+        .partial
+        .map(|partial| (partial.selected_hunks, partial.selected_lines))
+        .unwrap_or_default();
     Ok(Some(StashPushResult {
         oid: built.w_commit,
         message: built.message,
         w_tree: built.w_tree,
+        stashed_hunks,
+        stashed_lines,
     }))
 }
 
@@ -1666,10 +1702,10 @@ fn reset_after_stash_push(
     if !built.untracked_paths.is_empty() {
         remove_stashed_untracked(repo, work_tree, &built.untracked_paths)?;
     }
-    if let Some(ref patches) = built.partial_patches {
+    if let Some(ref partial) = built.partial {
         return reverse_apply_patches_to_worktree(
             repo,
-            patches,
+            &partial.patches,
             &WorktreeReverseApplyOptions { dry_run: false },
             progress,
             cancel,
@@ -1835,7 +1871,33 @@ pub(crate) fn stash_diff(
     if options.include_untracked {
         append_stash_untracked_show_entries(repo, &head_tree, &stash_commit, &mut diffs)?;
     }
+    sort_entries_by_path(&mut diffs);
     Ok(diffs)
+}
+
+pub(crate) fn stash_diff_stat(
+    repo: &Repository,
+    n: usize,
+    options: &StashDiffOptions,
+    diff_options: DiffOptions,
+) -> Result<DiffStat> {
+    let entries = stash_diff(repo, n, options)?;
+    let config = repo.config()?;
+    let whitespace = diff_options.whitespace;
+    let output = build_file_diffs(
+        repo.odb(),
+        entries,
+        DiffDetail::Stat,
+        diff_options,
+        &config,
+        &repo.thread_policy(),
+    )?;
+    Ok(output
+        .files
+        .iter()
+        .filter(|file| !file.changes_all_ignored(whitespace))
+        .map(FileStat::from)
+        .collect())
 }
 
 fn append_stash_untracked_show_entries(
@@ -1939,6 +2001,7 @@ pub(crate) fn stash_branch(repo: &Repository, name: &str, n: usize) -> Result<St
         n,
         &StashApplyOptions {
             restore_index: true,
+            ..Default::default()
         },
         &mut NullProgress,
         &NeverCancel,
@@ -2063,25 +2126,6 @@ fn materialize_flat_entry_in_worktree(
     Ok(())
 }
 
-/// Paths whose worktree content the stash would change vs. its HEAD-at-stash base.
-///
-/// Paths use [`crate::repo_relpath::storage_string`] to preserve raw Git path bytes.
-pub fn stash_worktree_change_paths(
-    repo: &Repository,
-    stash_commit: &CommitData,
-) -> Result<BTreeSet<String>> {
-    let head_at_stash = stash_commit
-        .parents
-        .first()
-        .ok_or(Error::CorruptStash("expected at least 2 parents"))?;
-    let head_tree = repo.odb().commit_tree(head_at_stash)?;
-    Ok(StashTreeDelta::read(repo, &head_tree, &stash_commit.tree)?
-        .changes
-        .into_iter()
-        .map(|(path, _)| crate::repo_relpath::storage_string(&path))
-        .collect())
-}
-
 /// Whether the cached stat data of `ie` proves the worktree file still matches the index.
 ///
 /// `false` means "unknown", not "modified": callers must fall back to a content comparison.
@@ -2203,6 +2247,7 @@ fn collect_worktree_paths_blocking_stash_untracked_restore(
             sort_paths: true,
             use_untracked_cache: false,
             cache_miss: UntrackedCacheMissAction::RefreshFull,
+            clean_unit_dirs: None,
         },
         &worktree_rules,
         None,
@@ -2228,6 +2273,7 @@ fn check_stash_untracked_restore(
     stash_commit: &CommitData,
     index: &mut Index,
     wt_deletions: &BTreeSet<Vec<u8>>,
+    options: &StashApplyOptions,
 ) -> Result<()> {
     if stash_commit.parents.len() < 3 {
         return Ok(());
@@ -2271,12 +2317,57 @@ fn check_stash_untracked_restore(
             score: None,
         })
         .collect();
-    if let Some(path) =
-        untracked_would_be_overwritten_by_tree_changes(&existing_paths, &tree_changes).first()
-    {
+    let collisions = untracked_would_be_overwritten_by_tree_changes(&existing_paths, &tree_changes);
+    for path in &collisions {
+        if options.overwrite_identical_untracked
+            && untracked_on_disk_matches_stash(repo, work_tree, index, ut_oid, &ut_entries, path)?
+        {
+            continue;
+        }
         return Err(Error::StashCouldNotRestoreUntracked { path: path.clone() });
     }
     Ok(())
+}
+
+fn untracked_on_disk_matches_stash(
+    repo: &Repository,
+    work_tree: &Path,
+    index: &Index,
+    ut_commit: &ObjectId,
+    ut_entries: &[FlatTreeEntry],
+    path: &str,
+) -> Result<bool> {
+    let _ = ut_commit;
+    let Some(entry) = ut_entries.iter().find(|e| e.path == path) else {
+        return Ok(false);
+    };
+    if entry.mode == MODE_GITLINK || entry.mode == MODE_TREE {
+        return Ok(false);
+    }
+    let abs = crate::index::worktree_path_from_index_rel(work_tree, path.as_bytes());
+    let meta = match fs::symlink_metadata(&abs) {
+        Ok(m) => m,
+        Err(_) => return Ok(false),
+    };
+    if meta.is_dir() {
+        return Ok(false);
+    }
+    let rules = crate::worktree_rules::WorktreeRules::from_repository(repo, index)?;
+    let stash_blob = repo.odb().read(&entry.oid)?;
+    let worktree_bytes = smudge_bytes_for_worktree_path(
+        repo,
+        &rules,
+        path,
+        entry.mode,
+        &stash_blob.data,
+        &entry.oid,
+    )?;
+    if meta.file_type().is_symlink() {
+        let target = fs::read_link(&abs).map_err(Error::Io)?;
+        return Ok(target.as_os_str().as_encoded_bytes() == worktree_bytes);
+    }
+    let disk = fs::read(&abs).map_err(Error::Io)?;
+    Ok(disk == worktree_bytes)
 }
 
 /// Apply a stash commit onto the current worktree and index.
@@ -2298,14 +2389,7 @@ pub(crate) fn apply_stash_oid(
     cancel: &dyn Cancel,
 ) -> Result<StashApplyOutcome> {
     let work_tree = repo.work_tree().ok_or(Error::StashBareRepository)?;
-    apply_stash_commit(
-        repo,
-        work_tree,
-        stash_oid,
-        options.restore_index,
-        progress,
-        cancel,
-    )
+    apply_stash_commit(repo, work_tree, stash_oid, options, progress, cancel)
 }
 
 /// Result of [`RepositoryStash::apply`](crate::repo_handles::RepositoryStash::apply),
@@ -2372,10 +2456,11 @@ fn apply_stash_commit(
     repo: &Repository,
     work_tree: &Path,
     stash_oid: &ObjectId,
-    restore_index: bool,
+    options: &StashApplyOptions,
     progress: &mut dyn ProgressSink,
     cancel: &dyn Cancel,
 ) -> Result<StashApplyOutcome> {
+    let restore_index = options.restore_index;
     let stash_commit = repo.odb().read_commit(stash_oid)?;
 
     if stash_commit.parents.len() < 2 {
@@ -2411,7 +2496,14 @@ fn apply_stash_commit(
         .filter(|(_, e)| e.is_none())
         .map(|(p, _)| p.clone())
         .collect();
-    check_stash_untracked_restore(repo, work_tree, &stash_commit, &mut new_index, &deletions)?;
+    check_stash_untracked_restore(
+        repo,
+        work_tree,
+        &stash_commit,
+        &mut new_index,
+        &deletions,
+        options,
+    )?;
     drop(deletions);
 
     // Include the index delta even when a staged addition was removed again in the worktree.
@@ -2907,6 +2999,8 @@ fn apply_stash_commit(
             if !written.entries.is_empty() {
                 written.sort();
                 written.source_mtime = new_index.source_mtime;
+                written.source_checksum = new_index.source_checksum.clone();
+                written.source_file_len = new_index.source_file_len;
                 refresh_index_stats_content_verified(repo, work_tree, &mut written)?;
                 for refreshed in written.entries {
                     if let Some(ie) = new_index.get_mut(&refreshed.path, 0) {
@@ -2974,20 +3068,67 @@ const STASH_REF: &str = "refs/stash";
 ///
 /// Propagates ref and reflog update failures.
 pub(crate) fn drop_stash_commit(repo: &Repository, stash_oid: &ObjectId) -> Result<bool> {
+    const RETRIES: u32 = 128;
     let store = repo.refs();
-    let mut entries = read_reflog_on_store(store, STASH_REF)?;
-    if entries.last().is_none_or(|tip| tip.new_oid != *stash_oid) {
-        return Ok(false);
-    }
-    entries.pop();
-    match entries.last().map(|entry| entry.new_oid) {
-        None => delete_ref_on_store(store, STASH_REF)?,
-        Some(prev) => {
-            store.replace_reflog(STASH_REF, entries)?;
-            update_direct_ref_on_store(store, repo.git_dir(), STASH_REF, &prev)?;
+    let git_dir = repo.git_dir();
+    for _ in 0..RETRIES {
+        if store
+            .resolve(STASH_REF)
+            .ok()
+            .is_none_or(|tip| tip != *stash_oid)
+        {
+            return Ok(false);
+        }
+        let mut new_tip = None;
+        match store.rewrite_reflog(STASH_REF, &mut |mut entries| {
+            if entries.last().is_none_or(|tip| tip.new_oid != *stash_oid) {
+                return Err(crate::error::Error::RefStore(
+                    crate::refs::store::RefStoreError::ReflogRewriteStale {
+                        name: STASH_REF.to_owned(),
+                    },
+                ));
+            }
+            entries.pop();
+            new_tip = entries.last().map(|entry| entry.new_oid);
+            Ok(entries)
+        }) {
+            Ok(()) => {}
+            Err(crate::error::Error::RefStore(
+                crate::refs::store::RefStoreError::ReflogRewriteStale { .. },
+            )) => continue,
+            Err(err) => return Err(err),
+        }
+        let ref_result = match new_tip {
+            None => crate::refs::store_write_value_on_store(
+                store,
+                git_dir,
+                STASH_REF,
+                None,
+                crate::refs::store::Expected::Oid(*stash_oid),
+                None,
+            ),
+            Some(prev) => crate::refs::store_write_value_on_store(
+                store,
+                git_dir,
+                STASH_REF,
+                Some(crate::refs::store::RawRef::Direct(prev)),
+                crate::refs::store::Expected::Oid(*stash_oid),
+                None,
+            ),
+        };
+        match ref_result {
+            Ok(()) => return Ok(true),
+            Err(crate::error::Error::RefStore(
+                crate::refs::store::RefStoreError::ExpectedMismatch { .. },
+            )) => continue,
+            Err(err) => return Err(err),
         }
     }
-    Ok(true)
+    Err(crate::error::Error::RefStore(
+        crate::refs::store::RefStoreError::Corrupt(
+            "refs/stash changed too often during drop".to_owned(),
+        ),
+    ))
 }
 
 /// Stash dirty worktree/index changes before `pull --autostash` / merge autostash.
@@ -3082,6 +3223,20 @@ pub(crate) fn save_merge_autostash_ref(repo: &Repository, identity: &str) -> Res
     store_stash(repo, stash_oid, "autostash", identity)?;
     fs::remove_file(&path).map_err(Error::Io)?;
     Ok(())
+}
+
+/// Record `stash_oid` as the merge autostash (`MERGE_AUTOSTASH`) of a merge left in progress,
+/// so finishing it ([`apply_merge_autostash`]) or aborting it puts the stashed edits back.
+///
+/// # Errors
+///
+/// [`Error::Io`] when the file cannot be written.
+pub(crate) fn record_merge_autostash(repo: &Repository, stash_oid: &ObjectId) -> Result<()> {
+    fs::write(
+        repo.git_dir().join("MERGE_AUTOSTASH"),
+        format!("{}\n", stash_oid.to_hex()),
+    )
+    .map_err(Error::Io)
 }
 
 /// Apply and drop the merge autostash recorded in `MERGE_AUTOSTASH`, matching `git commit` after
@@ -3283,6 +3438,50 @@ mod coverage_tests {
     }
 
     #[test]
+    fn drop_stash_commit_races_concurrent_stash_push() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let tmp = TempDir::new().unwrap();
+        let repo = Arc::new(init_repo(tmp.path()));
+        let ident = "T <t@t> 1 +0000";
+        fs::write(tmp.path().join("f"), b"dirty\n").unwrap();
+        let opts = StashPushOptions {
+            message: Some("m".into()),
+            include_untracked: false,
+            identity: ident.parse().expect("signature"),
+            selection: None,
+            pathspecs: Vec::new(),
+            dry_run: false,
+            mode: StashMode::default(),
+        };
+        let oid = create_stash(&repo, &opts).expect("create").expect("some");
+        store_stash(&repo, oid, "On main: m", ident).expect("store");
+        let drop_repo = repo.clone();
+        let drop_oid = oid;
+        let dropper = thread::spawn(move || {
+            for _ in 0..50 {
+                let _ = drop_stash_commit(drop_repo.as_ref(), &drop_oid);
+            }
+        });
+        let mut pushed = 0usize;
+        while !dropper.is_finished() {
+            fs::write(tmp.path().join("f"), format!("v{pushed}\n")).unwrap();
+            if push_stash(&repo, &opts, &mut NullProgress, &NeverCancel)
+                .expect("push")
+                .is_some()
+            {
+                pushed += 1;
+            }
+        }
+        dropper.join().expect("join");
+        assert!(
+            list_stashes(&repo).expect("list").len() >= pushed,
+            "concurrent stash pushes lost during drop_stash_commit"
+        );
+    }
+
+    #[test]
     fn drop_stash_commit_removes_tip_after_store() {
         let tmp = TempDir::new().unwrap();
         let repo = init_repo(tmp.path());
@@ -3449,7 +3648,7 @@ mod hunk_push_tests {
     use crate::diff::hunk_id::{hunk_ids_with_duplicate_peers, DiffSide};
     use crate::diff::{unstaged_file_diffs_with_peer_hunks, DiffOptions};
     use crate::environment::RepositoryOptions;
-    use crate::porcelain::hunk_select::HunkSelection;
+    use crate::porcelain::hunk_select::{HunkSelection, LineRange};
     use crate::porcelain::index_from_tree::index_from_tree;
     use crate::repo::Repository;
     use std::process::Command;
@@ -3535,6 +3734,7 @@ mod hunk_push_tests {
     #[test]
     fn stash_push_hunks_dry_run_does_not_mutate_repo() {
         let (tmp, repo, selection) = setup_two_hunk_repo();
+        let selected_ids = selection.ids.clone();
         let before = fs::read_to_string(tmp.path().join("f.txt")).unwrap();
         let preview = preview_stash(
             &repo,
@@ -3551,6 +3751,11 @@ mod hunk_push_tests {
         .expect("preview")
         .expect("paths");
         assert!(preview.paths.iter().any(|p| p == "f.txt"));
+        assert_eq!(
+            preview.stashed_hunks,
+            BTreeMap::from([("f.txt".to_string(), selected_ids)])
+        );
+        assert!(preview.stashed_lines.is_empty());
         assert_eq!(list_stashes(&repo).expect("list").len(), 0);
         assert_eq!(
             fs::read_to_string(tmp.path().join("f.txt")).unwrap(),
@@ -3566,7 +3771,8 @@ mod hunk_push_tests {
     #[test]
     fn stash_push_hunks_stashes_only_selected() {
         let (tmp, repo, selection) = setup_two_hunk_repo();
-        let oid = push_stash(
+        let selected_ids = selection.ids.clone();
+        let pushed = push_stash(
             &repo,
             &StashPushOptions {
                 message: Some("partial".into()),
@@ -3581,9 +3787,13 @@ mod hunk_push_tests {
             &NeverCancel,
         )
         .expect("push")
-        .expect("oid")
-        .oid;
-        let w_tree = stash_w_tree(&repo, &oid);
+        .expect("oid");
+        assert_eq!(
+            pushed.stashed_hunks,
+            BTreeMap::from([("f.txt".to_string(), selected_ids)])
+        );
+        assert!(pushed.stashed_lines.is_empty());
+        let w_tree = stash_w_tree(&repo, &pushed.oid);
         let blob = tree_blob(&repo, &w_tree, "f.txt");
         let text = String::from_utf8_lossy(&blob);
         assert!(text.contains("LINE5"), "stashed hunk in W tree: {text}");
@@ -3696,5 +3906,103 @@ mod hunk_push_tests {
             "pop restored stashed hunk: {on_disk}"
         );
         git(tmp.path(), &["fsck", "--strict"]);
+    }
+
+    fn options_with(selection: Option<HunkSelection>, include_untracked: bool) -> StashPushOptions {
+        StashPushOptions {
+            message: None,
+            include_untracked,
+            identity: IDENT.parse().expect("signature"),
+            selection,
+            pathspecs: Vec::new(),
+            dry_run: false,
+            mode: StashMode::default(),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_include_untracked_with_selection() {
+        let selection = HunkSelection {
+            ids: Vec::new(),
+            ranges: vec![LineRange {
+                path: "f.txt".into(),
+                start: 1,
+                end: 1,
+            }],
+        };
+        let err = options_with(Some(selection), true)
+            .validate()
+            .expect_err("conflict");
+        assert!(
+            matches!(err, Error::StashOptionConflict(ref msg) if msg.contains("--include-untracked")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_allows_include_untracked_with_empty_selection() {
+        options_with(Some(HunkSelection::default()), true)
+            .validate()
+            .expect("an empty selection is a full stash");
+        options_with(None, true).validate().expect("no selection");
+    }
+
+    #[cfg_attr(
+        not(feature = "full-tests"),
+        ignore = "starts system git or is heavy; run with --features full-tests"
+    )]
+    #[test]
+    fn stash_push_lines_reports_line_labels() {
+        let (tmp, repo, _) = setup_two_hunk_repo();
+        let selection = HunkSelection {
+            ids: Vec::new(),
+            ranges: vec![LineRange {
+                path: "f.txt".into(),
+                start: 6,
+                end: 6,
+            }],
+        };
+        let preview = preview_stash(&repo, &options_with(Some(selection.clone()), false))
+            .expect("preview")
+            .expect("something to stash");
+        let expected_lines = BTreeMap::from([("f.txt".to_string(), vec!["6".to_string()])]);
+        assert_eq!(preview.stashed_lines, expected_lines);
+        assert!(preview.stashed_hunks.is_empty());
+
+        let pushed = push_stash(
+            &repo,
+            &options_with(Some(selection), false),
+            &mut NullProgress,
+            &NeverCancel,
+        )
+        .expect("push")
+        .expect("stashed");
+        assert_eq!(pushed.stashed_lines, expected_lines);
+        assert!(pushed.stashed_hunks.is_empty());
+        let on_disk = fs::read_to_string(tmp.path().join("f.txt")).unwrap();
+        assert!(!on_disk.contains("LINE5") && on_disk.contains("LINE18"));
+        git(tmp.path(), &["fsck", "--strict"]);
+    }
+
+    #[cfg_attr(
+        not(feature = "full-tests"),
+        ignore = "starts system git or is heavy; run with --features full-tests"
+    )]
+    #[test]
+    fn stash_push_without_selection_reports_no_hunks() {
+        let (_tmp, repo, _) = setup_two_hunk_repo();
+        let preview = preview_stash(&repo, &options_with(None, false))
+            .expect("preview")
+            .expect("something to stash");
+        assert!(preview.stashed_hunks.is_empty() && preview.stashed_lines.is_empty());
+        let pushed = push_stash(
+            &repo,
+            &options_with(None, false),
+            &mut NullProgress,
+            &NeverCancel,
+        )
+        .expect("push")
+        .expect("stashed");
+        assert!(pushed.stashed_hunks.is_empty() && pushed.stashed_lines.is_empty());
     }
 }

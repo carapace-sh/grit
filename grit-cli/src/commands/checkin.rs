@@ -358,10 +358,10 @@ impl IntegrateOutcome {
     #[must_use]
     pub fn needs_attention(&self) -> bool {
         self.refresh_error.is_some()
-            || self
-                .refresh
-                .as_ref()
-                .is_some_and(|r| crate::commands::pull::pull_check_exit_code(r) != 0)
+            || self.refresh.as_ref().is_some_and(|r| {
+                crate::exit_status::ExitStatus::from_pull(r)
+                    != crate::exit_status::ExitStatus::Success
+            })
     }
 }
 

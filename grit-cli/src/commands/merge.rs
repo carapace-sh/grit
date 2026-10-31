@@ -5,6 +5,7 @@
 //! markers in the worktree.
 
 use crate::context;
+use crate::json_error;
 use crate::markdown;
 use crate::merge_strategy_args::MergeStrategyArgs;
 use crate::message_input::{read_message_input, MessageInputArgs};
@@ -18,12 +19,14 @@ use grit_lib::config::ident_resolve::IdentRole;
 use grit_lib::error::Error;
 use grit_lib::objects::ObjectId;
 use grit_lib::operation::Conflict;
+use grit_lib::porcelain::commit::HookPolicy;
 use grit_lib::porcelain::merge::{
-    abort_branch_merge, continue_merge, integrate_branch_with, plan_branch_merge, predict_merge,
-    resolve_merge_source, ContinueOptions, FastForwardPolicy, IntegrateBranchOutcome,
-    MergeCommitMode, MergeDryRunPlan, MergeOptions, MergePrediction, MergePredictionOptions,
+    abort_branch_merge, continue_merge, integrate_branch_with, integrate_detached_head_with,
+    plan_branch_merge, predict_merge, resolve_merge_source, ContinueOptions, FastForwardPolicy,
+    IntegrateBranchOutcome, MergeCommitMode, MergeDryRunPlan, MergeOptions, MergePrediction,
+    MergePredictionOptions,
 };
-use grit_lib::progress::{NeverCancel, ProgressSink};
+use grit_lib::progress::{Cancel, ProgressSink};
 use grit_lib::repo::Repository;
 use grit_lib::state::{read_merge_msg, resolve_head, HeadState};
 use schemars::JsonSchema;
@@ -38,6 +41,7 @@ pub struct MergeRunOptions {
     pub no_commit: bool,
     pub squash: bool,
     pub allow_unrelated_histories: bool,
+    pub no_verify: bool,
     pub strategy: MergeStrategyArgs,
     pub message: MessageInputArgs,
 }
@@ -99,6 +103,9 @@ pub struct MergeOutcome {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(skip_serializing_if = "Option::is_none")]
     pub parents: Option<Vec<String>>,
+    /// True when `HEAD` was detached for this merge (not serialized in `--json`).
+    #[serde(skip)]
+    pub(crate) detached_head: bool,
 }
 
 /// One conflicted path in `--json` output (pull v1 `conflict_details` and merge v2 items).
@@ -138,6 +145,7 @@ impl MergeOutcome {
             dry_run: None,
             parents: None,
             updated_branch: None,
+            detached_head: false,
         }
     }
 
@@ -171,6 +179,7 @@ impl MergeOutcome {
             dry_run: None,
             parents: None,
             updated_branch: fast_forward_updated_branch(head_short, label),
+            detached_head: false,
         }
     }
 
@@ -192,6 +201,7 @@ impl MergeOutcome {
             dry_run: None,
             parents: None,
             updated_branch: fast_forward_updated_branch(head_short, label),
+            detached_head: false,
         }
     }
 
@@ -219,6 +229,7 @@ impl MergeOutcome {
             dry_run: None,
             parents: None,
             updated_branch: None,
+            detached_head: false,
         }
     }
 
@@ -235,6 +246,7 @@ impl MergeOutcome {
             dry_run: Some(true),
             parents: Some(parents.iter().map(ObjectId::to_hex).collect()),
             updated_branch: None,
+            detached_head: false,
         }
     }
 
@@ -251,6 +263,7 @@ impl MergeOutcome {
             dry_run: None,
             parents: None,
             updated_branch: None,
+            detached_head: false,
         }
     }
 
@@ -273,6 +286,7 @@ impl MergeOutcome {
             dry_run: None,
             parents: None,
             updated_branch: None,
+            detached_head: false,
         }
     }
 
@@ -297,6 +311,7 @@ impl MergeOutcome {
             dry_run: None,
             parents: None,
             updated_branch: None,
+            detached_head: false,
         }
     }
 
@@ -316,6 +331,7 @@ impl MergeOutcome {
             dry_run: None,
             parents: None,
             updated_branch: None,
+            detached_head: false,
         }
     }
 
@@ -332,6 +348,7 @@ impl MergeOutcome {
             dry_run: None,
             parents: None,
             updated_branch: None,
+            detached_head: false,
         }
     }
 
@@ -348,6 +365,7 @@ impl MergeOutcome {
             dry_run: None,
             parents: None,
             updated_branch: None,
+            detached_head: false,
         }
     }
 
@@ -370,7 +388,14 @@ impl MergeOutcome {
             dry_run: None,
             parents: None,
             updated_branch: None,
+            detached_head: false,
         }
+    }
+
+    fn for_detached_head(mut self) -> Self {
+        self.detached_head = true;
+        self.updated_branch = None;
+        self
     }
 }
 
@@ -380,10 +405,14 @@ fn fast_forward_updated_branch(head_short: &str, merge_label: &str) -> Option<St
 
 fn write_fast_forward_human(w: &mut dyn Write, outcome: &MergeOutcome, would: bool) -> Result<()> {
     let short = outcome.oid.as_deref().map(short_hex).unwrap_or_default();
-    let head = outcome
-        .updated_branch
-        .as_deref()
-        .unwrap_or(outcome.branch.as_str());
+    let head = if outcome.detached_head {
+        "HEAD"
+    } else {
+        outcome
+            .updated_branch
+            .as_deref()
+            .unwrap_or(outcome.branch.as_str())
+    };
     let source = outcome
         .updated_branch
         .as_ref()
@@ -402,11 +431,15 @@ impl HumanRender for MergeOutcome {
         let short = self.oid.as_deref().map(short_hex).unwrap_or_default();
         match self.result {
             MergeResult::UpToDate if self.dry_run == Some(true) => {
-                outln!(
-                    w,
-                    "Would leave the current branch up to date with {}.",
-                    self.branch
-                );
+                if self.detached_head {
+                    outln!(w, "Would leave HEAD up to date with {}.", self.branch);
+                } else {
+                    outln!(
+                        w,
+                        "Would leave the current branch up to date with {}.",
+                        self.branch
+                    );
+                }
             }
             MergeResult::UpToDate => outln!(w, "Already up to date."),
             MergeResult::FastForward if self.check || self.dry_run == Some(true) => {
@@ -415,11 +448,18 @@ impl HumanRender for MergeOutcome {
             MergeResult::FastForward => write_fast_forward_human(w, self, false)?,
             MergeResult::Clean => outln!(w, "Would merge {} cleanly (tree {short})", self.branch),
             MergeResult::Merged if self.dry_run == Some(true) => {
-                outln!(
-                    w,
-                    "Would merge {} into the current branch (merge commit)",
-                    self.branch
-                );
+                if self.detached_head {
+                    outln!(w, "Would merge {} into HEAD (merge commit)", self.branch);
+                } else {
+                    outln!(
+                        w,
+                        "Would merge {} into the current branch (merge commit)",
+                        self.branch
+                    );
+                }
+            }
+            MergeResult::Merged if self.detached_head => {
+                outln!(w, "Merged {} into HEAD ({short})", self.branch)
             }
             MergeResult::Merged => outln!(
                 w,
@@ -496,6 +536,7 @@ pub fn run(
     progress: &mut dyn ProgressSink,
 ) -> Result<MergeOutcome> {
     let repo = context::discover()?;
+    let interrupt = crate::interrupt::InterruptCancel::install();
 
     if abort {
         abort_branch_merge(&repo).map_err(anyhow::Error::new)?;
@@ -507,50 +548,87 @@ pub fn run(
             bail!("cannot merge a branch while finishing a merge with --continue");
         }
         let continue_message = read_message_input(&options.message)?;
-        return run_continue(&repo, continue_message.as_deref(), progress);
+        return run_continue(&repo, continue_message.as_deref(), progress, &interrupt);
     }
 
     let branch = branch.context("branch name required unless using --abort or --continue")?;
 
-    let (refname, head_short, head_oid) = match resolve_head(repo.git_dir())? {
-        HeadState::Branch {
-            refname,
-            short_name,
-            oid: Some(oid),
-            ..
-        } => (refname, short_name, oid),
-        HeadState::Branch { .. } => bail!("no commits yet on this branch"),
-        HeadState::Detached { .. } => bail!("HEAD is detached; grit merge needs a branch"),
-        HeadState::Invalid => bail!("HEAD is in an unknown state"),
-    };
+    if let Some(op) = grit_lib::state::operation_blocking_switch(repo.git_dir())? {
+        if !matches!(op, grit_lib::state::InProgressOperation::Merge) {
+            return Err(crate::json_error::operation_in_progress_for_repo(
+                &repo, "merge", op,
+            ));
+        }
+    }
 
+    let head = resolve_head(repo.git_dir())?;
     let other_oid = resolve_merge_source(&repo, branch)
         .map_err(crate::json_error::map_lib_error)?
         .oid;
     let merge_options = build_merge_options(&options)?;
-    if dry_run {
-        return dry_run_merge(
-            &repo,
-            head_oid,
-            other_oid,
-            branch,
-            &head_short,
-            &merge_options,
-        );
+
+    match head {
+        HeadState::Branch {
+            refname,
+            short_name,
+            oid: Some(head_oid),
+            ..
+        } => {
+            if dry_run {
+                return dry_run_merge(
+                    &repo,
+                    head_oid,
+                    other_oid,
+                    branch,
+                    &short_name,
+                    &merge_options,
+                );
+            }
+            if check {
+                return check_merge(&repo, head_oid, other_oid, branch, &short_name);
+            }
+            integrate_with_options(
+                &repo,
+                &refname,
+                head_oid,
+                other_oid,
+                branch,
+                &short_name,
+                &merge_options,
+                progress,
+                &interrupt,
+            )
+        }
+        HeadState::Branch { .. } => bail!("no commits yet on this branch"),
+        HeadState::Detached { oid: head_oid } => {
+            if dry_run {
+                return Ok(dry_run_merge(
+                    &repo,
+                    head_oid,
+                    other_oid,
+                    branch,
+                    "HEAD",
+                    &merge_options,
+                )?
+                .for_detached_head());
+            }
+            if check {
+                return Ok(
+                    check_merge(&repo, head_oid, other_oid, branch, "HEAD")?.for_detached_head()
+                );
+            }
+            integrate_detached_with_options(
+                &repo,
+                head_oid,
+                other_oid,
+                branch,
+                &merge_options,
+                progress,
+                &interrupt,
+            )
+        }
+        HeadState::Invalid => bail!("HEAD is in an unknown state"),
     }
-    if check {
-        return check_merge(&repo, head_oid, other_oid, branch, &head_short);
-    }
-    integrate_with_options(
-        &repo,
-        &refname,
-        head_oid,
-        other_oid,
-        branch,
-        &head_short,
-        &merge_options,
-        progress,
-    )
 }
 
 fn build_merge_options(run: &MergeRunOptions) -> Result<MergeOptions> {
@@ -577,6 +655,12 @@ fn build_merge_options(run: &MergeRunOptions) -> Result<MergeOptions> {
         conflict_style,
         allow_unrelated: run.allow_unrelated_histories,
         hooks: grit_lib::PostOperationHooks::Run,
+        verify: if run.no_verify {
+            HookPolicy::SkipVerify
+        } else {
+            HookPolicy::Run
+        },
+        directory_renames: None,
     })
 }
 
@@ -602,16 +686,24 @@ fn run_continue(
     repo: &Repository,
     message: Option<&str>,
     progress: &mut dyn ProgressSink,
+    cancel: &dyn Cancel,
 ) -> Result<MergeOutcome> {
     let label = merge_continue_label(repo.git_dir());
+    let detached = matches!(resolve_head(repo.git_dir())?, HeadState::Detached { .. });
     let now = context::wall_clock_now(repo.environment());
     let options = ContinueOptions {
         message: message.map(str::to_owned),
         author: Some(context::signature(repo, IdentRole::Author, now)?),
         committer: Some(context::signature(repo, IdentRole::Committer, now)?),
     };
-    match continue_merge(repo, &options, progress, &NeverCancel) {
-        Ok(outcome) => Ok(MergeOutcome::merged(&label, outcome.oid, outcome.change_id)),
+    match continue_merge(repo, &options, progress, cancel) {
+        Ok(outcome) => {
+            let mut merged = MergeOutcome::merged(&label, outcome.oid, outcome.change_id);
+            if detached {
+                merged = merged.for_detached_head();
+            }
+            Ok(merged)
+        }
         Err(err) => Err(anyhow::Error::new(err)),
     }
 }
@@ -685,6 +777,7 @@ fn integrate_with_options(
     head_short: &str,
     options: &MergeOptions,
     progress: &mut dyn ProgressSink,
+    cancel: &dyn Cancel,
 ) -> Result<MergeOutcome> {
     match integrate_branch_with(
         repo,
@@ -694,10 +787,42 @@ fn integrate_with_options(
         label,
         options,
         progress,
-        &NeverCancel,
+        cancel,
     ) {
         Ok(outcome) => Ok(map_integrate_outcome(outcome, label, head_short)),
         Err(Error::NotFastForward) => Ok(MergeOutcome::refused_not_ff(label)),
+        Err(err @ Error::Hook(_)) => Err(json_error::hook_failed_with_hint(
+            err,
+            "the merge is still in progress: run `grit merge --continue` to commit it, or `grit merge --abort` to cancel",
+        )),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn integrate_detached_with_options(
+    repo: &Repository,
+    into_oid: ObjectId,
+    other_oid: ObjectId,
+    label: &str,
+    options: &MergeOptions,
+    progress: &mut dyn ProgressSink,
+    cancel: &dyn Cancel,
+) -> Result<MergeOutcome> {
+    match integrate_detached_head_with(
+        repo,
+        into_oid,
+        other_oid,
+        label,
+        options,
+        progress,
+        cancel,
+    ) {
+        Ok(outcome) => Ok(map_integrate_outcome(outcome, label, "HEAD").for_detached_head()),
+        Err(Error::NotFastForward) => Ok(MergeOutcome::refused_not_ff(label).for_detached_head()),
+        Err(err @ Error::Hook(_)) => Err(json_error::hook_failed_with_hint(
+            err,
+            "the merge is still in progress: run `grit merge --continue` to commit it, or `grit merge --abort` to cancel",
+        )),
         Err(err) => Err(err.into()),
     }
 }
@@ -929,5 +1054,138 @@ mod tests {
                 .any(|s| s.as_str() == Some("grit merge --abort")),
             "{alts:?}"
         );
+    }
+
+    #[test]
+    fn merge_on_detached_head_fast_forward_issue_2314() {
+        let fixture = CliFixture::empty();
+        std::fs::write(fixture.path().join("f"), "a\n").unwrap();
+        fixture.run_ok(&["add", "f"]);
+        fixture.run_ok(&["commit", "-m", "a"]);
+        fixture.run_ok(&["switch", "--create", "topic"]);
+        std::fs::write(fixture.path().join("g"), "b\n").unwrap();
+        fixture.run_ok(&["add", "g"]);
+        fixture.run_ok(&["commit", "-m", "b"]);
+        fixture.run_ok(&["switch", "main"]);
+        fixture.run_ok(&["switch", "--detach", "HEAD"]);
+        let head_before = grit_test_support::git(fixture.path(), &["rev-parse", "HEAD"])
+            .trim()
+            .to_owned();
+        let main_before = grit_test_support::git(fixture.path(), &["rev-parse", "main"])
+            .trim()
+            .to_owned();
+
+        let out = fixture.run(&["--json", "merge", "topic"]);
+        assert_eq!(out.status, Some(0), "{}", out.dump("merge detached"));
+        let v: serde_json::Value = serde_json::from_str(&out.stdout).expect("json");
+        assert_eq!(v["result"], "fast_forward");
+        assert!(v.get("updated_branch").is_none());
+        let head_after = grit_test_support::git(fixture.path(), &["rev-parse", "HEAD"])
+            .trim()
+            .to_owned();
+        assert_ne!(head_before, head_after);
+        assert_eq!(
+            grit_test_support::git(fixture.path(), &["rev-parse", "main"]).trim(),
+            main_before
+        );
+
+        fixture.run_ok(&["switch", "main"]);
+        fixture.run_ok(&["switch", "--detach", "HEAD"]);
+        let head = grit_test_support::git(fixture.path(), &["rev-parse", "HEAD"])
+            .trim()
+            .to_owned();
+        let check = fixture.run(&["--json", "merge", "--check", "topic"]);
+        assert_eq!(check.status, Some(0), "{}", check.dump("check"));
+        assert_eq!(
+            grit_test_support::git(fixture.path(), &["rev-parse", "HEAD"]).trim(),
+            head
+        );
+        assert!(!fixture.path().join(".git/MERGE_HEAD").exists());
+
+        fixture.run_ok(&["switch", "main"]);
+        fixture.run_ok(&["switch", "--detach", "HEAD"]);
+        let head = grit_test_support::git(fixture.path(), &["rev-parse", "HEAD"])
+            .trim()
+            .to_owned();
+        let dry = fixture.run(&["--json", "merge", "--dry-run", "topic"]);
+        assert_eq!(dry.status, Some(0), "{}", dry.dump("dry-run"));
+        assert_eq!(
+            grit_test_support::git(fixture.path(), &["rev-parse", "HEAD"]).trim(),
+            head
+        );
+        assert!(!fixture.path().join(".git/MERGE_HEAD").exists());
+    }
+
+    #[test]
+    fn merge_continue_on_detached_head_human_says_head() {
+        let fixture = CliFixture::empty();
+        std::fs::write(fixture.path().join("f.txt"), "base\n").unwrap();
+        fixture.run_ok(&["add", "f.txt"]);
+        fixture.run_ok(&["commit", "-m", "base"]);
+        fixture.run_ok(&["switch", "--create", "topic"]);
+        std::fs::write(fixture.path().join("f.txt"), "topic\n").unwrap();
+        fixture.run_ok(&["commit", "-m", "topic"]);
+        fixture.run_ok(&["switch", "main"]);
+        std::fs::write(fixture.path().join("f.txt"), "main\n").unwrap();
+        fixture.run_ok(&["commit", "-m", "main"]);
+        let main_before = grit_test_support::git(fixture.path(), &["rev-parse", "main"])
+            .trim()
+            .to_owned();
+        fixture.run_ok(&["switch", "--detach", "HEAD"]);
+
+        let conflict = fixture.run(&["merge", "topic"]);
+        assert_eq!(
+            conflict.status,
+            Some(1),
+            "{}",
+            conflict.dump("merge conflict")
+        );
+        std::fs::write(fixture.path().join("f.txt"), "resolved\n").unwrap();
+        fixture.run_ok(&["add", "f.txt"]);
+
+        let cont = fixture.run(&["merge", "--continue"]);
+        assert_eq!(cont.status, Some(0), "{}", cont.dump("continue"));
+        let human = format!("{}{}", cont.stdout, cont.stderr);
+        assert!(
+            human.contains("Merged topic into HEAD"),
+            "expected HEAD wording, got: {human:?}"
+        );
+        assert!(
+            !human.contains("current branch"),
+            "must not claim a branch moved: {human:?}"
+        );
+        assert!(
+            grit_test_support::git(fixture.path(), &["branch", "--show-current"])
+                .trim()
+                .is_empty(),
+            "HEAD should stay detached"
+        );
+        assert_eq!(
+            grit_test_support::git(fixture.path(), &["rev-parse", "main"]).trim(),
+            main_before
+        );
+
+        let md_fixture = CliFixture::empty();
+        std::fs::write(md_fixture.path().join("f.txt"), "base\n").unwrap();
+        md_fixture.run_ok(&["add", "f.txt"]);
+        md_fixture.run_ok(&["commit", "-m", "base"]);
+        md_fixture.run_ok(&["switch", "--create", "topic"]);
+        std::fs::write(md_fixture.path().join("f.txt"), "topic\n").unwrap();
+        md_fixture.run_ok(&["commit", "-m", "topic"]);
+        md_fixture.run_ok(&["switch", "main"]);
+        std::fs::write(md_fixture.path().join("f.txt"), "main\n").unwrap();
+        md_fixture.run_ok(&["commit", "-m", "main"]);
+        md_fixture.run_ok(&["switch", "--detach", "HEAD"]);
+        md_fixture.run(&["merge", "topic"]);
+        std::fs::write(md_fixture.path().join("f.txt"), "resolved\n").unwrap();
+        md_fixture.run_ok(&["add", "f.txt"]);
+        let md = md_fixture.run(&["--markdown", "merge", "--continue"]);
+        assert_eq!(md.status, Some(0), "{}", md.dump("markdown continue"));
+        let md_out = format!("{}{}", md.stdout, md.stderr);
+        assert!(
+            md_out.contains("into HEAD"),
+            "markdown should say HEAD: {md_out:?}"
+        );
+        assert!(!md_out.contains("current branch"));
     }
 }

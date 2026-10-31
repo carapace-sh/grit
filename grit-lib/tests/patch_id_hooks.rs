@@ -120,6 +120,176 @@ fn patch_id_matches_git_patch_id_stable() {
     }
 }
 
+fn git_rev_list_oids(dir: &std::path::Path, range: &str) -> Vec<ObjectId> {
+    git_in(dir, &["rev-list", range])
+        .lines()
+        .map(|l| l.parse().expect("rev-list oid"))
+        .collect()
+}
+
+fn git_stable_patch_id_of(dir: &std::path::Path, commit: &ObjectId) -> ObjectId {
+    let show = git_in(dir, &["show", "-p", &commit.to_hex()]);
+    git_patch_id_from_text(dir, show.as_bytes(), "--stable")
+}
+
+#[test]
+fn patch_ids_for_revs_expands_two_dot_range_like_git() {
+    let history = crate::support::HistoryRepo::init();
+    let wt = history.worktree();
+    crate::support::rewritten_branch_fixture(wt);
+    let repo = crate::support::open_grit_repo(wt);
+
+    let got = repo
+        .patch_ids_for_revs(&["main..old-feat"], PatchIdMode::Stable)
+        .expect("range patch-ids");
+    let want: Vec<(ObjectId, ObjectId)> = git_rev_list_oids(wt, "main..old-feat")
+        .into_iter()
+        .map(|c| (git_stable_patch_id_of(wt, &c), c))
+        .collect();
+    assert_eq!(want.len(), 3, "c1..c3 on the old branch");
+    assert_eq!(got, want, "rev-list order and git patch-id --stable");
+
+    let rewritten = repo
+        .patch_ids_for_revs(&["main..feat"], PatchIdMode::Stable)
+        .expect("rewritten range");
+    let old_ids: Vec<ObjectId> = got.iter().map(|(p, _)| *p).collect();
+    let new_ids: Vec<ObjectId> = rewritten.iter().map(|(p, _)| *p).collect();
+    assert_eq!(new_ids, old_ids, "rebase and c3 reword keep every patch-id");
+    assert_ne!(rewritten[0].1, got[0].1, "c3 was rewritten");
+}
+
+#[test]
+fn patch_ids_for_revs_mixes_single_revisions_and_symmetric_ranges() {
+    let history = crate::support::HistoryRepo::init();
+    let wt = history.worktree();
+    crate::support::rewritten_branch_fixture(wt);
+    let repo = crate::support::open_grit_repo(wt);
+
+    let got = repo
+        .patch_ids_for_revs(&["feat", "old-feat...feat", "feat"], PatchIdMode::Stable)
+        .expect("mixed specs");
+    let tip: ObjectId = git_in(wt, &["rev-parse", "feat"]).trim().parse().unwrap();
+    let symmetric = git_rev_list_oids(wt, "old-feat...feat");
+    assert_eq!(
+        symmetric.len(),
+        7,
+        "3 old commits, 3 rewritten and main's m"
+    );
+    let mut want_commits = vec![tip];
+    want_commits.extend(&symmetric);
+    want_commits.push(tip);
+    let got_commits: Vec<ObjectId> = got.iter().map(|(_, c)| *c).collect();
+    assert_eq!(got_commits, want_commits, "spec order, then walk order");
+    for (patch_id, commit) in &got {
+        assert_eq!(*patch_id, git_stable_patch_id_of(wt, commit), "{commit}");
+    }
+
+    let unstable = repo
+        .patch_ids_for_revs(&["main..old-feat"], PatchIdMode::Unstable)
+        .expect("unstable range");
+    let single: Vec<(ObjectId, ObjectId)> = git_rev_list_oids(wt, "main..old-feat")
+        .into_iter()
+        .map(|c| {
+            (
+                repo.patch_id(&c, PatchIdMode::Unstable).unwrap().unwrap(),
+                c,
+            )
+        })
+        .collect();
+    assert_eq!(unstable, single, "mode applies to every expanded commit");
+}
+
+#[test]
+fn patch_ids_and_cherry_mark_match_git_on_ranges_split_across_workers() {
+    let history = crate::support::HistoryRepo::init();
+    let wt = history.worktree();
+    crate::support::commit_file(wt, "base", "base\n", "base");
+    git_in(wt, &["branch", "-M", "main"]);
+    git_in(wt, &["switch", "-q", "-c", "topic"]);
+    for i in 0..40 {
+        crate::support::commit_file(wt, &format!("t{i}"), &format!("{i}\n"), &format!("t{i}"));
+    }
+    git_in(wt, &["branch", "old-topic"]);
+    git_in(wt, &["switch", "-q", "main"]);
+    crate::support::commit_file(wt, "up", "up\n", "upstream");
+    git_in(wt, &["switch", "-q", "topic"]);
+    git_in(wt, &["rebase", "-q", "main"]);
+    let repo = crate::support::open_grit_repo(wt);
+
+    let got = repo
+        .patch_ids_for_revs(&["old-topic...topic"], PatchIdMode::Stable)
+        .expect("range patch-ids");
+    let want: Vec<(ObjectId, ObjectId)> = git_rev_list_oids(wt, "old-topic...topic")
+        .into_iter()
+        .map(|c| (git_stable_patch_id_of(wt, &c), c))
+        .collect();
+    assert_eq!(want.len(), 81);
+    assert_eq!(got, want);
+
+    let opts = grit_lib::revwalk::RevWalkListOptions {
+        cherry_mark: true,
+        ..Default::default()
+    };
+    let result = repo
+        .rev_walk()
+        .rev_list_result(&["old-topic...topic"], &opts)
+        .expect("cherry-mark");
+    assert_eq!(result.cherry_matches.len(), 40);
+    assert!(result
+        .cherry_matches
+        .iter()
+        .all(|m| m.left.len() == 1 && m.right.len() == 1 && m.message_changed == Some(false)));
+    let marked = git_in(
+        wt,
+        &[
+            "rev-list",
+            "--left-right",
+            "--cherry-mark",
+            "old-topic...topic",
+        ],
+    );
+    let equivalent: Vec<&str> = marked.lines().filter_map(|l| l.strip_prefix('=')).collect();
+    assert_eq!(equivalent.len(), 80);
+    for oid in equivalent {
+        assert!(result.cherry_equivalent.contains(&oid.parse().unwrap()));
+    }
+}
+
+#[test]
+fn patch_ids_for_revs_skips_merges_and_rejects_unknown_specs() {
+    let history = crate::support::HistoryRepo::init();
+    let wt = history.worktree();
+    crate::support::rewritten_branch_fixture(wt);
+    git_in(wt, &["switch", "-q", "main"]);
+    git_in(
+        wt,
+        &["merge", "-q", "--no-ff", "-m", "merge old", "old-feat"],
+    );
+    let repo = crate::support::open_grit_repo(wt);
+
+    let got = repo
+        .patch_ids_for_revs(&["old-feat..main", "main"], PatchIdMode::Stable)
+        .expect("range with merge");
+    let commits: Vec<ObjectId> = got.iter().map(|(_, c)| *c).collect();
+    let m: ObjectId = git_in(wt, &["rev-parse", "main^1"]).trim().parse().unwrap();
+    assert_eq!(
+        commits,
+        vec![m],
+        "merge skipped in the range and as a single spec"
+    );
+
+    assert!(repo
+        .patch_ids_for_revs(&["main..no-such-branch"], PatchIdMode::Stable)
+        .is_err());
+    assert!(repo
+        .patch_ids_for_revs(&["no-such-branch"], PatchIdMode::Stable)
+        .is_err());
+    assert!(repo
+        .patch_ids_for_revs(&[], PatchIdMode::Stable)
+        .expect("no specs")
+        .is_empty());
+}
+
 fn git_patch_id_from_show(dir: &std::path::Path, flag: &str) -> ObjectId {
     let show_p = git_in(dir, &["show", "-p", "HEAD"]);
     git_patch_id_from_text(dir, show_p.as_bytes(), flag)
@@ -437,6 +607,71 @@ fn patch_id_uses_three_context_lines_for_text_hunks() {
 }
 
 #[test]
+fn patch_id_places_slidable_insertion_like_git_diff() {
+    let dir = TempDir::new().unwrap();
+    git_in(dir.path(), &["init", "-q", "-b", "main"]);
+    std::fs::write(dir.path().join("f"), "a\nb\n\n#t\nfn e\nx\ny\n").unwrap();
+    git_in(dir.path(), &["add", "f"]);
+    git_in(dir.path(), &["commit", "-qm", "base"]);
+    // `#t\nfn c\n` can slide one block either side of the existing `#t`; Git's
+    // change-compact and indent heuristic place it before.
+    std::fs::write(dir.path().join("f"), "a\nb\n\n#t\nfn c\n#t\nfn e\nx\ny\n").unwrap();
+    git_in(dir.path(), &["commit", "-qam", "t"]);
+    let id = assert_patch_id_matches_normal_patch(dir.path(), &[], "slidable insertion");
+    assert_eq!(id.to_hex(), "0490ffb8ca10b8210d0b8cd748ee0da016bc6130");
+    let commit: ObjectId = git_in(dir.path(), &["rev-parse", "HEAD"])
+        .trim()
+        .parse()
+        .unwrap();
+    let repo = Repository::open(
+        &dir.path().join(".git"),
+        &RepositoryOptions::empty().with_work_tree(dir.path()),
+    )
+    .unwrap();
+    for (mode, flag) in [
+        (PatchIdMode::Stable, "--stable"),
+        (PatchIdMode::Unstable, "--unstable"),
+        (PatchIdMode::Verbatim, "--verbatim"),
+    ] {
+        assert_eq!(
+            repo.patch_id(&commit, mode).unwrap(),
+            Some(git_patch_id_from_show(dir.path(), flag)),
+            "git show | git patch-id {flag}"
+        );
+    }
+}
+
+#[test]
+fn patch_id_keeps_insertion_off_final_line_without_newline() {
+    let dir = TempDir::new().unwrap();
+    git_in(dir.path(), &["init", "-q", "-b", "main"]);
+    std::fs::write(dir.path().join("f.json"), "{\n  \"a\": 1\n}\n").unwrap();
+    git_in(dir.path(), &["add", "f.json"]);
+    git_in(dir.path(), &["commit", "-qm", "base"]);
+    // The new last line `}` has no newline, so it is not the old `}\n`: the
+    // appended object must not slide up to absorb the old closing brace.
+    std::fs::write(
+        dir.path().join("f.json"),
+        "{\n  \"a\": 2\n}\n{\n  \"b\": 2\n}",
+    )
+    .unwrap();
+    git_in(dir.path(), &["commit", "-qam", "append"]);
+    assert_patch_id_matches_normal_patch(dir.path(), &[], "insertion before missing newline");
+}
+
+#[test]
+fn patch_id_hashes_form_feed_and_vertical_tab() {
+    let dir = TempDir::new().unwrap();
+    git_in(dir.path(), &["init", "-q", "-b", "main"]);
+    std::fs::write(dir.path().join("f"), "keep\n8 | 4\x0c+\nv\x0bt\n").unwrap();
+    git_in(dir.path(), &["add", "f"]);
+    git_in(dir.path(), &["commit", "-qm", "base"]);
+    std::fs::write(dir.path().join("f"), "keep\n8 | 4\u{240c}+\nvt\n").unwrap();
+    git_in(dir.path(), &["commit", "-qam", "visible control pictures"]);
+    assert_patch_id_matches_normal_patch(dir.path(), &[], "form feed and vertical tab");
+}
+
+#[test]
 fn patch_id_equivalence_ignores_distant_context_but_keeps_nearby_context() {
     let mut ids = Vec::new();
     for (distant, nearby) in [
@@ -469,4 +704,161 @@ fn patch_id_equivalence_ignores_distant_context_but_keeps_nearby_context() {
         ids[0], ids[2],
         "nearby unchanged lines are part of the patch"
     );
+}
+
+fn git_patch_id_of_commit(dir: &std::path::Path, commit: &ObjectId, flag: &str) -> ObjectId {
+    let show_p = git_in(dir, &["show", "-p", &commit.to_hex()]);
+    git_patch_id_from_text(dir, show_p.as_bytes(), flag)
+}
+
+#[test]
+fn patch_id_hashes_gitlink_changes_without_reading_the_submodule_commit() {
+    let dir = TempDir::new().unwrap();
+    let missing_a = "13299d28f69f8009be8e08e453a9b0024f153a60";
+    let missing_b = "23299d28f69f8009be8e08e453a9b0024f153a60";
+    git_in(dir.path(), &["init", "-q", "-b", "main"]);
+    std::fs::write(dir.path().join("a"), "a\n").unwrap();
+    git_in(dir.path(), &["add", "a"]);
+    git_in(dir.path(), &["commit", "-qm", "base"]);
+    let cacheinfo = |oid: &str, path: &str| format!("160000,{oid},{path}");
+    let mut commits = Vec::new();
+    let mut commit = |message: &str| {
+        git_in(dir.path(), &["commit", "-qm", message]);
+        let oid: ObjectId = git_in(dir.path(), &["rev-parse", "HEAD"])
+            .trim()
+            .parse()
+            .unwrap();
+        commits.push(oid);
+    };
+
+    git_in(
+        dir.path(),
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &cacheinfo(missing_a, "sub"),
+        ],
+    );
+    commit("add gitlink");
+    git_in(
+        dir.path(),
+        &["update-index", "--cacheinfo", &cacheinfo(missing_b, "sub")],
+    );
+    commit("bump gitlink");
+    git_in(
+        dir.path(),
+        &["update-index", "--cacheinfo", &cacheinfo(missing_a, "sub")],
+    );
+    std::fs::write(dir.path().join("a"), "a\nb\n").unwrap();
+    git_in(dir.path(), &["add", "a"]);
+    commit("bump gitlink and edit a file");
+    git_in(dir.path(), &["update-index", "--force-remove", "sub"]);
+    commit("delete gitlink");
+    git_in(dir.path(), &["rm", "-q", "--cached", "a"]);
+    git_in(
+        dir.path(),
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &cacheinfo(missing_b, "a"),
+        ],
+    );
+    commit("replace a file with a gitlink");
+    std::fs::write(dir.path().join("f"), "f\n").unwrap();
+    git_in(dir.path(), &["add", "f"]);
+    commit("add a file");
+    std::fs::remove_file(dir.path().join("f")).unwrap();
+    std::os::unix::fs::symlink("target", dir.path().join("f")).unwrap();
+    git_in(dir.path(), &["add", "f"]);
+    commit("replace a file with a symlink");
+
+    for missing in [missing_a, missing_b] {
+        let probe = Command::new("git")
+            .current_dir(dir.path())
+            .args(["cat-file", "-t", missing])
+            .output()
+            .unwrap();
+        assert!(!probe.status.success(), "{missing} must not be an object");
+    }
+
+    let repo = Repository::open(
+        &dir.path().join(".git"),
+        &RepositoryOptions::empty().with_work_tree(dir.path()),
+    )
+    .unwrap();
+    for (mode, flag) in [
+        (PatchIdMode::Stable, "--stable"),
+        (PatchIdMode::Unstable, "--unstable"),
+        (PatchIdMode::Verbatim, "--verbatim"),
+    ] {
+        let expected: Vec<(ObjectId, ObjectId)> = commits
+            .iter()
+            .map(|c| (git_patch_id_of_commit(dir.path(), c, flag), *c))
+            .collect();
+        for (patch_id, commit) in &expected {
+            assert_eq!(
+                repo.patch_id(commit, mode).unwrap(),
+                Some(*patch_id),
+                "git show {commit} | git patch-id {flag}"
+            );
+        }
+        let range = format!("main~{}..main", commits.len());
+        let mut from_range = repo.patch_ids_for_revs(&[&range], mode).unwrap();
+        from_range.reverse();
+        assert_eq!(from_range, expected, "range {flag}");
+    }
+}
+
+fn tail_lines_bytes(content: &[u8], n: usize) -> Vec<u8> {
+    let mut lines: Vec<&[u8]> = content.split(|&b| b == b'\n').collect();
+    if lines.last() == Some(&&b""[..]) {
+        lines.pop();
+    }
+    let start = lines.len().saturating_sub(n);
+    let mut out = Vec::new();
+    for line in &lines[start..] {
+        out.extend_from_slice(line);
+        out.push(b'\n');
+    }
+    out
+}
+
+#[cfg_attr(
+    not(feature = "full-tests"),
+    ignore = "starts system git or is heavy; run with --features full-tests"
+)]
+#[test]
+fn patch_id_stable_matches_git_git_t4201_shortlog_invalid_utf8() {
+    let git_src = std::path::Path::new("/tmp/git-src");
+    if !git_src.join("HEAD").exists() {
+        eprintln!(
+            "skip patch_id_stable_matches_git_git_t4201_shortlog_invalid_utf8: no /tmp/git-src"
+        );
+        return;
+    }
+    const C: &str = "253118d1d99b28b1c809e3607c0a182e141f3e45";
+    let old_blob = git_in(git_src, &["show", &format!("{C}^:t/t4201-shortlog.sh")]);
+    let new_blob = git_in(git_src, &["show", &format!("{C}:t/t4201-shortlog.sh")]);
+
+    let dir = TempDir::new().unwrap();
+    git_in(dir.path(), &["init", "-q", "-b", "main"]);
+    std::fs::write(dir.path().join("f"), &old_blob).unwrap();
+    git_in(dir.path(), &["add", "f"]);
+    git_in(dir.path(), &["commit", "-qm", "base"]);
+    std::fs::write(dir.path().join("f"), &new_blob).unwrap();
+    git_in(dir.path(), &["commit", "-qam", "change"]);
+    assert_patch_id_matches_normal_patch(dir.path(), &[], "git t4201 shortlog full file");
+
+    let dir = TempDir::new().unwrap();
+    git_in(dir.path(), &["init", "-q", "-b", "main"]);
+    let old_tail = tail_lines_bytes(old_blob.as_bytes(), 320);
+    let new_tail = tail_lines_bytes(new_blob.as_bytes(), 320);
+    std::fs::write(dir.path().join("f"), &old_tail).unwrap();
+    git_in(dir.path(), &["add", "f"]);
+    git_in(dir.path(), &["commit", "-qm", "base"]);
+    std::fs::write(dir.path().join("f"), &new_tail).unwrap();
+    git_in(dir.path(), &["commit", "-qam", "change"]);
+    assert_patch_id_matches_normal_patch(dir.path(), &[], "git t4201 shortlog tail-320");
 }

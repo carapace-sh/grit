@@ -13,9 +13,11 @@ grit resolve [--short] [--abbrev-ref | --symbolic-full-name] [--verify <SPEC> [-
 
 ## Description
 
-Resolves one or more revision specs to an object id, plus the object type and uncompressed size. Type and size follow `git cat-file` semantics, including `refs/replace` when replace refs are enabled (honor `GIT_NO_REPLACE_OBJECTS` to read the stored object instead). Supported forms match the library rev-parse surface: branches and tags, `HEAD~n`, peel suffixes such as `^{tree}`, path suffixes such as `main:path/file`, reflog selectors like `@{1}`, abbreviated object ids, and **change ids** (reverse-hex tokens in `k`–`z`, 4–32 characters — stored header or derived id). See [Change ids — Revisions](../library/change-ids.md#revisions).
+Resolves one or more revision specs to an object id, plus the object type and uncompressed size. Type and size follow `git cat-file` semantics, including `refs/replace` when replace refs are enabled (honor `GIT_NO_REPLACE_OBJECTS` to read the stored object instead). Supported forms match the library rev-parse surface: branches and tags, `HEAD~n`, peel suffixes such as `^{tree}`, path suffixes such as `main:path/file`, reflog selectors like `main@{1}` or `HEAD@{yesterday}` (date text uses the same relaxed grammar as `grit log --since`, for example `yesterday`, `last week`, `noon yesterday`, `Oct 27`, `10/27/2026`), abbreviated object ids, and **change ids** (reverse-hex tokens in `k`–`z`, 4–32 characters — stored header or derived id). See [Change ids — Revisions](../library/change-ids.md#revisions). When a date selector is older than every reflog entry, grit resolves to the oldest entry and emits a warning (same behavior as Git).
 
 Each spec prints on its own line as `OID TYPE` (full hex by default). With `--short`, oids are abbreviated using the same uniqueness rules as elsewhere in grit.
+
+The `:/<text>` message search resolves to the **youngest** matching commit by committer date among all commits reachable from any ref (including `HEAD`), not merely the first match walking back from one branch tip.
 
 With `--abbrev-ref` or `--symbolic-full-name`, output switches to ref names (one line per spec): the shortest unambiguous short name, or the full symbolic ref name, matching `git rev-parse` for the same flags. Specs that are not refs (commit oids, peeled objects, unknown names) produce no line for that spec; exit status stays `0` unless a spec fails for another reason (for example `@{u}` with no upstream).
 

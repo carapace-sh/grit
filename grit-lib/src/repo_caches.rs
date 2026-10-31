@@ -26,7 +26,6 @@ use crate::attributes::{
     load_gitattributes_stack_uncached, AttrStackCacheEntry, ParsedGitAttributes,
 };
 use crate::blame::PromisorHydrateHook;
-use crate::command_runner::CommandEnvironment;
 use crate::config::{
     config_cache_lookup, config_cache_store, config_file_stamps, ConfigCacheKey, ConfigSet,
     LoadConfigOptions,
@@ -235,7 +234,7 @@ impl RepoCaches {
                 .lock()
                 .map_err(|e| Error::Message(format!("config cache lock poisoned: {e}")))?;
             if let Some(cached) = config_cache_lookup(&cache, &key, &env_fp, &base_stamps) {
-                return Ok(Arc::new(cached));
+                return Ok(cached);
             }
         }
         #[cfg(test)]
@@ -245,6 +244,7 @@ impl RepoCaches {
         included_files.sort_unstable();
         included_files.dedup();
         let extra_stamps = crate::config::stamp_paths(included_files);
+        let set = Arc::new(set);
         let mut cache = self
             .config_cache
             .lock()
@@ -255,9 +255,9 @@ impl RepoCaches {
             env_fp,
             base_stamps,
             extra_stamps,
-            Arc::new(set.clone()),
+            Arc::clone(&set),
         );
-        Ok(Arc::new(set))
+        Ok(set)
     }
 
     /// Drop cached repository-local `config` body and derived parse (not the full cascade cache).
@@ -610,25 +610,15 @@ impl RepoCaches {
     /// Cwd and environment for clean/smudge filter subprocesses on this repository handle.
     pub(crate) fn configure_filter_subprocess(
         &self,
-        environment: &Environment,
+        environment: &Arc<Environment>,
         git_dir: &Path,
         work_tree: Option<&Path>,
     ) {
-        let work_dir = work_tree
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| git_dir.to_path_buf());
-        let mut extra = vec![("GIT_DIR".to_owned(), git_dir.to_string_lossy().into_owned())];
-        if let Some(wt) = work_tree {
-            extra.push((
-                "GIT_WORK_TREE".to_owned(),
-                wt.to_string_lossy().into_owned(),
-            ));
-        }
-        let mut env = CommandEnvironment::from_repository_environment(environment, &extra);
-        if cfg!(windows) {
-            crate::git_path::strip_verbatim_prefix_from_subprocess_path_vars(&mut env.set);
-        }
-        self.filters.configure_subprocess(work_dir, env);
+        self.filters.configure_subprocess(
+            Arc::clone(environment),
+            git_dir.to_path_buf(),
+            work_tree.map(Path::to_path_buf),
+        );
     }
 
     /// Optional promisor-object hydration hook for blame on partial clones.

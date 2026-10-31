@@ -194,6 +194,23 @@ fn rebase_stops_on_conflict_json() -> TestResult {
 }
 
 #[test]
+fn rebase_conflict_marker_names_replayed_commit() -> TestResult {
+    let scratch = Scratch::new("marker-label")?;
+    let dir = scratch.path();
+    let (upstream, onto, topic_tip, file) = init_conflict_rebase(dir)?;
+    let out = gs(dir, ["rebase", "--onto", &onto, &upstream, "--json"])?;
+    assert_eq!(out.status, Some(1), "{}\n{}", out.stdout, out.stderr);
+    let body = fs::read_to_string(dir.join(&file))?;
+    let incoming = body.lines().find(|line| line.starts_with(">>>>>>>"));
+    assert_eq!(
+        incoming,
+        Some(format!(">>>>>>> {} (topic change)", &topic_tip[..7]).as_str()),
+        "{body}"
+    );
+    Ok(())
+}
+
+#[test]
 fn rebase_continue_finishes_and_moves_refs() -> TestResult {
     for command in [&["rebase"][..], &["history", "rebase"][..]] {
         for output in ["--json", "--markdown"] {
@@ -242,6 +259,51 @@ fn rebase_continue_finishes_and_moves_refs() -> TestResult {
             git(dir, &["fsck", "--strict"])?;
         }
     }
+    Ok(())
+}
+
+#[test]
+fn rebase_commit_then_continue_replays_remainder() -> TestResult {
+    let scratch = Scratch::new("commit-continue")?;
+    let dir = scratch.path();
+    git(dir, &["init", "-b", "main"])?;
+    fs::write(dir.join("f"), "1\n2\n3\n")?;
+    fs::write(dir.join("g"), "x\n")?;
+    git(dir, &["add", "f", "g"])?;
+    git(dir, &["commit", "-m", "base"])?;
+    git(dir, &["checkout", "-b", "o"])?;
+    fs::write(dir.join("f"), "1\nO\n3\n")?;
+    git(dir, &["add", "f"])?;
+    git(dir, &["commit", "-m", "o1"])?;
+    fs::write(dir.join("g"), "y\n")?;
+    git(dir, &["add", "g"])?;
+    git(dir, &["commit", "-m", "o2"])?;
+    git(dir, &["checkout", "main"])?;
+    fs::write(dir.join("f"), "1\nM\n3\n")?;
+    git(dir, &["add", "f"])?;
+    git(dir, &["commit", "-m", "m"])?;
+    git(dir, &["checkout", "o"])?;
+    let out = gs(dir, ["rebase", "main"])?;
+    assert_eq!(out.status, Some(1), "{}\n{}", out.stdout, out.stderr);
+    fs::write(dir.join("f"), "1\nR\n3\n")?;
+    let commit = gs(dir, ["commit", "-m", "resolved o1"])?;
+    assert_eq!(
+        commit.status,
+        Some(0),
+        "{}\n{}",
+        commit.stdout,
+        commit.stderr
+    );
+    let cont = gs(dir, ["rebase", "--continue"])?;
+    assert_eq!(cont.status, Some(0), "{}\n{}", cont.stdout, cont.stderr);
+    assert_eq!(fs::read_to_string(dir.join("f"))?, "1\nR\n3\n");
+    assert_eq!(git(dir, &["show", "HEAD:g"])?, "y\n");
+    assert_eq!(
+        git(dir, &["log", "-1", "--format=%s", "HEAD~1"])?.trim(),
+        "resolved o1"
+    );
+    assert!(!dir.join(".git/rebase-merge").exists());
+    git(dir, &["fsck", "--strict"])?;
     Ok(())
 }
 
@@ -403,6 +465,58 @@ fn rebase_skip_with_remaining_replay_reports_head_change() -> TestResult {
         assert!(git(dir, &["status", "--porcelain"])?.trim().is_empty());
         assert!(!dir.join(".git/rebase-merge").exists());
         git(dir, &["fsck", "--strict"])?;
+    }
+    Ok(())
+}
+
+fn assert_rebase_in_progress_message(stderr: &str, from_pick: bool) {
+    assert!(stderr.contains("rebase is in progress"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("grit rebase --continue"),
+        "stderr: {stderr}"
+    );
+    assert!(stderr.contains("grit rebase --abort"), "stderr: {stderr}");
+    if from_pick {
+        assert!(
+            !stderr.contains("grit commit"),
+            "pick must not suggest commit: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn mid_rebase_refused_commands_name_rebase() -> TestResult {
+    let scratch = Scratch::new("issue-2295")?;
+    let dir = scratch.path();
+    gs(dir, ["init"])?;
+    fs::write(dir.join("f"), "1\n2\n3\n")?;
+    gs(dir, ["commit", "-m", "base"])?;
+    gs(dir, ["switch", "-c", "o"])?;
+    fs::write(dir.join("f"), "1\nO\n3\n")?;
+    gs(dir, ["commit", "-m", "o"])?;
+    gs(dir, ["switch", "main"])?;
+    fs::write(dir.join("f"), "1\nM\n3\n")?;
+    gs(dir, ["commit", "-m", "m"])?;
+    gs(dir, ["switch", "o"])?;
+    let rebase = gs(dir, ["rebase", "main"])?;
+    assert_ne!(
+        rebase.status,
+        Some(0),
+        "{}\n{}",
+        rebase.stdout,
+        rebase.stderr
+    );
+
+    for (args, from_pick) in [
+        (vec!["pull"], false),
+        (vec!["merge", "main"], false),
+        (vec!["rebase", "main"], false),
+        (vec!["pick", "main"], true),
+        (vec!["branch", "-m", "x"], false),
+    ] {
+        let out = gs(dir, args)?;
+        assert_ne!(out.status, Some(0), "{}\n{}", out.stdout, out.stderr);
+        assert_rebase_in_progress_message(&out.stderr, from_pick);
     }
     Ok(())
 }

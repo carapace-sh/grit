@@ -8,7 +8,11 @@ use crate::error::Result;
 type StoreResult<T> = std::result::Result<T, RefStoreError>;
 use crate::reflog::ReflogEntry;
 
-use super::backend::{apply_transaction, check_transaction, resolve_symbolic, RefBatchState};
+use super::apply::{rollback_failed_apply, snapshot_for_apply_rollback};
+use super::backend::{
+    apply_transaction, check_transaction, partition_updates_allowing_failures, resolve_symbolic,
+    RefBatchState,
+};
 use super::error::RefStoreError;
 use super::transaction::RefTransaction;
 use super::{PreparedRefTransaction, RawRef, RefEntry, RefStorageFormat, RefStore};
@@ -18,7 +22,10 @@ struct MemoryRefStoreInner {
     /// Shared so iterators can walk a snapshot after releasing the lock; writers go through
     /// [`Arc::make_mut`], which copies only while such a walk still holds the old state.
     state: Arc<RefBatchState>,
-    prepared: Option<PreparedBatch>,
+    /// The single writer slot: the transaction between `prepare` and commit or abort.
+    prepared: Option<RefTransaction>,
+    /// Per-ref rejections from the last [`RefTransaction::allowing_failures`] prepare.
+    rejections: Vec<(String, RefStoreError)>,
 }
 
 impl MemoryRefStoreInner {
@@ -27,16 +34,12 @@ impl MemoryRefStoreInner {
     }
 }
 
-#[derive(Debug, Clone)]
-struct PreparedBatch {
-    lock_name: String,
-    txn: RefTransaction,
-}
-
 /// Fully in-memory ref database with transactional updates.
 ///
 /// Built only on the public [`super::backend`] helpers, so it doubles as a reference for
-/// custom backends.
+/// custom backends. One prepared transaction at a time holds the whole store; another
+/// `prepare` meanwhile fails with [`RefStoreError::LockHeld`], which grit-lib's ref writes
+/// retry (see [`crate::refs::prepare_with_lock_wait`]).
 #[derive(Debug)]
 pub struct MemoryRefStore {
     inner: Mutex<MemoryRefStoreInner>,
@@ -56,6 +59,7 @@ impl MemoryRefStore {
             inner: Mutex::new(MemoryRefStoreInner {
                 state: Arc::default(),
                 prepared: None,
+                rejections: Vec::new(),
             }),
         }
     }
@@ -64,15 +68,14 @@ impl MemoryRefStore {
     ///
     /// # Errors
     ///
-    /// Returns [`RefStoreError::LockHeld`] when a transaction is prepared.
+    /// Returns [`RefStoreError::LockHeld`] naming `name` when a transaction is prepared.
     pub fn set_ref(&self, name: impl Into<String>, value: RawRef) -> StoreResult<()> {
+        let name = name.into();
         let mut inner = self.lock();
-        if let Some(active) = &inner.prepared {
-            return Err(RefStoreError::LockHeld {
-                name: active.lock_name.clone(),
-            });
+        if inner.prepared.is_some() {
+            return Err(RefStoreError::LockHeld { name });
         }
-        inner.state_mut().refs.insert(name.into(), value);
+        inner.state_mut().refs.insert(name, value);
         Ok(())
     }
 
@@ -100,6 +103,7 @@ impl RefStore for MemoryRefStore {
         prefix: &str,
         f: &mut dyn FnMut(&RefEntry) -> ControlFlow<()>,
     ) -> Result<()> {
+        let prefix = if prefix.is_empty() { "refs/" } else { prefix };
         let state = self.snapshot();
         for (name, value) in state.refs.range(prefix.to_owned()..) {
             if !name.starts_with(prefix) {
@@ -127,26 +131,43 @@ impl RefStore for MemoryRefStore {
     ) -> StoreResult<Box<dyn PreparedRefTransaction + Send + '_>> {
         txn.validate()?;
         let mut inner = self.lock();
-        if let Some(active) = &inner.prepared {
+        if inner.prepared.is_some() {
             return Err(RefStoreError::LockHeld {
-                name: active.lock_name.clone(),
+                name: txn.lock_name(),
             });
         }
 
-        check_transaction(&inner.state, &txn)?;
+        let allow_failures = txn.allows_failures();
+        let txn = if allow_failures {
+            let (updates, reflog_renames, case_only) = {
+                let updates = txn.updates().to_vec();
+                let reflog_renames = txn.reflog_renames().to_vec();
+                let case_only = txn.case_only_renames().to_vec();
+                (updates, reflog_renames, case_only)
+            };
+            let (accepted, rejected) = partition_updates_allowing_failures(&inner.state, updates)?;
+            inner.rejections = rejected;
+            let mut accepted_txn = RefTransaction::from_updates(accepted)?;
+            for rename in reflog_renames {
+                accepted_txn = accepted_txn.with_reflog_rename(rename);
+            }
+            for rename in case_only {
+                accepted_txn = accepted_txn.with_case_only_rename(rename);
+            }
+            accepted_txn
+        } else {
+            inner.rejections.clear();
+            txn
+        };
 
-        let lock_name = txn
-            .updates()
-            .first()
-            .map(|u| u.name.clone())
-            .or_else(|| txn.reflog_renames().first().map(|r| r.from.clone()))
-            .or_else(|| txn.case_only_renames().first().map(|r| r.from.clone()))
-            .unwrap_or_else(|| "refs".to_owned());
-        inner.prepared = Some(PreparedBatch { lock_name, txn });
+        check_transaction(&inner.state, &txn)?;
+        let rejections = inner.rejections.clone();
+        inner.prepared = Some(txn);
 
         Ok(Box::new(MemoryPrepared {
             store: self,
             committed: false,
+            rejections,
         }))
     }
 
@@ -200,10 +221,18 @@ impl RefStore for MemoryRefStore {
     }
 
     fn replace_reflog(&self, name: &str, entries: Vec<ReflogEntry>) -> Result<()> {
-        self.lock()
-            .state_mut()
-            .reflogs
-            .insert(name.to_owned(), entries);
+        self.rewrite_reflog(name, &mut |_| Ok(entries.clone()))
+    }
+
+    fn rewrite_reflog(
+        &self,
+        name: &str,
+        transform: &mut dyn FnMut(Vec<ReflogEntry>) -> Result<Vec<ReflogEntry>>,
+    ) -> Result<()> {
+        let mut inner = self.lock();
+        let current = inner.state.reflogs.get(name).cloned().unwrap_or_default();
+        let rewritten = transform(current)?;
+        inner.state_mut().reflogs.insert(name.to_owned(), rewritten);
         Ok(())
     }
 
@@ -221,17 +250,25 @@ impl RefStore for MemoryRefStore {
 struct MemoryPrepared<'a> {
     store: &'a MemoryRefStore,
     committed: bool,
+    rejections: Vec<(String, RefStoreError)>,
 }
 
 impl PreparedRefTransaction for MemoryPrepared<'_> {
+    fn rejected_updates(&self) -> &[(String, RefStoreError)] {
+        &self.rejections
+    }
+
     fn commit(mut self: Box<Self>) -> StoreResult<()> {
         let mut inner = self.store.lock();
-        let Some(batch) = inner.prepared.take() else {
+        let Some(txn) = inner.prepared.take() else {
             return Ok(());
         };
-        let mut trial = inner.state.snapshot();
-        apply_transaction(&mut trial, &batch.txn)?;
-        inner.state = Arc::new(trial);
+        let backup = snapshot_for_apply_rollback(&inner.state, &txn);
+        let state = inner.state_mut();
+        if let Err(err) = apply_transaction(state, &txn) {
+            rollback_failed_apply(state, &backup);
+            return Err(err);
+        }
         self.committed = true;
         Ok(())
     }

@@ -6,8 +6,12 @@
 //! `User-Agent` / `Content-Type` / `Accept` headers, and reading the response
 //! body into a `Vec<u8>` — and adds optional HTTP basic auth driven by a
 //! [`CredentialProvider`]: on a `401` it parses `WWW-Authenticate`, fills a
-//! credential, and retries once, then `approve`/`reject`s the credential per the
-//! retry status (Git's `credential_approve` / `credential_reject`).
+//! credential, and retries once. On the retry, `reject` runs only when the
+//! server still answers `401` (Git's `credential_reject`); a working credential
+//! that gets 403, 404, 429 or 5xx is left alone — neither `approve` nor
+//! `reject` — and the request fails with [`Error::RemoteUnreadable`].
+//! Successful retries call `approve` and cache the auth header (Git's
+//! `credential_approve`).
 //!
 //! When authentication is required but cannot be satisfied — no provider wired,
 //! the provider cannot supply a usable username/password, an unsupported auth
@@ -799,14 +803,9 @@ impl UreqHttpClient {
         let Some(input) = credential_for_url(&auth_url, &self.credential_config) else {
             return Err(auth_error(&auth_url, AuthFailure::UrlNotDescribable));
         };
-        let cred = provider.fill(&input).map_err(|e| {
-            auth_error(
-                &auth_url,
-                AuthFailure::CredentialsUnavailable {
-                    detail: e.to_string(),
-                },
-            )
-        })?;
+        let cred = provider
+            .fill(&input)
+            .map_err(|e| auth_error(&auth_url, AuthFailure::from_fill_error(e)))?;
         let Some(header) = basic_auth_header(&cred) else {
             return Err(auth_error(&auth_url, AuthFailure::UnusableCredentials));
         };
@@ -819,8 +818,6 @@ impl UreqHttpClient {
             return Err(auth_error(url, AuthFailure::Rejected));
         }
         if retry_head.status >= 400 {
-            let _ = provider.reject(&cred);
-            self.clear_auth_header();
             drain_response_body(retry_reader);
             return Err(http_status_error(url, retry_head.status));
         }
@@ -942,14 +939,9 @@ impl UreqHttpClient {
         let Some(input) = credential_for_url(url, &self.credential_config) else {
             return Err(auth_error(url, AuthFailure::UrlNotDescribable));
         };
-        let cred = provider.fill(&input).map_err(|e| {
-            auth_error(
-                url,
-                AuthFailure::CredentialsUnavailable {
-                    detail: e.to_string(),
-                },
-            )
-        })?;
+        let cred = provider
+            .fill(&input)
+            .map_err(|e| auth_error(url, AuthFailure::from_fill_error(e)))?;
         let Some(header) = basic_auth_header(&cred) else {
             return Err(auth_error(url, AuthFailure::UnusableCredentials));
         };
@@ -1010,14 +1002,9 @@ impl UreqHttpClient {
         // A provider that cannot supply a credential (no configured helper, or a
         // non-interactive failure) reports it as a typed auth error rather than a
         // generic message, and crucially never blocks on a TTY.
-        let cred = provider.fill(&input).map_err(|e| {
-            auth_error(
-                &auth_url,
-                AuthFailure::CredentialsUnavailable {
-                    detail: e.to_string(),
-                },
-            )
-        })?;
+        let cred = provider
+            .fill(&input)
+            .map_err(|e| auth_error(&auth_url, AuthFailure::from_fill_error(e)))?;
         let Some(header) = basic_auth_header(&cred) else {
             return Err(auth_error(&auth_url, AuthFailure::UnusableCredentials));
         };
@@ -1030,8 +1017,6 @@ impl UreqHttpClient {
             return Err(auth_error(url, AuthFailure::Rejected));
         }
         if retry.status >= 400 {
-            let _ = provider.reject(&cred);
-            self.clear_auth_header();
             return Err(http_status_error(url, retry.status));
         }
         // Success: approve + cache the working auth header for this origin only.

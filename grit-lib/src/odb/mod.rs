@@ -24,8 +24,12 @@
 pub mod builder;
 mod commit;
 mod peel;
+mod read_store;
 pub mod store;
 mod stream;
+mod tree;
+
+pub(crate) use stream::deflate_stream_to_writer;
 
 #[doc(inline)]
 pub use builder::OdbBuilder;
@@ -78,6 +82,12 @@ pub(crate) enum UnreachablePackRetention {
     DropAll,
 }
 
+/// Pack paths and `.keep` status captured once at repack inventory.
+pub(crate) struct RepackPackInventorySnapshot {
+    pub pack_paths: HashSet<PathBuf>,
+    pub kept_at_inventory: HashSet<PathBuf>,
+}
+
 type MemOdbOverlayStore = Arc<RwLock<Option<Arc<MemoryStore>>>>;
 
 /// Cached alternate [`CompositeStore`] keyed by file/env/submodule alternate state.
@@ -112,19 +122,33 @@ pub struct WriteOptions {
     /// every pack on a miss.
     pub assume_loose_only_existence: bool,
     /// When set, skip existence probes and write when the loose path is absent
-    /// (bulk add of all-new blobs).
+    /// (bulk add of all-new blobs). [`Self::freshen_existing`] still applies.
     pub trust_new_loose: bool,
     /// When set, skip `create_dir_all` on the loose prefix directory (call
     /// [`Odb::ensure_all_loose_prefix_dirs`] first).
     pub loose_prefix_dirs_ready: bool,
+    /// When set and no loose copy exists in this repository's object directory, freshen
+    /// a copy stored in a local pack (promisor packs included) or in an alternate object
+    /// directory, and skip the write when that succeeds (Git freshens before writing).
+    ///
+    /// Packs are looked up in the cached pack listing; a miss does not rescan
+    /// `objects/pack/`, so many probes for new objects stay cheap. An object stored only
+    /// where it cannot be freshened (a cruft pack) is still written loose. Like the pack
+    /// hits of [`Self::assume_loose_only_existence`], the copy is freshened even when
+    /// [`Self::silent`] is set.
+    pub freshen_existing: bool,
 }
 
 /// [`WriteOptions`] for parallel staging of new worktree blobs (bulk `git add`).
+///
+/// Only a loose copy stops the write; use [`Odb::bulk_stage_write_options`] for staging
+/// content that may already be packed.
 pub const BULK_NEW_LOOSE_WRITE: WriteOptions = WriteOptions {
     assume_loose_only_existence: true,
     trust_new_loose: true,
     silent: false,
     loose_prefix_dirs_ready: true,
+    freshen_existing: false,
 };
 
 /// Parallel restage of tracked modifications (objects may already be loose or packed).
@@ -133,6 +157,7 @@ pub const BULK_TRACKED_RESTAGE_LOOSE_WRITE: WriteOptions = WriteOptions {
     trust_new_loose: false,
     silent: false,
     loose_prefix_dirs_ready: true,
+    freshen_existing: false,
 };
 
 /// True when `oid` is stored as a loose object or in a **non-promisor** local pack.
@@ -256,9 +281,11 @@ pub struct Odb {
     extra_read_sources: Vec<Arc<dyn ObjectStore>>,
     /// When false, alternate object directories are not consulted ([`OdbBuilder::alternates`]).
     alternates_enabled: bool,
+    /// Commit-graph supplied by [`OdbBuilder::commit_graph`]; used instead of any on-disk graph.
+    attached_commit_graph: Option<Arc<crate::commit_graph_file::CommitGraphChain>>,
     /// Avoid re-reading the same loose object repeatedly during one repository session.
     session_loose_reads: Arc<std::sync::Mutex<SessionLooseReads>>,
-    /// Parsed tree entries reused for the lifetime of this [`Odb`] handle (Git object cache).
+    /// Parsed or raw trees reused for the lifetime of this [`Odb`] handle (Git object cache).
     session_tree_entries: Arc<Mutex<SessionTreeEntries>>,
 }
 
@@ -315,29 +342,55 @@ impl SessionLooseReads {
     }
 }
 
-/// Recently parsed trees for [`Odb::cached_tree_entries`], bounded by total entry count.
+/// A tree held by [`SessionTreeEntries`]: parsed for callers that keep owned entries, or the
+/// raw payload for read-only walks that borrow names straight from it.
+#[derive(Clone)]
+pub(crate) enum SessionTree {
+    /// Entries parsed by [`Odb::cached_tree_entries`].
+    Parsed(Arc<Vec<crate::objects::TreeEntry>>),
+    /// The tree object's payload, as read by [`Odb::cached_tree_for_walk`].
+    Raw(Arc<Vec<u8>>),
+}
+
+impl SessionTree {
+    /// Approximate heap bytes a parsed entry costs (struct plus its name allocation).
+    const PARSED_ENTRY_BYTES: usize = 80;
+
+    fn cost(&self) -> usize {
+        match self {
+            Self::Parsed(entries) => entries.len().saturating_mul(Self::PARSED_ENTRY_BYTES),
+            Self::Raw(data) => data.len(),
+        }
+    }
+}
+
+/// Recently read trees for [`Odb::cached_tree_entries`] and [`Odb::cached_tree_for_walk`],
+/// bounded by their approximate size.
 #[derive(Default)]
 struct SessionTreeEntries {
-    trees: OidHashMap<Arc<Vec<crate::objects::TreeEntry>>>,
-    entries: usize,
+    trees: OidHashMap<SessionTree>,
+    bytes: usize,
 }
 
 impl SessionTreeEntries {
-    /// Total tree entries kept before the cache starts over; a bigger tree is never
-    /// kept. A parsed entry costs roughly 80 bytes, so this holds a few MiB: enough
-    /// for the trees a diff of neighbouring commits revisits, without growing with
-    /// history size.
-    const ENTRY_BUDGET: usize = 1 << 16;
+    /// Approximate bytes kept before the cache starts over; a bigger tree is never kept. A few
+    /// MiB is enough for the trees a diff of neighbouring commits revisits, without growing
+    /// with history size.
+    const BYTE_BUDGET: usize = (1 << 16) * SessionTree::PARSED_ENTRY_BYTES;
 
-    fn insert(&mut self, oid: ObjectId, tree: Arc<Vec<crate::objects::TreeEntry>>) {
-        if tree.len() > Self::ENTRY_BUDGET {
+    fn insert(&mut self, oid: ObjectId, tree: SessionTree) {
+        let cost = tree.cost();
+        if cost > Self::BYTE_BUDGET {
             return;
         }
-        if self.entries + tree.len() > Self::ENTRY_BUDGET {
-            self.trees.clear();
-            self.entries = 0;
+        if let Some(old) = self.trees.remove(&oid) {
+            self.bytes -= old.cost();
         }
-        self.entries += tree.len();
+        if self.bytes + cost > Self::BYTE_BUDGET {
+            self.trees.clear();
+            self.bytes = 0;
+        }
+        self.bytes += cost;
         self.trees.insert(oid, tree);
     }
 }
@@ -347,40 +400,74 @@ mod session_tree_entries_tests {
     use super::*;
     use crate::objects::TreeEntry;
 
-    fn tree(entries: usize) -> Arc<Vec<TreeEntry>> {
+    fn tree(entries: usize) -> SessionTree {
         let entry = TreeEntry {
             mode: 0o100644,
             name: b"f".to_vec(),
             oid: ObjectId::zero(),
         };
-        Arc::new(vec![entry; entries])
+        SessionTree::Parsed(Arc::new(vec![entry; entries]))
+    }
+
+    fn raw(bytes: usize) -> SessionTree {
+        SessionTree::Raw(Arc::new(vec![0u8; bytes]))
     }
 
     fn oid(n: u8) -> ObjectId {
         ObjectId::from_bytes(&[n; 20]).expect("oid")
     }
 
+    const ENTRY_BUDGET: usize = SessionTreeEntries::BYTE_BUDGET / SessionTree::PARSED_ENTRY_BYTES;
+
     #[test]
-    fn cache_starts_over_when_the_entry_budget_is_exceeded() {
+    fn cache_starts_over_when_the_budget_is_exceeded() {
         let mut cache = SessionTreeEntries::default();
-        let half = SessionTreeEntries::ENTRY_BUDGET / 2;
+        let half = ENTRY_BUDGET / 2;
         cache.insert(oid(1), tree(half));
         cache.insert(oid(2), tree(half));
-        assert_eq!(cache.entries, SessionTreeEntries::ENTRY_BUDGET);
+        assert_eq!(cache.bytes, SessionTreeEntries::BYTE_BUDGET);
         assert_eq!(cache.trees.len(), 2);
 
         cache.insert(oid(3), tree(1));
         assert_eq!(cache.trees.len(), 1);
         assert!(cache.trees.contains_key(&oid(3)));
-        assert_eq!(cache.entries, 1);
+        assert_eq!(cache.bytes, SessionTree::PARSED_ENTRY_BYTES);
 
-        cache.insert(oid(4), tree(SessionTreeEntries::ENTRY_BUDGET + 1));
+        cache.insert(oid(4), tree(ENTRY_BUDGET + 1));
         assert!(
             !cache.trees.contains_key(&oid(4)),
             "an oversized tree is not cached"
         );
         assert!(cache.trees.contains_key(&oid(3)));
-        assert!(cache.entries <= SessionTreeEntries::ENTRY_BUDGET);
+        assert!(cache.bytes <= SessionTreeEntries::BYTE_BUDGET);
+    }
+
+    #[test]
+    fn raw_trees_count_their_payload_bytes() {
+        let mut cache = SessionTreeEntries::default();
+        cache.insert(oid(1), raw(1000));
+        cache.insert(oid(2), tree(10));
+        assert_eq!(cache.bytes, 1000 + 10 * SessionTree::PARSED_ENTRY_BYTES);
+
+        cache.insert(oid(3), raw(SessionTreeEntries::BYTE_BUDGET + 1));
+        assert!(
+            !cache.trees.contains_key(&oid(3)),
+            "an oversized payload is not cached"
+        );
+        assert_eq!(cache.trees.len(), 2);
+    }
+
+    #[test]
+    fn replacing_a_tree_releases_its_old_cost() {
+        let mut cache = SessionTreeEntries::default();
+        cache.insert(oid(1), raw(4000));
+        cache.insert(oid(1), tree(2));
+        assert_eq!(cache.trees.len(), 1);
+        assert_eq!(cache.bytes, 2 * SessionTree::PARSED_ENTRY_BYTES);
+        assert!(matches!(
+            cache.trees.get(&oid(1)),
+            Some(SessionTree::Parsed(_))
+        ));
     }
 }
 
@@ -472,6 +559,7 @@ impl Odb {
             custom_primary: None,
             extra_read_sources: Vec::new(),
             alternates_enabled: true,
+            attached_commit_graph: None,
             session_loose_reads: Arc::new(Mutex::new(SessionLooseReads::default())),
             session_tree_entries: Arc::new(Mutex::new(SessionTreeEntries::default())),
             #[cfg(test)]
@@ -525,6 +613,7 @@ impl Odb {
             custom_primary: None,
             extra_read_sources: Vec::new(),
             alternates_enabled: true,
+            attached_commit_graph: None,
             session_loose_reads: Arc::new(Mutex::new(SessionLooseReads::default())),
             session_tree_entries: Arc::new(Mutex::new(SessionTreeEntries::default())),
             #[cfg(test)]
@@ -534,16 +623,22 @@ impl Odb {
         }
     }
 
-    /// Parsed tree entries for `oid`, cached on this [`Odb`] handle.
-    pub(crate) fn cached_tree_entries(
-        &self,
-        oid: &ObjectId,
-    ) -> Result<Arc<Vec<crate::objects::TreeEntry>>> {
-        if let Ok(guard) = self.session_tree_entries.lock() {
-            if let Some(entries) = guard.trees.get(oid) {
-                return Ok(Arc::clone(entries));
-            }
+    fn session_tree(&self, oid: &ObjectId) -> Option<SessionTree> {
+        self.session_tree_entries
+            .lock()
+            .ok()?
+            .trees
+            .get(oid)
+            .cloned()
+    }
+
+    fn remember_session_tree(&self, oid: &ObjectId, tree: SessionTree) {
+        if let Ok(mut guard) = self.session_tree_entries.lock() {
+            guard.insert(*oid, tree);
         }
+    }
+
+    fn read_tree_payload(&self, oid: &ObjectId) -> Result<Vec<u8>> {
         let obj = self.read_impl(oid, false)?;
         if obj.kind != ObjectKind::Tree {
             return Err(Error::CorruptObject(format!(
@@ -551,16 +646,50 @@ impl Odb {
                 obj.kind.as_str()
             )));
         }
-        let parsed = crate::objects::parse_tree_with_oid_len(&obj.data, self.hash_algo().len())?;
+        Ok(obj.data)
+    }
+
+    /// Parsed tree entries for `oid`, cached on this [`Odb`] handle.
+    pub(crate) fn cached_tree_entries(
+        &self,
+        oid: &ObjectId,
+    ) -> Result<Arc<Vec<crate::objects::TreeEntry>>> {
+        let parsed = match self.session_tree(oid) {
+            Some(SessionTree::Parsed(entries)) => return Ok(entries),
+            Some(SessionTree::Raw(data)) => {
+                crate::objects::parse_tree_with_oid_len(&data, self.hash_algo().len())?
+            }
+            None => crate::objects::parse_tree_with_oid_len(
+                &self.read_tree_payload(oid)?,
+                self.hash_algo().len(),
+            )?,
+        };
         let arc = Arc::new(parsed);
-        if let Ok(mut guard) = self.session_tree_entries.lock() {
-            guard.insert(*oid, Arc::clone(&arc));
-        }
+        self.remember_session_tree(oid, SessionTree::Parsed(Arc::clone(&arc)));
         Ok(arc)
+    }
+
+    /// The tree `oid` for a read-only walk, cached on this [`Odb`] handle.
+    ///
+    /// Returns the parsed entries when another caller already cached them, otherwise the raw
+    /// payload, so a walk that only compares entries never allocates one per entry.
+    pub(crate) fn cached_tree_for_walk(&self, oid: &ObjectId) -> Result<SessionTree> {
+        if let Some(tree) = self.session_tree(oid) {
+            return Ok(tree);
+        }
+        let tree = SessionTree::Raw(Arc::new(self.read_tree_payload(oid)?));
+        self.remember_session_tree(oid, tree.clone());
+        Ok(tree)
     }
 
     fn session_cached_loose_read(&self, oid: &ObjectId) -> Option<Object> {
         self.session_loose_reads.lock().ok()?.get(oid).cloned()
+    }
+
+    /// Whether the session read cache holds a copy of `oid` (crate-internal tests only).
+    #[cfg(test)]
+    pub(crate) fn session_read_is_cached(&self, oid: &ObjectId) -> bool {
+        self.session_cached_loose_read(oid).is_some()
     }
 
     /// Keep `obj` in the session read cache. Bounded checkout reads call this directly for
@@ -627,23 +756,29 @@ impl Odb {
             .unwrap_or_else(|| Arc::new(NullDiagnostics))
     }
 
-    fn load_config_cascade(&self) -> Result<ConfigSet> {
-        if let (Some(caches), Some(env)) = (&self.shared_config_state, &self.shared_environment) {
-            let git_dir = self
-                .config_git_dir
-                .as_deref()
-                .or_else(|| self.objects_dir.parent());
-            let cfg = caches.load_config(env.as_ref(), git_dir, true)?;
-            return Ok(cfg.as_ref().clone());
-        }
+    /// The config cascade for this object database's repository.
+    ///
+    /// With a shared repository config state this is the repository's own snapshot: the load
+    /// uses the same options (and so the same cache entry) as
+    /// [`crate::repo::Repository::config`], so opening a repository parses the cascade once.
+    pub(crate) fn load_config_cascade(&self) -> Result<Arc<ConfigSet>> {
         let git_dir = self
             .config_git_dir
             .as_deref()
             .or_else(|| self.objects_dir.parent());
-        if let Some(git_dir) = git_dir {
-            ConfigSet::load(self.config_environment(), Some(git_dir), true)
-        } else {
-            Ok(ConfigSet::new())
+        if let (Some(caches), Some(env)) = (&self.shared_config_state, &self.shared_environment) {
+            let opts = crate::config::LoadConfigOptions::for_repository(
+                env,
+                git_dir,
+                Some(Arc::clone(caches)),
+            );
+            return caches.load_config_with_options(env.as_ref(), git_dir, &opts);
+        }
+        match git_dir {
+            Some(git_dir) => {
+                ConfigSet::load(self.config_environment(), Some(git_dir), true).map(Arc::new)
+            }
+            None => Ok(Arc::new(ConfigSet::new())),
         }
     }
 
@@ -723,15 +858,6 @@ impl Odb {
             path.hash(&mut hasher);
         }
         hasher.finish()
-    }
-
-    /// Drop the cached `info/alternates` chain so the next lookup re-reads the file.
-    pub fn invalidate_alternates_cache(&self) {
-        if let Ok(mut guard) = self.file_alternate_dirs_cache.write() {
-            guard.generation = guard.generation.wrapping_add(1);
-            guard.snapshot = None;
-        }
-        self.clear_alternate_sources_cache();
     }
 
     /// Reload `info/alternates` from disk into this [`Odb`]'s cache (used after external writes).
@@ -907,9 +1033,15 @@ impl Odb {
 
     /// Primary on-disk object source for this repository's `objects/` directory.
     ///
+    /// Files-backed primaries only. For a store that works with any primary use
+    /// [`Self::primary_writable`] (the primary alone) or [`Self::read_store`] (everything
+    /// this database can read).
+    ///
     /// # Errors
     ///
-    /// Propagates failures while opening pack, MIDX, or loose backends.
+    /// - [`Error::UnsupportedObjectStore`] (`operation: "primary"`) when
+    ///   [`OdbBuilder::primary`] replaced the files-backed primary.
+    /// - Failures while opening pack, MIDX, or loose backends.
     pub fn primary(&self) -> Result<Arc<FilesSource>> {
         self.require_files_primary("primary")?;
         if let Some(src) = self.primary_source.get() {
@@ -924,6 +1056,18 @@ impl Odb {
             Ok(()) => Ok(src),
             Err(existing) => Ok(existing),
         }
+    }
+
+    /// Whether abbreviation must consult the full read chain (not only the primary pack index).
+    ///
+    /// True when [`OdbBuilder::push_read_source`] layers or alternate object directories
+    /// can hold additional objects beyond the primary `objects/` loose and pack stores.
+    #[must_use]
+    pub(crate) fn has_secondary_object_stores(&self) -> bool {
+        if !self.extra_read_sources.is_empty() {
+            return true;
+        }
+        self.alternates_enabled && self.alternate_object_lookup_needed()
     }
 
     /// Whether any alternate object directory is configured for this database.
@@ -942,6 +1086,10 @@ impl Odb {
     }
 
     /// Alternate object directories (`info/alternates`, env, submodules) as one composite store.
+    ///
+    /// Only the alternates: neither the primary nor [`OdbBuilder::push_read_source`] layers
+    /// are included, and the composite is empty when [`OdbBuilder::alternates`] is off. Use
+    /// [`Self::read_store`] for the whole lookup chain.
     ///
     /// # Errors
     ///
@@ -1178,7 +1326,8 @@ impl Odb {
         self.delta_base_cache_sync.get_or_init(|| {
             if self.config_git_dir.is_some() {
                 let cfg = self.load_config_cascade().unwrap_or_default();
-                self.pack_store.configure_delta_base_from_config(Some(&cfg));
+                self.pack_store
+                    .configure_delta_base_from_config(Some(cfg.as_ref()));
             }
         });
     }
@@ -1282,6 +1431,7 @@ impl Odb {
         reachable: &crate::gc::LazyReachable<'_>,
         retention: UnreachablePackRetention,
         retained_packs: &HashSet<PathBuf>,
+        inventory: &RepackPackInventorySnapshot,
     ) -> Result<usize> {
         if matches!(retention, UnreachablePackRetention::DropAll) {
             return Ok(0);
@@ -1293,9 +1443,11 @@ impl Odb {
         } else {
             HashSet::new()
         };
-        let kept_pack_oids = oids_in_marker_kept_packs(pack_dir, keep_pack)?;
+        let kept_pack_oids =
+            oids_in_inventory_kept_packs(pack_dir, keep_pack, &inventory.kept_at_inventory)?;
         let mut loosened = 0usize;
-        for (idx_path, pack_mtime) in superseded_pack_indexes(pack_dir, keep_pack, retained_packs)?
+        for (idx_path, pack_mtime) in
+            superseded_pack_indexes(pack_dir, keep_pack, retained_packs, inventory)?
         {
             let oids = PackedObjects::object_ids_from_index_path(&idx_path)?;
             for oid in oids {
@@ -1447,13 +1599,25 @@ impl Odb {
         &self.objects_dir
     }
 
-    /// The repository's commit-graph chain, loaded at most once per repository handle.
+    /// The commit-graph history walks consult for this database.
     ///
-    /// `None` when this database is not attached to a repository's caches (built
-    /// standalone) or has no readable commit-graph; callers then read commits directly.
+    /// A graph attached with [`OdbBuilder::commit_graph`] wins for any primary. Otherwise a
+    /// files primary loads `objects/info/commit-graph` (or the split chain) at most once per
+    /// repository handle. A custom primary never reads graph files from `objects/`: they
+    /// describe whatever the files layout holds, not the custom store, and a walk trusting
+    /// them would report commits the store does not have.
+    ///
+    /// `None` when no graph applies, or when a files-backed database is not attached to a
+    /// repository's caches (built standalone); callers then read commits directly.
     pub(crate) fn commit_graph_chain(
         &self,
     ) -> Option<Arc<crate::commit_graph_file::CommitGraphChain>> {
+        if let Some(chain) = &self.attached_commit_graph {
+            return Some(Arc::clone(chain));
+        }
+        if self.custom_primary.is_some() {
+            return None;
+        }
         self.shared_config_state
             .as_ref()?
             .commit_graph_chain(self.objects_dir())
@@ -1512,7 +1676,56 @@ impl Odb {
     ///
     /// Propagates pack directory listing and index parse failures.
     pub(crate) fn local_pack_indexes(&self) -> Result<Vec<Arc<pack::PackIndex>>> {
-        pack::read_local_pack_indexes_cached(&self.objects_dir)
+        // Outside this database's pack-read context the listing would come from a fresh
+        // store, which maps every index a second time beside the copies object reads use.
+        self.with_primary_read_context(|| pack::read_local_pack_indexes_cached(&self.objects_dir))
+    }
+
+    /// Whether `oid` is stored in a non-promisor pack under any alternate object directory.
+    ///
+    /// Loose objects in alternates do not count (Git `has_object_pack` / `prune-packed`).
+    ///
+    /// # Errors
+    ///
+    /// Propagates pack index read failures from an alternate directory.
+    pub(crate) fn contained_in_alternate_pack(&self, oid: &ObjectId) -> Result<bool> {
+        if !self.alternates_enabled {
+            return Ok(false);
+        }
+        for alt_dir in self.file_alternate_dirs_snapshot().iter() {
+            if store::object_in_non_promisor_pack(alt_dir, oid) {
+                return Ok(true);
+            }
+        }
+        for alt_dir in self.env_alternate_dirs_snapshot().iter() {
+            if store::object_in_non_promisor_pack(alt_dir, oid) {
+                return Ok(true);
+            }
+        }
+        if let Ok(guard) = self.submodule_alternate_dirs.lock() {
+            for alt_dir in guard.iter() {
+                if store::object_in_non_promisor_pack(alt_dir, oid) {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// Delete `oid`'s loose file from this database's own `objects/`, if there is one.
+    ///
+    /// Returns whether a file was removed. Packed copies and alternates are untouched;
+    /// callers drop cached reads themselves if they keep any.
+    ///
+    /// # Errors
+    ///
+    /// Removal failures other than the file not existing.
+    pub(crate) fn remove_local_loose(&self, oid: &ObjectId) -> Result<bool> {
+        match fs::remove_file(self.object_path(oid)) {
+            Ok(()) => Ok(true),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(err) => Err(Error::Io(err)),
+        }
     }
 
     /// Size in bytes of `oid`'s loose file in this database's own `objects/`,
@@ -1750,6 +1963,9 @@ impl Odb {
     /// The oids from `oids` that are not stored locally per [`Self::exists_stored`]
     /// (alternates are not consulted), in input order.
     ///
+    /// `objects/pack/` is rescanned once for the whole batch, not once per missing
+    /// object: a partial clone asks this about thousands of absent blobs at a time.
+    ///
     /// # Errors
     ///
     /// Propagates the first failure of a custom primary store.
@@ -1757,7 +1973,17 @@ impl Odb {
         &self,
         oids: impl IntoIterator<Item = ObjectId>,
     ) -> Result<Vec<ObjectId>> {
-        filter_oids(oids, |oid| self.try_exists_stored(oid).map(|has| !has))
+        if self.custom_primary.is_some() {
+            return filter_oids(oids, |oid| self.try_exists_stored(oid).map(|has| !has));
+        }
+        self.reprepare_local_packs();
+        self.with_pack_store_for(&self.objects_dir, || {
+            filter_oids(oids, |oid| {
+                Ok(!(oid.is_canonical_empty_tree()
+                    || self.overlay_read(oid).is_some()
+                    || store::local_object_stored_without_rescan(&self.objects_dir, oid)))
+            })
+        })
     }
 
     /// Lenient [`Self::contains`]: a source that fails is skipped, so a later source can
@@ -1775,6 +2001,21 @@ impl Odb {
     fn with_pack_store_for<R>(&self, objects_dir: &Path, f: impl FnOnce() -> R) -> R {
         let store = self.pack_store_for(objects_dir);
         PackStore::with_context(store, f)
+    }
+
+    /// Run a read against the primary store.
+    ///
+    /// Only the files primary reads packs under `objects/`, so only it gets this database's
+    /// pack-read context; installing that context costs a path copy and a cache warm-up per
+    /// call, which a custom primary would pay on every object for nothing.
+    fn with_primary_read_context<R>(&self, f: impl FnOnce() -> R) -> R {
+        if self.custom_primary.is_some()
+            || PackStore::read_context_matches_objects_dir(&self.objects_dir)
+        {
+            f()
+        } else {
+            self.with_pack_store_for(&self.objects_dir, f)
+        }
     }
 
     /// Run `f` with pack read caches for this database's primary `objects/` directory.
@@ -1822,8 +2063,17 @@ impl Odb {
         if loose.is_file() {
             return self.touch_object_mtime(&loose).is_some();
         }
+        self.freshen_packed_or_alternate(oid)
+    }
 
-        if self.freshen_object_in_objects_dir(&self.objects_dir, oid) {
+    /// [`Self::freshen_object`] without the loose probe in this repository's object
+    /// directory: touch the local pack holding `oid` (cached listing, no rescan) or a
+    /// loose or packed copy in an alternate object directory.
+    fn freshen_packed_or_alternate(&self, oid: &ObjectId) -> bool {
+        if self.is_empty_tree(oid) {
+            return false;
+        }
+        if self.freshen_packed_in_objects_dir(&self.objects_dir, oid) {
             return true;
         }
 
@@ -1858,6 +2108,10 @@ impl Odb {
         if loose.is_file() {
             return self.touch_object_mtime(&loose).is_some();
         }
+        self.freshen_packed_in_objects_dir(objects_dir, oid)
+    }
+
+    fn freshen_packed_in_objects_dir(&self, objects_dir: &Path, oid: &ObjectId) -> bool {
         self.with_pack_store_for(objects_dir, || {
             let Ok(indexes) = pack::read_local_pack_indexes_cached(objects_dir) else {
                 return false;
@@ -1891,6 +2145,28 @@ impl Odb {
         pack::refresh_pack_bytes_signature(pack_path, touched_at);
         guard.insert(pack_path.to_path_buf());
         true
+    }
+
+    /// [`WriteOptions`] for storing many worktree blobs while staging (`add`, restage).
+    ///
+    /// Returns [`BULK_NEW_LOOSE_WRITE`] when this database has no local pack and no
+    /// alternate object directory, so only the loose path can hold a copy and nothing
+    /// else is probed. Otherwise the options also set [`WriteOptions::freshen_existing`],
+    /// so content already stored in a pack or alternate is freshened instead of written
+    /// again as a loose object. Call once per batch: the pack listing is read here, so
+    /// workers probe already-loaded indexes.
+    #[must_use]
+    pub fn bulk_stage_write_options(&self) -> WriteOptions {
+        let stored_beyond_loose = self.custom_primary.is_none()
+            && (self.alternate_object_lookup_needed()
+                || self.with_pack_read_context(|| {
+                    pack::read_local_pack_indexes_cached(&self.objects_dir)
+                        .is_ok_and(|indexes| !indexes.is_empty())
+                }));
+        WriteOptions {
+            freshen_existing: stored_beyond_loose,
+            ..BULK_NEW_LOOSE_WRITE
+        }
     }
 
     /// When `oid` is already reachable, freshen it and return its id. Returns `None` when the
@@ -2012,11 +2288,7 @@ impl Odb {
         let files_primary = self.primary().ok();
         let mut unreadable_local_loose = None;
         let read_primary = || primary.read(oid);
-        match if PackStore::read_context_matches_objects_dir(&self.objects_dir) {
-            read_primary()
-        } else {
-            self.with_pack_store_for(&self.objects_dir, read_primary)
-        } {
+        match self.with_primary_read_context(read_primary) {
             Ok(Some(obj)) => return self.finish_session_loose_read(oid, obj, remember),
             Ok(None) => {}
             Err(err)
@@ -2076,7 +2348,7 @@ impl Odb {
     /// Read available storage without consulting the promisor fetcher.
     /// Missing objects return `None`; corrupt storage still returns an error.
     pub(crate) fn try_read_once(&self, oid: &ObjectId) -> Result<Option<Object>> {
-        if oid.is_well_known_empty_tree() {
+        if self.is_empty_tree(oid) {
             return Ok(Some(Object {
                 kind: ObjectKind::Tree,
                 data: Vec::new(),
@@ -2105,11 +2377,7 @@ impl Odb {
         let files_primary = self.primary().ok();
         let mut unreadable_local_loose = None;
         let read_primary = || primary.read(oid);
-        match if PackStore::read_context_matches_objects_dir(&self.objects_dir) {
-            read_primary()
-        } else {
-            self.with_pack_store_for(&self.objects_dir, read_primary)
-        } {
+        match self.with_primary_read_context(read_primary) {
             Ok(Some(obj)) => return Ok(Some(self.finish_session_loose_read(oid, obj, true)?)),
             Ok(None) => {}
             Err(err)
@@ -2159,6 +2427,24 @@ impl Odb {
         )?))
     }
 
+    /// Fetch a batch of missing promisor objects before bulk blob reads (tree diffs, checkout).
+    ///
+    /// No-ops when lazy promisor fetch is unavailable; per-object lazy fetch remains the fallback.
+    ///
+    /// # Errors
+    ///
+    /// Propagates transport and pack ingest failures from the promisor fetcher.
+    pub(crate) fn prefetch_promisor_read_batch(
+        &self,
+        oids: impl IntoIterator<Item = ObjectId>,
+    ) -> Result<()> {
+        let (Some(caches), Some(env)) = (&self.shared_config_state, &self.shared_environment)
+        else {
+            return Ok(());
+        };
+        crate::promisor_fetch::prefetch_promisor_read_batch(caches, self, env.as_ref(), oids)
+    }
+
     /// Read and decompress an object into `buf`, reusing its capacity across calls.
     ///
     /// Resolution order matches [`Self::read`]. Returns a borrowed view of the payload
@@ -2199,12 +2485,8 @@ impl Odb {
         let primary = self.primary_writable()?;
         let files_primary = self.primary().ok();
         let mut unreadable_local_loose = None;
-        let mut read_primary = || primary.read_into(oid, buf);
-        match if PackStore::read_context_matches_objects_dir(&self.objects_dir) {
-            read_primary()
-        } else {
-            self.with_pack_store_for(&self.objects_dir, read_primary)
-        } {
+        let read_primary = || primary.read_into(oid, buf);
+        match self.with_primary_read_context(read_primary) {
             Ok(Some(kind)) => return Ok(kind),
             Ok(None) => {}
             Err(err)
@@ -2242,7 +2524,9 @@ impl Odb {
     /// For walks that read many objects sharing delta chains (successive root trees) and do
     /// not want the per-session object copy [`Self::read`] makes. Objects outside the local
     /// object directory (overlay, alternates, promisor fetches) and any local read failure go
-    /// through [`Self::read`], so errors and fallbacks match it.
+    /// through [`Self::read`], so errors and fallbacks match it. A custom primary has no local
+    /// packs, so its objects go through [`Self::read_into`] and the store's
+    /// [`ObjectStore::read_into`].
     ///
     /// # Errors
     ///
@@ -2270,10 +2554,39 @@ impl Odb {
                 }
             }
         }
+        if self.custom_primary.is_some() {
+            return self.read_into(oid, buf);
+        }
         let object = self.read(oid)?;
         buf.clear();
         buf.extend_from_slice(&object.data);
         Ok(object.kind)
+    }
+
+    /// Read only the header block of commit `oid` into `buf` when a local pack stores it whole.
+    ///
+    /// `buf` then ends with the blank line that closes the headers: it parses as the commit
+    /// with an empty message, giving its tree, parents and dates without inflating the message.
+    /// The entry is fetched with a positioned read, so walks that touch many scattered commits
+    /// do not keep pack pages resident. Returns `false` when this shortcut does not apply (a
+    /// custom primary store, a loose or deltified commit, an object that is not a commit, very
+    /// long headers); read the whole object instead.
+    ///
+    /// # Errors
+    ///
+    /// Propagates pack directory listing and pack index lookup errors.
+    pub(crate) fn read_packed_commit_header_block_into(
+        &self,
+        oid: &ObjectId,
+        buf: &mut Vec<u8>,
+    ) -> Result<bool> {
+        if self.custom_primary.is_some() {
+            return Ok(false);
+        }
+        let Ok(files) = self.primary() else {
+            return Ok(false);
+        };
+        files.read_packed_commit_header_block_into(oid, buf)
     }
 
     #[cold]
@@ -2337,12 +2650,8 @@ impl Odb {
         let primary = self.primary_writable()?;
         let files_primary = self.primary().ok();
         let mut unreadable_local_loose = None;
-        let mut read_primary = || primary.read_into(oid, buf);
-        match if PackStore::read_context_matches_objects_dir(&self.objects_dir) {
-            read_primary()
-        } else {
-            self.with_pack_store_for(&self.objects_dir, read_primary)
-        } {
+        let read_primary = || primary.read_into(oid, buf);
+        match self.with_primary_read_context(read_primary) {
             Ok(Some(kind)) => return Ok(Some(kind)),
             Ok(None) => {}
             Err(err)
@@ -2493,6 +2802,43 @@ impl Odb {
             .ok_or_else(|| Error::ObjectNotFound(oid.to_hex()))
     }
 
+    /// Kind of `oid` when this database stores it, for checks that must not accept an
+    /// object that is only implied.
+    ///
+    /// Header-only like [`Self::read_info_without_fetch`] (no promisor fetch), except that
+    /// the empty tree counts only when a copy is actually stored (the overlay, the primary
+    /// store or an alternate), since `git fsck` reports a ref to an unstored one as missing.
+    ///
+    /// # Errors
+    ///
+    /// Read failures other than a missing object (corrupt headers, I/O, a failing custom
+    /// store).
+    pub(crate) fn stored_object_kind(&self, oid: &ObjectId) -> Result<Option<ObjectKind>> {
+        if oid.is_well_known_empty_tree() && !self.empty_tree_stored(oid) {
+            return Ok(None);
+        }
+        match self.try_read_info_once(oid) {
+            Ok(info) => Ok(info.map(|info| info.kind)),
+            Err(Error::ObjectNotFound(_)) => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
+
+    fn empty_tree_stored(&self, oid: &ObjectId) -> bool {
+        if self.overlay_read(oid).is_some() || self.exists_materialized_local(oid) {
+            return true;
+        }
+        if !self.alternates_enabled {
+            return false;
+        }
+        let file_dirs = self.file_alternate_dirs_snapshot();
+        let env_dirs = self.env_alternate_dirs_snapshot();
+        file_dirs
+            .iter()
+            .chain(env_dirs.iter())
+            .any(|dir| self.with_pack_store_for(dir, || store::local_object_materialized(dir, oid)))
+    }
+
     #[cold]
     #[inline(never)]
     fn read_info_after_promisor_miss(&self, oid: &ObjectId) -> Result<ObjectInfo> {
@@ -2519,7 +2865,7 @@ impl Odb {
     }
 
     fn try_read_info_once(&self, oid: &ObjectId) -> Result<Option<ObjectInfo>> {
-        if oid.is_well_known_empty_tree() {
+        if self.is_empty_tree(oid) {
             return Ok(Some(ObjectInfo {
                 kind: ObjectKind::Tree,
                 size: 0,
@@ -2683,6 +3029,14 @@ impl Odb {
         f: impl FnOnce(ObjectStream<'_>) -> Result<R>,
     ) -> Result<Option<R>> {
         use std::io::Cursor;
+        if self.is_empty_tree(oid) {
+            return f(ObjectStream {
+                kind: ObjectKind::Tree,
+                size: 0,
+                reader: Box::new(std::io::empty()),
+            })
+            .map(Some);
+        }
         if let Some(obj) = self.overlay_read(oid) {
             let size = u64::try_from(obj.data.len()).map_err(|_| {
                 Error::CorruptObject(format!("object size overflow for {}", oid.to_hex()))
@@ -3051,6 +3405,9 @@ impl Odb {
         if let Some(existing) = primary.try_finish_duplicate_write(oid, options)? {
             return Ok(existing);
         }
+        if options.freshen_existing && self.freshen_packed_or_alternate(oid) {
+            return Ok(*oid);
+        }
 
         let already_exists = !(options.trust_new_loose || options.assume_loose_only_existence)
             && self.object_exists_for_write_skip(oid);
@@ -3092,6 +3449,9 @@ impl Odb {
         let primary = self.primary()?;
         if let Some(existing) = primary.try_finish_duplicate_write(oid, options)? {
             return Ok(existing);
+        }
+        if options.freshen_existing && self.freshen_packed_or_alternate(oid) {
+            return Ok(*oid);
         }
         let already_exists = !(options.trust_new_loose || options.assume_loose_only_existence)
             && self.object_exists_for_write_skip(oid);
@@ -3145,6 +3505,9 @@ impl Odb {
         let primary = self.primary()?;
         if let Some(existing) = primary.try_finish_duplicate_write(&oid, options)? {
             return Ok(existing);
+        }
+        if options.freshen_existing && self.freshen_packed_or_alternate(&oid) {
+            return Ok(oid);
         }
 
         let already_exists = !(options.trust_new_loose || options.assume_loose_only_existence)
@@ -3309,13 +3672,7 @@ impl Odb {
     fn touch_object_mtime(&self, path: &Path) -> Option<std::time::SystemTime> {
         #[cfg(test)]
         self.hot_path_test_metrics.record_freshen();
-        // `utime(path, NULL)` sets both atime and mtime to the current time.
-        let now = filetime::FileTime::now();
-        filetime::set_file_times(path, now, now).ok()?;
-        Some(
-            std::time::UNIX_EPOCH
-                + std::time::Duration::new(now.unix_seconds() as u64, now.nanoseconds()),
-        )
+        crate::fs_readonly::set_file_times_now(path)
     }
 }
 
@@ -3491,6 +3848,7 @@ fn superseded_pack_indexes(
     pack_dir: &Path,
     keep_pack: &Path,
     retained_packs: &HashSet<PathBuf>,
+    inventory: &RepackPackInventorySnapshot,
 ) -> Result<Vec<(PathBuf, std::time::SystemTime)>> {
     let keep_stem = keep_pack
         .file_stem()
@@ -3520,9 +3878,10 @@ fn superseded_pack_indexes(
         if !pack_path.is_file() {
             continue;
         }
-        if superseded_pack_has_keep_marker(pack_dir, &pack_path)
+        if inventory.kept_at_inventory.contains(&pack_path)
             || pack_path.with_extension("promisor").is_file()
             || retained_packs.contains(&pack_path)
+            || !inventory.pack_paths.contains(&pack_path)
         {
             continue;
         }
@@ -3534,32 +3893,21 @@ fn superseded_pack_indexes(
     Ok(out)
 }
 
-fn superseded_pack_has_keep_marker(pack_dir: &Path, pack_path: &Path) -> bool {
-    let Some(stem) = pack_path.file_stem().and_then(|s| s.to_str()) else {
-        return false;
-    };
-    pack_dir.join(format!("{stem}.keep")).is_file()
-}
-
-fn oids_in_marker_kept_packs(pack_dir: &Path, keep_pack: &Path) -> Result<OidHashSet> {
+fn oids_in_inventory_kept_packs(
+    pack_dir: &Path,
+    keep_pack: &Path,
+    inventory_kept_packs: &HashSet<PathBuf>,
+) -> Result<OidHashSet> {
     let keep_stem = keep_pack.file_stem().and_then(|s| s.to_str()).unwrap_or("");
     let mut oids = oid_hash_set();
-    if !pack_dir.is_dir() {
-        return Ok(oids);
-    }
-    for entry in fs::read_dir(pack_dir).map_err(Error::Io)? {
-        let entry = entry.map_err(Error::Io)?;
-        let pack_path = entry.path();
-        if pack_path.extension().is_none_or(|e| e != "pack") {
-            continue;
-        }
+    for pack_path in inventory_kept_packs {
         let Some(stem) = pack_path.file_stem().and_then(|s| s.to_str()) else {
             continue;
         };
         if stem == keep_stem {
             continue;
         }
-        if !superseded_pack_has_keep_marker(pack_dir, &pack_path) {
+        if pack_path.parent().is_some_and(|p| p != pack_dir) {
             continue;
         }
         let idx_path = pack_path.with_extension("idx");
@@ -4538,6 +4886,37 @@ mod tests {
             odb.missing_stored_oids([present, absent, alt_oid]).unwrap(),
             vec![absent, alt_oid],
             "stored ignores alternates"
+        );
+    }
+
+    #[test]
+    fn missing_stored_oids_sees_packs_written_since_the_last_probe() {
+        let dir = TempDir::new().unwrap();
+        let odb = Odb::new(dir.path());
+        let other = TempDir::new().unwrap();
+        let source = Odb::new(other.path());
+        let blobs: Vec<ObjectId> = (0..3)
+            .map(|i| {
+                source
+                    .write(ObjectKind::Blob, format!("b{i}").as_bytes())
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(odb.missing_stored_oids(blobs.clone()).unwrap(), blobs);
+        // Another writer adds a pack with two of them.
+        let pack = crate::pack_objects::build_pack_from_send_list(
+            &source,
+            &blobs[..2],
+            &std::collections::HashSet::new(),
+            &crate::pack_objects::PackBuildOptions::default(),
+            &std::collections::HashMap::new(),
+        )
+        .unwrap();
+        crate::index_pack::install_pack_bytes(pack, &Odb::new(dir.path()), &Default::default())
+            .unwrap();
+        assert_eq!(
+            odb.missing_stored_oids(blobs.clone()).unwrap(),
+            vec![blobs[2]]
         );
     }
 

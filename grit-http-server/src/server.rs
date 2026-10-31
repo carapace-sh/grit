@@ -180,6 +180,13 @@ pub struct ServeConfig {
     /// The user database (see [`default_database_path`]).
     pub database: PathBuf,
     /// Environment used to load global and system config for each repository.
+    ///
+    /// A [`RepositoryOptions::promisor_fetcher`] here is given only to upload-pack
+    /// and snapshot-checkout requests that may lazily fetch promised objects
+    /// (`uploadpack.lazyFetch`, `GIT_NO_LAZY_FETCH=0`). Everything else the server
+    /// opens a repository for (clone bundles, pushes, the web pages) gets no
+    /// fetcher, so reading a blob kept on a large-object promisor never pulls it
+    /// back in.
     pub repository_options: RepositoryOptions,
     /// When clone bundles are built ([`crate::bundles`]).
     pub bundles: BundleSettings,
@@ -189,7 +196,11 @@ pub(crate) struct ServerState {
     pub(crate) repositories: Repositories,
     store: Mutex<AuthStore>,
     logins: Mutex<PendingLogins>,
+    /// [`ServeConfig::repository_options`] without the promisor fetcher.
     pub(crate) options: RepositoryOptions,
+    /// [`ServeConfig::repository_options`] as given, for smart-protocol and
+    /// snapshot-checkout requests: they keep the fetcher only when lazy fetch is on.
+    pub(crate) smart_options: RepositoryOptions,
     /// Checked when a sign-in names no user, so it takes as long as a real one.
     pub(crate) stand_in_password: HashedPassword,
     bundles: BundleSettings,
@@ -233,7 +244,11 @@ impl Server {
                 repositories: Repositories::at(&config.root),
                 store: Mutex::new(store),
                 logins: Mutex::new(PendingLogins::default()),
-                options: config.repository_options,
+                options: config
+                    .repository_options
+                    .clone()
+                    .with_promisor_fetcher(None),
+                smart_options: config.repository_options,
                 stand_in_password,
                 bundles: config.bundles,
                 scheduler: Mutex::new(None),
@@ -328,43 +343,6 @@ fn router(state: Arc<ServerState>) -> Router {
         .route(web::USERS_PATH, get(web::users_page).post(web::add_user))
         .route(web::GRANTS_PATH, post(web::grant))
         .route(
-            "/.grit/checkouts/{repo}",
-            get(crate::checkouts::server_info).post(crate::checkouts::create),
-        )
-        .route("/.grit/checkouts/{repo}/{id}", get(crate::checkouts::show))
-        .route(
-            "/.grit/checkouts/{repo}/{id}/checkin",
-            post(crate::checkouts::checkin),
-        )
-        .route(
-            "/.grit/checkouts/{repo}/{id}/update",
-            post(crate::checkouts::update),
-        )
-        .route(
-            "/.grit/checkouts/{repo}/{id}/work",
-            post(crate::checkouts::work_branch),
-        )
-        .route(
-            "/.grit/checkouts/{repo}/{id}/branch",
-            post(crate::checkouts::branch),
-        )
-        .route(
-            "/.grit/checkouts/{repo}/integrate",
-            post(crate::checkouts::integrate_branch),
-        )
-        .route(
-            "/.grit/checkouts/{repo}/slices",
-            get(crate::checkouts::list_slices),
-        )
-        .route(
-            "/.grit/checkouts/{repo}/slices/{slice}",
-            axum::routing::put(crate::checkouts::put_slice).delete(crate::checkouts::delete_slice),
-        )
-        .route(
-            "/.grit/checkouts/{repo}/{id}/bundle",
-            get(crate::checkouts::bundle),
-        )
-        .route(
             "/{*path}",
             get(get_dispatch)
                 .post(post_dispatch)
@@ -372,6 +350,7 @@ fn router(state: Arc<ServerState>) -> Router {
                 .patch(patch_dispatch)
                 .options(options_dispatch),
         )
+        .merge(crate::checkouts::routes::<ServerState>())
         .with_state(state)
 }
 
@@ -529,15 +508,20 @@ impl ServerState {
 }
 
 /// An error response for a request that may not proceed (boxed: responses are large).
-type Rejection = Box<Response<Body>>;
+pub type Rejection = Box<Response<Body>>;
 
-/// A request [`ServerState::authorize`] let through.
-pub(crate) struct Authorized {
-    pub(crate) repo: ServedRepository,
-    pub(crate) access: Access,
-    pub(crate) user_id: i64,
-    /// The signed-in user's email address.
-    pub(crate) email: String,
+/// A request a server let through to a repository.
+#[derive(Debug, Clone)]
+pub struct Authorized {
+    /// The repository, on local disk.
+    pub repo: ServedRepository,
+    /// What the user may do with it.
+    pub access: Access,
+    /// The user's id in the server's user database.
+    pub user_id: i64,
+    /// The signed-in user's email address, which server-made commits are
+    /// signed with.
+    pub email: String,
 }
 
 /// `scheme://host` the client used to reach the server, from `Host` (or the
@@ -593,7 +577,7 @@ async fn get_dispatch(
         repo.path,
         service,
         protocol_version,
-        state.options.clone(),
+        state.smart_options.clone(),
         extensions,
     )
     .await
@@ -732,7 +716,7 @@ async fn post_dispatch(
         protocol_version,
         &headers,
         body,
-        state.options.clone(),
+        state.smart_options.clone(),
         extensions,
     )
     .await;

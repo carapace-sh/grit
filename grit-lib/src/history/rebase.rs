@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::cell::Cell;
 
 use crate::diff::diff_trees;
+use crate::hooks::run_pre_rebase;
 use crate::merge_base::{
     commits_reachable_excluding_ancestors_of, is_ancestor, merge_bases_first_vs_rest,
 };
@@ -22,7 +23,8 @@ use super::plan::{
     plan_rewrite_with_order_resumable, ResumablePlanOutcome,
 };
 use super::types::{
-    CommitEdit, HistoryEdits, RefScope, RewriteOptions, RewritePlan, RewrittenCommit,
+    CommitEdit, HistoryEdits, PlannedRefUpdate, RefScope, RewriteOptions, RewritePlan,
+    RewrittenCommit,
 };
 
 #[cfg(any(test, feature = "unstable-bench-helpers"))]
@@ -65,8 +67,13 @@ pub enum RebasePlan {
     Conflict {
         /// Original commit that could not be replayed cleanly.
         commit: ObjectId,
+        /// First line of that commit's message.
+        subject: String,
         /// Conflicted paths and how they conflicted, sorted by path.
         conflicts: Vec<Conflict>,
+        /// Full names of the other branches whose replay failed, sorted; empty when the
+        /// commit is on the branch being rebased. See [`HistoryError::Conflict`].
+        refs: Vec<String>,
     },
 }
 
@@ -82,7 +89,10 @@ pub struct RebaseOntoOptions {
     /// commit is replayed on top of the previous one, starting at the onto commit, in
     /// topological order. A branch that merged its upstream, or merged a local topic, keeps all
     /// of its own commits and ends on top of the onto commit. All tips are chained into that one
-    /// line, so pass a single tip. When `false`, merges are replayed as merges.
+    /// line, so pass a single tip. When `false`, merges are replayed as merges (like
+    /// `git rebase --rebase-merges`): only the first-parent chain from each tip to the fork
+    /// is reparented onto `onto`; a side branch that forked at the rebase boundary is replayed
+    /// onto the new base, while one that forked inside the range follows its rewritten parent.
     pub flatten_leaf_merges: bool,
     /// Auto-resolve replay conflicts the same way as `git rebase -X ours|theirs`.
     ///
@@ -130,8 +140,13 @@ pub enum RebaseCheckPlan {
     Conflict {
         /// Original commit that could not be replayed cleanly.
         commit: ObjectId,
+        /// First line of that commit's message.
+        subject: String,
         /// Conflicted paths and how they conflicted, sorted by path.
         conflicts: Vec<Conflict>,
+        /// Full names of the other branches whose replay failed, sorted; empty when the
+        /// commit is on the branch being rebased. See [`HistoryError::Conflict`].
+        refs: Vec<String>,
     },
 }
 
@@ -150,12 +165,50 @@ pub fn plan_rebase_check(
 ) -> Result<RebaseCheckPlan, HistoryError> {
     match plan_rebase(repo, request, opts)? {
         RebasePlan::UpToDate => Ok(RebaseCheckPlan::UpToDate),
-        RebasePlan::Conflict { commit, conflicts } => {
-            Ok(RebaseCheckPlan::Conflict { commit, conflicts })
-        }
+        RebasePlan::Conflict {
+            commit,
+            subject,
+            conflicts,
+            refs,
+        } => Ok(RebaseCheckPlan::Conflict {
+            commit,
+            subject,
+            conflicts,
+            refs,
+        }),
         RebasePlan::Plan(plan) => {
             let commits = plan.commits.iter().filter_map(|row| row.new).collect();
             Ok(RebaseCheckPlan::Clean { commits })
+        }
+    }
+}
+
+/// Whether a rebase runs the `pre-rebase` hook before it rewrites anything, and what the hook
+/// is told.
+///
+/// The hook runs once the rebase is known to have work to do (never when the branch is already
+/// up to date) and before any commit is replayed, so a refusal leaves nothing written. A
+/// non-zero exit refuses the rebase.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreRebase {
+    /// Run the hook (Git's default).
+    Run {
+        /// The upstream exactly as the user named it (Git passes the argument, not the resolved
+        /// commit); `None` when the branch's configured upstream was used, which the hook
+        /// receives as its full ref name.
+        upstream: Option<String>,
+    },
+    /// Do not run the hook (`--no-verify`).
+    Skip,
+}
+
+impl PreRebase {
+    pub(crate) fn run(&self, repo: &Repository) -> Result<(), HistoryError> {
+        match self {
+            Self::Run { upstream } => run_pre_rebase(repo, upstream.as_deref())
+                .map(drop)
+                .map_err(|err| HistoryError::from(crate::error::Error::Hook(err))),
+            Self::Skip => Ok(()),
         }
     }
 }
@@ -174,6 +227,23 @@ pub fn plan_rebase(
     request: &RebaseRequest,
     opts: &RebaseOntoOptions,
 ) -> Result<RebasePlan, HistoryError> {
+    plan_rebase_with_hook(repo, request, opts, &PreRebase::Skip)
+}
+
+/// [`plan_rebase`] for a rebase that is about to be applied: runs `pre_rebase` once the branch
+/// is known not to be up to date, before any commit is replayed (Git's order), so a refusal
+/// happens before a replay conflict is found or a new object is written.
+///
+/// # Errors
+///
+/// Same as [`plan_rebase`], plus [`HistoryError::Library`] wrapping
+/// [`crate::error::Error::Hook`] when the hook refuses the rebase or cannot start.
+pub fn plan_rebase_with_hook(
+    repo: &Repository,
+    request: &RebaseRequest,
+    opts: &RebaseOntoOptions,
+    pre_rebase: &PreRebase,
+) -> Result<RebasePlan, HistoryError> {
     let fork = rebase_fork(repo, request.upstream, request.branch_tip)?;
     let effective_onto = request.onto.unwrap_or(request.upstream);
     if request.branch_tip == effective_onto {
@@ -181,6 +251,7 @@ pub fn plan_rebase(
     }
     let range = commits_in_rebase_range(repo, fork, &[request.branch_tip])?;
     if range.is_empty() && is_ancestor(repo, request.branch_tip, effective_onto)? {
+        pre_rebase.run(repo)?;
         return Ok(RebasePlan::Plan(plan_rebase_fast_forward(
             repo,
             request.branch_tip,
@@ -199,6 +270,7 @@ pub fn plan_rebase(
     )? {
         return Ok(RebasePlan::UpToDate);
     }
+    pre_rebase.run(repo)?;
     match rebase_onto_impl(
         repo,
         fork,
@@ -208,9 +280,17 @@ pub fn plan_rebase(
         Some(&range),
     ) {
         Ok(plan) => Ok(RebasePlan::Plan(plan)),
-        Err(HistoryError::Conflict { commit, conflicts }) => {
-            Ok(RebasePlan::Conflict { commit, conflicts })
-        }
+        Err(HistoryError::Conflict {
+            commit,
+            subject,
+            conflicts,
+            refs,
+        }) => Ok(RebasePlan::Conflict {
+            commit,
+            subject,
+            conflicts,
+            refs,
+        }),
         Err(other) => Err(other),
     }
 }
@@ -223,7 +303,8 @@ pub fn plan_rebase(
 /// Merge commits in the range are replayed with updated parents and trees, unless
 /// [`RebaseOntoOptions::flatten_leaf_merges`] linearizes the replay. Under
 /// [`RefScope::Branches`](super::RefScope::Branches),
-/// every local branch whose tip descends from the rewritten range is moved to its replayed tip.
+/// every local branch whose tip descends from the rewritten range is moved to its replayed tip,
+/// except other branches at the same commit as `HEAD`, which keep the pre-rebase history.
 ///
 /// # Errors
 ///
@@ -349,10 +430,16 @@ pub(crate) fn build_rebase_rewrite_inputs(
     let edits = if opts.flatten_leaf_merges {
         linear_rebase_edits(repo, onto, &range, &skip_map, &opts.drop)?
     } else {
-        merge_preserving_rebase_edits(repo, fork, onto, &range, &skip_map)?
+        merge_preserving_rebase_edits(repo, fork, onto, tips, &range, &skip_map)?
     };
 
-    let replay_order = extend_rebase_replay_order(repo, fork, &range, &opts.rewrite, &skip_map)?;
+    let mut replay_order =
+        extend_rebase_replay_order(repo, fork, &range, &opts.rewrite, &skip_map)?;
+    if !opts.flatten_leaf_merges {
+        let range_set: HashSet<ObjectId> = range.iter().copied().collect();
+        let mainline = mainline_commits_in_range(repo, fork, tips, &range_set)?;
+        replay_order = reorder_side_branches_before_mainline(&mainline, &replay_order);
+    }
     Ok((edits, replay_order, range))
 }
 
@@ -393,8 +480,11 @@ fn linear_rebase_edits(
     Ok(edits)
 }
 
-/// Edits that replay `range` onto `onto` keeping its shape: local roots move onto `onto` (or
-/// onto the replayed mainline of the merge that brings them in) and merges are replayed.
+/// Edits that replay `range` onto `onto` keeping its shape: the first-parent chain from each
+/// tip back to `fork` is reparented onto `onto` when its first parent is the fork or outside
+/// the range (even if other merge parents are still in the range); side branches that forked
+/// at the boundary (first parent is the fork) are reparented onto `onto`, and merge commits are
+/// replayed with two parents.
 ///
 /// A commit whose patch is already in `fork..onto` is skipped: what follows it continues from
 /// where the commit itself would have been replayed onto, never from the upstream equivalent.
@@ -402,20 +492,21 @@ fn merge_preserving_rebase_edits(
     repo: &Repository,
     fork: ObjectId,
     onto: ObjectId,
+    tips: &[ObjectId],
     range: &[ObjectId],
     skip_map: &HashMap<ObjectId, ObjectId>,
 ) -> Result<HistoryEdits, HistoryError> {
     let range_set: HashSet<ObjectId> = range.iter().copied().collect();
+    let mainline = mainline_commits_in_range(repo, fork, tips, &range_set)?;
     let mut edits = HistoryEdits::new();
     for &commit in range {
         let parents = commit_parents(repo, commit)?;
-        let is_local_root = parents
-            .iter()
-            .all(|parent| *parent == fork || !range_set.contains(parent));
-        let reparent_onto = if is_local_root {
-            Some(mainline_anchor_for_parallel_root(repo, commit, &range_set)?.unwrap_or(onto))
-        } else {
-            None
+        let first_parent = parents.first().copied();
+        let reparent_onto = match first_parent {
+            Some(fp) if mainline.contains(&commit) && fp == fork => Some(onto),
+            Some(fp) if mainline.contains(&commit) && !range_set.contains(&fp) => Some(onto),
+            Some(fp) if !mainline.contains(&commit) && fp == fork => Some(onto),
+            _ => None,
         };
         if let Some(&existing) = skip_map.get(&commit) {
             let parent = reparent_onto.or(parents.first().copied()).unwrap_or(onto);
@@ -427,6 +518,44 @@ fn merge_preserving_rebase_edits(
         }
     }
     Ok(edits)
+}
+
+/// Replay merged side branches before mainline commits, matching `git rebase --rebase-merges`
+/// (topological order alone can pick a parallel mainline root before its merged topic).
+fn reorder_side_branches_before_mainline(
+    mainline: &HashSet<ObjectId>,
+    replay_order: &[ObjectId],
+) -> Vec<ObjectId> {
+    let side: Vec<ObjectId> = replay_order
+        .iter()
+        .copied()
+        .filter(|commit| !mainline.contains(commit))
+        .collect();
+    let mainline_part: Vec<ObjectId> = replay_order
+        .iter()
+        .copied()
+        .filter(|commit| mainline.contains(commit))
+        .collect();
+    side.into_iter().chain(mainline_part).collect()
+}
+
+/// First-parent commits from each rebase tip back to `fork` (exclusive).
+fn mainline_commits_in_range(
+    repo: &Repository,
+    fork: ObjectId,
+    tips: &[ObjectId],
+    range_set: &HashSet<ObjectId>,
+) -> Result<HashSet<ObjectId>, HistoryError> {
+    let mut mainline = HashSet::new();
+    for &tip in tips {
+        let mut current = tip;
+        while current != fork && range_set.contains(&current) {
+            mainline.insert(current);
+            let parents = commit_parents(repo, current)?;
+            current = parents.first().copied().unwrap_or(fork);
+        }
+    }
+    Ok(mainline)
 }
 
 fn rebase_onto_impl(
@@ -458,11 +587,64 @@ fn rebase_onto_impl(
     Ok(plan)
 }
 
-/// Like [`plan_rebase`], but resumable planning may stop on the first replay conflict.
+/// Replay plan for `--exec` when the branch is already based on the upstream: reuse each commit
+/// in the replay order unchanged so commands run without minting new OIDs until a command rewrites
+/// one (stacked branch tips are included the same way as [`extend_rebase_replay_order`]).
+pub(crate) fn plan_rebase_identity_exec(
+    repo: &Repository,
+    fork: ObjectId,
+    onto: ObjectId,
+    range: &[ObjectId],
+    opts: &RebaseOntoOptions,
+) -> Result<RewritePlan, HistoryError> {
+    let skip_map = HashMap::new();
+    let replay_order = extend_rebase_replay_order(repo, fork, range, &opts.rewrite, &skip_map)?;
+    let mut edits = HistoryEdits::new();
+    let mut previous = onto;
+    for &commit in &replay_order {
+        edits.insert(
+            commit,
+            CommitEdit::Reuse {
+                existing: commit,
+                parent: previous,
+            },
+        );
+        previous = commit;
+    }
+    let mut plan = plan_rewrite_with_order(
+        repo,
+        &edits,
+        &opts.rewrite,
+        Some(&replay_order),
+        Some(onto),
+        opts.favor,
+    )?;
+    plan.head.checkout_onto = Some(onto);
+    // Identity mapping leaves `plan_ref_updates` empty; seed every scoped ref so
+    // [`super::exec::ExecRewrites::finish`] can remap stacked tips after amending commands.
+    if let Some(&oldest) = replay_order.first() {
+        let scoped = collect_scoped_refs(repo, &opts.rewrite, oldest)?;
+        for (name, old) in scoped {
+            if plan.ref_updates.iter().any(|update| update.name == name) {
+                continue;
+            }
+            plan.ref_updates.push(PlannedRefUpdate {
+                name,
+                old,
+                new: old,
+            });
+        }
+        plan.ref_updates.sort_by(|a, b| a.name.cmp(&b.name));
+    }
+    Ok(plan)
+}
+
+/// Like [`plan_rebase_with_hook`], but resumable planning may stop on the first replay conflict.
 pub(crate) fn plan_rebase_resumable(
     repo: &Repository,
     request: &RebaseRequest,
     opts: &RebaseOntoOptions,
+    pre_rebase: &PreRebase,
 ) -> Result<Result<ResumablePlanOutcome, RebasePlan>, HistoryError> {
     let fork = rebase_fork(repo, request.upstream, request.branch_tip)?;
     let effective_onto = request.onto.unwrap_or(request.upstream);
@@ -471,6 +653,7 @@ pub(crate) fn plan_rebase_resumable(
     }
     let range = commits_in_rebase_range(repo, fork, &[request.branch_tip])?;
     if range.is_empty() && is_ancestor(repo, request.branch_tip, effective_onto)? {
+        pre_rebase.run(repo)?;
         let plan = plan_rebase_fast_forward(repo, request.branch_tip, effective_onto, opts)?;
         return Ok(Ok(ResumablePlanOutcome::Complete(Box::new(plan))));
     }
@@ -485,6 +668,7 @@ pub(crate) fn plan_rebase_resumable(
     )? {
         return Ok(Err(RebasePlan::UpToDate));
     }
+    pre_rebase.run(repo)?;
     let tips = [request.branch_tip];
     let (edits, replay_order, range) =
         build_rebase_rewrite_inputs(repo, fork, effective_onto, &tips, opts, Some(&range))?;
@@ -497,6 +681,7 @@ pub(crate) fn plan_rebase_resumable(
         &opts.rewrite,
         Some(&replay_order),
         opts.flatten_leaf_merges.then_some(effective_onto),
+        opts.favor,
     )?;
     if let ResumablePlanOutcome::Complete(plan) = &mut outcome {
         plan.head.checkout_onto = Some(effective_onto);
@@ -504,7 +689,10 @@ pub(crate) fn plan_rebase_resumable(
     Ok(Ok(outcome))
 }
 
-/// Include sibling branch tips (same parent in the rebase range) when updating all descendant refs.
+/// Append commits on scoped branch tips that descend from the rebase range but are not in it.
+///
+/// Stacked branches often carry more than one commit above the checked-out branch; those commits
+/// must replay after the primary range so ref updates stay on the rewritten tips.
 fn extend_rebase_replay_order(
     repo: &Repository,
     fork: ObjectId,
@@ -518,48 +706,66 @@ fn extend_rebase_replay_order(
     if matches!(opts.scope, RefScope::Head) {
         return Ok(range.to_vec());
     }
-    let mut order = range.to_vec();
-    let mut in_order: HashSet<ObjectId> = order.iter().copied().collect();
+    let range_set: HashSet<ObjectId> = range.iter().copied().collect();
     let oldest = range[0];
     let scoped = collect_scoped_refs(repo, opts, oldest)?;
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for (_, tip) in &scoped {
-            if in_order.contains(tip) || skip_map.contains_key(tip) {
-                continue;
-            }
-            let parents = commit_parents(repo, *tip)?;
-            if parents
-                .iter()
-                .all(|parent| *parent == fork || in_order.contains(parent))
-            {
-                order.push(*tip);
-                in_order.insert(*tip);
-                changed = true;
-            }
+
+    let mut extra = HashSet::new();
+    for (_, tip) in &scoped {
+        if skip_map.contains_key(tip) || range_set.contains(tip) {
+            continue;
+        }
+        extra.extend(stacked_commits_above_range(
+            repo, *tip, &range_set, fork, skip_map,
+        )?);
+    }
+
+    if extra.is_empty() {
+        return Ok(range.to_vec());
+    }
+
+    let extra_vec: Vec<ObjectId> = extra.into_iter().collect();
+    let mut appended = topo_order_commit_subset(repo, &extra_vec, true)?;
+    appended.reverse();
+
+    let mut order = range.to_vec();
+    let mut in_order = range_set;
+    for oid in appended {
+        if in_order.insert(oid) {
+            order.push(oid);
         }
     }
     Ok(order)
 }
 
-/// When `commit` is the tip of a side branch merged into the range, return the first parent
-/// of that merge on the mainline so the side replay chains onto the replayed mainline commit.
-fn mainline_anchor_for_parallel_root(
+/// Commits reachable from `tip` that descend from the rewritten range but are not part of it.
+///
+/// Unrelated parents of a stacked merge (orphan roots, etc.) are excluded even when they appear
+/// first in the parent list; those parents stay unmapped when the merge is replayed.
+fn stacked_commits_above_range(
+    repo: &Repository,
+    tip: ObjectId,
+    range_set: &HashSet<ObjectId>,
+    fork: ObjectId,
+    skip_map: &HashMap<ObjectId, ObjectId>,
+) -> Result<Vec<ObjectId>, HistoryError> {
+    let mut reachable = commits_reachable_excluding_ancestors_of(repo, &[tip], &[fork], None)?;
+    reachable.retain(|oid| *oid != fork && !range_set.contains(oid) && !skip_map.contains_key(oid));
+    reachable.retain(|oid| descends_from_rewritten_range(repo, *oid, range_set));
+    Ok(reachable)
+}
+
+fn descends_from_rewritten_range(
     repo: &Repository,
     commit: ObjectId,
     range_set: &HashSet<ObjectId>,
-) -> Result<Option<ObjectId>, HistoryError> {
-    for &merge_oid in range_set {
-        let parents = commit_parents(repo, merge_oid)?;
-        if parents.len() >= 2 && parents[1] == commit {
-            return Ok(Some(parents[0]));
-        }
-    }
-    Ok(None)
+) -> bool {
+    range_set
+        .iter()
+        .any(|&range_commit| is_ancestor(repo, range_commit, commit).unwrap_or(false))
 }
 
-fn commits_in_rebase_range(
+pub(crate) fn commits_in_rebase_range(
     repo: &Repository,
     fork: ObjectId,
     tips: &[ObjectId],
@@ -587,7 +793,7 @@ fn paths_changed_by_commit(
     let mut parent_trees = parsed
         .parents
         .iter()
-        .map(|parent| Ok(Some(parse_commit(&repo.odb().read(parent)?.data)?.tree)))
+        .map(|parent| Ok(Some(repo.odb().commit_tree(parent)?)))
         .collect::<Result<Vec<_>, HistoryError>>()?;
     if parent_trees.is_empty() {
         // A root commit adds its whole tree; `None` diffs against the empty tree.

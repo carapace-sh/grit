@@ -14,17 +14,19 @@
 //! - [`compute_patch_ids_from_text`] parses unified diff text from stdin (e.g.
 //!   output of `git log -p` or `git diff-tree --patch --stdin`), matching the
 //!   behaviour of `git patch-id`.
-
-use similar::{ChangeTag, TextDiff};
+//!
+//! Non-UTF-8 bytes in text blobs are decoded with the same lossy UTF-8 rules as
+//! [`crate::diff::structured`] text diffs so context lines stay aligned with `git diff`.
 
 use crate::diff::{
-    diff_trees_with_renames, unified_diff_histogram_with_prefix_and_funcname, zero_oid, DiffEntry,
-    DiffStatus,
+    diff_trees_with_renames, gitlink_line, structured::text_bytes_for_diff,
+    unified_diff_with_prefix_and_funcname, unified_hunk_body_for_diff_options, zero_oid, DiffEntry,
+    DiffOptions, DiffStatus,
 };
 use crate::error::Result;
 use crate::hash::ChecksumHasher;
 use crate::merge_file;
-use crate::objects::{CommitRef, HashAlgo, ObjectId, ObjectKind};
+use crate::objects::{CommitRef, FileMode, HashAlgo, ObjectId, ObjectKind};
 use crate::odb::Odb;
 
 const PATCH_ID_DIGEST_MAX: usize = 32;
@@ -293,18 +295,25 @@ fn text_flush_one_hunk(
     }
 }
 
-/// Hash `raw` bytes into `ctx`, skipping ASCII whitespace.
+/// Whether patch-ID hashing drops `b`: space, tab, LF and CR only.
 ///
-/// Returns the number of non-whitespace bytes fed to the hasher.
+/// Form feed and vertical tab are kept, so a line differing only by one hashes differently,
+/// as in `git patch-id`.
+fn is_patch_id_space(b: &u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | b'\r')
+}
+
+/// Hash `raw` bytes into `ctx`, skipping [`is_patch_id_space`] bytes.
+///
+/// Returns the number of bytes fed to the hasher.
 fn hash_without_whitespace(ctx: &mut ChecksumHasher, raw: &[u8]) -> usize {
-    let mut count = 0;
-    for &b in raw {
-        if !b.is_ascii_whitespace() {
-            ctx.update(&[b]);
-            count += 1;
-        }
-    }
-    count
+    raw.split(is_patch_id_space)
+        .filter(|run| !run.is_empty())
+        .map(|run| {
+            ctx.update(run);
+            run.len()
+        })
+        .sum()
 }
 
 /// Parse a full hex OID at the start of `s` for `algo`.
@@ -404,10 +413,14 @@ fn split_lines_with_nl(input: &[u8]) -> Vec<&[u8]> {
 ///
 /// Returns `None` for merge commits (more than one parent), since those do not
 /// have a well-defined single-parent diff.  Root commits (no parents) are
-/// compared against the empty tree. Text diffs use unified hunks with three
-/// context lines on each side, matching `git show --format= --no-ext-diff -U3`
-/// piped to `git patch-id` in the corresponding mode. Unchanged lines outside
-/// those hunks do not contribute to the ID.
+/// compared against the empty tree. Text diffs use the hunks of Git's default
+/// diff (Myers with change-compact and the indent heuristic, three context
+/// lines on each side), so the ID matches `git show --format= --no-ext-diff`
+/// piped to `git patch-id` in the corresponding mode, including where an
+/// ambiguous insertion or deletion is placed. Unchanged lines outside those
+/// hunks do not contribute to the ID. A gitlink side is hashed as its
+/// `Subproject commit <oid>` line without reading the submodule commit, and a
+/// type change is hashed as a deletion followed by an addition.
 ///
 /// # Parameters
 ///
@@ -419,6 +432,9 @@ fn split_lines_with_nl(input: &[u8]) -> Vec<&[u8]> {
 /// # Errors
 ///
 /// Returns errors from object-database reads or object-parse failures.
+///
+/// Text blobs that are not valid UTF-8 are still diffed (lossy decode), matching
+/// `git diff` and `git patch-id` on the same commit.
 pub fn compute_patch_id(
     algo: HashAlgo,
     odb: &Odb,
@@ -492,8 +508,10 @@ fn compute_patch_id_filtered(
     if diffs.is_empty() {
         return Ok(None);
     }
+    let mut diffs = split_type_changes(diffs);
 
     // Sort by primary path (lexicographic), matching diffcore_std ordering.
+    // The sort is stable, so a split type change keeps its deletion first.
     diffs.sort_by(|a, b| a.path().cmp(b.path()));
 
     if mode == PatchIdMode::Verbatim {
@@ -505,8 +523,7 @@ fn compute_patch_id_filtered(
     if diffs.len() == 1 {
         let entry = &diffs[0];
         if entry.old_oid != entry.new_oid {
-            let old_bytes = read_blob(odb, &entry.old_oid)?;
-            let new_bytes = read_blob(odb, &entry.new_oid)?;
+            let (old_bytes, new_bytes) = read_sides(odb, entry)?;
             if merge_file::is_binary(&old_bytes) || merge_file::is_binary(&new_bytes) {
                 let mut patch = Vec::new();
                 patch_id_write_line(&mut patch, &format!("commit {}", commit_oid.to_hex()));
@@ -518,31 +535,55 @@ fn compute_patch_id_filtered(
     }
 
     let mut result = [0u8; PATCH_ID_DIGEST_MAX];
-    let mut rolling_ctx = ChecksumHasher::new(algo);
-
+    let mut ctx = ChecksumHasher::new(algo);
+    // Stable IDs split only where a file's hunks or binary line end, so a
+    // header-only entry (empty file, mode change, pure rename) shares one
+    // digest with the entry that follows it.
+    let mut ended_with_body = false;
     for entry in &diffs {
-        if per_file_flush {
-            let mut ctx = ChecksumHasher::new(algo);
-            patch_id_hash_diff_entry(odb, entry, &mut ctx)?;
+        if per_file_flush && ended_with_body {
             text_flush_one_hunk(&mut result[..digest_len], digest_len, &mut ctx, algo);
-        } else {
-            patch_id_hash_diff_entry(odb, entry, &mut rolling_ctx)?;
         }
+        patch_id_hash_diff_entry(odb, entry, &mut ctx)?;
+        ended_with_body = patch_id_has_content_diff(entry);
     }
-
-    if !per_file_flush {
-        text_flush_one_hunk(
-            &mut result[..digest_len],
-            digest_len,
-            &mut rolling_ctx,
-            algo,
-        );
-    }
+    text_flush_one_hunk(&mut result[..digest_len], digest_len, &mut ctx, algo);
 
     if result.iter().take(digest_len).all(|&b| b == 0) {
         return Ok(None);
     }
     ObjectId::from_bytes(&result[..digest_len]).map(Some)
+}
+
+/// Replace each type change (e.g. file to symlink or gitlink) with a deletion
+/// followed by an addition of the same path, the two file diffs `git show`
+/// prints for it.
+fn split_type_changes(diffs: Vec<DiffEntry>) -> Vec<DiffEntry> {
+    if diffs.iter().all(|e| e.status != DiffStatus::TypeChanged) {
+        return diffs;
+    }
+    let mut out = Vec::with_capacity(diffs.len());
+    for entry in diffs {
+        if entry.status != DiffStatus::TypeChanged {
+            out.push(entry);
+            continue;
+        }
+        out.push(DiffEntry {
+            status: DiffStatus::Deleted,
+            new_path: None,
+            new_mode: FileMode::ABSENT,
+            new_oid: zero_oid(),
+            ..entry.clone()
+        });
+        out.push(DiffEntry {
+            status: DiffStatus::Added,
+            old_path: None,
+            old_mode: FileMode::ABSENT,
+            old_oid: zero_oid(),
+            ..entry
+        });
+    }
+    out
 }
 
 fn diff_entry_matches_paths(entry: &DiffEntry, paths: &[String]) -> bool {
@@ -685,12 +726,11 @@ fn patch_id_append_git_show_entry(odb: &Odb, entry: &DiffEntry, out: &mut Vec<u8
         ),
     );
 
-    if entry.old_oid == entry.new_oid {
+    if !patch_id_has_content_diff(entry) {
         return Ok(());
     }
 
-    let old_bytes = read_blob(odb, &entry.old_oid)?;
-    let new_bytes = read_blob(odb, &entry.new_oid)?;
+    let (old_bytes, new_bytes) = read_sides(odb, entry)?;
 
     if merge_file::is_binary(&old_bytes) || merge_file::is_binary(&new_bytes) {
         let old_side = if old_mode == 0 {
@@ -710,8 +750,8 @@ fn patch_id_append_git_show_entry(odb: &Odb, entry: &DiffEntry, out: &mut Vec<u8
         return Ok(());
     }
 
-    let old_str = std::str::from_utf8(&old_bytes).unwrap_or("");
-    let new_str = std::str::from_utf8(&new_bytes).unwrap_or("");
+    let old_str = text_bytes_for_diff(&old_bytes);
+    let new_str = text_bytes_for_diff(&new_bytes);
     let old_path = if old_mode == 0 {
         "/dev/null".to_owned()
     } else {
@@ -722,11 +762,31 @@ fn patch_id_append_git_show_entry(odb: &Odb, entry: &DiffEntry, out: &mut Vec<u8
     } else {
         format!("b/{git_new}")
     };
-    let unified = unified_diff_histogram_with_prefix_and_funcname(
-        old_str, new_str, &old_path, &new_path, 3, 0, "", "", None, false, false,
+    let unified = unified_diff_with_prefix_and_funcname(
+        old_str.as_ref(),
+        new_str.as_ref(),
+        &old_path,
+        &new_path,
+        3,
+        0,
+        "",
+        "",
+        None,
+        true,
+        false,
     );
     out.extend_from_slice(unified.as_bytes());
     Ok(())
+}
+
+/// Whether `git show` prints `---`/`+++` lines and a body for `entry`.
+///
+/// Git prints only the header block when the content is unchanged or when
+/// both sides are empty (adding or deleting an empty file), and that
+/// header block is all the patch ID covers.
+fn patch_id_has_content_diff(entry: &DiffEntry) -> bool {
+    let empty = |oid: &ObjectId| oid.is_zero() || oid.is_empty_blob();
+    entry.old_oid != entry.new_oid && !(empty(&entry.old_oid) && empty(&entry.new_oid))
 }
 
 /// Hash one tree diff entry into `ctx` (rename or regular file).
@@ -784,12 +844,11 @@ fn patch_id_hash_file_entry_into_ctx(
         patch_id_add_mode(ctx, new_mode);
     }
 
-    if entry.old_oid == entry.new_oid {
+    if !patch_id_has_content_diff(entry) {
         return Ok(());
     }
 
-    let old_bytes = read_blob(odb, &entry.old_oid)?;
-    let new_bytes = read_blob(odb, &entry.new_oid)?;
+    let (old_bytes, new_bytes) = read_sides(odb, entry)?;
 
     if merge_file::is_binary(&old_bytes) || merge_file::is_binary(&new_bytes) {
         let a = patch_id_index_oid(&entry.old_oid);
@@ -797,8 +856,8 @@ fn patch_id_hash_file_entry_into_ctx(
         ctx.update(a.as_bytes());
         ctx.update(b.as_bytes());
     } else {
-        let old_str = std::str::from_utf8(&old_bytes).unwrap_or("");
-        let new_str = std::str::from_utf8(&new_bytes).unwrap_or("");
+        let old_str = text_bytes_for_diff(&old_bytes);
+        let new_str = text_bytes_for_diff(&new_bytes);
 
         if old_mode == 0 {
             patch_id_add_string(ctx, b"---/dev/null");
@@ -815,7 +874,7 @@ fn patch_id_hash_file_entry_into_ctx(
             ctx.update(&new_path_buf[..len2]);
         }
 
-        patch_id_hash_text_hunks(ctx, old_str, new_str);
+        patch_id_hash_text_hunks(ctx, old_str.as_ref(), new_str.as_ref());
     }
     Ok(())
 }
@@ -858,63 +917,48 @@ fn patch_id_hash_rename_entry_into_ctx(
     }
 
     if entry.old_oid != entry.new_oid {
-        let old_bytes = read_blob(odb, &entry.old_oid)?;
-        let new_bytes = read_blob(odb, &entry.new_oid)?;
+        let (old_bytes, new_bytes) = read_sides(odb, entry)?;
         if merge_file::is_binary(&old_bytes) || merge_file::is_binary(&new_bytes) {
             let a = entry.old_oid.to_hex();
             let b = entry.new_oid.to_hex();
             ctx.update(a.as_bytes());
             ctx.update(b.as_bytes());
         } else {
-            let old_str = std::str::from_utf8(&old_bytes).unwrap_or("");
-            let new_str = std::str::from_utf8(&new_bytes).unwrap_or("");
+            let old_str = text_bytes_for_diff(&old_bytes);
+            let new_str = text_bytes_for_diff(&new_bytes);
             patch_id_add_string(ctx, b"---a/");
             ctx.update(&old_path_buf[..len1]);
             patch_id_add_string(ctx, b"+++b/");
             ctx.update(&new_path_buf[..len2]);
-            patch_id_hash_text_hunks(ctx, old_str, new_str);
+            patch_id_hash_text_hunks(ctx, old_str.as_ref(), new_str.as_ref());
         }
     }
 
     Ok(())
 }
 
+/// Hash the context, removed and added lines of the default `git diff` hunks
+/// (Myers, change-compact and indent heuristic, `-U3`), whitespace stripped.
+///
+/// Slidable insertions and deletions have several equally short placements;
+/// the ID only matches Git's when the hunk lines come out in Git's order.
 fn patch_id_hash_text_hunks(ctx: &mut ChecksumHasher, old_str: &str, new_str: &str) {
-    let diff = TextDiff::from_lines(old_str, new_str);
-    // Hash ordinary unified hunks, retaining nearby context without including
-    // unchanged portions of the file outside those hunks.
-    for change in diff
-        .grouped_ops(3)
-        .iter()
-        .flatten()
-        .flat_map(|op| diff.iter_changes(op))
-    {
-        let prefix = match change.tag() {
-            ChangeTag::Equal => b' ',
-            ChangeTag::Delete => b'-',
-            ChangeTag::Insert => b'+',
-        };
-        let text = change.as_str().unwrap_or("");
-        for piece in text.split_inclusive('\n') {
-            let line_body = piece.strip_suffix('\n').unwrap_or(piece);
-            let mut line_buf = Vec::with_capacity(1 + line_body.len() + 1);
-            line_buf.push(prefix);
-            line_buf.extend_from_slice(line_body.as_bytes());
-            line_buf.push(b'\n');
-            let n = remove_space_bytes(&mut line_buf);
-            ctx.update(&line_buf[..n]);
+    let body = unified_hunk_body_for_diff_options(old_str, new_str, &DiffOptions::default());
+    for line in body.split_inclusive('\n') {
+        if matches!(line.as_bytes().first(), Some(b' ' | b'-' | b'+')) {
+            hash_without_whitespace(ctx, line.as_bytes());
         }
     }
 }
 
-/// Strip ASCII whitespace in-place; returns new length (prefix of `buf` is valid).
+/// Strip [`is_patch_id_space`] bytes in-place; returns new length (prefix of `buf` is valid).
 fn remove_space_bytes(buf: &mut [u8]) -> usize {
     let mut dst = 0usize;
     let mut src = 0usize;
     while src < buf.len() {
         let c = buf[src];
         src += 1;
-        if !c.is_ascii_whitespace() {
+        if !is_patch_id_space(&c) {
             buf[dst] = c;
             dst += 1;
         }
@@ -922,15 +966,25 @@ fn remove_space_bytes(buf: &mut [u8]) -> usize {
     dst
 }
 
-/// Read a blob's raw bytes from the ODB.
+/// The content each side of `entry` contributes to its patch, as `(old, new)`.
 ///
-/// Returns an empty `Vec` for the zero OID (representing an absent file).
-fn read_blob(odb: &Odb, oid: &ObjectId) -> Result<Vec<u8>> {
-    if *oid == zero_oid() {
-        return Ok(Vec::new());
-    }
-    let obj = odb.read(oid)?;
-    Ok(obj.data)
+/// A blob side is read from the ODB and the zero OID (an absent side) is empty.
+/// A gitlink side is its `Subproject commit` line, never an object read: the
+/// submodule's commit lives in another repository.
+fn read_sides(odb: &Odb, entry: &DiffEntry) -> Result<(Vec<u8>, Vec<u8>)> {
+    let read_side = |mode: FileMode, oid: &ObjectId| -> Result<Vec<u8>> {
+        if mode == FileMode::GITLINK {
+            return Ok(gitlink_line(oid).into_bytes());
+        }
+        if *oid == zero_oid() {
+            return Ok(Vec::new());
+        }
+        Ok(odb.read(oid)?.data)
+    };
+    Ok((
+        read_side(entry.old_mode, &entry.old_oid)?,
+        read_side(entry.new_mode, &entry.new_oid)?,
+    ))
 }
 
 #[cfg(test)]
@@ -1000,6 +1054,54 @@ mod tests {
             ctx.finalize(),
             HashAlgo::Sha1.checksum_digest(b"567-8+first91011-12+second131415")
         );
+    }
+
+    #[test]
+    fn text_hunks_place_slidable_insertion_like_git_diff() {
+        let mut ctx = ChecksumHasher::new(HashAlgo::Sha1);
+        patch_id_hash_text_hunks(
+            &mut ctx,
+            "a\nb\n\n#t\nfn e\nx\ny\n",
+            "a\nb\n\n#t\nfn c\n#t\nfn e\nx\ny\n",
+        );
+        assert_eq!(
+            ctx.finalize(),
+            HashAlgo::Sha1.checksum_digest(b"ab+#t+fnc#tfnex")
+        );
+    }
+
+    #[test]
+    fn text_hunks_do_not_slide_across_missing_final_newline() {
+        let mut ctx = ChecksumHasher::new(HashAlgo::Sha1);
+        patch_id_hash_text_hunks(
+            &mut ctx,
+            "{\n  \"a\": 1\n}\n",
+            "{\n  \"a\": 2\n}\n{\n  \"b\": 2\n}",
+        );
+        assert_eq!(
+            ctx.finalize(),
+            HashAlgo::Sha1.checksum_digest(b"{-\"a\":1+\"a\":2}+{+\"b\":2+}")
+        );
+    }
+
+    #[test]
+    fn hash_without_whitespace_skips_every_ascii_space() {
+        let mut ctx = ChecksumHasher::new(HashAlgo::Sha1);
+        assert_eq!(hash_without_whitespace(&mut ctx, b" \t+a b\r\nc  \n"), 4);
+        assert_eq!(ctx.finalize(), HashAlgo::Sha1.checksum_digest(b"+abc"));
+    }
+
+    #[test]
+    fn hash_without_whitespace_keeps_form_feed_and_vertical_tab() {
+        let mut ctx = ChecksumHasher::new(HashAlgo::Sha1);
+        assert_eq!(hash_without_whitespace(&mut ctx, b"+4\x0c+ \x0b\n"), 5);
+        assert_eq!(
+            ctx.finalize(),
+            HashAlgo::Sha1.checksum_digest(b"+4\x0c+\x0b")
+        );
+        let mut path = *b"a/\x0cf b";
+        assert_eq!(remove_space_bytes(&mut path), 5);
+        assert_eq!(&path[..5], b"a/\x0cfb");
     }
 
     #[cfg_attr(
@@ -1286,6 +1388,152 @@ mod tests {
             compute_patch_id(HashAlgo::Sha1, &repo.odb(), &merge_tip, PatchIdMode::Stable)
                 .expect("merge")
                 .is_none()
+        );
+    }
+
+    fn git_show_patch_id(dir: &std::path::Path, commit: &str, mode_flag: &str) -> ObjectId {
+        use std::io::Write;
+        let show = git_in(dir, &["show", commit]);
+        let mut child = Command::new("git")
+            .current_dir(dir)
+            .args(["patch-id", mode_flag])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn git patch-id");
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(show.as_bytes())
+            .expect("write show");
+        let out = child.wait_with_output().expect("wait");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let hex = stdout.split_whitespace().next().expect("patch id");
+        ObjectId::from_hex(hex).expect("patch hex")
+    }
+
+    #[cfg_attr(
+        not(feature = "full-tests"),
+        ignore = "starts system git or is heavy; run with --features full-tests"
+    )]
+    #[test]
+    fn empty_file_add_and_delete_patch_ids_match_git() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path();
+        git_in(path, &["init", "-q", "--initial-branch=main", "."]);
+        std::fs::write(path.join("a"), b"a\n").unwrap();
+        git_in(path, &["add", "a"]);
+        git_in(path, &["commit", "-q", "-m", "c1"]);
+
+        let mut commits = Vec::new();
+        let mut commit = |label: &str| {
+            git_in(path, &["commit", "-q", "-m", label]);
+            commits.push((label.to_owned(), git_in(path, &["rev-parse", "HEAD"])));
+        };
+        std::fs::write(path.join("empty"), b"").unwrap();
+        git_in(path, &["add", "empty"]);
+        commit("add empty");
+        git_in(path, &["rm", "-q", "empty"]);
+        commit("delete empty");
+        std::fs::write(path.join("run"), b"").unwrap();
+        git_in(path, &["add", "--chmod=+x", "run"]);
+        commit("add empty executable");
+        std::fs::write(path.join("a"), b"a\nb\n").unwrap();
+        std::fs::write(path.join("z-empty"), b"").unwrap();
+        git_in(path, &["add", "a", "z-empty"]);
+        commit("edit and add empty");
+        std::fs::write(path.join("0-empty"), b"").unwrap();
+        std::fs::write(path.join("a"), b"a\nb\nc\n").unwrap();
+        git_in(path, &["add", "0-empty", "a"]);
+        commit("add empty before edit");
+        git_in(path, &["rm", "-q", "0-empty", "z-empty"]);
+        std::fs::write(path.join("b"), b"b\n").unwrap();
+        git_in(path, &["add", "b"]);
+        commit("delete empties around add");
+        git_in(path, &["update-index", "--chmod=+x", "a"]);
+        std::fs::write(path.join("b"), b"b\nc\n").unwrap();
+        git_in(path, &["add", "b"]);
+        commit("mode change before edit");
+        git_in(path, &["mv", "a", "0-moved"]);
+        std::fs::write(path.join("b"), b"b\nc\nd\n").unwrap();
+        git_in(path, &["add", "b"]);
+        commit("pure rename before edit");
+        std::fs::write(path.join("b"), b"").unwrap();
+        git_in(path, &["add", "b"]);
+        commit("truncate to empty");
+
+        let repo = crate::repo::Repository::open(
+            &path.join(".git"),
+            &RepositoryOptions::empty().with_work_tree(path),
+        )
+        .unwrap();
+        for (label, hex) in &commits {
+            let oid: ObjectId = hex.trim().parse().expect("commit oid");
+            for (mode, flag) in [
+                (PatchIdMode::Stable, "--stable"),
+                (PatchIdMode::Unstable, "--unstable"),
+                (PatchIdMode::Verbatim, "--verbatim"),
+            ] {
+                let grit = compute_patch_id(HashAlgo::Sha1, &repo.odb(), &oid, mode)
+                    .expect("patch id")
+                    .expect("non-merge commit");
+                let git = git_show_patch_id(path, hex.trim(), flag);
+                assert_eq!(grit, git, "{label} {flag}");
+            }
+        }
+    }
+
+    #[test]
+    fn stable_patch_id_matches_git_with_invalid_utf8_in_unchanged_context() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path();
+        git_in(path, &["init", "-q", "--initial-branch=main", "."]);
+        let mut base = Vec::new();
+        for i in 0..420 {
+            base.extend_from_slice(format!("line{i}\n").as_bytes());
+        }
+        base.extend_from_slice(b"context one\n");
+        base.extend_from_slice(b"invalid \xF8 in line\n");
+        base.extend_from_slice(b"context two\n");
+        base.extend_from_slice(b"near end one\n");
+        base.extend_from_slice(b"near end two\n");
+        base.extend_from_slice(b"near end three\n");
+        base.extend_from_slice(b"\n");
+        base.extend_from_slice(b"test_done\n");
+
+        let mut new = base.clone();
+        let insert_at = base.len() - b"test_done\n".len();
+        new.splice(
+            insert_at..insert_at,
+            b"inserted one\ninserted two\ninserted three\ninserted four\ninserted five\ninserted six\n"
+                .iter()
+                .copied(),
+        );
+
+        std::fs::write(path.join("f"), &base).unwrap();
+        git_in(path, &["add", "f"]);
+        git_in(path, &["commit", "-q", "-m", "base"]);
+        std::fs::write(path.join("f"), &new).unwrap();
+        git_in(path, &["add", "f"]);
+        git_in(path, &["commit", "-q", "-m", "change"]);
+
+        let commit: ObjectId = git_in(path, &["rev-parse", "HEAD"])
+            .trim()
+            .parse()
+            .expect("commit oid");
+        let repo = crate::repo::Repository::open(
+            &path.join(".git"),
+            &RepositoryOptions::empty().with_work_tree(path),
+        )
+        .expect("open repo");
+        let grit = compute_patch_id(HashAlgo::Sha1, &repo.odb(), &commit, PatchIdMode::Stable)
+            .expect("patch id")
+            .expect("non-empty patch");
+        let git = git_show_patch_id(path, commit.to_hex().as_str(), "--stable");
+        assert_eq!(
+            grit, git,
+            "stable patch-id with invalid utf8 in unchanged context"
         );
     }
 }

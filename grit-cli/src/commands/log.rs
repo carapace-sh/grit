@@ -1,10 +1,14 @@
 //! `grit log` — the recent history reachable from HEAD.
 //!
-//! Deliberately minimal: it shows one page of commits (newest first) and, when
-//! there's more, prints the command to fetch the next page.
+//! For scripts and agents (`--json`, `--markdown`, or output that is not a terminal) it
+//! shows one page of commits, newest first, and when there's more, a `--cursor` token for
+//! the next page. On a terminal it shows the whole history through the pager.
 
 use anyhow::{bail, Context, Result};
-use grit_lib::diff::{CommitFilesManyInput, CommitFilesManyOptions, DiffOptions};
+use grit_lib::diff::{
+    CommitFilesManyInput, CommitFilesManyOptions, DiffDetail, DiffOptions, DiffTotals,
+};
+use grit_lib::gitbutler::GitButlerWorkspace;
 use grit_lib::objects::ObjectId;
 use grit_lib::porcelain::log::CommitReuse;
 use grit_lib::revwalk::graph::{
@@ -32,8 +36,9 @@ use crate::context::{self, CommitSummary};
 use crate::diff_format::DiffFormatArgs;
 use crate::diff_render::{render_stat, use_color};
 use crate::log_display::{
-    decorate_commit_row, render_author_groups_human, render_author_groups_markdown,
-    render_oneline_from_summary, render_oneline_line, render_oneline_oid_subject,
+    decorate_commit_row, format_decorations_folded, render_author_groups_human,
+    render_author_groups_markdown, render_oneline_from_summary, render_oneline_line,
+    render_oneline_oid_subject,
 };
 use crate::markdown;
 use crate::output::{outln, CommitJson, HumanRender, MarkdownRender, OutputMode, RenderContext};
@@ -42,7 +47,38 @@ use crate::rev_select::{self, RevSelectArgs};
 use crate::ui;
 
 /// How many commits to show per page when the caller does not set `-n` / `--max-count`.
-const PAGE: usize = 10;
+const PAGE: usize = 20;
+
+/// How many commits one `grit log` run lists when `-n` / `--max-count` is not given.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LogPage {
+    /// One page of [`PAGE`] commits and a `--cursor` token for the next (scripts, agents).
+    ///
+    /// Walks that cannot resume from a cursor (path limits, commit filters) list every
+    /// match, except `--graph`, which stops at a page.
+    Paged,
+    /// Batches of this many commits for [`LogStream`], resumed from the walk itself instead of
+    /// a token. Walks that cannot resume list every match at once.
+    Batches(usize),
+}
+
+impl LogPage {
+    /// Page size for walks that can hand out a continuation cursor.
+    fn cursor_page(self) -> usize {
+        match self {
+            Self::Paged => PAGE,
+            Self::Batches(n) => n,
+        }
+    }
+
+    /// Commit limit for `--graph` walks.
+    fn graph_limit(self) -> Option<usize> {
+        match self {
+            Self::Paged => Some(PAGE),
+            Self::Batches(_) => None,
+        }
+    }
+}
 
 /// Group commits for summary output.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,6 +96,10 @@ pub struct LogDisplayOptions {
     pub graph: bool,
     /// When set with `--graph`, draw the graph with ASCII `*|` instead of Unicode box-drawing.
     pub graph_ascii: bool,
+    /// End each default human row with a `+added -removed` line summary (on a terminal).
+    pub line_counts: bool,
+    /// Author and date column widths to keep, so streamed batches line up.
+    pub columns: Option<ui::CommitColumns>,
 }
 
 /// Result of `grit log`: one page of commits, plus the next page's start (if any).
@@ -97,9 +137,14 @@ pub struct LogOutcome {
     #[serde(skip)]
     #[schemars(skip)]
     continuation_args: Option<String>,
+    /// Per-commit line summaries for human rows (see [`LogDisplayOptions::line_counts`]).
     #[serde(skip)]
     #[schemars(skip)]
-    show_continuation_cursor: bool,
+    line_counts: Vec<Option<ui::LineCounts>>,
+    /// Where a [`LogPage::Batches`] walk continues.
+    #[serde(skip)]
+    #[schemars(skip)]
+    resume: Option<(LogWalkQuery, LogWalkCursor)>,
     #[serde(skip)]
     #[schemars(skip)]
     format: DiffFormatArgs,
@@ -117,27 +162,26 @@ struct LogPatchTextParams {
     pathspecs: Vec<String>,
 }
 
-/// Persist a short cursor only when the token is exposed (`--json` or `--cursor` with no value).
-fn encode_next_cursor_if_exposed(
+/// The `--cursor` token for the next page, only when the listing is shown as a page (a
+/// streamed listing hands its walk on to the next batch instead).
+///
+/// The token is the short form stored under `.git`; when the repository is not writable it
+/// falls back to the long self-contained form, so a read-only repository still pages.
+fn encode_next_cursor(
     repo: &grit_lib::repo::Repository,
-    cursor: LogWalkCursor,
-    output_mode: OutputMode,
-    show_in_human_hint: bool,
+    cursor: Option<LogWalkCursor>,
+    page: LogPage,
 ) -> Result<Option<String>> {
-    if output_mode == OutputMode::Json || show_in_human_hint {
-        cursor
-            .encode_short(repo)
+    let Some(cursor) = cursor.filter(|_| page == LogPage::Paged) else {
+        return Ok(None);
+    };
+    match cursor.encode_short(repo) {
+        Ok(token) => Ok(Some(token)),
+        Err(grit_lib::error::Error::Io(_)) => cursor
+            .encode()
             .map(Some)
-            .context("could not store log continuation cursor")
-    } else {
-        Ok(None)
-    }
-}
-
-fn format_log_more_command(rev_args: Option<&str>) -> String {
-    match rev_args.filter(|s| !s.is_empty()) {
-        Some(revs) => format!("grit log {revs}"),
-        None => "grit log".to_owned(),
+            .context("could not encode log continuation cursor"),
+        Err(e) => Err(e).context("could not store log continuation cursor"),
     }
 }
 
@@ -146,6 +190,17 @@ fn format_log_cursor_command(rev_args: Option<&str>, cursor: &str) -> String {
         Some(revs) => format!("grit log {revs} --cursor={cursor}"),
         None => format!("grit log --cursor={cursor}"),
     }
+}
+
+/// What to tell the reader about the history past this page, if anything.
+fn continuation_hint(outcome: &LogOutcome) -> Option<String> {
+    if !outcome.truncated {
+        return None;
+    }
+    Some(match &outcome.next {
+        Some(next) => format_log_cursor_command(outcome.continuation_args.as_deref(), next),
+        None => "rerun with a larger `-n`".to_owned(),
+    })
 }
 
 /// Author aggregate in `--json` output when `--group-by author` is set.
@@ -178,9 +233,16 @@ impl HumanRender for LogOutcome {
             }
             return render_author_groups_human(w, &self.author_group_rows);
         }
-        if self.commits.is_empty() && !self.display.graph {
-            outln!(w, "No commits yet.");
-            return Ok(());
+        if !self.display.graph {
+            let empty = if self.display.oneline {
+                self.oneline_lines.is_empty()
+            } else {
+                self.commit_rows.is_empty()
+            };
+            if empty {
+                outln!(w, "No commits yet.");
+                return Ok(());
+            }
         }
         let now = ctx.now.unix_timestamp();
         let color = use_color();
@@ -196,22 +258,50 @@ impl HumanRender for LogOutcome {
                 outln!(w, "{line}");
             }
         } else {
-            for (row, (commit, diff)) in ui::commit_rows(&self.commit_rows, now)
+            // Decorations go in after each row is cut to width, so leave room for them.
+            let reserved: Vec<usize> = if self.display.decorate {
+                self.commits
+                    .iter()
+                    .map(|c| {
+                        match ui::display_width(&format_decorations_folded(
+                            &c.commit.refs,
+                            head_branch,
+                        )) {
+                            0 => 0,
+                            n => n + 1,
+                        }
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let opts = ui::CommitRowOptions {
+                reserved: &reserved,
+                line_counts: &self.line_counts,
+                columns: self.display.columns,
+            };
+            // `commits` and `commit_diffs` are empty when the rows need neither refs nor diffs.
+            for (i, row) in ui::commit_rows_with(&self.commit_rows, now, &opts)
                 .iter()
-                .zip(self.commits.iter().zip(&self.commit_diffs))
+                .enumerate()
             {
-                let row = if self.display.decorate {
-                    decorate_commit_row(row, &commit.commit.refs, head_branch)
-                } else {
-                    row.clone()
-                };
-                outln!(w, "{row}");
+                let commit = self.commits.get(i);
+                let diff = self.commit_diffs.get(i).and_then(Option::as_ref);
+                let stat = commit.and_then(|c| c.stat.as_ref());
+                match commit {
+                    Some(commit) if self.display.decorate => outln!(
+                        w,
+                        "{}",
+                        decorate_commit_row(row, &commit.commit.refs, head_branch)
+                    ),
+                    _ => outln!(w, "{row}"),
+                }
                 if let Some(outcome) = diff {
                     render_log_commit_diff(w, outcome)?;
-                } else if let Some(stat) = &commit.stat {
+                } else if let Some(stat) = stat {
                     render_stat(w, stat, color, None)?;
                 }
-                if diff.is_some() || commit.stat.is_some() {
+                if diff.is_some() || stat.is_some() {
                     outln!(w);
                 }
             }
@@ -222,17 +312,11 @@ impl HumanRender for LogOutcome {
 
 impl LogOutcome {
     fn render_continuation(&self, w: &mut dyn Write) -> Result<()> {
-        if !self.truncated {
+        let Some(hint) = continuation_hint(self) else {
             return Ok(());
-        }
-        outln!(w);
-        let cmd = match (&self.next, self.show_continuation_cursor) {
-            (Some(next), true) => {
-                format_log_cursor_command(self.continuation_args.as_deref(), next)
-            }
-            _ => format_log_more_command(self.continuation_args.as_deref()),
         };
-        outln!(w, "→ more: {cmd}");
+        outln!(w);
+        outln!(w, "→ more: {hint}");
         Ok(())
     }
 }
@@ -261,9 +345,16 @@ impl MarkdownRender for LogOutcome {
             }
             return render_author_groups_markdown(w, &self.author_group_rows);
         }
-        if self.commit_rows.is_empty() && !self.display.graph {
-            outln!(w, "No commits yet.");
-            return Ok(());
+        if !self.display.graph {
+            let empty = if self.display.oneline {
+                self.oneline_lines.is_empty()
+            } else {
+                self.commit_rows.is_empty()
+            };
+            if empty {
+                outln!(w, "No commits yet.");
+                return Ok(());
+            }
         }
         if let Some(note) = self.graph_note {
             outln!(w, "_{note}_");
@@ -294,20 +385,25 @@ impl MarkdownRender for LogOutcome {
         if self.format.any_format_flag() {
             render_commit_diffs_markdown(w, &self.commit_rows, &self.commit_diffs, ctx)?;
         }
-        if self.truncated {
-            outln!(w);
-            let cmd = match (&self.next, self.show_continuation_cursor) {
-                (Some(next), true) => {
-                    format_log_cursor_command(self.continuation_args.as_deref(), next)
-                }
-                _ => format_log_more_command(self.continuation_args.as_deref()),
-            };
-            outln!(w, "More history: run `{cmd}`");
+        match (continuation_hint(self), &self.next) {
+            (Some(cmd), Some(_)) => {
+                outln!(w);
+                outln!(w, "More history: run `{cmd}`");
+            }
+            (Some(hint), None) => {
+                outln!(w);
+                outln!(w, "More history: {hint}");
+            }
+            (None, _) => {}
         }
         Ok(())
     }
 }
 
+/// List one page (or all) of the commits `rev` and `pathspecs` select.
+///
+/// `cursor` resumes a paged walk from a `--cursor` token (an empty token is ignored);
+/// `page` sets how many commits to list when `-n` is not given.
 pub fn run(
     rev: RevSelectArgs,
     pathspecs: TrailingPathspecArgs,
@@ -315,6 +411,7 @@ pub fn run(
     format: DiffFormatArgs,
     display: LogDisplayOptions,
     output_mode: OutputMode,
+    page: LogPage,
 ) -> Result<LogOutcome> {
     if display.group_by.is_some() {
         if format.any_format_flag() {
@@ -342,8 +439,9 @@ pub fn run(
     let env = repo.environment();
     let walk_paths = pathspecs.rev_walk_tokens(&repo)?;
     let path_args = walk_paths.as_slice();
-    let opts = rev.to_rev_walk_options(&repo, env, &["HEAD"], path_args)?;
-    let show_continuation_cursor = cursor.is_some();
+    let default_tips = default_tips(&repo, &rev)?;
+    let default_tips: Vec<&str> = default_tips.iter().map(String::as_str).collect();
+    let opts = rev.to_rev_walk_options(&repo, env, &default_tips, path_args)?;
     let continuation = cursor.filter(|token| !token.is_empty());
     if display.group_by.is_some() && continuation.is_some() {
         bail!("`grit log` cannot combine `--cursor` with `--group-by`");
@@ -378,20 +476,15 @@ pub fn run(
         let resume = LogWalkCursor::decode_with_git_dir(token, Some(repo.git_dir()))
             .context("invalid log continuation cursor")?;
         let query = resume.query().clone();
-        let page_size = rev.max_count().unwrap_or(PAGE);
-        let page = LogWalkCursor::step(&repo, &query, Some(&resume), page_size)
+        let page_size = rev.max_count().unwrap_or(page.cursor_page());
+        let walked = LogWalkCursor::step(&repo, &query, Some(&resume), page_size)
             .context("could not list commits")?;
-        let truncated = page.next.is_some();
-        let next = match page.next {
-            None => None,
-            Some(c) => {
-                encode_next_cursor_if_exposed(&repo, c, output_mode, show_continuation_cursor)?
-            }
-        };
+        let truncated = walked.next.is_some();
+        let next = encode_next_cursor(&repo, walked.next, page)?;
         return build_commit_outcome(
             &repo,
-            &page.commits,
-            page.commit_data,
+            &walked.commits,
+            walked.commit_data,
             format,
             path_args,
             next,
@@ -399,13 +492,12 @@ pub fn run(
             display,
             output_mode,
             None,
-            show_continuation_cursor,
             LogGraphBuild::default(),
         );
     }
 
-    let token_refs = rev.rev_tokens(&["HEAD"]);
-    let page_size = rev.max_count().unwrap_or(PAGE);
+    let token_refs = rev.rev_tokens(&default_tips);
+    let page_size = rev.max_count().unwrap_or(page.cursor_page());
 
     let mut walk_opts = opts.clone();
     walk_opts.graph = display.graph;
@@ -430,11 +522,11 @@ pub fn run(
         }
         let walk = repo.rev_walk();
         let mut fetch_opts = walk_opts.clone();
-        let page_limit = if display.graph && rev.max_count().is_none() {
-            Some(PAGE)
+        let page_limit = rev.max_count().or(if display.graph {
+            page.graph_limit()
         } else {
-            rev.max_count()
-        };
+            None
+        });
         fetch_opts.limit = fetch_limit_plus_one(page_limit);
         fetch_opts.retain_commit_data = !display.graph && display.group_by.is_none();
         let mut list_result = walk
@@ -490,7 +582,6 @@ pub fn run(
             display,
             output_mode,
             None,
-            show_continuation_cursor,
             LogGraphBuild {
                 parent_rewrite: graph_needs_parent_rewrite(pathspecs.has_any(), &walk_opts),
                 linkage: graph_linkage,
@@ -498,33 +589,48 @@ pub fn run(
         );
     };
 
-    let page =
+    let walked =
         LogWalkCursor::step(&repo, &query, None, page_size).context("could not list commits")?;
-    let truncated = page.next.is_some();
-    let next = if rev.max_count().is_some() {
-        None
-    } else {
-        match page.next {
-            None => None,
-            Some(c) => {
-                encode_next_cursor_if_exposed(&repo, c, output_mode, show_continuation_cursor)?
-            }
-        }
+    let truncated = walked.next.is_some();
+    // A one-shot `-n` asks for that many commits, not for the first page of a walk.
+    let resumable = walked.next.filter(|_| rev.max_count().is_none());
+    // A batch hands its walk on to the next batch instead of to a `--cursor` token.
+    let (next, resume) = match page {
+        LogPage::Batches(_) => (None, resumable.map(|cursor| (query, cursor))),
+        LogPage::Paged => (encode_next_cursor(&repo, resumable, page)?, None),
     };
-    build_commit_outcome(
+    let mut outcome = build_commit_outcome(
         &repo,
-        &page.commits,
-        page.commit_data,
+        &walked.commits,
+        walked.commit_data,
         format,
         path_args,
         next,
-        truncated,
+        truncated && resume.is_none(),
         display,
         output_mode,
         None,
-        show_continuation_cursor,
         LogGraphBuild::default(),
-    )
+    )?;
+    outcome.resume = resume;
+    Ok(outcome)
+}
+
+/// Where the walk starts when no revision is given: `HEAD`, or on a GitButler workspace the
+/// branches merged into it, so GitButler's own workspace commit is not listed.
+fn default_tips(repo: &grit_lib::repo::Repository, rev: &RevSelectArgs) -> Result<Vec<String>> {
+    if !rev.revs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let workspace = GitButlerWorkspace::detect(repo).context("could not read HEAD")?;
+    Ok(match workspace.filter(|w| !w.heads.is_empty()) {
+        Some(workspace) => workspace
+            .head_commits()
+            .iter()
+            .map(ObjectId::to_hex)
+            .collect(),
+        None => vec!["HEAD".to_owned()],
+    })
 }
 
 #[derive(Clone, Default)]
@@ -567,7 +673,8 @@ fn empty_outcome(display: LogDisplayOptions) -> Result<LogOutcome> {
         graph_lines: Vec::new(),
         graph_note: None,
         continuation_args: None,
-        show_continuation_cursor: false,
+        line_counts: Vec::new(),
+        resume: None,
         format: DiffFormatArgs::default(),
         commit_diffs: Vec::new(),
         patch_text: None,
@@ -639,7 +746,8 @@ fn build_author_group_outcome_from_groups(
         graph_lines: Vec::new(),
         graph_note: None,
         continuation_args: None,
-        show_continuation_cursor: false,
+        line_counts: Vec::new(),
+        resume: None,
         format: DiffFormatArgs::default(),
         commit_diffs: Vec::new(),
         patch_text: None,
@@ -670,22 +778,27 @@ pub(crate) fn render_commit_diffs_markdown(
 }
 
 /// Load commit rows for a fixed OID list, optionally attaching per-commit diff detail.
+///
+/// The human [`CommitSummary`] rows are left empty unless `summaries` is set.
 pub(crate) fn load_commits_with_format_for_oids(
     repo: &grit_lib::repo::Repository,
     oids: &[ObjectId],
     format: DiffFormatArgs,
     path_args: &[String],
     parsed: impl CommitReuse,
+    summaries: bool,
 ) -> Result<LoadedCommitList> {
     let now = context::wall_clock_now(repo.environment()).unix_timestamp();
-    let (commit_json_rows, commit_rows) = CommitJsonLoader::for_listed_commits()
-        .load_with_summaries_reusing(repo, oids, now, parsed)?;
+    let loader = CommitJsonLoader::for_listed_commits();
+    let (commit_json_rows, commit_rows) = if summaries {
+        loader.load_with_summaries_reusing(repo, oids, now, parsed)?
+    } else {
+        (loader.load_reusing(repo, oids, now, parsed)?, Vec::new())
+    };
 
     let detail = format.detail_for_log();
-    let config = repo.config().context("could not load config")?;
-    let thread_policy = repo.thread_policy();
 
-    let mut commit_inputs = Vec::with_capacity(oids.len());
+    let mut commit_inputs = Vec::new();
     if detail.is_some() {
         for oid in oids {
             let commit = context::read_commit(repo, oid)?;
@@ -704,6 +817,8 @@ pub(crate) fn load_commits_with_format_for_oids(
     };
 
     let many_results = if let Some(detail) = detail {
+        let config = repo.config().context("could not load config")?;
+        let thread_policy = repo.thread_policy();
         let mut diff_options = DiffOptions::from_config(config.as_ref());
         format.apply_context(&mut diff_options);
         diff_options.word_level_inline = false;
@@ -770,7 +885,6 @@ fn build_commit_outcome(
     display: LogDisplayOptions,
     output_mode: OutputMode,
     continuation_args: Option<String>,
-    show_continuation_cursor: bool,
     graph: LogGraphBuild,
 ) -> Result<LogOutcome> {
     let env = repo.environment();
@@ -783,6 +897,10 @@ fn build_commit_outcome(
         && !display.decorate;
     let need_refs = display.decorate || json_output;
     let need_commit_details = need_refs || (format.any_format_flag() && !format.log_patch_text());
+    let plain_oneline = display.oneline
+        && !need_commit_details
+        && !display.decorate
+        && (!display.graph || output_mode == OutputMode::Markdown);
     let head_branch = if display.oneline || display.decorate {
         resolve_current_branch(repo)?
     } else {
@@ -808,13 +926,59 @@ fn build_commit_outcome(
             graph_lines: Vec::new(),
             graph_note: None,
             continuation_args,
-            show_continuation_cursor,
+            line_counts: Vec::new(),
+            resume: None,
             format,
             commit_diffs: Vec::new(),
             patch_text: Some(LogPatchTextParams {
                 oids: oids.to_vec(),
                 pathspecs,
             }),
+        });
+    }
+
+    let graph_note = if display.graph && output_mode == OutputMode::Markdown {
+        Some("`--graph` affects human output only; this listing omits graph columns.")
+    } else {
+        None
+    };
+
+    if plain_oneline {
+        use grit_lib::objects::read_commit_subject_line;
+        use grit_lib::OidAbbrevBatch;
+
+        let mut abbrev = OidAbbrevBatch::new(7);
+        let oneline_lines = oids
+            .iter()
+            .map(|oid| {
+                let abbrev_hex = abbrev.abbrev_known(repo, *oid)?;
+                let subject = match parsed.cached_subject_line(oid) {
+                    Some(Ok(s)) => s,
+                    Some(Err(e)) => return Err(e.into()),
+                    None => read_commit_subject_line(&repo.odb().read(oid)?.data)?,
+                };
+                Ok(format!("{abbrev_hex} {subject}"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        drop(parsed);
+        return Ok(LogOutcome {
+            commits: Vec::new(),
+            groups: None,
+            next,
+            truncated,
+            commit_rows: Vec::new(),
+            author_group_rows: Vec::new(),
+            display,
+            head_branch,
+            oneline_lines,
+            graph_lines: Vec::new(),
+            graph_note,
+            continuation_args,
+            line_counts: Vec::new(),
+            resume: None,
+            format,
+            commit_diffs: Vec::new(),
+            patch_text: None,
         });
     }
 
@@ -833,33 +997,22 @@ fn build_commit_outcome(
             graph_lines,
             graph_note: None,
             continuation_args,
-            show_continuation_cursor,
+            line_counts: Vec::new(),
+            resume: None,
             format,
             commit_diffs: Vec::new(),
             patch_text: None,
         });
     }
 
+    // Without refs, diffs or JSON output, human and Markdown rows render from the summaries
+    // alone, so no JSON commit rows are built.
     let (commits, commit_rows, commit_diffs) = if need_commit_details {
-        load_commits_with_format_for_oids(repo, oids, format, path_args, parsed)?
+        load_commits_with_format_for_oids(repo, oids, format, path_args, parsed, !json_output)?
     } else {
         let summaries = CommitJsonLoader::load_summaries_only(repo, oids, &mut parsed)?;
         drop(parsed);
-        let json_rows = summaries
-            .iter()
-            .map(|s| CommitJson::from_summary(s, now))
-            .collect::<Vec<_>>();
-        let commits: Vec<LogCommit> = json_rows
-            .into_iter()
-            .map(|commit| LogCommit {
-                commit,
-                files: None,
-                totals: None,
-                stat: None,
-            })
-            .collect();
-        let diffs = (0..commits.len()).map(|_| None).collect();
-        (commits, summaries, diffs)
+        (Vec::new(), summaries, Vec::new())
     };
 
     let head_branch_ref = head_branch.as_deref();
@@ -874,18 +1027,23 @@ fn build_commit_outcome(
             Vec::new()
         };
 
-    let graph_note = if display.graph && output_mode == OutputMode::Markdown {
-        Some("`--graph` affects human output only; this listing omits graph columns.")
+    let line_counts = if display.line_counts
+        && output_mode == OutputMode::Human
+        && !display.oneline
+        && !format.any_format_flag()
+    {
+        commit_line_counts(repo, oids, path_args)?
     } else {
-        None
+        Vec::new()
     };
 
     let graph_lines = if display.graph && output_mode == OutputMode::Human {
         build_graph_text_lines(
             repo,
             oids,
-            Some(&commits),
+            (!commits.is_empty()).then_some(commits.as_slice()),
             &commit_rows,
+            &line_counts,
             display,
             head_branch_ref,
             now,
@@ -908,28 +1066,247 @@ fn build_commit_outcome(
         graph_lines,
         graph_note,
         continuation_args,
-        show_continuation_cursor,
+        line_counts,
+        resume: None,
         format,
         commit_diffs,
         patch_text: None,
     })
 }
 
+/// Lines each commit added and removed against its first parent, limited to `path_args`.
+///
+/// Merges get `None`, as in `git log --shortstat`, and so do commits that change no lines.
+fn commit_line_counts(
+    repo: &grit_lib::repo::Repository,
+    oids: &[ObjectId],
+    path_args: &[String],
+) -> Result<Vec<Option<ui::LineCounts>>> {
+    let mut inputs = Vec::with_capacity(oids.len());
+    let mut slots = Vec::with_capacity(oids.len());
+    for oid in oids {
+        let commit = context::read_commit(repo, oid)?;
+        if commit.parents.len() > 1 {
+            slots.push(None);
+            continue;
+        }
+        slots.push(Some(inputs.len()));
+        inputs.push(CommitFilesManyInput {
+            oid: *oid,
+            parents: commit.parents,
+            tree: commit.tree,
+        });
+    }
+    let pathspecs = if path_args.is_empty() {
+        Vec::new()
+    } else {
+        resolve_commit_diff_pathspecs(repo, path_args)?
+    };
+    let config = repo.config().context("could not load config")?;
+    let opts = CommitFilesManyOptions {
+        diff_options: DiffOptions::from_config(config.as_ref()),
+        detail: DiffDetail::Stat,
+        skip_merge_patches: true,
+    };
+    let results = repo
+        .diff()
+        .commit_files_many_work(
+            &inputs,
+            &pathspecs,
+            opts,
+            config.as_ref(),
+            &repo.thread_policy(),
+        )
+        .context("could not diff commits")?;
+    Ok(slots
+        .into_iter()
+        .map(|slot| {
+            let output = &results.get(slot?)?.output;
+            let totals = output
+                .totals
+                .unwrap_or_else(|| DiffTotals::from_files(&output.files));
+            (totals.insertions + totals.deletions > 0).then_some(ui::LineCounts {
+                added: totals.insertions,
+                removed: totals.deletions,
+            })
+        })
+        .collect())
+}
+
+/// What `grit log` draws on a terminal.
+pub enum TerminalLog {
+    /// One listing (`-n` or `--cursor` was given).
+    Listing(Box<LogOutcome>),
+    /// The whole history, a batch at a time.
+    Stream(Box<LogStream>),
+}
+
+impl TerminalLog {
+    /// Draw it as human output to `w`.
+    ///
+    /// # Errors
+    ///
+    /// Returns render, walk and write errors (a reader that hangs up mid-stream is not one).
+    pub fn render(self, w: &mut dyn Write, ctx: &RenderContext) -> Result<()> {
+        match self {
+            Self::Listing(outcome) => outcome.render_human(w, ctx),
+            Self::Stream(stream) => stream.render(w, ctx),
+        }
+    }
+}
+
+/// How many commits [`LogStream`] draws before walking further, so the first screen is quick.
+const FIRST_BATCH: usize = 100;
+
+/// How many commits each later [`LogStream`] batch walks.
+const BATCH: usize = 1000;
+
+/// The whole history for a terminal, walked and drawn a batch at a time.
+///
+/// The first batch is walked by [`Self::start`], so errors show before a pager opens.
+/// [`Self::render`] draws it and keeps walking until history ends or the reader hangs up.
+/// Walks that cannot resume from a cursor (path limits, commit filters, `--graph`) are
+/// walked in full as one batch.
+pub struct LogStream {
+    repo: grit_lib::repo::Repository,
+    batch: LogOutcome,
+    format: DiffFormatArgs,
+    display: LogDisplayOptions,
+}
+
+impl LogStream {
+    /// Walk the first batch of the commits `rev` and `pathspecs` select.
+    ///
+    /// # Errors
+    ///
+    /// Returns the selection and walk errors [`run`] does.
+    pub fn start(
+        rev: RevSelectArgs,
+        pathspecs: TrailingPathspecArgs,
+        format: DiffFormatArgs,
+        display: LogDisplayOptions,
+    ) -> Result<Self> {
+        let batch = run(
+            rev,
+            pathspecs,
+            None,
+            format,
+            display,
+            OutputMode::Human,
+            LogPage::Batches(FIRST_BATCH),
+        )?;
+        Ok(Self {
+            repo: context::discover()?,
+            batch,
+            format,
+            display,
+        })
+    }
+
+    /// Draw every batch to `w`, stopping early without error when `w`'s reader hangs up.
+    ///
+    /// # Errors
+    ///
+    /// Returns walk, diff and write errors other than a closed pipe.
+    pub fn render(mut self, w: &mut dyn Write, ctx: &RenderContext) -> Result<()> {
+        // Every batch keeps the first batch's column widths, so the rows line up.
+        let columns =
+            ui::CommitColumns::for_stream(&self.batch.commit_rows, ctx.now.unix_timestamp());
+        loop {
+            self.batch.display.columns = Some(columns);
+            let resume = self.batch.resume.take();
+            let mut buf = Vec::new();
+            self.batch.render_human(&mut buf, ctx)?;
+            match w.write_all(&buf).and_then(|()| w.flush()) {
+                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => return Ok(()),
+                result => result.context("writing output")?,
+            }
+            let Some((query, cursor)) = resume else {
+                return Ok(());
+            };
+            let walked = LogWalkCursor::step(&self.repo, &query, Some(&cursor), BATCH)
+                .context("could not list commits")?;
+            if walked.commits.is_empty() {
+                return Ok(());
+            }
+            let next = walked.next.map(|cursor| (query, cursor));
+            self.batch = build_commit_outcome(
+                &self.repo,
+                &walked.commits,
+                walked.commit_data,
+                self.format,
+                &[],
+                None,
+                false,
+                self.display,
+                OutputMode::Human,
+                None,
+                LogGraphBuild::default(),
+            )?;
+            self.batch.resume = next;
+        }
+    }
+}
+
 impl LogOutcome {
     fn render_graph_human(&self, w: &mut dyn Write) -> Result<()> {
         let mut buf = String::new();
-        for (i, line) in self.graph_lines.iter().enumerate() {
-            if i > 0 {
-                buf.push('\n');
-            }
+        for line in &self.graph_lines {
             buf.push_str(line);
-        }
-        if !buf.is_empty() {
             buf.push('\n');
-            w.write_all(buf.as_bytes())?;
         }
-        Ok(())
+        crate::stdio::io_result(w.write_all(buf.as_bytes()))
+            .map_err(|e| anyhow::anyhow!("writing output: {e}"))
     }
+}
+
+/// Lay out the graph for `oids` and return each commit's block of rendered lines.
+fn graph_blocks(
+    oids: &[ObjectId],
+    parent_map: &HashMap<ObjectId, Vec<ObjectId>>,
+    display: LogDisplayOptions,
+) -> Vec<Vec<GraphRenderedLine>> {
+    let charset = if display.graph_ascii {
+        GraphCharset::ASCII
+    } else {
+        GraphCharset::UNICODE
+    };
+    let inputs: Vec<GraphCommitInput> = oids
+        .iter()
+        .map(|&id| GraphCommitInput {
+            id,
+            parents: parent_map.get(&id).cloned().unwrap_or_default(),
+        })
+        .collect();
+    GraphLayout::new(charset).render(&inputs)
+}
+
+/// Columns the commit line's graph prefix takes in each block.
+fn commit_prefix_widths(blocks: &[Vec<GraphRenderedLine>]) -> Vec<usize> {
+    blocks
+        .iter()
+        .map(|block| {
+            block
+                .iter()
+                .find(|line| line.kind != GraphLineKind::Padding)
+                .map_or(0, |line| ui::display_width(&line.prefix))
+        })
+        .collect()
+}
+
+/// Join each block's graph prefixes to its commit text.
+fn join_graph_blocks(blocks: Vec<Vec<GraphRenderedLine>>, texts: Vec<String>) -> Vec<String> {
+    let mut out = Vec::with_capacity(blocks.len() * 2);
+    for (block, text) in blocks.into_iter().zip(texts) {
+        for graph_line in block {
+            if graph_line.kind == GraphLineKind::Padding {
+                out.push(graph_line.prefix.trim_end().to_owned());
+            } else {
+                out.push(format!("{}{text}", graph_line.prefix));
+            }
+        }
+    }
+    out
 }
 
 fn build_graph_oneline_lines(
@@ -938,42 +1315,30 @@ fn build_graph_oneline_lines(
     display: LogDisplayOptions,
     graph: &LogGraphBuild,
 ) -> Result<Vec<String>> {
-    let charset = if display.graph_ascii {
-        GraphCharset::ASCII
-    } else {
-        GraphCharset::UNICODE
-    };
     let (parent_map, subjects) = if let Some(linkage) = graph.linkage.clone() {
         (linkage.parents, linkage.subjects)
     } else {
         log_graph_materialize(repo, oids, graph.parent_rewrite)?
     };
-    let inputs: Vec<GraphCommitInput> = oids
+    let blocks = graph_blocks(oids, &parent_map, display);
+    let term_width = ui::terminal_width();
+    let mut abbrev_batch = grit_lib::OidAbbrevBatch::new(7);
+    let texts = oids
         .iter()
-        .map(|&id| GraphCommitInput {
-            id,
-            parents: parent_map.get(&id).cloned().unwrap_or_default(),
+        .zip(commit_prefix_widths(&blocks))
+        .map(|(&oid, lead)| {
+            let subject = subjects
+                .get(&oid)
+                .map(String::as_str)
+                .unwrap_or("(no subject)");
+            let text = render_oneline_oid_subject(repo, oid, subject, &mut abbrev_batch)?;
+            Ok(ui::fit_width(
+                &text,
+                term_width.map(|w| w.saturating_sub(lead)),
+            ))
         })
-        .collect();
-    let mut layout = GraphLayout::new(charset);
-    let blocks = layout.render(&inputs);
-    let mut out = Vec::with_capacity(oids.len() + blocks.len());
-    let mut prefix_cache = HashMap::new();
-    for (block, &oid) in blocks.into_iter().zip(oids.iter()) {
-        let subject = subjects
-            .get(&oid)
-            .map(String::as_str)
-            .unwrap_or("(no subject)");
-        for graph_line in block {
-            if graph_line.kind == GraphLineKind::Padding {
-                out.push(graph_line.prefix.trim_end().to_owned());
-                continue;
-            }
-            let text = render_oneline_oid_subject(repo, oid, subject, &mut prefix_cache)?;
-            out.push(format!("{}{text}", graph_line.prefix));
-        }
-    }
-    Ok(out)
+        .collect::<Result<Vec<_>>>()?;
+    Ok(join_graph_blocks(blocks, texts))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -982,97 +1347,81 @@ fn build_graph_text_lines(
     oids: &[ObjectId],
     commits: Option<&[LogCommit]>,
     summaries: &[CommitSummary],
+    line_counts: &[Option<ui::LineCounts>],
     display: LogDisplayOptions,
     head_branch: Option<&str>,
     now: i64,
     graph: &LogGraphBuild,
 ) -> Result<Vec<String>> {
-    let charset = if display.graph_ascii {
-        GraphCharset::ASCII
-    } else {
-        GraphCharset::UNICODE
-    };
     let visible: HashSet<ObjectId> = oids.iter().copied().collect();
     let parent_map = if let Some(linkage) = graph.linkage.as_ref() {
         linkage.parents.clone()
     } else {
         display_parents_for_graph(repo, &visible, graph.parent_rewrite)?
     };
-    let inputs: Vec<GraphCommitInput> = oids
-        .iter()
-        .map(|&id| GraphCommitInput {
-            id,
-            parents: parent_map.get(&id).cloned().unwrap_or_default(),
-        })
-        .collect();
-    let mut layout = GraphLayout::new(charset);
-    let blocks = layout.render(&inputs);
-    let mut out = Vec::with_capacity(oids.len() + blocks.len());
-    if let Some(commits) = commits {
-        for (block, (commit, summary)) in blocks.into_iter().zip(commits.iter().zip(summaries)) {
-            append_graph_block_lines(
-                repo,
-                &mut out,
-                block,
-                summary,
-                Some(commit),
-                display,
-                head_branch,
-                now,
-            )?;
-        }
+    let blocks = graph_blocks(oids, &parent_map, display);
+    let leads = commit_prefix_widths(&blocks);
+    let texts = if display.oneline {
+        let term_width = ui::terminal_width();
+        summaries
+            .iter()
+            .zip(&leads)
+            .enumerate()
+            .map(|(i, (summary, lead))| {
+                let text = if display.decorate {
+                    let commit = commits
+                        .and_then(|c| c.get(i))
+                        .ok_or_else(|| anyhow::anyhow!("internal error: missing log commit row"))?;
+                    render_oneline_line(repo, &commit.commit, true, head_branch)?
+                } else {
+                    render_oneline_from_summary(repo, summary)?
+                };
+                Ok(ui::fit_width(
+                    &text,
+                    term_width.map(|w| w.saturating_sub(*lead)),
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?
     } else {
-        for (block, summary) in blocks.into_iter().zip(summaries) {
-            append_graph_block_lines(
-                repo,
-                &mut out,
-                block,
-                summary,
-                None,
-                display,
-                head_branch,
-                now,
-            )?;
-        }
-    }
-    Ok(out)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn append_graph_block_lines(
-    repo: &grit_lib::repo::Repository,
-    out: &mut Vec<String>,
-    block: Vec<GraphRenderedLine>,
-    summary: &CommitSummary,
-    commit: Option<&LogCommit>,
-    display: LogDisplayOptions,
-    head_branch: Option<&str>,
-    now: i64,
-) -> Result<()> {
-    for graph_line in block {
-        if graph_line.kind == GraphLineKind::Padding {
-            out.push(graph_line.prefix.trim_end().to_owned());
-            continue;
-        }
-        let text = if display.oneline {
-            if display.decorate {
-                let commit = commit
-                    .ok_or_else(|| anyhow::anyhow!("internal error: missing log commit row"))?;
-                render_oneline_line(repo, &commit.commit, true, head_branch)?
-            } else {
-                render_oneline_from_summary(repo, summary)?
-            }
-        } else {
-            let commit =
-                commit.ok_or_else(|| anyhow::anyhow!("internal error: missing log commit row"))?;
-            let row = ui::commit_rows(std::slice::from_ref(summary), now)[0].clone();
-            if display.decorate {
-                decorate_commit_row(&row, &commit.commit.refs, head_branch)
-            } else {
-                row
-            }
+        let refs = (0..summaries.len())
+            .map(|i| {
+                if !display.decorate {
+                    return Ok(None);
+                }
+                commits
+                    .and_then(|c| c.get(i))
+                    .map(|commit| Some(commit.commit.refs.as_slice()))
+                    .ok_or_else(|| anyhow::anyhow!("internal error: missing log commit row"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        // Decorations go in after the row is cut to width, so leave room for them too.
+        let reserved: Vec<usize> = leads
+            .iter()
+            .zip(&refs)
+            .map(|(lead, refs)| {
+                let deco = refs.map_or(0, |refs| {
+                    ui::display_width(&format_decorations_folded(refs, head_branch))
+                });
+                if deco == 0 {
+                    *lead
+                } else {
+                    lead + deco + 1
+                }
+            })
+            .collect();
+        let opts = ui::CommitRowOptions {
+            reserved: &reserved,
+            line_counts,
+            columns: display.columns,
         };
-        out.push(format!("{}{text}", graph_line.prefix));
-    }
-    Ok(())
+        ui::commit_rows_with(summaries, now, &opts)
+            .into_iter()
+            .zip(&refs)
+            .map(|(row, refs)| match refs {
+                Some(refs) => decorate_commit_row(&row, refs, head_branch),
+                None => row,
+            })
+            .collect()
+    };
+    Ok(join_graph_blocks(blocks, texts))
 }

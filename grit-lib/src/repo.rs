@@ -44,18 +44,19 @@ use crate::config::{
 use crate::diagnostics::{self, DiagnosticsHandle};
 use crate::environment::{Environment, RepositoryOptions};
 use crate::error::{Error, NotARepositoryReason, Result};
-use crate::git_dir::io_error::map_index_write_error;
+use crate::git_dir::io_error::{map_git_dir_io, map_index_write_error, GitDirPathOperation};
 use crate::git_path::path_for_error_message;
 use crate::hooks::run_hook;
 use crate::index::Index;
 use crate::init_filesystem::{apply_init_filesystem_config, InitFilesystemConfigOptions};
-use crate::objects::{parse_commit, HashAlgo, ObjectId};
+use crate::objects::{HashAlgo, ObjectId};
 use crate::odb::Odb;
 use crate::repo_caches::RepoCaches;
 use crate::rev_parse::is_inside_work_tree;
 use crate::sparse_checkout::effective_cone_mode_for_sparse_file;
 use crate::split_index::{write_index_file_split, WriteSplitIndexRequest};
 use crate::state::resolve_head;
+use crate::worktree::io_error::{map_worktree_io, WorktreePathOperation};
 use crate::worktree_cwd::cwd_relative_under_work_tree;
 
 /// Compute Git `GIT_PREFIX` for `env.cwd` relative to the work tree (POSIX, no trailing `/`).
@@ -133,7 +134,10 @@ pub struct InitOptions {
     ///
     /// When `None`, new repositories default to SHA-1; reinit preserves the existing format.
     pub object_format: Option<HashAlgo>,
-    /// Environment used to resolve `init.defaultBranch` (and other init-time config).
+    /// Environment used to resolve `init.defaultBranch` and other init-time config, and stored
+    /// on the returned [`Repository`] when set (identity, `core.autocrlf`, `safe.directory`, and
+    /// related cascade). When `None`, init uses [`Environment::empty`] and the handle stays
+    /// hermetic like [`RepositoryOptions::empty`].
     pub environment: Option<Environment>,
 }
 
@@ -226,8 +230,13 @@ impl InitOptions {
 /// - A [`Self::ref_store`]: no `HEAD` file (the store holds `HEAD`), and `refs/` is never read.
 /// - A custom [`OdbBuilder::primary`](crate::odb::OdbBuilder::primary): no `objects/`.
 /// - Both: nothing at all. The git directory may be empty or missing; it is still where the
-///   repository config (`config`) is read from and where the index lives once something
-///   stages files, so create it before using index-based operations.
+///   repository config (`config`) is read from and where the index lives. Staging creates
+///   the directory when it is missing.
+///
+/// Hooks run with `GIT_DIR` exported only when the [`Environment`] in the options sets
+/// [`Environment::git_dir`]; `open` does not set it from its path. Objects and refs held in
+/// injected stores are not on disk, so a hook that runs the system `git` against such a
+/// repository finds no repository.
 ///
 /// ```
 /// use std::sync::Arc;
@@ -328,8 +337,9 @@ impl RepositoryBuilder {
     /// - [`Error::OdbObjectsDirMismatch`] when a files-backed [`Self::odb_builder`] names a
     ///   directory other than the repository's `objects/` (or the environment's
     ///   `GIT_OBJECT_DIRECTORY`).
-    /// - [`Error::ObjectFormatMismatch`] when the builder's custom primary or a read source
-    ///   reports a [`hash_algo`](crate::odb::store::ObjectStore::hash_algo) other than the
+    /// - [`Error::ObjectFormatMismatch`] when the builder's custom primary, a read source or
+    ///   its attached [`commit_graph`](crate::odb::OdbBuilder::commit_graph) reports a
+    ///   [`hash_algo`](crate::odb::store::ObjectStore::hash_algo) other than the
     ///   repository's `extensions.objectformat` (SHA-1 when unset or when the git directory
     ///   has no config).
     /// - [`Error::InvalidRef`] when [`Self::initial_branch`] is not a valid branch name.
@@ -426,8 +436,8 @@ pub struct Repository {
     config_session: Mutex<Option<ConfigSession>>,
     /// Repository-scoped caches (config, attributes, filters, precompose, …).
     caches: Arc<RepoCaches>,
-    /// Pluggable ref backend selected for this repository.
-    ref_store: Arc<dyn crate::refs::store::RefStore>,
+    /// Pluggable ref backend selected for this repository, checked against [`Self::odb`].
+    ref_store: crate::refs::store::ObjectCheckedRefStore,
     /// Discovery and configuration environment used to open this repository.
     environment: Arc<Environment>,
     /// Repository-relative path of [`Environment::cwd`] under [`Self::work_tree`] (Git `GIT_PREFIX`).
@@ -480,6 +490,10 @@ struct ConfigSessionValidation {
     env_fingerprint: Vec<(String, Option<String>)>,
     base_stamps: Vec<(PathBuf, Option<(std::time::SystemTime, u64)>)>,
     extra_stamps: Vec<(PathBuf, Option<(std::time::SystemTime, u64)>)>,
+    /// The environment snapshot the stamps were last validated against. While the handle
+    /// still uses this very snapshot (and git dir), the fingerprint, cache key and cascade
+    /// paths cannot have changed, so validation only re-stats the stamped files.
+    environment: Arc<Environment>,
 }
 
 /// In-memory config session for one open [`Repository`] handle.
@@ -492,7 +506,21 @@ struct ConfigSession {
 }
 
 impl ConfigSessionValidation {
-    fn still_valid(&self, env: &Environment, git_dir: &Path, opts: &LoadConfigOptions) -> bool {
+    /// Whether the session's cascade still matches `env`, `git_dir` and the files on disk.
+    ///
+    /// `opts` builds the load options of the handle (always the same for one environment
+    /// and git dir); it is only called when `env` is not the snapshot last validated. A
+    /// full check that passes adopts `env` as that snapshot.
+    fn still_valid(
+        &mut self,
+        env: &Arc<Environment>,
+        git_dir: &Path,
+        opts: impl FnOnce() -> LoadConfigOptions,
+    ) -> bool {
+        if Arc::ptr_eq(env, &self.environment) && self.key.git_dir.as_deref() == Some(git_dir) {
+            return stamps_unchanged(&self.base_stamps) && stamps_unchanged(&self.extra_stamps);
+        }
+        let opts = &opts();
         let Some(env_fp) = env.config_fingerprint() else {
             return false;
         };
@@ -504,31 +532,55 @@ impl ConfigSessionValidation {
             return false;
         }
         let base_stamps = config_file_stamps(env, Some(git_dir), opts);
-        if self.base_stamps.as_slice() != base_stamps.as_slice() {
+        if self.base_stamps.as_slice() != base_stamps.as_slice()
+            || !stamps_unchanged(&self.extra_stamps)
+        {
             return false;
         }
-        for (path, stamp) in &self.extra_stamps {
-            if stamp_for_path(path) != *stamp {
-                return false;
-            }
-        }
+        self.environment = Arc::clone(env);
         true
     }
+}
+
+fn stamps_unchanged(stamps: &[(PathBuf, Option<(std::time::SystemTime, u64)>)]) -> bool {
+    stamps
+        .iter()
+        .all(|(path, stamp)| stamp_for_path(path) == *stamp)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn checked_ref_store_with_hooks(
+    inner: Arc<dyn crate::refs::store::RefStore>,
+    odb: crate::odb::Odb,
+    git_dir: &Path,
+    work_tree: Option<&Path>,
+    environment: &Arc<Environment>,
+    command_runner: &Arc<dyn CommandRunner>,
+    hook_stdio: crate::hooks::HookStdio,
+    diagnostics: &crate::diagnostics::DiagnosticsHandle,
+) -> crate::refs::store::ObjectCheckedRefStore {
+    let hooks = Arc::new(crate::hooks::RefHookContext::new(
+        git_dir.to_path_buf(),
+        work_tree.map(Path::to_path_buf),
+        Arc::clone(environment),
+        Arc::clone(command_runner),
+        hook_stdio,
+        Arc::clone(diagnostics),
+        odb.hash_algo(),
+    ));
+    crate::refs::store::ObjectCheckedRefStore::new(inner, odb).with_ref_hooks(hooks)
 }
 
 impl Repository {
     fn config_load_options(&self, include_system: bool) -> LoadConfigOptions {
         LoadConfigOptions {
             include_system,
-            include_ctx: crate::config::IncludeContext {
-                git_dir: Some(self.git_dir.clone()),
-                cwd: self.environment.cwd.clone(),
-                pwd: self.environment.pwd.clone(),
-                ..Default::default()
-            },
             diagnostics: Some(self.diagnostics()),
-            repo_caches: Some(Arc::clone(&self.caches)),
-            ..Default::default()
+            ..LoadConfigOptions::for_repository(
+                &self.environment,
+                Some(&self.git_dir),
+                Some(Arc::clone(&self.caches)),
+            )
         }
     }
 
@@ -589,8 +641,17 @@ impl Repository {
             .as_ref()
             .and_then(|wt| compute_git_prefix(environment.as_ref(), wt));
 
-        let ref_store = open_or_install_ref_store(&caches, &git_dir, &environment, injected_refs)?;
-        caches.configure_filter_subprocess(environment.as_ref(), &git_dir, work_tree.as_deref());
+        let ref_store = checked_ref_store_with_hooks(
+            open_or_install_ref_store(&caches, &git_dir, &environment, injected_refs)?,
+            odb.clone(),
+            &git_dir,
+            work_tree.as_deref(),
+            &environment,
+            &command_runner,
+            options.hook_stdio,
+            &options.diagnostics,
+        );
+        caches.configure_filter_subprocess(&environment, &git_dir, work_tree.as_deref());
 
         Ok(Self {
             git_dir,
@@ -773,6 +834,29 @@ impl Repository {
         }
     }
 
+    /// [`RepositoryOptions`] for opening another repository on this machine as the far end of
+    /// a local transfer, such as the destination of a local-path or `file://` push.
+    ///
+    /// Keeps the caller's environment (so that repository's hook scripts see the same `PATH`
+    /// and `HOME`, and global config applies), command runner and diagnostics, but drops the
+    /// variables that describe only this repository: its location, index and object
+    /// directories, `GIT_CONFIG`, command-line config overrides, namespace and replace-ref
+    /// settings. Git clears the same set before starting the far end of its local transport.
+    #[must_use]
+    pub(crate) fn peer_repository_options(&self) -> RepositoryOptions {
+        let mut options = self.linked_worktree_discover_options();
+        let env = &mut options.environment;
+        env.git_alternate_object_directories = None;
+        env.git_namespace = None;
+        env.git_replace_ref_base = None;
+        env.git_no_replace_objects = false;
+        env.git_config = None;
+        env.git_config_parameters = None;
+        env.git_config_count = None;
+        env.git_config_pairs.clear();
+        options
+    }
+
     /// Handle for the linked worktree administered at `admin_dir` with its files at
     /// `work_tree`.
     ///
@@ -810,11 +894,21 @@ impl Repository {
             let view: Arc<dyn crate::refs::store::RefStore> =
                 Arc::new(crate::refs::store::LinkedWorktreeRefStore::new(
                     git_dir.clone(),
-                    Arc::clone(&self.ref_store),
+                    Arc::clone(self.ref_store.inner()),
                 ));
             caches.install_ref_store(&git_dir, Arc::clone(&view));
             view
         };
+        let ref_store = checked_ref_store_with_hooks(
+            ref_store,
+            self.odb.clone(),
+            &git_dir,
+            Some(work_tree.as_path()),
+            &environment,
+            &self.command_runner,
+            self.hook_stdio,
+            &self.diagnostics,
+        );
         let repo = Self {
             git_prefix: compute_git_prefix(&environment, &work_tree),
             git_dir,
@@ -839,7 +933,7 @@ impl Repository {
             hook_stdio: self.hook_stdio,
         };
         repo.caches().configure_filter_subprocess(
-            repo.environment.as_ref(),
+            &repo.environment,
             repo.git_dir(),
             repo.work_tree(),
         );
@@ -882,14 +976,14 @@ impl Repository {
 
     fn config_arc_with_validation(&self, validate_stamps: bool) -> Result<Arc<ConfigSet>> {
         if validate_stamps {
-            if let Ok(guard) = self.config_session.lock() {
-                if let Some(session) = guard.as_ref() {
-                    let opts = self.config_load_options(true);
-                    if session.validation.still_valid(
-                        self.environment.as_ref(),
-                        &self.git_dir,
-                        &opts,
-                    ) {
+            if let Ok(mut guard) = self.config_session.lock() {
+                if let Some(session) = guard.as_mut() {
+                    if session
+                        .validation
+                        .still_valid(&self.environment, &self.git_dir, || {
+                            self.config_load_options(true)
+                        })
+                    {
                         return Ok(Arc::clone(&session.config));
                     }
                 }
@@ -911,11 +1005,11 @@ impl Repository {
     fn refresh_config_session(&self) -> Result<()> {
         crate::trace::trace_span!("grit.config.load");
         let opts = self.config_load_options(true);
-        if let Ok(guard) = self.config_session.lock() {
-            if let Some(session) = guard.as_ref() {
+        if let Ok(mut guard) = self.config_session.lock() {
+            if let Some(session) = guard.as_mut() {
                 if session
                     .validation
-                    .still_valid(self.environment.as_ref(), &self.git_dir, &opts)
+                    .still_valid(&self.environment, &self.git_dir, || opts.clone())
                 {
                     return Ok(());
                 }
@@ -952,6 +1046,7 @@ impl Repository {
                 env_fingerprint,
                 base_stamps,
                 extra_stamps,
+                environment: Arc::clone(&self.environment),
             },
             cached_settings,
             replace_lookup_inactive,
@@ -1064,9 +1159,16 @@ impl Repository {
     }
 
     /// Reference storage backend for this repository.
+    ///
+    /// Unlike a backend opened on its own, this store checks every transaction against the
+    /// repository's objects in [`RefStore::prepare`](crate::refs::store::RefStore::prepare):
+    /// a direct value must name a stored object
+    /// ([`RefStoreError::MissingObject`](crate::refs::store::RefStoreError::MissingObject)),
+    /// and a branch or `HEAD` must name a commit
+    /// ([`RefStoreError::NotACommit`](crate::refs::store::RefStoreError::NotACommit)).
     #[must_use]
     pub fn refs(&self) -> &dyn crate::refs::store::RefStore {
-        self.ref_store.as_ref()
+        &self.ref_store
     }
 
     /// Whether [`Self::refs`] is an on-disk files or reftable backend, so `HEAD` and refs can
@@ -1076,7 +1178,7 @@ impl Repository {
     pub(crate) fn refs_on_disk(&self) -> bool {
         use crate::refs::store::RefStorageFormat;
         matches!(
-            self.ref_store.format(),
+            self.refs().format(),
             RefStorageFormat::Files | RefStorageFormat::Reftable
         )
     }
@@ -1139,6 +1241,12 @@ impl Repository {
     #[must_use]
     pub fn stash(&self) -> crate::repo_handles::RepositoryStash<'_> {
         crate::repo_handles::RepositoryStash::new(self)
+    }
+
+    /// Capture and restore workspace state (index with conflict stages, worktree, refs, sentinels).
+    #[must_use]
+    pub fn workspace_snapshot(&self) -> crate::repo_handles::RepositoryWorkspaceSnapshot<'_> {
+        crate::repo_handles::RepositoryWorkspaceSnapshot::new(self)
     }
 
     /// Git notes read/write for this repository.
@@ -1204,9 +1312,13 @@ impl Repository {
 
     /// Patch-ID for a single commit (merge commits and empty diffs return `None`).
     ///
-    /// Text diffs use unified hunks with three context lines on each side,
-    /// matching `git show --format= --no-ext-diff -U3` piped to `git patch-id`
-    /// in the selected mode. Only context inside those hunks contributes to the ID.
+    /// Text diffs use the hunks of Git's default diff (Myers with change-compact
+    /// and the indent heuristic, three context lines on each side), matching
+    /// `git show --format= --no-ext-diff` piped to `git patch-id` in the
+    /// selected mode, including where an ambiguous insertion or deletion is
+    /// placed. Only context inside those hunks contributes to the ID. Stable
+    /// and unstable modes drop spaces, tabs, CR and LF before hashing; form
+    /// feed and vertical tab still count.
     ///
     /// # Errors
     ///
@@ -1217,6 +1329,49 @@ impl Repository {
         mode: crate::patch_ids::PatchIdMode,
     ) -> crate::error::Result<Option<crate::objects::ObjectId>> {
         crate::patch_ids::compute_patch_id(self.odb().hash_algo(), self.odb(), commit, mode)
+    }
+
+    /// Patch-IDs for every commit named by `specs`, as `(patch_id, commit)` pairs.
+    ///
+    /// A spec that is a top-level range expands to the commits that range selects, in
+    /// default `rev-list` order: `A..B` lists the commits reachable from `B` but not `A`,
+    /// and `A...B` lists the commits on both sides of the symmetric difference in one
+    /// walk-ordered sequence without saying which side each came from (use
+    /// [`crate::revwalk::RevWalkListOptions::cherry_mark`] to compare the sides). Any
+    /// other spec names one object, resolved like `git rev-parse` without index-path
+    /// guessing. Merge commits and commits with no file changes are skipped, as in
+    /// [`Self::patch_id`]. Results follow the order of `specs`; a commit named twice
+    /// appears twice.
+    ///
+    /// # Errors
+    ///
+    /// Propagates rev-parse, merge-base, and rev-list errors for unresolvable specs, and
+    /// object database read/parse failures while diffing.
+    pub fn patch_ids_for_revs(
+        &self,
+        specs: &[&str],
+        mode: crate::patch_ids::PatchIdMode,
+    ) -> crate::error::Result<Vec<(crate::objects::ObjectId, crate::objects::ObjectId)>> {
+        let walk = self.rev_walk();
+        let walk_options = crate::revwalk::RevWalkListOptions::default();
+        let mut out = Vec::new();
+        for spec in specs {
+            let commits = if crate::rev_parse::is_top_level_range(spec) {
+                walk.commits(&[spec], &walk_options)?
+            } else {
+                vec![crate::rev_parse::resolve_revision_without_index_dwim(
+                    self, spec,
+                )?]
+            };
+            let patch_ids =
+                crate::rev_list::map_commits_in_parallel(&commits, |c| self.patch_id(c, mode));
+            for (patch_id, commit) in patch_ids.into_iter().zip(commits) {
+                if let Some(patch_id) = patch_id? {
+                    out.push((patch_id, commit));
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Reflog listing, deletion, and expiry for this repository.
@@ -1249,7 +1404,7 @@ impl Repository {
     ///
     /// Propagates [`crate::refs::store::RefStoreError`] as [`Error::RefStore`].
     pub(crate) fn resolve_ref_oid(&self, refname: &str) -> Result<crate::objects::ObjectId> {
-        self.ref_store.resolve(refname)
+        self.refs().resolve(refname)
     }
 
     /// Replace the ref store (embedders injecting [`crate::refs::store::MemoryRefStore`]).
@@ -1261,7 +1416,16 @@ impl Repository {
         let store = linked_worktree_view(&self.git_dir, store);
         self.caches
             .install_ref_store(&self.git_dir, Arc::clone(&store));
-        self.ref_store = store;
+        self.ref_store = checked_ref_store_with_hooks(
+            store,
+            self.odb.clone(),
+            self.git_dir(),
+            self.work_tree().map(Path::as_ref),
+            &self.environment,
+            &self.command_runner,
+            self.hook_stdio,
+            &self.diagnostics,
+        );
         self
     }
 
@@ -1548,6 +1712,7 @@ impl Repository {
                 options.template_dir.as_deref(),
                 options.ref_storage,
                 object_format,
+                &env,
             )?
         } else if separate_layout {
             init_repository_separate_git_dir(
@@ -1557,6 +1722,7 @@ impl Repository {
                 options.template_dir.as_deref(),
                 options.ref_storage,
                 object_format,
+                &env,
             )?
         } else {
             init_repository_with_object_format(
@@ -1566,6 +1732,7 @@ impl Repository {
                 options.template_dir.as_deref(),
                 options.ref_storage,
                 object_format,
+                &env,
             )?
         };
         Ok((
@@ -1721,8 +1888,17 @@ impl Repository {
             .as_ref()
             .and_then(|wt| compute_git_prefix(environment.as_ref(), wt));
 
-        let ref_store = open_or_install_ref_store(&caches, &git_dir, &environment, injected_refs)?;
-        caches.configure_filter_subprocess(environment.as_ref(), &git_dir, work_tree.as_deref());
+        let ref_store = checked_ref_store_with_hooks(
+            open_or_install_ref_store(&caches, &git_dir, &environment, injected_refs)?,
+            odb.clone(),
+            &git_dir,
+            work_tree.as_deref(),
+            &environment,
+            &command_runner,
+            options.hook_stdio,
+            &options.diagnostics,
+        );
+        caches.configure_filter_subprocess(&environment, &git_dir, work_tree.as_deref());
 
         let repo = Self {
             git_dir,
@@ -1758,7 +1934,7 @@ impl Repository {
     }
 
     /// Fail with [`Error::ObjectFormatMismatch`] when one of `injected` (the hash algorithms
-    /// of the stores passed to [`RepositoryBuilder::odb_builder`]) differs from
+    /// of the stores and commit-graph passed to [`RepositoryBuilder::odb_builder`]) differs from
     /// `extensions.objectformat`, SHA-1 when unset.
     ///
     /// Reads the config snapshot the open already loaded. Files-backed primaries and
@@ -2048,7 +2224,9 @@ impl Repository {
         )
     }
 
-    fn load_index_at_preserving_sparse(
+    /// Load the index at `path` without expanding sparse-directory placeholders (and
+    /// so without reading any tree), resolving a split index.
+    pub(crate) fn load_index_at_preserving_sparse(
         &self,
         path: &std::path::Path,
         parse_ctx: crate::index::IndexParseContext,
@@ -2191,7 +2369,20 @@ impl Repository {
     /// Like [`Repository::try_write_index`], but writes to an explicit index file path
     /// (for example the path selected by `GIT_INDEX_FILE`).
     pub(crate) fn try_write_index_at(&self, path: &Path, index: &mut Index) -> Result<bool> {
-        match self.write_index_at(path, index) {
+        if !self.environment().git_optional_locks {
+            return Ok(false);
+        }
+        let cfg = self.config().ok();
+        let mut lock = match crate::index::IndexLock::acquire(path, cfg.as_deref()) {
+            Ok(lock) => lock,
+            Err(e) if Self::opportunistic_index_write_skippable(&e) => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        let on_disk = crate::index::read_index_on_disk_identity(path, index.hash_algo)?;
+        if !crate::index::opportunistic_index_write_still_current(index, &on_disk) {
+            return Ok(false);
+        }
+        match self.write_index_with_lock(&mut lock, index, false) {
             Ok(()) => Ok(true),
             Err(e) if Self::opportunistic_index_write_skippable(&e) => Ok(false),
             Err(e) => Err(e),
@@ -2384,6 +2575,18 @@ impl Repository {
         Ok((lock, index))
     }
 
+    /// Like [`Self::lock_and_load_index`], but keeps sparse-directory placeholders collapsed.
+    pub(crate) fn lock_and_load_index_preserving_sparse(
+        &self,
+    ) -> Result<(crate::index::IndexLock, Index)> {
+        let lock = self.lock_index()?;
+        let index = self.load_index_at_preserving_sparse(
+            &lock.index_path,
+            crate::index::IndexParseContext::from_policy(self.thread_policy()),
+        )?;
+        Ok((lock, index))
+    }
+
     /// Shared pre-write housekeeping for [`Self::write_index_file`] and [`Self::flush_index_update`].
     fn prepare_index_for_disk_write(
         &self,
@@ -2419,7 +2622,7 @@ impl Repository {
                 }
             }
         }
-        index.content_verified.clear();
+        index.clear_content_verified();
         let skip_hash = crate::index::index_skip_hash_for_write(Some(cfg.as_ref()));
         Ok((skip_hash, cfg))
     }
@@ -2484,7 +2687,7 @@ impl Repository {
         let tree_oid = match index.cache_tree_root {
             Some(tree) => Some(tree),
             None => match resolve_head(&self.git_dir)?.oid() {
-                Some(oid) => Some(parse_commit(&self.odb.read(oid)?.data)?.tree),
+                Some(oid) => Some(self.odb.commit_tree(oid)?),
                 None => None,
             },
         };
@@ -4425,6 +4628,7 @@ fn ensure_git_directory_layout(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_fresh_git_directory(
     git_dir: &Path,
     bare: bool,
@@ -4433,6 +4637,7 @@ fn write_fresh_git_directory(
     ref_storage: crate::ref_storage::RefStorageFormat,
     object_format: HashAlgo,
     skip_hooks_and_info: bool,
+    environment: &Environment,
 ) -> Result<()> {
     ensure_git_directory_layout(git_dir, bare, ref_storage, skip_hooks_and_info)?;
 
@@ -4497,11 +4702,7 @@ fn write_fresh_git_directory(
         crate::refs::store::RawRef::Symbolic(format!("refs/heads/{initial_branch}")),
     )?;
 
-    apply_init_filesystem_config(
-        git_dir,
-        InitFilesystemConfigOptions::default(),
-        &Environment::empty(),
-    )?;
+    apply_init_filesystem_config(git_dir, InitFilesystemConfigOptions::default(), environment)?;
 
     fs::write(
         git_dir.join("description"),
@@ -4517,7 +4718,7 @@ fn write_fresh_git_directory(
 ///
 /// # Errors
 ///
-/// Returns [`Error::Io`] on filesystem failures.
+/// Returns [`Error::WorktreePathIo`] or [`Error::GitDirPathIo`] on filesystem failures.
 pub(crate) fn init_repository_separate_git_dir(
     work_tree: &Path,
     git_dir: &Path,
@@ -4525,10 +4726,19 @@ pub(crate) fn init_repository_separate_git_dir(
     template_dir: Option<&Path>,
     ref_storage: crate::ref_storage::RefStorageFormat,
     object_format: HashAlgo,
+    environment: &Environment,
 ) -> Result<Repository> {
     let skip_hooks_info = template_dir.is_some_and(|p| p.as_os_str().is_empty());
-    fs::create_dir_all(work_tree)?;
-    fs::create_dir_all(git_dir)?;
+    fs::create_dir_all(work_tree).map_err(|source| {
+        map_worktree_io(
+            path_for_error_message(work_tree),
+            WorktreePathOperation::Create,
+            source,
+        )
+    })?;
+    fs::create_dir_all(git_dir).map_err(|source| {
+        map_git_dir_io(git_dir, git_dir, GitDirPathOperation::CreateDir, source)
+    })?;
     let existing = git_dir.join("config").is_file() && git_dir.join("HEAD").is_file();
     if existing {
         ensure_git_directory_layout(git_dir, false, ref_storage, skip_hooks_info)?;
@@ -4541,6 +4751,7 @@ pub(crate) fn init_repository_separate_git_dir(
             ref_storage,
             object_format,
             skip_hooks_info,
+            environment,
         )?;
     }
 
@@ -4555,7 +4766,7 @@ pub(crate) fn init_repository_separate_git_dir(
 
     Repository::open(
         git_dir,
-        &RepositoryOptions::empty().with_work_tree(work_tree),
+        &RepositoryOptions::with_environment(environment.clone()).with_work_tree(work_tree),
     )
 }
 
@@ -4607,6 +4818,7 @@ pub(crate) fn init_repository(
         template_dir,
         ref_storage,
         HashAlgo::Sha1,
+        &Environment::empty(),
     )
 }
 
@@ -4617,6 +4829,7 @@ pub(crate) fn init_repository_with_object_format(
     template_dir: Option<&Path>,
     ref_storage: crate::ref_storage::RefStorageFormat,
     object_format: HashAlgo,
+    environment: &Environment,
 ) -> Result<Repository> {
     let skip_hooks_info = !bare && template_dir.is_some_and(|p| p.as_os_str().is_empty());
     let git_dir = if bare {
@@ -4626,9 +4839,25 @@ pub(crate) fn init_repository_with_object_format(
     };
 
     if !bare {
-        fs::create_dir_all(path)?;
+        fs::create_dir_all(path).map_err(|source| {
+            map_worktree_io(
+                path_for_error_message(path),
+                WorktreePathOperation::Create,
+                source,
+            )
+        })?;
     }
-    fs::create_dir_all(&git_dir)?;
+    fs::create_dir_all(&git_dir).map_err(|source| {
+        if bare {
+            map_worktree_io(
+                path_for_error_message(path),
+                WorktreePathOperation::Create,
+                source,
+            )
+        } else {
+            map_git_dir_io(&git_dir, &git_dir, GitDirPathOperation::CreateDir, source)
+        }
+    })?;
     let existing = git_dir.join("config").is_file() && git_dir.join("HEAD").is_file();
     if existing {
         ensure_git_directory_layout(&git_dir, bare, ref_storage, skip_hooks_info)?;
@@ -4641,15 +4870,20 @@ pub(crate) fn init_repository_with_object_format(
             ref_storage,
             object_format,
             skip_hooks_info,
+            environment,
         )?;
     }
 
     if bare {
-        Repository::open(&git_dir, &RepositoryOptions::empty())
+        Repository::open(
+            &git_dir,
+            &RepositoryOptions::with_environment(environment.clone()),
+        )
     } else {
         Repository::open(
             &git_dir,
-            &RepositoryOptions::empty().with_work_tree(path.to_path_buf()),
+            &RepositoryOptions::with_environment(environment.clone())
+                .with_work_tree(path.to_path_buf()),
         )
     }
 }
@@ -4661,7 +4895,7 @@ pub(crate) fn init_repository_with_object_format(
 ///
 /// # Errors
 ///
-/// Returns [`Error::Io`] on filesystem failures.
+/// Returns [`Error::WorktreePathIo`] or [`Error::GitDirPathIo`] on filesystem failures.
 pub(crate) fn init_bare_with_env_worktree(
     git_dir: &Path,
     work_tree: &Path,
@@ -4669,6 +4903,7 @@ pub(crate) fn init_bare_with_env_worktree(
     template_dir: Option<&Path>,
     ref_storage: crate::ref_storage::RefStorageFormat,
     object_format: HashAlgo,
+    environment: &Environment,
 ) -> Result<Repository> {
     fs::create_dir_all(git_dir)?;
     fs::create_dir_all(work_tree)?;
@@ -4684,6 +4919,7 @@ pub(crate) fn init_bare_with_env_worktree(
             ref_storage,
             object_format,
             false,
+            environment,
         )?;
     }
     let work_tree_abs = work_tree
@@ -4698,7 +4934,7 @@ pub(crate) fn init_bare_with_env_worktree(
     config.write()?;
     Repository::open(
         git_dir,
-        &RepositoryOptions::empty().with_work_tree(work_tree),
+        &RepositoryOptions::with_environment(environment.clone()).with_work_tree(work_tree),
     )
 }
 
@@ -4861,3 +5097,98 @@ fn test_inject_index_write_fail() -> Result<()> {
 #[cfg(test)]
 #[path = "repo_line_coverage_tests.rs"]
 mod line_coverage_tests;
+
+#[cfg(test)]
+mod config_session_tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+    use std::ffi::OsString;
+
+    fn options_with_global(home: &Path, global: &Path) -> RepositoryOptions {
+        RepositoryOptions {
+            environment: Environment::from_vars(
+                [
+                    ("HOME", home.as_os_str()),
+                    ("GIT_CONFIG_NOSYSTEM", "1".as_ref()),
+                    ("GIT_CONFIG_GLOBAL", global.as_os_str()),
+                ]
+                .map(|(k, v)| (OsString::from(k), v.to_owned())),
+                home.to_path_buf(),
+            ),
+            ..RepositoryOptions::default()
+        }
+    }
+
+    #[test]
+    fn config_is_reused_until_a_cascade_file_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("global.cfg");
+        fs::write(&global, "[user]\n\tname = First\n").unwrap();
+        let work = dir.path().join("work");
+        let options = options_with_global(dir.path(), &global);
+        Repository::init(
+            &work,
+            &InitOptions {
+                environment: Some(options.environment.clone()),
+                ..InitOptions::default()
+            },
+        )
+        .unwrap();
+        let repo = Repository::discover(Some(&work), &options).unwrap();
+
+        let first = repo.config().unwrap();
+        assert_eq!(first.get("user.name").as_deref(), Some("First"));
+        assert!(Arc::ptr_eq(&first, &repo.config().unwrap()));
+
+        fs::write(&global, "[user]\n\tname = Second one\n").unwrap();
+        assert_eq!(
+            repo.config().unwrap().get("user.name").as_deref(),
+            Some("Second one")
+        );
+
+        let local = repo.git_dir().join("config");
+        let mut text = fs::read_to_string(&local).unwrap();
+        text.push_str("[user]\n\tname = Local\n");
+        fs::write(&local, text).unwrap();
+        let reloaded = repo.config().unwrap();
+        assert_eq!(reloaded.get("user.name").as_deref(), Some("Local"));
+        assert!(Arc::ptr_eq(&reloaded, &repo.config().unwrap()));
+
+        fs::remove_file(&global).unwrap();
+        fs::write(&local, "[core]\n\trepositoryformatversion = 0\n").unwrap();
+        assert_eq!(repo.config().unwrap().get("user.name"), None);
+    }
+
+    #[test]
+    fn a_replaced_environment_is_checked_in_full_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("global.cfg");
+        fs::write(&global, "[user]\n\tname = Env\n").unwrap();
+        let work = dir.path().join("work");
+        let options = options_with_global(dir.path(), &global);
+        Repository::init(
+            &work,
+            &InitOptions {
+                environment: Some(options.environment.clone()),
+                ..InitOptions::default()
+            },
+        )
+        .unwrap();
+        let mut repo = Repository::discover(Some(&work), &options).unwrap();
+        let before = repo.config().unwrap();
+
+        // An equal snapshot in a new allocation passes the full check and keeps the session.
+        repo.environment = Arc::new(options.environment.clone());
+        assert!(Arc::ptr_eq(&before, &repo.config().unwrap()));
+
+        // A snapshot naming another global file must not reuse the old stamps.
+        let other = dir.path().join("other.cfg");
+        fs::write(&other, "[user]\n\tname = Other\n").unwrap();
+        repo.environment = Arc::new(options_with_global(dir.path(), &other).environment);
+        assert_eq!(
+            repo.config().unwrap().get("user.name").as_deref(),
+            Some("Other")
+        );
+    }
+}

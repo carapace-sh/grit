@@ -50,17 +50,35 @@ pub enum CloneError {
     /// Remote resolution or transport failure.
     #[error(transparent)]
     Remote(#[from] crate::remote::RemoteError),
+    /// Every object and ref arrived and `HEAD` is set, but checking out the work tree
+    /// failed, for example because a partial clone could not fetch the blobs it needs.
+    ///
+    /// As with Git, the repository is kept so the checkout can be retried (for example
+    /// with a hard reset to `HEAD`); [`Self::should_cleanup_failed_clone`] is `false`. A
+    /// checkout cancelled part way is [`CloneError::Library`] with [`Error::Cancelled`]
+    /// instead, and is cleaned up like any other cancelled clone.
+    #[error("cloned into '{}', but checking out {commit} failed: {source}", .path.display())]
+    CheckoutFailed {
+        /// Destination of the clone, where the repository was kept.
+        path: PathBuf,
+        /// The commit the checkout was writing.
+        commit: ObjectId,
+        /// Why the checkout failed.
+        #[source]
+        source: Box<Error>,
+    },
 }
 
 impl CloneError {
     /// Whether [`cleanup_failed_clone`] may run after this failure.
     ///
     /// Returns `false` when the destination must be left unchanged: [`CloneError::DestNotEmpty`]
-    /// and pre-initialization failures such as [`RemoteError::InvalidRemoteName`].
+    /// and pre-initialization failures such as [`RemoteError::InvalidRemoteName`], and
+    /// [`CloneError::CheckoutFailed`], whose repository is kept.
     #[must_use]
     pub fn should_cleanup_failed_clone(&self) -> bool {
         match self {
-            Self::DestNotEmpty(_) | Self::InvalidCloneDepth => false,
+            Self::DestNotEmpty(_) | Self::InvalidCloneDepth | Self::CheckoutFailed { .. } => false,
             Self::Remote(RemoteError::InvalidRemoteName(_)) => false,
             Self::RemoteRefNotFound(_) => true,
             Self::Library(_) | Self::Remote(_) => true,
@@ -80,7 +98,10 @@ impl CloneError {
         match self {
             Self::Library(e) => e.is_remote_unreadable(),
             Self::Remote(e) => e.is_remote_unreadable(),
-            Self::DestNotEmpty(_) | Self::RemoteRefNotFound(_) | Self::InvalidCloneDepth => false,
+            Self::DestNotEmpty(_)
+            | Self::RemoteRefNotFound(_)
+            | Self::InvalidCloneDepth
+            | Self::CheckoutFailed { .. } => false,
         }
     }
 
@@ -92,8 +113,72 @@ impl CloneError {
         match self {
             Self::Library(e) => e.is_cancelled(),
             Self::Remote(e) => e.is_cancelled(),
-            Self::DestNotEmpty(_) | Self::RemoteRefNotFound(_) | Self::InvalidCloneDepth => false,
+            Self::DestNotEmpty(_)
+            | Self::RemoteRefNotFound(_)
+            | Self::InvalidCloneDepth
+            | Self::CheckoutFailed { .. } => false,
         }
+    }
+
+    /// The repository a failed clone left in place ([`CloneError::CheckoutFailed`]).
+    ///
+    /// # Returns
+    ///
+    /// The clone destination when the fetch and ref setup succeeded and only the
+    /// checkout failed; `None` for every other failure.
+    #[must_use]
+    pub fn kept_repository(&self) -> Option<&Path> {
+        match self {
+            Self::CheckoutFailed { path, .. } => Some(path),
+            _ => None,
+        }
+    }
+
+    /// The promised object a [`CloneError::CheckoutFailed`] checkout could not get.
+    ///
+    /// # Returns
+    ///
+    /// The first object still missing when the checkout failed on
+    /// [`Error::PromisorFetchFailed`] or [`Error::PromisedObjectMissing`] (for example
+    /// with lazy fetch turned off); `None` otherwise.
+    #[must_use]
+    pub fn missing_promised_object(&self) -> Option<ObjectId> {
+        let Self::CheckoutFailed { source, .. } = self else {
+            return None;
+        };
+        match promisor_cause(source)? {
+            Error::PromisorFetchFailed { missing, .. } => Some(*missing),
+            Error::PromisedObjectMissing(oid) => Some(*oid),
+            _ => None,
+        }
+    }
+
+    /// The promisor remotes that failed while a [`CloneError::CheckoutFailed`] checkout
+    /// fetched its missing objects.
+    ///
+    /// # Returns
+    ///
+    /// Each failing remote's name with its first error, in the order they were tried;
+    /// empty when the checkout did not fail on [`Error::PromisorFetchFailed`].
+    #[must_use]
+    pub fn failed_promisor_remotes(&self) -> &[(String, Error)] {
+        let Self::CheckoutFailed { source, .. } = self else {
+            return &[];
+        };
+        match promisor_cause(source) {
+            Some(Error::PromisorFetchFailed { failures, .. }) => failures,
+            _ => &[],
+        }
+    }
+}
+
+/// The promisor fetch failure behind a checkout error, looking through a checkout whose
+/// rollback was also incomplete.
+fn promisor_cause(err: &Error) -> Option<&Error> {
+    match err {
+        Error::PromisorFetchFailed { .. } | Error::PromisedObjectMissing(_) => Some(err),
+        Error::CheckoutRollbackIncomplete { source, .. } => promisor_cause(source),
+        _ => None,
     }
 }
 
@@ -139,13 +224,25 @@ pub struct CloneOptions {
     pub depth: Option<u32>,
     /// Partial-clone object filter applied to the initial fetch and recorded in config.
     pub filter: Option<ObjectFilterSpec>,
+    /// Pick the filter from the promisor remotes the server advertises and the new
+    /// repository accepts (Git's `clone --filter=auto`), and record
+    /// `remote.<name>.partialclonefilter=auto` so later fetches do the same. Ignored when
+    /// [`Self::filter`] is set. Accepting needs `promisor.acceptFromServer` and the promisor
+    /// remotes themselves in config, usually through [`Self::config`].
+    pub auto_filter: bool,
+    /// Config entries written into the new repository right after it is created, before
+    /// anything is fetched (`git clone -c <key>=<value>`). Each entry is added, so a key
+    /// given twice gets both values.
+    pub config: Vec<(String, String)>,
     /// Remote branch or tag to check out (`git clone -b` / `--branch`).
     pub branch: Option<String>,
     /// Single-branch fetch (`git clone --single-branch` / `--no-single-branch`).
     ///
     /// `None` matches Git: depth implies single-branch unless explicitly disabled.
     pub single_branch: Option<bool>,
-    /// Tag fetch mode. `None` uses Git defaults (all tags for full clones, following for shallow).
+    /// Tag fetch mode. `None` uses Git defaults: all tags for full multi-branch clones,
+    /// tag-following when [`clone_effective_single_branch`] is true (explicit
+    /// `--single-branch` or shallow clone without `--no-single-branch`).
     pub tags: Option<CloneTags>,
     /// Optional on-demand promisor fetcher installed on the opened repository (for checkout prefetch).
     pub promisor_fetcher: Option<Arc<dyn PromisorFetcher>>,
@@ -172,6 +269,8 @@ impl CloneOptions {
             thread_policy: crate::parallel::ThreadPolicy::default(),
             depth: None,
             filter: None,
+            auto_filter: false,
+            config: Vec::new(),
             branch: None,
             single_branch: None,
             tags: None,
@@ -268,11 +367,38 @@ pub struct CloneOutcome {
     pub worktree_bytes: u64,
     /// Index paths that collided on a case-insensitive filesystem during checkout.
     pub path_collisions: Vec<String>,
+    /// Gitlink paths materialized during checkout (submodules grit does not fetch).
+    pub submodule_paths: Vec<String>,
     /// Whether the destination is a bare repository.
     pub bare: bool,
     /// Whether a bundle from the server's `bundle-uri` seeded the clone.
     /// [`Self::transfer`] includes what the bundle brought.
     pub bundle: crate::bundle_uri::BundleSeed,
+    /// True when the initial fetch sent an object filter and the server applied it.
+    /// False while [`Self::filter`] is set means the server does not support `filter`,
+    /// so every object came; the clone is still configured as a partial clone, as Git
+    /// leaves it (see [`Self::filter_ignored`]).
+    pub filter_sent: bool,
+    /// The `promisor-remote` exchange of the initial fetch, when the server advertised
+    /// promisor remotes.
+    pub promisor: Option<crate::promisor_remote::PromisorHandshake>,
+    /// The filter the initial fetch used: [`CloneOptions::filter`], or what
+    /// [`CloneOptions::auto_filter`] resolved to.
+    pub filter: Option<ObjectFilterSpec>,
+}
+
+impl CloneOutcome {
+    /// Whether a filter was requested but the server does not support `filter`.
+    ///
+    /// # Returns
+    ///
+    /// `true` when [`Self::filter`] is set but was not sent ([`Self::filter_sent`] is
+    /// false), so the server sent every object; the clone is still configured as a
+    /// partial clone, as Git leaves it.
+    #[must_use]
+    pub fn filter_ignored(&self) -> bool {
+        self.filter.is_some() && !self.filter_sent
+    }
 }
 
 /// Derive a destination directory from a clone URL (Git [`git_url_basename`]).
@@ -411,7 +537,11 @@ fn dir_is_empty(path: &Path) -> bool {
 /// Remove a partially created clone destination.
 ///
 /// When `keep_toplevel` is true, only contents of `path` are removed (empty dir existed before clone).
+/// Call it on the thread that ran [`clone`]: it first drops that thread's cached pack maps.
 pub fn cleanup_failed_clone(path: &Path, keep_toplevel: bool) {
+    // Windows refuses to delete a memory-mapped file, and the clone's pack reads leave the
+    // new packs mapped in this thread's caches.
+    crate::pack::clear_pack_cache();
     if keep_toplevel {
         let Ok(entries) = fs::read_dir(path) else {
             return;
@@ -427,6 +557,170 @@ pub fn cleanup_failed_clone(path: &Path, keep_toplevel: bool) {
     } else {
         let _ = fs::remove_dir_all(path);
     }
+}
+
+/// Options for [`clone_into`]: configure a remote and fetch into an already-open repository.
+pub struct CloneIntoOptions {
+    /// Source URL or path.
+    pub url: String,
+    /// Remote name to configure (default [`DEFAULT_REMOTE`]).
+    pub remote_name: String,
+    /// Process environment for config and reflog identity.
+    pub environment: Environment,
+    /// Initial branch name when the repository has no commits yet (`main`).
+    pub initial_branch: String,
+    /// Global thread policy for fetch pack ingest.
+    pub thread_policy: crate::parallel::ThreadPolicy,
+    /// Shallow clone depth.
+    pub depth: Option<u32>,
+    /// Partial-clone filter for the fetch.
+    pub filter: Option<ObjectFilterSpec>,
+    /// Branch or tag to check out.
+    pub branch: Option<String>,
+    /// Single-branch fetch mode.
+    pub single_branch: Option<bool>,
+    /// Tag fetch mode.
+    pub tags: Option<CloneTags>,
+    /// Promisor fetcher for checkout prefetch.
+    pub promisor_fetcher: Option<Arc<dyn PromisorFetcher>>,
+    /// Whether this repository is bare (affects ref layout).
+    pub bare: bool,
+    /// Populate the working tree after fetch.
+    pub checkout: bool,
+    /// Bundle-uri cache directory.
+    pub bundle_cache: Option<PathBuf>,
+}
+
+impl CloneIntoOptions {
+    /// Options for fetching from `url` into an existing repository.
+    #[must_use]
+    pub fn new(url: impl Into<String>) -> Self {
+        Self {
+            url: url.into(),
+            remote_name: DEFAULT_REMOTE.to_owned(),
+            environment: Environment::empty(),
+            initial_branch: "main".to_owned(),
+            thread_policy: crate::parallel::ThreadPolicy::default(),
+            depth: None,
+            filter: None,
+            branch: None,
+            single_branch: None,
+            tags: None,
+            promisor_fetcher: None,
+            bare: false,
+            checkout: true,
+            bundle_cache: None,
+        }
+    }
+
+    /// Replace the process environment used for config and reflog identity.
+    #[must_use]
+    pub fn with_environment(mut self, environment: Environment) -> Self {
+        self.environment = environment;
+        self
+    }
+
+    fn clone_options_for_repo(&self, repo: &Repository) -> CloneOptions {
+        let dest = repo
+            .work_tree()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| repo.git_dir().to_path_buf());
+        CloneOptions {
+            url: self.url.clone(),
+            dest,
+            remote_name: self.remote_name.clone(),
+            environment: self.environment.clone(),
+            initial_branch: self.initial_branch.clone(),
+            thread_policy: self.thread_policy,
+            depth: self.depth,
+            filter: self.filter,
+            branch: self.branch.clone(),
+            single_branch: self.single_branch,
+            tags: self.tags,
+            promisor_fetcher: self.promisor_fetcher.clone(),
+            bare: self.bare,
+            checkout: self.checkout,
+            bundle_cache: self.bundle_cache.clone(),
+            auto_filter: false,
+            config: Vec::new(),
+        }
+    }
+}
+
+/// Result of [`clone_into`].
+#[derive(Debug)]
+pub struct CloneIntoOutcome {
+    /// Branch checked out, or detached tag checkout.
+    pub head: CloneHead,
+    /// Commit checked out on that branch.
+    pub checkout_oid: ObjectId,
+    /// Checkout disposition after fetch.
+    pub checkout: CloneCheckout,
+    /// Objects received during the fetch.
+    pub transfer: TransferStats,
+    /// Remote branches fetched.
+    pub branches: u64,
+    /// Remote tags fetched.
+    pub tags: u64,
+    /// Working-tree files checked out.
+    pub files: u64,
+    /// Checked-out file bytes.
+    pub worktree_bytes: u64,
+    /// Case-collision paths during checkout.
+    pub path_collisions: Vec<String>,
+    /// Submodule gitlink paths materialized at checkout.
+    pub submodule_paths: Vec<String>,
+    /// Whether a bundle-uri seed ran.
+    pub bundle: crate::bundle_uri::BundleSeed,
+    /// Whether a partial-clone filter was applied by the server.
+    pub filter_sent: bool,
+}
+
+/// Configure a remote on `repo`, fetch from `opts.url`, set up `HEAD`, and optionally check out.
+///
+/// Use this when the repository is already open with a custom object or ref store. Path-based
+/// [`clone`] always initializes a files-backed layout; `clone_into` only runs fetch and checkout.
+/// The supplied `repo` handle is kept through fetch and checkout (injected stores are not
+/// replaced with a files-backed reopen). Set [`CloneIntoOptions::environment`] explicitly when
+/// config or reflog identity must reflect the host process.
+///
+/// # Errors
+///
+/// Same as [`clone`] except [`CloneError::DestNotEmpty`] cannot occur. Local clone sources
+/// whose object format differs from the repository's injected store return
+/// [`Error::ObjectFormatMismatch`](crate::error::Error::ObjectFormatMismatch).
+pub fn clone_into(
+    repo: Repository,
+    opts: CloneIntoOptions,
+    progress: &mut dyn Progress,
+    cancel: &dyn Cancel,
+    http_factory: Option<&dyn HttpClientFactory>,
+) -> std::result::Result<CloneIntoOutcome, CloneError> {
+    if opts.depth == Some(0) {
+        return Err(CloneError::InvalidCloneDepth);
+    }
+    if !crate::remote::is_valid_remote_name(&opts.remote_name) {
+        return Err(CloneError::Remote(RemoteError::InvalidRemoteName(
+            opts.remote_name.clone(),
+        )));
+    }
+    ensure_clone_remote_object_format(&repo, &opts.url, &opts.environment)?;
+    let clone_opts = opts.clone_options_for_repo(&repo);
+    let outcome = populate_repo_from_remote(repo, clone_opts, progress, cancel, http_factory)?;
+    Ok(CloneIntoOutcome {
+        head: outcome.head,
+        checkout_oid: outcome.checkout_oid,
+        checkout: outcome.checkout,
+        transfer: outcome.transfer,
+        branches: outcome.branches,
+        tags: outcome.tags,
+        files: outcome.files,
+        worktree_bytes: outcome.worktree_bytes,
+        path_collisions: outcome.path_collisions,
+        submodule_paths: outcome.submodule_paths,
+        bundle: outcome.bundle,
+        filter_sent: outcome.filter_sent,
+    })
 }
 
 /// Initialize, fetch, configure the default branch, and optionally check out files.
@@ -464,20 +758,6 @@ pub fn clone(
 
     let bare = opts.bare;
     CloneDestinationGuard::try_claim(&opts.dest, bare)?;
-    clone_after_claim(opts, progress, cancel, http_factory, bare)
-}
-
-fn clone_after_claim(
-    opts: CloneOptions,
-    progress: &mut dyn Progress,
-    cancel: &dyn Cancel,
-    http_factory: Option<&dyn HttpClientFactory>,
-    bare: bool,
-) -> std::result::Result<CloneOutcome, CloneError> {
-    let dir = opts
-        .dest
-        .to_str()
-        .ok_or_else(|| CloneError::Library(Error::Message("non-UTF-8 destination path".into())))?;
     let discovery_cwd = opts.environment.discovery_cwd();
     let object_format =
         local_clone_source_hash_algo(&opts.url, &discovery_cwd).unwrap_or(HashAlgo::Sha1);
@@ -488,6 +768,7 @@ fn clone_after_claim(
         None,
         RefStorageFormat::Files,
         object_format,
+        &Environment::empty(),
     )
     .map_err(|e| {
         CloneError::Library(Error::Message(format!("could not initialize '{dir}': {e}")))
@@ -497,7 +778,7 @@ fn clone_after_claim(
     } else {
         opts.dest.join(".git")
     };
-    let mut repo = open_clone_repository(
+    let repo = open_clone_repository(
         &git_dir,
         &opts.dest,
         bare,
@@ -505,7 +786,54 @@ fn clone_after_claim(
         opts.promisor_fetcher.clone(),
     )
     .map_err(CloneError::Library)?;
+    populate_repo_from_remote(repo, opts, progress, cancel, http_factory)
+}
 
+fn populate_repo_from_remote(
+    repo: Repository,
+    opts: CloneOptions,
+    progress: &mut dyn Progress,
+    cancel: &dyn Cancel,
+    http_factory: Option<&dyn HttpClientFactory>,
+) -> std::result::Result<CloneOutcome, CloneError> {
+    let bare = opts.bare;
+    clone_after_claim(repo, opts, progress, cancel, http_factory, bare)
+}
+
+/// For injected object stores, refuse a local clone source whose object format differs.
+fn ensure_clone_remote_object_format(
+    repo: &Repository,
+    url: &str,
+    environment: &Environment,
+) -> std::result::Result<(), CloneError> {
+    if repo.odb().uses_files_primary() {
+        return Ok(());
+    }
+    let Some(remote_algo) = local_clone_source_hash_algo(url, &environment.discovery_cwd()) else {
+        return Ok(());
+    };
+    let local = repo.odb().hash_algo();
+    if local != remote_algo {
+        return Err(CloneError::Library(Error::ObjectFormatMismatch {
+            repository: local,
+            store: remote_algo,
+        }));
+    }
+    Ok(())
+}
+
+fn clone_after_claim(
+    mut repo: Repository,
+    opts: CloneOptions,
+    progress: &mut dyn Progress,
+    cancel: &dyn Cancel,
+    http_factory: Option<&dyn HttpClientFactory>,
+    bare: bool,
+) -> std::result::Result<CloneOutcome, CloneError> {
+    let git_dir = repo.git_dir().to_path_buf();
+    let preserve_injected_store = !repo.odb().uses_files_primary();
+
+    add_local_config(&repo, &opts.config)?;
     let origin_url = stored_clone_remote_url(&opts.url);
     set_local_config(
         &repo,
@@ -517,7 +845,12 @@ fn clone_after_claim(
 
     let config = ConfigSet::load(&opts.environment, Some(repo.git_dir()), true)
         .map_err(CloneError::Library)?;
-    let remote = Remote::from_config(&config, &opts.remote_name)?;
+    let mut remote = Remote::from_config(&config, &opts.remote_name)?;
+    if bare {
+        // Bare clones have no `remote.*.fetch` refspec; avoid synthesizing tracking refspecs
+        // that would create `refs/remotes/<name>/…` (Git bare clone has none).
+        remote.fetch_refspecs.clear();
+    }
     let requested = match opts.branch.as_deref() {
         Some(name) => resolve_requested_clone_ref(name, &remote, &repo, http_factory)?,
         None => CloneRequestedRef::Default,
@@ -566,6 +899,7 @@ fn clone_after_claim(
         remote_progress: progress.remote_sideband_progress(),
         fetch_depth: opts.depth.and_then(crate::transfer::FetchDepth::depth),
         filter: opts.filter,
+        auto_filter: opts.auto_filter && opts.filter.is_none(),
         link_source_objects: should_store_absolute_local_clone_url(&opts.url),
         ..Default::default()
     };
@@ -573,7 +907,7 @@ fn clone_after_claim(
         fetch_opts.http_protocol_version = Some(v);
     }
     let bundle = match opts.bundle_cache.as_deref() {
-        Some(cache) if opts.depth.is_none() && opts.filter.is_none() => {
+        Some(cache) if opts.depth.is_none() && opts.filter.is_none() && !opts.auto_filter => {
             remote.seed_from_bundle_uri(&repo, cache, progress, cancel, http_factory)
         }
         _ => crate::bundle_uri::BundleSeed::NotOffered,
@@ -586,21 +920,35 @@ fn clone_after_claim(
         crate::bundle_uri::remove_bundle_refs(&repo).map_err(CloneError::Library)?;
         fetch_outcome.transfer += seeded.transfer;
     }
-    // Wire clone may upgrade an empty SHA-1 destination to the remote object format; reopen so
-    // checkout uses a fresh ODB hash algorithm (the pre-fetch handle caches SHA-1).
-    repo = open_clone_repository(
-        &git_dir,
-        &opts.dest,
-        bare,
-        &opts.environment,
-        opts.promisor_fetcher.clone(),
-    )
-    .map_err(CloneError::Library)?;
-
-    if let Some(spec) = opts.filter {
-        PartialCloneConfig::write(repo.git_dir(), &opts.remote_name, &spec)
-            .map_err(CloneError::Library)?;
+    if !preserve_injected_store {
+        // Wire clone may upgrade an empty SHA-1 destination to the remote object format; reopen
+        // so checkout uses a fresh ODB hash algorithm (the pre-fetch handle caches SHA-1).
+        repo = open_clone_repository(
+            &git_dir,
+            &opts.dest,
+            bare,
+            &opts.environment,
+            opts.promisor_fetcher.clone(),
+        )
+        .map_err(CloneError::Library)?;
     }
+
+    let used_filter = match opts.filter {
+        Some(spec) => {
+            PartialCloneConfig::write(repo.git_dir(), &opts.remote_name, &spec)
+                .map_err(CloneError::Library)?;
+            Some(spec)
+        }
+        None if opts.auto_filter => {
+            PartialCloneConfig::write_auto(repo.git_dir(), &opts.remote_name)
+                .map_err(CloneError::Library)?;
+            fetch_outcome
+                .promisor
+                .as_ref()
+                .and_then(|h| h.resolved_filter)
+        }
+        None => None,
+    };
 
     let (head, oid) = setup_clone_head(
         &repo,
@@ -628,11 +976,25 @@ fn clone_after_claim(
     let mut files = 0;
     let mut worktree_bytes = 0;
     let mut path_collisions = Vec::new();
+    let mut submodule_paths = Vec::new();
     if opts.checkout && !bare {
         if let CloneCheckout::CheckedOut(checkout_oid) = checkout {
-            (files, worktree_bytes, path_collisions) =
-                perform_clone_checkout(&repo, checkout_oid, progress, cancel)
-                    .map_err(CloneError::Library)?;
+            // Objects and refs are in place: from here on a failure keeps the repository,
+            // as Git does, so the checkout can be retried.
+            (files, worktree_bytes, path_collisions, submodule_paths) =
+                perform_clone_checkout(&repo, checkout_oid, progress, cancel).map_err(
+                    |source| {
+                        if source.is_cancelled() {
+                            CloneError::Library(source)
+                        } else {
+                            CloneError::CheckoutFailed {
+                                path: opts.dest.clone(),
+                                commit: checkout_oid,
+                                source: Box::new(source),
+                            }
+                        }
+                    },
+                )?;
         }
     } else if matches!(checkout, CloneCheckout::CheckedOut(_)) {
         checkout = CloneCheckout::Skipped;
@@ -652,9 +1014,22 @@ fn clone_after_claim(
         files,
         worktree_bytes,
         path_collisions,
+        submodule_paths,
         bare,
         bundle,
+        filter_sent: fetch_outcome.filter_sent,
+        promisor: fetch_outcome.promisor,
+        filter: used_filter,
     })
+}
+
+fn gitlink_paths_in_index(index: &crate::index::Index) -> Vec<String> {
+    index
+        .entries
+        .iter()
+        .filter(|e| e.stage() == 0 && e.mode == crate::index::MODE_GITLINK)
+        .map(|e| String::from_utf8_lossy(&e.path).into_owned())
+        .collect()
 }
 
 fn perform_clone_checkout(
@@ -662,7 +1037,7 @@ fn perform_clone_checkout(
     commit: ObjectId,
     progress: &mut dyn Progress,
     cancel: &dyn Cancel,
-) -> Result<(u64, u64, Vec<String>)> {
+) -> Result<(u64, u64, Vec<String>, Vec<String>)> {
     let tree = crate::diff::tree_oid_of_commit_in_repo(repo, &commit)?;
     let checkout = crate::porcelain::checkout::checkout_between_trees_with_progress(
         repo, None, &tree, progress, cancel,
@@ -675,11 +1050,26 @@ fn perform_clone_checkout(
         .unwrap_or(false);
     let (files, worktree_bytes) =
         crate::path_icase::icase_worktree_file_stats(&index, repo.work_tree(), ignorecase);
-    Ok((files, worktree_bytes, checkout.path_collisions))
+    let submodule_paths = gitlink_paths_in_index(&index);
+    Ok((
+        files,
+        worktree_bytes,
+        checkout.path_collisions,
+        submodule_paths,
+    ))
+}
+
+fn resolve_clone_ref(repo: &Repository, refname: &str) -> ObjectId {
+    refs::resolve_ref_in(repo, refname).unwrap_or(ObjectId::zero())
+}
+
+fn write_clone_head_symref(repo: &Repository, target: &str) -> std::result::Result<(), CloneError> {
+    refs::write_symbolic_ref_on_store(repo.refs(), repo.git_dir(), "HEAD", target)
+        .map_err(CloneError::Library)
 }
 
 fn local_branch_names_with_commits(repo: &Repository) -> Vec<String> {
-    refs::list_refs(repo.git_dir(), "refs/heads/")
+    refs::list_refs_in(repo, "refs/heads/")
         .unwrap_or_default()
         .into_iter()
         .filter_map(|(name, oid)| {
@@ -693,7 +1083,7 @@ fn local_branch_names_with_commits(repo: &Repository) -> Vec<String> {
 
 fn remote_branch_names_with_commits(repo: &Repository, remote_name: &str) -> Vec<String> {
     let prefix = format!("refs/remotes/{remote_name}/");
-    refs::list_refs(repo.git_dir(), &prefix)
+    refs::list_refs_in(repo, &prefix)
         .unwrap_or_default()
         .into_iter()
         .filter_map(|(name, oid)| {
@@ -831,7 +1221,7 @@ pub fn clone_effective_single_branch(opts: &CloneOptions) -> bool {
 
 fn resolve_clone_tag_mode(opts: &CloneOptions) -> TagMode {
     opts.tags.map(CloneTags::tag_mode).unwrap_or_else(|| {
-        if opts.depth.is_some() {
+        if clone_effective_single_branch(opts) {
             TagMode::Following
         } else {
             TagMode::All
@@ -851,7 +1241,8 @@ fn setup_clone_head(
     match requested {
         CloneRequestedRef::Tag { name, peel } => {
             if !peel.is_zero() {
-                refs::write_ref(repo.git_dir(), "HEAD", peel).map_err(CloneError::Library)?;
+                refs::update_direct_ref_on_store(repo.refs(), repo.git_dir(), "HEAD", peel)
+                    .map_err(CloneError::Library)?;
                 refs::append_reflog_with_signature(
                     repo.git_dir(),
                     "HEAD",
@@ -874,13 +1265,18 @@ fn setup_clone_head(
         CloneRequestedRef::Branch(branch) => {
             let branch_ref = format!("refs/heads/{branch}");
             let oid = if opts.bare {
-                refs::resolve_ref(repo.git_dir(), &branch_ref).unwrap_or(ObjectId::zero())
+                resolve_clone_ref(repo, &branch_ref)
             } else {
                 let tracking = format!("refs/remotes/{}/{}", opts.remote_name, branch);
-                let oid = refs::resolve_ref(repo.git_dir(), &tracking).unwrap_or(ObjectId::zero());
+                let oid = resolve_clone_ref(repo, &tracking);
                 if !oid.is_zero() {
-                    refs::write_ref(repo.git_dir(), &branch_ref, &oid)
-                        .map_err(CloneError::Library)?;
+                    refs::update_direct_ref_on_store(
+                        repo.refs(),
+                        repo.git_dir(),
+                        &branch_ref,
+                        &oid,
+                    )
+                    .map_err(CloneError::Library)?;
                     refs::append_reflog_with_signature(
                         repo.git_dir(),
                         &branch_ref,
@@ -894,8 +1290,7 @@ fn setup_clone_head(
                 }
                 oid
             };
-            refs::write_symbolic_ref(repo.git_dir(), "HEAD", &branch_ref)
-                .map_err(CloneError::Library)?;
+            write_clone_head_symref(repo, &branch_ref)?;
             if !oid.is_zero() {
                 refs::append_reflog_with_signature(
                     repo.git_dir(),
@@ -933,13 +1328,18 @@ fn setup_clone_head(
             );
             let branch_ref = format!("refs/heads/{default}");
             let oid = if opts.bare {
-                refs::resolve_ref(repo.git_dir(), &branch_ref).unwrap_or(ObjectId::zero())
+                resolve_clone_ref(repo, &branch_ref)
             } else {
                 let tracking = format!("refs/remotes/{}/{default}", opts.remote_name);
-                let oid = refs::resolve_ref(repo.git_dir(), &tracking).unwrap_or(ObjectId::zero());
+                let oid = resolve_clone_ref(repo, &tracking);
                 if !oid.is_zero() {
-                    refs::write_ref(repo.git_dir(), &branch_ref, &oid)
-                        .map_err(CloneError::Library)?;
+                    refs::update_direct_ref_on_store(
+                        repo.refs(),
+                        repo.git_dir(),
+                        &branch_ref,
+                        &oid,
+                    )
+                    .map_err(CloneError::Library)?;
                     refs::append_reflog_with_signature(
                         repo.git_dir(),
                         &branch_ref,
@@ -953,8 +1353,7 @@ fn setup_clone_head(
                 }
                 oid
             };
-            refs::write_symbolic_ref(repo.git_dir(), "HEAD", &branch_ref)
-                .map_err(CloneError::Library)?;
+            write_clone_head_symref(repo, &branch_ref)?;
             if !oid.is_zero() {
                 refs::append_reflog_with_signature(
                     repo.git_dir(),
@@ -1044,6 +1443,22 @@ fn stored_clone_remote_url(url: &str) -> String {
     }
 }
 
+/// Add `entries` to the repository's local config (`git clone -c`), keeping any
+/// existing values of the same keys.
+fn add_local_config(repo: &Repository, entries: &[(String, String)]) -> Result<()> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let path = repo.git_dir().join("config");
+    let content = fs::read_to_string(&path).unwrap_or_default();
+    let mut config = ConfigFile::parse(&path, &content, ConfigScope::Local)?;
+    for (key, value) in entries {
+        config.add_value(key, value)?;
+    }
+    config.write()?;
+    Ok(())
+}
+
 fn set_local_config(repo: &Repository, entries: &[(&str, String)]) -> Result<()> {
     let path = repo.git_dir().join("config");
     let content = fs::read_to_string(&path).unwrap_or_default();
@@ -1092,7 +1507,7 @@ fn choose_clone_default_branch(
         } else {
             format!("refs/remotes/{remote_name}/{name}")
         };
-        if refs::resolve_ref(repo.git_dir(), &resolved).is_ok() {
+        if refs::resolve_ref_in(repo, &resolved).is_ok() {
             return name.clone();
         }
     }
@@ -1104,11 +1519,11 @@ fn choose_clone_default_branch(
 
 fn pick_default_branch_bare(repo: &Repository) -> Option<String> {
     for candidate in ["main", "master"] {
-        if refs::resolve_ref(repo.git_dir(), &format!("refs/heads/{candidate}")).is_ok() {
+        if refs::resolve_ref_in(repo, &format!("refs/heads/{candidate}")).is_ok() {
             return Some(candidate.to_owned());
         }
     }
-    refs::list_refs(repo.git_dir(), "refs/heads/")
+    refs::list_refs_in(repo, "refs/heads/")
         .ok()?
         .into_iter()
         .find_map(|(name, _)| name.strip_prefix("refs/heads/").map(str::to_owned))
@@ -1158,16 +1573,11 @@ fn default_branch_from_local_remote(url: &str, repo: &Repository) -> Option<Stri
 
 fn pick_default_branch(repo: &Repository, remote_name: &str) -> Option<String> {
     for candidate in ["main", "master"] {
-        if refs::resolve_ref(
-            repo.git_dir(),
-            &format!("refs/remotes/{remote_name}/{candidate}"),
-        )
-        .is_ok()
-        {
+        if refs::resolve_ref_in(repo, &format!("refs/remotes/{remote_name}/{candidate}")).is_ok() {
             return Some(candidate.to_owned());
         }
     }
-    refs::list_refs(repo.git_dir(), &format!("refs/remotes/{remote_name}/"))
+    refs::list_refs_in(repo, &format!("refs/remotes/{remote_name}/"))
         .ok()?
         .into_iter()
         .find_map(|(name, _)| {
@@ -1582,7 +1992,6 @@ mod tests {
         }
         git_cmd(&["branch", "feature", "HEAD~2"], &wt);
         git_cmd(&["tag", "v1", "HEAD~1"], &wt);
-        let url = format!("file://{}", bare.to_string_lossy());
         git_cmd(&["clone", "-q", "--bare", ".", bare.to_str().unwrap()], &wt);
     }
 

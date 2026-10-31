@@ -20,13 +20,14 @@ use crate::partial_clone::ObjectFilterSpec;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, RemoteUnreadableReason, Result};
 use crate::fetch::{NoProgress, Progress};
 use crate::objects::{parse_commit, parse_tag, parse_tree, HashAlgo, ObjectId, ObjectKind};
 use crate::odb::Odb;
-use crate::progress::{ProgressPhase, ProgressSink};
+use crate::progress::{ProgressPhase, ProgressSink, ReceivedObjects};
 use crate::push_report::{PushRefResult, PushRefStatus};
 use crate::refspec::{parse_fetch_refspec, RefspecItem};
 use std::num::NonZeroU32;
@@ -175,6 +176,7 @@ impl FetchDepth {
 }
 
 /// Options controlling a fetch.
+#[non_exhaustive]
 pub struct FetchOptions {
     /// Positive refspecs selecting what to fetch.
     pub refspecs: Vec<String>,
@@ -200,7 +202,7 @@ pub struct FetchOptions {
     pub deepen_not: Vec<String>,
     /// First fetch populating a remote-tracking namespace (clone): write `packed-refs`
     /// and `refs/remotes/{remote}/HEAD`.
-    pub initial_remote_fetch: bool,
+    pub(crate) initial_remote_fetch: bool,
     /// Remote name paired with [`Self::initial_remote_fetch`] (e.g. `"origin"`).
     pub remote_name: Option<String>,
     /// Source label written into [`FETCH_HEAD`](https://git-scm.com/docs/git-fetch#_discussion).
@@ -211,6 +213,10 @@ pub struct FetchOptions {
     pub configured_refspecs: Vec<String>,
     /// Clone-only reflog entries for `refs/remotes/{remote}/HEAD` (not remote branches).
     pub clone_reflog: Option<CloneReflog>,
+    /// Force ref updates that would otherwise be rejected (non-fast-forward branches,
+    /// tag clobber under [`TagMode::All`] or explicit refspecs). Does not move tags
+    /// that already exist locally under default tag following.
+    pub force: bool,
     /// Diagnostic sink for [`crate::diagnostics::Trace::Network`] events.
     pub diagnostics: Option<crate::diagnostics::DiagnosticsHandle>,
     /// When true with [`Self::diagnostics`], fetch paths may emit network trace events.
@@ -222,7 +228,7 @@ pub struct FetchOptions {
     /// Discovery/config environment for pack ingest (`GIT_CONFIG_*`, `-c`); defaults to empty.
     pub environment: crate::environment::Environment,
     /// When true, spool the negotiated pack to disk and return without index-pack or ref updates.
-    pub pack_spool_only: bool,
+    pub(crate) pack_spool_only: bool,
     /// Override the HTTP `Git-Protocol` header for this fetch (`None` → client default, usually v2).
     pub http_protocol_version: Option<u8>,
     /// When true, omit the `no-progress` capability/argument so the remote may
@@ -231,15 +237,21 @@ pub struct FetchOptions {
     /// Object filter for partial clone (`blob:none`, `blob:limit=<n>`). Omitted when
     /// unset; promisor remotes may reapply `remote.*.partialclonefilter` automatically.
     pub filter: Option<ObjectFilterSpec>,
+    /// Pick the filter from the promisor remotes the server advertises and the client
+    /// accepts, from their advertised `partialCloneFilter` (Git's `--filter=auto`; see
+    /// [`PromisorDecision::combined_filter`](crate::promisor_remote::PromisorDecision::combined_filter)).
+    /// Ignored when [`Self::filter`] is set. A remote whose stored filter is `auto` turns it on.
+    /// Without an accepted remote that advertises a usable filter, the fetch is unfiltered.
+    pub auto_filter: bool,
     /// When true, the received pack is written with a sibling `.promisor` marker.
     ///
     /// Set by the fetch driver when a filter was sent on the wire; callers should
     /// leave this `false`.
-    pub mark_received_pack_promisor: bool,
+    pub(crate) mark_received_pack_promisor: bool,
     /// Explicit object ids to fetch (promisor on-demand); skips refspec matching and ref updates.
-    pub object_wants: Vec<ObjectId>,
+    pub(crate) object_wants: Vec<ObjectId>,
     /// On-demand promisor object fetch: always mark the received pack promisor.
-    pub promisor_object_fetch: bool,
+    pub(crate) promisor_object_fetch: bool,
     /// Initial fetch from a plain local path: hard-link the source's packfiles and
     /// loose objects wholesale instead of walking the requested refs (Git's
     /// `clone --local`).
@@ -278,10 +290,12 @@ impl Default for FetchOptions {
             http_protocol_version: None,
             remote_progress: false,
             filter: None,
+            auto_filter: false,
             mark_received_pack_promisor: false,
             object_wants: Vec::new(),
             promisor_object_fetch: false,
             link_source_objects: false,
+            force: false,
         }
     }
 }
@@ -320,15 +334,47 @@ impl Clone for FetchOptions {
             http_protocol_version: self.http_protocol_version,
             remote_progress: self.remote_progress,
             filter: self.filter,
+            auto_filter: self.auto_filter,
             mark_received_pack_promisor: self.mark_received_pack_promisor,
             object_wants: self.object_wants.clone(),
             promisor_object_fetch: self.promisor_object_fetch,
             link_source_objects: self.link_source_objects,
+            force: self.force,
         }
     }
 }
 
 impl FetchOptions {
+    /// Default fetch options for callers that set fields individually.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Clone layout fetch: populate `refs/remotes/{remote}/HEAD` and packed refs.
+    #[must_use]
+    pub fn initial_remote_fetch(mut self, enabled: bool) -> Self {
+        self.initial_remote_fetch = enabled;
+        self
+    }
+
+    /// Spool the received pack without index-pack (transport tests and diagnostics).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn pack_spool_only(mut self, enabled: bool) -> Self {
+        self.pack_spool_only = enabled;
+        self
+    }
+
+    /// Promisor on-demand object fetch by oid (see [`crate::promisor_fetch`]).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn promisor_object_wants(mut self, wants: Vec<ObjectId>) -> Self {
+        self.object_wants = wants;
+        self.promisor_object_fetch = true;
+        self
+    }
+
     /// Whether this fetch carries any shallow/deepen request (an explicit
     /// `fetch_depth`/`deepen-since`/`deepen-not`). Note this does NOT cover the
     /// "already shallow, fetching more of the same boundary" case — that is
@@ -536,6 +582,14 @@ pub struct FetchOutcome {
     pub new_unshallow: Vec<ObjectId>,
     /// Objects and pack bytes ingested during this fetch.
     pub transfer: TransferStats,
+    /// True when an object filter from [`FetchOptions::filter`] was sent on the wire
+    /// and the server advertised filter support. False with a requested filter means
+    /// the server does not support `filter` and sent every object; as in Git, the pack
+    /// is still marked promisor and the remote stays a promisor remote.
+    pub filter_sent: bool,
+    /// The `promisor-remote` exchange, when the server advertised promisor remotes
+    /// (protocol v2 only). Says which remotes were accepted and why others were not.
+    pub promisor: Option<crate::promisor_remote::PromisorHandshake>,
 }
 
 impl FetchOutcome {
@@ -678,9 +732,13 @@ fn enrich_local_link_transfer_kinds(
 }
 
 /// Per-fetch transfer stats for objects installed during one local copy operation.
+///
+/// `loose_candidates` limits which installed objects are looked for as loose files (each
+/// costs a `stat`); `None` checks all of `installed`.
 fn transfer_stats_for_local_operation(
     local_odb: &Odb,
     installed: &HashSet<ObjectId>,
+    loose_candidates: Option<&HashSet<ObjectId>>,
     pack_dir_before: &HashSet<String>,
 ) -> Result<TransferStats> {
     let objects_dir = local_odb.objects_dir();
@@ -708,7 +766,8 @@ fn transfer_stats_for_local_operation(
             }
         }
     }
-    let (loose_objects, loose_bytes) = loose_transfer_stats(local_odb, installed);
+    let (loose_objects, loose_bytes) =
+        loose_transfer_stats(local_odb, loose_candidates.unwrap_or(installed));
     bytes = bytes.saturating_add(loose_bytes);
     let installed_count = u64::try_from(installed.len()).unwrap_or(u64::MAX);
     let objects = if objects_from_new_packs > 0 {
@@ -716,7 +775,7 @@ fn transfer_stats_for_local_operation(
     } else {
         installed_count
     };
-    let kinds = if objects == installed_count {
+    let kinds = if objects == installed_count && installed_count <= LOCAL_LINK_KINDS_OID_PROBE_MAX {
         Some(object_kind_counts_for_oids(local_odb, installed)?)
     } else {
         None
@@ -816,7 +875,10 @@ pub struct PushOptions {
     ///
     /// If this is non-empty but the remote `git-receive-pack` does not advertise
     /// the `push-options` capability, the push fails with
-    /// [`crate::error::Error::PushOptionsUnsupported`] (matching Git).
+    /// [`crate::error::Error::PushOptionsUnsupported`] (matching Git). A local-path or
+    /// `file://` push ([`push_local`]) accepts them only when the destination repository
+    /// sets `receive.advertisePushOptions`, and passes them to its `pre-receive` and
+    /// `post-receive` hooks. Either check runs before anything is written, dry runs included.
     pub push_options: Vec<String>,
     /// Diagnostic sink for [`crate::diagnostics::Trace::Network`] events.
     pub diagnostics: Option<crate::diagnostics::DiagnosticsHandle>,
@@ -901,7 +963,8 @@ pub struct PushOutcome {
     pub results: Vec<PushRefResult>,
     /// Hook and diagnostic lines from the remote (side-band channel 2), in order.
     ///
-    /// Empty for local `file://` pushes and when the server did not use side-band.
+    /// For a local-path or `file://` push, the output of the destination's receive hooks.
+    /// Empty when the server did not use side-band or no hook wrote anything.
     pub remote_messages: Vec<String>,
 }
 
@@ -910,7 +973,7 @@ pub use crate::pack_objects::{
     PackObjectsOptions, PackStats,
 };
 
-pub(crate) use crate::pack_objects::build_pack_for_local_fetch;
+pub(crate) use crate::pack_objects::write_pack_for_local_fetch;
 
 fn pack_build_options_for_send(
     source_odb: &Odb,
@@ -954,8 +1017,82 @@ fn ingest_pack_options_for_fetch(
         merged_config: Some(pack_config),
         environment: fetch_opts.environment.clone(),
         mark_promisor_pack: fetch_opts.mark_received_pack_promisor,
+        keep_message: None,
         trusted_index_rows: None,
     })
+}
+
+/// Incremental [`ProgressPhase::CopyingObjects`] reporting for local fetch/push copies.
+struct LocalCopyProgress {
+    total: u64,
+    done: u64,
+    last_reported: u64,
+    phase_active: bool,
+}
+
+/// Forwards loose-object link [`ProgressSink::inc`] into [`LocalCopyProgress::add`].
+struct CopyingLooseLink<'a> {
+    copy: &'a mut LocalCopyProgress,
+    progress: &'a mut dyn Progress,
+}
+
+impl ProgressSink for CopyingLooseLink<'_> {
+    fn inc(&mut self, n: u64) {
+        self.copy.add(self.progress, n);
+    }
+}
+
+impl LocalCopyProgress {
+    fn new(total: u64) -> Self {
+        Self {
+            total,
+            done: 0,
+            last_reported: 0,
+            phase_active: false,
+        }
+    }
+
+    fn ensure_started(&mut self, progress: &mut dyn Progress) {
+        if !self.phase_active {
+            progress.start(ProgressPhase::CopyingObjects, Some(self.total));
+            self.phase_active = true;
+        }
+    }
+
+    fn add(&mut self, progress: &mut dyn Progress, n: u64) {
+        if n == 0 {
+            return;
+        }
+        self.ensure_started(progress);
+        self.done = self.done.saturating_add(n).min(self.total);
+        if self.last_reported < self.done {
+            crate::progress::report_object_progress_stride(
+                progress,
+                self.done,
+                &mut self.last_reported,
+                Some(self.total),
+            );
+        }
+        if progress.wants_received_objects() {
+            progress.received_objects(ReceivedObjects {
+                received: self.done,
+                total: self.total,
+                deltas: 0,
+            });
+        }
+    }
+
+    fn finish(&mut self, progress: &mut dyn Progress) {
+        if !self.phase_active {
+            return;
+        }
+        if self.last_reported < self.done {
+            progress.set(self.done);
+            self.last_reported = self.done;
+        }
+        progress.finish();
+        self.phase_active = false;
+    }
 }
 
 /// Copy objects for a local fetch: link remote packfiles that hold only objects
@@ -975,12 +1112,13 @@ fn copy_objects_for_local_fetch(
     try_pack_link: bool,
     pack_build: &PackBuildOptions,
     fetch_opts: &FetchOptions,
-    progress: &mut dyn ProgressSink,
+    progress: &mut dyn Progress,
     cancel: &dyn crate::progress::Cancel,
+    prep_enumerating: bool,
 ) -> Result<(HashSet<ObjectId>, TransferStats)> {
     use crate::local_object_copy::{
-        link_loose_objects, link_loose_objects_for_oids, link_packs_within, link_remote_pack_files,
-        linked_object_set, refresh_local_odb_after_link,
+        count_store_objects_for_link, link_loose_objects, link_loose_objects_for_oids,
+        link_packs_within, link_remote_pack_files, linked_object_set, refresh_local_odb_after_link,
     };
 
     let remote_objects = remote_odb.objects_dir();
@@ -988,31 +1126,44 @@ fn copy_objects_for_local_fetch(
     let pack_dir_before = pack_file_basenames(&local_objects.join("pack"));
     let remote_has_alternates = !crate::pack::read_alternates_recursive(remote_objects)?.is_empty();
 
-    if fetch_opts.link_source_objects
+    if local_odb.uses_files_primary()
+        && fetch_opts.link_source_objects
         && !remote_has_alternates
         && !pack_build.thin
         && try_pack_link
         && haves.is_empty()
         && !wants.is_empty()
     {
-        progress.start(ProgressPhase::CopyingObjects, Some(wants.len() as u64));
         crate::progress::poll_cancel(progress, cancel)?;
-        let linked_packs =
-            link_remote_pack_files(remote_objects, local_objects, progress, cancel, wants.len())?;
-        if linked_packs > 0 {
+        let copy_total = count_store_objects_for_link(remote_objects)? as u64;
+        let mut copy = LocalCopyProgress::new(copy_total);
+        let linked_packs = link_remote_pack_files(
+            remote_objects,
+            local_objects,
+            &mut crate::progress::NullProgress,
+            cancel,
+            0,
+        )?;
+        if linked_packs.objects > 0 {
             refresh_local_odb_after_link(local_odb);
+            copy.add(progress, linked_packs.objects as u64);
         }
         let pack_alone_satisfies_wants =
-            linked_packs > 0 && wants.iter().all(|oid| local_odb.exists(oid));
-        let linked_loose = link_loose_objects(remote_objects, local_objects, progress, cancel)?;
-        if linked_packs > 0 || linked_loose > 0 {
+            linked_packs.objects > 0 && wants.iter().all(|oid| local_odb.exists(oid));
+        let linked_loose = link_loose_objects(
+            remote_objects,
+            local_objects,
+            &mut crate::progress::NullProgress,
+            cancel,
+        )?;
+        if linked_loose > 0 {
             refresh_local_odb_after_link(local_odb);
+            copy.add(progress, linked_loose as u64);
         }
-        if (linked_packs > 0 || linked_loose > 0) && wants.iter().all(|oid| local_odb.exists(oid)) {
-            if linked_loose == 0 {
-                progress.set(wants.len() as u64);
-            }
-            progress.finish();
+        if (linked_packs.files > 0 || linked_loose > 0)
+            && wants.iter().all(|oid| local_odb.exists(oid))
+        {
+            copy.finish(progress);
             let stats_loose = if pack_alone_satisfies_wants {
                 HashSet::new()
             } else {
@@ -1028,8 +1179,12 @@ fn copy_objects_for_local_fetch(
             } else {
                 stats_loose.clone()
             };
-            let mut transfer =
-                transfer_stats_for_local_operation(local_odb, &stats_loose, &pack_dir_before)?;
+            let mut transfer = transfer_stats_for_local_operation(
+                local_odb,
+                &stats_loose,
+                None,
+                &pack_dir_before,
+            )?;
             enrich_local_link_transfer_kinds(
                 local_odb,
                 &pack_dir_before,
@@ -1038,10 +1193,15 @@ fn copy_objects_for_local_fetch(
             )?;
             return Ok((oids, transfer));
         }
-        progress.finish();
+        copy.finish(progress);
     }
 
+    let stop = crate::progress::CancelSignal::new(cancel);
     let have_tips: HashSet<ObjectId> = haves.iter().copied().collect();
+    if !prep_enumerating {
+        progress.start(ProgressPhase::EnumeratingObjects, None);
+    }
+    let mut enum_last = 0u64;
     let send_set = collect_reachable_excluding_peer(
         remote_odb,
         wants,
@@ -1049,58 +1209,106 @@ fn copy_objects_for_local_fetch(
         &have_tips,
         false,
         source_shallow,
+        &stop,
+        progress,
+        &mut enum_last,
     )?;
     let send = &send_set.objects;
+    let send_len = send.len() as u64;
+    progress.set(send_len);
 
-    if !pack_build.thin && try_pack_link {
-        progress.start(ProgressPhase::CopyingObjects, Some(send.len() as u64));
-        let linked = link_packs_within(remote_objects, local_objects, send, progress, cancel)?;
+    let will_scan_packs =
+        local_odb.uses_files_primary() && !pack_build.thin && try_pack_link && !send.is_empty();
+    if !will_scan_packs {
+        progress.finish();
+    }
+
+    let mut copy = LocalCopyProgress::new(send_len);
+
+    if will_scan_packs {
+        let local_has = |oid: &ObjectId| local_odb.exists_materialized_local_without_rescan(oid);
+        let mut pack_scan = send_len;
+        let mut pack_scan_last = send_len;
+        let mut on_pack_scan = |n: u64| {
+            pack_scan = pack_scan.saturating_add(n);
+            crate::progress::report_object_progress_stride(
+                progress,
+                pack_scan,
+                &mut pack_scan_last,
+                None,
+            );
+        };
+        let linked = link_packs_within(
+            remote_objects,
+            local_objects,
+            send,
+            &local_has,
+            &mut crate::progress::NullProgress,
+            cancel,
+            Some(&mut on_pack_scan),
+        )?;
+        progress.finish();
         if linked > 0 {
             refresh_local_odb_after_link(local_odb);
-            progress.set(linked as u64);
+            copy.add(progress, linked as u64);
         }
-        progress.finish();
     }
 
     let mut still_missing = objects_missing_from_peer(local_odb, send);
     if still_missing.is_empty() {
-        let oids = linked_object_set(local_odb, send);
-        let transfer = transfer_stats_for_local_operation(local_odb, &oids, &pack_dir_before)?;
+        copy.finish(progress);
+        // Every object in `send` is stored locally now, and only packs were installed.
+        let oids: HashSet<ObjectId> = send.iter().copied().collect();
+        let transfer = transfer_stats_for_local_operation(
+            local_odb,
+            &oids,
+            Some(&HashSet::new()),
+            &pack_dir_before,
+        )?;
         return Ok((oids, transfer));
     }
 
     // Hard-link loose objects before building an in-memory pack. Re-reading and
     // recompressing large loose blobs (typical local clone) would spike RSS to several
     // times the object size; linking matches system `git clone` on the same filesystem.
-    progress.start(
-        ProgressPhase::CopyingObjects,
-        Some(still_missing.len() as u64),
-    );
-    let linked_loose = link_loose_objects_for_oids(
-        remote_objects,
-        local_objects,
-        &still_missing,
-        progress,
-        cancel,
-    )?;
-    if linked_loose > 0 {
-        refresh_local_odb_after_link(local_odb);
-        still_missing = local_odb.missing_oids(still_missing)?;
+    let loose_candidates: HashSet<ObjectId> = still_missing.iter().copied().collect();
+    if local_odb.uses_files_primary() {
+        let mut loose_link = CopyingLooseLink {
+            copy: &mut copy,
+            progress,
+        };
+        let linked_loose = link_loose_objects_for_oids(
+            remote_objects,
+            local_objects,
+            &still_missing,
+            &mut loose_link,
+            cancel,
+        )?;
+        if linked_loose > 0 {
+            refresh_local_odb_after_link(local_odb);
+            copy.add(progress, linked_loose as u64);
+            still_missing = local_odb.missing_oids(still_missing)?;
+        }
     }
-    progress.finish();
     if still_missing.is_empty() {
-        let oids = linked_object_set(local_odb, send);
-        let transfer = transfer_stats_for_local_operation(local_odb, &oids, &pack_dir_before)?;
+        copy.finish(progress);
+        // Every object in `send` is stored locally now; the loose links covered the rest.
+        let oids: HashSet<ObjectId> = send.iter().copied().collect();
+        let transfer = transfer_stats_for_local_operation(
+            local_odb,
+            &oids,
+            Some(&loose_candidates),
+            &pack_dir_before,
+        )?;
         return Ok((oids, transfer));
     }
 
     let pack_opts = pack_build_options_for_send(remote_odb, &still_missing, pack_build);
-    progress.start(
-        ProgressPhase::CopyingObjects,
-        Some(still_missing.len() as u64),
-    );
     crate::progress::poll_cancel(progress, cancel)?;
-    let pack = build_pack_for_local_transfer(
+    // Stream the pack into a spool in `objects/pack` rather than memory, as a local push
+    // does; a cancelled or failed copy removes the spool.
+    let mut spool = crate::pack_receive::TempPackReceive::create_in_pack_dir(local_objects)?;
+    write_pack_for_local_transfer(
         remote_odb,
         &send_set,
         &still_missing,
@@ -1109,79 +1317,113 @@ fn copy_objects_for_local_fetch(
         source_shallow,
         have_shallow,
         &pack_opts,
+        &stop,
+        &mut spool,
+        Some((&mut copy, progress)),
     )?;
+    copy.finish(progress);
     crate::progress::poll_cancel(progress, cancel)?;
-    let ingest_opts = ingest_pack_options_for_fetch(local_git_dir, fetch_opts)?;
-    let ingested = crate::index_pack::ingest_received_pack_with_progress(
-        pack,
-        local_odb,
-        &ingest_opts,
-        None,
-        Some(cancel),
-    )?;
-    progress.inc(ingested.object_ids.len() as u64);
-    progress.finish();
+    let ingested = match spool.finish()? {
+        Some(pack_path) => {
+            let ingest_opts = ingest_pack_options_for_fetch(local_git_dir, fetch_opts)?;
+            crate::index_pack::ingest_received_pack_path_with_progress(
+                pack_path,
+                local_odb,
+                &ingest_opts,
+                Some(progress),
+                Some(cancel),
+            )?
+        }
+        None => crate::index_pack::IngestedPack::default(),
+    };
     refresh_local_odb_after_link(local_odb);
-    let mut out = linked_object_set(local_odb, send);
+    // Every object in `send` is stored locally now: linked, or in the new pack.
+    let mut out: HashSet<ObjectId> = send.iter().copied().collect();
     out.extend(ingested.object_ids);
-    let transfer = transfer_stats_for_local_operation(local_odb, &out, &pack_dir_before)?;
+    let transfer = transfer_stats_for_local_operation(local_odb, &out, None, &pack_dir_before)?;
     Ok((out, transfer))
 }
 
 /// Copy objects for a local push: link source packfiles that hold only objects
-/// the push must send into the remote, then pack any remainder.
+/// the push must send into `dest_odb`, then pack any remainder.
+///
+/// `peer_odb` is the remote's own object store: the walk stops at objects it already
+/// has, and it answers for `haves`. `dest_odb` receives the copied objects (the
+/// remote's receive quarantine) and must read `peer_odb` as an alternate.
+///
+/// The remainder is streamed into a `tmp_pack_*` spool in `dest_odb`'s `pack/`
+/// directory and indexed from there, so the pack is never held in memory. `cancel`
+/// is polled throughout the walk, the linking, the pack build and the indexing; a
+/// cancelled copy removes its spool and staging files and publishes no pack.
 #[allow(clippy::too_many_arguments)]
 fn copy_objects_for_local_push(
     local_odb: &Odb,
-    remote_odb: &Odb,
+    peer_odb: &Odb,
+    dest_odb: &Odb,
     wants: &[ObjectId],
     haves: &[ObjectId],
     source_shallow: &HashSet<ObjectId>,
     have_shallow: &HashSet<ObjectId>,
     opts: &PackBuildOptions,
+    cancel: &dyn crate::progress::Cancel,
 ) -> Result<()> {
     use crate::local_object_copy::{
         link_loose_objects_for_oids, link_packs_within, refresh_local_odb_after_link,
     };
 
     let local_objects = local_odb.objects_dir();
-    let remote_objects = remote_odb.objects_dir();
+    let dest_objects = dest_odb.objects_dir();
+    let stop = crate::progress::CancelSignal::new(cancel);
 
     let have_tips: HashSet<ObjectId> = haves.iter().copied().collect();
+    let mut enum_last = 0u64;
+    let mut enum_sink = crate::progress::NullProgress;
     let send_set = collect_reachable_excluding_peer(
         local_odb,
         wants,
-        remote_odb,
+        peer_odb,
         &have_tips,
         false,
         source_shallow,
+        &stop,
+        &mut enum_sink,
+        &mut enum_last,
     )?;
     let send = &send_set.objects;
 
     let mut progress = crate::progress::NullProgress;
-    let cancel = crate::progress::NeverCancel;
-    if !opts.thin
-        && link_packs_within(local_objects, remote_objects, send, &mut progress, &cancel)? > 0
+    let dest_has = |oid: &ObjectId| dest_odb.exists_materialized_local_without_rescan(oid);
+    if local_odb.uses_files_primary()
+        && !opts.thin
+        && link_packs_within(
+            local_objects,
+            dest_objects,
+            send,
+            &dest_has,
+            &mut progress,
+            cancel,
+            None,
+        )? > 0
     {
-        refresh_local_odb_after_link(remote_odb);
+        refresh_local_odb_after_link(dest_odb);
     }
 
-    let mut still_missing = objects_missing_from_peer(remote_odb, send);
+    let mut still_missing = objects_missing_from_peer(dest_odb, send);
     if still_missing.is_empty() {
         return Ok(());
     }
 
-    if !haves.is_empty() {
+    if local_odb.uses_files_primary() && !haves.is_empty() {
         let linked_loose = link_loose_objects_for_oids(
             local_objects,
-            remote_objects,
+            dest_objects,
             &still_missing,
             &mut progress,
-            &cancel,
+            cancel,
         )?;
         if linked_loose > 0 {
-            refresh_local_odb_after_link(remote_odb);
-            still_missing = remote_odb.missing_oids(still_missing)?;
+            refresh_local_odb_after_link(dest_odb);
+            still_missing = dest_odb.missing_oids(still_missing)?;
         }
         if still_missing.is_empty() {
             return Ok(());
@@ -1189,25 +1431,37 @@ fn copy_objects_for_local_push(
     }
 
     let pack_opts = pack_build_options_for_send(local_odb, &still_missing, opts);
-    let pack = build_pack_for_local_transfer(
+    let mut spool = crate::pack_receive::TempPackReceive::create_in_pack_dir(dest_objects)?;
+    write_pack_for_local_transfer(
         local_odb,
         &send_set,
         &still_missing,
-        remote_odb,
+        peer_odb,
         haves,
         source_shallow,
         have_shallow,
         &pack_opts,
+        &stop,
+        &mut spool,
+        None,
     )?;
-    crate::index_pack::ingest_received_pack(
-        pack,
-        remote_odb,
+    let Some(pack_path) = spool.finish()? else {
+        return Ok(());
+    };
+    // Indexing hashes every object and checks the trailer, as receive-pack does, so
+    // the second whole-pack verification pass is skipped.
+    crate::index_pack::ingest_received_pack_path_with_progress(
+        pack_path,
+        dest_odb,
         &crate::index_pack::IngestPackOptions {
             fix_thin: pack_opts.thin,
+            skip_post_index_verify: true,
             ..Default::default()
         },
+        None,
+        Some(cancel),
     )?;
-    refresh_local_odb_after_link(remote_odb);
+    refresh_local_odb_after_link(dest_odb);
     Ok(())
 }
 
@@ -1224,16 +1478,18 @@ fn objects_missing_from_peer(peer_odb: &Odb, send: &[ObjectId]) -> Vec<ObjectId>
         .collect()
 }
 
-/// Build the pack that copies `missing` (a subset of `send_set`) into the peer.
+/// Stream the pack that copies `missing` (a subset of `send_set`) into the peer to `w`.
 ///
-/// With no `haves` and a non-thin pack, `missing` is already the exact set the
-/// peer lacks (the walk stopped at every object the peer stores), so it is
-/// packed as-is. Re-enumerating from `missing` instead would walk its whole
-/// closure and re-send objects just linked into the peer, such as every packed
-/// object reachable from a loose annotated tag. Otherwise defer to
-/// [`build_pack_for_local_fetch`], which negotiates against the peer's `haves`.
+/// For a non-thin pack, `missing` is already the exact set the peer lacks (the walk
+/// stopped at every object the peer stores, with or without `haves`), so it is packed
+/// as-is. Re-enumerating from `missing` instead would walk its whole closure again (for
+/// a fetch with `haves`, a second reachability pass over everything the peer has) and
+/// re-send objects just linked into the peer, such as every packed object reachable
+/// from a loose annotated tag. A thin pack, or a shallow peer, defers to
+/// [`write_pack_for_local_fetch`], which negotiates against the peer's `haves`.
+/// Stops with [`Error::Cancelled`] once `stop` fires.
 #[allow(clippy::too_many_arguments)]
-fn build_pack_for_local_transfer(
+fn write_pack_for_local_transfer(
     source_odb: &Odb,
     send_set: &PeerSendSet,
     missing: &[ObjectId],
@@ -1242,25 +1498,55 @@ fn build_pack_for_local_transfer(
     source_shallow: &HashSet<ObjectId>,
     have_shallow: &HashSet<ObjectId>,
     opts: &PackBuildOptions,
-) -> Result<Vec<u8>> {
-    if haves.is_empty() && !opts.thin {
-        return crate::pack_objects::build_pack_from_send_list(
+    stop: &crate::progress::CancelSignal<'_>,
+    w: &mut dyn Write,
+    copy: Option<(&mut LocalCopyProgress, &mut dyn Progress)>,
+) -> Result<()> {
+    if !opts.thin && have_shallow.is_empty() {
+        let pack_budget = missing.len() as u64;
+        if let Some((copy, progress)) = copy {
+            let mut pack_reported = 0u64;
+            let mut on_pack = |n: u64| {
+                let add = n.min(pack_budget.saturating_sub(pack_reported));
+                if add > 0 {
+                    pack_reported += add;
+                    copy.add(progress, add);
+                }
+            };
+            crate::pack_objects::write_pack_from_send_list(
+                source_odb,
+                missing,
+                opts,
+                &send_set.name_hashes,
+                stop,
+                w,
+                Some(&mut on_pack),
+            )?;
+        } else {
+            crate::pack_objects::write_pack_from_send_list(
+                source_odb,
+                missing,
+                opts,
+                &send_set.name_hashes,
+                stop,
+                w,
+                None,
+            )?;
+        }
+    } else {
+        write_pack_for_local_fetch(
             source_odb,
             missing,
-            &HashSet::new(),
+            peer_odb,
+            haves,
+            source_shallow,
+            have_shallow,
             opts,
-            &send_set.name_hashes,
-        );
+            stop,
+            w,
+        )?;
     }
-    build_pack_for_local_fetch(
-        source_odb,
-        missing,
-        peer_odb,
-        haves,
-        source_shallow,
-        have_shallow,
-        opts,
-    )
+    Ok(())
 }
 
 /// Objects a local transfer must send, from [`collect_reachable_excluding_peer`].
@@ -1274,6 +1560,8 @@ struct PeerSendSet {
 /// Like [`collect_reachable_excluding`], but treats every object already stored in
 /// `peer_odb` as a boundary (plus explicit `peer_boundary` tips). Used for local
 /// file fetch/push so incremental transfers do not walk full history from `haves`.
+/// `stop` is polled for every object read.
+#[allow(clippy::too_many_arguments)]
 fn collect_reachable_excluding_peer(
     source_odb: &Odb,
     roots: &[ObjectId],
@@ -1281,11 +1569,17 @@ fn collect_reachable_excluding_peer(
     peer_boundary: &HashSet<ObjectId>,
     skip_missing: bool,
     shallow_grafts: &HashSet<ObjectId>,
+    stop: &crate::progress::CancelSignal<'_>,
+    enum_sink: &mut dyn ProgressSink,
+    enum_last: &mut u64,
 ) -> Result<PeerSendSet> {
     use crate::pack_name_hash::pack_name_hash_extend;
 
+    stop.poll()?;
     if peer_boundary.is_empty() && shallow_grafts.is_empty() {
-        if let Some(send_set) = bitmap_send_set(source_odb, roots, peer_odb)? {
+        if let Some(send_set) = bitmap_send_set(source_odb, roots, peer_odb, enum_sink, enum_last)?
+        {
+            stop.poll()?;
             return Ok(send_set);
         }
     }
@@ -1327,6 +1621,7 @@ fn collect_reachable_excluding_peer(
     }
 
     while let Some((oid, prefix_hash)) = queue.pop_front() {
+        stop.poll()?;
         let obj = match source_odb.read(&oid) {
             Ok(o) => o,
             Err(_) if skip_missing => continue,
@@ -1377,6 +1672,8 @@ fn collect_reachable_excluding_peer(
             }
             ObjectKind::Blob => {}
         }
+        let n = ordered.len() as u64;
+        crate::progress::report_object_progress_stride(enum_sink, n, enum_last, None);
     }
 
     Ok(PeerSendSet {
@@ -1393,6 +1690,8 @@ fn bitmap_send_set(
     source_odb: &Odb,
     roots: &[ObjectId],
     peer_odb: &Odb,
+    enum_sink: &mut dyn ProgressSink,
+    enum_last: &mut u64,
 ) -> Result<Option<PeerSendSet>> {
     let no_haves = HashSet::new();
     let Some((reachable, _)) = crate::pack_object_select::try_bitmap_reachable_for_upload(
@@ -1406,10 +1705,15 @@ fn bitmap_send_set(
         return Ok(None);
     };
     peer_odb.reprepare_local_packs();
-    let objects: Vec<ObjectId> = reachable
+    let mut objects: Vec<ObjectId> = Vec::new();
+    for oid in reachable
         .iter_grouped_by_kind()
         .filter(|oid| !peer_odb.exists_materialized_local_without_rescan(oid))
-        .collect();
+    {
+        objects.push(oid);
+        let n = objects.len() as u64;
+        crate::progress::report_object_progress_stride(enum_sink, n, enum_last, None);
+    }
     let name_hashes = crate::pack_object_select::name_hashes_for_send(
         reachable.bitmap_index(),
         &objects,
@@ -1502,8 +1806,15 @@ pub(crate) fn build_fetch_matched_set(
         );
     }
 
-    let matched =
+    let mut matched =
         crate::fetch_request::matched_refs_with_negatives(&plan, remote, &negatives, opts.prune)?;
+    if opts.force {
+        for m in &mut matched {
+            if !m.auto_followed {
+                m.force = true;
+            }
+        }
+    }
     Ok(FetchMatchSet {
         matched,
         positive,
@@ -1644,6 +1955,12 @@ pub(crate) fn fetch_local_into(
     let local_shallow = crate::shallow::load_shallow_boundaries(local_git_dir);
     let remote_shallow = crate::shallow::load_shallow_boundaries(remote_git_dir);
 
+    let mut prep_enumerating = false;
+    if !opts.dry_run {
+        progress.start(ProgressPhase::EnumeratingObjects, None);
+        prep_enumerating = true;
+    }
+
     // Explicitly requested tags participate in depth calculation; automatically
     // followed tags must only use the history selected by those fetch roots.
     if opts.tags == TagMode::All {
@@ -1654,6 +1971,7 @@ pub(crate) fn fetch_local_into(
             &remote_shallow,
             &negatives,
             &HashSet::new(),
+            opts.force,
             &mut matched,
             &mut matched_oids,
             &mut seen_remote_ref,
@@ -1706,6 +2024,7 @@ pub(crate) fn fetch_local_into(
             &tag_shallow,
             &negatives,
             &tags_present,
+            opts.force,
             &mut matched,
             &mut matched_oids,
             &mut seen_remote_ref,
@@ -1776,6 +2095,10 @@ pub(crate) fn fetch_local_into(
     };
     let mut pack_oids: HashSet<ObjectId> = HashSet::new();
     let mut transfer = TransferStats::default();
+    if wants.is_empty() && prep_enumerating {
+        progress.finish();
+        prep_enumerating = false;
+    }
     if !wants.is_empty() && !opts.dry_run {
         // Resolve exclusion tips only once the final shallow/deepen wants need a copy.
         let mut haves: Vec<ObjectId> = Vec::new();
@@ -1805,6 +2128,7 @@ pub(crate) fn fetch_local_into(
             opts,
             progress,
             cancel,
+            prep_enumerating,
         )?;
         pack_oids = oids;
         transfer = fetch_transfer;
@@ -1850,7 +2174,8 @@ pub(crate) fn fetch_local_into(
         prune_tracking_refs(local, &positive, &remote_refs, opts.dry_run, &mut updates)?;
     }
 
-    let mut store_batch: Vec<crate::refs::store::RefUpdate> = Vec::new();
+    let mut store_batch: Vec<(String, crate::refs::store::RawRef)> =
+        Vec::with_capacity(matched.len());
     for m in &matched {
         let Some(local_ref) = &m.local_ref else {
             // dst empty: fetched but not stored. Report as a no-store update.
@@ -1911,13 +2236,7 @@ pub(crate) fn fetch_local_into(
                 });
                 continue;
             }
-            store_batch.push(crate::refs::store::RefUpdate {
-                name: local_ref.clone(),
-                new_value: Some(crate::refs::store::RawRef::Direct(m.oid)),
-                expected: crate::refs::store::Expected::Any,
-                reflog: None,
-                flags: Default::default(),
-            });
+            store_batch.push((local_ref.clone(), crate::refs::store::RawRef::Direct(m.oid)));
         }
 
         updates.push(RefUpdate {
@@ -1936,16 +2255,10 @@ pub(crate) fn fetch_local_into(
                 let head_ref = format!("refs/remotes/{remote}/HEAD");
                 if crate::refs::resolve_ref_in(local, &head_ref).is_err() {
                     let target = format!("refs/remotes/{remote}/{branch}");
-                    let target_will_exist = store_batch.iter().any(|u| u.name == target)
+                    let target_will_exist = store_batch.iter().any(|(name, _)| *name == target)
                         || crate::refs::resolve_ref_in(local, &target).is_ok();
                     if target_will_exist {
-                        store_batch.push(crate::refs::store::RefUpdate {
-                            name: head_ref,
-                            new_value: Some(crate::refs::store::RawRef::Symbolic(target)),
-                            expected: crate::refs::store::Expected::Any,
-                            reflog: None,
-                            flags: Default::default(),
-                        });
+                        store_batch.push((head_ref, crate::refs::store::RawRef::Symbolic(target)));
                     }
                 }
             }
@@ -1954,7 +2267,7 @@ pub(crate) fn fetch_local_into(
     if !opts.dry_run && !store_batch.is_empty() {
         apply_fetch_ref_updates(
             local,
-            &store_batch,
+            store_batch,
             &mut updates,
             FetchRefRejectHint {
                 prune: opts.prune,
@@ -1962,6 +2275,7 @@ pub(crate) fn fetch_local_into(
                 remote_refs: &remote_refs,
                 remote_name: opts.remote_name.as_deref(),
             },
+            opts.initial_remote_fetch,
         )?;
     }
 
@@ -1995,6 +2309,8 @@ pub(crate) fn fetch_local_into(
         new_shallow,
         new_unshallow: shallow_unshallow,
         transfer,
+        filter_sent: false,
+        promisor: None,
     })
 }
 
@@ -2018,14 +2334,36 @@ pub(crate) fn fetch_local_into(
 ///    * unchanged (remote already at the source) → [`PushRefStatus::UpToDate`].
 ///    * otherwise [`PushRefStatus::Ok`].
 /// 3. For accepted non-delete updates, copies the minimal object closure from the
-///    LOCAL odb into the REMOTE odb via [`build_pack`] and
+///    LOCAL odb into a quarantine of the REMOTE odb via [`build_pack`] and
 ///    [`crate::index_pack::ingest_received_pack`], excluding objects already
 ///    reachable from the remote's existing ref tips.
-/// 4. Applies the ref change on the remote (unless `opts.dry_run`).
+/// 4. Applies the remote's `receive.*` policy (deny non-fast-forwards, deletes and the
+///    current branch, hidden refs) as [`crate::serve::receive_pack`] does.
+/// 5. Runs the remote's receive hooks with Git's arguments, stdin and environment:
+///    `pre-receive` over every update (with the quarantine variables, so it can read
+///    the pushed objects), then `update` per ref once the objects are installed. A
+///    non-zero `pre-receive` refuses every update and keeps the objects out of the
+///    remote; a non-zero `update` refuses its ref. Refusals are
+///    [`PushRefStatus::RemoteRejected`] results, not errors.
+/// 6. Applies the ref changes on the remote as a compare-and-swap against the value
+///    read in step 1, like receive-pack: an update or delete needs the ref to still
+///    hold that oid, and a create needs it to still be absent, even with `force`. A
+///    ref that another writer created in between is reported as
+///    [`PushRefStatus::RejectAlreadyExists`]; one that moved is
+///    [`PushRefStatus::RejectStale`]. Then `post-receive` and `post-update` run over
+///    the refs that were written.
 ///
-/// When `opts.atomic` is set and any ref is rejected, no ref or object is
-/// written and every otherwise-accepted ref is reported as
-/// [`PushRefStatus::AtomicPushFailed`].
+/// Objects are copied into a quarantine directory first and move into the remote's
+/// object store only when some update is going ahead. With `opts.dry_run` nothing is
+/// copied or written and no receive hook runs, as with `git push --dry-run`. Hook
+/// output is returned in [`PushOutcome::remote_messages`]. Through
+/// [`crate::remote::Remote::push`], hooks run with the pushing repository's environment
+/// minus the variables that locate it; `push_local` opens the local repository with
+/// [`RepositoryOptions::empty`], so the hooks it runs get an empty environment (no `PATH`).
+///
+/// When `opts.atomic` is set and any ref is rejected (by the update rules, the
+/// remote's policy or a hook), no ref is written and every otherwise-accepted ref is
+/// reported as [`PushRefStatus::AtomicPushFailed`].
 ///
 /// Both repositories must use the same object hash algorithm; the hash width is
 /// threaded through [`Odb::hash_algo`] so SHA-256 repos work.
@@ -2036,6 +2374,8 @@ pub(crate) fn fetch_local_into(
 ///
 /// Returns an error if either repository cannot be opened, if a source object is
 /// missing from the local odb, or on I/O failure while writing objects or refs.
+/// Returns [`Error::PushOptionsUnsupported`] when `opts.push_options` is non-empty and
+/// the remote does not set `receive.advertisePushOptions`.
 //
 // TODO(phase: remote transports): `git://`, `http(s)`, and `ssh` push
 // (receive-pack handshake + report-status parsing + credential helpers) are out
@@ -2048,30 +2388,49 @@ pub fn push_local(
     cancel: &dyn crate::progress::Cancel,
 ) -> Result<PushOutcome> {
     let local = crate::repo::Repository::open(local_git_dir, &RepositoryOptions::empty())?;
-    push_local_from(&local, remote_git_dir, refs, opts, cancel, None)
+    push_local_from(
+        &local,
+        remote_git_dir,
+        refs,
+        opts,
+        &mut crate::fetch::NoProgress,
+        cancel,
+        None,
+    )
 }
 
-/// Like [`push_local`], reading the objects to send through `local`'s object store and
+/// Like [`push_local`], reading the objects to send through `local`'s object store,
 /// running `pre_push` after every update is decided and before anything is written to the
-/// remote.
+/// remote, and relaying the remote's hook output to [`crate::fetch::Progress::message`] as a
+/// wire push relays side-band output.
 pub(crate) fn push_local_from(
     local: &crate::repo::Repository,
     remote_git_dir: &Path,
     refs: &[PushRefSpec],
     opts: &PushOptions,
+    progress: &mut dyn crate::fetch::Progress,
     cancel: &dyn crate::progress::Cancel,
     pre_push: Option<&PrePushGate<'_>>,
 ) -> Result<PushOutcome> {
     let local_git_dir = local.git_dir();
     let mut progress_sink = crate::progress::NullProgress;
     crate::progress::poll_cancel(&mut progress_sink, cancel)?;
-    if !opts.push_options.is_empty() {
+    ensure_local_remote_repository(remote_git_dir)?;
+    let remote_repo =
+        crate::repo::Repository::open(remote_git_dir, &local.peer_repository_options())?;
+    let remote_cfg = remote_repo
+        .config()
+        .unwrap_or_else(|_| std::sync::Arc::new(crate::config::ConfigSet::new()));
+    if !opts.push_options.is_empty()
+        && !remote_cfg
+            .get_bool("receive.advertisepushoptions")
+            .and_then(|r| r.ok())
+            .unwrap_or(false)
+    {
         return Err(Error::PushOptionsUnsupported);
     }
-    ensure_local_remote_repository(remote_git_dir)?;
 
     let local_odb = local.odb();
-    let remote_odb = open_odb(remote_git_dir);
 
     // The remote's existing ref tips become the `haves` for pack building, so the
     // copied object closure excludes everything the remote already has.
@@ -2100,7 +2459,10 @@ pub(crate) fn push_local_from(
             _ => None,
         })
         .collect();
-    if !push_wants.is_empty() && !opts.dry_run {
+    // Pushed objects wait in a quarantine until the receive hooks accept the push, so a
+    // declined or refused push leaves nothing behind in the remote's object store.
+    let mut quarantine = None;
+    if !push_wants.is_empty() {
         crate::progress::poll_cancel(&mut progress_sink, cancel)?;
         let local_cfg = config_for_git_dir(local_git_dir);
         let pack_opts = if remote_have_tips.is_empty() {
@@ -2110,38 +2472,102 @@ pub(crate) fn push_local_from(
         };
         let empty_shallow = HashSet::new();
         let remote_shallow = crate::shallow::load_shallow_boundaries(remote_git_dir);
+        let q = crate::receive_quarantine::ReceiveQuarantine::create(
+            remote_repo.odb(),
+            remote_git_dir,
+        )?;
+        let q_odb = q.odb();
         copy_objects_for_local_push(
             local_odb,
-            &remote_odb,
+            remote_repo.odb(),
+            &q_odb,
             &push_wants,
             &remote_have_tips,
             &empty_shallow,
             &remote_shallow,
             &pack_opts,
+            cancel,
         )?;
+        quarantine = Some((q, q_odb));
     }
 
-    apply_remote_receive_policy(remote_git_dir, local_git_dir, opts.dry_run, &mut decisions)?;
+    // What a receive-pack would be sent: every update still going ahead, before the
+    // remote's own checks refuse any of them.
+    let received: Vec<crate::serve::RefCommand> = if opts.dry_run {
+        Vec::new()
+    } else {
+        decisions
+            .iter()
+            .filter(|d| d.apply)
+            .filter_map(PushDecision::ref_command)
+            .collect()
+    };
 
-    // Atomic: if any update would be rejected, apply none and demote the
-    // otherwise-accepted updates to AtomicPushFailed.
-    let any_rejected = decisions.iter().any(|d| d.result.status.is_error());
-    if opts.atomic && any_rejected {
-        for d in &mut decisions {
-            if matches!(d.result.status, PushRefStatus::Ok) {
-                d.result.status = PushRefStatus::AtomicPushFailed;
-                d.apply = false;
-            }
-        }
+    #[cfg(test)]
+    tests::run_push_hook(tests::PushHookPoint::BeforeReceivePolicy);
+
+    apply_remote_receive_policy(
+        &remote_repo,
+        local_git_dir,
+        opts.dry_run,
+        quarantine.as_ref().map(|(_, odb)| odb),
+        &mut decisions,
+    )?;
+
+    if opts.atomic && decisions.iter().any(|d| d.result.status.is_error()) {
+        fail_atomic_push(&mut decisions);
         return Ok(PushOutcome {
             results: decisions.into_iter().map(|d| d.result).collect(),
             remote_messages: Vec::new(),
         });
     }
 
-    // Second pass: apply ref updates (one transaction per ref unless `atomic`).
+    let scripts =
+        crate::serve::ReceiveHookScripts::new(&remote_repo, &opts.push_options, Vec::new());
+    let mut remote_messages = Vec::new();
+    if !received.is_empty() {
+        let commands: Vec<&crate::serve::RefCommand> = received.iter().collect();
+        let pre = scripts.pre_receive(&commands, quarantine.as_ref().map(|(q, _)| q));
+        relay_hook_output(progress, &mut remote_messages, &pre);
+        if !pre.is_ok() {
+            for d in decisions.iter_mut().filter(|d| d.apply) {
+                d.refuse(&crate::serve::RefUpdateRefusal::PreReceiveHookDeclined);
+            }
+        }
+    }
+    let mut migrated_pack_keeps = Vec::new();
+    if decisions.iter().any(|d| d.apply) && !opts.dry_run {
+        if let Some((mut q, _)) = quarantine.take() {
+            migrated_pack_keeps = q.migrate()?;
+            remote_repo.odb().invalidate_packs();
+        }
+        for d in decisions.iter_mut().filter(|d| d.apply) {
+            let Some(cmd) = d.ref_command() else {
+                continue;
+            };
+            let update = scripts.update(&cmd);
+            relay_hook_output(progress, &mut remote_messages, &update);
+            if !update.is_ok() {
+                d.refuse(&crate::serve::RefUpdateRefusal::UpdateHookDeclined);
+                // receive-pack names the declined ref to the pusher.
+                // hygiene: Git wire-compatible remote message, relayed like receive-pack's
+                let line = format!("error: hook declined to update {}", d.result.remote_ref);
+                progress.message(format!("{line}\n").as_bytes());
+                remote_messages.push(line);
+            }
+        }
+        if opts.atomic && decisions.iter().any(|d| d.result.status.is_error()) {
+            fail_atomic_push(&mut decisions);
+        }
+    }
+
+    #[cfg(test)]
+    tests::run_push_hook(tests::PushHookPoint::BeforeRefCommit);
+
+    // Second pass: apply ref updates (one batch unless `atomic`, then batched non-atomic).
     let mut ref_batch: Vec<crate::refs::store::RefUpdate> = Vec::new();
-    for d in &mut decisions {
+    let mut non_atomic_batch: Vec<(usize, crate::refs::store::RefUpdate)> = Vec::new();
+    for (idx, d) in decisions.iter_mut().enumerate() {
         if !d.apply || opts.dry_run {
             continue;
         }
@@ -2154,8 +2580,8 @@ pub(crate) fn push_local_from(
                 );
                 if opts.atomic {
                     ref_batch.push(update);
-                } else if let Err(err) = crate::refs::commit_store_update(remote_git_dir, update) {
-                    apply_ref_store_error_to_push_decision(d, &err, false);
+                } else {
+                    non_atomic_batch.push((idx, update));
                 }
             }
             PushAction::Delete => {
@@ -2163,8 +2589,8 @@ pub(crate) fn push_local_from(
                     push_store_ref_update(d.result.remote_ref.as_str(), None, d.result.old_oid);
                 if opts.atomic {
                     ref_batch.push(update);
-                } else if let Err(err) = crate::refs::commit_store_update(remote_git_dir, update) {
-                    apply_ref_store_error_to_push_decision(d, &err, false);
+                } else {
+                    non_atomic_batch.push((idx, update));
                 }
             }
             PushAction::None => {}
@@ -2173,6 +2599,48 @@ pub(crate) fn push_local_from(
     if opts.atomic && !opts.dry_run && !ref_batch.is_empty() {
         if let Err(err) = crate::refs::commit_ref_store_batch(remote_git_dir, &ref_batch) {
             apply_atomic_batch_ref_store_error(&mut decisions, &ref_batch, err);
+        }
+    } else if !opts.dry_run && !non_atomic_batch.is_empty() {
+        let indices: Vec<_> = non_atomic_batch.iter().map(|(idx, _)| *idx).collect();
+        let updates: Vec<_> = non_atomic_batch.into_iter().map(|(_, u)| u).collect();
+        match crate::refs::commit_ref_updates_non_atomic_on_store(remote_repo.refs(), updates) {
+            Ok(outcomes) => {
+                for (idx, outcome) in indices.into_iter().zip(outcomes) {
+                    if let Err(err) = outcome.result {
+                        apply_ref_store_error_to_push_decision(
+                            &mut decisions[idx],
+                            &Error::RefStore(err),
+                            false,
+                        );
+                    }
+                }
+            }
+            Err(err) => {
+                for idx in indices {
+                    apply_ref_store_error_to_push_decision(&mut decisions[idx], &err, false);
+                }
+            }
+        }
+    }
+
+    if !opts.dry_run {
+        let applied: Vec<crate::serve::RefCommand> = decisions
+            .iter()
+            .filter(|d| d.apply)
+            .filter_map(PushDecision::ref_command)
+            .collect();
+        if !applied.is_empty() {
+            let applied: Vec<&crate::serve::RefCommand> = applied.iter().collect();
+            relay_hook_output(
+                progress,
+                &mut remote_messages,
+                &scripts.post_receive(&applied),
+            );
+            relay_hook_output(
+                progress,
+                &mut remote_messages,
+                &scripts.post_update(&applied),
+            );
         }
     }
 
@@ -2183,10 +2651,53 @@ pub(crate) fn push_local_from(
         }
     }
 
+    drop(migrated_pack_keeps);
+
     Ok(PushOutcome {
         results,
-        remote_messages: Vec::new(),
+        remote_messages,
     })
+}
+
+/// An `atomic` push with a refused update applies none: demote every otherwise-accepted
+/// update to [`PushRefStatus::AtomicPushFailed`].
+fn fail_atomic_push(decisions: &mut [PushDecision]) {
+    for d in decisions {
+        if matches!(d.result.status, PushRefStatus::Ok) {
+            d.result.status = PushRefStatus::AtomicPushFailed;
+            d.apply = false;
+        }
+    }
+}
+
+/// Pass what a receive hook wrote (stdout, then stderr) to `progress` and append it to
+/// `messages`, one entry per non-empty line, as a wire push handles the remote's side-band
+/// hook output.
+fn relay_hook_output(
+    progress: &mut dyn crate::fetch::Progress,
+    messages: &mut Vec<String>,
+    result: &crate::hooks::HookResult,
+) {
+    use crate::sideband_lines::{RemoteLine, SidebandLines};
+
+    let Some(output) = result.output() else {
+        return;
+    };
+    let mut record = |line: RemoteLine| {
+        if let RemoteLine::Line(text) = line {
+            if !text.is_empty() {
+                messages.push(text);
+            }
+        }
+    };
+    for stream in [&output.stdout, &output.stderr] {
+        if !stream.is_empty() {
+            progress.message(stream);
+        }
+        let mut lines = SidebandLines::new();
+        lines.feed(stream, &mut record);
+        lines.finish(&mut record);
+    }
 }
 
 /// Object database for receive-policy checks during local push.
@@ -2200,50 +2711,44 @@ fn push_policy_object_lookup(remote_git_dir: &Path, local_git_dir: &Path) -> Odb
 }
 
 /// Apply the remote repository's `receive.*` policy to updates that would mutate refs.
+///
+/// `quarantine` holds the objects a real push copied; a dry run copied none and looks
+/// objects up in the pusher's store as well.
 fn apply_remote_receive_policy(
-    remote_git_dir: &Path,
+    remote_repo: &crate::repo::Repository,
     local_git_dir: &Path,
     dry_run: bool,
+    quarantine: Option<&Odb>,
     decisions: &mut [PushDecision],
 ) -> Result<()> {
     if !decisions.iter().any(|d| d.apply) {
         return Ok(());
     }
-    let remote_repo = crate::repo::Repository::open(remote_git_dir, &RepositoryOptions::empty())?;
     let cfg = remote_repo
         .config()
         .unwrap_or_else(|_| std::sync::Arc::new(crate::config::ConfigSet::new()));
     let policy = crate::serve::ReceivePolicy::from_config(cfg.as_ref());
     let hidden_refs = crate::hide_refs::hide_ref_patterns_receive(cfg.as_ref());
-    let head_branch = crate::serve::head_branch(&remote_repo);
-    let checked_out = crate::serve::checked_out_branch(&remote_repo);
+    let head_branch = crate::serve::head_branch(remote_repo);
+    let checked_out = crate::serve::checked_out_branch(remote_repo);
     let branches = crate::serve::HeadBranches {
         head: head_branch.as_deref(),
         checked_out: checked_out.as_deref(),
     };
-    let pre_copy_lookup = dry_run.then(|| push_policy_object_lookup(remote_git_dir, local_git_dir));
+    let pre_copy_lookup =
+        dry_run.then(|| push_policy_object_lookup(remote_repo.git_dir(), local_git_dir));
+    let object_lookup = pre_copy_lookup
+        .as_ref()
+        .or(quarantine)
+        .unwrap_or(remote_repo.odb());
 
     for d in decisions.iter_mut().filter(|d| d.apply) {
-        let cmd = match &d.action {
-            PushAction::Update(src) => crate::serve::RefCommand {
-                refname: d.result.remote_ref.clone(),
-                old: d.result.old_oid,
-                new: Some(*src),
-            },
-            PushAction::Delete => crate::serve::RefCommand {
-                refname: d.result.remote_ref.clone(),
-                old: d.result.old_oid,
-                new: None,
-            },
-            PushAction::None => continue,
+        let Some(cmd) = d.ref_command() else {
+            continue;
         };
-        let object_lookup = pre_copy_lookup
-            .as_ref()
-            .map(|odb| odb as &Odb)
-            .or_else(|| (!dry_run).then_some(remote_repo.odb()));
         let refusal = match crate::serve::validate_ref_update(
-            &remote_repo,
-            object_lookup,
+            remote_repo,
+            Some(object_lookup),
             &cmd,
             &policy,
             &hidden_refs,
@@ -2254,8 +2759,17 @@ fn apply_remote_receive_policy(
             Err(e) => return Err(Error::Message(e.to_string())),
         };
         if let Some(reason) = refusal {
-            d.result.status = PushRefStatus::RemoteRejected;
-            d.result.message = Some(reason.to_string());
+            d.result.status = match (&reason, cmd.old) {
+                (crate::serve::RefUpdateRefusal::StaleInfo, None) => {
+                    PushRefStatus::RejectAlreadyExists
+                }
+                (crate::serve::RefUpdateRefusal::StaleInfo, Some(_)) => PushRefStatus::RejectStale,
+                _ => PushRefStatus::RemoteRejected,
+            };
+            d.result.message = Some(match d.result.status {
+                PushRefStatus::RejectAlreadyExists => "already exists".to_owned(),
+                _ => reason.to_string(),
+            });
             d.apply = false;
             d.action = PushAction::None;
         }
@@ -2263,17 +2777,21 @@ fn apply_remote_receive_policy(
     Ok(())
 }
 
+/// The remote ref update for a decided push, compare-and-swapped against `observed_old`.
+///
+/// Like a receive-pack command, an update applies only if the ref still holds the value the
+/// decision saw: `Some(oid)` must still be `oid`, and `None` (a create) must still be absent.
 fn push_store_ref_update(
     refname: &str,
     new_oid: Option<ObjectId>,
-    expected_old: Option<ObjectId>,
+    observed_old: Option<ObjectId>,
 ) -> crate::refs::store::RefUpdate {
     crate::refs::store::RefUpdate {
         name: refname.to_owned(),
         new_value: new_oid.map(crate::refs::store::RawRef::Direct),
-        expected: match expected_old {
+        expected: match observed_old {
             Some(oid) => crate::refs::store::Expected::Oid(oid),
-            None => crate::refs::store::Expected::Any,
+            None => crate::refs::store::Expected::Missing,
         },
         reflog: None,
         flags: Default::default(),
@@ -2282,10 +2800,22 @@ fn push_store_ref_update(
 
 fn push_status_for_ref_store_error(err: &Error) -> PushRefStatus {
     match err {
+        Error::RefStore(crate::refs::store::RefStoreError::ExpectedMismatch {
+            expected: crate::refs::store::Expected::Missing,
+            ..
+        }) => PushRefStatus::RejectAlreadyExists,
         Error::RefStore(crate::refs::store::RefStoreError::ExpectedMismatch { .. }) => {
             PushRefStatus::RejectStale
         }
         _ => PushRefStatus::RemoteRejected,
+    }
+}
+
+/// The per-ref message for a ref store failure while applying a push update.
+fn push_message_for_ref_store_error(err: &Error) -> String {
+    match push_status_for_ref_store_error(err) {
+        PushRefStatus::RejectAlreadyExists => "already exists".to_owned(),
+        _ => err.to_string(),
     }
 }
 
@@ -2298,8 +2828,13 @@ fn ref_store_error_refname(err: &Error) -> Option<String> {
         | crate::refs::store::RefStoreError::DuplicateUpdate { name }
         | crate::refs::store::RefStoreError::LockHeld { name }
         | crate::refs::store::RefStoreError::InvalidRefName { name }
+        | crate::refs::store::RefStoreError::InvalidSymrefTarget { name, .. }
         | crate::refs::store::RefStoreError::NullOid { name }
-        | crate::refs::store::RefStoreError::NotFound { name } => name.clone(),
+        | crate::refs::store::RefStoreError::MissingObject { name, .. }
+        | crate::refs::store::RefStoreError::NotACommit { name, .. }
+        | crate::refs::store::RefStoreError::ObjectLookup { name, .. }
+        | crate::refs::store::RefStoreError::NotFound { name }
+        | crate::refs::store::RefStoreError::ReflogRewriteStale { name } => name.clone(),
         crate::refs::store::RefStoreError::NameUnavailable { reason } => match reason {
             crate::refs::RefnameUnavailable::SameBatch { refname, .. }
             | crate::refs::RefnameUnavailable::AncestorExists {
@@ -2313,13 +2848,14 @@ fn ref_store_error_refname(err: &Error) -> Option<String> {
         | crate::refs::store::RefStoreError::Corrupt(_)
         | crate::refs::store::RefStoreError::GitDirPathIo { .. }
         | crate::refs::store::RefStoreError::InvalidReflog(_)
-        | crate::refs::store::RefStoreError::Backend(_) => return None,
+        | crate::refs::store::RefStoreError::Backend(_)
+        | crate::refs::store::RefStoreError::Hook(_) => return None,
     })
 }
 
 fn apply_ref_store_error_to_push_decision(d: &mut PushDecision, err: &Error, _atomic: bool) {
     d.result.status = push_status_for_ref_store_error(err);
-    d.result.message = Some(err.to_string());
+    d.result.message = Some(push_message_for_ref_store_error(err));
     d.apply = false;
 }
 
@@ -2329,7 +2865,7 @@ fn apply_atomic_batch_ref_store_error(
     err: Error,
 ) {
     let fail_ref = ref_store_error_refname(&err);
-    let message = err.to_string();
+    let message = push_message_for_ref_store_error(&err);
     let batch_names: HashSet<&str> = batch.iter().map(|u| u.name.as_str()).collect();
     let in_batch = decisions
         .iter_mut()
@@ -2377,6 +2913,31 @@ struct PushDecision {
     action: PushAction,
     /// Whether the second pass should apply `action`.
     apply: bool,
+}
+
+impl PushDecision {
+    /// The `<old> <new> <ref>` command a receive-pack would get for this update, or `None`
+    /// when it changes nothing.
+    fn ref_command(&self) -> Option<crate::serve::RefCommand> {
+        let new = match self.action {
+            PushAction::Update(src) => Some(src),
+            PushAction::Delete => None,
+            PushAction::None => return None,
+        };
+        Some(crate::serve::RefCommand {
+            refname: self.result.remote_ref.clone(),
+            old: self.result.old_oid,
+            new,
+        })
+    }
+
+    /// Record that the remote refused this update for `reason`; nothing is applied.
+    fn refuse(&mut self, reason: &crate::serve::RefUpdateRefusal) {
+        self.result.status = PushRefStatus::RemoteRejected;
+        self.result.message = Some(reason.to_string());
+        self.apply = false;
+        self.action = PushAction::None;
+    }
 }
 
 /// Decide the status of a single [`PushRefSpec`] without mutating either repo.
@@ -2897,7 +3458,7 @@ fn glob_matches(pattern: &str, refname: &str) -> bool {
 ///
 /// Under `Following`, tags named in `already_local` (see
 /// [`crate::fetch::tags_already_local`]) are skipped, matching Git's auto-follow,
-/// which never reconsiders a tag the local repository already has.
+/// which never reconsiders a tag the local repository already has by name.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_tag_mode(
     mode: TagMode,
@@ -2906,6 +3467,7 @@ pub(crate) fn apply_tag_mode(
     shallow_boundaries: &HashSet<ObjectId>,
     negatives: &[RefspecItem],
     already_local: &HashSet<String>,
+    force_all_tags: bool,
     matched: &mut Vec<MatchedRef>,
     matched_oids: &mut HashSet<ObjectId>,
     seen_remote_ref: &mut HashSet<String>,
@@ -2971,7 +3533,7 @@ pub(crate) fn apply_tag_mode(
                 remote_ref: name.clone(),
                 local_ref: Some(name.clone()),
                 oid,
-                force: false,
+                force: force_all_tags && mode == TagMode::All,
                 is_tag: true,
                 auto_followed: mode == TagMode::Following,
                 dest_is_tag: true,
@@ -3220,24 +3782,47 @@ fn mark_fetch_ref_update_rejected(
 /// Commit tracking-ref writes from a fetch into `local`'s ref store, applying every ref
 /// that can be updated.
 ///
-/// Uses one batch transaction when the full batch validates; otherwise falls back to
-/// per-ref commits and records lock or namespace failures on the matching
+/// Each of `writes` stores a value under a name whatever the ref held before, without a
+/// reflog entry. They are committed as one batch transaction when the full batch validates;
+/// otherwise one at a time, recording lock or namespace failures on the matching
 /// [`RefUpdate`] rows instead of aborting the whole fetch.
+///
+/// With `initial` (the first fetch of a clone), the direct refs are committed first as an
+/// initial transaction ([`crate::refs::store::RefTransaction::initial`]), which the files
+/// backend stores in one `packed-refs` write; symbolic refs follow as a regular batch.
 ///
 /// # Errors
 ///
 /// Propagates non-rejectable ref-store and I/O errors from the fallback path.
 pub(crate) fn apply_fetch_ref_updates(
     local: &crate::repo::Repository,
-    store_batch: &[crate::refs::store::RefUpdate],
+    writes: Vec<(String, crate::refs::store::RawRef)>,
     updates: &mut [RefUpdate],
     hint: FetchRefRejectHint<'_>,
+    initial: bool,
 ) -> Result<()> {
-    if store_batch.is_empty() {
-        return Ok(());
-    }
+    use crate::refs::store::RawRef;
+    let store_update = |(name, value): &(String, RawRef)| crate::refs::store::RefUpdate {
+        name: name.clone(),
+        new_value: Some(value.clone()),
+        expected: crate::refs::store::Expected::Any,
+        reflog: None,
+        flags: Default::default(),
+    };
     let store = local.refs();
-    if crate::refs::commit_ref_updates_on_store(store, store_batch, &[]).is_ok() {
+    let mut pending: Vec<&(String, RawRef)> = writes.iter().collect();
+    if initial {
+        let (direct, rest): (Vec<_>, Vec<_>) = pending
+            .iter()
+            .copied()
+            .partition(|(_, value)| matches!(value, RawRef::Direct(_)));
+        let direct = direct.into_iter().map(store_update).collect();
+        if crate::refs::commit_initial_ref_updates_on_store(store, direct).is_ok() {
+            pending = rest;
+        }
+    }
+    let batch = pending.iter().copied().map(store_update).collect();
+    if pending.is_empty() || crate::refs::commit_owned_ref_updates_on_store(store, batch).is_ok() {
         return Ok(());
     }
 
@@ -3250,17 +3835,11 @@ pub(crate) fn apply_fetch_ref_updates(
             .collect()
     };
 
-    for store_update in store_batch {
-        match crate::refs::commit_ref_update_on_store(store, store_update.clone()) {
+    for write in pending {
+        match crate::refs::commit_ref_update_on_store(store, store_update(write)) {
             Ok(()) => {}
             Err(err) if fetch_ref_store_error_rejectable(&err) => {
-                mark_fetch_ref_update_rejected(
-                    updates,
-                    &store_update.name,
-                    &err,
-                    &stale_tracking,
-                    &hint,
-                );
+                mark_fetch_ref_update_rejected(updates, &write.0, &err, &stale_tracking, &hint);
             }
             Err(err) => return Err(err),
         }
@@ -3330,8 +3909,12 @@ mod tests {
         started: Vec<(ProgressPhase, Option<u64>)>,
         finished: Vec<ProgressPhase>,
         counts: Vec<u64>,
+        enumerating_counts: Vec<u64>,
+        copying_counts: Vec<u64>,
         active: Option<ProgressPhase>,
         current: u64,
+        received: Vec<ReceivedObjects>,
+        want_received: bool,
     }
 
     impl ProgressSink for PhaseRecorder {
@@ -3344,12 +3927,12 @@ mod tests {
         fn inc(&mut self, units: u64) {
             self.events.push("inc");
             self.current += units;
-            self.counts.push(self.current);
+            self.record_count();
         }
         fn set(&mut self, current: u64) {
             self.events.push("set");
             self.current = current;
-            self.counts.push(self.current);
+            self.record_count();
         }
         fn finish(&mut self) {
             self.events.push("finish");
@@ -3359,7 +3942,40 @@ mod tests {
         }
     }
 
-    impl Progress for PhaseRecorder {}
+    impl PhaseRecorder {
+        fn record_count(&mut self) {
+            self.counts.push(self.current);
+            match self.active {
+                Some(ProgressPhase::EnumeratingObjects) => {
+                    self.enumerating_counts.push(self.current);
+                }
+                Some(ProgressPhase::CopyingObjects) => {
+                    self.copying_counts.push(self.current);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    impl Progress for PhaseRecorder {
+        fn wants_received_objects(&self) -> bool {
+            self.want_received
+        }
+
+        fn received_objects(&mut self, counts: ReceivedObjects) {
+            assert_eq!(
+                self.active,
+                Some(ProgressPhase::CopyingObjects),
+                "received_objects must run only during CopyingObjects (active={active:?}, counts={counts:?})",
+                active = self.active,
+            );
+            assert!(
+                counts.received <= counts.total,
+                "received must not exceed total: {counts:?}"
+            );
+            self.received.push(counts);
+        }
+    }
 
     fn git_ok(dir: &Path, args: &[&str]) -> bool {
         Command::new("git") // hygiene: git fixture comparison in cfg(test) module
@@ -3376,10 +3992,252 @@ mod tests {
             .unwrap_or(false)
     }
 
+    /// Where in [`push_local_from`] a test hook interleaves another writer.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub(crate) enum PushHookPoint {
+        /// After every update is decided and its objects copied, before the remote's
+        /// `receive.*` policy rechecks each update against the remote refs.
+        BeforeReceivePolicy,
+        /// After the policy check, before any remote ref is written.
+        BeforeRefCommit,
+    }
+
+    type PushHook = (PushHookPoint, Box<dyn FnOnce()>);
+
+    // hygiene: test-only push interleaving hook
+    thread_local! {
+        static PUSH_HOOK: std::cell::RefCell<Option<PushHook>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Runs (once) the hook installed by [`on_next_push`] when the push reaches `point`.
+    pub(super) fn run_push_hook(point: PushHookPoint) {
+        let hook = PUSH_HOOK.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            match slot.as_ref() {
+                Some((at, _)) if *at == point => slot.take().map(|(_, hook)| hook),
+                _ => None,
+            }
+        });
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    /// Run `hook` inside the next local push on this thread when it reaches `point`.
+    pub(crate) fn on_next_push(point: PushHookPoint, hook: impl FnOnce() + 'static) {
+        PUSH_HOOK.with(|slot| *slot.borrow_mut() = Some((point, Box::new(hook))));
+    }
+
+    fn git_stdout(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git") // hygiene: git fixture comparison in cfg(test) module
+            .env("GIT_AUTHOR_NAME", "Test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "Test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .expect("run git");
+        assert!(out.status.success(), "git {args:?} failed");
+        String::from_utf8(out.stdout)
+            .expect("utf8")
+            .trim()
+            .to_owned()
+    }
+
+    /// Fixture: a bare remote with `main`, plus a clone holding one more commit on `main` and
+    /// a second, diverging commit already stored in the remote as `refs/heads/other`.
+    /// Returns `(remote, local_git_dir, local_tip, other_tip)`.
+    fn racing_create_fixture(tmp: &Path) -> (PathBuf, PathBuf, ObjectId, ObjectId) {
+        let remote = tmp.join("remote.git");
+        let local = tmp.join("local");
+        std::fs::create_dir_all(&remote).unwrap();
+        std::fs::create_dir_all(&local).unwrap();
+        assert!(git_ok(&remote, &["init", "-q", "--bare", "-b", "main"]));
+        assert!(git_ok(&local, &["init", "-q", "-b", "main"]));
+        assert!(git_ok(&local, &["commit", "--allow-empty", "-qm", "base"]));
+        assert!(git_ok(
+            &local,
+            &["push", "-q", remote.to_str().unwrap(), "main"]
+        ));
+        assert!(git_ok(&local, &["checkout", "-q", "-b", "other"]));
+        assert!(git_ok(&local, &["commit", "--allow-empty", "-qm", "other"]));
+        assert!(git_ok(
+            &local,
+            &["push", "-q", remote.to_str().unwrap(), "other"]
+        ));
+        let other = ObjectId::from_hex(&git_stdout(&local, &["rev-parse", "HEAD"])).unwrap();
+        assert!(git_ok(&local, &["checkout", "-q", "main"]));
+        assert!(git_ok(&local, &["commit", "--allow-empty", "-qm", "mine"]));
+        let tip = ObjectId::from_hex(&git_stdout(&local, &["rev-parse", "HEAD"])).unwrap();
+        (remote, local.join(".git"), tip, other)
+    }
+
+    #[cfg_attr(
+        not(feature = "full-tests"),
+        ignore = "starts system git or is heavy; run with --features full-tests"
+    )]
+    #[test]
+    fn push_local_create_rejects_ref_created_after_decision() {
+        let points = [
+            PushHookPoint::BeforeReceivePolicy,
+            PushHookPoint::BeforeRefCommit,
+        ];
+        let modes = [(false, false), (true, false), (false, true)];
+        for (point, (force, atomic)) in points
+            .into_iter()
+            .flat_map(|p| modes.into_iter().map(move |m| (p, m)))
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let (remote, local_git, tip, other) = racing_create_fixture(tmp.path());
+
+            let racer_remote = remote.clone();
+            on_next_push(point, move || {
+                assert!(git_ok(
+                    &racer_remote,
+                    &["update-ref", "refs/heads/shared", &other.to_hex(), ""]
+                ));
+            });
+            let outcome = push_local(
+                &local_git,
+                &remote,
+                &[PushRefSpec {
+                    src: Some(tip),
+                    dst: "refs/heads/shared".to_owned(),
+                    force,
+                    ..Default::default()
+                }],
+                &PushOptions {
+                    atomic,
+                    ..Default::default()
+                },
+                &crate::progress::NeverCancel,
+            )
+            .expect("push call");
+
+            let result = &outcome.results[0];
+            let case = format!("{point:?} force={force} atomic={atomic}");
+            assert_eq!(result.status, PushRefStatus::RejectAlreadyExists, "{case}");
+            assert!(result.status.is_error(), "{case}");
+            assert_eq!(result.message.as_deref(), Some("already exists"), "{case}");
+            assert_eq!(
+                git_stdout(&remote, &["rev-parse", "refs/heads/shared"]),
+                other.to_hex(),
+                "{case}: the racing creator's value must survive"
+            );
+            assert!(!git_ok(
+                &remote,
+                &[
+                    "merge-base",
+                    "--is-ancestor",
+                    &tip.to_hex(),
+                    &other.to_hex()
+                ]
+            ));
+        }
+    }
+
+    #[cfg_attr(
+        not(feature = "full-tests"),
+        ignore = "starts system git or is heavy; run with --features full-tests"
+    )]
+    #[test]
+    fn push_local_update_rejects_ref_moved_after_decision() {
+        for point in [
+            PushHookPoint::BeforeReceivePolicy,
+            PushHookPoint::BeforeRefCommit,
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (remote, local_git, tip, other) = racing_create_fixture(tmp.path());
+
+            let racer_remote = remote.clone();
+            on_next_push(point, move || {
+                assert!(git_ok(
+                    &racer_remote,
+                    &["update-ref", "refs/heads/main", &other.to_hex()]
+                ));
+            });
+            let outcome = push_local(
+                &local_git,
+                &remote,
+                &[PushRefSpec {
+                    src: Some(tip),
+                    dst: "refs/heads/main".to_owned(),
+                    ..Default::default()
+                }],
+                &PushOptions::default(),
+                &crate::progress::NeverCancel,
+            )
+            .expect("push call");
+
+            assert_eq!(
+                outcome.results[0].status,
+                PushRefStatus::RejectStale,
+                "{point:?}"
+            );
+            assert_eq!(
+                git_stdout(&remote, &["rev-parse", "refs/heads/main"]),
+                other.to_hex(),
+                "{point:?}"
+            );
+        }
+    }
+
     fn assert_monotonic(counts: &[u64]) {
         for pair in counts.windows(2) {
             assert!(pair[1] >= pair[0], "progress counts must be monotonic");
         }
+    }
+
+    fn copying_phase_total(rec: &PhaseRecorder) -> Option<u64> {
+        rec.started
+            .iter()
+            .find(|(phase, _)| *phase == ProgressPhase::CopyingObjects)
+            .and_then(|(_, total)| *total)
+    }
+
+    fn assert_copy_progress_within_total(rec: &PhaseRecorder, copied_objects: u64) {
+        let Some(total) = copying_phase_total(rec) else {
+            panic!("missing CopyingObjects start: {:?}", rec.started);
+        };
+        assert!(
+            total >= copied_objects,
+            "progress total {total} smaller than copied objects {copied_objects}"
+        );
+        for &count in &rec.copying_counts {
+            assert!(
+                count <= total,
+                "copy progress {count} exceeds phase total {total}"
+            );
+        }
+        for snapshot in &rec.received {
+            assert!(
+                snapshot.received <= snapshot.total,
+                "received {} exceeds snapshot total {}",
+                snapshot.received,
+                snapshot.total
+            );
+            assert!(
+                snapshot.total <= total,
+                "snapshot total {} exceeds phase total {}",
+                snapshot.total,
+                total
+            );
+            assert!(
+                snapshot.received <= total,
+                "received {} exceeds phase total {}",
+                snapshot.received,
+                total
+            );
+        }
+        assert_eq!(
+            rec.copying_counts.last().copied().unwrap_or(0),
+            copied_objects,
+            "final copy count should match transferred objects"
+        );
     }
 
     #[cfg_attr(
@@ -3406,11 +4264,12 @@ mod tests {
             .set_ref("refs/remotes/origin/main", RawRef::Direct(tip))
             .unwrap();
         let repo = repo.with_ref_store(store);
-        let opts = FetchOptions {
-            refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".into()],
-            tags: TagMode::None,
-            dry_run: true,
-            ..Default::default()
+        let opts = {
+            let mut opts = FetchOptions::new();
+            opts.refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".into()];
+            opts.tags = TagMode::None;
+            opts.dry_run = true;
+            opts
         };
         let outcome = fetch_local_into(
             &repo,
@@ -3424,6 +4283,259 @@ mod tests {
         assert_eq!(outcome.updates.len(), 1);
         assert_eq!(outcome.updates[0].old_oid, Some(tip));
         assert_eq!(outcome.updates[0].mode, UpdateMode::UpToDate);
+    }
+
+    fn write_linear_commits(objects: &Path, depth: usize) -> (Odb, ObjectId) {
+        use crate::objects::{serialize_commit, CommitData};
+        let odb = Odb::new(objects);
+        let mut parent = None;
+        for i in 0..depth {
+            let blob = odb
+                .write(ObjectKind::Blob, format!("payload {i}\n").as_bytes())
+                .expect("blob");
+            let mut tree = b"100644 f.txt\0".to_vec();
+            tree.extend_from_slice(blob.as_bytes());
+            let tree_oid = odb.write(ObjectKind::Tree, &tree).expect("tree");
+            let commit = CommitData {
+                tree: tree_oid,
+                parents: parent.into_iter().collect(),
+                author: "T <t@e.com> 0 +0000".into(),
+                committer: "T <t@e.com> 0 +0000".into(),
+                author_raw: Vec::new(),
+                committer_raw: Vec::new(),
+                encoding: None,
+                message: format!("c{i}\n"),
+                raw_message: None,
+                extra_headers: Vec::new(),
+            };
+            parent = Some(
+                odb.write(ObjectKind::Commit, &serialize_commit(&commit))
+                    .expect("commit"),
+            );
+        }
+        (odb, parent.expect("tip"))
+    }
+
+    #[test]
+    fn fetch_local_hardlinked_pack_reports_scan_progress() {
+        let remote = tempfile::tempdir().expect("remote");
+        assert!(git_ok(
+            remote.path(),
+            &["init", "-q", "-b", "main", "--bare"]
+        ));
+        let src = tempfile::tempdir().expect("src");
+        assert!(git_ok(src.path(), &["init", "-q", "-b", "main"]));
+        for i in 0..280 {
+            std::fs::write(src.path().join("f.txt"), format!("payload {i}\n")).unwrap();
+            assert!(git_ok(src.path(), &["add", "f.txt"]));
+            assert!(git_ok(src.path(), &["commit", "-qm", &format!("c{i}")],));
+        }
+        assert!(git_ok(
+            src.path(),
+            &["push", "-q", remote.path().to_str().unwrap(), "main:main"],
+        ));
+        assert!(git_ok(remote.path(), &["repack", "-a", "-d", "-f"],));
+
+        let local = tempfile::tempdir().expect("local");
+        init_repository(local.path(), false, "main", None, RefStorageFormat::Files).expect("init");
+
+        let opts = FetchOptions {
+            refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()],
+            initial_remote_fetch: true,
+            tags: TagMode::None,
+            ..Default::default()
+        };
+        let mut rec = PhaseRecorder {
+            want_received: true,
+            ..Default::default()
+        };
+        let outcome = fetch_local_with_progress(
+            &local.path().join(".git"),
+            remote.path(),
+            &opts,
+            &mut rec,
+            &crate::progress::NeverCancel,
+        )
+        .expect("fetch_local");
+        assert!(
+            outcome.transfer.objects > 500,
+            "expected a large hardlinked pack transfer"
+        );
+        assert!(
+            rec.enumerating_counts.len() >= 3,
+            "expected pack index scan progress under EnumeratingObjects, got {:?}",
+            rec.enumerating_counts
+        );
+        assert_monotonic(&rec.enumerating_counts);
+        assert_eq!(
+            rec.started
+                .iter()
+                .filter(|(p, _)| *p == ProgressPhase::CopyingObjects)
+                .count(),
+            1,
+            "expected a single CopyingObjects phase, got {:?}",
+            rec.started
+        );
+        assert!(
+            !rec.copying_counts.is_empty(),
+            "expected copy progress after pack install, got {:?}",
+            rec.copying_counts
+        );
+        assert_monotonic(&rec.copying_counts);
+        assert!(
+            rec.received.last().is_some_and(|s| s.received > 0),
+            "expected received_objects only after objects were installed"
+        );
+    }
+
+    #[test]
+    fn fetch_local_packed_remote_reports_incremental_copy_progress() {
+        let remote = tempfile::tempdir().expect("remote");
+        init_repository(remote.path(), true, "main", None, RefStorageFormat::Files)
+            .expect("remote init");
+        let objects = remote.path().join("objects");
+        let (remote_odb, tip) = write_linear_commits(&objects, 280);
+        crate::refs::write_ref(remote.path(), "refs/heads/main", &tip).expect("main ref");
+        remote_odb
+            .write(ObjectKind::Blob, b"unreachable orphan blob\n")
+            .expect("orphan");
+
+        let local = tempfile::tempdir().expect("local");
+        init_repository(local.path(), false, "main", None, RefStorageFormat::Files).expect("init");
+
+        let opts = {
+            let mut opts = FetchOptions::new();
+            opts.refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()];
+            opts.tags = TagMode::None;
+            opts = opts.initial_remote_fetch(true);
+            opts
+        };
+        let mut rec = PhaseRecorder {
+            want_received: true,
+            ..Default::default()
+        };
+        let outcome = fetch_local_with_progress(
+            &local.path().join(".git"),
+            remote.path(),
+            &opts,
+            &mut rec,
+            &crate::progress::NeverCancel,
+        )
+        .expect("fetch_local");
+        assert!(
+            !rec.received.is_empty(),
+            "expected received_objects callbacks"
+        );
+        for snapshot in &rec.received {
+            assert!(snapshot.received <= snapshot.total);
+        }
+
+        let enum_pos = rec
+            .started
+            .iter()
+            .position(|(p, _)| *p == ProgressPhase::EnumeratingObjects)
+            .expect("EnumeratingObjects");
+        let copy_pos = rec
+            .started
+            .iter()
+            .position(|(p, _)| *p == ProgressPhase::CopyingObjects)
+            .expect("CopyingObjects");
+        assert!(
+            enum_pos < copy_pos,
+            "enumerate before copy: {:?}",
+            rec.started
+        );
+        assert_eq!(
+            rec.started
+                .iter()
+                .filter(|(p, _)| *p == ProgressPhase::CopyingObjects)
+                .count(),
+            1,
+            "expected a single CopyingObjects phase, got {:?}",
+            rec.started
+        );
+        assert!(
+            rec.counts.len() >= 3,
+            "expected >=3 progress samples overall, got {:?}",
+            rec.counts
+        );
+        assert!(
+            rec.copying_counts.len() >= 3,
+            "expected >=3 copy progress samples, got {:?}",
+            rec.copying_counts
+        );
+        assert_monotonic(&rec.copying_counts);
+        assert!(
+            rec.copying_counts.last().copied().unwrap_or(0) >= outcome.transfer.objects as u64,
+            "final copy count should reach transferred objects"
+        );
+    }
+
+    #[test]
+    fn link_source_objects_progress_counts_objects_not_sidecar_files() {
+        for want_received in [false, true] {
+            let remote = tempfile::tempdir().expect("remote");
+            assert!(git_ok(
+                remote.path(),
+                &["init", "-q", "-b", "main", "--bare"]
+            ));
+            let src = tempfile::tempdir().expect("src");
+            assert!(git_ok(src.path(), &["init", "-q", "-b", "main"]));
+            for i in 0..20 {
+                std::fs::write(src.path().join("f.txt"), format!("payload {i}\n")).unwrap();
+                assert!(git_ok(src.path(), &["add", "f.txt"]));
+                assert!(git_ok(src.path(), &["commit", "-qm", &format!("c{i}")],));
+            }
+            assert!(git_ok(
+                src.path(),
+                &["push", "-q", remote.path().to_str().unwrap(), "main:main"],
+            ));
+            assert!(git_ok(remote.path(), &["repack", "-a", "-d", "-f"],));
+
+            let local = tempfile::tempdir().expect("local");
+            init_repository(local.path(), false, "main", None, RefStorageFormat::Files)
+                .expect("init");
+
+            let opts = {
+                let mut opts = FetchOptions::new();
+                opts.refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()];
+                opts.tags = TagMode::None;
+                opts.link_source_objects = true;
+                opts = opts.initial_remote_fetch(true);
+                opts
+            };
+            let mut rec = PhaseRecorder {
+                want_received,
+                ..Default::default()
+            };
+            let outcome = fetch_local_with_progress(
+                &local.path().join(".git"),
+                remote.path(),
+                &opts,
+                &mut rec,
+                &crate::progress::NeverCancel,
+            )
+            .expect("fetch_local");
+
+            if want_received {
+                assert!(
+                    !rec.received.is_empty(),
+                    "expected received_objects when enabled"
+                );
+            } else {
+                assert!(
+                    rec.received.is_empty(),
+                    "expected no received_objects when disabled"
+                );
+            }
+            assert_copy_progress_within_total(&rec, outcome.transfer.objects as u64);
+            assert_ne!(
+                copying_phase_total(&rec),
+                Some(1),
+                "total must be object count, not ref count: {:?}",
+                rec.started
+            );
+        }
     }
 
     #[cfg_attr(
@@ -3450,11 +4562,12 @@ mod tests {
         let local = tempfile::tempdir().expect("local");
         init_repository(local.path(), false, "main", None, RefStorageFormat::Files).expect("init");
 
-        let opts = FetchOptions {
-            refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()],
-            initial_remote_fetch: true,
-            tags: TagMode::None,
-            ..Default::default()
+        let opts = {
+            let mut opts = FetchOptions::new();
+            opts.refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()];
+            opts.tags = TagMode::None;
+            opts = opts.initial_remote_fetch(true);
+            opts
         };
         let mut rec = PhaseRecorder::default();
         fetch_local_with_progress(
@@ -3550,8 +4663,9 @@ mod tests {
         let git_dir = repo.join(".git");
         let pack_dir = git_dir.join("objects/pack");
         let odb = Odb::new(&git_dir.join("objects")).with_config_git_dir(git_dir.clone());
-        let stats = transfer_stats_for_local_operation(&odb, &HashSet::new(), &HashSet::new())
-            .expect("stats");
+        let stats =
+            transfer_stats_for_local_operation(&odb, &HashSet::new(), None, &HashSet::new())
+                .expect("stats");
         assert!(stats.bytes > 0);
         assert!(stats.objects > 0);
 

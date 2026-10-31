@@ -18,6 +18,7 @@ use time::{OffsetDateTime, UtcOffset};
 
 use crate::change_id::{ChangeIdGenerator, OsChangeIdGenerator};
 use crate::command_runner::{system_command_runner, CommandRunner};
+use crate::config::parse_git_config_maybe_bool;
 use crate::diagnostics::{DiagnosticsHandle, NullDiagnostics};
 use crate::git_date::tm::{local_tzoffset_with_tz, TzHhmm};
 use crate::ident_resolve::IdentityEnv;
@@ -44,6 +45,9 @@ pub struct Environment {
     pub git_replace_ref_base: Option<String>,
     /// When true, replacement objects from `GIT_REPLACE_OBJECT` are ignored.
     pub git_no_replace_objects: bool,
+    /// When false, opportunistic index updates that take optional locks are skipped (Git
+    /// `GIT_OPTIONAL_LOCKS=0` / `--no-optional-locks`). Defaults to true when unset.
+    pub git_optional_locks: bool,
     /// Override for `GIT_ALTERNATE_OBJECT_DIRECTORIES` when set (see Git environment variable of the same name).
     pub git_alternate_object_directories: Option<String>,
     /// Override for `GIT_OBJECT_DIRECTORY` when set (see Git environment variable of the same name).
@@ -152,6 +156,7 @@ impl Environment {
             git_namespace: None,
             git_replace_ref_base: None,
             git_no_replace_objects: false,
+            git_optional_locks: true,
             git_alternate_object_directories: None,
             git_object_directory: None,
             git_prefix: None,
@@ -211,6 +216,7 @@ impl Environment {
             && self.git_namespace == e.git_namespace
             && self.git_replace_ref_base == e.git_replace_ref_base
             && self.git_no_replace_objects == e.git_no_replace_objects
+            && self.git_optional_locks == e.git_optional_locks
             && self.git_alternate_object_directories == e.git_alternate_object_directories
             && self.git_object_directory == e.git_object_directory
             && self.git_prefix == e.git_prefix
@@ -288,6 +294,7 @@ impl Environment {
             git_namespace: get("GIT_NAMESPACE"),
             git_replace_ref_base: get("GIT_REPLACE_REF_BASE"),
             git_no_replace_objects: map.contains_key("GIT_NO_REPLACE_OBJECTS"),
+            git_optional_locks: git_optional_locks_from_env(get("GIT_OPTIONAL_LOCKS").as_deref()),
             git_alternate_object_directories: get("GIT_ALTERNATE_OBJECT_DIRECTORIES"),
             git_object_directory: get("GIT_OBJECT_DIRECTORY"),
             git_prefix: get("GIT_PREFIX"),
@@ -522,6 +529,11 @@ impl Environment {
             "GIT_INDEX_FILE" => self.git_index_file.clone(),
             "GIT_NAMESPACE" => self.git_namespace.clone(),
             "GIT_REPLACE_REF_BASE" => self.git_replace_ref_base.clone(),
+            "GIT_OPTIONAL_LOCKS" => Some(if self.git_optional_locks {
+                "1".to_owned()
+            } else {
+                "0".to_owned()
+            }),
             "GIT_ALTERNATE_OBJECT_DIRECTORIES" => self.git_alternate_object_directories.clone(),
             "GIT_OBJECT_DIRECTORY" => self.git_object_directory.clone(),
             "GIT_CONFIG_NOSYSTEM" => self.git_config_nosystem.clone(),
@@ -584,6 +596,13 @@ impl Environment {
         if key == "GIT_NO_REPLACE_OBJECTS" && self.git_no_replace_objects {
             return Some(OsString::new());
         }
+        if key == "GIT_OPTIONAL_LOCKS" {
+            return Some(OsString::from(if self.git_optional_locks {
+                "1"
+            } else {
+                "0"
+            }));
+        }
         if key == "GIT_INSTALL_ROOT" {
             return self.git_install_root.clone();
         }
@@ -594,6 +613,66 @@ impl Environment {
             return Some(OsString::from(v));
         }
         self.captured_vars.as_ref()?.get(key).cloned()
+    }
+
+    /// This environment as seen by a repository served over a local transport (a
+    /// `file://` URL or a path), the way Git's local transport passes the client's
+    /// environment to the `upload-pack` it runs.
+    ///
+    /// Global and system config discovery (`HOME`, `XDG_CONFIG_HOME`,
+    /// `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM`, `GIT_CONFIG_NOSYSTEM`, …) is kept, so the
+    /// served repository sees settings such as `uploadpack.allowFilter` from
+    /// `~/.gitconfig`. Variables that describe the client's own repository are dropped:
+    /// `GIT_DIR`, `GIT_WORK_TREE`, `GIT_COMMON_DIR`, `GIT_INDEX_FILE`,
+    /// `GIT_OBJECT_DIRECTORY`, `GIT_ALTERNATE_OBJECT_DIRECTORIES`, `GIT_PREFIX`,
+    /// replace-object and graft/shallow overrides, and the `-c` / `GIT_CONFIG_*`
+    /// command-line config (`GIT_CONFIG`, `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_COUNT`).
+    #[must_use]
+    pub(crate) fn for_local_transport(&self) -> Self {
+        const CLIENT_REPO_VARS: &[&str] = &[
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_IMPLICIT_WORK_TREE",
+            "GIT_COMMON_DIR",
+            "GIT_INDEX_FILE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_GRAFT_FILE",
+            "GIT_SHALLOW_FILE",
+            "GIT_NO_REPLACE_OBJECTS",
+            "GIT_REPLACE_REF_BASE",
+            "GIT_PREFIX",
+            "GIT_CONFIG",
+            "GIT_CONFIG_PARAMETERS",
+            "GIT_CONFIG_COUNT",
+        ];
+        let is_client_repo_var = |key: &str| {
+            CLIENT_REPO_VARS.contains(&key)
+                || key.starts_with("GIT_CONFIG_KEY_")
+                || key.starts_with("GIT_CONFIG_VALUE_")
+        };
+        let mut env = self.clone();
+        env.git_dir = None;
+        env.git_work_tree = None;
+        env.git_index_file = None;
+        env.git_object_directory = None;
+        env.git_alternate_object_directories = None;
+        env.git_prefix = None;
+        env.git_no_replace_objects = false;
+        env.git_replace_ref_base = None;
+        env.git_config = None;
+        env.git_config_parameters = None;
+        env.git_config_count = None;
+        env.git_config_pairs = Vec::new();
+        env.captured_vars = self.captured_vars.as_ref().and_then(|vars| {
+            let kept: HashMap<String, OsString> = vars
+                .iter()
+                .filter(|(k, _)| !is_client_repo_var(k))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            (!kept.is_empty()).then(|| Arc::new(kept))
+        });
+        env
     }
 
     /// Resolve `cwd` for discovery: canonicalize when possible without `env::current_dir`.
@@ -754,6 +833,9 @@ impl Environment {
         if self.git_no_replace_objects {
             set.push((OsString::from("GIT_NO_REPLACE_OBJECTS"), OsString::new()));
         }
+        if !self.git_optional_locks {
+            set.push((OsString::from("GIT_OPTIONAL_LOCKS"), OsString::from("0")));
+        }
         if self.grit_debug_safe_dir {
             set.push((OsString::from("GRIT_DEBUG_SAFE_DIR"), OsString::new()));
         }
@@ -904,6 +986,7 @@ const TYPED_ENVIRONMENT_VARS: &[&str] = &[
     "GIT_NAMESPACE",
     "GIT_REPLACE_REF_BASE",
     "GIT_NO_REPLACE_OBJECTS",
+    "GIT_OPTIONAL_LOCKS",
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
     "GIT_OBJECT_DIRECTORY",
     "GIT_PREFIX",
@@ -947,6 +1030,13 @@ fn is_typed_environment_var(key: &str) -> bool {
     TYPED_ENVIRONMENT_VARS.contains(&key)
         || key.starts_with("GIT_CONFIG_KEY_")
         || key.starts_with("GIT_CONFIG_VALUE_")
+}
+
+fn git_optional_locks_from_env(raw: Option<&str>) -> bool {
+    match raw {
+        None => true,
+        Some(value) => parse_git_config_maybe_bool(value).unwrap_or(true),
+    }
 }
 
 fn subprocess_push_str(out: &mut Vec<(OsString, OsString)>, key: &str, val: Option<&str>) {
@@ -1188,6 +1278,26 @@ mod tests {
     }
 
     #[test]
+    fn git_optional_locks_parses_like_git() {
+        assert!(Environment::from_vars([], PathBuf::from(".")).git_optional_locks);
+        for disabled in ["0", "false", "no", "off", "FALSE"] {
+            let env = Environment::from_vars(
+                [(
+                    OsString::from("GIT_OPTIONAL_LOCKS"),
+                    OsString::from(disabled),
+                )],
+                PathBuf::from("."),
+            );
+            assert!(!env.git_optional_locks, "expected disabled for {disabled}");
+        }
+        let enabled = Environment::from_vars(
+            [(OsString::from("GIT_OPTIONAL_LOCKS"), OsString::from("1"))],
+            PathBuf::from("."),
+        );
+        assert!(enabled.git_optional_locks);
+    }
+
+    #[test]
     fn is_fetch_options_default_matches_empty() {
         assert!(Environment::empty().is_fetch_options_default());
         assert!(Environment::from_vars([], PathBuf::from("."))
@@ -1203,6 +1313,55 @@ mod tests {
         assert!(!env.is_fetch_options_default());
         env.captured_vars = None;
         assert!(env.is_fetch_options_default());
+    }
+
+    #[test]
+    fn local_transport_keeps_config_discovery_and_drops_the_client_repository() {
+        let vars = [
+            ("HOME", "/home/u"),
+            ("XDG_CONFIG_HOME", "/home/u/.config"),
+            ("GIT_CONFIG_NOSYSTEM", "1"),
+            ("GIT_CONFIG_GLOBAL", "/home/u/alt.gitconfig"),
+            ("GIT_DIR", "/client/.git"),
+            ("GIT_WORK_TREE", "/client"),
+            ("GIT_COMMON_DIR", "/client/.git"),
+            ("GIT_OBJECT_DIRECTORY", "/client/.git/objects"),
+            ("GIT_ALTERNATE_OBJECT_DIRECTORIES", "/elsewhere"),
+            ("GIT_INDEX_FILE", "/client/.git/index"),
+            ("GIT_CONFIG_PARAMETERS", "'core.bare'='true'"),
+            ("GIT_CONFIG_COUNT", "1"),
+            ("GIT_CONFIG_KEY_0", "uploadpack.allowfilter"),
+            ("GIT_CONFIG_VALUE_0", "false"),
+            ("PATH", "/usr/bin"),
+        ]
+        .map(|(k, v)| (OsString::from(k), OsString::from(v)));
+        let env = Environment::from_vars(vars, PathBuf::from("/client")).for_local_transport();
+        assert_eq!(env.var("HOME").as_deref(), Some("/home/u"));
+        assert_eq!(
+            env.var("XDG_CONFIG_HOME").as_deref(),
+            Some("/home/u/.config")
+        );
+        assert_eq!(env.var("GIT_CONFIG_NOSYSTEM").as_deref(), Some("1"));
+        assert_eq!(
+            env.var("GIT_CONFIG_GLOBAL").as_deref(),
+            Some("/home/u/alt.gitconfig")
+        );
+        assert_eq!(env.var("PATH").as_deref(), Some("/usr/bin"));
+        for key in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_COMMON_DIR",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_INDEX_FILE",
+            "GIT_CONFIG_PARAMETERS",
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_KEY_0",
+            "GIT_CONFIG_VALUE_0",
+        ] {
+            assert_eq!(env.var_os(key), None, "{key}");
+        }
+        assert!(env.git_config_pairs.is_empty());
     }
 
     #[test]

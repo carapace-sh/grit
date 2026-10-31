@@ -36,7 +36,11 @@ start the system `git` (comparisons with Git, fixtures built with `git`) or buil
 heavy fixtures (scale, memory and benchmark-style tests, grit-bench scenarios)
 are left out of it: each crate compiles them only with its `full-tests`
 feature. `make test-full` enables that feature in every crate; CI runs it in the
-nightly **test-full** job, not on every branch.
+nightly **test-full** job, not on every branch. That target builds release
+`grit-cli` and sets **`GRIT_BIN`** for `grit-lib`'s `checkout_wide_tree_rss` test
+(fork/`wait4` peak RSS against the CLI under test). CI and local nextest runs use
+`scripts/nextest-checkout-wide-tree-rss-env.sh` (see `.config/nextest.toml`) to
+build release `grit` and export **`GRIT_BIN`** before that test.
 
 [`scripts/classify_tests.py`](scripts/classify_tests.py) decides which tests are
 full-only: a test that calls `Command::new("git")`, or a helper that does
@@ -477,7 +481,7 @@ Shared harness: [`grit-lib/tests/support/diff_harness.rs`](grit-lib/tests/suppor
 | t4061-diff-indent.sh | `--indent-heuristic` / `diff.indentHeuristic` | `diff_blob_algorithms.rs` (`t4061_indent_heuristic_matches_git`) | covered (spaces.txt subset) |
 | t4015-diff-whitespace.sh | trailing whitespace blob diffs; `-b`/`-w` oracle notes | `diff_blob_algorithms.rs` (`t4015_whitespace_modes_match_git`) | partial (default ws; `--ignore-space-at-eol` equivalence checked via git oracle) |
 | t4012-diff-binary.sh | binary detection / parse git binary patch | `diff_blob_algorithms.rs` (`t4012_binary_patch_applies_with_git`) | partial (text patch parity; binary marker + apply parse) |
-| t4052-stat-output.sh | `--numstat` / `--stat` width layout | `diff_blob_algorithms.rs` (`t4052_numstat_and_stat_width_match_git`) | partial (numstat + grit stat line; `--stat=width` UX skipped on older git) |
+| t4052-stat-output.sh | `--numstat` counts and `--stat` change column | `diff_blob_algorithms.rs` (`t4052_numstat_matches_git`, `t4052_numstat_total_matches_git_stat_column`) | partial (counts only; `--stat` width layout is CLI presentation) |
 | t4032-diff-inter-hunk-context.sh | `-U0` + `--inter-hunk-context` hunk count | `diff_blob_algorithms.rs` (`t4032_inter_hunk_context_matches_git`) | covered |
 | t4029-diff-trailing-space.sh | trailing space line diff | `diff_blob_algorithms.rs` (`t4015_whitespace_modes_match_git`) | covered |
 | t4074-diff-shifted-matched-group.sh | histogram shifted groups | `diff_blob_algorithms.rs` (`t4074_shifted_matched_group_histogram_applies_with_git`) | partial (patch applies; hunk body may differ from git histogram) |
@@ -485,7 +489,7 @@ Shared harness: [`grit-lib/tests/support/diff_harness.rs`](grit-lib/tests/suppor
 | t4051-diff-function-context.sh | `-W` function context | `diff_blob_algorithms.rs` (`t4051_function_context_applies_with_git`) | partial (apply parity; hunk extent may differ from git `-W`) |
 | t4055-diff-context.sh | `diff.context` config | — | not ported |
 | t4024-diff-optimize-common.sh | optimize common subexpression | — | not ported |
-| t4049-diff-stat-count.sh | stat count limits | `diffstat.rs` (`write_diffstat_stat_count_hides_lines_but_sums_summary`) | covered (library stat block) |
+| t4049-diff-stat-count.sh | stat count limits | — | skipped (`--stat-count` is display UX) |
 | t4047-diff-dirstat.sh | `--dirstat` | — | not ported |
 | — | no newline at EOF markers | `diff_blob_algorithms.rs` (`no_newline_at_eof_pairs_match_git_or_apply`) | covered |
 | — | random apply `--check` all algorithms | `diff_blob_algorithms.rs` (`random_patches_apply_with_git_all_algorithms`) | covered |
@@ -593,9 +597,8 @@ Shared harness: [`grit-lib/tests/support/diff_harness.rs`](grit-lib/tests/suppor
 | t6425-merge-rename-delete.sh | rename/delete | `merge_ort_git_compat.rs` (`t6422_rename_corner_cases_match_git_merge_tree`) | partial |
 | t6427-diff3-conflict-markers.sh | diff3 / zdiff3 markers | `merge_file_git_compat.rs` (`t6427_diff3_and_zdiff3_markers_match_git_merge_file`) | covered |
 | t6423-merge-rename-detection.sh | directory rename detection | — | gap (directory renames not implemented in merge-ort path) |
-| t6401/t6404/t6431 | criss-cross / virtual merge bases | — | gap (virtual bases not implemented) |
+| t6401/t6404/t6431 | criss-cross / virtual merge bases | `merge_ort_git_compat.rs` (`t6401_criss_cross_merge_matches_git`, `t6404_recursive_merge_matches_git`, `t6431_criss_cross_rename_delete_matches_git`, `criss_cross_*_matches_git`); `merge_check_git_compat.rs` (`criss_cross_*`) | partial (rename/rename and directory/file conflicts between the merge bases are not settled the way Git's inner merges are) |
 | t4301-merge-tree-write-tree.sh | `--write-tree` oracle | `merge_ort_git_compat.rs` (`t4301_merge_tree_write_tree_clean_merge_matches_git`) | covered |
-| t7603 | octopus parent reduction | `grit-lib/src/porcelain/merge.rs` (`reduce_octopus_merge_heads_drops_ancestor`) | covered |
 | — | cherry-pick tree vs `git cherry-pick --no-commit` | `merge_ort_git_compat.rs` (`cherry_pick_tree_remap_matches_git`) | covered |
 
 #### Stash/notes/worktrees/patch-ids
@@ -615,7 +618,7 @@ Shared harness: [`grit-lib/tests/support/diff_harness.rs`](grit-lib/tests/suppor
 | t2404-worktree-config.sh | `extensions.worktreeConfig` + `config.worktree` via `copy_filtered_worktree_config` | `worktree_git_compat.rs` (`t2404_worktree_config_matches_git`) | covered |
 | t2401 worktree remove | linked worktree removal vs git | `grit-lib/tests/worktree_git_compat.rs` (`t2401_remove_linked_worktree_matches_git`) | covered (library `remove_linked_worktree`; no grit `worktree remove` CLI yet) |
 | t2403/t2406/t2407 worktree | move/repair/prune/exclusive heads | — | gap (no grit `worktree move/repair/prune` yet; branch exclusivity covered in `worktree_extended_git_compat.rs`) |
-| t4204-patch-id.sh | `PatchIdMode` stable/unstable/verbatim vs `git patch-id`; ODB `compute_patch_id` | `grit-lib/src/patch_ids.rs` (`t4204_patch_id_modes_match_git`, `stable_patch_ids_match_git_patch_id_on_log_p`) | covered |
+| t4204-patch-id.sh | `PatchIdMode` stable/unstable/verbatim vs `git patch-id`; ODB `compute_patch_id`, including header-only entries (empty files, mode changes, pure renames) in multi-file commits | `grit-lib/src/patch_ids.rs` (`t4204_patch_id_modes_match_git`, `stable_patch_ids_match_git_patch_id_on_log_p`, `empty_file_add_and_delete_patch_ids_match_git`) | covered |
 | — | per-worktree refs `main-worktree/` / `worktrees/<id>/` storage | `worktree_git_compat.rs` (`per_worktree_refs_resolve_like_git`); `worktree_ref.rs` unit tests | covered |
 | — | stash apply/pop conflicts keep entry | `stash_git_compat.rs` (`pop_keeps_entry_on_conflict`); `stash_apply_git_compat.rs` | covered |
 
@@ -658,7 +661,7 @@ Reproduce locally with **`make docs-check`**; preview with **`make docs`** (dev 
 ## Adding tests
 
 - Put **library behavior** in `grit-lib/src/**` unit tests or `grit-lib/tests/*.rs` integration tests.
-- Use **`grit-test-support`** helpers for temp repos and fixtures shared across crates.
+- Use **`grit-test-support`** helpers for temp repos and fixtures shared across crates. Run system `git` with `grit_test_support::git` (hermetic identity, date and config), resolve revisions with `grit_test_support::rev_parse`, and reserve server ports with `grit_test_support::free_port` (its handout list is process-wide, so modules in one test binary never collide) instead of adding per-file copies.
 - Integration tests in `grit-lib`, `grit-cli`, `grit-utils`, `grit-examples`, `grit-protocol` and `grit-http-server` build as **one test binary per crate**, `tests/integration.rs`, which includes each `tests/*.rs` file as a module. After adding, renaming or removing a test file, run **`python3 scripts/sync_integration_tests.py`**; the `every_test_file_is_compiled` test fails until you do. Run one file's tests with `cargo test -p <crate> --test integration <file>::`. A file that changes the working directory or environment, or runs its own binary again by test name, gets a `[[test]]` entry in the crate's `Cargo.toml` instead, so it keeps its own process. Shared helper directories (`tests/support/`) are declared once in `integration.rs`; a test file uses them with `use crate::support;`.
 - For new **public API**, add at least one test that exercises the happy path and important errors.
 - When behavior must match Git, assert it against the system `git` binary in the test (formats, protocols, `fsck`), not against copied Git output text.

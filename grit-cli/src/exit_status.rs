@@ -27,7 +27,7 @@ pub enum ExitStatus {
     RemoteUnreadable,
     /// Bundle unbundle missing prerequisite commits (128).
     MissingPrerequisite,
-    /// `merge --ff-only` refused: not fast-forward (128).
+    /// `merge --ff-only` or `pull --ff-only` refused: not fast-forward (128).
     RefusedNotFf,
     /// Invalid commit filter / pickaxe pattern (129).
     InvalidCommitFilter,
@@ -80,6 +80,13 @@ impl ExitStatus {
             .chain()
             .any(|cause| cause.downcast_ref::<BranchUsageError>().is_some())
         {
+            return Self::Usage;
+        }
+        if err.chain().any(|cause| {
+            cause
+                .downcast_ref::<commands::tag::TagUsageError>()
+                .is_some()
+        }) {
             return Self::Usage;
         }
         if err
@@ -245,9 +252,26 @@ impl ExitStatus {
         }
     }
 
+    /// `--check` succeeds only when a fast-forward is possible; otherwise a
+    /// refused fast-forward (`--ff-only` or `pull.ff=only`) is 128, like
+    /// `merge --ff-only`, and a stop on conflicts is 1.
     #[must_use]
     pub fn from_pull(outcome: &commands::pull::PullOutcome) -> Self {
-        Self::from_i32(commands::pull::pull_check_exit_code(outcome))
+        use commands::pull::PullResult;
+        if let Some(check) = &outcome.check {
+            return if check.fast_forward_possible {
+                Self::Success
+            } else {
+                Self::Failure
+            };
+        }
+        match outcome.result {
+            PullResult::RefusedNotFf => Self::RefusedNotFf,
+            PullResult::Conflicts | PullResult::AutostashConflict | PullResult::RebaseStopped => {
+                Self::Failure
+            }
+            _ => Self::Success,
+        }
     }
 
     #[must_use]
@@ -304,7 +328,7 @@ mod tests {
     use crate::error_kind::ErrorKind;
     use crate::json_error::{
         hash_collision, incompatible_output_flags, invalid_commit_filter, invalid_pickaxe,
-        operation_conflict, would_overwrite_error,
+        replay_conflict, would_overwrite_error,
     };
     use grit_lib::command_runner::hooks::{HookError, HookOutput};
     use grit_lib::error::OverwriteReason;
@@ -318,7 +342,7 @@ mod tests {
         let structured: &[(ErrorKind, anyhow::Error, ExitStatus)] = &[
             (
                 ErrorKind::Conflict,
-                operation_conflict("merge", vec!["f.txt".into()], None),
+                replay_conflict("rebase", oid, "subject", vec!["f.txt".into()], Vec::new()),
                 ExitStatus::Failure,
             ),
             (
@@ -436,6 +460,30 @@ mod tests {
             let payload = crate::json_error::structured_json_payload(&mapped).expect("payload");
             assert!(ErrorKind::all().contains(&payload.kind));
             assert_eq!(ExitStatus::for_error(&mapped), ExitStatus::Failure);
+        }
+    }
+
+    #[test]
+    fn pull_refused_not_ff_is_128_and_conflicts_are_1() {
+        use commands::pull::{PullOutcome, PullResult};
+        let status = |result| ExitStatus::from_pull(&PullOutcome::bare(result, "main".into()));
+
+        assert_eq!(status(PullResult::RefusedNotFf), ExitStatus::RefusedNotFf);
+        assert_eq!(status(PullResult::RefusedNotFf).code(), 128);
+        for stopped in [
+            PullResult::Conflicts,
+            PullResult::AutostashConflict,
+            PullResult::RebaseStopped,
+        ] {
+            assert_eq!(status(stopped), ExitStatus::Failure);
+        }
+        for done in [
+            PullResult::UpToDate,
+            PullResult::FastForward,
+            PullResult::Merged,
+            PullResult::Rebased,
+        ] {
+            assert_eq!(status(done), ExitStatus::Success);
         }
     }
 }

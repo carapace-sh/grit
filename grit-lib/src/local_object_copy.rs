@@ -30,6 +30,45 @@ fn pack_entry_name_ok(name: &str) -> bool {
         || name.ends_with(".mtimes")
 }
 
+/// Outcome of [`link_remote_pack_files`].
+pub(crate) struct LinkRemotePacksOutcome {
+    /// Pack sidecar files (`.pack`, `.idx`, …) installed by this call.
+    pub files: usize,
+    /// Git objects in newly installed pack indexes (not sidecar file count).
+    pub objects: usize,
+}
+
+/// Count objects stored under `source_objects` (packed index entries plus loose files).
+///
+/// Used to size local whole-store link progress before copying.
+pub(crate) fn count_store_objects_for_link(source_objects: &Path) -> Result<usize> {
+    let mut objects = 0usize;
+    let pack_dir = source_objects.join("pack");
+    if pack_dir.is_dir() {
+        for entry in fs::read_dir(&pack_dir).map_err(Error::Io)? {
+            let entry = entry.map_err(Error::Io)?;
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "idx") {
+                let index = pack::read_pack_index_no_verify(&path)?;
+                objects += index.len();
+            }
+        }
+    }
+    for entry in fs::read_dir(source_objects).map_err(Error::Io)? {
+        let entry = entry.map_err(Error::Io)?;
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if name_str.len() != 2 || !name_str.chars().all(|c| c.is_ascii_hexdigit()) {
+            continue;
+        }
+        let Ok(shard) = fs::read_dir(entry.path()) else {
+            continue;
+        };
+        objects += shard.flatten().count();
+    }
+    Ok(objects)
+}
+
 /// Link or copy pack-related files from `remote_objects/pack/` into `local_objects/pack/`.
 ///
 /// Skips files that already exist in the destination. Every `.idx` is linked after
@@ -42,10 +81,13 @@ pub(crate) fn link_remote_pack_files(
     progress: &mut dyn crate::progress::ProgressSink,
     cancel: &dyn crate::progress::Cancel,
     total_hint: usize,
-) -> Result<usize> {
+) -> Result<LinkRemotePacksOutcome> {
     let remote_pack = remote_objects.join("pack");
     if !remote_pack.is_dir() {
-        return Ok(0);
+        return Ok(LinkRemotePacksOutcome {
+            files: 0,
+            objects: 0,
+        });
     }
     let local_pack = local_objects.join("pack");
     fs::create_dir_all(&local_pack).map_err(Error::Io)?;
@@ -57,7 +99,8 @@ pub(crate) fn link_remote_pack_files(
         }
     }
     names.sort_by_key(|name| name.to_string_lossy().ends_with(".idx"));
-    let mut linked = 0usize;
+    let mut linked_files = 0usize;
+    let mut linked_objects = 0usize;
     for name in names {
         crate::progress::poll_cancel(progress, cancel)?;
         let dst = local_pack.join(&name);
@@ -65,12 +108,20 @@ pub(crate) fn link_remote_pack_files(
             continue;
         }
         hard_link_or_copy(&remote_pack.join(&name), &dst)?;
-        linked += 1;
+        linked_files += 1;
         if total_hint > 0 {
             progress.inc(1);
         }
+        let name_str = name.to_string_lossy();
+        if name_str.ends_with(".idx") {
+            let index = pack::read_pack_index_no_verify(&dst)?;
+            linked_objects += index.len();
+        }
     }
-    Ok(linked)
+    Ok(LinkRemotePacksOutcome {
+        files: linked_files,
+        objects: linked_objects,
+    })
 }
 
 pub(crate) fn link_loose_objects(
@@ -187,21 +238,29 @@ pub(crate) fn refresh_local_odb_after_link(local_odb: &Odb) {
     pack::clear_pack_cache();
 }
 
+/// Largest share of a linked pack, in percent, that may be objects the destination already
+/// has. Above it the pack would mostly duplicate what the destination stores, as on an
+/// incremental fetch, and building a pack of only the missing objects is the better trade.
+pub(crate) const LINK_ALREADY_PRESENT_PERCENT: usize = 1;
+
 /// Link or copy every source pack whose objects all belong to `send` into `dest_objects/pack/`.
 ///
 /// `send` is the exact set of objects the destination must receive, so a pack that
-/// qualifies carries nothing the requested refs do not reach and nothing the
-/// destination already has. Packs holding any other object (other branches, hidden
-/// refs, excluded tags, unreachable leftovers) are skipped; the caller packs the
-/// remainder itself. Only the `.pack`, `.idx` and the per-pack `.rev` / `.bitmap`
-/// files are installed; `.keep`, `.promisor` and `.mtimes` markers describe the
-/// source's storage policy and are not carried over.
+/// qualifies carries nothing the requested refs do not reach. It may carry a few objects
+/// the destination already has (one, or up to [`LINK_ALREADY_PRESENT_PERCENT`] of the pack),
+/// such as the empty tree a freshly initialized repository writes before its first fetch;
+/// duplicates across packs are harmless and cheaper than rebuilding the pack. Packs
+/// holding any other object (other branches, hidden refs, excluded tags, unreachable
+/// leftovers) are skipped; the caller packs the remainder itself. Only the `.pack`, `.idx`
+/// and the per-pack `.rev` / `.bitmap` files are installed; `.keep`, `.promisor` and
+/// `.mtimes` markers describe the source's storage policy and are not carried over.
 ///
 /// # Parameters
 ///
 /// - `source_objects`: the sender's `objects/` directory.
 /// - `dest_objects`: the receiver's `objects/` directory.
 /// - `send`: objects the receiver lacks and must end up with.
+/// - `dest_has`: whether the receiver already stores an object outside `send`.
 /// - `progress` / `cancel`: polled between packs.
 ///
 /// # Returns
@@ -216,8 +275,10 @@ pub(crate) fn link_packs_within(
     source_objects: &Path,
     dest_objects: &Path,
     send: &[ObjectId],
+    dest_has: &dyn Fn(&ObjectId) -> bool,
     progress: &mut dyn crate::progress::ProgressSink,
     cancel: &dyn crate::progress::Cancel,
+    mut on_index_scan: Option<&mut dyn FnMut(u64)>,
 ) -> Result<usize> {
     let source_pack = source_objects.join("pack");
     if send.is_empty() || !source_pack.is_dir() {
@@ -241,10 +302,45 @@ pub(crate) fn link_packs_within(
             continue;
         }
         let index = pack::read_pack_index_no_verify(&entry.path())?;
-        let within = !index.is_empty()
-            && (0..index.len()).all(|i| {
-                ObjectId::from_bytes(index.oid_at(i)).is_ok_and(|oid| send.contains(&oid))
-            });
+        let mut already_present_budget = (index.len() * LINK_ALREADY_PRESENT_PERCENT / 100).max(1);
+        let mut within = !index.is_empty();
+        if within {
+            let mut scan_last = 0u64;
+            let stride = crate::progress::OBJECT_PROGRESS_STRIDE;
+            for i in 0..index.len() {
+                if i.is_multiple_of(64) {
+                    crate::progress::poll_cancel(progress, cancel)?;
+                }
+                let Ok(oid) = ObjectId::from_bytes(index.oid_at(i)) else {
+                    within = false;
+                    break;
+                };
+                let scanned = (i + 1) as u64;
+                if let Some(on_scan) = on_index_scan.as_deref_mut() {
+                    while scanned.saturating_sub(scan_last) >= stride {
+                        scan_last += stride;
+                        on_scan(stride);
+                    }
+                }
+                if send.contains(&oid) {
+                    continue;
+                }
+                if already_present_budget == 0 || !dest_has(&oid) {
+                    within = false;
+                    break;
+                }
+                already_present_budget -= 1;
+            }
+            if within {
+                if let Some(on_scan) = on_index_scan.as_deref_mut() {
+                    let scanned = index.len() as u64;
+                    let rem = scanned.saturating_sub(scan_last);
+                    if rem > 0 {
+                        on_scan(rem);
+                    }
+                }
+            }
+        }
         if !within {
             continue;
         }
@@ -357,8 +453,14 @@ mod tests {
         )
         .expect("link");
         assert!(
-            linked >= 2,
-            "expected at least .pack and .idx, got {linked}"
+            linked.files >= 2,
+            "expected at least .pack and .idx, got {}",
+            linked.files
+        );
+        assert!(
+            linked.objects >= 3,
+            "expected packed objects, got {}",
+            linked.objects
         );
 
         let local_odb = Odb::new(&dst_objects);

@@ -647,10 +647,14 @@ fn write_merge_fast_forward_markdown(
     would: bool,
 ) -> anyhow::Result<()> {
     let short = outcome.oid.as_deref().map(short_hex).unwrap_or("");
-    let head = outcome
-        .updated_branch
-        .as_deref()
-        .unwrap_or(outcome.branch.as_str());
+    let head = if outcome.detached_head {
+        "HEAD"
+    } else {
+        outcome
+            .updated_branch
+            .as_deref()
+            .unwrap_or(outcome.branch.as_str())
+    };
     let source = outcome
         .updated_branch
         .as_ref()
@@ -694,11 +698,15 @@ pub fn print_merge_outcome(w: &mut dyn Write, outcome: &MergeOutcome) -> anyhow:
         }
         MergeResult::Merged => {
             let short = outcome.oid.as_deref().map(short_hex).unwrap_or("");
-            outln!(
-                w,
-                "- Merged **`{}`** into the current branch · `{short}`",
-                outcome.branch
-            );
+            if outcome.detached_head {
+                outln!(w, "- Merged **`{}`** into HEAD · `{short}`", outcome.branch);
+            } else {
+                outln!(
+                    w,
+                    "- Merged **`{}`** into the current branch · `{short}`",
+                    outcome.branch
+                );
+            }
             if let Some(id) = outcome.change_id.as_deref() {
                 outln!(w, "- change id `{short}`", short = short_change_id(id));
             }
@@ -1271,7 +1279,18 @@ pub fn print_rebase_outcome(
     outln!(w, "## Rebase");
     outln!(w);
     match outcome.result {
-        RebaseResult::Aborted => outln!(w, "Rebase aborted."),
+        RebaseResult::Aborted => {
+            outln!(w, "Rebase aborted.");
+            for pair in &outcome.refs {
+                outln!(
+                    w,
+                    "- `{}` was moved during the rebase; reset `{}` → `{}` (the moved tip stays in its reflog)",
+                    pair.ref_name,
+                    short_hex(&pair.old),
+                    short_hex(&pair.new)
+                );
+            }
+        }
         RebaseResult::ExecDirty => {
             outln!(
                 w,
@@ -1314,7 +1333,11 @@ pub fn print_rebase_outcome(
                 outln!(w, "- Dry run (refs unchanged)");
             }
             if outcome.rewritten.is_empty() {
-                outln!(w, "- Already up to date");
+                if !outcome.exec.is_empty() {
+                    outln!(w, "- Exec commands ran; branch is unchanged");
+                } else {
+                    outln!(w, "- Already up to date");
+                }
             } else {
                 print_history_rewrite_rows(
                     w,
@@ -1342,7 +1365,17 @@ pub fn print_rebase_check_outcome(
             outln!(w, "- Would rebase {n} commit(s) cleanly");
         }
         RebaseCheckResult::Conflicts => {
-            outln!(w, "- Would conflict during rebase");
+            match &outcome.refs {
+                Some(refs) => {
+                    let refs: Vec<String> = refs.iter().map(|r| format!("`{r}`")).collect();
+                    outln!(
+                        w,
+                        "- Would conflict moving {} onto the rebased history",
+                        refs.join(", ")
+                    );
+                }
+                None => outln!(w, "- Would conflict during rebase"),
+            }
             if let Some(conflicts) = &outcome.conflicts {
                 for c in conflicts {
                     outln!(w, "- `{}` ({})", c.path, c.kind);
@@ -1361,13 +1394,37 @@ pub fn print_history_rewrite_outcome(
     outln!(w, "## {title}");
     outln!(w);
     if outcome.operation == "rebase" && outcome.rewritten.is_empty() {
-        outln!(w, "- Already up to date");
+        if !outcome.exec.is_empty() {
+            outln!(w, "- Exec commands ran; branch is unchanged");
+        } else {
+            outln!(w, "- Already up to date");
+        }
         return Ok(());
     }
     if outcome.dry_run {
         outln!(w, "- Dry run (refs unchanged)");
     }
     print_history_rewrite_rows(w, &outcome.rewritten, &outcome.refs, outcome.head.as_ref())
+}
+
+pub fn print_history_undo_restores(
+    w: &mut dyn Write,
+    dry_run: bool,
+    restored_paths: &[String],
+    unrestored_edits: Option<&str>,
+) -> anyhow::Result<()> {
+    let verb = if dry_run { "would restore" } else { "restored" };
+    for path in restored_paths {
+        outln!(w, "- {verb} `{path}` (index and work tree)");
+    }
+    if let Some(oid) = unrestored_edits {
+        outln!(
+            w,
+            "- staged edits from the undone command were not restored; they remain in commit `{}`",
+            short_hex(oid)
+        );
+    }
+    Ok(())
 }
 
 fn print_history_rewrite_rows(
@@ -1480,7 +1537,9 @@ pub fn print_history_absorb_outcome(
                 "| `{}` | `{}` | {} |",
                 escape_table_cell(&row.path),
                 absorb_hunk_header(&row.hunk_range),
-                escape_table_cell(&row.reason)
+                escape_table_cell(&crate::commands::history::format_absorb_unassigned_reason(
+                    row
+                ))
             );
         }
         outln!(w);
@@ -1510,6 +1569,15 @@ pub fn print_switch_outcome(w: &mut dyn Write, outcome: &SwitchOutcome) -> anyho
     }
     if !outcome.hooks_run.is_empty() {
         outln!(w, "- Hooks: `{}`", outcome.hooks_run.join("`, `"));
+    }
+    if !outcome.path_collisions.is_empty() {
+        outln!(
+            w,
+            "- **Path collisions** (case-insensitive paths share one file):"
+        );
+        for path in &outcome.path_collisions {
+            outln!(w, "  - `{path}`");
+        }
     }
     print_switch_stranded(w, outcome)
 }
@@ -1751,17 +1819,20 @@ fn print_worktree_table(w: &mut dyn Write, worktrees: &[WorktreeRow]) -> anyhow:
     outln!(w, "| Path | Branch | HEAD | Current | Locked | Prunable |");
     outln!(w, "| --- | --- | --- | --- | --- | --- |");
     for wt in worktrees {
-        let branch = wt
-            .branch
-            .as_deref()
-            .map(|b| format!("`{}`", escape_table_cell(b)))
-            .unwrap_or_else(|| {
-                if wt.detached {
-                    "_(detached)_".into()
-                } else {
-                    "—".into()
-                }
-            });
+        let branch = if wt.bare {
+            "_(bare)_".into()
+        } else {
+            wt.branch
+                .as_deref()
+                .map(|b| format!("`{}`", escape_table_cell(b)))
+                .unwrap_or_else(|| {
+                    if wt.detached {
+                        "_(detached)_".into()
+                    } else {
+                        "—".into()
+                    }
+                })
+        };
         let head = if wt.head.is_empty() {
             "—".to_owned()
         } else {
@@ -1806,6 +1877,11 @@ pub fn print_auth_outcome(w: &mut dyn Write, outcome: &AuthOutcome) -> anyhow::R
     outln!(w);
     if outcome.authenticated {
         match &outcome.user {
+            Some(user) if !outcome.verified => outln!(
+                w,
+                "- Stored a token for **`{user}`** on **`{}`** (not verified; the next push or fetch uses it)",
+                outcome.host
+            ),
             Some(user) => outln!(w, "- Signed in to **`{}`** as **`{user}`**", outcome.host),
             None => outln!(w, "- Signed in to **`{}`**", outcome.host),
         }
@@ -2003,7 +2079,22 @@ pub fn print_push_results(
         let target = format!("{remote} {}", result.ref_name);
         match result.status {
             crate::commands::push::PushRefOutcomeStatus::Ok => {
-                if dry_run {
+                if result.deleted == Some(true) {
+                    let short = crate::commands::push::ref_short_display(&result.ref_name);
+                    if dry_run {
+                        outln!(
+                            w,
+                            "- **`{}`** · would delete `{short}` from `{remote}`",
+                            result.ref_name
+                        );
+                    } else {
+                        outln!(
+                            w,
+                            "- **`{}`** · deleted `{short}` from `{remote}`",
+                            result.ref_name
+                        );
+                    }
+                } else if dry_run {
                     outln!(
                         w,
                         "- **`{}`** · would push `{branch}` → `{target}`",

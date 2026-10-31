@@ -75,6 +75,12 @@ pub struct ObjectStream<'a> {
 ///
 /// Implementations must be safe to share across threads (`Send + Sync`). Missing
 /// objects are reported as `Ok(None)`, not as errors.
+///
+/// A store used as a repository's primary can give history walks a commit-graph so they
+/// skip commit reads altogether: build one with [`crate::maintenance::build_commit_graph`],
+/// persist its bytes, and attach it with
+/// [`OdbBuilder::commit_graph`](crate::odb::OdbBuilder::commit_graph). Graph files under
+/// `objects/info/` are never read for a custom primary.
 pub trait ObjectStore: Send + Sync + std::fmt::Debug {
     /// Hash algorithm for objects written through this store.
     fn hash_algo(&self) -> HashAlgo;
@@ -88,8 +94,11 @@ pub trait ObjectStore: Send + Sync + std::fmt::Debug {
 
     /// Load object payload into `buf`, reusing its capacity when possible.
     ///
-    /// Default implementation delegates to [`Self::read`] and copies into `buf`.
-    /// Native backends should inflate or resolve deltas directly into `buf`.
+    /// History walks (rev-list, merge-base, path-limited log) read commits through this
+    /// method into one reused buffer, so it is the hot path for a custom backend. The
+    /// default implementation delegates to [`Self::read`], which allocates an owned
+    /// [`Object`] per call, and copies into `buf`. Backends should override it to decode
+    /// or copy their stored bytes straight into `buf`.
     ///
     /// # Errors
     ///
@@ -251,6 +260,93 @@ pub trait WritableObjectStore: ObjectStore {
     fn freshen(&self, oid: &ObjectId) -> Result<bool>;
 }
 
+/// Forward both traits through a pointer type so a store behind `Arc`, `Box` or `&` is
+/// itself a store: a decorator generic over `S: ObjectStore` can wrap a shared
+/// `Arc<dyn ObjectStore>` and still be passed on as one. Every method forwards, so the
+/// pointee's overrides (batched `contains_many`, native `read_into`, ...) are kept.
+macro_rules! forward_object_store {
+    ($pointer:ty) => {
+        impl<T: ObjectStore + ?Sized> ObjectStore for $pointer {
+            fn hash_algo(&self) -> HashAlgo {
+                (**self).hash_algo()
+            }
+
+            fn read(&self, oid: &ObjectId) -> Result<Option<Object>> {
+                (**self).read(oid)
+            }
+
+            fn read_into(&self, oid: &ObjectId, buf: &mut Vec<u8>) -> Result<Option<ObjectKind>> {
+                (**self).read_into(oid, buf)
+            }
+
+            fn read_info(&self, oid: &ObjectId) -> Result<Option<ObjectInfo>> {
+                (**self).read_info(oid)
+            }
+
+            fn contains(&self, oid: &ObjectId) -> Result<bool> {
+                (**self).contains(oid)
+            }
+
+            fn contains_many(&self, oids: &[ObjectId]) -> Result<Vec<bool>> {
+                (**self).contains_many(oids)
+            }
+
+            fn open_stream(&self, oid: &ObjectId) -> Result<Option<ObjectStream<'_>>> {
+                (**self).open_stream(oid)
+            }
+
+            fn for_each_object(
+                &self,
+                f: &mut dyn FnMut(&ObjectId) -> ControlFlow<()>,
+            ) -> Result<()> {
+                (**self).for_each_object(f)
+            }
+
+            fn lookup_prefix(
+                &self,
+                prefix: &str,
+                limit: usize,
+                out: &mut Vec<ObjectId>,
+            ) -> Result<()> {
+                (**self).lookup_prefix(prefix, limit, out)
+            }
+
+            fn refresh(&self) -> Result<bool> {
+                (**self).refresh()
+            }
+        }
+
+        impl<T: WritableObjectStore + ?Sized> WritableObjectStore for $pointer {
+            fn write(
+                &self,
+                kind: ObjectKind,
+                data: &[u8],
+                options: WriteOptions,
+            ) -> Result<ObjectId> {
+                (**self).write(kind, data, options)
+            }
+
+            fn write_stream(
+                &self,
+                kind: ObjectKind,
+                size: u64,
+                reader: &mut dyn Read,
+                options: WriteOptions,
+            ) -> Result<ObjectId> {
+                (**self).write_stream(kind, size, reader, options)
+            }
+
+            fn freshen(&self, oid: &ObjectId) -> Result<bool> {
+                (**self).freshen(oid)
+            }
+        }
+    };
+}
+
+forward_object_store!(Arc<T>);
+forward_object_store!(Box<T>);
+forward_object_store!(&T);
+
 /// True when `oid` is stored as loose or in a non-promisor pack under `objects_dir`.
 pub(crate) fn local_object_materialized(objects_dir: &Path, oid: &ObjectId) -> bool {
     if local_object_materialized_without_rescan(objects_dir, oid) {
@@ -269,6 +365,11 @@ pub(crate) fn local_object_materialized_without_rescan(objects_dir: &Path, oid: 
 }
 
 fn object_in_local_packs(objects_dir: &Path, oid: &ObjectId) -> bool {
+    object_in_non_promisor_pack(objects_dir, oid)
+}
+
+/// Whether `oid` is listed in a non-promisor pack index under `objects_dir` (not loose).
+pub(crate) fn object_in_non_promisor_pack(objects_dir: &Path, oid: &ObjectId) -> bool {
     let Ok(indexes) = pack::read_local_pack_indexes_cached(objects_dir) else {
         return false;
     };
@@ -350,6 +451,18 @@ impl ObjectStore for MemoryStore {
         Ok(guard.get(oid).map(|(kind, data)| Object {
             kind: *kind,
             data: data.to_vec(),
+        }))
+    }
+
+    fn read_into(&self, oid: &ObjectId, buf: &mut Vec<u8>) -> Result<Option<ObjectKind>> {
+        let guard = self
+            .objects
+            .read()
+            .map_err(|e| Error::Io(io::Error::other(e.to_string())))?;
+        Ok(guard.get(oid).map(|(kind, data)| {
+            buf.clear();
+            buf.extend_from_slice(data);
+            *kind
         }))
     }
 
@@ -509,6 +622,14 @@ mod tests {
         assert_eq!(obj.kind, ObjectKind::Blob);
         assert_eq!(obj.data, data);
         assert!(store.read(&ObjectId::zero()).unwrap().is_none());
+        let mut buf = b"stale bytes".to_vec();
+        assert_eq!(
+            store.read_into(&oid, &mut buf).unwrap(),
+            Some(ObjectKind::Blob)
+        );
+        assert_eq!(buf, data);
+        assert_eq!(store.read_into(&ObjectId::zero(), &mut buf).unwrap(), None);
+        assert_eq!(buf, data, "a miss leaves the buffer alone");
         assert!(store.read_info(&ObjectId::zero()).unwrap().is_none());
         assert!(!store.contains(&ObjectId::zero()).unwrap());
         assert!(store.contains(&oid).unwrap());

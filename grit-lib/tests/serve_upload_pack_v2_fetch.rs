@@ -9,34 +9,16 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 use grit_lib::config::environment::RepositoryOptions;
+use grit_lib::objects::ObjectId;
 use grit_lib::remote::serve::{
     upload_pack, DeepenNotError, ProtocolVersion, ServeError, ServeOptions,
 };
 use grit_lib::repo::Repository;
 
+/// System `git` output with surrounding whitespace trimmed, ready to compare
+/// with pkt-line payloads.
 fn git(dir: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
-        .current_dir(dir)
-        .args(args)
-        .env("GIT_AUTHOR_NAME", "T")
-        .env("GIT_AUTHOR_EMAIL", "t@example.com")
-        .env("GIT_AUTHOR_DATE", "2005-04-07T22:13:13 +0200")
-        .env("GIT_COMMITTER_NAME", "T")
-        .env("GIT_COMMITTER_EMAIL", "t@example.com")
-        .env("GIT_COMMITTER_DATE", "2005-04-07T22:13:13 +0200")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .output()
-        .expect("run git");
-    assert!(
-        out.status.success(),
-        "git {args:?} failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8(out.stdout)
-        .expect("utf8")
-        .trim()
-        .to_owned()
+    grit_test_support::git(dir, args).trim().to_owned()
 }
 
 /// A bare repository with six linear commits on `main`, tags `v3` (lightweight)
@@ -825,4 +807,46 @@ fn git_fetch_accepts_grit_upload_pack_with_server_option() {
         git(&client, &["rev-parse", "fetched-main"]),
         git(&bare, &["rev-parse", "main"])
     );
+}
+
+#[test]
+fn stateful_v2_session_returns_upload_outcome_for_fetch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bare = fixture(tmp.path());
+    let tip =
+        ObjectId::from_hex(git(&bare, &["rev-parse", "refs/heads/main"]).trim()).expect("main tip");
+    let body = fetch_request(&[&format!("want {}", tip.to_hex())]);
+    let repo = Repository::open(&bare, &RepositoryOptions::empty()).expect("open");
+    let mut out = Vec::new();
+    let mut opts = ServeOptions {
+        protocol: ProtocolVersion::V2,
+        stateless_rpc: false,
+        agent: "grit-test".to_owned(),
+        ..ServeOptions::default()
+    };
+    let summary =
+        upload_pack(&repo, &mut Cursor::new(body), &mut out, &mut opts).expect("stateful v2");
+    assert!(
+        summary.objects_sent > 0,
+        "expected pack objects, got {summary:?}"
+    );
+    assert!(summary.bytes_written > 100);
+    assert!(summary.pack.is_some());
+
+    let mut two_step = negotiation_request(&[&format!("want {}", tip.to_hex())]);
+    two_step.extend(fetch_request(&[&format!("want {}", tip.to_hex())]));
+    let summary2 = upload_pack(
+        &repo,
+        &mut Cursor::new(two_step),
+        &mut Vec::new(),
+        &mut ServeOptions {
+            protocol: ProtocolVersion::V2,
+            stateless_rpc: false,
+            agent: "grit-test".to_owned(),
+            ..ServeOptions::default()
+        },
+    )
+    .expect("stateful v2 two-step");
+    assert_eq!(summary2.negotiation_rounds, 1);
+    assert!(summary2.objects_sent > 0);
 }

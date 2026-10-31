@@ -14,6 +14,7 @@ use crate::output::OutputMode;
 use crate::progress::summary::transfer_header;
 use anyhow::{Context, Result};
 use grit_lib::config::ConfigSet;
+use grit_lib::error::Error as LibError;
 use grit_lib::porcelain::pull::{pull, PullError, PullMode, PullOptions};
 use grit_lib::progress::NeverCancel;
 use grit_lib::remote::fetch_request::resolve_pull_invocation;
@@ -77,8 +78,14 @@ pub fn run(args: &PullRunArgs, mode: OutputMode) -> Result<PullOutcome> {
         None => {}
     }
     let mut options =
-        PullOptions::for_working_branch(&repo, context::environment(), cli_mode(args))
-            .map_err(anyhow::Error::new)?;
+        PullOptions::for_working_branch(&repo, context::environment(), cli_mode(args)).map_err(
+            |err| match err {
+                PullError::Repository(LibError::OperationInProgress(kind)) => {
+                    crate::json_error::operation_in_progress_for_repo(&repo, "pull", kind)
+                }
+                other => anyhow::Error::new(other),
+            },
+        )?;
     let head = resolve_head_for_repository(&repo)?;
     let invocation = resolve_pull_invocation(
         &config,
@@ -93,17 +100,19 @@ pub fn run(args: &PullRunArgs, mode: OutputMode) -> Result<PullOutcome> {
     }
     options.autostash = args.autostash;
     options.check = args.check;
-    options.fetch = FetchOptions {
-        refspecs: invocation.user_refspecs,
-        tags: resolve_fetch_tags(&config, &invocation.remote, args.fetch.tag_mode_override()),
-        thread_policy: repo.thread_policy(),
-        environment: context::environment(),
-        prune: resolve_fetch_prune(&config, &invocation.remote, args.fetch.prune_override())
-            .context("could not resolve fetch prune settings")?,
-        dry_run: args.fetch.dry_run,
-        remote_name: Some(invocation.remote.clone()),
-        ..Default::default()
-    };
+    let mut fetch_opts = FetchOptions::new();
+    fetch_opts.refspecs = invocation.user_refspecs;
+    fetch_opts.tags =
+        resolve_fetch_tags(&config, &invocation.remote, args.fetch.tag_mode_override());
+    fetch_opts.force = args.fetch.force;
+    fetch_opts.thread_policy = repo.thread_policy();
+    fetch_opts.environment = context::environment();
+    fetch_opts.prune =
+        resolve_fetch_prune(&config, &invocation.remote, args.fetch.prune_override())
+            .context("could not resolve fetch prune settings")?;
+    fetch_opts.dry_run = args.fetch.dry_run;
+    fetch_opts.remote_name = Some(invocation.remote.clone());
+    options.fetch = fetch_opts;
     let remote_name = invocation.remote;
     let factory = crate::context::http_client_factory();
     // The work-tree update after the fetch reports no progress, so the overall
@@ -134,6 +143,21 @@ pub fn run(args: &PullRunArgs, mode: OutputMode) -> Result<PullOutcome> {
         Err(other) => {
             return Err(match other {
                 PullError::Remote(remote) => map_remote_error(remote),
+                PullError::Repository(hook @ grit_lib::error::Error::Hook(_)) => {
+                    if repo.git_dir().join("MERGE_HEAD").is_file() {
+                        crate::json_error::hook_failed_with_hint(
+                            hook,
+                            "the merge is still in progress: run `grit merge --continue` to commit it, or `grit merge --abort` to cancel; autostashed edits come back either way",
+                        )
+                    } else {
+                        anyhow::Error::new(hook)
+                    }
+                }
+                PullError::Repository(LibError::OperationInProgress(kind)) => {
+                    return Err(crate::json_error::operation_in_progress_for_repo(
+                        &repo, "pull", kind,
+                    ));
+                }
                 rest => anyhow::Error::new(rest),
             });
         }
@@ -225,11 +249,9 @@ fn pull_server_branch(
         );
     }
     let info = client.branch(&marker.id, name)?;
-    let fetch = FetchOptions {
-        thread_policy: repo.thread_policy(),
-        environment: context::environment(),
-        ..Default::default()
-    };
+    let mut fetch = FetchOptions::new();
+    fetch.thread_policy = repo.thread_policy();
+    fetch.environment = context::environment();
     let transfer = fetch_branch(
         repo,
         marker,
@@ -283,10 +305,11 @@ fn refresh_checkout(
         mode: cli_mode(args),
         autostash: args.autostash,
         check: args.check,
-        fetch: FetchOptions {
-            thread_policy: repo.thread_policy(),
-            environment: context::environment(),
-            ..Default::default()
+        fetch: {
+            let mut fetch = FetchOptions::new();
+            fetch.thread_policy = repo.thread_policy();
+            fetch.environment = context::environment();
+            fetch
         },
         ..Default::default()
     };
@@ -348,23 +371,5 @@ fn refresh_error(err: CheckoutError) -> anyhow::Error {
             "your {name} has nothing in common with the server's {name}; rename yours (`grit branch -m {name} <new name>`), then `grit pull {name}` gets the server's"
         ),
         other => other.into(),
-    }
-}
-
-/// Exit code for `grit pull --check` (0 when up-to-date or fast-forward is possible).
-#[must_use]
-pub fn pull_check_exit_code(outcome: &PullOutcome) -> i32 {
-    if let Some(check) = &outcome.check {
-        if check.fast_forward_possible {
-            return 0;
-        }
-        return 1;
-    }
-    match outcome.result {
-        PullResult::Conflicts
-        | PullResult::RefusedNotFf
-        | PullResult::AutostashConflict
-        | PullResult::RebaseStopped => 1,
-        _ => 0,
     }
 }

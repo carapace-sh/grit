@@ -65,7 +65,7 @@ fn copy_detection_twice_reports_original_path_in_json() {
     let mut git_cmd = Command::new("git");
     git_cmd
         .current_dir(dir.path())
-        .args(["blame", "--porcelain", "-C", "-C1", "--", "uno"]);
+        .args(["blame", "--porcelain", "-C", "-C", "--", "uno"]);
     git_env(&mut git_cmd);
     let git_out = git_cmd.output().unwrap();
     assert!(git_out.status.success());
@@ -76,6 +76,29 @@ fn copy_detection_twice_reports_original_path_in_json() {
         Some(40),
         "expected full commit oid in JSON"
     );
+}
+
+#[test]
+fn copy_detection_short_move_json_original_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    git(root, &["init", "-q", "-b", "main"]);
+    let a: String = (1..=20).map(|n| format!("orig line {n}\n")).collect();
+    fs::write(root.join("a.txt"), a).unwrap();
+    git(root, &["add", "."]);
+    git(root, &["commit", "-m", "add a"]);
+    let a_tail: String = (11..=20).map(|n| format!("orig line {n}\n")).collect();
+    fs::write(root.join("a.txt"), a_tail).unwrap();
+    let b: String = (1..=10)
+        .map(|n| format!("orig line {n}\n"))
+        .chain(std::iter::once("extra\n".to_owned()))
+        .collect();
+    fs::write(root.join("b.txt"), b).unwrap();
+    git(root, &["add", "."]);
+    git(root, &["commit", "-m", "move"]);
+    let grit = gs_json(root, &["blame", "-C", "b.txt"]);
+    let line = &grit["lines"][0];
+    assert_eq!(line["original_path"].as_str(), Some("a.txt"));
 }
 
 #[test]

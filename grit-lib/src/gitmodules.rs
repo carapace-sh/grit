@@ -60,6 +60,55 @@ fn is_hfs_or_ntfs_dot_gitattributes(name: &str) -> bool {
     is_hfs_dot_gitattributes(name) || is_ntfs_dot_gitattributes(name)
 }
 
+/// True when `name` is an HFS/NTFS `.gitmodules` spelling, including `foo\\.gitmodules`.
+#[must_use]
+fn tree_entry_name_is_dot_gitmodules(name: &str) -> bool {
+    if is_hfs_or_ntfs_dot_gitmodules(name) {
+        return true;
+    }
+    ntfs_backslash_suffix_matches(name, is_ntfs_dot_gitmodules)
+}
+
+/// After each `\`, test the remainder with `pred` (Git `fsck_tree` NTFS segment rules).
+fn ntfs_backslash_suffix_matches(name: &str, mut pred: impl FnMut(&str) -> bool) -> bool {
+    let mut rest = name;
+    while let Some(idx) = rest.find('\\') {
+        let after = &rest[idx + 1..];
+        if pred(after) {
+            return true;
+        }
+        rest = after;
+    }
+    false
+}
+
+/// When `mode` is `120000`, the well-known metadata file name the entry must not symlink to.
+///
+/// Covers HFS and NTFS spellings of `.gitmodules`, `.gitattributes`, `.gitignore`, and
+/// `.mailmap`, matching [`fsck_dot_special_tree_pass`].
+#[must_use]
+pub fn tree_entry_reserved_dot_symlink(mode: u32, name: &[u8]) -> Option<&'static str> {
+    if mode != 0o120000 {
+        return None;
+    }
+    let Ok(name_str) = std::str::from_utf8(name) else {
+        return None;
+    };
+    if tree_entry_name_is_dot_gitmodules(name_str) {
+        return Some(".gitmodules");
+    }
+    if is_hfs_or_ntfs_dot_gitattributes(name_str) {
+        return Some(".gitattributes");
+    }
+    if is_hfs_dot_gitignore(name_str) || is_ntfs_dot_gitignore(name_str) {
+        return Some(".gitignore");
+    }
+    if is_hfs_dot_mailmap(name_str) || is_ntfs_dot_mailmap(name_str) {
+        return Some(".mailmap");
+    }
+    None
+}
+
 /// Symlink and registration for one tree (Git `fsck_tree` entry loop).
 pub fn fsck_dot_special_tree_pass(
     tree_oid: &ObjectId,
@@ -75,7 +124,7 @@ pub fn fsck_dot_special_tree_pass(
         };
         let is_symlink = mode == 0o120000;
 
-        if is_hfs_or_ntfs_dot_gitmodules(name_str) {
+        if tree_entry_name_is_dot_gitmodules(name_str) {
             if is_symlink {
                 issues.push(DotFsckIssue::TreeSymlink {
                     tree_oid: *tree_oid,
@@ -114,23 +163,6 @@ pub fn fsck_dot_special_tree_pass(
                     detail: ".mailmap is a symlink",
                 });
             }
-        }
-
-        let mut slash_rest = name_str;
-        while let Some(idx) = slash_rest.find('\\') {
-            let after = &slash_rest[idx + 1..];
-            if is_ntfs_dot_gitmodules(after) {
-                if is_symlink {
-                    issues.push(DotFsckIssue::TreeSymlink {
-                        tree_oid: *tree_oid,
-                        id: "gitmodulesSymlink",
-                        detail: ".gitmodules is a symbolic link",
-                    });
-                } else {
-                    gitmodules_out.insert(oid);
-                }
-            }
-            slash_rest = after;
         }
     }
     Ok(issues)

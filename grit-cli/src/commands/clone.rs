@@ -129,6 +129,8 @@ pub struct CloneRunOptions {
     pub bare: bool,
     pub no_checkout: bool,
     pub blobs: Option<String>,
+    /// `--config KEY=VALUE` entries written into the new repository.
+    pub config: Vec<grit_lib::config::environment::ConfigOverride>,
     pub quiet: crate::quiet_args::QuietArgs,
     pub mode: OutputMode,
 }
@@ -169,10 +171,32 @@ pub struct CloneOutcome {
     /// Partial-clone blob filter when `--blobs` was used (`"none"` or a byte limit).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub blobs: Option<CloneBlobsJson>,
-    /// True when `--blobs` configured a promisor partial clone.
+    /// True when the server applied the `--blobs` filter on the initial fetch.
     #[serde(default, skip_serializing_if = "CloneOutcome::partial_not_set")]
     #[schemars(default)]
     pub partial: bool,
+    /// True with `--blobs auto`: the filter comes from the promisor remotes the server
+    /// advertised and the clone accepted (`blobs` is the filter it resolved to).
+    #[serde(default, skip_serializing_if = "CloneOutcome::partial_not_set")]
+    #[schemars(default)]
+    pub filter_auto: bool,
+    /// True when the server does not support filters: the `blobs` filter was not sent and
+    /// every blob was downloaded (the clone is still configured as a partial clone).
+    #[serde(default, skip_serializing_if = "CloneOutcome::partial_not_set")]
+    #[schemars(default)]
+    pub filter_ignored: bool,
+    /// Promisor remotes the server advertised, and whether the clone accepted each.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(default)]
+    pub promisor_remotes: Vec<crate::commands::promisor_json::PromisorRemoteJson>,
+    /// Remote fields stored from the advertisement (`promisor.storeFields`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(default)]
+    pub stored_fields: Vec<crate::commands::promisor_json::StoredFieldJson>,
+    /// Promisor config or advertised values that were ignored or could not be used.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(default)]
+    pub promisor_warnings: Vec<crate::commands::promisor_json::PromisorWarningJson>,
     /// Objects received during the fetch.
     pub objects: u64,
     /// Pack bytes received during the fetch.
@@ -203,6 +227,9 @@ pub struct CloneOutcome {
     /// Index paths that collided on a case-insensitive filesystem during checkout.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub path_collisions: Vec<String>,
+    /// Gitlink paths in the checked-out tree (submodules grit does not fetch).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub submodule_paths: Vec<String>,
     /// The server's prebuilt bundle the clone started from, when it offered
     /// one. `objects` and `bytes` include what it brought.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -217,6 +244,11 @@ impl CloneOutcome {
     fn partial_not_set(partial: &bool) -> bool {
         !*partial
     }
+
+    /// Summary line shown instead of the partial-clone line when the server ignored
+    /// the filter.
+    const FILTER_IGNORED_SUMMARY: &'static str =
+        "the server does not support filters; every blob was downloaded";
 
     fn partial_clone_summary(blobs: Option<CloneBlobsJson>) -> &'static str {
         match blobs {
@@ -258,6 +290,20 @@ fn render_summary(o: &CloneOutcome, w: &mut dyn Write, color: bool) -> Result<()
             paint(color, DIM, "partial"),
             CloneOutcome::partial_clone_summary(o.blobs)
         );
+    } else if o.filter_ignored {
+        outln!(
+            w,
+            "  {}  {}",
+            paint(color, DIM, "filter"),
+            CloneOutcome::FILTER_IGNORED_SUMMARY
+        );
+    }
+    for line in crate::commands::promisor_json::human_lines(
+        &o.promisor_remotes,
+        &o.stored_fields,
+        &o.promisor_warnings,
+    ) {
+        outln!(w, "  {}  {line}", paint(color, DIM, "promisor"));
     }
     outln!(w);
 
@@ -365,6 +411,18 @@ impl MarkdownRender for CloneOutcome {
                     CloneBlobsJson::Limit(n) => outln!(w, "- **blobs**: {n} bytes"),
                 }
             }
+        } else if self.filter_ignored {
+            outln!(w, "- **filter**: {}", CloneOutcome::FILTER_IGNORED_SUMMARY);
+        }
+        if let Some(line) = crate::commands::promisor_json::markdown_line(&self.promisor_remotes) {
+            outln!(w, "{line}");
+        }
+        for s in &self.stored_fields {
+            outln!(w, "- **stored**: `{}` for `{}`", s.field, s.remote);
+        }
+        for line in crate::commands::promisor_json::markdown_warning_lines(&self.promisor_warnings)
+        {
+            outln!(w, "{line}");
         }
         outln!(w, "- **url**: `{}`", self.url);
         if let Some(bundle) = &self.bundle {
@@ -397,6 +455,12 @@ impl MarkdownRender for CloneOutcome {
                 outln!(w, "  - `{path}`");
             }
         }
+        if !self.submodule_paths.is_empty() {
+            outln!(w, "- **submodule paths** (not fetched):");
+            for path in &self.submodule_paths {
+                outln!(w, "  - `{path}`");
+            }
+        }
         outln!(
             w,
             "- **worktree bytes**: {} ({})",
@@ -423,7 +487,33 @@ impl MarkdownRender for CloneOutcome {
     }
 }
 
-fn emit_path_collision_warning(mode: OutputMode, paths: &[String]) {
+fn emit_submodule_note(mode: OutputMode, paths: &[String]) {
+    if paths.is_empty() {
+        return;
+    }
+    let count = paths.len();
+    let list = paths.join(", ");
+    let noun = if count == 1 {
+        "submodule"
+    } else {
+        "submodules"
+    };
+    match mode {
+        OutputMode::Human => {
+            eprintln!(
+                "note: this repository has {count} {noun} ({list}); grit does not fetch submodules"
+            );
+        }
+        OutputMode::Markdown => {
+            eprintln!(
+                "> **Note:** this repository has {count} {noun} (`{list}`); grit does not fetch submodules."
+            );
+        }
+        OutputMode::Json => {}
+    }
+}
+
+pub(crate) fn emit_path_collision_warning(mode: OutputMode, paths: &[String]) {
     if paths.is_empty() {
         return;
     }
@@ -502,19 +592,38 @@ fn resolved_clone_tags(opts: &CloneRunOptions) -> Option<CloneTags> {
 }
 
 fn effective_tag_fetch_mode(opts: &CloneRunOptions) -> CloneTags {
-    resolved_clone_tags(opts).unwrap_or(if opts.shallow || opts.depth.is_some() {
-        CloneTags::Following
-    } else {
-        CloneTags::All
+    resolved_clone_tags(opts).unwrap_or_else(|| {
+        let clone_opts = CloneOptions {
+            depth: opts.depth.or_else(|| opts.shallow.then_some(1)),
+            single_branch: opts.single_branch,
+            ..CloneOptions::new(String::new(), std::path::PathBuf::new())
+        };
+        if clone_effective_single_branch(&clone_opts) {
+            CloneTags::Following
+        } else {
+            CloneTags::All
+        }
     })
 }
 
-fn parse_blobs_filter(raw: Option<&str>) -> Result<Option<ObjectFilterSpec>> {
+/// A parsed `--blobs` value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BlobsArg {
+    /// `none` or a size.
+    Filter(ObjectFilterSpec),
+    /// `auto`: take the filter from the accepted promisor remotes.
+    Auto,
+}
+
+fn parse_blobs_filter(raw: Option<&str>) -> Result<Option<BlobsArg>> {
     let Some(raw) = raw else {
         return Ok(None);
     };
+    if raw.trim().eq_ignore_ascii_case("auto") {
+        return Ok(Some(BlobsArg::Auto));
+    }
     ObjectFilterSpec::from_blobs_cli(raw)
-        .map(Some)
+        .map(|spec| Some(BlobsArg::Filter(spec)))
         .map_err(|e| {
             anyhow::Error::from(CloneUsageError).context(format!("invalid --blobs value: {e}"))
         })
@@ -555,7 +664,7 @@ pub fn run(mut opts: CloneRunOptions) -> Result<CloneOutcome> {
     }
     match clone_into(
         &opts,
-        filter.as_ref(),
+        filter,
         &path,
         &dir,
         started,
@@ -579,7 +688,7 @@ pub fn run(mut opts: CloneRunOptions) -> Result<CloneOutcome> {
 #[allow(clippy::too_many_arguments)]
 fn clone_into(
     run: &CloneRunOptions,
-    filter: Option<&ObjectFilterSpec>,
+    blobs: Option<BlobsArg>,
     path: &Path,
     dir: &str,
     started: Instant,
@@ -592,6 +701,11 @@ fn clone_into(
         .clone()
         .unwrap_or_else(|| grit_lib::remote::DEFAULT_REMOTE.to_owned());
     let tag_mode = effective_tag_fetch_mode(run);
+    let filter = match blobs {
+        Some(BlobsArg::Filter(spec)) => Some(spec),
+        Some(BlobsArg::Auto) | None => None,
+    };
+    let auto_filter = blobs == Some(BlobsArg::Auto);
     let clone_opts = CloneOptions {
         url: run.url.clone(),
         dest: path.to_path_buf(),
@@ -601,7 +715,13 @@ fn clone_into(
         thread_policy: crate::context::thread_policy_for_repo(),
         depth: run.depth,
         branch: run.branch.clone(),
-        filter: filter.copied(),
+        filter,
+        auto_filter,
+        config: run
+            .config
+            .iter()
+            .map(|c| (c.key().to_owned(), c.value().unwrap_or("true").to_owned()))
+            .collect(),
         single_branch: run.single_branch,
         tags: resolved_clone_tags(run),
         promisor_fetcher: Some(std::sync::Arc::new(
@@ -636,7 +756,9 @@ fn clone_into(
     let files = outcome.files;
     let worktree_bytes = outcome.worktree_bytes;
     let path_collisions = outcome.path_collisions.clone();
+    let submodule_paths = outcome.submodule_paths.clone();
     emit_path_collision_warning(run.mode, &path_collisions);
+    emit_submodule_note(run.mode, &submodule_paths);
     let (no_checkout_reason, branches_with_commits) = match outcome.checkout {
         CloneCheckout::CheckedOut(_) => (None, None),
         CloneCheckout::Skipped => {
@@ -662,6 +784,12 @@ fn clone_into(
     let elapsed = started.elapsed();
     let transfer = TransferSummary::new(outcome.transfer, term_progress.phases().to_vec(), elapsed);
 
+    if outcome.filter_ignored() {
+        eprintln!(
+            "warning: the server did not advertise filter support; fetched all objects without applying --blobs"
+        );
+    }
+
     let (branch, detached, tag) = match &outcome.head {
         CloneHead::Branch(name) => (Some(name.clone()), false, None),
         CloneHead::Detached { tag, .. } => (None, true, Some(tag.clone())),
@@ -677,8 +805,15 @@ fn clone_into(
         detached,
         tag,
         depth: run.depth,
-        blobs: filter.map(CloneBlobsJson::from_spec),
-        partial: filter.is_some(),
+        blobs: outcome.filter.as_ref().map(CloneBlobsJson::from_spec),
+        partial: outcome.filter_sent,
+        filter_auto: auto_filter,
+        filter_ignored: outcome.filter_ignored(),
+        promisor_remotes: crate::commands::promisor_json::promisor_remotes(
+            outcome.promisor.as_ref(),
+        ),
+        stored_fields: crate::commands::promisor_json::stored_fields(outcome.promisor.as_ref()),
+        promisor_warnings: crate::commands::promisor_json::warnings(outcome.promisor.as_ref()),
         objects: outcome.transfer.objects,
         bytes: outcome.transfer.bytes,
         branches: outcome.branches,
@@ -701,6 +836,7 @@ fn clone_into(
         no_checkout_reason,
         branches_with_commits,
         path_collisions,
+        submodule_paths,
         bare: outcome.bare,
         bundle,
     })
@@ -764,6 +900,11 @@ mod tests {
             depth: None,
             blobs: None,
             partial: false,
+            filter_auto: false,
+            filter_ignored: false,
+            promisor_remotes: Vec::new(),
+            stored_fields: Vec::new(),
+            promisor_warnings: Vec::new(),
             objects: 1_234,
             bytes: 2 * 1024 * 1024,
             branches: 1,
@@ -783,6 +924,7 @@ mod tests {
             no_checkout_reason: None,
             branches_with_commits: None,
             path_collisions: Vec::new(),
+            submodule_paths: Vec::new(),
             bundle: None,
             bare: false,
         }

@@ -84,6 +84,7 @@ fn guide_cause(cause: &(dyn StdError + 'static)) -> Option<Error> {
         return match err {
             CloneError::Library(lib) => guide_lib(lib),
             CloneError::Remote(remote) => guide_remote(remote),
+            CloneError::CheckoutFailed { .. } => Some(clone_checkout_failed(err)),
             _ => None,
         };
     }
@@ -175,15 +176,27 @@ fn guide_lib(err: &LibError) -> Option<Error> {
                 ErrorKind::UnmergedPaths,
                 err.to_string(),
                 Some(format!(
-                    "take one side with `grit restore --ours {words}` or `grit restore --theirs {words}`, or bring the conflict markers back with `grit restore --merge {words}`"
+                    "take one side with `grit restore --ours {words}` or `grit restore --theirs {words}`, bring the conflict markers back with `grit restore --merge {words}`, or edit out the markers and run `grit add {words}`"
                 )),
                 Some(paths.clone()),
             ))
         }
+        LibError::UnmergedConflictMarkers { paths } => Some(Error::new(StructuredCliError {
+            human: format!("{err}{}", indented_paths(paths)),
+            payload: StructuredJsonError {
+                hint: Some(format!(
+                    "edit out the conflict markers in {}, then try again",
+                    listed_paths(paths)
+                )),
+                paths: Some(paths.clone()),
+                ..StructuredJsonError::new(err.to_string(), ErrorKind::UnmergedPaths)
+            },
+        })),
         LibError::WorktreePathIo { path, .. } => Some(guided(
             ErrorKind::WorktreePathIo,
             err.to_string(),
-            Some("close programs that may have the file open, then try again".to_owned()),
+            err.is_worktree_file_in_use()
+                .then(|| "close programs that may have the file open, then try again".to_owned()),
             Some(vec![path.clone()]),
         )),
         LibError::CheckoutRollbackIncomplete { unrestored, .. } => Some(Error::new(
@@ -201,7 +214,12 @@ fn guide_lib(err: &LibError) -> Option<Error> {
         LibError::GitDirPathIo { path, .. } => Some(guided(
             ErrorKind::GitDirPathIo,
             err.to_string(),
-            Some(git_dir_path_io_hint(path)),
+            err.is_git_dir_file_in_use()
+                .then(|| {
+                    "another thread or process is updating the same git metadata; retry shortly"
+                        .to_owned()
+                })
+                .or_else(|| Some(git_dir_path_io_hint(path))),
             Some(vec![path.clone()]),
         )),
         LibError::UnbornHead => Some(
@@ -211,6 +229,48 @@ fn guide_lib(err: &LibError) -> Option<Error> {
         LibError::Branch(branch_err) => guide_branch(branch_err),
         _ => None,
     }
+}
+
+/// A clone kept after its checkout failed: say so, and how to finish the checkout.
+fn clone_checkout_failed(err: &CloneError) -> Error {
+    let CloneError::CheckoutFailed {
+        path,
+        commit,
+        source,
+    } = err
+    else {
+        return guided(ErrorKind::CloneCheckoutFailed, err.to_string(), None, None);
+    };
+    let dir = path.display();
+    let human = format!("the clone into '{dir}' succeeded, but its checkout failed: {source}");
+    let hint = format!(
+        "the repository was kept; run `grit reset --hard` in '{dir}' to finish the checkout{}",
+        if err.missing_promised_object().is_some() {
+            " once its promisor remotes can supply the missing objects"
+        } else {
+            ""
+        }
+    );
+    Error::new(StructuredCliError {
+        payload: StructuredJsonError {
+            hint: Some(hint),
+            clone_checkout: Some(crate::json_error::CloneCheckoutJson {
+                path: path.display().to_string(),
+                commit: commit.to_hex(),
+                missing_object: err.missing_promised_object().map(|oid| oid.to_hex()),
+                failed_remotes: err
+                    .failed_promisor_remotes()
+                    .iter()
+                    .map(|(remote, e)| crate::json_error::PromisorRemoteFailureJson {
+                        remote: remote.clone(),
+                        error: e.to_string(),
+                    })
+                    .collect(),
+            }),
+            ..StructuredJsonError::new(human.clone(), ErrorKind::CloneCheckoutFailed)
+        },
+        human,
+    })
 }
 
 fn guide_branch(err: &BranchError) -> Option<Error> {
@@ -260,30 +320,45 @@ fn looks_like_rev_syntax(name: &str) -> bool {
 
 fn auth_error(err: &LibError, url: &str, reason: &AuthFailure) -> Error {
     let github = is_github_https_url(url);
+    let store = format!("`grit auth {url} --username <user> --token <token>`");
     let (kind, hint) = match reason {
         AuthFailure::Rejected if github => (
             ErrorKind::AuthRejected,
-            Some("your saved GitHub token may have expired; sign in again with `grit auth`"),
+            Some("your saved GitHub token may have expired; sign in again with `grit auth`".to_owned()),
         ),
         AuthFailure::Rejected => (
             ErrorKind::AuthRejected,
-            Some("update the credentials your credential helper stores for this host, then try again"),
+            Some(format!(
+                "update the credentials your credential helper stores for this host (for example with {store}), then try again"
+            )),
         ),
         AuthFailure::UnsupportedScheme { .. } | AuthFailure::UrlNotDescribable => {
             (ErrorKind::AuthRequired, None)
         }
         _ if github => (
             ErrorKind::AuthRequired,
-            Some("sign in to GitHub with `grit auth` and try again; if it still fails, check the URL"),
+            Some("sign in to GitHub with `grit auth` and try again; if it still fails, check the URL".to_owned()),
+        ),
+        // Helper entries are commands that can embed secrets, so they are counted, never shown.
+        AuthFailure::CredentialsUnavailable { helpers, .. } if !helpers.is_empty() => (
+            ErrorKind::AuthRequired,
+            Some(format!(
+                "{} has no credentials for this host; save them with {store}, or point GIT_ASKPASS at a program that prints them, then try again",
+                if helpers.len() == 1 {
+                    "your credential helper".to_owned()
+                } else {
+                    format!("none of your {} credential helpers", helpers.len())
+                }
+            )),
         ),
         _ => (
             ErrorKind::AuthRequired,
-            Some(
-                "configure a credential helper that has your credentials (for example `grit config --global credential.helper store`) or point GIT_ASKPASS at a program that prints them, then try again",
-            ),
+            Some(format!(
+                "save a user name and token for this host with {store} (it sets up a credential helper), or point GIT_ASKPASS at a program that prints them, then try again"
+            )),
         ),
     };
-    guided(kind, err.to_string(), hint.map(str::to_owned), None)
+    guided(kind, err.to_string(), hint, None)
 }
 
 fn remote_not_found(name: &str) -> Error {
@@ -424,6 +499,34 @@ mod tests {
     }
 
     #[test]
+    fn worktree_path_io_suggests_closing_programs_only_when_in_use() {
+        let in_use = payload(Error::new(LibError::WorktreePathIo {
+            path: "a.txt".into(),
+            operation: grit_lib::error::WorktreePathOperation::Replace,
+            source: std::io::Error::from_raw_os_error(libc::EBUSY),
+        }));
+        assert_eq!(in_use.kind, ErrorKind::WorktreePathIo);
+        assert!(in_use.hint.expect("hint").contains("close programs"));
+        let denied = payload(Error::new(LibError::WorktreePathIo {
+            path: "a.txt".into(),
+            operation: grit_lib::error::WorktreePathOperation::Metadata,
+            source: std::io::Error::from_raw_os_error(libc::EACCES),
+        }));
+        assert_eq!(denied.paths, Some(vec!["a.txt".to_owned()]));
+        assert!(denied.hint.is_none());
+    }
+
+    #[test]
+    fn git_dir_path_io_suggests_retry_when_in_use() {
+        let in_use = payload(Error::new(LibError::GitDirPathIo {
+            path: ".git/index".into(),
+            operation: grit_lib::error::GitDirPathOperation::WriteIndex,
+            source: std::io::Error::from_raw_os_error(libc::EBUSY as i32),
+        }));
+        assert!(in_use.hint.expect("hint").contains("retry shortly"));
+    }
+
+    #[test]
     fn git_dir_path_io_hint_matches_layout() {
         let worktree = payload(Error::new(LibError::GitDirPathIo {
             path: ".git/objects/pack/tmp".into(),
@@ -454,15 +557,54 @@ mod tests {
         };
         let unavailable = || AuthFailure::CredentialsUnavailable {
             detail: "none".into(),
+            helpers: Vec::new(),
         };
         let p = auth("https://github.com/o/r.git", unavailable());
         assert_eq!(p.kind, ErrorKind::AuthRequired);
         assert!(p.hint.expect("hint").contains("`grit auth`"));
         assert!(!p.error.contains("info/refs"));
         let p = auth("https://git.example.com/o/r.git", unavailable());
-        assert!(p.hint.expect("hint").contains("credential.helper"));
+        let hint = p.hint.expect("hint");
+        assert!(
+            hint.contains(
+                "`grit auth https://git.example.com/o/r.git --username <user> --token <token>`"
+            ),
+            "{hint}"
+        );
+        assert!(hint.contains("GIT_ASKPASS"), "{hint}");
+        let configured = |helpers: &[&str]| {
+            auth(
+                "https://git.example.com/o/r.git",
+                AuthFailure::CredentialsUnavailable {
+                    detail: "none".into(),
+                    helpers: helpers.iter().map(|h| (*h).to_owned()).collect(),
+                },
+            )
+        };
+        let secret = "!echo password=literal-secret";
+        let two = configured(&["store", secret]).hint.expect("hint");
+        assert!(two.contains("none of your 2 credential helpers"), "{two}");
+        assert!(
+            !two.contains("literal-secret") && !two.contains("store"),
+            "{two}"
+        );
+        let p = configured(&[secret]);
+        assert!(!p.error.contains("literal-secret"), "{}", p.error);
+        let hint = p.hint.expect("hint");
+        assert!(
+            hint.contains("your credential helper has no credentials"),
+            "{hint}"
+        );
+        assert!(!hint.contains("literal-secret"), "{hint}");
+        assert!(!hint.contains("configure a credential helper"), "{hint}");
+        assert!(hint.contains("--username <user> --token <token>"), "{hint}");
         let p = auth("https://git.example.com/o/r.git", AuthFailure::Rejected);
         assert_eq!(p.kind, ErrorKind::AuthRejected);
+        let hint = p.hint.expect("hint");
+        assert!(
+            hint.contains("update the credentials your credential helper stores"),
+            "{hint}"
+        );
     }
 
     #[test]
@@ -507,6 +649,18 @@ mod tests {
                 "{hint}"
             );
         }
+        assert!(hint.contains("grit add 'a b'"), "{hint}");
+    }
+
+    #[test]
+    fn conflict_markers_refusal_names_paths() {
+        let p = payload(Error::new(LibError::UnmergedConflictMarkers {
+            paths: strings(&["f"]),
+        }));
+        assert_eq!(p.kind, ErrorKind::UnmergedPaths);
+        assert_eq!(p.paths, Some(strings(&["f"])));
+        assert_eq!(p.error, "unmerged paths still have conflict markers");
+        assert!(p.hint.expect("hint").contains("conflict markers in f"));
     }
 
     #[test]

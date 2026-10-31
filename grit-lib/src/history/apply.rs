@@ -5,16 +5,22 @@ use std::fs;
 use std::path::Path;
 
 use crate::config::ConfigSet;
-use crate::diff::{diff_trees, mode_from_metadata};
+use crate::diff::{mode_from_metadata, DiffEntry, DiffStatus};
 use crate::hooks::{run_post_checkout, run_post_rewrite, HookName, RewriteKind};
 use crate::index::MODE_REGULAR;
+use crate::lockfile::LockWait;
 use crate::objects::ObjectId;
-use crate::objects::{parse_tree, ObjectKind};
+use crate::objects::ObjectKind;
+use crate::porcelain::checkout::{
+    materialize_gitlink_worktree, write_blob_to_worktree, LeadingDirCache,
+};
 use crate::porcelain::switch::{
     checkout_tree_transition_allow_local, checkout_tree_transition_allow_local_with_preserved,
-    verify_tree_transition_allow_local, TreeTransitionVerifyError,
+    prepare_tree_transition_allow_local, verify_tree_transition_allow_local,
+    TreeTransitionPrepareError, TreeTransitionVerifyError,
 };
 use crate::porcelain::worktree_guard::prepare_tree_checkout;
+use crate::refs::prepare_with_lock_wait;
 use crate::refs::read_symbolic_ref_for_repository;
 use crate::refs::ref_update_flags;
 use crate::refs::should_autocreate_reflog_with_config;
@@ -24,6 +30,7 @@ use crate::refs::store::{
 };
 use crate::repo::Repository;
 use crate::state::{resolve_head_for_repository, HeadState};
+use crate::worktree_rules::WorktreeRules;
 
 use similar::{capture_diff_slices, Algorithm, DiffTag};
 
@@ -31,19 +38,25 @@ use super::absorb::{remaining_index_blob_for_path, staged_absorb_paths, AbsorbPl
 use super::error::HistoryError;
 use super::last::{write_history_last, HistoryLastRecord};
 use super::types::{AppliedRewrite, ApplyOptions, PlannedRefUpdate, RewritePlan};
+use super::undo_work::{
+    capture_path_states, install_path_states, states_not_in_place, tree_path_states, PathState,
+    UndoWork,
+};
 
 fn maybe_record_history_last(
     repo: &Repository,
     opts: &ApplyOptions,
     plan: &RewritePlan,
+    work: Option<&UndoWork>,
 ) -> Result<(), HistoryError> {
     let Some(operation) = opts.record_operation.as_deref() else {
         return Ok(());
     };
     let record = HistoryLastRecord::from_applied_plan(operation, plan);
-    write_history_last(repo, &record)
+    write_history_last(repo, &record, work)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn complete_applied_rewrite(
     repo: &Repository,
     plan: &RewritePlan,
@@ -52,15 +65,20 @@ fn complete_applied_rewrite(
     needs_worktree: bool,
     index_snapshot: Option<&IndexSnapshot>,
     worktree_snapshot: Option<&HashMap<String, WorktreePathSnapshot>>,
+    work: Option<&UndoWork>,
 ) -> Result<AppliedRewrite, HistoryError> {
-    if let Err(record_err) = maybe_record_history_last(repo, opts, plan) {
+    if let Err(record_err) = maybe_record_history_last(repo, opts, plan, work) {
         if opts.record_operation.is_some() {
             if !plan.ref_updates.is_empty() {
                 let _ = rollback_ref_updates(repo, &plan.ref_updates, opts);
             }
             if needs_worktree {
-                let _ =
-                    restore_worktree_after_failed_apply(repo, index_snapshot, worktree_snapshot);
+                let _ = restore_worktree_after_failed_apply(
+                    repo,
+                    plan.head.old_tree.as_ref(),
+                    index_snapshot,
+                    worktree_snapshot,
+                );
             }
         }
         return Err(record_err);
@@ -242,14 +260,42 @@ pub fn apply_absorb_rewrite(
     } else {
         None
     };
-    apply_absorb_refs_and_worktree(repo, absorb, opts, &staged_paths, prestate.as_ref()).or_else(
-        |err| {
-            if let Some(pre) = prestate {
-                pre.restore(repo)?;
-            }
-            Err(err)
-        },
+    let consumed = consumed_states_for_undo(repo, opts, &staged_paths)?;
+    apply_absorb_refs_and_worktree(
+        repo,
+        absorb,
+        opts,
+        &staged_paths,
+        prestate.as_ref(),
+        consumed,
     )
+    .or_else(|err| {
+        if let Some(pre) = prestate {
+            pre.restore(repo)?;
+        }
+        Err(err)
+    })
+}
+
+/// Pre-command state of `paths` for the undo sidecar, captured only when the apply is recorded.
+fn consumed_states_for_undo(
+    repo: &Repository,
+    opts: &ApplyOptions,
+    paths: &[String],
+) -> Result<Option<Vec<PathState>>, HistoryError> {
+    if opts.record_operation.is_none() {
+        return Ok(None);
+    }
+    capture_path_states(repo, paths).map(Some)
+}
+
+fn undo_work_after_command(
+    repo: &Repository,
+    consumed: Option<Vec<PathState>>,
+) -> Result<Option<UndoWork>, HistoryError> {
+    consumed
+        .map(|states| UndoWork::after_command(repo, states))
+        .transpose()
 }
 
 fn apply_absorb_refs_and_worktree(
@@ -258,6 +304,7 @@ fn apply_absorb_refs_and_worktree(
     opts: &ApplyOptions,
     staged_paths: &[String],
     prestate: Option<&FixupApplyPrestate>,
+    consumed: Option<Vec<PathState>>,
 ) -> Result<AppliedRewrite, HistoryError> {
     let plan = &absorb.plan;
     let (old_tree, new_tree) = head_tree_transition(plan);
@@ -284,7 +331,8 @@ fn apply_absorb_refs_and_worktree(
                 absorb,
                 staged_paths,
                 prestate,
-            )
+            )?;
+            undo_work_after_command(repo, consumed)
         },
     )
     .inspect_err(|_| {
@@ -372,19 +420,42 @@ pub fn apply_fixup_rewrite(
     opts: &ApplyOptions,
     staged_paths: &[String],
 ) -> Result<AppliedRewrite, HistoryError> {
+    let consumed = consumed_states_for_undo(repo, opts, staged_paths)?;
+    apply_fixup_rewrite_then(repo, plan, opts, staged_paths, consumed, |_| Ok(()))
+}
+
+/// [`apply_fixup_rewrite`] with the undo sidecar's pre-command states supplied by the caller and
+/// `finish` run on the work tree before the rewrite is recorded.
+///
+/// `consumed` is `None` when the apply is not recorded. A `finish` failure rolls the apply back.
+pub(crate) fn apply_fixup_rewrite_then(
+    repo: &Repository,
+    plan: &RewritePlan,
+    opts: &ApplyOptions,
+    staged_paths: &[String],
+    consumed: Option<Vec<PathState>>,
+    finish: impl FnOnce(&Repository) -> Result<(), HistoryError>,
+) -> Result<AppliedRewrite, HistoryError> {
     let prestate = if !repo.is_bare() && !staged_paths.is_empty() {
         Some(FixupApplyPrestate::capture(repo, staged_paths)?)
     } else {
         None
     };
-    apply_fixup_refs_and_worktree(repo, plan, opts, staged_paths, prestate.as_ref()).or_else(
-        |err| {
-            if let Some(pre) = prestate {
-                pre.restore(repo)?;
-            }
-            Err(err)
-        },
+    apply_fixup_refs_and_worktree(
+        repo,
+        plan,
+        opts,
+        staged_paths,
+        prestate.as_ref(),
+        consumed,
+        finish,
     )
+    .or_else(|err| {
+        if let Some(pre) = prestate {
+            pre.restore(repo)?;
+        }
+        Err(err)
+    })
 }
 
 struct StagedPathPrestate {
@@ -684,6 +755,8 @@ fn apply_fixup_refs_and_worktree(
     opts: &ApplyOptions,
     staged_paths: &[String],
     prestate: Option<&FixupApplyPrestate>,
+    consumed: Option<Vec<PathState>>,
+    finish: impl FnOnce(&Repository) -> Result<(), HistoryError>,
 ) -> Result<AppliedRewrite, HistoryError> {
     let (old_tree, new_tree) = head_tree_transition(plan);
     let needs_worktree = !repo.is_bare() && head_tree_changes(&old_tree, &new_tree);
@@ -708,7 +781,9 @@ fn apply_fixup_refs_and_worktree(
                 old_head_commit,
                 staged_paths,
                 prestate,
-            )
+            )?;
+            finish(repo)?;
+            undo_work_after_command(repo, consumed)
         },
     )
     .inspect_err(|_| {
@@ -821,14 +896,18 @@ fn clear_fixup_staging_after_apply(
                     entry.oid = oid;
                     entry.mode = mode;
                 } else {
-                    let size = repo
-                        .odb()
-                        .read(&oid)
-                        .map_err(|e| HistoryError::WorktreeApply {
-                            message: e.to_string(),
-                        })?
-                        .data
-                        .len() as u32;
+                    // A gitlink names a commit in the submodule's own object store.
+                    let size = if mode == crate::index::MODE_GITLINK {
+                        0
+                    } else {
+                        repo.odb()
+                            .read(&oid)
+                            .map_err(|e| HistoryError::WorktreeApply {
+                                message: e.to_string(),
+                            })?
+                            .data
+                            .len() as u32
+                    };
                     index.add_or_replace(crate::index::IndexEntry {
                         ctime_sec: 0,
                         ctime_nsec: 0,
@@ -865,34 +944,13 @@ fn tree_entry_at_path(
     tree: ObjectId,
     path: &str,
 ) -> Result<Option<(ObjectId, u32)>, HistoryError> {
-    let mut current = tree;
-    let mut components = path.split('/').peekable();
-    while let Some(name) = components.next() {
-        let raw = repo
-            .odb()
-            .read(&current)
-            .map_err(|e| HistoryError::WorktreeApply {
-                message: e.to_string(),
-            })?;
-        let entries = parse_tree(&raw.data).map_err(|e| HistoryError::WorktreeApply {
+    let entry = repo
+        .odb()
+        .tree_entry_at_path(&tree, path.as_bytes())
+        .map_err(|e| HistoryError::WorktreeApply {
             message: e.to_string(),
         })?;
-        let Some(entry) = entries
-            .iter()
-            .find(|e| e.name.as_slice() == name.as_bytes())
-        else {
-            return Ok(None);
-        };
-        if components.peek().is_some() {
-            if entry.mode != crate::index::MODE_TREE {
-                return Ok(None);
-            }
-            current = entry.oid;
-        } else {
-            return Ok(Some((entry.oid, entry.mode)));
-        }
-    }
-    Ok(None)
+    Ok(entry.map(|e| (e.oid, e.mode)))
 }
 
 pub(crate) fn commit_tree_for_apply(
@@ -944,11 +1002,102 @@ pub fn apply_rewrite(
         opts,
         rewrite_journal::RewriteApplyKind::Standard,
         |repo, old_tree, new_tree| {
-            apply_head_tree_to_worktree(repo, old_tree, new_tree, None, progress, cancel)
+            apply_head_tree_to_worktree(repo, old_tree, new_tree, None, progress, cancel)?;
+            Ok(None)
         },
     )
 }
 
+/// Work tree checks for undoing a rewrite whose sidecar restores `work`'s paths.
+///
+/// Every recorded path must still be as the rewrite left it. Those paths are then not local
+/// changes for the inverse checkout: [`apply_undo_rewrite`] resets them before checking out.
+/// Returns the live state of the recorded paths (empty without `work`).
+pub(crate) fn verify_undo_worktree(
+    repo: &Repository,
+    plan: &RewritePlan,
+    work: Option<&UndoWork>,
+) -> Result<Vec<PathState>, HistoryError> {
+    let Some(work) = work.filter(|_| !repo.is_bare()) else {
+        verify_rewrite_plan(repo, plan)?;
+        return Ok(Vec::new());
+    };
+    let live = work.unchanged_live_states(repo)?;
+    let recorded = work.paths();
+    match verify_rewrite_plan(repo, plan) {
+        Err(HistoryError::LocalChangesWouldBeOverwritten { paths }) => {
+            let paths: Vec<String> = paths
+                .into_iter()
+                .filter(|p| !recorded.contains(p))
+                .collect();
+            if !paths.is_empty() {
+                return Err(HistoryError::LocalChangesWouldBeOverwritten { paths });
+            }
+        }
+        other => other?,
+    }
+    Ok(live)
+}
+
+/// Apply an undo `plan`, then install the index and work tree states recorded in `work`.
+///
+/// The recorded paths are reset to `HEAD`'s tree before the inverse checkout, and their state
+/// just before the undo becomes the new record's sidecar, so undoing again redoes the rewrite
+/// with the same paths put back.
+pub(crate) fn apply_undo_rewrite(
+    repo: &Repository,
+    plan: &RewritePlan,
+    opts: &ApplyOptions,
+    work: Option<&UndoWork>,
+) -> Result<AppliedRewrite, HistoryError> {
+    verify_live_head_matches_plan(repo, &plan.head)?;
+    let before = verify_undo_worktree(repo, plan, work)?;
+    let paths = work.map(UndoWork::paths).unwrap_or_default();
+    run_planned_rewrite_apply(
+        repo,
+        plan,
+        opts,
+        rewrite_journal::RewriteApplyKind::Standard,
+        |repo, old_tree, new_tree| {
+            let checkout = |repo: &Repository| {
+                apply_head_tree_to_worktree(
+                    repo,
+                    old_tree,
+                    new_tree,
+                    None,
+                    &mut crate::progress::NullProgress,
+                    &crate::progress::NeverCancel,
+                )
+            };
+            let Some(work) = work else {
+                checkout(repo)?;
+                return Ok(None);
+            };
+            let restore = work.restore_states();
+            let installed = (|| {
+                if let Some(from) = old_tree {
+                    let reset =
+                        states_not_in_place(tree_path_states(repo, *from, &paths)?, &before);
+                    if !reset.is_empty() {
+                        install_path_states(repo, &reset)?;
+                    }
+                }
+                checkout(repo)?;
+                install_path_states(repo, &restore)
+            })();
+            if let Err(err) = installed {
+                let _ = install_path_states(repo, &before);
+                return Err(err);
+            }
+            UndoWork::pair(repo.odb().hash_algo(), before, &restore).map(Some)
+        },
+    )
+}
+
+/// Move refs, then run `apply_worktree` when `HEAD`'s tree changes and record the rewrite.
+///
+/// `apply_worktree` returns the index and work tree state an undo must put back, stored next to
+/// the undo record; `None` records refs only.
 fn run_planned_rewrite_apply<F>(
     repo: &Repository,
     plan: &RewritePlan,
@@ -957,8 +1106,9 @@ fn run_planned_rewrite_apply<F>(
     apply_worktree: F,
 ) -> Result<AppliedRewrite, HistoryError>
 where
-    F: FnOnce(&Repository, Option<&ObjectId>, &ObjectId) -> Result<(), HistoryError>,
+    F: FnOnce(&Repository, Option<&ObjectId>, &ObjectId) -> Result<Option<UndoWork>, HistoryError>,
 {
+    let mut work = None;
     let (old_tree, new_tree) = head_tree_transition(plan);
     let needs_worktree = !repo.is_bare() && head_tree_changes(&old_tree, &new_tree);
     let new_head_commit = head_commit_after(repo, &plan.ref_updates)?;
@@ -1024,22 +1174,26 @@ where
                 message: "missing head tree for worktree apply".into(),
             });
         };
-        if let Err(checkout_err) = apply_worktree(repo, Some(&old), &new) {
-            let ref_rollback = rollback_ref_updates(repo, &plan.ref_updates, opts).err();
-            let worktree_restore = restore_worktree_after_failed_apply(
-                repo,
-                index_snapshot.as_ref(),
-                worktree_snapshot.as_ref(),
-            )
-            .err();
-            if ref_rollback.is_none() && worktree_restore.is_none() {
-                let _ = rewrite_journal::clear_rewrite_apply_journal(repo);
+        match apply_worktree(repo, Some(&old), &new) {
+            Ok(recorded) => work = recorded,
+            Err(checkout_err) => {
+                let ref_rollback = rollback_ref_updates(repo, &plan.ref_updates, opts).err();
+                let worktree_restore = restore_worktree_after_failed_apply(
+                    repo,
+                    Some(&old),
+                    index_snapshot.as_ref(),
+                    worktree_snapshot.as_ref(),
+                )
+                .err();
+                if ref_rollback.is_none() && worktree_restore.is_none() {
+                    let _ = rewrite_journal::clear_rewrite_apply_journal(repo);
+                }
+                return Err(apply_failure_after_ref_update(
+                    checkout_err,
+                    ref_rollback,
+                    worktree_restore,
+                ));
             }
-            return Err(apply_failure_after_ref_update(
-                checkout_err,
-                ref_rollback,
-                worktree_restore,
-            ));
         }
     }
 
@@ -1051,6 +1205,7 @@ where
         needs_worktree,
         index_snapshot.as_ref(),
         worktree_snapshot.as_ref(),
+        work.as_ref(),
     );
     if applied.is_ok() {
         let _ = rewrite_journal::clear_rewrite_apply_journal(repo);
@@ -1167,13 +1322,8 @@ fn verify_worktree_ready_for_head_tree_change(
 }
 
 fn map_prepare_checkout_error(err: crate::error::Error) -> HistoryError {
-    if let Some(path) = err.to_string().strip_prefix("untracked file '") {
-        if let Some(path) = path.strip_suffix("' would be overwritten — move or remove it first")
-        {
-            return HistoryError::LocalChangesWouldBeOverwritten {
-                paths: vec![path.to_owned()],
-            };
-        }
+    if let crate::error::Error::WouldOverwrite { paths, .. } = err {
+        return HistoryError::LocalChangesWouldBeOverwritten { paths };
     }
     HistoryError::WorktreeApply {
         message: err.to_string(),
@@ -1245,7 +1395,8 @@ fn commit_planned_ref_updates(
             .update(update)
             .map_err(|e| map_ref_store_error(e, &planned.name))?;
     }
-    let prepared = store.prepare(txn).map_err(|e| {
+    let wait = LockWait::files_ref_lock(config.as_ref().map(|c| c.as_ref()));
+    let prepared = prepare_with_lock_wait(store, txn, wait).map_err(|e| {
         map_ref_store_error(
             e,
             updates.first().map(|u| u.name.as_str()).unwrap_or("refs"),
@@ -1302,8 +1453,8 @@ pub(super) fn log_head_move(
     let txn = RefTransaction::new()
         .update(update)
         .map_err(|e| map_ref_store_error(e, "HEAD"))?;
-    repo.refs()
-        .prepare(txn)
+    let wait = LockWait::files_ref_lock(config.as_ref().map(|c| c.as_ref()));
+    prepare_with_lock_wait(repo.refs(), txn, wait)
         .and_then(|prepared| prepared.commit())
         .map_err(|e| map_ref_store_error(e, "HEAD"))?;
     Ok(())
@@ -1327,6 +1478,7 @@ fn head_log_update(
         flags: RefUpdateFlags {
             log_only: true,
             no_deref: true,
+            ..Default::default()
         },
     })
 }
@@ -1409,7 +1561,7 @@ fn apply_failure_after_ref_update(
 
 /// Worktree presence captured before a tree transition checkout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WorktreePathKind {
+pub(crate) enum WorktreePathKind {
     /// Path did not exist in the worktree.
     Absent,
     /// Path was a directory (possibly implicit via tracked children).
@@ -1422,11 +1574,94 @@ enum WorktreePathKind {
 
 /// Pre-checkout state for one path in the forward tree transition.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct WorktreePathSnapshot {
-    kind: WorktreePathKind,
-    bytes: Option<Vec<u8>>,
+pub(crate) struct WorktreePathSnapshot {
+    pub(crate) kind: WorktreePathKind,
+    pub(crate) bytes: Option<Vec<u8>>,
+    /// When set, rollback rebuilds this path from the journal's pre-apply `head-tree` OID.
+    pub(crate) from_old_tree: bool,
     #[cfg(unix)]
     mode: u32,
+}
+
+impl WorktreePathSnapshot {
+    /// No file at the path.
+    pub(crate) fn absent() -> Self {
+        Self::from_parts(WorktreePathKind::Absent, None, 0)
+    }
+
+    /// The file a checkout of a blob with Git `git_mode` writes (`0` permissions mean the
+    /// process default).
+    pub(crate) fn file(git_mode: u32, bytes: Vec<u8>) -> Self {
+        match git_mode {
+            0o120000 => Self::from_parts(WorktreePathKind::Symlink, Some(bytes), 0),
+            0o100755 => Self::from_parts(WorktreePathKind::Regular, Some(bytes), 0o755),
+            _ => Self::from_parts(WorktreePathKind::Regular, Some(bytes), 0),
+        }
+    }
+
+    /// Reassemble a snapshot from its stored parts; `unix_mode` is ignored off Unix.
+    pub(crate) fn from_parts(
+        kind: WorktreePathKind,
+        bytes: Option<Vec<u8>>,
+        unix_mode: u32,
+    ) -> Self {
+        #[cfg(not(unix))]
+        let _ = unix_mode;
+        Self {
+            kind,
+            bytes,
+            from_old_tree: false,
+            #[cfg(unix)]
+            mode: unix_mode,
+        }
+    }
+
+    /// Pre-apply path that matches the old tree; rollback materializes it from the ODB.
+    pub(crate) fn from_old_tree(kind: WorktreePathKind) -> Self {
+        #[cfg(unix)]
+        let mode = match kind {
+            WorktreePathKind::Directory => 0o755,
+            WorktreePathKind::Regular => 0o644,
+            _ => 0,
+        };
+        Self {
+            kind,
+            bytes: None,
+            from_old_tree: true,
+            #[cfg(unix)]
+            mode,
+        }
+    }
+
+    /// Permission bits recorded for the path (`0` when unknown or off Unix).
+    pub(crate) fn unix_mode(&self) -> u32 {
+        #[cfg(unix)]
+        {
+            self.mode
+        }
+        #[cfg(not(unix))]
+        {
+            0
+        }
+    }
+
+    pub(crate) fn is_executable(&self) -> bool {
+        self.kind == WorktreePathKind::Regular && self.unix_mode() & 0o111 != 0
+    }
+
+    /// Whether this file is what checking out a blob of `git_mode` with `data` produces.
+    pub(crate) fn content_matches(&self, git_mode: u32, data: &[u8]) -> bool {
+        let Some(bytes) = self.bytes.as_deref() else {
+            return false;
+        };
+        let mode_matches = match self.kind {
+            WorktreePathKind::Symlink => git_mode == 0o120000,
+            WorktreePathKind::Regular if self.is_executable() => git_mode == 0o100755,
+            WorktreePathKind::Regular => git_mode == 0o100644,
+            WorktreePathKind::Absent | WorktreePathKind::Directory => false,
+        };
+        mode_matches && bytes == data
+    }
 }
 
 fn snapshot_worktree_for_tree_transition(
@@ -1439,43 +1674,65 @@ fn snapshot_worktree_for_tree_transition(
         .ok_or_else(|| HistoryError::WorktreeApply {
             message: "cannot snapshot worktree in a bare repository".into(),
         })?;
-    let changes = diff_trees(repo.odb(), Some(from_tree), Some(to_tree), "").map_err(|e| {
-        HistoryError::WorktreeApply {
-            message: e.to_string(),
-        }
-    })?;
+    let prepared =
+        prepare_tree_transition_allow_local(repo, Some(from_tree), to_tree, &HashSet::new())
+            .map_err(|err| match err {
+                TreeTransitionPrepareError::Failed(e) => HistoryError::WorktreeApply {
+                    message: e.to_string(),
+                },
+                TreeTransitionPrepareError::OverwritePaths(paths) => {
+                    HistoryError::LocalChangesWouldBeOverwritten { paths }
+                }
+            })?;
+    let preserve = prepared.preserve_worktree_paths();
+    let index = prepared.index();
     let mut out = HashMap::new();
-    for change in changes {
-        let Some(path) = tree_transition_path(&change) else {
+    for change in prepared.tree_changes() {
+        let Some(path) = tree_transition_path(change) else {
             continue;
         };
-        let snap = read_worktree_path_snapshot(work_tree, path).map_err(|e| {
-            HistoryError::WorktreeApply {
-                message: format!("snapshot worktree path '{path}': {e}"),
-            }
-        })?;
-        if snap.kind == WorktreePathKind::Directory && worktree_path_is_gitlink(repo, path)? {
+        if index
+            .get(path.as_bytes(), 0)
+            .is_some_and(|entry| entry.mode == crate::index::MODE_GITLINK)
+        {
             continue;
         }
+        let snap = if preserve.contains(path) {
+            read_worktree_path_snapshot(work_tree, path).map_err(|e| {
+                HistoryError::WorktreeApply {
+                    message: format!("snapshot worktree path '{path}': {e}"),
+                }
+            })?
+        } else {
+            worktree_snapshot_from_tree_change(change)?
+        };
         out.insert(path.to_owned(), snap);
     }
     Ok(out)
 }
 
-fn worktree_path_is_gitlink(repo: &Repository, path: &str) -> Result<bool, HistoryError> {
-    let index = repo.load_index().map_err(|e| HistoryError::WorktreeApply {
-        message: e.to_string(),
-    })?;
-    Ok(index
-        .get(path.as_bytes(), 0)
-        .is_some_and(|entry| entry.mode == crate::index::MODE_GITLINK))
+fn worktree_snapshot_from_tree_change(
+    change: &DiffEntry,
+) -> Result<WorktreePathSnapshot, HistoryError> {
+    if change.status == DiffStatus::Added {
+        return Ok(WorktreePathSnapshot::from_old_tree(
+            WorktreePathKind::Absent,
+        ));
+    }
+    let mode = change.old_mode.bits();
+    let kind = match mode {
+        crate::index::MODE_TREE | crate::index::MODE_GITLINK => WorktreePathKind::Directory,
+        0o120000 => WorktreePathKind::Symlink,
+        _ => WorktreePathKind::Regular,
+    };
+    Ok(WorktreePathSnapshot::from_old_tree(kind))
 }
 
 fn tree_transition_path(change: &crate::diff::DiffEntry) -> Option<&str> {
     change.new_path.as_deref().or(change.old_path.as_deref())
 }
 
-fn read_worktree_path_snapshot(
+pub(crate) fn read_worktree_path_snapshot(
     work_tree: &Path,
     path: &str,
 ) -> Result<WorktreePathSnapshot, std::io::Error> {
@@ -1486,6 +1743,7 @@ fn read_worktree_path_snapshot(
             return Ok(WorktreePathSnapshot {
                 kind: WorktreePathKind::Absent,
                 bytes: None,
+                from_old_tree: false,
                 #[cfg(unix)]
                 mode: 0o644,
             });
@@ -1497,6 +1755,7 @@ fn read_worktree_path_snapshot(
         return Ok(WorktreePathSnapshot {
             kind: WorktreePathKind::Symlink,
             bytes: Some(target.as_os_str().as_encoded_bytes().to_vec()),
+            from_old_tree: false,
             #[cfg(unix)]
             mode: 0,
         });
@@ -1510,6 +1769,7 @@ fn read_worktree_path_snapshot(
             return Ok(WorktreePathSnapshot {
                 kind: WorktreePathKind::Regular,
                 bytes: Some(bytes),
+                from_old_tree: false,
                 mode,
             });
         }
@@ -1518,19 +1778,22 @@ fn read_worktree_path_snapshot(
             return Ok(WorktreePathSnapshot {
                 kind: WorktreePathKind::Regular,
                 bytes: Some(bytes),
+                from_old_tree: false,
             });
         }
     }
     Ok(WorktreePathSnapshot {
         kind: WorktreePathKind::Directory,
         bytes: None,
+        from_old_tree: false,
         #[cfg(unix)]
         mode: 0o755,
     })
 }
 
-fn restore_worktree_after_failed_apply(
+pub(crate) fn restore_worktree_after_failed_apply(
     repo: &Repository,
+    old_tree: Option<&ObjectId>,
     index_snapshot: Option<&IndexSnapshot>,
     worktree_snapshot: Option<&HashMap<String, WorktreePathSnapshot>>,
 ) -> Result<(), HistoryError> {
@@ -1561,12 +1824,61 @@ fn restore_worktree_after_failed_apply(
     paths.sort_by(|a, b| path_depth_cmp(a, b));
     for path in &paths {
         let saved = &snapshot[*path];
-        let abs = work_tree.join(path.as_str());
-        restore_worktree_path(&abs, saved).map_err(|e| HistoryError::WorktreeApply {
-            message: format!("failed to restore '{path}': {e}"),
-        })?;
+        if saved.from_old_tree {
+            let old_tree = old_tree.ok_or_else(|| HistoryError::WorktreeApply {
+                message: "missing head-tree for from-tree worktree restore".into(),
+            })?;
+            restore_worktree_path_from_old_tree(repo, work_tree, path.as_str(), old_tree, saved)
+                .map_err(|e| HistoryError::WorktreeApply {
+                    message: format!("failed to restore '{path}' from tree: {e}"),
+                })?;
+        } else {
+            let abs = work_tree.join(path.as_str());
+            restore_worktree_path(&abs, saved).map_err(|e| HistoryError::WorktreeApply {
+                message: format!("failed to restore '{path}': {e}"),
+            })?;
+        }
     }
     Ok(())
+}
+
+fn restore_worktree_path_from_old_tree(
+    repo: &Repository,
+    work_tree: &Path,
+    path: &str,
+    old_tree: &ObjectId,
+    saved: &WorktreePathSnapshot,
+) -> Result<(), crate::error::Error> {
+    let abs = work_tree.join(path);
+    clear_worktree_path_before_restore(&abs, saved)?;
+    match saved.kind {
+        WorktreePathKind::Absent => Ok(()),
+        WorktreePathKind::Directory => {
+            fs::create_dir_all(&abs)?;
+            Ok(())
+        }
+        WorktreePathKind::Regular | WorktreePathKind::Symlink => {
+            let Some((oid, mode)) = tree_entry_at_path(repo, *old_tree, path)? else {
+                return Ok(());
+            };
+            if mode == crate::index::MODE_GITLINK {
+                return materialize_gitlink_worktree(work_tree, path, &mut LeadingDirCache::new());
+            }
+            let index = repo.load_index()?;
+            let config = repo.config()?;
+            let rules = WorktreeRules::from_parts_index_attributes_only(repo, &index, config)?;
+            write_blob_to_worktree(
+                repo,
+                &rules,
+                work_tree,
+                path,
+                &oid,
+                mode,
+                &mut LeadingDirCache::new(),
+            )?;
+            Ok(())
+        }
+    }
 }
 
 fn path_depth_cmp(a: &str, b: &str) -> std::cmp::Ordering {
@@ -1591,7 +1903,14 @@ fn clear_worktree_path_before_restore(
                 fs::remove_file(abs)?;
             }
         }
-        WorktreePathKind::Regular | WorktreePathKind::Symlink => {
+        WorktreePathKind::Symlink => {
+            if abs.is_dir() {
+                fs::remove_dir_all(abs)?;
+            } else if abs.is_symlink() || abs.is_file() {
+                fs::remove_file(abs)?;
+            }
+        }
+        WorktreePathKind::Regular => {
             if abs.is_dir() {
                 fs::remove_dir_all(abs)?;
             }
@@ -1600,7 +1919,78 @@ fn clear_worktree_path_before_restore(
     Ok(())
 }
 
-fn restore_worktree_path(abs: &Path, saved: &WorktreePathSnapshot) -> std::io::Result<()> {
+fn symlink_target_from_snapshot_bytes(bytes: &[u8]) -> std::io::Result<std::path::PathBuf> {
+    #[cfg(unix)]
+    {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        Ok(std::path::PathBuf::from(OsStr::from_bytes(bytes)))
+    }
+    #[cfg(windows)]
+    {
+        let text = std::str::from_utf8(bytes).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "symlink restore requires a UTF-8 target on Windows",
+            )
+        })?;
+        Ok(std::path::PathBuf::from(text))
+    }
+    #[cfg(all(not(unix), not(windows)))]
+    {
+        let _ = bytes;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "symlink restore is not supported on this platform",
+        ))
+    }
+}
+
+fn write_symlink_from_snapshot(abs: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let target = symlink_target_from_snapshot_bytes(bytes)?;
+    if let Some(parent) = abs.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::{symlink_dir, symlink_file};
+        let lookup = if target.is_relative() {
+            abs.parent()
+                .map(|parent| parent.join(&target))
+                .unwrap_or_else(|| target.clone())
+        } else {
+            target.clone()
+        };
+        if lookup.is_dir() {
+            symlink_dir(&target, abs)
+        } else {
+            symlink_file(&target, abs)
+        }
+    }
+    #[cfg(unix)]
+    {
+        use crate::porcelain::checkout::create_symlink_at;
+        create_symlink_at(&target, abs)
+    }
+    #[cfg(all(not(unix), not(windows)))]
+    {
+        let _ = (abs, target);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "symlink restore is not supported on this platform",
+        ))
+    }
+}
+
+pub(crate) fn restore_worktree_path(
+    abs: &Path,
+    saved: &WorktreePathSnapshot,
+) -> std::io::Result<()> {
+    if matches!(saved.kind, WorktreePathKind::Symlink) {
+        if let Some(bytes) = saved.bytes.as_ref() {
+            symlink_target_from_snapshot_bytes(bytes)?;
+        }
+    }
     if !matches!(saved.kind, WorktreePathKind::Absent) {
         clear_worktree_path_before_restore(abs, saved)?;
     }
@@ -1614,28 +2004,7 @@ fn restore_worktree_path(abs: &Path, saved: &WorktreePathSnapshot) -> std::io::R
             let Some(bytes) = saved.bytes.as_ref() else {
                 return Ok(());
             };
-            if abs.is_symlink() || abs.is_file() {
-                fs::remove_file(abs)?;
-            }
-            #[cfg(unix)]
-            {
-                use std::ffi::OsStr;
-                use std::os::unix::ffi::OsStrExt;
-                use std::os::unix::fs::symlink;
-                let target = OsStr::from_bytes(bytes);
-                if let Some(parent) = abs.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                symlink(target, abs)?;
-            }
-            #[cfg(not(unix))]
-            {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Unsupported,
-                    "symlink restore requires unix",
-                ));
-            }
-            Ok(())
+            write_symlink_from_snapshot(abs, bytes)
         }
         WorktreePathKind::Regular => {
             let Some(bytes) = saved.bytes.as_ref() else {
@@ -1747,6 +2116,14 @@ mod inject_and_apply_tests {
             entries: Vec<ReflogEntry>,
         ) -> crate::error::Result<()> {
             self.inner.replace_reflog(name, entries)
+        }
+
+        fn rewrite_reflog(
+            &self,
+            name: &str,
+            transform: &mut dyn FnMut(Vec<ReflogEntry>) -> crate::error::Result<Vec<ReflogEntry>>,
+        ) -> crate::error::Result<()> {
+            self.inner.rewrite_reflog(name, transform)
         }
 
         fn for_each_reflog_ref(
@@ -2307,6 +2684,7 @@ mod inject_and_apply_tests {
         let saved = WorktreePathSnapshot {
             kind: WorktreePathKind::Regular,
             bytes: Some(b"original file\n".to_vec()),
+            from_old_tree: false,
             #[cfg(unix)]
             mode: 0o100644,
         };
@@ -2334,6 +2712,7 @@ mod inject_and_apply_tests {
         let saved = WorktreePathSnapshot {
             kind: WorktreePathKind::Regular,
             bytes: Some(b"original file\n".to_vec()),
+            from_old_tree: false,
             mode: 0o100644,
         };
         restore_worktree_path(&tracked, &saved).expect("restore");
@@ -2352,6 +2731,27 @@ mod inject_and_apply_tests {
 
     #[cfg(unix)]
     #[test]
+    fn restore_worktree_path_replaces_regular_file_with_saved_symlink() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tracked = dir.path().join("tracked");
+        fs::write(&tracked, "regular file\n").expect("write");
+        let saved = WorktreePathSnapshot {
+            kind: WorktreePathKind::Symlink,
+            bytes: Some(b"link-target.txt".to_vec()),
+            from_old_tree: false,
+            mode: 0,
+        };
+        restore_worktree_path(&tracked, &saved).expect("restore symlink");
+        assert!(tracked.is_symlink());
+        assert!(!tracked.is_file());
+        assert_eq!(
+            fs::read_link(&tracked).expect("read link"),
+            std::path::Path::new("link-target.txt")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn read_worktree_path_snapshot_propagates_unreadable_regular_file() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -2362,6 +2762,26 @@ mod inject_and_apply_tests {
         let err = read_worktree_path_snapshot(dir.path(), "secret.txt").expect_err("read denied");
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("restore mode");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn restore_worktree_symlink_invalid_target_leaves_existing_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tracked = dir.path().join("tracked.txt");
+        fs::write(&tracked, "keep me\n").expect("write");
+        let saved = WorktreePathSnapshot {
+            kind: WorktreePathKind::Symlink,
+            bytes: Some(vec![0xff]),
+            from_old_tree: false,
+        };
+        let err = restore_worktree_path(&tracked, &saved).expect_err("non-utf8 target");
+        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+        assert_eq!(
+            fs::read_to_string(&tracked).expect("read"),
+            "keep me\n",
+            "must not remove the file when symlink restore is unsupported"
+        );
     }
 
     #[cfg(unix)]
@@ -2397,6 +2817,7 @@ mod inject_and_apply_tests {
             WorktreePathSnapshot {
                 kind: WorktreePathKind::Directory,
                 bytes: None,
+                from_old_tree: false,
                 #[cfg(unix)]
                 mode: 0o755,
             },
@@ -2406,12 +2827,13 @@ mod inject_and_apply_tests {
             WorktreePathSnapshot {
                 kind: WorktreePathKind::Regular,
                 bytes: Some(b"child\n".to_vec()),
+                from_old_tree: false,
                 #[cfg(unix)]
                 mode: 0o644,
             },
         );
 
-        restore_worktree_after_failed_apply(&repo, None, Some(&snapshot)).expect("restore");
+        restore_worktree_after_failed_apply(&repo, None, None, Some(&snapshot)).expect("restore");
 
         let tracked = dir.path().join("tracked");
         let child = dir.path().join("tracked/child");

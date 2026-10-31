@@ -20,7 +20,7 @@ use crate::objects::{ObjectId, ObjectKind};
 use crate::push_report::PushRefResult;
 use crate::refs;
 use crate::refspec::{parse_push_refspec, RefspecItem};
-use crate::remote::{HttpClientFactory, Remote, RemoteError, RemoteRef};
+use crate::remote::{HttpClientFactory, ProbeHttpClientFactory, Remote, RemoteError, RemoteRef};
 use crate::repo::Repository;
 use crate::repo_handles::has_remote_section;
 use crate::rev_parse::{resolve_push_full_ref_for_branch, resolve_revision_for_verify};
@@ -677,6 +677,36 @@ pub fn resolve_push_invocation(
     })
 }
 
+/// The URL `<host>/<owner>/<project>.git` when `grit push <owner>/<project> <refspec>...` names
+/// a repository on a grit host rather than a remote.
+///
+/// Only a first positional followed by refspecs is a remote, so a lone `topic/x` stays a
+/// refspec (`None`). A configured remote of the same name wins, and literal URLs and paths
+/// (`a/b/c`, `./a/b`, `x/y.git`) are left alone. Owner and project are letters, digits, `-`,
+/// `_` and `.`, not starting with `.`.
+#[must_use]
+pub fn expand_repository_shorthand(
+    config: &ConfigSet,
+    positionals: &[String],
+    host: &str,
+) -> Option<String> {
+    let [first, _, ..] = positionals else {
+        return None;
+    };
+    if has_remote_url(config, first) || looks_like_literal_remote(first) {
+        return None;
+    }
+    let is_segment = |s: &str| {
+        !s.is_empty()
+            && !s.starts_with('.')
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    };
+    let (owner, project) = first.split_once('/')?;
+    (is_segment(owner) && is_segment(project))
+        .then(|| format!("{}/{owner}/{project}.git", host.trim_end_matches('/')))
+}
+
 /// Open the [`Remote`] a resolved push sends to ([`ResolvedPush::remote`]).
 ///
 /// Literal URLs and paths (see [`resolve_push_invocation`]) become anonymous remotes; any other
@@ -721,6 +751,10 @@ impl PushPlanContext {
 /// listed with [`Remote::list_push_refs`]. The context is best-effort: a remote without a URL, or one whose refs cannot be listed,
 /// yields an empty context, and the push itself reports any connection failure.
 ///
+/// The listing uses a [probe client](HttpClientFactory::create_for_probe), so credentials the
+/// server refuses stay stored and the push reports them as rejected
+/// ([`AuthFailure::Rejected`](crate::error::AuthFailure::Rejected)).
+///
 /// # Errors
 ///
 /// Only errors from [`configured_remote_for_push`].
@@ -734,7 +768,8 @@ pub fn load_push_plan_context(
     let Ok(handle) = open_push_destination(config, &remote) else {
         return Ok(PushPlanContext::default());
     };
-    let Ok(advertised) = handle.list_push_refs(repo, http_factory) else {
+    let probe = ProbeHttpClientFactory::new(http_factory, repo);
+    let Ok(advertised) = handle.list_push_refs(repo, Some(&probe)) else {
         return Ok(PushPlanContext::default());
     };
     Ok(PushPlanContext::from_advertised_refs(advertised))
@@ -1588,6 +1623,32 @@ mod tests {
         let err = resolve_push_invocation(&ConfigSet::new(), None, &strings(&["nosuch", "main"]))
             .expect_err("unknown remote");
         assert_eq!(err, PushPlanError::UnknownRemote("nosuch".into()));
+    }
+
+    #[test]
+    fn owner_project_shorthand_expands_to_host_url() {
+        let config = config_from("[remote \"team/app\"]\n\turl = /srv/app.git\n");
+        let expand = |args: &[&str]| {
+            let args: Vec<String> = args.iter().map(|s| (*s).to_owned()).collect();
+            expand_repository_shorthand(&config, &args, "https://grithub.dev/")
+        };
+        assert_eq!(
+            expand(&["me/proj", "main"]).as_deref(),
+            Some("https://grithub.dev/me/proj.git")
+        );
+        // A lone positional is a refspec, not a repository.
+        assert_eq!(expand(&["topic/x"]), None);
+        // Configured remotes, URLs and paths are left alone.
+        for literal in [
+            "team/app",
+            "origin",
+            "./a/b",
+            "a/b/c",
+            "x/y.git",
+            "https://h/a/b",
+        ] {
+            assert_eq!(expand(&[literal, "main"]), None, "{literal}");
+        }
     }
 
     #[test]

@@ -148,7 +148,7 @@ impl IgnorePatternList {
         self.rules
             .iter()
             .rev()
-            .find(|rule| rule_matches_path_exact(rule, path, is_dir, ignore_case))
+            .find(|rule| rule_matches(rule, path, is_dir, ignore_case))
             .map(|rule| IgnorePatternMatch {
                 line_number: rule.line_number,
                 pattern_text: rule.pattern_text.clone(),
@@ -162,26 +162,6 @@ impl IgnorePatternList {
     pub fn is_ignored(&self, path: &str, is_dir: bool, ignore_case: bool) -> Option<bool> {
         self.last_match(path, is_dir, ignore_case)
             .map(|m| !m.negative)
-    }
-}
-
-/// Git's single-path pattern test (`dir.c` `last_matching_pattern_from_list`), without the
-/// parent-directory probing [`rule_matches`] adds for [`IgnoreMatcher`].
-fn rule_matches_path_exact(rule: &IgnoreRule, path: &str, is_dir: bool, ignore_case: bool) -> bool {
-    if rule.directory_only && !is_dir {
-        return false;
-    }
-    let Some(rel_to_base) = strip_base(&rule.base_dir, path, ignore_case) else {
-        return false;
-    };
-    if rel_to_base.is_empty() {
-        return false;
-    }
-    if rule.has_slash || rule.anchored {
-        rule_body_matches(rule, rel_to_base, true, ignore_case)
-    } else {
-        let basename = rel_to_base.rsplit('/').next().unwrap_or(rel_to_base);
-        rule_body_matches(rule, basename, false, ignore_case)
     }
 }
 
@@ -232,6 +212,8 @@ pub struct IgnoreMatcher {
     dir_exclude_stack_cache: HashMap<String, Vec<String>>,
     /// Fold ASCII case when comparing patterns and base directories (`core.ignorecase`).
     ignore_case: bool,
+    /// Repository-relative directories entered during a depth-first walk (skip restat in EXC_DIRS).
+    known_worktree_directories: std::collections::HashSet<String>,
 }
 
 impl IgnoreMatcher {
@@ -571,6 +553,7 @@ impl IgnoreMatcher {
         if self.gitignore_cache.contains_key(dir_rel) {
             return Ok(());
         }
+        self.known_worktree_directories.insert(dir_rel.to_owned());
         let per_dir_name = self.per_directory_name.clone();
         let rules = load_gitignore_for_dir(
             repo,
@@ -581,6 +564,21 @@ impl IgnoreMatcher {
         )?;
         self.gitignore_cache.insert(dir_rel.to_owned(), rules);
         Ok(())
+    }
+
+    /// Record that the walk entered work-tree directory `dir_rel` without reading its
+    /// per-directory exclude file yet.
+    ///
+    /// The file is read by the first query for a path inside the directory, so a directory
+    /// whose entries are all tracked never opens it (as in Git, where exclude rules are only
+    /// consulted for untracked paths).
+    pub(crate) fn note_directory_known(&mut self, dir_rel: &str) {
+        if self.read_per_directory
+            && !self.gitignore_cache.contains_key(dir_rel)
+            && !self.known_worktree_directories.contains(dir_rel)
+        {
+            self.known_worktree_directories.insert(dir_rel.to_owned());
+        }
     }
 
     fn ensure_per_dir_rules_loaded(
@@ -609,12 +607,15 @@ impl IgnoreMatcher {
                                 cur.push('/');
                             }
                             cur.push_str(segment);
-                            if worktree_path_is_existing_file(repo, &cur) {
+                            if self.known_worktree_directories.contains(&cur) {
+                                dirs.push(cur.clone());
+                            } else if worktree_path_is_existing_file(repo, &cur) {
                                 // Git does not treat a file path as a directory for EXC_DIRS
                                 // loading (`tracked.txt/.gitignore` must not be probed).
                                 break;
+                            } else {
+                                dirs.push(cur.clone());
                             }
-                            dirs.push(cur.clone());
                         }
                     }
                     self.per_dir_dirs_cache = Some((parent.to_string(), dirs.clone()));
@@ -987,48 +988,33 @@ fn rule_matches(rule: &IgnoreRule, repo_rel_path: &str, is_dir: bool, ignore_cas
 
 /// [`rule_matches`] specialized on case folding so the default case-sensitive path carries
 /// no per-comparison `core.ignorecase` checks.
+///
+/// Only the queried path itself is tested: slash-free patterns match its basename, patterns
+/// with a slash match the whole path relative to the rule's directory. A path under an
+/// excluded directory inherits that exclusion from [`IgnoreMatcher::first_excluded_ancestor`],
+/// which probes each ancestor with the same test, so `tags` followed by `!tags/` leaves
+/// `tags/a.txt` unignored while `tags` alone ignores it through its parent.
 fn rule_matches_with<const FOLD: bool>(
     rule: &IgnoreRule,
     repo_rel_path: &str,
     is_dir: bool,
 ) -> bool {
-    // Directory-only patterns (`foo/`) participate only when the query path is a directory,
-    // mirroring Git's `PATTERN_FLAG_MUSTBEDIR` / `sparse_pattern_matches` dtype gate. Ancestor
-    // probes use `is_dir=true` (`first_excluded_ancestor`); matching `!pkg/` against files under
-    // `pkg/` would wrongly re-include them when `*` still applies (issue #1650).
+    // Directory-only patterns (`foo/`) never match files, so `!pkg/` cannot re-include files
+    // under `pkg/` that `*` still ignores (issue #1650).
     if rule.directory_only && !is_dir {
         return false;
     }
-
     let Some(rel_to_base) = strip_base(&rule.base_dir, repo_rel_path, FOLD) else {
         return false;
     };
-
-    if rule.directory_only {
-        if rule.has_slash || rule.anchored {
-            for ancestor in ancestor_dirs(rel_to_base, is_dir) {
-                if rule_body_matches(rule, &ancestor, true, FOLD) {
-                    return true;
-                }
-            }
-            return false;
-        }
-        for ancestor in ancestor_dir_basenames(rel_to_base, is_dir) {
-            if rule_body_matches(rule, ancestor, false, FOLD) {
-                return true;
-            }
-        }
+    if rel_to_base.is_empty() {
         return false;
     }
-
     if rule.has_slash || rule.anchored {
         return rule_body_matches(rule, rel_to_base, true, FOLD);
     }
-
-    !rel_to_base.is_empty()
-        && rel_to_base
-            .split('/')
-            .any(|name| rule_body_matches(rule, name, false, FOLD))
+    let basename = rel_to_base.rsplit('/').next().unwrap_or(rel_to_base);
+    rule_body_matches(rule, basename, false, FOLD)
 }
 
 fn is_tracked(index: Option<&Index>, repo_rel_path: &str) -> bool {
@@ -1104,7 +1090,6 @@ enum InTreePatternFile {
 /// Read `path` without following a final symlink, so a link (dangling, or to a FIFO or
 /// device) is reported instead of opened. A missing file costs a single failed open on Unix.
 fn read_in_tree_pattern_file(path: &Path) -> Result<InTreePatternFile> {
-    let is_symlink = || fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink());
     #[cfg(unix)]
     let opened = {
         use std::os::unix::fs::OpenOptionsExt;
@@ -1114,18 +1099,22 @@ fn read_in_tree_pattern_file(path: &Path) -> Result<InTreePatternFile> {
             .open(path)
     };
     #[cfg(not(unix))]
-    let opened = if is_symlink() {
-        return Ok(InTreePatternFile::Symlink);
-    } else {
-        fs::File::open(path)
+    let opened = match fs::symlink_metadata(path) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(InTreePatternFile::Missing);
+        }
+        Err(err) => return Err(Error::Io(err)),
+        Ok(meta) if meta.file_type().is_symlink() => return Ok(InTreePatternFile::Symlink),
+        Ok(_) => fs::File::open(path),
     };
     let mut file = match opened {
         Ok(file) => file,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             return Ok(InTreePatternFile::Missing);
         }
-        // `O_NOFOLLOW` fails with `ELOOP` (or `EMLINK` on some BSDs) on a symlink.
-        Err(_) if is_symlink() => return Ok(InTreePatternFile::Symlink),
+        Err(_) if fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) => {
+            return Ok(InTreePatternFile::Symlink);
+        }
         Err(err) => return Err(Error::Io(err)),
     };
     let mut content = String::new();
@@ -1190,41 +1179,6 @@ fn parent_dir(path: &str) -> &str {
         Some((parent, _)) => parent,
         None => "",
     }
-}
-
-fn ancestor_dirs(path: &str, is_dir: bool) -> Vec<String> {
-    let mut out = Vec::new();
-    if path.is_empty() {
-        return out;
-    }
-    let parts: Vec<&str> = path.split('/').collect();
-    let max = if is_dir {
-        parts.len()
-    } else {
-        parts.len().saturating_sub(1)
-    };
-    for idx in 1..=max {
-        out.push(parts[..idx].join("/"));
-    }
-    out
-}
-
-fn ancestor_dir_basenames(path: &str, is_dir: bool) -> Vec<&str> {
-    let mut out = Vec::new();
-    let parts: Vec<&str> = if path.is_empty() {
-        Vec::new()
-    } else {
-        path.split('/').collect()
-    };
-    let max = if is_dir {
-        parts.len()
-    } else {
-        parts.len().saturating_sub(1)
-    };
-    for item in parts.iter().take(max) {
-        out.push(*item);
-    }
-    out
 }
 
 fn pattern_matches_kind(
@@ -1335,16 +1289,14 @@ fn sparse_pattern_matches(p: &SparsePattern, pathname: &str, as_directory: bool)
     // paths only (`dir/c`, not `a`). When walking parents (`as_directory`), Git still matches this
     // pattern against directory paths like `dir` so `dir/c` can be excluded (t7817).
     if p.directory_only && p.anchored && !p.has_slash && p.body == "*" {
+        // Git `match_pathname` for MUSTBEDIR `/*` / `!/*/`: only top-level directory names
+        // (no `/` in the pathname), including on the parent-directory pass — not every
+        // `as_directory` path (dir.c / filter_sparse).
         let trimmed = pathname.trim_end_matches('/');
-        return trimmed.contains('/') || as_directory;
+        return !trimmed.contains('/');
     }
     if !p.has_slash && !p.anchored {
-        let pat = p.body.as_bytes();
         sparse_unanchored_basename_matches(&p.body, pathname)
-            || wildmatch(pat, pathname.as_bytes(), WM_PATHNAME)
-            || pathname
-                .split('/')
-                .any(|comp| wildmatch(pat, comp.as_bytes(), 0))
     } else if p.anchored && !p.has_slash && p.body == "*" && !p.directory_only {
         // Sparse line `/*`: include only top-level paths (one segment). `WM_PATHNAME` keeps `*`
         // from matching `/`, but we match against the bare pathname; require no `/` so `dir/c` is
@@ -1468,16 +1420,7 @@ pub fn path_matches_sparse_pattern_list(pathname: &str, lines: &[String]) -> Opt
 
 fn sparse_unanchored_basename_matches(pat: &str, path: &str) -> bool {
     let basename = path.rsplit('/').next().unwrap_or(path);
-    if basename == pat {
-        return true;
-    }
-    if let Some(rest) = basename.strip_prefix(pat) {
-        return rest.starts_with('.') || rest.starts_with('/');
-    }
-    if path == pat {
-        return true;
-    }
-    path.starts_with(&format!("{pat}/"))
+    wildmatch(pat.as_bytes(), basename.as_bytes(), 0)
 }
 
 /// Returns the submodule path if `repo_rel_path` names something inside a gitlink entry.
@@ -1586,6 +1529,40 @@ mod normalization_tests {
 }
 
 #[cfg(test)]
+mod per_directory_load_tests {
+    use super::*;
+
+    #[test]
+    fn known_directory_reads_its_exclude_file_on_first_query() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let repo =
+            crate::repo::init_repository(root, false, "main", None, crate::RefStorageFormat::Files)
+                .unwrap();
+        fs::create_dir_all(root.join("d/sub")).unwrap();
+        fs::write(root.join("d/.gitignore"), "*.tmp\n").unwrap();
+
+        let mut matcher = IgnoreMatcher::from_repository(&repo).unwrap();
+        matcher.note_directory_known("d");
+        matcher.note_directory_known("d/sub");
+        assert!(
+            matcher.gitignore_cache.is_empty(),
+            "entering a directory must not read its exclude file"
+        );
+        assert!(matcher.known_worktree_directories.contains("d/sub"));
+
+        assert!(matcher
+            .is_path_ignored(&repo, None, "d/sub/x.tmp", false)
+            .unwrap());
+        assert!(!matcher
+            .is_path_ignored(&repo, None, "d/sub/x.txt", false)
+            .unwrap());
+        assert!(matcher.gitignore_cache.contains_key("d"));
+        assert!(matcher.gitignore_cache.contains_key("d/sub"));
+    }
+}
+
+#[cfg(test)]
 mod sparse_checkout_tests {
     use super::*;
 
@@ -1607,6 +1584,23 @@ mod sparse_checkout_tests {
         assert!(path_in_sparse_checkout("folder1/a", &lines, None));
         assert!(path_in_sparse_checkout("folder2/a", &lines, None));
         assert!(!path_in_sparse_checkout("deep/a", &lines, None));
+    }
+
+    #[test]
+    fn non_cone_src_nested_under_included_dir_with_negated_slash_slash() {
+        let lines = vec!["/*".into(), "!/*/".into(), "/src/".into()];
+        assert!(path_in_sparse_checkout("a.txt", &lines, None));
+        assert!(path_in_sparse_checkout("src/z", &lines, None));
+        assert!(path_in_sparse_checkout("src/deep/w", &lines, None));
+        assert!(!path_in_sparse_checkout("d1/x", &lines, None));
+        assert!(!path_in_sparse_checkout("d1/sub/y", &lines, None));
+    }
+
+    #[test]
+    fn unanchored_star_with_negated_other_includes_other_slash_q() {
+        let lines = vec!["*".into(), "!other".into()];
+        assert!(path_in_sparse_checkout("other/q", &lines, None));
+        assert!(!path_in_sparse_checkout("other", &lines, None));
     }
 }
 

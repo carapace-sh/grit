@@ -21,6 +21,7 @@ use crate::pack_objects::{
     PackStats, PlannedEntry,
 };
 use crate::parallel::{ParallelOp, ParallelOptions, ThreadPolicy};
+use crate::progress::CancelSignal;
 
 /// Resolve [`ParallelOptions`] for windowed delta search from repo config.
 pub(crate) fn pack_delta_search_parallel_options(
@@ -54,16 +55,26 @@ enum PreparedBody {
     /// zlib-compressed delta copied verbatim from a local pack (header written in the
     /// serial stage).
     ReusedZlib(PackSlice),
+    /// Whole object streamed from the ODB at emit time (large loose blobs).
+    StreamWhole { oid: ObjectId, kind: ObjectKind },
 }
 
 impl PreparedBody {
-    fn as_slice(&self) -> &[u8] {
+    fn as_slice(&self) -> Option<&[u8]> {
         match self {
-            Self::Raw(slice) | Self::ReusedZlib(slice) => slice.as_slice(),
-            Self::Zlib(bytes) => bytes,
+            Self::Raw(slice) | Self::ReusedZlib(slice) => Some(slice.as_slice()),
+            Self::Zlib(bytes) => Some(bytes),
+            Self::StreamWhole { .. } => None,
         }
     }
 }
+
+/// Whole objects at least this large that cannot be copied from a local pack are
+/// streamed through zlib into the output by the serial stage
+/// ([`PreparedBody::StreamWhole`]), or from `core.bigFileThreshold` when that is lower. Batches hold up to [`WRITE_BATCH_ENTRIES`] prepared
+/// entries and several batches are in flight, so without this a pack of large loose
+/// blobs would be held in memory, inflated and compressed, many objects at a time.
+const STREAM_WHOLE_FROM: u64 = 1 << 20;
 
 struct PreparedEntry {
     body: PreparedBody,
@@ -112,6 +123,8 @@ pub(crate) fn serialize_pack_with_deltas(
         write_threads,
         &mut bytes,
         Some(&mut index_rows),
+        &CancelSignal::never(),
+        None,
     )?;
     Ok(crate::pack_objects::SerializedDeltaPack {
         bytes,
@@ -131,11 +144,16 @@ const WRITE_BATCH_ENTRIES: usize = 256;
 /// `opts.use_ofs_delta` is set, `REF_DELTA` otherwise). Payloads are read from `odb`
 /// as each batch is prepared; deltas the search already compressed are copied, and
 /// the others (thin-pack deltas) are computed here. When `index_rows` is set it
-/// receives `(oid, pack offset, crc32)` for each entry in pack order.
+/// receives `(oid, pack offset, crc32)` for each entry in pack order. `stop` is
+/// polled before each entry is written.
 ///
 /// # Errors
 ///
-/// Returns object read or encoding errors, and [`Error::Io`] when writing to `w` fails.
+/// Returns object read or encoding errors, [`Error::PackDeltaBaseNotWritten`] when the
+/// pack is not thin (`opts.thin` unset) and a delta comes before its base (a base
+/// missing from `entries`, or a delta cycle), [`Error::Io`] when writing to `w`
+/// fails, and [`Error::Cancelled`] once `stop` fires.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn write_pack_with_deltas(
     odb: &Odb,
     entries: &[PlannedEntry],
@@ -143,6 +161,8 @@ pub(crate) fn write_pack_with_deltas(
     write_threads: Option<usize>,
     w: &mut dyn Write,
     index_rows: Option<&mut Vec<(ObjectId, u64, u32)>>,
+    stop: &CancelSignal<'_>,
+    on_objects: Option<&mut dyn FnMut(u64)>,
 ) -> Result<PackStats> {
     write_pack_in_batches(
         odb,
@@ -152,9 +172,12 @@ pub(crate) fn write_pack_with_deltas(
         w,
         index_rows,
         WRITE_BATCH_ENTRIES,
+        stop,
+        on_objects,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_pack_in_batches(
     odb: &Odb,
     entries: &[PlannedEntry],
@@ -163,6 +186,8 @@ fn write_pack_in_batches(
     w: &mut dyn Write,
     mut index_rows: Option<&mut Vec<(ObjectId, u64, u32)>>,
     batch_entries: usize,
+    stop: &CancelSignal<'_>,
+    mut on_objects: Option<&mut dyn FnMut(u64)>,
 ) -> Result<PackStats> {
     let par_opts = pack_write_parallel_options(odb, write_threads)?;
     let compression = pack_zlib_compression(odb)?;
@@ -183,6 +208,7 @@ fn write_pack_in_batches(
 
     let mut oid_to_offset: OidHashMap<u64> = oid_hash_map();
     let mut emit = |entry: &PlannedEntry, prep: &PreparedEntry| -> Result<()> {
+        stop.poll()?;
         header.clear();
         match (entry.base, &prep.body) {
             (None, PreparedBody::Raw(_)) => {}
@@ -190,6 +216,7 @@ fn write_pack_in_batches(
                 let kind = prep.whole_kind.unwrap_or(entry.kind);
                 encode_pack_object_header(&mut header, pack_type_code(kind), prep.payload_len);
             }
+            (None, PreparedBody::StreamWhole { .. }) => {}
             (Some(base_oid), _) => {
                 let in_pack_offset = oid_to_offset.get(&base_oid).copied();
                 if let Some(base_off) = in_pack_offset.filter(|_| opts.use_ofs_delta) {
@@ -199,6 +226,12 @@ fn write_pack_in_batches(
                     encode_pack_object_header(&mut header, 6, prep.payload_len);
                     encode_ofs_delta_distance(&mut header, dist);
                 } else {
+                    if !opts.thin && in_pack_offset.is_none() {
+                        return Err(Error::PackDeltaBaseNotWritten {
+                            target: entry.oid,
+                            base: base_oid,
+                        });
+                    }
                     if base_oid.as_bytes().len() != algo.len() {
                         return Err(Error::CorruptObject(
                             "ref-delta base oid width mismatch".to_owned(),
@@ -209,21 +242,41 @@ fn write_pack_in_batches(
                 }
             }
         }
-        let body = prep.body.as_slice();
         out.write_all(&header).map_err(Error::Io)?;
-        out.write_all(body).map_err(Error::Io)?;
+        let (body_len, entry_crc) = match &prep.body {
+            PreparedBody::StreamWhole { oid, kind, .. } => {
+                let mut crc_out = crate::pack_objects::CrcWriter::new(&mut out, &header);
+                let n = crate::pack_objects::write_whole_pack_object_to_odb(
+                    &mut crc_out,
+                    odb,
+                    *oid,
+                    *kind,
+                    opts,
+                )?;
+                (n, crc_out.finalize())
+            }
+            body => {
+                let bytes = body
+                    .as_slice()
+                    .ok_or_else(|| Error::CorruptObject("missing prepared pack body".to_owned()))?;
+                crate::pack_objects::write_all_chunked(&mut out, bytes)?;
+                let mut crc = crc32fast::Hasher::new();
+                crc.update(&header);
+                for chunk in bytes.chunks(crate::pack_objects::PACK_STREAM_COPY_CHUNK) {
+                    crc.update(chunk);
+                }
+                (bytes.len() as u64, crc.finalize())
+            }
+        };
         if let Some(rows) = index_rows.as_deref_mut() {
-            let mut crc = crc32fast::Hasher::new();
-            crc.update(&header);
-            crc.update(body);
-            rows.push((entry.oid, offset, crc.finalize()));
+            rows.push((entry.oid, offset, entry_crc));
         }
         if prep.reused {
             verbatim_reuse_objects += 1;
-            verbatim_reuse_bytes += body.len() as u64;
+            verbatim_reuse_bytes += body_len;
         }
         oid_to_offset.insert(entry.oid, offset);
-        offset += (header.len() + body.len()) as u64;
+        offset += header.len() as u64 + body_len;
         Ok(())
     };
     let prepare = |batch: &[PlannedEntry]| prepare_batch(odb, batch, opts, compression);
@@ -243,6 +296,9 @@ fn write_pack_in_batches(
                     for (entry, prep) in batch.iter().zip(&preps) {
                         emit(entry, prep)?;
                     }
+                    if let Some(on) = on_objects.as_deref_mut() {
+                        on(batch.len() as u64);
+                    }
                 }
                 Ok(())
             },
@@ -251,6 +307,9 @@ fn write_pack_in_batches(
         for batch in batches {
             for (entry, prep) in batch.iter().zip(&prepare(batch)?) {
                 emit(entry, prep)?;
+            }
+            if let Some(on) = on_objects.as_deref_mut() {
+                on(batch.len() as u64);
             }
         }
     }
@@ -316,6 +375,23 @@ fn prepare_whole(
                 reused: true,
             });
         }
+    }
+    let info = odb.read_info(&entry.oid)?;
+    if entry.kind == ObjectKind::Blob
+        && info.size >= STREAM_WHOLE_FROM.min(odb.big_file_threshold()?)
+    {
+        let payload_len = usize::try_from(info.size).map_err(|_| {
+            Error::CorruptObject(format!("object size overflow for {}", entry.oid.to_hex()))
+        })?;
+        return Ok(PreparedEntry {
+            body: PreparedBody::StreamWhole {
+                oid: entry.oid,
+                kind: entry.kind,
+            },
+            payload_len,
+            whole_kind: Some(entry.kind),
+            reused: false,
+        });
     }
     let payload = odb.read(&entry.oid)?.data;
     let zlib = zlib_compress(&payload, compression)?;
@@ -453,6 +529,100 @@ mod tests {
         );
     }
 
+    /// Write `entries` as a pack that is thin or not, discarding the bytes.
+    fn write_plan(odb: &Odb, entries: &[PlannedEntry], thin: bool) -> Result<PackStats> {
+        let opts = PackBuildOptions {
+            thin,
+            ..PackBuildOptions::default()
+        };
+        write_pack_with_deltas(
+            odb,
+            entries,
+            &opts,
+            Some(1),
+            &mut Vec::new(),
+            None,
+            &CancelSignal::never(),
+            None,
+        )
+    }
+
+    /// Two blobs that differ in one byte.
+    fn similar_pair(odb: &Odb, fill: u8) -> (PlannedEntry, PlannedEntry) {
+        let mut data = vec![fill; 4096];
+        let first = whole_entry(odb, &data);
+        data[100] = b'!';
+        (first, whole_entry(odb, &data))
+    }
+
+    #[test]
+    fn full_pack_refuses_a_delta_whose_base_it_does_not_contain() {
+        let (_dir, odb) = scratch_odb();
+        let (absent, mut target) = similar_pair(&odb, b'r');
+        target.base = Some(absent.oid);
+        let entries = [target];
+        match write_plan(&odb, &entries, false) {
+            Err(Error::PackDeltaBaseNotWritten { target, base }) => {
+                assert_eq!((target, base), (entries[0].oid, absent.oid));
+            }
+            other => panic!("expected PackDeltaBaseNotWritten, got {other:?}"),
+        }
+        assert!(
+            write_plan(&odb, &entries, true).is_ok(),
+            "a thin pack leaves the base to the peer"
+        );
+    }
+
+    #[test]
+    fn full_pack_refuses_a_delta_cycle() {
+        let (_dir, odb) = scratch_odb();
+        let (mut a, mut b) = similar_pair(&odb, b's');
+        a.base = Some(b.oid);
+        b.base = Some(a.oid);
+        let (a_oid, b_oid) = (a.oid, b.oid);
+        match write_plan(&odb, &[a, b], false) {
+            Err(Error::PackDeltaBaseNotWritten { target, base }) => {
+                assert_eq!((target, base), (a_oid, b_oid));
+            }
+            other => panic!("expected PackDeltaBaseNotWritten, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_fired_cancel_stops_the_writer_before_any_entry() {
+        let (_dir, odb) = scratch_odb();
+        let entries: Vec<PlannedEntry> = (0..3000u32)
+            .map(|i| whole_entry(&odb, format!("blob number {i}\n").as_bytes()))
+            .collect();
+        let cancel = crate::progress::FlagCancel::new();
+        cancel.cancel();
+        for threads in [1, 4] {
+            let mut out = Vec::new();
+            let err = write_pack_with_deltas(
+                &odb,
+                &entries,
+                &PackBuildOptions::default(),
+                Some(threads),
+                &mut out,
+                None,
+                &CancelSignal::new(&cancel),
+                None,
+            )
+            .unwrap_err();
+            assert!(matches!(err, Error::Cancelled), "{err:?}");
+            assert_eq!(out.len(), 12, "only the pack header was written");
+        }
+    }
+
+    #[test]
+    fn full_pack_writes_a_delta_after_its_base() {
+        let (_dir, odb) = scratch_odb();
+        let (base, mut target) = similar_pair(&odb, b't');
+        target.base = Some(base.oid);
+        let stats = write_plan(&odb, &[base, target], false).expect("base first");
+        assert_eq!((stats.object_count, stats.delta_count), (2, 1));
+    }
+
     #[test]
     fn streamed_pack_is_identical_across_worker_counts() {
         let (_dir, odb) = scratch_odb();
@@ -470,6 +640,8 @@ mod tests {
                 Some(threads),
                 &mut out,
                 Some(&mut rows),
+                &CancelSignal::never(),
+                None,
             )
             .unwrap();
             (out, stats, rows)
@@ -508,6 +680,7 @@ mod tests {
             &opts,
             &selection.name_hashes,
             None,
+            &CancelSignal::never(),
         )
         .unwrap();
         assert!(plan.entries.iter().any(|e| e.base.is_some()));
@@ -523,6 +696,8 @@ mod tests {
                 &mut bytes,
                 Some(&mut rows),
                 batch,
+                &CancelSignal::never(),
+                None,
             )
             .unwrap();
             (bytes, rows, stats)

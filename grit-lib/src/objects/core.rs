@@ -322,7 +322,23 @@ impl ObjectId {
     /// Lowercase hex representation (40 or 64 characters).
     #[must_use]
     pub fn to_hex(&self) -> String {
-        hex::encode(self.as_bytes())
+        self.hex_digits().as_str().to_owned()
+    }
+
+    /// The lowercase hex digits of this id, without allocating.
+    fn hex_digits(&self) -> HexDigits {
+        const DIGITS: &[u8; 16] = b"0123456789abcdef";
+        let mut buf = [0u8; MAX_OID_LEN * 2];
+        for (pair, &byte) in buf.as_chunks_mut::<2>().0.iter_mut().zip(self.as_bytes()) {
+            *pair = [
+                DIGITS[usize::from(byte >> 4)],
+                DIGITS[usize::from(byte & 0x0f)],
+            ];
+        }
+        HexDigits {
+            buf,
+            len: usize::from(self.len) * 2,
+        }
     }
 
     /// The two-character directory prefix used by the loose object store.
@@ -418,7 +434,19 @@ impl std::hash::Hash for ObjectId {
 
 impl fmt::Display for ObjectId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.to_hex())
+        f.write_str(self.hex_digits().as_str())
+    }
+}
+
+/// Stack buffer holding an [`ObjectId`]'s hex digits.
+struct HexDigits {
+    buf: [u8; MAX_OID_LEN * 2],
+    len: usize,
+}
+
+impl HexDigits {
+    fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.buf[..self.len]).unwrap_or_default()
     }
 }
 
@@ -862,16 +890,6 @@ impl Object {
             data: self.data.as_slice(),
         }
     }
-
-    /// Serialize to the canonical Git object format: `"<kind> <size>\0<data>"`.
-    #[must_use]
-    pub fn to_store_bytes(&self) -> Vec<u8> {
-        let header = format!("{} {}\0", self.kind, self.data.len());
-        let mut out = Vec::with_capacity(header.len() + self.data.len());
-        out.extend_from_slice(header.as_bytes());
-        out.extend_from_slice(&self.data);
-        out
-    }
 }
 
 /// A single entry in a Git tree object.
@@ -1283,13 +1301,10 @@ pub fn commit_subject_pretty(message: &str) -> String {
 ///
 /// Returns [`Error::CorruptObject`] when the commit headers are malformed.
 pub fn read_commit_subject_pretty(data: &[u8]) -> Result<String> {
-    let message_start = data
-        .windows(2)
-        .position(|w| w == b"\n\n")
-        .map(|p| p + 2)
-        .ok_or_else(|| {
-            Error::CorruptObject("commit missing blank line before message".to_owned())
-        })?;
+    let message_start = data.windows(2).position(|w| w == b"\n\n").map(|p| p + 2);
+    let Some(message_start) = message_start else {
+        return Ok(String::new());
+    };
     let body = std::str::from_utf8(data.get(message_start..).unwrap_or_default()).unwrap_or("");
     Ok(commit_subject_pretty(body))
 }
@@ -1336,9 +1351,7 @@ pub fn read_commit_subject_line(data: &[u8]) -> Result<String> {
         }
         pos = after_nl;
     }
-    Err(Error::CorruptObject(
-        "commit missing blank line before message".to_owned(),
-    ))
+    Ok("(no subject)".to_owned())
 }
 
 pub(crate) fn parse_oid_field(value: &[u8]) -> Result<ObjectId> {
@@ -1468,6 +1481,8 @@ pub struct TagData {
 /// # Errors
 ///
 /// Returns [`Error::CorruptObject`] if required headers are missing or malformed.
+///
+/// When the header block ends at EOF without a blank line, the message is empty (Git accepts this).
 pub fn parse_tag(data: &[u8]) -> Result<TagData> {
     use super::extra_headers::next_header_block;
 
@@ -1584,9 +1599,16 @@ pub fn parse_tag(data: &[u8]) -> Result<TagData> {
         pos = after_nl;
     }
 
-    Err(Error::CorruptObject(
-        "tag missing blank line before message".to_owned(),
-    ))
+    Ok(TagData {
+        object: object
+            .ok_or_else(|| Error::CorruptObject("tag missing object header".to_owned()))?,
+        object_type: object_type
+            .ok_or_else(|| Error::CorruptObject("tag missing type header".to_owned()))?,
+        tag: tag_name.ok_or_else(|| Error::CorruptObject("tag missing tag header".to_owned()))?,
+        tagger,
+        extra_headers,
+        message: String::new(),
+    })
 }
 
 /// Serialize a [`TagData`] into the raw bytes suitable for storage as a tag object.
@@ -1933,6 +1955,21 @@ mod commit_parse_tests {
         let mut non_ascii = sha1.as_bytes().to_vec();
         non_ascii[3] = 0xb0;
         assert!(ObjectId::from_hex_ascii(&non_ascii).is_err());
+    }
+
+    #[test]
+    fn hex_and_display_cover_every_byte_for_both_lengths() {
+        let all: Vec<u8> = (0..=255).collect();
+        for width in [20, 32] {
+            for chunk in all.chunks(width).filter(|c| c.len() == width) {
+                let oid = ObjectId::from_bytes(chunk).unwrap();
+                let expected: String = chunk.iter().map(|b| format!("{b:02x}")).collect();
+                assert_eq!(oid.to_hex(), expected);
+                assert_eq!(oid.to_string(), expected);
+                assert_eq!(format!("{oid:?}"), format!("ObjectId({expected})"));
+                assert_eq!(ObjectId::from_hex(&expected).unwrap(), oid);
+            }
+        }
     }
 
     #[test]

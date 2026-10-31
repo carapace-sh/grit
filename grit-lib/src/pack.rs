@@ -133,8 +133,8 @@ pub(crate) mod pack_cache {
         static PACK_DIR_LISTING_TRUSTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// [`PackStore::cache_epoch`] last seen on this thread (cross-thread invalidation).
         static THREAD_WARM_EPOCH: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-        /// [`PackStore`] address last warmed on this thread (distinct stores can share epoch 0).
-        static THREAD_WARM_STORE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        /// [`PackStore::id`] last warmed on this thread (distinct stores can share an epoch).
+        static THREAD_WARM_STORE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
         static PACK_MONOTONIC_CURSOR: std::cell::RefCell<Option<(PathBuf, usize)>> =
             const { std::cell::RefCell::new(None) };
         static SINGLE_READER_MEMO: std::cell::RefCell<Option<SingleReaderMemo>> =
@@ -218,8 +218,8 @@ pub(crate) mod pack_cache {
         })
     }
 
-    fn store_thread_local_key(store: &crate::pack_store::PackStore) -> usize {
-        store as *const crate::pack_store::PackStore as usize
+    fn store_thread_local_key(store: &crate::pack_store::PackStore) -> u64 {
+        store.id()
     }
 
     pub(crate) fn clear_thread_local_dir_indexes() {
@@ -385,12 +385,13 @@ pub(crate) mod pack_cache {
         let objects_dir = store.objects_dir();
         let pack_dir = objects_dir.join("pack");
         store.with_catalog_read(|g| {
-            if let Some(cached) = g.by_dir.get(&pack_dir) {
-                PACK_DIR_INDEXES.with(|cell| {
-                    *cell.borrow_mut() =
-                        Some((pack_dir.clone(), cached.dir_mtime, cached.indexes.clone()));
-                });
-            }
+            // Replace the listing even when this store has none yet: one left by another store
+            // on this thread may predate a repack, and the listing is trusted from here on.
+            let listing = g
+                .by_dir
+                .get(&pack_dir)
+                .map(|cached| (pack_dir.clone(), cached.dir_mtime, cached.indexes.clone()));
+            PACK_DIR_INDEXES.with(|cell| *cell.borrow_mut() = listing);
             for (path, entry) in &g.by_pack {
                 remember_pack_bytes(path, &entry.bytes);
             }
@@ -468,19 +469,24 @@ pub(crate) mod pack_cache {
         })
     }
 
+    /// The pack that served the last lookup in `objects_dir` ([`remember_pack_hit`]), when
+    /// the active pack store reads that directory.
+    pub(crate) fn hinted_pack_index(objects_dir: &Path) -> Option<Arc<PackIndex>> {
+        if !crate::pack_store::PackStore::read_context_matches_objects_dir(objects_dir) {
+            return None;
+        }
+        PACK_HIT_INDEX.with(|cell| {
+            cell.borrow()
+                .as_ref()
+                .and_then(|(dir, idx)| (dir == objects_dir).then(|| Arc::clone(idx)))
+        })
+    }
+
     pub(crate) fn try_read_from_hinted_pack(
         objects_dir: &Path,
         oid: &crate::objects::ObjectId,
     ) -> Result<Option<crate::objects::Object>> {
-        if !crate::pack_store::PackStore::read_context_matches_objects_dir(objects_dir) {
-            return Ok(None);
-        }
-        let idx = PACK_HIT_INDEX.with(|cell| {
-            cell.borrow()
-                .as_ref()
-                .and_then(|(dir, idx)| (dir == objects_dir).then(|| Arc::clone(idx)))
-        });
-        let Some(idx) = idx else {
+        let Some(idx) = hinted_pack_index(objects_dir) else {
             return Ok(None);
         };
         let Some(offset) = find_offset_in_pack_read_context(objects_dir, &idx, oid)? else {
@@ -499,15 +505,7 @@ pub(crate) mod pack_cache {
         populate_delta_lru: bool,
         buf: &mut Vec<u8>,
     ) -> Result<Option<crate::objects::ObjectKind>> {
-        if !crate::pack_store::PackStore::read_context_matches_objects_dir(objects_dir) {
-            return Ok(None);
-        }
-        let idx = PACK_HIT_INDEX.with(|cell| {
-            cell.borrow()
-                .as_ref()
-                .and_then(|(dir, idx)| (dir == objects_dir).then(|| Arc::clone(idx)))
-        });
-        let Some(idx) = idx else {
+        let Some(idx) = hinted_pack_index(objects_dir) else {
             return Ok(None);
         };
         let Some(offset) = find_offset_in_pack_read_context(objects_dir, &idx, oid)? else {
@@ -524,15 +522,7 @@ pub(crate) mod pack_cache {
         objects_dir: &Path,
         oid: &crate::objects::ObjectId,
     ) -> Result<Option<crate::objects::ObjectInfo>> {
-        if !crate::pack_store::PackStore::read_context_matches_objects_dir(objects_dir) {
-            return Ok(None);
-        }
-        let idx = PACK_HIT_INDEX.with(|cell| {
-            cell.borrow()
-                .as_ref()
-                .and_then(|(dir, idx)| (dir == objects_dir).then(|| Arc::clone(idx)))
-        });
-        let Some(idx) = idx else {
+        let Some(idx) = hinted_pack_index(objects_dir) else {
             return Ok(None);
         };
         let Some(offset) = idx.find_offset(oid)? else {
@@ -2149,13 +2139,65 @@ pub fn max_verify_pack_delta_depth(records: &[VerifyObjectRecord]) -> u64 {
     records.iter().filter_map(|r| r.depth).max().unwrap_or(0)
 }
 
-/// Break only delta chains longer than `max_depth` edges in a target→base map.
+/// Targets whose delta edge must be dropped so a target→base graph has no cycle.
 ///
-/// Each entry maps a delta object to its chosen in-pack base. Chains already within
-/// `max_depth` keep their original bases unchanged. Longer chains are broken on Git's
-/// `(depth + 1)` modulo rule by removing only the delta edges at cut points; links
-/// inside each resulting segment stay as originally chosen (matching `break_delta_chains`).
+/// `base_of` returns the base of each object stored as a delta. Chains are walked from
+/// `starts` only, so a cycle is found when one of its objects is a start; passing every
+/// delta target finds them all. A cycle (`a` against `b`, `b` against `a`, or longer)
+/// can never be resolved by a reader, yet appears when deltas are reused from several
+/// packs that stored the same objects in opposite directions. For every cycle the
+/// smallest object id is returned, so the choice does not depend on `starts` order;
+/// reverting those targets to whole objects leaves every chain ending in a whole object.
+pub(crate) fn delta_cycle_breaks(
+    starts: impl IntoIterator<Item = ObjectId>,
+    base_of: impl Fn(&ObjectId) -> Option<ObjectId>,
+) -> Vec<ObjectId> {
+    // `Some(i)`: at position `i` of the walk in progress; `None`: already settled.
+    let mut seen: crate::objects::OidHashMap<Option<usize>> = crate::objects::oid_hash_map();
+    let mut path: Vec<ObjectId> = Vec::new();
+    let mut breaks = Vec::new();
+    for start in starts {
+        let mut cur = Some(start);
+        while let Some(oid) = cur {
+            match seen.get(&oid) {
+                Some(None) => break,
+                Some(Some(pos)) => {
+                    breaks.extend(path[*pos..].iter().min().copied());
+                    break;
+                }
+                None => {
+                    seen.insert(oid, Some(path.len()));
+                    path.push(oid);
+                    cur = base_of(&oid);
+                }
+            }
+        }
+        for oid in path.drain(..) {
+            seen.insert(oid, None);
+        }
+    }
+    breaks
+}
+
+/// Break delta cycles, then delta chains longer than `max_depth` edges, in a
+/// target→base map.
+///
+/// Each entry maps a delta object to its chosen in-pack base. A cycle cannot be
+/// resolved at any depth, so the smallest object id of each one loses its edge first.
+/// Chains already within `max_depth` keep their original bases unchanged. Longer
+/// chains are broken on Git's `(depth + 1)` modulo rule by removing only the delta
+/// edges at cut points; links inside each resulting segment stay as originally chosen
+/// (matching `break_delta_chains`).
 pub fn apply_delta_depth_limit(map: &mut HashMap<ObjectId, ObjectId>, max_depth: usize) {
+    for target in delta_cycle_breaks(map.keys().copied(), |oid| map.get(oid).copied()) {
+        map.remove(&target);
+    }
+    cap_delta_chain_depth(map, max_depth);
+}
+
+/// The chain-length half of [`apply_delta_depth_limit`], for a map already known to
+/// be acyclic (a cycle is left as it is).
+pub(crate) fn cap_delta_chain_depth(map: &mut HashMap<ObjectId, ObjectId>, max_depth: usize) {
     let keys: Vec<ObjectId> = map.keys().copied().collect();
     let value_set: HashSet<ObjectId> = map.values().copied().collect();
     let mut tips: Vec<ObjectId> = keys
@@ -3536,6 +3578,86 @@ pub fn read_object_info_from_pack_at_offset(idx: &PackIndex, offset: u64) -> Res
     unreachable!("at most two read attempts")
 }
 
+/// Compressed bytes [`read_packed_commit_header_block_into`] fetches with one positioned read.
+const COMMIT_HEADER_BLOCK_WINDOW: usize = 4096;
+
+/// Most commit bytes [`read_packed_commit_header_block_into`] inflates looking for the blank
+/// line that ends the headers. Covers ordinary headers; long signatures take the whole read.
+const COMMIT_HEADER_BLOCK_MAX: usize = 1024;
+
+/// Inflate the header block of commit `oid`, stored whole in a local pack, into `out`.
+///
+/// On success `out` holds the headers through the blank line that ends them, so it parses as
+/// the same commit with an empty message. The entry is fetched with one positioned read rather
+/// than through the pack mapping: walks seeded from every ref read hundreds of scattered tip
+/// commits, and each mapped read would leave a fault-around window of the pack resident.
+///
+/// Returns `false`, leaving `out` unspecified, when no local pack index lists `oid`, the entry
+/// is not a whole commit, the header block exceeds [`COMMIT_HEADER_BLOCK_MAX`], or the
+/// positioned read or the inflate fails. Callers then read the whole object, which reports
+/// any corruption.
+///
+/// # Errors
+///
+/// Propagates pack directory listing and pack index lookup errors.
+pub(crate) fn read_packed_commit_header_block_into(
+    objects_dir: &Path,
+    oid: &ObjectId,
+    out: &mut Vec<u8>,
+) -> Result<bool> {
+    if crate::pack_store::PackStore::read_context_matches_objects_dir(objects_dir) {
+        pack_cache::sync_thread_local_with_store(&crate::pack_store::PackStore::active_for_reads());
+    }
+    if let Some(idx) = pack_cache::hinted_pack_index(objects_dir) {
+        if let Some(offset) = idx.find_offset(oid)? {
+            return Ok(read_commit_header_block_at(&idx, offset, out));
+        }
+    }
+    for idx in pack_indexes_for_lookup(objects_dir, PackLookupOptions::ALL_LOCAL_PACKS)? {
+        if let Some(offset) = idx.find_offset(oid)? {
+            pack_cache::remember_pack_hit(objects_dir, &idx);
+            return Ok(read_commit_header_block_at(&idx, offset, out));
+        }
+    }
+    Ok(false)
+}
+
+fn read_commit_header_block_at(idx: &PackIndex, offset: u64, out: &mut Vec<u8>) -> bool {
+    let Ok(pack_bytes) = read_pack_bytes_cached(&idx.pack_path) else {
+        return false;
+    };
+    if !pack_cache::pack_object_count_validated(&idx.pack_path) {
+        if validate_pack_index_object_count(&pack_bytes, idx).is_err() {
+            return false;
+        }
+        pack_cache::mark_pack_object_count_validated(&idx.pack_path);
+    }
+    let mut window = [0u8; COMMIT_HEADER_BLOCK_WINDOW];
+    let Some(len) = pack_bytes.read_sparse(offset, &mut window) else {
+        return false;
+    };
+    let window = &window[..len];
+    let mut pos = 0usize;
+    let Ok((PackedType::Commit, size)) = parse_pack_object_header(window, &mut pos) else {
+        return false;
+    };
+    let want = usize::try_from(size).map_or(COMMIT_HEADER_BLOCK_MAX, |size| {
+        size.min(COMMIT_HEADER_BLOCK_MAX)
+    });
+    let inflated = WHOLE_OBJECT_ZLIB.with(|slot| {
+        slot.borrow_mut()
+            .decompress_prefix_into(&window[pos..], want, out)
+    });
+    if inflated.is_err() || out.len() != want {
+        return false;
+    }
+    let Some(blank) = out.windows(2).position(|pair| pair == b"\n\n") else {
+        return false;
+    };
+    out.truncate(blank + 2);
+    true
+}
+
 fn read_object_info_from_pack_at_offset_with_bytes(
     idx: &PackIndex,
     offset: u64,
@@ -4896,6 +5018,12 @@ pub(crate) type OnDiskReuseZlibEntry = (ObjectId, u64, Arc<PackData>, usize, usi
 /// a stored chain is itself such a target or was accepted when its target was parsed. Entries
 /// are CRC-checked when the index provides CRC32.
 ///
+/// The returned edges never form a cycle. Each pack's deltas are acyclic, but two packs
+/// may store the same objects as deltas in opposite directions (a repository filled by
+/// separate pushes, whose later thin pack was completed with bases the earlier one
+/// stores as deltas). Such a cycle loses the edge of its smallest object id, which
+/// is then sent whole, as [`delta_cycle_breaks`] describes.
+///
 /// # Errors
 ///
 /// Returns [`Error::CorruptObject`] when a pack stream is malformed.
@@ -4925,6 +5053,17 @@ pub(crate) fn collect_packed_delta_reuse_for_send(
             );
         }
     }
+    // Edges whose target and base were both taken from one pack are that pack's own,
+    // acyclic deltas, so every cycle passes through an edge that crosses packs.
+    let crosses_packs = |(_, (base, _, pack, ..)): &(&ObjectId, &OnDiskReuseZlibEntry)| {
+        found
+            .get(base)
+            .is_some_and(|(_, _, base_pack, ..)| !Arc::ptr_eq(base_pack, pack))
+    };
+    let starts = found.iter().filter(crosses_packs).map(|(t, _)| *t);
+    for target in delta_cycle_breaks(starts, |oid| found.get(oid).map(|e| e.0)) {
+        found.remove(&target);
+    }
     Ok(found)
 }
 
@@ -4941,15 +5080,10 @@ pub fn packed_ref_delta_reuse_slice(
     oid: &ObjectId,
     packed_set: &HashSet<ObjectId>,
 ) -> Result<Option<(ObjectId, Vec<u8>)>> {
-    let mut indexes = read_local_pack_indexes_cached(objects_dir)?;
-    sort_pack_indexes_oldest_first(&mut indexes);
-    for idx in indexes {
+    for (idx, entry_offset) in packs_holding(objects_dir, oid, PackPreference::Oldest)? {
         if idx.hash_bytes() != 20 {
             continue;
         }
-        let Some(entry_offset) = idx.find_offset(oid)? else {
-            continue;
-        };
         let pack_bytes = read_pack_bytes_cached(&idx.pack_path)?;
         let Some((base, delta)) =
             parse_in_pack_delta_reuse_candidate(&idx, &pack_bytes, entry_offset, packed_set)?
@@ -4965,41 +5099,64 @@ pub fn packed_ref_delta_reuse_slice(
 
 /// Prefer older packs when the same OID exists as a full object in a fresh repack and as a delta
 /// in an earlier thin pack (t5316).
+///
+/// Each pack's mtime is read once per call (not once per comparison).
 pub(crate) fn sort_pack_indexes_oldest_first(indexes: &mut [Arc<PackIndex>]) {
-    indexes.sort_by(|a, b| {
-        let ta = fs::metadata(&a.pack_path)
-            .and_then(|m| m.modified())
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-        let tb = fs::metadata(&b.pack_path)
-            .and_then(|m| m.modified())
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-        ta.cmp(&tb).then_with(|| a.pack_path.cmp(&b.pack_path))
-    });
+    if indexes.len() < 2 {
+        return;
+    }
+    indexes.sort_by_cached_key(|idx| (pack_mtime(idx), idx.pack_path.clone()));
 }
 
-fn sort_pack_indexes_newest_first(indexes: &mut [Arc<PackIndex>]) {
-    indexes.sort_by(|a, b| {
-        let ta = fs::metadata(&a.pack_path)
-            .and_then(|m| m.modified())
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-        let tb = fs::metadata(&b.pack_path)
-            .and_then(|m| m.modified())
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-        tb.cmp(&ta).then_with(|| b.pack_path.cmp(&a.pack_path))
-    });
+fn pack_mtime(idx: &PackIndex) -> std::time::SystemTime {
+    fs::metadata(&idx.pack_path)
+        .and_then(|m| m.modified())
+        .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+}
+
+/// Which pack wins when one object is stored in several.
+#[derive(Clone, Copy)]
+enum PackPreference {
+    /// Oldest pack first, as [`sort_pack_indexes_oldest_first`].
+    Oldest,
+    /// Newest pack first (ties: path descending).
+    Newest,
+}
+
+/// The local packs whose index lists `oid`, with its offset there, preferred pack first.
+///
+/// Per-object lookups call this instead of sorting every pack: the order only matters
+/// among packs that hold the object, which is almost always one, so the common case
+/// reads no pack mtimes at all.
+fn packs_holding(
+    objects_dir: &Path,
+    oid: &ObjectId,
+    preference: PackPreference,
+) -> Result<Vec<(Arc<PackIndex>, u64)>> {
+    let mut holding = Vec::new();
+    for idx in read_local_pack_indexes_cached(objects_dir)? {
+        if let Some(offset) = idx.find_offset(oid)? {
+            holding.push((idx, offset));
+        }
+    }
+    if holding.len() > 1 {
+        let key = |idx: &PackIndex| (pack_mtime(idx), idx.pack_path.clone());
+        match preference {
+            PackPreference::Oldest => holding.sort_by_cached_key(|(idx, _)| key(idx)),
+            PackPreference::Newest => {
+                holding.sort_by_cached_key(|(idx, _)| std::cmp::Reverse(key(idx)));
+            }
+        }
+    }
+    Ok(holding)
 }
 
 /// `packed_delta_base_oid` function.
 pub fn packed_delta_base_oid(objects_dir: &Path, oid: &ObjectId) -> Result<Option<ObjectId>> {
-    let mut indexes = read_local_pack_indexes_cached(objects_dir)?;
-    sort_pack_indexes_newest_first(&mut indexes);
-    for idx in &indexes {
+    for (idx, entry_offset) in packs_holding(objects_dir, oid, PackPreference::Newest)? {
         if idx.hash_bytes() != 20 {
             continue;
         }
-        let Some(entry_offset) = idx.find_offset(oid)? else {
-            continue;
-        };
         let pack_bytes = read_pack_bytes_cached(&idx.pack_path)?;
         let mut p = entry_offset as usize;
         let (packed_type, _) = parse_pack_object_header(&pack_bytes, &mut p)?;
@@ -5135,7 +5292,7 @@ pub(crate) fn locate_packed_whole_object(
 /// A large entry is hashed with a bounded window of the pack mapping resident (see
 /// [`VERIFY_RESIDENT_PACK_BYTES`]), so checking a big blob before streaming it does not pull
 /// its whole compressed size into the resident set.
-fn packed_entry_matches_index_crc(
+pub(crate) fn packed_entry_matches_index_crc(
     idx: &PackIndex,
     pack: &PackData,
     entry_offset: u64,
@@ -5188,12 +5345,7 @@ pub(crate) fn packed_full_object_range(
     objects_dir: &Path,
     oid: &ObjectId,
 ) -> Result<Option<(Arc<PackData>, usize, usize)>> {
-    let mut indexes = read_local_pack_indexes_cached(objects_dir)?;
-    sort_pack_indexes_newest_first(&mut indexes);
-    for idx in &indexes {
-        let Some(entry_offset) = idx.find_offset(oid)? else {
-            continue;
-        };
+    for (idx, entry_offset) in packs_holding(objects_dir, oid, PackPreference::Newest)? {
         let pack_bytes = read_pack_bytes_cached(&idx.pack_path)?;
         let start = entry_offset as usize;
         let mut p = start;
@@ -5204,35 +5356,17 @@ pub(crate) fn packed_full_object_range(
             // The same OID may be a full object in another pack; keep scanning.
             continue;
         }
-        let Some(end) = pack_entry_raw_end(idx, &pack_bytes, entry_offset)? else {
+        let Some(end) = pack_entry_raw_end(&idx, &pack_bytes, entry_offset)? else {
             continue;
         };
         if end <= start {
             continue;
         }
-        let slice = &pack_bytes[start..end];
         // Git `check_pack_crc`: verbatim reuse copies bytes unparsed, so guard with the pack
-        // index's CRC32. A corrupt copy is skipped, letting a redundant pack or the normal
-        // (validating) read path serve the object instead (t5303).
-        let recorded_crc = idx.crc32_for_pack_offset(entry_offset)?;
-        match recorded_crc {
-            Some(crc) if crc32fast::hash(slice) != crc => continue,
-            // v1 indexes carry no CRC; verify by inflating and re-hashing the content.
-            None if read_object_from_pack(idx, oid)
-                .map(|obj| {
-                    HashAlgo::from_len(idx.hash_bytes())
-                        .map(|algo| {
-                            hash_object(algo, obj.kind, &obj.data)
-                                .map(|h| h != *oid)
-                                .unwrap_or(true)
-                        })
-                        .unwrap_or(true)
-                })
-                .unwrap_or(true) =>
-            {
-                continue;
-            }
-            _ => {}
+        // index's CRC32 when v2 records one. v1 indexes rely on the zlib trailer; inflating
+        // here only to verify the oid would retain the whole payload in anon RSS (issue #2287).
+        if !packed_entry_matches_index_crc(&idx, &pack_bytes, entry_offset)? {
+            continue;
         }
         return Ok(Some((pack_bytes, start, end)));
     }
@@ -6918,6 +7052,41 @@ mod tests {
         let got = odb_b.read(&oid_new).expect("b reprepares after miss");
         assert_eq!(got.data.as_slice(), b"after");
     }
+
+    #[test]
+    fn fresh_store_does_not_trust_a_listing_left_by_another_store() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = dir.path();
+        git(dir, &["init", "-q"]);
+        git(dir, &["commit", "-q", "--allow-empty", "-m", "a"]);
+        git(dir, &["repack", "-adq"]);
+        let objects = dir.join(".git/objects");
+        let pack_names = |indexes: Vec<Arc<PackIndex>>| -> Vec<PathBuf> {
+            indexes
+                .into_iter()
+                .map(|idx| idx.pack_path.clone())
+                .collect()
+        };
+
+        let first = Arc::new(crate::pack_store::PackStore::new(objects.clone()));
+        let before = crate::pack_store::PackStore::with_context(first, || {
+            read_local_pack_indexes_cached(&objects)
+        })
+        .expect("first listing");
+
+        // Another process replaces the pack.
+        git(dir, &["commit", "-q", "--allow-empty", "-m", "b"]);
+        git(dir, &["repack", "-adq"]);
+
+        let second = Arc::new(crate::pack_store::PackStore::new(objects.clone()));
+        let after = crate::pack_store::PackStore::with_context(second, || {
+            read_local_pack_indexes_cached(&objects)
+        })
+        .expect("second listing");
+        let (before, after) = (pack_names(before), pack_names(after));
+        assert_ne!(before, after);
+        assert!(after.iter().all(|p| p.is_file()), "{after:?}");
+    }
 }
 #[cfg(test)]
 mod cached_lookup_tests {
@@ -6948,6 +7117,109 @@ mod cached_lookup_tests {
 
     fn repack_all(dir: &Path) {
         git(dir, &["repack", "-a", "-d"]);
+    }
+
+    fn git_stdout(dir: &Path, args: &[&str], stdin: Option<&str>) -> String {
+        use std::io::Write;
+        let mut child = Command::new("git") // hygiene: git fixture comparison in cfg(test) module
+            .current_dir(dir)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn git");
+        if let Some(input) = stdin {
+            child
+                .stdin
+                .as_mut()
+                .expect("stdin")
+                .write_all(input.as_bytes())
+                .expect("write stdin");
+        }
+        let out = child.wait_with_output().expect("git output");
+        assert!(out.status.success(), "git {args:?}");
+        String::from_utf8(out.stdout)
+            .expect("utf-8")
+            .trim()
+            .to_owned()
+    }
+
+    fn oid_of(dir: &Path, rev: &str) -> ObjectId {
+        ObjectId::from_hex(&git_stdout(dir, &["rev-parse", rev], None)).expect("oid")
+    }
+
+    #[cfg_attr(
+        not(feature = "full-tests"),
+        ignore = "starts system git or is heavy; run with --features full-tests"
+    )]
+    #[test]
+    fn packed_commit_header_block_parses_like_the_whole_commit() {
+        let _guard = pack_cache_test_guard();
+        clear_pack_cache();
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        git(root, &["init", "-q"]);
+        fs::write(root.join("f"), "one\n").unwrap();
+        git(root, &["add", "f"]);
+        git(root, &["commit", "-qm", "first"]);
+        fs::write(root.join("f"), "two\n").unwrap();
+        let long_message = format!("second\n\n{}", "a long body line\n".repeat(200));
+        git(root, &["commit", "-qam", &long_message]);
+        git(root, &["tag", "-a", "-m", "annotated", "v1"]);
+        let signature: String = (0..60)
+            .map(|i| format!(" signature line {i:03} with some padding text\n"))
+            .collect();
+        let signed_body = format!(
+            "tree {}\nparent {}\nauthor t <t@example.com> 1 +0000\n\
+             committer t <t@example.com> 2 +0000\ngpgsig -----BEGIN-----\n{signature} \
+             -----END-----\n\nsigned\n",
+            oid_of(root, "HEAD^{tree}"),
+            oid_of(root, "HEAD"),
+        );
+        let signed = git_stdout(
+            root,
+            &["hash-object", "-t", "commit", "-w", "--stdin"],
+            Some(&signed_body),
+        );
+        git(root, &["update-ref", "refs/heads/signed", &signed]);
+        git(root, &["repack", "-a", "-d", "--window=0"]);
+        fs::write(root.join("f"), "three\n").unwrap();
+        git(root, &["commit", "-qam", "second pack"]);
+        git(root, &["repack", "-d", "--window=0"]);
+        fs::write(root.join("f"), "four\n").unwrap();
+        git(root, &["commit", "-qam", "loose"]);
+
+        let objects = root.join(".git/objects");
+        let mut buf = Vec::new();
+        for rev in ["HEAD~3", "HEAD~2", "HEAD~1"] {
+            let oid = oid_of(root, rev);
+            assert!(
+                read_packed_commit_header_block_into(&objects, &oid, &mut buf).unwrap(),
+                "{rev} is a whole packed commit"
+            );
+            assert!(buf.ends_with(b"\n\n"), "{rev} ends at the blank line");
+            let whole = git_stdout(root, &["cat-file", "commit", rev], None);
+            let whole = crate::objects::CommitRef::parse(whole.as_bytes()).unwrap();
+            let header = crate::objects::CommitRef::parse(&buf).unwrap();
+            assert_eq!(header.tree(), whole.tree(), "{rev}");
+            assert_eq!(header.parents(), whole.parents(), "{rev}");
+            assert_eq!(header.committer_raw(), whole.committer_raw(), "{rev}");
+            assert!(header.message_bytes().is_empty(), "{rev}");
+        }
+        let signed = ObjectId::from_hex(&signed).unwrap();
+        for (oid, why) in [
+            (signed, "headers longer than the inflate budget"),
+            (oid_of(root, "v1"), "an annotated tag"),
+            (oid_of(root, "HEAD~1^{tree}"), "a packed tree"),
+            (oid_of(root, "HEAD"), "a loose commit"),
+        ] {
+            assert!(
+                !read_packed_commit_header_block_into(&objects, &oid, &mut buf).unwrap(),
+                "{why}"
+            );
+        }
     }
 
     fn init_repo_with_pack(dir: &Path) -> ObjectId {
@@ -7354,6 +7626,51 @@ mod cached_lookup_tests {
             preserved > 40,
             "non-cut edges should keep original bases (preserved {preserved})"
         );
+    }
+
+    #[test]
+    fn delta_cycle_breaks_drops_smallest_oid_of_each_cycle_only() {
+        let o = |n: u8| test_oid(n);
+        // 1 <-> 2 is a 2-cycle; 5 -> 4 -> 3 -> 5 a 3-cycle with 6 hanging off it;
+        // 8 -> 7 is a plain chain.
+        let map = HashMap::from([
+            (o(1), o(2)),
+            (o(2), o(1)),
+            (o(3), o(5)),
+            (o(4), o(3)),
+            (o(5), o(4)),
+            (o(6), o(4)),
+            (o(8), o(7)),
+        ]);
+        let mut keys: Vec<ObjectId> = map.keys().copied().collect();
+        for order in [false, true] {
+            keys.sort();
+            if order {
+                keys.reverse();
+            }
+            let mut breaks = delta_cycle_breaks(keys.iter().copied(), |oid| map.get(oid).copied());
+            breaks.sort();
+            assert_eq!(breaks, vec![o(1), o(3)], "independent of walk order");
+        }
+    }
+
+    #[test]
+    fn delta_cycle_breaks_handles_self_delta_and_acyclic_maps() {
+        let a = test_oid(9);
+        assert_eq!(delta_cycle_breaks([a], |_| Some(a)), vec![a]);
+        let chain: HashMap<ObjectId, ObjectId> =
+            (1..60u8).map(|i| (test_oid(i), test_oid(i - 1))).collect();
+        assert!(delta_cycle_breaks(chain.keys().copied(), |o| chain.get(o).copied()).is_empty());
+    }
+
+    #[test]
+    fn apply_delta_depth_limit_breaks_cycles_shorter_than_depth() {
+        let (a, b, c, d) = (test_oid(1), test_oid(2), test_oid(3), test_oid(4));
+        // a <-> b, plus c -> b and d -> c hanging off the cycle.
+        let mut map = HashMap::from([(a, b), (b, a), (c, b), (d, c)]);
+        apply_delta_depth_limit(&mut map, 50);
+        assert_eq!(map, HashMap::from([(b, a), (c, b), (d, c)]));
+        assert_eq!(max_delta_map_chain_edges(&map), 3);
     }
 
     #[test]

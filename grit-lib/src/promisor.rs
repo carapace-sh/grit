@@ -146,6 +146,65 @@ pub fn promisor_expanded_object_ids(repo: &Repository) -> Result<HashSet<ObjectI
     maintenance_promise_boundary(repo.odb())
 }
 
+/// The objects a promisor remote promises, as Git's `is_promisor_object` defines
+/// them: every object stored in a promisor pack, plus the objects those refer to
+/// directly (a commit's tree and parents, a tag's target, a tree's entries), plus
+/// [`read_promisor_missing_oids`].
+///
+/// Unlike [`maintenance_promise_boundary`] there is no further walk: an object
+/// named only by an object outside the promisor packs is not promised, even when
+/// that object is itself reachable from promisor history. This is the rule for
+/// deciding whether a missing object is acceptable (serving, receiving, fsck).
+/// Only objects already in promisor packs are read; nothing is fetched.
+///
+/// # Errors
+///
+/// Pack index and object read failures, and parse errors in promisor-pack objects.
+pub(crate) fn promisor_referenced_objects(odb: &Odb) -> Result<HashSet<ObjectId>> {
+    let mut members = Vec::new();
+    if odb.uses_files_primary() {
+        odb.primary()?
+            .packed_objects()
+            .for_each_promisor_object(&mut |oid| {
+                members.push(*oid);
+                ControlFlow::Continue(())
+            })?;
+    }
+    let mut set: HashSet<ObjectId> = HashSet::with_capacity(members.len());
+    for oid in members {
+        set.insert(oid);
+        match odb.read_info_without_fetch(&oid) {
+            Ok(info) if info.kind == ObjectKind::Blob => continue,
+            Err(crate::error::Error::ObjectNotFound(_)) => continue,
+            Err(err) => return Err(err),
+            Ok(_) => {}
+        }
+        let Some(obj) = odb.try_read_once(&oid)? else {
+            continue;
+        };
+        match obj.kind {
+            ObjectKind::Commit => {
+                let c = parse_commit(&obj.data)?;
+                set.insert(c.tree);
+                set.extend(c.parents);
+            }
+            ObjectKind::Tag => {
+                set.insert(parse_tag(&obj.data)?.object);
+            }
+            ObjectKind::Tree => {
+                for entry in TreeRefIter::with_oid_len(&obj.data, odb.hash_algo().len()) {
+                    set.insert(entry?.oid);
+                }
+            }
+            ObjectKind::Blob => {}
+        }
+    }
+    if let Some(git_dir) = odb.config_git_dir() {
+        set.extend(read_promisor_missing_oids(git_dir));
+    }
+    Ok(set)
+}
+
 /// Classify promises using only available objects. Never hydrate missing targets while
 /// deciding which objects maintenance may omit from local packs and reachability walks.
 ///
@@ -209,4 +268,124 @@ pub(crate) fn maintenance_promise_boundary(odb: &Odb) -> Result<HashSet<ObjectId
         set.extend(read_promisor_missing_oids(git_dir));
     }
     Ok(set)
+}
+
+/// Blobs some checkout of the repository needs on disk: every regular file and
+/// symlink in each worktree's index, and in the tree of each worktree's `HEAD`.
+///
+/// Maintenance that drops promised blobs from the local object store (offloading
+/// to a large-object promisor, reclaiming space in a partial clone) must keep these,
+/// so a checkout never needs the network to show or restore its own files. Bare
+/// worktrees contribute nothing. Objects that cannot be read (already missing, or
+/// beyond a shallow boundary) are skipped; nothing is fetched.
+///
+/// # Errors
+///
+/// Worktree listing, index parse and object read failures.
+pub(crate) fn blobs_needed_by_checkouts(repo: &Repository) -> Result<crate::objects::OidHashSet> {
+    use crate::index::MODE_GITLINK;
+    use crate::state::HeadState;
+
+    let is_file_mode = |mode: u32| matches!(mode & 0o170000, 0o100000 | 0o120000);
+    let odb = repo.odb();
+    let mut blobs = crate::objects::oid_hash_set();
+    let mut trees_seen = crate::objects::oid_hash_set();
+    for wt in crate::worktree::list_worktrees(repo)? {
+        if wt.is_bare {
+            continue;
+        }
+        let index = if wt.admin_dir == repo.git_dir() {
+            repo.load_index()?
+        } else {
+            crate::index::Index::load(&wt.admin_dir.join("index"))?
+        };
+        blobs.extend(
+            index
+                .entries()
+                .iter()
+                .filter(|e| e.mode != MODE_GITLINK && is_file_mode(e.mode) && !e.oid.is_zero())
+                .map(|e| e.oid),
+        );
+        let head = match wt.head {
+            HeadState::Detached { oid } | HeadState::Branch { oid: Some(oid), .. } => oid,
+            HeadState::Branch { .. } | HeadState::Invalid => continue,
+        };
+        let Some(commit) = odb.try_read_once(&head)? else {
+            continue;
+        };
+        if commit.kind != ObjectKind::Commit {
+            continue;
+        }
+        let mut trees = vec![parse_commit(&commit.data)?.tree];
+        while let Some(tree) = trees.pop() {
+            if !trees_seen.insert(tree) {
+                continue;
+            }
+            let Some(obj) = odb.try_read_once(&tree)? else {
+                continue;
+            };
+            for entry in TreeRefIter::with_oid_len(&obj.data, odb.hash_algo().len()) {
+                let entry = entry?;
+                if entry.mode & 0o170000 == 0o040000 {
+                    trees.push(entry.oid);
+                } else if is_file_mode(entry.mode) {
+                    blobs.insert(entry.oid);
+                }
+            }
+        }
+    }
+    Ok(blobs)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod checkout_blob_tests {
+    use super::*;
+    use crate::porcelain::add::stage_for_commit;
+    use crate::porcelain::commit::{create_commit, CommitRequest};
+    use crate::progress::{NeverCancel, NullProgress};
+    use crate::repo::InitOptions;
+
+    fn commit_all(repo: &Repository, message: &str) {
+        stage_for_commit(repo, &mut NullProgress, &NeverCancel).unwrap();
+        let ident = "T <t@example.com> 1 +0000".to_string();
+        create_commit(
+            repo,
+            &CommitRequest {
+                message: message.into(),
+                author: Some(ident.parse().unwrap()),
+                committer: Some(ident.parse().unwrap()),
+                ..Default::default()
+            },
+            &mut NullProgress,
+            &NeverCancel,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn checkout_blobs_cover_index_and_head_but_not_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path(), &InitOptions::default()).unwrap();
+        let work = repo.work_tree().unwrap().to_path_buf();
+        let blob = |data: &[u8]| repo.odb().hash(ObjectKind::Blob, data).unwrap();
+        std::fs::write(work.join("a"), b"old\n").unwrap();
+        commit_all(&repo, "one");
+        std::fs::write(work.join("a"), b"new\n").unwrap();
+        commit_all(&repo, "two");
+        std::fs::write(work.join("a"), b"staged\n").unwrap();
+        stage_for_commit(&repo, &mut NullProgress, &NeverCancel).unwrap();
+
+        let needed = blobs_needed_by_checkouts(&repo).unwrap();
+        assert!(needed.contains(&blob(b"staged\n")), "index");
+        assert!(needed.contains(&blob(b"new\n")), "HEAD tree");
+        assert!(!needed.contains(&blob(b"old\n")), "history only");
+    }
+
+    #[test]
+    fn bare_repositories_need_no_blobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path(), &InitOptions::new().with_bare(true)).unwrap();
+        assert!(blobs_needed_by_checkouts(&repo).unwrap().is_empty());
+    }
 }

@@ -14,18 +14,18 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use super::{
+    materialize_gitlink_worktree, path_under_wholesale_directory, remove_created_checkout_paths,
+    remove_empty_parent_dirs_batch, remove_uninitialized_gitlink_worktree,
+    restore_checkout_rollback_paths, CheckoutRollbackRestore, LeadingDirCache,
+};
 use crate::diff::{DiffEntry, DiffStatus};
 use crate::error::{Error, Result};
 use crate::index::{Index, MODE_GITLINK};
 use crate::objects::ObjectId;
+use crate::progress::NullProgress;
 use crate::repo::Repository;
 use crate::worktree::{io_with_path, WorktreePathOperation};
-use crate::worktree_rules::WorktreeRules;
-
-use super::{
-    materialize_gitlink_worktree, path_under_wholesale_directory, remove_empty_parent_dirs_batch,
-    remove_uninitialized_gitlink_worktree, write_blob_to_worktree, LeadingDirCache,
-};
 
 static SPOOL_NAME_SEQ: AtomicUsize = AtomicUsize::new(0);
 
@@ -40,6 +40,14 @@ struct SpooledCheckoutDelete {
     rel: String,
     stash: PathBuf,
     kind: SpooledPathKind,
+}
+
+/// A work-tree directory moved aside so a file could be written at the same path (untracked
+/// contents included).
+#[derive(Debug)]
+struct SpooledDirectoryReplace {
+    rel: String,
+    stash: PathBuf,
 }
 
 /// Worktree files removed during checkout, moved into a spool so a later failure can restore them.
@@ -61,6 +69,17 @@ impl CheckoutDeleteSpool {
             entries: Vec::new(),
             keep: false,
         })
+    }
+
+    /// Move the directory at `rel_path` (and everything under it) into the spool.
+    fn spool_directory_tree(&mut self, work_tree: &Path, rel_path: &str) -> Result<PathBuf> {
+        let abs = crate::repo_relpath::worktree_abs(work_tree, rel_path);
+        let stash = self
+            .spool
+            .path()
+            .join(spool_entry_name(&format!("dir/{rel_path}")));
+        move_directory_tree(&abs, &stash).map_err(Error::Io)?;
+        Ok(stash)
     }
 
     /// Move `rel_path` out of the worktree into the spool, or no-op when absent.
@@ -144,10 +163,6 @@ impl PathList {
         self.ends.push(self.bytes.len());
     }
 
-    fn len(&self) -> usize {
-        self.ends.len()
-    }
-
     /// Paths, newest first.
     fn iter_rev(&self) -> impl Iterator<Item = &str> {
         self.ends.iter().enumerate().rev().map(|(i, &end)| {
@@ -181,6 +196,8 @@ pub(crate) struct CheckoutJournal {
     removed_gitlinks: Vec<String>,
     /// Paths never written whose leading directories the checkout may already have created.
     unwritten: Vec<String>,
+    /// Directories removed so a regular file or symlink could be written at the same path.
+    spooled_directories: Vec<SpooledDirectoryReplace>,
     committed: bool,
 }
 
@@ -195,6 +212,7 @@ impl CheckoutJournal {
             removed_dirs: BTreeSet::new(),
             removed_gitlinks: Vec::new(),
             unwritten: Vec::new(),
+            spooled_directories: Vec::new(),
             committed: false,
         })
     }
@@ -256,11 +274,14 @@ impl CheckoutJournal {
     }
 
     /// Before overwriting `rel_path`, keep its current bytes for rollback: spool an existing
-    /// file or symlink, or remember that the path is new.
+    /// file or symlink, move aside an existing directory (including untracked contents), or
+    /// remember that the path is new.
     pub(crate) fn preserve_before_write(&mut self, rel_path: &str) -> Result<()> {
         let abs = crate::repo_relpath::worktree_abs(&self.work_tree, rel_path);
         match fs::symlink_metadata(&abs) {
-            Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => Ok(()),
+            Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {
+                self.spool_directory_at_path(rel_path)
+            }
             Ok(_) => self.spool_remove(rel_path),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 self.record_created(rel_path);
@@ -268,6 +289,20 @@ impl CheckoutJournal {
             }
             Err(e) => io_with_path(rel_path, WorktreePathOperation::Replace, Err(e)),
         }
+    }
+
+    /// Move the directory at `rel_path` into the delete spool so rollback can put it back.
+    fn spool_directory_at_path(&mut self, rel_path: &str) -> Result<()> {
+        let stash = self
+            .spool
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .spool_directory_tree(&self.work_tree, rel_path)?;
+        self.spooled_directories.push(SpooledDirectoryReplace {
+            rel: rel_path.to_owned(),
+            stash,
+        });
+        Ok(())
     }
 
     /// The checkout's index is on disk: keep every change and drop the spool.
@@ -278,6 +313,9 @@ impl CheckoutJournal {
         self.removed_dirs = BTreeSet::new();
         self.removed_gitlinks = Vec::new();
         self.unwritten = Vec::new();
+        for entry in self.spooled_directories.drain(..) {
+            let _ = fs::remove_dir_all(&entry.stash);
+        }
         self.spool
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -317,14 +355,10 @@ impl CheckoutJournal {
     fn rollback(&mut self, repo: &Repository) -> Vec<String> {
         let mut unrestored = Vec::new();
         let created = std::mem::take(&mut self.created);
-        let mut removed = Vec::with_capacity(created.len());
-        for rel in created.iter_rev() {
-            let abs = crate::repo_relpath::worktree_abs(&self.work_tree, rel);
-            match remove_created_path(&abs) {
-                Ok(()) => removed.push(abs),
-                Err(_) => unrestored.push(rel.to_owned()),
-            }
-        }
+        let created_paths: Vec<String> = created.iter_rev().map(str::to_owned).collect();
+        let (mut removed, create_failed) =
+            remove_created_checkout_paths(repo, &self.work_tree, &created_paths);
+        unrestored.extend(create_failed);
         removed.extend(
             self.unwritten
                 .drain(..)
@@ -345,31 +379,104 @@ impl CheckoutJournal {
             spooled
         };
 
+        for entry in self.spooled_directories.drain(..).rev() {
+            if restore_spooled_directory(&self.work_tree, &entry).is_err() {
+                unrestored.push(entry.rel);
+            }
+        }
+
         let replaced = std::mem::take(&mut self.replaced);
         let removed_gitlinks = std::mem::take(&mut self.removed_gitlinks);
         let removed_dirs = std::mem::take(&mut self.removed_dirs);
         if replaced.is_empty() && removed_gitlinks.is_empty() && removed_dirs.is_empty() {
             return unrestored;
         }
-        let mut restore = RestoreFromIndex::new(repo, &self.work_tree);
+
+        let index = repo.load_index().ok();
+        let mut restore_targets: Vec<CheckoutRollbackRestore> = Vec::new();
+        let mut restore_paths = HashSet::new();
+        let mut dir_cache = LeadingDirCache::new();
         for entry in replaced.iter().rev() {
             if spooled.contains(&entry.path) {
                 continue;
             }
-            if !restore.path(&entry.path, Some((entry.oid, entry.mode))) {
-                unrestored.push(entry.path.clone());
+            let (oid, mode) =
+                index_entry_or_fallback(index.as_ref(), &entry.path, entry.oid, entry.mode);
+            if mode == MODE_GITLINK {
+                if materialize_gitlink_worktree(&self.work_tree, &entry.path, &mut dir_cache)
+                    .is_err()
+                {
+                    unrestored.push(entry.path.clone());
+                }
+                continue;
+            }
+            if restore_paths.insert(entry.path.clone()) {
+                restore_targets.push(CheckoutRollbackRestore {
+                    path: entry.path.clone(),
+                    oid,
+                    mode,
+                });
             }
         }
+        if let Some(index) = index.as_ref() {
+            for entry in &index.entries {
+                if entry.stage() != 0
+                    || entry.skip_worktree()
+                    || entry.is_sparse_directory_placeholder()
+                {
+                    continue;
+                }
+                let rel = crate::repo_relpath::storage_string(&entry.path);
+                if !path_under_wholesale_directory(&rel, &removed_dirs) || spooled.contains(&rel) {
+                    continue;
+                }
+                if entry.mode == MODE_GITLINK {
+                    if materialize_gitlink_worktree(&self.work_tree, &rel, &mut dir_cache).is_err()
+                    {
+                        unrestored.push(rel);
+                    }
+                    continue;
+                }
+                if restore_paths.insert(rel.clone()) {
+                    restore_targets.push(CheckoutRollbackRestore {
+                        path: rel,
+                        oid: entry.oid,
+                        mode: entry.mode,
+                    });
+                }
+            }
+        } else if !removed_dirs.is_empty() {
+            unrestored.extend(removed_dirs.iter().cloned());
+        }
         for rel in &removed_gitlinks {
-            if !restore.path(rel, Some((ObjectId::zero(), MODE_GITLINK))) {
+            if materialize_gitlink_worktree(&self.work_tree, rel, &mut dir_cache).is_err() {
                 unrestored.push(rel.clone());
             }
         }
-        if !removed_dirs.is_empty() {
-            unrestored.extend(restore.directories(&removed_dirs, &spooled));
-        }
+
+        let mut progress = NullProgress;
+        unrestored.extend(restore_checkout_rollback_paths(
+            repo,
+            &self.work_tree,
+            &restore_targets,
+            &mut progress,
+        ));
         unrestored
     }
+}
+
+fn index_entry_or_fallback(
+    index: Option<&Index>,
+    rel: &str,
+    fallback_oid: ObjectId,
+    fallback_mode: u32,
+) -> (ObjectId, u32) {
+    let key = crate::repo_relpath::storage_bytes(rel);
+    index
+        .and_then(|index| index.get(&key, 0))
+        .filter(|entry| !entry.skip_worktree())
+        .map(|entry| (entry.oid, entry.mode))
+        .unwrap_or((fallback_oid, fallback_mode))
 }
 
 impl Drop for CheckoutJournal {
@@ -384,116 +491,93 @@ impl Drop for CheckoutJournal {
     }
 }
 
-/// Writes paths back as the on-disk index (the pre-checkout state) records them.
-struct RestoreFromIndex<'a> {
-    repo: &'a Repository,
-    work_tree: &'a Path,
-    index: Option<Index>,
-    rules: Option<WorktreeRules>,
-    dir_cache: LeadingDirCache,
+/// Longest file-name tail kept in a spool entry name, so a kept spool stays recognizable while
+/// the whole name fits one path component (255 bytes on common filesystems).
+const SPOOL_NAME_TAIL_BYTES: usize = 64;
+
+/// A spool file name unique within the spool. The repository path lives on the entry itself;
+/// the name keeps at most a short tail of the file name, never the directories, so deep paths
+/// cannot exceed the component length limit.
+fn spool_entry_name(rel: &str) -> String {
+    let seq = SPOOL_NAME_SEQ.fetch_add(1, Ordering::Relaxed);
+    let file_name = rel.rsplit(['/', '\\']).next().unwrap_or_default();
+    let mut start = file_name.len().saturating_sub(SPOOL_NAME_TAIL_BYTES);
+    while !file_name.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("{}_{seq}_{}", std::process::id(), &file_name[start..])
 }
 
-impl<'a> RestoreFromIndex<'a> {
-    fn new(repo: &'a Repository, work_tree: &'a Path) -> Self {
-        let index = repo.load_index().ok();
-        let rules = index.as_ref().and_then(|index| {
-            let config = repo.config().ok()?;
-            WorktreeRules::from_parts_index_attributes_only(repo, index, config).ok()
-        });
-        Self {
-            repo,
-            work_tree,
-            index,
-            rules,
-            dir_cache: LeadingDirCache::new(),
-        }
+fn move_directory_tree(from: &Path, to: &Path) -> std::io::Result<()> {
+    if let Some(parent) = to.parent() {
+        fs::create_dir_all(parent)?;
     }
-
-    /// Restore `rel` from its stage-0 index entry, else from `fallback` (`oid`, `mode`).
-    /// Returns `false` when the path could not be written.
-    fn path(&mut self, rel: &str, fallback: Option<(ObjectId, u32)>) -> bool {
-        let key = crate::repo_relpath::storage_bytes(rel);
-        let tracked = self
-            .index
-            .as_ref()
-            .and_then(|index| index.get(&key, 0))
-            .filter(|entry| !entry.skip_worktree())
-            .map(|entry| (entry.oid, entry.mode));
-        match tracked.or(fallback) {
-            Some((oid, mode)) => self.write(rel, oid, mode),
-            None => true,
+    match fs::rename(from, to) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::CrossesDevices => {
+            copy_directory_tree(from, to)?;
+            fs::remove_dir_all(from)?;
+            Ok(())
         }
-    }
-
-    /// Restore every stage-0 index entry under `dirs` except `skip`; returns the paths that
-    /// failed (or the directories themselves when the index could not be read).
-    fn directories(&mut self, dirs: &BTreeSet<String>, skip: &HashSet<String>) -> Vec<String> {
-        let Some(index) = self.index.take() else {
-            return dirs.iter().cloned().collect();
-        };
-        let mut failed = Vec::new();
-        for entry in &index.entries {
-            if entry.stage() != 0
-                || entry.skip_worktree()
-                || entry.is_sparse_directory_placeholder()
-            {
-                continue;
-            }
-            let rel = crate::repo_relpath::storage_string(&entry.path);
-            if path_under_wholesale_directory(&rel, dirs)
-                && !skip.contains(&rel)
-                && !self.write(&rel, entry.oid, entry.mode)
-            {
-                failed.push(rel);
-            }
-        }
-        self.index = Some(index);
-        failed
-    }
-
-    fn write(&mut self, rel: &str, oid: ObjectId, mode: u32) -> bool {
-        if mode == MODE_GITLINK {
-            return materialize_gitlink_worktree(self.work_tree, rel, &mut self.dir_cache).is_ok();
-        }
-        let Some(rules) = &self.rules else {
-            return false;
-        };
-        matches!(
-            write_blob_to_worktree(
-                self.repo,
-                rules,
-                self.work_tree,
-                rel,
-                &oid,
-                mode,
-                &mut self.dir_cache
-            ),
-            Ok(Some(_))
-        )
+        Err(err) => Err(err),
     }
 }
 
-/// Remove a path the checkout created: a file, a symlink or an empty gitlink directory.
-fn remove_created_path(abs: &Path) -> std::io::Result<()> {
+fn copy_directory_tree(from: &Path, to: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(to)?;
+    for entry in fs::read_dir(from)? {
+        let entry = entry?;
+        let src = entry.path();
+        let dest = to.join(entry.file_name());
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::symlink;
+                symlink(fs::read_link(&src)?, &dest)?;
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::{symlink_dir, symlink_file};
+                let target = fs::read_link(&src)?;
+                if target.is_dir() {
+                    symlink_dir(&target, &dest)?;
+                } else {
+                    symlink_file(&target, &dest)?;
+                }
+            }
+        } else if file_type.is_dir() {
+            copy_directory_tree(&src, &dest)?;
+        } else {
+            fs::copy(&src, &dest)?;
+        }
+    }
+    Ok(())
+}
+
+fn remove_path_for_replace(abs: &Path) -> std::io::Result<()> {
     let meta = match fs::symlink_metadata(abs) {
         Ok(meta) => meta,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e),
     };
-    if meta.is_dir() {
-        fs::remove_dir(abs)
+    if meta.file_type().is_symlink() {
+        fs::remove_file(abs)
+    } else if meta.is_dir() {
+        fs::remove_dir_all(abs)
     } else {
         fs::remove_file(abs)
     }
 }
 
-fn spool_entry_name(rel: &str) -> String {
-    let seq = SPOOL_NAME_SEQ.fetch_add(1, Ordering::Relaxed);
-    let safe: String = rel
-        .chars()
-        .map(|c| if c == '/' || c == '\\' { '_' } else { c })
-        .collect();
-    format!("{}_{}_{safe}", std::process::id(), seq)
+fn restore_spooled_directory(
+    work_tree: &Path,
+    entry: &SpooledDirectoryReplace,
+) -> std::io::Result<()> {
+    let abs = crate::repo_relpath::worktree_abs(work_tree, &entry.rel);
+    remove_path_for_replace(&abs)?;
+    move_directory_tree(&entry.stash, &abs)?;
+    Ok(())
 }
 
 fn move_worktree_entry_to_spool(
@@ -572,7 +656,7 @@ fn cross_device_restore_from_spool(
     Ok(())
 }
 
-fn create_symlink_at(target: &Path, link: &Path) -> std::io::Result<()> {
+pub(crate) fn create_symlink_at(target: &Path, link: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::symlink;
@@ -599,12 +683,39 @@ mod path_list_tests {
         for path in ["a", "dir/b.txt", "dir/sub/ünï.txt", "c"] {
             list.push(path);
         }
-        assert_eq!(list.len(), 4);
+        assert_eq!(list.ends.len(), 4);
         assert_eq!(
             list.iter_rev().collect::<Vec<_>>(),
             ["c", "dir/sub/ünï.txt", "dir/b.txt", "a"]
         );
         assert_eq!(PathList::default().iter_rev().count(), 0);
+    }
+}
+
+#[cfg(test)]
+mod spool_name_tests {
+    use super::spool_entry_name;
+
+    #[test]
+    fn deep_paths_get_short_unique_names() {
+        let deep = format!("{}/deep.txt", vec!["d".repeat(40); 8].join("/"));
+        assert!(deep.len() > 255);
+        let first = spool_entry_name(&deep);
+        let second = spool_entry_name(&deep);
+        assert_ne!(first, second);
+        for name in [&first, &second] {
+            assert!(name.len() < 100, "{name}");
+            assert!(name.ends_with("_deep.txt"), "{name}");
+            assert!(!name.contains(['/', '\\']), "{name}");
+        }
+    }
+
+    #[test]
+    fn long_file_names_are_cut_on_a_char_boundary() {
+        let long = "ü".repeat(120);
+        let name = spool_entry_name(&format!("dir/{long}"));
+        assert!(name.len() <= 100, "{name}");
+        assert!(long.ends_with(name.rsplit('_').next().unwrap_or_default()));
     }
 }
 

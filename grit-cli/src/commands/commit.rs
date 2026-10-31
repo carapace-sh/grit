@@ -12,7 +12,7 @@ use grit_lib::porcelain::commit::{
     CommitPatchError, CommitPatchInput, CommitRequest, CommitScope, HookPolicy,
 };
 use grit_lib::porcelain::hunk_select::{parse_hunk_id_list, HunkSelectError};
-use grit_lib::progress::{NeverCancel, NullProgress, ProgressSink};
+use grit_lib::progress::{NullProgress, ProgressSink};
 use grit_lib::revwalk::rev_parse::resolve_revision_as_commit;
 use grit_lib::state::{resolve_head, HeadState};
 use schemars::JsonSchema;
@@ -191,6 +191,7 @@ pub fn run_hunks(
     lines: &[String],
 ) -> Result<CommitOutcome> {
     let repo = context::discover()?;
+    refuse_gitbutler_workspace(&repo)?;
     let resolved = paths.resolve(&repo)?;
     let (pathspecs, _) = resolved.into_pathspec_lists();
     let mut selection = parse_hunk_id_list(hunks).map_err(map_hunk_parse)?;
@@ -216,13 +217,14 @@ pub fn run_hunks(
         amend,
         allow_empty,
     )?;
+    let interrupt = crate::interrupt::InterruptCancel::install();
     let outcome = commit_with_patch(
         &repo,
         &req,
         CommitPatchInput::Hunks(selection),
         &pathspecs,
         &mut NullProgress,
-        &NeverCancel,
+        &interrupt,
     )
     .map_err(map_patch_error)?;
     finish_commit_outcome(
@@ -255,6 +257,7 @@ pub fn run_patch_file(
     patch_file: &str,
 ) -> Result<CommitOutcome> {
     let repo = context::discover()?;
+    refuse_gitbutler_workspace(&repo)?;
     let patches = crate::patch_selection::parse_patch_file(patch_file)?;
     if patches.is_empty() {
         bail!("patch file contains no applicable hunks");
@@ -277,13 +280,14 @@ pub fn run_patch_file(
         amend,
         allow_empty,
     )?;
+    let interrupt = crate::interrupt::InterruptCancel::install();
     let outcome = commit_with_patch(
         &repo,
         &req,
         CommitPatchInput::Patches(patches),
         &[],
         &mut NullProgress,
-        &NeverCancel,
+        &interrupt,
     )
     .map_err(map_patch_error)?;
     finish_commit_outcome(
@@ -294,6 +298,15 @@ pub fn run_patch_file(
         dry_run,
         message_for_outcome,
     )
+}
+
+/// Fail when `HEAD` is on a GitButler workspace: GitButler rewrites that branch, so a commit
+/// made on it would be lost.
+fn refuse_gitbutler_workspace(repo: &grit_lib::repo::Repository) -> Result<()> {
+    match grit_lib::gitbutler::GitButlerWorkspace::detect(repo).context("could not read HEAD")? {
+        Some(_) => Err(crate::json_error::gitbutler_workspace_commit()),
+        None => Ok(()),
+    }
 }
 
 /// Run `grit commit` with the given message, flags, and optional path scope.
@@ -319,6 +332,7 @@ pub fn run(
     progress: &mut dyn ProgressSink,
 ) -> Result<CommitOutcome> {
     let repo = context::discover()?;
+    refuse_gitbutler_workspace(&repo)?;
 
     match resolve_head(repo.git_dir())? {
         HeadState::Branch { .. } | HeadState::Detached { .. } => {}
@@ -345,8 +359,9 @@ pub fn run(
         amend,
         allow_empty,
     )?;
+    let interrupt = crate::interrupt::InterruptCancel::install();
     let outcome =
-        commit_with_scope(&repo, &req, scope, progress, &NeverCancel).map_err(map_commit_error)?;
+        commit_with_scope(&repo, &req, scope, progress, &interrupt).map_err(map_commit_error)?;
     finish_commit_outcome(
         &repo,
         req,
@@ -384,14 +399,14 @@ fn build_commit_request(
         None
     };
 
-    let message = resolve_commit_message(
-        repo,
-        message,
-        message_file,
-        amend,
-        reuse_message_from.is_some(),
-    )?;
-    if message.is_none() && !amend && reuse_message_from.is_none() {
+    let message =
+        resolve_commit_message(message, message_file, amend, reuse_message_from.is_some())?;
+    let has_pending_message = || -> Result<bool> {
+        Ok(pending_commit_message(repo)
+            .context("could not read pending commit message")?
+            .is_some_and(|m| !m.trim().is_empty()))
+    };
+    if message.is_none() && !amend && reuse_message_from.is_none() && !has_pending_message()? {
         bail!("provide a commit message, e.g. grit commit \"what changed\"");
     }
     let message_text = message.as_deref().unwrap_or("");
@@ -416,7 +431,8 @@ fn build_commit_request(
     } else if amend || reuse_message_from.is_some() {
         None
     } else {
-        Some(context::signature(repo, IdentRole::Author, now)?)
+        // Leave unset so grit-lib picks author from CHERRY_PICK_HEAD, config, or identity.
+        None
     };
 
     let parsed_author_date = author_date.as_deref().map(parse_trailer_date).transpose()?;
@@ -439,22 +455,20 @@ fn build_commit_request(
         HookPolicy::Run
     };
 
-    Ok(CommitRequest {
-        message: message_text.to_owned(),
-        author,
-        committer,
-        allow_empty,
-        sign_override,
-        amend,
-        hooks,
-        author_date: parsed_author_date,
-        trailers: parsed_trailers,
-        signoff,
-        reset_author,
-        reuse_message_from,
-        dry_run,
-        ..Default::default()
-    })
+    let mut req = CommitRequest::new(message_text);
+    req.author = author;
+    req.committer = committer;
+    req.allow_empty = allow_empty;
+    req.sign_override = sign_override;
+    req.amend = amend;
+    req.hooks = hooks;
+    req.author_date = parsed_author_date;
+    req.trailers = parsed_trailers;
+    req.signoff = signoff;
+    req.reset_author = reset_author;
+    req.reuse_message_from = reuse_message_from;
+    req.dry_run = dry_run;
+    Ok(req)
 }
 
 fn finish_commit_outcome(
@@ -523,9 +537,9 @@ fn finish_commit_outcome(
     })
 }
 
-/// Resolve the commit message from CLI input, pending merge/squash state, or amend reuse.
+/// Resolve the commit message from CLI input. `None` leaves the message to the library: the
+/// pending merge or squash message, or the amended or reused commit's.
 fn resolve_commit_message(
-    repo: &grit_lib::repo::Repository,
     message: Option<String>,
     message_file: Option<String>,
     amend: bool,
@@ -563,9 +577,7 @@ fn resolve_commit_message(
             }
             Ok(Some(contents))
         }
-        (None, None) => Ok(pending_commit_message(repo)
-            .context("could not read pending commit message")?
-            .filter(|m| !m.trim().is_empty())),
+        (None, None) => Ok(None),
         (Some(_), Some(_)) => unreachable!("clap rejects message and message-file together"),
     }
 }
@@ -658,6 +670,9 @@ fn map_commit_error(err: Error) -> anyhow::Error {
         Error::AmendUnborn => anyhow::anyhow!("cannot amend: no commits on this branch yet"),
         Error::PartialCommitDuringMerge => {
             anyhow::anyhow!("cannot do a partial commit during a merge")
+        }
+        Error::PartialCommitDuringReplay => {
+            anyhow::anyhow!("cannot do a partial commit during a cherry-pick or revert")
         }
         Error::PathspecNoMatch { spec } => anyhow::anyhow!(
             "pathspec '{spec}' did not match any file(s) known to git"

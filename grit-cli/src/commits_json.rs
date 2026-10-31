@@ -50,7 +50,7 @@ impl CommitJsonLoader {
         for oid in oids {
             let data = match parsed.take_commit(oid) {
                 Some(data) => data?,
-                None => grit_lib::objects::parse_commit(&repo.odb().read(oid)?.data)?,
+                None => repo.odb().read_commit(oid)?,
             };
             let resolved = grit_lib::change_id::resolved_change_id(oid, &data);
             let (author, timestamp) = context::author_and_time(&data.author);
@@ -58,10 +58,8 @@ impl CommitJsonLoader {
                 oid: *oid,
                 subject: subject_line(&data.message),
                 author,
-                author_ident: data.author,
                 timestamp,
                 change_id: resolved.id.as_str().to_owned(),
-                change_id_stored: resolved.stored,
             });
         }
         Ok(summaries)
@@ -89,8 +87,47 @@ impl CommitJsonLoader {
         repo: &Repository,
         oids: &[ObjectId],
         now: i64,
-        mut parsed: impl CommitReuse,
+        parsed: impl CommitReuse,
     ) -> Result<(Vec<CommitJson>, Vec<CommitSummary>)> {
+        let loaded = self.load_commits(repo, oids, parsed)?;
+        let mut json = Vec::with_capacity(loaded.len());
+        let mut summaries = Vec::with_capacity(loaded.len());
+        for row in &loaded {
+            summaries.push(CommitSummary {
+                oid: row.oid,
+                subject: subject_line(&row.message),
+                author: context::author_display_name(&row.author.name, &row.author.email),
+                timestamp: row.author.time.unix_timestamp(),
+                change_id: row.change_id.as_str().to_owned(),
+            });
+            json.push(CommitJson::from_loaded(row, now));
+        }
+        Ok((json, summaries))
+    }
+
+    /// Like [`Self::load_with_summaries_reusing`], for output that only needs the JSON rows.
+    pub fn load_reusing(
+        &self,
+        repo: &Repository,
+        oids: &[ObjectId],
+        now: i64,
+        parsed: impl CommitReuse,
+    ) -> Result<Vec<CommitJson>> {
+        Ok(self
+            .load_commits(repo, oids, parsed)?
+            .iter()
+            .map(|row| CommitJson::from_loaded(row, now))
+            .collect())
+    }
+
+    /// Load `oids` with their decorations, taking walked commits out of `parsed`, which is
+    /// dropped before the caller builds its rows.
+    fn load_commits(
+        &self,
+        repo: &Repository,
+        oids: &[ObjectId],
+        mut parsed: impl CommitReuse,
+    ) -> Result<Vec<LoadedCommit>> {
         let listed;
         let decorations = match &self.decorations {
             Some(all) => all,
@@ -99,23 +136,12 @@ impl CommitJsonLoader {
                 &listed
             }
         };
-        let loaded = load_commits_with_decorations_reusing(repo, oids, decorations, &mut parsed)?;
-        drop(parsed);
-        let mut json = Vec::with_capacity(loaded.len());
-        let mut summaries = Vec::with_capacity(loaded.len());
-        for row in &loaded {
-            summaries.push(CommitSummary {
-                oid: row.oid,
-                subject: subject_line(&row.message),
-                author: context::author_display_name(&row.author.name, &row.author.email),
-                author_ident: row.author.header_line(),
-                timestamp: row.author.time.unix_timestamp(),
-                change_id: row.change_id.as_str().to_owned(),
-                change_id_stored: row.change_id_stored,
-            });
-            json.push(CommitJson::from_loaded(row, now));
-        }
-        Ok((json, summaries))
+        Ok(load_commits_with_decorations_reusing(
+            repo,
+            oids,
+            decorations,
+            &mut parsed,
+        )?)
     }
 
     /// Build a single [`CommitJson`] row.

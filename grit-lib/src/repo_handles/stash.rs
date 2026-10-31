@@ -3,14 +3,14 @@
 //! [`RepositoryStash`] (from [`Repository::stash`](crate::repo::Repository::stash)) is the one
 //! public stash API; option and result types live in [`crate::stash`].
 
-use crate::diff::DiffEntry;
+use crate::diff::{DiffEntry, DiffOptions, DiffStat};
 use crate::error::Result;
 use crate::objects::ObjectId;
 use crate::porcelain::stash::{
     apply_stash_entry, apply_stash_oid, clear_stashes, create_stash, drop_stash, list_stashes,
-    pop_stash_entry, preview_stash, push_stash, stash_branch, stash_diff, StashApplyOptions,
-    StashApplyOutcome, StashBranchOutcome, StashDiffOptions, StashEntry, StashPreview,
-    StashPushOptions, StashPushResult,
+    pop_stash_entry, preview_stash, push_stash, stash_branch, stash_diff, stash_diff_stat,
+    StashApplyOptions, StashApplyOutcome, StashBranchOutcome, StashDiffOptions, StashEntry,
+    StashPreview, StashPushOptions, StashPushResult,
 };
 use crate::progress::{Cancel, ProgressSink};
 use crate::repo::Repository;
@@ -81,19 +81,14 @@ impl<'repo> RepositoryStash<'repo> {
     /// ```
     /// # use grit_lib::repo::Repository;
     /// # use grit_lib::config::ident_resolve::IdentRole;
-    /// # use grit_lib::stash::{StashMode, StashPushOptions};
+    /// # use grit_lib::stash::StashPushOptions;
     /// # use std::path::Path;
     /// # fn demo() -> grit_lib::error::Result<()> {
     /// let repo = Repository::discover(Some(Path::new(".")), &grit_lib::config::environment::RepositoryOptions::empty())?;
-    /// let opts = StashPushOptions {
-    ///     message: Some("wip".into()),
-    ///     include_untracked: false,
-    ///     identity: repo.identity(IdentRole::Committer, repo.identity_now())?,
-    ///     selection: None,
-    ///     pathspecs: Vec::new(),
-    ///     dry_run: false,
-    ///     mode: StashMode::default(),
-    /// };
+    /// let mut opts = StashPushOptions::new(
+    ///     repo.identity(IdentRole::Committer, repo.identity_now())?,
+    /// );
+    /// opts.message = Some("wip".into());
     /// let _ = repo.stash().push(
     ///     &opts,
     ///     &mut grit_lib::progress::NullProgress,
@@ -218,7 +213,8 @@ impl<'repo> RepositoryStash<'repo> {
         clear_stashes(self.repo)
     }
 
-    /// Tree diff of `stash@{index}` against the commit it was made on (`git stash show`).
+    /// Tree diff of `stash@{index}` against the commit it was made on (`git stash show`), in
+    /// path order.
     ///
     /// # Errors
     ///
@@ -226,6 +222,46 @@ impl<'repo> RepositoryStash<'repo> {
     /// entry is missing or malformed.
     pub fn diff(&self, index: usize, options: &StashDiffOptions) -> Result<Vec<DiffEntry>> {
         stash_diff(self.repo, index, options)
+    }
+
+    /// Per-file line counts of [`Self::diff`] (`git stash show --stat`).
+    ///
+    /// Counts come from the line-count engine, without building hunks. Files whose every
+    /// change `diff_options.whitespace` ignores are left out, as Git does (see
+    /// [`ListedFileDiff::changes_all_ignored`](crate::diff::ListedFileDiff::changes_all_ignored)).
+    ///
+    /// # Parameters
+    ///
+    /// - `index`: newest-first stash index (`0` is `stash@{0}`).
+    /// - `options`: which stash parents to include.
+    /// - `diff_options`: line-diff settings, e.g. [`DiffOptions::from_config`].
+    ///
+    /// # Errors
+    ///
+    /// The [`Self::diff`] errors, plus config load and object read failures.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use grit_lib::repo::Repository;
+    /// # use grit_lib::diff::DiffOptions;
+    /// # use grit_lib::stash::StashDiffOptions;
+    /// # use std::path::Path;
+    /// # fn demo() -> grit_lib::error::Result<()> {
+    /// let repo = Repository::discover(Some(Path::new(".")), &grit_lib::config::environment::RepositoryOptions::empty())?;
+    /// let diff_options = DiffOptions::from_config(repo.config()?.as_ref());
+    /// let stat = repo.stash().diff_stat(0, &StashDiffOptions::default(), diff_options)?;
+    /// let _ = stat.totals().insertions;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn diff_stat(
+        &self,
+        index: usize,
+        options: &StashDiffOptions,
+        diff_options: DiffOptions,
+    ) -> Result<DiffStat> {
+        stash_diff_stat(self.repo, index, options, diff_options)
     }
 
     /// Create branch `name` at the commit `stash@{index}` was made on, switch to it, apply the

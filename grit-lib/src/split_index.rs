@@ -1,17 +1,15 @@
 //! Split index: `link` extension and `sharedindex.<sha1>` (Git `split-index.c`).
 
-use crate::git_path::CanonicalizeExt;
-use std::fs;
-use std::io;
-use std::path::{Path, PathBuf};
-use std::time::{Duration, UNIX_EPOCH};
-
 use crate::config::ConfigSet;
 use crate::error::{Error, Result};
 use crate::ewah_bitmap::EwahBitmap;
 use crate::git_date::approx::approxidate_careful;
+use crate::git_path::CanonicalizeExt;
 use crate::index::{Index, IndexEntry};
 use crate::objects::{HashAlgo, ObjectId};
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
 
 /// Split-index metadata carried on an [`Index`] (in-memory; bitmaps cleared after merge/write).
 #[derive(Debug, Clone)]
@@ -529,6 +527,7 @@ pub(crate) fn freshen_shared_index(path: &Path) {
 
 #[cfg(unix)]
 fn filetime_set_to_now(path: &Path) -> io::Result<()> {
+    use std::time::{Duration, UNIX_EPOCH};
     let t = UNIX_EPOCH + Duration::from_secs(crate::git_date::tm::process_wall_clock_sec() as u64);
     let ft = filetime::FileTime::from_system_time(t);
     filetime::set_file_mtime(path, ft)
@@ -679,12 +678,16 @@ pub(crate) fn write_index_file_split(
             .zip(default_index.canonicalize_simplified().ok())
             .is_some_and(|(a, b)| a == b);
     if !is_primary_index {
+        // Alternate index paths (GIT_INDEX_FILE, commit hook `next-index-*`) must be written
+        // unified, but the caller's in-memory split metadata must survive for the primary write.
+        let saved_link = index.split_link.clone();
+        let saved_base_pos: Vec<u32> = index.entries.iter().map(|e| e.base_index_pos).collect();
         index.split_link = None;
         for e in &mut index.entries {
             e.base_index_pos = 0;
         }
         let perm_lock = staged_lock_path_buf_for_perm(existing_lock.as_deref(), commit_lock);
-        write_index_through_lock(
+        let write_result = write_index_through_lock(
             index,
             path,
             skip_hash,
@@ -692,7 +695,12 @@ pub(crate) fn write_index_file_split(
             existing_lock,
             commit_lock,
             thread_policy,
-        )?;
+        );
+        index.split_link = saved_link;
+        for (e, pos) in index.entries.iter_mut().zip(saved_base_pos) {
+            e.base_index_pos = pos;
+        }
+        write_result?;
         adjust_shared_perm_written_index(path, perm_lock.as_deref(), shared_repo)?;
         return Ok(());
     }
@@ -760,11 +768,14 @@ pub(crate) fn write_index_file_split(
             cache_tree: None,
             hash_algo: index.hash_algo,
             source_mtime: None,
+            source_checksum: None,
+            source_file_len: None,
             defer_untracked_cache_invalidation: false,
             skip_racy_smudge_on_write: false,
             content_verified: std::collections::HashMap::new(),
             fsmonitor_refresh_ran: false,
             suppress_pre_write_index_housekeeping: false,
+            entry_modes_repaired_on_load: false,
         };
         let tmp = match tempfile::NamedTempFile::new_in(git_dir) {
             Ok(t) => t,
@@ -923,11 +934,14 @@ pub(crate) fn write_index_file_split(
         cache_tree: index.cache_tree.clone(),
         hash_algo: index.hash_algo,
         source_mtime: index.source_mtime,
+        source_checksum: index.source_checksum.clone(),
+        source_file_len: index.source_file_len,
         defer_untracked_cache_invalidation: false,
         skip_racy_smudge_on_write: false,
         content_verified: std::collections::HashMap::new(),
         fsmonitor_refresh_ran: index.fsmonitor_refresh_ran,
         suppress_pre_write_index_housekeeping: index.suppress_pre_write_index_housekeeping,
+        entry_modes_repaired_on_load: index.entry_modes_repaired_on_load,
     };
 
     let perm_lock = staged_lock_path_buf_for_perm(existing_lock.as_deref(), commit_lock);
@@ -1186,7 +1200,7 @@ mod tests {
         fs::write(&index_path, b"live").expect("write index");
         fs::set_permissions(&index_path, fs::Permissions::from_mode(0o644)).expect("index mode");
 
-        let mut lock = crate::index::IndexLock::acquire(&index_path, None).expect("lock");
+        let lock = crate::index::IndexLock::acquire(&index_path, None).expect("lock");
         fs::write(&lock.lock_path, b"staged").expect("write lock");
         fs::set_permissions(&lock.lock_path, fs::Permissions::from_mode(0o644)).expect("lock mode");
 

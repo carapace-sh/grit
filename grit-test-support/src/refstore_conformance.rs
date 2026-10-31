@@ -110,6 +110,7 @@ pub const CASES: &[(&str, Case)] = &[
     ),
     ("empty_reflog_exists", empty_reflog_exists),
     ("prefix_iteration_order", prefix_iteration_order),
+    ("empty_prefix_omits_root_refs", empty_prefix_omits_root_refs),
     ("abort_leaves_state_unchanged", abort_leaves_state_unchanged),
     ("abort_releases_lock", abort_releases_lock),
     (
@@ -118,6 +119,7 @@ pub const CASES: &[(&str, Case)] = &[
     ),
     ("concurrent_prepare_lock_held", concurrent_prepare_lock_held),
     ("reflog_roundtrip", reflog_roundtrip),
+    ("rewrite_reflog_roundtrip", rewrite_reflog_roundtrip),
     ("reentrant_callbacks", reentrant_callbacks),
 ];
 
@@ -315,14 +317,7 @@ const UNSAFE_NAMES: &[&str] = &[
 ];
 
 fn all_ref_names(store: &dyn RefStore) -> Vec<String> {
-    let mut names = Vec::new();
-    store
-        .for_each_ref("", &mut |entry| {
-            names.push(entry.name.clone());
-            ControlFlow::Continue(())
-        })
-        .expect("iterate refs");
-    names
+    ref_names_with_prefix(store, "")
 }
 
 /// Names Git refuses to store fail `prepare` with [`RefStoreError::InvalidRefName`], alone or
@@ -445,6 +440,7 @@ pub fn pseudoref_and_log_only_null_oid_accepted(store: Arc<dyn RefStore>) {
     log_only.flags = RefUpdateFlags {
         log_only: true,
         no_deref: true,
+        ..Default::default()
     };
     commit_txn(
         store.as_ref(),
@@ -915,6 +911,39 @@ pub fn prefix_iteration_order(store: Arc<dyn RefStore>) {
     assert_eq!(limited, vec!["refs/heads/a"]);
 }
 
+fn ref_names_with_prefix(store: &dyn RefStore, prefix: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    store
+        .for_each_ref(prefix, &mut |entry| {
+            names.push(entry.name.clone());
+            ControlFlow::Continue(())
+        })
+        .expect("iterate refs");
+    names
+}
+
+/// The empty prefix lists only refs under `refs/`, like `git for-each-ref` with no pattern;
+/// root refs such as `HEAD` and `ORIG_HEAD` are listed only by a non-empty prefix they match.
+pub fn empty_prefix_omits_root_refs(store: Arc<dyn RefStore>) {
+    seed_direct(store.as_ref(), "refs/heads/main", oid(1));
+    seed_symref(store.as_ref(), "HEAD", "refs/heads/main");
+    seed_direct(store.as_ref(), "ORIG_HEAD", oid(1));
+
+    for (prefix, expected) in [
+        ("", "refs/heads/main"),
+        ("refs/", "refs/heads/main"),
+        ("H", "HEAD"),
+        ("HEAD", "HEAD"),
+        ("ORIG", "ORIG_HEAD"),
+    ] {
+        assert_eq!(
+            ref_names_with_prefix(store.as_ref(), prefix),
+            vec![expected],
+            "prefix {prefix:?}"
+        );
+    }
+}
+
 /// Aborting a prepared transaction changes nothing.
 pub fn abort_leaves_state_unchanged(store: Arc<dyn RefStore>) {
     seed_direct(store.as_ref(), "refs/heads/stay", oid(5));
@@ -1084,6 +1113,33 @@ pub fn reflog_roundtrip(store: Arc<dyn RefStore>) {
         })
         .expect("list");
     assert_eq!(reflog_refs, vec!["refs/heads/rr"]);
+}
+
+/// Locked [`RefStore::rewrite_reflog`] read-transform-write keeps other entries intact.
+pub fn rewrite_reflog_roundtrip(store: Arc<dyn RefStore>) {
+    let log = |byte: u8| ReflogEntry {
+        old_oid: oid(0),
+        new_oid: oid(byte),
+        identity: "A <a@a.com> 1 +0000".to_owned(),
+        message: format!("m{byte}"),
+    };
+    store
+        .replace_reflog("refs/heads/r", vec![log(1), log(2), log(3)])
+        .expect("seed");
+    store
+        .rewrite_reflog("refs/heads/r", &mut |entries| {
+            assert_eq!(entries.len(), 3);
+            Ok(vec![entries[0].clone(), entries[2].clone()])
+        })
+        .expect("rewrite");
+    let mut kept = Vec::new();
+    store
+        .for_each_reflog_entry("refs/heads/r", false, &mut |e| {
+            kept.push(e.clone());
+            ControlFlow::Continue(())
+        })
+        .expect("read");
+    assert_eq!(kept, vec![log(1), log(3)]);
 }
 
 /// Iteration callbacks may read and write the store they are iterating. A backend that holds

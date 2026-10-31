@@ -9,15 +9,17 @@ use std::cmp::{Ordering, Reverse};
 use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use crate::bitmap_walk::{bitmap_filter_supported, BitmapWalkError, PeeledTips, ReachableSet};
 use crate::commit_graph_file::{BloomPrecheck, BloomWalkStatsHandle, CommitGraphChain};
 use crate::config::ConfigSet;
+use crate::diff::pickaxe::PickaxeRenames;
 use crate::diff::zero_oid;
 use crate::error::{Error, Result};
 use crate::ident::{committer_unix_seconds_for_ordering, parse_signature_times};
-use crate::ignore::{parse_sparse_patterns_from_blob, path_in_sparse_checkout};
+use crate::ignore::{parse_sparse_patterns_from_blob, ParsedSparsePatterns};
 use crate::index::{CacheTreeNode, Index, MODE_GITLINK, MODE_TREE};
 use crate::merge_base::{
     commits_reachable_excluding_ancestors_of_with_graph, ReachableWalkCommitterCutoffs,
@@ -29,6 +31,8 @@ use crate::objects::{
 use crate::odb::store::ObjectStore;
 use crate::pack_bitmap::BitmapIndex;
 use crate::patch_ids::{compute_patch_id, compute_patch_id_for_paths};
+use crate::pathspec::pathspec_entry_is_relevant;
+use crate::progress::poll_watch;
 use crate::ref_exclusions::{git_namespace_prefix, strip_git_namespace, RefExclusions};
 use crate::reflog::{list_reflog_refs, read_reflog};
 use crate::refs;
@@ -464,7 +468,9 @@ pub enum OrderingMode {
 pub struct RevListOptions {
     /// Include all refs (`--all`) as positive tips.
     pub all_refs: bool,
-    /// Follow only first parent when walking merges.
+    /// Follow only first parent when walking merges to collect listed commits. Excluded tips
+    /// still hide everything they reach through every parent unless
+    /// [`Self::exclude_first_parent_only`] is set.
     pub first_parent: bool,
     /// Enable ancestry-path filtering.
     pub ancestry_path: bool,
@@ -602,6 +608,9 @@ pub struct RevListOptions {
     /// Keep the commits a walk parses anyway in [`RevListResult::commit_data`], so callers that
     /// render the listed commits do not read and inflate them a second time.
     pub retain_commit_data: bool,
+    /// When set, filtered object walks poll this flag and stop with [`Error::Cancelled`].
+    #[doc(hidden)]
+    pub cancel_watch: Option<Arc<AtomicBool>>,
 }
 
 impl RevListOptions {
@@ -711,6 +720,7 @@ impl Default for RevListOptions {
             commit_filter: None,
             pickaxe: None,
             retain_commit_data: false,
+            cancel_watch: None,
         }
     }
 }
@@ -742,6 +752,13 @@ pub struct RevListResult {
     pub left_right_map: HashMap<ObjectId, bool>,
     /// For `--cherry-mark`: set of commits that are equivalent (patch-id match).
     pub cherry_equivalent: HashSet<ObjectId>,
+    /// For `--cherry-mark`: which commits share each patch-id across the two sides of the
+    /// symmetric range, so callers can pair the versions of a rewritten change.
+    ///
+    /// Covers the whole range before `--skip` / `--max-count`, in the walk order of the
+    /// first commit of each group on the side that was hashed. Empty without
+    /// [`RevListOptions::cherry_mark`]. Index it with [`Self::cherry_match_index`].
+    pub cherry_matches: Vec<CherryMatch>,
     /// Per-commit object counts (parallel to `commits`) for `--in-commit-order`.
     /// When non-empty, `objects[sum(counts[..i])..sum(counts[..=i])]` are the objects
     /// introduced by `commits[i]`.
@@ -792,6 +809,169 @@ impl RevListResult {
         }
         self.commits.len() + self.objects.len()
     }
+
+    /// Map every commit in [`Self::cherry_matches`] to the group it belongs to.
+    #[must_use]
+    pub fn cherry_match_index(&self) -> HashMap<ObjectId, &CherryMatch> {
+        self.cherry_matches
+            .iter()
+            .flat_map(|group| {
+                group
+                    .left
+                    .iter()
+                    .chain(&group.right)
+                    .map(move |o| (*o, group))
+            })
+            .collect()
+    }
+}
+
+/// Commits on the two sides of a symmetric range (`A...B`) that share one patch-id.
+///
+/// Produced by [`RevListOptions::cherry_mark`]. Both sides are non-empty. When several
+/// commits on one side share the patch-id, the group stays many-to-many: no commit is
+/// paired with a particular counterpart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CherryMatch {
+    /// The shared stable patch-id (path-limited when the walk has paths).
+    pub patch_id: ObjectId,
+    /// Left-side commits (reachable from the left tip only) with this patch-id, in walk order.
+    pub left: Vec<ObjectId>,
+    /// Right-side commits (reachable from the right tip only) with this patch-id, in walk order.
+    pub right: Vec<ObjectId>,
+    /// For a one-to-one group, whether the two commit messages differ; `None` otherwise.
+    pub message_changed: Option<bool>,
+}
+
+impl CherryMatch {
+    /// The commit on the other side of a one-to-one group, or `None` for many-to-many groups
+    /// or a commit not in this group.
+    #[must_use]
+    pub fn counterpart(&self, oid: &ObjectId) -> Option<ObjectId> {
+        match (self.left.as_slice(), self.right.as_slice()) {
+            ([left], [right]) if left == oid => Some(*right),
+            ([left], [right]) if right == oid => Some(*left),
+            _ => None,
+        }
+    }
+}
+
+/// A patch-id group before messages are compared.
+struct CherryPatchGroup {
+    patch_id: ObjectId,
+    left: Vec<ObjectId>,
+    right: Vec<ObjectId>,
+}
+
+impl CherryPatchGroup {
+    fn into_match(self, repo: &Repository) -> Result<CherryMatch> {
+        let message_changed = match (self.left.as_slice(), self.right.as_slice()) {
+            ([left], [right]) => Some(
+                repo.odb().read_commit(left)?.message != repo.odb().read_commit(right)?.message,
+            ),
+            _ => None,
+        };
+        Ok(CherryMatch {
+            patch_id: self.patch_id,
+            left: self.left,
+            right: self.right,
+            message_changed,
+        })
+    }
+}
+
+/// Fewest commits per worker before [`map_commits_in_parallel`] spawns threads; below this a
+/// per-commit diff is cheaper than a thread start.
+const PARALLEL_COMMIT_MAP_MIN_PER_THREAD: usize = 16;
+
+/// Apply `f` to every commit, splitting large lists across scoped worker threads.
+///
+/// Results keep the order of `commits`. Used for per-commit work that only reads the
+/// object database, such as patch-ids.
+pub(crate) fn map_commits_in_parallel<T, F>(commits: &[ObjectId], f: F) -> Vec<T>
+where
+    T: Send,
+    F: Fn(&ObjectId) -> T + Sync,
+{
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .clamp(1, 8)
+        .min(commits.len() / PARALLEL_COMMIT_MAP_MIN_PER_THREAD);
+    if threads <= 1 {
+        return commits.iter().map(f).collect();
+    }
+    let chunk = commits.len().div_ceil(threads);
+    let f = &f;
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = commits
+            .chunks(chunk)
+            .map(|part| scope.spawn(move || part.iter().map(f).collect::<Vec<T>>()))
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|handle| {
+                handle
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            })
+            .collect()
+    })
+}
+
+/// Group left and right commits by patch-id, keeping only ids present on both sides.
+///
+/// Hashes the smaller side first and probes with the other, as Git's cherry detection does,
+/// so commits on the larger side whose patch-id matches nothing are hashed once and dropped.
+fn cherry_patch_groups(
+    repo: &Repository,
+    left_commits: &[ObjectId],
+    right_commits: &[ObjectId],
+    paths: &[String],
+) -> Vec<CherryPatchGroup> {
+    let left_first = !left_commits.is_empty()
+        && !right_commits.is_empty()
+        && left_commits.len() < right_commits.len();
+    let (hashed, probed) = if left_first {
+        (left_commits, right_commits)
+    } else {
+        (right_commits, left_commits)
+    };
+    let patch_id = |oid: &ObjectId| compute_cherry_patch_id(repo, oid, paths).ok().flatten();
+    let mut by_patch: HashMap<ObjectId, usize> = HashMap::new();
+    let mut groups: Vec<(ObjectId, Vec<ObjectId>, Vec<ObjectId>)> = Vec::new();
+    for (oid, pid) in hashed.iter().zip(map_commits_in_parallel(hashed, patch_id)) {
+        let Some(pid) = pid else { continue };
+        let idx = *by_patch.entry(pid).or_insert_with(|| {
+            groups.push((pid, Vec::new(), Vec::new()));
+            groups.len() - 1
+        });
+        groups[idx].1.push(*oid);
+    }
+    if by_patch.is_empty() {
+        return Vec::new();
+    }
+    for (oid, pid) in probed.iter().zip(map_commits_in_parallel(probed, patch_id)) {
+        if let Some(&idx) = pid.and_then(|pid| by_patch.get(&pid)) {
+            groups[idx].2.push(*oid);
+        }
+    }
+    groups
+        .into_iter()
+        .filter(|(_, _, probed)| !probed.is_empty())
+        .map(|(patch_id, hashed, probed)| {
+            let (left, right) = if left_first {
+                (hashed, probed)
+            } else {
+                (probed, hashed)
+            };
+            CherryPatchGroup {
+                patch_id,
+                left,
+                right,
+            }
+        })
+        .collect()
 }
 
 /// Per-commit bisection score for `rev-list --bisect*` output.
@@ -1043,6 +1223,7 @@ pub fn rev_list(
                 boundary_commits: Vec::new(),
                 left_right_map: HashMap::new(),
                 cherry_equivalent: HashSet::new(),
+                cherry_matches: Vec::new(),
                 per_commit_object_counts: Vec::new(),
                 object_walk_tips: Vec::new(),
                 objects_print_commit: Vec::new(),
@@ -1087,7 +1268,13 @@ pub fn rev_list(
         HashSet::new()
     };
 
-    if let Some(result) = try_bounded_commit_filter_limit_list(repo, &include, &exclude, options)? {
+    if let Some(result) =
+        try_bounded_commit_filter_limit_list(repo, &include, &exclude, options, &repo_config)?
+    {
+        return Ok(result);
+    }
+
+    if let Some(result) = try_bounded_parent_filter_limit_list(repo, &include, &exclude, options)? {
         return Ok(result);
     }
 
@@ -1118,6 +1305,25 @@ pub fn rev_list(
         && !options.ancestry_path
         && !options.simplify_merges;
 
+    // `--first-parent` follows first parents only from listed commits; excluded tips still hide
+    // everything they reach through any parent unless `--exclude-first-parent-only` says so.
+    let hide_all_parents =
+        options.first_parent && !options.exclude_first_parent_only && !exclude.is_empty();
+    let painted_hidden_frontier = if hide_all_parents
+        && !options.exclude_promisor_objects
+        && options.missing_action == MissingAction::Error
+        && !include.is_empty()
+    {
+        Some(crate::merge_base::first_parent_hidden_frontier(
+            repo,
+            &include,
+            &exclude,
+            options.use_commit_graph,
+        )?)
+    } else {
+        None
+    };
+
     let mut traversal_missing = Vec::new();
     let mut traversal_missing_seen = HashSet::new();
     let (mut included, mut discovery_order) = if include.is_empty() {
@@ -1137,18 +1343,29 @@ pub fn rev_list(
             &mut traversal_missing,
             &mut traversal_missing_seen,
         )?
+    } else if let Some(frontier) = &painted_hidden_frontier {
+        walk_closure_ordered_excluding(&mut graph, &include, frontier)?
     } else {
         walk_closure_ordered(&mut graph, &include)?
     };
+    let mut all_parents_graph;
+    let exclude_graph = if hide_all_parents && painted_hidden_frontier.is_none() {
+        all_parents_graph = CommitGraph::with_commit_graph(repo, false, options.use_commit_graph);
+        &mut all_parents_graph
+    } else {
+        &mut graph
+    };
     let excluded = if exclude.is_empty() {
         HashSet::new()
+    } else if let Some(frontier) = painted_hidden_frontier {
+        frontier
     } else if options.exclude_promisor_objects {
-        walk_closure_ordered_excluding(&mut graph, &exclude, &excluded_promisor)?.0
+        walk_closure_ordered_excluding(exclude_graph, &exclude, &excluded_promisor)?.0
     } else if options.exclude_first_parent_only {
-        walk_closure_first_parent_only(&mut graph, &exclude)?
+        walk_closure_first_parent_only(exclude_graph, &exclude)?
     } else if options.missing_action != MissingAction::Error {
         walk_closure_ordered_with_missing(
-            &mut graph,
+            exclude_graph,
             &exclude,
             &HashSet::new(),
             options.missing_action,
@@ -1157,7 +1374,7 @@ pub fn rev_list(
         )?
         .0
     } else {
-        walk_closure(&mut graph, &exclude)?
+        walk_closure(exclude_graph, &exclude)?
     };
     included.retain(|oid| !excluded.contains(oid));
 
@@ -1193,9 +1410,7 @@ pub fn rev_list(
             && crate::pathspec::pathspecs_allow_bloom(&options.paths);
         let read_changed = read_paths && options.commit_graph_read_changed_paths;
         let chain = if use_bloom {
-            repo.caches()
-                .commit_graph_chain(repo.odb().objects_dir())
-                .map(|arc| (*arc).clone())
+            repo.odb().commit_graph_chain().map(|arc| (*arc).clone())
         } else {
             None
         };
@@ -1313,7 +1528,14 @@ pub fn rev_list(
     }
     if let Some(pickaxe) = options.pickaxe.as_ref() {
         repo.odb().with_pack_read_context(|| {
-            retain_included_by_pickaxe(repo, &mut included, pickaxe, &options.paths)
+            retain_included_by_pickaxe(
+                repo,
+                &mut graph,
+                &mut included,
+                pickaxe,
+                &options.paths,
+                &repo_config,
+            )
         })?;
     }
 
@@ -1332,6 +1554,7 @@ pub fn rev_list(
             boundary_commits: Vec::new(),
             left_right_map: HashMap::new(),
             cherry_equivalent: HashSet::new(),
+            cherry_matches: Vec::new(),
             per_commit_object_counts: Vec::new(),
             object_walk_tips: Vec::new(),
             objects_print_commit: Vec::new(),
@@ -1505,6 +1728,7 @@ pub fn rev_list(
     // Cherry-pick / cherry-mark: match commits by Git-compatible patch-id (see `git revision.c`
     // `cherry_pick_list`, used by `git rebase` todo generation).
     let mut cherry_equivalent = HashSet::new();
+    let mut cherry_matches = Vec::new();
     if options.cherry_pick || options.cherry_mark {
         let left_commits: Vec<_> = ordered
             .iter()
@@ -1516,39 +1740,15 @@ pub fn rev_list(
             .filter(|o| left_right_map.get(o) == Some(&false))
             .copied()
             .collect();
-        let left_first = !left_commits.is_empty()
-            && !right_commits.is_empty()
-            && left_commits.len() < right_commits.len();
-
-        let mut by_patch: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
-        if left_first {
-            for oid in &left_commits {
-                if let Ok(Some(pid)) = compute_cherry_patch_id(repo, oid, &options.paths) {
-                    by_patch.entry(pid).or_default().push(*oid);
-                }
-            }
-            for oid in &right_commits {
-                if let Ok(Some(pid)) = compute_cherry_patch_id(repo, oid, &options.paths) {
-                    if let Some(others) = by_patch.get(&pid) {
-                        cherry_equivalent.insert(*oid);
-                        cherry_equivalent.extend(others.iter().copied());
-                    }
-                }
-            }
-        } else {
-            for oid in &right_commits {
-                if let Ok(Some(pid)) = compute_cherry_patch_id(repo, oid, &options.paths) {
-                    by_patch.entry(pid).or_default().push(*oid);
-                }
-            }
-            for oid in &left_commits {
-                if let Ok(Some(pid)) = compute_cherry_patch_id(repo, oid, &options.paths) {
-                    if let Some(others) = by_patch.get(&pid) {
-                        cherry_equivalent.insert(*oid);
-                        cherry_equivalent.extend(others.iter().copied());
-                    }
-                }
-            }
+        let groups = cherry_patch_groups(repo, &left_commits, &right_commits, &options.paths);
+        for group in &groups {
+            cherry_equivalent.extend(group.left.iter().chain(&group.right).copied());
+        }
+        if options.cherry_mark {
+            cherry_matches = groups
+                .into_iter()
+                .map(|group| group.into_match(repo))
+                .collect::<Result<_>>()?;
         }
     }
 
@@ -1711,7 +1911,7 @@ pub fn rev_list(
         Vec::new()
     };
 
-    let sparse_lines = sparse_oid_lines_from_filter(repo, options.filter.as_ref())?;
+    let sparse_patterns = sparse_oid_lines_from_filter(repo, options.filter.as_ref())?;
     let skip_trees = skip_tree_descent_for_object_type_filter(options.filter.as_ref());
     let walk_cfg = repo_config.as_ref().clone();
     let promisor_repo = crate::promisor::repo_treats_promisor_packs(repo.git_dir(), &walk_cfg);
@@ -1741,10 +1941,11 @@ pub fn rev_list(
                     repo,
                     &negative_object_roots,
                     object_walk_missing_action,
-                    sparse_lines.as_deref(),
+                    sparse_patterns.as_ref(),
                     skip_trees,
                     omit_object_paths,
                     collect_tree_omits,
+                    options.cancel_watch.clone(),
                 )?;
                 let filter_provided = options.filter_provided_objects;
                 let (mut objs, mut omit, mut miss, mut counts, mut segments) =
@@ -1758,11 +1959,12 @@ pub fn rev_list(
                             options.filter.as_ref(),
                             filter_provided,
                             object_walk_missing_action,
-                            sparse_lines.as_deref(),
+                            sparse_patterns.as_ref(),
                             skip_trees,
                             omit_object_paths,
                             packed_set.as_ref(),
                             collect_tree_omits,
+                            options.cancel_watch.clone(),
                         )?;
                         (o, om, mi, c, Vec::<Vec<(ObjectId, String)>>::new())
                     } else {
@@ -1775,11 +1977,12 @@ pub fn rev_list(
                             options.filter.as_ref(),
                             filter_provided,
                             object_walk_missing_action,
-                            sparse_lines.as_deref(),
+                            sparse_patterns.as_ref(),
                             skip_trees,
                             omit_object_paths,
                             packed_set.as_ref(),
                             collect_tree_omits,
+                            options.cancel_watch.clone(),
                         )?;
                         (o, om, mi, Vec::new(), segments)
                     };
@@ -1872,6 +2075,7 @@ pub fn rev_list(
         boundary_commits,
         left_right_map,
         cherry_equivalent,
+        cherry_matches,
         per_commit_object_counts,
         object_walk_tips: object_walk_tip_commits,
         objects_print_commit,
@@ -3164,17 +3368,19 @@ fn skip_tree_descent_for_object_type_filter(filter: Option<&ObjectFilter>) -> bo
 fn sparse_filter_includes_path(
     repo: &Repository,
     path: &str,
-    sparse_lines: Option<&[String]>,
+    sparse_patterns: Option<&ParsedSparsePatterns>,
+    tree_state: &mut TreeWalkState,
 ) -> bool {
-    sparse_lines
-        .map(|lines| path_in_sparse_checkout(path, lines, repo.work_tree()))
-        .unwrap_or(true)
+    let Some(patterns) = sparse_patterns else {
+        return true;
+    };
+    tree_state.sparse_includes(repo, patterns, path)
 }
 
 fn sparse_oid_lines_from_filter(
     repo: &Repository,
     filter: Option<&ObjectFilter>,
-) -> Result<Option<Vec<String>>> {
+) -> Result<Option<ParsedSparsePatterns>> {
     let Some(f) = filter else {
         return Ok(None);
     };
@@ -3215,7 +3421,9 @@ fn sparse_oid_lines_from_filter(
                     object_id: blob_oid.to_hex(),
                 })
             })?;
-            Ok(Some(parse_sparse_patterns_from_blob(text)))
+            Ok(Some(ParsedSparsePatterns::parse(
+                &parse_sparse_patterns_from_blob(text),
+            )))
         }
         ObjectFilter::Combine(parts) => {
             for p in parts {
@@ -3278,6 +3486,15 @@ fn resolve_specs_with_options(
         }
     }
     Ok(out)
+}
+
+/// Resolve revision tokens for [`open_commit_stream`] /
+/// [`RevWalk::commits_iter`](crate::revwalk::handle::RevWalk::commits_iter).
+pub fn resolve_specs_for_commit_stream(
+    repo: &Repository,
+    specs: &[String],
+) -> Result<Vec<ObjectId>> {
+    resolve_specs_with_options(repo, specs, false)
 }
 
 /// Resolve revision strings to commit tips and non-commit roots (tags, trees, blobs, `rev:path`).
@@ -3350,7 +3567,9 @@ fn resolve_specs_for_objects_with_options(
             let raw_object = match repo.odb().read(&raw_oid) {
                 Ok(obj) => obj,
                 Err(Error::ObjectNotFound(_)) if ignore_missing => continue,
-                Err(Error::ObjectNotFound(_)) if missing_action != MissingAction::Error => {
+                Err(Error::ObjectNotFound(_) | Error::PromisedObjectMissing(_))
+                    if missing_action != MissingAction::Error =>
+                {
                     roots.push(RootObject {
                         oid: raw_oid,
                         input: spec.clone(),
@@ -3422,7 +3641,11 @@ fn resolve_specs_for_objects_with_options(
                 };
                 let expected_kind = match repo.odb().read_info(&object_oid) {
                     Ok(info) => ExpectedObjectKind::from_object_kind(info.kind),
-                    Err(Error::ObjectNotFound(_)) if missing_action != MissingAction::Error => None,
+                    Err(Error::ObjectNotFound(_) | Error::PromisedObjectMissing(_))
+                        if missing_action != MissingAction::Error =>
+                    {
+                        None
+                    }
                     Err(Error::ObjectNotFound(_)) if ignore_missing => continue,
                     Err(err) => return Err(err),
                 };
@@ -3604,7 +3827,9 @@ fn walk_closure_ordered_with_missing(
         }
         let parents = match graph.parents_of(oid) {
             Ok(parents) => parents,
-            Err(Error::ObjectNotFound(_)) if missing_action != MissingAction::Error => {
+            Err(Error::ObjectNotFound(_) | Error::PromisedObjectMissing(_))
+                if missing_action != MissingAction::Error =>
+            {
                 if missing_action.reports_missing() && missing_seen.insert(oid) {
                     missing.push(oid);
                 }
@@ -5185,13 +5410,25 @@ fn record_literal_tree_diff(
 /// Plain normalized literal pathspec safe for [`trees_differ_at_literal_path`].
 fn retain_included_by_pickaxe(
     repo: &Repository,
+    graph: &mut CommitGraph<'_>,
     included: &mut HashSet<ObjectId>,
     pickaxe: &crate::diff::Pickaxe,
     paths: &[String],
+    repo_config: &ConfigSet,
 ) -> Result<()> {
+    let renames = PickaxeRenames::from_config(repo_config);
+    let mut blob_occurrence_cache = HashMap::new();
     let mut drop = Vec::new();
     for &oid in included.iter() {
-        if !pickaxe.matches_commit(repo, oid, paths)? {
+        if !pickaxe_matches_commit_with_graph(
+            repo,
+            graph,
+            pickaxe,
+            oid,
+            paths,
+            renames,
+            &mut blob_occurrence_cache,
+        )? {
             drop.push(oid);
         }
     }
@@ -5201,13 +5438,16 @@ fn retain_included_by_pickaxe(
     Ok(())
 }
 
+/// Pickaxe match of `commit_oid` against its parents in `graph`, which carries
+/// `--first-parent` truncation and grafts the way the walk sees them.
 fn pickaxe_matches_commit_with_graph(
     repo: &Repository,
     graph: &mut CommitGraph<'_>,
     pickaxe: &crate::diff::Pickaxe,
     commit_oid: ObjectId,
     paths: &[String],
-    blob_occurrence_cache: Option<&mut HashMap<ObjectId, usize>>,
+    renames: PickaxeRenames<'_>,
+    blob_occurrence_cache: &mut HashMap<ObjectId, usize>,
 ) -> Result<bool> {
     let parents = graph.parents_of(commit_oid)?;
     if parents.len() > 1 {
@@ -5228,6 +5468,7 @@ fn pickaxe_matches_commit_with_graph(
         parent_tree.as_ref(),
         &commit_tree,
         paths,
+        renames,
         blob_occurrence_cache,
     )
 }
@@ -5284,12 +5525,6 @@ fn dense_path_limited_count_from_included(
     included: &mut HashSet<ObjectId>,
     options: &RevListOptions,
 ) -> Result<usize> {
-    if let Some(filter) = options.commit_filter.as_ref().filter(|f| f.is_active()) {
-        included.retain(|oid| filter.matches(repo, *oid).unwrap_or(false));
-    }
-    if let Some(pickaxe) = options.pickaxe.as_ref() {
-        retain_included_by_pickaxe(repo, &mut *included, pickaxe, &options.paths)?;
-    }
     if options.until_cutoff.is_some() || options.since_cutoff.is_some() {
         let until = options.until_cutoff;
         let since = options.since_cutoff;
@@ -5528,16 +5763,6 @@ fn is_tree_mode(mode: u32) -> bool {
     mode == 0o040000
 }
 
-fn pathspec_entry_is_relevant(path: &str, is_tree: bool, pathspecs: &[String]) -> bool {
-    if crate::pathspec::matches_pathspec_list(path, pathspecs) {
-        return true;
-    }
-    if is_tree {
-        return crate::pathspec::pathspec_wants_descent_for_rev_tree(path, pathspecs);
-    }
-    false
-}
-
 fn read_parsed_tree(repo: &Repository, tree_oid: ObjectId) -> Result<Vec<TreeEntry>> {
     let object = repo.odb().read(&tree_oid)?;
     if object.kind != ObjectKind::Tree {
@@ -5715,7 +5940,9 @@ fn trees_differ_tree_entries(
                         let relevant =
                             pathspec_entry_is_relevant(&path, o_is_tree || n_is_tree, pathspecs);
                         if relevant {
-                            if o.oid != n.oid || canon_tree_mode(o.mode) != canon_tree_mode(n.mode)
+                            if o.oid != n.oid
+                                || crate::index::canon_mode(o.mode)
+                                    != crate::index::canon_mode(n.mode)
                             {
                                 if o_is_tree && n_is_tree {
                                     if trees_differ_for_pathspecs_optional(
@@ -5884,7 +6111,8 @@ fn trees_differ_at_literal_path(
                 (None, None) => false,
                 (None, Some(_)) | (Some(_), None) => true,
                 (Some((o_oid, o_mode)), Some((n_oid, n_mode))) => {
-                    o_oid != n_oid || canon_tree_mode(o_mode) != canon_tree_mode(n_mode)
+                    o_oid != n_oid
+                        || crate::index::canon_mode(o_mode) != crate::index::canon_mode(n_mode)
                 }
             };
             if let (Some(old), Some(new)) = (old_o, new_o) {
@@ -6001,6 +6229,7 @@ fn rev_list_result_from_commits_with_linkage(
         boundary_commits: Vec::new(),
         left_right_map: HashMap::new(),
         cherry_equivalent: HashSet::new(),
+        cherry_matches: Vec::new(),
         per_commit_object_counts: Vec::new(),
         object_walk_tips: Vec::new(),
         objects_print_commit: Vec::new(),
@@ -6118,7 +6347,7 @@ fn try_filtered_count_only(
         .collect();
     let grafts = crate::rev_parse::load_graft_parents(repo.git_dir());
     let graph_chain = if options.use_commit_graph && !exclude.is_empty() {
-        repo.caches().commit_graph_chain(repo.odb().objects_dir())
+        repo.odb().commit_graph_chain()
     } else {
         None
     };
@@ -6188,7 +6417,7 @@ fn try_commit_graph_count_only(
     if !crate::rev_parse::load_graft_parents(repo.git_dir()).is_empty() {
         return Ok(None);
     }
-    let Some(chain) = repo.caches().commit_graph_chain(repo.odb().objects_dir()) else {
+    let Some(chain) = repo.odb().commit_graph_chain() else {
         return Ok(None);
     };
     let n = if exclude.is_empty() {
@@ -6266,6 +6495,7 @@ fn try_rev_list_accelerated(
         skip_trees,
         true,
         false,
+        None,
     )?;
 
     let (commit_count, non_commit_count) = if excluded_object_ids.is_empty() {
@@ -6315,6 +6545,7 @@ fn try_rev_list_accelerated(
         boundary_commits: Vec::new(),
         left_right_map: HashMap::new(),
         cherry_equivalent: HashSet::new(),
+        cherry_matches: Vec::new(),
         per_commit_object_counts: Vec::new(),
         object_walk_tips: if options.objects {
             filter_want_tips
@@ -6392,6 +6623,7 @@ where
         skip_trees,
         true,
         false,
+        None,
     )?;
 
     for oid in reachable.iter_by_kind(ObjectKind::Commit) {
@@ -6472,6 +6704,7 @@ pub(crate) fn try_bitmap_reachable_commit_set_for_specs(
         skip_trees,
         true,
         false,
+        None,
     )?;
     if !excluded_object_ids.is_empty() {
         return Ok(None);
@@ -6497,11 +6730,10 @@ pub(crate) fn try_bitmap_reachable_commit_set_for_specs(
 }
 
 /// When `--max-count` (plus `--skip`) is at least this large, prefer the commit-graph
-/// rev-list path and truncate after ordering instead of the per-commit bounded walk.
+/// rev-list path and truncate after ordering instead of the per-commit bounded topo walk.
 ///
-/// The bounded walks that test exclusions per commit get slower than one up-front closure
-/// as the limit grows. [`try_bounded_limit_list`] is exempt: its walks stop early at any
-/// limit, or at the hide frontier, and cost no more per commit than the full path.
+/// Filtered and path-limited date walks stop at `--since` frontiers and at `-n`, so they
+/// are exempt. Plain bounded limit lists without cutoffs also stop early at any limit.
 const BOUNDED_LIMIT_LIST_EARLY_STOP_MAX: usize = 4096;
 
 fn bounded_limit_list_need(options: &RevListOptions) -> usize {
@@ -6530,6 +6762,10 @@ enum WalkControl {
     Stop,
 }
 
+fn date_heap_past_since_frontier(heap: &BinaryHeap<CommitDateKey>, since: i64) -> bool {
+    heap.is_empty() || heap.iter().all(|pending| pending.date < since)
+}
+
 /// Visit commits reachable from `include` in Git's default `rev-list` order, until `visit`
 /// returns [`WalkControl::Stop`].
 ///
@@ -6538,11 +6774,16 @@ enum WalkControl {
 /// going to the earlier discovery. Nothing waits for a commit's other children, so under
 /// clock skew or equal timestamps a parent can come out before one of its children, as in
 /// Git. Commits in `excluded` are neither visited nor traversed.
+///
+/// When `since_cutoff` is set and the heap uses committer dates (`author_dates` is false),
+/// the walk stops once every queued commit is older than the cutoff, matching Git's
+/// `--since` frontier after parents of the last in-window commit are enqueued.
 fn streaming_date_walk<'r>(
     graph: &mut CommitGraph<'r>,
     include: &[ObjectId],
     excluded: &HashSet<ObjectId>,
     author_dates: bool,
+    since_cutoff: Option<i64>,
     mut visit: impl FnMut(&mut CommitGraph<'r>, ObjectId) -> Result<WalkControl>,
 ) -> Result<()> {
     let mut heap = BinaryHeap::new();
@@ -6559,7 +6800,7 @@ fn streaming_date_walk<'r>(
         });
         next_seq += 1;
     }
-    while let Some(CommitDateKey { oid, .. }) = heap.pop() {
+    while let Some(CommitDateKey { oid, date, .. }) = heap.pop() {
         if visit(graph, oid)? == WalkControl::Stop {
             break;
         }
@@ -6574,8 +6815,154 @@ fn streaming_date_walk<'r>(
             });
             next_seq += 1;
         }
+        if !author_dates {
+            if let Some(since) = since_cutoff {
+                if date < since && date_heap_past_since_frontier(&heap, since) {
+                    break;
+                }
+            }
+        }
     }
     Ok(())
+}
+
+/// Parameters for [`open_commit_stream`].
+#[derive(Debug, Clone, Default)]
+pub struct CommitStreamParams {
+    /// Skip this many matching commits before yielding.
+    pub skip: usize,
+    /// Maximum commits to yield (`None` = unbounded).
+    pub limit: Option<usize>,
+    /// Exclude commits with committer date strictly before this Unix timestamp.
+    pub since: Option<i64>,
+    /// Exclude commits with committer date strictly after this Unix timestamp.
+    pub until: Option<i64>,
+    /// Follow only the first parent at merges when walking history.
+    pub first_parent: bool,
+}
+
+/// Lazy commit-only walk in default date order (no object/cherry side tables).
+pub struct CommitStream<'repo> {
+    graph: CommitGraph<'repo>,
+    heap: BinaryHeap<CommitDateKey>,
+    excluded: HashSet<ObjectId>,
+    queued: OidHashSet,
+    next_seq: u64,
+    skip: usize,
+    limit: Option<usize>,
+    since: Option<i64>,
+    until: Option<i64>,
+    seen: usize,
+    emitted: usize,
+    errored: Option<Error>,
+    _pack: crate::pack_store::PackReadContextGuard,
+}
+
+impl<'repo> CommitStream<'repo> {
+    fn push_tip(&mut self, tip: ObjectId) {
+        if self.excluded.contains(&tip) || !self.queued.insert(tip) {
+            return;
+        }
+        let date = self.graph.sort_key(tip, false);
+        self.heap.push(CommitDateKey {
+            oid: tip,
+            date,
+            seq: self.next_seq,
+        });
+        self.next_seq += 1;
+    }
+
+    fn enqueue_parents(&mut self, oid: ObjectId) {
+        let parents = match self.graph.parents_of(oid) {
+            Ok(p) => p,
+            Err(e) => {
+                self.errored = Some(e);
+                return;
+            }
+        };
+        for parent in parents {
+            self.push_tip(parent);
+        }
+    }
+}
+
+impl Iterator for CommitStream<'_> {
+    type Item = Result<ObjectId>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(err) = self.errored.take() {
+            return Some(Err(err));
+        }
+        loop {
+            let CommitDateKey { oid, date, .. } = self.heap.pop()?;
+            if self
+                .until
+                .is_some_and(|until| self.graph.committer_time(oid) > until)
+            {
+                self.enqueue_parents(oid);
+                continue;
+            }
+            if let Some(since) = self.since {
+                if date < since {
+                    if date_heap_past_since_frontier(&self.heap, since) {
+                        return None;
+                    }
+                    self.enqueue_parents(oid);
+                    continue;
+                }
+            }
+            self.seen += 1;
+            if self.seen <= self.skip {
+                self.enqueue_parents(oid);
+                continue;
+            }
+            if self.limit.is_some_and(|limit| self.emitted >= limit) {
+                return None;
+            }
+            self.emitted += 1;
+            self.enqueue_parents(oid);
+            return Some(Ok(oid));
+        }
+    }
+}
+
+/// Open a lazy commit walk; see [`CommitStream`].
+///
+/// # Errors
+///
+/// Propagates rev-list setup errors (for example invalid tips).
+pub fn open_commit_stream<'repo>(
+    repo: &'repo Repository,
+    include: &[ObjectId],
+    exclude: &[ObjectId],
+    params: &CommitStreamParams,
+) -> Result<CommitStream<'repo>> {
+    let pack = repo.odb().pack_read_context_guard();
+    let mut graph = CommitGraph::with_commit_graph(repo, params.first_parent, true);
+    let excluded = if exclude.is_empty() {
+        HashSet::new()
+    } else {
+        walk_closure(&mut graph, exclude)?
+    };
+    let mut stream = CommitStream {
+        graph,
+        heap: BinaryHeap::new(),
+        excluded,
+        queued: oid_hash_set(),
+        next_seq: 0,
+        skip: params.skip,
+        limit: params.limit,
+        since: params.since,
+        until: params.until,
+        seen: 0,
+        emitted: 0,
+        errored: None,
+        _pack: pack,
+    };
+    for &tip in include {
+        stream.push_tip(tip);
+    }
+    Ok(stream)
 }
 
 fn can_use_bounded_commit_filter_list(options: &RevListOptions) -> bool {
@@ -6585,13 +6972,19 @@ fn can_use_bounded_commit_filter_list(options: &RevListOptions) -> bool {
         .is_some_and(|f| f.is_active())
         || options.pickaxe.is_some();
     output_filter
-        && (options.max_count.is_some() || options.skip > 0)
-        && within_bounded_limit_list_cap(options)
-        && can_use_bounded_limit_list(&RevListOptions {
-            commit_filter: None,
-            pickaxe: None,
-            ..options.clone()
-        })
+        && (options.max_count.is_some()
+            || options.skip > 0
+            || options.count
+            || options.since_cutoff.is_some())
+        && options.ordering == OrderingMode::Default
+        && plain_commit_walk(
+            &RevListOptions {
+                commit_filter: None,
+                pickaxe: None,
+                ..options.clone()
+            },
+            false,
+        )
 }
 
 fn try_bounded_commit_filter_limit_list(
@@ -6599,106 +6992,234 @@ fn try_bounded_commit_filter_limit_list(
     include: &[ObjectId],
     exclude: &[ObjectId],
     options: &RevListOptions,
+    repo_config: &ConfigSet,
 ) -> Result<Option<RevListResult>> {
     let filter = options.commit_filter.as_ref().filter(|f| f.is_active());
     let pickaxe = options.pickaxe.as_ref();
+    let pickaxe_renames = PickaxeRenames::from_config(repo_config);
     if filter.is_none() && pickaxe.is_none() {
         return Ok(None);
     }
     if include.is_empty() || !can_use_bounded_commit_filter_list(options) {
         return Ok(None);
     }
-    let Some(max_count) = options.max_count else {
+    if !options.count
+        && options.max_count.is_none()
+        && options.skip == 0
+        && options.since_cutoff.is_none()
+    {
         return Ok(None);
-    };
+    }
+    let max_count = options.max_count;
+    if max_count == Some(0) {
+        if options.count {
+            let mut result = rev_list_result_from_commits(Vec::new());
+            result.reachable_commit_count = Some(0);
+            return Ok(Some(result));
+        }
+        return Ok(Some(rev_list_result_from_commits(Vec::new())));
+    }
 
     let mut commit_data = if options.retain_commit_data {
-        crate::objects::oid_hash_map_with_capacity(max_count.min(64))
+        crate::objects::oid_hash_map_with_capacity(max_count.unwrap_or(64).min(64))
     } else {
         oid_hash_map()
     };
-    let mut ordered = repo
-        .odb()
-        .with_pack_read_context(|| -> Result<Vec<ObjectId>> {
-            let mut graph = CommitGraph::with_commit_graph(
-                repo,
-                options.first_parent,
-                options.use_commit_graph,
-            );
-            let excluded = if exclude.is_empty() {
-                HashSet::new()
-            } else {
-                walk_closure(&mut graph, exclude)?
-            };
-            // Reuse traversal bytes for filters and output, without keeping every
-            // nonmatching commit when a selective filter scans a long history.
-            graph.keep_unreleased_commit_bytes();
+    let (mut ordered, filtered_count) =
+        repo.odb()
+            .with_pack_read_context(|| -> Result<(Vec<ObjectId>, Option<usize>)> {
+                let mut graph = CommitGraph::with_commit_graph(
+                    repo,
+                    options.first_parent,
+                    options.use_commit_graph,
+                );
+                let excluded = if exclude.is_empty() {
+                    HashSet::new()
+                } else {
+                    walk_closure(&mut graph, exclude)?
+                };
+                // Reuse traversal bytes for filters and output, without keeping every
+                // nonmatching commit when a selective filter scans a long history.
+                graph.keep_unreleased_commit_bytes();
 
-            let author_dates = options.ordering == OrderingMode::AuthorDateWalk;
-            let mut matched_seen = 0usize;
-            let mut ordered = Vec::with_capacity(max_count.min(64));
-            let mut pickaxe_blob_cache = HashMap::new();
-            let since = options.since_cutoff;
-            let until = options.until_cutoff;
-            streaming_date_walk(
-                &mut graph,
-                include,
-                &excluded,
-                author_dates,
-                |graph, oid| {
-                    let mut consider = true;
-                    if since.is_some() || until.is_some() {
-                        let ts = graph.committer_time(oid);
-                        if until.is_some_and(|u| ts > u) || since.is_some_and(|s| ts < s) {
-                            consider = false;
-                        }
-                    }
-
-                    if consider {
-                        let mut passes = true;
-                        if let Some(filter) = filter {
-                            passes = filter.matches_bytes(graph.commit_bytes(oid)?);
-                        }
-                        if passes {
-                            if let Some(px) = pickaxe {
-                                passes = pickaxe_matches_commit_with_graph(
-                                    repo,
-                                    graph,
-                                    px,
-                                    oid,
-                                    &options.paths,
-                                    Some(&mut pickaxe_blob_cache),
-                                )?;
+                let author_dates = options.ordering == OrderingMode::AuthorDateWalk;
+                let mut matched_seen = 0usize;
+                let mut match_count = 0usize;
+                let mut ordered = Vec::with_capacity(max_count.unwrap_or(64).min(64));
+                let mut pickaxe_blob_cache = HashMap::new();
+                let since = options.since_cutoff;
+                let until = options.until_cutoff;
+                let since_frontier = if author_dates { None } else { since };
+                streaming_date_walk(
+                    &mut graph,
+                    include,
+                    &excluded,
+                    author_dates,
+                    since_frontier,
+                    |graph, oid| {
+                        let mut consider = true;
+                        if since.is_some() || until.is_some() {
+                            let ts = graph.committer_time(oid);
+                            if until.is_some_and(|u| ts > u) || since.is_some_and(|s| ts < s) {
+                                consider = false;
                             }
                         }
-                        if passes {
-                            matched_seen += 1;
-                            if matched_seen > options.skip && ordered.len() < max_count {
-                                ordered.push(oid);
-                                if options.retain_commit_data {
-                                    commit_data
-                                        .insert(oid, parse_commit(graph.commit_bytes(oid)?)?);
+
+                        if consider {
+                            let mut passes = true;
+                            if let Some(filter) = filter {
+                                passes = filter.matches_bytes(graph.commit_bytes(oid)?);
+                            }
+                            if passes {
+                                if let Some(px) = pickaxe {
+                                    passes = pickaxe_matches_commit_with_graph(
+                                        repo,
+                                        graph,
+                                        px,
+                                        oid,
+                                        &options.paths,
+                                        pickaxe_renames,
+                                        &mut pickaxe_blob_cache,
+                                    )?;
+                                }
+                            }
+                            if passes {
+                                matched_seen += 1;
+                                if matched_seen > options.skip {
+                                    if options.count {
+                                        match_count += 1;
+                                    } else if max_count.is_none_or(|m| ordered.len() < m) {
+                                        ordered.push(oid);
+                                        if options.retain_commit_data {
+                                            commit_data.insert(
+                                                oid,
+                                                parse_commit(graph.commit_bytes(oid)?)?,
+                                            );
+                                        }
+                                    }
                                 }
                             }
                         }
-                    }
-                    graph.release_commit_bytes(oid);
+                        graph.release_commit_bytes(oid);
 
-                    Ok(if ordered.len() >= max_count {
-                        WalkControl::Stop
-                    } else {
-                        WalkControl::Continue
-                    })
-                },
-            )?;
+                        Ok(if options.count {
+                            if max_count.is_some_and(|m| match_count >= m) {
+                                WalkControl::Stop
+                            } else {
+                                WalkControl::Continue
+                            }
+                        } else if max_count.is_some_and(|m| ordered.len() >= m) {
+                            WalkControl::Stop
+                        } else {
+                            WalkControl::Continue
+                        })
+                    },
+                )?;
 
-            Ok(ordered)
+                if options.count {
+                    Ok((Vec::new(), Some(match_count)))
+                } else {
+                    Ok((ordered, None))
+                }
+            })?;
+
+    if options.reverse {
+        ordered.reverse();
+    }
+    let mut result = if let Some(n) = filtered_count {
+        let mut result = rev_list_result_from_commits(Vec::new());
+        result.reachable_commit_count = Some(n);
+        result
+    } else {
+        rev_list_result_from_commits(ordered)
+    };
+    result.commit_data = commit_data;
+    Ok(Some(result))
+}
+
+fn rev_list_options_without_parent_selectors(options: &RevListOptions) -> RevListOptions {
+    RevListOptions {
+        first_parent: false,
+        min_parents: None,
+        max_parents: None,
+        ..options.clone()
+    }
+}
+
+fn can_use_bounded_parent_filter_limit_list(options: &RevListOptions) -> bool {
+    let parent_selector =
+        options.first_parent || options.min_parents.is_some() || options.max_parents.is_some();
+    if !parent_selector {
+        return false;
+    }
+    let stripped = rev_list_options_without_parent_selectors(options);
+    options.ordering == OrderingMode::Default
+        && bounded_limit_list_common_inner(&stripped, false)
+        && plain_commit_walk(&stripped, false)
+}
+
+fn try_bounded_parent_filter_limit_list(
+    repo: &Repository,
+    include: &[ObjectId],
+    exclude: &[ObjectId],
+    options: &RevListOptions,
+) -> Result<Option<RevListResult>> {
+    if include.is_empty() || !can_use_bounded_parent_filter_limit_list(options) {
+        return Ok(None);
+    }
+    let max_count = options.max_count;
+    if max_count == Some(0) {
+        let mut result = rev_list_result_from_commits(Vec::new());
+        if options.count {
+            result.reachable_commit_count = Some(0);
+        }
+        return Ok(Some(result));
+    }
+    let min_p = options.min_parents.unwrap_or(0);
+    let max_p = options.max_parents.unwrap_or(usize::MAX);
+
+    let mut ordered = Vec::with_capacity(max_count.unwrap_or(64).min(64));
+    let mut commit_data = oid_hash_map();
+    repo.odb().with_pack_read_context(|| -> Result<()> {
+        let mut graph =
+            CommitGraph::with_commit_graph(repo, options.first_parent, options.use_commit_graph);
+        let excluded = if exclude.is_empty() {
+            HashSet::new()
+        } else {
+            walk_closure(&mut graph, exclude)?
+        };
+        if options.retain_commit_data {
+            graph.retain_parsed_commits(expected_parsed_commits(
+                options.skip.saturating_add(max_count.unwrap_or(64)),
+            ));
+        }
+
+        let mut matched_seen = 0usize;
+        streaming_date_walk(&mut graph, include, &excluded, false, None, |graph, oid| {
+            let parent_count = graph.parent_count_for_filter(oid)?;
+            if parent_count >= min_p && parent_count <= max_p {
+                matched_seen += 1;
+                if matched_seen > options.skip && max_count.is_none_or(|m| ordered.len() < m) {
+                    ordered.push(oid);
+                }
+            }
+            Ok(if max_count.is_some_and(|m| ordered.len() >= m) {
+                WalkControl::Stop
+            } else {
+                WalkControl::Continue
+            })
         })?;
+        commit_data = graph.take_retained_commits(&ordered);
+        Ok(())
+    })?;
 
     if options.reverse {
         ordered.reverse();
     }
     let mut result = rev_list_result_from_commits(ordered);
+    if options.count {
+        result.reachable_commit_count = Some(result.commits.len());
+    }
     result.commit_data = commit_data;
     Ok(Some(result))
 }
@@ -7032,17 +7553,24 @@ fn streaming_default_order_list(
                 ));
             }
             let mut seen = 0usize;
-            streaming_date_walk(&mut graph, include, &HashSet::new(), false, |_, oid| {
-                seen += 1;
-                if seen > options.skip {
-                    ordered.push(oid);
-                }
-                Ok(if ordered.len() >= max_count {
-                    WalkControl::Stop
-                } else {
-                    WalkControl::Continue
-                })
-            })?;
+            streaming_date_walk(
+                &mut graph,
+                include,
+                &HashSet::new(),
+                false,
+                None,
+                |_, oid| {
+                    seen += 1;
+                    if seen > options.skip {
+                        ordered.push(oid);
+                    }
+                    Ok(if ordered.len() >= max_count {
+                        WalkControl::Stop
+                    } else {
+                        WalkControl::Continue
+                    })
+                },
+            )?;
             commit_data = graph.take_retained_commits(&ordered);
             Ok(())
         })?;
@@ -7056,18 +7584,28 @@ fn streaming_default_order_list(
 }
 
 fn can_use_bounded_path_limit_list(options: &RevListOptions) -> bool {
-    options.max_count.is_some()
+    let since_date_bounded = options.since_cutoff.is_some()
+        && options.ordering == OrderingMode::Default
+        && plain_commit_walk(
+            &RevListOptions {
+                paths: Vec::new(),
+                pickaxe: None,
+                ..options.clone()
+            },
+            false,
+        );
+    (options.max_count.is_some() || since_date_bounded)
         && !options.paths.is_empty()
         && !options.full_history
         && !options.ancestry_path
         && !options.simplify_merges
         && !options.sparse
         && !options.count
-        && within_bounded_limit_list_cap(options)
-        && can_use_bounded_limit_list(&RevListOptions {
+        && (can_use_bounded_limit_list(&RevListOptions {
             paths: Vec::new(),
+            pickaxe: None,
             ..options.clone()
-        })
+        }) || since_date_bounded)
 }
 
 fn repo_commit_graph_enabled(repo: &Repository, cfg: &ConfigSet) -> bool {
@@ -7100,7 +7638,7 @@ fn dense_bloom_context_for_paths(
         && crate::pathspec::pathspecs_allow_bloom(&options.paths);
     let read_changed = read_paths && options.commit_graph_read_changed_paths;
     let chain = if use_bloom {
-        repo.caches().commit_graph_chain(repo.odb().objects_dir())
+        repo.odb().commit_graph_chain()
     } else {
         None
     };
@@ -7130,12 +7668,11 @@ fn try_bounded_path_limit_list(
         return Ok(None);
     }
 
-    let Some(max_count) = options.max_count else {
-        return Ok(None);
+    let max_count = match options.max_count {
+        Some(0) => return Ok(Some(Vec::new())),
+        Some(n) => n,
+        None => usize::MAX,
     };
-    if max_count == 0 {
-        return Ok(Some(Vec::new()));
-    }
     let mut graph =
         CommitGraph::with_commit_graph(repo, options.first_parent, options.use_commit_graph);
     let excluded = if exclude.is_empty() {
@@ -7155,6 +7692,11 @@ fn try_bounded_path_limit_list(
     };
 
     let author_dates = options.ordering == OrderingMode::AuthorDateWalk;
+    let since_frontier = if author_dates {
+        None
+    } else {
+        options.since_cutoff
+    };
     let paths = &options.paths;
     let mut heap = BinaryHeap::new();
     let mut queued = HashSet::new();
@@ -7172,6 +7714,8 @@ fn try_bounded_path_limit_list(
     }
 
     let mut cache = DenseWalkCache::default();
+    let pickaxe_renames = PickaxeRenames::from_config(repo_config);
+    let mut pickaxe_blob_cache = HashMap::new();
     let mut visible_seen = 0usize;
     let mut ordered = Vec::with_capacity(max_count.min(64));
     while let Some(item) = heap.pop() {
@@ -7198,7 +7742,19 @@ fn try_bounded_path_limit_list(
             .map(|f| f.matches(repo, oid))
             .transpose()?
             .unwrap_or(true);
-        if action.visible && filter_ok {
+        let pickaxe_ok = match options.pickaxe.as_ref() {
+            Some(pickaxe) if action.visible && filter_ok => pickaxe_matches_commit_with_graph(
+                repo,
+                &mut graph,
+                pickaxe,
+                oid,
+                paths,
+                pickaxe_renames,
+                &mut pickaxe_blob_cache,
+            )?,
+            _ => true,
+        };
+        if action.visible && filter_ok && pickaxe_ok {
             visible_seen += 1;
             if visible_seen > options.skip && ordered.len() < max_count {
                 ordered.push(oid);
@@ -7219,6 +7775,12 @@ fn try_bounded_path_limit_list(
                 seq: next_seq,
             });
             next_seq += 1;
+        }
+
+        if let Some(since) = since_frontier {
+            if item.date < since && date_heap_past_since_frontier(&heap, since) {
+                break;
+            }
         }
     }
 
@@ -7499,6 +8061,8 @@ pub(crate) struct CommitGraph<'r> {
     shallow_boundaries: OidHashSet,
     graft_parents: OidHashMap<Vec<ObjectId>>,
     subjects: HashMap<ObjectId, String>,
+    /// Full parent count before [`Self::first_parent_only`] truncation, when that mode is on.
+    full_parent_counts: OidHashMap<usize>,
     /// Parsed commits kept for the caller once [`Self::retain_parsed_commits`] is called.
     ///
     /// Retained commits are the only record of their tree and author time; those side maps
@@ -7548,9 +8112,7 @@ impl<'r> CommitGraph<'r> {
                 .into_iter()
                 .collect();
         let graph_chain = if use_commit_graph {
-            repo.caches()
-                .commit_graph_chain(repo.odb().objects_dir())
-                .map(|arc| (*arc).clone())
+            repo.odb().commit_graph_chain().map(|arc| (*arc).clone())
         } else {
             None
         };
@@ -7565,6 +8127,7 @@ impl<'r> CommitGraph<'r> {
             shallow_boundaries,
             graft_parents,
             subjects: HashMap::new(),
+            full_parent_counts: oid_hash_map(),
             retained: None,
             read_buf: Vec::new(),
             unreleased_bytes: None,
@@ -7639,6 +8202,23 @@ impl<'r> CommitGraph<'r> {
     pub(crate) fn parents_of(&mut self, oid: ObjectId) -> Result<Vec<ObjectId>> {
         self.populate(oid)?;
         Ok(self.parents.get(&oid).cloned().unwrap_or_default())
+    }
+
+    /// Parent count for `--merges` / `--no-merges` output filtering.
+    ///
+    /// Under [`Self::first_parent_only`], traversal follows only the first parent but merge
+    /// filters still use the commit's real parent count.
+    pub(crate) fn parent_count_for_filter(&mut self, oid: ObjectId) -> Result<usize> {
+        self.populate(oid)?;
+        if self.first_parent_only {
+            Ok(self
+                .full_parent_counts
+                .get(&oid)
+                .copied()
+                .unwrap_or_else(|| self.parents.get(&oid).map(|p| p.len()).unwrap_or(0)))
+        } else {
+            Ok(self.parents.get(&oid).map(|p| p.len()).unwrap_or(0))
+        }
     }
 
     fn committer_time(&mut self, oid: ObjectId) -> i64 {
@@ -7747,8 +8327,11 @@ impl<'r> CommitGraph<'r> {
                 if let Some(graft_parents) = self.graft_parents.get(&oid) {
                     parents = graft_parents.clone();
                 }
-                if self.first_parent_only && parents.len() > 1 {
-                    parents.truncate(1);
+                if self.first_parent_only {
+                    self.full_parent_counts.insert(oid, parents.len());
+                    if parents.len() > 1 {
+                        parents.truncate(1);
+                    }
                 }
                 self.committer_time.insert(oid, ctime);
                 self.parents.insert(oid, parents);
@@ -7766,8 +8349,11 @@ impl<'r> CommitGraph<'r> {
             if let Some(graft_parents) = self.graft_parents.get(&oid) {
                 parents = graft_parents.clone();
             }
-            if self.first_parent_only && parents.len() > 1 {
-                parents.truncate(1);
+            if self.first_parent_only {
+                self.full_parent_counts.insert(oid, parents.len());
+                if parents.len() > 1 {
+                    parents.truncate(1);
+                }
             }
             self.committer_time
                 .insert(oid, committer_unix_seconds_for_ordering(&commit.committer));
@@ -7803,8 +8389,11 @@ impl<'r> CommitGraph<'r> {
         if let Some(graft_parents) = self.graft_parents.get(&oid) {
             parents = graft_parents.clone();
         }
-        if self.first_parent_only && parents.len() > 1 {
-            parents.truncate(1);
+        if self.first_parent_only {
+            self.full_parent_counts.insert(oid, parents.len());
+            if parents.len() > 1 {
+                parents.truncate(1);
+            }
         }
         self.committer_time.insert(oid, ctime);
         self.author_time.insert(oid, atime);
@@ -8420,7 +9009,9 @@ fn commit_parent_trees(
     for &parent in parents {
         let commit = match load_commit(repo, parent) {
             Ok(commit) => commit,
-            Err(Error::ObjectNotFound(_)) if missing_action != MissingAction::Error => {
+            Err(Error::ObjectNotFound(_) | Error::PromisedObjectMissing(_))
+                if missing_action != MissingAction::Error =>
+            {
                 if missing_action.reports_missing() && missing_seen.insert(parent) {
                     missing.push(parent);
                 }
@@ -8538,11 +9129,31 @@ struct TreeWalkState {
     tree_blobs: HashMap<ObjectId, Arc<Vec<u8>>>,
     oid_len: Option<usize>,
     tree_read_buf: Vec<u8>,
+    cancel_watch: Option<Arc<AtomicBool>>,
+    cancel_poll_counter: u32,
+    /// Cached [`ParsedSparsePatterns::includes`] results for this walk.
+    sparse_match_cache: HashMap<String, bool>,
+    /// Subtrees fully enumerated for sparse at `(tree_oid, prefix)` on this walk.
+    sparse_complete_trees: HashSet<(ObjectId, String)>,
 }
 
 impl TreeWalkState {
-    fn new() -> Self {
-        Self::default()
+    fn new(cancel_watch: Option<Arc<AtomicBool>>) -> Self {
+        Self {
+            cancel_watch,
+            ..Self::default()
+        }
+    }
+
+    fn poll_cancel(&mut self) -> Result<()> {
+        let Some(flag) = self.cancel_watch.as_ref() else {
+            return Ok(());
+        };
+        self.cancel_poll_counter = self.cancel_poll_counter.wrapping_add(1);
+        if self.cancel_poll_counter & 0x3f == 0 {
+            poll_watch(flag)?;
+        }
+        Ok(())
     }
 
     fn oid_len(&mut self, repo: &Repository) -> usize {
@@ -8564,6 +9175,20 @@ impl TreeWalkState {
         Ok(blob)
     }
 
+    fn sparse_includes(
+        &mut self,
+        repo: &Repository,
+        patterns: &ParsedSparsePatterns,
+        path: &str,
+    ) -> bool {
+        if let Some(&included) = self.sparse_match_cache.get(path) {
+            return included;
+        }
+        let included = patterns.includes(path, repo.work_tree());
+        self.sparse_match_cache.insert(path.to_owned(), included);
+        included
+    }
+
     /// Returns `true` if this tree at `depth` should be skipped (already entered at same or
     /// shallower depth).
     fn should_skip_tree(&mut self, oid: ObjectId, depth: u64) -> bool {
@@ -8583,26 +9208,28 @@ impl TreeWalkState {
 
 fn object_walk_needs_child_read_info(
     filter: Option<&ObjectFilter>,
-    sparse_lines: Option<&[String]>,
+    sparse_patterns: Option<&ParsedSparsePatterns>,
     missing_action: MissingAction,
 ) -> bool {
-    filter.is_some() || sparse_lines.is_some() || missing_action != MissingAction::Error
+    filter.is_some() || sparse_patterns.is_some() || missing_action != MissingAction::Error
 }
 
+#[expect(clippy::too_many_arguments)]
 fn excluded_object_root_ids(
     repo: &Repository,
     object_roots: &[RootObject],
     missing_action: MissingAction,
-    sparse_lines: Option<&[String]>,
+    sparse_patterns: Option<&ParsedSparsePatterns>,
     skip_trees_for_type_filter: bool,
     omit_object_paths: bool,
     collect_tree_omits: bool,
+    cancel_watch: Option<Arc<AtomicBool>>,
 ) -> Result<HashSet<ObjectId>> {
     if object_roots.is_empty() {
         return Ok(HashSet::new());
     }
 
-    let mut tree_state = TreeWalkState::new();
+    let mut tree_state = TreeWalkState::new(cancel_watch);
     let mut emitted = HashSet::new();
     let mut objects = Vec::new();
     let mut omitted = Vec::new();
@@ -8624,7 +9251,7 @@ fn excluded_object_root_ids(
             None,
             false,
             missing_action,
-            sparse_lines,
+            sparse_patterns,
             skip_trees_for_type_filter,
             omit_object_paths,
             None,
@@ -8726,11 +9353,12 @@ fn collect_reachable_objects_segmented(
     filter: Option<&ObjectFilter>,
     filter_provided: bool,
     missing_action: MissingAction,
-    sparse_lines: Option<&[String]>,
+    sparse_patterns: Option<&ParsedSparsePatterns>,
     skip_trees_for_type_filter: bool,
     omit_object_paths: bool,
     packed_set: Option<&HashSet<ObjectId>>,
     collect_tree_omits: bool,
+    cancel_watch: Option<Arc<AtomicBool>>,
 ) -> Result<ReachableObjectsSegmented> {
     let mut emitted = HashSet::new();
     let mut result = Vec::new();
@@ -8738,16 +9366,19 @@ fn collect_reachable_objects_segmented(
     let mut missing = Vec::new();
     let mut missing_seen = HashSet::new();
     let mut segments: Vec<Vec<(ObjectId, String)>> = Vec::with_capacity(commits.len() + 1);
-    let mut tree_state = TreeWalkState::new();
+    let mut tree_state = TreeWalkState::new(cancel_watch.clone());
     let mut top_tree_omit =
         walk_needs_top_tree_omit_set(filter, collect_tree_omits).then(HashSet::<ObjectId>::new);
-    let mut combine_states = CombineSubState::prepare_sub_states(filter, collect_tree_omits);
+    let mut combine_states =
+        CombineSubState::prepare_sub_states(filter, collect_tree_omits, cancel_watch);
 
     for &commit_oid in commits {
         let start = result.len();
         let commit_tree = match graph.commit_tree(commit_oid) {
             Ok(tree) => tree,
-            Err(Error::ObjectNotFound(_)) if missing_action != MissingAction::Error => {
+            Err(Error::ObjectNotFound(_) | Error::PromisedObjectMissing(_))
+                if missing_action != MissingAction::Error =>
+            {
                 if missing_action.reports_missing() && missing_seen.insert(commit_oid) {
                     missing.push(commit_oid);
                 }
@@ -8761,7 +9392,9 @@ fn collect_reachable_objects_segmented(
                 result.push((tag_oid, "tag".to_owned()));
             }
         }
-        let parent_trees_slice = if filter.is_some() {
+        let parent_trees_slice = if filter
+            .is_some_and(|f| f.is_depth_sensitive() || matches!(f, ObjectFilter::SparseOid(_)))
+        {
             None
         } else {
             Some(graph.parent_commit_trees(commit_oid)?)
@@ -8773,12 +9406,9 @@ fn collect_reachable_objects_segmented(
             segments.push(result[start..].to_vec());
             continue;
         }
-        // The parent_union short-circuit dedups objects already reachable from a parent commit.
-        // With an active filter this changes which trees are *visited* per commit, which breaks
-        // Git's `tree:`/`combine:` skip-tree semantics (and the matching GIT_TRACE output): Git
-        // visits every reachable tree per commit and relies on each filter's own seen state to
-        // detect re-visits. Dedup of shown/omitted objects is already handled by `emitted` and the
-        // final omitted set, so skip the union optimization whenever a filter is present.
+        // Depth-sensitive filters (`tree:<n>` with n > 0, and combines containing them) must
+        // revisit trees at each commit so per-depth seen state matches Git. Other filters
+        // (including `sparse:oid`) still use unchanged-subtree skipping against parent trees.
         collect_tree_objects_filtered(
             repo,
             commit_tree,
@@ -8796,7 +9426,7 @@ fn collect_reachable_objects_segmented(
             filter,
             filter_provided,
             missing_action,
-            sparse_lines,
+            sparse_patterns,
             skip_trees_for_type_filter,
             omit_object_paths,
             packed_set,
@@ -8821,7 +9451,7 @@ fn collect_reachable_objects_segmented(
             filter,
             filter_provided,
             missing_action,
-            sparse_lines,
+            sparse_patterns,
             skip_trees_for_type_filter,
             omit_object_paths,
             packed_set,
@@ -9088,10 +9718,14 @@ struct CombineSubState {
 }
 
 impl CombineSubState {
-    fn new(parts_len: usize, collect_omits: bool) -> Vec<Self> {
+    fn new(
+        parts_len: usize,
+        collect_omits: bool,
+        cancel_watch: Option<Arc<AtomicBool>>,
+    ) -> Vec<Self> {
         (0..parts_len)
             .map(|_| Self {
-                tree_state: TreeWalkState::new(),
+                tree_state: TreeWalkState::new(cancel_watch.clone()),
                 tree_omit_set: collect_omits.then(HashSet::new),
                 is_skipping_tree: false,
                 skip_tree_oid: None,
@@ -9102,11 +9736,14 @@ impl CombineSubState {
     fn prepare_sub_states(
         filter: Option<&ObjectFilter>,
         collect_omits: bool,
+        cancel_watch: Option<Arc<AtomicBool>>,
     ) -> Option<Vec<CombineSubState>> {
         match filter {
-            Some(ObjectFilter::Combine(parts)) => {
-                Some(CombineSubState::new(parts.len(), collect_omits))
-            }
+            Some(ObjectFilter::Combine(parts)) => Some(CombineSubState::new(
+                parts.len(),
+                collect_omits,
+                cancel_watch,
+            )),
             _ => None,
         }
     }
@@ -9130,7 +9767,7 @@ fn collect_tree_objects_filtered(
     filter: Option<&ObjectFilter>,
     filter_provided: bool,
     missing_action: MissingAction,
-    sparse_lines: Option<&[String]>,
+    sparse_patterns: Option<&ParsedSparsePatterns>,
     skip_trees_for_type_filter: bool,
     omit_object_paths: bool,
     packed_set: Option<&HashSet<ObjectId>>,
@@ -9138,6 +9775,7 @@ fn collect_tree_objects_filtered(
     tree_omit_set: &mut Option<HashSet<ObjectId>>,
     combine_states: &mut Option<Vec<CombineSubState>>,
 ) -> Result<()> {
+    tree_state.poll_cancel()?;
     if !explicit_root {
         if let Some(parents) = parent_commit_trees {
             if subtree_unchanged_in_all_parents(repo, tree_state, parents, prefix, tree_oid)? {
@@ -9149,9 +9787,27 @@ fn collect_tree_objects_filtered(
             }
         }
     }
+    if sparse_patterns.is_some()
+        && parent_commit_trees.is_none()
+        && tree_state
+            .sparse_complete_trees
+            .contains(&(tree_oid, prefix.to_owned()))
+    {
+        if !packed_set.is_some_and(|p| p.contains(&tree_oid)) && emitted.insert(tree_oid) {
+            let out_path = if omit_object_paths {
+                String::new()
+            } else {
+                prefix.to_owned()
+            };
+            result.push((tree_oid, out_path));
+        }
+        return Ok(());
+    }
     let tree_blob = match tree_state.tree_blob(repo, tree_oid) {
         Ok(blob) => blob,
-        Err(Error::ObjectNotFound(_)) if missing_action != MissingAction::Error => {
+        Err(Error::ObjectNotFound(_) | Error::PromisedObjectMissing(_))
+            if missing_action != MissingAction::Error =>
+        {
             if missing_action.reports_missing() && missing_seen.insert(tree_oid) {
                 missing.push(tree_oid);
             }
@@ -9226,13 +9882,15 @@ fn collect_tree_objects_filtered(
     }
 
     if bits.skip_tree {
+        tree_state.tree_blobs.remove(&tree_oid);
         return Ok(());
     }
 
     let needs_child_read_info =
-        object_walk_needs_child_read_info(filter, sparse_lines, missing_action);
+        object_walk_needs_child_read_info(filter, sparse_patterns, missing_action);
     let mut parent_dirs: Option<ParentDirEntries> = None;
     for entry in TreeRefIter::with_oid_len(tree_blob.as_slice(), oid_len) {
+        tree_state.poll_cancel()?;
         let entry = entry?;
         if entry.mode == 0o160000 {
             continue;
@@ -9247,7 +9905,9 @@ fn collect_tree_objects_filtered(
             if needs_child_read_info {
                 let child_info = match repo.odb().read_info(&entry.oid) {
                     Ok(info) => info,
-                    Err(Error::ObjectNotFound(_)) if missing_action != MissingAction::Error => {
+                    Err(Error::ObjectNotFound(_) | Error::PromisedObjectMissing(_))
+                        if missing_action != MissingAction::Error =>
+                    {
                         if missing_action.reports_missing() && missing_seen.insert(entry.oid) {
                             missing.push(entry.oid);
                         }
@@ -9292,7 +9952,7 @@ fn collect_tree_objects_filtered(
                 filter,
                 filter_provided,
                 missing_action,
-                sparse_lines,
+                sparse_patterns,
                 skip_trees_for_type_filter,
                 omit_object_paths,
                 packed_set,
@@ -9319,7 +9979,9 @@ fn collect_tree_objects_filtered(
             if needs_child_read_info {
                 let child_info = match repo.odb().read_info(&entry.oid) {
                     Ok(info) => info,
-                    Err(Error::ObjectNotFound(_)) if missing_action != MissingAction::Error => {
+                    Err(Error::ObjectNotFound(_) | Error::PromisedObjectMissing(_))
+                        if missing_action != MissingAction::Error =>
+                    {
                         if missing_action.reports_missing() && missing_seen.insert(entry.oid) {
                             missing.push(entry.oid);
                         }
@@ -9328,7 +9990,8 @@ fn collect_tree_objects_filtered(
                     Err(err) => return Err(err),
                 };
                 if child_info.kind == ObjectKind::Blob {
-                    let sparse_blob = sparse_filter_includes_path(repo, &path, sparse_lines);
+                    let sparse_blob =
+                        sparse_filter_includes_path(repo, &path, sparse_patterns, tree_state);
                     let blob_bits = match filter {
                         None => ListFilterBits {
                             mark_seen: true,
@@ -9391,7 +10054,9 @@ fn collect_tree_objects_filtered(
             } else {
                 let child_info = match repo.odb().read_info(&entry.oid) {
                     Ok(info) => info,
-                    Err(Error::ObjectNotFound(_)) if missing_action != MissingAction::Error => {
+                    Err(Error::ObjectNotFound(_) | Error::PromisedObjectMissing(_))
+                        if missing_action != MissingAction::Error =>
+                    {
                         if missing_action.reports_missing() && missing_seen.insert(entry.oid) {
                             missing.push(entry.oid);
                         }
@@ -9437,6 +10102,13 @@ fn collect_tree_objects_filtered(
         }
     }
 
+    if sparse_patterns.is_some() && parent_commit_trees.is_none() {
+        tree_state
+            .sparse_complete_trees
+            .insert((tree_oid, prefix.to_owned()));
+    }
+    tree_state.tree_blobs.remove(&tree_oid);
+
     Ok(())
 }
 
@@ -9453,7 +10125,7 @@ fn collect_root_object(
     filter: Option<&ObjectFilter>,
     filter_provided: bool,
     missing_action: MissingAction,
-    sparse_lines: Option<&[String]>,
+    sparse_patterns: Option<&ParsedSparsePatterns>,
     skip_trees_for_type_filter: bool,
     omit_object_paths: bool,
     packed_set: Option<&HashSet<ObjectId>>,
@@ -9475,7 +10147,9 @@ fn collect_root_object(
 
     let object = match repo.odb().read(&root.oid) {
         Ok(object) => object,
-        Err(Error::ObjectNotFound(_)) if missing_action != MissingAction::Error => {
+        Err(Error::ObjectNotFound(_) | Error::PromisedObjectMissing(_))
+            if missing_action != MissingAction::Error =>
+        {
             if missing_action.reports_missing() && missing_seen.insert(root.oid) {
                 missing.push(root.oid);
             }
@@ -9540,7 +10214,7 @@ fn collect_root_object(
                 filter,
                 filter_provided,
                 missing_action,
-                sparse_lines,
+                sparse_patterns,
                 skip_trees_for_type_filter,
                 omit_object_paths,
                 packed_set,
@@ -9568,7 +10242,7 @@ fn collect_root_object(
                 filter,
                 filter_provided,
                 missing_action,
-                sparse_lines,
+                sparse_patterns,
                 skip_trees_for_type_filter,
                 omit_object_paths,
                 packed_set,
@@ -9579,7 +10253,8 @@ fn collect_root_object(
         }
         ObjectKind::Blob => {
             let path_for_sparse = root.root_path.as_deref().unwrap_or("");
-            let sparse_blob = sparse_filter_includes_path(repo, path_for_sparse, sparse_lines);
+            let sparse_blob =
+                sparse_filter_includes_path(repo, path_for_sparse, sparse_patterns, tree_state);
             let blob_bits = match filter {
                 None => ListFilterBits {
                     mark_seen: true,
@@ -9665,7 +10340,7 @@ fn collect_root_object(
                 filter,
                 filter_provided,
                 missing_action,
-                sparse_lines,
+                sparse_patterns,
                 skip_trees_for_type_filter,
                 omit_object_paths,
                 packed_set,
@@ -9692,16 +10367,18 @@ fn collect_reachable_objects_in_commit_order(
     filter: Option<&ObjectFilter>,
     filter_provided: bool,
     missing_action: MissingAction,
-    sparse_lines: Option<&[String]>,
+    sparse_patterns: Option<&ParsedSparsePatterns>,
     skip_trees_for_type_filter: bool,
     omit_object_paths: bool,
     packed_set: Option<&HashSet<ObjectId>>,
     collect_tree_omits: bool,
+    cancel_watch: Option<Arc<AtomicBool>>,
 ) -> Result<ReachableObjectsInOrder> {
-    let mut tree_state = TreeWalkState::new();
+    let mut tree_state = TreeWalkState::new(cancel_watch.clone());
     let mut top_tree_omit =
         walk_needs_top_tree_omit_set(filter, collect_tree_omits).then(HashSet::<ObjectId>::new);
-    let mut combine_states = CombineSubState::prepare_sub_states(filter, collect_tree_omits);
+    let mut combine_states =
+        CombineSubState::prepare_sub_states(filter, collect_tree_omits, cancel_watch);
     let mut emitted = HashSet::new();
     let mut result = Vec::new();
     let mut omitted = Vec::new();
@@ -9711,7 +10388,9 @@ fn collect_reachable_objects_in_commit_order(
     for &commit_oid in commits {
         let commit = match load_commit(repo, commit_oid) {
             Ok(commit) => commit,
-            Err(Error::ObjectNotFound(_)) if missing_action != MissingAction::Error => {
+            Err(Error::ObjectNotFound(_) | Error::PromisedObjectMissing(_))
+                if missing_action != MissingAction::Error =>
+            {
                 if missing_action.reports_missing() && missing_seen.insert(commit_oid) {
                     missing.push(commit_oid);
                 }
@@ -9746,7 +10425,7 @@ fn collect_reachable_objects_in_commit_order(
             filter,
             filter_provided,
             missing_action,
-            sparse_lines,
+            sparse_patterns,
             skip_trees_for_type_filter,
             omit_object_paths,
             packed_set,
@@ -9770,7 +10449,7 @@ fn collect_reachable_objects_in_commit_order(
             filter,
             filter_provided,
             missing_action,
-            sparse_lines,
+            sparse_patterns,
             skip_trees_for_type_filter,
             omit_object_paths,
             packed_set,
@@ -9827,35 +10506,13 @@ fn flatten_tree_with_mode(
         if child_info.kind == ObjectKind::Tree {
             subtrees.push((entry.oid, path));
         } else {
-            result.push((path, (entry.oid, canon_tree_mode(entry.mode))));
+            result.push((path, (entry.oid, crate::index::canon_mode(entry.mode))));
         }
     }
     for (child_oid, path) in subtrees {
         result.extend(flatten_tree_with_mode(repo, child_oid, &path, buf)?);
     }
     Ok(result)
-}
-
-/// Canonicalize a tree entry mode for path-change comparison, mirroring Git's `canon_mode`:
-/// regular files collapse to `0100644`/`0100755`, symlinks to `0120000`, gitlinks to
-/// `0160000`. This keeps mode comparison stable regardless of incidental low-bit noise.
-fn canon_tree_mode(mode: u32) -> u32 {
-    const S_IFMT: u32 = 0o170000;
-    const S_IFREG: u32 = 0o100000;
-    const S_IFLNK: u32 = 0o120000;
-    const S_IFGITLINK: u32 = 0o160000;
-    match mode & S_IFMT {
-        S_IFREG => {
-            if mode & 0o111 != 0 {
-                0o100755
-            } else {
-                0o100644
-            }
-        }
-        S_IFLNK => 0o120000,
-        S_IFGITLINK => 0o160000,
-        _ => mode,
-    }
 }
 
 /// Compute merge bases between two commits.
@@ -10618,6 +11275,35 @@ mod line_coverage_tests {
         }
         fs::write(repo.git_dir().join("refs/heads/main"), format!("{tip}\n")).expect("main");
         (dir, repo, tip)
+    }
+
+    #[test]
+    fn cherry_match_counterpart_and_index() {
+        let oid = |b: u8| ObjectId::from_bytes(&[b; 20]).expect("oid");
+        let one_to_one = CherryMatch {
+            patch_id: oid(9),
+            left: vec![oid(1)],
+            right: vec![oid(2)],
+            message_changed: Some(true),
+        };
+        let many = CherryMatch {
+            patch_id: oid(8),
+            left: vec![oid(3), oid(4)],
+            right: vec![oid(5)],
+            message_changed: None,
+        };
+        assert_eq!(one_to_one.counterpart(&oid(1)), Some(oid(2)));
+        assert_eq!(one_to_one.counterpart(&oid(2)), Some(oid(1)));
+        assert_eq!(one_to_one.counterpart(&oid(3)), None);
+        assert_eq!(many.counterpart(&oid(5)), None);
+
+        let mut result = rev_list_result_from_commits(Vec::new());
+        result.cherry_matches = vec![one_to_one.clone(), many.clone()];
+        let index = result.cherry_match_index();
+        assert_eq!(index.len(), 5);
+        assert_eq!(index[&oid(2)], &one_to_one);
+        assert_eq!(index[&oid(4)], &many);
+        assert!(!index.contains_key(&oid(9)));
     }
 
     #[test]

@@ -21,8 +21,13 @@ use grit_lib::refs::reftable::{
     reftable_write_ref_with_write_options, reftable_write_symref, reftable_write_transaction,
     RefValue, ReftableError, ReftableStack, ReftableTransactionUpdate,
 };
+use grit_lib::refs::store::{
+    open_ref_store, Expected, RawRef, RefStore, RefTransaction, RefUpdate, RefUpdateFlags,
+};
 use grit_lib::refs::{read_head, resolve_ref};
+use grit_lib::repo::{InitOptions, Repository};
 use grit_lib::state::{resolve_head, HeadState};
+use grit_lib::RefStorageFormat;
 
 use support::{
     build_commit_dag, git, git_empty_commit_oid, git_for_each_ref_peeled, git_fsck_strict,
@@ -619,6 +624,76 @@ fn concurrent_grit_writers_serialize_and_preserve_updates() {
 }
 
 #[test]
+fn concurrent_readers_survive_autocompact_writes() {
+    if !require_reftable_git() {
+        return;
+    }
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    let root = git_init_reftable_repo("main");
+    let git_dir = root.path().join(".git");
+    let opts = read_write_options(&git_dir);
+    let oid_a = git_empty_commit_oid(root.path());
+    let oid_b = git_empty_commit_oid(root.path());
+    let stop = Arc::new(AtomicBool::new(false));
+
+    let git_dir_writer = git_dir.clone();
+    let opts_writer = opts.clone();
+    let stop_writer = Arc::clone(&stop);
+    let writer = thread::spawn(move || {
+        let mut stack = ReftableStack::open(&git_dir_writer).expect("writer open");
+        for i in 0..120u8 {
+            let oid = if i.is_multiple_of(2) { oid_a } else { oid_b };
+            stack
+                .write_ref(
+                    &format!("refs/heads/stress/{i}"),
+                    RefValue::Val1(oid),
+                    None,
+                    &opts_writer,
+                )
+                .expect("write_ref");
+        }
+        stop_writer.store(true, Ordering::Release);
+    });
+
+    let mut readers = Vec::new();
+    for _ in 0..4 {
+        let git_dir_reader = git_dir.clone();
+        let stop_reader = Arc::clone(&stop);
+        readers.push(thread::spawn(move || {
+            let stack = ReftableStack::open(&git_dir_reader).expect("reader open");
+            while !stop_reader.load(Ordering::Acquire) {
+                stack.read_refs().expect("read_refs");
+                stack
+                    .list_refs_under_prefix(&git_dir_reader, "refs/heads/stress/")
+                    .expect("list refs");
+                thread::sleep(Duration::from_millis(1));
+            }
+            for _ in 0..30 {
+                stack.read_refs().expect("read_refs tail");
+                stack.read_all_logs().expect("read_all_logs tail");
+            }
+        }));
+    }
+
+    writer.join().expect("writer join");
+    for reader in readers {
+        reader.join().expect("reader join");
+    }
+
+    assert!(git_fsck_strict(root.path()));
+    if git_supports_refs_verify() {
+        git_refs_verify(root.path());
+    }
+    let show = git_show_ref(root.path());
+    for i in 0..120u8 {
+        let name = format!("refs/heads/stress/{i}");
+        assert!(show.contains_key(&name), "missing {name}");
+    }
+}
+
+#[test]
 fn resolve_head_after_git_commit_tree_on_reftable() {
     if !require_reftable_git() {
         return;
@@ -645,6 +720,129 @@ fn resolve_head_after_git_commit_tree_on_reftable() {
         }
         other => panic!("expected branch head, got {other:?}"),
     }
+}
+
+fn cas_oid(n: u32) -> ObjectId {
+    let mut b = [0u8; 20];
+    b[..4].copy_from_slice(&(n + 1).to_be_bytes());
+    ObjectId::from_bytes(&b).expect("oid")
+}
+
+fn reftable_table_file_count(git_dir: &Path) -> usize {
+    fs::read_dir(git_dir.join("reftable"))
+        .expect("reftable dir")
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name().to_str().is_some_and(|n| n.ends_with(".ref")))
+        .count()
+}
+
+#[test]
+fn ref_store_cas_updates_trigger_geometric_auto_compaction() {
+    if !require_reftable_git() {
+        return;
+    }
+    let root = tempfile::tempdir().expect("tempdir");
+    let repo = Repository::init(
+        root.path(),
+        &InitOptions::new()
+            .with_initial_branch("main")
+            .with_ref_storage(RefStorageFormat::Reftable),
+    )
+    .expect("init");
+    let git_dir = repo.git_dir().to_path_buf();
+    let store = open_ref_store(&git_dir).expect("open ref store");
+
+    const UPDATES: u32 = 100;
+    for i in 0..UPDATES {
+        let txn = RefTransaction::new()
+            .update(RefUpdate {
+                name: "refs/heads/hot".into(),
+                new_value: Some(RawRef::Direct(cas_oid(i))),
+                expected: if i == 0 {
+                    Expected::Missing
+                } else {
+                    Expected::Oid(cas_oid(i - 1))
+                },
+                reflog: None,
+                flags: RefUpdateFlags::default(),
+            })
+            .expect("txn");
+        store
+            .prepare(txn)
+            .expect("prepare")
+            .commit()
+            .expect("commit");
+    }
+
+    let tables = reftable_table_file_count(&git_dir);
+    assert!(
+        tables <= 8,
+        "expected logarithmic reftable stack after {UPDATES} CAS updates, got {tables} tables"
+    );
+    assert_eq!(
+        store
+            .read_raw("refs/heads/hot")
+            .expect("read hot")
+            .and_then(|r| match r {
+                RawRef::Direct(oid) => Some(oid),
+                _ => None,
+            }),
+        Some(cas_oid(UPDATES - 1))
+    );
+    assert!(git_fsck_strict(root.path()));
+    git_refs_verify(root.path());
+}
+
+#[test]
+fn geometric_factor_two_compacts_more_than_large_factor() {
+    if !require_reftable_git() {
+        return;
+    }
+    let run_updates = |factor: u8| -> usize {
+        let root = tempfile::tempdir().expect("tempdir");
+        let repo = Repository::init(
+            root.path(),
+            &InitOptions::new()
+                .with_initial_branch("main")
+                .with_ref_storage(RefStorageFormat::Reftable),
+        )
+        .expect("init");
+        let git_dir = repo.git_dir();
+        fs::write(
+            git_dir.join("config"),
+            format!("[reftable]\ngeometricFactor = {factor}\n"),
+        )
+        .expect("config");
+        let store = open_ref_store(git_dir).expect("open ref store");
+        for i in 0..60u32 {
+            let txn = RefTransaction::new()
+                .update(RefUpdate {
+                    name: "refs/heads/hot".into(),
+                    new_value: Some(RawRef::Direct(cas_oid(i))),
+                    expected: if i == 0 {
+                        Expected::Missing
+                    } else {
+                        Expected::Oid(cas_oid(i - 1))
+                    },
+                    reflog: None,
+                    flags: RefUpdateFlags::default(),
+                })
+                .expect("txn");
+            store
+                .prepare(txn)
+                .expect("prepare")
+                .commit()
+                .expect("commit");
+        }
+        reftable_table_file_count(git_dir)
+    };
+
+    let tables_factor_two = run_updates(2);
+    let tables_factor_255 = run_updates(255);
+    assert!(
+        tables_factor_two < tables_factor_255,
+        "factor 2 should compact more aggressively (2 -> {tables_factor_two} tables, 255 -> {tables_factor_255})"
+    );
 }
 
 #[test]

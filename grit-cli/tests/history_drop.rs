@@ -224,3 +224,143 @@ fn history_drop_dry_run_changes_no_refs() -> TestResult {
     assert_eq!(json["dry_run"], true);
     Ok(())
 }
+
+/// Issue #2204: `topic` (checked out) is base, c1, c2 (appends to a.txt), c3; `other` is built on
+/// `topic` with o1 editing the line c2 added, so `other` cannot be replayed without c2.
+fn init_sibling_conflict_repo(dir: &Path) -> Result<(String, String), Box<dyn Error>> {
+    git(dir, &["init", "-b", "main"])?;
+    let commit = |path: &str, content: &str, msg: &str| -> Result<(), Box<dyn Error>> {
+        fs::write(dir.join(path), content)?;
+        git(dir, &["add", path])?;
+        git(dir, &["commit", "-m", msg])?;
+        Ok(())
+    };
+    commit("a.txt", "1\n", "base")?;
+    git(dir, &["switch", "-c", "topic"])?;
+    commit("b.txt", "b1\n", "c1")?;
+    commit("a.txt", "1\nx\n", "c2")?;
+    commit("b.txt", "b3\n", "c3")?;
+    git(dir, &["switch", "-c", "other"])?;
+    commit("a.txt", "1\nxy\n", "o1")?;
+    let o1 = git(dir, &["rev-parse", "HEAD"])?.trim().to_string();
+    git(dir, &["switch", "topic"])?;
+    let topic = git(dir, &["rev-parse", "HEAD"])?.trim().to_string();
+    Ok((topic, o1))
+}
+
+#[test]
+fn history_drop_conflict_in_sibling_branch_names_branch_and_hints() -> TestResult {
+    let scratch = Scratch::new("sibling-human")?;
+    let dir = scratch.path();
+    let (topic, o1) = init_sibling_conflict_repo(dir)?;
+    let out = gs(dir, ["history", "drop", "topic~1"])?;
+    assert_eq!(out.status, Some(1), "{}", out.stderr);
+    assert!(
+        out.stderr
+            .contains("history drop has conflicts moving refs/heads/other onto the new history:"),
+        "{}",
+        out.stderr
+    );
+    assert!(
+        out.stderr.contains(&format!("commit {} o1", &o1[..7])),
+        "{}",
+        out.stderr
+    );
+    assert!(out.stderr.contains("  a.txt"), "{}", out.stderr);
+    assert!(
+        out.stderr.contains("hint: pass --update-refs head"),
+        "{}",
+        out.stderr
+    );
+    assert_eq!(git(dir, &["rev-parse", "topic"])?.trim(), topic);
+    assert_eq!(git(dir, &["rev-parse", "other"])?.trim(), o1);
+    Ok(())
+}
+
+#[test]
+fn history_drop_conflict_in_sibling_branch_json() -> TestResult {
+    let scratch = Scratch::new("sibling-json")?;
+    let dir = scratch.path();
+    let (_topic, o1) = init_sibling_conflict_repo(dir)?;
+    let out = gs(dir, ["history", "drop", "topic~1", "--json"])?;
+    assert_eq!(out.status, Some(1), "{}", out.stderr);
+    let json = parse_json(&out.stdout)?;
+    assert_eq!(json["kind"], "conflict");
+    assert_eq!(json["error"], "history drop has conflicts");
+    assert_eq!(json["commit"].as_str(), Some(o1.as_str()));
+    assert_eq!(json["conflicts"], serde_json::json!(["a.txt"]));
+    assert_eq!(json["refs"], serde_json::json!(["refs/heads/other"]));
+    assert!(
+        json["hint"]
+            .as_str()
+            .is_some_and(|hint| hint.contains("--update-refs head")),
+        "{json}"
+    );
+    Ok(())
+}
+
+#[test]
+fn history_drop_update_refs_head_skips_conflicting_sibling() -> TestResult {
+    let scratch = Scratch::new("sibling-head")?;
+    let dir = scratch.path();
+    let (topic, o1) = init_sibling_conflict_repo(dir)?;
+    let out = gs(
+        dir,
+        [
+            "history",
+            "drop",
+            "topic~1",
+            "--update-refs",
+            "head",
+            "--json",
+        ],
+    )?;
+    assert!(out.success(), "{}", out.stderr);
+    let json = parse_json(&out.stdout)?;
+    let refs: Vec<&str> = json["refs"]
+        .as_array()
+        .ok_or("refs array")?
+        .iter()
+        .filter_map(|row| row["ref"].as_str())
+        .collect();
+    assert_eq!(refs, vec!["refs/heads/topic"]);
+    assert_ne!(git(dir, &["rev-parse", "topic"])?.trim(), topic);
+    assert_eq!(git(dir, &["rev-parse", "other"])?.trim(), o1);
+    assert_eq!(git(dir, &["show", "topic:a.txt"])?, "1\n");
+    git(dir, &["fsck", "--strict"])?;
+    Ok(())
+}
+
+#[test]
+fn history_drop_conflict_on_current_branch_has_no_refs_or_hint() -> TestResult {
+    let scratch = Scratch::new("own-conflict")?;
+    let dir = scratch.path();
+    git(dir, &["init", "-b", "main"])?;
+    for (content, msg) in [
+        ("1\nbase\n3\n", "a"),
+        ("1\nleft\n3\n", "b"),
+        ("1\nright\n3\n", "c"),
+    ] {
+        fs::write(dir.join("f.txt"), content)?;
+        git(dir, &["add", "f.txt"])?;
+        git(dir, &["commit", "-m", msg])?;
+    }
+    let c = git(dir, &["rev-parse", "HEAD"])?.trim().to_string();
+    let out = gs(dir, ["history", "drop", "HEAD~1", "--json"])?;
+    assert_eq!(out.status, Some(1), "{}", out.stderr);
+    let json = parse_json(&out.stdout)?;
+    assert_eq!(json["commit"].as_str(), Some(c.as_str()));
+    assert!(json.get("refs").is_none(), "{json}");
+    assert!(json.get("hint").is_none(), "{json}");
+    let human = gs(dir, ["history", "drop", "HEAD~1"])?;
+    assert!(
+        human.stderr.contains(&format!(
+            "history drop has conflicts in:\n  commit {} c\n  f.txt",
+            &c[..7]
+        )),
+        "{}",
+        human.stderr
+    );
+    assert!(!human.stderr.contains("hint:"), "{}", human.stderr);
+    Ok(())
+}

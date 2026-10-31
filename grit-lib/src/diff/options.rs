@@ -50,7 +50,7 @@ impl DiffAlgorithm {
         }
     }
 
-    /// Whether this selection uses Git's histogram engine (`imara-diff`).
+    /// Whether this selection uses the histogram line-diff engine.
     #[must_use]
     pub fn uses_git_histogram(self) -> bool {
         matches!(self, Self::Histogram)
@@ -72,8 +72,9 @@ pub enum RenameDetection {
 }
 
 impl Default for RenameDetection {
+    /// 50% similarity, Git's default for `-M` and `diff.renames=true`.
     fn default() -> Self {
-        Self::Similarity(40)
+        Self::Similarity(50)
     }
 }
 
@@ -116,6 +117,8 @@ pub struct DiffOptions {
     /// When set, incremented on each blob ODB read during tree content loading (tests only).
     #[doc(hidden)]
     pub blob_read_counter: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+    /// For [`super::diff_paths`] only: count lines via [`super::line_change_counts`] without hunks.
+    pub(crate) no_index_stat_only: bool,
 }
 
 impl Default for DiffOptions {
@@ -131,6 +134,7 @@ impl Default for DiffOptions {
             word_level_inline: true,
             function_context: false,
             blob_read_counter: None,
+            no_index_stat_only: false,
         }
     }
 }
@@ -146,6 +150,7 @@ impl PartialEq for DiffOptions {
             && self.whitespace == other.whitespace
             && self.word_level_inline == other.word_level_inline
             && self.function_context == other.function_context
+            && self.no_index_stat_only == other.no_index_stat_only
     }
 }
 
@@ -219,6 +224,13 @@ impl DiffOptions {
     #[must_use]
     pub fn with_whitespace(mut self, whitespace: WhitespaceMode) -> Self {
         self.whitespace = whitespace;
+        self
+    }
+
+    /// When true, [`super::diff_paths`] uses [`super::line_change_counts`] instead of building hunks.
+    #[must_use]
+    pub fn with_no_index_stat_only(mut self, stat_only: bool) -> Self {
+        self.no_index_stat_only = stat_only;
         self
     }
 
@@ -344,10 +356,20 @@ mod tests {
         assert!(!opts.indent_heuristic);
         assert_eq!(opts.renames, RenameDetection::Off);
 
-        let cfg2 = config_from("[diff]\n\trenames = copies\n");
+        for on in [
+            "",
+            "[diff]\n\trenames = true\n",
+            "[diff]\n\trenames = copies\n",
+        ] {
+            assert_eq!(
+                DiffOptions::from_config(&config_from(on)).renames,
+                RenameDetection::Similarity(50),
+                "config {on:?}"
+            );
+        }
         assert_eq!(
-            DiffOptions::from_config(&cfg2).renames,
-            RenameDetection::default()
+            DiffOptions::default().renames,
+            RenameDetection::Similarity(50)
         );
 
         for off in ["no", "0", "off", "OFF"] {

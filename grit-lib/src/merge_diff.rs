@@ -127,25 +127,12 @@ pub fn combined_merge_parent_blob_paths(
     any_rename.then_some(per_parent)
 }
 
-/// Mode of the blob at `path` in `tree`, or `None` if missing / not a blob.
-fn blob_mode_at_path(odb: &Odb, tree: &ObjectId, path: &str) -> Option<u32> {
-    let mut current = *tree;
-    let parts: Vec<&str> = path.split('/').collect();
-    for (pi, part) in parts.iter().enumerate() {
-        let obj = odb.read(&current).ok()?;
-        let entries = crate::objects::parse_tree(&obj.data).ok()?;
-        let found = entries
-            .iter()
-            .find(|e| std::str::from_utf8(&e.name).ok() == Some(*part))?;
-        if pi + 1 == parts.len() {
-            return Some(found.mode);
-        }
-        if found.mode != 0o040000 {
-            return None;
-        }
-        current = found.oid;
-    }
-    None
+/// The entry at the `repo_relpath::storage_string` path `path` in `tree`; unreadable trees count
+/// as missing.
+fn entry_at_path(odb: &Odb, tree: &ObjectId, path: &str) -> Option<crate::objects::TreeEntry> {
+    odb.tree_entry_at_path(tree, &crate::repo_relpath::storage_bytes(path))
+        .ok()
+        .flatten()
 }
 
 /// Enrich a combined diff path with per-parent rename info (`-M`/`-C`).
@@ -183,15 +170,12 @@ pub fn enrich_combined_path_renames(
         if src.is_empty() || src == &path.path {
             continue;
         }
-        let (Some(oid), Some(mode)) = (
-            blob_oid_at_path(odb, &parent_trees[i], src),
-            blob_mode_at_path(odb, &parent_trees[i], src),
-        ) else {
+        let Some(entry) = entry_at_path(odb, &parent_trees[i], src) else {
             continue;
         };
         side.status = CombinedParentStatus::Renamed;
-        side.oid = oid;
-        side.mode = mode;
+        side.oid = entry.oid;
+        side.mode = entry.mode;
         side.rename_from = Some(src.clone());
     }
 }
@@ -293,6 +277,20 @@ fn diff_driver_binary_config(config: &ConfigSet, driver: &str) -> bool {
     config
         .get(&key)
         .is_some_and(|v| parse_bool(v.as_str()).unwrap_or(false))
+}
+
+/// True when a path's `diff=<driver>` attribute pairs with an explicit `diff.<driver>.binary=false`.
+///
+/// Git resolves the driver before the big-file shortcut and keeps such paths textual even above
+/// `core.bigFileThreshold`.
+#[must_use]
+pub fn diff_driver_forces_text(git_dir: &Path, config: &ConfigSet, path: &str) -> bool {
+    let fa = attrs_for_repo_path(git_dir, path);
+    let DiffAttr::Driver(driver) = fa.diff_attr else {
+        return false;
+    };
+    let key = format!("diff.{driver}.binary");
+    config.get(&key).and_then(|v| parse_bool(v.as_str()).ok()) == Some(false)
 }
 
 /// Force `Binary files ... differ` when the path's diff driver sets `binary`, except for symlinks.
@@ -984,22 +982,7 @@ pub fn read_blob_at_path(odb: &Odb, tree: &ObjectId, path: &str) -> Option<Vec<u
 /// `path` uses the reversible `repo_relpath::storage_string` representation.
 #[must_use]
 pub fn blob_oid_at_path(odb: &Odb, tree: &ObjectId, path: &str) -> Option<ObjectId> {
-    let mut current = *tree;
-    let bytes = crate::repo_relpath::storage_bytes(path);
-    let parts: Vec<&[u8]> = bytes.split(|&b| b == b'/').collect();
-    for (pi, part) in parts.iter().enumerate() {
-        let obj = odb.read(&current).ok()?;
-        let entries = crate::objects::parse_tree(&obj.data).ok()?;
-        let found = entries.iter().find(|e| e.name == *part)?;
-        if pi + 1 == parts.len() {
-            return Some(found.oid);
-        }
-        if found.mode != 0o040000 {
-            return None;
-        }
-        current = found.oid;
-    }
-    None
+    entry_at_path(odb, tree, path).map(|entry| entry.oid)
 }
 
 fn abbrev_hex(oid: &ObjectId, abbrev: usize) -> String {

@@ -26,8 +26,17 @@
 //! `[include] path = <path>` and `[includeIf "<condition>"] path = <path>`
 //! are supported. Conditions: `gitdir:`, `gitdir/i:`, `onbranch:`,
 //! and `hasconfig:remote.*.url:`.
+//!
+//! An included file is merged in place, at the position of its directive, so
+//! later entries still override it. `hasconfig:remote.*.url:<glob>` matches
+//! against every `remote.<name>.url` value of the whole load, not just the
+//! files read so far: a global include can select a work identity from a
+//! remote defined in the repository `config`. As in Git, remote URLs may not
+//! be set in a file reached through a conditional include once such a
+//! condition is evaluated ([`ConfigError::RemoteUrlInHasconfigInclude`]).
 
 use crate::git_path::CanonicalizeExt;
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use crate::environment::Environment;
@@ -37,9 +46,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
-#[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
-
 use crate::error::{BadNumericSource, ConfigError, Error, Result};
 
 /// Test-only counters for config cascade load activity (see `porcelain_ops_load_config_cascade_once`).
@@ -47,14 +53,13 @@ use crate::error::{BadNumericSource, ConfigError, Error, Result};
 pub mod cascade_load_counters {
     use std::cell::Cell;
 
-    use super::{AtomicUsize, Ordering};
-
+    // Counters are per thread like `MEASURING`, so tests measuring on parallel threads do not
+    // add to or reset each other's counts.
     thread_local! {
         static MEASURING: Cell<bool> = const { Cell::new(false) };
+        static UNCACHED: Cell<usize> = const { Cell::new(0) };
+        static CACHE_VALIDATED: Cell<usize> = const { Cell::new(0) };
     }
-
-    static UNCACHED: AtomicUsize = AtomicUsize::new(0);
-    static CACHE_VALIDATED: AtomicUsize = AtomicUsize::new(0);
 
     /// Run `f` while recording cascade loads on this thread only (parallel-safe).
     pub fn measure<R>(f: impl FnOnce() -> R) -> R {
@@ -69,20 +74,20 @@ pub mod cascade_load_counters {
 
     /// Reset counters before an operation under test.
     pub fn reset() {
-        UNCACHED.store(0, Ordering::SeqCst);
-        CACHE_VALIDATED.store(0, Ordering::SeqCst);
+        UNCACHED.with(|c| c.set(0));
+        CACHE_VALIDATED.with(|c| c.set(0));
     }
 
     /// Full cascade parses (cache miss).
     #[must_use]
     pub fn uncached_loads() -> usize {
-        UNCACHED.load(Ordering::SeqCst)
+        UNCACHED.with(Cell::get)
     }
 
     /// Served from the process-global config cache after stat revalidation.
     #[must_use]
     pub fn cache_validated_loads() -> usize {
-        CACHE_VALIDATED.load(Ordering::SeqCst)
+        CACHE_VALIDATED.with(Cell::get)
     }
 
     /// Total [`ConfigSet::load`] / [`ConfigSet::load_with_options`] invocations.
@@ -92,11 +97,9 @@ pub mod cascade_load_counters {
     }
 
     pub(crate) fn record_uncached() {
-        MEASURING.with(|m| {
-            if m.get() {
-                UNCACHED.fetch_add(1, Ordering::SeqCst);
-            }
-        });
+        if MEASURING.with(Cell::get) {
+            UNCACHED.with(|c| c.set(c.get() + 1));
+        }
     }
 }
 use crate::refs;
@@ -280,6 +283,31 @@ impl Default for LoadConfigOptions {
     }
 }
 
+impl LoadConfigOptions {
+    /// Options for the full cascade of the repository at `git_dir`, as its
+    /// [`crate::repo::Repository`] handle loads it: system config included, `gitdir:`
+    /// conditions matched against `git_dir`, and the local `config` read through `repo_caches`.
+    ///
+    /// Every loader of one repository's cascade must use these options so they share a single
+    /// [`crate::repo_caches::RepoCaches`] cache entry instead of parsing the files again.
+    pub(crate) fn for_repository(
+        env: &Environment,
+        git_dir: Option<&Path>,
+        repo_caches: Option<Arc<crate::repo_caches::RepoCaches>>,
+    ) -> Self {
+        Self {
+            include_ctx: IncludeContext {
+                git_dir: git_dir.map(Path::to_path_buf),
+                cwd: env.cwd.clone(),
+                pwd: env.pwd.clone(),
+                ..IncludeContext::default()
+            },
+            repo_caches,
+            ..Self::default()
+        }
+    }
+}
+
 /// Source file for `--show-origin` style output.
 ///
 /// `-f` / `--file` reads use `command` scope but keep a real file path; synthetic
@@ -358,22 +386,23 @@ pub fn canonical_key(raw: &str) -> Result<String> {
         ));
     }
 
-    if first_dot == last_dot {
-        // No subsection: section.name
-        Ok(format!(
-            "{}.{}",
-            section.to_lowercase(),
-            name.to_lowercase()
-        ))
+    let mut key = String::with_capacity(raw.len());
+    push_lowercase(&mut key, section);
+    key.push('.');
+    if first_dot != last_dot {
+        key.push_str(&raw[first_dot + 1..last_dot]);
+        key.push('.');
+    }
+    push_lowercase(&mut key, name);
+    Ok(key)
+}
+
+/// Append `s` lowercased like [`str::to_lowercase`], without a temporary for ASCII input.
+fn push_lowercase(out: &mut String, s: &str) {
+    if s.is_ascii() {
+        out.extend(s.bytes().map(|b| char::from(b.to_ascii_lowercase())));
     } else {
-        // section.subsection.name
-        let subsection = &raw[first_dot + 1..last_dot];
-        Ok(format!(
-            "{}.{}.{}",
-            section.to_lowercase(),
-            subsection,
-            name.to_lowercase()
-        ))
+        out.push_str(&s.to_lowercase());
     }
 }
 
@@ -423,6 +452,9 @@ fn reject_valueless_negotiation_algorithm(
 struct Parser {
     section: String,
     subsection: Option<String>,
+    /// `section.` or `section.subsection.` in canonical case, shared by every key of the
+    /// current section.
+    key_prefix: String,
 }
 
 impl Parser {
@@ -430,23 +462,36 @@ impl Parser {
         Self {
             section: String::new(),
             subsection: None,
+            key_prefix: String::new(),
         }
     }
 
     fn valid_variable_name(name: &str) -> bool {
         let name = name.trim();
-        name.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
-            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        name.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+            && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    }
+
+    fn set_section(&mut self, section: String, subsection: Option<String>) {
+        self.key_prefix.clear();
+        push_lowercase(&mut self.key_prefix, &section);
+        self.key_prefix.push('.');
+        if let Some(sub) = &subsection {
+            self.key_prefix.push_str(sub);
+            self.key_prefix.push('.');
+        }
+        self.section = section;
+        self.subsection = subsection;
     }
 
     /// Build the canonical key for a variable name in the current section.
+    ///
+    /// `name` must already satisfy [`Self::valid_variable_name`], so it is ASCII.
     fn make_key(&self, name: &str) -> String {
-        let sec = self.section.to_lowercase();
-        let var = name.to_lowercase();
-        match &self.subsection {
-            Some(sub) => format!("{sec}.{sub}.{var}"),
-            None => format!("{sec}.{var}"),
-        }
+        let mut key = String::with_capacity(self.key_prefix.len() + name.len());
+        key.push_str(&self.key_prefix);
+        push_lowercase(&mut key, name);
+        key
     }
 
     /// Parse a section header line like `[section]` or `[section "subsection"]`.
@@ -499,7 +544,7 @@ impl Parser {
         let inside = &trimmed[1..end];
         // Check for subsection: [section "subsection"]
         if let Some(quote_start) = inside.find('"') {
-            self.section = inside[..quote_start].trim().to_owned();
+            let section = inside[..quote_start].trim().to_owned();
             let rest = &inside[quote_start + 1..];
             // Find unescaped closing quote
             let mut sub = String::new();
@@ -515,10 +560,9 @@ impl Parser {
                     sub.push(ch);
                 }
             }
-            self.subsection = Some(sub);
+            self.set_section(section, Some(sub));
         } else {
-            self.section = inside.trim().to_owned();
-            self.subsection = None;
+            self.set_section(inside.trim().to_owned(), None);
         }
         // Check for inline content after the closing `]`
         let after = trimmed[end + 1..].trim();
@@ -558,8 +602,7 @@ impl Parser {
             }
             let raw_value = trimmed[eq_pos + 1..].trim();
             // Strip inline comment (not inside quotes)
-            let value = strip_inline_comment(raw_value);
-            let value = parse_config_value(&value);
+            let value = parse_config_value(strip_inline_comment(raw_value));
             let key = self.make_key(raw_name);
             Some((key, Some(value)))
         } else {
@@ -595,17 +638,19 @@ fn entry_line_value_has_unclosed_quote(line: &str) -> bool {
     let raw_value = trimmed[eq_pos + 1..].trim_start();
     let mut in_quote = false;
     let mut last_was_backslash = false;
-    for ch in raw_value.chars() {
-        match ch {
-            '"' if !last_was_backslash => {
+    // Every byte that matters is ASCII, and UTF-8 never reuses ASCII bytes inside a
+    // multi-byte character, so scanning bytes gives the same answer as scanning chars.
+    for b in raw_value.bytes() {
+        match b {
+            b'"' if !last_was_backslash => {
                 in_quote = !in_quote;
                 last_was_backslash = false;
             }
-            '\\' if !last_was_backslash => {
+            b'\\' if !last_was_backslash => {
                 last_was_backslash = true;
                 continue;
             }
-            '#' | ';' if !in_quote && !last_was_backslash => return false,
+            b'#' | b';' if !in_quote && !last_was_backslash => return false,
             _ => {
                 last_was_backslash = false;
             }
@@ -629,22 +674,22 @@ fn value_line_continues(line: &str) -> bool {
     let mut in_quote = false;
     let mut last_was_backslash = false;
     let mut in_comment = false;
-    for ch in value_part.chars() {
+    for b in value_part.bytes() {
         if in_comment {
             // Inside comment, backslash doesn't matter
             last_was_backslash = false;
             continue;
         }
-        match ch {
-            '"' if !last_was_backslash => {
+        match b {
+            b'"' if !last_was_backslash => {
                 in_quote = !in_quote;
                 last_was_backslash = false;
             }
-            '\\' if !last_was_backslash => {
+            b'\\' if !last_was_backslash => {
                 last_was_backslash = true;
                 continue;
             }
-            '#' | ';' if !in_quote && !last_was_backslash => {
+            b'#' | b';' if !in_quote && !last_was_backslash => {
                 in_comment = true;
                 last_was_backslash = false;
             }
@@ -657,40 +702,33 @@ fn value_line_continues(line: &str) -> bool {
     last_was_backslash && !in_comment
 }
 
-/// Strip an inline comment (`#` or `;`) that is not inside quotes.
-fn strip_inline_comment(s: &str) -> String {
+/// Strip an inline comment (`#` or `;`) that is not inside quotes, and the whitespace
+/// before it. The result is always a prefix of `s`.
+fn strip_inline_comment(s: &str) -> &str {
+    let bytes = s.as_bytes();
     let mut in_quote = false;
     let mut last_was_backslash = false;
-    let mut result = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(ch) = chars.next() {
-        match ch {
-            '"' if !last_was_backslash => {
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' if !last_was_backslash => {
                 in_quote = !in_quote;
-                result.push(ch);
                 last_was_backslash = false;
             }
-            '\\' if !last_was_backslash => {
+            b'\\' if !last_was_backslash => {
                 last_was_backslash = true;
-                result.push(ch);
-                if in_quote {
-                    if let Some(&next) = chars.peek() {
-                        result.push(next);
-                        chars.next();
-                        last_was_backslash = false;
-                    }
+                if in_quote && i + 1 < bytes.len() {
+                    i += 1;
+                    last_was_backslash = false;
                 }
             }
-            '#' | ';' if !in_quote && !last_was_backslash => break,
-            _ => {
-                last_was_backslash = false;
-                result.push(ch);
-            }
+            b'#' | b';' if !in_quote && !last_was_backslash => break,
+            _ => last_was_backslash = false,
         }
+        i += 1;
     }
-    // Trim trailing whitespace that was before the comment
-    let trimmed = result.trim_end();
-    trimmed.to_owned()
+    // `i` stops on an ASCII byte or the end, so it is a char boundary.
+    s[..i].trim_end()
 }
 
 /// Parse a config value after `=` (comments already stripped).
@@ -935,23 +973,25 @@ impl ConfigFile {
 
             // For entry lines, we need to check continuation.
             // Build a logical line by joining continuations.
-            let mut logical_line = line.clone();
+            let mut logical_line = Cow::Borrowed(line.as_str());
             while value_line_continues(&logical_line) && idx < raw_lines.len() {
                 // Remove the trailing backslash
                 let t = logical_line.trim_end();
-                logical_line = t[..t.len() - 1].to_string();
+                let mut joined = t[..t.len() - 1].to_string();
                 // Append next line (trimmed of leading whitespace)
-                let next = raw_lines[idx].trim_start();
-                logical_line.push_str(next);
+                joined.push_str(raw_lines[idx].trim_start());
+                logical_line = Cow::Owned(joined);
                 idx += 1;
             }
 
-            while entry_line_value_has_unclosed_quote(&logical_line) && idx < raw_lines.len() {
+            let mut unclosed_quote = entry_line_value_has_unclosed_quote(&logical_line);
+            while unclosed_quote && idx < raw_lines.len() {
                 let next = raw_lines[idx].trim_start();
-                logical_line.push_str(next);
+                logical_line.to_mut().push_str(next);
                 idx += 1;
+                unclosed_quote = entry_line_value_has_unclosed_quote(&logical_line);
             }
-            if entry_line_value_has_unclosed_quote(&logical_line) {
+            if unclosed_quote {
                 let file_disp = config_error_path_display(path);
                 return Err(ConfigError::BadConfigLineInFile {
                     file: file_disp,
@@ -1738,13 +1778,11 @@ impl ConfigFile {
                 }
             })?;
 
+        #[cfg(unix)]
         if let Ok(meta) = fs::metadata(&self.path) {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let mode = meta.permissions().mode();
-                let _ = fs::set_permissions(&lock_path, fs::Permissions::from_mode(mode));
-            }
+            use std::os::unix::fs::PermissionsExt;
+            let mode = meta.permissions().mode();
+            let _ = fs::set_permissions(&lock_path, fs::Permissions::from_mode(mode));
         }
 
         use std::io::Write as _;
@@ -2029,6 +2067,7 @@ impl ConfigSet {
             lookup_table: self.pack_write_bitmap_lookup_table(),
             prefer_bitmap_tips: self.pack_prefer_bitmap_tips(),
             verify_reachability_closure: true,
+            reachability_roots: None,
         }
     }
 
@@ -2474,7 +2513,6 @@ impl ConfigSet {
         opts: &LoadConfigOptions,
         included_files: &mut Vec<PathBuf>,
     ) -> Result<Self> {
-        let mut set = Self::new();
         let proc = opts.process_includes;
         let mut ctx = opts.include_ctx.clone();
         if ctx.cwd.as_os_str().is_empty() {
@@ -2482,27 +2520,19 @@ impl ConfigSet {
         }
         ctx.pwd = env.pwd.clone();
         ctx.env = std::sync::Arc::new(env.clone());
+        let mut layers = Vec::new();
 
-        // System config
         if opts.include_system && !git_config_nosystem_enabled(env) {
             let system_path = system_config_path(env);
-            match ConfigFile::from_path(&system_path, ConfigScope::System) {
-                Ok(Some(f)) => {
-                    Self::merge_with_includes_collect(&mut set, &f, proc, 0, &ctx, included_files)?
-                }
-                Ok(None) => {}
-                Err(e) => return Err(e),
+            if let Some(f) = ConfigFile::from_path(&system_path, ConfigScope::System)? {
+                layers.push(ConfigLayer::file(f));
             }
         }
 
         // Global config (Git merges every existing file: XDG then ~/.gitconfig).
         for path in global_config_paths(env) {
-            match ConfigFile::from_path(&path, ConfigScope::Global) {
-                Ok(Some(f)) => {
-                    Self::merge_with_includes_collect(&mut set, &f, proc, 0, &ctx, included_files)?
-                }
-                Ok(None) => {}
-                Err(e) => return Err(e),
+            if let Some(f) = ConfigFile::from_path(&path, ConfigScope::Global)? {
+                layers.push(ConfigLayer::file(f));
             }
         }
 
@@ -2523,79 +2553,45 @@ impl ConfigSet {
                 }
             } else if let Some(text) = local_text.as_deref() {
                 let f = ConfigFile::parse(&local_path, text, ConfigScope::Local)?;
-                Self::merge_with_includes_collect(&mut set, &f, proc, 0, &ctx, included_files)?;
+                layers.push(ConfigLayer::file(f));
             }
 
             // Worktree config — Git only reads `config.worktree` when
             // `extensions.worktreeConfig` is enabled in the common repository `config`.
             let wt_path = gd.join("config.worktree");
             if crate::repo::worktree_config_enabled_for_text(local_text.as_deref()) {
-                match ConfigFile::from_path(&wt_path, ConfigScope::Worktree) {
-                    Ok(Some(f)) => Self::merge_with_includes_collect(
-                        &mut set,
-                        &f,
-                        proc,
-                        0,
-                        &ctx,
-                        included_files,
-                    )?,
-                    Ok(None) => {}
-                    Err(e) => return Err(e),
+                if let Some(f) = ConfigFile::from_path(&wt_path, ConfigScope::Worktree)? {
+                    layers.push(ConfigLayer::file(f));
                 }
             }
         }
 
-        // Environment overrides: optional file
         if let Some(path) = env.git_config.as_deref() {
             let path = resolve_config_override_path(env, path);
-            match ConfigFile::from_path(&path, ConfigScope::Command) {
-                Ok(Some(f)) => {
-                    if proc {
-                        Self::merge_with_includes_collect(
-                            &mut set,
-                            &f,
-                            proc,
-                            0,
-                            &ctx,
-                            included_files,
-                        )?;
-                    } else {
-                        set.merge(&f);
-                    }
-                }
-                Ok(None) => {}
-                Err(e) => return Err(e),
+            if let Some(f) = ConfigFile::from_path(&path, ConfigScope::Command)? {
+                layers.push(ConfigLayer::file(f));
             }
         }
 
-        add_environment_config_pairs(&mut set, env)?;
+        layers.push(ConfigLayer::Entries(environment_config_pair_entries(env)?));
 
         // GIT_CONFIG_PARAMETERS — used by `git -c key=value`.
-        if let Some(params) = env.git_config_parameters.as_deref() {
-            if proc && opts.command_includes && !params.trim().is_empty() {
+        if let Some(params) = env
+            .git_config_parameters
+            .as_deref()
+            .filter(|p| !p.trim().is_empty())
+        {
+            if proc && opts.command_includes {
                 let pseudo = Path::new(":GIT_CONFIG_PARAMETERS");
                 let cmd_file = ConfigFile::from_git_config_parameters(pseudo, params)?;
-                Self::merge_with_includes_collect(
-                    &mut set,
-                    &cmd_file,
-                    proc,
-                    0,
-                    &ctx,
-                    included_files,
-                )?;
-            } else if !params.trim().is_empty() {
-                for entry in parse_config_parameters(params) {
-                    if let Some((key, val)) =
-                        entry.split_once('\u{1}').or_else(|| entry.split_once('='))
-                    {
-                        let _ = set.add_command_override(key.trim(), val);
-                    } else {
-                        let _ = set.add_command_override(entry.trim(), "true");
-                    }
-                }
+                layers.push(ConfigLayer::file(cmd_file));
+            } else {
+                layers.push(ConfigLayer::Entries(command_override_entries(params)));
             }
         }
 
+        let mut set = Self::new();
+        set.merge_layers(&layers, proc, &ctx, included_files)?;
         Ok(set)
     }
 
@@ -2615,7 +2611,6 @@ impl ConfigSet {
         git_dir: Option<&Path>,
         key: &str,
     ) -> Result<Vec<String>> {
-        let mut set = Self::new();
         let ctx = IncludeContext {
             git_dir: git_dir.map(PathBuf::from),
             command_line_relative_include_is_error: false,
@@ -2623,19 +2618,19 @@ impl ConfigSet {
             pwd: env.pwd.clone(),
             env: std::sync::Arc::new(env.clone()),
         };
+        let mut layers = Vec::new();
 
-        // System
         if !git_config_nosystem_enabled(env) {
             let system_path = system_config_path(env);
             if let Ok(Some(f)) = ConfigFile::from_path(&system_path, ConfigScope::System) {
-                Self::merge_with_includes(&mut set, &f, true, 0, &ctx)?;
+                layers.push(ConfigLayer::file(f));
             }
         }
 
         // Global: all existing candidates (Git merges every readable file).
         for path in global_config_paths(env) {
             if let Ok(Some(f)) = ConfigFile::from_path(&path, ConfigScope::Global) {
-                Self::merge_with_includes(&mut set, &f, true, 0, &ctx)?;
+                layers.push(ConfigLayer::file(f));
             }
         }
 
@@ -2646,27 +2641,31 @@ impl ConfigSet {
             if crate::repo::early_config_ignore_repo_reason(&common_dir).is_some() {
                 // Local config skipped for unsupported repository format (see `Warning::IgnoredGitDir`).
             } else if let Ok(Some(f)) = ConfigFile::from_path(&local_path, ConfigScope::Local) {
-                set.merge_file_with_includes(&f, true, &ctx)?;
+                layers.push(ConfigLayer::file(f));
             }
 
             // Worktree-specific config (when enabled for this repo).
             let wt_path = gd.join("config.worktree");
             if crate::repo::worktree_config_enabled(&common_dir) {
                 if let Ok(Some(f)) = ConfigFile::from_path(&wt_path, ConfigScope::Worktree) {
-                    Self::merge_with_includes(&mut set, &f, true, 0, &ctx)?;
+                    layers.push(ConfigLayer::file(f));
                 }
             }
         }
 
         // GIT_CONFIG_PARAMETERS — same as full load (`load_with_options` default).
-        if let Some(params) = env.git_config_parameters.as_deref() {
-            if !params.trim().is_empty() {
-                let pseudo = Path::new(":GIT_CONFIG_PARAMETERS");
-                let cmd_file = ConfigFile::from_git_config_parameters(pseudo, params)?;
-                Self::merge_with_includes(&mut set, &cmd_file, true, 0, &ctx)?;
-            }
+        if let Some(params) = env
+            .git_config_parameters
+            .as_deref()
+            .filter(|p| !p.trim().is_empty())
+        {
+            let pseudo = Path::new(":GIT_CONFIG_PARAMETERS");
+            let cmd_file = ConfigFile::from_git_config_parameters(pseudo, params)?;
+            layers.push(ConfigLayer::file(cmd_file));
         }
 
+        let mut set = Self::new();
+        set.merge_layers(&layers, true, &ctx, &mut Vec::new())?;
         Ok(set.get_all(key))
     }
 
@@ -2674,13 +2673,26 @@ impl ConfigSet {
     ///
     /// Used by `grit config -f` and scoped reads; [`ConfigSet::load_with_options`] uses the same
     /// internal routine for the standard cascade.
+    ///
+    /// `hasconfig:remote.*.url:` conditions match only remote URLs reachable from `file`
+    /// itself (like `git config -f <file> --includes`), not URLs already in `self`.
+    ///
+    /// # Errors
+    ///
+    /// Unreadable or unparsable include targets, include recursion past Git's depth limit,
+    /// and [`ConfigError::RemoteUrlInHasconfigInclude`].
     pub fn merge_file_with_includes(
         &mut self,
         file: &ConfigFile,
         process_includes: bool,
         ctx: &IncludeContext,
     ) -> Result<()> {
-        Self::merge_with_includes(self, file, process_includes, 0, ctx)
+        self.merge_layers(
+            &[ConfigLayer::File(Cow::Borrowed(file))],
+            process_includes,
+            ctx,
+            &mut Vec::new(),
+        )
     }
 
     /// Load only the repository's own `config` file (plus any `[include]` targets).
@@ -2689,7 +2701,6 @@ impl ConfigSet {
     /// overrides. Used for receive-side options (e.g. `transfer.fsckObjects`) so a
     /// pusher's global configuration cannot weaken the remote repository's policy.
     pub fn load_repo_local_only(git_dir: &Path) -> Result<Self> {
-        let mut set = Self::new();
         let local_path = git_dir.join("config");
         let ctx = IncludeContext {
             git_dir: Some(git_dir.to_path_buf()),
@@ -2698,8 +2709,9 @@ impl ConfigSet {
             pwd: None,
             env: std::sync::Arc::new(Environment::empty()),
         };
+        let mut set = Self::new();
         if let Ok(Some(f)) = ConfigFile::from_path(&local_path, ConfigScope::Local) {
-            Self::merge_with_includes(&mut set, &f, true, 0, &ctx)?;
+            set.merge_layers(&[ConfigLayer::file(f)], true, &ctx, &mut Vec::new())?;
         }
         Ok(set)
     }
@@ -2715,7 +2727,6 @@ impl ConfigSet {
     /// unless `GIT_CONFIG_GLOBAL` is set (single file). When both global files exist, both are
     /// merged so later entries win for duplicate keys.
     pub fn load_protected(env: &Environment, include_system: bool) -> Result<Self> {
-        let mut set = Self::new();
         let ctx = IncludeContext {
             git_dir: None,
             command_line_relative_include_is_error: false,
@@ -2723,76 +2734,84 @@ impl ConfigSet {
             pwd: env.pwd.clone(),
             env: std::sync::Arc::new(env.clone()),
         };
+        let mut layers = Vec::new();
 
         if include_system && !git_config_nosystem_enabled(env) {
             let system_path = system_config_path(env);
             if let Ok(Some(f)) = ConfigFile::from_path(&system_path, ConfigScope::System) {
-                Self::merge_with_includes(&mut set, &f, true, 0, &ctx)?;
+                layers.push(ConfigLayer::file(f));
             }
         }
 
         for path in global_config_paths(env) {
             if let Ok(Some(f)) = ConfigFile::from_path(&path, ConfigScope::Global) {
-                Self::merge_with_includes(&mut set, &f, true, 0, &ctx)?;
+                layers.push(ConfigLayer::file(f));
             }
         }
 
-        add_environment_config_pairs(&mut set, env)?;
-
+        layers.push(ConfigLayer::Entries(environment_config_pair_entries(env)?));
         if let Some(params) = env.git_config_parameters.as_deref() {
-            for entry in parse_config_parameters(params) {
-                if let Some((key, val)) =
-                    entry.split_once('\u{1}').or_else(|| entry.split_once('='))
-                {
-                    let _ = set.add_command_override(key.trim(), val);
-                } else {
-                    let _ = set.add_command_override(entry.trim(), "true");
-                }
-            }
+            layers.push(ConfigLayer::Entries(command_override_entries(params)));
         }
 
+        let mut set = Self::new();
+        set.merge_layers(&layers, true, &ctx, &mut Vec::new())?;
         Ok(set)
     }
 
-    /// Merge a file, processing `[include]` and `[includeIf]` directives.
+    /// Merge `layers` in order, expanding includes in file layers when `process_includes`.
+    ///
+    /// `hasconfig:remote.*.url:` conditions anywhere in the load match against the remote
+    /// URLs of *all* layers (Git evaluates them against the complete configuration), so a
+    /// global include can depend on a remote defined in the repository `config`. Every
+    /// include target opened is recorded in `included_files` so the cascade cache can stamp it.
+    fn merge_layers(
+        &mut self,
+        layers: &[ConfigLayer<'_>],
+        process_includes: bool,
+        ctx: &IncludeContext,
+        included_files: &mut Vec<PathBuf>,
+    ) -> Result<()> {
+        // Headroom for the entries of typical small include files (identities, aliases), so
+        // merging one does not double a vector sized exactly to the top-level layers.
+        const INCLUDE_HEADROOM: usize = 64;
+        let mut remote_urls = RemoteUrls::new(layers);
+        let top_level: usize = layers
+            .iter()
+            .map(|layer| match layer {
+                ConfigLayer::File(file) => file.entries.len(),
+                ConfigLayer::Entries(entries) => entries.len(),
+            })
+            .sum();
+        self.entries.reserve(top_level + INCLUDE_HEADROOM);
+        for layer in layers {
+            match layer {
+                ConfigLayer::File(file) => Self::merge_with_includes(
+                    self,
+                    file,
+                    process_includes,
+                    0,
+                    ctx,
+                    &mut remote_urls,
+                    included_files,
+                )?,
+                ConfigLayer::Entries(entries) => self.entries.extend(entries.iter().cloned()),
+            }
+        }
+        Ok(())
+    }
+
+    /// Merge `file`, expanding `[include]` / `[includeIf]` targets in place.
     fn merge_with_includes(
         set: &mut Self,
         file: &ConfigFile,
         process_includes: bool,
         depth: usize,
         ctx: &IncludeContext,
-    ) -> Result<()> {
-        let mut included_files = Vec::new();
-        Self::merge_with_includes_collect(
-            set,
-            file,
-            process_includes,
-            depth,
-            ctx,
-            &mut included_files,
-        )
-    }
-
-    /// [`Self::merge_with_includes`], additionally recording every resolved
-    /// include target path in `included_files` (whether or not the target
-    /// exists) so the cascade cache can stamp them.
-    fn merge_with_includes_collect(
-        set: &mut Self,
-        file: &ConfigFile,
-        process_includes: bool,
-        depth: usize,
-        ctx: &IncludeContext,
+        remote_urls: &mut RemoteUrls<'_>,
         included_files: &mut Vec<PathBuf>,
     ) -> Result<()> {
-        // Mirror Git behavior and stop runaway include recursion.
-        const MAX_INCLUDE_DEPTH: usize = 10;
-        if depth > MAX_INCLUDE_DEPTH {
-            return Err(ConfigError::IncludeDepthExceeded {
-                depth,
-                limit: MAX_INCLUDE_DEPTH,
-            }
-            .into());
-        }
+        check_include_depth(depth)?;
         if !process_includes {
             set.merge(file);
             return Ok(());
@@ -2804,47 +2823,176 @@ impl ConfigSet {
             let Some((inc_path, condition)) = include_directive_for_entry(entry) else {
                 continue;
             };
-            let included_by_hasconfig = condition.as_deref().is_some_and(is_hasconfig_remote_url);
-            if condition.is_some() && !included_by_hasconfig {
-                let cond = condition.as_deref().unwrap_or_default();
-                if !evaluate_include_condition(cond, set, file, ctx) {
+            if let Some(cond) = condition.as_deref() {
+                let holds = match hasconfig_remote_url_pattern(cond) {
+                    Some(pattern) => remote_urls.any_matches(pattern, ctx, included_files)?,
+                    None => evaluate_include_condition(cond, file, ctx),
+                };
+                if !holds {
                     continue;
                 }
             }
-
-            let resolved = match resolve_include_file_path(&inc_path, file, ctx) {
-                Ok(p) => p,
-                Err(Error::Config(ConfigError::Other(msg))) if msg.is_empty() => continue,
-                Err(e) => return Err(e),
-            };
-            included_files.push(resolved.clone());
-            // Git's `git_config_from_file` surfaces parse errors in an included file as a
-            // fatal error (t0001 #102 `re-init reads matching includeIf.onbranch`). A missing
-            // include target is silently skipped (`from_path` -> `Ok(None)`).
-            let Some(inc_file) = ConfigFile::from_path(&resolved, file.scope)? else {
+            let Some(inc_file) = open_include_target(&inc_path, file, ctx, included_files)? else {
                 continue;
             };
-
-            if included_by_hasconfig {
-                validate_hasconfig_remote_url_include(&inc_file, process_includes, depth + 1, ctx)?;
-                let cond = condition.as_deref().unwrap_or_default();
-                if !evaluate_include_condition(cond, set, file, ctx) {
-                    continue;
-                }
-            }
-
-            Self::merge_with_includes_collect(
+            Self::merge_with_includes(
                 set,
                 &inc_file,
                 process_includes,
                 depth + 1,
                 ctx,
+                remote_urls,
                 included_files,
             )?;
         }
 
         Ok(())
     }
+}
+
+/// One step of a configuration load, merged in order by [`ConfigSet::merge_layers`].
+enum ConfigLayer<'a> {
+    /// A config file whose includes are expanded when the load processes includes.
+    File(Cow<'a, ConfigFile>),
+    /// Entries appended verbatim (`GIT_CONFIG_COUNT` pairs, `-c` overrides read without includes).
+    Entries(Vec<ConfigEntry>),
+}
+
+impl ConfigLayer<'_> {
+    fn file(file: ConfigFile) -> Self {
+        Self::File(Cow::Owned(file))
+    }
+}
+
+/// Remote URLs that `hasconfig:remote.*.url:` conditions match against, collected from every
+/// layer of the current load on the first such condition and reused for the rest of it.
+struct RemoteUrls<'a> {
+    layers: &'a [ConfigLayer<'a>],
+    urls: Option<Vec<String>>,
+}
+
+impl<'a> RemoteUrls<'a> {
+    fn new(layers: &'a [ConfigLayer<'a>]) -> Self {
+        Self { layers, urls: None }
+    }
+
+    /// Whether any `remote.<name>.url` value in the load matches `pattern` (`WM_PATHNAME`).
+    fn any_matches(
+        &mut self,
+        pattern: &str,
+        ctx: &IncludeContext,
+        included_files: &mut Vec<PathBuf>,
+    ) -> Result<bool> {
+        let urls = match self.urls.take() {
+            Some(urls) => urls,
+            None => self.collect(ctx, included_files)?,
+        };
+        let hit = urls
+            .iter()
+            .any(|url| wildmatch(pattern.as_bytes(), url.as_bytes(), WM_PATHNAME));
+        self.urls = Some(urls);
+        Ok(hit)
+    }
+
+    fn collect(
+        &self,
+        ctx: &IncludeContext,
+        included_files: &mut Vec<PathBuf>,
+    ) -> Result<Vec<String>> {
+        let mut urls = Vec::new();
+        for layer in self.layers {
+            match layer {
+                ConfigLayer::File(file) => {
+                    collect_remote_urls(file, false, 0, ctx, &mut urls, included_files)?;
+                }
+                ConfigLayer::Entries(entries) => urls.extend(
+                    entries
+                        .iter()
+                        .filter(|entry| is_remote_url_entry(entry))
+                        .filter_map(|entry| entry.value.clone()),
+                ),
+            }
+        }
+        Ok(urls)
+    }
+}
+
+/// Collect `remote.<name>.url` values from `file` and everything it includes.
+///
+/// As in Git, this pass opens every `[includeIf]` target whose condition holds, treating every
+/// `hasconfig:remote.*.url:` condition as holding. Remote URLs may not come from a conditional
+/// include (directly or through nested includes), since they could change which conditions hold:
+/// finding one there is [`ConfigError::RemoteUrlInHasconfigInclude`].
+fn collect_remote_urls(
+    file: &ConfigFile,
+    in_conditional_include: bool,
+    depth: usize,
+    ctx: &IncludeContext,
+    urls: &mut Vec<String>,
+    included_files: &mut Vec<PathBuf>,
+) -> Result<()> {
+    check_include_depth(depth)?;
+    for entry in &file.entries {
+        if is_remote_url_entry(entry) {
+            if in_conditional_include {
+                return Err(ConfigError::RemoteUrlInHasconfigInclude.into());
+            }
+            urls.extend(entry.value.clone());
+            continue;
+        }
+        let Some((inc_path, condition)) = include_directive_for_entry(entry) else {
+            continue;
+        };
+        let conditional = match condition.as_deref() {
+            None => in_conditional_include,
+            Some(cond) => {
+                if hasconfig_remote_url_pattern(cond).is_none()
+                    && !evaluate_include_condition(cond, file, ctx)
+                {
+                    continue;
+                }
+                true
+            }
+        };
+        let Some(inc_file) = open_include_target(&inc_path, file, ctx, included_files)? else {
+            continue;
+        };
+        collect_remote_urls(&inc_file, conditional, depth + 1, ctx, urls, included_files)?;
+    }
+    Ok(())
+}
+
+/// Fail once include nesting exceeds Git's limit, which stops runaway recursion.
+fn check_include_depth(depth: usize) -> Result<()> {
+    const MAX_INCLUDE_DEPTH: usize = 10;
+    if depth > MAX_INCLUDE_DEPTH {
+        return Err(ConfigError::IncludeDepthExceeded {
+            depth,
+            limit: MAX_INCLUDE_DEPTH,
+        }
+        .into());
+    }
+    Ok(())
+}
+
+/// Resolve and parse the target of an include directive in `file`, recording the resolved path
+/// in `included_files` (even when missing) so the cascade cache stamps it.
+///
+/// Returns `None` for a missing target or a path Git skips. Parse errors in the target are
+/// fatal, as in Git (t0001 `re-init reads matching includeIf.onbranch`).
+fn open_include_target(
+    inc_path: &str,
+    file: &ConfigFile,
+    ctx: &IncludeContext,
+    included_files: &mut Vec<PathBuf>,
+) -> Result<Option<ConfigFile>> {
+    let resolved = match resolve_include_file_path(inc_path, file, ctx) {
+        Ok(p) => p,
+        Err(Error::Config(ConfigError::Other(msg))) if msg.is_empty() => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    included_files.push(resolved.clone());
+    ConfigFile::from_path(&resolved, file.scope)
 }
 
 fn include_directive_for_entry(entry: &ConfigEntry) -> Option<(String, Option<String>)> {
@@ -2875,7 +3023,9 @@ fn include_directive_for_entry(entry: &ConfigEntry) -> Option<(String, Option<St
 //
 // The remaining `includeIf` condition inputs are covered transitively:
 // `gitdir:` depends only on the cache key and environment, and
-// `hasconfig:remote.*.url:` depends only on the (stamped) file contents.
+// `hasconfig:remote.*.url:` depends only on the (stamped) file contents —
+// every file its URL scan opens is recorded as an include target — plus the
+// command-line config already in the environment fingerprint.
 //
 // In-process writers ([`ConfigFile::write`]) additionally evict every entry
 // whose cascade contains the written path, closing the window where a
@@ -2989,7 +3139,7 @@ pub(crate) fn config_cache_lookup(
     key: &ConfigCacheKey,
     env_fp: &[(String, Option<String>)],
     base_stamps: &[ConfigFileStamp],
-) -> Option<ConfigSet> {
+) -> Option<Arc<ConfigSet>> {
     let entry = cache.get(key)?;
     if entry.env_fingerprint.as_slice() != env_fp || entry.base_stamps.as_slice() != base_stamps {
         return None;
@@ -2999,7 +3149,7 @@ pub(crate) fn config_cache_lookup(
             return None;
         }
     }
-    Some((*entry.set).clone())
+    Some(Arc::clone(&entry.set))
 }
 
 pub(crate) fn config_cache_store(
@@ -3028,12 +3178,13 @@ fn git_config_nosystem_enabled(env: &Environment) -> bool {
         .unwrap_or(false)
 }
 
-fn add_environment_config_pairs(set: &mut ConfigSet, env: &Environment) -> Result<()> {
+/// Entries from `GIT_CONFIG_COUNT` / `GIT_CONFIG_KEY_<n>` / `GIT_CONFIG_VALUE_<n>`.
+fn environment_config_pair_entries(env: &Environment) -> Result<Vec<ConfigEntry>> {
     let Some(count_str) = env.git_config_count.as_deref() else {
-        return Ok(());
+        return Ok(Vec::new());
     };
     if count_str.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     let count = count_str
@@ -3045,14 +3196,28 @@ fn add_environment_config_pairs(set: &mut ConfigSet, env: &Environment) -> Resul
         ));
     }
 
+    let mut set = ConfigSet::new();
     for i in 0..count {
         let (key, value) = env.git_config_pairs.get(i).ok_or_else(|| {
             Error::Config(format!("missing config key GIT_CONFIG_KEY_{i}").into())
         })?;
         set.add_command_override(key, value)?;
     }
+    Ok(set.entries)
+}
 
-    Ok(())
+/// `GIT_CONFIG_PARAMETERS` as plain command-scope entries (no include processing); entries
+/// with an invalid key are skipped.
+fn command_override_entries(params: &str) -> Vec<ConfigEntry> {
+    let mut set = ConfigSet::new();
+    for entry in parse_config_parameters(params) {
+        let (key, val) = entry
+            .split_once('\u{1}')
+            .or_else(|| entry.split_once('='))
+            .unwrap_or((entry.as_str(), "true"));
+        let _ = set.add_command_override(key.trim(), val);
+    }
+    set.entries
 }
 
 // ── Type coercion helpers ───────────────────────────────────────────
@@ -4376,82 +4541,25 @@ fn include_by_onbranch(condition: &str, ctx: &IncludeContext) -> bool {
     wildmatch(pattern.as_bytes(), short.as_bytes(), WM_PATHNAME)
 }
 
+/// Whether `entry` is `remote.<name>.url` (keys are canonical: section and variable lowercase).
 fn is_remote_url_entry(entry: &ConfigEntry) -> bool {
-    let Ok((section, subsection, variable)) = split_key(&entry.key) else {
-        return false;
-    };
-    section == "remote" && subsection.is_some() && variable == "url"
+    entry
+        .key
+        .strip_prefix("remote.")
+        .is_some_and(|rest| rest.ends_with(".url"))
 }
 
-fn is_hasconfig_remote_url(condition: &str) -> bool {
-    condition
-        .strip_prefix("hasconfig:")
-        .is_some_and(|rest| rest.starts_with("remote.*.url:"))
-}
-
-fn include_by_hasconfig_remote_url(condition: &str, set: &ConfigSet, file: &ConfigFile) -> bool {
-    let Some(pattern) = condition.strip_prefix("remote.*.url:") else {
-        return false;
-    };
-    set.entries
-        .iter()
-        .chain(file.entries.iter())
-        .filter(|entry| is_remote_url_entry(entry))
-        .filter_map(|entry| entry.value.as_deref())
-        .any(|value| wildmatch(pattern.as_bytes(), value.as_bytes(), WM_PATHNAME))
-}
-
-fn validate_hasconfig_remote_url_include(
-    file: &ConfigFile,
-    process_includes: bool,
-    depth: usize,
-    ctx: &IncludeContext,
-) -> Result<()> {
-    const MAX_INCLUDE_DEPTH: usize = 10;
-    if depth > MAX_INCLUDE_DEPTH {
-        return Err(ConfigError::IncludeDepthExceeded {
-            depth,
-            limit: MAX_INCLUDE_DEPTH,
-        }
-        .into());
-    }
-    if file.entries.iter().any(is_remote_url_entry) {
-        return Err(ConfigError::RemoteUrlInHasconfigInclude.into());
-    }
-    if !process_includes {
-        return Ok(());
-    }
-    for entry in &file.entries {
-        let Some((inc_path, condition)) = include_directive_for_entry(entry) else {
-            continue;
-        };
-        if let Some(ref cond) = condition {
-            if !evaluate_include_condition(cond, &ConfigSet::new(), file, ctx) {
-                continue;
-            }
-        }
-        let resolved = match resolve_include_file_path(&inc_path, file, ctx) {
-            Ok(p) => p,
-            Err(Error::Config(ConfigError::Other(msg))) if msg.is_empty() => continue,
-            Err(e) => return Err(e),
-        };
-        if let Some(inc_file) = ConfigFile::from_path(&resolved, file.scope)? {
-            validate_hasconfig_remote_url_include(&inc_file, process_includes, depth + 1, ctx)?;
-        }
-    }
-    Ok(())
+/// The URL glob of a `hasconfig:remote.*.url:<glob>` include condition.
+fn hasconfig_remote_url_pattern(condition: &str) -> Option<&str> {
+    condition.strip_prefix("hasconfig:remote.*.url:")
 }
 
 /// Evaluate an `[includeIf]` condition.
 ///
-/// Supports `gitdir:`, `gitdir/i:`, `onbranch:`, and `hasconfig:remote.*.url:` like Git.
-/// Unknown prefixes are false.
-fn evaluate_include_condition(
-    condition: &str,
-    set: &ConfigSet,
-    file: &ConfigFile,
-    ctx: &IncludeContext,
-) -> bool {
+/// Supports `gitdir:`, `gitdir/i:` and `onbranch:` like Git. `hasconfig:remote.*.url:` needs
+/// the whole load's remote URLs and is evaluated by [`RemoteUrls::any_matches`]. Unknown
+/// prefixes are false.
+fn evaluate_include_condition(condition: &str, file: &ConfigFile, ctx: &IncludeContext) -> bool {
     if let Some(rest) = condition.strip_prefix("gitdir/i:") {
         return include_by_gitdir(rest, file, ctx, true);
     }
@@ -4460,9 +4568,6 @@ fn evaluate_include_condition(
     }
     if let Some(rest) = condition.strip_prefix("onbranch:") {
         return include_by_onbranch(rest, ctx);
-    }
-    if let Some(rest) = condition.strip_prefix("hasconfig:") {
-        return include_by_hasconfig_remote_url(rest, set, file);
     }
     false
 }
@@ -5116,5 +5221,214 @@ mod config_cache_tests {
             matches!(err, Error::Io(_)),
             "expected I/O error for symlink loop, got {err:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod line_scan_tests {
+    use super::*;
+
+    /// The char-at-a-time comment stripper the byte scan replaced, kept as the reference.
+    fn strip_inline_comment_by_chars(s: &str) -> String {
+        let mut in_quote = false;
+        let mut last_was_backslash = false;
+        let mut result = String::with_capacity(s.len());
+        let mut chars = s.chars().peekable();
+        while let Some(ch) = chars.next() {
+            match ch {
+                '"' if !last_was_backslash => {
+                    in_quote = !in_quote;
+                    result.push(ch);
+                    last_was_backslash = false;
+                }
+                '\\' if !last_was_backslash => {
+                    last_was_backslash = true;
+                    result.push(ch);
+                    if in_quote {
+                        if let Some(&next) = chars.peek() {
+                            result.push(next);
+                            chars.next();
+                            last_was_backslash = false;
+                        }
+                    }
+                }
+                '#' | ';' if !in_quote && !last_was_backslash => break,
+                _ => {
+                    last_was_backslash = false;
+                    result.push(ch);
+                }
+            }
+        }
+        result.trim_end().to_owned()
+    }
+
+    fn unclosed_quote_by_chars(line: &str) -> bool {
+        let trimmed = line.trim();
+        let Some(eq_pos) = trimmed.find('=') else {
+            return false;
+        };
+        let mut in_quote = false;
+        let mut last_was_backslash = false;
+        for ch in trimmed[eq_pos + 1..].trim_start().chars() {
+            match ch {
+                '"' if !last_was_backslash => {
+                    in_quote = !in_quote;
+                    last_was_backslash = false;
+                }
+                '\\' if !last_was_backslash => {
+                    last_was_backslash = true;
+                    continue;
+                }
+                '#' | ';' if !in_quote && !last_was_backslash => return false,
+                _ => last_was_backslash = false,
+            }
+        }
+        in_quote
+    }
+
+    fn continues_by_chars(line: &str) -> bool {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with(';') {
+            return false;
+        }
+        let Some(pos) = trimmed.find('=') else {
+            return false;
+        };
+        let mut in_quote = false;
+        let mut last_was_backslash = false;
+        let mut in_comment = false;
+        for ch in trimmed[pos + 1..].chars() {
+            if in_comment {
+                last_was_backslash = false;
+                continue;
+            }
+            match ch {
+                '"' if !last_was_backslash => {
+                    in_quote = !in_quote;
+                    last_was_backslash = false;
+                }
+                '\\' if !last_was_backslash => {
+                    last_was_backslash = true;
+                    continue;
+                }
+                '#' | ';' if !in_quote && !last_was_backslash => {
+                    in_comment = true;
+                    last_was_backslash = false;
+                }
+                _ => last_was_backslash = false,
+            }
+        }
+        last_was_backslash && !in_comment
+    }
+
+    /// Every string of up to five tokens drawn from the characters the scanners treat
+    /// specially, plus ASCII and multi-byte text and Unicode whitespace.
+    fn corpus() -> Vec<String> {
+        const TOKENS: [&str; 11] = [
+            "a", "\"", "\\", "#", ";", " ", "=", "\t", "é", "日", "\u{2003}",
+        ];
+        let mut out = vec![String::new()];
+        let mut frontier = vec![String::new()];
+        for _ in 0..5 {
+            let mut next = Vec::with_capacity(frontier.len() * TOKENS.len());
+            for prefix in &frontier {
+                for token in TOKENS {
+                    next.push(format!("{prefix}{token}"));
+                }
+            }
+            out.extend(next.iter().cloned());
+            frontier = next;
+        }
+        out
+    }
+
+    #[test]
+    fn byte_scanners_match_char_scanners_on_every_short_line() {
+        for s in corpus() {
+            assert_eq!(
+                strip_inline_comment(&s),
+                strip_inline_comment_by_chars(&s),
+                "strip_inline_comment({s:?})"
+            );
+            let line = format!("k = {s}");
+            assert_eq!(
+                entry_line_value_has_unclosed_quote(&line),
+                unclosed_quote_by_chars(&line),
+                "unclosed quote in {line:?}"
+            );
+            assert_eq!(
+                value_line_continues(&line),
+                continues_by_chars(&line),
+                "continuation of {line:?}"
+            );
+            assert_eq!(
+                entry_line_value_has_unclosed_quote(&s),
+                unclosed_quote_by_chars(&s),
+                "unclosed quote in {s:?}"
+            );
+            assert_eq!(
+                value_line_continues(&s),
+                continues_by_chars(&s),
+                "continuation of {s:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn strip_inline_comment_borrows_a_prefix() {
+        let s = "\"a # b\" tail ; comment";
+        let stripped = strip_inline_comment(s);
+        assert_eq!(stripped, "\"a # b\" tail");
+        assert_eq!(stripped.as_ptr(), s.as_ptr());
+        assert_eq!(strip_inline_comment("\"\\\"#\" x"), "\"\\\"#\" x");
+        assert_eq!(strip_inline_comment("v\\#kept # gone"), "v\\#kept");
+    }
+
+    #[test]
+    fn canonical_key_lowercases_section_and_name_only() {
+        assert_eq!(canonical_key("core.bare").unwrap(), "core.bare");
+        assert_eq!(canonical_key("CORE.BARE").unwrap(), "core.bare");
+        assert_eq!(
+            canonical_key("Remote.Origin.URL").unwrap(),
+            "remote.Origin.url"
+        );
+        assert_eq!(canonical_key("a.B.C.D").unwrap(), "a.B.C.d");
+        assert!(canonical_key("nodot").is_err());
+        assert!(canonical_key("core.").is_err());
+        assert!(canonical_key("core.1bad").is_err());
+        assert!(canonical_key("core.ba\nre").is_err());
+    }
+
+    #[test]
+    fn parsed_keys_reuse_the_section_prefix_per_header() {
+        let text = "[Core]\n\tBare = false\n\tFileMode\n\
+                    [Remote \"Origin\"]\n\tURL = /x\n\
+                    [branch \"Main\"] Remote = origin\n\
+                    [core]\n\tEditor = vi ; trailing\n";
+        let file = ConfigFile::parse(Path::new("cfg"), text, ConfigScope::Local).unwrap();
+        let keys: Vec<(&str, Option<&str>)> = file
+            .entries
+            .iter()
+            .map(|e| (e.key.as_str(), e.value.as_deref()))
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                ("core.bare", Some("false")),
+                ("core.filemode", None),
+                ("remote.Origin.url", Some("/x")),
+                ("branch.Main.remote", Some("origin")),
+                ("core.editor", Some("vi")),
+            ]
+        );
+    }
+
+    #[test]
+    fn push_lowercase_matches_to_lowercase() {
+        for s in ["", "core", "MiXeD-09", "ÄBC", "İx", "ΣΑΣ"] {
+            let mut out = String::from("p.");
+            push_lowercase(&mut out, s);
+            assert_eq!(out, format!("p.{}", s.to_lowercase()));
+        }
     }
 }

@@ -100,6 +100,66 @@ fn rename_threshold_matches_git_m() {
     }
 }
 
+/// Delete + add pair that git scores at 44% similarity (between the 40 and 50 thresholds).
+fn low_similarity_pair_repo() -> (DiffRepo, ObjectId, ObjectId) {
+    let dr = DiffRepo::init();
+    let wt = &dr.worktree;
+    let old: String = (1..=100).map(|i| format!("line {i}\n")).collect();
+    fs::write(wt.join("old.txt"), old).unwrap();
+    git_quiet(wt, &["add", "."]);
+    git_quiet(wt, &["commit", "-qm", "one"]);
+    let parent = rev_parse_tree(wt, "HEAD^{tree}");
+
+    fs::remove_file(wt.join("old.txt")).unwrap();
+    let new: String = (1..=45)
+        .map(|i| format!("line {i}\n"))
+        .chain((1..=55).map(|i| format!("new {i}\n")))
+        .collect();
+    fs::write(wt.join("new.txt"), new).unwrap();
+    git_quiet(wt, &["add", "-A"]);
+    git_quiet(wt, &["commit", "-qm", "two"]);
+    let commit = rev_parse_tree(wt, "HEAD^{tree}");
+    (dr, parent, commit)
+}
+
+#[test]
+fn default_rename_threshold_matches_git_default() {
+    use grit_lib::config::ConfigSet;
+    use grit_lib::diff::{renames_from_config, DiffOptions};
+
+    let (dr, parent, commit) = low_similarity_pair_repo();
+    let wt = &dr.worktree;
+    let (p, c) = (parent.to_hex(), commit.to_hex());
+    let grit_at = |threshold: u32| {
+        let entries =
+            diff_trees_with_renames(dr.repo.odb(), Some(&parent), Some(&commit), "", threshold)
+                .expect("diff");
+        grit_name_status(&entries)
+    };
+
+    let git_default = git_name_status(wt, &[&p, &c]);
+    assert_eq!(git_default, ["A\tnew.txt", "D\told.txt"], "git default");
+    for default in [
+        DiffOptions::default().rename_threshold_u32(),
+        DiffOptions::from_config(&ConfigSet::new()).rename_threshold_u32(),
+        renames_from_config(&ConfigSet::new())
+            .threshold_percent()
+            .expect("renames on by default"),
+    ] {
+        assert_eq!(grit_at(default), git_default, "default threshold {default}");
+    }
+
+    for threshold in [40u32, 45, 50] {
+        let git_m = format!("-M{threshold}");
+        assert_eq!(
+            grit_at(threshold),
+            git_name_status(wt, &[&git_m, &p, &c]),
+            "threshold {threshold}"
+        );
+    }
+    assert_eq!(grit_at(40), ["R044\told.txt\tnew.txt"]);
+}
+
 #[test]
 fn no_renames_reports_add_and_delete() {
     let (dr, parent, commit) = t4001_rename_repo();
@@ -232,4 +292,195 @@ fn exact_rename_matches_git_m100_percent() {
         diff_trees_with_renames(repo.odb(), Some(&parent), Some(&commit), "", 100).expect("diff");
     let grit_lines = grit_name_status(&grit_entries);
     assert_eq!(git_lines, grit_lines);
+}
+
+fn git_rename_score_raw(wt: &std::path::Path, parent: &ObjectId, commit: &ObjectId) -> u32 {
+    let out = git_output(
+        wt,
+        &["diff", "-M", "--raw", &parent.to_hex(), &commit.to_hex()],
+    );
+    let line = String::from_utf8_lossy(&out.stdout);
+    let raw = line
+        .lines()
+        .find(|l| l.contains(" R") || l.starts_with('R'))
+        .expect("rename raw line");
+    let r_pos = raw.find('R').expect("R score");
+    raw[r_pos + 1..r_pos + 4]
+        .parse()
+        .expect("three-digit score")
+}
+
+/// Long line (>64 bytes) with a one-byte edit after the first span boundary.
+fn span_hash_long_line_edit_repo() -> (DiffRepo, ObjectId, ObjectId, u32) {
+    let dr = DiffRepo::init();
+    let wt = &dr.worktree;
+    let line = "x".repeat(70) + "\n";
+    let old_body = format!("header\n{line}footer\n");
+    fs::write(wt.join("old.rs"), &old_body).unwrap();
+    git_quiet(wt, &["add", "."]);
+    git_quiet(wt, &["commit", "-qm", "base"]);
+    let parent = rev_parse_tree(wt, "HEAD^{tree}");
+    fs::remove_file(wt.join("old.rs")).unwrap();
+    let line2 = format!("{}{}{}\n", "x".repeat(65), "y", "x".repeat(4));
+    let new_body = format!("header\n{line2}footer\n");
+    fs::write(wt.join("new.rs"), new_body).unwrap();
+    git_quiet(wt, &["add", "-A"]);
+    git_quiet(wt, &["commit", "-qm", "rename"]);
+    let commit = rev_parse_tree(wt, "HEAD^{tree}");
+    let git_score = git_rename_score_raw(wt, &parent, &commit);
+    (dr, parent, commit, git_score)
+}
+
+#[test]
+fn span_hash_rename_similarity_matches_git() {
+    use grit_lib::diff::rename_similarity_score;
+
+    let (dr, parent, commit, git_score) = span_hash_long_line_edit_repo();
+    let wt = &dr.worktree;
+    assert!(
+        git_score >= 85 && git_score < 100,
+        "git score {git_score} should reflect partial span overlap"
+    );
+
+    let grit_entries =
+        diff_trees_with_renames(dr.repo.odb(), Some(&parent), Some(&commit), "", 50).expect("diff");
+    let rename = grit_entries
+        .iter()
+        .find(|e| e.status == DiffStatus::Renamed)
+        .expect("rename entry");
+    assert_eq!(rename.score, Some(git_score));
+    assert_eq!(
+        grit_name_status(&grit_entries),
+        git_name_status(wt, &["-M50", &parent.to_hex(), &commit.to_hex()])
+    );
+
+    let old_blob = dr.repo.odb().read(&rename.old_oid).expect("old");
+    let new_blob = dr.repo.odb().read(&rename.new_oid).expect("new");
+    assert_eq!(
+        rename_similarity_score(&old_blob.data, &new_blob.data),
+        git_score
+    );
+}
+
+/// CRLF text must not be LF-normalized before scoring (denominator keeps `\r` bytes).
+fn crlf_partial_rename_repo() -> (DiffRepo, ObjectId, ObjectId, u32) {
+    let dr = DiffRepo::init();
+    let wt = &dr.worktree;
+    let mut old = String::new();
+    for i in 1..=40 {
+        old.push_str(&format!("line {i} unchanged\r\n"));
+    }
+    old.push_str(&format!("{}\r\n", "z".repeat(72)));
+    fs::write(wt.join("old.txt"), &old).unwrap();
+    git_quiet(wt, &["add", "."]);
+    git_quiet(wt, &["commit", "-qm", "base"]);
+    let parent = rev_parse_tree(wt, "HEAD^{tree}");
+
+    let mut new = old.clone();
+    new = new.replacen("unchanged", "changed", 1);
+    let idx = new.rfind("\r\n").unwrap();
+    new.replace_range(idx - 4..idx, "yyyy");
+    fs::remove_file(wt.join("old.txt")).unwrap();
+    fs::write(wt.join("new.txt"), new).unwrap();
+    git_quiet(wt, &["add", "-A"]);
+    git_quiet(wt, &["commit", "-qm", "rename"]);
+    let commit = rev_parse_tree(wt, "HEAD^{tree}");
+    let git_score = git_rename_score_raw(wt, &parent, &commit);
+    (dr, parent, commit, git_score)
+}
+
+#[test]
+fn crlf_span_hash_rename_similarity_matches_git() {
+    let (dr, parent, commit, git_score) = crlf_partial_rename_repo();
+    let wt = &dr.worktree;
+    let grit_entries =
+        diff_trees_with_renames(dr.repo.odb(), Some(&parent), Some(&commit), "", 50).expect("diff");
+    let rename = grit_entries
+        .iter()
+        .find(|e| e.status == DiffStatus::Renamed)
+        .expect("rename");
+    assert_eq!(rename.score, Some(git_score));
+    assert_eq!(
+        grit_name_status(&grit_entries),
+        git_name_status(wt, &["-M50", &parent.to_hex(), &commit.to_hex()])
+    );
+}
+
+#[test]
+fn no_trailing_newline_rename_similarity_matches_git() {
+    let dr = DiffRepo::init();
+    let wt = &dr.worktree;
+    let old = format!("{}\n{}", "a".repeat(80), "b".repeat(30));
+    fs::write(wt.join("old.bin"), &old).unwrap();
+    git_quiet(wt, &["add", "."]);
+    git_quiet(wt, &["commit", "-qm", "base"]);
+    let parent = rev_parse_tree(wt, "HEAD^{tree}");
+    fs::remove_file(wt.join("old.bin")).unwrap();
+    let new = format!("{}\n{}", "a".repeat(80), "b".repeat(29) + "c");
+    fs::write(wt.join("new.bin"), new).unwrap();
+    git_quiet(wt, &["add", "-A"]);
+    git_quiet(wt, &["commit", "-qm", "rename"]);
+    let commit = rev_parse_tree(wt, "HEAD^{tree}");
+    let git_score = git_rename_score_raw(wt, &parent, &commit);
+
+    let grit_entries =
+        diff_trees_with_renames(dr.repo.odb(), Some(&parent), Some(&commit), "", 50).expect("diff");
+    let rename = grit_entries
+        .iter()
+        .find(|e| e.status == DiffStatus::Renamed)
+        .expect("rename");
+    assert_eq!(rename.score, Some(git_score));
+}
+
+#[test]
+fn patch_id_stable_matches_git_on_span_scored_rename() {
+    use grit_lib::diff::patch_ids::PatchIdMode;
+    use grit_lib::repo::Repository;
+
+    let (dr, _parent, _commit, _git_score) = span_hash_long_line_edit_repo();
+    let wt = &dr.worktree;
+    let tip: ObjectId = String::from_utf8_lossy(&git_output(wt, &["rev-parse", "HEAD"]).stdout)
+        .trim()
+        .parse()
+        .unwrap();
+    let git_show = git_output(wt, &["show", "-p", &tip.to_hex()]);
+    let git_patch = {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let mut child = Command::new("git")
+            .args(["patch-id", "--stable"])
+            .current_dir(wt)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("git patch-id");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(&git_show.stdout)
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success());
+        String::from_utf8_lossy(&out.stdout)
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse::<ObjectId>()
+            .unwrap()
+    };
+
+    let repo = Repository::discover(
+        Some(wt),
+        &grit_lib::config::environment::RepositoryOptions::empty(),
+    )
+    .expect("open");
+    let grit_patch = repo
+        .patch_id(&tip, PatchIdMode::Stable)
+        .expect("patch_id")
+        .expect("non-merge patch-id");
+    assert_eq!(
+        grit_patch, git_patch,
+        "similarity index line must match git"
+    );
 }

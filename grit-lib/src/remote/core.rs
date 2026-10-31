@@ -12,7 +12,9 @@ use thiserror::Error;
 
 use crate::config::ConfigSet;
 #[cfg(feature = "http-ureq")]
-use crate::credentials::{askpass_program, HelperCredentialProvider};
+use crate::credentials::{
+    askpass_program, Credential, CredentialProvider, HelperCredentialProvider,
+};
 #[cfg(feature = "http-ureq")]
 use crate::environment::Environment;
 use crate::error::Error;
@@ -298,6 +300,83 @@ pub trait HttpClientFactory: Send + Sync {
     ///
     /// Returns an error when the client cannot be constructed.
     fn create(&self, config: &ConfigSet) -> RemoteResult<Box<dyn HttpClient>>;
+
+    /// Create a client for a best-effort request whose failure the caller ignores,
+    /// such as the advertisement [`load_push_plan_context`](crate::remote::push_plan::load_push_plan_context)
+    /// reads before a push.
+    ///
+    /// Such a client must not erase credentials the server refuses (no
+    /// [`CredentialProvider::reject`](crate::credentials::CredentialProvider::reject)):
+    /// the request that reports the failure does that, so it can tell the user the
+    /// stored credentials were rejected rather than finding none. A factory whose
+    /// clients never reject (or carry no credentials) can return
+    /// [`create`](Self::create)'s client.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the client cannot be constructed.
+    fn create_for_probe(&self, config: &ConfigSet) -> RemoteResult<Box<dyn HttpClient>>;
+}
+
+/// An [`HttpClientFactory`] whose clients are all [probes](HttpClientFactory::create_for_probe)
+/// of the factory a request would otherwise use (the caller's, or the default one).
+pub(crate) struct ProbeHttpClientFactory<'a> {
+    inner: Option<&'a dyn HttpClientFactory>,
+    #[cfg(feature = "http-ureq")]
+    default: DefaultHttpClientFactory,
+}
+
+impl<'a> ProbeHttpClientFactory<'a> {
+    /// Probes of `inner`, or of the default factory for `repo` when there is none.
+    pub(crate) fn new(inner: Option<&'a dyn HttpClientFactory>, repo: &Repository) -> Self {
+        #[cfg(not(feature = "http-ureq"))]
+        let _ = repo;
+        Self {
+            inner,
+            #[cfg(feature = "http-ureq")]
+            default: DefaultHttpClientFactory::with_environment(repo.environment().clone()),
+        }
+    }
+}
+
+impl HttpClientFactory for ProbeHttpClientFactory<'_> {
+    fn create(&self, config: &ConfigSet) -> RemoteResult<Box<dyn HttpClient>> {
+        if let Some(inner) = self.inner {
+            return inner.create_for_probe(config);
+        }
+        #[cfg(feature = "http-ureq")]
+        {
+            self.default.create_for_probe(config)
+        }
+        #[cfg(not(feature = "http-ureq"))]
+        {
+            let _ = config;
+            Err(RemoteError::HttpUnavailable)
+        }
+    }
+
+    fn create_for_probe(&self, config: &ConfigSet) -> RemoteResult<Box<dyn HttpClient>> {
+        self.create(config)
+    }
+}
+
+/// Fills and approves through the wrapped provider, but never rejects.
+#[cfg(feature = "http-ureq")]
+struct KeepRejectedCredentials<P>(P);
+
+#[cfg(feature = "http-ureq")]
+impl<P: CredentialProvider> CredentialProvider for KeepRejectedCredentials<P> {
+    fn fill(&self, input: &Credential) -> crate::error::Result<Credential> {
+        self.0.fill(input)
+    }
+
+    fn approve(&self, cred: &Credential) -> crate::error::Result<()> {
+        self.0.approve(cred)
+    }
+
+    fn reject(&self, _cred: &Credential) -> crate::error::Result<()> {
+        Ok(())
+    }
 }
 
 /// Default [`HttpClientFactory`] using `UreqHttpClient` (`http-ureq` feature).
@@ -330,21 +409,37 @@ impl DefaultHttpClientFactory {
             environment: Some(environment),
         }
     }
+
+    fn credential_provider(&self, config: &ConfigSet) -> HelperCredentialProvider {
+        let askpass = match &self.environment {
+            Some(env) => askpass_program(env, config),
+            None => askpass_program(&Environment::empty(), config),
+        };
+        HelperCredentialProvider::new(config.clone()).with_askpass(askpass)
+    }
+
+    fn client(
+        config: &ConfigSet,
+        provider: Box<dyn CredentialProvider + Send + Sync>,
+    ) -> RemoteResult<Box<dyn HttpClient>> {
+        let client = UreqHttpClient::from_config(config)
+            .map_err(|e| RemoteError::InvalidUrl(e.to_string()))?
+            .with_credential_provider(provider);
+        Ok(Box::new(client))
+    }
 }
 
 #[cfg(feature = "http-ureq")]
 impl HttpClientFactory for DefaultHttpClientFactory {
     fn create(&self, config: &ConfigSet) -> RemoteResult<Box<dyn HttpClient>> {
-        let askpass = match &self.environment {
-            Some(env) => askpass_program(env, config),
-            None => askpass_program(&Environment::empty(), config),
-        };
-        let provider =
-            Box::new(HelperCredentialProvider::new(config.clone()).with_askpass(askpass));
-        let client = UreqHttpClient::from_config(config)
-            .map_err(|e| RemoteError::InvalidUrl(e.to_string()))?
-            .with_credential_provider(provider);
-        Ok(Box::new(client))
+        Self::client(config, Box::new(self.credential_provider(config)))
+    }
+
+    fn create_for_probe(&self, config: &ConfigSet) -> RemoteResult<Box<dyn HttpClient>> {
+        Self::client(
+            config,
+            Box::new(KeepRejectedCredentials(self.credential_provider(config))),
+        )
     }
 }
 
@@ -433,11 +528,9 @@ impl Remote {
     ///
     /// # Errors
     ///
-    /// Returns [`RemoteError`] or transport errors on failure, and
-    /// [`Error::UnsupportedObjectStore`] (operation `"fetch"`) before contacting the remote
-    /// when `repo` uses a custom [`OdbBuilder::primary`](crate::odb::OdbBuilder::primary)
-    /// store: received objects are installed under the on-disk `objects/` directory, which
-    /// that repository does not read.
+    /// Returns [`RemoteError`] or transport errors on failure. Received pack bytes are written
+    /// into the repository's [`OdbBuilder::primary`](crate::odb::OdbBuilder::primary) store
+    /// (including custom backends) via [`ingest_received_pack`](crate::index_pack::ingest_received_pack).
     pub fn fetch(
         &self,
         repo: &Repository,
@@ -446,7 +539,6 @@ impl Remote {
         cancel: &dyn crate::progress::Cancel,
         http_factory: Option<&dyn HttpClientFactory>,
     ) -> RemoteResult<FetchOutcome> {
-        repo.odb().require_files_primary("fetch")?;
         if opts.configured_refspecs.is_empty() {
             opts.configured_refspecs = self.fetch_refspecs.clone();
         }
@@ -482,12 +574,19 @@ impl Remote {
 
     /// Push `refs` to this remote from `repo`.
     ///
+    /// `cancel` is polled throughout: while the objects to send are walked, while the
+    /// pack is built and streamed, while a local (`file://` or path) remote indexes
+    /// it, and while a smart-HTTP push waits for the server's report. A cancel
+    /// before the objects are stored updates no remote ref and leaves no temporary
+    /// files; a cancel after a wire push sent its whole request stops waiting, but
+    /// the server may still apply the update. Remote-tracking refs are not updated
+    /// either way.
+    ///
     /// # Errors
     ///
-    /// Returns [`RemoteError`] or transport errors on failure, and
-    /// [`Error::UnsupportedObjectStore`] (operation `"push"`) before contacting the remote
-    /// when `repo` uses a custom [`OdbBuilder::primary`](crate::odb::OdbBuilder::primary)
-    /// store: the pack is built from the on-disk `objects/` directory.
+    /// Returns [`Error::Cancelled`] (see [`RemoteError::is_cancelled`]) once `cancel`
+    /// fires, or [`RemoteError`] / transport errors on failure. The pack is built from
+    /// [`Odb::read_store`](crate::odb::Odb::read_store), including custom primaries.
     pub fn push(
         &self,
         repo: &Repository,
@@ -497,7 +596,6 @@ impl Remote {
         cancel: &dyn crate::progress::Cancel,
         http_factory: Option<&dyn HttpClientFactory>,
     ) -> RemoteResult<PushOutcome> {
-        repo.odb().require_files_primary("push")?;
         if opts.tracking_remote.is_none() {
             opts.tracking_remote = self.name.clone();
         }
@@ -546,7 +644,10 @@ impl Remote {
     /// - `progress`: receives the download and unpack progress.
     /// - `cancel`: checked while the bundle is downloaded and unpacked; a
     ///   cancelled seed comes back as `Failed`, so callers check `cancel` again.
-    /// - `http_factory`: builds the HTTP client, as for [`Self::fetch`].
+    /// - `http_factory`: builds the HTTP client, as for [`Self::fetch`]. Seeding is
+    ///   best-effort, so it uses a [probe client](HttpClientFactory::create_for_probe):
+    ///   credentials the server refuses stay stored for the fetch that follows to
+    ///   report.
     #[must_use]
     pub fn seed_from_bundle_uri(
         &self,
@@ -568,7 +669,8 @@ impl Remote {
         if !enabled {
             return BundleSeed::NotOffered;
         }
-        let client = match http_client(http_factory, repo) {
+        let probe = ProbeHttpClientFactory::new(http_factory, repo);
+        let client = match http_client(Some(&probe), repo) {
             Ok(c) => c,
             Err(e) => {
                 return BundleSeed::Failed {
@@ -677,18 +779,38 @@ impl Remote {
                         opts.filter = crate::partial_clone::stored_remote_filter(&cfg, name);
                     }
                 }
-                if crate::partial_clone::fetch_requires_upload_pack(
-                    opts.filter.as_ref(),
-                    &cfg,
-                    opts.remote_name.as_deref().or(self.name.as_deref()),
-                ) {
+                // An automatic filter needs the server's promisor advertisement, which
+                // only the wire protocol carries. A source that is itself backed by a
+                // promisor remote (a server whose large blobs live on a LOP) lacks some
+                // objects, so copying its object store would come up short: it is
+                // served like a remote, which omits or fetches what it lacks.
+                if opts.auto_filter
+                    || crate::partial_clone::fetch_requires_upload_pack(
+                        opts.filter.as_ref(),
+                        &cfg,
+                        opts.remote_name.as_deref().or(self.name.as_deref()),
+                    )
+                    || local_source_has_promisor_remotes(&remote_git)
+                {
+                    let client_env = if opts.environment.is_fetch_options_default() {
+                        repo.environment()
+                    } else {
+                        &opts.environment
+                    };
                     let mut conn = crate::transport::connect_local_upload_pack(
                         &remote_git,
                         Service::UploadPack,
                         &connect,
+                        client_env,
+                        repo.caches().promisor_fetcher(),
                     )
                     .map_err(RemoteError::Library)?;
-                    return Ok(fetch_remote_into(repo, &mut *conn, opts, progress, cancel)?);
+                    let fetched = fetch_remote_into(repo, &mut *conn, opts, progress, cancel);
+                    // A serving side that failed knows why (the client may only have
+                    // seen the stream end early, or even taken it as an empty pack), so
+                    // its error comes first.
+                    conn.finish().map_err(RemoteError::Library)?;
+                    return Ok(fetched?);
                 }
                 Ok(fetch_local_into(repo, &remote_git, opts, progress, cancel)?)
             }
@@ -735,6 +857,7 @@ impl Remote {
                     &remote_git,
                     refs,
                     opts,
+                    progress,
                     cancel,
                     pre_push,
                 )?)
@@ -818,6 +941,13 @@ fn repo_context(repo: Option<&Repository>) -> (&Path, Option<&Path>, Option<Odb>
         Some(r) => (r.git_dir(), r.work_tree(), Some(r.odb().clone())),
         None => (Path::new("."), None, None),
     }
+}
+
+/// Whether the local repository at `git_dir` has promisor remotes of its own
+/// (only its own config counts, as for any served repository's partial state).
+fn local_source_has_promisor_remotes(git_dir: &Path) -> bool {
+    ConfigSet::load_repo_local_only(git_dir)
+        .is_ok_and(|cfg| crate::promisor::repo_treats_promisor_packs(git_dir, &cfg))
 }
 
 fn local_git_dir_from_url(

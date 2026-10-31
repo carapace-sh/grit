@@ -27,9 +27,9 @@ grit history undo [--dry-run]
 
 Shared behavior for every subcommand:
 
-- **Conflicts abort** — if replaying a descendant would conflict, nothing is applied (planned objects may already exist in the ODB from planning).
+- **Conflicts abort** — if replaying a descendant would conflict, nothing is applied (planned objects may already exist in the ODB from planning). The error names the commit that could not be replayed. When that commit is only on another branch that `--update-refs branches` would move (a branch built on top of the edited commit), the error also names that branch and hints at `--update-refs head`, which rewrites only the current branch and leaves the others where they are.
 - **`--dry-run`** — print which refs would move; refs, the index, and the worktree stay unchanged. New commit objects are still written during planning, matching Git’s `git history --dry-run` model. Commit signing is skipped during dry-run planning (no `gpg` / `ssh-keygen` invocation); a full run signs replacement commits when [`commit.gpgsign`](../commit/) is enabled, like [`grit commit`](../commit/).
-- **`--update-refs`** — `branches` (default) updates every local branch whose tip descends from the edited commit; `head` updates only the commit `HEAD` points at.
+- **`--update-refs`** — `branches` (default) updates every local branch whose tip descends from the edited commit, except other branches at the same commit as `HEAD` (a `backup` branch made before the edit keeps the old history); `head` updates only the commit `HEAD` points at.
 
 ### `drop`
 
@@ -61,15 +61,35 @@ Provide exactly one of `-m` / `--message` or `--message-file` when you want an e
 
 Assign **staged** hunks into the commits that last touched overlapping lines (between `--base` and `HEAD`), then replay descendants in **one** rewrite. Grit uses blame line mapping to find candidate commits and checks that each hunk commutes with commits after its target. Assigned hunks are folded into target commits via the same three-way merge as [`fixup`](#fixup); unassigned hunks stay staged.
 
-`--base` is exclusive: commits at and before the base are not considered. When omitted, grit hides other local branch tips, applies an upstream fork-point when configured, and caps the stack at ten commits.
+`--base` is exclusive: commits at and before the base are not considered. When omitted, grit hides other local branch tips (except a second branch name at the checked-out tip, such as a backup or review branch parked at `HEAD`), applies an upstream fork-point when configured, and caps the stack at ten commits. When a hunk’s introducing commit is excluded because of another local tip, `--json` and human output report `hidden_by_ref` with the ref name and suggest `--base`.
 
 ### `rebase`
 
-Replay commits on the current branch onto `<upstream>` (or `--onto`), matching [`grit rebase`](rebase.md) including `--continue`, `--abort`, and `--skip`. Prefer the top-level command for everyday use; `grit history rebase` shares the same handler and JSON shape. Successful `--exec` commands that leave tracked edits stop with `exec_dirty`, preserve the index and worktree, and use the same [exec recovery](rebase.md#successful-exec-commands-that-leave-edits) workflow.
+Replay commits on the current branch onto `<upstream>` (or `--onto`), matching [`grit rebase`](rebase.md) including `--continue`, `--abort`, and `--skip`. Prefer the top-level command for everyday use; `grit history rebase` shares the same handler and JSON shape. `--exec` commands may [amend or add commits](rebase.md#exec-commands-that-amend-or-add-commits) at each replayed commit; later commits are replayed onto the result. Successful `--exec` commands that leave tracked edits stop with `exec_dirty`, preserve the index and worktree, and use the same [exec recovery](rebase.md#successful-exec-commands-that-leave-edits) workflow.
 
 ### `undo`
 
 Restore branch tips (and the worktree when `HEAD`'s tree changed) from the last successful history rewrite that moved refs. Grit records each apply in `.git/grit/history-last` (ignored by `git fsck --strict`); `undo` inverts that plan when every recorded ref is still at its post-rewrite tip. A second `undo` redoes the rewrite. Recorded applies always write reflog entries for moved refs (even when `core.logAllRefUpdates=false`) so the pre-rewrite tips stay reachable until undo or reflog expiry.
+
+`fixup` and `absorb` consume staged (or `--hunks` / `--lines` selected) edits. Undoing one puts those edits back: each consumed path gets the index entry and work tree file it had before the command, so a staged fixup comes back staged, unstaged edits on the same path come back unstaged, and a `--hunks` fixup leaves the selected hunks unstaged again. A staged submodule pointer comes back staged too; the submodule's own checkout is never touched. The saved state lives next to the record in `.git/grit/history-last-work` (also ignored by `git fsck`), and the next recorded rewrite replaces it. A second `undo` returns to the post-fixup state. Undo refuses to run when one of those paths changed after the command, because putting the edit back would overwrite the newer change.
+
+```console
+$ git add a.txt
+$ grit history fixup HEAD~2
+Fixed up 3 commit(s)
+  commit 6904103 → 32a5464 (c1)
+  commit 8b9fec5 → 384d455 (c2)
+  commit 16a0857 → 46f21c2 (c3)
+  refs/heads/main 16a0857 → 46f21c2
+$ grit history undo
+Undid last history rewrite
+  refs/heads/main 46f21c2 → 16a0857
+  restored a.txt (index and work tree)
+$ git status --short
+M  a.txt
+```
+
+A record written by an older grit has no saved state. Undoing a `fixup` or `absorb` from such a record still moves the refs, and prints the commit that still holds the folded edits (`unrestored_edits` in `--json`), so you can recover them from it.
 
 There is nothing to undo when no record exists, when a listed ref moved, or when local changes would be overwritten by the checkout.
 
@@ -237,7 +257,7 @@ Pass `--json` on `grit history drop`, `grit history move`, `grit history reword`
 | `refs` | array | `{ref,old,new}` for each ref that would move or moved. `name` duplicates `ref` and is deprecated; it will be removed in a future release. |
 | `head` | object or null | `{old,new}` when `HEAD`'s commit OID changes; `null` when unchanged. |
 | `dry_run` | boolean | `true` when `--dry-run` was set. |
-| `commit` | string | `rebase` when paused: source commit for `conflicts`, or checked-out replay commit for `exec_dirty` (full hex). |
+| `commit` | string | `rebase` when paused: source commit for `conflicts`, or `HEAD` after the command for `exec_dirty` (full hex). |
 | `conflicts` | array | `rebase` when `result` is `conflicts`: `{path,kind,summary?}`. |
 | `next_steps` | array | `rebase` when paused: ordered follow-up `grit` commands. |
 | `alternatives` | array | `rebase` when paused: `grit rebase --abort` and `grit rebase --skip`. |
@@ -255,7 +275,15 @@ For `absorb`, the object also includes:
 | Field | Type | Meaning |
 | ----- | ---- | ------- |
 | `assignments` | array | `{path,hunk_range,commit,subject}` for hunks assigned to historical commits. |
-| `unassigned` | array | `{path,hunk_range,reason}` for hunks left staged (`reason` is a stable code). |
+| `unassigned` | array | `{path,hunk_range,reason,detail?}` for hunks left staged (`reason` is a stable code; `detail` explains `hidden_by_ref`). |
+| `excluded_refs` | array | `{ref,commit}` for local branch tips hidden from the stack (always present; empty when none apply). |
+
+For `undo`, the object also includes:
+
+| Field | Type | Meaning |
+| ----- | ---- | ------- |
+| `restored_paths` | array | Paths whose index entry and work tree file were put back (or would be, with `--dry-run`) because the undone `fixup` or `absorb` had consumed their edits. Omitted when empty. |
+| `unrestored_edits` | string | Full hex OID of the commit that still holds edits an undone `fixup` or `absorb` folded in, when the record had no saved state to restore. Omitted otherwise. |
 
 For `rebase`, use the [`grit rebase`](rebase.md) JSON table (`result`, `commit`, `conflicts`, `next_steps`, `alternatives`, plus `rewritten` / `refs` / `head` when `result` is `completed`).
 
@@ -288,7 +316,26 @@ Example:
 }
 ```
 
-History rewrite commands other than `rebase` report planning conflicts as structured errors (`kind: "conflict"`). `grit history rebase` uses the same stop/resume JSON as [`grit rebase`](rebase.md) (`result: "conflicts"`, exit **1**).
+History rewrite commands other than `rebase` report planning conflicts as structured errors (`kind: "conflict"`) with `conflicts` (paths) and `commit` (the commit that could not be replayed). When that commit is only on other branches the rewrite would move, `refs` lists them and `hint` suggests `--update-refs head`. `grit history rebase` uses the same stop/resume JSON as [`grit rebase`](rebase.md) (`result: "conflicts"`, exit **1**).
+
+Here `other` was built on `topic` and edits the line that `c2` added, so dropping `c2` from `topic` cannot move `other`:
+
+```console
+$ grit history drop topic~1
+error: history drop has conflicts moving refs/heads/other onto the new history:
+  commit 78d765c o1
+  a.txt
+
+Nothing was changed. grit can't resolve conflicts yet.
+hint: pass --update-refs head to rewrite only the current branch and leave the others as they are
+$ grit history drop topic~1 --json
+{"commit":"78d765caa49114094c4779be2dc3e505979ba6c4","conflicts":["a.txt"],"error":"history drop has conflicts","hint":"pass --update-refs head to rewrite only the current branch and leave the others as they are","kind":"conflict","refs":["refs/heads/other"]}
+$ grit history drop topic~1 --update-refs head
+Dropped 1 commit, replayed 2 descendant commit(s)
+  commit e8de07f → (dropped) (c2)
+  commit a8a77a4 → 844233b (c3)
+  refs/heads/topic a8a77a4 → 844233b
+```
 
 ## Markdown output
 

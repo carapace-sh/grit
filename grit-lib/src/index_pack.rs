@@ -150,6 +150,13 @@ pub struct IngestPackOptions {
     pub environment: crate::environment::Environment,
     /// When true, write an empty sibling `.promisor` file next to the installed pack.
     pub mark_promisor_pack: bool,
+    /// When set, write a sibling `.keep` file holding this message (Git's
+    /// `index-pack --keep=<msg>`), so `gc` and `repack` leave the pack alone.
+    ///
+    /// The marker is written before the pack is published, so a concurrent `gc`
+    /// never sees the pack unprotected. A large-object promisor relies on that,
+    /// since nothing references the blobs it holds.
+    pub keep_message: Option<String>,
     /// Rows for a pack built in-process (`oid`, pack offset, per-object CRC32). When set, the
     /// pack body is not rescanned to rebuild the index (local repack/gc only); together with
     /// [`Self::skip_post_index_verify`] the pack's trailer is trusted as written too, so the
@@ -166,9 +173,43 @@ impl Default for IngestPackOptions {
             merged_config: None,
             environment: crate::environment::Environment::empty(),
             mark_promisor_pack: false,
+            keep_message: None,
             trusted_index_rows: None,
         }
     }
+}
+
+struct IngestPackPublishPolicy {
+    shared_repo: i32,
+    write_rev: bool,
+}
+
+fn resolve_ingest_pack_publish_policy(
+    opts: &IngestPackOptions,
+    odb: &Odb,
+) -> Result<IngestPackPublishPolicy> {
+    let cfg = if let Some(c) = &opts.merged_config {
+        Some(c.clone())
+    } else if let Some(git_dir) = odb.config_git_dir() {
+        Some(crate::config::ConfigSet::load(
+            &opts.environment,
+            Some(git_dir),
+            true,
+        )?)
+    } else {
+        None
+    };
+    let shared_raw = cfg.as_ref().and_then(|c| c.get("core.sharedRepository"));
+    let shared_repo =
+        crate::shared_repo::shared_repository_from_config_value(shared_raw.as_deref())
+            .map_err(|msg| Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, msg)))?;
+    let write_rev = cfg
+        .as_ref()
+        .is_none_or(|c| c.pack_write_reverse_index_default(&opts.environment));
+    Ok(IngestPackPublishPolicy {
+        shared_repo,
+        write_rev,
+    })
 }
 
 impl IngestPackOptions {
@@ -356,7 +397,8 @@ pub fn install_pack_bytes_with_progress(
 /// Install a pack from `pack_path` into `odb`'s `objects/pack/` directory.
 ///
 /// The file is moved into place when possible; callers may pass a temp receive
-/// path under `objects/pack/`.
+/// path under `objects/pack/`. Newly published `.pack`, `.idx`, and `.rev`
+/// sidecars are made read-only (respecting umask and `core.sharedRepository`).
 ///
 /// Several threads or processes may install the same pack into one repository at
 /// once (parallel fetches): each stages under its own name, and a `.pack`/`.idx`
@@ -385,6 +427,7 @@ pub fn install_pack_path_with_progress(
     cancel: Option<&dyn Cancel>,
 ) -> Result<IngestedPack> {
     odb.require_files_primary("index_pack")?;
+    let publish_policy = resolve_ingest_pack_publish_policy(opts, odb)?;
     let owned = pack_path.to_path_buf();
     let hb = odb.hash_algo().len();
     let meta = std::fs::metadata(&owned).map_err(Error::Io)?;
@@ -533,10 +576,32 @@ pub fn install_pack_path_with_progress(
             let staged = TempPath::try_from_path(staged).map_err(Error::Io)?;
             publish_no_clobber(staged, final_path).map_err(Error::Io)
         };
-        if !publish(&stage_pack, &final_pack)? {
-            touch_pack_mtime(&final_pack);
+        let shared_repo = publish_policy.shared_repo;
+        // The keep marker goes first: a gc that finds the pack must find it too.
+        let keep = write_keep_marker(&final_pack, opts)?;
+        let published = (|| -> Result<()> {
+            if !publish(&stage_pack, &final_pack)? {
+                touch_pack_mtime(&final_pack);
+            } else {
+                crate::shared_repo::finalize_pack_file_mode(shared_repo, &final_pack)?;
+            }
+            if publish(&stage_idx, &idx_path)? {
+                crate::shared_repo::finalize_pack_file_mode(shared_repo, &idx_path)?;
+            }
+            if publish_policy.write_rev {
+                crate::pack_rev::write_pack_rev_sidecar_for_index_path_with_shared(
+                    &idx_path,
+                    shared_repo,
+                )?;
+            }
+            Ok(())
+        })();
+        if let Err(err) = published {
+            if let Some(keep) = keep.filter(|_| !final_pack.is_file()) {
+                let _ = std::fs::remove_file(keep);
+            }
+            return Err(err);
         }
-        publish(&stage_idx, &idx_path)?;
         if opts.mark_promisor_pack {
             std::fs::write(final_pack.with_extension("promisor"), b"").map_err(Error::Io)?;
         }
@@ -557,6 +622,55 @@ pub fn install_pack_path_with_progress(
     let ingested = install_result?;
     odb.invalidate_packs();
     Ok(ingested)
+}
+
+/// Flush an installed pack to disk: the `.pack`, its `.idx` and whichever of the
+/// `.rev`, `.keep` and `.promisor` sidecars exist, then the pack directory, so the
+/// new names survive a crash too.
+///
+/// [`install_pack_path`] does not do this itself (Git does by default, through
+/// `core.fsync`). Callers that delete other copies of the pack's objects right
+/// after (offloading to a large-object promisor, rewriting a partial repository's
+/// packs) call it first, so a power loss never leaves an object in neither place.
+///
+/// # Errors
+///
+/// [`Error::Io`] when a file cannot be opened or synced.
+pub(crate) fn sync_installed_pack(pack_path: &Path) -> Result<()> {
+    let sync = |path: &Path| std::fs::File::open(path).and_then(|f| f.sync_all());
+    sync(pack_path).map_err(Error::Io)?;
+    sync(&pack_path.with_extension("idx")).map_err(Error::Io)?;
+    for ext in ["rev", "keep", "promisor"] {
+        let sidecar = pack_path.with_extension(ext);
+        if sidecar.is_file() {
+            sync(&sidecar).map_err(Error::Io)?;
+        }
+    }
+    // Directories can be synced this way on Unix only.
+    #[cfg(unix)]
+    if let Some(dir) = pack_path.parent() {
+        sync(dir).map_err(Error::Io)?;
+    }
+    Ok(())
+}
+
+/// Write the `.keep` marker [`IngestPackOptions::keep_message`] asks for next to
+/// `final_pack`.
+///
+/// Returns the marker when this call created it, so a failed publish can take it
+/// back; one that was already there (another installer of the same pack) is left.
+fn write_keep_marker(final_pack: &Path, opts: &IngestPackOptions) -> Result<Option<PathBuf>> {
+    let Some(message) = &opts.keep_message else {
+        return Ok(None);
+    };
+    let path = final_pack.with_extension("keep");
+    let created = !path.exists();
+    let mut contents = message.trim_end_matches('\n').as_bytes().to_vec();
+    if !contents.is_empty() {
+        contents.push(b'\n');
+    }
+    std::fs::write(&path, contents).map_err(Error::Io)?;
+    Ok(created.then_some(path))
 }
 
 /// Complete a thin pack in place (`index-pack --fix-thin`): append each of `bases` from
@@ -1500,6 +1614,39 @@ mod tests {
     }
 
     #[test]
+    fn keep_message_is_written_next_to_the_pack() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let odb = Odb::new(tmp.path());
+        let ingested = install_pack_bytes(
+            single_blob_pack(b"kept blob"),
+            &odb,
+            &IngestPackOptions {
+                keep_message: Some("large-object promisor".to_owned()),
+                mark_promisor_pack: true,
+                ..Default::default()
+            },
+        )
+        .expect("install");
+        let pack = ingested.pack_path.expect("pack path");
+        assert_eq!(
+            std::fs::read_to_string(pack.with_extension("keep")).expect("keep"),
+            "large-object promisor\n"
+        );
+        assert!(pack.with_extension("promisor").is_file());
+
+        // A pack installed without the option gets no marker.
+        let plain = install_pack_bytes(
+            single_blob_pack(b"plain blob"),
+            &odb,
+            &IngestPackOptions::default(),
+        )
+        .expect("install")
+        .pack_path
+        .expect("pack path");
+        assert!(!plain.with_extension("keep").exists());
+    }
+
+    #[test]
     fn install_failure_leaves_no_published_pack_or_index() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let odb = Odb::new(tmp.path());
@@ -1544,5 +1691,97 @@ mod tests {
             matches!(err, Error::ReceivedPackTempMissing { .. }),
             "expected typed missing-pack error, got {err:?}"
         );
+    }
+
+    #[cfg(unix)]
+    fn pack_sidecar_mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777
+    }
+
+    #[cfg(unix)]
+    fn large_blob_pack_for_install_test() -> Vec<u8> {
+        use grit_test_support::objects::{HashAlgo, ObjectKind as PK, PackBuilder};
+        let mut pb = PackBuilder::new(HashAlgo::Sha1);
+        for i in 0..120 {
+            pb.add_full(PK::Blob, format!("install-mode-{i}\n").as_bytes());
+        }
+        pb.build().bytes
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_pack_finalizes_modes_for_shared_group_and_writes_rev() {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let git_dir = tmp.path().join("remote.git");
+        std::fs::create_dir_all(git_dir.join("objects/pack")).expect("pack dir");
+        std::fs::write(
+            git_dir.join("config"),
+            "[core]\n\trepositoryformatversion = 0\n\tsharedRepository = group\n",
+        )
+        .expect("config");
+        let objects = git_dir.join("objects");
+        let odb = Odb::new(objects.as_path()).with_config_git_dir(git_dir.clone());
+
+        let pack_bytes = large_blob_pack_for_install_test();
+        let spool = git_dir.join("objects/pack/incoming.pack");
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&spool)
+                .expect("0600 spool");
+            f.write_all(&pack_bytes).expect("write pack");
+        }
+        assert_eq!(pack_sidecar_mode(&spool), 0o600);
+
+        install_pack_path(&spool, &odb, &IngestPackOptions::default()).expect("install");
+
+        let pack_dir = git_dir.join("objects/pack");
+        let pack_path = std::fs::read_dir(&pack_dir)
+            .expect("read pack dir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|p| p.extension().is_some_and(|x| x == "pack"))
+            .expect("installed pack");
+        let idx_path = pack_path.with_extension("idx");
+        let rev_path = pack_path.with_extension("rev");
+        assert_eq!(pack_sidecar_mode(&pack_path), 0o444);
+        assert_eq!(pack_sidecar_mode(&idx_path), 0o444);
+        assert!(rev_path.is_file(), "expected .rev sidecar");
+        assert_eq!(pack_sidecar_mode(&rev_path), 0o444);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_pack_finalizes_modes_for_shared_0660_config() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let git_dir = tmp.path().join("remote.git");
+        std::fs::create_dir_all(git_dir.join("objects/pack")).expect("pack dir");
+        std::fs::write(
+            git_dir.join("config"),
+            "[core]\n\trepositoryformatversion = 0\n\tsharedRepository = 0660\n",
+        )
+        .expect("config");
+        let objects = git_dir.join("objects");
+        let odb = Odb::new(objects.as_path()).with_config_git_dir(git_dir.clone());
+        let pack_bytes = large_blob_pack_for_install_test();
+        install_pack_bytes(pack_bytes, &odb, &IngestPackOptions::default()).expect("install");
+        let pack_path = std::fs::read_dir(git_dir.join("objects/pack"))
+            .expect("read pack dir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|p| p.extension().is_some_and(|x| x == "pack"))
+            .expect("pack");
+        assert_eq!(pack_sidecar_mode(&pack_path), 0o440);
+        assert_eq!(pack_sidecar_mode(&pack_path.with_extension("idx")), 0o440);
     }
 }

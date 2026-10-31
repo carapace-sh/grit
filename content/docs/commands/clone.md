@@ -8,14 +8,14 @@ order: 2
 ## Synopsis
 
 ```text
-grit clone <url> [<dir>] [--depth <N>] [-b|--branch <NAME>] [--blobs <none|SIZE>] [--shallow] [--single-branch | --no-single-branch] [--no-tags] [-o <name>] [--bare] [--no-checkout] [-q|--quiet]
+grit clone <url> [<dir>] [--depth <N>] [-b|--branch <NAME>] [--blobs <none|auto|SIZE>] [--config <KEY=VALUE>]... [--shallow] [--single-branch | --no-single-branch] [--no-tags] [-o <name>] [--bare] [--no-checkout] [-q|--quiet]
 ```
 
 ## Description
 
 Copies the repository at `<url>` into a new directory and checks out the remote's default branch. The remote is saved as `origin`, so [`grit fetch`](../fetch/), [`grit pull`](../pull/) and [`grit push`](../push/) work with no further setup.
 
-Clone fetches every remote tag under `refs/tags/`, including tags on commits that are not reachable from any branch tip (matching `git clone`). Later [`grit fetch`](../fetch/) uses tag-following by default; pass `--tags` to fetch all tags again.
+Clone fetches every remote tag under `refs/tags/` on a full multi-branch clone, including tags on commits that are not reachable from any branch tip (matching `git clone`). With `--single-branch` (or a shallow clone without `--no-single-branch`), only tags whose peeled commits are reachable from the fetched branch history are imported — the same tag-following default as `git clone --single-branch`. Later [`grit fetch`](../fetch/) uses tag-following by default; pass `--tags` to fetch all tags again.
 
 With files-based ref storage, clone packs imported tags and remote-tracking refs,
 including final peel records for nested annotated tags. Symbolic `HEAD` refs stay
@@ -46,6 +46,8 @@ After the clone, stdout gets a summary: total time with a bar showing where it w
 
 On a case-insensitive filesystem (`core.ignorecase`), when the repository contains paths that differ only by case (or other spellings that map to one on-disk file), grit prints a **warning** on **stderr** (human mode only) listing every colliding index path. Only one path from each group exists on disk; the summary **files** and **worktree_bytes** counts reflect distinct on-disk files, not the number of index entries. With `commit.autoStage` (the default), grit does not auto-stage collision losers — their index blobs stay as recorded in the tree even though the work tree shows them as modified.
 
+When the checked-out tree contains **submodule gitlinks** (mode `160000`), grit creates an empty directory at each path and does **not** fetch the nested repository. There is no `grit submodule` command and no `--recurse-submodules` flag. After a successful checkout, human and `--markdown` output print a one-line **note** on stderr listing how many gitlinks were found; `--json` includes a `submodule_paths` array (omitted when empty). Use the system `git` command if you need submodule checkout or updates.
+
 ### Starting from the server's bundle
 
 When an HTTP(S) server offers a prebuilt bundle through Git's `bundle-uri` protocol command (as [`grit serve`](../serve/) does), clone downloads that bundle first, unpacks it, and then fetches only what is newer than it. A bundle is a plain file, so the download resumes instead of starting over:
@@ -62,7 +64,7 @@ The bundle download has its own display: an arrow and the bundle's URL, then a b
 
 When it finishes, the line becomes `✓ bundle 58.5 MiB in 8.5s · 5.23 MiB/s · resumed at 14.1 MiB`, and the summary gets a `bundle` row. Shallow (`--depth`) and partial (`--blobs`) clones never use a bundle, and `transfer.bundleURI=false` in config turns bundles off. When the bundle cannot be used, clone warns and fetches everything as usual.
 
-For private GitHub repositories over HTTPS, sign in first with [`grit auth`](../auth/).
+For private GitHub repositories over HTTPS, sign in first with [`grit auth`](../auth/). For other hosts, save a user name and token first with `grit auth <url> --username <user> --token <token>`.
 
 When the remote has no commits yet (an empty bare repository), grit still creates the destination directory, configures `origin`, and points `HEAD` at the remote's default branch without checking out files. Human output includes a short note on stderr (`note: the remote repository is empty.`); `--json` reports `"files": 0`, `"no_checkout_reason": "empty_remote"`, and the configured branch name.
 
@@ -78,7 +80,51 @@ Pass `--depth <N>` for the same result as `git clone --depth`: only one ref is f
 
 `--blobs <SIZE>` omits blobs whose inflated size is at or above the limit. `<SIZE>` accepts the same suffixes as Git's `blob:limit` filter (`512`, `1k`, `2m`, …). Smaller blobs stay in the first pack, which keeps checkouts working when only large assets are skipped.
 
-Partial clone trades disk and bandwidth on the first fetch for extra round-trips when something needs blob bytes (for example `git log -p` or reading a large file). It works with `--depth`, `-b` / `--branch`, and the other clone options. The server must allow filter requests (`uploadpack.allowFilter` on bare repos served over smart HTTP or `file://`).
+`--blobs auto` takes the filter from the server instead: from the [large-object promisors](#large-object-promisors) it advertises and the clone accepts, using the strictest `partialCloneFilter` they advertise (`blob:none` over any limit, else the smallest limit). Without an accepted remote that advertises a filter, nothing is filtered. The clone records `remote.<name>.partialclonefilter=auto`, so each later fetch picks its filter the same way, as Git 2.54 and newer do; older Git does not understand that value.
+
+Partial clone trades disk and bandwidth on the first fetch for extra round-trips when something needs blob bytes (for example `git log -p` or reading a large file). It works with `--depth`, `-b` / `--branch`, and the other clone options. The server must allow filter requests (`uploadpack.allowFilter` on bare repos served over smart HTTP or `file://`); a server that does not sends every blob, and the summary says the filter was ignored. A partial clone of a local path or `file://` URL runs grit's own upload-pack in-process, where Git would start `git upload-pack`, so it needs no `git` installed and follows the same `uploadpack.*` settings, read from the served repository's config and, as with Git, from your global and system config.
+
+When you pass `--blobs` but the server does not advertise filter support, grit warns on stderr (even with `-q`), fetches an unfiltered pack, and does not treat the clone as partial in human output or `--json` (`partial` is omitted or false). Promisor configuration is still written, matching `git clone --filter` when the server ignores the filter, so later commands may warn about a promisor remote even though every blob arrived in the first pack.
+
+`--config <KEY=VALUE>` writes a config value into the new repository before anything is fetched, like `git clone -c`. It can be repeated, and a key given twice gets both values. A key without `=VALUE` is set to `true`. Unlike the global `-c`, which lasts for one command, these values stay in the clone's config.
+
+### Large-object promisors
+
+A server can keep its large blobs on another remote, a large-object promisor (LOP), and say so with the protocol v2 `promisor-remote` capability (see [grit serve](../serve/#large-object-promisors)). A clone that accepts the LOP lets the server leave those blobs out; they are then fetched from the LOP when something needs them, instead of through the server.
+
+Accepting takes two things in the new repository's config, so they go in with `--config`: the LOP itself as a promisor remote (`remote.<name>.url` and `remote.<name>.promisor=true`), and a policy in `promisor.acceptFromServer`:
+
+| Value | Accepts |
+| --- | --- |
+| `none` (default) | nothing |
+| `knownUrl` | a remote configured under the advertised name with the same URL (the safest choice) |
+| `knownName` | a remote configured under the advertised name, whatever its URL |
+| `all` | every advertised remote; only for servers you fully trust |
+
+`promisor.checkFields` (`partialCloneFilter`, `token`) also requires the advertised value of each listed field to equal the one configured for the remote. `promisor.storeFields` copies the advertised values of the listed fields into the config of a remote that is already configured; it never creates a remote or changes its URL. Lazy fetches always use the URL configured locally, never the advertised one.
+
+Accepting needs a partial clone (`--blobs`): a full clone needs every object from the server, so it declines (`not_partial`). The clone's summary says what it decided:
+
+```console
+$ grit clone --blobs auto \
+    --config remote.lop.url=https://lop.example.com/project.git \
+    --config remote.lop.promisor=true \
+    --config promisor.acceptFromServer=knownUrl \
+    https://git.example.com/project.git
+Cloning into 'project' ...
+✓ Cloned into project on main in 128ms
+  partial  partial clone; large blobs are fetched on demand
+  promisor  lop accepted · blob:limit=5k
+
+  time      ·······················█▓······▒▒▒▒▒▒▒▒▒  128ms
+            · connect 72ms  █ receiving 0ms  ▓ indexing 2ms  · other 17ms  ▒ checkout 28ms
+  data      225 B received
+  objects   3 · 1 commit · 1 tree · 1 blob
+  refs      1 branch · 0 tags
+  files     2 files · 19.5 KiB in the work tree
+```
+
+The checkout's missing blobs came from `lop`. Missing objects are always asked of the promisor remotes in config order, with the remote the clone came from (`extensions.partialClone`) last, so a LOP configured before it is tried first and the server is only asked for what the LOP did not have. A server refuses a request that names any object it lacks, so when the LOP holds only the large blobs, the missing objects are split into smaller requests until each remote is asked only for what it has. When an object cannot be fetched, the error names every remote that failed and why.
 
 `--bare` creates a bare repository at the destination (the directory itself is the git directory, named with a `.git` suffix when the URL is derived automatically), fetches `refs/heads/*` and tags directly, and configures only `remote.<name>.url` — matching `git clone --bare`. `--no-checkout` fetches and sets `HEAD` to the default branch without writing the index or work tree files, matching `git clone --no-checkout`.
 
@@ -97,11 +143,12 @@ Working-tree materialization after fetch uses the same parallel checkout path as
 | `--depth <N>` | Shallow clone: fetch at most `N` commits on the selected ref (`git clone --depth`). |
 | `-b`, `--branch <NAME>` | Branch or tag to check out instead of the remote default. |
 | `--shallow` | Hidden alias for `--depth 1` (conflicts with `--depth`). |
-| `--single-branch` | Fetch only the branch that is checked out (`git clone --single-branch`). |
+| `--single-branch` | Fetch only the branch that is checked out and follow tags into that history only (`git clone --single-branch`). JSON `tag_fetch` is `following`. |
 | `--no-single-branch` | With `--depth`, fetch every branch tip (`git clone --no-single-branch --depth=1`). |
 | `--no-tags` | Do not fetch tags; sets `remote.<name>.tagOpt=--no-tags` like Git. |
 | `-o`, `--origin <name>` | Name of the remote (default `origin`). |
-| `--blobs <none\|SIZE>` | Partial clone: omit all blobs (`none`) or blobs at/above `<SIZE>` (`1k`, `512`, …). |
+| `--blobs <none\|auto\|SIZE>` | Partial clone: omit all blobs (`none`), blobs at/above `<SIZE>` (`1k`, `512`, …), or what the accepted promisor remotes hold (`auto`). |
+| `--config <KEY=VALUE>` | Write a config value into the new repository before fetching (`git clone -c`). Repeatable. |
 | `--bare` | Bare repository; no working tree (`git clone --bare`). |
 | `--no-checkout` | Fetch refs but do not check out files (`git clone --no-checkout`). |
 | `-q`, `--quiet` | No progress, no `Cloning into` line and no human summary. Warnings (such as an empty remote) still go to stderr; `--json` and `--markdown` output is unchanged. |
@@ -181,14 +228,20 @@ Pass `--json` for stable, scripting-friendly output:
 | `detached` | boolean | True when `HEAD` is detached (tag checkout). |
 | `tag` | string or omitted | Tag name when `-b` named a tag. |
 | `depth` | integer or omitted | Shallow depth when `--depth` or `--shallow` was used. |
-| `blobs` | string or integer or omitted | `"none"` or a byte limit when `--blobs` was used. |
-| `partial` | boolean or omitted | `true` when `--blobs` configured a promisor partial clone. |
+| `blobs` | string or integer or omitted | The filter used: `"none"` or a byte limit. With `--blobs auto`, the filter it resolved to; omitted when nothing was filtered. |
+| `partial` | boolean or omitted | `true` when the server applied the `--blobs` filter on the initial fetch. Omitted or false when the server lacks filter support (see warning above). |
+| `filter_auto` | boolean or omitted | `true` with `--blobs auto`. |
+| `filter_ignored` | boolean or omitted | `true` when the server does not support filters, so `--blobs` was not sent and every blob was downloaded (`partial` is then omitted); the clone is still set up as a partial clone, as Git leaves it. The human summary then shows a `filter` line saying so instead of calling the clone blobless. |
+| `promisor_remotes` | array or omitted | The promisor remotes the server advertised: `name`, `url` (credentials removed), `accepted`, `filter` (the advertised `partialCloneFilter`, or `null`) and `rejected` (why it was not accepted: `policy_none`, `unknown_remote`, `url_mismatch`, `field_missing`, `field_mismatch` or `not_partial`; `null` when accepted). Omitted when the server advertised none. Tokens are never shown. |
+| `stored_fields` | array or omitted | Fields copied into config by `promisor.storeFields`: `remote` and `field` (`partialCloneFilter` or `token`), never the value. Omitted when nothing was stored. |
+| `promisor_warnings` | array or omitted | Promisor config or advertised values that were ignored: `code` is `unknown_accept_value` (`promisor.acceptFromServer` is not a known policy, so nothing is accepted), `unknown_field` (a `promisor.checkFields` / `promisor.storeFields` entry is not a known field), `invalid_advertised_value` (an advertised field was not stored because its value is invalid) or `unusable_auto_filter` (`--blobs auto` cannot use an accepted remote's filter, such as `tree:0`); `key`, `remote`, `field` and `value` say which, when they apply. A rejected advertised value is never shown. Shown as `promisor  warning: …` lines in the human output and `promisor warning` bullets in `--markdown`. Omitted when there were none. |
 | `objects` | integer | Objects installed during fetch: for network clones, objects in the received pack; for local-path clones, objects in newly linked pack indexes plus any reachable loose objects hardlinked from the source. |
 | `bytes` | integer | On-disk payload bytes installed during fetch: for network clones, the received `.pack` size; for local-path clones, the sum of newly linked `.pack` files plus reachable loose object files (same bytes as hardlinked/copied object store data). |
 | `branches` | integer | Remote branches fetched. |
 | `tags` | integer | Remote tags fetched. |
 | `files` | integer | Working-tree files checked out (distinct on-disk paths when `core.ignorecase` collapsed spellings). |
 | `path_collisions` | array of strings | Index paths that collided during checkout on a case-insensitive filesystem. Omitted when empty. |
+| `submodule_paths` | array of strings | Gitlink paths in the checked-out tree. Grit does not fetch submodule repositories. Omitted when empty. |
 | `object_types` | object or null | Objects received by type: `commits`, `trees`, `blobs` and `tags` (annotated tag objects). Populated when grit indexed the received pack or can tally every object in the transfer. `null` when a local pack link installed more objects than the transfer summary tracks individually (typical for a single linked pack on clone). |
 | `worktree_bytes` | integer | Total size of the checked-out files. |
 | `seconds` | number | Wall-clock seconds for the whole clone. |
@@ -288,6 +341,42 @@ Unborn remote default branch (`HEAD` on the server points at a branch with no co
 }
 ```
 
+A clone that accepted a large-object promisor (`--blobs auto`):
+
+```json
+{
+  "url": "https://git.example.com/project.git",
+  "path": "project",
+  "remote": "origin",
+  "single_branch": false,
+  "tag_fetch": "all",
+  "branch": "main",
+  "detached": false,
+  "blobs": 5120,
+  "partial": true,
+  "filter_auto": true,
+  "promisor_remotes": [
+    {
+      "name": "lop",
+      "url": "https://lop.example.com/project.git",
+      "accepted": true,
+      "filter": "blob:limit=5k",
+      "rejected": null
+    }
+  ],
+  "objects": 3,
+  "bytes": 225,
+  "branches": 1,
+  "tags": 0,
+  "files": 2,
+  "object_types": { "commits": 1, "trees": 1, "blobs": 1, "tags": 0 },
+  "worktree_bytes": 20006,
+  "seconds": 0.13,
+  "phases": [],
+  "bare": false
+}
+```
+
 ## Markdown output
 
 Pass [`--markdown`](../global-options/) for agent-friendly output.
@@ -319,21 +408,50 @@ Markdown uses headings, bullet lists, and fenced blocks; pipe characters inside 
 | checkout | 2 | files | [SECONDS] |
 ```
 
+When the server advertised promisor remotes, a bullet lists them, and one more names each stored field:
+
+```text
+- **promisor remotes**: `lop` (accepted)
+- **stored**: `partialCloneFilter` for `lop`
+```
+
 ## Exit status
 
 | Code | Meaning |
 | ---: | --- |
 | `0` | Clone succeeded (including empty remote with no checkout). |
-| `1` | Destination not empty, checkout failure, or other error. Missing or refused credentials are `kind` `auth_required` / `auth_rejected` with a `hint` in `--json` and on the human `hint:` line. HTTPS credentials come from your credential helper, then an askpass program (`GIT_ASKPASS`, `core.askPass`, `SSH_ASKPASS`); see [Credentials](../agents/#credentials-https). |
+| `1` | Destination not empty, checkout failure (the repository is kept: `kind` `clone_checkout_failed`, see [When the checkout fails](#when-the-checkout-fails)), or other error. Missing or refused credentials are `kind` `auth_required` / `auth_rejected` with a `hint` in `--json` and on the human `hint:` line. HTTPS credentials come from your credential helper (`grit auth <url> --username <user> --token <token>` saves one for any host), then an askpass program (`GIT_ASKPASS`, `core.askPass`, `SSH_ASKPASS`); see [Credentials](../agents/#credentials-https). |
 | `2` | Invalid flags ([`usage`](../exit-codes/)). |
 | `128` | Could not reach or read the source: missing path, DNS or connection failure, HTTP error status ([`remote_unreadable`](../exit-codes/)); a `404` adds a hint to check the URL. |
-| `130` | Interrupted with Ctrl-C ([`interrupted`](../exit-codes/)). The error is `operation cancelled` (`{"error":"operation cancelled"}` with `--json`). |
+| `130` | Interrupted with Ctrl-C, `SIGTERM`, or `SIGHUP` ([`interrupted`](../exit-codes/)). The error is `operation cancelled` (`{"error":"operation cancelled"}` with `--json`). |
 
 See [Exit codes](../exit-codes/).
 
+### When the checkout fails
+
+A failure while downloading or setting up the repository removes the destination again. Once every object and ref is in place and `HEAD` is set, a failure while writing the work tree keeps the repository, as `git clone` does, so the checkout can be finished without downloading everything again. The usual cause is a partial clone whose missing blobs cannot be fetched: a large-object promisor that is unreachable or does not have them yet, or lazy fetch turned off. The error says the clone was kept, the `hint` says how to finish, and `--json` reports `kind` `clone_checkout_failed` with a `clone_checkout` object (exit `1`):
+
+```console
+$ GRIT_NO_LAZY_FETCH=1 grit clone --blobs none file:///srv/project.git project
+Cloning into 'project' ...
+error: the clone into 'project' succeeded, but its checkout failed: promised object not available locally: ce013625030ba8dba906f756967f9e9ca394464a
+hint: the repository was kept; run `grit reset --hard` in 'project' to finish the checkout once its promisor remotes can supply the missing objects
+$ grit -C project reset --hard
+Reset master to 284c599 (hard)
+```
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `clone_checkout.path` | string | The clone's directory, where the repository was kept. |
+| `clone_checkout.commit` | string | The commit `HEAD` points at, whose files the checkout was writing. |
+| `clone_checkout.missing_object` | string or omitted | The first promised object that could not be fetched, when the checkout failed for lack of one. |
+| `clone_checkout.failed_remotes` | array | Each promisor remote that failed to supply the missing objects, in the order they were asked: `remote` (name) and `error` (its first error). Empty when no remote was asked, for example with lazy fetch off. |
+
+A clone interrupted during the checkout is still removed (see below).
+
 ### Interrupting a clone
 
-Ctrl-C stops a clone at any point: while it downloads, copies objects or checks out files. The first Ctrl-C asks the clone to stop; grit then rolls back the checkout, removes the destination directory it created (or empties one that already existed empty) and exits `130`. Nothing is left in the way, so the same `grit clone` command can simply be run again, and a bundle download carries on where it stopped. A duplicate signal that arrives with the first (`timeout -s INT` signals both the process and its group) is ignored; pressing Ctrl-C again later ends grit at once, without the cleanup.
+Ctrl-C, `SIGTERM`, and `SIGHUP` stop a clone at any point: while it downloads, copies objects or checks out files. The first signal asks the clone to stop; grit then rolls back the checkout, removes the destination directory it created (or empties one that already existed empty) and exits `130`. Nothing is left in the way, so the same `grit clone` command can simply be run again, and a bundle download carries on where it stopped. A duplicate signal that arrives with the first (`timeout -s INT` or `timeout -s TERM` signals both the process and its group) is ignored; sending the same signal again later ends grit at once, without the cleanup. Only an uncatchable `SIGKILL` (or that second signal after the duplicate window) skips rollback. In a Windows console Ctrl-C and Ctrl-Break behave the same way. Closing the console window still gives grit no chance to clean up, so delete the leftover directory by hand before you clone again.
 
 ```console
 $ grit clone ../git git

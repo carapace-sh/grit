@@ -4,6 +4,15 @@
 
 //! grit-lib — fast, linkable Git engine for Rust.
 //!
+//! # Minimum Rust version
+//!
+//! The published crate requires **Rust 1.95** or newer (`rust-version` in
+//! [`Cargo.toml`](https://github.com/gitbutlerapp/grit/blob/main/grit-lib/Cargo.toml)).
+//! Contributors building the Grit workspace use the pinned toolchain in
+//! [`rust-toolchain.toml`](https://github.com/gitbutlerapp/grit/blob/main/rust-toolchain.toml)
+//! (currently 1.99.0); that pin does not apply when you depend on `grit-lib`
+//! from crates.io outside the repo.
+//!
 //! Grit reimplements Git's on-disk formats and wire protocols in idiomatic Rust
 //! so embedders can open repositories, walk history, diff, merge, fetch, and push
 //! without shelling out to the `git` binary. The [`grit`](https://github.com/gitbutlerapp/grit)
@@ -187,16 +196,17 @@ pub mod diagnostics;
 pub mod diff;
 pub(crate) mod diff_indent_heuristic;
 mod diff_rename_parallel;
-pub(crate) mod diffstat;
 pub(crate) mod dotfile;
 pub(crate) mod environment;
 pub mod error;
 mod ewah_bitmap;
 pub(crate) mod git_dir;
+pub mod gitbutler;
 pub(crate) mod github_auth;
 pub(crate) mod grit_server_auth;
 pub(crate) mod line_interner;
 pub mod line_range;
+mod oid_abbrev;
 pub(crate) mod oid_abbrev_cache;
 pub(crate) mod pack_roll_delta;
 pub(crate) mod partial_clone;
@@ -211,6 +221,7 @@ mod fetch_request;
 pub(crate) mod filter_process;
 pub(crate) mod fmt_merge_msg;
 pub(crate) mod fs_publish;
+pub(crate) mod fs_readonly;
 pub(crate) mod fsck;
 pub(crate) mod fsck_msg_policy;
 pub(crate) mod fsck_standalone;
@@ -226,6 +237,8 @@ pub(crate) mod hide_refs;
 #[path = "history/mod.rs"]
 mod history_root;
 pub(crate) use history_root as history;
+pub(crate) mod alternate_boundary;
+pub(crate) mod atomic_replace;
 pub(crate) mod hooks;
 pub mod ident;
 pub(crate) mod ident_config;
@@ -243,6 +256,7 @@ pub mod lockfile;
 pub(crate) mod log_walk;
 pub(crate) mod mailmap;
 pub mod maintenance;
+pub(crate) mod mem_pipe;
 pub(crate) mod merge_base;
 pub(crate) mod merge_diff;
 pub(crate) mod merge_driver;
@@ -256,6 +270,7 @@ pub mod notes;
 mod object_inspect_root;
 pub mod objects;
 pub(crate) mod odb;
+pub(crate) mod offload;
 pub mod operation;
 pub(crate) mod pack;
 pub(crate) mod pack_bitmap;
@@ -358,7 +373,9 @@ mod worktree_scan;
 pub use crate::hooks::{HookName, PostOperationHooks};
 pub use worktree_scan::PARALLEL_STAT_MIN_ENTRIES;
 #[doc(hidden)]
-pub use worktree_scan::{reset_worktree_metadata_probe, worktree_metadata_probe_count};
+pub use worktree_scan::{
+    reset_worktree_metadata_probe, worktree_metadata_probe_count, worktree_path_resolve_probe_count,
+};
 pub(crate) mod write_tree;
 pub(crate) mod ws;
 pub(crate) mod zlib_inflate;
@@ -368,6 +385,7 @@ pub mod fuzz;
 
 pub use ref_storage::RefStorageFormat;
 
+pub use crate::oid_abbrev::OidAbbrevBatch;
 pub use objects::bench_fixture;
 pub use objects::pack_reuse;
 pub use objects::pack_write;

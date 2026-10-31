@@ -1,22 +1,31 @@
 //! Serving fetches and clones (`upload-pack`).
 
+use super::promised_objects::{
+    missing_objects_policy, plan_pack, resolve_missing_wants, MissingObjects,
+};
 use super::shallow_upload::{compute_shallow_response, ShallowRequest, ShallowResponse};
 use super::upload_pack_policy::{
     resolve_want_ref, validate_wants, validate_wants_filtered, UploadPackPolicy,
 };
 use super::{
     advertised_refs, check_object_format, head_info, parse_oid, read_packet, write_flush,
-    write_line, AdvertisedRef, DeepenNotError, Packet, Peel, ProtocolVersion, Result, ServeError,
-    ServeOptions,
+    write_line, AdvertisedRef, DeepenNotError, MissingObjectReason, Packet, Peel, ProtocolVersion,
+    Result, ServeError, ServeOptions,
 };
 use crate::config::ConfigSet;
+use crate::objects::pack_objects::PackStats;
 use crate::objects::{ObjectId, ObjectKind};
-use crate::pack_objects::{write_upload_pack_stream, PackProgress};
+use crate::pack_object_select::{PackObjectSelection, TagCandidate};
+use crate::pack_objects::{
+    write_upload_pack_selection, write_upload_pack_stream_with_cancel, PackProgress,
+};
 use crate::pkt_line::SidebandChannel1Writer;
+use crate::progress::{Cancel, CancelSignal, NeverCancel};
+use crate::promisor_remote::{parse_accepted_reply, PromisorAdvertisement};
 use crate::repo::Repository;
 use crate::rev_list::ObjectFilter;
 use crate::transfer::PackBuildOptions;
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
 use std::io::{Read, Write};
 
 /// Capabilities offered in a v0/v1 advertisement, before the per-repository ones.
@@ -33,6 +42,88 @@ const V0_CAPABILITIES: &[&str] = &[
     "deepen-not",
 ];
 
+/// Summary of one completed or partial upload-pack session.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct UploadOutcome {
+    /// Bytes written to the client (advertisement, negotiation, sideband, pack).
+    pub bytes_written: u64,
+    /// Objects sent in the pack, when a pack was written.
+    pub objects_sent: u32,
+    /// Negotiation rounds answered (v0 flush rounds and v2 acknowledgment sections).
+    pub negotiation_rounds: u32,
+    /// Pack build counters when a pack was sent.
+    pub pack: Option<PackStats>,
+}
+
+struct CountingWriter<'a> {
+    inner: &'a mut dyn Write,
+    bytes: u64,
+}
+
+impl Write for CountingWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.bytes += n as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+#[derive(Default)]
+struct UploadSession {
+    pack: Option<PackStats>,
+    negotiation_rounds: u32,
+}
+
+impl UploadSession {
+    fn into_outcome(self, bytes_written: u64) -> UploadOutcome {
+        UploadOutcome {
+            bytes_written,
+            objects_sent: self.pack.map(|p| p.object_count).unwrap_or(0),
+            negotiation_rounds: self.negotiation_rounds,
+            pack: self.pack,
+        }
+    }
+
+    fn absorb(&mut self, other: UploadSession) {
+        self.negotiation_rounds = self
+            .negotiation_rounds
+            .saturating_add(other.negotiation_rounds);
+        if let Some(p) = other.pack {
+            self.pack = Some(match self.pack {
+                None => p,
+                Some(existing) => PackStats {
+                    object_count: existing.object_count.saturating_add(p.object_count),
+                    pack_bytes: existing.pack_bytes.saturating_add(p.pack_bytes),
+                    delta_count: existing.delta_count.saturating_add(p.delta_count),
+                    verbatim_reuse_bytes: existing
+                        .verbatim_reuse_bytes
+                        .saturating_add(p.verbatim_reuse_bytes),
+                    verbatim_reuse_objects: existing
+                        .verbatim_reuse_objects
+                        .saturating_add(p.verbatim_reuse_objects),
+                    pack_ofs_fixup_objects: existing
+                        .pack_ofs_fixup_objects
+                        .saturating_add(p.pack_ofs_fixup_objects),
+                    pack_ref_from_ofs_objects: existing
+                        .pack_ref_from_ofs_objects
+                        .saturating_add(p.pack_ref_from_ofs_objects),
+                },
+            });
+        }
+    }
+}
+
+fn map_repo_cancel(err: ServeError) -> ServeError {
+    match err {
+        ServeError::Repository(crate::error::Error::Cancelled) => ServeError::Cancelled,
+        other => other,
+    }
+}
+
 /// Serve one fetch session: advertise refs, negotiate, and send a pack.
 ///
 /// The version in [`ServeOptions::protocol`] selects the wire format. With
@@ -43,7 +134,10 @@ const V0_CAPABILITIES: &[&str] = &[
 /// Shallow fetches, partial-clone filters, and `want-ref` follow repository
 /// upload-pack policy and the capabilities advertised for the session. As in
 /// Git, the v2 `object-info` command is advertised and answered only when
-/// `transfer.advertiseObjectInfo` is true.
+/// `transfer.advertiseObjectInfo` is true. With `promisor.advertise` set, the
+/// v2 capabilities end with `promisor-remote` naming the repository's promisor
+/// remotes, and the names a client accepts are collected in
+/// [`ServeOptions::accepted_promisor_remotes`].
 ///
 /// # Parameters
 ///
@@ -58,39 +152,152 @@ const V0_CAPABILITIES: &[&str] = &[
 /// Returns [`ServeError::NotOurRef`] when the client wants an object outside the
 /// allowed set (advertised refs in stateful mode; reachable from ref tips in
 /// stateless RPC), [`ServeError::Protocol`] for malformed or unsupported requests,
-/// and I/O or repository errors from reading objects and writing the pack.
+/// [`ServeError::ObjectMissing`] when a repository with promisor remotes lacks an
+/// object the response needs (see below), and I/O or repository errors from
+/// reading objects and writing the pack.
+///
+/// # Repositories with promisor remotes
+///
+/// A repository that keeps some blobs on a promisor remote (`remote.<name>.promisor`
+/// or `extensions.partialClone`), such as a server whose large blobs live on a
+/// large-object promisor, plans each pack before sending any of it, with the object
+/// walk rather than bitmaps. A promised blob it does not store is left out when the
+/// client accepted one of the advertised promisor remotes. Otherwise it is fetched
+/// first when [`ServeOptions::lazy_fetch`] (or `uploadpack.lazyFetch`) allows, and
+/// the request fails with [`ServeError::ObjectMissing`] when it does not. That error
+/// reaches a protocol v2 client as an `ERR` line. A v0 client gets it as an `ERR`
+/// line when a want itself is missing, and on side band 3 when the pack walk
+/// finds the missing object.
+/// Only blobs are handled this way: a missing commit, tree or tag fails the
+/// request as before.
 pub fn upload_pack(
     repo: &Repository,
     input: &mut dyn Read,
     output: &mut dyn Write,
     opts: &mut ServeOptions,
-) -> Result<()> {
+) -> Result<UploadOutcome> {
+    upload_pack_cancellable(repo, input, output, opts, &NeverCancel)
+}
+
+/// Serve one fetch session, stopping when `cancel` fires.
+///
+/// Same as [`upload_pack`], but object enumeration and pack generation poll
+/// `cancel` and return [`ServeError::Cancelled`] without writing a pack when it
+/// fires.
+pub fn upload_pack_cancellable(
+    repo: &Repository,
+    input: &mut dyn Read,
+    output: &mut dyn Write,
+    opts: &mut ServeOptions,
+    cancel: &dyn Cancel,
+) -> Result<UploadOutcome> {
+    let stop = CancelSignal::new(cancel);
+    stop.poll().map_err(|_| ServeError::Cancelled)?;
+    let mut counter = CountingWriter {
+        inner: output,
+        bytes: 0,
+    };
     let result = match opts.protocol {
-        ProtocolVersion::V2 => serve_v2(repo, input, output, opts),
-        ProtocolVersion::V0 | ProtocolVersion::V1 => serve_v0(repo, input, output, opts),
+        ProtocolVersion::V2 => serve_v2(repo, input, &mut counter, opts, &stop),
+        ProtocolVersion::V0 | ProtocolVersion::V1 => {
+            serve_v0(repo, input, &mut counter, opts, &stop)
+        }
     };
     match result {
-        Ok(()) => {
-            output.flush()?;
-            Ok(())
-        }
-        Err(err) if opts.stateless_rpc && opts.protocol == ProtocolVersion::V2 => {
-            let msg = serve_error_client_message(&err);
-            write_line(output, &format!("ERR {msg}"))?;
-            write_flush(output)?;
-            output.flush()?;
-            Ok(())
+        Ok(session) => {
+            counter.flush()?;
+            Ok(session.into_outcome(counter.bytes))
         }
         Err(err) => {
-            output.flush()?;
-            Err(err)
+            let err = map_repo_cancel(err);
+            match err {
+                ServeError::Cancelled => {
+                    counter.flush()?;
+                    Err(ServeError::Cancelled)
+                }
+                // Part of the pack is out: an `ERR` line now would land inside it.
+                err @ ServeError::PackInterrupted(_) => {
+                    counter.flush()?;
+                    Err(err)
+                }
+                // Raised before any pack byte: tell the client why instead of hanging up.
+                err @ ServeError::ObjectMissing { .. } if opts.protocol == ProtocolVersion::V2 => {
+                    write_line(
+                        &mut counter,
+                        &format!("ERR {}", client_error_message(repo, &err)),
+                    )?;
+                    write_flush(&mut counter)?;
+                    counter.flush()?;
+                    if opts.stateless_rpc {
+                        Ok(UploadOutcome {
+                            bytes_written: counter.bytes,
+                            ..UploadOutcome::default()
+                        })
+                    } else {
+                        Err(err)
+                    }
+                }
+                err if opts.stateless_rpc && opts.protocol == ProtocolVersion::V2 => {
+                    let msg = serve_error_client_message(&err);
+                    write_line(&mut counter, &format!("ERR {msg}"))?;
+                    write_flush(&mut counter)?;
+                    counter.flush()?;
+                    Ok(UploadOutcome {
+                        bytes_written: counter.bytes,
+                        ..UploadOutcome::default()
+                    })
+                }
+                err => {
+                    counter.flush()?;
+                    Err(err)
+                }
+            }
         }
+    }
+}
+
+/// [`serve_error_client_message`], naming the advertised promisor remotes when
+/// the client could have fetched a missing object from one of them.
+fn client_error_message(repo: &Repository, err: &ServeError) -> String {
+    let msg = serve_error_client_message(err);
+    if !matches!(
+        err,
+        ServeError::ObjectMissing {
+            reason: MissingObjectReason::Promised,
+            ..
+        }
+    ) {
+        return msg;
+    }
+    match PromisorAdvertisement::from_server_config(&repo_config(repo)) {
+        Some(adv) => format!(
+            "{msg} (promisor remotes offered: {})",
+            adv.names().collect::<Vec<_>>().join(", ")
+        ),
+        None => msg,
     }
 }
 
 fn serve_error_client_message(err: &ServeError) -> String {
     match err {
+        ServeError::ObjectMissing { oid, reason } => match reason {
+            MissingObjectReason::Promised => format!(
+                "object {oid} lives on a promisor remote this client did not accept; \
+                 accept it on the client (promisor.acceptFromServer) or let the server \
+                 fetch it (uploadpack.lazyFetch)"
+            ),
+            MissingObjectReason::NotPromised => {
+                format!("object {oid} is missing from the repository")
+            }
+            MissingObjectReason::NoFetcher => format!(
+                "object {oid} is missing and this server cannot fetch from its promisor remotes"
+            ),
+            MissingObjectReason::LazyFetchFailed => format!(
+                "object {oid} is missing and the server's promisor remotes did not supply it"
+            ),
+        },
         ServeError::Protocol(msg) => msg.clone(),
+        ServeError::PackInterrupted(inner) => serve_error_client_message(inner),
         ServeError::UploadFilter(e) => e.to_string(),
         ServeError::NotOurRef(oid) => format!("not our ref {}", oid.to_hex()),
         ServeError::UnknownCommand(cmd) => format!("unknown command {cmd}"),
@@ -100,6 +307,7 @@ fn serve_error_client_message(err: &ServeError) -> String {
         }
         ServeError::Repository(e) => e.to_string(),
         ServeError::Io(e) => e.to_string(),
+        ServeError::Cancelled => "cancelled".to_owned(),
     }
 }
 
@@ -111,12 +319,39 @@ fn upload_policy(repo: &Repository) -> UploadPackPolicy {
     UploadPackPolicy::from_config(&repo_config(repo))
 }
 
+/// How this request treats objects the repository lacks; `None` for a repository
+/// without promisor remotes (the ordinary pack path).
+///
+/// Promised blobs are left out for a client that accepted a promisor remote, and,
+/// among the objects the walk reaches, for one whose `filter` leaves them out anyway
+/// ([`crate::promisor_remote::request_filter_omits_promised_blobs`]). Over stateless
+/// HTTP the second is what lets Git clients fetch: Git sends its `promisor-remote`
+/// reply with `ls-refs` only, so the `fetch` request carries no acceptance. Pass
+/// `None` for the wants themselves, which are sent whatever the filter says.
+fn missing_objects_mode(
+    repo: &Repository,
+    config: &ConfigSet,
+    policy: &UploadPackPolicy,
+    opts: &ServeOptions,
+    filter: Option<&ObjectFilter>,
+) -> Option<MissingObjects> {
+    let omitted_by_filter = filter
+        .is_some_and(|f| crate::promisor_remote::request_filter_omits_promised_blobs(config, f));
+    missing_objects_policy(
+        crate::promisor::repo_treats_promisor_packs(repo.git_dir(), config),
+        !opts.accepted_promisor_remotes.is_empty() || omitted_by_filter,
+        opts.lazy_fetch.unwrap_or(policy.lazy_fetch),
+    )
+}
+
 fn serve_v0(
     repo: &Repository,
     input: &mut dyn Read,
     output: &mut dyn Write,
     opts: &ServeOptions,
-) -> Result<()> {
+    stop: &CancelSignal<'_>,
+) -> Result<UploadSession> {
+    stop.poll().map_err(|_| ServeError::Cancelled)?;
     let config = repo_config(repo);
     let policy = UploadPackPolicy::from_config(&config);
     let refs = advertised_refs(repo, &opts.hidden_refs, &[], Peel::Yes)?;
@@ -128,14 +363,28 @@ fn serve_v0(
         }
         write_v0_advertisement(repo, output, &refs, &head, opts)?;
         if opts.advertise_refs {
-            return Ok(());
+            return Ok(UploadSession::default());
         }
         output.flush()?;
     }
 
-    let Some(request) = read_v0_request(repo, input, &config, &policy)? else {
-        return Ok(());
+    let Some(mut request) = read_v0_request(repo, input, &config, &policy, stop)? else {
+        return Ok(UploadSession::default());
     };
+    // Wanted objects are sent whatever the filter says, so only acceptance (or
+    // lazy fetch) covers a missing want.
+    if let Some(mode) = missing_objects_mode(repo, &config, &policy, opts, None) {
+        if let Err(err) = resolve_missing_wants(repo, &mut request.wants, mode) {
+            if matches!(err, ServeError::ObjectMissing { .. }) {
+                // The client reads ACK/NAK next; an `ERR` line there is reported
+                // as a remote error, as for Git's own refusals of a want.
+                write_line(output, &format!("ERR {}", client_error_message(repo, &err)))?;
+                output.flush()?;
+            }
+            return Err(err);
+        }
+    }
+    let missing = missing_objects_mode(repo, &config, &policy, opts, request.filter.as_ref());
     if request.filter.is_some() {
         validate_wants_filtered(repo, &request.wants)?;
     } else {
@@ -167,9 +416,15 @@ fn serve_v0(
     }
 
     let detailed = request.caps.contains("multi_ack_detailed");
+    let wants = &request.wants;
     let mut common: Vec<ObjectId> = Vec::new();
     let mut seen: HashSet<ObjectId> = HashSet::new();
+    let mut round_got_common = false;
+    let mut round_got_other = false;
+    let mut round_last_common: Option<ObjectId> = None;
+    let mut negotiation_rounds = 0u32;
     loop {
+        stop.poll().map_err(|_| ServeError::Cancelled)?;
         match read_packet(input)? {
             None => {
                 if opts.stateless_rpc {
@@ -178,7 +433,10 @@ fn serve_v0(
                         write_flush(output)?;
                     }
                 }
-                return Ok(());
+                return Ok(UploadSession {
+                    negotiation_rounds,
+                    ..UploadSession::default()
+                });
             }
             Some(Packet::Data(line)) if line == "done" => break,
             Some(Packet::Data(line)) => {
@@ -188,10 +446,21 @@ fn serve_v0(
                     )));
                 };
                 let oid = parse_oid(repo, hex.trim())?;
-                if !seen.insert(oid) || !repo.odb().contains(&oid)? {
+                if !seen.insert(oid) {
+                    continue;
+                }
+                if !repo.odb().contains(&oid)? {
+                    if detailed {
+                        round_got_other = true;
+                        if ready_to_send_pack(repo, wants, &common)? {
+                            write_line(output, &format!("ACK {} ready", oid.to_hex()))?;
+                        }
+                    }
                     continue;
                 }
                 common.push(oid);
+                round_got_common = true;
+                round_last_common = Some(oid);
                 if detailed {
                     write_line(output, &format!("ACK {} common", oid.to_hex()))?;
                 } else if common.len() == 1 {
@@ -199,7 +468,21 @@ fn serve_v0(
                 }
             }
             Some(Packet::Flush) => {
-                if detailed || common.is_empty() {
+                negotiation_rounds = negotiation_rounds.saturating_add(1);
+                if detailed {
+                    if round_got_common
+                        && !round_got_other
+                        && ready_to_send_pack(repo, wants, &common)?
+                    {
+                        if let Some(last) = round_last_common {
+                            write_line(output, &format!("ACK {} ready", last.to_hex()))?;
+                        }
+                    }
+                    write_line(output, "NAK")?;
+                    round_got_common = false;
+                    round_got_other = false;
+                    round_last_common = None;
+                } else if common.is_empty() {
                     write_line(output, "NAK")?;
                 }
                 output.flush()?;
@@ -224,16 +507,22 @@ fn serve_v0(
     }
     output.flush()?;
     let sideband = request.caps.contains("side-band-64k");
-    write_response_pack_from_v0(
+    stop.poll().map_err(|_| ServeError::Cancelled)?;
+    let pack = write_response_pack_from_v0(
         repo,
         &refs,
         &request,
         &common,
-        request.filter.as_ref(),
         shallow_resp.as_ref(),
+        missing,
         output,
         sideband,
-    )
+        stop,
+    )?;
+    Ok(UploadSession {
+        pack: Some(pack),
+        negotiation_rounds,
+    })
 }
 
 /// Write the v0 ref advertisement: `HEAD` and every ref, capabilities on the
@@ -301,12 +590,14 @@ fn read_v0_request(
     input: &mut dyn Read,
     config: &ConfigSet,
     policy: &UploadPackPolicy,
+    stop: &CancelSignal<'_>,
 ) -> Result<Option<V0Request>> {
     let mut wants = Vec::new();
     let mut caps = HashSet::new();
     let mut shallow = ShallowRequest::default();
     let mut filter: Option<ObjectFilter> = None;
     loop {
+        stop.poll().map_err(|_| ServeError::Cancelled)?;
         match read_packet(input)? {
             None | Some(Packet::Flush) => break,
             Some(Packet::Data(line)) => {
@@ -448,11 +739,12 @@ fn write_response_pack_from_v0(
     refs: &[AdvertisedRef],
     request: &V0Request,
     common: &[ObjectId],
-    filter: Option<&ObjectFilter>,
     shallow: Option<&ShallowResponse>,
+    missing: Option<MissingObjects>,
     output: &mut dyn Write,
     sideband: bool,
-) -> Result<()> {
+    stop: &CancelSignal<'_>,
+) -> Result<PackStats> {
     let mut pack_wants = request.wants.clone();
     if let Some(sh) = shallow {
         pack_wants.extend(sh.extra_wants.iter().copied());
@@ -475,20 +767,29 @@ fn write_response_pack_from_v0(
         .map(|s| s.pack_shallow_grafts.clone())
         .unwrap_or_default();
 
-    write_response_pack(
-        ResponsePackInput {
-            repo,
-            refs,
-            wants: &pack_wants,
-            common: &pack_common,
-            caps: &request.caps,
-            filter,
-            have_shallow: &have_shallow,
-            source_shallow: &source_shallow,
-        },
-        output,
-        sideband,
-    )
+    let input = ResponsePackInput {
+        repo,
+        refs,
+        wants: &pack_wants,
+        common: &pack_common,
+        caps: &request.caps,
+        filter: request.filter.as_ref(),
+        have_shallow: &have_shallow,
+        source_shallow: &source_shallow,
+        missing,
+    };
+    let prepared = match prepare_response_pack(&input) {
+        Ok(prepared) => prepared,
+        Err(err @ ServeError::ObjectMissing { .. }) if sideband => {
+            // Nothing of the pack is out yet: say why on the error band.
+            let message = format!("{}\n", client_error_message(repo, &err));
+            let _ = crate::pkt_line::write_sideband_packet(output, 3, message.as_bytes())
+                .and_then(|()| output.flush());
+            return Err(err);
+        }
+        Err(err) => return Err(err),
+    };
+    write_prepared_pack(&input, &prepared, output, sideband, stop)
 }
 
 fn serve_v2(
@@ -496,8 +797,12 @@ fn serve_v2(
     input: &mut dyn Read,
     output: &mut dyn Write,
     opts: &mut ServeOptions,
-) -> Result<()> {
-    let policy = upload_policy(repo);
+    stop: &CancelSignal<'_>,
+) -> Result<UploadSession> {
+    stop.poll().map_err(|_| ServeError::Cancelled)?;
+    let config = repo_config(repo);
+    let policy = UploadPackPolicy::from_config(&config);
+    let promisor_adv = PromisorAdvertisement::from_server_config(&config);
     if opts.advertise_refs || !opts.stateless_rpc {
         write_line(output, "version 2")?;
         if !opts.agent.is_empty() {
@@ -519,32 +824,52 @@ fn serve_v2(
             // clients match the capability by key, so older ones still see it.
             write_line(output, "object-info=size type")?;
         }
+        if let Some(adv) = &promisor_adv {
+            write_line(
+                output,
+                &format!(
+                    "{}={}",
+                    crate::protocol_v2::PROMISOR_REMOTE_CAPABILITY,
+                    adv.to_capability_value()
+                ),
+            )?;
+        }
         write_flush(output)?;
         if opts.advertise_refs {
-            return Ok(());
+            return Ok(UploadSession::default());
         }
         output.flush()?;
     }
 
+    let mut aggregate = UploadSession::default();
     loop {
+        stop.poll().map_err(|_| ServeError::Cancelled)?;
         opts.server_options.clear();
-        let Some(request) = read_v2_request(input, opts)? else {
-            return Ok(());
+        let Some(request) = read_v2_request(input, opts, promisor_adv.as_ref())? else {
+            return Ok(aggregate);
         };
         check_object_format(repo, request.object_format.as_deref())?;
-        match request.command.as_str() {
-            "ls-refs" => ls_refs(repo, output, &request.args, opts)?,
-            "fetch" => fetch_v2(repo, output, &request.args, opts)?,
-            "object-info" if policy.advertise_object_info => {
-                super::object_info::write_object_info_response(repo, output, &request.args)?
+        let session = match request.command.as_str() {
+            "ls-refs" => {
+                ls_refs(repo, output, &request.args, opts)?;
+                UploadSession::default()
             }
-            "bundle-uri" if opts.bundle_list.is_some() => bundle_uri(output, opts)?,
+            "fetch" => fetch_v2(repo, output, &request.args, opts, stop)?,
+            "object-info" if policy.advertise_object_info => {
+                super::object_info::write_object_info_response(repo, output, &request.args)?;
+                UploadSession::default()
+            }
+            "bundle-uri" if opts.bundle_list.is_some() => {
+                bundle_uri(output, opts)?;
+                UploadSession::default()
+            }
             other => return Err(ServeError::UnknownCommand(other.to_owned())),
-        }
+        };
         output.flush()?;
         if opts.stateless_rpc {
-            return Ok(());
+            return Ok(session);
         }
+        aggregate.absorb(session);
     }
 }
 
@@ -557,7 +882,15 @@ struct V2Request {
 
 /// Read a v2 command request. Returns `None` at end of input or on a bare
 /// flush, which ends the session.
-fn read_v2_request(input: &mut dyn Read, opts: &mut ServeOptions) -> Result<Option<V2Request>> {
+///
+/// A `promisor-remote=<names>` capability records the names this server
+/// advertised in [`ServeOptions::accepted_promisor_remotes`]; other names are
+/// ignored, and a reply without names is a protocol error.
+fn read_v2_request(
+    input: &mut dyn Read,
+    opts: &mut ServeOptions,
+    promisor_adv: Option<&PromisorAdvertisement>,
+) -> Result<Option<V2Request>> {
     let mut command = None;
     let mut object_format = None;
     let mut args = Vec::new();
@@ -586,6 +919,10 @@ fn read_v2_request(input: &mut dyn Read, opts: &mut ServeOptions) -> Result<Opti
                     object_format = Some(f.to_owned());
                 } else if let Some(opt) = line.strip_prefix("server-option=") {
                     opts.server_options.push(opt.to_owned());
+                } else if let Some(rest) =
+                    line.strip_prefix(crate::protocol_v2::PROMISOR_REMOTE_CAPABILITY)
+                {
+                    record_accepted_promisors(rest, opts, promisor_adv)?;
                 }
                 // agent= and unknown capabilities are ignored.
             }
@@ -607,6 +944,34 @@ fn read_v2_request(input: &mut dyn Read, opts: &mut ServeOptions) -> Result<Opti
             "command request without command".into(),
         )),
     }
+}
+
+/// Record the client's `promisor-remote` reply (`rest` is what follows the
+/// capability name) in `opts`, keeping only names this server advertised.
+fn record_accepted_promisors(
+    rest: &str,
+    opts: &mut ServeOptions,
+    promisor_adv: Option<&PromisorAdvertisement>,
+) -> Result<()> {
+    let Some(value) = rest.strip_prefix('=') else {
+        if rest.is_empty() {
+            return Err(ServeError::Protocol(
+                "promisor-remote capability without a value".into(),
+            ));
+        }
+        // Some other capability that merely starts with the same letters.
+        return Ok(());
+    };
+    let names = parse_accepted_reply(value).map_err(|e| ServeError::Protocol(e.to_string()))?;
+    let Some(adv) = promisor_adv else {
+        return Ok(());
+    };
+    for name in names {
+        if adv.names().any(|n| n == name) && !opts.accepted_promisor_remotes.contains(&name) {
+            opts.accepted_promisor_remotes.push(name);
+        }
+    }
+    Ok(())
 }
 
 /// Answer `command=bundle-uri` with the configured bundle list.
@@ -670,7 +1035,9 @@ fn fetch_v2(
     output: &mut dyn Write,
     args: &[String],
     opts: &mut ServeOptions,
-) -> Result<()> {
+    stop: &CancelSignal<'_>,
+) -> Result<UploadSession> {
+    stop.poll().map_err(|_| ServeError::Cancelled)?;
     let config = repo_config(repo);
     let policy = UploadPackPolicy::from_config(&config);
     let mut wants = Vec::new();
@@ -748,6 +1115,12 @@ fn fetch_v2(
         Some(spec) => Some(policy.parse_filter(&config, &spec)?),
     };
 
+    // Wanted objects are sent whatever the filter says, so only acceptance (or
+    // lazy fetch) covers a missing want.
+    if let Some(mode) = missing_objects_mode(repo, &config, &policy, opts, None) {
+        resolve_missing_wants(repo, &mut wants, mode)?;
+    }
+    let missing = missing_objects_mode(repo, &config, &policy, opts, filter.as_ref());
     if filter.is_some() {
         validate_wants_filtered(repo, &wants)?;
     } else {
@@ -760,7 +1133,9 @@ fn fetch_v2(
         .odb()
         .present_oids(haves.into_iter().filter(|h| seen.insert(*h)))?;
 
+    let mut negotiation_rounds = 0u32;
     if !done {
+        negotiation_rounds = 1;
         write_v2_fetch_line(output, "acknowledgments", sideband_all)?;
         if common.is_empty() {
             write_v2_fetch_line(output, "NAK", sideband_all)?;
@@ -769,7 +1144,11 @@ fn fetch_v2(
             write_v2_fetch_line(output, &format!("ACK {}", oid.to_hex()), sideband_all)?;
         }
         if wait_for_done || !ready_to_send_pack(repo, &wants, &common)? {
-            return write_flush(output);
+            write_flush(output)?;
+            return Ok(UploadSession {
+                negotiation_rounds,
+                ..UploadSession::default()
+            });
         }
         // After `ready` the pack follows in this same response.
         write_v2_fetch_line(output, "ready", sideband_all)?;
@@ -796,6 +1175,25 @@ fn fetch_v2(
         Default::default()
     };
 
+    let mut pack_wants = wants;
+    pack_wants.extend(shallow_resp.extra_wants.iter().copied());
+    pack_wants.sort();
+    pack_wants.dedup();
+    let have_shallow: HashSet<ObjectId> = client_shallow.iter().copied().collect();
+    let input = ResponsePackInput {
+        repo,
+        refs: &refs,
+        wants: &pack_wants,
+        common: &common,
+        caps: &caps,
+        filter: filter.as_ref(),
+        have_shallow: &have_shallow,
+        source_shallow: &shallow_resp.pack_shallow_grafts,
+        missing,
+    };
+    // Settle what the pack holds before any section that commits to sending it.
+    let prepared = prepare_response_pack(&input)?;
+
     if !shallow_resp.shallow.is_empty() || !shallow_resp.unshallow.is_empty() {
         write_v2_fetch_line(output, "shallow-info", sideband_all)?;
         for oid in &shallow_resp.unshallow {
@@ -815,29 +1213,15 @@ fn fetch_v2(
         write_v2_section_delim(output)?;
     }
 
-    let mut pack_wants = wants;
-    pack_wants.extend(shallow_resp.extra_wants);
-    pack_wants.sort();
-    pack_wants.dedup();
-
-    let have_shallow: HashSet<ObjectId> = client_shallow.iter().copied().collect();
     write_v2_fetch_line(output, "packfile", sideband_all)?;
+    stop.poll().map_err(|_| ServeError::Cancelled)?;
     // Protocol v2 always side-band-64k frames the packfile section payload (band 1),
     // even when `sideband-all` was not negotiated.
-    write_response_pack(
-        ResponsePackInput {
-            repo,
-            refs: &refs,
-            wants: &pack_wants,
-            common: &common,
-            caps: &caps,
-            filter: filter.as_ref(),
-            have_shallow: &have_shallow,
-            source_shallow: &shallow_resp.pack_shallow_grafts,
-        },
-        output,
-        true,
-    )
+    let pack = write_prepared_pack(&input, &prepared, output, true, stop)?;
+    Ok(UploadSession {
+        pack: Some(pack),
+        negotiation_rounds,
+    })
 }
 
 /// Whether a v2 negotiation can stop at this round: some have was acknowledged
@@ -891,7 +1275,7 @@ fn write_v2_fetch_line(output: &mut dyn Write, line: &str, sideband_all: bool) -
     }
 }
 
-/// Inputs for [`write_response_pack`].
+/// Inputs for [`prepare_response_pack`] and [`write_prepared_pack`].
 struct ResponsePackInput<'a> {
     repo: &'a Repository,
     refs: &'a [AdvertisedRef],
@@ -901,116 +1285,169 @@ struct ResponsePackInput<'a> {
     filter: Option<&'a ObjectFilter>,
     have_shallow: &'a HashSet<ObjectId>,
     source_shallow: &'a HashSet<ObjectId>,
+    /// How objects the repository lacks are handled; `None` without promisor remotes.
+    missing: Option<MissingObjects>,
 }
 
-/// Stream the pack answering a fetch to `output`, adding annotated tags when
-/// `include-tag` was negotiated.
-///
-/// With `sideband` the pack is framed on side-band channel 1 and followed by a
-/// flush packet. The pack is written as it is produced, never held in memory whole.
-fn write_response_pack(
-    input: ResponsePackInput<'_>,
-    output: &mut dyn Write,
-    sideband: bool,
-) -> Result<()> {
-    let mut pack_wants = input.wants.to_vec();
-    if input.caps.contains("include-tag") {
-        pack_wants.extend(included_tags(&input)?);
-    }
-    pack_wants.sort();
-    pack_wants.dedup();
+/// A response pack whose contents are settled but not yet written.
+struct PreparedPack {
+    /// Annotated tags `include-tag` may add; the pack writer adds those whose peeled
+    /// object it sends.
+    include_tags: Vec<TagCandidate>,
+    pack_opts: PackBuildOptions,
+    /// The planned objects, for a repository with promisor remotes; otherwise the
+    /// pack is enumerated (or reused from bitmaps) while it streams.
+    planned: Option<PackObjectSelection>,
+}
 
+/// Settle what a response pack holds: the `include-tag` candidates and, for a
+/// repository with promisor remotes, the objects with missing blobs omitted or
+/// fetched.
+///
+/// # Errors
+///
+/// [`ServeError::ObjectMissing`] when a missing blob can be neither omitted nor
+/// fetched, and read failures. Nothing has been written to the client then.
+fn prepare_response_pack(input: &ResponsePackInput<'_>) -> Result<PreparedPack> {
+    let include_tags = if input.caps.contains("include-tag") {
+        tag_candidates(input.refs)
+    } else {
+        Vec::new()
+    };
     let cfg = input.repo.config().ok();
     let pack_opts = PackBuildOptions::for_serve(
         cfg.as_deref(),
         input.caps.contains("thin-pack") && !input.common.is_empty(),
         input.caps.contains("ofs-delta"),
     );
-    let mut progress = |_ev: PackProgress| {};
-    let mut write = |w: &mut dyn Write| {
-        write_upload_pack_stream(
+    let planned = match input.missing {
+        None => None,
+        Some(mode) => Some(plan_pack(
             input.repo,
-            &pack_wants,
+            input.wants,
             input.common,
             input.source_shallow,
             input.have_shallow,
             input.filter,
+            &include_tags,
             &pack_opts,
+            mode,
+        )?),
+    };
+    Ok(PreparedPack {
+        include_tags,
+        pack_opts,
+        planned,
+    })
+}
+
+/// Stream the pack [`prepare_response_pack`] settled to `output`.
+///
+/// With `sideband` the pack is framed on side-band channel 1 and followed by a
+/// flush packet. The pack is written as it is produced, never held in memory whole.
+///
+/// # Errors
+///
+/// A failure before any pack byte went out is returned as is. One after is
+/// [`ServeError::PackInterrupted`]; with a side band, the client is first told
+/// on band 3 (best effort: the failure may be the client hanging up).
+fn write_prepared_pack(
+    input: &ResponsePackInput<'_>,
+    prepared: &PreparedPack,
+    output: &mut dyn Write,
+    sideband: bool,
+    stop: &CancelSignal<'_>,
+) -> Result<PackStats> {
+    stop.poll().map_err(|_| ServeError::Cancelled)?;
+    let mut progress = |_ev: PackProgress| {};
+    let mut send = |out: &mut dyn Write| match &prepared.planned {
+        Some(selection) => {
+            write_upload_pack_selection(input.repo, selection, &prepared.pack_opts, out, stop)
+        }
+        None => write_upload_pack_stream_with_cancel(
+            input.repo,
+            input.wants,
+            input.common,
+            input.source_shallow,
+            input.have_shallow,
+            input.filter,
+            &prepared.include_tags,
+            &prepared.pack_opts,
             &mut progress,
-            w,
-        )
+            out,
+            stop,
+        ),
     };
     if !sideband {
-        write(output)?;
-        return Ok(());
+        let mut counted = CountingWriter {
+            inner: output,
+            bytes: 0,
+        };
+        return match send(&mut counted) {
+            Ok(stats) => Ok(stats),
+            Err(e) => Err(pack_failure(e, counted.bytes)),
+        };
     }
-    let mut band = SidebandChannel1Writer::new(output);
-    write(&mut band)?;
-    band.finish()?;
-    write_flush(output)
+    let sent = {
+        let mut band = SidebandChannel1Writer::new(&mut *output);
+        let mut counted = CountingWriter {
+            inner: &mut band,
+            bytes: 0,
+        };
+        let result = send(&mut counted);
+        let written = counted.bytes;
+        match result {
+            Ok(stats) => band
+                .finish()
+                .map(|()| stats)
+                .map_err(|e| pack_failure_io(e, written)),
+            Err(e) => Err(pack_failure(e, written)),
+        }
+    };
+    match sent {
+        Ok(stats) => {
+            write_flush(output)?;
+            Ok(stats)
+        }
+        Err(ServeError::PackInterrupted(err)) => {
+            // hygiene: band 3 carries the remote error line Git clients print verbatim
+            let message = format!("error: {}\n", serve_error_client_message(&err));
+            let _ = crate::pkt_line::write_sideband_packet(output, 3, message.as_bytes())
+                .and_then(|()| output.flush());
+            Err(ServeError::PackInterrupted(err))
+        }
+        Err(err) => Err(err),
+    }
 }
 
-/// Annotated tags the client did not ask for but whose target commit is being
-/// sent, so the client can follow tags without a second request.
+/// Classify a pack-writing failure: before any byte went out it is returned
+/// as is (a cancel stays a cancel), after it is [`ServeError::PackInterrupted`].
+fn pack_failure(err: crate::error::Error, written: u64) -> ServeError {
+    let err = map_repo_cancel(ServeError::Repository(err));
+    if written == 0 || matches!(err, ServeError::Cancelled) {
+        return err;
+    }
+    ServeError::PackInterrupted(Box::new(err))
+}
+
+/// [`pack_failure`] for an I/O error from finishing the side band.
+fn pack_failure_io(err: std::io::Error, written: u64) -> ServeError {
+    if written == 0 {
+        return ServeError::Io(err);
+    }
+    ServeError::PackInterrupted(Box::new(ServeError::Io(err)))
+}
+
+/// The annotated tags under `refs/tags/` that `include-tag` may add to the pack.
 ///
-/// Only tags that peel to commits are considered. Both walks honor the shallow
-/// grafts of their side, so a shallow fetch only picks up tags on the commits
-/// it actually sends.
-fn included_tags(input: &ResponsePackInput<'_>) -> Result<Vec<ObjectId>> {
-    let repo = input.repo;
-    let want_set: HashSet<ObjectId> = input.wants.iter().copied().collect();
-    let candidates: Vec<&AdvertisedRef> = input
-        .refs
-        .iter()
-        .filter(|r| r.name.starts_with("refs/tags/") && r.peeled.is_some())
-        .filter(|r| !want_set.contains(&r.oid))
-        .collect();
-    if candidates.is_empty() {
-        return Ok(Vec::new());
-    }
-    let have_commits = commit_closure(repo, input.common, &HashSet::new(), input.have_shallow)?;
-    let sent_commits = commit_closure(repo, input.wants, &have_commits, input.source_shallow)?;
-    Ok(candidates
-        .into_iter()
-        .filter(|r| r.peeled.is_some_and(|p| sent_commits.contains(&p)))
-        .map(|r| r.oid)
-        .collect())
-}
-
-/// Commits reachable from `tips` (peeling tags), not descending into `stop`.
-/// Commits in `grafts` are included but their parents are not walked.
-fn commit_closure(
-    repo: &Repository,
-    tips: &[ObjectId],
-    stop: &HashSet<ObjectId>,
-    grafts: &HashSet<ObjectId>,
-) -> Result<HashSet<ObjectId>> {
-    let mut seen = HashSet::new();
-    let mut queue: VecDeque<ObjectId> = VecDeque::new();
-    for tip in tips {
-        let Ok(oid) = repo.odb().peel_tags(*tip).map(|(p, _)| p) else {
-            continue;
-        };
-        queue.push_back(oid);
-    }
-    while let Some(oid) = queue.pop_front() {
-        if stop.contains(&oid) || !seen.insert(oid) {
-            continue;
-        }
-        let Ok(obj) = repo.odb().read(&oid) else {
-            continue;
-        };
-        if obj.kind != ObjectKind::Commit {
-            seen.remove(&oid);
-            continue;
-        }
-        if grafts.contains(&oid) {
-            continue;
-        }
-        let commit = crate::objects::parse_commit(&obj.data)?;
-        queue.extend(commit.parents);
-    }
-    Ok(seen)
+/// The pack writer adds a tag only when the object it peels to (a commit, tree or
+/// blob) is among the objects being sent, so tags on history the client already has
+/// or beyond a shallow boundary stay out, and no history is walked to decide it.
+fn tag_candidates(refs: &[AdvertisedRef]) -> Vec<TagCandidate> {
+    refs.iter()
+        .filter(|r| r.name.starts_with("refs/tags/"))
+        .filter_map(|r| r.peeled.map(|peeled| TagCandidate { tag: r.oid, peeled }))
+        .collect()
 }
 
 #[cfg(test)]
@@ -1033,10 +1470,23 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         Repository::init(dir.path(), &InitOptions::new().with_bare(true)).unwrap();
         let repo = Repository::open(dir.path(), &RepositoryOptions::empty()).unwrap();
-        let tree = repo
-            .odb()
-            .write_loose_materialize(ObjectKind::Tree, b"")
-            .unwrap();
+        let (commits, tags) = write_history(&repo, n, tagged);
+        Fixture {
+            _dir: dir,
+            repo,
+            commits,
+            tags,
+        }
+    }
+
+    /// Write `n` linear commits and the annotated tags `t<i>` for `tagged` into `repo`.
+    fn write_history(
+        repo: &Repository,
+        n: usize,
+        tagged: &[usize],
+    ) -> (Vec<ObjectId>, Vec<AdvertisedRef>) {
+        let odb = repo.odb();
+        let tree = odb.write(ObjectKind::Tree, b"").unwrap();
         let mut commits: Vec<ObjectId> = Vec::new();
         for i in 0..n {
             let parent = commits
@@ -1046,11 +1496,7 @@ mod tests {
             let body = format!(
                 "tree {tree}\n{parent}author T <t@x> {i} +0000\ncommitter T <t@x> {i} +0000\n\nc{i}\n"
             );
-            commits.push(
-                repo.odb()
-                    .write_loose_materialize(ObjectKind::Commit, body.as_bytes())
-                    .unwrap(),
-            );
+            commits.push(odb.write(ObjectKind::Commit, body.as_bytes()).unwrap());
         }
         let tags = tagged
             .iter()
@@ -1061,20 +1507,46 @@ mod tests {
                 );
                 AdvertisedRef {
                     name: format!("refs/tags/t{i}"),
-                    oid: repo
-                        .odb()
-                        .write_loose_materialize(ObjectKind::Tag, body.as_bytes())
-                        .unwrap(),
+                    oid: odb.write(ObjectKind::Tag, body.as_bytes()).unwrap(),
                     peeled: Some(commits[i]),
                 }
             })
             .collect();
-        Fixture {
-            _dir: dir,
-            repo,
-            commits,
-            tags,
-        }
+        (commits, tags)
+    }
+
+    /// Prepare and write the pack answering `input`, as a fetch does.
+    fn write_response_pack(
+        input: ResponsePackInput<'_>,
+        output: &mut dyn Write,
+        sideband: bool,
+        stop: &CancelSignal<'_>,
+    ) -> Result<PackStats> {
+        let prepared = prepare_response_pack(&input)?;
+        write_prepared_pack(&input, &prepared, output, sideband, stop)
+    }
+
+    /// Answer `input` with `include-tag` and return the tags of `input.refs` the
+    /// pack holds, sorted.
+    fn packed_tags(input: ResponsePackInput<'_>) -> Vec<ObjectId> {
+        let refs = input.refs;
+        let mut pack = Vec::new();
+        write_response_pack(input, &mut pack, false, &CancelSignal::never()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let unpacked = crate::odb::Odb::new(dir.path());
+        crate::unpack_objects::unpack_objects(
+            &mut pack.as_slice(),
+            &unpacked,
+            &crate::unpack_objects::UnpackOptions::default(),
+        )
+        .unwrap();
+        let mut tags: Vec<ObjectId> = refs
+            .iter()
+            .map(|r| r.oid)
+            .filter(|oid| unpacked.contains(oid).unwrap())
+            .collect();
+        tags.sort();
+        tags
     }
 
     fn depth_request(depth: u32) -> ShallowRequest {
@@ -1134,7 +1606,7 @@ mod tests {
         let tip = fx.commits[5];
         let resp = compute_shallow_response(&fx.repo, &[tip], &depth_request(3)).unwrap();
         let caps = HashSet::from(["include-tag".to_owned()]);
-        let tags = included_tags(&ResponsePackInput {
+        let tags = packed_tags(ResponsePackInput {
             repo: &fx.repo,
             refs: &fx.tags,
             wants: &[tip],
@@ -1143,12 +1615,10 @@ mod tests {
             filter: None,
             have_shallow: &HashSet::new(),
             source_shallow: &resp.pack_shallow_grafts,
-        })
-        .unwrap();
+            missing: None,
+        });
         let mut expected = vec![fx.tags[1].oid, fx.tags[2].oid];
         expected.sort();
-        let mut tags = tags;
-        tags.sort();
         assert_eq!(tags, expected, "t1 lies beyond the depth-3 cut");
     }
 
@@ -1160,7 +1630,7 @@ mod tests {
     fn included_tags_skip_history_the_client_already_has() {
         let fx = fixture(6, &[1, 3, 5]);
         let caps = HashSet::from(["include-tag".to_owned()]);
-        let tags = included_tags(&ResponsePackInput {
+        let tags = packed_tags(ResponsePackInput {
             repo: &fx.repo,
             refs: &fx.tags,
             wants: &[fx.commits[5]],
@@ -1169,9 +1639,149 @@ mod tests {
             filter: None,
             have_shallow: &HashSet::new(),
             source_shallow: &HashSet::new(),
-        })
-        .unwrap();
+            missing: None,
+        });
         assert_eq!(tags, vec![fx.tags[2].oid]);
+    }
+
+    #[test]
+    fn include_tag_reads_follow_the_fetch_not_the_history() {
+        let store = crate::odb::store::flaky::FlakyStore::new();
+        let dir = tempfile::tempdir().unwrap();
+        let git_dir = dir.path().join("repo.git");
+        let repo = crate::repo::RepositoryBuilder::new(RepositoryOptions::empty())
+            .odb_builder(
+                crate::odb::OdbBuilder::files(git_dir.join("objects"))
+                    .primary(store.clone())
+                    .alternates(false),
+            )
+            .ref_store(std::sync::Arc::new(
+                crate::refs::store::MemoryRefStore::new(),
+            ))
+            .open(&git_dir, None)
+            .unwrap();
+        let n = 3000;
+        let (commits, tags) = write_history(&repo, n, &[5, n - 1]);
+        let caps = HashSet::from(["include-tag".to_owned()]);
+        let before = store.reads();
+        let packed = packed_tags(ResponsePackInput {
+            repo: &repo,
+            refs: &tags,
+            wants: &[commits[n - 1]],
+            common: &[commits[n - 3]],
+            caps: &caps,
+            filter: None,
+            have_shallow: &HashSet::new(),
+            source_shallow: &HashSet::new(),
+            missing: None,
+        });
+        let reads = store.reads() - before;
+        assert_eq!(packed, vec![tags[1].oid], "only the tag on a sent commit");
+        assert!(
+            reads < 50,
+            "a two-commit fetch read {reads} objects from a {n}-commit history"
+        );
+    }
+
+    #[test]
+    fn include_tag_follows_tag_chains_and_non_commit_targets() {
+        let fx = fixture(3, &[2]);
+        let odb = fx.repo.odb();
+        let tag = |target: ObjectId, kind: &str, name: &str| {
+            let body =
+                format!("object {target}\ntype {kind}\ntag {name}\ntagger T <t@x> 0 +0000\n\nt\n");
+            odb.write(ObjectKind::Tag, body.as_bytes()).unwrap()
+        };
+        let inner = fx.tags[0].oid;
+        let outer = tag(inner, "tag", "outer");
+        let blob = odb.write(ObjectKind::Blob, b"new\n").unwrap();
+        let mut tree_body = b"100644 f\0".to_vec();
+        tree_body.extend_from_slice(blob.as_bytes());
+        let tree = odb.write(ObjectKind::Tree, &tree_body).unwrap();
+        let tip = odb
+            .write(
+                ObjectKind::Commit,
+                format!(
+                    "tree {tree}\nparent {}\nauthor T <t@x> 3 +0000\ncommitter T <t@x> 3 +0000\n\nc3\n",
+                    fx.commits[2]
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        let blob_tag = tag(blob, "blob", "blob");
+        let old_tag = tag(fx.commits[0], "commit", "old");
+        let refs = vec![
+            AdvertisedRef {
+                name: "refs/tags/outer".to_owned(),
+                oid: outer,
+                peeled: Some(fx.commits[2]),
+            },
+            AdvertisedRef {
+                name: "refs/tags/blob".to_owned(),
+                oid: blob_tag,
+                peeled: Some(blob),
+            },
+            AdvertisedRef {
+                name: "refs/tags/old".to_owned(),
+                oid: old_tag,
+                peeled: Some(fx.commits[0]),
+            },
+        ];
+        let caps = HashSet::from(["include-tag".to_owned()]);
+        let fetch = |wants: &[ObjectId]| {
+            let mut pack = Vec::new();
+            write_response_pack(
+                ResponsePackInput {
+                    repo: &fx.repo,
+                    refs: &refs,
+                    wants,
+                    common: &[fx.commits[1]],
+                    caps: &caps,
+                    filter: None,
+                    have_shallow: &HashSet::new(),
+                    source_shallow: &HashSet::new(),
+                    missing: None,
+                },
+                &mut pack,
+                false,
+                &CancelSignal::never(),
+            )
+            .unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let unpacked = crate::odb::Odb::new(dir.path());
+            let count = crate::unpack_objects::unpack_objects(
+                &mut pack.as_slice(),
+                &unpacked,
+                &crate::unpack_objects::UnpackOptions::default(),
+            )
+            .unwrap();
+            (dir, unpacked, count)
+        };
+
+        let (_dir, unpacked, count) = fetch(&[tip]);
+        for (oid, what) in [
+            (outer, "the followed tag"),
+            (inner, "the tag it names"),
+            (blob_tag, "a tag of a sent blob"),
+        ] {
+            assert!(unpacked.contains(&oid).unwrap(), "{what} is packed");
+        }
+        assert!(
+            !unpacked.contains(&old_tag).unwrap(),
+            "a tag on history the client has is not packed"
+        );
+        assert_eq!(
+            count, 7,
+            "two commits, tree, blob, both chain tags, blob tag"
+        );
+
+        let (_dir, unpacked, count) = fetch(&[inner]);
+        assert!(unpacked.contains(&outer).unwrap());
+        assert!(
+            !unpacked.contains(&blob_tag).unwrap(),
+            "its blob is not sent"
+        );
+        assert_eq!(count, 3, "the wanted inner tag is packed once");
     }
 
     /// Write a commit with an empty tree, `parents`, and committer time `time`.

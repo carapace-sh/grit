@@ -1,8 +1,9 @@
 //! Receive-pack server hooks, quarantine, and side-band hook output.
 
+use grit_test_support::{free_port, git, rev_parse};
 use std::io::Write;
 #[cfg(unix)]
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -11,38 +12,16 @@ use std::time::{Duration, Instant};
 
 use grit_lib::command_runner::{CommandRunner, RecordedResponse, RecordingRunner};
 use grit_lib::config::environment::{Environment, RepositoryOptions};
+use grit_lib::objects::odb::Odb;
 use grit_lib::objects::{HashAlgo, ObjectId};
+use grit_lib::progress::FlagCancel;
 use grit_lib::refs::resolve_ref;
 use grit_lib::remote::serve::{
-    receive_pack, ProtocolVersion, ReceiveOutcome, ReceivePolicy, RefUpdateRefusal, ServeOptions,
+    receive_pack, receive_pack_with_hook, receive_pack_with_hook_cancellable, ProtocolVersion,
+    ReceiveHook, ReceiveHookContext, ReceiveOutcome, ReceivePolicy, RefCommand, RefUpdateRefusal,
+    ServeError, ServeOptions,
 };
 use grit_lib::repo::Repository;
-
-fn git(dir: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
-        .current_dir(dir)
-        .args(args)
-        .env("GIT_AUTHOR_NAME", "T")
-        .env("GIT_AUTHOR_EMAIL", "t@example.com")
-        .env("GIT_AUTHOR_DATE", "2005-04-07T22:13:13 +0200")
-        .env("GIT_COMMITTER_NAME", "T")
-        .env("GIT_COMMITTER_EMAIL", "t@example.com")
-        .env("GIT_COMMITTER_DATE", "2005-04-07T22:13:13 +0200")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .output()
-        .expect("run git");
-    assert!(
-        out.status.success(),
-        "git {args:?} failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8(out.stdout).expect("utf8")
-}
-
-fn rev_parse(dir: &Path, rev: &str) -> ObjectId {
-    ObjectId::from_hex(git(dir, &["rev-parse", rev]).trim()).expect("oid")
-}
 
 fn write_executable_hook(path: &Path, body: &str) {
     std::fs::write(path, body).expect("hook body");
@@ -193,6 +172,124 @@ fn recording_runner_pre_receive_sees_push_options_and_ref_stdin() {
     let stdin = String::from_utf8(stdins[0].clone()).expect("utf8 stdin");
     assert!(stdin.contains(&oid.to_hex()));
     assert!(stdin.contains("refs/heads/main"));
+}
+
+struct DenyPushOption(&'static str);
+
+impl ReceiveHook for DenyPushOption {
+    fn pre_receive_ctx(
+        &self,
+        _commands: &[RefCommand],
+        _odb: &Odb,
+        ctx: &ReceiveHookContext<'_>,
+    ) -> Result<(), RefUpdateRefusal> {
+        if ctx.push_options.iter().any(|o| o == self.0) {
+            return Err(RefUpdateRefusal::Policy(self.0.to_owned()));
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn in_process_pre_receive_can_reject_push_options_before_refs_move() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let bare = tmp.path().join("bare");
+    let repo = open_bare_with_runner(&bare, grit_lib::command_runner::system_command_runner());
+    std::fs::write(
+        bare.join("config"),
+        "[receive]\n\tadvertisePushOptions = true\n",
+    )
+    .expect("config");
+
+    let source = tmp.path().join("src");
+    std::fs::create_dir_all(&source).unwrap();
+    git(&source, &["init", "-q", "-b", "main", "."]);
+    std::fs::write(source.join("f"), "payload\n").unwrap();
+    git(&source, &["add", "f"]);
+    git(&source, &["commit", "-q", "-m", "c"]);
+    let oid = rev_parse(&source, "HEAD");
+    let pack = pack_for_commit(&source, oid);
+
+    let mut body = pkt_line(&format!(
+        "{} {} refs/heads/main\0report-status push-options\n",
+        "0000000000000000000000000000000000000000",
+        oid.to_hex()
+    ));
+    body.extend_from_slice(b"0000");
+    body.extend_from_slice(&pkt_line("ci.skip\n"));
+    body.extend_from_slice(b"0000");
+    body.extend_from_slice(&pack);
+
+    let opts = ServeOptions {
+        protocol: ProtocolVersion::V0,
+        stateless_rpc: true,
+        advertise_refs: false,
+        agent: "grit-test".to_owned(),
+        hidden_refs: Vec::new(),
+        ..ServeOptions::default()
+    };
+    let policy = ReceivePolicy::default();
+    let mut output = Vec::new();
+    let outcome = receive_pack_with_hook(
+        &repo,
+        &mut std::io::Cursor::new(body),
+        &mut output,
+        &opts,
+        &policy,
+        &DenyPushOption("ci.skip"),
+    )
+    .expect("receive_pack");
+    assert_eq!(outcome.updates.len(), 1);
+    assert_eq!(
+        outcome.updates[0].error,
+        Some(RefUpdateRefusal::Policy("ci.skip".to_owned()))
+    );
+    assert!(resolve_ref(&bare, "refs/heads/main").is_err());
+    assert!(
+        !repo.odb().exists(&oid),
+        "rejected push must not install objects in the main ODB"
+    );
+}
+
+#[test]
+fn receive_cancel_before_apply_leaves_ref_unmoved() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let bare = tmp.path().join("bare");
+    let repo = open_bare_with_runner(&bare, grit_lib::command_runner::system_command_runner());
+
+    let source = tmp.path().join("src");
+    std::fs::create_dir_all(&source).unwrap();
+    git(&source, &["init", "-q", "-b", "main", "."]);
+    std::fs::write(source.join("f"), "payload\n").unwrap();
+    git(&source, &["add", "f"]);
+    git(&source, &["commit", "-q", "-m", "c"]);
+    let oid = rev_parse(&source, "HEAD");
+    let pack = pack_for_commit(&source, oid);
+    let body = push_body(None, oid, "refs/heads/main", &pack);
+
+    let opts = ServeOptions {
+        protocol: ProtocolVersion::V0,
+        stateless_rpc: true,
+        advertise_refs: false,
+        agent: "grit-test".to_owned(),
+        hidden_refs: Vec::new(),
+        ..ServeOptions::default()
+    };
+    let cancel = FlagCancel::new();
+    cancel.cancel();
+    let err = receive_pack_with_hook_cancellable(
+        &repo,
+        &mut std::io::Cursor::new(body),
+        &mut Vec::new(),
+        &opts,
+        &ReceivePolicy::default(),
+        &(),
+        &cancel,
+    )
+    .expect_err("cancelled");
+    assert!(matches!(err, ServeError::Cancelled));
+    assert!(resolve_ref(&bare, "refs/heads/main").is_err());
+    assert!(!repo.odb().exists(&oid));
 }
 
 #[test]
@@ -755,12 +852,6 @@ fn find_binary(name: &str) -> Option<PathBuf> {
         }
     }
     None
-}
-
-#[cfg(unix)]
-fn free_port() -> Option<u16> {
-    let l = TcpListener::bind(("127.0.0.1", 0)).ok()?;
-    Some(l.local_addr().ok()?.port())
 }
 
 #[cfg(unix)]

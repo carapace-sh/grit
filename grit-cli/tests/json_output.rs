@@ -583,18 +583,18 @@ fn log_json_pages_with_next_cursor() -> TestResult {
     fs::create_dir_all(&repo)?;
     gs_ok(&repo, &["init", "."]);
 
-    // 11 commits → one full page (10) plus a `next` cursor.
-    for i in 0..11 {
+    // 21 commits → one full page (20) plus a `next` cursor.
+    for i in 0..21 {
         write_file(&repo.join("a.txt"), &format!("v{i}\n"));
         gs_ok(&repo, &["add", "a.txt"]);
         gs_ok(&repo, &["commit", &format!("commit {i}")]);
     }
     let v = gs_json(&repo, &["log"]);
-    assert_eq!(v["commits"].as_array().unwrap().len(), 10);
+    assert_eq!(v["commits"].as_array().unwrap().len(), 20);
     assert_eq!(v["truncated"], Value::Bool(true));
     assert!(v["next"].as_str().is_some(), "expected a next cursor: {v}");
     let first = &v["commits"][0];
-    assert_eq!(first["subject"], "commit 10");
+    assert_eq!(first["subject"], "commit 20");
     assert_eq!(first["oid"].as_str().unwrap().len(), 40);
 
     // Last page: follow `next`, expect no further cursor.
@@ -1571,6 +1571,43 @@ fn diff_binary_content_shows_differs_message() -> TestResult {
     Ok(())
 }
 
+#[test]
+fn diff_binary_size_change_shows_differs_message_in_every_format() -> TestResult {
+    let scratch = Scratch::new("diffbinsize")?;
+    let repo = scratch.child("repo");
+    fs::create_dir_all(&repo)?;
+    gs_ok(&repo, &["init", "."]);
+    std::fs::write(repo.join("bin.dat"), b"\0\x01\x02\0\xff\xfe\0")?;
+    gs_ok(&repo, &["commit", "init"]);
+    std::fs::write(repo.join("bin.dat"), b"\0\x01\x02\0\xff\xfe\0\t")?;
+    for target in [&[][..], &["--unstaged"][..]] {
+        let label = if target.is_empty() {
+            "default"
+        } else {
+            "--unstaged"
+        };
+        let human = gs(&repo, [&["diff"][..], target].concat());
+        assert_eq!(human.status, Some(0), "{label}: {}", human.dump());
+        assert!(
+            human.stdout.contains("Binary file differs"),
+            "{label}: size-changing binary must be noted: {}",
+            human.dump()
+        );
+        let md = gs(&repo, [&["diff", "--markdown"][..], target].concat());
+        assert_eq!(md.status, Some(0), "{label}: {}", md.dump());
+        assert!(
+            md.stdout.contains("Binary file differs."),
+            "{label}: markdown must note the binary change: {}",
+            md.dump()
+        );
+        let json = gs(&repo, [&["diff", "--json"][..], target].concat());
+        assert_eq!(json.status, Some(0), "{label}: {}", json.dump());
+        let v: Value = serde_json::from_str(&json.stdout)?;
+        assert_binary_json_no_hunk_content(&v, label);
+    }
+    Ok(())
+}
+
 fn assert_binary_json_no_hunk_content(v: &Value, label: &str) {
     let files = v["files"].as_array().expect("files array");
     assert_eq!(files.len(), 1, "{label}: {v}");
@@ -2316,6 +2353,7 @@ fn bad_filter_and_missing_revision_errors_are_clean() -> TestResult {
     assert_eq!(out.status, Some(1), "{}", out.dump());
     let v: Value = serde_json::from_str(&out.stdout)?;
     assert_eq!(v["error"], "revision 'nonexistent' not found");
+    assert_eq!(v["kind"].as_str(), Some("revision_not_found"));
 
     let out = gs(&repo, ["switch", "nonexistent", "--json"]);
     assert_eq!(out.status, Some(1), "{}", out.dump());

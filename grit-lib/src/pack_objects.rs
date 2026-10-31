@@ -15,13 +15,17 @@ use flate2::Compression;
 use crate::bitmap_walk::ReachableSet;
 use crate::delta_encode::{encode_prefix_extension_delta, DeltaIndex};
 use crate::error::{Error, Result};
+use crate::hash::HashingWriter;
 use crate::objects::{
     empty_object_id_hash_set, oid_hash_map, oid_hash_set, oid_hash_set_from, parse_commit,
     parse_tag, HashAlgo, ObjectId, ObjectInfo, ObjectKind, OidHashMap, OidHashSet, TreeRefIter,
 };
 use crate::odb::Odb;
-use crate::pack_object_select::{HaveBoundary, NameTrees};
+use crate::pack_object_select::{
+    append_included_tags, HaveBoundary, NameTrees, PackObjectSelection, TagCandidate,
+};
 use crate::parallel::{try_par_map_force, ParallelHashError};
+use crate::progress::CancelSignal;
 use crate::repo::Repository;
 use crate::rev_list::ObjectFilter;
 
@@ -47,7 +51,17 @@ pub struct PackBuildOptions {
     pub reuse_objects: bool,
     /// Use pack reachability bitmaps for object enumeration when present.
     pub use_bitmaps: bool,
+    /// Soft cap, in bytes, on the payloads and delta indexes one delta-search
+    /// window holds (Git `--window-memory`; each search thread has a window).
+    /// `None` reads `pack.windowMemory`, which defaults to unlimited; `Some(0)`
+    /// is unlimited too.
+    pub window_memory: Option<u64>,
 }
+
+/// The delta-search window cap a served fetch uses when `pack.windowMemory`
+/// is not set: unlimited windows of large blobs would hold `window` of them,
+/// with their indexes, per search thread.
+pub const SERVE_WINDOW_MEMORY: u64 = 32 * 1024 * 1024;
 
 impl Default for PackBuildOptions {
     fn default() -> Self {
@@ -61,6 +75,7 @@ impl Default for PackBuildOptions {
             reuse_deltas: true,
             reuse_objects: true,
             use_bitmaps: true,
+            window_memory: None,
         }
     }
 }
@@ -129,6 +144,10 @@ impl PackBuildOptions {
         use_ofs_delta: bool,
     ) -> Self {
         let (window, max_depth) = Self::window_and_depth_from_config(cfg);
+        let window_memory = cfg
+            .map(crate::config::ConfigSet::pack_window_memory_bytes)
+            .filter(|&bytes| bytes > 0)
+            .unwrap_or(SERVE_WINDOW_MEMORY);
         Self {
             thin,
             delta: true,
@@ -138,6 +157,7 @@ impl PackBuildOptions {
             reuse_deltas: true,
             reuse_objects: true,
             use_bitmaps: true,
+            window_memory: Some(window_memory),
             ..Default::default()
         }
     }
@@ -306,7 +326,16 @@ impl<'a> PackObjects<'a> {
     /// # Errors
     ///
     /// Missing wants, corrupt objects, or I/O failures while writing.
-    pub fn write_to(mut self, w: &mut dyn Write) -> Result<PackStats> {
+    pub fn write_to(self, w: &mut dyn Write) -> Result<PackStats> {
+        self.write_to_with_cancel(w, &CancelSignal::never())
+    }
+
+    /// [`Self::write_to`], stopping with [`Error::Cancelled`] once `stop` fires.
+    pub(crate) fn write_to_with_cancel(
+        mut self,
+        w: &mut dyn Write,
+        stop: &CancelSignal<'_>,
+    ) -> Result<PackStats> {
         let opts = self.opts.build;
         let have_shallow: HashSet<ObjectId> = self.have_shallow.iter().copied().collect();
         let source_shallow: HashSet<ObjectId> = self.source_shallow.iter().copied().collect();
@@ -325,11 +354,14 @@ impl<'a> PackObjects<'a> {
                 have_boundary: HaveBoundary::CommitClosure,
             },
             NameTrees::for_delta_search(&opts),
+            false,
+            stop,
         )?;
         let send = selection.send;
         self.fire(PackProgress::Enumerated { total: send.len() });
         if !opts.delta {
             let bytes = serialize_pack(self.source_odb, &send, &opts)?;
+            stop.poll()?;
             w.write_all(&bytes).map_err(Error::Io)?;
             let count = u32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
             return Ok(PackStats {
@@ -346,6 +378,7 @@ impl<'a> PackObjects<'a> {
             &opts,
             &selection.name_hashes,
             self.opts.search_threads,
+            stop,
         )?;
         self.fire(PackProgress::PlannedDeltas);
         crate::pack_delta::write_pack_with_deltas(
@@ -354,6 +387,8 @@ impl<'a> PackObjects<'a> {
             &opts,
             self.opts.write_threads,
             w,
+            None,
+            stop,
             None,
         )
     }
@@ -447,6 +482,18 @@ pub fn write_pack_for_push(
     opts: &PackBuildOptions,
     w: &mut dyn Write,
 ) -> Result<PackStats> {
+    write_pack_for_push_with_cancel(odb, wants, haves, opts, w, &CancelSignal::never())
+}
+
+/// [`write_pack_for_push`], stopping with [`Error::Cancelled`] once `stop` fires.
+pub(crate) fn write_pack_for_push_with_cancel(
+    odb: &Odb,
+    wants: &[ObjectId],
+    haves: &[ObjectId],
+    opts: &PackBuildOptions,
+    w: &mut dyn Write,
+    stop: &CancelSignal<'_>,
+) -> Result<PackStats> {
     // One pack read context for the walk, the reuse scan and the write, so the
     // source packs are mapped and indexed once rather than once per phase.
     odb.with_pack_read_context(|| {
@@ -459,7 +506,9 @@ pub fn write_pack_for_push(
             None,
             opts,
             HaveBoundary::TipsOnly,
+            &[],
             w,
+            stop,
         )
     })
 }
@@ -510,12 +559,15 @@ fn build_pack_with_shallow_filter_and_boundary(
         filter,
         opts,
         have_boundary,
+        &[],
         &mut pack,
+        &CancelSignal::never(),
     )?;
     Ok(pack)
 }
 
-/// Streaming form of [`build_pack_with_shallow_and_filter`].
+/// Streaming form of [`build_pack_with_shallow_and_filter`]; `include_tags` are added
+/// when the objects they peel to are selected.
 #[allow(clippy::too_many_arguments)]
 fn write_pack_with_shallow_and_filter(
     odb: &Odb,
@@ -526,9 +578,11 @@ fn write_pack_with_shallow_and_filter(
     filter: Option<&ObjectFilter>,
     opts: &PackBuildOptions,
     have_boundary: HaveBoundary,
+    include_tags: &[TagCandidate],
     w: &mut dyn Write,
+    stop: &CancelSignal<'_>,
 ) -> Result<PackStats> {
-    let selection = crate::pack_object_select::enumerate_pack_objects_naming(
+    let mut selection = crate::pack_object_select::enumerate_pack_objects_naming(
         odb,
         wants,
         haves,
@@ -542,9 +596,25 @@ fn write_pack_with_shallow_and_filter(
             have_boundary,
         },
         NameTrees::for_delta_search(opts),
+        false,
+        stop,
     )?;
+    append_included_tags(odb, &mut selection.send, include_tags)?;
+    write_selected_pack(odb, &selection, opts, w, stop)
+}
+
+/// Write a pack holding exactly `selection.send`, searching for deltas when `opts`
+/// asks for them (thin bases from `selection.have_closure`).
+fn write_selected_pack(
+    odb: &Odb,
+    selection: &PackObjectSelection,
+    opts: &PackBuildOptions,
+    w: &mut dyn Write,
+    stop: &CancelSignal<'_>,
+) -> Result<PackStats> {
     if !opts.delta {
         let bytes = serialize_pack(odb, &selection.send, opts)?;
+        stop.poll()?;
         w.write_all(&bytes).map_err(Error::Io)?;
         return Ok(PackStats {
             object_count: u32::try_from(selection.send.len()).unwrap_or(u32::MAX),
@@ -560,8 +630,9 @@ fn write_pack_with_shallow_and_filter(
         opts,
         &selection.name_hashes,
         None,
+        stop,
     )?;
-    crate::pack_delta::write_pack_with_deltas(odb, &plan.entries, opts, None, w, None)
+    crate::pack_delta::write_pack_with_deltas(odb, &plan.entries, opts, None, w, None, stop, None)
 }
 
 /// Stream a pack for upload-pack: pack reuse when bitmaps allow, otherwise pack-objects.
@@ -584,6 +655,38 @@ pub fn write_upload_pack_stream(
     progress: &mut dyn FnMut(PackProgress),
     w: &mut dyn Write,
 ) -> Result<PackStats> {
+    write_upload_pack_stream_with_cancel(
+        repo,
+        wants,
+        haves,
+        source_shallow,
+        have_shallow,
+        filter,
+        &[],
+        opts,
+        progress,
+        w,
+        &CancelSignal::never(),
+    )
+}
+
+/// [`write_upload_pack_stream`], stopping object enumeration when `stop` fires, that
+/// also packs each of `include_tags` whose peeled object is among the objects sent
+/// (`include-tag`), on the walk and reuse paths alike.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn write_upload_pack_stream_with_cancel(
+    repo: &Repository,
+    wants: &[ObjectId],
+    haves: &[ObjectId],
+    source_shallow: &HashSet<ObjectId>,
+    have_shallow: &HashSet<ObjectId>,
+    filter: Option<&ObjectFilter>,
+    include_tags: &[TagCandidate],
+    opts: &PackBuildOptions,
+    progress: &mut dyn FnMut(PackProgress),
+    w: &mut dyn Write,
+    stop: &CancelSignal<'_>,
+) -> Result<PackStats> {
     repo.odb().with_pack_read_context(|| {
         write_upload_pack_stream_in_context(
             repo,
@@ -592,9 +695,11 @@ pub fn write_upload_pack_stream(
             source_shallow,
             have_shallow,
             filter,
+            include_tags,
             opts,
             progress,
             w,
+            stop,
         )
     })
 }
@@ -607,21 +712,25 @@ fn write_upload_pack_stream_in_context(
     source_shallow: &HashSet<ObjectId>,
     have_shallow: &HashSet<ObjectId>,
     filter: Option<&ObjectFilter>,
+    include_tags: &[TagCandidate],
     opts: &PackBuildOptions,
     progress: &mut dyn FnMut(PackProgress),
     w: &mut dyn Write,
+    stop: &CancelSignal<'_>,
 ) -> Result<PackStats> {
     if opts.use_bitmaps && filter.is_none() {
-        if let Some(stats) = crate::pack_reuse::try_write_streaming_pack(
+        if let Some(stats) = crate::pack_reuse::try_write_streaming_pack_including_tags(
             repo,
             wants,
             haves,
             source_shallow,
             have_shallow,
             filter,
+            include_tags,
             opts,
             progress,
             w,
+            stop,
         )? {
             return Ok(stats);
         }
@@ -637,8 +746,63 @@ fn write_upload_pack_stream_in_context(
         filter,
         opts,
         HaveBoundary::TipsOnly,
+        include_tags,
         w,
+        stop,
     )
+}
+
+type PackIndexRows = Vec<(ObjectId, u64, u32)>;
+
+/// Objects selected for an upload-pack response from a repository with promisor
+/// remotes, with the blobs it does not store set aside.
+///
+/// Always uses the object walk: bitmaps and verbatim pack reuse cannot tell that a
+/// blob is missing. See [`write_upload_pack_selection`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn select_upload_pack_objects_probing(
+    repo: &Repository,
+    wants: &[ObjectId],
+    haves: &[ObjectId],
+    source_shallow: &HashSet<ObjectId>,
+    have_shallow: &HashSet<ObjectId>,
+    filter: Option<&ObjectFilter>,
+    opts: &PackBuildOptions,
+) -> Result<(
+    PackObjectSelection,
+    Vec<crate::pack_object_select::MissingBlob>,
+)> {
+    repo.odb().with_pack_read_context(|| {
+        crate::pack_object_select::enumerate_pack_objects_probing(
+            repo.odb(),
+            wants,
+            haves,
+            &crate::pack_object_select::PackEnumerateOptions {
+                filter,
+                shallow_grafts: source_shallow,
+                have_shallow_grafts: Some(have_shallow),
+                use_bitmaps: false,
+                exclude_objects: None,
+                peer_odb: None,
+                have_boundary: HaveBoundary::TipsOnly,
+            },
+            NameTrees::for_delta_search(opts),
+            &CancelSignal::never(),
+        )
+    })
+}
+
+/// Stream the pack for a selection made by [`select_upload_pack_objects_probing`]
+/// (after its missing blobs were omitted or fetched).
+pub(crate) fn write_upload_pack_selection(
+    repo: &Repository,
+    selection: &PackObjectSelection,
+    opts: &PackBuildOptions,
+    w: &mut dyn Write,
+    stop: &CancelSignal<'_>,
+) -> Result<PackStats> {
+    repo.odb()
+        .with_pack_read_context(|| write_selected_pack(repo.odb(), selection, opts, w, stop))
 }
 
 fn write_pack_header(w: &mut dyn Write, count: u32) -> Result<()> {
@@ -656,27 +820,32 @@ pub(crate) fn write_delta_pack_stream(
     w: &mut dyn Write,
     reuse: Option<&mut crate::pack_reuse::StreamingReuse>,
 ) -> Result<PackStats> {
-    let (pack_bytes_len, reuse_stats) = if let Some(reuse) = reuse {
-        let pack = serialize_delta_plan_stream(odb, plan, opts, Some(reuse))?;
-        let len = pack.bytes.len() as u64;
-        w.write_all(&pack.bytes).map_err(Error::Io)?;
-        (len, reuse.take_stats())
+    let algo = odb.hash_algo();
+    let mut out = HashingWriter::new(algo, w);
+    let reuse_stats = if let Some(reuse) = reuse {
+        let (_, body_bytes) = write_delta_plan_stream_body(&mut out, odb, plan, opts, Some(reuse))?;
+        out.finish().map_err(Error::Io)?;
+        let pack_bytes = 12u64 + body_bytes + algo.len() as u64;
+        let stats = reuse.take_stats();
+        (pack_bytes, stats)
     } else {
-        let pack = serialize_delta_plan_stream(odb, plan, opts, None)?;
-        let len = pack.bytes.len() as u64;
-        w.write_all(&pack.bytes).map_err(Error::Io)?;
-        (len, crate::pack_reuse::ReuseWriteStats::default())
+        let (_, body_bytes) = write_delta_plan_stream_body(&mut out, odb, plan, opts, None)?;
+        out.finish().map_err(Error::Io)?;
+        (
+            12u64 + body_bytes + algo.len() as u64,
+            crate::pack_reuse::ReuseWriteStats::default(),
+        )
     };
     let delta_count = plan.entries.iter().filter(|e| e.base.is_some()).count() as u32;
     Ok(PackStats {
         object_count: u32::try_from(plan.entries.len())
             .map_err(|_| Error::CorruptObject("pack object count exceeds u32".to_owned()))?,
-        pack_bytes: pack_bytes_len,
+        pack_bytes: reuse_stats.0,
         delta_count,
-        verbatim_reuse_bytes: reuse_stats.verbatim_reuse_bytes,
-        verbatim_reuse_objects: reuse_stats.verbatim_reuse_objects,
-        pack_ofs_fixup_objects: reuse_stats.pack_ofs_fixup_objects,
-        pack_ref_from_ofs_objects: reuse_stats.pack_ref_from_ofs_objects,
+        verbatim_reuse_bytes: reuse_stats.1.verbatim_reuse_bytes,
+        verbatim_reuse_objects: reuse_stats.1.verbatim_reuse_objects,
+        pack_ofs_fixup_objects: reuse_stats.1.pack_ofs_fixup_objects,
+        pack_ref_from_ofs_objects: reuse_stats.1.pack_ref_from_ofs_objects,
     })
 }
 
@@ -686,30 +855,68 @@ fn write_delta_plan_stream_body(
     plan: &DeltaPlan,
     opts: &PackBuildOptions,
     reuse: Option<&mut crate::pack_reuse::StreamingReuse>,
-) -> Result<Vec<(ObjectId, u64, u32)>> {
+) -> Result<(PackIndexRows, u64)> {
     let count = u32::try_from(plan.entries.len())
         .map_err(|_| Error::CorruptObject("pack object count exceeds u32".to_owned()))?;
     write_pack_header(w, count)?;
     let mut index_rows = Vec::with_capacity(plan.entries.len());
-    write_planned_entries(w, odb, plan, opts, 12, reuse, &mut index_rows)?;
-    Ok(index_rows)
+    let body_bytes = write_planned_entries(w, odb, plan, opts, 12, reuse, &mut index_rows)?;
+    Ok((index_rows, body_bytes))
 }
 
-/// Serialize a delta plan to an in-memory PACK v2 stream with a matching `.idx` row set.
-pub(crate) fn serialize_delta_plan_stream(
-    odb: &Odb,
-    plan: &DeltaPlan,
-    opts: &PackBuildOptions,
-    reuse: Option<&mut crate::pack_reuse::StreamingReuse>,
-) -> Result<SerializedDeltaPack> {
-    let mut buf = Vec::new();
-    let index_rows = write_delta_plan_stream_body(&mut buf, odb, plan, opts, reuse)?;
-    append_pack_trailer(&mut buf, odb.hash_algo());
-    Ok(SerializedDeltaPack {
-        bytes: buf,
-        index_rows,
-        staging_path: None,
-    })
+pub(crate) const PACK_STREAM_COPY_CHUNK: usize = 64 * 1024;
+
+pub(crate) struct CrcWriter<'a, W: Write + ?Sized> {
+    inner: &'a mut W,
+    crc: crc32fast::Hasher,
+}
+
+impl<'a, W: Write + ?Sized> CrcWriter<'a, W> {
+    pub(crate) fn new(inner: &'a mut W, prefix: &[u8]) -> Self {
+        let mut crc = crc32fast::Hasher::new();
+        crc.update(prefix);
+        Self { inner, crc }
+    }
+
+    pub(crate) fn finalize(self) -> u32 {
+        self.crc.finalize()
+    }
+}
+
+impl<W: Write + ?Sized> Write for CrcWriter<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.crc.update(&buf[..n]);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+struct ByteCounter<'a, W: Write + ?Sized> {
+    inner: &'a mut W,
+    n: u64,
+}
+
+impl<W: Write + ?Sized> Write for ByteCounter<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.n += n as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+pub(crate) fn write_all_chunked(w: &mut dyn Write, data: &[u8]) -> Result<()> {
+    for chunk in data.chunks(PACK_STREAM_COPY_CHUNK) {
+        w.write_all(chunk).map_err(Error::Io)?;
+    }
+    Ok(())
 }
 
 fn write_planned_entries(
@@ -720,7 +927,7 @@ fn write_planned_entries(
     pack_body_start: u64,
     mut reuse: Option<&mut crate::pack_reuse::StreamingReuse>,
     index_rows: &mut Vec<(ObjectId, u64, u32)>,
-) -> Result<()> {
+) -> Result<u64> {
     let algo = odb.hash_algo();
     let compression = odb.pack_compression()?;
     let mut oid_to_offset: OidHashMap<u64> = oid_hash_map();
@@ -730,17 +937,34 @@ fn write_planned_entries(
         let start = pack_body_start + body_written;
         let mut chunk = Vec::new();
         if entry.base.is_none() {
-            if let Some(reuse) = reuse.as_mut() {
-                if let Some(bytes) = reuse.try_emit_whole(&entry.oid, opts)? {
-                    chunk = bytes;
+            let mut crc_w = CrcWriter {
+                inner: w,
+                crc: crc32fast::Hasher::new(),
+            };
+            let wrote = {
+                let mut counter = ByteCounter {
+                    inner: &mut crc_w,
+                    n: 0,
+                };
+                if let Some(reuse) = reuse.as_mut() {
+                    if let Some(n) = reuse.try_write_whole(&mut counter, &entry.oid, opts)? {
+                        n
+                    } else {
+                        write_whole_pack_object_to_odb(
+                            &mut counter,
+                            odb,
+                            entry.oid,
+                            entry.kind,
+                            opts,
+                        )?
+                    }
+                } else {
+                    write_whole_pack_object_to_odb(&mut counter, odb, entry.oid, entry.kind, opts)?
                 }
-            }
-            if chunk.is_empty() {
-                write_whole_pack_object_from_odb(&mut chunk, odb, entry.oid, entry.kind, opts)?;
-            }
-            w.write_all(&chunk).map_err(Error::Io)?;
-            index_rows.push((entry.oid, start, crc32fast::hash(&chunk)));
-            body_written += chunk.len() as u64;
+            };
+            let crc = crc_w.finalize();
+            index_rows.push((entry.oid, start, crc));
+            body_written += wrote;
             oid_to_offset.insert(entry.oid, start);
             continue;
         }
@@ -816,7 +1040,7 @@ fn write_planned_entries(
         body_written += chunk.len() as u64;
         oid_to_offset.insert(entry.oid, start);
     }
-    Ok(())
+    Ok(body_written)
 }
 
 /// Serialize a precomputed object list into a pack (used by [`build_pack`] and filtered bundles).
@@ -880,6 +1104,8 @@ pub(crate) fn build_pack_with_write_threads_full(
             have_boundary: HaveBoundary::CommitClosure,
         },
         NameTrees::for_delta_search(opts),
+        false,
+        &CancelSignal::never(),
     )?;
     build_pack_from_send_list_full(
         odb,
@@ -917,6 +1143,8 @@ pub fn build_pack_with_parallel_threads(
             have_boundary: HaveBoundary::CommitClosure,
         },
         NameTrees::for_delta_search(opts),
+        false,
+        &CancelSignal::never(),
     )?;
     build_pack_from_send_list_with_parallel_threads(
         odb,
@@ -996,12 +1224,69 @@ pub(crate) fn build_pack_from_send_list_full(
         opts,
         blob_name_hashes,
         search_threads,
+        &CancelSignal::never(),
     )?;
     crate::pack_delta::serialize_pack_with_deltas(odb, &plan.entries, opts, write_threads)
 }
 
-/// Build a pack for local fetch: enumerate haves on `have_odb`, read payloads from `source_odb`.
-pub(crate) fn build_pack_for_local_fetch(
+/// Stream a pack of exactly `send` (objects the receiver lacks, none of which it
+/// needs as a delta base) to `w`, stopping with [`Error::Cancelled`] once `stop` fires.
+///
+/// Reuses on-disk whole objects and deltas as `opts` allows, like
+/// [`build_pack_from_send_list`], without holding the pack in memory.
+pub(crate) fn write_pack_from_send_list(
+    odb: &Odb,
+    send: &[ObjectId],
+    opts: &PackBuildOptions,
+    name_hashes: &HashMap<ObjectId, u32>,
+    stop: &CancelSignal<'_>,
+    w: &mut dyn Write,
+    mut on_objects: Option<&mut dyn FnMut(u64)>,
+) -> Result<PackStats> {
+    if !opts.delta {
+        let bytes = serialize_pack(odb, send, opts)?;
+        stop.poll()?;
+        w.write_all(&bytes).map_err(Error::Io)?;
+        if let Some(on) = on_objects.as_deref_mut() {
+            on(send.len() as u64);
+        }
+        return Ok(PackStats {
+            object_count: u32::try_from(send.len()).unwrap_or(u32::MAX),
+            pack_bytes: bytes.len() as u64,
+            ..PackStats::default()
+        });
+    }
+    odb.with_pack_read_context(|| {
+        read_object_infos_with_progress(odb, send, None, stop, &mut on_objects)?;
+        stop.poll()?;
+        let plan = plan_deltas(
+            odb,
+            send,
+            &HashSet::new(),
+            None,
+            opts,
+            name_hashes,
+            None,
+            stop,
+        )?;
+        stop.poll()?;
+        crate::pack_delta::write_pack_with_deltas(
+            odb,
+            &plan.entries,
+            opts,
+            None,
+            w,
+            None,
+            stop,
+            on_objects,
+        )
+    })
+}
+
+/// Stream a pack for a local transfer to `w`: enumerate haves on `have_odb`, read
+/// payloads from `source_odb`, and stop with [`Error::Cancelled`] once `stop` fires.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn write_pack_for_local_fetch(
     source_odb: &Odb,
     wants: &[ObjectId],
     have_odb: &Odb,
@@ -1009,16 +1294,16 @@ pub(crate) fn build_pack_for_local_fetch(
     source_shallow: &HashSet<ObjectId>,
     have_shallow: &HashSet<ObjectId>,
     opts: &PackBuildOptions,
-) -> Result<Vec<u8>> {
-    let mut buf = Vec::new();
+    stop: &CancelSignal<'_>,
+    w: &mut dyn Write,
+) -> Result<PackStats> {
     PackObjects::new(have_odb, PackObjectsOptions::from(*opts))
         .with_source_odb(source_odb)
         .wants(wants)
         .haves(haves)
         .have_shallow_grafts(have_shallow)
         .source_shallow_grafts(source_shallow)
-        .write_to(&mut buf)?;
-    Ok(buf)
+        .write_to_with_cancel(w, stop)
 }
 
 fn collect_reachable_excluding(
@@ -1149,27 +1434,55 @@ fn write_whole_pack_object_from_odb(
     kind: ObjectKind,
     opts: &PackBuildOptions,
 ) -> Result<()> {
+    write_whole_pack_object_to_odb(buf, odb, oid, kind, opts).map(|_| ())
+}
+
+/// Write one whole object from the ODB to `w`, reusing on-disk pack bytes or streaming
+/// blobs at or above [`Odb::big_file_threshold`].
+pub(crate) fn write_whole_pack_object_to_odb(
+    w: &mut dyn Write,
+    odb: &Odb,
+    oid: ObjectId,
+    kind: ObjectKind,
+    opts: &PackBuildOptions,
+) -> Result<u64> {
     if opts.reuse_objects && odb.hash_algo() == HashAlgo::Sha1 {
-        if let Some(raw) = crate::pack::packed_full_object_slice(odb.objects_dir(), &oid)? {
-            buf.extend_from_slice(&raw);
-            return Ok(());
+        if let Some((bytes, start, end)) =
+            crate::pack::packed_full_object_range(odb.objects_dir(), &oid)?
+        {
+            write_all_chunked(w, &bytes[start..end])?;
+            return Ok((end - start) as u64);
         }
     }
     let size = odb.read_info(&oid)?.size;
     let stream_from = odb.big_file_threshold()?;
     if kind == ObjectKind::Blob && size >= stream_from {
-        return odb
-            .with_stream(&oid, |mut stream| {
-                let payload_len = usize::try_from(stream.size).map_err(|_| {
-                    Error::CorruptObject(format!("object size overflow for {}", oid.to_hex()))
-                })?;
-                encode_pack_object_header(buf, pack_type_code(kind), payload_len);
-                write_zlib_from_reader(buf, &mut stream.reader, odb.pack_compression()?)
-            })?
-            .ok_or_else(|| Error::ObjectNotFound(oid.to_hex()));
+        let mut counter = ByteCounter { inner: w, n: 0 };
+        odb.with_stream(&oid, |mut stream| {
+            let payload_len = usize::try_from(stream.size).map_err(|_| {
+                Error::CorruptObject(format!("object size overflow for {}", oid.to_hex()))
+            })?;
+            encode_pack_object_header_to(&mut counter, pack_type_code(kind), payload_len)?;
+            crate::odb::deflate_stream_to_writer(
+                &mut stream.reader,
+                stream.size,
+                &mut counter,
+                odb.pack_compression()?,
+            )?;
+            Ok(())
+        })?
+        .ok_or_else(|| Error::ObjectNotFound(oid.to_hex()))?;
+        return Ok(counter.n);
     }
     let obj = odb.read(&oid)?;
-    write_whole_pack_object(buf, odb, oid, kind, &obj.data, opts)
+    write_whole_pack_object_to(w, odb, oid, kind, &obj.data, opts)
+}
+
+fn encode_pack_object_header_to(w: &mut dyn Write, type_code: u8, size: usize) -> Result<()> {
+    let mut header = Vec::new();
+    encode_pack_object_header(&mut header, type_code, size);
+    w.write_all(&header).map_err(Error::Io)?;
+    Ok(())
 }
 
 /// Write one whole (non-delta) pack object, reusing on-disk bytes when allowed.
@@ -1181,15 +1494,29 @@ fn write_whole_pack_object(
     data: &[u8],
     opts: &PackBuildOptions,
 ) -> Result<()> {
+    write_whole_pack_object_to(buf, odb, oid, kind, data, opts).map(|_| ())
+}
+
+fn write_whole_pack_object_to(
+    w: &mut dyn Write,
+    odb: &Odb,
+    oid: ObjectId,
+    kind: ObjectKind,
+    data: &[u8],
+    opts: &PackBuildOptions,
+) -> Result<u64> {
+    let mut counter = ByteCounter { inner: w, n: 0 };
     if opts.reuse_objects && odb.hash_algo() == HashAlgo::Sha1 {
-        if let Some(raw) = crate::pack::packed_full_object_slice(odb.objects_dir(), &oid)? {
-            buf.extend_from_slice(&raw);
-            return Ok(());
+        if let Some((bytes, start, end)) =
+            crate::pack::packed_full_object_range(odb.objects_dir(), &oid)?
+        {
+            write_all_chunked(&mut counter, &bytes[start..end])?;
+            return Ok(counter.n);
         }
     }
-    encode_pack_object_header(buf, pack_type_code(kind), data.len());
-    let compression = odb.pack_compression()?;
-    write_zlib(buf, data, compression)
+    encode_pack_object_header_to(&mut counter, pack_type_code(kind), data.len())?;
+    write_zlib_to(&mut counter, data, odb.pack_compression()?)?;
+    Ok(counter.n)
 }
 
 /// Append the trailing pack checksum: the hash of everything written so far, at
@@ -1255,10 +1582,38 @@ fn read_object_infos(
     oids: &[ObjectId],
     search_threads: Option<usize>,
 ) -> Result<Vec<ObjectInfo>> {
+    let mut none: Option<&mut dyn FnMut(u64)> = None;
+    read_object_infos_with_progress(odb, oids, search_threads, &CancelSignal::never(), &mut none)
+}
+
+fn read_object_infos_with_progress(
+    odb: &Odb,
+    oids: &[ObjectId],
+    search_threads: Option<usize>,
+    stop: &CancelSignal<'_>,
+    on_objects: &mut Option<&mut dyn FnMut(u64)>,
+) -> Result<Vec<ObjectInfo>> {
     let par = crate::pack_delta::pack_delta_search_parallel_options(odb, search_threads)?;
     let read = |oid: &ObjectId| odb.read_info(oid);
+    let stride = crate::progress::OBJECT_PROGRESS_STRIDE as usize;
     if par.threads.get() <= 1 || oids.len() < 32 {
-        return oids.iter().map(read).collect();
+        let mut out = Vec::with_capacity(oids.len());
+        for (i, oid) in oids.iter().enumerate() {
+            stop.poll()?;
+            out.push(read(oid)?);
+            if (i + 1).is_multiple_of(stride) {
+                if let Some(on) = on_objects.as_deref_mut() {
+                    on(stride as u64);
+                }
+            }
+        }
+        let rem = oids.len() % stride;
+        if rem != 0 {
+            if let Some(on) = on_objects.as_deref_mut() {
+                on(rem as u64);
+            }
+        }
+        return Ok(out);
     }
     try_par_map_force(oids, par, read).map_err(|e| match e {
         ParallelHashError::Task(err) => err,
@@ -1333,9 +1688,10 @@ pub(crate) fn objects_dir_has_local_packs(objects_dir: &Path) -> bool {
 /// kind, groups objects by kind, path name hash (`name_hashes`, for blobs and trees)
 /// and size as Git does, and reads payloads from `odb` only while they are in the
 /// window, so memory does not grow with the number or size of the objects packed.
-/// Chains are depth-limited via [`crate::pack::apply_delta_depth_limit`].
-/// Correctness (re-indexability) is preserved because every chosen base is acyclic
-/// and either in-pack or, for thin packs, peer-held.
+/// Chains are depth-limited on [`crate::pack::apply_delta_depth_limit`]'s rule.
+/// Correctness (re-indexability) is preserved because the chosen edges form no cycle,
+/// even when on-disk deltas come from several packs, and every base is either in-pack
+/// (emitted ahead of its targets) or, for thin packs, peer-held.
 ///
 /// Two optional refinements:
 ///
@@ -1356,6 +1712,7 @@ pub(crate) fn objects_dir_has_local_packs(objects_dir: &Path) -> bool {
 /// in `peer_held`. Edge commits are the parents of sent commits that `peer_commits`
 /// (the selection's [`crate::pack_object_select::PackObjectSelection::have_closure`])
 /// or `peer_held` contains.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn plan_deltas(
     odb: &Odb,
     send: &[ObjectId],
@@ -1364,11 +1721,14 @@ pub(crate) fn plan_deltas(
     opts: &PackBuildOptions,
     name_hashes: &HashMap<ObjectId, u32>,
     search_threads: Option<usize>,
+    stop: &CancelSignal<'_>,
 ) -> Result<DeltaPlan> {
     let has_local_packs = objects_dir_has_local_packs(odb.objects_dir());
     let reuse_on_disk = opts.reuse_deltas && odb.hash_algo() == HashAlgo::Sha1 && has_local_packs;
     let search = opts.window > 0 && opts.max_depth > 0;
+    stop.poll()?;
     let infos = read_object_infos(odb, send, search_threads)?;
+    stop.poll()?;
     let in_pack: HashSet<ObjectId> = if reuse_on_disk || opts.thin || opts.respect_islands {
         send.iter().copied().collect()
     } else {
@@ -1413,6 +1773,7 @@ pub(crate) fn plan_deltas(
             &in_pack,
             &reusable_base,
         )?;
+        stop.poll()?;
         reused_zlib.retain(|t, (base, ..)| {
             // A stored delta against some other object the receiver holds is kept only
             // when the search has no base at the object's own path to do better with.
@@ -1470,7 +1831,9 @@ pub(crate) fn plan_deltas(
             opts,
             search_threads,
             has_local_packs,
+            stop.flag(),
         )?;
+        stop.poll()?;
         for (target, base, delta) in found {
             delta_to_base.insert(target, base);
             searched.insert(target, delta);
@@ -1479,9 +1842,12 @@ pub(crate) fn plan_deltas(
     drop((in_pack, thin_bases));
 
     if opts.max_depth > 0 && !delta_to_base.is_empty() {
-        // Cap chain length. After snipping, any removed target reverts to whole.
+        // Cap chain length. After snipping, any removed target reverts to whole. The
+        // edges are acyclic: reused ones come without cycles, and the search neither
+        // retargets a reused delta nor deltas the root of a reused chain against
+        // anything in the pack.
         let mut delta_std: HashMap<ObjectId, ObjectId> = delta_to_base.drain().collect();
-        crate::pack::apply_delta_depth_limit(&mut delta_std, opts.max_depth);
+        crate::pack::cap_delta_chain_depth(&mut delta_std, opts.max_depth);
         delta_to_base.extend(delta_std);
     }
 
@@ -1540,6 +1906,7 @@ fn search_new_deltas(
     opts: &PackBuildOptions,
     search_threads: Option<usize>,
     has_local_packs: bool,
+    stop: &std::sync::atomic::AtomicBool,
 ) -> Result<Vec<SearchedDelta>> {
     u32::try_from(send.len() + thin_bases.bases.len())
         .map_err(|_| Error::CorruptObject("too many objects for one pack".to_owned()))?;
@@ -1598,7 +1965,10 @@ fn search_new_deltas(
             .copied()
             .unwrap_or_else(|| base_oids[id - send.len()])
     };
-    let window_memory = crate::pack_delta::pack_config(odb)?.pack_window_memory_bytes();
+    let window_memory = match opts.window_memory {
+        Some(bytes) => bytes,
+        None => crate::pack_delta::pack_config(odb)?.pack_window_memory_bytes(),
+    };
     let threads = crate::pack_delta::pack_delta_search_parallel_options(odb, search_threads)?;
     let allowed = |target: &ObjectId, base: &ObjectId| {
         islands.in_same_island(target, base)
@@ -1616,6 +1986,7 @@ fn search_new_deltas(
             threads: threads.threads.get(),
         },
         &allowed,
+        stop,
     )?;
     Ok(found
         .into_iter()
@@ -1649,23 +2020,13 @@ fn load_islands_for_pack(
 
 /// zlib-deflate `data` and append it to `buf`.
 fn write_zlib(buf: &mut Vec<u8>, data: &[u8], compression: Compression) -> Result<()> {
-    let mut enc = ZlibEncoder::new(Vec::new(), compression);
-    enc.write_all(data).map_err(Error::Io)?;
-    let compressed = enc.finish().map_err(Error::Io)?;
-    buf.extend_from_slice(&compressed);
-    Ok(())
+    write_zlib_to(buf, data, compression)
 }
 
-/// zlib-deflate bytes read from `reader` and append them to `buf`.
-fn write_zlib_from_reader(
-    buf: &mut Vec<u8>,
-    reader: &mut dyn std::io::Read,
-    compression: Compression,
-) -> Result<()> {
-    let mut enc = ZlibEncoder::new(Vec::new(), compression);
-    std::io::copy(reader, &mut enc).map_err(Error::Io)?;
-    let compressed = enc.finish().map_err(Error::Io)?;
-    buf.extend_from_slice(&compressed);
+fn write_zlib_to(w: &mut dyn Write, data: &[u8], compression: Compression) -> Result<()> {
+    let mut enc = ZlibEncoder::new(w, compression);
+    enc.write_all(data).map_err(Error::Io)?;
+    enc.finish().map_err(Error::Io)?;
     Ok(())
 }
 
@@ -1778,6 +2139,7 @@ pub(crate) mod tests {
             &opts,
             &selection.name_hashes,
             None,
+            &CancelSignal::never(),
         )
         .unwrap();
 
@@ -1860,6 +2222,8 @@ pub(crate) mod tests {
                 have_boundary: HaveBoundary::CommitClosure,
             },
             NameTrees::for_delta_search(&opts),
+            false,
+            &CancelSignal::never(),
         )
         .unwrap();
         let plan = plan_deltas(
@@ -1870,6 +2234,7 @@ pub(crate) mod tests {
             &opts,
             &selection.name_hashes,
             Some(1),
+            &CancelSignal::never(),
         )
         .unwrap();
         let deltas_of = |kind| {
@@ -2011,6 +2376,7 @@ pub(crate) mod tests {
                 &PackBuildOptions::for_serve(None, true, true),
                 &self.name_hashes,
                 Some(1),
+                &CancelSignal::never(),
             )
             .unwrap()
         }

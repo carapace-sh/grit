@@ -1,33 +1,45 @@
 //! Stop/resume rebase sessions with Git-compatible `.git/rebase-merge/` state.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use crate::change_id::logical_change_id_for_commit;
 use crate::hooks::{
     run_post_checkout, run_post_rewrite, HookName, PostOperationHooks, RewriteKind,
 };
 use crate::lockfile::{LockFile, LockWait};
+use crate::merge_trees::materialized_merge_result_tree;
 use crate::objects::ObjectId;
 use crate::operation::conflicts_from_tree_merge;
 use crate::porcelain::checkout::checkout_hard_to_tree_from_head_tree;
 use crate::porcelain::merge::apply_conflict_merge_worktree;
 use crate::porcelain::reset::{reset_to_commit, ResetMode, ResetOptions};
-use crate::porcelain::worktree_guard::ensure_safe_for_rebase_stop;
+use crate::porcelain::worktree_guard::{
+    ensure_safe_for_rebase_stop, ensure_worktree_clean_for_rebase_exec,
+};
 use crate::progress::{
     poll_cancel, Cancel, NeverCancel, NullProgress, ProgressSink, UncancellableProgress,
 };
 use crate::refs;
 use crate::repo::Repository;
-use crate::state::{resolve_head_for_repository, HeadState};
+use crate::state::{resolve_head_for_repository, write_orig_head, HeadState};
 use crate::write_tree::{write_tree_update_index, WriteTreeFlags};
 
 use super::apply::{apply_rewrite, log_head_move};
 use super::error::HistoryError;
-use super::plan::{plan_rewrite_with_order_resumable_seeded, ResumablePlanOutcome};
-use super::rebase::{plan_rebase_resumable, RebaseOntoOptions, RebasePlan, RebaseRequest};
+use super::last::{write_history_last, HistoryLastRecord};
+use super::plan::{
+    commit_parents, plan_rewrite_with_order_resumable_seeded, write_rebase_staged_resolution,
+    ResumablePlanOutcome,
+};
+use super::rebase::{
+    commits_in_rebase_range, plan_rebase_resumable, PreRebase, RebaseOntoOptions, RebasePlan,
+    RebaseRequest,
+};
+use super::types::RefScope;
 use super::types::{
     AppliedRewrite, ApplyOptions, CommitEdit, HistoryEdits, PlannedRefUpdate, RewriteOptions,
     RewritePlan, RewrittenCommit,
@@ -43,6 +55,9 @@ pub struct StartRebaseOptions {
     pub rebase: RebaseOntoOptions,
     /// Reflog identity and message used when the rebase finishes with [`apply_rewrite`].
     pub apply: ApplyOptions,
+    /// Whether [`start_rebase`] runs the `pre-rebase` hook. [`continue_rebase`] and
+    /// [`skip_rebase`] never run it.
+    pub pre_rebase: PreRebase,
 }
 
 /// Snapshot when a resumable rebase stops on conflicts.
@@ -78,17 +93,30 @@ pub enum RebaseOutcome {
         /// `HEAD`. Unlike [`RewritePlan::head_change`], this covers the entire session call.
         head_change: Option<(ObjectId, ObjectId)>,
     },
-    /// An exec stop was resumed to completion and the atomic plan was applied.
+    /// `--exec` commands ran at every replayed commit (from [`start_rebase_with_exec`], or a
+    /// resumed exec stop) and the atomic plan was applied.
     ExecDone {
         /// Ref movements performed on completion.
         applied: AppliedRewrite,
         /// Final rewrite plan; boxed to keep the outcome small.
         plan: Box<RewritePlan>,
-        /// Invocations captured during this continue/skip call.
+        /// Invocations captured during this call ([`start_rebase_with_exec`], or a
+        /// continue/skip that resumed an exec stop).
         exec: super::ExecReport,
     },
     /// Replay stopped on conflicts; `.git/rebase-merge/` and grit state were written.
     Stopped(RebaseStop),
+}
+
+/// Result of [`abort_rebase`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde-models", derive(serde::Serialize))]
+pub struct RebaseAbort {
+    /// Branches that something else moved while the rebase was stopped and that the abort
+    /// reset to their pre-rebase tip: `old` is the tip that was overwritten (still reachable
+    /// from the branch reflog), `new` the restored pre-rebase tip. Empty when the branch was
+    /// where the rebase left it.
+    pub overwritten: Vec<PlannedRefUpdate>,
 }
 
 /// Failures while driving a rebase session.
@@ -119,6 +147,16 @@ pub enum RebaseSessionError {
     #[error("nothing to commit after conflict resolution")]
     NothingToCommit,
 
+    /// `HEAD` is not the recorded conflict parent and is not a descendant of it, so grit
+    /// cannot tell which commit finished the stopped pick.
+    #[error(
+        "HEAD moved away from the conflict resolution parent (expected {expected}); save commits on a branch or reset before `grit rebase --continue`"
+    )]
+    ResolutionHeadChanged {
+        /// Detached replay parent written when the rebase stopped.
+        expected: ObjectId,
+    },
+
     /// Branch rebase requires a symbolic `HEAD`.
     #[error("rebase session requires HEAD on a branch")]
     NotOnBranch,
@@ -129,6 +167,30 @@ pub enum RebaseSessionError {
     ExecHeadChanged {
         /// Detached replay commit at the exec stop.
         expected: ObjectId,
+    },
+
+    /// A ref the stopped exec rebase will move (the rebased branch or one of its planned
+    /// updates) was moved by something else, so the saved plan can no longer be applied.
+    /// Nothing was changed; [`abort_rebase`] restores the pre-rebase state.
+    #[error(
+        "ref {name} moved from {expected} to {} while the rebase was stopped; abort the rebase to restore it",
+        .actual.map_or_else(|| "(deleted)".to_owned(), |oid| oid.to_hex())
+    )]
+    StaleExecPlan {
+        /// Full ref name.
+        name: String,
+        /// Tip the saved plan expects.
+        expected: ObjectId,
+        /// Current tip, or `None` when the ref was deleted.
+        actual: Option<ObjectId>,
+    },
+
+    /// The rebased branch moved again while [`abort_rebase`] was resetting it; the rebase is
+    /// still in progress and the abort can be retried.
+    #[error("ref {name} moved while aborting the rebase; retry the abort")]
+    AbortRefMoved {
+        /// Full ref name.
+        name: String,
     },
 
     /// Underlying history rewrite failure.
@@ -152,17 +214,27 @@ impl RebaseSessionError {
             | Self::ForeignRebaseInProgress
             | Self::UnmergedPaths
             | Self::NothingToCommit
+            | Self::ResolutionHeadChanged { .. }
             | Self::NotOnBranch
-            | Self::ExecHeadChanged { .. } => false,
+            | Self::ExecHeadChanged { .. }
+            | Self::StaleExecPlan { .. }
+            | Self::AbortRefMoved { .. } => false,
         }
     }
 }
 
 /// Start a resumable rebase of `opts.request.branch_tip` onto the effective onto commit.
 ///
+/// Unless the branch is already up to date, runs `pre-rebase` before any commit is replayed
+/// (see [`StartRebaseOptions::pre_rebase`]); a refusal returns [`RebaseSessionError::History`]
+/// wrapping [`HistoryError::Library`] with [`Error::Hook`](crate::error::Error::Hook), and
+/// nothing is changed or written.
+///
 /// On a clean replay, applies the plan atomically and returns [`RebaseOutcome::Done`].
 /// On conflict, writes Git-compatible rebase state and returns [`RebaseOutcome::Stopped`]
-/// without moving the branch ref away from its pre-rebase tip.
+/// without moving the branch ref away from its pre-rebase tip. Both record the pre-rebase tip
+/// as `ORIG_HEAD`, which finishing or aborting the rebase leaves in place; an up-to-date branch
+/// leaves `ORIG_HEAD` untouched.
 ///
 /// # Errors
 ///
@@ -188,32 +260,24 @@ pub fn start_rebase(
     cancel: &dyn Cancel,
 ) -> Result<RebaseOutcome, RebaseSessionError> {
     super::ensure_rewrite_apply_ready(repo)?;
-    if active_rebase(repo.git_dir()).is_some() {
-        return Err(RebaseSessionError::RebaseAlreadyInProgress);
+    if let Some(active) = active_rebase(repo.git_dir()) {
+        return Err(match active {
+            ActiveRebase::Foreign(_) => RebaseSessionError::ForeignRebaseInProgress,
+            ActiveRebase::Exec | ActiveRebase::Grit => RebaseSessionError::RebaseAlreadyInProgress,
+        });
     }
     let (head_ref, orig_head) = branch_head(repo)?;
-    let plan = plan_rebase_resumable(repo, &opts.request, &opts.rebase)?;
+    let plan = plan_rebase_resumable(repo, &opts.request, &opts.rebase, &opts.pre_rebase)?;
     poll_cancel(progress, cancel).map_err(map_lib)?;
     match plan {
-        Err(RebasePlan::UpToDate) => Ok(RebaseOutcome::Done {
-            head_change: None,
-            applied: AppliedRewrite {
-                ref_updates: Vec::new(),
-                head: orig_head,
-                hooks_run: Vec::new(),
-            },
-            plan: Box::new(RewritePlan {
-                commits: Vec::new(),
-                ref_updates: Vec::new(),
-                head: super::types::HeadEffect::default(),
-            }),
-        }),
+        Err(RebasePlan::UpToDate) => Ok(up_to_date_outcome(orig_head)),
         Err(RebasePlan::Plan(_) | RebasePlan::Conflict { .. }) => Err(HistoryError::Planning {
             message: "unexpected non-resumable rebase plan".into(),
         }
         .into()),
         Ok(ResumablePlanOutcome::Complete(plan)) => {
             let applied = apply_rewrite(repo, &plan, &opts.apply, progress, cancel)?;
+            write_orig_head(repo, orig_head).map_err(map_lib)?;
             Ok(RebaseOutcome::Done {
                 head_change: (orig_head != applied.head).then_some((orig_head, applied.head)),
                 applied,
@@ -235,6 +299,7 @@ pub fn start_rebase(
                 progress,
                 cancel,
             )?;
+            write_orig_head(repo, orig_head).map_err(map_lib)?;
             if opts.apply.hooks.enabled() {
                 let onto = opts.request.onto.unwrap_or(opts.request.upstream);
                 run_post_checkout(repo, Some(orig_head), onto, true);
@@ -244,18 +309,261 @@ pub fn start_rebase(
     }
 }
 
+/// Rebase like [`start_rebase`], running `spec.commands` at each replayed commit before any
+/// ref moves (`grit rebase --exec`).
+///
+/// [`StartRebaseOptions::pre_rebase`] runs before anything is replayed, as for [`start_rebase`].
+///
+/// The commands run through [`verify_rebase_with_exec`](super::verify_rebase_with_exec); when
+/// they all succeed, the (possibly amended) plan is applied atomically and the pre-rebase tip
+/// `opts.request.branch_tip` is recorded as `ORIG_HEAD`. When there is nothing to replay and
+/// no `--exec` commands, returns [`RebaseOutcome::Done`] with no `head_change` and leaves
+/// `ORIG_HEAD` untouched. With `--exec`, commits in the rebase range still run the commands
+/// even when the branch is already based on the upstream (matching `git rebase -x`). Unlike
+/// [`start_rebase`], a replay conflict before any command runs is reported as an error and
+/// nothing changes.
+///
+/// # Errors
+///
+/// Returns [`RebaseSessionError::History`] wrapping [`HistoryError::Conflict`] when planning
+/// conflicts, and the `--exec` errors of
+/// [`verify_rebase_with_exec`](super::verify_rebase_with_exec)
+/// ([`HistoryError::ExecFailed`], [`HistoryError::ExecDirty`],
+/// [`HistoryError::ExecConflict`], …). The two that save a resumable stop
+/// ([`HistoryError::ExecDirty`] and [`HistoryError::ExecConflict`]) record `ORIG_HEAD` first;
+/// the others roll back and leave it alone. Planning, work-tree and apply failures propagate
+/// as for [`start_rebase`].
+pub fn start_rebase_with_exec(
+    repo: &Repository,
+    opts: &StartRebaseOptions,
+    spec: &super::ExecSpec,
+    runner: &dyn crate::command_runner::CommandRunner,
+    progress: &mut dyn ProgressSink,
+    cancel: &dyn Cancel,
+) -> Result<RebaseOutcome, RebaseSessionError> {
+    super::ensure_rewrite_apply_ready(repo)?;
+    let orig_head = opts.request.branch_tip;
+    let mut plan = match super::rebase::plan_rebase_with_hook(
+        repo,
+        &opts.request,
+        &opts.rebase,
+        &opts.pre_rebase,
+    )? {
+        RebasePlan::UpToDate => {
+            if spec.commands.is_empty() {
+                return Ok(up_to_date_outcome(orig_head));
+            }
+            let fork =
+                super::rebase::rebase_fork(repo, opts.request.upstream, opts.request.branch_tip)?;
+            let effective_onto = opts.request.onto.unwrap_or(opts.request.upstream);
+            if opts.request.branch_tip == effective_onto {
+                return Ok(up_to_date_outcome(orig_head));
+            }
+            let range =
+                super::rebase::commits_in_rebase_range(repo, fork, &[opts.request.branch_tip])?;
+            if range.is_empty() {
+                return Ok(up_to_date_outcome(orig_head));
+            }
+            opts.pre_rebase.run(repo)?;
+            super::rebase::plan_rebase_identity_exec(
+                repo,
+                fork,
+                effective_onto,
+                &range,
+                &opts.rebase,
+            )?
+        }
+        RebasePlan::Conflict {
+            commit,
+            subject,
+            conflicts,
+            refs,
+        } => {
+            return Err(HistoryError::Conflict {
+                commit,
+                subject,
+                conflicts,
+                refs,
+            }
+            .into());
+        }
+        RebasePlan::Plan(plan) => plan,
+    };
+    super::apply::verify_rewrite_plan(repo, &plan)?;
+    let exec =
+        match super::verify_rebase_with_exec(repo, &mut plan, spec, &opts.rebase.rewrite, runner) {
+            Ok(exec) => exec,
+            Err(stop @ (HistoryError::ExecDirty { .. } | HistoryError::ExecConflict { .. })) => {
+                write_orig_head(repo, orig_head).map_err(map_lib)?;
+                return Err(stop.into());
+            }
+            Err(err) => return Err(err.into()),
+        };
+    let applied = apply_rewrite(repo, &plan, &opts.apply, progress, cancel)?;
+    write_orig_head(repo, orig_head).map_err(map_lib)?;
+    Ok(RebaseOutcome::ExecDone {
+        applied,
+        plan: Box::new(plan),
+        exec,
+    })
+}
+
+fn up_to_date_outcome(head: ObjectId) -> RebaseOutcome {
+    RebaseOutcome::Done {
+        head_change: None,
+        applied: AppliedRewrite {
+            ref_updates: Vec::new(),
+            head,
+            hooks_run: Vec::new(),
+        },
+        plan: Box::new(RewritePlan {
+            commits: Vec::new(),
+            ref_updates: Vec::new(),
+            head: super::types::HeadEffect::default(),
+        }),
+    }
+}
+
+/// When `grit-plan` predates `stopped_head`, record the detached replay parent before
+/// `grit commit` moves `HEAD` to the resolution commit.
+pub(crate) fn persist_rebase_stopped_head_if_missing(
+    repo: &Repository,
+) -> Result<(), RebaseSessionError> {
+    if !crate::state::grit_rebase_conflict_stop_active(repo.git_dir()) {
+        return Ok(());
+    }
+    let path = repo.git_dir().join("rebase-merge/grit-plan");
+    let raw = fs::read_to_string(&path).map_err(|_| RebaseSessionError::NoRebaseInProgress)?;
+    let mut parsed: PersistedRebaseState =
+        serde_json::from_str(&raw).map_err(|_| RebaseSessionError::NoRebaseInProgress)?;
+    if parsed.stopped_head.is_some() {
+        return Ok(());
+    }
+    let head = resolve_head_oid(repo)?;
+    parsed.stopped_head = Some(oid_hex(&head));
+    write_persisted_state(repo.git_dir(), &parsed)
+}
+
+fn replay_base_parent(state: &LoadedState, oid: ObjectId) -> bool {
+    oid == state.onto || state.mapping.values().any(|mapped| *mapped == oid)
+}
+
+fn stopped_head_for_continue(
+    state: &LoadedState,
+    repo: &Repository,
+) -> Result<ObjectId, RebaseSessionError> {
+    if let Some(oid) = state.stopped_head {
+        return Ok(oid);
+    }
+    let head = resolve_head_oid(repo)?;
+    if replay_base_parent(state, head) {
+        return Ok(head);
+    }
+    let head_commit = load_commit(repo, head)?;
+    if head_commit.parents.len() == 1 {
+        if let Some(&parent) = head_commit.parents.first() {
+            if replay_base_parent(state, parent) {
+                return Ok(parent);
+            }
+        }
+    } else {
+        for &parent in &head_commit.parents {
+            if replay_base_parent(state, parent) {
+                return Ok(parent);
+            }
+        }
+    }
+    Err(RebaseSessionError::NoRebaseInProgress)
+}
+
+fn is_first_parent_descendant_of(
+    repo: &Repository,
+    ancestor: ObjectId,
+    tip: ObjectId,
+) -> Result<bool, RebaseSessionError> {
+    if tip == ancestor {
+        return Ok(false);
+    }
+    let mut current = Some(tip);
+    while let Some(oid) = current {
+        let parents = commit_parents(repo, oid).map_err(RebaseSessionError::from)?;
+        let Some(first) = parents.first().copied() else {
+            break;
+        };
+        if first == ancestor {
+            return Ok(true);
+        }
+        current = Some(first);
+    }
+    Ok(false)
+}
+
+fn advance_after_user_resolution_commit(
+    repo: &Repository,
+    state: &LoadedState,
+    opts: &StartRebaseOptions,
+    current: ObjectId,
+    head_oid: ObjectId,
+    progress: &mut dyn ProgressSink,
+    cancel: &dyn Cancel,
+) -> Result<RebaseOutcome, RebaseSessionError> {
+    let current_data = load_commit(repo, current)?;
+    let mut mapping = state.mapping.clone();
+    mapping.insert(current, head_oid);
+    let mut rewritten = state.rewritten.clone();
+    rewritten.push(RewrittenCommit {
+        old: current,
+        new: Some(head_oid),
+        change_id: logical_change_id_for_commit(repo, head_oid).map_err(map_lib)?,
+        subject: super::subject::subject_for_rewrite_row(repo, &current_data, Some(head_oid))
+            .map_err(RebaseSessionError::from)?,
+        reused: false,
+    });
+    let resume_order: Vec<ObjectId> = replay_order_for_resume(state, current)
+        .into_iter()
+        .filter(|commit| *commit != current)
+        .collect();
+    let mut edits = state.edits.clone();
+    edits.retain(|commit, _| resume_order.contains(commit));
+    let rewrite = replan_rewrite_options(state);
+    let outcome = plan_rewrite_with_order_resumable_seeded(
+        repo,
+        &edits,
+        &rewrite,
+        Some(&resume_order),
+        state.flatten_leaf_merges.then_some(state.onto),
+        state.rebase.favor,
+        Some((mapping, rewritten)),
+        Some(state.scoped_refs.clone()),
+    )?;
+    advance_after_plan(
+        repo,
+        state,
+        &opts.apply,
+        outcome,
+        head_oid,
+        progress,
+        cancel,
+    )
+}
+
 /// Finish the current conflicted commit and replay remaining commits.
 ///
 /// For an exec stop, requires a clean index/worktree at the recorded replay HEAD,
 /// then resumes at the next command (the successful dirty command is not rerun).
 /// Save exec edits with a stash before continuing. A moved HEAD is rejected;
-/// save new commits on a branch, abort, and restart in that case.
+/// save new commits on a branch, abort, and restart in that case. For an exec replay
+/// conflict ([`HistoryError::ExecConflict`]), commits the staged resolution and runs the
+/// commands at it. Later replays and new commits use the rewrite options saved when the
+/// exec stop was recorded, not `opts.rebase.rewrite`.
 ///
 /// # Errors
 ///
 /// Returns [`RebaseSessionError::UnmergedPaths`] when the index still records conflicts,
-/// [`RebaseSessionError::ForeignRebaseInProgress`] when `git` started the rebase, and
-/// [`RebaseSessionError::NoRebaseInProgress`] when no rebase is in progress.
+/// [`RebaseSessionError::ForeignRebaseInProgress`] when `git` started the rebase,
+/// [`RebaseSessionError::NoRebaseInProgress`] when no rebase is in progress, and, for an
+/// exec stop, [`RebaseSessionError::StaleExecPlan`] (changing nothing) when the rebased branch
+/// or a ref the plan updates was moved during the stop.
 /// Cancellation follows [`start_rebase`]: a cancel before the replayed commits are applied
 /// keeps the rebase stopped where it was.
 pub fn continue_rebase(
@@ -265,7 +573,7 @@ pub fn continue_rebase(
     cancel: &dyn Cancel,
 ) -> Result<RebaseOutcome, RebaseSessionError> {
     if matches!(active_rebase(repo.git_dir()), Some(ActiveRebase::Exec)) {
-        return super::exec::resume_exec_rebase(repo, &opts.apply, false);
+        return super::exec::resume_exec_rebase(repo, &opts.apply, false, progress, cancel);
     }
     super::ensure_rewrite_apply_ready(repo)?;
     let state = load_persisted_state(repo.git_dir())?;
@@ -273,9 +581,8 @@ pub fn continue_rebase(
         return Err(RebaseSessionError::UnmergedPaths);
     }
     let current = state
-        .remaining
-        .first()
-        .copied()
+        .stopped_commit
+        .or_else(|| state.remaining.first().copied())
         .ok_or(RebaseSessionError::NoRebaseInProgress)?;
     let new_tree = {
         let mut index = repo.load_index()?;
@@ -285,9 +592,56 @@ pub fn continue_rebase(
     let head_oid = resolve_head_oid(repo)?;
     let head_tree = commit_tree(repo, head_oid)?;
     if new_tree == head_tree {
-        return Err(RebaseSessionError::NothingToCommit);
+        let stopped_head = stopped_head_for_continue(&state, repo)?;
+        if head_oid == stopped_head {
+            return Err(RebaseSessionError::NothingToCommit);
+        }
+        if is_first_parent_descendant_of(repo, stopped_head, head_oid)? {
+            ensure_worktree_clean_for_rebase_exec(repo).map_err(map_lib)?;
+            return advance_after_user_resolution_commit(
+                repo, &state, opts, current, head_oid, progress, cancel,
+            );
+        }
+        return Err(RebaseSessionError::ResolutionHeadChanged {
+            expected: stopped_head,
+        });
     }
 
+    let original_parents = commit_parents(repo, current).map_err(RebaseSessionError::from)?;
+    let parents = if original_parents.len() <= 1 {
+        vec![head_oid]
+    } else {
+        let mut mapped = vec![head_oid];
+        mapped.extend(
+            original_parents[1..]
+                .iter()
+                .map(|parent| state.mapping.get(parent).copied().unwrap_or(*parent)),
+        );
+        mapped
+    };
+
+    // Merge-preserving replay with side branches before mainline needs the resolution
+    // recorded as a real commit before resuming; a single-commit stop can plan the staged
+    // tree directly (matches the linear `git rebase --continue` path).
+    if state.remaining.len() > 1 {
+        let stopped_head = stopped_head_for_continue(&state, repo)?;
+        if head_oid != stopped_head {
+            return Err(RebaseSessionError::ResolutionHeadChanged {
+                expected: stopped_head,
+            });
+        }
+        let resolved =
+            write_rebase_staged_resolution(repo, &state.rewrite, current, new_tree, &parents)
+                .map_err(RebaseSessionError::from)?;
+        refs::update_direct_ref_on_store(repo.refs(), repo.git_dir(), "HEAD", &resolved)
+            .map_err(map_lib)?;
+        ensure_worktree_clean_for_rebase_exec(repo).map_err(map_lib)?;
+        return advance_after_user_resolution_commit(
+            repo, &state, opts, current, resolved, progress, cancel,
+        );
+    }
+
+    let resume_order = replay_order_for_resume(&state, current);
     let mut edits = state.edits.clone();
     edits.insert(
         current,
@@ -295,9 +649,10 @@ pub fn continue_rebase(
             tree: Some(new_tree),
             message: None,
             author: None,
-            parents: Some(vec![head_oid]),
+            parents: Some(parents),
         },
     );
+    edits.retain(|commit, _| resume_order.contains(commit));
 
     let seed = (state.mapping.clone(), state.rewritten.clone());
     let rewrite = replan_rewrite_options(&state);
@@ -305,8 +660,9 @@ pub fn continue_rebase(
         repo,
         &edits,
         &rewrite,
-        Some(&state.replay_order),
+        Some(&resume_order),
         state.flatten_leaf_merges.then_some(state.onto),
+        state.rebase.favor,
         Some(seed),
         Some(state.scoped_refs.clone()),
     )?;
@@ -325,11 +681,14 @@ pub fn continue_rebase(
 ///
 /// For an exec stop, requires the edits to be saved or removed first, then skips
 /// remaining commands at that replay commit; the already replayed commit is kept.
+/// For an exec replay conflict, drops the conflicted commit and runs that commit's
+/// commands at the current `HEAD`, as Git's todo list would.
 ///
 /// # Errors
 ///
 /// Returns [`RebaseSessionError::ForeignRebaseInProgress`] when `git` started the rebase,
-/// [`RebaseSessionError::NoRebaseInProgress`] when no rebase is in progress, and
+/// [`RebaseSessionError::NoRebaseInProgress`] when no rebase is in progress,
+/// [`RebaseSessionError::StaleExecPlan`] as for [`continue_rebase`], and
 /// planning/apply failures otherwise. Cancellation follows [`continue_rebase`].
 pub fn skip_rebase(
     repo: &Repository,
@@ -338,7 +697,7 @@ pub fn skip_rebase(
     cancel: &dyn Cancel,
 ) -> Result<RebaseOutcome, RebaseSessionError> {
     if matches!(active_rebase(repo.git_dir()), Some(ActiveRebase::Exec)) {
-        return super::exec::resume_exec_rebase(repo, &opts.apply, true);
+        return super::exec::resume_exec_rebase(repo, &opts.apply, true, progress, cancel);
     }
     let state = load_persisted_state(repo.git_dir())?;
     let current = state
@@ -361,13 +720,22 @@ pub fn skip_rebase(
         reused: false,
     });
 
+    let resume_order: Vec<ObjectId> = state
+        .remaining
+        .iter()
+        .copied()
+        .filter(|c| *c != current)
+        .collect();
+    let mut edits = state.edits.clone();
+    edits.retain(|commit, _| resume_order.contains(commit));
     let rewrite = replan_rewrite_options(&state);
     let outcome = plan_rewrite_with_order_resumable_seeded(
         repo,
-        &state.edits,
+        &edits,
         &rewrite,
-        Some(&state.replay_order),
+        Some(&resume_order),
         state.flatten_leaf_merges.then_some(state.onto),
+        state.rebase.favor,
         Some((mapping, rewritten)),
         Some(state.scoped_refs.clone()),
     )?;
@@ -390,15 +758,22 @@ pub fn skip_rebase(
 /// removed. Either way, unresolved rerere records for the abandoned conflict are cleared
 /// (`MERGE_RR`), as `git rebase --abort` does.
 ///
+/// The branch is restored to `orig-head` even when something else (another worktree, a
+/// `git branch -f`, an amend on the checked-out branch) moved it while the rebase was stopped;
+/// such movements are listed in [`RebaseAbort::overwritten`] and logged as `rebase (abort)`
+/// in the branch reflog with `identity`. `identity` also signs the reflog entries of the reset.
+///
 /// # Errors
 ///
-/// Returns [`RebaseSessionError::NoRebaseInProgress`] when no rebase is in progress, and
+/// Returns [`RebaseSessionError::NoRebaseInProgress`] when no rebase is in progress,
 /// [`RebaseSessionError::ForeignRebaseInProgress`] when a git-started rebase recorded an
-/// autostash or has no readable `orig-head` (finish those with `git rebase --abort`).
+/// autostash or has no readable `orig-head` (finish those with `git rebase --abort`), and
+/// [`RebaseSessionError::AbortRefMoved`] when, for an exec stop, the branch moves again between
+/// reading and resetting it (nothing is restored and the abort can be retried).
 pub fn abort_rebase(
     repo: &Repository,
     identity: &crate::ident::Signature,
-) -> Result<(), RebaseSessionError> {
+) -> Result<RebaseAbort, RebaseSessionError> {
     identity
         .validate()
         .map_err(|err| map_lib(crate::error::Error::InvalidSignature(err)))?;
@@ -409,19 +784,19 @@ pub fn abort_rebase(
     match active_rebase(repo.git_dir()) {
         None => {
             if had_journal {
-                Ok(())
+                Ok(RebaseAbort::default())
             } else {
                 Err(RebaseSessionError::NoRebaseInProgress)
             }
         }
         Some(ActiveRebase::Foreign(dir)) => abort_foreign_rebase(repo, &dir, identity),
-        Some(ActiveRebase::Exec) => super::exec::abort_exec_rebase(repo),
+        Some(ActiveRebase::Exec) => super::exec::abort_exec_rebase(repo, identity),
         Some(ActiveRebase::Grit) => {
             let state = load_persisted_state(repo.git_dir())?;
             crate::rerere::rerere_clear(repo.git_dir()).map_err(map_lib)?;
-            hard_reset_branch(repo, &state.head_ref, state.orig_head, identity)?;
+            let abort = hard_reset_branch(repo, &state.head_ref, state.orig_head, identity)?;
             clear_rebase_state(repo.git_dir())?;
-            Ok(())
+            Ok(abort)
         }
     }
 }
@@ -430,7 +805,7 @@ fn abort_foreign_rebase(
     repo: &Repository,
     state_dir: &Path,
     identity: &crate::ident::Signature,
-) -> Result<(), RebaseSessionError> {
+) -> Result<RebaseAbort, RebaseSessionError> {
     if state_dir.join("autostash").exists() {
         return Err(RebaseSessionError::ForeignRebaseInProgress);
     }
@@ -438,15 +813,19 @@ fn abort_foreign_rebase(
         .and_then(|hex| ObjectId::from_hex(&hex).ok())
         .ok_or(RebaseSessionError::ForeignRebaseInProgress)?;
     crate::rerere::rerere_clear(repo.git_dir()).map_err(map_lib)?;
-    match first_line(&state_dir.join("head-name")).filter(|name| name.starts_with("refs/")) {
-        Some(head_ref) => hard_reset_branch(repo, &head_ref, orig_head, identity)?,
-        None => hard_reset_head(repo, orig_head, identity)?,
-    }
+    let abort =
+        match first_line(&state_dir.join("head-name")).filter(|name| name.starts_with("refs/")) {
+            Some(head_ref) => hard_reset_branch(repo, &head_ref, orig_head, identity)?,
+            None => {
+                hard_reset_head(repo, orig_head, identity)?;
+                RebaseAbort::default()
+            }
+        };
     for name in ["REBASE_HEAD", "AUTO_MERGE", "MERGE_MSG"] {
         remove_if_exists(&repo.git_dir().join(name))?;
     }
     fs::remove_dir_all(state_dir).map_err(map_lib)?;
-    Ok(())
+    Ok(abort)
 }
 
 /// Which tool owns the rebase state under the git directory.
@@ -508,6 +887,12 @@ struct PersistedRebaseState {
     branch_tip: String,
     flatten_leaf_merges: bool,
     scoped_refs: Vec<(String, String)>,
+    /// Detached `HEAD` at the conflict stop (`conflict.replayed_parent`).
+    #[serde(default)]
+    stopped_head: Option<String>,
+    /// Original commit being replayed when the rebase stopped (`partial.conflict.commit`).
+    #[serde(default)]
+    stopped_commit: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -652,6 +1037,25 @@ fn mapping_from_persist(
         .collect()
 }
 
+/// Commits still to replay when resuming after a stop (not the full initial replay order).
+fn replay_order_for_resume(state: &LoadedState, current: ObjectId) -> Vec<ObjectId> {
+    if let Some(pos) = state.replay_order.iter().position(|c| *c == current) {
+        return state.replay_order[pos..].to_vec();
+    }
+    let mut order = if state.remaining.is_empty() {
+        state.replay_order.clone()
+    } else {
+        state.remaining.clone()
+    };
+    if !order.contains(&current) {
+        order.insert(0, current);
+    } else if order.first() != Some(&current) {
+        order.retain(|c| *c != current);
+        order.insert(0, current);
+    }
+    order
+}
+
 #[allow(clippy::too_many_arguments)]
 fn state_from_partial(
     partial: &super::plan::PartialRewritePlan,
@@ -663,18 +1067,18 @@ fn state_from_partial(
     effective_onto: ObjectId,
     fork: ObjectId,
 ) -> PersistedRebaseState {
-    let done: Vec<ObjectId> = partial
+    let conflict = partial.conflict.commit;
+    let stop_idx = partial
         .commits_to_replay
+        .iter()
+        .position(|c| *c == conflict)
+        .unwrap_or(0);
+    let done: Vec<ObjectId> = partial.commits_to_replay[..stop_idx]
         .iter()
         .copied()
         .filter(|c| partial.mapping.contains_key(c))
         .collect();
-    let remaining: Vec<ObjectId> = partial
-        .commits_to_replay
-        .iter()
-        .copied()
-        .filter(|c| !partial.mapping.contains_key(c))
-        .collect();
+    let remaining: Vec<ObjectId> = partial.commits_to_replay[stop_idx..].to_vec();
     PersistedRebaseState {
         mapping: mapping_to_persist(&partial.mapping),
         rewritten: partial
@@ -705,6 +1109,8 @@ fn state_from_partial(
             .iter()
             .map(|(n, o)| (n.clone(), oid_hex(o)))
             .collect(),
+        stopped_head: None,
+        stopped_commit: Some(oid_hex(&conflict)),
     }
 }
 
@@ -723,6 +1129,8 @@ struct LoadedState {
     branch_tip: ObjectId,
     flatten_leaf_merges: bool,
     scoped_refs: Vec<(String, ObjectId)>,
+    stopped_head: Option<ObjectId>,
+    stopped_commit: Option<ObjectId>,
 }
 
 fn load_persisted_state(git_dir: &Path) -> Result<LoadedState, RebaseSessionError> {
@@ -775,6 +1183,12 @@ fn load_persisted_state(git_dir: &Path) -> Result<LoadedState, RebaseSessionErro
             .iter()
             .map(|(name, hex)| parse_oid(hex).map(|oid| (name.clone(), oid)))
             .collect::<Result<_, _>>()?,
+        stopped_head: parsed.stopped_head.as_deref().map(parse_oid).transpose()?,
+        stopped_commit: parsed
+            .stopped_commit
+            .as_deref()
+            .map(parse_oid)
+            .transpose()?,
     })
 }
 
@@ -809,7 +1223,7 @@ fn install_stopped_rebase(
     poll_cancel(progress, cancel).map_err(map_lib)?;
     let effective_onto = request.onto.unwrap_or(request.upstream);
     let fork = super::rebase::rebase_fork(repo, request.upstream, request.branch_tip)?;
-    let persisted = state_from_partial(
+    let mut persisted = state_from_partial(
         &partial,
         head_ref,
         orig_head,
@@ -820,6 +1234,7 @@ fn install_stopped_rebase(
         fork,
     );
     let conflict = partial.conflict;
+    persisted.stopped_head = Some(oid_hex(&conflict.replayed_parent));
     let done = persisted
         .done
         .iter()
@@ -830,14 +1245,23 @@ fn install_stopped_rebase(
         .iter()
         .map(|h| parse_oid(h))
         .collect::<Result<Vec<_>, _>>()?;
+    let git_progress = git_visible_rebase_progress(
+        repo,
+        fork,
+        request.branch_tip,
+        &rebase_opts.rewrite,
+        &done,
+        &remaining,
+        conflict.commit,
+    )?;
     write_git_rebase_merge_files(
         repo,
         head_ref,
         orig_head,
         effective_onto,
-        &done,
-        &remaining,
-        &conflict.commit,
+        &git_progress.done,
+        &git_progress.remaining,
+        git_progress.stop.as_ref(),
     )?;
     write_persisted_state(repo.git_dir(), &persisted)?;
 
@@ -853,10 +1277,13 @@ fn install_stopped_rebase(
     let mut progress = UncancellableProgress::new(progress);
     reset_index_worktree_to_head(repo, conflict.replayed_parent, &mut progress, &NeverCancel)?;
     let ours_tree = commit_tree(repo, conflict.replayed_parent)?;
+    let materialized =
+        materialized_merge_result_tree(repo.odb(), &conflict.merge).map_err(map_lib)?;
     apply_conflict_merge_worktree(
         repo,
         &ours_tree,
         &conflict.merge,
+        &materialized,
         &mut progress,
         &NeverCancel,
     )
@@ -916,6 +1343,20 @@ fn advance_after_plan(
             // The refs already moved: finish the rebase even if a cancel arrives now.
             reset_index_worktree_to_head(repo, branch_tip, &mut NullProgress, &NeverCancel)?;
             applied.head = branch_tip;
+            if let Some(operation) = apply.record_operation.as_deref() {
+                let head_old_tree = commit_tree(repo, prev.orig_head)?;
+                let head_new_tree = commit_tree(repo, branch_tip)?;
+                let record = HistoryLastRecord {
+                    operation: operation.into(),
+                    head_ref: Some(prev.head_ref.clone()),
+                    head_old_commit: Some(prev.orig_head),
+                    head_new_commit: Some(branch_tip),
+                    head_old_tree: Some(head_old_tree),
+                    head_new_tree: Some(head_new_tree),
+                    ref_updates: plan.ref_updates.clone(),
+                };
+                write_history_last(repo, &record, None)?;
+            }
             clear_rebase_state(repo.git_dir())?;
             if apply.hooks.enabled()
                 && run_post_rewrite(repo, RewriteKind::Rebase, &plan.rewritten_pairs())
@@ -950,6 +1391,53 @@ fn advance_after_plan(
     }
 }
 
+struct GitVisibleRebaseProgress {
+    done: Vec<ObjectId>,
+    remaining: Vec<ObjectId>,
+    stop: Option<ObjectId>,
+}
+
+/// Commits written to Git's `rebase-merge/` files for cross-tool `--continue`.
+///
+/// Grit's full replay order can include stacked-branch commits when
+/// [`RefScope::Branches`](super::types::RefScope::Branches) is active; Git must only see the
+/// rebased branch's own range so `git rebase --continue` finishes on that branch's tip.
+fn git_visible_rebase_progress(
+    repo: &Repository,
+    fork: ObjectId,
+    branch_tip: ObjectId,
+    rewrite: &RewriteOptions,
+    done: &[ObjectId],
+    remaining: &[ObjectId],
+    conflict: ObjectId,
+) -> Result<GitVisibleRebaseProgress, RebaseSessionError> {
+    if matches!(rewrite.scope, RefScope::Head) {
+        return Ok(GitVisibleRebaseProgress {
+            done: done.to_vec(),
+            remaining: remaining.to_vec(),
+            stop: Some(conflict),
+        });
+    }
+    let primary = commits_in_rebase_range(repo, fork, &[branch_tip])?;
+    let primary_set: HashSet<ObjectId> = primary.iter().copied().collect();
+    let git_done: Vec<ObjectId> = done
+        .iter()
+        .copied()
+        .filter(|oid| primary_set.contains(oid))
+        .collect();
+    let git_remaining: Vec<ObjectId> = remaining
+        .iter()
+        .copied()
+        .filter(|oid| primary_set.contains(oid))
+        .collect();
+    let git_stop = primary_set.contains(&conflict).then_some(conflict);
+    Ok(GitVisibleRebaseProgress {
+        done: git_done,
+        remaining: git_remaining,
+        stop: git_stop,
+    })
+}
+
 fn write_git_rebase_merge_files(
     repo: &Repository,
     head_ref: &str,
@@ -957,17 +1445,18 @@ fn write_git_rebase_merge_files(
     onto: ObjectId,
     done: &[ObjectId],
     remaining: &[ObjectId],
-    current: &ObjectId,
+    current: Option<&ObjectId>,
 ) -> Result<(), RebaseSessionError> {
     let dir = repo.git_dir().join("rebase-merge");
     fs::create_dir_all(&dir).map_err(map_lib)?;
     fs::write(dir.join("head-name"), format!("{head_ref}\n")).map_err(map_lib)?;
     fs::write(dir.join("onto"), format!("{}\n", onto.to_hex())).map_err(map_lib)?;
     fs::write(dir.join("orig-head"), format!("{}\n", orig_head.to_hex())).map_err(map_lib)?;
-    let todo_remaining: Vec<ObjectId> = if remaining.first() == Some(current) {
-        remaining.iter().skip(1).copied().collect()
-    } else {
-        remaining.to_vec()
+    let todo_remaining: Vec<ObjectId> = match current {
+        Some(current) if remaining.first() == Some(current) => {
+            remaining.iter().skip(1).copied().collect()
+        }
+        _ => remaining.to_vec(),
     };
     fs::write(
         dir.join("git-rebase-todo"),
@@ -976,24 +1465,28 @@ fn write_git_rebase_merge_files(
     .map_err(map_lib)?;
     // Git lists the stopped pick as the last `done` line and resumes from `stopped-sha`,
     // committing the staged resolution with `message` and `author-script`.
-    let done_with_current: Vec<ObjectId> = done.iter().chain([current]).copied().collect();
+    let done_with_current: Vec<ObjectId> = match current {
+        Some(current) => done.iter().chain([current]).copied().collect(),
+        None => done.to_vec(),
+    };
     fs::write(dir.join("done"), todo_lines(repo, &done_with_current)?).map_err(map_lib)?;
-    let msgnum = done.len() + 1;
-    let end = done.len() + remaining.len();
+    let msgnum = done_with_current.len();
+    let end = done_with_current.len() + todo_remaining.len();
     fs::write(dir.join("msgnum"), format!("{msgnum}\n")).map_err(map_lib)?;
     fs::write(dir.join("end"), format!("{end}\n")).map_err(map_lib)?;
-    fs::write(dir.join("stopped-sha"), format!("{}\n", current.to_hex())).map_err(map_lib)?;
-    let commit = load_commit(repo, *current)?;
-    match author_script(&commit.author) {
-        Some(script) => fs::write(dir.join("author-script"), script).map_err(map_lib)?,
-        None => remove_if_exists(&dir.join("author-script"))?,
+    if let Some(current) = current {
+        fs::write(dir.join("stopped-sha"), format!("{}\n", current.to_hex())).map_err(map_lib)?;
+        let commit = load_commit(repo, *current)?;
+        match author_script(&commit.author) {
+            Some(script) => fs::write(dir.join("author-script"), script).map_err(map_lib)?,
+            None => remove_if_exists(&dir.join("author-script"))?,
+        }
+        fs::write(dir.join("message"), commit.message).map_err(map_lib)?;
+    } else {
+        remove_if_exists(&dir.join("stopped-sha"))?;
+        remove_if_exists(&dir.join("author-script"))?;
+        remove_if_exists(&dir.join("message"))?;
     }
-    fs::write(dir.join("message"), commit.message).map_err(map_lib)?;
-    fs::write(
-        repo.git_dir().join("ORIG_HEAD"),
-        format!("{}\n", orig_head.to_hex()),
-    )
-    .map_err(map_lib)?;
     Ok(())
 }
 
@@ -1026,12 +1519,7 @@ fn author_script(author: &str) -> Option<String> {
 }
 
 pub(super) fn clear_rebase_state(git_dir: &Path) -> Result<(), RebaseSessionError> {
-    for name in ["ORIG_HEAD", "MERGE_MSG"] {
-        let path = git_dir.join(name);
-        if path.exists() {
-            fs::remove_file(&path).map_err(map_lib)?;
-        }
-    }
+    remove_if_exists(&git_dir.join("MERGE_MSG"))?;
     let dir = git_dir.join("rebase-merge");
     if dir.is_dir() {
         fs::remove_dir_all(&dir).map_err(map_lib)?;
@@ -1085,15 +1573,29 @@ fn reset_index_worktree_to_head(
     Ok(())
 }
 
+/// Re-attach `HEAD` to `refname` and hard-reset it to `target`, reporting the tip it had
+/// when that was not `target`.
 fn hard_reset_branch(
     repo: &Repository,
     refname: &str,
     target: ObjectId,
     identity: &crate::ident::Signature,
-) -> Result<(), RebaseSessionError> {
+) -> Result<RebaseAbort, RebaseSessionError> {
+    let before = repo
+        .references()
+        .resolve_if_exists(refname)
+        .map_err(map_lib)?;
     refs::write_symbolic_ref_on_store(repo.refs(), repo.git_dir(), "HEAD", refname)
         .map_err(map_lib)?;
-    hard_reset_head(repo, target, identity)
+    hard_reset_head(repo, target, identity)?;
+    let overwritten = (before != Some(target)).then(|| PlannedRefUpdate {
+        name: refname.to_owned(),
+        old: before.unwrap_or_else(crate::diff::zero_oid),
+        new: target,
+    });
+    Ok(RebaseAbort {
+        overwritten: overwritten.into_iter().collect(),
+    })
 }
 
 fn hard_reset_head(

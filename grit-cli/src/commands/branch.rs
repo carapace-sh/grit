@@ -13,7 +13,11 @@ use grit_lib::refs::branch_tracking::{
 use grit_lib::refs::listing::{RefQuery, RefSort, SortKey};
 use grit_lib::repo::Repository;
 use grit_lib::revwalk::rev_parse::resolve_revision;
-use grit_lib::state::{resolve_head, resolve_head_for_repository, HeadState};
+use grit_lib::revwalk::rev_parse_error::RevParseError;
+use grit_lib::state::{
+    operation_blocking_switch, resolve_head, resolve_head_for_repository, wt_status_get_state,
+    HeadState, InProgressOperation,
+};
 use schemars::JsonSchema;
 use serde::Serialize;
 use std::error::Error as StdError;
@@ -513,20 +517,45 @@ fn resolve_rename(
         return Ok(None);
     };
     let current = current_branch_short(repo).ok();
-    Ok(Some(match args.len() {
+    let parsed = match args.len() {
         1 => {
             let old = if let Some(name) = &opts.name {
                 name.clone()
+            } else if let Some(name) = current {
+                name
+            } else if let Some(op) = operation_blocking_switch(repo.git_dir())? {
+                return Err(json_error::operation_in_progress_for_repo(
+                    repo,
+                    "rename the branch",
+                    op,
+                ));
             } else {
-                current.ok_or_else(|| {
-                    anyhow::anyhow!("branch name required when HEAD is not on a branch")
-                })?
+                bail!("branch name required when HEAD is not on a branch");
             };
             (old, args[0].clone(), force)
         }
         2 => (args[0].clone(), args[1].clone(), force),
         _ => bail!("`--move` expects one or two branch names"),
-    }))
+    };
+    if let Some(op) = operation_blocking_switch(repo.git_dir())? {
+        if matches!(
+            op,
+            InProgressOperation::Rebase | InProgressOperation::RebaseInteractive
+        ) && rebase_branch_short_name(repo)? == Some(parsed.0.clone())
+        {
+            return Err(json_error::operation_in_progress_for_repo(
+                repo,
+                "rename the branch",
+                op,
+            ));
+        }
+    }
+    Ok(Some(parsed))
+}
+
+fn rebase_branch_short_name(repo: &Repository) -> Result<Option<String>> {
+    let state = wt_status_get_state(repo.git_dir(), &HeadState::Invalid, false)?;
+    Ok(state.rebase_branch)
 }
 
 fn list(repo: &Repository, opts: &BranchRunOptions) -> Result<BranchOutcome> {
@@ -677,6 +706,22 @@ fn track_mode(opts: &BranchRunOptions) -> TrackMode {
     }
 }
 
+fn map_create_start_revision_error(rev: &str, err: Error) -> AnyhowError {
+    use grit_lib::porcelain::branch::BranchError;
+    match err {
+        Error::RevParse(
+            RevParseError::InvalidObjectName { .. } | RevParseError::AmbiguousArgument { .. },
+        )
+        | Error::ObjectNotFound(_) => {
+            map_branch_error(Error::Branch(BranchError::InvalidStartPoint {
+                label: rev.to_owned(),
+                reason: "revision not found".into(),
+            }))
+        }
+        other => map_branch_error(other),
+    }
+}
+
 fn create(
     repo: &Repository,
     name: &str,
@@ -684,7 +729,8 @@ fn create(
     opts: &BranchRunOptions,
 ) -> Result<BranchOutcome> {
     let start_point = if let Some(rev) = start {
-        let oid = resolve_revision(repo, rev).map_err(map_branch_error)?;
+        let oid =
+            resolve_revision(repo, rev).map_err(|err| map_create_start_revision_error(rev, err))?;
         Some(StartPoint {
             oid,
             label: rev.to_owned(),

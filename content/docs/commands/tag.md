@@ -57,7 +57,8 @@ Tags are local until you publish them with [`grit push --tags`](../push/). Delet
 | `--points-at` | Only tags pointing at `REV` (repeatable). |
 | `-n`, `--limit` | Maximum number of tags to print. |
 | `-d`, `--delete` | Delete the tag locally. |
-| `-m`, `--message` | Annotated tag message. |
+| `-a`, `--annotate` | Git habit for an annotated tag; ignored when `-m` or `-F` is set (those already create an annotated tag). Without a message, grit errors instead of opening an editor. |
+| `-m`, `--message` | Annotated tag message (repeatable; paragraphs are separated by a blank line, like Git). |
 | `-F`, `--message-file` | Read the annotated tag message from a file (`-` reads stdin). |
 | `--file` | Hidden alias for `--message-file` (deprecated; emits a one-time warning). |
 | `-f`, `--force` | Replace an existing tag with the same name. |
@@ -90,7 +91,7 @@ $ grit push --tags
   pushed --tags → origin refs/tags/v0.1
 
 $ grit push --delete v0.1
-  pushed --delete → origin refs/tags/v0.1
+  deleted v0.1 from origin
 
 $ grit tag -d v0.1
 Deleted tag v0.1

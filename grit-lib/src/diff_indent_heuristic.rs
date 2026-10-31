@@ -22,19 +22,37 @@ const INDENT_HEURISTIC_MAX_SLIDING: isize = 100;
 
 #[derive(Clone)]
 struct XdFile<'a> {
+    /// Line bodies, used to measure indentation.
     lines: &'a [&'a str],
+    /// Records compared when sliding, one per line. Unlike `lines`, these must tell a final line
+    /// without a newline apart from the same text with one.
+    keys: &'a [&'a str],
+    /// Dense interned compare keys; avoids memcmp on long repeated lines when present.
+    compare_ids: Option<&'a [u32]>,
     /// `changed[i]` matches Git's `xdf->changed`: length `nrec + 1`, last entry always false.
-    changed: Vec<bool>,
+    changed: Vec<u8>,
 }
 
 impl<'a> XdFile<'a> {
-    fn from_mask(lines: &'a [&'a str], mut changed: Vec<bool>) -> Self {
+    fn from_mask(
+        lines: &'a [&'a str],
+        keys: &'a [&'a str],
+        compare_ids: Option<&'a [u32]>,
+        mut changed: Vec<bool>,
+    ) -> Self {
+        debug_assert_eq!(lines.len(), keys.len());
         let n = lines.len();
         changed.resize(n + 1, false);
         if !changed.is_empty() {
             changed[n] = false;
         }
-        Self { lines, changed }
+        let changed = changed.into_iter().map(u8::from).collect();
+        Self {
+            lines,
+            keys,
+            compare_ids,
+            changed,
+        }
     }
 
     fn nrec(&self) -> usize {
@@ -49,20 +67,18 @@ impl<'a> XdFile<'a> {
         if u >= self.changed.len() {
             return false;
         }
-        self.changed[u]
+        self.changed[u] != 0
     }
 
     fn set_changed(&mut self, i: usize, v: bool) {
         if i < self.changed.len() {
-            self.changed[i] = v;
+            self.changed[i] = u8::from(v);
         }
     }
 
     fn into_changed(self) -> Vec<bool> {
         let n = self.lines.len();
-        let mut c = self.changed;
-        c.truncate(n);
-        c
+        self.changed.into_iter().take(n).map(|b| b != 0).collect()
     }
 }
 
@@ -256,9 +272,11 @@ fn recs_match(xdf: &XdFile<'_>, i: isize, j: isize, ws: WhitespaceMode) -> bool 
         return false;
     }
     if ws.normalizes_line_compare() {
-        ws.normalize_line_for_compare(xdf.lines[ui]) == ws.normalize_line_for_compare(xdf.lines[uj])
+        ws.normalize_line_for_compare(xdf.keys[ui]) == ws.normalize_line_for_compare(xdf.keys[uj])
+    } else if let Some(ids) = xdf.compare_ids {
+        ids[ui] == ids[uj]
     } else {
-        xdf.lines[ui] == xdf.lines[uj]
+        xdf.keys[ui] == xdf.keys[uj]
     }
 }
 
@@ -305,8 +323,8 @@ fn apply_myers_rediff_region(
     if o_start >= o_end && n_start >= n_end {
         return;
     }
-    let old_slice = &xdf.lines[o_start..o_end];
-    let new_slice = &xdfo.lines[n_start..n_end];
+    let old_slice = &xdf.keys[o_start..o_end];
+    let new_slice = &xdfo.keys[n_start..n_end];
     let (sub_old, sub_new) =
         crate::diff::myers_rediff_changed_masks_for_region(old_slice, new_slice, ws);
     for (i, changed) in sub_old.iter().enumerate() {
@@ -446,9 +464,31 @@ fn apply_indent_heuristic_shift(
     }
 }
 
+/// One side of a diff as the compactor sees it: bodies for indent scoring, keys for matching.
+#[derive(Clone, Copy)]
+pub(crate) struct CompactSide<'a> {
+    /// Line bodies without line terminators.
+    pub(crate) lines: &'a [&'a str],
+    /// Compare records, one per line; equal keys mean equal lines.
+    pub(crate) keys: &'a [&'a str],
+    /// Optional interned ids parallel to `keys` for fast equality.
+    pub(crate) compare_ids: Option<&'a [u32]>,
+}
+
+impl<'a> CompactSide<'a> {
+    /// A side whose bodies double as compare keys (no newline-at-EOF distinction).
+    fn bodies(lines: &'a [&'a str]) -> Self {
+        Self {
+            lines,
+            keys: lines,
+            compare_ids: None,
+        }
+    }
+}
+
 fn change_compact_both_passes(
-    old_lines: &[&str],
-    new_lines: &[&str],
+    old: CompactSide<'_>,
+    new: CompactSide<'_>,
     changed_old: &mut Vec<bool>,
     changed_new: &mut Vec<bool>,
     indent_heuristic: bool,
@@ -457,15 +497,25 @@ fn change_compact_both_passes(
 ) {
     let c_old = std::mem::take(changed_old);
     let c_new = std::mem::take(changed_new);
-    let mut xdf = XdFile::from_mask(old_lines, c_old);
-    let mut xdfo = XdFile::from_mask(new_lines, c_new);
+    let mut xdf = XdFile::from_mask(old.lines, old.keys, old.compare_ids, c_old);
+    let mut xdfo = XdFile::from_mask(new.lines, new.keys, new.compare_ids, c_new);
 
     change_compact_one(&mut xdf, &mut xdfo, indent_heuristic, ws, histogram_rediff);
     *changed_old = xdf.into_changed();
     *changed_new = xdfo.into_changed();
 
-    let mut xdf2 = XdFile::from_mask(new_lines, std::mem::take(changed_new));
-    let mut xdfo2 = XdFile::from_mask(old_lines, std::mem::take(changed_old));
+    let mut xdf2 = XdFile::from_mask(
+        new.lines,
+        new.keys,
+        new.compare_ids,
+        std::mem::take(changed_new),
+    );
+    let mut xdfo2 = XdFile::from_mask(
+        old.lines,
+        old.keys,
+        old.compare_ids,
+        std::mem::take(changed_old),
+    );
     change_compact_one(
         &mut xdf2,
         &mut xdfo2,
@@ -596,27 +646,27 @@ fn ops_from_masks(old_lines: &[&str], new_lines: &[&str], c1: &[bool], c2: &[boo
 
 /// Compact Git xdiff `changed` masks (one flag per line on each side) and return the ops.
 ///
-/// Same result as converting the masks to ops and calling [`apply_change_compact_to_ops`], without
-/// the round trip.
+/// Groups slide only across lines whose keys are equal, so `}` at EOF without a newline never
+/// trades places with a `}\n` the way it would if bodies were compared.
 pub(crate) fn apply_change_compact_to_masks(
     mut changed_old: Vec<bool>,
     mut changed_new: Vec<bool>,
-    old_lines: &[&str],
-    new_lines: &[&str],
+    old: CompactSide<'_>,
+    new: CompactSide<'_>,
     indent_heuristic: bool,
 ) -> Vec<DiffOp> {
-    changed_old.resize(old_lines.len(), false);
-    changed_new.resize(new_lines.len(), false);
+    changed_old.resize(old.lines.len(), false);
+    changed_new.resize(new.lines.len(), false);
     change_compact_both_passes(
-        old_lines,
-        new_lines,
+        old,
+        new,
         &mut changed_old,
         &mut changed_new,
         indent_heuristic,
         WhitespaceMode::default(),
         false,
     );
-    ops_from_masks(old_lines, new_lines, &changed_old, &changed_new)
+    ops_from_masks(old.lines, new.lines, &changed_old, &changed_new)
 }
 
 /// Apply Git `xdl_change_compact` twice (old/new), optionally with `XDF_INDENT_HEURISTIC`.
@@ -645,34 +695,35 @@ pub fn apply_change_compact_to_ops_with_ws(
 ) -> Vec<DiffOp> {
     apply_change_compact_to_ops_with_ws_histogram(
         ops,
-        old_lines,
-        new_lines,
+        CompactSide::bodies(old_lines),
+        CompactSide::bodies(new_lines),
         indent_heuristic,
         ws,
         false,
     )
 }
 
-/// Like [`apply_change_compact_to_ops_with_ws`], with Git 2.55+ histogram merged-group rediff.
-pub fn apply_change_compact_to_ops_with_ws_histogram(
+/// Like [`apply_change_compact_to_ops_with_ws`] over separate bodies and compare keys, optionally
+/// with Git 2.55+ histogram merged-group rediff.
+pub(crate) fn apply_change_compact_to_ops_with_ws_histogram(
     ops: &[DiffOp],
-    old_lines: &[&str],
-    new_lines: &[&str],
+    old: CompactSide<'_>,
+    new: CompactSide<'_>,
     indent_heuristic: bool,
     ws: WhitespaceMode,
     histogram_rediff: bool,
 ) -> Vec<DiffOp> {
-    let (mut c1, mut c2) = masks_from_ops(ops, old_lines.len(), new_lines.len());
+    let (mut c1, mut c2) = masks_from_ops(ops, old.lines.len(), new.lines.len());
     change_compact_both_passes(
-        old_lines,
-        new_lines,
+        old,
+        new,
         &mut c1,
         &mut c2,
         indent_heuristic,
         ws,
         histogram_rediff,
     );
-    ops_from_masks(old_lines, new_lines, &c1, &c2)
+    ops_from_masks(old.lines, new.lines, &c1, &c2)
 }
 
 /// Line-diff then Git-style compaction; used by unified diff generation.

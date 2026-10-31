@@ -77,12 +77,19 @@ pub enum ErrorKind {
     /// A checkout stopped part way and could not put some worktree paths back (`paths`);
     /// `HEAD` and the index are unchanged.
     CheckoutIncomplete,
+    /// `grit clone` fetched every object and set up the refs, but checking out the work
+    /// tree failed (for example a partial clone could not fetch its blobs). The repository
+    /// is kept (`clone_checkout`).
+    CloneCheckoutFailed,
     /// Git directory I/O failed on a named path under `.git/` (`paths`, often one entry).
     GitDirPathIo,
     /// Index-only commit while the work tree has unstaged or untracked changes.
     NothingStaged,
     /// Genuinely nothing to commit (clean tree or auto-stage cancel-out).
     NothingToCommit,
+    /// `HEAD` is on a GitButler workspace, which GitButler rewrites; commit with `but commit`.
+    #[serde(rename = "gitbutler_workspace")]
+    GitButlerWorkspace,
 }
 
 impl ErrorKind {
@@ -142,9 +149,11 @@ impl ErrorKind {
             Self::DirtyWorktree,
             Self::WorktreePathIo,
             Self::CheckoutIncomplete,
+            Self::CloneCheckoutFailed,
             Self::GitDirPathIo,
             Self::NothingStaged,
             Self::NothingToCommit,
+            Self::GitButlerWorkspace,
         ]
     }
 }

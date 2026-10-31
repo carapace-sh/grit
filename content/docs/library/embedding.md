@@ -93,7 +93,7 @@ The feature covers [`StatusModel`](rustdoc:grit_lib::porcelain::status::StatusMo
 | [`ObjectId`](rustdoc:grit_lib::objects::ObjectId), [`ChangeId`](rustdoc:grit_lib::change_id::ChangeId) | hex string |
 | [`FileMode`](rustdoc:grit_lib::objects::FileMode) | octal string such as `"100644"`; `"000000"` for the missing side of an add or delete |
 | [`Signature`](rustdoc:grit_lib::ident::Signature) | `{"name", "email", "date"}`, with `date` in RFC 3339 keeping the recorded offset |
-| [`Error`](rustdoc:grit_lib::error::Error) | `{"kind", "message"}`, where `kind` is [`Error::kind_name`](rustdoc:grit_lib::error::Error::kind_name) |
+| [`Error`](rustdoc:grit_lib::error::Error) | Always `kind` and `message` ([`Error::kind_name`](rustdoc:grit_lib::error::Error::kind_name)). Selected variants also expose structured fields: `LockHeld` → `path`, optional `holder` `{pid, running}`; `WouldOverwrite` → `reason`, `paths`; `StashCouldNotRestoreUntracked` → `path`; `DirtyWorktree` → `operation`, `paths`; `UnmergedConflictMarkers` → `paths` |
 | enums | snake_case variant names (`"type_changed"`, `"merge"`); hook names use Git's spelling (`"pre-commit"`) |
 
 `LoadedCommit` holds typed author and committer signatures. A commit whose identity line has a malformed date still loads, with the Unix epoch as its date, the way `git log` shows it ([`Signature::from_header_lossy`](rustdoc:grit_lib::ident::Signature::from_header_lossy)).
@@ -121,19 +121,59 @@ cargo run -p grit-examples --bin guide_embedding
 [`blame_file`](rustdoc:grit_lib::blame::blame_file),
 [`compute_blame`](rustdoc:grit_lib::blame::compute_blame), and
 [`resolve_blame_line_range`](rustdoc:grit_lib::blame::resolve_blame_line_range)
-accept the reversible path strings returned by library status. Pass status paths
-unchanged. For a raw byte path, build the input with
-`repo_relpath::storage_string`. Ordinary UTF-8
-paths remain readable; non-UTF-8 paths and names beginning with the reserved
-`grit+pathhex:` prefix are escaped. Encoded inputs identify repository-relative
-paths without applying the caller's working-directory prefix. For `blame_file`
-and `resolve_blame_line_range`, ordinary UTF-8 operands are normalized against
-the working directory before storage escaping, so
-`./grit+pathhex:6162` (or `../grit+pathhex:6162` from a subdirectory)
-addresses that literal filename rather than the file `ab`.
+take **repository-relative** paths: the same string names the same file no matter
+where the host process is running. Pass status paths unchanged. For a raw byte
+path, build the input with `repo_relpath::storage_string`. Non-UTF-8 paths and
+names beginning with the reserved `grit+pathhex:` prefix are escaped. Absolute
+paths under the work tree and `./` / `../` segments normalize against the
+work-tree root. To turn command-line operands into that form (cwd-relative, like
+`git blame`), resolve each path with
+[`Repository::resolve_worktree_pathspec`](rustdoc:grit_lib::repo::Repository::resolve_worktree_pathspec)
+using [`Repository::pathspec_argv_prefix`](rustdoc:grit_lib::repo::Repository::pathspec_argv_prefix)
+before calling blame APIs.
 
 Every blame `original_path`, including hunks and rename/copy origins, uses that
 same storage representation. Recover its exact bytes with
 `repo_relpath::storage_bytes`. Decode once:
 a literal filename that itself resembles an encoded path is a separate file.
 Line ranges and Git-written changed-path Bloom filters use the decoded path too.
+
+### Blaming uncommitted content
+
+By default `blame_file` blames the file as committed at
+[`BlameOptions::start`](rustdoc:grit_lib::blame::BlameOptions::start) (or
+`HEAD`). Set
+[`BlameOptions::final_source`](rustdoc:grit_lib::blame::BlameOptions::final_source)
+to [`BlameFinalSource::Worktree`](rustdoc:grit_lib::blame::BlameFinalSource::Worktree)
+to blame the working-tree file, or to
+[`BlameFinalSource::Contents`](rustdoc:grit_lib::blame::BlameFinalSource::Contents)
+with an editor buffer's bytes. The content is blamed as a commit on top of the
+start revision (plus any `MERGE_HEAD` commits), so returned line numbers match
+the buffer. Lines that exist only in that content have
+[`BlameAttributedLine::not_committed`](rustdoc:grit_lib::blame::BlameAttributedLine::not_committed)
+set and the null object id as `commit`; their
+[`BlameCommitInfo`](rustdoc:grit_lib::blame::BlameCommitInfo) carries
+[`BlameOptions::now`](rustdoc:grit_lib::blame::BlameOptions::now) as the author
+time, with the labels left to the caller. Resolve `-L` specs against the same
+text with
+[`resolve_blame_line_range_with_options`](rustdoc:grit_lib::blame::resolve_blame_line_range_with_options).
+Nothing is written to the object database.
+
+```rust
+use grit_lib::blame::{blame_file, BlameFinalSource, BlameOptions};
+
+# fn editor(repo: &grit_lib::repo::Repository, buffer: Vec<u8>) -> grit_lib::error::Result<()> {
+let result = blame_file(
+    repo,
+    "src/main.rs",
+    &BlameOptions {
+        final_source: BlameFinalSource::Contents(buffer),
+        ..BlameOptions::default()
+    },
+)?;
+for line in result.lines.iter().filter(|line| line.not_committed) {
+    println!("unsaved or uncommitted: {}", line.content);
+}
+# Ok(())
+# }
+```

@@ -13,12 +13,14 @@ use crate::ewah_bitmap::Bitmap;
 use crate::midx::{read_midx_btmp_ranges, read_midx_pack_idx_names, read_midx_preferred_idx_name};
 use crate::objects::ObjectId;
 use crate::pack::{
-    pack_entry_raw_end, parse_pack_object_header, read_local_pack_indexes_cached,
-    read_pack_bytes_cached, read_packed_delta_dependency, PackedDeltaDependency, PackedType,
+    parse_pack_object_header, read_local_pack_indexes_cached, read_pack_bytes_cached,
+    read_packed_delta_dependency, PackedDeltaDependency, PackedType,
 };
 use crate::pack_index::PackIndex;
 use crate::pack_map::PackData;
-use crate::pack_object_select::try_bitmap_reachable_for_upload;
+use crate::pack_object_select::{
+    included_tag_chains, try_bitmap_reachable_for_upload, TagCandidate,
+};
 use crate::pack_objects::{write_delta_pack_stream, PackBuildOptions, PackProgress, PackStats};
 use crate::repo::Repository;
 use crate::rev_list::ObjectFilter;
@@ -92,12 +94,13 @@ impl StreamingReuse {
             .is_some_and(|pos| self.reuse_bits.get(pos as usize))
     }
 
-    /// Emit a whole packed object when marked reusable.
-    pub(crate) fn try_emit_whole(
+    /// Stream a whole packed object to `w` when marked reusable.
+    pub(crate) fn try_write_whole(
         &mut self,
+        w: &mut dyn Write,
         oid: &ObjectId,
         opts: &PackBuildOptions,
-    ) -> Result<Option<Vec<u8>>> {
+    ) -> Result<Option<u64>> {
         if !opts.reuse_objects || !self.marks_reuse(oid) {
             return Ok(None);
         }
@@ -108,14 +111,13 @@ impl StreamingReuse {
             .parent()
             .and_then(|p| p.parent())
             .ok_or_else(|| Error::CorruptObject("pack path layout".to_owned()))?;
-        let mut out = Vec::new();
-        match write_whole_reused(&mut out, objects_dir, oid, opts) {
-            Ok(n) => {
-                self.note_verbatim(n);
-            }
-            Err(_) => return Ok(None),
+        let Some((bytes, start, end)) = crate::pack::packed_full_object_range(objects_dir, oid)?
+        else {
+            return Ok(None);
         };
-        Ok(Some(out))
+        let n = write_whole_reused(w, &bytes[start..end])?;
+        self.note_verbatim(n);
+        Ok(Some(n))
     }
 }
 
@@ -134,14 +136,50 @@ pub fn try_write_streaming_pack(
     progress: &mut dyn FnMut(PackProgress),
     w: &mut dyn Write,
 ) -> Result<Option<PackStats>> {
+    try_write_streaming_pack_including_tags(
+        repo,
+        wants,
+        haves,
+        source_shallow,
+        have_shallow,
+        filter,
+        &[],
+        opts,
+        progress,
+        w,
+        &crate::progress::CancelSignal::never(),
+    )
+}
+
+/// [`try_write_streaming_pack`] that also packs each of `include_tags` whose peeled
+/// object the bitmap send set holds (`include-tag`).
+///
+/// Added tags are planned like any object outside the reuse bitmap, so they are
+/// written whole and never duplicate an object the client asked for.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_write_streaming_pack_including_tags(
+    repo: &Repository,
+    wants: &[ObjectId],
+    haves: &[ObjectId],
+    source_shallow: &HashSet<ObjectId>,
+    have_shallow: &HashSet<ObjectId>,
+    filter: Option<&ObjectFilter>,
+    include_tags: &[TagCandidate],
+    opts: &PackBuildOptions,
+    progress: &mut dyn FnMut(PackProgress),
+    w: &mut dyn Write,
+    stop: &crate::progress::CancelSignal<'_>,
+) -> Result<Option<PackStats>> {
     if !source_shallow.is_empty() || !have_shallow.is_empty() {
         return Ok(None);
     }
+    stop.poll()?;
     let Some((send_set, peer_held)) =
         try_bitmap_reachable_for_upload(repo.odb(), wants, haves, filter, source_shallow)?
     else {
         return Ok(None);
     };
+    stop.poll()?;
     let have_tips: HashSet<ObjectId> = haves.iter().copied().collect();
     let index = send_set.bitmap_index();
     let objects_dir = repo.odb().objects_dir();
@@ -152,7 +190,10 @@ pub fn try_write_streaming_pack(
     let Some(pack) = packs.into_iter().next() else {
         return Ok(None);
     };
-    let send: Vec<ObjectId> = send_set.iter_grouped_by_kind().collect();
+    let mut send: Vec<ObjectId> = send_set.iter_grouped_by_kind().collect();
+    send.extend(included_tag_chains(repo.odb(), include_tags, |oid| {
+        send_set.contains(oid)
+    })?);
     progress(PackProgress::Enumerated { total: send.len() });
 
     let send_bits = send_set.reuse_send_bits();
@@ -168,8 +209,10 @@ pub fn try_write_streaming_pack(
         opts,
         &blob_name_hashes,
         None,
+        stop,
     )?;
     progress(PackProgress::PlannedDeltas);
+    stop.poll()?;
 
     let mut reuse = StreamingReuse::new(pack, reuse_bits, &send_set);
     let stats = write_delta_pack_stream(repo.odb(), &plan, opts, w, Some(&mut reuse))?;
@@ -306,7 +349,7 @@ fn compute_reuse_bits(
             let Some(entry_off) = pack.idx.find_offset(&oid)? else {
                 continue;
             };
-            if !entry_crc_ok(&pack.idx, pack_bytes, entry_off)? {
+            if !entry_crc_ok(&pack.idx, &pack.pack_bytes, entry_off)? {
                 continue;
             }
             let mut p = entry_off as usize;
@@ -354,15 +397,12 @@ fn compute_reuse_bits(
     Ok(reuse)
 }
 
-fn entry_crc_ok(idx: &PackIndex, pack_bytes: &[u8], entry_off: u64) -> Result<bool> {
-    let Some(end) = pack_entry_raw_end(idx, pack_bytes, entry_off)? else {
-        return Ok(false);
-    };
-    let slice = &pack_bytes[entry_off as usize..end];
-    match idx.crc32_for_pack_offset(entry_off)? {
-        Some(crc) => Ok(crc32fast::hash(slice) == crc),
-        None => Ok(true),
-    }
+fn entry_crc_ok(
+    idx: &PackIndex,
+    pack_bytes: &crate::pack::PackData,
+    entry_off: u64,
+) -> Result<bool> {
+    crate::pack::packed_entry_matches_index_crc(idx, pack_bytes, entry_off)
 }
 
 fn delta_base_oid(
@@ -386,19 +426,9 @@ fn delta_base_oid(
     }))
 }
 
-fn write_whole_reused(
-    w: &mut dyn Write,
-    objects_dir: &Path,
-    oid: &ObjectId,
-    opts: &PackBuildOptions,
-) -> Result<u64> {
-    if opts.reuse_objects {
-        if let Some(raw) = crate::pack::packed_full_object_slice(objects_dir, oid)? {
-            w.write_all(&raw).map_err(Error::Io)?;
-            return Ok(raw.len() as u64);
-        }
+fn write_whole_reused(w: &mut dyn Write, entry: &[u8]) -> Result<u64> {
+    for chunk in entry.chunks(64 * 1024) {
+        w.write_all(chunk).map_err(Error::Io)?;
     }
-    Err(Error::CorruptObject(
-        "expected reusable whole object in pack".to_owned(),
-    ))
+    Ok(entry.len() as u64)
 }

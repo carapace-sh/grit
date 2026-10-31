@@ -1541,6 +1541,12 @@ fn switch_dirty_gitlink_on_changing_gitlink_matches_git() {
         git_porcelain(root).contains("inner"),
         "porcelain must still report modified inner after grit switch"
     );
+    let ls_files = git(root, &["ls-files", "-s", "inner"]);
+    assert_eq!(
+        ls_files.split_whitespace().nth(1),
+        Some(sub2.as_str()),
+        "index gitlink must advance to the target like git, got:\n{ls_files}"
+    );
 }
 
 #[test]
@@ -1991,4 +1997,396 @@ fn switch_bulk_add_mod_delete_leaves_git_clean() {
         git_porcelain(tmp.path())
     );
     git_fsck(tmp.path());
+}
+
+/// Submodule upstream with commits `up1..up3`, and a superproject where `A` records `sub` at
+/// `up1` and `B` (also branch `tip-b`) at `up2`. `main` is reset back to `A` with `git reset
+/// --hard`, which leaves the submodule checkout at `up2`, then the submodule is moved to
+/// `sub_at` (one of the `up*` oids) and `sub/f` is made dirty when `dirty` is set.
+struct GitlinkAhead {
+    _tmp: tempfile::TempDir,
+    root: std::path::PathBuf,
+    up: [String; 3],
+}
+
+impl GitlinkAhead {
+    fn new(sub_at: usize, dirty: bool) -> Self {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let up_dir = tmp.path().join("up");
+        let root = tmp.path().join("main");
+        std::fs::create_dir_all(&up_dir).expect("mkdir up");
+        std::fs::create_dir_all(&root).expect("mkdir main");
+        git(&up_dir, &["init", "-q", "-b", "main"]);
+        let mut up: [String; 3] = Default::default();
+        for (i, slot) in up.iter_mut().enumerate() {
+            let body: String = (1..=i + 1).map(|n| format!("{n}\n")).collect();
+            std::fs::write(up_dir.join("f"), body).expect("write up f");
+            git(&up_dir, &["add", "f"]);
+            git(&up_dir, &["commit", "-qm", &format!("up{}", i + 1)]);
+            *slot = git(&up_dir, &["rev-parse", "HEAD"]).trim().to_owned();
+        }
+
+        git(&root, &["init", "-q", "-b", "main"]);
+        git(
+            &root,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                "../up",
+                "sub",
+            ],
+        );
+        let sub = root.join("sub");
+        git(&sub, &["checkout", "-q", &up[0]]);
+        git(&root, &["add", "sub"]);
+        git(&root, &["commit", "-qm", "A: sub at up1"]);
+        git(&sub, &["checkout", "-q", &up[1]]);
+        git(&root, &["add", "sub"]);
+        git(&root, &["commit", "-qm", "B: sub at up2"]);
+        git(&root, &["branch", "tip-b"]);
+        git(&root, &["reset", "-q", "--hard", "HEAD~1"]);
+
+        git(&sub, &["checkout", "-q", &up[sub_at]]);
+        if dirty {
+            std::fs::write(sub.join("f"), b"dirty\n").expect("dirty sub f");
+        }
+        Self {
+            _tmp: tmp,
+            root,
+            up,
+        }
+    }
+
+    fn repo(&self) -> Repository {
+        Repository::open(
+            &self.root.join(".git"),
+            &RepositoryOptions::empty().with_work_tree(&self.root),
+        )
+        .expect("open grit repo")
+    }
+
+    fn rev(&self, rev: &str) -> ObjectId {
+        ObjectId::from_hex(git(&self.root, &["rev-parse", rev]).trim()).expect("oid")
+    }
+
+    fn index_gitlink(&self) -> String {
+        let line = git(&self.root, &["ls-files", "-s", "sub"]);
+        line.split_whitespace()
+            .nth(1)
+            .expect("ls-files oid")
+            .to_owned()
+    }
+
+    fn head_gitlink(&self) -> String {
+        let line = git(&self.root, &["ls-tree", "HEAD", "sub"]);
+        line.split_whitespace()
+            .nth(2)
+            .expect("ls-tree oid")
+            .to_owned()
+    }
+
+    fn sub_head(&self) -> String {
+        git(&self.root.join("sub"), &["rev-parse", "HEAD"])
+            .trim()
+            .to_owned()
+    }
+
+    fn sub_file(&self) -> String {
+        std::fs::read_to_string(self.root.join("sub/f")).expect("read sub/f")
+    }
+
+    /// What system git leaves behind after the same transition: (`status --porcelain`,
+    /// index gitlink, submodule HEAD, `sub/f`).
+    fn observed(&self) -> (String, String, String, String) {
+        (
+            git_porcelain(&self.root),
+            self.index_gitlink(),
+            self.sub_head(),
+            self.sub_file(),
+        )
+    }
+
+    /// The index gitlink matches `HEAD`, and committing an unrelated file does not touch `sub`.
+    fn assert_index_follows_head(&self) {
+        assert_eq!(
+            self.index_gitlink(),
+            self.head_gitlink(),
+            "index gitlink must follow HEAD after the transition"
+        );
+        assert_eq!(self.head_gitlink(), self.up[1]);
+        let cached = git(&self.root, &["diff", "--cached", "--name-only"]);
+        assert!(
+            cached.trim().is_empty(),
+            "nothing may be staged after the transition, got:\n{cached}"
+        );
+        std::fs::write(self.root.join("n"), b"x\n").expect("write n");
+        git(&self.root, &["add", "n"]);
+        git(&self.root, &["commit", "-qm", "innocent"]);
+        let stat = git(&self.root, &["show", "--stat", "--format=%s", "HEAD"]);
+        assert!(
+            !stat
+                .lines()
+                .any(|line| line.trim_start().starts_with("sub ")),
+            "an unrelated commit must not revert the submodule bump, got:\n{stat}"
+        );
+        git_fsck(&self.root);
+    }
+}
+
+fn grit_switch_detach(repo: &Repository, commit: ObjectId) {
+    switch_repository(
+        repo,
+        &SwitchOptions {
+            mode: SwitchMode::Detached {
+                commit,
+                reflog_to_label: "tip-b".into(),
+            },
+            dry_run: false,
+            hooks: grit_lib::PostOperationHooks::Run,
+        },
+        &mut grit_lib::progress::NullProgress,
+        &grit_lib::progress::NeverCancel,
+    )
+    .expect("grit switch --detach tip-b");
+}
+
+/// The issue #2200 shapes: submodule checkout ahead of the old gitlink (at the target), behind
+/// it with dirty files, or at an unrelated third commit. Each transition must match system git.
+const GITLINK_DRIFT_CASES: [(usize, bool); 4] = [(1, false), (1, true), (0, true), (2, false)];
+
+#[test]
+fn switch_detach_advances_index_gitlink_when_submodule_ahead() {
+    let fixture = GitlinkAhead::new(1, false);
+    let repo = fixture.repo();
+    grit_switch_detach(&repo, fixture.rev("tip-b"));
+    assert_eq!(git_porcelain(&fixture.root), "");
+    assert_eq!(fixture.sub_head(), fixture.up[1]);
+    fixture.assert_index_follows_head();
+}
+
+#[test]
+fn switch_create_advances_index_gitlink_when_submodule_ahead() {
+    let fixture = GitlinkAhead::new(1, false);
+    let repo = fixture.repo();
+    switch_repository(
+        &repo,
+        &SwitchOptions {
+            mode: SwitchMode::Create {
+                branch: "x".into(),
+                start_oid: fixture.rev("tip-b"),
+                create_source_label: "tip-b".into(),
+                track_upstream: None,
+            },
+            dry_run: false,
+            hooks: grit_lib::PostOperationHooks::Run,
+        },
+        &mut grit_lib::progress::NullProgress,
+        &grit_lib::progress::NeverCancel,
+    )
+    .expect("grit switch -c x tip-b");
+    assert_eq!(git_porcelain(&fixture.root), "");
+    assert_eq!(fixture.sub_head(), fixture.up[1]);
+    fixture.assert_index_follows_head();
+}
+
+#[test]
+fn merge_fast_forward_advances_index_gitlink_when_submodule_ahead() {
+    let fixture = GitlinkAhead::new(1, false);
+    let repo = fixture.repo();
+    let outcome = grit_lib::porcelain::merge::integrate_branch(
+        &repo,
+        "refs/heads/main",
+        fixture.rev("HEAD"),
+        fixture.rev("tip-b"),
+        "tip-b",
+        &mut grit_lib::progress::NullProgress,
+        &grit_lib::progress::NeverCancel,
+    )
+    .expect("grit merge tip-b");
+    assert!(
+        matches!(
+            outcome,
+            grit_lib::porcelain::merge::IntegrateBranchOutcome::FastForward { .. }
+        ),
+        "expected a fast-forward"
+    );
+    assert_eq!(git_porcelain(&fixture.root), "");
+    assert_eq!(fixture.sub_head(), fixture.up[1]);
+    fixture.assert_index_follows_head();
+}
+
+#[test]
+fn switch_with_drifted_gitlink_matches_git() {
+    for (sub_at, dirty) in GITLINK_DRIFT_CASES {
+        let oracle = GitlinkAhead::new(sub_at, dirty);
+        git(&oracle.root, &["switch", "-q", "--detach", "tip-b"]);
+        let expected = oracle.observed();
+        assert_eq!(expected.1, oracle.up[1], "git advances the index gitlink");
+
+        let fixture = GitlinkAhead::new(sub_at, dirty);
+        let repo = fixture.repo();
+        grit_switch_detach(&repo, fixture.rev("tip-b"));
+        let (porcelain, index_oid, sub_head, sub_file) = fixture.observed();
+        assert_eq!(
+            index_oid,
+            fixture.up[1],
+            "submodule at up{} (dirty: {dirty}): index gitlink must advance to the target",
+            sub_at + 1
+        );
+        assert_eq!(
+            sub_head, fixture.up[sub_at],
+            "the submodule checkout is not moved"
+        );
+        assert_eq!(
+            (porcelain.as_str(), sub_file.as_str()),
+            (expected.0.as_str(), expected.3.as_str()),
+            "submodule at up{} (dirty: {dirty}): status and submodule files must match git",
+            sub_at + 1
+        );
+        assert_eq!(sub_head, expected.2);
+    }
+}
+
+#[test]
+fn merge_fast_forward_with_drifted_gitlink_matches_git() {
+    for (sub_at, dirty) in GITLINK_DRIFT_CASES {
+        let oracle = GitlinkAhead::new(sub_at, dirty);
+        git(&oracle.root, &["merge", "-q", "--ff-only", "tip-b"]);
+        let expected = oracle.observed();
+
+        let fixture = GitlinkAhead::new(sub_at, dirty);
+        let repo = fixture.repo();
+        grit_lib::porcelain::merge::integrate_branch(
+            &repo,
+            "refs/heads/main",
+            fixture.rev("HEAD"),
+            fixture.rev("tip-b"),
+            "tip-b",
+            &mut grit_lib::progress::NullProgress,
+            &grit_lib::progress::NeverCancel,
+        )
+        .expect("grit merge tip-b with drifted submodule");
+        let observed = fixture.observed();
+        assert_eq!(
+            (
+                observed.0.as_str(),
+                observed.1.as_str(),
+                observed.3.as_str()
+            ),
+            (
+                expected.0.as_str(),
+                expected.1.as_str(),
+                expected.3.as_str()
+            ),
+            "submodule at up{} (dirty: {dirty}): merge must leave what git leaves",
+            sub_at + 1
+        );
+        assert_eq!(
+            observed.2, fixture.up[sub_at],
+            "submodule checkout is not moved"
+        );
+    }
+}
+
+#[test]
+fn switch_refuses_staged_gitlink_that_differs_from_target_like_git() {
+    let oracle = GitlinkAhead::new(2, false);
+    git(&oracle.root, &["add", "sub"]);
+    let git_paths = git_switch_refused_paths(&oracle.root, "tip-b");
+    assert_eq!(git_paths, vec!["sub".to_owned()]);
+
+    let fixture = GitlinkAhead::new(2, false);
+    git(&fixture.root, &["add", "sub"]);
+    let repo = fixture.repo();
+    let err = switch_repository(
+        &repo,
+        &SwitchOptions {
+            mode: SwitchMode::Existing {
+                branch: "tip-b".into(),
+                oid: fixture.rev("tip-b"),
+            },
+            dry_run: false,
+            hooks: grit_lib::PostOperationHooks::Run,
+        },
+        &mut grit_lib::progress::NullProgress,
+        &grit_lib::progress::NeverCancel,
+    )
+    .expect_err("grit switch must refuse a staged gitlink the target would overwrite");
+    match err {
+        Error::WouldOverwrite {
+            reason: OverwriteReason::LocalChanges,
+            paths,
+            ..
+        } => assert_eq!(paths, git_paths),
+        other => panic!("expected WouldOverwrite LocalChanges, got {other:?}"),
+    }
+    assert_eq!(
+        fixture.index_gitlink(),
+        fixture.up[2],
+        "staged gitlink is kept"
+    );
+}
+
+/// [`GitlinkAhead`] with `sub` deinitialized (no `.git`) and an untracked `sub/local.txt`.
+fn gitlink_uninitialized_with_local_file() -> GitlinkAhead {
+    let fixture = GitlinkAhead::new(1, false);
+    git(&fixture.root, &["submodule", "deinit", "-q", "-f", "sub"]);
+    std::fs::write(fixture.root.join("sub/local.txt"), b"local\n").expect("write local");
+    fixture
+}
+
+fn uninitialized_gitlink_observed(fixture: &GitlinkAhead) -> (String, String, Option<String>) {
+    (
+        git_porcelain(&fixture.root),
+        fixture.index_gitlink(),
+        std::fs::read_to_string(fixture.root.join("sub/local.txt")).ok(),
+    )
+}
+
+#[test]
+fn switch_keeps_files_in_uninitialized_gitlink_dir_like_git() {
+    let oracle = gitlink_uninitialized_with_local_file();
+    git(&oracle.root, &["switch", "-q", "--detach", "tip-b"]);
+    let expected = uninitialized_gitlink_observed(&oracle);
+    assert_eq!(expected.1, oracle.up[1], "git advances the index gitlink");
+    assert_eq!(
+        expected.2.as_deref(),
+        Some("local\n"),
+        "git keeps local.txt"
+    );
+
+    let fixture = gitlink_uninitialized_with_local_file();
+    let repo = fixture.repo();
+    grit_switch_detach(&repo, fixture.rev("tip-b"));
+    assert_eq!(uninitialized_gitlink_observed(&fixture), expected);
+    git_fsck(&fixture.root);
+}
+
+#[test]
+fn merge_fast_forward_keeps_files_in_uninitialized_gitlink_dir_like_git() {
+    let oracle = gitlink_uninitialized_with_local_file();
+    git(&oracle.root, &["merge", "-q", "--ff-only", "tip-b"]);
+    let expected = uninitialized_gitlink_observed(&oracle);
+    assert_eq!(
+        expected.2.as_deref(),
+        Some("local\n"),
+        "git keeps local.txt"
+    );
+
+    let fixture = gitlink_uninitialized_with_local_file();
+    let repo = fixture.repo();
+    grit_lib::porcelain::merge::integrate_branch(
+        &repo,
+        "refs/heads/main",
+        fixture.rev("HEAD"),
+        fixture.rev("tip-b"),
+        "tip-b",
+        &mut grit_lib::progress::NullProgress,
+        &grit_lib::progress::NeverCancel,
+    )
+    .expect("grit merge tip-b with uninitialized submodule");
+    assert_eq!(uninitialized_gitlink_observed(&fixture), expected);
 }

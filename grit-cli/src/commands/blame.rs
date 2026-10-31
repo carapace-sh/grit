@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::io::Write;
+use std::ops::Not;
 
 use anyhow::{bail, Context, Result};
 use std::fmt;
@@ -11,8 +12,8 @@ use std::fmt;
 pub struct BlameUsageError;
 
 use grit_lib::blame::{
-    blame_file, resolve_blame_line_range, BlameOptions, BlameResult, CopyDetection, IgnoreRevs,
-    IgnoreRevsSources,
+    blame_file, resolve_blame_line_range_with_options, BlameFinalSource, BlameOptions, BlameResult,
+    CopyDetection, IgnoreRevs, IgnoreRevsSources,
 };
 use grit_lib::diff::WhitespaceMode;
 
@@ -54,10 +55,14 @@ pub struct BlameLineJson {
     pub original_path: String,
     pub final_line: usize,
     pub content: String,
+    #[serde(default, skip_serializing_if = "Not::not")]
+    pub encoding_lossy: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ignored: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unblamable: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub not_committed: Option<bool>,
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -71,7 +76,11 @@ pub struct BlameHunkJson {
     pub ignored: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unblamable: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub not_committed: Option<bool>,
     pub lines: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_encoding_lossy: Option<Vec<bool>>,
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -181,6 +190,7 @@ pub fn run(
     group: bool,
     ignore_all_space: bool,
     copy_detection: u8,
+    contents: Option<String>,
     now: time::OffsetDateTime,
 ) -> Result<BlameOutcome> {
     let (rev_pos, file) = match (rev_pos, file) {
@@ -192,27 +202,50 @@ pub fn run(
     if rev.is_some() && rev_pos.is_some() {
         bail!("cannot use both `--rev` and a positional revision before `--`");
     }
-    let rev_spec = rev.or(rev_pos).unwrap_or_else(|| "HEAD".to_owned());
+    let explicit_rev = rev.or(rev_pos);
+    let rev_spec = explicit_rev.as_deref().unwrap_or("HEAD");
 
     let repo = context::discover()?;
-    let start = resolve_revision_as_commit(&repo, &rev_spec)
+    let start = resolve_revision_as_commit(&repo, rev_spec)
         .with_context(|| format!("could not resolve revision '{rev_spec}'"))?;
 
-    let range = line_range
-        .as_deref()
-        .map(|spec| resolve_blame_line_range(&repo, start, &file, spec))
-        .transpose()
-        .with_context(|| "could not parse line range")?;
+    let final_source = match contents.as_deref() {
+        Some("-") => {
+            let mut buf = Vec::new();
+            std::io::Read::read_to_end(&mut std::io::stdin(), &mut buf)
+                .context("could not read --contents from stdin")?;
+            BlameFinalSource::Contents(buf)
+        }
+        Some(path) => BlameFinalSource::Contents(
+            std::fs::read(path).with_context(|| format!("could not read --contents '{path}'"))?,
+        ),
+        None if explicit_rev.is_none() && repo.work_tree().is_some() => BlameFinalSource::Worktree,
+        None => BlameFinalSource::Revision,
+    };
+    let uncommitted_label = if matches!(final_source, BlameFinalSource::Contents(_)) {
+        "External file (--contents)"
+    } else {
+        "Not Committed Yet"
+    };
+    let mut options = BlameOptions {
+        start: Some(start),
+        final_source,
+        now: Some(now),
+        ..BlameOptions::default()
+    };
 
-    let normalized = if let Some(wt) = repo.work_tree() {
-        grit_lib::worktree::pathspec::normalize_worktree_file_path(
-            &file,
-            wt,
-            repo.pathspec_argv_prefix(&file),
-        )
+    let blame_path = if repo.work_tree().is_some() {
+        repo.resolve_worktree_pathspec(&file, repo.pathspec_argv_prefix(&file))
+            .with_context(|| format!("could not resolve path '{file}'"))?
     } else {
         file.clone()
     };
+
+    options.line_range = line_range
+        .as_deref()
+        .map(|spec| resolve_blame_line_range_with_options(&repo, &blame_path, spec, &options))
+        .transpose()
+        .with_context(|| "could not parse line range")?;
 
     let ignore = IgnoreRevs::load(
         &repo,
@@ -231,26 +264,38 @@ pub fn run(
         whitespace = WhitespaceMode::ignore_all_space();
     }
 
-    let result = blame_file(
-        &repo,
-        &file,
-        &BlameOptions {
-            start: Some(start),
-            line_range: range,
-            first_parent_only: first_parent,
-            ignore,
-            whitespace,
-            copy_detection,
-        },
-    )?;
+    options.first_parent_only = first_parent;
+    options.ignore = ignore;
+    options.whitespace = whitespace;
+    options.copy_detection = copy_detection;
+    let mut result = blame_file(&repo, &blame_path, &options)?;
+    label_uncommitted(&mut result, uncommitted_label);
 
     Ok(outcome_from_result(
-        normalized,
+        blame_path,
         start.to_hex(),
         result,
         group,
         now.unix_timestamp(),
     ))
+}
+
+/// Give uncommitted lines the author identity Git's porcelain output shows for them.
+fn label_uncommitted(result: &mut BlameResult, label: &str) {
+    let uncommitted: Vec<_> = result
+        .lines
+        .iter()
+        .filter(|line| line.not_committed)
+        .map(|line| line.commit)
+        .collect();
+    for oid in uncommitted {
+        if let Some(info) = result.commits.get_mut(&oid) {
+            if info.author.is_empty() {
+                info.author = format!("{label} <not.committed.yet> {} +0000", info.author_time);
+                info.summary = label.to_owned();
+            }
+        }
+    }
 }
 
 fn outcome_from_result(
@@ -292,8 +337,10 @@ fn outcome_from_result(
             final_line: line.final_line,
             content: content.clone(),
             original_path: line.original_path.clone(),
+            encoding_lossy: line.encoding_lossy,
             ignored: line.ignored.then_some(true),
             unblamable: line.unblamable.then_some(true),
+            not_committed: line.not_committed.then_some(true),
         });
         display_lines.push(BlameDisplayLine {
             commit: line.commit,
@@ -315,6 +362,7 @@ fn outcome_from_result(
                 .final_start
                 .saturating_add(hunk.count.saturating_sub(1));
             let mut hunk_lines = Vec::with_capacity(hunk.count);
+            let mut hunk_encoding_lossy = Vec::with_capacity(hunk.count);
             for _ in 0..hunk.count {
                 let line = &result.lines[line_cursor];
                 debug_assert!(
@@ -326,7 +374,12 @@ fn outcome_from_result(
                 );
                 line_cursor += 1;
                 hunk_lines.push(normalize_blame_line_content(line.content.clone()));
+                hunk_encoding_lossy.push(line.encoding_lossy);
             }
+            let line_encoding_lossy = hunk_encoding_lossy
+                .iter()
+                .any(|&v| v)
+                .then_some(hunk_encoding_lossy);
             hunks_json.push(BlameHunkJson {
                 commit: hunk.commit.to_hex(),
                 original_path: hunk.original_path,
@@ -335,7 +388,9 @@ fn outcome_from_result(
                 count: hunk.count,
                 ignored: hunk.ignored.then_some(true),
                 unblamable: hunk.unblamable.then_some(true),
+                not_committed: hunk.commit.is_zero().then_some(true),
                 lines: hunk_lines,
+                line_encoding_lossy,
             });
         }
         debug_assert_eq!(line_cursor, result.lines.len());

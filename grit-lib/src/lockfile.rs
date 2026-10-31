@@ -183,6 +183,7 @@ pub struct LockFile {
     commit_path: Option<PathBuf>,
     file: Option<File>,
     committed: bool,
+    wrote_holder_pid: bool,
 }
 
 impl LockFile {
@@ -212,55 +213,49 @@ impl LockFile {
         clock: Arc<dyn LockClock>,
         jitter: Arc<dyn LockJitter>,
     ) -> Result<Self, LockError> {
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent).map_err(|source| LockError::Io {
-                path: target.to_path_buf(),
-                source,
-            })?;
-        }
-
-        let deadline = match wait {
-            LockWait::Immediately => Some(clock.now()),
-            LockWait::Backoff { budget } => Some(clock.now() + budget),
-            LockWait::Indefinitely => None,
-        };
-
-        let mut attempt: u32 = 0;
-        loop {
-            match OpenOptions::new().write(true).create_new(true).open(target) {
-                Ok(file) => {
-                    return Ok(Self {
-                        lock_path: target.to_path_buf(),
-                        commit_path: None,
-                        file: Some(file),
-                        committed: false,
-                    });
+        let to_lock_error = |source: io::Error| {
+            if crate::atomic_replace::is_lock_acquire_contention(&source, target) {
+                LockError::Held {
+                    path: target.to_path_buf(),
                 }
-                Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
-                    if matches!(wait, LockWait::Immediately)
-                        || deadline.is_some_and(|deadline| clock.now() >= deadline)
-                    {
-                        return Err(LockError::Held {
-                            path: target.to_path_buf(),
-                        });
-                    }
-                    let delay = backoff_delay(target, attempt, jitter.as_ref());
-                    attempt = attempt.saturating_add(1);
-                    if let Some(deadline) = deadline {
-                        let remaining = deadline.saturating_duration_since(clock.now());
-                        clock.sleep(delay.min(remaining));
-                    } else {
-                        clock.sleep(delay);
-                    }
-                }
-                Err(source) => {
-                    return Err(LockError::Io {
-                        path: target.to_path_buf(),
-                        source,
-                    });
+            } else {
+                LockError::Io {
+                    path: target.to_path_buf(),
+                    source,
                 }
             }
-        }
+        };
+        let open = || OpenOptions::new().write(true).create_new(true).open(target);
+        // The parent usually exists, so it is only created once an open fails. Creating it
+        // then still reports a parent blocked by a file as the directory error.
+        let mut parent_ready = false;
+        retry_while_held(
+            target,
+            || wait,
+            clock.as_ref(),
+            jitter.as_ref(),
+            || match open() {
+                Err(_) if !parent_ready => {
+                    parent_ready = true;
+                    if let Some(parent) = target.parent() {
+                        fs::create_dir_all(parent).map_err(|source| LockError::Io {
+                            path: target.to_path_buf(),
+                            source,
+                        })?;
+                    }
+                    open().map_err(to_lock_error)
+                }
+                other => other.map_err(to_lock_error),
+            },
+            |err| matches!(err, LockError::Held { .. }),
+        )
+        .map(|file| Self {
+            lock_path: target.to_path_buf(),
+            commit_path: None,
+            file: Some(file),
+            committed: false,
+            wrote_holder_pid: false,
+        })
     }
 
     /// Set the destination path used by [`Self::commit`].
@@ -343,11 +338,30 @@ impl LockFile {
             source,
         })?;
         drop(file);
-        fs::rename(&self.lock_path, other_path).map_err(|source| LockError::Io {
-            path: self.lock_path.clone(),
-            source,
+        crate::atomic_replace::replace_file(&self.lock_path, other_path).map_err(|source| {
+            LockError::Io {
+                path: self.lock_path.clone(),
+                source,
+            }
         })?;
+        self.remove_holder_pid_sidecar();
         self.committed = true;
+        Ok(())
+    }
+
+    /// Record this process as the holder of [`Self::lock_path`] in a Git-compatible pid sidecar.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LockError::Io`] when the sidecar cannot be written.
+    pub fn write_holder_pid(&mut self) -> Result<(), LockError> {
+        write_lock_pid_file(&pid_path_for_lock(&self.lock_path)).map_err(|source| {
+            LockError::Io {
+                path: self.lock_path.clone(),
+                source,
+            }
+        })?;
+        self.wrote_holder_pid = true;
         Ok(())
     }
 
@@ -358,7 +372,14 @@ impl LockFile {
         }
         drop(self.file.take());
         let _ = fs::remove_file(&self.lock_path);
+        self.remove_holder_pid_sidecar();
         self.committed = true;
+    }
+
+    fn remove_holder_pid_sidecar(&self) {
+        if self.wrote_holder_pid {
+            let _ = fs::remove_file(pid_path_for_lock(&self.lock_path));
+        }
     }
 
     /// Close this handle but leave the lock file on disk (mutex-only locks).
@@ -396,6 +417,55 @@ impl Drop for LockFile {
         }
         drop(self.file.take());
         let _ = fs::remove_file(&self.lock_path);
+        self.remove_holder_pid_sidecar();
+    }
+}
+
+/// Run `attempt` until it succeeds, fails with an error `is_held` does not accept, or the wait
+/// budget is spent, sleeping the jittered backoff between attempts.
+///
+/// The deadline starts before the first attempt, so time spent inside `attempt` (which may
+/// itself wait on a lock) counts against the budget. `wait` is resolved only after the first
+/// held failure, so callers that read it from config pay nothing when the lock is free.
+/// `key` names the lock for [`LockJitter::fraction`].
+///
+/// # Errors
+///
+/// Returns the last error from `attempt`: immediately when `is_held` rejects it, otherwise
+/// once the budget is exhausted.
+pub(crate) fn retry_while_held<T, E>(
+    key: &Path,
+    wait: impl FnOnce() -> LockWait,
+    clock: &dyn LockClock,
+    jitter: &dyn LockJitter,
+    mut attempt: impl FnMut() -> Result<T, E>,
+    is_held: impl Fn(&E) -> bool,
+) -> Result<T, E> {
+    let start = clock.now();
+    let mut err = match attempt() {
+        Err(err) if is_held(&err) => err,
+        other => return other,
+    };
+    let deadline = match wait() {
+        LockWait::Immediately => return Err(err),
+        LockWait::Backoff { budget } => Some(start + budget),
+        LockWait::Indefinitely => None,
+    };
+    let mut tries: u32 = 0;
+    loop {
+        if deadline.is_some_and(|deadline| clock.now() >= deadline) {
+            return Err(err);
+        }
+        let delay = backoff_delay(key, tries, jitter);
+        tries = tries.saturating_add(1);
+        clock.sleep(match deadline {
+            Some(deadline) => delay.min(deadline.saturating_duration_since(clock.now())),
+            None => delay,
+        });
+        match attempt() {
+            Err(held) if is_held(&held) => err = held,
+            other => return other,
+        }
     }
 }
 
@@ -438,16 +508,86 @@ impl LockHolder {
             running: is_process_running(pid),
         })
     }
+
+    /// Remove `lock_path` and its pid sidecar when [`Self::read`] reports a dead holder.
+    ///
+    /// Returns `true` when both files were removed (or were already absent after the lock).
+    /// Returns `false` when there is no sidecar, the holder is still running, or the sidecar
+    /// looks left over from an earlier holder (lock file newer than the sidecar).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::Error`] when metadata or removal fails for reasons other than
+    /// [`io::ErrorKind::NotFound`].
+    pub fn remove_if_stale(lock_path: &Path) -> io::Result<bool> {
+        let Some(holder) = Self::read(lock_path) else {
+            return Ok(false);
+        };
+        if holder.running {
+            return Ok(false);
+        }
+        let pid_path = pid_path_for_lock(lock_path);
+        if lock_path.is_file() && pid_path.is_file() {
+            let lock_mtime = fs::metadata(lock_path)?.modified()?;
+            let pid_mtime = fs::metadata(&pid_path)?.modified()?;
+            if lock_mtime > pid_mtime {
+                return Ok(false);
+            }
+        }
+        for path in [lock_path, &pid_path] {
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(true)
+    }
+}
+
+/// Whether grit writes pid sidecars for locks it creates.
+///
+/// Honors an explicit `core.lockfilePid=false`. When unset, grit defaults to `true` so crash
+/// recovery can detect stale index locks without requiring Git's opt-in.
+///
+/// When `config` is `None`, values are loaded from `git_dir` when provided.
+#[must_use]
+pub fn grit_lockfile_pid_enabled(config: Option<&ConfigSet>, git_dir: Option<&Path>) -> bool {
+    fn from_config(cfg: &ConfigSet) -> bool {
+        match cfg.get_bool("core.lockfilepid") {
+            Some(Ok(false)) => false,
+            Some(Ok(true)) | Some(Err(_)) | None => true,
+        }
+    }
+    if let Some(cfg) = config {
+        return from_config(cfg);
+    }
+    if let Some(dir) = git_dir {
+        if let Ok(cfg) = ConfigSet::load(&Environment::empty(), Some(dir), true) {
+            return from_config(&cfg);
+        }
+    }
+    true
 }
 
 /// Path of the pid sidecar for `lock_path` (`name.lock` → `name~pid.lock`).
-pub(crate) fn pid_path_for_lock(lock_path: &Path) -> PathBuf {
+pub fn pid_path_for_lock(lock_path: &Path) -> PathBuf {
     let file_name = lock_path
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "index.lock".to_owned());
     let base = file_name.strip_suffix(".lock").unwrap_or(&file_name);
     lock_path.with_file_name(format!("{base}~pid.lock"))
+}
+
+pub(crate) fn write_lock_pid_file(pid_path: &Path) -> io::Result<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(pid_path)?;
+    writeln!(file, "pid {}", std::process::id())?;
+    Ok(())
 }
 
 fn read_lock_pid(pid_path: &Path) -> Option<u64> {
@@ -608,6 +748,24 @@ mod tests {
     }
 
     #[test]
+    fn remove_if_stale_skips_when_lock_is_newer_than_sidecar() {
+        use std::thread;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("index.lock");
+        fs::write(&lock_path, b"").unwrap();
+        let pid_path = pid_path_for_lock(&lock_path);
+        fs::write(&pid_path, "pid 999999999\n").unwrap();
+        thread::sleep(Duration::from_millis(20));
+        fs::write(&lock_path, b"replaced").unwrap();
+
+        assert!(!LockHolder::remove_if_stale(&lock_path).unwrap());
+        assert!(lock_path.is_file());
+        assert!(pid_path.is_file());
+    }
+
+    #[test]
     fn held_converts_to_typed_error_with_holder() {
         let dir = tempfile::tempdir().unwrap();
         let lock_path = dir.path().join("index.lock");
@@ -700,5 +858,75 @@ mod tests {
             Arc::new(FixedJitter(0.0)),
         )
         .expect("indefinite wait should eventually acquire");
+    }
+
+    #[test]
+    fn retry_while_held_resolves_wait_lazily_and_counts_attempt_time() {
+        let key = Path::new("refs");
+        let jitter = FixedJitter(0.0);
+        let clock = FakeLockClock::new(Instant::now());
+
+        let ok: Result<u32, u32> = retry_while_held(
+            key,
+            || panic!("wait resolved without contention"),
+            clock.as_ref(),
+            &jitter,
+            || Ok(7),
+            |_| true,
+        );
+        assert_eq!(ok, Ok(7));
+
+        let mut calls = 0;
+        let other = retry_while_held(
+            key,
+            || LockWait::Indefinitely,
+            clock.as_ref(),
+            &jitter,
+            || {
+                calls += 1;
+                Err::<(), _>("io")
+            },
+            |e| *e == "held",
+        );
+        assert_eq!((other, calls), (Err("io"), 1));
+        assert!(clock.sleeps().is_empty());
+
+        // The first attempt itself takes the whole budget, so nothing is retried.
+        let mut calls = 0;
+        let slow = retry_while_held(
+            key,
+            || LockWait::Backoff {
+                budget: Duration::from_millis(10),
+            },
+            clock.as_ref(),
+            &jitter,
+            || {
+                calls += 1;
+                clock.sleep(Duration::from_millis(10));
+                Err::<(), _>(calls)
+            },
+            |_| true,
+        );
+        assert_eq!(slow, Err(1));
+
+        let mut calls = 0;
+        let later = retry_while_held(
+            key,
+            || LockWait::Backoff {
+                budget: Duration::from_secs(1),
+            },
+            clock.as_ref(),
+            &jitter,
+            || {
+                calls += 1;
+                if calls < 4 {
+                    Err(calls)
+                } else {
+                    Ok(calls)
+                }
+            },
+            |_| true,
+        );
+        assert_eq!(later, Ok(4));
     }
 }

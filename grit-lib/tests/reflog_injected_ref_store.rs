@@ -12,7 +12,7 @@ use grit_lib::error::Error;
 use grit_lib::objects::odb::{store::MemoryStore, OdbBuilder};
 use grit_lib::objects::{HashAlgo, ObjectId};
 use grit_lib::porcelain::add::{stage, StageOptions};
-use grit_lib::porcelain::commit::{commit_with_scope, CommitRequest, CommitScope};
+use grit_lib::porcelain::commit::{commit_with_scope, CommitScope};
 use grit_lib::progress::NullProgress;
 use grit_lib::refs::store::{MemoryRefStore, RefName, RefStore};
 use grit_lib::repo::{Repository, RepositoryBuilder};
@@ -63,12 +63,7 @@ fn commit_n(repo: &Repository, work_tree: &Path, n: usize) -> Vec<ObjectId> {
             .expect("stage");
             commit_with_scope(
                 repo,
-                &CommitRequest {
-                    message: format!("c{i}"),
-                    author: Some(IDENT_TS.parse().expect("signature")),
-                    committer: Some(IDENT_TS.parse().expect("signature")),
-                    ..Default::default()
-                },
+                &grit_test_support::commit_request(format!("c{i}"), IDENT_TS),
                 CommitScope::Staged,
                 &mut NullProgress,
                 &grit_lib::progress::NeverCancel,

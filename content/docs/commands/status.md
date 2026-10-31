@@ -25,7 +25,11 @@ The status screen is your home base. It shows, from top to bottom:
 
 Each change has a label: `new`, `modified`, `deleted`, `renamed`, `copied`, `type changed` or `conflict`. `type changed` (`type_changed` in `--json`, Git's `T`) means the path switched between a regular file, a symlink and a submodule; a permission-only change such as `chmod +x` is `modified`.
 
+**Submodules:** grit records gitlinks in the index but does not fetch nested repositories ([`grit clone`](../clone/) leaves an empty directory and prints a note). An **uninitialized** submodule directory (no embedded `.git`) is ignored the same way Git ignores it: stray files you create inside that placeholder are not listed as modified or untracked, and `grit commit` agrees with a clean `git status`. A **checked-out** submodule with its own `.git` directory is compared by its HEAD commit and inner worktree dirtiness.
+
 A tracked file that grit cannot open to compare its content (another program holds it open without sharing, or it has no read permission) is listed as `modified`, like Git does, and the rest of the status is reported as usual. Commands that need the file's bytes, such as `grit add` of that path or a patch from `grit diff`, still fail with [`worktree_path_io`](../exit-codes/), and `grit switch` refuses a branch that would change it.
+
+**Index refresh:** after stat data in the work tree no longer matches `.git/index`, grit re-verifies content and normally writes the refreshed stat cache back to the index (like `git status`). If another command updates the index after status loaded it (for example a concurrent commit), grit skips the write and keeps the on-disk index that command wrote. Use [`--no-optional-locks`](../global-options/) or `GIT_OPTIONAL_LOCKS=0` when a background status must not touch the index file; grit still refreshes stat data in memory so the report matches a full run. Library callers set [`StatusOptions::write_index`](rustdoc:grit_lib::porcelain::status::StatusOptions::write_index) to `false` for the same read-only behavior without changing the process environment.
 
 During a paused merge or grit rebase, human output also lists **Conflicts** grouped by kind (`both modified`, `both added`, …). In `--json`, each conflict is `{ "path", "kind" }` and `operation.next_steps` lists the ordered `grit` commands while an operation is paused (for example `grit diff` then `grit add .` with conflicts, or `grit merge --continue` / `grit rebase --continue` once conflicts are resolved). Use `operation.alternatives` for cancel paths such as `grit merge --abort` or `grit rebase --abort` (not part of the ordered sequence). Grit rebase sessions are detected via `.git/rebase-merge/grit-plan`.
 
@@ -45,14 +49,17 @@ Every grit command that reports conflicts (`status`, `merge`, `pick`, `revert`, 
 | `deleted_by_us` | deleted by us | `DU` | We deleted the path and they changed it. |
 | `deleted_by_them` | deleted by them | `UD` | We changed the path and they deleted it. |
 | `rename_rename` | — | — | Both sides renamed one file to different names (`merge`, `pick`, `revert`, `rebase` and `pull` only; `status` shows the three paths as `both_deleted`, `added_by_us` and `added_by_them`). |
+| `directory_rename_moved` | moved with its directory | — | A file one side added to a directory the other side renamed was moved into the new directory; confirm the location (operations only; `status` shows the path as `added_by_us` or `added_by_them`). See [directory renames](../merge/#directory-renames). |
+| `directory_rename_split` | directory split up | — | A directory was spread over several directories with no clear destination, so files added to it stayed put. The path is the directory; nothing is unmerged (operations only). |
+| `directory_rename_blocked` | directory move blocked | — | Files were not moved into a renamed directory because their destination is taken. The path is the destination; nothing is unmerged (operations only). |
 
 ### Interrupted rebases and history edits
 
-A `grit rebase` or `grit history` edit that is killed after moving branches but before the files are updated leaves a recovery journal in `.git/grit/rewrite-apply/`. `grit status` finishes that work before it reports anything, and says what it did in one line above the usual screen:
+A `grit rebase` or `grit history` edit that is killed after moving branches but before the files are updated leaves a recovery journal in `.git/grit/rewrite-apply/`. With optional locks enabled (the default), `grit status` finishes that work before it reports anything, and says what it did in one line above the usual screen. With `--no-optional-locks` / `GIT_OPTIONAL_LOCKS=0`, recovery is deferred and the outcome stays **Pending** until a status run that may write the index:
 
 - **Finished the checkout.** The branches had already moved, so status puts back the files the interrupted checkout was writing and checks out the rewritten commit again. The rebase stands. Unrelated local edits are kept.
 - **Rolled back.** When that checkout cannot finish (or for an interrupted `history fixup` or `absorb`), branches, index and files go back to where they were before the command. Status still succeeds.
-- **Pending.** Another process holds `.git/index.lock`, so nothing is touched yet. If the lock belongs to a process that no longer runs (recorded with `core.lockfilePid`), status removes it and recovers. Otherwise, run `grit status` again after that process exits, or delete the lock when you know nothing owns it.
+- **Pending.** Another process holds `.git/index.lock`, so nothing is touched yet. When grit wrote a pid sidecar for that lock (default for grit-owned locks) and the recorded process has exited, the next status removes the stale lock and recovers. When no sidecar exists (for example `core.lockfilePid=false` or a foreign Git lock), the message notes the lock may be stale; run status again after the holder exits, or remove the lock only when nothing else is using the repository.
 
 `--json` reports the outcome in `interrupted_rewrite`. The line and the field appear only on the run that finished or rolled back the work, and on every run while it is pending.
 
@@ -68,6 +75,22 @@ Nothing to commit — working tree clean.
 ```
 
 Paths are shown relative to the directory you run `grit` from. Valid UTF-8 file names print as-is in human and `--markdown` output (unlike Git’s default `core.quotepath=true`, which octal-escapes non-ASCII bytes). Names that contain C0 control characters (including ESC and BEL) are still C-quoted so a malicious repository cannot inject terminal escape sequences. Set `core.quotepath=true` in config if you want Git-style octal escaping for all non-ASCII bytes. `--json` path fields are always unquoted UTF-8 strings (JSON escapes controls as `\uXXXX`).
+
+### GitButler workspaces
+
+[GitButler](https://gitbutler.com) applies several branches at once by checking out `gitbutler/workspace`, topped by a merge of the applied branches that it maintains itself (its message says `GitButler Workspace Commit`). That commit is GitButler's bookkeeping, so on such a workspace `grit status` lists the applied branches instead of the commits ahead, and leaves the workspace commit out of `commits` and `ahead`. The next-step hint suggests `but commit`, because [`grit commit`](../commit/) refuses to commit there.
+
+```console
+$ grit status
+On GitButler workspace  ·  2 branches applied  ·  3 behind origin/main
+
+  login-form   4f2a9c1  qzvtyxkl  Ada Lovelace  2 hours ago  Validate the login form
+  api-retries  9b3e0d2  mrnwkpst  Ada Lovelace  1 day ago    Retry failed API calls
+
+Nothing to commit — working tree clean.
+```
+
+`--json` describes the workspace in `gitbutler_workspace`.
 
 ### The target branch
 
@@ -99,13 +122,15 @@ On Unix, explicit path operands must be valid UTF-8. An operand containing inval
 | `--pathspec-from-file <FILE\|->` | Read pathspecs from a file (`-` for stdin), in addition to any `PATH` arguments. |
 | `--pathspec-file-nul` | `--pathspec-from-file` entries are NUL-separated (requires `--pathspec-from-file`). |
 | `--ignored` | List ignored paths (traditional mode; same `!!` set as `git status --ignored --porcelain`). |
-| `--short` | Compact one-line-per-path output for humans only (two-letter staged/unstaged codes; JSON unchanged). |
+| `-s`, `--short` | Compact one-line-per-path output for humans only (two-letter staged/unstaged codes; JSON unchanged). |
 
 Rename detection is on by default (Git’s `status.renames` / `diff.renames`; disable with `status.renames=false`). Human output shows renames as `old → new`; `--json` adds `old_path` on rename and copy entries.
 
 ### How changes are detected
 
 Like Git, `grit status` compares each tracked file's size and timestamps with what the index recorded, and reads a file only when they differ. A clean tree costs one file-system lookup per tracked file, whatever the file sizes or `core.filemode`. Files written in the same second as the index (right after `git clone`, a commit or a checkout) cannot be trusted by timestamp alone: status reads them once and saves the refreshed index, so later runs skip them. Like `git status`, it may therefore rewrite `.git/index`; only the cached file information changes, never what is staged.
+
+A changed size alone counts as a change only when nothing converts the file on the way into the repository. When a line-ending setting (`core.autocrlf`, `text`, `eol`), a clean filter, `working-tree-encoding` or `ident` applies, status reads the file and decides by content. So a file rewritten with only different line endings, which cleans to the staged content, is clean, and its index entry is refreshed. `git status` may show such a file as ` M` until its index is refreshed, while `git diff` already shows nothing.
 
 Mode changes the checkout cannot express are not reported: with `core.filemode=false` the executable bit is ignored, and with `core.symlinks=false` a symlink checked out as a plain file holding its target is compared by content, so it shows up only when the target text changes.
 
@@ -267,6 +292,7 @@ Pass `--json` for stable, scripting-friendly output:
 | `ignored` | array | Ignored paths when `--ignored` was passed; omitted otherwise. |
 | `stash_count` | number | Entries on the stash reflog (`0` when empty). |
 | `interrupted_rewrite` | string | Recovery of a rebase or history edit that was killed after moving refs: `finished_checkout` (the rewrite stands), `rolled_back` (it was undone) or `pending` (another process holds `.git/index.lock`). Omitted when nothing was pending. |
+| `gitbutler_workspace` | object | Only on a [GitButler workspace](#gitbutler-workspaces): `commit` (the workspace commit, which `head` names and `commits` and `ahead` leave out) and `heads`, the merged branch tips in the workspace's parent order, each with `commit`, `branches` (local branches pointing there, sorted; empty when none), `subject` and `ahead` (commits not on `target`, or `null` when counts were skipped). Omitted otherwise. |
 
 Example:
 

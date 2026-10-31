@@ -11,8 +11,8 @@ use crate::error::{Error, Result};
 use crate::ewah_bitmap::Bitmap;
 use crate::log_walk::WalkedCommits;
 use crate::objects::{
-    oid_hash_map, oid_hash_set, oid_hash_set_from, parse_commit, CommitRef, ObjectId, ObjectKind,
-    OidHashMap, OidHashSet,
+    oid_hash_map, oid_hash_set, oid_hash_set_from, CommitRef, ObjectId, ObjectKind, OidHashMap,
+    OidHashSet,
 };
 use crate::pack_bitmap::BitmapIndex;
 use crate::promisor::{read_promisor_missing_oids, repo_treats_promisor_packs};
@@ -191,6 +191,9 @@ pub fn merge_bases_octopus(repo: &Repository, commits: &[ObjectId]) -> Result<Ve
 ///
 /// This is the same intersection-and-reduction as [`merge_bases_octopus`]; the name
 /// documents the `git merge-base A B C ...` calling convention.
+///
+/// For two commits the bases come newest committer date first, and bases with equal
+/// dates in the order Git reports them (the order its history walk reaches them).
 pub fn merge_bases_all(repo: &Repository, commits: &[ObjectId]) -> Result<Vec<ObjectId>> {
     if commits.is_empty() {
         return Ok(Vec::new());
@@ -198,8 +201,8 @@ pub fn merge_bases_all(repo: &Repository, commits: &[ObjectId]) -> Result<Vec<Ob
     if commits.len() == 1 {
         return Ok(vec![commits[0]]);
     }
-    let mut cache = CommitGraphCache::new(repo);
     if commits.len() == 2 {
+        let mut cache = CommitGraphCache::new(repo);
         // A tip that is an ancestor of the other is the only merge base: every other common
         // ancestor is one of its own ancestors.
         match direct_ancestor_relation(&mut cache, commits[0], commits[1])? {
@@ -209,13 +212,39 @@ pub fn merge_bases_all(repo: &Repository, commits: &[ObjectId]) -> Result<Vec<Ob
             FirstParentRelation::SecondIsAncestor => return Ok(vec![commits[1]]),
             FirstParentRelation::Unrelated => {}
         }
-        let walked = walk_intersecting_histories(&mut cache, commits[0], &[commits[1]], true)?;
-        let candidates: OidHashSet = walked.into_iter().collect();
-        let mut bases = reduce_to_best(candidates, &mut cache)?;
-        sort_merge_bases_for_git_output(&mut cache, &mut bases)?;
-        return Ok(bases);
+        return all_merge_bases_vs_union(&mut cache, commits[0], &commits[1..2]);
     }
     merge_bases_octopus(repo, commits)
+}
+
+/// Every merge base of `one` and a hypothetical merge of all `others`, newest committer first.
+///
+/// The hypothetical merge's history is the union of the histories of `others`, so this is
+/// also the merge-base set of `one` and an in-memory commit whose parents are `others`
+/// (what a recursive merge needs after merging several merge bases into a virtual one).
+/// Unlike [`merge_bases_first_vs_rest`] the result is not truncated to one base.
+pub(crate) fn merge_bases_all_vs_union(
+    repo: &Repository,
+    one: ObjectId,
+    others: &[ObjectId],
+) -> Result<Vec<ObjectId>> {
+    all_merge_bases_vs_union(&mut CommitGraphCache::new(repo), one, others)
+}
+
+fn all_merge_bases_vs_union(
+    cache: &mut CommitGraphCache<'_>,
+    one: ObjectId,
+    others: &[ObjectId],
+) -> Result<Vec<ObjectId>> {
+    // The walk yields bases newest first and, among equal dates, in discovery order (Git's
+    // order); dropping redundant ones keeps that order, which a set would lose.
+    let mut walked = walk_intersecting_histories(cache, one, others, true)?;
+    if walked.len() > 1 {
+        let candidates: OidHashSet = walked.iter().copied().collect();
+        let best: OidHashSet = reduce_to_best(candidates, cache)?.into_iter().collect();
+        walked.retain(|oid| best.contains(oid));
+    }
+    Ok(walked)
 }
 
 /// Check whether `ancestor` is reachable from `descendant`.
@@ -229,6 +258,57 @@ pub fn is_ancestor(repo: &Repository, ancestor: ObjectId, descendant: ObjectId) 
     }
     let mut cache = CommitGraphCache::new(repo);
     cache.is_ancestor(ancestor, descendant)
+}
+
+/// [`is_ancestor`] that first looks for `descendant` on `ancestor`'s first-parent chain, the
+/// shape of a ref moved back with `HEAD~n`.
+///
+/// Finding it proves `descendant` is a strict ancestor of `ancestor`, so the answer is `false`
+/// (history has no cycles) without [`is_ancestor`]'s date-slop walk, which would otherwise read
+/// a hundred commits below `ancestor`'s date. The chain walk stops at the first commit dated
+/// before `descendant`, so a ref that moved anywhere else costs only the few commits newer
+/// than `descendant`; [`is_ancestor`] then decides. Grafts and replace refs can make ancestry
+/// cyclic, so with either present the chain is not consulted.
+///
+/// # Errors
+///
+/// Propagates commit read and parse errors.
+pub(crate) fn is_ancestor_unless_rewound(
+    repo: &Repository,
+    ancestor: ObjectId,
+    descendant: ObjectId,
+) -> Result<bool> {
+    if ancestor == descendant {
+        return Ok(true);
+    }
+    let mut cache = CommitGraphCache::new(repo);
+    if !cache.has_parent_rewrites()?
+        && first_parent_chain_reaches_newer(&mut cache, ancestor, descendant).unwrap_or(false)
+    {
+        return Ok(false);
+    }
+    cache.is_ancestor(ancestor, descendant)
+}
+
+/// Whether `target` lies on `from`'s first-parent chain, walking only commits dated at or
+/// after `target`.
+fn first_parent_chain_reaches_newer(
+    cache: &mut CommitGraphCache<'_>,
+    from: ObjectId,
+    target: ObjectId,
+) -> Result<bool> {
+    let target_time = cache.commit_time(target)?;
+    let mut cur = from;
+    while cache.commit_time(cur)? >= target_time {
+        let Some(&parent) = cache.parents_of(cur)?.first() else {
+            return Ok(false);
+        };
+        if parent == target {
+            return Ok(true);
+        }
+        cur = parent;
+    }
+    Ok(false)
 }
 
 /// Whether the acknowledged haves of a fetch negotiation cover every wanted
@@ -859,6 +939,21 @@ impl ReachableWalkState {
         limit: usize,
         cutoffs: ReachableWalkCommitterCutoffs,
     ) -> Result<(Self, Vec<ObjectId>, WalkedCommits)> {
+        // Under the pack-read context the walk reads every commit through one single-pack
+        // reader instead of installing the context and opening a reader per object.
+        repo.odb().with_pack_read_context(|| {
+            Self::page_retaining_commits_in_context(repo, resume, tips, hide, limit, cutoffs)
+        })
+    }
+
+    fn page_retaining_commits_in_context(
+        repo: &Repository,
+        resume: Option<ReachableWalkSnapshot>,
+        tips: &[ObjectId],
+        hide: &[ObjectId],
+        limit: usize,
+        cutoffs: ReachableWalkCommitterCutoffs,
+    ) -> Result<(Self, Vec<ObjectId>, WalkedCommits)> {
         // Sized for the page up front so the id table never exists twice while it grows.
         const MAX_PRESIZE: usize = 1 << 16;
         let mut cache = CommitGraphCache::new(repo);
@@ -1342,6 +1437,57 @@ pub fn count_commits_reachable_excluding_ancestors_of(
     Ok(count)
 }
 
+/// The first commit on each first-parent chain from `tips` that a `hide` tip reaches through
+/// any parent: the cut points of a `--first-parent` range walk.
+///
+/// Git follows only first parents from the commits it lists, while excluded tips still hide
+/// everything they reach. Every ancestor of a hidden commit is hidden too, so a first-parent
+/// walk from `tips` that stops at the returned commits lists exactly the range. The paint ends
+/// once the tips' first-parent chains meet hidden history when commit-graph generations bound
+/// it; otherwise it converges like the range count does.
+///
+/// # Parameters
+///
+/// - `tips` - commits to list from, following first parents only.
+/// - `hide` - excluded tips; their ancestry through every parent is hidden.
+/// - `use_commit_graph` - read parents and generations from the on-disk commit-graph.
+///
+/// # Errors
+///
+/// Propagates commit read and parse errors for commits not reached from `hide`.
+pub(crate) fn first_parent_hidden_frontier(
+    repo: &Repository,
+    tips: &[ObjectId],
+    hide: &[ObjectId],
+    use_commit_graph: bool,
+) -> Result<HashSet<ObjectId>> {
+    let mut cache = CommitGraphCache::with_commit_graph(repo, use_commit_graph);
+    // Grafts and replacements rewrite parents behind the graph's back, so its generations
+    // cannot order the paint.
+    if cache.graph.is_some() && cache.has_parent_rewrites()? {
+        cache = CommitGraphCache::with_commit_graph(repo, false);
+    }
+    let paint = SidePaint::compute_hiding_first_parent(&mut cache, tips, hide)?;
+
+    let mut frontier = HashSet::new();
+    let mut seen = oid_hash_set();
+    let mut stack = tips.to_vec();
+    while let Some(oid) = stack.pop() {
+        if !seen.insert(oid) {
+            continue;
+        }
+        // Unpainted chain commits lie below a commit both sides reach, so they are hidden.
+        if paint.sides.get(&oid) != Some(&PAINT_LEFT) {
+            frontier.insert(oid);
+            continue;
+        }
+        if let Some(&parent) = cache.parents_of(oid)?.first() {
+            stack.push(parent);
+        }
+    }
+    Ok(frontier)
+}
+
 /// Shortcuts for [`count_commits_reachable_excluding_ancestors_of`] that avoid painting, or
 /// `None` when the paint has to run.
 fn try_count_without_paint(
@@ -1389,9 +1535,10 @@ fn try_count_without_paint(
     Ok(None)
 }
 
-/// Like [`first_parent_commits_with_cutoffs`] but only when every visited commit has at most
-/// one parent (linear history). Returns `None` when a merge is encountered so callers can
-/// fall back to a full-graph bounded walk.
+/// Newest-first commits from `tip` applying committer-date cutoffs, stopping after `limit`
+/// matches, but only when every visited commit has at most one parent (linear history).
+/// Returns `None` when a merge is encountered so callers can fall back to a full-graph
+/// bounded walk.
 pub fn try_linear_chain_commits_with_cutoffs(
     repo: &Repository,
     tip: ObjectId,
@@ -1424,39 +1571,6 @@ pub fn try_linear_chain_commits_with_cutoffs(
         }
     }
     Ok(Some(out))
-}
-
-/// Newest-first commits on the first-parent chain from `tip`, applying committer-date
-/// cutoffs, stopping after `limit` matches (or when the chain ends).
-pub fn first_parent_commits_with_cutoffs(
-    repo: &Repository,
-    tip: ObjectId,
-    limit: usize,
-    cutoffs: ReachableWalkCommitterCutoffs,
-) -> Result<Vec<ObjectId>> {
-    let mut cache = CommitGraphCache::new(repo);
-    let mut out = Vec::with_capacity(limit.min(64));
-    let mut stack = vec![tip];
-    while let Some(cur) = stack.pop() {
-        if out.len() >= limit {
-            break;
-        }
-        let time = cache.commit_time(cur)?;
-        let below_since = cutoffs.since.is_some_and(|since| time < since);
-        let above_until = cutoffs.until.is_some_and(|until| time > until);
-        if !below_since && !above_until {
-            out.push(cur);
-        }
-        let parents = cache.parents_of(cur)?;
-        if below_since {
-            stack.extend(parents);
-            continue;
-        }
-        if let Some(&parent) = parents.first() {
-            stack.push(parent);
-        }
-    }
-    Ok(out)
 }
 
 /// Count commits on `tip`'s first-parent chain above `hide`.
@@ -1637,13 +1751,7 @@ fn first_parent_chain(repo: &Repository, start: ObjectId) -> Result<Vec<ObjectId
 }
 
 fn first_parent(repo: &Repository, oid: ObjectId) -> Result<Option<ObjectId>> {
-    let object = repo.odb().read(&oid)?;
-    if object.kind != ObjectKind::Commit {
-        return Err(Error::CorruptObject(format!(
-            "object {oid} is not a commit"
-        )));
-    }
-    let commit = parse_commit(&object.data)?;
+    let commit = repo.odb().read_commit(&oid)?;
     Ok(commit.parents.first().copied())
 }
 
@@ -1724,15 +1832,18 @@ pub(crate) mod intersect_walk_test_hooks {
 struct RankedCommit {
     rank: u64,
     committed_at: i64,
+    /// Queue insertion counter: among equal rank and date, the earlier queued commit pops
+    /// first, so merge bases with equal dates come out in Git's discovery order.
+    queued_at: u64,
     oid: ObjectId,
 }
 
 impl Ord for RankedCommit {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        match self.rank.cmp(&other.rank) {
-            std::cmp::Ordering::Equal => self.committed_at.cmp(&other.committed_at),
-            ord => ord,
-        }
+        self.rank
+            .cmp(&other.rank)
+            .then_with(|| self.committed_at.cmp(&other.committed_at))
+            .then_with(|| other.queued_at.cmp(&self.queued_at))
     }
 }
 
@@ -1748,6 +1859,8 @@ struct OpenQueueTally {
     open_on_both: isize,
     newest_rank_seen: u64,
     rank_stop: u64,
+    /// Commits queued so far; stamps [`RankedCommit::queued_at`].
+    queued: u64,
 }
 
 impl OpenQueueTally {
@@ -2028,9 +2141,11 @@ impl SidePaint {
         right: &[ObjectId],
         mut walk: PaintWalk,
     ) -> Result<Self> {
+        cache.prime_tips(left);
+        cache.prime_tips(right);
         for (tips, side) in [(left, PAINT_LEFT), (right, PAINT_RIGHT)] {
             for &tip in tips {
-                let Some(tip) = try_peel_to_commit_for_merge_base(cache.repo, tip)? else {
+                let Some(tip) = cache.peel_tip(tip)? else {
                     continue;
                 };
                 walk.mark(cache, tip, side)?;
@@ -2262,9 +2377,11 @@ fn enqueue_commit_for_intersect_walk(
     *slot = merged | MARK_QUEUED;
     let rank = commit_rank_for_walk(cache, oid);
     let committed_at = cache.commit_time(oid)?;
+    tally.queued += 1;
     pending.push(RankedCommit {
         rank,
         committed_at,
+        queued_at: tally.queued,
         oid,
     });
     tally.apply_label(merged | MARK_QUEUED, 1);
@@ -2314,6 +2431,7 @@ fn walk_intersecting_histories(
         open_on_both: 0,
         newest_rank_seen: UNRANKED_COMMIT,
         rank_stop: LEGACY_RANK_CAP,
+        queued: 0,
     };
     let mut discovered: Vec<ObjectId> = Vec::new();
 
@@ -2407,6 +2525,10 @@ fn reduce_to_best(
     Ok(best.into_iter().collect())
 }
 
+/// Fewest tips on one side of a paint for [`CommitGraphCache::prime_tips`] to read them up
+/// front; merge-base and range walks start from one or two tips and keep the plain reads.
+const PRIME_TIPS_MIN: usize = 64;
+
 struct CommitGraphCache<'r> {
     repo: &'r Repository,
     closures: OidHashMap<OidHashSet>,
@@ -2420,12 +2542,20 @@ struct CommitGraphCache<'r> {
     graph: Option<crate::commit_graph_file::CommitGraphChain>,
     /// Monotonic pack cursor for single-pack repos (deep-history benchmarks).
     single_pack: Option<crate::pack::SingleLocalPackReader>,
+    /// Set when [`Self::single_pack`] could not be opened under a matching pack-read context.
+    single_pack_unavailable: bool,
     /// When set, the commit objects [`Self::commit_time_for_heap`] reads from the object
     /// database, so a caller that renders the walked commits does not read them a second time.
     retained: Option<WalkedCommits>,
     /// True only while [`Self::commit_time_for_heap`] runs, so commits read for painting
     /// or ancestry checks are not retained.
     retain_reads: bool,
+    /// Payload of the commit [`Self::parents_of`] parses, reused across reads. Linkage and
+    /// [`Self::retained`] keep what the walk needs, so a per-commit allocation (and the
+    /// object database's session copy of every walked commit) would only be thrown away.
+    read_buf: Vec<u8>,
+    /// Plain commits whose linkage [`Self::prime_tips`] recorded from their header blocks.
+    header_primed: OidHashSet,
 }
 
 impl<'r> CommitGraphCache<'r> {
@@ -2452,9 +2582,7 @@ impl<'r> CommitGraphCache<'r> {
             oid_hash_set()
         };
         let graph = if use_commit_graph {
-            repo.caches()
-                .commit_graph_chain(repo.odb().objects_dir())
-                .map(|arc| (*arc).clone())
+            repo.odb().commit_graph_chain().map(|arc| (*arc).clone())
         } else {
             None
         };
@@ -2468,17 +2596,28 @@ impl<'r> CommitGraphCache<'r> {
             graft_parents,
             graph,
             single_pack: None,
+            single_pack_unavailable: false,
             retained: None,
             retain_reads: false,
+            read_buf: Vec::new(),
+            header_primed: oid_hash_set(),
         }
     }
 
-    fn read_object(&mut self, oid: &ObjectId) -> Result<crate::objects::Object> {
+    /// Read `oid` into `buf` and return its kind. Delta bases stay cached, as for
+    /// [`crate::odb::Odb::read`].
+    ///
+    /// The single local pack answers first; an object it does not hold (one in an alternate,
+    /// say) is read through the object database, so a walk never mistakes it for missing.
+    fn read_object_into(&mut self, oid: &ObjectId, buf: &mut Vec<u8>) -> Result<ObjectKind> {
         self.ensure_single_pack_reader();
-        match self.single_pack.as_mut() {
-            Some(reader) => reader.read_object(oid),
-            None => self.repo.odb().read(oid),
+        if let Some(reader) = self.single_pack.as_mut() {
+            match reader.read_object_into_with_delta_policy(oid, true, buf) {
+                Err(Error::ObjectNotFound(_)) => {}
+                read => return read,
+            }
         }
+        self.repo.odb().read_into_caching_delta_bases(oid, buf)
     }
 
     /// Parent rewrites can invalidate commit-graph linkage and create ancestry cycles.
@@ -2513,13 +2652,25 @@ impl<'r> CommitGraphCache<'r> {
         f(&mut guard)
     }
 
+    /// Open the reader over the single local pack, once per pack-read context.
+    ///
+    /// Loose objects may exist beside the pack: [`Self::read_object_into`] reads whatever the
+    /// pack lacks through the object database.
     fn ensure_single_pack_reader(&mut self) {
-        if self.single_pack.is_some() {
+        if self.single_pack.is_some()
+            || self.single_pack_unavailable
+            || !self.repo.odb().uses_files_primary()
+        {
             return;
         }
         let objects_dir = self.repo.odb().objects_dir();
-        if let Ok(Some(reader)) = crate::pack::SingleLocalPackReader::open(objects_dir) {
-            self.single_pack = Some(reader);
+        if !crate::pack_store::PackStore::read_context_matches_objects_dir(objects_dir) {
+            return;
+        }
+        match crate::pack::SingleLocalPackReader::open_allow_loose(objects_dir) {
+            Ok(Some(reader)) => self.single_pack = Some(reader),
+            // Several packs, or none: the listing will not change during this walk.
+            _ => self.single_pack_unavailable = true,
         }
     }
 
@@ -2602,38 +2753,54 @@ impl<'r> CommitGraphCache<'r> {
         }
         // A plain commit without a replacement is its own peel target, so one read serves both
         // the peel and the parse; anything else (tags, replaced objects) peels first.
+        let mut buf = std::mem::take(&mut self.read_buf);
+        let parents = self.parents_from_object(oid, &mut buf);
+        self.read_buf = buf;
+        parents
+    }
+
+    /// [`Self::parents_of`] for a commit the commit-graph does not cover: read and parse its
+    /// object through `buf`, then record its linkage.
+    fn parents_from_object(&mut self, oid: ObjectId, buf: &mut Vec<u8>) -> Result<Vec<ObjectId>> {
         let effective_oid = self.repo.object_id_after_replace(&oid);
-        let direct = if effective_oid == oid {
-            Some(self.read_object(&oid)?).filter(|object| object.kind == ObjectKind::Commit)
+        let direct_commit =
+            effective_oid == oid && self.read_object_into(&oid, buf)? == ObjectKind::Commit;
+        let commit_oid = if direct_commit {
+            oid
         } else {
-            None
-        };
-        let (commit_oid, object) = match direct {
-            Some(object) => (oid, object),
-            None => {
-                let commit_oid =
-                    peel_to_commit_for_merge_base(self.repo, oid).map_err(|e| match e {
-                        Error::InvalidRef(msg) => Error::CorruptObject(msg),
-                        other => other,
-                    })?;
-                (
-                    commit_oid,
-                    self.read_object(&self.repo.object_id_after_replace(&commit_oid))?,
-                )
+            let commit_oid =
+                peel_to_commit_for_merge_base(self.repo, oid).map_err(|e| match e {
+                    Error::InvalidRef(msg) => Error::CorruptObject(msg),
+                    other => other,
+                })?;
+            let kind =
+                self.read_object_into(&self.repo.object_id_after_replace(&commit_oid), buf)?;
+            if kind != ObjectKind::Commit {
+                return Err(Error::CorruptObject(format!(
+                    "object {commit_oid} is not a commit"
+                )));
             }
+            commit_oid
         };
-        if object.kind != ObjectKind::Commit {
-            return Err(Error::CorruptObject(format!(
-                "object {commit_oid} is not a commit"
-            )));
-        }
-        let linkage = CommitRef::parse(&object.data)?;
+        let linkage = CommitRef::parse(buf)?;
         let (time, parsed_parents) = (linkage.committer_timestamp(), linkage.parents().to_vec());
         if self.retain_reads && effective_oid == oid && commit_oid == oid {
             if let Some(retained) = self.retained.as_mut() {
-                retained.insert(oid, &object.data);
+                retained.insert(oid, buf);
             }
         }
+        Ok(self.record_linkage(oid, commit_oid, time, &parsed_parents))
+    }
+
+    /// Record `oid`'s committer time and its parents, read from `commit_oid` (the commit
+    /// `oid` peels to), after shallow, promisor and graft rewrites. Returns those parents.
+    fn record_linkage(
+        &mut self,
+        oid: ObjectId,
+        commit_oid: ObjectId,
+        time: i64,
+        parsed_parents: &[ObjectId],
+    ) -> Vec<ObjectId> {
         let parents: Vec<ObjectId> = if self.shallow_boundaries.contains(&commit_oid) {
             Vec::new()
         } else {
@@ -2648,7 +2815,74 @@ impl<'r> CommitGraphCache<'r> {
             link.times.insert(oid, time);
             link.parents.insert(oid, parents.clone());
         });
-        Ok(parents)
+        parents
+    }
+
+    /// Whether `oid` names itself: no replace ref, promisor stop or shallow boundary rewrites it.
+    fn is_plain_tip(&self, oid: &ObjectId) -> bool {
+        self.repo.object_id_after_replace(oid) == *oid
+            && !self.promisor_stop.contains(oid)
+            && !self.shallow_boundaries.contains(oid)
+    }
+
+    fn graph_lists(&self, oid: &ObjectId) -> bool {
+        self.graph
+            .as_ref()
+            .is_some_and(|graph| graph.find_commit(oid).is_some())
+    }
+
+    /// Record the linkage of every plain packed commit among `tips` from its header block
+    /// ([`crate::odb::Odb::read_packed_commit_header_block_into`]), reading them in parallel.
+    ///
+    /// Hide sets hold every ref in the repository, so a walk can start from hundreds of
+    /// scattered tips whose dates it needs before taking a single step. Their reads are
+    /// independent, and each one only needs the headers. Commits the commit-graph lists need
+    /// no read. Tips this cannot prime (tags, loose or deltified commits, unparsable headers,
+    /// read errors) are left to [`Self::peel_tip`] and the regular object reads, which report
+    /// any error. Sides with fewer than [`PRIME_TIPS_MIN`] tips are left alone too.
+    fn prime_tips(&mut self, tips: &[ObjectId]) {
+        if tips.len() < PRIME_TIPS_MIN {
+            return;
+        }
+        let pending: Vec<ObjectId> = tips
+            .iter()
+            .filter(|oid| {
+                !self.header_primed.contains(*oid)
+                    && self.is_plain_tip(oid)
+                    && !self.graph_lists(oid)
+            })
+            .copied()
+            .collect();
+        let repo = self.repo;
+        let read_linkage = |oid: &ObjectId| -> Option<(i64, Vec<ObjectId>)> {
+            let mut buf = Vec::new();
+            if !repo
+                .odb()
+                .read_packed_commit_header_block_into(oid, &mut buf)
+                .ok()?
+            {
+                return None;
+            }
+            let commit = CommitRef::parse(&buf).ok()?;
+            Some((commit.committer_timestamp(), commit.parents().to_vec()))
+        };
+        let read = crate::rev_list::map_commits_in_parallel(&pending, read_linkage);
+        for (oid, linkage) in pending.into_iter().zip(read) {
+            if let Some((time, parents)) = linkage {
+                self.record_linkage(oid, oid, time, &parents);
+                self.header_primed.insert(oid);
+            }
+        }
+    }
+
+    /// Peel a walk tip to its commit, like [`try_peel_to_commit_for_merge_base`], without a read
+    /// for tips [`Self::prime_tips`] recorded or the commit-graph lists.
+    fn peel_tip(&mut self, oid: ObjectId) -> Result<Option<ObjectId>> {
+        if self.header_primed.contains(&oid) || (self.is_plain_tip(&oid) && self.graph_lists(&oid))
+        {
+            return Ok(Some(oid));
+        }
+        try_peel_to_commit_for_merge_base(self.repo, oid)
     }
 
     /// Committer timestamp (unix seconds) for `oid`, peeling tags to their commit.
@@ -3397,6 +3631,93 @@ mod tests {
             },
         )?;
         Repository::open(dir.path(), &RepositoryOptions::empty())
+    }
+
+    #[test]
+    fn parents_of_reads_through_one_buffer_without_session_copies() -> Result<()> {
+        let dir = tempdir()?;
+        let repo = open_test_bare(&dir)?;
+        let root = write_commit_same_time(repo.odb(), &[], "root", 100)?;
+        let mid = write_commit_same_time(repo.odb(), &[root], "mid", 200)?;
+        let tip = write_commit_same_time(repo.odb(), &[mid], "tip with a longer message", 300)?;
+        let tag = repo.odb().write_loose_materialize(
+            ObjectKind::Tag,
+            format!("object {tip}\ntype commit\ntag v1\ntagger T <t@e.com> 300 +0000\n\nv1\n")
+                .as_bytes(),
+        )?;
+
+        let mut cache = CommitGraphCache::with_commit_graph(&repo, false);
+        cache.retained = Some(WalkedCommits::default());
+        cache.retain_reads = true;
+        assert_eq!(cache.parents_of(tip)?, vec![mid]);
+        assert_eq!(cache.parents_of(mid)?, vec![root]);
+        assert_eq!(cache.parents_of(root)?, Vec::<ObjectId>::new());
+        for oid in [tip, mid, root] {
+            assert!(
+                !repo.odb().session_read_is_cached(&oid),
+                "walked commit {oid} must not be copied into the session read cache"
+            );
+        }
+        use crate::porcelain::log::CommitReuse;
+        let mut retained = cache.retained.take().expect("retention enabled");
+        for (oid, message) in [(tip, "tip with a longer message\n"), (root, "root\n")] {
+            let data = retained
+                .take_commit(&oid)
+                .expect("walked commit is retained")?;
+            assert_eq!(data.message, message);
+        }
+
+        cache.retain_reads = false;
+        assert_eq!(cache.parents_of(tag)?, vec![mid]);
+        let _ = repo.odb().read(&mid)?;
+        assert!(repo.odb().session_read_is_cached(&mid));
+        Ok(())
+    }
+
+    #[test]
+    fn merge_bases_all_vs_union_matches_a_real_merge_of_the_others() -> Result<()> {
+        let dir = tempdir().map_err(Error::Io)?;
+        let repo = open_test_bare(&dir)?;
+        let odb = repo.odb();
+        let root = write_commit_same_time(&odb, &[], "root", 100)?;
+        let a1 = write_commit_same_time(&odb, &[root], "a1", 200)?;
+        let b1 = write_commit_same_time(&odb, &[root], "b1", 300)?;
+        let ours = write_commit_same_time(&odb, &[a1, b1], "ours", 400)?;
+        let theirs = write_commit_same_time(&odb, &[b1, a1], "theirs", 500)?;
+        let c1 = write_commit_same_time(&odb, &[root], "c1", 600)?;
+        let merged = write_commit_same_time(&odb, &[ours, c1], "virtual", 700)?;
+        let other = write_commit_same_time(&odb, &[theirs, c1], "other", 800)?;
+
+        assert_eq!(merge_bases_all(&repo, &[ours, theirs])?, vec![b1, a1]);
+        assert_eq!(
+            merge_bases_all_vs_union(&repo, other, &[ours, c1])?,
+            merge_bases_all(&repo, &[other, merged])?,
+        );
+        assert_eq!(
+            merge_bases_all_vs_union(&repo, other, &[ours, c1])?,
+            vec![c1, b1, a1]
+        );
+        assert_eq!(merge_bases_all_vs_union(&repo, a1, &[a1, b1])?, vec![a1]);
+        Ok(())
+    }
+
+    #[test]
+    fn merge_bases_with_equal_dates_keep_discovery_order() -> Result<()> {
+        let dir = tempdir().map_err(Error::Io)?;
+        let repo = open_test_bare(&dir)?;
+        let odb = repo.odb();
+        let root = write_commit_same_time(&odb, &[], "root", 100)?;
+        let sides: Vec<ObjectId> = (0..4)
+            .map(|i| write_commit_same_time(&odb, &[root], &format!("side {i}"), 100))
+            .collect::<Result<_>>()?;
+        let left = write_commit_same_time(&odb, &sides, "left", 100)?;
+        let mut reversed = sides.clone();
+        reversed.reverse();
+        let right = write_commit_same_time(&odb, &reversed, "right", 100)?;
+        // Same dates: the walk visits `left`'s parents in parent order first.
+        assert_eq!(merge_bases_all(&repo, &[left, right])?, sides);
+        assert_eq!(merge_bases_all(&repo, &[right, left])?, reversed);
+        Ok(())
     }
 
     #[test]
@@ -4607,6 +4928,222 @@ mod tests {
 
         assert_eq!(total, 30);
         assert_eq!(newest, vec![chain[29], chain[28], chain[27]]);
+        Ok(())
+    }
+
+    /// Point `refs` at their commits, pack everything they reach with whole objects (no
+    /// deltas), and reopen the repository so reads go through the pack.
+    fn packed_over_refs(
+        dir: &tempfile::TempDir,
+        repo: Repository,
+        refs: &[(String, ObjectId)],
+    ) -> Result<Repository> {
+        for (name, oid) in refs {
+            crate::refs::write_ref(repo.git_dir(), name, oid)?;
+        }
+        let opts = crate::maintenance::RepackOptions {
+            pack_build: Some(crate::pack_objects::PackBuildOptions {
+                delta: false,
+                window: 0,
+                max_depth: 0,
+                ..crate::pack_objects::PackBuildOptions::for_local_copy(None)
+            }),
+            ..crate::maintenance::RepackOptions::default()
+        };
+        crate::maintenance::repack(&repo, &opts)?;
+        drop(repo);
+        Repository::open(dir.path(), &RepositoryOptions::empty())
+    }
+
+    /// A trunk with one old tagged side commit per tag, every tag older than the trunk tip.
+    struct ManyTags {
+        trunk: Vec<ObjectId>,
+        tags: Vec<ObjectId>,
+        refs: Vec<(String, ObjectId)>,
+    }
+
+    fn write_many_tags(repo: &Repository, count: usize) -> Result<ManyTags> {
+        const HOUR: i64 = 3_600;
+        let trunk = write_chain(repo, count + 10, |i| 1_000_000 + HOUR * i as i64)?;
+        let mut tags = Vec::with_capacity(count);
+        let mut refs = vec![("refs/heads/main".to_owned(), trunk[count + 9])];
+        for i in 0..count {
+            let tag = write_commit_same_time(
+                &repo.odb(),
+                &[trunk[i]],
+                &format!("release {i}\n\nA longer message body for release {i}."),
+                1_000_000 + HOUR * i as i64 + 60,
+            )?;
+            refs.push((format!("refs/tags/v{i}"), tag));
+            tags.push(tag);
+        }
+        Ok(ManyTags { trunk, tags, refs })
+    }
+
+    #[test]
+    fn prime_tips_records_the_linkage_a_full_read_records() -> Result<()> {
+        let dir = tempdir().map_err(Error::Io)?;
+        let repo = open_test_bare(&dir)?;
+        let history = write_many_tags(&repo, PRIME_TIPS_MIN + 16)?;
+        let repo = packed_over_refs(&dir, repo, &history.refs)?;
+
+        let mut expected = Vec::new();
+        clear_commit_linkage(&repo);
+        let mut full = CommitGraphCache::new(&repo);
+        for &tag in &history.tags {
+            expected.push((full.parents_of(tag)?, full.commit_time(tag)?));
+        }
+
+        clear_commit_linkage(&repo);
+        let mut primed = CommitGraphCache::new(&repo);
+        primed.prime_tips(&history.tags);
+        assert_eq!(primed.header_primed.len(), history.tags.len());
+        for (&tag, want) in history.tags.iter().zip(&expected) {
+            assert_eq!(primed.peel_tip(tag)?, Some(tag));
+            let recorded = primed.with_linkage(|link| {
+                (
+                    link.parents.get(&tag).cloned(),
+                    link.times.get(&tag).copied(),
+                )
+            });
+            assert_eq!(recorded, (Some(want.0.clone()), Some(want.1)), "{tag}");
+        }
+
+        clear_commit_linkage(&repo);
+        let mut few = CommitGraphCache::new(&repo);
+        few.prime_tips(&history.tags[..PRIME_TIPS_MIN - 1]);
+        assert!(
+            few.header_primed.is_empty(),
+            "a paint with few tips keeps the plain reads"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn prime_tips_leaves_loose_commits_and_tags_to_the_full_peel() -> Result<()> {
+        use crate::objects::{serialize_tag, TagData};
+
+        let dir = tempdir().map_err(Error::Io)?;
+        let repo = open_test_bare(&dir)?;
+        let history = write_many_tags(&repo, PRIME_TIPS_MIN)?;
+        let repo = packed_over_refs(&dir, repo, &history.refs)?;
+        let loose = write_commit_same_time(&repo.odb(), &[history.tags[0]], "loose", 9_999_999)?;
+        let tag_bytes = serialize_tag(&TagData {
+            object: history.tags[1],
+            object_type: "commit".into(),
+            tag: "annotated".into(),
+            tagger: Some("T <t@e.com> 1 +0000".into()),
+            message: "annotated\n".into(),
+            extra_headers: Vec::new(),
+        });
+        let annotated = repo.odb().write(ObjectKind::Tag, &tag_bytes)?;
+        let mut tips = history.tags.clone();
+        tips.extend([loose, annotated]);
+
+        clear_commit_linkage(&repo);
+        let mut cache = CommitGraphCache::new(&repo);
+        cache.prime_tips(&tips);
+        assert_eq!(cache.header_primed.len(), history.tags.len());
+        assert!(!cache.header_primed.contains(&loose));
+        assert!(!cache.header_primed.contains(&annotated));
+        assert_eq!(cache.peel_tip(loose)?, Some(loose));
+        assert_eq!(cache.peel_tip(annotated)?, Some(history.tags[1]));
+        Ok(())
+    }
+
+    #[test]
+    fn left_behind_walk_over_many_packed_tags_matches_the_exhaustive_walk() -> Result<()> {
+        let dir = tempdir().map_err(Error::Io)?;
+        let repo = open_test_bare(&dir)?;
+        let history = write_many_tags(&repo, 2 * PRIME_TIPS_MIN)?;
+        let tip = *history.trunk.last().expect("trunk");
+        let repo = packed_over_refs(&dir, repo, &history.refs)?;
+        let wip = write_commit_same_time(&repo.odb(), &[tip], "wip", 9_000_000)?;
+        let mut hide: Vec<ObjectId> = history.refs.iter().map(|(_, oid)| *oid).collect();
+
+        for expected in [(1, vec![wip]), (0, Vec::new())] {
+            clear_commit_linkage(&repo);
+            let exhaustive = walk_commits_reachable_excluding_ancestors_of(
+                &repo,
+                &[wip],
+                &hide,
+                ReachableWalkLimit::CountAllRetainNewest(20),
+            )?;
+            clear_commit_linkage(&repo);
+            let bounded = count_commits_left_behind(&repo, &[wip], &hide, 20)?;
+            assert_eq!(bounded, expected);
+            assert_eq!(bounded, exhaustive);
+            // A ref on a descendant of `wip` keeps it reachable.
+            let child = write_commit_same_time(&repo.odb(), &[wip], "child", 9_000_100)?;
+            hide.push(child);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn rewound_ref_is_not_an_ancestor_without_the_slop_walk() -> Result<()> {
+        use super::intersect_walk_test_hooks::{
+            commit_parent_lookups, reset_commit_parent_lookups,
+        };
+
+        const HOUR: i64 = 3_600;
+        let dir = tempdir().map_err(Error::Io)?;
+        let repo = open_test_bare(&dir)?;
+        let trunk = write_chain(&repo, 400, |i| 1_000_000 + HOUR * i as i64)?;
+        let wip = write_commit_same_time(&repo.odb(), &[trunk[399]], "wip", 9_000_000)?;
+        let side = write_commit_same_time(&repo.odb(), &[trunk[200]], "side", 9_000_000)?;
+
+        for (ancestor, descendant) in [
+            (wip, trunk[399]),
+            (wip, trunk[396]),
+            (trunk[396], wip),
+            (side, trunk[399]),
+            (trunk[100], side),
+            (trunk[399], trunk[399]),
+        ] {
+            clear_commit_linkage(&repo);
+            let expected = is_ancestor(&repo, ancestor, descendant)?;
+            clear_commit_linkage(&repo);
+            assert_eq!(
+                is_ancestor_unless_rewound(&repo, ancestor, descendant)?,
+                expected,
+                "{ancestor} -> {descendant}"
+            );
+        }
+
+        clear_commit_linkage(&repo);
+        reset_commit_parent_lookups();
+        assert!(is_ancestor(&repo, wip, trunk[396]).is_ok_and(|a| !a));
+        let slop_lookups = commit_parent_lookups();
+        clear_commit_linkage(&repo);
+        reset_commit_parent_lookups();
+        assert!(!is_ancestor_unless_rewound(&repo, wip, trunk[396])?);
+        let lookups = commit_parent_lookups();
+        assert!(slop_lookups >= 100, "the date-slop walk ({slop_lookups})");
+        // The target, then `wip` and the three commits down the chain to it.
+        assert!(lookups <= 5, "HEAD~3 is found on the chain ({lookups})");
+        Ok(())
+    }
+
+    #[test]
+    fn rewound_check_defers_to_the_full_walk_when_grafts_rewrite_parents() -> Result<()> {
+        let dir = tempdir().map_err(Error::Io)?;
+        let repo = open_test_bare(&dir)?;
+        let base = write_commit_same_time(&repo.odb(), &[], "base", 100)?;
+        let tip = write_commit_same_time(&repo.odb(), &[base], "tip", 200)?;
+        // The graft makes `base` a child of `tip`: each reaches the other.
+        fs::create_dir_all(repo.git_dir().join("info"))?;
+        fs::write(
+            repo.git_dir().join("info/grafts"),
+            format!("{base} {tip}\n"),
+        )?;
+        let repo = Repository::open(dir.path(), &RepositoryOptions::empty())?;
+
+        clear_commit_linkage(&repo);
+        let expected = is_ancestor(&repo, tip, base)?;
+        clear_commit_linkage(&repo);
+        assert_eq!(is_ancestor_unless_rewound(&repo, tip, base)?, expected);
+        assert!(expected, "the graft makes {tip} an ancestor of {base}");
         Ok(())
     }
 }

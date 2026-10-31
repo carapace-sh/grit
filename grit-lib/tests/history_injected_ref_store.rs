@@ -289,6 +289,7 @@ fn clean_start_rebase_on_memory_backends_moves_the_branch_in_the_store() {
                 ..rewrite_opts()
             }),
             apply: apply_opts("rebase", Some("rebase")),
+            pre_rebase: grit_lib::revwalk::history::PreRebase::Skip,
         },
         &mut NullProgress,
         &NeverCancel,
@@ -344,13 +345,14 @@ fn rebase_exec_detaches_and_restores_head_in_the_store() {
     let disk_head = fs::read_to_string(git_dir.join("HEAD")).expect("HEAD");
     let tips = three_commits(&repo, dir.path());
 
-    let plan = reword(&repo, tips[1], "reworded\n".into(), &rewrite_opts()).expect("plan");
+    let mut plan = reword(&repo, tips[1], "reworded\n".into(), &rewrite_opts()).expect("plan");
     let report = verify_rebase_with_exec(
         &repo,
-        &plan,
+        &mut plan,
         &ExecSpec {
             commands: vec!["test -f f2".into()],
         },
+        &rewrite_opts(),
         system_command_runner().as_ref(),
     )
     .expect("exec");

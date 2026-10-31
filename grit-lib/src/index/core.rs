@@ -19,13 +19,14 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::{self, Write};
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 
 use crate::hash::verify_trailer;
 
 use crate::config::ConfigSet;
 use crate::error::{Error, Result};
-use crate::lockfile::pid_path_for_lock;
+use crate::lockfile::{grit_lockfile_pid_enabled, pid_path_for_lock};
 use crate::objects::{parse_tree, HashAlgo, ObjectId, ObjectKind, TreeEntry};
 use crate::odb::Odb;
 use crate::repo::Repository;
@@ -48,6 +49,37 @@ pub const MODE_GITLINK: u32 = 0o160000;
 /// File mode for a directory (tree) entry — only used in tree objects, not index.
 pub const MODE_TREE: u32 = 0o040000;
 
+/// Whether `mode` is a tree (directory) by Git type bits, including `040755`.
+#[must_use]
+pub(crate) fn is_tree_mode(mode: u32) -> bool {
+    (mode & 0o170000) == MODE_TREE
+}
+
+/// Canonical index/tree-entry mode, mirroring Git's `canon_mode` / `create_ce_from_modes`.
+///
+/// Legacy tree object modes such as `100664` and `100775` collapse to `100644` / `100755`.
+/// Only canonical modes may be stored in the index.
+#[must_use]
+pub(crate) fn canon_mode(mode: u32) -> u32 {
+    const S_IFMT: u32 = 0o170000;
+    const S_IFREG: u32 = 0o100000;
+    const S_IFLNK: u32 = 0o120000;
+    const S_IFGITLINK: u32 = 0o160000;
+    match mode & S_IFMT {
+        S_IFREG => {
+            if mode & 0o111 != 0 {
+                MODE_EXECUTABLE
+            } else {
+                MODE_REGULAR
+            }
+        }
+        S_IFLNK => MODE_SYMLINK,
+        S_IFGITLINK => MODE_GITLINK,
+        MODE_TREE => MODE_TREE,
+        _ => MODE_REGULAR,
+    }
+}
+
 /// Git `match_stat_data` policy (`core.trustctime`, `core.checkstat`, `core.usenanosec`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StatMatchPolicy {
@@ -55,7 +87,11 @@ pub struct StatMatchPolicy {
     pub trust_ctime: bool,
     /// When true, compare owner, inode, device, and nanoseconds (if `use_nanosec`).
     pub check_stat: bool,
-    /// When true with `check_stat`, compare sub-second mtime/ctime fractions.
+    /// When true with `check_stat`, compare sub-second mtime/ctime fractions, and judge an
+    /// entry racily clean only when its mtime is at or after the index file's to the
+    /// nanosecond rather than to the second.
+    ///
+    /// Defaults to [`Self::DEFAULT_USE_NANOSEC`].
     pub use_nanosec: bool,
 }
 
@@ -64,13 +100,22 @@ impl Default for StatMatchPolicy {
         Self {
             trust_ctime: true,
             check_stat: true,
-            use_nanosec: false,
+            use_nanosec: Self::DEFAULT_USE_NANOSEC,
         }
     }
 }
 
 impl StatMatchPolicy {
-    /// Load policy from repository config, using Git's defaults for unset keys.
+    /// `core.usenanosec` when the key is unset: on for Windows, off elsewhere.
+    ///
+    /// A clone or switch writes the whole tree and then its index within the same second.
+    /// Under whole-second racy detection every entry is then re-read once by the next status,
+    /// and opening files is what makes that slow on Windows. NTFS keeps 100 ns timestamps, so
+    /// comparing sub-second fractions there is sound and keeps that first status stat-only,
+    /// as it is with Git for Windows. Elsewhere Git's default is off.
+    pub const DEFAULT_USE_NANOSEC: bool = cfg!(windows);
+
+    /// Load policy from repository config, using the platform defaults for unset keys.
     #[must_use]
     pub fn from_config(config: Option<&ConfigSet>) -> Self {
         let mut policy = Self::default();
@@ -293,6 +338,8 @@ impl IndexEntry {
     const FLAG_EXT_OVERLAY_TREE_SKIP: u16 = 0x8000;
     /// In-memory and on-disk compatibility bit for fsmonitor validity (`git ls-files -f`).
     const FLAG_EXT_FSMONITOR_VALID: u16 = 0x1000;
+    /// In-memory only (Git `CE_UPTODATE`): see [`Self::mark_content_verified`].
+    const FLAG_EXT_CONTENT_VERIFIED: u16 = 0x0800;
     /// Extended flags Git persists in the on-disk index (`CE_EXTENDED_FLAGS` in `read-cache-ll.h`).
     /// `CE_FSMONITOR_VALID` is in-memory only; fsmonitor state lives in the `FSMN` extension.
     const FLAG_EXT_ON_DISK: u16 = 0x2000 | 0x4000;
@@ -339,6 +386,34 @@ impl IndexEntry {
                 self.flags_extended = None;
             }
         }
+    }
+
+    /// Compare extended flags for merge index fast paths, ignoring in-memory-only bits.
+    pub(crate) fn extended_flags_equal_ignoring_volatile(
+        left: Option<u16>,
+        right: Option<u16>,
+    ) -> bool {
+        (left.unwrap_or(0) & Self::FLAG_EXT_ON_DISK)
+            == (right.unwrap_or(0) & Self::FLAG_EXT_ON_DISK)
+    }
+
+    /// Mark this entry's `oid` as just hashed from the worktree file whose stat data it holds
+    /// (in-memory only, like [`Index::mark_content_verified`] without a per-path map entry).
+    pub(crate) fn mark_content_verified(&mut self) {
+        *self.flags_extended.get_or_insert(0) |= Self::FLAG_EXT_CONTENT_VERIFIED;
+    }
+
+    /// Clear the content-verified bit, returning whether it was set.
+    pub(crate) fn take_content_verified(&mut self) -> bool {
+        let Some(fe) = self.flags_extended else {
+            return false;
+        };
+        if fe & Self::FLAG_EXT_CONTENT_VERIFIED == 0 {
+            return false;
+        }
+        let rest = fe & !Self::FLAG_EXT_CONTENT_VERIFIED;
+        self.flags_extended = (rest != 0).then_some(rest);
+        true
     }
 }
 
@@ -389,6 +464,10 @@ pub struct Index {
     pub hash_algo: HashAlgo,
     /// On-disk index mtime when this index was last read (Git `istate->timestamp`).
     pub source_mtime: Option<(u32, u32)>,
+    /// Trailing checksum bytes from the on-disk index at load time (not recomputed after stat refresh).
+    pub(crate) source_checksum: Option<Vec<u8>>,
+    /// On-disk index byte length at load time (pairs with [`Self::source_checksum`] under `index.skipHash`).
+    pub(crate) source_file_len: Option<u64>,
     /// When set, [`Self::invalidate_untracked_cache_for_path`] is a no-op (bulk staging defers invalidation).
     pub(crate) defer_untracked_cache_invalidation: bool,
     /// Skip the pre-write racy smudge walk (checkout just aligned worktree and index entries).
@@ -396,12 +475,15 @@ pub struct Index {
     /// In-memory only (Git `CE_UPTODATE`): stage-0 paths whose worktree content this process
     /// hashed to the recorded object id after taking the stat data now in the entry. The
     /// pre-write racy smudge skips an entry that still holds that id instead of reading the
-    /// file again; the next index write consumes the map.
+    /// file again; the next index write consumes the map. Bulk staging marks freshly built
+    /// entries with [`IndexEntry::mark_content_verified`] instead, which needs no path copy.
     pub(crate) content_verified: HashMap<Vec<u8>, ObjectId>,
     /// In-memory only: Git `istate->fsmonitor_has_run_once`.
     pub(crate) fsmonitor_refresh_ran: bool,
     /// Skip racy smudge and UNTR shell setup on the next index write (checkout fast path).
     pub(crate) suppress_pre_write_index_housekeeping: bool,
+    /// Set when a loaded on-disk index had non-canonical entry modes repaired in memory.
+    pub(crate) entry_modes_repaired_on_load: bool,
 }
 
 impl Default for Index {
@@ -769,12 +851,33 @@ impl Index {
             cache_tree: None,
             hash_algo: HashAlgo::Sha1,
             source_mtime: None,
+            source_checksum: None,
+            source_file_len: None,
             defer_untracked_cache_invalidation: false,
             skip_racy_smudge_on_write: false,
             content_verified: HashMap::new(),
             fsmonitor_refresh_ran: false,
             suppress_pre_write_index_housekeeping: false,
+            entry_modes_repaired_on_load: false,
         }
+    }
+
+    /// Normalize any legacy or non-canonical entry modes to Git index form.
+    pub(crate) fn repair_noncanonical_entry_modes(&mut self) -> bool {
+        let mut repaired = false;
+        for entry in &mut self.entries {
+            let canon = canon_mode(entry.mode);
+            if entry.mode != canon {
+                entry.mode = canon;
+                repaired = true;
+            }
+        }
+        if repaired {
+            self.entry_modes_repaired_on_load = true;
+            self.cache_tree_root = None;
+            self.cache_tree = None;
+        }
+        repaired
     }
 
     /// Index entries used for `.gitattributes` fallback when the worktree copy is missing.
@@ -821,11 +924,14 @@ impl Index {
             cache_tree: None,
             hash_algo: HashAlgo::Sha1,
             source_mtime: None,
+            source_checksum: None,
+            source_file_len: None,
             defer_untracked_cache_invalidation: false,
             skip_racy_smudge_on_write: false,
             content_verified: HashMap::new(),
             fsmonitor_refresh_ran: false,
             suppress_pre_write_index_housekeeping: false,
+            entry_modes_repaired_on_load: false,
         }
     }
 
@@ -853,11 +959,14 @@ impl Index {
                 cache_tree: None,
                 hash_algo: HashAlgo::default(),
                 source_mtime: None,
+                source_checksum: None,
+                source_file_len: None,
                 defer_untracked_cache_invalidation: false,
                 skip_racy_smudge_on_write: false,
                 content_verified: HashMap::new(),
                 fsmonitor_refresh_ran: false,
                 suppress_pre_write_index_housekeeping: false,
+                entry_modes_repaired_on_load: false,
             };
         }
 
@@ -893,11 +1002,14 @@ impl Index {
             cache_tree: None,
             hash_algo: HashAlgo::default(),
             source_mtime: None,
+            source_checksum: None,
+            source_file_len: None,
             defer_untracked_cache_invalidation: false,
             skip_racy_smudge_on_write: false,
             content_verified: HashMap::new(),
             fsmonitor_refresh_ran: false,
             suppress_pre_write_index_housekeeping: false,
+            entry_modes_repaired_on_load: false,
         }
     }
 
@@ -923,11 +1035,14 @@ impl Index {
                 cache_tree: None,
                 hash_algo: HashAlgo::default(),
                 source_mtime: None,
+                source_checksum: None,
+                source_file_len: None,
                 defer_untracked_cache_invalidation: false,
                 skip_racy_smudge_on_write: false,
                 content_verified: HashMap::new(),
                 fsmonitor_refresh_ran: false,
                 suppress_pre_write_index_housekeeping: false,
+                entry_modes_repaired_on_load: false,
             };
         }
 
@@ -966,11 +1081,14 @@ impl Index {
             cache_tree: None,
             hash_algo: HashAlgo::default(),
             source_mtime: None,
+            source_checksum: None,
+            source_file_len: None,
             defer_untracked_cache_invalidation: false,
             skip_racy_smudge_on_write: false,
             content_verified: HashMap::new(),
             fsmonitor_refresh_ran: false,
             suppress_pre_write_index_housekeeping: false,
+            entry_modes_repaired_on_load: false,
         }
     }
 
@@ -985,7 +1103,7 @@ impl Index {
         match read_index_file(path) {
             Ok((data, mtime)) => {
                 let mut idx = Self::parse(&data)?;
-                idx.source_mtime = Some(mtime);
+                record_loaded_index_identity(&mut idx, &data, mtime);
                 Ok(idx)
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Self {
@@ -1002,10 +1120,11 @@ impl Index {
     /// placeholder is replaced by the blob entries from the referenced tree.
     pub fn load_expand_sparse(path: &Path, odb: &Odb) -> Result<Self> {
         let mut idx = match read_index_file(path) {
-            Ok((data, mtime)) => Self {
-                source_mtime: Some(mtime),
-                ..Self::parse_with_algo(&data, odb.hash_algo())?
-            },
+            Ok((data, mtime)) => {
+                let mut idx = Self::parse_with_algo(&data, odb.hash_algo())?;
+                record_loaded_index_identity(&mut idx, &data, mtime);
+                idx
+            }
             Err(e) if e.kind() == io::ErrorKind::NotFound => Self {
                 sparse_directories: false,
                 hash_algo: odb.hash_algo(),
@@ -1072,10 +1191,11 @@ impl Index {
     ) -> Result<Self> {
         let algo = odb.hash_algo();
         let idx = match read_index_file(path) {
-            Ok((data, mtime)) => Self {
-                source_mtime: Some(mtime),
-                ..Self::parse_with_algo_and_config(&data, algo, config, parse_context)?
-            },
+            Ok((data, mtime)) => {
+                let mut idx = Self::parse_with_algo_and_config(&data, algo, config, parse_context)?;
+                record_loaded_index_identity(&mut idx, &data, mtime);
+                idx
+            }
             Err(e) if e.kind() == io::ErrorKind::NotFound => Self {
                 hash_algo: algo,
                 ..Self::new()
@@ -1155,61 +1275,95 @@ impl Index {
 
         self.ensure_canonical_order();
         let mut prefixes = BTreeSet::<Vec<u8>>::new();
+        let mut last_dir: &[u8] = &[];
         for e in &self.entries {
             if e.stage() != 0 || e.mode == MODE_TREE || !e.skip_worktree() {
                 continue;
             }
+            // Sorted rows share their directory with their neighbours; every ancestor of a
+            // directory already seen is already in the set.
+            let Some(slash) = e.path.iter().rposition(|&b| b == b'/') else {
+                continue;
+            };
+            let dir = &e.path[..slash];
+            if dir == last_dir {
+                continue;
+            }
+            last_dir = dir;
             collect_directory_prefixes(&e.path, &mut prefixes);
         }
 
-        let mut collapsed_any = false;
         // Deepest prefixes first so nested dirs collapse before parents.
         let mut ordered: Vec<Vec<u8>> = prefixes.into_iter().collect();
         ordered.sort_by_key(|p| std::cmp::Reverse(p.len()));
 
+        // Each directory is judged against the index as it would look with the directories
+        // collapsed so far, but `entries` is only rewritten once at the end: removing rows and
+        // inserting a placeholder per directory is O(entries) each.
+        let mut collapsed = CollapsedDirectories::default();
+        let mut head_trees = PrefixTreeResolver::new(*head_tree);
         for pref in ordered {
             let pref_str = String::from_utf8_lossy(&pref);
             if directory_in_cone(&pref_str, patterns, cone_mode) {
                 continue;
             }
-            let Some(subtree_oid) = tree_oid_for_prefix(odb, head_tree, &pref)? else {
+            let Some(subtree_oid) = head_trees.resolve(odb, &pref)? else {
                 continue;
             };
-            let expected = collect_sparse_aware_expected_blobs(
+            let view = SparseCollapseView {
+                entries: &self.entries,
+                collapsed: &collapsed,
+            };
+            let mut expected = collect_sparse_aware_expected_blobs(
                 odb,
                 &subtree_oid,
                 &pref,
                 patterns,
                 cone_mode,
-                &self.entries,
+                &view,
                 protect,
             )?;
-            if expected.is_empty() {
-                continue;
-            }
             let mut directory = pref.clone();
             directory.push(b'/');
             let start = self.entries.partition_point(|e| e.path < directory);
             let end =
                 start + self.entries[start..].partition_point(|e| e.path.starts_with(&directory));
             let rows = &self.entries[start..end];
+            if expected.is_empty() {
+                if try_collapse_directory_of_sparse_placeholders(
+                    odb,
+                    &directory,
+                    rows,
+                    &subtree_oid,
+                )? {
+                    collapsed.insert(directory.clone(), subtree_oid);
+                    if let Ok(p) = std::str::from_utf8(&directory) {
+                        self.invalidate_untracked_cache_for_path(p);
+                    }
+                    self.invalidate_cache_tree_for_path(&directory);
+                    self.touch_fsmonitor_after_entry_change();
+                }
+                continue;
+            }
             if rows.iter().any(|e| e.stage() != 0) {
                 continue;
             }
-            let mut matched: Vec<_> = rows
+            // Rows are sorted and all stage 0, so `matched` is already in path order.
+            let nested = collapsed.has_descendants(&directory);
+            let mut scratch = Vec::new();
+            let matched: Vec<&IndexEntry> = rows
                 .iter()
-                .filter(|e| e.mode != MODE_TREE)
-                .cloned()
+                .filter(|e| {
+                    e.mode != MODE_TREE && !(nested && collapsed.covers(&e.path, &mut scratch))
+                })
                 .collect();
             if matched.len() != expected.len() {
                 continue;
             }
-            matched.sort_by(|a, b| a.path.cmp(&b.path));
-            let mut exp_sorted = expected;
-            exp_sorted.sort_by(|a, b| a.path.cmp(&b.path));
+            expected.sort_by(|a, b| a.path.cmp(&b.path));
             if !matched
                 .iter()
-                .zip(exp_sorted.iter())
+                .zip(expected.iter())
                 .all(|(a, b)| a.path == b.path && a.oid == b.oid && a.mode == b.mode)
             {
                 continue;
@@ -1221,42 +1375,31 @@ impl Index {
             // submodule (gitlink); the sparse-directory entry could not faithfully represent
             // the gitlink's committed OID. Leave such directories expanded.
             if matched.iter().any(|e| e.mode == MODE_GITLINK)
-                || exp_sorted.iter().any(|e| e.mode == MODE_GITLINK)
+                || expected.iter().any(|e| e.mode == MODE_GITLINK)
             {
                 continue;
             }
 
-            let mut path_with_slash = pref.clone();
-            if !path_with_slash.ends_with(b"/") {
-                path_with_slash.push(b'/');
+            collapsed.insert(directory.clone(), subtree_oid);
+            if let Ok(p) = std::str::from_utf8(&directory) {
+                self.invalidate_untracked_cache_for_path(p);
             }
-            self.entries
-                .retain(|e| e.stage() != 0 || !path_under_prefix(&e.path, &pref));
-            let mut placeholder = IndexEntry {
-                ctime_sec: 0,
-                ctime_nsec: 0,
-                mtime_sec: 0,
-                mtime_nsec: 0,
-                dev: 0,
-                ino: 0,
-                mode: MODE_TREE,
-                uid: 0,
-                gid: 0,
-                size: 0,
-                oid: subtree_oid,
-                flags: path_with_slash.len().min(0xFFF) as u16,
-                flags_extended: Some(0),
-                path: path_with_slash,
-                base_index_pos: 0,
-            };
-            placeholder.set_skip_worktree(true);
-            self.add_or_replace(placeholder);
-            collapsed_any = true;
+            self.invalidate_cache_tree_for_path(&directory);
+            self.touch_fsmonitor_after_entry_change();
         }
 
-        if collapsed_any {
+        if !collapsed.is_empty() {
+            let covered = collapsed.covered_rows(&self.entries);
+            let mut entries: Vec<IndexEntry> = std::mem::take(&mut self.entries)
+                .into_iter()
+                .zip(covered)
+                .filter(|(e, covered)| e.stage() != 0 || !covered)
+                .map(|(e, _)| e)
+                .collect();
+            entries.extend(collapsed.into_placeholders());
+            self.entries = entries;
+            self.entries_sorted = false;
             self.sort();
-            self.sparse_directories = true;
         }
         self.sparse_directories = self.has_sparse_directory_placeholders();
         Ok(())
@@ -1408,7 +1551,7 @@ impl Index {
             (entries, ext_fields)
         };
 
-        Ok(Self {
+        let mut index = Self {
             version,
             entries,
             entries_sorted: true,
@@ -1423,12 +1566,17 @@ impl Index {
             cache_tree: ext_fields.cache_tree,
             hash_algo,
             source_mtime: None,
+            source_checksum: None,
+            source_file_len: None,
             defer_untracked_cache_invalidation: false,
             skip_racy_smudge_on_write: false,
             content_verified: HashMap::new(),
             fsmonitor_refresh_ran: false,
             suppress_pre_write_index_housekeeping: false,
-        })
+            entry_modes_repaired_on_load: false,
+        };
+        index.repair_noncanonical_entry_modes();
+        Ok(index)
     }
 
     /// Write the index to a file, computing and appending the trailing SHA-1.
@@ -1546,21 +1694,22 @@ impl Index {
 
         let tmp_path = path.with_extension("lock");
         let pid_path = pid_path_for_lock(&tmp_path);
-        let lockfile_pid_enabled = lockfile_pid_enabled(path, config);
+        let lockfile_pid_enabled = grit_lockfile_pid_enabled(config, path.parent());
 
         use crate::lockfile::{LockFile, LockWait};
         let wait = LockWait::files_ref_lock(config);
-        let (tmp_path, mut lock_file) =
-            LockFile::acquire(&tmp_path, wait).and_then(LockFile::into_open_file)?;
-
-        let mut wrote_pid_file = false;
+        let mut lock_file = LockFile::acquire(&tmp_path, wait).map_err(Error::from)?;
         if lockfile_pid_enabled {
-            if let Err(e) = write_lock_pid_file(&pid_path) {
-                let _ = fs::remove_file(&tmp_path);
-                return Err(Error::Io(e));
+            if let Err(e) = lock_file
+                .write_holder_pid()
+                .map_err(crate::error::Error::from)
+            {
+                lock_file.rollback();
+                return Err(e);
             }
-            wrote_pid_file = true;
         }
+        let wrote_pid_file = lockfile_pid_enabled;
+        let (tmp_path, mut lock_file) = lock_file.into_open_file()?;
 
         if let Err(e) =
             write_index_body_and_trailer(&mut lock_file, self.hash_algo, skip_hash, &body)
@@ -1573,7 +1722,7 @@ impl Index {
         }
         drop(lock_file);
 
-        if let Err(e) = fs::rename(&tmp_path, path) {
+        if let Err(e) = crate::atomic_replace::replace_file(&tmp_path, path) {
             let _ = fs::remove_file(&tmp_path);
             if wrote_pid_file {
                 let _ = fs::remove_file(&pid_path);
@@ -1615,7 +1764,10 @@ impl Index {
             entries_per_ieot_block, ieot_block_count_for_write, record_end_of_index_entries,
             write_ieot_payload, IeotEntry, IeotTable, INDEX_EXT_EOIE, INDEX_EXT_IEOT,
         };
-        let has_extended_flags = self.entries.iter().any(|e| e.flags_extended.is_some());
+        let has_extended_flags = self.entries.iter().any(|e| {
+            e.flags_extended
+                .is_some_and(|fe| IndexEntry::disk_flags_extended(fe) != 0)
+        });
         let write_version = if self.version >= 4 {
             4
         } else if has_extended_flags {
@@ -2056,8 +2208,12 @@ impl Index {
             return self.entries.iter().any(|e| e.stage() == 0);
         }
         if self.entries_sorted {
-            let (start, end) = self.descendant_run_range_sorted(rel_dir);
-            return self.entries[start..end].iter().any(|e| e.stage() == 0);
+            let prefix = rel_dir.as_bytes();
+            let start = self.descendant_run_start_sorted(prefix);
+            return self.entries[start..]
+                .iter()
+                .take_while(|e| path_is_under_dir(&e.path, prefix))
+                .any(|e| e.stage() == 0);
         }
         let prefix = format!("{rel_dir}/");
         self.entries
@@ -2065,27 +2221,50 @@ impl Index {
             .any(|e| e.stage() == 0 && e.path.starts_with(prefix.as_bytes()))
     }
 
-    /// Inclusive start and exclusive end of entries strictly under `path/` (sorted indexes only).
-    fn descendant_run_range_sorted(&self, path: &str) -> (usize, usize) {
-        debug_assert!(self.entries_sorted);
-        let prefix = path.as_bytes();
-        let plen = prefix.len();
-        let mut prefix_slash = Vec::with_capacity(plen + 1);
-        prefix_slash.extend_from_slice(prefix);
-        prefix_slash.push(b'/');
-        let start = self.entries.partition_point(|e| {
-            Self::cmp_paths(e.path.as_slice(), prefix_slash.as_slice()).is_lt()
-        });
-        let mut end = start;
-        while end < self.entries.len() {
-            let ep = self.entries[end].path.as_slice();
-            if ep.len() > plen && ep.starts_with(prefix) && ep[plen] == b'/' {
-                end += 1;
-            } else {
-                break;
-            }
+    /// Entries strictly under `dir/` (raw path bytes; every entry when `dir` is empty), in
+    /// index order.
+    ///
+    /// Returns `None` when the entries are not known to be sorted.
+    pub(crate) fn sorted_entries_under(&self, dir: &[u8]) -> Option<&[IndexEntry]> {
+        if !self.entries_sorted {
+            return None;
         }
-        (start, end)
+        if dir.is_empty() {
+            return Some(&self.entries);
+        }
+        let (start, end) = self.descendant_run_range_sorted(dir);
+        Some(&self.entries[start..end])
+    }
+
+    /// Whether some entry (at any stage) has exactly `path`; `None` when the entries are not
+    /// known to be sorted.
+    pub(crate) fn sorted_contains_path(&self, path: &[u8]) -> Option<bool> {
+        self.entries_sorted.then(|| {
+            self.entries
+                .binary_search_by(|e| Self::cmp_paths(e.path.as_slice(), path))
+                .is_ok()
+        })
+    }
+
+    /// Inclusive start and exclusive end of entries strictly under `path/` (sorted indexes only).
+    fn descendant_run_range_sorted(&self, path: &[u8]) -> (usize, usize) {
+        let start = self.descendant_run_start_sorted(path);
+        let len = self.entries[start..]
+            .iter()
+            .take_while(|e| path_is_under_dir(&e.path, path))
+            .count();
+        (start, start + len)
+    }
+
+    /// Position of the first entry that sorts at or after `path/` (sorted indexes only).
+    fn descendant_run_start_sorted(&self, path: &[u8]) -> usize {
+        debug_assert!(self.entries_sorted);
+        let mut prefix_slash = Vec::with_capacity(path.len() + 1);
+        prefix_slash.extend_from_slice(path);
+        prefix_slash.push(b'/');
+        self.entries.partition_point(|e| {
+            Self::cmp_paths(e.path.as_slice(), prefix_slash.as_slice()).is_lt()
+        })
     }
 
     fn record_resolve_undo_for_path(&mut self, path: &[u8]) {
@@ -2394,6 +2573,14 @@ impl Index {
         self.content_verified.insert(path.to_vec(), oid);
     }
 
+    /// Drop every just-hashed mark: the [`Self::content_verified`] map and the per-entry bits.
+    pub(crate) fn clear_content_verified(&mut self) {
+        self.content_verified.clear();
+        for entry in &mut self.entries {
+            entry.take_content_verified();
+        }
+    }
+
     /// Overwrite the stage-0 rows that already hold each replacement's path, in place.
     ///
     /// Same result and cache invalidation as [`Self::replace_stage0_entries_batch`], without
@@ -2442,6 +2629,10 @@ impl Index {
     /// Append sorted `replacements` to a sorted index and merge in one linear pass.
     fn merge_sorted_replacements_into_entries(&mut self, mut replacements: Vec<IndexEntry>) {
         if replacements.is_empty() {
+            return;
+        }
+        if self.entries.is_empty() {
+            self.entries = replacements;
             return;
         }
         self.entries.reserve(replacements.len());
@@ -2548,14 +2739,20 @@ impl Index {
                 .collect::<Vec<_>>();
             self.entries = merge_sorted_index_entries(kept, replacements);
             self.entries_sorted = true;
-            for path in invalidated_paths {
-                self.invalidate_after_path_removal(&path);
-            }
-            for path in repl_for_inval {
-                if let Ok(p) = std::str::from_utf8(&path) {
-                    self.invalidate_untracked_cache_for_path(p);
+            const BULK_INDEX_EXTENSION_INVALIDATE_MIN: usize = 64;
+            let invalidations = invalidated_paths.len() + repl_for_inval.len();
+            if invalidations >= BULK_INDEX_EXTENSION_INVALIDATE_MIN {
+                self.drop_derived_index_extensions();
+            } else {
+                for path in invalidated_paths {
+                    self.invalidate_after_path_removal(&path);
                 }
-                self.invalidate_cache_tree_for_path(&path);
+                for path in repl_for_inval {
+                    if let Ok(p) = std::str::from_utf8(&path) {
+                        self.invalidate_untracked_cache_for_path(p);
+                    }
+                    self.invalidate_cache_tree_for_path(&path);
+                }
             }
             self.touch_fsmonitor_after_entry_change();
             return;
@@ -2775,7 +2972,7 @@ impl Index {
         }
         let plen = prefix.len();
         if self.entries_sorted {
-            let (start, end) = self.descendant_run_range_sorted(path);
+            let (start, end) = self.descendant_run_range_sorted(prefix);
             if start < end {
                 self.record_resolve_undo_for_run(start, end);
                 self.entries.drain(start..end);
@@ -2973,7 +3170,10 @@ impl Index {
     /// Find a mutable entry by path and stage.
     pub fn get_mut(&mut self, path: &[u8], stage: u8) -> Option<&mut IndexEntry> {
         let pos = self.find_entry_pos(path, stage)?;
-        Some(&mut self.entries[pos])
+        let entry = &mut self.entries[pos];
+        // The caller may change `oid` or stat data, which voids a just-hashed mark.
+        entry.take_content_verified();
+        Some(entry)
     }
 
     /// Index positions of stage-0 entries, keyed like [`index_path_outcome_key`].
@@ -3380,16 +3580,6 @@ fn trim_trailing_slash_bytes(path: &[u8]) -> &[u8] {
     path.strip_suffix(b"/").unwrap_or(path)
 }
 
-fn path_under_prefix(path: &[u8], prefix: &[u8]) -> bool {
-    if path == prefix {
-        return true;
-    }
-    if prefix.is_empty() {
-        return true;
-    }
-    path.len() > prefix.len() && path.starts_with(prefix) && path[prefix.len()] == b'/'
-}
-
 fn directory_in_cone(dir_path: &str, patterns: &[String], cone_mode: bool) -> bool {
     // Match Git `path_in_cone_mode_sparse_checkout`: a *directory* is in the cone when its
     // contents are recursively included. `path_matches_sparse_patterns` distinguishes a
@@ -3409,56 +3599,273 @@ fn directory_in_cone(dir_path: &str, patterns: &[String], cone_mode: bool) -> bo
 
 fn collect_directory_prefixes(path: &[u8], out: &mut BTreeSet<Vec<u8>>) {
     for (i, &b) in path.iter().enumerate() {
-        if b == b'/' {
+        if b == b'/' && !out.contains(&path[..i]) {
             out.insert(path[..i].to_vec());
         }
     }
 }
 
-fn tree_oid_for_prefix(odb: &Odb, root_tree: &ObjectId, prefix: &[u8]) -> Result<Option<ObjectId>> {
-    if prefix.is_empty() {
-        return Ok(Some(*root_tree));
+/// Directories chosen for collapse so far, keyed by their path with a trailing slash.
+///
+/// No key is nested under another: collapsing a directory drops the descendants it subsumes.
+#[derive(Default)]
+struct CollapsedDirectories {
+    dirs: BTreeMap<Vec<u8>, ObjectId>,
+}
+
+impl CollapsedDirectories {
+    fn is_empty(&self) -> bool {
+        self.dirs.is_empty()
     }
-    let pref_str = String::from_utf8_lossy(prefix);
-    let components: Vec<&str> = pref_str.split('/').filter(|c| !c.is_empty()).collect();
-    let mut current = *root_tree;
-    for comp in components {
-        let obj = odb.read(&current)?;
-        if obj.kind != ObjectKind::Tree {
-            return Ok(None);
+
+    /// Record `directory` (with trailing slash) as collapsed to `oid`.
+    fn insert(&mut self, directory: Vec<u8>, oid: ObjectId) {
+        let nested: Vec<Vec<u8>> = self
+            .dirs
+            .range::<[u8], _>((
+                std::ops::Bound::Excluded(directory.as_slice()),
+                std::ops::Bound::Unbounded,
+            ))
+            .map(|(k, _)| k)
+            .take_while(|k| k.starts_with(&directory))
+            .cloned()
+            .collect();
+        for key in nested {
+            self.dirs.remove(&key);
         }
-        let entries = parse_tree(&obj.data)?;
-        let mut next = None;
-        for e in entries {
-            if e.name == comp.as_bytes() {
-                if e.mode == MODE_TREE {
-                    next = Some(e.oid);
+        self.dirs.insert(directory, oid);
+    }
+
+    fn get(&self, directory: &[u8]) -> Option<&ObjectId> {
+        self.dirs.get(directory)
+    }
+
+    /// Whether a collapsed directory lies strictly under `directory` (with trailing slash).
+    fn has_descendants(&self, directory: &[u8]) -> bool {
+        self.dirs
+            .range::<[u8], _>((
+                std::ops::Bound::Excluded(directory),
+                std::ops::Bound::Unbounded,
+            ))
+            .next()
+            .is_some_and(|(k, _)| k.starts_with(directory))
+    }
+
+    /// For sorted `entries`, which rows [`Self::covers`] holds for, found by binary search per
+    /// collapsed directory instead of a lookup per row.
+    fn covered_rows(&self, entries: &[IndexEntry]) -> Vec<bool> {
+        let mut covered = vec![false; entries.len()];
+        let mut mark = |start: usize, matches: &dyn Fn(&[u8]) -> bool| {
+            for (row, entry) in covered[start..].iter_mut().zip(&entries[start..]) {
+                if !matches(&entry.path) {
+                    break;
                 }
-                break;
+                *row = true;
             }
-        }
-        current = match next {
-            Some(o) => o,
-            None => return Ok(None),
         };
+        for directory in self.dirs.keys() {
+            let name = trim_trailing_slash_bytes(directory);
+            let start = entries.partition_point(|e| e.path.as_slice() < name);
+            mark(start, &|path| path == name);
+            let start = entries.partition_point(|e| e.path.as_slice() < directory.as_slice());
+            mark(start, &|path| path.starts_with(directory));
+        }
+        covered
     }
-    Ok(Some(current))
+
+    /// Whether a row at `path` is replaced by a collapsed placeholder: it lies under a
+    /// collapsed directory, or names the directory itself. `scratch` is reused between calls.
+    fn covers(&self, path: &[u8], scratch: &mut Vec<u8>) -> bool {
+        if self.dirs.is_empty() {
+            return false;
+        }
+        // Keys are never nested, so the only key that can prefix `path` is the greatest key
+        // not after it.
+        let under = self
+            .dirs
+            .range::<[u8], _>((std::ops::Bound::Unbounded, std::ops::Bound::Included(path)))
+            .next_back()
+            .is_some_and(|(k, _)| path.starts_with(k));
+        if under {
+            return true;
+        }
+        scratch.clear();
+        scratch.extend_from_slice(path);
+        scratch.push(b'/');
+        self.dirs.contains_key(scratch.as_slice())
+    }
+
+    fn into_placeholders(self) -> impl Iterator<Item = IndexEntry> {
+        self.dirs.into_iter().map(|(path, oid)| {
+            let mut placeholder = IndexEntry {
+                ctime_sec: 0,
+                ctime_nsec: 0,
+                mtime_sec: 0,
+                mtime_nsec: 0,
+                dev: 0,
+                ino: 0,
+                mode: MODE_TREE,
+                uid: 0,
+                gid: 0,
+                size: 0,
+                oid,
+                flags: path.len().min(0xFFF) as u16,
+                flags_extended: Some(0),
+                path,
+                base_index_pos: 0,
+            };
+            placeholder.set_skip_worktree(true);
+            placeholder
+        })
+    }
+}
+
+/// The index as [`Index::try_collapse_sparse_directories`] sees it mid-run: sorted `entries`
+/// with the directories in `collapsed` replaced by placeholders.
+struct SparseCollapseView<'a> {
+    entries: &'a [IndexEntry],
+    collapsed: &'a CollapsedDirectories,
+}
+
+impl SparseCollapseView<'_> {
+    /// Whether a stage-0 sparse-directory placeholder for `path_slash` points at `oid`.
+    fn has_placeholder(&self, path_slash: &[u8], oid: &ObjectId, scratch: &mut Vec<u8>) -> bool {
+        if let Some(collapsed_oid) = self.collapsed.get(path_slash) {
+            return collapsed_oid == oid;
+        }
+        if self.collapsed.covers(path_slash, scratch) {
+            return false;
+        }
+        let start = self
+            .entries
+            .partition_point(|e| e.path.as_slice() < path_slash);
+        self.entries[start..]
+            .iter()
+            .take_while(|e| e.path == path_slash)
+            .any(|e| e.stage() == 0 && e.is_sparse_directory_placeholder() && e.oid == *oid)
+    }
+}
+
+/// Resolves directory prefixes to their tree OIDs under one root tree, reading and parsing
+/// each tree on the way at most once.
+struct PrefixTreeResolver {
+    root: ObjectId,
+    resolved: HashMap<Vec<u8>, Option<ObjectId>>,
+    parsed: HashMap<ObjectId, Option<Vec<TreeEntry>>>,
+}
+
+impl PrefixTreeResolver {
+    fn new(root: ObjectId) -> Self {
+        Self {
+            root,
+            resolved: HashMap::new(),
+            parsed: HashMap::new(),
+        }
+    }
+
+    /// The tree at `prefix` (no trailing slash), or `None` when a component is missing or
+    /// is not a tree.
+    fn resolve(&mut self, odb: &Odb, prefix: &[u8]) -> Result<Option<ObjectId>> {
+        if prefix.is_empty() {
+            return Ok(Some(self.root));
+        }
+        if let Some(known) = self.resolved.get(prefix) {
+            return Ok(*known);
+        }
+        let (parent, name) = match prefix.iter().rposition(|&b| b == b'/') {
+            Some(i) => (&prefix[..i], &prefix[i + 1..]),
+            None => (&prefix[..0], prefix),
+        };
+        let found = match self.resolve(odb, parent)? {
+            Some(parent_oid) if !name.is_empty() => {
+                let entries = match self.parsed.entry(parent_oid) {
+                    std::collections::hash_map::Entry::Occupied(known) => known.into_mut(),
+                    std::collections::hash_map::Entry::Vacant(slot) => {
+                        let obj = odb.read(&parent_oid)?;
+                        slot.insert(if obj.kind == ObjectKind::Tree {
+                            Some(parse_tree(&obj.data)?)
+                        } else {
+                            None
+                        })
+                    }
+                };
+                entries
+                    .as_ref()
+                    .and_then(|entries| entries.iter().find(|e| e.name == name))
+                    .filter(|e| e.mode == MODE_TREE)
+                    .map(|e| e.oid)
+            }
+            // An empty component (`a//b`) is skipped, as when splitting on `/`.
+            Some(parent_oid) => Some(parent_oid),
+            None => None,
+        };
+        self.resolved.insert(prefix.to_vec(), found);
+        Ok(found)
+    }
+}
+
+/// When every stage-0 row under `directory` is a sparse-directory placeholder whose OID
+/// matches the corresponding `HEAD` tree entry, the directory can collapse to one placeholder.
+fn try_collapse_directory_of_sparse_placeholders(
+    odb: &Odb,
+    directory: &[u8],
+    rows: &[IndexEntry],
+    head_subtree: &ObjectId,
+) -> Result<bool> {
+    if rows.is_empty() || rows.iter().any(|e| e.stage() != 0) {
+        return Ok(false);
+    }
+    if !rows.iter().all(|e| e.is_sparse_directory_placeholder()) {
+        return Ok(false);
+    }
+    let obj = odb.read(head_subtree)?;
+    if obj.kind != crate::objects::ObjectKind::Tree {
+        return Ok(false);
+    }
+    let tree_entries = crate::objects::parse_tree(&obj.data)?;
+    if tree_entries.len() != rows.len() {
+        return Ok(false);
+    }
+    for te in &tree_entries {
+        if te.mode != MODE_TREE {
+            return Ok(false);
+        }
+        let mut path = directory.to_vec();
+        path.extend_from_slice(&te.name);
+        path.push(b'/');
+        let Some(row) = rows.iter().find(|e| e.path == path) else {
+            return Ok(false);
+        };
+        if row.oid != te.oid || !row.skip_worktree() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Build the list of blob index entries under `prefix` that match `HEAD` at `tree_oid`,
-/// treating existing sparse-directory placeholders in `entries` as opaque subtrees (like Git).
+/// treating existing sparse-directory placeholders in `view` as opaque subtrees (like Git).
 fn collect_sparse_aware_expected_blobs(
     odb: &Odb,
     tree_oid: &ObjectId,
     prefix: &[u8],
     patterns: &[String],
     cone_mode: bool,
-    entries: &[IndexEntry],
+    view: &SparseCollapseView<'_>,
     protect: crate::path_validate::ProtectOptions,
-) -> Result<Vec<IndexEntry>> {
+) -> Result<Vec<ExpectedBlob>> {
     let mut out = Vec::new();
+    let mut scratch = Vec::new();
     walk_sparse_aware(
-        odb, tree_oid, prefix, patterns, cone_mode, entries, protect, &mut out,
+        odb,
+        tree_oid,
+        prefix,
+        patterns,
+        cone_mode,
+        view,
+        protect,
+        &mut scratch,
+        &mut out,
     )?;
     Ok(out)
 }
@@ -3470,71 +3877,62 @@ fn walk_sparse_aware(
     prefix: &[u8],
     patterns: &[String],
     cone_mode: bool,
-    entries: &[IndexEntry],
+    view: &SparseCollapseView<'_>,
     protect: crate::path_validate::ProtectOptions,
-    out: &mut Vec<IndexEntry>,
+    scratch: &mut Vec<u8>,
+    out: &mut Vec<ExpectedBlob>,
 ) -> Result<()> {
-    let obj = odb.read(tree_oid)?;
-    if obj.kind != ObjectKind::Tree {
-        return Err(Error::IndexError(format!("expected tree at {}", tree_oid)));
-    }
-    let tree_entries = parse_tree(&obj.data)?;
-    for te in tree_entries {
+    // Switch and checkout have usually just diffed these trees, so share the handle's cache.
+    let tree = odb.cached_tree_for_walk(tree_oid)?;
+    let mut visit = |name: &[u8], mode: u32, oid: ObjectId| -> Result<()> {
         let path = if prefix.is_empty() {
-            te.name.clone()
+            name.to_vec()
         } else {
-            let mut p = prefix.to_vec();
+            let mut p = Vec::with_capacity(prefix.len() + 1 + name.len());
+            p.extend_from_slice(prefix);
             p.push(b'/');
-            p.extend_from_slice(&te.name);
+            p.extend_from_slice(name);
             p
         };
-        crate::path_population::validate_tree_walk_entry(&path, &te.name, te.mode, protect)?;
-        if te.mode == MODE_TREE {
-            let path_slash = {
-                let mut p = path.clone();
-                p.push(b'/');
-                p
-            };
-            if entries.iter().any(|e| {
-                e.stage() == 0
-                    && e.is_sparse_directory_placeholder()
-                    && e.path == path_slash
-                    && e.oid == te.oid
-            }) {
-                continue;
+        crate::path_population::validate_tree_walk_entry(&path, name, mode, protect)?;
+        if mode == MODE_TREE {
+            let mut path_slash = path.clone();
+            path_slash.push(b'/');
+            if view.has_placeholder(&path_slash, &oid, scratch) {
+                return Ok(());
             }
-            walk_sparse_aware(
-                odb, &te.oid, &path, patterns, cone_mode, entries, protect, out,
-            )?;
-        } else {
-            let path_len = path.len().min(0xFFF) as u16;
-            let path_str = String::from_utf8_lossy(&path);
-            if crate::sparse_checkout::path_matches_sparse_patterns(&path_str, patterns, cone_mode)
-            {
-                continue;
+            return walk_sparse_aware(
+                odb, &oid, &path, patterns, cone_mode, view, protect, scratch, out,
+            );
+        }
+        let path_str = String::from_utf8_lossy(&path);
+        if crate::sparse_checkout::path_matches_sparse_patterns(&path_str, patterns, cone_mode) {
+            return Ok(());
+        }
+        out.push(ExpectedBlob { path, mode, oid });
+        Ok(())
+    };
+    match &tree {
+        crate::odb::SessionTree::Parsed(entries) => {
+            for te in entries.iter() {
+                visit(&te.name, te.mode, te.oid)?;
             }
-            let mut e = IndexEntry {
-                ctime_sec: 0,
-                ctime_nsec: 0,
-                mtime_sec: 0,
-                mtime_nsec: 0,
-                dev: 0,
-                ino: 0,
-                mode: te.mode,
-                uid: 0,
-                gid: 0,
-                size: 0,
-                oid: te.oid,
-                flags: path_len,
-                flags_extended: Some(0),
-                path,
-                base_index_pos: 0,
-            };
-            e.set_skip_worktree(true);
-            out.push(e);
+        }
+        crate::odb::SessionTree::Raw(data) => {
+            for te in crate::objects::TreeRefIter::with_oid_len(data, odb.hash_algo().len()) {
+                let te = te?;
+                visit(te.name, te.mode, te.oid)?;
+            }
         }
     }
     Ok(())
+}
+
+/// A blob a collapsible sparse directory must hold, from the `HEAD` tree.
+struct ExpectedBlob {
+    path: Vec<u8>,
+    mode: u32,
+    oid: ObjectId,
 }
 
 fn flatten_tree_blobs(
@@ -3559,7 +3957,7 @@ fn flatten_tree_blobs(
             p
         };
         crate::path_population::validate_tree_walk_entry(prefix, &te.name, te.mode, protect)?;
-        if te.mode == MODE_TREE {
+        if is_tree_mode(te.mode) {
             let sub = flatten_tree_blobs(odb, &te.oid, &path, protect)?;
             out.extend(sub);
         } else {
@@ -3571,7 +3969,7 @@ fn flatten_tree_blobs(
                 mtime_nsec: 0,
                 dev: 0,
                 ino: 0,
-                mode: te.mode,
+                mode: canon_mode(te.mode),
                 uid: 0,
                 gid: 0,
                 size: 0,
@@ -3586,36 +3984,6 @@ fn flatten_tree_blobs(
         }
     }
     Ok(out)
-}
-
-fn lockfile_pid_enabled(index_path: &Path, config: Option<&ConfigSet>) -> bool {
-    let git_dir = match index_path.parent() {
-        Some(dir) => dir,
-        None => return false,
-    };
-
-    let cfg = config.cloned().unwrap_or_else(|| {
-        ConfigSet::load(
-            &crate::environment::Environment::empty(),
-            Some(git_dir),
-            true,
-        )
-        .unwrap_or_default()
-    });
-    cfg.get_bool("core.lockfilepid")
-        .and_then(|res| res.ok())
-        .unwrap_or(false)
-}
-
-fn write_lock_pid_file(pid_path: &Path) -> io::Result<()> {
-    use std::io::Write as _;
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(pid_path)?;
-    writeln!(file, "pid {}", std::process::id())?;
-    Ok(())
 }
 
 /// Exclusive `.git/index.lock` held for a mutating porcelain operation.
@@ -3650,7 +4018,9 @@ impl IndexLock {
 
     /// Rename the staged lock file over the on-disk index.
     pub(crate) fn commit_replace_index(&mut self) -> Result<()> {
-        fs::rename(&self.lock_path, &self.index_path).map_err(Error::Io)?;
+        crate::atomic_replace::detach_open_handle(&mut self.file).map_err(Error::Io)?;
+        crate::atomic_replace::replace_file(&self.lock_path, &self.index_path)
+            .map_err(Error::Io)?;
         self.committed = true;
         if self.wrote_pid {
             let _ = fs::remove_file(&self.pid_path);
@@ -3668,21 +4038,22 @@ impl IndexLock {
     pub fn acquire(index_path: &Path, config: Option<&ConfigSet>) -> Result<Self> {
         let lock_path = index_path.with_extension("lock");
         let pid_path = pid_path_for_lock(&lock_path);
-        let lockfile_pid_enabled = lockfile_pid_enabled(index_path, config);
+        let lockfile_pid_enabled = grit_lockfile_pid_enabled(config, index_path.parent());
 
         use crate::lockfile::{LockFile, LockWait};
         let wait = LockWait::files_ref_lock(config);
-        let (lock_path, file) =
-            LockFile::acquire(&lock_path, wait).and_then(LockFile::into_open_file)?;
-
-        let mut wrote_pid = false;
+        let mut lock_file = LockFile::acquire(&lock_path, wait).map_err(Error::from)?;
         if lockfile_pid_enabled {
-            write_lock_pid_file(&pid_path).map_err(|e| {
-                let _ = fs::remove_file(&lock_path);
-                Error::Io(e)
-            })?;
-            wrote_pid = true;
+            if let Err(e) = lock_file
+                .write_holder_pid()
+                .map_err(crate::error::Error::from)
+            {
+                lock_file.rollback();
+                return Err(e);
+            }
         }
+        let wrote_pid = lockfile_pid_enabled;
+        let (lock_path, file) = lock_file.into_open_file()?;
 
         Ok(Self {
             index_path: index_path.to_path_buf(),
@@ -3705,6 +4076,11 @@ impl Drop for IndexLock {
             let _ = fs::remove_file(&self.pid_path);
         }
     }
+}
+
+/// Whether `path` lies strictly under directory `dir` (`dir/…`).
+fn path_is_under_dir(path: &[u8], dir: &[u8]) -> bool {
+    path.len() > dir.len() && path[dir.len()] == b'/' && path.starts_with(dir)
 }
 
 /// Hash an index body with the given algorithm, returning the raw checksum.
@@ -4123,6 +4499,79 @@ impl std::ops::Deref for IndexFileBytes {
     }
 }
 
+/// Trailing checksum bytes from a full on-disk index file (including the trailer).
+#[must_use]
+pub(crate) fn index_file_trailer(data: &[u8], hash_algo: HashAlgo) -> Option<Vec<u8>> {
+    let hash_len = hash_algo.len();
+    (data.len() >= hash_len).then(|| data[data.len() - hash_len..].to_vec())
+}
+
+fn record_loaded_index_identity(index: &mut Index, data: &[u8], mtime: (u32, u32)) {
+    index.source_mtime = Some(mtime);
+    index.source_file_len = Some(u64::try_from(data.len()).unwrap_or(u64::MAX));
+    index.source_checksum = index_file_trailer(data, index.hash_algo);
+}
+
+/// On-disk identity of `.git/index` for opportunistic writers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct IndexOnDiskIdentity {
+    pub checksum: Option<Vec<u8>>,
+    pub mtime: Option<(u32, u32)>,
+    pub len: u64,
+}
+
+/// Read checksum, mtime, and length for an existing index file.
+pub(crate) fn read_index_on_disk_identity(
+    path: &Path,
+    hash_algo: HashAlgo,
+) -> io::Result<IndexOnDiskIdentity> {
+    match read_index_file(path) {
+        Ok((data, mtime)) => {
+            let bytes = data.deref();
+            Ok(IndexOnDiskIdentity {
+                checksum: index_file_trailer(bytes, hash_algo),
+                mtime: Some(mtime),
+                len: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            })
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(IndexOnDiskIdentity {
+            checksum: None,
+            mtime: None,
+            len: 0,
+        }),
+        Err(e) => Err(e),
+    }
+}
+
+/// Whether an opportunistic index write may still replace the on-disk file.
+///
+/// Mandatory writers (`write_index`, commit, staging) do not call this.
+#[must_use]
+pub(crate) fn opportunistic_index_write_still_current(
+    loaded: &Index,
+    on_disk: &IndexOnDiskIdentity,
+) -> bool {
+    let had_disk_index = loaded.source_checksum.is_some()
+        || loaded.source_mtime.is_some()
+        || loaded.source_file_len.is_some();
+    if !had_disk_index {
+        return on_disk.len == 0;
+    }
+    if on_disk.len == 0 {
+        return false;
+    }
+    if let (Some(loaded_cs), Some(disk_cs)) = (&loaded.source_checksum, &on_disk.checksum) {
+        if loaded_cs != disk_cs {
+            return false;
+        }
+        if loaded_cs.iter().all(|&b| b == 0) {
+            return loaded.source_mtime == on_disk.mtime
+                && loaded.source_file_len == Some(on_disk.len);
+        }
+    }
+    true
+}
+
 /// Read an index file along with the mtime of the same open file.
 ///
 /// Large files are mapped read-only: index writers replace the file by renaming a lock file
@@ -4182,11 +4631,14 @@ pub(crate) fn stage0_mtime_max(entries: &[IndexEntry]) -> (u32, u32) {
 ///
 /// This only acts when the index write lands on the same timestamp tick as the newest entry
 /// (or earlier), as coarse filesystem clocks allow, and moves it the smallest step past that
-/// entry. That step clears raciness only under `core.usenanosec`. Under the default
-/// whole-second rule, entries in the index's own second stay racy, and the next status
-/// verifies them by content once and then rewrites the index. Never move the mtime into a
-/// later second: stat matching ignores nanoseconds by default, so that would hide an edit
-/// made within the entry's second.
+/// entry: one tick of the filesystem clock, which is 100 ns on NTFS (a 1 ns step would be
+/// truncated back onto the entry's own tick there). That step clears raciness only under
+/// `core.usenanosec` (the default on Windows, see [`StatMatchPolicy::DEFAULT_USE_NANOSEC`]).
+/// Under the whole-second rule, entries in the index's own second stay racy, and the next
+/// status verifies them by content once and then rewrites the index. Never move the mtime
+/// into a later second: whole-second stat matching would then hide an edit made within the
+/// entry's second. When the newest entry sits on the last tick of its second, the index is
+/// left as it is and those entries stay racy.
 ///
 /// When `touched_only_max` is set, it must be the true maximum stage-0 mtime in the index after
 /// checkout (not just the touched entries), or later switch prepare may treat paths as racy.
@@ -4212,11 +4664,11 @@ pub(crate) fn advance_index_file_mtime_past_entries(
     if !needs_bump {
         return Ok(());
     }
-    let ft = if max_nsec < 999_999_999 {
-        FileTime::from_unix_time(i64::from(max_sec), max_nsec + 1)
-    } else {
-        FileTime::from_unix_time(i64::from(max_sec) + 1, 0)
-    };
+    const TICK_NSEC: u32 = if cfg!(windows) { 100 } else { 1 };
+    if max_nsec >= 1_000_000_000 - TICK_NSEC {
+        return Ok(());
+    }
+    let ft = FileTime::from_unix_time(i64::from(max_sec), max_nsec + TICK_NSEC);
     filetime::set_file_mtime(index_path, ft).map_err(Error::Io)
 }
 
@@ -4405,11 +4857,23 @@ impl From<&fs::Metadata> for IndexStatFields {
 }
 
 impl IndexStatFields {
-    /// Whether munged size and whole-second mtime match the index row (Git quick stat check).
+    /// Whether munged size and mtime match the index row, plus the sub-second mtime/ctime
+    /// fractions that `policy` compares; ctime seconds and identity fields are ignored.
     #[must_use]
     #[cfg_attr(not(windows), allow(dead_code))]
-    pub(crate) fn mtime_and_size_match_index(&self, ie: &IndexEntry) -> bool {
-        self.size == ie.size && self.mtime_sec == ie.mtime_sec
+    pub(crate) fn size_and_times_match_index(
+        &self,
+        ie: &IndexEntry,
+        policy: StatMatchPolicy,
+    ) -> bool {
+        if self.size != ie.size || self.mtime_sec != ie.mtime_sec {
+            return false;
+        }
+        if !(policy.use_nanosec && policy.check_stat) {
+            return true;
+        }
+        self.mtime_nsec == ie.mtime_nsec
+            && (!policy.trust_ctime || self.ctime_nsec == ie.ctime_nsec)
     }
 
     /// Whether cached stat fields match a stage-0 index row (Git `ie_match_stat`).
@@ -4630,6 +5094,45 @@ mod tests {
     }
 
     #[test]
+    fn content_verified_bit_is_in_memory_only() {
+        let mut index = Index::new();
+        let mut plain = make_entry("a.txt");
+        plain.mark_content_verified();
+        let mut skipped = make_entry("b.txt");
+        skipped.set_skip_worktree(true);
+        skipped.mark_content_verified();
+        index.add_or_replace(plain);
+        index.add_or_replace(skipped);
+
+        let mut only_marked = index.clone();
+        only_marked.remove(b"b.txt");
+        let mut out = Vec::new();
+        only_marked.serialize_into(&mut out).unwrap();
+        assert_eq!(&out[4..8], &2u32.to_be_bytes(), "the bit alone keeps v2");
+
+        out.clear();
+        index.serialize_into(&mut out).unwrap();
+        let checksum = hash_index_body(index.hash_algo, &out);
+        out.extend_from_slice(&checksum);
+        let reread = Index::parse(&out).unwrap();
+        assert_eq!(reread.version, 3);
+        assert!(reread
+            .entries
+            .iter()
+            .all(|e| !e.clone().take_content_verified()));
+        assert!(reread.get(b"b.txt", 0).unwrap().skip_worktree());
+
+        assert!(index.get_mut(b"a.txt", 0).is_some());
+        assert_eq!(
+            index.entries[0].flags_extended, None,
+            "get_mut voids the mark"
+        );
+        index.clear_content_verified();
+        assert!(index.entries[1].skip_worktree());
+        assert!(!index.entries[1].clone().take_content_verified());
+    }
+
+    #[test]
     fn round_trip_empty_index() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("index");
@@ -4639,6 +5142,57 @@ mod tests {
 
         let loaded = Index::load(&path).unwrap();
         assert_eq!(loaded.entries.len(), 0);
+    }
+
+    #[test]
+    fn opportunistic_write_still_current_logic() {
+        use super::{opportunistic_index_write_still_current, IndexOnDiskIdentity};
+
+        let mut loaded = Index::new();
+        loaded.source_checksum = Some(vec![1; 20]);
+        loaded.source_mtime = Some((1, 0));
+        loaded.source_file_len = Some(100);
+        let same = IndexOnDiskIdentity {
+            checksum: Some(vec![1; 20]),
+            mtime: Some((1, 0)),
+            len: 100,
+        };
+        assert!(opportunistic_index_write_still_current(&loaded, &same));
+
+        let changed = IndexOnDiskIdentity {
+            checksum: Some(vec![2; 20]),
+            mtime: Some((1, 0)),
+            len: 100,
+        };
+        assert!(!opportunistic_index_write_still_current(&loaded, &changed));
+
+        loaded.source_checksum = Some(vec![0; 20]);
+        assert!(!opportunistic_index_write_still_current(
+            &loaded,
+            &IndexOnDiskIdentity {
+                checksum: Some(vec![0; 20]),
+                mtime: Some((2, 0)),
+                len: 100,
+            }
+        ));
+
+        let empty_loaded = Index::new();
+        assert!(opportunistic_index_write_still_current(
+            &empty_loaded,
+            &IndexOnDiskIdentity {
+                checksum: None,
+                mtime: None,
+                len: 0,
+            }
+        ));
+        assert!(!opportunistic_index_write_still_current(
+            &empty_loaded,
+            &IndexOnDiskIdentity {
+                checksum: Some(vec![1; 20]),
+                mtime: Some((1, 0)),
+                len: 50,
+            }
+        ));
     }
 
     #[test]
@@ -5096,6 +5650,80 @@ mod tests {
         );
     }
 
+    fn sorted_index(entries: Vec<IndexEntry>) -> Index {
+        let mut idx = Index::new();
+        idx.entries = entries;
+        idx.sort();
+        idx
+    }
+
+    fn paths_of(entries: &[IndexEntry]) -> Vec<&str> {
+        entries
+            .iter()
+            .map(|e| std::str::from_utf8(&e.path).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn sorted_entries_under_returns_the_directory_run_at_every_stage() {
+        let idx = sorted_index(vec![
+            make_entry("a-b"),
+            make_entry("a.txt"),
+            make_entry("a/x"),
+            make_staged_entry("a/y", 2),
+            make_staged_entry("a/y", 3),
+            make_entry("a/z/deep"),
+            make_entry("a0"),
+            make_entry("ab/c"),
+        ]);
+        let run = idx.sorted_entries_under(b"a").unwrap();
+        assert_eq!(paths_of(run), vec!["a/x", "a/y", "a/y", "a/z/deep"]);
+        assert_eq!(
+            paths_of(idx.sorted_entries_under(b"a/z").unwrap()),
+            vec!["a/z/deep"]
+        );
+        assert!(idx.sorted_entries_under(b"a.txt").unwrap().is_empty());
+        assert!(idx.sorted_entries_under(b"missing").unwrap().is_empty());
+        assert_eq!(idx.sorted_entries_under(b"").unwrap().len(), 8);
+    }
+
+    #[test]
+    fn sorted_lookups_decline_unsorted_indexes() {
+        let mut idx = sorted_index(vec![make_entry("b"), make_entry("a/x")]);
+        assert_eq!(idx.sorted_contains_path(b"a/x"), Some(true));
+        assert_eq!(idx.sorted_contains_path(b"a"), Some(false));
+        idx.mark_entries_unsorted();
+        assert!(idx.sorted_entries_under(b"a").is_none());
+        assert_eq!(idx.sorted_contains_path(b"a/x"), None);
+    }
+
+    #[test]
+    fn sorted_contains_path_matches_conflict_stages() {
+        let idx = sorted_index(vec![
+            make_staged_entry("both.txt", 2),
+            make_staged_entry("both.txt", 3),
+            make_entry("plain.txt"),
+        ]);
+        assert_eq!(idx.sorted_contains_path(b"both.txt"), Some(true));
+        assert_eq!(idx.sorted_contains_path(b"plain.txt"), Some(true));
+        assert_eq!(idx.sorted_contains_path(b"both"), Some(false));
+    }
+
+    #[test]
+    fn has_stage0_descendant_under_skips_conflict_only_directories() {
+        let idx = sorted_index(vec![
+            make_staged_entry("conf/f", 1),
+            make_staged_entry("conf/f", 2),
+            make_entry("conf.txt"),
+            make_entry("mixed/a"),
+            make_staged_entry("mixed/b", 3),
+        ]);
+        assert!(!idx.has_stage0_descendant_under("conf"));
+        assert!(idx.has_stage0_descendant_under("mixed"));
+        assert!(!idx.has_stage0_descendant_under("conf.txt"));
+        assert!(!idx.has_stage0_descendant_under("mix"));
+    }
+
     #[test]
     fn unsorted_remove_drops_every_matching_stage_globally() {
         let mut idx = Index::new();
@@ -5313,6 +5941,198 @@ mod tests {
         assert!(!policy.trust_ctime);
         assert!(!policy.check_stat);
         assert!(policy.use_nanosec);
+    }
+
+    fn policy_from_core_config(body: &str) -> StatMatchPolicy {
+        let dir = TempDir::new().unwrap();
+        let git_dir = dir.path().join(".git");
+        fs::create_dir_all(&git_dir).unwrap();
+        fs::write(git_dir.join("config"), format!("[core]\n{body}")).unwrap();
+        let cfg = crate::config::ConfigSet::load(
+            &crate::environment::Environment::empty(),
+            Some(&git_dir),
+            true,
+        )
+        .unwrap();
+        StatMatchPolicy::from_config(Some(&cfg))
+    }
+
+    #[test]
+    fn stat_match_policy_uses_nanoseconds_by_default_on_windows_only() {
+        assert_eq!(StatMatchPolicy::DEFAULT_USE_NANOSEC, cfg!(windows));
+        assert_eq!(StatMatchPolicy::default().use_nanosec, cfg!(windows));
+        assert_eq!(
+            StatMatchPolicy::from_config(None),
+            StatMatchPolicy::default()
+        );
+        assert_eq!(
+            policy_from_core_config("\tbare = false\n"),
+            StatMatchPolicy::default()
+        );
+        assert!(!policy_from_core_config("\tusenanosec = false\n").use_nanosec);
+        assert!(policy_from_core_config("\tusenanosec = true\n").use_nanosec);
+    }
+
+    const NSEC_POLICY: StatMatchPolicy = StatMatchPolicy {
+        trust_ctime: true,
+        check_stat: true,
+        use_nanosec: true,
+    };
+    const WHOLE_SECOND_POLICY: StatMatchPolicy = StatMatchPolicy {
+        use_nanosec: false,
+        ..NSEC_POLICY
+    };
+
+    fn entry_with_mtime(sec: u32, nsec: u32) -> IndexEntry {
+        IndexEntry {
+            mtime_sec: sec,
+            mtime_nsec: nsec,
+            ctime_sec: sec,
+            ctime_nsec: nsec,
+            size: 42,
+            ..make_entry("f")
+        }
+    }
+
+    #[test]
+    fn nanosecond_policy_trusts_same_second_entries_but_sees_newer_fractions() {
+        let ie = entry_with_mtime(1_700_000_000, 123_456_700);
+        let index_mtime = Some((ie.mtime_sec, ie.mtime_nsec + 1));
+        assert!(!crate::diff::entry_is_racy_with_policy(
+            &ie,
+            index_mtime,
+            NSEC_POLICY
+        ));
+        assert!(crate::diff::entry_is_racy_with_policy(
+            &ie,
+            Some((ie.mtime_sec, ie.mtime_nsec)),
+            NSEC_POLICY
+        ));
+        assert!(
+            crate::diff::entry_is_racy_with_policy(&ie, index_mtime, WHOLE_SECOND_POLICY),
+            "the whole-second rule keeps the index's own second racy"
+        );
+
+        // A same-second, same-size edit is only visible in the fraction.
+        let mut edited = IndexStatFields::of_entry(&ie);
+        edited.mtime_nsec += 1;
+        assert!(IndexStatFields::of_entry(&ie).matches_index_entry(&ie, NSEC_POLICY));
+        assert!(!edited.matches_index_entry(&ie, NSEC_POLICY));
+        assert!(edited.matches_index_entry(&ie, WHOLE_SECOND_POLICY));
+    }
+
+    #[test]
+    fn minimal_checkstat_keeps_whole_second_racy_rule_under_nanosec() {
+        let minimal = StatMatchPolicy {
+            check_stat: false,
+            ..NSEC_POLICY
+        };
+        let ie = entry_with_mtime(1_700_000_000, 100_000_000);
+        let index_mtime = Some((ie.mtime_sec, 500_000_000));
+        assert!(
+            crate::diff::entry_is_racy_with_policy(&ie, index_mtime, minimal),
+            "without fraction equality, a same-second entry must stay racy"
+        );
+        let mut edited = IndexStatFields::of_entry(&ie);
+        edited.mtime_nsec = 200_000_000;
+        assert!(edited.matches_index_entry(&ie, minimal));
+        assert!(!crate::diff::entry_is_racy_with_policy(
+            &ie,
+            Some((ie.mtime_sec + 1, 0)),
+            minimal
+        ));
+    }
+
+    #[test]
+    fn advancing_index_mtime_never_leaves_the_last_tick_of_a_second() {
+        let dir = TempDir::new().unwrap();
+        let index_path = dir.path().join("index");
+        let sec = 1_700_000_000u32;
+        let last_tick = if cfg!(windows) {
+            999_999_900
+        } else {
+            999_999_999
+        };
+        let mut index = Index::new();
+        index.add_or_replace(entry_with_mtime(sec, last_tick));
+        index.write(&index_path).unwrap();
+        let pinned = filetime::FileTime::from_unix_time(i64::from(sec), last_tick);
+        filetime::set_file_mtime(&index_path, pinned).unwrap();
+
+        advance_index_file_mtime_past_entries(&index, &index_path, None).unwrap();
+        assert_eq!(index_file_mtime(&index_path), Some((sec, last_tick)));
+        for policy in [NSEC_POLICY, WHOLE_SECOND_POLICY] {
+            assert!(crate::diff::entry_is_racy_with_policy(
+                &index.entries[0],
+                index_file_mtime(&index_path),
+                policy
+            ));
+        }
+    }
+
+    #[test]
+    fn size_and_times_match_index_compares_fractions_only_under_nanosec_policy() {
+        let ie = entry_with_mtime(1_700_000_000, 123_456_700);
+        let mut scan = IndexStatFields::of_entry(&ie);
+        scan.ctime_sec += 5;
+        scan.ino = 99;
+        assert!(scan.size_and_times_match_index(&ie, NSEC_POLICY));
+
+        let mut mtime_frac = IndexStatFields::of_entry(&ie);
+        mtime_frac.mtime_nsec += 100;
+        assert!(!mtime_frac.size_and_times_match_index(&ie, NSEC_POLICY));
+        assert!(mtime_frac.size_and_times_match_index(&ie, WHOLE_SECOND_POLICY));
+
+        let mut ctime_frac = IndexStatFields::of_entry(&ie);
+        ctime_frac.ctime_nsec += 100;
+        assert!(!ctime_frac.size_and_times_match_index(&ie, NSEC_POLICY));
+        let no_ctime = StatMatchPolicy {
+            trust_ctime: false,
+            ..NSEC_POLICY
+        };
+        assert!(ctime_frac.size_and_times_match_index(&ie, no_ctime));
+
+        let mut resized = IndexStatFields::of_entry(&ie);
+        resized.size += 1;
+        assert!(!resized.size_and_times_match_index(&ie, WHOLE_SECOND_POLICY));
+    }
+
+    #[test]
+    fn advancing_index_mtime_clears_same_tick_entries_within_their_second() {
+        let dir = TempDir::new().unwrap();
+        let index_path = dir.path().join("index");
+        let (sec, nsec) = (1_700_000_000u32, 123_456_700u32);
+        let mut index = Index::new();
+        index.add_or_replace(entry_with_mtime(sec, nsec));
+        index.write(&index_path).unwrap();
+        filetime::set_file_mtime(
+            &index_path,
+            filetime::FileTime::from_unix_time(i64::from(sec), nsec),
+        )
+        .unwrap();
+        let ie = &index.entries[0];
+        assert!(crate::diff::entry_is_racy_with_policy(
+            ie,
+            index_file_mtime(&index_path),
+            NSEC_POLICY
+        ));
+
+        advance_index_file_mtime_past_entries(&index, &index_path, None).unwrap();
+        let bumped = index_file_mtime(&index_path);
+        assert_eq!(
+            bumped.map(|(s, _)| s),
+            Some(sec),
+            "never leave the entry's second"
+        );
+        assert!(
+            !crate::diff::entry_is_racy_with_policy(ie, bumped, NSEC_POLICY),
+            "bumped index mtime {bumped:?} must be past the entry's filesystem tick"
+        );
+        assert!(crate::diff::entry_is_racy_with_policy(
+            ie,
+            bumped,
+            WHOLE_SECOND_POLICY
+        ));
     }
 
     #[test]
@@ -5658,6 +6478,282 @@ mod tests {
             let expected = naive_merge_sorted(&kept, &insert);
             let merged = merge_sorted_index_entries(kept, insert);
             assert_eq!(merged, expected, "seed {seed} merge mismatch");
+        }
+    }
+
+    mod sparse_collapse {
+        use super::*;
+
+        const PATTERNS: [&str; 3] = ["/*", "!/*/", "/a/"];
+
+        fn patterns() -> Vec<String> {
+            PATTERNS.iter().map(|p| (*p).to_owned()).collect()
+        }
+
+        /// Write a tree holding `files` (`path`, `mode`, blob body) and return its OID.
+        fn write_tree(odb: &Odb, files: &[(&str, u32, &str)]) -> ObjectId {
+            let mut here: BTreeMap<Vec<u8>, (u32, ObjectId)> = BTreeMap::new();
+            let mut subdirs: BTreeMap<&str, Vec<(&str, u32, &str)>> = BTreeMap::new();
+            for (path, mode, body) in files {
+                match path.split_once('/') {
+                    Some((dir, rest)) => subdirs.entry(dir).or_default().push((rest, *mode, body)),
+                    None => {
+                        let oid = if *mode == MODE_GITLINK {
+                            ObjectId::from_bytes(&[7u8; 20]).unwrap()
+                        } else {
+                            odb.write(ObjectKind::Blob, body.as_bytes()).unwrap()
+                        };
+                        here.insert(path.as_bytes().to_vec(), (*mode, oid));
+                    }
+                }
+            }
+            for (dir, children) in subdirs {
+                here.insert(
+                    dir.as_bytes().to_vec(),
+                    (MODE_TREE, write_tree(odb, &children)),
+                );
+            }
+            let mut entries: Vec<TreeEntry> = here
+                .into_iter()
+                .map(|(name, (mode, oid))| TreeEntry { mode, name, oid })
+                .collect();
+            entries.sort_by(|a, b| {
+                crate::objects::tree_entry_cmp(
+                    &a.name,
+                    a.mode == MODE_TREE,
+                    &b.name,
+                    b.mode == MODE_TREE,
+                )
+            });
+            odb.write(ObjectKind::Tree, &crate::objects::serialize_tree(&entries))
+                .unwrap()
+        }
+
+        fn subtree(odb: &Odb, root: &ObjectId, prefix: &str) -> ObjectId {
+            PrefixTreeResolver::new(*root)
+                .resolve(odb, prefix.as_bytes())
+                .unwrap()
+                .unwrap()
+        }
+
+        /// The fully expanded index for `root`, with everything outside `a/` and the top
+        /// level marked skip-worktree.
+        fn expanded_index(odb: &Odb, root: &ObjectId) -> Index {
+            let mut index = Index::new();
+            let rows = flatten_tree_blobs(
+                odb,
+                root,
+                b"",
+                crate::path_validate::ProtectOptions::default(),
+            )
+            .unwrap();
+            for mut row in rows {
+                let in_cone = !row.path.contains(&b'/') || row.path.starts_with(b"a/");
+                row.set_skip_worktree(!in_cone);
+                index.entries_mut().push(row);
+            }
+            index.sort();
+            index
+        }
+
+        fn collapse(index: &mut Index, odb: &Odb, root: &ObjectId) {
+            index
+                .try_collapse_sparse_directories(
+                    odb,
+                    root,
+                    &patterns(),
+                    true,
+                    true,
+                    crate::path_validate::ProtectOptions::default(),
+                )
+                .unwrap();
+        }
+
+        fn rows(index: &Index) -> Vec<(String, u32, ObjectId)> {
+            index
+                .entries()
+                .iter()
+                .map(|e| (String::from_utf8_lossy(&e.path).into_owned(), e.mode, e.oid))
+                .collect()
+        }
+
+        fn placeholder_paths(index: &Index) -> Vec<String> {
+            index
+                .entries()
+                .iter()
+                .filter(|e| e.is_sparse_directory_placeholder())
+                .map(|e| String::from_utf8_lossy(&e.path).into_owned())
+                .collect()
+        }
+
+        const FILES: [(&str, u32, &str); 8] = [
+            ("a/in", 0o100644, "in\n"),
+            ("top", 0o100644, "top\n"),
+            ("w/f4", 0o100644, "f4\n"),
+            ("w/f5", 0o100755, "f5\n"),
+            ("x/f1", 0o100644, "f1\n"),
+            ("x/y/f2", 0o100644, "f2\n"),
+            ("x/y/z/f3", 0o100644, "f3\n"),
+            ("x/y-z", 0o100644, "dash\n"),
+        ];
+
+        #[test]
+        fn unchanged_excluded_directories_collapse_to_their_outermost_placeholder() {
+            let dir = TempDir::new().unwrap();
+            let odb = Odb::new(dir.path());
+            let root = write_tree(&odb, &FILES);
+            let mut index = expanded_index(&odb, &root);
+            collapse(&mut index, &odb, &root);
+
+            assert_eq!(
+                rows(&index),
+                vec![
+                    ("a/in".to_owned(), 0o100644, index.entries()[0].oid),
+                    ("top".to_owned(), 0o100644, index.entries()[1].oid),
+                    ("w/".to_owned(), MODE_TREE, subtree(&odb, &root, "w")),
+                    ("x/".to_owned(), MODE_TREE, subtree(&odb, &root, "x")),
+                ]
+            );
+            assert!(index.sparse_directories);
+            assert!(index.entries_are_sorted());
+        }
+
+        #[test]
+        fn a_changed_row_keeps_its_ancestors_expanded_but_not_its_siblings() {
+            let dir = TempDir::new().unwrap();
+            let odb = Odb::new(dir.path());
+            let root = write_tree(&odb, &FILES);
+            let mut index = expanded_index(&odb, &root);
+            let edited = odb.write(ObjectKind::Blob, b"edited\n").unwrap();
+            let pos = index.find_entry_pos(b"x/f1", 0).unwrap();
+            index.entries_mut()[pos].oid = edited;
+            index.sort();
+            collapse(&mut index, &odb, &root);
+
+            assert_eq!(
+                placeholder_paths(&index),
+                vec!["w/".to_owned(), "x/y/".to_owned()]
+            );
+            let kept: Vec<String> = rows(&index).into_iter().map(|(p, _, _)| p).collect();
+            assert_eq!(kept, ["a/in", "top", "w/", "x/f1", "x/y-z", "x/y/"]);
+            let f1 = &index.entries()[index.find_entry_pos(b"x/f1", 0).unwrap()];
+            assert_eq!(f1.oid, edited);
+            let y = &index.entries()[index.find_entry_pos(b"x/y/", 0).unwrap()];
+            assert_eq!(y.oid, subtree(&odb, &root, "x/y"));
+        }
+
+        #[test]
+        fn directories_with_worktree_rows_gitlinks_or_conflicts_stay_expanded() {
+            let dir = TempDir::new().unwrap();
+            let odb = Odb::new(dir.path());
+            let mut files = FILES.to_vec();
+            files.push(("v/sub", MODE_GITLINK, ""));
+            files.push(("u/f6", 0o100644, "f6\n"));
+            let root = write_tree(&odb, &files);
+            let mut index = expanded_index(&odb, &root);
+            let pos = index.find_entry_pos(b"w/f4", 0).unwrap();
+            index.entries_mut()[pos].set_skip_worktree(false);
+            let pos = index.find_entry_pos(b"u/f6", 0).unwrap();
+            let mut theirs = index.entries()[pos].clone();
+            index.entries_mut()[pos].set_stage(2);
+            theirs.set_stage(3);
+            index.entries_mut().push(theirs);
+            index.sort();
+            collapse(&mut index, &odb, &root);
+
+            assert_eq!(placeholder_paths(&index), vec!["x/".to_owned()]);
+            for path in ["u/f6", "v/sub", "w/f4", "w/f5"] {
+                assert!(
+                    index.entries().iter().any(|e| e.path == path.as_bytes()),
+                    "{path} must stay expanded"
+                );
+            }
+        }
+
+        #[test]
+        fn existing_placeholders_count_only_when_they_match_head() {
+            let dir = TempDir::new().unwrap();
+            let odb = Odb::new(dir.path());
+            let root = write_tree(&odb, &FILES);
+            let y = subtree(&odb, &root, "x/y");
+
+            let with_y_placeholder = |oid: ObjectId| {
+                let mut index = expanded_index(&odb, &root);
+                index.entries_mut().retain(|e| !e.path.starts_with(b"x/y/"));
+                let mut placeholder = index.entries()[0].clone();
+                placeholder.path = b"x/y/".to_vec();
+                placeholder.mode = MODE_TREE;
+                placeholder.oid = oid;
+                placeholder.flags = 4;
+                placeholder.set_skip_worktree(true);
+                index.entries_mut().push(placeholder);
+                index.sort();
+                index
+            };
+
+            let mut matching = with_y_placeholder(y);
+            collapse(&mut matching, &odb, &root);
+            assert_eq!(
+                placeholder_paths(&matching),
+                vec!["w/".to_owned(), "x/".to_owned()]
+            );
+
+            let stale = odb.write(ObjectKind::Tree, b"").unwrap();
+            let mut outdated = with_y_placeholder(stale);
+            collapse(&mut outdated, &odb, &root);
+            assert_eq!(
+                placeholder_paths(&outdated),
+                vec!["w/".to_owned(), "x/y/".to_owned()]
+            );
+            let y_row = &outdated.entries()[outdated.find_entry_pos(b"x/y/", 0).unwrap()];
+            assert_eq!(y_row.oid, stale, "an outdated placeholder is left alone");
+            assert!(outdated.entries().iter().any(|e| e.path == b"x/f1"));
+        }
+
+        #[test]
+        fn collapsed_directories_subsume_nested_ones_and_cover_their_rows() {
+            let oid = ObjectId::from_bytes(&[1u8; 20]).unwrap();
+            let mut collapsed = CollapsedDirectories::default();
+            collapsed.insert(b"a/b/".to_vec(), oid);
+            collapsed.insert(b"a/c/".to_vec(), oid);
+            assert!(collapsed.has_descendants(b"a/"));
+            assert!(!collapsed.has_descendants(b"a/b/"));
+            collapsed.insert(b"a/".to_vec(), oid);
+            assert!(!collapsed.has_descendants(b"a/"));
+            assert_eq!(collapsed.dirs.len(), 1);
+
+            let mut scratch = Vec::new();
+            for (path, covered) in [
+                (&b"a/x"[..], true),
+                (b"a/b/c", true),
+                (b"a", true),
+                (b"a-b", false),
+                (b"ab/c", false),
+                (b"0", false),
+            ] {
+                assert_eq!(
+                    collapsed.covers(path, &mut scratch),
+                    covered,
+                    "{}",
+                    String::from_utf8_lossy(path)
+                );
+            }
+
+            let entry = |path: &str| IndexEntry {
+                path: path.as_bytes().to_vec(),
+                ..make_entry(path)
+            };
+            let entries = vec![
+                entry("0"),
+                entry("a"),
+                entry("a-b"),
+                entry("a/b/c"),
+                entry("ab"),
+            ];
+            assert_eq!(
+                collapsed.covered_rows(&entries),
+                vec![false, true, false, true, false]
+            );
         }
     }
 }

@@ -15,22 +15,48 @@ After planning, apply with [`apply_rewrite`](rustdoc:grit_lib::revwalk::history:
 
 [`start_rebase`](rustdoc:grit_lib::revwalk::history::start_rebase) runs resumable planning. When replay finishes without conflicts, it applies the plan atomically and returns [`RebaseOutcome::Done`](rustdoc:grit_lib::revwalk::history::RebaseOutcome::Done). When a commit conflicts, grit writes Git-compatible `.git/rebase-merge/` files plus `rebase-merge/grit-plan` (mapping, replay order, and options), detaches `HEAD` at the replayed parent, and leaves the branch ref at its pre-rebase tip — matching `git rebase` stop behavior.
 
-Resolve conflicts in the worktree, stage paths, then [`continue_rebase`](rustdoc:grit_lib::revwalk::history::continue_rebase) to record the resolved tree and replay remaining commits. [`skip_rebase`](rustdoc:grit_lib::revwalk::history::skip_rebase) maps the current commit to `HEAD` and replans the rest. [`abort_rebase`](rustdoc:grit_lib::revwalk::history::abort_rebase) hard-resets the branch to `orig-head` and removes session state. [`continue_rebase`](rustdoc:grit_lib::revwalk::history::continue_rebase) returns [`RebaseSessionError::UnmergedPaths`](rustdoc:grit_lib::revwalk::history::RebaseSessionError::UnmergedPaths) while the index still has conflict stages.
+Resolve conflicts in the worktree, stage paths, then [`continue_rebase`](rustdoc:grit_lib::revwalk::history::continue_rebase) to record the resolved tree and replay remaining commits. [`skip_rebase`](rustdoc:grit_lib::revwalk::history::skip_rebase) maps the current commit to `HEAD` and replans the rest. [`abort_rebase`](rustdoc:grit_lib::revwalk::history::abort_rebase) hard-resets the branch to `orig-head` and removes session state, even when something else moved the branch during the stop; it returns a [`RebaseAbort`](rustdoc:grit_lib::revwalk::history::RebaseAbort) whose `overwritten` list names each such branch with the tip it replaced (still in the branch reflog as `rebase (abort)`). For an exec stop the reset is a compare-and-swap against the tip just read; a concurrent move returns [`RebaseSessionError::AbortRefMoved`](rustdoc:grit_lib::revwalk::history::RebaseSessionError::AbortRefMoved) and leaves the rebase in place to retry. [`continue_rebase`](rustdoc:grit_lib::revwalk::history::continue_rebase) returns [`RebaseSessionError::UnmergedPaths`](rustdoc:grit_lib::revwalk::history::RebaseSessionError::UnmergedPaths) while the index still has conflict stages.
 
-On completion, [`RebaseOutcome::Done`](rustdoc:grit_lib::revwalk::history::RebaseOutcome::Done) exposes `head_change: Option<(ObjectId, ObjectId)>`. It compares `HEAD` at the start of that `start_rebase`, `continue_rebase`, or `skip_rebase` call with `applied.head` after completion and branch reattachment. For resume calls, the old OID is the stopped, detached `HEAD`, which can differ from the original branch tip in the plan's ref updates. `None` means the OID did not change, including a final skip that only reattaches `HEAD`. The plan retains its detached-HEAD metadata for apply validation; use `head_change` for the completed call's transition rather than deriving it from the plan. The CLI exposes this same pair as `head: {old, new}` in completed JSON and as the HEAD row in Markdown.
+On completion, [`RebaseOutcome::Done`](rustdoc:grit_lib::revwalk::history::RebaseOutcome::Done) exposes `head_change: Option<(ObjectId, ObjectId)>`. It compares `HEAD` at the start of that `start_rebase`, `continue_rebase`, or `skip_rebase` call with `applied.head` after completion and branch reattachment. For resume calls, the old OID is the stopped, detached `HEAD`, which can differ from the original branch tip in the plan's ref updates. `None` means the OID did not change, including a final skip that only reattaches `HEAD`. The plan retains its detached-HEAD metadata for apply validation; use `head_change` for the completed call's transition rather than deriving it from the plan. When [`ApplyOptions::record_operation`](rustdoc:grit_lib::revwalk::history::ApplyOptions::record_operation) is set, a finished `continue_rebase` or `skip_rebase` overwrites `.git/grit/history-last` after reattaching `HEAD` to the branch, using the pre-rebase branch tip and final tip (not the detached stop commit), so [`undo_last_rewrite`](rustdoc:grit_lib::revwalk::history::undo_last_rewrite) matches a one-shot rebase. The CLI exposes this same pair as `head: {old, new}` in completed JSON and as the HEAD row in Markdown.
 
 ## Exec verification and recovery
 
 [`verify_rebase_with_exec`](rustdoc:grit_lib::revwalk::history::verify_rebase_with_exec)
-checks out each replacement and runs the injected command runner. After every
-successful invocation it reloads the index and checks staged and unstaged tracked
-changes against the replay tree, including racy file timestamps. Clean commands
-restore the original HEAD, index, and tracked files before the caller applies the
-plan atomically.
+checks out each replacement and runs the injected command runner. It takes the
+plan by `&mut` with the plan's `RewriteOptions`: after a successful invocation, a
+detached `HEAD` that amends the replay commit (same first parent) or adds commits on
+top of it is adopted into the plan, later commits are replayed onto it with those
+options, and ref updates and the `HEAD` effect follow. Any other `HEAD` move returns
+[`HistoryError::ExecHeadMoved`](rustdoc:grit_lib::revwalk::history::HistoryError::ExecHeadMoved)
+after a rollback. After every successful invocation it also reloads the index and
+checks staged and unstaged tracked changes against the resulting `HEAD` tree,
+including racy file timestamps. Clean commands restore the original HEAD, index, and
+tracked files before the caller applies the updated plan atomically.
+
+```rust
+use grit_lib::progress::{NeverCancel, NullProgress};
+use grit_lib::revwalk::history::{apply_rewrite, verify_rebase_with_exec, ExecSpec};
+
+// `plan` comes from `plan_rebase(&repo, &request, &options)`.
+let spec = ExecSpec { commands: vec!["cargo fmt && git commit -qa --amend --no-edit".into()] };
+let report = verify_rebase_with_exec(&repo, &mut plan, &spec, &options.rewrite, runner.as_ref())?;
+apply_rewrite(&repo, &plan, &apply, &mut NullProgress, &NeverCancel)?;
+```
+
+When replaying a later commit onto an amended one conflicts,
+[`HistoryError::ExecConflict`](rustdoc:grit_lib::revwalk::history::HistoryError::ExecConflict)
+leaves the conflict checked out on top of the rewritten commit and saves recovery
+state: stage a resolution and call `continue_rebase` (commands then run at the
+resolved commit), or `skip_rebase` to drop the commit (its commands still run at the
+current `HEAD`, as in Git's todo list), or `abort_rebase`. The recovery record keeps
+the `RewriteOptions` the exec run started with, and resuming uses those rather than
+the options passed to `continue_rebase` / `skip_rebase`. If the record cannot be
+written, the run is rolled back instead of leaving a detached conflict behind.
 
 [`HistoryError::ExecDirty`](rustdoc:grit_lib::revwalk::history::HistoryError::ExecDirty)
-carries the replay commit, command, changed paths, and captured run records. The
-edited index and worktree are preserved at the detached replay HEAD. Original
+carries the `HEAD` the command left (the replay commit or its amended replacement),
+the command, changed paths, and captured run records. The
+edited index and worktree are preserved at that detached HEAD. Original
 branch refs remain unchanged. Do **not** apply the rewrite after this error.
 The library saves the original HEAD and index, plan, and next command position in
 `rebase-merge/grit-exec`; it distinguishes this stop from an unresolved pick.
@@ -40,7 +66,11 @@ remaining commits. `skip_rebase` skips remaining commands at the current commit
 without dropping that commit. Both reject a dirty index/worktree without changing
 it. A moved replay HEAD returns
 [`RebaseSessionError::ExecHeadChanged`](rustdoc:grit_lib::revwalk::history::RebaseSessionError::ExecHeadChanged):
-save any new commits on a branch, abort, and restart. `abort_rebase` explicitly
+save any new commits on a branch, abort, and restart. When the rebased branch, or a
+ref the saved plan updates, was moved while stopped, both return
+[`RebaseSessionError::StaleExecPlan`](rustdoc:grit_lib::revwalk::history::RebaseSessionError::StaleExecPlan)
+with the ref name and the expected and current tips, before checking the worktree and
+without changing anything. `abort_rebase` explicitly
 restores the saved HEAD, index, and tracked files, discarding unsaved exec edits.
 Clean recovery returns `RebaseOutcome::ExecDone` with an `exec` report containing the
 invocations captured during that call, for the embedding caller to render.

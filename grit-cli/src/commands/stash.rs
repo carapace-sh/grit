@@ -1,17 +1,17 @@
 //! `grit stash` — save and restore shelved work.
 
-use grit_lib::progress::{NeverCancel, ProgressSink};
+use grit_lib::progress::ProgressSink;
 use std::io::IsTerminal;
 use std::io::Write;
 
 use crate::pathspec_args::TrailingPathspecArgs;
 use anyhow::{Context, Result};
 use grit_lib::config::ident_resolve::IdentRole;
+use grit_lib::diff::hunk_id::HunkId;
+use grit_lib::diff::DiffOptions;
 use grit_lib::error::Error;
 use grit_lib::error::Error as LibError;
-use grit_lib::porcelain::hunk_select::{
-    parse_hunk_id_list, report_unstaged_hunk_selection, HunkSelectError,
-};
+use grit_lib::porcelain::hunk_select::{parse_hunk_id_list, HunkSelectError};
 use grit_lib::stash::{StashApplyOptions, StashDiffOptions, StashMode, StashPushOptions};
 use schemars::JsonSchema;
 use serde::Serialize;
@@ -412,32 +412,12 @@ pub fn run_push(args: StashPushRunArgs<'_>) -> Result<StashPushOutcome> {
         }
         Some(sel)
     };
-    if include_untracked && selection.is_some() {
-        anyhow::bail!("--include-untracked cannot be used with --hunks or --lines");
-    }
     let mode = stash_mode_from_flags(staged, keep_index)?;
     let resolved = pathspec_args.resolve(&repo)?;
     let (pathspecs, _) = resolved.into_pathspec_lists();
     if !pathspecs.is_empty() && selection.is_some() {
         anyhow::bail!("path arguments cannot be used with --hunks or --lines");
     }
-    let (stashed_hunks, stashed_lines) = if let Some(ref sel) = selection {
-        let report =
-            report_unstaged_hunk_selection(&repo, sel, &pathspecs).map_err(anyhow::Error::new)?;
-        let hunks = report
-            .stashed_hunks
-            .into_iter()
-            .map(|(path, ids)| {
-                (
-                    path,
-                    ids.into_iter().map(|id| id.as_str().to_string()).collect(),
-                )
-            })
-            .collect();
-        (hunks, report.stashed_lines)
-    } else {
-        (BTreeMap::new(), BTreeMap::new())
-    };
     let push_paths = pathspecs.clone();
     let options = StashPushOptions {
         message: message.clone(),
@@ -463,16 +443,17 @@ pub fn run_push(args: StashPushRunArgs<'_>) -> Result<StashPushOutcome> {
                     mode: mode.into(),
                     paths,
                     untracked,
-                    stashed_hunks,
-                    stashed_lines,
+                    stashed_hunks: hunk_id_strings(p.stashed_hunks),
+                    stashed_lines: p.stashed_lines,
                 }
             }
             None => StashPushOutcome::Nothing { stashed: false },
         });
     }
+    let interrupt = crate::interrupt::InterruptCancel::install();
     let pushed = repo
         .stash()
-        .push(&options, progress, &NeverCancel)
+        .push(&options, progress, &interrupt)
         .map_err(map_stash_error)?;
     Ok(match pushed {
         Some(result) => StashPushOutcome::Saved {
@@ -480,12 +461,19 @@ pub fn run_push(args: StashPushRunArgs<'_>) -> Result<StashPushOutcome> {
             message: result.message,
             dry_run: false,
             mode: mode.into(),
-            stashed_hunks,
-            stashed_lines,
+            stashed_hunks: hunk_id_strings(result.stashed_hunks),
+            stashed_lines: result.stashed_lines,
             paths: push_paths,
         },
         None => StashPushOutcome::Nothing { stashed: false },
     })
+}
+
+fn hunk_id_strings(by_path: BTreeMap<String, Vec<HunkId>>) -> BTreeMap<String, Vec<String>> {
+    by_path
+        .into_iter()
+        .map(|(path, ids)| (path, ids.iter().map(|id| id.as_str().to_owned()).collect()))
+        .collect()
 }
 
 pub fn run_list() -> Result<StashListOutcome> {
@@ -510,12 +498,12 @@ pub fn run_show(
 ) -> Result<StashShowOutcome> {
     let repo = context::discover()?;
     let n = parse_stash_index(index.as_deref())?;
-    let diff_options = StashDiffOptions { include_untracked };
-    let entries = repo
-        .stash()
-        .diff(n, &diff_options)
-        .map_err(map_stash_error)?;
+    let stash_options = StashDiffOptions { include_untracked };
     if patch {
+        let entries = repo
+            .stash()
+            .diff(n, &stash_options)
+            .map_err(map_stash_error)?;
         let patch = diff::outcome_from_tree_entries(&repo, entries)?;
         return Ok(StashShowOutcome {
             index: n,
@@ -524,12 +512,15 @@ pub fn run_show(
             patch: Some(patch),
         });
     }
-    let full = diff::outcome_from_tree_entries(&repo, entries)?;
-    let stat = diff_render::diffstat_from_files(&full.files);
+    let config = repo.config().context("could not load config")?;
+    let stat = repo
+        .stash()
+        .diff_stat(n, &stash_options, DiffOptions::from_config(&config))
+        .map_err(map_stash_error)?;
     Ok(StashShowOutcome {
         index: n,
         include_untracked,
-        stat: Some(stat),
+        stat: Some(stat.into()),
         patch: None,
     })
 }
@@ -703,13 +694,17 @@ pub fn run_apply(
     repo.work_tree()
         .context("grit stash apply needs a working tree")?;
     let n = parse_stash_index(index.as_deref())?;
+    let interrupt = crate::interrupt::InterruptCancel::install();
     let applied = repo
         .stash()
         .apply(
             n,
-            &StashApplyOptions { restore_index },
+            &StashApplyOptions {
+                restore_index,
+                ..Default::default()
+            },
             progress,
-            &NeverCancel,
+            &interrupt,
         )
         .map_err(map_stash_error)?;
     Ok(StashApplyOutcome {
@@ -729,13 +724,17 @@ pub fn run_pop(
     repo.work_tree()
         .context("grit stash pop needs a working tree")?;
     let n = parse_stash_index(index.as_deref())?;
+    let interrupt = crate::interrupt::InterruptCancel::install();
     let popped = repo
         .stash()
         .pop(
             n,
-            &StashApplyOptions { restore_index },
+            &StashApplyOptions {
+                restore_index,
+                ..Default::default()
+            },
             progress,
-            &NeverCancel,
+            &interrupt,
         )
         .map_err(map_stash_error)?;
     let conflicts = popped.has_conflicts();

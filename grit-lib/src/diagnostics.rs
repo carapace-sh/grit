@@ -167,6 +167,13 @@ pub enum Warning {
         /// Why the append failed.
         detail: String,
     },
+    /// Reflog `@{date}` cutoff is older than every reflog entry; the oldest entry was used.
+    ReflogDateBeforeOldestEntry {
+        /// Human-readable ref label from the revision spec.
+        ref_display: String,
+        /// Parsed cutoff instant (Unix seconds).
+        cutoff_sec: i64,
+    },
     /// A traditional hook script exists but is not executable.
     NonExecutableHookIgnored {
         /// Hook script basename that was skipped.

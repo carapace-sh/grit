@@ -2,6 +2,8 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use crate::support;
+
 use grit_lib::objects::FileMode;
 use std::io::{Cursor, Write};
 use std::num::NonZeroUsize;
@@ -9,17 +11,15 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 use grit_lib::blame::build_fuzzy_line_map;
-use grit_lib::command_runner::hooks::{
-    resolve_hooks_dir, run_hook, run_reference_transaction_committed_for_head_update,
-};
+use grit_lib::command_runner::hooks::{resolve_hooks_dir, run_hook};
 use grit_lib::command_runner::{run_program, CommandStdin, CommandStdio, RecordingRunner};
 use grit_lib::config::config_file_display_for_error;
 use grit_lib::config::dotfile::is_ntfs_dot_gitignore;
 use grit_lib::config::ident::SignatureTimestamp;
 use grit_lib::config::ident::{fsck_commit_idents, timestamp_for_at_ct};
 use grit_lib::diff::{
-    detect_copies, format_stat_line, read_submodule_head_for_checkout,
-    submodule_commit_subject_line, unified_diff, unified_diff_with_prefix,
+    detect_copies, read_submodule_head_for_checkout, submodule_commit_subject_line, unified_diff,
+    unified_diff_with_prefix,
 };
 use grit_lib::lockfile::{LockFile, LockWait, SystemLockJitter};
 use grit_lib::objects::hash::try_par_hash_with_force;
@@ -101,8 +101,6 @@ fn blame_diff_dotfile_ident_and_hash_helpers() {
 
     let _ = unified_diff("a\n", "b\n", "f", "f", 3, false, false);
     let _ = unified_diff_with_prefix("a\n", "b\n", "f", "f", 3, 0, "a/", "b/", false, false);
-    let _ = format_stat_line("path", 1, 2, 80);
-
     let empty_tree = ObjectId::from_hex("4b825dc642cb6eb9a060e54bf8d69288fbee4904").expect("tree");
     let odb_dir = tempdir().expect("t").path().join("objects");
     let odb = grit_lib::objects::odb::Odb::new(&odb_dir);
@@ -405,7 +403,7 @@ fn porcelain_log_revert_and_submodule_diff_helpers() {
     let dir = tempdir().expect("tempdir");
     let repo = init_repo(dir.path());
     let git_dir = dir.path().join(".git");
-    let seed = ObjectId::from_hex("4b825dc642cb6eb9a060e54bf8d69288fbee4904").expect("tree");
+    let seed = support::stored_commit(&git_dir, 1);
     grit_lib::refs::write_ref(git_dir.as_path(), "refs/heads/main", &seed).expect("seed main");
     let _ = collect_decorations(&repo, false);
     let _ = collect_decorations_inner(&repo, true, true, &DecorationFilter::default());
@@ -444,7 +442,10 @@ fn hooks_helpers_with_repo() {
     let _ = resolve_hooks_dir(&repo);
     let _ = repo.hooks().list(None);
     let _ = run_hook(&repo, "pre-commit", &[], None);
-    let head = grit_lib::state::resolve_head(repo.git_dir()).expect("head");
-    let zero = ObjectId::zero();
-    let _ = run_reference_transaction_committed_for_head_update(&repo, &head, None, zero);
+    let _ = run_hook(
+        &repo,
+        "reference-transaction",
+        &["committed"],
+        Some(b"0000000000000000000000000000000000000000 0000000000000000000000000000000000000000 HEAD\n"),
+    );
 }

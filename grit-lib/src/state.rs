@@ -606,6 +606,25 @@ fn grit_rebase_plan_active(rebase_merge: &Path) -> bool {
     rebase_merge.join("grit-plan").is_file() || rebase_merge.join("grit-exec").is_file()
 }
 
+/// True when grit stopped a resumable rebase on replay conflicts (`stopped-sha` is set).
+pub(crate) fn grit_rebase_conflict_stop_active(git_dir: &Path) -> bool {
+    let merge = git_dir.join("rebase-merge");
+    merge.is_dir() && merge.join("grit-plan").is_file() && merge.join("stopped-sha").is_file()
+}
+
+/// Source commit being replayed when [`grit_rebase_conflict_stop_active`] is true.
+pub(crate) fn read_grit_rebase_stopped_source(
+    git_dir: &Path,
+) -> crate::error::Result<Option<ObjectId>> {
+    if !grit_rebase_conflict_stop_active(git_dir) {
+        return Ok(None);
+    }
+    let raw = fs::read_to_string(git_dir.join("rebase-merge/stopped-sha"))?;
+    let oid =
+        ObjectId::from_hex(raw.trim()).map_err(|e| crate::error::Error::Message(e.to_string()))?;
+    Ok(Some(oid))
+}
+
 /// Detect in-progress operations by checking for sentinel files.
 ///
 /// # Parameters
@@ -662,6 +681,17 @@ pub fn detect_in_progress(git_dir: &Path) -> Vec<InProgressOperation> {
     }
 
     ops
+}
+
+/// Remove in-progress operation sentinels without moving `HEAD`, refs, or the worktree.
+///
+/// Returns the operations that were active before clearing (same order as [`detect_in_progress`]).
+///
+/// # Errors
+///
+/// Returns [`Error::Io`] when sentinel files cannot be removed.
+pub fn clear_in_progress(repo: &Repository) -> Result<Vec<InProgressOperation>> {
+    crate::porcelain::workspace_snapshot::clear_in_progress(repo)
 }
 
 /// The paused operation that must finish before `HEAD` may move to another branch or commit.
@@ -1210,9 +1240,44 @@ fn read_oid_head_file_optional(path: &Path) -> Result<Option<ObjectId>> {
     }
 }
 
-/// Read ORIG_HEAD.
+/// Read the loose `$GIT_DIR/ORIG_HEAD` file.
+///
+/// Only sees a files-backend `ORIG_HEAD`; use [`read_orig_head_for_repository`] to read it
+/// through the repository's ref store (reftable or injected stores).
+///
+/// # Errors
+///
+/// Returns [`Error::Io`] when the file cannot be read and an object id parse error when it
+/// does not hold one.
 pub fn read_orig_head(git_dir: &Path) -> Result<Option<ObjectId>> {
     read_single_oid_file(&git_dir.join("ORIG_HEAD"))
+}
+
+/// Read `ORIG_HEAD` through `repo`'s ref store.
+///
+/// # Returns
+///
+/// The commit `ORIG_HEAD` resolves to, or `None` when it is not set.
+///
+/// # Errors
+///
+/// Propagates ref store read and resolution failures.
+pub fn read_orig_head_for_repository(repo: &Repository) -> Result<Option<ObjectId>> {
+    repo.references().resolve_if_exists("ORIG_HEAD")
+}
+
+/// Record `oid` as `ORIG_HEAD`, the `HEAD` an operation started from.
+///
+/// Reset, merge and rebase call this so `ORIG_HEAD` names the pre-operation commit and
+/// `reset --hard ORIG_HEAD` undoes them. The value goes through `repo`'s ref store (the loose
+/// `$GIT_DIR/ORIG_HEAD` file on the files backend, the reftable stack otherwise), overwrites
+/// any previous value, and writes no reflog, as Git does.
+///
+/// # Errors
+///
+/// Propagates ref store write failures (for example a held lock).
+pub fn write_orig_head(repo: &Repository, oid: ObjectId) -> Result<()> {
+    crate::refs::update_direct_ref_on_store(repo.refs(), repo.git_dir(), "ORIG_HEAD", &oid)
 }
 
 /// Read a file that contains a single OID on its first line.

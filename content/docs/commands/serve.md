@@ -56,6 +56,18 @@ Fetches over protocol v2 see the `bundle-uri` command in the server's capabiliti
 
 `--no-bundles` turns this off: nothing is built and nothing is advertised.
 
+A repository with promisor remotes gets no bundle, and any bundle built earlier is removed. This covers a repository offloaded with [`grit gc offload`](../gc/#grit-gc-offload): some of its blobs live elsewhere, and a bundle holding them would undo the offload. Its clients clone through upload-pack, which points them at the promisor.
+
+### Partial clone filters
+
+[`grit clone --blobs`](../clone/) and filtered fetches need the server to advertise Git's `filter` capability. On each served bare repository, enable it the same way as with `git upload-pack`:
+
+```console
+$ git -C /path/to/root/project.git config uploadpack.allowFilter true
+```
+
+Filter support is off by default (matching stock `git upload-pack`). Without it, clients that pass `--blobs` or `--filter` still connect, but the server sends a full pack; grit warns when that happens.
+
 ### Resumable pushes
 
 The push advertisement carries a `pushBundle=/push` capability: a [TUS](https://tus.io/protocols/resumable-upload) upload endpoint at `http://<host>:<port>/<name>/push`. [`grit push`](../push/) sends a large push there as a bundle, in chunks that survive a dropped connection, then posts the usual ref updates to `…/push/<id>/receive`. The server applies them exactly as for a normal push (the same checks, policy and hooks) and answers with the usual push report. Uploading needs write access, and an upload belongs to the user who started it. Unfinished uploads are deleted after a week. Git clients ignore the capability and push the usual way.
@@ -91,6 +103,14 @@ The server keeps checkouts in `grit-serve/checkouts/` inside the Git directory (
 Once a repository has checkouts, its target branch changes only through integrations and slice changes. Pushes that create, update or delete it are refused, by `git` and `grit` clients alike, over smart HTTP and the resumable endpoint (and by [`grit receive-pack`](../receive-pack/)); branches whose names differ from it only in case are refused too. The refusal (`main is the target branch; it changes only through integrate`, or Git's own `branch is currently checked out` when the repository has it checked out) comes with instructions, which Git clients show as `remote:` lines: push another branch and run [`grit integrate <branch>`](../integrate/). A repository without checkouts keeps Git's rules for pushes, including refusing to delete the branch `HEAD` names (`receive.denyDeleteCurrent`).
 
 Integrations and slice changes take turns, one at a time per repository, and each starts over on the new tip if the target moves while it is made (by another process). Integrating refuses names that are not valid branch names, the target itself and branches that share no history with it. A server-made commit's author comes from the request (the client's own author identity) or is the signed-in user; `<`, `>` and line breaks are cleaned out of it, so it can't break the commit's header. When the repository has a working tree with the target checked out (`HEAD` names it), that tree and its index move with each integration and slice change, keeping uncommitted changes there as `git reset --keep` does; a change that would overwrite them is refused and the target stays where it was. Every ref move the server makes is logged where the repository keeps reflogs (`core.logAllRefUpdates`, on by default in a repository with a working tree), as `checkin: from checkout <id>`, `integrate: Merge branch '<branch>' into <target>` or `slice: <message>`, so `git reflog <branch>` shows it and `<branch>@{1}` undoes it.
+
+### Large-object promisors
+
+A repository can point clients at promisor remotes that hold some of its objects, such as a large-object promisor (LOP) with the big blobs. Set `promisor.advertise = true` and give the repository a promisor remote (`remote.<name>.url` and `remote.<name>.promisor = true`); the protocol v2 capabilities then carry a `promisor-remote` line naming it, and `promisor.sendFields` adds its `partialCloneFilter` and `token`. A LOP served by `grit serve` needs `uploadpack.allowFilter` and `uploadpack.allowAnySHA1InWant`, so clients can fetch blobs no ref points at. See [grit upload-pack](../upload-pack/#promisor-remotes) for the exchange, and [grit clone](../clone/) for the client side.
+
+Over smart HTTP every request stands alone, so the server only knows a client accepted a promisor remote when the `fetch` request itself says so. `grit` clients send their acceptance with every command; `git` clients send it with `ls-refs` only, so for them the server behaves as if nothing was accepted. A `git` fetch whose filter is no looser than the promisor remotes' `partialCloneFilter` still gets its pack without the offloaded blobs, since its filter leaves them out anyway (see [upload-pack](../upload-pack/#serving-a-repository-whose-large-blobs-live-elsewhere)).
+
+To keep a repository's big blobs out of it, host the LOP as a second repository next to it and run [`grit gc offload`](../gc/#grit-gc-offload) on the main one. Point `remote.<lop>.url` at the URL clients should use (for example `http://<host>:<port>/<lop>.git` on this server), and pass `--lop-dir` with the LOP's directory on disk. The main repository then serves clients that accept the LOP without the offloaded blobs. A client that accepts nothing is refused with a hint, unless the server may fetch the blobs itself: set `uploadpack.lazyFetch = true` in the main repository, or start `grit serve` with `GIT_NO_LAZY_FETCH=0`. Only those requests get a promisor fetcher, upload-pack and snapshot checkouts alike; clone bundles and pushes never do. So a server without lazy fetch never fetches anything, and nothing pulls an offloaded blob back into the main repository. A snapshot holds every file it names, so a snapshot checkout follows the same rule as a client that accepted nothing: with lazy fetch on, the server first fetches the offloaded blobs the snapshot needs, all in one request, and they stay in the main repository until the next `grit gc offload`; with it off, `POST /.grit/checkouts/<name>` (and `update`) answer `409` naming the first missing blob and how many there are, and a fetch that fails answers `502`. Pushes may name offloaded blobs in their trees. If the LOP sits behind this server's authentication, the server needs credentials for it, like any other client. See [Serving a repository whose large blobs live elsewhere](../upload-pack/#serving-a-repository-whose-large-blobs-live-elsewhere).
 
 ### Running it
 

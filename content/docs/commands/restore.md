@@ -17,12 +17,12 @@ Discards local changes for tracked paths you name. By default, `grit restore` re
 
 - `--staged` resets the **index** from `HEAD` (or from `--source` when you pass it). On an unborn branch, staged paths are removed from the index.
 - `--worktree` resets the **working tree**. When you omit both flags, only the worktree is restored.
-- `--hunks` and `--lines` reverse-apply only the selected diff hunks instead of whole files. Unstaged ids come from `grit diff --unstaged --json`; with `--staged`, ids come from `grit diff --staged --json`. Line ranges use new-side line numbers from `grit diff --json` (`lines[].new`), same as `grit add --lines`. Cannot be combined with `--source`, `--ours`, `--theirs`, or `--merge`.
+- `--hunks` and `--lines` reverse-apply only the selected diff hunks instead of whole files. Unstaged ids come from `grit diff --unstaged --json`; with `--staged`, ids come from `grit diff --staged --json`. Line ranges use new-side line numbers from `grit diff --json` (`lines[].new`), same as `grit add --lines`. Cannot be combined with `--source`, `--ours`, `--theirs`, or `--merge`. A worktree hunk restore rewrites `.git/index` only when it updates a path's cached stat data (for example once every hunk of a file is restored); while the file still differs from the index, the index file is left as it was, like `git apply -R`.
 - `--dry-run` with `--hunks` or `--lines` validates selection and reports paths without writing the worktree or index.
 - `--source=<rev>` reads content from a commit or tree instead of the usual default (`HEAD` for `--staged`, the index for the worktree).
 - Paths that are missing in the source are removed from the target. Untracked files are never touched.
 - During a merge conflict, `--ours` and `--theirs` write index stage 2 or 3 into the worktree (filters and line endings apply) and leave the index unmerged. `--merge` rebuilds conflict markers from stages 1–3; `--conflict` picks the marker style and implies `--merge`. These options cannot be combined with `--staged` or `--source`.
-- A plain worktree restore (no `--staged`, no `--source`) refuses paths that are still unmerged, for example after a conflicted `grit merge` or `grit stash pop`: there is no single index version to restore. It fails before writing anything, even when other matched paths could be restored (`grit restore .` included), and tells you to pick `--ours`, `--theirs` or `--merge`. Exclude the conflicted path (`-- . ':!f.txt'`) to restore the rest. `--staged` and `--source` replace the conflict stages instead, like Git.
+- A plain worktree restore (no `--staged`, no `--source`) refuses paths that are still unmerged, for example after a conflicted `grit merge` or `grit stash pop`: there is no single index version to restore. It fails before writing anything, even when other matched paths could be restored (`grit restore .` included), and tells you to pick `--ours`, `--theirs` or `--merge`. Exclude the conflicted path (`-- . ':!f.txt'`) to restore the rest. `--staged` on its own refuses unmerged paths the same way (Git would drop the conflict stages and leave the markers in the file, and grit's auto-staging commit would then record them); to resolve, edit out the markers and `grit add` the file. `--staged --worktree` resets both the index and the file to `HEAD`, and `--source` without `--staged` writes only the worktree and leaves the conflict stages in place.
 
 ## Options
 
@@ -36,7 +36,7 @@ Discards local changes for tracked paths you name. By default, `grit restore` re
 | `--hunks` | Discard or unstage only the listed hunk ids (comma-separated, repeatable). |
 | `--lines` | Discard or unstage only new-side line ranges (`path:start-end`, repeatable). Mix with `--hunks`. |
 | `--dry-run` | With `--hunks` or `--lines`, report paths that would change without writing. |
-| `--source` | Commit or tree to restore from. |
+| `-s`, `--source` | Commit or tree to restore from. |
 | `--ours` | Unmerged paths only: check out our side (stage 2) in the worktree. |
 | `--theirs` | Unmerged paths only: check out their side (stage 3) in the worktree. |
 | `--merge` | Unmerged paths only: recreate conflict markers in the worktree (default style from `merge.conflictStyle`). |
@@ -84,12 +84,12 @@ $ grit restore --merge --conflict=diff3 -- README.md
 Restored README.md
 ```
 
-A plain restore on a conflicted path names the options that work:
+A plain or `--staged` restore on a conflicted path names the options that work:
 
 ```console
 $ grit restore README.md
 error: path 'README.md' is unmerged
-hint: take one side with `grit restore --ours README.md` or `grit restore --theirs README.md`, or bring the conflict markers back with `grit restore --merge README.md`
+hint: take one side with `grit restore --ours README.md` or `grit restore --theirs README.md`, bring the conflict markers back with `grit restore --merge README.md`, or edit out the markers and run `grit add README.md`
 ```
 
 ## JSON output
@@ -118,7 +118,7 @@ Example:
 }
 ```
 
-When a plain restore refuses an unmerged path, stdout with `--json` is a single error object with `kind` `unmerged_paths`, a `paths` array of the unmerged paths and a `hint` naming the `grit restore --ours` / `--theirs` / `--merge` commands. See the [error schema](/schemas/error/v1.json).
+When a plain or `--staged` restore refuses an unmerged path, stdout with `--json` is a single error object with `kind` `unmerged_paths`, a `paths` array of the unmerged paths and a `hint` naming the `grit restore --ours` / `--theirs` / `--merge` commands and `grit add`. See the [error schema](/schemas/error/v1.json).
 
 ## Markdown output
 
@@ -140,7 +140,7 @@ Pass `--markdown` for agent-friendly bullet lists of restored and removed paths.
 | Code | Meaning |
 | ---: | --- |
 | `0` | Success ([`success`](../exit-codes/)). |
-| `1` | Command failed ([`failure`](../exit-codes/)), including a plain restore of an unmerged path. |
+| `1` | Command failed ([`failure`](../exit-codes/)), including a plain or `--staged` restore of an unmerged path. |
 | `2` | Invalid flags or arguments ([`usage`](../exit-codes/)). |
 
 See [Exit codes](../exit-codes/) for shared rules and structured `--json` `kind` values.

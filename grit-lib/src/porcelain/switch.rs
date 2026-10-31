@@ -8,12 +8,13 @@ use crate::diff::{DiffEntry, DiffStatus};
 use crate::error::{Error, OverwriteReason, Result};
 use crate::hooks::{run_post_checkout, HookName, PostOperationHooks};
 use crate::index::{Index, IndexLock, MODE_GITLINK};
-use crate::objects::{parse_commit, ObjectId};
+use crate::objects::ObjectId;
 use crate::porcelain::branch::resolve_create_tracking;
 use crate::porcelain::branch_error::{BranchError, TrackMode};
 use crate::porcelain::checkout::{
-    checkout_tree_changes_with_index_opts, precompute_wholesale_safe_directories,
-    trusted_wholesale_directories_for_switch, CheckoutApplyOptions, CheckoutIndexWrite,
+    checkout_tree_changes_with_index_opts, filter_wholesale_dirs_by_blocked,
+    precompute_wholesale_safe_directories, trusted_wholesale_directories_for_switch,
+    wholesale_blocked_top_level_directories, CheckoutApplyOptions, CheckoutIndexWrite,
     WholesalePrecomputeResult, WholesaleWorktreeScan,
 };
 use crate::porcelain::checkout_reflog::{
@@ -104,6 +105,8 @@ pub struct SwitchOutcome {
     pub stranded_total: usize,
     /// True when [`Self::stranded_commits`] was capped at [`DEFAULT_ORPHAN_LIMIT`].
     pub stranded_truncated: bool,
+    /// Stage-0 paths that share a worktree slot when `core.ignorecase` is set.
+    pub path_collisions: Vec<String>,
 }
 
 impl SwitchOutcome {
@@ -131,6 +134,7 @@ impl SwitchOutcome {
             stranded_commits: Vec::new(),
             stranded_total: 0,
             stranded_truncated: false,
+            path_collisions: Vec::new(),
         }
     }
 
@@ -142,6 +146,24 @@ impl SwitchOutcome {
             ..self
         }
     }
+
+    fn with_path_collisions(mut self, path_collisions: Vec<String>) -> Self {
+        self.path_collisions = path_collisions;
+        self
+    }
+}
+
+fn switch_path_collisions(repo: &Repository, index: &Index) -> Result<Vec<String>> {
+    let config = repo.config()?;
+    let ignorecase = config
+        .get_bool("core.ignorecase")
+        .and_then(|r| r.ok())
+        .unwrap_or(false);
+    Ok(if ignorecase {
+        crate::path_icase::icase_checkout_collision_paths(index, true)
+    } else {
+        Vec::new()
+    })
 }
 
 pub(crate) struct PreparedSwitch {
@@ -161,6 +183,34 @@ pub(crate) struct PreparedSwitch {
 impl PreparedSwitch {
     pub(crate) fn preserve_worktree_paths(&self) -> &HashSet<String> {
         &self.preserve_worktree_paths
+    }
+
+    pub(crate) fn tree_changes(&self) -> &[crate::diff::DiffEntry] {
+        &self.plan.tree_changes
+    }
+
+    pub(crate) fn untracked_for_overwrite_check(&self) -> &[String] {
+        &self.plan.untracked
+    }
+
+    pub(crate) fn trust_wholesale_dir_removal(&self) -> bool {
+        self.trust_wholesale_dir_removal
+    }
+
+    pub(crate) fn preverified_wholesale_dirs(&self) -> &BTreeSet<String> {
+        &self.preverified_wholesale_dirs
+    }
+
+    pub(crate) fn wholesale_safety_precomputed(&self) -> bool {
+        self.wholesale_safety_precomputed
+    }
+
+    pub(crate) fn index(&self) -> &crate::index::Index {
+        &self.index
+    }
+
+    pub(crate) fn into_index(self) -> crate::index::Index {
+        self.index
     }
 }
 
@@ -436,15 +486,13 @@ fn switch_without_hooks(
         && is_already_on_branch(repo, &branch_ref, target_oid)?
         && repo.index_path_for_env()?.try_exists()?
     {
+        let index = repo.load_index()?;
         if opts.dry_run {
-            return Ok(SwitchOutcome::new(
-                &branch_label,
-                created,
-                detached,
-                target_oid,
-                true,
-                0,
-            ));
+            let collisions = switch_path_collisions(repo, &index)?;
+            return Ok(
+                SwitchOutcome::new(&branch_label, created, detached, target_oid, true, 0)
+                    .with_path_collisions(collisions),
+            );
         }
         let head_before = resolve_head_for_repository(repo)?;
         if let Some(from_label) = checkout_reflog_from_label(&head_before) {
@@ -454,19 +502,18 @@ fn switch_without_hooks(
                 .unwrap_or_else(crate::diff::zero_oid);
             append_head_checkout_reflog(repo, old_oid, target_oid, &from_label, &branch_label)?;
         }
-        return Ok(SwitchOutcome::new(
-            &branch_label,
-            created,
-            detached,
-            target_oid,
-            false,
-            0,
-        ));
+        let collisions = switch_path_collisions(repo, &index)?;
+        return Ok(
+            SwitchOutcome::new(&branch_label, created, detached, target_oid, false, 0)
+                .with_path_collisions(collisions),
+        );
     }
     if detached
         && is_already_detached_at(repo, target_oid)?
         && repo.index_path_for_env()?.try_exists()?
     {
+        let index = repo.load_index()?;
+        let collisions = switch_path_collisions(repo, &index)?;
         return Ok(SwitchOutcome::new(
             &branch_label,
             created,
@@ -474,7 +521,8 @@ fn switch_without_hooks(
             target_oid,
             opts.dry_run,
             0,
-        ));
+        )
+        .with_path_collisions(collisions));
     }
 
     // A real switch reads the index under `index.lock`, so a held lock refuses it before any
@@ -529,15 +577,15 @@ fn switch_to_target(
         head_before.oid().copied()
     };
     let (target_tree, head_tree) = match checkout_head {
-        None => (commit_tree(repo, &target_oid)?, None),
+        None => (repo.odb().commit_tree(&target_oid)?, None),
         Some(head) if head == target_oid => {
-            let tree = commit_tree(repo, &target_oid)?;
+            let tree = repo.odb().commit_tree(&target_oid)?;
             (tree, Some(tree))
         }
         Some(head) => {
             let (target_res, head_res) = std::thread::scope(|scope| {
-                let target = scope.spawn(|| commit_tree(repo, &target_oid));
-                let head = scope.spawn(|| commit_tree(repo, &head));
+                let target = scope.spawn(|| repo.odb().commit_tree(&target_oid));
+                let head = scope.spawn(|| repo.odb().commit_tree(&head));
                 (target.join(), head.join())
             });
             (
@@ -560,6 +608,7 @@ fn switch_to_target(
     let prepared = prepare_tree_switch_allow_local_with_snapshot(repo, &target_tree, snapshot)?;
     let changed_paths = count_unique_tree_change_paths(&prepared.plan.tree_changes);
     let stranded = stranded_by_leaving_detached_head(repo, &head_before, target_oid)?;
+    let dry_run_collisions = switch_path_collisions(repo, &prepared.index)?;
     if dry_run {
         return Ok(SwitchOutcome::new(
             branch_label,
@@ -569,7 +618,8 @@ fn switch_to_target(
             true,
             changed_paths,
         )
-        .with_stranded(stranded));
+        .with_stranded(stranded)
+        .with_path_collisions(dry_run_collisions));
     }
     checkout_prepared_tree_transition(repo, prepared, index_lock, progress, cancel)?;
 
@@ -605,9 +655,12 @@ fn switch_to_target(
         }
     }
 
+    let index = repo.load_index()?;
+    let path_collisions = switch_path_collisions(repo, &index)?;
     Ok(
         SwitchOutcome::new(branch_label, created, detached, target_oid, false, 0)
-            .with_stranded(stranded),
+            .with_stranded(stranded)
+            .with_path_collisions(path_collisions),
     )
 }
 
@@ -830,6 +883,7 @@ fn plan_allow_local_tree_transition_core(
                 &snapshot.index,
                 &delete_paths,
                 &gitlink_deletes,
+                &tree_changes,
             ),
             true,
         )
@@ -848,7 +902,11 @@ fn plan_allow_local_tree_transition_core(
             scan.as_ref(),
             &gitlink_deletes,
         );
-        (safe_directories, true)
+        let blocked = wholesale_blocked_top_level_directories(&tree_changes);
+        (
+            filter_wholesale_dirs_by_blocked(safe_directories, &blocked),
+            true,
+        )
     };
     Ok(AllowLocalTreeTransitionCore {
         tree_changes,
@@ -913,11 +971,6 @@ pub(crate) fn keep_style_transition_would_block_paths_for_preview(
     Ok(merge_keep_style_block_paths(&core))
 }
 
-fn commit_tree(repo: &Repository, commit: &ObjectId) -> Result<ObjectId> {
-    let obj = repo.odb().read(commit)?;
-    Ok(parse_commit(&obj.data)?.tree)
-}
-
 fn path_from_diff(entry: &DiffEntry) -> Option<&str> {
     entry.new_path.as_deref().or(entry.old_path.as_deref())
 }
@@ -953,10 +1006,17 @@ fn index_matches_target_tree_entry(
         .is_some_and(|entry| entry.oid == target.oid && entry.mode == target.mode)
 }
 
-/// True when a gitlink worktree's checked-out HEAD already matches the branch being switched to.
-fn gitlink_worktree_head_matches_target(entry: &DiffEntry, target: TargetTreeEntry) -> bool {
-    use crate::index::MODE_GITLINK;
-    target.mode == MODE_GITLINK && entry.new_oid == target.oid
+/// True when `entry` is a submodule directory that drifted from its index gitlink (another
+/// commit checked out or dirty files in an initialized submodule) and the target tree still has
+/// a gitlink there.
+///
+/// Like Git, such drift is not a local edit the transition would overwrite: the index gitlink
+/// still advances to the target commit, and checkout leaves the directory as it is.
+fn gitlink_drift_survives_gitlink_target(entry: &DiffEntry, target: TargetTreeEntry) -> bool {
+    target.mode == MODE_GITLINK
+        && entry.status == DiffStatus::Modified
+        && entry.old_mode.bits() == MODE_GITLINK
+        && entry.new_mode.bits() == MODE_GITLINK
 }
 
 /// Failure while verifying a tree transition without overwriting local edits.
@@ -1141,7 +1201,7 @@ fn checkout_prepared_tree_transition(
         progress,
         cancel,
         CheckoutApplyOptions {
-            parallel_prepare_blobs: true,
+            parallel_prepare_blobs: false,
             checkout_parallel_threshold: None,
             trust_wholesale_dir_removal: prepared.trust_wholesale_dir_removal,
             preverified_wholesale_dirs: prepared.preverified_wholesale_dirs,
@@ -1222,10 +1282,11 @@ pub(crate) fn ensure_local_changes_compatible_with_switch(
             }
         }
         if let Some(target) = target_by_path.get(path) {
-            if index_matches_target_tree_entry(index, path, *target)
-                || gitlink_worktree_head_matches_target(entry, *target)
-            {
+            if index_matches_target_tree_entry(index, path, *target) {
                 preserve_worktree_paths.insert(path.to_owned());
+                continue;
+            }
+            if gitlink_drift_survives_gitlink_target(entry, *target) {
                 continue;
             }
         }
@@ -1259,6 +1320,75 @@ mod tests {
         let repo = init_repository(dir.path(), false, "main", None, RefStorageFormat::Files)
             .expect("init");
         (dir, repo)
+    }
+
+    #[test]
+    fn gitlink_drift_advances_index_but_typechange_and_staged_drift_block() {
+        use crate::objects::FileMode;
+
+        let oid = |byte: u8| ObjectId::from_bytes(&[byte; 20]).expect("oid");
+        let entry = |status, old_mode, new_mode, old_oid, new_oid| DiffEntry {
+            status,
+            old_path: Some("sub".into()),
+            new_path: Some("sub".into()),
+            old_mode,
+            new_mode,
+            old_oid,
+            new_oid,
+            score: None,
+        };
+        let bump = entry(
+            DiffStatus::Modified,
+            FileMode::GITLINK,
+            FileMode::GITLINK,
+            oid(1),
+            oid(2),
+        );
+        let work_tree = std::path::Path::new("/nonexistent");
+        let index = Index::default();
+        let check = |staged: &[DiffEntry], unstaged: &[DiffEntry]| {
+            ensure_local_changes_compatible_with_switch(
+                work_tree,
+                &index,
+                staged,
+                unstaged,
+                std::slice::from_ref(&bump),
+                &HashSet::new(),
+            )
+        };
+
+        for checked_out in [oid(2), oid(3), ObjectId::zero()] {
+            let drift = entry(
+                DiffStatus::Modified,
+                FileMode::GITLINK,
+                FileMode::GITLINK,
+                oid(1),
+                checked_out,
+            );
+            let preserved = check(&[], &[drift]).expect("gitlink drift must not block");
+            assert!(
+                preserved.is_empty(),
+                "the index gitlink must still advance, so the path is not preserved"
+            );
+        }
+
+        let typechange = entry(
+            DiffStatus::TypeChanged,
+            FileMode::GITLINK,
+            FileMode::REGULAR,
+            oid(1),
+            oid(4),
+        );
+        assert_eq!(check(&[], &[typechange]), Err(vec!["sub".to_owned()]));
+
+        let staged = entry(
+            DiffStatus::Modified,
+            FileMode::GITLINK,
+            FileMode::GITLINK,
+            oid(1),
+            oid(3),
+        );
+        assert_eq!(check(&[staged], &[]), Err(vec!["sub".to_owned()]));
     }
 
     #[test]
@@ -1980,7 +2110,7 @@ mod tests {
     fn skewed_dates_do_not_strand_a_commit_branches_hold() {
         let (_dir, repo) = init_repo();
         let main_tip = commit_on_branch(&repo, "main", "f", "one\n", None);
-        let tree = commit_tree(&repo, &main_tip).expect("tree");
+        let tree = repo.odb().commit_tree(&main_tip).expect("tree");
         let skewed = commit_dated(&repo, tree, main_tip, 1_000);
         let old_tip = commit_dated(&repo, tree, skewed, 1_100);
         let behind = commit_dated(&repo, tree, skewed, 150);

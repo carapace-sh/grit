@@ -19,9 +19,11 @@ Creates new commits on the current branch that undo the changes introduced by ea
 
 `<commit>` can be a full or short commit id, a branch name, a range such as `v1.0..main`, or several commits in one invocation.
 
-When a step would conflict, grit stops with conflict markers in the worktree and unmerged index entries — the same model as [`grit pick`](../pick/) and [`grit merge`](../merge/). Resolve conflicts, stage the result with [`grit add`](../add/), then run `grit revert --continue`. Use `--abort` to restore the branch to its pre-revert state, or `--skip` to drop the current step and continue with any remaining commits.
+When a step would conflict, grit stops with conflict markers in the worktree and unmerged index entries — the same model as [`grit pick`](../pick/) and [`grit merge`](../merge/). Resolve conflicts, then either run [`grit commit`](../commit/) (auto-stages and finishes the step) or stage with [`grit add`](../add/) and run `grit revert --continue`. Use `--abort` to restore the branch to its pre-revert state when the tip has not moved; if you already committed the resolution, `--abort` only clears revert state. Use `--skip` to drop the current step and continue with any remaining commits.
 
 Merge commits require `--mainline <n>` (1-based parent number, long option only) so grit knows which parent line to replay.
+
+Revert either completes a step, stops for conflicts or an empty commit, or changes nothing. Pressing Ctrl+C, or sending `SIGTERM` or `SIGHUP` on Unix, while files are being checked out stops the revert with `error: operation cancelled`; `HEAD`, the index and the work tree are left as they were before the revert started (no `REVERT_HEAD`), no `.git/index.lock` is left behind, and the same revert can simply be run again. This works the same in a Windows console, where Ctrl+Break counts as Ctrl+C. A second interrupt terminates grit at once, without that cleanup; only `SIGKILL` skips rollback.
 
 ## Options
 
@@ -64,6 +66,13 @@ Revert a range (newest commit in the range first):
 $ grit revert release~5..release
 Reverted f1e2d3c → … Revert "Prepare release"
 Reverted a1b2c3d → … Revert "Bump version"
+```
+
+While a rebase is paused:
+
+```console
+$ grit revert main
+error: cannot revert while a rebase is in progress; finish it with `grit rebase --continue` or cancel it with `grit rebase --abort`
 ```
 
 When the revert conflicts:

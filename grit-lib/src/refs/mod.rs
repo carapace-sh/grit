@@ -13,6 +13,17 @@
 //! When `extensions.refStorage = reftable`, the reftable backend is used
 //! instead.  The public API is the same; dispatch is handled internally.
 //!
+//! ## On-disk ref helpers vs `Repository::refs`
+//!
+//! Many public functions take `git_dir: &Path` and open a fresh files or reftable backend via
+//! `store::open_ref_store` (writes also use an internal object-checked open). They bypass
+//! [`crate::repo::Repository::refs`] and any injected [`store::RefStore`]. Use them for bare git
+//! directories (alternates, receive-pack physical listings, tests). When you hold a
+//! [`crate::repo::Repository`], prefer [`crate::refs::References`] (`resolve`, `list`,
+//! `update`), [`list_refs_for_repository`], [`read_symbolic_ref_for_repository`],
+//! [`update_branch_for_commit_on_store`], [`commit_ref_update_on_store`], and
+//! [`crate::state::resolve_head_for_repository`].
+//!
 //! Library guide: [mod](https://grit-scm.com/docs/library/refs)
 //!
 //! ```rust
@@ -45,7 +56,7 @@ pub use handle::References;
 pub use on_store::update_branch_for_commit_on_store;
 pub(crate) use on_store::{
     append_reflog_on_store, delete_ref_on_store, update_detached_head_for_commit_on_store,
-    write_symbolic_ref_on_store,
+    verify_new_tip, write_symbolic_ref_on_store,
 };
 
 /// In-process ref-transaction and loose-object prune helpers.
@@ -60,14 +71,16 @@ use std::io;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use store::{
-    open_ref_store, Expected, RawRef as StoreRawRef, RefCaseOnlyRename, RefEntry, RefReflogRename,
-    RefStorageFormat, RefStore, RefTransaction, RefUpdate, RefUpdateFlags, ReflogUpdate,
+    open_ref_store, Expected, PreparedRefTransaction, RawRef as StoreRawRef, RefCaseOnlyRename,
+    RefEntry, RefReflogRename, RefStorageFormat, RefStore, RefStoreError, RefTransaction,
+    RefUpdate, RefUpdateFlags, ReflogUpdate,
 };
 
 use crate::check_ref_format::{check_refname_format_borrowed, RefNameOptions};
 use crate::config::ConfigSet;
 use crate::error::{Error, RefLockError, Result};
 use crate::ident::Signature;
+use crate::lockfile::LockWait;
 use crate::objects::{HashAlgo, ObjectId};
 use crate::pack;
 use store::format_reflog_identity;
@@ -96,12 +109,7 @@ fn files_legacy_write_precheck(git_dir: &Path, refname: &str) -> Result<()> {
         .map(|m| m.file_type().is_dir())
         .unwrap_or(false)
     {
-        let display = ref_path_for_display(&path);
-        return Err(crate::error::RefLockError::DirectoryInTheWay {
-            refname: refname.to_owned(),
-            path: display,
-        }
-        .into());
+        return Err(directory_in_the_way(git_dir, refname, &path));
     }
     if path.is_file() && matches!(read_ref_file(&path), Err(Error::InvalidRef(_))) {
         return Err(Error::InvalidRef(format!(
@@ -109,6 +117,23 @@ fn files_legacy_write_precheck(git_dir: &Path, refname: &str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// The error for a non-empty directory at `path`, where the loose file of `refname` goes.
+///
+/// When a ref below it (loose or packed) or a packed ancestor blocks the name, this is
+/// [`store::RefStoreError::NameUnavailable`] naming that ref, as the ref store reports it.
+/// A directory that holds no ref (stray files or lock files only) is
+/// [`RefLockError::DirectoryInTheWay`].
+fn directory_in_the_way(git_dir: &Path, refname: &str, path: &Path) -> Error {
+    match verify_refname_available_for_create(git_dir, refname, &BTreeSet::new(), &HashSet::new()) {
+        Err(reason) => Error::RefStore(store::RefStoreError::NameUnavailable { reason }),
+        Ok(()) => RefLockError::DirectoryInTheWay {
+            refname: refname.to_owned(),
+            path: ref_path_for_display(path),
+        }
+        .into(),
+    }
 }
 
 fn legacy_ref_update_flags(refname: &str) -> RefUpdateFlags {
@@ -121,17 +146,26 @@ fn legacy_ref_update_flags(refname: &str) -> RefUpdateFlags {
 }
 
 pub(crate) fn commit_store_update(git_dir: &Path, update: RefUpdate) -> Result<()> {
-    let store = open_ref_store(git_dir)?;
-    commit_ref_update_on_store(store.as_ref(), update)
+    commit_ref_update_on_store(&store::open_checked_ref_store(git_dir)?, update)
 }
 
-/// Apply one ref update through an already-selected [`RefStore`] (for example the store on
+/// Apply one ref update through an already-selected [`crate::refs::store::RefStore`] (for example the store on
 /// [`crate::repo::Repository`] after [`crate::repo::Repository::with_ref_store`]).
 ///
 /// # Errors
 ///
 /// Propagates validation, compare-and-swap, and backend errors.
 pub fn commit_ref_update_on_store(store: &dyn RefStore, update: RefUpdate) -> Result<()> {
+    commit_ref_update_on_store_with_wait(store, update, || default_ref_lock_wait(store))
+}
+
+/// [`commit_ref_update_on_store`] retrying a busy store for `wait` (see
+/// [`prepare_with_lock_wait`]); `wait` is only evaluated once the store reports a held lock.
+pub(crate) fn commit_ref_update_on_store_with_wait(
+    store: &dyn RefStore,
+    update: RefUpdate,
+    wait: impl FnOnce() -> LockWait,
+) -> Result<()> {
     if let Some(ref log) = update.reflog {
         validate_reflog_update(log)?;
     }
@@ -139,12 +173,90 @@ pub fn commit_ref_update_on_store(store: &dyn RefStore, update: RefUpdate) -> Re
     let txn = RefTransaction::new()
         .update(update)
         .map_err(crate::error::Error::from)?;
-    let prepared = store
-        .prepare(txn)
+    let prepared = prepare_retrying(store, txn, wait)
         .map_err(|e| map_public_ref_store_error(Error::from(e), &refname))?;
     prepared
         .commit()
         .map_err(|e| map_public_ref_store_error(Error::from(e), &refname))
+}
+
+/// Prepare `txn` on `store`, retrying while the store reports [`RefStoreError::LockHeld`]
+/// until `wait` runs out.
+///
+/// [`RefStore::prepare`] fails fast when another transaction holds the lock it needs. A
+/// backend with one writer slot for the whole store (such as
+/// [`store::MemoryRefStore`], or a database with a single write transaction) therefore
+/// rejects concurrent updates even to disjoint refs. This helper turns that into a bounded
+/// wait, sleeping a short jittered backoff between attempts: [`LockWait::Immediately`] tries
+/// once, [`LockWait::Backoff`] retries until its budget elapses, and
+/// [`LockWait::Indefinitely`] retries until the lock is free. Use
+/// [`LockWait::files_ref_lock`] to follow `core.filesRefLockTimeout` like Git. The budget
+/// includes time spent inside `prepare`, so a backend that already waits for its own locks
+/// (the files and reftable backends) is not waited for twice. grit-lib's own ref writes
+/// (commits, branch updates, history rewrites, fetch and push) go through this retry.
+///
+/// ```rust
+/// use grit_lib::lockfile::LockWait;
+/// use grit_lib::objects::ObjectId;
+/// use grit_lib::refs::prepare_with_lock_wait;
+/// use grit_lib::refs::store::{
+///     Expected, MemoryRefStore, RawRef, RefStore, RefStoreError, RefTransaction, RefUpdate,
+/// };
+/// # fn main() -> grit_lib::error::Result<()> {
+/// let store = MemoryRefStore::new();
+/// let oid = ObjectId::from_hex("1111111111111111111111111111111111111111")?;
+/// let txn = |name: &str| {
+///     RefTransaction::new().update(RefUpdate {
+///         name: name.into(),
+///         new_value: Some(RawRef::Direct(oid)),
+///         expected: Expected::Any,
+///         reflog: None,
+///         flags: Default::default(),
+///     })
+/// };
+///
+/// let held = store.prepare(txn("refs/heads/a")?)?;
+/// let busy = prepare_with_lock_wait(&store, txn("refs/heads/b")?, LockWait::Immediately);
+/// assert!(matches!(busy.map(|_| ()), Err(RefStoreError::LockHeld { name }) if name == "refs/heads/b"));
+/// held.commit()?;
+///
+/// prepare_with_lock_wait(&store, txn("refs/heads/b")?, LockWait::files_ref_lock(None))?.commit()?;
+/// assert_eq!(store.read_raw("refs/heads/b")?, Some(RawRef::Direct(oid)));
+/// # Ok(())
+/// # }
+/// ```
+///
+/// # Errors
+///
+/// Returns [`RefStoreError::LockHeld`] when the lock is still held after `wait`, and any
+/// other error from `prepare` immediately, without retrying.
+pub fn prepare_with_lock_wait(
+    store: &dyn RefStore,
+    txn: RefTransaction,
+    wait: LockWait,
+) -> std::result::Result<Box<dyn PreparedRefTransaction + Send + '_>, RefStoreError> {
+    prepare_retrying(store, txn, || wait)
+}
+
+fn prepare_retrying(
+    store: &dyn RefStore,
+    txn: RefTransaction,
+    wait: impl FnOnce() -> LockWait,
+) -> std::result::Result<Box<dyn PreparedRefTransaction + Send + '_>, RefStoreError> {
+    use crate::lockfile::{retry_while_held, SystemLockClock, SystemLockJitter};
+    retry_while_held(
+        Path::new("refs"),
+        wait,
+        &SystemLockClock,
+        &SystemLockJitter,
+        || store.prepare(txn.clone()),
+        |err| matches!(err, RefStoreError::LockHeld { .. }),
+    )
+}
+
+/// How long ref writes wait for a busy store when the caller has no config at hand.
+fn default_ref_lock_wait(store: &dyn RefStore) -> LockWait {
+    store.ref_lock_wait()
 }
 
 /// Point `refname` at `oid` using `store`, optionally running loose-files prechecks when
@@ -196,21 +308,46 @@ pub(crate) fn store_write_value_on_store(
 
 /// Apply several ref updates in one [`RefStore::prepare`] / commit (all-or-nothing).
 ///
+/// Opens a fresh on-disk ref store for `git_dir` (object-checked open used internally)
+/// and bypasses [`crate::repo::Repository::refs`] and any injected
+/// [`crate::refs::store::RefStore`]. Prefer [`commit_ref_updates_on_store`] with
+/// [`crate::repo::Repository::refs`] when you already have a
+/// [`crate::repo::Repository`].
+///
 /// Used by batch ref paths (`fetch`, `push`, `receive-pack`, [`crate::gc::update_refs`]).
+/// Like [`crate::repo::Repository::refs`], the batch is checked against `git_dir`'s objects
+/// first.
 ///
 /// # Errors
 ///
 /// Returns [`crate::refs::store::RefStoreError`] for duplicate names, CAS failures,
-/// lock conflicts, and namespace conflicts. Propagates I/O and corrupt-store failures.
+/// lock conflicts, namespace conflicts, and direct values naming a missing object
+/// ([`MissingObject`](store::RefStoreError::MissingObject)) or, on a branch or `HEAD`, a
+/// non-commit ([`NotACommit`](store::RefStoreError::NotACommit)). Propagates I/O and
+/// corrupt-store failures.
 pub fn commit_ref_store_batch(git_dir: &Path, updates: &[RefUpdate]) -> Result<()> {
     if updates.is_empty() {
         return Ok(());
     }
-    let store = open_ref_store(git_dir)?;
-    commit_ref_updates_on_store(store.as_ref(), updates, &[])
+    commit_ref_updates_on_store(&store::open_checked_ref_store(git_dir)?, updates, &[])
 }
 
-/// Apply several ref updates atomically through an existing [`RefStore`].
+/// [`commit_ref_updates_non_atomic_on_store`] for a repository git directory.
+///
+/// # Errors
+///
+/// Same as [`commit_ref_updates_non_atomic_on_store`].
+pub fn commit_ref_updates_non_atomic(
+    git_dir: &Path,
+    updates: Vec<RefUpdate>,
+) -> Result<Vec<RefUpdateCommitOutcome>> {
+    commit_ref_updates_non_atomic_on_store(&store::open_checked_ref_store(git_dir)?, updates)
+}
+
+/// Apply several ref updates atomically through an existing [`crate::refs::store::RefStore`].
+///
+/// Object checks are those of `store`: the store from [`crate::repo::Repository::refs`]
+/// verifies direct values against the repository's objects, a bare backend does not.
 ///
 /// # Errors
 ///
@@ -242,7 +379,124 @@ pub fn commit_ref_batch_on_store(
         updates.to_vec(),
         reflog_renames.to_vec(),
         case_only_renames.to_vec(),
+        false,
+        || default_ref_lock_wait(store),
     )
+}
+
+/// Per-ref result from [`commit_ref_updates_non_atomic_on_store`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefUpdateCommitOutcome {
+    /// Full ref name from the input batch.
+    pub name: String,
+    /// `Ok(())` when the ref was updated; store errors otherwise.
+    pub result: std::result::Result<(), store::RefStoreError>,
+}
+
+/// Apply ref updates like Git non-atomic receive-pack: deletions in one transaction, then
+/// creates and updates in another, with per-ref rejections inside each phase.
+///
+/// Matches Git `execute_commands_non_atomic` (two store transactions, not one per ref).
+/// Compare-and-swap, directory/file, and object-target failures reject only that ref; siblings
+/// in the same phase still commit in one reftable table / one files batch.
+///
+/// # Errors
+///
+/// Propagates whole-transaction failures (duplicate names in the batch, I/O, lock timeout).
+pub fn commit_ref_updates_non_atomic_on_store(
+    store: &dyn RefStore,
+    updates: Vec<RefUpdate>,
+) -> Result<Vec<RefUpdateCommitOutcome>> {
+    if updates.is_empty() {
+        return Ok(Vec::new());
+    }
+    let order: Vec<String> = updates.iter().map(|u| u.name.clone()).collect();
+    let (deletes, rest): (Vec<_>, Vec<_>) = updates
+        .into_iter()
+        .partition(|u| u.new_value.is_none() && !u.flags.log_only);
+    let mut results: std::collections::HashMap<String, store::RefStoreError> =
+        std::collections::HashMap::new();
+    for phase in [deletes, rest] {
+        if phase.is_empty() {
+            continue;
+        }
+        for outcome in commit_ref_updates_allowing_failures_on_store(store, phase)? {
+            if let Err(err) = outcome.result {
+                results.insert(outcome.name, err);
+            }
+        }
+    }
+    Ok(order
+        .into_iter()
+        .map(|name| RefUpdateCommitOutcome {
+            result: results.remove(&name).map_or(Ok(()), Err),
+            name,
+        })
+        .collect())
+}
+
+/// Commit `updates` in one store transaction, recording per-ref rejections instead of failing
+/// the whole batch when [`RefTransaction::allowing_failures`] applies.
+///
+/// # Errors
+///
+/// Propagates whole-transaction failures from [`RefStore::prepare`] or commit.
+pub fn commit_ref_updates_allowing_failures_on_store(
+    store: &dyn RefStore,
+    updates: Vec<RefUpdate>,
+) -> Result<Vec<RefUpdateCommitOutcome>> {
+    if updates.is_empty() {
+        return Ok(Vec::new());
+    }
+    let order: Vec<String> = updates.iter().map(|u| u.name.clone()).collect();
+    for update in &updates {
+        if let Some(ref log) = update.reflog {
+            validate_reflog_update(log)?;
+        }
+    }
+    let label = updates
+        .first()
+        .map(|u| u.name.clone())
+        .unwrap_or_else(|| "refs".to_owned());
+    let txn = RefTransaction::from_updates(updates).map_err(|e| {
+        let name = match &e {
+            store::RefStoreError::DuplicateUpdate { name } => name.clone(),
+            _ => label.clone(),
+        };
+        map_public_ref_store_error(Error::from(e), &name)
+    })?;
+    let txn = txn.allowing_failures();
+    let prepared = prepare_retrying(store, txn, || default_ref_lock_wait(store))
+        .map_err(|e| map_public_ref_store_error(Error::from(e), &label))?;
+    let rejections: std::collections::HashMap<String, store::RefStoreError> = prepared
+        .rejected_updates()
+        .iter()
+        .map(|(name, err)| (name.clone(), err.clone()))
+        .collect();
+    prepared
+        .commit()
+        .map_err(|e| map_public_ref_store_error(Error::from(e), &label))?;
+
+    Ok(order
+        .into_iter()
+        .map(|name| {
+            let result = rejections.get(&name).cloned().map_or(Ok(()), Err);
+            RefUpdateCommitOutcome { name, result }
+        })
+        .collect())
+}
+
+/// [`commit_ref_updates_on_store`] retrying a busy store for `wait` (see
+/// [`prepare_with_lock_wait`]); `wait` is only evaluated once the store reports a held lock.
+pub(crate) fn commit_ref_updates_on_store_with_wait(
+    store: &dyn RefStore,
+    updates: &[RefUpdate],
+    wait: impl FnOnce() -> LockWait,
+) -> Result<()> {
+    if updates.is_empty() {
+        return Ok(());
+    }
+    commit_owned_ref_batch_on_store(store, updates.to_vec(), Vec::new(), Vec::new(), false, wait)
 }
 
 /// [`commit_ref_updates_on_store`] taking ownership of `updates`, so a large batch is not copied.
@@ -257,7 +511,36 @@ pub(crate) fn commit_owned_ref_updates_on_store(
     if updates.is_empty() {
         return Ok(());
     }
-    commit_owned_ref_batch_on_store(store, updates, Vec::new(), Vec::new())
+    commit_owned_ref_batch_on_store(store, updates, Vec::new(), Vec::new(), false, || {
+        default_ref_lock_wait(store)
+    })
+}
+
+/// [`commit_owned_ref_updates_on_store`] as the first ref transaction of a new repository
+/// ([`RefTransaction::initial`]): the files backend stores a batch of plain creates in one
+/// `packed-refs` rewrite instead of a loose file per ref.
+///
+/// # Errors
+///
+/// Same as [`commit_ref_updates_on_store`].
+pub(crate) fn commit_initial_ref_updates_on_store(
+    store: &dyn RefStore,
+    updates: Vec<RefUpdate>,
+) -> Result<()> {
+    commit_initial_ref_updates_on_store_with_wait(store, updates, || default_ref_lock_wait(store))
+}
+
+/// [`commit_initial_ref_updates_on_store`] retrying a busy store for `wait` (see
+/// [`prepare_with_lock_wait`]); `wait` is only evaluated once the store reports a held lock.
+pub(crate) fn commit_initial_ref_updates_on_store_with_wait(
+    store: &dyn RefStore,
+    updates: Vec<RefUpdate>,
+    wait: impl FnOnce() -> LockWait,
+) -> Result<()> {
+    if updates.is_empty() {
+        return Ok(());
+    }
+    commit_owned_ref_batch_on_store(store, updates, Vec::new(), Vec::new(), true, wait)
 }
 
 fn commit_owned_ref_batch_on_store(
@@ -265,6 +548,8 @@ fn commit_owned_ref_batch_on_store(
     updates: Vec<RefUpdate>,
     reflog_renames: Vec<RefReflogRename>,
     case_only_renames: Vec<RefCaseOnlyRename>,
+    initial: bool,
+    wait: impl FnOnce() -> LockWait,
 ) -> Result<()> {
     for update in &updates {
         if let Some(ref log) = update.reflog {
@@ -293,8 +578,10 @@ fn commit_owned_ref_batch_on_store(
     for rename in case_only_renames {
         txn = txn.with_case_only_rename(rename);
     }
-    let prepared = store
-        .prepare(txn)
+    if initial {
+        txn = txn.initial();
+    }
+    let prepared = prepare_retrying(store, txn, wait)
         .map_err(|e| map_public_ref_store_error(Error::from(e), &label))?;
     prepared
         .commit()
@@ -308,9 +595,8 @@ fn store_write_value(
     expected: Expected,
     reflog: Option<ReflogUpdate>,
 ) -> Result<()> {
-    let store = open_ref_store(git_dir)?;
     store_write_value_on_store(
-        store.as_ref(),
+        &store::open_checked_ref_store(git_dir)?,
         git_dir,
         refname,
         new_value,
@@ -364,27 +650,53 @@ pub enum Ref {
 /// - [`Error::InvalidRef`] if the file content is not a valid ref.
 /// - [`Error::Io`] on filesystem errors.
 pub fn read_ref_file(path: &Path) -> Result<Ref> {
-    if let Ok(target) = fs::read_link(path) {
-        return Ok(Ref::Symbolic(target.to_string_lossy().into_owned()));
-    }
-
-    let content = match fs::read_to_string(path) {
-        Ok(c) => c,
-        // `refs/heads/master` can be a directory when a branch named `master/...` exists, and a
-        // probe like `refs/remotes/v1` can hit ENOTDIR when `refs/remotes` is a file. Treat both
-        // like a missing loose ref so optional DWIM candidates fall through cleanly.
-        Err(e)
-            if e.kind() == io::ErrorKind::IsADirectory
-                || e.kind() == io::ErrorKind::NotADirectory
-                || e.raw_os_error() == Some(libc::EISDIR)
-                || e.raw_os_error() == Some(libc::ENOTDIR) =>
-        {
-            return Err(Error::Io(io::Error::new(io::ErrorKind::NotFound, e)));
+    // One `lstat` answers the common "no such ref" probe and finds legacy symlink refs.
+    let meta = fs::symlink_metadata(path).map_err(|e| loose_ref_io_error(e, path))?;
+    if meta.file_type().is_symlink() {
+        if let Ok(target) = fs::read_link(path) {
+            return Ok(Ref::Symbolic(target.to_string_lossy().into_owned()));
         }
-        Err(e) => return Err(Error::Io(e)),
-    };
-    let content = content.trim_end_matches('\n');
-    parse_ref_content(content)
+    }
+    if meta.is_dir() {
+        return Err(Error::Io(io::Error::new(
+            io::ErrorKind::NotFound,
+            "loose ref path is a directory",
+        )));
+    }
+    read_regular_ref_file(path)
+}
+
+/// Like [`read_ref_file`] for a path known not to be a symlink.
+pub(crate) fn read_regular_ref_file(path: &Path) -> Result<Ref> {
+    let content = fs::read_to_string(path).map_err(|e| loose_ref_io_error(e, path))?;
+    parse_ref_content(content.trim_end_matches('\n'))
+}
+
+/// Map a failure to read the loose ref file at `path` to [`Error::Io`], with
+/// [`io::ErrorKind::NotFound`] when [`io_error_is_missing_file`] holds so optional DWIM
+/// candidates fall through cleanly.
+fn loose_ref_io_error(e: io::Error, path: &Path) -> Error {
+    if io_error_is_missing_file(&e, path) {
+        return Error::Io(io::Error::new(io::ErrorKind::NotFound, e));
+    }
+    Error::Io(e)
+}
+
+/// Whether `err`, from reading `path` as a file, means there is no file there.
+///
+/// A ref or reflog path is a directory when refs exist below it (`refs/heads/rel` while
+/// `refs/heads/rel/1.0` exists), and a probe like `refs/remotes/v1` runs through a file
+/// when `refs/remotes` is one. Opening a directory fails with "is a directory" on Unix but
+/// with access denied on Windows, so a permission error counts as a miss only when `path` is
+/// a directory; an unreadable file stays an error.
+pub(crate) fn io_error_is_missing_file(err: &io::Error, path: &Path) -> bool {
+    match err.kind() {
+        io::ErrorKind::NotFound | io::ErrorKind::IsADirectory | io::ErrorKind::NotADirectory => {
+            true
+        }
+        io::ErrorKind::PermissionDenied => fs::symlink_metadata(path).is_ok_and(|m| m.is_dir()),
+        _ => matches!(err.raw_os_error(), Some(libc::EISDIR | libc::ENOTDIR)),
+    }
 }
 
 /// Parse the content of a ref file (without trailing newline).
@@ -409,6 +721,11 @@ pub(crate) fn parse_ref_content(content: &str) -> Result<Ref> {
 
 /// Resolve a reference to its target [`ObjectId`], following symbolic refs.
 ///
+/// Opens a fresh on-disk ref store via [`crate::refs::store::open_ref_store`] and
+/// bypasses [`crate::repo::Repository::refs`] and any injected
+/// [`crate::refs::store::RefStore`]. Prefer [`crate::refs::References::resolve`]
+/// when you already have a [`crate::repo::Repository`].
+///
 /// Dispatches to the reftable backend when `extensions.refStorage = reftable`.
 ///
 /// # Parameters
@@ -418,7 +735,7 @@ pub(crate) fn parse_ref_content(content: &str) -> Result<Ref> {
 ///
 /// # Errors
 ///
-/// - [`Error::RefStore`] with [`RefStoreError::NotFound`](store::RefStoreError::NotFound) if
+/// - [`Error::RefStore`] with [`RefStoreError::NotFound`] if
 ///   `refname`, or the target at the end of its symbolic chain, does not exist.
 /// - [`Error::InvalidRef`] if the ref is malformed or forms a cycle.
 pub fn resolve_ref(git_dir: &Path, refname: &str) -> Result<ObjectId> {
@@ -465,6 +782,12 @@ pub enum RawRefLookup {
 
 /// Return whether `refname` exists as a ref in the repository's ref storage.
 ///
+/// Opens a fresh on-disk ref store via [`crate::refs::store::open_ref_store`] and
+/// bypasses [`crate::repo::Repository::refs`] and any injected
+/// [`crate::refs::store::RefStore`]. Prefer [`crate::refs::store::RefStore::read_raw`]
+/// on [`crate::repo::Repository::refs`] when you already have a
+/// [`crate::repo::Repository`].
+///
 /// This matches `git refs exists` / `git show-ref --exists`: no DWIM, no
 /// resolution of symbolic targets. Dispatches to the reftable backend when
 /// configured.
@@ -500,9 +823,15 @@ pub fn read_raw_ref(git_dir: &Path, refname: &str) -> Result<RawRefLookup> {
 /// Lock file path for a loose ref file (`<refpath>.lock`), matching Git's naming for nested refs.
 #[must_use]
 pub fn lock_path_for_ref(path: &Path) -> PathBuf {
-    let mut s = path.as_os_str().to_owned();
-    s.push(".lock");
-    PathBuf::from(s)
+    let mut name = path
+        .file_name()
+        .map(|s| s.to_os_string())
+        .unwrap_or_default();
+    name.push(".lock");
+    match path.parent() {
+        Some(parent) => parent.join(&name),
+        None => PathBuf::from(name),
+    }
 }
 
 /// First packed ref name strictly under `refname/` (sorted `packed-refs` prefix scan).
@@ -558,6 +887,10 @@ fn packed_ref_namespace_conflict(git_dir: &Path, refname: &str) -> Result<bool> 
 
 /// Returns true if `packed-refs` in the ref storage directory for `refname` contains that name.
 ///
+/// Opens a fresh on-disk ref store via [`crate::refs::store::open_ref_store`] and
+/// bypasses [`crate::repo::Repository::refs`] and any injected
+/// [`crate::refs::store::RefStore`].
+///
 /// Used to mirror Git's `is_packed_transaction_needed` behaviour: deleting a ref may open a nested
 /// packed-refs transaction whose abort runs the `reference-transaction` hook in the `aborted`
 /// state between `preparing` and `prepared` on the main transaction.
@@ -605,6 +938,16 @@ pub enum RefnameUnavailable {
 }
 
 impl RefnameUnavailable {
+    /// The ref that could not be created (for [`Self::SameBatch`], the one validated first).
+    #[must_use]
+    pub fn refname(&self) -> &str {
+        match self {
+            RefnameUnavailable::AncestorExists { new_ref, .. }
+            | RefnameUnavailable::DescendantExists { new_ref, .. } => new_ref,
+            RefnameUnavailable::SameBatch { refname, .. } => refname,
+        }
+    }
+
     /// Suffix after `cannot lock ref '<display_ref>': ` for stderr (no trailing newline).
     #[must_use]
     pub fn lock_message_suffix(&self) -> String {
@@ -782,10 +1125,10 @@ pub fn verify_refname_available_for_create(
                 let Ok(meta) = fs::metadata(&path) else {
                     continue;
                 };
-                if !meta.is_file() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if !meta.is_file() || name.ends_with(".lock") {
                     continue;
                 }
-                let name = entry.file_name().to_string_lossy().into_owned();
                 let full = format!("{refname}/{name}");
                 blocking = Some(full);
                 break;
@@ -1841,7 +2184,28 @@ pub(crate) fn lookup_packed_ref_with_peel(
     view.lookup_entry(&packed_path, refname)
 }
 
+/// Store a root commit labelled `message` in `git_dir`'s objects, so tests can point refs at
+/// an object that exists. Its tree (the empty tree) is not stored.
+#[cfg(test)]
+pub(crate) fn test_commit(git_dir: &Path, message: &str) -> ObjectId {
+    let common = common_dir(git_dir).unwrap_or_else(|| git_dir.to_path_buf());
+    let body = format!(
+        "tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n\
+         author T <t@example.com> 0 +0000\n\
+         committer T <t@example.com> 0 +0000\n\n{message}\n"
+    );
+    crate::odb::Odb::new(&common.join("objects"))
+        .write(crate::objects::ObjectKind::Commit, body.as_bytes())
+        .unwrap_or_else(|err| panic!("store test commit {message:?}: {err}"))
+}
+
 /// Write a symbolic ref (e.g. `NOTES_MERGE_REF` → `refs/notes/m`).
+///
+/// Opens a fresh on-disk ref store via [`crate::refs::store::open_ref_store`] and
+/// bypasses [`crate::repo::Repository::refs`] and any injected
+/// [`crate::refs::store::RefStore`]. Prefer [`commit_ref_update_on_store`] with a
+/// symbolic [`crate::refs::store::RawRef`] on [`crate::repo::Repository::refs`]
+/// when you already have a [`crate::repo::Repository`].
 ///
 /// For reftable-backed repositories this dispatches to the reftable writer.
 ///
@@ -1879,6 +2243,11 @@ pub(crate) fn ensure_refname_safe_for_storage(refname: &str) -> Result<()> {
 
 /// Write a ref, creating parent directories as needed.
 ///
+/// Opens a fresh on-disk ref store via [`crate::refs::store::open_ref_store`] and
+/// bypasses [`crate::repo::Repository::refs`] and any injected
+/// [`crate::refs::store::RefStore`]. Prefer [`crate::refs::References::update`]
+/// or [`update_direct_ref_on_store`] when you already have a [`crate::repo::Repository`].
+///
 /// Dispatches to the reftable backend when `extensions.refStorage = reftable`.
 ///
 /// # Parameters
@@ -1891,6 +2260,9 @@ pub(crate) fn ensure_refname_safe_for_storage(refname: &str) -> Result<()> {
 ///
 /// Returns [`Error::InvalidRef`] when `refname` is not safe for ref storage (e.g. path
 /// traversal under `refs/`), on a namespace conflict, or [`Error::Io`] on filesystem errors.
+/// Returns [`store::RefStoreError::MissingObject`] when `git_dir`'s objects do not include
+/// `oid`, and [`store::RefStoreError::NotACommit`] when `refname` is a branch or `HEAD` and
+/// `oid` is not a commit (both as [`Error::RefStore`]).
 pub fn write_ref(git_dir: &Path, refname: &str, oid: &ObjectId) -> Result<()> {
     store_write_value(
         git_dir,
@@ -1907,38 +2279,9 @@ pub fn ref_update_flags(refname: &str) -> RefUpdateFlags {
     legacy_ref_update_flags(refname)
 }
 
-/// Create a new direct ref and its initial reflog line in one store transaction.
-///
-/// # Errors
-///
-/// Returns an error when the ref already exists, the name is invalid, or ref/reflog I/O fails.
-pub fn create_ref_with_reflog(
-    git_dir: &Path,
-    refname: &str,
-    oid: &ObjectId,
-    identity: &str,
-    message: &str,
-) -> Result<()> {
-    let config = ConfigSet::load(
-        &crate::environment::Environment::empty(),
-        Some(git_dir),
-        true,
-    )
-    .unwrap_or_default();
-    let store = open_ref_store(git_dir)?;
-    create_ref_with_reflog_on_store(
-        store.as_ref(),
-        git_dir,
-        &config,
-        refname,
-        oid,
-        identity,
-        message,
-    )
-}
-
-/// [`create_ref_with_reflog`] through an already-open store with already-loaded `config`, so
-/// a caller holding a [`crate::repo::Repository`] reuses its packed-refs and config caches.
+/// Create a new direct ref and its initial reflog line in one store transaction, through an
+/// already-open store with already-loaded `config`, so a caller holding a
+/// [`crate::repo::Repository`] reuses its packed-refs and config caches.
 pub(crate) fn create_ref_with_reflog_on_store(
     store: &dyn RefStore,
     git_dir: &Path,
@@ -1983,22 +2326,13 @@ fn write_ref_at_storage(
     // directory". Non-empty directories (containing files or `*.lock`) are left in place so the
     // subsequent write surfaces the conflict, matching Git's behaviour.
     remove_empty_ref_directory(&path);
-    // If a *non-empty* directory still sits where the ref file must go, locking cannot
-    // proceed. Git reports this as a "non-empty directory ... blocking reference" rather
-    // than letting the rename fail with a raw "Is a directory" I/O error (see t0600
-    // "non-empty directory blocks create"). Mirror that message so callers display it
-    // verbatim. This only applies to direct (non-deref) writes where `refname` is also the
-    // user-visible ref; indirect symref writes are handled by the caller.
+    // A non-empty directory where the ref file must go blocks the lock; report it as a typed
+    // conflict rather than letting the rename fail with a raw "Is a directory" I/O error.
     if fs::symlink_metadata(&path)
         .map(|m| m.file_type().is_dir())
         .unwrap_or(false)
     {
-        let display = ref_path_for_display(&path);
-        return Err(crate::error::RefLockError::DirectoryInTheWay {
-            refname: refname.to_owned(),
-            path: display,
-        }
-        .into());
+        return Err(directory_in_the_way(git_dir, refname, &path));
     }
     if path.is_file() && matches!(read_ref_file(&path), Err(Error::InvalidRef(_))) {
         return Err(Error::InvalidRef(format!(
@@ -2050,6 +2384,12 @@ fn write_ref_at_storage(
 /// Like [`write_ref`], but requires `expected_old` to match the ref's current value
 /// while the loose-ref lock is held (atomic CAS for concurrent updaters).
 ///
+/// Opens a fresh on-disk ref store via [`crate::refs::store::open_ref_store`] and
+/// bypasses [`crate::repo::Repository::refs`] and any injected
+/// [`crate::refs::store::RefStore`]. Prefer [`commit_ref_update_on_store`] with
+/// [`crate::refs::store::Expected::Oid`] on [`crate::repo::Repository::refs`]
+/// when you already have a [`crate::repo::Repository`].
+///
 /// # Errors
 ///
 /// Same as [`write_ref`], plus [`store::RefStoreError::ExpectedMismatch`] when the CAS check
@@ -2070,6 +2410,12 @@ pub fn write_ref_cas(
 }
 
 /// Like [`delete_ref`], but requires `expected_old` to match under the ref lock.
+///
+/// Opens a fresh on-disk ref store via [`crate::refs::store::open_ref_store`] and
+/// bypasses [`crate::repo::Repository::refs`] and any injected
+/// [`crate::refs::store::RefStore`]. Prefer [`commit_ref_update_on_store`] with
+/// [`crate::refs::store::Expected::Oid`] on [`crate::repo::Repository::refs`]
+/// when you already have a [`crate::repo::Repository`].
 ///
 /// # Errors
 ///
@@ -2325,6 +2671,9 @@ pub(crate) fn prune_empty_loose_ref_parents(storage_dir: &Path, ref_path: &Path)
 }
 
 /// Remove `dir` and then its parents while they hold no files, stopping at `refs/`.
+///
+/// `refs/` itself and its direct children (`refs/heads`, `refs/tags`, …) are never
+/// removed: Git keeps those namespace directories even when empty.
 pub(crate) fn prune_empty_ref_dirs(storage_dir: &Path, dir: &Path) {
     let refs_root = storage_dir.join("refs");
     let mut current = Some(dir);
@@ -2332,10 +2681,16 @@ pub(crate) fn prune_empty_ref_dirs(storage_dir: &Path, dir: &Path) {
         if dir == refs_root.as_path() || !dir.starts_with(&refs_root) {
             break;
         }
+        if dir
+            .parent()
+            .is_some_and(|parent| parent == refs_root.as_path())
+        {
+            break;
+        }
         if dir_tree_has_files(dir) {
             break;
         }
-        if fs::remove_dir(dir).is_err() {
+        if remove_dir_tree(dir).is_err() {
             break;
         }
         current = dir.parent();
@@ -2355,11 +2710,17 @@ fn remove_dir_tree(dir: &Path) -> io::Result<()> {
 
 /// Delete a ref.
 ///
+/// Opens a fresh on-disk ref store via [`crate::refs::store::open_ref_store`] and
+/// bypasses [`crate::repo::Repository::refs`] and any injected
+/// [`crate::refs::store::RefStore`]. Prefer [`commit_ref_update_on_store`] with
+/// `new_value: None` on [`crate::repo::Repository::refs`] when you already have a
+/// [`crate::repo::Repository`].
+///
 /// Dispatches to the reftable backend when `extensions.refStorage = reftable`.
 ///
 /// # Errors
 ///
-/// Returns [`RefStoreError::NotFound`](store::RefStoreError::NotFound) (inside
+/// Returns [`RefStoreError::NotFound`] (inside
 /// [`Error::RefStore`]) when `refname` does not exist, [`Error::InvalidRef`] when it is not
 /// safe for ref storage, or [`Error::Io`] for filesystem failures.
 pub fn delete_ref(git_dir: &Path, refname: &str) -> Result<()> {
@@ -2671,6 +3032,11 @@ fn replace_packed_refs_file(
 
 /// Read the symbolic ref target of `HEAD`.
 ///
+/// Opens a fresh on-disk ref store via [`crate::refs::store::open_ref_store`] and
+/// bypasses [`crate::repo::Repository::refs`] and any injected
+/// [`crate::refs::store::RefStore`]. Prefer [`read_symbolic_ref_for_repository`] with `refname` `"HEAD"`
+/// when you already have a [`crate::repo::Repository`].
+///
 /// Returns `None` if HEAD is detached (points directly to a commit hash).
 ///
 /// # Errors
@@ -2681,6 +3047,11 @@ pub fn read_head(git_dir: &Path) -> Result<Option<String>> {
 }
 
 /// Read symbolic target of any ref.
+///
+/// Opens a fresh on-disk ref store via [`crate::refs::store::open_ref_store`] and
+/// bypasses [`crate::repo::Repository::refs`] and any injected
+/// [`crate::refs::store::RefStore`]. Prefer [`read_symbolic_ref_for_repository`]
+/// when you already have a [`crate::repo::Repository`].
 ///
 /// Dispatches to the reftable backend when `extensions.refStorage = reftable`.
 ///
@@ -3188,7 +3559,7 @@ fn pack_refs_files_matching(
         packed_loose += 1;
     }
 
-    if packed_loose == 0 && merged.is_empty() {
+    if packed_loose == 0 {
         return Ok((packed_path, 0, 0));
     }
 
@@ -3241,8 +3612,8 @@ fn pack_refs_files_matching(
 
     // Each CAS lock has dropped. Scan each parent only once, rather than rereading a
     // wide tag directory after every ref (when the current lock still made it nonempty).
-    for parent in parents {
-        remove_empty_ref_directory(&parent);
+    for parent in &parents {
+        prune_empty_ref_dirs(&storage_git_dir, parent);
     }
 
     Ok((packed_path, packed_loose, pruned))
@@ -3600,12 +3971,7 @@ impl BranchCommitRefLock {
             .map(|m| m.file_type().is_dir())
             .unwrap_or(false)
         {
-            let display = ref_path_for_display(&path);
-            return Err(crate::error::RefLockError::DirectoryInTheWay {
-                refname: branch_ref.to_owned(),
-                path: display,
-            }
-            .into());
+            return Err(directory_in_the_way(git_dir, branch_ref, &path));
         }
         if let Some(parent) = path.parent() {
             crate::git_dir::io_error::io_with_git_path(
@@ -3796,10 +4162,184 @@ pub(crate) fn update_branch_for_commit_files(
     lock.commit(git_dir, update, reflog_old, config)
 }
 
+/// Like [`update_branch_for_commit_files`], but runs `reference-transaction` after the branch
+/// ref lock is held and before any reflog or ref write.
+pub(crate) fn update_branch_for_commit_files_with_reference_transaction_hooks(
+    git_dir: &Path,
+    update: &BranchCommitRefUpdate<'_>,
+    reflog_old: &ObjectId,
+    config: &ConfigSet,
+    ctx: &crate::hooks::RefHookContext,
+    lines: &[store::reference_transaction::ReferenceTransactionLine],
+) -> Result<()> {
+    use crate::hooks::ReferenceTransactionPhase;
+    use store::reference_transaction::stdin_from_lines;
+
+    let lock = BranchCommitRefLock::acquire(git_dir, update.branch_ref, update.expected_old)?;
+    if lines.is_empty() {
+        return lock.commit(git_dir, update, reflog_old, config);
+    }
+    let stdin = stdin_from_lines(lines);
+    ctx.run_reference_transaction(ReferenceTransactionPhase::Prepared, &stdin)
+        .map_err(Error::Hook)?;
+    match lock.commit(git_dir, update, reflog_old, config) {
+        Ok(()) => {
+            let _ = ctx.run_reference_transaction(ReferenceTransactionPhase::Committed, &stdin);
+            Ok(())
+        }
+        Err(err) => {
+            let _ = ctx.run_reference_transaction(ReferenceTransactionPhase::Aborted, &stdin);
+            Err(err)
+        }
+    }
+}
+
+/// Loose `HEAD` lock held between CAS validation and updating a detached `HEAD`.
+pub(crate) struct DetachedHeadRefLock {
+    lock: Option<crate::lockfile::LockFile>,
+    disarmed: bool,
+}
+
+impl DetachedHeadRefLock {
+    fn acquire(git_dir: &Path, expected_old: Option<ObjectId>) -> Result<Self> {
+        let current = resolve_ref(git_dir, "HEAD").ok();
+        verify_branch_cas(expected_old, current, "HEAD")?;
+        let path = git_dir.join("HEAD");
+        let lock_path = lock_path_for_ref(&path);
+        use crate::lockfile::{LockError, LockFile, LockWait};
+        let wait = LockWait::files_ref_lock_for_git_dir(git_dir);
+        let lock = LockFile::acquire(&lock_path, wait).map_err(|err| match err {
+            held @ LockError::Held { .. } => Error::from(held),
+            LockError::Io { source, path } => crate::git_dir::io_error::map_git_dir_io(
+                git_dir,
+                path.as_path(),
+                crate::git_dir::GitDirPathOperation::UpdateRef,
+                source,
+            ),
+        })?;
+        Ok(Self {
+            lock: Some(lock),
+            disarmed: false,
+        })
+    }
+
+    fn commit(
+        mut self,
+        git_dir: &Path,
+        new_oid: ObjectId,
+        reflog_old: &ObjectId,
+        identity: &str,
+        reflog_message: &str,
+        config: &ConfigSet,
+    ) -> Result<()> {
+        let path = git_dir.join("HEAD");
+        let content = format!("{new_oid}\n");
+        use crate::lockfile::LockError;
+        use std::io::Write as _;
+        let mut file_lock = self
+            .lock
+            .take()
+            .ok_or_else(|| Error::Message("HEAD ref lock already released".into()))?;
+        crate::git_dir::io_error::io_with_git_path(
+            git_dir,
+            &path,
+            crate::git_dir::GitDirPathOperation::UpdateRef,
+            file_lock.write_all(content.as_bytes()),
+        )?;
+        file_lock.commit_to(&path).map_err(|err| match err {
+            LockError::Io {
+                source,
+                path: lock_path,
+            } => crate::git_dir::io_error::map_git_dir_io(
+                git_dir,
+                lock_path.as_path(),
+                crate::git_dir::GitDirPathOperation::UpdateRef,
+                source,
+            ),
+            held @ LockError::Held { .. } => Error::from(held),
+        })?;
+        if should_autocreate_reflog_with_config(config, git_dir, "HEAD") {
+            if let Err(err) = append_reflog_with_config(
+                git_dir,
+                "HEAD",
+                reflog_old,
+                &new_oid,
+                identity,
+                reflog_message,
+                false,
+                Some(config),
+            ) {
+                let _ = write_ref_cas(git_dir, "HEAD", reflog_old, new_oid);
+                return Err(err);
+            }
+        }
+        self.disarmed = true;
+        Ok(())
+    }
+}
+
+impl Drop for DetachedHeadRefLock {
+    fn drop(&mut self) {
+        drop(self.lock.take());
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn update_detached_head_for_commit_files_with_reference_transaction_hooks(
+    git_dir: &Path,
+    expected_old: Option<ObjectId>,
+    new_oid: ObjectId,
+    identity: &str,
+    reflog_message: &str,
+    config: &ConfigSet,
+    ctx: &crate::hooks::RefHookContext,
+    lines: &[store::reference_transaction::ReferenceTransactionLine],
+) -> Result<()> {
+    use crate::hooks::ReferenceTransactionPhase;
+    use store::reference_transaction::stdin_from_lines;
+
+    let lock = DetachedHeadRefLock::acquire(git_dir, expected_old)?;
+    if lines.is_empty() {
+        let reflog_old = expected_old.unwrap_or_else(crate::diff::zero_oid);
+        return lock.commit(
+            git_dir,
+            new_oid,
+            &reflog_old,
+            identity,
+            reflog_message,
+            config,
+        );
+    }
+    let stdin = stdin_from_lines(lines);
+    ctx.run_reference_transaction(ReferenceTransactionPhase::Prepared, &stdin)
+        .map_err(Error::Hook)?;
+    let reflog_old = expected_old.unwrap_or_else(|| ctx.null_oid());
+    match lock.commit(
+        git_dir,
+        new_oid,
+        &reflog_old,
+        identity,
+        reflog_message,
+        config,
+    ) {
+        Ok(()) => {
+            let _ = ctx.run_reference_transaction(ReferenceTransactionPhase::Committed, &stdin);
+            Ok(())
+        }
+        Err(err) => {
+            let _ = ctx.run_reference_transaction(ReferenceTransactionPhase::Aborted, &stdin);
+            Err(err)
+        }
+    }
+}
+
 /// Apply [`BranchCommitRefUpdate`]: branch CAS, ref write, branch + `HEAD` reflogs.
 ///
-/// Opens the ref store for `git_dir`; prefer [`update_branch_for_commit_on_store`] with
-/// [`crate::repo::Repository::refs`] when a repository handle is available.
+/// Opens a fresh on-disk ref store for `git_dir` (object-checked open used internally)
+/// and bypasses [`crate::repo::Repository::refs`] and any injected
+/// [`crate::refs::store::RefStore`]. Prefer [`update_branch_for_commit_on_store`] with
+/// [`crate::repo::Repository::refs`] when you already have a
+/// [`crate::repo::Repository`].
 pub fn update_branch_for_commit(git_dir: &Path, update: &BranchCommitRefUpdate<'_>) -> Result<()> {
     let config = ConfigSet::load(
         &crate::environment::Environment::empty(),
@@ -3812,13 +4352,18 @@ pub fn update_branch_for_commit(git_dir: &Path, update: &BranchCommitRefUpdate<'
 
 /// Like [`update_branch_for_commit`], using a repository config snapshot for reflog policy.
 ///
-/// Opens the ref store for `git_dir`; see [`update_branch_for_commit_on_store`].
+/// Opens a fresh on-disk ref store for `git_dir` (object-checked open used internally)
+/// and bypasses [`crate::repo::Repository::refs`] and any injected
+/// [`crate::refs::store::RefStore`]. Prefer [`update_branch_for_commit_on_store`] with
+/// [`crate::repo::Repository::refs`] when you already have a
+/// [`crate::repo::Repository`]. Checked against that repository's objects like
+/// [`write_ref`]; see [`update_branch_for_commit_on_store`].
 pub fn update_branch_for_commit_with_config(
     git_dir: &Path,
     update: &BranchCommitRefUpdate<'_>,
     config: &ConfigSet,
 ) -> Result<()> {
-    update_branch_for_commit_on_store(open_ref_store(git_dir)?.as_ref(), update, config)
+    update_branch_for_commit_on_store(&store::open_checked_ref_store(git_dir)?, update, config)
 }
 
 /// Files-backend body of [`update_detached_head_for_commit_on_store`]; the caller has checked
@@ -3894,7 +4439,7 @@ fn normalize_list_refs_prefix(git_dir: &Path, prefix: &str) -> String {
 
 /// The `^` line of a `fully-peeled` `packed-refs` entry: the innermost non-tag object when `oid`
 /// is an annotated tag. Lightweight refs, and tags whose chain cannot be read, get no peel line.
-fn packed_ref_peel(odb: &crate::odb::Odb, oid: ObjectId) -> Option<ObjectId> {
+pub(crate) fn packed_ref_peel(odb: &crate::odb::Odb, oid: ObjectId) -> Option<ObjectId> {
     odb.peel_stored_tag_target(oid).ok().flatten()
 }
 
@@ -3986,7 +4531,8 @@ pub struct PackedRefRecord {
 /// Replace `packed-refs` with `records`, sorted by ref name.
 ///
 /// Existing loose ref files for names present in `records` are removed so the
-/// packed file is authoritative (Git's `pack-refs` behaviour).
+/// packed file is authoritative (Git's `pack-refs` behaviour). Directories left
+/// empty below `refs/` are removed too; `refs/` itself always remains.
 ///
 /// # Errors
 ///
@@ -4018,7 +4564,7 @@ pub fn write_packed_refs_file(git_dir: &Path, records: &[PackedRefRecord]) -> Re
             fs::remove_file(&loose).map_err(Error::Io)?;
         }
         if let Some(parent) = loose.parent() {
-            remove_empty_ref_directory(parent);
+            prune_empty_ref_dirs(&storage_dir, parent);
         }
     }
     Ok(())
@@ -4110,6 +4656,12 @@ pub(crate) fn list_refs_glob_in(
 
 /// List resolved refs under `git_dir` whose full names start with `prefix`.
 ///
+/// Opens a fresh on-disk ref store via [`crate::refs::store::open_ref_store`] and
+/// bypasses [`crate::repo::Repository::refs`] and any injected
+/// [`crate::refs::store::RefStore`]. Prefer [`list_refs_for_repository`] or
+/// [`crate::refs::References::list`] when you already have a
+/// [`crate::repo::Repository`].
+///
 /// Uses the on-disk ref backend (files or reftable) and applies linked-worktree
 /// visibility rules when `git_dir` is a linked worktree git directory.
 ///
@@ -4162,11 +4714,22 @@ pub(crate) fn list_refs_filtering_packed(
 }
 
 /// Resolve a ref using Git DWIM rules (`expand_ref` / `repo_dwim_ref`).
+///
+/// Opens a fresh on-disk ref store via [`crate::refs::store::open_ref_store`] and
+/// bypasses [`crate::repo::Repository::refs`] and any injected
+/// [`crate::refs::store::RefStore`]. Prefer [`crate::worktree_ref::resolve_ref_dwim`]
+/// with a closure over [`crate::repo::Repository::refs`] when you already have a
+/// [`crate::repo::Repository`].
 pub fn resolve_ref_dwim(git_dir: &Path, spec: &str) -> (usize, Option<ObjectId>) {
     crate::worktree_ref::resolve_ref_dwim(|candidate| resolve_ref(git_dir, candidate).ok(), spec)
 }
 
 /// List refs under `prefix` using **literal** on-disk paths (ignores `GIT_NAMESPACE`).
+///
+/// Opens a fresh on-disk ref store via [`crate::refs::store::open_ref_store`] and
+/// bypasses [`crate::repo::Repository::refs`] and any injected
+/// [`crate::refs::store::RefStore`]. There is no injected-store equivalent; use
+/// [`list_refs_for_repository`] when you need the repository's ref backend.
 ///
 /// Used by `receive-pack` when advertising: the server must see every physical ref so refs outside
 /// the active namespace can be offered as `.have` lines (matches Git `show_ref_cb`).
@@ -4211,6 +4774,10 @@ pub fn list_refs_physical(git_dir: &Path, prefix: &str) -> Result<Vec<(String, O
 /// Collect commit OIDs from alternate repositories' refs, matching Git's
 /// `git for-each-ref --format=%(objectname)` on each alternate (with optional
 /// `core.alternateRefsPrefixes` arguments).
+///
+/// Opens a fresh on-disk ref store in each alternate git directory and bypasses any injected
+/// store on a [`crate::repo::Repository`]. Prefer [`list_refs_for_repository`] when
+/// resolving refs on an open repository.
 ///
 /// Order is preserved: alternates file order, then ref iteration order from
 /// [`list_refs`] under each configured prefix (or all of `refs/` when no
@@ -4286,6 +4853,11 @@ pub fn list_refs_glob_for_repository(
 }
 
 /// List refs matching a glob pattern (e.g. `refs/heads/topic/*`).
+///
+/// Opens a fresh on-disk ref store via [`crate::refs::store::open_ref_store`] and
+/// bypasses [`crate::repo::Repository::refs`] and any injected
+/// [`crate::refs::store::RefStore`]. Prefer [`list_refs_glob_for_repository`] when you
+/// already have a [`crate::repo::Repository`].
 pub fn list_refs_glob(git_dir: &Path, pattern: &str) -> Result<Vec<(String, ObjectId)>> {
     let glob_pos = pattern.find(['*', '?', '[']);
     let prefix_owned: String = match glob_pos {
@@ -4430,6 +5002,12 @@ fn collect_loose_refs_into_map(
 }
 
 /// Resolve `@{-N}` syntax to the branch name (not an OID).
+///
+/// Opens a fresh on-disk ref store via [`crate::refs::store::open_ref_store`] and
+/// bypasses [`crate::repo::Repository::refs`] and any injected
+/// [`crate::refs::store::RefStore`]. Prefer resolving through a [`crate::repo::Repository`]
+/// and its ref store when the checkout stack lives there.
+///
 /// Returns the branch name of the Nth previously checked out branch.
 pub fn resolve_at_n_branch(git_dir: &Path, spec: &str) -> Result<String> {
     // Parse the N from @{-N}
@@ -4550,9 +5128,9 @@ mod update_branch_for_commit_tests {
         )
         .unwrap();
         let git_dir = repo.git_dir().to_path_buf();
-        let oid1 = sample_oid("67bf698f3ab735e92fb011a99cff3497c44d30c1");
-        let oid2 = sample_oid("1111111111111111111111111111111111111111");
-        let oid3 = sample_oid("2222222222222222222222222222222222222222");
+        let oid1 = test_commit(&git_dir, "one");
+        let oid2 = test_commit(&git_dir, "two");
+        let oid3 = test_commit(&git_dir, "three");
         write_ref(&git_dir, "refs/heads/main", &oid1).unwrap();
 
         let gate = Arc::new(branch_ref_pause_inject::PauseGate {
@@ -4968,7 +5546,8 @@ mod ref_storage_traversal_guard_tests {
     #[test]
     fn write_ref_accepts_refs_heads_head() {
         let (_dir, git_dir) = bare_repo_with_config();
-        write_ref(&git_dir, "refs/heads/HEAD", &sample_oid())
+        let commit = test_commit(&git_dir, "head-named branch");
+        write_ref(&git_dir, "refs/heads/HEAD", &commit)
             .expect("refs/heads/HEAD is valid ref syntax");
         assert!(git_dir.join("refs/heads/HEAD").is_file());
     }
@@ -5102,6 +5681,53 @@ mod read_raw_ref_tests {
             read_raw_ref(git_dir, "refs/heads/packed").unwrap(),
             RawRefLookup::Exists
         );
+    }
+
+    #[test]
+    fn access_denied_on_a_directory_is_a_missing_file() {
+        let dir = tempdir().unwrap();
+        let ref_dir = dir.path().join("refs/heads/rel");
+        fs::create_dir_all(&ref_dir).unwrap();
+        let file = dir.path().join("refs/heads/main");
+        fs::write(&file, "x\n").unwrap();
+        let denied = || io::Error::from(io::ErrorKind::PermissionDenied);
+
+        // Windows opens a directory with ERROR_ACCESS_DENIED rather than EISDIR.
+        assert!(io_error_is_missing_file(&denied(), &ref_dir));
+        assert!(
+            !io_error_is_missing_file(&denied(), &file),
+            "an unreadable ref file is a real I/O error"
+        );
+        assert!(!io_error_is_missing_file(
+            &denied(),
+            &dir.path().join("refs/heads/none")
+        ));
+        for kind in [
+            io::ErrorKind::NotFound,
+            io::ErrorKind::IsADirectory,
+            io::ErrorKind::NotADirectory,
+        ] {
+            assert!(io_error_is_missing_file(&io::Error::from(kind), &file));
+        }
+        assert!(io_error_is_missing_file(
+            &io::Error::from_raw_os_error(libc::EISDIR),
+            &file
+        ));
+        assert!(!io_error_is_missing_file(
+            &io::Error::from(io::ErrorKind::InvalidData),
+            &ref_dir
+        ));
+    }
+
+    #[test]
+    fn reading_a_ref_directory_is_not_found() {
+        let dir = tempdir().unwrap();
+        let ref_dir = dir.path().join("refs/heads/rel");
+        fs::create_dir_all(ref_dir.join("1.0")).unwrap();
+        match read_ref_file(&ref_dir) {
+            Err(Error::Io(e)) => assert_eq!(e.kind(), io::ErrorKind::NotFound),
+            other => panic!("expected a missing ref, got {other:?}"),
+        }
     }
 }
 
@@ -6154,6 +6780,68 @@ mod pack_refs_tests {
             fs::read_to_string(store::paths::packed_refs_path(git_dir)).expect("packed-refs");
         assert!(body.contains("refs/heads/a-first"));
         assert!(body.find("a-first").expect("a-first") < body.find("z-last").expect("z-last"));
+    }
+
+    #[test]
+    fn write_packed_refs_file_keeps_refs_dir_for_top_level_ref() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let git_dir = dir.path();
+        fs::create_dir_all(git_dir.join("refs/tags")).expect("refs/tags");
+        let oid = ObjectId::from_hex("0000000000000000000000000000000000000001").expect("oid");
+        fs::write(git_dir.join("refs/stash"), format!("{oid}\n")).expect("loose stash");
+        write_packed_refs_file(
+            git_dir,
+            &[PackedRefRecord {
+                refname: "refs/stash".into(),
+                oid,
+                peeled: None,
+            }],
+        )
+        .expect("write packed-refs");
+        assert!(!git_dir.join("refs/stash").exists());
+        assert!(git_dir.join("refs").is_dir(), "refs/ must remain");
+        assert!(git_dir.join("refs/tags").is_dir());
+    }
+
+    #[test]
+    fn write_packed_refs_file_prunes_emptied_ref_dirs_below_refs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let git_dir = dir.path();
+        fs::create_dir_all(git_dir.join("refs/heads/topic/empty")).expect("refs/heads");
+        let oid = ObjectId::from_hex("0000000000000000000000000000000000000001").expect("oid");
+        fs::write(git_dir.join("refs/heads/topic/a"), format!("{oid}\n")).expect("loose ref");
+        write_packed_refs_file(
+            git_dir,
+            &[PackedRefRecord {
+                refname: "refs/heads/topic/a".into(),
+                oid,
+                peeled: None,
+            }],
+        )
+        .expect("write packed-refs");
+        assert!(!git_dir.join("refs/heads/topic/a").exists());
+        assert!(!git_dir.join("refs/heads/topic").exists());
+        assert!(git_dir.join("refs/heads").is_dir(), "refs/heads/ kept");
+        assert!(git_dir.join("refs").is_dir(), "refs/ must remain");
+    }
+
+    #[test]
+    fn pack_refs_files_keeps_refs_dir_after_packing_stash() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = init_repository(
+            dir.path(),
+            false,
+            "main",
+            None,
+            crate::RefStorageFormat::Files,
+        )
+        .expect("init");
+        let blob = repo.odb().write(ObjectKind::Blob, b"x").expect("blob");
+        write_ref(repo.git_dir(), "refs/stash", &blob).expect("stash");
+        let refs = repo.git_dir().join("refs");
+        pack_refs_files(repo.git_dir(), repo.odb(), true, false).expect("pack");
+        assert!(!refs.join("stash").exists());
+        assert!(refs.is_dir(), "refs/ must remain");
     }
 }
 

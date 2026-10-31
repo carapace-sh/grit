@@ -43,6 +43,9 @@ mod auth_server_cli;
 #[path = "blame_copy_cli.rs"]
 mod blame_copy_cli;
 #[cfg(feature = "full-tests")]
+#[path = "blame_encoding_lossy_json.rs"]
+mod blame_encoding_lossy_json;
+#[cfg(feature = "full-tests")]
 #[path = "blame_ignore_revs_cli.rs"]
 mod blame_ignore_revs_cli;
 #[cfg(feature = "full-tests")]
@@ -56,9 +59,13 @@ mod blame_range_memory;
 #[cfg(feature = "full-tests")]
 #[path = "blame_stored_path_cli.rs"]
 mod blame_stored_path_cli;
+#[path = "blame_subdir_cli.rs"]
+mod blame_subdir_cli;
 #[cfg(feature = "full-tests")]
 #[path = "blame_whitespace_cli.rs"]
 mod blame_whitespace_cli;
+#[path = "blame_worktree_cli.rs"]
+mod blame_worktree_cli;
 #[cfg(feature = "full-tests")]
 #[path = "branch_list_cli.rs"]
 mod branch_list_cli;
@@ -113,6 +120,8 @@ mod clone_invalid_origin;
 #[cfg(feature = "full-tests")]
 #[path = "clone_progress.rs"]
 mod clone_progress;
+#[path = "clone_promisor_remote.rs"]
+mod clone_promisor_remote;
 #[cfg(feature = "full-tests")]
 #[path = "clone_shallow.rs"]
 mod clone_shallow;
@@ -155,6 +164,8 @@ mod commit_hunks;
 #[cfg(feature = "full-tests")]
 #[path = "commit_hyphen_values.rs"]
 mod commit_hyphen_values;
+#[path = "commit_interrupt.rs"]
+mod commit_interrupt;
 #[cfg(feature = "full-tests")]
 #[path = "commit_message_author_hooks.rs"]
 mod commit_message_author_hooks;
@@ -250,6 +261,8 @@ mod fsck_cli;
 #[cfg(feature = "full-tests")]
 #[path = "gc_auto.rs"]
 mod gc_auto;
+#[path = "gc_drop_large_blobs.rs"]
+mod gc_drop_large_blobs;
 #[cfg(feature = "full-tests")]
 #[path = "gc_roundtrip.rs"]
 mod gc_roundtrip;
@@ -260,6 +273,9 @@ mod gc_subcommand_dry_run;
 mod git_dir_path_io_1970;
 #[path = "git_habit_hints.rs"]
 mod git_habit_hints;
+#[cfg(feature = "full-tests")]
+#[path = "gitbutler_workspace_cli.rs"]
+mod gitbutler_workspace_cli;
 #[cfg(feature = "full-tests")]
 #[path = "global_repo_options.rs"]
 mod global_repo_options;
@@ -307,6 +323,8 @@ mod init_reftable_git_compat;
 #[cfg(feature = "full-tests")]
 #[path = "intent_to_add_add_commit.rs"]
 mod intent_to_add_add_commit;
+#[path = "interrupt_common.rs"]
+mod interrupt_common;
 #[cfg(feature = "full-tests")]
 #[path = "issue_1653_gc_repack.rs"]
 mod issue_1653_gc_repack;
@@ -342,6 +360,11 @@ mod log_loose_tags_memory;
 #[cfg(feature = "full-tests")]
 #[path = "log_pickaxe_json.rs"]
 mod log_pickaxe_json;
+#[path = "log_terminal_cli.rs"]
+mod log_terminal_cli;
+#[cfg(feature = "full-tests")]
+#[path = "lop_serve_git_compat.rs"]
+mod lop_serve_git_compat;
 #[cfg(feature = "full-tests")]
 #[path = "maintenance_commands.rs"]
 mod maintenance_commands;
@@ -355,11 +378,17 @@ mod merge_continue_json;
 #[path = "merge_dry_run.rs"]
 mod merge_dry_run;
 #[cfg(feature = "full-tests")]
+#[path = "merge_interrupt.rs"]
+mod merge_interrupt;
+#[cfg(feature = "full-tests")]
 #[path = "merge_missing_identity.rs"]
 mod merge_missing_identity;
 #[cfg(feature = "full-tests")]
 #[path = "merge_options.rs"]
 mod merge_options;
+#[cfg(feature = "full-tests")]
+#[path = "merge_rebase_verify_hooks.rs"]
+mod merge_rebase_verify_hooks;
 #[cfg(feature = "full-tests")]
 #[path = "merge_rename_rename_cli.rs"]
 mod merge_rename_rename_cli;
@@ -393,6 +422,9 @@ mod output_snapshots_network;
 #[path = "pathspec_args_cli.rs"]
 mod pathspec_args_cli;
 #[cfg(feature = "full-tests")]
+#[path = "pick_interrupt.rs"]
+mod pick_interrupt;
+#[cfg(feature = "full-tests")]
 #[path = "pick_revert_check.rs"]
 mod pick_revert_check;
 #[cfg(feature = "full-tests")]
@@ -407,6 +439,9 @@ mod precise_commit_workflow;
 #[cfg(feature = "full-tests")]
 #[path = "promisor_blobless_cli.rs"]
 mod promisor_blobless_cli;
+#[cfg(feature = "full-tests")]
+#[path = "promisor_remote_git_client.rs"]
+mod promisor_remote_git_client;
 #[cfg(feature = "full-tests")]
 #[path = "pull_json.rs"]
 mod pull_json;
@@ -440,6 +475,9 @@ mod rebase_cli;
 #[cfg(feature = "full-tests")]
 #[path = "rebase_conflicts_cli.rs"]
 mod rebase_conflicts_cli;
+#[cfg(unix)]
+#[path = "rebase_exec_interrupt.rs"]
+mod rebase_exec_interrupt;
 #[cfg(feature = "full-tests")]
 #[path = "receive_pack_deny_non_ff.rs"]
 mod receive_pack_deny_non_ff;
@@ -449,6 +487,9 @@ mod receive_pack_fsck_objects;
 #[cfg(feature = "full-tests")]
 #[path = "receive_pack_git_push.rs"]
 mod receive_pack_git_push;
+#[cfg(feature = "full-tests")]
+#[path = "receive_pack_shared_pack_mode.rs"]
+mod receive_pack_shared_pack_mode;
 #[cfg(feature = "full-tests")]
 #[path = "reflog_filter_cli.rs"]
 mod reflog_filter_cli;
@@ -472,6 +513,12 @@ mod remote_set_url_cli;
 #[path = "remote_show_cli.rs"]
 mod remote_show_cli;
 #[cfg(feature = "full-tests")]
+#[path = "reset_hard_memory.rs"]
+mod reset_hard_memory;
+#[cfg(feature = "full-tests")]
+#[path = "reset_interrupt.rs"]
+mod reset_interrupt;
+#[cfg(feature = "full-tests")]
 #[path = "reset_sparse_checkout_cli.rs"]
 mod reset_sparse_checkout_cli;
 #[cfg(feature = "full-tests")]
@@ -483,10 +530,16 @@ mod reset_without_identity;
 #[path = "resolve_ref_modes_cli.rs"]
 mod resolve_ref_modes_cli;
 #[cfg(feature = "full-tests")]
+#[path = "resolve_reflog_invalid_date_cli.rs"]
+mod resolve_reflog_invalid_date_cli;
+#[cfg(feature = "full-tests")]
 #[path = "resolve_verify_quiet_cli.rs"]
 mod resolve_verify_quiet_cli;
 #[path = "restore_hunks.rs"]
 mod restore_hunks;
+#[cfg(feature = "full-tests")]
+#[path = "restore_interrupt.rs"]
+mod restore_interrupt;
 #[cfg(feature = "full-tests")]
 #[path = "restore_ours_theirs_cli.rs"]
 mod restore_ours_theirs_cli;
@@ -526,6 +579,8 @@ mod skill_recipes;
 #[cfg(feature = "full-tests")]
 #[path = "stash.rs"]
 mod stash;
+#[path = "stash_interrupt.rs"]
+mod stash_interrupt;
 #[path = "stash_pop_conflict_cli.rs"]
 mod stash_pop_conflict_cli;
 #[cfg(feature = "full-tests")]
@@ -557,6 +612,9 @@ mod status_upstream;
 #[path = "status_utf8_paths.rs"]
 mod status_utf8_paths;
 #[cfg(feature = "full-tests")]
+#[path = "switch_interrupt.rs"]
+mod switch_interrupt;
+#[cfg(feature = "full-tests")]
 #[path = "switch_stranded_commits.rs"]
 mod switch_stranded_commits;
 #[cfg(feature = "full-tests")]
@@ -580,6 +638,9 @@ mod untracked_overwrite_merge_pick;
 #[cfg(feature = "full-tests")]
 #[path = "upload_pack_filter.rs"]
 mod upload_pack_filter;
+#[cfg(feature = "full-tests")]
+#[path = "upload_pack_shallow_bitmaps.rs"]
+mod upload_pack_shallow_bitmaps;
 #[cfg(feature = "full-tests")]
 #[path = "upload_pack_shallow_exclude_want_ref.rs"]
 mod upload_pack_shallow_exclude_want_ref;

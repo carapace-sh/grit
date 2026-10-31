@@ -21,7 +21,8 @@
 
 #![cfg(feature = "http-ureq")]
 
-use std::net::{TcpListener, TcpStream};
+use grit_test_support::{free_port, git, rev_parse};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -29,9 +30,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use grit_lib::config::ConfigSet;
-use grit_lib::error::{AuthFailure, Error, Result as GritResult};
+use grit_lib::error::{AuthFailure, Error, RemoteUnreadableReason, Result as GritResult};
 use grit_lib::objects::odb::Odb;
-use grit_lib::objects::ObjectId;
 use grit_lib::refs::resolve_ref;
 use grit_lib::remote::credentials::{Credential, CredentialProvider, HelperCredentialProvider};
 use grit_lib::remote::fetch::NoProgress;
@@ -43,32 +43,6 @@ use grit_lib::remote::transport::http::{http_client_arc, http_fetch};
 
 const USER: &str = "alice";
 const PASS: &str = "s3cr3t";
-
-fn git(dir: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
-        .current_dir(dir)
-        .args(args)
-        .env("GIT_AUTHOR_NAME", "T")
-        .env("GIT_AUTHOR_EMAIL", "t@example.com")
-        .env("GIT_AUTHOR_DATE", "2005-04-07T22:13:13 +0200")
-        .env("GIT_COMMITTER_NAME", "T")
-        .env("GIT_COMMITTER_EMAIL", "t@example.com")
-        .env("GIT_COMMITTER_DATE", "2005-04-07T22:13:13 +0200")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .output()
-        .expect("run git");
-    assert!(
-        out.status.success(),
-        "git {args:?} failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8(out.stdout).expect("utf8 git output")
-}
-
-fn rev_parse(dir: &Path, rev: &str) -> ObjectId {
-    ObjectId::from_hex(git(dir, &["rev-parse", rev]).trim()).expect("valid oid")
-}
 
 fn open_odb(git_dir: &Path) -> Odb {
     Odb::new(&git_dir.join("objects")).with_config_git_dir(git_dir.to_path_buf())
@@ -85,24 +59,6 @@ fn build_source(dir: &Path) {
     git(dir, &["commit", "-q", "-m", "c2"]);
     git(dir, &["tag", "-a", "v1", "-m", "release one"]);
     git(dir, &["branch", "topic"]);
-}
-
-fn free_port() -> Option<u16> {
-    // Dedup port handout per process so a concurrent caller never accepts a
-    // port another test already reserved (closes the bind-before-spawn TOCTOU
-    // that let two servers share a port under high test parallelism).
-    static USED: std::sync::Mutex<Vec<u16>> = std::sync::Mutex::new(Vec::new());
-    let mut used = USED.lock().unwrap_or_else(|e| e.into_inner());
-    for _ in 0..200 {
-        let l = TcpListener::bind(("127.0.0.1", 0)).ok()?;
-        let p = l.local_addr().ok()?.port();
-        drop(l);
-        if !used.contains(&p) {
-            used.push(p);
-            return Some(p);
-        }
-    }
-    None
 }
 
 fn find_binary(name: &str) -> Option<PathBuf> {
@@ -453,6 +409,92 @@ fn fetch_over_authed_http_succeeds_with_right_credentials_and_fails_typed_otherw
         fsck.status.success(),
         "git fsck failed after authed fetch: {}",
         String::from_utf8_lossy(&fsck.stderr)
+    );
+}
+
+/// Authenticated discovery against a missing repository must not erase credentials:
+/// Git runs `credential reject` only on 401, not on 404/403/5xx.
+#[test]
+fn fetch_missing_repo_with_valid_credentials_does_not_reject_them() {
+    if find_binary("grit-http-server").is_none() {
+        eprintln!("SKIP: `grit-http-server` binary not found (build it first)");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let work = tmp.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    build_source(&work);
+
+    let root = tmp.path().join("srv");
+    mirror_bare(&work, &root, "repo.git");
+
+    let Some((_guard, port)) = start_authed_server(&root) else {
+        eprintln!("SKIP: could not start authed grit-http-server");
+        return;
+    };
+    let good_url = format!("http://127.0.0.1:{port}/repo.git");
+    let typo_url = format!("http://127.0.0.1:{port}/repo-typo.git");
+
+    let mut opts = FetchOptions {
+        refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()],
+        tags: TagMode::All,
+        ..Default::default()
+    };
+
+    let provider = SharedProvider(Arc::new(StaticCredentialProvider::new(USER, PASS)));
+    let client = http_client_arc(
+        UreqHttpClient::with_credentials(Box::new(provider.clone())).with_git_protocol("version=2"),
+    );
+
+    let local = tmp.path().join("typo");
+    std::fs::create_dir_all(&local).unwrap();
+    git(&local, &["init", "-q", "-b", "main", "."]);
+    let local_git = local.join(".git");
+
+    let err = http_fetch(
+        client.clone(),
+        &local_git,
+        &typo_url,
+        &mut opts,
+        &mut NoProgress,
+    )
+    .expect_err("fetch of a missing repo must fail");
+    assert!(
+        matches!(
+            err,
+            Error::RemoteUnreadable {
+                reason: RemoteUnreadableReason::HttpStatus { status: 404 },
+                ..
+            }
+        ),
+        "expected HTTP 404 remote_unreadable, got: {err:?}"
+    );
+    assert_eq!(
+        provider.0.rejects.load(Ordering::SeqCst),
+        0,
+        "404 must not reject stored credentials"
+    );
+    assert_eq!(
+        provider.0.approves.load(Ordering::SeqCst),
+        0,
+        "404 must not approve credentials either"
+    );
+
+    let local_ok = tmp.path().join("ok");
+    std::fs::create_dir_all(&local_ok).unwrap();
+    git(&local_ok, &["init", "-q", "-b", "main", "."]);
+    let local_ok_git = local_ok.join(".git");
+    http_fetch(client, &local_ok_git, &good_url, &mut opts, &mut NoProgress)
+        .expect("fetch of the real repo must still work with the same provider");
+    assert!(
+        provider.0.approves.load(Ordering::SeqCst) >= 1,
+        "correct credentials should be approved after a successful fetch"
+    );
+    assert_eq!(
+        provider.0.rejects.load(Ordering::SeqCst),
+        0,
+        "credentials must still not be rejected"
     );
 }
 
@@ -996,4 +1038,267 @@ fn wrong_credentials_in_the_url_are_rejected_without_asking_askpass() {
         !log.exists(),
         "askpass must not run for a complete URL credential"
     );
+}
+
+/// A stored credential the server refuses survives the best-effort advertisement
+/// [`load_push_plan_context`] reads, so the push itself sends it, reports it as
+/// rejected (not as missing), and erases it as Git does. With the right
+/// credential stored, the same advertisement authenticates and fills the context.
+#[test]
+fn a_rejected_stored_credential_is_reported_by_the_push_not_erased_by_the_plan() {
+    use grit_lib::config::environment::{Environment, RepositoryOptions};
+    use grit_lib::remote::push_plan::{load_push_plan_context, open_push_destination};
+    use grit_lib::remote::RemoteError;
+    use grit_lib::repo::Repository;
+
+    if find_binary("grit-http-server").is_none() {
+        eprintln!("SKIP: `grit-http-server` binary not found (build it first)");
+        return;
+    }
+    if system_credential_store().is_none() {
+        eprintln!("SKIP: system git-credential-store not available");
+        return;
+    }
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let work = tmp.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    build_source(&work);
+    let root = tmp.path().join("srv");
+    let push_target = make_bare_target(&root, "push.git");
+    let main_oid = rev_parse(&work, "refs/heads/main");
+    let Some((_guard, port)) = start_authed_server(&root) else {
+        eprintln!("SKIP: could not start authed grit-http-server");
+        return;
+    };
+
+    let store_file = tmp.path().join("git-credentials");
+    let wrong = format!("http://{USER}:WRONG@127.0.0.1%3a{port}\n");
+    std::fs::write(&store_file, &wrong).unwrap();
+    git(
+        &work,
+        &[
+            "remote",
+            "add",
+            "origin",
+            &format!("http://127.0.0.1:{port}/push.git"),
+        ],
+    );
+    git(
+        &work,
+        &[
+            "config",
+            "credential.helper",
+            &format!("store --file {}", store_file.display()),
+        ],
+    );
+
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let mut vars: Vec<(std::ffi::OsString, std::ffi::OsString)> = std::env::vars_os()
+        .filter(|(k, _)| !k.to_string_lossy().starts_with("GIT_"))
+        .collect();
+    vars.push(("HOME".into(), home.clone().into()));
+    vars.push(("XDG_CONFIG_HOME".into(), home.join(".config").into()));
+    vars.push(("GIT_CONFIG_NOSYSTEM".into(), "1".into()));
+    let env = Environment::from_vars(vars, work.clone());
+    let repo = Repository::open(
+        &work.join(".git"),
+        &RepositoryOptions::with_environment(env).with_work_tree(&work),
+    )
+    .expect("open repo");
+    let config = repo.config().expect("config");
+
+    let ctx = load_push_plan_context(&repo, &config, Some("origin"), None).expect("context");
+    assert!(ctx.remote_tips.is_none(), "the advertisement was refused");
+    assert_eq!(
+        std::fs::read_to_string(&store_file).unwrap(),
+        wrong,
+        "planning must not erase the stored credential"
+    );
+
+    let spec = PushRefSpec {
+        src: Some(main_oid),
+        dst: "refs/heads/main".to_owned(),
+        ..Default::default()
+    };
+    let push = || {
+        open_push_destination(&config, "origin")
+            .expect("origin")
+            .push(
+                &repo,
+                std::slice::from_ref(&spec),
+                PushOptions::default(),
+                &mut NoProgress,
+                &grit_lib::progress::NeverCancel,
+                None,
+            )
+    };
+    let err = push().expect_err("the stored credential is wrong");
+    assert!(
+        matches!(
+            &err,
+            RemoteError::Library(Error::Auth {
+                reason: AuthFailure::Rejected,
+                ..
+            })
+        ),
+        "expected the push to report rejected credentials, got: {err:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&store_file).unwrap(),
+        "",
+        "the push erases the refused credential, as Git does"
+    );
+
+    std::fs::write(
+        &store_file,
+        format!("http://{USER}:{PASS}@127.0.0.1%3a{port}\n"),
+    )
+    .unwrap();
+    let ctx = load_push_plan_context(&repo, &config, Some("origin"), None).expect("context");
+    assert_eq!(
+        ctx.remote_tips,
+        Some(Vec::new()),
+        "the empty target was listed"
+    );
+    let outcome = push().expect("push with the stored credential");
+    assert_eq!(outcome.results[0].status, PushRefStatus::Ok);
+    assert_eq!(
+        git(&push_target, &["rev-parse", "refs/heads/main"]).trim(),
+        main_oid.to_hex()
+    );
+    git_fsck(&push_target);
+}
+
+/// A caller's own [`HttpClientFactory`](grit_lib::remote::HttpClientFactory) is
+/// asked for a probe client for the push-plan advertisement and a normal client
+/// for the push, so only the push rejects the refused credential.
+#[test]
+fn custom_factories_build_the_push_plan_probe_with_create_for_probe() {
+    use grit_lib::config::environment::{Environment, RepositoryOptions};
+    use grit_lib::remote::push_plan::{load_push_plan_context, open_push_destination};
+    use grit_lib::remote::transport::http::HttpClient;
+    use grit_lib::remote::{HttpClientFactory, RemoteError, RemoteResult};
+    use grit_lib::repo::Repository;
+
+    /// Fills like the shared provider but drops `reject`.
+    struct NoReject(SharedProvider);
+    impl CredentialProvider for NoReject {
+        fn fill(&self, input: &Credential) -> GritResult<Credential> {
+            self.0.fill(input)
+        }
+        fn approve(&self, cred: &Credential) -> GritResult<()> {
+            self.0.approve(cred)
+        }
+        fn reject(&self, _cred: &Credential) -> GritResult<()> {
+            Ok(())
+        }
+    }
+
+    struct CountingFactory {
+        provider: SharedProvider,
+        creates: AtomicUsize,
+        probes: AtomicUsize,
+    }
+    impl HttpClientFactory for CountingFactory {
+        fn create(&self, config: &ConfigSet) -> RemoteResult<Box<dyn HttpClient>> {
+            self.creates.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(
+                UreqHttpClient::from_config(config)
+                    .expect("client")
+                    .with_credential_provider(Box::new(self.provider.clone())),
+            ))
+        }
+        fn create_for_probe(&self, config: &ConfigSet) -> RemoteResult<Box<dyn HttpClient>> {
+            self.probes.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(
+                UreqHttpClient::from_config(config)
+                    .expect("client")
+                    .with_credential_provider(Box::new(NoReject(self.provider.clone()))),
+            ))
+        }
+    }
+
+    if find_binary("grit-http-server").is_none() {
+        eprintln!("SKIP: `grit-http-server` binary not found (build it first)");
+        return;
+    }
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let work = tmp.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    build_source(&work);
+    let root = tmp.path().join("srv");
+    make_bare_target(&root, "push.git");
+    let main_oid = rev_parse(&work, "refs/heads/main");
+    let Some((_guard, port)) = start_authed_server(&root) else {
+        eprintln!("SKIP: could not start authed grit-http-server");
+        return;
+    };
+    git(
+        &work,
+        &[
+            "remote",
+            "add",
+            "origin",
+            &format!("http://127.0.0.1:{port}/push.git"),
+        ],
+    );
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let mut vars: Vec<(std::ffi::OsString, std::ffi::OsString)> = std::env::vars_os()
+        .filter(|(k, _)| !k.to_string_lossy().starts_with("GIT_"))
+        .collect();
+    vars.push(("HOME".into(), home.clone().into()));
+    vars.push(("GIT_CONFIG_NOSYSTEM".into(), "1".into()));
+    let repo = Repository::open(
+        &work.join(".git"),
+        &RepositoryOptions::with_environment(Environment::from_vars(vars, work.clone()))
+            .with_work_tree(&work),
+    )
+    .expect("open repo");
+    let config = repo.config().expect("config");
+
+    let counters = Arc::new(StaticCredentialProvider::new(USER, "WRONG"));
+    let factory = CountingFactory {
+        provider: SharedProvider(counters.clone()),
+        creates: AtomicUsize::new(0),
+        probes: AtomicUsize::new(0),
+    };
+    let ctx =
+        load_push_plan_context(&repo, &config, Some("origin"), Some(&factory)).expect("context");
+    assert!(ctx.remote_tips.is_none());
+    assert_eq!(factory.probes.load(Ordering::SeqCst), 1);
+    assert_eq!(factory.creates.load(Ordering::SeqCst), 0);
+    assert_eq!(counters.fills.load(Ordering::SeqCst), 1);
+    assert_eq!(counters.rejects.load(Ordering::SeqCst), 0);
+
+    let spec = PushRefSpec {
+        src: Some(main_oid),
+        dst: "refs/heads/main".to_owned(),
+        ..Default::default()
+    };
+    let err = open_push_destination(&config, "origin")
+        .expect("origin")
+        .push(
+            &repo,
+            std::slice::from_ref(&spec),
+            PushOptions::default(),
+            &mut NoProgress,
+            &grit_lib::progress::NeverCancel,
+            Some(&factory),
+        )
+        .expect_err("wrong credentials");
+    assert!(
+        matches!(
+            &err,
+            RemoteError::Library(Error::Auth {
+                reason: AuthFailure::Rejected,
+                ..
+            })
+        ),
+        "{err:?}"
+    );
+    assert_eq!(factory.probes.load(Ordering::SeqCst), 1);
+    assert!(factory.creates.load(Ordering::SeqCst) >= 1);
+    assert_eq!(counters.rejects.load(Ordering::SeqCst), 1);
 }

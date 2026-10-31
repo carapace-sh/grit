@@ -2,6 +2,8 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use crate::support;
+
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
@@ -99,8 +101,6 @@ fn seed_main_commit(repo: &Repository, dir: &Path) -> ObjectId {
             sign_override: None,
             amend: false,
             assume_worktree_synced: false,
-            skip_pre_commit_tree_match: false,
-            staged_change_count: None,
             ..Default::default()
         },
         &mut NullProgress,
@@ -284,7 +284,7 @@ fn refs_state_repo_caches_and_notes() {
     let dir = tempdir().expect("tempdir");
     let repo = init_repo(dir.path());
     let git_dir = dir.path().join(".git");
-    let oid = ObjectId::from_bytes(&[7u8; 20]).expect("oid");
+    let oid = support::stored_commit(&git_dir, 7);
     write_ref(git_dir.as_path(), "refs/heads/topic/foo", &oid).expect("write ref");
     let _ = list_refs_glob_for_repository(&repo, "refs/heads/topic/*");
     let _ = detect_format(git_dir.as_path());

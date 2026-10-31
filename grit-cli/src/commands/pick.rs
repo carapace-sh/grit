@@ -20,8 +20,8 @@ use grit_lib::operation::{
 use grit_lib::porcelain::replay::ReplayDirection;
 use grit_lib::porcelain::replay_sequence::{
     abort_replay_sequence, commits_to_replay, continue_replay_sequence, predict_replay_sequence,
-    skip_replay_step, start_replay_sequence, ReplayCreated, ReplayOptions, ReplaySequenceRequest,
-    SequenceOutcome, SequencePrediction,
+    skip_replay_step, start_replay_sequence, ReplayAbortOutcome, ReplayCreated, ReplayOptions,
+    ReplaySequenceRequest, SequenceOutcome, SequencePrediction,
 };
 use grit_lib::state::InProgressOperation;
 use schemars::JsonSchema;
@@ -201,17 +201,29 @@ pub fn run(opts: PickRunOptions) -> Result<PickOutcome> {
     }
 
     if opts.abort {
-        abort_replay_sequence(&repo).map_err(map_replay_error)?;
+        match abort_replay_sequence(&repo).map_err(|e| map_replay_error(&repo, e))? {
+            ReplayAbortOutcome::Rewound => {}
+            ReplayAbortOutcome::ClearedInPlace => {
+                eprintln!(
+                    "warning: branch tip moved during the pick; replay state cleared without moving the branch"
+                );
+            }
+        }
         return Ok(PickOutcome::new(PickResult::Aborted));
     }
 
+    let interrupt = crate::interrupt::InterruptCancel::install();
+    let mut progress = grit_lib::progress::NullProgress;
+
     if opts.continue_pick {
-        let outcome = continue_replay_sequence(&repo, &committer).map_err(map_replay_error)?;
+        let outcome = continue_replay_sequence(&repo, &committer, &mut progress, &interrupt)
+            .map_err(|e| map_replay_error(&repo, e))?;
         return Ok(map_sequence_outcome(outcome, PickResult::Picked));
     }
 
     if opts.skip {
-        let outcome = skip_replay_step(&repo, &committer).map_err(map_replay_error)?;
+        let outcome = skip_replay_step(&repo, &committer, &mut progress, &interrupt)
+            .map_err(|e| map_replay_error(&repo, e))?;
         return Ok(map_sequence_outcome(outcome, PickResult::Skipped));
     }
 
@@ -260,10 +272,12 @@ pub fn run(opts: PickRunOptions) -> Result<PickOutcome> {
         },
     };
     if opts.check {
-        let prediction = predict_replay_sequence(&repo, &req).map_err(map_replay_error)?;
+        let prediction =
+            predict_replay_sequence(&repo, &req).map_err(|e| map_replay_error(&repo, e))?;
         return Ok(map_prediction_outcome(prediction));
     }
-    let outcome = start_replay_sequence(&repo, &req).map_err(map_replay_error)?;
+    let outcome = start_replay_sequence(&repo, &req, &mut progress, &interrupt)
+        .map_err(|e| map_replay_error(&repo, e))?;
     Ok(map_sequence_outcome(outcome, PickResult::Picked))
 }
 
@@ -375,8 +389,11 @@ fn map_prediction_outcome(prediction: SequencePrediction) -> PickOutcome {
     }
 }
 
-fn map_replay_error(err: Error) -> anyhow::Error {
+fn map_replay_error(repo: &grit_lib::repo::Repository, err: Error) -> anyhow::Error {
     match err {
+        Error::OperationInProgress(kind) => {
+            crate::json_error::operation_in_progress_for_repo(repo, "pick", kind)
+        }
         Error::DetachedHead => anyhow::anyhow!("HEAD is detached; grit pick needs a branch"),
         Error::UnbornHead => anyhow::anyhow!("no commits yet on this branch to pick onto"),
         Error::MergeCommit { oid } => {
@@ -394,9 +411,12 @@ fn map_replay_error(err: Error) -> anyhow::Error {
         Error::ReplayContinueUnmerged => anyhow::anyhow!(
             "cannot continue: resolve conflicts and stage the result (`grit add`), then run `grit pick --continue`"
         ),
-        Error::ReplayAbortHeadMoved => {
-            anyhow::anyhow!("cannot abort: branch tip moved since the pick started")
-        }
+        Error::ReplaySkipAlreadyCommitted => anyhow::anyhow!(
+            "nothing to skip: current step already committed; run `grit pick --continue` instead"
+        ),
+        Error::ReplayContinueDirtyIndex => anyhow::anyhow!(
+            "cannot continue: index differs from HEAD after the step was committed"
+        ),
         Error::Message(msg) => anyhow::anyhow!(msg),
         other => anyhow::Error::new(other),
     }

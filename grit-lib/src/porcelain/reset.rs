@@ -15,7 +15,9 @@ use crate::porcelain::worktree_guard::{load_worktree_snapshot, local_change_diff
 use crate::refs;
 use crate::refs::store::{Expected, RawRef, RefUpdate, RefUpdateFlags, ReflogUpdate};
 use crate::repo::Repository;
-use crate::state::{clear_merge_state, clear_replay_state, resolve_head_for_repository, HeadState};
+use crate::state::{
+    clear_merge_state, clear_replay_state, resolve_head_for_repository, write_orig_head, HeadState,
+};
 
 pub use crate::porcelain::orphans::{OrphanedCommitSummary, DEFAULT_ORPHAN_LIMIT};
 
@@ -155,7 +157,9 @@ pub fn preview_reset(repo: &Repository, opts: &ResetOptions) -> Result<ResetPrev
 
 /// Move `HEAD` to `opts.target` according to `opts.mode`.
 ///
-/// Index and worktree updates run before the branch or detached `HEAD` moves.
+/// Index and worktree updates run before the branch or detached `HEAD` moves. After a
+/// successful reset (including one to the current `HEAD`), `ORIG_HEAD` names the previous
+/// `HEAD` commit, so resetting to `ORIG_HEAD` undoes it; a dry run leaves it alone.
 /// Hard and keep resets take `index.lock` before reading the index or touching the
 /// worktree. When [`ResetOptions::dry_run`] is true, nothing is written and the returned
 /// [`ResetOutcome::target`] is still the requested commit.
@@ -219,6 +223,7 @@ pub fn reset_to_commit(
     } else {
         ref_label
     };
+    write_orig_head(repo, previous)?;
 
     Ok(ResetOutcome {
         mode: opts.mode,
@@ -443,6 +448,7 @@ fn append_reset_reflogs(
                     flags: RefUpdateFlags {
                         no_deref: true,
                         log_only: true,
+                        ..Default::default()
                     },
                 },
             )?;
@@ -1360,8 +1366,11 @@ mod tests {
                 root,
                 &["commit", "-q", "--allow-empty", "-m", &format!("c{i}")],
             );
+            // Enough tags that the walk reads the tips up front, as on a real clone.
             if i % 10 == 0 {
                 git(root, &["tag", "-a", "-m", "release", &format!("v{i}")]);
+            } else {
+                git(root, &["tag", &format!("light{i}")]);
             }
             if i == 100 {
                 git(root, &["branch", "side"]);
@@ -1386,9 +1395,17 @@ mod tests {
         let target = ObjectId::from_hex(&base).expect("oid");
         let opts = reset_opts(target, ResetMode::Mixed);
 
-        for (packed, graph) in [(false, false), (true, false), (true, true)] {
+        for (packed, objects_packed, graph) in [
+            (false, false, false),
+            (true, false, false),
+            (true, true, false),
+            (true, true, true),
+        ] {
             if packed {
                 git(root, &["pack-refs", "--all"]);
+            }
+            if objects_packed {
+                git(root, &["repack", "-a", "-d", "-q"]);
             }
             if graph {
                 git(root, &["commit-graph", "write", "--reachable"]);
@@ -1423,8 +1440,29 @@ mod tests {
             let mut got: Vec<ObjectId> = preview.orphaned_commits.iter().map(|c| c.oid).collect();
             got.sort_unstable();
             expected.sort_unstable();
-            assert_eq!(got, expected, "packed={packed} graph={graph}");
+            assert_eq!(
+                got, expected,
+                "packed={packed} objects_packed={objects_packed} graph={graph}"
+            );
         }
+
+        let repo = Repository::open(
+            &root.join(".git"),
+            &crate::environment::RepositoryOptions::empty().with_work_tree(root),
+        )
+        .expect("open");
+        let previous = git(root, &["rev-parse", "HEAD"]).trim().to_owned();
+        let outcome = reset_to_commit(
+            &repo,
+            &reset_opts(target, ResetMode::Soft),
+            &mut crate::progress::NullProgress,
+            &crate::progress::NeverCancel,
+        )
+        .expect("soft reset");
+        assert_eq!(outcome.orphaned_total, 2);
+        assert_eq!(outcome.orphaned_commits[0].oid.to_hex(), previous);
+        assert_eq!(git(root, &["rev-parse", "main"]).trim(), base);
+        git(root, &["fsck", "--strict", "--no-dangling"]);
     }
 
     fn git(dir: &std::path::Path, args: &[&str]) -> String {

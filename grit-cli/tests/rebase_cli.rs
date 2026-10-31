@@ -405,6 +405,80 @@ fn rebase_updates_stacked_branches() -> TestResult {
     Ok(())
 }
 
+#[test]
+fn rebase_main_moves_deep_stacked_branches_json() -> TestResult {
+    let scratch = Scratch::new("deep-stack")?;
+    let dir = scratch.path();
+    init_repo(dir)?;
+    git(dir, &["commit", "-m", "base", "--allow-empty"])?;
+    for branch in ["a", "b", "c"] {
+        git(dir, &["switch", "-q", "-c", branch])?;
+        for n in 1..=2 {
+            git(
+                dir,
+                &["commit", "-m", &format!("{branch}{n}"), "--allow-empty"],
+            )?;
+        }
+    }
+    git(dir, &["switch", "-q", "main"])?;
+    git(dir, &["commit", "-m", "main advances", "--allow-empty"])?;
+    git(dir, &["switch", "-q", "a"])?;
+    gs(dir, ["config", "grit.changeIds", "false"])?;
+    let out = gs(dir, ["rebase", "main", "--json"])?;
+    assert!(out.success(), "{}\n{}", out.stdout, out.stderr);
+    let json = parse_json(&out.stdout)?;
+    let refs: Vec<&str> = json["refs"]
+        .as_array()
+        .ok_or("refs")?
+        .iter()
+        .filter_map(|r| r["ref"].as_str())
+        .collect();
+    for name in ["refs/heads/a", "refs/heads/b", "refs/heads/c"] {
+        assert!(refs.contains(&name), "missing {name} in {json}");
+    }
+    git_fsck_strict(dir)?;
+    Ok(())
+}
+
+#[test]
+fn rebase_keeps_backup_branch_at_old_tip() -> TestResult {
+    let scratch = Scratch::new("backup")?;
+    let dir = scratch.path();
+    init_repo(dir)?;
+    git(dir, &["switch", "-q", "-c", "feature"])?;
+    fs::write(dir.join("x.txt"), "x\n")?;
+    git(dir, &["add", "x.txt"])?;
+    git(dir, &["commit", "-m", "X"])?;
+    fs::write(dir.join("y.txt"), "y\n")?;
+    git(dir, &["add", "y.txt"])?;
+    git(dir, &["commit", "-m", "Y"])?;
+    git(dir, &["branch", "backup"])?;
+    let old_tip = git(dir, &["rev-parse", "HEAD"])?.trim().to_string();
+    git(dir, &["switch", "-q", "main"])?;
+    fs::write(dir.join("m.txt"), "m\n")?;
+    git(dir, &["add", "m.txt"])?;
+    git(dir, &["commit", "-m", "M"])?;
+    git(dir, &["switch", "-q", "feature"])?;
+    gs(dir, ["config", "grit.changeIds", "false"])?;
+    let out = gs(dir, ["rebase", "main", "--json"])?;
+    assert!(out.success(), "{}\n{}", out.stdout, out.stderr);
+    let json = parse_json(&out.stdout)?;
+    let refs: Vec<&str> = json["refs"]
+        .as_array()
+        .ok_or("refs")?
+        .iter()
+        .filter_map(|r| r["ref"].as_str())
+        .collect();
+    assert_eq!(refs, ["refs/heads/feature"], "{json}");
+    assert_eq!(git(dir, &["rev-parse", "backup"])?.trim(), old_tip);
+    assert_eq!(
+        git(dir, &["rev-parse", "feature~2"])?,
+        git(dir, &["rev-parse", "main"])?
+    );
+    git_fsck_strict(dir)?;
+    Ok(())
+}
+
 fn init_rebase_conflict_fixture(dir: &Path) -> Result<(String, String), Box<dyn Error>> {
     init_repo(dir)?;
     git(dir, &["checkout", "-b", "topic"])?;
@@ -477,6 +551,7 @@ fn rebase_x_theirs_json() -> TestResult {
     let dir = scratch.path();
     let (upstream, onto) = init_rebase_conflict_fixture(dir)?;
     gs(dir, ["config", "grit.changeIds", "false"])?;
+    let tip = git(dir, &["rev-parse", "HEAD"])?.trim().to_owned();
     let out = gs(
         dir,
         [
@@ -484,6 +559,11 @@ fn rebase_x_theirs_json() -> TestResult {
         ],
     )?;
     assert!(out.success(), "{}\n{}", out.stdout, out.stderr);
+    assert_ne!(git(dir, &["rev-parse", "HEAD"])?.trim(), tip);
+    assert_eq!(
+        git(dir, &["rev-parse", "--verify", "ORIG_HEAD"])?.trim(),
+        tip
+    );
     let json = parse_json(&out.stdout)?;
     assert_eq!(json["operation"], "rebase");
     assert!(json["rewritten"].as_array().is_some_and(|a| !a.is_empty()));
@@ -510,6 +590,10 @@ fn rebase_exec_true_moves_refs() -> TestResult {
     let exec = json["exec"].as_array().ok_or("exec array")?;
     assert!(!exec.is_empty());
     assert_ne!(git(dir, &["rev-parse", "HEAD"])?.trim(), tip);
+    assert_eq!(
+        git(dir, &["rev-parse", "--verify", "ORIG_HEAD"])?.trim(),
+        tip
+    );
     git_fsck_strict(dir)?;
     Ok(())
 }
@@ -528,6 +612,10 @@ fn rebase_exec_failure_emits_single_error_line() -> TestResult {
     )?;
     assert_eq!(out.status, Some(7), "stderr:\n{}", out.stderr);
     assert_eq!(git(dir, &["rev-parse", "HEAD"])?.trim(), tip);
+    assert!(
+        git(dir, &["rev-parse", "--verify", "-q", "ORIG_HEAD"]).is_err(),
+        "a rolled-back exec rebase records no ORIG_HEAD"
+    );
     let marker = "rebase --exec command failed";
     let count = out.stderr.matches(marker).count() + out.stdout.matches(marker).count();
     assert_eq!(
@@ -557,6 +645,10 @@ fn rebase_exec_failure_restores_unchanged_tracked_file() -> TestResult {
     )?;
     assert_eq!(out.status, Some(7), "stderr:\n{}", out.stderr);
     assert_eq!(git(dir, &["rev-parse", "HEAD"])?.trim(), tip);
+    assert!(
+        git(dir, &["rev-parse", "--verify", "-q", "ORIG_HEAD"]).is_err(),
+        "a rolled-back exec rebase records no ORIG_HEAD"
+    );
     assert_eq!(
         fs::read_to_string(dir.join("stable.txt"))?,
         "stable\n",
@@ -584,6 +676,10 @@ fn rebase_exec_failure_exit_code_and_refs_unchanged() -> TestResult {
     )?;
     assert_eq!(out.status, Some(7), "stderr:\n{}", out.stderr);
     assert_eq!(git(dir, &["rev-parse", "HEAD"])?.trim(), tip);
+    assert!(
+        git(dir, &["rev-parse", "--verify", "-q", "ORIG_HEAD"]).is_err(),
+        "a rolled-back exec rebase records no ORIG_HEAD"
+    );
     git_fsck_strict(dir)?;
     Ok(())
 }
@@ -610,6 +706,10 @@ fn rebase_exec_forwards_stdout_and_stderr() -> TestResult {
     )?;
     assert_eq!(out.status, Some(7), "stderr:\n{}", out.stderr);
     assert_eq!(git(dir, &["rev-parse", "HEAD"])?.trim(), tip);
+    assert!(
+        git(dir, &["rev-parse", "--verify", "-q", "ORIG_HEAD"]).is_err(),
+        "a rolled-back exec rebase records no ORIG_HEAD"
+    );
     assert!(
         out.stderr.contains("EXEC_STDOUT"),
         "stdout from successful --exec must be forwarded: {}",
@@ -800,6 +900,201 @@ fn successful_dirty_exec_stops_immediately_and_preserves_index_and_worktree() ->
 }
 
 #[test]
+fn exec_stop_with_moved_branch_refuses_resume_and_abort_restores_the_branch() -> TestResult {
+    for mode in ["human", "--json", "--markdown"] {
+        let scratch = Scratch::new("exec-dirty-moved-branch")?;
+        let dir = scratch.path();
+        let tip = init_dirty_exec_fixture(dir, 2)?;
+        let stop = gs(dir, ["rebase", "main", "--exec", "echo fmt >> f"])?;
+        assert_eq!(stop.status, Some(1), "{}\n{}", stop.stdout, stop.stderr);
+        let moved = git(
+            dir,
+            &[
+                "commit-tree",
+                "-p",
+                "feature",
+                "-m",
+                "moved",
+                "feature^{tree}",
+            ],
+        )?
+        .trim()
+        .to_owned();
+        git(dir, &["update-ref", "refs/heads/feature", &moved])?;
+
+        let flags: &[&str] = if mode == "human" { &[] } else { &[mode] };
+        for resume in ["--continue", "--skip"] {
+            let out = gs(dir, [&["rebase", resume][..], flags].concat())?;
+            assert_eq!(out.status, Some(1), "{}\n{}", out.stdout, out.stderr);
+            let text = format!("{}{}", out.stdout, out.stderr);
+            assert!(
+                text.contains("refs/heads/feature moved to")
+                    && text.contains("grit rebase --abort")
+                    && !text.contains("exec left tracked changes"),
+                "{resume} {mode}: {text}"
+            );
+            assert_eq!(git(dir, &["rev-parse", "feature"])?.trim(), moved);
+            assert_eq!(fs::read_to_string(dir.join("f"))?, "base\nfmt\n");
+        }
+
+        let abort = gs(dir, [&["rebase", "--abort"][..], flags].concat())?;
+        assert!(abort.success(), "{}\n{}", abort.stdout, abort.stderr);
+        match mode {
+            "--json" => {
+                let json = parse_json(&abort.stdout)?;
+                assert_eq!(json["result"], "aborted");
+                assert_eq!(
+                    json["refs"],
+                    serde_json::json!([{
+                        "ref": "refs/heads/feature",
+                        "name": "refs/heads/feature",
+                        "old": moved,
+                        "new": tip,
+                    }])
+                );
+            }
+            _ => {
+                assert!(abort.stdout.contains("Rebase aborted."), "{}", abort.stdout);
+                assert!(
+                    abort.stdout.contains("refs/heads/feature")
+                        && abort.stdout.contains(&moved[..7])
+                        && abort.stdout.contains(&tip[..7]),
+                    "{}",
+                    abort.stdout
+                );
+            }
+        }
+        assert_eq!(git(dir, &["rev-parse", "feature"])?.trim(), tip);
+        assert_eq!(
+            git(dir, &["symbolic-ref", "HEAD"])?.trim(),
+            "refs/heads/feature"
+        );
+        assert_eq!(git(dir, &["rev-parse", "feature@{1}"])?.trim(), moved);
+        assert_eq!(fs::read_to_string(dir.join("f"))?, "base\n");
+        assert_eq!(git(dir, &["status", "--porcelain"])?, "");
+        assert!(!dir.join(".git/rebase-merge").exists());
+        git_fsck_strict(dir)?;
+        let again = gs(dir, ["rebase", "main", "--json"])?;
+        assert!(again.success(), "{}\n{}", again.stdout, again.stderr);
+    }
+    Ok(())
+}
+
+/// The issue #2156 fixture: `one` and `two` on `feature`, `up` on `main`.
+fn init_amend_exec_fixture(dir: &Path) -> Result<(), Box<dyn Error>> {
+    git(dir, &["init", "-q", "-b", "main"])?;
+    for (path, branch) in [("f", None), ("one", Some("feature")), ("two", None)] {
+        if let Some(branch) = branch {
+            git(dir, &["switch", "-qc", branch])?;
+        }
+        fs::write(dir.join(path), format!("{path}\n"))?;
+        git(dir, &["add", path])?;
+        git(dir, &["commit", "-qm", path])?;
+    }
+    git(dir, &["switch", "-q", "main"])?;
+    fs::write(dir.join("up"), "up\n")?;
+    git(dir, &["add", "up"])?;
+    git(dir, &["commit", "-qm", "up"])?;
+    git(dir, &["switch", "-q", "feature"])?;
+    Ok(())
+}
+
+#[test]
+fn exec_that_amends_each_commit_completes_like_git() -> TestResult {
+    let command = "echo fmt >> one && git commit -qa --amend --no-edit";
+    let scratch = Scratch::new("exec-amend")?;
+    let dir = scratch.path();
+    init_amend_exec_fixture(dir)?;
+    let out = gs(dir, ["rebase", "main", "--exec", command, "--json"])?;
+    assert!(out.success(), "{}\n{}", out.stdout, out.stderr);
+    let json = parse_json(&out.stdout)?;
+    assert_eq!(json["result"], "completed");
+    let tip = git(dir, &["rev-parse", "feature"])?.trim().to_owned();
+    assert_eq!(json["head"]["new"], tip);
+    assert_eq!(json["rewritten"].as_array().ok_or("rewritten")?.len(), 2);
+    assert_eq!(json["exec"].as_array().ok_or("exec")?.len(), 2);
+    assert_eq!(
+        git(dir, &["log", "--format=%s", "feature"])?,
+        "two\none\nup\nf\n"
+    );
+    assert_eq!(git(dir, &["show", "feature~1:one"])?, "one\nfmt\n");
+    assert_eq!(
+        git(dir, &["symbolic-ref", "HEAD"])?.trim(),
+        "refs/heads/feature"
+    );
+    assert_eq!(git(dir, &["status", "--porcelain"])?, "");
+    assert!(!dir.join(".git/rebase-merge").exists());
+    git_fsck_strict(dir)?;
+
+    let twin = Scratch::new("exec-amend-git")?;
+    init_amend_exec_fixture(twin.path())?;
+    git(twin.path(), &["rebase", "-q", "main", "--exec", command])?;
+    for rev in ["feature^{tree}", "feature~1^{tree}"] {
+        assert_eq!(
+            git(dir, &["rev-parse", rev])?,
+            git(twin.path(), &["rev-parse", rev])?
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn exec_amend_conflict_stops_with_conflicts_and_continues() -> TestResult {
+    let command = "if ! test -f two; then echo amended > two && git add two && git commit -q --amend --no-edit; fi";
+    let scratch = Scratch::new("exec-amend-conflict")?;
+    let dir = scratch.path();
+    init_amend_exec_fixture(dir)?;
+    let tip = git(dir, &["rev-parse", "feature"])?.trim().to_owned();
+    let out = gs(dir, ["rebase", "main", "--exec", command, "--json"])?;
+    assert_eq!(out.status, Some(1), "{}\n{}", out.stdout, out.stderr);
+    let json = parse_json(&out.stdout)?;
+    assert_eq!(json["result"], "conflicts");
+    assert_eq!(json["commit"], tip);
+    assert_eq!(json["conflicts"][0]["path"], "two");
+    assert_eq!(json["exec"].as_array().ok_or("exec")?.len(), 1);
+    assert_eq!(git(dir, &["rev-parse", "feature"])?.trim(), tip);
+    fs::write(dir.join("two"), "resolved\n")?;
+    git(dir, &["add", "two"])?;
+    let resume = gs(dir, ["rebase", "--continue", "--json"])?;
+    assert!(resume.success(), "{}\n{}", resume.stdout, resume.stderr);
+    assert_eq!(parse_json(&resume.stdout)?["result"], "completed");
+    assert_eq!(git(dir, &["show", "feature:two"])?, "resolved\n");
+    assert_eq!(git(dir, &["show", "feature~1:two"])?, "amended\n");
+    assert_eq!(git(dir, &["status", "--porcelain"])?, "");
+    git_fsck_strict(dir)?;
+    Ok(())
+}
+
+#[test]
+fn exec_conflict_continue_keeps_the_empty_policy_the_rebase_started_with() -> TestResult {
+    let command = "if ! test -f two; then echo amended > two && git add two && git commit -q --amend --no-edit; fi";
+    let scratch = Scratch::new("exec-resume-options")?;
+    let dir = scratch.path();
+    init_amend_exec_fixture(dir)?;
+    git(dir, &["switch", "-q", "feature"])?;
+    fs::write(dir.join("two"), "C\n")?;
+    git(dir, &["commit", "-qam", "three"])?;
+    let out = gs(
+        dir,
+        [
+            "rebase", "main", "--empty", "keep", "--exec", command, "--json",
+        ],
+    )?;
+    assert_eq!(out.status, Some(1), "{}\n{}", out.stdout, out.stderr);
+    assert_eq!(parse_json(&out.stdout)?["result"], "conflicts");
+    fs::write(dir.join("two"), "C\n")?;
+    git(dir, &["add", "two"])?;
+    let resume = gs(dir, ["rebase", "--continue", "--json"])?;
+    assert!(resume.success(), "{}\n{}", resume.stdout, resume.stderr);
+    assert_eq!(
+        git(dir, &["log", "--format=%s", "main..feature"])?,
+        "three\ntwo\none\n"
+    );
+    git_fsck_strict(dir)?;
+    Ok(())
+}
+
+#[test]
 fn dirty_exec_human_and_markdown_explain_recovery() -> TestResult {
     for format in [None, Some("--markdown")] {
         let scratch = Scratch::new("dirty-exec-render")?;
@@ -898,6 +1193,51 @@ fn exec_failure_after_dirty_stop_forwards_streams_and_exit_code() -> TestResult 
     assert!(!dir.join(".git/rebase-merge").exists());
     assert!(gs(dir, ["stash", "pop"])?.success());
     assert_eq!(fs::read_to_string(dir.join("f"))?, "base\nedit\n");
+    git_fsck_strict(dir)?;
+    Ok(())
+}
+
+/// Issue #2246: `--exec` must run when the branch is already based on the upstream.
+#[test]
+fn rebase_exec_runs_when_already_up_to_date_with_upstream() -> TestResult {
+    let scratch = Scratch::new("issue-2246")?;
+    let dir = scratch.path();
+    git(dir, &["init", "-q", "-b", "main"])?;
+    for i in 1..=3 {
+        fs::write(dir.join(format!("f{i}.txt")), format!("{i}\n"))?;
+        git(dir, &["add", "."])?;
+        git(dir, &["commit", "-qm", &format!("c{i}")])?;
+    }
+    let tip = git(dir, &["rev-parse", "HEAD"])?.trim().to_owned();
+    let upstream = git(dir, &["rev-parse", "HEAD~2"])?.trim().to_owned();
+
+    let ok = gs(dir, ["rebase", "--exec", "true", &upstream, "--json"])?;
+    assert!(ok.success(), "{}\n{}", ok.stdout, ok.stderr);
+    let json = parse_json(&ok.stdout)?;
+    assert_eq!(
+        json.get("result").and_then(Value::as_str),
+        Some("completed")
+    );
+    let exec = json
+        .get("exec")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    assert_eq!(exec, 2, "expected exec at c2 and c3: {json}");
+    assert_eq!(git(dir, &["rev-parse", "HEAD"])?.trim(), tip);
+    assert!(
+        !ok.stdout.contains("Already up to date"),
+        "must not claim up to date when exec ran"
+    );
+
+    let failed = gs(dir, ["rebase", "--exec", "false", &upstream, "--json"])?;
+    assert_eq!(
+        failed.status,
+        Some(1),
+        "{}\n{}",
+        failed.stdout,
+        failed.stderr
+    );
+    assert_eq!(git(dir, &["rev-parse", "HEAD"])?.trim(), tip);
     git_fsck_strict(dir)?;
     Ok(())
 }

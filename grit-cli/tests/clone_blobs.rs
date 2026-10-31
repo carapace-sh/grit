@@ -34,6 +34,47 @@ fn setup_filtering_bare(base: &std::path::Path) -> std::path::PathBuf {
 }
 
 #[test]
+fn clone_blobs_none_without_server_filter_warns_and_is_not_partial() {
+    let base = tempfile::tempdir().expect("tempdir");
+    let bare = setup_filtering_bare(base.path());
+    git_in(&bare, &["config", "--unset", "uploadpack.allowFilter"]);
+    let url = format!("file://{}", bare.canonicalize().unwrap().display());
+    let dest = base.path().join("full-with-blobs-flag");
+    let out = Command::new(GRIT)
+        .args([
+            "clone",
+            "--blobs",
+            "none",
+            "--json",
+            url.as_str(),
+            dest.to_str().unwrap(),
+        ])
+        .output()
+        .expect("grit clone");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("did not advertise filter"),
+        "expected unsupported-filter warning, got: {stderr}"
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert_eq!(v["blobs"], "none");
+    assert!(v.get("partial").is_none() || v["partial"] == false);
+    assert!(
+        count_pack_blobs(&dest) > 0,
+        "unfiltered clone should include blob objects"
+    );
+    assert_eq!(
+        git_in_read_config(&dest, "remote.origin.partialclonefilter"),
+        "blob:none"
+    );
+}
+
+#[test]
 fn clone_blobs_none_json_fields() {
     let base = tempfile::tempdir().expect("tempdir");
     let bare = setup_filtering_bare(base.path());

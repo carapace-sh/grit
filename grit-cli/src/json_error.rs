@@ -12,7 +12,9 @@ use grit_lib::objects::ObjectId;
 use grit_lib::porcelain::pull::PullError;
 use grit_lib::remote::clone::CloneError;
 use grit_lib::remote::RemoteError;
-use grit_lib::state::{InProgressOperation, NextStep, Operation};
+use grit_lib::repo::Repository;
+use grit_lib::revwalk::rev_parse_error::RevParseError;
+use grit_lib::state::{wt_status_get_state, HeadState, InProgressOperation, NextStep, Operation};
 use schemars::JsonSchema;
 use serde::Serialize;
 
@@ -48,6 +50,32 @@ pub struct LockHolderJson {
     pub running: bool,
 }
 
+/// A clone that was kept after its checkout failed, when `kind == "clone_checkout_failed"`.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct CloneCheckoutJson {
+    /// The clone's directory; the repository in it was kept.
+    pub path: String,
+    /// The commit `HEAD` points at, whose files the checkout was writing.
+    pub commit: String,
+    /// The first promised object that could not be fetched, when the checkout failed for
+    /// lack of one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(skip_serializing_if = "Option::is_none")]
+    pub missing_object: Option<String>,
+    /// Each promisor remote that failed while fetching the missing objects, in the order
+    /// they were asked; empty when no remote was asked.
+    pub failed_remotes: Vec<PromisorRemoteFailureJson>,
+}
+
+/// One promisor remote that failed to supply missing objects.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct PromisorRemoteFailureJson {
+    /// The remote's name.
+    pub remote: String,
+    /// Why the remote failed (its first error).
+    pub error: String,
+}
+
 /// JSON object emitted on stdout for structured command failures.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct StructuredJsonError {
@@ -63,6 +91,11 @@ pub struct StructuredJsonError {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(skip_serializing_if = "Option::is_none")]
     pub commit: Option<String>,
+    /// Other branches (full ref names) whose replay onto the rewritten history conflicted,
+    /// when `kind == "conflict"` comes from a history rewrite or rebase.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(skip_serializing_if = "Option::is_none")]
+    pub refs: Option<Vec<String>>,
     /// Overwrite details when `kind == "would_overwrite"`.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(skip_serializing_if = "Option::is_none")]
@@ -88,6 +121,10 @@ pub struct StructuredJsonError {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(skip_serializing_if = "Option::is_none")]
     pub lock: Option<LockHeldJson>,
+    /// The kept repository and what failed, when `kind == "clone_checkout_failed"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(skip_serializing_if = "Option::is_none")]
+    pub clone_checkout: Option<CloneCheckoutJson>,
 }
 
 impl StructuredJsonError {
@@ -99,12 +136,14 @@ impl StructuredJsonError {
             kind,
             conflicts: None,
             commit: None,
+            refs: None,
             would_overwrite: None,
             oid: None,
             hook: None,
             paths: None,
             hint: None,
             lock: None,
+            clone_checkout: None,
         }
     }
 }
@@ -129,6 +168,18 @@ pub fn hook_error_from_chain(err: &Error) -> Option<&HookError> {
             Some(LibError::Hook(hook)) => Some(hook),
             _ => cause.downcast_ref::<HookError>(),
         })
+}
+
+/// A failed hook with the next step as `hint`. The [`LibError::Hook`] stays in the chain, so
+/// the hook's captured output is still rendered.
+pub fn hook_failed_with_hint(err: LibError, hint: &str) -> Error {
+    let err = Error::new(err);
+    let Some(mut payload) = hook_failure_payload(&err) else {
+        return err;
+    };
+    payload.hint = Some(hint.to_owned());
+    let human = payload.error.clone();
+    err.context(StructuredCliError { payload, human })
 }
 
 fn hook_failure_payload(err: &Error) -> Option<StructuredJsonError> {
@@ -167,26 +218,46 @@ impl fmt::Display for StructuredCliError {
 
 impl StdError for StructuredCliError {}
 
-/// Build an error for a merge, pick, or rebase that would introduce conflicts.
-pub fn operation_conflict(
+/// Build an error for a history rewrite or rebase that stopped because replaying `commit`
+/// conflicts.
+///
+/// `refs` lists other branches whose replay failed; when non-empty the message names them and
+/// the hint points at `--update-refs head`, which rewrites only the current branch.
+pub fn replay_conflict(
     operation: &str,
+    commit: ObjectId,
+    subject: &str,
     mut paths: Vec<String>,
-    commit: Option<ObjectId>,
+    refs: Vec<String>,
 ) -> Error {
     paths.sort();
     paths.dedup();
-    let list = paths.join("\n  ");
-    let commit_line = commit
-        .as_ref()
-        .map(|oid| format!("\n  commit {}", &oid.to_hex()[..7.min(oid.to_hex().len())]))
-        .unwrap_or_default();
+    let hex = commit.to_hex();
+    let short = &hex[..7.min(hex.len())];
+    let header = if refs.is_empty() {
+        format!("{operation} has conflicts in:")
+    } else {
+        format!(
+            "{operation} has conflicts moving {} onto the new history:",
+            refs.join(", ")
+        )
+    };
+    let commit_line = format!("commit {short} {subject}");
     let human = format!(
-        "{operation} has conflicts in:{commit_line}\n  {list}\n\nNothing was changed. grit can't resolve conflicts yet."
+        "{header}\n  {}\n  {}\n\nNothing was changed. grit can't resolve conflicts yet.",
+        commit_line.trim_end(),
+        paths.join("\n  ")
     );
+    let hint = (!refs.is_empty()).then(|| {
+        "pass --update-refs head to rewrite only the current branch and leave the others as they are"
+            .to_owned()
+    });
     Error::new(StructuredCliError {
         payload: StructuredJsonError {
             conflicts: Some(paths),
-            commit: commit.map(|oid| oid.to_hex()),
+            commit: Some(hex),
+            refs: (!refs.is_empty()).then_some(refs),
+            hint,
             ..StructuredJsonError::new(format!("{operation} has conflicts"), ErrorKind::Conflict)
         },
         human,
@@ -234,6 +305,18 @@ pub fn would_overwrite_error(
 /// Build a structured CLI error for a command refused while `kind` is paused.
 ///
 /// `operation` supplies the finish / cancel commands named in the message, when grit knows them.
+/// Like [`operation_in_progress`], loading finish/cancel commands from the repository state.
+pub fn operation_in_progress_for_repo(
+    repo: &Repository,
+    action: &str,
+    kind: InProgressOperation,
+) -> Error {
+    let operation = wt_status_get_state(repo.git_dir(), &HeadState::Invalid, false)
+        .ok()
+        .and_then(|state| grit_lib::state::status_operation(&state, false));
+    operation_in_progress(action, kind, operation.as_ref())
+}
+
 pub fn operation_in_progress(
     action: &str,
     kind: InProgressOperation,
@@ -269,13 +352,57 @@ pub fn operation_in_progress(
     })
 }
 
+/// Refuse to commit on a GitButler workspace, whose branch GitButler rewrites.
+pub fn gitbutler_workspace_commit() -> Error {
+    let human =
+        "HEAD is a GitButler workspace, which GitButler rewrites, so grit does not commit to it"
+            .to_owned();
+    Error::new(StructuredCliError {
+        payload: StructuredJsonError {
+            hint: Some("commit with `but commit`, or switch to a branch first".to_owned()),
+            ..StructuredJsonError::new(human.clone(), ErrorKind::GitButlerWorkspace)
+        },
+        human,
+    })
+}
+
 /// Build a structured CLI error for a revision that names nothing.
 pub fn revision_not_found(spec: &str) -> Error {
-    let human = format!("no branch, tag or commit named '{spec}'");
+    structured_revision_not_found(format!("no branch, tag or commit named '{spec}'"))
+}
+
+/// Structured `--json` failure for a missing revision, preserving caller-chosen wording.
+pub fn structured_revision_not_found(human: impl Into<String>) -> Error {
+    let human = human.into();
     Error::new(StructuredCliError {
         payload: StructuredJsonError::new(human.clone(), ErrorKind::RevisionNotFound),
         human,
     })
+}
+
+/// Detect rev-parse misses that should surface as `revision_not_found` (not every [`LibError`]).
+fn revision_not_found_payload_from_chain(err: &Error) -> Option<StructuredJsonError> {
+    for cause in err.chain() {
+        let Some(lib) = cause.downcast_ref::<LibError>() else {
+            continue;
+        };
+        match lib {
+            LibError::RevParse(RevParseError::InvalidObjectName { name }) => {
+                return Some(StructuredJsonError::new(
+                    format!("revision '{name}' not found"),
+                    ErrorKind::RevisionNotFound,
+                ));
+            }
+            LibError::RevParse(RevParseError::AmbiguousArgument { spec }) => {
+                return Some(StructuredJsonError::new(
+                    format!("revision '{spec}' not found"),
+                    ErrorKind::RevisionNotFound,
+                ));
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Map a library error to `anyhow`, using structured JSON for typed failures.
@@ -400,6 +527,10 @@ pub fn ensure_structured(err: Error) -> Error {
     if let Some(structured) = would_overwrite_from_chain(&err) {
         return structured;
     }
+    if let Some(payload) = revision_not_found_payload_from_chain(&err) {
+        let human = payload.error.clone();
+        return Error::new(StructuredCliError { payload, human });
+    }
     crate::unborn_errors::enrich_unborn_head(err)
 }
 
@@ -448,6 +579,7 @@ pub fn structured_json_payload(err: &Error) -> Option<StructuredJsonError> {
                 .downcast_ref::<StructuredCliError>()
                 .map(|structured| structured.payload.clone())
         })
+        .or_else(|| revision_not_found_payload_from_chain(err))
 }
 
 /// Build a structured error for incompatible `--json` / `--markdown` flag combinations.

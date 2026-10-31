@@ -7,22 +7,19 @@
 //! objects, the per-ref `UpdateMode`, and the resolved default branch — then
 //! repeat after advancing the remote to assert a `FastForward`.
 
+use grit_test_support::rev_parse;
 use std::path::Path;
 use std::process::Command;
 
 use grit_lib::config::environment::Environment;
 use grit_lib::config::ConfigSet;
 use grit_lib::objects::odb::Odb;
-use grit_lib::objects::{ObjectId, ObjectKind};
+use grit_lib::objects::ObjectKind;
 use grit_lib::refs::resolve_ref;
 use grit_lib::remote::transfer::{
     build_pack, fetch_local, FetchOptions, PackBuildOptions, TagMode, UpdateMode,
 };
 use grit_test_support::{git, git_cmd};
-
-fn rev_parse(dir: &Path, rev: &str) -> ObjectId {
-    ObjectId::from_hex(git(dir, &["rev-parse", rev]).trim()).expect("valid oid")
-}
 
 fn open_odb(git_dir: &Path) -> Odb {
     Odb::new(&git_dir.join("objects")).with_config_git_dir(git_dir.to_path_buf())
@@ -370,6 +367,58 @@ fn fetch_local_into_empty_repo_links_remote_pack() {
         "initial fetch must link remote packfiles instead of rebuilding"
     );
 
+    let fsck = git_cmd(&["fsck", "--strict"]).in_dir(&local_git).exec();
+    assert!(fsck.ok(), "fsck after linked fetch: {}", fsck.stderr);
+}
+
+/// Pack basenames under `git_dir/objects/pack`, sorted.
+fn pack_names(git_dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(git_dir.join("objects/pack"))
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.ends_with(".pack"))
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+#[test]
+fn fetch_into_repo_holding_the_empty_tree_still_links_the_source_pack() {
+    // Jujutsu writes the empty tree into a new repository before its first fetch. The
+    // source's pack holds it too (an empty first commit), which must not stop the pack
+    // from being linked instead of rebuilt.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let remote = tmp.path().join("remote");
+    let local = tmp.path().join("local");
+    std::fs::create_dir_all(&remote).unwrap();
+    std::fs::create_dir_all(&local).unwrap();
+    git(&remote, &["init", "-q", "-b", "main", "."]);
+    git(&remote, &["commit", "-q", "--allow-empty", "-m", "empty"]);
+    std::fs::write(remote.join("a.txt"), "one\n").unwrap();
+    git(&remote, &["add", "a.txt"]);
+    git(&remote, &["commit", "-q", "-m", "c1"]);
+    git(&remote, &["repack", "-adq"]);
+    let remote_git = remote.join(".git");
+
+    git(&local, &["init", "-q", "-b", "main", "."]);
+    let local_git = local.join(".git");
+    let empty_tree = git_cmd(&["hash-object", "-t", "tree", "-w", "--stdin"])
+        .in_dir(&local_git)
+        .stdin("")
+        .exec();
+    assert!(empty_tree.ok(), "{}", empty_tree.stderr);
+
+    let opts = FetchOptions {
+        refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()],
+        tags: TagMode::None,
+        ..Default::default()
+    };
+    fetch_local(&local_git, &remote_git, &opts).expect("fetch_local");
+
+    assert_eq!(pack_names(&local_git), pack_names(&remote_git));
     let fsck = git_cmd(&["fsck", "--strict"]).in_dir(&local_git).exec();
     assert!(fsck.ok(), "fsck after linked fetch: {}", fsck.stderr);
 }
