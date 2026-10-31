@@ -138,14 +138,6 @@ pub(crate) fn action_sort_keys() -> Action {
     Action::values(["date", "name", "version"]).tag("sort keys")
 }
 
-/// Configuration values for the key in the previous positional.
-pub(crate) fn action_config_value_for_key() -> Action {
-    Action::callback(|context| match context.args.first() {
-        Some(key) => action_config_values(key),
-        None => Action::default(),
-    })
-}
-
 /// Shell names `grit completions` accepts.
 pub(crate) fn shell_names() -> &'static [&'static str] {
     SHELLS
@@ -369,24 +361,20 @@ pub(crate) fn action_remotes() -> Action {
     })
 }
 
-/// Branch names as they exist on the remote named in the previous positional.
+/// Branch names on the remote typed as the command's first positional.
 ///
 /// `grit remote set-head` names a branch inside the remote, so `origin/main`
-/// from the remote-tracking refs is trimmed to `main`; without a remote yet
-/// typed, every remote's branches are offered.
+/// from the remote-tracking refs is trimmed to `main`.
 pub(crate) fn action_remote_branch_names() -> Action {
     Action::callback(|context| {
         let Some(repo) = repository(context) else {
             return Action::default();
         };
         let summaries = list_ref_summaries(&repo, &[RefNamespace::Remotes]).unwrap_or_default();
-        Action::values_described(remote_branch_values(
-            &summaries,
-            context.args.first().map(String::as_str),
-        ))
-        .style(BRANCH_STYLE)
-        .tag("remote branches")
-        .uid("git", "remote-branch", repository_uid_opts(&repo))
+        Action::values_described(remote_branch_values(&summaries, &context.args[0]))
+            .style(BRANCH_STYLE)
+            .tag("remote branches")
+            .uid("git", "remote-branch", repository_uid_opts(&repo))
     })
 }
 
@@ -404,13 +392,10 @@ pub(crate) fn action_fetch_refspecs() -> Action {
             .unwrap_or_default();
         let uid = repository_uid_opts(&repo);
         batch(vec![
-            Action::values_described(remote_branch_values(
-                &summaries,
-                context.args.first().map(String::as_str),
-            ))
-            .style(BRANCH_STYLE)
-            .tag("remote branches")
-            .uid("git", "remote-branch", uid.clone()),
+            Action::values_described(remote_branch_values(&summaries, &context.args[0]))
+                .style(BRANCH_STYLE)
+                .tag("remote branches")
+                .uid("git", "remote-branch", uid.clone()),
             Action::values_described(described(
                 summaries
                     .iter()
@@ -423,24 +408,18 @@ pub(crate) fn action_fetch_refspecs() -> Action {
     })
 }
 
-/// Remote-tracking branches in `summaries` as `(name on the remote, tip subject)`.
+/// Remote-tracking branches of `remote` in `summaries` as `(name on the
+/// remote, tip subject)`.
 ///
 /// A refspec source and `remote set-head` both name the branch the way the
 /// remote does, so the tracking ref's remote component is dropped.
-fn remote_branch_values(summaries: &[RefSummary], remote: Option<&str>) -> Vec<(String, String)> {
-    let prefix = remote.map(|remote| format!("{remote}/"));
+fn remote_branch_values(summaries: &[RefSummary], remote: &str) -> Vec<(String, String)> {
+    let prefix = format!("{remote}/");
     summaries
         .iter()
         .filter(|summary| summary.kind == RefKind::Remote)
         .filter_map(|summary| {
-            let name = match &prefix {
-                Some(prefix) => summary.name.strip_prefix(prefix.as_str())?.to_owned(),
-                None => summary
-                    .name
-                    .split_once('/')
-                    .map(|(_, name)| name)?
-                    .to_owned(),
-            };
+            let name = summary.name.strip_prefix(prefix.as_str())?.to_owned();
             Some((name, summary.subject.clone().unwrap_or_default()))
         })
         .collect()

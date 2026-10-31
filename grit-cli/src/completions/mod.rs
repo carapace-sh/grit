@@ -4,8 +4,10 @@
 //! integration scripts, and `grit completions <shell>` prints those scripts.
 //! Both use the same clap tree as the parser, so completion follows the CLI
 //! automatically: what an argument offers is declared next to the argument
-//! itself with `add = completer!(…)`, and commands only need wiring when the
-//! completion lives on the command rather than on one argument.
+//! itself with `add = completer!(…)`, and what a whole command's positionals
+//! offer is declared next to the command itself with
+//! `add = PositionalCompleter(vec![…])`. This module only adds global wiring:
+//! the environment hook, display groups, and the shell entry points.
 
 pub(crate) mod grit;
 
@@ -23,18 +25,19 @@ pub fn handle(args: &[String]) -> Option<String> {
     carapace_rs_clap::complete(command, args)
 }
 
-/// The command tree with the wiring carapace cannot attach to one argument.
+/// The command tree with the wiring carapace cannot attach to a definition.
 ///
 /// The tree is rebuilt per request; nothing is cached, so a rebuilt binary
 /// always completes against its own arguments.
 pub fn command() -> clap::Command {
-    let root =
-        crate::cli_command::full_cli_command("grit").pre_invoke(Arc::new(repository_context));
-    GROUPS.iter().fold(root, |root, (group, commands)| {
-        commands.iter().fold(root, |root, name| {
-            root.mut_subcommand(name, |sub| sub.completion_group(*group))
-        })
-    })
+    GROUPS.iter().fold(
+        crate::cli_command::full_cli_command("grit").pre_invoke(Arc::new(repository_context)),
+        |root, (group, commands)| {
+            commands.iter().fold(root, |root, name| {
+                root.mut_subcommand(name, |sub| sub.completion_group(*group))
+            })
+        },
+    )
 }
 
 /// Shell names `grit completions` accepts.
@@ -291,5 +294,74 @@ mod tests {
             handle(&["_carapace".to_owned(), "fish".to_owned()]).expect("snippet")
         });
         assert!(output.contains("_carapace"), "{output}");
+    }
+
+    #[test]
+    fn config_value_completes_for_the_typed_key() {
+        let contextualized = Context::new([""])
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "comp.test.complete")
+            .env("GIT_CONFIG_VALUE_0", "grit-completion");
+        let values = grit::action_config_values("comp.test.complete")
+            .invoke(&contextualized)
+            .to_export();
+        assert!(
+            values
+                .values
+                .iter()
+                .any(|value| value.value == "grit-completion"),
+            "the value completes for the key typed before it"
+        );
+    }
+
+    #[test]
+    fn config_positionals_wired_on_the_command() {
+        let output = complete(Shell::Zsh, &["config", ""]);
+        assert!(output.contains("user.name"), "{output}");
+
+        let output = complete(Shell::Zsh, &["config", "user.name", ""]);
+        assert!(
+            !output.contains("user.name\n"),
+            "after a key, values for it complete instead: {output}"
+        );
+
+        let output = complete(
+            Shell::Zsh,
+            &[
+                "-c",
+                "comp.test.complete=grit-completion",
+                "config",
+                "comp.test.complete",
+                "",
+            ],
+        );
+        assert!(output.contains("grit-completion"), "{output}");
+    }
+
+    #[test]
+    fn remote_scoped_positionals_wired_on_the_command() {
+        for words in [
+            vec!["fetch", ""],
+            vec!["pull", ""],
+            vec!["remote", "set-head", ""],
+        ] {
+            let output = complete(Shell::Zsh, &words);
+            assert!(
+                output.contains("origin"),
+                "remotes complete first: {output}"
+            );
+        }
+
+        for words in [
+            vec!["fetch", "origin"],
+            vec!["pull", "origin"],
+            vec!["remote", "set-head", "origin"],
+        ] {
+            let output = complete(Shell::Zsh, &words);
+            assert!(
+                !output.contains("origin/"),
+                "branch names scope to the typed remote: {output}"
+            );
+        }
     }
 }

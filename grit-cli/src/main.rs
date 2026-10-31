@@ -159,12 +159,16 @@ enum RemoteAction {
         dry_run: bool,
     },
     /// Set or delete `refs/remotes/<name>/HEAD`.
+    ///
+    /// The branch completes scoped to the remote named before it.
+    #[command(add = carapace_rs_clap::PositionalCompleter(vec![
+        grit::action_remotes(),
+        grit::action_remote_branch_names(),
+    ]))]
     SetHead {
         /// Configured remote name.
-        #[arg(add = completer!(grit::action_remotes()))]
         name: String,
         /// Short branch name (sets HEAD to `refs/remotes/<name>/<branch>`).
-        #[arg(add = completer!(grit::action_remote_branch_names()))]
         branch: Option<String>,
         /// Query the remote and set HEAD from its default branch.
         #[arg(long, conflicts_with_all = ["branch", "delete"])]
@@ -1825,6 +1829,12 @@ enum Command {
         dry_run: bool,
     },
     /// Download refs and objects from a remote.
+    ///
+    /// The refspecs complete scoped to the remote named before them.
+    #[command(add = carapace_rs_clap::PositionalCompleter(vec![
+        grit::action_remotes(),
+        grit::action_fetch_refspecs(),
+    ]))]
     Fetch {
         #[command(flatten)]
         fetch: commands::fetch_args::FetchArgs,
@@ -1834,6 +1844,12 @@ enum Command {
     /// In a snapshot checkout, refresh it onto the server's newest snapshot;
     /// `grit pull <branch>` brings `<branch>` onto the server's branch of that
     /// name, as the checkout sees it.
+    ///
+    /// The refspecs complete scoped to the remote named before them.
+    #[command(add = carapace_rs_clap::PositionalCompleter(vec![
+        grit::action_remotes(),
+        grit::action_fetch_refspecs(),
+    ]))]
     Pull {
         #[command(flatten)]
         fetch: commands::fetch_args::FetchArgs,
@@ -2100,6 +2116,12 @@ enum Command {
         shell: String,
     },
     /// Read, set, or list configuration values.
+    ///
+    /// Values complete for the key typed before them.
+    #[command(add = carapace_rs_clap::PositionalCompleter(vec![
+        grit::action_config_keys(),
+        Action::callback(|context| grit::action_config_values(&context.args[0])),
+    ]))]
     Config {
         /// Use the global (per-user) config file instead of this repository's.
         #[arg(long, conflicts_with_all = ["local", "system", "worktree", "file"])]
@@ -2267,10 +2289,8 @@ enum Command {
         )]
         dry_run: bool,
         /// The configuration key, e.g. user.name. Optional prefix with `--list`.
-        #[arg(add = completer!(grit::action_config_keys()))]
         key: Option<String>,
         /// The value to set. Omit to read the current value.
-        #[arg(add = completer!(grit::action_config_value_for_key()))]
         value: Option<String>,
     },
     /// Git credential helper backed by the Windows Credential Manager.
