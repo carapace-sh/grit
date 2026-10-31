@@ -56,9 +56,11 @@ mod usage_hints;
 use std::ffi::OsString;
 
 use anyhow::{bail, Result};
+use carapace_rs::Action;
 use carapace_rs_clap::completer;
 use clap::{Parser, Subcommand};
 
+use crate::completions::grit;
 use exit_status::ExitStatus;
 use grit_lib::command_runner::hooks::HookStdio;
 use output::{emit, OutputMode, OutputOptions, RenderContext};
@@ -117,7 +119,7 @@ enum RemoteAction {
         /// Short name for the remote (e.g. origin).
         name: String,
         /// The remote's URL or path.
-        #[arg(add = completer!(carapace_rs::Action::files([])))]
+        #[arg(add = completer!(Action::files([])))]
         url: String,
         /// Fetch from the remote after adding it.
         #[arg(long)]
@@ -126,10 +128,10 @@ enum RemoteAction {
     /// Set the fetch or push URL for an existing remote.
     SetUrl {
         /// Remote to update.
-        #[arg(add = completer!(crate::completions::actions::remotes()))]
+        #[arg(add = completer!(grit::action_remotes()))]
         name: String,
         /// New URL or path.
-        #[arg(add = completer!(carapace_rs::Action::files([])))]
+        #[arg(add = completer!(Action::files([])))]
         url: String,
         /// Update `pushurl` instead of `url`.
         #[arg(long)]
@@ -141,7 +143,7 @@ enum RemoteAction {
     /// Remove a remote and its remote-tracking refs.
     Remove {
         /// Remote name to remove.
-        #[arg(add = completer!(crate::completions::actions::remotes()))]
+        #[arg(add = completer!(grit::action_remotes()))]
         name: String,
         /// Report changes without writing config or refs.
         #[arg(long)]
@@ -150,7 +152,7 @@ enum RemoteAction {
     /// Delete stale remote-tracking refs without fetching.
     Prune {
         /// Configured remote name.
-        #[arg(add = completer!(crate::completions::actions::remotes()))]
+        #[arg(add = completer!(grit::action_remotes()))]
         name: String,
         /// Report refs that would be pruned without deleting them.
         #[arg(long)]
@@ -159,10 +161,10 @@ enum RemoteAction {
     /// Set or delete `refs/remotes/<name>/HEAD`.
     SetHead {
         /// Configured remote name.
-        #[arg(add = completer!(crate::completions::actions::remotes()))]
+        #[arg(add = completer!(grit::action_remotes()))]
         name: String,
         /// Short branch name (sets HEAD to `refs/remotes/<name>/<branch>`).
-        #[arg(add = completer!(crate::completions::actions::remote_branch_names()))]
+        #[arg(add = completer!(grit::action_remote_branch_names()))]
         branch: Option<String>,
         /// Query the remote and set HEAD from its default branch.
         #[arg(long, conflicts_with_all = ["branch", "delete"])]
@@ -177,7 +179,7 @@ enum RemoteAction {
     /// Summarize a remote (URLs, branches, pull config).
     Show {
         /// Configured remote name.
-        #[arg(add = completer!(crate::completions::actions::remotes()))]
+        #[arg(add = completer!(grit::action_remotes()))]
         name: String,
         /// Use local remote-tracking refs only; do not contact the remote.
         #[arg(long = "no-query")]
@@ -189,7 +191,7 @@ enum RemoteAction {
     /// Rename an existing remote.
     Rename {
         /// Current remote name.
-        #[arg(add = completer!(crate::completions::actions::remotes()))]
+        #[arg(add = completer!(grit::action_remotes()))]
         old: String,
         /// New remote name.
         new: String,
@@ -200,7 +202,7 @@ enum RemoteAction {
     /// List references on a remote (like `git ls-remote`).
     Refs {
         /// Configured remote name or a literal URL/path.
-        #[arg(add = completer!(crate::completions::actions::remotes()))]
+        #[arg(add = completer!(grit::action_remotes()))]
         remote_or_url: String,
         /// Only show refs under `refs/heads/`.
         #[arg(long)]
@@ -239,7 +241,7 @@ enum ReflogAction {
     Delete {
         /// Reflog selectors (`main@{1}`, `HEAD@{0}`, …).
         #[arg(required = true, value_name = "REF@{N}")]
-        #[arg(add = completer!(crate::completions::actions::reflog_selectors()))]
+        #[arg(add = completer!(grit::action_reflog_selectors()))]
         specs: Vec<String>,
     },
     /// Drop reflog entries older than configured or explicit cutoffs.
@@ -315,11 +317,11 @@ enum GcAction {
 #[derive(Debug, Subcommand)]
 enum IgnoreAction {
     /// Print whether paths match exclude rules.
-    #[command(add = carapace_rs_clap::DashAnyCompleter::new(crate::completions::actions::paths()))]
+    #[command(add = carapace_rs_clap::DashAnyCompleter::new(grit::action_paths()))]
     Check {
         /// Paths to query (repository-relative or from the current directory).
         #[arg(value_name = "PATH")]
-        #[arg(add = completer!(crate::completions::actions::paths()))]
+        #[arg(add = completer!(grit::action_paths()))]
         paths: Vec<String>,
         /// Also list paths that are not ignored.
         #[arg(long)]
@@ -348,7 +350,7 @@ enum StashAction {
             action = clap::ArgAction::Append,
             conflicts_with = "include_untracked"
         )]
-        #[arg(add = completer!(crate::completions::actions::hunks()))]
+        #[arg(add = completer!(grit::action_hunks()))]
         hunks: Vec<String>,
         /// Stash only unstaged line ranges (`path:start-end`).
         #[arg(
@@ -357,7 +359,7 @@ enum StashAction {
             action = clap::ArgAction::Append,
             conflicts_with = "include_untracked"
         )]
-        #[arg(add = completer!(crate::completions::actions::line_ranges()))]
+        #[arg(add = completer!(grit::action_line_ranges()))]
         lines: Vec<String>,
         /// Preview stash without updating refs, index, or worktree.
         #[arg(long = "dry-run")]
@@ -384,7 +386,7 @@ enum StashAction {
     /// Show the summary or patch for a stash entry.
     Show {
         /// Stash index (`0` is newest) or `stash@{n}`.
-        #[arg(add = completer!(crate::completions::actions::stashes()))]
+        #[arg(add = completer!(grit::action_stashes()))]
         index: Option<String>,
         /// Show a diffstat summary (default).
         #[arg(long = "stat")]
@@ -401,7 +403,7 @@ enum StashAction {
         /// New branch name.
         name: String,
         /// Stash index (`0` is newest) or `stash@{n}`.
-        #[arg(add = completer!(crate::completions::actions::stashes()))]
+        #[arg(add = completer!(grit::action_stashes()))]
         index: Option<String>,
     },
     /// Remove every stash entry.
@@ -416,7 +418,7 @@ enum StashAction {
     /// Apply a stash entry without removing it.
     Apply {
         /// Stash index (`0` is newest) or `stash@{n}`.
-        #[arg(add = completer!(crate::completions::actions::stashes()))]
+        #[arg(add = completer!(grit::action_stashes()))]
         index: Option<String>,
         /// Restore the stashed index as well as the worktree.
         #[arg(long = "index")]
@@ -425,7 +427,7 @@ enum StashAction {
     /// Apply a stash entry and remove it when there are no conflicts.
     Pop {
         /// Stash index (`0` is newest) or `stash@{n}`.
-        #[arg(add = completer!(crate::completions::actions::stashes()))]
+        #[arg(add = completer!(grit::action_stashes()))]
         index: Option<String>,
         /// Restore the stashed index as well as the worktree.
         #[arg(long = "index")]
@@ -434,7 +436,7 @@ enum StashAction {
     /// Remove a stash entry without applying it.
     Drop {
         /// Stash index (`0` is newest) or `stash@{n}`.
-        #[arg(add = completer!(crate::completions::actions::stashes()))]
+        #[arg(add = completer!(grit::action_stashes()))]
         index: Option<String>,
     },
 }
@@ -445,7 +447,7 @@ enum HistoryAction {
     /// Remove a commit and replay descendants onto its parent.
     Drop {
         /// Commit to remove (revision spec).
-        #[arg(add = completer!(crate::completions::actions::revisions()))]
+        #[arg(add = completer!(grit::action_revisions()))]
         commit: String,
         #[command(flatten)]
         shared: commands::history::HistoryRewriteArgs,
@@ -453,7 +455,7 @@ enum HistoryAction {
     /// Reorder a commit on the first-parent chain of `HEAD`.
     Move {
         /// Commit to move (revision spec).
-        #[arg(add = completer!(crate::completions::actions::revisions()))]
+        #[arg(add = completer!(grit::action_revisions()))]
         commit: String,
         /// Place the commit immediately before this revision.
         #[arg(long = "before", conflicts_with = "after")]
@@ -467,7 +469,7 @@ enum HistoryAction {
     /// Replace a commit message and replay descendants onto the new history.
     Reword {
         /// Commit to reword (revision spec).
-        #[arg(add = completer!(crate::completions::actions::revisions()))]
+        #[arg(add = completer!(grit::action_revisions()))]
         commit: String,
         #[command(flatten)]
         message: message_input::MessageInputArgs,
@@ -477,20 +479,20 @@ enum HistoryAction {
         shared: commands::history::HistoryRewriteArgs,
     },
     /// Apply staged changes onto a commit and replay descendants.
-    #[command(add = carapace_rs_clap::DashAnyCompleter::new(crate::completions::actions::paths()))]
+    #[command(add = carapace_rs_clap::DashAnyCompleter::new(grit::action_paths()))]
     Fixup {
         /// Commit to fix up (revision spec).
-        #[arg(add = completer!(crate::completions::actions::revisions()))]
+        #[arg(add = completer!(grit::action_revisions()))]
         commit: String,
         #[command(flatten)]
         message: message_input::MessageInputArgs,
         /// Unstaged hunk ids to fold (`grit diff --unstaged --json`, comma-separated or repeated).
         #[arg(long = "hunks", value_name = "ID,...", action = clap::ArgAction::Append)]
-        #[arg(add = completer!(crate::completions::actions::hunks()))]
+        #[arg(add = completer!(grit::action_hunks()))]
         hunks: Vec<String>,
         /// Unstaged new-side line ranges to fold (`path:start-end` or `path:line`, comma-separated or repeated).
         #[arg(long = "lines", value_name = "PATH:START-END", action = clap::ArgAction::Append)]
-        #[arg(add = completer!(crate::completions::actions::line_ranges()))]
+        #[arg(add = completer!(grit::action_line_ranges()))]
         lines: Vec<String>,
         #[command(flatten)]
         pathspecs: crate::pathspec_args::TrailingPathspecArgs,
@@ -501,7 +503,7 @@ enum HistoryAction {
     Absorb {
         /// Oldest commit boundary (exclusive) for candidate commits.
         #[arg(long = "base")]
-        #[arg(add = completer!(crate::completions::actions::revisions()))]
+        #[arg(add = completer!(grit::action_revisions()))]
         base: Option<String>,
         #[command(flatten)]
         shared: commands::history::HistoryRewriteArgs,
@@ -510,11 +512,11 @@ enum HistoryAction {
     Rebase {
         /// Commits to replay are those reachable from `HEAD` but not from this revision (defaults to `@{upstream}`).
         #[arg(value_name = "UPSTREAM")]
-        #[arg(add = completer!(crate::completions::actions::revisions()))]
+        #[arg(add = completer!(grit::action_revisions()))]
         upstream: Option<String>,
         /// Replay onto this commit instead of `UPSTREAM`.
         #[arg(long = "onto", value_name = "REV")]
-        #[arg(add = completer!(crate::completions::actions::revisions()))]
+        #[arg(add = completer!(grit::action_revisions()))]
         onto: Option<String>,
         /// Finish a rebase stopped on conflicts after resolving and staging paths.
         #[arg(long = "continue", conflicts_with_all = ["abort", "skip", "upstream", "onto", "check"])]
@@ -531,10 +533,10 @@ enum HistoryAction {
         shared: commands::history::HistoryRewriteArgs,
     },
     /// Peel path-limited changes out of a commit into a new parent and replay descendants.
-    #[command(add = carapace_rs_clap::DashAnyCompleter::new(crate::completions::actions::paths()))]
+    #[command(add = carapace_rs_clap::DashAnyCompleter::new(grit::action_paths()))]
     Split {
         /// Commit to split (revision spec).
-        #[arg(add = completer!(crate::completions::actions::revisions()))]
+        #[arg(add = completer!(grit::action_revisions()))]
         commit: String,
         #[command(flatten)]
         message: message_input::MessageInputArgs,
@@ -555,7 +557,7 @@ enum HistoryAction {
     Squash {
         /// Revision range (same syntax as `git rev-list`, for example `base..tip`).
         #[arg(required = true)]
-        #[arg(add = completer!(crate::completions::actions::revision_ranges()))]
+        #[arg(add = completer!(grit::action_revision_ranges()))]
         range: Vec<String>,
         #[command(flatten)]
         message: message_input::MessageInputArgs,
@@ -578,13 +580,13 @@ enum NotesAction {
     /// Show the note for a revision.
     Show {
         /// Commit (or other object) to show the note for.
-        #[arg(add = completer!(crate::completions::actions::revisions()))]
+        #[arg(add = completer!(grit::action_revisions()))]
         rev: String,
     },
     /// Add or replace a note on a revision.
     Add {
         /// Revision to attach the note to.
-        #[arg(add = completer!(crate::completions::actions::revisions()))]
+        #[arg(add = completer!(grit::action_revisions()))]
         rev: String,
         #[command(flatten)]
         message: message_input::MessageInputArgs,
@@ -596,7 +598,7 @@ enum NotesAction {
     Remove {
         /// Revisions whose notes should be removed.
         #[arg(value_name = "REV")]
-        #[arg(add = completer!(crate::completions::actions::revisions()))]
+        #[arg(add = completer!(grit::action_revisions()))]
         revs: Vec<String>,
     },
 }
@@ -609,19 +611,19 @@ enum WorktreeAction {
     /// Create a linked worktree at `path`.
     Add {
         /// Directory for the new working tree.
-        #[arg(add = completer!(carapace_rs::Action::directories()))]
+        #[arg(add = completer!(Action::directories()))]
         path: std::path::PathBuf,
         /// Commit or branch to check out (defaults to `HEAD`).
         #[arg(value_name = "REV")]
-        #[arg(add = completer!(crate::completions::actions::revisions()))]
+        #[arg(add = completer!(grit::action_revisions()))]
         start_point: Option<String>,
         /// Create and check out a new branch.
         #[arg(short = 'b', long = "branch", value_name = "NAME", conflicts_with_all = ["force_branch", "detach"])]
-        #[arg(add = completer!(crate::completions::actions::local_branches()))]
+        #[arg(add = completer!(grit::action_local_branches()))]
         branch: Option<String>,
         /// Create or reset a branch to the start point (`-B`).
         #[arg(short = 'B', value_name = "NAME", conflicts_with_all = ["branch", "detach"])]
-        #[arg(add = completer!(crate::completions::actions::local_branches()))]
+        #[arg(add = completer!(grit::action_local_branches()))]
         force_branch: Option<String>,
         /// Check out in detached HEAD mode.
         #[arg(long = "detach", conflicts_with_all = ["branch", "force_branch"])]
@@ -645,7 +647,7 @@ enum WorktreeAction {
     /// Remove a linked worktree.
     Remove {
         /// Path to the worktree to remove.
-        #[arg(add = completer!(crate::completions::actions::worktrees()))]
+        #[arg(add = completer!(grit::action_worktrees()))]
         path: std::path::PathBuf,
         /// Remove even when the worktree has local changes or is locked.
         #[arg(short, long)]
@@ -660,7 +662,7 @@ enum WorktreeAction {
     /// Mark a linked worktree as locked (prevents accidental removal).
     Lock {
         /// Path to the linked worktree.
-        #[arg(add = completer!(crate::completions::actions::worktrees()))]
+        #[arg(add = completer!(grit::action_worktrees()))]
         path: std::path::PathBuf,
         /// Optional reason stored in the lock file.
         #[arg(long)]
@@ -669,16 +671,16 @@ enum WorktreeAction {
     /// Clear the lock on a linked worktree.
     Unlock {
         /// Path to the linked worktree.
-        #[arg(add = completer!(crate::completions::actions::worktrees()))]
+        #[arg(add = completer!(grit::action_worktrees()))]
         path: std::path::PathBuf,
     },
     /// Move a linked worktree to a new directory.
     Move {
         /// Current worktree path.
-        #[arg(add = completer!(crate::completions::actions::worktrees()))]
+        #[arg(add = completer!(grit::action_worktrees()))]
         worktree: std::path::PathBuf,
         /// New path for the working tree.
-        #[arg(add = completer!(carapace_rs::Action::directories()))]
+        #[arg(add = completer!(Action::directories()))]
         new_path: std::path::PathBuf,
         /// Allow move when the worktree is locked.
         #[arg(short, long)]
@@ -691,7 +693,7 @@ enum WorktreeAction {
     Repair {
         /// Linked worktree roots to repair (default: all registered linked worktrees).
         #[arg(value_name = "PATH")]
-        #[arg(add = completer!(carapace_rs::Action::directories()))]
+        #[arg(add = completer!(Action::directories()))]
         paths: Vec<std::path::PathBuf>,
         /// Report repairs without writing files.
         #[arg(long)]
@@ -705,11 +707,11 @@ enum BundleAction {
     /// Write a bundle file from revision specs.
     Create {
         /// Output bundle path.
-        #[arg(add = completer!(carapace_rs::Action::files([])))]
+        #[arg(add = completer!(Action::files([])))]
         file: String,
         /// Commits or ref ranges to include (same rules as `grit log`).
         #[arg(value_name = "REV", conflicts_with = "all")]
-        #[arg(add = completer!(crate::completions::actions::revision_ranges()))]
+        #[arg(add = completer!(grit::action_revision_ranges()))]
         revs: Vec<String>,
         /// Include every ref tip in the bundle header (`HEAD`, all branches and tags).
         #[arg(long)]
@@ -721,13 +723,13 @@ enum BundleAction {
     /// Check that a bundle file is well-formed.
     Verify {
         /// Bundle file to verify.
-        #[arg(add = completer!(carapace_rs::Action::files([])))]
+        #[arg(add = completer!(Action::files([])))]
         file: String,
     },
     /// List refs recorded in a bundle header.
     List {
         /// Bundle file to read.
-        #[arg(add = completer!(carapace_rs::Action::files([])))]
+        #[arg(add = completer!(Action::files([])))]
         file: String,
         #[command(flatten)]
         limit: limit_args::LimitArgs,
@@ -735,7 +737,7 @@ enum BundleAction {
     /// Ingest a bundle pack into the current repository.
     Unbundle {
         /// Bundle file to read.
-        #[arg(add = completer!(carapace_rs::Action::files([])))]
+        #[arg(add = completer!(Action::files([])))]
         file: String,
         /// Verify and list ref updates without ingesting objects or writing refs.
         #[arg(long = "dry-run")]
@@ -754,7 +756,7 @@ enum HooksAction {
     /// Run a hook by name (passes `--` arguments through to the script).
     Run {
         /// Hook basename (e.g. `pre-commit`).
-        #[arg(add = completer!(crate::completions::actions::hooks()))]
+        #[arg(add = completer!(grit::action_hooks()))]
         name: String,
         /// Arguments forwarded to the hook after `--`.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -787,7 +789,7 @@ enum SliceAction {
         name: String,
         /// A path in the slice (repeatable).
         #[arg(short = 'p', long = "path", value_name = "PATH")]
-        #[arg(add = completer!(crate::completions::actions::paths()))]
+        #[arg(add = completer!(grit::action_paths()))]
         paths: Vec<String>,
         /// What the slice is for.
         #[arg(short = 'd', long, value_name = "TEXT")]
@@ -799,11 +801,11 @@ enum SliceAction {
         name: String,
         /// A path to add (repeatable).
         #[arg(long, value_name = "PATH")]
-        #[arg(add = completer!(crate::completions::actions::paths()))]
+        #[arg(add = completer!(grit::action_paths()))]
         add: Vec<String>,
         /// A path to remove (repeatable).
         #[arg(long, value_name = "PATH")]
-        #[arg(add = completer!(crate::completions::actions::paths()))]
+        #[arg(add = completer!(grit::action_paths()))]
         remove: Vec<String>,
         /// A new description.
         #[arg(short = 'd', long, value_name = "TEXT")]
@@ -861,21 +863,21 @@ enum Command {
     /// Create a new, empty repository.
     Init {
         /// Where to create the repository (defaults to the current directory).
-        #[arg(add = completer!(carapace_rs::Action::directories()))]
+        #[arg(add = completer!(Action::directories()))]
         path: Option<String>,
         /// Create a bare repository (no working tree).
         #[arg(long, conflicts_with = "separate_git_dir")]
         bare: bool,
         /// Ref storage backend for the new repository.
         #[arg(long, value_name = "FORMAT", default_value = "files")]
-        #[arg(add = completer!(crate::completions::actions::ref_formats()))]
+        #[arg(add = completer!(grit::action_ref_formats()))]
         ref_format: grit_lib::refs::ref_storage::RefStorageFormat,
         /// Initial branch name (overrides `init.defaultBranch` from config).
         #[arg(short = 'b', long = "initial-branch", value_name = "NAME")]
         initial_branch: Option<String>,
         /// Place the git directory here and link from the work tree via a gitfile.
         #[arg(long = "separate-git-dir", value_name = "DIR", conflicts_with = "bare")]
-        #[arg(add = completer!(carapace_rs::Action::directories()))]
+        #[arg(add = completer!(Action::directories()))]
         separate_git_dir: Option<std::path::PathBuf>,
         /// Object hash algorithm for the new repository (default SHA-1; omitted on reinit preserves format).
         #[arg(
@@ -883,11 +885,11 @@ enum Command {
             value_name = "ALGO",
             value_parser = parse_init_object_format
         )]
-        #[arg(add = completer!(crate::completions::actions::object_formats()))]
+        #[arg(add = completer!(grit::action_object_formats()))]
         object_format: Option<grit_lib::objects::HashAlgo>,
     },
     /// Start work on a repository from a snapshot of its main branch (or some of its paths) instead of a clone.
-    #[command(add = carapace_rs_clap::DashAnyCompleter::new(crate::completions::actions::paths()))]
+    #[command(add = carapace_rs_clap::DashAnyCompleter::new(grit::action_paths()))]
     Checkout {
         /// The repository on a server that offers snapshot checkouts (`grit serve`).
         url: String,
@@ -895,18 +897,18 @@ enum Command {
         slice: Option<String>,
         /// Check out only this path, plus the files in the directories above it (repeatable).
         #[arg(short = 'p', long = "path", value_name = "PATH")]
-        #[arg(add = completer!(crate::completions::actions::paths()))]
+        #[arg(add = completer!(grit::action_paths()))]
         paths: Vec<String>,
         /// Directory to check out into (defaults to the repository name).
         #[arg(long, value_name = "DIR")]
-        #[arg(add = completer!(carapace_rs::Action::directories()))]
+        #[arg(add = completer!(Action::directories()))]
         into: Option<std::path::PathBuf>,
     },
     /// Send a snapshot checkout's branches back to the server, grafted onto its real history.
     Checkin {
         /// Branches to check in (default: every branch with commits on top of the snapshot).
         #[arg(value_name = "BRANCH")]
-        #[arg(add = completer!(crate::completions::actions::local_branches()))]
+        #[arg(add = completer!(grit::action_local_branches()))]
         branches: Vec<String>,
         /// Replace a server branch even where that drops commits it has.
         #[arg(short = 'f', long)]
@@ -916,7 +918,7 @@ enum Command {
     Integrate {
         /// The branch to merge.
         #[arg(value_name = "BRANCH")]
-        #[arg(add = completer!(crate::completions::actions::revisions()))]
+        #[arg(add = completer!(grit::action_revisions()))]
         branch: String,
     },
     /// Named sets of paths to check out together, kept on the server's target branch.
@@ -932,7 +934,7 @@ enum Command {
         /// The repository to clone (URL or local path).
         url: String,
         /// Directory to clone into (defaults to the repository name).
-        #[arg(add = completer!(carapace_rs::Action::directories()))]
+        #[arg(add = completer!(Action::directories()))]
         dir: Option<String>,
         /// Truncate fetched history to this many commits (`git clone --depth`).
         #[arg(long, value_name = "N", conflicts_with = "shallow")]
@@ -976,7 +978,7 @@ enum Command {
         action: Option<RemoteAction>,
     },
     /// Show recent commits reachable from HEAD.
-    #[command(add = carapace_rs_clap::DashAnyCompleter::new(crate::completions::actions::paths()))]
+    #[command(add = carapace_rs_clap::DashAnyCompleter::new(grit::action_paths()))]
     Log {
         #[command(flatten)]
         rev: rev_select::RevSelectArgs,
@@ -1015,7 +1017,7 @@ enum Command {
         graph_unicode: bool,
     },
     /// List or count commits matching revision ranges.
-    #[command(add = carapace_rs_clap::DashAnyCompleter::new(crate::completions::actions::paths()))]
+    #[command(add = carapace_rs_clap::DashAnyCompleter::new(grit::action_paths()))]
     Revs {
         #[command(flatten)]
         rev: rev_select::RevSelectArgs,
@@ -1032,10 +1034,10 @@ enum Command {
     #[command(name = "merge-base")]
     MergeBase {
         /// First commit or ref.
-        #[arg(add = completer!(crate::completions::actions::revisions()))]
+        #[arg(add = completer!(grit::action_revisions()))]
         a: String,
         /// Second commit or ref.
-        #[arg(add = completer!(crate::completions::actions::revisions()))]
+        #[arg(add = completer!(grit::action_revisions()))]
         b: String,
         /// List every minimal merge base (criss-cross histories).
         #[arg(long)]
@@ -1048,7 +1050,7 @@ enum Command {
     Reflog {
         /// Ref to show (defaults to `HEAD`).
         #[arg(value_name = "REF")]
-        #[arg(add = completer!(crate::completions::actions::revisions()))]
+        #[arg(add = completer!(grit::action_revisions()))]
         reference: Option<String>,
         /// Show at most this many entries (newest first).
         #[arg(short = 'n', long = "max-count", alias = "limit", value_name = "N")]
@@ -1072,19 +1074,19 @@ enum Command {
         action: Option<ReflogAction>,
     },
     /// Show who last modified each line of a file.
-    #[command(add = carapace_rs_clap::DashAnyCompleter::new(crate::completions::actions::paths()))]
+    #[command(add = carapace_rs_clap::DashAnyCompleter::new(grit::action_paths()))]
     Blame {
         /// Optional revision before the file (use `--` to disambiguate paths that look like refs).
         #[arg(value_name = "REV")]
-        #[arg(add = completer!(crate::completions::actions::revisions()))]
+        #[arg(add = completer!(grit::action_revisions()))]
         rev_pos: Option<String>,
         /// File to blame (repository-relative).
         #[arg(value_name = "FILE", last = true, allow_hyphen_values = true)]
-        #[arg(add = completer!(carapace_rs::Action::files([])))]
+        #[arg(add = completer!(Action::files([])))]
         file: Option<String>,
         /// Blame at this revision instead of `HEAD`.
         #[arg(long)]
-        #[arg(add = completer!(crate::completions::actions::revisions()))]
+        #[arg(add = completer!(grit::action_revisions()))]
         rev: Option<String>,
         /// Limit output with a Git-style line range (`-L` / `--lines`).
         #[arg(
@@ -1099,11 +1101,11 @@ enum Command {
         first_parent: bool,
         /// Ignore this revision when attributing lines (repeatable).
         #[arg(long = "ignore-rev", value_name = "REV")]
-        #[arg(add = completer!(crate::completions::actions::revisions()))]
+        #[arg(add = completer!(grit::action_revisions()))]
         ignore_rev: Vec<String>,
         /// Read revision oids to ignore from a file (repeatable; `""` clears prior entries).
         #[arg(long = "ignore-revs-file", value_name = "FILE")]
-        #[arg(add = completer!(carapace_rs::Action::files([])))]
+        #[arg(add = completer!(Action::files([])))]
         ignore_revs_file: Vec<String>,
         /// With `--json`, emit grouped `hunks[]` instead of per-line `lines[]`.
         #[arg(long)]
@@ -1117,7 +1119,7 @@ enum Command {
     },
     /// Show changes as a diff. No argument: uncommitted changes; with a commit:
     /// the change that commit introduced; with two commits (or `A..B`) diff their trees.
-    #[command(add = carapace_rs_clap::DashAnyCompleter::new(crate::completions::actions::paths()))]
+    #[command(add = carapace_rs_clap::DashAnyCompleter::new(grit::action_paths()))]
     Diff {
         /// Compare two filesystem paths outside any repository (like `git diff --no-index`).
         #[arg(long = "no-index")]
@@ -1130,7 +1132,7 @@ enum Command {
         unstaged: bool,
         /// Compare the worktree to this ref's tree instead of HEAD (no commit arguments).
         #[arg(long = "against", value_name = "REF")]
-        #[arg(add = completer!(crate::completions::actions::revisions()))]
+        #[arg(add = completer!(grit::action_revisions()))]
         against: Option<String>,
         /// Exit with 1 when there are changes (errors exit 2).
         #[arg(long = "exit-code")]
@@ -1140,7 +1142,7 @@ enum Command {
         quiet: bool,
         /// One commit (that commit's patch), two commits (tree diff), or a range `A..B` / `A...B`.
         #[arg(value_name = "COMMIT")]
-        #[arg(add = completer!(crate::completions::actions::revision_ranges()))]
+        #[arg(add = completer!(grit::action_revision_ranges()))]
         commits: Vec<String>,
         #[command(flatten)]
         pathspecs: pathspec_args::TrailingPathspecArgs,
@@ -1150,15 +1152,15 @@ enum Command {
         line_format: diff_args::DiffCompareArgs,
     },
     /// Show information about a commit, tag, or branch (defaults to HEAD).
-    #[command(add = carapace_rs_clap::DashAnyCompleter::new(crate::completions::actions::paths()))]
+    #[command(add = carapace_rs_clap::DashAnyCompleter::new(grit::action_paths()))]
     Show {
         /// Commits, tags, branches, or `rev:path` specs to show.
         #[arg(value_name = "OBJECT")]
-        #[arg(add = completer!(crate::completions::actions::revisions()))]
+        #[arg(add = completer!(grit::action_revisions()))]
         objects: Vec<String>,
         /// Merge commit diffs: `combined` (default) or `first-parent`.
         #[arg(long = "diff-merges", value_name = "MODE", default_value = "combined")]
-        #[arg(add = completer!(crate::completions::actions::diff_merges()))]
+        #[arg(add = completer!(grit::action_diff_merges()))]
         diff_merges: String,
         #[command(flatten)]
         pathspecs: pathspec_args::TrailingPathspecArgs,
@@ -1167,7 +1169,7 @@ enum Command {
     },
     /// Show what's changed and where you are (this is the default).
     #[command(alias = "st")]
-    #[command(add = carapace_rs_clap::DashAnyCompleter::new(crate::completions::actions::paths()))]
+    #[command(add = carapace_rs_clap::DashAnyCompleter::new(grit::action_paths()))]
     Status {
         #[command(flatten)]
         status: commands::status::StatusCliArgs,
@@ -1202,22 +1204,22 @@ enum Command {
         non_executable: bool,
         /// Apply a unified diff to the index (`git apply --cached`). Use `-` for stdin.
         #[arg(long = "patch-file", value_name = "FILE|-")]
-        #[arg(add = completer!(carapace_rs::Action::files([])))]
+        #[arg(add = completer!(Action::files([])))]
         patch_file: Option<String>,
         /// Stage only the listed hunk ids from `grit diff --json` (comma-separated, repeatable).
         #[arg(long = "hunks", value_name = "ID,...", action = clap::ArgAction::Append)]
-        #[arg(add = completer!(crate::completions::actions::hunks()))]
+        #[arg(add = completer!(grit::action_hunks()))]
         hunks: Vec<String>,
         /// Stage only new-side line ranges from `grit diff --json` (`path:start-end`, repeatable).
         #[arg(long = "lines", value_name = "PATH:START-END", action = clap::ArgAction::Append)]
-        #[arg(add = completer!(crate::completions::actions::line_ranges()))]
+        #[arg(add = completer!(grit::action_line_ranges()))]
         lines: Vec<String>,
         /// Unified context lines when resolving `--hunks` / `--lines` (match `grit diff -U`; default 3).
         #[arg(short = 'U', long = "unified", value_name = "N")]
         unified_context: Option<usize>,
     },
     /// Remove tracked paths from the working tree and index.
-    #[command(add = carapace_rs_clap::DashAnyCompleter::new(crate::completions::actions::paths()))]
+    #[command(add = carapace_rs_clap::DashAnyCompleter::new(grit::action_paths()))]
     Rm {
         #[command(flatten)]
         pathspecs: pathspec_args::PathspecArgs,
@@ -1235,11 +1237,11 @@ enum Command {
         ignore_unmatch: bool,
     },
     /// Rename or move tracked paths.
-    #[command(add = carapace_rs_clap::DashAnyCompleter::new(crate::completions::actions::paths()))]
+    #[command(add = carapace_rs_clap::DashAnyCompleter::new(grit::action_paths()))]
     Mv {
         /// Source path(s) and final destination (last argument).
         #[arg(value_name = "PATH")]
-        #[arg(add = completer!(crate::completions::actions::paths()))]
+        #[arg(add = completer!(grit::action_paths()))]
         paths: Vec<String>,
         /// Replace existing files at the destination.
         #[arg(short = 'f', long = "force")]
@@ -1249,7 +1251,7 @@ enum Command {
         dry_run: bool,
     },
     /// Remove untracked files from the working tree.
-    #[command(add = carapace_rs_clap::DashAnyCompleter::new(crate::completions::actions::paths()))]
+    #[command(add = carapace_rs_clap::DashAnyCompleter::new(grit::action_paths()))]
     Clean {
         #[command(flatten)]
         pathspecs: pathspec_args::PathspecArgs,
@@ -1334,7 +1336,7 @@ enum Command {
     PatchId {
         /// Commits or revisions to hash (merge commits are skipped).
         #[arg(value_name = "REV")]
-        #[arg(add = completer!(crate::completions::actions::revision_ranges()))]
+        #[arg(add = completer!(grit::action_revision_ranges()))]
         revs: Vec<String>,
         /// Use legacy unstable patch-ID algorithm (Git 1.9 and older).
         #[arg(long)]
@@ -1350,7 +1352,7 @@ enum Command {
             id = "specs",
             conflicts_with = "verify"
         )]
-        #[arg(add = completer!(crate::completions::actions::revision_ranges()))]
+        #[arg(add = completer!(grit::action_revision_ranges()))]
         specs: Vec<String>,
         /// Print abbreviated object ids.
         #[arg(long)]
@@ -1369,7 +1371,7 @@ enum Command {
             id = "verify",
             conflicts_with_all = ["abbrev_ref", "symbolic_full_name", "specs"]
         )]
-        #[arg(add = completer!(crate::completions::actions::revisions()))]
+        #[arg(add = completer!(grit::action_revisions()))]
         verify_spec: Option<String>,
         /// With `--verify`, answer yes/no via exit status only (no stdout/stderr).
         #[arg(short = 'q', long = "quiet", requires = "verify")]
@@ -1378,11 +1380,11 @@ enum Command {
     /// Show blob, tree, commit, or tag contents for a revision spec.
     Cat {
         /// Object or revision spec (`HEAD`, `main:path`, `v1^{commit}`, …).
-        #[arg(add = completer!(crate::completions::actions::revisions()))]
+        #[arg(add = completer!(grit::action_revisions()))]
         spec: String,
     },
     /// Stage every change and record a new commit.
-    #[command(add = carapace_rs_clap::DashAnyCompleter::new(crate::completions::actions::paths()))]
+    #[command(add = carapace_rs_clap::DashAnyCompleter::new(grit::action_paths()))]
     Commit {
         /// Commit message (you can also pass it with -m).
         #[arg(
@@ -1404,7 +1406,7 @@ enum Command {
         author_date: Option<String>,
         /// Append a commit trailer (`key=value` or `key: value`); repeat for multiple trailers.
         #[arg(long = "trailer", value_name = "KEY=VALUE", allow_hyphen_values = true)]
-        #[arg(add = completer!(crate::completions::actions::trailers()))]
+        #[arg(add = completer!(grit::action_trailers()))]
         trailers: Vec<String>,
         /// Append a `Signed-off-by` trailer for the committer.
         #[arg(short = 's', long = "signoff")]
@@ -1414,7 +1416,7 @@ enum Command {
         reset_author: bool,
         /// Reuse the log message and author from a commit (`-C` / `--reuse-message`).
         #[arg(short = 'C', long = "reuse-message", value_name = "COMMIT")]
-        #[arg(add = completer!(crate::completions::actions::revisions()))]
+        #[arg(add = completer!(grit::action_revisions()))]
         reuse_message: Option<String>,
         /// Sign the commit with the configured signing key.
         #[arg(short = 'S', long = "gpg-sign")]
@@ -1453,7 +1455,7 @@ enum Command {
             value_name = "FILE|-",
             conflicts_with_all = ["hunks", "lines", "all", "staged", "paths", "pathspec_from_file"]
         )]
-        #[arg(add = completer!(carapace_rs::Action::files([])))]
+        #[arg(add = completer!(Action::files([])))]
         patch_file: Option<String>,
         /// Commit only the listed hunk ids from `grit diff --json` (comma-separated, repeatable).
         #[arg(
@@ -1462,7 +1464,7 @@ enum Command {
             action = clap::ArgAction::Append,
             conflicts_with_all = ["patch_file", "all", "staged"]
         )]
-        #[arg(add = completer!(crate::completions::actions::hunks()))]
+        #[arg(add = completer!(grit::action_hunks()))]
         hunks: Vec<String>,
         /// Commit only line ranges from the unstaged diff (same format as `grit add --lines`).
         #[arg(
@@ -1471,7 +1473,7 @@ enum Command {
             action = clap::ArgAction::Append,
             conflicts_with_all = ["patch_file", "all", "staged"]
         )]
-        #[arg(add = completer!(crate::completions::actions::line_ranges()))]
+        #[arg(add = completer!(grit::action_line_ranges()))]
         lines: Vec<String>,
         #[command(flatten)]
         paths: crate::pathspec_args::TrailingPathspecArgs,
@@ -1479,10 +1481,10 @@ enum Command {
     /// List branches, or create / delete / rename / configure one.
     Branch {
         /// Branch to create, delete, rename, or configure upstream for. Omit to list.
-        #[arg(add = completer!(crate::completions::actions::local_branches()))]
+        #[arg(add = completer!(grit::action_local_branches()))]
         name: Option<String>,
         /// Start commit when creating (`grit branch <name> <start>`).
-        #[arg(add = completer!(crate::completions::actions::revisions()))]
+        #[arg(add = completer!(grit::action_revisions()))]
         start: Option<String>,
         /// Overwrite an existing branch when creating or renaming.
         #[arg(short = 'f', long = "force", conflicts_with = "force_rename")]
@@ -1495,7 +1497,7 @@ enum Command {
         no_track: bool,
         /// Set upstream for the named branch (or the current branch when omitted).
         #[arg(short = 'u', long = "set-upstream-to", value_name = "UPSTREAM")]
-        #[arg(add = completer!(crate::completions::actions::remote_branches()))]
+        #[arg(add = completer!(grit::action_remote_branches()))]
         set_upstream_to: Option<String>,
         /// Remove upstream configuration for the named branch (or the current branch).
         #[arg(long = "unset-upstream")]
@@ -1508,11 +1510,11 @@ enum Command {
             num_args = 1..=2,
             conflicts_with = "force_rename"
         )]
-        #[arg(add = completer!(crate::completions::actions::local_branches()))]
+        #[arg(add = completer!(grit::action_local_branches()))]
         rename: Option<Vec<String>>,
         /// Force rename: `-M <new>` or `-M <old> <new>`.
         #[arg(short = 'M', value_name = "NAME", num_args = 1..=2, conflicts_with = "rename")]
-        #[arg(add = completer!(crate::completions::actions::local_branches()))]
+        #[arg(add = completer!(grit::action_local_branches()))]
         force_rename: Option<Vec<String>>,
         /// Delete the named branch instead of creating it.
         #[arg(short = 'd', long = "delete")]
@@ -1533,11 +1535,11 @@ enum Command {
         #[arg(
             value_name = "NAME",
             required_unless_present = "detach",
-            add = completer!(crate::completions::actions::branch_targets())
+            add = completer!(grit::action_branch_targets())
         )]
         branch: Option<String>,
         /// With `-c`, the commit to start the branch from (defaults to `HEAD`).
-        #[arg(add = completer!(crate::completions::actions::revisions()))]
+        #[arg(add = completer!(grit::action_revisions()))]
         start_point: Option<String>,
         /// Create the branch first, then switch to it.
         #[arg(short = 'c', long = "create")]
@@ -1553,7 +1555,7 @@ enum Command {
     Reset {
         /// Commit to reset to (defaults to `HEAD`).
         #[arg(value_name = "REV")]
-        #[arg(add = completer!(crate::completions::actions::revisions()))]
+        #[arg(add = completer!(grit::action_revisions()))]
         rev: Option<String>,
         /// Keep the index and worktree; move the branch tip only.
         #[arg(long, conflicts_with_all = ["hard", "mixed", "keep"])]
@@ -1582,7 +1584,7 @@ enum Command {
             required_unless_present_any = ["abort", "continue_merge"],
             conflicts_with = "continue_merge"
         )]
-        #[arg(add = completer!(crate::completions::actions::revisions()))]
+        #[arg(add = completer!(grit::action_revisions()))]
         branch: Option<String>,
         /// Cancel an in-progress merge and restore the pre-merge state.
         #[arg(long = "abort", conflicts_with_all = ["continue_merge", "check"])]
@@ -1636,7 +1638,7 @@ enum Command {
             value_name = "COMMIT",
             conflicts_with_all = ["continue_pick", "abort", "skip"]
         )]
-        #[arg(add = completer!(crate::completions::actions::revision_ranges()))]
+        #[arg(add = completer!(grit::action_revision_ranges()))]
         commits: Vec<String>,
         /// Parent number when picking a merge commit (1-based, long only).
         #[arg(long = "mainline", value_name = "N")]
@@ -1680,7 +1682,7 @@ enum Command {
             required_unless_present_any = ["continue_revert", "abort", "skip"],
             value_name = "COMMIT"
         )]
-        #[arg(add = completer!(crate::completions::actions::revision_ranges()))]
+        #[arg(add = completer!(grit::action_revision_ranges()))]
         commits: Vec<String>,
         /// Parent number when reverting a merge commit (1-based, long only).
         #[arg(long = "mainline", value_name = "N")]
@@ -1720,7 +1722,7 @@ enum Command {
         action: HistoryAction,
     },
     /// Save or restore shelved work.
-    #[command(add = carapace_rs_clap::DashAnyCompleter::new(crate::completions::actions::paths()))]
+    #[command(add = carapace_rs_clap::DashAnyCompleter::new(grit::action_paths()))]
     Stash {
         /// Stash message (bare `grit stash` / `grit stash push`).
         #[arg(
@@ -1784,7 +1786,7 @@ enum Command {
         action: Option<StashAction>,
     },
     /// Restore working tree and/or index paths.
-    #[command(add = carapace_rs_clap::DashAnyCompleter::new(crate::completions::actions::paths()))]
+    #[command(add = carapace_rs_clap::DashAnyCompleter::new(grit::action_paths()))]
     Restore {
         #[command(flatten)]
         pathspecs: pathspec_args::PathspecArgs,
@@ -1796,7 +1798,7 @@ enum Command {
         worktree: bool,
         /// Tree or commit to restore from.
         #[arg(long)]
-        #[arg(add = completer!(crate::completions::actions::revisions()))]
+        #[arg(add = completer!(grit::action_revisions()))]
         source: Option<String>,
         /// For unmerged paths, write our side (index stage 2) into the worktree.
         #[arg(long = "ours", conflicts_with_all = ["theirs", "merge", "conflict_style"])]
@@ -1812,11 +1814,11 @@ enum Command {
         conflict_style: Option<conflict_style::ConflictStyleArg>,
         /// Discard only the listed unstaged hunk ids (`grit diff --unstaged --json`) or unstage staged ids (`--staged`).
         #[arg(long = "hunks", value_name = "ID,...", action = clap::ArgAction::Append)]
-        #[arg(add = completer!(crate::completions::actions::hunks()))]
+        #[arg(add = completer!(grit::action_hunks()))]
         hunks: Vec<String>,
         /// Discard or unstage only new-side line ranges (`path:start-end` from `grit diff --json`).
         #[arg(long = "lines", value_name = "PATH:START-END", action = clap::ArgAction::Append)]
-        #[arg(add = completer!(crate::completions::actions::line_ranges()))]
+        #[arg(add = completer!(grit::action_line_ranges()))]
         lines: Vec<String>,
         /// Report paths that would change without writing the worktree or index.
         #[arg(long = "dry-run")]
@@ -1855,11 +1857,11 @@ enum Command {
     Rebase {
         /// Commits to replay are those reachable from `HEAD` but not from this revision (defaults to `@{upstream}`).
         #[arg(value_name = "UPSTREAM")]
-        #[arg(add = completer!(crate::completions::actions::revisions()))]
+        #[arg(add = completer!(grit::action_revisions()))]
         upstream: Option<String>,
         /// Replay onto this commit instead of `UPSTREAM`.
         #[arg(long = "onto", value_name = "REV")]
-        #[arg(add = completer!(crate::completions::actions::revisions()))]
+        #[arg(add = completer!(grit::action_revisions()))]
         onto: Option<String>,
         /// Finish a rebase stopped on conflicts after resolving and staging paths.
         #[arg(long = "continue", conflicts_with_all = ["abort", "skip", "upstream", "onto", "check"])]
@@ -1886,7 +1888,7 @@ enum Command {
         delete: bool,
         /// Remote to push to (defaults to the current branch's remote or `origin`).
         #[arg(long, hide = true)]
-        #[arg(add = completer!(crate::completions::actions::remotes()))]
+        #[arg(add = completer!(grit::action_remotes()))]
         remote: Option<String>,
         /// Contact the remote but do not update refs or send objects.
         #[arg(long = "dry-run")]
@@ -1903,7 +1905,7 @@ enum Command {
             require_equals = true,
             conflicts_with = "force"
         )]
-        #[arg(add = completer!(crate::completions::actions::revisions()))]
+        #[arg(add = completer!(grit::action_revisions()))]
         force_with_lease: Option<Option<String>>,
         /// Set `branch.<name>.remote` and `branch.<name>.merge` for each pushed branch.
         #[arg(short = 'u', long = "set-upstream")]
@@ -1924,11 +1926,11 @@ enum Command {
         quiet: quiet_args::QuietArgs,
         /// Remote name (when not using `--remote`).
         #[arg(value_name = "REMOTE")]
-        #[arg(add = completer!(crate::completions::actions::remotes()))]
+        #[arg(add = completer!(grit::action_remotes()))]
         remote_name: Option<String>,
         /// Refspec (`src`, `src:dst`, `:dst`, …).
         #[arg(value_name = "REFSPEC")]
-        #[arg(add = completer!(crate::completions::actions::revisions()))]
+        #[arg(add = completer!(grit::action_revisions()))]
         refspecs: Vec<String>,
     },
     /// Create, verify, or list git bundle files.
@@ -1940,7 +1942,7 @@ enum Command {
     Notes {
         /// Notes ref (default: `core.notesRef` or `refs/notes/commits`).
         #[arg(long = "ref", value_name = "REF", global = true)]
-        #[arg(add = completer!(crate::completions::actions::notes_refs()))]
+        #[arg(add = completer!(grit::action_notes_refs()))]
         notes_ref: Option<String>,
         /// Preview `add` or `remove` without writing objects or refs.
         #[arg(long = "dry-run", global = true)]
@@ -1954,11 +1956,11 @@ enum Command {
     Tag {
         /// Name of the tag to create. Omit to list tags.
         #[arg(value_name = "NAME", conflicts_with = "verify")]
-        #[arg(add = completer!(crate::completions::actions::tags()))]
+        #[arg(add = completer!(grit::action_tags()))]
         name: Option<String>,
         /// Revision to tag (default `HEAD`).
         #[arg(value_name = "TARGET", conflicts_with_all = ["object", "verify"])]
-        #[arg(add = completer!(crate::completions::actions::revisions()))]
+        #[arg(add = completer!(grit::action_revisions()))]
         target: Option<String>,
         /// List tags matching `PATTERN` (repeatable). Omit `PATTERN` to list all tags.
         #[arg(
@@ -1969,7 +1971,7 @@ enum Command {
             default_missing_value = "",
             action = clap::ArgAction::Append
         )]
-        #[arg(add = completer!(crate::completions::actions::tags()))]
+        #[arg(add = completer!(grit::action_tags()))]
         list: Vec<String>,
         /// Sort listed tags by version, date, or name.
         #[arg(long = "sort", value_enum, default_value_t = commands::tag::TagListSort::Version)]
@@ -1979,11 +1981,11 @@ enum Command {
         reverse: bool,
         /// Only tags whose peeled commit contains this revision (`HEAD` when omitted).
         #[arg(long = "contains", value_name = "REV", default_missing_value = "HEAD", num_args = 0..=1)]
-        #[arg(add = completer!(crate::completions::actions::revisions()))]
+        #[arg(add = completer!(grit::action_revisions()))]
         contains: Option<String>,
         /// Only tags pointing at this object (repeatable).
         #[arg(long = "points-at", value_name = "REV")]
-        #[arg(add = completer!(crate::completions::actions::revisions()))]
+        #[arg(add = completer!(grit::action_revisions()))]
         points_at: Vec<String>,
         #[command(flatten)]
         limit: limit_args::LimitArgs,
@@ -2000,7 +2002,7 @@ enum Command {
             conflicts_with_all = ["message", "message_file"],
             allow_hyphen_values = true
         )]
-        #[arg(add = completer!(carapace_rs::Action::files([])))]
+        #[arg(add = completer!(Action::files([])))]
         legacy_message_file: Option<String>,
         /// Object to tag (revision). Defaults to `HEAD`.
         #[arg(
@@ -2009,7 +2011,7 @@ enum Command {
             hide = true,
             conflicts_with = "target"
         )]
-        #[arg(add = completer!(crate::completions::actions::revisions()))]
+        #[arg(add = completer!(grit::action_revisions()))]
         object: Option<String>,
         /// Replace an existing tag with the same name.
         #[arg(short = 'f', long = "force", conflicts_with = "delete")]
@@ -2053,7 +2055,7 @@ enum Command {
             requires = "verify",
             last = true
         )]
-        #[arg(add = completer!(crate::completions::actions::tags()))]
+        #[arg(add = completer!(grit::action_tags()))]
         verify_names: Vec<String>,
         /// Skip signature verification (still checks `tree-sha256` when present).
         #[arg(long = "no-signature", requires = "verify")]
@@ -2094,7 +2096,7 @@ enum Command {
     Completions {
         /// Target shell (bash, zsh, fish, nushell, powershell, elvish, xonsh, …).
         #[arg(value_name = "SHELL", value_parser = parse_completion_shell)]
-        #[arg(add = completer!(crate::completions::actions::shells()))]
+        #[arg(add = completer!(grit::action_shells()))]
         shell: String,
     },
     /// Read, set, or list configuration values.
@@ -2118,7 +2120,7 @@ enum Command {
             value_name = "PATH",
             conflicts_with_all = ["global", "local", "system", "worktree"]
         )]
-        #[arg(add = completer!(carapace_rs::Action::files([])))]
+        #[arg(add = completer!(Action::files([])))]
         file: Option<std::path::PathBuf>,
         /// List configuration values (optional `<prefix>` filters keys).
         #[arg(
@@ -2200,7 +2202,7 @@ enum Command {
             requires = "rename_section_new",
             conflicts_with_all = ["list", "all", "add", "unset", "unset_all", "remove_section"]
         )]
-        #[arg(add = completer!(crate::completions::actions::config_keys()))]
+        #[arg(add = completer!(grit::action_config_keys()))]
         rename_section: Option<String>,
         /// New section name for `--rename-section`.
         #[arg(
@@ -2209,7 +2211,7 @@ enum Command {
             requires = "rename_section",
             conflicts_with_all = ["list", "all", "add", "unset", "unset_all", "remove_section"]
         )]
-        #[arg(add = completer!(crate::completions::actions::config_keys()))]
+        #[arg(add = completer!(grit::action_config_keys()))]
         rename_section_new: Option<String>,
         /// Remove an entire section.
         #[arg(
@@ -2225,7 +2227,7 @@ enum Command {
                 "rename_section_new"
             ]
         )]
-        #[arg(add = completer!(crate::completions::actions::config_keys()))]
+        #[arg(add = completer!(grit::action_config_keys()))]
         remove_section: Option<String>,
         /// Coerce values as bool, int, or path (canonical on write).
         #[arg(
@@ -2265,10 +2267,10 @@ enum Command {
         )]
         dry_run: bool,
         /// The configuration key, e.g. user.name. Optional prefix with `--list`.
-        #[arg(add = completer!(crate::completions::actions::config_keys()))]
+        #[arg(add = completer!(grit::action_config_keys()))]
         key: Option<String>,
         /// The value to set. Omit to read the current value.
-        #[arg(add = completer!(crate::completions::actions::config_value_for_key()))]
+        #[arg(add = completer!(grit::action_config_value_for_key()))]
         value: Option<String>,
     },
     /// Git credential helper backed by the Windows Credential Manager.
@@ -2277,7 +2279,7 @@ enum Command {
     /// `credential.helper` on Windows. It speaks Git's credential protocol.
     Manager {
         /// The credential operation: get, store, or erase.
-        #[arg(add = completer!(crate::completions::actions::credential_operations()))]
+        #[arg(add = completer!(grit::action_credential_operations()))]
         operation: String,
     },
     /// Serve repositories over HTTP, with a web view where people sign in with email and password.
@@ -2286,11 +2288,11 @@ enum Command {
         action: Option<ServeAction>,
         /// A repository, or a directory of repositories, to serve.
         #[arg(long, global = true, value_name = "PATH", default_value = ".")]
-        #[arg(add = completer!(carapace_rs::Action::directories()))]
+        #[arg(add = completer!(Action::directories()))]
         root: std::path::PathBuf,
         /// The user database (default: `grit-serve.db` in the root, or in its `.git`).
         #[arg(long, global = true, value_name = "FILE")]
-        #[arg(add = completer!(carapace_rs::Action::files([])))]
+        #[arg(add = completer!(Action::files([])))]
         db: Option<std::path::PathBuf>,
         /// Address to listen on.
         #[arg(long, value_name = "HOST:PORT", default_value = "127.0.0.1:8080")]
@@ -2337,7 +2339,7 @@ struct ServeArgs {
     #[arg(long, alias = "http-backend-info-refs")]
     advertise_refs: bool,
     /// The repository to serve.
-    #[arg(add = completer!(carapace_rs::Action::directories()))]
+    #[arg(add = completer!(Action::directories()))]
     directory: String,
 }
 

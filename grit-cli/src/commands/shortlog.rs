@@ -16,6 +16,7 @@ use crate::commands::diff::{render_log_commit_diff, DiffOutcome};
 use crate::commands::log::{
     load_commits_with_format_for_oids, render_commit_diffs_markdown, LogCommit,
 };
+use crate::completions::grit;
 use crate::context::{self, CommitSummary};
 use crate::diff_format::{DiffFormatArgs, ShortlogDiffFormatArgs};
 use crate::diff_render::{render_stat, use_color};
@@ -28,7 +29,7 @@ use crate::ui;
 pub struct ShortlogCliArgs {
     /// Compare against this ref or revision instead of the discovered target branch.
     #[arg(long = "target", value_name = "REF")]
-    #[arg(add = completer!(crate::completions::actions::revisions()))]
+    #[arg(add = completer!(grit::action_revisions()))]
     pub target: Option<String>,
     /// Maximum commits to list on each side (`ahead`, and with `--behind` the behind list too).
     #[arg(short = 'n', long = "max-count", default_value = "100")]

@@ -3,6 +3,8 @@
 use carapace_rs_clap::completer;
 use clap::Args;
 
+use crate::completions::grit;
+
 /// Options shared by fetch-like commands.
 #[derive(Args, Clone, Debug, Default)]
 pub struct FetchArgs {
@@ -15,11 +17,11 @@ pub struct FetchArgs {
     pub all: bool,
     /// Remote to fetch from (defaults to the current branch's remote, else `origin`).
     #[arg(value_name = "REMOTE")]
-    #[arg(add = completer!(crate::completions::actions::remotes()))]
+    #[arg(add = completer!(grit::action_remotes()))]
     pub remote: Option<String>,
     /// Refspecs selecting refs to fetch (`main`, `+refs/heads/x:refs/heads/y`, …).
     #[arg(value_name = "REFSPEC", num_args = 0..)]
-    #[arg(add = completer!(crate::completions::actions::fetch_refspecs()))]
+    #[arg(add = completer!(grit::action_fetch_refspecs()))]
     pub refspecs: Vec<String>,
     /// Fetch all tags from the remote (`git fetch --tags`).
     #[arg(long = "tags")]

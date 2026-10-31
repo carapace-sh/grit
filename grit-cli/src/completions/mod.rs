@@ -7,7 +7,7 @@
 //! itself with `add = completer!(…)`, and commands only need wiring when the
 //! completion lives on the command rather than on one argument.
 
-pub(crate) mod actions;
+pub(crate) mod grit;
 
 use std::sync::Arc;
 
@@ -39,7 +39,7 @@ pub fn command() -> clap::Command {
 
 /// Shell names `grit completions` accepts.
 pub fn shell_names() -> &'static [&'static str] {
-    actions::shell_names()
+    grit::shell_names()
 }
 
 /// Parse a shell name accepted by `grit completions`.

@@ -3,6 +3,7 @@
 use carapace_rs_clap::completer;
 use clap::Args;
 
+use crate::completions::grit;
 use crate::limit_args::LimitArgs;
 
 /// Flags that apply when listing branches (no positional `NAME`).
@@ -13,7 +14,7 @@ pub struct BranchListArgs {
         long = "list",
         value_name = "GLOB",
         action = clap::ArgAction::Append,
-        add = completer!(crate::completions::actions::local_branches())
+        add = completer!(grit::action_local_branches())
     )]
     pub patterns: Vec<String>,
     /// List remote-tracking branches under `refs/remotes/`.
@@ -28,7 +29,7 @@ pub struct BranchListArgs {
         value_name = "REV",
         num_args = 0..=1,
         default_missing_value = "HEAD",
-        add = completer!(crate::completions::actions::revisions())
+        add = completer!(grit::action_revisions())
     )]
     pub merged: Option<String>,
     /// List branches not merged into `REV` (defaults to `HEAD` when omitted).
@@ -37,7 +38,7 @@ pub struct BranchListArgs {
         value_name = "REV",
         num_args = 0..=1,
         default_missing_value = "HEAD",
-        add = completer!(crate::completions::actions::revisions())
+        add = completer!(grit::action_revisions())
     )]
     pub no_merged: Option<String>,
     /// List branches whose tip contains `REV` (defaults to `HEAD` when omitted).
@@ -46,14 +47,14 @@ pub struct BranchListArgs {
         value_name = "REV",
         num_args = 0..=1,
         default_missing_value = "HEAD",
-        add = completer!(crate::completions::actions::revisions())
+        add = completer!(grit::action_revisions())
     )]
     pub contains: Option<String>,
     /// Sort key: `name`, `version`, or `date`.
     #[arg(
         long = "sort",
         value_name = "KEY",
-        add = completer!(crate::completions::actions::sort_keys())
+        add = completer!(grit::action_sort_keys())
     )]
     pub sort: Option<String>,
     /// Reverse sort order.

@@ -6,6 +6,7 @@ use std::io::Read;
 use std::sync::Once;
 
 use anyhow::{Context, Result};
+use carapace_rs::Action;
 use carapace_rs_clap::completer;
 use clap::Args;
 use grit_lib::config::ident::parse_author_arg;
@@ -35,7 +36,7 @@ pub struct MessageInputArgs {
         value_name = "PATH|-",
         conflicts_with = "message",
         allow_hyphen_values = true,
-        add = completer!(carapace_rs::Action::files([]))
+        add = completer!(Action::files([]))
     )]
     pub message_file: Option<String>,
 }

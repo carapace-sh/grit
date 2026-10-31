@@ -103,45 +103,45 @@ fn repository_uid_opts(repo: &Repository) -> Vec<(&'static str, String)> {
 }
 
 /// Object hash formats `grit init --object-format` accepts.
-pub(crate) fn object_formats() -> Action {
+pub(crate) fn action_object_formats() -> Action {
     Action::values(["sha1", "sha256"]).tag("object formats")
 }
 
 /// Ref backends `grit init --ref-format` accepts.
-pub(crate) fn ref_formats() -> Action {
+pub(crate) fn action_ref_formats() -> Action {
     Action::values(["files", "reftable"]).tag("ref formats")
 }
 
 /// Diff algorithms `--diff-algorithm` accepts (`default` is another spelling of
 /// `myers`).
-pub(crate) fn diff_algorithms() -> Action {
+pub(crate) fn action_diff_algorithms() -> Action {
     Action::values(["histogram", "minimal", "myers", "patience"]).tag("diff algorithms")
 }
 
 /// Merge-diff modes `grit show --diff-merges` accepts.
-pub(crate) fn diff_merges() -> Action {
+pub(crate) fn action_diff_merges() -> Action {
     Action::values(["combined", "dense-combined", "first-parent"]).tag("diff merge modes")
 }
 
 /// Credential-helper operations `grit manager` accepts.
-pub(crate) fn credential_operations() -> Action {
+pub(crate) fn action_credential_operations() -> Action {
     Action::values(["erase", "get", "store"]).tag("operations")
 }
 
 /// Untracked-path modes `grit status --untracked` accepts.
-pub(crate) fn untracked_modes() -> Action {
+pub(crate) fn action_untracked_modes() -> Action {
     Action::values(["all", "no", "normal"]).tag("untracked modes")
 }
 
 /// Sort keys the branch listing accepts.
-pub(crate) fn sort_keys() -> Action {
+pub(crate) fn action_sort_keys() -> Action {
     Action::values(["date", "name", "version"]).tag("sort keys")
 }
 
 /// Configuration values for the key in the previous positional.
-pub(crate) fn config_value_for_key() -> Action {
+pub(crate) fn action_config_value_for_key() -> Action {
     Action::callback(|context| match context.args.first() {
-        Some(key) => config_values(key),
+        Some(key) => action_config_values(key),
         None => Action::default(),
     })
 }
@@ -152,12 +152,12 @@ pub(crate) fn shell_names() -> &'static [&'static str] {
 }
 
 /// The shells `grit completions` can print a script for.
-pub(crate) fn shells() -> Action {
+pub(crate) fn action_shells() -> Action {
     Action::values(SHELLS.iter().copied()).tag("shells")
 }
 
 /// Local branches (`refs/heads/*`) with the subject of their tip commit.
-pub(crate) fn local_branches() -> Action {
+pub(crate) fn action_local_branches() -> Action {
     Action::callback(|context| {
         let Some(repo) = repository(context) else {
             return Action::default();
@@ -171,7 +171,7 @@ pub(crate) fn local_branches() -> Action {
 }
 
 /// Remote-tracking branches (`refs/remotes/*`) with their tip subject.
-pub(crate) fn remote_branches() -> Action {
+pub(crate) fn action_remote_branches() -> Action {
     Action::callback(|context| {
         let Some(repo) = repository(context) else {
             return Action::default();
@@ -185,7 +185,7 @@ pub(crate) fn remote_branches() -> Action {
 }
 
 /// Tags (`refs/tags/*`) with the subject of the commit they peel to.
-pub(crate) fn tags() -> Action {
+pub(crate) fn action_tags() -> Action {
     Action::callback(|context| {
         let Some(repo) = repository(context) else {
             return Action::default();
@@ -199,8 +199,8 @@ pub(crate) fn tags() -> Action {
 }
 
 /// Local and remote branch names, as `switch` accepts them.
-pub(crate) fn branch_targets() -> Action {
-    batch(vec![remote_branches(), local_branches()])
+pub(crate) fn action_branch_targets() -> Action {
+    batch(vec![action_remote_branches(), action_local_branches()])
 }
 
 /// The pseudo refs that name a tip right now: `HEAD`, and the operation refs
@@ -218,7 +218,7 @@ fn pseudo_refs(repo: &Repository) -> Action {
 }
 
 /// Stash entries (`stash@{N}`) with the message they were created with.
-pub(crate) fn stashes() -> Action {
+pub(crate) fn action_stashes() -> Action {
     Action::callback(|context| match repository(context) {
         Some(repo) => stash_entries(&repo),
         None => Action::default(),
@@ -242,7 +242,7 @@ fn stash_entries(repo: &Repository) -> Action {
 /// Only refs that actually have a reflog are offered, newest entries first, so
 /// `grit reflog delete` can only be pointed at entries that exist. The list is
 /// capped because every ref with a reflog contributes its own entries.
-pub(crate) fn reflog_selectors() -> Action {
+pub(crate) fn action_reflog_selectors() -> Action {
     Action::callback(|context| {
         let Some(repo) = repository(context) else {
             return Action::default();
@@ -285,7 +285,7 @@ fn short_refname(refname: &str) -> &str {
 ///
 /// One repository open and one ref listing feed all of it; the kinds still read
 /// apart in the menu.
-pub(crate) fn revisions() -> Action {
+pub(crate) fn action_revisions() -> Action {
     Action::callback(|context| {
         let Some(repo) = repository(context) else {
             return Action::default();
@@ -332,10 +332,10 @@ pub(crate) fn revisions() -> Action {
 }
 
 /// Revisions plus range syntax: `A..B`, `A...B`, and `^A`.
-pub(crate) fn revision_ranges() -> Action {
+pub(crate) fn action_revision_ranges() -> Action {
     Action::callback(|context| {
         if context.value.starts_with('^') {
-            return revisions().prefix("^");
+            return action_revisions().prefix("^");
         }
         let delimiter = if context.value.contains("...") {
             "..."
@@ -343,17 +343,17 @@ pub(crate) fn revision_ranges() -> Action {
             ".."
         };
         let Some(index) = context.value.find(delimiter) else {
-            return revisions();
+            return action_revisions();
         };
         let start = context.value[..index].to_owned();
         let range = context.value[..index + delimiter.len()].to_owned();
         // the end of a range is another revision, but not the one it starts at
-        revisions().filter([start]).prefix(range)
+        action_revisions().filter([start]).prefix(range)
     })
 }
 
 /// Configured remotes, described with their fetch URL.
-pub(crate) fn remotes() -> Action {
+pub(crate) fn action_remotes() -> Action {
     Action::callback(|context| {
         let Some(repo) = repository(context) else {
             return Action::default();
@@ -374,7 +374,7 @@ pub(crate) fn remotes() -> Action {
 /// `grit remote set-head` names a branch inside the remote, so `origin/main`
 /// from the remote-tracking refs is trimmed to `main`; without a remote yet
 /// typed, every remote's branches are offered.
-pub(crate) fn remote_branch_names() -> Action {
+pub(crate) fn action_remote_branch_names() -> Action {
     Action::callback(|context| {
         let Some(repo) = repository(context) else {
             return Action::default();
@@ -392,10 +392,10 @@ pub(crate) fn remote_branch_names() -> Action {
 
 /// Refspecs `fetch` accepts: a remote branch (or tag) source and a local
 /// destination, as in `main:incoming`.
-pub(crate) fn fetch_refspecs() -> Action {
+pub(crate) fn action_fetch_refspecs() -> Action {
     Action::multiparts_n(":", 2, |context| {
         if !context.parts.is_empty() {
-            return local_branches();
+            return action_local_branches();
         }
         let Some(repo) = repository(context) else {
             return Action::default();
@@ -447,7 +447,7 @@ fn remote_branch_values(summaries: &[RefSummary], remote: Option<&str>) -> Vec<(
 }
 
 /// Notes refs, as the short names `grit notes --ref` accepts.
-pub(crate) fn notes_refs() -> Action {
+pub(crate) fn action_notes_refs() -> Action {
     Action::callback(|context| {
         let Some(repo) = repository(context) else {
             return Action::default();
@@ -469,7 +469,7 @@ pub(crate) fn notes_refs() -> Action {
 }
 
 /// Linked worktree paths, with the branch each one has checked out.
-pub(crate) fn worktrees() -> Action {
+pub(crate) fn action_worktrees() -> Action {
     Action::callback(|context| {
         let Some(repo) = repository(context) else {
             return Action::default();
@@ -490,7 +490,7 @@ pub(crate) fn worktrees() -> Action {
 }
 
 /// Hook scripts installed for this repository, flagged when not executable.
-pub(crate) fn hooks() -> Action {
+pub(crate) fn action_hooks() -> Action {
     Action::callback(|context| {
         let Some(repo) = repository(context) else {
             return Action::default();
@@ -515,7 +515,7 @@ pub(crate) fn hooks() -> Action {
 
 /// Config keys: those already in the effective configuration plus the ones
 /// people set most often.
-pub(crate) fn config_keys() -> Action {
+pub(crate) fn action_config_keys() -> Action {
     Action::callback(|context| {
         let Some(repo) = repository(context) else {
             return Action::values(CONFIG_KEYS.iter().copied()).tag("config keys");
@@ -534,7 +534,7 @@ pub(crate) fn config_keys() -> Action {
 }
 
 /// Values already configured for `key`.
-pub(crate) fn config_values(key: &str) -> Action {
+pub(crate) fn action_config_values(key: &str) -> Action {
     let key = key.to_owned();
     Action::callback(move |context| {
         let Some(repo) = repository(context) else {
@@ -553,7 +553,7 @@ pub(crate) fn config_values(key: &str) -> Action {
 }
 
 /// Trailer keys `grit commit --trailer` understands, ready for `KEY=value`.
-pub(crate) fn trailers() -> Action {
+pub(crate) fn action_trailers() -> Action {
     Action::values([
         "Co-authored-by",
         "Fixes",
@@ -567,10 +567,10 @@ pub(crate) fn trailers() -> Action {
 }
 
 /// `KEY=VALUE` support for the global `-c KEY=VALUE` flag.
-pub(crate) fn config_overrides() -> Action {
+pub(crate) fn action_config_overrides() -> Action {
     Action::multiparts_n("=", 2, |context| match context.parts.len() {
-        0 => config_keys().nospace(['=']).suffix("="),
-        _ => config_values(&context.parts[0]),
+        0 => action_config_keys().nospace(['=']).suffix("="),
+        _ => action_config_values(&context.parts[0]),
     })
 }
 
@@ -581,7 +581,7 @@ pub(crate) fn config_overrides() -> Action {
 /// file is gone, which no directory listing can show; a path that still exists
 /// keeps the worktree rendering (LS_COLORS style), so `tracked paths` means
 /// deleted.
-pub(crate) fn paths() -> Action {
+pub(crate) fn action_paths() -> Action {
     Action::callback(|context| {
         let files = Action::files([]).invoke(context);
         let Some(repo) = repository(context) else {
@@ -703,7 +703,7 @@ impl HunkCandidate {
 ///
 /// The side follows `--staged`, so `grit restore --staged --hunks` is offered
 /// index hunks and every other command is offered unstaged ones.
-pub(crate) fn hunks() -> Action {
+pub(crate) fn action_hunks() -> Action {
     Action::callback(|context| {
         let Some(repo) = repository(context) else {
             return Action::default();
@@ -722,10 +722,10 @@ pub(crate) fn hunks() -> Action {
 }
 
 /// Line ranges `--lines` accepts: a path, then the new-side range of one hunk.
-pub(crate) fn line_ranges() -> Action {
+pub(crate) fn action_line_ranges() -> Action {
     Action::multiparts_n(":", 2, |context| {
         if context.parts.is_empty() {
-            return paths();
+            return action_paths();
         }
         let Some(repo) = repository(context) else {
             return Action::default();

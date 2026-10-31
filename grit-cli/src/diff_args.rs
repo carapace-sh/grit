@@ -9,6 +9,8 @@ use grit_lib::diff::{
     parse_diff_rename_threshold_percent, DiffAlgorithm, DiffOptions, RenameDetection,
 };
 
+use crate::completions::grit;
+
 /// Line-diff and tree-diff formatting flags (`-M`, `--diff-algorithm`, filters).
 #[derive(Debug, Clone, Default, Args)]
 #[group(id = "diff_compare_flags")]
@@ -29,7 +31,7 @@ pub struct DiffCompareArgs {
     no_renames: bool,
     /// Line diff algorithm (overrides `diff.algorithm`).
     #[arg(long = "diff-algorithm", value_name = "ALGO")]
-    #[arg(add = completer!(crate::completions::actions::diff_algorithms()))]
+    #[arg(add = completer!(grit::action_diff_algorithms()))]
     diff_algorithm: Option<String>,
     /// Limit output to these change types (Git letter syntax: `ADMR…`).
     #[arg(long = "diff-filter", value_name = "LETTERS")]

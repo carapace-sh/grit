@@ -20,6 +20,7 @@ use schemars::JsonSchema;
 use serde::Serialize;
 use std::io::Write;
 
+use crate::completions::grit;
 use crate::context::{self, CommitSummary};
 use crate::markdown;
 use crate::output::{
@@ -765,7 +766,7 @@ pub struct StatusCliArgs {
     /// directories; `all` lists every file; `no` omits untracked paths. When omitted,
     /// uses `status.showUntrackedFiles` from config.
     #[arg(long = "untracked", value_name = "MODE")]
-    #[arg(add = completer!(crate::completions::actions::untracked_modes()))]
+    #[arg(add = completer!(grit::action_untracked_modes()))]
     pub untracked: Option<UntrackedListing>,
     /// Skip ahead/behind rev-list walks (also when `status.aheadBehind=false`).
     #[arg(long = "no-ahead-behind")]

@@ -1,6 +1,8 @@
 //! Shared `--pathspec-from-file` / trailing path arguments for porcelain commands.
 
+use crate::completions::grit;
 use anyhow::{bail, Context, Result};
+use carapace_rs::Action;
 use carapace_rs_clap::completer;
 use clap::Args;
 use grit_lib::error::PathspecFromFileParseError;
@@ -18,7 +20,7 @@ pub struct PathspecArgs {
     /// Files or directories to limit the command to.
     #[arg(
         value_name = "PATH",
-        add = completer!(crate::completions::actions::paths())
+        add = completer!(grit::action_paths())
     )]
     pub paths: Vec<String>,
     /// Read pathspecs from a file (`-` for stdin) instead of or in addition to argv paths.
@@ -26,7 +28,7 @@ pub struct PathspecArgs {
         long = "pathspec-from-file",
         value_name = "FILE|-",
         allow_hyphen_values = true,
-        add = completer!(carapace_rs::Action::files([]))
+        add = completer!(Action::files([]))
     )]
     pub pathspec_from_file: Option<String>,
     /// `--pathspec-from-file` entries are NUL-separated.
@@ -42,7 +44,7 @@ pub struct TrailingPathspecArgs {
         value_name = "PATH",
         last = true,
         allow_hyphen_values = true,
-        add = completer!(crate::completions::actions::paths())
+        add = completer!(grit::action_paths())
     )]
     pub paths: Vec<String>,
     /// Read pathspecs from a file (`-` for stdin) instead of or in addition to argv paths.
@@ -50,7 +52,7 @@ pub struct TrailingPathspecArgs {
         long = "pathspec-from-file",
         value_name = "FILE|-",
         allow_hyphen_values = true,
-        add = completer!(carapace_rs::Action::files([]))
+        add = completer!(Action::files([]))
     )]
     pub pathspec_from_file: Option<String>,
     /// `--pathspec-from-file` entries are NUL-separated.

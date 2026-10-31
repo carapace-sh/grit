@@ -15,6 +15,7 @@ use grit_lib::revwalk::{
     committer_cutoff_from_date, MergeFilter, RefSelection, RevWalkListOptions,
 };
 
+use crate::completions::grit;
 use crate::error_kind::ErrorKind;
 use crate::json_error::{
     invalid_commit_filter, invalid_pickaxe, StructuredCliError, StructuredJsonError,
@@ -29,7 +30,7 @@ pub struct RevSelectArgs {
     /// Revision tips and ranges (`A..B`, `A...B`, `^tip`, plain tips).
     #[arg(
         value_name = "REV",
-        add = completer!(crate::completions::actions::revision_ranges())
+        add = completer!(grit::action_revision_ranges())
     )]
     pub revs: Vec<String>,
 
@@ -82,7 +83,7 @@ pub struct RevSelectArgs {
         value_name = "GLOB",
         num_args = 0..=1,
         default_missing_value = "",
-        add = completer!(crate::completions::actions::local_branches())
+        add = completer!(grit::action_local_branches())
     )]
     pub branches: Option<String>,
 
@@ -92,7 +93,7 @@ pub struct RevSelectArgs {
         value_name = "GLOB",
         num_args = 0..=1,
         default_missing_value = "",
-        add = completer!(crate::completions::actions::tags())
+        add = completer!(grit::action_tags())
     )]
     pub tags: Option<String>,
 
@@ -102,7 +103,7 @@ pub struct RevSelectArgs {
         value_name = "GLOB",
         num_args = 0..=1,
         default_missing_value = "",
-        add = completer!(crate::completions::actions::remotes())
+        add = completer!(grit::action_remotes())
     )]
     pub remotes: Option<String>,
 
