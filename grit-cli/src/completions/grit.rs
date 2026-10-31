@@ -83,10 +83,33 @@ const CONFIG_KEYS: &[&str] = &[
     "merge.conflictStyle",
     "pull.rebase",
     "push.default",
+    "remote.pushDefault",
     "tag.gpgSign",
     "user.email",
     "user.name",
 ];
+
+/// Config key templates for the keys grit reads that name a branch or remote
+/// of the repository. The placeholders (`<branch>`, `<remote>`) are filled in
+/// with the branches and remotes the repository actually has, completed part
+/// by part like carapace-bin does for Git.
+const CONFIG_KEY_TEMPLATES: &[&str] = &[
+    "branch.<branch>.merge",
+    "branch.<branch>.pushRemote",
+    "branch.<branch>.rebase",
+    "branch.<branch>.remote",
+    "remote.<remote>.fetch",
+    "remote.<remote>.partialclonefilter",
+    "remote.<remote>.prune",
+    "remote.<remote>.promisor",
+    "remote.<remote>.pushurl",
+    "remote.<remote>.tagOpt",
+    "remote.<remote>.url",
+];
+
+/// Placeholder segments of config key templates. A segment matching this
+/// pattern is completed from the repository instead of listed verbatim.
+const CONFIG_KEY_PLACEHOLDER: &str = r"<.*>";
 
 /// Uid options that scope a `git://` uid to `repo`: the work tree, and the git
 /// directory when it is not the work tree's `.git` (a bare repository or a
@@ -495,42 +518,133 @@ pub(crate) fn action_hooks() -> Action {
     })
 }
 
-/// Config keys: those already in the effective configuration plus the ones
-/// people set most often.
+/// Config keys, completed part by part between the dots.
+///
+/// The offered keys are the ones already in the effective configuration, the
+/// ones people set most often, and templates for the keys naming a branch or
+/// remote such as `branch.<branch>.remote`. A placeholder segment completes
+/// with what the repository actually has, so after `remote.` the configured
+/// remotes are offered, and `branch.` continues from the local branches.
 pub(crate) fn action_config_keys() -> Action {
     Action::callback(|context| {
-        let Some(repo) = repository(context) else {
-            return Action::values(CONFIG_KEYS.iter().copied()).tag("config keys");
+        let mut keys: Vec<String> = CONFIG_KEYS
+            .iter()
+            .chain(CONFIG_KEY_TEMPLATES.iter())
+            .map(|key| (*key).to_owned())
+            .collect();
+        let base = match repository(context) {
+            Some(repo) => {
+                keys.extend(
+                    repo.config()
+                        .map(|config| {
+                            config
+                                .entries()
+                                .iter()
+                                .map(|entry| entry.key.clone())
+                                .collect::<Vec<String>>()
+                        })
+                        .unwrap_or_default(),
+                );
+                keys.sort();
+                keys.dedup();
+                Action::values(keys).tag("config keys").uid(
+                    "git",
+                    "config",
+                    repository_uid_opts(&repo),
+                )
+            }
+            None => {
+                keys.sort();
+                keys.dedup();
+                Action::values(keys).tag("config keys")
+            }
         };
-        let mut keys: Vec<String> = repo
-            .config()
-            .map(|config| config.entries().iter().map(|e| e.key.clone()).collect())
-            .unwrap_or_default();
-        keys.extend(CONFIG_KEYS.iter().map(|key| (*key).to_owned()));
-        keys.sort();
-        keys.dedup();
-        Action::values(keys)
-            .tag("config keys")
-            .uid("git", "config", repository_uid_opts(&repo))
+        base.multipartsp(".", CONFIG_KEY_PLACEHOLDER, config_key_placeholder)
     })
 }
 
-/// Values already configured for `key`.
+/// The placeholder segments of config key templates, completed from the
+/// repository. `<branch>` fills in with local branches, `<remote>` with the
+/// configured remotes.
+fn config_key_placeholder(
+    placeholder: &str,
+    _entered: &std::collections::HashMap<String, String>,
+) -> Action {
+    match placeholder {
+        "<branch>" => action_local_branches(),
+        "<remote>" => action_remotes(),
+        _ => Action::default(),
+    }
+}
+
+/// Values `grit config` completes for `key`: the values the key takes for the
+/// keys grit reads (booleans, the remotes and branches the key names), merged
+/// with the values already configured for it.
 pub(crate) fn action_config_values(key: &str) -> Action {
     let key = key.to_owned();
     Action::callback(move |context| {
-        let Some(repo) = repository(context) else {
-            return Action::default();
-        };
-        let values = repo
-            .config()
-            .map(|config| config.get_all(&key))
-            .unwrap_or_default();
-        Action::values(values)
-            .style_f(|_, value| for_keyword(&value.value))
-            .tag("config values")
-            .uid("git", "config-value", repository_uid_opts(&repo))
+        let mut actions = Vec::new();
+        if let Some(expected) = config_value_values(&key) {
+            actions.push(expected);
+        }
+        if let Some(repo) = repository(context) {
+            let values = repo
+                .config()
+                .map(|config| config.get_all(&key))
+                .unwrap_or_default();
+            if !values.is_empty() {
+                actions.push(
+                    Action::values(values)
+                        .style_f(|_, value| for_keyword(&value.value))
+                        .tag("config values")
+                        .uid("git", "config-value", repository_uid_opts(&repo)),
+                );
+            }
+        }
+        batch(actions)
     })
+}
+
+/// The values a config key takes for the keys grit reads; `None` when there is
+/// nothing special to offer beyond the values already configured for it.
+fn config_value_values(key: &str) -> Option<Action> {
+    let keywords = |values: &[&'static str]| {
+        Action::values(values.iter().copied()).style_f(|_, value| for_keyword(&value.value))
+    };
+    let sections: Vec<&str> = key.split('.').collect();
+    match sections.as_slice() {
+        [section, leaf] => {
+            let (section, leaf) = (section.to_ascii_lowercase(), leaf.to_ascii_lowercase());
+            match (section.as_str(), leaf.as_str()) {
+                ("commit", "autostage" | "gpgsign") | ("tag", "gpgsign") => {
+                    Some(keywords(&["false", "true"]))
+                }
+                ("pull", "rebase") | ("core", "autocrlf") => {
+                    Some(keywords(&["false", "input", "merges", "true"]))
+                }
+                ("init", "defaultbranch") => Some(action_local_branches()),
+                ("remote", "pushdefault") | ("checkout", "defaultremote") => Some(action_remotes()),
+                _ => None,
+            }
+        }
+        [section, _, leaf] if section.eq_ignore_ascii_case("branch") => {
+            match leaf.to_ascii_lowercase().as_str() {
+                "remote" | "pushremote" => Some(action_remotes()),
+                "rebase" => Some(keywords(&["false", "true"])),
+                _ => None,
+            }
+        }
+        [section, _, leaf] if section.eq_ignore_ascii_case("remote") => {
+            let leaf = leaf.to_ascii_lowercase();
+            match leaf.as_str() {
+                "prune" | "promisor" | "prunetags" => Some(keywords(&["false", "true"])),
+                "tagopt" => Some(Action::values(["--tags", "--no-tags"])),
+                "partialclonefilter" => Some(Action::values(["blob:none", "tree:0"])),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }
 
 /// Trailer keys `grit commit --trailer` understands, ready for `KEY=value`.

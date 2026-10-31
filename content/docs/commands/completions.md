@@ -27,7 +27,7 @@ What completion offers:
 | Reflog selectors (`reflog delete`) | `ref@{n}` selectors for refs that have a reflog, described with the entry message |
 | Remote branches (`remote set-head`) | Branch names inside the remote, without the remote-name prefix |
 | Stashes, hooks, worktrees, notes refs | The entries of the current repository |
-| Config keys and values (`config`, `-c`) | Keys already present in the effective configuration, common keys, and the values set for a key |
+| Config keys and values (`config`, `-c`) | Keys completed part by part between the dots: configured sections first; `remote.` then offers the configured remotes, `branch.` the local branches, and `branch.main.` the keys of that section. Values offer what the key takes (booleans with the keyword colors, remotes for `branch.<branch>.remote` and friends) plus the values already set for the key |
 | Shells | The shells this command accepts |
 
 Candidates are styled like Git completions elsewhere: branches blue, tags yellow, pseudo refs bold, stashes green, notes cyan, hunk ids magenta, with each kind in its own group in the menu. Keyword-shaped values take carapace's keyword colors (`no` and `false` red, `all` and `true` green). Subcommands are grouped too, the way this documentation groups them, so the menu separates everyday commands from plumbing.

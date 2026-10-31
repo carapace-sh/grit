@@ -288,11 +288,59 @@ fn config_keys_and_values_are_completed() {
         .in_dir(&dir)
         .suc();
 
-    let keys = export(&dir, &["config", ""]);
+    let keys = export(&dir, &["config", "user."]);
     assert!(has_value(&keys, "user.name"), "{:?}", values(&keys));
 
     let payload = export(&dir, &["config", "user.name", ""]);
     assert!(has_value(&payload, "Test User"), "{:?}", values(&payload));
+}
+
+/// The `display` field of an export payload: what a shell shows the user.
+fn displays(payload: &Value) -> Vec<String> {
+    payload["values"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|value| value["display"].as_str().unwrap_or_default().to_owned())
+        .collect()
+}
+
+#[test]
+fn config_keys_complete_in_parts_with_repository_values() {
+    let (_tmp, dir) = sample_repo();
+
+    let remotes = export(&dir, &["config", "remote."]);
+    assert!(
+        displays(&remotes)
+            .iter()
+            .any(|candidate| candidate.starts_with("origin")),
+        "{remotes:?}"
+    );
+
+    let branches = export(&dir, &["config", "branch."]);
+    assert!(
+        displays(&branches)
+            .iter()
+            .any(|candidate| candidate.starts_with("main")),
+        "{branches:?}"
+    );
+
+    let leaves = export(&dir, &["config", "branch.main."]);
+    assert!(has_value(&leaves, "branch.main.rebase"), "{leaves:?}");
+}
+
+#[test]
+fn config_values_follow_the_key_typed() {
+    let (_tmp, dir) = sample_repo();
+
+    let payload = export(&dir, &["config", "branch.main.remote", ""]);
+    assert!(has_value(&payload, "origin"), "{:?}", values(&payload));
+
+    let payload = export(&dir, &["config", "remote.origin.prune", ""]);
+    assert!(has_value(&payload, "true"), "{:?}", values(&payload));
+
+    let payload = export(&dir, &["config", "remote.origin.tagOpt", ""]);
+    assert!(has_value(&payload, "--no-tags"), "{:?}", values(&payload));
 }
 
 #[test]
