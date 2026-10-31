@@ -79,6 +79,50 @@ fn uid_of(payload: &Value, value: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// `style` of one candidate, when the export carries styles.
+fn style_of(payload: &Value, value: &str) -> String {
+    payload["values"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|candidate| candidate["value"] == value)
+        .and_then(|candidate| candidate["style"].as_str())
+        .unwrap_or_default()
+        .to_owned()
+}
+
+#[test]
+fn keyword_values_take_the_carapace_keyword_styles() {
+    let (tmp, dir) = sample_repo();
+
+    let modes = export(&dir, &["status", "--untracked", ""]);
+    assert!(
+        !values(&modes).is_empty(),
+        "status --untracked completion: {modes}"
+    );
+    assert_eq!(style_of(&modes, "no"), "red", "{modes:?}");
+    assert_eq!(style_of(&modes, "all"), "green", "{modes:?}");
+    assert_eq!(style_of(&modes, "normal"), "", "{modes:?}");
+
+    grit_cmd(&["config", "pull.rebase", "true"])
+        .in_dir(&dir)
+        .suc();
+    let configured = export(&dir, &["-c", "pull.rebase="]);
+    assert!(
+        values(&configured)
+            .iter()
+            .any(|candidate| candidate.0 == "pull.rebase=true"),
+        "-c pull.rebase= completion: {configured}"
+    );
+    assert_eq!(
+        style_of(&configured, "pull.rebase=true"),
+        "green",
+        "{configured:?}"
+    );
+
+    drop(tmp);
+}
+
 #[test]
 fn bash_completions_install_a_completion_function() {
     let script = script("bash");

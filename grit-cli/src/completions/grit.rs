@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-use carapace_rs::{batch, Action, Context, InvokedAction};
+use carapace_rs::{batch, style::for_keyword, Action, Context, InvokedAction};
 use grit_lib::config::environment::{Environment, RepositoryOptions};
 use grit_lib::diff::structured::StructuredHunk;
 use grit_lib::diff::{hunk_diff_bundle, hunk_ids_with_duplicate_peers, DiffOptions, DiffSide};
@@ -128,9 +128,12 @@ pub(crate) fn action_credential_operations() -> Action {
     Action::values(["erase", "get", "store"]).tag("operations")
 }
 
-/// Untracked-path modes `grit status --untracked` accepts.
+/// Untracked-path modes `grit status --untracked` accepts. The keyword-words
+/// among them (`no`) take the carapace keyword colors.
 pub(crate) fn action_untracked_modes() -> Action {
-    Action::values(["all", "no", "normal"]).tag("untracked modes")
+    Action::values(["all", "no", "normal"])
+        .style_f(|_, value| for_keyword(&value.value))
+        .tag("untracked modes")
 }
 
 /// Sort keys the branch listing accepts.
@@ -523,11 +526,10 @@ pub(crate) fn action_config_values(key: &str) -> Action {
             .config()
             .map(|config| config.get_all(&key))
             .unwrap_or_default();
-        Action::values(values).tag("config values").uid(
-            "git",
-            "config-value",
-            repository_uid_opts(&repo),
-        )
+        Action::values(values)
+            .style_f(|_, value| for_keyword(&value.value))
+            .tag("config values")
+            .uid("git", "config-value", repository_uid_opts(&repo))
     })
 }
 

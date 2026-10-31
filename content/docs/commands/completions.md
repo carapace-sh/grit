@@ -30,7 +30,7 @@ What completion offers:
 | Config keys and values (`config`, `-c`) | Keys already present in the effective configuration, common keys, and the values set for a key |
 | Shells | The shells this command accepts |
 
-Candidates are styled like Git completions elsewhere: branches blue, tags yellow, pseudo refs bold, stashes green, notes cyan, hunk ids magenta, with each kind in its own group in the menu. Subcommands are grouped too, the way this documentation groups them, so the menu separates everyday commands from plumbing.
+Candidates are styled like Git completions elsewhere: branches blue, tags yellow, pseudo refs bold, stashes green, notes cyan, hunk ids magenta, with each kind in its own group in the menu. Keyword-shaped values take carapace's keyword colors (`no` and `false` red, `all` and `true` green). Subcommands are grouped too, the way this documentation groups them, so the menu separates everyday commands from plumbing.
 
 Values that come from the repository also carry a `git://` identifier naming the kind and the repository they belong to (`git://local-branch/main?GIT_WORK_TREE=…`), following the layout carapace uses for Git. Carapace emits those identifiers only in its experimental tabdance mode; other shells see grouped and styled values.
 
