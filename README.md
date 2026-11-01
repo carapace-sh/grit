@@ -1,6 +1,8 @@
-# Grit — Git in Rust
+> Fork of [gitbutlerapp/grit](https://github.com/gitbutlerapp/grit) to test [carapace-sh/carapace-rs](https://github.com/carapace-sh/carapace-rs).
 
-Fork of [gitbutlerapp/grit](https://github.com/gitbutlerapp/grit) to test [carapace-sh/carapace-rs](https://github.com/carapace-sh/carapace-rs).
+---
+
+# Grit — Git in Rust
 
 Grit is a **Git engine in idiomatic Rust**: a linkable **`grit-lib`** and a modern **`grit`** client (**`grit-cli`**) built on it. See **ROADMAP.md** for the plan.
 
