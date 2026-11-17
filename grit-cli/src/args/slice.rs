@@ -1,6 +1,9 @@
 //! Clap arguments for `grit slice`.
 
+use carapace_rs_clap::completer;
 use clap::{Args, Subcommand};
+
+use crate::completions::grit;
 
 /// Subcommands of `grit slice`.
 #[derive(Debug, Subcommand)]
@@ -12,7 +15,7 @@ pub(crate) enum SliceAction {
         /// The slice's name.
         name: String,
         /// A path in the slice (repeatable).
-        #[arg(short = 'p', long = "path", value_name = "PATH")]
+        #[arg(short = 'p', long = "path", value_name = "PATH", add = completer!(grit::action_paths()))]
         paths: Vec<String>,
         /// What the slice is for.
         #[arg(short = 'd', long, value_name = "TEXT")]
@@ -23,10 +26,10 @@ pub(crate) enum SliceAction {
         /// The slice's name.
         name: String,
         /// A path to add (repeatable).
-        #[arg(long, value_name = "PATH")]
+        #[arg(long, value_name = "PATH", add = completer!(grit::action_paths()))]
         add: Vec<String>,
         /// A path to remove (repeatable).
-        #[arg(long, value_name = "PATH")]
+        #[arg(long, value_name = "PATH", add = completer!(grit::action_paths()))]
         remove: Vec<String>,
         /// A new description.
         #[arg(short = 'd', long, value_name = "TEXT")]

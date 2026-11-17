@@ -1,11 +1,10 @@
 //! Clap arguments for `grit completions`.
 
 use clap::Args;
-use clap_complete::Shell;
 
-/// Generate shell completion scripts for bash, zsh, or fish.
+/// Print the shell integration script that answers with live candidates.
 #[derive(Debug, Args)]
 pub(crate) struct CompletionsArgs {
-    /// Target shell.
-    pub(crate) shell: Shell,
+    /// Target shell (bash, zsh, fish, nushell, powershell, elvish, xonsh, …).
+    pub(crate) shell: String,
 }

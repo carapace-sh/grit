@@ -16,6 +16,7 @@ mod cli_messages;
 mod cli_test_stack;
 mod commands;
 mod commits_json;
+mod completions;
 mod conflict_style;
 mod context;
 mod dates;
@@ -136,6 +137,12 @@ fn main() {
 }
 
 fn run() -> Result<ExitStatus, anyhow::Error> {
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(output) = completions::handle(&raw_args) {
+        print!("{output}");
+        return Ok(ExitStatus::Success);
+    }
+
     let parse_argv = normalize_tag_verify_argv(normalize_log_limit_argv(
         diff_args::normalize_diff_argv(std::env::args_os().collect()),
     ));

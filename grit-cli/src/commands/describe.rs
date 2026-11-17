@@ -3,7 +3,9 @@
 use anyhow::Result;
 use grit_lib::revwalk::{DescribeOptions, DescribedCommit};
 
+use crate::completions::grit;
 use crate::context;
+use carapace_rs_clap::completer;
 
 pub use crate::render::describe::DescribeOutcome;
 
@@ -11,7 +13,7 @@ pub use crate::render::describe::DescribeOutcome;
 #[derive(Debug, clap::Args, Default)]
 pub struct DescribeCliArgs {
     /// Commit or ref to describe (defaults to `HEAD`).
-    #[arg(value_name = "REV", default_value = "HEAD")]
+    #[arg(value_name = "REV", default_value = "HEAD", add = completer!(grit::action_revisions()))]
     pub rev: String,
     /// Include lightweight tags (default: annotated tags only).
     #[arg(long)]

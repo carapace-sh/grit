@@ -1,6 +1,10 @@
 //! Clap arguments for `grit checkout`.
 
+use carapace_rs::Action;
+use carapace_rs_clap::completer;
 use clap::Args;
+
+use crate::completions::grit;
 
 /// Start work on a repository from a snapshot of its main branch (or some of its paths) instead of a clone.
 #[derive(Debug, Args)]
@@ -10,9 +14,9 @@ pub(crate) struct CheckoutArgs {
     /// A slice (named set of paths) on the server to check out; `--path` adds to it.
     pub(crate) slice: Option<String>,
     /// Check out only this path, plus the files in the directories above it (repeatable).
-    #[arg(short = 'p', long = "path", value_name = "PATH")]
+    #[arg(short = 'p', long = "path", value_name = "PATH", add = completer!(grit::action_paths()))]
     pub(crate) paths: Vec<String>,
     /// Directory to check out into (defaults to the repository name).
-    #[arg(long, value_name = "DIR")]
+    #[arg(long, value_name = "DIR", add = completer!(Action::directories()))]
     pub(crate) into: Option<std::path::PathBuf>,
 }
