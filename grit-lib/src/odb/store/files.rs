@@ -1,5 +1,6 @@
 //! On-disk object source for one `objects/` directory (MIDX, packs, loose).
 
+use crate::error::ObjectError;
 use std::collections::HashSet;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
@@ -39,7 +40,32 @@ impl std::fmt::Debug for FilesSource {
     }
 }
 
+/// MIDX-related switches when opening a [`FilesSource`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct FilesSourceOpenOptions {
+    /// Read packs through a multi-pack-index when present.
+    pub use_midx: bool,
+    /// Use tip pack listing for MIDX `contains` probes (Git-compatible).
+    pub midx_tip_listing_for_exists: bool,
+}
+
 impl FilesSource {
+    fn with_pack_access<R>(&self, f: impl FnOnce() -> R) -> R {
+        if PackStore::read_context_matches_objects_dir(&self.objects_dir) {
+            f()
+        } else if PackStore::has_context() {
+            pack::with_alternate_pack_store(self.packs.pack_store().clone(), f)
+        } else {
+            PackStore::with_context(self.packs.pack_store().clone(), f)
+        }
+    }
+
+    fn skip_loose_probe_after_empty_warmup(&self, oid: &ObjectId) -> bool {
+        pack::pack_cache::trusted_verified_empty_pack_listing(&self.objects_dir)
+            && self.loose.cached_absent_loose_path(oid)
+    }
+
     /// Open a files source for `pack_store`'s directory.
     ///
     /// `use_midx` enables multi-pack-index reads when a chain is present.
@@ -55,14 +81,32 @@ impl FilesSource {
         midx_tip_listing_for_exists: bool,
         diagnostics: DiagnosticsHandle,
     ) -> Result<Self> {
-        let midx = MidxObjects::new(Arc::clone(&pack_store), use_midx)?;
+        Self::open_with_options(
+            pack_store,
+            loose,
+            &FilesSourceOpenOptions {
+                use_midx,
+                midx_tip_listing_for_exists,
+            },
+            diagnostics,
+        )
+    }
+
+    /// Like [`Self::open`], with switches grouped in [`FilesSourceOpenOptions`].
+    pub fn open_with_options(
+        pack_store: Arc<PackStore>,
+        loose: LooseStore,
+        options: &FilesSourceOpenOptions,
+        diagnostics: DiagnosticsHandle,
+    ) -> Result<Self> {
+        let midx = MidxObjects::new(Arc::clone(&pack_store), options.use_midx)?;
         Ok(Self {
             objects_dir: pack_store.objects_dir().to_path_buf(),
             loose,
             packs: PackedObjects::new(pack_store),
             midx,
-            use_midx,
-            midx_tip_listing_for_exists,
+            use_midx: options.use_midx,
+            midx_tip_listing_for_exists: options.midx_tip_listing_for_exists,
             _diagnostics: diagnostics,
         })
     }
@@ -83,12 +127,6 @@ impl FilesSource {
     #[must_use]
     pub fn packed_objects(&self) -> &PackedObjects {
         &self.packs
-    }
-
-    /// MIDX layer for this directory.
-    #[must_use]
-    pub fn midx_objects(&self) -> &MidxObjects {
-        &self.midx
     }
 
     /// Whether `oid` is materialized under this `objects/` tree (local loose or non-promisor pack).
@@ -148,7 +186,10 @@ impl FilesSource {
         }
         matches!(
             err,
-            Error::CorruptObject(_) | Error::LooseHashMismatch { .. } | Error::Zlib(_)
+            Error::Object(ObjectError::Corrupt { .. })
+                | Error::Object(ObjectError::CorruptLoose { .. })
+                | Error::Object(ObjectError::LooseHashMismatch { .. })
+                | Error::Object(ObjectError::Zlib { .. })
         )
     }
 
@@ -156,8 +197,13 @@ impl FilesSource {
         self.use_midx && self.midx.status() == MidxObjectsStatus::Active
     }
 
+    /// Whether an on-disk multi-pack-index chain drives reads for this `objects/` tree.
+    pub(crate) fn midx_reads_active(&self) -> bool {
+        self.midx_pack_filter_active()
+    }
+
     fn midx_read_should_fallback_to_packs(err: &Error) -> bool {
-        matches!(err, Error::CorruptObject(_) | Error::Zlib(_))
+        err.is_damaged_object()
     }
 
     fn try_read_object_into(
@@ -181,7 +227,7 @@ impl FilesSource {
             match self.midx.read_into(oid, buf) {
                 Ok(Some(kind)) => return Ok(Some(kind)),
                 Ok(None) => {}
-                Err(Error::Midx(_)) => {}
+                Err(Error::Object(ObjectError::Midx(_))) => {}
                 Err(err) if Self::midx_read_should_fallback_to_packs(&err) => {}
                 Err(err) => return Err(err),
             }
@@ -195,7 +241,7 @@ impl FilesSource {
             buf,
         ) {
             Ok(kind) => return Ok(Some(kind)),
-            Err(Error::ObjectNotFound(_)) => {}
+            Err(Error::Object(ObjectError::NotFound { .. })) => {}
             Err(err) => return Err(err),
         }
 
@@ -208,11 +254,14 @@ impl FilesSource {
                 buf,
             ) {
                 Ok(kind) => return Ok(Some(kind)),
-                Err(Error::ObjectNotFound(_)) => {}
+                Err(Error::Object(ObjectError::NotFound { .. })) => {}
                 Err(err) => return Err(err),
             }
         }
 
+        if self.skip_loose_probe_after_empty_warmup(oid) {
+            return Ok(None);
+        }
         #[cfg(test)]
         crate::hot_path_test_metrics::record_loose_path_open_for_active_scope();
         self.loose.read_into(oid, buf)
@@ -236,7 +285,7 @@ impl FilesSource {
             match self.midx.read(oid) {
                 Ok(Some(obj)) => return Ok(Some(obj)),
                 Ok(None) => {}
-                Err(Error::Midx(_)) => {}
+                Err(Error::Object(ObjectError::Midx(_))) => {}
                 Err(err) if Self::midx_read_should_fallback_to_packs(&err) => {}
                 Err(err) => return Err(err),
             }
@@ -244,7 +293,7 @@ impl FilesSource {
 
         match pack::try_read_object_from_packs_with_options(&self.objects_dir, oid, pack_opts) {
             Ok(obj) => return Ok(Some(obj)),
-            Err(Error::ObjectNotFound(_)) => {}
+            Err(Error::Object(ObjectError::NotFound { .. })) => {}
             Err(err) => return Err(err),
         }
 
@@ -255,11 +304,14 @@ impl FilesSource {
                 PackLookupOptions::MIDX_COVERED_PACKS,
             ) {
                 Ok(obj) => return Ok(Some(obj)),
-                Err(Error::ObjectNotFound(_)) => {}
+                Err(Error::Object(ObjectError::NotFound { .. })) => {}
                 Err(err) => return Err(err),
             }
         }
 
+        if self.skip_loose_probe_after_empty_warmup(oid) {
+            return Ok(None);
+        }
         #[cfg(test)]
         crate::hot_path_test_metrics::record_loose_path_open_for_active_scope();
         self.loose.read(oid)
@@ -283,7 +335,7 @@ impl FilesSource {
             match self.midx.read_info(oid) {
                 Ok(Some(info)) => return Ok(Some(info)),
                 Ok(None) => {}
-                Err(Error::Midx(_)) => {}
+                Err(Error::Object(ObjectError::Midx(_))) => {}
                 Err(err) if Self::midx_read_should_fallback_to_packs(&err) => {}
                 Err(err) => return Err(err),
             }
@@ -292,7 +344,7 @@ impl FilesSource {
         match pack::try_read_object_info_from_packs_with_options(&self.objects_dir, oid, pack_opts)
         {
             Ok(info) => return Ok(Some(info)),
-            Err(Error::ObjectNotFound(_)) => {}
+            Err(Error::Object(ObjectError::NotFound { .. })) => {}
             Err(err) => return Err(err),
         }
 
@@ -303,11 +355,14 @@ impl FilesSource {
                 PackLookupOptions::MIDX_COVERED_PACKS,
             ) {
                 Ok(info) => return Ok(Some(info)),
-                Err(Error::ObjectNotFound(_)) => {}
+                Err(Error::Object(ObjectError::NotFound { .. })) => {}
                 Err(err) => return Err(err),
             }
         }
 
+        if self.skip_loose_probe_after_empty_warmup(oid) {
+            return Ok(None);
+        }
         #[cfg(test)]
         crate::hot_path_test_metrics::record_loose_path_open_for_active_scope();
         self.loose.read_info(oid)
@@ -336,11 +391,7 @@ impl FilesSource {
                 None => LocalSizedRead::Missing,
             })
         };
-        if PackStore::read_context_matches_objects_dir(&self.objects_dir) {
-            probe()
-        } else {
-            PackStore::with_context(self.packs.pack_store().clone(), probe)
-        }
+        self.with_pack_access(probe)
     }
 
     fn read_with_pack_retry(&self, oid: &ObjectId) -> Result<Option<Object>> {
@@ -434,12 +485,7 @@ impl FilesSource {
         populate_delta_lru: bool,
         buf: &mut Vec<u8>,
     ) -> Result<Option<ObjectKind>> {
-        let mut read = || self.read_with_pack_retry_into(oid, populate_delta_lru, buf);
-        if PackStore::read_context_matches_objects_dir(&self.objects_dir) {
-            read()
-        } else {
-            PackStore::with_context(self.packs.pack_store().clone(), read)
-        }
+        self.with_pack_access(|| self.read_with_pack_retry_into(oid, populate_delta_lru, buf))
     }
 
     /// See [`crate::odb::Odb::read_packed_commit_header_block_into`].
@@ -448,12 +494,20 @@ impl FilesSource {
         oid: &ObjectId,
         buf: &mut Vec<u8>,
     ) -> Result<bool> {
-        let mut read = || pack::read_packed_commit_header_block_into(&self.objects_dir, oid, buf);
-        if PackStore::read_context_matches_objects_dir(&self.objects_dir) {
-            read()
-        } else {
-            PackStore::with_context(self.packs.pack_store().clone(), read)
-        }
+        self.with_pack_access(|| {
+            pack::read_packed_commit_header_block_into(&self.objects_dir, oid, buf)
+        })
+    }
+
+    /// See [`crate::odb::Odb::read_packed_commit_header_blocks`].
+    pub(crate) fn read_packed_commit_header_blocks(
+        &self,
+        oids: &[ObjectId],
+        found: impl FnMut(usize, &[u8]),
+    ) -> Result<()> {
+        self.with_pack_access(|| {
+            pack::read_packed_commit_header_blocks(&self.objects_dir, oids, found)
+        })
     }
 }
 
@@ -463,12 +517,7 @@ impl ObjectStore for FilesSource {
     }
 
     fn read(&self, oid: &ObjectId) -> Result<Option<Object>> {
-        if PackStore::read_context_matches_objects_dir(&self.objects_dir) {
-            return self.read_with_pack_retry(oid);
-        }
-        PackStore::with_context(self.packs.pack_store().clone(), || {
-            self.read_with_pack_retry(oid)
-        })
+        self.with_pack_access(|| self.read_with_pack_retry(oid))
     }
 
     fn read_into(&self, oid: &ObjectId, buf: &mut Vec<u8>) -> Result<Option<ObjectKind>> {
@@ -476,12 +525,7 @@ impl ObjectStore for FilesSource {
     }
 
     fn read_info(&self, oid: &ObjectId) -> Result<Option<ObjectInfo>> {
-        if PackStore::read_context_matches_objects_dir(&self.objects_dir) {
-            return self.read_info_with_pack_retry(oid);
-        }
-        PackStore::with_context(self.packs.pack_store().clone(), || {
-            self.read_info_with_pack_retry(oid)
-        })
+        self.with_pack_access(|| self.read_info_with_pack_retry(oid))
     }
 
     fn contains(&self, oid: &ObjectId) -> Result<bool> {
@@ -491,12 +535,7 @@ impl ObjectStore for FilesSource {
         if self.loose.object_path(oid).is_file() {
             return Ok(true);
         }
-        let check = || self.contains_in_packs(oid);
-        if PackStore::read_context_matches_objects_dir(&self.objects_dir) {
-            check()
-        } else {
-            PackStore::with_context(self.packs.pack_store().clone(), check)
-        }
+        self.with_pack_access(|| self.contains_in_packs(oid))
     }
 
     fn contains_many(&self, oids: &[ObjectId]) -> Result<Vec<bool>> {
@@ -517,11 +556,7 @@ impl ObjectStore for FilesSource {
                 })
                 .collect()
         };
-        if PackStore::read_context_matches_objects_dir(&self.objects_dir) {
-            probe()
-        } else {
-            PackStore::with_context(self.packs.pack_store().clone(), probe)
-        }
+        self.with_pack_access(probe)
     }
 
     fn open_stream(&self, oid: &ObjectId) -> Result<Option<ObjectStream<'_>>> {
@@ -532,19 +567,19 @@ impl ObjectStore for FilesSource {
                 reader: Box::new(std::io::Cursor::new(Vec::<u8>::new())),
             }));
         }
-        PackStore::with_context(self.packs.pack_store().clone(), || {
+        self.with_pack_access(|| {
             if self.use_midx {
                 match self.midx.open_stream(oid) {
                     Ok(Some(stream)) => return Ok(Some(stream)),
                     Ok(None) => {}
-                    Err(Error::Midx(_)) => {}
+                    Err(Error::Object(ObjectError::Midx(_))) => {}
                     Err(err) if Self::midx_read_should_fallback_to_packs(&err) => {}
                     Err(err) => return Err(err),
                 }
             }
             match self.packs.open_stream(oid) {
                 Ok(Some(stream)) => return Ok(Some(stream)),
-                Ok(None) | Err(Error::ObjectNotFound(_)) => {}
+                Ok(None) | Err(Error::Object(ObjectError::NotFound { .. })) => {}
                 Err(err) => return Err(err),
             }
             self.loose.open_stream(oid)
@@ -553,7 +588,7 @@ impl ObjectStore for FilesSource {
 
     fn for_each_object(&self, f: &mut dyn FnMut(&ObjectId) -> ControlFlow<()>) -> Result<()> {
         let mut seen = HashSet::new();
-        PackStore::with_context(self.packs.pack_store().clone(), || {
+        self.with_pack_access(|| {
             let mut layer = |store: &dyn ObjectStore| -> Result<bool> {
                 super::for_each_propagate_break(store, &mut |oid| {
                     if !seen.insert(*oid) {
@@ -576,17 +611,11 @@ impl ObjectStore for FilesSource {
     fn lookup_prefix(&self, prefix: &str, limit: usize, out: &mut Vec<ObjectId>) -> Result<()> {
         ObjectIdPrefix::from_hex(prefix, self.hash_algo())?;
         let mut seen: HashSet<ObjectId> = out.iter().copied().collect();
-        if PackStore::read_context_matches_objects_dir(&self.objects_dir) {
-            files_lookup_prefix_layers(self, prefix, limit, out, &mut seen)
-        } else {
-            PackStore::with_context(self.packs.pack_store().clone(), || {
-                files_lookup_prefix_layers(self, prefix, limit, out, &mut seen)
-            })
-        }
+        self.with_pack_access(|| files_lookup_prefix_layers(self, prefix, limit, out, &mut seen))
     }
 
     fn refresh(&self) -> Result<bool> {
-        PackStore::with_context(self.packs.pack_store().clone(), || {
+        self.with_pack_access(|| {
             let mut changed = self.packs.refresh()?;
             if self.midx.refresh()? {
                 changed = true;
@@ -609,9 +638,7 @@ impl WritableObjectStore for FilesSource {
         if self.loose.freshen(oid)? {
             return Ok(true);
         }
-        PackStore::with_context(self.packs.pack_store().clone(), || {
-            self.packs.freshen_pack_containing(oid)
-        })
+        self.with_pack_access(|| self.packs.freshen_pack_containing(oid))
     }
 }
 

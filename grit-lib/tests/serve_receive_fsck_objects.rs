@@ -11,9 +11,8 @@ use std::process::{Command, Stdio};
 use grit_lib::config::environment::{Environment, RepositoryOptions};
 use grit_lib::maintenance::fsck::{FsckMsgLevel, ObjectFsckPolicy, SkipListError};
 use grit_lib::objects::{HashAlgo, ObjectId, ObjectKind};
-use grit_lib::refs::resolve_ref;
 use grit_lib::remote::serve::{
-    receive_pack, ProtocolVersion, ReceiveOutcome, ReceivePolicy, RefUpdateRefusal, ServeOptions,
+    ProtocolVersion, ReceiveOutcome, ReceivePack, ReceivePolicy, RefUpdateRefusal, ServeOptions,
     UnpackError,
 };
 use grit_lib::repo::Repository;
@@ -115,14 +114,9 @@ fn serve_push(repo: &Repository, policy: &ReceivePolicy, body: &[u8]) -> Pushed 
         ..ServeOptions::default()
     };
     let mut output = Vec::new();
-    let outcome = receive_pack(
-        repo,
-        &mut std::io::Cursor::new(body),
-        &mut output,
-        &opts,
-        policy,
-    )
-    .expect("receive_pack");
+    let outcome = ReceivePack::new(repo, &opts, policy)
+        .run(&mut std::io::Cursor::new(body), &mut output)
+        .expect("receive_pack");
     Pushed {
         outcome,
         report: String::from_utf8_lossy(&output).into_owned(),
@@ -178,7 +172,7 @@ impl Fixture {
     }
 
     fn config_policy(&self) -> ReceivePolicy {
-        ReceivePolicy::from_config(&self.server().config().expect("config"))
+        ReceivePolicy::from_config(&self.server().config().snapshot().expect("config"))
     }
 
     /// A commit on `base` whose author line has no email (`missingEmail`).
@@ -253,7 +247,10 @@ impl Fixture {
             "{}",
             pushed.report
         );
-        assert!(resolve_ref(&self.bare, "refs/heads/bad").is_err());
+        assert!(grit_test_support::refs::at(&self.bare)
+            .references()
+            .resolve("refs/heads/bad")
+            .is_err());
         assert!(
             !self.server().odb().exists(&bad),
             "refused object must not enter the repository"
@@ -272,7 +269,13 @@ impl Fixture {
             pushed.outcome
         );
         assert!(pushed.outcome.updates[0].error.is_none());
-        assert_eq!(resolve_ref(&self.bare, "refs/heads/bad").expect("ref"), tip);
+        assert_eq!(
+            grit_test_support::refs::at(&self.bare)
+                .references()
+                .resolve("refs/heads/bad")
+                .expect("ref"),
+            tip
+        );
     }
 }
 
@@ -366,7 +369,10 @@ fn unreadable_skip_list_refuses_the_push() {
         pushed.outcome
     );
     assert!(pushed.report.contains("skip list"), "{}", pushed.report);
-    assert!(resolve_ref(&f.bare, "refs/heads/bad").is_err());
+    assert!(grit_test_support::refs::at(&f.bare)
+        .references()
+        .resolve("refs/heads/bad")
+        .is_err());
 }
 
 #[test]

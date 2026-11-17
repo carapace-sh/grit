@@ -15,9 +15,11 @@ grit clean [--dry-run] [--ignored | --only-ignored] [-e <pattern>] [--files-only
 
 ## Description
 
-Removes untracked files (and untracked directories) from the working tree. Tracked files and nested Git repositories (directories that contain their own `.git`) are never removed.
+Removes untracked files (and untracked directories) from the working tree. Pathnames in human and `--markdown` output use the same quoting rules as [`grit status`](../status/) (see **Description** there). Tracked files and nested Git repositories (directories that contain their own `.git`) are never removed.
 
 Without `-f` / `--force`, `grit clean` is a **dry run**: it prints what would be removed and leaves the work tree unchanged. This differs from Git’s `clean.requireForce` error on purpose — previewing is the default so you can see the impact before deleting anything. `--dry-run` is accepted explicitly (and conflicts with `-f`).
+
+While files are being deleted, Ctrl+C (or `SIGTERM` / `SIGHUP` on Unix) stops with `error: operation cancelled` and exit code **130**. Paths removed before the interrupt stay removed; there is no index lock to restore.
 
 Pass `-f` to actually delete the listed paths. Pass `--ignored` to also remove ignored files (similar to `git clean -x`). Pass `--only-ignored` to remove only ignored paths (similar to `git clean -X`); it cannot be combined with `--ignored`.
 
@@ -73,7 +75,7 @@ Pass `--json` for stable, scripting-friendly output:
 | Field | Type | Meaning |
 | ----- | ---- | ------- |
 | `dry_run` | boolean | `true` when `-f` was not passed (preview only); `false` when paths were actually deleted. |
-| `removed` | array of strings | Repository-relative paths removed, or that would be removed when `-f` was not passed. |
+| `removed` | array of strings | Repository-relative paths removed, or that would be removed when `-f` was not passed. Non-UTF-8 names use the reversible `grit+pathhex:` storage form (same as `grit status` and `grit diff --json`); a work tree file literally named `grit+pathhex:…` is double-encoded in this field. |
 | `scope` | string | `untracked`, `untracked_and_ignored`, or `only_ignored`. |
 
 Example (dry run):

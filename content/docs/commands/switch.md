@@ -30,13 +30,13 @@ Use `--dry-run` to run the same overwrite checks and report how many paths would
 
 On the first switch after `clone --no-checkout`, the dry-run count includes every path to materialize, including files unchanged between the old and new commits.
 
-A switch either completes or changes nothing. Pressing Ctrl+C, or sending `SIGTERM` or `SIGHUP` on Unix, while files are being checked out stops the switch with `error: operation cancelled`; `HEAD`, the index and the work tree are left exactly as they were, so `grit status` stays clean, no `.git/index.lock` is left behind and the same switch can simply be run again. This works the same in a Windows console, where Ctrl+Break counts as Ctrl+C. A second interrupt terminates grit at once, without that cleanup; only `SIGKILL` or closing the console window skips rollback. In the rare case that a path cannot be put back (for example a directory that became read-only), the error has kind `checkout_incomplete` and lists those paths in `paths`; `HEAD` and the index still did not move.
+A switch either completes or changes nothing. Pressing Ctrl+C, or sending `SIGTERM` or `SIGHUP` on Unix, while files are being checked out stops the switch with `error: operation cancelled`; `HEAD`, the index and the work tree are left exactly as they were, so `grit status` stays clean, no `.git/index.lock` is left behind and the same switch can simply be run again. If cancellation is already requested before the switch starts (or is observed while the plan is being built), grit returns cancelled without deleting work-tree paths. This works the same in a Windows console, where Ctrl+Break counts as Ctrl+C. A second interrupt terminates grit at once, without that cleanup; only `SIGKILL` or closing the console window skips rollback. In the rare case that a path cannot be put back (for example a directory that became read-only), the error has kind `checkout_incomplete` and lists those paths in `paths`; `HEAD` and the index still did not move.
 
 Switching is refused while a merge, rebase, pick, revert or `am` is paused, whether grit or `git` started it: those operations finish by committing onto the current `HEAD`, so moving it would land their result on the wrong branch. When grit knows how the operation finishes or is cancelled (merge, rebase, pick, revert), the error names those commands. `--dry-run` is refused too. A bisect does not block a switch.
 
 A local branch can only be checked out in one worktree at a time (including linked worktrees created with `git worktree add`). Switching to a branch that is already checked out elsewhere fails.
 
-With `-c`, creates the branch at the current commit (or at `<start-point>` when you pass one), then switches to it.
+With `-c`, creates the branch at the current commit (or at `<start-point>` when you pass one), then switches to it. When `<start-point>` is a remote-tracking branch (for example `origin/main`), grit configures upstream tracking the same way as [`grit branch --track`](../branch/) and `git switch -c`, unless you pass `--no-track` or `branch.autoSetupMerge` is `false`/`simple`.
 
 When `<branch>` names a remote-tracking branch (for example `origin/feature`), Grit creates `feature` at the same commit and switches to it if no local branch exists yet. It also records upstream tracking in the repository config (`branch.feature.remote` and `branch.feature.merge`), the same keys `git switch` writes, so `grit status`, `grit pull`, and `grit push` use the matching remote branch.
 
@@ -58,6 +58,8 @@ Updating the working tree uses parallel checkout when the change set is large en
 | `-`, `@{-1}` | Switch to the previous branch (from the `HEAD` reflog); fails when there is no prior checkout entry. |
 | `<start-point>` | With `-c`, commit to create the branch from (defaults to `HEAD`). |
 | `-c`, `--create` | Create the branch first, then switch to it. Fails if the branch already exists. |
+| `-t`, `--track` | With `-c`, always configure upstream from the start point. |
+| `--no-track` | With `-c`, do not configure upstream. |
 | `--detach` | Check out a commit in detached `HEAD` mode instead of switching a branch. |
 | `--dry-run` | Run overwrite checks and report how many paths would change; do not update refs, the index, or the worktree. |
 
@@ -74,8 +76,13 @@ hooks: post-checkout
 $ grit switch -
 Switched to branch feature
 
+$ grit switch -c work origin/main
+Created and switched to branch work
+  tracking origin/main
+
 $ grit switch -c br2 origin/br2
 Created and switched to branch br2
+  tracking origin/br2
 
 $ grit switch --detach HEAD~1
 HEAD detached at a1b2c3d
@@ -144,6 +151,7 @@ Pass `--json` for stable, scripting-friendly output:
 | ----- | ---- | ------- |
 | `branch` | string or null | Short branch name `HEAD` is on after the switch; `null` when detached. |
 | `created` | boolean | `true` when `-c` or remote DWIM created the branch. |
+| `upstream` | string or null | When `-c` configured upstream tracking, the remote branch name (for example `origin/main`); omitted when none was set. |
 | `detached` | boolean | `true` when `HEAD` is detached after the switch (`branch` is `null`). |
 | `commit` | string or null | Full hex oid when `detached` is true; omitted when attached. |
 | `dry_run` | boolean | `true` when `--dry-run` was used (omitted when false). |
@@ -154,7 +162,7 @@ Pass `--json` for stable, scripting-friendly output:
 | `stranded_truncated` | boolean | `true` when `stranded_commits` was capped (omitted when false). |
 | `path_collisions` | array of strings | Index paths that collided during checkout on a case-insensitive filesystem. Omitted when empty. |
 
-On a case-insensitive filesystem (`core.ignorecase`), when the destination tree contains paths that differ only by case (or other spellings that map to one on-disk file), grit prints a **warning** on **stderr** in human mode listing every colliding index path, the same message as [`grit clone`](clone/). Only one path from each group exists on disk; status and diff treat index rows whose blob does not match the shared dentry as modified.
+On a case-insensitive filesystem (`core.ignorecase`), when the destination tree contains paths that differ only by case (or other spellings that map to one on-disk file), grit prints a **warning** on **stderr** in human mode listing every colliding index path, the same message as [`grit clone`](../clone/). Only one path from each group exists on disk; status and diff treat index rows whose blob does not match the shared dentry as modified.
 
 Example (branch switch):
 
@@ -214,6 +222,8 @@ Example (leaving a detached `HEAD` with one commit of its own):
 On overwrite refusal with `--json`, stdout is a single object with `kind` `would_overwrite` and `would_overwrite.reason` (`local_changes` or `untracked`) plus a sorted `paths` array, and a `hint`, for example `{"error":"you have uncommitted changes — commit them before switching","hint":"…","kind":"would_overwrite","would_overwrite":{"paths":["notes.txt"],"reason":"local_changes"}}`. See the [error schema](/schemas/error/v1.json).
 
 A branch that does not exist is `kind` `branch_not_found` with a `hint`.
+
+With `--create`, an existing name is `kind` `branch_already_exists`, an invalid name is `branch_invalid_name`, and an empty repository with no start point is `branch_no_commits`. A start point that does not resolve is `revision_not_found`; one that resolves to a non-commit object is a plain error string with no dedicated `kind`.
 
 While a merge, rebase, pick or revert is paused, the refusal is `{"error": "interactive rebase in progress", "kind": "operation_in_progress"}` (the `error` names the paused operation).
 

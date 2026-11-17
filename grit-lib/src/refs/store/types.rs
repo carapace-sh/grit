@@ -1,47 +1,12 @@
 //! Reference store value types.
 
-use crate::check_ref_format::{check_refname_format, RefNameError, RefNameOptions};
+pub use crate::check_ref_format::{RefName, RefNameRef};
+
 use crate::objects::ObjectId;
-
-/// Validated full ref name (for example `refs/heads/main`).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct RefName(String);
-
-impl RefName {
-    /// Parse and validate `name` using Git refname rules.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`RefNameError`] when the name is empty or otherwise invalid.
-    pub fn try_from(name: &str) -> Result<Self, RefNameError> {
-        if name == "HEAD" {
-            return Ok(Self(name.to_owned()));
-        }
-        check_refname_format(name, &RefNameOptions::default())?;
-        Ok(Self(name.to_owned()))
-    }
-
-    /// Borrow the stored ref name.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl AsRef<str> for RefName {
-    fn as_ref(&self) -> &str {
-        self.as_str()
-    }
-}
-
-impl std::fmt::Display for RefName {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
 
 /// Storage-level ref value without DWIM or resolution.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde-models", derive(serde::Serialize, serde::Deserialize))]
 pub enum RawRef {
     /// Points directly at an object.
     Direct(ObjectId),
@@ -61,10 +26,11 @@ impl RawRef {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefEntry {
     /// Full ref name.
-    pub name: String,
+    pub name: RefName,
     /// Stored value (direct or symbolic).
     pub value: RawRef,
-    /// Peeled oid when `value` is symbolic and resolves successfully.
+    /// Peeled tip when `value` is symbolic and resolves, or when a direct ref's
+    /// `packed-refs` record includes a `^` peel line.
     pub peeled: Option<ObjectId>,
 }
 
@@ -81,7 +47,7 @@ pub enum Expected {
     /// Ref must be a direct ref pointing at this oid.
     Oid(ObjectId),
     /// Ref must be symbolic with this exact target name.
-    Symref(String),
+    Symref(RefName),
 }
 
 /// Metadata appended to a ref update for the reflog.
@@ -97,6 +63,22 @@ pub struct ReflogUpdate {
     pub old_oid: Option<crate::objects::ObjectId>,
     /// When set, recorded as the reflog new OID instead of deriving from the update.
     pub new_oid: Option<crate::objects::ObjectId>,
+}
+
+impl ReflogUpdate {
+    /// Build a reflog line from a committer [`crate::ident::Signature`].
+    ///
+    /// Old and new object ids are left unset so the ref store derives them from the update.
+    #[must_use]
+    pub fn from_signature(signature: &crate::ident::Signature, message: impl Into<String>) -> Self {
+        Self {
+            identity: signature.reflog_name_email(),
+            message: message.into(),
+            time: signature.time,
+            old_oid: None,
+            new_oid: None,
+        }
+    }
 }
 
 /// Per-update flags (Git `REF_NO_DEREF` / `REF_LOG_ONLY` / `REF_SKIP_OID_VERIFICATION`
@@ -120,18 +102,18 @@ pub struct RefUpdateFlags {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefCaseOnlyRename {
     /// Full ref name before rename (for example `refs/heads/topic`).
-    pub from: String,
+    pub from: RefName,
     /// Full ref name after rename (for example `refs/heads/Topic`).
-    pub to: String,
+    pub to: RefName,
 }
 
 /// Move a branch reflog to a new ref name and append one entry (branch rename).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefReflogRename {
     /// Full ref name whose reflog is moved (for example `refs/heads/topic`).
-    pub from: String,
+    pub from: RefName,
     /// Destination ref name (for example `refs/heads/new`).
-    pub to: String,
+    pub to: RefName,
     /// Rename entry appended as the newest reflog line on `to`.
     pub append: ReflogUpdate,
 }
@@ -140,12 +122,14 @@ pub struct RefReflogRename {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefUpdate {
     /// Full ref name.
-    pub name: String,
+    pub name: RefName,
     /// New stored value, or `None` to delete the ref.
     pub new_value: Option<RawRef>,
     /// Required current state for compare-and-swap.
     pub expected: Expected,
-    /// Reflog line to append when the update commits (`None` skips reflog).
+    /// Reflog line to append when the update commits (`None` skips reflog). Ignored when
+    /// [`Self::new_value`] is `None` and the update is not log-only: deleting a ref drops
+    /// its reflog, matching Git.
     pub reflog: Option<ReflogUpdate>,
     /// Update modifiers.
     pub flags: RefUpdateFlags,

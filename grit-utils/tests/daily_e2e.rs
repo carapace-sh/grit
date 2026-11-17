@@ -349,6 +349,7 @@ const MATRIX_SMOKE_IDS: [&str; 43] = [
     "diff/staged@deep-tree",
     "log/oneline-100@synth-100k",
     "log/all@git-git",
+    "log/group-by-author@git-git",
     "log/path@git-git",
     "show/head@synth-10k",
     "show/head@big-blobs",
@@ -476,6 +477,10 @@ fn baseline_grit_records_headlines() {
     let row = &report.scenarios[0];
     let base = row.baseline_grit.as_ref().expect("baseline_grit row");
     assert!(base.peak_rss_bytes > 0);
+    assert_eq!(
+        base.runs, row.grit.runs,
+        "baseline_grit must time the same number of samples as grit"
+    );
     assert!(row.baseline_grit_ratio.is_some());
     assert!(report.tools.baseline_grit.is_some());
 }

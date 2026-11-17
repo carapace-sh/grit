@@ -13,12 +13,8 @@ use grit_lib::index::{Index, IndexEntry, MODE_REGULAR};
 use grit_lib::objects::{
     parse_commit, parse_tree, serialize_commit, CommitData, ObjectId, ObjectKind,
 };
-use grit_lib::refs::{resolve_ref, write_ref};
 use grit_lib::repo::Repository;
-use grit_lib::revwalk::history::{
-    plan_rewrite, CommitEdit, EmptyPolicy, HistoryEdits, RefScope, RewriteOptions,
-};
-use grit_lib::state::resolve_head;
+use grit_lib::revwalk::history::{CommitEdit, EmptyPolicy, HistoryEdits, RefScope, RewriteOptions};
 
 use support::{build_commit_dag, commit_file, git, git_rev_parse, HistoryRepo};
 
@@ -65,7 +61,7 @@ fn tree_plus_file(
         path: path.as_bytes().to_vec(),
         base_index_pos: 0,
     });
-    write_tree_from_index(repo.odb(), &index, "")
+    write_tree_from_index(repo.odb(), &index, "").map_err(Into::into)
 }
 
 fn index_entry_from_tree(entry: &grit_lib::objects::TreeEntry, name: &str) -> IndexEntry {
@@ -113,7 +109,7 @@ fn write_tree_with_blob(
         path: path.as_bytes().to_vec(),
         base_index_pos: 0,
     });
-    write_tree_from_index(repo.odb(), &index, "")
+    write_tree_from_index(repo.odb(), &index, "").map_err(Into::into)
 }
 
 fn write_test_commit(
@@ -176,18 +172,19 @@ fn plan_rewrite_rewords_and_replays_linear_descendants() {
             parents: None,
         },
     );
-    let plan = plan_rewrite(
-        &grit,
-        &edits,
-        &RewriteOptions {
-            scope: RefScope::Branches,
-            empty: EmptyPolicy::Drop,
-            committer: committer(2).parse().expect("signature"),
-            preserve_committer: false,
-            sign: true,
-        },
-    )
-    .expect("plan");
+    let plan = grit
+        .history()
+        .plan_rewrite(
+            &edits,
+            &RewriteOptions {
+                scope: RefScope::Branches,
+                empty: EmptyPolicy::Drop,
+                committer: committer(2).parse().expect("signature"),
+                preserve_committer: false,
+                sign: true,
+            },
+        )
+        .expect("plan");
 
     assert_eq!(plan.commits.len(), 2);
     let b_row = plan.commits.iter().find(|r| r.old == oids["b"]).unwrap();
@@ -247,18 +244,19 @@ fn plan_rewrite_preserves_encoding_when_message_unchanged() {
             parents: None,
         },
     );
-    let plan = plan_rewrite(
-        &grit,
-        &edits,
-        &RewriteOptions {
-            scope: RefScope::Branches,
-            empty: EmptyPolicy::Drop,
-            committer: committer(9).parse().expect("signature"),
-            preserve_committer: false,
-            sign: true,
-        },
-    )
-    .expect("plan");
+    let plan = grit
+        .history()
+        .plan_rewrite(
+            &edits,
+            &RewriteOptions {
+                scope: RefScope::Branches,
+                empty: EmptyPolicy::Drop,
+                committer: committer(9).parse().expect("signature"),
+                preserve_committer: false,
+                sign: true,
+            },
+        )
+        .expect("plan");
     let row = plan
         .commits
         .iter()
@@ -303,18 +301,19 @@ fn plan_rewrite_implicit_tree_replay_preserves_ancestor_tree_change() {
             parents: None,
         },
     );
-    let plan = plan_rewrite(
-        &grit,
-        &edits,
-        &RewriteOptions {
-            scope: RefScope::Branches,
-            empty: EmptyPolicy::Drop,
-            committer: committer(20).parse().expect("signature"),
-            preserve_committer: false,
-            sign: true,
-        },
-    )
-    .expect("plan");
+    let plan = grit
+        .history()
+        .plan_rewrite(
+            &edits,
+            &RewriteOptions {
+                scope: RefScope::Branches,
+                empty: EmptyPolicy::Drop,
+                committer: committer(20).parse().expect("signature"),
+                preserve_committer: false,
+                sign: true,
+            },
+        )
+        .expect("plan");
     let new_b = plan
         .commits
         .iter()
@@ -347,18 +346,19 @@ fn plan_rewrite_insert_before_root_succeeds() {
             message: "inserted root parent\n".into(),
         }),
     );
-    let plan = plan_rewrite(
-        &grit,
-        &edits,
-        &RewriteOptions {
-            scope: RefScope::Branches,
-            empty: EmptyPolicy::Drop,
-            committer: committer(21).parse().expect("signature"),
-            preserve_committer: false,
-            sign: true,
-        },
-    )
-    .expect("insert before root");
+    let plan = grit
+        .history()
+        .plan_rewrite(
+            &edits,
+            &RewriteOptions {
+                scope: RefScope::Branches,
+                empty: EmptyPolicy::Drop,
+                committer: committer(21).parse().expect("signature"),
+                preserve_committer: false,
+                sign: true,
+            },
+        )
+        .expect("insert before root");
     assert_eq!(plan.commits.len(), 1);
     assert!(plan.commits[0].new.is_some());
     git_fsck_strict(wt);
@@ -376,7 +376,7 @@ fn plan_rewrite_insert_before_merge_is_rejected() {
     let b = write_test_commit(&grit, tree_b, &[], "b", &ident).expect("b");
     let merge_tree = write_tree_with_blob(&grit, "m.txt", b"m\n").expect("merge tree");
     let merge = write_test_commit(&grit, merge_tree, &[a, b], "merge", &ident).expect("merge");
-    write_ref(grit.git_dir(), "refs/heads/main", &merge).expect("ref");
+    grit_test_support::refs::set_ref(&grit, "refs/heads/main", &merge).expect("ref");
 
     let insert_tree = grit.odb().write(ObjectKind::Tree, &[]).expect("empty tree");
     let mut edits = HistoryEdits::new();
@@ -388,18 +388,19 @@ fn plan_rewrite_insert_before_merge_is_rejected() {
             message: "inserted parent\n".into(),
         }),
     );
-    let err = plan_rewrite(
-        &grit,
-        &edits,
-        &RewriteOptions {
-            scope: RefScope::Head,
-            empty: EmptyPolicy::Drop,
-            committer: committer(23).parse().expect("signature"),
-            preserve_committer: false,
-            sign: true,
-        },
-    )
-    .expect_err("insert before merge");
+    let err = grit
+        .history()
+        .plan_rewrite(
+            &edits,
+            &RewriteOptions {
+                scope: RefScope::Head,
+                empty: EmptyPolicy::Drop,
+                committer: committer(23).parse().expect("signature"),
+                preserve_committer: false,
+                sign: true,
+            },
+        )
+        .expect_err("insert before merge");
     assert!(matches!(
         err,
         grit_lib::revwalk::history::HistoryError::InsertBeforeOnMerge { commit: m } if m == merge
@@ -407,13 +408,13 @@ fn plan_rewrite_insert_before_merge_is_rejected() {
 }
 
 #[test]
-fn plan_rewrite_non_commit_tip_returns_planning_error() {
+fn plan_rewrite_non_commit_tip_is_a_typed_engine_error() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let grit = grit_lib::repo::Repository::init(
+    let (grit, _) = grit_lib::repo::Repository::init(
         dir.path(),
         &grit_lib::repo::InitOptions::new()
             .with_initial_branch("main".to_owned())
-            .with_ref_storage(grit_lib::RefStorageFormat::Files),
+            .with_ref_storage(grit_lib::refs::ref_storage::RefStorageFormat::Files),
     )
     .expect("init");
     let ident = committer(24);
@@ -424,7 +425,7 @@ fn plan_rewrite_non_commit_tip_returns_planning_error() {
     // A corrupt branch on purpose: ref writes refuse a branch at a blob unless told not to check.
     let corrupt = grit_lib::refs::store::RefTransaction::new()
         .update(grit_lib::refs::store::RefUpdate {
-            name: "refs/heads/main".to_owned(),
+            name: grit_lib::refs::store::RefName::from_trusted("refs/heads/main"),
             new_value: Some(grit_lib::refs::store::RawRef::Direct(blob)),
             expected: grit_lib::refs::store::Expected::Any,
             reflog: None,
@@ -434,7 +435,7 @@ fn plan_rewrite_non_commit_tip_returns_planning_error() {
             },
         })
         .expect("txn");
-    grit.refs()
+    grit.ref_store()
         .prepare(corrupt)
         .and_then(|prepared| prepared.commit())
         .expect("ref");
@@ -448,24 +449,33 @@ fn plan_rewrite_non_commit_tip_returns_planning_error() {
             parents: None,
         },
     );
-    let err = plan_rewrite(
-        &grit,
-        &edits,
-        &RewriteOptions {
-            scope: RefScope::Head,
-            empty: EmptyPolicy::Drop,
-            committer: ident.parse().expect("signature"),
-            preserve_committer: false,
-            sign: true,
-        },
-    )
-    .expect_err("blob tip is not a commit");
+    let err = grit
+        .history()
+        .plan_rewrite(
+            &edits,
+            &RewriteOptions {
+                scope: RefScope::Head,
+                empty: EmptyPolicy::Drop,
+                committer: ident.parse().expect("signature"),
+                preserve_committer: false,
+                sign: true,
+            },
+        )
+        .expect_err("blob tip is not a commit");
     assert!(
         matches!(
-            err,
-            grit_lib::revwalk::history::HistoryError::Planning { .. }
+            &err,
+            grit_lib::revwalk::history::HistoryError::Engine(engine)
+                if matches!(
+                    **engine,
+                    grit_lib::revwalk::history::HistoryEngineError::UnexpectedObjectKind {
+                        oid,
+                        expected: ObjectKind::Commit,
+                        actual: ObjectKind::Blob,
+                    } if oid == blob
+                )
         ),
-        "expected planning error, got {err:?}"
+        "expected a typed not-a-commit error, got {err:?}"
     );
 }
 
@@ -520,18 +530,19 @@ fn plan_rewrite_strips_gpgsig_and_gpgsig_sha256() {
                 parents: None,
             },
         );
-        let plan = plan_rewrite(
-            &grit,
-            &edits,
-            &RewriteOptions {
-                scope: RefScope::Head,
-                empty: EmptyPolicy::Drop,
-                committer: committer(22).parse().expect("signature"),
-                preserve_committer: false,
-                sign: true,
-            },
-        )
-        .expect("plan signed rewrite");
+        let plan = grit
+            .history()
+            .plan_rewrite(
+                &edits,
+                &RewriteOptions {
+                    scope: RefScope::Head,
+                    empty: EmptyPolicy::Drop,
+                    committer: committer(22).parse().expect("signature"),
+                    preserve_committer: false,
+                    sign: true,
+                },
+            )
+            .expect("plan signed rewrite");
         let new_oid = plan.commits[0].new.expect("new commit");
         let parsed = parse_commit(&grit.odb().read(&new_oid).expect("read").data).expect("parse");
         let raw = String::from_utf8_lossy(&parsed.extra_headers);
@@ -555,7 +566,7 @@ fn plan_rewrite_keeps_all_merge_parents_on_implicit_tree_reword() {
     git(wt, &["checkout", "main"]);
     git(wt, &["merge", "side", "-m", "merge m"]);
     let grit = open_grit(wt);
-    let merge_oid = match resolve_head(grit.git_dir()).expect("head") {
+    let merge_oid = match grit.references().head().expect("head") {
         grit_lib::state::HeadState::Branch { oid: Some(oid), .. } => oid,
         grit_lib::state::HeadState::Detached { oid } => oid,
         _ => panic!("expected merge tip"),
@@ -573,18 +584,19 @@ fn plan_rewrite_keeps_all_merge_parents_on_implicit_tree_reword() {
             parents: None,
         },
     );
-    let plan = plan_rewrite(
-        &grit,
-        &edits,
-        &RewriteOptions {
-            scope: RefScope::Head,
-            empty: EmptyPolicy::Drop,
-            committer: committer(23).parse().expect("signature"),
-            preserve_committer: false,
-            sign: true,
-        },
-    )
-    .expect("merge reword");
+    let plan = grit
+        .history()
+        .plan_rewrite(
+            &edits,
+            &RewriteOptions {
+                scope: RefScope::Head,
+                empty: EmptyPolicy::Drop,
+                committer: committer(23).parse().expect("signature"),
+                preserve_committer: false,
+                sign: true,
+            },
+        )
+        .expect("merge reword");
     let new_oid = plan
         .commits
         .iter()
@@ -612,18 +624,19 @@ fn plan_rewrite_skips_merge_when_parent_tree_unchanged() {
             parents: None,
         },
     );
-    let _plan = plan_rewrite(
-        &grit,
-        &edits,
-        &RewriteOptions {
-            scope: RefScope::Branches,
-            empty: EmptyPolicy::Drop,
-            committer: committer(3).parse().expect("signature"),
-            preserve_committer: false,
-            sign: true,
-        },
-    )
-    .expect("plan");
+    let _plan = grit
+        .history()
+        .plan_rewrite(
+            &edits,
+            &RewriteOptions {
+                scope: RefScope::Branches,
+                empty: EmptyPolicy::Drop,
+                committer: committer(3).parse().expect("signature"),
+                preserve_committer: false,
+                sign: true,
+            },
+        )
+        .expect("plan");
 }
 
 #[test]
@@ -646,18 +659,19 @@ fn plan_rewrite_updates_all_descendant_branches() {
             parents: None,
         },
     );
-    let plan = plan_rewrite(
-        &grit,
-        &edits,
-        &RewriteOptions {
-            scope: RefScope::Branches,
-            empty: EmptyPolicy::Drop,
-            committer: committer(4).parse().expect("signature"),
-            preserve_committer: false,
-            sign: true,
-        },
-    )
-    .expect("plan");
+    let plan = grit
+        .history()
+        .plan_rewrite(
+            &edits,
+            &RewriteOptions {
+                scope: RefScope::Branches,
+                empty: EmptyPolicy::Drop,
+                committer: committer(4).parse().expect("signature"),
+                preserve_committer: false,
+                sign: true,
+            },
+        )
+        .expect("plan");
 
     let names: Vec<_> = plan.ref_updates.iter().map(|u| u.name.as_str()).collect();
     assert!(names.iter().any(|n| n.ends_with("main")));
@@ -687,21 +701,28 @@ fn plan_rewrite_head_scope_updates_only_head() {
             parents: None,
         },
     );
-    let plan = plan_rewrite(
-        &grit,
-        &edits,
-        &RewriteOptions {
-            scope: RefScope::Head,
-            empty: EmptyPolicy::Drop,
-            committer: committer(5).parse().expect("signature"),
-            preserve_committer: false,
-            sign: true,
-        },
-    )
-    .expect("plan");
+    let plan = grit
+        .history()
+        .plan_rewrite(
+            &edits,
+            &RewriteOptions {
+                scope: RefScope::Head,
+                empty: EmptyPolicy::Drop,
+                committer: committer(5).parse().expect("signature"),
+                preserve_committer: false,
+                sign: true,
+            },
+        )
+        .expect("plan");
 
-    assert!(plan.ref_updates.iter().all(|u| u.name.contains("main")));
-    assert!(!plan.ref_updates.iter().any(|u| u.name.ends_with("feature")));
+    assert!(plan
+        .ref_updates
+        .iter()
+        .all(|u| u.name.as_str().contains("main")));
+    assert!(!plan
+        .ref_updates
+        .iter()
+        .any(|u| u.name.as_str().ends_with("feature")));
 }
 
 #[test]
@@ -724,18 +745,19 @@ fn plan_rewrite_replays_merge_descendants() {
             parents: None,
         },
     );
-    let plan = plan_rewrite(
-        &grit,
-        &edits,
-        &RewriteOptions {
-            scope: RefScope::Branches,
-            empty: EmptyPolicy::Drop,
-            committer: committer(6).parse().expect("signature"),
-            preserve_committer: false,
-            sign: true,
-        },
-    )
-    .expect("merge replay");
+    let plan = grit
+        .history()
+        .plan_rewrite(
+            &edits,
+            &RewriteOptions {
+                scope: RefScope::Branches,
+                empty: EmptyPolicy::Drop,
+                committer: committer(6).parse().expect("signature"),
+                preserve_committer: false,
+                sign: true,
+            },
+        )
+        .expect("merge replay");
     let merge_row = plan
         .commits
         .iter()
@@ -765,11 +787,11 @@ fn plan_rewrite_replays_merge_descendants() {
 #[test]
 fn plan_rewrite_reports_conflict_with_paths() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let grit = grit_lib::repo::Repository::init(
+    let (grit, _) = grit_lib::repo::Repository::init(
         dir.path(),
         &grit_lib::repo::InitOptions::new()
             .with_initial_branch("main".to_owned())
-            .with_ref_storage(grit_lib::RefStorageFormat::Files),
+            .with_ref_storage(grit_lib::refs::ref_storage::RefStorageFormat::Files),
     )
     .expect("init");
     let ident = committer(7);
@@ -784,7 +806,7 @@ fn plan_rewrite_reports_conflict_with_paths() {
     let a = write_test_commit(&grit, tree_base, &[], "a", &ident).expect("a");
     let b = write_test_commit(&grit, tree_left, &[a], "b", &ident).expect("b");
     let c = write_test_commit(&grit, tree_right, &[b], "c", &ident).expect("c");
-    write_ref(grit.git_dir(), "refs/heads/main", &c).expect("ref");
+    grit_test_support::refs::set_ref(&grit, "refs/heads/main", &c).expect("ref");
 
     let mut edits = HistoryEdits::new();
     edits.insert(
@@ -799,18 +821,19 @@ fn plan_rewrite_reports_conflict_with_paths() {
         },
     );
 
-    let err = plan_rewrite(
-        &grit,
-        &edits,
-        &RewriteOptions {
-            scope: RefScope::Head,
-            empty: EmptyPolicy::Abort,
-            committer: ident.parse().expect("signature"),
-            preserve_committer: false,
-            sign: true,
-        },
-    )
-    .expect_err("conflict");
+    let err = grit
+        .history()
+        .plan_rewrite(
+            &edits,
+            &RewriteOptions {
+                scope: RefScope::Head,
+                empty: EmptyPolicy::Abort,
+                committer: ident.parse().expect("signature"),
+                preserve_committer: false,
+                sign: true,
+            },
+        )
+        .expect_err("conflict");
     match err {
         grit_lib::revwalk::history::HistoryError::Conflict { conflicts, .. } => {
             assert!(conflicts.iter().any(|c| c.path.contains("conflict.txt")
@@ -823,11 +846,11 @@ fn plan_rewrite_reports_conflict_with_paths() {
 #[test]
 fn plan_rewrite_empty_policy_drop_keep_abort() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let grit = grit_lib::repo::Repository::init(
+    let (grit, _) = grit_lib::repo::Repository::init(
         dir.path(),
         &grit_lib::repo::InitOptions::new()
             .with_initial_branch("main".to_owned())
-            .with_ref_storage(grit_lib::RefStorageFormat::Files),
+            .with_ref_storage(grit_lib::refs::ref_storage::RefStorageFormat::Files),
     )
     .expect("init");
     let ident = committer(8);
@@ -836,7 +859,7 @@ fn plan_rewrite_empty_policy_drop_keep_abort() {
     let a = write_test_commit(&grit, tree_a, &[], "a", &ident).expect("a");
     let b = write_test_commit(&grit, tree_b, &[a], "b", &ident).expect("b");
     let c = write_test_commit(&grit, tree_a, &[b], "c", &ident).expect("c");
-    write_ref(grit.git_dir(), "refs/heads/main", &c).expect("ref");
+    grit_test_support::refs::set_ref(&grit, "refs/heads/main", &c).expect("ref");
     let oids_c = c;
     let mut edits_drop = HistoryEdits::new();
     edits_drop.insert(
@@ -848,18 +871,19 @@ fn plan_rewrite_empty_policy_drop_keep_abort() {
             parents: None,
         },
     );
-    let drop_plan = plan_rewrite(
-        &grit,
-        &edits_drop,
-        &RewriteOptions {
-            scope: RefScope::Head,
-            empty: EmptyPolicy::Drop,
-            committer: committer(8).parse().expect("signature"),
-            preserve_committer: false,
-            sign: true,
-        },
-    )
-    .expect("drop");
+    let drop_plan = grit
+        .history()
+        .plan_rewrite(
+            &edits_drop,
+            &RewriteOptions {
+                scope: RefScope::Head,
+                empty: EmptyPolicy::Drop,
+                committer: committer(8).parse().expect("signature"),
+                preserve_committer: false,
+                sign: true,
+            },
+        )
+        .expect("drop");
     let c_drop = drop_plan.commits.iter().find(|r| r.old == oids_c).unwrap();
     let b_drop = drop_plan
         .commits
@@ -883,35 +907,37 @@ fn plan_rewrite_empty_policy_drop_keep_abort() {
             parents: None,
         },
     );
-    let abort_err = plan_rewrite(
-        &grit,
-        &edits_abort,
-        &RewriteOptions {
-            scope: RefScope::Head,
-            empty: EmptyPolicy::Abort,
-            committer: committer(9).parse().expect("signature"),
-            preserve_committer: false,
-            sign: true,
-        },
-    )
-    .expect_err("abort");
+    let abort_err = grit
+        .history()
+        .plan_rewrite(
+            &edits_abort,
+            &RewriteOptions {
+                scope: RefScope::Head,
+                empty: EmptyPolicy::Abort,
+                committer: committer(9).parse().expect("signature"),
+                preserve_committer: false,
+                sign: true,
+            },
+        )
+        .expect_err("abort");
     assert!(matches!(
         abort_err,
         grit_lib::revwalk::history::HistoryError::BecameEmpty { .. }
     ));
 
-    let keep_plan = plan_rewrite(
-        &grit,
-        &edits_abort,
-        &RewriteOptions {
-            scope: RefScope::Head,
-            empty: EmptyPolicy::Keep,
-            committer: committer(10).parse().expect("signature"),
-            preserve_committer: false,
-            sign: true,
-        },
-    )
-    .expect("keep");
+    let keep_plan = grit
+        .history()
+        .plan_rewrite(
+            &edits_abort,
+            &RewriteOptions {
+                scope: RefScope::Head,
+                empty: EmptyPolicy::Keep,
+                committer: committer(10).parse().expect("signature"),
+                preserve_committer: false,
+                sign: true,
+            },
+        )
+        .expect("keep");
     let c_keep = keep_plan.commits.iter().find(|r| r.old == oids_c).unwrap();
     assert!(c_keep.new.is_some());
 }
@@ -947,18 +973,19 @@ fn plan_rewrite_rejects_branch_checked_out_in_other_worktree() {
             parents: None,
         },
     );
-    let err = plan_rewrite(
-        &grit,
-        &edits,
-        &RewriteOptions {
-            scope: RefScope::Branches,
-            empty: EmptyPolicy::Drop,
-            committer: committer(11).parse().expect("signature"),
-            preserve_committer: false,
-            sign: true,
-        },
-    )
-    .expect_err("worktree");
+    let err = grit
+        .history()
+        .plan_rewrite(
+            &edits,
+            &RewriteOptions {
+                scope: RefScope::Branches,
+                empty: EmptyPolicy::Drop,
+                committer: committer(11).parse().expect("signature"),
+                preserve_committer: false,
+                sign: true,
+            },
+        )
+        .expect_err("worktree");
     assert!(matches!(
         err,
         grit_lib::revwalk::history::HistoryError::BranchCheckedOutElsewhere { .. }
@@ -993,18 +1020,19 @@ fn plan_rewrite_skips_same_tip_branch_checked_out_in_other_worktree() {
             parents: None,
         },
     );
-    let plan = plan_rewrite(
-        &grit,
-        &edits,
-        &RewriteOptions {
-            scope: RefScope::Branches,
-            empty: EmptyPolicy::Drop,
-            committer: committer(11).parse().expect("signature"),
-            preserve_committer: false,
-            sign: true,
-        },
-    )
-    .expect("same-tip branch is out of scope");
+    let plan = grit
+        .history()
+        .plan_rewrite(
+            &edits,
+            &RewriteOptions {
+                scope: RefScope::Branches,
+                empty: EmptyPolicy::Drop,
+                committer: committer(11).parse().expect("signature"),
+                preserve_committer: false,
+                sign: true,
+            },
+        )
+        .expect("same-tip branch is out of scope");
     let moved: Vec<&str> = plan.ref_updates.iter().map(|u| u.name.as_str()).collect();
     assert_eq!(moved, ["refs/heads/main"]);
 }
@@ -1026,20 +1054,21 @@ fn plan_rewrite_detached_head() {
             parents: None,
         },
     );
-    let plan = plan_rewrite(
-        &grit,
-        &edits,
-        &RewriteOptions {
-            scope: RefScope::Branches,
-            empty: EmptyPolicy::Drop,
-            committer: committer(12).parse().expect("signature"),
-            preserve_committer: false,
-            sign: true,
-        },
-    )
-    .expect("plan");
+    let plan = grit
+        .history()
+        .plan_rewrite(
+            &edits,
+            &RewriteOptions {
+                scope: RefScope::Branches,
+                empty: EmptyPolicy::Drop,
+                committer: committer(12).parse().expect("signature"),
+                preserve_committer: false,
+                sign: true,
+            },
+        )
+        .expect("plan");
     assert!(plan.head.commit_changes);
-    assert!(plan.ref_updates.iter().any(|u| u.name == "HEAD"));
+    assert!(plan.ref_updates.iter().any(|u| u.name.as_str() == "HEAD"));
 }
 
 #[test]
@@ -1048,7 +1077,10 @@ fn plan_rewrite_leaves_refs_index_worktree_untouched() {
     let wt = repo.worktree();
     let oids = build_commit_dag(wt, &[("b", "a")], &[("b", "refs/heads/main")]);
     commit_file(wt, "tracked.txt", "v1", "track");
-    let before_head = resolve_ref(open_grit(wt).git_dir(), "refs/heads/main").expect("read ref");
+    let before_head = grit_test_support::refs::at(open_grit(wt).git_dir())
+        .references()
+        .resolve("refs/heads/main")
+        .expect("read ref");
     let grit = open_grit(wt);
     let mut edits = HistoryEdits::new();
     edits.insert(
@@ -1060,19 +1092,23 @@ fn plan_rewrite_leaves_refs_index_worktree_untouched() {
             parents: None,
         },
     );
-    let _plan = plan_rewrite(
-        &grit,
-        &edits,
-        &RewriteOptions {
-            scope: RefScope::Head,
-            empty: EmptyPolicy::Drop,
-            committer: committer(13).parse().expect("signature"),
-            preserve_committer: false,
-            sign: true,
-        },
-    )
-    .expect("plan");
-    let after_head = resolve_ref(grit.git_dir(), "refs/heads/main").expect("read ref after");
+    let _plan = grit
+        .history()
+        .plan_rewrite(
+            &edits,
+            &RewriteOptions {
+                scope: RefScope::Head,
+                empty: EmptyPolicy::Drop,
+                committer: committer(13).parse().expect("signature"),
+                preserve_committer: false,
+                sign: true,
+            },
+        )
+        .expect("plan");
+    let after_head = grit
+        .references()
+        .resolve("refs/heads/main")
+        .expect("read ref after");
     assert_eq!(before_head, after_head);
     assert!(wt.join("tracked.txt").exists());
 }
@@ -1096,26 +1132,29 @@ fn plan_rewrite_surfaces_missing_object_as_library_error() {
             parents: None,
         },
     );
-    let err = plan_rewrite(
-        &grit,
-        &edits,
-        &RewriteOptions {
-            scope: RefScope::Branches,
-            empty: EmptyPolicy::Drop,
-            committer: committer(30).parse().expect("signature"),
-            preserve_committer: false,
-            sign: true,
-        },
-    )
-    .expect_err("missing commit object");
+    let err = grit
+        .history()
+        .plan_rewrite(
+            &edits,
+            &RewriteOptions {
+                scope: RefScope::Branches,
+                empty: EmptyPolicy::Drop,
+                committer: committer(30).parse().expect("signature"),
+                preserve_committer: false,
+                sign: true,
+            },
+        )
+        .expect_err("missing commit object");
     match err {
-        grit_lib::revwalk::history::HistoryError::Library(boxed) => {
-            assert!(matches!(*boxed, grit_lib::error::Error::ObjectNotFound(_)));
-        }
+        grit_lib::revwalk::history::HistoryError::Engine(e)
+            if matches!(
+                e.as_ref(),
+                grit_lib::revwalk::history::HistoryEngineError::ObjectNotFound(_)
+            ) => {}
         grit_lib::revwalk::history::HistoryError::Conflict { .. } => {
             panic!("missing object must not surface as Conflict");
         }
-        other => panic!("expected Library(ObjectNotFound), got {other:?}"),
+        other => panic!("expected Engine(ObjectNotFound), got {other:?}"),
     }
 }
 
@@ -1144,18 +1183,19 @@ fn plan_rewrite_parent_only_replay_matches_git_commit_tree() {
         },
     );
     let committer_line = committer(99);
-    let plan = plan_rewrite(
-        &grit,
-        &edits,
-        &RewriteOptions {
-            scope: RefScope::Head,
-            empty: EmptyPolicy::Drop,
-            committer: committer_line.parse().expect("signature"),
-            preserve_committer: false,
-            sign: true,
-        },
-    )
-    .expect("plan");
+    let plan = grit
+        .history()
+        .plan_rewrite(
+            &edits,
+            &RewriteOptions {
+                scope: RefScope::Head,
+                empty: EmptyPolicy::Drop,
+                committer: committer_line.parse().expect("signature"),
+                preserve_committer: false,
+                sign: true,
+            },
+        )
+        .expect("plan");
     let c_row = plan
         .commits
         .iter()
@@ -1207,9 +1247,7 @@ fn history_public_api_coverage_smoke() {
         EmptyPolicy::Keep,
         RefScope::Head,
         HistoryError::EmptyMessage,
-        HistoryError::Planning {
-            message: "coverage".into(),
-        },
+        HistoryError::Planning(grit_lib::revwalk::history::PlanningError::EmptyReplayOrder),
         HistoryError::InsertBeforeOnMerge {
             commit: ObjectId::null(grit_lib::objects::HashAlgo::Sha1),
         },
@@ -1226,7 +1264,7 @@ fn history_public_api_coverage_smoke() {
             reused: false,
         }],
         ref_updates: vec![PlannedRefUpdate {
-            name: "refs/heads/x".into(),
+            name: grit_lib::refs::store::RefName::from_trusted("refs/heads/x"),
             old: ObjectId::null(grit_lib::objects::HashAlgo::Sha1),
             new: ObjectId::null(grit_lib::objects::HashAlgo::Sha1),
         }],
@@ -1250,6 +1288,8 @@ fn history_public_api_coverage_smoke() {
         CommitEdit::InsertBefore(_nc),
     );
     let _edits: HistoryEdits = map;
-    let head = resolve_head(&HistoryRepo::init().worktree().join(".git"));
+    let head = grit_test_support::refs::at(&HistoryRepo::init().worktree().join(".git"))
+        .references()
+        .head();
     let _ = head;
 }

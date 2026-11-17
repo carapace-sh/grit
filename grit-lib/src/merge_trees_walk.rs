@@ -27,7 +27,7 @@ pub(crate) struct PathPrefixIndex<'a> {
 }
 
 impl<'a> PathPrefixIndex<'a> {
-    pub(crate) fn new(paths: impl IntoIterator<Item = &'a Vec<u8>>) -> Self {
+    pub fn new(paths: impl IntoIterator<Item = &'a Vec<u8>>) -> Self {
         let mut index = Self {
             paths: HashSet::new(),
             ancestor_dirs: HashSet::new(),
@@ -396,8 +396,12 @@ pub(crate) fn compose_merged_tree_oid(
     }
 
     out_entries.sort_by(|a, b| {
-        crate::objects::tree_entry_cmp(&a.name, a.mode == MODE_DIR, &b.name, b.mode == MODE_DIR)
+        crate::objects::tree_name_cmp(&a.name, a.mode == MODE_DIR, &b.name, b.mode == MODE_DIR)
     });
+
+    if out_entries.is_empty() {
+        return Ok(*empty_tree);
+    }
 
     let data = serialize_tree(&out_entries);
     odb.write(ObjectKind::Tree, &data)
@@ -628,6 +632,7 @@ pub(crate) fn three_way_on_touched_paths(
     ours_new_to_old: &std::collections::HashMap<Vec<u8>, Vec<u8>>,
     theirs_old_to_new: &std::collections::HashMap<Vec<u8>, Vec<u8>>,
     rename_conflicts: Vec<RenameRenameConflict>,
+    df_skip_paths: &HashSet<Vec<u8>>,
     favor: MergeFavor,
     ws: WhitespaceMergeOptions,
     diff_algorithm: Option<&str>,
@@ -738,7 +743,8 @@ pub(crate) fn three_way_on_touched_paths(
 
     // When the other side renamed base paths to `new`, those destinations are also in
     // `touched`. When ours still has the rename source, the source iteration already merges
-    // at `new`; skip duplicate passes (issue #1093). Do not skip when ours deleted the source.
+    // at `new`; skip duplicate passes (issue #1093). When ours deleted the source, the source
+    // path iteration already merged at `new` (rename/delete conflict); skip the destination too.
     let mut theirs_rename_destinations: HSet<&[u8]> = HSet::new();
     for (old, new) in theirs_old_to_new {
         if old != new && touched.contains(old) {
@@ -747,7 +753,7 @@ pub(crate) fn three_way_on_touched_paths(
     }
 
     for op in ours_paths {
-        if handled_ours.contains(op) {
+        if df_skip_paths.contains(op) || handled_ours.contains(op) {
             continue;
         }
         if ours_rename_sources.contains(op)
@@ -767,6 +773,8 @@ pub(crate) fn three_way_on_touched_paths(
                         }
                         continue;
                     }
+                } else {
+                    continue;
                 }
             }
         }
@@ -813,7 +821,7 @@ pub(crate) fn three_way_on_touched_paths(
     base_paths.sort();
     base_paths.dedup();
     for bp in base_paths {
-        if handled_base.contains(bp) {
+        if df_skip_paths.contains(bp) || handled_base.contains(bp) {
             continue;
         }
         let tp = theirs_old_to_new.get(bp).map_or(bp, Vec::as_slice);
@@ -844,7 +852,7 @@ pub(crate) fn three_way_on_touched_paths(
     theirs_paths.sort();
     theirs_paths.dedup();
     for tp in theirs_paths {
-        if handled_theirs.contains(tp) {
+        if df_skip_paths.contains(tp) || handled_theirs.contains(tp) {
             continue;
         }
         let t = sides.file(cache, odb, MergeTreeSide::Theirs, tp);

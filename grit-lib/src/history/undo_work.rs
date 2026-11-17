@@ -25,7 +25,10 @@ use crate::repo::Repository;
 use super::apply::{
     read_worktree_path_snapshot, restore_worktree_path, WorktreePathKind, WorktreePathSnapshot,
 };
-use super::error::HistoryError;
+use super::error::{
+    undo_record_read_io, undo_record_read_str, undo_record_write_str, worktree_apply_engine,
+    worktree_apply_io, HistoryError,
+};
 
 const FORMAT_VERSION: u32 = 1;
 
@@ -93,7 +96,7 @@ pub(crate) struct UndoWork {
 pub(crate) fn capture_path_states(
     repo: &Repository,
     paths: &[String],
-) -> Result<Vec<PathState>, HistoryError> {
+) -> crate::error::Result<Vec<PathState>> {
     let Some(work_tree) = repo.work_tree() else {
         return Ok(Vec::new());
     };
@@ -133,7 +136,7 @@ pub(crate) fn tree_path_states(
     repo: &Repository,
     tree: ObjectId,
     paths: &[String],
-) -> Result<Vec<PathState>, HistoryError> {
+) -> crate::error::Result<Vec<PathState>> {
     paths
         .iter()
         .map(|path| {
@@ -162,7 +165,7 @@ pub(crate) fn tree_path_states(
 pub(crate) fn install_path_states(
     repo: &Repository,
     states: &[PathState],
-) -> Result<(), HistoryError> {
+) -> crate::error::Result<()> {
     let Some(work_tree) = repo.work_tree() else {
         return Ok(());
     };
@@ -221,7 +224,7 @@ impl PathState {
             && a.is_executable() == b.is_executable()
     }
 
-    fn digest(&self, algo: HashAlgo) -> Result<PathDigest, HistoryError> {
+    fn digest(&self, algo: HashAlgo) -> crate::error::Result<PathDigest> {
         let index = self.index.as_ref().map(|blob| (blob.mode, blob.oid));
         let wt = &self.worktree;
         let worktree = match (wt.kind, wt.bytes.as_deref()) {
@@ -244,7 +247,7 @@ impl UndoWork {
     pub(crate) fn after_command(
         repo: &Repository,
         restore: Vec<PathState>,
-    ) -> Result<Self, HistoryError> {
+    ) -> crate::error::Result<Self> {
         let paths: Vec<String> = restore.iter().map(|s| s.path.clone()).collect();
         let now = capture_path_states(repo, &paths)?;
         Self::pair(repo.odb().hash_algo(), restore, &now)
@@ -256,7 +259,7 @@ impl UndoWork {
         algo: HashAlgo,
         restore: Vec<PathState>,
         now: &[PathState],
-    ) -> Result<Self, HistoryError> {
+    ) -> crate::error::Result<Self> {
         let now: HashMap<&str, &PathState> = now.iter().map(|s| (s.path.as_str(), s)).collect();
         let paths = restore
             .into_iter()
@@ -268,12 +271,12 @@ impl UndoWork {
                     .digest(algo)?;
                 Ok(UndoWorkPath { restore, expect })
             })
-            .collect::<Result<_, HistoryError>>()?;
+            .collect::<crate::error::Result<_>>()?;
         Ok(Self { paths })
     }
 
     /// Paths this record restores, in record order.
-    pub(crate) fn paths(&self) -> Vec<String> {
+    pub fn paths(&self) -> Vec<String> {
         self.paths.iter().map(|p| p.restore.path.clone()).collect()
     }
 
@@ -291,7 +294,7 @@ impl UndoWork {
     pub(crate) fn unchanged_live_states(
         &self,
         repo: &Repository,
-    ) -> Result<Vec<PathState>, HistoryError> {
+    ) -> crate::error::Result<Vec<PathState>> {
         let algo = repo.odb().hash_algo();
         let live = capture_path_states(repo, &self.paths())?;
         let by_path: HashMap<&str, &PathState> =
@@ -307,7 +310,7 @@ impl UndoWork {
             }
         }
         if !changed.is_empty() {
-            return Err(HistoryError::LocalChangesWouldBeOverwritten { paths: changed });
+            return Err(HistoryError::LocalChangesWouldBeOverwritten { paths: changed }.into());
         }
         Ok(live)
     }
@@ -327,32 +330,30 @@ impl StagedUndoWork {
     /// Write `work` to the sidecar's lock file without publishing it.
     ///
     /// Called by [`super::last`] while it holds the `history-last` lock.
-    pub(crate) fn stage(repo: &Repository, work: &UndoWork) -> Result<Self, HistoryError> {
+    pub fn stage(repo: &Repository, work: &UndoWork) -> crate::error::Result<Self> {
         let target = sidecar_path(repo);
         let mut lock = LockFile::acquire(&target.with_extension("lock"), LockWait::Immediately)
-            .map_err(write_err)?;
+            .map_err(|e| undo_record_write_str(e.to_string()))?;
         lock.write_all(&serialize(work)).map_err(write_err)?;
         Ok(Self { lock, target })
     }
 
     /// Rename the staged bytes over the sidecar.
-    pub(crate) fn commit(self) -> Result<(), HistoryError> {
+    pub fn commit(self) -> crate::error::Result<()> {
         self.lock.commit_to(&self.target).map_err(write_err)
     }
 }
 
 /// Delete the sidecar so it cannot be paired with a newer record.
-pub(crate) fn remove_undo_work(repo: &Repository) -> Result<(), HistoryError> {
+pub(crate) fn remove_undo_work(repo: &Repository) -> crate::error::Result<()> {
     match fs::remove_file(sidecar_path(repo)) {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(write_err(e)),
         _ => Ok(()),
     }
 }
 
-fn write_err(err: impl std::fmt::Display) -> HistoryError {
-    HistoryError::UndoRecordWrite {
-        message: err.to_string(),
-    }
+fn write_err(err: impl std::fmt::Display) -> crate::error::Error {
+    undo_record_write_str(err.to_string())
 }
 
 /// Read the sidecar when present.
@@ -360,13 +361,11 @@ fn write_err(err: impl std::fmt::Display) -> HistoryError {
 /// # Errors
 ///
 /// Returns [`HistoryError::UndoRecordRead`] when the file exists but is invalid.
-pub(crate) fn read_undo_work(repo: &Repository) -> Result<Option<UndoWork>, HistoryError> {
+pub(crate) fn read_undo_work(repo: &Repository) -> crate::error::Result<Option<UndoWork>> {
     match fs::read(sidecar_path(repo)) {
         Ok(bytes) => parse(&bytes).map(Some),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(HistoryError::UndoRecordRead {
-            message: e.to_string(),
-        }),
+        Err(e) => Err(undo_record_read_io(e)),
     }
 }
 
@@ -406,7 +405,7 @@ fn tree_blob_at_path(
     repo: &Repository,
     tree: ObjectId,
     path: &str,
-) -> Result<Option<IndexBlob>, HistoryError> {
+) -> crate::error::Result<Option<IndexBlob>> {
     let odb = repo.odb();
     let Some(entry) = odb
         .tree_entry_at_path(&tree, path.as_bytes())
@@ -427,18 +426,16 @@ fn tree_blob_at_path(
     }))
 }
 
-fn hash_blob(algo: HashAlgo, data: &[u8]) -> Result<ObjectId, HistoryError> {
+fn hash_blob(algo: HashAlgo, data: &[u8]) -> crate::error::Result<ObjectId> {
     algo.hash_object(ObjectKind::Blob, data).map_err(apply_err)
 }
 
-fn apply_err(err: impl std::fmt::Display) -> HistoryError {
-    HistoryError::WorktreeApply {
-        message: err.to_string(),
-    }
+fn apply_err(err: impl Into<crate::error::Error>) -> crate::error::Error {
+    worktree_apply_engine(err)
 }
 
-fn io_err(err: std::io::Error) -> HistoryError {
-    apply_err(err)
+fn io_err(err: std::io::Error) -> crate::error::Error {
+    worktree_apply_io(err)
 }
 
 /// Text header lines with length-prefixed binary payloads:
@@ -533,7 +530,7 @@ impl<'a> Cursor<'a> {
         self.pos >= self.bytes.len()
     }
 
-    fn line(&mut self) -> Result<Vec<&'a str>, HistoryError> {
+    fn line(&mut self) -> crate::error::Result<Vec<&'a str>> {
         let rest = &self.bytes[self.pos..];
         let end = rest
             .iter()
@@ -544,7 +541,7 @@ impl<'a> Cursor<'a> {
         Ok(text.split(' ').collect())
     }
 
-    fn payload(&mut self, len: &str) -> Result<Vec<u8>, HistoryError> {
+    fn payload(&mut self, len: &str) -> crate::error::Result<Vec<u8>> {
         let len: usize = len.parse().map_err(|_| parse_err("bad payload length"))?;
         let end = self
             .pos
@@ -556,7 +553,7 @@ impl<'a> Cursor<'a> {
         Ok(data)
     }
 
-    fn expect_keyword(&mut self, keyword: &str) -> Result<Vec<&'a str>, HistoryError> {
+    fn expect_keyword(&mut self, keyword: &str) -> crate::error::Result<Vec<&'a str>> {
         let mut parts = self.line()?;
         if parts.first() != Some(&keyword) {
             return Err(parse_err(&format!("expected {keyword}")));
@@ -566,7 +563,7 @@ impl<'a> Cursor<'a> {
     }
 }
 
-fn parse(bytes: &[u8]) -> Result<UndoWork, HistoryError> {
+fn parse(bytes: &[u8]) -> crate::error::Result<UndoWork> {
     let mut cur = Cursor { bytes, pos: 0 };
     let version = cur.expect_keyword("version")?;
     if version != [FORMAT_VERSION.to_string().as_str()] {
@@ -632,25 +629,23 @@ fn parse(bytes: &[u8]) -> Result<UndoWork, HistoryError> {
     Ok(UndoWork { paths })
 }
 
-fn field<'a>(parts: &[&'a str], i: usize) -> Result<&'a str, HistoryError> {
+fn field<'a>(parts: &[&'a str], i: usize) -> crate::error::Result<&'a str> {
     parts
         .get(i)
         .copied()
         .ok_or_else(|| parse_err("missing field"))
 }
 
-fn parse_mode(text: &str) -> Result<u32, HistoryError> {
+fn parse_mode(text: &str) -> crate::error::Result<u32> {
     u32::from_str_radix(text, 8).map_err(|_| parse_err("bad mode"))
 }
 
-fn parse_oid(text: &str) -> Result<ObjectId, HistoryError> {
+fn parse_oid(text: &str) -> crate::error::Result<ObjectId> {
     ObjectId::from_hex(text).map_err(|e| parse_err(&e.to_string()))
 }
 
-fn parse_err(detail: &str) -> HistoryError {
-    HistoryError::UndoRecordRead {
-        message: format!("history-last-work: {detail}"),
-    }
+fn parse_err(detail: &str) -> crate::error::Error {
+    undo_record_read_str(format!("history-last-work: {detail}"))
 }
 
 #[cfg(test)]

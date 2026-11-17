@@ -19,11 +19,11 @@ Downloads objects and updates refs from a remote. Your working tree and current 
 
 Each `<refspec>` selects what to fetch (`main`, `refs/heads/x:refs/heads/y`, `+refs/…` to force). When no refspecs are given, configured `remote.<name>.fetch` refspecs apply (usually all heads into `refs/remotes/<remote>/…`).
 
-When the source is a **literal path or URL** (not a configured remote), grit does not update `refs/remotes/origin/*` unless you pass refspecs with destinations. [`FETCH_HEAD`](https://git-scm.com/docs/git-fetch#_discussion) is updated for explicit refspecs.
+When the source is a **literal path or URL** (not a configured remote), grit does not update `refs/remotes/origin/*` unless you pass refspecs with destinations. With no refspecs, grit fetches the bundle's `HEAD` into [`FETCH_HEAD`](https://git-scm.com/docs/git-fetch#_discussion) (matching Git's anonymous fetch). A bundle whose header lists no `HEAD` — typical of incremental range bundles — fails with a clear ref error instead of reporting "already up to date"; pass an explicit refspec (for example `main:refs/remotes/bundle/main` or `main` to update `FETCH_HEAD` only) to take a listed branch.
 
-Human output lists each local ref with its remote source and old → new oids. Pruned refs show `deleted`; rejected updates are listed and exit **1** (same as [`grit push`](../push/) rejections). When a stale remote-tracking ref blocks another update (for example `origin/gone/x` still exists locally but the remote now has `gone`), grit still applies every ref it can and reports the blocked ref as rejected; the `reason` field suggests `grit fetch --prune` or `grit remote prune <remote>` when pruning would remove the stale ref.
+Human output lists each local ref with its remote source and old → new oids. Pruned refs show `deleted`; rejected updates are listed and exit **1** (same as [`grit push`](../push/) rejections). When a stale remote-tracking ref blocks another update (for example `origin/gone/x` still exists locally but the remote now has `gone`), grit still applies every ref it can and reports the blocked ref as rejected; the `reason` field suggests `grit fetch --prune` or `grit remote prune <remote>` when pruning would remove the stale ref. With `core.ignorecase`, when the remote advertises two refs that differ only by case, grit stores the first and rejects the second as a loose ref; the `reason` mentions case and suggests `grit init --ref-format=reftable` if you need both spellings locally.
 
-When the fetch received objects, the ref list is followed by the same transfer summary [`grit clone`](../clone/) prints: a `time` bar splitting the run into connecting, receiving, indexing, resolving deltas and finishing; the `data` received off the wire with its average and peak rate; and the `objects` received by type. Local `file://` and plain-path remotes use the same summary shape, with **Enumerating** (reachability walk) and **Copying** (link or pack the send set) instead of network **Receiving**. Nothing extra is printed when the fetch was already up to date. With `--all`, one summary after the last remote covers the whole run.
+When the fetch received objects, the ref list is followed by the same transfer summary [`grit clone`](../clone/) prints: a `time` bar splitting the run into the network wait before the pack (**handshake**, **negotiate** and the server's **pack prep**, as described for [`grit clone`](../clone/)), receiving, indexing, resolving deltas and finishing; the `data` received off the wire with its average and peak rate; and the `objects` received by type. Local `file://` and plain-path remotes use the same summary shape, with **Enumerating** (reachability walk) and **Copying** (link or pack the send set) instead of network **Receiving**. Nothing extra is printed when the fetch was already up to date. With `--all`, one summary after the last remote covers the whole run.
 
 On a terminal, stderr first shows `Fetching <remote> <url>`, then one live progress line per phase with a throughput graph and, under it, an overall bar with a time-left estimate. Finished phases stay on screen as `✓` lines. When stderr is not a TTY, or with `--json`, `--markdown` or `-q`, no progress is drawn.
 
@@ -33,7 +33,7 @@ Default tag following never updates a tag you already have locally, even when th
 
 `--dry-run` negotiates and reports updates without writing refs, objects, or `FETCH_HEAD`. Human output ends with **Would fetch N update(s) from …** when anything would change, or **Already up to date with …** when nothing would.
 
-`--depth`, `--deepen`, and `--unshallow` match Git’s shallow fetch controls (mutually exclusive). `--depth` truncates history on the first shallow fetch; `--deepen` adds commits relative to an existing shallow clone; `--unshallow` fetches the rest and removes `.git/shallow`. `--unshallow` on a complete repository is a typed error. With default tag following, tags on newly fetched history (including annotated tags) arrive in that same operation; a second fetch is unnecessary. Following tags does not extend the requested branch depth. A shallow source can only supply its available history, so boundaries remain when the source is incomplete.
+`--depth`, `--deepen`, and `--unshallow` match Git’s shallow fetch controls (mutually exclusive). `--depth` truncates history on the first shallow fetch; `--deepen` adds commits relative to an existing shallow clone; `--unshallow` fetches the rest and removes `.git/shallow`. `--unshallow` on a complete repository is a typed error. With default tag following, tags on newly fetched history (including annotated tags) arrive in that same operation; a second fetch is unnecessary. Following tags does not extend the requested branch depth. A shallow source can only supply its available history, so boundaries remain when the source is incomplete. A shallow fetch still offers the server the commits you have (the tips being deepened and your other branches and tags), over every protocol version, so only history the repository lacks is transferred.
 
 In a partial clone, a fetch takes part in the server's `promisor-remote` exchange (protocol v2) the way [`grit clone`](../clone/#large-object-promisors) does: it accepts the advertised large-object promisors that `promisor.acceptFromServer` allows, tells the server so, and applies `promisor.storeFields`. A remote whose `partialclonefilter` is `auto` (a clone made with `--blobs auto`) picks its filter on every fetch from the accepted remotes' advertised `partialCloneFilter`. A fetch that is neither filtered nor from a promisor remote declines every promisor remote (`not_partial`), because it needs every object from the server; that includes an unfiltered fetch from a second, non-promisor remote of a partial clone, whose pack would otherwise be marked promisor although no promisor remote can give its objects back. The human output adds a `promisor` line per advertised remote, for example `promisor  lop accepted · blob:limit=5k`, and `promisor  stored partialCloneFilter for lop` for each stored field.
 
@@ -41,7 +41,11 @@ In a partial clone, a fetch takes part in the server's `promisor-remote` exchang
 
 Local fetches reuse the repository's ref store across tracking refs and tags. An up-to-date fetch skips object-copy preparation while still handling pruning, `FETCH_HEAD`, and the remote's default branch. See the [many-ref local fetch measurements](../../benchmarks/#local-fetch-with-many-refs).
 
+When `core.logAllRefUpdates` is enabled (grit's default for new repositories), each fetch that moves a remote-tracking branch writes a reflog entry on that ref (`fetch: fast-forward`, `fetch: forced-update`, or `fetch: storing head` for a newly stored tracking ref). [`grit pull`](../pull/) uses the same mechanism with a `pull:` prefix. The initial clone fetch does not create branch tracking reflogs (Git matches this); only `refs/remotes/<remote>/HEAD` gets `clone: from <url>`. Pruning a stale tracking ref removes its reflog file. Tags are not logged unless a reflog already exists or logging is set to `always`.
+
 `--all` fetches every configured remote in config order. Remotes with `remote.<name>.skipFetchAll=true` are skipped. Each remote uses its own `remote.<name>.prune` and `remote.<name>.tagOpt` unless `--prune`, `--no-prune`, `--tags`, or `--no-tags` override on the command line. Failures on one remote do not stop the rest; the command exits **1** if any remote failed or any ref update was rejected. `--all` cannot be combined with `<remote>` or `<refspec>` arguments.
+
+When a fetch is interrupted (`SIGINT`, `SIGTERM`, or `SIGHUP`, including Ctrl+C from a terminal), grit cancels the in-progress transfer, removes any partial pack temp file it was writing, and exits **130** without leaving `tmp_pack_*` or pack install staging directories behind. Stale temp files from a hard kill (`SIGKILL`) are removed later by [`grit gc`](gc.md) once they are older than `gc.pruneExpire`, the same way `git gc` prunes `tmp_pack_*`.
 
 ## Options
 
@@ -98,15 +102,15 @@ On a terminal, with progress on stderr above the summary (here filling in a shal
 ```console
 $ grit fetch --unshallow
 Fetching origin https://github.com/BurntSushi/ripgrep.git
-✓ Receiving  ▇▇▄▄▄▄▅▅▅▆▆▆▆▆▆▆▆█▇▇█          4.66 MiB          381 KiB/s   12.5s
-✓ Indexing   ▆▆▆▆▆▆▆▆▆▆▆██████████    13,689 objects    82.2k objects/s   166ms
-✓ Resolving  ▃▃▃▃▃▃▃▃▃▃▃██████████      9,877 deltas     49.1k deltas/s   201ms
+✓ Receiving  █████████████████████          4.64 MiB         48.1 MiB/s    96ms
+✓ Indexing   █████████████████████    13,715 objects   223.6k objects/s    61ms
+✓ Resolving  █████████████████████      9,905 deltas    451.8k deltas/s    21ms
 Already up to date with origin.
 
-  time      ·······████████████████████████████·▓▒··  18.1s
-            · connect 3.0s  █ receiving 12.5s  ▓ indexing 166ms  ▒ resolving 201ms  · finish 2.1s
-  data      4.66 MiB received · 381 KiB/s avg · 583 KiB/s peak
-  objects   13,845 · 2,297 commits · 6,306 trees · 4,973 blobs · 269 tags
+  time      ·····························███·▓▓▒····  1.2s
+            · handshake 259ms  · negotiate 584ms  · pack prep 61ms  █ receiving 96ms  ▓ indexing 61ms  ▒ resolving 21ms  · finish 138ms
+  data      4.64 MiB received · 48.1 MiB/s avg · 48.1 MiB/s peak
+  objects   13,868 · 2,302 commits · 6,319 trees · 4,977 blobs · 270 tags
 ```
 
 The rates are left out when the pack arrived in a single read, too fast to time. A fetch pack can be *thin*: grit completes it with the delta bases it already has, so `objects` can be a little higher than the `Indexing` count.
@@ -129,7 +133,7 @@ Schema: [v1](/schemas/fetch/v1.json)
 
 | Field | Type | Meaning |
 | ----- | ---- | ------- |
-| `remote` | string | Remote that was fetched. |
+| `remote` | string | Remote that was fetched: its name, or the URL given with any `user:password@` removed. Human and Markdown output show the same value. |
 | `dry_run` | boolean | True when `--dry-run` was used. |
 | `rejected` | boolean | True when any update was rejected (exit 1). |
 | `updates` | array | Per-ref results. Each object has `ref`, `remote_ref`, `status` (`new`, `fast_forward`, `forced`, `pruned`, `rejected`, or `up_to_date`), `old_oid` and `new_oid` (full hex or `null`), and `reason` when `status` is `rejected`. |

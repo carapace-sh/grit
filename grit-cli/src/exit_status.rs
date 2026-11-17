@@ -23,6 +23,9 @@ pub enum ExitStatus {
     Failure,
     /// Usage / invalid arguments (2).
     Usage,
+    /// The command did its work, but a shared branch's heads diverged in a
+    /// way someone has to decide about (3).
+    NeedsDecision,
     /// Clone, fetch, pull, push, or `remote refs` could not reach or read the remote (128).
     RemoteUnreadable,
     /// Bundle unbundle missing prerequisite commits (128).
@@ -45,6 +48,7 @@ impl ExitStatus {
             Self::Success => 0,
             Self::Failure => 1,
             Self::Usage => 2,
+            Self::NeedsDecision => 3,
             Self::RemoteUnreadable | Self::MissingPrerequisite | Self::RefusedNotFf => 128,
             Self::InvalidCommitFilter => 129,
             Self::Interrupted => 130,
@@ -104,8 +108,8 @@ impl ExitStatus {
         }
         if err.chain().any(|cause| {
             cause
-                .downcast_ref::<grit_lib::remote::clone::CloneError>()
-                .is_some_and(grit_lib::remote::clone::CloneError::is_cancelled)
+                .downcast_ref::<grit_lib::error::Error>()
+                .is_some_and(grit_lib::error::Error::is_cancelled)
         }) {
             return Self::Interrupted;
         }
@@ -131,7 +135,7 @@ impl ExitStatus {
     }
 
     #[must_use]
-    fn for_structured_kind(kind: ErrorKind) -> Self {
+    pub(crate) fn for_structured_kind(kind: ErrorKind) -> Self {
         match kind {
             ErrorKind::InvalidPattern => Self::InvalidCommitFilter,
             ErrorKind::Usage => Self::Usage,
@@ -286,9 +290,22 @@ impl ExitStatus {
     /// `1` when `grit integrate` merged but the checkout's refresh failed or
     /// stopped ([`commands::checkin::IntegrateOutcome::needs_attention`]).
     #[must_use]
-    pub fn from_integrate(outcome: &commands::checkin::IntegrateOutcome) -> Self {
+    pub fn from_integrate(outcome: &crate::render::checkin::IntegrateOutcome) -> Self {
         if outcome.needs_attention() {
             Self::Failure
+        } else {
+            Self::Success
+        }
+    }
+
+    /// Failure when something was refused, else [`Self::NeedsDecision`]
+    /// when a shared branch needs a decision, else success.
+    #[must_use]
+    pub fn from_shared(rejected: bool, needs_decision: bool) -> Self {
+        if rejected {
+            Self::Failure
+        } else if needs_decision {
+            Self::NeedsDecision
         } else {
             Self::Success
         }
@@ -379,9 +396,9 @@ mod tests {
         ];
         for (kind, err, expected) in structured {
             let payload =
-                crate::json_error::structured_json_payload(&err).expect("structured payload");
+                crate::json_error::structured_json_payload(err).expect("structured payload");
             assert_eq!(payload.kind, *kind);
-            assert_eq!(ExitStatus::for_error(&err), *expected);
+            assert_eq!(ExitStatus::for_error(err), *expected);
         }
 
         let filter_err = grit_lib::revwalk::filter::CommitFilterError::InvalidPattern {
@@ -399,35 +416,39 @@ mod tests {
         };
         for err in [
             anyhow::Error::new(unreadable()),
-            commands::fetch::map_remote_error(grit_lib::remote::RemoteError::Library(unreadable())),
-            anyhow::Error::new(grit_lib::remote::clone::CloneError::Library(unreadable())),
-            anyhow::Error::new(grit_lib::porcelain::pull::PullError::Remote(
-                grit_lib::remote::RemoteError::Library(unreadable()),
-            )),
+            commands::fetch::map_remote_error(unreadable()),
+            anyhow::Error::new(unreadable()).context("clone failed"),
+            anyhow::Error::new(unreadable()).context("pull failed"),
         ] {
             let payload = crate::json_error::structured_json_payload(&err).expect("payload");
             assert_eq!(payload.kind, ErrorKind::RemoteUnreadable);
             assert_eq!(payload.error, "could not find repository at '/nope.git'");
             assert_eq!(ExitStatus::for_error(&err), ExitStatus::RemoteUnreadable);
         }
-        let auth = commands::fetch::map_remote_error(grit_lib::remote::RemoteError::Library(
-            grit_lib::error::Error::Auth {
+        let auth = commands::fetch::map_remote_error(
+            grit_lib::remote::RemoteError::Auth {
                 url: "https://example.com/r.git".into(),
                 reason: grit_lib::error::AuthFailure::Rejected,
-            },
-        ));
+            }
+            .into(),
+        );
         assert_eq!(ExitStatus::for_error(&auth), ExitStatus::Failure);
 
-        let cancelled = anyhow::Error::new(grit_lib::remote::clone::CloneError::Library(
-            grit_lib::error::Error::Cancelled,
-        ));
+        let cancelled =
+            anyhow::Error::new(grit_lib::error::Error::Cancelled).context("clone failed");
         assert_eq!(ExitStatus::for_error(&cancelled), ExitStatus::Interrupted);
         assert_eq!(ExitStatus::Interrupted.code(), 130);
-        assert_eq!(
-            ExitStatus::for_error(&anyhow::Error::new(grit_lib::error::Error::Cancelled)),
-            ExitStatus::Failure,
-            "only clone maps cancellation to 130"
-        );
+        for err in [
+            anyhow::Error::new(grit_lib::error::Error::Cancelled),
+            commands::fetch::map_remote_error(grit_lib::error::Error::Cancelled),
+            anyhow::Error::new(grit_lib::error::Error::Cancelled).context("pull failed"),
+        ] {
+            assert_eq!(
+                ExitStatus::for_error(&err),
+                ExitStatus::Interrupted,
+                "fetch/pull map cancellation to 130: {err:?}"
+            );
+        }
 
         let pickaxe_err = grit_lib::diff::PickaxeError::InvalidPattern {
             pattern: "x".into(),

@@ -14,8 +14,9 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use grit_lib::config::environment::RepositoryOptions;
-use grit_lib::porcelain::add::{stage, StageOptions, StageOutcome};
-use grit_lib::progress::{NeverCancel, NullProgress};
+use grit_lib::porcelain::add::{StageOptions, StageOutcome};
+use grit_lib::progress::CancelToken;
+use grit_lib::progress::NullProgress;
 use grit_lib::repo::Repository;
 use grit_test_support::git;
 
@@ -82,13 +83,14 @@ fn open(root: &Path) -> Repository {
 fn stage_all(root: &Path) -> (StageOutcome, Duration) {
     let repo = open(root);
     let t0 = Instant::now();
-    let outcome = stage(
-        &repo,
-        &StageOptions::default(),
-        &mut NullProgress,
-        &NeverCancel,
-    )
-    .expect("stage");
+    let outcome = repo
+        .index()
+        .stage(
+            &StageOptions::default(),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("stage");
     (outcome, t0.elapsed())
 }
 
@@ -148,7 +150,7 @@ fn clean_ignorecase_tree_stages_nothing_in_linear_time() {
     fixture(large.path(), 4_000, wide_layout);
 
     let first = stage_all(large.path());
-    assert_nothing_staged(&first.0);
+    assert_nothing_staged(first.0);
     let t_small = median_clean_stage(small.path());
     let t_large = median_clean_stage(large.path());
     eprintln!("clean ignorecase stage: 2000 files {t_small:?}, 4000 files {t_large:?}");

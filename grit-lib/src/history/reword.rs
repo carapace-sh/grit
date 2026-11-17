@@ -9,13 +9,31 @@ use super::error::HistoryError;
 use super::plan::plan_rewrite;
 use super::types::{CommitEdit, HistoryEdits, RewriteOptions, RewritePlan};
 
-/// Fields to change when rewriting one commit's message and/or author.
+/// Fields to change when rewriting one commit's message and/or author with
+/// [`History::reword`](super::History::reword).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct RewordOptions {
     /// Replacement commit message (normalized like [`normalize_rewrite_message`]).
     pub message: Option<String>,
     /// Replacement author (`Name <email>` or bare email); date defaults to the source commit's.
     pub author: Option<String>,
+}
+
+impl RewordOptions {
+    /// Sets [`message`](Self::message).
+    #[must_use]
+    pub fn with_message(mut self, message: impl Into<String>) -> Self {
+        self.message = Some(message.into());
+        self
+    }
+
+    /// Sets [`author`](Self::author).
+    #[must_use]
+    pub fn with_author(mut self, author: impl Into<String>) -> Self {
+        self.author = Some(author.into());
+        self
+    }
 }
 
 /// Clean a commit message the same way [`crate::porcelain::commit`] does before hooks: stripspace,
@@ -24,8 +42,8 @@ pub struct RewordOptions {
 /// # Errors
 ///
 /// Returns [`HistoryError::EmptyMessage`] when the cleaned body would be empty.
-pub fn normalize_rewrite_message(raw: &str) -> Result<String, HistoryError> {
-    normalize_commit_message(raw).map_err(|_| HistoryError::EmptyMessage)
+pub fn normalize_rewrite_message(raw: &str) -> crate::error::Result<String> {
+    normalize_commit_message(raw).map_err(|_| HistoryError::EmptyMessage.into())
 }
 
 fn author_date_suffix_from_ident(ident: &str) -> Option<String> {
@@ -41,7 +59,7 @@ fn resolve_reword_author(
     repo: &Repository,
     original_author: &str,
     author_arg: &str,
-) -> Result<String, HistoryError> {
+) -> crate::error::Result<String> {
     let contact = parse_author_arg(author_arg)?;
     let date_override = author_date_suffix_from_ident(original_author);
     Ok(author_identity_line(
@@ -51,30 +69,20 @@ fn resolve_reword_author(
     ))
 }
 
-/// Plan a message and/or author rewrite of `commit` and replay of its descendants.
-///
-/// Writes replacement commit objects into the ODB; refs are updated only when the caller applies
-/// the returned [`RewritePlan`].
-///
-/// # Errors
-///
-/// Returns [`HistoryError::NothingToReword`] when both options are absent,
-/// [`HistoryError::EmptyMessage`] when a provided message is empty after cleanup,
-/// [`HistoryError::InvalidAuthor`] when the author string is invalid, or any error from
-/// [`plan_rewrite`].
-pub fn reword_with(
+/// Plan a message and/or author rewrite of `commit`; see [`History::reword`](super::History::reword).
+pub(crate) fn reword(
     repo: &Repository,
     commit: ObjectId,
     options: &RewordOptions,
     opts: &RewriteOptions,
-) -> Result<RewritePlan, HistoryError> {
+) -> crate::error::Result<RewritePlan> {
     let has_message = options.message.is_some();
     let has_author = options
         .author
         .as_ref()
         .is_some_and(|a| !a.trim().is_empty());
     if !has_message && !has_author {
-        return Err(HistoryError::NothingToReword);
+        return Err(HistoryError::NothingToReword.into());
     }
 
     let message = if let Some(ref raw) = options.message {
@@ -87,11 +95,8 @@ pub fn reword_with(
         if arg.trim().is_empty() {
             None
         } else {
-            let raw = repo
-                .odb()
-                .read(&commit)
-                .map_err(|e| HistoryError::Library(Box::new(e)))?;
-            let parsed = parse_commit(&raw.data).map_err(|e| HistoryError::Library(Box::new(e)))?;
+            let raw = repo.odb().read(&commit)?;
+            let parsed = parse_commit(&raw.data)?;
             Some(resolve_reword_author(repo, &parsed.author, arg)?)
         }
     } else {
@@ -109,29 +114,4 @@ pub fn reword_with(
         },
     );
     plan_rewrite(repo, &edits, opts)
-}
-
-/// Plan a message-only rewrite of `commit` and replay of its descendants.
-///
-/// Writes replacement commit objects into the ODB; refs are updated only when the caller applies
-/// the returned [`RewritePlan`].
-///
-/// # Errors
-///
-/// Returns [`HistoryError::EmptyMessage`] or any error from [`reword_with`].
-pub fn reword(
-    repo: &Repository,
-    commit: ObjectId,
-    message: String,
-    opts: &RewriteOptions,
-) -> Result<RewritePlan, HistoryError> {
-    reword_with(
-        repo,
-        commit,
-        &RewordOptions {
-            message: Some(message),
-            author: None,
-        },
-        opts,
-    )
 }

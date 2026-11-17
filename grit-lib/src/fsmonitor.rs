@@ -19,6 +19,7 @@ use crate::command_runner::{
 use crate::config::ConfigSet;
 use crate::error::{Error, Result};
 use crate::index::Index;
+use crate::index::IndexError;
 
 /// Nanoseconds since the Unix epoch, sampled immediately before a fsmonitor hook query.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,7 +66,7 @@ pub fn fsmonitor_enabled(config: &ConfigSet) -> bool {
 }
 
 fn fsmonitor_mode(config: &ConfigSet) -> FsmonitorMode {
-    let Some(raw) = config.get("core.fsmonitor") else {
+    let Some(raw) = config.value("core.fsmonitor") else {
         return FsmonitorMode::Disabled;
     };
     let trimmed = raw.trim();
@@ -83,7 +84,7 @@ fn fsmonitor_mode(config: &ConfigSet) -> FsmonitorMode {
 
 fn hook_version(config: &ConfigSet) -> u32 {
     config
-        .get("core.fsmonitorhookversion")
+        .value("core.fsmonitorhookversion")
         .and_then(|v| v.trim().parse().ok())
         .filter(|&v| v == 1 || v == 2)
         .unwrap_or(2)
@@ -244,15 +245,12 @@ fn query_hook(
     let child = runner.spawn(&spec).map_err(Error::Io)?;
     let output = child.wait_with_output().map_err(Error::Io)?;
     if !output.status.success {
-        return Err(Error::Message(format!(
-            "fsmonitor hook exited with {}",
-            output.status.code.unwrap_or(-1)
-        )));
+        return Err(IndexError::FsmonitorHookFailed {
+            status: output.status.code,
+        }
+        .into());
     }
-    if version == 1 {
-        let token = v1_query_token.ok_or_else(|| {
-            Error::Message("internal error: missing v1 fsmonitor query token".into())
-        })?;
+    if let (1, Some(token)) = (version, v1_query_token) {
         return Ok(parse_v1_hook_response(&output.stdout, token));
     }
     parse_v2_hook_response(&output.stdout)
@@ -283,7 +281,7 @@ fn parse_v2_hook_response(buf: &[u8]) -> Result<QueryOutcome> {
         .next()
         .map(|p| String::from_utf8_lossy(p).into_owned())
         .filter(|t| !t.is_empty())
-        .ok_or_else(|| Error::Message("fsmonitor hook returned empty token".into()))?;
+        .ok_or(IndexError::FsmonitorHookEmptyToken)?;
     let mut changed_paths = Vec::new();
     let mut trivial = false;
     for p in parts {
@@ -348,9 +346,9 @@ fn ipc_send_query(ipc_path: &Path, message: &[u8]) -> Result<Vec<u8>> {
     #[cfg(not(any(unix, windows)))]
     {
         let _ = (ipc_path, message);
-        Err(Error::Message(
-            "fsmonitor IPC is not supported on this platform".into(),
-        ))
+        Err(Error::Io(std::io::Error::from(
+            std::io::ErrorKind::Unsupported,
+        )))
     }
 }
 
@@ -395,7 +393,7 @@ fn ipc_send_query_windows(ipc_path: &Path, message: &[u8]) -> Result<Vec<u8>> {
     pipe.push(0);
     unsafe {
         if WaitNamedPipeW(pipe.as_ptr(), 3000) == 0 {
-            return Err(Error::Message("fsmonitor daemon pipe not available".into()));
+            return Err(Error::Io(std::io::Error::last_os_error()));
         }
         let handle = CreateFileW(
             pipe.as_ptr(),
@@ -407,7 +405,7 @@ fn ipc_send_query_windows(ipc_path: &Path, message: &[u8]) -> Result<Vec<u8>> {
             std::ptr::null_mut(),
         );
         if handle == INVALID_HANDLE_VALUE {
-            return Err(Error::Message("fsmonitor IPC connect failed".into()));
+            return Err(Error::Io(std::io::Error::last_os_error()));
         }
         let mut file = std::fs::File::from_raw_handle(handle as _);
         crate::pkt_line::write_packet_raw(&mut file, message).map_err(Error::Io)?;
@@ -437,10 +435,7 @@ fn apply_query_result(index: &mut Index, config: &ConfigSet, outcome: QueryOutco
     if outcome.changed_paths.is_empty() {
         return;
     }
-    let ignorecase = config
-        .get_bool("core.ignorecase")
-        .and_then(|r| r.ok())
-        .unwrap_or(false);
+    let ignorecase = config.ignore_case();
     for path in outcome.changed_paths {
         index.invalidate_fsmonitor_for_path(&path, ignorecase);
     }
@@ -448,6 +443,44 @@ fn apply_query_result(index: &mut Index, config: &ConfigSet, outcome: QueryOutco
 
 fn invalidate_all_valid(index: &mut Index) {
     index.invalidate_all_fsmonitor_valid();
+}
+
+/// Mark a stage-0 entry fsmonitor-valid after a worktree scan proved it unchanged.
+///
+/// Returns `true` when the valid bit flipped from false to true.
+pub(crate) fn mark_fsmonitor_valid_proven_clean(index: &mut Index, entry_index: usize) -> bool {
+    if index.fsmonitor_last_update.is_none() {
+        return false;
+    }
+    let Some(entry) = index.entries.get_mut(entry_index) else {
+        return false;
+    };
+    if entry.stage() != 0 || entry.mode == crate::index::MODE_GITLINK {
+        return false;
+    }
+    if entry.fsmonitor_valid() {
+        return false;
+    }
+    entry.set_fsmonitor_valid(true);
+    true
+}
+
+/// Like [`mark_fsmonitor_valid_proven_clean`], keyed by path.
+pub(crate) fn mark_fsmonitor_valid_proven_clean_path(index: &mut Index, path: &[u8]) -> bool {
+    if index.fsmonitor_last_update.is_none() {
+        return false;
+    }
+    let Some(entry) = index.get_mut(path, 0) else {
+        return false;
+    };
+    if entry.mode == crate::index::MODE_GITLINK {
+        return false;
+    }
+    if entry.fsmonitor_valid() {
+        return false;
+    }
+    entry.set_fsmonitor_valid(true);
+    true
 }
 
 /// When true, this index entry can skip worktree stat I/O during diff/status.

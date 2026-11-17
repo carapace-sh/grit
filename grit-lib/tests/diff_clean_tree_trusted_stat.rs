@@ -1,11 +1,12 @@
 //! Index↔worktree diff on a clean tree matches system `git diff-files`.
 
+use grit_lib::diff::TreeDiffOptions;
 use std::collections::BTreeSet;
 use std::process::Command;
 
 use filetime::FileTime;
 use grit_lib::config::environment::RepositoryOptions;
-use grit_lib::diff::{diff_index_to_worktree_with_options, DiffIndexToWorktreeOptions};
+
 use grit_lib::repo::Repository;
 use grit_test_support::git;
 
@@ -51,24 +52,22 @@ fn library_unstaged_paths(root: &std::path::Path) -> BTreeSet<String> {
         &RepositoryOptions::empty().with_work_tree(root),
     )
     .expect("open");
-    let mut index = repo.index_handle().load().expect("index");
+    let mut index = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("index");
     let index_mtime = grit_lib::diff::index_mtime_for_diff(&index, None);
-    let config = repo.config().expect("config");
-    let (entries, _) = diff_index_to_worktree_with_options(
-        repo.odb(),
-        &mut index,
-        root,
-        DiffIndexToWorktreeOptions {
-            repository_git_dir: Some(repo.git_dir().to_path_buf()),
-            index_mtime,
-            refresh_index_stat_in_pass: false,
-            for_status: true,
-            config: Some(config),
-            thread_policy: Some(repo.thread_policy()),
-            ..DiffIndexToWorktreeOptions::default()
-        },
-    )
-    .expect("diff");
+    let config = repo.config().snapshot().expect("config");
+    let (entries, _) = repo
+        .diff()
+        .index_to_worktree(
+            &mut index,
+            &TreeDiffOptions::default()
+                .with_for_status(true)
+                .with_threads(Some(repo.thread_policy())),
+        )
+        .map(|r| (r.entries, r.index_stat_refreshed))
+        .expect("diff");
     entries
         .into_iter()
         .filter_map(|e| e.old_path.or(e.new_path))
@@ -112,24 +111,22 @@ fn grit_diff_index_worktree_empty_on_deep_clean_tree() {
         &RepositoryOptions::empty().with_work_tree(root),
     )
     .expect("open");
-    let mut index = repo.index_handle().load().expect("index");
+    let mut index = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("index");
     let index_mtime = grit_lib::diff::index_mtime_for_diff(&index, None);
-    let config = repo.config().expect("config");
-    let (entries, _) = diff_index_to_worktree_with_options(
-        repo.odb(),
-        &mut index,
-        root,
-        DiffIndexToWorktreeOptions {
-            repository_git_dir: Some(repo.git_dir().to_path_buf()),
-            index_mtime,
-            refresh_index_stat_in_pass: false,
-            for_status: true,
-            config: Some(config),
-            thread_policy: Some(repo.thread_policy()),
-            ..DiffIndexToWorktreeOptions::default()
-        },
-    )
-    .expect("diff");
+    let config = repo.config().snapshot().expect("config");
+    let (entries, _) = repo
+        .diff()
+        .index_to_worktree(
+            &mut index,
+            &TreeDiffOptions::default()
+                .with_for_status(true)
+                .with_threads(Some(repo.thread_policy())),
+        )
+        .map(|r| (r.entries, r.index_stat_refreshed))
+        .expect("diff");
     assert!(
         entries.is_empty(),
         "expected no unstaged diff, got {}",

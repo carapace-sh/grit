@@ -2,8 +2,9 @@
 
 use anyhow::Error;
 use grit_lib::error::Error as LibError;
+use grit_lib::error::RefError;
 use grit_lib::repo::Repository;
-use grit_lib::state::{resolve_head_for_repository, HeadState};
+use grit_lib::state::HeadState;
 
 use crate::context;
 use crate::error_kind::ErrorKind;
@@ -38,7 +39,7 @@ pub fn unborn_head_from_cwd() -> Option<Error> {
 
 /// When `repo` has an unborn branch at `HEAD`, return a guided error.
 pub fn unborn_head_from_repo(repo: &Repository) -> Option<Error> {
-    match resolve_head_for_repository(repo).ok()? {
+    match repo.references().head().ok()? {
         HeadState::Branch {
             short_name,
             oid: None,
@@ -48,14 +49,17 @@ pub fn unborn_head_from_repo(repo: &Repository) -> Option<Error> {
     }
 }
 
-/// Replace bare [`LibError::UnbornHead`] anywhere in the chain with a guided error.
+/// Replace bare unborn-HEAD library errors anywhere in the chain with a guided error.
 pub fn enrich_unborn_head(err: Error) -> Error {
     if err.downcast_ref::<StructuredCliError>().is_some() {
         return err;
     }
-    let has_unborn = err
-        .chain()
-        .any(|cause| matches!(cause.downcast_ref::<LibError>(), Some(LibError::UnbornHead)));
+    let has_unborn = err.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<LibError>(),
+            Some(LibError::Ref(RefError::UnbornHead))
+        )
+    });
     if !has_unborn {
         return err;
     }

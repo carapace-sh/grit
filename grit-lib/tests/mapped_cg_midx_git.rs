@@ -7,15 +7,14 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use grit_lib::objects::commit_graph::{
-    commit_graph_chain_from_layers_for_test, CommitGraphChain, CommitGraphLayer,
-};
+use grit_lib::objects::commit_graph::{CommitGraphChain, CommitGraphLayer};
 use grit_lib::objects::midx::{
     load_midx_reuse_tables_from_path, midx_lookup_pack_and_offset_opt, read_midx_objects,
-    read_midx_pack_idx_names, try_read_object_via_midx, write_multi_pack_index_with_options,
+    read_midx_pack_idx_names, try_read_object_via_midx, write_multi_pack_index,
     WriteMultiPackIndexOptions,
 };
-use grit_lib::objects::pack::{
+use grit_lib::test_support::commit_graph::chain_from_layers;
+use grit_lib::test_support::objects_pack::{
     clear_pack_cache, read_object_from_pack_at_offset, read_pack_index_cached,
 };
 /// One byte above PackData's 8 KiB owned-read threshold (8192).
@@ -104,7 +103,7 @@ fn write_large_single_pack_midx(dir: &Path) -> (PathBuf, PathBuf) {
             s.starts_with("pack-") && s.ends_with(".idx")
         })
         .expect("pack index");
-    write_multi_pack_index_with_options(
+    write_multi_pack_index(
         &pack_dir,
         &WriteMultiPackIndexOptions {
             preferred_pack_name: Some(preferred_idx.to_string_lossy().into_owned()),
@@ -137,7 +136,7 @@ fn git_commit_graph_chain_mapped_matches_owned_layers() {
         owned_layers.push(CommitGraphLayer::try_parse(path, raw).expect("owned layer"));
     }
     owned_layers.reverse();
-    let owned = commit_graph_chain_from_layers_for_test(owned_layers);
+    let owned = chain_from_layers(owned_layers);
     assert_eq!(mapped.num_layers(), owned.num_layers());
     assert_eq!(mapped.total_commits(), owned.total_commits());
     for oid in mapped.all_oids_in_order() {

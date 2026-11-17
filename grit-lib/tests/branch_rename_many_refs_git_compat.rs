@@ -7,7 +7,8 @@ use std::path::Path;
 
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::objects::ObjectId;
-use grit_lib::porcelain::branch::{rename_branch, RenameBranchOptions};
+use grit_lib::porcelain::branch::BranchRenameOptions;
+use grit_lib::refs::store::RefNameRef;
 use grit_lib::repo::Repository;
 use grit_test_support::{git, git_cmd};
 
@@ -16,16 +17,14 @@ fn open(dir: &Path) -> Repository {
 }
 
 fn rename(repo: &Repository, old: &str, new: &str) {
-    rename_branch(
-        repo,
-        &RenameBranchOptions {
+    repo.branches()
+        .rename(&BranchRenameOptions {
             old: old.into(),
             new: new.into(),
             force: false,
             dry_run: false,
-        },
-    )
-    .unwrap();
+        })
+        .unwrap();
 }
 
 fn fixture() -> tempfile::TempDir {
@@ -77,10 +76,13 @@ fn loose_rename_preserves_unrelated_packed_refs_and_roundtrips_through_git() {
     git(dir, &["fsck", "--strict", "--no-progress"]);
 
     git(dir, &["branch", "-m", "renamed", "returned"]);
-    assert_eq!(repo.refs().resolve("refs/heads/returned").unwrap(), tip);
+    assert_eq!(
+        repo.ref_store().resolve("refs/heads/returned").unwrap(),
+        tip
+    );
     assert!(repo
-        .refs()
-        .read_raw("refs/heads/renamed")
+        .ref_store()
+        .read_raw(RefNameRef::from_trusted("refs/heads/renamed"))
         .unwrap()
         .is_none());
     assert_eq!(fs::read(&packed).unwrap(), before);
@@ -112,12 +114,16 @@ fn rename_removes_shadowed_packed_source_and_keeps_peeled_tags() {
         expected
     );
     assert_eq!(git(dir, &["rev-parse", "renamed"]).trim(), tip.to_string());
-    assert!(repo.refs().read_raw("refs/heads/b1000").unwrap().is_none());
+    assert!(repo
+        .ref_store()
+        .read_raw(RefNameRef::from_trusted("refs/heads/b1000"))
+        .unwrap()
+        .is_none());
     assert_eq!(
         git(dir, &["rev-parse", "annotated^{}"]),
         git(dir, &["rev-parse", "HEAD^"])
     );
     git(dir, &["fsck", "--strict", "--no-progress"]);
     git(dir, &["pack-refs", "--all"]);
-    assert_eq!(repo.refs().resolve("refs/heads/renamed").unwrap(), tip);
+    assert_eq!(repo.ref_store().resolve("refs/heads/renamed").unwrap(), tip);
 }

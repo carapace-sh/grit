@@ -1,6 +1,6 @@
 //! Wire-protocol push orchestration over a [`crate::transport::Connection`].
 //!
-//! [`push_remote`] is the wire counterpart to [`crate::transfer::push_local`]:
+//! [`push_remote_from`] is the wire counterpart to the local-path push in [`crate::transfer`]:
 //! instead of copying objects between two on-disk repositories, it drives a
 //! `git-receive-pack` exchange over a live [`crate::transport::Connection`] —
 //! reading the receive-pack advertisement (remote refs + `.have` lines +
@@ -24,19 +24,20 @@
 //! zero/null OID, the empty-pack trailer, and the advertisement parsing are all
 //! hash-width aware.
 
+use crate::error::ObjectError;
+use crate::error::RefError;
 use std::collections::{HashMap, HashSet};
 use std::io::{Cursor, ErrorKind, Read, Write};
-use std::path::Path;
 
 use crate::branch_tracking;
-use crate::environment::RepositoryOptions;
 use crate::error::{Error, Result};
 use crate::fetch::Progress;
 use crate::objects::{HashAlgo, ObjectId};
 use crate::pack_objects::PackStats;
 use crate::pkt_line::{self, Packet};
-use crate::progress::{poll_cancel, Cancel, ProgressPhase, ProgressUnit, ReceivedObjects};
+use crate::progress::{poll_cancel, CancelToken, ProgressPhase, ProgressUnit, ReceivedObjects};
 use crate::push_report::{PushRefResult, PushRefStatus};
+use crate::remote::RemoteError;
 use crate::repo::Repository;
 use crate::sideband_lines::{RemoteLine, SidebandLines};
 use crate::transfer::{PackBuildOptions, PrePushGate, PushOptions, PushOutcome, PushRefSpec};
@@ -47,6 +48,7 @@ fn finish_push_outcome(
     opts: &PushOptions,
     results: Vec<PushRefResult>,
     remote_messages: Vec<String>,
+    sent: crate::transfer::TransferStats,
 ) -> Result<PushOutcome> {
     if !opts.dry_run {
         if let Some(remote) = opts.tracking_remote.as_deref() {
@@ -56,6 +58,7 @@ fn finish_push_outcome(
     Ok(PushOutcome {
         results,
         remote_messages,
+        sent,
     })
 }
 
@@ -112,10 +115,6 @@ impl crate::progress::ProgressSink for PushSidebandCollector<'_> {
     fn finish(&mut self) {
         self.inner.finish();
     }
-
-    fn should_cancel(&self) -> bool {
-        self.inner.should_cancel()
-    }
 }
 
 impl Progress for PushSidebandCollector<'_> {
@@ -145,7 +144,7 @@ const PUSH_CAPS_BASE: &str = "report-status report-status-v2 quiet";
 
 /// Push refs to a remote over a live [`Connection`] speaking `git-receive-pack`.
 ///
-/// The flow mirrors [`crate::transfer::push_local`], but the remote ref list and
+/// The flow mirrors the local-path push, but the remote ref list and
 /// `.have` hints come from the connection's advertisement, the objects are
 /// streamed over the wire as a single pack, and per-ref acceptance/rejection is
 /// learned from the server's `report-status` reply (a server may reject an update
@@ -181,29 +180,17 @@ const PUSH_CAPS_BASE: &str = "report-status report-status-v2 quiet";
 /// Returns an error if the connection is protocol v2, if a source object is
 /// missing from the local odb, if the pack build fails, or on wire/parse I/O
 /// failure. An atomic push to a server without `atomic` support returns
-/// [`Error::PushAtomicUnsupported`] before sending updates or objects.
-pub fn push_remote(
-    local_git_dir: &Path,
-    conn: &mut dyn Connection,
-    refs: &[PushRefSpec],
-    opts: &PushOptions,
-    progress: &mut dyn Progress,
-    cancel: &dyn Cancel,
-) -> Result<PushOutcome> {
-    let local = Repository::open(local_git_dir, &RepositoryOptions::empty())?;
-    push_remote_from(&local, conn, refs, opts, progress, cancel, None)
-}
-
-/// Like [`push_remote`], reading the objects to send through `local`'s object store and
-/// running `pre_push` after every update is decided against the advertisement and before
-/// any command or pack is sent.
+/// [`RemoteError::PushAtomicUnsupported`] before sending updates or objects.
+///
+/// Objects to send are read through `local`'s object store. `pre_push` runs after every
+/// update is decided against the advertisement and before any command or pack is sent.
 pub(crate) fn push_remote_from(
     local: &Repository,
     conn: &mut dyn Connection,
     refs: &[PushRefSpec],
     opts: &PushOptions,
     progress: &mut dyn Progress,
-    cancel: &dyn Cancel,
+    cancel: &CancelToken,
     pre_push: Option<&PrePushGate<'_>>,
 ) -> Result<PushOutcome> {
     push_remote_with(local, conn, refs, opts, progress, cancel, None, pre_push)
@@ -226,7 +213,7 @@ pub(crate) fn push_remote_with(
     refs: &[PushRefSpec],
     opts: &PushOptions,
     progress: &mut dyn Progress,
-    cancel: &dyn Cancel,
+    cancel: &CancelToken,
     bundle_target: Option<BundlePushTarget<'_>>,
     pre_push: Option<&PrePushGate<'_>>,
 ) -> Result<PushOutcome> {
@@ -249,9 +236,9 @@ pub(crate) fn push_remote_with(
         opts.push_options.len()
     );
     if conn.protocol_version() >= 2 {
-        return Err(Error::Message(
-            "push_remote: protocol v2 not supported in this phase (use v0/v1)".to_owned(),
-        ));
+        return Err(Error::Remote(crate::remote::RemoteError::Fatal {
+            message: "push_remote: protocol v2 not supported in this phase (use v0/v1)".to_owned(),
+        }));
     }
 
     let algo = local.odb().hash_algo();
@@ -283,16 +270,25 @@ pub(crate) fn push_remote_with(
             if !opts.dry_run {
                 crate::transport::send_client_flush(conn)?;
             }
-            return finish_push_outcome(local, opts, results, Vec::new());
+            return finish_push_outcome(
+                local,
+                opts,
+                results,
+                Vec::new(),
+                crate::transfer::TransferStats::default(),
+            );
         }
     };
+
+    let mut sent = crate::transfer::TransferStats::default();
 
     // 4. Write the ref-update commands (first carries the cap list after a NUL),
     //    then the pack — but only when there are objects to send. A deletion-only
     //    push streams no pack at all (matching `git send-pack`); `receive-pack`
     //    does not read one after a delete-only command block, so sending an empty
     //    pack would leave unread bytes on the wire and reset the connection.
-    let commands = build_command_block(&plan, &adv, algo, opts)?;
+    let shallow = crate::shallow::load_shallow_oids(local_git_dir)?;
+    let commands = build_command_block(&plan, &adv, algo, opts, &shallow)?;
     let sent_refs: Vec<&str> = plan
         .to_send
         .iter()
@@ -332,7 +328,7 @@ pub(crate) fn push_remote_with(
                 let mut haves: Vec<ObjectId> = adv.remote_refs.values().copied().collect();
                 haves.extend_from_slice(&adv.advertised_haves);
                 match session.write_bundle(local.odb(), &haves, &tips, threshold, |w| {
-                    pack.write_to(local, w, &stop).map(drop)
+                    pack.write_to(local, w, &stop, None).map(drop)
                 })? {
                     crate::push_bundle::Spooled::Bundle => true,
                     crate::push_bundle::Spooled::Small(small) => {
@@ -360,7 +356,7 @@ pub(crate) fn push_remote_with(
             apply_report_status(&report, &mut plan.decisions);
             let results: Vec<_> = plan.decisions.into_iter().map(|d| d.result).collect();
             sideband.finish_pending();
-            return finish_push_outcome(local, opts, results, sideband.remote_messages);
+            return finish_push_outcome(local, opts, results, sideband.remote_messages, sent);
         }
     }
 
@@ -383,17 +379,44 @@ pub(crate) fn push_remote_with(
         // The pack streams straight into the connection; a push of a whole
         // repository never holds the packfile in memory.
         let mut out = std::io::BufWriter::with_capacity(PACK_SEND_BUFFER, conn.writer());
-        let sent = match spooled_pack.take() {
-            Some(spooled) => spooled.copy_to(&mut out)?,
-            None => pack.write_to(local, &mut out, &stop)?.pack_bytes,
+        let stats = match spooled_pack.take() {
+            Some(spooled) => {
+                let mut metered = crate::progress::ProgressWrite::new(
+                    &mut out,
+                    &mut sideband as &mut dyn crate::progress::ProgressSink,
+                );
+                let bytes = spooled.copy_to(&mut metered)?;
+                metered.finish();
+                PackStats {
+                    pack_bytes: bytes,
+                    ..PackStats::default()
+                }
+            }
+            None => {
+                let stats = pack.write_to(local, &mut out, &stop, Some(&mut sideband))?;
+                if stats.pack_bytes > 0 {
+                    use crate::progress::{ProgressPhase, ProgressSink as _, ProgressUnit};
+                    sideband.start_with_unit(
+                        ProgressPhase::SendingObjects,
+                        ProgressUnit::Bytes,
+                        Some(stats.pack_bytes),
+                    );
+                    sideband.set(stats.pack_bytes);
+                    sideband.finish();
+                }
+                stats
+            }
         };
         out.flush()?;
         drop(out);
         conn.writer().flush()?;
+        sent.objects = stats.object_count as u64;
+        sent.bytes = stats.pack_bytes;
         net_trace!(
             opts.network_trace,
             opts.diagnostics.as_ref(),
-            "push_remote: sent pack ({sent} bytes)"
+            "push_remote: sent pack ({bytes} bytes)",
+            bytes = sent.bytes
         );
     } else {
         net_trace!(
@@ -440,13 +463,13 @@ pub(crate) fn push_remote_with(
         "push_remote: done — {} result(s)",
         results.len()
     );
-    finish_push_outcome(local, opts, results, remote_messages)
+    finish_push_outcome(local, opts, results, remote_messages, sent)
 }
 
 /// Push refs to a remote over smart HTTP (`git-receive-pack`), returning a
 /// [`PushOutcome`].
 ///
-/// This is the stateless-RPC counterpart to [`push_remote`]: instead of a duplex
+/// This is the stateless-RPC counterpart to [`push_remote_from`]: instead of a duplex
 /// [`Connection`] it issues a `GET info/refs?service=git-receive-pack` discovery
 /// (the receive-pack advertisement: remote refs + `.have`s + capabilities), then
 /// a single `POST git-receive-pack` whose body is the ref-update commands
@@ -455,7 +478,7 @@ pub(crate) fn push_remote_with(
 ///
 /// The decision logic, command framing, pack building (thin + delta + advertised
 /// `.have` set + `ofs-delta` per caps), and report parsing are the *same* shared
-/// helpers used by [`push_remote`] — only the wire (discovery GET + one POST vs.
+/// helpers used by [`push_remote_from`] — only the wire (discovery GET + one POST vs.
 /// the duplex socket) differs.
 ///
 /// `client` is the embedder's [`crate::transport::http::HttpClient`]; `repo_url`
@@ -465,22 +488,22 @@ pub(crate) fn push_remote_with(
 ///
 /// Protocol v0/v1 only; a v2 receive-pack advertisement is rejected (a v2 push
 /// would require the `command=push` round and is deferred — matching
-/// [`push_remote`]).
+/// [`push_remote_from`]).
 ///
 /// # Errors
 ///
 /// Returns an error if discovery fails, the advertisement is protocol v2, a
 /// source object is missing from the local odb, the pack build fails, or on
 /// wire/parse I/O failure. An atomic push to a server without `atomic` support
-/// returns [`Error::PushAtomicUnsupported`] before sending updates or objects.
-pub fn push_http(
+/// returns [`RemoteError::PushAtomicUnsupported`] before sending updates or objects.
+pub(crate) fn push_http(
     client: std::sync::Arc<dyn crate::transport::http::HttpClient>,
-    local_git_dir: &Path,
+    local: &Repository,
     repo_url: &str,
     refs: &[PushRefSpec],
     opts: &PushOptions,
     progress: &mut dyn Progress,
-    cancel: &dyn Cancel,
+    cancel: &CancelToken,
 ) -> Result<PushOutcome> {
     use crate::transport::http::SmartHttpTransport;
     use crate::transport::{ConnectOptions, Service, Transport};
@@ -492,11 +515,11 @@ pub fn push_http(
     };
     let transport = SmartHttpTransport::new(client);
     let mut conn = transport.connect(repo_url, Service::ReceivePack, &connect)?;
-    push_remote(local_git_dir, &mut *conn, refs, opts, progress, cancel)
+    push_remote_from(local, &mut *conn, refs, opts, progress, cancel, None)
 }
 
 /// The remote ref map + `.have` hints + capability flags parsed from a
-/// receive-pack advertisement. Shared by the duplex ([`push_remote`]) and
+/// receive-pack advertisement. Shared by the duplex ([`push_remote_from`]) and
 /// stateless-HTTP ([`push_http`]) paths so the decision/command/pack logic is
 /// identical regardless of how the advertisement was obtained.
 struct AdvertisedState {
@@ -567,7 +590,7 @@ enum PlanOutcome {
 
 /// Decide every [`PushRefSpec`] client-side against the advertised remote refs,
 /// applying the atomic / dry-run / nothing-to-send gates. Shared by
-/// [`push_remote`] and [`push_http`] so both paths reach the wire with an
+/// [`push_remote_from`] and [`push_http`] so both paths reach the wire with an
 /// identical decision set.
 fn plan_push(
     refs: &[PushRefSpec],
@@ -619,10 +642,10 @@ fn plan_push(
 /// any commands or pack data, including for dry-run and no-op pushes.
 fn require_push_capabilities(adv: &AdvertisedState, opts: &PushOptions) -> Result<()> {
     if opts.atomic && !adv.server_atomic {
-        return Err(Error::PushAtomicUnsupported);
+        return Err(RemoteError::PushAtomicUnsupported.into());
     }
     if !opts.push_options.is_empty() && !adv.server_push_options {
-        return Err(Error::PushOptionsUnsupported);
+        return Err(RemoteError::PushOptionsUnsupported.into());
     }
     Ok(())
 }
@@ -645,6 +668,7 @@ fn build_command_block(
     adv: &AdvertisedState,
     algo: HashAlgo,
     opts: &PushOptions,
+    shallow: &[ObjectId],
 ) -> Result<Vec<u8>> {
     let zero_hex = "0".repeat(algo.hex_len());
     let mut command_caps = PUSH_CAPS_BASE.to_owned();
@@ -660,6 +684,9 @@ fn build_command_block(
     command_caps.push_str(&format!(" object-format={}", algo.name()));
 
     let mut commands: Vec<u8> = Vec::new();
+    for oid in shallow {
+        pkt_line::write_line_to_vec(&mut commands, &format!("shallow {}", oid.to_hex()))?;
+    }
     let mut first = true;
     for &i in &plan.to_send {
         let d = &plan.decisions[i];
@@ -713,6 +740,7 @@ struct PushPack {
     wants: Vec<ObjectId>,
     haves: Vec<ObjectId>,
     opts: PackBuildOptions,
+    source_shallow: HashSet<ObjectId>,
 }
 
 impl PushPack {
@@ -746,7 +774,10 @@ impl PushPack {
         let local_cfg = crate::config::ConfigSet::load(
             &crate::environment::Environment::empty(),
             Some(local.git_dir()),
-            true,
+            &crate::config::LoadConfigOptions::standard(
+                &crate::environment::Environment::empty(),
+                Some(local.git_dir()),
+            ),
         )
         .ok();
         let mut opts = if haves.is_empty() {
@@ -755,23 +786,35 @@ impl PushPack {
             PackBuildOptions::for_local_push(local_cfg.as_ref())
         };
         opts.use_ofs_delta = adv.server_ofs_delta;
-        Ok(Some(Self { wants, haves, opts }))
+        let source_shallow = crate::shallow::load_shallow_boundaries(local.git_dir());
+        Ok(Some(Self {
+            wants,
+            haves,
+            opts,
+            source_shallow,
+        }))
     }
 
     /// Stream the pack to `w`, stopping with [`Error::Cancelled`] once `stop` fires.
+    ///
+    /// Reports pack-build phases to `progress` when provided.
     fn write_to(
         &self,
         local: &Repository,
         w: &mut dyn Write,
         stop: &crate::progress::CancelSignal<'_>,
+        progress: Option<&mut dyn crate::progress::ProgressSink>,
     ) -> Result<PackStats> {
         crate::pack_objects::write_pack_for_push_with_cancel(
             local.odb(),
             &self.wants,
             &self.haves,
+            &HashSet::new(),
+            &self.source_shallow,
             &self.opts,
             w,
             stop,
+            progress,
         )
     }
 }
@@ -885,16 +928,20 @@ fn decide_push_wire(
     }
 
     let Some(src) = spec.src else {
-        return Err(Error::Message(format!(
-            "push to '{}' has no source object and is not a deletion",
-            spec.dst
-        )));
+        return Err(Error::Ref(RefError::Invalid {
+            detail: format!(
+                "push to '{}' has no source object and is not a deletion",
+                spec.dst
+            ),
+        }));
     };
     if !local_odb.contains(&src)? {
-        return Err(Error::Message(format!(
-            "source object {src} for '{}' is missing from the local object store",
-            spec.dst
-        )));
+        return Err(Error::Object(ObjectError::NotFound {
+            name: format!(
+                "source object {src} for '{}' is missing from the local object store",
+                spec.dst
+            ),
+        }));
     }
 
     // New ref: nothing on the remote yet — always allowed.
@@ -914,6 +961,34 @@ fn decide_push_wire(
             send: true,
         });
     };
+
+    if let Some(tag_decision) =
+        crate::transfer::existing_tag_push_decision(spec, &spec.dst, old, src)
+    {
+        return Ok(match tag_decision {
+            crate::transfer::ExistingTagPushDecision::Reject => no_op(
+                PushRefStatus::RejectAlreadyExists,
+                Some(old),
+                Some(src),
+                false,
+                Some(crate::transfer::PUSH_TAG_EXISTS_MESSAGE.to_owned()),
+            ),
+            crate::transfer::ExistingTagPushDecision::ForcedUpdate => PushDecision {
+                result: PushRefResult {
+                    local_ref: crate::transfer::push_spec_local_ref(spec),
+                    remote_ref: spec.dst.clone(),
+                    old_oid: Some(old),
+                    new_oid: Some(src),
+                    forced: true,
+                    deletion: false,
+                    status: PushRefStatus::Ok,
+                    message: None,
+                },
+                new_tip: Some(src),
+                send: true,
+            },
+        });
+    }
 
     if !spec.force && !local_odb.contains(&old)? {
         return Ok(no_op(
@@ -971,6 +1046,21 @@ fn decide_push_wire(
             send: true,
         })
     } else {
+        let remote_ahead = if crate::merge_base::is_ancestor_odb_walk_with_graph(
+            local_odb,
+            local_odb.commit_graph_chain().as_deref(),
+            src,
+            old,
+        )? {
+            true
+        } else {
+            crate::merge_base::is_ancestor(local, src, old).unwrap_or(false)
+        };
+        let status = if remote_ahead {
+            PushRefStatus::RejectNonFastForward
+        } else {
+            PushRefStatus::RejectNeedsForce
+        };
         Ok(PushDecision {
             result: PushRefResult {
                 local_ref: crate::transfer::push_spec_local_ref(spec),
@@ -979,7 +1069,7 @@ fn decide_push_wire(
                 new_oid: Some(src),
                 forced: false,
                 deletion: false,
-                status: PushRefStatus::RejectNonFastForward,
+                status,
                 message: Some("non-fast-forward".to_owned()),
             },
             new_tip: None,
@@ -1000,7 +1090,7 @@ pub(crate) fn read_receive_pack_response(
     reader: &mut dyn Read,
     sent_refs: &[&str],
     server_sideband: bool,
-    cancel: &dyn Cancel,
+    cancel: &CancelToken,
 ) -> Result<Vec<u8>> {
     let mut raw = Vec::new();
     let mut buf = [0u8; 8192];
@@ -1024,9 +1114,9 @@ pub(crate) fn read_receive_pack_response(
         }
     }
     if !receive_pack_response_complete(&raw, sent_refs, server_sideband)? {
-        return Err(Error::Message(
-            "receive-pack response ended before a complete report-status".to_owned(),
-        ));
+        return Err(Error::Object(ObjectError::Corrupt {
+            detail: "receive-pack response ended before a complete report-status".to_owned(),
+        }));
     }
     Ok(raw)
 }
@@ -1195,7 +1285,9 @@ fn demux_report_and_remote_messages(input: &[u8], progress: &mut dyn Progress) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::environment::RepositoryOptions;
     use crate::objects::ObjectKind;
+    use std::path::Path;
 
     fn make_decision(refname: &str, send: bool) -> PushDecision {
         PushDecision {
@@ -1307,7 +1399,7 @@ mod tests {
                     push_options: vec!["ci.skip".to_owned()],
                     ..Default::default()
                 };
-                let block = build_command_block(&plan, &adv, HashAlgo::Sha1, &opts).unwrap();
+                let block = build_command_block(&plan, &adv, HashAlgo::Sha1, &opts, &[]).unwrap();
                 let pkts = decode_block(&block);
                 let (command, caps) = pkts[0].as_deref().unwrap().split_once('\0').unwrap();
                 assert_eq!(
@@ -1331,7 +1423,7 @@ mod tests {
     #[test]
     fn unsupported_atomic_push_fails_before_any_update_or_pack_bytes() {
         let dir = tempfile::tempdir().unwrap();
-        let repo = Repository::init(dir.path(), &crate::repo::InitOptions::default()).unwrap();
+        let (repo, _) = Repository::init(dir.path(), &crate::repo::InitOptions::default()).unwrap();
         let refs = [PushRefSpec {
             src: Some(repo.odb().write(ObjectKind::Blob, b"payload").unwrap()),
             dst: "refs/tags/payload".to_owned(),
@@ -1350,16 +1442,20 @@ mod tests {
                         dry_run,
                         ..Default::default()
                     };
-                    let err = push_remote(
-                        repo.git_dir(),
-                        &mut conn,
-                        refs,
-                        &opts,
-                        &mut crate::fetch::NoProgress,
-                        &crate::progress::NeverCancel,
-                    )
-                    .unwrap_err();
-                    assert!(matches!(err, Error::PushAtomicUnsupported), "{err:?}");
+                    let err = repo
+                        .remotes()
+                        .push_to(
+                            crate::transfer::TransferEndpoint::Connection(&mut conn),
+                            refs,
+                            &opts,
+                            &mut crate::fetch::NoProgress,
+                            &crate::progress::CancelToken::never(),
+                        )
+                        .unwrap_err();
+                    assert!(
+                        matches!(err, Error::Remote(RemoteError::PushAtomicUnsupported)),
+                        "{err:?}"
+                    );
                     assert!(
                         conn.output.is_empty(),
                         "unsupported atomic push wrote bytes"
@@ -1396,7 +1492,12 @@ mod tests {
         PushPack::for_plan(plan, repo, adv)?
             .map(|pack| {
                 let mut bytes = Vec::new();
-                pack.write_to(repo, &mut bytes, &crate::progress::CancelSignal::never())?;
+                pack.write_to(
+                    repo,
+                    &mut bytes,
+                    &crate::progress::CancelSignal::never(),
+                    None,
+                )?;
                 Ok(bytes)
             })
             .transpose()
@@ -1410,17 +1511,15 @@ mod tests {
     ) {
         let flaky = crate::odb::store::flaky::FlakyStore::new();
         let git_dir = dir.join("repo.git");
-        let repo = crate::repo::RepositoryBuilder::new(RepositoryOptions::empty())
-            .odb_builder(
-                crate::odb::OdbBuilder::files(git_dir.join("objects"))
-                    .primary(flaky.clone())
-                    .alternates(false),
-            )
-            .ref_store(std::sync::Arc::new(
-                crate::refs::store::MemoryRefStore::new(),
-            ))
-            .open(&git_dir, None)
-            .unwrap();
+        let repo = crate::repo::Repository::open(
+            &git_dir,
+            &(RepositoryOptions::empty()
+                .with_object_store(flaky.clone())
+                .with_ref_store(std::sync::Arc::new(
+                    crate::refs::store::MemoryRefStore::new(),
+                ))),
+        )
+        .unwrap();
         (repo, flaky)
     }
 
@@ -1443,6 +1542,83 @@ mod tests {
         flaky.fail_contains(true);
         let err = push_pack_bytes(&plan, &repo, &adv).unwrap_err();
         assert!(crate::odb::store::flaky::is_injected(&err), "{err:?}");
+    }
+
+    #[test]
+    fn decide_push_wire_rejects_existing_tag_without_force() {
+        let dir = tempfile::tempdir().unwrap();
+        let (repo, _) = Repository::init(dir.path(), &crate::repo::InitOptions::default()).unwrap();
+        let c1 = repo
+            .odb()
+            .write(ObjectKind::Commit, b"fake commit 1")
+            .unwrap();
+        let c2 = repo
+            .odb()
+            .write(ObjectKind::Commit, b"fake commit 2")
+            .unwrap();
+        let mut remote_refs = HashMap::new();
+        remote_refs.insert("refs/tags/v1".to_owned(), c1);
+        let spec = PushRefSpec {
+            src: Some(c2),
+            dst: "refs/tags/v1".to_owned(),
+            ..Default::default()
+        };
+        let decision = decide_push_wire(&spec, &repo, &remote_refs).unwrap();
+        assert_eq!(decision.result.status, PushRefStatus::RejectAlreadyExists);
+        assert_eq!(
+            decision.result.message.as_deref(),
+            Some(crate::transfer::PUSH_TAG_EXISTS_MESSAGE)
+        );
+        assert!(!decision.send);
+    }
+
+    #[test]
+    fn decide_push_wire_rejects_existing_tag_when_advertised_oid_missing_locally() {
+        let dir = tempfile::tempdir().unwrap();
+        let (repo, _) = Repository::init(dir.path(), &crate::repo::InitOptions::default()).unwrap();
+        let src = repo
+            .odb()
+            .write(ObjectKind::Commit, b"local tag tip")
+            .unwrap();
+        let remote_only = ObjectId::from_hex(&"a".repeat(40)).unwrap();
+        assert!(
+            !repo.odb().contains(&remote_only).unwrap(),
+            "fixture: remote tag oid must be absent locally"
+        );
+        let mut remote_refs = HashMap::new();
+        remote_refs.insert("refs/tags/v1".to_owned(), remote_only);
+        let spec = PushRefSpec {
+            src: Some(src),
+            dst: "refs/tags/v1".to_owned(),
+            ..Default::default()
+        };
+        let decision = decide_push_wire(&spec, &repo, &remote_refs).unwrap();
+        assert_eq!(decision.result.status, PushRefStatus::RejectAlreadyExists);
+        assert_eq!(
+            decision.result.message.as_deref(),
+            Some(crate::transfer::PUSH_TAG_EXISTS_MESSAGE)
+        );
+        assert!(!decision.send);
+    }
+
+    #[test]
+    fn decide_push_wire_force_tag_update_marks_forced_even_when_ff() {
+        let dir = tempfile::tempdir().unwrap();
+        let (repo, _) = Repository::init(dir.path(), &crate::repo::InitOptions::default()).unwrap();
+        let parent = repo.odb().write(ObjectKind::Commit, b"parent").unwrap();
+        let child = repo.odb().write(ObjectKind::Commit, b"child").unwrap();
+        let mut remote_refs = HashMap::new();
+        remote_refs.insert("refs/tags/v1".to_owned(), parent);
+        let spec = PushRefSpec {
+            src: Some(child),
+            dst: "refs/tags/v1".to_owned(),
+            force: true,
+            ..Default::default()
+        };
+        let decision = decide_push_wire(&spec, &repo, &remote_refs).unwrap();
+        assert_eq!(decision.result.status, PushRefStatus::Ok);
+        assert!(decision.result.forced);
+        assert!(decision.send);
     }
 
     #[test]
@@ -1488,6 +1664,30 @@ mod tests {
     }
 
     #[test]
+    fn command_block_prepends_shallow_boundaries() {
+        let boundary = ObjectId::from_hex(&"a".repeat(40)).unwrap();
+        let new = ObjectId::from_hex(&"1".repeat(40)).unwrap();
+        let plan = PushPlan {
+            decisions: vec![send_decision("refs/heads/main", new)],
+            to_send: vec![0],
+        };
+        let block = build_command_block(
+            &plan,
+            &adv_state(false, false, true),
+            HashAlgo::Sha1,
+            &PushOptions::default(),
+            &[boundary],
+        )
+        .unwrap();
+        let pkts = decode_block(&block);
+        let expected_shallow = format!("shallow {}", boundary.to_hex());
+        assert_eq!(pkts[0].as_deref(), Some(expected_shallow.as_str()));
+        let cmd = pkts[1].as_deref().unwrap();
+        assert!(cmd.contains("refs/heads/main"));
+        assert_eq!(pkts[2], None, "trailing flush");
+    }
+
+    #[test]
     fn command_block_without_push_options_has_no_capability_or_lines() {
         let new = ObjectId::from_hex(&"1".repeat(40)).unwrap();
         let plan = PushPlan {
@@ -1499,6 +1699,7 @@ mod tests {
             &adv_state(false, false, true),
             HashAlgo::Sha1,
             &PushOptions::default(),
+            &[],
         )
         .unwrap();
         let pkts = decode_block(&block);
@@ -1527,8 +1728,14 @@ mod tests {
             push_options: vec!["ci.skip".to_owned(), "reviewer=alice".to_owned()],
             ..Default::default()
         };
-        let block = build_command_block(&plan, &adv_state(true, true, true), HashAlgo::Sha1, &opts)
-            .unwrap();
+        let block = build_command_block(
+            &plan,
+            &adv_state(true, true, true),
+            HashAlgo::Sha1,
+            &opts,
+            &[],
+        )
+        .unwrap();
         let pkts = decode_block(&block);
         // command line | flush | push-option ci.skip | push-option reviewer=alice | flush
         assert_eq!(
@@ -1562,7 +1769,7 @@ mod tests {
         // Server did NOT advertise push-options: typed error, not Message.
         let err = require_push_capabilities(&adv_state(true, true, false), &opts).unwrap_err();
         assert!(
-            matches!(err, Error::PushOptionsUnsupported),
+            matches!(err, Error::Remote(RemoteError::PushOptionsUnsupported)),
             "expected PushOptionsUnsupported, got {err:?}"
         );
         assert_eq!(
@@ -1703,8 +1910,12 @@ mod tests {
         sideband: bool,
         progress: &mut dyn Progress,
     ) -> Result<Vec<u8>> {
-        let raw =
-            read_receive_pack_response(reader, sent_refs, sideband, &crate::progress::NeverCancel)?;
+        let raw = read_receive_pack_response(
+            reader,
+            sent_refs,
+            sideband,
+            &crate::progress::CancelToken::never(),
+        )?;
         if sideband {
             demux_report_and_remote_messages(&raw, progress)
         } else {
@@ -1724,7 +1935,7 @@ mod tests {
             &mut reader,
             &["refs/heads/main"],
             false,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .expect("reset");
         assert_eq!(out, report);
@@ -1735,7 +1946,7 @@ mod tests {
         /// Hands out `payload` in one read, then fires `cancel`.
         struct CancelAfterRead {
             payload: Cursor<Vec<u8>>,
-            cancel: crate::progress::FlagCancel,
+            cancel: crate::progress::CancelToken,
         }
         impl Read for CancelAfterRead {
             fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
@@ -1749,7 +1960,7 @@ mod tests {
             (&["unpack ok"][..], false),
             (&["unpack ok", "ok refs/heads/main"][..], true),
         ] {
-            let cancel = crate::progress::FlagCancel::new();
+            let cancel = crate::progress::CancelToken::new();
             let report = report_bytes(lines);
             let mut reader = CancelAfterRead {
                 payload: Cursor::new(report.clone()),
@@ -1776,7 +1987,7 @@ mod tests {
             &mut reader,
             &["refs/heads/main"],
             false,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap_err();
         assert!(

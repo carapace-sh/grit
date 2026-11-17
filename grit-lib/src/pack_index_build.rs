@@ -14,6 +14,7 @@
 //! of through the mapping. The mapping's resident pages therefore stay bounded instead
 //! of growing to the pack's size.
 
+use crate::error::ObjectError;
 use crate::error::{Error, Result};
 use crate::hash::{hash_object, Parallelism};
 use crate::objects::{HashAlgo, ObjectId, ObjectKind};
@@ -24,9 +25,7 @@ use crate::pack_delta_walk::{
 };
 use crate::pack_map::{PackData, ResidentBudget};
 use crate::pack_zlib::skip_zlib_at_with_scratch;
-use crate::progress::{
-    cancel_watch_arc, poll_cancel, poll_watch, Cancel, ProgressPhase, ProgressSink,
-};
+use crate::progress::{poll_cancel, poll_watch, CancelToken, ProgressPhase, ProgressSink};
 use crate::unpack_objects::{type_code_to_kind, PackIndexRecord, PackReader};
 use crate::zlib_inflate::ZlibInflateScratch;
 use std::collections::{HashSet, VecDeque};
@@ -39,7 +38,7 @@ const PROGRESS_POLL_EVERY: u64 = 32;
 
 /// Poll cancel handles during index-pack (main thread and worker loops).
 fn poll_index_build_cancel(
-    cancel: Option<&dyn Cancel>,
+    cancel: Option<&CancelToken>,
     progress: Option<&mut dyn ProgressSink>,
     watch: Option<&Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<()> {
@@ -144,8 +143,11 @@ impl PendingDeltas {
         uncompressed_size: usize,
         base: DeltaBase,
     ) -> Result<()> {
-        let index = u32::try_from(self.deltas.len())
-            .map_err(|_| Error::CorruptObject("too many deltas in pack".to_owned()))?;
+        let index = u32::try_from(self.deltas.len()).map_err(|_| {
+            Error::Object(ObjectError::Corrupt {
+                detail: "too many deltas in pack".to_owned(),
+            })
+        })?;
         self.deltas.push(PendingDelta::new(
             offset,
             zlib_offset,
@@ -199,7 +201,7 @@ pub(crate) fn build_mapped_pack_index(
     parallelism: Parallelism,
     verify_trailer: bool,
     progress: Option<&mut dyn ProgressSink>,
-    cancel: Option<&dyn Cancel>,
+    cancel: Option<&CancelToken>,
 ) -> Result<PackIndexBuild> {
     build_records(
         pack,
@@ -228,8 +230,8 @@ pub(crate) fn build_mapped_pack_index(
 ///
 /// # Errors
 ///
-/// Returns [`Error::CorruptObject`] for a malformed pack or a bad trailer (when
-/// `verify_trailer`), and [`Error::UnresolvedDeltas`] for deltas whose bases are in
+/// Returns [`crate::error::ObjectError::Corrupt`] for a malformed pack or a bad trailer (when
+/// `verify_trailer`), and [`crate::error::ObjectError::UnresolvedDeltas`] for deltas whose bases are in
 /// neither the pack nor `odb`.
 pub fn build_pack_index_records(
     pack: &[u8],
@@ -248,7 +250,7 @@ pub fn build_pack_index_records_with_progress(
     parallelism: Parallelism,
     verify_trailer: bool,
     progress: Option<&mut dyn ProgressSink>,
-    cancel: Option<&dyn Cancel>,
+    cancel: Option<&CancelToken>,
 ) -> Result<Vec<PackIndexRecord>> {
     build_records(
         pack,
@@ -273,13 +275,13 @@ fn build_records(
     parallelism: Parallelism,
     verify_trailer: bool,
     progress: Option<&mut dyn ProgressSink>,
-    cancel: Option<&dyn Cancel>,
+    cancel: Option<&CancelToken>,
     chain_limit: usize,
     resident: &ResidentBudget<'_>,
     source: PackBytes<'_>,
 ) -> Result<PackIndexBuild> {
     crate::trace::trace_span!("grit.pack.delta.resolve");
-    let cancel_watch = cancel.map(cancel_watch_arc);
+    let cancel_watch = cancel.map(|c| c.watch_arc());
     poll_index_build_cancel(cancel, None, cancel_watch.as_ref())?;
     let algo = odb.hash_algo();
     let threads = parallelism.threads();
@@ -354,17 +356,17 @@ fn build_records(
 fn read_pack_header(pack: &[u8]) -> Result<PackHeader> {
     let sig = &pack[0..4.min(pack.len())];
     if sig != b"PACK" {
-        return Err(Error::CorruptObject(
-            "not a pack stream: invalid signature".to_owned(),
-        ));
+        return Err(Error::Object(ObjectError::Corrupt {
+            detail: "not a pack stream: invalid signature".to_owned(),
+        }));
     }
     let mut rd = PackReader::new(pack);
     rd.read_exact(4)?;
     let version = rd.read_u32_be()?;
     if version != 2 && version != 3 {
-        return Err(Error::CorruptObject(format!(
-            "unsupported pack version {version}"
-        )));
+        return Err(Error::Object(ObjectError::Corrupt {
+            detail: format!("unsupported pack version {version}"),
+        }));
     }
     let nr_objects = rd.read_u32_be()? as usize;
     Ok(PackHeader { nr_objects })
@@ -380,7 +382,7 @@ fn scan_and_hash_wholes_serial(
     algo: HashAlgo,
     verify_trailer: bool,
     mut progress: Option<&mut PackIndexReporter<'_>>,
-    cancel: Option<&dyn Cancel>,
+    cancel: Option<&CancelToken>,
     cancel_watch: Option<&Arc<AtomicBool>>,
     resident: &ResidentBudget<'_>,
 ) -> Result<()> {
@@ -427,9 +429,9 @@ fn scan_and_hash_wholes_serial(
                 &mut skip_scratch,
             )?,
             other => {
-                return Err(Error::CorruptObject(format!(
-                    "unknown packed-object type {other}"
-                )));
+                return Err(Error::Object(ObjectError::Corrupt {
+                    detail: format!("unknown packed-object type {other}"),
+                }));
             }
         }
         resident.charge(rd.pos - obj_offset);
@@ -612,7 +614,9 @@ fn scan_and_hash_whole_slots_overlapped(
                     .unwrap_or_else(|e| e.into_inner())
                     .is_some()
                 {
-                    return Err(Error::CorruptObject("index-pack hash worker failed".into()));
+                    return Err(Error::Object(ObjectError::Corrupt {
+                        detail: "index-pack hash worker failed".into(),
+                    }));
                 }
                 let obj_offset = rd.pos;
                 let (type_code, size) = rd.read_type_size()?;
@@ -650,9 +654,9 @@ fn scan_and_hash_whole_slots_overlapped(
                         &mut skip_scratch,
                     )?,
                     other => {
-                        return Err(Error::CorruptObject(format!(
-                            "unknown packed-object type {other}"
-                        )));
+                        return Err(Error::Object(ObjectError::Corrupt {
+                            detail: format!("unknown packed-object type {other}"),
+                        }));
                     }
                 }
                 resident.charge(rd.pos - obj_offset);
@@ -677,7 +681,11 @@ fn scan_and_hash_whole_slots_overlapped(
     }
 
     let mut hashed = Arc::try_unwrap(hashed)
-        .map_err(|_| Error::CorruptObject("index-pack hash worker stopped".into()))?
+        .map_err(|_| {
+            Error::Object(ObjectError::Corrupt {
+                detail: "index-pack hash worker stopped".into(),
+            })
+        })?
         .into_inner()
         .unwrap_or_else(|e| e.into_inner());
     hashed.sort_unstable_by_key(|(index, _)| *index);
@@ -726,9 +734,11 @@ fn push_ofs_delta(
     skip_scratch: &mut ZlibInflateScratch,
 ) -> Result<()> {
     let neg = rd.read_ofs_neg_offset()?;
-    let base_offset = obj_offset
-        .checked_sub(neg)
-        .ok_or_else(|| Error::CorruptObject("ofs-delta base offset underflow".to_owned()))?;
+    let base_offset = obj_offset.checked_sub(neg).ok_or_else(|| {
+        Error::Object(ObjectError::Corrupt {
+            detail: "ofs-delta base offset underflow".to_owned(),
+        })
+    })?;
     let zlib_offset = rd.pos;
     let consumed = skip_zlib_at_with_scratch(skip_scratch, pack, zlib_offset, size)?;
     let pack_end = rd.pos + consumed;
@@ -778,12 +788,16 @@ fn verify_pack_trailer(
 ) -> Result<()> {
     let hb = algo.len();
     let Some(body_end) = pack.len().checked_sub(hb) else {
-        return Err(Error::CorruptObject("pack stream truncated".to_owned()));
+        return Err(Error::Object(ObjectError::Corrupt {
+            detail: "pack stream truncated".to_owned(),
+        }));
     };
     if consumed != body_end {
-        return Err(Error::CorruptObject(format!(
-            "pack object stream ends at {consumed} but pack trailer starts at {body_end}"
-        )));
+        return Err(Error::Object(ObjectError::Corrupt {
+            detail: format!(
+                "pack object stream ends at {consumed} but pack trailer starts at {body_end}"
+            ),
+        }));
     }
     let Some(resident) = checksum else {
         return Ok(());
@@ -791,9 +805,9 @@ fn verify_pack_trailer(
     let expected = resident.checksum(algo, &pack[..consumed]);
     let trailing = &pack[consumed..body_end + hb];
     if expected.as_slice() != trailing {
-        return Err(Error::CorruptObject(
-            "pack trailing checksum mismatch".to_owned(),
-        ));
+        return Err(Error::Object(ObjectError::Corrupt {
+            detail: "pack trailing checksum mismatch".to_owned(),
+        }));
     }
     Ok(())
 }
@@ -812,6 +826,7 @@ impl DeltaVisitor for IndexRecordVisitor<'_> {
         _root: &DeltaRoot,
         _kind: ObjectKind,
         _data: &[u8],
+        _hash_verified: bool,
         _out: &mut Self::Out,
     ) -> Result<bool> {
         Ok(true)
@@ -822,6 +837,7 @@ impl DeltaVisitor for IndexRecordVisitor<'_> {
         index: u32,
         kind: ObjectKind,
         data: &[u8],
+        _hash_verified: bool,
         out: &mut Self::Out,
     ) -> Result<Option<ObjectId>> {
         let oid = hash_object(self.algo, kind, data)?;
@@ -859,7 +875,7 @@ fn resolve_deltas(
     records: &mut Vec<PackIndexRecord>,
     mut progress: Option<&mut PackIndexReporter<'_>>,
     chain_limit: usize,
-    cancel: Option<&dyn Cancel>,
+    cancel: Option<&CancelToken>,
     cancel_watch: Option<&Arc<AtomicBool>>,
 ) -> Result<Vec<ObjectId>> {
     if pending.deltas.is_empty() {
@@ -902,7 +918,9 @@ fn resolve_deltas(
     let total = u64::try_from(pending.deltas.len()).unwrap_or(u64::MAX);
     let unresolved = total.saturating_sub(walk.resolved());
     if unresolved > 0 {
-        return Err(Error::UnresolvedDeltas { count: unresolved });
+        return Err(Error::Object(ObjectError::UnresolvedDeltas {
+            count: unresolved,
+        }));
     }
     let mut thin_bases: Vec<ObjectId> = thin
         .iter()
@@ -1347,7 +1365,7 @@ mod line_coverage_tests {
         let pack = pb.build().bytes;
         for threads in [1_usize, 2] {
             match build_pack_index_records(&pack, &odb, Parallelism::resolve(Some(threads)), true) {
-                Err(Error::UnresolvedDeltas { count: 2 }) => {}
+                Err(Error::Object(ObjectError::UnresolvedDeltas { count: 2 })) => {}
                 other => panic!("threads={threads}: expected unresolved deltas, got {other:?}"),
             }
         }
@@ -1393,7 +1411,7 @@ mod line_coverage_tests {
                 build_pack_index_records(&pack, &odb, Parallelism::resolve(Some(threads)), true)
                     .expect_err("reserved type must fail");
             assert!(
-                matches!(err, Error::CorruptObject(_)),
+                matches!(err, Error::Object(ObjectError::Corrupt { .. })),
                 "threads={threads}: {err:?}"
             );
         }

@@ -1,15 +1,16 @@
 //! Regression for campaign-scale UNTR deferral during tracked restage (task #1734).
 
 use crate::support;
+use grit_lib::progress::NullProgress;
 
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::index::Index;
-use grit_lib::porcelain::add::{stage, StageMode, StageOptions};
+use grit_lib::porcelain::add::{StageMode, StageOptions};
 use grit_lib::porcelain::stage_tracked::{
     stage_tracked_modifications_with_thresholds, IndexStagingThresholds,
 };
-use grit_lib::progress::NullProgress;
 use grit_lib::repo::Repository;
+use grit_lib::test_support::knobs::stage_options_staging_thresholds;
 use std::fs;
 
 use support::git;
@@ -19,7 +20,8 @@ fn open_grit(wt: &std::path::Path) -> Repository {
 }
 
 fn untr_root_valid(index_bytes: &[u8]) -> bool {
-    let idx = Index::parse(index_bytes).expect("parse index");
+    let idx = Index::parse(index_bytes, &grit_lib::index::IndexParseOptions::default())
+        .expect("parse index");
     idx.untracked_cache
         .as_ref()
         .and_then(|uc| uc.root.as_ref())
@@ -34,12 +36,14 @@ fn small_bulk_thresholds() -> IndexStagingThresholds {
 }
 
 fn stage_opts_with_small_bulk() -> StageOptions {
-    StageOptions {
-        mode: StageMode::All,
-        executable_hint: Default::default(),
-        staging_thresholds: Some(small_bulk_thresholds()),
-        ..StageOptions::default()
-    }
+    stage_options_staging_thresholds(
+        StageOptions {
+            mode: StageMode::All,
+            executable_hint: Default::default(),
+            ..StageOptions::default()
+        },
+        small_bulk_thresholds(),
+    )
 }
 
 #[test]
@@ -65,13 +69,13 @@ fn bulk_deferred_untr_replay_after_mass_removal() {
     }
 
     let grit = open_grit(&repo_dir);
-    stage(
-        &grit,
-        &stage_opts_with_small_bulk(),
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("grit add");
+    grit.index()
+        .stage(
+            &stage_opts_with_small_bulk(),
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("grit add");
 
     let grit_index = fs::read(repo_dir.join(".git/index")).expect("grit index");
     assert!(

@@ -3,12 +3,13 @@
 //! Matches Git's `notes-cache.c`: the notes ref's **commit subject** stores the current
 //! `diff.<driver>.textconv` command string; when it changes, the cache is treated as empty.
 
+use crate::error::ObjectError;
 use std::collections::BTreeMap;
 use std::path::Path;
 
 use crate::config::ConfigSet;
 use crate::objects::{
-    parse_commit, parse_tree, serialize_commit, serialize_tree, tree_entry_cmp, CommitData,
+    parse_commit, parse_tree, serialize_commit, serialize_tree, tree_name_cmp, CommitData,
     ObjectId, ObjectKind, TreeEntry,
 };
 use crate::odb::Odb;
@@ -38,9 +39,9 @@ fn collect_tree_entries(
 ) -> crate::error::Result<()> {
     let tree_obj = odb.read(tree_oid)?;
     if tree_obj.kind != ObjectKind::Tree {
-        return Err(crate::error::Error::CorruptObject(
-            "notes tree is not a tree object".to_owned(),
-        ));
+        return Err(crate::error::Error::Object(ObjectError::Corrupt {
+            detail: "notes tree is not a tree object".to_owned(),
+        }));
     }
     for entry in parse_tree(&tree_obj.data)? {
         let mut path = prefix.to_vec();
@@ -143,7 +144,7 @@ fn write_notes_subtree(odb: &Odb, entries: &[NotesEntry]) -> crate::error::Resul
         }
     }
     tree_entries
-        .sort_by(|a, b| tree_entry_cmp(&a.name, a.mode == 0o040000, &b.name, b.mode == 0o040000));
+        .sort_by(|a, b| tree_name_cmp(&a.name, a.mode == 0o040000, &b.name, b.mode == 0o040000));
     let data = serialize_tree(&tree_entries);
     odb.write(ObjectKind::Tree, &data)
 }
@@ -170,7 +171,10 @@ fn write_notes_ref(
     let config = ConfigSet::load(
         &crate::environment::Environment::empty(),
         Some(git_dir),
-        true,
+        &crate::config::LoadConfigOptions::standard(
+            &crate::environment::Environment::empty(),
+            Some(git_dir),
+        ),
     )
     .unwrap_or_default();
     let now = time::OffsetDateTime::now_utc();
@@ -193,6 +197,7 @@ fn write_notes_ref(
     };
     let bytes = serialize_commit(&commit);
     let commit_oid = odb.write(ObjectKind::Commit, &bytes)?;
+    odb.flush_for_publish()?;
     // Check the commit against `odb`, which may not be the files store under `git_dir`.
     let store = crate::refs::store::ObjectCheckedRefStore::new(
         crate::refs::store::open_ref_store(git_dir)?,
@@ -205,11 +210,11 @@ fn write_notes_ref(
 fn grit_ident(config: &ConfigSet, now: time::OffsetDateTime) -> String {
     let name = crate::environment::Environment::empty()
         .var("GIT_COMMITTER_NAME")
-        .or_else(|| config.get("user.name"))
+        .or_else(|| config.value("user.name"))
         .unwrap_or_else(|| "grit".to_owned());
     let email = crate::environment::Environment::empty()
         .var("GIT_COMMITTER_EMAIL")
-        .or_else(|| config.get("user.email"))
+        .or_else(|| config.value("user.email"))
         .unwrap_or_default();
     let epoch = now.unix_timestamp();
     let offset = now.offset();

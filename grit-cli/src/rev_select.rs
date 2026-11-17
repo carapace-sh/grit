@@ -3,19 +3,17 @@
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
-use carapace_rs_clap::completer;
 use clap::Args;
 use grit_lib::config::environment::Environment;
-use grit_lib::config::mailmap::load_mailmap_table;
 use grit_lib::config::parse_bool;
 use grit_lib::diff::{Pickaxe, PickaxeError};
 use grit_lib::repo::Repository;
-use grit_lib::revwalk::filter::{CommitFilter, CommitFilterBuilder, CommitFilterError};
 use grit_lib::revwalk::{
     committer_cutoff_from_date, MergeFilter, RefSelection, RevWalkListOptions,
 };
+use grit_lib::revwalk::{CommitFilter, CommitFilterBuilder, CommitFilterError};
+use grit_lib::worktree::pathspec::Pathspec;
 
-use crate::completions::grit;
 use crate::error_kind::ErrorKind;
 use crate::json_error::{
     invalid_commit_filter, invalid_pickaxe, StructuredCliError, StructuredJsonError,
@@ -28,10 +26,7 @@ const LOG_CURSOR_PREFIX: &str = "lw1.";
 #[derive(Debug, Args, Clone)]
 pub struct RevSelectArgs {
     /// Revision tips and ranges (`A..B`, `A...B`, `^tip`, plain tips).
-    #[arg(
-        value_name = "REV",
-        add = completer!(grit::action_revision_ranges())
-    )]
+    #[arg(value_name = "REV")]
     pub revs: Vec<String>,
 
     #[command(flatten)]
@@ -61,6 +56,10 @@ pub struct RevSelectArgs {
     #[arg(long = "first-parent")]
     pub first_parent: bool,
 
+    /// Follow a single file path across renames (Git `log --follow`).
+    #[arg(long = "follow")]
+    pub follow: bool,
+
     /// Include only merge commits.
     #[arg(long = "merges", conflicts_with = "no_merges")]
     pub merges: bool,
@@ -82,8 +81,7 @@ pub struct RevSelectArgs {
         long = "branches",
         value_name = "GLOB",
         num_args = 0..=1,
-        default_missing_value = "",
-        add = completer!(grit::action_local_branches())
+        default_missing_value = ""
     )]
     pub branches: Option<String>,
 
@@ -92,8 +90,7 @@ pub struct RevSelectArgs {
         long = "tags",
         value_name = "GLOB",
         num_args = 0..=1,
-        default_missing_value = "",
-        add = completer!(grit::action_tags())
+        default_missing_value = ""
     )]
     pub tags: Option<String>,
 
@@ -102,8 +99,7 @@ pub struct RevSelectArgs {
         long = "remotes",
         value_name = "GLOB",
         num_args = 0..=1,
-        default_missing_value = "",
-        add = completer!(grit::action_remotes())
+        default_missing_value = ""
     )]
     pub remotes: Option<String>,
 
@@ -184,8 +180,8 @@ impl RevSelectArgs {
         &self,
         repo: &Repository,
         env: &Environment,
-        default_revs: &[&str],
-        walk_paths: &[String],
+        _default_revs: &[&str],
+        pathspec: Pathspec,
     ) -> Result<RevWalkListOptions> {
         if self.merges && self.no_merges {
             bail!("`--merges` and `--no-merges` cannot be used together");
@@ -217,7 +213,6 @@ impl RevSelectArgs {
             .build_commit_filter(repo)
             .map_err(invalid_commit_filter)?;
         let pickaxe = self.build_pickaxe().map_err(invalid_pickaxe)?;
-        let _ = default_revs;
         Ok(RevWalkListOptions {
             limit: self.limit.get(),
             skip: self.skip,
@@ -227,11 +222,14 @@ impl RevSelectArgs {
             reverse: self.reverse,
             refs: ref_selections(self),
             first_parent: self.first_parent,
-            paths: walk_paths.to_vec(),
+            follow: self.follow,
+            full_history: false,
+            pathspec,
             commit_filter,
             pickaxe,
             graph: false,
             retain_commit_data: false,
+            retained_commit_extent: grit_lib::revwalk::CommitExtent::Whole,
             left_right: false,
             cherry_mark: false,
         })
@@ -239,10 +237,13 @@ impl RevSelectArgs {
 
     /// Revision tokens passed to the library walk (after applying command defaults).
     pub fn rev_tokens<'a>(&'a self, default_revs: &'a [&'a str]) -> Vec<&'a str> {
-        if self.revs.is_empty() {
-            default_revs.to_vec()
+        if !self.revs.is_empty() {
+            return self.revs.iter().map(String::as_str).collect();
+        }
+        if self.all || self.branches.is_some() || self.tags.is_some() || self.remotes.is_some() {
+            Vec::new()
         } else {
-            self.revs.iter().map(String::as_str).collect()
+            default_revs.to_vec()
         }
     }
 
@@ -307,7 +308,7 @@ impl RevSelectArgs {
             builder = builder.grep(pat.as_str());
         }
         if log_mailmap_enabled(repo, self.no_mailmap) {
-            if let Ok(table) = load_mailmap_table(repo) {
+            if let Ok(table) = repo.config().mailmap() {
                 if !table.is_empty() {
                     builder = builder.mailmap(table);
                 }
@@ -322,10 +323,10 @@ pub(crate) fn log_mailmap_enabled(repo: &Repository, no_mailmap: bool) -> bool {
     if no_mailmap {
         return false;
     }
-    let Ok(config) = repo.config() else {
+    let Ok(config) = repo.config().snapshot() else {
         return true;
     };
-    match config.get("log.mailmap") {
+    match crate::context::config_string(config.as_ref(), "log.mailmap") {
         None => true,
         Some(v) => parse_bool(&v).unwrap_or(true),
     }

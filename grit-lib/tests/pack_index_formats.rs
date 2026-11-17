@@ -5,16 +5,18 @@
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use grit_lib::error::Error;
+use grit_lib::error::ObjectError;
 use grit_lib::objects::odb::Odb;
-use grit_lib::objects::pack::{
+use grit_lib::objects::{HashAlgo, ObjectId, ObjectKind};
+use grit_lib::test_support::objects_pack::{
     clear_pack_cache, collect_local_pack_info, compute_fanout_from_oid_slices,
     pack_index_entry_matches_sha1_oid, parse_pack_index_bytes, read_idx_object_ids,
     read_local_pack_indexes, read_local_pack_indexes_cached, read_object_from_pack,
     read_object_from_packs, read_pack_bytes_cached, read_pack_index, read_pack_index_no_verify,
     reprepare_pack_directory_on_miss, revalidate_stale_pack_bytes, skip_one_pack_object,
-    test_pack_cache_guard, verify_pack_and_collect, write_v2_pack_index, PackIndex, PackIndexEntry,
+    verify_pack_and_collect, write_v2_pack_index, PackIndex, PackIndexEntry,
 };
-use grit_lib::objects::{HashAlgo, ObjectId, ObjectKind};
+use grit_lib::test_support::pack::pack_cache_guard;
 use grit_test_support::objects::{
     git_cat_file_batch_check, git_supports_sha256, write_pack_and_index, HashAlgo as FixtureAlgo,
     IndexPackOptions, IndexVersion, ObjectKind as FixtureKind, PackBuilder, PackBuilt, RepoFixture,
@@ -115,7 +117,7 @@ fn large_fanout_lookup_roundtrips_git_and_grit_indexes() {
                     )
                 })
                 .collect();
-            grit_lib::objects::pack::write_v2_pack_index_with_trailer(
+            grit_lib::test_support::objects_pack::write_v2_pack_index_from_trailer(
                 &grit_index_path,
                 &entries,
                 trailer,
@@ -470,14 +472,14 @@ fn empty_pack_index_from_git() {
 
 fn assert_corrupt(result: Result<(), Error>) {
     match result {
-        Err(Error::CorruptObject(_)) => {}
+        Err(Error::Object(ObjectError::Corrupt { .. })) => {}
         other => panic!("expected CorruptObject, got {other:?}"),
     }
 }
 
 fn assert_corrupt_contains(result: Result<(), Error>, needle: &str) {
     match result {
-        Err(Error::CorruptObject(msg)) => {
+        Err(Error::Object(ObjectError::Corrupt { detail: msg })) => {
             assert!(
                 msg.contains(needle),
                 "expected CorruptObject containing {needle:?}, got {msg:?}"
@@ -566,7 +568,9 @@ fn truncated_idx_bad_magic_version_and_trailer() {
     trailer_bytes[last] ^= 0xff;
     std::fs::write(&bad_trailer, &trailer_bytes).expect("write bad trailer idx");
     match read_pack_index(&bad_trailer) {
-        Err(Error::PackIndexChecksumMismatch { path, .. }) => assert_eq!(path, bad_trailer),
+        Err(Error::Object(ObjectError::PackIndexChecksumMismatch { path, .. })) => {
+            assert_eq!(path, bad_trailer)
+        }
         other => panic!(
             "expected PackIndexChecksumMismatch, got {:?}",
             other.map(|_| ())
@@ -594,7 +598,10 @@ fn pack_index_object_count_mismatch_errors() {
     idx_bad.pack_path = bad_pack;
     let err = read_object_from_pack(&idx_bad, &oid).unwrap_err();
     assert!(
-        matches!(err, Error::CorruptObject(_) | Error::Io(_)),
+        matches!(
+            err,
+            Error::Object(ObjectError::Corrupt { .. }) | Error::Io(_)
+        ),
         "unexpected error: {err:?}"
     );
 
@@ -738,12 +745,15 @@ fn bogus_offsets_and_ofs_delta_rejected_without_panic() {
     bad32_idx.pack_path = bad32_pack.clone();
     let bad32_read = read_object_from_pack(&bad32_idx, &oid1);
     assert!(
-        matches!(bad32_read, Err(Error::CorruptObject(_))),
+        matches!(bad32_read, Err(Error::Object(ObjectError::Corrupt { .. }))),
         "bogus 32-bit offset read: {bad32_read:?}"
     );
     let bad32_verify = verify_pack_and_collect(&bad32_path);
     assert!(
-        matches!(bad32_verify, Err(Error::CorruptObject(_))),
+        matches!(
+            bad32_verify,
+            Err(Error::Object(ObjectError::Corrupt { .. }))
+        ),
         "bogus 32-bit offset verify: {bad32_verify:?}"
     );
 
@@ -778,14 +788,14 @@ fn bogus_offsets_and_ofs_delta_rejected_without_panic() {
     assert!(
         matches!(
             read_object_from_pack(&ext_bad_idx, &ext_oid),
-            Err(Error::CorruptObject(_))
+            Err(Error::Object(ObjectError::Corrupt { .. }))
         ),
         "bogus 64-bit table offset must fail read"
     );
     assert!(
         matches!(
             verify_pack_and_collect(&ext_bad),
-            Err(Error::CorruptObject(_))
+            Err(Error::Object(ObjectError::Corrupt { .. }))
         ),
         "bogus 64-bit table offset must fail verify"
     );
@@ -875,7 +885,7 @@ fn duplicate_index_entries_remain_readable() {
 
 #[test]
 fn large_pack_uses_mmap_backing_for_reads() {
-    let _guard = test_pack_cache_guard();
+    let _guard = pack_cache_guard();
     clear_pack_cache();
     let repo = RepoFixture::init(FixtureAlgo::Sha1).expect("init");
     std::fs::create_dir_all(repo.objects_dir().join("pack")).expect("pack dir");
@@ -903,7 +913,7 @@ fn large_pack_uses_mmap_backing_for_reads() {
 
 #[test]
 fn collect_local_pack_info_and_cache_invalidation() {
-    let _guard = test_pack_cache_guard();
+    let _guard = pack_cache_guard();
     clear_pack_cache();
     run_both_algos(|algo| {
         let (repo, _pack, oids) = rich_pack_fixture(algo);
@@ -920,7 +930,7 @@ fn collect_local_pack_info_and_cache_invalidation() {
 
 #[test]
 fn warmed_pack_cache_revalidates_after_same_path_replacement() {
-    let _guard = test_pack_cache_guard();
+    let _guard = pack_cache_guard();
     clear_pack_cache();
     let repo = RepoFixture::init(FixtureAlgo::Sha1).expect("init");
     let objects = repo.objects_dir();

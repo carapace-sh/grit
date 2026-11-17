@@ -1,19 +1,20 @@
 //! Initial switch materialization, including upstream t2018's no-checkout branch scenario.
 
+use grit_lib::worktree::WorktreeError;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use grit_lib::command_runner::hooks::PostOperationHooks;
 use grit_lib::config::environment::{Environment, RepositoryOptions};
 use grit_lib::error::{Error, OverwriteReason};
 use grit_lib::objects::ObjectId;
-use grit_lib::porcelain::switch::{switch_repository, SwitchMode, SwitchOptions, SwitchOutcome};
-use grit_lib::progress::{NeverCancel, NullProgress};
+use grit_lib::porcelain::switch::{SwitchMode, SwitchOptions, SwitchOutcome};
+use grit_lib::progress::CancelToken;
+use grit_lib::progress::NullProgress;
 use grit_lib::remote::clone::{clone as clone_repo, CloneOptions};
-use grit_lib::remote::fetch::NoProgress;
 use grit_lib::repo::Repository;
-use grit_lib::PostOperationHooks;
 use grit_test_support::git;
 
 fn source() -> tempfile::TempDir {
@@ -46,7 +47,7 @@ fn no_checkout(source: &Path, with_grit: bool) -> tempfile::TempDir {
                 ..CloneOptions::new(source.to_string_lossy(), dest.path().to_owned())
             },
             &mut NoProgress,
-            &NeverCancel,
+            &CancelToken::never(),
             None,
         )
         .expect("grit clone");
@@ -88,15 +89,14 @@ fn switch(
     mode: SwitchMode,
     dry_run: bool,
 ) -> grit_lib::error::Result<SwitchOutcome> {
-    switch_repository(
-        repo,
+    repo.checkout().switch(
         &SwitchOptions {
             mode,
             dry_run,
             hooks: PostOperationHooks::Skip,
         },
         &mut NullProgress,
-        &NeverCancel,
+        &CancelToken::never(),
     )
 }
 
@@ -259,11 +259,11 @@ fn initial_switch_refuses_untracked_collisions_without_mutating_any_bytes() {
             for dry_run in [true, false] {
                 let err = switch(&repo, mode.clone(), dry_run).expect_err("untracked collision");
                 match err {
-                    Error::WouldOverwrite {
+                    Error::Worktree(WorktreeError::WouldOverwrite {
                         reason: OverwriteReason::Untracked,
                         paths,
                         ..
-                    } => assert_eq!(paths, vec![path.to_owned()]),
+                    }) => assert_eq!(paths, vec![path.to_owned()]),
                     other => panic!("expected untracked refusal: {other:?}"),
                 }
                 assert_eq!(bytes(dest.path()), before);
@@ -294,10 +294,10 @@ fn existing_empty_index_preserves_staged_deletions() {
     for dry_run in [true, false] {
         assert!(matches!(
             switch(&repo, mode.clone(), dry_run),
-            Err(Error::WouldOverwrite {
+            Err(Error::Worktree(WorktreeError::WouldOverwrite {
                 reason: OverwriteReason::LocalChanges,
                 ..
-            })
+            }))
         ));
         assert_eq!(bytes(dest.path()), before);
     }
@@ -391,11 +391,19 @@ fn initial_switch_hook_receives_actual_previous_head() {
         dry_run: true,
         hooks: PostOperationHooks::Run,
     };
-    switch_repository(&repo, &opts, &mut NullProgress, &NeverCancel).unwrap();
+    repo.checkout()
+        .switch(&opts, &mut NullProgress, &CancelToken::never())
+        .unwrap();
     assert_eq!(bytes(dest.path()), before);
     opts.dry_run = false;
-    let outcome = switch_repository(&repo, &opts, &mut NullProgress, &NeverCancel).unwrap();
-    assert_eq!(outcome.hooks_run, vec![grit_lib::HookName::PostCheckout]);
+    let outcome = repo
+        .checkout()
+        .switch(&opts, &mut NullProgress, &CancelToken::never())
+        .unwrap();
+    assert_eq!(
+        outcome.hooks_run,
+        vec![grit_lib::command_runner::hooks::HookName::PostCheckout]
+    );
     assert_eq!(
         fs::read_to_string(dest.path().join(".git/checkout-args")).unwrap(),
         format!("{previous}\n{target}\n1\n")

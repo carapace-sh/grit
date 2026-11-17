@@ -1,13 +1,14 @@
 //! Exercises commit-graph file APIs for line coverage (t5318/t5324 helpers).
 
+use grit_lib::error::ObjectError;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use grit_lib::diff::bloom::BloomFilterSettings;
 use grit_lib::error::Error;
 use grit_lib::index::write_tree::write_tree_from_index;
 use grit_lib::index::{Index, IndexEntry, MODE_REGULAR};
+use grit_lib::objects::commit_graph::BloomFilterSettings;
 use grit_lib::objects::commit_graph::{build_commit_graph_bytes, load_commit_graph_commit_info};
 use grit_lib::objects::commit_graph::{
     commit_tree_has_high_bit_paths, dump_bloom_filters, parse_graph_file, BloomPrecheck,
@@ -19,11 +20,11 @@ use grit_lib::repo::{InitOptions, Repository};
 
 fn one_commit_repo() -> (tempfile::TempDir, Repository, ObjectId) {
     let dir = tempfile::tempdir().expect("tempdir");
-    let repo = Repository::init(
+    let (repo, _) = Repository::init(
         dir.path(),
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
-            .with_ref_storage(grit_lib::RefStorageFormat::Files),
+            .with_ref_storage(grit_lib::refs::ref_storage::RefStorageFormat::Files),
     )
     .expect("init");
     let mut index = Index::new();
@@ -60,7 +61,7 @@ fn one_commit_repo() -> (tempfile::TempDir, Repository, ObjectId) {
         extra_headers: Vec::new(),
     });
     let commit = repo.odb().write(ObjectKind::Commit, &raw).expect("commit");
-    grit_lib::refs::write_ref(repo.git_dir(), "refs/heads/main", &commit).expect("ref");
+    grit_test_support::refs::set_ref(&repo, "refs/heads/main", &commit).expect("ref");
     (dir, repo, commit)
 }
 
@@ -95,11 +96,11 @@ fn git_cmd(dir: &Path, args: &[&str]) {
 
 fn octopus_merge_graph() -> (tempfile::TempDir, Repository, ObjectId, Vec<ObjectId>) {
     let dir = tempfile::tempdir().expect("tempdir");
-    let repo = Repository::init(
+    let (repo, _) = Repository::init(
         dir.path(),
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
-            .with_ref_storage(grit_lib::RefStorageFormat::Files),
+            .with_ref_storage(grit_lib::refs::ref_storage::RefStorageFormat::Files),
     )
     .expect("init");
     let mk = |parents: Vec<ObjectId>, t: i64| -> ObjectId {
@@ -221,11 +222,11 @@ fn bloom_walk_stats_counters() {
 #[test]
 fn commit_tree_high_bit_and_parse_graph_dump() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let repo = Repository::init(
+    let (repo, _) = Repository::init(
         dir.path(),
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
-            .with_ref_storage(grit_lib::RefStorageFormat::Files),
+            .with_ref_storage(grit_lib::refs::ref_storage::RefStorageFormat::Files),
     )
     .expect("init");
     let mut index = Index::new();
@@ -375,11 +376,11 @@ fn bloom_filter_slice_warns_on_bad_offsets_in_memory() {
 #[test]
 fn two_parent_graph_commit_matches_object() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let repo = Repository::init(
+    let (repo, _) = Repository::init(
         dir.path(),
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
-            .with_ref_storage(grit_lib::RefStorageFormat::Files),
+            .with_ref_storage(grit_lib::refs::ref_storage::RefStorageFormat::Files),
     )
     .expect("init");
     let tree = repo.odb().write(ObjectKind::Tree, b"").expect("tree");
@@ -449,11 +450,11 @@ fn graph_content_hash(bytes: &[u8], algo: HashAlgo) -> String {
 
 fn two_commit_repo() -> (tempfile::TempDir, Repository, Vec<ObjectId>) {
     let dir = tempfile::tempdir().expect("tempdir");
-    let repo = Repository::init(
+    let (repo, _) = Repository::init(
         dir.path(),
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
-            .with_ref_storage(grit_lib::RefStorageFormat::Files),
+            .with_ref_storage(grit_lib::refs::ref_storage::RefStorageFormat::Files),
     )
     .expect("init");
     let tree = repo.odb().write(ObjectKind::Tree, b"").expect("tree");
@@ -592,7 +593,7 @@ fn grit_octopus_graph_rejects_invalid_extra_edge_parent() {
         bytes[off..off + 4].copy_from_slice(&99u32.to_be_bytes());
         reseal_commit_graph(&mut bytes, repo.odb().hash_algo());
         let err = CommitGraphLayer::try_parse(std::path::PathBuf::from("g"), bytes).unwrap_err();
-        assert!(matches!(err, Error::CorruptObject(_)));
+        assert!(matches!(err, Error::Object(ObjectError::Corrupt { .. })));
     }
 }
 
@@ -635,7 +636,7 @@ fn grit_graph_rejects_invalid_parent_index_in_cdat() {
     bytes[cdat_off + hash_len..cdat_off + hash_len + 4].copy_from_slice(&99u32.to_be_bytes());
     reseal_commit_graph(&mut bytes, repo.odb().hash_algo());
     let err = CommitGraphLayer::try_parse(std::path::PathBuf::from("g"), bytes).unwrap_err();
-    assert!(matches!(err, Error::CorruptObject(_)));
+    assert!(matches!(err, Error::Object(ObjectError::Corrupt { .. })));
 }
 
 #[test]
@@ -753,7 +754,7 @@ fn grit_graph_rejects_unsupported_hash_version() {
     bytes[5] = 99;
     reseal_commit_graph(&mut bytes, repo.odb().hash_algo());
     let err = CommitGraphLayer::try_parse(std::path::PathBuf::from("g"), bytes).unwrap_err();
-    assert!(matches!(err, Error::CorruptObject(_)));
+    assert!(matches!(err, Error::Object(ObjectError::Corrupt { .. })));
 }
 
 #[test]

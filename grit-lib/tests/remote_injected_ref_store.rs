@@ -11,9 +11,8 @@ use std::sync::Arc;
 
 use grit_lib::config::environment::{Environment, RepositoryOptions};
 use grit_lib::objects::ObjectId;
-use grit_lib::progress::NeverCancel;
-use grit_lib::refs::store::{MemoryRefStore, RawRef, RefStore};
-use grit_lib::remote::fetch::NoProgress;
+use grit_lib::progress::CancelToken;
+use grit_lib::refs::store::{MemoryRefStore, RawRef, RefNameRef, RefStore};
 use grit_lib::remote::partial_clone::ObjectFilterSpec;
 use grit_lib::remote::transfer::{FetchOptions, PushOptions, PushRefSpec};
 use grit_lib::remote::InspectOptions;
@@ -115,7 +114,7 @@ fn fetch(repo: &Repository, remote: &str, opts: FetchOptions) {
     repo.remotes()
         .get(remote)
         .expect("remote")
-        .fetch(repo, opts, &mut NoProgress, &NeverCancel, None)
+        .fetch(repo, opts, &mut NoProgress, &CancelToken::never(), None)
         .expect("fetch");
 }
 
@@ -153,14 +152,20 @@ fn assert_origin_tracking_in_store(repo: &Repository, store: &MemoryRefStore, ti
         ]
     );
     assert_eq!(
-        repo.rev_walk()
-            .resolve("refs/remotes/origin/main")
+        repo.revwalk()
+            .resolve(
+                "refs/remotes/origin/main",
+                &grit_lib::revwalk::ResolveOptions::default()
+            )
             .expect("resolve through handle"),
         tip
     );
     assert_eq!(
-        repo.rev_walk()
-            .resolve("refs/remotes/origin/HEAD")
+        repo.revwalk()
+            .resolve(
+                "refs/remotes/origin/HEAD",
+                &grit_lib::revwalk::ResolveOptions::default()
+            )
             .expect("resolve HEAD"),
         tip
     );
@@ -182,14 +187,9 @@ fn local_fetch_and_prune_stay_in_the_injected_store() {
     store
         .set_ref("refs/remotes/origin/gone", RawRef::Direct(remotes.tip))
         .expect("seed stale ref");
-    fetch(
-        &repo,
-        "origin",
-        FetchOptions {
-            prune: true,
-            ..Default::default()
-        },
-    );
+    let mut fetch_opts = FetchOptions::new();
+    fetch_opts.prune = true;
+    fetch(&repo, "origin", fetch_opts);
     let names: Vec<String> = store_refs(&store, "refs/remotes/origin/")
         .into_iter()
         .map(|(name, _)| name)
@@ -210,29 +210,19 @@ fn wire_fetch_stays_in_the_injected_store() {
     let repo = open(&local).with_ref_store(store.clone());
 
     // A partial-clone filter sends a local fetch through `git upload-pack` and the wire path.
-    fetch(
-        &repo,
-        "origin",
-        FetchOptions {
-            filter: Some(ObjectFilterSpec::BlobNone),
-            ..Default::default()
-        },
-    );
+    let mut fetch_opts = FetchOptions::new();
+    fetch_opts.filter = Some(ObjectFilterSpec::BlobNone);
+    fetch(&repo, "origin", fetch_opts);
     assert_origin_tracking_in_store(&repo, &store, remotes.tip);
     assert_no_disk_tracking_refs(&local);
 
     git(&remotes.upstream, &["branch", "-D", "topic"]);
-    fetch(
-        &repo,
-        "origin",
-        FetchOptions {
-            filter: Some(ObjectFilterSpec::BlobNone),
-            prune: true,
-            ..Default::default()
-        },
-    );
+    let mut fetch_opts = FetchOptions::new();
+    fetch_opts.filter = Some(ObjectFilterSpec::BlobNone);
+    fetch_opts.prune = true;
+    fetch(&repo, "origin", fetch_opts);
     assert!(store
-        .read_raw("refs/remotes/origin/topic")
+        .read_raw(RefNameRef::from_trusted("refs/remotes/origin/topic"))
         .expect("read")
         .is_none());
     assert_no_disk_tracking_refs(&local);
@@ -269,14 +259,9 @@ fn bundle_fetch_stays_in_the_injected_store() {
         .expect("seed stale ref");
     let repo = open(&local).with_ref_store(store.clone());
 
-    fetch(
-        &repo,
-        "origin",
-        FetchOptions {
-            prune: true,
-            ..Default::default()
-        },
-    );
+    let mut fetch_opts = FetchOptions::new();
+    fetch_opts.prune = true;
+    fetch(&repo, "origin", fetch_opts);
     assert_eq!(
         store_refs(&store, "refs/remotes/origin/"),
         vec![
@@ -319,7 +304,7 @@ fn push_updates_tracking_refs_in_the_injected_store() {
             &[spec],
             PushOptions::default(),
             &mut NoProgress,
-            &NeverCancel,
+            &CancelToken::never(),
             None,
         )
         .expect("push");
@@ -386,7 +371,7 @@ fn remote_prune_set_head_and_inspect_use_the_injected_store() {
         .expect("remote prune");
     assert_eq!(pruned, ["refs/remotes/origin/topic"]);
     assert!(store
-        .read_raw("refs/remotes/origin/topic")
+        .read_raw(RefNameRef::from_trusted("refs/remotes/origin/topic"))
         .expect("read")
         .is_none());
 
@@ -399,7 +384,7 @@ fn remote_prune_set_head_and_inspect_use_the_injected_store() {
         Some("refs/remotes/origin/main")
     );
     assert!(store
-        .read_raw("refs/remotes/origin/HEAD")
+        .read_raw(RefNameRef::from_trusted("refs/remotes/origin/HEAD"))
         .expect("read")
         .is_none());
 
@@ -409,7 +394,9 @@ fn remote_prune_set_head_and_inspect_use_the_injected_store() {
         .expect("set head");
     assert_eq!(set.previous_target, None);
     assert_eq!(
-        store.read_raw("refs/remotes/origin/HEAD").expect("read"),
+        store
+            .read_raw(RefNameRef::from_trusted("refs/remotes/origin/HEAD"))
+            .expect("read"),
         Some(RawRef::Symbolic("refs/remotes/origin/main".into()))
     );
     assert!(repo
@@ -428,14 +415,9 @@ fn files_backend_fetch_prune_and_push_round_trip_with_git() {
 
     fetch(&repo, "origin", FetchOptions::default());
     git(&remotes.upstream, &["branch", "-D", "topic"]);
-    fetch(
-        &repo,
-        "origin",
-        FetchOptions {
-            prune: true,
-            ..Default::default()
-        },
-    );
+    let mut fetch_opts = FetchOptions::new();
+    fetch_opts.prune = true;
+    fetch(&repo, "origin", fetch_opts);
     git(
         &local,
         &["update-ref", "refs/heads/main", &remotes.tip.to_hex()],
@@ -454,7 +436,7 @@ fn files_backend_fetch_prune_and_push_round_trip_with_git() {
             &[spec],
             PushOptions::default(),
             &mut NoProgress,
-            &NeverCancel,
+            &CancelToken::never(),
             None,
         )
         .expect("push");

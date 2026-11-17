@@ -1,16 +1,42 @@
 //! Repository-scoped reference and reflog access via [`References`].
 use std::ops::ControlFlow;
 
-use crate::error::Result;
+use crate::config::ident_resolve::IdentRole;
+use crate::error::{Error, Result};
+use crate::lockfile::LockWait;
 use crate::objects::ObjectId;
+use crate::porcelain::CommitError;
 use crate::reflog::ReflogEntry;
-use crate::refs::listing::{query_refs, RefListing, RefQuery, RefQueryError, RefQueryOptions};
-use crate::refs::store::{Expected, RawRef, RefName, RefUpdate, RefUpdateFlags};
+use crate::refs::listing::{query_refs, RefListing, RefQuery, RefQueryOptions};
+use crate::refs::on_store::reflog_wanted;
+use crate::refs::store::{
+    Expected, RawRef, RefName, RefNameRef, RefStoreError, RefUpdate, RefUpdateFlags, ReflogUpdate,
+};
 use crate::refs::{
-    commit_ref_update_on_store, ensure_refname_safe_for_storage, list_refs_for_repository,
-    update_direct_ref_on_store,
+    commit_ref_update_on_store, commit_ref_updates_non_atomic_on_store,
+    commit_ref_updates_on_store, commit_ref_updates_on_store_with_wait, delete_ref_on_store,
+    ensure_refname_safe_for_storage, list_refs_glob_in, list_refs_in,
+    read_symbolic_ref_for_repository, shorten::expand_ref_dwim_full_name,
+    store_write_value_on_store, write_symbolic_ref_on_store, RefUpdateCommitOutcome,
 };
 use crate::repo::Repository;
+use crate::state::HeadState;
+
+/// The ref a short name such as `main` or `v1.0` stands for, from [`References::dwim`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DwimMatch {
+    /// Full name of the ref the short name expands to, with symbolic refs followed to the
+    /// last ref in the chain (`HEAD` on `main` yields `refs/heads/main`).
+    pub name: RefName,
+    /// Object [`Self::name`] resolves to.
+    pub oid: ObjectId,
+    /// How many expansion rules (`<name>`, `refs/<name>`, `refs/tags/<name>`,
+    /// `refs/heads/<name>`, …) named an existing ref. More than one means the short name is
+    /// ambiguous; [`Self::name`] is the first by Git's precedence. With
+    /// `core.warnAmbiguousRefs = false` the scan stops at the first match, so this is `1`.
+    pub candidates: usize,
+}
 
 /// A ref returned by [`References::read_existing`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,6 +68,29 @@ impl<'repo> References<'repo> {
         self.repo
     }
 
+    /// Low-level ref storage backend (same as [`Repository::ref_store`]).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # fn main() -> grit_lib::error::Result<()> {
+    /// use grit_lib::refs::store::RefNameRef;
+    /// use grit_lib::repo::{InitOptions, Repository};
+    /// let dir = tempfile::tempdir()?;
+    /// let (repo, _) = Repository::init(dir.path(), &InitOptions::default())?;
+    /// let _ = repo
+    ///     .references()
+    ///     .store()
+    ///     .read_raw(RefNameRef::from_trusted("HEAD"))?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    #[must_use]
+    pub fn store(&self) -> &'repo dyn crate::refs::store::RefStore {
+        self.repo.ref_store()
+    }
+
     /// Resolve a ref name to an object id, following symbolic refs.
     ///
     /// # Errors
@@ -52,18 +101,18 @@ impl<'repo> References<'repo> {
     ///
     /// ```
     /// # fn main() -> grit_lib::error::Result<()> {
-    /// use grit_lib::refs::store::RefName;
+    /// use grit_lib::refs::store::{RefName, RefNameRef};
     /// use grit_lib::repo::{InitOptions, Repository};
     /// use grit_lib::ident::Signature;
-    /// use grit_lib::porcelain::commit::{create_commit, CommitRequest};
+    /// use grit_lib::porcelain::commit::CommitRequest;
     /// use grit_lib::progress::NullProgress;
     /// let dir = std::env::temp_dir().join("grit-refs-resolve-doc");
-    /// let repo = Repository::init(&dir, &InitOptions::default())?;
+    /// let (repo, _) = Repository::init(&dir, &InitOptions::default())?;
     /// let mut req = CommitRequest::new("doc");
     /// req.author = Some(Signature::new("Doc", "doc@example.com", repo.identity_now())?);
     /// req.committer = Some(Signature::new("Doc", "doc@example.com", repo.identity_now())?);
     /// req.allow_empty = true;
-    /// let _ = create_commit(&repo, &req, &mut NullProgress, &grit_lib::progress::NeverCancel)?;
+    /// let _ = repo.commits().create_staged(&req, &mut NullProgress, &grit_lib::progress::CancelToken::never())?;
     /// let main = RefName::try_from("refs/heads/main").expect("valid ref");
     /// let head = repo.references().resolve(&main)?;
     /// assert!(!head.to_hex().is_empty());
@@ -71,8 +120,98 @@ impl<'repo> References<'repo> {
     /// # }
     /// ```
     #[inline]
-    pub fn resolve(&self, name: &RefName) -> Result<ObjectId> {
-        self.repo.resolve_ref_oid(name.as_str())
+    pub fn resolve(&self, name: impl AsRef<RefNameRef>) -> Result<ObjectId> {
+        self.repo.resolve_ref_oid(name.as_ref().as_str())
+    }
+
+    /// Where `HEAD` points: a branch (possibly unborn), a detached commit, or nothing usable.
+    ///
+    /// Files repositories read the on-disk `HEAD` (including a symlinked `HEAD`) and resolve
+    /// the branch tip through this repository's ref store; reftable and injected stores are
+    /// the only source of `HEAD`. A missing or malformed `HEAD` is [`HeadState::Invalid`],
+    /// not an error.
+    ///
+    /// # Errors
+    ///
+    /// Propagates ref store read and resolution failures other than a missing branch tip.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # fn main() -> grit_lib::error::Result<()> {
+    /// use grit_lib::repo::{InitOptions, Repository};
+    /// let dir = tempfile::tempdir()?;
+    /// let (repo, _) = Repository::init(dir.path(), &InitOptions::default())?;
+    /// let head = repo.references().head()?;
+    /// assert!(head.is_unborn());
+    /// assert_eq!(head.branch_name(), Some("main"));
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn head(&self) -> Result<HeadState> {
+        crate::state::resolve_head_for_repository(self.repo)
+    }
+
+    /// The target of the symbolic ref `name`, or `None` when `name` is missing or direct.
+    ///
+    /// Only one level is read: `HEAD` pointing at `refs/heads/main` yields
+    /// `refs/heads/main` even when that ref is itself symbolic.
+    ///
+    /// # Errors
+    ///
+    /// Propagates ref store read failures.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # fn main() -> grit_lib::error::Result<()> {
+    /// use grit_lib::repo::{InitOptions, Repository};
+    /// let dir = tempfile::tempdir()?;
+    /// let (repo, _) = Repository::init(dir.path(), &InitOptions::default())?;
+    /// let target = repo.references().symbolic("HEAD")?;
+    /// assert_eq!(target.as_ref().map(|name| name.as_str()), Some("refs/heads/main"));
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn symbolic(&self, name: impl AsRef<RefNameRef>) -> Result<Option<RefName>> {
+        Ok(read_symbolic_ref_for_repository(self.repo, name)?.map(RefName::from_trusted))
+    }
+
+    /// Expand a short name the way revision arguments are expanded (`main` to
+    /// `refs/heads/main`, `v1.0` to `refs/tags/v1.0`, `origin` to
+    /// `refs/remotes/origin/HEAD`, …).
+    ///
+    /// Returns `None` when no rule names an existing ref that resolves. A symbolic ref whose
+    /// target is missing does not match; the repository's warning sink is told about it.
+    ///
+    /// # Errors
+    ///
+    /// Propagates ref store read failures and a symbolic ref chain that loops.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # fn main() -> grit_lib::error::Result<()> {
+    /// use grit_lib::repo::{InitOptions, Repository};
+    /// let dir = tempfile::tempdir()?;
+    /// let (repo, _) = Repository::init(dir.path(), &InitOptions::default())?;
+    /// assert!(repo.references().dwim("main")?.is_none());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn dwim(&self, spec: &str) -> Result<Option<DwimMatch>> {
+        let (candidates, name) = expand_ref_dwim_full_name(self.repo, spec)?;
+        let Some(name) = name else {
+            return Ok(None);
+        };
+        let Some(oid) = self.resolve_if_exists(&name)? else {
+            return Ok(None);
+        };
+        Ok(Some(DwimMatch {
+            name: RefName::from_trusted(name),
+            oid,
+            candidates,
+        }))
     }
 
     /// Read `name` when it exists: its stored value and the object it resolves to.
@@ -81,12 +220,13 @@ impl<'repo> References<'repo> {
     /// so read and corruption failures stay distinguishable from absence. A direct ref is
     /// read once; only a symbolic ref is followed.
     pub(crate) fn read_existing(&self, name: &str) -> Result<Option<ExistingRef>> {
-        let Some(raw) = self.repo.refs().read_raw(name)? else {
+        let name = RefNameRef::from_trusted(name);
+        let Some(raw) = self.repo.ref_store().read_raw(name)? else {
             return Ok(None);
         };
         let oid = match &raw {
             RawRef::Direct(oid) => *oid,
-            RawRef::Symbolic(_) => self.repo.resolve_ref_oid(name)?,
+            RawRef::Symbolic(_) => self.repo.resolve_ref_oid(name.as_str())?,
         };
         Ok(Some(ExistingRef { raw, oid }))
     }
@@ -104,15 +244,19 @@ impl<'repo> References<'repo> {
     /// target.
     pub(crate) fn delete_verified(&self, name: &str, existing: &ExistingRef) -> Result<()> {
         ensure_refname_safe_for_storage(name)?;
+        let name_ref = RefNameRef::from_trusted(name);
         let (expected, no_deref) = match &existing.raw {
-            RawRef::Symbolic(target) => (Expected::Symref(target.clone()), true),
+            RawRef::Symbolic(target) => (
+                Expected::Symref(RefName::from_trusted(target.clone())),
+                true,
+            ),
             RawRef::Direct(oid) => (Expected::Oid(*oid), false),
         };
-        let store = self.repo.refs();
+        let store = self.store();
         commit_ref_update_on_store(
             store,
             RefUpdate {
-                name: name.to_owned(),
+                name: RefName::from_trusted(name.to_owned()),
                 new_value: None,
                 expected,
                 reflog: None,
@@ -122,7 +266,7 @@ impl<'repo> References<'repo> {
                 },
             },
         )?;
-        store.delete_reflog(name)
+        store.delete_reflog(name_ref)
     }
 
     /// List refs under `prefix` (for example `"refs/heads/"`), sorted by name.
@@ -131,21 +275,52 @@ impl<'repo> References<'repo> {
     ///
     /// Propagates ref store iteration errors.
     #[inline]
-    pub fn list(&self, prefix: &str) -> Result<Vec<(String, ObjectId)>> {
-        list_refs_for_repository(self.repo, prefix)
+    pub fn list(&self, prefix: &str) -> Result<Vec<(RefName, ObjectId)>> {
+        Ok(list_refs_in(self.repo, prefix)?
+            .into_iter()
+            .map(|(name, oid)| (RefName::from_trusted(name), oid))
+            .collect())
+    }
+
+    /// List refs whose full names match the glob `pattern` (for example `refs/heads/topic/*`
+    /// or `refs/tags/v1.*`), sorted by name.
+    ///
+    /// The text before the first wildcard is a name prefix, so `refs/tags/v*` lists
+    /// `refs/tags/v1`. A pattern without wildcards lists the refs under that directory.
+    ///
+    /// # Errors
+    ///
+    /// Propagates ref store iteration errors.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # fn main() -> grit_lib::error::Result<()> {
+    /// use grit_lib::repo::{InitOptions, Repository};
+    /// let dir = tempfile::tempdir()?;
+    /// let (repo, _) = Repository::init(dir.path(), &InitOptions::default())?;
+    /// assert!(repo.references().list_glob("refs/tags/v*")?.is_empty());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn list_glob(&self, pattern: &str) -> Result<Vec<(RefName, ObjectId)>> {
+        Ok(list_refs_glob_in(self.repo, pattern)?
+            .into_iter()
+            .map(|(name, oid)| (RefName::from_trusted(name), oid))
+            .collect())
     }
 
     /// List refs matching `query` (patterns, sort, limit) through this repository's ref store.
     ///
     /// # Errors
     ///
-    /// Returns [`RefQueryError`] when the ref store cannot be read, when creator-date sort
+    /// Returns ref store errors when the ref store cannot be read, when creator-date sort
     /// is requested without object data, or when an object read fails.
     pub fn query(
         &self,
         query: &RefQuery,
         options: &RefQueryOptions,
-    ) -> std::result::Result<Vec<RefListing>, RefQueryError> {
+    ) -> crate::error::Result<Vec<RefListing>> {
         query_refs(self.repo, query, options)
     }
 
@@ -153,6 +328,15 @@ impl<'repo> References<'repo> {
     ///
     /// Uses the [`RefStore`](crate::refs::store::RefStore) installed on this repository (including
     /// injected in-memory stores), not a fresh open from `git_dir` alone.
+    ///
+    /// Symbolic refs are followed: updating `HEAD` while it points at `refs/heads/main` moves
+    /// `main` and leaves `HEAD` symbolic. Reflog entries are appended when
+    /// [`core.logAllRefUpdates`](crate::refs::LogRefsConfig) allows (same policy as
+    /// `git update-ref`). Identity comes from the repository committer signature.
+    ///
+    /// To rewrite `HEAD` itself (detach or replace the symref file), use
+    /// [`Self::update_direct`]. To require the ref tip to match an expected oid first, use
+    /// [`Self::compare_and_swap`].
     ///
     /// `oid` must be stored in this repository, and must be a commit when `name` is a branch
     /// (`refs/heads/…`) or `HEAD`. This catches a commit that a concurrent prune deleted after
@@ -166,25 +350,25 @@ impl<'repo> References<'repo> {
     ///   `name` is a branch or `HEAD` and `oid` is not a commit.
     /// - Validation, locking, and I/O errors from the ref backend.
     ///
-    /// The two object errors are returned as [`crate::error::Error::RefStore`]. The ref is
+    /// The two object errors are returned as [`crate::error::RefError::Store`]. The ref is
     /// unchanged on error.
     ///
     /// # Examples
     ///
     /// ```
     /// # fn main() -> grit_lib::error::Result<()> {
-    /// use grit_lib::refs::store::RefName;
+    /// use grit_lib::refs::store::{RefName, RefNameRef};
     /// use grit_lib::repo::{InitOptions, Repository};
     /// use grit_lib::ident::Signature;
-    /// use grit_lib::porcelain::commit::{create_commit, CommitRequest};
+    /// use grit_lib::porcelain::commit::CommitRequest;
     /// use grit_lib::progress::NullProgress;
     /// let dir = std::env::temp_dir().join("grit-refs-write-doc");
-    /// let repo = Repository::init(&dir, &InitOptions::default())?;
+    /// let (repo, _) = Repository::init(&dir, &InitOptions::default())?;
     /// let mut req = CommitRequest::new("doc");
     /// req.author = Some(Signature::new("Doc", "doc@example.com", repo.identity_now())?);
     /// req.committer = Some(Signature::new("Doc", "doc@example.com", repo.identity_now())?);
     /// req.allow_empty = true;
-    /// let commit = create_commit(&repo, &req, &mut NullProgress, &grit_lib::progress::NeverCancel)?.oid;
+    /// let commit = repo.commits().create_staged(&req, &mut NullProgress, &grit_lib::progress::CancelToken::never())?.oid;
     /// let name = RefName::try_from("refs/heads/handle-demo").expect("valid ref");
     /// repo.references().update(&name, &commit)?;
     /// assert_eq!(repo.references().resolve(&name)?, commit);
@@ -192,8 +376,287 @@ impl<'repo> References<'repo> {
     /// # }
     /// ```
     #[inline]
-    pub fn update(&self, name: &RefName, oid: &ObjectId) -> Result<()> {
-        update_direct_ref_on_store(self.repo.refs(), self.repo.git_dir(), name.as_str(), oid)
+    pub fn update(&self, name: impl AsRef<RefNameRef>, oid: &ObjectId) -> Result<()> {
+        self.commit_point(name.as_ref(), oid, Expected::Any, RefUpdateFlags::default())
+    }
+
+    /// Point `name` at `oid` without following symbolic refs.
+    ///
+    /// Updating `HEAD` writes the object id into `.git/HEAD` (detached HEAD) instead of moving
+    /// the branch `HEAD` points at. Reflog policy matches [`Self::update`].
+    ///
+    /// # Errors
+    ///
+    /// Same validation and backend errors as [`Self::update`].
+    pub fn update_direct(&self, name: impl AsRef<RefNameRef>, oid: &ObjectId) -> Result<()> {
+        self.commit_point(
+            name.as_ref(),
+            oid,
+            Expected::Any,
+            RefUpdateFlags {
+                no_deref: true,
+                ..RefUpdateFlags::default()
+            },
+        )
+    }
+
+    /// Point `name` at `oid` only when it currently resolves to `expected`.
+    ///
+    /// Symbolic refs are followed the same way as [`Self::update`]. On mismatch the ref is
+    /// unchanged and the error is
+    /// [`RefStoreError::ExpectedMismatch`](crate::refs::store::RefStoreError::ExpectedMismatch).
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::update`], plus compare-and-swap mismatch.
+    pub fn compare_and_swap(
+        &self,
+        name: impl AsRef<RefNameRef>,
+        expected: &ObjectId,
+        oid: &ObjectId,
+    ) -> Result<()> {
+        self.commit_point(
+            name.as_ref(),
+            oid,
+            Expected::Oid(*expected),
+            RefUpdateFlags::default(),
+        )
+    }
+
+    /// Make `name` a symbolic ref pointing at `target` (for example `HEAD` at
+    /// `refs/heads/main`), replacing whatever `name` held. No reflog entry is written.
+    ///
+    /// `target` does not have to exist: pointing `HEAD` at a branch with no commits yet
+    /// leaves the repository on an unborn branch.
+    ///
+    /// # Errors
+    ///
+    /// [`RefError::Invalid`](crate::error::RefError::Invalid) when `name` is not safe to store, a namespace conflict with an
+    /// existing ref, and lock and I/O failures from the ref backend.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # fn main() -> grit_lib::error::Result<()> {
+    /// use grit_lib::repo::{InitOptions, Repository};
+    /// let dir = tempfile::tempdir()?;
+    /// let (repo, _) = Repository::init(dir.path(), &InitOptions::default())?;
+    /// repo.references().update_symbolic("HEAD", "refs/heads/trunk")?;
+    /// assert_eq!(repo.references().head()?.branch_name(), Some("trunk"));
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn update_symbolic(
+        &self,
+        name: impl AsRef<RefNameRef>,
+        target: impl AsRef<RefNameRef>,
+    ) -> Result<()> {
+        write_symbolic_ref_on_store(
+            self.store(),
+            self.repo.git_dir(),
+            name.as_ref().as_str(),
+            target.as_ref().as_str(),
+        )
+    }
+
+    /// Delete `name` and its reflog. A symbolic ref is deleted itself, not its target.
+    ///
+    /// # Errors
+    ///
+    /// [`RefStoreError::NotFound`](crate::refs::store::RefStoreError::NotFound) (as
+    /// [`RefError::Store`](crate::error::RefError::Store)) when `name` does not exist, [`RefError::Invalid`](crate::error::RefError::Invalid) when it is not
+    /// safe to store, and lock and I/O failures from the ref backend.
+    pub fn delete(&self, name: impl AsRef<RefNameRef>) -> Result<()> {
+        delete_ref_on_store(self.store(), name.as_ref().as_str())
+    }
+
+    /// Delete `name` only when it currently resolves to `expected`.
+    ///
+    /// On mismatch the ref is unchanged and the error is
+    /// [`RefStoreError::ExpectedMismatch`](crate::refs::store::RefStoreError::ExpectedMismatch).
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::delete`], plus the compare-and-swap mismatch.
+    pub fn compare_and_delete(
+        &self,
+        name: impl AsRef<RefNameRef>,
+        expected: &ObjectId,
+    ) -> Result<()> {
+        let name = name.as_ref().as_str();
+        ensure_refname_safe_for_storage(name)?;
+        store_write_value_on_store(
+            self.store(),
+            self.repo.git_dir(),
+            name,
+            None,
+            Expected::Oid(*expected),
+            None,
+        )
+    }
+
+    /// Apply `updates` as one all-or-nothing transaction through this repository's ref store.
+    ///
+    /// Every update is checked (compare-and-swap expectations, name conflicts, and that a
+    /// direct value names a stored object, and a commit on a branch or `HEAD`) before any ref
+    /// moves. Reflog lines are written only for updates that carry
+    /// [`RefUpdate::reflog`](crate::refs::store::RefUpdate::reflog).
+    ///
+    /// # Errors
+    ///
+    /// [`RefStoreError`](crate::refs::store::RefStoreError) (as [`RefError::Store`](crate::error::RefError::Store)) for
+    /// duplicate names, expectation mismatches, lock and name conflicts, and missing or
+    /// non-commit objects; I/O and corrupt-store failures from the backend. No ref changes on
+    /// error.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # fn main() -> grit_lib::error::Result<()> {
+    /// use grit_lib::refs::store::{Expected, RawRef, RefName, RefUpdate, RefUpdateFlags};
+    /// use grit_lib::repo::{InitOptions, Repository};
+    /// let dir = tempfile::tempdir()?;
+    /// let (repo, _) = Repository::init(dir.path(), &InitOptions::default())?;
+    /// let target = RefName::try_from("refs/heads/main").expect("valid ref");
+    /// repo.references().apply(&[RefUpdate {
+    ///     name: RefName::try_from("refs/heads/alias").expect("valid ref"),
+    ///     new_value: Some(RawRef::Symbolic(target.as_str().to_owned())),
+    ///     expected: Expected::Missing,
+    ///     reflog: None,
+    ///     flags: RefUpdateFlags::default(),
+    /// }])?;
+    /// assert_eq!(repo.references().symbolic("refs/heads/alias")?, Some(target));
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn apply(&self, updates: &[RefUpdate]) -> Result<()> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+        commit_ref_updates_on_store(self.store(), updates, &[])
+    }
+
+    /// Apply `updates` one ref at a time, the way a non-atomic push is applied: deletions
+    /// commit together first, then creates and updates, and a failing ref is reported in its
+    /// outcome instead of failing its siblings.
+    ///
+    /// Outcomes are returned in input order.
+    ///
+    /// # Errors
+    ///
+    /// Only failures that stop a whole phase (for example the backend cannot be locked or
+    /// read); per-ref rejections are in [`RefUpdateCommitOutcome::result`].
+    pub fn apply_each(&self, updates: Vec<RefUpdate>) -> Result<Vec<RefUpdateCommitOutcome>> {
+        commit_ref_updates_non_atomic_on_store(self.store(), updates)
+    }
+
+    fn commit_point(
+        &self,
+        name: &RefNameRef,
+        oid: &ObjectId,
+        expected: Expected,
+        flags: RefUpdateFlags,
+    ) -> Result<()> {
+        let refname = name.as_str();
+        ensure_refname_safe_for_storage(refname)?;
+        let store = self.store();
+        let config = self.repo.config().snapshot()?;
+        let signature = match self
+            .repo
+            .identity(IdentRole::Committer, self.repo.identity_now())
+        {
+            Ok(sig) => Some(sig),
+            Err(crate::error::Error::Commit(CommitError::Identity(_))) => None,
+            Err(err) => return Err(err),
+        };
+        let reflog_for = |target: &str| -> Result<Option<ReflogUpdate>> {
+            let Some(sig) = signature.as_ref() else {
+                return Ok(None);
+            };
+            Ok(reflog_wanted(store, config.as_ref(), target)?
+                .then(|| ReflogUpdate::from_signature(sig, "")))
+        };
+
+        // A symbolic ref whose target does not exist yet (an unborn `HEAD`) has no old tip.
+        let old_tip = match self.resolve_if_exists(refname) {
+            Ok(tip) => tip,
+            Err(Error::Ref(crate::error::RefError::Store(RefStoreError::NotFound { .. }))) => None,
+            Err(err) => return Err(err),
+        };
+        let mut updates = Vec::with_capacity(2);
+
+        // Peeling `HEAD` must not attach one reflog decision to both `HEAD` and the target
+        // branch: Git evaluates existing logs independently when log-all-ref-updates is off.
+        let peeled_head_target = if !flags.no_deref && refname == "HEAD" {
+            match store.read_raw(RefNameRef::from_trusted("HEAD"))? {
+                Some(RawRef::Symbolic(target)) => Some(target),
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        if let Some(branch) = peeled_head_target {
+            let branch_for_reflog = branch.clone();
+            updates.push(RefUpdate {
+                name: RefName::from_trusted(branch),
+                new_value: Some(RawRef::Direct(*oid)),
+                expected,
+                reflog: reflog_for(branch_for_reflog.as_str())?,
+                flags: RefUpdateFlags::default(),
+            });
+            if let Some(mut head_reflog) = reflog_for("HEAD")? {
+                head_reflog.old_oid = old_tip;
+                head_reflog.new_oid = Some(*oid);
+                updates.push(RefUpdate {
+                    name: RefName::from_trusted("HEAD"),
+                    new_value: Some(RawRef::Direct(*oid)),
+                    expected: Expected::Any,
+                    reflog: Some(head_reflog),
+                    flags: RefUpdateFlags {
+                        log_only: true,
+                        no_deref: true,
+                        ..RefUpdateFlags::default()
+                    },
+                });
+            }
+        } else {
+            updates.push(RefUpdate {
+                name: RefName::from_trusted(refname.to_owned()),
+                new_value: Some(RawRef::Direct(*oid)),
+                expected,
+                reflog: reflog_for(refname)?,
+                flags,
+            });
+
+            let mirror_head = !flags.no_deref
+                && refname.starts_with("refs/heads/")
+                && matches!(
+                    store.read_raw(RefNameRef::from_trusted("HEAD"))?,
+                    Some(RawRef::Symbolic(head_branch)) if head_branch.as_str() == refname
+                );
+            if mirror_head {
+                if let Some(mut head_reflog) = reflog_for("HEAD")? {
+                    head_reflog.old_oid = old_tip;
+                    head_reflog.new_oid = Some(*oid);
+                    updates.push(RefUpdate {
+                        name: RefName::from_trusted("HEAD"),
+                        new_value: Some(RawRef::Direct(*oid)),
+                        expected: Expected::Any,
+                        reflog: Some(head_reflog),
+                        flags: RefUpdateFlags {
+                            log_only: true,
+                            no_deref: true,
+                            ..RefUpdateFlags::default()
+                        },
+                    });
+                }
+            }
+        }
+
+        commit_ref_updates_on_store_with_wait(store, &updates, || {
+            LockWait::files_ref_lock(Some(config.as_ref()))
+        })
     }
 
     /// Read reflog entries for `name` (oldest first).
@@ -202,11 +665,11 @@ impl<'repo> References<'repo> {
     ///
     /// Propagates reflog parse and backend errors.
     #[inline]
-    pub fn reflog(&self, name: &RefName) -> Result<Vec<ReflogEntry>> {
+    pub fn reflog(&self, name: impl AsRef<RefNameRef>) -> Result<Vec<ReflogEntry>> {
         let mut entries = Vec::new();
         self.repo
-            .refs()
-            .for_each_reflog_entry(name.as_str(), false, &mut |entry| {
+            .ref_store()
+            .for_each_reflog_entry(name.as_ref(), false, &mut |entry| {
                 entries.push(entry.clone());
                 ControlFlow::Continue(())
             })?;

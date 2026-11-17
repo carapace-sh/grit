@@ -1,5 +1,7 @@
 //! Parallel read, filter, hash, and compress of worktree file blobs (`add` and tracked-file restage).
 
+use crate::error::ObjectError;
+use crate::worktree::WorktreeError;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
@@ -9,12 +11,13 @@ use crate::diff::{mode_from_metadata, worktree_blob_content, WorktreeBlobContent
 use crate::error::{Error, Result};
 use crate::filter_process::FilterProcessState;
 use crate::hash::{
-    hash_object, try_par_hash_with, try_par_hash_with_force, ParallelHashError, Parallelism,
+    hash_object, try_par_hash_forced, try_par_hash_with, ParallelHashError, Parallelism,
 };
 use crate::index::IndexEntry;
 use crate::objects::{HashAlgo, ObjectId, ObjectKind};
 use crate::odb::{self, Odb, WriteOptions};
 use crate::progress::poll_watch;
+use crate::repo::RepositoryError;
 use crate::worktree::{io_with_path, map_worktree_io, WorktreePathOperation};
 
 /// One worktree path to read and normalize in parallel.
@@ -50,8 +53,8 @@ impl PreparedBlobPayload {
     /// # Errors
     ///
     /// Propagates write failures from the loose store or the custom primary.
-    /// [`Error::WorktreeFileChanged`] when a streamed file no longer hashes to `oid`.
-    pub(crate) fn store(
+    /// [`crate::worktree::WorktreeError::FileChanged`] when a streamed file no longer hashes to `oid`.
+    pub fn store(
         &self,
         odb: &Odb,
         index_relpath: &str,
@@ -63,7 +66,7 @@ impl PreparedBlobPayload {
                 odb.write_loose_zlib_prehashed(oid, zlib_store, options)?;
             }
             Self::Raw(data) => {
-                let written = odb.write_with_options(ObjectKind::Blob, data, options)?;
+                let written = odb.write_with(ObjectKind::Blob, data, options)?;
                 debug_assert_eq!(written, *oid);
             }
             Self::Stream(path) => {
@@ -73,9 +76,9 @@ impl PreparedBlobPayload {
                 let size = file.metadata()?.len();
                 let written = odb.write_stream(ObjectKind::Blob, size, &mut file, options)?;
                 if written != *oid {
-                    return Err(Error::WorktreeFileChanged {
+                    return Err(Error::Worktree(WorktreeError::FileChanged {
                         path: index_relpath.to_owned(),
-                    });
+                    }));
                 }
             }
         }
@@ -224,11 +227,12 @@ impl PrepareBlobContext {
 /// Name the index path in I/O errors from storing a blob.
 fn with_path_context(index_relpath: &str, err: Error) -> Error {
     match err {
-        Error::Io(source) => Error::LooseObjectWrite {
+        Error::Io(source) => Error::Object(ObjectError::LooseObjectWrite {
             path: index_relpath.to_owned(),
             source,
-        },
-        Error::WorktreePathIo { .. } | Error::GitDirPathIo { .. } => err,
+        }),
+        Error::Worktree(crate::worktree::WorktreeError::PathIo(_))
+        | Error::Repository(RepositoryError::GitDirPathIo(_)) => err,
         other => other,
     }
 }
@@ -295,7 +299,7 @@ pub(crate) fn prepare_and_store_worktree_blobs_parallel(
         ctx.prepare_and_store(odb, item, conv, filter_process, write_opts)
     };
     if items.len() >= crate::hash::PAR_HASH_MIN_ITEMS {
-        try_par_hash_with_force(items, threads, map_item)
+        try_par_hash_forced(items, threads, map_item)
     } else {
         let total_bytes = items.len().saturating_mul(4096);
         try_par_hash_with(items, threads, total_bytes, map_item)

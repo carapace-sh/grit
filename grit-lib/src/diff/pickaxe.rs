@@ -13,7 +13,8 @@ use crate::diff::core::diff_trees_for_pathspecs;
 use crate::diff::posix_ere::PosixEre;
 use crate::diff::structured::SideBytes;
 use crate::diff::{
-    detect_renames_with_policy, renames_from_config, DiffEntry, DiffStatus, RenameDetection,
+    detect_renames_with_policy, renames_from_config, DetectRenamesOptions, DiffEntry, DiffStatus,
+    RenameDetection,
 };
 use crate::error::{Error, Result};
 use crate::objects::{parse_commit, FileMode, ObjectId};
@@ -30,7 +31,7 @@ pub(crate) struct PickaxeRenames<'a> {
 }
 
 impl<'a> PickaxeRenames<'a> {
-    pub(crate) fn new(detection: RenameDetection, config: &'a ConfigSet) -> Self {
+    pub fn new(detection: RenameDetection, config: &'a ConfigSet) -> Self {
         Self {
             threshold: detection.threshold_percent(),
             config,
@@ -38,11 +39,11 @@ impl<'a> PickaxeRenames<'a> {
     }
 
     /// Git's `log` default: `diff.renames` from `config`, at the default similarity.
-    pub(crate) fn from_config(config: &'a ConfigSet) -> Self {
+    pub fn from_config(config: &'a ConfigSet) -> Self {
         Self::new(renames_from_config(config), config)
     }
 
-    pub(crate) fn config(&self) -> &'a ConfigSet {
+    pub fn config(&self) -> &'a ConfigSet {
         self.config
     }
 }
@@ -161,8 +162,6 @@ impl Pickaxe {
     /// - `paths` — repository-relative pathspecs limiting the diff; empty means the whole tree.
     /// - `renames` — rename pairing; callers following Git use
     ///   [`renames_from_config`] (`diff.renames`).
-    /// - `config` — supplies `diff.renameLimit` and rename-scoring thread settings.
-    ///
     /// # Errors
     ///
     /// Propagates object read and diff errors.
@@ -172,14 +171,16 @@ impl Pickaxe {
         commit_oid: ObjectId,
         paths: &[String],
         renames: RenameDetection,
-        config: &ConfigSet,
     ) -> Result<bool> {
+        let config = repo.config().snapshot()?;
         let data = repo.odb().read(&commit_oid)?.data;
         let commit = parse_commit(&data)?;
-        if commit.parents.len() > 1 {
+        let parent_ctx = crate::shallow::EffectiveCommitParents::load(repo);
+        let effective_parents = parent_ctx.for_commit(commit_oid, &commit.parents);
+        if effective_parents.len() > 1 {
             return Ok(false);
         }
-        let parent_tree = if let Some(&parent_oid) = commit.parents.first() {
+        let parent_tree = if let Some(&parent_oid) = effective_parents.first() {
             let parent_data = repo.odb().read(&parent_oid)?.data;
             let parent = parse_commit(&parent_data)?;
             if parent.tree == commit.tree {
@@ -189,7 +190,7 @@ impl Pickaxe {
         } else {
             None
         };
-        let renames = PickaxeRenames::new(renames, config);
+        let renames = PickaxeRenames::new(renames, config.as_ref());
         self.matches_trees(
             repo,
             parent_tree.as_ref(),
@@ -215,7 +216,18 @@ impl Pickaxe {
     ) -> Result<bool> {
         let diff_options = crate::diff::DiffOptions::from_config(renames.config());
         let odb = repo.odb();
-        let entries = diff_trees_for_pathspecs(odb, parent_tree, Some(commit_tree), paths)?;
+        let pathspec_matcher = if paths.is_empty() {
+            None
+        } else {
+            Some(repo.pathspec_matcher(paths)?)
+        };
+        let entries = diff_trees_for_pathspecs(
+            odb,
+            parent_tree,
+            Some(commit_tree),
+            paths,
+            pathspec_matcher.as_ref(),
+        )?;
         // Rename pairing only ever combines an added path with a deleted one, so every other
         // entry can be tested (and can end the search) before paying for it.
         let mut unpaired = Vec::new();
@@ -246,15 +258,19 @@ impl Pickaxe {
             return Ok(false);
         }
         let pairs = match renames.threshold {
-            Some(threshold) => detect_renames_with_policy(
-                odb,
-                None,
-                unpaired,
-                threshold,
-                renames.config,
-                &ThreadPolicy::default(),
-                None,
-            )?,
+            Some(threshold) => {
+                detect_renames_with_policy(
+                    odb,
+                    None,
+                    unpaired,
+                    threshold,
+                    renames.config,
+                    &ThreadPolicy::default(),
+                    None,
+                    DetectRenamesOptions::default(),
+                )?
+                .entries
+            }
             None => unpaired,
         };
         for entry in &pairs {
@@ -384,6 +400,7 @@ impl Pickaxe {
 
 /// Invalid pickaxe pattern.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum PickaxeError {
     /// Pattern compilation failed.
     #[error("invalid pickaxe pattern `{pattern}`: {detail}")]
@@ -397,11 +414,7 @@ pub enum PickaxeError {
 
 impl From<PickaxeError> for Error {
     fn from(value: PickaxeError) -> Self {
-        match value {
-            PickaxeError::InvalidPattern { pattern, detail } => {
-                Error::Message(format!("invalid pickaxe pattern `{pattern}`: {detail}"))
-            }
-        }
+        Error::Diff(crate::error::DiffError::Pickaxe(value))
     }
 }
 
@@ -472,8 +485,8 @@ fn line_grep_match(
 
     let before = LineSide::from_text(old_text);
     let after = LineSide::from_text(new_text);
-    let old_lines: Vec<&str> = before.lines.iter().map(|l| l.body).collect();
-    let new_lines: Vec<&str> = after.lines.iter().map(|l| l.body).collect();
+    let old_lines: Vec<&str> = before.lines().map(|l| l.body).collect();
+    let new_lines: Vec<&str> = after.lines().map(|l| l.body).collect();
     for op in compacted_line_ops_for_options(old_text, new_text, diff_options) {
         match op {
             DiffOp::Equal { .. } => {}

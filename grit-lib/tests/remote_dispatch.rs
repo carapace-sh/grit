@@ -13,7 +13,6 @@ use std::time::{Duration, Instant};
 use grit_lib::config::environment::{Environment, RepositoryOptions};
 use grit_lib::config::ConfigSet;
 use grit_lib::objects::ObjectId;
-use grit_lib::refs::resolve_ref;
 use grit_lib::remote::transfer::{FetchOptions, PushOptions, PushRefSpec, TagMode};
 use grit_lib::remote::{ListRefsOptions, Remote, RemoteRef, RemoteUrl};
 use grit_lib::repo::Repository;
@@ -71,6 +70,7 @@ fn git(dir: Option<&Path>, args: &[&str]) -> String {
 fn git_ls_remote(
     url: &str,
     git_args: &[&str],
+    patterns: &[&str],
     extra: &[(&str, &str)],
     protocol_version: Option<u8>,
 ) -> BTreeMap<String, ObjectId> {
@@ -81,6 +81,7 @@ fn git_ls_remote(
     cmd.arg("ls-remote")
         .args(git_args)
         .arg(url)
+        .args(patterns)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null");
     for (k, v) in extra {
@@ -126,7 +127,7 @@ fn assert_refs_match_git(
     extra: &[(&str, &str)],
 ) {
     let git_args = git_args_for_list_opts(opts);
-    let mut git_map = git_ls_remote(url, &git_args, extra, opts.protocol_version);
+    let mut git_map = git_ls_remote(url, &git_args, &[], extra, opts.protocol_version);
     assert!(
         !git_map.is_empty(),
         "git ls-remote must return refs for {url}"
@@ -273,6 +274,21 @@ fn bare_fixture() -> (tempfile::TempDir, PathBuf) {
     (tmp, bare)
 }
 
+fn bare_fixture_with_custom_refs() -> (tempfile::TempDir, PathBuf) {
+    let (tmp, bare) = bare_fixture();
+    let work = tmp.path().join("work");
+    git(
+        Some(&work),
+        &[
+            "push",
+            bare.to_str().unwrap(),
+            "HEAD:refs/pull/1/head",
+            "HEAD:refs/custom/x",
+        ],
+    );
+    (tmp, bare)
+}
+
 #[test]
 fn remote_url_parsing_and_config() {
     assert!(matches!(
@@ -334,6 +350,55 @@ fn list_refs_file_url_matches_git_ls_remote() {
 }
 
 #[test]
+fn list_refs_custom_namespaces_match_git_ls_remote() {
+    let (_tmp, bare) = bare_fixture_with_custom_refs();
+    let path_url = bare.to_str().unwrap();
+    let file_url = format!("file://{}", bare.display());
+    for url in [path_url, file_url.as_str()] {
+        let remote = Remote::from_url(url).unwrap();
+        let opts = ListRefsOptions::default();
+        let refs = remote.list_refs(None, &opts, None).unwrap();
+        assert_refs_match_git(url, &refs, &opts, &[]);
+        for name in [
+            "refs/heads/main",
+            "refs/tags/v1",
+            "refs/pull/1/head",
+            "refs/custom/x",
+        ] {
+            assert!(
+                refs.iter().any(|r| r.name == name),
+                "missing {name} in list_refs for {url}"
+            );
+        }
+    }
+
+    let url = file_url.as_str();
+    for pattern in ["refs/pull/1/head", "refs/custom/x", "refs/pull/*", "HEAD"] {
+        let remote = Remote::from_url(url).unwrap();
+        let opts = ListRefsOptions {
+            prefixes: vec![pattern.to_owned()],
+            ..Default::default()
+        };
+        let refs = remote.list_refs(None, &opts, None).unwrap();
+        let git_map = git_ls_remote(url, &[], &[pattern], &[], None);
+        assert_eq!(grit_refs_map(&refs), git_map, "pattern {pattern}");
+    }
+
+    let remote = Remote::from_url(url).unwrap();
+    let opts = ListRefsOptions {
+        heads: true,
+        ..Default::default()
+    };
+    let refs = remote.list_refs(None, &opts, None).unwrap();
+    let git_map = git_ls_remote(url, &["--heads"], &[], &[], None);
+    assert_eq!(grit_refs_map(&refs), git_map);
+    assert!(
+        !refs.iter().any(|r| r.name.starts_with("refs/pull/")),
+        "heads-only must exclude pull refs"
+    );
+}
+
+#[test]
 fn list_refs_heads_only_matches_git() {
     let (_tmp, bare) = bare_fixture();
     let url = format!("file://{}", bare.display());
@@ -345,7 +410,7 @@ fn list_refs_heads_only_matches_git() {
     let refs = remote.list_refs(None, &opts, None).unwrap();
     assert!(!refs.iter().any(|r| r.name == "HEAD"));
 
-    let git_heads = git_ls_remote(&url, &["--heads"], &[], None);
+    let git_heads = git_ls_remote(&url, &["--heads"], &[], &[], None);
     let grit_map = grit_refs_map(&refs);
     assert_eq!(git_heads, grit_map);
 }
@@ -362,11 +427,9 @@ fn remote_push_local_file_url_matches_git() {
     )
     .unwrap();
 
-    let fetch_opts = FetchOptions {
-        refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()],
-        tags: TagMode::Following,
-        ..Default::default()
-    };
+    let mut fetch_opts = FetchOptions::new();
+    fetch_opts.refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()];
+    fetch_opts.tags = TagMode::Following;
     let url = format!("file://{}", bare.display());
     let remote = Remote::from_url(&url).unwrap();
     remote
@@ -374,7 +437,7 @@ fn remote_push_local_file_url_matches_git() {
             &repo,
             fetch_opts,
             &mut grit_lib::remote::fetch::NoProgress,
-            &grit_lib::progress::NeverCancel,
+            &grit_lib::progress::CancelToken::never(),
             None,
         )
         .unwrap();
@@ -382,7 +445,7 @@ fn remote_push_local_file_url_matches_git() {
     std::fs::write(local.join("push.txt"), "push\n").unwrap();
     git(Some(&local), &["add", "push.txt"]);
     git(Some(&local), &["commit", "-q", "-m", "push commit"]);
-    let tip = resolve_ref(repo.git_dir(), "refs/heads/main").unwrap();
+    let tip = repo.references().resolve("refs/heads/main").unwrap();
 
     let push_spec = PushRefSpec {
         src: Some(tip),
@@ -400,7 +463,7 @@ fn remote_push_local_file_url_matches_git() {
             &[push_spec],
             PushOptions::default(),
             &mut grit_lib::remote::fetch::NoProgress,
-            &grit_lib::progress::NeverCancel,
+            &grit_lib::progress::CancelToken::never(),
             None,
         )
         .unwrap();
@@ -518,23 +581,25 @@ fn remote_fetch_git_daemon_matches_git() {
     )
     .unwrap();
     let remote = Remote::from_url(url).unwrap();
+    let mut fetch_opts = FetchOptions::new();
+    fetch_opts.refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()];
+    fetch_opts.tags = TagMode::Following;
     remote
         .fetch(
             &repo,
-            FetchOptions {
-                refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()],
-                tags: TagMode::Following,
-                ..Default::default()
-            },
+            fetch_opts,
             &mut grit_lib::remote::fetch::NoProgress,
-            &grit_lib::progress::NeverCancel,
+            &grit_lib::progress::CancelToken::never(),
             None,
         )
         .unwrap();
     let main_git =
         ObjectId::from_hex(git(Some(&fixture.bare), &["rev-parse", "refs/heads/main"]).trim())
             .unwrap();
-    let main_grit = resolve_ref(repo.git_dir(), "refs/remotes/origin/main").unwrap();
+    let main_grit = repo
+        .references()
+        .resolve("refs/remotes/origin/main")
+        .unwrap();
     assert_eq!(main_git, main_grit);
 }
 

@@ -4,6 +4,7 @@
 //! [`StageMode::All`] is selected). It does **not** compute the index-vs-HEAD diff
 //! that full [`super::status::status`] requires.
 
+use crate::worktree::WorktreeError;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
@@ -11,10 +12,11 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::diff::{
-    empty_blob_oid, is_unregistered_embedded_git_repo, materialize_worktree_blob,
-    mode_from_metadata, read_submodule_head_oid, DiffEntry, DiffIndexToWorktreeOptions, DiffStatus,
+    classify_embedded_git_repo_for_stage, empty_blob_oid, is_unregistered_embedded_git_repo,
+    materialize_worktree_blob, mode_from_metadata, read_submodule_head_oid, DiffEntry,
+    DiffIndexToWorktreeOptions, DiffStatus, EmbeddedGitRepoStage,
 };
-use crate::error::{Error, Result};
+use crate::error::{Error, PathOutsideRepoError, Result, SubmoduleError};
 use crate::hash::Parallelism;
 use crate::ignore::IgnoreMatcher;
 use crate::index::{
@@ -31,8 +33,8 @@ use crate::path_icase::{
 use crate::path_validate::{validate_path, EntryMode, PathValidationKind, ProtectOptions};
 use crate::pathspec::{
     context_from_mode_bits, exact_literal_pathspec_set, has_glob_chars,
-    matches_pathspec_list_with_context, pathspec_is_exclude, sorted_paths_match_pathspec,
-    PathspecListMatcher, PathspecMatchContext,
+    matches_pathspec_list_with_context, pathspec_has_attr_magic, pathspec_is_exclude,
+    sorted_paths_match_pathspec, PathspecListMatcher, PathspecMatchContext, PathspecMatcher,
 };
 use crate::porcelain::bulk_index::IndexStagingThresholds;
 use crate::porcelain::index_mode::{
@@ -47,8 +49,9 @@ use crate::porcelain::status::{
     collect_untracked_and_ignored_inner, expand_untracked_for_staging_with_rules, IgnoredMode,
     UntrackedCacheMissAction, UntrackedScan,
 };
-use crate::progress::{Cancel, ProgressPhase, ProgressScope, ProgressSink};
+use crate::progress::{CancelToken, ProgressPhase, ProgressScope, ProgressSink};
 use crate::repo::Repository;
+use crate::repo::RepositoryError;
 use crate::repo_relpath::{as_utf8_for_matching, storage_bytes};
 use crate::unicode_normalization::resolve_worktree_path_for_staging;
 use crate::worktree_batch::{prepare_and_store_worktree_blobs_parallel, WorktreeBlobReadInput};
@@ -79,19 +82,23 @@ pub struct StageOptions {
     pub mode: StageMode,
     /// Force executable or non-executable mode for explicitly listed regular files (see [`StageExecutableHint`]).
     pub executable_hint: StageExecutableHint,
-    /// Override bulk/parallel staging thresholds (integration tests only).
-    #[doc(hidden)]
+    /// Override bulk/parallel staging thresholds (integration tests only; use test_support knobs with the test-support feature).
+    #[cfg(any(test, feature = "test-support"))]
     pub staging_thresholds: Option<IndexStagingThresholds>,
+    #[cfg(not(any(test, feature = "test-support")))]
+    pub(crate) staging_thresholds: Option<IndexStagingThresholds>,
     /// When true, hash worktree blobs without writing loose objects (commit `--dry-run`); also
     /// classifies paths without persisting the index or UNTR when used from `grit add --dry-run`.
     pub dry_run: bool,
     /// Record intent-to-add entries (empty blob, extended flag) instead of hashing file content.
     pub intent_to_add: bool,
-    /// Stage explicitly named ignored paths instead of returning [`Error::PathspecIgnored`].
+    /// Stage explicitly named ignored paths instead of returning [`crate::worktree::WorktreeError::PathspecIgnored`].
     pub force_ignored: bool,
-    /// Skip [`Error::PathspecIgnored`] validation (caller already checked ignore rules).
-    #[doc(hidden)]
+    /// Skip [`crate::worktree::WorktreeError::PathspecIgnored`] validation (integration tests only; use test_support knobs with the test-support feature).
+    #[cfg(any(test, feature = "test-support"))]
     pub skip_pathspec_ignore_check: bool,
+    #[cfg(not(any(test, feature = "test-support")))]
+    pub(crate) skip_pathspec_ignore_check: bool,
 }
 
 /// Paths returned by [`stage`] (repository-relative, `/` separators).
@@ -105,6 +112,9 @@ pub struct StageOutcome {
     pub removed: Vec<String>,
     /// Paths recorded with the intent-to-add bit (`git add -N`).
     pub intent_to_add: Vec<String>,
+    /// Nested repositories newly recorded as gitlinks (mode 160000) because they were not yet
+    /// indexed at stage 0.
+    pub embedded_gitlinks: Vec<String>,
     /// Index stat cache refreshed without staging new content (not counted in [`Self::total`]).
     pub(crate) stat_refreshed: bool,
 }
@@ -138,6 +148,7 @@ fn sort_outcome_paths_in_index_order(outcome: &mut StageOutcome, index: &Index) 
     sort_paths(&mut outcome.modified);
     sort_paths(&mut outcome.removed);
     sort_paths(&mut outcome.intent_to_add);
+    sort_paths(&mut outcome.embedded_gitlinks);
 }
 
 fn sort_outcome_paths_lexicographic(outcome: &mut StageOutcome) {
@@ -146,31 +157,54 @@ fn sort_outcome_paths_lexicographic(outcome: &mut StageOutcome) {
         &mut outcome.modified,
         &mut outcome.removed,
         &mut outcome.intent_to_add,
+        &mut outcome.embedded_gitlinks,
     ] {
         paths.sort();
         paths.dedup();
     }
 }
 
-/// Stage every tracked and untracked change for [`crate::porcelain::commit`].
+/// Stage worktree changes for [`crate::porcelain::commit`] auto-staging.
 ///
 /// Uses the stat-trust tracked scan from `stage_tracked_modifications_in_index_with_rules` instead of
 /// the diff-for-staging pipeline, then stages untracked paths the same way as [`stage`] with
-/// [`StageMode::All`].
+/// [`StageMode::All`], unless `status.showUntrackedFiles` is `no` (or a Git boolean false synonym),
+/// in which case only tracked modifications and deletions are staged — the same set as `git commit -a`
+/// and the set [`crate::porcelain::status`] lists.
 ///
 /// # Errors
 ///
-/// Same as [`stage`].
-pub fn stage_for_commit(
+/// Same as [`stage`], plus [`crate::error::ConfigError::InvalidUntrackedFilesMode`] when
+/// `status.showUntrackedFiles` is invalid.
+pub(crate) fn stage_for_commit(
     repo: &Repository,
     progress: &mut dyn ProgressSink,
-    cancel: &dyn Cancel,
+    cancel: &CancelToken,
 ) -> Result<StageOutcome> {
+    let config = repo.config().snapshot()?;
     let opts = StageOptions {
-        mode: StageMode::All,
+        mode: stage_mode_for_commit(config.as_ref())?,
         ..StageOptions::default()
     };
     stage_with_tracked_scan(repo, &opts, progress, cancel)
+}
+
+/// Staging mode for commit auto-staging from `status.showUntrackedFiles`.
+///
+/// # Errors
+///
+/// Returns [`crate::error::ConfigError::InvalidUntrackedFilesMode`] for invalid config values.
+pub(crate) fn stage_mode_for_commit(
+    config: &crate::config::ConfigSet,
+) -> std::result::Result<StageMode, crate::error::ConfigError> {
+    use crate::porcelain::status::{untracked_mode_from_config, UntrackedMode};
+    Ok(
+        if matches!(untracked_mode_from_config(config)?, UntrackedMode::No) {
+            StageMode::Update
+        } else {
+            StageMode::All
+        },
+    )
 }
 
 /// Like [`stage_for_commit`], but updates a caller-owned index and does not write it to disk.
@@ -182,11 +216,12 @@ pub(crate) fn stage_for_commit_on_index(
     repo: &Repository,
     index: &mut Index,
     progress: &mut dyn ProgressSink,
-    cancel: &dyn Cancel,
+    cancel: &CancelToken,
     dry_run: bool,
 ) -> Result<StageOutcome> {
+    let config = repo.config().snapshot()?;
     let opts = StageOptions {
-        mode: StageMode::All,
+        mode: stage_mode_for_commit(config.as_ref())?,
         dry_run,
         ..StageOptions::default()
     };
@@ -198,24 +233,24 @@ pub(crate) fn stage_for_commit_on_index(
 /// Stage paths into a caller-owned index without writing it to disk.
 ///
 /// Same matching and validation rules as [`stage`].
-pub fn stage_on_index(
+pub(crate) fn stage_on_index(
     repo: &Repository,
     index: &mut Index,
     opts: &StageOptions,
     progress: &mut dyn ProgressSink,
-    cancel: &dyn Cancel,
+    cancel: &CancelToken,
 ) -> Result<StageOutcome> {
     stage_on_index_with_pathspec_ignore_exempt(repo, index, opts, progress, cancel, None)
 }
 
 /// Like [`stage_on_index`], but paths already staged at stage 0 in `ignore_exempt_index` skip
-/// [`Error::PathspecIgnored`] (used by path-scoped commits that stage on a parent-tree index).
+/// [`crate::worktree::WorktreeError::PathspecIgnored`] (used by path-scoped commits that stage on a parent-tree index).
 pub(crate) fn stage_on_index_with_pathspec_ignore_exempt(
     repo: &Repository,
     index: &mut Index,
     opts: &StageOptions,
     progress: &mut dyn ProgressSink,
-    cancel: &dyn Cancel,
+    cancel: &CancelToken,
     ignore_exempt_index: Option<&Index>,
 ) -> Result<StageOutcome> {
     let mut scope = ProgressScope::new(progress, cancel);
@@ -239,7 +274,7 @@ pub(crate) fn validate_commit_staging_pathspecs(
     index: &Index,
     opts: &StageOptions,
 ) -> Result<()> {
-    let work_tree = repo.work_tree().ok_or(Error::RequiresWorkTree)?;
+    let work_tree = repo.work_tree().ok_or(RepositoryError::RequiresWorkTree)?;
     let rules = WorktreeRules::from_repository(repo, index)?;
     validate_pathspecs(repo, index, work_tree, &[], &[], opts, &rules, Some(index))
 }
@@ -254,7 +289,7 @@ pub(crate) fn validate_commit_staging_pathspecs(
 /// time. A dry run reads the index without locking.
 ///
 /// Reports [`ProgressPhase::StagingFiles`] to `progress` (no total: the changed set is found
-/// while scanning) and stops when `cancel` or [`ProgressSink::should_cancel`] fires.
+/// while scanning) and stops when `cancel` fires.
 ///
 /// # Errors
 ///
@@ -262,14 +297,15 @@ pub(crate) fn validate_commit_staging_pathspecs(
 /// `index.lock` is released (blobs already hashed may remain as unreachable loose objects).
 /// Returns [`Error::LockHeld`] when another process
 /// still holds `index.lock` after the `core.filesRefLockTimeout` wait (nothing is staged;
-/// the caller may retry), [`Error::Message`] when an explicit pathspec matches nothing,
-/// [`Error::PathspecIgnored`] when a path exists but is excluded by ignore rules,
+/// the caller may retry), [`crate::worktree::WorktreeError::PathspecNoMatch`] when an explicit
+/// pathspec matches nothing,
+/// [`crate::worktree::WorktreeError::PathspecIgnored`] when a path exists but is excluded by ignore rules,
 /// or I/O / object-store failures while reading the work tree.
-pub fn stage(
+pub(crate) fn stage(
     repo: &Repository,
     opts: &StageOptions,
     progress: &mut dyn ProgressSink,
-    cancel: &dyn Cancel,
+    cancel: &CancelToken,
 ) -> Result<StageOutcome> {
     if uses_tracked_scan_fast_path(opts) {
         return stage_with_tracked_scan(repo, opts, progress, cancel);
@@ -316,6 +352,7 @@ fn staging_pathspec_context_for_mode(
         is_directory: from_mode.is_directory,
         is_git_submodule: from_mode.is_git_submodule,
         precompose_paths: base.precompose_paths,
+        globals: base.globals,
     }
 }
 
@@ -376,18 +413,57 @@ fn staging_path_matches(
     }
 }
 
-fn restricted_index_paths_for_pathspecs(
+/// Whether a blob path (tree or index entry) is selected by `pathspecs`, including `:(attr:...)`
+/// magic and `:(exclude)` semantics.
+pub(crate) fn blob_path_matches_restrict_pathspecs(
+    path: &str,
+    mode: u32,
+    pathspecs: &[String],
+    base_ctx: PathspecMatchContext,
+    attr_matcher: Option<&PathspecMatcher<'_>>,
+) -> Result<bool> {
+    if pathspecs.is_empty() {
+        return Ok(true);
+    }
+    if let Some(matcher) =
+        attr_matcher.filter(|_| pathspecs.iter().any(|s| pathspec_has_attr_magic(s)))
+    {
+        return Ok(matcher.matches_entry(path, mode));
+    }
+    if staging_pathspecs_need_entry_mode_context(pathspecs) {
+        return Ok(index_path_matches_staging_pathspecs(
+            path, mode, pathspecs, base_ctx,
+        ));
+    }
+    Ok(PathspecListMatcher::new(pathspecs, base_ctx).matches(path))
+}
+
+pub(crate) fn restricted_index_paths_for_pathspecs(
+    repo: &Repository,
     index: &Index,
     pathspecs: &[String],
     base_ctx: PathspecMatchContext,
-) -> BTreeSet<String> {
+) -> Result<BTreeSet<String>> {
+    if pathspecs.iter().any(|s| pathspec_has_attr_magic(s)) {
+        let matcher = repo.pathspec_matcher(pathspecs)?;
+        let mut paths = BTreeSet::new();
+        for entry in &index.entries {
+            let Ok(path) = std::str::from_utf8(&entry.path) else {
+                continue;
+            };
+            if matcher.matches_entry(path, entry.mode) {
+                paths.insert(path.to_owned());
+            }
+        }
+        return Ok(paths);
+    }
     if let Some(exact) = exact_literal_pathspec_set(pathspecs, base_ctx) {
         if exact.iter().all(|p| {
             index
                 .get(p.as_bytes(), 0)
                 .is_some_and(|e| e.mode != MODE_TREE)
         }) {
-            return exact;
+            return Ok(exact);
         }
     }
     if staging_pathspecs_need_entry_mode_context(pathspecs) {
@@ -400,7 +476,7 @@ fn restricted_index_paths_for_pathspecs(
                 paths.insert(path.to_owned());
             }
         }
-        return paths;
+        return Ok(paths);
     }
     let matcher = PathspecListMatcher::new(pathspecs, base_ctx);
     let mut paths: BTreeSet<String> = index
@@ -421,7 +497,7 @@ fn restricted_index_paths_for_pathspecs(
             }
         }
     }
-    paths
+    Ok(paths)
 }
 
 enum StagingPathspecFilter<'a> {
@@ -429,6 +505,10 @@ enum StagingPathspecFilter<'a> {
     ModeAware {
         pathspecs: &'a [String],
         base_ctx: PathspecMatchContext,
+        index_path_modes: HashMap<Vec<u8>, u32>,
+    },
+    Attr {
+        matcher: PathspecMatcher<'a>,
         index_path_modes: HashMap<Vec<u8>, u32>,
     },
 }
@@ -442,31 +522,49 @@ impl StagingPathspecFilter<'_> {
                 base_ctx,
                 index_path_modes,
             } => staging_path_matches(path, index_path_modes, pathspecs, *base_ctx),
+            Self::Attr {
+                matcher,
+                index_path_modes,
+            } => {
+                if let Some(&mode) = index_path_modes.get(path.as_bytes()) {
+                    matcher.matches_entry(path, mode)
+                } else {
+                    matcher.matches(path)
+                }
+            }
         }
     }
 }
 
 fn staging_pathspec_filter<'a>(
+    repo: &Repository,
     index: &Index,
     pathspecs: &'a [String],
     base_ctx: PathspecMatchContext,
-) -> StagingPathspecFilter<'a> {
+) -> Result<StagingPathspecFilter<'a>> {
+    if pathspecs.iter().any(|s| pathspec_has_attr_magic(s)) {
+        return Ok(StagingPathspecFilter::Attr {
+            matcher: repo.pathspec_matcher(pathspecs)?,
+            index_path_modes: staging_index_path_modes(index),
+        });
+    }
     if staging_pathspecs_need_entry_mode_context(pathspecs) {
-        StagingPathspecFilter::ModeAware {
+        return Ok(StagingPathspecFilter::ModeAware {
             pathspecs,
             base_ctx,
             index_path_modes: staging_index_path_modes(index),
-        }
-    } else {
-        StagingPathspecFilter::List(PathspecListMatcher::new(pathspecs, base_ctx))
+        });
     }
+    Ok(StagingPathspecFilter::List(PathspecListMatcher::new(
+        pathspecs, base_ctx,
+    )))
 }
 
 fn stage_via_worktree_diff(
     repo: &Repository,
     opts: &StageOptions,
     progress: &mut dyn ProgressSink,
-    cancel: &dyn Cancel,
+    cancel: &CancelToken,
 ) -> Result<StageOutcome> {
     stage_inner(repo, opts, progress, cancel, false)
 }
@@ -475,7 +573,7 @@ fn stage_with_tracked_scan(
     repo: &Repository,
     opts: &StageOptions,
     progress: &mut dyn ProgressSink,
-    cancel: &dyn Cancel,
+    cancel: &CancelToken,
 ) -> Result<StageOutcome> {
     stage_inner(repo, opts, progress, cancel, true)
 }
@@ -493,7 +591,7 @@ fn stage_inner(
     repo: &Repository,
     opts: &StageOptions,
     progress: &mut dyn ProgressSink,
-    cancel: &dyn Cancel,
+    cancel: &CancelToken,
     tracked_scan: bool,
 ) -> Result<StageOutcome> {
     let mut scope = ProgressScope::new(progress, cancel);
@@ -506,7 +604,7 @@ fn stage_inner(
                 &opts.pathspecs,
             )?;
         }
-        if let Ok(cfg) = repo.config() {
+        if let Ok(cfg) = repo.config().snapshot() {
             repo.clear_present_skip_worktree(&mut index, cfg.as_ref());
         }
         return stage_inner_on_index(
@@ -528,7 +626,7 @@ fn stage_inner(
             &opts.pathspecs,
         )?;
     }
-    if let Ok(cfg) = repo.config() {
+    if let Ok(cfg) = repo.config().snapshot() {
         repo.clear_present_skip_worktree(&mut index, cfg.as_ref());
     }
     stage_inner_on_index(
@@ -566,7 +664,7 @@ fn stage_inner_on_index(
     repo.odb().hot_path_metrics().record_staging_pass();
     let dry_run = opts.dry_run;
     let dry_run_list_only = dry_run && on_disk;
-    let work_tree = repo.work_tree().ok_or(Error::RequiresWorkTree)?;
+    let work_tree = repo.work_tree().ok_or(RepositoryError::RequiresWorkTree)?;
     scope.poll()?;
     scope.sink().start(ProgressPhase::StagingFiles, None);
 
@@ -586,10 +684,7 @@ fn stage_inner_on_index(
             rules_config.as_ref(),
         )
         .parallelism();
-    let ignorecase = rules_config
-        .get_bool("core.ignorecase")
-        .and_then(|r| r.ok())
-        .unwrap_or(false);
+    let ignorecase = rules_config.ignore_case();
     let icase_collisions =
         ignorecase.then(|| IcaseCheckoutCollisionMap::from_index(work_tree, index, true));
     let mut icase_map = Stage0IcasePathMap::from_index(index, ignorecase);
@@ -604,10 +699,11 @@ fn stage_inner_on_index(
         None
     } else {
         Some(Arc::new(restricted_index_paths_for_pathspecs(
+            repo,
             index,
             staging_pathspecs.as_ref(),
             pathspec_ctx,
-        )))
+        )?))
     };
     let mut tracked_scan_summary = None;
     let (unstaged, staging_stats) = if index.entries.is_empty() {
@@ -673,12 +769,14 @@ fn stage_inner_on_index(
             use_untracked_cache: !bulk_empty_index_add,
             cache_miss: UntrackedCacheMissAction::RefreshFull,
             clean_unit_dirs: None,
+            listing_cache: None,
         };
         let (untracked, _, _) = collect_untracked_and_ignored_inner(
             repo,
             index,
             work_tree,
             staging_pathspecs.as_ref(),
+            None,
             scan,
             &rules,
             None,
@@ -730,7 +828,8 @@ fn stage_inner_on_index(
         }
     }
 
-    let pathspec_filter = staging_pathspec_filter(index, staging_pathspecs.as_ref(), pathspec_ctx);
+    let pathspec_filter =
+        staging_pathspec_filter(repo, index, staging_pathspecs.as_ref(), pathspec_ctx)?;
     let matches = |path: &str| staging_pathspecs.is_empty() || pathspec_filter.matches(path);
 
     if opts.intent_to_add {
@@ -779,15 +878,16 @@ fn stage_inner_on_index(
         for (path, plan) in worktree_updates {
             scope.poll()?;
             scope.sink().inc(1);
+            let raw_path = storage_bytes(&path);
             if has_unmerged
-                && unmerged_only_paths.contains(path.as_bytes())
+                && unmerged_only_paths.contains(raw_path.as_ref())
                 && opts.mode != StageMode::Update
             {
                 continue;
             }
             if icase_collisions
                 .as_ref()
-                .is_some_and(|map| map.is_auto_stage_loser(path.as_bytes()))
+                .is_some_and(|map| map.is_auto_stage_loser(&raw_path))
             {
                 continue;
             }
@@ -796,8 +896,8 @@ fn stage_inner_on_index(
                     outcome.removed.push(path);
                     continue;
                 }
-                if index.get(path.as_bytes(), 0).is_some() {
-                    index.remove(path.as_bytes());
+                if index.get(&raw_path, 0).is_some() {
+                    index.remove(&raw_path);
                     outcome.removed.push(path);
                 }
                 continue;
@@ -807,7 +907,7 @@ fn stage_inner_on_index(
                 continue;
             }
             if !dry_run {
-                icase_map.remove_alias_of(index, path.as_bytes());
+                icase_map.remove_alias_of(index, &raw_path);
             }
             apply_tracked_stage_plan(
                 repo,
@@ -888,9 +988,9 @@ fn stage_inner_on_index(
         collapsed_rejects.extend(conflict_marker_rejects);
         collapsed_rejects.sort_unstable();
         collapsed_rejects.dedup();
-        return Err(Error::UnmergedConflictMarkers {
+        return Err(Error::Worktree(WorktreeError::UnmergedConflictMarkers {
             paths: collapsed_rejects,
-        });
+        }));
     }
 
     if dry_run {
@@ -899,9 +999,18 @@ fn stage_inner_on_index(
         sort_outcome_paths_in_index_order(&mut outcome, index);
     }
 
-    if (outcome.total() > 0 || outcome.stat_refreshed) && !dry_run {
+    if (outcome.total() > 0
+        || outcome.stat_refreshed
+        || tracked_scan_summary
+            .as_ref()
+            .is_some_and(|s| s.fsmonitor_valid_updated))
+        && !dry_run
+    {
         if let Some(summary) = &tracked_scan_summary {
             replay_deferred_untracked_invalidations(index, summary);
+            if summary.fsmonitor_valid_updated {
+                index.fsmonitor_validity_changed();
+            }
         }
         index.ensure_canonical_order();
         if let Some(lock) = lock {
@@ -912,9 +1021,9 @@ fn stage_inner_on_index(
     if !conflict_marker_rejects.is_empty() {
         conflict_marker_rejects.sort_unstable();
         conflict_marker_rejects.dedup();
-        return Err(Error::UnmergedConflictMarkers {
+        return Err(Error::Worktree(WorktreeError::UnmergedConflictMarkers {
             paths: conflict_marker_rejects,
-        });
+        }));
     }
 
     Ok(outcome)
@@ -979,23 +1088,27 @@ fn stage_unmerged_paths_matching_pathspecs(
             }
         }
         if meta.is_dir() && !meta.file_type().is_symlink() {
-            if let Some(head_oid) = read_submodule_head_oid(&abs) {
-                if dry_run {
+            match classify_embedded_git_repo_for_stage(index, rel, &abs)? {
+                EmbeddedGitRepoStage::Gitlink(head_oid) => {
+                    if dry_run {
+                        modified.push(rel.to_owned());
+                        continue;
+                    }
+                    stage_gitlink_at(rel, &meta, head_oid, index)?;
                     modified.push(rel.to_owned());
                     continue;
                 }
-                stage_gitlink_at(rel, &meta, head_oid, index)?;
-                modified.push(rel.to_owned());
-                continue;
+                EmbeddedGitRepoStage::NotEmbedded => {}
             }
             if index
                 .entries
                 .iter()
                 .any(|e| e.path == *raw_path && e.mode == MODE_GITLINK)
             {
-                return Err(Error::Message(format!(
-                    "could not resolve submodule HEAD for '{rel}'"
-                )));
+                return Err(SubmoduleError::HeadUnreadable {
+                    path: rel.to_string(),
+                }
+                .into());
             }
         }
         if dry_run {
@@ -1013,8 +1126,7 @@ fn stage_unmerged_paths_matching_pathspecs(
             rel,
             None,
             Some(rules.filter_process()),
-        )
-        .map_err(|e| Error::Message(format!("could not store {rel}: {e}")))?;
+        )?;
         let mut entry = entry_from_metadata(&meta, raw_path, oid, mode);
         entry.mode = mode;
         index.stage_file(entry);
@@ -1075,7 +1187,8 @@ fn collapsed_conflicts_with_markers(
         }
         let tree = match head_tree {
             Some(tree) => tree,
-            None => *head_tree.insert(head_tree_oid(repo)?),
+            None => *head_tree
+                .insert(crate::state::resolve_head_for_repository(repo)?.tree(repo.odb())?),
         };
         let markers_already_committed = tree
             .and_then(|tree| crate::merge_diff::read_blob_at_path(repo.odb(), &tree, rel))
@@ -1089,14 +1202,6 @@ fn collapsed_conflicts_with_markers(
     Ok(rejects)
 }
 
-fn head_tree_oid(repo: &Repository) -> Result<Option<ObjectId>> {
-    match crate::state::resolve_head_for_repository(repo)? {
-        crate::state::HeadState::Branch { oid: Some(oid), .. }
-        | crate::state::HeadState::Detached { oid } => Ok(Some(repo.odb().commit_tree(&oid)?)),
-        _ => Ok(None),
-    }
-}
-
 struct TrackedStagePlan {
     remove: bool,
     oid: ObjectId,
@@ -1107,9 +1212,7 @@ struct TrackedStagePlan {
 fn lock_rules(
     rules: &std::sync::Mutex<WorktreeRules>,
 ) -> Result<std::sync::MutexGuard<'_, WorktreeRules>> {
-    rules
-        .lock()
-        .map_err(|e| Error::Message(format!("worktree rules lock poisoned: {e}")))
+    rules.lock().or_else(|poisoned| Ok(poisoned.into_inner()))
 }
 
 /// Merge unstaged diff rows into one staging action per path (unmerged paths may appear twice).
@@ -1194,7 +1297,8 @@ fn apply_tracked_stage_plan(
     executable_hint: StageExecutableHint,
     matches: &impl Fn(&str) -> bool,
 ) -> Result<()> {
-    let abs = work_tree.join(rel_path);
+    let abs = crate::repo_relpath::worktree_abs(work_tree, rel_path);
+    let raw_path = storage_bytes(rel_path);
 
     if plan.gitlink {
         let meta = fs::symlink_metadata(&abs).map_err(|e| {
@@ -1205,7 +1309,9 @@ fn apply_tracked_stage_plan(
         })?;
         let oid = if plan.oid.is_zero() {
             read_submodule_head_oid(&abs).ok_or_else(|| {
-                Error::Message(format!("could not resolve submodule HEAD for '{rel_path}'"))
+                Error::from(SubmoduleError::HeadUnreadable {
+                    path: rel_path.to_string(),
+                })
             })?
         } else {
             plan.oid
@@ -1216,7 +1322,7 @@ fn apply_tracked_stage_plan(
     let oid = plan.oid;
     let mode = mode_with_executable_hint(plan.mode, rel_path, executable_hint, matches);
     let mut entry = if let Some(stat) = cached_stat {
-        stat.index_entry(rel_path.as_bytes(), oid, mode)
+        stat.index_entry(&raw_path, oid, mode)
     } else {
         let meta = fs::symlink_metadata(&abs).map_err(|e| {
             Error::Io(std::io::Error::new(
@@ -1224,7 +1330,7 @@ fn apply_tracked_stage_plan(
                 format!("could not read {rel_path}: {e}"),
             ))
         })?;
-        entry_from_metadata(&meta, rel_path.as_bytes(), oid, mode)
+        entry_from_metadata(&meta, &raw_path, oid, mode)
     };
     entry.mode = mode;
     if has_unmerged {
@@ -1356,11 +1462,7 @@ fn stage_untracked_paths_parallel(
     outcome: &mut StageOutcome,
     scope: &mut ProgressScope<'_>,
 ) -> Result<()> {
-    let precompose_unicode = rules
-        .config()
-        .get_bool("core.precomposeunicode")
-        .and_then(|r| r.ok())
-        .unwrap_or(false);
+    let precompose_unicode = rules.config().precompose_unicode();
 
     let untracked =
         collapse_embedded_git_repo_untracked_paths(index, work_tree, untracked, precompose_unicode);
@@ -1444,12 +1546,14 @@ fn stage_untracked_paths_parallel(
         batch_entries.reserve(blobs.len());
         for blob in blobs {
             let abs = crate::repo_relpath::worktree_abs(work_tree, &blob.index_relpath);
-            if blob.meta.is_dir()
-                && !blob.meta.file_type().is_symlink()
-                && read_submodule_head_oid(&abs).is_some()
-            {
-                deferred.push(blob.index_relpath);
-                continue;
+            if blob.meta.is_dir() && !blob.meta.file_type().is_symlink() {
+                match classify_embedded_git_repo_for_stage(index, &blob.index_relpath, &abs)? {
+                    EmbeddedGitRepoStage::Gitlink(_) => {
+                        deferred.push(blob.index_relpath);
+                        continue;
+                    }
+                    EmbeddedGitRepoStage::NotEmbedded => {}
+                }
             }
             let index_path = storage_bytes(&blob.index_relpath);
             icase_map.remove_alias_of(index, &index_path);
@@ -1486,7 +1590,14 @@ fn stage_untracked_paths_parallel(
         scope.poll()?;
         scope.sink().inc(1);
         if dry_run_list_only {
-            outcome.added.push(path);
+            outcome.added.push(path.clone());
+            let abs = crate::repo_relpath::worktree_abs(work_tree, &path);
+            if matches!(
+                classify_embedded_git_repo_for_stage(index, &path, &abs)?,
+                EmbeddedGitRepoStage::Gitlink(_)
+            ) {
+                outcome.embedded_gitlinks.push(path);
+            }
             continue;
         }
         icase_map.remove_alias_of(index, &storage_bytes(&path));
@@ -1500,7 +1611,13 @@ fn stage_untracked_paths_parallel(
             dry_run,
             matches,
         )?;
-        outcome.added.push(path);
+        outcome.added.push(path.clone());
+        if index
+            .get(storage_bytes(&path).as_ref(), 0)
+            .is_some_and(|e| e.mode == MODE_GITLINK)
+        {
+            outcome.embedded_gitlinks.push(path);
+        }
     }
 
     Ok(())
@@ -1518,11 +1635,7 @@ fn stage_untracked_path(
     matches: &impl Fn(&str) -> bool,
 ) -> Result<()> {
     let rel_path = rel_path.trim_end_matches('/');
-    let precompose_unicode = rules
-        .config()
-        .get_bool("core.precomposeunicode")
-        .and_then(|r| r.ok())
-        .unwrap_or(false);
+    let precompose_unicode = rules.config().precompose_unicode();
     let resolved = resolve_worktree_path_for_staging(work_tree, rel_path, precompose_unicode);
     let abs = resolved.abs;
     let index_relpath = resolved.index_relpath;
@@ -1537,13 +1650,12 @@ fn stage_untracked_path(
         return Ok(());
     }
 
-    if meta.is_dir() && !meta.file_type().is_symlink() && read_submodule_head_oid(&abs).is_some() {
-        let head_oid = read_submodule_head_oid(&abs).ok_or_else(|| {
-            Error::Message(format!(
-                "could not resolve submodule HEAD for '{index_relpath}'"
-            ))
-        })?;
-        return stage_gitlink_at(&index_relpath, &meta, head_oid, index);
+    if meta.is_dir() && !meta.file_type().is_symlink() {
+        if let EmbeddedGitRepoStage::Gitlink(head_oid) =
+            classify_embedded_git_repo_for_stage(index, &index_relpath, &abs)?
+        {
+            return stage_gitlink_at(&index_relpath, &meta, head_oid, index);
+        }
     }
 
     let file_attrs = rules.file_attrs(&as_utf8_for_matching(&index_relpath), false);
@@ -1563,8 +1675,7 @@ fn stage_untracked_path(
             &index_relpath,
             None,
             Some(rules.filter_process()),
-        )
-        .map_err(|e| Error::Message(format!("could not hash {index_relpath}: {e}")))?
+        )?
     } else {
         materialize_worktree_blob(
             repo.odb(),
@@ -1575,8 +1686,7 @@ fn stage_untracked_path(
             &index_relpath,
             None,
             Some(rules.filter_process()),
-        )
-        .map_err(|e| Error::Message(format!("could not store {index_relpath}: {e}")))?
+        )?
     };
 
     let index_path = storage_bytes(&index_relpath);
@@ -1591,7 +1701,7 @@ fn stage_untracked_path(
 fn validate_worktree_paths_for_staging(rules: &WorktreeRules, paths: &[String]) -> Result<()> {
     let protect = ProtectOptions::from_config(rules.config());
     for path in paths {
-        if path.ends_with('/') {
+        if path.ends_with('/') || crate::repo_relpath::stored_path_is_directory_marker(path) {
             continue;
         }
         validate_path(
@@ -1704,9 +1814,9 @@ fn validate_pathspecs(
         let matches_repo = checker.matches(resolved)?
             || pathspec_matches_unmerged_index_entries(index, &unmerged_paths, resolved, ctx);
         if !matches_repo {
-            return Err(Error::Message(format!(
-                "pathspec '{label}' did not match any files"
-            )));
+            return Err(Error::Worktree(WorktreeError::PathspecNoMatch {
+                spec: (*label).to_owned(),
+            }));
         }
         if opts.force_ignored || opts.skip_pathspec_ignore_check {
             continue;
@@ -1731,9 +1841,9 @@ fn validate_pathspecs(
     if !ignored_paths.is_empty() {
         ignored_paths.sort_unstable();
         ignored_paths.dedup();
-        return Err(Error::PathspecIgnored {
+        return Err(Error::Worktree(WorktreeError::PathspecIgnored {
             paths: ignored_paths,
-        });
+        }));
     }
     Ok(())
 }
@@ -1842,7 +1952,7 @@ fn collect_force_ignored_untracked(
             continue;
         }
         if is_dir {
-            walk_worktree_files_under(work_tree, &rel, &mut out)?;
+            walk_worktree_files_under(index, work_tree, &rel, &mut out)?;
         } else {
             out.push(rel);
         }
@@ -1850,8 +1960,20 @@ fn collect_force_ignored_untracked(
     Ok(out)
 }
 
-fn walk_worktree_files_under(work_tree: &Path, rel_dir: &str, out: &mut Vec<String>) -> Result<()> {
-    let abs_dir = work_tree.join(rel_dir);
+fn walk_worktree_files_under(
+    index: &Index,
+    work_tree: &Path,
+    rel_dir: &str,
+    out: &mut Vec<String>,
+) -> Result<()> {
+    let rel_norm = rel_dir.trim_end_matches('/');
+    let abs_dir = work_tree.join(rel_norm);
+    if matches!(
+        classify_embedded_git_repo_for_stage(index, rel_norm, &abs_dir)?,
+        EmbeddedGitRepoStage::Gitlink(_)
+    ) {
+        return Ok(());
+    }
     let mut stack = vec![abs_dir];
     while let Some(dir) = stack.pop() {
         for entry in fs::read_dir(&dir).map_err(Error::Io)? {
@@ -1876,10 +1998,14 @@ fn walk_worktree_files_under(work_tree: &Path, rel_dir: &str, out: &mut Vec<Stri
 }
 
 fn pathdiff_worktree(work_tree: &Path, abs: &Path) -> Result<String> {
-    let rel = abs
-        .strip_prefix(work_tree)
-        .map_err(|_| Error::Message("path escaped the work tree during force-add walk".into()))?;
-    Ok(rel.to_string_lossy().replace('\\', "/"))
+    crate::repo_relpath::strip_worktree_prefix_stored(abs, work_tree).ok_or_else(|| {
+        PathOutsideRepoError::OutsideRepository {
+            path: abs.display().to_string(),
+            subpath: abs.display().to_string(),
+            repo_root: work_tree.display().to_string(),
+        }
+        .into()
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1916,15 +2042,9 @@ fn stage_intent_to_add_paths(
     let mut outcome = StageOutcome::default();
     let empty = empty_blob_oid();
     if !dry_run {
-        repo.odb()
-            .write(crate::objects::ObjectKind::Blob, b"")
-            .map_err(|e| Error::Message(format!("could not store empty blob: {e}")))?;
+        repo.odb().write(crate::objects::ObjectKind::Blob, b"")?;
     }
-    let precompose = rules
-        .config()
-        .get_bool("core.precomposeunicode")
-        .and_then(|r| r.ok())
-        .unwrap_or(false);
+    let precompose = rules.config().precompose_unicode();
 
     let mut file_paths: BTreeSet<String> = BTreeSet::new();
     for rel in candidates {
@@ -1932,7 +2052,7 @@ fn stage_intent_to_add_paths(
         let meta = fs::symlink_metadata(&resolved.abs).map_err(Error::Io)?;
         if meta.is_dir() && !meta.file_type().is_symlink() {
             let mut under = Vec::new();
-            walk_worktree_files_under(work_tree, &resolved.index_relpath, &mut under)?;
+            walk_worktree_files_under(index, work_tree, &resolved.index_relpath, &mut under)?;
             file_paths.extend(under);
         } else if meta.is_file() || meta.file_type().is_symlink() {
             file_paths.insert(resolved.index_relpath);
@@ -2066,7 +2186,7 @@ mod tests {
         };
         assert!(matches!(
             validate_commit_staging_pathspecs(&repo, &index, &opts),
-            Err(Error::PathspecIgnored { .. })
+            Err(Error::Worktree(WorktreeError::PathspecIgnored { .. }))
         ));
     }
 
@@ -2209,7 +2329,7 @@ mod tests {
             &fresh,
             &opts,
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
 
@@ -2241,7 +2361,7 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         assert_eq!(outcome.added.len(), 3);
@@ -2280,7 +2400,7 @@ mod tests {
                 ..StageOptions::default()
             },
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         assert_eq!(outcome.added.len(), expected_count);
@@ -2319,7 +2439,7 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         assert_eq!(outcome.added.len(), count);
@@ -2361,7 +2481,7 @@ mod tests {
             &mut index,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         assert_eq!(index.entries.len(), 100);
@@ -2397,7 +2517,7 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         assert_eq!(outcome.added.len(), 1);
@@ -2424,7 +2544,7 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         assert_eq!(outcome.added.len(), 1);
@@ -2442,11 +2562,73 @@ mod tests {
         write_index(&repo, &mut index);
         fs::write(root.join("new.txt"), b"fresh\n").unwrap();
 
-        let outcome =
-            stage_for_commit(&repo, &mut NullProgress, &crate::progress::NeverCancel).unwrap();
+        let outcome = stage_for_commit(
+            &repo,
+            &mut NullProgress,
+            &crate::progress::CancelToken::never(),
+        )
+        .unwrap();
         assert_eq!(outcome.added.len(), 1);
         let index = repo.load_index().unwrap();
         assert!(index.get(b"new.txt", 0).is_some());
+    }
+
+    #[test]
+    fn stage_for_commit_hides_untracked_when_show_untracked_files_no() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let repo = init_repo(root);
+        let git = root.join(".git");
+        fs::write(
+            git.join("config"),
+            "[core]\n\trepositoryformatversion = 0\n\tbare = false\n[status]\n\tshowUntrackedFiles = no\n",
+        )
+        .unwrap();
+        let repo =
+            Repository::open(&git, &RepositoryOptions::empty().with_work_tree(root)).unwrap();
+        let mut index = Index::new();
+        stage_file_in_index(&repo, &mut index, "tracked.txt", b"tracked\n");
+        write_index(&repo, &mut index);
+        fs::write(root.join("tracked.txt"), b"tracked-modified\n").unwrap();
+        fs::write(root.join("secret.env"), b"secret\n").unwrap();
+
+        let outcome = stage_for_commit(
+            &repo,
+            &mut NullProgress,
+            &crate::progress::CancelToken::never(),
+        )
+        .unwrap();
+        assert_eq!(outcome.added.len(), 0);
+        assert_eq!(outcome.modified.len(), 1);
+        let index = repo.load_index().unwrap();
+        assert!(index.get(b"secret.env", 0).is_none());
+    }
+
+    #[test]
+    fn stage_for_commit_still_adds_untracked_when_show_untracked_files_all() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let repo = init_repo(root);
+        let git = root.join(".git");
+        fs::write(
+            git.join("config"),
+            "[core]\n\trepositoryformatversion = 0\n\tbare = false\n[status]\n\tshowUntrackedFiles = all\n",
+        )
+        .unwrap();
+        let repo =
+            Repository::open(&git, &RepositoryOptions::empty().with_work_tree(root)).unwrap();
+        let mut index = Index::new();
+        stage_file_in_index(&repo, &mut index, "tracked.txt", b"tracked\n");
+        write_index(&repo, &mut index);
+        fs::write(root.join("new.txt"), b"fresh\n").unwrap();
+
+        let outcome = stage_for_commit(
+            &repo,
+            &mut NullProgress,
+            &crate::progress::CancelToken::never(),
+        )
+        .unwrap();
+        assert_eq!(outcome.added.len(), 1);
     }
 
     #[test]
@@ -2468,7 +2650,7 @@ mod tests {
                 ..StageOptions::default()
             },
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         assert_eq!(outcome.modified.len(), 1);
@@ -2502,7 +2684,7 @@ mod tests {
                 ..StageOptions::default()
             },
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         assert_eq!(outcome.added, vec!["new.txt".to_owned()]);
@@ -2550,7 +2732,7 @@ mod tests {
                 ..StageOptions::default()
             },
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         assert_eq!(outcome.modified.len(), 4);
@@ -2567,11 +2749,11 @@ mod tests {
                     ..StageOptions::default()
                 },
                 &mut NullProgress,
-                &crate::progress::NeverCancel,
+                &crate::progress::CancelToken::never(),
             )
             .unwrap_err();
             assert!(
-                matches!(&err, Error::Message(msg) if msg.contains(&format!("'{missing}'"))),
+                matches!(&err, Error::Worktree(WorktreeError::PathspecNoMatch { spec }) if spec == missing),
                 "{missing}: {err:?}"
             );
         }
@@ -2593,10 +2775,13 @@ mod tests {
                 ..StageOptions::default()
             },
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap_err();
-        assert!(matches!(err, Error::PathspecIgnored { .. }));
+        assert!(matches!(
+            err,
+            Error::Worktree(WorktreeError::PathspecIgnored { .. })
+        ));
     }
 
     #[test]
@@ -2616,11 +2801,13 @@ mod tests {
                 ..StageOptions::default()
             },
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap_err();
         match err {
-            Error::PathspecIgnored { paths } => assert_eq!(paths, vec!["build".to_owned()]),
+            Error::Worktree(WorktreeError::PathspecIgnored { paths }) => {
+                assert_eq!(paths, vec!["build".to_owned()])
+            }
             other => panic!("expected PathspecIgnored, got {other:?}"),
         }
     }
@@ -2639,7 +2826,7 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         let index = repo.load_index().unwrap();
@@ -2665,7 +2852,7 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
 
@@ -2692,7 +2879,7 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         assert_eq!(outcome.modified.len(), 1);
@@ -2726,7 +2913,7 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
 
@@ -2817,14 +3004,17 @@ mod tests {
                 ..StageOptions::default()
             },
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap_err();
         assert!(
-            matches!(err, Error::UnmergedConflictMarkers { .. }),
+            matches!(
+                err,
+                Error::Worktree(WorktreeError::UnmergedConflictMarkers { .. })
+            ),
             "explicit add must refuse marked file: {err}"
         );
-        if let Error::UnmergedConflictMarkers { paths } = err {
+        if let Error::Worktree(WorktreeError::UnmergedConflictMarkers { paths }) = err {
             assert_eq!(paths, vec!["f".to_owned()]);
         }
 
@@ -2853,12 +3043,12 @@ mod tests {
                 ..StageOptions::default()
             },
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         );
         assert!(
             !matches!(
                 &result,
-                Err(Error::Message(msg)) if msg.contains("did not match any files")
+                Err(Error::Worktree(WorktreeError::PathspecNoMatch { .. }))
             ),
             "pathspec validation must see unmerged index stages: {result:?}"
         );
@@ -2886,11 +3076,14 @@ mod tests {
                 ..StageOptions::default()
             },
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap_err();
         assert!(
-            matches!(err, Error::UnmergedConflictMarkers { .. }),
+            matches!(
+                err,
+                Error::Worktree(WorktreeError::UnmergedConflictMarkers { .. })
+            ),
             "dry-run explicit add must not claim success: {err}"
         );
     }
@@ -2913,11 +3106,14 @@ mod tests {
                 ..StageOptions::default()
             },
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap_err();
         assert!(
-            matches!(err, Error::UnmergedConflictMarkers { .. }),
+            matches!(
+                err,
+                Error::Worktree(WorktreeError::UnmergedConflictMarkers { .. })
+            ),
             "must honor conflict-marker-size=10: {err}"
         );
         assert!(repo.load_index().unwrap().has_unmerged_entries());
@@ -2942,11 +3138,14 @@ mod tests {
                 ..StageOptions::default()
             },
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap_err();
         assert!(
-            matches!(err, Error::UnmergedConflictMarkers { .. }),
+            matches!(
+                err,
+                Error::Worktree(WorktreeError::UnmergedConflictMarkers { .. })
+            ),
             "{err}"
         );
     }
@@ -2979,11 +3178,14 @@ mod tests {
                 ..StageOptions::default()
             },
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap_err();
         assert!(
-            matches!(err, Error::UnmergedConflictMarkers { .. }),
+            matches!(
+                err,
+                Error::Worktree(WorktreeError::UnmergedConflictMarkers { .. })
+            ),
             "{err}"
         );
         let index = repo.load_index().unwrap();
@@ -3032,10 +3234,10 @@ mod tests {
                 ..StageOptions::default()
             },
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap_err();
-        let Error::UnmergedConflictMarkers { paths } = err else {
+        let Error::Worktree(WorktreeError::UnmergedConflictMarkers { paths }) = err else {
             panic!("expected marker rejection, got {err}");
         };
         assert_eq!(paths, vec!["b.txt".to_owned()]);
@@ -3078,7 +3280,7 @@ mod tests {
                 ..StageOptions::default()
             },
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         assert_eq!(outcome.modified.len(), 1);
@@ -3118,7 +3320,7 @@ mod tests {
                 ..StageOptions::default()
             },
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         assert_eq!(outcome.total(), 1);
@@ -3197,7 +3399,7 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         let index = repo.load_index().unwrap();
@@ -3226,7 +3428,7 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         let index = repo.load_index().unwrap();
@@ -3277,6 +3479,42 @@ mod tests {
     }
 
     #[test]
+    fn stage_refuses_embedded_repo_without_commit() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let repo = init_repo(root);
+        let mut index = Index::new();
+        stage_file_in_index(&repo, &mut index, "a", b"a\n");
+        write_index(&repo, &mut index);
+        let sub = root.join("tool/sub");
+        fs::create_dir_all(&sub).unwrap();
+        open_nested_repo(&sub);
+        fs::write(sub.join("main.rs"), b"fn main() {}\n").unwrap();
+        fs::write(root.join("tool/sibling.txt"), b"s\n").unwrap();
+
+        let err = stage(
+            &repo,
+            &StageOptions {
+                pathspecs: vec!["tool".into()],
+                pathspec_sources: vec!["tool".into()],
+                ..StageOptions::default()
+            },
+            &mut NullProgress,
+            &crate::progress::CancelToken::never(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::Worktree(WorktreeError::EmbeddedRepoWithoutCommit { path }) if path == "tool/sub"
+        ));
+
+        let index = repo.load_index().unwrap();
+        assert!(index.get(b"tool/sub", 0).is_none());
+        assert!(index.get(b"tool/sibling.txt", 0).is_none());
+        assert_eq!(index.entries.len(), 1);
+    }
+
+    #[test]
     fn stage_all_records_unregistered_embedded_repo_as_gitlink() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
@@ -3297,7 +3535,7 @@ mod tests {
                 ..StageOptions::default()
             },
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
 
@@ -3306,6 +3544,73 @@ mod tests {
         assert_eq!(entry.mode, MODE_GITLINK);
         assert_eq!(entry.oid, head);
         assert!(index.get(b"inner/i", 0).is_none());
+    }
+
+    #[test]
+    fn stage_all_reports_unregistered_embedded_repo_in_outcome() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let repo = init_repo(root);
+        fs::write(root.join("a"), b"a\n").unwrap();
+        let sub = root.join("inner");
+        fs::create_dir_all(&sub).unwrap();
+        let sub_repo = open_nested_repo(&sub);
+        let head = commit_in_repo(&sub_repo, "i", b"i\n", "i");
+        set_branch_head(&sub_repo, head);
+
+        let outcome = stage(
+            &repo,
+            &StageOptions {
+                pathspecs: Vec::new(),
+                pathspec_sources: Vec::new(),
+                mode: StageMode::All,
+                ..StageOptions::default()
+            },
+            &mut NullProgress,
+            &crate::progress::CancelToken::never(),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.embedded_gitlinks, vec!["inner".to_owned()]);
+    }
+
+    #[test]
+    fn stage_does_not_report_already_indexed_gitlink_as_embedded() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let repo = init_repo(root);
+        let sub = root.join("inner");
+        fs::create_dir_all(&sub).unwrap();
+        let sub_repo = open_nested_repo(&sub);
+        let head = commit_in_repo(&sub_repo, "i", b"i\n", "i");
+        set_branch_head(&sub_repo, head);
+
+        stage(
+            &repo,
+            &StageOptions {
+                pathspecs: vec!["inner".to_owned()],
+                pathspec_sources: vec!["inner".to_owned()],
+                ..StageOptions::default()
+            },
+            &mut NullProgress,
+            &crate::progress::CancelToken::never(),
+        )
+        .unwrap();
+
+        let outcome = stage(
+            &repo,
+            &StageOptions {
+                pathspecs: vec!["inner".to_owned()],
+                pathspec_sources: vec!["inner".to_owned()],
+                mode: StageMode::All,
+                ..StageOptions::default()
+            },
+            &mut NullProgress,
+            &crate::progress::CancelToken::never(),
+        )
+        .unwrap();
+
+        assert!(outcome.embedded_gitlinks.is_empty());
     }
 
     fn seed_one_file_dirs(root: &Path, count: usize) {
@@ -3326,7 +3631,7 @@ mod tests {
                 ..StageOptions::default()
             },
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap()
     }
@@ -3384,7 +3689,7 @@ mod tests {
                     ..StageOptions::default()
                 },
                 &mut NullProgress,
-                &crate::progress::NeverCancel,
+                &crate::progress::CancelToken::never(),
             )
             .unwrap();
             assert_eq!(outcome.added.len(), DIRS as usize, "{specs:?}");
@@ -3453,7 +3758,7 @@ mod tests {
                 ..StageOptions::default()
             },
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         assert_eq!(outcome.total(), 1);
@@ -3462,6 +3767,52 @@ mod tests {
         let entry = index.get(b"sub", 0).unwrap();
         assert_eq!(entry.mode, MODE_GITLINK);
         assert_eq!(entry.oid, new_head);
+    }
+
+    #[test]
+    fn stage_unmerged_gitlink_refuses_unborn_nested_head() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let repo = init_repo(root);
+        let sub = root.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        let sub_repo = open_nested_repo(&sub);
+        let base_oid = commit_in_repo(&sub_repo, "inside.txt", b"base\n", "base");
+        let ours_oid = commit_in_repo(&sub_repo, "inside.txt", b"ours\n", "ours");
+        let theirs_oid = commit_in_repo(&sub_repo, "inside.txt", b"theirs\n", "theirs");
+        fs::write(sub.join(".git/HEAD"), "ref: refs/heads/does-not-exist\n").unwrap();
+
+        let mut index = Index::new();
+        index
+            .entries
+            .push(conflict_index_entry("sub", 1, base_oid, MODE_GITLINK));
+        index
+            .entries
+            .push(conflict_index_entry("sub", 2, ours_oid, MODE_GITLINK));
+        index
+            .entries
+            .push(conflict_index_entry("sub", 3, theirs_oid, MODE_GITLINK));
+        write_index(&repo, &mut index);
+        let index_path = repo.git_dir().join("index");
+        let index_before = fs::read(&index_path).unwrap();
+
+        let err = stage(
+            &repo,
+            &StageOptions {
+                pathspecs: vec!["sub".to_owned()],
+                ..StageOptions::default()
+            },
+            &mut NullProgress,
+            &crate::progress::CancelToken::never(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::Worktree(WorktreeError::EmbeddedRepoWithoutCommit { path }) if path == "sub"
+        ));
+        assert_eq!(fs::read(&index_path).unwrap(), index_before);
+        let index = repo.load_index().unwrap();
+        assert!(index.has_unmerged_entries());
     }
 
     #[test]
@@ -3496,7 +3847,7 @@ mod tests {
                     ..StageOptions::default()
                 },
                 &mut NullProgress,
-                &crate::progress::NeverCancel,
+                &crate::progress::CancelToken::never(),
             )
             .unwrap();
             assert_eq!(outcome.modified, vec![spec.trim_end_matches('/')]);
@@ -3540,7 +3891,7 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         fs::write(root.join("foo"), b"new foo\n").unwrap();
@@ -3557,7 +3908,7 @@ mod tests {
                 ..StageOptions::default()
             },
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         let mut modified = outcome.modified;
@@ -3621,7 +3972,7 @@ mod tests {
                 ..StageOptions::default()
             },
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         assert_eq!(outcome.modified.len(), 1);
@@ -3660,7 +4011,7 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         fs::write(root.join("tracked.txt"), b"v2\n").unwrap();
@@ -3676,7 +4027,7 @@ mod tests {
                 ..StageOptions::default()
             },
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         assert!(!outcome.added.is_empty() || !outcome.modified.is_empty());
@@ -3698,7 +4049,7 @@ mod tests {
                 ..StageOptions::default()
             },
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         assert_eq!(count_loose_objects(root), objects_before);
@@ -3729,7 +4080,7 @@ mod tests {
                 ..StageOptions::default()
             },
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         assert_eq!(outcome.total(), 1, "pathless -u must stage resolved file");
@@ -3765,7 +4116,7 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         grit_test_support::git(root, &["commit", "-qm", "seed"]);
@@ -3789,7 +4140,7 @@ mod tests {
                 ..StageOptions::default()
             },
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         assert_eq!(outcome.removed, vec!["f".to_owned()]);
@@ -3874,7 +4225,7 @@ mod tests {
                 ..StageOptions::default()
             },
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         assert_eq!(bulk.added.len(), 2);
@@ -3889,7 +4240,7 @@ mod tests {
                 ..StageOptions::default()
             },
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         assert_eq!(serial.added, vec!["c.txt".to_owned()]);
@@ -3934,7 +4285,7 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         grit_test_support::git(root, &["commit", "-qm", "seed"]);
@@ -3948,7 +4299,7 @@ mod tests {
                 ..StageOptions::default()
             },
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         assert!(outcome.removed.iter().any(|p| p == "gone.txt"));
@@ -4003,7 +4354,7 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         grit_test_support::git(root, &["commit", "-qm", "seed"]);
@@ -4018,7 +4369,7 @@ mod tests {
                 ..StageOptions::default()
             },
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         assert_eq!(outcome.modified, vec!["sub/a.txt".to_owned()]);
@@ -4035,7 +4386,7 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         fs::write(root.join("f.txt"), b"2\n").unwrap();
@@ -4046,7 +4397,7 @@ mod tests {
                 ..StageOptions::default()
             },
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         assert_eq!(outcome.modified.len(), 1);
@@ -4063,7 +4414,7 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         fs::write(root.join("f.txt"), b"2\n").unwrap();
@@ -4075,7 +4426,7 @@ mod tests {
                 ..StageOptions::default()
             },
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         assert!(outcome.modified.contains(&"f.txt".to_owned()));
@@ -4101,7 +4452,7 @@ mod tests {
                 ..StageOptions::default()
             },
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         assert_eq!(outcome.added, vec!["a.log".to_owned()]);
@@ -4141,7 +4492,7 @@ mod tests {
                 ..StageOptions::default()
             },
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
 
@@ -4190,7 +4541,7 @@ mod tests {
                 ..StageOptions::default()
             },
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         let grit_porcelain = Command::new("git")
@@ -4266,6 +4617,7 @@ mod tests {
             modified: vec![valid_display.clone(), invalid_display.clone()],
             removed: Vec::new(),
             intent_to_add: Vec::new(),
+            embedded_gitlinks: Vec::new(),
             stat_refreshed: false,
         };
         sort_outcome_paths_in_index_order(&mut outcome, &index);
@@ -4294,6 +4646,7 @@ mod tests {
             modified,
             removed: Vec::new(),
             intent_to_add: Vec::new(),
+            embedded_gitlinks: Vec::new(),
             stat_refreshed: false,
         };
 
@@ -4323,7 +4676,6 @@ mod tests {
     #[test]
     fn bulk_stage_and_parallel_restage_write_through_custom_primary() {
         use crate::odb::store::{MemoryStore, ObjectStore};
-        use crate::odb::OdbBuilder;
         use std::sync::Arc;
 
         let tmp = TempDir::new().unwrap();
@@ -4331,14 +4683,13 @@ mod tests {
         init_repo(root);
         let git = root.join(".git");
         let store = Arc::new(MemoryStore::new(crate::objects::HashAlgo::Sha1));
-        let repo = crate::repo::RepositoryBuilder::new(RepositoryOptions::empty())
-            .odb_builder(
-                OdbBuilder::files(git.join("objects"))
-                    .primary(store.clone())
-                    .alternates(false),
-            )
-            .open(&git, Some(root))
-            .unwrap();
+        let repo = crate::repo::Repository::open(
+            &git,
+            &(RepositoryOptions::empty()
+                .with_object_store(store.clone())
+                .with_work_tree(root)),
+        )
+        .unwrap();
         let bulk = StageOptions {
             staging_thresholds: Some(IndexStagingThresholds {
                 large_index_restage: 0,
@@ -4355,7 +4706,7 @@ mod tests {
                 &repo,
                 &bulk,
                 &mut NullProgress,
-                &crate::progress::NeverCancel
+                &crate::progress::CancelToken::never()
             )
             .unwrap()
             .added
@@ -4370,7 +4721,7 @@ mod tests {
             &repo,
             &bulk,
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         assert_eq!(restaged.modified.len(), paths.len());

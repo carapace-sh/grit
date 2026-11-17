@@ -9,7 +9,41 @@ use super::detail::{DiffDetail, DiffTotals, FileDiff, LineStat};
 use super::tree_content::{
     tree_diff_stat_parallel, tree_diff_structured_parallel, TreeDiffStructured,
 };
-use super::{DiffEntry, DiffOptions, DiffStatus};
+use super::{
+    detect_renames_with_policy, DetectRenamesOptions, DiffEntry, DiffOptions, DiffStatus,
+    InexactRenameDetectionSkipped,
+};
+
+fn entries_with_options_renames(
+    odb: &Odb,
+    entries: Vec<DiffEntry>,
+    diff_options: &DiffOptions,
+    config: &ConfigSet,
+    thread_policy: &ThreadPolicy,
+    inexact_notice: Option<&mut Option<InexactRenameDetectionSkipped>>,
+) -> Result<Vec<DiffEntry>> {
+    if let Some(percent) = diff_options.rename_similarity_threshold() {
+        if percent <= 100 {
+            let out = detect_renames_with_policy(
+                odb,
+                None,
+                entries,
+                percent,
+                config,
+                thread_policy,
+                None,
+                DetectRenamesOptions::default(),
+            )?;
+            if let Some(slot) = inexact_notice {
+                if out.inexact_skipped.is_some() {
+                    *slot = out.inexact_skipped;
+                }
+            }
+            return Ok(out.entries);
+        }
+    }
+    Ok(entries)
+}
 
 fn path_from_entry(entry: &DiffEntry) -> String {
     entry
@@ -32,7 +66,7 @@ impl FileDiff {
     ///
     /// Moves the paths and modes out of `entry` without reading any blob, so converting a
     /// list entry by entry costs no more than the entries themselves. This is the row
-    /// [`build_file_diffs`] produces for [`DiffDetail::NameOnly`] and [`DiffDetail::NameStatus`].
+    /// [`Diff::files_for_entries`](super::Diff::files_for_entries) produces for [`DiffDetail::NameOnly`] and [`DiffDetail::NameStatus`].
     ///
     /// # Parameters
     ///
@@ -59,6 +93,8 @@ impl FileDiff {
             old_mode: entry.old_mode.octal_if_present(),
             new_mode: entry.new_mode.octal_if_present(),
             binary: false,
+            old_size: 0,
+            new_size: 0,
             similarity,
             stat: None,
             structured: None,
@@ -77,6 +113,8 @@ fn file_diff_from_structured(t: TreeDiffStructured) -> FileDiff {
         old_mode: t.structured.old_mode.clone(),
         new_mode: t.structured.new_mode.clone(),
         binary: t.binary,
+        old_size: t.old_size,
+        new_size: t.new_size,
         similarity: t.entry.rename_similarity(),
         stat: None,
         structured: Some(t.structured),
@@ -85,7 +123,13 @@ fn file_diff_from_structured(t: TreeDiffStructured) -> FileDiff {
     }
 }
 
-fn file_diff_from_stat(entry: DiffEntry, binary: bool, stat: Option<LineStat>) -> FileDiff {
+fn file_diff_from_stat(
+    entry: DiffEntry,
+    binary: bool,
+    stat: Option<LineStat>,
+    old_size: u64,
+    new_size: u64,
+) -> FileDiff {
     let path = path_from_entry(&entry);
     FileDiff {
         path: path.clone(),
@@ -94,6 +138,8 @@ fn file_diff_from_stat(entry: DiffEntry, binary: bool, stat: Option<LineStat>) -
         old_mode: entry.old_mode.octal_if_present(),
         new_mode: entry.new_mode.octal_if_present(),
         binary,
+        old_size,
+        new_size,
         similarity: entry.rename_similarity(),
         stat,
         structured: None,
@@ -102,24 +148,30 @@ fn file_diff_from_stat(entry: DiffEntry, binary: bool, stat: Option<LineStat>) -
     }
 }
 
-/// Output of [`build_file_diffs`].
+/// Output of [`Diff::files_for_entries`](super::Diff::files_for_entries).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiffFilesOutput {
     /// Per-file results in path order.
     pub files: Vec<FileDiff>,
     /// Aggregate counts for stat detail; `None` for patch and name-only modes.
     pub totals: Option<DiffTotals>,
+    /// Set when inexact rename detection was skipped due to `diff.renameLimit`.
+    pub inexact_rename_skipped: Option<InexactRenameDetectionSkipped>,
 }
 
 /// Fill per-file diff bodies for tree/index diff entries.
 ///
-/// Name-only and name-status skip blob reads for line diffs; stat loads blobs for
-/// counts only; patch runs the full structured line engine.
+/// Applies [`DiffOptions::renames`] to the entry list first (Git's default `-M50`), pairing
+/// added and deleted paths before stat or patch work. Use [`RenameDetection::Off`](crate::diff::RenameDetection::Off) when the
+/// caller already ran rename detection (`detect_renames`) or
+/// [`Diff::tree_to_tree`](crate::diff::Diff::tree_to_tree) with renames on. Metadata-only
+/// [`DiffDetail::NameOnly`] and [`DiffDetail::NameStatus`] still skip line-diff blob reads,
+/// but rename detection may read blob sides for similarity scoring when renames are enabled.
 ///
 /// # Errors
 ///
 /// Propagates object database and parallel diff errors.
-pub fn build_file_diffs(
+pub(crate) fn build_file_diffs(
     odb: &Odb,
     entries: Vec<DiffEntry>,
     detail: DiffDetail,
@@ -127,22 +179,38 @@ pub fn build_file_diffs(
     config: &ConfigSet,
     thread_policy: &ThreadPolicy,
 ) -> Result<DiffFilesOutput> {
+    let mut inexact_rename_skipped = None;
+    let entries = entries_with_options_renames(
+        odb,
+        entries,
+        &diff_options,
+        config,
+        thread_policy,
+        Some(&mut inexact_rename_skipped),
+    )?;
     match detail {
         DiffDetail::NameOnly | DiffDetail::NameStatus => {
             let files: Vec<FileDiff> = entries.into_iter().map(FileDiff::from_metadata).collect();
             Ok(DiffFilesOutput {
                 files,
                 totals: None,
+                inexact_rename_skipped,
             })
         }
         DiffDetail::Stat => {
             let rows = tree_diff_stat_parallel(odb, entries, config, thread_policy, diff_options)?;
             let files: Vec<FileDiff> = rows
                 .into_iter()
-                .map(|(entry, binary, stat)| file_diff_from_stat(entry, binary, stat))
+                .map(|(entry, binary, stat, old_size, new_size)| {
+                    file_diff_from_stat(entry, binary, stat, old_size, new_size)
+                })
                 .collect();
             let totals = Some(DiffTotals::from_files(&files));
-            Ok(DiffFilesOutput { files, totals })
+            Ok(DiffFilesOutput {
+                files,
+                totals,
+                inexact_rename_skipped,
+            })
         }
         DiffDetail::Patch => {
             let structured =
@@ -154,6 +222,7 @@ pub fn build_file_diffs(
             Ok(DiffFilesOutput {
                 files,
                 totals: None,
+                inexact_rename_skipped,
             })
         }
     }
@@ -167,7 +236,7 @@ pub fn build_file_diffs(
 /// # Errors
 ///
 /// Propagates object database and parallel diff errors, and callback errors.
-pub fn build_file_diffs_streaming(
+pub(crate) fn build_file_diffs_streaming(
     odb: &Odb,
     entries: Vec<DiffEntry>,
     diff_options: DiffOptions,
@@ -176,6 +245,8 @@ pub fn build_file_diffs_streaming(
     mut emit: impl FnMut(FileDiff) -> Result<()>,
 ) -> Result<()> {
     use super::tree_content::for_each_tree_diff_structured;
+    let entries =
+        entries_with_options_renames(odb, entries, &diff_options, config, thread_policy, None)?;
     for_each_tree_diff_structured(
         odb,
         &entries,
@@ -271,5 +342,91 @@ mod tests {
             );
             assert!(file.stat.is_none() && file.structured.is_none());
         }
+    }
+
+    #[test]
+    fn build_file_diffs_applies_default_rename_detection() {
+        use crate::config::ConfigSet;
+        use crate::objects::{serialize_commit, CommitData, ObjectKind, TreeEntry};
+        use crate::parallel::ThreadPolicy;
+        use crate::repo::{InitOptions, Repository};
+
+        fn tree_with(repo: &Repository, entries: &[(&str, &[u8])]) -> ObjectId {
+            let mut tes = Vec::new();
+            for (name, data) in entries {
+                let oid = repo.odb().write(ObjectKind::Blob, data).expect("blob");
+                tes.push(TreeEntry {
+                    mode: 0o100644,
+                    name: name.as_bytes().to_vec(),
+                    oid,
+                });
+            }
+            let data = crate::objects::serialize_tree(&tes);
+            repo.odb().write(ObjectKind::Tree, &data).expect("tree")
+        }
+
+        fn write_commit(repo: &Repository, tree: ObjectId, parents: Vec<ObjectId>) -> ObjectId {
+            let ident = "A <a@example.com> 0 +0000";
+            let commit = CommitData {
+                tree,
+                parents,
+                author: ident.into(),
+                committer: ident.into(),
+                author_raw: Vec::new(),
+                committer_raw: Vec::new(),
+                encoding: None,
+                message: "m\n".into(),
+                raw_message: None,
+                extra_headers: Vec::new(),
+            };
+            repo.odb()
+                .write(ObjectKind::Commit, &serialize_commit(&commit))
+                .expect("commit")
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (repo, _) = Repository::init(dir.path(), &InitOptions::default()).expect("init");
+        let shared = b"same line\nsame line\nsame line\n";
+        let mut old_body = shared.to_vec();
+        old_body.extend_from_slice(b"tail\n");
+        let mut new_body = shared.to_vec();
+        new_body.extend_from_slice(b"tail2\n");
+        let parent_tree = tree_with(&repo, &[("old.txt", &old_body)]);
+        let parent = write_commit(&repo, parent_tree, vec![]);
+        let child_tree = tree_with(&repo, &[("new.txt", &new_body)]);
+        let _child = write_commit(&repo, child_tree, vec![parent]);
+        let old_tree = repo.odb().commit_tree(&parent).expect("tree");
+        let new_tree = repo.odb().commit_tree(&_child).expect("tree");
+        let entries = repo
+            .diff()
+            .tree_to_tree(
+                Some(&old_tree),
+                Some(&new_tree),
+                &crate::diff::TreeDiffOptions::default(),
+            )
+            .expect("diff")
+            .entries;
+        let config = ConfigSet::default();
+        let with_renames = build_file_diffs(
+            repo.odb(),
+            entries.clone(),
+            DiffDetail::Stat,
+            DiffOptions::default(),
+            &config,
+            &ThreadPolicy::default(),
+        )
+        .expect("stat");
+        assert_eq!(with_renames.files.len(), 1);
+        assert_eq!(with_renames.files[0].status, DiffStatus::Renamed);
+        let without = build_file_diffs(
+            repo.odb(),
+            entries,
+            DiffDetail::Stat,
+            DiffOptions::default().with_renames(crate::diff::RenameDetection::Off),
+            &config,
+            &ThreadPolicy::default(),
+        )
+        .expect("stat");
+        assert_eq!(without.files.len(), 2);
     }
 }

@@ -7,16 +7,17 @@
 //! Run: `cargo run -p grit-lib --example cherry_pick`
 
 use grit_lib::commit::trailers;
-use grit_lib::config::ConfigSet;
+use grit_lib::config::environment::Environment;
+use grit_lib::config::{ConfigSet, LoadConfigOptions};
 use grit_lib::diff::merge_file::MergeFavor;
 use grit_lib::diff::merge_trees::{
     merge_trees_three_way, DirectoryRenameMode, WhitespaceMergeOptions,
 };
+use grit_lib::error::ObjectError;
 use grit_lib::index::write_tree::write_tree_from_index;
 use grit_lib::objects::{parse_commit, serialize_commit, CommitData, ObjectKind};
 use grit_lib::refs;
 use grit_lib::repo::{InitOptions, Repository};
-use grit_lib::revwalk::rev_parse::resolve_revision;
 
 fn commit_from_tree(
     repo: &grit_lib::repo::Repository,
@@ -48,13 +49,13 @@ fn tree_of_commit(
     Ok(parse_commit(&obj.data)?.tree)
 }
 
-fn main() -> grit_lib::error::Result<()> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let root = tempfile::tempdir()?;
-    let repo = Repository::init(
+    let (repo, _) = Repository::init(
         root.path(),
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
-            .with_ref_storage(grit_lib::RefStorageFormat::Files),
+            .with_ref_storage(grit_lib::refs::ref_storage::RefStorageFormat::Files),
     )?;
 
     use grit_lib::index::{Index, IndexEntry, MODE_REGULAR};
@@ -79,11 +80,14 @@ fn main() -> grit_lib::error::Result<()> {
         path: b"base.txt".to_vec(),
         base_index_pos: 0,
     });
-    repo.index_handle().write(&mut index)?;
-    let index = repo.index_handle().load()?;
+    repo.index()
+        .write(&mut index, &grit_lib::index::IndexWriteOptions::default())?;
+    let index = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())?;
     let tree_a = write_tree_from_index(repo.odb(), &index, "")?;
     let commit_a = commit_from_tree(&repo, tree_a, &[], "initial\n")?;
-    refs::write_ref(repo.git_dir(), "refs/heads/main", &commit_a)?;
+    repo.references().update("refs/heads/main", &commit_a)?;
 
     // Topic commit: parent A, adds picked.txt (not on main yet).
     let blob_pick = repo.odb().write(ObjectKind::Blob, b"hello from topic\n")?;
@@ -122,19 +126,28 @@ fn main() -> grit_lib::error::Result<()> {
         path: b"picked.txt".to_vec(),
         base_index_pos: 0,
     });
-    repo.index_handle().write(&mut index)?;
-    let index = repo.index_handle().load()?;
+    repo.index()
+        .write(&mut index, &grit_lib::index::IndexWriteOptions::default())?;
+    let index = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())?;
     let tree_b = write_tree_from_index(repo.odb(), &index, "")?;
     let commit_b = commit_from_tree(&repo, tree_b, &[commit_a], "add picked file\n")?;
-    refs::write_ref(repo.git_dir(), "refs/heads/topic", &commit_b)?;
+    repo.references().update("refs/heads/topic", &commit_b)?;
 
     // Cherry-pick `topic` onto `main` (still at A).
-    let head = resolve_revision(&repo, "main")?;
-    let picked = resolve_revision(&repo, "topic")?;
+    let head = repo
+        .revwalk()
+        .resolve("main", &grit_lib::revwalk::ResolveOptions::default())?;
+    let picked = repo
+        .revwalk()
+        .resolve("topic", &grit_lib::revwalk::ResolveOptions::default())?;
     let picked_obj = repo.odb().read(&picked)?;
     let picked_data = parse_commit(&picked_obj.data)?;
     let parent = picked_data.parents.first().copied().ok_or_else(|| {
-        grit_lib::error::Error::CorruptObject("picked commit has no parent".into())
+        grit_lib::error::Error::Object(ObjectError::Corrupt {
+            detail: "picked commit has no parent".into(),
+        })
     })?;
 
     let base_tree = tree_of_commit(&repo, parent)?;
@@ -162,25 +175,29 @@ fn main() -> grit_lib::error::Result<()> {
     )?;
 
     if grit_lib::operation::tree_merge_has_conflicts(&merged) {
-        return Err(grit_lib::error::Error::Message(format!(
+        return Err(format!(
             "merge produced {} conflict(s); this example expects a clean pick",
             grit_lib::operation::conflicts_from_tree_merge(&merged).len()
-        )));
+        )
+        .into());
     }
 
     let new_tree = merged.result_tree;
-    let config = ConfigSet::load_repo_local_only(repo.git_dir())?;
-    let msg = trailers::finalize_cherry_pick_message(
+    let config = ConfigSet::load(
+        &Environment::empty(),
+        Some(repo.git_dir()),
+        &LoadConfigOptions::repo_local_only(repo.git_dir()),
+    )?;
+    let msg = trailers::finalize_cherry_pick_message_with_options(
         &picked_data.message,
-        true,
-        false,
+        &trailers::CherryPickMessageOptions::default().with_append_source(true),
         "Example",
         "example@example.com",
         &config,
         &picked.to_hex(),
     );
     let new_commit = commit_from_tree(&repo, new_tree, &[head], &msg)?;
-    refs::write_ref(repo.git_dir(), "refs/heads/main", &new_commit)?;
+    repo.references().update("refs/heads/main", &new_commit)?;
 
     println!("cherry-picked {} onto {}", picked, head);
     println!("new main: {new_commit}");

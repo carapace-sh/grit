@@ -52,6 +52,26 @@ pub enum RefStoreError {
         reason: RefnameUnavailable,
     },
 
+    /// A create was requested for a ref name that already exists under ASCII case folding
+    /// when `core.ignorecase` is enabled (or the git directory is on a case-insensitive
+    /// volume).
+    #[error("reference '{name}' already exists")]
+    CreateExists {
+        /// Ref the caller tried to create.
+        name: String,
+    },
+
+    /// Two creates in one transaction differ only by ASCII case while `core.ignorecase`
+    /// is enabled. The files ref backend cannot store both as loose refs; packed-refs
+    /// during an initial clone can hold both spellings.
+    #[error("cannot store refs '{name}' and '{other}' together when core.ignorecase is enabled")]
+    CaseConflict {
+        /// One ref in the conflicting pair.
+        name: String,
+        /// The other ref, equal under ASCII case folding.
+        other: String,
+    },
+
     /// The same ref name appears more than once in one transaction.
     #[error("multiple updates for ref '{name}' not allowed")]
     DuplicateUpdate {
@@ -71,8 +91,11 @@ pub enum RefStoreError {
     },
 
     /// Stored data for a ref or reflog is malformed.
-    #[error("corrupt ref store: {0}")]
-    Corrupt(String),
+    #[error("corrupt ref store: {detail}")]
+    Corrupt {
+        /// What is wrong with the stored refs.
+        detail: String,
+    },
 
     /// Filesystem I/O on a git-directory path during ref store work.
     #[error("{}", crate::git_dir::io_error::format_git_dir_io_message(.path, *operation, &Self::git_dir_io_source(*.os_error)))]
@@ -212,8 +235,10 @@ impl ReferenceTransactionHookErr {
                 source: std::io::Error::new(source.kind(), source.to_string()),
                 output: output.clone(),
             },
-            crate::hooks::HookError::Internal(msg) => {
-                crate::hooks::HookError::Internal(msg.clone())
+            crate::hooks::HookError::MissingHookCommand { hook_name } => {
+                crate::hooks::HookError::MissingHookCommand {
+                    hook_name: hook_name.clone(),
+                }
             }
         })
     }

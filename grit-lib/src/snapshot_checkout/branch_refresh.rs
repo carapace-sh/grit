@@ -1,6 +1,6 @@
 //! Bringing a local branch onto the server's branch of its name, as the
 //! checkout sees it: what `grit pull <branch>` does in a checkout once the
-//! server has projected its branch ([`super::project_branch`]) and the
+//! server has projected its branch ([`project_branch`](crate::repo_handles::RepositorySnapshotCheckouts::project_branch)) and the
 //! projection has been fetched ([`super::fetch_branch`]).
 //!
 //! A branch the checkout doesn't have is created at the projection. One that
@@ -27,7 +27,7 @@ use crate::patch_ids::{compute_patch_id, PatchIdMode};
 use crate::porcelain::checkout_reflog::checkout_reflog_identity;
 use crate::porcelain::pull::{pull, FetchedUpstream, PullMode, PullOptions, PullResult};
 use crate::porcelain::switch::{switch_repository, SwitchMode, SwitchOptions};
-use crate::progress::NeverCancel;
+use crate::progress::CancelToken;
 use crate::remote::transfer::FetchOptions;
 use crate::repo::Repository;
 use crate::state::{resolve_head_for_repository, HeadState};
@@ -117,47 +117,8 @@ struct OwnCommits {
     own: usize,
 }
 
-/// Bring the local branch `info.name` onto the server's branch as the
-/// checkout sees it, `info.projected`, fetched already (see the module
-/// docs).
-///
-/// First the branch's commits made with plain Git are given a change id
-/// ([`give_change_ids`], not with `check`), logged at the repository
-/// handle's clock ([`Repository::identity_now`]). The branch's own commits
-/// are then those above `from`, the newer of its merge base with the
-/// projection and the newest snapshot it builds on, past the copies of the
-/// server's commits right above it; other copies among them (same change key
-/// as one of the projection's commits above the snapshots, or same patch-id
-/// as one of the projection's commits the branch lacks) are left out of the
-/// rebase too.
-///
-/// When the branch is not the current one, it is moved by compare-and-swap
-/// to the projection when it has nothing of its own, and otherwise `HEAD` is
-/// switched to it first (as `git rebase <upstream> <branch>` does) and it is
-/// rebased in place, with the worktree. When that rebase fails or refuses
-/// (local changes it would overwrite, say), `HEAD` is switched back.
-///
-/// # Parameters
-///
-/// - `repo`: the checkout.
-/// - `marker`: its marker.
-/// - `info`: the server's answer to [`super::CheckoutClient::branch`], whose
-///   projection must be at [`upstream_ref`]`(<name>)` here.
-/// - `check`: say what would happen without changing anything.
-///
-/// # Errors
-///
-/// [`CheckoutError::OperationInProgress`] while a rebase or merge is in
-/// progress; [`CheckoutError::BranchMoved`] when the projection is not at
-/// [`upstream_ref`]`(<name>)`; [`CheckoutError::UnrelatedBranch`] for a local
-/// branch that shares nothing with the projection;
-/// [`CheckoutError::RefKeptMoving`] when the branch moved meanwhile;
-/// [`CheckoutError::Library`] for a branch checked out (or being rebased or
-/// bisected) in another worktree, or a switch that would overwrite local
-/// changes; [`CheckoutError::Pull`] when the rebase fails;
-/// [`CheckoutError::StillSwitched`] when it fails and `HEAD` can't be
-/// switched back; and ref, walk and object failures.
-pub fn refresh_branch(
+/// [`RepositorySnapshotCheckouts::refresh_branch`](crate::repo_handles::RepositorySnapshotCheckouts::refresh_branch) for `repo`.
+pub(crate) fn refresh_branch(
     repo: &Repository,
     marker: &CheckoutMarker,
     info: &BranchInfo,
@@ -166,7 +127,10 @@ pub fn refresh_branch(
     ensure_refreshable(repo)?;
     let name = info.name.as_str();
     if !valid_branch_name(name) {
-        return Err(CheckoutError::InvalidBranchName(name.to_owned()));
+        return Err(CheckoutError::InvalidBranchName {
+            name: name.to_owned(),
+        }
+        .into());
     }
     let projected = ObjectId::from_hex(&info.projected).map_err(|e| CheckoutError::Protocol {
         url: marker.url.clone(),
@@ -175,7 +139,7 @@ pub fn refresh_branch(
             info.projected
         ),
     })?;
-    let fetched = crate::refs::resolve_ref(repo.git_dir(), &upstream_ref(name)).ok();
+    let fetched = crate::refs::resolve_ref(repo.git_dir(), upstream_ref(name)).ok();
     if fetched != Some(projected) {
         return Err(CheckoutError::BranchMoved {
             name: name.to_owned(),
@@ -183,7 +147,8 @@ pub fn refresh_branch(
             got: fetched
                 .map(|g| g.to_hex())
                 .unwrap_or_else(|| "nothing".to_owned()),
-        });
+        }
+        .into());
     }
     let refname = format!("refs/heads/{name}");
     let gave_change_ids = if check {
@@ -222,7 +187,7 @@ pub fn refresh_branch(
                 &format!("branch: Created from {}", upstream_label(name)),
             )?;
             if created == Swap::Moved {
-                return Err(CheckoutError::RefKeptMoving { refname });
+                return Err(CheckoutError::RefKeptMoving { refname }.into());
             }
         }
         return Ok(BranchRefresh {
@@ -257,7 +222,7 @@ pub fn refresh_branch(
                 &message,
             )?;
             if moved == Swap::Moved {
-                return Err(CheckoutError::RefKeptMoving { refname });
+                return Err(CheckoutError::RefKeptMoving { refname }.into());
             }
             return Ok(done(
                 Some(tip),
@@ -290,7 +255,7 @@ pub fn refresh_branch(
                 hooks: crate::hooks::PostOperationHooks::Run,
             },
             &mut crate::progress::NullProgress,
-            &NeverCancel,
+            &CancelToken::never(),
         )?;
         switched = true;
     }
@@ -310,7 +275,7 @@ pub fn refresh_branch(
         },
         ..Default::default()
     };
-    let pulled = pull(repo, &options, &mut NoProgress, &NeverCancel, None);
+    let pulled = pull(repo, &options, &mut NoProgress, &CancelToken::never(), None);
     // A rebase that failed or refused changed nothing, so HEAD goes back
     // where it was, as if the branch had never been switched to.
     let nothing_done = match &pulled {
@@ -328,10 +293,11 @@ pub fn refresh_branch(
         Err(failed) if switched => {
             return Err(CheckoutError::StillSwitched {
                 branch: name.to_owned(),
-                failed: Box::new(failed.into()),
-            })
+                failed: crate::error::ErrorSummary::from(failed),
+            }
+            .into())
         }
-        Err(failed) => return Err(failed.into()),
+        Err(failed) => return Err(failed),
     };
     let after = pulled.oid.unwrap_or(tip);
     // A rebase pull never merges, refuses or adopts an upstream; those are
@@ -385,7 +351,7 @@ fn switch_back(repo: &Repository, head: &HeadState) -> bool {
         repo,
         &options,
         &mut crate::progress::NullProgress,
-        &NeverCancel,
+        &CancelToken::never(),
     )
     .is_ok()
 }
@@ -397,7 +363,7 @@ fn upstream_label(name: &str) -> String {
 
 /// Refuse to move `name` when another worktree has it checked out.
 fn ensure_not_checked_out_elsewhere(repo: &Repository, name: &str) -> Result<()> {
-    Ok(crate::worktree::ensure_branch_not_checked_out_in_any_worktree(repo, name)?)
+    crate::worktree::ensure_branch_not_checked_out_in_any_worktree(repo, name)
 }
 
 /// Which of the commits of `tip` are the branch's own against `projected`
@@ -431,7 +397,8 @@ fn own_commits(
         (None, None) => {
             return Err(CheckoutError::UnrelatedBranch {
                 name: name.to_owned(),
-            })
+            }
+            .into())
         }
     };
     // The server's commits above the snapshots, by change key, and by patch
@@ -484,9 +451,10 @@ fn own_commits(
 mod tests {
     use super::*;
     use crate::objects::{serialize_commit, ObjectKind};
+    use crate::porcelain::branch_error::BranchError;
     use crate::snapshot_checkout::testing::*;
     use crate::snapshot_checkout::{
-        branches_with_work, fetch_branch, project_branch, refresh, CheckoutStore,
+        branches_with_work, fetch_branch, project::project_branch, refresh, CheckoutStore,
     };
     use std::path::Path;
 
@@ -503,7 +471,7 @@ mod tests {
             &info,
             FetchOptions::default(),
             &mut NoProgress,
-            &NeverCancel,
+            &CancelToken::never(),
             None,
         )
         .expect("fetch");
@@ -627,7 +595,7 @@ mod tests {
             &newer,
             &options,
             &mut NoProgress,
-            &NeverCancel,
+            &CancelToken::never(),
             None,
         )
         .expect("refresh");
@@ -701,11 +669,13 @@ mod tests {
         assert!(co.join(".git/rebase-merge/grit-plan").is_file());
         assert!(matches!(
             refresh_branch(&repo, &marker(&repo), &info, false),
-            Err(CheckoutError::OperationInProgress(_))
+            Err(crate::error::Error::Remote(
+                crate::remote::RemoteError::Snapshot(CheckoutError::OperationInProgress(_))
+            ))
         ));
         assert_eq!(stopped.tip, stopped.previous.expect("previous"));
         let identity = "T <t@example.com> 0 +0000".parse().expect("signature");
-        crate::revwalk::history::abort_rebase(&repo, &identity).expect("abort");
+        repo.history().abort_rebase(&identity).expect("abort");
         assert_eq!(git(&co, &["rev-parse", "feature"]), stopped.tip.to_hex());
         assert_eq!(git(&co, &["log", "-1", "--format=%s", "feature"]), "Mine");
     }
@@ -762,8 +732,8 @@ mod tests {
         assert!(
             matches!(
                 &refused,
-                Err(CheckoutError::Library(e))
-                    if matches!(**e, crate::error::Error::BranchCheckedOutInWorktree { .. })
+                Err(e)
+                    if matches!(e, crate::error::Error::Branch(BranchError::CheckedOut { .. }))
             ),
             "{refused:?}"
         );
@@ -808,14 +778,18 @@ mod tests {
         let info = fetched(&served, &repo, "lone");
         assert!(matches!(
             refresh_branch(&repo, &marker(&repo), &info, false),
-            Err(CheckoutError::UnrelatedBranch { .. })
+            Err(crate::error::Error::Remote(
+                crate::remote::RemoteError::Snapshot(CheckoutError::UnrelatedBranch { .. })
+            ))
         ));
         // Nor is a projection that isn't here.
         let mut stale = info.clone();
         stale.projected = "1".repeat(40);
         assert!(matches!(
             refresh_branch(&repo, &marker(&repo), &stale, false),
-            Err(CheckoutError::BranchMoved { .. })
+            Err(crate::error::Error::Remote(
+                crate::remote::RemoteError::Snapshot(CheckoutError::BranchMoved { .. })
+            ))
         ));
     }
 
@@ -841,10 +815,7 @@ mod tests {
         let info = fetched(&served, &repo, "feature");
 
         let refused = refresh_branch(&repo, &marker(&repo), &info, false);
-        assert!(
-            matches!(refused, Err(CheckoutError::Pull(_))),
-            "{refused:?}"
-        );
+        assert!(matches!(refused, Err(_)), "{refused:?}");
         assert_eq!(git(&co, &["symbolic-ref", "--short", "HEAD"]), "work");
         assert_eq!(git(&co, &["rev-parse", "feature~1"]), before, "not rebased");
         assert_eq!(git(&co, &["log", "-1", "--format=%s", "feature"]), "Add c");

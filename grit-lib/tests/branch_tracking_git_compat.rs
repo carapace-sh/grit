@@ -4,6 +4,7 @@ use std::process::Command;
 
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::refs::branch_tracking::{Standing, TipComparison};
+use grit_lib::refs::store::RefNameRef;
 use grit_lib::repo::Repository;
 use tempfile::TempDir;
 
@@ -73,8 +74,8 @@ fn t6040_branch_tracking_ahead_behind_matches_git() {
         .unwrap();
 
     let repo = Repository::discover(Some(dir.path()), &RepositoryOptions::empty()).expect("open");
-    let topic = repo.refs().resolve("refs/heads/topic").expect("topic");
-    let main = repo.refs().resolve("refs/heads/main").expect("main");
+    let topic = repo.ref_store().resolve("refs/heads/topic").expect("topic");
+    let main = repo.ref_store().resolve("refs/heads/main").expect("main");
     let comparison = TipComparison::compute(&repo, topic, main, 1).expect("compare");
     let (git_left, git_right) = git_ahead_behind(dir.path(), "main", "topic");
     // The comparison reports how `topic` differs from `main`; git `main...topic` uses

@@ -10,21 +10,25 @@ use std::fs;
 use std::path::Path;
 
 use grit_lib::config::environment::RepositoryOptions;
+use grit_lib::merge::IntegrateBranchOutcome;
+use grit_lib::merge::{ReplayOptions, ReplaySequenceRequest, SequenceOutcome};
 use grit_lib::objects::ObjectId;
 use grit_lib::operation::{Conflict, ConflictKind};
-use grit_lib::porcelain::merge::{integrate_branch, IntegrateBranchOutcome};
 use grit_lib::porcelain::replay::ReplayDirection;
 use grit_lib::porcelain::replay_sequence::{
     start_replay_sequence, ReplayOptions, ReplaySequenceRequest, SequenceOutcome,
 };
-use grit_lib::porcelain::status::{status, StatusOptions};
-use grit_lib::progress::{NeverCancel, NullProgress};
+use grit_lib::porcelain::status::StatusOptions;
+use grit_lib::progress::CancelToken;
+use grit_lib::progress::NullProgress;
 use grit_lib::repo::Repository;
 use grit_lib::revwalk::history::{
-    start_rebase, ApplyOptions, EmptyPolicy, RebaseOntoOptions, RebaseOutcome, RebaseRequest,
-    RefScope, RewriteOptions, StartRebaseOptions,
+    ApplyOptions, EmptyPolicy, RebaseOntoOptions, RebaseOutcome, RebaseRequest, RefScope,
+    RewriteOptions, StartRebaseOptions,
 };
 use grit_test_support::git;
+use grit_test_support::integrate_branch;
+use grit_test_support::start_replay_sequence;
 
 const IDENT: &str = "Test User <t@example.com> 1700000000 +0000";
 
@@ -70,14 +74,14 @@ fn open(root: &Path) -> Repository {
 }
 
 fn status_conflicts(repo: &Repository) -> Vec<Conflict> {
-    status(
-        repo,
-        &StatusOptions::default(),
-        &mut NullProgress,
-        &NeverCancel,
-    )
-    .expect("status")
-    .conflict_details
+    repo.status()
+        .run(
+            &StatusOptions::default(),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("status")
+        .conflict_details
 }
 
 fn deleted_by_us() -> Vec<Conflict> {
@@ -106,6 +110,7 @@ fn rebase_stop_and_status_report_the_same_conflict() {
             branch_tip: fx.feat,
         },
         rebase: RebaseOntoOptions {
+            pre_rebase: grit_lib::revwalk::history::PreRebase::Skip,
             rewrite: RewriteOptions {
                 scope: RefScope::Head,
                 empty: EmptyPolicy::Drop,
@@ -122,16 +127,23 @@ fn rebase_stop_and_status_report_the_same_conflict() {
             identity: IDENT.parse().expect("identity"),
             reflog_message: "rebase".into(),
             record_operation: None,
-            hooks: grit_lib::PostOperationHooks::Run,
+            hooks: grit_lib::command_runner::hooks::PostOperationHooks::Run,
         },
-        pre_rebase: grit_lib::revwalk::history::PreRebase::Skip,
+        exec: None,
     };
-    let RebaseOutcome::Stopped(stop) =
-        start_rebase(&repo, &opts, &mut NullProgress, &NeverCancel).expect("rebase")
+    let RebaseOutcome::Stopped(stop) = repo
+        .history()
+        .start_rebase(
+            &opts,
+            repo.command_runner().as_ref(),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("rebase")
     else {
         panic!("expected the rebase to stop on f");
     };
-    assert_one_model(&fx.root, &stop.conflicts);
+    assert_one_model(fx.root, &stop.conflicts);
 }
 
 #[test]
@@ -145,12 +157,12 @@ fn merge_conflicts_and_status_report_the_same_conflict() {
         fx.feat,
         "feat",
         &mut NullProgress,
-        &NeverCancel,
+        &CancelToken::never(),
     )
     .expect("merge") else {
         panic!("expected merge conflicts");
     };
-    assert_one_model(&fx.root, &details);
+    assert_one_model(fx.root, &details);
 }
 
 #[test]
@@ -164,11 +176,11 @@ fn pick_conflicts_and_status_report_the_same_conflict() {
         options: ReplayOptions::default(),
     };
     let SequenceOutcome::Conflicts { conflicts, .. } =
-        start_replay_sequence(&repo, &req, &mut NullProgress, &NeverCancel).expect("pick")
+        start_replay_sequence(&repo, &req, &mut NullProgress, &CancelToken::never()).expect("pick")
     else {
         panic!("expected the pick to stop on f");
     };
-    assert_one_model(&fx.root, &conflicts);
+    assert_one_model(fx.root, &conflicts);
 }
 
 #[test]

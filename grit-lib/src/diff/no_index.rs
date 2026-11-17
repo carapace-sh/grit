@@ -1,5 +1,6 @@
 //! Compare arbitrary filesystem paths without a repository (`git diff --no-index`).
 
+use crate::error::ObjectError;
 use std::collections::{BTreeSet, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -17,7 +18,7 @@ use super::core::{
     apply_rename_detection_to_diff_entries, mode_from_metadata, read_worktree_bytes_for_mode,
     zero_oid, DiffEntry, DiffStatus,
 };
-use super::detail::line_change_counts;
+use super::detail::line_stat_for_options;
 use super::options::DiffOptions;
 use super::patch_log::{write_patch, PatchTextOptions};
 use super::structured::{structured_file_diff, SideBytes};
@@ -44,7 +45,7 @@ pub enum NoIndexError {
 
 impl From<NoIndexError> for crate::error::Error {
     fn from(value: NoIndexError) -> Self {
-        Self::Message(value.to_string())
+        Self::Diff(crate::error::DiffError::NoIndex(value))
     }
 }
 
@@ -93,11 +94,12 @@ pub fn write_paths_patch<W: std::io::Write>(
     let temp = tempfile::tempdir().map_err(|e| NoIndexError::PathNotAccessible {
         path: e.to_string(),
     })?;
-    let repo = Repository::init(temp.path(), &InitOptions::new().with_bare(true)).map_err(|e| {
-        NoIndexError::PathNotAccessible {
-            path: e.to_string(),
-        }
-    })?;
+    let (repo, _) =
+        Repository::init(temp.path(), &InitOptions::new().with_bare(true)).map_err(|e| {
+            NoIndexError::PathNotAccessible {
+                path: e.to_string(),
+            }
+        })?;
     let entries = no_index_prepared_entries(a, b, opts, repo.odb())?;
     if entries.is_empty() {
         return Ok(false);
@@ -185,7 +187,7 @@ fn file_diff_from_entry(
     } else if stat_only {
         let old_text = String::from_utf8_lossy(&old_bytes.data);
         let new_text = String::from_utf8_lossy(&new_bytes.data);
-        let stat = line_change_counts(old_text.as_ref(), new_text.as_ref(), &opts);
+        let stat = line_stat_for_options(old_text.as_ref(), new_text.as_ref(), &opts);
         (
             old_bytes.encoding_lossy,
             new_bytes.encoding_lossy,
@@ -211,6 +213,8 @@ fn file_diff_from_entry(
         old_oid: entry.old_oid,
         new_oid: entry.new_oid,
         binary,
+        old_size: old_bytes.byte_len(),
+        new_size: new_bytes.byte_len(),
         content_changed: entry.old_oid != entry.new_oid,
         old_encoding_lossy,
         new_encoding_lossy,
@@ -288,7 +292,9 @@ fn hash_side_at_path(path: &str, mode: FileMode) -> Result<ObjectId, NoIndexErro
 
 fn hash_blob(data: &[u8]) -> Result<ObjectId, NoIndexError> {
     hash_object(HashAlgo::Sha1, ObjectKind::Blob, data).map_err(|e| match e {
-        crate::error::Error::HashCollision { .. } => NoIndexError::HashCollision,
+        crate::error::Error::Object(ObjectError::HashCollision { .. }) => {
+            NoIndexError::HashCollision
+        }
         other => panic!("unexpected error hashing no-index blob: {other}"),
     })
 }

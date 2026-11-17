@@ -15,22 +15,24 @@ use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::error::{Error, RemoteUnreadableReason};
 use grit_lib::objects::ObjectId;
 use grit_lib::porcelain::pull::PullError;
-use grit_lib::progress::NeverCancel;
+use grit_lib::prelude::Environment;
+use grit_lib::progress::CancelToken;
 use grit_lib::remote::clone::{clone, CloneError, CloneOptions};
-use grit_lib::remote::fetch::NoProgress;
 use grit_lib::remote::transfer::{FetchOptions, PushOptions, PushRefSpec};
 use grit_lib::remote::{HttpClientFactory, ListRefsOptions, Remote, RemoteError};
 use grit_lib::repo::{InitOptions, Repository};
 
 fn unreadable_reason(err: &RemoteError) -> &RemoteUnreadableReason {
     match err {
-        RemoteError::Library(Error::RemoteUnreadable { reason, .. }) => reason,
+        RemoteError::Unreadable { reason, .. } => reason,
         other => panic!("expected RemoteUnreadable, got {other:?}"),
     }
 }
 
 fn init_repo(dir: &Path) -> Repository {
-    Repository::init(dir, &InitOptions::default()).expect("init")
+    Repository::init(dir, &InitOptions::default())
+        .expect("init")
+        .0
 }
 
 /// Port with nothing listening (bound, then released).
@@ -82,7 +84,7 @@ fn http_factory() -> Option<&'static dyn HttpClientFactory> {
     None
 }
 
-fn list_refs(url: &str) -> Result<usize, RemoteError> {
+fn list_refs(url: &str) -> grit_lib::error::Result<usize> {
     let remote = Remote::from_url(url).expect("parse url");
     remote
         .list_refs(None, &ListRefsOptions::default(), http_factory())
@@ -161,7 +163,7 @@ fn list_refs_over_refused_http_port_is_transport_failure() {
         "{err:?}"
     );
     match &err {
-        RemoteError::Library(Error::RemoteUnreadable { url: Some(u), .. }) => {
+        RemoteError::Unreadable { url: Some(u), .. } => {
             assert!(u.starts_with(&url), "url {u} should name {url}");
         }
         other => panic!("expected a url, got {other:?}"),
@@ -237,7 +239,7 @@ fn fetch_from_missing_local_path_is_remote_unreadable() {
             &repo,
             FetchOptions::default(),
             &mut NoProgress,
-            &NeverCancel,
+            &CancelToken::never(),
             None,
         )
         .expect_err("fetch from missing path must fail");
@@ -259,7 +261,7 @@ fn fetch_over_refused_http_port_is_remote_unreadable() {
             &repo,
             FetchOptions::default(),
             &mut NoProgress,
-            &NeverCancel,
+            &CancelToken::never(),
             http_factory(),
         )
         .expect_err("refused connection must fail");
@@ -286,7 +288,7 @@ fn push_to_missing_local_path_is_remote_unreadable() {
             &[spec],
             PushOptions::default(),
             &mut NoProgress,
-            &NeverCancel,
+            &CancelToken::never(),
             None,
         )
         .expect_err("push to missing path must fail");
@@ -315,7 +317,7 @@ fn push_over_refused_http_port_is_remote_unreadable() {
             &[spec],
             PushOptions::default(),
             &mut NoProgress,
-            &NeverCancel,
+            &CancelToken::never(),
             http_factory(),
         )
         .expect_err("refused connection must fail");
@@ -332,12 +334,96 @@ fn clone_of_missing_local_path_is_remote_unreadable() {
             tmp.path().join("dest"),
         ),
         &mut NoProgress,
-        &NeverCancel,
+        &CancelToken::never(),
         None,
     )
     .expect_err("clone of missing path must fail");
     assert!(err.is_remote_unreadable(), "{err:?}");
     assert!(err.should_cleanup_failed_clone());
+}
+
+fn clone_env_in(cwd: &Path) -> Environment {
+    let mut env = Environment::empty();
+    env.cwd = cwd.to_path_buf();
+    env
+}
+
+#[test]
+fn clone_missing_relative_parent_path_uses_logical_absolute_url_in_error() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let work = tmp.path().join("w");
+    let sub = work.join("sub");
+    std::fs::create_dir_all(&sub).expect("mkdir sub");
+    let mut env = clone_env_in(&sub);
+    env.pwd = Some(sub.to_string_lossy().into_owned());
+    let mut opts = CloneOptions::new("../nonexist2".into(), sub.join("dest"));
+    opts.environment = env;
+    let err = clone(
+        opts,
+        &mut grit_lib::remote::fetch::NoProgress,
+        &CancelToken::never(),
+        None,
+    )
+    .expect_err("clone of missing relative path");
+    let msg = err.to_string();
+    let expected = format!("'{}/../nonexist2'", sub.display());
+    assert!(
+        msg.contains(&expected),
+        "error should quote logical absolute path, got: {msg}"
+    );
+}
+
+#[test]
+fn clone_missing_relative_source_with_dest_basename_is_remote_unreadable() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let work = tmp.path().join("work");
+    std::fs::create_dir_all(&work).expect("mkdir work");
+    let source = "typo-repo";
+    let dest = work.join(source);
+    let mut opts = CloneOptions::new(source.to_owned(), dest.clone());
+    opts.environment = clone_env_in(&work);
+    let err = clone(opts, &mut NoProgress, &CancelToken::never(), None)
+        .expect_err("clone must fail before creating the destination");
+    assert!(err.is_remote_unreadable(), "{err:?}");
+    assert!(
+        !dest.exists(),
+        "destination must not be created when the source path is missing"
+    );
+}
+
+#[test]
+fn clone_existing_empty_dir_matching_source_is_remote_unreadable() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let work = tmp.path().join("work");
+    std::fs::create_dir_all(&work).expect("mkdir work");
+    let source = "typo-repo";
+    let dest = work.join(source);
+    std::fs::create_dir(&dest).expect("empty dir at clone destination");
+    let mut opts = CloneOptions::new(source.to_owned(), dest.clone());
+    opts.environment = clone_env_in(&work);
+    let err = clone(opts, &mut NoProgress, &CancelToken::never(), None)
+        .expect_err("clone must fail when source path is an empty directory");
+    assert!(err.is_remote_unreadable(), "{err:?}");
+    assert!(
+        dest.read_dir().expect("read dir").next().is_none(),
+        "empty destination must stay empty (no .git)"
+    );
+}
+
+#[test]
+fn clone_missing_file_url_before_dest_is_remote_unreadable() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let work = tmp.path().join("work");
+    std::fs::create_dir_all(&work).expect("mkdir work");
+    let missing = work.join("missing.git");
+    let url = format!("file://{}", missing.display());
+    let dest = work.join("dest");
+    let mut opts = CloneOptions::new(url, dest.clone());
+    opts.environment = clone_env_in(&work);
+    let err = clone(opts, &mut NoProgress, &CancelToken::never(), None)
+        .expect_err("file:// clone of missing path must fail");
+    assert!(err.is_remote_unreadable(), "{err:?}");
+    assert!(!dest.exists());
 }
 
 #[cfg(feature = "http-ureq")]
@@ -348,7 +434,7 @@ fn clone_over_refused_http_port_is_remote_unreadable() {
     let err = clone(
         CloneOptions::new(url, tmp.path().join("dest")),
         &mut NoProgress,
-        &NeverCancel,
+        &CancelToken::never(),
         http_factory(),
     )
     .expect_err("refused connection must fail");
@@ -386,23 +472,23 @@ fn wrapper_helpers_classify_only_remote_unreadable() {
         )
     };
     assert!(unreadable().is_remote_unreadable());
-    assert!(!Error::NothingToCommit.is_remote_unreadable());
+    assert!(!CommitError::NothingToCommit.is_remote_unreadable());
 
-    assert!(RemoteError::Library(unreadable()).is_remote_unreadable());
+    assert!(RemoteError::from(unreadable()).is_remote_unreadable());
     assert!(!RemoteError::NoUrl { remote: None }.is_remote_unreadable());
-    assert!(!RemoteError::Library(Error::Auth {
+    assert!(!RemoteError::Auth {
         url: "https://example.com/r.git".into(),
         reason: grit_lib::error::AuthFailure::Rejected,
-    })
+    }
     .is_remote_unreadable());
 
-    assert!(CloneError::Library(unreadable()).is_remote_unreadable());
-    assert!(CloneError::Remote(RemoteError::Library(unreadable())).is_remote_unreadable());
+    assert!(CloneError::Nested(Box::new(unreadable())).is_remote_unreadable());
+    assert!(CloneError::Remote(RemoteError::from(unreadable())).is_remote_unreadable());
     assert!(!CloneError::InvalidCloneDepth.is_remote_unreadable());
-    assert!(!CloneError::RemoteRefNotFound("x".into()).is_remote_unreadable());
+    assert!(!CloneError::RemoteRefNotFound { name: "x".into() }.is_remote_unreadable());
 
-    assert!(PullError::Remote(RemoteError::Library(unreadable())).is_remote_unreadable());
-    assert!(PullError::Repository(unreadable()).is_remote_unreadable());
+    assert!(PullError::Remote(RemoteError::from(unreadable())).is_remote_unreadable());
+    assert!(PullError::Nested(Box::new(unreadable())).is_remote_unreadable());
     assert!(!PullError::DetachedHead.is_remote_unreadable());
 }
 
@@ -447,10 +533,10 @@ fn messages_and_slugs_per_reason() {
             message
         );
     }
-    let without_url = Error::RemoteUnreadable {
+    let without_url = Error::Remote(RemoteError::Unreadable {
         url: None,
         reason: RemoteUnreadableReason::NoHandshake,
-    };
+    });
     assert_eq!(
         without_url.to_string(),
         "could not read from the remote: no Git protocol response"
@@ -547,7 +633,7 @@ fn linked_worktree_checkout_is_a_readable_local_remote() {
     let outcome = clone(
         CloneOptions::new(wt.to_str().expect("utf8").to_owned(), dest.clone()),
         &mut NoProgress,
-        &NeverCancel,
+        &CancelToken::never(),
         None,
     )
     .expect("clone from a linked worktree");
@@ -579,7 +665,7 @@ fn linked_worktree_checkout_is_a_readable_local_remote() {
             &[spec],
             PushOptions::default(),
             &mut NoProgress,
-            &NeverCancel,
+            &CancelToken::never(),
             None,
         )
         .expect("push into a linked worktree's repository");
@@ -598,7 +684,7 @@ fn linked_worktree_checkout_is_a_readable_local_remote() {
             &repo,
             FetchOptions::default(),
             &mut NoProgress,
-            &NeverCancel,
+            &CancelToken::never(),
             None,
         )
         .expect("fetch from a linked worktree");
@@ -666,7 +752,7 @@ fn git_daemon_without_advertisement_is_no_handshake() {
             &[spec],
             PushOptions::default(),
             &mut NoProgress,
-            &NeverCancel,
+            &CancelToken::never(),
             None,
         )
         .expect_err("push to a silent git:// peer must fail");
@@ -676,7 +762,7 @@ fn git_daemon_without_advertisement_is_no_handshake() {
             &repo,
             FetchOptions::default(),
             &mut NoProgress,
-            &NeverCancel,
+            &CancelToken::never(),
             None,
         )
         .expect_err("fetch from a silent git:// peer must fail");

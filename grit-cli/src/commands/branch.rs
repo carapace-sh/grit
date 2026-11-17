@@ -2,39 +2,28 @@
 
 use anyhow::{bail, Context, Error as AnyhowError, Result};
 use grit_lib::error::Error;
+use grit_lib::error::ObjectError;
+use grit_lib::error::RevisionError;
 use grit_lib::porcelain::branch::{
-    create_branch, delete_branch, preview_unset_upstream, rename_branch, set_upstream,
-    unset_upstream, validate_set_upstream, CreateBranchOptions, DeleteMode, RenameBranchOptions,
-    StartPoint, TrackMode,
+    BranchCreateOptions, BranchDeleteMode, BranchDeleteOptions, BranchRenameOptions, StartPoint,
+    TrackMode,
 };
-use grit_lib::refs::branch_tracking::{
-    list_branches, upstream_branch, BranchDetail, BranchListQuery, BranchScope, BranchSummary,
-};
+use grit_lib::refs::branch_tracking::{BranchDetail, BranchListQuery, BranchScope, BranchSummary};
 use grit_lib::refs::listing::{RefQuery, RefSort, SortKey};
 use grit_lib::repo::Repository;
-use grit_lib::revwalk::rev_parse::resolve_revision;
+use grit_lib::revwalk::ResolveOptions;
+
 use grit_lib::revwalk::rev_parse_error::RevParseError;
-use grit_lib::state::{
-    operation_blocking_switch, resolve_head, resolve_head_for_repository, wt_status_get_state,
-    HeadState, InProgressOperation,
-};
-use schemars::JsonSchema;
-use serde::Serialize;
+use grit_lib::state::{HeadState, InProgressOperation};
 use std::error::Error as StdError;
 use std::fmt;
-use std::io::Write;
 use time::format_description::well_known::Rfc3339;
 
 use crate::branch_list_args::BranchListArgs;
 use crate::context;
 use crate::error_kind::ErrorKind;
 use crate::json_error::{self, StructuredCliError, StructuredJsonError};
-use crate::markdown;
-use crate::output::{outln, HumanRender, MarkdownRender, RenderContext};
-
-fn is_false(value: &bool) -> bool {
-    !*value
-}
+pub use crate::render::branch::{BranchEntry, BranchListScope, BranchOutcome, BranchUpstreamEntry};
 
 /// Parsed flags for a single `grit branch` invocation.
 pub struct BranchRunOptions {
@@ -61,295 +50,6 @@ pub struct BranchRunOptions {
     pub list: BranchListArgs,
     pub list_full_detail: bool,
     pub dry_run: bool,
-}
-
-/// Which branches were listed (human / markdown empty-state text only).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BranchListScope {
-    Local,
-    Remote,
-    All,
-}
-
-pub(crate) fn empty_list_message(scope: BranchListScope) -> &'static str {
-    match scope {
-        BranchListScope::Local => "No branches yet.",
-        BranchListScope::Remote => "No remote-tracking branches.",
-        BranchListScope::All => "No branches.",
-    }
-}
-
-/// Result of `grit branch`, tagged by `action`.
-#[derive(Serialize, JsonSchema)]
-#[serde(tag = "action", rename_all = "snake_case")]
-pub enum BranchOutcome {
-    List {
-        /// The current branch, or `null` when detached / unborn.
-        current: Option<String>,
-        branches: Vec<BranchEntry>,
-        /// True when more branches matched than returned (`-n` / `--limit`).
-        #[serde(default, skip_serializing_if = "is_false")]
-        #[schemars(default)]
-        truncated: bool,
-        #[serde(skip)]
-        #[schemars(skip)]
-        scope: BranchListScope,
-        #[serde(skip)]
-        #[schemars(skip)]
-        show_current: bool,
-    },
-    Create {
-        name: String,
-        oid: String,
-        short_oid: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        #[schemars(skip_serializing_if = "Option::is_none")]
-        upstream: Option<String>,
-        #[serde(default, skip_serializing_if = "is_false")]
-        #[schemars(default)]
-        dry_run: bool,
-    },
-    Delete {
-        name: String,
-        oid: String,
-        short_oid: String,
-        #[serde(default, skip_serializing_if = "is_false")]
-        #[schemars(default)]
-        dry_run: bool,
-    },
-    Rename {
-        old: String,
-        new: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        #[schemars(skip_serializing_if = "Option::is_none")]
-        oid: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        #[schemars(skip_serializing_if = "Option::is_none")]
-        short_oid: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        #[schemars(skip_serializing_if = "Option::is_none")]
-        replaced: Option<String>,
-        #[serde(default, skip_serializing_if = "is_false")]
-        #[schemars(default)]
-        dry_run: bool,
-    },
-    SetUpstream {
-        branch: String,
-        upstream: String,
-        #[serde(default, skip_serializing_if = "is_false")]
-        #[schemars(default)]
-        dry_run: bool,
-    },
-    UnsetUpstream {
-        branch: String,
-        #[serde(default, skip_serializing_if = "is_false")]
-        #[schemars(default)]
-        dry_run: bool,
-    },
-}
-
-/// Configured upstream for a local branch in a `list` outcome.
-#[derive(Serialize, JsonSchema)]
-pub struct BranchUpstreamEntry {
-    #[serde(rename = "ref")]
-    pub ref_name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schemars(skip_serializing_if = "Option::is_none")]
-    pub remote: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schemars(skip_serializing_if = "Option::is_none")]
-    pub ahead: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schemars(skip_serializing_if = "Option::is_none")]
-    pub behind: Option<usize>,
-    #[serde(default, skip_serializing_if = "is_false")]
-    #[schemars(default)]
-    pub gone: bool,
-}
-
-/// One branch in a `list` outcome.
-#[derive(Serialize, JsonSchema)]
-pub struct BranchEntry {
-    pub name: String,
-    pub current: bool,
-    #[serde(default, skip_serializing_if = "is_false")]
-    #[schemars(default)]
-    pub is_remote: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schemars(skip_serializing_if = "Option::is_none")]
-    pub full_ref: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schemars(skip_serializing_if = "Option::is_none")]
-    pub remote: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schemars(skip_serializing_if = "Option::is_none")]
-    pub oid: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schemars(skip_serializing_if = "Option::is_none")]
-    pub short_oid: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schemars(skip_serializing_if = "Option::is_none")]
-    pub subject: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schemars(skip_serializing_if = "Option::is_none")]
-    pub date: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schemars(skip_serializing_if = "Option::is_none")]
-    pub upstream: Option<BranchUpstreamEntry>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schemars(skip_serializing_if = "Option::is_none")]
-    pub worktree: Option<String>,
-}
-
-impl HumanRender for BranchOutcome {
-    fn render_human(&self, w: &mut dyn Write, _ctx: &RenderContext) -> Result<()> {
-        match self {
-            BranchOutcome::List {
-                branches,
-                scope,
-                show_current,
-                current,
-                ..
-            } => {
-                if *show_current {
-                    if let Some(name) = current {
-                        outln!(w, "{name}");
-                    }
-                    return Ok(());
-                }
-                if branches.is_empty() {
-                    outln!(w, "{}", empty_list_message(*scope));
-                    return Ok(());
-                }
-                for branch in branches {
-                    let marker = branch
-                        .upstream
-                        .as_ref()
-                        .map(format_upstream_marker)
-                        .unwrap_or_default();
-                    let prefix = if branch.current { "* " } else { "  " };
-                    if marker.is_empty() {
-                        outln!(w, "{prefix}{}", branch.name);
-                    } else {
-                        outln!(w, "{prefix}{} {marker}", branch.name);
-                    }
-                }
-            }
-            BranchOutcome::Create {
-                name,
-                short_oid,
-                upstream,
-                dry_run,
-                ..
-            } => {
-                if *dry_run {
-                    outln!(w, "Would create branch {name} at {short_oid}");
-                } else {
-                    outln!(w, "Created branch {name} at {short_oid}");
-                }
-                if let Some(up) = upstream {
-                    outln!(w, "  tracking {up}");
-                }
-            }
-            BranchOutcome::Delete {
-                name,
-                short_oid,
-                dry_run,
-                ..
-            } => {
-                if *dry_run {
-                    outln!(w, "Would delete branch {name} (was {short_oid}).");
-                } else {
-                    outln!(w, "Deleted branch {name} (was {short_oid}).");
-                }
-            }
-            BranchOutcome::Rename {
-                old, new, dry_run, ..
-            } => {
-                if *dry_run {
-                    outln!(w, "Would rename branch {old} to {new}");
-                } else {
-                    outln!(w, "Renamed branch {old} to {new}");
-                }
-            }
-            BranchOutcome::SetUpstream {
-                branch,
-                upstream,
-                dry_run,
-            } => {
-                if *dry_run {
-                    outln!(w, "Would set upstream of {branch} to {upstream}");
-                } else {
-                    outln!(w, "Set upstream of {branch} to {upstream}");
-                }
-            }
-            BranchOutcome::UnsetUpstream { branch, dry_run } => {
-                if *dry_run {
-                    outln!(w, "Would unset upstream of {branch}");
-                } else {
-                    outln!(w, "Unset upstream of {branch}");
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
-impl MarkdownRender for BranchOutcome {
-    fn render_markdown(&self, w: &mut dyn Write, _ctx: &RenderContext) -> Result<()> {
-        match self {
-            BranchOutcome::List {
-                branches, scope, ..
-            } => {
-                markdown::print_branch_list(w, branches, *scope)?;
-            }
-            BranchOutcome::Create {
-                name,
-                short_oid,
-                upstream,
-                dry_run,
-                ..
-            } => {
-                let verb = if *dry_run { "Would create" } else { "Created" };
-                if let Some(up) = upstream {
-                    outln!(
-                        w,
-                        "{verb} branch `{name}` at `{short_oid}` (tracking `{up}`)."
-                    );
-                } else {
-                    outln!(w, "{verb} branch `{name}` at `{short_oid}`.");
-                }
-            }
-            BranchOutcome::Delete {
-                name,
-                short_oid,
-                dry_run,
-                ..
-            } => {
-                let verb = if *dry_run { "Would delete" } else { "Deleted" };
-                outln!(w, "{verb} branch `{name}` (was `{short_oid}`).");
-            }
-            BranchOutcome::Rename {
-                old, new, dry_run, ..
-            } => {
-                let verb = if *dry_run { "Would rename" } else { "Renamed" };
-                outln!(w, "{verb} branch `{old}` to `{new}`.");
-            }
-            BranchOutcome::SetUpstream {
-                branch,
-                upstream,
-                dry_run,
-            } => {
-                let verb = if *dry_run { "Would set" } else { "Set" };
-                outln!(w, "{verb} upstream of `{branch}` to `{upstream}`.");
-            }
-            BranchOutcome::UnsetUpstream { branch, dry_run } => {
-                let verb = if *dry_run { "Would unset" } else { "Unset" };
-                outln!(w, "{verb} upstream of `{branch}`.");
-            }
-        }
-        Ok(())
-    }
 }
 
 /// Usage mistakes specific to `grit branch` (exit code 2).
@@ -498,7 +198,7 @@ fn branch_for_upstream(repo: &Repository, opts: &BranchRunOptions) -> Result<Str
 }
 
 fn current_branch_short(repo: &Repository) -> Result<String> {
-    match resolve_head_for_repository(repo)? {
+    match repo.references().head()? {
         HeadState::Branch { short_name, .. } => Ok(short_name),
         HeadState::Detached { .. } => bail!("HEAD is detached; pass the branch name"),
         HeadState::Invalid => bail!("HEAD is in an unknown state"),
@@ -523,7 +223,7 @@ fn resolve_rename(
                 name.clone()
             } else if let Some(name) = current {
                 name
-            } else if let Some(op) = operation_blocking_switch(repo.git_dir())? {
+            } else if let Some(op) = repo.operation().blocking_switch()? {
                 return Err(json_error::operation_in_progress_for_repo(
                     repo,
                     "rename the branch",
@@ -537,7 +237,7 @@ fn resolve_rename(
         2 => (args[0].clone(), args[1].clone(), force),
         _ => bail!("`--move` expects one or two branch names"),
     };
-    if let Some(op) = operation_blocking_switch(repo.git_dir())? {
+    if let Some(op) = repo.operation().blocking_switch()? {
         if matches!(
             op,
             InProgressOperation::Rebase | InProgressOperation::RebaseInteractive
@@ -554,7 +254,7 @@ fn resolve_rename(
 }
 
 fn rebase_branch_short_name(repo: &Repository) -> Result<Option<String>> {
-    let state = wt_status_get_state(repo.git_dir(), &HeadState::Invalid, false)?;
+    let state = repo.operation().status_state()?;
     Ok(state.rebase_branch)
 }
 
@@ -577,11 +277,14 @@ fn list(repo: &Repository, opts: &BranchRunOptions) -> Result<BranchOutcome> {
         BranchDetail::Names
     };
     let limit = list.limit.get();
-    let rows = list_branches(repo, &query, detail).context("could not list branches")?;
+    let rows = repo
+        .branches()
+        .list(&query, detail)
+        .context("could not list branches")?;
     let limited = grit_lib::list_limit::Limited::from_vec(rows, limit);
     let rows = limited.items;
     let truncated = limited.truncated;
-    let current = match resolve_head_for_repository(repo)? {
+    let current = match repo.references().head()? {
         HeadState::Branch { short_name, .. } => Some(short_name),
         HeadState::Detached { .. } | HeadState::Invalid => None,
     };
@@ -634,7 +337,10 @@ fn resolve_filter_revs(
     let Some(rev) = rev else {
         return Ok(Vec::new());
     };
-    let oid = resolve_revision(repo, rev).map_err(map_branch_error)?;
+    let oid = repo
+        .revwalk()
+        .resolve(rev, &ResolveOptions::default())
+        .map_err(map_branch_error)?;
     Ok(vec![oid])
 }
 
@@ -648,7 +354,7 @@ fn summary_to_entry(row: BranchSummary, full_detail: bool) -> BranchEntry {
         full_ref: None,
         remote: None,
         oid: Some(oid_hex.clone()),
-        short_oid: Some(short_hex(&oid_hex)),
+        short_oid: Some(row.oid.to_short_hex()),
         subject: None,
         date: None,
         upstream: row.upstream.as_ref().map(upstream_to_entry),
@@ -684,18 +390,6 @@ fn remote_name_from_full_ref(full_ref: &str, is_remote: bool) -> Option<String> 
         .map(str::to_owned)
 }
 
-fn format_upstream_marker(up: &BranchUpstreamEntry) -> String {
-    if up.gone {
-        return "[gone]".to_owned();
-    }
-    match (up.ahead, up.behind) {
-        (Some(ahead), Some(behind)) => {
-            format!("[{}: ahead {ahead}, behind {behind}]", up.ref_name)
-        }
-        _ => format!("[{}]", up.ref_name),
-    }
-}
-
 fn track_mode(opts: &BranchRunOptions) -> TrackMode {
     if opts.no_track {
         TrackMode::Never
@@ -709,10 +403,10 @@ fn track_mode(opts: &BranchRunOptions) -> TrackMode {
 fn map_create_start_revision_error(rev: &str, err: Error) -> AnyhowError {
     use grit_lib::porcelain::branch::BranchError;
     match err {
-        Error::RevParse(
+        Error::Revision(RevisionError::Parse(
             RevParseError::InvalidObjectName { .. } | RevParseError::AmbiguousArgument { .. },
-        )
-        | Error::ObjectNotFound(_) => {
+        ))
+        | Error::Object(ObjectError::NotFound { .. }) => {
             map_branch_error(Error::Branch(BranchError::InvalidStartPoint {
                 label: rev.to_owned(),
                 reason: "revision not found".into(),
@@ -729,8 +423,10 @@ fn create(
     opts: &BranchRunOptions,
 ) -> Result<BranchOutcome> {
     let start_point = if let Some(rev) = start {
-        let oid =
-            resolve_revision(repo, rev).map_err(|err| map_create_start_revision_error(rev, err))?;
+        let oid = repo
+            .revwalk()
+            .resolve(rev, &ResolveOptions::default())
+            .map_err(|err| map_create_start_revision_error(rev, err))?;
         Some(StartPoint {
             oid,
             label: rev.to_owned(),
@@ -739,55 +435,26 @@ fn create(
         None
     };
 
-    let create_opts = CreateBranchOptions {
+    let create_opts = BranchCreateOptions {
         name: name.to_owned(),
         start: start_point,
         force: opts.force,
         track: track_mode(opts),
         dry_run: opts.dry_run,
     };
-    let created = create_branch(repo, &create_opts).map_err(map_branch_error)?;
+    let created = repo
+        .branches()
+        .create(&create_opts)
+        .map_err(map_branch_error)?;
     let oid = created.oid.to_hex();
-    let short_oid = short_hex(&oid);
-    let upstream = if opts.dry_run {
-        predicted_upstream(repo, name, &create_opts)?
-    } else {
-        upstream_branch(repo, name).map(|base| base.name)
-    };
+    let short_oid = created.oid.to_short_hex();
     Ok(BranchOutcome::Create {
         name: created.name,
         oid,
         short_oid,
-        upstream,
+        upstream: created.upstream,
         dry_run: opts.dry_run,
     })
-}
-
-fn predicted_upstream(
-    repo: &Repository,
-    name: &str,
-    opts: &CreateBranchOptions,
-) -> Result<Option<String>> {
-    use grit_lib::porcelain::branch::resolve_create_tracking;
-    let (start_oid, label) = match &opts.start {
-        Some(point) => (point.oid, point.label.clone()),
-        None => {
-            let head = resolve_head(repo.git_dir())?;
-            let oid = head.oid().copied().ok_or_else(|| {
-                map_branch_error(Error::Branch(
-                    grit_lib::porcelain::branch::BranchError::NoCommits,
-                ))
-            })?;
-            let label =
-                grit_lib::porcelain::checkout_reflog::branch_create_reflog_source_label(&head);
-            (oid, label)
-        }
-    };
-    let tracking = resolve_create_tracking(repo, name, &label, start_oid, opts.track)
-        .map_err(map_branch_error)?;
-    Ok(tracking.map(|(remote, merge)| {
-        grit_lib::porcelain::branch::upstream_tracking_display(&remote, &merge)
-    }))
 }
 
 fn remove(
@@ -797,13 +464,16 @@ fn remove(
     dry_run: bool,
 ) -> Result<BranchOutcome> {
     let mode = if force_delete {
-        DeleteMode::Force
+        BranchDeleteMode::Force
     } else {
-        DeleteMode::Safe
+        BranchDeleteMode::Safe
     };
-    let deleted = delete_branch(repo, name, mode, dry_run).map_err(map_branch_error)?;
+    let deleted = repo
+        .branches()
+        .delete(name, &BranchDeleteOptions { mode, dry_run })
+        .map_err(map_branch_error)?;
     let oid = deleted.oid.to_hex();
-    let short_oid = short_hex(&oid);
+    let short_oid = deleted.oid.to_short_hex();
     Ok(BranchOutcome::Delete {
         name: deleted.name,
         oid,
@@ -819,30 +489,34 @@ fn rename(
     force: bool,
     dry_run: bool,
 ) -> Result<BranchOutcome> {
-    let outcome = rename_branch(
-        repo,
-        &RenameBranchOptions {
+    let outcome = repo
+        .branches()
+        .rename(&BranchRenameOptions {
             old: old.to_owned(),
             new: new.to_owned(),
             force,
             dry_run,
-        },
-    )
-    .map_err(map_branch_error)?;
+        })
+        .map_err(map_branch_error)?;
     Ok(BranchOutcome::Rename {
         old: outcome.old,
         new: outcome.new,
         oid: outcome.oid.map(|o| o.to_hex()),
-        short_oid: outcome.oid.map(|o| short_hex(&o.to_hex())),
+        short_oid: outcome.oid.map(|o| o.to_short_hex()),
         replaced: outcome.replaced.map(|o| o.to_hex()),
         dry_run: outcome.dry_run,
     })
 }
 
 fn set(repo: &Repository, branch: &str, upstream: &str, dry_run: bool) -> Result<BranchOutcome> {
-    let display = validate_set_upstream(repo, branch, upstream).map_err(map_branch_error)?;
+    let display = repo
+        .branches()
+        .validate_set_upstream(branch, upstream)
+        .map_err(map_branch_error)?;
     if !dry_run {
-        set_upstream(repo, branch, upstream).map_err(map_branch_error)?;
+        repo.branches()
+            .set_upstream(branch, upstream)
+            .map_err(map_branch_error)?;
     }
     Ok(BranchOutcome::SetUpstream {
         branch: branch.to_owned(),
@@ -853,9 +527,13 @@ fn set(repo: &Repository, branch: &str, upstream: &str, dry_run: bool) -> Result
 
 fn unset(repo: &Repository, branch: &str, dry_run: bool) -> Result<BranchOutcome> {
     if dry_run {
-        preview_unset_upstream(repo, branch).map_err(map_branch_error)?;
+        repo.branches()
+            .preview_unset_upstream(branch)
+            .map_err(map_branch_error)?;
     } else {
-        unset_upstream(repo, branch).map_err(map_branch_error)?;
+        repo.branches()
+            .unset_upstream(branch)
+            .map_err(map_branch_error)?;
     }
     Ok(BranchOutcome::UnsetUpstream {
         branch: branch.to_owned(),
@@ -863,45 +541,56 @@ fn unset(repo: &Repository, branch: &str, dry_run: bool) -> Result<BranchOutcome
     })
 }
 
-fn short_hex(full: &str) -> String {
-    full[..7.min(full.len())].to_owned()
-}
+pub use crate::error_map::map_branch_error;
 
-fn branch_error_message(err: &grit_lib::porcelain::branch::BranchError) -> String {
-    use grit_lib::porcelain::branch::BranchError;
-    match err {
-        BranchError::NotFullyMerged { name, .. } => format!(
-            "{err}\nIf you are sure you want to delete it, run 'grit branch --force-delete {name}'"
-        ),
-        BranchError::AlreadyExists { name } => {
-            format!("branch '{name}' already exists (use --force to replace its tip)")
-        }
-        other => other.to_string(),
-    }
-}
+/// Dispatch parsed CLI args for `Branch`.
+pub fn dispatch(
+    args: crate::args::BranchArgs,
+    env: crate::dispatch::CommandEnv<'_>,
+) -> anyhow::Result<crate::exit_status::ExitStatus> {
+    use crate::args::*;
+    use crate::commands;
 
-pub fn map_branch_error(err: Error) -> anyhow::Error {
-    match err {
-        Error::Branch(branch_err) => {
-            let human = branch_error_message(&branch_err);
-            anyhow::Error::new(StructuredCliError {
-                payload: StructuredJsonError::new(
-                    human.clone(),
-                    ErrorKind::from_branch_error(&branch_err),
-                ),
-                human,
-            })
-        }
-        Error::BranchCheckedOutInWorktree { worktree_path, .. } => {
-            let worktree = grit_lib::config::git_path::path_for_error_message(
-                std::path::Path::new(&worktree_path),
-            );
-            let human = format!("branch is checked out in '{worktree}'");
-            anyhow::Error::new(StructuredCliError {
-                payload: StructuredJsonError::new(human.clone(), ErrorKind::BranchCheckedOut),
-                human,
-            })
-        }
-        other => json_error::map_lib_error(other),
-    }
+    use crate::dispatch::{emit_success, CommandEnv};
+
+    let CommandEnv {
+        opts,
+        ctx,
+        process_env: _,
+    } = env;
+    let BranchArgs {
+        name,
+        start,
+        force,
+        track,
+        no_track,
+        set_upstream_to,
+        unset_upstream,
+        rename,
+        force_rename,
+        delete,
+        force_delete,
+        list,
+        dry_run,
+    } = args;
+    emit_success(
+        commands::branch::run(commands::branch::BranchRunOptions {
+            name,
+            start,
+            force,
+            track,
+            no_track,
+            set_upstream_to,
+            unset_upstream,
+            rename,
+            force_rename,
+            delete,
+            force_delete,
+            list,
+            list_full_detail: env.branch_list_full_detail(),
+            dry_run,
+        })?,
+        opts,
+        ctx,
+    )
 }

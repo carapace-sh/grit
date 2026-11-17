@@ -8,35 +8,38 @@ use thiserror::Error;
 
 use crate::config::ConfigSet;
 use crate::diff::changes::{
-    head_tree, load_changes, load_object_changes, staged_entries_in, unstaged_entries_in,
-    worktree_entries_in, FileChange, WorktreeSide,
+    load_changes, load_object_changes, pathspec_restrict_paths_for_scan, staged_entries_in,
+    unstaged_entries_in, worktree_entries_in, FileChange, WorktreeSide,
 };
 use crate::diff::detail::LineStat;
-use crate::diff::diff_trees_with_renames_and_policy;
 use crate::diff::structured::StructuredHunk;
 use crate::diff::{
-    diff_commits_with_renames_and_policy, sort_entries_by_path, tree_diff_structured_parallel,
-    DiffEntry, DiffOptions, DiffStatus, TreeDiffStructured,
+    apply_diff_filter, sort_entries_by_path, tree_diff_structured_parallel, DiffEntry, DiffOptions,
+    DiffStatus, TreeDiffStructured,
 };
-use crate::error::{Error, PathspecResolveError, Result};
+use crate::error::{DiffError, Error, PathspecResolveError, Result};
 use crate::index::Index;
 use crate::index::MODE_TREE;
 use crate::objects::FileMode;
-use crate::objects::{parse_commit, CommitData, ObjectId, ObjectKind};
+use crate::objects::ObjectId;
 use crate::parallel::{par_map, ParallelOp, ThreadPolicy};
-use crate::pathspec::{exact_literal_pathspec_set, PathspecMatchContext, PathspecMatcher};
+use crate::pathspec::resolve_pathspec;
+use crate::pathspec::{
+    exact_literal_pathspec_set, Pathspec, PathspecGlobalFlags, PathspecMatchContext,
+    PathspecMatcher,
+};
 use crate::porcelain::pathspec_match::{
     ensure_pathspec_matches_known_in_repository, pathspec_matches_known_in_repository,
 };
 use crate::repo::Repository;
+use crate::repo::RepositoryError;
 use crate::rev_parse::peel_tags_to_commit;
-use crate::revwalk::merge_base::{merge_base_for_diff_two_commits, MergeBaseForDiffError};
+use crate::revwalk::merge_base::merge_base_for_diff_two_commits;
 use crate::revwalk::rev_parse::{
     resolve_revision, resolve_revision_for_range_end, split_double_dot_range,
     split_triple_dot_range,
 };
-use crate::state::resolve_head;
-use crate::worktree::pathspec::resolve_pathspec;
+use crate::state::resolve_head_for_repository;
 use crate::worktree::worktree_rules::WorktreeRules;
 
 /// What to compare when producing a structured file diff list.
@@ -53,16 +56,20 @@ pub enum DiffTarget {
     WorktreeVsIndex,
     /// Patch introduced by one commit (parent tree vs commit tree).
     Commit(ObjectId),
-    /// Tree diff between two commits (`old` may be absent for root commits).
+    /// Tree diff between two commits or trees (`old` may be absent for root commits).
     Trees {
-        /// Older commit (left side of the range).
+        /// Older commit or tree (left side of the range).
         old: Option<ObjectId>,
-        /// Newer commit (right side).
+        /// Newer commit or tree (right side).
         new: ObjectId,
     },
 }
 
-/// One changed file with structured hunks and metadata.
+/// One changed file with structured hunks and metadata (returned by [`Diff::files`](crate::diff::Diff::files)).
+///
+/// Always carries [`Self::hunks`] when line diff was computed. For stat-or-patch listing rows
+/// from [`Diff::files_for_entries`](crate::diff::Diff::files_for_entries), use [`ListedFileDiff`](crate::diff::ListedFileDiff)
+/// instead (structured hunks and line counts are optional there).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileDiff {
     /// Display path (new path, or old path for a deletion).
@@ -81,6 +88,10 @@ pub struct FileDiff {
     pub new_oid: ObjectId,
     /// True when either side was treated as binary (NUL in the first 8 KiB).
     pub binary: bool,
+    /// Old-side byte length (for binary `--stat` and JSON).
+    pub old_size: u64,
+    /// New-side byte length (for binary `--stat` and JSON).
+    pub new_size: u64,
     /// True when blob content changed (not a mode-only touch on the same OID).
     pub content_changed: bool,
     /// Old side was decoded with lossy UTF-8.
@@ -94,17 +105,17 @@ pub struct FileDiff {
 }
 
 /// Resolved diff mode and normalized pathspecs.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct DiffArguments {
     /// What to diff.
     pub target: DiffTarget,
-    /// Repository-relative pathspecs (empty = all paths).
-    pub pathspecs: Vec<String>,
+    /// Path limit (entire tree when unscoped).
+    pub pathspec: Pathspec,
 }
 
 /// Unparsed `grit diff` flags and operands, as the user typed them.
 ///
-/// [`resolve_diff_request`] turns this into a [`DiffArguments`].
+/// [`Diff::resolve_request`](crate::diff::Diff::resolve_request) turns this into a [`DiffArguments`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DiffRequest {
     /// Compare the index with `HEAD` (`--staged`).
@@ -159,13 +170,16 @@ pub enum ResolveDiffArgumentsError {
     NoWorkTree,
 
     /// A revision operand does not name an object.
+    ///
+    /// Resolution failures outside the revision area (a damaged object, an unreadable ref)
+    /// are returned in their own area instead.
     #[error("could not resolve '{spec}'")]
     UnresolvedRevision {
         /// The operand as given.
         spec: String,
         /// Why resolution failed.
         #[source]
-        source: Box<Error>,
+        source: Box<crate::error::RevisionError>,
     },
 
     /// A revision (after peeling tags) names a tree or blob instead of a commit.
@@ -175,69 +189,18 @@ pub enum ResolveDiffArgumentsError {
         oid: ObjectId,
     },
 
-    /// A three-dot range whose sides share no history.
-    #[error("no merge base for that revision range")]
-    NoMergeBase,
-
-    /// A three-dot range whose sides have more than one merge base (criss-cross history).
-    #[error("multiple merge bases for that revision range")]
-    MultipleMergeBases,
-
     /// A pathspec could not be parsed or normalized.
     #[error(transparent)]
     Pathspec(#[from] PathspecResolveError),
-
-    /// Range endpoint resolution, object reads, or a working-tree pathspec matching nothing
-    /// ([`Error::PathspecNoMatch`]).
-    #[error(transparent)]
-    Library(Box<Error>),
 }
 
-impl From<Error> for ResolveDiffArgumentsError {
-    fn from(err: Error) -> Self {
-        Self::Library(Box::new(err))
+impl From<ResolveDiffArgumentsError> for Error {
+    fn from(err: ResolveDiffArgumentsError) -> Self {
+        Self::Diff(DiffError::Arguments(err))
     }
 }
 
-type ResolveResult<T> = std::result::Result<T, ResolveDiffArgumentsError>;
-
-/// Parse `grit diff` flags and positionals into a [`DiffTarget`] and pathspecs.
-///
-/// Shorthand for [`resolve_diff_request`] without a pathspec file.
-///
-/// # Parameters
-///
-/// - `repo` - repository the revisions and paths belong to.
-/// - `cwd_prefix` - path from the work tree root to the process cwd (from
-///   [`pathdiff`](crate::worktree::pathspec::pathdiff)); `None` at the root, when unknown, or in
-///   a bare repository.
-/// - `staged`, `unstaged`, `against` - see [`DiffRequest`].
-/// - `positionals` - operands before `--`.
-/// - `explicit_paths` - paths after `--`.
-///
-/// # Errors
-///
-/// Returns [`ResolveDiffArgumentsError`] for flag conflicts, unresolvable revisions, or
-/// pathspecs that cannot be resolved.
-pub fn resolve_diff_arguments(
-    repo: &Repository,
-    cwd_prefix: Option<&str>,
-    staged: bool,
-    unstaged: bool,
-    against: Option<&str>,
-    positionals: &[String],
-    explicit_paths: &[String],
-) -> ResolveResult<DiffArguments> {
-    let request = DiffRequest {
-        staged,
-        unstaged,
-        against: against.map(str::to_owned),
-        positionals: positionals.to_vec(),
-        paths: explicit_paths.to_vec(),
-        pathspec_file: None,
-    };
-    resolve_diff_request(repo, cwd_prefix, &request)
-}
+type ResolveResult<T> = Result<T>;
 
 /// Decide what `grit diff` compares and which paths it is limited to.
 ///
@@ -271,13 +234,13 @@ pub fn resolve_diff_arguments(
 ///   [`RangeWithSecondRevision`](ResolveDiffArgumentsError::RangeWithSecondRevision).
 /// - Revisions: [`UnresolvedRevision`](ResolveDiffArgumentsError::UnresolvedRevision),
 ///   [`NotACommit`](ResolveDiffArgumentsError::NotACommit),
-///   [`NoMergeBase`](ResolveDiffArgumentsError::NoMergeBase),
-///   [`MultipleMergeBases`](ResolveDiffArgumentsError::MultipleMergeBases).
+///   [`RevisionError::NoMergeBase`](crate::error::RevisionError::NoMergeBase),
+///   [`RevisionError::MultipleMergeBases`](crate::error::RevisionError::MultipleMergeBases).
 /// - Working tree: [`NoWorkTree`](ResolveDiffArgumentsError::NoWorkTree) when the target reads
 ///   the working tree in a bare repository.
 /// - Paths: [`Pathspec`](ResolveDiffArgumentsError::Pathspec), or
-///   [`Library`](ResolveDiffArgumentsError::Library) wrapping [`Error::PathspecNoMatch`].
-pub fn resolve_diff_request(
+///   [`crate::worktree::WorktreeError::PathspecNoMatch`].
+pub(crate) fn resolve_diff_request(
     repo: &Repository,
     cwd_prefix: Option<&str>,
     request: &DiffRequest,
@@ -288,7 +251,7 @@ pub fn resolve_diff_request(
         DiffTarget::WorktreeVsHead | DiffTarget::WorktreeVsTree(_) | DiffTarget::WorktreeVsIndex
     );
     if reads_worktree && repo.work_tree().is_none() {
-        return Err(ResolveDiffArgumentsError::NoWorkTree);
+        return Err(ResolveDiffArgumentsError::NoWorkTree.into());
     }
     Ok(arguments)
 }
@@ -309,19 +272,21 @@ fn resolve_diff_request_in(
     if (request.pathspec_file.is_some() || !request.paths.is_empty())
         && (path_tokens.is_empty() || path_tokens.iter().any(String::is_empty))
     {
-        return Err(PathspecResolveError::EmptyPathspec.into());
+        return Err(
+            ResolveDiffArgumentsError::Pathspec(PathspecResolveError::EmptyPathspec).into(),
+        );
     }
     let against = request.against.as_deref();
 
     if request.staged && request.unstaged {
-        return Err(ResolveDiffArgumentsError::StagedAndUnstaged);
+        return Err(ResolveDiffArgumentsError::StagedAndUnstaged.into());
     }
     if request.staged || request.unstaged {
         if !commits.is_empty() || against.is_some() {
             return Err(if request.staged {
-                ResolveDiffArgumentsError::StagedWithRevisions
+                crate::error::Error::from(ResolveDiffArgumentsError::StagedWithRevisions)
             } else {
-                ResolveDiffArgumentsError::UnstagedWithRevisions
+                crate::error::Error::from(ResolveDiffArgumentsError::UnstagedWithRevisions)
             });
         }
         return Ok(DiffArguments {
@@ -330,53 +295,60 @@ fn resolve_diff_request_in(
             } else {
                 DiffTarget::WorktreeVsIndex
             },
-            pathspecs: resolve_worktree_diff_pathspecs(repo, cwd_prefix, &path_tokens)?,
+            pathspec: pathspec_from_resolved_specs(resolve_worktree_diff_pathspecs(
+                repo,
+                cwd_prefix,
+                &path_tokens,
+            )?),
         });
     }
     if commits.len() > 2 {
-        return Err(ResolveDiffArgumentsError::TooManyRevisions);
+        return Err(ResolveDiffArgumentsError::TooManyRevisions.into());
     }
     if against.is_some() && !commits.is_empty() {
-        return Err(ResolveDiffArgumentsError::AgainstWithCommits);
+        return Err(ResolveDiffArgumentsError::AgainstWithCommits.into());
     }
 
-    let trees = |old: ObjectId, new: ObjectId, pathspecs: Vec<String>| DiffArguments {
+    let trees = |old: ObjectId, new: ObjectId, pathspec: Pathspec| DiffArguments {
         target: DiffTarget::Trees {
             old: Some(old),
             new,
         },
-        pathspecs,
+        pathspec,
     };
     match commits.as_slice() {
         [] => {
-            let pathspecs = resolve_worktree_diff_pathspecs(repo, cwd_prefix, &path_tokens)?;
+            let pathspec = pathspec_from_resolved_specs(resolve_worktree_diff_pathspecs(
+                repo,
+                cwd_prefix,
+                &path_tokens,
+            )?);
             let target = match against {
-                Some(spec) => DiffTarget::WorktreeVsTree(commit_tree(
-                    repo,
-                    &resolve_diff_commit(repo, spec)?,
-                )?),
+                Some(spec) => DiffTarget::WorktreeVsTree(
+                    repo.odb().commit_tree(&resolve_diff_commit(repo, spec)?)?,
+                ),
                 None => DiffTarget::WorktreeVsHead,
             };
-            Ok(DiffArguments { target, pathspecs })
+            Ok(DiffArguments { target, pathspec })
         }
         [spec] => {
             if let Some((base, tip)) = parse_commit_range(repo, spec)? {
-                let pathspecs = resolve_commit_diff_pathspecs(repo, cwd_prefix, &path_tokens)?;
-                return Ok(trees(base, tip, pathspecs));
+                let pathspec = resolve_commit_diff_pathspecs(repo, cwd_prefix, &path_tokens)?;
+                return Ok(trees(base, tip, pathspec));
             }
             match resolve_diff_commit(repo, spec) {
                 Ok(oid) => Ok(DiffArguments {
                     target: DiffTarget::Commit(oid),
-                    pathspecs: resolve_commit_diff_pathspecs(repo, cwd_prefix, &path_tokens)?,
+                    pathspec: resolve_commit_diff_pathspecs(repo, cwd_prefix, &path_tokens)?,
                 }),
                 // Neither a revision nor (per disambiguation) a known path: report it as a path.
                 Err(_) if path_tokens.is_empty() => Ok(DiffArguments {
                     target: DiffTarget::WorktreeVsIndex,
-                    pathspecs: resolve_worktree_diff_pathspecs(
+                    pathspec: pathspec_from_resolved_specs(resolve_worktree_diff_pathspecs(
                         repo,
                         cwd_prefix,
                         std::slice::from_ref(spec),
-                    )?,
+                    )?),
                 }),
                 Err(err) => Err(err),
             }
@@ -385,18 +357,18 @@ fn resolve_diff_request_in(
             if let Some((base, tip)) = parse_commit_range(repo, first)? {
                 if !token_is_known_worktree_pathspec(repo, cwd_prefix, second) {
                     resolve_diff_commit(repo, second)?;
-                    return Err(ResolveDiffArgumentsError::RangeWithSecondRevision);
+                    return Err(ResolveDiffArgumentsError::RangeWithSecondRevision.into());
                 }
                 let range_paths = [file_paths, std::slice::from_ref(second)].concat();
-                let pathspecs = resolve_commit_diff_pathspecs(repo, cwd_prefix, &range_paths)?;
-                return Ok(trees(base, tip, pathspecs));
+                let pathspec = resolve_commit_diff_pathspecs(repo, cwd_prefix, &range_paths)?;
+                return Ok(trees(base, tip, pathspec));
             }
             let base = resolve_diff_commit(repo, first)?;
             let tip = resolve_diff_commit(repo, second)?;
-            let pathspecs = resolve_commit_diff_pathspecs(repo, cwd_prefix, &path_tokens)?;
-            Ok(trees(base, tip, pathspecs))
+            let pathspec = resolve_commit_diff_pathspecs(repo, cwd_prefix, &path_tokens)?;
+            Ok(trees(base, tip, pathspec))
         }
-        _ => Err(ResolveDiffArgumentsError::TooManyRevisions),
+        _ => Err(ResolveDiffArgumentsError::TooManyRevisions.into()),
     }
 }
 
@@ -426,20 +398,16 @@ pub(crate) fn collect_files_for_target(
     pathspecs: &[String],
     opts: DiffOptions,
 ) -> Result<Vec<FileDiff>> {
-    let config = repo.config()?;
+    let config = repo.config().snapshot()?;
     let thread_policy = repo.thread_policy();
     // Git uses similarity 50 by default; when renames are off, skip detection (101 = never).
     let rename_threshold = opts.renames.threshold_percent().unwrap_or(101);
 
     let files = match target {
         DiffTarget::WorktreeVsHead => {
-            let head = resolve_head(repo.git_dir())?;
-            let head_tree = match head.oid() {
-                Some(oid) => Some(commit_tree(repo, oid)?),
-                None => None,
-            };
+            let head_tree = resolve_head_for_repository(repo)?.tree(repo.odb())?;
             let changes = filter_file_changes(
-                worktree_changes(repo, head_tree.as_ref(), rename_threshold)?,
+                worktree_changes(repo, head_tree.as_ref(), rename_threshold, pathspecs)?,
                 repo,
                 pathspecs,
             )?;
@@ -447,14 +415,17 @@ pub(crate) fn collect_files_for_target(
         }
         DiffTarget::WorktreeVsTree(tree) => {
             let changes = filter_file_changes(
-                worktree_changes(repo, Some(tree), rename_threshold)?,
+                worktree_changes(repo, Some(tree), rename_threshold, pathspecs)?,
                 repo,
                 pathspecs,
             )?;
             file_diffs_from_worktree_changes(changes, &config, &thread_policy, opts.clone())?
         }
         DiffTarget::IndexVsHead => {
-            let restrict = pathspec_restrict_set(pathspecs);
+            let index = repo.load_index()?;
+            let head_tree = resolve_head_for_repository(repo)?.tree(repo.odb())?;
+            let restrict =
+                pathspec_restrict_paths_for_scan(repo, &index, pathspecs, head_tree.as_ref())?;
             let changes = filter_file_changes(
                 staged_changes(repo, rename_threshold, restrict)?,
                 repo,
@@ -463,14 +434,18 @@ pub(crate) fn collect_files_for_target(
             file_diffs_from_worktree_changes(changes, &config, &thread_policy, opts.clone())?
         }
         DiffTarget::WorktreeVsIndex => {
-            let changes =
-                filter_file_changes(unstaged_changes(repo, rename_threshold)?, repo, pathspecs)?;
+            let changes = filter_file_changes(
+                unstaged_changes(repo, rename_threshold, pathspecs)?,
+                repo,
+                pathspecs,
+            )?;
             file_diffs_from_worktree_changes(changes, &config, &thread_policy, opts.clone())?
         }
         DiffTarget::Commit(oid) => {
             let items = commit_changes(
                 repo,
                 oid,
+                pathspecs,
                 &config,
                 &thread_policy,
                 opts.clone(),
@@ -484,15 +459,17 @@ pub(crate) fn collect_files_for_target(
                     repo,
                     base,
                     new,
+                    pathspecs,
                     &config,
                     &thread_policy,
                     opts.clone(),
                     rename_threshold,
                 )?
             } else {
-                commit_changes(
+                empty_tree_to_side_changes(
                     repo,
                     new,
+                    pathspecs,
                     &config,
                     &thread_policy,
                     opts.clone(),
@@ -503,6 +480,80 @@ pub(crate) fn collect_files_for_target(
         }
     };
     Ok(files)
+}
+
+/// Metadata entries for a target that compares stored objects ([`DiffTarget::Commit`] and
+/// [`DiffTarget::Trees`]), sorted by path; `None` for a target that reads the index or working
+/// tree.
+pub(crate) fn stored_target_entries(
+    repo: &Repository,
+    target: &DiffTarget,
+    pathspecs: &[String],
+    options: &DiffOptions,
+) -> Result<Option<super::core::DiffEntriesResult>> {
+    let rename_threshold = options.rename_threshold_u32();
+    let entries = match target {
+        DiffTarget::Commit(oid) => {
+            let config = repo.config().snapshot()?;
+            commit_diff_entries(
+                repo,
+                oid,
+                pathspecs,
+                &config,
+                &repo.thread_policy(),
+                rename_threshold,
+            )?
+        }
+        DiffTarget::Trees { old, new } => {
+            let config = repo.config().snapshot()?;
+            let thread_policy = repo.thread_policy();
+            match old {
+                Some(base) => tree_commit_diff_entries(
+                    repo,
+                    base,
+                    new,
+                    pathspecs,
+                    &config,
+                    &thread_policy,
+                    rename_threshold,
+                )?,
+                None => empty_tree_to_side_diff_entries(
+                    repo,
+                    new,
+                    pathspecs,
+                    &config,
+                    &thread_policy,
+                    rename_threshold,
+                )?,
+            }
+        }
+        DiffTarget::WorktreeVsHead
+        | DiffTarget::WorktreeVsTree(_)
+        | DiffTarget::IndexVsHead
+        | DiffTarget::WorktreeVsIndex => return Ok(None),
+    };
+    Ok(Some(entries))
+}
+
+/// Keep the entries within `pathspecs` whose status passes `options.filter` (`--diff-filter`).
+pub(crate) fn limit_target_entries(
+    repo: &Repository,
+    mut result: super::core::DiffEntriesResult,
+    pathspecs: &[String],
+    options: &DiffOptions,
+) -> Result<super::core::DiffEntriesResult> {
+    let entries = if pathspecs.is_empty() {
+        result.entries
+    } else {
+        let matcher = repo.pathspec_matcher(pathspecs)?;
+        result
+            .entries
+            .into_iter()
+            .filter(|entry| diff_entry_matches(&matcher, entry))
+            .collect()
+    };
+    result.entries = apply_diff_filter(entries, options.filter);
+    Ok(result)
 }
 
 fn filter_and_map_tree_structured(
@@ -535,6 +586,8 @@ fn file_diff_from_tree_structured(t: TreeDiffStructured) -> FileDiff {
         old_oid: e.old_oid,
         new_oid: e.new_oid,
         binary: t.binary,
+        old_size: t.old_size,
+        new_size: t.new_size,
         content_changed: e.old_oid != e.new_oid,
         old_encoding_lossy: t.structured.old_encoding_lossy,
         new_encoding_lossy: t.structured.new_encoding_lossy,
@@ -572,6 +625,8 @@ fn build_file_diff(fc: &FileChange, diff_options: DiffOptions) -> FileDiff {
         old_oid: fc.old_oid,
         new_oid: fc.new_oid,
         binary: fc.binary,
+        old_size: fc.old_bytes.byte_len(),
+        new_size: fc.new_bytes.byte_len(),
         content_changed: fc.content_changed,
         old_encoding_lossy: structured.old_encoding_lossy,
         new_encoding_lossy: structured.new_encoding_lossy,
@@ -645,16 +700,27 @@ fn resolve_worktree_diff_pathspecs(
         return Ok(Vec::new());
     }
     if repo.work_tree().is_none() {
-        return Err(ResolveDiffArgumentsError::NoWorkTree);
+        return Err(ResolveDiffArgumentsError::NoWorkTree.into());
     }
     raw_paths
         .iter()
         .map(|pathspec| {
-            let resolved = repo.resolve_worktree_pathspec(pathspec, cwd_prefix)?;
+            let resolved = repo
+                .resolve_worktree_pathspec(pathspec, cwd_prefix)
+                .map_err(ResolveDiffArgumentsError::Pathspec)?;
             ensure_pathspec_matches_known_in_repository(repo, pathspec, &resolved)?;
             Ok(resolved)
         })
         .collect()
+}
+
+/// Build a [`Pathspec`] from resolved work-tree-relative strings (empty → entire tree).
+fn pathspec_from_resolved_specs(specs: Vec<String>) -> Pathspec {
+    if specs.is_empty() {
+        Pathspec::entire_tree(PathspecGlobalFlags::default())
+    } else {
+        Pathspec::scoped(specs, PathspecGlobalFlags::default())
+    }
 }
 
 /// Normalize pathspecs for a commit or range diff to repository-relative form.
@@ -674,22 +740,28 @@ fn resolve_worktree_diff_pathspecs(
 ///
 /// Returns [`ResolveDiffArgumentsError::Pathspec`] when a pathspec cannot be parsed or lies
 /// outside the work tree.
-pub fn resolve_commit_diff_pathspecs(
+pub(crate) fn resolve_commit_diff_pathspecs(
     repo: &Repository,
     cwd_prefix: Option<&str>,
     raw_paths: &[String],
-) -> ResolveResult<Vec<String>> {
-    if repo.work_tree().is_none() {
+) -> ResolveResult<Pathspec> {
+    let specs: Vec<String> = if repo.work_tree().is_none() {
         let root = pathspec_resolution_root(repo);
-        return Ok(raw_paths
+        raw_paths
             .iter()
             .map(|pathspec| resolve_pathspec(pathspec, root, cwd_prefix))
-            .collect());
-    }
-    raw_paths
-        .iter()
-        .map(|pathspec| Ok(repo.resolve_worktree_pathspec(pathspec, cwd_prefix)?))
-        .collect()
+            .collect()
+    } else {
+        raw_paths
+            .iter()
+            .map(|pathspec| {
+                Ok(repo
+                    .resolve_worktree_pathspec(pathspec, cwd_prefix)
+                    .map_err(ResolveDiffArgumentsError::Pathspec)?)
+            })
+            .collect::<ResolveResult<Vec<_>>>()?
+    };
+    Ok(pathspec_from_resolved_specs(specs))
 }
 
 fn filter_file_changes(
@@ -731,17 +803,14 @@ fn filter_tree_diff(
         .collect())
 }
 
-fn pathspec_restrict_set(pathspecs: &[String]) -> Option<Arc<BTreeSet<String>>> {
-    if pathspecs.is_empty() {
-        None
-    } else {
-        Some(Arc::new(pathspecs.iter().cloned().collect()))
-    }
-}
-
-fn unstaged_changes(repo: &Repository, rename_threshold: u32) -> Result<Vec<FileChange>> {
-    let mut index = repo.index_handle().load()?;
-    unstaged_changes_inner(repo, &mut index, rename_threshold, None)
+fn unstaged_changes(
+    repo: &Repository,
+    rename_threshold: u32,
+    pathspecs: &[String],
+) -> Result<Vec<FileChange>> {
+    let mut index = repo.load_index()?;
+    let restrict = pathspec_restrict_paths_for_scan(repo, &index, pathspecs, None)?;
+    unstaged_changes_inner(repo, &mut index, rename_threshold, restrict)
 }
 
 fn unstaged_changes_inner(
@@ -750,7 +819,7 @@ fn unstaged_changes_inner(
     rename_threshold: u32,
     restrict_to_paths: Option<Arc<BTreeSet<String>>>,
 ) -> Result<Vec<FileChange>> {
-    let work_tree = repo.work_tree().ok_or(Error::RequiresWorkTree)?;
+    let work_tree = repo.work_tree().ok_or(RepositoryError::RequiresWorkTree)?;
     let rules = Arc::new(Mutex::new(WorktreeRules::from_repository(repo, index)?));
     let entries = unstaged_entries_in(
         repo,
@@ -841,7 +910,7 @@ fn staged_changes(
     rename_threshold: u32,
     restrict_to_paths: Option<Arc<BTreeSet<String>>>,
 ) -> Result<Vec<FileChange>> {
-    let index = repo.index_handle().load()?;
+    let index = repo.load_index()?;
     let entries = staged_entries_in(repo, &index, rename_threshold, restrict_to_paths.as_deref())?;
     load_object_changes(repo, &entries)
 }
@@ -850,9 +919,11 @@ fn worktree_changes(
     repo: &Repository,
     base_tree: Option<&ObjectId>,
     rename_threshold: u32,
+    pathspecs: &[String],
 ) -> Result<Vec<FileChange>> {
-    let work_tree = repo.work_tree().ok_or(Error::RequiresWorkTree)?;
-    let mut index = repo.index_handle().load()?;
+    let work_tree = repo.work_tree().ok_or(RepositoryError::RequiresWorkTree)?;
+    let mut index = repo.load_index()?;
+    let restrict = pathspec_restrict_paths_for_scan(repo, &index, pathspecs, base_tree)?;
     let rules = Arc::new(Mutex::new(WorktreeRules::from_repository(repo, &index)?));
     let entries = worktree_entries_in(
         repo,
@@ -861,6 +932,7 @@ fn worktree_changes(
         &rules,
         base_tree,
         rename_threshold,
+        restrict,
     )?;
     let side = WorktreeSide {
         work_tree,
@@ -870,90 +942,200 @@ fn worktree_changes(
     load_changes(repo.odb(), entries, Some(&side))
 }
 
+fn pathspec_matcher_for_stored_diff<'a>(
+    repo: &'a Repository,
+    pathspecs: &'a [String],
+) -> Result<Option<crate::pathspec::PathspecMatcher<'a>>> {
+    if pathspecs.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(repo.pathspec_matcher(pathspecs)?))
+    }
+}
+
 fn tree_commit_diff_entries(
     repo: &Repository,
     base: &ObjectId,
     tip: &ObjectId,
+    pathspecs: &[String],
     config: &ConfigSet,
     thread_policy: &ThreadPolicy,
     rename_threshold: u32,
-) -> Result<Vec<DiffEntry>> {
-    let mut entries = diff_commits_with_renames_and_policy(
-        repo.odb(),
-        base,
-        tip,
+) -> Result<super::core::DiffEntriesResult> {
+    let odb = repo.odb();
+    let base_tree = super::core::tree_oid_for_diff_side(odb, base)?;
+    let tip_tree = super::core::tree_oid_for_diff_side(odb, tip)?;
+    let pathspec_matcher = pathspec_matcher_for_stored_diff(repo, pathspecs)?;
+    let mut result = super::core::diff_trees_with_renames_for_pathspecs_and_policy_result(
+        odb,
+        Some(&base_tree),
+        Some(&tip_tree),
+        "",
+        pathspecs,
+        pathspec_matcher.as_ref(),
         rename_threshold,
         config,
         thread_policy,
     )?;
-    sort_entries_by_path(&mut entries);
-    Ok(entries)
+    sort_entries_by_path(&mut result.entries);
+    Ok(result)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn tree_commit_changes(
     repo: &Repository,
     base: &ObjectId,
     tip: &ObjectId,
+    pathspecs: &[String],
     config: &ConfigSet,
     thread_policy: &ThreadPolicy,
     diff_options: DiffOptions,
     rename_threshold: u32,
 ) -> Result<Vec<TreeDiffStructured>> {
-    let entries =
-        tree_commit_diff_entries(repo, base, tip, config, thread_policy, rename_threshold)?;
-    tree_diff_structured_parallel(repo.odb(), entries, config, thread_policy, diff_options)
+    let result = tree_commit_diff_entries(
+        repo,
+        base,
+        tip,
+        pathspecs,
+        config,
+        thread_policy,
+        rename_threshold,
+    )?;
+    tree_diff_structured_parallel(
+        repo.odb(),
+        result.entries,
+        config,
+        thread_policy,
+        diff_options,
+    )
 }
 
 fn commit_diff_entries(
     repo: &Repository,
     oid: &ObjectId,
+    pathspecs: &[String],
     config: &ConfigSet,
     thread_policy: &ThreadPolicy,
     rename_threshold: u32,
-) -> Result<Vec<DiffEntry>> {
-    let commit = read_commit(repo, oid)?;
+) -> Result<super::core::DiffEntriesResult> {
+    let commit = repo.read_commit_with_replace(oid)?;
     let new_tree = commit.tree;
-    let old_tree = match commit.parents.first() {
-        Some(parent) => Some(commit_tree(repo, parent)?),
+    let parent_ctx = crate::shallow::EffectiveCommitParents::load(repo);
+    let effective_parents = parent_ctx.for_commit(*oid, &commit.parents);
+    let old_tree = match effective_parents.first() {
+        Some(parent) => Some(repo.read_commit_with_replace(parent)?.tree),
         None => None,
     };
 
-    let mut entries = diff_trees_with_renames_and_policy(
+    let pathspec_matcher = pathspec_matcher_for_stored_diff(repo, pathspecs)?;
+    let mut result = super::core::diff_trees_with_renames_for_pathspecs_and_policy_result(
         repo.odb(),
         old_tree.as_ref(),
         Some(&new_tree),
         "",
+        pathspecs,
+        pathspec_matcher.as_ref(),
         rename_threshold,
         config,
         thread_policy,
     )?;
-    sort_entries_by_path(&mut entries);
-    Ok(entries)
+    sort_entries_by_path(&mut result.entries);
+    Ok(result)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn commit_changes(
     repo: &Repository,
     oid: &ObjectId,
+    pathspecs: &[String],
     config: &ConfigSet,
     thread_policy: &ThreadPolicy,
     diff_options: DiffOptions,
     rename_threshold: u32,
 ) -> Result<Vec<TreeDiffStructured>> {
-    let entries = commit_diff_entries(repo, oid, config, thread_policy, rename_threshold)?;
-    tree_diff_structured_parallel(repo.odb(), entries, config, thread_policy, diff_options)
+    let result = commit_diff_entries(
+        repo,
+        oid,
+        pathspecs,
+        config,
+        thread_policy,
+        rename_threshold,
+    )?;
+    tree_diff_structured_parallel(
+        repo.odb(),
+        result.entries,
+        config,
+        thread_policy,
+        diff_options,
+    )
+}
+
+fn empty_tree_to_side_diff_entries(
+    repo: &Repository,
+    side: &ObjectId,
+    pathspecs: &[String],
+    config: &ConfigSet,
+    thread_policy: &ThreadPolicy,
+    rename_threshold: u32,
+) -> Result<super::core::DiffEntriesResult> {
+    let tip_tree = super::core::tree_oid_for_diff_side(repo.odb(), side)?;
+    let pathspec_matcher = pathspec_matcher_for_stored_diff(repo, pathspecs)?;
+    let mut result = super::core::diff_trees_with_renames_for_pathspecs_and_policy_result(
+        repo.odb(),
+        None,
+        Some(&tip_tree),
+        "",
+        pathspecs,
+        pathspec_matcher.as_ref(),
+        rename_threshold,
+        config,
+        thread_policy,
+    )?;
+    sort_entries_by_path(&mut result.entries);
+    Ok(result)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn empty_tree_to_side_changes(
+    repo: &Repository,
+    side: &ObjectId,
+    pathspecs: &[String],
+    config: &ConfigSet,
+    thread_policy: &ThreadPolicy,
+    diff_options: DiffOptions,
+    rename_threshold: u32,
+) -> Result<Vec<TreeDiffStructured>> {
+    let result = empty_tree_to_side_diff_entries(
+        repo,
+        side,
+        pathspecs,
+        config,
+        thread_policy,
+        rename_threshold,
+    )?;
+    tree_diff_structured_parallel(
+        repo.odb(),
+        result.entries,
+        config,
+        thread_policy,
+        diff_options,
+    )
 }
 
 fn peel_diff_commit(repo: &Repository, oid: ObjectId) -> ResolveResult<ObjectId> {
-    peel_tags_to_commit(repo, oid)?.map_err(|oid| ResolveDiffArgumentsError::NotACommit { oid })
+    Ok(peel_tags_to_commit(repo, oid)?
+        .map_err(|oid| ResolveDiffArgumentsError::NotACommit { oid })?)
 }
 
 /// Resolve a revision operand to a commit, peeling annotated tags.
 fn resolve_diff_commit(repo: &Repository, spec: &str) -> ResolveResult<ObjectId> {
-    let oid = resolve_revision(repo, spec).map_err(|source| {
-        ResolveDiffArgumentsError::UnresolvedRevision {
+    let oid = resolve_revision(repo, spec).map_err(|err| match err {
+        crate::error::Error::Revision(source) => ResolveDiffArgumentsError::UnresolvedRevision {
             spec: spec.to_owned(),
             source: Box::new(source),
         }
+        .into(),
+        other => other,
     })?;
     peel_diff_commit(repo, oid)
 }
@@ -972,11 +1154,7 @@ fn parse_commit_range(
     if let Some((left, right)) = split_triple_dot_range(spec) {
         let left = resolve_diff_range_end(repo, left)?;
         let right = resolve_diff_range_end(repo, right)?;
-        let base = merge_base_for_diff_two_commits(repo, left, right).map_err(|e| match e {
-            MergeBaseForDiffError::None => ResolveDiffArgumentsError::NoMergeBase,
-            MergeBaseForDiffError::Multiple => ResolveDiffArgumentsError::MultipleMergeBases,
-            MergeBaseForDiffError::Other(msg) => Error::Message(msg).into(),
-        })?;
+        let base = merge_base_for_diff_two_commits(repo, left, right)?;
         return Ok(Some((base, right)));
     }
     let Some((left, right)) = split_double_dot_range(spec) else {
@@ -986,21 +1164,6 @@ fn parse_commit_range(
         resolve_diff_range_end(repo, left)?,
         resolve_diff_range_end(repo, right)?,
     )))
-}
-
-fn read_commit(repo: &Repository, oid: &ObjectId) -> Result<CommitData> {
-    let object = repo.odb().read(oid)?;
-    if object.kind != ObjectKind::Commit {
-        return Err(Error::Message(format!(
-            "object {oid} is a {}, not a commit",
-            object.kind
-        )));
-    }
-    parse_commit(&object.data)
-}
-
-pub(super) fn commit_tree(repo: &Repository, commit: &ObjectId) -> Result<ObjectId> {
-    Ok(read_commit(repo, commit)?.tree)
 }
 
 /// Unstaged file diffs with staged peer hunks per path (for stable hunk ids).
@@ -1020,7 +1183,7 @@ pub(crate) fn unstaged_raw_changes_with_peer_hunks(
     pathspecs: &[String],
     opts: DiffOptions,
 ) -> Result<UnstagedRawWithPeers> {
-    let mut index = repo.index_handle().load()?;
+    let mut index = repo.load_index()?;
     unstaged_raw_changes_with_peer_hunks_in(repo, &mut index, pathspecs, opts)
 }
 
@@ -1036,7 +1199,7 @@ pub(crate) fn unstaged_raw_changes_with_peer_hunks_in(
     let rename_threshold = opts.renames.threshold_percent().unwrap_or(101);
     let literal_paths = exact_literal_pathspec_set(pathspecs, PathspecMatchContext::default());
     let head_tree = match literal_paths {
-        Some(_) => head_tree(repo)?,
+        Some(_) => resolve_head_for_repository(repo)?.tree(repo.odb())?,
         None => None,
     };
     let peer_hunks = staged_peer_hunks_for_pathspecs(
@@ -1152,7 +1315,7 @@ pub(crate) fn unstaged_file_diffs_with_peer_hunks(
     pathspecs: &[String],
     opts: DiffOptions,
 ) -> Result<UnstagedDiffWithPeers> {
-    let config = repo.config()?;
+    let config = repo.config().snapshot()?;
     let thread_policy = repo.thread_policy();
     let rename_threshold = opts.renames.threshold_percent().unwrap_or(101);
     let staged = filter_file_changes(
@@ -1167,7 +1330,11 @@ pub(crate) fn unstaged_file_diffs_with_peer_hunks(
             (fc.path.clone(), structured.hunks)
         })
         .collect();
-    let unstaged = filter_file_changes(unstaged_changes(repo, rename_threshold)?, repo, pathspecs)?;
+    let unstaged = filter_file_changes(
+        unstaged_changes(repo, rename_threshold, pathspecs)?,
+        repo,
+        pathspecs,
+    )?;
     let files = file_diffs_from_worktree_changes(unstaged, &config, &thread_policy, opts)?;
     Ok((files, peer_hunks))
 }
@@ -1188,15 +1355,15 @@ pub struct HunkDiffBundle {
 /// # Errors
 ///
 /// Propagates index, object database, and working tree read errors.
-pub fn hunk_diff_bundle(
+pub(crate) fn hunk_diff_bundle(
     repo: &Repository,
-    pathspecs: &[String],
+    pathspec: &Pathspec,
     opts: DiffOptions,
 ) -> Result<HunkDiffBundle> {
-    let config = repo.config()?;
+    let config = repo.config().snapshot()?;
     let thread_policy = repo.thread_policy();
     let (unstaged_fc, peer_hunks) =
-        unstaged_raw_changes_with_peer_hunks(repo, pathspecs, opts.clone())?;
+        unstaged_raw_changes_with_peer_hunks(repo, pathspec.specs(), opts.clone())?;
     let unstaged = file_diffs_from_worktree_changes(unstaged_fc, &config, &thread_policy, opts)?;
     Ok(HunkDiffBundle {
         unstaged,
@@ -1219,6 +1386,8 @@ mod tests {
             old_oid: ObjectId::from_hex("0000000000000000000000000000000000000001").unwrap(),
             new_oid: ObjectId::from_hex("0000000000000000000000000000000000000002").unwrap(),
             binary: false,
+            old_size: 0,
+            new_size: 0,
             content_changed: true,
             old_encoding_lossy: false,
             new_encoding_lossy: false,
@@ -1242,6 +1411,8 @@ mod tests {
             old_oid: oid,
             new_oid: oid,
             binary: false,
+            old_size: 0,
+            new_size: 0,
             content_changed: false,
             old_encoding_lossy: false,
             new_encoding_lossy: false,
@@ -1265,6 +1436,8 @@ mod tests {
             old_oid: oid,
             new_oid: oid,
             binary: false,
+            old_size: 0,
+            new_size: 0,
             content_changed: false,
             old_encoding_lossy: false,
             new_encoding_lossy: false,
@@ -1287,6 +1460,8 @@ mod tests {
             old_oid: ObjectId::from_hex("0000000000000000000000000000000000000001").unwrap(),
             new_oid: ObjectId::from_hex("0000000000000000000000000000000000000001").unwrap(),
             binary: false,
+            old_size: 0,
+            new_size: 0,
             content_changed: false,
             old_encoding_lossy: false,
             new_encoding_lossy: false,
@@ -1299,9 +1474,77 @@ mod tests {
     }
 
     #[test]
+    fn worktree_targets_have_no_stored_entries() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (repo, _) =
+            Repository::init(dir.path(), &crate::repo::InitOptions::default()).expect("init");
+        for target in [
+            DiffTarget::WorktreeVsHead,
+            DiffTarget::WorktreeVsTree(ObjectId::zero()),
+            DiffTarget::IndexVsHead,
+            DiffTarget::WorktreeVsIndex,
+        ] {
+            let entries = stored_target_entries(&repo, &target, &[], &DiffOptions::default())
+                .expect("no object reads");
+            assert_eq!(entries, None, "{target:?}");
+        }
+    }
+
+    #[test]
+    fn limit_target_entries_applies_pathspecs_then_diff_filter() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (repo, _) =
+            Repository::init(dir.path(), &crate::repo::InitOptions::default()).expect("init");
+        let entry = |status: DiffStatus, path: &str| DiffEntry {
+            status,
+            old_path: (status != DiffStatus::Added).then(|| path.to_owned()),
+            new_path: (status != DiffStatus::Deleted).then(|| path.to_owned()),
+            old_mode: FileMode::REGULAR,
+            new_mode: FileMode::REGULAR,
+            old_oid: ObjectId::zero(),
+            new_oid: ObjectId::zero(),
+            score: None,
+        };
+        let entries = crate::diff::DiffEntriesResult {
+            entries: vec![
+                entry(DiffStatus::Added, "a.txt"),
+                entry(DiffStatus::Deleted, "dir/b.txt"),
+                entry(DiffStatus::Modified, "dir/c.rs"),
+            ],
+            ..Default::default()
+        };
+        let paths = |kept: Vec<DiffEntry>| -> Vec<String> {
+            kept.iter()
+                .map(|e| {
+                    e.new_path
+                        .clone()
+                        .or(e.old_path.clone())
+                        .unwrap_or_default()
+                })
+                .collect()
+        };
+        let all = DiffOptions::default();
+        let kept = limit_target_entries(&repo, entries.clone(), &[], &all).expect("limit");
+        assert_eq!(paths(kept.entries), ["a.txt", "dir/b.txt", "dir/c.rs"]);
+
+        let kept =
+            limit_target_entries(&repo, entries.clone(), &["dir".to_owned()], &all).expect("dir");
+        assert_eq!(paths(kept.entries), ["dir/b.txt", "dir/c.rs"]);
+
+        let added_or_deleted = all.with_filter(Some("AD".parse().expect("filter")));
+        let kept =
+            limit_target_entries(&repo, entries.clone(), &[], &added_or_deleted).expect("filter");
+        assert_eq!(paths(kept.entries), ["a.txt", "dir/b.txt"]);
+
+        let kept = limit_target_entries(&repo, entries, &["dir".to_owned()], &added_or_deleted)
+            .expect("both");
+        assert_eq!(paths(kept.entries), ["dir/b.txt"]);
+    }
+
+    #[test]
     fn failed_revision_with_file_paths_keeps_revision_error() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let repo =
+        let (repo, _) =
             Repository::init(dir.path(), &crate::repo::InitOptions::default()).expect("init");
         let request = DiffRequest {
             positionals: vec!["unknown-revision".into()],
@@ -1310,16 +1553,27 @@ mod tests {
         };
         let err = resolve_diff_request(&repo, None, &request).expect_err("unknown revision");
         assert!(
-            matches!(err, ResolveDiffArgumentsError::UnresolvedRevision { spec, .. } if spec == "unknown-revision")
+            matches!(err, crate::error::Error::Diff(DiffError::Arguments(ResolveDiffArgumentsError::UnresolvedRevision { spec, .. })) if spec == "unknown-revision")
         );
     }
 
     #[test]
     fn resolve_errors_staged_and_unstaged() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let repo = crate::repo::Repository::init(dir.path(), &crate::repo::InitOptions::default())
-            .expect("init");
-        let err = resolve_diff_arguments(&repo, None, true, true, None, &[], &[]).unwrap_err();
-        assert!(matches!(err, ResolveDiffArgumentsError::StagedAndUnstaged));
+        let (repo, _) =
+            crate::repo::Repository::init(dir.path(), &crate::repo::InitOptions::default())
+                .expect("init");
+        let request = DiffRequest {
+            staged: true,
+            unstaged: true,
+            ..DiffRequest::default()
+        };
+        let err = resolve_diff_request(&repo, None, &request).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::error::Error::Diff(DiffError::Arguments(
+                ResolveDiffArgumentsError::StagedAndUnstaged
+            ))
+        ));
     }
 }

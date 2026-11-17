@@ -14,6 +14,10 @@
 #   make gate         - pre-integration gate (fmt, clippy, rustdoc, workspace tests)
 #   make public-api   - regenerate grit-lib/public-api.txt (pinned nightly + cargo-public-api)
 #   make public-api-check - diff committed public API snapshot against a fresh run
+#   make api-ratchet       - regenerate grit-lib/api-ratchet.toml (API quality counts)
+#   make api-ratchet-check - fail if API quality counts rose or fell without baseline update
+#   make api-ratchet-report - list consolidation offenders per top-level module (MODULE=diff filters)
+#   make semver-check     - compare grit-lib API to latest v* tag (cargo-semver-checks; informational)
 #   make coverage     - llvm-cov on grit-lib with per-module floor ratchet
 #   make clean        - remove build artifacts
 
@@ -26,7 +30,7 @@ GRIT_PROFILE ?= dist
 LLVM_COV_TARGET ?= target/llvm-cov-target
 GRIT_COV_BIN := $(CURDIR)/$(LLVM_COV_TARGET)/debug/grit
 
-.PHONY: all build debug test test-full clippy fmt doc gate clean docs docs-check coverage public-api public-api-check bench-lib bench-scenarios
+.PHONY: all build debug test test-full clippy fmt doc gate clean docs docs-check coverage public-api public-api-check api-ratchet api-ratchet-check api-ratchet-report api-audit api-audit-check cli-layer-ratchet cli-layer-ratchet-check semver-check bench-lib bench-scenarios
 
 BENCH_DIR := target/bench
 CRITERION_DIR := target/criterion
@@ -43,18 +47,21 @@ build:
 debug:
 	$(CARGO) build -p grit-cli
 
+# grit-lib integration tests link `test_support::fixtures`; enable on workspace test runs.
+WORKSPACE_TEST_FEATURES = --features grit-lib/test-support
+
 # nextest runs test binaries in parallel, each test in its own process
 # (.config/nextest.toml); it does not run doctests, so those go through cargo test.
 test:
 	@if $(CARGO) nextest --version >/dev/null 2>&1; then \
-		$(CARGO) nextest run --workspace && $(CARGO) test --workspace --doc; \
+		$(CARGO) nextest run --workspace $(WORKSPACE_TEST_FEATURES) && $(CARGO) test --workspace --doc $(WORKSPACE_TEST_FEATURES); \
 	else \
-		$(CARGO) test --workspace; \
+		$(CARGO) test --workspace $(WORKSPACE_TEST_FEATURES); \
 	fi
 
 # Tests that start the system git (comparisons, fixtures built with git) or build
 # heavy fixtures are compiled only with the full-tests feature of each crate.
-FULL_TESTS = --features grit-lib/full-tests,grit-cli/full-tests,grit-utils/full-tests,grit-examples/full-tests,grit-protocol/full-tests,grit-http-server/full-tests,grit-test-support/full-tests
+FULL_TESTS = --features grit-lib/test-support,grit-lib/full-tests,grit-cli/full-tests,grit-utils/full-tests,grit-examples/full-tests,grit-protocol/full-tests,grit-http-server/full-tests,grit-test-support/full-tests
 
 test-full:
 	$(CARGO) build --release -p grit-cli
@@ -80,7 +87,7 @@ gate:
 bench-lib:
 	@mkdir -p $(BENCH_DIR)
 	$(CARGO) build --release -p grit-utils
-	$(CARGO) bench -p grit-lib --features unstable-bench-helpers
+	$(CARGO) bench -p grit-lib --features test-support
 	./target/release/grit-bench criterion-summary --criterion-dir $(CRITERION_DIR) --format json --output $(BENCH_DIR)/criterion-summary.json
 
 bench-scenarios:
@@ -95,6 +102,32 @@ public-api:
 
 public-api-check:
 	./scripts/public-api.sh check
+	./scripts/public-api.sh check-api-migration
+	./scripts/public-api.sh check-test-items
+
+api-ratchet:
+	python3 scripts/api_ratchet.py update
+
+api-ratchet-check:
+	python3 scripts/api_ratchet.py check
+
+api-audit:
+	python3 scripts/api_ratchet.py audit --write
+
+api-audit-check:
+	python3 scripts/api_ratchet.py audit --check
+
+cli-layer-ratchet:
+	python3 scripts/cli_layer_stats.py update
+
+cli-layer-ratchet-check:
+	python3 scripts/cli_layer_stats.py check
+
+api-ratchet-report:
+	python3 scripts/api_ratchet.py report $(if $(MODULE),--module $(MODULE))
+
+semver-check:
+	./scripts/semver-check.sh check
 
 clean:
 	$(CARGO) clean
@@ -111,7 +144,7 @@ docs-check: site/node_modules
 	$(CARGO) doc -p grit-lib --no-deps
 	cd site && GRIT_SITE_STRICT=1 npm run check && npm test && npm run typecheck && GRIT_SITE_STRICT=1 npm run build
 
-LLVM_COV_FEATURES ?= http-ureq,unstable-bench-helpers,full-tests
+LLVM_COV_FEATURES ?= http-ureq,full-tests,test-support
 
 coverage:
 	@mkdir -p target/llvm-cov target/doc

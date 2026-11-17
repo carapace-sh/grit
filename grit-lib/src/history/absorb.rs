@@ -25,6 +25,7 @@ use super::fixup::staged_fixup_paths;
 use super::message::commit_subject_single_line;
 use super::plan::{conflict_error, plan_rewrite};
 use super::types::{CommitEdit, HistoryEdits, RewriteOptions, RewritePlan};
+use super::PlanningError;
 use super::{commit_tree, load_commit};
 
 /// Default maximum number of commits considered when `--base` is omitted.
@@ -33,7 +34,7 @@ pub const DEFAULT_ABSORB_STACK_LIMIT: usize = 10;
 /// How far a pure insertion may sit from blamed context before it stays staged.
 const PURE_ADD_MAX_DISTANCE: usize = 3;
 
-/// Options for [`absorb`].
+/// Options for [`History::absorb`](super::History::absorb).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AbsorbOptions {
     /// Oldest commit boundary (exclusive). When `None`, [`default_absorb_base`] applies.
@@ -162,7 +163,7 @@ pub struct UnassignedHunk {
     pub detail: Option<String>,
 }
 
-/// Result of [`absorb`]: rewrite plan plus assignment detail.
+/// Result of [`History::absorb`](super::History::absorb): rewrite plan plus assignment detail.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AbsorbPlan {
     /// Combined rewrite for every assigned target.
@@ -177,13 +178,10 @@ pub struct AbsorbPlan {
 
 /// Plan absorption of staged hunks into commits between `opts.base` and `HEAD`.
 ///
-/// # Errors
-///
-/// Returns [`HistoryError::BareRepository`], [`HistoryError::NothingStaged`], merge
-/// [`HistoryError::Conflict`], and other planning errors.
-pub fn absorb(repo: &Repository, opts: &AbsorbOptions) -> Result<AbsorbPlan, HistoryError> {
+/// See [`History::absorb`](super::History::absorb).
+pub(crate) fn absorb(repo: &Repository, opts: &AbsorbOptions) -> crate::error::Result<AbsorbPlan> {
     if repo.is_bare() {
-        return Err(HistoryError::BareRepository);
+        return Err(HistoryError::BareRepository.into());
     }
 
     let head = repo.head_commit()?;
@@ -191,7 +189,7 @@ pub fn absorb(repo: &Repository, opts: &AbsorbOptions) -> Result<AbsorbPlan, His
     let index = repo.load_index()?;
     let staged_entries = diff_index_to_tree(repo.odb(), &index, Some(&head_tree), false)?;
     if staged_entries.is_empty() {
-        return Err(HistoryError::NothingStaged);
+        return Err(HistoryError::NothingStaged.into());
     }
 
     let (stack, stack_bounds, _base) = if let Some(base) = opts.base {
@@ -340,10 +338,8 @@ fn empty_absorb_plan() -> AbsorbPlan {
 
 /// Paths touched by staged hunks that would be consumed on apply.
 ///
-/// # Errors
-///
-/// Returns [`HistoryError::BareRepository`] or diff failures.
-pub fn staged_absorb_paths(repo: &Repository) -> Result<Vec<String>, HistoryError> {
+/// See [`History::staged_paths`](super::History::staged_paths).
+pub(crate) fn staged_absorb_paths(repo: &Repository) -> crate::error::Result<Vec<String>> {
     staged_fixup_paths(repo)
 }
 
@@ -358,7 +354,7 @@ fn classify_path_hunks(
     stack_bounds: &AbsorbStackBounds,
     assignments: &mut Vec<HunkAssignment>,
     unassigned: &mut Vec<UnassignedHunk>,
-) -> Result<(), HistoryError> {
+) -> crate::error::Result<()> {
     let path = entry.path().to_owned();
     match entry.status {
         DiffStatus::Added => {
@@ -465,7 +461,7 @@ fn hunk_ranges_overlap_on_new_side(range: &HunkRange, others: &[(usize, usize)])
         .any(|&(other_start, other_end)| start <= other_end && end >= other_start)
 }
 
-fn synthetic_whole_file_hunks(entry: &DiffEntry) -> Result<Vec<HunkRange>, HistoryError> {
+fn synthetic_whole_file_hunks(entry: &DiffEntry) -> crate::error::Result<Vec<HunkRange>> {
     Ok(vec![HunkRange {
         old_start: 1,
         old_lines: if entry.status == DiffStatus::Deleted {
@@ -524,7 +520,7 @@ fn assign_hunk(
     stack_bounds: &AbsorbStackBounds,
     range: &HunkRange,
     hunk: &StructuredHunk,
-) -> Result<AssignHunkOutcome, HistoryError> {
+) -> crate::error::Result<AssignHunkOutcome> {
     let candidates = blame_candidates(repo, head, path, head_blob, range, stack_bounds)?;
     Ok(match candidates {
         BlameCandidates::HiddenByRef(detail) => AssignHunkOutcome::Unassigned(HunkAssignFailure {
@@ -595,7 +591,7 @@ fn blame_candidates(
     head_blob: &[u8],
     range: &HunkRange,
     stack_bounds: &AbsorbStackBounds,
-) -> Result<BlameCandidates, HistoryError> {
+) -> crate::error::Result<BlameCandidates> {
     if range.old_lines == 0 {
         return blame_candidates_for_pure_add(repo, head, path, head_blob, range, stack_bounds);
     }
@@ -638,7 +634,7 @@ fn blame_candidates_for_pure_add(
     head_blob: &[u8],
     range: &HunkRange,
     stack_bounds: &AbsorbStackBounds,
-) -> Result<BlameCandidates, HistoryError> {
+) -> crate::error::Result<BlameCandidates> {
     let head_lines = line_count(head_blob);
     let insert_at = range.new_start;
     let mut probe_lines = Vec::new();
@@ -705,7 +701,7 @@ fn hidden_by_ref_detail_for_blame(
     head: ObjectId,
     blame_commits: &HashSet<ObjectId>,
     bounds: &AbsorbStackBounds,
-) -> Result<Option<String>, HistoryError> {
+) -> crate::error::Result<Option<String>> {
     if bounds.excluded_refs.is_empty() || blame_commits.is_empty() {
         return Ok(None);
     }
@@ -761,7 +757,7 @@ impl BuiltAbsorbStack {
         &self,
         repo: &Repository,
         head: ObjectId,
-    ) -> Result<AbsorbStackBounds, HistoryError> {
+    ) -> crate::error::Result<AbsorbStackBounds> {
         let stack_set: HashSet<ObjectId> = self.commits.iter().copied().collect();
         let commits_without_branch_tips =
             absorb_stack_commits(repo, head, &self.hidden_without_branch_tips, self.max_count)?;
@@ -780,7 +776,7 @@ fn absorb_stack_set(
     head: ObjectId,
     hidden: &HashSet<ObjectId>,
     max_count: Option<usize>,
-) -> Result<HashSet<ObjectId>, HistoryError> {
+) -> crate::error::Result<HashSet<ObjectId>> {
     Ok(absorb_stack_commits(repo, head, hidden, max_count)?
         .into_iter()
         .collect())
@@ -791,7 +787,7 @@ fn absorb_stack_commits(
     head: ObjectId,
     hidden: &HashSet<ObjectId>,
     max_count: Option<usize>,
-) -> Result<Vec<ObjectId>, HistoryError> {
+) -> crate::error::Result<Vec<ObjectId>> {
     let negative: Vec<String> = hidden.iter().map(ObjectId::to_hex).collect();
     let walk = rev_list(
         repo,
@@ -820,7 +816,7 @@ fn fork_point_and_upstream_hidden(
     repo: &Repository,
     head: ObjectId,
     explicit_base: Option<ObjectId>,
-) -> Result<HashSet<ObjectId>, HistoryError> {
+) -> crate::error::Result<HashSet<ObjectId>> {
     let mut hidden = HashSet::new();
     if let Some(base) = explicit_base {
         hidden.insert(base);
@@ -997,7 +993,7 @@ pub(crate) fn remaining_index_blob_for_path(
     pre_index_blob: &[u8],
     path: &str,
     assignments: &[HunkAssignment],
-) -> Result<Vec<u8>, HistoryError> {
+) -> crate::error::Result<Vec<u8>> {
     let pre_head_blob = blob_at_path(repo, pre_head_tree, path).unwrap_or_default();
     let post_head_blob = blob_at_path(repo, post_head_tree, path).unwrap_or_default();
     let diff = structured_text_diff(
@@ -1070,7 +1066,7 @@ fn advance_working_index_after_target(
     assignments: &[HunkAssignment],
     unassigned: &[UnassignedHunk],
     targets_after: &[ObjectId],
-) -> Result<(), HistoryError> {
+) -> crate::error::Result<()> {
     let later_targets: HashSet<ObjectId> = targets_after.iter().copied().collect();
     let paths: HashSet<&str> = assignments
         .iter()
@@ -1114,7 +1110,7 @@ fn merged_tree_for_target_with_trees(
     target: ObjectId,
     assignments: &[HunkAssignment],
     unassigned: &[UnassignedHunk],
-) -> Result<ObjectId, HistoryError> {
+) -> crate::error::Result<ObjectId> {
     let partial_index =
         partial_index_for_target(repo, head_tree, index, target, assignments, unassigned)?;
     let index_tree = write_tree_from_index(repo.odb(), &partial_index, "")?;
@@ -1144,7 +1140,7 @@ fn partial_index_for_target(
     target: ObjectId,
     assignments: &[HunkAssignment],
     unassigned: &[UnassignedHunk],
-) -> Result<crate::index::Index, HistoryError> {
+) -> crate::error::Result<crate::index::Index> {
     let mut out = index.clone();
     let assigned_paths: HashSet<&str> = assignments
         .iter()
@@ -1195,7 +1191,7 @@ fn blob_with_assignments_on_path(
     index: &crate::index::Index,
     path: &str,
     assignments: &[HunkAssignment],
-) -> Result<Vec<u8>, HistoryError> {
+) -> crate::error::Result<Vec<u8>> {
     let head_blob = blob_at_path(repo, head_tree, path)?;
     let index_blob = index
         .get(path.as_bytes(), 0)
@@ -1240,7 +1236,7 @@ fn partial_blob_for_path(
     path: &str,
     target: ObjectId,
     assignments: &[HunkAssignment],
-) -> Result<Vec<u8>, HistoryError> {
+) -> crate::error::Result<Vec<u8>> {
     let selected: Vec<_> = assignments
         .iter()
         .filter(|a| a.path == path && a.commit == target)
@@ -1335,7 +1331,7 @@ fn write_index_blob(
     index: &mut crate::index::Index,
     path: &str,
     blob: &[u8],
-) -> Result<(), HistoryError> {
+) -> crate::error::Result<()> {
     let oid = repo.odb().write(ObjectKind::Blob, blob)?;
     let key = path.as_bytes();
     if let Some(entry) = index.get_mut(key, 0) {
@@ -1350,7 +1346,7 @@ fn restore_index_path_from_tree(
     index: &mut crate::index::Index,
     tree: ObjectId,
     path: &str,
-) -> Result<(), HistoryError> {
+) -> crate::error::Result<()> {
     match blob_at_path(repo, tree, path) {
         Ok(blob) => write_index_blob(repo, index, path, &blob),
         Err(_) => {
@@ -1362,10 +1358,11 @@ fn restore_index_path_from_tree(
 
 /// Default exclusive base for absorb when `--base` is omitted.
 ///
-/// # Errors
-///
-/// Returns planning failures when `HEAD` or branch metadata cannot be read.
-pub fn default_absorb_base(repo: &Repository, head: ObjectId) -> Result<ObjectId, HistoryError> {
+/// See [`History::default_absorb_base`](super::History::default_absorb_base).
+pub(crate) fn default_absorb_base(
+    repo: &Repository,
+    head: ObjectId,
+) -> crate::error::Result<ObjectId> {
     let stack = build_absorb_stack(repo, head, None)?;
     Ok(stack
         .commits
@@ -1379,7 +1376,7 @@ fn build_absorb_stack(
     repo: &Repository,
     head: ObjectId,
     explicit_base: Option<ObjectId>,
-) -> Result<BuiltAbsorbStack, HistoryError> {
+) -> crate::error::Result<BuiltAbsorbStack> {
     let mut hidden_branch_tips = HashSet::new();
     let excluded_refs = if explicit_base.is_some() {
         Vec::new()
@@ -1408,7 +1405,7 @@ fn build_absorb_stack(
 fn hide_other_branch_tips(
     repo: &Repository,
     hidden: &mut HashSet<ObjectId>,
-) -> Result<Vec<AbsorbExcludedRef>, HistoryError> {
+) -> crate::error::Result<Vec<AbsorbExcludedRef>> {
     let head_ref = resolve_head_for_repository(repo)?;
     let (current, head_tip) = match head_ref {
         HeadState::Branch { refname, oid, .. } => (Some(refname), oid),
@@ -1425,14 +1422,14 @@ fn hide_other_branch_tips(
         }
         hidden.insert(oid);
         excluded.push(AbsorbExcludedRef {
-            ref_name: name,
+            ref_name: name.as_str().to_owned(),
             tip: oid,
         });
     }
     Ok(excluded)
 }
 
-fn current_branch_short(repo: &Repository) -> Result<Option<String>, HistoryError> {
+fn current_branch_short(repo: &Repository) -> crate::error::Result<Option<String>> {
     match resolve_head_for_repository(repo)? {
         HeadState::Branch { refname, .. } => {
             Ok(refname.strip_prefix("refs/heads/").map(str::to_owned))
@@ -1447,7 +1444,7 @@ fn commit_subject(repo: &Repository, commit: ObjectId) -> String {
         .unwrap_or_default()
 }
 
-fn first_parent(repo: &Repository, commit: ObjectId) -> Result<Option<ObjectId>, HistoryError> {
+fn first_parent(repo: &Repository, commit: ObjectId) -> crate::error::Result<Option<ObjectId>> {
     let parents = load_commit(repo, commit)?.parents;
     Ok(parents.into_iter().next())
 }
@@ -1502,12 +1499,14 @@ pub(super) fn blob_at_path(
     repo: &Repository,
     tree: ObjectId,
     path: &str,
-) -> Result<Vec<u8>, HistoryError> {
+) -> crate::error::Result<Vec<u8>> {
     let odb = repo.odb();
     let entry = odb
         .tree_entry_at_path(&tree, path.as_bytes())?
-        .ok_or_else(|| HistoryError::Planning {
-            message: format!("path '{path}' not found in tree"),
+        .ok_or_else(|| {
+            HistoryError::Planning(PlanningError::AbsorbPathNotInTree {
+                path: path.to_string(),
+            })
         })?;
     Ok(odb.read(&entry.oid)?.data)
 }

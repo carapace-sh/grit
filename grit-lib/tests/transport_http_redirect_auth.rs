@@ -22,12 +22,11 @@ use std::time::{Duration, Instant};
 use base64::Engine as _;
 use grit_lib::config::ConfigSet;
 use grit_lib::objects::ObjectId;
-use grit_lib::refs::resolve_ref;
+use grit_lib::progress::NullProgress;
 use grit_lib::remote::credentials::{Credential, CredentialProvider};
-use grit_lib::remote::fetch::NoProgress;
 use grit_lib::remote::transfer::{FetchOptions, TagMode};
+use grit_lib::remote::transport::http::http_client_arc;
 use grit_lib::remote::transport::http::ureq_client::UreqHttpClient;
-use grit_lib::remote::transport::http::{http_client_arc, http_fetch};
 
 const USER: &str = "alice";
 const PASS: &str = "s3cr3t";
@@ -260,11 +259,10 @@ fn setup_fixture() -> Option<Fixture> {
 }
 
 fn fetch_opts() -> FetchOptions {
-    FetchOptions {
-        refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()],
-        tags: TagMode::None,
-        ..Default::default()
-    }
+    let mut opts = FetchOptions::new();
+    opts.refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()];
+    opts.tags = TagMode::None;
+    opts
 }
 
 #[test]
@@ -284,16 +282,29 @@ fn cross_authority_redirect_does_not_forward_cached_basic_auth() {
     client.seed_cached_basic_auth(&fx.gateway_url, "wronguser", "wrongpass");
 
     let mut opts = fetch_opts();
-    http_fetch(
-        http_client_arc(client),
+    grit_lib::repo::Repository::open(
         &fx.local_git,
-        &fx.gateway_url,
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&mut opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Http {
+            client: http_client_arc(client),
+            url: &fx.gateway_url,
+        },
         &mut opts,
-        &mut NoProgress,
+        &mut NullProgress,
+        grit_lib::progress::CancelToken::never_ref(),
     )
     .expect("fetch through cross-origin redirect");
 
-    let got = resolve_ref(&fx.local_git, "refs/remotes/origin/main").expect("origin/main");
+    let got = grit_test_support::refs::at(&fx.local_git)
+        .references()
+        .resolve("refs/remotes/origin/main")
+        .expect("origin/main");
     assert_eq!(got, fx.main_oid);
 
     let logged = read_logged_headers(&fx.headers_log);
@@ -321,21 +332,32 @@ fn cross_authority_redirect_does_not_forward_host_only_cookies() {
     let mut cfg = ConfigSet::new();
     cfg.add_command_override("http.cookieFile", cookie_file.to_str().unwrap())
         .unwrap();
-    let client = UreqHttpClient::from_config(&cfg)
-        .expect("from_config")
-        .with_credential_provider(Box::new(StaticProvider {
-            username: USER.to_owned(),
-            password: PASS.to_owned(),
-        }))
-        .with_git_protocol("version=2");
+    let client =
+        UreqHttpClient::from_config(&cfg, &grit_lib::config::environment::Environment::empty())
+            .expect("from_config")
+            .with_credential_provider(Box::new(StaticProvider {
+                username: USER.to_owned(),
+                password: PASS.to_owned(),
+            }))
+            .with_git_protocol("version=2");
 
     let mut opts = fetch_opts();
-    http_fetch(
-        http_client_arc(client),
+    grit_lib::repo::Repository::open(
         &fx.local_git,
-        &fx.gateway_url,
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&mut opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Http {
+            client: http_client_arc(client),
+            url: &fx.gateway_url,
+        },
         &mut opts,
-        &mut NoProgress,
+        &mut NullProgress,
+        grit_lib::progress::CancelToken::never_ref(),
     )
     .expect("fetch with host-only cookie file");
 

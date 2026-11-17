@@ -11,23 +11,23 @@ order: 4
 grit stash [-m <msg>] [-u] [-- path…]
 grit stash push [-m <msg>] [-u] [-S] [-k] [--hunks <id,...>] [--lines <path:start-end>] [--dry-run] [--pathspec-from-file <file|->] [--pathspec-file-nul] [-- path…]
 grit stash list
-grit stash show [<n>] [--stat] [-p] [-u]
-grit stash apply [<n>] [--index]
-grit stash pop [<n>] [--index]
-grit stash branch <name> [<n>]
+grit stash show [<n>|<commit>] [--stat] [-p] [-u]
+grit stash apply [<n>|<commit>] [--index]
+grit stash pop [<n>|<commit>] [--index]
+grit stash branch <name> [<n>|<commit>]
 grit stash drop [<n>]
 grit stash clear [--force] [--dry-run]
 ```
 
 ## Description
 
-Shelve uncommitted changes and restore them later. With no subcommand, `grit stash` saves local changes (same as `grit stash push`), resets the working tree and index to `HEAD`, and records a stash entry compatible with Git's `refs/stash` format.
+Shelve uncommitted changes and restore them later. With no subcommand, `grit stash` saves local changes (same as `grit stash push`), resets the working tree and index to `HEAD`, and records a stash entry compatible with Git's `refs/stash` format. Skip-worktree paths are not stashed or reset on push, and the bit stays set through pop, matching Git. Unreadable worktree directories produce a warning naming the path; stash still saves readable changes and does not treat files under those directories as deleted. Like Git, dirty content inside a checked-out submodule whose gitlink commit is unchanged does not count as a local change to save (push reports that there is nothing to stash); a submodule whose HEAD moved away from the recorded gitlink is still stashed.
 
 Like Git, stash never signs the commits it records, even when `commit.gpgsign` is true, so a configured signing program is not run on push.
 
-Pass `--` followed by pathspecs (or `--pathspec-from-file`) on push to stash only matching paths; other staged and unstaged changes stay in place. The stash commit still records the full index on its index parent; the working-tree parent and optional untracked parent are limited to those paths, matching `git stash push -- <pathspec>`.
+Pass `--` followed by pathspecs (or `--pathspec-from-file`) on push to stash only matching paths; other staged and unstaged changes stay in place. The stash commit still records the full index on its index parent; the working-tree parent and optional untracked parent are limited to those paths, matching `git stash push -- <pathspec>`. Attribute pathspecs such as `:(attr:myattr)` use the same `.gitattributes` stack as [`grit log`](log.md).
 
-Stash indices follow Git: `0` is the newest entry. You can pass an integer or `stash@{n}`.
+Stash indices follow Git: `0` is the newest entry. You can pass an integer or `stash@{n}`. An all-decimal token is always an index (never a short object id). Any other revision resolves to a stash commit id: `apply` and `branch` accept dangling stash commits (for example after `drop`), and `pop` accepts a commit id only while that commit is still on the stack.
 
 `grit stash pop` applies the entry and removes it when there are no conflicts. When applying would leave merge conflicts, the stash entry is kept and the command exits non-zero; conflicting paths are listed. There is no merge to continue: edit the files, mark them resolved with `grit add <file>`, then remove the kept entry with `grit stash drop` (or pick a side with `grit restore --ours|--theirs <file>`). `grit stash apply` stops the same way but never drops the entry.
 
@@ -37,7 +37,7 @@ When a stash was created with `-u` / `--include-untracked`, `apply` and `pop` re
 
 On an interactive terminal (human output, not `--json` or `--markdown`), push shows a live **Staging** line while it hashes local changes and a **Checkout** line while it resets them, and apply and pop show a **Checkout** line; nothing is drawn when stderr is not a TTY.
 
-Push, apply, and pop either complete or change nothing. Pressing Ctrl+C, or sending `SIGTERM` or `SIGHUP` on Unix, while the index or work tree is being updated stops the command with `error: operation cancelled`; `HEAD`, the index and the work tree are left as they were, no `.git/index.lock` is left behind, and the same stash command can simply be run again. This works the same in a Windows console, where Ctrl+Break counts as Ctrl+C. A second interrupt terminates grit at once, without that cleanup; only `SIGKILL` skips rollback. Staging may leave unreachable loose blobs if you interrupt mid-write; they are harmless.
+Push, apply, and pop either complete or change nothing. A pop or apply that includes untracked files finishes restoring every path (tracked and untracked) before it writes the index or drops the stash entry; if an object cannot be read (for example because background repack moved it while the command was running), the worktree and index are rolled back and the stash entry stays. Pressing Ctrl+C, or sending `SIGTERM` or `SIGHUP` on Unix, while the index or work tree is being updated stops the command with `error: operation cancelled`; `HEAD`, the index and the work tree are left as they were, no `.git/index.lock` is left behind, and the same stash command can simply be run again. This works the same in a Windows console, where Ctrl+Break counts as Ctrl+C. A second interrupt terminates grit at once, without that cleanup; only `SIGKILL` skips rollback. Staging may leave unreachable loose blobs if you interrupt mid-write; they are harmless.
 
 ## Options
 
@@ -54,7 +54,7 @@ Push, apply, and pop either complete or change nothing. Pressing Ctrl+C, or send
 | `<path>…` | Limit what is stashed (after `--`); with `--staged`, only matching index changes are saved and reset. |
 | `--pathspec-from-file` | Read pathspecs from a file, or `-` for stdin (same rules as Git). |
 | `--pathspec-file-nul` | With `--pathspec-from-file`, entries are NUL-separated instead of line-based. |
-| `--index` | On `apply` / `pop`, restore the stashed index as well as the worktree. |
+| `--index` | On `apply` / `pop`, restore the stashed index as well as the worktree. Changes that were unstaged when you stashed come back unstaged, including when nothing was staged at all. |
 | `<n>` | Stash index for `show`, `apply`, `pop`, or `drop` (default `0`). |
 | `--stat` | Show a diffstat in `grit stash show` (default when `-p` is not set). |
 | `-p`, `--patch` | Show the full patch in `grit stash show` instead of a diffstat. |
@@ -65,7 +65,7 @@ Push, apply, and pop either complete or change nothing. Pressing Ctrl+C, or send
 | `apply` | Apply an entry without removing it. |
 | `pop` | Apply an entry and drop it when clean. |
 | `drop` | Remove an entry without applying it. |
-| `branch` | Create a branch at the stash base commit, check it out, apply with `--index`, and drop the entry on success. |
+| `branch` | Create a branch at the stash base commit, check it out, apply with `--index` (staged changes come back staged, unstaged ones unstaged), and drop the entry on success. |
 | `clear` | Remove every stash entry. Requires `--force`; without it the command exits non-zero and reports how many entries would be cleared. `--dry-run` reports the count without deleting. |
 
 ## Examples
@@ -123,7 +123,7 @@ stash untracked restore blocked: 'notes.txt' already exists on disk
 
 ## JSON output
 
-Schema: [v1](/schemas/stash/v1.json) · [stash.push v1](/schemas/stash.push/v1.json) · [stash.list v1](/schemas/stash.list/v1.json) · [stash.show v1](/schemas/stash.show/v1.json) · [stash.apply v1](/schemas/stash.apply/v1.json) · [stash.pop v1](/schemas/stash.pop/v1.json) · [stash.drop v1](/schemas/stash.drop/v1.json) · [stash.branch v1](/schemas/stash.branch/v1.json) · [stash.clear v1](/schemas/stash.clear/v1.json)
+Schema: [v1](/schemas/stash/v1.json) · [stash.push v1](/schemas/stash.push/v1.json) · [stash.list v2](/schemas/stash.list/v2.json), [v1](/schemas/stash.list/v1.json) · [stash.show v1](/schemas/stash.show/v1.json) · [stash.apply v2](/schemas/stash.apply/v2.json), [v1](/schemas/stash.apply/v1.json) · [stash.pop v1](/schemas/stash.pop/v1.json) · [stash.drop v2](/schemas/stash.drop/v2.json), [v1](/schemas/stash.drop/v1.json) · [stash.branch v2](/schemas/stash.branch/v2.json), [v1](/schemas/stash.branch/v1.json) · [stash.clear v1](/schemas/stash.clear/v1.json)
 
 Pass `--json` for stable, scripting-friendly output.
 
@@ -175,23 +175,26 @@ When there was nothing to save:
 
 ### `grit stash list`
 
-The JSON value is a top-level array (newest entry first):
-
 ```json
-[
-  {
-    "index": 0,
-    "oid": "6e513d5cd6ab8d618238e22d7ca55d942b55964a",
-    "message": "On main: second"
-  }
-]
+{
+  "action": "list",
+  "entries": [
+    {
+      "index": 0,
+      "oid": "6e513d5cd6ab8d618238e22d7ca55d942b55964a",
+      "message": "On main: second"
+    }
+  ]
+}
 ```
 
 | Field | Type | Meaning |
 | ----- | ---- | ------- |
-| `index` | number | Index matching `stash@{index}`. |
-| `oid` | string | Full stash commit id. |
-| `message` | string | Reflog message. |
+| `action` | string | Always `"list"`. |
+| `entries` | array | Stash entries, newest first. |
+| `entries[].index` | number | Index matching `stash@{index}`. |
+| `entries[].oid` | string | Full stash commit id. |
+| `entries[].message` | string | Reflog message. |
 
 ### `grit stash show`
 
@@ -233,6 +236,7 @@ With `--patch`, a `patch` object with the same shape as [`grit diff`](../diff/) 
 {
   "branch": "from-stash",
   "base": "a1b2c3d4e5f6789012345678901234567890abcd",
+  "oid": "d78432c4772cb8509513bca138a60d13e5ad50fd",
   "index": 0,
   "conflicts": false
 }
@@ -244,7 +248,8 @@ When `conflicts` is true, `conflict_paths` lists paths with unmerged index entri
 | ----- | ---- | ------- |
 | `branch` | string | Branch created and checked out. |
 | `base` | string | Stash base commit (parent 1 of the W commit). |
-| `index` | number | Stash index that was applied. |
+| `oid` | string | Stash W commit that was applied. |
+| `index` | number | Stash index when the commit was on the stack (omitted for an off-stack commit id). |
 | `conflicts` | boolean | Whether merge conflicts remain after apply. |
 | `conflict_paths` | array of strings | Conflicted paths when `conflicts` is true. |
 
@@ -277,6 +282,7 @@ After `grit stash clear --force`:
 
 ```json
 {
+  "oid": "d78432c4772cb8509513bca138a60d13e5ad50fd",
   "index": 0,
   "conflicts": false,
   "index_restored": false,
@@ -290,7 +296,8 @@ Pop adds `dropped` (whether the entry was removed):
 
 | Field | Type | Meaning |
 | ----- | ---- | ------- |
-| `index` | number | Stash index targeted. |
+| `oid` | string | Stash W commit id (always set on apply). |
+| `index` | number | Stash index when the selector was on the stack (omitted for a bare commit id). |
 | `conflicts` | boolean | Whether merge conflicts remain. |
 | `index_restored` | boolean | Whether `--index` was used. |
 | `conflict_paths` | array of strings | Paths with unmerged index entries when `conflicts` is true. |
@@ -300,13 +307,15 @@ Pop adds `dropped` (whether the entry was removed):
 
 ```json
 {
-  "index": 0
+  "index": 0,
+  "oid": "d78432c4772cb8509513bca138a60d13e5ad50fd"
 }
 ```
 
 | Field | Type | Meaning |
 | ----- | ---- | ------- |
 | `index` | number | Stash index removed. |
+| `oid` | string | Full hex id of the dropped stash W commit (for recovery with `grit stash apply <oid>`). |
 
 ## Markdown output
 
@@ -349,6 +358,8 @@ hint: save local changes with `grit stash push`
 | `2` | Invalid flags or arguments ([`usage`](../exit-codes/)). |
 
 See [Exit codes](../exit-codes/) for shared rules and structured `--json` `kind` values.
+
+With `--json`, typed stash failures use the shared [error schema](/schemas/error/v1.json). Common `kind` values include `stash_not_found` when `apply`, `pop`, `drop`, or `show` names an index with no entry (for example `pop` on an empty stack), `not_a_repository` when the command needs a repository, and `lock_held` when another process holds `.git/index.lock` before any stash write. Human messages name the missing index (`stash@{n}`) or say `no stash entries` when the stack is empty. Apply and pop that would overwrite local tracked edits or clobber an on-disk untracked file exit **1** without changing the stash entry; `--json` still carries the error string (no separate `kind` yet for those cases).
 
 When another process holds `.git/index.lock`, `grit stash`, `stash push`, `apply`, `pop` and `branch` fail with exit `1` (`kind` `lock_held` under `--json`) before writing anything: no stash commit or `refs/stash` entry is created, and the worktree and index are unchanged. Retry once the other process finishes. If a push fails after `refs/stash` was updated (for example an I/O error while resetting the worktree), the entry stays on the stash so the saved changes are never only a dangling object.
 

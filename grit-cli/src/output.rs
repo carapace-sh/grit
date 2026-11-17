@@ -14,27 +14,21 @@
 //!   exit code *or* the presence of an `error` key.
 //! * progress / prompts / diagnostics go to **stderr** and never pollute stdout.
 
+use crate::json_filter::write_json_filter_val;
+use crate::json_to_jaq;
+use crate::stdio;
+use crate::ui::entry_path;
 use anyhow::{bail, Result};
-use grit_lib::command_runner::hooks::HookError;
 use grit_lib::diff::{DiffEntry, DiffStatus};
+use grit_lib::porcelain::log::DecorationKind;
 use schemars::JsonSchema;
 use serde::Serialize;
 use std::io::{ErrorKind, IsTerminal, Write};
+use std::path::Path;
+#[cfg(test)]
 use time::OffsetDateTime;
 
-use crate::cli_messages::human_error_message;
-use crate::json_error::structured_json_payload;
-use crate::json_filter::apply_json_filter;
-use crate::stdio;
-use crate::ui::entry_path;
-use grit_lib::porcelain::log::DecorationKind;
-
-/// Wall-clock instant captured once per process invocation for relative dates.
-#[derive(Clone, Copy, Debug)]
-pub struct RenderContext {
-    /// Current time with repository timezone semantics applied at capture.
-    pub now: OffsetDateTime,
-}
+pub use crate::render::{HumanRender, MarkdownRender, OutputMode, RenderContext};
 
 /// Write one line to `w`, treating a closed pipe as success.
 #[macro_export]
@@ -47,17 +41,6 @@ macro_rules! outln {
 
 pub(crate) use outln;
 
-/// How a command's outcome should be rendered.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum OutputMode {
-    /// Human-readable text (the default).
-    Human,
-    /// A single machine-readable JSON object on stdout.
-    Json,
-    /// Agent-friendly Markdown on stdout.
-    Markdown,
-}
-
 /// Rendering options for a command outcome.
 #[derive(Clone, Debug)]
 pub struct OutputOptions {
@@ -68,6 +51,12 @@ pub struct OutputOptions {
 }
 
 impl OutputOptions {
+    /// Whether this invocation should emit human progress lines to stderr.
+    #[must_use]
+    pub fn show_progress(&self) -> bool {
+        self.mode == OutputMode::Human
+    }
+
     /// Reject incompatible output flag combinations.
     pub fn validate(&self) -> Result<()> {
         if self.filter.is_some() && self.mode != OutputMode::Json {
@@ -80,49 +69,90 @@ impl OutputOptions {
     }
 }
 
-/// Render a value as the command's human-readable output.
-pub trait HumanRender {
-    /// Write human-oriented text to `w`.
-    fn render_human(&self, w: &mut dyn Write, ctx: &RenderContext) -> Result<()>;
-}
-
-/// Render a command outcome as agent-friendly Markdown on stdout.
-pub trait MarkdownRender: Serialize {
-    fn render_markdown(&self, w: &mut dyn Write, ctx: &RenderContext) -> Result<()>;
-}
-
 /// Render a command outcome to stdout in the chosen mode.
 ///
 /// Generic (rather than `Box<dyn …>`) because `serde::Serialize` is not
 /// object-safe; each dispatch arm calls this with its concrete outcome type.
 pub fn emit<T: Serialize + HumanRender + MarkdownRender>(
-    value: &T,
+    value: T,
     opts: &OutputOptions,
     ctx: &RenderContext,
 ) -> Result<()> {
     opts.validate()?;
     let stdout = std::io::stdout();
-    let mut lock = stdout.lock();
-    let render = |w: &mut dyn Write| -> Result<()> {
-        match opts.mode {
+    let lock = stdout.lock();
+    let mode = opts.mode;
+    let filter = opts.filter.clone();
+    let render = move |w: &mut StreamingStdout<'_>| -> Result<()> {
+        match mode {
             OutputMode::Human => value.render_human(w, ctx),
-            OutputMode::Json => write_json(w, value, opts.filter.as_deref()),
+            OutputMode::Json => write_json(w, value, filter.as_deref()),
             OutputMode::Markdown => value.render_markdown(w, ctx),
         }
     };
     // Rust's stdout flushes every line, so a large single-line JSON document, or a long list,
     // costs a write per kilobyte or per line. Buffer like C stdio does: always for the single
     // JSON value, and for text unless a terminal is watching it appear.
-    if opts.mode != OutputMode::Json && lock.is_terminal() {
-        return render(&mut lock);
+    if mode != OutputMode::Json && lock.is_terminal() {
+        let mut out = StreamingStdout::Terminal(lock);
+        return render(&mut out);
     }
-    let mut buffered = std::io::BufWriter::with_capacity(OUTPUT_BUFFER_BYTES, lock);
-    render(&mut buffered)?;
-    stdio::io_result(buffered.flush()).map_err(|e| anyhow::anyhow!("writing output: {e}"))
+    with_streaming_writer(lock, render)
 }
 
-/// Stdout buffer size for [`emit`] when output is not shown on a terminal.
-const OUTPUT_BUFFER_BYTES: usize = 64 * 1024;
+/// Stdout buffer size for [`emit`] and streamed command bodies when output is not a terminal.
+pub(crate) const OUTPUT_BUFFER_BYTES: usize = 64 * 1024;
+
+/// Locked stdout, optionally wrapped in a 64 KiB buffer when output is not a terminal.
+pub(crate) enum StreamingStdout<'a> {
+    /// Line-buffered terminal output.
+    Terminal(std::io::StdoutLock<'a>),
+    /// Buffered output for pipes and redirects.
+    Buffered(std::io::BufWriter<std::io::StdoutLock<'a>>),
+}
+
+impl Write for StreamingStdout<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Terminal(w) => w.write(buf),
+            Self::Buffered(w) => w.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Terminal(w) => w.flush(),
+            Self::Buffered(w) => w.flush(),
+        }
+    }
+}
+
+/// Run `f` on a writer backed by locked stdout. When stdout is not a terminal, wrap it in a
+/// 64 KiB buffer so redirected or piped output does not flush on every line.
+pub(crate) fn with_streaming_stdout<R>(
+    f: impl FnOnce(&mut StreamingStdout<'_>) -> Result<R>,
+) -> Result<R> {
+    let stdout = std::io::stdout();
+    let lock = stdout.lock();
+    with_streaming_writer(lock, f)
+}
+
+fn with_streaming_writer<R>(
+    lock: std::io::StdoutLock<'_>,
+    f: impl FnOnce(&mut StreamingStdout<'_>) -> Result<R>,
+) -> Result<R> {
+    if lock.is_terminal() {
+        let mut out = StreamingStdout::Terminal(lock);
+        return f(&mut out);
+    }
+    let mut out =
+        StreamingStdout::Buffered(std::io::BufWriter::with_capacity(OUTPUT_BUFFER_BYTES, lock));
+    let result = f(&mut out)?;
+    if let StreamingStdout::Buffered(w) = &mut out {
+        stdio::io_result(w.flush()).map_err(|e| anyhow::anyhow!("writing output: {e}"))?;
+    }
+    Ok(result)
+}
 
 /// Render an outcome into an in-memory string (for snapshot tests).
 #[cfg(test)]
@@ -134,27 +164,33 @@ pub fn render_to_string<T: Serialize + HumanRender + MarkdownRender>(
     let mut buf = Vec::new();
     match mode {
         OutputMode::Human => value.render_human(&mut buf, ctx)?,
-        OutputMode::Json => write_json(&mut buf, value, None)?,
+        OutputMode::Json => {
+            json_write(serde_json::to_writer(&mut buf, value))?;
+            stdio::io_result(writeln!(&mut buf))
+                .map_err(|e| anyhow::anyhow!("writing output: {e}"))?;
+        }
         OutputMode::Markdown => value.render_markdown(&mut buf, ctx)?,
     }
     Ok(String::from_utf8(buf)?)
 }
 
 /// Serialize `value` to `w`, optionally applying a jq-like `filter`.
-fn write_json<T: Serialize>(w: &mut dyn Write, value: &T, filter: Option<&str>) -> Result<()> {
+fn write_json<T: Serialize>(w: &mut dyn Write, value: T, filter: Option<&str>) -> Result<()> {
     if let Some(expr) = filter {
-        let full = serde_json::to_value(value)
-            .map_err(|e| anyhow::anyhow!("serializing JSON output: {e}"))?;
-        let filtered = apply_json_filter(&full, expr)?;
-        json_write(serde_json::to_writer(&mut *w, &filtered))?;
+        // Build the jaq input tree in one pass from the typed outcome (interning
+        // object keys). Do not serialize to JSON bytes and re-parse: that roughly
+        // doubles work and peak RSS on large diff/log payloads (#2409).
+        let input_val = json_to_jaq::serialize_value(value)
+            .map_err(|e| anyhow::anyhow!("serializing JSON for filter: {e}"))?;
+        write_json_filter_val(w, input_val, expr)?;
     } else {
-        json_write(serde_json::to_writer(&mut *w, value))?;
+        json_write(serde_json::to_writer(&mut *w, &value))?;
     }
     stdio::io_result(writeln!(w)).map_err(|e| anyhow::anyhow!("writing output: {e}"))?;
     Ok(())
 }
 
-fn json_write(result: Result<(), serde_json::Error>) -> Result<()> {
+pub(crate) fn json_write(result: Result<(), serde_json::Error>) -> Result<()> {
     match result {
         Ok(()) => Ok(()),
         Err(e) if e.io_error_kind() == Some(ErrorKind::BrokenPipe) => Ok(()),
@@ -165,64 +201,15 @@ fn json_write(result: Result<(), serde_json::Error>) -> Result<()> {
 /// Report a command failure: `{"error": "…"}` on stdout in JSON mode, or the
 /// usual `error: …` line on stderr in human mode. The caller still exits 1.
 pub fn emit_error(err: &anyhow::Error, opts: &OutputOptions) {
-    if let Err(filter_err) = opts.validate() {
-        eprintln!("error: {filter_err:#}");
-        return;
-    }
-    let human = human_error_message(err);
-    let hook_output = crate::json_error::hook_error_from_chain(err).and_then(HookError::output);
-    let hint = structured_json_payload(err).and_then(|payload| payload.hint);
-    match opts.mode {
-        OutputMode::Human => {
-            if let Some(output) = hook_output {
-                let mut stderr = std::io::stderr().lock();
-                let _ = stdio::io_result(stderr.write_all(&output.stdout));
-                let _ = stdio::io_result(stderr.write_all(&output.stderr));
-            }
-            if human.starts_with("fatal:") || human.starts_with("error:") {
-                eprintln!("{human}");
-            } else {
-                eprintln!("error: {human}");
-            }
-            if let Some(hint) = &hint {
-                eprintln!("hint: {hint}");
-            }
-        }
-        OutputMode::Markdown => {
-            let stdout = std::io::stdout();
-            let mut lock = stdout.lock();
-            let _ = stdio::io_result(writeln!(lock, "**Error:** {human}"));
-            if let Some(hint) = &hint {
-                let _ = stdio::io_result(writeln!(lock, "\n**Hint:** {hint}"));
-            }
-            if let Some(output) = hook_output {
-                let _ = crate::markdown::render_hook_output(
-                    &mut lock,
-                    &String::from_utf8_lossy(&output.stdout),
-                    &String::from_utf8_lossy(&output.stderr),
-                );
-            }
-        }
-        OutputMode::Json => {
-            let payload = if let Some(structured) = structured_json_payload(err) {
-                serde_json::to_value(structured)
-                    .unwrap_or_else(|_| serde_json::json!({ "error": human.clone() }))
-            } else if let Some(expr) = opts.filter.as_deref() {
-                let full = serde_json::json!({ "error": human.clone() });
-                match apply_json_filter(&full, expr) {
-                    Ok(filtered) => filtered,
-                    Err(filter_err) => {
-                        serde_json::json!({ "error": format!("{filter_err:#}") })
-                    }
-                }
-            } else {
-                serde_json::json!({ "error": human })
-            };
-            let stdout = std::io::stdout();
-            let mut lock = stdout.lock();
-            let _ = stdio::io_result(writeln!(lock, "{payload}"));
-        }
-    }
+    crate::render::error::emit(err, opts);
+}
+
+/// Whether human stdout should emit ANSI color for this process (TTY, ANSI, no `NO_COLOR`).
+#[must_use]
+pub fn stdout_color_enabled() -> bool {
+    std::io::stdout().is_terminal()
+        && grit_lib::porcelain::terminal::ansi_supported()
+        && std::env::var_os("NO_COLOR").is_none()
 }
 
 /// Emit a human-only progress line to **stderr**. Suppressed in JSON mode so
@@ -327,6 +314,14 @@ pub struct CommitJson {
     pub change_id_stored: bool,
 }
 
+/// Submodule detail on a gitlink change in status/diff JSON output.
+#[derive(Serialize, JsonSchema)]
+pub struct SubmoduleChangeJson {
+    pub new_commits: bool,
+    pub modified: bool,
+    pub untracked: bool,
+}
+
 /// A single worktree/index change in JSON output.
 #[derive(Serialize, JsonSchema)]
 pub struct ChangeJson {
@@ -335,6 +330,9 @@ pub struct ChangeJson {
     /// Previous path for renames and copies (`null` when not applicable).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub old_path: Option<String>,
+    /// Present for gitlink worktree changes (`160000`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub submodule: Option<SubmoduleChangeJson>,
 }
 
 /// Machine-readable diff change status (`--json` / `--markdown` contract).
@@ -385,15 +383,34 @@ impl From<&DiffStatus> for ChangeStatus {
 }
 
 /// Serialize a [`DiffEntry`] as a [`ChangeJson`].
+#[allow(dead_code)] // thin wrapper kept for callers that do not have a work tree path
 pub fn change_json(entry: &DiffEntry) -> ChangeJson {
+    change_json_with_worktree(entry, None)
+}
+
+/// Like [`change_json`], with optional superproject work tree for gitlink submodule detail.
+pub fn change_json_with_worktree(entry: &DiffEntry, work_tree: Option<&Path>) -> ChangeJson {
     let old_path = match entry.status {
         DiffStatus::Renamed | DiffStatus::Copied => entry.old_path.clone(),
         _ => None,
     };
+    let submodule = work_tree.and_then(|wt| {
+        if !entry.old_mode.is_gitlink() || entry.status != DiffStatus::Modified {
+            return None;
+        }
+        let path = entry_path(entry);
+        let flags = grit_lib::diff::submodule_porcelain_flags(wt, path, entry.old_oid);
+        Some(SubmoduleChangeJson {
+            new_commits: flags.new_commits,
+            modified: flags.modified,
+            untracked: flags.untracked,
+        })
+    });
     ChangeJson {
         path: entry_path(entry).to_owned(),
         status: entry.status.into(),
         old_path,
+        submodule,
     }
 }
 
@@ -427,6 +444,8 @@ mod tests {
     fn sample_ctx() -> RenderContext {
         RenderContext {
             now: OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("valid timestamp"),
+            mode: OutputMode::Human,
+            color: false,
         }
     }
 

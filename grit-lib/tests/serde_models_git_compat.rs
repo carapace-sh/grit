@@ -3,9 +3,10 @@
 #![cfg(feature = "serde-models")]
 
 use grit_lib::config::environment::RepositoryOptions;
-use grit_lib::porcelain::log::{load_commits_with_decorations, DecorationMap};
-use grit_lib::porcelain::status::{status, StatusOptions};
-use grit_lib::progress::{NeverCancel, NullProgress};
+use grit_lib::porcelain::log::DecorationMap;
+use grit_lib::porcelain::status::StatusOptions;
+use grit_lib::progress::CancelToken;
+use grit_lib::progress::NullProgress;
 use grit_lib::repo::Repository;
 use grit_test_support::git;
 
@@ -38,13 +39,14 @@ fn status_model_of_git_paused_merge_serializes_operation_and_conflicts() {
         .with_status(1);
 
     let repo = open(root);
-    let model = status(
-        &repo,
-        &StatusOptions::default(),
-        &mut NullProgress,
-        &NeverCancel,
-    )
-    .expect("status");
+    let model = repo
+        .status()
+        .run(
+            &StatusOptions::default(),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("status");
     let json = serde_json::to_value(&model).expect("serialize status");
 
     assert_eq!(json["head"]["branch"]["short_name"], "main");
@@ -53,7 +55,10 @@ fn status_model_of_git_paused_merge_serializes_operation_and_conflicts() {
     assert_eq!(json["conflicts"][0], "a.txt");
     assert_eq!(json["conflict_details"][0]["path"], "a.txt");
     assert_eq!(json["conflict_details"][0]["kind"], "both_modified");
-    assert!(json.get("index").is_none(), "the index is not serialized");
+    assert!(
+        json.get("index").unwrap().is_none(),
+        "the index is not serialized"
+    );
 }
 
 /// Author and committer dates match what `git log` reports for the same commit.
@@ -75,8 +80,10 @@ fn loaded_commit_signatures_match_git_log_dates() {
     let head = git(root, &["rev-parse", "HEAD"]);
     let oid = grit_lib::objects::ObjectId::from_hex(head.trim()).expect("oid");
     let repo = open(root);
-    let loaded =
-        load_commits_with_decorations(&repo, &[oid], &DecorationMap::default()).expect("load");
+    let loaded = repo
+        .revwalk()
+        .load_commits(&[oid], &DecorationMap::default(), &mut ())
+        .expect("load");
     let json = serde_json::to_value(&loaded[0]).expect("serialize commit");
 
     let git_dates = git(root, &["log", "-1", "--format=%aI%n%cI"]);

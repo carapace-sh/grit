@@ -1,5 +1,6 @@
 //! Loose object store scenarios from upstream t1006/t1007/t1050/t1060 (object-level).
 
+use grit_lib::error::ObjectError;
 use std::io::Write;
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -7,7 +8,8 @@ use std::time::Duration;
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use grit_lib::config::environment::Environment;
-use grit_lib::error::Error;
+use grit_lib::error::{Error, ObjectReadFailure};
+use grit_lib::objects::odb::store::read_loose_object_info;
 use grit_lib::objects::odb::{
     hash_algo_for_git_dir, hash_algo_for_objects_dir, Odb, WriteOptions, BULK_NEW_LOOSE_WRITE,
 };
@@ -236,6 +238,29 @@ fn large_blob_round_trip_grit_then_git_and_git_then_grit() {
     }
 }
 
+fn assert_corrupt_loose(err: Error, oid: &ObjectId, path: &std::path::Path) {
+    match err {
+        Error::Object(ObjectError::CorruptLoose {
+            oid: got_oid,
+            path: got_path,
+            source,
+            ..
+        }) => {
+            assert_eq!(got_oid, *oid);
+            assert_eq!(got_path, path);
+            assert!(
+                matches!(
+                    source.as_ref(),
+                    Error::Object(ObjectError::Zlib { .. })
+                        | Error::Object(ObjectError::Corrupt { .. })
+                ),
+                "source: {source:?}"
+            );
+        }
+        other => panic!("expected CorruptLooseObject, got {other:?}"),
+    }
+}
+
 #[test]
 fn t1060_loose_zlib_bit_flip_returns_zlib_error() {
     let repo = init_repo(HashAlgo::Sha1);
@@ -245,7 +270,11 @@ fn t1060_loose_zlib_bit_flip_returns_zlib_error() {
     make_loose_object_mutable(&path);
     flip_byte_at(&path, 4).expect("flip");
     let err = odb.read(&oid).unwrap_err();
-    assert!(matches!(err, Error::Zlib(_)), "{err:?}");
+    assert_corrupt_loose(err, &oid, &path);
+    let info = odb
+        .read_info(&oid)
+        .expect("header still readable after mid-file flip");
+    assert_eq!(info.size, 7);
 }
 
 #[test]
@@ -267,7 +296,110 @@ fn t1060_loose_truncated_returns_zlib_error() {
             .expect("truncate");
     }
     let err = odb.read(&oid).unwrap_err();
-    assert!(matches!(err, Error::Zlib(_)), "{err:?}");
+    assert_corrupt_loose(err, &oid, &path);
+}
+
+#[test]
+fn t1060_loose_empty_file_returns_corrupt_loose_with_io_source() {
+    let repo = init_repo(HashAlgo::Sha1);
+    let odb = Odb::new(&repo.objects_dir());
+    let oid = odb.write(ObjectKind::Blob, b"empty-file").expect("write");
+    let path = odb.object_path(&oid);
+    make_loose_object_mutable(&path);
+    std::fs::write(&path, []).expect("empty loose");
+    let err = odb.read(&oid).unwrap_err();
+    match err {
+        Error::Object(ObjectError::CorruptLoose { source, .. }) => {
+            assert!(
+                matches!(
+                    *source,
+                    ObjectReadFailure::Io(_) | ObjectReadFailure::Zlib(_)
+                ),
+                "{source:?}"
+            );
+        }
+        other => panic!("expected CorruptLooseObject, got {other:?}"),
+    }
+    let err = odb.read_info(&oid).unwrap_err();
+    assert_corrupt_loose(err, &oid, &path);
+    let Err(err) = odb.open_stream(&oid) else {
+        panic!("open_stream must fail on empty loose object");
+    };
+    assert_corrupt_loose(err, &oid, &path);
+}
+
+#[test]
+fn read_loose_object_info_sha256_corrupt_wraps_corrupt_loose() {
+    if !git_supports_sha256() {
+        return;
+    }
+    let repo = init_repo(HashAlgo::Sha256);
+    let odb = Odb::new(&repo.objects_dir());
+    let oid = odb.write(ObjectKind::Blob, b"sha256-wrap").expect("write");
+    let path = odb.object_path(&oid);
+    make_loose_object_mutable(&path);
+    flip_byte_at(&path, 4).expect("flip");
+    let err = read_loose_object_info(&path).unwrap_err();
+    assert_corrupt_loose(err, &oid, &path);
+}
+
+#[test]
+fn t1060_packed_zlib_bit_flip_names_pack_and_offset() {
+    let repo = init_repo(HashAlgo::Sha1);
+    let odb = Odb::new(&repo.objects_dir());
+    let payload = vec![0u8; 20_000];
+    let oid = odb.write(ObjectKind::Blob, &payload).expect("write");
+    git_in(repo.path(), &["add", "-A"]);
+    git_in(repo.path(), &["commit", "-m", "c"]);
+    git_in(repo.path(), &["repack", "-adq"]);
+    odb.invalidate_packs();
+    let pack_path = std::fs::read_dir(repo.path().join(".git/objects/pack"))
+        .expect("pack dir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|x| x == "pack"))
+        .expect("pack file");
+    let mut bytes = std::fs::read(&pack_path).expect("read pack");
+    let flip_at = 300.min(bytes.len().saturating_sub(1));
+    bytes[flip_at] ^= 0x55;
+    make_loose_object_mutable(&pack_path);
+    std::fs::write(&pack_path, &bytes).expect("write pack");
+    odb.invalidate_packs();
+    let err = odb.read(&oid).unwrap_err();
+    match err {
+        Error::Object(ObjectError::CorruptPacked {
+            oid: got_oid,
+            pack,
+            offset,
+            source,
+            ..
+        }) => {
+            assert_eq!(got_oid, oid);
+            assert_eq!(pack, pack_path);
+            assert!(offset > 0);
+            assert!(
+                matches!(
+                    *source,
+                    ObjectReadFailure::Zlib(_) | ObjectReadFailure::CorruptObject(_)
+                ),
+                "{source:?}"
+            );
+        }
+        other => panic!("expected CorruptPackedObject, got {other:?}"),
+    }
+}
+
+fn git_in(dir: &std::path::Path, args: &[&str]) {
+    let out = Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .expect("git");
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[test]
@@ -286,7 +418,7 @@ fn t1060_loose_header_size_mismatch_returns_corrupt_object() {
     std::fs::write(&path, zlib).unwrap();
     let err = odb.read(&oid).unwrap_err();
     assert!(
-        matches!(err, Error::CorruptObject(_)),
+        matches!(err, Error::Object(ObjectError::Corrupt { .. })),
         "expected CorruptObject, got {err:?}"
     );
 }
@@ -307,7 +439,7 @@ fn t1060_loose_header_type_mismatch_returns_loose_hash_mismatch() {
     std::fs::write(&path, zlib).unwrap();
     let err = Odb::read_loose_verify_oid(&path, &oid).unwrap_err();
     assert!(
-        matches!(err, Error::LooseHashMismatch { .. }),
+        matches!(err, Error::Object(ObjectError::LooseHashMismatch { .. })),
         "expected LooseHashMismatch, got {err:?}"
     );
 }
@@ -326,7 +458,10 @@ fn t1060_read_loose_verify_oid_wrong_path_returns_loose_hash_mismatch() {
     std::fs::copy(&real_path, &decoy_path).expect("copy to wrong name");
     let _ = std::fs::remove_file(&real_path);
     let err = Odb::read_loose_verify_oid(&decoy_path, &decoy_oid).unwrap_err();
-    assert!(matches!(err, Error::LooseHashMismatch { .. }), "{err:?}");
+    assert!(
+        matches!(err, Error::Object(ObjectError::LooseHashMismatch { .. })),
+        "{err:?}"
+    );
 }
 
 #[test]
@@ -335,7 +470,10 @@ fn t1060_missing_loose_object_returns_object_not_found() {
     let odb = Odb::new(&repo.objects_dir());
     let missing = odb.hash(ObjectKind::Blob, b"never-written").expect("hash");
     let err = odb.read(&missing).unwrap_err();
-    assert!(matches!(err, Error::ObjectNotFound(_)), "{err:?}");
+    assert!(
+        matches!(err, Error::Object(ObjectError::NotFound { .. })),
+        "{err:?}"
+    );
 }
 
 #[test]
@@ -354,7 +492,7 @@ fn odb_exists_local_freshen_and_write_options() {
     assert!(after >= before);
 
     let again = odb
-        .write_with_options(
+        .write_with(
             ObjectKind::Blob,
             b"opts",
             WriteOptions {
@@ -391,7 +529,7 @@ fn write_trust_new_loose_and_assume_loose_only_existence() {
     let odb = Odb::new(&repo.objects_dir());
     let data = b"trust-new";
     let oid = odb
-        .write_with_options(
+        .write_with(
             ObjectKind::Blob,
             data,
             WriteOptions {
@@ -403,7 +541,7 @@ fn write_trust_new_loose_and_assume_loose_only_existence() {
     assert_eq!(odb.read(&oid).unwrap().data, data);
 
     let oid2 = odb
-        .write_with_options(
+        .write_with(
             ObjectKind::Blob,
             data,
             WriteOptions {
@@ -469,7 +607,10 @@ fn t1060_object_header_too_long_returns_typed_error() {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(&path, zlib).unwrap();
     let err = odb.read(&oid).unwrap_err();
-    assert!(matches!(err, Error::ObjectHeaderTooLong { .. }), "{err:?}");
+    assert!(
+        matches!(err, Error::Object(ObjectError::HeaderTooLong { .. })),
+        "{err:?}"
+    );
 }
 
 #[test]
@@ -615,7 +756,7 @@ fn bulk_trust_new_loose_materializes_loose_when_object_only_in_cruft_pack() {
     assert!(odb.exists_local(&oid));
 
     let again = odb
-        .write_with_options(ObjectKind::Blob, data, BULK_NEW_LOOSE_WRITE)
+        .write_with(ObjectKind::Blob, data, BULK_NEW_LOOSE_WRITE)
         .expect("bulk write after cruft repack");
     assert_eq!(again, oid);
     assert!(
@@ -690,7 +831,7 @@ fn bulk_stage_write_skips_blob_already_in_regular_pack_and_freshens_it() {
     filetime::set_file_mtime(&pack, old).unwrap();
 
     let again = odb
-        .write_with_options(ObjectKind::Blob, data, opts)
+        .write_with(ObjectKind::Blob, data, opts)
         .expect("bulk stage write of packed blob");
     assert_eq!(again, oid);
     assert!(
@@ -719,7 +860,7 @@ fn bulk_stage_write_skips_blob_already_in_regular_pack_and_freshens_it() {
     );
 
     let new_oid = odb
-        .write_with_options(ObjectKind::Blob, b"brand new\n", opts)
+        .write_with(ObjectKind::Blob, b"brand new\n", opts)
         .expect("bulk stage write of new blob");
     assert!(odb.object_path(&new_oid).is_file());
     assert!(git_fsck(repo.path(), true).ok, "git fsck --strict");
@@ -737,7 +878,7 @@ fn bulk_stage_write_materializes_loose_when_object_only_in_cruft_pack() {
 
     let opts = odb.bulk_stage_write_options();
     assert!(opts.freshen_existing);
-    odb.write_with_options(ObjectKind::Blob, data, opts)
+    odb.write_with(ObjectKind::Blob, data, opts)
         .expect("bulk stage write after cruft repack");
     assert!(
         odb.object_path(&oid).is_file(),
@@ -755,7 +896,7 @@ fn bulk_stage_write_treats_promisor_pack_object_as_present() {
     std::fs::write(pack.with_extension("promisor"), b"").unwrap();
     odb.invalidate_packs();
 
-    odb.write_with_options(ObjectKind::Blob, data, odb.bulk_stage_write_options())
+    odb.write_with(ObjectKind::Blob, data, odb.bulk_stage_write_options())
         .expect("bulk stage write of promisor-packed blob");
     assert!(
         !odb.object_path(&oid).is_file(),
@@ -773,7 +914,7 @@ fn t1006_zlib_preset_dictionary_returns_needs_dictionary() {
     std::fs::write(&path, zlib_with_preset_dictionary()).unwrap();
     let err = odb.read(&oid).unwrap_err();
     match err {
-        Error::Zlib(msg) => assert_eq!(msg, "needs dictionary"),
+        Error::Object(ObjectError::Zlib { detail: msg }) => assert_eq!(msg, "needs dictionary"),
         other => panic!("expected needs dictionary, got {other:?}"),
     }
 }

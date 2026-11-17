@@ -41,6 +41,7 @@ use crate::precompose_config::{
 };
 use crate::promisor_fetch::PromisorFetcher;
 use crate::ref_storage::RefStorageFormat;
+use crate::reftable::ReftableWriteOptions;
 use crate::repo::Repository;
 
 /// Parents and committer timestamps reused across rev-parse and revwalk on one handle.
@@ -68,16 +69,22 @@ pub struct RepoCaches {
     pathspec_precompose: OnceLock<bool>,
     ref_storage_format: Mutex<HashMap<PathBuf, RefStorageFormat>>,
     pub(crate) ref_stores: Mutex<HashMap<PathBuf, Arc<dyn crate::refs::store::RefStore>>>,
+    /// The repository's objects when they are not the files database under the git
+    /// directory; files ref stores opened here peel `packed-refs` entries against it.
+    ref_peel_source: OnceLock<Arc<dyn crate::odb::ObjectStore>>,
     filters: FilterProcessState,
     promisor_hydrate: Mutex<Option<PromisorHydrateHook>>,
     promisor_fetcher: Mutex<Option<Arc<dyn PromisorFetcher>>>,
     commit_graph_warn_seen: Mutex<HashSet<String>>,
     commit_graph: Mutex<Option<Arc<CommitGraphChain>>>,
     commit_linkage: Mutex<CommitLinkageCache>,
+    /// Resolved `refs/replace/` redirects for this handle (built once when the directory is non-empty).
+    replace_redirects: Mutex<Option<OidHashMap<ObjectId>>>,
     bitmap_index: BitmapIndexCache,
     diagnostics: Mutex<DiagnosticsHandle>,
     /// Cached change-id header probe `(odb fingerprint, result)` for this handle.
     stored_change_id_header_likely: Mutex<Option<(u64, bool)>>,
+    reftable_write: ReftableWriteOptions,
 }
 
 impl std::fmt::Debug for RepoCaches {
@@ -90,7 +97,11 @@ impl RepoCaches {
     /// Create an empty cache arena for one repository handle.
     #[must_use]
     pub fn new(command_runner: Arc<dyn crate::command_runner::CommandRunner>) -> Arc<Self> {
-        Self::with_diagnostics(command_runner, Arc::new(NullDiagnostics))
+        Self::with_diagnostics(
+            command_runner,
+            Arc::new(NullDiagnostics),
+            ReftableWriteOptions::default(),
+        )
     }
 
     /// Create a cache arena wired to the given diagnostic sink.
@@ -98,6 +109,7 @@ impl RepoCaches {
     pub fn with_diagnostics(
         command_runner: Arc<dyn crate::command_runner::CommandRunner>,
         diagnostics: DiagnosticsHandle,
+        reftable_write: ReftableWriteOptions,
     ) -> Arc<Self> {
         Arc::new(Self {
             config_cache: Mutex::new(HashMap::new()),
@@ -111,15 +123,18 @@ impl RepoCaches {
             pathspec_precompose: OnceLock::new(),
             ref_storage_format: Mutex::new(HashMap::new()),
             ref_stores: Mutex::new(HashMap::new()),
+            ref_peel_source: OnceLock::new(),
             filters: FilterProcessState::new(command_runner),
             promisor_hydrate: Mutex::new(None),
             promisor_fetcher: Mutex::new(None),
             commit_graph_warn_seen: Mutex::new(HashSet::new()),
             commit_graph: Mutex::new(None),
             commit_linkage: Mutex::new(CommitLinkageCache::default()),
+            replace_redirects: Mutex::new(None),
             bitmap_index: BitmapIndexCache::default(),
             diagnostics: Mutex::new(diagnostics),
             stored_change_id_header_likely: Mutex::new(None),
+            reftable_write,
         })
     }
 
@@ -135,6 +150,10 @@ impl RepoCaches {
     /// Shared commit parent/timestamp cache for merge-base and revwalk.
     pub(crate) fn commit_linkage(&self) -> &Mutex<CommitLinkageCache> {
         &self.commit_linkage
+    }
+
+    pub(crate) fn replace_redirects(&self) -> &Mutex<Option<OidHashMap<ObjectId>>> {
+        &self.replace_redirects
     }
 
     /// Return the diagnostic sink for this cache arena.
@@ -159,16 +178,30 @@ impl RepoCaches {
     }
 
     /// Parsed commit-graph chain for this repository handle (at most one disk load).
-    pub(crate) fn commit_graph_chain(&self, objects_dir: &Path) -> Option<Arc<CommitGraphChain>> {
+    pub(crate) fn commit_graph_chain(
+        &self,
+        objects_dir: &Path,
+        alternate_object_dirs: &[PathBuf],
+    ) -> Option<Arc<CommitGraphChain>> {
         let Ok(mut guard) = self.commit_graph.lock() else {
             return None;
         };
         if let Some(chain) = guard.as_ref() {
             return Some(Arc::clone(chain));
         }
-        let chain = CommitGraphChain::try_load_with_caches(objects_dir, Some(self))
+        let chain = if alternate_object_dirs.is_empty() {
+            CommitGraphChain::try_load_with_caches(objects_dir, Some(self))
+                .ok()
+                .flatten()?
+        } else {
+            CommitGraphChain::try_load_across_with_caches(
+                objects_dir,
+                alternate_object_dirs,
+                Some(self),
+            )
             .ok()
-            .flatten()?;
+            .flatten()?
+        };
         let arc = Arc::new(chain);
         *guard = Some(Arc::clone(&arc));
         Some(arc)
@@ -194,7 +227,7 @@ impl RepoCaches {
     ) -> Result<Arc<ConfigSet>> {
         let opts = LoadConfigOptions {
             include_system,
-            ..LoadConfigOptions::default()
+            ..crate::config::LoadConfigOptions::default()
         };
         self.load_config_with_options(env, git_dir, &opts)
     }
@@ -232,7 +265,7 @@ impl RepoCaches {
             let cache = self
                 .config_cache
                 .lock()
-                .map_err(|e| Error::Message(format!("config cache lock poisoned: {e}")))?;
+                .map_err(|_| Error::Config(crate::error::ConfigError::ConfigCacheLockPoisoned))?;
             if let Some(cached) = config_cache_lookup(&cache, &key, &env_fp, &base_stamps) {
                 return Ok(cached);
             }
@@ -248,7 +281,7 @@ impl RepoCaches {
         let mut cache = self
             .config_cache
             .lock()
-            .map_err(|e| Error::Message(format!("config cache lock poisoned: {e}")))?;
+            .map_err(|_| Error::Config(crate::error::ConfigError::ConfigCacheLockPoisoned))?;
         config_cache_store(
             &mut cache,
             key,
@@ -412,7 +445,7 @@ impl RepoCaches {
             let cache = self
                 .attr_stack
                 .lock()
-                .map_err(|e| Error::Message(format!("attr stack cache lock poisoned: {e}")))?;
+                .map_err(|_| Error::Config(crate::error::ConfigError::ConfigCacheLockPoisoned))?;
             if let Some(entry) = cache.get(&key) {
                 if attr_stamps_valid(entry) {
                     return Ok(Arc::clone(&entry.parsed));
@@ -424,7 +457,7 @@ impl RepoCaches {
         let mut cache = self
             .attr_stack
             .lock()
-            .map_err(|e| Error::Message(format!("attr stack cache lock poisoned: {e}")))?;
+            .map_err(|_| Error::Config(crate::error::ConfigError::ConfigCacheLockPoisoned))?;
         cache.insert(
             key,
             AttrStackCacheEntry {
@@ -455,7 +488,7 @@ impl RepoCaches {
             let cache = self
                 .attr_bare
                 .lock()
-                .map_err(|e| Error::Message(format!("attr bare cache lock poisoned: {e}")))?;
+                .map_err(|_| Error::Config(crate::error::ConfigError::ConfigCacheLockPoisoned))?;
             if let Some(entry) = cache.get(&key) {
                 if attr_stamps_valid(entry) {
                     return Ok(Arc::clone(&entry.parsed));
@@ -472,7 +505,7 @@ impl RepoCaches {
         let mut cache = self
             .attr_bare
             .lock()
-            .map_err(|e| Error::Message(format!("attr bare cache lock poisoned: {e}")))?;
+            .map_err(|_| Error::Config(crate::error::ConfigError::ConfigCacheLockPoisoned))?;
         cache.insert(
             key,
             AttrStackCacheEntry {
@@ -563,6 +596,12 @@ impl RepoCaches {
         v
     }
 
+    /// Reftable write overrides for this handle.
+    #[must_use]
+    pub(crate) fn reftable_write(&self) -> ReftableWriteOptions {
+        self.reftable_write
+    }
+
     /// Open (or reuse) the [`crate::refs::store::RefStore`] for `git_dir`.
     ///
     /// # Errors
@@ -581,11 +620,29 @@ impl RepoCaches {
                 return Ok(Arc::clone(store));
             }
         }
-        let store = crate::refs::store::open_ref_store_uncached(git_dir, env, Some(self))?;
+        let store = crate::refs::store::open_ref_store_uncached(
+            git_dir,
+            env,
+            &self.reftable_write,
+            Some(self),
+        )?;
         if let Ok(mut guard) = self.ref_stores.lock() {
             guard.insert(key, Arc::clone(&store));
         }
         Ok(store)
+    }
+
+    /// Have files ref stores this cache opens compute `packed-refs` peel lines from `store`.
+    ///
+    /// Set once, before the first [`Self::open_ref_store`], for a repository whose primary
+    /// object store is not the files database; later calls are ignored.
+    pub(crate) fn set_ref_peel_source(&self, store: Arc<dyn crate::odb::ObjectStore>) {
+        let _ = self.ref_peel_source.set(store);
+    }
+
+    /// The store set by [`Self::set_ref_peel_source`], if any.
+    pub(crate) fn ref_peel_source(&self) -> Option<Arc<dyn crate::odb::ObjectStore>> {
+        self.ref_peel_source.get().cloned()
     }
 
     /// Make `store` the ref store [`Self::open_ref_store`] returns for `git_dir`.

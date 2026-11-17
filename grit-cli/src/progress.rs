@@ -12,11 +12,9 @@ use std::time::{Duration, Instant};
 use grit_lib::progress::{
     OverallEstimate, OverallEstimator, ProgressPhase, ProgressSink, ProgressUnit, ReceivedObjects,
 };
-use grit_lib::remote::fetch::Progress;
+use grit_lib::remote::fetch::{FetchMilestone, Progress};
 use grit_lib::remote::sideband_lines::{RemoteLine, SidebandLines};
 use terminal_size::{terminal_size, Width};
-
-use crate::output::OutputMode;
 
 pub mod resumable;
 pub mod summary;
@@ -57,6 +55,15 @@ pub struct PhaseRecord {
     pub samples: Vec<f64>,
     /// Highest sampled throughput.
     pub peak_rate: f64,
+}
+
+/// When a wire fetch reached a [`FetchMilestone`], on the [`PhaseRecord::started_at`] clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MilestoneRecord {
+    /// Which point of the fetch conversation was reached.
+    pub milestone: FetchMilestone,
+    /// When it was reached, measured from the sink's creation.
+    pub at: Duration,
 }
 
 impl PhaseRecord {
@@ -135,6 +142,7 @@ pub struct TerminalProgress {
     color: bool,
     active: Option<ActivePhase>,
     finished: Vec<PhaseRecord>,
+    milestones: Vec<MilestoneRecord>,
     last_draw: Instant,
     frame: usize,
     remote_lines: SidebandLines,
@@ -149,21 +157,24 @@ pub struct TerminalProgress {
 }
 
 impl TerminalProgress {
-    /// Create a sink; it draws nothing unless `mode` is human and stderr is a TTY.
+    /// Create a sink; it draws nothing unless `human_interactive` is set and stderr is a TTY.
+    ///
+    /// `human_interactive` is true when the command renders for people (not
+    /// `--json` or `--markdown`), so stderr may carry live progress.
     #[must_use]
-    pub fn new(mode: OutputMode) -> Self {
-        Self::new_inner(mode, false)
+    pub fn new(human_interactive: bool) -> Self {
+        Self::new_inner(human_interactive, false)
     }
 
-    /// Progress sink that never draws (for `-q` / `--quiet`).
+    /// Progress sink that never draws or prints side-band lines (for `-q` / `--quiet`).
     #[must_use]
-    pub fn quiet(mode: OutputMode) -> Self {
-        Self::new_inner(mode, true)
+    pub fn quiet() -> Self {
+        Self::new_inner(false, true)
     }
 
-    fn new_inner(mode: OutputMode, force_silent: bool) -> Self {
-        let draw = !force_silent && mode == OutputMode::Human && io::stderr().is_terminal();
-        let emit_remote = !force_silent && mode == OutputMode::Human;
+    fn new_inner(human_interactive: bool, force_silent: bool) -> Self {
+        let draw = !force_silent && human_interactive && io::stderr().is_terminal();
+        let emit_remote = !force_silent && human_interactive;
         let color = draw
             && grit_lib::porcelain::terminal::stderr_supports_color()
             && std::env::var_os("NO_COLOR").is_none();
@@ -173,6 +184,7 @@ impl TerminalProgress {
             color,
             active: None,
             finished: Vec::new(),
+            milestones: Vec::new(),
             last_draw: Instant::now() - MIN_REDRAW,
             frame: 0,
             remote_lines: SidebandLines::new(),
@@ -217,6 +229,12 @@ impl TerminalProgress {
         self.draw
     }
 
+    /// Whether this sink reports status to stderr: human output, not `--quiet`.
+    #[must_use]
+    pub fn reports_status(&self) -> bool {
+        self.emit_remote
+    }
+
     /// Whether drawn output uses ANSI color.
     #[must_use]
     pub fn uses_color(&self) -> bool {
@@ -233,6 +251,12 @@ impl TerminalProgress {
     #[must_use]
     pub fn phases(&self) -> &[PhaseRecord] {
         &self.finished
+    }
+
+    /// Wire fetch milestones reached so far, in order.
+    #[must_use]
+    pub fn milestones(&self) -> &[MilestoneRecord] {
+        &self.milestones
     }
 
     fn redraw(&mut self, force: bool) {
@@ -354,6 +378,11 @@ impl Progress for TerminalProgress {
         self.resumable.handle(event);
     }
 
+    fn milestone(&mut self, milestone: FetchMilestone) {
+        let at = self.since_start();
+        self.milestones.push(MilestoneRecord { milestone, at });
+    }
+
     fn received_objects(&mut self, counts: ReceivedObjects) {
         let at = self.since_start();
         if let Some(overall) = &mut self.overall {
@@ -462,6 +491,7 @@ pub(crate) fn phase_palette(phase: ProgressPhase) -> [u8; 5] {
         ProgressPhase::CopyingObjects => [23, 30, 37, 44, 87],
         ProgressPhase::CheckingOutFiles => [22, 28, 34, 40, 82],
         ProgressPhase::TransferringBundle => [96, 133, 170, 177, 219],
+        ProgressPhase::SendingObjects => [178, 184, 190, 196, 202],
         ProgressPhase::StagingFiles => [58, 64, 70, 106, 148],
         _ => [240, 244, 248, 252, 255],
     }
@@ -477,6 +507,7 @@ pub(crate) fn phase_label(phase: ProgressPhase) -> &'static str {
         ProgressPhase::CopyingObjects => "Copying",
         ProgressPhase::CheckingOutFiles => "Checkout",
         ProgressPhase::TransferringBundle => "Bundle",
+        ProgressPhase::SendingObjects => "Sending",
         ProgressPhase::StagingFiles => "Staging",
         _ => "Working",
     }
@@ -1129,7 +1160,7 @@ mod tests {
 
     #[test]
     fn overall_needs_an_ansi_terminal() {
-        let sink = TerminalProgress::new(OutputMode::Json).with_overall(true);
+        let sink = TerminalProgress::new(false).with_overall(true);
         assert!(!sink.wants_received_objects());
     }
 
@@ -1152,7 +1183,7 @@ mod tests {
 
     #[test]
     fn sink_records_phases_without_drawing() {
-        let mut sink = TerminalProgress::new(OutputMode::Json);
+        let mut sink = TerminalProgress::new(false);
         assert!(!sink.is_drawing());
         sink.start_with_unit(ProgressPhase::ReceivingObjects, ProgressUnit::Bytes, None);
         sink.inc(1024);

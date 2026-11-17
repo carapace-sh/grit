@@ -3,13 +3,15 @@
 //! (#2176). Updates git accepts round-trip in both directions.
 
 use crate::support;
+use grit_lib::error::RefError;
 
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::error::Error;
 use grit_lib::ident::Signature;
 use grit_lib::objects::{NewCommit, ObjectId, ObjectKind, TreeEntry};
 use grit_lib::refs::store::{
-    Expected, RawRef, RefName, RefStore, RefStoreError, RefTransaction, RefUpdate, RefUpdateFlags,
+    Expected, RawRef, RefName, RefNameRef, RefStore, RefStoreError, RefTransaction, RefUpdate,
+    RefUpdateFlags,
 };
 use grit_lib::repo::Repository;
 
@@ -78,7 +80,7 @@ fn issue_2176_reproduction_is_refused_and_git_fsck_stays_clean() {
         let grit = open(repo);
 
         assert_eq!(
-            commit_one(grit.refs(), put("refs/heads/bogus", bogus())),
+            commit_one(grit.ref_store(), put("refs/heads/bogus", bogus())),
             Err(RefStoreError::MissingObject {
                 name: "refs/heads/bogus".to_owned(),
                 oid: bogus(),
@@ -92,10 +94,10 @@ fn issue_2176_reproduction_is_refused_and_git_fsck_stays_clean() {
         assert!(
             matches!(
                 &to_tree,
-                Err(Error::RefStore(RefStoreError::NotACommit {
+                Err(Error::Ref(RefError::Store(RefStoreError::NotACommit {
                     kind: ObjectKind::Tree,
                     ..
-                }))
+                })))
             ),
             "{backend:?}: {to_tree:?}"
         );
@@ -106,7 +108,9 @@ fn issue_2176_reproduction_is_refused_and_git_fsck_stays_clean() {
         assert!(
             matches!(
                 &missing,
-                Err(Error::RefStore(RefStoreError::MissingObject { .. }))
+                Err(Error::Ref(RefError::Store(
+                    RefStoreError::MissingObject { .. }
+                )))
             ),
             "{backend:?}: {missing:?}"
         );
@@ -143,13 +147,13 @@ fn non_branch_refs_at_a_tree_round_trip_with_git() {
         let tree = head_tree(repo);
         let grit = open(repo);
         for name in ["refs/tags/grit-tree", "refs/remotes/origin/grit-tree"] {
-            commit_one(grit.refs(), put(name, tree))
+            commit_one(grit.ref_store(), put(name, tree))
                 .unwrap_or_else(|err| panic!("{backend:?} {name}: {err}"));
         }
         for name in ["refs/tags/git-tree", "refs/remotes/origin/git-tree"] {
             git(repo.worktree(), &["update-ref", name, &tree.to_hex()]);
             assert_eq!(
-                grit.refs().read_raw(name).expect("read"),
+                grit.ref_store().read_raw(name).expect("read"),
                 Some(RawRef::Direct(tree)),
                 "{backend:?} {name}"
             );
@@ -157,7 +161,7 @@ fn non_branch_refs_at_a_tree_round_trip_with_git() {
         // A detached HEAD at a commit is accepted by both.
         let mut detach = put("HEAD", commit);
         detach.flags.no_deref = true;
-        commit_one(grit.refs(), detach).expect("detach HEAD at a commit");
+        commit_one(grit.ref_store(), detach).expect("detach HEAD at a commit");
         assert_eq!(
             git(repo.worktree(), &["rev-parse", "HEAD"]).trim(),
             commit.to_hex()
@@ -215,7 +219,7 @@ fn ref_update_after_git_prune_removed_the_commit_is_refused() {
         let mut cas = put("refs/heads/main", next);
         cas.expected = Expected::Oid(base);
         assert_eq!(
-            commit_one(grit.refs(), cas),
+            commit_one(grit.ref_store(), cas),
             Err(RefStoreError::MissingObject {
                 name: "refs/heads/main".to_owned(),
                 oid: next,
@@ -240,7 +244,7 @@ fn skip_oid_verification_writes_the_dangling_ref_git_fsck_reports() {
         let grit = open(repo);
         let mut dangling = put("refs/heads/dangling", bogus());
         dangling.flags.skip_oid_verification = true;
-        commit_one(grit.refs(), dangling).expect("deliberately dangling ref");
+        commit_one(grit.ref_store(), dangling).expect("deliberately dangling ref");
         assert!(
             !git_ok(repo.worktree(), &["fsck", "--no-progress"]),
             "{backend:?}: git fsck must flag the dangling ref"
@@ -258,15 +262,21 @@ fn issue_2258_invalid_symref_targets_leave_git_status_and_fsck_clean() {
         let grit = open(repo);
         for (name, target) in [
             ("HEAD", "foo"),
-            ("refs/heads/sym1", "foo"),
+            ("HEAD", "refs/heads/x\nref: refs/heads/evil"),
+            ("refs/heads/sym-a", "refs/heads/has space"),
+            ("refs/heads/sym-b", "refs/heads/../../config"),
+            ("refs/heads/sym-c", "refs/heads/trailing.lock"),
             ("refs/heads/loop", "refs/heads/loop"),
             ("HEAD", "refs/heads/a..b"),
         ] {
             assert!(
-                commit_one(grit.refs(), symref(name, target)).is_err(),
+                commit_one(grit.ref_store(), symref(name, target)).is_err(),
                 "{backend:?} {name} -> {target}"
             );
         }
+        commit_one(grit.ref_store(), symref("refs/heads/probe", "foo")).expect("one-level symref");
+        commit_one(grit.ref_store(), symref("refs/heads/probe2", "heads/main"))
+            .expect("two-component symref without refs/");
         assert!(git_ok(repo.worktree(), &["status", "--porcelain"]));
         assert!(git_ok(repo.worktree(), &["fsck", "--no-progress"]));
         assert_fsck_when_git_interop(repo);
@@ -282,9 +292,9 @@ fn branch_commit_writer_to_a_missing_object_is_refused_and_git_fsck_stays_clean(
         }
         let grit = open(repo);
         let err = grit_lib::refs::update_branch_for_commit_on_store(
-            grit.refs(),
+            grit.ref_store(),
             &grit_lib::refs::BranchCommitRefUpdate {
-                branch_ref: "refs/heads/main",
+                branch_ref: RefNameRef::from_trusted("refs/heads/main"),
                 expected_old: Some(commit),
                 new_oid: bogus(),
                 identity: "Ref Verify <verify@example.com> 1700000000 +0000",
@@ -294,7 +304,10 @@ fn branch_commit_writer_to_a_missing_object_is_refused_and_git_fsck_stays_clean(
         )
         .expect_err("missing tip");
         assert!(
-            matches!(&err, Error::RefStore(RefStoreError::MissingObject { .. })),
+            matches!(
+                &err,
+                Error::Ref(RefError::Store(RefStoreError::MissingObject { .. }))
+            ),
             "{backend:?}: {err:?}"
         );
         // Git refuses the equivalent update too.

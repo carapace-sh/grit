@@ -14,12 +14,10 @@ use grit_lib::command_runner::{CommandRunner, RecordedResponse, RecordingRunner}
 use grit_lib::config::environment::{Environment, RepositoryOptions};
 use grit_lib::objects::odb::Odb;
 use grit_lib::objects::{HashAlgo, ObjectId};
-use grit_lib::progress::FlagCancel;
-use grit_lib::refs::resolve_ref;
+use grit_lib::progress::CancelToken;
 use grit_lib::remote::serve::{
-    receive_pack, receive_pack_with_hook, receive_pack_with_hook_cancellable, ProtocolVersion,
-    ReceiveHook, ReceiveHookContext, ReceiveOutcome, ReceivePolicy, RefCommand, RefUpdateRefusal,
-    ServeError, ServeOptions,
+    ProtocolVersion, ReceiveHook, ReceiveHookContext, ReceiveOutcome, ReceivePack, ReceivePolicy,
+    RefCommand, RefUpdateRefusal, ServeError, ServeOptions,
 };
 use grit_lib::repo::Repository;
 
@@ -84,14 +82,9 @@ fn serve_push(repo: &Repository, body: &[u8]) -> (ReceiveOutcome, Vec<u8>) {
     };
     let policy = ReceivePolicy::default();
     let mut output = Vec::new();
-    let outcome = receive_pack(
-        repo,
-        &mut std::io::Cursor::new(body),
-        &mut output,
-        &opts,
-        &policy,
-    )
-    .expect("receive_pack");
+    let outcome = ReceivePack::new(repo, &opts, &policy)
+        .run(&mut std::io::Cursor::new(body), &mut output)
+        .expect("receive_pack");
     (outcome, output)
 }
 
@@ -230,24 +223,113 @@ fn in_process_pre_receive_can_reject_push_options_before_refs_move() {
     };
     let policy = ReceivePolicy::default();
     let mut output = Vec::new();
-    let outcome = receive_pack_with_hook(
-        &repo,
-        &mut std::io::Cursor::new(body),
-        &mut output,
-        &opts,
-        &policy,
-        &DenyPushOption("ci.skip"),
-    )
-    .expect("receive_pack");
+    let outcome = ReceivePack::new(&repo, &opts, &policy)
+        .with_hook(&DenyPushOption("ci.skip"))
+        .run(&mut std::io::Cursor::new(body), &mut output)
+        .expect("receive_pack");
     assert_eq!(outcome.updates.len(), 1);
     assert_eq!(
         outcome.updates[0].error,
         Some(RefUpdateRefusal::Policy("ci.skip".to_owned()))
     );
-    assert!(resolve_ref(&bare, "refs/heads/main").is_err());
+    assert!(grit_test_support::refs::at(&bare)
+        .references()
+        .resolve("refs/heads/main")
+        .is_err());
     assert!(
         !repo.odb().exists(&oid),
         "rejected push must not install objects in the main ODB"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn pre_receive_cancel_kills_hook_process_group_and_leaves_ref_unmoved() {
+    use std::process::Command;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let bare = tmp.path().join("bare");
+    let pid_file = tmp.path().join("hook.pid");
+    let child_pid_file = tmp.path().join("hook-child.pid");
+    std::fs::create_dir_all(&bare).unwrap();
+    git(&bare, &["init", "-q", "--bare", "."]);
+    write_executable_hook(
+        &bare.join("hooks/pre-receive"),
+        &format!(
+            "#!/bin/sh\ncat >/dev/null\necho $$ >{}\nsleep 120 &\necho $! >{}\nwait\n",
+            pid_file.display(),
+            child_pid_file.display()
+        ),
+    );
+    let repo = open_bare_with_runner(&bare, grit_lib::command_runner::system_command_runner());
+
+    let source = tmp.path().join("src");
+    std::fs::create_dir_all(&source).unwrap();
+    git(&source, &["init", "-q", "-b", "main", "."]);
+    std::fs::write(source.join("f"), "payload\n").unwrap();
+    git(&source, &["add", "f"]);
+    git(&source, &["commit", "-q", "-m", "c"]);
+    let oid = rev_parse(&source, "HEAD");
+    let pack = pack_for_commit(&source, oid);
+    let body = push_body(None, oid, "refs/heads/main", &pack);
+
+    let opts = ServeOptions {
+        protocol: ProtocolVersion::V0,
+        stateless_rpc: true,
+        advertise_refs: false,
+        agent: "grit-test".to_owned(),
+        hidden_refs: Vec::new(),
+        ..ServeOptions::default()
+    };
+    let cancel = CancelToken::new();
+    let repo_for_thread =
+        open_bare_with_runner(&bare, grit_lib::command_runner::system_command_runner());
+    let body_for_thread = body.clone();
+    let cancel_for_thread = cancel.clone();
+    let handle = std::thread::spawn(move || {
+        ReceivePack::new(&repo_for_thread, &opts, &ReceivePolicy::default())
+            .with_hook(&())
+            .with_cancel(&cancel_for_thread)
+            .run(&mut std::io::Cursor::new(body_for_thread), &mut Vec::new())
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !pid_file.is_file() {
+        assert!(Instant::now() < deadline, "pre-receive hook did not start");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let hook_pid: u32 = std::fs::read_to_string(&pid_file)
+        .expect("pid file")
+        .trim()
+        .parse()
+        .expect("pid");
+    cancel.cancel();
+    let err = handle.join().expect("join").expect_err("cancelled");
+    assert!(matches!(err, ServeError::Cancelled));
+    assert!(grit_test_support::refs::at(&bare)
+        .references()
+        .resolve("refs/heads/main")
+        .is_err());
+    assert!(!repo.odb().exists(&oid));
+    let child_pid: u32 = std::fs::read_to_string(&child_pid_file)
+        .expect("child pid file")
+        .trim()
+        .parse()
+        .expect("child pid");
+    let process_alive = |pid: u32| {
+        Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .expect("kill -0")
+            .code()
+            == Some(0)
+    };
+    assert!(
+        !process_alive(hook_pid),
+        "hook shell {hook_pid} should be gone"
+    );
+    assert!(
+        !process_alive(child_pid),
+        "hook sleep child {child_pid} should be gone with the process group"
     );
 }
 
@@ -275,20 +357,18 @@ fn receive_cancel_before_apply_leaves_ref_unmoved() {
         hidden_refs: Vec::new(),
         ..ServeOptions::default()
     };
-    let cancel = FlagCancel::new();
+    let cancel = CancelToken::new();
     cancel.cancel();
-    let err = receive_pack_with_hook_cancellable(
-        &repo,
-        &mut std::io::Cursor::new(body),
-        &mut Vec::new(),
-        &opts,
-        &ReceivePolicy::default(),
-        &(),
-        &cancel,
-    )
-    .expect_err("cancelled");
+    let err = ReceivePack::new(&repo, &opts, &ReceivePolicy::default())
+        .with_hook(&())
+        .with_cancel(&cancel)
+        .run(&mut std::io::Cursor::new(body), &mut Vec::new())
+        .expect_err("cancelled");
     assert!(matches!(err, ServeError::Cancelled));
-    assert!(resolve_ref(&bare, "refs/heads/main").is_err());
+    assert!(grit_test_support::refs::at(&bare)
+        .references()
+        .resolve("refs/heads/main")
+        .is_err());
     assert!(!repo.odb().exists(&oid));
 }
 
@@ -319,7 +399,10 @@ fn pre_receive_reject_leaves_main_object_store_clean() {
         outcome.updates[0].error,
         Some(RefUpdateRefusal::PreReceiveHookDeclined)
     );
-    assert!(resolve_ref(&bare, "refs/heads/main").is_err());
+    assert!(grit_test_support::refs::at(&bare)
+        .references()
+        .resolve("refs/heads/main")
+        .is_err());
     assert_eq!(count_pack_files(&bare.join("objects")), packs_before);
     assert!(
         !repo.odb().exists(&oid),
@@ -375,8 +458,17 @@ fn update_reject_only_blocks_one_ref() {
         outcome.updates[1].error,
         Some(RefUpdateRefusal::UpdateHookDeclined)
     );
-    assert_eq!(resolve_ref(&bare, "refs/heads/main").unwrap(), main);
-    assert!(resolve_ref(&bare, "refs/heads/block").is_err());
+    assert_eq!(
+        grit_test_support::refs::at(&bare)
+            .references()
+            .resolve("refs/heads/main")
+            .unwrap(),
+        main
+    );
+    assert!(grit_test_support::refs::at(&bare)
+        .references()
+        .resolve("refs/heads/block")
+        .is_err());
 }
 
 #[test]
@@ -943,7 +1035,7 @@ fn receive_pack_finishes_when_push_client_keeps_stream_open() {
         let policy = ReceivePolicy::default();
         let mut output = Vec::new();
         let started = Instant::now();
-        let outcome = receive_pack(&repo, &mut server, &mut output, &opts, &policy);
+        let outcome = ReceivePack::new(&repo, &opts, &policy).run(&mut server, &mut output);
         result_tx
             .send((outcome, output, started.elapsed()))
             .expect("send receive_pack result");
@@ -979,7 +1071,10 @@ fn receive_pack_finishes_when_push_client_keeps_stream_open() {
         outcome.updates
     );
     assert_eq!(
-        resolve_ref(&bare, "refs/heads/main").expect("main"),
+        grit_test_support::refs::at(&bare)
+            .references()
+            .resolve("refs/heads/main")
+            .expect("main"),
         oid,
         "push should land on the remote"
     );

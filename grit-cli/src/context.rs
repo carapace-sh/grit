@@ -4,14 +4,12 @@ use anyhow::{Context, Result};
 use grit_lib::change_id::resolved_change_id;
 use grit_lib::command_runner::hooks::HookStdio;
 use grit_lib::config::environment::Environment;
-use grit_lib::config::ident_resolve::{
-    resolve_identity_with, resolve_loose_committer_identity_with, IdentRole, IdentityError,
-};
+use grit_lib::config::ident_resolve::{resolve_identity_with, IdentRole};
 use grit_lib::config::ConfigSet;
 use grit_lib::ident::Signature;
 use grit_lib::objects::{parse_commit, CommitData, ObjectId};
 use grit_lib::parallel::ThreadPolicy;
-use grit_lib::repo::Repository;
+use grit_lib::repo::{Repository, RepositoryLocation};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use time::OffsetDateTime;
@@ -101,6 +99,33 @@ pub struct CommitSummary {
 pub fn discover() -> Result<Repository> {
     let (options, _sink) = diagnostics::repository_options(false);
     Repository::discover(None, &options).context("not in a repository")
+}
+
+/// Like [`discover`], but returns [`grit_lib::error::Error`] so callers can classify failures.
+pub fn discover_lib_error() -> grit_lib::error::Result<Repository> {
+    let (options, _sink) = diagnostics::repository_options(false);
+    Repository::discover(None, &options)
+}
+
+/// Locate the repository from the current directory without opening it.
+pub fn locate_repository() -> Result<RepositoryLocation> {
+    let repo = Repository::discover(None, &location_options()).context("not in a repository")?;
+    Ok(RepositoryLocation::from(&repo))
+}
+
+/// Like [`locate_repository`], and also return the repository's merged config.
+pub fn locate_repository_with_config() -> Result<(RepositoryLocation, ConfigSet)> {
+    let repo = Repository::discover(None, &location_options()).context("not in a repository")?;
+    let location = RepositoryLocation::from(&repo);
+    let config = repo.config().snapshot().context("could not load config")?;
+    Ok((location, (*config).clone()))
+}
+
+fn location_options() -> grit_lib::config::environment::RepositoryOptions {
+    let mut options = grit_lib::config::environment::RepositoryOptions::default();
+    options.environment = environment();
+    options.diagnostics = std::sync::Arc::new(diagnostics::CliDiagnosticSink::new());
+    options
 }
 
 /// Like [`discover`], but returns the diagnostic sink used for warnings.
@@ -228,11 +253,6 @@ pub fn relative_date_from(timestamp: i64, now: i64) -> String {
     format!("{n} {unit}{} ago", if n == 1 { "" } else { "s" })
 }
 
-/// The tree OID recorded by a commit.
-pub fn commit_tree(repo: &Repository, oid: &ObjectId) -> Result<ObjectId> {
-    grit_lib::diff::tree_oid_of_commit_in_repo(repo, oid).map_err(Into::into)
-}
-
 /// Read and parse a commit object.
 pub fn read_commit(repo: &Repository, oid: &ObjectId) -> Result<CommitData> {
     repo.odb()
@@ -259,16 +279,14 @@ pub fn identity(
     role: IdentRole,
     now: OffsetDateTime,
 ) -> Result<String> {
-    resolve_identity_with(env, config, role, now).map_err(identity_error)
+    resolve_identity_with(env, config, role, now).map_err(crate::error_map::identity_error)
 }
 
 /// The author or committer `repo` records on a new commit, stash, or notes commit
 /// ([`Repository::identity`]), with setup advice when no identity is configured.
 pub fn signature(repo: &Repository, role: IdentRole, now: OffsetDateTime) -> Result<Signature> {
-    repo.identity(role, now).map_err(|err| match err {
-        grit_lib::error::Error::Identity(err) => identity_error(err),
-        other => other.into(),
-    })
+    repo.identity(role, now)
+        .map_err(crate::error_map::map_repo_identity_error)
 }
 
 /// Committer for reflog entries: configured [`signature`] when available, otherwise the
@@ -278,25 +296,20 @@ pub fn committer_reflog_signature(
     config: &ConfigSet,
     now: OffsetDateTime,
 ) -> Result<Signature> {
-    match repo.identity(IdentRole::Committer, now) {
-        Ok(sig) => Ok(sig),
-        Err(grit_lib::error::Error::Identity(_)) => {
-            let line = resolve_loose_committer_identity_with(repo.environment(), config, now);
-            line.parse()
-                .map_err(|err| grit_lib::error::Error::InvalidSignature(err).into())
-        }
-        Err(other) => Err(other.into()),
-    }
+    crate::error_map::committer_reflog_signature(repo, config, now)
 }
 
-fn identity_error(err: IdentityError) -> anyhow::Error {
-    let setup = "\n\nTell grit who you are:\n  grit config --global user.name \"Your Name\"\n  grit config --global user.email \"you@example.com\"";
-    match err {
-        IdentityError::MissingConfiguredEmail { role }
-        | IdentityError::AutoDetectionDisabled { role } => anyhow::anyhow!(
-            "{}\n\nunable to auto-detect email address{setup}",
-            role.missing_email_hint()
-        ),
-        other => anyhow::anyhow!("{other}{setup}"),
-    }
+/// Lenient merged config string lookup (invalid keys and parse errors → `None`).
+pub fn config_string(config: &ConfigSet, key: &str) -> Option<String> {
+    config.get(key).ok().flatten()
+}
+
+/// All values for `key` in load order; load/parse failures → empty list.
+pub fn config_strings(config: &ConfigSet, key: &str) -> Vec<String> {
+    config.get_all(key).unwrap_or_default()
+}
+
+/// Boolean config with a fallback when the key is unset or unparsable.
+pub fn config_bool_default(config: &ConfigSet, key: &str, default: bool) -> bool {
+    config.get_bool(key).ok().flatten().unwrap_or(default)
 }

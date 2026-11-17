@@ -5,11 +5,9 @@
 use grit_lib::config::environment::{Environment, RepositoryOptions};
 use grit_lib::config::ConfigSet;
 use grit_lib::objects::ObjectId;
-use grit_lib::remote::push_plan::{
-    follow_tag_push_specs, resolve_push, PushPlanContext, PushRequest,
-};
+use grit_lib::remote::push_plan::{PushPlanContext, PushRequest};
 use grit_lib::remote::push_report::PushRefStatus;
-use grit_lib::remote::transfer::{push_local, PushOptions, PushRefSpec};
+use grit_lib::remote::transfer::{PushOptions, PushRefSpec};
 use grit_lib::repo::Repository;
 use grit_test_support::{git, git_cmd};
 use std::collections::HashSet;
@@ -33,7 +31,12 @@ fn open_repo(path: &Path) -> Repository {
 }
 
 fn load_config(repo: &Repository) -> ConfigSet {
-    ConfigSet::load(&Environment::empty(), Some(repo.git_dir()), true).expect("config")
+    ConfigSet::load(
+        &Environment::empty(),
+        Some(repo.git_dir()),
+        &crate::config::LoadConfigOptions::standard(&Environment::empty(), Some(repo.git_dir())),
+    )
+    .expect("config")
 }
 
 fn ctx_from_bare(bare: &Path) -> PushPlanContext {
@@ -88,39 +91,39 @@ fn push_set_upstream_writes_same_config_as_git() {
     let repo = open_repo(&local);
     let config = load_config(&repo);
     let ctx = ctx_from_bare(&bare);
-    let plan = resolve_push(
-        &repo,
-        &config,
-        &PushRequest {
-            set_upstream: true,
-            ..PushRequest {
-                remote: Some("origin".into()),
-                refspecs: vec!["main".into()],
+    let plan = repo
+        .remotes()
+        .resolve_push(
+            &PushRequest {
+                set_upstream: true,
+                ..PushRequest {
+                    remote: Some("origin".into()),
+                    refspecs: vec!["main".into()],
+                    ..Default::default()
+                }
+            },
+            &ctx,
+        )
+        .expect("plan");
+    let out = repo
+        .remotes()
+        .push_to(
+            grit_lib::remote::transfer::TransferEndpoint::Local(&bare),
+            &plan.specs,
+            &PushOptions {
+                tracking_remote: Some("origin".into()),
                 ..Default::default()
-            }
-        },
-        &ctx,
-    )
-    .expect("plan");
-    let out = push_local(
-        repo.git_dir(),
-        &bare,
-        &plan.specs,
-        &PushOptions {
-            tracking_remote: Some("origin".into()),
-            ..Default::default()
-        },
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("push");
-    grit_lib::remote::push_plan::apply_set_upstream_after_push(
-        &repo,
-        "origin",
-        true,
-        false,
-        &plan.specs,
-        &out.results,
-    )
+            },
+            &mut grit_lib::remote::fetch::NoProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("push");
+    (if true && !false {
+        repo.remotes()
+            .set_upstream_after_push("origin", &plan.specs, &out.results)
+    } else {
+        Ok(Vec::new())
+    })
     .expect("upstream");
 
     assert_eq!(git_config(&local, "branch.main.remote"), git_remote);
@@ -174,12 +177,18 @@ fn atomic_push_aborts_all_updates_on_bare_remote() {
         atomic: true,
         ..Default::default()
     };
-    push_local(
+    grit_lib::repo::Repository::open(
         local.join(".git").as_path(),
-        &bare,
+        &grit_lib::config::environment::RepositoryOptions::empty(),
+    )
+    .expect("open push source")
+    .remotes()
+    .push_to(
+        grit_lib::remote::transfer::TransferEndpoint::Local(&bare),
         &[good.clone(), bad],
         &atomic,
-        &grit_lib::progress::NeverCancel,
+        &mut grit_lib::remote::fetch::NoProgress,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("atomic push returns outcome");
 
@@ -192,12 +201,18 @@ fn atomic_push_aborts_all_updates_on_bare_remote() {
     );
 
     // Without atomic, partial success: good ref lands, bad stays rejected.
-    push_local(
+    grit_lib::repo::Repository::open(
         local.join(".git").as_path(),
-        &bare,
+        &grit_lib::config::environment::RepositoryOptions::empty(),
+    )
+    .expect("open push source")
+    .remotes()
+    .push_to(
+        grit_lib::remote::transfer::TransferEndpoint::Local(&bare),
         &[good, spec(&side_oid, "refs/heads/main")],
         &PushOptions::default(),
-        &grit_lib::progress::NeverCancel,
+        &mut grit_lib::remote::fetch::NoProgress,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("non-atomic");
     assert!(git_cmd(&["show-ref", "--verify", "refs/heads/atomic-ok"])
@@ -232,20 +247,22 @@ fn follow_tags_matches_git_push_follow_tags() {
     let repo = open_repo(&local);
     let config = load_config(&repo);
     let ctx = ctx_from_bare(&bare);
-    let branch_specs = resolve_push(
-        &repo,
-        &config,
-        &PushRequest {
-            remote: Some("origin".into()),
-            refspecs: vec!["main".into()],
-            ..Default::default()
-        },
-        &ctx,
-    )
-    .expect("plan")
-    .specs;
+    let branch_specs = repo
+        .remotes()
+        .resolve_push(
+            &PushRequest {
+                remote: Some("origin".into()),
+                refspecs: vec!["main".into()],
+                ..Default::default()
+            },
+            &ctx,
+        )
+        .expect("plan")
+        .specs;
 
-    let grit_tags: HashSet<String> = follow_tag_push_specs(&repo, &branch_specs, &ctx)
+    let grit_tags: HashSet<String> = repo
+        .remotes()
+        .follow_tag_push_specs(&branch_specs, &ctx)
         .expect("follow")
         .into_iter()
         .map(|s| s.dst)
@@ -316,30 +333,31 @@ fn follow_tags_custom_dst_matches_git() {
     let repo = open_repo(&local);
     let config = load_config(&repo);
     let ctx = ctx_from_bare(&bare_grit);
-    let branch_specs = resolve_push(
-        &repo,
-        &config,
-        &PushRequest {
-            remote: Some("grit".into()),
-            refspecs: vec!["main:refs/custom/main".into()],
-            follow_tags: true,
-            ..Default::default()
-        },
-        &ctx,
-    )
-    .expect("plan")
-    .specs;
-    push_local(
-        repo.git_dir(),
-        &bare_grit,
-        &branch_specs,
-        &PushOptions {
-            tracking_remote: Some("grit".into()),
-            ..Default::default()
-        },
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("grit push");
+    let branch_specs = repo
+        .remotes()
+        .resolve_push(
+            &PushRequest {
+                remote: Some("grit".into()),
+                refspecs: vec!["main:refs/custom/main".into()],
+                follow_tags: true,
+                ..Default::default()
+            },
+            &ctx,
+        )
+        .expect("plan")
+        .specs;
+    repo.remotes()
+        .push_to(
+            grit_lib::remote::transfer::TransferEndpoint::Local(&bare_grit),
+            &branch_specs,
+            &PushOptions {
+                tracking_remote: Some("grit".into()),
+                ..Default::default()
+            },
+            &mut grit_lib::remote::fetch::NoProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("grit push");
 
     let git_refs = refs_on_bare(&bare_git);
     let grit_refs = refs_on_bare(&bare_grit);
@@ -371,20 +389,22 @@ fn follow_tags_on_up_to_date_branch_includes_older_annotated_tag() {
     let repo = open_repo(&local);
     let config = load_config(&repo);
     let ctx = ctx_from_bare(&bare);
-    let branch_specs = resolve_push(
-        &repo,
-        &config,
-        &PushRequest {
-            remote: Some("origin".into()),
-            refspecs: vec!["main".into()],
-            ..Default::default()
-        },
-        &ctx,
-    )
-    .expect("plan")
-    .specs;
+    let branch_specs = repo
+        .remotes()
+        .resolve_push(
+            &PushRequest {
+                remote: Some("origin".into()),
+                refspecs: vec!["main".into()],
+                ..Default::default()
+            },
+            &ctx,
+        )
+        .expect("plan")
+        .specs;
 
-    let grit_tags: HashSet<String> = follow_tag_push_specs(&repo, &branch_specs, &ctx)
+    let grit_tags: HashSet<String> = repo
+        .remotes()
+        .follow_tag_push_specs(&branch_specs, &ctx)
         .expect("follow")
         .into_iter()
         .map(|s| s.dst)
@@ -427,15 +447,21 @@ fn push_local_push_options_follow_advertise_push_options() {
             dst: "refs/heads/main".into(),
             ..Default::default()
         };
-        let result = push_local(
+        let result = grit_lib::repo::Repository::open(
             local.join(".git").as_path(),
-            &bare,
+            &grit_lib::config::environment::RepositoryOptions::empty(),
+        )
+        .expect("open push source")
+        .remotes()
+        .push_to(
+            grit_lib::remote::transfer::TransferEndpoint::Local(&bare),
             &[spec],
             &PushOptions {
                 push_options: vec!["ci.skip".into()],
                 ..Default::default()
             },
-            &grit_lib::progress::NeverCancel,
+            &mut grit_lib::remote::fetch::NoProgress,
+            &grit_lib::progress::CancelToken::never(),
         );
         let created = git_cmd(&["show-ref", "--verify", "refs/heads/main"])
             .in_dir(&bare)

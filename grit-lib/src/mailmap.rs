@@ -8,6 +8,7 @@ use crate::error::Error;
 use crate::objects::ObjectKind;
 use crate::repo::Repository;
 use crate::rev_parse::resolve_revision;
+use crate::worktree::WorktreeError;
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fs;
@@ -176,7 +177,8 @@ fn parse_name_and_email(
     // `< a@example.com >` does not match a commit's `a@example.com` (t4203).
     let email = rest[..right_rel].to_string();
     let right = left + 1 + right_rel;
-    let name_part = buffer[..left].trim_end_matches(|c: char| c.is_ascii_whitespace());
+    // Git trims C `isspace` at both ends of the name — ASCII whitespace only (not U+00A0 NBSP).
+    let name_part = buffer[..left].trim_matches(|c: char| c.is_ascii_whitespace());
     let name = if name_part.is_empty() {
         None
     } else {
@@ -188,8 +190,12 @@ fn parse_name_and_email(
 
 fn read_mailmap_line_into(table: &mut MailmapTable, line: &str) {
     let line = line.trim_end_matches(['\r', '\n']);
-    let line = line.trim_start();
-    if line.is_empty() || line.starts_with('#') {
+    if line.is_empty() {
+        return;
+    }
+    // Git `read_mailmap_line`: only `buffer[0] == '#'` skips the line — leading spaces mean the
+    // first byte is not `#`, so indented `#` is part of the canonical name (see `check-mailmap`).
+    if line.as_bytes().first() == Some(&b'#') {
         return;
     }
 
@@ -201,12 +207,18 @@ fn read_mailmap_line_into(table: &mut MailmapTable, line: &str) {
         None => return,
     };
 
-    let (name2, email2) = if rest1.trim().is_empty() {
+    // Git runs a second `parse_name_and_email` on the remainder after the first `>` with
+    // `allow_empty_email=1`. If that parse succeeds, the mapping uses that pair and any trailing
+    // text is discarded (Git does not treat `#` as an inline comment). If there is remainder but
+    // no second `<email>` pair — for example `René <e> Rene Scharfe` — the second parse fails and
+    // the line is handled like a single-pair entry: canonical identity only, keyed by email.
+    let rest1_trim = rest1.trim_start();
+    let (name2, email2) = if rest1_trim.is_empty() {
         (None, None)
     } else {
-        match parse_name_and_email(rest1.trim_start(), true) {
-            Some((n, e, tail)) if tail.trim().is_empty() => (n, e),
-            _ => return,
+        match parse_name_and_email(rest1_trim, true) {
+            Some((n2, e2, _tail)) => (n2, e2),
+            None => (None, None),
         }
     };
 
@@ -214,7 +226,7 @@ fn read_mailmap_line_into(table: &mut MailmapTable, line: &str) {
 }
 
 /// Append mappings from a mailmap file body (Git `read_mailmap_string`).
-pub fn read_mailmap_string(table: &mut MailmapTable, buf: &str) {
+pub(crate) fn read_mailmap_string(table: &mut MailmapTable, buf: &str) {
     let mut start = 0usize;
     for (i, ch) in buf.char_indices() {
         if ch == '\n' {
@@ -309,7 +321,8 @@ pub fn parse_contact(contact: &str) -> (Option<String>, Option<String>) {
 
 /// Map `(name, email)` through the mailmap; uses [`MailmapTable`] internally.
 #[must_use]
-pub fn map_contact(
+#[allow(dead_code)] // integration / re-export use only
+pub(crate) fn map_contact(
     name: Option<&str>,
     email: Option<&str>,
     mailmap: &[MailmapEntry],
@@ -373,17 +386,25 @@ fn read_mailmap_file_nofollow(path: &Path) -> Result<String> {
             .custom_flags(libc::O_NOFOLLOW)
             .open(path)
             .map_err(|_| {
-                Error::PathError(format!("unable to open mailmap at {}", path.display()))
+                Error::Worktree(WorktreeError::Path {
+                    detail: format!("unable to open mailmap at {}", path.display()),
+                })
             })?;
         let mut s = String::new();
-        file.read_to_string(&mut s)
-            .map_err(|e| Error::PathError(format!("reading {}: {e}", path.display())))?;
+        file.read_to_string(&mut s).map_err(|e| {
+            Error::Worktree(WorktreeError::Path {
+                detail: format!("reading {}: {e}", path.display()),
+            })
+        })?;
         Ok(s)
     }
     #[cfg(not(unix))]
     {
-        fs::read_to_string(path)
-            .map_err(|e| Error::PathError(format!("reading {}: {e}", path.display())))
+        fs::read_to_string(path).map_err(|e| {
+            Error::Worktree(WorktreeError::Path {
+                detail: format!("reading {}: {e}", path.display()),
+            })
+        })
     }
 }
 
@@ -394,8 +415,11 @@ fn read_optional_mailmap_file(path: &Path, nofollow: bool) -> Result<String> {
     if nofollow {
         read_mailmap_file_nofollow(path)
     } else {
-        fs::read_to_string(path)
-            .map_err(|e| Error::PathError(format!("reading {}: {e}", path.display())))
+        fs::read_to_string(path).map_err(|e| {
+            Error::Worktree(WorktreeError::Path {
+                detail: format!("reading {}: {e}", path.display()),
+            })
+        })
     }
 }
 
@@ -403,16 +427,20 @@ fn read_optional_mailmap_file(path: &Path, nofollow: bool) -> Result<String> {
 ///
 /// # Errors
 ///
-/// Returns [`Error::PathError`] when `spec` does not resolve, the object cannot be read,
+/// Returns [`crate::worktree::WorktreeError::Path`] when `spec` does not resolve, the object cannot be read,
 /// or it names an object that is not a blob.
-pub fn read_mailmap_blob(repo: &Repository, spec: &str) -> Result<String> {
-    let oid = resolve_revision(repo, spec)
-        .map_err(|e| Error::PathError(format!("resolving mailmap blob '{spec}': {e}")))?;
+#[allow(dead_code)] // integration / re-export use only
+pub(crate) fn read_mailmap_blob(repo: &Repository, spec: &str) -> Result<String> {
+    let oid = resolve_revision(repo, spec).map_err(|e| {
+        Error::Worktree(WorktreeError::Path {
+            detail: format!("resolving mailmap blob '{spec}': {e}"),
+        })
+    })?;
     match read_blob_text(repo, &oid, spec)? {
         BlobText::Text(text) => Ok(text),
-        BlobText::NotABlob(kind) => Err(Error::PathError(format!(
-            "mailmap blob '{spec}' is a {kind}, not a blob"
-        ))),
+        BlobText::NotABlob(kind) => Err(Error::Worktree(WorktreeError::Path {
+            detail: format!("mailmap blob '{spec}' is a {kind}, not a blob"),
+        })),
     }
 }
 
@@ -427,10 +455,11 @@ fn read_blob_text(
     oid: &crate::objects::ObjectId,
     spec: &str,
 ) -> Result<BlobText> {
-    let obj = repo
-        .odb()
-        .read(oid)
-        .map_err(|e| Error::PathError(format!("reading mailmap blob '{spec}': {e}")))?;
+    let obj = repo.odb().read(oid).map_err(|e| {
+        Error::Worktree(WorktreeError::Path {
+            detail: format!("reading mailmap blob '{spec}': {e}"),
+        })
+    })?;
     if obj.kind != ObjectKind::Blob {
         return Ok(BlobText::NotABlob(obj.kind));
     }
@@ -458,16 +487,16 @@ fn read_configured_mailmap_blob(repo: &Repository, spec: &str) -> Result<Option<
 }
 
 /// Load mailmap from the repository using Git's source order and merge rules.
-pub fn load_mailmap_table(repo: &Repository) -> Result<MailmapTable> {
+pub(crate) fn load_mailmap_table(repo: &Repository) -> Result<MailmapTable> {
     let mut table = MailmapTable::default();
     load_mailmap_into(repo, &mut table)?;
     Ok(table)
 }
 
 /// Merge Git's configured mailmap sources into `table`.
-pub fn load_mailmap_into(repo: &Repository, table: &mut MailmapTable) -> Result<()> {
-    let config = repo.config()?;
-    let mut mailmap_blob = config.get("mailmap.blob");
+pub(crate) fn load_mailmap_into(repo: &Repository, table: &mut MailmapTable) -> Result<()> {
+    let config = repo.config().snapshot()?;
+    let mut mailmap_blob = config.value("mailmap.blob");
     let is_bare = repo.work_tree().is_none();
     if mailmap_blob.is_none() && is_bare {
         mailmap_blob = Some("HEAD:.mailmap".to_string());
@@ -487,7 +516,7 @@ pub fn load_mailmap_into(repo: &Repository, table: &mut MailmapTable) -> Result<
         }
     }
 
-    if let Some(file) = config.get("mailmap.file") {
+    if let Some(file) = config.value("mailmap.file") {
         read_mailmap_string(
             table,
             &read_optional_mailmap_file(&resolve_mailmap_path(&base_dir, &file), false)?,
@@ -497,17 +526,12 @@ pub fn load_mailmap_into(repo: &Repository, table: &mut MailmapTable) -> Result<
     Ok(())
 }
 
-/// Parsed mailmap for the repository (default `.mailmap` + config).
-pub fn load_mailmap(repo: &Repository) -> Result<Vec<MailmapEntry>> {
-    let table = load_mailmap_table(repo)?;
-    Ok(table_to_entries(&table))
-}
-
 /// Rewrite `author ` / `committer ` / `tagger ` header lines in a commit or tag object buffer.
 ///
 /// Git applies mailmap only to the `Name <email>` prefix; the trailing ` <epoch> <tz>` is preserved.
 #[must_use]
-pub fn apply_mailmap_to_commit_or_tag_bytes(data: &[u8], mailmap: &MailmapTable) -> Vec<u8> {
+#[allow(dead_code)] // integration / re-export use only
+pub(crate) fn apply_mailmap_to_commit_or_tag_bytes(data: &[u8], mailmap: &MailmapTable) -> Vec<u8> {
     if mailmap.is_empty() {
         return data.to_vec();
     }
@@ -583,5 +607,128 @@ mod tests {
         let (n2, e2) = t.map_user("A".into(), " a@example.com ".into());
         assert_eq!(n2, "Ah");
         assert_eq!(e2, "ah@example.com");
+    }
+
+    #[test]
+    fn name_only_remainder_collapses_names_for_same_email() {
+        let mut t = MailmapTable::default();
+        read_mailmap_string(&mut t, "René Scharfe <l.s.r@web.de> Rene Scharfe\n");
+        let (n1, e1) = t.map_user_str("Rene Scharfe", "l.s.r@web.de");
+        assert_eq!(n1, "René Scharfe");
+        assert_eq!(e1, "l.s.r@web.de");
+        let (n2, e2) = t.map_user_str("René Scharfe", "l.s.r@web.de");
+        assert_eq!(n2, "René Scharfe");
+        assert_eq!(e2, "l.s.r@web.de");
+    }
+
+    #[test]
+    fn two_pairs_discards_tail_after_second_angle_pair() {
+        let mut t = MailmapTable::default();
+        read_mailmap_string(
+            &mut t,
+            "Philip Oakley <philipoakley@iee.email> <philipoakley@iee.org> # secondary <philipoakley@dunelm.org.uk>\n",
+        );
+        let (n, e) = t.map_user_str("Phil", "philipoakley@iee.org");
+        assert_eq!(n, "Philip Oakley");
+        assert_eq!(e, "philipoakley@iee.email");
+    }
+
+    #[test]
+    fn hash_at_column_zero_skips_line() {
+        let mut t = MailmapTable::default();
+        read_mailmap_string(&mut t, "# René Scharfe <x@example.com> Rene\n");
+        let (n, e) = t.map_user_str("Rene", "x@example.com");
+        assert_eq!(n, "Rene");
+        assert_eq!(e, "x@example.com");
+    }
+
+    #[test]
+    fn leading_whitespace_before_hash_is_data_not_a_comment() {
+        let mut t = MailmapTable::default();
+        read_mailmap_string(&mut t, " # Canonical <old@example.com>\n");
+        let (n, e) = t.map_user_str("Old Name", "old@example.com");
+        assert_eq!(n, "# Canonical");
+        assert_eq!(e, "old@example.com");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::process::Command::new("git")
+            .current_dir(root)
+            .args(["init", "-q"])
+            .status()
+            .expect("git init");
+        std::fs::write(root.join(".mailmap"), " # Canonical <old@example.com>\n").expect("mailmap");
+        let out = std::process::Command::new("git")
+            .current_dir(root)
+            .args(["check-mailmap", "Old Name <old@example.com>"])
+            .output()
+            .expect("git check-mailmap");
+        assert!(
+            out.status.success(),
+            "git: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim_end(),
+            "# Canonical <old@example.com>"
+        );
+    }
+
+    #[test]
+    fn name_trimming_is_ascii_only_nbsp_preserved_matches_git() {
+        let nbsp = '\u{00A0}';
+        let line = format!("{nbsp}Canonical{nbsp} <old@example.com>\n");
+
+        let mut t = MailmapTable::default();
+        read_mailmap_string(&mut t, &line);
+        let (n, e) = t.map_user_str("Anyone", "old@example.com");
+        assert_eq!(e, "old@example.com");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::process::Command::new("git")
+            .current_dir(root)
+            .args(["init", "-q"])
+            .status()
+            .expect("git init");
+        std::fs::write(root.join(".mailmap"), &line).expect("mailmap");
+        let out = std::process::Command::new("git")
+            .current_dir(root)
+            .args(["check-mailmap", "Anyone <old@example.com>"])
+            .output()
+            .expect("git check-mailmap");
+        assert!(
+            out.status.success(),
+            "git: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let git_line = String::from_utf8_lossy(&out.stdout).trim_end().to_string();
+        let expected = format!("{nbsp}Canonical{nbsp} <old@example.com>");
+        assert_eq!(git_line, expected);
+        assert_eq!(n, format!("{nbsp}Canonical{nbsp}"));
+    }
+
+    #[test]
+    fn pound_inside_old_name_is_not_inline_comment() {
+        let mut t = MailmapTable::default();
+        read_mailmap_string(
+            &mut t,
+            "New Person <new@example.com> Old # Name <old@example.com>\n",
+        );
+        let (n, e) = t.map_user_str("Old # Name", "old@example.com");
+        assert_eq!(n, "New Person");
+        assert_eq!(e, "new@example.com");
+    }
+
+    #[test]
+    fn remainder_without_second_email_pair_is_simple_canonical_mapping() {
+        let mut t = MailmapTable::default();
+        read_mailmap_string(
+            &mut t,
+            "Canonical <canon@example.com> loose-old-name-token\n",
+        );
+        let (n, e) = t.map_user_str("Anyone", "canon@example.com");
+        assert_eq!(n, "Canonical");
+        assert_eq!(e, "canon@example.com");
     }
 }

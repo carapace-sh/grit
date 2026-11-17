@@ -7,17 +7,22 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
 
+use std::sync::Arc;
+
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::error::Error;
+use grit_lib::ident::Signature;
+use grit_lib::objects::odb::store::MemoryStore;
 use grit_lib::objects::{HashAlgo, ObjectId};
-use grit_lib::porcelain::add::stage_for_commit;
-use grit_lib::porcelain::commit::{create_commit, CommitRequest};
+use grit_lib::porcelain::commit::{CommitRequest, CommitScope};
 use grit_lib::progress::NullProgress;
-use grit_lib::refs::store::{Expected, RawRef, RefUpdate, RefUpdateFlags};
+use grit_lib::refs::store::{
+    Expected, MemoryRefStore, RawRef, RefNameRef, RefUpdate, RefUpdateFlags,
+};
 use grit_lib::refs::{
     commit_ref_update_on_store, update_branch_for_commit_on_store, BranchCommitRefUpdate,
 };
-use grit_lib::repo::Repository;
+use grit_lib::repo::{InitOptions, Repository};
 use grit_test_support::git;
 
 fn install_reference_transaction_hook(repo: &Repository, log_path: &Path, deny_prepared: bool) {
@@ -54,10 +59,10 @@ fn branch_create_runs_prepared_and_committed() {
     let repo = Repository::discover(Some(tmp.path()), &RepositoryOptions::empty()).expect("open");
     install_reference_transaction_hook(&repo, &log, false);
 
-    let tip = repo.refs().resolve("HEAD").expect("head");
+    let tip = repo.ref_store().resolve("HEAD").expect("head");
     fs::write(&log, "").expect("clear log");
     commit_ref_update_on_store(
-        repo.refs(),
+        repo.ref_store(),
         RefUpdate {
             name: "refs/heads/topic".into(),
             new_value: Some(RawRef::Direct(tip)),
@@ -96,10 +101,10 @@ fn prepared_refusal_leaves_ref_unchanged_and_logs_aborted() {
     let repo = Repository::discover(Some(tmp.path()), &RepositoryOptions::empty()).expect("open");
     install_reference_transaction_hook(&repo, &log, true);
 
-    let tip = repo.refs().resolve("HEAD").expect("head");
+    let tip = repo.ref_store().resolve("HEAD").expect("head");
     fs::write(&log, "").expect("clear log");
     let err = commit_ref_update_on_store(
-        repo.refs(),
+        repo.ref_store(),
         RefUpdate {
             name: "refs/heads/blocked".into(),
             new_value: Some(RawRef::Direct(tip)),
@@ -111,8 +116,8 @@ fn prepared_refusal_leaves_ref_unchanged_and_logs_aborted() {
     .expect_err("hook blocks");
     assert!(matches!(err, Error::Hook(_)), "{err}");
     assert!(repo
-        .refs()
-        .read_raw("refs/heads/blocked")
+        .ref_store()
+        .read_raw(RefNameRef::from_trusted("refs/heads/blocked"))
         .expect("read")
         .is_none());
     let text = read_log(&log);
@@ -136,21 +141,21 @@ fn files_backend_commit_emits_head_and_branch_lines() {
     install_reference_transaction_hook(&repo, &log, false);
 
     git(tmp.path(), &["commit", "--allow-empty", "-qm", "c2"]);
-    let new_commit = repo.refs().resolve("HEAD").expect("new tip");
+    let new_commit = repo.ref_store().resolve("HEAD").expect("new tip");
     git(tmp.path(), &["reset", "--hard", "HEAD~1"]);
-    let old = repo.refs().resolve("HEAD").expect("old tip");
+    let old = repo.ref_store().resolve("HEAD").expect("old tip");
 
     fs::write(&log, "").expect("clear log");
     update_branch_for_commit_on_store(
-        repo.refs(),
+        repo.ref_store(),
         &BranchCommitRefUpdate {
-            branch_ref: "refs/heads/main",
+            branch_ref: RefNameRef::from_trusted("refs/heads/main"),
             expected_old: Some(old),
             new_oid: new_commit,
             identity: "T <t@e.x> 1700000000 +0000",
             reflog_message: "commit: c2",
         },
-        &repo.config().expect("config"),
+        &repo.config().snapshot().expect("config"),
     )
     .expect("advance branch");
 
@@ -181,21 +186,23 @@ fn sha256_initial_commit_hook_uses_wide_null_old_id() {
     install_reference_transaction_hook(&repo, &log, false);
 
     fs::write(&log, "").expect("clear log");
-    stage_for_commit(&repo, &mut NullProgress, &grit_lib::progress::NeverCancel).expect("stage");
+    repo.index()
+        .stage_for_commit(&mut NullProgress, &grit_lib::progress::CancelToken::never())
+        .expect("stage");
     let ident = "T <t@e.x> 1700000000 +0000".to_string();
-    create_commit(
-        &repo,
-        &CommitRequest {
-            message: "c1".into(),
-            author: Some(ident.parse().expect("sig")),
-            committer: Some(ident.parse().expect("sig")),
-            allow_empty: false,
-            ..Default::default()
-        },
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("commit");
+    repo.commits()
+        .create_staged(
+            &{
+                let mut req = CommitRequest::new("c1");
+                req.author = Some(ident.parse().expect("sig"));
+                req.committer = Some(ident.parse().expect("sig"));
+                req.allow_empty = false;
+                req
+            },
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("commit");
 
     let null = ObjectId::null(HashAlgo::Sha256).to_hex();
     assert_eq!(null.len(), 64, "sha256 null width");
@@ -251,20 +258,20 @@ fn branch_lock_held_during_prepared_blocks_nested_ref_update() {
 
     fs::write(&log, "").expect("clear log");
     update_branch_for_commit_on_store(
-        repo.refs(),
+        repo.ref_store(),
         &BranchCommitRefUpdate {
-            branch_ref: "refs/heads/main",
+            branch_ref: RefNameRef::from_trusted("refs/heads/main"),
             expected_old: Some(old_oid),
             new_oid,
             identity: "T <t@e.x> 1700000000 +0000",
             reflog_message: "commit: c2",
         },
-        &repo.config().expect("config"),
+        &repo.config().snapshot().expect("config"),
     )
     .expect("outer commit succeeds");
 
     assert_eq!(
-        repo.refs().resolve("refs/heads/main").expect("tip"),
+        repo.ref_store().resolve("refs/heads/main").expect("tip"),
         new_oid,
         "branch must stay at grit's new tip, not the hook's rewind"
     );
@@ -311,10 +318,10 @@ fn core_hooks_path_is_honored() {
     git(&work, &["commit", "-qm", "c1"]);
 
     let repo = Repository::discover(Some(&work), &RepositoryOptions::empty()).expect("open");
-    let tip = repo.refs().resolve("HEAD").expect("head");
+    let tip = repo.ref_store().resolve("HEAD").expect("head");
     fs::write(&log, "").expect("clear log");
     commit_ref_update_on_store(
-        repo.refs(),
+        repo.ref_store(),
         RefUpdate {
             name: "refs/heads/x".into(),
             new_value: Some(RawRef::Direct(tip)),
@@ -327,4 +334,92 @@ fn core_hooks_path_is_honored() {
     let text = read_log(&log);
     assert!(text.contains("prepared prepared"), "{text}");
     assert!(text.contains("committed prepared"), "{text}");
+}
+
+fn hook_lines_for_phase(text: &str, phase: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|line| {
+            let prefix = format!("{phase}: ");
+            line.strip_prefix(&prefix).map(|rest| {
+                rest.split_terminator('|')
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+        })
+        .flatten()
+        .collect()
+}
+
+#[test]
+fn memory_ref_store_second_commit_head_line_matches_branch_old_oid() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path().join("r");
+    Repository::init(&root, &InitOptions::new().with_initial_branch("main")).expect("init");
+    let git_dir = root.join(".git");
+    fs::write(
+        git_dir.join("config"),
+        format!(
+            "{}\n[user]\n\tname = T\n\temail = t@x\n",
+            fs::read_to_string(git_dir.join("config")).expect("config")
+        ),
+    )
+    .expect("config");
+    let log = tmp.path().join("hook.log");
+    let hooks = git_dir.join("hooks");
+    fs::create_dir_all(&hooks).expect("hooks");
+    let script = format!(
+        "#!/bin/sh\n\
+         echo \"$1: $(cat | tr '\\n' '|')\" >> {log}\n\
+         exit 0\n",
+        log = log.display()
+    );
+    let hook = hooks.join("reference-transaction");
+    fs::write(&hook, script).expect("hook");
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).expect("chmod");
+
+    let repo = Repository::open(
+        &git_dir,
+        &(RepositoryOptions::empty()
+            .with_initial_branch("main")
+            .with_object_store(Arc::new(MemoryStore::new(HashAlgo::Sha1)))
+            .with_ref_store(Arc::new(MemoryRefStore::new()))
+            .with_work_tree(&root)),
+    )
+    .expect("open");
+
+    let ident: Signature = "T <t@x> 1700000000 +0000".parse().expect("sig");
+    for i in 0..2 {
+        fs::write(root.join(format!("f{i}")), "x").expect("file");
+        let mut req = CommitRequest::new(format!("c{i}"));
+        req.author = Some(ident.clone());
+        req.committer = Some(ident.clone());
+        repo.commits()
+            .create(
+                &grit_lib::commits::CommitOptions::new(req.clone(), CommitScope::AutoStage),
+                &mut NullProgress,
+                &CancelToken::never(),
+            )
+            .expect("commit");
+        if i == 0 {
+            fs::write(&log, "").expect("clear after first commit");
+            continue;
+        }
+        let text = read_log(&log);
+        for phase in ["prepared", "committed"] {
+            let lines = hook_lines_for_phase(&text, phase);
+            assert_eq!(lines.len(), 2, "{phase}: {text}");
+            let head = lines
+                .iter()
+                .find(|l| l.ends_with(" HEAD"))
+                .expect("HEAD line");
+            let branch = lines
+                .iter()
+                .find(|l| l.ends_with(" refs/heads/main"))
+                .expect("branch line");
+            let head_old = head.split_whitespace().next().expect("head old");
+            let branch_old = branch.split_whitespace().next().expect("branch old");
+            assert_ne!(head_old, ObjectId::null(HashAlgo::Sha1).to_hex(), "{phase}");
+            assert_eq!(head_old, branch_old, "{phase}: {text}");
+        }
+    }
 }

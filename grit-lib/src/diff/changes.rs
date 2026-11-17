@@ -2,32 +2,38 @@
 //!
 //! [`UncommittedDiff`] collects [`DiffEntry`] rows for the index against `HEAD`, the working
 //! tree against the index, or the working tree against any tree, reusing one loaded index and
-//! one set of [`WorktreeRules`] for every step. [`UncommittedDiff::load_worktree_changes`] and
-//! [`load_object_changes`] then turn entries into [`FileChange`]s whose bytes feed structured
+//! one set of [`WorktreeRules`] for every step; [`UncommittedDiff::entries`] picks the comparison
+//! from a [`DiffTarget`] and applies pathspecs and `--diff-filter`.
+//! [`UncommittedDiff::load_worktree_changes`] and
+//! [`Diff::object_changes`](super::Diff::object_changes) then turn entries into [`FileChange`]s whose bytes feed structured
 //! hunks ([`FileChange::structured`]) or line counts ([`FileChange::line_stat`]).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use crate::diff::structured::{structured_file_diff, SideBytes, StructuredFileDiff};
-use crate::diff::targets::{commit_tree, diff_index_to_tree_for_paths};
+use crate::diff::targets::{
+    diff_index_to_tree_for_paths, limit_target_entries, stored_target_entries,
+};
 use crate::diff::tree_content::{gitlink_line, load_new_side, load_old_side};
 use crate::diff::{
     apply_rename_detection_to_diff_entries, diff_index_to_tree_with_renames,
-    diff_index_to_worktree_with_renames, diff_tree_to_worktree_with_git_dir_and_rules,
-    index_mtime_for_diff, line_change_counts, load_worktree_side_for_diff, read_submodule_head_oid,
-    sort_entries_by_path, submodule_porcelain_flags, DiffEntry, DiffIndexToWorktreeOptions,
-    DiffOptions, DiffStatus, LineStat, RenameDetection, RENAME_DETECTION_DISABLED,
+    diff_index_to_worktree_with_renames, diff_tree_to_worktree_with_git_dir_and_rules_extras,
+    index_mtime_for_diff, load_worktree_side_for_diff, peer_scope_includes_path,
+    read_submodule_head_oid, sort_entries_by_path, submodule_porcelain_flags, DiffEntry,
+    DiffIndexToWorktreeOptions, DiffOptions, DiffSide, DiffStatus, DiffTarget,
+    DiffTreeToWorktreeExtras, LineStat, RenameDetection, RENAME_DETECTION_DISABLED,
 };
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::index::write_tree::cache_tree_extension_valid;
 use crate::index::Index;
 use crate::objects::odb::Odb;
 use crate::objects::{FileMode, ObjectId};
 use crate::parallel::{try_par_map, ParallelHashError, ParallelOp};
 use crate::repo::Repository;
-use crate::state::resolve_head;
+use crate::repo::RepositoryError;
+use crate::state::resolve_head_for_repository;
 use crate::worktree::fsmonitor::fsmonitor_enabled;
 use crate::worktree::worktree_rules::WorktreeRules;
 
@@ -52,7 +58,7 @@ pub struct FileChange {
     pub old_bytes: SideBytes,
     /// New side contents, read from the working tree for working-tree changes.
     pub new_bytes: SideBytes,
-    /// Either side is treated as binary; binary sides may not carry their bytes.
+    /// Either side is treated as binary; a binary change may carry neither side's bytes.
     pub binary: bool,
     /// The object ids differ (false for a mode-only change).
     pub content_changed: bool,
@@ -128,7 +134,7 @@ impl FileChange {
         if self.binary {
             return None;
         }
-        Some(line_change_counts(
+        Some(super::detail::line_stat_for_options(
             &self.old_bytes.text(),
             &self.new_bytes.text(),
             options,
@@ -150,8 +156,11 @@ impl FileChange {
 /// # Errors
 ///
 /// Returns config load failures and object read errors.
-pub fn load_object_changes(repo: &Repository, entries: &[DiffEntry]) -> Result<Vec<FileChange>> {
-    let config = repo.config()?;
+pub(crate) fn load_object_changes(
+    repo: &Repository,
+    entries: &[DiffEntry],
+) -> Result<Vec<FileChange>> {
+    let config = repo.config().snapshot()?;
     let par_opts = repo
         .thread_policy()
         .resolve(ParallelOp::DiffContent, config.as_ref());
@@ -172,15 +181,21 @@ pub(crate) struct WorktreeSide<'a> {
 
 /// Load one entry's sides: the old side from the object database, the new side from the
 /// working tree when `worktree` is given, otherwise from the object database.
+///
+/// A binary new side makes the whole change binary, so the old blob is then not read at all.
 pub(crate) fn load_change(
     odb: &Odb,
     entry: DiffEntry,
     worktree: Option<&WorktreeSide<'_>>,
 ) -> Result<FileChange> {
-    let (old_bytes, old_binary) = load_old_side(odb, &entry, None)?;
     let (new_bytes, new_binary) = match worktree {
         Some(side) => load_worktree_new_side(odb, &entry, side)?,
-        None => load_new_side(odb, &entry, None)?,
+        None => load_new_side(odb, &entry)?,
+    };
+    let (old_bytes, old_binary) = if new_binary {
+        (old_side_without_payload(odb, &entry, worktree)?, false)
+    } else {
+        load_old_side(odb, &entry)?
     };
     Ok(FileChange::from_entry(
         entry,
@@ -202,6 +217,35 @@ pub(crate) fn load_changes(
         .collect()
 }
 
+fn old_side_without_payload(
+    odb: &Odb,
+    entry: &DiffEntry,
+    worktree: Option<&WorktreeSide<'_>>,
+) -> Result<SideBytes> {
+    if entry.old_mode == FileMode::GITLINK {
+        return Ok(SideBytes::from_bytes(
+            gitlink_line(&entry.old_oid).into_bytes(),
+        ));
+    }
+    if entry.old_mode == FileMode::ABSENT {
+        return Ok(SideBytes::unread(0));
+    }
+    if let Some(side) = worktree {
+        if let Some(path) = entry.old_path.as_deref().or(entry.new_path.as_deref()) {
+            if let Some(ie) = side.index.get(&crate::repo_relpath::storage_bytes(path), 0) {
+                if ie.oid == entry.old_oid && !ie.stat_cache_unset() {
+                    return Ok(SideBytes::unread(u64::from(ie.size)));
+                }
+            }
+        }
+    }
+    if entry.old_oid.is_zero() {
+        return Ok(SideBytes::unread(0));
+    }
+    let info = odb.read_info(&entry.old_oid)?;
+    Ok(SideBytes::unread(info.size))
+}
+
 fn load_worktree_new_side(
     odb: &Odb,
     entry: &DiffEntry,
@@ -215,7 +259,7 @@ fn load_worktree_new_side(
         return Ok((SideBytes::from_bytes(Vec::new()), false));
     }
     let Some(path) = entry.new_path.as_deref().or(entry.old_path.as_deref()) else {
-        return load_new_side(odb, entry, None);
+        return load_new_side(odb, entry);
     };
     // Working-tree entries often carry only a hash of the normalized file, and the blob is not
     // in the object database until it is staged, so always read the live file.
@@ -253,18 +297,51 @@ fn worktree_gitlink_line(entry: &DiffEntry, work_tree: &Path) -> String {
     }
 }
 
+/// Paths to scan before a worktree or index diff when `pathspecs` limit the operation.
+///
+/// Includes index entries selected by the pathspecs plus blob paths in `base_tree` that match,
+/// so a staged deletion (absent from the index but present in `HEAD`) is not dropped.
+pub(crate) fn pathspec_restrict_paths_for_scan(
+    repo: &Repository,
+    index: &Index,
+    pathspecs: &[String],
+    base_tree: Option<&ObjectId>,
+) -> Result<Option<Arc<BTreeSet<String>>>> {
+    if pathspecs.is_empty() {
+        return Ok(None);
+    }
+    let base_ctx = repo.pathspec_match_context();
+    let mut paths = crate::porcelain::add::restricted_index_paths_for_pathspecs(
+        repo, index, pathspecs, base_ctx,
+    )?;
+    if let Some(tree) = base_tree {
+        let attr_matcher = if pathspecs
+            .iter()
+            .any(|s| crate::pathspec::pathspec_has_attr_magic(s))
+        {
+            Some(repo.pathspec_matcher(pathspecs)?)
+        } else {
+            None
+        };
+        for (path, mode, _) in super::flatten_tree_entries(repo.odb(), tree)? {
+            if crate::porcelain::add::blob_path_matches_restrict_pathspecs(
+                &path,
+                mode.bits(),
+                pathspecs,
+                base_ctx,
+                attr_matcher.as_ref(),
+            )? {
+                paths.insert(path);
+            }
+        }
+    }
+    Ok(Some(Arc::new(paths)))
+}
+
 fn rename_threshold(renames: RenameDetection) -> u32 {
     renames
         .threshold_percent()
         .unwrap_or(RENAME_DETECTION_DISABLED)
-}
-
-/// `HEAD`'s tree, or `None` on an unborn branch.
-pub(crate) fn head_tree(repo: &Repository) -> Result<Option<ObjectId>> {
-    resolve_head(repo.git_dir())?
-        .oid()
-        .map(|oid| commit_tree(repo, oid))
-        .transpose()
 }
 
 /// Index against `HEAD`'s tree, sorted by path.
@@ -276,29 +353,44 @@ pub(crate) fn staged_entries_in(
     rename_threshold: u32,
     restrict_to_paths: Option<&BTreeSet<String>>,
 ) -> Result<Vec<DiffEntry>> {
-    let head_tree = head_tree(repo)?;
+    let head_tree = resolve_head_for_repository(repo)?.tree(repo.odb())?;
+    let config = repo.config().snapshot()?;
     let mut entries = match restrict_to_paths.filter(|paths| !paths.is_empty()) {
         Some(paths) => diff_index_to_tree_for_paths(repo, index, head_tree.as_ref(), paths)?,
-        None => {
-            let config = repo.config()?;
-            diff_index_to_tree_with_renames(
-                repo.odb(),
-                index,
-                head_tree.as_ref(),
-                false,
-                rename_threshold,
-                config.as_ref(),
-                &repo.thread_policy(),
-            )?
-        }
+        None => diff_index_to_tree_with_renames(
+            repo.odb(),
+            index,
+            head_tree.as_ref(),
+            false,
+            rename_threshold,
+            config.as_ref(),
+            &repo.thread_policy(),
+        )?,
     };
+    if let Some(work_tree) = repo.work_tree() {
+        entries.retain(|entry| {
+            if !entry.old_mode.is_gitlink() && !entry.new_mode.is_gitlink() {
+                return true;
+            }
+            let Some(path) = entry.new_path.as_deref().or(entry.old_path.as_deref()) else {
+                return true;
+            };
+            !crate::submodule_ignore::staged_gitlink_omitted_in_diff(
+                config.as_ref(),
+                work_tree,
+                path,
+            )
+        });
+    }
     sort_entries_by_path(&mut entries);
     Ok(entries)
 }
 
 /// Working tree against `index`, sorted by path.
 ///
-/// `restrict_to_paths` limits the scan to those paths and skips the fsmonitor refresh.
+/// `restrict_to_paths` limits the scan to those paths and skips the fsmonitor refresh. A file
+/// whose size changed (under an identity clean conversion) is reported without being hashed,
+/// with a null `new_oid`; loading its side reads the live file anyway.
 pub(crate) fn unstaged_entries_in(
     repo: &Repository,
     index: &mut Index,
@@ -315,10 +407,13 @@ pub(crate) fn unstaged_entries_in(
         config: Some(config),
         thread_policy: Some(repo.thread_policy()),
         refresh_index_stat_in_pass: false,
+        size_change_proves_modified: true,
         refresh_fsmonitor,
         worktree_rules: Some(Arc::clone(rules)),
         command_runner: Some(repo.command_runner()),
         restrict_to_paths,
+        skip_inaccessible_paths: true,
+        diagnostics: Some(repo.diagnostics()),
         ..DiffIndexToWorktreeOptions::default()
     };
     let (mut entries, _) =
@@ -338,6 +433,7 @@ pub(crate) fn worktree_entries_in(
     rules: &Arc<Mutex<WorktreeRules>>,
     base_tree: Option<&ObjectId>,
     rename_threshold: u32,
+    restrict_to_paths: Option<Arc<BTreeSet<String>>>,
 ) -> Result<Vec<DiffEntry>> {
     let index_matches_base = match (base_tree, index.cache_tree_root.as_ref()) {
         (Some(base), Some(cached)) => base == cached,
@@ -345,12 +441,19 @@ pub(crate) fn worktree_entries_in(
         _ => false,
     };
     if index_matches_base && cache_tree_extension_valid(index.cache_tree.as_ref()) {
-        return unstaged_entries_in(repo, index, work_tree, rules, rename_threshold, None);
+        return unstaged_entries_in(
+            repo,
+            index,
+            work_tree,
+            rules,
+            rename_threshold,
+            restrict_to_paths,
+        );
     }
-    let config = repo.config()?;
+    let config = repo.config().snapshot()?;
     let raw = {
         let rules = rules.lock().unwrap_or_else(|e| e.into_inner());
-        diff_tree_to_worktree_with_git_dir_and_rules(
+        diff_tree_to_worktree_with_git_dir_and_rules_extras(
             repo.odb(),
             base_tree,
             work_tree,
@@ -358,6 +461,11 @@ pub(crate) fn worktree_entries_in(
             index,
             Some(config.as_ref()),
             Some(&rules),
+            DiffTreeToWorktreeExtras {
+                skip_inaccessible_paths: true,
+                diagnostics: Some(repo.diagnostics()),
+                restrict_to_paths: restrict_to_paths.clone(),
+            },
         )?
     };
     let mut entries = apply_rename_detection_to_diff_entries(
@@ -420,10 +528,26 @@ impl<'repo> UncommittedDiff<'repo> {
     ///
     /// Returns `HEAD` resolution, config, and object read errors.
     pub fn staged_entries(&self, renames: RenameDetection) -> Result<Vec<DiffEntry>> {
-        staged_entries_in(self.repo, &self.index, rename_threshold(renames), None)
+        self.staged_entries_for_paths(renames, None)
+    }
+
+    fn staged_entries_for_paths(
+        &self,
+        renames: RenameDetection,
+        restrict_to_paths: Option<Arc<BTreeSet<String>>>,
+    ) -> Result<Vec<DiffEntry>> {
+        staged_entries_in(
+            self.repo,
+            &self.index,
+            rename_threshold(renames),
+            restrict_to_paths.as_deref(),
+        )
     }
 
     /// Working tree against the index (`grit diff --unstaged`), sorted by path.
+    ///
+    /// Like Git's `diff-files`, a working-tree side that was not hashed carries a null
+    /// `new_oid`; a tracked file whose size changed is reported that way without reading it.
     ///
     /// # Parameters
     ///
@@ -431,9 +555,17 @@ impl<'repo> UncommittedDiff<'repo> {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::RequiresWorkTree`] in a bare repository, plus worktree rule, I/O, and
+    /// Returns [`RepositoryError::RequiresWorkTree`] in a bare repository, plus worktree rule, I/O, and
     /// object read errors.
     pub fn unstaged_entries(&mut self, renames: RenameDetection) -> Result<Vec<DiffEntry>> {
+        self.unstaged_entries_for_paths(renames, None)
+    }
+
+    fn unstaged_entries_for_paths(
+        &mut self,
+        renames: RenameDetection,
+        restrict_to_paths: Option<Arc<BTreeSet<String>>>,
+    ) -> Result<Vec<DiffEntry>> {
         let work_tree = self.work_tree()?;
         let rules = self.rules()?;
         unstaged_entries_in(
@@ -442,7 +574,7 @@ impl<'repo> UncommittedDiff<'repo> {
             work_tree,
             &rules,
             rename_threshold(renames),
-            None,
+            restrict_to_paths,
         )
     }
 
@@ -456,12 +588,21 @@ impl<'repo> UncommittedDiff<'repo> {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::RequiresWorkTree`] in a bare repository, plus worktree rule, I/O, and
+    /// Returns [`RepositoryError::RequiresWorkTree`] in a bare repository, plus worktree rule, I/O, and
     /// object read errors.
     pub fn worktree_entries(
         &mut self,
         base_tree: Option<&ObjectId>,
         renames: RenameDetection,
+    ) -> Result<Vec<DiffEntry>> {
+        self.worktree_entries_for_paths(base_tree, renames, None)
+    }
+
+    fn worktree_entries_for_paths(
+        &mut self,
+        base_tree: Option<&ObjectId>,
+        renames: RenameDetection,
+        restrict_to_paths: Option<Arc<BTreeSet<String>>>,
     ) -> Result<Vec<DiffEntry>> {
         let work_tree = self.work_tree()?;
         let rules = self.rules()?;
@@ -472,7 +613,150 @@ impl<'repo> UncommittedDiff<'repo> {
             &rules,
             base_tree,
             rename_threshold(renames),
+            restrict_to_paths,
         )
+    }
+
+    /// Changed paths for any [`DiffTarget`], limited to `pathspecs` and to the statuses in
+    /// `options.filter` (`--diff-filter`), sorted by path. No contents are loaded.
+    ///
+    /// [`DiffTarget::WorktreeVsHead`] compares with `HEAD`'s tree (the empty tree when unborn).
+    /// Commit and tree targets ignore the index, so prefer [`Diff::entries`](crate::diff::Diff::entries)
+    /// for them; it does not load one.
+    ///
+    /// # Parameters
+    ///
+    /// - `target` - what to compare, e.g. from [`Diff::resolve_request`](crate::diff::Diff::resolve_request).
+    /// - `pathspecs` - repository-relative pathspecs; empty means every path.
+    /// - `options` - only `renames` and `filter` are used.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RepositoryError::RequiresWorkTree`] for a working-tree target in a bare repository, plus
+    /// `HEAD` resolution, pathspec, worktree rule, I/O, and object read errors.
+    pub fn entries(
+        &mut self,
+        target: &DiffTarget,
+        pathspec: &crate::pathspec::Pathspec,
+        options: &DiffOptions,
+    ) -> Result<super::core::DiffEntriesResult> {
+        let pathspecs = pathspec.specs();
+        let renames = options.renames;
+        let result = match target {
+            DiffTarget::IndexVsHead => {
+                let head_tree = resolve_head_for_repository(self.repo)?.tree(self.repo.odb())?;
+                let restrict = pathspec_restrict_paths_for_scan(
+                    self.repo,
+                    &self.index,
+                    pathspecs,
+                    head_tree.as_ref(),
+                )?;
+                super::core::DiffEntriesResult {
+                    entries: self.staged_entries_for_paths(renames, restrict)?,
+                    inexact_rename_skipped: None,
+                    ..Default::default()
+                }
+            }
+            DiffTarget::WorktreeVsIndex => {
+                let restrict =
+                    pathspec_restrict_paths_for_scan(self.repo, &self.index, pathspecs, None)?;
+                super::core::DiffEntriesResult {
+                    entries: self.unstaged_entries_for_paths(renames, restrict)?,
+                    inexact_rename_skipped: None,
+                    ..Default::default()
+                }
+            }
+            DiffTarget::WorktreeVsHead => {
+                let head_tree = resolve_head_for_repository(self.repo)?.tree(self.repo.odb())?;
+                let restrict = pathspec_restrict_paths_for_scan(
+                    self.repo,
+                    &self.index,
+                    pathspecs,
+                    head_tree.as_ref(),
+                )?;
+                super::core::DiffEntriesResult {
+                    entries: self.worktree_entries_for_paths(
+                        head_tree.as_ref(),
+                        renames,
+                        restrict,
+                    )?,
+                    ..Default::default()
+                }
+            }
+            DiffTarget::WorktreeVsTree(tree) => {
+                let restrict = pathspec_restrict_paths_for_scan(
+                    self.repo,
+                    &self.index,
+                    pathspecs,
+                    Some(tree),
+                )?;
+                super::core::DiffEntriesResult {
+                    entries: self.worktree_entries_for_paths(Some(tree), renames, restrict)?,
+                    inexact_rename_skipped: None,
+                    ..Default::default()
+                }
+            }
+            DiffTarget::Commit(_) | DiffTarget::Trees { .. } => {
+                stored_target_entries(self.repo, target, pathspecs, options)?.unwrap_or_default()
+            }
+        };
+        limit_target_entries(self.repo, result, pathspecs, options)
+    }
+
+    /// Changes on the other side of the index for the paths in `primary_paths`, which feed
+    /// [`hunk_ids`](crate::diff::hunk_ids) so hunk ids
+    /// stay stable when an identical hunk moves between the staged and unstaged sides.
+    ///
+    /// For [`DiffSide::Staged`] primaries this loads the unstaged changes on those paths; for
+    /// [`DiffSide::Unstaged`] the staged ones. [`DiffSide::Other`] has no peer side. A path
+    /// matches when it is the peer's display path or, for a rename, its old path. No
+    /// `--diff-filter` applies: ids must not depend on which statuses are shown.
+    ///
+    /// # Parameters
+    ///
+    /// - `side` - the side the primary changes came from.
+    /// - `pathspecs` - the pathspecs the primary changes were limited to.
+    /// - `renames` - rename detection, as for the primary changes.
+    /// - `primary_paths` - display paths of the primary changes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RepositoryError::RequiresWorkTree`] for staged primaries in a bare repository, plus the
+    /// errors of [`Self::entries`] and of loading the changes.
+    pub fn peer_changes<'a>(
+        &mut self,
+        side: DiffSide,
+        pathspec: &crate::pathspec::Pathspec,
+        renames: RenameDetection,
+        primary_paths: impl IntoIterator<Item = &'a str>,
+    ) -> Result<Vec<FileChange>> {
+        let peer_target = match side {
+            DiffSide::Staged => DiffTarget::WorktreeVsIndex,
+            DiffSide::Unstaged => DiffTarget::IndexVsHead,
+            DiffSide::Other => return Ok(Vec::new()),
+        };
+        let primary: HashSet<&str> = primary_paths.into_iter().collect();
+        if primary.is_empty() {
+            return Ok(Vec::new());
+        }
+        let options = DiffOptions::default().with_renames(renames);
+        let entries: Vec<DiffEntry> = self
+            .entries(&peer_target, pathspec, &options)?
+            .entries
+            .into_iter()
+            .filter(|entry| {
+                let display = entry
+                    .new_path
+                    .as_deref()
+                    .or(entry.old_path.as_deref())
+                    .unwrap_or("");
+                peer_scope_includes_path(display, entry.old_path.as_deref(), &primary)
+            })
+            .collect();
+        match side {
+            DiffSide::Staged => self.load_worktree_changes(entries),
+            DiffSide::Unstaged | DiffSide::Other => load_object_changes(self.repo, &entries),
+        }
     }
 
     /// Load entries from [`Self::unstaged_entries`] or [`Self::worktree_entries`]: old sides
@@ -481,7 +765,7 @@ impl<'repo> UncommittedDiff<'repo> {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::RequiresWorkTree`] in a bare repository, plus I/O, filter, and object
+    /// Returns [`RepositoryError::RequiresWorkTree`] in a bare repository, plus I/O, filter, and object
     /// read errors.
     pub fn load_worktree_changes(&mut self, entries: Vec<DiffEntry>) -> Result<Vec<FileChange>> {
         let work_tree = self.work_tree()?;
@@ -495,7 +779,9 @@ impl<'repo> UncommittedDiff<'repo> {
     }
 
     fn work_tree(&self) -> Result<&'repo Path> {
-        self.repo.work_tree().ok_or(Error::RequiresWorkTree)
+        self.repo
+            .work_tree()
+            .ok_or(RepositoryError::RequiresWorkTree.into())
     }
 
     fn rules(&mut self) -> Result<Arc<Mutex<WorktreeRules>>> {
@@ -514,7 +800,8 @@ impl<'repo> UncommittedDiff<'repo> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::repo::InitOptions;
+    use crate::error::Error;
+    use crate::repo::{InitOptions, RepositoryError};
 
     fn entry(status: DiffStatus, old: Option<&str>, new: Option<&str>) -> DiffEntry {
         DiffEntry {
@@ -592,6 +879,99 @@ mod tests {
         );
     }
 
+    /// Repository whose index tracks `files`, staged from the working tree.
+    fn staged_repo(files: &[(&str, &[u8])]) -> (tempfile::TempDir, Repository) {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
+        let (repo, _) = Repository::init(dir.path(), &InitOptions::default())
+            .unwrap_or_else(|e| panic!("init: {e}"));
+        for (path, bytes) in files {
+            std::fs::write(dir.path().join(path), bytes).unwrap_or_else(|e| panic!("write: {e}"));
+        }
+        crate::porcelain::add::stage(
+            &repo,
+            &crate::porcelain::add::StageOptions::default(),
+            &mut crate::progress::NullProgress,
+            &crate::progress::CancelToken::never(),
+        )
+        .unwrap_or_else(|e| panic!("stage: {e}"));
+        (dir, repo)
+    }
+
+    fn unstaged(repo: &Repository) -> Vec<DiffEntry> {
+        let index = repo.load_index().unwrap_or_else(|e| panic!("index: {e}"));
+        UncommittedDiff::new(repo, index)
+            .unstaged_entries(RenameDetection::Off)
+            .unwrap_or_else(|e| panic!("unstaged: {e}"))
+    }
+
+    #[test]
+    fn unstaged_size_change_is_reported_without_hashing() {
+        let (dir, repo) = staged_repo(&[("grown.txt", b"one\n"), ("same.txt", b"aaaa\n")]);
+        std::fs::write(dir.path().join("grown.txt"), b"one\ntwo\n")
+            .unwrap_or_else(|e| panic!("{e}"));
+        std::fs::write(dir.path().join("same.txt"), b"bbbb\n").unwrap_or_else(|e| panic!("{e}"));
+
+        let metrics = repo.odb().hot_path_metrics();
+        metrics.set_blob_counting(true);
+        metrics.reset_blob_content_reads();
+        let entries = unstaged(&repo);
+        // Only the same-size file is read (to hash it); the size change alone proves the other.
+        assert_eq!(metrics.blob_content_reads(), 1);
+        assert_eq!(entries.len(), 2);
+        let grown = &entries[0];
+        assert_eq!(grown.path(), "grown.txt");
+        assert_eq!(grown.status, DiffStatus::Modified);
+        assert_eq!(grown.new_oid, ObjectId::zero());
+        // A same-size edit is only reported once hashing proves the content changed.
+        let same = &entries[1];
+        assert_eq!(same.path(), "same.txt");
+        assert_eq!(same.status, DiffStatus::Modified);
+
+        let index = repo.load_index().unwrap_or_else(|e| panic!("index: {e}"));
+        let changes = UncommittedDiff::new(&repo, index)
+            .load_worktree_changes(entries)
+            .unwrap_or_else(|e| panic!("load: {e}"));
+        assert!(changes[0].content_changed);
+        assert_eq!(
+            changes[0].line_stat(&DiffOptions::default()),
+            Some(LineStat {
+                insertions: 1,
+                deletions: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn binary_worktree_side_skips_reading_the_old_blob() {
+        let (dir, repo) = staged_repo(&[("data.bin", b"old text\n"), ("notes.txt", b"a\n")]);
+        std::fs::write(dir.path().join("data.bin"), b"new\0binary")
+            .unwrap_or_else(|e| panic!("{e}"));
+        std::fs::write(dir.path().join("notes.txt"), b"a\nb\n").unwrap_or_else(|e| panic!("{e}"));
+
+        let entries = unstaged(&repo);
+        let index = repo.load_index().unwrap_or_else(|e| panic!("index: {e}"));
+        let mut diff = UncommittedDiff::new(&repo, index);
+        let metrics = repo.odb().hot_path_metrics();
+        metrics.set_blob_counting(true);
+        metrics.reset_blob_content_reads();
+        let binary = diff
+            .load_worktree_changes(vec![entries[0].clone()])
+            .unwrap_or_else(|e| panic!("load: {e}"));
+        assert_eq!(binary[0].path, "data.bin");
+        assert!(binary[0].binary);
+        assert!(binary[0].content_changed);
+        // Only the working-tree file was read.
+        assert_eq!(metrics.blob_content_reads(), 1);
+
+        metrics.reset_blob_content_reads();
+        let text = diff
+            .load_worktree_changes(vec![entries[1].clone()])
+            .unwrap_or_else(|e| panic!("load: {e}"));
+        assert!(!text[0].binary);
+        assert_eq!(text[0].old_bytes.text(), "a\n");
+        assert_eq!(metrics.blob_content_reads(), 2);
+    }
+
     #[test]
     fn bare_repository_worktree_methods_require_a_work_tree() {
         let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
@@ -599,22 +979,22 @@ mod tests {
             bare: true,
             ..InitOptions::default()
         };
-        let repo = Repository::init(dir.path(), &init).unwrap_or_else(|e| panic!("init: {e}"));
+        let (repo, _) = Repository::init(dir.path(), &init).unwrap_or_else(|e| panic!("init: {e}"));
         let mut diff = UncommittedDiff::new(&repo, Index::default());
         assert!(diff
             .staged_entries(RenameDetection::Off)
             .is_ok_and(|e| e.is_empty()));
         assert!(matches!(
             diff.unstaged_entries(RenameDetection::Off),
-            Err(Error::RequiresWorkTree)
+            Err(Error::Repository(RepositoryError::RequiresWorkTree))
         ));
         assert!(matches!(
             diff.worktree_entries(None, RenameDetection::Off),
-            Err(Error::RequiresWorkTree)
+            Err(Error::Repository(RepositoryError::RequiresWorkTree))
         ));
         assert!(matches!(
             diff.load_worktree_changes(Vec::new()),
-            Err(Error::RequiresWorkTree)
+            Err(Error::Repository(RepositoryError::RequiresWorkTree))
         ));
     }
 }

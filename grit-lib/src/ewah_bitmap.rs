@@ -103,7 +103,7 @@ pub(crate) struct Bitmap {
 
 impl Bitmap {
     /// Empty bitmap with no allocated words.
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self { words: Vec::new() }
     }
 
@@ -224,7 +224,7 @@ pub(crate) struct EwahView<'a> {
 
 impl<'a> EwahView<'a> {
     /// Parse and validate `data` as Git's EWAH serialization prefix.
-    pub(crate) fn parse(data: &'a [u8]) -> Result<(Self, usize), EwahError> {
+    pub fn parse(data: &'a [u8]) -> Result<(Self, usize), EwahError> {
         let bit_size = read_be32(data)? as usize;
         let mut pos = 4;
         let buffer_size = read_be32(data.get(pos..).ok_or(EwahError::TruncatedHeader)?)? as usize;
@@ -290,7 +290,7 @@ impl<'a> EwahView<'a> {
     }
 
     /// OR logical words into `out`, advancing only through set runs and literal payloads.
-    #[cfg(any(test, feature = "unstable-bench-helpers"))]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn or_into(&self, out: &mut Bitmap) -> Result<(), EwahError> {
         let word_limit = self.bit_size.div_ceil(BITS_IN_EWORD);
         out.grow_words(word_limit);
@@ -323,7 +323,7 @@ impl<'a> EwahView<'a> {
     }
 
     /// Population count without materializing an uncompressed bitmap.
-    #[cfg(any(test, feature = "unstable-bench-helpers"))]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn count_ones(&self) -> Result<usize, EwahError> {
         let mut count = 0usize;
         let mut pointer = 0usize;
@@ -445,7 +445,7 @@ pub(crate) struct EwahBitmap {
 }
 
 impl EwahBitmap {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             buffer: vec![0; 32],
             buffer_size: 1,

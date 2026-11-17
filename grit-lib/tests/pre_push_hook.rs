@@ -9,15 +9,12 @@
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use grit_lib::command_runner::hooks::{run_pre_push_hook, HookError, PrePushRef};
+use grit_lib::command_runner::hooks::{HookError, PrePushRef};
 use grit_lib::config::environment::{Environment, RepositoryOptions};
 use grit_lib::error::Error;
 use grit_lib::objects::ObjectId;
-use grit_lib::progress::NeverCancel;
 use grit_lib::remote::fetch::NoProgress;
-use grit_lib::remote::push_plan::{
-    load_push_plan_context, open_push_destination, resolve_push, PushRequest,
-};
+use grit_lib::remote::push_plan::{open_push_destination, PushRequest};
 use grit_lib::remote::push_report::PushRefStatus;
 use grit_lib::remote::transfer::{PushOptions, PushOutcome};
 use grit_lib::remote::RemoteError;
@@ -114,34 +111,43 @@ fn grit_push(
     refspecs: &[&str],
     delete: &[&str],
     opts: PushOptions,
-) -> Result<PushOutcome, RemoteError> {
-    let config = repo.config().expect("config");
-    let ctx = load_push_plan_context(repo, &config, Some(remote), None).expect("plan context");
+) -> grit_lib::error::Result<PushOutcome> {
+    let config = repo.config().snapshot().expect("config");
+    let ctx = repo
+        .remotes()
+        .push_plan_context(Some(remote), None)
+        .expect("plan context");
     let request = PushRequest {
         remote: Some(remote.to_owned()),
         refspecs: refspecs.iter().map(|s| (*s).to_owned()).collect(),
         delete: delete.iter().map(|s| (*s).to_owned()).collect(),
         ..PushRequest::default()
     };
-    let plan = resolve_push(repo, &config, &request, &ctx).expect("resolve push");
+    let plan = repo
+        .remotes()
+        .resolve_push(&request, &ctx)
+        .expect("resolve push");
     open_push_destination(&config, &plan.remote)?.push(
         repo,
         &plan.specs,
         opts,
         &mut NoProgress,
-        &NeverCancel,
+        &CancelToken::never(),
         None,
     )
 }
 
 fn assert_hook_failed(err: RemoteError, expected_status: i32) {
     match err {
-        RemoteError::Library(Error::Hook(HookError::Failed {
-            hook_name, status, ..
-        })) => {
-            assert_eq!(hook_name, "pre-push");
-            assert_eq!(status, expected_status);
-        }
+        RemoteError::Nested(boxed) => match boxed.as_ref() {
+            Error::Hook(HookError::Failed {
+                hook_name, status, ..
+            }) => {
+                assert_eq!(hook_name, "pre-push");
+                assert_eq!(status, expected_status);
+            }
+            other => panic!("expected a pre-push hook failure, got {other:?}"),
+        },
         other => panic!("expected a pre-push hook failure, got {other:?}"),
     }
 }
@@ -176,7 +182,7 @@ fn failing_pre_push_hook_blocks_local_push() {
 }
 
 fn resolve_ref_opt(repo: &Repository, name: &str) -> Option<ObjectId> {
-    grit_lib::refs::resolve_ref(repo.git_dir(), name).ok()
+    repo.references().resolve(name).ok()
 }
 
 #[test]
@@ -332,32 +338,32 @@ fn run_pre_push_hook_formats_stdin_lines() {
     let a = ObjectId::from_hex(&"a".repeat(40)).expect("oid");
     let b = ObjectId::from_hex(&"b".repeat(40)).expect("oid");
     let zero = "0".repeat(40);
-    run_pre_push_hook(
-        &repo,
-        "up",
-        "https://example.com/r.git",
-        &[
-            PrePushRef {
-                local_ref: Some("refs/heads/main".to_owned()),
-                local_oid: Some(a),
-                remote_ref: "refs/heads/main".to_owned(),
-                remote_oid: Some(b),
-            },
-            PrePushRef {
-                local_ref: None,
-                local_oid: Some(a),
-                remote_ref: "refs/heads/new".to_owned(),
-                remote_oid: None,
-            },
-            PrePushRef {
-                local_ref: None,
-                local_oid: None,
-                remote_ref: "refs/heads/gone".to_owned(),
-                remote_oid: Some(b),
-            },
-        ],
-    )
-    .expect("hook succeeds");
+    repo.hooks()
+        .run_pre_push(
+            "up",
+            "https://example.com/r.git",
+            &[
+                PrePushRef {
+                    local_ref: Some("refs/heads/main".to_owned()),
+                    local_oid: Some(a),
+                    remote_ref: "refs/heads/main".to_owned(),
+                    remote_oid: Some(b),
+                },
+                PrePushRef {
+                    local_ref: None,
+                    local_oid: Some(a),
+                    remote_ref: "refs/heads/new".to_owned(),
+                    remote_oid: None,
+                },
+                PrePushRef {
+                    local_ref: None,
+                    local_oid: None,
+                    remote_ref: "refs/heads/gone".to_owned(),
+                    remote_oid: Some(b),
+                },
+            ],
+        )
+        .expect("hook succeeds");
     let a = a.to_hex();
     let b = b.to_hex();
     assert_eq!(
@@ -371,7 +377,10 @@ fn run_pre_push_hook_formats_stdin_lines() {
     );
 
     fx.write_hook(4);
-    let err = run_pre_push_hook(&repo, "up", "u", &[]).expect_err("failing hook");
+    let err = repo
+        .hooks()
+        .run_pre_push("up", "u", &[])
+        .expect_err("failing hook");
     assert!(
         matches!(err, HookError::Failed { status: 4, .. }),
         "{err:?}"
@@ -382,22 +391,28 @@ fn run_pre_push_hook_formats_stdin_lines() {
 fn run_pre_push_hook_without_a_hook_is_ok() {
     let fx = Fixture::new();
     let repo = fx.open(&[]);
-    run_pre_push_hook(&repo, "origin", "../remote.git", &[]).expect("no hook installed");
+    repo.hooks()
+        .run_pre_push("origin", "../remote.git", &[])
+        .expect("no hook installed");
 }
 
 #[test]
 fn head_refspec_keeps_resolved_src_ref_and_names_head_for_the_hook() {
     let fx = Fixture::new();
     let repo = fx.open(&[]);
-    let config = repo.config().expect("config");
-    let ctx = load_push_plan_context(&repo, &config, Some("origin"), None).expect("context");
+    let config = repo.config().snapshot().expect("config");
+    let ctx = repo
+        .remotes()
+        .push_plan_context(Some("origin"), None)
+        .expect("context");
     let plan_for = |refspec: &str| {
         let request = PushRequest {
             remote: Some("origin".to_owned()),
             refspecs: vec![refspec.to_owned()],
             ..PushRequest::default()
         };
-        resolve_push(&repo, &config, &request, &ctx)
+        repo.remotes()
+            .resolve_push(&request, &ctx)
             .expect("resolve push")
             .specs
             .remove(0)

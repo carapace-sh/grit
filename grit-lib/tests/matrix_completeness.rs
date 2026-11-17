@@ -50,11 +50,7 @@ use std::time::{Duration, Instant};
 use grit_lib::error::{Error, RemoteUnreadableReason, Result as GritResult};
 use grit_lib::objects::odb::Odb;
 use grit_lib::objects::ObjectId;
-use grit_lib::progress::NeverCancel;
-use grit_lib::refs::resolve_ref;
-use grit_lib::remote::fetch::{fetch_remote, NoProgress};
 use grit_lib::remote::pkt_line;
-use grit_lib::remote::push::{push_http, push_remote};
 use grit_lib::remote::push_report::PushRefStatus;
 use grit_lib::remote::transfer::{FetchDepth, FetchOptions, PushOptions, PushRefSpec, TagMode};
 use grit_lib::remote::transport::http::HttpClient;
@@ -220,21 +216,26 @@ fn fetch_v0_sideband_band3_fatal_is_typed_error_not_hang() {
         .with_caps(&["side-band-64k", "multi_ack_detailed", "ofs-delta"])
         .with_version(0);
 
-    let mut opts = FetchOptions {
-        refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()],
-        tags: TagMode::None,
-        ..Default::default()
-    };
+    let mut opts = FetchOptions::new();
+    opts.refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()];
+    opts.tags = TagMode::None;
 
     let local_git_for_thread = local_git.clone();
     let err = with_watchdog(10, "fetch band-3", move || {
         let mut conn = conn;
-        fetch_remote(
+        grit_lib::repo::Repository::open(
             &local_git_for_thread,
-            &mut conn,
+            &grit_lib::config::environment::RepositoryOptions::with_environment(
+                (&mut opts).environment.clone(),
+            ),
+        )
+        .expect("open fetch target")
+        .remotes()
+        .fetch_from(
+            grit_lib::remote::transfer::TransferEndpoint::Connection(&mut conn),
             &mut opts,
             &mut NoProgress,
-            &NeverCancel,
+            &CancelToken::never(),
         )
         .expect_err("a band-3 fatal must surface as an error")
     });
@@ -244,7 +245,10 @@ fn fetch_v0_sideband_band3_fatal_is_typed_error_not_hang() {
         "band-3 fatal must be reported as a remote error carrying the server text, got: {msg}"
     );
     // Nothing landed.
-    assert!(resolve_ref(&local_git, "refs/remotes/origin/main").is_err());
+    assert!(grit_test_support::refs::at(&local_git)
+        .references()
+        .resolve("refs/remotes/origin/main")
+        .is_err());
 }
 
 // ===========================================================================
@@ -268,21 +272,26 @@ fn fetch_v0_err_after_done_is_typed_remote_error() {
         .with_caps(&["side-band-64k", "multi_ack_detailed", "ofs-delta"])
         .with_version(0);
 
-    let mut opts = FetchOptions {
-        refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()],
-        tags: TagMode::None,
-        ..Default::default()
-    };
+    let mut opts = FetchOptions::new();
+    opts.refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()];
+    opts.tags = TagMode::None;
 
     let local_git_for_thread = local_git.clone();
     let err = with_watchdog(10, "fetch ERR-after-done", move || {
         let mut conn = conn;
-        fetch_remote(
+        grit_lib::repo::Repository::open(
             &local_git_for_thread,
-            &mut conn,
+            &grit_lib::config::environment::RepositoryOptions::with_environment(
+                (&mut opts).environment.clone(),
+            ),
+        )
+        .expect("open fetch target")
+        .remotes()
+        .fetch_from(
+            grit_lib::remote::transfer::TransferEndpoint::Connection(&mut conn),
             &mut opts,
             &mut NoProgress,
-            &NeverCancel,
+            &CancelToken::never(),
         )
         .expect_err("an ERR after done must surface as an error")
     });
@@ -367,13 +376,18 @@ fn push_remote_rejects_protocol_v2_typed_before_touching_refs() {
         expect_absent: false,
         ..Default::default()
     };
-    let err = push_remote(
+    let err = grit_lib::repo::Repository::open(
         &local_git,
-        &mut conn,
+        &grit_lib::config::environment::RepositoryOptions::empty(),
+    )
+    .expect("open push source")
+    .remotes()
+    .push_to(
+        grit_lib::remote::transfer::TransferEndpoint::Connection(&mut conn),
         &[spec],
         &PushOptions::default(),
         &mut NoProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect_err("a v2 push must be rejected in this phase");
     let msg = format!("{err}");
@@ -431,13 +445,18 @@ fn push_remote_unpack_failure_report_demotes_all_sent_refs() {
         expect_absent: false,
         ..Default::default()
     };
-    let outcome = push_remote(
+    let outcome = grit_lib::repo::Repository::open(
         &local_git,
-        &mut conn,
+        &grit_lib::config::environment::RepositoryOptions::empty(),
+    )
+    .expect("open push source")
+    .remotes()
+    .push_to(
+        grit_lib::remote::transfer::TransferEndpoint::Connection(&mut conn),
         &[spec],
         &PushOptions::default(),
         &mut NoProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("push_remote completes and parses the report");
 
@@ -480,9 +499,9 @@ struct FakeHttpClient {
 }
 
 impl HttpClient for FakeHttpClient {
-    fn get(&self, _url: &str, _git_protocol: Option<&str>) -> GritResult<Vec<u8>> {
+    fn get(&self, _url: &str, _git_protocol: Option<&str>) -> grit_lib::error::Result<Vec<u8>> {
         if let Some(e) = &self.get_err {
-            return Err(Error::Message(e.clone()));
+            return Err(Error::Verbatim(e.clone()));
         }
         Ok(self.get_body.clone())
     }
@@ -493,9 +512,9 @@ impl HttpClient for FakeHttpClient {
         _accept: &str,
         _body: &[u8],
         _git_protocol: Option<&str>,
-    ) -> GritResult<Vec<u8>> {
+    ) -> grit_lib::error::Result<Vec<u8>> {
         if let Some(e) = &self.post_err {
-            return Err(Error::Message(e.clone()));
+            return Err(Error::Verbatim(e.clone()));
         }
         // No test reaches a successful POST; return an empty report-status.
         Ok(b"0000".to_vec())
@@ -508,7 +527,7 @@ impl HttpClient for FakeHttpClient {
         accept: &str,
         body: &[u8],
         git_protocol: Option<&str>,
-    ) -> GritResult<Box<dyn std::io::Read + Send>> {
+    ) -> grit_lib::error::Result<Box<dyn std::io::Read + Send>> {
         Ok(Box::new(std::io::Cursor::new(self.post(
             url,
             content_type,
@@ -558,14 +577,21 @@ fn push_http_rejects_v2_receive_pack_advertisement_typed() {
         expect_absent: false,
         ..Default::default()
     };
-    let err = push_http(
-        client,
+    let err = grit_lib::repo::Repository::open(
         &local_git,
-        "http://example.invalid/repo.git",
+        &grit_lib::config::environment::RepositoryOptions::empty(),
+    )
+    .expect("open push source")
+    .remotes()
+    .push_to(
+        grit_lib::remote::transfer::TransferEndpoint::Http {
+            client: client,
+            url: "http://example.invalid/repo.git",
+        },
         &[spec],
         &PushOptions::default(),
         &mut NoProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect_err("a v2 receive-pack advertisement must be rejected");
     let msg = format!("{err}");
@@ -604,14 +630,21 @@ fn push_http_propagates_discovery_transport_error_typed() {
         expect_absent: false,
         ..Default::default()
     };
-    let err = push_http(
-        client,
+    let err = grit_lib::repo::Repository::open(
         &local_git,
-        "http://127.0.0.1:1/repo.git",
+        &grit_lib::config::environment::RepositoryOptions::empty(),
+    )
+    .expect("open push source")
+    .remotes()
+    .push_to(
+        grit_lib::remote::transfer::TransferEndpoint::Http {
+            client: client,
+            url: "http://127.0.0.1:1/repo.git",
+        },
         &[spec],
         &PushOptions::default(),
         &mut NoProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect_err("a discovery transport failure must surface as an error");
     let msg = format!("{err}");
@@ -656,10 +689,10 @@ fn ssh_connect_refused_port_is_remote_unreadable_not_hang() {
     assert!(
         matches!(
             err,
-            Error::RemoteUnreadable {
+            Error::Remote(grit_lib::remote::RemoteError::Unreadable {
                 reason: RemoteUnreadableReason::NoHandshake,
                 ..
-            }
+            })
         ),
         "expected RemoteUnreadable(NoHandshake), got {err}"
     );
@@ -687,10 +720,10 @@ fn git_daemon_connect_refused_port_is_typed_error_not_hang() {
     assert!(
         matches!(
             err,
-            Error::RemoteUnreadable {
+            Error::Remote(grit_lib::remote::RemoteError::Unreadable {
                 reason: RemoteUnreadableReason::Transport { .. },
                 ..
-            }
+            })
         ),
         "expected RemoteUnreadable(Transport), got {err}"
     );
@@ -840,24 +873,32 @@ fn shallow_depth1_with_all_tags_over_git_daemon() {
         }
     };
 
-    let mut opts = FetchOptions {
-        refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()],
-        tags: TagMode::All,
-        fetch_depth: FetchDepth::depth(1),
-        ..Default::default()
-    };
-    let outcome = fetch_remote(
+    let mut opts = FetchOptions::new();
+    opts.refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()];
+    opts.tags = TagMode::All;
+    opts.fetch_depth = FetchDepth::depth(1);
+    let outcome = grit_lib::repo::Repository::open(
         &local_git,
-        &mut *conn,
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&mut opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Connection(&mut *conn),
         &mut opts,
         &mut NoProgress,
-        &NeverCancel,
+        &CancelToken::never(),
     )
     .expect("shallow+tags fetch over git daemon");
     drop(conn);
 
     // The shallow tip landed as origin/main, cross-checked vs system git.
-    let landed_tip = resolve_ref(&local_git, "refs/remotes/origin/main").expect("origin/main");
+    let landed_tip = grit_test_support::refs::at(&local_git)
+        .references()
+        .resolve("refs/remotes/origin/main")
+        .expect("origin/main");
     assert_eq!(landed_tip, tip, "shallow fetch must land the remote tip");
     assert_eq!(
         landed_tip.to_hex(),
@@ -866,7 +907,10 @@ fn shallow_depth1_with_all_tags_over_git_daemon() {
 
     // The annotated tag came along (TagMode::All + include-tag), and points at the
     // same object system git resolves it to.
-    let landed_tag = resolve_ref(&local_git, "refs/tags/v1").expect("tag v1 must be fetched");
+    let landed_tag = grit_test_support::refs::at(&local_git)
+        .references()
+        .resolve("refs/tags/v1")
+        .expect("tag v1 must be fetched");
     assert_eq!(
         landed_tag, tag,
         "the annotated tag must land with the shallow fetch"

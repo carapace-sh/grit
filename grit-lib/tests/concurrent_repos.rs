@@ -19,14 +19,13 @@ use grit_lib::diff::merge_trees::{
 use grit_lib::diff::rerere::{repo_rerere, RerereAutoupdate, RerereEventKind};
 use grit_lib::ident::Signature;
 use grit_lib::index::{Index, IndexEntry, MODE_REGULAR};
-use grit_lib::notes::{write_notes_commit, NotesTreeEntry};
+use grit_lib::notes::NotesTreeEntry;
 use grit_lib::objects::{parse_commit, ObjectId};
-use grit_lib::porcelain::add::{stage, StageOptions};
-use grit_lib::porcelain::commit::{create_commit, CommitRequest};
-use grit_lib::porcelain::status::{status, StatusOptions};
-use grit_lib::progress::NeverCancel;
+use grit_lib::porcelain::add::StageOptions;
+use grit_lib::porcelain::commit::CommitRequest;
+use grit_lib::porcelain::status::StatusOptions;
 use grit_lib::progress::NullProgress;
-use grit_lib::remote::transfer::{fetch_local, FetchOptions, TagMode};
+use grit_lib::remote::transfer::{FetchOptions, TagMode};
 use grit_lib::repo::{InitOptions, Repository};
 use tempfile::TempDir;
 
@@ -59,7 +58,7 @@ fn prepare_repo(
         &root,
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
-            .with_ref_storage(grit_lib::RefStorageFormat::Files),
+            .with_ref_storage(grit_lib::refs::ref_storage::RefStorageFormat::Files),
     )
     .expect("init");
 
@@ -171,13 +170,13 @@ fn write_non_executable_hook(hook_path: &Path) {
 fn run_repo_loop(fx: RepoFixture, ack: mpsc::Sender<()>) {
     for i in 0..ITERS {
         let repo = open_with_env(&fx);
-        let cfg = repo.config().expect("config");
+        let cfg = repo.config().snapshot().expect("config");
         assert_eq!(
-            cfg.get("user.name").as_deref(),
+            cfg.get("user.name").unwrap().as_deref(),
             Some(fx.author.as_str()),
             "iteration {i}: wrong user.name"
         );
-        let autocrlf = cfg.get("core.autocrlf").unwrap_or_default();
+        let autocrlf = cfg.get("core.autocrlf").unwrap().unwrap_or_default();
         let expect_autocrlf = if fx.author == "Alice" {
             "true"
         } else {
@@ -191,37 +190,38 @@ fn run_repo_loop(fx: RepoFixture, ack: mpsc::Sender<()>) {
 
         let path = fx.root.join(format!("file-{i}.txt"));
         fs::write(&path, format!("content {i}\n")).expect("write");
-        status(
-            &repo,
-            &StatusOptions::default(),
-            &mut NullProgress,
-            &NeverCancel,
-        )
-        .expect("status");
-        stage(
-            &repo,
-            &StageOptions::default(),
-            &mut NullProgress,
-            &NeverCancel,
-        )
-        .expect("stage");
+        &repo
+            .status()
+            .run(
+                &StatusOptions::default(),
+                &mut NullProgress,
+                &CancelToken::never(),
+            )
+            .expect("status");
+        repo.index()
+            .stage(
+                &StageOptions::default(),
+                &mut NullProgress,
+                &CancelToken::never(),
+            )
+            .expect("stage");
         let ident = format!("{} <{}@example.com> 1 +0000", fx.author, fx.author);
-        create_commit(
-            &repo,
-            &CommitRequest {
-                message: format!("commit {i}"),
-                author: Some(ident.parse().expect("signature")),
-                committer: Some(ident.parse().expect("signature")),
-                allow_empty: false,
-                sign_override: None,
-                amend: false,
-                assume_worktree_synced: false,
-                ..Default::default()
-            },
-            &mut NullProgress,
-            &NeverCancel,
-        )
-        .expect("commit");
+        repo.commits()
+            .create_staged(
+                &{
+                    let mut req = CommitRequest::new(format!("commit {i}"));
+                    req.author = Some(ident.parse().expect("signature"));
+                    req.committer = Some(ident.parse().expect("signature"));
+                    req.allow_empty = false;
+                    req.sign_override = None;
+                    req.amend = false;
+                    req.assume_worktree_synced = false;
+                    req
+                },
+                &mut NullProgress,
+                &CancelToken::never(),
+            )
+            .expect("commit");
     }
     ack.send(()).expect("ack");
 }
@@ -358,7 +358,7 @@ fn run_fetch_merge_notes_no_crosstalk_once(iter: usize) {
             &root,
             &InitOptions::new()
                 .with_initial_branch("main".to_owned())
-                .with_ref_storage(grit_lib::RefStorageFormat::Files),
+                .with_ref_storage(grit_lib::refs::ref_storage::RefStorageFormat::Files),
         )
         .expect("init");
         let home = base.path().join(format!("home-{name}-{iter}"));
@@ -405,37 +405,38 @@ fn run_fetch_merge_notes_no_crosstalk_once(iter: usize) {
             rerere_enabled,
         };
         let repo = open_with_env(&fx);
-        status(
-            &repo,
-            &StatusOptions::default(),
-            &mut NullProgress,
-            &NeverCancel,
-        )
-        .expect("status");
-        stage(
-            &repo,
-            &StageOptions::default(),
-            &mut NullProgress,
-            &NeverCancel,
-        )
-        .expect("stage");
+        &repo
+            .status()
+            .run(
+                &StatusOptions::default(),
+                &mut NullProgress,
+                &CancelToken::never(),
+            )
+            .expect("status");
+        repo.index()
+            .stage(
+                &StageOptions::default(),
+                &mut NullProgress,
+                &CancelToken::never(),
+            )
+            .expect("stage");
         let ident = Signature::new(name, email, repo.identity_now()).expect("signature");
-        create_commit(
-            &repo,
-            &CommitRequest {
-                message: "seed".into(),
-                author: Some(ident.clone()),
-                committer: Some(ident),
-                allow_empty: false,
-                sign_override: None,
-                amend: false,
-                assume_worktree_synced: false,
-                ..Default::default()
-            },
-            &mut NullProgress,
-            &NeverCancel,
-        )
-        .expect("seed commit");
+        repo.commits()
+            .create_staged(
+                &{
+                    let mut req = CommitRequest::new("seed");
+                    req.author = Some(ident.clone());
+                    req.committer = Some(ident);
+                    req.allow_empty = false;
+                    req.sign_override = None;
+                    req.amend = false;
+                    req.assume_worktree_synced = false;
+                    req
+                },
+                &mut NullProgress,
+                &CancelToken::never(),
+            )
+            .expect("seed commit");
         RepoFixture {
             root,
             env,
@@ -481,21 +482,24 @@ fn run_fetch_merge_notes_no_crosstalk_once(iter: usize) {
             fx.reference_unix_time,
             "wall clock must stay on the repository handle"
         );
-        let cfg = repo.config().expect("config");
-        let email = cfg.get("user.email").unwrap_or_default();
-        fetch_local(
-            repo.git_dir(),
-            upstream,
-            &FetchOptions {
-                refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".into()],
-                tags: TagMode::None,
-                ..Default::default()
-            },
-        )
-        .expect("fetch");
+        let cfg = repo.config().snapshot().expect("config");
+        let email = cfg.get("user.email").unwrap().unwrap_or_default();
+        let mut fetch_opts = FetchOptions::new();
+        fetch_opts.refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".into()];
+        fetch_opts.tags = TagMode::None;
+        repo.remotes()
+            .fetch_from(
+                grit_lib::remote::transfer::TransferEndpoint::Local(upstream),
+                &mut fetch_opts.clone(),
+                &mut grit_lib::remote::fetch::NoProgress,
+                grit_lib::progress::CancelToken::never_ref(),
+            )
+            .expect("fetch");
         let main_ref = format!("refs/remotes/origin/{default_branch}");
-        let main_tip = grit_lib::refs::resolve_ref(repo.git_dir(), &main_ref).expect("main tip");
-        let topic_tip = grit_lib::refs::resolve_ref(repo.git_dir(), "refs/remotes/origin/topic")
+        let main_tip = repo.references().resolve(&main_ref).expect("main tip");
+        let topic_tip = repo
+            .references()
+            .resolve("refs/remotes/origin/topic")
             .expect("topic tip");
         let main_tree = parse_commit(&repo.odb().read(&main_tip).expect("main obj").data)
             .expect("parse main")
@@ -503,9 +507,13 @@ fn run_fetch_merge_notes_no_crosstalk_once(iter: usize) {
         let topic_tree = parse_commit(&repo.odb().read(&topic_tip).expect("topic obj").data)
             .expect("parse topic")
             .tree;
-        let bases =
-            grit_lib::revwalk::merge_base::merge_bases_first_vs_rest(&repo, main_tip, &[topic_tip])
-                .expect("merge base");
+        let bases = repo
+            .revwalk()
+            .merge_bases(
+                &[main_tip, topic_tip],
+                grit_lib::revwalk::MergeBaseMode::Best,
+            )
+            .expect("merge base");
         let merge_base = *bases.first().expect("non-empty merge base");
         let base_tree = parse_commit(&repo.odb().read(&merge_base).expect("base obj").data)
             .expect("parse base")
@@ -532,8 +540,8 @@ fn run_fetch_merge_notes_no_crosstalk_once(iter: usize) {
         index.add_or_replace(index_conflict_entry(path, 1, base));
         index.add_or_replace(index_conflict_entry(path, 2, ours));
         index.add_or_replace(index_conflict_entry(path, 3, theirs));
-        repo.index_handle()
-            .write(&mut index)
+        repo.index()
+            .write(&mut index, &grit_lib::index::IndexWriteOptions::default())
             .expect("write conflict index");
         let rerere_events = repo_rerere(&repo, RerereAutoupdate::No).expect("rerere");
         let rerere_preimage = rerere_events
@@ -555,19 +563,21 @@ fn run_fetch_merge_notes_no_crosstalk_once(iter: usize) {
             RunHookOptions::default(),
         )
         .expect("traditional hook scan");
-        write_notes_commit(
-            &repo,
-            "refs/notes/commits",
-            &[NotesTreeEntry {
-                mode: 0o100644,
-                path: main_tip.to_hex().into_bytes(),
-                oid: main_tip,
-            }],
-            &format!("note for {email}"),
-        )
-        .expect("notes");
-        let notes_tip =
-            grit_lib::refs::resolve_ref(repo.git_dir(), "refs/notes/commits").expect("notes tip");
+        repo.notes()
+            .write_tree_commit(
+                "refs/notes/commits",
+                &[NotesTreeEntry {
+                    mode: 0o100644,
+                    path: main_tip.to_hex().into_bytes(),
+                    oid: main_tip,
+                }],
+                &format!("note for {email}"),
+            )
+            .expect("notes");
+        let notes_tip = repo
+            .references()
+            .resolve("refs/notes/commits")
+            .expect("notes tip");
         let notes_commit = parse_commit(
             &repo
                 .odb()

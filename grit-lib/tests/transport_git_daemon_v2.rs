@@ -1,6 +1,6 @@
 //! Integration test for protocol **v2** fetch over the `git://` streaming
 //! transport: `GitDaemonTransport` + `fetch::fetch_remote` with
-//! `ConnectOptions { protocol_version: 2, .. }`.
+//! `ConnectOptions::with_protocol_version(2)`.
 //!
 //! This is the v2 counterpart of `transport_git_daemon.rs`. It builds the same
 //! source repo (two commits on `main`, a `topic` branch, an annotated tag),
@@ -29,9 +29,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use grit_lib::objects::odb::Odb;
-use grit_lib::progress::NeverCancel;
-use grit_lib::refs::resolve_ref;
-use grit_lib::remote::fetch::{fetch_remote, NoProgress};
+use grit_lib::progress::CancelToken;
 use grit_lib::remote::transfer::{FetchOptions, TagMode, UpdateMode};
 use grit_lib::remote::transport::{ConnectOptions, GitDaemonTransport, Service, Transport};
 
@@ -146,10 +144,7 @@ fn fetch_over_git_daemon_v2_lands_refs_and_objects() {
 
     // Connect requesting protocol v2.
     let transport = GitDaemonTransport::new();
-    let opts_v2 = ConnectOptions {
-        protocol_version: 2,
-        ..Default::default()
-    };
+    let opts_v2 = ConnectOptions::with_protocol_version(2);
     let mut conn = match transport.connect(&url, Service::UploadPack, &opts_v2) {
         Ok(c) => c,
         Err(e) => {
@@ -179,28 +174,42 @@ fn fetch_over_git_daemon_v2_lands_refs_and_objects() {
         conn.capabilities()
     );
 
-    let mut opts = FetchOptions {
-        refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()],
-        tags: TagMode::All,
-        ..Default::default()
-    };
-    let outcome = fetch_remote(
+    let mut opts = FetchOptions::new();
+    opts.refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()];
+    opts.tags = TagMode::All;
+    let outcome = grit_lib::repo::Repository::open(
         &local_git,
-        &mut *conn,
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&mut opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Connection(&mut *conn),
         &mut opts,
         &mut NoProgress,
-        &NeverCancel,
+        &CancelToken::never(),
     )
     .expect("v2 fetch_remote over git daemon");
 
     // Tracking refs written (same assertions as the v0/v1 test).
-    let got_main = resolve_ref(&local_git, "refs/remotes/origin/main").expect("origin/main");
-    let got_topic = resolve_ref(&local_git, "refs/remotes/origin/topic").expect("origin/topic");
+    let got_main = grit_test_support::refs::at(&local_git)
+        .references()
+        .resolve("refs/remotes/origin/main")
+        .expect("origin/main");
+    let got_topic = grit_test_support::refs::at(&local_git)
+        .references()
+        .resolve("refs/remotes/origin/topic")
+        .expect("origin/topic");
     assert_eq!(got_main, main_oid, "origin/main oid mismatch vs source");
     assert_eq!(got_topic, topic_oid, "origin/topic oid mismatch vs source");
 
     // The annotated tag arrived (TagMode::All).
-    let got_tag = resolve_ref(&local_git, "refs/tags/v1").expect("tag v1 written");
+    let got_tag = grit_test_support::refs::at(&local_git)
+        .references()
+        .resolve("refs/tags/v1")
+        .expect("tag v1 written");
     assert_eq!(got_tag, tag_oid, "tag v1 oid mismatch vs source");
 
     // Objects landed in the local odb.
@@ -328,10 +337,7 @@ fn fetch_over_git_daemon_v2_incremental_with_haves() {
     let local_git = local.join(".git");
 
     let transport = GitDaemonTransport::new();
-    let opts_v2 = ConnectOptions {
-        protocol_version: 2,
-        ..Default::default()
-    };
+    let opts_v2 = ConnectOptions::with_protocol_version(2);
 
     // First fetch (v2) to seed the local repo with main's full history.
     {
@@ -343,17 +349,22 @@ fn fetch_over_git_daemon_v2_incremental_with_haves() {
             }
         };
         assert_eq!(conn.protocol_version(), 2);
-        let mut opts = FetchOptions {
-            refspecs: vec!["+refs/heads/main:refs/remotes/origin/main".to_owned()],
-            tags: TagMode::None,
-            ..Default::default()
-        };
-        fetch_remote(
+        let mut opts = FetchOptions::new();
+        opts.refspecs = vec!["+refs/heads/main:refs/remotes/origin/main".to_owned()];
+        opts.tags = TagMode::None;
+        grit_lib::repo::Repository::open(
             &local_git,
-            &mut *conn,
+            &grit_lib::config::environment::RepositoryOptions::with_environment(
+                (&mut opts).environment.clone(),
+            ),
+        )
+        .expect("open fetch target")
+        .remotes()
+        .fetch_from(
+            grit_lib::remote::transfer::TransferEndpoint::Connection(&mut *conn),
             &mut opts,
             &mut NoProgress,
-            &NeverCancel,
+            &CancelToken::never(),
         )
         .expect("seed v2 fetch");
     }
@@ -381,22 +392,30 @@ fn fetch_over_git_daemon_v2_incremental_with_haves() {
         .connect(&url, Service::UploadPack, &opts_v2)
         .expect("reconnect v2");
     assert_eq!(conn.protocol_version(), 2);
-    let mut opts = FetchOptions {
-        refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()],
-        tags: TagMode::None,
-        ..Default::default()
-    };
-    fetch_remote(
+    let mut opts = FetchOptions::new();
+    opts.refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()];
+    opts.tags = TagMode::None;
+    grit_lib::repo::Repository::open(
         &local_git,
-        &mut *conn,
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&mut opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Connection(&mut *conn),
         &mut opts,
         &mut NoProgress,
-        &NeverCancel,
+        &CancelToken::never(),
     )
     .expect("incremental v2 fetch");
 
     // The new topic tip landed.
-    let got_topic = resolve_ref(&local_git, "refs/remotes/origin/topic").expect("origin/topic");
+    let got_topic = grit_test_support::refs::at(&local_git)
+        .references()
+        .resolve("refs/remotes/origin/topic")
+        .expect("origin/topic");
     assert_eq!(got_topic, topic_new, "incremental topic tip mismatch");
     let local_odb = open_odb(&local_git);
     assert!(

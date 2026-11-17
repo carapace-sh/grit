@@ -1,14 +1,13 @@
 //! Repository-scoped revision parsing and walking via [`RevWalk`].
 use crate::error::Result;
-use crate::object_inspect::{ResolveError, ResolvedObject};
+use crate::object_inspect::ResolvedObject;
 use crate::objects::ObjectId;
 use crate::repo::Repository;
 use crate::rev_list::{
-    open_commit_stream, rev_list, CommitStreamParams, RevListOptions, RevListResult,
+    open_commit_stream, rev_list, CommitExtent, CommitStreamParams, RevListOptions, RevListResult,
 };
 use crate::rev_list_error::RevListError;
-use crate::rev_parse::resolve_revision;
-use crate::revwalk::parse_rev_walk_tokens;
+use crate::revwalk::queries::parse_rev_walk_tokens;
 use crate::revwalk::RevWalkCommitIterOptions;
 use std::borrow::Cow;
 
@@ -33,44 +32,78 @@ impl<'repo> RevWalk<'repo> {
         self.repo
     }
 
-    /// Resolve a user revision spec (for example `HEAD`, `main~2`, `v1.0`).
-    ///
-    /// # Errors
-    ///
-    /// Propagates rev-parse and ref errors.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// # fn main() -> grit_lib::error::Result<()> {
-    /// use grit_lib::repo::{InitOptions, Repository};
-    /// use grit_lib::ident::Signature;
-    /// use grit_lib::porcelain::commit::{create_commit, CommitRequest};
-    /// use grit_lib::progress::NullProgress;
-    /// let dir = std::env::temp_dir().join("grit-revwalk-parse-doc");
-    /// let repo = Repository::init(&dir, &InitOptions::default())?;
-    /// let mut req = CommitRequest::new("doc");
-    /// req.author = Some(Signature::new("Doc", "doc@example.com", repo.identity_now())?);
-    /// req.committer = Some(Signature::new("Doc", "doc@example.com", repo.identity_now())?);
-    /// req.allow_empty = true;
-    /// let _ = create_commit(&repo, &req, &mut NullProgress, &grit_lib::progress::NeverCancel)?;
-    /// let _ = repo.rev_walk().resolve("refs/heads/main")?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    #[inline]
-    pub fn resolve(&self, spec: &str) -> Result<ObjectId> {
-        resolve_revision(self.repo, spec)
-    }
-
     /// Resolve `spec` to oid, kind, size, and optional ref name ([`ResolvedObject`]).
     ///
     /// # Errors
     ///
     /// See [`Repository::resolve`].
     #[inline]
-    pub fn resolve_object(&self, spec: &str) -> std::result::Result<ResolvedObject, ResolveError> {
+    pub fn resolve_object(&self, spec: &str) -> Result<ResolvedObject> {
         self.repo.resolve(spec)
+    }
+
+    /// Run the rev-list engine over already split revision specs: commits reachable from
+    /// any of `positive` and from none of `negative` (`git rev-list pos... ^neg...`).
+    ///
+    /// Each spec is one revision; split range tokens first with [`Self::parse_tokens`].
+    /// [`RevListOptions`] carries the full engine configuration (ordering, path limits,
+    /// object listing, filters, bitmaps). For user tokens with the common options use
+    /// [`Self::commits`] / [`Self::rev_list_result`].
+    ///
+    /// # Errors
+    ///
+    /// Propagates rev-parse, object read and rev-list errors, including
+    /// [`RevListError::UnexpandedSymmetricRange`]
+    /// for an `A...B` spec that was not split.
+    pub fn rev_list(
+        &self,
+        positive: &[String],
+        negative: &[String],
+        options: &RevListOptions,
+    ) -> Result<RevListResult> {
+        rev_list(self.repo, positive, negative, options)
+    }
+
+    /// Resolve revision `specs` to commit tips the way a history walk reads its arguments:
+    /// each spec may be a revision expression, an exclusion (`^rev`) or a two-dot range, and
+    /// every resolved tip is peeled to a commit.
+    ///
+    /// # Errors
+    ///
+    /// Propagates rev-parse errors.
+    pub fn resolve_commits(&self, specs: &[String]) -> Result<Vec<ObjectId>> {
+        crate::rev_list::resolve_revision_specs_to_commits(self.repo, specs)
+    }
+
+    /// Merge command-line revision `args` with `rev-list --stdin` `lines`.
+    ///
+    /// Stdin lines use their own `--not` toggle, independent of the command line; ref
+    /// pseudo-options on stdin (`--all`, `--branches[=<glob>]`, `--tags`, `--remotes`,
+    /// `--glob`) list refs through the repository's ref store, and lines after `--` are
+    /// pathspecs.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`RevListError`] for invalid stdin pseudo-options and ref store failures.
+    pub fn parse_stdin_specs(&self, args: &[String], lines: &[&str]) -> Result<StdinRevisionSpecs> {
+        let (positive, negative, all_refs, pathspecs) =
+            crate::rev_list::collect_revision_specs_from_stdin_lines(self.repo, args, lines)?;
+        Ok(StdinRevisionSpecs {
+            positive,
+            negative,
+            all_refs,
+            pathspecs,
+        })
+    }
+
+    /// Object ids every tag under `refs/tags/` points at, read through the repository's ref
+    /// store.
+    ///
+    /// # Errors
+    ///
+    /// Propagates ref store failures.
+    pub fn tag_targets(&self) -> Result<std::collections::HashSet<ObjectId>> {
+        crate::rev_list::tag_targets(self.repo)
     }
 
     /// Walk commits matching one revision `spec`: a plain tip (`main`, `HEAD~3`), an exclusion
@@ -149,11 +182,34 @@ impl<'repo> RevWalk<'repo> {
             since: options.since,
             until: options.until,
             first_parent: options.first_parent,
+            retain_commit_bytes: false,
+            retained_commit_extent: CommitExtent::Whole,
         };
         Ok(RevWalkCommitIter {
             inner: open_commit_stream(self.repo, &include, &exclude, &params)?,
         })
     }
+
+    /// Shallow-boundary commits recorded in `shallow` (empty when not a shallow clone).
+    #[must_use]
+    pub fn shallow_boundary_oids(&self) -> std::collections::HashSet<crate::objects::ObjectId> {
+        crate::rev_list::shallow_boundary_oids(self.repo.git_dir())
+    }
+}
+
+/// Revision specs from [`RevWalk::parse_stdin_specs`], ready for [`RevWalk::rev_list`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct StdinRevisionSpecs {
+    /// Tips to include.
+    pub positive: Vec<String>,
+    /// Tips to exclude (`^rev`, range left sides, and stdin lines after `--not`).
+    pub negative: Vec<String>,
+    /// Whether stdin asked for every ref (`--all`); set
+    /// [`RevListOptions::all_refs`] to walk them.
+    pub all_refs: bool,
+    /// Pathspecs from stdin lines after `--`.
+    pub pathspecs: Vec<String>,
 }
 
 /// Iterator over commits from [`RevWalk::commits_iter`].
@@ -165,7 +221,7 @@ impl Iterator for RevWalkCommitIter<'_> {
     type Item = Result<ObjectId>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next()
+        self.inner.next().map(|item| item.map(|row| row.oid))
     }
 }
 
@@ -195,12 +251,12 @@ mod commit_iter_tests {
     use super::*;
     use crate::ident::Signature;
     use crate::porcelain::commit::{create_commit, CommitRequest};
-    use crate::progress::{NeverCancel, NullProgress};
+    use crate::progress::{CancelToken, NullProgress};
     use crate::repo::{InitOptions, Repository};
 
     fn init_repo_with_commits(count: usize) -> (tempfile::TempDir, Repository) {
         let dir = tempfile::tempdir().expect("tempdir");
-        let repo = Repository::init(dir.path(), &InitOptions::default()).expect("init");
+        let (repo, _) = Repository::init(dir.path(), &InitOptions::default()).expect("init");
         for i in 0..count {
             let mut req = CommitRequest::new(format!("commit {i}"));
             req.author = Some(
@@ -211,7 +267,7 @@ mod commit_iter_tests {
                     .expect("committer"),
             );
             req.allow_empty = true;
-            create_commit(&repo, &req, &mut NullProgress, &NeverCancel).expect("commit");
+            create_commit(&repo, &req, &mut NullProgress, &CancelToken::never()).expect("commit");
         }
         (dir, repo)
     }
@@ -224,7 +280,7 @@ mod commit_iter_tests {
             ..RevWalkCommitIterOptions::default()
         };
         let ids: Vec<_> = repo
-            .rev_walk()
+            .revwalk()
             .commits_iter("HEAD", &options)
             .expect("iter")
             .collect::<Result<Vec<_>>>()
@@ -235,13 +291,17 @@ mod commit_iter_tests {
     #[test]
     fn commits_iter_since_cutoff_filters_old_commits() {
         let (_dir, repo) = init_repo_with_commits(4);
-        let newest = repo.rev_walk().resolve("HEAD").expect("head");
+        let newest = repo
+            .revwalk()
+            .resolve("HEAD", &crate::revwalk::ResolveOptions::default())
+            .expect("head");
         let params = crate::rev_list::CommitStreamParams {
             limit: Some(10),
             ..Default::default()
         };
         let all: Vec<_> = open_commit_stream(&repo, std::slice::from_ref(&newest), &[], &params)
             .expect("stream")
+            .map(|item| item.map(|row| row.oid))
             .collect::<Result<Vec<_>>>()
             .expect("walk");
         assert_eq!(all.len(), 4);
@@ -257,6 +317,7 @@ mod commit_iter_tests {
             },
         )
         .expect("stream")
+        .map(|item| item.map(|row| row.oid))
         .collect::<Result<Vec<_>>>()
         .expect("walk");
         assert!(filtered.is_empty());

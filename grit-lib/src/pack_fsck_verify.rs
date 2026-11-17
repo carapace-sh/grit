@@ -6,6 +6,7 @@
 //! after, so memory follows the delta chains being walked and the checks' compact
 //! results, not the uncompressed size of the pack.
 
+use crate::error::ObjectError;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -65,25 +66,35 @@ where
         oid: ObjectId,
         kind: ObjectKind,
         data: &[u8],
+        hash_verified: bool,
         out: &mut Outcomes<T>,
     ) -> Result<bool> {
         if self.cancel.load(Ordering::Relaxed) {
             return Err(Error::Cancelled);
         }
-        let outcome = match hash_object(self.algo, kind, data) {
-            Ok(actual) if actual == oid => PackFsckObjectOutcome::Clean {
+        let outcome = if hash_verified {
+            PackFsckObjectOutcome::Clean {
                 oid,
                 facts: (self.check)(oid, kind, data),
-            },
-            Ok(actual) => PackFsckObjectOutcome::Failed {
-                oid,
-                err: Error::CorruptObject(format!(
-                    "packed object {} hashes to {}",
-                    oid.to_hex(),
-                    actual.to_hex()
-                )),
-            },
-            Err(err) => PackFsckObjectOutcome::Failed { oid, err },
+            }
+        } else {
+            match hash_object(self.algo, kind, data) {
+                Ok(actual) if actual == oid => PackFsckObjectOutcome::Clean {
+                    oid,
+                    facts: (self.check)(oid, kind, data),
+                },
+                Ok(actual) => PackFsckObjectOutcome::Failed {
+                    oid,
+                    err: Error::Object(ObjectError::Corrupt {
+                        detail: format!(
+                            "packed object {} hashes to {}",
+                            oid.to_hex(),
+                            actual.to_hex()
+                        ),
+                    }),
+                },
+                Err(err) => PackFsckObjectOutcome::Failed { oid, err },
+            }
         };
         let clean = matches!(outcome, PackFsckObjectOutcome::Clean { .. });
         out.push((offset, outcome));
@@ -103,10 +114,13 @@ where
         root: &DeltaRoot,
         kind: ObjectKind,
         data: &[u8],
+        hash_verified: bool,
         out: &mut Self::Out,
     ) -> Result<bool> {
         match *root {
-            DeltaRoot::Pack { offset, oid, .. } => self.visit(offset, oid, kind, data, out),
+            DeltaRoot::Pack { offset, oid, .. } => {
+                self.visit(offset, oid, kind, data, hash_verified, out)
+            }
             // Bases from other packs or loose objects are checked where they live.
             DeltaRoot::Odb(_) => Ok(true),
         }
@@ -124,11 +138,14 @@ where
         index: u32,
         kind: ObjectKind,
         data: &[u8],
+        hash_verified: bool,
         out: &mut Self::Out,
     ) -> Result<Option<ObjectId>> {
         let oid = self.delta_oids[index as usize];
         let offset = self.pending[index as usize].offset;
-        Ok(self.visit(offset, oid, kind, data, out)?.then_some(oid))
+        Ok(self
+            .visit(offset, oid, kind, data, hash_verified, out)?
+            .then_some(oid))
     }
 
     fn delta_failed(&self, index: u32, err: Error, out: &mut Self::Out) -> Result<()> {
@@ -159,7 +176,9 @@ fn pending_delta(
     let base = match packed_type {
         PackedType::RefDelta => {
             let raw = pack_bytes.get(pos..pos + hash_bytes).ok_or_else(|| {
-                Error::CorruptObject(format!("truncated ref-delta base at offset {offset}"))
+                Error::Object(ObjectError::Corrupt {
+                    detail: format!("truncated ref-delta base at offset {offset}"),
+                })
             })?;
             pos += hash_bytes;
             DeltaBase::Oid(ObjectId::from_bytes(raw)?)
@@ -169,13 +188,15 @@ fn pending_delta(
             DeltaBase::Offset(base as usize)
         }
         PackedType::Commit | PackedType::Tree | PackedType::Blob | PackedType::Tag => {
-            return Err(Error::CorruptObject(format!(
-                "expected a delta at offset {offset}"
-            )));
+            return Err(Error::Object(ObjectError::Corrupt {
+                detail: format!("expected a delta at offset {offset}"),
+            }));
         }
     };
     let uncompressed_size = usize::try_from(size).map_err(|_| {
-        Error::CorruptObject(format!("pack object size overflow at offset {offset}"))
+        Error::Object(ObjectError::Corrupt {
+            detail: format!("pack object size overflow at offset {offset}"),
+        })
     })?;
     let end = offset.saturating_add(record.size_in_pack as usize);
     Ok((
@@ -231,8 +252,11 @@ where
             }
             PackedType::OfsDelta | PackedType::RefDelta => {
                 let (delta, base) = pending_delta(&pack_bytes, record, hash_bytes)?;
-                let index = u32::try_from(pending.len())
-                    .map_err(|_| Error::CorruptObject("too many deltas in pack".to_owned()))?;
+                let index = u32::try_from(pending.len()).map_err(|_| {
+                    Error::Object(ObjectError::Corrupt {
+                        detail: "too many deltas in pack".to_owned(),
+                    })
+                })?;
                 children.push(base, index);
                 pending.push(delta);
                 delta_oids.push(oid);
@@ -249,13 +273,16 @@ where
         check: &check,
         cancel,
     };
-    let walk = DeltaWalk::new(
+    let stream_from = odb.big_file_threshold().ok();
+    let walk = DeltaWalk::new_with_streaming(
         PackBytes::Slice(&pack_bytes),
         odb,
         &pending,
         &children,
         DELTA_CHAIN_BYTES_PER_WORKER,
         &visitor,
+        stream_from,
+        Some(&delta_oids),
     );
     let mut outcomes = Outcomes::with_capacity(roots.len() + pending.len());
     walk.run(&roots, threads, &mut outcomes, &mut |_| {})?;
@@ -266,10 +293,12 @@ where
             pending[index as usize].offset,
             PackFsckObjectOutcome::Failed {
                 oid,
-                err: Error::CorruptObject(format!(
-                    "delta base for {} could not be resolved during pack fsck",
-                    oid.to_hex()
-                )),
+                err: Error::Object(ObjectError::Corrupt {
+                    detail: format!(
+                        "delta base for {} could not be resolved during pack fsck",
+                        oid.to_hex()
+                    ),
+                }),
             },
         ));
     }

@@ -11,15 +11,13 @@ use std::time::{Duration, SystemTime};
 
 use grit_lib::config::environment::{Environment, RepositoryOptions};
 use grit_lib::config::ConfigSet;
-use grit_lib::maintenance::{
-    drop_promised_blobs, DropPromisedBlobsOptions, DropPromisedBlobsReport,
-};
-use grit_lib::objects::pack::clear_pack_cache;
+use grit_lib::maintenance::{DropPromisedBlobsOptions, DropPromisedBlobsReport};
 use grit_lib::objects::promisor::{DefaultPromisorFetcher, PromisorFetcher};
 use grit_lib::objects::ObjectId;
 use grit_lib::remote::transport::http::HttpClient;
-use grit_lib::remote::{HttpClientFactory, RemoteError, RemoteResult};
+use grit_lib::remote::{HttpClientFactory, RemoteError};
 use grit_lib::repo::Repository;
+use grit_lib::test_support::objects_pack::clear_pack_cache;
 use grit_test_support::{git_at_least, git_cmd, Output};
 use time::OffsetDateTime;
 
@@ -59,11 +57,11 @@ fn days_ago(days: u64) -> u64 {
 struct NoHttp;
 
 impl HttpClientFactory for NoHttp {
-    fn create(&self, _: &ConfigSet) -> RemoteResult<Box<dyn HttpClient>> {
+    fn create(&self, _: &ConfigSet) -> grit_lib::error::Result<Box<dyn HttpClient>> {
         Err(RemoteError::UnsupportedScheme)
     }
 
-    fn create_for_probe(&self, _: &ConfigSet) -> RemoteResult<Box<dyn HttpClient>> {
+    fn create_for_preflight(&self, _: &ConfigSet) -> grit_lib::error::Result<Box<dyn HttpClient>> {
         Err(RemoteError::UnsupportedScheme)
     }
 }
@@ -220,7 +218,7 @@ impl Fixture {
             keep_newer_than,
         );
         opts.dry_run = dry_run;
-        let report = drop_promised_blobs(repo, &opts).expect("drop");
+        let report = repo.maintenance().drop_promised_blobs(&opts).expect("drop");
         clear_pack_cache();
         report
     }
@@ -511,7 +509,7 @@ fn sparse_index_directories_protect_their_blobs() {
         LIMIT,
         None,
     );
-    let report = drop_promised_blobs(&repo, &opts).expect("drop");
+    let report = repo.maintenance().drop_promised_blobs(&opts).expect("drop");
     clear_pack_cache();
     assert_eq!(report.candidates, 1, "{report:?}");
     assert_eq!(report.kept.checked_out, 1, "{report:?}");

@@ -1,11 +1,10 @@
 //! `grit_lib::diff::DiffStat`: per-file counts, totals and change bars from listed file diffs.
 
 use grit_lib::diff::{
-    build_file_diffs, DiffDetail, DiffOptions, DiffStat, DiffStatus, DiffTotals, FileStat,
-    LineStat, ListedFileDiff, StatBar,
+    DiffDetail, DiffOptions, DiffStat, DiffStatus, DiffTotals, FileStat, LineStat, ListedFileDiff,
+    StatBar, TreeDiffOptions,
 };
 use grit_lib::objects::{serialize_tree, ObjectId, ObjectKind, TreeEntry};
-use grit_lib::parallel::ThreadPolicy;
 use grit_lib::repo::{InitOptions, Repository};
 
 fn tree_with(repo: &Repository, entries: &[(&str, &[u8])]) -> ObjectId {
@@ -30,25 +29,19 @@ fn listed(
 ) -> Vec<ListedFileDiff> {
     let entries = repo
         .diff()
-        .tree_to_tree(Some(old), Some(new))
+        .tree_to_tree(Some(old), Some(new), &TreeDiffOptions::default())
+        .map(|r| r.entries)
         .expect("tree diff");
-    let config = repo.config().expect("config");
-    build_file_diffs(
-        repo.odb(),
-        entries,
-        detail,
-        DiffOptions::default(),
-        config.as_ref(),
-        &ThreadPolicy::default(),
-    )
-    .expect("file diffs")
-    .files
+    repo.diff()
+        .files_for_entries(entries, detail, &DiffOptions::default())
+        .expect("file diffs")
+        .files
 }
 
 #[test]
 fn stat_and_patch_details_give_the_same_diffstat() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let repo = Repository::init(dir.path(), &InitOptions::default()).expect("init");
+    let (repo, _) = Repository::init(dir.path(), &InitOptions::default()).expect("init");
     let old = tree_with(
         &repo,
         &[
@@ -70,15 +63,24 @@ fn stat_and_patch_details_give_the_same_diffstat() {
     let from_patch = DiffStat::from_files(&listed(&repo, &old, &new, DiffDetail::Patch));
     assert_eq!(from_stat, from_patch);
 
+    let lines = |insertions, deletions| LineStat {
+        insertions,
+        deletions,
+    };
+    let bin_row = from_stat
+        .files()
+        .iter()
+        .find(|f| f.path == "bin.dat")
+        .expect("bin.dat row");
+    assert!(bin_row.binary);
+    assert_eq!(bin_row.old_size, 3);
+    assert_eq!(bin_row.new_size, 4);
+
     let rows: Vec<_> = from_stat
         .files()
         .iter()
         .map(|f| (f.path.as_str(), f.status, f.binary, f.lines))
         .collect();
-    let lines = |insertions, deletions| LineStat {
-        insertions,
-        deletions,
-    };
     assert_eq!(
         rows,
         [
@@ -115,6 +117,8 @@ fn diffstat_from_rows_sums_totals_in_order() {
         old_path: None,
         status: DiffStatus::Modified,
         binary: false,
+        old_size: 0,
+        new_size: 0,
         similarity: None,
         lines: LineStat {
             insertions,

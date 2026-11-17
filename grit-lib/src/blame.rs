@@ -14,19 +14,24 @@
 //! use grit_lib::repo::{InitOptions, Repository};
 //! # fn main() -> grit_lib::error::Result<()> {
 //! let dir = tempfile::tempdir()?;
-//! let _repo = Repository::init(dir.path(), &InitOptions::default())?;
+//! let (_repo, _) = Repository::init(dir.path(), &InitOptions::default())?;
 //! # Ok(())
 //! # }
 //! ```
 
+use crate::error::DiffError;
+use crate::error::ObjectError;
+use crate::error::RefError;
+use crate::worktree::WorktreeError;
 use std::ops::RangeInclusive;
 use std::sync::OnceLock;
 
 use similar::{Algorithm as SimilarAlgorithm, DiffOp};
 
+use crate::line_range::{resolve_line_range, LineRangeError};
+
 #[path = "blame_ignore_revs.rs"]
 mod blame_ignore_revs;
-pub use crate::line_range::{resolve_line_range, LineRangeError};
 pub use blame_ignore_revs::{IgnoreRevs, IgnoreRevsSources};
 
 /// Diff algorithm used when mapping lines between blob revisions during blame.
@@ -44,7 +49,7 @@ pub enum BlameDiffAlgorithm {
 
 impl BlameDiffAlgorithm {
     /// Map this blame diff setting to a [`similar::Algorithm`] instance.
-    pub fn to_similar(self) -> SimilarAlgorithm {
+    pub(crate) fn to_similar(self) -> SimilarAlgorithm {
         match self {
             // The `similar` crate doesn't expose histogram/minimal directly.
             // These mappings are chosen to match expected blame behavior in
@@ -781,14 +786,6 @@ fn fill_exact_text_relocate_with_lookup<'a>(
 /// Recover line mappings by exact text match when Myers left a line unresolved.
 ///
 /// Used during blame to follow moved but unchanged lines without pairing rewrites.
-pub fn build_exact_relocate_line_map(
-    old: &[&str],
-    new: &[&str],
-    exact_map: &[Option<usize>],
-) -> Vec<Option<usize>> {
-    build_exact_relocate_line_map_ws(old, new, exact_map, crate::diff::WhitespaceMode::default())
-}
-
 fn build_exact_relocate_line_map_ws(
     old: &[&str],
     new: &[&str],
@@ -1284,7 +1281,7 @@ use crate::wildmatch::wildmatch;
 /// promisor remote (partial clone). The lib does no transport itself; the CLI
 /// supplies a function that performs the fetch. Install via
 /// [`RepoCaches::set_promisor_hydrate_hook`](crate::repo_caches::RepoCaches::set_promisor_hydrate_hook).
-pub type PromisorHydrateHook = fn(&Repository, ObjectId);
+pub(crate) type PromisorHydrateHook = fn(&Repository, ObjectId);
 
 /// A single line attribution produced by [`compute_blame`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1439,6 +1436,7 @@ struct OverlayWalk<'a> {
     textconv_ctx: Option<&'a BlameTextconvContext>,
     use_textconv: bool,
     copy_depth: usize,
+    move_detection: bool,
     first_parent_only: bool,
     grafts: &'a HashMap<ObjectId, Vec<ObjectId>>,
     indent_heuristic: bool,
@@ -1546,11 +1544,17 @@ fn pass_overlay_to_parents(
         }
     }
 
-    if walk.copy_depth >= 1 && !remaining.is_empty() {
+    if blame_run_relocation_detect(walk.copy_depth, walk.move_detection) && !remaining.is_empty() {
         if let Some(&parent) = overlay.parents.first() {
-            let parent_commit =
-                get_blame_commit(odb, parent, commit_cache, session.commit_graph.as_deref())?;
-            let (left, _handoff, copy_lines) = copy_detect_attribute_pending(
+            let parent_commit = get_blame_commit(session, parent, commit_cache)?;
+            let move_parent_lines = if walk.move_detection {
+                session
+                    .resolve_blob_at_commit(odb, parent, walk.path, commit_cache)?
+                    .and_then(|(blob, mode)| session.load_blob_lines(blob, walk.path, mode).ok())
+            } else {
+                None
+            };
+            let (left, handoff, copy_lines) = copy_detect_attribute_pending(
                 odb,
                 session,
                 remaining,
@@ -1562,9 +1566,10 @@ fn pass_overlay_to_parents(
                 &parent_commit.tree,
                 walk.path,
                 walk.copy_depth,
+                walk.move_detection,
                 false,
                 Some(overlay.copy_paths.as_ref()),
-                None,
+                move_parent_lines.as_ref(),
                 walk.ignore_revs,
                 walk.diff_algorithm,
                 walk.textconv_ctx,
@@ -1575,6 +1580,11 @@ fn pass_overlay_to_parents(
             )?;
             result.extend(copy_lines);
             remaining = left;
+            if !handoff.is_empty() {
+                if let Some(ref mut suspect) = first {
+                    suspect.pending.extend(handoff);
+                }
+            }
         }
     }
 
@@ -1711,7 +1721,11 @@ pub struct BlameTextconvContext {
 impl BlameTextconvContext {
     /// Build textconv context from the open repository (config, attributes, filters).
     pub fn new(repo: &Repository) -> Self {
-        let config = repo.config().map(|c| (*c).clone()).unwrap_or_default();
+        let config = repo
+            .config()
+            .snapshot()
+            .map(|c| (*c).clone())
+            .unwrap_or_default();
         let conversion = ConversionConfig::from_config(&config);
         let parsed = load_attr_parsed(repo);
         let attrs = parsed.rules.clone();
@@ -1799,21 +1813,23 @@ fn load_diff_attr_rules(repo: &Repository) -> Vec<DiffAttrRule> {
 }
 
 /// Read an object for blame, optionally invoking a promisor hydration hook on miss.
-pub fn read_object_for_blame(
+pub(crate) fn read_object_for_blame(
     odb: &Odb,
     oid: &ObjectId,
     repo: Option<&Repository>,
 ) -> Result<Object> {
     match odb.read(oid) {
         Ok(obj) => Ok(obj),
-        Err(LibError::ObjectNotFound(_)) => {
+        Err(LibError::Object(ObjectError::NotFound { .. })) => {
             if let Some(repo) = repo {
                 if let Some(hook) = repo.promisor_hydrate_hook() {
                     hook(repo, *oid);
                     return odb.read(oid);
                 }
             }
-            Err(LibError::ObjectNotFound(oid.to_hex()))
+            Err(LibError::Object(ObjectError::NotFound {
+                name: oid.to_hex(),
+            }))
         }
         Err(err) => Err(err),
     }
@@ -1866,7 +1882,7 @@ fn resolve_textconv_command(ctx: &BlameTextconvContext, path: &str) -> Option<St
     }
 
     match selected {
-        Some(DiffAttrValue::Driver(driver)) => ctx.config.get(&format!("diff.{driver}.textconv")),
+        Some(DiffAttrValue::Driver(driver)) => ctx.config.value(&format!("diff.{driver}.textconv")),
         _ => None,
     }
 }
@@ -1896,15 +1912,19 @@ fn run_textconv_command(command: &str, input_data: &[u8]) -> Result<Vec<u8>> {
         CommandStdin::Null,
         CommandStdio::Inherit,
     )
-    .map_err(|e| LibError::Message(format!("running textconv command '{command}': {e}")))?;
+    .map_err(|source| DiffError::TextconvSpawn {
+        command: command.to_owned(),
+        source,
+    })?;
 
     let _ = std::fs::remove_file(&temp_path);
 
     if !output.status.success {
-        return Err(LibError::Message(format!(
-            "textconv command exited with status {}",
-            output.status.code.unwrap_or(-1)
-        )));
+        return Err(DiffError::TextconvFailed {
+            command: command.to_owned(),
+            status: output.status.code,
+        }
+        .into());
     }
 
     Ok(output.stdout)
@@ -1925,9 +1945,11 @@ fn create_temp_textconv_file(data: &[u8]) -> Result<std::path::PathBuf> {
             Err(err) => return Err(err.into()),
         }
     }
-    Err(LibError::Message(
-        "failed to create temporary textconv input file".to_string(),
-    ))
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "no unused temporary textconv input file name",
+    )
+    .into())
 }
 
 fn shell_quote(text: &str) -> String {
@@ -1944,7 +1966,12 @@ fn read_blob_content_for_blame(
 ) -> Result<Vec<u8>> {
     let obj = read_object_for_blame(odb, oid, None)?;
     if obj.kind != ObjectKind::Blob {
-        return Err(LibError::Message("expected blob object".to_string()));
+        return Err(ObjectError::UnexpectedKind {
+            oid: *oid,
+            expected: ObjectKind::Blob,
+            actual: obj.kind,
+        }
+        .into());
     }
 
     if !use_textconv || !is_regular_mode(mode) {
@@ -1970,7 +1997,7 @@ fn read_blob_content_for_blame(
         None,
         Some(ctx.filters()),
     )
-    .map_err(LibError::Filter)?;
+    .map_err(|e| LibError::Worktree(WorktreeError::Filter(e)))?;
     run_textconv_command(&command, &worktree_data)
         .or_else(|_| run_textconv_command(&command, &obj.data))
 }
@@ -2209,6 +2236,7 @@ const BLOB_LINES_CACHE_SOFT_LIMIT: usize = 64;
 /// Per-blame caches for blob lines, tree path resolution, and parent/child line maps.
 struct BlameSession<'a> {
     odb: &'a Odb,
+    repo: Option<&'a Repository>,
     textconv_ctx: Option<&'a BlameTextconvContext>,
     use_textconv: bool,
     whitespace: crate::diff::WhitespaceMode,
@@ -2232,6 +2260,7 @@ struct BlameSession<'a> {
 impl<'a> BlameSession<'a> {
     fn new(
         odb: &'a Odb,
+        repo: Option<&'a Repository>,
         textconv_ctx: Option<&'a BlameTextconvContext>,
         use_textconv: bool,
         thread_policy: &ThreadPolicy,
@@ -2239,6 +2268,7 @@ impl<'a> BlameSession<'a> {
         let _ = thread_policy;
         Self {
             odb,
+            repo,
             textconv_ctx,
             use_textconv,
             whitespace: crate::diff::WhitespaceMode::default(),
@@ -2274,7 +2304,12 @@ impl<'a> BlameSession<'a> {
         // a first-parent walk from re-inflating every chain from its base.
         let obj = self.pack.read(self.odb, &tree_oid)?;
         if obj.kind != ObjectKind::Tree {
-            return Err(LibError::Message("expected tree".to_string()));
+            return Err(ObjectError::UnexpectedKind {
+                oid: tree_oid,
+                expected: ObjectKind::Tree,
+                actual: obj.kind,
+            }
+            .into());
         }
         let oid_len = self.odb.hash_algo().len();
         Ok(
@@ -2324,7 +2359,7 @@ impl<'a> BlameSession<'a> {
 
     fn resolve_blob_at_commit(
         &mut self,
-        odb: &Odb,
+        _odb: &Odb,
         commit: ObjectId,
         path: &str,
         commit_cache: &mut BlameCommitCache,
@@ -2333,7 +2368,7 @@ impl<'a> BlameSession<'a> {
         if let Some(resolved) = self.commit_path_blob.get(&cache_key) {
             return Ok(*resolved);
         }
-        let meta = get_blame_commit(odb, commit, commit_cache, self.commit_graph.as_deref())?;
+        let meta = get_blame_commit(self, commit, commit_cache)?;
         let resolved = self.resolve_path_in_tree(meta.tree, path)?;
         self.commit_path_blob.insert(cache_key, resolved);
         Ok(resolved)
@@ -2574,13 +2609,14 @@ impl SessionPackReader {
         }
         let mut data = Vec::new();
         if odb.read_into(oid, &mut data)? != ObjectKind::Commit {
-            return Err(LibError::CorruptObject(format!(
-                "{} is not a commit",
-                oid.to_hex()
-            )));
+            return Err(LibError::Object(ObjectError::Corrupt {
+                detail: format!("{} is not a commit", oid.to_hex()),
+            }));
         }
         parse_commit_tree_and_parents_lenient(&data, hex_len).ok_or_else(|| {
-            LibError::CorruptObject(format!("commit {} has no valid tree header", oid.to_hex()))
+            LibError::Object(ObjectError::Corrupt {
+                detail: format!("commit {} has no valid tree header", oid.to_hex()),
+            })
         })
     }
 }
@@ -2612,6 +2648,7 @@ pub fn compute_blame(
     textconv_ctx: Option<&BlameTextconvContext>,
     use_textconv: bool,
     copy_depth: usize,
+    move_detection: bool,
     first_parent_only: bool,
     grafts: &HashMap<ObjectId, Vec<ObjectId>>,
     indent_heuristic: bool,
@@ -2621,7 +2658,7 @@ pub fn compute_blame(
 ) -> Result<Vec<BlameLine>> {
     let bounded_odb = line_range.as_ref().map(|_| odb.with_bounded_pack_cache());
     let odb = bounded_odb.as_ref().unwrap_or(odb);
-    let mut session = BlameSession::new(odb, textconv_ctx, use_textconv, thread_policy);
+    let mut session = BlameSession::new(odb, None, textconv_ctx, use_textconv, thread_policy);
     session.whitespace = whitespace;
     session.cache_pair_maps = !ignore_revs.is_empty() || copy_depth > 0;
     let revision_label = start_oid.to_hex();
@@ -2636,6 +2673,7 @@ pub fn compute_blame(
             textconv_ctx,
             use_textconv,
             copy_depth,
+            move_detection,
             first_parent_only,
             grafts,
             indent_heuristic,
@@ -2710,14 +2748,22 @@ fn fast_forward_same_blob(
             oid = parent_oid;
             continue;
         }
-        let parent_tree = if let Some(chain) = session.commit_graph.as_deref() {
-            if let Some(tree) = chain.graph_commit_tree(&parent_oid) {
-                tree
+        let parent_tree = if session
+            .repo
+            .map(|repo| repo.object_id_after_replace(&parent_oid) == parent_oid)
+            .unwrap_or(true)
+        {
+            if let Some(chain) = session.commit_graph.as_deref() {
+                if let Some(tree) = chain.graph_commit_tree(&parent_oid) {
+                    tree
+                } else {
+                    get_blame_commit(session, parent_oid, commit_cache)?.tree
+                }
             } else {
-                get_blame_commit(odb, parent_oid, commit_cache, Some(chain))?.tree
+                get_blame_commit(session, parent_oid, commit_cache)?.tree
             }
         } else {
-            get_blame_commit(odb, parent_oid, commit_cache, None)?.tree
+            get_blame_commit(session, parent_oid, commit_cache)?.tree
         };
         let Some((p_blob, _mode)) = session.resolve_path_in_tree(parent_tree, path)? else {
             break;
@@ -2741,6 +2787,7 @@ fn compute_blame_with_session(
     textconv_ctx: Option<&BlameTextconvContext>,
     use_textconv: bool,
     copy_depth: usize,
+    move_detection: bool,
     first_parent_only: bool,
     grafts: &HashMap<ObjectId, Vec<ObjectId>>,
     indent_heuristic: bool,
@@ -2757,12 +2804,7 @@ fn compute_blame_with_session(
             0,
         ),
         None => {
-            let start_commit = get_blame_commit(
-                odb,
-                start_oid,
-                &mut commit_cache,
-                session.commit_graph.as_deref(),
-            )?;
+            let start_commit = get_blame_commit(session, start_oid, &mut commit_cache)?;
             let (blob_oid, blob_mode) = session
                 .resolve_path_in_tree(start_commit.tree, file_path)?
                 .ok_or_else(|| blame_path_missing_in_revision(file_path, revision_label))?;
@@ -2831,6 +2873,7 @@ fn compute_blame_with_session(
             textconv_ctx,
             use_textconv,
             copy_depth,
+            move_detection,
             first_parent_only,
             grafts,
             indent_heuristic,
@@ -2911,12 +2954,7 @@ fn compute_blame_with_session(
             }
         }
 
-        let commit = get_blame_commit(
-            odb,
-            current_oid,
-            &mut commit_cache,
-            session.commit_graph.as_deref(),
-        )?;
+        let commit = get_blame_commit(session, current_oid, &mut commit_cache)?;
         let mut parents =
             commit_parents_for_blame(odb, current_oid, grafts, &mut commit_cache, session)?;
         let is_ignored = ignore_revs.contains(&current_oid);
@@ -3017,12 +3055,7 @@ fn compute_blame_with_session(
             let mut parent_lines: Vec<Option<Vec<String>>> = Vec::new();
             let mut parent_blames: Vec<Option<Vec<BlameLine>>> = Vec::new();
             for parent_oid in &parents {
-                let parent_commit = get_blame_commit(
-                    odb,
-                    *parent_oid,
-                    &mut commit_cache,
-                    session.commit_graph.as_deref(),
-                )?;
+                let parent_commit = get_blame_commit(session, *parent_oid, &mut commit_cache)?;
                 if let Some((p_blob_oid, p_blob_mode)) =
                     session.resolve_path_in_tree(parent_commit.tree, &current_path)?
                 {
@@ -3040,6 +3073,7 @@ fn compute_blame_with_session(
                         textconv_ctx,
                         use_textconv,
                         copy_depth,
+                        move_detection,
                         first_parent_only,
                         grafts,
                         indent_heuristic,
@@ -3165,8 +3199,7 @@ fn compute_blame_with_session(
                     break;
                 }
                 let p = parents[i];
-                let parent_commit =
-                    get_blame_commit(odb, p, &mut commit_cache, session.commit_graph.as_deref())?;
+                let parent_commit = get_blame_commit(session, p, &mut commit_cache)?;
                 let mut parent_path = current_path.clone();
                 let mut resolved =
                     session.resolve_blob_at_commit(odb, p, &current_path, &mut commit_cache)?;
@@ -3257,20 +3290,14 @@ fn compute_blame_with_session(
                     false,
                     true,
                 );
+                let map_arc = Arc::clone(&pair.diff_line_map);
+                let par_lines_arc = Arc::clone(&pl_arc);
                 par_lines_vec[i] = Some(pl_arc);
-                maps[i] = Some(Arc::clone(&pair.diff_line_map));
+                maps[i] = Some(Arc::clone(&map_arc));
 
                 let mut next_remaining: Vec<TrackedLine> = Vec::new();
-                let Some(map) = maps[i].as_ref() else {
-                    return Err(LibError::Message(
-                        "internal: missing merge parent line map".to_string(),
-                    ));
-                };
-                let Some(par_lines) = par_lines_vec[i].as_ref() else {
-                    return Err(LibError::Message(
-                        "internal: missing merge parent lines".to_string(),
-                    ));
-                };
+                let map = &map_arc;
+                let par_lines = &par_lines_arc;
                 let parent_line_count = par_lines.len();
                 let mut pass_origin = None;
                 for t in remaining {
@@ -3379,12 +3406,7 @@ fn compute_blame_with_session(
         }
 
         let parent_oid = parents[0];
-        let parent_commit = get_blame_commit(
-            odb,
-            parent_oid,
-            &mut commit_cache,
-            session.commit_graph.as_deref(),
-        )?;
+        let parent_commit = get_blame_commit(session, parent_oid, &mut commit_cache)?;
         let mut parent_blob_entry =
             session.resolve_blob_at_commit(odb, parent_oid, &current_path, &mut commit_cache)?;
         let mut parent_blob_path = current_path.clone();
@@ -3448,6 +3470,7 @@ fn compute_blame_with_session(
                         &commit.tree,
                         &current_path,
                         copy_depth,
+                        move_detection,
                         true,
                         None,
                         None,
@@ -3598,7 +3621,11 @@ fn compute_blame_with_session(
                         if diff_line_map.get(t.current_idx).and_then(|m| *m).is_none()
                             && !is_ignored
                         {
-                            if copy_depth >= 1 && !inserted_line_duplicates_parent {
+                            if blame_pending_needs_relocation_detect(
+                                copy_depth,
+                                move_detection,
+                                inserted_line_duplicates_parent,
+                            ) {
                                 introduced_for_copy.push(t);
                             } else {
                                 result.push(blame_line_at_path(
@@ -3723,7 +3750,11 @@ fn compute_blame_with_session(
                                 });
                                 continue;
                             }
-                            if copy_depth >= 1 && !inserted_line_duplicates_parent {
+                            if blame_pending_needs_relocation_detect(
+                                copy_depth,
+                                move_detection,
+                                inserted_line_duplicates_parent,
+                            ) {
                                 introduced_for_copy.push(t);
                             } else {
                                 result.push(blame_line_at_path(
@@ -3764,7 +3795,9 @@ fn compute_blame_with_session(
                     }
                 }
 
-                if copy_depth >= 1 && !introduced_for_copy.is_empty() {
+                if blame_run_relocation_detect(copy_depth, move_detection)
+                    && !introduced_for_copy.is_empty()
+                {
                     let (left, handoff, copy_lines) = copy_detect_attribute_pending(
                         odb,
                         session,
@@ -3777,6 +3810,7 @@ fn compute_blame_with_session(
                         &commit.tree,
                         &current_path,
                         copy_depth,
+                        move_detection,
                         false,
                         None,
                         Some(&par_lines_arc),
@@ -3826,6 +3860,22 @@ fn compute_blame_with_session(
 const BLAME_DEFAULT_COPY_SCORE: usize = 40;
 /// Git's default minimum chunk score for within-file move detection (`blame.h`).
 const BLAME_DEFAULT_MOVE_SCORE: usize = 20;
+
+/// Whether still-unblamed lines should be passed to relocation detection (`-M` / `-C`).
+fn blame_pending_needs_relocation_detect(
+    copy_depth: usize,
+    move_detection: bool,
+    inserted_line_duplicates_parent: bool,
+) -> bool {
+    if move_detection {
+        return true;
+    }
+    copy_depth >= 1 && !inserted_line_duplicates_parent
+}
+
+fn blame_run_relocation_detect(copy_depth: usize, move_detection: bool) -> bool {
+    move_detection || copy_depth >= 1
+}
 
 fn blame_copy_content_score(line: &str) -> usize {
     line.chars().filter(|c| c.is_ascii_alphanumeric()).count()
@@ -3882,17 +3932,22 @@ fn find_best_contiguous_copy_match(
 }
 
 /// Contiguous `current_idx` groups for copy/move suspect chunks.
+///
+/// Several [`TrackedLine`] values may share one file line index after move/copy
+/// detection hands the same parent line to multiple final lines. Group by unique
+/// sorted indices so each file range is scored once and every tracked line is
+/// handled in exactly one group.
 fn group_contiguous_tracked(pending: &[TrackedLine]) -> Vec<(usize, usize)> {
     if pending.is_empty() {
         return Vec::new();
     }
-    let mut order: Vec<usize> = (0..pending.len()).collect();
-    order.sort_by_key(|&i| pending[i].current_idx);
+    let mut indices: Vec<usize> = pending.iter().map(|t| t.current_idx).collect();
+    indices.sort_unstable();
+    indices.dedup();
     let mut groups = Vec::new();
-    let mut start = pending[order[0]].current_idx;
+    let mut start = indices[0];
     let mut end = start + 1;
-    for &i in order.iter().skip(1) {
-        let idx = pending[i].current_idx;
+    for &idx in indices.iter().skip(1) {
         if idx == end {
             end += 1;
         } else {
@@ -3919,6 +3974,7 @@ fn load_copy_source_blame(
     textconv_ctx: Option<&BlameTextconvContext>,
     use_textconv: bool,
     copy_depth: usize,
+    move_detection: bool,
     first_parent_only: bool,
     grafts: &HashMap<ObjectId, Vec<ObjectId>>,
     indent_heuristic: bool,
@@ -3940,6 +3996,7 @@ fn load_copy_source_blame(
         textconv_ctx,
         use_textconv,
         copy_depth,
+        move_detection,
         first_parent_only,
         grafts,
         indent_heuristic,
@@ -3968,6 +4025,7 @@ fn copy_detect_attribute_pending(
     child_tree: &ObjectId,
     current_path: &str,
     copy_depth: usize,
+    move_detection: bool,
     blaming_new_file: bool,
     // When set, skip tree-based copy path rules and use this allow-list (`None` = all paths).
     explicit_allowed_paths: Option<Option<&HashSet<String>>>,
@@ -3980,29 +4038,14 @@ fn copy_detect_attribute_pending(
     grafts: &HashMap<ObjectId, Vec<ObjectId>>,
     indent_heuristic: bool,
 ) -> Result<(Vec<TrackedLine>, Vec<TrackedLine>, Vec<BlameLine>)> {
-    if copy_depth == 0 || pending.is_empty() {
+    if pending.is_empty() {
+        return Ok((pending, Vec::new(), Vec::new()));
+    }
+    if copy_depth == 0 && !move_detection {
         return Ok((pending, Vec::new(), Vec::new()));
     }
     let ws = session.whitespace;
     let cur_refs = cur_lines.comparison_refs(ws);
-    let allowed = match explicit_allowed_paths {
-        Some(paths) => paths.cloned(),
-        None => {
-            copy_allowed_parent_paths(odb, parent_tree, child_tree, copy_depth, blaming_new_file)?
-        }
-    };
-    let mut entries = Vec::new();
-    collect_tree_file_entries(odb, parent_tree, "", &mut entries)?;
-    let mut candidates: Vec<(String, ObjectId, u32)> = Vec::new();
-    for (path, oid, mode) in entries {
-        if path == current_path || !is_regular_mode(mode) {
-            continue;
-        }
-        if !path_allowed_for_copy_search(&path, allowed.as_ref()) {
-            continue;
-        }
-        candidates.push((path, oid, mode));
-    }
     let mut source_cache: CopySourceCache = HashMap::new();
     let mut result = Vec::new();
     let mut parent_handoff = Vec::new();
@@ -4010,174 +4053,203 @@ fn copy_detect_attribute_pending(
     let copy_threshold = BLAME_DEFAULT_COPY_SCORE;
     let move_threshold = BLAME_DEFAULT_MOVE_SCORE;
 
-    if let Some(par_lines) = move_parent_lines {
-        let par_refs = par_lines.comparison_refs(ws);
-        let mut next_work = Vec::new();
-        for group in group_contiguous_tracked(&work) {
-            let slice: Vec<&str> = (group.0..group.1).map(|i| cur_refs[i]).collect();
-            if blame_entry_score_lines(&slice) <= move_threshold {
-                next_work.extend(
-                    work.iter()
-                        .filter(|t| t.current_idx >= group.0 && t.current_idx < group.1)
-                        .cloned(),
-                );
-                continue;
-            }
-            let Some(m) = find_best_contiguous_copy_match(&slice, &par_refs, ws) else {
-                next_work.extend(
-                    work.iter()
-                        .filter(|t| t.current_idx >= group.0 && t.current_idx < group.1)
-                        .cloned(),
-                );
-                continue;
-            };
-            if m.score <= move_threshold {
-                next_work.extend(
-                    work.iter()
-                        .filter(|t| t.current_idx >= group.0 && t.current_idx < group.1)
-                        .cloned(),
-                );
-                continue;
-            }
-            for t in work
-                .iter()
-                .filter(|t| t.current_idx >= group.0 && t.current_idx < group.1)
-            {
-                let off = t.current_idx - group.0;
-                if off < m.suspect_start || off >= m.suspect_start + m.len {
-                    next_work.push(t.clone());
+    if move_detection {
+        if let Some(par_lines) = move_parent_lines {
+            let par_refs = par_lines.comparison_refs(ws);
+            let mut next_work = Vec::new();
+            for group in group_contiguous_tracked(&work) {
+                let slice: Vec<&str> = (group.0..group.1).map(|i| cur_refs[i]).collect();
+                if blame_entry_score_lines(&slice) <= move_threshold {
+                    next_work.extend(
+                        work.iter()
+                            .filter(|t| t.current_idx >= group.0 && t.current_idx < group.1)
+                            .cloned(),
+                    );
                     continue;
                 }
-                let parent_line = m.parent_start + (off - m.suspect_start);
-                parent_handoff.push(TrackedLine {
-                    current_idx: parent_line,
-                    ..t.clone()
-                });
-            }
-        }
-        work = next_work;
-    }
-
-    loop {
-        let mut made_progress = false;
-        let groups = group_contiguous_tracked(&work);
-        let mut still_pending = Vec::new();
-        for (start_idx, end_idx) in groups {
-            let slice: Vec<&str> = (start_idx..end_idx).map(|i| cur_refs[i]).collect();
-            let group_lines: Vec<TrackedLine> = work
-                .iter()
-                .filter(|t| t.current_idx >= start_idx && t.current_idx < end_idx)
-                .cloned()
-                .collect();
-            let mut subranges = vec![(0usize, slice.len())];
-            let mut group_pending = Vec::new();
-            while let Some((off, len)) = subranges.pop() {
-                if len == 0 {
-                    continue;
-                }
-                let sub = &slice[off..off + len];
-                if blame_entry_score_lines(sub) <= copy_threshold {
-                    for t in &group_lines {
-                        let rel = t.current_idx - start_idx;
-                        if rel >= off && rel < off + len {
-                            group_pending.push(t.clone());
-                        }
-                    }
-                    continue;
-                }
-                let mut best: Option<(ContiguousCopyMatch, String, ObjectId, u32)> = None;
-                for (path, oid, mode) in &candidates {
-                    let source_lines = session.load_blob_lines(*oid, path, *mode)?;
-                    let src_refs = source_lines.comparison_refs(ws);
-                    let Some(m) = find_best_contiguous_copy_match(sub, &src_refs, ws) else {
-                        continue;
-                    };
-                    let replace = best.as_ref().is_none_or(|(b, _, _, _)| {
-                        m.score > b.score || (m.score == b.score && m.len > b.len)
-                    });
-                    if replace {
-                        best = Some((m, path.clone(), *oid, *mode));
-                    }
-                }
-                let Some((m, source_path, source_oid, source_mode)) = best else {
-                    for t in &group_lines {
-                        let rel = t.current_idx - start_idx;
-                        if rel >= off && rel < off + len {
-                            group_pending.push(t.clone());
-                        }
-                    }
+                let Some(m) = find_best_contiguous_copy_match(&slice, &par_refs, ws) else {
+                    next_work.extend(
+                        work.iter()
+                            .filter(|t| t.current_idx >= group.0 && t.current_idx < group.1)
+                            .cloned(),
+                    );
                     continue;
                 };
-                if m.score <= copy_threshold {
-                    for t in &group_lines {
-                        let rel = t.current_idx - start_idx;
-                        if rel >= off && rel < off + len {
-                            group_pending.push(t.clone());
-                        }
-                    }
+                if m.score <= move_threshold {
+                    next_work.extend(
+                        work.iter()
+                            .filter(|t| t.current_idx >= group.0 && t.current_idx < group.1)
+                            .cloned(),
+                    );
                     continue;
                 }
-                let (_source_lines, source_blame) = load_copy_source_blame(
-                    odb,
-                    parent_oid,
-                    &source_path,
-                    source_oid,
-                    source_mode,
-                    ignore_revs,
-                    diff_algorithm,
-                    textconv_ctx,
-                    use_textconv,
-                    copy_depth.saturating_sub(1),
-                    first_parent_only,
-                    grafts,
-                    indent_heuristic,
-                    session,
-                    &mut source_cache,
-                )?;
-                made_progress = true;
-                if m.suspect_start > 0 {
-                    subranges.push((off, m.suspect_start));
-                }
-                if m.suspect_start + m.len < len {
-                    subranges.push((off + m.suspect_start + m.len, len - m.suspect_start - m.len));
-                }
-                for t in &group_lines {
-                    let rel = t.current_idx - start_idx;
-                    if rel < off + m.suspect_start || rel >= off + m.suspect_start + m.len {
+                for t in work
+                    .iter()
+                    .filter(|t| t.current_idx >= group.0 && t.current_idx < group.1)
+                {
+                    let off = t.current_idx - group.0;
+                    if off < m.suspect_start || off >= m.suspect_start + m.len {
+                        next_work.push(t.clone());
                         continue;
                     }
-                    let parent_line = m.parent_start + (rel - off - m.suspect_start);
-                    let pb = source_blame
-                        .iter()
-                        .find(|l| l.final_lineno == parent_line + 1)
-                        .cloned()
-                        .unwrap_or_else(|| {
-                            blame_line_at_path(
-                                parent_oid,
-                                parent_line + 1,
-                                parent_line + 1,
-                                final_line_display(final_text, t.final_lineno),
-                                &source_path,
-                                None,
-                                false,
-                                false,
-                            )
-                        });
-                    result.push(blame_line_from_parent(
-                        &pb,
-                        t.final_lineno,
-                        final_line_display(final_text, t.final_lineno),
-                        pb.source_file.clone().or_else(|| Some(source_path.clone())),
-                        pb.ignored || t.ignored,
-                        pb.unblamable,
-                    ));
+                    let parent_line = m.parent_start + (off - m.suspect_start);
+                    parent_handoff.push(TrackedLine {
+                        current_idx: parent_line,
+                        ..t.clone()
+                    });
                 }
             }
-            still_pending.extend(group_pending);
+            work = next_work;
         }
-        work = still_pending;
-        if !made_progress {
-            break;
+    }
+
+    if copy_depth >= 1 {
+        let allowed = match explicit_allowed_paths {
+            Some(paths) => paths.cloned(),
+            None => copy_allowed_parent_paths(
+                odb,
+                parent_tree,
+                child_tree,
+                copy_depth,
+                blaming_new_file,
+            )?,
+        };
+        let mut entries = Vec::new();
+        collect_tree_file_entries(odb, parent_tree, "", &mut entries)?;
+        let mut candidates: Vec<(String, ObjectId, u32)> = Vec::new();
+        for (path, oid, mode) in entries {
+            if path == current_path || !is_regular_mode(mode) {
+                continue;
+            }
+            if !path_allowed_for_copy_search(&path, allowed.as_ref()) {
+                continue;
+            }
+            candidates.push((path, oid, mode));
+        }
+
+        loop {
+            let mut made_progress = false;
+            let groups = group_contiguous_tracked(&work);
+            let mut still_pending = Vec::new();
+            for (start_idx, end_idx) in groups {
+                let slice: Vec<&str> = (start_idx..end_idx).map(|i| cur_refs[i]).collect();
+                let group_lines: Vec<TrackedLine> = work
+                    .iter()
+                    .filter(|t| t.current_idx >= start_idx && t.current_idx < end_idx)
+                    .cloned()
+                    .collect();
+                let mut subranges = vec![(0usize, slice.len())];
+                let mut group_pending = Vec::new();
+                while let Some((off, len)) = subranges.pop() {
+                    if len == 0 {
+                        continue;
+                    }
+                    let sub = &slice[off..off + len];
+                    if blame_entry_score_lines(sub) <= copy_threshold {
+                        for t in &group_lines {
+                            let rel = t.current_idx - start_idx;
+                            if rel >= off && rel < off + len {
+                                group_pending.push(t.clone());
+                            }
+                        }
+                        continue;
+                    }
+                    let mut best: Option<(ContiguousCopyMatch, String, ObjectId, u32)> = None;
+                    for (path, oid, mode) in &candidates {
+                        let source_lines = session.load_blob_lines(*oid, path, *mode)?;
+                        let src_refs = source_lines.comparison_refs(ws);
+                        let Some(m) = find_best_contiguous_copy_match(sub, &src_refs, ws) else {
+                            continue;
+                        };
+                        let replace = best.as_ref().is_none_or(|(b, _, _, _)| {
+                            m.score > b.score || (m.score == b.score && m.len > b.len)
+                        });
+                        if replace {
+                            best = Some((m, path.clone(), *oid, *mode));
+                        }
+                    }
+                    let Some((m, source_path, source_oid, source_mode)) = best else {
+                        for t in &group_lines {
+                            let rel = t.current_idx - start_idx;
+                            if rel >= off && rel < off + len {
+                                group_pending.push(t.clone());
+                            }
+                        }
+                        continue;
+                    };
+                    if m.score <= copy_threshold {
+                        for t in &group_lines {
+                            let rel = t.current_idx - start_idx;
+                            if rel >= off && rel < off + len {
+                                group_pending.push(t.clone());
+                            }
+                        }
+                        continue;
+                    }
+                    let (_source_lines, source_blame) = load_copy_source_blame(
+                        odb,
+                        parent_oid,
+                        &source_path,
+                        source_oid,
+                        source_mode,
+                        ignore_revs,
+                        diff_algorithm,
+                        textconv_ctx,
+                        use_textconv,
+                        copy_depth.saturating_sub(1),
+                        move_detection,
+                        first_parent_only,
+                        grafts,
+                        indent_heuristic,
+                        session,
+                        &mut source_cache,
+                    )?;
+                    made_progress = true;
+                    if m.suspect_start > 0 {
+                        subranges.push((off, m.suspect_start));
+                    }
+                    if m.suspect_start + m.len < len {
+                        subranges
+                            .push((off + m.suspect_start + m.len, len - m.suspect_start - m.len));
+                    }
+                    for t in &group_lines {
+                        let rel = t.current_idx - start_idx;
+                        if rel < off + m.suspect_start || rel >= off + m.suspect_start + m.len {
+                            continue;
+                        }
+                        let parent_line = m.parent_start + (rel - off - m.suspect_start);
+                        let pb = source_blame
+                            .iter()
+                            .find(|l| l.final_lineno == parent_line + 1)
+                            .cloned()
+                            .unwrap_or_else(|| {
+                                blame_line_at_path(
+                                    parent_oid,
+                                    parent_line + 1,
+                                    parent_line + 1,
+                                    final_line_display(final_text, t.final_lineno),
+                                    &source_path,
+                                    None,
+                                    false,
+                                    false,
+                                )
+                            });
+                        result.push(blame_line_from_parent(
+                            &pb,
+                            t.final_lineno,
+                            final_line_display(final_text, t.final_lineno),
+                            pb.source_file.clone().or_else(|| Some(source_path.clone())),
+                            pb.ignored || t.ignored,
+                            pb.unblamable,
+                        ));
+                    }
+                }
+                still_pending.extend(group_pending);
+            }
+            work = still_pending;
+            if !made_progress {
+                break;
+            }
         }
     }
     Ok((work, parent_handoff, result))
@@ -4276,7 +4348,12 @@ fn collect_tree_file_entries(
 ) -> Result<()> {
     let obj = read_object_for_blame(odb, tree_oid, None)?;
     if obj.kind != ObjectKind::Tree {
-        return Err(LibError::Message("expected tree".to_string()));
+        return Err(ObjectError::UnexpectedKind {
+            oid: *tree_oid,
+            expected: ObjectKind::Tree,
+            actual: obj.kind,
+        }
+        .into());
     }
     let entries = parse_tree(&obj.data)?;
     for entry in entries {
@@ -4291,22 +4368,29 @@ fn collect_tree_file_entries(
 }
 
 fn get_blame_commit(
-    odb: &Odb,
+    session: &BlameSession<'_>,
     oid: ObjectId,
     cache: &mut BlameCommitCache,
-    graph: Option<&CommitGraphChain>,
 ) -> Result<Arc<BlameCommitMeta>> {
     if let Some(c) = cache.metas.get(&oid) {
         return Ok(Arc::clone(c));
     }
-    let meta = if let Some(chain) = graph {
-        if let Some((tree, parents)) = chain.graph_commit_meta(&oid) {
-            Arc::new(BlameCommitMeta { tree, parents })
+    let unreplaced = session
+        .repo
+        .map(|repo| repo.object_id_after_replace(&oid) == oid)
+        .unwrap_or(true);
+    let meta = if unreplaced {
+        if let Some(chain) = session.commit_graph.as_deref() {
+            if let Some((tree, parents)) = chain.graph_commit_meta(&oid) {
+                Arc::new(BlameCommitMeta { tree, parents })
+            } else {
+                load_blame_commit_from_object(session, oid, &mut cache.pack)?
+            }
         } else {
-            load_blame_commit_from_object(odb, oid, &mut cache.pack)?
+            load_blame_commit_from_object(session, oid, &mut cache.pack)?
         }
     } else {
-        load_blame_commit_from_object(odb, oid, &mut cache.pack)?
+        load_blame_commit_from_object(session, oid, &mut cache.pack)?
     };
     cache.metas.insert(oid, Arc::clone(&meta));
     Ok(meta)
@@ -4315,11 +4399,15 @@ fn get_blame_commit(
 /// Read only the tree and parent headers; author and summary are loaded later, and
 /// only for the commits that end up owning lines.
 fn load_blame_commit_from_object(
-    odb: &Odb,
+    session: &BlameSession<'_>,
     oid: ObjectId,
     pack: &mut SessionPackReader,
 ) -> Result<Arc<BlameCommitMeta>> {
-    let (tree, parents) = pack.commit_tree_and_parents(odb, &oid)?;
+    let read_oid = session
+        .repo
+        .map(|repo| repo.object_id_after_replace(&oid))
+        .unwrap_or(oid);
+    let (tree, parents) = pack.commit_tree_and_parents(session.odb, &read_oid)?;
     Ok(Arc::new(BlameCommitMeta { tree, parents }))
 }
 
@@ -4341,7 +4429,14 @@ fn advance_across_unchanged_first_parents(
         if grafts.contains_key(&current_oid) {
             break;
         }
-        let parent_oid = if let Some(ref chain) = chain {
+        let parent_oid = if session
+            .repo
+            .is_some_and(|repo| repo.object_id_after_replace(&current_oid) != current_oid)
+        {
+            commit_parents_for_blame(odb, current_oid, grafts, commit_cache, session)?
+                .first()
+                .copied()
+        } else if let Some(ref chain) = chain {
             if let Some((parents, _)) = chain.graph_commit(&current_oid) {
                 parents.first().copied()
             } else {
@@ -4448,20 +4543,22 @@ fn bloom_precheck_definitely_not(
 /// Parent OIDs stored in the commit object (or commit-graph), ignoring grafts.
 fn commit_object_parents(
     session: &BlameSession<'_>,
-    odb: &Odb,
+    _odb: &Odb,
     oid: ObjectId,
     cache: &mut BlameCommitCache,
 ) -> Result<Vec<ObjectId>> {
-    if let Some(chain) = session.commit_graph.as_ref() {
-        if let Some((parents, _commit_time)) = chain.graph_commit(&oid) {
-            return Ok(parents);
+    if session
+        .repo
+        .map(|repo| repo.object_id_after_replace(&oid) == oid)
+        .unwrap_or(true)
+    {
+        if let Some(chain) = session.commit_graph.as_ref() {
+            if let Some((parents, _commit_time)) = chain.graph_commit(&oid) {
+                return Ok(parents);
+            }
         }
     }
-    Ok(
-        get_blame_commit(odb, oid, cache, session.commit_graph.as_deref())?
-            .parents
-            .clone(),
-    )
+    Ok(get_blame_commit(session, oid, cache)?.parents.clone())
 }
 
 /// Parent list for a commit, honoring `.git/info/grafts` (same rules as `git rev-list`).
@@ -4472,19 +4569,22 @@ fn commit_parents_for_blame(
     cache: &mut BlameCommitCache,
     session: &BlameSession<'_>,
 ) -> Result<Vec<ObjectId>> {
+    let _ = odb;
     if let Some(p) = grafts.get(&oid) {
         return Ok(p.clone());
     }
-    if let Some(chain) = session.commit_graph.as_ref() {
-        if let Some((parents, _)) = chain.graph_commit(&oid) {
-            return Ok(parents);
+    if session
+        .repo
+        .map(|repo| repo.object_id_after_replace(&oid) == oid)
+        .unwrap_or(true)
+    {
+        if let Some(chain) = session.commit_graph.as_ref() {
+            if let Some((parents, _)) = chain.graph_commit(&oid) {
+                return Ok(parents);
+            }
         }
     }
-    Ok(
-        get_blame_commit(odb, oid, cache, session.commit_graph.as_deref())?
-            .parents
-            .clone(),
-    )
+    Ok(get_blame_commit(session, oid, cache)?.parents.clone())
 }
 
 /// Resolve a Git-style `-L` range against the blob at `start` for `path`.
@@ -4496,7 +4596,7 @@ fn commit_parents_for_blame(
 /// # Errors
 ///
 /// Returns [`LineRangeError`] when the spec is invalid or out of range for the file at `start`.
-pub fn resolve_blame_line_range(
+pub(crate) fn resolve_blame_line_range(
     repo: &crate::repo::Repository,
     start: crate::objects::ObjectId,
     path: &str,
@@ -4523,7 +4623,7 @@ pub fn resolve_blame_line_range(
 ///
 /// Returns [`LineRangeError`] when the spec is invalid or out of range, or when the
 /// final text cannot be loaded (reported as [`LineRangeError::InvalidSpec`]).
-pub fn resolve_blame_line_range_with_options(
+pub(crate) fn resolve_blame_line_range_with_options(
     repo: &crate::repo::Repository,
     path: &str,
     spec: &str,
@@ -4539,7 +4639,9 @@ pub fn resolve_blame_line_range_with_options(
     };
     let file_path = normalize_blame_path(repo, path);
     let start = resolve_blame_start(repo, options.start).map_err(|e| invalid(e.to_string()))?;
-    let commit = get_blame_commit(repo.odb(), start, &mut BlameCommitCache::default(), None)
+    let thread_policy = repo.thread_policy();
+    let session = BlameSession::new(repo.odb(), Some(repo), None, false, &thread_policy);
+    let commit = get_blame_commit(&session, start, &mut BlameCommitCache::default())
         .map_err(|e| invalid(e.to_string()))?;
     let overlay = load_blame_overlay(
         repo,
@@ -4568,16 +4670,23 @@ pub fn resolve_blame_line_range_with_options(
             String::from_utf8_lossy(&content_bytes).into_owned().into()
         }
     };
-    let config = repo.config().map(|c| (*c).clone()).unwrap_or_default();
+    let config = repo
+        .config()
+        .snapshot()
+        .map(|c| (*c).clone())
+        .unwrap_or_default();
     let parsed = load_gitattributes_for_check_attr_source(repo, &commit.tree)
         .map_err(|e| invalid(e.to_string()))?;
     let matcher =
         matcher_for_path_parsed(&config, &parsed.rules, &parsed.macros, &file_path, false)
-            .map_err(invalid)?;
+            .map_err(|e| invalid(e.to_string()))?;
     resolve_line_range(spec, &content, &file_path, &config, matcher.as_ref(), 1)
 }
 
 /// Copy detection depth for blame, matching Git's repeated `-C` flag.
+///
+/// Any level other than [`Off`](Self::Off) also enables within-file move detection, matching
+/// Git's rule that `-C` implies `-M` (see [`BlameOptions::move_detection_enabled`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CopyDetection {
     /// No copy detection (default).
@@ -4607,16 +4716,14 @@ impl CopyDetection {
     ///
     /// # Errors
     ///
-    /// Returns [`LibError::Message`] when `count` is greater than three.
+    /// Returns [`DiffError::BlameCopyLevelTooHigh`] when `count` is greater than three.
     pub fn from_count(count: usize) -> Result<Self> {
         match count {
             0 => Ok(Self::Off),
             1 => Ok(Self::FromModifiedFiles),
             2 => Ok(Self::FromCreatingCommit),
             3 => Ok(Self::FromAnyCommit),
-            _ => Err(LibError::Message(
-                "blame copy detection: at most three -C flags are supported".into(),
-            )),
+            _ => Err(DiffError::BlameCopyLevelTooHigh { count }.into()),
         }
     }
 
@@ -4644,12 +4751,24 @@ pub struct BlameOptions {
     pub whitespace: crate::diff::WhitespaceMode,
     /// Copy detection depth (Git `-C`, `-C -C`, `-C -C -C`).
     pub copy_detection: CopyDetection,
+    /// Detect lines moved within the same file (Git `-M`). When false, moved blocks stay on
+    /// the commit that relocated them unless [`copy_detection`](Self::copy_detection) is not
+    /// [`CopyDetection::Off`], which enables move detection the same way Git's `-C` implies `-M`.
+    pub move_detection: bool,
     /// Which version of the file supplies the blamed lines. The default blames the file as
     /// committed at `start`.
     pub final_source: BlameFinalSource,
     /// Author time reported in [`BlameResult::commits`] for uncommitted lines (Git reports
     /// the current time). The library never reads the clock; `None` reports `0`.
     pub now: Option<time::OffsetDateTime>,
+}
+
+impl BlameOptions {
+    /// Whether within-file move detection runs for this blame request.
+    #[must_use]
+    pub fn move_detection_enabled(&self) -> bool {
+        self.move_detection || self.copy_detection != CopyDetection::Off
+    }
 }
 
 /// Which version of the blamed file [`blame_file`] attributes, line by line.
@@ -4672,6 +4791,35 @@ pub enum BlameFinalSource {
     /// Caller-supplied file content, such as an editor buffer with unsaved edits
     /// (Git's `blame --contents`). The bytes get the same clean conversion as a worktree file.
     Contents(Vec<u8>),
+}
+
+/// Email shown in the placeholder identity of uncommitted lines (Git's porcelain `author-mail`).
+pub(crate) const UNCOMMITTED_EMAIL: &str = "not.committed.yet";
+
+impl BlameFinalSource {
+    /// Author name Git's porcelain blame gives lines that exist only in this source:
+    /// `External file (--contents)` for [`Contents`](Self::Contents), `Not Committed Yet`
+    /// otherwise.
+    #[must_use]
+    pub const fn uncommitted_author_name(&self) -> &'static str {
+        match self {
+            Self::Contents(_) => "External file (--contents)",
+            Self::Revision | Self::Worktree => "Not Committed Yet",
+        }
+    }
+
+    /// Commit metadata [`blame_file`] reports for uncommitted lines: the
+    /// [`uncommitted_author_name`](Self::uncommitted_author_name) as author name and summary,
+    /// [`UNCOMMITTED_EMAIL`] as email, and `author_time` at UTC.
+    #[must_use]
+    pub(crate) fn uncommitted_commit_info(&self, author_time: i64) -> BlameCommitInfo {
+        let label = self.uncommitted_author_name();
+        BlameCommitInfo {
+            author: format!("{label} <{UNCOMMITTED_EMAIL}> {author_time} +0000"),
+            author_time,
+            summary: label.to_owned(),
+        }
+    }
 }
 
 /// One blamed line returned by [`blame_file`].
@@ -4697,6 +4845,8 @@ pub struct BlameAttributedLine {
     pub ignored: bool,
     /// Line could not be blamed past an ignored revision.
     pub unblamable: bool,
+    /// Commit has no effective parents (repository root or shallow boundary).
+    pub boundary: bool,
     /// Line exists only in the uncommitted content selected by
     /// [`BlameOptions::final_source`]. `commit` is then the null object id and
     /// `original_line` equals `final_line`.
@@ -4722,13 +4872,19 @@ pub struct BlameHunk {
     pub ignored: bool,
     /// Set when every line in the hunk could not be blamed past an ignored revision.
     pub unblamable: bool,
+    /// Set when the hunk's lines exist only in the uncommitted final content
+    /// ([`BlameAttributedLine::not_committed`]); `commit` is then the null object id.
+    pub not_committed: bool,
+    /// Indices of this hunk's lines in [`BlameResult::lines`]; see [`BlameResult::hunk_lines`].
+    pub lines: std::ops::Range<usize>,
 }
 
 /// Metadata for a commit referenced by [`BlameResult::lines`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlameCommitInfo {
     /// Author identity line (`Name <email> <epoch> <tz>`); empty when the commit has no
-    /// `author` header.
+    /// `author` header. For uncommitted lines this is the placeholder identity Git reports
+    /// (see [`BlameFinalSource::uncommitted_author_name`]).
     pub author: String,
     /// Author timestamp (Unix seconds); `0` when the author line has none.
     pub author_time: i64,
@@ -4758,20 +4914,170 @@ impl BlameResult {
             let extend =
                 i < self.lines.len() && blame_lines_share_hunk(&self.lines[i - 1], &self.lines[i]);
             if !extend {
-                let slice = &self.lines[start..i];
+                let first = &self.lines[start];
                 out.push(BlameHunk {
-                    commit: slice[0].commit,
-                    original_path: slice[0].original_path.clone(),
-                    original_start: slice[0].original_line,
-                    final_start: slice[0].final_line,
-                    count: slice.len(),
-                    ignored: slice[0].ignored,
-                    unblamable: slice[0].unblamable,
+                    commit: first.commit,
+                    original_path: first.original_path.clone(),
+                    original_start: first.original_line,
+                    final_start: first.final_line,
+                    count: i - start,
+                    ignored: first.ignored,
+                    unblamable: first.unblamable,
+                    not_committed: first.not_committed,
+                    lines: start..i,
                 });
                 start = i;
             }
         }
         out
+    }
+
+    /// The lines of `hunk`, a hunk returned by `Self::hunks` on this result.
+    ///
+    /// Returns an empty slice when `hunk.lines` is out of range (a hunk from another result).
+    #[must_use]
+    pub fn hunk_lines(&self, hunk: &BlameHunk) -> &[BlameAttributedLine] {
+        self.lines.get(hunk.lines.clone()).unwrap_or_default()
+    }
+
+    /// Give the null-commit entry in [`Self::commits`] an author identity for display, named
+    /// the way Git's porcelain blame names uncommitted lines.
+    ///
+    /// [`blame_file`] leaves that entry's `author` and `summary` empty. This fills the author
+    /// line as `<name> <not.committed.yet> <author_time> +0000` and the summary as `<name>`,
+    /// where the name is [`BlameFinalSource::uncommitted_author_name`] for `source` (the
+    /// [`BlameOptions::final_source`] the result was computed with). The email is
+    /// `not.committed.yet` for every source. An entry whose author is already set, or a
+    /// result with no uncommitted lines, is left unchanged.
+    #[allow(dead_code)]
+    fn name_uncommitted_author(&mut self, source: &BlameFinalSource) {
+        let Some(info) = self.commits.get_mut(&ObjectId::zero()) else {
+            return;
+        };
+        if !info.author.is_empty() {
+            return;
+        }
+        let name = source.uncommitted_author_name();
+        info.author = format!("{name} <not.committed.yet> {} +0000", info.author_time);
+        name.clone_into(&mut info.summary);
+    }
+}
+
+#[cfg(feature = "serde-models")]
+fn blame_line_bytes_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[cfg(feature = "serde-models")]
+impl serde::Serialize for BlameAttributedLine {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+
+        let field_count = if self.content_bytes.is_some() { 10 } else { 9 };
+        let mut out = serializer.serialize_struct("BlameAttributedLine", field_count)?;
+        out.serialize_field("commit", &self.commit)?;
+        out.serialize_field("original_line", &self.original_line)?;
+        out.serialize_field("final_line", &self.final_line)?;
+        out.serialize_field("original_path", &self.original_path)?;
+        out.serialize_field("content", &self.content)?;
+        out.serialize_field("encoding_lossy", &self.encoding_lossy)?;
+        if let Some(bytes) = &self.content_bytes {
+            out.serialize_field("content_bytes", &blame_line_bytes_hex(bytes))?;
+        }
+        out.serialize_field("ignored", &self.ignored)?;
+        out.serialize_field("unblamable", &self.unblamable)?;
+        out.serialize_field("boundary", &self.boundary)?;
+        out.serialize_field("not_committed", &self.not_committed)?;
+        out.end()
+    }
+}
+
+#[cfg(feature = "serde-models")]
+#[derive(serde::Serialize)]
+struct BlameHunkLineRange {
+    start: usize,
+    end: usize,
+}
+
+#[cfg(feature = "serde-models")]
+impl serde::Serialize for BlameHunk {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+
+        let lines = BlameHunkLineRange {
+            start: self.lines.start,
+            end: self.lines.end,
+        };
+        let mut out = serializer.serialize_struct("BlameHunk", 9)?;
+        out.serialize_field("commit", &self.commit)?;
+        out.serialize_field("original_path", &self.original_path)?;
+        out.serialize_field("original_start", &self.original_start)?;
+        out.serialize_field("final_start", &self.final_start)?;
+        out.serialize_field("count", &self.count)?;
+        out.serialize_field("ignored", &self.ignored)?;
+        out.serialize_field("unblamable", &self.unblamable)?;
+        out.serialize_field("not_committed", &self.not_committed)?;
+        out.serialize_field("lines", &lines)?;
+        out.end()
+    }
+}
+
+#[cfg(feature = "serde-models")]
+impl serde::Serialize for BlameCommitInfo {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use crate::ident::Signature;
+        use serde::ser::SerializeStruct;
+
+        let author = Signature::from_header_lossy(&self.author);
+        let mut out = serializer.serialize_struct("BlameCommitInfo", 2)?;
+        out.serialize_field("author", &author)?;
+        out.serialize_field("summary", &self.summary)?;
+        out.end()
+    }
+}
+
+#[cfg(feature = "serde-models")]
+struct SortedBlameCommits<'a>(&'a HashMap<ObjectId, BlameCommitInfo>);
+
+#[cfg(feature = "serde-models")]
+impl serde::Serialize for SortedBlameCommits<'_> {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+
+        let mut keys: Vec<_> = self.0.keys().collect();
+        keys.sort_by_key(|oid| oid.as_bytes());
+        let mut map = serializer.serialize_map(Some(keys.len()))?;
+        for oid in keys {
+            map.serialize_entry(&oid.to_hex(), &self.0[oid])?;
+        }
+        map.end()
+    }
+}
+
+#[cfg(feature = "serde-models")]
+impl serde::Serialize for BlameResult {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+
+        let mut out = serializer.serialize_struct("BlameResult", 2)?;
+        out.serialize_field("lines", &self.lines)?;
+        out.serialize_field("commits", &SortedBlameCommits(&self.commits))?;
+        out.end()
     }
 }
 
@@ -4780,6 +5086,8 @@ fn blame_lines_share_hunk(prev: &BlameAttributedLine, next: &BlameAttributedLine
         && prev.original_path == next.original_path
         && prev.ignored == next.ignored
         && prev.unblamable == next.unblamable
+        && prev.boundary == next.boundary
+        && prev.not_committed == next.not_committed
         && next.original_line == prev.original_line + 1
         && next.final_line == prev.final_line + 1
 }
@@ -4811,14 +5119,26 @@ fn blame_lines_share_hunk(prev: &BlameAttributedLine, next: &BlameAttributedLine
 /// worktree file cannot be read or cleaned, when the path is in no parent and not in the
 /// index ([`crate::rev_parse_error::RevParseError::PathNotInRevision`]), and for
 /// [`BlameFinalSource::Worktree`] in a bare repository
-/// ([`LibError::BlameWorktreeBareRepository`]).
-pub fn blame_file(repo: &Repository, path: &str, options: &BlameOptions) -> Result<BlameResult> {
+/// ([`crate::error::DiffError::BlameWorktreeBareRepository`]).
+pub(crate) fn blame_file(
+    repo: &Repository,
+    path: &str,
+    options: &BlameOptions,
+) -> Result<BlameResult> {
     let start_oid = resolve_blame_start(repo, options.start)?;
     let file_path = normalize_blame_path(repo, path);
-    let config = repo.config().map(|cfg| (*cfg).clone()).unwrap_or_default();
-    let grafts = crate::rev_parse::load_graft_parents(repo.git_dir());
+    let config = repo
+        .config()
+        .snapshot()
+        .map(|cfg| (*cfg).clone())
+        .unwrap_or_default();
+    let mut grafts = crate::rev_parse::load_graft_parents(repo.git_dir());
+    for oid in crate::shallow::load_shallow_boundaries(repo.git_dir()) {
+        grafts.entry(oid).or_default();
+    }
+    let parent_ctx = crate::shallow::EffectiveCommitParents::load(repo);
     let diff_algorithm = config
-        .get("diff.algorithm")
+        .value("diff.algorithm")
         .as_ref()
         .and_then(|name| parse_diff_algorithm_name(name))
         .unwrap_or(BlameDiffAlgorithm::Myers);
@@ -4831,7 +5151,7 @@ pub fn blame_file(repo: &Repository, path: &str, options: &BlameOptions) -> Resu
         .map(|_| repo.odb().with_bounded_pack_cache());
     let odb = bounded_odb.as_ref().unwrap_or(repo.odb());
     let thread_policy = repo.thread_policy();
-    let mut session = BlameSession::new(odb, None, false, &thread_policy);
+    let mut session = BlameSession::new(odb, Some(repo), None, false, &thread_policy);
     session.whitespace = options.whitespace;
     session.commit_graph = repo.odb().commit_graph_chain();
     let revision_label = blame_revision_label(options.start, start_oid);
@@ -4844,6 +5164,7 @@ pub fn blame_file(repo: &Repository, path: &str, options: &BlameOptions) -> Resu
         options.copy_detection,
     )?;
     let copy_depth = options.copy_detection.depth();
+    let move_detection = options.move_detection_enabled();
     session.cache_pair_maps = !ignore_revs.is_empty() || copy_depth > 0;
     let (lines, commits) = odb.with_pack_read_context(
         || -> Result<(Vec<BlameAttributedLine>, HashMap<ObjectId, BlameCommitInfo>)> {
@@ -4857,6 +5178,7 @@ pub fn blame_file(repo: &Repository, path: &str, options: &BlameOptions) -> Resu
                 None,
                 false,
                 copy_depth,
+                move_detection,
                 options.first_parent_only,
                 &grafts,
                 indent_heuristic,
@@ -4865,19 +5187,29 @@ pub fn blame_file(repo: &Repository, path: &str, options: &BlameOptions) -> Resu
                 &mut session,
             )?;
 
+            let mut boundary_cache: HashMap<ObjectId, bool> = HashMap::new();
             let lines: Vec<BlameAttributedLine> = raw
                 .into_iter()
-                .map(|line| BlameAttributedLine {
-                    commit: line.oid,
-                    original_line: line.orig_lineno,
-                    final_line: line.final_lineno,
-                    original_path: line.original_path,
-                    content: line.content,
-                    encoding_lossy: line.encoding_lossy,
-                    content_bytes: line.content_bytes,
-                    ignored: line.ignored,
-                    unblamable: line.unblamable,
-                    not_committed: line.not_committed,
+                .map(|line| {
+                    let boundary = *boundary_cache.entry(line.oid).or_insert_with(|| {
+                        repo.odb()
+                            .read_commit(&line.oid)
+                            .ok()
+                            .is_some_and(|c| parent_ctx.is_history_root(line.oid, &c.parents))
+                    });
+                    BlameAttributedLine {
+                        commit: line.oid,
+                        original_line: line.orig_lineno,
+                        final_line: line.final_lineno,
+                        original_path: line.original_path,
+                        content: line.content,
+                        encoding_lossy: line.encoding_lossy,
+                        content_bytes: line.content_bytes,
+                        ignored: line.ignored,
+                        unblamable: line.unblamable,
+                        boundary,
+                        not_committed: line.not_committed,
+                    }
                 })
                 .collect();
 
@@ -4885,11 +5217,9 @@ pub fn blame_file(repo: &Repository, path: &str, options: &BlameOptions) -> Resu
             for line in &lines {
                 commits.entry(line.commit).or_insert_with(|| {
                     if line.not_committed {
-                        BlameCommitInfo {
-                            author: String::new(),
-                            author_time: options.now.map_or(0, |now| now.unix_timestamp()),
-                            summary: String::new(),
-                        }
+                        options.final_source.uncommitted_commit_info(
+                            options.now.map_or(0, |now| now.unix_timestamp()),
+                        )
                     } else {
                         load_blame_commit_info(odb, line.commit)
                     }
@@ -4911,6 +5241,41 @@ fn blame_revision_label(start: Option<ObjectId>, start_oid: ObjectId) -> String 
     }
 }
 
+/// Worktree path absent on disk: blame the revision when the path still exists at `start_oid`.
+fn blame_worktree_missing_path(
+    repo: &Repository,
+    odb: &Odb,
+    start_oid: ObjectId,
+    revision_label: &str,
+    file_path: &str,
+    path_bytes: &[u8],
+    index: &mut Option<Index>,
+) -> Result<Option<BlameOverlay>> {
+    let thread_policy = repo.thread_policy();
+    let session = BlameSession::new(odb, Some(repo), None, false, &thread_policy);
+    let start_tree = get_blame_commit(&session, start_oid, &mut BlameCommitCache::default())?.tree;
+    if resolve_path_in_tree_entry(odb, &start_tree, file_path)?.is_some() {
+        return Ok(None);
+    }
+    let staged = loaded_index(repo, index)?;
+    let mut known = (0..=3).any(|stage| staged.get(path_bytes, stage).is_some());
+    if !known {
+        let mut parents = vec![start_oid];
+        parents.extend(crate::state::read_merge_heads(repo.git_dir())?);
+        for parent in &parents[1..] {
+            if known {
+                break;
+            }
+            let tree = get_blame_commit(&session, *parent, &mut BlameCommitCache::default())?.tree;
+            known = resolve_path_in_tree_entry(odb, &tree, file_path)?.is_some();
+        }
+    }
+    if !known {
+        return Err(blame_path_missing_in_revision(file_path, revision_label));
+    }
+    Ok(None)
+}
+
 /// Load the uncommitted final text `source` selects as an overlay on `start_oid`.
 ///
 /// Returns `None` for [`BlameFinalSource::Revision`] and when the text hashes to the blob
@@ -4929,7 +5294,11 @@ fn load_blame_overlay(
         BlameFinalSource::Contents(bytes) => Some(bytes.as_slice()),
     };
     let odb = repo.odb();
-    let config = repo.config().map(|c| (*c).clone()).unwrap_or_default();
+    let config = repo
+        .config()
+        .snapshot()
+        .map(|c| (*c).clone())
+        .unwrap_or_default();
     let path_bytes = storage_bytes(file_path);
     let rel_match = crate::repo_relpath::as_utf8_for_matching(file_path);
     let conv = crate::crlf::ConversionConfig::from_config(&config);
@@ -4942,13 +5311,27 @@ fn load_blame_overlay(
     let bytes = match (supplied, repo.work_tree(), attrs.as_ref()) {
         (None, Some(work_tree), Some(attrs)) => {
             let abs = crate::repo_relpath::worktree_abs(work_tree, file_path);
-            let meta = std::fs::symlink_metadata(&abs).map_err(|source| {
-                crate::worktree::map_worktree_io(
-                    rel_match.as_ref(),
-                    crate::worktree::WorktreePathOperation::Metadata,
-                    source,
-                )
-            })?;
+            let meta = match std::fs::symlink_metadata(&abs) {
+                Ok(meta) => meta,
+                Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                    return blame_worktree_missing_path(
+                        repo,
+                        odb,
+                        start_oid,
+                        revision_label,
+                        file_path,
+                        &path_bytes,
+                        &mut index,
+                    );
+                }
+                Err(source) => {
+                    return Err(crate::worktree::map_worktree_io(
+                        rel_match.as_ref(),
+                        crate::worktree::WorktreePathOperation::Metadata,
+                        source,
+                    ));
+                }
+            };
             let index_entry = if crate::crlf::clean_uses_autocrlf_index_guard(attrs, &conv) {
                 loaded_index(repo, &mut index)?.get(&path_bytes, 0)
             } else {
@@ -4965,15 +5348,17 @@ fn load_blame_overlay(
                 None,
             )?
         }
-        (None, _, _) => return Err(LibError::BlameWorktreeBareRepository),
+        (None, _, _) => return Err(LibError::Diff(DiffError::BlameWorktreeBareRepository)),
         (Some(bytes), _, Some(attrs)) => {
             crate::crlf::convert_to_git(bytes, rel_match.as_ref(), &conv, attrs)
-                .map_err(LibError::Filter)?
+                .map_err(|e| LibError::Worktree(WorktreeError::Filter(e)))?
         }
         (Some(bytes), _, None) => bytes.to_vec(),
     };
 
-    let start_tree = get_blame_commit(odb, start_oid, &mut BlameCommitCache::default(), None)?.tree;
+    let thread_policy = repo.thread_policy();
+    let session = BlameSession::new(odb, Some(repo), None, false, &thread_policy);
+    let start_tree = get_blame_commit(&session, start_oid, &mut BlameCommitCache::default())?.tree;
     let start_blob = resolve_path_in_tree_entry(odb, &start_tree, file_path)?;
     if let Some((blob, _)) = start_blob {
         if odb.hash(ObjectKind::Blob, &bytes)? == blob {
@@ -4989,7 +5374,7 @@ fn load_blame_overlay(
             if known {
                 break;
             }
-            let tree = get_blame_commit(odb, *parent, &mut BlameCommitCache::default(), None)?.tree;
+            let tree = get_blame_commit(&session, *parent, &mut BlameCommitCache::default())?.tree;
             known = resolve_path_in_tree_entry(odb, &tree, file_path)?.is_some();
         }
         if !known {
@@ -5036,13 +5421,12 @@ fn resolve_blame_start(repo: &Repository, start: Option<ObjectId>) -> Result<Obj
     if let Some(oid) = start {
         return crate::revwalk::rev_parse::peel_to_commit_for_merge_base(repo, oid);
     }
-    use crate::state::{resolve_head, HeadState};
-    match resolve_head(repo.git_dir())? {
+    use crate::state::{resolve_head_for_repository, HeadState};
+    match resolve_head_for_repository(repo)? {
         HeadState::Detached { oid } => Ok(oid),
         HeadState::Branch { oid: Some(oid), .. } => Ok(oid),
-        HeadState::Branch { oid: None, .. } | HeadState::Invalid => Err(LibError::Message(
-            "cannot blame: HEAD does not point to a commit".to_string(),
-        )),
+        HeadState::Branch { oid: None, .. } => Err(RefError::UnbornHead.into()),
+        HeadState::Invalid => Err(RefError::InvalidHead.into()),
     }
 }
 
@@ -5103,6 +5487,41 @@ fn author_epoch_from_identity(identity: &str) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn group_contiguous_tracked_dedupes_shared_current_idx() {
+        let pending = vec![
+            TrackedLine {
+                final_lineno: 1,
+                current_idx: 0,
+                ignored: false,
+                source_path: None,
+                origin: 0,
+            },
+            TrackedLine {
+                final_lineno: 2,
+                current_idx: 0,
+                ignored: false,
+                source_path: None,
+                origin: 0,
+            },
+            TrackedLine {
+                final_lineno: 3,
+                current_idx: 1,
+                ignored: false,
+                source_path: None,
+                origin: 0,
+            },
+            TrackedLine {
+                final_lineno: 4,
+                current_idx: 1,
+                ignored: false,
+                source_path: None,
+                origin: 0,
+            },
+        ];
+        assert_eq!(group_contiguous_tracked(&pending), vec![(0, 2)]);
+    }
 
     #[test]
     fn blob_lines_preserves_interior_and_trailing_blank_lines() {
@@ -5232,7 +5651,12 @@ mod tests {
             "}",
         ];
         let diff = build_line_map(&old, &new, BlameDiffAlgorithm::Myers, true);
-        let map = build_exact_relocate_line_map(&old, &new, &diff);
+        let map = build_exact_relocate_line_map_ws(
+            &old,
+            &new,
+            &diff,
+            crate::diff::WhitespaceMode::default(),
+        );
         let (_, flags) = build_line_map_with_changed_flags(
             &old,
             &new,
@@ -5555,7 +5979,12 @@ mod tests {
         let par = ["a", "b", "c", "d"];
         let cur = ["d", "a", "b", "c"];
         let diff = build_line_map(&par, &cur, BlameDiffAlgorithm::Myers, false);
-        let map = build_exact_relocate_line_map(&par, &cur, &diff);
+        let map = build_exact_relocate_line_map_ws(
+            &par,
+            &cur,
+            &diff,
+            crate::diff::WhitespaceMode::default(),
+        );
         let xdiff = crate::diff::xdiff_new_line_changed_flags(&par, &cur, false);
         let blame = blame_stops_on_current_commit(&diff, &map, &xdiff);
         assert_eq!(blame, vec![true, false, false, false]);
@@ -5566,7 +5995,12 @@ mod tests {
         let par = ["alpha ONE", "inserted", " gamma three"];
         let cur = ["alpha ONE", " gamma three", "inserted"];
         let diff = build_line_map(&par, &cur, BlameDiffAlgorithm::Myers, false);
-        let map = build_exact_relocate_line_map(&par, &cur, &diff);
+        let map = build_exact_relocate_line_map_ws(
+            &par,
+            &cur,
+            &diff,
+            crate::diff::WhitespaceMode::default(),
+        );
         let xdiff = crate::diff::xdiff_new_line_changed_flags(&par, &cur, false);
         let blame = blame_stops_on_current_commit(&diff, &map, &xdiff);
         assert_eq!(blame, vec![false, false, true]);
@@ -5577,7 +6011,12 @@ mod tests {
         let par = ["a", "b", "c", "d"];
         let cur = ["d", "a", "c", "b"];
         let diff = build_line_map(&par, &cur, BlameDiffAlgorithm::Myers, false);
-        let map = build_exact_relocate_line_map(&par, &cur, &diff);
+        let map = build_exact_relocate_line_map_ws(
+            &par,
+            &cur,
+            &diff,
+            crate::diff::WhitespaceMode::default(),
+        );
         let xdiff = crate::diff::xdiff_new_line_changed_flags(&par, &cur, false);
         let blame = blame_stops_on_current_commit(&diff, &map, &xdiff);
         assert_eq!(blame, vec![true, false, false, true]);
@@ -5588,7 +6027,12 @@ mod tests {
         let par = ["a", "b", "c", "d"];
         let cur = ["a", "d", "c", "b"];
         let diff = build_line_map(&par, &cur, BlameDiffAlgorithm::Myers, false);
-        let map = build_exact_relocate_line_map(&par, &cur, &diff);
+        let map = build_exact_relocate_line_map_ws(
+            &par,
+            &cur,
+            &diff,
+            crate::diff::WhitespaceMode::default(),
+        );
         let xdiff = crate::diff::xdiff_new_line_changed_flags(&par, &cur, false);
         let blame = blame_stops_on_current_commit(&diff, &map, &xdiff);
         assert_eq!(blame, vec![false, false, true, true]);
@@ -5598,10 +6042,11 @@ mod tests {
     fn fuzzy_line_map_recovers_moved_unchanged_line() {
         let par = ["alpha ONE", "inserted", " gamma three"];
         let cur = ["alpha ONE", " gamma three", "inserted"];
-        let map = build_exact_relocate_line_map(
+        let map = build_exact_relocate_line_map_ws(
             &par,
             &cur,
             &build_line_map(&par, &cur, BlameDiffAlgorithm::Myers, false),
+            crate::diff::WhitespaceMode::default(),
         );
         assert_eq!(map[1], Some(2));
     }
@@ -5662,6 +6107,7 @@ mod tests {
                     content_bytes: None,
                     ignored: false,
                     unblamable: false,
+                    boundary: false,
                     not_committed: false,
                 },
                 BlameAttributedLine {
@@ -5674,6 +6120,7 @@ mod tests {
                     content_bytes: None,
                     ignored: false,
                     unblamable: false,
+                    boundary: false,
                     not_committed: false,
                 },
                 BlameAttributedLine {
@@ -5686,6 +6133,7 @@ mod tests {
                     content_bytes: None,
                     ignored: false,
                     unblamable: false,
+                    boundary: false,
                     not_committed: false,
                 },
             ],
@@ -5698,6 +6146,157 @@ mod tests {
         assert_eq!(hunks[0].final_start, 1);
         assert_eq!(hunks[1].count, 1);
         assert_eq!(hunks[1].original_path, "b.txt");
+        assert_eq!(
+            (hunks[0].lines.clone(), hunks[1].lines.clone()),
+            (0..2, 2..3)
+        );
+        let contents: Vec<_> = hunks
+            .iter()
+            .map(|h| {
+                result
+                    .hunk_lines(h)
+                    .iter()
+                    .map(|l| l.content.as_str())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(contents, [vec!["one", "two"], vec!["three"]]);
+        assert!(hunks.iter().all(|h| !h.not_committed));
+    }
+
+    fn uncommitted_result(lines: usize) -> BlameResult {
+        let committed =
+            crate::objects::ObjectId::from_hex("1111111111111111111111111111111111111111").unwrap();
+        let line = |n: usize, commit, not_committed| BlameAttributedLine {
+            commit,
+            original_line: n,
+            final_line: n,
+            original_path: "f.txt".to_owned(),
+            content: format!("line {n}"),
+            encoding_lossy: false,
+            content_bytes: None,
+            ignored: false,
+            unblamable: false,
+            boundary: false,
+            not_committed,
+        };
+        let mut all = vec![line(1, committed, false)];
+        all.extend((2..2 + lines).map(|n| line(n, ObjectId::zero(), true)));
+        let mut commits = HashMap::new();
+        commits.insert(
+            committed,
+            BlameCommitInfo {
+                author: "A U Thor <a@example.com> 100 +0000".to_owned(),
+                author_time: 100,
+                summary: "first".to_owned(),
+            },
+        );
+        if lines > 0 {
+            commits.insert(
+                ObjectId::zero(),
+                BlameCommitInfo {
+                    author: String::new(),
+                    author_time: 1_800_000_000,
+                    summary: String::new(),
+                },
+            );
+        }
+        BlameResult {
+            lines: all,
+            commits,
+        }
+    }
+
+    #[test]
+    fn blame_result_hunks_mark_uncommitted_runs() {
+        let result = uncommitted_result(2);
+        let hunks = result.hunks();
+        assert_eq!(hunks.len(), 2);
+        assert!(!hunks[0].not_committed);
+        assert!(hunks[1].not_committed && hunks[1].commit.is_zero());
+        assert_eq!((hunks[1].lines.clone(), hunks[1].count), (1..3, 2));
+        assert_eq!(result.hunk_lines(&hunks[1]), &result.lines[1..]);
+    }
+
+    #[test]
+    fn blame_result_hunk_lines_of_foreign_hunk_is_empty() {
+        let result = uncommitted_result(0);
+        let mut hunk = uncommitted_result(3).hunks().pop().unwrap();
+        assert!(result.hunk_lines(&hunk).is_empty());
+        hunk.lines = 3..1;
+        assert!(result.hunk_lines(&hunk).is_empty());
+    }
+
+    #[test]
+    fn uncommitted_author_name_follows_final_source() {
+        assert_eq!(
+            BlameFinalSource::Worktree.uncommitted_author_name(),
+            "Not Committed Yet"
+        );
+        assert_eq!(
+            BlameFinalSource::Revision.uncommitted_author_name(),
+            "Not Committed Yet"
+        );
+        assert_eq!(
+            BlameFinalSource::Contents(b"x\n".to_vec()).uncommitted_author_name(),
+            "External file (--contents)"
+        );
+    }
+
+    #[test]
+    fn name_uncommitted_author_fills_only_the_null_commit() {
+        let mut result = uncommitted_result(1);
+        result.name_uncommitted_author(&BlameFinalSource::Worktree);
+        let info = &result.commits[&ObjectId::zero()];
+        assert_eq!(
+            info.author,
+            "Not Committed Yet <not.committed.yet> 1800000000 +0000"
+        );
+        assert_eq!(info.summary, "Not Committed Yet");
+        assert_eq!(info.author_time, 1_800_000_000);
+        let committed = result.lines[0].commit;
+        assert_eq!(
+            result.commits[&committed].author,
+            "A U Thor <a@example.com> 100 +0000"
+        );
+
+        let before = result.clone();
+        result.name_uncommitted_author(&BlameFinalSource::Contents(Vec::new()));
+        assert_eq!(result, before, "an already named entry is kept");
+
+        let mut contents = uncommitted_result(1);
+        contents.name_uncommitted_author(&BlameFinalSource::Contents(Vec::new()));
+        let info = &contents.commits[&ObjectId::zero()];
+        assert_eq!(
+            info.author,
+            "External file (--contents) <not.committed.yet> 1800000000 +0000"
+        );
+        assert_eq!(info.summary, "External file (--contents)");
+
+        let mut clean = uncommitted_result(0);
+        let before = clean.clone();
+        clean.name_uncommitted_author(&BlameFinalSource::Worktree);
+        assert_eq!(clean, before);
+    }
+
+    #[test]
+    fn uncommitted_commit_info_depends_on_final_source() {
+        let contents = BlameFinalSource::Contents(b"x\n".to_vec());
+
+        let info = BlameFinalSource::Worktree.uncommitted_commit_info(1_800_000_000);
+        assert_eq!(
+            info.author,
+            "Not Committed Yet <not.committed.yet> 1800000000 +0000"
+        );
+        assert_eq!(info.author_time, 1_800_000_000);
+        assert_eq!(info.summary, "Not Committed Yet");
+
+        let info = contents.uncommitted_commit_info(0);
+        assert_eq!(
+            info.author,
+            "External file (--contents) <not.committed.yet> 0 +0000"
+        );
+        assert_eq!(info.summary, "External file (--contents)");
     }
 
     #[test]
@@ -5715,7 +6314,7 @@ mod tests {
 
     #[test]
     fn blame_file_resolves_nested_path_in_wide_root_tree() -> Result<()> {
-        use crate::objects::{serialize_tree, tree_entry_cmp, ObjectKind, TreeEntry};
+        use crate::objects::{serialize_tree, tree_name_cmp, ObjectKind, TreeEntry};
         use crate::repo::init_repository;
         use crate::RefStorageFormat;
         use std::fs;
@@ -5741,7 +6340,7 @@ mod tests {
             oid: sub_tree,
         });
         entries.sort_by(|a, b| {
-            tree_entry_cmp(&a.name, a.mode == 0o040000, &b.name, b.mode == 0o040000)
+            tree_name_cmp(&a.name, a.mode == 0o040000, &b.name, b.mode == 0o040000)
         });
         let root_tree = repo
             .odb()
@@ -5826,7 +6425,7 @@ mod tests {
         }
 
         let thread_policy = repo.thread_policy();
-        let mut session = BlameSession::new(repo.odb(), None, false, &thread_policy);
+        let mut session = BlameSession::new(repo.odb(), Some(&repo), None, false, &thread_policy);
         let lines = compute_blame_with_session(
             repo.odb(),
             tip,
@@ -5837,6 +6436,7 @@ mod tests {
             None,
             false,
             0,
+            false,
             false,
             &HashMap::new(),
             false,
@@ -5968,7 +6568,7 @@ mod tests {
             }]),
         )?;
         let policy = ThreadPolicy::default();
-        let mut session = BlameSession::new(repo.odb(), None, false, &policy);
+        let mut session = BlameSession::new(repo.odb(), Some(&repo), None, false, &policy);
         for entry in entries {
             let raw = crate::repo_relpath::join_rel(b"dir\xff", &entry.name);
             let stored = storage_string(&raw);
@@ -6001,7 +6601,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let repo = init_repository(dir.path(), false, "main", None, RefStorageFormat::Files)?;
         let policy = ThreadPolicy::default();
-        let mut session = BlameSession::new(repo.odb(), None, false, &policy);
+        let mut session = BlameSession::new(repo.odb(), Some(&repo), None, false, &policy);
         for version in [1, 2] {
             let settings = BloomFilterSettings {
                 hash_version: version,

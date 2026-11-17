@@ -264,7 +264,7 @@ fn create_commit_one_change_writes_only_changed_path_trees() {
             ..Default::default()
         },
         &mut NullProgress,
-        &crate::progress::NeverCancel,
+        &crate::progress::CancelToken::never(),
     )
     .unwrap();
 
@@ -300,7 +300,7 @@ fn create_commit_one_change_writes_only_changed_path_trees() {
             ..Default::default()
         },
         &mut NullProgress,
-        &crate::progress::NeverCancel,
+        &crate::progress::CancelToken::never(),
     )
     .unwrap();
     metrics.set_freshen_counting(false);
@@ -379,7 +379,7 @@ fn stage_one_modified_file_hashes_one_blob() {
         &repo,
         &StageOptions::default(),
         &mut NullProgress,
-        &crate::progress::NeverCancel,
+        &crate::progress::CancelToken::never(),
     )
     .unwrap();
     metrics.set_blob_counting(false);
@@ -440,7 +440,7 @@ fn pack_signature_not_restatted_per_object() {
             ..Default::default()
         },
         &mut NullProgress,
-        &crate::progress::NeverCancel,
+        &crate::progress::CancelToken::never(),
     )
     .unwrap();
 
@@ -452,7 +452,7 @@ fn pack_signature_not_restatted_per_object() {
     let warm_data = format!("pack:{warm_rel}");
     let _ = repo
         .odb()
-        .write_with_options(ObjectKind::Blob, warm_data.as_bytes(), Default::default())
+        .write_with(ObjectKind::Blob, warm_data.as_bytes(), Default::default())
         .unwrap();
 
     let index = repo.load_index().unwrap();
@@ -466,7 +466,7 @@ fn pack_signature_not_restatted_per_object() {
         let data = format!("pack:{rel}");
         let _ = repo
             .odb()
-            .write_with_options(ObjectKind::Blob, data.as_bytes(), Default::default())
+            .write_with(ObjectKind::Blob, data.as_bytes(), Default::default())
             .unwrap();
     }
     metrics.set_stamp_counting(false);
@@ -515,7 +515,7 @@ fn pack_signature_not_restatted_per_object() {
             ..Default::default()
         },
         &mut NullProgress,
-        &crate::progress::NeverCancel,
+        &crate::progress::CancelToken::never(),
     )
     .unwrap();
     metrics.set_stamp_counting(false);

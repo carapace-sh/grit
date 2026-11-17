@@ -8,8 +8,8 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 use grit_lib::config::environment::RepositoryOptions;
-use grit_lib::diff::hunk_id::{hunk_ids_with_duplicate_peers, DiffSide, HunkId};
-use grit_lib::porcelain::hunk_select::{restore_hunks, unstaged_file_diffs, HunkSelection};
+use grit_lib::diff::{hunk_ids_with_duplicate_peers, DiffSide, HunkId};
+use grit_lib::porcelain::hunk_select::HunkSelection;
 use grit_lib::repo::Repository;
 use grit_test_support::git;
 
@@ -59,9 +59,12 @@ fn loose_object_count(root: &Path) -> usize {
 
 fn unstaged_ids(repo: &Repository, path: &str) -> Vec<HunkId> {
     let pathspec = vec![path.to_string()];
-    let diffs = unstaged_file_diffs(repo, &pathspec).expect("unstaged diffs");
+    let diffs = repo
+        .index()
+        .unstaged_file_diffs(&pathspec)
+        .expect("unstaged diffs");
     let (file, peer) = diffs.first().expect("path is modified");
-    hunk_ids_with_duplicate_peers(DiffSide::Unstaged, path, &file.hunks, peer)
+    hunk_ids(DiffSide::Unstaged, path, &file.hunks, peer)
 }
 
 fn restore(repo: &Repository, ids: Vec<HunkId>, path: &str) {
@@ -69,7 +72,8 @@ fn restore(repo: &Repository, ids: Vec<HunkId>, path: &str) {
         ids,
         ranges: Vec::new(),
     };
-    restore_hunks(repo, &selection, &[path.to_string()], false, true, false)
+    repo.index()
+        .restore_hunks(&selection, &[path.to_string()], false, true, false)
         .expect("restore hunks");
 }
 
@@ -295,8 +299,73 @@ fn held_index_lock_fails_before_touching_the_worktree() {
         "another writer's lock is left in place"
     );
 
-    let dry = restore_hunks(&repo, &selection, &["f.txt".to_string()], false, true, true)
+    let dry = repo
+        .index()
+        .restore_hunks(&selection, &["f.txt".to_string()], false, true, true)
         .expect("dry run needs no lock");
     assert_eq!(dry.restored, vec!["f.txt".to_string()]);
     assert_eq!(fs::read_to_string(root.join("f.txt")).unwrap(), edited);
+}
+
+#[test]
+fn restoring_the_last_remaining_hunk_refreshes_the_entry() {
+    let dir = init_repo();
+    let root = dir.path();
+    let (original, _) = commit_with_edits(root, "f.txt", 300, 100);
+    std::thread::sleep(std::time::Duration::from_millis(1_100));
+
+    for remaining in (1..=3).rev() {
+        let repo = open(root);
+        let ids = unstaged_ids(&repo, "f.txt");
+        assert_eq!(ids.len(), remaining);
+        restore(&repo, ids[..1].to_vec(), "f.txt");
+        if remaining > 1 {
+            assert_eq!(
+                git(root, &["diff-files", "--name-only"]).trim(),
+                "f.txt",
+                "a file that keeps unstaged hunks stays stat-dirty"
+            );
+        }
+    }
+
+    assert_eq!(fs::read_to_string(root.join("f.txt")).unwrap(), original);
+    assert_eq!(git(root, &["diff-files", "--name-only"]).trim(), "");
+    assert_eq!(git(root, &["status", "--porcelain"]).trim(), "");
+}
+
+#[test]
+fn partial_restore_keeps_crlf_worktree_line_endings() {
+    let dir = init_repo();
+    let root = dir.path();
+    fs::write(root.join(".gitattributes"), "*.txt text eol=crlf\n").unwrap();
+    let lines: Vec<String> = (0..60).map(|i| format!("line{i}")).collect();
+    fs::write(root.join("c.txt"), lines.join("\n") + "\n").unwrap();
+    git(root, &["add", ".gitattributes", "c.txt"]);
+    git(root, &["commit", "-qm", "base"]);
+    fs::remove_file(root.join("c.txt")).unwrap();
+    git(root, &["checkout", "--", "c.txt"]);
+    assert!(fs::read_to_string(root.join("c.txt"))
+        .unwrap()
+        .starts_with("line0\r\n"));
+
+    let mut edited = lines.clone();
+    edited[5] = "LINE5".into();
+    edited[50] = "LINE50".into();
+    fs::write(root.join("c.txt"), edited.join("\r\n") + "\r\n").unwrap();
+
+    let repo = open(root);
+    let ids = unstaged_ids(&repo, "c.txt");
+    assert_eq!(ids.len(), 2);
+    restore(&repo, ids[..1].to_vec(), "c.txt");
+
+    let mut expected = lines;
+    expected[50] = "LINE50".into();
+    assert_eq!(
+        fs::read_to_string(root.join("c.txt")).unwrap(),
+        expected.join("\r\n") + "\r\n"
+    );
+    assert_eq!(
+        git(root, &["diff", "--numstat", "--", "c.txt"]).trim(),
+        "1\t1\tc.txt"
+    );
 }

@@ -9,7 +9,7 @@ These options work on any command (and on `grit` itself when you pass no subcomm
 | --- | --- |
 | `--json` | Print one JSON object instead of human-readable text. Errors become `{"error": "..."}`. |
 | `--markdown` | Print agent-friendly Markdown instead of human-readable text. Most commands render structured headings, lists, and tables (or fenced diffs) rather than dumping JSON. Mutually exclusive with `--json`. |
-| `--filter <EXPR>` | Apply a jq expression to the JSON output. Requires `--json`. |
+| `--filter <EXPR>` | Apply a jq expression to the JSON output. Requires `--json`. Iterator-style filters always emit a JSON array; singular filters emit one value (`null` when absent). |
 | `--threads <N>` | Worker threads for parallel library work inside this process. `0` selects all logical CPUs (Git-style auto); `1` forces serial paths. Does not change human, `--json`, or `--markdown` output shape. |
 | `--no-optional-locks` | Skip opportunistic index updates that take optional locks (same as `GIT_OPTIONAL_LOCKS=0`). Stat refresh still runs in memory; `.git/index` is left untouched. |
 | `-h`, `--help` | Print help for `grit` or for a command. |
@@ -55,15 +55,15 @@ The `grit` CLI snapshots the process environment into [`Environment`](../library
 | `HOME`, `XDG_CONFIG_HOME`, `USERPROFILE`, `USER`, `USERNAME` | Home and identity fallbacks |
 | `GIT_AUTHOR_*`, `GIT_COMMITTER_*` | Author/committer name, email, and date overrides for new objects |
 | `GIT_SSH`, `GIT_SSH_COMMAND` | SSH transport command (`GIT_SSH_COMMAND` overrides `core.sshCommand` and `GIT_SSH`; see Git precedence) |
-| `GIT_HTTP_LOW_SPEED_LIMIT`, `GIT_HTTP_LOW_SPEED_TIME` | HTTP low-speed abort thresholds |
+| `GIT_HTTP_LOW_SPEED_LIMIT`, `GIT_HTTP_LOW_SPEED_TIME` | HTTP low-speed abort thresholds (override `http.lowSpeedLimit` / `http.lowSpeedTime` from config) |
+| `http.timeout`, `http.lowSpeedLimit`, `http.lowSpeedTime` | Smart HTTP read timeouts in config (see [`fetch`](../fetch/)): `http.timeout` caps the whole transfer (default 600s); low-speed settings abort when throughput stays below the limit for the configured window. Fetch and clone poll cancellation during these waits, not only between read chunks |
 | `GIT_NOTES_REF`, `GIT_NOTES_DISPLAY_REF` | Notes ref selection |
-| `GIT_ATTR_SOURCE`, `GIT_INDEX_VERSION`, `GIT_PRINT_SHA1_ELLIPSIS` | Attributes, index format, diff OID display |
+| `GIT_ATTR_SOURCE` | Tree to read `.gitattributes` from |
 | `GIT_NAMESPACE`, `GIT_REPLACE_REF_BASE`, `GIT_NO_REPLACE_OBJECTS` | Ref namespaces and replace refs |
 | `GIT_OPTIONAL_LOCKS` | When set to `0`, `false`, `no`, or `off`, grit skips optional index writes during read-mostly commands such as `status` (same as `--no-optional-locks`). Unset means optional locks are allowed. |
-| `GIT_TRACE`, `GIT_TRACE_SETUP`, `GIT_TRACE2_PERF` | Trace output |
 | `GRIT_TRACE` | Grit operation spans to stderr (`1` / `true` / `yes`), or appended to a file when set to an absolute path; see [Debugging and tracing](../debugging/) |
 | `PATH` | Helper lookup (e.g. signing programs) |
 | `TZ` | Local timezone for dates when no explicit offset is given |
 | `GIT_EXEC_PATH`, `GIT_INSTALL_ROOT` | Git helper discovery (credentials) |
 
-Test-only knobs (`GIT_TEST_NO_WRITE_REV_INDEX`, `GIT_TEST_MIDX_WRITE_REV`, `GIT_TEST_REFTABLE_AUTOCOMPACTION`, `GIT_TEST_DATE_NOW`, and related values) are parsed into typed [`Environment`](../library/repository/) fields when present; they are not read elsewhere in `grit-lib`.
+Grit does not read `GIT_TEST_*` variables from Git's test suite. Use repository config instead (`pack.writeReverseIndex`, `index.version`, …), [`InitOptions::with_init_filesystem`](rustdoc:grit_lib::repo::InitOptions::with_init_filesystem) with [`PrecomposeDetection::Always`](rustdoc:grit_lib::config::init_filesystem::PrecomposeDetection::Always) for NFD/NFC init probes, and [`RepositoryOptions::with_reftable_write`](rustdoc:grit_lib::config::environment::RepositoryOptions::with_reftable_write) to disable reftable auto-compaction in tests. For `safe.directory` behavior in tests, implement [`OwnershipCheck`](rustdoc:grit_lib::ownership_check::OwnershipCheck) and pass it through [`RepositoryOptions::with_ownership_check`](rustdoc:grit_lib::config::environment::RepositoryOptions::with_ownership_check) (keep `GIT_TEST_ASSUME_DIFFERENT_OWNER` only when invoking the system `git` binary for cross-checks). `GIT_INDEX_VERSION` and `GIT_PRINT_SHA1_ELLIPSIS` are also ignored.

@@ -6,21 +6,21 @@
 //! - **Local lists** (`query_refs`, `query_listings_from_pairs`): patterns follow
 //!   `git for-each-ref` / `git branch --list` on the **short** ref name (suffix after
 //!   `refs/heads/`, `refs/tags/`, etc.), and a trailing `/` selects a directory prefix.
-//! - **Remote advertisements** ([`pattern_matches_ls_remote_refname`]): patterns follow
+//! - **Remote advertisements** ([`pattern_matches_ls_remote_pattern`]): patterns follow
 //!   `git ls-remote` tail-match rules on the **full** ref name (`main` matches
 //!   `refs/heads/main`; `refs/tags/v1*` also matches `refs/tags/v1^{}`).
 //!
 //! ```rust
-//! use grit_lib::refs::listing::{query_refs, RefNamespace, RefQuery, RefQueryOptions, SortKey};
+//! use grit_lib::refs::listing::{RefNamespace, RefQuery, RefQueryOptions, SortKey};
 //! use grit_lib::repo::{InitOptions, Repository};
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! let dir = tempfile::tempdir()?;
-//! let repo = Repository::init(dir.path(), &InitOptions::default())?;
+//! let (repo, _) = Repository::init(dir.path(), &InitOptions::default())?;
 //! let query = RefQuery {
 //!     namespaces: vec![RefNamespace::Heads],
 //!     ..RefQuery::default()
 //! };
-//! let _branches = query_refs(&repo, &query, &RefQueryOptions::default())?;
+//! let _branches = repo.references().query(&query, &RefQueryOptions::default())?;
 //! # Ok(())
 //! # }
 //! ```
@@ -29,15 +29,13 @@ use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::ops::ControlFlow;
 
-use thiserror::Error;
-
-use crate::error::Error;
 use crate::ident::committer_unix_seconds_for_ordering_bytes;
 use crate::objects::{ObjectId, ObjectKind};
 use crate::odb::Odb;
-use crate::refs::store::{RefEntry, RefStore};
+use crate::refs::query_reachability::{self, ReachRow};
+use crate::refs::store::{RefEntry, RefNameRef, RefStore};
 use crate::refs::version_sort::compare_refname_versions;
-use crate::refs::{query_reachability, PackedRefPeels};
+use crate::refs::PackedRefPeels;
 use crate::repo::Repository;
 use crate::wildmatch::{wildmatch, WM_CASEFOLD};
 
@@ -156,24 +154,7 @@ pub struct RefQueryOptions {
     pub ignore_case: bool,
 }
 
-/// Errors from ref query operations.
-#[derive(Debug, Error)]
-pub enum RefQueryError {
-    /// Ref store iteration or resolution failed.
-    #[error("ref store: {0}")]
-    Store(#[from] Error),
-    /// Creator-date sort was requested but no object database was supplied.
-    #[error("creator-date sort requires an object database")]
-    MissingObjectDatabase,
-    /// Filter object id is not present in the object database.
-    #[error("object {0} not found")]
-    MissingObject(ObjectId),
-    /// `--contains` / `--merged` target does not resolve to a commit.
-    #[error("object {0} is not a commit")]
-    NotCommit(ObjectId),
-}
-
-type QueryResult<T> = std::result::Result<T, RefQueryError>;
+type QueryResult<T> = crate::error::Result<T>;
 
 #[derive(Clone)]
 struct CollectedRef {
@@ -209,29 +190,29 @@ pub fn short_name_in_namespace(full_name: &str, namespace: &RefNamespace) -> Str
         .to_owned()
 }
 
-/// Whether `refname` matches `pattern` using `git ls-remote` tail-match rules.
+/// Whether `full_ref_name` matches `pattern` using `git ls-remote` tail-match rules.
 #[must_use]
-pub fn pattern_matches_ls_remote_refname(refname: &str, pattern: &str) -> bool {
+pub fn pattern_matches_ls_remote_pattern(full_ref_name: &str, pattern: &str) -> bool {
     if pattern.is_empty() {
         return false;
     }
-    let path = format!("/{refname}");
+    let path = format!("/{full_ref_name}");
     let full = format!("*/{pattern}");
     ls_remote_glob_match(&full, &path)
 }
 
-/// Returns `true` when `refname` matches one of `patterns`.
+/// Returns `true` when `full_ref_name` matches one of `patterns`.
 ///
 /// An empty `patterns` slice means no pattern filter (all ref names pass). An explicit
 /// empty-string pattern (`patterns == [""]`) matches nothing, like `git ls-remote`.
 #[must_use]
-pub fn patterns_match_ls_remote(refname: &str, patterns: &[String]) -> bool {
+pub fn patterns_match_ls_remote(full_ref_name: &str, patterns: &[String]) -> bool {
     if patterns.is_empty() {
         return true;
     }
     patterns
         .iter()
-        .any(|p| pattern_matches_ls_remote_refname(refname, p))
+        .any(|p| pattern_matches_ls_remote_pattern(full_ref_name, p))
 }
 
 fn ls_remote_glob_match(pattern: &str, text: &str) -> bool {
@@ -400,8 +381,9 @@ pub fn creator_date(odb: &Odb, oid: &ObjectId) -> crate::error::Result<i64> {
 ///
 /// # Errors
 ///
-/// Returns [`RefQueryError::MissingObjectDatabase`] when sort key is [`SortKey::Date`] and
-/// `odb` is `None`. Propagates object read errors as [`RefQueryError::Store`].
+/// Returns [`RefError::QueryNeedsObjectDatabase`](crate::error::RefError::QueryNeedsObjectDatabase)
+/// when sort key is [`SortKey::Date`] and `odb` is `None`, and propagates ref store and object
+/// read errors.
 pub fn query_listings_from_pairs<I>(
     entries: I,
     query: &RefQuery,
@@ -494,7 +476,7 @@ pub(crate) enum PeelTips {
 /// # Errors
 ///
 /// Propagates ref-store and object-read failures.
-pub fn query_refs(
+pub(crate) fn query_refs(
     repo: &Repository,
     query: &RefQuery,
     options: &RefQueryOptions,
@@ -515,7 +497,7 @@ pub(crate) fn query_refs_peeling(
     peel: PeelTips,
 ) -> QueryResult<Vec<RefListing>> {
     let git_dir = repo.git_dir();
-    let store = repo.refs();
+    let store = repo.ref_store();
     let namespaces = effective_namespaces(query);
     let linked_worktree = crate::worktree_ref::is_linked_worktree_git_dir(git_dir);
     let early_limit = early_ref_collection_limit(query, options);
@@ -524,7 +506,7 @@ pub(crate) fn query_refs_peeling(
         let prefix = ns.prefix();
         store.for_each_ref(prefix, &mut |entry: &RefEntry| {
             if linked_worktree
-                && !crate::worktree_ref::ref_visible_from_worktree(git_dir, &entry.name)
+                && !crate::worktree_ref::ref_visible_from_worktree(git_dir, entry.name.as_str())
             {
                 return ControlFlow::Continue(());
             }
@@ -569,13 +551,19 @@ fn insert_collected_ref(
         .peeled
         .or_else(|| match &entry.value {
             crate::refs::store::RawRef::Direct(oid) => Some(*oid),
-            crate::refs::store::RawRef::Symbolic(target) => store.resolve(target).ok(),
+            crate::refs::store::RawRef::Symbolic(target) => {
+                store.resolve(RefNameRef::from_trusted(target)).ok()
+            }
         })
-        .or_else(|| store.resolve(&entry.name).ok());
+        .or_else(|| {
+            store
+                .resolve(RefNameRef::from_trusted(entry.name.as_str()))
+                .ok()
+        });
     let Some(resolved) = resolved else {
         return;
     };
-    let short_name = short_name_for_query(&entry.name, namespaces);
+    let short_name = short_name_for_query(entry.name.as_str(), namespaces);
     if !patterns_match(&short_name, &query.patterns, options.ignore_case) {
         return;
     }
@@ -587,9 +575,9 @@ fn insert_collected_ref(
         crate::refs::store::RawRef::Direct(_) => entry.peeled,
         crate::refs::store::RawRef::Symbolic(_) => None,
     };
-    let kind = ref_kind_from_name(&entry.name);
+    let kind = ref_kind_from_name(entry.name.as_str());
     collected.push(CollectedRef {
-        full_name: entry.name.clone(),
+        full_name: entry.name.as_str().to_owned(),
         short_name,
         oid: direct_oid,
         peeled,
@@ -674,36 +662,43 @@ fn finish_query(
     repo: Option<&Repository>,
     peel: PeelTips,
 ) -> QueryResult<Vec<RefListing>> {
-    let bounded_contains = query_reachability::can_bound_contains(query);
-    let peel = (peel == PeelTips::Always || query_has_reachability(query)) && !bounded_contains;
-    if let Some(odb) = odb.filter(|_| peel) {
-        // A malformed `packed-refs` only loses the shortcut; peeling falls back to the objects.
-        let to_peel = collected.iter().filter(|c| c.peeled.is_none()).count();
-        let packed = repo
-            .filter(|_| to_peel >= PACKED_PEELS_MIN_REFS)
-            .and_then(|r| PackedRefPeels::for_store(r.refs(), r.git_dir()).ok());
+    if query_has_reachability(query) {
+        // Filtering peels the tips it judges, so only the refs it keeps without having
+        // peeled them are peeled afterwards; each tip's header is read once.
+        let repo = repo.ok_or(crate::error::RefError::QueryNeedsObjectDatabase)?;
+        let packed = packed_peels_for(repo, &collected);
+        let mut rows: Vec<ReachRow> = collected
+            .iter()
+            .map(|c| ReachRow {
+                oid: c.oid,
+                peeled: c
+                    .peeled
+                    .map(Some)
+                    .or_else(|| packed.as_ref().and_then(|p| p.peeled(&c.full_name, &c.oid))),
+            })
+            .collect();
+        let keep = query_reachability::filter_listings_by_reachability(repo, query, &mut rows)?;
+        let mut verdicts = keep.into_iter().zip(rows);
+        collected.retain_mut(|entry| {
+            let Some((keep, row)) = verdicts.next() else {
+                return false;
+            };
+            if keep {
+                match row.peeled {
+                    Some(peeled) => entry.peeled = peeled,
+                    None => fill_peeled(repo.odb(), None, entry),
+                }
+            }
+            keep
+        });
+    } else if let Some(odb) = odb.filter(|_| peel == PeelTips::Always) {
+        let packed = repo.and_then(|r| packed_peels_for(r, &collected));
         for entry in &mut collected {
             fill_peeled(odb, packed.as_ref(), entry);
         }
     }
-    if query_has_reachability(query) {
-        let repo = repo.ok_or(RefQueryError::MissingObjectDatabase)?;
-        let mut reach_rows: Vec<(String, ObjectId, Option<ObjectId>)> = collected
-            .iter()
-            .map(|c| (c.full_name.clone(), c.oid, c.peeled))
-            .collect();
-        query_reachability::filter_listings_by_reachability(repo, query, &mut reach_rows)?;
-        let keep: std::collections::HashSet<String> =
-            reach_rows.into_iter().map(|(name, _, _)| name).collect();
-        collected.retain(|c| keep.contains(&c.full_name));
-        if bounded_contains {
-            for entry in &mut collected {
-                fill_peeled(repo.odb(), None, entry);
-            }
-        }
-    }
     if matches!(query.sort.key, SortKey::Date) {
-        let odb = odb.ok_or(RefQueryError::MissingObjectDatabase)?;
+        let odb = odb.ok_or(crate::error::RefError::QueryNeedsObjectDatabase)?;
         for entry in &mut collected {
             entry.creator_date = creator_date(odb, &entry.oid).unwrap_or(0);
         }
@@ -741,6 +736,17 @@ fn finish_query(
 /// Loading the peel lines indexes the whole file, which in a repository with many packed
 /// refs costs more than a handful of object-header reads.
 pub(crate) const PACKED_PEELS_MIN_REFS: usize = 64;
+
+/// `packed-refs` peel lines for `collected`, when enough refs lack a peel to pay for them.
+///
+/// A malformed `packed-refs` only loses the shortcut; peeling falls back to the objects.
+fn packed_peels_for(repo: &Repository, collected: &[CollectedRef]) -> Option<PackedRefPeels> {
+    let to_peel = collected.iter().filter(|c| c.peeled.is_none()).count();
+    if to_peel < PACKED_PEELS_MIN_REFS {
+        return None;
+    }
+    PackedRefPeels::for_store(repo.ref_store(), repo.git_dir()).ok()
+}
 
 /// Set `entry.peeled` for annotated tags, preferring `packed-refs` peel lines over
 /// reading the tag object.
@@ -802,12 +808,9 @@ fn find_header_value<'a>(header: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
 ///
 /// Propagates config load failures from [`Repository::config`](crate::repo::Repository::config).
 pub fn ref_query_options_for_repo(repo: &Repository) -> crate::error::Result<RefQueryOptions> {
-    let config = repo.config()?;
-    let versionsort_suffixes = config.get_all("versionsort.suffix");
-    let ignore_case = config
-        .get_bool("core.ignorecase")
-        .and_then(|r| r.ok())
-        .unwrap_or(false);
+    let config = repo.config().snapshot()?;
+    let versionsort_suffixes = config.values_all("versionsort.suffix");
+    let ignore_case = config.ignore_case();
     Ok(RefQueryOptions {
         versionsort_suffixes,
         ignore_case,
@@ -867,7 +870,7 @@ mod tests {
 
     #[test]
     fn ls_remote_empty_string_pattern_matches_nothing() {
-        assert!(!pattern_matches_ls_remote_refname("refs/heads/main", ""));
+        assert!(!pattern_matches_ls_remote_pattern("refs/heads/main", ""));
         assert!(!patterns_match_ls_remote(
             "refs/heads/main",
             &[String::new()]
@@ -877,16 +880,16 @@ mod tests {
 
     #[test]
     fn ls_remote_pattern_tail_component() {
-        assert!(pattern_matches_ls_remote_refname("refs/heads/main", "main"));
-        assert!(!pattern_matches_ls_remote_refname(
+        assert!(pattern_matches_ls_remote_pattern("refs/heads/main", "main"));
+        assert!(!pattern_matches_ls_remote_pattern(
             "refs/heads/topic",
             "main"
         ));
-        assert!(pattern_matches_ls_remote_refname(
+        assert!(pattern_matches_ls_remote_pattern(
             "refs/tags/v1^{}",
             "refs/tags/v1*"
         ));
-        assert!(!pattern_matches_ls_remote_refname("refs/tags/v1^{}", "v1"));
+        assert!(!pattern_matches_ls_remote_pattern("refs/tags/v1^{}", "v1"));
     }
 
     #[test]
@@ -932,6 +935,7 @@ mod tests {
                     tagger: Some("T <t@example.com> 1 +0000".into()),
                     extra_headers: Vec::new(),
                     message: "t\n".into(),
+                    raw_message: None,
                 }),
             )
             .unwrap();

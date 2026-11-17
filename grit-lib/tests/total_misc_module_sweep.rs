@@ -9,16 +9,14 @@ use grit_lib::config::git_path::{
 use grit_lib::config::gitmodules::{
     check_submodule_name, check_submodule_url, looks_like_command_line_option,
     tree_entry_is_gitattributes_blob, tree_entry_is_gitmodules_blob, validate_gitmodules_blob_line,
-    write_gitmodules_cli_option_warnings,
 };
 use grit_lib::config::mailmap::{
-    load_mailmap, map_contact_table, parse_contact, parse_mailmap, render_contact,
-    table_from_entries,
+    map_contact_table, parse_contact, parse_mailmap, render_contact, table_from_entries,
 };
 use grit_lib::config::ConfigSet;
+use grit_lib::error::Error;
 use grit_lib::objects::ObjectKind;
 use grit_lib::repo::{InitOptions, Repository};
-use std::io::Cursor;
 use tempfile::tempdir;
 
 #[test]
@@ -33,9 +31,6 @@ fn gitmodules_mailmap_path_and_signing_helpers() -> grit_lib::error::Result<()> 
     assert!(!check_submodule_name(""));
     assert!(check_submodule_url("https://example.com/repo.git"));
     let _ = validate_gitmodules_blob_line(b"[submodule \"x\"]\n\tpath = p\n\turl = u\n");
-    let content = "[submodule \"s\"]\n\tpath = --weird\n\turl = --also\n";
-    let mut out = Cursor::new(Vec::new());
-    write_gitmodules_cli_option_warnings(&mut out, content).expect("warnings");
 
     let _ = normalize_path_copy("a//b/../c").ok();
     let _ = cleanup_path("./a/b");
@@ -50,13 +45,13 @@ fn gitmodules_mailmap_path_and_signing_helpers() -> grit_lib::error::Result<()> 
     let _ = render_contact("A", "a@b.com");
 
     let dir = tempdir().map_err(grit_lib::error::Error::Io)?;
-    let repo = Repository::init(dir.path(), &InitOptions::default())?;
-    let _ = load_mailmap(&repo).ok();
+    let (repo, _) = Repository::init(dir.path(), &InitOptions::default())?;
+    let _ = repo.config().mailmap().ok();
     let tree = repo.odb().write(ObjectKind::Tree, b"")?;
     let commit =
         format!("tree {tree}\nauthor T <t@e.com> 1 +0000\ncommitter T <t@e.com> 1 +0000\n\nm\n");
     let cfg = ConfigSet::new();
     let gpg = GpgConfig::from_config(&cfg)?;
-    let _ = verify_commit(&gpg, commit.as_bytes())?;
+    let _ = verify_commit(&gpg, commit.as_bytes()).map_err(Error::from)?;
     Ok(())
 }

@@ -13,7 +13,7 @@ use grit_lib::tree_sha256::TreeSha256Options;
 
 # fn main() -> grit_lib::error::Result<()> {
 let dir = tempfile::tempdir()?;
-let repo = Repository::init(dir.path(), &InitOptions::default())?;
+let (repo, _) = Repository::init(dir.path(), &InitOptions::default())?;
 # let head = repo.odb().write_loose_materialize(
 #     grit_lib::objects::ObjectKind::Commit,
 #     b"tree 0000000000000000000000000000000000000000\n\n",
@@ -32,7 +32,7 @@ println!("{}", report.digest);
 
 ## Missing submodules
 
-When a gitlink submodule is not checked out or its commit is absent, hashing returns [`Error::TreeSha256MissingSubmodules`](rustdoc:grit_lib::error::Error::TreeSha256MissingSubmodules) listing every path.
+When a gitlink submodule is not checked out or its commit is absent, hashing returns [`TagError::TreeSha256MissingSubmodules`](rustdoc:grit_lib::porcelain::tag::TagError::TreeSha256MissingSubmodules) listing every path.
 
 ## Tag header claim
 
@@ -59,7 +59,7 @@ use grit_lib::tree_sha256::TagVerifyOptions;
 # fn main() -> grit_lib::error::Result<()> {
 # let repo: Repository = todo!();
 # let tag_oid = todo!();
-let gpg = GpgConfig::from_config(repo.config()?.as_ref())?
+let gpg = GpgConfig::from_config(repo.config().snapshot()?.as_ref())?
     .with_command_runner(repo.command_runner());
 let report = repo.verify_tag(tag_oid, &TagVerifyOptions {
     check_signature: true,
@@ -70,7 +70,7 @@ assert!(report.is_ok());
 # }
 ```
 
-To verify by tag name, as `grit tag --verify` does, call [`verify_tag_by_name`](rustdoc:grit_lib::porcelain::tag::verify_tag_by_name). It resolves `refs/tags/<name>` through the repository's ref store (loose, packed or reftable), reads the tag object once, and returns a [`VerifiedTag`](rustdoc:grit_lib::porcelain::tag::VerifiedTag) with the tag object id, the `object` header target and the [`TagVerification`](rustdoc:grit_lib::tree_sha256::TagVerification). A bad name, a missing tag, and a lightweight tag (one with no tag object to verify) are the typed errors `TagError::InvalidName`, `TagError::NotFound` and [`TagError::Lightweight`](rustdoc:grit_lib::porcelain::tag::TagError::Lightweight).
+To verify by tag name, as `grit tag --verify` does, call [`verify_tag_by_name`](rustdoc:grit_lib::repo::Repository::verify_tag). It resolves `refs/tags/<name>` through the repository's ref store (loose, packed or reftable), reads the tag object once, and returns a [`VerifiedTag`](rustdoc:grit_lib::porcelain::tag::VerifiedTag) with the tag object id, the `object` header target and the [`TagVerification`](rustdoc:grit_lib::tree_sha256::TagVerification). A bad name, a missing tag, and a lightweight tag (one with no tag object to verify) are the typed errors `TagError::InvalidName`, `TagError::NotFound` and [`TagError::Lightweight`](rustdoc:grit_lib::porcelain::tag::TagError::Lightweight).
 
 ## Example program (verify)
 

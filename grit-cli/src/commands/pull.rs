@@ -10,25 +10,22 @@ use crate::commands::auth;
 use crate::commands::fetch::map_remote_error;
 use crate::commands::fetch_args::FetchArgs;
 use crate::context;
-use crate::output::OutputMode;
 use crate::progress::summary::transfer_header;
 use anyhow::{Context, Result};
 use grit_lib::config::ConfigSet;
-use grit_lib::error::Error as LibError;
-use grit_lib::porcelain::pull::{pull, PullError, PullMode, PullOptions};
-use grit_lib::progress::NeverCancel;
+use grit_lib::porcelain::pull::{pull, PullMode, PullOptions};
+use grit_lib::progress::CancelToken;
 use grit_lib::remote::fetch_request::resolve_pull_invocation;
 use grit_lib::remote::snapshot_checkout::{
-    ensure_refreshable, fetch_branch, refresh, refresh_branch, same_branch_name, valid_branch_name,
-    CheckoutClient, CheckoutError, CheckoutMarker,
+    same_branch_name, valid_branch_name, CheckoutClient, CheckoutError, CheckoutMarker,
 };
 use grit_lib::remote::transfer::{resolve_fetch_prune, resolve_fetch_tags, FetchOptions};
 use grit_lib::remote::HttpClientFactory;
 use grit_lib::repo::Repository;
-use grit_lib::state::{resolve_head_for_repository, InProgressOperation};
+use grit_lib::state::InProgressOperation;
 
-pub(crate) use pull_outcome::{changes_phrase, commits_on_snapshots, gave_change_ids_phrase};
-pub use pull_outcome::{map_outcome, PullOutcome, PullResult};
+pub use crate::render::pull::{PullOutcome, PullResult};
+pub use pull_outcome::map_outcome;
 
 #[derive(Default)]
 pub struct PullRunArgs {
@@ -61,32 +58,33 @@ fn cli_mode(args: &PullRunArgs) -> Option<PullMode> {
     }
 }
 
-pub fn run(args: &PullRunArgs, mode: OutputMode) -> Result<PullOutcome> {
+pub fn run(args: &PullRunArgs, human_interactive: bool) -> Result<PullOutcome> {
     if args.check && args.autostash {
         anyhow::bail!("--check cannot be used with --autostash");
     }
     let repo = context::discover()?;
-    let config = ConfigSet::load(&context::environment(), Some(repo.git_dir()), true)
-        .context("could not load config")?;
+    let config = ConfigSet::load(
+        &context::environment(),
+        Some(repo.git_dir()),
+        &grit_lib::config::LoadConfigOptions::standard(
+            &context::environment(),
+            Some(repo.git_dir()),
+        ),
+    )
+    .context("could not load config")?;
     match checkout_pull(&repo, &config, args) {
         Some(CheckoutPull::Refresh(marker)) => {
-            return refresh_checkout(&repo, &config, &marker, args, mode)
+            return refresh_checkout(&repo, &config, &marker, args, human_interactive)
         }
         Some(CheckoutPull::Branch(marker, name)) => {
-            return pull_server_branch(&repo, &config, &marker, &name, args, mode)
+            return pull_server_branch(&repo, &config, &marker, &name, args, human_interactive)
         }
         None => {}
     }
     let mut options =
-        PullOptions::for_working_branch(&repo, context::environment(), cli_mode(args)).map_err(
-            |err| match err {
-                PullError::Repository(LibError::OperationInProgress(kind)) => {
-                    crate::json_error::operation_in_progress_for_repo(&repo, "pull", kind)
-                }
-                other => anyhow::Error::new(other),
-            },
-        )?;
-    let head = resolve_head_for_repository(&repo)?;
+        PullOptions::for_working_branch(&repo, context::environment(), cli_mode(args))
+            .map_err(|err| crate::error_map::map_pull_options_error(&repo, err))?;
+    let head = repo.references().head()?;
     let invocation = resolve_pull_invocation(
         &config,
         args.fetch.remote.as_deref(),
@@ -115,10 +113,15 @@ pub fn run(args: &PullRunArgs, mode: OutputMode) -> Result<PullOutcome> {
     options.fetch = fetch_opts;
     let remote_name = invocation.remote;
     let factory = crate::context::http_client_factory();
+    let _interrupt = crate::interrupt::InterruptCancel::install();
     // The work-tree update after the fetch reports no progress, so the overall
     // bar covers the transfer only.
-    let mut progress = args.fetch.quiet.progress(mode).with_overall(false);
-    let url = config.get(&format!("remote.{remote_name}.url"));
+    let mut progress = args
+        .fetch
+        .quiet
+        .progress(human_interactive)
+        .with_overall(false);
+    let url = crate::context::config_string(&config, &format!("remote.{remote_name}.url"));
     if progress.is_drawing() && remote_name != "." {
         eprintln!(
             "{}",
@@ -130,40 +133,33 @@ pub fn run(args: &PullRunArgs, mode: OutputMode) -> Result<PullOutcome> {
             )
         );
     }
-    let lib = match pull(&repo, &options, &mut progress, &NeverCancel, Some(&factory)) {
+    let lib = match pull(
+        &repo,
+        &options,
+        &mut progress,
+        &crate::interrupt::process_cancel_token(),
+        Some(&factory),
+    ) {
         Ok(outcome) => outcome,
-        Err(PullError::Remote(remote_err)) => {
+        Err(remote_err @ grit_lib::error::Error::Remote(_)) => {
             let mapped = map_remote_error(remote_err);
             if auth::offer_reauth(&mapped, url.as_deref().unwrap_or_default())? {
-                pull(&repo, &options, &mut progress, &NeverCancel, Some(&factory))?
+                pull(
+                    &repo,
+                    &options,
+                    &mut progress,
+                    &crate::interrupt::process_cancel_token(),
+                    Some(&factory),
+                )?
             } else {
                 return Err(mapped);
             }
         }
-        Err(other) => {
-            return Err(match other {
-                PullError::Remote(remote) => map_remote_error(remote),
-                PullError::Repository(hook @ grit_lib::error::Error::Hook(_)) => {
-                    if repo.git_dir().join("MERGE_HEAD").is_file() {
-                        crate::json_error::hook_failed_with_hint(
-                            hook,
-                            "the merge is still in progress: run `grit merge --continue` to commit it, or `grit merge --abort` to cancel; autostashed edits come back either way",
-                        )
-                    } else {
-                        anyhow::Error::new(hook)
-                    }
-                }
-                PullError::Repository(LibError::OperationInProgress(kind)) => {
-                    return Err(crate::json_error::operation_in_progress_for_repo(
-                        &repo, "pull", kind,
-                    ));
-                }
-                rest => anyhow::Error::new(rest),
-            });
-        }
+        Err(other) => return Err(crate::error_map::map_pull_repository_error(&repo, other)),
     };
     let mut outcome = map_outcome(lib);
     outcome.transfer.records = progress.phases().to_vec();
+    outcome.transfer.milestones = progress.milestones().to_vec();
     outcome.transfer.elapsed = progress.elapsed();
     Ok(outcome)
 }
@@ -193,7 +189,8 @@ fn checkout_pull(
         return None;
     }
     let marker = CheckoutMarker::read(repo.git_dir())?;
-    let remote_url = |remote: &str| config.get(&format!("remote.{remote}.url"));
+    let remote_url =
+        |remote: &str| crate::context::config_string(config, &format!("remote.{remote}.url"));
     let is_server =
         |remote: &str| remote == marker.url || remote_url(remote).as_deref() == Some(&marker.url);
     let branch = match (args.fetch.remote.as_deref(), args.fetch.refspecs.as_slice()) {
@@ -229,19 +226,25 @@ fn pull_server_branch(
     marker: &CheckoutMarker,
     name: &str,
     args: &PullRunArgs,
-    mode: OutputMode,
+    human_interactive: bool,
 ) -> Result<PullOutcome> {
     if args.ff_only || args.no_rebase || args.autostash || args.fetch.dry_run {
         anyhow::bail!(
             "`grit pull {name}` in a snapshot checkout rebases {name} onto the server's; it takes no --ff-only, --no-rebase, --autostash or --dry-run"
         );
     }
-    ensure_refreshable(repo).map_err(refresh_error)?;
+    repo.snapshot_checkouts()
+        .ensure_refreshable()
+        .map_err(refresh_error)?;
     let http = crate::context::http_client_factory()
         .create(config)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     let client = CheckoutClient::new(http.as_ref(), &marker.url)?;
-    let mut progress = args.fetch.quiet.progress(mode).with_overall(false);
+    let mut progress = args
+        .fetch
+        .quiet
+        .progress(human_interactive)
+        .with_overall(false);
     if progress.is_drawing() {
         eprintln!(
             "{}",
@@ -252,19 +255,24 @@ fn pull_server_branch(
     let mut fetch = FetchOptions::new();
     fetch.thread_policy = repo.thread_policy();
     fetch.environment = context::environment();
-    let transfer = fetch_branch(
-        repo,
-        marker,
-        &info,
-        fetch,
-        &mut progress,
-        &NeverCancel,
-        Some(&crate::context::http_client_factory()),
-    )
-    .map_err(refresh_error)?;
-    let refreshed = refresh_branch(repo, marker, &info, args.check).map_err(refresh_error)?;
+    let transfer = repo
+        .snapshot_checkouts()
+        .fetch_branch(
+            marker,
+            &info,
+            fetch,
+            &mut progress,
+            &CancelToken::never(),
+            Some(&crate::context::http_client_factory()),
+        )
+        .map_err(refresh_error)?;
+    let refreshed = repo
+        .snapshot_checkouts()
+        .refresh_branch(marker, &info, args.check)
+        .map_err(refresh_error)?;
     let mut outcome = PullOutcome::from_server_branch(&info, &refreshed, transfer);
     outcome.transfer.records = progress.phases().to_vec();
+    outcome.transfer.milestones = progress.milestones().to_vec();
     outcome.transfer.elapsed = progress.elapsed();
     Ok(outcome)
 }
@@ -277,9 +285,11 @@ fn refresh_checkout(
     config: &ConfigSet,
     marker: &CheckoutMarker,
     args: &PullRunArgs,
-    mode: OutputMode,
+    human_interactive: bool,
 ) -> Result<PullOutcome> {
-    ensure_refreshable(repo).map_err(refresh_error)?;
+    repo.snapshot_checkouts()
+        .ensure_refreshable()
+        .map_err(refresh_error)?;
     let http = crate::context::http_client_factory()
         .create(config)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -288,7 +298,11 @@ fn refresh_checkout(
         let state = client.show(&marker.id)?;
         return Ok(PullOutcome::refresh_dry_run(marker, &state));
     }
-    let mut progress = args.fetch.quiet.progress(mode).with_overall(false);
+    let mut progress = args
+        .fetch
+        .quiet
+        .progress(human_interactive)
+        .with_overall(false);
     if progress.is_drawing() {
         eprintln!(
             "{}",
@@ -313,30 +327,34 @@ fn refresh_checkout(
         },
         ..Default::default()
     };
-    let refreshed = refresh(
-        repo,
-        marker,
-        &info,
-        &options,
-        &mut progress,
-        &NeverCancel,
-        Some(&crate::context::http_client_factory()),
-    )
-    .map_err(refresh_error)?;
+    let refreshed = repo
+        .snapshot_checkouts()
+        .refresh(
+            marker,
+            &info,
+            &options,
+            &mut progress,
+            &CancelToken::never(),
+            Some(&crate::context::http_client_factory()),
+        )
+        .map_err(refresh_error)?;
     let mut outcome = PullOutcome::from_refresh(refreshed);
     outcome.transfer.records = progress.phases().to_vec();
+    outcome.transfer.milestones = progress.milestones().to_vec();
     outcome.transfer.elapsed = progress.elapsed();
     Ok(outcome)
 }
 
 /// A refresh failure in words that say what to do next.
-fn refresh_error(err: CheckoutError) -> anyhow::Error {
+fn refresh_error(err: grit_lib::error::Error) -> anyhow::Error {
+    let err = match err {
+        grit_lib::error::Error::Remote(grit_lib::remote::RemoteError::Snapshot(checkout)) => {
+            checkout
+        }
+        remote @ grit_lib::error::Error::Remote(_) => return map_remote_error(remote),
+        other => return anyhow::Error::new(other),
+    };
     match err {
-        CheckoutError::Remote(remote) => map_remote_error(*remote),
-        CheckoutError::Pull(pull) => match *pull {
-            PullError::Remote(remote) => map_remote_error(remote),
-            other => anyhow::Error::new(other),
-        },
         CheckoutError::OperationInProgress(operation) => {
             let next = match operation {
                 InProgressOperation::Rebase | InProgressOperation::RebaseInteractive => {
@@ -370,6 +388,6 @@ fn refresh_error(err: CheckoutError) -> anyhow::Error {
         CheckoutError::UnrelatedBranch { name } => anyhow::anyhow!(
             "your {name} has nothing in common with the server's {name}; rename yours (`grit branch -m {name} <new name>`), then `grit pull {name}` gets the server's"
         ),
-        other => other.into(),
+        other => anyhow::Error::new(grit_lib::error::Error::from(other)),
     }
 }

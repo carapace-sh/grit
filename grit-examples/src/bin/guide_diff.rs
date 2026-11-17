@@ -2,13 +2,14 @@
 //!
 //! Source for the library guide "Diff" page (included in the docs site).
 
+use anyhow::Result;
 use grit_lib::config::environment::RepositoryOptions;
-use grit_lib::diff::{diff_index_to_worktree, unified_diff, DiffEntry, DiffStatus};
+use grit_lib::diff::{unified_diff, DiffEntry, DiffStatus, TreeDiffOptions, UnifiedDiffOptions};
 use grit_lib::repo::Repository;
-use grit_lib::state::resolve_head;
+
 use std::path::{Path, PathBuf};
 
-fn open_repo(root: &Path) -> Result<Repository, grit_lib::error::Error> {
+fn open_repo(root: &Path) -> Result<Repository> {
     let git_dir = if root.join(".git").is_dir() {
         root.join(".git")
     } else {
@@ -23,7 +24,7 @@ fn open_repo(root: &Path) -> Result<Repository, grit_lib::error::Error> {
     if let Some(wt) = work_tree {
         opts = opts.with_work_tree(wt);
     }
-    Repository::open(&git_dir, &opts)
+    Ok(Repository::open(&git_dir, &opts)?)
 }
 
 fn print_name_status(entries: &[DiffEntry]) {
@@ -40,38 +41,49 @@ fn print_name_status(entries: &[DiffEntry]) {
     }
 }
 
-fn main() -> Result<(), grit_lib::error::Error> {
+fn main() -> Result<()> {
     let root = std::env::args()
         .nth(1)
         .map(PathBuf::from)
         .or_else(|| std::env::current_dir().ok())
-        .ok_or_else(|| grit_lib::error::Error::Message("missing repository path".into()))?;
+        .ok_or_else(|| anyhow::anyhow!("missing repository path"))?;
     let repo = open_repo(&root)?;
 
-    let head = resolve_head(repo.git_dir())?;
+    let head = repo.references().head()?;
     let new_commit = head
         .oid()
         .cloned()
-        .ok_or_else(|| grit_lib::error::Error::Message("HEAD has no commit".into()))?;
+        .ok_or_else(|| anyhow::anyhow!("HEAD has no commit"))?;
     let new_commit_data = repo.objects().read_commit(&new_commit)?;
     let parent = new_commit_data
         .parents
         .first()
         .copied()
-        .ok_or_else(|| grit_lib::error::Error::Message("need a commit with a parent".into()))?;
+        .ok_or_else(|| anyhow::anyhow!("need a commit with a parent"))?;
 
     let old_tree = repo.objects().commit_tree(&parent)?;
     let new_tree = new_commit_data.tree;
 
-    let tree_changes = repo.diff().tree_to_tree(Some(&old_tree), Some(&new_tree))?;
+    let tree_changes = repo
+        .diff()
+        .tree_to_tree(
+            Some(&old_tree),
+            Some(&new_tree),
+            &TreeDiffOptions::default(),
+        )?
+        .entries;
     println!("tree_diff_begin");
     print_name_status(&tree_changes);
     println!("tree_diff_end");
 
-    if let Some(wt) = repo.work_tree() {
-        let mut index = repo.index_handle().load()?;
-        let wt_changes = diff_index_to_worktree(repo.odb(), &mut index, wt, false, false)?;
-        println!("index_worktree_dirty={}", !wt_changes.is_empty());
+    if repo.work_tree().is_some() {
+        let mut index = repo
+            .index()
+            .load(&grit_lib::index::IndexLoadOptions::default())?;
+        let wt_changes = repo
+            .diff()
+            .index_to_worktree(&mut index, &TreeDiffOptions::default())?;
+        println!("index_worktree_dirty={}", !wt_changes.entries.is_empty());
     }
 
     if let (Some(entry),) = (tree_changes.first(),) {
@@ -82,7 +94,8 @@ fn main() -> Result<(), grit_lib::error::Error> {
             let new_text = String::from_utf8_lossy(&new_blob);
             let old_path = entry.old_path.as_deref().unwrap_or(entry.path());
             let new_path = entry.new_path.as_deref().unwrap_or(entry.path());
-            let patch = unified_diff(&old_text, &new_text, old_path, new_path, 3, false, false);
+            let options = UnifiedDiffOptions::new().with_paths(old_path, new_path);
+            let patch = unified_diff(&old_text, &new_text, &options);
             let hunk_lines = patch
                 .lines()
                 .filter(|l| l.starts_with('-') || l.starts_with('+'))

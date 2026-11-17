@@ -9,12 +9,7 @@ use std::process::Command;
 use grit_lib::config::environment::{Environment, RepositoryOptions};
 use grit_lib::config::ConfigSet;
 use grit_lib::objects::ObjectId;
-use grit_lib::progress::NeverCancel;
-use grit_lib::refs::resolve_ref;
-use grit_lib::remote::fetch::NoProgress;
-use grit_lib::remote::push_plan::{
-    resolve_push, ForceMode, LeaseExpectation, PushPlanContext, PushRequest,
-};
+use grit_lib::remote::push_plan::{ForceMode, LeaseExpectation, PushPlanContext, PushRequest};
 use grit_lib::remote::push_report::PushRefStatus;
 use grit_lib::remote::transfer::{PushOptions, PushOutcome};
 use grit_lib::remote::Remote;
@@ -64,7 +59,12 @@ fn open_repo(work: &Path) -> Repository {
 }
 
 fn load_config(repo: &Repository) -> ConfigSet {
-    ConfigSet::load(&Environment::empty(), Some(repo.git_dir()), true).expect("config")
+    ConfigSet::load(
+        &Environment::empty(),
+        Some(repo.git_dir()),
+        &crate::config::LoadConfigOptions::standard(&Environment::empty(), Some(repo.git_dir())),
+    )
+    .expect("config")
 }
 
 fn push_plan_context(bare: &Path) -> PushPlanContext {
@@ -150,7 +150,7 @@ fn grit_push_request(work: &Path, bare: &Path, request: PushRequest) -> PushOutc
     let repo = open_repo(work);
     let config = load_config(&repo);
     let ctx = push_plan_context(bare);
-    let plan = resolve_push(&repo, &config, &request, &ctx).expect("plan");
+    let plan = repo.remotes().resolve_push(&request, &ctx).expect("plan");
     Remote::from_config(&config, "origin")
         .expect("remote")
         .push(
@@ -161,7 +161,7 @@ fn grit_push_request(work: &Path, bare: &Path, request: PushRequest) -> PushOutc
                 ..Default::default()
             },
             &mut NoProgress,
-            &NeverCancel,
+            &CancelToken::never(),
             None,
         )
         .expect("push")
@@ -400,10 +400,9 @@ fn file_lease_success_updates_tracking_ref() {
         ForceMode::Lease(LeaseExpectation::Tracking),
         &[],
     );
-    let tracking = resolve_ref(
-        open_repo(&fx.grit_client).git_dir(),
-        "refs/remotes/origin/main",
-    )
-    .expect("tracking");
+    let tracking = grit_test_support::refs::at(open_repo(&fx.grit_client).git_dir())
+        .references()
+        .resolve("refs/remotes/origin/main")
+        .expect("tracking");
     assert_eq!(tracking, remote_tip(&fx.bare));
 }

@@ -1,6 +1,7 @@
 //! `grit add` and index write compatibility with system Git (v2/v3/v4, cache-tree).
 
 use crate::support;
+use grit_lib::progress::NullProgress;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -11,7 +12,7 @@ use grit_lib::config::environment::{Environment, RepositoryOptions};
 use grit_lib::index::write_tree::{write_tree_update_index, WriteTreeFlags};
 use grit_lib::index::Index;
 use grit_lib::objects::ObjectId;
-use grit_lib::porcelain::add::{stage, StageOptions};
+use grit_lib::porcelain::add::StageOptions;
 use grit_lib::progress::NullProgress;
 use grit_lib::repo::Repository;
 
@@ -238,8 +239,8 @@ fn git_oracle_and_grit_ignore_hostile_git_dir_on_subprocess() {
 
     git_oracle(wt, &["add", "-A"]);
     open_grit(wt)
-        .index_handle()
-        .load()
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
         .expect("grit opens fixture");
     assert_git_fsck_strict_oracle(wt);
 }
@@ -252,14 +253,19 @@ fn grit_written_index_v2_v3_v4_accepted_by_git() {
         let wt = repo.worktree();
 
         let grit = open_grit(wt);
-        let mut index = grit.index_handle().load().expect("load");
+        let mut index = grit
+            .index()
+            .load(&grit_lib::index::IndexLoadOptions::default())
+            .expect("load");
         index.version = version;
         if version == 3 {
             if let Some(e) = index.entries_mut().first_mut() {
                 e.set_skip_worktree(true);
             }
         }
-        grit.index_handle().write(&mut index).expect("grit write");
+        grit.index()
+            .write(&mut index, &grit_lib::index::IndexWriteOptions::default())
+            .expect("grit write");
         assert_git_fsck_strict_oracle(wt);
         assert_grit_index_matches_git_oracle(wt, &index);
     }
@@ -274,8 +280,14 @@ fn git_written_index_reload_byte_identical_when_unchanged() {
     let bytes = fs::read(wt.join(".git/index")).expect("git index");
 
     let grit = open_grit(wt);
-    let mut parsed = Index::parse_with_algo(&bytes, grit.odb().hash_algo()).expect("parse");
-    grit.index_handle().write(&mut parsed).expect("rewrite");
+    let mut parsed = Index::parse(
+        &bytes,
+        &grit_lib::index::IndexParseOptions::default().with_hash_algo(grit.odb().hash_algo()),
+    )
+    .expect("parse");
+    grit.index()
+        .write(&mut parsed, &grit_lib::index::IndexWriteOptions::default())
+        .expect("rewrite");
     let round = fs::read(wt.join(".git/index")).expect("roundtrip index");
     assert_eq!(
         bytes, round,
@@ -304,13 +316,13 @@ fn cache_tree_after_add_matches_git_write_tree() {
 
     let grit = open_grit(&repo_dir);
     let opts = StageOptions::default();
-    stage(
-        &grit,
-        &opts,
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("grit add");
+    grit.index()
+        .stage(
+            &opts,
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("grit add");
 
     let mut write_tree_cmd = Command::new("git");
     write_tree_cmd.current_dir(&repo_dir).args(["write-tree"]);
@@ -321,7 +333,10 @@ fn cache_tree_after_add_matches_git_write_tree() {
         .to_owned();
     let git_tree = ObjectId::from_hex(&git_tree_hex).expect("parse git tree");
 
-    let mut index = grit.index_handle().load().expect("load after add");
+    let mut index = grit
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("load after add");
     let grit_tree = write_tree_update_index(grit.odb(), &mut index, "", WriteTreeFlags::default())
         .expect("grit write-tree from index");
     assert_eq!(grit_tree, git_tree);
@@ -346,16 +361,19 @@ fn add_untracked_path_keeps_index_entries_canonical() {
 
     let grit = open_grit(&repo_dir);
     let opts = StageOptions::default();
-    stage(
-        &grit,
-        &opts,
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("grit add");
+    grit.index()
+        .stage(
+            &opts,
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("grit add");
 
     assert_git_fsck_strict_oracle(&repo_dir);
-    let index = grit.index_handle().load().expect("load index");
+    let index = grit
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("load index");
     assert!(
         index.entries_are_sorted(),
         "index paths must stay sorted for git fsck"

@@ -10,7 +10,7 @@ use std::path::Path;
 
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::error::Error;
-use grit_lib::index::{index_file_mtime, Index, IndexParseContext};
+use grit_lib::index::{index_file_mtime, Index, IndexCorruptReason, IndexError, IndexParseContext};
 use grit_lib::objects::HashAlgo;
 use grit_lib::parallel::ThreadPolicy;
 use grit_lib::repo::Repository;
@@ -36,11 +36,9 @@ fn init_large_repo(root: &Path, extra_config: &[(&str, &str)]) {
 
 fn assert_checksum_mismatch(result: grit_lib::error::Result<Index>) {
     match result {
-        Err(Error::IndexError(msg)) => assert!(
-            msg.contains("checksum mismatch"),
-            "expected a checksum mismatch, got {msg}"
-        ),
-        Err(other) => panic!("expected IndexError, got {other:?}"),
+        Err(Error::Index(IndexError::Corrupt { corrupt, .. }))
+            if matches!(corrupt.reason, IndexCorruptReason::ChecksumMismatch { .. }) => {}
+        Err(other) => panic!("expected checksum mismatch IndexError::Corrupt, got {other:?}"),
         Ok(_) => panic!("corrupt index loaded"),
     }
 }
@@ -58,11 +56,17 @@ fn large_git_index_loads_and_matches_ls_files() {
     assert_eq!(index.source_mtime, index_file_mtime(&index_path));
 
     let repo = Repository::discover(Some(root), &RepositoryOptions::empty()).expect("open");
-    let loaded = repo.index_handle().load().expect("repository load");
+    let loaded = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("repository load");
     assert_grit_index_matches_git_ls_files(root, &loaded);
     assert_eq!(loaded.source_mtime, index_file_mtime(&index_path));
 
-    let expanded = Index::load_expand_sparse(&index_path, repo.odb()).expect("expand load");
+    let expanded = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default().with_path(&index_path))
+        .expect("expand load");
     assert_eq!(expanded.entries(), index.entries());
     assert_eq!(expanded.source_mtime, index_file_mtime(&index_path));
 }
@@ -80,8 +84,14 @@ fn large_index_with_corrupt_trailer_is_rejected() {
 
     assert_checksum_mismatch(Index::load(&index_path));
     let repo = Repository::discover(Some(root), &RepositoryOptions::empty()).expect("open");
-    assert_checksum_mismatch(repo.index_handle().load());
-    assert_checksum_mismatch(Index::parse(&bytes));
+    assert_checksum_mismatch(
+        repo.index()
+            .load(&grit_lib::index::IndexLoadOptions::default()),
+    );
+    assert_checksum_mismatch(Index::parse(
+        &bytes,
+        &grit_lib::index::IndexParseOptions::default(),
+    ));
 }
 
 #[test]
@@ -97,11 +107,12 @@ fn large_index_reports_checksum_mismatch_before_structural_errors() {
     assert_checksum_mismatch(Index::load(&index_path));
     for threads in [None, Some(1), Some(4)] {
         let context = IndexParseContext::from_policy(ThreadPolicy::with_threads_override(threads));
-        assert_checksum_mismatch(Index::parse_with_algo_and_config(
+        assert_checksum_mismatch(Index::parse(
             &bytes,
-            HashAlgo::Sha1,
-            None,
-            context,
+            &grit_lib::index::IndexParseOptions::default()
+                .with_hash_algo(HashAlgo::Sha1)
+                .with_source_path(index_path.as_path())
+                .with_parse_context(context),
         ));
     }
 }
@@ -113,12 +124,15 @@ fn large_index_serial_thread_policy_parses_identically() {
     init_large_repo(root, &[]);
     let bytes = fs::read(root.join(".git/index")).expect("read");
 
-    let default = Index::parse(&bytes).expect("parse");
-    let serial = Index::parse_with_algo_and_config(
+    let default =
+        Index::parse(&bytes, &grit_lib::index::IndexParseOptions::default()).expect("parse");
+    let serial = Index::parse(
         &bytes,
-        HashAlgo::Sha1,
-        None,
-        IndexParseContext::from_policy(ThreadPolicy::with_threads_override(Some(1))),
+        &grit_lib::index::IndexParseOptions::default()
+            .with_hash_algo(HashAlgo::Sha1)
+            .with_parse_context(IndexParseContext::from_policy(
+                ThreadPolicy::with_threads_override(Some(1)),
+            )),
     )
     .expect("serial parse");
     assert_eq!(default.entries(), serial.entries());

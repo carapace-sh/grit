@@ -8,6 +8,7 @@
 //! clean paths; callers that may overwrite dirty files (hard reset) spool those first, and
 //! spooled bytes win over the index.
 
+use crate::worktree::WorktreeError;
 use std::collections::{BTreeSet, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -132,8 +133,23 @@ impl Drop for CheckoutDeleteSpool {
     }
 }
 
+type CheckoutDeleteSpoolSlot = Arc<Mutex<Option<CheckoutDeleteSpool>>>;
+
+fn ensure_checkout_delete_spool(
+    slot: &mut Option<CheckoutDeleteSpool>,
+) -> Result<&mut CheckoutDeleteSpool> {
+    if slot.is_none() {
+        *slot = Some(CheckoutDeleteSpool::new()?);
+    }
+    slot.as_mut().ok_or_else(|| {
+        Error::Io(std::io::Error::other(
+            "checkout delete spool missing after lazy initialization",
+        ))
+    })
+}
+
 /// Shared handle to a journal's delete spool, for parallel checkout deletes.
-pub(crate) struct SharedCheckoutDeleteRollback(Arc<Mutex<CheckoutDeleteSpool>>);
+pub(crate) struct SharedCheckoutDeleteRollback(CheckoutDeleteSpoolSlot);
 
 impl SharedCheckoutDeleteRollback {
     pub(crate) fn clone_handle(&self) -> Self {
@@ -142,10 +158,8 @@ impl SharedCheckoutDeleteRollback {
 
     /// Move `rel_path` into the spool so rollback can restore it; no-op when absent.
     pub(crate) fn spool_remove(&self, work_tree: &Path, rel_path: &str) -> Result<()> {
-        self.0
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .spool_remove(work_tree, rel_path)
+        let mut guard = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        ensure_checkout_delete_spool(&mut guard)?.spool_remove(work_tree, rel_path)
     }
 }
 
@@ -185,7 +199,7 @@ struct ReplacedPath {
 /// the repository state and nothing is undone. [`Self::finish`] rolls an uncommitted pass back.
 pub(crate) struct CheckoutJournal {
     work_tree: PathBuf,
-    spool: Arc<Mutex<CheckoutDeleteSpool>>,
+    spool: CheckoutDeleteSpoolSlot,
     /// Paths that did not exist before the checkout wrote them.
     created: PathList,
     /// Paths whose tracked content the checkout overwrote.
@@ -203,10 +217,10 @@ pub(crate) struct CheckoutJournal {
 
 impl CheckoutJournal {
     /// Start an empty journal for a checkout of `work_tree`.
-    pub(crate) fn new(work_tree: &Path) -> Result<Self> {
+    pub fn new(work_tree: &Path) -> Result<Self> {
         Ok(Self {
             work_tree: work_tree.to_path_buf(),
-            spool: Arc::new(Mutex::new(CheckoutDeleteSpool::new()?)),
+            spool: Arc::new(Mutex::new(None)),
             created: PathList::default(),
             replaced: Vec::new(),
             removed_dirs: BTreeSet::new(),
@@ -224,10 +238,8 @@ impl CheckoutJournal {
 
     /// Move `rel_path` into the spool so rollback can restore it; no-op when absent.
     pub(crate) fn spool_remove(&self, rel_path: &str) -> Result<()> {
-        self.spool
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .spool_remove(&self.work_tree, rel_path)
+        let mut guard = self.spool.lock().unwrap_or_else(|e| e.into_inner());
+        ensure_checkout_delete_spool(&mut guard)?.spool_remove(&self.work_tree, rel_path)
     }
 
     /// Record that the checkout is about to write `change`'s destination path.
@@ -293,10 +305,8 @@ impl CheckoutJournal {
 
     /// Move the directory at `rel_path` into the delete spool so rollback can put it back.
     fn spool_directory_at_path(&mut self, rel_path: &str) -> Result<()> {
-        let stash = self
-            .spool
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        let mut guard = self.spool.lock().unwrap_or_else(|e| e.into_inner());
+        let stash = ensure_checkout_delete_spool(&mut guard)?
             .spool_directory_tree(&self.work_tree, rel_path)?;
         self.spooled_directories.push(SpooledDirectoryReplace {
             rel: rel_path.to_owned(),
@@ -306,7 +316,7 @@ impl CheckoutJournal {
     }
 
     /// The checkout's index is on disk: keep every change and drop the spool.
-    pub(crate) fn commit(&mut self) {
+    pub fn commit(&mut self) {
         self.committed = true;
         self.created = PathList::default();
         self.replaced = Vec::new();
@@ -316,11 +326,14 @@ impl CheckoutJournal {
         for entry in self.spooled_directories.drain(..) {
             let _ = fs::remove_dir_all(&entry.stash);
         }
-        self.spool
+        if let Some(spool) = self
+            .spool
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .entries
-            .clear();
+            .as_mut()
+        {
+            spool.entries.clear();
+        }
     }
 
     /// End the pass with `result`: commit on success, roll back an uncommitted failure.
@@ -328,7 +341,7 @@ impl CheckoutJournal {
     /// # Errors
     ///
     /// Returns the checkout's own error after a complete rollback, or
-    /// [`Error::CheckoutRollbackIncomplete`] wrapping it with the paths that could not be put
+    /// [`crate::worktree::WorktreeError::CheckoutRollbackIncomplete`] wrapping it with the paths that could not be put
     /// back.
     pub(crate) fn finish<T>(mut self, repo: &Repository, result: Result<T>) -> Result<T> {
         let err = match result {
@@ -345,10 +358,10 @@ impl CheckoutJournal {
         if unrestored.is_empty() {
             return Err(err);
         }
-        Err(Error::CheckoutRollbackIncomplete {
-            source: Box::new(err),
+        Err(Error::Worktree(WorktreeError::CheckoutRollbackIncomplete {
+            source: crate::error::ErrorSummary::from(err),
             unrestored,
-        })
+        }))
     }
 
     /// Undo every recorded change; returns the paths left in a different state.
@@ -369,14 +382,18 @@ impl CheckoutJournal {
         // Spooled bytes are what the path held before the checkout; the index must not
         // overwrite them again below.
         let spooled: HashSet<String> = {
-            let mut spool = self.spool.lock().unwrap_or_else(|e| e.into_inner());
-            let spooled = spool
-                .entries
-                .iter()
-                .map(|entry| entry.rel.clone())
-                .collect();
-            unrestored.extend(spool.restore_all(&self.work_tree));
-            spooled
+            let mut guard = self.spool.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(spool) = guard.as_mut() {
+                let spooled = spool
+                    .entries
+                    .iter()
+                    .map(|entry| entry.rel.clone())
+                    .collect();
+                unrestored.extend(spool.restore_all(&self.work_tree));
+                spooled
+            } else {
+                HashSet::new()
+            }
         };
 
         for entry in self.spooled_directories.drain(..).rev() {
@@ -395,7 +412,11 @@ impl CheckoutJournal {
         let index = repo.load_index().ok();
         let mut restore_targets: Vec<CheckoutRollbackRestore> = Vec::new();
         let mut restore_paths = HashSet::new();
-        let mut dir_cache = LeadingDirCache::new();
+        let mut dir_cache = repo
+            .config()
+            .snapshot()
+            .map(|config| LeadingDirCache::for_config(config.as_ref()))
+            .unwrap_or_else(|_| LeadingDirCache::new());
         for entry in replaced.iter().rev() {
             if spooled.contains(&entry.path) {
                 continue;
@@ -482,11 +503,14 @@ fn index_entry_or_fallback(
 impl Drop for CheckoutJournal {
     fn drop(&mut self) {
         if !self.committed {
-            let _ = self
+            if let Some(spool) = self
                 .spool
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .restore_all(&self.work_tree);
+                .as_mut()
+            {
+                let _ = spool.restore_all(&self.work_tree);
+            }
         }
     }
 }
@@ -505,7 +529,7 @@ fn spool_entry_name(rel: &str) -> String {
     while !file_name.is_char_boundary(start) {
         start += 1;
     }
-    format!("{}_{seq}_{}", std::process::id(), &file_name[start..])
+    format!("{seq}_{}", &file_name[start..])
 }
 
 fn move_directory_tree(from: &Path, to: &Path) -> std::io::Result<()> {
@@ -585,14 +609,16 @@ fn move_worktree_entry_to_spool(
     stash: &Path,
     kind: SpooledPathKind,
 ) -> std::io::Result<()> {
-    if let Some(parent) = stash.parent() {
-        fs::create_dir_all(parent)?;
-    }
+    // `stash` sits directly in the spool directory: entry names never contain a separator.
     match fs::rename(abs, stash) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            crate::test_probe_hooks::hooks::checkout_spool_delete();
+            Ok(())
+        }
         Err(err) if err.kind() == std::io::ErrorKind::CrossesDevices => {
             cross_device_move_to_spool(abs, stash, kind)?;
             fs::remove_file(abs)?;
+            crate::test_probe_hooks::hooks::checkout_spool_delete();
             Ok(())
         }
         Err(err) => Err(err),
@@ -657,20 +683,7 @@ fn cross_device_restore_from_spool(
 }
 
 pub(crate) fn create_symlink_at(target: &Path, link: &Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::symlink;
-        symlink(target, link)
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::{symlink_dir, symlink_file};
-        if target.is_dir() {
-            symlink_dir(target, link)
-        } else {
-            symlink_file(target, link)
-        }
-    }
+    crate::worktree::create_worktree_symlink(link, target)
 }
 
 #[cfg(test)]

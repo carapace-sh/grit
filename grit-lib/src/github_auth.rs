@@ -25,25 +25,25 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 
 use crate::credentials::Credential;
-use crate::error::Error;
+use crate::error::ErrorSummary;
 use crate::transport::http::HttpClient;
 
 /// Host name of GitHub's web and Git endpoints.
 pub const GITHUB_HOST: &str = "github.com";
 
 /// GitHub endpoint that issues device and user codes.
-pub const DEVICE_CODE_URL: &str = "https://github.com/login/device/code";
+pub(crate) const DEVICE_CODE_URL: &str = "https://github.com/login/device/code";
 
 /// GitHub endpoint polled for the access token.
-pub const ACCESS_TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
+pub(crate) const ACCESS_TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
 
 /// Page where the user enters the code; used when GitHub omits
 /// `verification_uri` from its response.
-pub const VERIFICATION_URL: &str = "https://github.com/login/device";
+pub(crate) const VERIFICATION_URL: &str = "https://github.com/login/device";
 
 /// OAuth scope requested by default. `repo` covers fetching and pushing
 /// private repositories over HTTPS.
-pub const DEFAULT_SCOPE: &str = "repo";
+pub(crate) const DEFAULT_SCOPE: &str = "repo";
 
 /// Placeholder username GitHub documents for token authentication over HTTPS;
 /// GitHub authenticates by the token (the password) regardless of the name.
@@ -108,12 +108,15 @@ pub enum DeviceFlowError {
         step: DeviceFlowStep,
         /// The transport error from the [`HttpClient`].
         #[source]
-        source: Error,
+        source: ErrorSummary,
     },
     /// GitHub answered the device-code request with an OAuth `error` code
     /// (for example an unknown client id).
-    #[error("device-code request rejected: {0}")]
-    DeviceCodeRejected(String),
+    #[error("device-code request rejected: {code}")]
+    DeviceCodeRejected {
+        /// OAuth `error` code GitHub returned.
+        code: String,
+    },
     /// A required field was absent from GitHub's device-code response.
     #[error("device-code response is missing `{0}`")]
     MissingField(&'static str),
@@ -128,8 +131,11 @@ pub enum DeviceFlowError {
     TimedOut,
     /// The token endpoint answered with an OAuth `error` code the flow does not
     /// handle (for example `incorrect_device_code`).
-    #[error("token request failed: {0}")]
-    TokenRejected(String),
+    #[error("token request failed: {code}")]
+    TokenRejected {
+        /// OAuth `error` code GitHub returned.
+        code: String,
+    },
     /// The token endpoint answered with neither a token nor an `error` code.
     #[error("unexpected response from the token endpoint")]
     UnexpectedResponse,
@@ -202,7 +208,9 @@ impl<'a> DeviceFlow<'a> {
         let body = form_encode(&[("client_id", self.client_id), ("scope", self.scope)]);
         let fields = self.post_form(DEVICE_CODE_URL, &body, DeviceFlowStep::RequestDeviceCode)?;
         if let Some(code) = form_field(&fields, "error") {
-            return Err(DeviceFlowError::DeviceCodeRejected(code.to_owned()));
+            return Err(DeviceFlowError::DeviceCodeRejected {
+                code: code.to_owned(),
+            });
         }
         let required = |key: &'static str| {
             form_field(&fields, key)
@@ -255,7 +263,9 @@ impl<'a> DeviceFlow<'a> {
             }),
             Some("expired_token") => Err(DeviceFlowError::Expired),
             Some("access_denied") => Err(DeviceFlowError::AccessDenied),
-            Some(other) => Err(DeviceFlowError::TokenRejected(other.to_owned())),
+            Some(other) => Err(DeviceFlowError::TokenRejected {
+                code: other.to_owned(),
+            }),
             None => Err(DeviceFlowError::UnexpectedResponse),
         }
     }
@@ -305,7 +315,10 @@ impl<'a> DeviceFlow<'a> {
                 body.as_bytes(),
                 None,
             )
-            .map_err(|source| DeviceFlowError::Http { step, source })?;
+            .map_err(|source| DeviceFlowError::Http {
+                step,
+                source: ErrorSummary::from(source),
+            })?;
         Ok(parse_form(&String::from_utf8_lossy(&response)))
     }
 }
@@ -436,10 +449,12 @@ fn form_component_decode(input: &str) -> String {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    use crate::error::Error;
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
     use super::*;
+    use crate::remote::RemoteError;
 
     /// One recorded `POST`: URL and decoded form body.
     type Request = (String, Vec<(String, String)>);
@@ -620,7 +635,7 @@ mod tests {
         let flow = DeviceFlow::new(&http, "id");
         assert!(matches!(
             flow.request_device_code(),
-            Err(DeviceFlowError::DeviceCodeRejected(code)) if code == "unauthorized_client"
+            Err(DeviceFlowError::DeviceCodeRejected { code }) if code == "unauthorized_client"
         ));
         assert!(matches!(
             flow.request_device_code(),
@@ -635,26 +650,26 @@ mod tests {
     #[test]
     fn transport_errors_name_the_failing_step() {
         let http = ScriptedHttp::new(vec![
-            Err(Error::Auth {
+            Err(Error::Remote(RemoteError::Auth {
                 url: "https://github.com".to_owned(),
                 reason: crate::error::AuthFailure::Rejected,
-            }),
-            Err(Error::Message("offline".to_owned())),
+            })),
+            Err(Error::Io(std::io::Error::other("offline"))),
         ]);
         let flow = DeviceFlow::new(&http, "id");
         assert!(matches!(
             flow.request_device_code(),
             Err(DeviceFlowError::Http {
                 step: DeviceFlowStep::RequestDeviceCode,
-                source: Error::Auth { .. },
-            })
+                source,
+            }) if source.kind() == "auth"
         ));
         assert!(matches!(
             flow.poll(&device(5, 900), secs(5)),
             Err(DeviceFlowError::Http {
                 step: DeviceFlowStep::PollToken,
-                source: Error::Message(_),
-            })
+                source,
+            }) if matches!(source.area(), "io" | "remote")
         ));
     }
 
@@ -713,7 +728,7 @@ mod tests {
         ));
         assert!(matches!(
             flow.poll(&dev, secs(5)),
-            Err(DeviceFlowError::TokenRejected(code)) if code == "incorrect_device_code"
+            Err(DeviceFlowError::TokenRejected { code }) if code == "incorrect_device_code"
         ));
         assert!(matches!(
             flow.poll(&dev, secs(5)),

@@ -13,13 +13,15 @@ grit mv [-f|--force] [--dry-run] <source>... <destination>
 
 ## Description
 
-Renames or moves tracked paths in the working tree and index, preserving object ids and cached stat data. The last argument is the destination; earlier arguments are sources.
+Renames or moves tracked paths in the working tree and index, preserving object ids and cached stat data. Pathnames in human and `--markdown` output use the same quoting rules as [`grit status`](../status/) (see **Description** there). The last argument is the destination; earlier arguments are sources.
 
-When the destination is an existing directory, each source is moved into that directory under its original base name. Moving a directory renames the whole tree of tracked files. Multiple sources are validated together before anything moves; the index is updated once.
+When the destination is an existing directory, each source is moved into that directory under its original base name. A trailing slash on the destination (`docs/` or `docs//`) is accepted and means the same as naming the directory without the slash. Moving a directory renames the whole tree of tracked files. Multiple sources are validated together before anything moves; the index is updated once.
 
 Grit refuses untracked sources, overwriting an existing destination without `--force`, and moving a directory into one of its own subdirectories.
 
-On case-insensitive volumes with `core.ignorecase=true`, case-only renames (for example `README.md` to `readme.md`) succeed: the worktree spelling updates and the index tracks the destination path, matching `git mv`.
+On case-insensitive volumes with `core.ignorecase=true`, case-only renames succeed: the worktree spelling updates and the index tracks the destination path. That includes renaming a tracked directory to a case-only spelling (for example `Dir` to `dir`), which updates every indexed path under that tree (for example `Dir/x.txt` becomes `dir/x.txt`). Single-file case-only renames behave like `git mv`; upstream Git still fails directory case-only renames on APFS.
+
+When a move leaves a source directory empty, grit leaves that directory on disk (same as `git mv`).
 
 ## Options
 

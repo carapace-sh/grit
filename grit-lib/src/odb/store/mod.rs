@@ -2,7 +2,7 @@
 //!
 //! Backends implement read, metadata, streaming, iteration, and (optionally) write
 //! operations without allocating error strings on cache misses: a missing object
-//! is `Ok(None)`, not [`Error::ObjectNotFound`].
+//! is `Ok(None)`, not [`crate::error::ObjectError::NotFound`].
 //!
 //! Thread safety: [`ObjectStore`] requires `Send + Sync` so repositories can share
 //! a store across threads; individual methods may take internal locks.
@@ -11,20 +11,23 @@ mod composite;
 mod files;
 #[cfg(test)]
 pub(crate) mod flaky;
-pub mod loose;
+pub(crate) mod loose;
 mod midx;
 mod packs;
 
 pub use composite::CompositeStore;
-pub use files::FilesSource;
-pub use loose::LooseStore;
+pub use files::{FilesSource, FilesSourceOpenOptions};
+pub use loose::{enumerate_loose_objects, read_loose_object_info, LooseStore};
+pub(crate) use loose::{LooseNegativeCache, SharedLooseNegativeCache};
 pub use midx::{MidxObjects, MidxObjectsStatus};
 pub(crate) use packs::touch_pack_mtime;
 pub use packs::{PackFilter, PackedObjects};
 
+use crate::error::ObjectError;
 use std::io::{self, Cursor, Read};
 use std::ops::ControlFlow;
 use std::sync::{Arc, RwLock};
+use std::time::SystemTime;
 
 use std::path::Path;
 
@@ -77,7 +80,7 @@ pub struct ObjectStream<'a> {
 /// objects are reported as `Ok(None)`, not as errors.
 ///
 /// A store used as a repository's primary can give history walks a commit-graph so they
-/// skip commit reads altogether: build one with [`crate::maintenance::build_commit_graph`],
+/// skip commit reads altogether: build one with [`Maintenance::build_commit_graph`](crate::maintenance::Maintenance::build_commit_graph),
 /// persist its bytes, and attach it with
 /// [`OdbBuilder::commit_graph`](crate::odb::OdbBuilder::commit_graph). Graph files under
 /// `objects/info/` are never read for a custom primary.
@@ -89,7 +92,7 @@ pub trait ObjectStore: Send + Sync + std::fmt::Debug {
     ///
     /// # Errors
     ///
-    /// Returns I/O or corruption errors from the backend; never [`Error::ObjectNotFound`].
+    /// Returns I/O or corruption errors from the backend; never [`crate::error::ObjectError::NotFound`].
     fn read(&self, oid: &ObjectId) -> Result<Option<Object>>;
 
     /// Load object payload into `buf`, reusing its capacity when possible.
@@ -156,7 +159,9 @@ pub trait ObjectStore: Send + Sync + std::fmt::Debug {
             return Ok(None);
         };
         let size = u64::try_from(obj.data.len()).map_err(|_| {
-            Error::CorruptObject(format!("object size overflow for {}", oid.to_hex()))
+            Error::Object(ObjectError::Corrupt {
+                detail: format!("object size overflow for {}", oid.to_hex()),
+            })
         })?;
         Ok(Some(ObjectStream {
             kind: obj.kind,
@@ -187,7 +192,7 @@ pub trait ObjectStore: Send + Sync + std::fmt::Debug {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidObjectId`] when `prefix` is not valid hex or is longer
+    /// Returns [`crate::error::ObjectError::InvalidId`] when `prefix` is not valid hex or is longer
     /// than a full object id for this store's hash algorithm.
     fn lookup_prefix(&self, prefix: &str, limit: usize, out: &mut Vec<ObjectId>) -> Result<()> {
         let prefix = ObjectIdPrefix::from_hex(prefix, self.hash_algo())?;
@@ -243,7 +248,9 @@ pub trait WritableObjectStore: ObjectStore {
         options: WriteOptions,
     ) -> Result<ObjectId> {
         let size_usize = usize::try_from(size).map_err(|_| {
-            Error::CorruptObject(format!("object size {size} exceeds address space"))
+            Error::Object(ObjectError::Corrupt {
+                detail: format!("object size {size} exceeds address space"),
+            })
         })?;
         let mut buf = vec![0u8; size_usize];
         reader.read_exact(&mut buf).map_err(Error::Io)?;
@@ -258,6 +265,116 @@ pub trait WritableObjectStore: ObjectStore {
     ///
     /// Propagates backend failures.
     fn freshen(&self, oid: &ObjectId) -> Result<bool>;
+
+    /// Make prior successful [`Self::write`] calls durable (commit a transaction, fsync, …).
+    ///
+    /// Grit calls this after bulk ingest and before ref updates that publish new commits.
+    /// Reads on this store must observe every write that returned `Ok` even before
+    /// [`Self::flush`]; flush is the durability barrier for crash recovery.
+    ///
+    /// Default is a no-op. Do not flush automatically from [`Self::write`]; backends batch
+    /// many writes between flush calls.
+    ///
+    /// # Errors
+    ///
+    /// Propagates backend persistence failures.
+    fn flush(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Like [`Self::flush`], but rolls back the current batch when flush fails.
+    ///
+    /// # Errors
+    ///
+    /// Propagates flush failures after attempting [`Self::rollback`].
+    fn flush_for_publish(&self) -> Result<()> {
+        if let Err(err) = self.flush() {
+            let _ = self.rollback();
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    /// Discard unflushed writes from the current batch after a failed ingest or similar.
+    ///
+    /// Default is a no-op. After a successful [`Self::flush`], rollback is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// Propagates backend failures while aborting the batch.
+    fn rollback(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// This store's [`PrunableObjectStore`] capability, when it can delete objects.
+    ///
+    /// Garbage collection and pruning on a repository whose primary is this store call it
+    /// to find out whether unreachable objects can be removed. The default is `None`: such
+    /// a store is never pruned, and those operations fail with
+    /// [`RepositoryError::UnsupportedObjectStore`](crate::repo::RepositoryError::UnsupportedObjectStore)
+    /// naming [`FilesOnlyOperation::Prune`](crate::repo::error::FilesOnlyOperation::Prune).
+    /// A store that implements [`PrunableObjectStore`] returns `Some(self)`.
+    fn as_prunable(&self) -> Option<&dyn PrunableObjectStore> {
+        None
+    }
+}
+
+/// Object storage that can delete objects, so garbage collection can reclaim them.
+///
+/// Implement it next to [`WritableObjectStore`] and return `Some(self)` from
+/// [`WritableObjectStore::as_prunable`]. Then
+/// [`maintenance::prune_loose_objects`](crate::maintenance::prune_loose_objects),
+/// [`maintenance::gc`](crate::maintenance::gc) and [`Odb::gc`](crate::odb::Odb::gc) work on
+/// a repository whose primary is this store: they walk everything reachable from the
+/// repository's refs, reflogs, indexes and worktrees, list the store's objects with
+/// [`ObjectStore::for_each_object`], and pass the unreachable ones to [`Self::remove`] in
+/// batches, then call [`WritableObjectStore::flush`].
+///
+/// # Examples
+///
+/// ```
+/// use grit_lib::objects::{HashAlgo, ObjectKind};
+/// use grit_lib::objects::odb::store::{
+///     MemoryStore, ObjectStore, PrunableObjectStore, WritableObjectStore,
+/// };
+/// use grit_lib::objects::odb::WriteOptions;
+///
+/// let store = MemoryStore::new(HashAlgo::Sha1);
+/// let oid = store.write(ObjectKind::Blob, b"scratch", WriteOptions::default())?;
+/// let prunable = store.as_prunable().expect("MemoryStore can delete objects");
+/// assert_eq!(prunable.remove(&[oid])?, 1);
+/// assert!(!store.contains(&oid)?);
+/// # Ok::<(), grit_lib::error::Error>(())
+/// ```
+pub trait PrunableObjectStore: WritableObjectStore {
+    /// Delete every object in `oids` that this store holds, and return how many it deleted.
+    ///
+    /// Ids the store does not hold are skipped, not errors: another process may have
+    /// pruned them already. Deletions may be batched like writes; garbage collection calls
+    /// [`WritableObjectStore::flush`] after its last batch.
+    ///
+    /// # Errors
+    ///
+    /// Propagates backend failures. Objects deleted before the failure stay deleted.
+    fn remove(&self, oids: &[ObjectId]) -> Result<usize>;
+
+    /// When `oid` was last written or [freshened](WritableObjectStore::freshen), if this
+    /// store records it.
+    ///
+    /// Pruning keeps unreachable objects newer than the grace period (`gc.pruneExpire`,
+    /// two weeks by default, or [`PruneOptions::older_than`](crate::maintenance::PruneOptions::older_than)),
+    /// because a concurrent operation may be about to reference them. An object without a
+    /// known time cannot be proven old, so it is kept whenever a grace period applies and
+    /// removed only when the period is `now` (or `all`). The default returns `None` for
+    /// every object.
+    ///
+    /// # Errors
+    ///
+    /// Propagates backend failures.
+    fn object_mtime(&self, oid: &ObjectId) -> Result<Option<SystemTime>> {
+        let _ = oid;
+        Ok(None)
+    }
 }
 
 /// Forward both traits through a pointer type so a store behind `Arc`, `Box` or `&` is
@@ -338,6 +455,32 @@ macro_rules! forward_object_store {
 
             fn freshen(&self, oid: &ObjectId) -> Result<bool> {
                 (**self).freshen(oid)
+            }
+
+            fn flush(&self) -> Result<()> {
+                (**self).flush()
+            }
+
+            fn flush_for_publish(&self) -> Result<()> {
+                (**self).flush_for_publish()
+            }
+
+            fn rollback(&self) -> Result<()> {
+                (**self).rollback()
+            }
+
+            fn as_prunable(&self) -> Option<&dyn PrunableObjectStore> {
+                (**self).as_prunable()
+            }
+        }
+
+        impl<T: PrunableObjectStore + ?Sized> PrunableObjectStore for $pointer {
+            fn remove(&self, oids: &[ObjectId]) -> Result<usize> {
+                (**self).remove(oids)
+            }
+
+            fn object_mtime(&self, oid: &ObjectId) -> Result<Option<SystemTime>> {
+                (**self).object_mtime(oid)
             }
         }
     };
@@ -502,7 +645,9 @@ impl ObjectStore for MemoryStore {
             return Ok(None);
         };
         let size = u64::try_from(data.len()).map_err(|_| {
-            Error::CorruptObject(format!("object size overflow for {}", oid.to_hex()))
+            Error::Object(ObjectError::Corrupt {
+                detail: format!("object size overflow for {}", oid.to_hex()),
+            })
         })?;
         Ok(Some(ObjectStream {
             kind: *kind,
@@ -559,6 +704,25 @@ impl WritableObjectStore for MemoryStore {
             .read()
             .map_err(|e| Error::Io(io::Error::other(e.to_string())))?;
         Ok(guard.contains_key(oid))
+    }
+
+    fn as_prunable(&self) -> Option<&dyn PrunableObjectStore> {
+        Some(self)
+    }
+}
+
+/// Records no write times, so a grace period keeps every unreachable object: only a
+/// `now` prune removes them.
+impl PrunableObjectStore for MemoryStore {
+    fn remove(&self, oids: &[ObjectId]) -> Result<usize> {
+        let mut guard = self
+            .objects
+            .write()
+            .map_err(|e| Error::Io(io::Error::other(e.to_string())))?;
+        Ok(oids
+            .iter()
+            .filter(|oid| guard.remove(*oid).is_some())
+            .count())
     }
 }
 
@@ -763,7 +927,7 @@ mod tests {
         let mut out = Vec::new();
         assert!(matches!(
             store.lookup_prefix("xyz", 0, &mut out),
-            Err(Error::InvalidObjectId(_))
+            Err(Error::Object(ObjectError::InvalidId { .. }))
         ));
     }
 
@@ -801,6 +965,85 @@ mod tests {
         );
         assert!(store.freshen(&oid).unwrap());
         assert!(!store.freshen(&ObjectId::zero()).unwrap());
+    }
+
+    #[test]
+    fn memory_store_removes_held_objects_and_skips_the_rest() {
+        let store = MemoryStore::new(HashAlgo::Sha1);
+        let a = store
+            .write(ObjectKind::Blob, b"a", WriteOptions::default())
+            .unwrap();
+        let b = store
+            .write(ObjectKind::Blob, b"b", WriteOptions::default())
+            .unwrap();
+        let prunable = store.as_prunable().expect("MemoryStore is prunable");
+        assert_eq!(prunable.remove(&[a, ObjectId::zero(), a]).unwrap(), 1);
+        assert!(!store.contains(&a).unwrap());
+        assert!(store.contains(&b).unwrap());
+        assert_eq!(prunable.remove(&[]).unwrap(), 0);
+        assert_eq!(prunable.object_mtime(&b).unwrap(), None);
+    }
+
+    #[test]
+    fn pointers_forward_the_prune_capability() {
+        let shared = Arc::new(MemoryStore::new(HashAlgo::Sha1));
+        let oid = shared
+            .write(ObjectKind::Blob, b"x", WriteOptions::default())
+            .unwrap();
+        let as_dyn: Arc<dyn WritableObjectStore> = shared.clone();
+        let boxed: Box<dyn WritableObjectStore> = Box::new(Arc::clone(&shared));
+        let borrowed: &dyn WritableObjectStore = &as_dyn;
+        assert!(as_dyn.as_prunable().is_some());
+        assert!(boxed.as_prunable().is_some());
+        assert!(borrowed.as_prunable().is_some());
+        assert_eq!(PrunableObjectStore::remove(&shared, &[oid]).unwrap(), 1);
+        assert!(!as_dyn.contains(&oid).unwrap());
+    }
+
+    #[test]
+    fn writable_store_is_not_prunable_by_default() {
+        #[derive(Debug)]
+        struct WriteOnly(MemoryStore);
+
+        impl ObjectStore for WriteOnly {
+            fn hash_algo(&self) -> HashAlgo {
+                self.0.hash_algo()
+            }
+
+            fn read(&self, oid: &ObjectId) -> Result<Option<Object>> {
+                self.0.read(oid)
+            }
+
+            fn read_info(&self, oid: &ObjectId) -> Result<Option<ObjectInfo>> {
+                self.0.read_info(oid)
+            }
+
+            fn for_each_object(
+                &self,
+                f: &mut dyn FnMut(&ObjectId) -> ControlFlow<()>,
+            ) -> Result<()> {
+                self.0.for_each_object(f)
+            }
+        }
+
+        impl WritableObjectStore for WriteOnly {
+            fn write(
+                &self,
+                kind: ObjectKind,
+                data: &[u8],
+                options: WriteOptions,
+            ) -> Result<ObjectId> {
+                self.0.write(kind, data, options)
+            }
+
+            fn freshen(&self, oid: &ObjectId) -> Result<bool> {
+                self.0.freshen(oid)
+            }
+        }
+
+        let store: Arc<dyn WritableObjectStore> =
+            Arc::new(WriteOnly(MemoryStore::new(HashAlgo::Sha1)));
+        assert!(store.as_prunable().is_none());
     }
 
     #[test]

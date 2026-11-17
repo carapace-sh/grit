@@ -6,10 +6,15 @@ use crate::ewah_bitmap::EwahBitmap;
 use crate::git_date::approx::approxidate_careful;
 use crate::git_path::CanonicalizeExt;
 use crate::index::{Index, IndexEntry};
+use crate::index::{IndexCorrupt, IndexCorruptReason, IndexError};
 use crate::objects::{HashAlgo, ObjectId};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+
+fn split_index_error(path: Option<&Path>, reason: IndexCorruptReason) -> IndexError {
+    IndexError::corrupt_at(path, None, reason)
+}
 
 /// Split-index metadata carried on an [`Index`] (in-memory; bitmaps cleared after merge/write).
 #[derive(Debug, Clone)]
@@ -193,11 +198,7 @@ pub(crate) fn merge_split_into_index(
         .cloned()
         .collect();
     if stubs.len() != replace_pos.len() {
-        return Err(Error::IndexError(format!(
-            "split index: expected {} replacement stubs, found {}",
-            replace_pos.len(),
-            stubs.len()
-        )));
+        return Err(split_index_error(None, IndexCorruptReason::SplitIndexCorrupt).into());
     }
     let mut stub_iter = stubs.into_iter();
     let rest: Vec<IndexEntry> = saved.into_iter().filter(|e| !e.path.is_empty()).collect();
@@ -219,9 +220,7 @@ pub(crate) fn merge_split_into_index(
             .is_some_and(|b| b.bit_size > 0 && bitmap_has_bit(b, i))
         {
             let Some(rep) = stub_iter.next() else {
-                return Err(Error::IndexError(
-                    "split index: missing replacement entry".to_owned(),
-                ));
+                return Err(split_index_error(None, IndexCorruptReason::SplitIndexCorrupt).into());
             };
             let mut e = rep;
             e.path = base_e.path.clone();
@@ -234,9 +233,7 @@ pub(crate) fn merge_split_into_index(
     }
 
     if stub_iter.next().is_some() {
-        return Err(Error::IndexError(
-            "split index: too many replacement stubs".to_owned(),
-        ));
+        return Err(split_index_error(None, IndexCorruptReason::SplitIndexCorrupt).into());
     }
 
     for mut e in rest {
@@ -253,9 +250,7 @@ pub(crate) fn merge_split_into_index(
 pub(crate) fn parse_link_extension(data: &[u8], algo: HashAlgo) -> Result<SplitIndexLink> {
     let hash_len = algo.len();
     if data.len() < hash_len {
-        return Err(Error::IndexError(
-            "corrupt link extension (too short)".to_owned(),
-        ));
+        return Err(split_index_error(None, IndexCorruptReason::SplitIndexCorrupt).into());
     }
     let base_oid = ObjectId::from_bytes(&data[..hash_len])?;
     let mut rest = &data[hash_len..];
@@ -267,21 +262,15 @@ pub(crate) fn parse_link_extension(data: &[u8], algo: HashAlgo) -> Result<SplitI
         });
     }
     let Some((del, consumed)) = EwahBitmap::deserialize_prefix(rest) else {
-        return Err(Error::IndexError(
-            "corrupt delete bitmap in link extension".to_owned(),
-        ));
+        return Err(split_index_error(None, IndexCorruptReason::SplitIndexCorrupt).into());
     };
     rest = &rest[consumed..];
     let Some((rep, consumed2)) = EwahBitmap::deserialize_prefix(rest) else {
-        return Err(Error::IndexError(
-            "corrupt replace bitmap in link extension".to_owned(),
-        ));
+        return Err(split_index_error(None, IndexCorruptReason::SplitIndexCorrupt).into());
     };
     rest = &rest[consumed2..];
     if !rest.is_empty() {
-        return Err(Error::IndexError(
-            "garbage at the end of link extension".to_owned(),
-        ));
+        return Err(split_index_error(None, IndexCorruptReason::SplitIndexCorrupt).into());
     }
     Ok(SplitIndexLink {
         base_oid,
@@ -381,7 +370,7 @@ pub(crate) enum SplitIndexConfig {
 }
 
 pub(crate) fn split_index_config(cfg: &ConfigSet) -> SplitIndexConfig {
-    match cfg.get("core.splitIndex") {
+    match cfg.value("core.splitIndex") {
         None => SplitIndexConfig::Unset,
         Some(v) => {
             let t = v.trim();
@@ -397,7 +386,7 @@ pub(crate) fn split_index_config(cfg: &ConfigSet) -> SplitIndexConfig {
 }
 
 pub(crate) fn max_percent_split_change(cfg: &ConfigSet) -> i32 {
-    match cfg.get("splitIndex.maxPercentChange") {
+    match cfg.value("splitIndex.maxPercentChange") {
         None => -1,
         Some(v) => v.trim().parse::<i32>().unwrap_or(-1),
     }
@@ -428,45 +417,9 @@ pub(crate) fn should_rebuild_shared_index(index: &Index, cfg: &ConfigSet) -> boo
     total * (max_split as u64) < not_shared * 100
 }
 
-pub(crate) fn git_test_split_index_env() -> bool {
-    crate::environment::Environment::empty()
-        .var("GIT_TEST_SPLIT_INDEX")
-        .map(|v| {
-            let t = v.trim();
-            t == "1" || t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("yes")
-        })
-        .unwrap_or(false)
-}
-
-/// Whether cache-tree verification should run on index write.
-///
-/// Upstream's `write_locked_index` gates this on `git_env_bool("GIT_TEST_CHECK_CACHE_TREE", 0)`, but
-/// the upstream test harness (`test-lib.sh`) exports the variable as `true` by default — so in
-/// practice the check is *on* unless a test explicitly sets it to a falsy value. Grit mirrors that
-/// effective default: verification runs unless `GIT_TEST_CHECK_CACHE_TREE` is explicitly falsy
-/// (`0`/`false`/`no`/empty). This only ever rejects a genuinely corrupt cache-tree (e.g. one primed
-/// from a tree with duplicate path entries — `t4058-diff-duplicates`); well-formed trees always
-/// verify cleanly.
-pub(crate) fn git_test_check_cache_tree() -> bool {
-    match crate::environment::Environment::empty().var("GIT_TEST_CHECK_CACHE_TREE") {
-        Some(v) => {
-            let t = v.trim();
-            !(t.is_empty()
-                || t == "0"
-                || t.eq_ignore_ascii_case("false")
-                || t.eq_ignore_ascii_case("no"))
-        }
-        None => true,
-    }
-}
-
-pub(crate) fn git_test_split_index_force_reorder(base_oid: &ObjectId) -> bool {
-    git_test_split_index_env() && (base_oid.as_bytes()[0] & 15) < 6
-}
-
 pub(crate) fn shared_index_expire_threshold(cfg: &ConfigSet) -> u64 {
     let raw = cfg
-        .get("splitIndex.sharedIndexExpire")
+        .value("splitIndex.sharedIndexExpire")
         .map(|s| s.trim().to_owned());
     let spec = raw
         .as_deref()
@@ -541,35 +494,26 @@ fn filetime_set_to_now(_path: &Path) -> io::Result<()> {
 /// Request from `update-index` for the next index write.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct WriteSplitIndexRequest {
-    /// `Some(true)` / `Some(false)` for `--[no-]split-index`; `None` uses config / test env only.
+    /// `Some(true)` / `Some(false)` for `--[no-]split-index`; `None` uses config only.
     pub explicit: Option<bool>,
 }
 
 impl WriteSplitIndexRequest {
     /// Whether the next write should use split-index format.
     ///
-    /// Matches Git: `--split-index` still enables split index when `core.splitIndex` is false,
-    /// but emits a warning (see `builtin/update-index.c`).
+    /// An explicit request wins over `core.splitIndex` in either direction, as in Git.
     ///
     /// When `explicit` is `None`, an index that was already split (`split_link` set after load)
     /// stays split until `--no-split-index` (Git keeps `istate->split_index` across commands).
     pub fn want_write_split(self, cfg: &ConfigSet, index: &Index) -> bool {
         match self.explicit {
-            Some(false) => {
-                let _ = matches!(split_index_config(cfg), SplitIndexConfig::Enabled);
-                false
-            }
-            Some(true) => {
-                let _ = matches!(split_index_config(cfg), SplitIndexConfig::Disabled);
-                true
-            }
+            Some(explicit) => explicit,
             None => {
                 if matches!(split_index_config(cfg), SplitIndexConfig::Disabled) {
                     return false;
                 }
                 index.split_link.is_some()
                     || matches!(split_index_config(cfg), SplitIndexConfig::Enabled)
-                    || git_test_split_index_env()
             }
         }
     }
@@ -593,7 +537,7 @@ fn load_shared_entries(
 ) -> Result<Vec<IndexEntry>> {
     let p = resolve_shared_index_file(git_dir, index_path, base_oid);
     let data = fs::read(&p).map_err(Error::Io)?;
-    let mut shared = Index::parse(&data)?;
+    let mut shared = Index::parse(&data, &crate::index::IndexParseOptions::default())?;
     for (i, e) in shared.entries.iter_mut().enumerate() {
         e.base_index_pos = (i + 1) as u32;
     }
@@ -637,17 +581,13 @@ pub(crate) fn write_index_file_split(
     existing_lock: Option<&mut crate::index::IndexLock>,
     commit_lock: bool,
 ) -> Result<()> {
-    // Mirror upstream `write_locked_index`: under GIT_TEST_CHECK_CACHE_TREE, verify the cache-tree
-    // against the index before persisting. A duplicate-entry tree (t4058) produces a cache-tree
-    // whose entry counts exceed the deduplicated index, which must abort the write with the
-    // canonical "corrupted cache-tree" error rather than silently writing a broken index.
-    if git_test_check_cache_tree() {
-        crate::write_tree::verify_cache_tree(index)?;
-    }
+    // A duplicate-entry tree (t4058) primes a cache-tree whose entry counts exceed the
+    // deduplicated index; refuse to persist it rather than write a corrupt TREE extension.
+    crate::write_tree::verify_cache_tree(index)?;
 
     let want_split = request.want_write_split(cfg, index);
 
-    let shared_repo = parse_shared_repository_perm(cfg.get("core.sharedRepository").as_deref());
+    let shared_repo = parse_shared_repository_perm(cfg.value("core.sharedRepository").as_deref());
 
     if !want_split {
         index.split_link = None;
@@ -706,9 +646,7 @@ pub(crate) fn write_index_file_split(
     }
 
     if index.sparse_directories {
-        return Err(Error::IndexError(
-            "cannot write split index for a sparse index".to_owned(),
-        ));
+        return Err(split_index_error(None, IndexCorruptReason::SplitIndexCorrupt).into());
     }
 
     let prev_base = index
@@ -719,13 +657,7 @@ pub(crate) fn write_index_file_split(
 
     // A zero base oid is what Git leaves after writing the shared index under `index.skipHash`;
     // readers treat it as unsplit, so there is no usable shared index to reuse.
-    let mut rebuild = prev_base.is_zero()
-        || should_rebuild_shared_index(index, cfg)
-        || git_test_split_index_force_reorder(&prev_base);
-
-    if git_test_split_index_env() && index.split_link.is_none() {
-        rebuild = true;
-    }
+    let rebuild = prev_base.is_zero() || should_rebuild_shared_index(index, cfg);
 
     let base_snapshot: Vec<IndexEntry> = if rebuild {
         let mut v: Vec<IndexEntry> = index.entries.to_vec();
@@ -736,7 +668,9 @@ pub(crate) fn write_index_file_split(
         v
     } else {
         let link = index.split_link.as_ref().ok_or_else(|| {
-            Error::IndexError("split index missing base link during reuse".to_owned())
+            Error::from(IndexError::corrupt(IndexCorrupt::new(
+                IndexCorruptReason::SplitIndexCorrupt,
+            )))
         })?;
         load_shared_entries(git_dir, path, &link.base_oid)?
     };
@@ -844,7 +778,9 @@ pub(crate) fn write_index_file_split(
             .split_link
             .as_ref()
             .ok_or_else(|| {
-                Error::IndexError("split index missing base link during reuse".to_owned())
+                Error::from(IndexError::corrupt(IndexCorrupt::new(
+                    IndexCorruptReason::SplitIndexCorrupt,
+                )))
             })?
             .base_oid;
         freshen_shared_index(&resolve_shared_index_file(git_dir, path, &oid));
@@ -981,7 +917,7 @@ pub fn resolve_split_index_if_needed(
     index: &mut Index,
     git_dir: &Path,
     index_path: &Path,
-) -> Result<()> {
+) -> crate::error::Result<()> {
     let Some(link) = index.split_link.clone() else {
         return Ok(());
     };
@@ -990,17 +926,21 @@ pub fn resolve_split_index_if_needed(
     }
     let base_oid = link.base_oid;
     let shared_path = resolve_shared_index_file(git_dir, index_path, &base_oid);
-    let data = fs::read(&shared_path).map_err(|e| {
-        Error::IndexError(format!(
-            "split index: cannot read shared index {}: {e}",
-            shared_path.display()
-        ))
+    let data = fs::read(&shared_path).map_err(|source| {
+        IndexError::PathIo(crate::error::PathIoError {
+            operation: crate::error::PathIoOperation::GitDir(
+                crate::error::GitDirPathOperation::WriteIndex,
+            ),
+            path: Some(shared_path.clone()),
+            source,
+        })
     })?;
     let hash_len = index.hash_algo.len();
     if data.len() < hash_len {
-        return Err(Error::IndexError(
-            "split index: shared index too short".to_owned(),
-        ));
+        return Err(crate::error::Error::from(split_index_error(
+            Some(index_path),
+            IndexCorruptReason::SplitIndexTooShort,
+        )));
     }
     let (body, trailer) = data.split_at(data.len() - hash_len);
     // The link names the shared file's trailer, which must also match its body.
@@ -1011,15 +951,17 @@ pub fn resolve_split_index_if_needed(
         trailer
     };
     if got != base_oid {
-        return Err(Error::IndexError(format!(
-            "broken index, expect {} in {}, got {}",
-            base_oid.to_hex(),
-            shared_path.display(),
-            got.to_hex()
+        return Err(crate::error::Error::from(split_index_error(
+            Some(index_path),
+            IndexCorruptReason::SplitIndexCorrupt,
         )));
     }
     freshen_shared_index(&shared_path);
-    let base_entries = Index::parse_with_algo(&data, index.hash_algo)?.entries;
+    let base_entries = Index::parse(
+        &data,
+        &crate::index::IndexParseOptions::default().with_hash_algo(index.hash_algo),
+    )?
+    .entries;
     merge_split_into_index(index, link, base_entries)?;
     index.split_link = Some(SplitIndexLink {
         base_oid,
@@ -1031,11 +973,14 @@ pub fn resolve_split_index_if_needed(
 
 /// Format output for `test-tool dump-split-index` (Git reads the index with `do_read_index` only,
 /// without merging the shared base — stubs and EWAH bitmaps stay intact).
-pub fn format_dump_split_index_file(data: &[u8], index: &Index) -> Result<String> {
+#[allow(dead_code)] // integration / re-export use only
+pub fn format_dump_split_index_file(data: &[u8], index: &Index) -> crate::error::Result<String> {
     use std::fmt::Write;
     let hash_len = index.hash_algo.len();
     if data.len() < hash_len {
-        return Err(Error::IndexError("index too short".to_owned()));
+        return Err(
+            IndexError::corrupt(IndexCorrupt::new(IndexCorruptReason::SplitIndexTooShort)).into(),
+        );
     }
     let body = &data[..data.len() - hash_len];
     let trail = &data[data.len() - hash_len..];
@@ -1046,12 +991,12 @@ pub fn format_dump_split_index_file(data: &[u8], index: &Index) -> Result<String
     };
 
     let mut s = String::new();
-    writeln!(s, "own {}", own.to_hex()).map_err(|e| Error::IndexError(e.to_string()))?;
+    writeln!(s, "own {}", own.to_hex()).map_err(std::io::Error::other)?;
     let Some(link) = &index.split_link else {
-        writeln!(s, "not a split index").map_err(|e| Error::IndexError(e.to_string()))?;
+        writeln!(s, "not a split index").map_err(std::io::Error::other)?;
         return Ok(s);
     };
-    writeln!(s, "base {}", link.base_oid.to_hex()).map_err(|e| Error::IndexError(e.to_string()))?;
+    writeln!(s, "base {}", link.base_oid.to_hex()).map_err(std::io::Error::other)?;
     for e in &index.entries {
         // Split-index replacement stubs use `CE_STRIP_NAME`: zero-length path on disk (Git still prints the line).
         let path_disp = String::from_utf8_lossy(&e.path);
@@ -1063,22 +1008,22 @@ pub fn format_dump_split_index_file(data: &[u8], index: &Index) -> Result<String
             e.stage(),
             path_disp
         )
-        .map_err(|e| Error::IndexError(e.to_string()))?;
+        .map_err(std::io::Error::other)?;
     }
-    write!(s, "replacements:").map_err(|e| Error::IndexError(e.to_string()))?;
+    write!(s, "replacements:").map_err(std::io::Error::other)?;
     if let Some(bm) = &link.replace_bitmap {
         bm.each_set_bit(|pos| {
             write!(s, " {}", pos).ok();
         });
     }
-    writeln!(s).map_err(|e| Error::IndexError(e.to_string()))?;
-    write!(s, "deletions:").map_err(|e| Error::IndexError(e.to_string()))?;
+    writeln!(s).map_err(std::io::Error::other)?;
+    write!(s, "deletions:").map_err(std::io::Error::other)?;
     if let Some(bm) = &link.delete_bitmap {
         bm.each_set_bit(|pos| {
             write!(s, " {}", pos).ok();
         });
     }
-    writeln!(s).map_err(|e| Error::IndexError(e.to_string()))?;
+    writeln!(s).map_err(std::io::Error::other)?;
     Ok(s)
 }
 
@@ -1179,14 +1124,24 @@ mod tests {
             "[splitIndex]\n\tmaxPercentChange = 20\n",
         )
         .expect("write config");
-        let cfg = ConfigSet::load(&Environment::empty(), Some(dir.path()), true).expect("load");
+        let cfg = ConfigSet::load(
+            &Environment::empty(),
+            Some(dir.path()),
+            &crate::config::LoadConfigOptions::standard(&Environment::empty(), Some(dir.path())),
+        )
+        .expect("load");
         assert!(should_rebuild_shared_index(&idx, &cfg));
         fs::write(
             dir.path().join("config"),
             "[splitIndex]\n\tmaxPercentChange = 100\n",
         )
         .expect("write config");
-        let cfg = ConfigSet::load(&Environment::empty(), Some(dir.path()), true).expect("load");
+        let cfg = ConfigSet::load(
+            &Environment::empty(),
+            Some(dir.path()),
+            &crate::config::LoadConfigOptions::standard(&Environment::empty(), Some(dir.path())),
+        )
+        .expect("load");
         assert!(!should_rebuild_shared_index(&idx, &cfg));
     }
 
@@ -1236,13 +1191,18 @@ mod tests {
             "[core]\n\tsplitIndex = true\n\tsharedRepository = group\n",
         )
         .expect("write");
-        let cfg = ConfigSet::load(&Environment::empty(), Some(dir.path()), true).expect("load");
+        let cfg = ConfigSet::load(
+            &Environment::empty(),
+            Some(dir.path()),
+            &crate::config::LoadConfigOptions::standard(&Environment::empty(), Some(dir.path())),
+        )
+        .expect("load");
         assert!(matches!(
             split_index_config(&cfg),
             SplitIndexConfig::Enabled
         ));
         assert_eq!(
-            parse_shared_repository_perm(cfg.get("core.sharedRepository").as_deref()),
+            parse_shared_repository_perm(cfg.value("core.sharedRepository").as_deref()),
             0o660
         );
         let _ = max_percent_split_change(&cfg);
@@ -1295,7 +1255,12 @@ mod tests {
             "[splitIndex]\n\tsharedIndexExpire = never\n",
         )
         .expect("write");
-        let cfg = ConfigSet::load(&Environment::empty(), Some(dir.path()), true).expect("load");
+        let cfg = ConfigSet::load(
+            &Environment::empty(),
+            Some(dir.path()),
+            &crate::config::LoadConfigOptions::standard(&Environment::empty(), Some(dir.path())),
+        )
+        .expect("load");
         assert_eq!(shared_index_expire_threshold(&cfg), 0);
 
         fs::write(
@@ -1303,7 +1268,12 @@ mod tests {
             "[splitIndex]\n\tsharedIndexExpire = now\n",
         )
         .expect("write");
-        let cfg = ConfigSet::load(&Environment::empty(), Some(dir.path()), true).expect("load");
+        let cfg = ConfigSet::load(
+            &Environment::empty(),
+            Some(dir.path()),
+            &crate::config::LoadConfigOptions::standard(&Environment::empty(), Some(dir.path())),
+        )
+        .expect("load");
         assert!(shared_index_expire_threshold(&cfg) > 0);
     }
 
@@ -1330,7 +1300,11 @@ mod tests {
         let index_path = git_dir.join("index");
         fs::write(&index_path, b"x").expect("write");
         let err = resolve_split_index_if_needed(&mut idx, &git_dir, &index_path).expect_err("read");
-        assert!(err.to_string().contains("shared index"));
+        assert!(
+            err.path_io()
+                .is_some_and(|io| io.source.kind() == std::io::ErrorKind::NotFound),
+            "expected missing shared index I/O error, got {err:?}"
+        );
     }
 
     fn system_git(root: &Path, args: &[&str]) -> String {
@@ -1416,7 +1390,8 @@ mod tests {
                 main[main.len() - 20..].iter().all(|&b| b == 0),
                 "{key}: the main index keeps honoring skipHash"
             );
-            let reread = Index::parse(&main).expect("parse");
+            let reread =
+                Index::parse(&main, &crate::index::IndexParseOptions::default()).expect("parse");
             let link = reread.split_link.expect("index stays split");
             assert!(!link.base_oid.is_zero());
             let shared_name = format!("sharedindex.{}", link.base_oid.to_hex());
@@ -1513,7 +1488,11 @@ mod tests {
         let index_path = git_dir.join("index");
         let err = resolve_split_index_if_needed(&mut idx, &git_dir, &index_path)
             .expect_err("zero trailer does not match the link");
-        assert!(err.to_string().contains("broken index"), "{err}");
+        assert!(
+            matches!(err, crate::error::Error::Index(IndexError::Corrupt { .. })),
+            "expected corrupt split index, got {err:?}"
+        );
+        assert!(err.to_string().contains("split index corrupt"), "{err}");
     }
 
     #[test]
@@ -1526,7 +1505,12 @@ mod tests {
             "[splitIndex]\n\tsharedIndexExpire = now\n",
         )
         .expect("write config");
-        let cfg = ConfigSet::load(&Environment::empty(), Some(dir.path()), true).expect("load");
+        let cfg = ConfigSet::load(
+            &Environment::empty(),
+            Some(dir.path()),
+            &crate::config::LoadConfigOptions::standard(&Environment::empty(), Some(dir.path())),
+        )
+        .expect("load");
         let stale = git_dir.join("sharedindex.deadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
         fs::write(&stale, b"stale").expect("write stale");
         #[cfg(unix)]

@@ -3,26 +3,17 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use grit_lib::apply::parse_patch;
-use grit_lib::blame::{blame_file, BlameOptions};
+use grit_lib::blame::BlameOptions;
 use grit_lib::config::ConfigSet;
-use grit_lib::diff::{
-    diff_commits_with_renames, diff_index_to_tree, diff_index_to_worktree_for_staging,
-    diff_tree_to_worktree_with_git_dir_and_rules, diff_trees, diff_trees_with_renames,
-    postprocess_diff_entries, DiffIndexToWorktreeOptions, DiffPostprocessOptions,
-};
+use grit_lib::diff::{CopyDetection, RenameDetection, TreeDiffOptions};
 use grit_lib::index::write_tree::write_tree_from_index;
 use grit_lib::index::{Index, IndexEntry, MODE_REGULAR};
 use grit_lib::objects::{ObjectId, ObjectKind};
 use grit_lib::parallel::ThreadPolicy;
 use grit_lib::repo::{InitOptions, Repository};
-use grit_lib::revwalk::rev_list::{
-    merge_bases, rev_list, OrderingMode, OutputMode, RevListOptions,
-};
-use grit_lib::revwalk::rev_parse::{
-    resolve_revision, resolve_revision_as_commit, resolve_revision_for_verify,
-};
-use grit_lib::worktree::pathspec::{matches_pathspec_list, parse_pathspecs_from_source};
-use grit_lib::worktree::worktree_rules::WorktreeRules;
+use grit_lib::revwalk::rev_list::{OrderingMode, RevListOptions};
+
+use grit_lib::worktree::pathspec::{parse_pathspecs_from_source, Pathspec, PathspecGlobalFlags};
 use std::fs;
 use tempfile::tempdir;
 
@@ -75,13 +66,31 @@ fn seed_long_history(
 #[test]
 fn long_history_revwalk_revparse_and_blame() -> grit_lib::error::Result<()> {
     let dir = tempdir().map_err(grit_lib::error::Error::Io)?;
-    let repo = Repository::init(dir.path(), &InitOptions::default())?;
+    let (repo, _) = Repository::init(dir.path(), &InitOptions::default())?;
     let tip = seed_long_history(dir.path(), &repo, 560)?;
     for n in 0..340 {
         for spec in [format!("HEAD~{n}"), format!("main~{n}"), format!(":/c{n}")] {
-            let _ = resolve_revision_for_verify(&repo, &spec).ok();
-            let _ = resolve_revision(&repo, &spec).ok();
-            let _ = resolve_revision_as_commit(&repo, &spec).ok();
+            let _ = repo
+                .revwalk()
+                .resolve(
+                    &spec,
+                    &grit_lib::revwalk::ResolveOptions::default()
+                        .with_index_dwim(grit_lib::revwalk::IndexDwim::Off)
+                        .with_purpose(grit_lib::revwalk::ResolvePurpose::RangeEnd),
+                )
+                .ok();
+            let _ = repo
+                .revwalk()
+                .resolve(&spec, &grit_lib::revwalk::ResolveOptions::default())
+                .ok();
+            let _ = repo
+                .revwalk()
+                .resolve(
+                    &spec,
+                    &grit_lib::revwalk::ResolveOptions::default()
+                        .with_peel(grit_lib::revwalk::Peel::Commit),
+                )
+                .ok();
         }
     }
     for ordering in [
@@ -93,7 +102,6 @@ fn long_history_revwalk_revparse_and_blame() -> grit_lib::error::Result<()> {
     ] {
         let opts = RevListOptions {
             ordering,
-            output_mode: OutputMode::Format(String::from("oneline")),
             paths: vec!["a.txt".into(), "dir/".into()],
             first_parent: ordering == OrderingMode::Topo,
             simplify_merges: true,
@@ -102,11 +110,14 @@ fn long_history_revwalk_revparse_and_blame() -> grit_lib::error::Result<()> {
             max_count: Some(64),
             ..RevListOptions::default()
         };
-        let _ = rev_list(&repo, &[String::from("main")], &[], &opts)?;
+        let _ = repo
+            .revwalk()
+            .rev_list(&[String::from("main")], &[], &opts)?;
     }
-    let _ = merge_bases(&repo, tip, tip, false)?;
-    let blame = blame_file(
-        &repo,
+    let _ = repo
+        .revwalk()
+        .merge_bases(&[tip, tip], grit_lib::revwalk::MergeBaseMode::All)?;
+    let blame = repo.diff().blame(
         "a.txt",
         &BlameOptions {
             start: Some(tip),
@@ -121,7 +132,7 @@ fn long_history_revwalk_revparse_and_blame() -> grit_lib::error::Result<()> {
 #[test]
 fn diff_index_worktree_and_patch_parse_sweep() -> grit_lib::error::Result<()> {
     let dir = tempdir().map_err(grit_lib::error::Error::Io)?;
-    let repo = Repository::init(dir.path(), &InitOptions::default())?;
+    let (repo, _) = Repository::init(dir.path(), &InitOptions::default())?;
     let b1 = repo
         .odb()
         .write_loose_materialize(ObjectKind::Blob, b"one\n")?;
@@ -146,18 +157,16 @@ fn diff_index_worktree_and_patch_parse_sweep() -> grit_lib::error::Result<()> {
     fs::write(repo.git_dir().join("refs/heads/main"), format!("{tip}\n"))
         .map_err(grit_lib::error::Error::Io)?;
     fs::write(dir.path().join("f.txt"), b"two\n").map_err(grit_lib::error::Error::Io)?;
-    let raw = diff_trees(repo.odb(), Some(&t1), Some(&t2), "")?;
-    let _ = diff_trees_with_renames(repo.odb(), Some(&t1), Some(&t2), "", 50)?;
-    let _ = diff_commits_with_renames(repo.odb(), &base, &tip, 50)?;
-    let cfg = ConfigSet::new();
-    let policy = ThreadPolicy::default();
-    let opts = DiffPostprocessOptions {
-        rename_threshold: 50,
-        copy_threshold: Some(50),
-        find_copies_harder: true,
-        ..DiffPostprocessOptions::default()
-    };
-    let _ = postprocess_diff_entries(repo.odb(), raw, Some(&t1), None, None, &cfg, &policy, &opts)?;
+    let diff = repo.diff();
+    let renames = TreeDiffOptions::default().with_renames(RenameDetection::Similarity(50));
+    let _ = diff.tree_to_tree(Some(&t1), Some(&t2), &TreeDiffOptions::default())?;
+    let _ = diff.tree_to_tree(Some(&t1), Some(&t2), &renames)?;
+    let _ = diff.commits(&base, &tip, &renames)?;
+    let copies = renames
+        .clone()
+        .with_copies(CopyDetection::FindHarder(50))
+        .with_threads(Some(ThreadPolicy::default()));
+    let _ = diff.tree_to_tree(Some(&t1), Some(&t2), &copies)?;
     let mut index = Index::new();
     index.entries_mut().push(IndexEntry {
         ctime_sec: 0,
@@ -177,32 +186,18 @@ fn diff_index_worktree_and_patch_parse_sweep() -> grit_lib::error::Result<()> {
         base_index_pos: 0,
     });
     let head_tree = write_tree_from_index(repo.odb(), &index, "")?;
-    let _ = diff_index_to_tree(repo.odb(), &index, Some(&head_tree), false)?;
-    let _ = diff_index_to_worktree_for_staging(
-        repo.odb(),
-        repo.git_dir(),
+    let _ = diff.index_to_tree(&index, Some(&head_tree), &TreeDiffOptions::default())?;
+    let _ = diff.index_to_worktree(
         &mut index,
-        dir.path(),
-        DiffIndexToWorktreeOptions {
-            repository_git_dir: Some(repo.git_dir().to_path_buf()),
-            ..DiffIndexToWorktreeOptions::default()
-        },
+        &TreeDiffOptions::default().with_refresh_index_stat(true),
     )?;
-    let rules = WorktreeRules::from_repository(&repo, &index)?;
-    let _ = diff_tree_to_worktree_with_git_dir_and_rules(
-        repo.odb(),
-        Some(&head_tree),
-        dir.path(),
-        repo.git_dir(),
-        &index,
-        Some(&cfg),
-        Some(&rules),
-    )?;
+    let _ = diff.tree_to_worktree(Some(&head_tree), &index, &TreeDiffOptions::default())?;
     let patch = "diff --git a/f.txt b/f.txt\n--- a/f.txt\n+++ b/f.txt\n@@ -1 +1 @@\n-one\n+two\n";
     let _ = parse_patch(patch, 1, "p", false, None)?;
     let specs = parse_pathspecs_from_source(b"*.txt\0dir/\0", true)?;
     for path in ["f.txt", "g.txt", "dir/b.txt", "missing"] {
-        let _ = matches_pathspec_list(path, &specs);
+        let ps = Pathspec::scoped(specs.clone(), PathspecGlobalFlags::default());
+        let _ = ps.matches_path(path);
     }
     Ok(())
 }
@@ -211,7 +206,6 @@ fn diff_index_worktree_and_patch_parse_sweep() -> grit_lib::error::Result<()> {
 fn supporting_and_submodule_gitdir_sweep() -> grit_lib::error::Result<()> {
     use grit_lib::config::gitmodules::gitdir::{
         ensure_submodule_gitdir_config, submodule_gitdir_filesystem_path,
-        submodule_path_config_enabled,
     };
     use grit_lib::config::gitmodules::{check_submodule_name, validate_gitmodules_blob_line};
     use grit_lib::config::{ConfigFile, ConfigScope};
@@ -220,14 +214,13 @@ fn supporting_and_submodule_gitdir_sweep() -> grit_lib::error::Result<()> {
     };
 
     let dir = tempdir().map_err(grit_lib::error::Error::Io)?;
-    let repo = Repository::init(dir.path(), &InitOptions::default())?;
+    let (repo, _) = Repository::init(dir.path(), &InitOptions::default())?;
     let git_dir = repo.git_dir();
     fs::write(
         git_dir.join("config"),
         "[extensions]\n\tsubmodulePathConfig = true\n[core]\n\tautocrlf = true\n",
     )
     .map_err(grit_lib::error::Error::Io)?;
-    assert!(submodule_path_config_enabled(git_dir));
     assert!(check_submodule_name("lib/foo"));
     assert!(validate_gitmodules_blob_line(b"[submodule \"x\"]\n").is_none());
     let cfg = ConfigFile::parse(

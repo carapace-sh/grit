@@ -36,9 +36,6 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use grit_lib::objects::ObjectId;
-use grit_lib::progress::NeverCancel;
-use grit_lib::refs::resolve_ref;
-use grit_lib::remote::fetch::{fetch_remote, NoProgress};
 use grit_lib::remote::transfer::{FetchOptions, TagMode};
 use grit_lib::remote::transport::{
     ConnectOptions, Connection, GitDaemonTransport, Service, Transport,
@@ -343,10 +340,7 @@ fn v2_clone_from_scratch_no_haves_and_not_v0() {
     let local_git = local.join(".git");
 
     let transport = GitDaemonTransport::new();
-    let opts_v2 = ConnectOptions {
-        protocol_version: 2,
-        ..Default::default()
-    };
+    let opts_v2 = ConnectOptions::with_protocol_version(2);
     let mut conn = match transport.connect(&srv.url, Service::UploadPack, &opts_v2) {
         Ok(c) => c,
         Err(e) => {
@@ -357,27 +351,38 @@ fn v2_clone_from_scratch_no_haves_and_not_v0() {
     assert_eq!(conn.protocol_version(), 2, "expected v2 negotiation");
     assert!(conn.advertised_refs().is_empty(), "v2 advertises no refs");
 
-    let mut opts = FetchOptions {
-        refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()],
-        tags: TagMode::None,
-        ..Default::default()
-    };
-    fetch_remote(
+    let mut opts = FetchOptions::new();
+    opts.refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()];
+    opts.tags = TagMode::None;
+    grit_lib::repo::Repository::open(
         &local_git,
-        &mut *conn,
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&mut opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Connection(&mut *conn),
         &mut opts,
         &mut NoProgress,
-        &NeverCancel,
+        &CancelToken::never(),
     )
     .expect("v2 clone");
     drop(conn);
 
     assert_eq!(
-        resolve_ref(&local_git, "refs/remotes/origin/main").unwrap(),
+        grit_test_support::refs::at(&local_git)
+            .references()
+            .resolve("refs/remotes/origin/main")
+            .unwrap(),
         main_oid
     );
     assert_eq!(
-        resolve_ref(&local_git, "refs/remotes/origin/topic").unwrap(),
+        grit_test_support::refs::at(&local_git)
+            .references()
+            .resolve("refs/remotes/origin/topic")
+            .unwrap(),
         topic_oid
     );
     fsck_clean(&local);
@@ -430,10 +435,7 @@ fn v2_incremental_offers_haves_and_pack_is_minimal() {
     };
 
     let transport = GitDaemonTransport::new();
-    let opts_v2 = ConnectOptions {
-        protocol_version: 2,
-        ..Default::default()
-    };
+    let opts_v2 = ConnectOptions::with_protocol_version(2);
 
     let tmp = tempfile::tempdir().unwrap();
     let local = tmp.path().join("local");
@@ -451,17 +453,22 @@ fn v2_incremental_offers_haves_and_pack_is_minimal() {
             }
         };
         assert_eq!(conn.protocol_version(), 2);
-        let mut opts = FetchOptions {
-            refspecs: vec!["+refs/heads/main:refs/remotes/origin/main".to_owned()],
-            tags: TagMode::None,
-            ..Default::default()
-        };
-        fetch_remote(
+        let mut opts = FetchOptions::new();
+        opts.refspecs = vec!["+refs/heads/main:refs/remotes/origin/main".to_owned()];
+        opts.tags = TagMode::None;
+        grit_lib::repo::Repository::open(
             &local_git,
-            &mut *conn,
+            &grit_lib::config::environment::RepositoryOptions::with_environment(
+                (&mut opts).environment.clone(),
+            ),
+        )
+        .expect("open fetch target")
+        .remotes()
+        .fetch_from(
+            grit_lib::remote::transfer::TransferEndpoint::Connection(&mut *conn),
             &mut opts,
             &mut NoProgress,
-            &NeverCancel,
+            &CancelToken::never(),
         )
         .expect("seed fetch");
     }
@@ -508,23 +515,31 @@ fn v2_incremental_offers_haves_and_pack_is_minimal() {
     let mut conn = TeeConn::new(raw_conn);
     let captured = conn.captured();
     assert_eq!(conn.protocol_version(), 2);
-    let mut opts = FetchOptions {
-        refspecs: vec!["+refs/heads/main:refs/remotes/origin/main".to_owned()],
-        tags: TagMode::None,
-        ..Default::default()
-    };
-    fetch_remote(
+    let mut opts = FetchOptions::new();
+    opts.refspecs = vec!["+refs/heads/main:refs/remotes/origin/main".to_owned()];
+    opts.tags = TagMode::None;
+    grit_lib::repo::Repository::open(
         &local_git,
-        &mut conn,
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&mut opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Connection(&mut conn),
         &mut opts,
         &mut NoProgress,
-        &NeverCancel,
+        &CancelToken::never(),
     )
     .expect("incremental fetch");
     drop(conn);
 
     assert_eq!(
-        resolve_ref(&local_git, "refs/remotes/origin/main").unwrap(),
+        grit_test_support::refs::at(&local_git)
+            .references()
+            .resolve("refs/remotes/origin/main")
+            .unwrap(),
         main_new,
         "incremental main tip"
     );
@@ -586,10 +601,7 @@ fn v2_unborn_remote_is_empty_and_does_not_hang() {
     let local_git = local.join(".git");
 
     let transport = GitDaemonTransport::new();
-    let opts_v2 = ConnectOptions {
-        protocol_version: 2,
-        ..Default::default()
-    };
+    let opts_v2 = ConnectOptions::with_protocol_version(2);
     let mut conn = match transport.connect(&srv.url, Service::UploadPack, &opts_v2) {
         Ok(c) => c,
         Err(e) => {
@@ -599,11 +611,9 @@ fn v2_unborn_remote_is_empty_and_does_not_hang() {
     };
     assert_eq!(conn.protocol_version(), 2);
 
-    let mut opts = FetchOptions {
-        refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()],
-        tags: TagMode::All,
-        ..Default::default()
-    };
+    let mut opts = FetchOptions::new();
+    opts.refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()];
+    opts.tags = TagMode::All;
 
     // This must return PROMPTLY. The v2 server runs a persistent serve_loop; if
     // `finish_send` regressed (write side never closed), an ls-refs-only fetch
@@ -627,12 +637,19 @@ fn v2_unborn_remote_is_empty_and_does_not_hang() {
         kill_pid(watchdog_pid);
     });
 
-    let outcome = fetch_remote(
+    let outcome = grit_lib::repo::Repository::open(
         &local_git,
-        &mut *conn,
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&mut opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Connection(&mut *conn),
         &mut opts,
         &mut NoProgress,
-        &NeverCancel,
+        &CancelToken::never(),
     )
     .expect("v2 empty fetch");
     done.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -680,10 +697,7 @@ fn v2_tag_modes_all_and_following() {
     let v1_oid = rev_parse(&srv.source, "refs/tags/v1");
     let vside_oid = rev_parse(&srv.source, "refs/tags/vside");
     let transport = GitDaemonTransport::new();
-    let opts_v2 = ConnectOptions {
-        protocol_version: 2,
-        ..Default::default()
-    };
+    let opts_v2 = ConnectOptions::with_protocol_version(2);
 
     // --- TagMode::All: both tags land. ---
     {
@@ -701,28 +715,39 @@ fn v2_tag_modes_all_and_following() {
             }
         };
         assert_eq!(conn.protocol_version(), 2);
-        let mut opts = FetchOptions {
-            // Only fetch main; tags come via TagMode.
-            refspecs: vec!["+refs/heads/main:refs/remotes/origin/main".to_owned()],
-            tags: TagMode::All,
-            ..Default::default()
-        };
-        fetch_remote(
+        let mut opts = FetchOptions::new();
+        // Only fetch main; tags come via TagMode.
+        opts.refspecs = vec!["+refs/heads/main:refs/remotes/origin/main".to_owned()];
+        opts.tags = TagMode::All;
+        grit_lib::repo::Repository::open(
             &local_git,
-            &mut *conn,
+            &grit_lib::config::environment::RepositoryOptions::with_environment(
+                (&mut opts).environment.clone(),
+            ),
+        )
+        .expect("open fetch target")
+        .remotes()
+        .fetch_from(
+            grit_lib::remote::transfer::TransferEndpoint::Connection(&mut *conn),
             &mut opts,
             &mut NoProgress,
-            &NeverCancel,
+            &CancelToken::never(),
         )
         .expect("v2 tags=all");
         drop(conn);
 
         assert_eq!(
-            resolve_ref(&local_git, "refs/tags/v1").expect("v1 tag (All)"),
+            grit_test_support::refs::at(&local_git)
+                .references()
+                .resolve("refs/tags/v1")
+                .expect("v1 tag (All)"),
             v1_oid
         );
         assert_eq!(
-            resolve_ref(&local_git, "refs/tags/vside").expect("vside tag (All)"),
+            grit_test_support::refs::at(&local_git)
+                .references()
+                .resolve("refs/tags/vside")
+                .expect("vside tag (All)"),
             vside_oid,
             "TagMode::All must fetch even unreachable-from-main tags"
         );
@@ -741,30 +766,41 @@ fn v2_tag_modes_all_and_following() {
             .connect(&srv.url, Service::UploadPack, &opts_v2)
             .expect("connect follow");
         assert_eq!(conn.protocol_version(), 2);
-        let mut opts = FetchOptions {
-            refspecs: vec!["+refs/heads/main:refs/remotes/origin/main".to_owned()],
-            tags: TagMode::Following,
-            ..Default::default()
-        };
-        fetch_remote(
+        let mut opts = FetchOptions::new();
+        opts.refspecs = vec!["+refs/heads/main:refs/remotes/origin/main".to_owned()];
+        opts.tags = TagMode::Following;
+        grit_lib::repo::Repository::open(
             &local_git,
-            &mut *conn,
+            &grit_lib::config::environment::RepositoryOptions::with_environment(
+                (&mut opts).environment.clone(),
+            ),
+        )
+        .expect("open fetch target")
+        .remotes()
+        .fetch_from(
+            grit_lib::remote::transfer::TransferEndpoint::Connection(&mut *conn),
             &mut opts,
             &mut NoProgress,
-            &NeverCancel,
+            &CancelToken::never(),
         )
         .expect("v2 tags=following");
         drop(conn);
 
         // v1 points at main's tip's history -> kept.
         assert_eq!(
-            resolve_ref(&local_git, "refs/tags/v1").expect("v1 tag (Following)"),
+            grit_test_support::refs::at(&local_git)
+                .references()
+                .resolve("refs/tags/v1")
+                .expect("v1 tag (Following)"),
             v1_oid,
             "TagMode::Following must keep tags reachable from fetched heads"
         );
         // vside points at the `side` branch we did NOT fetch -> dropped.
         assert!(
-            resolve_ref(&local_git, "refs/tags/vside").is_err(),
+            grit_test_support::refs::at(&local_git)
+                .references()
+                .resolve("refs/tags/vside")
+                .is_err(),
             "TagMode::Following must NOT write a tag unreachable from fetched heads"
         );
         fsck_clean(&local);
@@ -796,10 +832,7 @@ fn v2_ref_prefix_filtering_excludes_tags() {
     let local_git = local.join(".git");
 
     let transport = GitDaemonTransport::new();
-    let opts_v2 = ConnectOptions {
-        protocol_version: 2,
-        ..Default::default()
-    };
+    let opts_v2 = ConnectOptions::with_protocol_version(2);
     let mut conn = match transport.connect(&srv.url, Service::UploadPack, &opts_v2) {
         Ok(c) => c,
         Err(e) => {
@@ -810,24 +843,32 @@ fn v2_ref_prefix_filtering_excludes_tags() {
     assert_eq!(conn.protocol_version(), 2);
 
     // Heads only, NO tag following -> ls-refs must only ask for HEAD + refs/heads/.
-    let mut opts = FetchOptions {
-        refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()],
-        tags: TagMode::None,
-        ..Default::default()
-    };
-    let outcome = fetch_remote(
+    let mut opts = FetchOptions::new();
+    opts.refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()];
+    opts.tags = TagMode::None;
+    let outcome = grit_lib::repo::Repository::open(
         &local_git,
-        &mut *conn,
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&mut opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Connection(&mut *conn),
         &mut opts,
         &mut NoProgress,
-        &NeverCancel,
+        &CancelToken::never(),
     )
     .expect("v2 heads-only fetch");
     drop(conn);
 
     // No tag ref was written.
     assert!(
-        resolve_ref(&local_git, "refs/tags/v1").is_err(),
+        grit_test_support::refs::at(&local_git)
+            .references()
+            .resolve("refs/tags/v1")
+            .is_err(),
         "heads-only refspec with TagMode::None must not fetch tags"
     );
     // The outcome's updates are all heads, never tags.
@@ -926,10 +967,7 @@ fn v2_sha256_fetch_lands_refs_and_objects() {
     let local_git = local.join(".git");
 
     let transport = GitDaemonTransport::new();
-    let opts_v2 = ConnectOptions {
-        protocol_version: 2,
-        ..Default::default()
-    };
+    let opts_v2 = ConnectOptions::with_protocol_version(2);
     let mut conn = match transport.connect(&srv.url, Service::UploadPack, &opts_v2) {
         Ok(c) => c,
         Err(e) => {
@@ -948,39 +986,55 @@ fn v2_sha256_fetch_lands_refs_and_objects() {
         conn.capabilities()
     );
 
-    let mut opts = FetchOptions {
-        refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()],
-        tags: TagMode::All,
-        ..Default::default()
-    };
-    let outcome = fetch_remote(
+    let mut opts = FetchOptions::new();
+    opts.refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()];
+    opts.tags = TagMode::All;
+    let outcome = grit_lib::repo::Repository::open(
         &local_git,
-        &mut *conn,
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&mut opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Connection(&mut *conn),
         &mut opts,
         &mut NoProgress,
-        &NeverCancel,
+        &CancelToken::never(),
     )
     .expect("v2 sha256 fetch_remote");
     drop(conn);
 
     // Tracking refs + tag landed with the source's 64-hex oids.
     assert_eq!(
-        resolve_ref(&local_git, "refs/remotes/origin/main").unwrap(),
+        grit_test_support::refs::at(&local_git)
+            .references()
+            .resolve("refs/remotes/origin/main")
+            .unwrap(),
         main_oid
     );
     assert_eq!(
-        resolve_ref(&local_git, "refs/remotes/origin/topic").unwrap(),
+        grit_test_support::refs::at(&local_git)
+            .references()
+            .resolve("refs/remotes/origin/topic")
+            .unwrap(),
         topic_oid
     );
     assert_eq!(
-        resolve_ref(&local_git, "refs/tags/v1").expect("sha256 tag v1"),
+        grit_test_support::refs::at(&local_git)
+            .references()
+            .resolve("refs/tags/v1")
+            .expect("sha256 tag v1"),
         tag_oid
     );
     assert_eq!(outcome.default_branch.as_deref(), Some("main"));
 
     // Cross-check every fetched oid against system `git rev-parse` on the source.
     assert_eq!(
-        resolve_ref(&local_git, "refs/remotes/origin/main")
+        grit_test_support::refs::at(&local_git)
+            .references()
+            .resolve("refs/remotes/origin/main")
             .unwrap()
             .to_hex(),
         git(&srv.source, &["rev-parse", "refs/heads/main"]).trim()

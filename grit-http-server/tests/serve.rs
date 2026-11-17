@@ -9,7 +9,7 @@ use std::path::Path;
 use std::process::{Command, Output};
 
 use grit_http_server::bundles::BundleSettings;
-use grit_http_server::server::{ServeConfig, Server, ServerError};
+use grit_http_server::server::{ServeConfig, ServeLimits, Server, ServerError, Shutdown};
 use grit_http_server::store::{Access, AuthStore, HashedPassword, Token};
 
 const ADMIN_EMAIL: &str = "admin@example.com";
@@ -132,18 +132,34 @@ fn start(root: &Path, database: &Path) -> SocketAddr {
 }
 
 fn start_with(root: &Path, database: &Path, bundles: BundleSettings) -> SocketAddr {
-    let server = Server::bind(
-        ServeConfig {
-            root: root.to_path_buf(),
-            database: database.to_path_buf(),
-            repository_options: grit_protocol::repository_options_from_process(),
-            bundles,
+    start_with_config(ServeConfig {
+        root: root.to_path_buf(),
+        database: database.to_path_buf(),
+        repository_options: grit_protocol::repository_options_from_process(),
+        bundles,
+        limits: ServeLimits::default(),
+    })
+}
+
+fn start_with_limits(root: &Path, database: &Path, limits: ServeLimits) -> SocketAddr {
+    start_with_config(ServeConfig {
+        root: root.to_path_buf(),
+        database: database.to_path_buf(),
+        repository_options: grit_protocol::repository_options_from_process(),
+        bundles: BundleSettings {
+            enabled: false,
+            ..BundleSettings::default()
         },
-        "127.0.0.1:0",
-    )
-    .expect("bind server");
+        limits,
+    })
+}
+
+fn start_with_config(config: ServeConfig) -> SocketAddr {
+    let server = Server::bind(config, "127.0.0.1:0").expect("bind server");
     let addr = server.local_addr().expect("local addr");
-    std::thread::spawn(move || server.run());
+    std::thread::spawn(move || {
+        let _ = server.run(Shutdown::default());
+    });
     addr
 }
 
@@ -254,6 +270,44 @@ fn sign_in(addr: SocketAddr, email: &str, password: &str) -> Reply {
         &[],
         &form(&[("email", email), ("password", password), ("next", "/")]),
     )
+}
+
+#[cfg(unix)]
+#[test]
+fn push_pre_receive_hook_sees_token_user_as_remote_user() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    let database = fixture(root);
+    let bare = root.join("repos/project.git");
+    let hook = bare.join("hooks/pre-receive");
+    std::fs::write(
+        &hook,
+        "#!/bin/sh\ncat >/dev/null\necho \"grit-remote-user=$REMOTE_USER\" >&2\n",
+    )
+    .expect("hook");
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let addr = start(&root.join("repos"), &database);
+    let clone_url = format!("http://u:{ADMIN_TOKEN}@{addr}/project.git");
+    git(root, &["clone", "-q", &clone_url, "w"]);
+    let w = root.join("w");
+    git(&w, &["commit", "-q", "--allow-empty", "-m", "x"]);
+    let out = git_output(&w, &["push", "origin", "HEAD:refs/heads/hook-user-test"]);
+    assert!(
+        out.status.success(),
+        "push failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("grit-remote-user=admin@example.com"),
+        "expected token user in hook output: {stderr}"
+    );
+    assert!(
+        !stderr.contains("grit-remote-user=u"),
+        "must not use HTTP username: {stderr}"
+    );
 }
 
 #[test]
@@ -735,6 +789,7 @@ fn a_database_without_users_refuses_to_start() {
             database: tmp.path().join("empty.db"),
             repository_options: grit_protocol::repository_options_from_process(),
             bundles: BundleSettings::default(),
+            limits: ServeLimits::default(),
         },
         "127.0.0.1:0",
     );
@@ -1038,17 +1093,19 @@ impl grit_lib::remote::HttpClientFactory for NoHttp {
     fn create(
         &self,
         _: &grit_lib::config::ConfigSet,
-    ) -> grit_lib::remote::RemoteResult<Box<dyn grit_lib::remote::transport::http::HttpClient>>
-    {
-        Err(grit_lib::remote::RemoteError::UnsupportedScheme)
+    ) -> grit_lib::error::Result<Box<dyn grit_lib::remote::transport::http::HttpClient>> {
+        Err(grit_lib::error::Error::Remote(
+            grit_lib::remote::RemoteError::UnsupportedScheme,
+        ))
     }
 
-    fn create_for_probe(
+    fn create_for_preflight(
         &self,
         _: &grit_lib::config::ConfigSet,
-    ) -> grit_lib::remote::RemoteResult<Box<dyn grit_lib::remote::transport::http::HttpClient>>
-    {
-        Err(grit_lib::remote::RemoteError::UnsupportedScheme)
+    ) -> grit_lib::error::Result<Box<dyn grit_lib::remote::transport::http::HttpClient>> {
+        Err(grit_lib::error::Error::Remote(
+            grit_lib::remote::RemoteError::UnsupportedScheme,
+        ))
     }
 }
 
@@ -1078,7 +1135,7 @@ fn snapshot_checkouts_of_offloaded_blobs_follow_lazy_fetch() {
         let mut opts = grit_lib::maintenance::OffloadOptions::new("lop", 4_000_000_000);
         opts.filter = Some(grit_lib::remote::partial_clone::ObjectFilterSpec::BlobLimit(10 * 1024));
         opts.configure_lop = true;
-        let report = grit_lib::maintenance::offload_blobs(&repo, &opts).expect("offload");
+        let report = repo.maintenance().offload_blobs(&opts).expect("offload");
         assert_eq!(report.dropped_from_main, 1);
         grit_lib::objects::pack::clear_pack_cache();
     }
@@ -1097,12 +1154,15 @@ fn snapshot_checkouts_of_offloaded_blobs_follow_lazy_fetch() {
                 enabled: false,
                 ..BundleSettings::default()
             },
+            limits: ServeLimits::default(),
         },
         "127.0.0.1:0",
     )
     .expect("bind server");
     let addr = server.local_addr().expect("local addr");
-    std::thread::spawn(move || server.run());
+    std::thread::spawn(move || {
+        let _ = server.run(Shutdown::default());
+    });
     let auth = [bearer(ADMIN_TOKEN)];
     let request = br#"{"paths":[]}"#;
 
@@ -1130,4 +1190,249 @@ fn snapshot_checkouts_of_offloaded_blobs_follow_lazy_fetch() {
     std::fs::write(root.join("snap.bundle"), bundle).expect("write bundle");
     git(root, &["clone", "-q", "-b", "main", "snap.bundle", "snap"]);
     assert_eq!(std::fs::read(root.join("snap/big.bin")).expect("big"), big);
+}
+
+#[test]
+fn incomplete_request_headers_are_closed() {
+    use std::io::{Read, Write};
+    use std::time::{Duration, Instant};
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let database = fixture(tmp.path());
+    let limits = ServeLimits {
+        header_timeout: Duration::from_millis(250),
+        ..ServeLimits::default()
+    };
+    let addr = start_with_limits(&tmp.path().join("repos"), &database, limits);
+    std::thread::sleep(Duration::from_millis(100));
+    let mut stream = TcpStream::connect(addr).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("read timeout");
+    stream
+        .write_all(b"GET /project.git/info/refs?service=git-upload-pack HTTP/1.1\r\nHost: x\r\n")
+        .expect("write");
+    let start = Instant::now();
+    let mut buf = [0u8; 256];
+    while start.elapsed() < Duration::from_secs(2) {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(_) => continue,
+            Err(_) => break,
+        }
+    }
+    if start.elapsed() >= Duration::from_secs(2) {
+        panic!("connection stayed open too long");
+    }
+    assert!(
+        start.elapsed() < Duration::from_millis(900),
+        "expected header timeout, took {:?}",
+        start.elapsed()
+    );
+}
+
+#[test]
+fn stalled_upload_pack_does_not_block_info_refs() {
+    use std::io::Write;
+    use std::time::Duration;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    let database = fixture(root);
+    let oid = rev_parse(&root.join("seed"), "HEAD");
+    let limits = ServeLimits {
+        idle_timeout: Duration::from_millis(400),
+        ..ServeLimits::default()
+    };
+    let addr = start_with_limits(&root.join("repos"), &database, limits);
+    std::thread::sleep(Duration::from_millis(100));
+
+    let mut stall = TcpStream::connect(addr).expect("connect");
+    let partial = format!(
+        "POST /project.git/git-upload-pack HTTP/1.1\r\nHost: x\r\n{}\r\nContent-Type: application/x-git-upload-pack-request\r\nContent-Length: 100000\r\n\r\n0032want {oid}\n",
+        bearer(ADMIN_TOKEN)
+    );
+    stall.write_all(partial.as_bytes()).expect("post");
+    stall.flush().ok();
+
+    std::thread::sleep(Duration::from_millis(700));
+
+    let reply = http(
+        addr,
+        "GET",
+        "/project.git/info/refs?service=git-upload-pack",
+        &[bearer(ADMIN_TOKEN)],
+        "",
+    );
+    assert!(
+        reply.status.contains("200"),
+        "info/refs should succeed after idle timeout, got {}",
+        reply.status
+    );
+    drop(stall);
+}
+
+#[test]
+fn max_git_requests_returns_service_unavailable() {
+    use std::io::Write;
+    use std::time::Duration;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    let database = fixture(root);
+    let oid = rev_parse(&root.join("seed"), "HEAD");
+    let limits = ServeLimits {
+        idle_timeout: Duration::from_secs(60),
+        max_git_requests: 1,
+        ..ServeLimits::default()
+    };
+    let addr = start_with_limits(&root.join("repos"), &database, limits);
+    std::thread::sleep(Duration::from_millis(100));
+
+    let mut stall = TcpStream::connect(addr).expect("connect");
+    let partial = format!(
+        "POST /project.git/git-upload-pack HTTP/1.1\r\nHost: x\r\n{}\r\nContent-Type: application/x-git-upload-pack-request\r\nContent-Length: 100000\r\n\r\n0032want {oid}\n",
+        bearer(ADMIN_TOKEN)
+    );
+    stall.write_all(partial.as_bytes()).expect("post");
+    stall.flush().ok();
+    std::thread::sleep(Duration::from_millis(50));
+
+    let reply = http(
+        addr,
+        "GET",
+        "/project.git/info/refs?service=git-upload-pack",
+        &[bearer(ADMIN_TOKEN)],
+        "",
+    );
+    assert!(
+        reply.status.contains("503"),
+        "second git request should be refused, got {}",
+        reply.status
+    );
+    drop(stall);
+}
+
+/// Stateless v0 upload-pack body: `want` (with caps), flush, `done`.
+fn stateless_fetch_body(oid: &str) -> Vec<u8> {
+    use grit_lib::remote::pkt_line;
+    let mut body = Vec::new();
+    let caps = " multi_ack side-band-64k thin-pack ofs-delta";
+    pkt_line::write_line_to_vec(&mut body, &format!("want {oid}{caps}")).expect("want");
+    body.extend_from_slice(b"0000");
+    pkt_line::write_line_to_vec(&mut body, "done").expect("done");
+    body
+}
+
+/// High-entropy bytes so the resulting pack stays large after zlib.
+fn incompressible_bytes(len: usize) -> Vec<u8> {
+    let mut seed = 0x2545_f491_4f6c_dd1du64;
+    (0..len)
+        .map(|_| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed & 0xff) as u8
+        })
+        .collect()
+}
+
+/// Read only the HTTP status line and headers from `stream`, leaving any
+/// response body bytes in the kernel buffer (simulates a client that stops
+/// reading the pack).
+fn read_response_headers_only(stream: &mut TcpStream) -> Vec<u8> {
+    use std::io::Read;
+    let mut response = Vec::new();
+    let mut byte = [0u8; 1];
+    while stream.read(&mut byte).expect("read header byte") != 0 {
+        response.push(byte[0]);
+        if response.len() >= 4 && response.ends_with(b"\r\n\r\n") {
+            break;
+        }
+    }
+    response
+}
+
+#[test]
+fn slow_fetch_response_reader_releases_git_slot() {
+    use std::io::Write;
+    use std::time::Duration;
+
+    use grit_http_server::smart_http::{STREAM_CHANNEL_DEPTH, STREAM_CHUNK};
+
+    // Must exceed upload-pack stream buffering so a non-reading client backpressures
+    // the worker (see `STREAM_CHANNEL_DEPTH` × `STREAM_CHUNK` in smart_http.rs).
+    const BLOB_BYTES: usize = 32 * 1024 * 1024;
+    assert!(BLOB_BYTES > STREAM_CHANNEL_DEPTH * STREAM_CHUNK);
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    let database = fixture(root);
+    let wt = root.join("wt");
+    git(
+        root,
+        &[
+            "clone",
+            "-q",
+            root.join("repos/project.git").to_str().expect("utf-8"),
+            "wt",
+        ],
+    );
+    std::fs::write(wt.join("big.bin"), incompressible_bytes(BLOB_BYTES)).expect("write");
+    git(&wt, &["add", "big.bin"]);
+    git(&wt, &["commit", "-q", "-m", "big"]);
+    git(
+        &wt,
+        &[
+            "push",
+            "-q",
+            root.join("repos/project.git").to_str().expect("utf-8"),
+            "main",
+        ],
+    );
+
+    let oid = rev_parse(&wt, "HEAD");
+    let limits = ServeLimits {
+        header_timeout: Duration::from_secs(30),
+        idle_timeout: Duration::from_secs(1),
+        max_git_requests: 1,
+    };
+    let addr = start_with_limits(&root.join("repos"), &database, limits);
+    std::thread::sleep(Duration::from_millis(100));
+
+    let body = stateless_fetch_body(&oid);
+    let mut stall = TcpStream::connect(addr).expect("connect");
+    stall
+        .set_read_timeout(Some(Duration::from_secs(120)))
+        .expect("read timeout");
+    let request_head = format!(
+        "POST /project.git/git-upload-pack HTTP/1.1\r\nHost: x\r\n{}\r\nContent-Type: application/x-git-upload-pack-request\r\nContent-Length: {}\r\n\r\n",
+        bearer(ADMIN_TOKEN),
+        body.len()
+    );
+    stall.write_all(request_head.as_bytes()).expect("post head");
+    stall.write_all(&body).expect("post body");
+    stall.flush().ok();
+    let response = read_response_headers_only(&mut stall);
+    assert!(
+        response.starts_with(b"HTTP/1.1 200") || response.starts_with(b"HTTP/1.0 200"),
+        "fetch should start: {}",
+        String::from_utf8_lossy(&response)
+    );
+
+    std::thread::sleep(Duration::from_secs(4));
+
+    let reply = http(
+        addr,
+        "GET",
+        "/project.git/info/refs?service=git-upload-pack",
+        &[bearer(ADMIN_TOKEN)],
+        "",
+    );
+    assert!(
+        reply.status.contains("200"),
+        "git slot should be free after response idle timeout, got {}",
+        reply.status
+    );
+    drop(stall);
 }

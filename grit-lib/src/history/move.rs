@@ -6,8 +6,9 @@ use crate::repo::Repository;
 use super::error::HistoryError;
 use super::plan::plan_replay_linear_segment;
 use super::types::{RewriteOptions, RewritePlan};
+use super::PlanningError;
 
-fn commit_parents(repo: &Repository, oid: ObjectId) -> Result<Vec<ObjectId>, HistoryError> {
+fn commit_parents(repo: &Repository, oid: ObjectId) -> crate::error::Result<Vec<ObjectId>> {
     Ok(repo.odb().read_commit(&oid)?.parents)
 }
 
@@ -22,41 +23,32 @@ pub enum Placement {
 
 /// Plan moving `commit` to `placement` on the linear first-parent history of `HEAD`.
 ///
-/// Writes replacement commit objects into the ODB; refs are updated only when the caller applies
-/// the returned [`RewritePlan`].
-///
-/// # Errors
-///
-/// Returns [`HistoryError::NotInHistory`], [`HistoryError::MoveTargetNotInHistory`],
-/// [`HistoryError::NoOp`], [`HistoryError::NotLinear`], or errors from replay planning.
-/// An unborn or invalid `HEAD` is [`HistoryError::Library`] wrapping
-/// [`Error::UnbornHead`](crate::error::Error::UnbornHead) or
-/// [`Error::InvalidHead`](crate::error::Error::InvalidHead).
-pub fn move_commit(
+/// See [`History::move_commit`](super::History::move_commit).
+pub(crate) fn move_commit(
     repo: &Repository,
     commit: ObjectId,
     placement: Placement,
     opts: &RewriteOptions,
-) -> Result<RewritePlan, HistoryError> {
+) -> crate::error::Result<RewritePlan> {
     let head = repo.head_commit()?;
     let mut chain = first_parent_chain(repo, head)?;
     if chain.is_empty() {
-        return Err(HistoryError::NotInHistory { commit });
+        return Err(HistoryError::NotInHistory { commit }.into());
     }
 
     let original = chain.clone();
     let Some(old_idx) = chain.iter().position(|&c| c == commit) else {
-        return Err(HistoryError::NotInHistory { commit });
+        return Err(HistoryError::NotInHistory { commit }.into());
     };
 
     let anchor = match placement {
         Placement::Before(anchor) | Placement::After(anchor) => anchor,
     };
     if anchor == commit {
-        return Err(HistoryError::NoOp { commit });
+        return Err(HistoryError::NoOp { commit }.into());
     }
     let Some(mut anchor_idx) = chain.iter().position(|&c| c == anchor) else {
-        return Err(HistoryError::MoveTargetNotInHistory { commit: anchor });
+        return Err(HistoryError::MoveTargetNotInHistory { commit: anchor }.into());
     };
 
     chain.remove(old_idx);
@@ -70,15 +62,15 @@ pub fn move_commit(
     chain.insert(insert_at, commit);
 
     if chain == original {
-        return Err(HistoryError::NoOp { commit });
+        return Err(HistoryError::NoOp { commit }.into());
     }
 
     let new_idx = chain
         .iter()
         .position(|&c| c == commit)
-        .ok_or(HistoryError::Planning {
-            message: "commit missing from reordered chain".into(),
-        })?;
+        .ok_or(HistoryError::Planning(
+            PlanningError::MoveCommitMissingFromChain,
+        ))?;
     let segment_start = old_idx.min(new_idx);
     let oldest = original[segment_start];
     let replay_order: Vec<ObjectId> = chain[segment_start..].to_vec();
@@ -86,7 +78,7 @@ pub fn move_commit(
     plan_replay_linear_segment(repo, oldest, &replay_order, opts)
 }
 
-fn first_parent_chain(repo: &Repository, tip: ObjectId) -> Result<Vec<ObjectId>, HistoryError> {
+fn first_parent_chain(repo: &Repository, tip: ObjectId) -> crate::error::Result<Vec<ObjectId>> {
     let mut newest_first = Vec::new();
     let mut current = Some(tip);
     while let Some(oid) = current {

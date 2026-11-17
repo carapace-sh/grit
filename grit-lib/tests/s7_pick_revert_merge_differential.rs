@@ -1,14 +1,16 @@
 //! s7-style differential: full library pick, revert, and merge vs system git (tree and worktree).
 
+use grit_lib::worktree::WorktreeError;
 use std::fs;
 use std::process::Command;
 
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::objects::ObjectId;
-use grit_lib::porcelain::merge::integrate_branch;
 use grit_lib::porcelain::replay::{replay_commit, ReplayDirection, ReplayOutcome, ReplayRequest};
+use grit_lib::progress::{CancelToken, NullProgress};
 use grit_lib::repo::Repository;
 use grit_test_support::git;
+use grit_test_support::integrate_branch;
 
 const IDENT: &str = "Test User <t@example.com> 1700000100 +0000";
 
@@ -121,7 +123,7 @@ fn replay_pick(repo: &Repository, commit: ObjectId) -> ReplayOutcome {
             message_override: None,
         },
         &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("replay pick")
 }
@@ -181,7 +183,7 @@ fn s7_differential_revert_matches_git() {
             message_override: None,
         },
         &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("revert");
 
@@ -226,7 +228,7 @@ fn s7_differential_merge_matches_git() {
         ObjectId::from_hex(&feature).expect("feature"),
         "feature",
         &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("merge");
 
@@ -273,16 +275,16 @@ fn s7_differential_pick_refuses_dirty_worktree() {
             message_override: None,
         },
         &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect_err("dirty");
     assert!(
         matches!(
             &err,
-            grit_lib::error::Error::DirtyWorktree {
+            grit_lib::error::Error::Worktree(WorktreeError::DirtyWorktree {
                 operation: grit_lib::error::WorktreeOperation::Pick,
                 paths,
-            } if paths == &["a.txt"]
+            }) if paths == &["a.txt"]
         ),
         "{err:?}"
     );

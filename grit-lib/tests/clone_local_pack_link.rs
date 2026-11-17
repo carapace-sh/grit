@@ -3,10 +3,11 @@
 use std::path::Path;
 use std::process::Command;
 
-use grit_lib::objects::pack::read_pack_index_no_verify;
-use grit_lib::progress::{NeverCancel, ProgressPhase, ProgressSink};
+use grit_lib::progress::CancelToken;
+use grit_lib::progress::{ProgressPhase, ProgressSink};
 use grit_lib::remote::clone::{clone as clone_repo, CloneOptions};
 use grit_lib::remote::fetch::NoProgress;
+use grit_lib::test_support::objects_pack::read_pack_index_no_verify;
 
 fn git(dir: &Path, args: &[&str]) {
     let out = Command::new("git")
@@ -51,7 +52,7 @@ struct CopyProgress {
     completed: Vec<u64>,
 }
 
-impl grit_lib::remote::fetch::Progress for CopyProgress {}
+impl grit_lib::progress::ProgressSink for CopyProgress {}
 
 impl ProgressSink for CopyProgress {
     fn start(&mut self, phase: ProgressPhase, _total: Option<u64>) {
@@ -91,8 +92,8 @@ fn clone_local_loose_source_links_blobs_and_reports_all_kinds() {
         let mut options = CloneOptions::new(source.to_string_lossy(), dest.clone());
         options.depth = depth;
         let mut progress = CopyProgress::default();
-        let outcome =
-            clone_repo(options, &mut progress, &NeverCancel, None).expect("clone loose source");
+        let outcome = clone_repo(options, &mut progress, &CancelToken::never(), None)
+            .expect("clone loose source");
         assert_eq!(outcome.transfer.objects, 3);
         assert_eq!(progress.completed.last(), Some(&3));
         let kinds = outcome.transfer.kinds.expect("object kinds");
@@ -136,7 +137,7 @@ fn clone_local_repacked_source_links_pack_and_reports_index_stats() {
             ..CloneOptions::new(remote.to_string_lossy(), dest.clone())
         },
         &mut NoProgress,
-        &NeverCancel,
+        &CancelToken::never(),
         None,
     )
     .expect("clone");
@@ -205,7 +206,7 @@ fn clone_local_repacked_plus_unreachable_loose_still_links_pack() {
             ..CloneOptions::new(remote.to_string_lossy(), dest.clone())
         },
         &mut NoProgress,
-        &NeverCancel,
+        &CancelToken::never(),
         None,
     )
     .expect("clone");

@@ -2,17 +2,18 @@
 //!
 //! Source for the library guide "Notes" page (included in the docs site).
 
+use anyhow::Result;
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::notes::NotesRef;
 use grit_lib::objects::ObjectId;
 use grit_lib::repo::Repository;
 use grit_lib::repo_handles::{NoteAddOutcome, NotesWriteOptions};
-use grit_lib::state::resolve_head;
+
 use std::path::{Path, PathBuf};
 
 const IDENT: &str = "Library Guide <guide@grit-scm.com> 1735689600 +0000";
 
-fn open_repo(root: &Path) -> Result<Repository, grit_lib::error::Error> {
+fn open_repo(root: &Path) -> Result<Repository> {
     let git_dir = if root.join(".git").is_dir() {
         root.join(".git")
     } else {
@@ -27,22 +28,22 @@ fn open_repo(root: &Path) -> Result<Repository, grit_lib::error::Error> {
     if let Some(wt) = work_tree {
         opts = opts.with_work_tree(wt);
     }
-    Repository::open(&git_dir, &opts)
+    Ok(Repository::open(&git_dir, &opts)?)
 }
 
-fn main() -> Result<(), grit_lib::error::Error> {
+fn main() -> Result<()> {
     let root = std::env::args()
         .nth(1)
         .map(PathBuf::from)
         .or_else(|| std::env::current_dir().ok())
-        .ok_or_else(|| grit_lib::error::Error::Message("missing repository path".into()))?;
+        .ok_or_else(|| anyhow::anyhow!("missing repository path"))?;
     let repo = open_repo(&root)?;
 
-    let head = resolve_head(repo.git_dir())?;
+    let head = repo.references().head()?;
     let commit: ObjectId = head
         .oid()
         .cloned()
-        .ok_or_else(|| grit_lib::error::Error::Message("HEAD has no commit".into()))?;
+        .ok_or_else(|| anyhow::anyhow!("HEAD has no commit"))?;
 
     let notes_ref = NotesRef::commits();
     let outcome = repo.notes().add(

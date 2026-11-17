@@ -6,10 +6,8 @@ use std::path::{Path, PathBuf};
 
 use grit_lib::objects::ObjectId;
 use grit_lib::refs::store::{Expected, RefUpdate};
-use grit_lib::refs::{
-    commit_ref_store_batch, pack_remote_tracking_refs_for_clone, resolve_ref, write_symbolic_ref,
-};
-use grit_lib::remote::transfer::{fetch_local, FetchOptions, TagMode, UpdateMode};
+use grit_lib::remote::transfer::{FetchOptions, TagMode, UpdateMode};
+use grit_lib::test_support::refs::pack_remote_tracking_refs_for_clone;
 use grit_test_support::git;
 
 fn setup_clone_like_layout(tmp: &Path) -> (PathBuf, PathBuf, ObjectId) {
@@ -33,19 +31,18 @@ fn setup_clone_like_layout(tmp: &Path) -> (PathBuf, PathBuf, ObjectId) {
         &local,
         &["fetch", "-q", remote.to_str().unwrap(), "refs/heads/main"],
     );
-    write_symbolic_ref(
-        &local_git,
-        "refs/remotes/origin/HEAD",
-        "refs/remotes/origin/main",
-    )
-    .unwrap();
+    grit_test_support::refs::at(&local_git)
+        .references()
+        .update_symbolic("refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+        .unwrap();
     write_ref_direct(&local_git, "refs/remotes/origin/main", &main);
     pack_remote_tracking_refs_for_clone(&local_git, "origin").unwrap();
     (local_git, remote_git, main)
 }
 
 fn write_ref_direct(git_dir: &Path, name: &str, oid: &ObjectId) {
-    grit_lib::refs::write_ref(git_dir, name, oid).expect("write ref");
+    grit_test_support::refs::set_ref(&grit_test_support::refs::at(git_dir), name, oid)
+        .expect("write ref");
 }
 
 #[test]
@@ -60,9 +57,9 @@ fn batch_delete_origin_head_keeps_packed_main() {
     let packed_before = fs::read_to_string(local_git.join("packed-refs")).unwrap();
     assert!(packed_before.contains("refs/remotes/origin/main"));
 
-    commit_ref_store_batch(
-        &local_git,
-        &[RefUpdate {
+    grit_test_support::refs::at(&local_git)
+        .references()
+        .apply(&[RefUpdate {
             name: "refs/remotes/origin/HEAD".to_owned(),
             new_value: None,
             expected: Expected::Any,
@@ -71,9 +68,8 @@ fn batch_delete_origin_head_keeps_packed_main() {
                 no_deref: true,
                 ..Default::default()
             },
-        }],
-    )
-    .expect("delete HEAD symref without peeling target");
+        }])
+        .expect("delete HEAD symref without peeling target");
 
     let packed_after = fs::read_to_string(local_git.join("packed-refs")).unwrap();
     assert!(
@@ -81,7 +77,10 @@ fn batch_delete_origin_head_keeps_packed_main() {
         "packed main must survive HEAD delete\nbefore:\n{packed_before}\nafter:\n{packed_after}"
     );
     assert_eq!(
-        resolve_ref(&local_git, "refs/remotes/origin/main").unwrap(),
+        grit_test_support::refs::at(&local_git)
+            .references()
+            .resolve("refs/remotes/origin/main")
+            .unwrap(),
         main
     );
 }
@@ -107,12 +106,13 @@ fn setup_slash_remote_layout(tmp: &Path) -> (PathBuf, PathBuf) {
         &local,
         &["fetch", "-q", remote.to_str().unwrap(), "refs/heads/main"],
     );
-    write_symbolic_ref(
-        &local_git,
-        "refs/remotes/team/origin/HEAD",
-        "refs/remotes/team/origin/main",
-    )
-    .unwrap();
+    grit_test_support::refs::at(&local_git)
+        .references()
+        .update_symbolic(
+            "refs/remotes/team/origin/HEAD",
+            "refs/remotes/team/origin/main",
+        )
+        .unwrap();
     write_ref_direct(&local_git, "refs/remotes/team/origin/main", &main);
     pack_remote_tracking_refs_for_clone(&local_git, "team/origin").unwrap();
     (local_git, remote_git)
@@ -123,15 +123,27 @@ fn fetch_local_prune_slash_remote_name_no_phantom_head_delete() {
     let tmp = tempfile::tempdir().unwrap();
     let (local_git, remote_git) = setup_slash_remote_layout(tmp.path());
 
-    let opts = FetchOptions {
-        refspecs: vec!["+refs/heads/*:refs/remotes/team/origin/*".to_owned()],
-        remote_name: Some("team/origin".to_owned()),
-        tags: TagMode::Following,
-        prune: true,
-        ..Default::default()
-    };
+    let mut opts = FetchOptions::new();
+    opts.refspecs = vec!["+refs/heads/*:refs/remotes/team/origin/*".to_owned()];
+    opts.remote_name = Some("team/origin".to_owned());
+    opts.tags = TagMode::Following;
+    opts.prune = true;
     for pass in 1..=2 {
-        let outcome = fetch_local(&local_git, &remote_git, &opts).expect("fetch");
+        let outcome = grit_lib::repo::Repository::open(
+            &local_git,
+            &grit_lib::config::environment::RepositoryOptions::with_environment(
+                (&opts).environment.clone(),
+            ),
+        )
+        .expect("open fetch target")
+        .remotes()
+        .fetch_from(
+            grit_lib::remote::transfer::TransferEndpoint::Local(&remote_git),
+            &mut opts.clone(),
+            &mut grit_lib::remote::fetch::NoProgress,
+            grit_lib::progress::CancelToken::never_ref(),
+        )
+        .expect("fetch");
         let noisy: Vec<_> = outcome
             .updates
             .iter()
@@ -153,13 +165,25 @@ fn fetch_local_prune_twice_reports_no_updates_when_up_to_date() {
     let tmp = tempfile::tempdir().unwrap();
     let (local_git, remote_git, _) = setup_clone_like_layout(tmp.path());
 
-    let opts = FetchOptions {
-        refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()],
-        tags: TagMode::Following,
-        prune: true,
-        ..Default::default()
-    };
-    let first = fetch_local(&local_git, &remote_git, &opts).expect("first fetch");
+    let mut opts = FetchOptions::new();
+    opts.refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()];
+    opts.tags = TagMode::Following;
+    opts.prune = true;
+    let first = grit_lib::repo::Repository::open(
+        &local_git,
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Local(&remote_git),
+        &mut opts.clone(),
+        &mut grit_lib::remote::fetch::NoProgress,
+        grit_lib::progress::CancelToken::never_ref(),
+    )
+    .expect("first fetch");
     let noisy: Vec<_> = first
         .updates
         .iter()
@@ -170,7 +194,21 @@ fn fetch_local_prune_twice_reports_no_updates_when_up_to_date() {
         "first prune fetch on up-to-date clone layout should report no changes: {noisy:?}"
     );
 
-    let second = fetch_local(&local_git, &remote_git, &opts).expect("second fetch");
+    let second = grit_lib::repo::Repository::open(
+        &local_git,
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Local(&remote_git),
+        &mut opts.clone(),
+        &mut grit_lib::remote::fetch::NoProgress,
+        grit_lib::progress::CancelToken::never_ref(),
+    )
+    .expect("second fetch");
     let noisy: Vec<_> = second
         .updates
         .iter()

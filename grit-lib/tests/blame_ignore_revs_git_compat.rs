@@ -1,9 +1,10 @@
 //! Git parity for blame ignore-revision lists (upstream `t8013` intent).
 
+use grit_lib::error::DiffError;
 use std::path::Path;
 use std::process::Command;
 
-use grit_lib::blame::{blame_file, BlameOptions, IgnoreRevs, IgnoreRevsSources};
+use grit_lib::blame::{BlameOptions, IgnoreRevs, IgnoreRevsSources};
 use grit_lib::config::environment::{Environment, RepositoryOptions};
 use grit_lib::error::Error;
 use grit_lib::objects::ObjectId;
@@ -142,15 +143,16 @@ fn grit_blame(repo: &Repository, file: &str, ignore: &IgnoreParams<'_>) -> Vec<P
         },
     )
     .expect("IgnoreRevs::load");
-    let result = blame_file(
-        repo,
-        file,
-        &BlameOptions {
-            ignore: loaded,
-            ..Default::default()
-        },
-    )
-    .expect("blame_file");
+    let result = repo
+        .diff()
+        .blame(
+            file,
+            &BlameOptions {
+                ignore: loaded,
+                ..Default::default()
+            },
+        )
+        .expect("blame_file");
     let mut out: Vec<PorcelainLine> = result
         .lines
         .into_iter()
@@ -456,16 +458,17 @@ fn line_range_through_ignored_commit() {
         },
     )
     .unwrap();
-    let grit = blame_file(
-        &repo,
-        "file",
-        &BlameOptions {
-            line_range: Some(1..=2),
-            ignore: grit_loaded,
-            ..Default::default()
-        },
-    )
-    .unwrap();
+    let grit = repo
+        .diff()
+        .blame(
+            "file",
+            &BlameOptions {
+                line_range: Some(1..=2),
+                ignore: grit_loaded,
+                ..Default::default()
+            },
+        )
+        .unwrap();
     let parsed = parse_git_blame_porcelain(&git_lines);
     assert_eq!(parsed.len(), grit.lines.len());
     for (g, r) in parsed.iter().zip(grit.lines.iter()) {
@@ -546,7 +549,10 @@ fn typed_errors_for_bad_rev_and_file() {
         },
     )
     .unwrap_err();
-    assert!(matches!(err, Error::BlameIgnoreRevUnknown { .. }));
+    assert!(matches!(
+        err,
+        Error::Diff(DiffError::BlameIgnoreRevUnknown { .. })
+    ));
 
     let err = IgnoreRevs::load(
         &repo,
@@ -556,7 +562,10 @@ fn typed_errors_for_bad_rev_and_file() {
         },
     )
     .unwrap_err();
-    assert!(matches!(err, Error::BlameIgnoreRevsFileOpen { .. }));
+    assert!(matches!(
+        err,
+        Error::Diff(DiffError::BlameIgnoreRevsFileOpen { .. })
+    ));
 
     std::fs::write(dir.path().join("ignore_norev"), "NOREV\n").unwrap();
     let err = IgnoreRevs::load(
@@ -567,5 +576,8 @@ fn typed_errors_for_bad_rev_and_file() {
         },
     )
     .unwrap_err();
-    assert!(matches!(err, Error::BlameIgnoreRevsFileInvalidRev { .. }));
+    assert!(matches!(
+        err,
+        Error::Diff(DiffError::BlameIgnoreRevsFileInvalidRev { .. })
+    ));
 }

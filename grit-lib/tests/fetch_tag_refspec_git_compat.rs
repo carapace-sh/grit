@@ -6,9 +6,7 @@ use grit_test_support::rev_parse;
 use std::path::{Path, PathBuf};
 
 use grit_lib::objects::ObjectId;
-use grit_lib::refs::resolve_ref;
-use grit_lib::remote::fetch::{fetch_remote, NoProgress};
-use grit_lib::remote::transfer::{fetch_local, FetchOptions, FetchOutcome, TagMode, UpdateMode};
+use grit_lib::remote::transfer::{FetchOptions, FetchOutcome, TagMode, UpdateMode};
 use grit_lib::remote::transport::{ConnectOptions, Service, SshTransport, Transport};
 use grit_test_support::git;
 
@@ -44,12 +42,24 @@ fn empty_repo(tmp: &Path, name: &str) -> PathBuf {
 }
 
 fn grit_fetch(local: &Path, up: &Path, spec: &str) -> FetchOutcome {
-    let opts = FetchOptions {
-        refspecs: vec![spec.to_owned()],
-        tags: TagMode::Following,
-        ..Default::default()
-    };
-    fetch_local(&local.join(".git"), &up.join(".git"), &opts).expect("grit fetch")
+    let mut opts = FetchOptions::new();
+    opts.refspecs = vec![spec.to_owned()];
+    opts.tags = TagMode::Following;
+    grit_lib::repo::Repository::open(
+        &local.join(".git"),
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Local(&up.join(".git")),
+        &mut opts.clone(),
+        &mut grit_lib::remote::fetch::NoProgress,
+        grit_lib::progress::CancelToken::never_ref(),
+    )
+    .expect("grit fetch")
 }
 
 fn git_fetch(local: &Path, up: &Path, spec: &str) {
@@ -66,7 +76,10 @@ fn update_mode(outcome: &FetchOutcome, local_ref: &str) -> UpdateMode {
 }
 
 fn assert_annotated_tag(dir: &Path, name: &str, expected: ObjectId) {
-    let got = resolve_ref(&dir.join(".git"), name).expect("tag ref");
+    let got = grit_test_support::refs::at(&dir.join(".git"))
+        .references()
+        .resolve(name)
+        .expect("tag ref");
     assert_eq!(got, expected, "{name} must point at the tag object");
     assert_eq!(git(dir, &["cat-file", "-t", name]).trim(), "tag");
 }
@@ -112,7 +125,10 @@ fn forced_annotated_tag_refspec_moves_retargeted_tag() {
         UpdateMode::TagUpdateRejected
     );
     assert_eq!(
-        resolve_ref(&grit_dn.join(".git"), "refs/tags/rel").unwrap(),
+        grit_test_support::refs::at(&grit_dn.join(".git"))
+            .references()
+            .resolve("refs/tags/rel")
+            .unwrap(),
         old
     );
 
@@ -136,7 +152,10 @@ fn tag_pattern_refspec_is_not_subject_to_following() {
     assert_eq!(update_mode(&outcome, "refs/tags/rel"), UpdateMode::New);
     assert_annotated_tag(&grit_dn, "refs/tags/rel", rev_parse(&up, "refs/tags/rel"));
     assert_eq!(
-        resolve_ref(&grit_dn.join(".git"), "refs/tags/v1").unwrap(),
+        grit_test_support::refs::at(&grit_dn.join(".git"))
+            .references()
+            .resolve("refs/tags/v1")
+            .unwrap(),
         rev_parse(&up, "refs/tags/v1")
     );
     fsck(&grit_dn);
@@ -186,24 +205,26 @@ fn ssh_fetch(
             0,
         )
     };
-    let connect_opts = ConnectOptions {
-        protocol_version,
-        ..Default::default()
-    };
+    let connect_opts = ConnectOptions::with_protocol_version(protocol_version);
     let mut conn = transport
         .connect(&url, Service::UploadPack, &connect_opts)
         .expect("connect");
-    let mut opts = FetchOptions {
-        refspecs: vec![spec.to_owned()],
-        tags: TagMode::Following,
-        ..Default::default()
-    };
-    fetch_remote(
+    let mut opts = FetchOptions::new();
+    opts.refspecs = vec![spec.to_owned()];
+    opts.tags = TagMode::Following;
+    grit_lib::repo::Repository::open(
         &local.join(".git"),
-        conn.as_mut(),
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&mut opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Connection(conn.as_mut()),
         &mut opts,
         &mut NoProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("ssh fetch")
 }

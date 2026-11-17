@@ -4,7 +4,7 @@
 [map]
 apply = "apply"
 attributes = "worktree::attributes"
-bench_fixture = "bench_fixture"
+bench_fixture = "test_support::fixtures"
 bitmap_walk = "objects::bitmap"
 blame = "blame"
 bloom = "diff::bloom"
@@ -22,12 +22,14 @@ commit_encoding = "commit::encoding"
 commit_graph_file = "objects::commit_graph"
 commit_graph_write = "objects::commit_graph"
 commit_trailers = "commit::trailers"
+commits = "commits"
 config = "config"
 credentials = "remote::credentials"
 crlf = "worktree::crlf"
 delta_encode = "objects::delta_encode"
 diagnostics = "diagnostics"
 diff = "diff"
+divergence = "divergence"
 environment = "config::environment"
 error = "error"
 ewah_bench = "objects::ewah_bench"
@@ -60,17 +62,19 @@ lockfile = "lockfile"
 line_range = "line_range"
 log_walk = "revwalk::log_walk"
 merge_base = "revwalk::merge_base"
-merge_diff = "diff::merge_diff"
-merge_file = "diff::merge_file"
-merge_trees = "diff::merge_trees"
+merge_diff = "merge::merge_diff"
+merge_file = "merge::merge_file"
+merge_trees = "merge::merge_trees"
 midx = "objects::midx"
 midx_error = "objects::midx"
 mailmap = "config::mailmap"
 maintenance = "maintenance"
+merge = "merge"
 notes = "notes"
-object_inspect = "object_inspect"
+object_inspect = "revwalk::object_inspect"
 objects = "objects"
 operation = "operation"
+ownership_check = "ownership_check"
 odb = "objects::odb"
 pack = "objects::pack"
 pack_bitmap = "objects::bitmap"
@@ -78,6 +82,7 @@ pack_name_hash = "objects::pack_name_hash"
 pack_objects = "objects::pack_objects"
 pack_object_select = "objects::pack_object_select"
 pack_reuse = "objects::pack"
+pack_write = "objects::pack_write"
 pack_rev = "objects::pack_rev"
 pack_store = "objects::pack_store"
 parallel = "parallel"
@@ -93,14 +98,14 @@ protocol = "remote::protocol"
 prune_packed = "objects::prune_packed"
 push = "remote::push"
 push_report = "remote::push_report"
-quote_path = "quote_path"
-ref_exclusions = "refs::ref_exclusions"
+quote_path = "porcelain::quote_path"
 reflog = "refs::reflog"
 ref_namespace = "refs::ref_namespace"
 refs = "refs"
 refs_fsck = "refs::refs_fsck"
 ref_storage = "refs::ref_storage"
 reftable = "refs::reftable"
+release_unused_heap = "release_unused_heap"
 remote = "remote"
 repo = "repo"
 repo_caches = "repo::caches"
@@ -119,9 +124,11 @@ sideband_lines = "remote::sideband_lines"
 signing = "commit::signing"
 sparse_checkout = "index::sparse_checkout"
 split_index = "index::split_index"
+status = "status"
 stash = "stash"
 state = "state"
 submodule_gitdir = "config::gitmodules::gitdir"
+test_support = "test_support"
 terminal = "porcelain::terminal"
 transfer = "remote::transfer"
 transport = "remote::transport"
@@ -146,13 +153,16 @@ modules = [
   "bundle",
   "command_runner",
   "commit",
+  "commits",
   "config",
   "diagnostics",
   "diff",
+  "divergence",
   "error",
   "history",
   "index",
   "maintenance",
+  "merge",
   "notes",
   "objects",
   "parallel",
@@ -165,6 +175,7 @@ modules = [
   "revwalk",
   "stash",
   "state",
+  "status",
   "tree_sha256",
   "worktree",
 ]

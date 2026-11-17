@@ -42,14 +42,11 @@ use std::time::{Duration, Instant};
 
 use grit_lib::objects::odb::Odb;
 use grit_lib::objects::{HashAlgo, ObjectId};
-use grit_lib::progress::NeverCancel;
-use grit_lib::refs::resolve_ref;
-use grit_lib::remote::fetch::{fetch_remote, NoProgress};
-use grit_lib::remote::push::{push_http, push_remote};
+use grit_lib::progress::{CancelToken, NullProgress};
 use grit_lib::remote::push_report::PushRefStatus;
 use grit_lib::remote::transfer::{FetchOptions, PushOptions, PushRefSpec, TagMode, UpdateMode};
 use grit_lib::remote::transport::http::{http_client_arc, ureq_client::UreqHttpClient};
-use grit_lib::remote::transport::http::{http_fetch, HttpClient, SmartHttpTransport};
+use grit_lib::remote::transport::http::{HttpClient, SmartHttpTransport};
 use grit_lib::remote::transport::{ConnectOptions, GitDaemonTransport, Service, Transport};
 
 // ---------------------------------------------------------------------------
@@ -332,10 +329,7 @@ fn sha256_fetch_over_git_daemon_v2() {
     assert_eq!(open_odb(&local_git).hash_algo(), HashAlgo::Sha256);
 
     let transport = GitDaemonTransport::new();
-    let opts_v2 = ConnectOptions {
-        protocol_version: 2,
-        ..Default::default()
-    };
+    let opts_v2 = ConnectOptions::with_protocol_version(2);
     let mut conn = match transport.connect(&url, Service::UploadPack, &opts_v2) {
         Ok(c) => c,
         Err(e) => {
@@ -371,24 +365,38 @@ fn sha256_fetch_over_git_daemon_v2() {
         conn.capabilities()
     );
 
-    let mut opts = FetchOptions {
-        refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()],
-        tags: TagMode::All,
-        ..Default::default()
-    };
-    let outcome = fetch_remote(
+    let mut opts = FetchOptions::new();
+    opts.refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()];
+    opts.tags = TagMode::All;
+    let outcome = grit_lib::repo::Repository::open(
         &local_git,
-        &mut *conn,
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&mut opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Connection(&mut *conn),
         &mut opts,
         &mut NoProgress,
-        &NeverCancel,
+        &CancelToken::never(),
     )
     .expect("sha256 v2 fetch_remote over git daemon");
 
     // Tracking refs landed with the source's 64-hex oids.
-    let got_main = resolve_ref(&local_git, "refs/remotes/origin/main").expect("origin/main");
-    let got_topic = resolve_ref(&local_git, "refs/remotes/origin/topic").expect("origin/topic");
-    let got_tag = resolve_ref(&local_git, "refs/tags/v1").expect("tag v1");
+    let got_main = grit_test_support::refs::at(&local_git)
+        .references()
+        .resolve("refs/remotes/origin/main")
+        .expect("origin/main");
+    let got_topic = grit_test_support::refs::at(&local_git)
+        .references()
+        .resolve("refs/remotes/origin/topic")
+        .expect("origin/topic");
+    let got_tag = grit_test_support::refs::at(&local_git)
+        .references()
+        .resolve("refs/tags/v1")
+        .expect("tag v1");
     assert_eq!(got_main, main_oid, "origin/main oid mismatch");
     assert_eq!(got_topic, topic_oid, "origin/topic oid mismatch");
     assert_eq!(got_tag, tag_oid, "tag v1 oid mismatch");
@@ -546,17 +554,40 @@ fn sha256_fetch_over_smart_http() {
 
     // 2. Fetch via http_fetch.
     let client = http_client_arc(UreqHttpClient::new());
-    let mut opts = FetchOptions {
-        refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()],
-        tags: TagMode::All,
-        ..Default::default()
-    };
-    let outcome = http_fetch(client.clone(), &local_git, &url, &mut opts, &mut NoProgress)
-        .expect("sha256 http_fetch over grit-http-server");
+    let mut opts = FetchOptions::new();
+    opts.refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()];
+    opts.tags = TagMode::All;
+    let outcome = grit_lib::repo::Repository::open(
+        &local_git,
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&mut opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Http {
+            client: client.clone(),
+            url: &url,
+        },
+        &mut opts,
+        &mut NullProgress,
+        grit_lib::progress::CancelToken::never_ref(),
+    )
+    .expect("sha256 http_fetch over grit-http-server");
 
-    let got_main = resolve_ref(&local_git, "refs/remotes/origin/main").expect("origin/main");
-    let got_topic = resolve_ref(&local_git, "refs/remotes/origin/topic").expect("origin/topic");
-    let got_tag = resolve_ref(&local_git, "refs/tags/v1").expect("tag v1");
+    let got_main = grit_test_support::refs::at(&local_git)
+        .references()
+        .resolve("refs/remotes/origin/main")
+        .expect("origin/main");
+    let got_topic = grit_test_support::refs::at(&local_git)
+        .references()
+        .resolve("refs/remotes/origin/topic")
+        .expect("origin/topic");
+    let got_tag = grit_test_support::refs::at(&local_git)
+        .references()
+        .resolve("refs/tags/v1")
+        .expect("tag v1");
     assert_eq!(got_main, main_oid, "origin/main oid mismatch");
     assert_eq!(got_topic, topic_oid, "origin/topic oid mismatch");
     assert_eq!(got_tag, tag_oid, "tag v1 oid mismatch");
@@ -674,13 +705,18 @@ fn sha256_push_over_git_daemon() {
         expect_absent: false,
         ..Default::default()
     };
-    let outcome = push_remote(
+    let outcome = grit_lib::repo::Repository::open(
         &local_git,
-        &mut *conn,
+        &grit_lib::config::environment::RepositoryOptions::empty(),
+    )
+    .expect("open push source")
+    .remotes()
+    .push_to(
+        grit_lib::remote::transfer::TransferEndpoint::Connection(&mut *conn),
         &[spec],
         &PushOptions::default(),
         &mut NoProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("sha256 push_remote over git daemon");
     drop(conn);
@@ -698,7 +734,10 @@ fn sha256_push_over_git_daemon() {
     assert!(r.old_oid.is_none(), "new ref has no old value");
 
     // The remote ref + objects landed with 64-hex oids; system git agrees.
-    let remote_main = resolve_ref(&bare, "refs/heads/main").expect("remote main written");
+    let remote_main = grit_test_support::refs::at(&bare)
+        .references()
+        .resolve("refs/heads/main")
+        .expect("remote main written");
     assert_eq!(remote_main, main_oid, "remote main oid mismatch");
     assert_sha256_oid(&remote_main, "remote main");
     assert_eq!(
@@ -750,23 +789,31 @@ fn sha256_push_over_git_daemon() {
         expect_absent: false,
         ..Default::default()
     };
-    let outcome2 = push_remote(
+    let outcome2 = grit_lib::repo::Repository::open(
         &local_git,
-        &mut *conn2,
+        &grit_lib::config::environment::RepositoryOptions::empty(),
+    )
+    .expect("open push source")
+    .remotes()
+    .push_to(
+        grit_lib::remote::transfer::TransferEndpoint::Connection(&mut *conn2),
         &[nonff],
         &PushOptions::default(),
         &mut NoProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("non-ff push_remote completes");
     drop(conn2);
     assert_eq!(
         outcome2.results[0].status,
-        PushRefStatus::RejectNonFastForward,
-        "non-fast-forward sha256 push must be rejected"
+        PushRefStatus::RejectNeedsForce,
+        "diverged non-fast-forward sha256 push must be rejected"
     );
     assert_eq!(
-        resolve_ref(&bare, "refs/heads/main").expect("remote main still set"),
+        grit_test_support::refs::at(&bare)
+            .references()
+            .resolve("refs/heads/main")
+            .expect("remote main still set"),
         main_oid,
         "rejected non-ff push must not move the remote sha256 ref"
     );
@@ -785,13 +832,18 @@ fn sha256_push_over_git_daemon() {
         expect_absent: false,
         ..Default::default()
     };
-    let outcome3 = push_remote(
+    let outcome3 = grit_lib::repo::Repository::open(
         &local_git,
-        &mut *conn3,
+        &grit_lib::config::environment::RepositoryOptions::empty(),
+    )
+    .expect("open push source")
+    .remotes()
+    .push_to(
+        grit_lib::remote::transfer::TransferEndpoint::Connection(&mut *conn3),
         &[forced],
         &PushOptions::default(),
         &mut NoProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("forced push_remote completes");
     drop(conn3);
@@ -806,7 +858,10 @@ fn sha256_push_over_git_daemon() {
     assert!(r3.forced, "forced update should be flagged forced");
     assert_eq!(r3.new_oid, Some(diverged));
     assert_eq!(
-        resolve_ref(&bare, "refs/heads/main").expect("remote main after force"),
+        grit_test_support::refs::at(&bare)
+            .references()
+            .resolve("refs/heads/main")
+            .expect("remote main after force"),
         diverged,
         "forced sha256 push must advance the remote ref"
     );
@@ -909,14 +964,21 @@ fn sha256_push_over_smart_http() {
         expect_absent: false,
         ..Default::default()
     };
-    let outcome = push_http(
-        client.clone(),
+    let outcome = grit_lib::repo::Repository::open(
         &local_git,
-        &url,
+        &grit_lib::config::environment::RepositoryOptions::empty(),
+    )
+    .expect("open push source")
+    .remotes()
+    .push_to(
+        grit_lib::remote::transfer::TransferEndpoint::Http {
+            client: client.clone(),
+            url: &url,
+        },
         &[spec],
         &PushOptions::default(),
         &mut NoProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("sha256 push_http over grit-http-server");
 
@@ -932,7 +994,10 @@ fn sha256_push_over_smart_http() {
     assert_eq!(r.new_oid, Some(main_oid));
     assert!(r.old_oid.is_none(), "new ref has no old value");
 
-    let remote_main = resolve_ref(&bare, "refs/heads/main").expect("remote main written");
+    let remote_main = grit_test_support::refs::at(&bare)
+        .references()
+        .resolve("refs/heads/main")
+        .expect("remote main written");
     assert_eq!(
         remote_main, main_oid,
         "remote main oid mismatch after http push"
@@ -976,14 +1041,21 @@ fn sha256_push_over_smart_http() {
         expect_absent: false,
         ..Default::default()
     };
-    let outcome_feature = push_http(
-        client.clone(),
+    let outcome_feature = grit_lib::repo::Repository::open(
         &local_git,
-        &url,
+        &grit_lib::config::environment::RepositoryOptions::empty(),
+    )
+    .expect("open push source")
+    .remotes()
+    .push_to(
+        grit_lib::remote::transfer::TransferEndpoint::Http {
+            client: client.clone(),
+            url: &url,
+        },
         &[spec_feature],
         &PushOptions::default(),
         &mut NoProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("sha256 push_http feature over grit-http-server");
     assert_eq!(
@@ -993,7 +1065,10 @@ fn sha256_push_over_smart_http() {
         outcome_feature.results[0].status,
         outcome_feature.results[0].message
     );
-    let remote_feature = resolve_ref(&bare, "refs/heads/feature").expect("remote feature written");
+    let remote_feature = grit_test_support::refs::at(&bare)
+        .references()
+        .resolve("refs/heads/feature")
+        .expect("remote feature written");
     assert_eq!(remote_feature, feature_oid);
     assert!(
         remote_odb.exists(&feature_oid),

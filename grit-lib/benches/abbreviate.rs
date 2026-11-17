@@ -17,13 +17,13 @@ use std::sync::{Arc, RwLock};
 
 use criterion::{criterion_group, criterion_main, Criterion};
 use grit_lib::error::Result;
-use grit_lib::objects::odb::builder::OdbBuilder;
+
 use grit_lib::objects::odb::store::{MemoryStore, ObjectStore, WritableObjectStore};
+use grit_lib::objects::odb::OdbBuilder;
 use grit_lib::objects::odb::WriteOptions;
 use grit_lib::objects::{HashAlgo, Object, ObjectId, ObjectInfo, ObjectKind};
 use grit_lib::prelude::RepositoryOptions;
-use grit_lib::repo::{InitOptions, Repository, RepositoryBuilder};
-use grit_lib::revwalk::rev_parse::abbreviate_object_id;
+use grit_lib::repo::{InitOptions, Repository};
 use tempfile::TempDir;
 
 const OBJECTS: usize = 200_000;
@@ -91,7 +91,8 @@ fn blob_body(i: usize) -> String {
 
 fn repo_over_store(store: Arc<dyn WritableObjectStore>) -> (TempDir, Repository, Vec<ObjectId>) {
     let dir = tempfile::tempdir().expect("tempdir");
-    Repository::init(dir.path(), &InitOptions::new().with_initial_branch("main")).expect("init");
+    let (_, _) = Repository::init(dir.path(), &InitOptions::new().with_initial_branch("main"))
+        .expect("init");
     let oids: Vec<ObjectId> = (0..OBJECTS)
         .map(|i| {
             store
@@ -104,14 +105,13 @@ fn repo_over_store(store: Arc<dyn WritableObjectStore>) -> (TempDir, Repository,
         })
         .collect();
     let git_dir = dir.path().join(".git");
-    let repo = RepositoryBuilder::new(RepositoryOptions::empty())
-        .odb_builder(
-            OdbBuilder::files(git_dir.join("objects"))
-                .primary(store)
-                .alternates(false),
-        )
-        .open(&git_dir, Some(dir.path()))
-        .expect("open repo over custom store");
+    let repo = Repository::open(
+        &git_dir,
+        &(RepositoryOptions::empty()
+            .with_object_store(store)
+            .with_work_tree(dir.path())),
+    )
+    .expect("open repo over custom store");
     (dir, repo, oids)
 }
 
@@ -137,7 +137,8 @@ fn fast_import_blobs(work_tree: &Path) {
 
 fn files_repo() -> (TempDir, Repository, Vec<ObjectId>) {
     let dir = tempfile::tempdir().expect("tempdir");
-    Repository::init(dir.path(), &InitOptions::new().with_initial_branch("main")).expect("init");
+    let (_, _) = Repository::init(dir.path(), &InitOptions::new().with_initial_branch("main"))
+        .expect("init");
     fast_import_blobs(dir.path());
     let repo = Repository::open(
         &dir.path().join(".git"),
@@ -161,7 +162,11 @@ fn bench_case(c: &mut Criterion, name: &str, repo: &Repository, oids: &[ObjectId
     c.bench_function(&format!("abbreviate/{name}_200k_x200"), |b| {
         b.iter(|| {
             for oid in &oids[..ABBREVIATED] {
-                black_box(abbreviate_object_id(repo, *oid, 7).expect("abbreviate"));
+                black_box(
+                    repo.revwalk()
+                        .abbreviate(*oid, grit_lib::revwalk::AbbrevLength::AtLeast(7))
+                        .expect("abbreviate"),
+                );
             }
         });
     });

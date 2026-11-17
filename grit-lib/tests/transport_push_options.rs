@@ -30,9 +30,6 @@ use std::time::{Duration, Instant};
 
 use grit_lib::error::Error;
 use grit_lib::objects::ObjectId;
-use grit_lib::refs::resolve_ref;
-use grit_lib::remote::fetch::NoProgress;
-use grit_lib::remote::push::push_remote;
 use grit_lib::remote::push_report::PushRefStatus;
 use grit_lib::remote::transfer::{PushOptions, PushRefSpec};
 #[cfg(unix)]
@@ -219,13 +216,18 @@ fn push_options_are_delivered_to_receive_pack_hook_over_git_daemon() {
         push_options: vec!["ci.skip".to_owned(), "reviewer=alice".to_owned()],
         ..PushOptions::default()
     };
-    let outcome = push_remote(
+    let outcome = grit_lib::repo::Repository::open(
         &local_git,
-        &mut *conn,
+        &grit_lib::config::environment::RepositoryOptions::empty(),
+    )
+    .expect("open push source")
+    .remotes()
+    .push_to(
+        grit_lib::remote::transfer::TransferEndpoint::Connection(&mut *conn),
         &[spec(main_oid, "refs/heads/main")],
         &opts,
         &mut NoProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("push_remote with push-options over git daemon");
     drop(conn);
@@ -240,7 +242,10 @@ fn push_options_are_delivered_to_receive_pack_hook_over_git_daemon() {
     );
     // The ref landed.
     assert_eq!(
-        resolve_ref(&bare, "refs/heads/main").expect("remote main written"),
+        grit_test_support::refs::at(&bare)
+            .references()
+            .resolve("refs/heads/main")
+            .expect("remote main written"),
         main_oid
     );
 
@@ -324,13 +329,18 @@ fn push_options_are_delivered_to_receive_pack_hook_over_ssh() {
         push_options: vec!["topic=feature".to_owned(), "notify".to_owned()],
         ..PushOptions::default()
     };
-    let outcome = push_remote(
+    let outcome = grit_lib::repo::Repository::open(
         &local_git,
-        &mut *conn,
+        &grit_lib::config::environment::RepositoryOptions::empty(),
+    )
+    .expect("open push source")
+    .remotes()
+    .push_to(
+        grit_lib::remote::transfer::TransferEndpoint::Connection(&mut *conn),
         &[spec(main_oid, "refs/heads/main")],
         &opts,
         &mut NoProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("push_remote with push-options over ssh");
     drop(conn);
@@ -343,7 +353,10 @@ fn push_options_are_delivered_to_receive_pack_hook_over_ssh() {
         outcome.results[0].message
     );
     assert_eq!(
-        resolve_ref(&bare, "refs/heads/main").expect("remote main written"),
+        grit_test_support::refs::at(&bare)
+            .references()
+            .resolve("refs/heads/main")
+            .expect("remote main written"),
         main_oid
     );
 
@@ -405,13 +418,18 @@ fn pushing_options_to_server_without_capability_errors_typed() {
         push_options: vec!["ci.skip".to_owned()],
         ..PushOptions::default()
     };
-    let err = push_remote(
+    let err = grit_lib::repo::Repository::open(
         &local_git,
-        &mut *conn,
+        &grit_lib::config::environment::RepositoryOptions::empty(),
+    )
+    .expect("open push source")
+    .remotes()
+    .push_to(
+        grit_lib::remote::transfer::TransferEndpoint::Connection(&mut *conn),
         &[spec(main_oid, "refs/heads/main")],
         &opts,
         &mut NoProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect_err("push with options to a server lacking the capability must fail");
     drop(conn);
@@ -423,7 +441,10 @@ fn pushing_options_to_server_without_capability_errors_typed() {
 
     // Nothing was pushed: the ref must not exist on the remote.
     assert!(
-        resolve_ref(&bare, "refs/heads/main").is_err(),
+        grit_test_support::refs::at(&bare)
+            .references()
+            .resolve("refs/heads/main")
+            .is_err(),
         "no ref should be created when the push aborts before sending"
     );
 }

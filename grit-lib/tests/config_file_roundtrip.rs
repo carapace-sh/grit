@@ -5,7 +5,6 @@ use crate::support;
 use std::fs;
 use std::path::Path;
 
-use grit_lib::config::environment::Environment;
 use grit_lib::config::{ConfigFile, ConfigIncludeOrigin, ConfigScope, ConfigSet};
 use tempfile::tempdir;
 
@@ -73,13 +72,12 @@ fn rename_and_remove_section() {
 #[test]
 fn parse_with_origin_and_include_origin() {
     let content = "[c]\n\tk = v\n";
-    let file = ConfigFile::parse_with_origin(
-        Path::new("-"),
-        content,
-        ConfigScope::Command,
-        ConfigIncludeOrigin::Stdin,
-    )
-    .expect("parse");
+    let file = ConfigFile::parse(Path::new("-"), content, ConfigScope::Command)
+        .map(|mut file| {
+            file.include_origin = ConfigIncludeOrigin::Stdin;
+            file
+        })
+        .expect("parse");
     assert_eq!(file.include_origin, ConfigIncludeOrigin::Stdin);
 }
 
@@ -99,8 +97,7 @@ fn config_set_pack_and_log_helpers() {
     let file = ConfigFile::parse(Path::new("cfg"), text, ConfigScope::Local).expect("parse");
     let mut set = ConfigSet::new();
     set.merge(&file);
-    let env = Environment::empty();
-    assert!(!set.pack_write_reverse_index_default(&env));
+    assert!(!set.pack_write_reverse_index_default());
     assert!(!set.pack_read_reverse_index_default());
     assert_eq!(set.pack_index_threads(), Some(4));
     assert_eq!(set.loose_objects_zlib_level().expect("zlib"), 3);
@@ -108,7 +105,7 @@ fn config_set_pack_and_log_helpers() {
         set.effective_log_refs_config(),
         grit_lib::refs::LogRefsConfig::Always
     );
-    assert!(!set.quote_path_fully() || set.get_bool("core.quotepath").is_none());
+    assert!(!set.quote_path_fully() || set.get_bool("core.quotepath").unwrap().is_none());
 }
 
 #[test]
@@ -145,11 +142,11 @@ fn write_api_comments_patterns_and_multivar() {
     let mut file = ConfigFile::from_path(&path, ConfigScope::Local)
         .expect("read")
         .expect("exists");
-    file.set_with_comment("sec.k", "new", Some("note"))
+    file.set_commented("sec.k", "new", "note")
         .expect("set comment");
-    file.replace_all_with_comment("remote.origin.url", "u", Some("u*"), Some("c"))
+    file.replace_all_commented("remote.origin.url", "u", Some("u*"), "c")
         .expect("replace pattern");
-    file.add_value_with_comment("sec.extra", "v", Some("added"))
+    file.add_value_commented("sec.extra", "v", "added")
         .expect("add comment");
     file.write().expect("persist");
     let again = ConfigFile::from_path(&path, ConfigScope::Local)

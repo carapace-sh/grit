@@ -16,6 +16,7 @@
 //!
 //! [TUS]: https://tus.io/protocols/resumable-upload
 
+use crate::worktree::WorktreeError;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
@@ -25,11 +26,12 @@ use crate::error::{Error, Result};
 use crate::fetch::Progress;
 use crate::objects::ObjectId;
 use crate::odb::Odb;
+use crate::remote::RemoteError;
 use crate::resumable::{resolve_url, ResumableError, TusUpload};
 use crate::transport::http::{HttpClient, HttpMethod, HttpRequest};
 
 /// Packs above this size use the resumable endpoint when no threshold is set.
-pub const DEFAULT_THRESHOLD: u64 = 16 * 1024 * 1024;
+pub(crate) const DEFAULT_THRESHOLD: u64 = 16 * 1024 * 1024;
 
 /// Path appended to an upload's URL to apply it.
 pub const RECEIVE_SUFFIX: &str = "receive";
@@ -40,7 +42,7 @@ pub const RECEIVE_SUFFIX: &str = "receive";
 /// URL, with or without a leading `/` (`/push` on `https://host/repo.git` is
 /// `https://host/repo.git/push`).
 #[must_use]
-pub fn resolve_endpoint(repo_url: &str, value: &str) -> Option<String> {
+pub(crate) fn resolve_endpoint(repo_url: &str, value: &str) -> Option<String> {
     if url::Url::parse(value).is_ok() {
         return Some(value.to_owned());
     }
@@ -113,7 +115,11 @@ impl Session {
         }
         let mut header = Vec::new();
         crate::bundle::write_bundle_header(&mut header, odb.hash_algo(), &prerequisites, tips)
-            .map_err(|e| Error::Message(format!("bundle: {e}")))?;
+            .map_err(|e| {
+                Error::Remote(crate::remote::RemoteError::Fatal {
+                    message: format!("bundle: {e}"),
+                })
+            })?;
         let mut spool = SpooledPack::create(self.dir.join("push.bundle.tmp"))?;
         let mut out = std::io::BufWriter::new(&spool.file);
         out.write_all(&header)?;
@@ -147,7 +153,11 @@ impl Session {
             url: upload.url.clone(),
             length: upload.length,
         };
-        let bytes = serde_json::to_vec(&saved).map_err(|e| Error::Message(e.to_string()))?;
+        let bytes = serde_json::to_vec(&saved).map_err(|e| {
+            Error::Worktree(WorktreeError::Path {
+                detail: e.to_string(),
+            })
+        })?;
         std::fs::write(self.upload_path(), bytes)?;
         Ok(())
     }
@@ -207,10 +217,6 @@ impl Drop for SpooledPack {
     }
 }
 
-fn resumable(e: ResumableError) -> Error {
-    Error::from(Box::new(e))
-}
-
 /// Upload the session's bundle to `endpoint` (resuming an earlier upload),
 /// then post `commands` to apply it.
 ///
@@ -225,27 +231,31 @@ pub(crate) fn push(
     sent_refs: &[&str],
     sideband: bool,
     progress: &mut dyn Progress,
-) -> Result<Vec<u8>> {
+) -> crate::error::Result<Vec<u8>> {
     let bundle = session.bundle_path();
-    let length = std::fs::metadata(&bundle)?.len();
+    let length = std::fs::metadata(&bundle).map_err(Error::Io)?.len();
     let mut upload = match session.saved_upload() {
-        Some(u) if u.length == length && u.offset(client).map_err(resumable)?.is_some() => u,
-        _ => TusUpload::create(client, endpoint, length).map_err(resumable)?,
+        Some(u) if u.length == length && u.offset(client)?.is_some() => u,
+        _ => TusUpload::create(client, endpoint, length)?,
     };
     session.save_upload(&upload)?;
     match upload.send_file(client, &bundle, progress) {
         Ok(()) => {}
         // The server forgot the upload (it expires): start a new one, once.
-        Err(ResumableError::Status {
-            status: 404 | 410, ..
-        }) => {
-            upload = TusUpload::create(client, endpoint, length).map_err(resumable)?;
+        Err(Error::Remote(RemoteError::Resumable(ref status)))
+            if matches!(
+                **status,
+                ResumableError::Status {
+                    status: 404 | 410,
+                    ..
+                }
+            ) =>
+        {
+            upload = TusUpload::create(client, endpoint, length)?;
             session.save_upload(&upload)?;
-            upload
-                .send_file(client, &bundle, progress)
-                .map_err(resumable)?;
+            upload.send_file(client, &bundle, progress)?;
         }
-        Err(e) => return Err(resumable(e)),
+        Err(e) => return Err(e),
     }
 
     let url = format!("{}/{RECEIVE_SUFFIX}", upload.url.trim_end_matches('/'));
@@ -261,17 +271,18 @@ pub(crate) fn push(
             .into_bytes()
             .map(|b| String::from_utf8_lossy(&b).trim().to_owned())
             .unwrap_or_default();
-        return Err(resumable(ResumableError::Protocol {
+        return Err(ResumableError::Protocol {
             url,
             detail: format!("HTTP {status} applying the pushed bundle: {detail}"),
-        }));
+        }
+        .into());
     }
     let mut body = response.body;
     let raw = crate::push::read_receive_pack_response(
         &mut body,
         sent_refs,
         sideband,
-        &crate::progress::NeverCancel,
+        &crate::progress::CancelToken::never(),
     )?;
     session.remove();
     Ok(raw)
@@ -280,6 +291,7 @@ pub(crate) fn push(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::ObjectError;
 
     #[test]
     fn endpoints_resolve_under_the_repository() {
@@ -315,13 +327,20 @@ mod tests {
     }
 
     impl HttpClient for Server {
-        fn get(&self, _: &str, _: Option<&str>) -> Result<Vec<u8>> {
+        fn get(&self, _: &str, _: Option<&str>) -> crate::error::Result<Vec<u8>> {
             unreachable!()
         }
-        fn post(&self, _: &str, _: &str, _: &str, _: &[u8], _: Option<&str>) -> Result<Vec<u8>> {
+        fn post(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: &[u8],
+            _: Option<&str>,
+        ) -> crate::error::Result<Vec<u8>> {
             unreachable!()
         }
-        fn send(&self, request: &HttpRequest<'_>) -> Result<HttpResponse> {
+        fn send(&self, request: &HttpRequest<'_>) -> crate::error::Result<HttpResponse> {
             let header = |name: &str| {
                 request
                     .headers
@@ -351,7 +370,12 @@ mod tests {
                 (HttpMethod::Head, _) => reply(200, offset(stored.len()), vec![]),
                 (HttpMethod::Patch, _) => {
                     if self.failing.load(Ordering::SeqCst) && !stored.is_empty() {
-                        return Err(Error::Message("connection reset".to_owned()));
+                        return Err(crate::error::Error::from(
+                            crate::remote::RemoteError::Transport {
+                                url: None,
+                                detail: "connection reset".to_owned(),
+                            },
+                        ));
                     }
                     if header("Upload-Offset") != Some(stored.len()) {
                         return Ok(reply(409, vec![], vec![]));
@@ -365,8 +389,10 @@ mod tests {
                     *self.applied.lock().unwrap_or_else(|e| e.into_inner()) =
                         Some(request.body.to_vec());
                     let mut report = Vec::new();
-                    crate::pkt_line::write_line_to_vec(&mut report, "unpack ok")?;
-                    crate::pkt_line::write_line_to_vec(&mut report, "ok refs/heads/main")?;
+                    crate::pkt_line::write_line_to_vec(&mut report, "unpack ok")
+                        .map_err(crate::remote::RemoteError::from_io)?;
+                    crate::pkt_line::write_line_to_vec(&mut report, "ok refs/heads/main")
+                        .map_err(crate::remote::RemoteError::from_io)?;
                     report.extend_from_slice(b"0000");
                     reply(200, vec![], report)
                 }
@@ -545,7 +571,9 @@ mod tests {
         let result =
             session.write_bundle(&odb, &[], &[(tip, "refs/heads/main".to_owned())], 0, |w| {
                 w.write_all(b"PACK")?;
-                Err(Error::Message("object went missing".to_owned()))
+                Err(Error::Object(ObjectError::NotFound {
+                    name: "object went missing".to_owned(),
+                }))
             });
         assert!(result.is_err());
         assert!(!session.has_bundle());

@@ -1,5 +1,7 @@
 //! Commits and annotated tags whose header block ends at EOF (no blank line) parse like Git.
 
+use grit_lib::progress::CancelToken;
+use grit_lib::progress::NullProgress;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
@@ -7,7 +9,6 @@ use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::maintenance::fsck::{fsck_object, FsckObjectOptions};
 use grit_lib::maintenance::repository_fsck::{self as repo_fsck, FsckOptions};
 use grit_lib::objects::{parse_commit, parse_tag, HashAlgo, ObjectId, ObjectKind};
-use grit_lib::progress::{NeverCancel, NullProgress};
 use grit_lib::repo::Repository;
 use grit_lib::revwalk::RevWalkListOptions;
 use grit_test_support::objects::{HashAlgo as FixtureAlgo, RepoFixture};
@@ -105,7 +106,7 @@ fn headers_only_commit_and_tag_match_git() {
     assert_eq!(from_odb.message, "");
 
     let oids = repo
-        .rev_walk()
+        .revwalk()
         .commits(&["main"], &RevWalkListOptions::default())
         .expect("rev walk");
     assert_eq!(oids.len(), 2);
@@ -156,13 +157,14 @@ fn repository_fsck_reports_nul_in_commit_message() {
 
     let repo =
         Repository::discover(Some(fixture.path()), &RepositoryOptions::empty()).expect("discover");
-    let report = repo_fsck::fsck(
-        &repo,
-        &FsckOptions::default(),
-        &mut NullProgress,
-        &NeverCancel,
-    )
-    .expect("fsck");
+    let report = repo
+        .maintenance()
+        .fsck(
+            &FsckOptions::default(),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("fsck");
     assert!(
         report
             .issues

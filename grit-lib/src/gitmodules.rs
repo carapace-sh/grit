@@ -7,7 +7,6 @@
 //! `check_submodule_url`).
 
 use std::collections::HashSet;
-use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -87,7 +86,7 @@ fn ntfs_backslash_suffix_matches(name: &str, mut pred: impl FnMut(&str) -> bool)
 /// Covers HFS and NTFS spellings of `.gitmodules`, `.gitattributes`, `.gitignore`, and
 /// `.mailmap`, matching [`fsck_dot_special_tree_pass`].
 #[must_use]
-pub fn tree_entry_reserved_dot_symlink(mode: u32, name: &[u8]) -> Option<&'static str> {
+pub(crate) fn tree_entry_reserved_dot_symlink(mode: u32, name: &[u8]) -> Option<&'static str> {
     if mode != 0o120000 {
         return None;
     }
@@ -110,7 +109,7 @@ pub fn tree_entry_reserved_dot_symlink(mode: u32, name: &[u8]) -> Option<&'stati
 }
 
 /// Symlink and registration for one tree (Git `fsck_tree` entry loop).
-pub fn fsck_dot_special_tree_pass(
+pub(crate) fn fsck_dot_special_tree_pass(
     tree_oid: &ObjectId,
     data: &[u8],
     gitmodules_out: &mut HashSet<ObjectId>,
@@ -171,40 +170,40 @@ pub fn fsck_dot_special_tree_pass(
 /// Problems reported while walking trees / blobs for `.gitmodules` / `.gitattributes` fsck.
 #[derive(Debug, Clone)]
 pub enum DotFsckIssue {
-    /// Returned when tree symlink.
+    /// A `.gitmodules` / `.gitattributes`-related path appears as a symlink in a tree.
     TreeSymlink {
-        /// Tree oid for this error or warning.
+        /// Tree object containing the symlink entry.
         tree_oid: ObjectId,
-        /// Id for this error or warning.
+        /// Git fsck message id (for example `gitmodulesSymlink`).
         id: &'static str,
         /// Additional human-readable detail for the failure.
         detail: &'static str,
     },
-    /// Returned when non blob dot file.
+    /// A registered dot-file path resolves to a non-blob object.
     NonBlobDotFile {
         /// Object id (hex) related to the error.
         oid: ObjectId,
         /// Object type name when known (`commit`, `tree`, etc.).
         kind: ObjectKind,
-        /// Id for this error or warning.
+        /// Git fsck message id.
         id: &'static str,
         /// Additional human-readable detail for the failure.
         detail: &'static str,
     },
-    /// Returned when blob gitmodules.
+    /// Content validation failed for a `.gitmodules` blob.
     BlobGitmodules {
-        /// Blob oid for this error or warning.
+        /// Blob object id.
         blob_oid: ObjectId,
-        /// Id for this error or warning.
+        /// Git fsck message id.
         id: &'static str,
         /// Additional human-readable detail for the failure.
         detail: String,
     },
-    /// Returned when blob gitattributes.
+    /// Content validation failed for a `.gitattributes` blob.
     BlobGitattributes {
-        /// Blob oid for this error or warning.
+        /// Blob object id.
         blob_oid: ObjectId,
-        /// Id for this error or warning.
+        /// Git fsck message id.
         id: &'static str,
         /// Additional human-readable detail for the failure.
         detail: &'static str,
@@ -309,7 +308,7 @@ fn trim_bytes(mut s: &[u8]) -> &[u8] {
 }
 
 /// Content checks for OIDs registered as `.gitmodules` / `.gitattributes` targets (Git `fsck_blob` / `fsck_blobs`).
-pub fn fsck_dot_special_object(
+pub(crate) fn fsck_dot_special_object(
     oid: &ObjectId,
     kind: ObjectKind,
     data: &[u8],
@@ -388,14 +387,14 @@ pub fn fsck_dot_special_object(
 
 /// Tracks `.gitmodules` / `.gitattributes` blob OIDs discovered in trees (Git `fsck_options` oidsets).
 #[derive(Debug, Default)]
-pub struct DotFsckTracker {
-    /// Gitmodules found for this item.
+pub(crate) struct DotFsckTracker {
+    /// `.gitmodules` blob OIDs discovered while walking trees.
     pub gitmodules_found: HashSet<ObjectId>,
-    /// Gitmodules done for this item.
+    /// `.gitmodules` blobs already checked by [`Self::on_object`].
     pub gitmodules_done: HashSet<ObjectId>,
-    /// Gitattributes found for this item.
+    /// `.gitattributes` blob OIDs discovered while walking trees.
     pub gitattributes_found: HashSet<ObjectId>,
-    /// Gitattributes done for this item.
+    /// `.gitattributes` blobs already checked by [`Self::on_object`].
     pub gitattributes_done: HashSet<ObjectId>,
 }
 
@@ -504,93 +503,6 @@ fn split_fsck_colon(msg: &str) -> (&'static str, &str) {
         "gitmodulesUpdate" => ("gitmodulesUpdate", b),
         _ => ("gitmodules", msg),
     }
-}
-
-/// Write Git-style warnings for submodule path/url values that look like CLI options.
-pub fn write_gitmodules_cli_option_warnings(
-    w: &mut dyn Write,
-    content: &str,
-) -> std::io::Result<()> {
-    if let Ok(config) = ConfigFile::parse(Path::new(".gitmodules"), content, ConfigScope::Local) {
-        let mut any = false;
-        for entry in &config.entries {
-            let key = &entry.key;
-            let Some(rest) = key.strip_prefix("submodule.") else {
-                continue;
-            };
-            let Some(last_dot) = rest.rfind('.') else {
-                continue;
-            };
-            let var = &rest[last_dot + 1..];
-            if var != "path" && var != "url" {
-                continue;
-            }
-            let Some(value) = entry.value.as_deref() else {
-                continue;
-            };
-            if looks_like_command_line_option(value) {
-                writeln!(
-                    w,
-                    "{}",
-                    crate::diagnostics::warning_line(&format!(
-                        "ignoring '{key}' which may be interpreted as a command-line option: {value}"
-                    ))
-                )?;
-                any = true;
-            }
-        }
-        if any {
-            return Ok(());
-        }
-    }
-
-    // Fallback: raw scan (handles minimal `.gitmodules` that the strict parser rejects).
-    let mut subsection: Option<&str> = None;
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('[') {
-            subsection = None;
-            if let Some(inner) = trimmed.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
-                let inner = inner.trim();
-                if let Some(rest) = inner.strip_prefix("submodule") {
-                    let rest = rest.trim();
-                    let name = rest
-                        .strip_prefix('"')
-                        .and_then(|s| s.strip_suffix('"'))
-                        .unwrap_or(rest);
-                    if !name.is_empty() {
-                        subsection = Some(name);
-                    }
-                }
-            }
-            continue;
-        }
-        let Some((raw_key, raw_val)) = trimmed.split_once('=') else {
-            continue;
-        };
-        let key = raw_key.trim();
-        if key != "path" && key != "url" {
-            continue;
-        }
-        let mut val = raw_val.trim();
-        if val.len() >= 2 && val.starts_with('"') && val.ends_with('"') {
-            val = &val[1..val.len() - 1];
-        }
-        if looks_like_command_line_option(val) {
-            let key_full = match subsection {
-                Some(name) => format!("submodule.{name}.{key}"),
-                None => key.to_string(),
-            };
-            writeln!(
-                w,
-                "{}",
-                crate::diagnostics::warning_line(&format!(
-                    "ignoring '{key_full}' which may be interpreted as a command-line option: {val}"
-                ))
-            )?;
-        }
-    }
-    Ok(())
 }
 
 /// Returns `true` when `name` is allowed as a submodule logical name (Git `check_submodule_name`).
@@ -907,7 +819,11 @@ fn collect_gitmodules_blobs_from_tree(
 }
 
 /// Validate every `.gitmodules` blob reachable from `commit_oid`. Returns `Some(hex: msg)` on error.
-pub fn verify_gitmodules_for_commit(odb: &Odb, commit_oid: ObjectId) -> Result<Option<String>> {
+#[allow(dead_code)] // integration / re-export use only
+pub(crate) fn verify_gitmodules_for_commit(
+    odb: &Odb,
+    commit_oid: ObjectId,
+) -> Result<Option<String>> {
     let obj = odb.read(&commit_oid)?;
     if obj.kind != ObjectKind::Commit {
         return Ok(None);
@@ -928,7 +844,8 @@ pub fn verify_gitmodules_for_commit(odb: &Odb, commit_oid: ObjectId) -> Result<O
 }
 
 /// Parse `objects/ab/cdef…` loose paths into OIDs; for `.idx` files load all contained OIDs.
-pub fn oids_from_copied_object_paths(copied: &[PathBuf]) -> Result<HashSet<ObjectId>> {
+#[allow(dead_code)] // integration / re-export use only
+pub(crate) fn oids_from_copied_object_paths(copied: &[PathBuf]) -> Result<HashSet<ObjectId>> {
     let mut out = HashSet::new();
     for p in copied {
         let Some(name) = p.file_name().and_then(|n| n.to_str()) else {

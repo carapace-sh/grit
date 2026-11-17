@@ -10,10 +10,12 @@ use std::path::Path;
 use std::process::Command;
 
 use grit_lib::config::environment::RepositoryOptions;
+use grit_lib::merge::IntegrateBranchOutcome;
 use grit_lib::objects::ObjectId;
-use grit_lib::porcelain::merge::{abort_branch_merge, integrate_branch, IntegrateBranchOutcome};
+use grit_lib::progress::{CancelToken, NullProgress};
 use grit_lib::repo::Repository;
 use grit_test_support::git;
+use grit_test_support::{abort_branch_merge, integrate_branch};
 
 const DIRS: usize = 200;
 const FILES_PER_DIR: usize = 300;
@@ -87,7 +89,7 @@ fn merge_conflict_child() {
             wb,
             "wb",
             &mut grit_lib::progress::NullProgress,
-            &grit_lib::progress::NeverCancel,
+            &grit_lib::progress::CancelToken::never(),
         )
         .expect("merge");
         abort_branch_merge(&repo).expect("abort");
@@ -104,7 +106,7 @@ fn merge_conflict_child() {
         wb,
         "wb",
         &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("integrate");
     assert!(matches!(outcome, IntegrateBranchOutcome::Conflicts { .. }));
@@ -184,7 +186,7 @@ fn wide_conflict_merge_memory_and_git_compatibility() {
         oid(root, "wb"),
         "wb",
         &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("grit merge");
     let IntegrateBranchOutcome::Conflicts { paths, .. } = outcome else {

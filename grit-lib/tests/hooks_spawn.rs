@@ -4,22 +4,22 @@
 //! interpreter, the real exit status and output must come back, and a hook that cannot start
 //! must be reported as [`HookError::Spawn`] rather than a made-up exit status.
 
+use grit_lib::command_runner::hooks::run_hook_opts;
 use grit_lib::command_runner::hooks::{
-    resolve_hooks_dir, run_commit_hook_checked, run_hook_opts, run_post_checkout, run_post_merge,
-    run_post_rewrite, CommitHookEnv, HookError, HookName, HookResult, RewriteKind, RunHookOptions,
+    CommitHookEnv, HookError, HookName, HookResult, RewriteKind, RunHookOptions,
 };
 use grit_lib::command_runner::{
     CommandExit, CommandRunner, CommandSpec, RunningCommand, ShellInvocation,
 };
 use grit_lib::config::environment::{Environment, RepositoryOptions};
 use grit_lib::diagnostics::{CollectingDiagnostics, Warning};
+use grit_lib::error::Error;
 use grit_lib::objects::ObjectId;
-use grit_lib::porcelain::add::{stage, StageOptions};
-use grit_lib::porcelain::commit::{create_commit, CommitOutcome, CommitRequest};
+use grit_lib::porcelain::add::StageOptions;
+use grit_lib::porcelain::commit::{CommitOutcome, CommitRequest};
 use grit_lib::porcelain::switch::{switch_repository, SwitchMode, SwitchOptions};
 use grit_lib::progress::NullProgress;
 use grit_lib::repo::Repository;
-use grit_lib::state::resolve_head;
 use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::io;
@@ -65,8 +65,8 @@ fn process_environment(cwd: &Path) -> Environment {
     Environment::from_vars(std::env::vars_os(), cwd.to_path_buf())
 }
 
-fn run_captured(repo: &Repository, hook: &str) -> (Result<HookResult, HookError>, String) {
-    let config = repo.config().expect("config");
+fn run_captured(repo: &Repository, hook: &str) -> (grit_lib::error::Result<HookResult>, String) {
+    let config = repo.config().snapshot().expect("config");
     let result = run_hook_opts(
         Some(repo),
         hook,
@@ -165,7 +165,8 @@ fn script_hook_exiting_zero_succeeds_and_commit_hook_passes() {
         matches!(result, Ok(HookResult::Success { .. })),
         "{result:?}, output: {output}"
     );
-    run_commit_hook_checked(&repo, "pre-commit", &[], None, &CommitHookEnv::default())
+    repo.hooks()
+        .run_commit_checked("pre-commit", &[], None, &CommitHookEnv::default())
         .expect("pre-commit exiting 0 lets the commit proceed");
 }
 
@@ -225,15 +226,17 @@ fn hook_that_cannot_start_is_a_typed_spawn_error() {
     let runner = FailingRunner::failing_with([io::Error::from(io::ErrorKind::NotFound)]);
     let repo = open(tmp.path(), Environment::empty(), Some(runner));
 
-    let err = run_commit_hook_checked(&repo, "pre-commit", &[], None, &CommitHookEnv::default())
+    let err = repo
+        .hooks()
+        .run_commit_checked("pre-commit", &[], None, &CommitHookEnv::default())
         .expect_err("spawn failure must not look like a hook exit status");
     match err {
-        HookError::Spawn {
+        Error::Hook(HookError::Spawn {
             hook_name,
             path,
             source,
             output,
-        } => {
+        }) => {
             assert!(output.is_empty(), "no hook ran before the failed start");
             assert_eq!(hook_name, "pre-commit");
             assert_eq!(path, Path::new(".git/hooks/pre-commit"));
@@ -322,7 +325,7 @@ fn hooks_dir_has_no_verbatim_prefix() {
     let canonical = tmp.path().canonicalize().expect("canonicalize");
     let repo = open(&canonical, Environment::empty(), None);
 
-    let hooks_dir = resolve_hooks_dir(&repo);
+    let hooks_dir = repo.hooks().hooks_dir();
     let shown = hooks_dir.to_string_lossy();
     assert!(!shown.starts_with(r"\\?\"), "{shown}");
     assert!(hooks_dir.ends_with("hooks"), "{shown}");
@@ -335,24 +338,23 @@ fn hooks_dir_has_no_verbatim_prefix() {
 
 fn commit_one_file(repo: &Repository, dir: &Path) -> grit_lib::error::Result<CommitOutcome> {
     std::fs::write(dir.join("f.txt"), b"data\n").expect("write");
-    stage(
-        repo,
-        &StageOptions::default(),
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("stage");
+    repo.index()
+        .stage(
+            &StageOptions::default(),
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("stage");
     let ident = "T <t@t> 1 +0000".to_string();
-    create_commit(
-        repo,
-        &CommitRequest {
-            message: "msg".into(),
-            author: Some(ident.parse().expect("signature")),
-            committer: Some(ident.parse().expect("signature")),
-            ..Default::default()
+    repo.commits().create_staged(
+        &{
+            let mut req = CommitRequest::new("msg");
+            req.author = Some(ident.parse().expect("signature"));
+            req.committer = Some(ident.parse().expect("signature"));
+            req
         },
         &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
 }
 
@@ -374,7 +376,7 @@ fn commit_with_unstartable_pre_commit_hook_fails_with_spawn_error() {
         other => panic!("expected a pre-commit spawn error, got {other:?}"),
     }
     assert!(
-        resolve_head(repo.git_dir()).expect("head").oid().is_none(),
+        repo.references().head().expect("head").oid().is_none(),
         "no commit is written when pre-commit cannot start"
     );
 }
@@ -397,7 +399,7 @@ fn commit_with_unstartable_post_commit_hook_succeeds_with_warning() {
     assert!(!outcome.hooks_run.contains(&HookName::PostCommit));
     assert_eq!(runner.specs().len(), 1, "post-commit was attempted");
     assert_eq!(
-        resolve_head(repo.git_dir()).expect("head").oid(),
+        repo.references().head().expect("head").oid(),
         Some(&outcome.oid)
     );
     let warned = diagnostics.warnings().into_iter().any(|w| match w {
@@ -442,7 +444,7 @@ fn spawn_error_keeps_output_of_hooks_that_already_ran() {
         other => panic!("expected the hooks-dir script to fail to start, got {other:?}"),
     }
     assert!(
-        resolve_head(repo.git_dir()).expect("head").oid().is_none(),
+        repo.references().head().expect("head").oid().is_none(),
         "no commit is written when pre-commit cannot start"
     );
 }
@@ -490,12 +492,14 @@ fn post_operation_hooks_receive_git_arguments() {
     let runner = FailingRunner::failing_with([]);
     let repo = open(tmp.path(), Environment::empty(), Some(runner.clone()));
 
-    assert!(run_post_checkout(&repo, Some(old), new, true));
-    assert!(run_post_checkout(&repo, None, new, false));
-    assert!(run_post_merge(&repo, true));
-    assert!(run_post_rewrite(&repo, RewriteKind::Amend, &[(old, new)]));
+    assert!(repo.hooks().run_post_checkout(Some(old), new, true));
+    assert!(repo.hooks().run_post_checkout(None, new, false));
+    assert!(repo.hooks().run_post_merge(true));
+    assert!(repo
+        .hooks()
+        .run_post_rewrite(RewriteKind::Amend, &[(old, new)]));
     assert!(
-        !run_post_rewrite(&repo, RewriteKind::Rebase, &[]),
+        !repo.hooks().run_post_rewrite(RewriteKind::Rebase, &[]),
         "an empty rewrite list runs nothing"
     );
 
@@ -527,26 +531,24 @@ fn switch_with_unstartable_post_checkout_hook_succeeds_with_warning() {
         .with_diagnostics(diagnostics.clone());
     let repo = Repository::open(&tmp.path().join(".git"), &opts).expect("open repo");
 
-    let outcome = switch_repository(
-        &repo,
-        &SwitchOptions {
-            mode: SwitchMode::Detached {
-                commit: first,
-                reflog_to_label: "HEAD~1".into(),
+    let outcome = repo
+        .checkout()
+        .switch(
+            &SwitchOptions {
+                mode: SwitchMode::Detached {
+                    commit: first,
+                    reflog_to_label: "HEAD~1".into(),
+                },
+                dry_run: false,
+                hooks: grit_lib::command_runner::hooks::PostOperationHooks::Run,
             },
-            dry_run: false,
-            hooks: grit_lib::PostOperationHooks::Run,
-        },
-        &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("post-checkout runs after the switch and must not fail it");
+            &mut grit_lib::progress::NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("post-checkout runs after the switch and must not fail it");
     assert!(outcome.hooks_run.is_empty());
     assert_eq!(runner.specs().len(), 1, "post-checkout was attempted");
-    assert_eq!(
-        resolve_head(repo.git_dir()).expect("head").oid(),
-        Some(&first)
-    );
+    assert_eq!(repo.references().head().expect("head").oid(), Some(&first));
     let warned = diagnostics.warnings().into_iter().any(
         |w| matches!(w, Warning::HookNotRun { hook_name, .. } if hook_name == "post-checkout"),
     );
@@ -584,24 +586,23 @@ fn commit_staged(
     message: &str,
 ) -> grit_lib::error::Result<CommitOutcome> {
     std::fs::write(dir.join("b.txt"), b"b\nc\n").expect("modify b");
-    stage(
-        repo,
-        &StageOptions::default(),
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("stage");
+    repo.index()
+        .stage(
+            &StageOptions::default(),
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("stage");
     let ident = "T <t@t> 1 +0000".to_string();
-    create_commit(
-        repo,
-        &CommitRequest {
-            message: message.into(),
-            author: Some(ident.parse().expect("signature")),
-            committer: Some(ident.parse().expect("signature")),
-            ..Default::default()
+    repo.commits().create_staged(
+        &{
+            let mut req = CommitRequest::new(message);
+            req.author = Some(ident.parse().expect("signature"));
+            req.committer = Some(ident.parse().expect("signature"));
+            req
         },
         &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
 }
 
@@ -651,7 +652,7 @@ fn commit_msg_hook_using_grep_rejects_the_commit() {
         "commit-msg",
         "#!/bin/sh\nif grep -q WIP \"$1\"; then echo no WIP >&2; exit 1; fi\n",
     );
-    let head_before = resolve_head(repo.git_dir()).expect("head").oid().copied();
+    let head_before = repo.references().head().expect("head").oid().copied();
 
     match commit_staged(&repo, &dir, "WIP thing") {
         Err(grit_lib::error::Error::Hook(HookError::Failed {
@@ -663,7 +664,7 @@ fn commit_msg_hook_using_grep_rejects_the_commit() {
         other => panic!("expected commit-msg to reject the commit, got {other:?}"),
     }
     assert_eq!(
-        resolve_head(repo.git_dir()).expect("head").oid().copied(),
+        repo.references().head().expect("head").oid().copied(),
         head_before
     );
     commit_staged(&repo, &dir, "real change").expect("a message without WIP passes");

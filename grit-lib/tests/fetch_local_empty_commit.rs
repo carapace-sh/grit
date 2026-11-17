@@ -4,7 +4,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use grit_lib::remote::transfer::{fetch_local, FetchOptions, TagMode};
+use grit_lib::remote::transfer::{FetchOptions, TagMode};
 
 fn git(dir: &Path, args: &[&str]) {
     let out = Command::new("git")
@@ -51,12 +51,24 @@ fn fetch_local_empty_commit_bare_remote() {
         &["remote", "add", "origin", bare.to_str().unwrap()],
     );
 
-    let opts = FetchOptions {
-        refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()],
-        tags: TagMode::Following,
-        ..Default::default()
-    };
-    fetch_local(&consumer.join(".git"), &bare, &opts).expect("fetch_local");
+    let mut opts = FetchOptions::new();
+    opts.refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()];
+    opts.tags = TagMode::Following;
+    grit_lib::repo::Repository::open(
+        &consumer.join(".git"),
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Local(&bare),
+        &mut opts.clone(),
+        &mut grit_lib::remote::fetch::NoProgress,
+        grit_lib::progress::CancelToken::never_ref(),
+    )
+    .expect("fetch_local");
 
     let fsck = Command::new("git")
         .current_dir(&consumer)

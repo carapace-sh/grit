@@ -10,7 +10,7 @@ order: 3
 ```text
 grit revs <RANGE>... [-n <N>] [--count] [--left-right] [--cherry-mark]
   [--skip <N>] [--since|--after <date>] [--until|--before <date>]
-  [--first-parent] [--merges | --no-merges] [--reverse]
+  [--first-parent] [--follow] [--merges | --no-merges] [--reverse]
   [--author <pat>] [--committer <pat>] [--grep <pat>]
   [-S <string>] [-G <pat>] [--pickaxe-regex]
   [-i] [--all-match] [--invert-grep] [-F] [--no-mailmap]
@@ -22,6 +22,8 @@ grit revs <RANGE>... [-n <N>] [--count] [--left-right] [--cherry-mark]
 ## Description
 
 Walks commits reachable from one or more revision ranges and prints each commit’s full object id and subject (first line of the message), one commit per line. Ranges use the same syntax as Git’s `rev-list`: plain tips, `A..B`, symmetric difference `A...B`, and `^tip` exclusions.
+
+With no revision arguments, `--branches`, `--tags`, and `--remotes` (and optional globs) select only those ref tips—they replace the implicit `HEAD` default, they do not union with it, and if nothing matches the count is `0` with exit **0** (like `git rev-list`).
 
 Use `--count` to print only the number of reachable commits (no subject lines). With `--left-right` and exactly one `A...B` range, `--count` prints left and right counts (same as `git rev-list --left-right --count`). Without `--count`, `--left-right` lists the range with a `<` (left) or `>` (right) prefix on each commit.
 
@@ -45,7 +47,7 @@ with a deep history. As in Git, `--first-parent` follows first parents from the
 included tips only; everything an excluded tip reaches through any parent stays
 excluded.
 
-Path arguments after `--` limit history to commits that touched those paths. Operands use Git pathspec cwd rules (same as [`grit diff`](../diff/)): from a subdirectory, `.` limits to that directory, and bare filenames are relative to the current directory, not the repository root.
+Path arguments after `--` limit history to commits that touched those paths. Operands use Git pathspec cwd rules (same as [`grit diff`](../diff/)): from a subdirectory, `.` limits to that directory, and bare filenames are relative to the current directory, not the repository root. Attribute pathspecs such as `:(attr:myattr)` use the repository's current `.gitattributes` stack (work tree, index, `info/attributes`, and macros), the same way as [`grit diff`](../diff/); they do not read historical trees' attribute files.
 
 Author, committer, message, and pickaxe filters use the same rules as [`grit log`](../log/) (`-S`, `-G`, `--pickaxe-regex`, and the same `-i` / `-F` / mailmap behavior). Invalid patterns exit **129** with `kind: "invalid_pattern"` in `--json` output.
 
@@ -62,9 +64,10 @@ Author, committer, message, and pickaxe filters use the same rules as [`grit log
 | `--since`, `--after <date>` | Exclude commits older than this date (committer date). |
 | `--until`, `--before <date>` | Exclude commits newer than this date. |
 | `--first-parent` | Follow first parents only at merges. |
+| `--follow` | With exactly one literal file path after `--`, walk history across renames (Git `log --follow`). Still walks when the path no longer exists at the start commit. |
 | `--merges` | Only merge commits (conflicts with `--no-merges`). |
 | `--no-merges` | Exclude merge commits (conflicts with `--merges`). |
-| `--reverse` | Oldest commits first. |
+| `--reverse` | Print the selected window oldest-first. `-n` and `--skip` choose the window (newest `N` commits after skip); `--reverse` only flips that window. |
 | `--all` | Include every ref tip. |
 | `--branches[=<glob>]` | Branch tips, optionally filtered by glob. |
 | `--tags[=<glob>]` | Tag tips, optionally filtered by glob. |

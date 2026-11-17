@@ -3,6 +3,7 @@
 //! All pack cache and index reads run under the owning [`PackStore`](crate::pack_store::PackStore)
 //! context via [`PackStore::with_context`](crate::pack_store::PackStore::with_context).
 
+use crate::error::ObjectError;
 use std::collections::HashSet;
 use std::io::{self, Cursor, Read};
 use std::ops::ControlFlow;
@@ -16,6 +17,7 @@ use crate::objects::{HashAlgo, Object, ObjectId, ObjectIdPrefix, ObjectInfo, Obj
 use crate::pack::{self, read_local_pack_indexes_cached, reprepare_pack_directory_on_miss};
 use crate::pack_index::PackIndex;
 use crate::pack_store::PackStore;
+use crate::zlib_inflate::{LOOSE_INFLATE_INPUT_CHUNK, LOOSE_INFLATE_OUTPUT_CHUNK};
 
 use super::{ObjectStore, ObjectStream};
 
@@ -199,7 +201,7 @@ impl PackedObjects {
         self.with_pack(
             |objects_dir| match pack::read_object_from_packs(objects_dir, oid) {
                 Ok(obj) => Ok(Some(obj)),
-                Err(Error::ObjectNotFound(_)) => Ok(None),
+                Err(Error::Object(ObjectError::NotFound { .. })) => Ok(None),
                 Err(err) => Err(err),
             },
         )
@@ -213,7 +215,7 @@ impl PackedObjects {
         self.with_pack(|objects_dir| {
             match pack::read_object_from_packs_into(objects_dir, oid, buf) {
                 Ok(kind) => Ok(Some(kind)),
-                Err(Error::ObjectNotFound(_)) => Ok(None),
+                Err(Error::Object(ObjectError::NotFound { .. })) => Ok(None),
                 Err(err) => Err(err),
             }
         })
@@ -223,7 +225,7 @@ impl PackedObjects {
         self.with_pack(
             |objects_dir| match pack::read_object_info_from_packs(objects_dir, oid) {
                 Ok(info) => Ok(Some(info)),
-                Err(Error::ObjectNotFound(_)) => Ok(None),
+                Err(Error::Object(ObjectError::NotFound { .. })) => Ok(None),
                 Err(err) => Err(err),
             },
         )
@@ -249,10 +251,11 @@ impl ObjectStore for PackedObjects {
 
     fn open_stream(&self, oid: &ObjectId) -> Result<Option<ObjectStream<'_>>> {
         self.with_pack(|dir| {
-            let mut entry = pack::locate_packed_whole_object(dir, oid, true)?;
+            let verify_crc = pack::count_local_packs_holding(dir, oid)? > 1;
+            let mut entry = pack::locate_packed_whole_object(dir, oid, verify_crc)?;
             if matches!(entry, pack::PackedEntry::Absent) && reprepare_pack_directory_on_miss(dir)?
             {
-                entry = pack::locate_packed_whole_object(dir, oid, true)?;
+                entry = pack::locate_packed_whole_object(dir, oid, verify_crc)?;
             }
             let pack::PackedEntry::Whole(whole) = entry else {
                 return stream_from_buffered_read(self, oid);
@@ -466,10 +469,18 @@ struct PackPayloadStream {
     stream_ended: bool,
     /// Compressed bytes consumed since the mapping's pages were last released.
     resident: usize,
+    /// Pack-index CRC32 check deferred until the compressed entry has been consumed.
+    index_crc: Option<(u32, crc32fast::Hasher)>,
 }
 
 impl PackPayloadStream {
     fn new(whole: pack::PackedWholeObject) -> Self {
+        let entry_start = whole.entry_offset as usize;
+        let index_crc = whole.index_crc.map(|expected| {
+            let mut hasher = crc32fast::Hasher::new();
+            hasher.update(&whole.pack[entry_start..whole.zlib_offset]);
+            (expected, hasher)
+        });
         Self {
             pos: whole.zlib_offset,
             remaining: whole.size,
@@ -477,12 +488,42 @@ impl PackPayloadStream {
             dec: Decompress::new(true),
             stream_ended: false,
             resident: 0,
+            index_crc,
         }
+    }
+
+    fn note_compressed_consumed(&mut self, start: usize, end: usize) {
+        if let Some((_, hasher)) = &mut self.index_crc {
+            hasher.update(&self.whole.pack[start..end]);
+        }
+    }
+
+    fn verify_index_crc_if_due(&mut self) -> io::Result<()> {
+        if self.pos < self.whole.entry_end {
+            return Ok(());
+        }
+        let Some((expected, hasher)) = self.index_crc.take() else {
+            return Ok(());
+        };
+        if hasher.finalize() != expected {
+            return Err(corrupt_pack_stream("pack index CRC mismatch"));
+        }
+        Ok(())
     }
 
     /// Inflate into `out`, returning the bytes produced.
     fn inflate(&mut self, out: &mut [u8]) -> io::Result<usize> {
-        let input = &self.whole.pack[self.pos..self.whole.data_end];
+        let cap = out.len().min(LOOSE_INFLATE_OUTPUT_CHUNK);
+        let out = &mut out[..cap];
+        let input_end = self.whole.data_end.min(self.whole.entry_end);
+        if self.pos >= input_end {
+            if self.stream_ended {
+                return Ok(0);
+            }
+            return Err(corrupt_pack_stream("zlib stream truncated"));
+        }
+        let input_take = (input_end - self.pos).min(LOOSE_INFLATE_INPUT_CHUNK);
+        let input = &self.whole.pack[self.pos..self.pos + input_take];
         let before_in = self.dec.total_in();
         let before_out = self.dec.total_out();
         let status = self
@@ -491,11 +532,12 @@ impl PackPayloadStream {
             .map_err(|e| corrupt_pack_stream(&e.to_string()))?;
         let consumed = (self.dec.total_in() - before_in) as usize;
         let produced = (self.dec.total_out() - before_out) as usize;
+        let from = self.pos;
         self.pos += consumed;
+        self.note_compressed_consumed(from, self.pos);
         self.resident += consumed;
         if self.resident >= STREAM_RESIDENT_PACK_BYTES {
-            // The bytes stay readable; later reads fault pages back in from the page cache.
-            self.whole.pack.release_resident();
+            self.whole.pack.release_resident_through(self.pos);
             self.resident = 0;
         }
         if status == Status::StreamEnd {
@@ -523,6 +565,13 @@ impl Read for PackPayloadStream {
                     return Err(corrupt_pack_stream("more data than declared size"));
                 }
             }
+            while self.pos < self.whole.entry_end {
+                let take = (self.whole.entry_end - self.pos).min(LOOSE_INFLATE_INPUT_CHUNK);
+                let from = self.pos;
+                self.pos += take;
+                self.note_compressed_consumed(from, self.pos);
+            }
+            self.verify_index_crc_if_due()?;
             return Ok(0);
         }
         if buf.is_empty() {
@@ -549,8 +598,11 @@ fn stream_from_buffered_read(
     let Some(obj) = store.read(oid)? else {
         return Ok(None);
     };
-    let size = u64::try_from(obj.data.len())
-        .map_err(|_| Error::CorruptObject(format!("object size overflow for {}", oid.to_hex())))?;
+    let size = u64::try_from(obj.data.len()).map_err(|_| {
+        Error::Object(ObjectError::Corrupt {
+            detail: format!("object size overflow for {}", oid.to_hex()),
+        })
+    })?;
     Ok(Some(ObjectStream {
         kind: obj.kind,
         size,
@@ -584,10 +636,13 @@ mod tests {
         bytes.extend_from_slice(&[0u8; TRAILER]);
         pack::PackedWholeObject {
             pack: PackData::from_owned(bytes),
+            entry_offset: 12,
+            entry_end: data_end,
             zlib_offset,
             data_end,
             kind: ObjectKind::Blob,
             size: declared_size,
+            index_crc: None,
         }
     }
 

@@ -10,12 +10,11 @@ use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::diff::merge_file::MergeFavor;
 use grit_lib::error::Error;
 use grit_lib::ident::Signature;
+use grit_lib::merge::{MergePrediction, MergePredictionOptions};
 use grit_lib::objects::{NewCommit, ObjectId};
-use grit_lib::porcelain::merge::{
-    predict_merge, write_merge_tree, MergePrediction, MergePredictionOptions,
-};
 use grit_lib::repo::Repository;
 use grit_test_support::{git, git_cmd};
+use grit_test_support::{predict_merge, write_merge_tree};
 use time::OffsetDateTime;
 
 use support::{
@@ -492,7 +491,12 @@ fn write_merge_tree_unrelated_histories() {
     let err = write_merge_tree(&repo, main, orphan, &MergePredictionOptions::default())
         .expect_err("unrelated histories must be refused by default");
     assert!(
-        matches!(err, Error::UnrelatedHistories { ours, theirs } if ours == main && theirs == orphan),
+        matches!(
+            err,
+            grit_lib::error::Error::Merge(
+                MergeError::UnrelatedHistories { ours, theirs } if ours == main && theirs == orphan,
+            )
+        ),
         "{err:?}"
     );
 

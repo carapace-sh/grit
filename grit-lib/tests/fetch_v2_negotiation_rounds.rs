@@ -24,9 +24,7 @@ use std::time::{Duration, Instant};
 
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::objects::{ObjectId, ObjectKind};
-use grit_lib::progress::NeverCancel;
-use grit_lib::refs::resolve_ref;
-use grit_lib::remote::fetch::{fetch_remote, NoProgress};
+use grit_lib::progress::CancelToken;
 use grit_lib::remote::transfer::{FetchOptions, TagMode};
 use grit_lib::remote::transport::{ConnectOptions, GitDaemonTransport, Service, Transport};
 use grit_lib::repo::Repository;
@@ -183,23 +181,25 @@ fn server_commit(srv: &Server) -> ObjectId {
 
 fn fetch_main(git_dir: &Path, srv: &Server) -> Result<(), grit_lib::error::Error> {
     let transport = GitDaemonTransport::new();
-    let connect = ConnectOptions {
-        protocol_version: 2,
-        ..Default::default()
-    };
+    let connect = ConnectOptions::with_protocol_version(2);
     let mut conn = transport.connect(&srv.url, Service::UploadPack, &connect)?;
     assert_eq!(conn.protocol_version(), 2, "expected protocol v2");
-    let mut opts = FetchOptions {
-        refspecs: vec!["+refs/heads/main:refs/remotes/origin/main".to_owned()],
-        tags: TagMode::None,
-        ..Default::default()
-    };
-    fetch_remote(
+    let mut opts = FetchOptions::new();
+    opts.refspecs = vec!["+refs/heads/main:refs/remotes/origin/main".to_owned()];
+    opts.tags = TagMode::None;
+    grit_lib::repo::Repository::open(
         git_dir,
-        &mut *conn,
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&mut opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Connection(&mut *conn),
         &mut opts,
         &mut NoProgress,
-        &NeverCancel,
+        &CancelToken::never(),
     )?;
     Ok(())
 }
@@ -272,7 +272,10 @@ fn ready_after_first_round_leaves_deep_history_unread() {
 
     fetch_main(&git_dir, &srv).expect("fetch must not walk past what the server needs");
     assert_eq!(
-        resolve_ref(&git_dir, "refs/remotes/origin/main").expect("tracking ref"),
+        grit_test_support::refs::at(&git_dir)
+            .references()
+            .resolve("refs/remotes/origin/main")
+            .expect("tracking ref"),
         new_tip
     );
 
@@ -315,7 +318,10 @@ fn later_rounds_resend_acknowledged_commits_and_pack_stays_minimal() {
 
     fetch_main(&git_dir, &srv).expect("multi-round fetch");
     assert_eq!(
-        resolve_ref(&git_dir, "refs/remotes/origin/main").expect("tracking ref"),
+        grit_test_support::refs::at(&git_dir)
+            .references()
+            .resolve("refs/remotes/origin/main")
+            .expect("tracking ref"),
         new_tip
     );
     // The skipping walk may land anywhere in the shared base, so the server can
@@ -373,7 +379,10 @@ fn remote_tracking_refs_are_negotiation_tips() {
 
     fetch_main(&git_dir, &srv).expect("fetch");
     assert_eq!(
-        resolve_ref(&git_dir, "refs/remotes/origin/main").expect("tracking ref"),
+        grit_test_support::refs::at(&git_dir)
+            .references()
+            .resolve("refs/remotes/origin/main")
+            .expect("tracking ref"),
         new_tip
     );
     assert_eq!(

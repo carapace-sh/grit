@@ -6,9 +6,8 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
 
-use grit_lib::progress::NeverCancel;
+use grit_lib::progress::CancelToken;
 use grit_lib::remote::clone::{clone as clone_repo, CloneError, CloneOptions};
-use grit_lib::remote::fetch::NoProgress;
 
 fn grit_bin() -> std::path::PathBuf {
     std::env::var("CARGO_BIN_EXE_grit")
@@ -65,7 +64,7 @@ fn parallel_clone_library_exactly_one_winner() {
             clone_repo(
                 CloneOptions::new(url, dest),
                 &mut NoProgress,
-                &NeverCancel,
+                &CancelToken::never(),
                 None,
             )
         }));
@@ -76,7 +75,7 @@ fn parallel_clone_library_exactly_one_winner() {
     for handle in handles {
         match handle.join().expect("join") {
             Ok(_) => successes += 1,
-            Err(CloneError::DestNotEmpty(_)) => dest_not_empty += 1,
+            Err(CloneError::DestNotEmpty { .. }) => dest_not_empty += 1,
             Err(other) => panic!("unexpected clone error: {other:?}"),
         }
     }

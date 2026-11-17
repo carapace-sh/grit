@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use crate::config::parse_config_parameters;
 use crate::environment::Environment;
-use crate::unicode_normalization::probe_filesystem_normalizes_nfd_to_nfc;
+use crate::init_filesystem::FilesystemCapabilities;
 
 fn parse_ceiling_directories_paths(env: &Environment) -> Vec<PathBuf> {
     let Some(raw) = env.git_ceiling_directories.as_deref() else {
@@ -191,7 +191,7 @@ pub fn effective_core_precomposeunicode(git_dir: Option<&Path>) -> bool {
 
 /// Like [`effective_core_precomposeunicode`], but uses an already-loaded config snapshot when provided.
 #[must_use]
-pub fn effective_core_precomposeunicode_with_config(
+pub(crate) fn effective_core_precomposeunicode_with_config(
     git_dir: Option<&Path>,
     config: Option<&crate::config::ConfigSet>,
 ) -> bool {
@@ -201,18 +201,21 @@ pub fn effective_core_precomposeunicode_with_config(
         return v;
     }
     if let Some(cfg) = config {
-        return cfg
-            .get_bool("core.precomposeunicode")
-            .and_then(|r| r.ok())
-            .unwrap_or(false);
+        return cfg.precompose_unicode();
     }
     let Some(gd) = git_dir else {
         return false;
     };
-    crate::config::ConfigSet::load(&crate::environment::Environment::empty(), Some(gd), true)
-        .ok()
-        .and_then(|cfg| cfg.get_bool("core.precomposeunicode").and_then(|r| r.ok()))
-        .unwrap_or(false)
+    crate::config::ConfigSet::load(
+        &crate::environment::Environment::empty(),
+        Some(gd),
+        &crate::config::LoadConfigOptions::standard(
+            &crate::environment::Environment::empty(),
+            Some(gd),
+        ),
+    )
+    .ok()
+    .is_some_and(|cfg| cfg.precompose_unicode())
 }
 
 /// True when the filesystem aliases NFD and NFC spellings for the same path (macOS / HFS+ style).
@@ -221,8 +224,8 @@ pub fn effective_core_precomposeunicode_with_config(
 /// `core.precomposeunicode` on Linux; argv and directory walks must still use the bytes the shell
 /// passed when the FS does not alias.
 #[must_use]
-pub fn filesystem_nfd_nfc_aliases(git_dir: &Path) -> bool {
-    probe_filesystem_normalizes_nfd_to_nfc(git_dir).unwrap_or(false)
+pub(crate) fn filesystem_nfd_nfc_aliases(git_dir: &Path) -> bool {
+    FilesystemCapabilities::detect_precomposes_unicode(git_dir).unwrap_or(false)
 }
 
 /// NFC-normalize command-line path arguments (Git's `precompose_argv_prefix`).

@@ -1,19 +1,21 @@
 //! `--stat` / `--name-only` / `--name-status` compatibility with system `git`.
 
+use grit_lib::error::ObjectError;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
 use grit_lib::diff::{
-    build_file_diffs, diff_trees_with_renames_and_policy, DiffDetail, DiffOptions, DiffStatus,
-    DiffTarget, ListedFileDiff,
+    DiffDetail, DiffOptions, DiffStatus, DiffTarget, ListedFileDiff, RenameDetection,
+    TreeDiffOptions,
 };
 use grit_lib::objects::{ObjectKind, TreeEntry};
 use grit_lib::parallel::ThreadPolicy;
 use grit_lib::repo::{InitOptions, Repository};
+use grit_lib::test_support::counters::track_blob_reads;
 
 fn init_repo() -> (tempfile::TempDir, Repository) {
     let dir = tempfile::tempdir().expect("tempdir");
-    let repo = Repository::init(dir.path(), &InitOptions::default()).expect("init");
+    let (repo, _) = Repository::init(dir.path(), &InitOptions::default()).expect("init");
     (dir, repo)
 }
 
@@ -44,17 +46,16 @@ fn grit_numstat_for_trees(
     old: Option<&grit_lib::objects::ObjectId>,
     new: Option<&grit_lib::objects::ObjectId>,
 ) -> Vec<(usize, usize, String)> {
-    let entries = repo.diff().tree_to_tree(old, new).expect("tree diff");
-    let config = repo.config().expect("config");
-    let out = build_file_diffs(
-        repo.odb(),
-        entries,
-        DiffDetail::Stat,
-        DiffOptions::default(),
-        config.as_ref(),
-        &ThreadPolicy::default(),
-    )
-    .expect("stat diff");
+    let entries = repo
+        .diff()
+        .tree_to_tree(old, new, &TreeDiffOptions::default())
+        .map(|r| r.entries)
+        .expect("tree diff");
+    let config = repo.config().snapshot().expect("config");
+    let out = repo
+        .diff()
+        .files_for_entries(entries, DiffDetail::Stat, &DiffOptions::default())
+        .expect("stat diff");
     out.files
         .into_iter()
         .map(|f| {
@@ -127,21 +128,17 @@ fn identical_binary_rename_keeps_binary_flag_in_stat_mode() {
     let new = tree_with(&repo, &[("f.txt", b"beta\n")]);
     let entries = repo
         .diff()
-        .tree_to_tree(Some(&old), Some(&new))
+        .tree_to_tree(Some(&old), Some(&new), &TreeDiffOptions::default())
+        .map(|r| r.entries)
         .expect("entries");
     let counter = Arc::new(AtomicUsize::new(0));
-    let config = repo.config().expect("config");
-    let mut opts = DiffOptions::default();
-    opts.blob_read_counter = Some(Arc::clone(&counter));
-    let _ = build_file_diffs(
-        repo.odb(),
-        entries,
-        DiffDetail::NameOnly,
-        opts,
-        config.as_ref(),
-        &ThreadPolicy::default(),
-    )
-    .expect("name-only");
+    let _reads = track_blob_reads(Arc::clone(&counter));
+    let config = repo.config().snapshot().expect("config");
+    let opts = DiffOptions::default();
+    let _ = repo
+        .diff()
+        .files_for_entries(entries, DiffDetail::NameOnly, &opts)
+        .expect("name-only");
     assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 0);
     let new_tree = tree_with(&repo, &[("f", b"x\n")]);
     let _target = DiffTarget::Trees {
@@ -151,9 +148,7 @@ fn identical_binary_rename_keeps_binary_flag_in_stat_mode() {
 }
 
 fn metadata_tree(repo: &Repository, mut entries: Vec<TreeEntry>) -> grit_lib::objects::ObjectId {
-    entries.sort_by(|a, b| {
-        grit_lib::objects::tree_entry_cmp(&a.name, a.mode == 0o040000, &b.name, b.mode == 0o040000)
-    });
+    entries.sort_by(|a, b| grit_lib::objects::tree_entry_cmp(&a.name, a.mode, &b.name, b.mode));
     repo.odb()
         .write(
             ObjectKind::Tree,
@@ -184,8 +179,9 @@ fn tree_metadata_matrix_matches_git_without_reading_blobs() {
 
     for algo in [HashAlgo::Sha1, HashAlgo::Sha256] {
         let dir = tempfile::tempdir().expect("tempdir");
-        let repo = Repository::init(dir.path(), &InitOptions::default().with_object_format(algo))
-            .expect("init");
+        let (repo, _) =
+            Repository::init(dir.path(), &InitOptions::default().with_object_format(algo))
+                .expect("init");
         let a = write_blob(&repo, b"before\n");
         let b = write_blob(&repo, b"after\n");
         let entry = |name: &[u8], mode, oid: ObjectId| TreeEntry {
@@ -276,21 +272,17 @@ fn tree_metadata_matrix_matches_git_without_reading_blobs() {
         for ((old, new), expected) in cases.into_iter().zip(expected) {
             let entries = repo
                 .diff()
-                .tree_to_tree(old.as_ref(), new.as_ref())
+                .tree_to_tree(old.as_ref(), new.as_ref(), &TreeDiffOptions::default())
+                .map(|r| r.entries)
                 .expect("metadata diff");
             for detail in [DiffDetail::NameOnly, DiffDetail::NameStatus] {
                 let counter = Arc::new(AtomicUsize::new(0));
-                let mut opts = DiffOptions::default();
-                opts.blob_read_counter = Some(Arc::clone(&counter));
-                let out = build_file_diffs(
-                    repo.odb(),
-                    entries.clone(),
-                    detail,
-                    opts,
-                    &grit_lib::config::ConfigSet::new(),
-                    &ThreadPolicy::default(),
-                )
-                .expect("names");
+                let _reads = track_blob_reads(Arc::clone(&counter));
+                let opts = DiffOptions::default().with_renames(RenameDetection::Off);
+                let out = repo
+                    .diff()
+                    .files_for_entries(entries.clone(), detail, &opts)
+                    .expect("names");
                 let actual: Vec<u8> = out
                     .files
                     .iter()
@@ -320,22 +312,26 @@ fn tree_metadata_matrix_matches_git_without_reading_blobs() {
             let adds_and_deletes = entries.iter().any(|e| e.status == DiffStatus::Added)
                 && entries.iter().any(|e| e.status == DiffStatus::Deleted);
             if !adds_and_deletes {
-                let renamed = diff_trees_with_renames_and_policy(
-                    repo.odb(),
-                    old.as_ref(),
-                    new.as_ref(),
-                    "",
-                    50,
-                    &grit_lib::config::ConfigSet::new(),
-                    &ThreadPolicy::default(),
-                )
-                .expect("rename pass without blobs");
+                let renames = TreeDiffOptions::default()
+                    .with_renames(RenameDetection::Similarity(50))
+                    .with_threads(Some(ThreadPolicy::default()));
+                let renamed = repo
+                    .diff()
+                    .tree_to_tree(old.as_ref(), new.as_ref(), &renames)
+                    .expect("rename pass without blobs")
+                    .entries;
                 assert_eq!(renamed, entries, "{algo:?} rename pass");
             }
         }
-        let shown =
-            grit_lib::diff::diff_trees_show_tree_entries(repo.odb(), Some(&old), Some(&new), "")
-                .expect("tree entries without blobs");
+        let shown = repo
+            .diff()
+            .tree_to_tree(
+                Some(&old),
+                Some(&new),
+                &TreeDiffOptions::default().with_show_tree_entries(true),
+            )
+            .expect("tree entries without blobs")
+            .entries;
         let shown: Vec<u8> = shown
             .iter()
             .flat_map(|entry| {
@@ -351,13 +347,20 @@ fn tree_metadata_matrix_matches_git_without_reading_blobs() {
             .write(ObjectKind::Tree, b"100644 truncated\0")
             .expect("malformed tree");
         assert!(matches!(
-            repo.diff().tree_to_tree(None, Some(&malformed)),
-            Err(grit_lib::error::Error::CorruptObject(_))
+            repo.diff()
+                .tree_to_tree(None, Some(&malformed), &TreeDiffOptions::default())
+                .map(|r| r.entries),
+            Err(grit_lib::error::Error::Object(ObjectError::Corrupt { .. }))
         ));
         // Identical-tree pruning does not attempt to parse even an unreadable tree.
         assert!(repo
             .diff()
-            .tree_to_tree(Some(&malformed), Some(&malformed))
+            .tree_to_tree(
+                Some(&malformed),
+                Some(&malformed),
+                &TreeDiffOptions::default()
+            )
+            .map(|r| r.entries)
             .expect("equal OIDs")
             .is_empty());
     }

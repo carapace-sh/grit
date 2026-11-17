@@ -6,6 +6,7 @@
 
 use crate::config::parse_path;
 use crate::config::ConfigSet;
+use crate::error::RefError;
 use crate::git_path::CanonicalizeExt;
 #[cfg(unix)]
 use crate::index::normalize_mode;
@@ -150,7 +151,7 @@ pub struct ParsedGitAttributes {
 
 /// Returns true if `name` is reserved (`builtin_*` except the real builtin names Git allows).
 #[must_use]
-pub fn is_reserved_builtin_name(name: &str) -> bool {
+pub(crate) fn is_reserved_builtin_name(name: &str) -> bool {
     let Some(rest) = name.strip_prefix("builtin_") else {
         return false;
     };
@@ -160,7 +161,8 @@ pub fn is_reserved_builtin_name(name: &str) -> bool {
 /// Validate user-defined attribute names in parsed rules (for `git add`).
 ///
 /// Returns an error string matching Git when a rule uses an invalid `builtin_*` name.
-pub fn validate_rules_for_add(
+#[allow(dead_code)] // integration / re-export use only
+pub(crate) fn validate_rules_for_add(
     rules: &[AttrRule],
     display_path: &str,
 ) -> std::result::Result<(), String> {
@@ -181,7 +183,7 @@ pub fn validate_rules_for_add(
 }
 
 /// Collect warnings for invalid `builtin_*` assignments (check-attr continues).
-pub fn builtin_warnings_for_rules(rules: &[AttrRule], display_path: &str) -> Vec<String> {
+pub(crate) fn builtin_warnings_for_rules(rules: &[AttrRule], display_path: &str) -> Vec<String> {
     let mut w = Vec::new();
     for rule in rules {
         if rule.skip {
@@ -207,9 +209,9 @@ pub fn builtin_warnings_for_rules(rules: &[AttrRule], display_path: &str) -> Vec
 pub(crate) fn global_attributes_path(
     repo: &Repository,
 ) -> std::result::Result<Option<PathBuf>, crate::error::Error> {
-    let config = repo.config()?;
+    let config = repo.config().snapshot()?;
     let env = repo.environment();
-    if let Some(path) = config.get("core.attributesfile") {
+    if let Some(path) = config.value("core.attributesfile") {
         return Ok(Some(PathBuf::from(parse_path(env, &path))));
     }
     Ok(env.default_xdg_config_git_file("attributes"))
@@ -233,13 +235,16 @@ fn read_gitattributes_maybe_symlink(
 
 /// Parse one gitattributes file from disk (patterns are relative to `attr_base`, the directory
 /// containing the file — use `""` for the repository root file).
-pub fn parse_gitattributes_file_content(content: &str, display_path: &str) -> ParsedGitAttributes {
+pub(crate) fn parse_gitattributes_file_content(
+    content: &str,
+    display_path: &str,
+) -> ParsedGitAttributes {
     parse_gitattributes_content_impl(content, display_path, false, "")
 }
 
 /// Parse attributes defined in a `.gitattributes` file located in `attr_base` (repo-relative,
 /// `/` separators, no trailing slash; empty string for the repository root).
-pub fn parse_gitattributes_file_content_with_base(
+pub(crate) fn parse_gitattributes_file_content_with_base(
     content: &str,
     display_path: &str,
     attr_base: &str,
@@ -560,7 +565,7 @@ fn path_dir_prefix(rel_path: &str) -> &str {
 ///
 /// Rules from nested attribute files only affect paths inside that directory tree.
 #[must_use]
-pub fn attr_rule_applies_to_path(attr_base: &str, rel_path: &str, icase: bool) -> bool {
+pub(crate) fn attr_rule_applies_to_path(attr_base: &str, rel_path: &str, icase: bool) -> bool {
     if attr_base.is_empty() {
         return true;
     }
@@ -587,7 +592,8 @@ pub fn attr_rule_applies_to_path(attr_base: &str, rel_path: &str, icase: bool) -
 
 /// Match one parsed rule against a repo-relative path (Git `path_matches` / `attr.c`).
 #[must_use]
-pub fn attr_rule_matches(rule: &AttrRule, rel_path: &str, icase: bool) -> bool {
+#[allow(dead_code)] // integration / re-export use only
+pub(crate) fn attr_rule_matches(rule: &AttrRule, rel_path: &str, icase: bool) -> bool {
     if !attr_rule_applies_to_path(&rule.attr_base, rel_path, icase) {
         return false;
     }
@@ -728,7 +734,8 @@ pub fn collect_attrs_for_path(
 
 /// Quote a path for `check-attr` output (C-style) when needed.
 #[must_use]
-pub fn quote_path_for_check_attr(path: &str) -> String {
+#[allow(dead_code)] // integration / re-export use only
+pub(crate) fn quote_path_for_check_attr(path: &str) -> String {
     let needs = path
         .chars()
         .any(|c| c.is_control() || c == '"' || c == '\\');
@@ -787,13 +794,24 @@ fn lexical_normalize_path(path: PathBuf) -> PathBuf {
 ///
 /// Uses [`std::fs::canonicalize`] when the target exists; otherwise resolves `..` lexically from the
 /// current directory so paths like `../f` work for missing files (Git `prefix_path`, t0003).
+///
+/// # Errors
+///
+/// [`RepositoryError::RequiresWorkTree`](crate::repo::RepositoryError::RequiresWorkTree) in a
+/// bare repository, and [`PathOutsideRepoError`](crate::error::PathOutsideRepoError) when the
+/// path is outside the work tree.
 pub fn path_relative_to_worktree(
     repo: &Repository,
     path_str: &str,
-) -> std::result::Result<String, String> {
+) -> crate::error::Result<String> {
     let wt = repo
         .work_tree()
-        .ok_or_else(|| "bare repository — no work tree".to_string())?;
+        .ok_or(crate::repo::RepositoryError::RequiresWorkTree)?;
+    let outside = || crate::error::PathOutsideRepoError::OutsideRepository {
+        path: path_str.to_owned(),
+        subpath: path_str.to_owned(),
+        repo_root: wt.display().to_string(),
+    };
     let cwd = repo.environment().cwd.clone();
     let p = Path::new(path_str);
     let combined = if p.is_absolute() {
@@ -803,14 +821,12 @@ pub fn path_relative_to_worktree(
     };
 
     if let Ok(abs) = combined.canonicalize_simplified() {
-        let rel = crate::git_path::strip_worktree_prefix(&abs, wt)
-            .ok_or_else(|| format!("path outside repository: {}", path_str))?;
+        let rel = crate::git_path::strip_worktree_prefix(&abs, wt).ok_or_else(outside)?;
         return Ok(normalize_rel_path(&rel));
     }
 
     let abs_lex = lexical_normalize_path(combined);
-    let rel = crate::git_path::strip_worktree_prefix(&abs_lex, wt)
-        .ok_or_else(|| format!("path outside repository: {}", path_str))?;
+    let rel = crate::git_path::strip_worktree_prefix(&abs_lex, wt).ok_or_else(outside)?;
     Ok(normalize_rel_path(&rel))
 }
 
@@ -1036,7 +1052,8 @@ pub(crate) fn load_gitattributes_stack_uncached(
 /// Bare repository: only `info/attributes` from disk (no in-repo `.gitattributes` file).
 ///
 /// Memoized like [`load_gitattributes_stack`], keyed by `git_dir`.
-pub fn load_gitattributes_bare(
+#[allow(dead_code)] // integration / re-export use only
+pub(crate) fn load_gitattributes_bare(
     repo: &Repository,
 ) -> std::result::Result<ParsedGitAttributes, crate::error::Error> {
     repo.caches().load_gitattributes_bare(repo)
@@ -1139,7 +1156,8 @@ fn merge_collected_gitattributes(
 }
 
 /// `load_gitattributes_from_tree` function.
-pub fn load_gitattributes_from_tree(
+#[allow(dead_code)] // integration / re-export use only
+pub(crate) fn load_gitattributes_from_tree(
     repo: &Repository,
     tree_oid: &ObjectId,
 ) -> std::result::Result<ParsedGitAttributes, crate::error::Error> {
@@ -1235,7 +1253,8 @@ fn append_gitattributes_from_tree(
 ///
 /// Returns an error when a tree-ish source is set from the environment or command line and cannot
 /// be resolved (Git: *"bad --attr-source or GIT_ATTR_SOURCE"*).
-pub fn load_gitattributes_for_diff(
+#[allow(dead_code)] // integration / re-export use only
+pub(crate) fn load_gitattributes_for_diff(
     repo: &Repository,
 ) -> std::result::Result<ParsedGitAttributes, crate::error::Error> {
     let (treeish, ignore_bad_tree) = resolve_attr_treeish(repo, None)?;
@@ -1244,9 +1263,9 @@ pub fn load_gitattributes_for_diff(
             Ok(oid) => return load_gitattributes_from_tree(repo, &oid),
             Err(_) if ignore_bad_tree => {}
             Err(_) => {
-                return Err(crate::error::Error::InvalidRef(format!(
-                    "bad --attr-source or GIT_ATTR_SOURCE: {spec}"
-                )));
+                return Err(crate::error::Error::Ref(RefError::Invalid {
+                    detail: format!("bad --attr-source or GIT_ATTR_SOURCE: {spec}"),
+                }));
             }
         }
     }
@@ -1261,7 +1280,8 @@ pub fn load_gitattributes_for_diff(
 /// The second return value is `ignore_bad_resolution`: when true (only for `attr.tree` from
 /// config), an unresolvable tree-ish falls back to reading `.gitattributes` from the work tree
 /// or index instead of erroring (matches Git `compute_default_attr_source`).
-pub fn resolve_attr_treeish(
+#[allow(dead_code)] // integration / re-export use only
+pub(crate) fn resolve_attr_treeish(
     repo: &Repository,
     source_arg: Option<&str>,
 ) -> std::result::Result<(Option<String>, bool), crate::error::Error> {
@@ -1269,8 +1289,12 @@ pub fn resolve_attr_treeish(
         .environment()
         .var("GIT_ATTR_SOURCE")
         .filter(|s| !s.is_empty());
-    let config = ConfigSet::load(repo.environment(), Some(repo.git_dir()), true)?;
-    let cfg_tree = config.get("attr.tree");
+    let config = ConfigSet::load(
+        repo.environment(),
+        Some(repo.git_dir()),
+        &crate::config::LoadConfigOptions::standard(repo.environment(), Some(repo.git_dir())),
+    )?;
+    let cfg_tree = config.value("attr.tree");
     if let Some(s) = source_arg.map(|s| s.to_string()) {
         return Ok((Some(s), false));
     }
@@ -1284,16 +1308,24 @@ pub fn resolve_attr_treeish(
 }
 
 /// Parse a revision to a tree OID for attribute loading.
-pub fn resolve_tree_oid(repo: &Repository, spec: &str) -> std::result::Result<ObjectId, String> {
-    let oid = resolve_revision(repo, spec).map_err(|e| e.to_string())?;
-    let obj = repo.read_replaced(&oid).map_err(|e| e.to_string())?;
+///
+/// # Errors
+///
+/// Revision resolution and object read failures, and
+/// [`ObjectError::UnexpectedKind`](crate::error::ObjectError::UnexpectedKind) when the revision
+/// names neither a commit nor a tree.
+pub fn resolve_tree_oid(repo: &Repository, spec: &str) -> crate::error::Result<ObjectId> {
+    let oid = resolve_revision(repo, spec)?;
+    let obj = repo.read_replaced(&oid)?;
     match obj.kind {
-        ObjectKind::Commit => {
-            let c = crate::objects::parse_commit(&obj.data).map_err(|e| e.to_string())?;
-            Ok(c.tree)
-        }
+        ObjectKind::Commit => Ok(crate::objects::parse_commit(&obj.data)?.tree),
         ObjectKind::Tree => Ok(oid),
-        _ => Err("revision is not a commit or tree".to_string()),
+        actual => Err(crate::error::ObjectError::UnexpectedKind {
+            oid,
+            expected: ObjectKind::Tree,
+            actual,
+        }
+        .into()),
     }
 }
 
@@ -1397,10 +1429,9 @@ fn merge_info_attributes(repo: &Repository, merged: &mut ParsedGitAttributes) {
 #[must_use]
 pub fn attribute_matching_ignore_case(repo: &Repository) -> bool {
     repo.config()
+        .snapshot()
         .ok()
-        .and_then(|c| c.get_bool("core.ignorecase"))
-        .and_then(|r| r.ok())
-        .unwrap_or(false)
+        .is_some_and(|c| c.ignore_case())
 }
 
 /// Merged attribute rules for `git check-attr --cached` (global, index `.gitattributes`, `info/attributes`).
@@ -1444,7 +1475,8 @@ pub fn load_gitattributes_for_check_attr_source(
 /// Submodule checkout directories (`.git` is a file containing `gitdir:`) report `160000`
 /// like Git, not `040000`.
 #[must_use]
-pub fn builtin_objectmode_worktree(repo: &Repository, rel_path: &str) -> Option<String> {
+#[allow(dead_code)] // integration / re-export use only
+pub(crate) fn builtin_objectmode_worktree(repo: &Repository, rel_path: &str) -> Option<String> {
     let wt = repo.work_tree()?;
     let p = wt.join(rel_path);
     let meta = fs::symlink_metadata(&p).ok()?;

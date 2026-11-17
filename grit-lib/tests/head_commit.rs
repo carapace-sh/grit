@@ -1,8 +1,9 @@
-//! [`Repository::head_commit`] on repositories written by the system `git`, on an injected ref
-//! store, and through the history engine that relies on it.
+//! [`Repository::head_commit`] and [`Repository::head_tree`] on repositories written by the
+//! system `git`, on an injected ref store, and through the history engine that relies on them.
 
 #![allow(clippy::expect_used)]
 
+use grit_lib::error::RefError;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
@@ -10,15 +11,15 @@ use std::sync::Arc;
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::error::Error;
 use grit_lib::objects::odb::store::MemoryStore;
-use grit_lib::objects::odb::OdbBuilder;
 use grit_lib::objects::{HashAlgo, ObjectId};
 use grit_lib::refs::store::{
     Expected, MemoryRefStore, RawRef, RefStore, RefTransaction, RefUpdate, RefUpdateFlags,
 };
-use grit_lib::repo::{Repository, RepositoryBuilder};
+use grit_lib::repo::Repository;
 use grit_lib::revwalk::history::{
-    move_commit, EmptyPolicy, HistoryError, Placement, RefScope, RewriteOptions,
+    EmptyPolicy, HistoryEngineError, HistoryError, Placement, RefScope, RewriteOptions,
 };
+use grit_lib::state::HeadState;
 use grit_test_support::git;
 
 fn open(dir: &Path) -> Repository {
@@ -67,7 +68,7 @@ fn unborn_branch_is_unborn_head() {
     let dir = tempfile::tempdir().expect("tempdir");
     git(dir.path(), &["init", "-q", "-b", "main"]);
     let err = open(dir.path()).head_commit().expect_err("unborn");
-    assert!(matches!(err, Error::UnbornHead), "{err:?}");
+    assert!(matches!(err, Error::Ref(RefError::UnbornHead)), "{err:?}");
 }
 
 #[test]
@@ -76,32 +77,70 @@ fn head_naming_a_missing_non_branch_ref_is_invalid_head() {
     let repo = open(dir.path());
     fs::write(repo.git_dir().join("HEAD"), "ref: refs/tags/missing\n").expect("write HEAD");
     let err = repo.head_commit().expect_err("invalid");
-    assert!(matches!(err, Error::InvalidHead), "{err:?}");
+    assert!(matches!(err, Error::Ref(RefError::InvalidHead)), "{err:?}");
+}
+
+fn git_head_tree(dir: &Path) -> ObjectId {
+    git(dir, &["rev-parse", "HEAD^{tree}"])
+        .trim()
+        .parse()
+        .expect("HEAD tree oid")
+}
+
+#[test]
+fn head_tree_matches_git_on_a_branch_and_detached() {
+    let dir = repo_with_two_commits();
+    assert_eq!(
+        open(dir.path()).head_tree().expect("head tree"),
+        Some(git_head_tree(dir.path()))
+    );
+    git(dir.path(), &["checkout", "-q", "--detach", "HEAD~1"]);
+    assert_eq!(
+        open(dir.path()).head_tree().expect("head tree"),
+        Some(git_head_tree(dir.path()))
+    );
+}
+
+#[test]
+fn head_tree_is_none_on_an_unborn_branch() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    git(dir.path(), &["init", "-q", "-b", "main"]);
+    assert_eq!(open(dir.path()).head_tree().expect("unborn"), None);
+}
+
+#[test]
+fn head_tree_of_an_invalid_head_is_invalid_head_but_head_state_tree_is_none() {
+    let dir = repo_with_two_commits();
+    let repo = open(dir.path());
+    fs::write(repo.git_dir().join("HEAD"), "ref: refs/tags/missing\n").expect("write HEAD");
+    let err = repo.head_tree().expect_err("invalid");
+    assert!(matches!(err, Error::Ref(RefError::InvalidHead)), "{err:?}");
+    let head = repo.references().head().expect("resolve");
+    assert_eq!(head, HeadState::Invalid);
+    assert_eq!(head.tree(repo.odb()).expect("lenient"), None);
 }
 
 #[test]
 fn injected_ref_store_is_the_source_of_head() {
     let dir = tempfile::tempdir().expect("tempdir");
     let refs = Arc::new(MemoryRefStore::new());
-    let repo = RepositoryBuilder::new(RepositoryOptions::empty())
-        .odb_builder(
-            OdbBuilder::files(dir.path().join("objects"))
-                .primary(Arc::new(MemoryStore::new(HashAlgo::Sha1)))
-                .alternates(false),
-        )
-        .ref_store(refs.clone())
-        .initial_branch("main")
-        .open(dir.path(), None)
-        .expect("open injected");
+    let repo = Repository::open(
+        dir.path(),
+        &(RepositoryOptions::empty()
+            .with_object_store(Arc::new(MemoryStore::new(HashAlgo::Sha1)))
+            .with_ref_store(refs.clone())
+            .with_initial_branch("main")),
+    )
+    .expect("open injected");
     let err = repo.head_commit().expect_err("unborn");
-    assert!(matches!(err, Error::UnbornHead), "{err:?}");
+    assert!(matches!(err, Error::Ref(RefError::UnbornHead)), "{err:?}");
 
     let oid: ObjectId = "0100000000000000000000000000000000000000"
         .parse()
         .expect("oid");
     let txn = RefTransaction::new()
         .update(RefUpdate {
-            name: "HEAD".to_owned(),
+            name: grit_lib::refs::store::RefName::from_trusted("HEAD"),
             new_value: Some(RawRef::Direct(oid)),
             expected: Expected::Any,
             reflog: None,
@@ -128,9 +167,12 @@ fn history_planning_reports_unborn_head_as_typed_library_error() {
         preserve_committer: false,
         sign: false,
     };
-    let err = move_commit(&repo, commit, Placement::Before(commit), &opts).expect_err("unborn");
+    let err = repo
+        .history()
+        .move_commit(commit, Placement::Before(commit), &opts)
+        .expect_err("unborn");
     assert!(
-        matches!(&err, HistoryError::Library(inner) if matches!(**inner, Error::UnbornHead)),
+        matches!(&err, HistoryError::Engine(e) if matches!(*e.as_ref(), HistoryEngineError::UnbornHead)),
         "{err:?}"
     );
 }
@@ -141,8 +183,9 @@ fn history_error_from_library_error_unwraps_history_failures() {
         HistoryError::from(Error::History(HistoryError::NotLinear)),
         HistoryError::NotLinear
     ));
-    assert!(matches!(
-        HistoryError::from(Error::UnbornHead),
-        HistoryError::Library(inner) if matches!(*inner, Error::UnbornHead)
-    ));
+    let unborn = HistoryError::from(Error::Ref(RefError::UnbornHead));
+    assert!(
+        matches!(&unborn, HistoryError::Engine(e) if matches!(*e.as_ref(), HistoryEngineError::UnbornHead)),
+        "{unborn:?}"
+    );
 }

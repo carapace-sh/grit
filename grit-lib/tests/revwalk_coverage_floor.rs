@@ -6,8 +6,7 @@ use grit_lib::objects::{ObjectId, ObjectKind};
 use grit_lib::refs::ref_storage::RefStorageFormat;
 use grit_lib::repo::{InitOptions, Repository};
 use grit_lib::revwalk::rev_list::{
-    expand_object_filter_for_protocol, merge_bases, rev_list, ObjectFilter, OrderingMode,
-    OutputMode, RevListOptions,
+    expand_object_filter_for_protocol, ObjectFilter, OrderingMode, RevListOptions,
 };
 use grit_lib::revwalk::RevWalk;
 use std::collections::HashSet;
@@ -80,7 +79,7 @@ fn seed_merged_history(
 #[test]
 fn revwalk_floor_cartesian_sweep() -> grit_lib::error::Result<()> {
     let dir = tempdir().map_err(grit_lib::error::Error::Io)?;
-    let repo = Repository::init(
+    let (repo, _) = Repository::init(
         dir.path(),
         &InitOptions::new()
             .with_bare(true)
@@ -90,9 +89,10 @@ fn revwalk_floor_cartesian_sweep() -> grit_lib::error::Result<()> {
     let (merge, tip, side) = seed_merged_history(&repo, 1100)?;
     repo.odb().write_commit_graph()?;
 
-    let _ = expand_object_filter_for_protocol("tree:0").map_err(grit_lib::error::Error::Message)?;
     let _ =
-        expand_object_filter_for_protocol("blob:none").map_err(grit_lib::error::Error::Message)?;
+        expand_object_filter_for_protocol("tree:0").map_err(grit_lib::error::Error::Verbatim)?;
+    let _ =
+        expand_object_filter_for_protocol("blob:none").map_err(grit_lib::error::Error::Verbatim)?;
 
     let mut deco = HashSet::new();
     deco.insert(merge);
@@ -106,83 +106,73 @@ fn revwalk_floor_cartesian_sweep() -> grit_lib::error::Result<()> {
         OrderingMode::AuthorDateWalk,
         OrderingMode::AuthorDateTopo,
     ];
-    let formats = [
-        OutputMode::OidOnly,
-        OutputMode::Parents,
-        OutputMode::Format(String::from("oneline")),
-        OutputMode::Format(String::from("format:%H %P %T %t %p %s %D %d %gD %N %G?")),
-        OutputMode::Format(String::from("tformat:%<(12,trunc)%h %>(10,trunc)%s")),
-    ];
-
     for ordering in orderings {
-        for output_mode in &formats {
-            for use_graph in [false, true] {
-                let opts = RevListOptions {
-                    ordering,
-                    output_mode: output_mode.clone(),
-                    all_refs: use_graph,
-                    first_parent: ordering == OrderingMode::Topo,
-                    ancestry_path: true,
-                    ancestry_path_bottoms: vec![tip],
-                    simplify_by_decoration: true,
-                    simplify_by_decoration_oids: deco.clone(),
-                    full_history: true,
-                    simplify_merges: true,
-                    preserve_simplify_merges_graph_merges: true,
-                    show_pulls: true,
-                    sparse: true,
-                    parent_rewrite: true,
-                    paths: vec!["tracked.txt".into()],
-                    objects: true,
-                    no_object_names: false,
-                    boundary: true,
-                    left_right: true,
-                    left_right_explicit: true,
-                    left_only: false,
-                    right_only: false,
-                    cherry_mark: true,
-                    cherry_pick: false,
-                    min_parents: Some(1),
-                    max_parents: Some(3),
-                    symmetric_left: Some(tip),
-                    symmetric_right: Some(side),
-                    exclude_first_parent_only: true,
-                    filter: Some(ObjectFilter::Combine(vec![
-                        ObjectFilter::BlobLimit(8192),
-                        ObjectFilter::TreeDepth(8),
-                    ])),
-                    filter_raw_specs: vec!["blob:limit=8k".into(), "tree:8".into()],
-                    filter_provided_objects: true,
-                    filter_print_omitted: true,
-                    include_reflog_entries: true,
-                    include_indexed_objects: true,
-                    use_commit_graph: use_graph,
-                    use_commit_graph_bloom: use_graph,
-                    commit_graph_read_changed_paths: use_graph,
-                    use_bitmap_index: use_graph,
-                    bitmap_oid_only_objects: use_graph,
-                    in_commit_order: true,
-                    maximal_only: false,
-                    reverse: true,
-                    skip: 1,
-                    max_count: Some(128),
-                    count: false,
-                    path_graph_reorder: true,
-                    ignore_missing: true,
-                    ..RevListOptions::default()
-                };
-                let _out = rev_list(
-                    &repo,
-                    &[String::from("main"), String::from("side")],
-                    &[],
-                    &opts,
-                )?;
-            }
+        for use_graph in [false, true] {
+            let opts = RevListOptions {
+                ordering,
+                all_refs: use_graph,
+                first_parent: ordering == OrderingMode::Topo,
+                ancestry_path: true,
+                ancestry_path_bottoms: vec![tip],
+                simplify_by_decoration: true,
+                simplify_by_decoration_oids: deco.clone(),
+                full_history: true,
+                simplify_merges: true,
+                preserve_simplify_merges_graph_merges: true,
+                show_pulls: true,
+                sparse: true,
+                parent_rewrite: true,
+                paths: vec!["tracked.txt".into()],
+                objects: true,
+                no_object_names: false,
+                boundary: true,
+                left_right: true,
+                left_right_explicit: true,
+                left_only: false,
+                right_only: false,
+                cherry_mark: true,
+                cherry_pick: false,
+                min_parents: Some(1),
+                max_parents: Some(3),
+                symmetric_left: Some(tip),
+                symmetric_right: Some(side),
+                exclude_first_parent_only: true,
+                filter: Some(ObjectFilter::Combine(vec![
+                    ObjectFilter::BlobLimit(8192),
+                    ObjectFilter::TreeDepth(8),
+                ])),
+                filter_raw_specs: vec!["blob:limit=8k".into(), "tree:8".into()],
+                filter_provided_objects: true,
+                filter_print_omitted: true,
+                include_reflog_entries: true,
+                include_indexed_objects: true,
+                use_commit_graph: use_graph,
+                use_commit_graph_bloom: use_graph,
+                commit_graph_read_changed_paths: use_graph,
+                use_bitmap_index: use_graph,
+                bitmap_oid_only_objects: use_graph,
+                in_commit_order: true,
+                maximal_only: false,
+                reverse: true,
+                skip: 1,
+                max_count: Some(128),
+                count: false,
+                path_graph_reorder: true,
+                ignore_missing: true,
+                ..RevListOptions::default()
+            };
+            let _out = repo.revwalk().rev_list(
+                &[String::from("main"), String::from("side")],
+                &[],
+                &opts,
+            )?;
         }
     }
 
     let walk = RevWalk::new(&repo);
-    let _ = merge_bases(&repo, tip, side, true)?;
+    let _ = repo
+        .revwalk()
+        .merge_bases(&[tip, side], grit_lib::revwalk::MergeBaseMode::All)?;
     // Every commit has the same tree, so only the root (below the merge base) touches the path;
     // `git rev-list --left-right main...side -- tracked.txt` is empty here.
     let path_limited = walk.walk(

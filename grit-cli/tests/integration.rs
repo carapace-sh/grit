@@ -16,6 +16,8 @@ mod add_executable_cli;
 mod add_hunks;
 #[path = "add_intent_force.rs"]
 mod add_intent_force;
+#[path = "add_interrupt.rs"]
+mod add_interrupt;
 #[path = "add_lines.rs"]
 mod add_lines;
 #[cfg(feature = "full-tests")]
@@ -59,6 +61,7 @@ mod blame_range_memory;
 #[cfg(feature = "full-tests")]
 #[path = "blame_stored_path_cli.rs"]
 mod blame_stored_path_cli;
+#[cfg(feature = "full-tests")]
 #[path = "blame_subdir_cli.rs"]
 mod blame_subdir_cli;
 #[cfg(feature = "full-tests")]
@@ -80,6 +83,11 @@ mod broken_pipe;
 #[cfg(feature = "full-tests")]
 #[path = "bundle_cli.rs"]
 mod bundle_cli;
+#[path = "bundle_create_interrupt.rs"]
+mod bundle_create_interrupt;
+#[cfg(feature = "full-tests")]
+#[path = "case_only_directory_rename_2522.rs"]
+mod case_only_directory_rename_2522;
 #[cfg(feature = "full-tests")]
 #[path = "cat_replace_stream.rs"]
 mod cat_replace_stream;
@@ -98,6 +106,8 @@ mod change_ids_git_compat;
 #[cfg(feature = "full-tests")]
 #[path = "checkout_cli.rs"]
 mod checkout_cli;
+#[path = "clean_interrupt.rs"]
+mod clean_interrupt;
 #[path = "cli_transport_hygiene.rs"]
 mod cli_transport_hygiene;
 #[cfg(feature = "full-tests")]
@@ -112,11 +122,15 @@ mod clone_depth_branch;
 #[cfg(feature = "full-tests")]
 #[path = "clone_empty_remote.rs"]
 mod clone_empty_remote;
+#[path = "clone_http_stall_interrupt.rs"]
+mod clone_http_stall_interrupt;
 #[path = "clone_interrupt.rs"]
 mod clone_interrupt;
 #[cfg(feature = "full-tests")]
 #[path = "clone_invalid_origin.rs"]
 mod clone_invalid_origin;
+#[path = "clone_missing_local_source.rs"]
+mod clone_missing_local_source;
 #[cfg(feature = "full-tests")]
 #[path = "clone_progress.rs"]
 mod clone_progress;
@@ -128,6 +142,8 @@ mod clone_shallow;
 #[cfg(feature = "full-tests")]
 #[path = "clone_unborn_default_branch.rs"]
 mod clone_unborn_default_branch;
+#[path = "clone_url_redaction.rs"]
+mod clone_url_redaction;
 #[path = "commit_allow_empty.rs"]
 mod commit_allow_empty;
 #[path = "commit_amend_committer_only.rs"]
@@ -197,6 +213,9 @@ mod config_advanced_cli;
 #[path = "config_location_cli.rs"]
 mod config_location_cli;
 #[cfg(feature = "full-tests")]
+#[path = "detached_head_pick_revert_rebase.rs"]
+mod detached_head_pick_revert_rebase;
+#[cfg(feature = "full-tests")]
 #[path = "diff_commit_range_stream.rs"]
 mod diff_commit_range_stream;
 #[cfg(feature = "full-tests")]
@@ -224,6 +243,9 @@ mod diff_pathspec;
 #[path = "diff_rename_algorithm_filter_flags.rs"]
 mod diff_rename_algorithm_filter_flags;
 #[cfg(feature = "full-tests")]
+#[path = "diff_rename_limit_notice.rs"]
+mod diff_rename_limit_notice;
+#[cfg(feature = "full-tests")]
 #[path = "diff_single_traversal.rs"]
 mod diff_single_traversal;
 #[cfg(feature = "full-tests")]
@@ -246,6 +268,10 @@ mod exit_status_contract;
 #[cfg(feature = "full-tests")]
 #[path = "fetch_all_cli.rs"]
 mod fetch_all_cli;
+#[path = "fetch_http_stall_interrupt.rs"]
+mod fetch_http_stall_interrupt;
+#[path = "fetch_interrupt.rs"]
+mod fetch_interrupt;
 #[cfg(feature = "full-tests")]
 #[path = "fetch_pull_branch_remote.rs"]
 mod fetch_pull_branch_remote;
@@ -307,6 +333,11 @@ mod history_squash;
 #[cfg(feature = "full-tests")]
 #[path = "history_undo.rs"]
 mod history_undo;
+#[path = "hot_text_layout.rs"]
+mod hot_text_layout;
+#[cfg(feature = "full-tests")]
+#[path = "http_success_url_redaction.rs"]
+mod http_success_url_redaction;
 #[path = "http_transport_error_redaction.rs"]
 mod http_transport_error_redaction;
 #[cfg(feature = "full-tests")]
@@ -331,6 +362,10 @@ mod issue_1653_gc_repack;
 #[cfg(feature = "full-tests")]
 #[path = "issue_1876_gc_midx_version.rs"]
 mod issue_1876_gc_midx_version;
+#[path = "json_error_kinds_2413.rs"]
+mod json_error_kinds_2413;
+#[path = "json_filter_large_diff.rs"]
+mod json_filter_large_diff;
 #[cfg(feature = "full-tests")]
 #[path = "json_output.rs"]
 mod json_output;
@@ -360,6 +395,9 @@ mod log_loose_tags_memory;
 #[cfg(feature = "full-tests")]
 #[path = "log_pickaxe_json.rs"]
 mod log_pickaxe_json;
+#[cfg(feature = "full-tests")]
+#[path = "log_reverse_limit.rs"]
+mod log_reverse_limit;
 #[path = "log_terminal_cli.rs"]
 mod log_terminal_cli;
 #[cfg(feature = "full-tests")]
@@ -418,6 +456,8 @@ mod output_snapshots;
 #[cfg(feature = "full-tests")]
 #[path = "output_snapshots_network.rs"]
 mod output_snapshots_network;
+#[path = "paths_interrupt.rs"]
+mod paths_interrupt;
 #[cfg(feature = "full-tests")]
 #[path = "pathspec_args_cli.rs"]
 mod pathspec_args_cli;
@@ -446,6 +486,9 @@ mod promisor_remote_git_client;
 #[path = "pull_json.rs"]
 mod pull_json;
 #[cfg(feature = "full-tests")]
+#[path = "push_all_mirror.rs"]
+mod push_all_mirror;
+#[cfg(feature = "full-tests")]
 #[path = "push_delete_remote_branch.rs"]
 mod push_delete_remote_branch;
 #[cfg(feature = "full-tests")]
@@ -454,15 +497,21 @@ mod push_dry_run;
 #[cfg(feature = "full-tests")]
 #[path = "push_force_lease.rs"]
 mod push_force_lease;
+#[path = "push_interrupt.rs"]
+mod push_interrupt;
 #[cfg(feature = "full-tests")]
 #[path = "push_json_flags.rs"]
 mod push_json_flags;
+#[path = "push_path_destination_tracking.rs"]
+mod push_path_destination_tracking;
 #[cfg(feature = "full-tests")]
 #[path = "push_pre_push_hook.rs"]
 mod push_pre_push_hook;
 #[cfg(feature = "full-tests")]
 #[path = "push_remote_hook_sideband.rs"]
 mod push_remote_hook_sideband;
+#[path = "push_tag_exists.rs"]
+mod push_tag_exists;
 #[cfg(feature = "full-tests")]
 #[path = "push_tag_label.rs"]
 mod push_tag_label;
@@ -479,6 +528,9 @@ mod rebase_conflicts_cli;
 #[path = "rebase_exec_interrupt.rs"]
 mod rebase_exec_interrupt;
 #[cfg(feature = "full-tests")]
+#[path = "rebase_interrupt.rs"]
+mod rebase_interrupt;
+#[cfg(feature = "full-tests")]
 #[path = "receive_pack_deny_non_ff.rs"]
 mod receive_pack_deny_non_ff;
 #[cfg(feature = "full-tests")]
@@ -490,6 +542,9 @@ mod receive_pack_git_push;
 #[cfg(feature = "full-tests")]
 #[path = "receive_pack_shared_pack_mode.rs"]
 mod receive_pack_shared_pack_mode;
+#[cfg(feature = "full-tests")]
+#[path = "receive_pack_update_instead_untracked.rs"]
+mod receive_pack_update_instead_untracked;
 #[cfg(feature = "full-tests")]
 #[path = "reflog_filter_cli.rs"]
 mod reflog_filter_cli;
@@ -556,6 +611,9 @@ mod rm_mv_clean_cli;
 #[path = "serve_bundles_cli.rs"]
 mod serve_bundles_cli;
 #[cfg(feature = "full-tests")]
+#[path = "serve_hook_sigpipe.rs"]
+mod serve_hook_sigpipe;
+#[cfg(feature = "full-tests")]
 #[path = "shallow_maintenance_cli.rs"]
 mod shallow_maintenance_cli;
 #[cfg(feature = "full-tests")]
@@ -604,6 +662,12 @@ mod status_midx_memory;
 #[path = "status_paths_renames.rs"]
 mod status_paths_renames;
 #[cfg(feature = "full-tests")]
+#[path = "status_unreadable_directory_cli.rs"]
+mod status_unreadable_directory_cli;
+#[cfg(feature = "full-tests")]
+#[path = "status_untracked_cwd_paths.rs"]
+mod status_untracked_cwd_paths;
+#[cfg(feature = "full-tests")]
 #[path = "status_untracked_mode.rs"]
 mod status_untracked_mode;
 #[cfg(feature = "full-tests")]
@@ -611,6 +675,8 @@ mod status_untracked_mode;
 mod status_upstream;
 #[path = "status_utf8_paths.rs"]
 mod status_utf8_paths;
+#[path = "switch_create_upstream.rs"]
+mod switch_create_upstream;
 #[cfg(feature = "full-tests")]
 #[path = "switch_interrupt.rs"]
 mod switch_interrupt;
@@ -638,6 +704,11 @@ mod untracked_overwrite_merge_pick;
 #[cfg(feature = "full-tests")]
 #[path = "upload_pack_filter.rs"]
 mod upload_pack_filter;
+#[path = "upload_pack_interrupt.rs"]
+mod upload_pack_interrupt;
+#[cfg(feature = "full-tests")]
+#[path = "upload_pack_re_shallow_branches.rs"]
+mod upload_pack_re_shallow_branches;
 #[cfg(feature = "full-tests")]
 #[path = "upload_pack_shallow_bitmaps.rs"]
 mod upload_pack_shallow_bitmaps;
@@ -656,6 +727,8 @@ mod worktree_add_prune_flags;
 #[cfg(feature = "full-tests")]
 #[path = "worktree_cli.rs"]
 mod worktree_cli;
+#[path = "worktree_interrupt.rs"]
+mod worktree_interrupt;
 
 /// Fails when a file in `tests/` is neither a module above nor a `[[test]]`
 /// target in Cargo.toml: with `autotests = false` cargo would never build it.
@@ -668,7 +741,7 @@ fn every_test_file_is_compiled() {
     for item in std::fs::read_dir(&dir).expect("read tests/") {
         let name = item.expect("tests/ entry").file_name();
         let Some(name) = name.to_str() else { continue };
-        if !name.ends_with(".rs") || name == "integration.rs" {
+        if !name.ends_with(".rs") || name == "integration.rs" || name.ends_with("_data.rs") {
             continue;
         }
         let module = format!("#[path = \"{name}\"]");

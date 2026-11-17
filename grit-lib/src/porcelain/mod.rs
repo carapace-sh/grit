@@ -3,11 +3,11 @@
 //! `status`, `log`, `merge`, `checkout`, and related commands).
 //!
 //! Rebase is not a porcelain module: it lives with the other history rewrites in
-//! [`crate::revwalk::history`] ([`start_rebase`](crate::revwalk::history::start_rebase) with
-//! [`continue_rebase`](crate::revwalk::history::continue_rebase) /
-//! [`abort_rebase`](crate::revwalk::history::abort_rebase) for the stop-and-resume flow,
-//! [`plan_rebase`](crate::revwalk::history::plan_rebase) and
-//! [`rebase_onto`](crate::revwalk::history::rebase_onto) for planning).
+//! [`crate::revwalk::history`] ([`History::start_rebase`](crate::revwalk::history::History::start_rebase)
+//! with [`History::continue_rebase`](crate::revwalk::history::History::continue_rebase) /
+//! [`History::abort_rebase`](crate::revwalk::history::History::abort_rebase) for the
+//! stop-and-resume flow, [`History::plan_rebase`](crate::revwalk::history::History::plan_rebase)
+//! and [`History::rebase_onto`](crate::revwalk::history::History::rebase_onto) for planning).
 //!
 //! # The library/CLI contract
 //!
@@ -30,15 +30,15 @@
 //! # Examples
 //!
 //! ```
-//! use grit_lib::porcelain::status::{self, StatusOptions};
-//! use grit_lib::progress::{NeverCancel, NullProgress};
+//! use grit_lib::progress::{CancelToken, NullProgress};
 //! use grit_lib::repo::{InitOptions, Repository};
+//! use grit_lib::status::StatusOptions;
 //!
 //! # fn main() -> grit_lib::error::Result<()> {
 //! let dir = tempfile::tempdir()?;
-//! let repo = Repository::init(dir.path(), &InitOptions::default())?;
+//! let (repo, _) = Repository::init(dir.path(), &InitOptions::default())?;
 //! let mut progress = NullProgress;
-//! let model = status::status(&repo, &StatusOptions::default(), &mut progress, &NeverCancel)?;
+//! let model = repo.status().run(&StatusOptions::default(), &mut progress, &CancelToken::never())?;
 //! assert!(model.staged.is_empty() && model.unstaged.is_empty());
 //! # Ok(())
 //! # }
@@ -47,26 +47,30 @@
 //! Library guide: [mod](https://grit-scm.com/docs/library/embedding)
 //!
 //! ```rust
-//! use grit_lib::progress::{NeverCancel, NullProgress};
+//! use grit_lib::progress::{CancelToken, NullProgress};
 //! use grit_lib::repo::{InitOptions, Repository};
 //! # fn main() -> grit_lib::error::Result<()> {
 //! let dir = tempfile::tempdir()?;
-//! let repo = Repository::init(dir.path(), &InitOptions::default())?;
+//! let (repo, _) = Repository::init(dir.path(), &InitOptions::default())?;
 //! let _sink = NullProgress;
-//! let _cancel = NeverCancel;
+//! let _cancel = CancelToken::never();
 //! # Ok(())
 //! # }
 //! ```
 
 pub mod add;
 pub mod branch;
-pub mod branch_error;
+pub(crate) mod branch_error;
 pub(crate) mod bulk_index;
 pub mod checkout;
 pub mod checkout_reflog;
 pub mod cherry_pick;
 pub mod clean;
 pub mod commit;
+pub(crate) mod commit_error;
+pub use commit_error::CommitError;
+pub(crate) mod merge_error;
+pub use merge_error::MergeError;
 pub mod hunk_select;
 pub(crate) mod index_from_tree;
 pub mod index_mode;
@@ -76,7 +80,6 @@ pub(crate) mod orphans;
 pub mod paths;
 pub mod pathspec_match;
 pub mod pull;
-pub mod ref_summaries;
 pub mod replay;
 pub mod replay_sequence;
 pub mod reset;
@@ -84,7 +87,8 @@ pub mod restore;
 pub mod revert;
 pub mod stage_tracked;
 pub mod staging;
-pub mod stash;
+pub(crate) mod stash;
+pub(crate) mod stash_error;
 pub mod status;
 pub mod switch;
 pub mod tag;

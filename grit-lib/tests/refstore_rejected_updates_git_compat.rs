@@ -3,11 +3,13 @@
 
 use crate::support;
 
+use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::objects::ObjectId;
 use grit_lib::refs::store::{
-    open_ref_store, Expected, RawRef, RefStore, RefStoreError, RefTransaction, RefUpdate,
-    RefUpdateFlags,
+    open_ref_store, Expected, RawRef, RefName, RefNameRef, RefStore, RefStoreError, RefTransaction,
+    RefUpdate, RefUpdateFlags,
 };
+use grit_lib::repo::Repository;
 
 use support::{
     assert_fsck_when_git_interop, each_backend, empty_commit_oid, git, git_for_each_ref,
@@ -16,7 +18,7 @@ use support::{
 
 fn put(store: &dyn RefStore, name: &str, value: RawRef) -> Result<(), RefStoreError> {
     let txn = RefTransaction::new().update(RefUpdate {
-        name: name.to_owned(),
+        name: RefName::from_trusted(name),
         new_value: Some(value),
         expected: Expected::Any,
         reflog: None,
@@ -30,7 +32,9 @@ fn rejected_updates_keep_repository_clean_for_git() {
     each_backend(|backend, repo| {
         let commit = empty_commit_oid(repo);
         let git_dir = repo.worktree().join(".git");
-        let store = open_ref_store(&git_dir).expect("open ref store");
+        let store = Repository::open(&git_dir, &RepositoryOptions::empty())
+            .expect("open ref store")
+            .ref_store();
 
         assert_eq!(
             put(
@@ -61,9 +65,26 @@ fn rejected_updates_keep_repository_clean_for_git() {
             );
         }
 
+        for (name, target) in [
+            ("HEAD", "refs/heads/x\nref: refs/heads/evil"),
+            ("refs/heads/sym-a", "refs/heads/has space"),
+            ("refs/heads/sym-b", "refs/heads/../../config"),
+            ("refs/heads/sym-c", "refs/heads/trailing.lock"),
+        ] {
+            assert!(
+                matches!(
+                    put(store.as_ref(), name, RawRef::Symbolic(target.to_owned())),
+                    Err(RefStoreError::InvalidSymrefTarget { .. })
+                ),
+                "{backend:?} {name:?} -> {target:?}"
+            );
+        }
+
         put(store.as_ref(), "refs/heads/kept", RawRef::Direct(commit)).expect("valid update");
         assert_eq!(
-            store.read_raw("refs/heads/z").expect("read z"),
+            store
+                .read_raw(RefNameRef::from_trusted("refs/heads/z"))
+                .expect("read z"),
             None,
             "{backend:?}"
         );

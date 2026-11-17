@@ -5,16 +5,18 @@ mod support;
 use std::fs;
 use std::path::Path;
 
+use grit_lib::command_runner::hooks::PostOperationHooks;
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::objects::ObjectId;
-use grit_lib::porcelain::switch::{switch_repository, SwitchMode, SwitchOptions};
-use grit_lib::progress::{NeverCancel, NullProgress};
+use grit_lib::porcelain::switch::{SwitchMode, SwitchOptions};
+use grit_lib::progress::CancelToken;
+use grit_lib::progress::NullProgress;
 use grit_lib::refs::ref_storage::RefStorageFormat;
 use grit_lib::refs::store::RawRef;
+use grit_lib::refs::store::RefNameRef;
 use grit_lib::repo::{InitOptions, Repository};
-use grit_lib::state::{resolve_head, resolve_head_for_repository, HeadState};
-use grit_lib::worktree::{add_linked_worktree, AddLinkedWorktreeOptions, WorktreeBranch};
-use grit_lib::PostOperationHooks;
+use grit_lib::state::HeadState;
+use grit_lib::worktree::{AddLinkedWorktreeOptions, WorktreeBranch};
 use grit_test_support::git;
 
 fn open(path: &Path) -> Repository {
@@ -33,14 +35,14 @@ fn seed(path: &Path) -> ObjectId {
 fn assert_head(path: &Path, oid: ObjectId, branch: Option<&str>, status: &str) {
     assert_eq!(git(path, &["rev-parse", "HEAD"]).trim(), oid.to_hex());
     let repo = open(path);
-    assert_eq!(repo.refs().resolve("HEAD").unwrap(), oid);
+    assert_eq!(repo.ref_store().resolve("HEAD").unwrap(), oid);
     let expected = branch.map_or(HeadState::Detached { oid }, |name| HeadState::Branch {
         refname: format!("refs/heads/{name}"),
         short_name: name.into(),
         oid: Some(oid),
     });
-    assert_eq!(resolve_head_for_repository(&repo).unwrap(), expected);
-    assert_eq!(resolve_head(repo.git_dir()).unwrap(), expected);
+    assert_eq!(repo.references().head().unwrap(), expected);
+    assert_eq!(repo.references().head().unwrap(), expected);
     let list = git(path, &["worktree", "list", "--porcelain"]);
     let worktree_line = format!("worktree {}", path.canonicalize().unwrap().display());
     let row = list
@@ -52,13 +54,17 @@ fn assert_head(path: &Path, oid: ObjectId, branch: Option<&str>, status: &str) {
         let target = format!("refs/heads/{branch}");
         assert_eq!(git(path, &["symbolic-ref", "HEAD"]).trim(), target);
         assert_eq!(
-            repo.refs().read_raw("HEAD").unwrap(),
+            repo.ref_store()
+                .read_raw(RefNameRef::from_trusted("HEAD"))
+                .unwrap(),
             Some(RawRef::Symbolic(target.clone()))
         );
         assert!(row.contains(&format!("branch {target}")), "{row}");
     } else {
         assert_eq!(
-            repo.refs().read_raw("HEAD").unwrap(),
+            repo.ref_store()
+                .read_raw(RefNameRef::from_trusted("HEAD"))
+                .unwrap(),
             Some(RawRef::Direct(oid))
         );
         assert!(!std::process::Command::new("git")
@@ -74,17 +80,18 @@ fn assert_head(path: &Path, oid: ObjectId, branch: Option<&str>, status: &str) {
 }
 
 fn switch(path: &Path, mode: SwitchMode) {
-    switch_repository(
-        &open(path),
-        &SwitchOptions {
-            mode,
-            dry_run: false,
-            hooks: PostOperationHooks::Skip,
-        },
-        &mut NullProgress,
-        &NeverCancel,
-    )
-    .unwrap();
+    open(path)
+        .checkout()
+        .switch(
+            &SwitchOptions {
+                mode,
+                dry_run: false,
+                hooks: PostOperationHooks::Skip,
+            },
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .unwrap();
 }
 
 #[test]
@@ -121,9 +128,9 @@ fn reftable_add_attached_detached_and_no_checkout_are_git_readable() {
         }
         let path = tmp.path().join(name);
         let repo = open(&main);
-        let entry = add_linked_worktree(
-            &repo,
-            &AddLinkedWorktreeOptions {
+        let entry = repo
+            .worktrees()
+            .add(&AddLinkedWorktreeOptions {
                 path: path.clone(),
                 branch: Some(if detached {
                     WorktreeBranch::Detach
@@ -139,9 +146,8 @@ fn reftable_add_attached_detached_and_no_checkout_are_git_readable() {
                 lock: None,
                 no_checkout,
                 track: false,
-            },
-        )
-        .unwrap();
+            })
+            .unwrap();
         assert!(entry.admin_dir.join("reftable/tables.list").is_file());
         assert!(entry.admin_dir.join("refs/heads").is_file());
         assert_eq!(

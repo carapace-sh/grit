@@ -5,7 +5,7 @@ default-members = ["grit-lib", "grit-protocol", "grit-cli"]
 resolver = "2"
 
 [workspace.package]
-version = "0.5.26"
+version = "0.5.33"
 edition = "2021"
 rust-version = "1.95"
 repository = "https://github.com/gitbutlerapp/grit"
@@ -14,10 +14,10 @@ repository = "https://github.com/gitbutlerapp/grit"
 anyhow = "1"
 thiserror = "2"
 clap = { version = "4", features = ["derive", "env"] }
-carapace-rs = "0.0.10"
-carapace-rs-clap = "0.0.10"
+clap_complete = "4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+bincode = { version = "2", default-features = false, features = ["alloc", "serde"] }
 schemars = "0.8"
 terminal_size = "0.4"
 flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
@@ -33,7 +33,7 @@ regex = "1"
 # Same engine and feature set `regex` already enables; listed so filters can set meta options.
 regex-automata = { version = "0.4.16", default-features = false, features = ["std", "syntax", "meta", "nfa-pikevm", "nfa-backtrack", "hybrid", "dfa-onepass", "perf-inline", "perf-literal", "unicode"] }
 libc = "0.2"
-ureq = { version = "3.3", default-features = false }
+ureq = { version = "3.5", default-features = false }
 url = "2.5"
 base64 = "0.22"
 crc32fast = "1.5.0"
@@ -41,6 +41,7 @@ memmap2 = "0.9"
 memchr = "2.7"
 icu_normalizer = "2.0.0"
 shell-words = "1.1"
+unicode-width = "0.2"
 smallvec = "1.15"
 toml = "0.8"
 filetime = "0.2"

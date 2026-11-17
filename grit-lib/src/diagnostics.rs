@@ -10,7 +10,7 @@
 //! use grit_lib::repo::{InitOptions, Repository};
 //! # fn main() -> grit_lib::error::Result<()> {
 //! let dir = tempfile::tempdir()?;
-//! let _repo = Repository::init(dir.path(), &InitOptions::default())?;
+//! let (_repo, _) = Repository::init(dir.path(), &InitOptions::default())?;
 //! # Ok(())
 //! # }
 //! ```
@@ -51,51 +51,6 @@ pub enum Warning {
         /// Pack file name or config identifier.
         name: String,
     },
-    /// A commit-graph chunk was smaller than required.
-    CommitGraphChunkTooSmall {
-        /// Commit-graph layer identifier in the warning.
-        layer: String,
-        /// Commit-graph chunk name that failed validation.
-        chunk: String,
-    },
-    /// Bloom filters were disabled for a commit-graph layer due to incompatible settings.
-    CommitGraphBloomDisabled {
-        /// Commit-graph layer identifier in the warning.
-        layer: String,
-    },
-    /// Changed-path Bloom index chunk does not cover all commits in the layer.
-    CommitGraphChangedPathIndexTooSmall,
-    /// Changed-path Bloom data chunk header is too small.
-    CommitGraphChangedPathChunkTooSmall {
-        /// Observed size or offset in bytes.
-        actual: usize,
-        /// Minimum required size in bytes.
-        minimum: usize,
-    },
-    /// Changed-path Bloom index entry points past the chunk.
-    CommitGraphChangedPathOffsetOutOfRange {
-        /// Byte offset into a commit-graph chunk.
-        offset: usize,
-        /// Index of the commit-graph entry being validated.
-        position: usize,
-        /// Path or label of the commit-graph file.
-        graph: String,
-        /// Total size of the commit-graph chunk in bytes.
-        chunk_size: usize,
-    },
-    /// Changed-path Bloom index offsets decrease between adjacent entries.
-    CommitGraphChangedPathOffsetsDecreasing {
-        /// Starting offset for an adjacent pair of entries.
-        start: usize,
-        /// Ending offset for an adjacent pair of entries.
-        end: usize,
-        /// Commit index for the start offset.
-        position_start: usize,
-        /// Commit index for the end offset.
-        position_end: usize,
-        /// Path or label of the commit-graph file.
-        graph: String,
-    },
     /// Repository config was skipped because the git directory uses an unsupported format.
     IgnoredGitDir {
         /// Repository-relative or filesystem path related to the failure.
@@ -111,46 +66,6 @@ pub enum Warning {
         key: String,
         /// Raw config value that could not be parsed.
         value: String,
-    },
-    /// Submodule name failed validation.
-    SuspiciousSubmoduleName {
-        /// Pack file name or config identifier.
-        name: String,
-    },
-    /// Submodule config value looked like a command-line flag.
-    SubmoduleConfigLooksLikeOption {
-        /// Config key name that failed validation.
-        key: String,
-        /// Raw config value that could not be parsed.
-        value: String,
-    },
-    /// Duplicate submodule keys in `.gitmodules` for one commit tree.
-    SubmoduleMultipleConfigs {
-        /// Commit object id or label tied to the warning.
-        commit: String,
-        /// Pack file name or config identifier.
-        name: String,
-        /// Config option or submodule key name.
-        option: String,
-    },
-    /// `.gitmodules` could not be parsed at a given line.
-    GitmodulesBadConfig {
-        /// Free-form diagnostic message body.
-        message: String,
-    },
-    /// Split index was requested while `core.splitIndex` disables it.
-    SplitIndexDisabledWhileConfigEnabled,
-    /// Split index was disabled on the command line while config enables it.
-    SplitIndexEnabledWhileConfigDisabled,
-    /// `GIT_INDEX_VERSION` was set but invalid.
-    IndexVersionEnvInvalid {
-        /// Index version used after the invalid setting was ignored.
-        fallback: u32,
-    },
-    /// `index.version` in config was invalid.
-    IndexVersionConfigInvalid {
-        /// Index version used after the invalid setting was ignored.
-        fallback: u32,
     },
     /// `mailmap.blob` (or the bare-repository `HEAD:.mailmap` default) names an object that
     /// is not a blob; it was skipped.
@@ -189,25 +104,25 @@ pub enum Warning {
         /// Why it did not run, including the underlying OS error.
         detail: String,
     },
-    /// Returned when midx checksum mismatch.
+    /// Multi-pack-index checksum does not match file contents.
     MidxChecksumMismatch,
-    /// Returned when midx ignoring existing checksum mismatch.
+    /// Existing on-disk MIDX had a checksum mismatch; grit ignored it and continued.
     MidxIgnoringExistingChecksumMismatch,
-    /// Returned when midx chunk table error.
+    /// Multi-pack-index chunk table is invalid or inconsistent.
     MidxChunkTableError {
         /// Additional human-readable detail for the failure.
         detail: String,
     },
-    /// Returned when midx rev index wrong size.
+    /// Reverse index chunk size does not match the MIDX layout.
     MidxRevIndexWrongSize,
-    /// Returned when midx bitmap missing reverse index.
+    /// Pack bitmap requires a reverse index that is missing from the MIDX.
     MidxBitmapMissingReverseIndex,
-    /// Returned when midx pack index unavailable.
+    /// A pack named in the MIDX has no readable `.idx` sidecar.
     MidxPackIndexUnavailable {
         /// Pack file basename (`.pack` suffix).
         pack: String,
     },
-    /// Returned when midx unknown preferred pack.
+    /// `core.midx` preferred pack name does not match any pack in the MIDX.
     MidxUnknownPreferredPack {
         /// Pack file name or config identifier.
         name: String,
@@ -219,13 +134,20 @@ pub enum Warning {
         /// Why the value or operation was rejected.
         reason: String,
     },
+    /// A work-tree path could not be accessed (for example permission denied); the scan continued.
+    WorktreeAccessFailed {
+        /// Repository-relative path (directories often end with `/`).
+        path: String,
+        /// OS error detail.
+        detail: String,
+    },
 }
 
 /// Optional trace events (network debugging, etc.), separate from [`Warning`].
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Trace {
-    /// Returned when network.
+    /// Low-level network trace line (when trace diagnostics are enabled).
     Network {
         /// Human-readable message body.
         message: String,
@@ -362,9 +284,8 @@ mod tests {
     #[test]
     fn collecting_diagnostics_dedupes_identical_warnings() {
         let sink = CollectingDiagnostics::with_dedupe(true);
-        let w = Warning::CommitGraphChunkTooSmall {
-            layer: "layer-a".into(),
-            chunk: "base graphs".into(),
+        let w = Warning::DanglingSymref {
+            name: "refs/remotes/origin/HEAD".into(),
         };
         sink.warn(w.clone());
         sink.warn(w);

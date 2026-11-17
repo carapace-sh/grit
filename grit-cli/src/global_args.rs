@@ -5,13 +5,10 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use carapace_rs::Action;
-use carapace_rs_clap::completer;
 use clap::builder::TypedValueParser as _;
 use clap::Args;
 use grit_lib::config::environment::ConfigOverride;
 
-use crate::completions::grit;
 use crate::error_kind::ErrorKind;
 use crate::json_error::{StructuredCliError, StructuredJsonError};
 
@@ -22,31 +19,21 @@ pub struct GlobalRepoArgs {
     #[arg(
         short = 'C',
         value_name = "DIR",
-        value_parser = clap::builder::OsStringValueParser::new().map(PathBuf::from),
-        add = completer!(Action::directories())
+        value_parser = clap::builder::OsStringValueParser::new().map(PathBuf::from)
     )]
     pub dirs: Vec<PathBuf>,
     /// Set a config value for this invocation only (repeatable; a bare KEY means true).
     #[arg(
         short = 'c',
         value_name = "KEY=VALUE",
-        value_parser = parse_config_override,
-        add = completer!(grit::action_config_overrides())
+        value_parser = parse_config_override
     )]
     pub config: Vec<ConfigOverride>,
     /// Use this repository directory instead of discovering one (same as `GIT_DIR`).
-    #[arg(
-        long = "git-dir",
-        value_name = "PATH",
-        add = completer!(Action::directories())
-    )]
+    #[arg(long = "git-dir", value_name = "PATH")]
     pub git_dir: Option<PathBuf>,
     /// Use this directory as the work tree root (same as `GIT_WORK_TREE`).
-    #[arg(
-        long = "work-tree",
-        value_name = "PATH",
-        add = completer!(Action::directories())
-    )]
+    #[arg(long = "work-tree", value_name = "PATH")]
     pub work_tree: Option<PathBuf>,
     /// Skip opportunistic index updates that take optional locks (same as `GIT_OPTIONAL_LOCKS=0`).
     #[arg(long = "no-optional-locks", global = true)]
@@ -55,7 +42,7 @@ pub struct GlobalRepoArgs {
 
 pub(crate) fn parse_config_override(spec: &str) -> Result<ConfigOverride, String> {
     spec.parse()
-        .map_err(|err: grit_lib::error::Error| err.to_string())
+        .map_err(crate::error_map::format_config_override_parse_error)
 }
 
 impl GlobalRepoArgs {

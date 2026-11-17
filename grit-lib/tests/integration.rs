@@ -15,6 +15,9 @@ mod pack_delta_scenarios;
 mod support;
 mod switch_overwrite_git_helpers;
 
+// Integration modules refer to `crate::config` for load options and types.
+pub use grit_lib::config;
+
 #[cfg(feature = "full-tests")]
 #[path = "abbreviate_default_lookup_prefix_issue_1736.rs"]
 mod abbreviate_default_lookup_prefix_issue_1736;
@@ -78,6 +81,9 @@ mod apply_blob_engine;
 #[cfg(feature = "full-tests")]
 #[path = "apply_git_compat.rs"]
 mod apply_git_compat;
+#[cfg(feature = "full-tests")]
+#[path = "assume_unchanged_porcelain_2521.rs"]
+mod assume_unchanged_porcelain_2521;
 #[cfg(feature = "full-tests")]
 #[path = "attributes_rules.rs"]
 mod attributes_rules;
@@ -161,6 +167,9 @@ mod branch_tag_list_delete_git_compat;
 #[cfg(feature = "full-tests")]
 #[path = "branch_tracking_git_compat.rs"]
 mod branch_tracking_git_compat;
+#[cfg(feature = "full-tests")]
+#[path = "branches_handle_git_compat.rs"]
+mod branches_handle_git_compat;
 #[path = "build_file_diffs_streaming.rs"]
 mod build_file_diffs_streaming;
 #[cfg(feature = "full-tests")]
@@ -186,6 +195,11 @@ mod cache_tree_extension_hot_path;
 mod cache_tree_git_compat;
 #[path = "canonical_paths.rs"]
 mod canonical_paths;
+#[path = "change_id_custom_store.rs"]
+mod change_id_custom_store;
+#[cfg(feature = "full-tests")]
+#[path = "change_id_custom_store_git_compat.rs"]
+mod change_id_custom_store_git_compat;
 #[cfg(feature = "full-tests")]
 #[path = "change_id_git_compat.rs"]
 mod change_id_git_compat;
@@ -229,6 +243,9 @@ mod checkout_ignorecase_collision_commit;
 #[path = "checkout_in_place_umask_git_compat.rs"]
 mod checkout_in_place_umask_git_compat;
 #[cfg(feature = "full-tests")]
+#[path = "checkout_incompressible_blob_restore.rs"]
+mod checkout_incompressible_blob_restore;
+#[cfg(feature = "full-tests")]
 #[path = "checkout_large_blob_rss.rs"]
 mod checkout_large_blob_rss;
 #[cfg(feature = "full-tests")]
@@ -258,6 +275,8 @@ mod checkout_replaced_top_level_dir_git_compat;
 #[cfg(feature = "full-tests")]
 #[path = "checkout_switch_away_invalid_index.rs"]
 mod checkout_switch_away_invalid_index;
+#[path = "clean_dir_mode_clean_tree_perf_git_compat.rs"]
+mod clean_dir_mode_clean_tree_perf_git_compat;
 #[cfg(feature = "full-tests")]
 #[path = "clean_untracked.rs"]
 mod clean_untracked;
@@ -279,6 +298,9 @@ mod clone_empty_remote_git_daemon_v2;
 #[cfg(feature = "full-tests")]
 #[path = "clone_eol_crlf_git_compat.rs"]
 mod clone_eol_crlf_git_compat;
+#[cfg(feature = "full-tests")]
+#[path = "clone_fetch_ignorecase_refs_2490.rs"]
+mod clone_fetch_ignorecase_refs_2490;
 #[cfg(feature = "full-tests")]
 #[path = "clone_index_cache_tree_git_compat.rs"]
 mod clone_index_cache_tree_git_compat;
@@ -315,6 +337,8 @@ mod clone_shallow_git_compat;
 #[cfg(feature = "full-tests")]
 #[path = "clone_single_branch_tags_git_compat.rs"]
 mod clone_single_branch_tags_git_compat;
+#[path = "clone_stored_origin_url_2562.rs"]
+mod clone_stored_origin_url_2562;
 #[cfg(feature = "full-tests")]
 #[path = "clone_thread_policy.rs"]
 mod clone_thread_policy;
@@ -390,9 +414,14 @@ mod commit_graph_shallow_git_compat;
 #[cfg(feature = "full-tests")]
 #[path = "commit_graph_write_coverage.rs"]
 mod commit_graph_write_coverage;
+#[path = "commit_hook_cancel.rs"]
+mod commit_hook_cancel;
 #[cfg(feature = "full-tests")]
 #[path = "commit_identity_create_git_compat.rs"]
 mod commit_identity_create_git_compat;
+#[cfg(feature = "full-tests")]
+#[path = "commit_merge_history_errors.rs"]
+mod commit_merge_history_errors;
 #[cfg(feature = "full-tests")]
 #[path = "commit_merge_state_git_compat.rs"]
 mod commit_merge_state_git_compat;
@@ -422,6 +451,8 @@ mod commit_scope_git_compat;
 #[cfg(feature = "full-tests")]
 #[path = "commit_scope_hook_index.rs"]
 mod commit_scope_hook_index;
+#[path = "commit_show_untracked_no_2523.rs"]
+mod commit_show_untracked_no_2523;
 #[cfg(feature = "full-tests")]
 #[path = "commit_tag_no_blank_line_git_compat.rs"]
 mod commit_tag_no_blank_line_git_compat;
@@ -441,6 +472,8 @@ mod concurrent_repos;
 mod config_advanced_git_compat;
 #[path = "config_dense_parse_coverage.rs"]
 mod config_dense_parse_coverage;
+#[path = "config_discover_errors.rs"]
+mod config_discover_errors;
 #[path = "config_file_api_coverage.rs"]
 mod config_file_api_coverage;
 #[path = "config_file_roundtrip.rs"]
@@ -472,6 +505,9 @@ mod config_parameters_coverage;
 mod config_parse;
 #[path = "config_repo_load_coverage.rs"]
 mod config_repo_load_coverage;
+#[cfg(feature = "full-tests")]
+#[path = "config_roundtrip.rs"]
+mod config_roundtrip;
 #[path = "config_set_getters_coverage.rs"]
 mod config_set_getters_coverage;
 #[cfg(feature = "full-tests")]
@@ -493,6 +529,8 @@ mod coverage_gate_bulk_sweep;
 mod coverage_max_sweep;
 #[path = "coverage_total_blame_crlf_sweep.rs"]
 mod coverage_total_blame_crlf_sweep;
+#[path = "crate_docs_dependency_snippet_matches_version.rs"]
+mod crate_docs_dependency_snippet_matches_version;
 #[cfg(feature = "full-tests")]
 #[path = "create_commit_git_compat.rs"]
 mod create_commit_git_compat;
@@ -505,8 +543,20 @@ mod cross_pack_ref_delta_odb;
 #[path = "custom_odb_porcelain.rs"]
 mod custom_odb_porcelain;
 #[cfg(feature = "full-tests")]
+#[path = "custom_store_ref_peel.rs"]
+mod custom_store_ref_peel;
+#[cfg(feature = "full-tests")]
 #[path = "deep_tree_untracked_autocrlf_git_compat.rs"]
 mod deep_tree_untracked_autocrlf_git_compat;
+#[cfg(feature = "full-tests")]
+#[path = "describe_git_compat.rs"]
+mod describe_git_compat;
+#[cfg(feature = "full-tests")]
+#[path = "describe_seed6593_skew_git_compat.rs"]
+mod describe_seed6593_skew_git_compat;
+#[cfg(feature = "full-tests")]
+#[path = "detached_head_pick_revert_rebase_git_compat.rs"]
+mod detached_head_pick_revert_rebase_git_compat;
 #[path = "detect_copies_hash_collision.rs"]
 mod detect_copies_hash_collision;
 #[cfg(feature = "full-tests")]
@@ -541,6 +591,11 @@ mod diff_detail_git_compat;
 mod diff_git_mv_cache_tree;
 #[path = "diff_gitlink_typechange_coverage.rs"]
 mod diff_gitlink_typechange_coverage;
+#[path = "diff_handle_entry_points.rs"]
+mod diff_handle_entry_points;
+#[cfg(feature = "full-tests")]
+#[path = "diff_handle_git_compat.rs"]
+mod diff_handle_git_compat;
 #[path = "diff_harness_blob_sweep.rs"]
 mod diff_harness_blob_sweep;
 #[cfg(feature = "full-tests")]
@@ -556,8 +611,10 @@ mod diff_no_index;
 #[path = "diff_options_line_engine.rs"]
 mod diff_options_line_engine;
 #[cfg(feature = "full-tests")]
-#[path = "diff_parallel_symlinks_git_compat.rs"]
-mod diff_parallel_symlinks_git_compat;
+#[path = "diff_rename_basename_over_limit.rs"]
+mod diff_rename_basename_over_limit;
+#[path = "diff_rename_disjoint_repeated_basenames.rs"]
+mod diff_rename_disjoint_repeated_basenames;
 #[cfg(feature = "full-tests")]
 #[path = "diff_rename_filter_git_compat.rs"]
 mod diff_rename_filter_git_compat;
@@ -593,22 +650,34 @@ mod diff_trees_renames;
 #[path = "diff_typechange_status_git_compat.rs"]
 mod diff_typechange_status_git_compat;
 #[cfg(feature = "full-tests")]
+#[path = "diff_unreadable_directory_2406.rs"]
+mod diff_unreadable_directory_2406;
+#[cfg(feature = "full-tests")]
 #[path = "diff_whitespace_git_compat.rs"]
 mod diff_whitespace_git_compat;
 #[cfg(feature = "full-tests")]
 #[path = "diff_worktree_eol_git_compat.rs"]
 mod diff_worktree_eol_git_compat;
 #[cfg(feature = "full-tests")]
+#[path = "diff_worktree_stale_index.rs"]
+mod diff_worktree_stale_index;
+#[cfg(feature = "full-tests")]
 #[path = "diff_worktree_stat_git_compat.rs"]
 mod diff_worktree_stat_git_compat;
 #[cfg(feature = "full-tests")]
 #[path = "diff_ws_filter_integration.rs"]
 mod diff_ws_filter_integration;
+#[cfg(feature = "full-tests")]
+#[path = "divergence_scenarios.rs"]
+mod divergence_scenarios;
 #[path = "drop_promised_blobs.rs"]
 mod drop_promised_blobs;
 #[cfg(feature = "full-tests")]
 #[path = "drop_promised_blobs_git_compat.rs"]
 mod drop_promised_blobs_git_compat;
+#[cfg(feature = "full-tests")]
+#[path = "embedded_gitlink_warnings_issue_2360.rs"]
+mod embedded_gitlink_warnings_issue_2360;
 #[cfg(feature = "full-tests")]
 #[path = "embedded_repo_gitlink_git_compat.rs"]
 mod embedded_repo_gitlink_git_compat;
@@ -620,6 +689,8 @@ mod environment_discover;
 #[cfg(feature = "full-tests")]
 #[path = "error_cancelled.rs"]
 mod error_cancelled;
+#[path = "error_contract.rs"]
+mod error_contract;
 #[cfg(feature = "full-tests")]
 #[path = "fetch_all_cancel.rs"]
 mod fetch_all_cancel;
@@ -667,6 +738,8 @@ mod fetch_pull_branch_remote_git_compat;
 #[cfg(feature = "full-tests")]
 #[path = "fetch_ref_namespace_partial_1654.rs"]
 mod fetch_ref_namespace_partial_1654;
+#[path = "fetch_reflog_git_compat.rs"]
+mod fetch_reflog_git_compat;
 #[cfg(feature = "full-tests")]
 #[path = "fetch_refspec_git_compat.rs"]
 mod fetch_refspec_git_compat;
@@ -679,8 +752,13 @@ mod fetch_tag_refspec_git_compat;
 #[path = "fetch_tags_resolve.rs"]
 mod fetch_tags_resolve;
 #[cfg(feature = "full-tests")]
+#[path = "fetch_v0_http_git_compat.rs"]
+mod fetch_v0_http_git_compat;
+#[cfg(feature = "full-tests")]
 #[path = "fetch_v2_negotiation_rounds.rs"]
 mod fetch_v2_negotiation_rounds;
+#[path = "files_only_refusals.rs"]
+mod files_only_refusals;
 #[cfg(feature = "full-tests")]
 #[path = "files_store_git_roundtrip.rs"]
 mod files_store_git_roundtrip;
@@ -690,11 +768,16 @@ mod files_store_review_fixes;
 #[cfg(feature = "full-tests")]
 #[path = "files_store_win32_reserved_refs.rs"]
 mod files_store_win32_reserved_refs;
+#[path = "filesystem_capabilities_public_coverage.rs"]
+mod filesystem_capabilities_public_coverage;
 #[cfg(feature = "full-tests")]
 #[path = "filter_required_git_compat.rs"]
 mod filter_required_git_compat;
 #[path = "fsck_api_coverage.rs"]
 mod fsck_api_coverage;
+#[cfg(feature = "full-tests")]
+#[path = "fsck_large_blob_memory.rs"]
+mod fsck_large_blob_memory;
 #[cfg(feature = "full-tests")]
 #[path = "fsck_memory.rs"]
 mod fsck_memory;
@@ -766,6 +849,9 @@ mod history_engine;
 #[path = "history_fixup.rs"]
 mod history_fixup;
 #[cfg(feature = "full-tests")]
+#[path = "history_handle_git_compat.rs"]
+mod history_handle_git_compat;
+#[cfg(feature = "full-tests")]
 #[path = "history_harness_smoke.rs"]
 mod history_harness_smoke;
 #[cfg(feature = "full-tests")]
@@ -804,6 +890,8 @@ mod hooks_path_relative;
 #[cfg(feature = "full-tests")]
 #[path = "hooks_spawn.rs"]
 mod hooks_spawn;
+#[path = "hot_text_linker_support.rs"]
+mod hot_text_linker_support;
 #[cfg(feature = "full-tests")]
 #[path = "ident_attribute_git_compat.rs"]
 mod ident_attribute_git_compat;
@@ -904,6 +992,8 @@ mod local_transport_reachable;
 #[cfg(feature = "full-tests")]
 #[path = "lockfile_contention_git_compat.rs"]
 mod lockfile_contention_git_compat;
+#[path = "log_group_by_custom_store.rs"]
+mod log_group_by_custom_store;
 #[cfg(feature = "full-tests")]
 #[path = "log_oneline_abbrev_packed.rs"]
 mod log_oneline_abbrev_packed;
@@ -916,6 +1006,9 @@ mod log_patch_index_abbrev_git;
 #[cfg(feature = "full-tests")]
 #[path = "log_patch_one_commit.rs"]
 mod log_patch_one_commit;
+#[cfg(feature = "full-tests")]
+#[path = "log_pathspec_git_compat.rs"]
+mod log_pathspec_git_compat;
 #[cfg(feature = "full-tests")]
 #[path = "loose_write_concurrent_issue_1875.rs"]
 mod loose_write_concurrent_issue_1875;
@@ -964,6 +1057,8 @@ mod merge_continue_git_compat;
 #[cfg(feature = "full-tests")]
 #[path = "merge_detached_head_git_compat.rs"]
 mod merge_detached_head_git_compat;
+#[path = "merge_df_integrate_issue_2359.rs"]
+mod merge_df_integrate_issue_2359;
 #[path = "merge_diff_line_coverage.rs"]
 mod merge_diff_line_coverage;
 #[cfg(feature = "full-tests")]
@@ -982,8 +1077,16 @@ mod merge_dry_run;
 #[path = "merge_eol_crlf_conflict_git_compat.rs"]
 mod merge_eol_crlf_conflict_git_compat;
 #[cfg(feature = "full-tests")]
+#[path = "merge_exact_renames_issue_2508.rs"]
+mod merge_exact_renames_issue_2508;
+#[cfg(feature = "full-tests")]
 #[path = "merge_file_git_compat.rs"]
 mod merge_file_git_compat;
+#[path = "merge_file_issue_2369_git_compat.rs"]
+mod merge_file_issue_2369_git_compat;
+#[cfg(feature = "full-tests")]
+#[path = "merge_file_issue_2397_git_compat.rs"]
+mod merge_file_issue_2397_git_compat;
 #[cfg(feature = "full-tests")]
 #[path = "merge_identity_git_compat.rs"]
 mod merge_identity_git_compat;
@@ -996,6 +1099,8 @@ mod merge_options_git_compat;
 #[cfg(feature = "full-tests")]
 #[path = "merge_ort_git_compat.rs"]
 mod merge_ort_git_compat;
+#[path = "merge_reflog_atomicity_2503.rs"]
+mod merge_reflog_atomicity_2503;
 #[cfg(feature = "full-tests")]
 #[path = "merge_rename_edit_issue_1093.rs"]
 mod merge_rename_edit_issue_1093;
@@ -1040,8 +1145,6 @@ mod midx_roundtrip;
 mod midx_write_coverage;
 #[path = "mv_force_multi_source_rollback.rs"]
 mod mv_force_multi_source_rollback;
-#[path = "negotiator_tag_tip.rs"]
-mod negotiator_tag_tip;
 #[path = "nfd_pathspec_argv.rs"]
 mod nfd_pathspec_argv;
 #[path = "non_exhaustive_options_api.rs"]
@@ -1063,6 +1166,9 @@ mod notes_git_compat;
 #[cfg(feature = "full-tests")]
 #[path = "notes_plan_dry_run.rs"]
 mod notes_plan_dry_run;
+#[cfg(feature = "full-tests")]
+#[path = "notes_rewrite.rs"]
+mod notes_rewrite;
 #[cfg(feature = "full-tests")]
 #[path = "notes_roundtrip.rs"]
 mod notes_roundtrip;
@@ -1114,6 +1220,9 @@ mod odb_custom_primary_transport;
 #[path = "odb_env_object_directory.rs"]
 mod odb_env_object_directory;
 #[cfg(feature = "full-tests")]
+#[path = "odb_flush_before_publish_2443.rs"]
+mod odb_flush_before_publish_2443;
+#[cfg(feature = "full-tests")]
 #[path = "odb_lookup_prefix_git_compat.rs"]
 mod odb_lookup_prefix_git_compat;
 #[cfg(feature = "full-tests")]
@@ -1163,9 +1272,14 @@ mod oid_abbrev_alternate_pack_collision;
 mod oid_abbrev_separate_pack_collision;
 #[path = "oid_hashtable_api.rs"]
 mod oid_hashtable_api;
+#[path = "one_form_handles_git_compat.rs"]
+mod one_form_handles_git_compat;
 #[cfg(feature = "full-tests")]
 #[path = "orig_head_git_compat.rs"]
 mod orig_head_git_compat;
+#[cfg(feature = "full-tests")]
+#[path = "ownership_check_discover.rs"]
+mod ownership_check_discover;
 #[cfg(feature = "full-tests")]
 #[path = "pack_bitmap_read_git_compat.rs"]
 mod pack_bitmap_read_git_compat;
@@ -1240,8 +1354,8 @@ mod patch_text_roundtrip;
 #[cfg(feature = "full-tests")]
 #[path = "path_validate_fsck_parity.rs"]
 mod path_validate_fsck_parity;
-#[path = "pathspec_api_sweep.rs"]
-mod pathspec_api_sweep;
+#[path = "pathspec_attr_porcelain.rs"]
+mod pathspec_attr_porcelain;
 #[cfg(feature = "full-tests")]
 #[path = "pathspec_attr_repo.rs"]
 mod pathspec_attr_repo;
@@ -1252,11 +1366,16 @@ mod pathspec_from_file_git_compat;
 #[path = "pathspec_git_compat.rs"]
 mod pathspec_git_compat;
 #[cfg(feature = "full-tests")]
+#[path = "pathspec_type.rs"]
+mod pathspec_type;
+#[cfg(feature = "full-tests")]
 #[path = "pick_stash_apply_git_compat.rs"]
 mod pick_stash_apply_git_compat;
 #[cfg(feature = "full-tests")]
 #[path = "pickaxe_git_compat.rs"]
 mod pickaxe_git_compat;
+#[path = "porcelain_custom_primary_merge.rs"]
+mod porcelain_custom_primary_merge;
 #[cfg(feature = "full-tests")]
 #[path = "porcelain_injected_ref_store.rs"]
 mod porcelain_injected_ref_store;
@@ -1275,6 +1394,8 @@ mod pre_push_hook;
 #[cfg(feature = "full-tests")]
 #[path = "precompose_system_git_roundtrip.rs"]
 mod precompose_system_git_roundtrip;
+#[path = "prelude_only_reexports.rs"]
+mod prelude_only_reexports;
 #[cfg(feature = "full-tests")]
 #[path = "promisor_on_demand_fetch.rs"]
 mod promisor_on_demand_fetch;
@@ -1288,8 +1409,15 @@ mod promisor_remote_git_compat;
 mod promisor_remote_handshake;
 #[path = "promisor_remote_local.rs"]
 mod promisor_remote_local;
+#[path = "prune_custom_store.rs"]
+mod prune_custom_store;
+#[cfg(feature = "full-tests")]
+#[path = "prune_custom_store_git_compat.rs"]
+mod prune_custom_store_git_compat;
 #[path = "pruned_modules.rs"]
 mod pruned_modules;
+#[path = "public_api_test_items.rs"]
+mod public_api_test_items;
 #[path = "published_crates_declare_rust_version.rs"]
 mod published_crates_declare_rust_version;
 #[cfg(feature = "full-tests")]
@@ -1309,8 +1437,6 @@ mod push_delete_local_git_compat;
 #[cfg(feature = "full-tests")]
 #[path = "push_delete_missing_remote.rs"]
 mod push_delete_missing_remote;
-#[path = "push_delete_ref_resolve.rs"]
-mod push_delete_ref_resolve;
 #[path = "push_fast_deep_history.rs"]
 mod push_fast_deep_history;
 #[cfg(feature = "full-tests")]
@@ -1322,9 +1448,15 @@ mod push_lease_git_compat;
 #[cfg(feature = "full-tests")]
 #[path = "push_local_receive_hooks_git_compat.rs"]
 mod push_local_receive_hooks_git_compat;
+#[path = "push_packed_tag_regression.rs"]
+mod push_packed_tag_regression;
+#[path = "push_path_tracking_git_compat.rs"]
+mod push_path_tracking_git_compat;
 #[cfg(feature = "full-tests")]
 #[path = "push_plan_git_compat.rs"]
 mod push_plan_git_compat;
+#[path = "push_tag_update_git_compat.rs"]
+mod push_tag_update_git_compat;
 #[cfg(feature = "full-tests")]
 #[path = "quote_path_git_compat.rs"]
 mod quote_path_git_compat;
@@ -1334,6 +1466,18 @@ mod racy_index_git_compat;
 #[cfg(feature = "full-tests")]
 #[path = "read_info_git_compat.rs"]
 mod read_info_git_compat;
+#[cfg(feature = "full-tests")]
+#[path = "rebase_cancel_rollback_wide_perf.rs"]
+mod rebase_cancel_rollback_wide_perf;
+#[cfg(feature = "full-tests")]
+#[path = "receive_hook_cancel_windows.rs"]
+mod receive_hook_cancel_windows;
+#[cfg(feature = "full-tests")]
+#[path = "receive_pack_ignorecase_ref_2471.rs"]
+mod receive_pack_ignorecase_ref_2471;
+#[cfg(feature = "full-tests")]
+#[path = "receive_pack_same_batch_casefold_2490.rs"]
+mod receive_pack_same_batch_casefold_2490;
 #[cfg(feature = "full-tests")]
 #[path = "ref_dir_file_conflict_2198.rs"]
 mod ref_dir_file_conflict_2198;
@@ -1345,6 +1489,9 @@ mod ref_target_verification;
 #[cfg(feature = "full-tests")]
 #[path = "ref_target_verification_git_compat.rs"]
 mod ref_target_verification_git_compat;
+#[cfg(feature = "full-tests")]
+#[path = "ref_update_kinds_git_compat.rs"]
+mod ref_update_kinds_git_compat;
 #[cfg(feature = "full-tests")]
 #[path = "reference_transaction_hook.rs"]
 mod reference_transaction_hook;
@@ -1379,12 +1526,16 @@ mod reflog_store_edits_git_compat;
 #[cfg(feature = "full-tests")]
 #[path = "reflog_transaction_identity.rs"]
 mod reflog_transaction_identity;
+#[path = "refname_policy.rs"]
+mod refname_policy;
 #[path = "refs_abstraction_guard.rs"]
 mod refs_abstraction_guard;
 #[path = "refs_api_coverage.rs"]
 mod refs_api_coverage;
 #[path = "refs_fsck_coverage.rs"]
 mod refs_fsck_coverage;
+#[path = "refs_handle_git_roundtrip.rs"]
+mod refs_handle_git_roundtrip;
 #[cfg(feature = "full-tests")]
 #[path = "refs_harness_smoke.rs"]
 mod refs_harness_smoke;
@@ -1397,6 +1548,9 @@ mod refs_list_empty_prefix_git;
 mod refs_listing_public_coverage;
 #[path = "refs_lock_coverage.rs"]
 mod refs_lock_coverage;
+#[cfg(feature = "full-tests")]
+#[path = "refs_loose_casefold_2502.rs"]
+mod refs_loose_casefold_2502;
 #[cfg(feature = "full-tests")]
 #[path = "refs_loose_symref.rs"]
 mod refs_loose_symref;
@@ -1415,6 +1569,9 @@ mod refs_query_git_compat;
 #[cfg(feature = "full-tests")]
 #[path = "refs_query_reachability_git_compat.rs"]
 mod refs_query_reachability_git_compat;
+#[cfg(feature = "full-tests")]
+#[path = "refs_refname_git_roundtrip.rs"]
+mod refs_refname_git_roundtrip;
 #[cfg(feature = "full-tests")]
 #[path = "refs_transactions.rs"]
 mod refs_transactions;
@@ -1468,9 +1625,15 @@ mod reftable_store_git_roundtrip;
 mod reftable_worktree_git_compat;
 #[path = "reftable_worktree_head_deref.rs"]
 mod reftable_worktree_head_deref;
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[path = "release_unused_heap.rs"]
+mod release_unused_heap;
 #[cfg(feature = "full-tests")]
 #[path = "remote_config_git_compat.rs"]
 mod remote_config_git_compat;
+#[cfg(feature = "full-tests")]
+#[path = "remote_error_variants.rs"]
+mod remote_error_variants;
 #[cfg(feature = "full-tests")]
 #[path = "remote_injected_ref_store.rs"]
 mod remote_injected_ref_store;
@@ -1489,6 +1652,8 @@ mod remote_set_url_git_compat;
 #[cfg(feature = "full-tests")]
 #[path = "remote_unreadable.rs"]
 mod remote_unreadable;
+#[path = "remote_url_display.rs"]
+mod remote_url_display;
 #[cfg(feature = "full-tests")]
 #[path = "repack_delta_reuse_git_compat.rs"]
 mod repack_delta_reuse_git_compat;
@@ -1519,6 +1684,8 @@ mod repo_handles_core;
 #[cfg(feature = "full-tests")]
 #[path = "repo_handles_more.rs"]
 mod repo_handles_more;
+#[path = "repo_init_injected_stores.rs"]
+mod repo_init_injected_stores;
 #[cfg(feature = "full-tests")]
 #[path = "repo_open_init.rs"]
 mod repo_open_init;
@@ -1530,14 +1697,35 @@ mod repo_setup_git_compat;
 mod repo_shared_init_git_compat;
 #[path = "repo_total_coverage_sweep.rs"]
 mod repo_total_coverage_sweep;
+#[path = "repository_config_hook_errors.rs"]
+mod repository_config_hook_errors;
+#[cfg(feature = "full-tests")]
+#[path = "repository_config_hook_errors_git.rs"]
+mod repository_config_hook_errors_git;
+#[path = "repository_conformance_files.rs"]
+mod repository_conformance_files;
+#[path = "repository_conformance_memory.rs"]
+mod repository_conformance_memory;
+#[path = "repository_conformance_parity.rs"]
+mod repository_conformance_parity;
 #[path = "repository_injected_backends_no_layout.rs"]
 mod repository_injected_backends_no_layout;
+#[path = "repository_no_filesystem.rs"]
+mod repository_no_filesystem;
+#[cfg(feature = "full-tests")]
+#[path = "repository_no_filesystem_git_compat.rs"]
+mod repository_no_filesystem_git_compat;
 #[cfg(feature = "full-tests")]
 #[path = "repository_refstore_git_namespace.rs"]
 mod repository_refstore_git_namespace;
 #[cfg(feature = "full-tests")]
 #[path = "repository_with_memory_ref_store.rs"]
 mod repository_with_memory_ref_store;
+#[path = "repository_with_object_store.rs"]
+mod repository_with_object_store;
+#[cfg(feature = "full-tests")]
+#[path = "repository_with_object_store_git_compat.rs"]
+mod repository_with_object_store_git_compat;
 #[cfg(feature = "full-tests")]
 #[path = "rerere_git_compat.rs"]
 mod rerere_git_compat;
@@ -1555,9 +1743,14 @@ mod reset_hard_at_head_restores_worktree;
 #[cfg(feature = "full-tests")]
 #[path = "reset_hard_cancel.rs"]
 mod reset_hard_cancel;
+#[path = "reset_hard_gitlink_stat_2559.rs"]
+mod reset_hard_gitlink_stat_2559;
 #[cfg(feature = "full-tests")]
 #[path = "reset_hard_wide_perf_git_compat.rs"]
 mod reset_hard_wide_perf_git_compat;
+#[cfg(feature = "full-tests")]
+#[path = "reset_hard_worktree_stat_git_compat.rs"]
+mod reset_hard_worktree_stat_git_compat;
 #[cfg(feature = "full-tests")]
 #[path = "reset_invalid_signature.rs"]
 mod reset_invalid_signature;
@@ -1585,6 +1778,8 @@ mod restore_hunks_git_compat;
 #[cfg(feature = "full-tests")]
 #[path = "restore_staged_conflict_issue_2155.rs"]
 mod restore_staged_conflict_issue_2155;
+#[path = "rev_list_attr_pathspec.rs"]
+mod rev_list_attr_pathspec;
 #[cfg(feature = "full-tests")]
 #[path = "rev_list_bitmaps.rs"]
 mod rev_list_bitmaps;
@@ -1594,11 +1789,14 @@ mod rev_list_commit_filter_git_compat;
 #[cfg(feature = "full-tests")]
 #[path = "rev_list_commit_graph_walk.rs"]
 mod rev_list_commit_graph_walk;
+#[cfg(feature = "full-tests")]
+#[path = "rev_list_count_git_compat.rs"]
+mod rev_list_count_git_compat;
 #[path = "rev_list_diff_coverage_sweep.rs"]
 mod rev_list_diff_coverage_sweep;
 #[cfg(feature = "full-tests")]
-#[path = "rev_list_format_git_compat.rs"]
-mod rev_list_format_git_compat;
+#[path = "rev_list_follow_git_compat.rs"]
+mod rev_list_follow_git_compat;
 #[path = "rev_list_object_segments.rs"]
 mod rev_list_object_segments;
 #[cfg(feature = "full-tests")]
@@ -1607,6 +1805,9 @@ mod rev_list_object_walk_roots_git_compat;
 #[cfg(feature = "full-tests")]
 #[path = "rev_list_ordering.rs"]
 mod rev_list_ordering;
+#[cfg(feature = "full-tests")]
+#[path = "rev_list_parents_git_compat.rs"]
+mod rev_list_parents_git_compat;
 #[cfg(feature = "full-tests")]
 #[path = "rev_list_path_limited_git_compat.rs"]
 mod rev_list_path_limited_git_compat;
@@ -1674,11 +1875,18 @@ mod revision_label_git_compat;
 #[path = "revwalk_coverage_floor.rs"]
 mod revwalk_coverage_floor;
 #[cfg(feature = "full-tests")]
+#[path = "revwalk_grep_body_subject_retention.rs"]
+mod revwalk_grep_body_subject_retention;
+#[cfg(feature = "full-tests")]
 #[path = "revwalk_injected_ref_store.rs"]
 mod revwalk_injected_ref_store;
 #[cfg(feature = "full-tests")]
 #[path = "revwalk_queries.rs"]
 mod revwalk_queries;
+#[path = "revwalk_resolve_options.rs"]
+mod revwalk_resolve_options;
+#[path = "revwalk_resolve_options_git_compat.rs"]
+mod revwalk_resolve_options_git_compat;
 #[cfg(feature = "full-tests")]
 #[path = "revwalk_symmetric_counts_git_compat.rs"]
 mod revwalk_symmetric_counts_git_compat;
@@ -1709,6 +1917,9 @@ mod serve_promisor_remote;
 #[cfg(feature = "full-tests")]
 #[path = "serve_receive_connectivity.rs"]
 mod serve_receive_connectivity;
+#[cfg(feature = "full-tests")]
+#[path = "serve_receive_custom_primary.rs"]
+mod serve_receive_custom_primary;
 #[cfg(feature = "full-tests")]
 #[path = "serve_receive_deny_non_ff.rs"]
 mod serve_receive_deny_non_ff;
@@ -1755,14 +1966,19 @@ mod sha256_midx_commit_graph;
 #[path = "sha256_worktree.rs"]
 mod sha256_worktree;
 #[cfg(feature = "full-tests")]
-#[path = "shallow_deepen_single_commit.rs"]
-mod shallow_deepen_single_commit;
+#[path = "shallow_boundary_diff_blame.rs"]
+mod shallow_boundary_diff_blame;
 #[cfg(feature = "full-tests")]
 #[path = "shallow_maintenance_git_compat.rs"]
 mod shallow_maintenance_git_compat;
 #[cfg(feature = "full-tests")]
 #[path = "signing_commit_git_compat.rs"]
 mod signing_commit_git_compat;
+#[path = "single_writer_gate_2500.rs"]
+mod single_writer_gate_2500;
+#[cfg(feature = "full-tests")]
+#[path = "skip_worktree_porcelain_2466.rs"]
+mod skip_worktree_porcelain_2466;
 #[cfg(feature = "full-tests")]
 #[path = "sparse_checkout_checkout.rs"]
 mod sparse_checkout_checkout;
@@ -1778,6 +1994,8 @@ mod sparse_oid_filter_git_compat;
 #[cfg(feature = "full-tests")]
 #[path = "split_index_git_compat.rs"]
 mod split_index_git_compat;
+#[path = "stage_options_embedder_guard.rs"]
+mod stage_options_embedder_guard;
 #[cfg(feature = "full-tests")]
 #[path = "stage_tracked_chunked_restage_git_compat.rs"]
 mod stage_tracked_chunked_restage_git_compat;
@@ -1797,11 +2015,16 @@ mod stash_apply_outcome_git_compat;
 #[path = "stash_diff_stat_git_compat.rs"]
 mod stash_diff_stat_git_compat;
 #[cfg(feature = "full-tests")]
+#[path = "stash_error_variants.rs"]
+mod stash_error_variants;
+#[cfg(feature = "full-tests")]
 #[path = "stash_git_compat.rs"]
 mod stash_git_compat;
 #[cfg(feature = "full-tests")]
 #[path = "stash_pathspec_git_compat.rs"]
 mod stash_pathspec_git_compat;
+#[path = "stash_pop_untracked_rollback.rs"]
+mod stash_pop_untracked_rollback;
 #[cfg(feature = "full-tests")]
 #[path = "stash_push_modes_git_compat.rs"]
 mod stash_push_modes_git_compat;
@@ -1817,6 +2040,9 @@ mod status_add_special_files_git_compat;
 #[cfg(feature = "full-tests")]
 #[path = "status_cancel_mid_scan.rs"]
 mod status_cancel_mid_scan;
+#[cfg(feature = "full-tests")]
+#[path = "status_cargo_scale_windows_perf_git_compat.rs"]
+mod status_cargo_scale_windows_perf_git_compat;
 #[cfg(feature = "full-tests")]
 #[path = "status_guidance_git_compat.rs"]
 mod status_guidance_git_compat;
@@ -1840,6 +2066,8 @@ mod status_path_buffer_git_compat;
 #[cfg(feature = "full-tests")]
 #[path = "status_scan_memory.rs"]
 mod status_scan_memory;
+#[path = "status_summary_coverage.rs"]
+mod status_summary_coverage;
 #[cfg(feature = "full-tests")]
 #[path = "status_symlink_ancestor_git_compat.rs"]
 mod status_symlink_ancestor_git_compat;
@@ -1852,6 +2080,9 @@ mod status_tracked_listing_git_compat;
 #[path = "status_unmerged_kinds_git_compat.rs"]
 mod status_unmerged_kinds_git_compat;
 #[cfg(feature = "full-tests")]
+#[path = "status_unreadable_directory_2361.rs"]
+mod status_unreadable_directory_2361;
+#[cfg(feature = "full-tests")]
 #[path = "status_unreadable_tracked_file_2107.rs"]
 mod status_unreadable_tracked_file_2107;
 #[cfg(feature = "full-tests")]
@@ -1859,6 +2090,9 @@ mod status_unreadable_tracked_file_2107;
 mod structured_diff_git_compat;
 #[path = "submodule_gitdir_sweep.rs"]
 mod submodule_gitdir_sweep;
+#[cfg(feature = "full-tests")]
+#[path = "submodule_ignore_git_compat.rs"]
+mod submodule_ignore_git_compat;
 #[path = "supporting_modules_sweep.rs"]
 mod supporting_modules_sweep;
 #[path = "supporting_public_fn_coverage.rs"]
@@ -1872,6 +2106,9 @@ mod switch_no_checkout_git_compat;
 #[cfg(feature = "full-tests")]
 #[path = "switch_reflog_git_compat.rs"]
 mod switch_reflog_git_compat;
+#[cfg(feature = "full-tests")]
+#[path = "switch_reset_mixed_swap_perf_git_compat.rs"]
+mod switch_reset_mixed_swap_perf_git_compat;
 #[cfg(feature = "full-tests")]
 #[path = "switch_tree_diff_git_compat.rs"]
 mod switch_tree_diff_git_compat;
@@ -1899,6 +2136,8 @@ mod tag_packed_peel_git_compat;
 #[cfg(feature = "full-tests")]
 #[path = "target_comparison_git_compat.rs"]
 mod target_comparison_git_compat;
+#[path = "text_diff_options.rs"]
+mod text_diff_options;
 #[path = "total_line_coverage_sweep.rs"]
 mod total_line_coverage_sweep;
 #[path = "total_misc_module_sweep.rs"]
@@ -1911,6 +2150,9 @@ mod trailer_git_compat;
 #[cfg(feature = "full-tests")]
 #[path = "transfer_cargo_mirror.rs"]
 mod transfer_cargo_mirror;
+#[cfg(feature = "full-tests")]
+#[path = "transfer_custom_primary_contains.rs"]
+mod transfer_custom_primary_contains;
 #[cfg(feature = "full-tests")]
 #[path = "transfer_local_copy_perf.rs"]
 mod transfer_local_copy_perf;
@@ -1953,6 +2195,8 @@ mod transport_git_daemon;
 #[cfg(feature = "full-tests")]
 #[path = "transport_git_daemon_v2.rs"]
 mod transport_git_daemon_v2;
+#[path = "transport_handles.rs"]
+mod transport_handles;
 #[cfg(feature = "full-tests")]
 #[path = "transport_http.rs"]
 mod transport_http;
@@ -2006,6 +2250,9 @@ mod tree_sha256_verify_coverage;
 #[path = "tree_sha256_verify_git_compat.rs"]
 mod tree_sha256_verify_git_compat;
 #[cfg(feature = "full-tests")]
+#[path = "typed_config_errors.rs"]
+mod typed_config_errors;
+#[cfg(feature = "full-tests")]
 #[path = "typed_errors_config_refs_filter.rs"]
 mod typed_errors_config_refs_filter;
 #[cfg(feature = "full-tests")]
@@ -2029,6 +2276,11 @@ mod userdiff_hunk_header_git_compat;
 #[cfg(feature = "full-tests")]
 #[path = "wildmatch_vectors.rs"]
 mod wildmatch_vectors;
+#[cfg(feature = "full-tests")]
+#[path = "windows_symlinks_enabled_git_compat.rs"]
+mod windows_symlinks_enabled_git_compat;
+#[path = "worktree_add_cancel.rs"]
+mod worktree_add_cancel;
 #[cfg(feature = "full-tests")]
 #[path = "worktree_add_options_git_compat.rs"]
 mod worktree_add_options_git_compat;
@@ -2094,7 +2346,7 @@ fn every_test_file_is_compiled() {
     for item in std::fs::read_dir(&dir).expect("read tests/") {
         let name = item.expect("tests/ entry").file_name();
         let Some(name) = name.to_str() else { continue };
-        if !name.ends_with(".rs") || name == "integration.rs" {
+        if !name.ends_with(".rs") || name == "integration.rs" || name.ends_with("_data.rs") {
             continue;
         }
         let module = format!("#[path = \"{name}\"]");

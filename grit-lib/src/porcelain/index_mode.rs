@@ -1,11 +1,21 @@
 //! Explicit index file modes for paths where the worktree does not report executable bits.
 //!
-//! When `core.filemode` is false (typical on Windows), [`crate::diff::mode_from_metadata`]
-//! always yields a non-executable mode. Staging can still record `100755` in the index when
+//! When `core.filemode` is false (typical on Windows), worktree `lstat` modes are mapped without
+//! the executable bit. Staging can still record `100755` in the index when
 //! the caller sets an [`StageExecutableHint`], matching Git's `update-index --chmod` behavior.
 
-use crate::error::{Error, Result};
-use crate::index::{Index, MODE_EXECUTABLE, MODE_GITLINK, MODE_REGULAR, MODE_SYMLINK, MODE_TREE};
+use crate::error::Result;
+use crate::index::{
+    Index, IndexChmodReason, IndexError, MODE_EXECUTABLE, MODE_GITLINK, MODE_REGULAR, MODE_SYMLINK,
+    MODE_TREE,
+};
+
+fn chmod_error(path: &[u8], reason: IndexChmodReason) -> IndexError {
+    IndexError::Chmod {
+        path: String::from_utf8_lossy(path).into_owned(),
+        reason,
+    }
+}
 
 /// Whether staging should force the executable bit for matched regular files.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -48,31 +58,35 @@ pub(crate) fn staged_mode_with_hint(base: u32, hint: StageExecutableHint) -> u32
 ///
 /// # Errors
 ///
-/// Returns [`Error::Message`] when the path is not a regular file entry or is unmerged.
-pub fn set_stage0_file_mode(index: &mut Index, path: &[u8], mode: u32) -> Result<bool> {
+/// Returns [`IndexError::Chmod`] when the path is not a regular file entry or is unmerged.
+pub fn set_stage0_file_mode(
+    index: &mut Index,
+    path: &[u8],
+    mode: u32,
+) -> crate::error::Result<bool> {
     if index
         .entries
         .iter()
         .any(|e| e.path == path && e.stage() != 0)
     {
-        return Err(Error::Message(format!(
-            "cannot change mode of unmerged path '{}'",
-            String::from_utf8_lossy(path)
+        return Err(crate::error::Error::from(chmod_error(
+            path,
+            IndexChmodReason::UnmergedPath,
         )));
     }
     let Some(entry) = index.get_mut(path, 0) else {
         return Ok(false);
     };
     if !is_chmod_eligible_mode(entry.mode) {
-        return Err(Error::Message(format!(
-            "cannot set executable bit on '{}'",
-            String::from_utf8_lossy(path)
+        return Err(crate::error::Error::from(chmod_error(
+            path,
+            IndexChmodReason::NotChmodEligible,
         )));
     }
     if !is_chmod_eligible_mode(mode) {
-        return Err(Error::Message(format!(
-            "invalid mode for regular file '{}'",
-            String::from_utf8_lossy(path)
+        return Err(crate::error::Error::from(chmod_error(
+            path,
+            IndexChmodReason::InvalidTargetMode { mode },
         )));
     }
     if entry.mode == mode {
@@ -111,17 +125,13 @@ pub(crate) fn apply_executable_hint_to_index(
             .iter()
             .any(|e| e.path == path && e.stage() != 0)
         {
-            return Err(Error::Message(format!(
-                "cannot change mode of unmerged path '{rel}'"
-            )));
+            return Err(chmod_error(&path, IndexChmodReason::UnmergedPath).into());
         }
         let Some(entry) = index.get(&path, 0) else {
             continue;
         };
         if entry.mode == MODE_SYMLINK || entry.mode == MODE_GITLINK || entry.mode == MODE_TREE {
-            return Err(Error::Message(format!(
-                "cannot set executable bit on '{rel}'"
-            )));
+            return Err(chmod_error(&path, IndexChmodReason::NotChmodEligible).into());
         }
         if !is_chmod_eligible_mode(entry.mode) {
             continue;
@@ -189,7 +199,10 @@ mod tests {
         let mut index = Index::new();
         index.add_or_replace(regular_entry("link", MODE_SYMLINK));
         let err = set_stage0_file_mode(&mut index, b"link", MODE_EXECUTABLE).unwrap_err();
-        assert!(matches!(err, Error::Message(_)));
+        assert!(matches!(
+            err,
+            crate::error::Error::Index(IndexError::Chmod { .. })
+        ));
     }
 
     #[test]
@@ -208,7 +221,10 @@ mod tests {
         let mut index = Index::new();
         index.add_or_replace(regular_entry("x", 0o100664));
         let err = set_stage0_file_mode(&mut index, b"x", MODE_EXECUTABLE).unwrap_err();
-        assert!(matches!(err, Error::Message(_)));
+        assert!(matches!(
+            err,
+            crate::error::Error::Index(IndexError::Chmod { .. })
+        ));
     }
 
     #[test]
@@ -216,6 +232,9 @@ mod tests {
         let mut index = Index::new();
         index.add_or_replace(regular_entry("run.sh", MODE_REGULAR));
         let err = set_stage0_file_mode(&mut index, b"run.sh", MODE_SYMLINK).unwrap_err();
-        assert!(matches!(err, Error::Message(_)));
+        assert!(matches!(
+            err,
+            crate::error::Error::Index(IndexError::Chmod { .. })
+        ));
     }
 }

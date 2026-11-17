@@ -13,6 +13,7 @@
 //! # }
 //! ```
 
+mod budget;
 mod map;
 mod policy;
 mod pool;
@@ -20,6 +21,8 @@ mod pool;
 pub(crate) use map::pool_worthwhile;
 pub(crate) use pool::{run_ordered_batches, run_ordered_pool};
 
+pub use budget::share_worker_budget_across_processes;
+pub(crate) use budget::FilesystemWork;
 pub use map::{
     par_map, parallel_worthwhile, try_par_map, try_par_map_force, try_par_map_with_local,
 };
@@ -32,6 +35,7 @@ use std::num::NonZeroUsize;
 /// If a worker panics, partial results are dropped and the panic is resumed on the
 /// caller thread after workers join.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ParallelHashError<E> {
     /// The first error returned by a worker (additional concurrent errors are discarded).
     Task(E),
@@ -114,31 +118,6 @@ pub fn index_pack_threads_for_ingest(
         ));
     }
     Ok(None)
-}
-
-/// Lazy name-hash thread count from config and Git's `LAZY_THREAD_COST` thresholds.
-#[must_use]
-pub fn index_load_lazy_thread_count(
-    policy: &ThreadPolicy,
-    config: &crate::config::ConfigSet,
-    cache_nr: usize,
-    try_threaded: bool,
-) -> usize {
-    if !try_threaded {
-        return 0;
-    }
-    let opts = policy.resolve(ParallelOp::IndexLoad, config);
-    if opts.threads.get() <= 1 {
-        return 0;
-    }
-    if cache_nr < 2 * crate::index_name_hash_lazy::LAZY_THREAD_COST {
-        return 0;
-    }
-    let mut nr = opts.threads.get();
-    if cache_nr < nr * crate::index_name_hash_lazy::LAZY_THREAD_COST {
-        nr = cache_nr / crate::index_name_hash_lazy::LAZY_THREAD_COST;
-    }
-    nr
 }
 
 #[cfg(test)]

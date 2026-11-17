@@ -1,37 +1,18 @@
 //! `grit restore` — restore working tree and/or index paths.
 
 use anyhow::{Context, Result};
-use grit_lib::error::Error as LibError;
-use grit_lib::porcelain::hunk_select::{
-    parse_hunk_id_list, restore_hunks, HunkSelectError, RestoreHunksOutcome,
-};
-use grit_lib::porcelain::restore::{
-    restore_paths, ConflictSide, RestoreOptions, RestoreOutcome, RestoreSource,
-};
+use grit_lib::porcelain::hunk_select::{parse_hunk_id_list, HunkSelectError, RestoreHunksOutcome};
+use grit_lib::porcelain::restore::{ConflictSide, RestoreOptions, RestoreOutcome, RestoreSource};
+use grit_lib::revwalk::ResolveOptions;
 
 use crate::conflict_style::{self, ConflictStyleArg};
-use grit_lib::revwalk::rev_parse::resolve_revision;
-use schemars::JsonSchema;
-use serde::Serialize;
 use std::collections::BTreeMap;
-use std::io::Write;
 
 use crate::context;
-use crate::output::{outln, HumanRender, MarkdownRender, RenderContext};
 use crate::pathspec_args::PathspecArgs;
+use crate::ui::PathDisplayOptions;
 
-/// CLI result (mirrors [`RestoreOutcome`] or [`RestoreHunksOutcome`]).
-#[derive(Serialize, JsonSchema, Clone)]
-pub struct RestoreCliOutcome {
-    pub restored: Vec<String>,
-    pub removed: Vec<String>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub restored_hunks: BTreeMap<String, Vec<String>>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub restored_lines: BTreeMap<String, Vec<String>>,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub dry_run: bool,
-}
+pub use crate::render::restore::RestoreCliOutcome;
 
 impl From<RestoreOutcome> for RestoreCliOutcome {
     fn from(value: RestoreOutcome) -> Self {
@@ -41,6 +22,7 @@ impl From<RestoreOutcome> for RestoreCliOutcome {
             restored_hunks: BTreeMap::new(),
             restored_lines: BTreeMap::new(),
             dry_run: false,
+            path_display: None,
         }
     }
 }
@@ -58,47 +40,8 @@ impl From<RestoreHunksOutcome> for RestoreCliOutcome {
             restored_hunks,
             restored_lines: value.restored_lines,
             dry_run: value.dry_run,
+            path_display: None,
         }
-    }
-}
-
-impl HumanRender for RestoreCliOutcome {
-    fn render_human(&self, w: &mut dyn Write, _ctx: &RenderContext) -> Result<()> {
-        let prefix = if self.dry_run {
-            "Would restore"
-        } else {
-            "Restored"
-        };
-        for path in &self.restored {
-            outln!(w, "{prefix} {path}");
-        }
-        for path in &self.removed {
-            outln!(w, "Removed {path}");
-        }
-        Ok(())
-    }
-}
-
-impl MarkdownRender for RestoreCliOutcome {
-    fn render_markdown(&self, w: &mut dyn Write, _ctx: &RenderContext) -> Result<()> {
-        outln!(w, "## Restore");
-        if self.restored.is_empty() && self.removed.is_empty() {
-            outln!(w, "\nNo paths changed.");
-            return Ok(());
-        }
-        if !self.restored.is_empty() {
-            outln!(w, "\n### Restored");
-            for path in &self.restored {
-                outln!(w, "- `{path}`");
-            }
-        }
-        if !self.removed.is_empty() {
-            outln!(w, "\n### Removed");
-            for path in &self.removed {
-                outln!(w, "- `{path}`");
-            }
-        }
-        Ok(())
     }
 }
 
@@ -109,10 +52,6 @@ pub fn hunks_exit_code(err: &anyhow::Error) -> i32 {
     } else {
         1
     }
-}
-
-fn map_hunk_error(err: HunkSelectError) -> anyhow::Error {
-    anyhow::Error::new(err)
 }
 
 /// Run partial restore via hunk ids and/or line ranges.
@@ -126,12 +65,15 @@ pub fn run_hunks(
 ) -> Result<RestoreCliOutcome> {
     let repo = context::discover()?;
     let resolved = args.resolve(&repo)?;
-    let (pathspecs, _) = resolved.into_pathspec_lists();
-    let mut selection = parse_hunk_id_list(hunks).map_err(map_hunk_error)?;
+    let pathspecs = resolved.specs().to_vec();
+    let mut selection = parse_hunk_id_list(hunks).map_err(super::add::map_hunk_error)?;
     selection.ranges = super::add::parse_line_range_list(lines)?;
-    let outcome = restore_hunks(&repo, &selection, &pathspecs, staged, worktree, dry_run)
-        .map_err(map_hunk_error)?;
-    Ok(outcome.into())
+    let outcome = repo
+        .index()
+        .restore_hunks(&selection, &pathspecs, staged, worktree, dry_run)
+        .map_err(super::add::map_hunk_error)?;
+    Ok(RestoreCliOutcome::from(outcome)
+        .with_path_display(PathDisplayOptions::from_repo(&repo).ok()))
 }
 
 /// Run `grit restore` with the given flags and path arguments.
@@ -160,7 +102,9 @@ pub fn run(
     let restore_source = match source {
         None => RestoreSource::Index,
         Some(rev) => {
-            let oid = resolve_revision(&repo, &rev)
+            let oid = repo
+                .revwalk()
+                .resolve(&rev, &ResolveOptions::default())
                 .with_context(|| format!("could not resolve '{rev}'"))?;
             let obj = repo.odb().read(&oid).context("reading source object")?;
             use grit_lib::objects::{parse_commit, ObjectKind};
@@ -175,11 +119,13 @@ pub fn run(
         }
     };
 
-    let grit_lib::worktree::pathspec::ResolvedPathspecs {
-        specs: pathspecs,
-        sources: pathspec_sources,
-        scoped: _,
-    } = resolved;
+    let pathspecs = resolved.specs().to_vec();
+    let pathspec_sources: Vec<String> = resolved.iter().map(str::to_owned).collect();
+    let pathspec_sources = if pathspec_sources.is_empty() {
+        pathspecs.clone()
+    } else {
+        pathspec_sources
+    };
 
     let opts = RestoreOptions {
         pathspecs,
@@ -191,20 +137,84 @@ pub fn run(
         remerge,
     };
 
-    let interrupt = crate::interrupt::InterruptCancel::install();
-    let outcome = restore_paths(
-        &repo,
-        &opts,
-        &mut grit_lib::progress::NullProgress,
-        &interrupt,
-    )
-    .map_err(map_restore_error)?;
-    Ok(outcome.into())
+    let _interrupt = crate::interrupt::InterruptCancel::install();
+    let cancel = crate::interrupt::process_cancel_token();
+    let outcome = repo
+        .checkout()
+        .restore(&opts, &mut grit_lib::progress::NullProgress, &cancel)
+        .map_err(crate::json_error::map_lib_error)?;
+    Ok(RestoreCliOutcome::from(outcome)
+        .with_path_display(PathDisplayOptions::from_repo(&repo).ok()))
 }
 
-fn map_restore_error(err: LibError) -> anyhow::Error {
-    match err {
-        unmerged @ LibError::RestorePathUnmerged { .. } => anyhow::Error::from(unmerged),
-        other => anyhow::anyhow!("{other}"),
+/// Dispatch parsed CLI args for `Restore`.
+pub fn dispatch(
+    args: crate::args::RestoreArgs,
+    env: crate::dispatch::CommandEnv<'_>,
+) -> anyhow::Result<crate::exit_status::ExitStatus> {
+    use crate::args::*;
+    use crate::commands;
+
+    use crate::dispatch::{emit_success, finish_hunk_error, CommandEnv};
+
+    use anyhow::bail;
+    let CommandEnv {
+        opts,
+        ctx,
+        process_env: _,
+    } = env;
+    let RestoreArgs {
+        pathspecs,
+        staged,
+        worktree,
+        source,
+        ours,
+        theirs,
+        merge,
+        conflict_style,
+        hunks,
+        lines,
+        dry_run,
+    } = args;
+    {
+        use grit_lib::porcelain::restore::ConflictSide;
+        let side = if ours {
+            Some(ConflictSide::Ours)
+        } else if theirs {
+            Some(ConflictSide::Theirs)
+        } else {
+            None
+        };
+        if !hunks.is_empty() || !lines.is_empty() {
+            if source.is_some() || side.is_some() || merge || conflict_style.is_some() {
+                bail!("--hunks and --lines cannot be used with --source, --ours, --theirs, or --merge");
+            }
+            match commands::restore::run_hunks(
+                &pathspecs, &hunks, &lines, staged, worktree, dry_run,
+            ) {
+                Ok(outcome) => emit_success(outcome, opts, ctx),
+                Err(err) => {
+                    let code = commands::restore::hunks_exit_code(&err);
+                    Ok(finish_hunk_error(err, opts, code))
+                }
+            }
+        } else {
+            if dry_run {
+                bail!("--dry-run requires --hunks or --lines");
+            }
+            emit_success(
+                commands::restore::run(
+                    &pathspecs,
+                    staged,
+                    worktree,
+                    source,
+                    side,
+                    merge,
+                    conflict_style,
+                )?,
+                opts,
+                ctx,
+            )
+        }
     }
 }

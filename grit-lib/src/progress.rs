@@ -2,7 +2,7 @@
 //!
 //! Library operations never touch the terminal. Long-running work reports
 //! progress through a [`ProgressSink`] supplied by the caller and checks a
-//! [`Cancel`] signal at loop boundaries. The CLI provides a concrete sink that
+//! [`CancelToken`] at loop boundaries. The CLI provides a concrete sink that
 //! draws to stderr (gated on `isatty`) and decides colour, redraw rate, and
 //! whether a pager is attached; the library makes none of those decisions.
 //!
@@ -12,15 +12,15 @@
 //! the final count up front.
 //!
 //! Tests, `grit-cli`, and any call site that does not want output use the
-//! no-op [`NullProgress`] / [`NeverCancel`].
+//! no-op [`NullProgress`] and a default [`CancelToken::never`] handle.
 //!
 //! Library guide: [progress](https://grit-scm.com/docs/library/parallelism)
 //!
 //! ```rust
-//! use grit_lib::progress::{NeverCancel, NullProgress};
+//! use grit_lib::progress::{CancelToken, NullProgress};
 //! # fn main() {
 //! let _sink = NullProgress;
-//! let _cancel = NeverCancel;
+//! let _cancel = CancelToken::never();
 //! # }
 //! ```
 
@@ -54,6 +54,12 @@ pub enum ProgressPhase {
     /// any bytes an earlier run already moved; the detailed events go to
     /// [`crate::fetch::Progress::resumable_transfer`].
     TransferringBundle,
+    /// Compressing objects while building a pack for upload.
+    CompressingObjects,
+    /// Writing object entries into a pack stream.
+    WritingObjects,
+    /// Streaming a pack to a remote during push (counted in bytes).
+    SendingObjects,
 }
 
 impl ProgressPhase {
@@ -65,9 +71,11 @@ impl ProgressPhase {
             | Self::EnumeratingObjects
             | Self::IndexingObjects
             | Self::ResolvingDeltas
-            | Self::CopyingObjects => ProgressUnit::Objects,
+            | Self::CopyingObjects
+            | Self::CompressingObjects
+            | Self::WritingObjects => ProgressUnit::Objects,
             Self::CheckingOutFiles | Self::StagingFiles => ProgressUnit::Files,
-            Self::TransferringBundle => ProgressUnit::Bytes,
+            Self::TransferringBundle | Self::SendingObjects => ProgressUnit::Bytes,
         }
     }
 }
@@ -137,15 +145,6 @@ pub trait ProgressSink {
 
     /// Finish the current phase.
     fn finish(&mut self) {}
-
-    /// When `true`, the operation should stop at the next [`poll_cancel`] check.
-    ///
-    /// CLI progress sinks may set this when the user interrupts (Ctrl+C). Most
-    /// call sites rely on a separate [`Cancel`] argument instead; either signal
-    /// produces [`crate::error::Error::Cancelled`].
-    fn should_cancel(&self) -> bool {
-        false
-    }
 }
 
 /// Forwarding impl so a `&mut P` can be threaded into sub-operations that also
@@ -166,9 +165,6 @@ impl<T: ProgressSink + ?Sized> ProgressSink for &mut T {
     fn finish(&mut self) {
         (**self).finish();
     }
-    fn should_cancel(&self) -> bool {
-        (**self).should_cancel()
-    }
 }
 
 /// A [`ProgressSink`] that discards every update. The default for tests,
@@ -178,35 +174,57 @@ pub struct NullProgress;
 
 impl ProgressSink for NullProgress {}
 
-/// A cancellation signal checked by long-running library operations at loop
-/// boundaries. Implementations must be cheap to query.
-pub trait Cancel {
-    /// Returns `true` once the operation should stop as soon as possible.
-    fn is_cancelled(&self) -> bool;
-
-    /// When cancellation is backed by a shared flag (for example [`FlagCancel`]), returns it
-    /// so worker threads can observe the same signal.
-    fn shared_watch(&self) -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
-        None
-    }
-}
-
-/// A [`Cancel`] that never signals cancellation. The default for call sites
-/// that do not support interruption.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct NeverCancel;
-
-impl Cancel for NeverCancel {
-    fn is_cancelled(&self) -> bool {
-        false
-    }
-}
-
 /// How often long object walks and pack builds report [`ProgressSink::set`].
 pub(crate) const OBJECT_PROGRESS_STRIDE: u64 = 256;
 
 /// How often worktree blob stat scans and similar loops poll [`poll_watch`].
 pub(crate) const CANCEL_POLL_STRIDE: usize = 256;
+
+/// Wraps a [`Write`] and reports bytes written to a [`ProgressSink`] as
+/// [`ProgressPhase::SendingObjects`].
+pub(crate) struct ProgressWrite<'a, W: ?Sized> {
+    inner: &'a mut W,
+    sink: &'a mut dyn ProgressSink,
+    started: bool,
+}
+
+impl<'a, W: ?Sized + std::io::Write> ProgressWrite<'a, W> {
+    /// Create a wrapper that forwards writes to `inner` and counts them on `sink`.
+    pub fn new(inner: &'a mut W, sink: &'a mut dyn ProgressSink) -> Self {
+        Self {
+            inner,
+            sink,
+            started: false,
+        }
+    }
+
+    /// End the sending phase when one was started.
+    pub fn finish(&mut self) {
+        if self.started {
+            self.sink.finish();
+            self.started = false;
+        }
+    }
+}
+
+impl<W: ?Sized + std::io::Write> std::io::Write for ProgressWrite<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        if n > 0 {
+            if !self.started {
+                self.sink
+                    .start_with_unit(ProgressPhase::SendingObjects, ProgressUnit::Bytes, None);
+                self.started = true;
+            }
+            self.sink.inc(n as u64);
+        }
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
 
 /// Report monotonic object progress at [`OBJECT_PROGRESS_STRIDE`] boundaries.
 ///
@@ -229,56 +247,238 @@ pub(crate) fn report_object_progress_stride(
     }
 }
 
-/// Shared flag for tests and embedders that flip cancellation mid-operation.
-#[derive(Debug, Clone)]
-pub struct FlagCancel(pub std::sync::Arc<std::sync::atomic::AtomicBool>);
+/// Returned from [`CancelToken::poll`] once cancellation was requested.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cancelled;
 
-impl FlagCancel {
-    /// Create a cancel signal that starts unset.
+/// Historical type alias for [`CancelToken`] retained for older examples and tests.
+pub type Token = CancelToken;
+
+/// Cooperative cancellation handle shared across threads (`Clone` shares the same flag).
+#[derive(Debug, Clone)]
+pub struct CancelToken {
+    flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(feature = "test-support")]
+    polls_until_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    #[cfg(feature = "test-support")]
+    check_counter: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+}
+
+impl CancelToken {
+    /// Create a handle that starts uncancelled.
     #[must_use]
     pub fn new() -> Self {
-        Self(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
-            false,
-        )))
+        Self {
+            flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(feature = "test-support")]
+            polls_until_cancel: None,
+            #[cfg(feature = "test-support")]
+            check_counter: None,
+        }
     }
 
-    /// Signal cancellation to every consumer polling this handle.
+    /// Alias for [`Self::new`]: a handle that never cancels unless [`Self::cancel`] is called.
+    #[must_use]
+    pub fn never() -> Self {
+        Self::new()
+    }
+
+    /// Shared uncancelled handle for default `&Self` parameters (see [`Self::never`] for an owned clone).
+    #[must_use]
+    pub fn never_ref() -> &'static Self {
+        static NEVER: std::sync::LazyLock<CancelToken> = std::sync::LazyLock::new(CancelToken::new);
+        &NEVER
+    }
+
+    pub(crate) fn from_shared_flag(flag: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Self {
+        Self {
+            flag,
+            #[cfg(feature = "test-support")]
+            polls_until_cancel: None,
+            #[cfg(feature = "test-support")]
+            check_counter: None,
+        }
+    }
+
+    /// Returns a token and the number of cancellation checks (integration tests only).
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn with_check_counter() -> (Self, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let token = Self {
+            flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            polls_until_cancel: None,
+            check_counter: Some(std::sync::Arc::clone(&counter)),
+        };
+        (token, counter)
+    }
+
+    /// Request stop at the next poll boundary on every clone of this handle.
     pub fn cancel(&self) {
-        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Clears a prior cancellation (for example when reinstalling signal handlers).
+    pub fn reset(&self) {
+        self.flag.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Returns `true` once [`Self::cancel`] was called or a test countdown reached zero.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        #[cfg(feature = "test-support")]
+        self.record_check_only();
+        self.flag.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(feature = "test-support")]
+    fn record_check_only(&self) {
+        if let Some(counter) = self.check_counter.as_ref() {
+            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Like [`Self::poll`], but only applies the test [`Self::after_polls`] budget — avoids
+    /// double-counting when [`Self::poll`] also reads cancellation.
+    #[cfg(feature = "test-support")]
+    fn tick_poll_budget_only(&self) {
+        if let Some(remaining) = self.polls_until_cancel.as_ref() {
+            let prev = remaining.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            if prev == 0 {
+                // Undo wrap when the budget was already exhausted.
+                remaining.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return;
+            }
+            if prev == 1 {
+                self.cancel();
+            }
+        }
+    }
+
+    /// Poll hook before blocking waits (in tests, counts toward the poll budget from
+    /// `CancelToken::after_polls`).
+    pub fn poll_before_wait(&self) {
+        #[cfg(feature = "test-support")]
+        self.tick_poll_budget_only();
+        let _ = self.is_cancelled();
+    }
+
+    /// Returns [`Cancelled`] once this handle was cancelled.
+    ///
+    /// Long-running library loops call this at coarse boundaries.
+    /// Like [`Self::poll`], mapping to [`crate::error::Error::Cancelled`].
+    pub(crate) fn poll_result(&self) -> crate::error::Result<()> {
+        self.poll()
+            .map_err(|Cancelled| crate::error::Error::Cancelled)
+    }
+
+    pub(crate) fn poll(&self) -> std::result::Result<(), Cancelled> {
+        #[cfg(feature = "test-support")]
+        {
+            self.tick_poll_budget_only();
+            // Match `is_cancelled()` for the integration-test hook (`CancelToken::with_check_counter`):
+            // hot paths poll instead of calling `is_cancelled()`, but tests still expect every poll to
+            // count as a cancellation check.
+            if let Some(counter) = self.check_counter.as_ref() {
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        #[cfg(not(feature = "test-support"))]
+        let _ = ();
+        // Read the flag directly so we do not run `is_cancelled()` here: that would double-apply
+        // `tick_poll_budget_only` in non-test builds and advance `polls_until_cancel` against
+        // `CancelToken::after_polls` budgets in the same boundary as this `poll`.
+        if self.flag.load(std::sync::atomic::Ordering::Relaxed) {
+            Err(Cancelled)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Shared flag for worker threads; clones share cancellation with this handle.
+    pub(crate) fn watch_arc(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        std::sync::Arc::clone(&self.flag)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn as_atomic(&self) -> &std::sync::atomic::AtomicBool {
+        &self.flag
+    }
+
+    /// Whether cancellation was requested, reading only the shared flag (no `after_polls`
+    /// countdown, no check counter). Used when mirroring into stack watches without consuming a
+    /// poll budget.
+    #[inline]
+    pub(crate) fn is_cancelled_raw(&self) -> bool {
+        self.flag.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Cancels on the `n`th call to [`Self::poll`] (for deterministic tests).
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn after_polls(n: u64) -> Self {
+        Self {
+            flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            polls_until_cancel: Some(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(n))),
+            check_counter: None,
+        }
     }
 }
 
-impl Default for FlagCancel {
+impl Default for CancelToken {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Cancel for FlagCancel {
-    fn is_cancelled(&self) -> bool {
-        self.0.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    fn shared_watch(&self) -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
-        Some(std::sync::Arc::clone(&self.0))
+/// Copy a stack [`CancelToken`] into `watch` for worker threads (call on the owning thread).
+#[inline]
+pub(crate) fn mirror_stack_cancel(cancel: &CancelToken, watch: &std::sync::atomic::AtomicBool) {
+    if cancel.is_cancelled_raw() {
+        watch.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
-/// Shared [`AtomicBool`](std::sync::atomic::AtomicBool) for cancellation visible across threads.
+/// Shared flag for smart-HTTP waits; the owning thread mirrors a stack [`CancelToken`] into it.
+pub(crate) struct HttpStackWatch(pub(crate) std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl HttpStackWatch {
+    #[must_use]
+    pub fn new(cancel: &CancelToken) -> Self {
+        Self(cancel.watch_arc())
+    }
+}
+
+/// Keeps [`HttpStackWatch`] alive for a fetch/push scope.
+pub(crate) struct HttpWaitGuard {
+    _watch: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl HttpWaitGuard {
+    pub(crate) fn bind(
+        cancel: &CancelToken,
+    ) -> (std::sync::Arc<std::sync::atomic::AtomicBool>, Self) {
+        let watch = HttpStackWatch::new(cancel).0;
+        (std::sync::Arc::clone(&watch), Self { _watch: watch })
+    }
+}
+
+/// Share a [`CancelToken`] with smart-HTTP connect options for worker threads.
 ///
-/// For [`FlagCancel`], this is the same flag as the handle (so embedders can cancel mid-scan).
-/// For other [`Cancel`] implementations, a private flag is seeded from [`Cancel::is_cancelled`]
-/// at creation time; combine with [`poll_cancel_watch`] on the main thread for progress signals.
+/// The owning thread mirrors the stack token into `stack_watch` during HTTP waits
+/// (see [`mirror_stack_cancel`]).
 #[must_use]
-pub fn cancel_watch_arc(cancel: &dyn Cancel) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
-    cancel.shared_watch().unwrap_or_else(|| {
-        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(cancel.is_cancelled()))
-    })
+pub(crate) fn connect_cancel_arc(
+    cancel: &CancelToken,
+    stack_watch: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> std::sync::Arc<CancelToken> {
+    mirror_stack_cancel(cancel, &stack_watch);
+    std::sync::Arc::new(CancelToken::from_shared_flag(cancel.watch_arc()))
 }
 
 /// Returns [`crate::error::Error::Cancelled`] when `watch` was set.
 #[inline]
-pub fn poll_watch(watch: &std::sync::atomic::AtomicBool) -> crate::error::Result<()> {
+pub(crate) fn poll_watch(watch: &std::sync::atomic::AtomicBool) -> crate::error::Result<()> {
     if watch.load(std::sync::atomic::Ordering::Relaxed) {
         Err(crate::error::Error::Cancelled)
     } else {
@@ -286,36 +486,18 @@ pub fn poll_watch(watch: &std::sync::atomic::AtomicBool) -> crate::error::Result
     }
 }
 
-/// Poll hook for long [`crate::diff::diff_index_to_worktree_with_options`] scans on the stack
-/// frame that owns `progress`.
-///
-/// [`Self::poll_owner`] must run only on the thread that owns the captured `WatchProgress`.
+/// Poll hook for long worktree stat scans on the thread that owns the cancel token.
 pub(crate) struct StackCancelPoll {
-    progress: usize,
     watch: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl StackCancelPoll {
-    /// Capture `progress` and `watch` for [`Self::poll_owner`].
     #[must_use]
-    pub(crate) fn new(
-        progress: &mut WatchProgress<'_>,
-        watch: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    ) -> Self {
-        Self {
-            progress: std::ptr::from_mut(progress).addr(),
-            watch,
-        }
+    pub fn new(watch: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Self {
+        Self { watch }
     }
 
-    /// Mirror [`ProgressSink::should_cancel`] into `watch`, then [`poll_watch`].
     pub(crate) fn poll_owner(&self) -> crate::error::Result<()> {
-        // SAFETY: only invoked on the owning thread while the captured `WatchProgress` is live.
-        let progress = unsafe { &mut *(self.progress as *mut WatchProgress<'_>) };
-        if progress.should_cancel() {
-            self.watch.store(true, std::sync::atomic::Ordering::Relaxed);
-            return Err(crate::error::Error::Cancelled);
-        }
         poll_watch(&self.watch)
     }
 }
@@ -341,132 +523,75 @@ impl StatScanCancel {
 
 /// Like [`poll_cancel`], but also records cancellation in `watch` for worker threads.
 #[inline]
-pub fn poll_cancel_watch(
-    progress: &mut dyn ProgressSink,
-    cancel: &dyn Cancel,
+pub(crate) fn poll_cancel_watch(
+    cancel: &CancelToken,
     watch: &std::sync::atomic::AtomicBool,
 ) -> crate::error::Result<()> {
-    if cancel.is_cancelled() || progress.should_cancel() {
-        watch.store(true, std::sync::atomic::Ordering::Relaxed);
-        return Err(crate::error::Error::Cancelled);
+    match cancel.poll() {
+        Err(_) => {
+            watch.store(true, std::sync::atomic::Ordering::Relaxed);
+            Err(crate::error::Error::Cancelled)
+        }
+        Ok(()) => poll_watch(watch),
     }
-    poll_watch(watch)
 }
 
-/// A [`Cancel`] polled on the calling thread, plus the flag its worker threads read.
-///
-/// [`Self::poll`] records a cancel in [`Self::flag`], so workers also stop for
-/// [`Cancel`] implementations that are not backed by a shared flag (once the calling
-/// thread next polls). For a [`FlagCancel`] the flag is the handle's own, so workers
-/// see a cancel from another thread right away.
+/// A [`CancelToken`] polled on the calling thread, plus the flag its worker threads read.
 pub(crate) struct CancelSignal<'a> {
-    cancel: &'a dyn Cancel,
-    flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    cancel: &'a CancelToken,
 }
 
 impl<'a> CancelSignal<'a> {
-    pub(crate) fn new(cancel: &'a dyn Cancel) -> Self {
-        Self {
-            cancel,
-            flag: cancel_watch_arc(cancel),
-        }
+    pub fn new(cancel: &'a CancelToken) -> Self {
+        Self { cancel }
     }
 
     /// A signal that never fires, for callers that cannot be interrupted.
     pub(crate) fn never() -> CancelSignal<'static> {
-        CancelSignal::new(&NeverCancel)
+        static NEVER: std::sync::LazyLock<CancelToken> = std::sync::LazyLock::new(CancelToken::new);
+        CancelSignal::new(&NEVER)
     }
 
     /// Returns [`crate::error::Error::Cancelled`] once the signal fired.
     #[inline]
     pub(crate) fn poll(&self) -> crate::error::Result<()> {
-        if self.cancel.is_cancelled() {
-            self.flag.store(true, std::sync::atomic::Ordering::Relaxed);
-        }
-        poll_watch(&self.flag)
+        self.cancel
+            .poll()
+            .map_err(|_| crate::error::Error::Cancelled)
     }
 
     /// The flag worker threads check; set once [`Self::poll`] observed a cancel.
     pub(crate) fn flag(&self) -> &std::sync::atomic::AtomicBool {
-        &self.flag
+        self.cancel.as_atomic()
     }
 
     /// Shared flag for long walks on other threads or modules.
     pub(crate) fn watch_arc(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
-        std::sync::Arc::clone(&self.flag)
-    }
-}
-
-/// [`ProgressSink`] adapter that mirrors [`ProgressSink::should_cancel`] into `watch`.
-pub struct WatchProgress<'a> {
-    inner: &'a mut dyn ProgressSink,
-    watch: std::sync::Arc<std::sync::atomic::AtomicBool>,
-}
-
-impl<'a> WatchProgress<'a> {
-    /// Wrap `inner` so any cancel request on the sink sets `watch`.
-    #[must_use]
-    pub fn new(
-        inner: &'a mut dyn ProgressSink,
-        watch: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    ) -> Self {
-        Self { inner, watch }
-    }
-
-    fn note_cancel(&self) {
-        if self.inner.should_cancel() {
-            self.watch.store(true, std::sync::atomic::Ordering::Relaxed);
-        }
-    }
-}
-
-impl ProgressSink for WatchProgress<'_> {
-    fn start(&mut self, phase: ProgressPhase, total: Option<u64>) {
-        self.note_cancel();
-        self.inner.start(phase, total);
-    }
-    fn start_with_unit(&mut self, phase: ProgressPhase, unit: ProgressUnit, total: Option<u64>) {
-        self.note_cancel();
-        self.inner.start_with_unit(phase, unit, total);
-    }
-    fn inc(&mut self, units: u64) {
-        self.note_cancel();
-        self.inner.inc(units);
-    }
-    fn set(&mut self, current: u64) {
-        self.note_cancel();
-        self.inner.set(current);
-    }
-    fn finish(&mut self) {
-        self.note_cancel();
-        self.inner.finish();
-    }
-    fn should_cancel(&self) -> bool {
-        self.inner.should_cancel()
+        self.cancel.watch_arc()
     }
 }
 
 /// The progress sink, cancel signal and shared watch flag one operation threads through its
 /// helpers, so worker threads and the calling thread stop on the same signal.
 pub(crate) struct ProgressScope<'a> {
-    sink: WatchProgress<'a>,
-    cancel: &'a dyn Cancel,
+    sink: &'a mut dyn ProgressSink,
+    cancel: &'a CancelToken,
     watch: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl<'a> ProgressScope<'a> {
-    pub(crate) fn new(sink: &'a mut dyn ProgressSink, cancel: &'a dyn Cancel) -> Self {
-        let watch = cancel_watch_arc(cancel);
+    pub fn new(sink: &'a mut dyn ProgressSink, cancel: &'a CancelToken) -> Self {
+        let watch = cancel.watch_arc();
         Self {
-            sink: WatchProgress::new(sink, std::sync::Arc::clone(&watch)),
+            sink,
             cancel,
             watch,
         }
     }
 
-    /// Returns [`crate::error::Error::Cancelled`] once either signal fired.
+    /// Returns [`crate::error::Error::Cancelled`] once the cancel signal fired.
     pub(crate) fn poll(&mut self) -> crate::error::Result<()> {
-        poll_cancel_watch(&mut self.sink, self.cancel, &self.watch)
+        poll_cancel_watch(self.cancel, &self.watch)
     }
 
     /// Flag for worker threads; set once [`Self::poll`] observed a cancel.
@@ -475,7 +600,7 @@ impl<'a> ProgressScope<'a> {
     }
 
     pub(crate) fn sink(&mut self) -> &mut dyn ProgressSink {
-        &mut self.sink
+        self.sink
     }
 }
 
@@ -486,7 +611,7 @@ pub(crate) struct UncancellableProgress<'a> {
 }
 
 impl<'a> UncancellableProgress<'a> {
-    pub(crate) fn new(inner: &'a mut dyn ProgressSink) -> Self {
+    pub fn new(inner: &'a mut dyn ProgressSink) -> Self {
         Self { inner }
     }
 }
@@ -509,32 +634,27 @@ impl ProgressSink for UncancellableProgress<'_> {
     }
 }
 
-/// Returns [`crate::error::Error::Cancelled`] when `cancel` or `progress` request stop.
+/// Returns [`crate::error::Error::Cancelled`] when `cancel` requests stop.
 #[inline]
 pub fn poll_cancel(
-    progress: &mut dyn ProgressSink,
-    cancel: &dyn Cancel,
+    _progress: &mut dyn ProgressSink,
+    cancel: &CancelToken,
 ) -> crate::error::Result<()> {
-    if cancel.is_cancelled() || progress.should_cancel() {
-        Err(crate::error::Error::Cancelled)
-    } else {
-        Ok(())
-    }
+    cancel.poll().map_err(|_| crate::error::Error::Cancelled)
 }
 
-/// [`ProgressSink`] that stops forwarding once [`Cancel`] or [`ProgressSink::should_cancel`] fires.
+/// [`ProgressSink`] that stops forwarding once the [`CancelToken`] fires.
 ///
 /// Long checkout loops call [`Self::finish_poll`] after apply so callers get [`crate::error::Error::Cancelled`]
 /// even when cancellation happened on an [`ProgressSink::inc`] boundary.
-pub struct CancelProgress<'a> {
+pub(crate) struct CancelProgress<'a> {
     inner: &'a mut dyn ProgressSink,
-    cancel: &'a dyn Cancel,
+    cancel: &'a CancelToken,
     stopped: std::cell::Cell<bool>,
 }
 
 impl<'a> CancelProgress<'a> {
-    /// Wrap `inner` so every progress update observes `cancel`.
-    pub fn new(inner: &'a mut dyn ProgressSink, cancel: &'a dyn Cancel) -> Self {
+    pub fn new(inner: &'a mut dyn ProgressSink, cancel: &'a CancelToken) -> Self {
         Self {
             inner,
             cancel,
@@ -542,13 +662,13 @@ impl<'a> CancelProgress<'a> {
         }
     }
 
-    /// Whether a cancel signal was observed.
     #[must_use]
+    #[allow(dead_code)]
     pub fn stopped(&self) -> bool {
         self.stopped.get()
     }
 
-    /// Returns [`crate::error::Error::Cancelled`] when [`Self::stopped`].
+    #[allow(dead_code)]
     pub fn finish_poll(&self) -> crate::error::Result<()> {
         if self.stopped() {
             Err(crate::error::Error::Cancelled)
@@ -558,7 +678,7 @@ impl<'a> CancelProgress<'a> {
     }
 
     fn note_stop(&self) {
-        if self.cancel.is_cancelled() || self.inner.should_cancel() {
+        if self.cancel.is_cancelled() {
             self.stopped.set(true);
         }
     }
@@ -598,10 +718,6 @@ impl ProgressSink for CancelProgress<'_> {
         if !self.stopped.get() {
             self.inner.finish();
         }
-    }
-
-    fn should_cancel(&self) -> bool {
-        self.stopped.get() || self.cancel.is_cancelled() || self.inner.should_cancel()
     }
 }
 
@@ -683,17 +799,58 @@ mod tests {
     }
 
     #[test]
-    fn never_cancel_never_cancels() {
-        assert!(!NeverCancel.is_cancelled());
+    fn poll_cancel_returns_typed_error() {
+        let token = CancelToken::new();
+        token.cancel();
+        let mut sink = NullProgress;
+        let err = poll_cancel(&mut sink, &token).expect_err("cancelled");
+        assert!(matches!(err, crate::error::Error::Cancelled));
     }
 
     #[test]
-    fn poll_cancel_returns_typed_error() {
-        let flag = FlagCancel::new();
-        flag.cancel();
-        let mut sink = NullProgress;
-        let err = poll_cancel(&mut sink, &flag).expect_err("cancelled");
-        assert!(matches!(err, crate::error::Error::Cancelled));
+    fn cancel_token_never_starts_cancelled() {
+        assert!(!CancelToken::never().is_cancelled());
+        assert!(!CancelToken::default().is_cancelled());
+    }
+
+    #[test]
+    fn cancel_token_clone_shares_flag() {
+        let token = CancelToken::new();
+        let clone = token.clone();
+        token.cancel();
+        assert!(clone.is_cancelled());
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn cancel_token_after_polls() {
+        let token = CancelToken::after_polls(3);
+        assert!(token.poll().is_ok());
+        assert!(token.poll().is_ok());
+        assert!(token.poll().is_err());
+        assert!(token.is_cancelled());
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn every_cancellation_check_path_is_counted_once() {
+        let (token, checks) = CancelToken::with_check_counter();
+        assert!(!token.is_cancelled());
+        assert_eq!(checks.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert!(token.poll().is_ok());
+        assert_eq!(checks.load(std::sync::atomic::Ordering::Relaxed), 2);
+        token.poll_before_wait();
+        assert_eq!(checks.load(std::sync::atomic::Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn cancel_token_cross_thread() {
+        let token = CancelToken::new();
+        let peer = token.clone();
+        std::thread::spawn(move || peer.cancel())
+            .join()
+            .expect("join");
+        assert!(token.is_cancelled());
     }
 
     #[test]

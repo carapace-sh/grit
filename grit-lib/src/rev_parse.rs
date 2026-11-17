@@ -5,7 +5,9 @@
 //! object-name resolution, and lightweight peeling (`^{}`, `^{object}`,
 //! `^{commit}`).
 
-use crate::environment::RepositoryOptions;
+use crate::error::ObjectError;
+use crate::error::RefError;
+use crate::error::RevisionError;
 use crate::git_path::CanonicalizeExt;
 
 use std::borrow::Cow;
@@ -21,67 +23,24 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::ops::ControlFlow;
 use std::sync::Arc;
 
-use crate::check_ref_format::{check_refname_format, RefNameOptions};
+use crate::check_ref_format::{check_refname_format, RefFormatOptions};
 use crate::config::ConfigSet;
-use crate::error::{Error, NotARepositoryReason, Result};
+use crate::error::{Error, Result};
 use crate::objects::{parse_commit, parse_tag, parse_tree, CommitRef, ObjectId, ObjectKind};
 use crate::reflog::ReflogEntry;
 use crate::refs;
-use crate::refs::store::RawRef;
+use crate::refs::store::{RawRef, RefNameRef};
 use crate::repo::Repository;
 use crate::rev_parse_error::{AmbiguousObjectHint, RevParseError};
-
-/// Return `Some(repo)` when a repository can be discovered at `start`.
-///
-/// # Parameters
-///
-/// - `start` - starting path for discovery; when `None`, uses current directory.
-///
-/// # Errors
-///
-/// Returns errors other than "not a repository" (for example I/O and path
-/// canonicalization failures). [`Error::NotARepository`] is returned too when discovery
-/// stopped at a malformed gitfile ([`NotARepositoryReason::GitfileNotRegularFile`] or
-/// [`NotARepositoryReason::GitfileMissingGitdir`]) or when `start` itself holds a `.git`
-/// file or symlink.
-pub fn discover_optional(start: Option<&Path>) -> Result<Option<Repository>> {
-    let err = match Repository::discover(start, &RepositoryOptions::empty()) {
-        Ok(repo) => return Ok(Some(repo)),
-        Err(err) => err,
-    };
-    // A missing repository is an expected outcome, but a malformed `.git` entry found during
-    // discovery, or any `.git` file or symlink at `start`, is reported.
-    let Error::NotARepository(reason) = &err else {
-        return Err(err);
-    };
-    let malformed_gitfile = matches!(
-        reason,
-        NotARepositoryReason::GitfileNotRegularFile { .. }
-            | NotARepositoryReason::GitfileMissingGitdir { .. }
-    );
-    let dot_git_at_start = start.is_some_and(|start| {
-        let dot_git = start.join(".git");
-        dot_git.is_file() || dot_git.is_symlink()
-    });
-    if malformed_gitfile || dot_git_at_start {
-        return Err(err);
-    }
-    Ok(None)
-}
+use crate::revwalk::{IndexDwim, Peel, ResolveOptions, ResolvePurpose};
 
 /// Compute whether `cwd` is inside the repository's work tree.
 #[must_use]
-pub fn is_inside_work_tree(repo: &Repository, cwd: &Path) -> bool {
+pub(crate) fn is_inside_work_tree(repo: &Repository, cwd: &Path) -> bool {
     let Some(work_tree) = &repo.work_tree() else {
         return false;
     };
     path_is_within(cwd, work_tree)
-}
-
-/// Compute whether `cwd` is inside the repository's git-dir.
-#[must_use]
-pub fn is_inside_git_dir(repo: &Repository, cwd: &Path) -> bool {
-    path_is_within(cwd, repo.git_dir())
 }
 
 /// Compute the `--show-prefix` output.
@@ -89,7 +48,7 @@ pub fn is_inside_git_dir(repo: &Repository, cwd: &Path) -> bool {
 /// Returns an empty string when `cwd` is at repository root or outside the work
 /// tree. Returned prefixes always use `/` separators and end with `/`.
 #[must_use]
-pub fn show_prefix(repo: &Repository, cwd: &Path) -> String {
+pub(crate) fn show_prefix(repo: &Repository, cwd: &Path) -> String {
     let Some(work_tree) = repo.work_tree() else {
         return String::new();
     };
@@ -113,28 +72,6 @@ pub fn show_prefix(repo: &Repository, cwd: &Path) -> String {
     out
 }
 
-/// Superproject work tree when `git_dir` lives under `.../<wt>/.git/modules/...` (nested submodule).
-///
-/// Used when the submodule's recorded path in the superproject index does not match the on-disk
-/// layout (e.g. `dir/sub` recorded but git dir is `.../modules/dir/modules/sub`), so
-/// `ls-files`-based superproject detection cannot find a gitlink.
-#[must_use]
-pub fn superproject_work_tree_from_nested_git_modules(git_dir: &Path) -> Option<PathBuf> {
-    let mut p = git_dir.to_path_buf();
-    while let Some(parent) = p.parent() {
-        if p.file_name().is_some_and(|n| n == "modules")
-            && parent.file_name().is_some_and(|n| n == ".git")
-        {
-            return parent.parent().map(PathBuf::from);
-        }
-        if parent == p {
-            break;
-        }
-        p = parent.to_path_buf();
-    }
-    None
-}
-
 /// Resolve a symbolic ref name to its full form.
 ///
 /// For `HEAD`, returns the symbolic target (e.g., `refs/heads/main`).
@@ -142,7 +79,7 @@ pub fn superproject_work_tree_from_nested_git_modules(git_dir: &Path) -> Option<
 /// For tag names, returns `refs/tags/<name>`.
 /// Returns `None` when the name cannot be resolved symbolically.
 #[must_use]
-pub fn symbolic_full_name(repo: &Repository, spec: &str) -> Option<String> {
+pub(crate) fn symbolic_full_name(repo: &Repository, spec: &str) -> Option<String> {
     // @{upstream} / @{push}: must error from rev-parse when invalid; do not fall through to DWIM.
     if upstream_suffix_info(spec).is_some() {
         return resolve_upstream_symbolic_name(repo, spec).ok();
@@ -195,7 +132,7 @@ fn remote_tracking_head_symbolic_target(repo: &Repository, name: &str) -> Option
     }
     let config = repo.ensure_config_arc_fast().ok()?;
     let url_key = format!("remote.{name}.url");
-    config.get(&url_key)?;
+    config.value(&url_key)?;
     let head_ref = format!("refs/remotes/{name}/HEAD");
     let target = refs::read_symbolic_ref_for_repository(repo, &head_ref).ok()??;
     Some(target)
@@ -208,23 +145,23 @@ fn remote_tracking_head_symbolic_target(repo: &Repository, name: &str) -> Option
 ///   to a branch name.
 /// - `Ok(None)` when `spec` is not an `@{-N}` token.
 /// - `Err(...)` when `spec` matches `@{-N}` syntax but cannot be resolved.
-pub fn expand_at_minus_to_branch_name(repo: &Repository, spec: &str) -> Result<Option<String>> {
+pub(crate) fn expand_at_minus_to_branch_name(
+    repo: &Repository,
+    spec: &str,
+) -> Result<Option<String>> {
     if !spec.starts_with("@{-") || !spec.ends_with('}') {
         return Ok(None);
     }
     let inner = &spec[3..spec.len() - 1];
-    let n: usize = inner
-        .parse()
-        .map_err(|_| Error::InvalidRef(format!("invalid N in @{{-N}} for '{spec}'")))?;
+    let n: usize = inner.parse().map_err(|_| {
+        Error::Ref(RefError::Invalid {
+            detail: format!("invalid N in @{{-N}} for '{spec}'"),
+        })
+    })?;
     if n < 1 {
         return Ok(None);
     }
     resolve_at_minus_to_branch(repo, n).map(Some)
-}
-
-/// Resolve `@{-N}` to the commit OID it points to.
-pub fn resolve_at_minus_to_oid(repo: &Repository, spec: &str) -> Result<Option<ObjectId>> {
-    try_resolve_at_minus(repo, spec)
 }
 
 /// Abbreviate a full ref name to its shortest unambiguous form.
@@ -264,9 +201,11 @@ pub fn upstream_suffix_info(spec: &str) -> Option<(&str, bool)> {
 }
 
 /// Resolve `@{upstream}` / `@{u}` / `@{push}` to the symbolic full ref name (for `rev-parse --symbolic-full-name`).
-pub fn resolve_upstream_symbolic_name(repo: &Repository, spec: &str) -> Result<String> {
+pub(crate) fn resolve_upstream_symbolic_name(repo: &Repository, spec: &str) -> Result<String> {
     let Some((base, is_push)) = upstream_suffix_info(spec) else {
-        return Err(Error::InvalidRef(format!("not an upstream spec: {spec}")));
+        return Err(Error::Ref(RefError::Invalid {
+            detail: format!("not an upstream spec: {spec}"),
+        }));
     };
     resolve_upstream_full_ref_name(repo, base, is_push)
 }
@@ -277,7 +216,7 @@ fn resolve_upstream_full_ref_name(repo: &Repository, base: &str, is_push: bool) 
     }
     let (branch_key, display_branch) = resolve_upstream_branch_context(repo, base)?;
     let config_path = repo.common_git_dir().join("config");
-    let _ = repo.config()?;
+    let _ = repo.config().snapshot()?;
     let config_content = repo.caches().local_config_text(&config_path)?;
     let Some((remote, merge)) = parse_branch_tracking(&config_content, &branch_key) else {
         return Err(RevParseError::NoUpstream {
@@ -292,9 +231,11 @@ fn resolve_upstream_full_ref_name(repo: &Repository, base: &str, is_push: bool) 
         }
         return Ok(format!("refs/heads/{m}"));
     }
-    let merge_branch = merge
-        .strip_prefix("refs/heads/")
-        .ok_or_else(|| Error::InvalidRef(format!("invalid merge ref: {merge}")))?;
+    let merge_branch = merge.strip_prefix("refs/heads/").ok_or_else(|| {
+        Error::Ref(RefError::Invalid {
+            detail: format!("invalid merge ref: {merge}"),
+        })
+    })?;
     let tracking = format!("refs/remotes/{remote}/{merge_branch}");
     if repo.resolve_ref_oid(&tracking).is_err() {
         return Err(RevParseError::UpstreamNotTracked {
@@ -309,9 +250,12 @@ fn resolve_upstream_full_ref_name(repo: &Repository, base: &str, is_push: bool) 
 ///
 /// Honors `remote.pushRemote`, `branch.<name>.pushRemote`, `push.default`, and per-remote
 /// `push` refspecs (exact `refs/heads/<branch>:refs/heads/<dest>` mappings).
-pub fn resolve_push_full_ref_for_branch(repo: &Repository, branch_short: &str) -> Result<String> {
+pub(crate) fn resolve_push_full_ref_for_branch(
+    repo: &Repository,
+    branch_short: &str,
+) -> Result<String> {
     let config_path = repo.common_git_dir().join("config");
-    let _ = repo.config()?;
+    let _ = repo.config().snapshot()?;
     let config_content = repo.caches().local_config_text(&config_path)?;
 
     let upstream_tracking =
@@ -665,7 +609,7 @@ fn parse_branch_tracking(config: &str, branch: &str) -> Option<(String, String)>
 ///
 /// # Errors
 ///
-/// Returns [`Error::ObjectNotFound`] or [`Error::InvalidRef`] when resolution
+/// Returns [`crate::error::ObjectError::NotFound`] or [`crate::error::RefError::Invalid`] when resolution
 /// fails.
 /// Split `spec` at a `..` range operator, avoiding the three-dot symmetric-diff form.
 ///
@@ -674,7 +618,7 @@ fn parse_branch_tracking(config: &str, branch: &str) -> Option<(String, String)>
 /// Load commit parent overrides from `.git/info/grafts` (same format as Git).
 ///
 /// Used for `^N` / `^@` / `^!` / `^-` resolution and for `rev-list` traversal.
-pub fn load_graft_parents(git_dir: &Path) -> HashMap<ObjectId, Vec<ObjectId>> {
+pub(crate) fn load_graft_parents(git_dir: &Path) -> HashMap<ObjectId, Vec<ObjectId>> {
     let graft_path = crate::repo::common_git_dir_for_config(git_dir).join("info/grafts");
     let mut grafts = HashMap::new();
     let Ok(contents) = fs::read_to_string(&graft_path) else {
@@ -721,6 +665,7 @@ const NAV_LINKAGE_CACHE_LIMIT: usize = 1024;
 struct NavParentCache<'repo> {
     repo: &'repo Repository,
     grafts: HashMap<ObjectId, Vec<ObjectId>>,
+    shallow: std::collections::HashSet<ObjectId>,
     graph: Option<crate::commit_graph_file::CommitGraphChain>,
     share_linkage: std::cell::OnceCell<bool>,
 }
@@ -733,10 +678,12 @@ enum NavigationMetadata {
 impl<'repo> NavParentCache<'repo> {
     fn new(repo: &'repo Repository, metadata: NavigationMetadata) -> Self {
         let grafts = load_graft_parents(repo.git_dir());
+        let shallow = crate::shallow::load_shallow_boundaries(repo.git_dir());
         let graph = repo.odb().commit_graph_chain().map(|arc| (*arc).clone());
         Self {
             repo,
             grafts,
+            shallow,
             graph,
             share_linkage: match metadata {
                 NavigationMetadata::Discard => std::cell::OnceCell::from(false),
@@ -749,20 +696,23 @@ impl<'repo> NavParentCache<'repo> {
         if let Some(grafted) = self.grafts.get(&commit_oid) {
             return Ok(grafted.clone());
         }
-        if let Some(graph) = &self.graph {
-            if let Some((parents, _)) = graph.graph_commit(&commit_oid) {
-                return Ok(parents);
+        if self.repo.object_id_after_replace(&commit_oid) == commit_oid {
+            if let Some(graph) = &self.graph {
+                if let Some((mut parents, _)) = graph.graph_commit(&commit_oid) {
+                    if self.shallow.contains(&commit_oid) {
+                        parents.clear();
+                    }
+                    return Ok(parents);
+                }
             }
         }
-        // Reachability uses effective parents, whereas navigation reads the object's own
-        // parents. Share metadata only when shallow/promisor boundaries and rewrites cannot
-        // make those differ. This also avoids inflating a range endpoint's chain twice.
+        // Share metadata only when shallow/promisor boundaries and rewrites cannot make
+        // cached parents differ from what we parse here.
         let share_linkage = *self.share_linkage.get_or_init(|| {
             self.grafts.is_empty()
-                && crate::shallow::load_shallow_boundaries(self.repo.git_dir()).is_empty()
+                && self.shallow.is_empty()
                 && !crate::promisor::repo_treats_promisor_packs(
-                    self.repo.git_dir(),
-                    &self.repo.config().unwrap_or_default(),
+                    &self.repo.config().snapshot().unwrap_or_default(),
                 )
         }) && self.repo.object_id_after_replace(&commit_oid) == commit_oid;
         if share_linkage {
@@ -776,14 +726,20 @@ impl<'repo> NavParentCache<'repo> {
                 return Ok(parents.clone());
             }
         }
-        let object = self.repo.odb().read(&commit_oid)?;
-        if object.kind != ObjectKind::Commit {
-            return Err(Error::InvalidRef(format!(
-                "invalid ref: {commit_oid} is not a commit"
-            )));
+        let bytes = match self.repo.read_commit_bytes_with_replace(&commit_oid) {
+            Err(Error::Object(ObjectError::UnexpectedKind { .. })) => {
+                return Err(Error::Ref(RefError::Invalid {
+                    detail: format!("invalid ref: {commit_oid} is not a commit"),
+                }));
+            }
+            Err(other) => return Err(other),
+            Ok(bytes) => bytes,
+        };
+        let commit = crate::objects::CommitRef::parse(&bytes)?;
+        let mut parents = commit.parents().to_vec();
+        if self.shallow.contains(&commit_oid) {
+            parents.clear();
         }
-        let commit = crate::objects::CommitRef::parse(&object.data)?;
-        let parents = commit.parents().to_vec();
         if share_linkage {
             let mut cache = self
                 .repo
@@ -801,7 +757,7 @@ impl<'repo> NavParentCache<'repo> {
 }
 
 /// Parent OIDs of `commit_oid` for revision navigation, honoring grafts.
-pub fn commit_parents_for_navigation(
+pub(crate) fn commit_parents_for_navigation(
     repo: &Repository,
     commit_oid: ObjectId,
 ) -> Result<Vec<ObjectId>> {
@@ -815,7 +771,7 @@ enum ParentShorthandKind {
     /// `rev^!` — include `rev`, exclude all parents (merge-safe).
     Bang,
     /// `rev^-` / `rev^-N` — include `rev`, exclude parent N (1-based), include other parents.
-    Minus { exclude_parent: usize },
+    Minus,
 }
 
 /// Returns true when `spec` ends with Git parent shorthands `^@`, `^!`, or `^-` / `^-N`.
@@ -843,18 +799,13 @@ fn find_parent_shorthand(spec: &str) -> Option<(usize, ParentShorthandKind)> {
             continue;
         }
         if let Some(after) = tail.strip_prefix('-') {
-            let (exclude_parent, valid) = if after.is_empty() {
-                (1usize, true)
-            } else if after.bytes().all(|b| b.is_ascii_digit()) && !after.is_empty() {
-                let n: usize = after.parse().unwrap_or(0);
-                (n, n >= 1)
-            } else {
-                (0, false)
-            };
+            let valid = after.is_empty()
+                || (after.bytes().all(|b| b.is_ascii_digit())
+                    && after.parse::<usize>().is_ok_and(|n| n >= 1));
             if !valid {
                 continue;
             }
-            let cand = (idx, ParentShorthandKind::Minus { exclude_parent }, 2);
+            let cand = (idx, ParentShorthandKind::Minus, 2);
             best = Some(match best {
                 Some(b) if b.2 < 2 => b,
                 _ => cand,
@@ -862,108 +813,6 @@ fn find_parent_shorthand(spec: &str) -> Option<(usize, ParentShorthandKind)> {
         }
     }
     best.map(|(i, k, _)| (i, k))
-}
-
-/// Expand Git parent shorthands (`^@`, `^!`, `^-`, `^-N`) to the strings `git rev-parse` would print.
-///
-/// Returns [`None`] when `spec` does not use these suffixes at the end (or the suffix is invalid).
-///
-/// # Errors
-///
-/// Returns resolution errors when the base committish cannot be resolved or is not a commit.
-pub fn expand_parent_shorthand_rev_parse_lines(
-    repo: &Repository,
-    spec: &str,
-    symbolic: bool,
-    short_len: Option<usize>,
-) -> Result<Option<Vec<String>>> {
-    let Some((mark_idx, kind)) = find_parent_shorthand(spec) else {
-        return Ok(None);
-    };
-    let base_spec = &spec[..mark_idx];
-    let base_for_resolve = if base_spec.is_empty() {
-        "HEAD"
-    } else {
-        base_spec
-    };
-    // Git `--symbolic` prints parent specs using the same spelling as the user would type
-    // (e.g. `final^1^1`), not full ref names (`refs/heads/...`).
-    let symbolic_base = if base_spec.is_empty() {
-        "HEAD"
-    } else {
-        base_spec
-    };
-    let tip_oid = resolve_revision_for_range_end(repo, base_for_resolve)?;
-    let commit_oid = peel_to_commit_for_merge_base(repo, tip_oid)?;
-    let parents = commit_parents_for_navigation(repo, commit_oid)?;
-
-    let mut out = Vec::new();
-    match kind {
-        ParentShorthandKind::At => {
-            if parents.is_empty() {
-                return Ok(Some(out));
-            }
-            for (i, p) in parents.iter().enumerate() {
-                let parent_n = i + 1;
-                if symbolic {
-                    out.push(format!("{symbolic_base}^{parent_n}"));
-                } else if let Some(len) = short_len {
-                    out.push(abbreviate_object_id(repo, *p, len)?);
-                } else {
-                    out.push(p.to_string());
-                }
-            }
-        }
-        ParentShorthandKind::Bang => {
-            if parents.is_empty() {
-                if symbolic {
-                    out.push(symbolic_base.to_string());
-                } else if let Some(len) = short_len {
-                    out.push(abbreviate_object_id(repo, commit_oid, len)?);
-                } else {
-                    out.push(commit_oid.to_string());
-                }
-                return Ok(Some(out));
-            }
-            if symbolic {
-                out.push(symbolic_base.to_string());
-                for (i, _) in parents.iter().enumerate() {
-                    let parent_n = i + 1;
-                    out.push(format!("^{symbolic_base}^{parent_n}"));
-                }
-            } else if let Some(len) = short_len {
-                out.push(abbreviate_object_id(repo, commit_oid, len)?);
-                for p in &parents {
-                    out.push(format!("^{}", abbreviate_object_id(repo, *p, len)?));
-                }
-            } else {
-                out.push(commit_oid.to_string());
-                for p in &parents {
-                    out.push(format!("^{p}"));
-                }
-            }
-        }
-        ParentShorthandKind::Minus { exclude_parent } => {
-            if exclude_parent > parents.len() {
-                return Ok(None);
-            }
-            let excluded_parent = parents[exclude_parent - 1];
-            if symbolic {
-                out.push(symbolic_base.to_string());
-                out.push(format!("^{symbolic_base}^{exclude_parent}"));
-            } else if let Some(len) = short_len {
-                out.push(abbreviate_object_id(repo, commit_oid, len)?);
-                out.push(format!(
-                    "^{}",
-                    abbreviate_object_id(repo, excluded_parent, len)?
-                ));
-            } else {
-                out.push(commit_oid.to_string());
-                out.push(format!("^{excluded_parent}"));
-            }
-        }
-    }
-    Ok(Some(out))
 }
 
 /// Split a revision range at `..` (double-dot), excluding `...` triple-dot ranges.
@@ -1084,70 +933,30 @@ pub(crate) fn split_top_level_triple_dot_range(spec: &str) -> Option<(&str, &str
 
 /// Like [`resolve_revision`], but does not treat a bare filename as an index path
 /// (matches `git rev-parse` / plumbing, where `file.txt` stays ambiguous).
-pub fn resolve_revision_without_index_dwim(repo: &Repository, spec: &str) -> Result<ObjectId> {
+pub(crate) fn resolve_revision_without_index_dwim(
+    repo: &Repository,
+    spec: &str,
+) -> Result<ObjectId> {
     resolve_revision_impl(repo, spec, false, false, true, false, false, false, false)
 }
 
 /// Resolve a revision string to an object ID.
-pub fn resolve_revision(repo: &Repository, spec: &str) -> Result<ObjectId> {
+pub(crate) fn resolve_revision(repo: &Repository, spec: &str) -> Result<ObjectId> {
     resolve_revision_impl(repo, spec, true, false, true, false, false, false, true)
-}
-
-/// Like [`resolve_revision`], but can disable remote-tracking DWIM used by `git checkout`
-/// when `--no-guess` / `checkout.guess=false` (t2024).
-pub fn resolve_revision_for_checkout_guess(
-    repo: &Repository,
-    spec: &str,
-    remote_branch_guess: bool,
-) -> Result<ObjectId> {
-    resolve_revision_impl(
-        repo,
-        spec,
-        true,
-        false,
-        true,
-        false,
-        false,
-        false,
-        remote_branch_guess,
-    )
 }
 
 /// Resolve `spec` when it appears as the end of a revision range (`A..B`, `A...B`, etc.):
 /// abbreviated hex and `core.disambiguate` prefer a commit (porcelain range parsing).
-pub fn resolve_revision_for_range_end(repo: &Repository, spec: &str) -> Result<ObjectId> {
+pub(crate) fn resolve_revision_for_range_end(repo: &Repository, spec: &str) -> Result<ObjectId> {
     resolve_revision_impl(repo, spec, true, true, true, false, false, false, true)
-}
-
-/// Like [`resolve_revision_for_range_end`], but does not resolve a bare filename as an index path.
-///
-/// Matches plumbing-style revision parsing (`git rev-parse` without index DWIM). Used when a
-/// token must not be confused with a tracked path that happens to match a branch name (e.g.
-/// `git reset --hard` after `submodule update` when the submodule has a branch `sub1` and the
-/// superproject index lists path `sub1`).
-pub fn resolve_revision_for_range_end_without_index_dwim(
-    repo: &Repository,
-    spec: &str,
-) -> Result<ObjectId> {
-    resolve_revision_impl(repo, spec, false, true, true, false, false, false, true)
 }
 
 /// Resolve a single revision for `git rev-parse --verify` (no index path DWIM).
 ///
 /// Git's `--verify` mode must reject tokens that only match an index entry when the path is
 /// missing from the work tree (`t7102-reset` disambiguation).
-pub fn resolve_revision_for_verify(repo: &Repository, spec: &str) -> Result<ObjectId> {
+pub(crate) fn resolve_revision_for_verify(repo: &Repository, spec: &str) -> Result<ObjectId> {
     resolve_revision_impl(repo, spec, false, true, true, false, false, false, true)
-}
-
-/// First argument to `commit-tree`: ambiguous short hex uses tree-ish rules (blob vs tree).
-pub fn resolve_revision_for_commit_tree_tree(repo: &Repository, spec: &str) -> Result<ObjectId> {
-    resolve_revision_impl(repo, spec, true, false, true, false, true, false, true)
-}
-
-/// Old blob OID from a patch `index <old>..<new>` line (`git apply --build-fake-ancestor`).
-pub fn resolve_revision_for_patch_old_blob(repo: &Repository, spec: &str) -> Result<ObjectId> {
-    resolve_revision_impl(repo, spec, true, false, true, false, false, true, true)
 }
 
 /// When `spec` uses two-dot range syntax (`A..B`, `..B`, `A..`), returns the commits to
@@ -1159,7 +968,7 @@ pub fn resolve_revision_for_patch_old_blob(repo: &Repository, spec: &str) -> Res
 /// # Errors
 ///
 /// Propagates resolution errors from either range endpoint.
-pub fn try_parse_double_dot_log_range(
+pub(crate) fn try_parse_double_dot_log_range(
     repo: &Repository,
     spec: &str,
 ) -> Result<Option<(ObjectId, ObjectId)>> {
@@ -1181,28 +990,6 @@ pub fn try_parse_double_dot_log_range(
     Ok(Some((left_c, right_c)))
 }
 
-fn try_parse_double_dot_log_range_without_index_dwim(
-    repo: &Repository,
-    spec: &str,
-) -> Result<Option<(ObjectId, ObjectId)>> {
-    let Some((left, right)) = split_double_dot_range(spec) else {
-        return Ok(None);
-    };
-    let left_tip = if left.is_empty() {
-        resolve_revision_for_range_end_without_index_dwim(repo, "HEAD")?
-    } else {
-        resolve_revision_for_range_end_without_index_dwim(repo, left)?
-    };
-    let right_tip = if right.is_empty() {
-        resolve_revision_for_range_end_without_index_dwim(repo, "HEAD")?
-    } else {
-        resolve_revision_for_range_end_without_index_dwim(repo, right)?
-    };
-    let left_c = peel_to_commit_for_merge_base(repo, left_tip)?;
-    let right_c = peel_to_commit_for_merge_base(repo, right_tip)?;
-    Ok(Some((left_c, right_c)))
-}
-
 /// Resolve `spec` to a commit OID for porcelain history commands (`log`, `reset`, etc.).
 ///
 /// Handles `A..B` / `..B` / `A..` (tip is the right side, defaulting to `HEAD`) and
@@ -1218,66 +1005,103 @@ pub fn revision_spec_contains_ancestry_navigation(spec: &str) -> bool {
     !steps.is_empty()
 }
 
-/// `resolve_revision_as_commit` function.
-pub fn resolve_revision_as_commit(repo: &Repository, spec: &str) -> Result<ObjectId> {
-    if let Some((left, right)) = split_triple_dot_range(spec) {
-        let left_tip = if left.is_empty() {
-            resolve_revision_for_range_end(repo, "HEAD")?
-        } else {
-            resolve_revision_for_range_end(repo, left)?
-        };
-        let right_tip = if right.is_empty() {
-            resolve_revision_for_range_end(repo, "HEAD")?
-        } else {
-            resolve_revision_for_range_end(repo, right)?
-        };
-        let left_c = peel_to_commit_for_merge_base(repo, left_tip)?;
-        let right_c = peel_to_commit_for_merge_base(repo, right_tip)?;
-        let bases = crate::merge_base::merge_bases_first_vs_rest(repo, left_c, &[right_c])?;
-        return bases
-            .into_iter()
-            .next()
-            .ok_or_else(|| Error::ObjectNotFound(format!("no merge base for '{spec}'")));
-    }
-    if let Some((_excl, tip)) = try_parse_double_dot_log_range(repo, spec)? {
-        return Ok(tip);
-    }
-    let oid = resolve_revision_for_range_end(repo, spec)?;
-    peel_to_commit_for_merge_base(repo, oid)
+/// Resolve `spec` to a commit for porcelain history commands (`log`, `reset`, etc.).
+///
+/// Handles `A..B` / `..B` / `A..` (the tip is the right side, defaulting to `HEAD`) and
+/// `A...B` symmetric diff (the merge base). Other specs are resolved and peeled to a commit
+/// (tags peeled, abbreviated hex disambiguated as commit-ish).
+pub(crate) fn resolve_revision_as_commit(repo: &Repository, spec: &str) -> Result<ObjectId> {
+    resolve_commit_ish(repo, spec, true, true)
 }
 
-/// Like [`resolve_revision_as_commit`], but never treats a bare path as an index revision.
-///
-/// Use when distinguishing the first `git reset` argument from pathspecs: a submodule work tree
-/// may have a branch whose name equals a path recorded in the **superproject** index (t3426).
-pub fn resolve_revision_as_commit_without_index_dwim(
+fn resolve_commit_ish(
     repo: &Repository,
     spec: &str,
+    index_dwim: bool,
+    remote_branch_name_guess: bool,
 ) -> Result<ObjectId> {
+    let endpoint = |side: &str| {
+        let side = if side.is_empty() { "HEAD" } else { side };
+        let oid = resolve_revision_impl(
+            repo,
+            side,
+            index_dwim,
+            true,
+            true,
+            false,
+            false,
+            false,
+            remote_branch_name_guess,
+        )?;
+        peel_to_commit_for_merge_base(repo, oid)
+    };
     if let Some((left, right)) = split_triple_dot_range(spec) {
-        let left_tip = if left.is_empty() {
-            resolve_revision_for_range_end_without_index_dwim(repo, "HEAD")?
-        } else {
-            resolve_revision_for_range_end_without_index_dwim(repo, left)?
-        };
-        let right_tip = if right.is_empty() {
-            resolve_revision_for_range_end_without_index_dwim(repo, "HEAD")?
-        } else {
-            resolve_revision_for_range_end_without_index_dwim(repo, right)?
-        };
-        let left_c = peel_to_commit_for_merge_base(repo, left_tip)?;
-        let right_c = peel_to_commit_for_merge_base(repo, right_tip)?;
+        let left_c = endpoint(left)?;
+        let right_c = endpoint(right)?;
         let bases = crate::merge_base::merge_bases_first_vs_rest(repo, left_c, &[right_c])?;
-        return bases
-            .into_iter()
-            .next()
-            .ok_or_else(|| Error::ObjectNotFound(format!("no merge base for '{spec}'")));
+        return bases.into_iter().next().ok_or_else(|| {
+            Error::Object(ObjectError::NotFound {
+                name: format!("no merge base for '{spec}'"),
+            })
+        });
     }
-    if let Some((_excl, tip)) = try_parse_double_dot_log_range_without_index_dwim(repo, spec)? {
-        return Ok(tip);
+    if let Some((left, right)) = split_double_dot_range(spec) {
+        endpoint(left)?;
+        return endpoint(right);
     }
-    let oid = resolve_revision_for_range_end_without_index_dwim(repo, spec)?;
-    peel_to_commit_for_merge_base(repo, oid)
+    endpoint(spec)
+}
+
+/// [`RevWalk::resolve`](crate::revwalk::RevWalk::resolve): resolve `spec` as `options` say.
+pub(crate) fn resolve_revision_with_options(
+    repo: &Repository,
+    spec: &str,
+    options: &ResolveOptions,
+) -> Result<ObjectId> {
+    let index_dwim = options.index_dwim == IndexDwim::On;
+    let remote_guess = options.purpose != ResolvePurpose::CheckoutNoGuess;
+    match options.peel {
+        Peel::Commit => resolve_commit_ish(repo, spec, index_dwim, remote_guess),
+        Peel::Tree => {
+            let oid = resolve_revision_impl(
+                repo,
+                spec,
+                index_dwim,
+                false,
+                true,
+                false,
+                true,
+                false,
+                remote_guess,
+            )?;
+            peel_to_tree(repo, oid)
+        }
+        Peel::Blob => {
+            let oid = resolve_revision_impl(
+                repo,
+                spec,
+                index_dwim,
+                false,
+                true,
+                false,
+                false,
+                true,
+                remote_guess,
+            )?;
+            peel_to_blob(repo, oid)
+        }
+        Peel::Any => resolve_revision_impl(
+            repo,
+            spec,
+            index_dwim,
+            options.purpose == ResolvePurpose::RangeEnd,
+            true,
+            false,
+            false,
+            false,
+            remote_guess,
+        ),
+    }
 }
 
 fn resolve_ref_dwim_for_rev_parse(repo: &Repository, spec: &str) -> (usize, Option<ObjectId>) {
@@ -1292,11 +1116,14 @@ fn resolve_ref_dwim_for_rev_parse(repo: &Repository, spec: &str) -> (usize, Opti
 
     let mut count = 0usize;
     let mut first = None;
-    let refname_opts = RefNameOptions::default();
+    let refname_opts = RefFormatOptions::default();
     for rule in RULES {
         let candidate = rule.replace("{0}", spec);
         // One raw read decides missing and direct candidates; only symrefs need resolving.
-        let resolved = match repo.refs().read_raw(&candidate) {
+        let resolved = match repo
+            .ref_store()
+            .read_raw(RefNameRef::from_trusted(&candidate))
+        {
             Ok(None) => continue,
             Ok(Some(refs::store::RawRef::Direct(oid))) => Ok(oid),
             Ok(Some(refs::store::RawRef::Symbolic(target))) => {
@@ -1389,12 +1216,16 @@ fn resolve_revision_with_navigation(
     if let Some(pattern) = spec.strip_prefix(":/") {
         if pattern.is_empty() {
             // `:/` with an empty pattern resolves to the youngest reachable commit (HEAD tip).
-            let head = crate::state::resolve_head_for_repository(repo)
-                .map_err(|_| Error::ObjectNotFound(":/".to_owned()))?;
-            return head
-                .oid()
-                .copied()
-                .ok_or_else(|| Error::ObjectNotFound(":/".to_owned()));
+            let head = crate::state::resolve_head_for_repository(repo).map_err(|_| {
+                Error::Object(ObjectError::NotFound {
+                    name: ":/".to_owned(),
+                })
+            })?;
+            return head.oid().copied().ok_or_else(|| {
+                Error::Object(ObjectError::NotFound {
+                    name: ":/".to_owned(),
+                })
+            });
         }
         return resolve_commit_message_search(repo, pattern);
     }
@@ -1423,9 +1254,11 @@ fn resolve_revision_with_navigation(
             })
         })?;
         let line = raw.lines().next().unwrap_or("").trim();
-        return line
-            .parse::<ObjectId>()
-            .map_err(|_| Error::InvalidRef("AUTO_MERGE: invalid object id".to_owned()));
+        return line.parse::<ObjectId>().map_err(|_| {
+            Error::Ref(RefError::Invalid {
+                detail: "AUTO_MERGE: invalid object id".to_owned(),
+            })
+        });
     }
 
     // `refs/...` spelled in full (e.g. `refs/tags/other`): resolve as a ref before any
@@ -1498,10 +1331,11 @@ fn resolve_revision_with_navigation(
                 },
             )?;
             let bases = crate::merge_base::merge_bases_first_vs_rest(repo, left_oid, &[right_oid])?;
-            return bases
-                .into_iter()
-                .next()
-                .ok_or_else(|| Error::ObjectNotFound(format!("no merge base for '{spec}'")));
+            return bases.into_iter().next().ok_or_else(|| {
+                Error::Object(ObjectError::NotFound {
+                    name: format!("no merge base for '{spec}'"),
+                })
+            });
         }
     }
 
@@ -1523,13 +1357,15 @@ fn resolve_revision_with_navigation(
                 remote_branch_name_guess,
             ) {
                 Ok(o) => o,
-                Err(Error::ObjectNotFound(s)) if s == before => {
+                Err(Error::Object(ObjectError::NotFound { name: s })) if s == before => {
                     return Err(RevParseError::InvalidObjectName {
                         name: before.to_owned(),
                     }
                     .into());
                 }
-                Err(Error::RevParse(RevParseError::AmbiguousArgument { .. })) => {
+                Err(Error::Revision(RevisionError::Parse(RevParseError::AmbiguousArgument {
+                    ..
+                }))) => {
                     return Err(RevParseError::InvalidObjectName {
                         name: before.to_owned(),
                     }
@@ -1544,7 +1380,9 @@ fn resolve_revision_with_navigation(
             }
             let clean_path = match normalize_colon_path_for_tree(repo, after) {
                 Ok(p) => p,
-                Err(Error::InvalidRef(msg)) if msg == "outside repository" => {
+                Err(Error::Ref(RefError::Invalid { detail: msg }))
+                    if msg == "outside repository" =>
+                {
                     let wt = repo
                         .work_tree()
                         .and_then(|p| p.canonicalize_simplified().ok())
@@ -1582,7 +1420,7 @@ fn resolve_revision_with_navigation(
     let nav_cache = NavParentCache::new(repo, metadata);
     for step in nav_steps {
         oid = apply_nav_step(repo, &nav_cache, oid, step).map_err(|e| {
-            if matches!(e, Error::ObjectNotFound(_)) {
+            if matches!(e, Error::Object(ObjectError::NotFound { .. })) {
                 RevParseError::RevisionOutOfRange {
                     spec: spec.to_owned(),
                 }
@@ -1619,9 +1457,9 @@ fn normalize_path_components(path: PathBuf) -> PathBuf {
 fn normalize_colon_path_for_bare_tree(raw_path: &str) -> Result<String> {
     let cwd_relative = raw_path.starts_with("./") || raw_path.starts_with("../") || raw_path == ".";
     if cwd_relative {
-        return Err(Error::InvalidRef(
-            "relative path syntax can't be used outside working tree".to_owned(),
-        ));
+        return Err(Error::Ref(RefError::Invalid {
+            detail: "relative path syntax can't be used outside working tree".to_owned(),
+        }));
     }
     let s = raw_path.trim_start_matches('/');
     let mut stack: Vec<&str> = Vec::new();
@@ -1648,9 +1486,9 @@ fn normalize_colon_path_for_tree(repo: &Repository, raw_path: &str) -> Result<St
 
     let cwd_relative = raw_path.starts_with("./") || raw_path.starts_with("../") || raw_path == ".";
     if cwd_relative && !path_is_within(&cwd, work_tree) {
-        return Err(Error::InvalidRef(
-            "relative path syntax can't be used outside working tree".to_owned(),
-        ));
+        return Err(Error::Ref(RefError::Invalid {
+            detail: "relative path syntax can't be used outside working tree".to_owned(),
+        }));
     }
 
     // `./` / `../` / `.` are relative to cwd; other relative paths are relative to work tree.
@@ -1664,11 +1502,15 @@ fn normalize_colon_path_for_tree(repo: &Repository, raw_path: &str) -> Result<St
     let full = normalize_path_components(full);
 
     if !path_is_within(&full, &wt_canon) {
-        return Err(Error::InvalidRef("outside repository".to_owned()));
+        return Err(Error::Ref(RefError::Invalid {
+            detail: "outside repository".to_owned(),
+        }));
     }
-    let rel = full
-        .strip_prefix(&wt_canon)
-        .map_err(|_| Error::InvalidRef("outside repository".to_owned()))?;
+    let rel = full.strip_prefix(&wt_canon).map_err(|_| {
+        Error::Ref(RefError::Invalid {
+            detail: "outside repository".to_owned(),
+        })
+    })?;
     let s = rel.to_string_lossy().replace('\\', "/");
     Ok(s.trim_end_matches('/').to_owned())
 }
@@ -1693,9 +1535,12 @@ fn is_unreplaced_commit(repo: &Repository, oid: ObjectId) -> bool {
 }
 
 /// Peel tags to a commit OID for merge-base computation (`A...B` and `rev-parse` output).
-pub fn peel_to_commit_for_merge_base(repo: &Repository, oid: ObjectId) -> Result<ObjectId> {
-    peel_tags_to_commit(repo, oid)?
-        .map_err(|other| Error::InvalidRef(format!("object {other} does not name a commit")))
+pub(crate) fn peel_to_commit_for_merge_base(repo: &Repository, oid: ObjectId) -> Result<ObjectId> {
+    peel_tags_to_commit(repo, oid)?.map_err(|other| {
+        Error::Ref(RefError::Invalid {
+            detail: format!("object {other} does not name a commit"),
+        })
+    })
 }
 
 /// Peel tags starting at `oid` until a non-tag object.
@@ -1718,7 +1563,7 @@ pub(crate) fn peel_tags_to_commit(
 
 /// Like [`peel_to_commit_for_merge_base`], but returns `Ok(None)` when the peeled object is not a
 /// commit (e.g. a tag pointing at a blob). Used by upload-pack fetch negotiation.
-pub fn try_peel_to_commit_for_merge_base(
+pub(crate) fn try_peel_to_commit_for_merge_base(
     repo: &Repository,
     oid: ObjectId,
 ) -> Result<Option<ObjectId>> {
@@ -1730,7 +1575,9 @@ pub fn try_peel_to_commit_for_merge_base(
     match obj.kind {
         ObjectKind::Commit => Ok(Some(oid)),
         ObjectKind::Tree | ObjectKind::Blob => Ok(None),
-        ObjectKind::Tag => Err(Error::InvalidRef("unexpected tag after peel".to_owned())),
+        ObjectKind::Tag => Err(Error::Ref(RefError::Invalid {
+            detail: "unexpected tag after peel".to_owned(),
+        })),
     }
 }
 
@@ -1738,8 +1585,8 @@ pub fn try_peel_to_commit_for_merge_base(
 ///
 /// # Errors
 ///
-/// Returns [`Error::ObjectNotFound`] when the object cannot be peeled to a tree (e.g. a blob).
-pub fn peel_to_tree(repo: &Repository, oid: ObjectId) -> Result<ObjectId> {
+/// Returns [`crate::error::ObjectError::NotFound`] when the object cannot be peeled to a tree (e.g. a blob).
+pub(crate) fn peel_to_tree(repo: &Repository, oid: ObjectId) -> Result<ObjectId> {
     let obj = repo.read_replaced(&oid)?;
     match obj.kind {
         crate::objects::ObjectKind::Tree => Ok(oid),
@@ -1751,10 +1598,27 @@ pub fn peel_to_tree(repo: &Repository, oid: ObjectId) -> Result<ObjectId> {
             let tag = crate::objects::parse_tag(&obj.data)?;
             peel_to_tree(repo, tag.object)
         }
-        _ => Err(Error::ObjectNotFound(format!(
-            "cannot peel {} to tree",
-            oid
-        ))),
+        _ => Err(Error::Object(ObjectError::NotFound {
+            name: format!("cannot peel {} to tree", oid),
+        })),
+    }
+}
+
+/// Peel tags starting at `oid` to a blob.
+///
+/// # Errors
+///
+/// Returns [`ObjectError::NotFound`] when the tags lead to a commit or tree.
+pub(crate) fn peel_to_blob(repo: &Repository, oid: ObjectId) -> Result<ObjectId> {
+    let not_blob = |other: ObjectId| {
+        Error::Object(ObjectError::NotFound {
+            name: format!("cannot peel {other} to blob"),
+        })
+    };
+    match peel_tags_to_commit(repo, oid)? {
+        Ok(commit) => Err(not_blob(commit)),
+        Err(other) if repo.read_info_replaced(&other)?.kind == ObjectKind::Blob => Ok(other),
+        Err(other) => Err(not_blob(other)),
     }
 }
 
@@ -1792,9 +1656,9 @@ fn resolve_tree_path_rev_parse(
     let entries = crate::objects::parse_tree(&obj.data)?;
     let components: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
     if components.is_empty() {
-        return Err(Error::InvalidRef(format!(
-            "path '{path}' does not name an object in tree {tree_oid}"
-        ))
+        return Err(Error::Ref(RefError::Invalid {
+            detail: format!("path '{path}' does not name an object in tree {tree_oid}"),
+        })
         .into());
     }
 
@@ -1812,7 +1676,10 @@ fn resolve_tree_path_rev_parse(
                 return Ok(entry.oid);
             }
             if entry.mode != crate::index::MODE_TREE {
-                return Err(Error::ObjectNotFound(path.to_owned()).into());
+                return Err(Error::Object(ObjectError::NotFound {
+                    name: path.to_owned(),
+                })
+                .into());
             }
             return resolve_tree_path_rev_parse(repo, &entry.oid, &rest.join("/"));
         }
@@ -1837,20 +1704,28 @@ pub struct TreeishBlobAtPath {
 ///
 /// Fails when `spec` is not `treeish:path`, when the path is missing, or when the
 /// target is a tree or gitlink rather than a blob/symlink blob.
-pub fn resolve_treeish_blob_at_path(repo: &Repository, spec: &str) -> Result<TreeishBlobAtPath> {
-    let (before, after) = split_treeish_colon(spec)
-        .ok_or_else(|| Error::InvalidRef(format!("'{spec}' is not a treeish:path revision")))?;
+pub(crate) fn resolve_treeish_blob_at_path(
+    repo: &Repository,
+    spec: &str,
+) -> Result<TreeishBlobAtPath> {
+    let (before, after) = split_treeish_colon(spec).ok_or_else(|| {
+        Error::Ref(RefError::Invalid {
+            detail: format!("'{spec}' is not a treeish:path revision"),
+        })
+    })?;
 
     let rev_oid =
         match resolve_revision_impl(repo, before, true, false, true, true, false, false, true) {
             Ok(o) => o,
-            Err(Error::ObjectNotFound(s)) if s == before => {
+            Err(Error::Object(ObjectError::NotFound { name: s })) if s == before => {
                 return Err(RevParseError::InvalidObjectName {
                     name: before.to_owned(),
                 }
                 .into());
             }
-            Err(Error::RevParse(RevParseError::AmbiguousArgument { .. })) => {
+            Err(Error::Revision(RevisionError::Parse(RevParseError::AmbiguousArgument {
+                ..
+            }))) => {
                 return Err(RevParseError::InvalidObjectName {
                     name: before.to_owned(),
                 }
@@ -1872,7 +1747,7 @@ pub fn resolve_treeish_blob_at_path(repo: &Repository, spec: &str) -> Result<Tre
 
     let clean_path = match normalize_colon_path_for_tree(repo, after) {
         Ok(p) => p,
-        Err(Error::InvalidRef(msg)) if msg == "outside repository" => {
+        Err(Error::Ref(RefError::Invalid { detail: msg })) if msg == "outside repository" => {
             let wt = repo
                 .work_tree()
                 .and_then(|p| p.canonicalize_simplified().ok())
@@ -1908,9 +1783,9 @@ fn walk_tree_to_blob_entry(
     let entries = crate::objects::parse_tree(&obj.data)?;
     let components: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
     if components.is_empty() {
-        return Err(Error::InvalidRef(format!(
-            "path '{path}' does not name a blob in tree {tree_oid}"
-        ))
+        return Err(Error::Ref(RefError::Invalid {
+            detail: format!("path '{path}' does not name a blob in tree {tree_oid}"),
+        })
         .into());
     }
 
@@ -1921,12 +1796,18 @@ fn walk_tree_to_blob_entry(
         if name == first {
             if rest.is_empty() {
                 if entry.mode == crate::index::MODE_TREE {
-                    return Err(Error::InvalidRef(format!("'{path}' is a tree, not a blob")).into());
+                    return Err(Error::Ref(RefError::Invalid {
+                        detail: format!("'{path}' is a tree, not a blob"),
+                    })
+                    .into());
                 }
                 return Ok((entry.oid, entry.mode_str()));
             }
             if entry.mode != crate::index::MODE_TREE {
-                return Err(Error::ObjectNotFound(path.to_owned()).into());
+                return Err(Error::Object(ObjectError::NotFound {
+                    name: path.to_owned(),
+                })
+                .into());
             }
             return walk_tree_to_blob_entry(repo, &entry.oid, &rest.join("/"));
         }
@@ -2016,19 +1897,21 @@ fn apply_nav_step(
         NavStep::ParentN(n) => {
             let oid = peel_annotated_tag_chain(repo, oid)?;
             let parents = nav.parents_of(oid)?;
-            parents
-                .get(n - 1)
-                .copied()
-                .ok_or_else(|| Error::ObjectNotFound(format!("{oid}^{n}")))
+            parents.get(n - 1).copied().ok_or_else(|| {
+                Error::Object(ObjectError::NotFound {
+                    name: format!("{oid}^{n}"),
+                })
+            })
         }
         NavStep::AncestorN(n) => {
             let mut current = peel_annotated_tag_chain(repo, oid)?;
             for _ in 0..n {
                 let parents = nav.parents_of(current)?;
-                current = parents
-                    .first()
-                    .copied()
-                    .ok_or_else(|| Error::ObjectNotFound(format!("{current}~1")))?;
+                current = parents.first().copied().ok_or_else(|| {
+                    Error::Object(ObjectError::NotFound {
+                        name: format!("{current}~1"),
+                    })
+                })?;
             }
             Ok(current)
         }
@@ -2047,7 +1930,11 @@ fn apply_nav_step(
 /// # Errors
 ///
 /// Propagates object database lookup failures.
-pub fn abbreviate_object_id(repo: &Repository, oid: ObjectId, min_len: usize) -> Result<String> {
+pub(crate) fn abbreviate_object_id(
+    repo: &Repository,
+    oid: ObjectId,
+    min_len: usize,
+) -> Result<String> {
     abbreviate_object_id_with_prefix_cache(repo, oid, min_len, &mut HashMap::new())
 }
 
@@ -2071,11 +1958,11 @@ pub(crate) fn abbreviate_object_id_with_prefix_cache(
 
     crate::oid_abbrev::abbreviate_object_id_known(
         repo,
+        &crate::oid_abbrev::PackListing::load(repo)?,
         oid,
         min_len,
         prefix_ambiguous,
-        &mut [None; 256],
-        &mut None,
+        &mut crate::oid_abbrev::LooseFanouts::default(),
     )
 }
 
@@ -2121,7 +2008,7 @@ fn oid_satisfies_peel_filter(repo: &Repository, oid: ObjectId, peel_inner: &str)
 }
 
 /// Candidate objects when a short object id is ambiguous (type order, then hex).
-pub fn ambiguous_object_hint_lines(
+pub(crate) fn ambiguous_object_hint_lines(
     repo: &Repository,
     short_prefix: &str,
     peel_filter: Option<&str>,
@@ -2165,7 +2052,7 @@ fn read_core_disambiguate(repo: &Repository) -> Option<&'static str> {
     let config = repo
         .ensure_config_arc_fast()
         .unwrap_or_else(|_| Arc::new(ConfigSet::new()));
-    let v = config.get("core.disambiguate")?;
+    let v = config.value("core.disambiguate")?;
     match v.to_ascii_lowercase().as_str() {
         "committish" | "commit" => Some("commit"),
         "treeish" | "tree" => Some("tree"),
@@ -2376,7 +2263,9 @@ fn try_resolve_describe_name(repo: &Repository, spec: &str) -> Result<Option<Obj
     }
 
     match commit_candidates.len() {
-        0 => Err(Error::ObjectNotFound(spec.to_owned())),
+        0 => Err(Error::Object(ObjectError::NotFound {
+            name: spec.to_owned(),
+        })),
         1 => Ok(Some(commit_candidates[0])),
         _ => Err(RevParseError::AmbiguousShortObject {
             spec: hex_abbrev.to_owned(),
@@ -2414,11 +2303,15 @@ fn resolve_base(
 
     if spec == "HEAD" {
         return match crate::state::resolve_head_for_repository(repo) {
-            Ok(crate::state::HeadState::Branch { oid: None, .. }) => Err(Error::UnbornHead),
+            Ok(crate::state::HeadState::Branch { oid: None, .. }) => {
+                Err(Error::Ref(RefError::UnbornHead))
+            }
             Ok(crate::state::HeadState::Branch { oid: Some(oid), .. }) => Ok(oid),
             Ok(crate::state::HeadState::Detached { oid }) => Ok(oid),
             Ok(crate::state::HeadState::Invalid) | Err(_) => {
-                Err(Error::ObjectNotFound(spec.to_owned()))
+                Err(Error::Object(ObjectError::NotFound {
+                    name: spec.to_owned(),
+                }))
             }
         };
     }
@@ -2427,8 +2320,11 @@ fn resolve_base(
     // the first fetched OID even when every line is marked `not-for-merge`.
     if spec == "FETCH_HEAD" {
         let path = repo.git_dir().join("FETCH_HEAD");
-        let content = std::fs::read_to_string(&path)
-            .map_err(|_| Error::ObjectNotFound("FETCH_HEAD".to_owned()))?;
+        let content = std::fs::read_to_string(&path).map_err(|_| {
+            Error::Object(ObjectError::NotFound {
+                name: "FETCH_HEAD".to_owned(),
+            })
+        })?;
         let mut first_oid = None;
         for line in content.lines() {
             let line = line.trim();
@@ -2440,9 +2336,11 @@ fn resolve_base(
                 continue;
             };
             if ObjectId::is_full_hex(oid_hex) {
-                let oid = oid_hex
-                    .parse::<ObjectId>()
-                    .map_err(|_| Error::InvalidRef("invalid FETCH_HEAD object id".to_owned()))?;
+                let oid = oid_hex.parse::<ObjectId>().map_err(|_| {
+                    Error::Ref(RefError::Invalid {
+                        detail: "invalid FETCH_HEAD object id".to_owned(),
+                    })
+                })?;
                 first_oid.get_or_insert(oid);
                 let not_for_merge = parts.next().is_some_and(|v| v == "not-for-merge");
                 if !not_for_merge {
@@ -2450,7 +2348,11 @@ fn resolve_base(
                 }
             }
         }
-        return first_oid.ok_or_else(|| Error::ObjectNotFound("FETCH_HEAD".to_owned()));
+        return first_oid.ok_or_else(|| {
+            Error::Object(ObjectError::NotFound {
+                name: "FETCH_HEAD".to_owned(),
+            })
+        });
     }
 
     // `@{-N}` must run before reflog parsing so `@{-1}@{1}` is not misread as `@{-1}` + `@{1}`.
@@ -2487,9 +2389,11 @@ fn resolve_base(
     // Handle @{upstream} / @{u} / @{push} suffixes (including compounds like branch@{u}@{1})
     if upstream_suffix_info(spec).is_some() {
         let full_ref = resolve_upstream_symbolic_name(repo, spec)?;
-        return repo
-            .resolve_ref_oid(&full_ref)
-            .map_err(|_| Error::ObjectNotFound(spec.to_owned()));
+        return repo.resolve_ref_oid(&full_ref).map_err(|_| {
+            Error::Object(ObjectError::NotFound {
+                name: spec.to_owned(),
+            })
+        });
     }
 
     // Reflog selectors: `main@{1}`, `@{3}` (current branch), `other@{u}@{1}`, etc.
@@ -2516,7 +2420,9 @@ fn resolve_base(
                             let raw_path = &rest[2..];
                             let path = match normalize_colon_path_for_tree(repo, raw_path) {
                                 Ok(p) => p,
-                                Err(Error::InvalidRef(msg)) if msg == "outside repository" => {
+                                Err(Error::Ref(RefError::Invalid { detail: msg }))
+                                    if msg == "outside repository" =>
+                                {
                                     let wt = repo
                                         .work_tree()
                                         .and_then(|p| p.canonicalize_simplified().ok())
@@ -2539,7 +2445,9 @@ fn resolve_base(
             }
             let clean_rest = match normalize_colon_path_for_tree(repo, rest) {
                 Ok(p) => p,
-                Err(Error::InvalidRef(msg)) if msg == "outside repository" => {
+                Err(Error::Ref(RefError::Invalid { detail: msg }))
+                    if msg == "outside repository" =>
+                {
                     let wt = repo
                         .work_tree()
                         .and_then(|p| p.canonicalize_simplified().ok())
@@ -2613,7 +2521,9 @@ fn resolve_base(
             // matches, fail as unknown revision — do not fall through to index DWIM (which would
             // incorrectly report "ambiguous argument" for paths like `000000000`).
             if (4..repo.odb().hash_algo().hex_len()).contains(&spec.len()) {
-                return Err(Error::ObjectNotFound(spec.to_owned()));
+                return Err(Error::Object(ObjectError::NotFound {
+                    name: spec.to_owned(),
+                }));
             }
         } else if matches.len() == 1 {
             let oid = matches[0];
@@ -2763,9 +2673,11 @@ fn resolve_base(
                 return Ok(matches[0]);
             }
             if matches.len() > 1 {
-                return Err(Error::InvalidRef(format!(
-                    "ambiguous refname '{spec}': matches multiple remote-tracking branches"
-                )));
+                return Err(Error::Ref(RefError::Invalid {
+                    detail: format!(
+                        "ambiguous refname '{spec}': matches multiple remote-tracking branches"
+                    ),
+                }));
             }
         }
     }
@@ -2796,16 +2708,21 @@ fn resolve_base(
         }
         .into());
     }
-    Err(Error::ObjectNotFound(spec.to_owned()))
+    Err(Error::Object(ObjectError::NotFound {
+        name: spec.to_owned(),
+    }))
 }
 
 fn read_reflog_for_repo(repo: &Repository, refname: &str) -> Result<Vec<ReflogEntry>> {
     let mut entries = Vec::new();
-    repo.refs()
-        .for_each_reflog_entry(refname, false, &mut |entry| {
+    repo.ref_store().for_each_reflog_entry_str(
+        RefNameRef::from_trusted(refname),
+        false,
+        &mut |entry| {
             entries.push(entry.clone());
             ControlFlow::Continue(())
-        })?;
+        },
+    )?;
     Ok(entries)
 }
 
@@ -2824,9 +2741,9 @@ fn resolve_at_minus_to_branch(repo: &Repository, n: usize) -> Result<String> {
             }
         }
     }
-    Err(Error::InvalidRef(format!(
-        "@{{-{n}}}: only {count} checkout(s) in reflog"
-    )))
+    Err(Error::Ref(RefError::Invalid {
+        detail: format!("@{{-{n}}}: only {count} checkout(s) in reflog"),
+    }))
 }
 
 /// Try to resolve `@{-N}` syntax — the Nth previously checked out branch.
@@ -2868,17 +2785,19 @@ fn try_resolve_at_minus(repo: &Repository, spec: &str) -> Result<Option<ObjectId
                             return Ok(Some(oid));
                         }
                     }
-                    return Err(Error::InvalidRef(format!(
-                        "cannot resolve @{{-{n}}}: branch '{}' not found",
-                        from_branch
-                    )));
+                    return Err(Error::Ref(RefError::Invalid {
+                        detail: format!(
+                            "cannot resolve @{{-{n}}}: branch '{}' not found",
+                            from_branch
+                        ),
+                    }));
                 }
             }
         }
     }
-    Err(Error::InvalidRef(format!(
-        "@{{-{n}}}: only {count} checkout(s) in reflog"
-    )))
+    Err(Error::Ref(RefError::Invalid {
+        detail: format!("@{{-{n}}}: only {count} checkout(s) in reflog"),
+    }))
 }
 
 #[derive(Debug, Clone)]
@@ -3000,7 +2919,9 @@ fn resolve_reflog_oid(
     if refname == "HEAD" {
         if let ReflogSelector::Index(index) = index_or_date {
             if index >= entries.len() {
-                if let Ok(Some(RawRef::Symbolic(branch_ref))) = repo.refs().read_raw("HEAD") {
+                if let Ok(Some(RawRef::Symbolic(branch_ref))) =
+                    repo.ref_store().read_raw(RefNameRef::from_trusted("HEAD"))
+                {
                     if let Ok(branch_entries) = read_reflog_for_repo(repo, &branch_ref) {
                         if index < branch_entries.len() {
                             entries = branch_entries;
@@ -3021,7 +2942,11 @@ fn resolve_reflog_oid(
                     // fails. Only when the reflog exists but is empty does `ref@{0}` fall
                     // back to the ref's current value (the `nth == co_cnt` case in
                     // object-name.c).
-                    if !repo.refs().reflog_exists(refname).unwrap_or(false) {
+                    if !repo
+                        .ref_store()
+                        .reflog_exists(RefNameRef::from_trusted(refname))
+                        .unwrap_or(false)
+                    {
                         return Err(RevParseError::ReflogEmpty {
                             ref_display: display.clone(),
                         }
@@ -3094,99 +3019,15 @@ fn resolve_at_minus_token_to_branch(repo: &Repository, token: &str) -> Result<Op
         return Ok(None);
     }
     let inner = &token[3..token.len() - 1];
-    let n: usize = inner
-        .parse()
-        .map_err(|_| Error::InvalidRef(format!("invalid N in @{{-N}} for '{token}'")))?;
+    let n: usize = inner.parse().map_err(|_| {
+        Error::Ref(RefError::Invalid {
+            detail: format!("invalid N in @{{-N}} for '{token}'"),
+        })
+    })?;
     if n < 1 {
         return Ok(None);
     }
     Ok(Some(resolve_at_minus_to_branch(repo, n)?))
-}
-
-/// Ref whose reflog `git log -g` should walk for a revision like `other@{u}` or `main@{1}`.
-///
-/// Returns `None` when `spec` is not a reflog-chain form (no `@{` step after the prefix).
-pub fn reflog_walk_refname(repo: &Repository, spec: &str) -> Result<Option<String>> {
-    let now_sec = repo.wall_clock_epoch();
-    let Some((prefix, steps)) = split_reflog_at_chain(spec, now_sec)? else {
-        return Ok(None);
-    };
-
-    let prefix_resolved = if let Some(b) = resolve_at_minus_token_to_branch(repo, &prefix)? {
-        b
-    } else {
-        prefix.clone()
-    };
-
-    let mut current_spec = if prefix_resolved.is_empty() {
-        if let Ok(Some(b)) = refs::read_symbolic_ref_for_repository(repo, "HEAD") {
-            if let Some(short) = b.strip_prefix("refs/heads/") {
-                short.to_owned()
-            } else {
-                "HEAD".to_owned()
-            }
-        } else {
-            "HEAD".to_owned()
-        }
-    } else {
-        prefix_resolved
-    };
-
-    let last_reflog_peel = steps
-        .iter()
-        .rposition(|s| matches!(s, AtStep::Index(_) | AtStep::Date(_) | AtStep::Now));
-
-    let limit = last_reflog_peel.unwrap_or(steps.len());
-    for step in steps.iter().take(limit) {
-        match step {
-            AtStep::Upstream => {
-                let base = if current_spec == "@" {
-                    "HEAD"
-                } else {
-                    current_spec.as_str()
-                };
-                let full = resolve_upstream_symbolic_name(repo, &format!("{base}@{{u}}"))?;
-                current_spec = full;
-            }
-            AtStep::Push => {
-                let base = if current_spec == "@" {
-                    "HEAD"
-                } else {
-                    current_spec.as_str()
-                };
-                let full = resolve_upstream_symbolic_name(repo, &format!("{base}@{{push}}"))?;
-                current_spec = full;
-            }
-            AtStep::Now | AtStep::Index(_) | AtStep::Date(_) => {}
-        }
-    }
-
-    Ok(Some(dwim_refname(repo, current_spec.as_str())))
-}
-
-/// Resolve a user revision string to the reflog file ref name for `log -g` / `rev-list -g`.
-///
-/// Mirrors Git `add_reflog_for_walk` / `read_complete_reflog` ref resolution before reading
-/// `logs/<ref>`.
-pub fn resolve_reflog_walk_log_ref(repo: &Repository, r: &str) -> Result<String> {
-    if let Ok(Some(w)) = reflog_walk_refname(repo, r) {
-        return Ok(w);
-    }
-    if r == "HEAD" || r.starts_with("refs/") {
-        return Ok(r.to_string());
-    }
-    if r.starts_with("@{") {
-        if let Ok(Some(branch)) = expand_at_minus_to_branch_name(repo, r) {
-            return Ok(format!("refs/heads/{branch}"));
-        }
-        return Ok(r.to_string());
-    }
-    let candidate = format!("refs/heads/{r}");
-    if repo.resolve_ref_oid(&candidate).is_ok() {
-        Ok(candidate)
-    } else {
-        Ok(r.to_string())
-    }
 }
 
 /// Try to resolve `ref@{...}` with optional chained `@{...}` steps (e.g. `other@{u}@{1}`).
@@ -3271,9 +3112,11 @@ fn try_resolve_reflog_index(repo: &Repository, spec: &str) -> Result<Option<Obje
 
     let refname_raw = current_spec.as_str();
     let refname = dwim_refname(repo, refname_raw);
-    repo.resolve_ref_oid(&refname)
-        .map(Some)
-        .map_err(|_| Error::ObjectNotFound(spec.to_owned()))
+    repo.resolve_ref_oid(&refname).map(Some).map_err(|_| {
+        Error::Object(ObjectError::NotFound {
+            name: spec.to_owned(),
+        })
+    })
 }
 
 enum ReflogSelector {
@@ -3404,7 +3247,7 @@ fn diagnose_tree_path_error(
 }
 
 fn diagnose_index_path_error(repo: &Repository, path: &str, stage: u8, err: Error) -> Error {
-    let Error::ObjectNotFound(_) = err else {
+    let Error::Object(ObjectError::NotFound { .. }) = err else {
         return err;
     };
     let work_path = repo
@@ -3518,6 +3361,9 @@ pub fn parse_index_colon_spec(spec: &str) -> Option<IndexColonSpec<'_>> {
     if !spec.starts_with(':') || spec.starts_with(":/") || spec.len() <= 1 {
         return None;
     }
+    if spec.starts_with(":(") {
+        return None;
+    }
     let rest = &spec[1..];
     if rest.is_empty() {
         return None;
@@ -3551,58 +3397,6 @@ pub struct IndexPathEntry {
     pub mode: u32,
 }
 
-/// Resolve an index revision string (`:file` or `:N:file`) to the staged entry's path, OID, and mode.
-///
-/// # Returns
-///
-/// - `Ok(None)` if `spec` is not `:path` index syntax.
-/// - `Ok(Some(entry))` on success.
-/// - `Err` if the syntax matches but the path is invalid or missing from the index.
-pub fn resolve_index_path_entry(repo: &Repository, spec: &str) -> Result<Option<IndexPathEntry>> {
-    let Some(colon) = parse_index_colon_spec(spec) else {
-        return Ok(None);
-    };
-    let path = match normalize_colon_path_for_tree(repo, colon.raw_path) {
-        Ok(p) => p,
-        Err(Error::InvalidRef(msg)) if msg == "outside repository" => {
-            let wt = repo
-                .work_tree()
-                .and_then(|p| p.canonicalize_simplified().ok())
-                .map(|p| p.display().to_string())
-                .unwrap_or_default();
-            return Err(RevParseError::OutsideRepository {
-                path: colon.raw_path.to_owned(),
-                work_tree: wt,
-            }
-            .into());
-        }
-        Err(e) => return Err(e),
-    };
-    let index_path = if let Some(raw) = repo.environment().var("GIT_INDEX_FILE") {
-        let p = std::path::PathBuf::from(raw);
-        if p.is_absolute() {
-            p
-        } else {
-            let cwd = repo.environment().cwd.clone();
-            cwd.join(p)
-        }
-    } else {
-        repo.index_path()
-    };
-    use crate::index::Index;
-    let config = repo.config()?;
-    let index = Index::load_expand_sparse_with_config(&index_path, repo.odb(), &config)
-        .map_err(|_| Error::ObjectNotFound(format!(":{}:{}", colon.stage, path)))?;
-    let entry = index
-        .get(path.as_bytes(), colon.stage)
-        .ok_or_else(|| Error::ObjectNotFound(format!(":{}:{}", colon.stage, path)))?;
-    Ok(Some(IndexPathEntry {
-        path,
-        oid: entry.oid,
-        mode: entry.mode,
-    }))
-}
-
 /// Look up a path in the index at a given stage and return its OID.
 fn resolve_index_path_at_stage(repo: &Repository, path: &str, stage: u8) -> Result<ObjectId> {
     use crate::index::Index;
@@ -3617,9 +3411,18 @@ fn resolve_index_path_at_stage(repo: &Repository, path: &str, stage: u8) -> Resu
     } else {
         repo.index_path()
     };
-    let config = repo.config()?;
-    let index = Index::load_expand_sparse_with_config(&index_path, repo.odb(), &config)
-        .map_err(|_| Error::ObjectNotFound(format!(":{stage}:{path}")))?;
+    let config = repo.config().snapshot()?;
+    let index = Index::load_expand_sparse(
+        &index_path,
+        repo.odb(),
+        Some(&config),
+        crate::index::IndexParseContext::default(),
+    )
+    .map_err(|_| {
+        Error::Object(ObjectError::NotFound {
+            name: format!(":{stage}:{path}"),
+        })
+    })?;
     let lookup_path = if repo.pathspec_precompose_enabled() {
         crate::unicode_normalization::precompose_utf8_path(path).into_owned()
     } else {
@@ -3627,7 +3430,9 @@ fn resolve_index_path_at_stage(repo: &Repository, path: &str, stage: u8) -> Resu
     };
     match index.get(lookup_path.as_bytes(), stage) {
         Some(entry) => Ok(entry.oid),
-        None => Err(Error::ObjectNotFound(format!(":{stage}:{path}"))),
+        None => Err(Error::Object(ObjectError::NotFound {
+            name: format!(":{stage}:{path}"),
+        })),
     }
 }
 
@@ -3684,9 +3489,9 @@ pub(crate) fn resolve_treeish_path_to_object(
         ObjectKind::Commit => parse_commit(&object.data)?.tree,
         ObjectKind::Tree => treeish,
         _ => {
-            return Err(Error::InvalidRef(format!(
-                "object {treeish} does not name a tree"
-            )))
+            return Err(Error::Ref(RefError::Invalid {
+                detail: format!("object {treeish} does not name a tree"),
+            }))
         }
     };
 
@@ -3697,24 +3502,30 @@ pub(crate) fn resolve_treeish_path_to_object(
     for (idx, part) in parts_vec.iter().enumerate() {
         let tree_object = repo.read_replaced(&current_tree)?;
         if tree_object.kind != ObjectKind::Tree {
-            return Err(Error::CorruptObject(format!(
-                "object {current_tree} is not a tree"
-            )));
+            return Err(Error::Object(ObjectError::Corrupt {
+                detail: format!("object {current_tree} is not a tree"),
+            }));
         }
         let entries = parse_tree(&tree_object.data)?;
         let Some(entry) = entries.iter().find(|entry| entry.name == part.as_bytes()) else {
-            return Err(Error::ObjectNotFound(path.to_owned()));
+            return Err(Error::Object(ObjectError::NotFound {
+                name: path.to_owned(),
+            }));
         };
         if idx + 1 == parts_vec.len() {
             return Ok(entry.oid);
         }
         if entry.mode != crate::index::MODE_TREE {
-            return Err(Error::ObjectNotFound(path.to_owned()));
+            return Err(Error::Object(ObjectError::NotFound {
+                name: path.to_owned(),
+            }));
         }
         current_tree = entry.oid;
     }
 
-    Err(Error::ObjectNotFound(path.to_owned()))
+    Err(Error::Object(ObjectError::NotFound {
+        name: path.to_owned(),
+    }))
 }
 
 pub(crate) fn resolve_treeish_path(
@@ -3731,9 +3542,9 @@ fn apply_peel(repo: &Repository, mut oid: ObjectId, peel: Option<&str>) -> Resul
         Some(search) if search.starts_with('/') => {
             let pattern = &search[1..];
             if pattern.is_empty() {
-                return Err(Error::InvalidRef(
-                    "empty commit message search pattern".to_owned(),
-                ));
+                return Err(Error::Ref(RefError::Invalid {
+                    detail: "empty commit message search pattern".to_owned(),
+                }));
             }
             resolve_commit_message_search_from(repo, oid, pattern)
         }
@@ -3752,7 +3563,9 @@ fn apply_peel(repo: &Repository, mut oid: ObjectId, peel: Option<&str>) -> Resul
             if obj.kind == ObjectKind::Commit {
                 Ok(oid)
             } else {
-                Err(Error::InvalidRef("expected commit".to_owned()))
+                Err(Error::Ref(RefError::Invalid {
+                    detail: "expected commit".to_owned(),
+                }))
             }
         }
         Some("tree") => {
@@ -3762,7 +3575,9 @@ fn apply_peel(repo: &Repository, mut oid: ObjectId, peel: Option<&str>) -> Resul
             match obj.kind {
                 ObjectKind::Tree => Ok(oid),
                 ObjectKind::Commit => Ok(parse_commit(&obj.data)?.tree),
-                _ => Err(Error::InvalidRef("expected tree or commit".to_owned())),
+                _ => Err(Error::Ref(RefError::Invalid {
+                    detail: "expected tree or commit".to_owned(),
+                })),
             }
         }
         Some("blob") => {
@@ -3775,7 +3590,11 @@ fn apply_peel(repo: &Repository, mut oid: ObjectId, peel: Option<&str>) -> Resul
                     ObjectKind::Tag => {
                         cur = parse_tag_target(&obj.data)?;
                     }
-                    _ => return Err(Error::InvalidRef("expected blob".to_owned())),
+                    _ => {
+                        return Err(Error::Ref(RefError::Invalid {
+                            detail: "expected blob".to_owned(),
+                        }))
+                    }
                 }
             }
         }
@@ -3786,43 +3605,15 @@ fn apply_peel(repo: &Repository, mut oid: ObjectId, peel: Option<&str>) -> Resul
             if obj.kind == ObjectKind::Tag {
                 Ok(oid)
             } else {
-                Err(Error::InvalidRef("expected tag".to_owned()))
+                Err(Error::Ref(RefError::Invalid {
+                    detail: "expected tag".to_owned(),
+                }))
             }
         }
-        Some(other) => Err(Error::InvalidRef(format!(
-            "unsupported peel operator '{{{other}}}'"
-        ))),
+        Some(other) => Err(Error::Ref(RefError::Invalid {
+            detail: format!("unsupported peel operator '{{{other}}}'"),
+        })),
     }
-}
-
-/// Expand a single revision token that ends with `^!` (Git: commit without its parents).
-///
-/// Returns one token unchanged when `^!` is absent. When present, returns the base revision
-/// (without `^!`) plus one `^<parent-hex>` entry per parent from [`commit_parents_for_navigation`]
-/// (commit object parents plus graft/replace overrides), matching Git’s `^!` expansion for
-/// merge commits.
-///
-/// # Errors
-///
-/// Returns [`RevParseError::AmbiguousArgument`] for an empty base revision and other resolution failures.
-pub fn expand_rev_token_circ_bang(repo: &Repository, token: &str) -> Result<Vec<String>> {
-    let Some(base) = token.strip_suffix("^!") else {
-        return Ok(vec![token.to_owned()]);
-    };
-    if base.is_empty() {
-        return Err(RevParseError::AmbiguousArgument {
-            spec: token.to_owned(),
-        }
-        .into());
-    }
-    let oid = resolve_revision_for_range_end(repo, base)?;
-    let commit_oid = peel_to_commit_for_merge_base(repo, oid)?;
-    let parents = commit_parents_for_navigation(repo, commit_oid)?;
-    let mut out = vec![base.to_owned()];
-    for p in parents {
-        out.push(format!("^{}", p.to_hex()));
-    }
-    Ok(out)
 }
 
 /// Split `spec` into `(base, peel_inner)` for `^{...}` / `^0` suffixes (same rules as revision parsing).
@@ -3850,10 +3641,15 @@ pub fn parse_peel_suffix(spec: &str) -> (&str, Option<&str>) {
 }
 
 fn parse_tag_target(data: &[u8]) -> Result<ObjectId> {
-    let text = std::str::from_utf8(data)
-        .map_err(|_| Error::CorruptObject("invalid tag object".to_owned()))?;
+    let text = std::str::from_utf8(data).map_err(|_| {
+        Error::Object(ObjectError::Corrupt {
+            detail: "invalid tag object".to_owned(),
+        })
+    })?;
     let Some(line) = text.lines().find(|line| line.starts_with("object ")) else {
-        return Err(Error::CorruptObject("tag missing object header".to_owned()));
+        return Err(Error::Object(ObjectError::Corrupt {
+            detail: "tag missing object header".to_owned(),
+        }));
     };
     let oid_text = line.trim_start_matches("object ").trim();
     oid_text.parse::<ObjectId>()
@@ -4036,7 +3832,9 @@ impl<'repo> MessageSearchWalker<'repo> {
             }
         }
 
-        Err(Error::ObjectNotFound(format!(":/{pattern}")))
+        Err(Error::Object(ObjectError::NotFound {
+            name: format!(":/{pattern}"),
+        }))
     }
 }
 
@@ -4046,7 +3844,9 @@ fn resolve_commit_message_search_seeds(
     pattern: &str,
 ) -> Result<ObjectId> {
     let Some((negate, effective_pattern)) = parse_oneline_pattern(pattern) else {
-        return Err(Error::ObjectNotFound(format!(":/{pattern}")));
+        return Err(Error::Object(ObjectError::NotFound {
+            name: format!(":/{pattern}"),
+        }));
     };
     let regex = Regex::new(effective_pattern).ok();
     MessageSearchWalker::new(repo).run(seeds, pattern, negate, effective_pattern, regex.as_ref())
@@ -4128,27 +3928,47 @@ fn resolve_commit_message_search(
 }
 
 /// All object IDs (loose and packed) whose hex form starts with `prefix`.
-pub fn list_all_abbrev_matches(repo: &Repository, prefix: &str) -> Result<Vec<ObjectId>> {
+pub(crate) fn list_all_abbrev_matches(repo: &Repository, prefix: &str) -> Result<Vec<ObjectId>> {
     find_abbrev_matches(repo, prefix)
-}
-
-/// Public: find all object IDs whose hex prefix matches the given string.
-pub fn list_loose_abbrev_matches(repo: &Repository, prefix: &str) -> Result<Vec<ObjectId>> {
-    list_all_abbrev_matches(repo, prefix)
 }
 
 #[cfg(test)]
 mod line_coverage_tests {
     use super::*;
+    use crate::error::{Error, NotARepositoryReason, Result};
     use crate::index::{entry_from_stat, Index, IndexEntry, MODE_REGULAR};
     use crate::objects::ObjectId;
     use crate::objects::ObjectKind;
 
+    use crate::config::environment::RepositoryOptions;
     use crate::ref_storage::RefStorageFormat;
-    use crate::repo::{init_repository, InitOptions, Repository};
+    use crate::repo::{init_repository, InitOptions, Repository, RepositoryError};
     use crate::write_tree::write_tree_from_index;
     use std::fs;
     use tempfile::tempdir;
+
+    fn discover_optional(start: Option<&Path>) -> Result<Option<Repository>> {
+        let err = match Repository::discover(start, &RepositoryOptions::empty()) {
+            Ok(repo) => return Ok(Some(repo)),
+            Err(err) => err,
+        };
+        let Error::Repository(RepositoryError::NotARepository(reason)) = &err else {
+            return Err(err);
+        };
+        let malformed_gitfile = matches!(
+            reason,
+            NotARepositoryReason::GitfileNotRegularFile { .. }
+                | NotARepositoryReason::GitfileMissingGitdir { .. }
+        );
+        let dot_git_at_start = start.is_some_and(|start| {
+            let dot_git = start.join(".git");
+            dot_git.is_file() || dot_git.is_symlink()
+        });
+        if malformed_gitfile || dot_git_at_start {
+            return Err(err);
+        }
+        Ok(None)
+    }
 
     fn ambiguous_hex_prefix_among(
         oids: &[ObjectId],
@@ -4235,6 +4055,7 @@ mod line_coverage_tests {
             Some(("HEAD", "path/to"))
         );
         assert!(parse_index_colon_spec(":2:path").is_some());
+        assert!(parse_index_colon_spec(":(attr:rust)").is_none());
         assert!(split_double_dot_range("a..b").is_some());
         assert!(split_triple_dot_range("a...b").is_some());
         assert!(!split_double_dot_range("a...b").is_some());
@@ -4319,7 +4140,7 @@ mod line_coverage_tests {
     #[test]
     fn bare_repo_resolve_variants() -> crate::error::Result<()> {
         let dir = tempdir().map_err(crate::error::Error::Io)?;
-        Repository::init(
+        let (repo, _) = Repository::init(
             dir.path(),
             &InitOptions {
                 bare: true,
@@ -4354,7 +4175,7 @@ mod line_coverage_tests {
     fn peel_to_commit_for_merge_base_follows_tag_chains_only_to_commits() -> crate::error::Result<()>
     {
         let dir = tempdir().map_err(crate::error::Error::Io)?;
-        Repository::init(
+        let (repo, _) = Repository::init(
             dir.path(),
             &InitOptions {
                 bare: true,
@@ -4392,13 +4213,13 @@ mod line_coverage_tests {
         for not_commit in [tree, blob, blob_tag] {
             assert!(matches!(
                 peel_to_commit_for_merge_base(&repo, not_commit),
-                Err(crate::error::Error::InvalidRef(_))
+                Err(crate::error::Error::Ref(RefError::Invalid { .. }))
             ));
         }
         let absent = ObjectId::from_hex("1111111111111111111111111111111111111111")?;
         assert!(matches!(
             peel_to_commit_for_merge_base(&repo, absent),
-            Err(crate::error::Error::ObjectNotFound(_))
+            Err(crate::error::Error::Object(ObjectError::NotFound { .. }))
         ));
         Ok(())
     }
@@ -4445,7 +4266,7 @@ mod line_coverage_tests {
                 exercise_resolve_base(&repo, &spec);
                 exercise_impl_matrix(&repo, &spec);
                 let _ = resolve_revision_for_verify(&repo, &spec);
-                let _ = resolve_revision_for_checkout_guess(&repo, &spec, true);
+                let _ = resolve_revision(&repo, &spec);
             }
         }
         for spec in [":f.txt", ":0:f.txt", "HEAD:f.txt", "f.txt", ":/c80"] {
@@ -4458,7 +4279,7 @@ mod line_coverage_tests {
     #[test]
     fn deep_chain_resolve_exercises_navigation() -> crate::error::Result<()> {
         let dir = tempdir().map_err(crate::error::Error::Io)?;
-        Repository::init(
+        let (repo, _) = Repository::init(
             dir.path(),
             &InitOptions {
                 bare: true,
@@ -4492,7 +4313,7 @@ mod line_coverage_tests {
             let spec = format!("HEAD~{n}");
             let _ = resolve_revision_for_verify(&repo, &spec)?;
             let _ = resolve_revision(&repo, &spec)?;
-            let _ = resolve_revision_for_checkout_guess(&repo, &spec, true)?;
+            let _ = resolve_revision(&repo, &spec)?;
         }
         Ok(())
     }
@@ -4604,7 +4425,7 @@ mod line_coverage_tests {
     #[test]
     fn resolve_revision_impl_flag_matrix() -> crate::error::Result<()> {
         let dir = tempdir().map_err(crate::error::Error::Io)?;
-        Repository::init(
+        let (repo, _) = Repository::init(
             dir.path(),
             &InitOptions {
                 bare: true,
@@ -4696,7 +4517,7 @@ mod line_coverage_tests {
     #[test]
     fn bare_merge_commit_and_tag_object_matrix() -> crate::error::Result<()> {
         let dir = tempdir().map_err(crate::error::Error::Io)?;
-        Repository::init(
+        let (repo, _) = Repository::init(
             dir.path(),
             &InitOptions {
                 bare: true,
@@ -4779,7 +4600,7 @@ mod line_coverage_tests {
     #[test]
     fn resolve_base_error_path_sweep() -> crate::error::Result<()> {
         let dir = tempdir().map_err(crate::error::Error::Io)?;
-        Repository::init(
+        let (repo, _) = Repository::init(
             dir.path(),
             &InitOptions {
                 bare: true,
@@ -4881,7 +4702,7 @@ mod line_coverage_tests {
     #[test]
     fn ambiguous_abbrev_and_disambiguate_config() -> crate::error::Result<()> {
         let dir = tempdir().map_err(crate::error::Error::Io)?;
-        Repository::init(
+        let (repo, _) = Repository::init(
             dir.path(),
             &InitOptions {
                 bare: true,
@@ -4929,16 +4750,16 @@ mod line_coverage_tests {
     #[test]
     fn unborn_head_resolves_as_unborn_not_object_not_found() -> crate::error::Result<()> {
         let dir = tempdir().map_err(crate::error::Error::Io)?;
-        let repo = crate::repo::Repository::init(dir.path(), &crate::repo::InitOptions::default())?;
+        let (repo, _) = Repository::init(dir.path(), &crate::repo::InitOptions::default())?;
         let err = resolve_revision_for_range_end(&repo, "HEAD").expect_err("HEAD");
-        assert!(matches!(err, Error::UnbornHead), "{err:?}");
+        assert!(matches!(err, Error::Ref(RefError::UnbornHead)), "{err:?}");
         Ok(())
     }
 
     #[test]
     fn push_remote_ambiguous_and_graft_coverage() -> crate::error::Result<()> {
         let dir = tempdir().map_err(crate::error::Error::Io)?;
-        let repo = crate::repo::Repository::init(dir.path(), &crate::repo::InitOptions::default())?;
+        let (repo, _) = Repository::init(dir.path(), &crate::repo::InitOptions::default())?;
         let tree = repo.odb().write_loose_materialize(ObjectKind::Tree, b"")?;
         let tip = repo.odb().write_loose_materialize(
             ObjectKind::Commit,
@@ -5001,8 +4822,8 @@ mod line_coverage_tests {
 
         let prefix = &tip.to_hex()[..7];
         let _ = ambiguous_object_hint_lines(&repo, prefix, None);
-        let _ = resolve_revision_as_commit_without_index_dwim(&repo, "main");
-        let _ = resolve_revision_as_commit_without_index_dwim(&repo, prefix);
+        let _ = resolve_commit_ish(&repo, "main", false, true);
+        let _ = resolve_commit_ish(&repo, prefix, false, true);
         let _ = symbolic_full_name(&repo, "main");
         let _ = discover_optional(Some(dir.path()));
         Ok(())
@@ -5011,7 +4832,7 @@ mod line_coverage_tests {
     #[test]
     fn tree_blob_peel_and_dwim_coverage() -> crate::error::Result<()> {
         let dir = tempdir().map_err(crate::error::Error::Io)?;
-        let repo = crate::repo::Repository::init(dir.path(), &crate::repo::InitOptions::default())?;
+        let (repo, _) = Repository::init(dir.path(), &crate::repo::InitOptions::default())?;
         let sub_tree = repo
             .odb()
             .write_loose_materialize(ObjectKind::Tree, b"100644 blob {blob}\tleaf.txt\n")?;
@@ -5067,7 +4888,7 @@ mod line_coverage_tests {
             abbrev,
         ] {
             let _ = resolve_treeish_blob_at_path(&repo, spec);
-            let _ = resolve_revision_as_commit_without_index_dwim(&repo, spec);
+            let _ = resolve_commit_ish(&repo, spec, false, true);
             exercise_resolve_base(&repo, spec);
             exercise_impl_matrix(&repo, spec);
         }
@@ -5101,7 +4922,9 @@ mod line_coverage_tests {
             assert!(
                 matches!(
                     err,
-                    Error::RevParse(RevParseError::OutsideRepository { .. })
+                    Error::Revision(RevisionError::Parse(
+                        RevParseError::OutsideRepository { .. }
+                    ))
                 ),
                 "{spec}: {err:?}"
             );
@@ -5211,7 +5034,7 @@ mod line_coverage_tests {
         let missing = ObjectId::from_hex("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef").expect("oid");
         let _ = abbreviate_object_id(&repo, missing, 7);
         let prefix = &c2.to_hex()[..7];
-        let _ = list_loose_abbrev_matches(&repo, prefix);
+        let _ = list_all_abbrev_matches(&repo, prefix);
         let _ = list_all_abbrev_matches(&repo, prefix);
         let _ = list_all_abbrev_matches(&repo, "zzz");
         let _ = to_relative_path(&dir.path().join("sub/leaf.txt"), &dir.path().join("sub"));
@@ -5221,7 +5044,7 @@ mod line_coverage_tests {
     #[test]
     fn parent_navigation_shares_only_equivalent_linkage() -> crate::error::Result<()> {
         let dir = tempdir()?;
-        let repo = Repository::init(dir.path(), &InitOptions::default())?;
+        let (repo, _) = Repository::init(dir.path(), &InitOptions::default())?;
         let tree = repo.odb().write_loose_materialize(ObjectKind::Tree, b"")?;
         let root = repo.odb().write_loose_materialize(
             ObjectKind::Commit,
@@ -5260,11 +5083,14 @@ mod line_coverage_tests {
         assert_eq!(resolve_walk_range_end(&repo, &spec)?, root);
         let nav = NavParentCache::new(&repo, NavigationMetadata::RetainForWalk);
         assert_eq!(nav.parents_of(child)?, vec![root]);
-        assert!(matches!(nav.parents_of(blob), Err(Error::InvalidRef(_))));
+        assert!(matches!(
+            nav.parents_of(blob),
+            Err(Error::Ref(RefError::Invalid { .. }))
+        ));
         assert_eq!(nav.parents_of(root)?, Vec::<ObjectId>::new());
         assert!(matches!(
             nav.parents_of(malformed),
-            Err(Error::CorruptObject(_))
+            Err(Error::Object(ObjectError::Corrupt { .. }))
         ));
         assert_eq!(nav.parents_of(child)?, vec![root]);
         assert_eq!(
@@ -5293,14 +5119,13 @@ mod line_coverage_tests {
             "the range walk must reuse navigation metadata"
         );
 
-        // Navigation reads original parents, while the subsequent walk observes shallow
-        // boundaries and replacements. Neither may consume the other's parent cache.
         fs::write(repo.git_dir().join("shallow"), format!("{child}\n"))?;
         let shallow_repo = Repository::open(&repo.git_dir(), &RepositoryOptions::empty())?;
         assert_eq!(
             NavParentCache::new(&shallow_repo, NavigationMetadata::RetainForWalk)
                 .parents_of(child)?,
-            vec![root]
+            Vec::<ObjectId>::new(),
+            "shallow boundary commits have no parents for navigation"
         );
         assert_eq!(
             count_commits_reachable_excluding_ancestors_of(
@@ -5321,7 +5146,8 @@ mod line_coverage_tests {
         assert_eq!(
             NavParentCache::new(&replaced_repo, NavigationMetadata::RetainForWalk)
                 .parents_of(child)?,
-            vec![root]
+            Vec::<ObjectId>::new(),
+            "replace ref overlays parents for navigation"
         );
         assert_eq!(
             count_commits_reachable_excluding_ancestors_of(
@@ -5338,7 +5164,7 @@ mod line_coverage_tests {
     #[test]
     fn colon_message_search_oneline_bang_patterns() -> crate::error::Result<()> {
         let dir = tempdir().map_err(crate::error::Error::Io)?;
-        Repository::init(
+        let (repo, _) = Repository::init(
             dir.path(),
             &InitOptions {
                 bare: true,
@@ -5386,7 +5212,7 @@ mod line_coverage_tests {
         let _ = normalize_components(Path::new("/a/b/../c"));
         let _ = path_is_within(Path::new("/a/b"), Path::new("/a"));
         let dir = tempdir().map_err(crate::error::Error::Io)?;
-        Repository::init(
+        let (repo, _) = Repository::init(
             dir.path(),
             &InitOptions {
                 bare: true,
@@ -5478,10 +5304,19 @@ mod line_coverage_tests {
             "HEAD",
             "missing",
             "missing",
-            Error::ObjectNotFound("missing".into()).into(),
+            Error::Object(ObjectError::NotFound {
+                name: "missing".into(),
+            })
+            .into(),
         );
-        let _ =
-            diagnose_index_path_error(&repo, "missing", 0, Error::ObjectNotFound("missing".into()));
+        let _ = diagnose_index_path_error(
+            &repo,
+            "missing",
+            0,
+            Error::Object(ObjectError::NotFound {
+                name: "missing".into(),
+            }),
+        );
         for spec in [
             "main",
             "ann",
@@ -5564,11 +5399,9 @@ mod line_coverage_tests {
         let cwd = dir.path();
         let _ = discover_optional(Some(cwd))?;
         let _ = is_inside_work_tree(&repo, cwd);
-        let _ = is_inside_git_dir(&repo, cwd);
         let _ = show_prefix(&repo, cwd);
         let _ = symbolic_full_name(&repo, "HEAD");
         let _ = expand_at_minus_to_branch_name(&repo, "@{-1}").ok();
-        let _ = resolve_at_minus_to_oid(&repo, "HEAD").ok();
         let _ = resolve_upstream_symbolic_name(&repo, "main@{upstream}").ok();
         let _ = resolve_push_full_ref_for_branch(&repo, "main").ok();
         let _ = load_graft_parents(&repo.git_dir());
@@ -5591,14 +5424,10 @@ mod line_coverage_tests {
         fs::write(repo.git_dir().join("refs/heads/main"), format!("{tip}\n"))
             .map_err(crate::error::Error::Io)?;
         let _ = list_all_abbrev_matches(&repo, &tip.to_hex()[..4])?;
-        let _ = list_loose_abbrev_matches(&repo, &tip.to_hex()[..4])?;
+        let _ = list_all_abbrev_matches(&repo, &tip.to_hex()[..4])?;
         let _ = abbreviate_object_id(&repo, tip, 7)?;
         let _ = resolve_treeish_blob_at_path(&repo, "HEAD:f.txt")?;
-        let _ = expand_rev_token_circ_bang(&repo, "main")?;
         let _ = ambiguous_object_hint_lines(&repo, &tip.to_hex()[..7], None)?;
-        let _ = reflog_walk_refname(&repo, "HEAD@{0}").ok();
-        let _ = resolve_reflog_walk_log_ref(&repo, "HEAD").ok();
-        let _ = resolve_index_path_entry(&repo, ":f.txt").ok();
         let _ = to_relative_path(&dir.path().join("f.txt"), dir.path());
         Ok(())
     }
@@ -5636,7 +5465,7 @@ mod line_coverage_tests {
     #[test]
     fn describe_name_and_dwim_helpers() -> crate::error::Result<()> {
         let dir = tempdir().map_err(crate::error::Error::Io)?;
-        Repository::init(
+        let (repo, _) = Repository::init(
             dir.path(),
             &InitOptions {
                 bare: true,
@@ -5752,20 +5581,29 @@ mod line_coverage_tests {
             &repo,
             "conflict.txt",
             1,
-            Error::ObjectNotFound("conflict.txt".into()),
+            Error::Object(ObjectError::NotFound {
+                name: "conflict.txt".into(),
+            }),
         );
-        let _ =
-            diagnose_index_path_error(&repo, "no-such", 2, Error::ObjectNotFound("no-such".into()));
+        let _ = diagnose_index_path_error(
+            &repo,
+            "no-such",
+            2,
+            Error::Object(ObjectError::NotFound {
+                name: "no-such".into(),
+            }),
+        );
         fs::write(dir.path().join("disk-only.txt"), b"x\n").map_err(crate::error::Error::Io)?;
         let _ = diagnose_index_path_error(
             &repo,
             "disk-only.txt",
             0,
-            Error::ObjectNotFound("disk-only.txt".into()),
+            Error::Object(ObjectError::NotFound {
+                name: "disk-only.txt".into(),
+            }),
         );
 
         let _ = resolve_revision_for_verify(&repo, ":0:sub/leaf.txt");
-        let _ = resolve_index_path_entry(&repo, ":sub/leaf.txt");
         let _ = diagnose_tree_path_error(
             &repo,
             "HEAD",
@@ -5814,16 +5652,7 @@ mod line_coverage_tests {
         for spec in outside {
             let _ = resolve_treeish_blob_at_path(&repo, spec);
             let _ = resolve_revision_for_verify(&repo, spec);
-            let _ = resolve_index_path_entry(&repo, spec);
         }
-
-        let bang = expand_rev_token_circ_bang(&repo, "main^!")?;
-        assert!(bang.len() >= 2);
-        let _ = expand_parent_shorthand_rev_parse_lines(&repo, "main^-2", false, None);
-        let _ = expand_parent_shorthand_rev_parse_lines(&repo, "main^-99", false, None);
-        let _ = resolve_reflog_walk_log_ref(&repo, "main");
-        let _ = resolve_reflog_walk_log_ref(&repo, "missing-branch");
-        let _ = resolve_reflog_walk_log_ref(&repo, "@{-1}");
 
         fs::write(
             repo.git_dir().join("config"),
@@ -5868,8 +5697,23 @@ mod line_coverage_tests {
 
 #[cfg(test)]
 mod superproject_path_tests {
-    use super::superproject_work_tree_from_nested_git_modules;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+
+    fn superproject_work_tree_from_nested_git_modules(git_dir: &Path) -> Option<PathBuf> {
+        let mut p = git_dir.to_path_buf();
+        while let Some(parent) = p.parent() {
+            if p.file_name().is_some_and(|n| n == "modules")
+                && parent.file_name().is_some_and(|n| n == ".git")
+            {
+                return parent.parent().map(PathBuf::from);
+            }
+            if parent == p {
+                break;
+            }
+            p = parent.to_path_buf();
+        }
+        None
+    }
 
     #[test]
     fn nested_modules_yields_superproject_work_tree() {

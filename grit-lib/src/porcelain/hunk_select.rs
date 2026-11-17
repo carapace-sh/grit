@@ -3,7 +3,6 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
-use std::path::Path as StdPath;
 use std::str::FromStr;
 
 use thiserror::Error;
@@ -13,7 +12,7 @@ use crate::apply::{
     apply_hunks_to_blob, apply_patch_to_index, apply_patch_to_index_and_write, ApplyOptions,
     FilePatch, Hunk, HunkLine, IndexApplyOptions, IndexApplyOutcome,
 };
-use crate::diff::hunk_id::{hunk_ids, hunk_ids_with_duplicate_peers, DiffSide, HunkId};
+use crate::crlf::worktree_conversion_is_identity;
 use crate::diff::structured::{
     structured_file_diff, SideBytes, StructuredHunk, StructuredLine, StructuredLineKind,
     StructuredSegment,
@@ -25,18 +24,19 @@ use crate::diff::{
     unstaged_raw_changes_with_peer_hunks_in, DiffOptions, DiffStatus, DiffTarget, FileChange,
     FileDiff,
 };
+use crate::diff::{hunk_ids, DiffSide, HunkId};
 use crate::error::{ApplyError, Error};
 use crate::index::{Index, IndexLock, MODE_EXECUTABLE, MODE_GITLINK, MODE_REGULAR};
 use crate::objects::FileMode;
-use crate::objects::{parse_commit, ObjectId, ObjectKind};
+use crate::objects::ObjectKind;
 use crate::porcelain::checkout::{
     remove_empty_parent_dirs, smudge_bytes_for_worktree_path, write_smudged_blob_to_worktree,
     write_to_worktree_cached, LeadingDirCache,
 };
 use crate::porcelain::index_from_tree::refresh_stage0_index_stats_for_paths;
-use crate::progress::{poll_cancel, Cancel, ProgressPhase, ProgressSink};
+use crate::progress::{poll_cancel, CancelToken, ProgressPhase, ProgressSink};
 use crate::repo::Repository;
-use crate::state::{resolve_head_for_repository, HeadState};
+use crate::repo::RepositoryError;
 use crate::worktree_rules::WorktreeRules;
 
 /// New-side line range for partial hunk staging (1-based, inclusive).
@@ -63,6 +63,7 @@ pub struct HunkSelection {
 
 /// Failure while resolving or staging hunk ids.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum HunkSelectError {
     /// Id string is not 12 lowercase hex characters.
     #[error("unknown hunk id {id}")]
@@ -140,21 +141,9 @@ pub enum HunkSelectError {
     /// A patch passed in for restoring names neither an old nor a new path.
     #[error("patch names no path")]
     MissingPath,
-    /// Repository or diff engine failure (not a hunk-id selection error).
-    ///
-    /// Match on the boxed [`crate::error::Error`] to branch on the underlying failure, for
-    /// example [`crate::error::Error::RequiresWorkTree`] when the repository is bare.
-    #[error(transparent)]
-    Repository(Box<Error>),
     /// Selected hunks could not be turned into an apply patch.
     #[error("could not build patch for selected hunks")]
     PatchBuild,
-}
-
-impl From<Error> for HunkSelectError {
-    fn from(err: Error) -> Self {
-        HunkSelectError::Repository(Box::new(err))
-    }
 }
 
 /// Result of [`stage_hunks`].
@@ -197,11 +186,11 @@ impl StageHunksOutcome {
 /// # Errors
 ///
 /// Propagates diff and repository errors.
-pub fn unstaged_file_diffs(
+pub(crate) fn unstaged_file_diffs(
     repo: &Repository,
     pathspecs: &[String],
 ) -> std::result::Result<Vec<(FileDiff, Vec<StructuredHunk>)>, Error> {
-    let opts = DiffOptions::from_config(repo.config()?.as_ref());
+    let opts = DiffOptions::from_config(repo.config().snapshot()?.as_ref());
     let (files, peers) = unstaged_file_diffs_with_peer_hunks(repo, pathspecs, opts)?;
     Ok(files
         .into_iter()
@@ -217,9 +206,7 @@ pub fn unstaged_file_diffs(
 /// # Errors
 ///
 /// Returns [`HunkSelectError::UnknownId`] for malformed tokens.
-pub fn parse_hunk_id_list(
-    tokens: &[String],
-) -> std::result::Result<HunkSelection, HunkSelectError> {
+pub fn parse_hunk_id_list(tokens: &[String]) -> crate::error::Result<HunkSelection> {
     let mut ids = Vec::new();
     for token in tokens {
         for part in token.split(',').map(str::trim).filter(|s| !s.is_empty()) {
@@ -244,13 +231,13 @@ pub fn parse_hunk_id_list(
 /// # Errors
 ///
 /// See [`HunkSelectError`].
-pub fn resolve_selection(
+pub(crate) fn resolve_selection(
     repo: &Repository,
     side: DiffSide,
     selection: &HunkSelection,
     pathspecs: &[String],
     diff_options: DiffOptions,
-) -> std::result::Result<Vec<FilePatch>, HunkSelectError> {
+) -> crate::error::Result<Vec<FilePatch>> {
     // Returns index-ready patches; see [`resolve_selection_with_staged`] for staged id map.
     Ok(resolve_selection_with_staged(repo, side, selection, pathspecs, diff_options)?.patches)
 }
@@ -263,6 +250,9 @@ pub(crate) struct ResolvedSelection {
     pub(crate) selected_hunks: BTreeMap<String, Vec<HunkId>>,
     /// Line range labels (`start` or `start-end`) per path.
     pub(crate) selected_lines: BTreeMap<String, Vec<String>>,
+    /// Paths whose every hunk was selected by id, so reversing the patch can bring the file back
+    /// to the content it was diffed against. Any other selected path keeps a difference.
+    pub(crate) whole_files: BTreeSet<String>,
 }
 
 /// Resolve `selection` on the unstaged side, keeping the per-path ids and line labels that
@@ -275,7 +265,7 @@ pub(crate) fn resolve_unstaged_selection(
     repo: &Repository,
     selection: &HunkSelection,
     pathspecs: &[String],
-) -> std::result::Result<ResolvedSelection, HunkSelectError> {
+) -> crate::error::Result<ResolvedSelection> {
     let diff_opts = diff_options_for_hunk_select(repo)?;
     resolve_selection_with_staged(repo, DiffSide::Unstaged, selection, pathspecs, diff_opts)
 }
@@ -287,6 +277,7 @@ fn merge_resolved(into: &mut ResolvedSelection, other: ResolvedSelection) {
     for (path, ranges) in other.selected_lines {
         into.selected_lines.entry(path).or_default().extend(ranges);
     }
+    into.whole_files.extend(other.whole_files);
     for patch in other.patches {
         if let Some(existing) = into
             .patches
@@ -307,7 +298,7 @@ fn resolve_selection_with_staged(
     selection: &HunkSelection,
     pathspecs: &[String],
     diff_options: DiffOptions,
-) -> std::result::Result<ResolvedSelection, HunkSelectError> {
+) -> crate::error::Result<ResolvedSelection> {
     resolve_selection_in(repo, None, side, selection, pathspecs, diff_options)
 }
 
@@ -320,7 +311,7 @@ fn resolve_selection_in(
     selection: &HunkSelection,
     pathspecs: &[String],
     diff_options: DiffOptions,
-) -> std::result::Result<ResolvedSelection, HunkSelectError> {
+) -> crate::error::Result<ResolvedSelection> {
     if selection.ids.is_empty() && selection.ranges.is_empty() {
         return Ok(ResolvedSelection::default());
     }
@@ -365,11 +356,12 @@ fn resolve_selection_in(
             if !selection.ranges.is_empty() {
                 return Err(HunkSelectError::RangeSelectsNothing {
                     path: selection.ranges[0].path.clone(),
-                });
+                }
+                .into());
             }
             resolve_staged(repo, pathspecs, opts, &requested)
         }
-        DiffSide::Other => Err(HunkSelectError::UnselectableSide { side }),
+        DiffSide::Other => Err(HunkSelectError::UnselectableSide { side }.into()),
     }
 }
 
@@ -378,7 +370,7 @@ fn resolve_staged(
     pathspecs: &[String],
     opts: DiffOptions,
     requested: &HashSet<HunkId>,
-) -> std::result::Result<ResolvedSelection, HunkSelectError> {
+) -> crate::error::Result<ResolvedSelection> {
     let files = collect_files_for_target(repo, &DiffTarget::IndexVsHead, pathspecs, opts)?;
     resolve_on_files(
         DiffSide::Staged,
@@ -396,9 +388,10 @@ fn resolve_unstaged(
     pathspecs: &[String],
     opts: DiffOptions,
     requested: &HashSet<HunkId>,
-) -> std::result::Result<ResolvedSelection, HunkSelectError> {
+) -> crate::error::Result<ResolvedSelection> {
     let mut patches = Vec::new();
     let mut staged_hunks = BTreeMap::new();
+    let mut whole_files = BTreeSet::new();
     let mut found = HashSet::new();
 
     for change in changes {
@@ -409,18 +402,21 @@ fn resolve_unstaged(
             .get(&change.path)
             .map(|h| h.as_slice())
             .unwrap_or(&[]);
-        let (file_patches, staged, matched) = resolve_file_change_by_unified_body(
+        let resolved = resolve_file_change_by_unified_body(
             DiffSide::Unstaged,
             change,
             peer,
             requested,
             &opts,
         )?;
-        found.extend(matched);
-        if let Some(staged) = staged {
+        found.extend(resolved.matched);
+        if let Some(staged) = resolved.selected_ids {
             staged_hunks.insert(change.path.clone(), staged);
         }
-        patches.extend(file_patches);
+        if resolved.whole_file {
+            whole_files.insert(change.path.clone());
+        }
+        patches.extend(resolved.patches);
     }
 
     let missing: Vec<HunkId> = requested
@@ -434,12 +430,13 @@ fn resolve_unstaged(
                 id: wrong,
                 actual_side: DiffSide::Staged,
                 requested_side: DiffSide::Unstaged,
-            });
+            }
+            .into());
         }
         if pathspecs.len() == 1 {
             let path = &pathspecs[0];
             if changes.iter().any(|c| c.path == *path && c.binary) {
-                return Err(HunkSelectError::Binary { path: path.clone() });
+                return Err(HunkSelectError::Binary { path: path.clone() }.into());
             }
         }
         let files: Vec<FileDiff> = changes
@@ -452,13 +449,15 @@ fn resolve_unstaged(
             id,
             path: stale_path_hint(pathspecs, &files),
             current_ids,
-        });
+        }
+        .into());
     }
 
     Ok(ResolvedSelection {
         patches,
         selected_hunks: staged_hunks,
         selected_lines: BTreeMap::new(),
+        whole_files,
     })
 }
 
@@ -481,7 +480,17 @@ fn line_count(text: &str) -> usize {
     }
 }
 
-type UnifiedHunkResolve = (Vec<FilePatch>, Option<Vec<HunkId>>, HashSet<HunkId>);
+/// One file's hunks matched against the requested ids.
+struct UnifiedHunkResolve {
+    /// The patch of the selected hunks (empty when none matched).
+    patches: Vec<FilePatch>,
+    /// Selected ids in hunk order, when any matched.
+    selected_ids: Option<Vec<HunkId>>,
+    /// Requested ids found on this file.
+    matched: HashSet<HunkId>,
+    /// Whether every hunk of the file was selected.
+    whole_file: bool,
+}
 
 fn resolve_file_change_by_unified_body(
     side: DiffSide,
@@ -489,7 +498,7 @@ fn resolve_file_change_by_unified_body(
     peer_hunks: &[StructuredHunk],
     requested: &HashSet<HunkId>,
     diff_options: &DiffOptions,
-) -> std::result::Result<UnifiedHunkResolve, HunkSelectError> {
+) -> crate::error::Result<UnifiedHunkResolve> {
     let old_text = side_text(&change.old_bytes);
     let new_text = side_text(&change.new_bytes);
     let body =
@@ -520,16 +529,27 @@ fn resolve_file_change_by_unified_body(
         }
     }
     if selected_slices.is_empty() {
-        return Ok((Vec::new(), None, matched));
+        return Ok(UnifiedHunkResolve {
+            patches: Vec::new(),
+            selected_ids: None,
+            matched,
+            whole_file: false,
+        });
     }
+    let whole_file = selected_slices.len() == slices.len();
     let patch = file_patch_from_unified_slices(change, &selected_slices)?;
-    Ok((vec![patch], Some(staged_ids), matched))
+    Ok(UnifiedHunkResolve {
+        patches: vec![patch],
+        selected_ids: Some(staged_ids),
+        matched,
+        whole_file,
+    })
 }
 
 fn file_patch_from_unified_slices(
     change: &FileChange,
     slices: &[&str],
-) -> std::result::Result<FilePatch, HunkSelectError> {
+) -> crate::error::Result<FilePatch> {
     let path = &change.path;
     let is_new = change.old_mode == FileMode::ABSENT;
     let mut is_deleted =
@@ -600,6 +620,8 @@ fn build_file_diff(change: &FileChange, opts: &DiffOptions) -> FileDiff {
         old_oid: change.old_oid,
         new_oid: change.new_oid,
         binary: change.binary,
+        old_size: change.old_bytes.byte_len(),
+        new_size: change.new_bytes.byte_len(),
         content_changed: change.content_changed,
         old_encoding_lossy: structured.old_encoding_lossy,
         new_encoding_lossy: structured.new_encoding_lossy,
@@ -613,13 +635,13 @@ fn find_id_on_staged_side(
     pathspecs: &[String],
     opts: DiffOptions,
     requested: &HashSet<HunkId>,
-) -> std::result::Result<Option<HunkId>, HunkSelectError> {
+) -> crate::error::Result<Option<HunkId>> {
     let files = collect_files_for_target(repo, &DiffTarget::IndexVsHead, pathspecs, opts)?;
     Ok(files.into_iter().find_map(|file| {
         if file.binary {
             return None;
         }
-        hunk_ids(DiffSide::Staged, &file.path, &file.hunks)
+        hunk_ids(DiffSide::Staged, &file.path, &file.hunks, &[])
             .into_iter()
             .find(|id| requested.contains(id))
     }))
@@ -631,7 +653,7 @@ fn resolve_on_files(
     peer_hunks: HashMap<String, Vec<StructuredHunk>>,
     requested: &HashSet<HunkId>,
     pathspecs: &[String],
-) -> std::result::Result<ResolvedSelection, HunkSelectError> {
+) -> crate::error::Result<ResolvedSelection> {
     let mut found = HashSet::new();
     let mut patches = Vec::new();
     let mut staged_by_path: BTreeMap<String, Vec<HunkId>> = BTreeMap::new();
@@ -644,7 +666,7 @@ fn resolve_on_files(
             .get(&file.path)
             .map(|h| h.as_slice())
             .unwrap_or(&[]);
-        let ids = hunk_ids_with_duplicate_peers(side, &file.path, &file.hunks, peer);
+        let ids = hunk_ids(side, &file.path, &file.hunks, peer);
         let mut selected = Vec::new();
         let mut selected_ids = Vec::new();
         for (hunk, id) in file.hunks.iter().zip(ids.iter()) {
@@ -673,7 +695,7 @@ fn resolve_on_files(
                 .find(|f| f.path == path)
                 .is_some_and(|f| f.binary)
             {
-                return Err(HunkSelectError::Binary { path });
+                return Err(HunkSelectError::Binary { path }.into());
             }
         }
         let current_ids = current_ids_for_stale(side, pathspecs, &files, &peer_hunks);
@@ -681,13 +703,15 @@ fn resolve_on_files(
             id,
             path: stale_path_hint(pathspecs, &files),
             current_ids,
-        });
+        }
+        .into());
     }
 
     Ok(ResolvedSelection {
         patches,
         selected_hunks: staged_by_path,
         selected_lines: BTreeMap::new(),
+        whole_files: BTreeSet::new(),
     })
 }
 
@@ -721,17 +745,18 @@ fn current_ids_for_stale(
         .get(&file.path)
         .map(|h| h.as_slice())
         .unwrap_or(&[]);
-    hunk_ids_with_duplicate_peers(side, &file.path, &file.hunks, peer)
+    hunk_ids(side, &file.path, &file.hunks, peer)
 }
 
 fn file_patch_from_hunks(
     file: &FileDiff,
     hunks: &[StructuredHunk],
-) -> std::result::Result<FilePatch, HunkSelectError> {
+) -> crate::error::Result<FilePatch> {
     if file.binary {
         return Err(HunkSelectError::Binary {
             path: file.path.clone(),
-        });
+        }
+        .into());
     }
     // Index preimage always comes from the existing stage-0 entry (including intent-to-add).
     let is_new = false;
@@ -838,7 +863,7 @@ fn validate_line_ranges(
     path: &str,
     intervals: &[(usize, usize)],
     max_line: usize,
-) -> std::result::Result<(), HunkSelectError> {
+) -> crate::error::Result<()> {
     for &(start, end) in intervals {
         if start == 0 || end == 0 || start > end || end > max_line {
             return Err(HunkSelectError::RangeOutOfBounds {
@@ -846,7 +871,8 @@ fn validate_line_ranges(
                 start,
                 end,
                 max_line,
-            });
+            }
+            .into());
         }
     }
     Ok(())
@@ -985,7 +1011,7 @@ fn resolve_line_ranges_unstaged(
     opts: &DiffOptions,
     selection: &HunkSelection,
     id_selected: &HashSet<HunkId>,
-) -> std::result::Result<ResolvedSelection, HunkSelectError> {
+) -> crate::error::Result<ResolvedSelection> {
     let mut by_path: BTreeMap<String, Vec<(usize, usize)>> = BTreeMap::new();
     let mut labels: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for range in &selection.ranges {
@@ -1009,15 +1035,15 @@ fn resolve_line_ranges_unstaged(
             .find(|c| c.path == path)
             .ok_or_else(|| HunkSelectError::RangeSelectsNothing { path: path.clone() })?;
         if change.binary {
-            return Err(HunkSelectError::Binary { path: path.clone() });
+            return Err(HunkSelectError::Binary { path: path.clone() }.into());
         }
         let file = build_file_diff(change, opts);
         if !include_file_in_diff(&file, opts) {
-            return Err(HunkSelectError::RangeSelectsNothing { path });
+            return Err(HunkSelectError::RangeSelectsNothing { path }.into());
         }
         validate_line_ranges(&path, &intervals, new_side_line_count(change))?;
         let peer = peer_hunks.get(&path).map(|h| h.as_slice()).unwrap_or(&[]);
-        let ids = hunk_ids_with_duplicate_peers(DiffSide::Unstaged, &path, &file.hunks, peer);
+        let ids = hunk_ids(DiffSide::Unstaged, &path, &file.hunks, peer);
         let mut partial = Vec::new();
         let mut selected_any = false;
         for (hunk, id) in file.hunks.iter().zip(ids.iter()) {
@@ -1035,7 +1061,7 @@ fn resolve_line_ranges_unstaged(
             .zip(ids.iter())
             .any(|(_, id)| id_selected.contains(id));
         if !selected_any && !id_covered_any {
-            return Err(HunkSelectError::RangeSelectsNothing { path: path.clone() });
+            return Err(HunkSelectError::RangeSelectsNothing { path: path.clone() }.into());
         }
         if selected_any {
             patches.push(file_patch_from_hunks(&file, &partial)?);
@@ -1049,6 +1075,7 @@ fn resolve_line_ranges_unstaged(
         patches,
         selected_hunks: BTreeMap::new(),
         selected_lines: staged_lines,
+        whole_files: BTreeSet::new(),
     })
 }
 
@@ -1102,14 +1129,14 @@ pub struct RestoreHunksOutcome {
 /// # Errors
 ///
 /// [`HunkSelectError`] for resolution failures; [`ApplyError`] for apply failures.
-pub fn restore_hunks(
+pub(crate) fn restore_hunks(
     repo: &Repository,
     selection: &HunkSelection,
     pathspecs: &[String],
     restore_staged: bool,
     restore_worktree: bool,
     dry_run: bool,
-) -> std::result::Result<RestoreHunksOutcome, HunkSelectError> {
+) -> crate::error::Result<RestoreHunksOutcome> {
     let diff_opts = diff_options_for_hunk_select(repo)?;
     let restore_worktree = restore_worktree || !restore_staged;
     let mut outcome = RestoreHunksOutcome {
@@ -1126,8 +1153,9 @@ pub fn restore_hunks(
             &IndexApplyOptions {
                 dry_run,
                 reverse: true,
-                head_tree_oid: head_tree_oid(repo)?,
+                head_tree_oid: repo.head_tree()?,
             },
+            &crate::progress::CancelToken::never(),
         )?;
         outcome
             .restored
@@ -1140,13 +1168,13 @@ pub fn restore_hunks(
     if restore_worktree {
         // One index read serves the diff, the plan and the stat refresh; taking the lock first
         // keeps that read current for the (rare) refresh that has to be written.
-        let handle = repo.index_handle();
+        let handle = repo.index();
         let lock = if dry_run {
             None
         } else {
             Some(handle.begin_update()?)
         };
-        let mut index = handle.load()?;
+        let mut index = handle.load(&crate::index::IndexLoadOptions::default())?;
         let resolved = resolve_selection_in(
             repo,
             Some(&mut index),
@@ -1155,9 +1183,18 @@ pub fn restore_hunks(
             pathspecs,
             diff_opts,
         )?;
-        let planned = plan_worktree_reverse(repo, &index, &resolved.patches)?;
+        let rules = WorktreeRules::from_repository(repo, &index)?;
+        let planned = plan_worktree_reverse(
+            repo,
+            &index,
+            &rules,
+            &resolved.patches,
+            &resolved.whole_files,
+        )?;
         match lock {
-            Some(lock) => commit_worktree_reverse(repo, lock, index, &planned, &mut outcome)?,
+            Some(lock) => {
+                commit_worktree_reverse(repo, lock, index, &rules, &planned, &mut outcome)?
+            }
             None => {
                 for plan in &planned {
                     push_restored_path(&mut outcome.restored, &plan.path);
@@ -1198,16 +1235,27 @@ struct WorktreeReversePlan {
     path: String,
     clean_bytes: Vec<u8>,
     mode: u32,
+    /// Whether the restored file can match its index entry again, which is the only case where
+    /// refreshing the entry's stat data changes anything. A file that keeps some unstaged hunk
+    /// stays different from the index, and leaving its stat data alone is what `git apply` does.
+    may_match_index: bool,
 }
 
+/// Reverse-apply each patch to the clean worktree content of its path.
+///
+/// `whole_files` lists the paths whose every unstaged hunk is in `patches`
+/// ([`ResolvedSelection::whole_files`]).
 fn plan_worktree_reverse(
     repo: &Repository,
     index: &Index,
+    rules: &WorktreeRules,
     patches: &[FilePatch],
-) -> std::result::Result<Vec<WorktreeReversePlan>, HunkSelectError> {
-    let work_tree = repo.work_tree().ok_or(Error::RequiresWorkTree)?;
-    let rules = WorktreeRules::from_repository(repo, index).map_err(HunkSelectError::from)?;
-    let config = repo.config().map_err(HunkSelectError::from)?;
+    whole_files: &BTreeSet<String>,
+) -> crate::error::Result<Vec<WorktreeReversePlan>> {
+    let work_tree = repo
+        .work_tree()
+        .ok_or_else(|| Error::from(RepositoryError::RequiresWorkTree))?;
+    let config = repo.config().snapshot()?;
     let mut out = Vec::with_capacity(patches.len());
     for patch in patches {
         let path = patch
@@ -1215,12 +1263,12 @@ fn plan_worktree_reverse(
             .ok_or(HunkSelectError::MissingPath)?
             .to_string();
         if patch.involves_gitlink() {
-            return Err(HunkSelectError::Gitlink { path });
+            return Err(HunkSelectError::Gitlink { path }.into());
         }
         let entry = index.get(path.as_bytes(), 0);
         let mode = entry.map(|e| e.mode).unwrap_or(MODE_REGULAR);
         if mode != MODE_REGULAR && mode != MODE_EXECUTABLE {
-            return Err(HunkSelectError::Binary { path: path.clone() });
+            return Err(HunkSelectError::Binary { path: path.clone() }.into());
         }
         let abs = crate::repo_relpath::worktree_abs(work_tree, &path);
         let clean = if patch.is_deleted || !abs.exists() {
@@ -1233,16 +1281,17 @@ fn plan_worktree_reverse(
                 mode,
                 config.as_ref(),
                 entry,
-                Some(&rules),
-            )
-            .map_err(HunkSelectError::from)?
+                Some(rules),
+            )?
         };
         let new_clean = apply_hunks_to_blob(&clean, &patch.hunks, &ApplyOptions { reverse: true })
             .map_err(HunkSelectError::Apply)?;
+        let may_match_index = whole_files.contains(&path);
         out.push(WorktreeReversePlan {
             path,
             clean_bytes: new_clean,
             mode,
+            may_match_index,
         });
     }
     Ok(out)
@@ -1250,75 +1299,70 @@ fn plan_worktree_reverse(
 
 /// Write the planned worktree files, then refresh their index stat data.
 ///
-/// `index` must have been loaded while holding `lock`. It is only written when the refresh
-/// changed an entry (a restore that leaves the file different from the index changes nothing,
-/// as with `git apply`); otherwise the lock is released untouched.
+/// `index` must have been loaded while holding `lock`, and `rules` built from it. It is only
+/// written when the refresh changed an entry (a restore that leaves the file different from the
+/// index changes nothing, as with `git apply`); otherwise the lock is released untouched.
 fn commit_worktree_reverse(
     repo: &Repository,
     mut lock: IndexLock,
     mut index: Index,
+    rules: &WorktreeRules,
     planned: &[WorktreeReversePlan],
     outcome: &mut RestoreHunksOutcome,
-) -> std::result::Result<(), HunkSelectError> {
-    let work_tree = repo.work_tree().ok_or(Error::RequiresWorkTree)?;
-    let rules = WorktreeRules::from_repository(repo, &index).map_err(HunkSelectError::from)?;
-    let mut dir_cache = LeadingDirCache::new();
+) -> crate::error::Result<()> {
+    let work_tree = repo
+        .work_tree()
+        .ok_or_else(|| Error::from(RepositoryError::RequiresWorkTree))?;
+    let config = repo.config().snapshot()?;
+    let mut dir_cache = LeadingDirCache::for_config(config.as_ref());
+    let has_symlinks = dir_cache.has_symlinks();
     for plan in planned {
-        // The restored content only lives in the worktree, so it is hashed (for `ident` and
-        // filter metadata) but not stored.
-        let oid = repo
-            .odb()
-            .hash_algo()
-            .hash_object(ObjectKind::Blob, &plan.clean_bytes)
-            .map_err(HunkSelectError::from)?;
-        let worktree_bytes = smudge_bytes_for_worktree_path(
-            repo,
-            &rules,
-            &plan.path,
-            plan.mode,
-            &plan.clean_bytes,
-            &oid,
-        )
-        .map_err(HunkSelectError::from)?;
+        let attrs = rules.file_attrs(&plan.path, false);
+        let smudged;
+        let worktree_bytes = if worktree_conversion_is_identity(rules.conversion(), &attrs) {
+            plan.clean_bytes.as_slice()
+        } else {
+            // The restored content only lives in the worktree, so it is hashed (for `ident` and
+            // filter metadata) but not stored.
+            let oid = repo
+                .odb()
+                .hash_algo()
+                .hash_object(ObjectKind::Blob, &plan.clean_bytes)?;
+            smudged = smudge_bytes_for_worktree_path(
+                repo,
+                rules,
+                &plan.path,
+                plan.mode,
+                &plan.clean_bytes,
+                &oid,
+            )?;
+            smudged.as_slice()
+        };
         write_to_worktree_cached(
             work_tree,
             &plan.path,
-            &worktree_bytes,
+            worktree_bytes,
             plan.mode,
             &mut dir_cache,
+            has_symlinks,
         )?;
         push_restored_path(&mut outcome.restored, &plan.path);
     }
-    if refresh_partial_restore_index_stats(repo, work_tree, &mut index, &outcome.restored)? {
-        repo.index_handle()
-            .commit_update(&mut lock, &mut index, false)?;
+    let still_different: BTreeSet<&str> = planned
+        .iter()
+        .filter(|plan| !plan.may_match_index)
+        .map(|plan| plan.path.as_str())
+        .collect();
+    let touched: BTreeSet<&str> = outcome
+        .restored
+        .iter()
+        .map(String::as_str)
+        .filter(|path| !still_different.contains(path))
+        .collect();
+    if refresh_stage0_index_stats_for_paths(repo, work_tree, &mut index, &touched)? {
+        repo.index().commit_update(&mut lock, &mut index, false)?;
     }
     Ok(())
-}
-
-fn head_tree_oid(repo: &Repository) -> std::result::Result<Option<ObjectId>, HunkSelectError> {
-    match resolve_head_for_repository(repo)? {
-        HeadState::Branch { oid: Some(oid), .. } | HeadState::Detached { oid } => {
-            let obj = repo.odb().read(&oid)?;
-            let commit = parse_commit(&obj.data)?;
-            Ok(Some(commit.tree))
-        }
-        HeadState::Branch { .. } => Ok(None),
-        HeadState::Invalid => Err(Error::InvalidHead.into()),
-    }
-}
-
-/// Returns whether any index entry changed.
-fn refresh_partial_restore_index_stats(
-    repo: &Repository,
-    work_tree: &StdPath,
-    index: &mut Index,
-    restored: &[String],
-) -> std::result::Result<bool, HunkSelectError> {
-    let touched: BTreeSet<&str> = restored.iter().map(String::as_str).collect();
-    Ok(refresh_stage0_index_stats_for_paths(
-        repo, work_tree, index, &touched,
-    )?)
 }
 
 /// Options for [`reverse_apply_patches_to_worktree`].
@@ -1338,13 +1382,13 @@ pub struct WorktreeReverseApplyOptions {
 /// # Errors
 ///
 /// [`ApplyError`] when a patch cannot be reversed on the worktree, and
-/// [`ApplyError::Cancelled`] when `cancel` or [`ProgressSink::should_cancel`] fired.
-pub fn reverse_apply_patches_to_worktree(
+/// [`ApplyError::Cancelled`] when `cancel` fired.
+pub(crate) fn reverse_apply_patches_to_worktree(
     repo: &Repository,
     patches: &[FilePatch],
     opts: &WorktreeReverseApplyOptions,
     progress: &mut dyn ProgressSink,
-    cancel: &dyn Cancel,
+    cancel: &CancelToken,
 ) -> std::result::Result<(), ApplyError> {
     let work_tree = repo.work_tree().ok_or_else(|| ApplyError::Failed {
         path: String::new(),
@@ -1354,7 +1398,7 @@ pub fn reverse_apply_patches_to_worktree(
         path: String::new(),
         message: e.to_string(),
     })?;
-    let config = repo.config().map_err(|e| ApplyError::Failed {
+    let config = repo.config().snapshot().map_err(|e| ApplyError::Failed {
         path: String::new(),
         message: e.to_string(),
     })?;
@@ -1467,8 +1511,10 @@ pub fn reverse_apply_patches_to_worktree(
 /// # Errors
 ///
 /// Returns repository config errors.
-pub fn diff_options_for_hunk_select(repo: &Repository) -> std::result::Result<DiffOptions, Error> {
-    let config = repo.config()?;
+pub(crate) fn diff_options_for_hunk_select(
+    repo: &Repository,
+) -> std::result::Result<DiffOptions, Error> {
+    let config = repo.config().snapshot()?;
     Ok(DiffOptions::from_config(config.as_ref()))
 }
 
@@ -1480,24 +1526,27 @@ pub fn diff_options_for_hunk_select(repo: &Repository) -> std::result::Result<Di
 /// # Errors
 ///
 /// [`HunkSelectError`] for resolution failures; [`ApplyError`] for index apply failures.
-pub fn stage_hunks(
+pub(crate) fn stage_hunks(
     repo: &Repository,
     side: DiffSide,
     selection: &HunkSelection,
     pathspecs: &[String],
     diff_options: DiffOptions,
     dry_run: bool,
-) -> std::result::Result<StageHunksOutcome, HunkSelectError> {
+    cancel: &crate::progress::CancelToken,
+) -> crate::error::Result<StageHunksOutcome> {
     // Lock first so the selection is resolved against the index the patches are applied to. The
     // index is reloaded rather than kept across the diff, which would add it to the diff's peak.
-    let handle = repo.index_handle();
+    let handle = repo.index();
     let mut lock = if dry_run {
         None
     } else {
         Some(handle.begin_update()?)
     };
+    crate::progress::poll_cancel(&mut crate::progress::NullProgress, cancel)?;
     let resolved = resolve_selection_in(repo, None, side, selection, pathspecs, diff_options)?;
-    let mut index = handle.load()?;
+    crate::progress::poll_cancel(&mut crate::progress::NullProgress, cancel)?;
+    let mut index = handle.load(&crate::index::IndexLoadOptions::default())?;
     let apply = apply_patch_to_index(
         repo,
         &mut index,
@@ -1507,7 +1556,9 @@ pub fn stage_hunks(
             ..IndexApplyOptions::default()
         },
     )?;
+    crate::progress::poll_cancel(&mut crate::progress::NullProgress, cancel)?;
     if let Some(lock) = lock.as_mut() {
+        crate::progress::poll_cancel(&mut crate::progress::NullProgress, cancel)?;
         handle.commit_update(lock, &mut index, false)?;
     }
     Ok(StageHunksOutcome::from_apply(
@@ -1527,7 +1578,7 @@ fn map_parse_err(_err: Error) -> HunkSelectError {
 /// # Errors
 ///
 /// Propagates repository and diff errors.
-pub fn list_unstaged_hunk_ids(
+pub(crate) fn list_unstaged_hunk_ids(
     repo: &Repository,
     pathspecs: &[String],
     diff_options: DiffOptions,
@@ -1566,8 +1617,9 @@ pub fn list_unstaged_hunk_ids(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::diff::hunk_diff_bundle;
-    use crate::diff::hunk_id::hunk_ids;
+    use crate::diff::hunk_ids;
+    use crate::diff::targets::hunk_diff_bundle;
+    use crate::error::RefError;
     use crate::index::write_tree::write_tree_from_index;
     use crate::porcelain::add::{stage, StageOptions};
     use crate::progress::NullProgress;
@@ -1596,7 +1648,7 @@ mod tests {
     fn init_repo() -> (tempfile::TempDir, Repository) {
         let dir = tempfile::tempdir().expect("tempdir");
         git(dir.path(), &["init", "-q", "-b", "main"]);
-        let repo = Repository::init(dir.path(), &InitOptions::default()).expect("init");
+        let (repo, _) = Repository::init(dir.path(), &InitOptions::default()).expect("init");
         (dir, repo)
     }
 
@@ -1633,7 +1685,7 @@ mod tests {
         let (files, peers) =
             unstaged_file_diffs_with_peer_hunks(&repo, &[], DiffOptions::default()).unwrap();
         assert_eq!(files.len(), 1);
-        let ids = hunk_ids_with_duplicate_peers(
+        let ids = hunk_ids(
             DiffSide::Unstaged,
             "f.txt",
             &files[0].hunks,
@@ -1659,10 +1711,10 @@ mod tests {
             &[],
             hunk_diff_opts(),
             false,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
-        let grit_tree =
-            write_tree_from_index(repo.odb(), &repo.index_handle().load().unwrap(), "").unwrap();
+        let grit_tree = write_tree_from_index(repo.odb(), &repo.load_index().unwrap(), "").unwrap();
 
         git(root, &["read-tree", "HEAD"]);
         let patch_path = root.join("partial.diff");
@@ -1740,7 +1792,7 @@ mod tests {
 
         let (files, peers) =
             unstaged_file_diffs_with_peer_hunks(&repo, &[], DiffOptions::default()).unwrap();
-        let ids = hunk_ids_with_duplicate_peers(
+        let ids = hunk_ids(
             DiffSide::Unstaged,
             "f.txt",
             &files[0].hunks,
@@ -1759,6 +1811,7 @@ mod tests {
             &[],
             hunk_diff_opts(),
             false,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         stage_hunks(
@@ -1771,6 +1824,7 @@ mod tests {
             &[],
             hunk_diff_opts(),
             false,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         git(root, &["fsck"]);
@@ -1794,9 +1848,9 @@ mod tests {
         git(root, &["commit", "-qm", "init"]);
         std::fs::write(root.join("f.txt"), edited_two).unwrap();
 
-        let opts = DiffOptions::from_config(repo.config().unwrap().as_ref());
+        let opts = DiffOptions::from_config(repo.config().snapshot().unwrap().as_ref());
         let (files, peers) = unstaged_file_diffs_with_peer_hunks(&repo, &[], opts.clone()).unwrap();
-        let ids = hunk_ids_with_duplicate_peers(
+        let ids = hunk_ids(
             DiffSide::Unstaged,
             "f.txt",
             &files[0].hunks,
@@ -1817,6 +1871,7 @@ mod tests {
             &[],
             opts,
             false,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         git(root, &["fsck"]);
@@ -1837,7 +1892,7 @@ mod tests {
         std::fs::write(root.join("f.txt"), edited).unwrap();
         let (files, peers) =
             unstaged_file_diffs_with_peer_hunks(&repo, &[], DiffOptions::default()).unwrap();
-        let ids = hunk_ids_with_duplicate_peers(
+        let ids = hunk_ids(
             DiffSide::Unstaged,
             "f.txt",
             &files[0].hunks,
@@ -1856,10 +1911,16 @@ mod tests {
             &["f.txt".into()],
             hunk_diff_opts(),
             false,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap_err();
         assert!(
-            matches!(err, HunkSelectError::Binary { .. }),
+            matches!(
+                err,
+                crate::error::Error::Diff(crate::error::DiffError::HunkSelection(
+                    HunkSelectError::Binary { .. }
+                ))
+            ),
             "expected Binary, got {err:?}"
         );
     }
@@ -1876,7 +1937,7 @@ mod tests {
         git(root, &["add", "f.txt"]);
         git(root, &["commit", "-qm", "init"]);
         std::fs::write(root.join("f.txt"), b"two\n").unwrap();
-        let before = repo.index_handle().load().unwrap();
+        let before = repo.load_index().unwrap();
         let stale = HunkId::from_str("000000000001").unwrap();
         let err = stage_hunks(
             &repo,
@@ -1888,10 +1949,16 @@ mod tests {
             &[],
             hunk_diff_opts(),
             false,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap_err();
-        assert!(matches!(err, HunkSelectError::StaleId { .. }));
-        let after = repo.index_handle().load().unwrap();
+        assert!(matches!(
+            err,
+            crate::error::Error::Diff(crate::error::DiffError::HunkSelection(
+                HunkSelectError::StaleId { .. }
+            ))
+        ));
+        let after = repo.load_index().unwrap();
         assert_eq!(before.entries.len(), after.entries.len());
     }
 
@@ -1911,13 +1978,13 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         let staged_files =
             collect_files_for_target(&repo, &DiffTarget::IndexVsHead, &[], DiffOptions::default())
                 .unwrap();
-        let staged_id = hunk_ids(DiffSide::Staged, "f.txt", &staged_files[0].hunks)[0].clone();
+        let staged_id = hunk_ids(DiffSide::Staged, "f.txt", &staged_files[0].hunks, &[])[0].clone();
         std::fs::write(root.join("f.txt"), b"three\n").unwrap();
         let err = stage_hunks(
             &repo,
@@ -1929,15 +1996,18 @@ mod tests {
             &[],
             hunk_diff_opts(),
             false,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap_err();
         assert!(matches!(
             err,
-            HunkSelectError::WrongSide {
-                actual_side: DiffSide::Staged,
-                requested_side: DiffSide::Unstaged,
-                ..
-            }
+            crate::error::Error::Diff(crate::error::DiffError::HunkSelection(
+                HunkSelectError::WrongSide {
+                    actual_side: DiffSide::Staged,
+                    requested_side: DiffSide::Unstaged,
+                    ..
+                }
+            ))
         ));
     }
 
@@ -1956,18 +2026,18 @@ mod tests {
 
     #[test]
     fn repository_error_keeps_typed_source() {
-        let err = HunkSelectError::from(Error::InvalidHead);
-        assert_eq!(err.to_string(), Error::InvalidHead.to_string());
-        match err {
-            HunkSelectError::Repository(inner) => assert!(matches!(*inner, Error::InvalidHead)),
-            other => panic!("expected Repository, got {other:?}"),
-        }
+        let err = Error::Ref(RefError::InvalidHead);
+        assert_eq!(
+            err.to_string(),
+            Error::Ref(RefError::InvalidHead).to_string()
+        );
+        assert!(matches!(err, Error::Ref(RefError::InvalidHead)));
     }
 
     #[test]
     fn other_side_is_unselectable() {
         let dir = tempfile::tempdir().unwrap();
-        let repo = Repository::init(dir.path(), &InitOptions::default()).unwrap();
+        let (repo, _) = Repository::init(dir.path(), &InitOptions::default()).unwrap();
         let by_id = HunkSelection {
             ids: vec![HunkId::from_bytes([1; 6])],
             ranges: Vec::new(),
@@ -1986,9 +2056,11 @@ mod tests {
             assert!(
                 matches!(
                     err,
-                    HunkSelectError::UnselectableSide {
-                        side: DiffSide::Other
-                    }
+                    crate::error::Error::Diff(crate::error::DiffError::HunkSelection(
+                        HunkSelectError::UnselectableSide {
+                            side: DiffSide::Other
+                        }
+                    ))
                 ),
                 "{err:?}"
             );
@@ -2005,10 +2077,19 @@ mod tests {
             .unwrap()
     }
 
+    fn plan_without_selection(
+        repo: &Repository,
+        patches: &[FilePatch],
+    ) -> crate::error::Result<Vec<WorktreeReversePlan>> {
+        let index = Index::new();
+        let rules = WorktreeRules::from_repository(repo, &index)?;
+        plan_worktree_reverse(repo, &index, &rules, patches, &BTreeSet::new())
+    }
+
     #[test]
     fn restore_plan_requires_work_tree() {
         let dir = tempfile::tempdir().unwrap();
-        let repo = Repository::init(
+        let (repo, _) = Repository::init(
             dir.path(),
             &InitOptions {
                 bare: true,
@@ -2016,13 +2097,11 @@ mod tests {
             },
         )
         .unwrap();
-        let err = plan_worktree_reverse(&repo, &Index::new(), &[one_line_patch("f.txt")])
+        let err = plan_without_selection(&repo, &[one_line_patch("f.txt")])
             .err()
             .unwrap();
         match err {
-            HunkSelectError::Repository(inner) => {
-                assert!(matches!(*inner, Error::RequiresWorkTree), "{inner:?}");
-            }
+            Error::Repository(RepositoryError::RequiresWorkTree) => {}
             other => panic!("expected Repository(RequiresWorkTree), got {other:?}"),
         }
     }
@@ -2030,25 +2109,29 @@ mod tests {
     #[test]
     fn restore_plan_rejects_gitlink_and_pathless_patches() {
         let dir = tempfile::tempdir().unwrap();
-        let repo = Repository::init(dir.path(), &InitOptions::default()).unwrap();
+        let (repo, _) = Repository::init(dir.path(), &InitOptions::default()).unwrap();
 
         let mut gitlink = one_line_patch("sub");
         gitlink.new_mode = Some("160000".into());
-        let err = plan_worktree_reverse(&repo, &Index::new(), &[gitlink])
-            .err()
-            .unwrap();
+        let err = plan_without_selection(&repo, &[gitlink]).err().unwrap();
         assert!(
-            matches!(&err, HunkSelectError::Gitlink { path } if path == "sub"),
+            matches!(&err, crate::error::Error::Diff(crate::error::DiffError::HunkSelection(HunkSelectError::Gitlink { path })) if path == "sub"),
             "{err:?}"
         );
 
         let mut pathless = one_line_patch("f.txt");
         pathless.old_path = None;
         pathless.new_path = None;
-        let err = plan_worktree_reverse(&repo, &Index::new(), &[pathless])
-            .err()
-            .unwrap();
-        assert!(matches!(err, HunkSelectError::MissingPath), "{err:?}");
+        let err = plan_without_selection(&repo, &[pathless]).err().unwrap();
+        assert!(
+            matches!(
+                err,
+                crate::error::Error::Diff(crate::error::DiffError::HunkSelection(
+                    HunkSelectError::MissingPath
+                ))
+            ),
+            "{err:?}"
+        );
     }
 
     #[cfg_attr(
@@ -2071,7 +2154,7 @@ mod tests {
                 ..StageOptions::default()
             },
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         let (files, peers) =
@@ -2084,7 +2167,7 @@ mod tests {
             !new_file.hunks.is_empty(),
             "new file should have structured hunks"
         );
-        let ids = hunk_ids_with_duplicate_peers(
+        let ids = hunk_ids(
             DiffSide::Unstaged,
             "new.txt",
             &new_file.hunks,
@@ -2100,14 +2183,10 @@ mod tests {
             &[],
             hunk_diff_opts(),
             false,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
-        assert!(repo
-            .index_handle()
-            .load()
-            .unwrap()
-            .get(b"new.txt", 0)
-            .is_some());
+        assert!(repo.load_index().unwrap().get(b"new.txt", 0).is_some());
         git(root, &["fsck"]);
     }
 
@@ -2142,10 +2221,10 @@ mod tests {
             &[path.into()],
             hunk_diff_opts(),
             false,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
-        let grit_tree =
-            write_tree_from_index(repo.odb(), &repo.index_handle().load().unwrap(), "").unwrap();
+        let grit_tree = write_tree_from_index(repo.odb(), &repo.load_index().unwrap(), "").unwrap();
         std::fs::write(&index_path, index_before).unwrap();
         let patch_path = root.join("partial.diff");
         std::fs::write(&patch_path, patch_text).unwrap();
@@ -2186,14 +2265,11 @@ mod tests {
             &[],
             hunk_diff_opts(),
             false,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         assert!(
-            repo.index_handle()
-                .load()
-                .unwrap()
-                .get(b"gone.txt", 0)
-                .is_none(),
+            repo.load_index().unwrap().get(b"gone.txt", 0).is_none(),
             "index entry removed after staging delete hunk"
         );
     }
@@ -2215,7 +2291,7 @@ mod tests {
         let (files, peers) =
             unstaged_file_diffs_with_peer_hunks(&repo, &[], DiffOptions::default()).unwrap();
         let file = files.iter().find(|f| f.path == "pkg/a.txt").expect("a.txt");
-        let ids = hunk_ids_with_duplicate_peers(
+        let ids = hunk_ids(
             DiffSide::Unstaged,
             "pkg/a.txt",
             &file.hunks,
@@ -2231,6 +2307,7 @@ mod tests {
             &[],
             hunk_diff_opts(),
             false,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         let file_pathspec = vec!["pkg/a.txt".to_string()];
@@ -2354,8 +2431,15 @@ mod tests {
         git(root, &["add", "f.txt"]);
         git(root, &["commit", "-qm", "init"]);
         std::fs::write(root.join("f.txt"), b"a\nB\n").unwrap();
-        let bundle = hunk_diff_bundle(&repo, &[":(glob)*.txt".into()], DiffOptions::default())
-            .expect("bundle");
+        let bundle = hunk_diff_bundle(
+            &repo,
+            &crate::pathspec::Pathspec::scoped(
+                [":(glob)*.txt"],
+                crate::pathspec::PathspecGlobalFlags::default(),
+            ),
+            DiffOptions::default(),
+        )
+        .expect("bundle");
         assert!(
             bundle.unstaged.iter().any(|f| f.path == "f.txt"),
             "expected f.txt in bundle, got {:?}",
@@ -2394,6 +2478,7 @@ mod tests {
             &[":(glob)*.txt".into()],
             hunk_diff_opts(),
             false,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         git(root, &["fsck"]);
@@ -2413,7 +2498,7 @@ mod tests {
         std::fs::write(root.join("f.txt"), b"two\n").unwrap();
         let (files, peers) =
             unstaged_file_diffs_with_peer_hunks(&repo, &[], DiffOptions::default()).unwrap();
-        let ids = hunk_ids_with_duplicate_peers(
+        let ids = hunk_ids(
             DiffSide::Unstaged,
             "f.txt",
             &files[0].hunks,
@@ -2434,6 +2519,7 @@ mod tests {
             &["f.txt".into()],
             hunk_diff_opts(),
             false,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         git(root, &["fsck"]);
@@ -2471,10 +2557,16 @@ mod tests {
             &[],
             hunk_diff_opts(),
             false,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap_err();
         assert!(
-            matches!(err, HunkSelectError::RangeSelectsNothing { .. }),
+            matches!(
+                err,
+                crate::error::Error::Diff(crate::error::DiffError::HunkSelection(
+                    HunkSelectError::RangeSelectsNothing { .. }
+                ))
+            ),
             "expected RangeSelectsNothing, got {err:?}"
         );
     }
@@ -2505,9 +2597,15 @@ mod tests {
             &[],
             hunk_diff_opts(),
             false,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap_err();
-        assert!(matches!(err, HunkSelectError::RangeOutOfBounds { .. }));
+        assert!(matches!(
+            err,
+            crate::error::Error::Diff(crate::error::DiffError::HunkSelection(
+                HunkSelectError::RangeOutOfBounds { .. }
+            ))
+        ));
     }
 
     #[cfg(unix)]
@@ -2559,7 +2657,7 @@ mod tests {
     fn stage_lines_dry_run_writes_nothing_and_stages_only_the_range() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let repo = Repository::init(root, &InitOptions::default()).unwrap();
+        let (repo, _) = Repository::init(root, &InitOptions::default()).unwrap();
         let base = numbered_lines(40);
         std::fs::write(root.join("f.txt"), &base).unwrap();
         std::fs::write(root.join("other.txt"), b"other\n").unwrap();
@@ -2567,7 +2665,7 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         std::fs::write(root.join("f.txt"), edit_every_tenth_line(&base)).unwrap();
@@ -2589,6 +2687,7 @@ mod tests {
             &["f.txt".into()],
             hunk_diff_opts(),
             true,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         assert!(outcome.dry_run);
@@ -2603,11 +2702,12 @@ mod tests {
             &["f.txt".into()],
             hunk_diff_opts(),
             false,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         assert_eq!(outcome.staged_lines["f.txt"], ["1-15"]);
         assert!(!root.join(".git/index.lock").exists());
-        let index = repo.index_handle().load().unwrap();
+        let index = repo.load_index().unwrap();
         let staged = repo
             .odb()
             .read(&index.get(b"f.txt", 0).unwrap().oid)
@@ -2706,6 +2806,7 @@ mod tests {
             &["f.txt".into()],
             hunk_diff_opts(),
             false,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         git(root, &["commit", "-qm", "partial"]);
@@ -2723,6 +2824,7 @@ mod tests {
             &["f.txt".into()],
             hunk_diff_opts(),
             false,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         stage_lines_and_compare_git(
@@ -2770,10 +2872,10 @@ mod tests {
             &[],
             hunk_diff_opts(),
             false,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
-        let grit_tree =
-            write_tree_from_index(repo.odb(), &repo.index_handle().load().unwrap(), "").unwrap();
+        let grit_tree = write_tree_from_index(repo.odb(), &repo.load_index().unwrap(), "").unwrap();
         git(root, &["read-tree", "HEAD"]);
         let patch_path = root.join("partial.diff");
         std::fs::write(&patch_path, patch_text).unwrap();

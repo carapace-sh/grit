@@ -22,8 +22,8 @@ cargo test -p grit-lib --lib
 cargo test -p grit-lib -p grit-cli
 
 # Whole workspace, fast (what `make test` runs: nextest when installed, then doctests)
-cargo nextest run --workspace && cargo test --workspace --doc
-cargo test --workspace   # without nextest
+cargo nextest run --workspace --features grit-lib/test-support && cargo test --workspace --doc --features grit-lib/test-support
+cargo test --workspace --features grit-lib/test-support   # without nextest
 
 # Everything, including git comparisons and heavy fixtures (`make test-full`, nightly CI)
 make test-full
@@ -147,6 +147,8 @@ cargo test -p grit-lib --features http-ureq --test matrix_credentials
 
 Add `-- --nocapture` and look for `SKIP:` lines to confirm nothing was skipped.
 
+Init-time filesystem capability detection is covered by [`grit-lib/tests/init_filesystem_capabilities.rs`](grit-lib/tests/init_filesystem_capabilities.rs) (`full-tests`, separate `[[test]]` target because it compares grit init config with system `git config`). It exercises [`FilesystemCapabilities`](grit-lib/src/init_filesystem.rs) against the `core.filemode`, `core.symlinks`, `core.ignorecase`, and `core.precomposeunicode` values grit writes.
+
 ### Parser fuzzing (`grit-lib/fuzz`)
 
 `grit-lib/fuzz/` is a **standalone** `cargo-fuzz` crate (not a workspace member; **nightly Rust only**). It exercises parser entry points in [`grit_lib::fuzz`](grit-lib/src/fuzz/mod.rs) for trees, commits, tags, the index, pkt-lines, protocol v2 responses, config, refspecs, ref names, transport URLs, dates, pack `.idx` files, and `packed-refs`.
@@ -228,6 +230,70 @@ make public-api-check
 
 The first run may install the pinned nightly toolchain and `cargo-public-api` (OpenSSL development headers are required to build the tool on Linux). The check is **not** part of **`make gate`** because installing nightly is slow; CI runs it in the dedicated **public-api** job.
 
+## Semver check
+
+[`scripts/semver-check.sh`](scripts/semver-check.sh) runs [`cargo-semver-checks`](https://github.com/obi1kenobi/cargo-semver-checks) **`check-release`** on **`grit-lib`** with **`--features http-ureq`** (same surface as the public API snapshot; no `test-support`). Until **0.6.0**, the baseline git revision comes from **`semver_baseline`** in [`grit-lib/api-ratchet.toml`](grit-lib/api-ratchet.toml) (bump it when you regenerate **`public-api.txt`** after an intentional API change). Override with **`SEMVER_BASELINE`**, or fall back to the latest **`v*`** tag when the pin is absent. Pin: **`CARGO_SEMVER_CHECKS_VERSION`** in the script.
+
+**Check locally (same as CI semver-check job):**
+
+```bash
+make semver-check
+```
+
+The first run may install **`cargo-semver-checks`** (OpenSSL development headers required on Linux). The tool builds the baseline crate in **`target/semver-checks/`**, not the normal worktree target dir. The check is **not** part of **`make gate`** because it clones and compiles the baseline tag; CI runs it in the dedicated **semver-check** job (**`continue-on-error: true`** until **0.6.0** — delete that line when the release policy becomes additive-only within **0.6.x**).
+
+## API ratchet
+
+[`scripts/api_ratchet.py`](scripts/api_ratchet.py) tracks public API quality metrics that must not grow without an intentional fix (and must ratchet down when you improve the API). Counts live in [`grit-lib/api-ratchet.toml`](grit-lib/api-ratchet.toml) next to the hygiene baseline. Inputs are the committed [`grit-lib/public-api.txt`](grit-lib/public-api.txt) and rustdoc JSON for `grit-lib` built with the pinned nightly from [`scripts/public-api.sh`](scripts/public-api.sh), `--features http-ureq` (same surface as the public API snapshot; no `test-support`).
+
+**Regenerate after intentional metric reductions:**
+
+```bash
+make api-ratchet
+```
+
+Commit `grit-lib/api-ratchet.toml` with the code change.
+
+**Check locally (same as CI public-api job):**
+
+```bash
+make api-ratchet-check
+```
+
+The check fails if any count **increases**, or **decreases** without updating the baseline (same ratchet rule as hygiene). When the pinned nightly is not installed, **`make gate`** prints a skip line instead of running the check; CI always runs it in the **public-api** job after **`make public-api-check`**.
+
+**Find what to consolidate next:**
+
+```bash
+make api-ratchet-report             # offenders per top-level module
+make api-ratchet-report MODULE=diff # one module
+```
+
+The report groups the `_with_`, `too_many_arguments`, two-bool, `&Repository`-first and git-dir-first offenders by public module (see **Canonical forms** in [`grit-lib/API.md`](grit-lib/API.md#canonical-forms)). It is informational and never fails.
+
+Unit tests: `python3 -m unittest scripts/tests/test_api_ratchet.py` (also covered by the **scripts** CI job).
+
+| Metric | What increases the count |
+| --- | --- |
+| `pub_cancel_types` | Public items in the cancel family (`Cancel`, `CancelToken`, `NeverCancel`, `CancelProgress`, `cancel_watch_arc`, `poll_watch`, `poll_cancel_watch`, `mirror_stack_cancel`) plus every public function parameter or struct field typed `dyn Cancel`, `Arc<AtomicBool>`, or `&AtomicBool`. Prefer [`CancelToken`](grit-lib) over raw flags. |
+| `pub_progress_interfaces` | Public traits whose name ends in `Progress` or that inherit `ProgressSink`, public structs whose name ends in `Progress`, plus public functions taking `FnMut` whose callback argument type name contains `Progress`. |
+| `pub_refname_validators` | Public free functions defined under `refs/` (including `check_ref_format`) whose name or path matches `refname` / `ref_name` / `ref_format` and that return `bool` or `Result<(), _>`. |
+| `pub_fn_refname_str` | Public functions or methods under `refs`, `refs::store`, `repo_handles`, or `revwalk` with a parameter named `name`, `refname`, `ref_name`, or `target_ref` typed `&str` or `String`. |
+| `pub_fn_pathspec_strings` | Public functions with a parameter named `pathspec`, `pathspecs`, `paths`, or `specs` typed `&[String]`, `Vec<String>`, or `&[&str]`, plus `sources` / `specs` fields on `ResolvedPathspecs`. |
+| `pub_fn_configset_with_repo` | Public functions or methods that take `&ConfigSet` and also take `&Repository` as the first parameter or use `&self` on a repository handle. |
+| `pub_repo_constructors` | Public associated functions returning `Repository` or `Result<Repository, _>`, plus `RepositoryLocation::discover*` and `rev_parse::discover_optional`. |
+
+Existing metrics (`public_api_lines`, `pub_fn_with_in_name`, `pub_free_fn_repository_first`, and the rest) are unchanged.
+
+### `test-support` and public API test hooks
+
+**`test-support`** is an empty-by-default, **unstable** `grit-lib` feature. It exposes [`grit_lib::test_support`](grit-lib/src/test_support/mod.rs) (including [`test_support::fixtures`](grit-lib/src/test_support/fixtures/mod.rs) for synthetic benchmark repos and [`test_support::ewah`](grit-lib/src/test_support/ewah.rs) for EWAH Criterion fixtures) for workspace tests and internal crates only. Enable it from **`grit-test-support`**, **`grit-utils`**, and **`cargo test --workspace`** / **`make gate`** via **`--features grit-lib/test-support`**; do not enable it from **`grit-cli`**, **`grit-protocol`**, or **`grit-http-server`** `[dependencies]`. It is **outside semver**: omitted from **`public-api.txt`** and **`make semver-check`**, and may change in any release. **`make gate`** and CI still run **`cargo check -p grit-lib`** and **`cargo check -p grit-cli`** without the feature so the default embedder build stays clean.
+
+Test hooks belong in several tiers (roadmap API 0.6): **`test_support::fixtures`** for shared repo generators, **`test_support::fuzz`** for `cargo fuzz` entry points, **`test_support::knobs`** for options-type test overrides, **`test_support::counters`** for hot-path probe counters (worktree stat scans, checkout spool deletes, diff blob reads, `has_changes` early-exit), **`test_support::inject`** for failure/pause/probe injection used by integration and CLI tests, **`test_support::status`** for opportunistic index-write race hooks, and other **`test_support`** helpers for cross-crate wiring. Legacy **`#[doc(hidden)]`** public hooks are retired in favor of **`test_support`** (or **`pub(crate)`** fields set only from in-crate code).
+
+Pack/ODB/index-pack/commit-graph integration hooks live under **`grit_lib::test_support`** (for example **`pack::pack_cache_guard`**, **`pack_store::{reset, implicit_stores_created, legacy_stores_created}`**, **`index_pack::{set_ingest_thread_recording, last_resolved_ingest_threads}`**, **`commit_graph::chain_from_layers`**). Counters and ingest-thread recorders compile out unless **`test-support`** or **`cfg(test)`** is active. **`Odb::test_loose_object_path`** / **`test_remove_loose_object`** and **`write_tree::test_tree_write_count`** stay **`#[cfg(test)]`** on the library because only in-crate unit tests use them.
+
+**Ratchet:** [`grit-lib/tests/public_api_test_items.rs`](grit-lib/tests/public_api_test_items.rs) (in the **`integration`** test binary) parses [`grit-lib/public-api.txt`](grit-lib/public-api.txt) and fails when any path segment looks like a test, probe, fixture, or bench hook (`test`, `probe`, `fixture`, `bench`, …). There is **no allowlist**: move hooks to **`test_support`**, rename, or make them **`pub(crate)`**. [`scripts/public-api.sh check-test-items`](scripts/public-api.sh) applies the same rule to **hidden** public items via rustdoc JSON (`--document-hidden-items`; `cargo-public-api` 0.52 has no flag). That check runs in **`make public-api-check`** and the **public-api** CI job. Grit does **not** read **`GIT_TEST_*`** environment variables; use **`test_support`** helpers, config keys, or **`OwnershipCheck`** in tests instead (keep **`GIT_TEST_*`** only when invoking the system **`git`** binary for cross-checks).
 ## Continuous integration
 
 GitHub Actions workflow: [`.github/workflows/ci.yml`](.github/workflows/ci.yml). It runs on push to **`main`**, on **pull requests**, nightly (**schedule**), and via **workflow_dispatch**. Superseded PR runs are cancelled via workflow **`concurrency`**.
@@ -246,7 +312,8 @@ Pushes and pull requests run only the fast jobs, the merge status. The nightly j
 | **fmt** | `cargo fmt --all --check` | `cargo fmt --all --check` |
 | **clippy** | `cargo clippy --workspace -- -D warnings` | `CARGO_BUILD_JOBS=$(nproc) cargo clippy --workspace -- -D warnings` |
 | **rustdoc** | Workspace API docs with warnings denied (see below) | `make doc` |
-| **public-api** | `make public-api-check` (`cargo public-api` on pinned nightly; diff vs `grit-lib/public-api.txt`) | `make public-api-check` |
+| **public-api** | `make public-api-check` then `make api-ratchet-check` (`cargo public-api` on pinned nightly; diff vs `grit-lib/public-api.txt`; API quality counts vs `grit-lib/api-ratchet.toml`) | `make public-api-check` and `make api-ratchet-check` |
+| **semver-check** | `make semver-check` (`cargo-semver-checks` vs latest reachable `v*` tag; informational until 0.6.0) | `make semver-check` |
 | **coverage** | Nightly and on demand only: `make coverage` (llvm-cov over every `grit-lib` test, `full-tests` included, floor ratchet) | `make coverage` |
 | **test** | The fast run: `cargo nextest run --workspace --profile ci` (every test binary, in parallel, without stopping at the first failure) and `cargo test --workspace --doc` | `make test` |
 | **test-full** | Nightly and on demand only: the same with `full-tests` on every crate (system `git` comparisons, heavy fixtures, `grit-bench` scenarios), the transport tests and Criterion smoke runs | `make test-full`; see [Transport tests](#transport-tests-fetch-and-push-over-smart-http) |
@@ -303,7 +370,7 @@ Each floor moves to `max(previous, current − 2.0)` rounded down to one decimal
 
 Every **public** function and method in `grit-lib` must be executed at least once by the combined **`--lib`**, integration **`--tests`**, and **`--doc`** runs that feed `make coverage`. The gate is [`scripts/public_fn_coverage.py`](scripts/public_fn_coverage.py):
 
-- Public paths come from **rustdoc JSON** (`target/doc/grit_lib.json`), built with the same pinned nightly as [`scripts/public-api.sh`](scripts/public-api.sh) (see the **public-api** CI job).
+- Public paths come from **rustdoc JSON** (`target/doc/grit_lib.json`), built with the same pinned nightly as [`scripts/public-api.sh`](scripts/public-api.sh) (see the **public-api** CI job). The **api-ratchet** gate uses a separate file (`target/api-ratchet-doc/grit_lib.json`, `http-ureq` only) and **check-test-items** uses `target/public-api-test-items-doc/grit_lib.json` (`--document-hidden-items`) so gates do not share one stale `grit_lib.json`.
 - Execution counts come from **`cargo llvm-cov --json`** function records (demangled with **`rustfilt`**), merged across `target/llvm-cov/summary.json` and `target/llvm-cov/functions-doc.json`.
 - Paths with zero executions must appear in [`grit-lib/public-fn-untested.txt`](grit-lib/public-fn-untested.txt). That allowlist **may only shrink**: the gate fails if an allowlisted path gains coverage (remove it in the same change as the new test) or if a public path is missing from both tests and the allowlist.
 
@@ -456,8 +523,8 @@ History-area upstream `t/` scripts are mapped in the subsections below as Rust c
 | t1600-index.sh | EOIE/IEOT parallel load (existing step) | `grit-lib/tests/index_eoie_ieot_git_compat.rs` | covered (see ODB mapping) |
 | t1700-split-index.sh | grit writes `link` + `sharedindex.<oid>`; system `git ls-files --stage` and `fsck --strict`; delete/replace EWAH bitmaps; `splitIndex.maxPercentChange` rebuild; `splitIndex.sharedIndexExpire` cleanup; `resolve_split_index_if_needed` on git split indexes | `grit-lib/tests/split_index_git_compat.rs` (`t1700_split_index_written_by_grit_read_by_git`, `t1700_git_split_index_read_by_grit`, `t1700_split_index_delete_and_replace_bitmaps_match_git`, `t1700_max_percent_change_rewrites_shared_index`, `t1700_shared_index_expire_removes_stale_file`, `split_index_link_extension_corrupt_rejected_without_panic`, `split_index_explicit_no_split_writes_unified_index`) | covered |
 | t1701-racy-split-index.sh | racy entries re-verified under split index (content vs stat) | `grit-lib/tests/split_index_git_compat.rs` (`t1701_racy_split_index_entries_rechecked`) | covered |
-| t7063-status-untracked-cache.sh | UNTR extension grit→git status reuse and git→grit; invalidation on add/remove; `dir_flags_from_config`; ident mismatch bypasses stale cache; `collect_untracked_from_cache` vs `git status --porcelain --untracked-files=all`; corrupt UNTR payloads | `grit-lib/tests/untracked_cache_git_compat.rs` (`t7063_untracked_cache_reused_by_git_status`, `t7063_git_untracked_cache_read_by_grit_status`, `t7063_invalidation_matches_git`, `t7063_dir_flags_from_config_modes`, `t7063_ident_mismatch_discards_stale_cache`, `untracked_extension_corrupt_payload_no_panic`, `index_name_hash_lazy_ignorecase_lookup`) | covered (skip git UX-only dump/progress cases) |
-| t3008 lazy name-hash | case-insensitive `memihash` / lazy init thresholds | `grit-lib/tests/untracked_cache_git_compat.rs` (`index_name_hash_lazy_ignorecase_lookup`) | partial (test-tool dump parity deferred) |
+| t7063-status-untracked-cache.sh | UNTR extension grit→git status reuse and git→grit; invalidation on add/remove; `dir_flags_from_config`; ident mismatch bypasses stale cache; `collect_untracked_from_cache` vs `git status --porcelain --untracked-files=all`; corrupt UNTR payloads | `grit-lib/tests/untracked_cache_git_compat.rs` (`t7063_untracked_cache_reused_by_git_status`, `t7063_git_untracked_cache_read_by_grit_status`, `t7063_invalidation_matches_git`, `t7063_dir_flags_from_config_modes`, `t7063_ident_mismatch_discards_stale_cache`, `untracked_extension_corrupt_payload_no_panic`, `index_name_hash_memihash_folds_ascii_case`) | covered (skip git UX-only dump/progress cases) |
+| t3008 lazy name-hash | case-insensitive `memihash` (the `test-tool lazy-init-name-hash` dump is not a library API) | `grit-lib/tests/untracked_cache_git_compat.rs` (`index_name_hash_memihash_folds_ascii_case`) | partial |
 
 #### Sparse
 
@@ -541,13 +608,13 @@ Shared harness: [`grit-lib/tests/support/diff_harness.rs`](grit-lib/tests/suppor
 | upstream file | scenario | Rust test | status |
 | --- | --- | --- | --- |
 | t6000-rev-list-misc.sh (simplify) | `--simplify-by-decoration` with `--boundary` (decorated root/tip, middle pruned) | `rev_list_ordering.rs` (`simplify_by_decoration_boundary_match_git`) | covered |
-| `t6002-rev-list-bisect.sh` | `--bisect-all` distances vs `select_bisect_commits` | `rev_list_simplify_objects.rs` (`t6002_bisect_all_matches_git`) | covered |
+| `t6002-rev-list-bisect.sh` | `--bisect-all` distances (no bisect command or library API) | not applicable | skip |
 | `t6004-rev-list-path-optim.sh` | path-limited trivial parent optimization | `rev_list_simplify_objects.rs` (`t6004_path_limited_trivial_optimization_matches_git`) | covered |
 | `t6012-rev-list-simplify.sh` | default / `--full-history` / `--simplify-merges` / `--first-parent` path limiting | `rev_list_simplify_objects.rs` (`t6012_simplification_modes_match_git`) | covered |
 | `t6016-rev-list-graph-simplify-history.sh` | `--graph` history layout (not commit OID lists) | not applicable | skip |
 | `t6017-rev-list-stdin.sh` | `--stdin` revision pseudo-options | `rev_list_simplify_objects.rs` (`t6017_stdin_revision_specs_match_git_semantics`); `rev_list_stdin_ref_glob_git_compat.rs` (`stdin_branches_tags_remotes_match_git`, `stdin_glob_and_tag_patterns_match_git`) | covered |
 | `t6018-rev-list-glob.sh` | `--glob` ref patterns from stdin | `rev_list_simplify_objects.rs` (`t6018_ref_globs_and_exclude_match_git`); `rev_list_stdin_ref_glob_git_compat.rs` (`stdin_glob_and_tag_patterns_match_git`) | covered |
-| `t6021-rev-list-exclude-hidden.sh` | `uploadpack.hideRefs` exclusion | `rev_list_simplify_objects.rs` (`t6021_exclude_hidden_refs_match_git`) | covered |
+| `t6021-rev-list-exclude-hidden.sh` | `uploadpack.hideRefs` / `receive.hideRefs` exclusion in ref advertisements (no `--exclude-hidden` walk option) | `serve_ls_refs_prefix.rs` (`ls_refs_matches_git_upload_pack_byte_for_byte`, `v0_advertisements_match_git_apart_from_capabilities`) | covered |
 | `t6022-rev-list-missing.sh` | `--missing=` with `--objects` | `rev_list_simplify_objects.rs` (`t6022_missing_actions_match_git`) | covered |
 | `t6102-rev-list-unexpected-objects.sh` | typed errors for type-mismatched object walks | `rev_list_simplify_objects.rs` (`t6102_unexpected_object_types_typed_error`) | covered |
 | `t6110-rev-list-sparse.sh` | `--first-parent --boundary` on `HEAD^..` | `rev_list_simplify_objects.rs` (`t6110_first_parent_boundary_matches_git`) | covered |

@@ -1,17 +1,20 @@
 //! Checkout materializes uninitialized gitlinks as empty directories (issue #934).
 
 use grit_lib::objects::FileMode;
+use grit_lib::progress::CancelToken;
+use grit_lib::progress::NullProgress;
 use std::process::Command;
 
 use grit_lib::config::environment::RepositoryOptions;
-use grit_lib::diff::{diff_trees, DiffStatus};
+use grit_lib::diff::{DiffStatus, TreeDiffOptions};
 use grit_lib::error::Error;
 use grit_lib::index::MODE_GITLINK;
 use grit_lib::objects::ObjectId;
 use grit_lib::porcelain::checkout::checkout_between_trees;
-use grit_lib::porcelain::commit::{commit_worktree, CommitRequest};
-use grit_lib::porcelain::status::{status, StatusOptions};
-use grit_lib::progress::{NeverCancel, NullProgress};
+use grit_lib::porcelain::commit::CommitRequest;
+use grit_lib::porcelain::status::StatusOptions;
+use grit_lib::progress::CancelToken;
+use grit_lib::progress::NullProgress;
 use grit_lib::repo::Repository;
 use grit_test_support::git;
 
@@ -63,10 +66,12 @@ fn checkout_uninitialized_gitlink_matches_git_clone() {
         &RepositoryOptions::empty().with_work_tree(&grit_dest),
     )
     .expect("open bare+wt");
-    let head_oid = grit_lib::refs::resolve_ref(repo.git_dir(), "HEAD").expect("head");
+    let head_oid = repo.references().resolve("HEAD").expect("head");
     let head_obj = repo.odb().read(&head_oid).expect("read");
     let commit = grit_lib::objects::parse_commit(&head_obj.data).expect("commit");
-    checkout_between_trees(&repo, None, &commit.tree).expect("checkout with gitlink");
+    repo.checkout()
+        .checkout(None, &commit.tree)
+        .expect("checkout with gitlink");
 
     let sub = grit_dest.join("sub");
     assert!(
@@ -80,7 +85,10 @@ fn checkout_uninitialized_gitlink_matches_git_clone() {
         "uninitialized gitlink must not have nested .git"
     );
 
-    let index = repo.index_handle().load().expect("index");
+    let index = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("index");
     let entry = index.get(b"sub", 0).expect("sub in index");
     assert_eq!(entry.mode, MODE_GITLINK);
     assert_eq!(entry.oid.to_string(), GITLINK_OID);
@@ -131,13 +139,14 @@ fn stray_files_in_uninitialized_gitlink_match_git_status_and_commit() {
         &RepositoryOptions::empty().with_work_tree(root),
     )
     .expect("open");
-    let model = status(
-        &repo,
-        &StatusOptions::default(),
-        &mut NullProgress,
-        &NeverCancel,
-    )
-    .expect("status");
+    let model = repo
+        .status()
+        .run(
+            &StatusOptions::default(),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("status");
     assert!(
         model.unstaged.is_empty() && model.untracked.is_empty(),
         "grit status should be clean: unstaged={:?} untracked={:?}",
@@ -145,18 +154,26 @@ fn stray_files_in_uninitialized_gitlink_match_git_status_and_commit() {
         model.untracked
     );
 
-    let err = commit_worktree(
-        &repo,
-        &CommitRequest {
-            message: "touch".into(),
-            ..Default::default()
-        },
-        &mut NullProgress,
-        &NeverCancel,
-    )
-    .unwrap_err();
+    let err = repo
+        .commits()
+        .create(
+            &grit_lib::commits::CommitOptions::new(
+                &{
+                    let mut req = CommitRequest::new("touch");
+                    req
+                }
+                .clone(),
+                grit_lib::porcelain::commit::CommitScope::AutoStage,
+            ),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .unwrap_err();
     assert!(
-        matches!(err, Error::NothingToCommit),
+        matches!(
+            err,
+            grit_lib::error::Error::Commit(CommitError::NothingToCommit)
+        ),
         "expected nothing to commit, got {err:?}"
     );
 }
@@ -203,8 +220,15 @@ fn checkout_removes_uninitialized_gitlink_on_delete() {
         &RepositoryOptions::empty().with_work_tree(&wt),
     )
     .expect("open");
-    let changes =
-        diff_trees(repo.odb(), Some(&with_sub_tree), Some(&no_sub_tree), "").expect("diff");
+    let changes = repo
+        .diff()
+        .tree_to_tree(
+            Some(&with_sub_tree),
+            Some(&no_sub_tree),
+            &TreeDiffOptions::default(),
+        )
+        .map(|r| r.entries)
+        .expect("diff");
     let sub_delete = changes
         .iter()
         .find(|c| c.status == DiffStatus::Deleted && c.old_path.as_deref() == Some("sub"))
@@ -214,7 +238,13 @@ fn checkout_removes_uninitialized_gitlink_on_delete() {
         FileMode::GITLINK,
         "gitlink delete should carry mode 160000"
     );
-    checkout_between_trees(&repo, Some(&with_sub_tree), &no_sub_tree)
+    repo.checkout()
+        .checkout(
+            Some(&with_sub_tree),
+            &no_sub_tree,
+            &mut grit_lib::progress::NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
         .expect("checkout delete gitlink");
 
     assert!(
@@ -222,7 +252,10 @@ fn checkout_removes_uninitialized_gitlink_on_delete() {
         "deleted gitlink directory should be removed"
     );
     assert!(wt.join("b").is_file());
-    let index = repo.index_handle().load().expect("index");
+    let index = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("index");
     assert!(index.get(b"sub", 0).is_none());
     assert!(index.get(b"b", 0).is_some());
 }

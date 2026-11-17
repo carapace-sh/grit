@@ -3,7 +3,7 @@
 use crate::config::ConfigSet;
 
 use super::filter::DiffFilter;
-use super::{indent_heuristic_from_config, resolve_indent_heuristic, WhitespaceMode};
+use super::{indent_heuristic_from_config, WhitespaceMode};
 
 /// Line diff algorithm names matching Git's `diff.algorithm` and `--diff-algorithm`.
 #[non_exhaustive]
@@ -36,24 +36,6 @@ impl std::str::FromStr for DiffAlgorithm {
             "histogram" => Ok(Self::Histogram),
             other => Err(UnknownDiffAlgorithm(other.to_owned())),
         }
-    }
-}
-
-impl DiffAlgorithm {
-    /// `similar` crate algorithm for non-histogram engines.
-    #[must_use]
-    pub fn similar_algorithm(self) -> similar::Algorithm {
-        match self {
-            Self::Myers | Self::Histogram => similar::Algorithm::Myers,
-            Self::Minimal => similar::Algorithm::Lcs,
-            Self::Patience => similar::Algorithm::Patience,
-        }
-    }
-
-    /// Whether this selection uses the histogram line-diff engine.
-    #[must_use]
-    pub fn uses_git_histogram(self) -> bool {
-        matches!(self, Self::Histogram)
     }
 }
 
@@ -104,7 +86,8 @@ pub struct DiffOptions {
     pub algorithm: DiffAlgorithm,
     /// Apply Git's indent heuristic when generating hunks.
     pub indent_heuristic: bool,
-    /// Rename detection for tree diffs.
+    /// Rename detection applied by [`Diff::files_for_entries`](super::Diff::files_for_entries) and tree content loaders when
+    /// entries are not already paired (default similarity 50 via [`RenameDetection::Similarity`], Git `-M`).
     pub renames: RenameDetection,
     /// `--diff-filter` status selection (applied after rename detection).
     pub filter: Option<DiffFilter>,
@@ -114,10 +97,7 @@ pub struct DiffOptions {
     pub word_level_inline: bool,
     /// Expand hunks to enclosing function boundaries (`git diff -W`).
     pub function_context: bool,
-    /// When set, incremented on each blob ODB read during tree content loading (tests only).
-    #[doc(hidden)]
-    pub blob_read_counter: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
-    /// For [`super::diff_paths`] only: count lines via [`super::line_change_counts`] without hunks.
+    /// For [`super::diff_paths`] only: count lines without building hunks.
     pub(crate) no_index_stat_only: bool,
 }
 
@@ -133,7 +113,6 @@ impl Default for DiffOptions {
             whitespace: WhitespaceMode::default(),
             word_level_inline: true,
             function_context: false,
-            blob_read_counter: None,
             no_index_stat_only: false,
         }
     }
@@ -206,7 +185,7 @@ impl DiffOptions {
         }
     }
 
-    /// u32 threshold for [`super::apply_rename_detection_to_diff_entries`] and related APIs.
+    /// u32 threshold for rename pairing (`apply_rename_detection_to_diff_entries`) and related APIs.
     #[must_use]
     pub fn rename_threshold_u32(&self) -> u32 {
         self.rename_similarity_threshold()
@@ -227,7 +206,7 @@ impl DiffOptions {
         self
     }
 
-    /// When true, [`super::diff_paths`] uses [`super::line_change_counts`] instead of building hunks.
+    /// When true, [`super::diff_paths`] counts lines instead of building hunks.
     #[must_use]
     pub fn with_no_index_stat_only(mut self, stat_only: bool) -> Self {
         self.no_index_stat_only = stat_only;
@@ -250,28 +229,24 @@ impl DiffOptions {
     #[must_use]
     pub fn from_config(config: &ConfigSet) -> Self {
         let mut opts = Self::default();
-        if let Some(name) = config.get("diff.algorithm") {
+        if let Some(name) = config.value("diff.algorithm") {
             if let Ok(parsed) = name.parse::<DiffAlgorithm>() {
                 opts.algorithm = parsed;
             }
         }
-        if let Some(v) = config.get("diff.context") {
+        if let Some(v) = config.value("diff.context") {
             if let Ok(n) = v.parse::<usize>() {
                 opts.context_lines = n;
             }
         }
-        if let Some(v) = config.get("diff.interHunkContext") {
+        if let Some(v) = config.value("diff.interHunkContext") {
             if let Ok(n) = v.parse::<usize>() {
                 opts.inter_hunk_context = n;
             }
         }
         opts.indent_heuristic = indent_heuristic_from_config(config);
         opts.renames = renames_from_config(config);
-        if config
-            .get_bool("diff.ignoreSpaceChange")
-            .and_then(|r| r.ok())
-            .unwrap_or(false)
-        {
+        if config.bool_with_default("diff.ignoreSpaceChange", false) {
             opts.whitespace.ignore_space_change = true;
         }
         opts
@@ -284,14 +259,45 @@ impl DiffOptions {
         cli_indent_heuristic: bool,
         cli_no_indent_heuristic: bool,
     ) -> bool {
-        resolve_indent_heuristic(config, cli_indent_heuristic, cli_no_indent_heuristic)
+        crate::diff::core::resolve_indent_heuristic(
+            config,
+            cli_indent_heuristic,
+            cli_no_indent_heuristic,
+        )
     }
+
+    /// Like [`Self::resolve_indent_heuristic`], with a structured CLI override enum.
+    #[must_use]
+    pub fn resolve_indent_heuristic_with_override(
+        config: &ConfigSet,
+        cli_override: IndentHeuristicOverride,
+    ) -> bool {
+        let (cli_on, cli_off) = match cli_override {
+            IndentHeuristicOverride::FromConfig => (false, false),
+            IndentHeuristicOverride::ForceOn => (true, false),
+            IndentHeuristicOverride::ForceOff => (false, true),
+        };
+        Self::resolve_indent_heuristic(config, cli_on, cli_off)
+    }
+}
+
+/// CLI override for `diff.indentHeuristic` when building [`DiffOptions`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum IndentHeuristicOverride {
+    /// Use `diff.indentHeuristic` from config (Git default: on when unset).
+    #[default]
+    FromConfig,
+    /// Force the heuristic on (`--indent-heuristic`).
+    ForceOn,
+    /// Force the heuristic off (`--no-indent-heuristic`).
+    ForceOff,
 }
 
 /// `diff.renames`: `false` disables; `true` or copy modes use default similarity.
 #[must_use]
 pub fn renames_from_config(config: &ConfigSet) -> RenameDetection {
-    match config.get("diff.renames") {
+    match config.value("diff.renames") {
         Some(v) => {
             let v = v.trim();
             if v.eq_ignore_ascii_case("false")

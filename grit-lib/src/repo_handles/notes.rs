@@ -1,12 +1,18 @@
 //! Git notes scoped to a [`Repository`](crate::repo::Repository) and a [`NotesRef`](crate::notes::NotesRef).
 
+use crate::error::NotesError;
 use crate::error::Result;
 use crate::ident::Signature;
 use crate::list_limit::{fetch_plus_one, Limited};
 use crate::notes::{
-    note_object_name, preview_notes_commit, read_blob_bytes, read_notes_snapshot, read_notes_tree,
-    read_notes_tree_limited, remove_note_entry, upsert_note_entry, write_notes_commit_idents,
-    NotesCommit, NotesRef, NotesSnapshot, NotesTreeEntry,
+    apply_prepared_notes_rewrite, copy_notes_for_rewrite, lookup_note_blob_oid,
+    materialize_notes_tree, note_object_name, notes_merge_inner, prepare_notes_for_rewrite,
+    preview_notes_commit, preview_notes_commit_on_tree, read_blob_bytes, read_notes_snapshot,
+    read_notes_tree, read_notes_tree_limited, remove_note_entry, resolve_notes_ref_tree,
+    splice_note_remove, splice_note_upsert, upsert_note_entry, write_notes_commit,
+    write_notes_commit_idents, write_notes_commit_idents_on_tree, NotesCommit, NotesMergeStrategy,
+    NotesRef, NotesRewriteCommand, NotesRewritePlan, NotesSnapshot, NotesSpliceResult,
+    NotesTreeEntry,
 };
 use crate::objects::{ObjectId, ObjectKind};
 use crate::porcelain::merge::MemOverlayGuard;
@@ -177,7 +183,7 @@ impl<'repo> RepositoryNotes<'repo> {
     /// # Errors
     ///
     /// - Notes tree read failures (see [`Self::list`]).
-    /// - [`Error::NotesObjectKind`](crate::error::Error::NotesObjectKind) when a note entry is
+    /// - [`crate::error::NotesError::UnexpectedObjectKind`](crate::error::NotesError::UnexpectedObjectKind) when a note entry is
     ///   not a blob, and object read failures (a missing note blob is an error, not an empty
     ///   note).
     pub fn list_with_bodies(
@@ -206,18 +212,18 @@ impl<'repo> RepositoryNotes<'repo> {
     /// # Errors
     ///
     /// Propagates notes tree and object read failures;
-    /// [`Error::NotesObjectKind`](crate::error::Error::NotesObjectKind) when the note entry is
+    /// [`crate::error::NotesError::UnexpectedObjectKind`](crate::error::NotesError::UnexpectedObjectKind) when the note entry is
     /// not a blob.
     pub fn read(&self, notes_ref: &NotesRef, object: &ObjectId) -> Result<Option<Vec<u8>>> {
         let hex = object.to_hex();
-        let entries = read_notes_tree(self.repo, notes_ref.as_str())?;
-        let Some(entry) = entries
-            .iter()
-            .find(|e| note_object_name(&e.path).as_deref() == Some(hex.as_str()))
-        else {
+        let (_, root_tree) = resolve_notes_ref_tree(self.repo, notes_ref.as_str())?;
+        let Some(root_tree) = root_tree else {
             return Ok(None);
         };
-        read_blob_bytes(self.repo, &entry.oid).map(Some)
+        let Some(blob_oid) = lookup_note_blob_oid(self.repo, &root_tree, &hex)? else {
+            return Ok(None);
+        };
+        read_blob_bytes(self.repo, &blob_oid).map(Some)
     }
 
     /// Preview [`Self::add`] without persisting blobs, trees, commits, or refs.
@@ -226,7 +232,7 @@ impl<'repo> RepositoryNotes<'repo> {
     ///
     /// # Errors
     ///
-    /// Same as [`Self::add`], including [`Error::NoteAlreadyExists`](crate::error::Error::NoteAlreadyExists)
+    /// Same as [`Self::add`], including [`crate::error::NotesError::AlreadyExists`](crate::error::NotesError::AlreadyExists)
     /// when `force` is false and a note already exists.
     pub fn plan_add(
         &self,
@@ -236,12 +242,11 @@ impl<'repo> RepositoryNotes<'repo> {
         options: &NotesWriteOptions,
         force: bool,
     ) -> Result<NoteAddPlan> {
-        let (NotesSnapshot { tip, mut entries }, outcome) =
-            self.read_for_add(notes_ref, object, force)?;
+        let (tip, root_tree, outcome) = self.read_for_add(notes_ref, object, force)?;
         let _overlay = MemOverlayGuard::enter(self.repo.odb());
         let blob = self.repo.odb().write(ObjectKind::Blob, content)?;
-        upsert_note_entry(&mut entries, &object.to_hex(), blob);
-        let notes_ref_tip_after = self.preview_commit(tip, &entries, options)?;
+        let notes_ref_tip_after =
+            self.preview_add_commit(notes_ref, tip, root_tree, object, blob, options)?;
         Ok(NoteAddPlan {
             object: *object,
             outcome,
@@ -307,7 +312,7 @@ impl<'repo> RepositoryNotes<'repo> {
     /// Add or replace the note on `object`; `content` is stored exactly as given.
     ///
     /// When `force` is false and a note already exists, returns
-    /// [`Error::NoteAlreadyExists`](crate::error::Error::NoteAlreadyExists).
+    /// [`crate::error::NotesError::AlreadyExists`](crate::error::NotesError::AlreadyExists).
     ///
     /// # Returns
     ///
@@ -348,11 +353,9 @@ impl<'repo> RepositoryNotes<'repo> {
         options: &NotesWriteOptions,
         force: bool,
     ) -> Result<NoteAddOutcome> {
-        let (NotesSnapshot { tip, mut entries }, outcome) =
-            self.read_for_add(notes_ref, object, force)?;
+        let (tip, root_tree, outcome) = self.read_for_add(notes_ref, object, force)?;
         let blob = self.repo.odb().write(ObjectKind::Blob, content)?;
-        upsert_note_entry(&mut entries, &object.to_hex(), blob);
-        self.write_commit(notes_ref, tip, &entries, options)?;
+        self.write_add_commit(notes_ref, tip, root_tree, object, blob, options)?;
         Ok(outcome)
     }
 
@@ -385,15 +388,109 @@ impl<'repo> RepositoryNotes<'repo> {
         objects: &[ObjectId],
         options: &NotesWriteOptions,
     ) -> Result<Vec<ObjectId>> {
-        let StagedRemoval {
-            tip,
-            entries,
-            removed,
-        } = self.stage_removals(notes_ref, objects)?;
+        let (tip, root_tree) = resolve_notes_ref_tree(self.repo, notes_ref.as_str())?;
+        let Some(mut root_tree) = root_tree else {
+            return Ok(Vec::new());
+        };
+        let mut removed = Vec::new();
+        for object in objects {
+            let hex = object.to_hex();
+            let had = lookup_note_blob_oid(self.repo, &root_tree, &hex)?.is_some();
+            if !had {
+                continue;
+            }
+            match splice_note_remove(self.repo, root_tree, &hex)? {
+                NotesSpliceResult::Tree(new_root) => {
+                    root_tree = new_root;
+                    removed.push(*object);
+                }
+                NotesSpliceResult::Fallback => {
+                    let StagedRemoval {
+                        tip: staged_tip,
+                        entries,
+                        removed: staged_removed,
+                    } = self.stage_removals(notes_ref, objects)?;
+                    if !staged_removed.is_empty() {
+                        self.write_commit(notes_ref, staged_tip, &entries, options)?;
+                    }
+                    return Ok(staged_removed);
+                }
+            }
+        }
         if !removed.is_empty() {
-            self.write_commit(notes_ref, tip, &entries, options)?;
+            let (author, committer) = options.header_lines()?;
+            write_notes_commit_idents_on_tree(
+                self.repo,
+                notes_ref.as_str(),
+                tip,
+                root_tree,
+                &options.message,
+                &author,
+                &committer,
+            )?;
         }
         Ok(removed)
+    }
+
+    /// Read the notes tree entries for `notes_ref` (full tree walk).
+    pub fn read_tree(&self, notes_ref: &str) -> Result<Vec<NotesTreeEntry>> {
+        read_notes_tree(self.repo, notes_ref)
+    }
+
+    /// Read notes tree entries with an optional cap (see [`read_notes_tree_limited`]).
+    pub fn read_tree_limited(
+        &self,
+        notes_ref: &str,
+        max_entries: Option<usize>,
+    ) -> Result<(Vec<NotesTreeEntry>, bool)> {
+        read_notes_tree_limited(self.repo, notes_ref, max_entries)
+    }
+
+    /// Write a new notes commit for `entries` on `notes_ref` using wall-clock identities.
+    pub fn write_tree_commit(
+        &self,
+        notes_ref: &str,
+        entries: &[NotesTreeEntry],
+        message: &str,
+    ) -> Result<()> {
+        write_notes_commit(self.repo, notes_ref, entries, message)
+    }
+
+    /// Merge two notes refs using `strategy`.
+    pub fn merge_refs(
+        &self,
+        local_ref: &str,
+        remote_ref: &str,
+        strategy: NotesMergeStrategy,
+    ) -> Result<std::result::Result<ObjectId, ObjectId>> {
+        notes_merge_inner(self.repo, local_ref, remote_ref, strategy)
+    }
+
+    /// Plan a notes rewrite for rewritten commit pairs.
+    pub fn prepare_rewrite(
+        &self,
+        command: NotesRewriteCommand,
+        pairs: &[(ObjectId, ObjectId)],
+    ) -> Result<Option<NotesRewritePlan>> {
+        prepare_notes_for_rewrite(self.repo, command, pairs)
+    }
+
+    /// Apply a plan from [`Self::prepare_rewrite`].
+    pub fn apply_rewrite_plan(
+        &self,
+        plan: &NotesRewritePlan,
+        pairs: &[(ObjectId, ObjectId)],
+    ) -> Result<()> {
+        apply_prepared_notes_rewrite(self.repo, plan, pairs)
+    }
+
+    /// Copy notes for rewritten commits (`notes.rewrite.*` config).
+    pub fn copy_for_rewrite(
+        &self,
+        command: NotesRewriteCommand,
+        pairs: &[(ObjectId, ObjectId)],
+    ) -> Result<()> {
+        copy_notes_for_rewrite(self.repo, command, pairs)
     }
 
     /// Read `notes_ref` and classify an add on `object`, refusing to replace without `force`.
@@ -402,22 +499,24 @@ impl<'repo> RepositoryNotes<'repo> {
         notes_ref: &NotesRef,
         object: &ObjectId,
         force: bool,
-    ) -> Result<(NotesSnapshot, NoteAddOutcome)> {
-        let snapshot = read_notes_snapshot(self.repo, notes_ref.as_str())?;
+    ) -> Result<(Option<ObjectId>, Option<ObjectId>, NoteAddOutcome)> {
+        let (tip, root_tree) = resolve_notes_ref_tree(self.repo, notes_ref.as_str())?;
         let hex = object.to_hex();
-        let exists = snapshot
-            .entries
-            .iter()
-            .any(|e| note_object_name(&e.path).as_deref() == Some(hex.as_str()));
+        let exists = match root_tree {
+            Some(tree) => lookup_note_blob_oid(self.repo, &tree, &hex)?.is_some(),
+            None => false,
+        };
         if exists && !force {
-            return Err(crate::error::Error::NoteAlreadyExists { object: *object });
+            return Err(crate::error::Error::Notes(NotesError::AlreadyExists {
+                object: *object,
+            }));
         }
         let outcome = if exists {
             NoteAddOutcome::Replaced
         } else {
             NoteAddOutcome::Added
         };
-        Ok((snapshot, outcome))
+        Ok((tip, root_tree, outcome))
     }
 
     /// Read `notes_ref` and drop the note of each object in `objects` from the in-memory tree.
@@ -434,6 +533,66 @@ impl<'repo> RepositoryNotes<'repo> {
             entries,
             removed,
         })
+    }
+
+    fn preview_add_commit(
+        &self,
+        notes_ref: &NotesRef,
+        tip: Option<ObjectId>,
+        root_tree: Option<ObjectId>,
+        object: &ObjectId,
+        blob: ObjectId,
+        options: &NotesWriteOptions,
+    ) -> Result<ObjectId> {
+        let tree = self.materialize_add_tree(notes_ref, root_tree, object, blob)?;
+        let (author, committer) = options.header_lines()?;
+        let commit = NotesCommit {
+            message: &options.message,
+            author: &author,
+            committer: &committer,
+        };
+        preview_notes_commit_on_tree(self.repo, tip, tree, &commit)
+    }
+
+    fn write_add_commit(
+        &self,
+        notes_ref: &NotesRef,
+        tip: Option<ObjectId>,
+        root_tree: Option<ObjectId>,
+        object: &ObjectId,
+        blob: ObjectId,
+        options: &NotesWriteOptions,
+    ) -> Result<()> {
+        let tree = self.materialize_add_tree(notes_ref, root_tree, object, blob)?;
+        let (author, committer) = options.header_lines()?;
+        write_notes_commit_idents_on_tree(
+            self.repo,
+            notes_ref.as_str(),
+            tip,
+            tree,
+            &options.message,
+            &author,
+            &committer,
+        )
+    }
+
+    fn materialize_add_tree(
+        &self,
+        notes_ref: &NotesRef,
+        root_tree: Option<ObjectId>,
+        object: &ObjectId,
+        blob: ObjectId,
+    ) -> Result<ObjectId> {
+        let hex = object.to_hex();
+        match splice_note_upsert(self.repo, root_tree, &hex, blob)? {
+            NotesSpliceResult::Tree(tree) => Ok(tree),
+            NotesSpliceResult::Fallback => {
+                let NotesSnapshot { mut entries, .. } =
+                    read_notes_snapshot(self.repo, notes_ref.as_str())?;
+                upsert_note_entry(&mut entries, &hex, blob);
+                materialize_notes_tree(self.repo, &entries)
+            }
+        }
     }
 
     /// Object id of the notes commit [`Self::write_commit`] would create; callers confine the

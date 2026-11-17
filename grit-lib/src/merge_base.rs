@@ -4,10 +4,14 @@
 //! default merge-base selection, `--all`, `--octopus`, `--independent`,
 //! and `--is-ancestor`.
 
+use crate::error::ObjectError;
+use crate::error::RefError;
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, BinaryHeap, HashSet, VecDeque};
+use std::rc::Rc;
 
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, RevisionError};
 use crate::ewah_bitmap::Bitmap;
 use crate::log_walk::WalkedCommits;
 use crate::objects::{
@@ -19,31 +23,10 @@ use crate::promisor::{read_promisor_missing_oids, repo_treats_promisor_packs};
 use crate::reflog::read_reflog;
 use crate::repo::Repository;
 use crate::rev_parse::{
-    load_graft_parents, peel_to_commit_for_merge_base, resolve_revision,
-    resolve_upstream_symbolic_name, try_peel_to_commit_for_merge_base, upstream_suffix_info,
+    load_graft_parents, peel_to_commit_for_merge_base, resolve_upstream_symbolic_name,
+    try_peel_to_commit_for_merge_base, upstream_suffix_info,
 };
 use crate::shallow::load_shallow_boundaries;
-
-/// Resolve commit-ish command arguments to commit object IDs.
-///
-/// # Parameters
-///
-/// - `repo` - repository used for revision lookup and object reads.
-/// - `specs` - revision arguments such as `HEAD`, ref names, or object IDs.
-///
-/// # Errors
-///
-/// Returns [`Error::ObjectNotFound`] when a revision does not resolve and
-/// [`Error::CorruptObject`] when the resolved object is not a commit.
-pub fn resolve_commit_specs(repo: &Repository, specs: &[String]) -> Result<Vec<ObjectId>> {
-    let mut out = Vec::with_capacity(specs.len());
-    for spec in specs {
-        let oid = resolve_revision(repo, spec)?;
-        ensure_is_commit(repo, oid)?;
-        out.push(oid);
-    }
-    Ok(out)
-}
 
 /// Compute merge bases for one commit vs one or more others.
 ///
@@ -59,7 +42,7 @@ pub fn resolve_commit_specs(repo: &Repository, specs: &[String]) -> Result<Vec<O
 /// # Errors
 ///
 /// Returns parse and object read errors from commit traversal.
-pub fn merge_bases_first_vs_rest(
+pub(crate) fn merge_bases_first_vs_rest(
     repo: &Repository,
     first: ObjectId,
     others: &[ObjectId],
@@ -115,49 +98,21 @@ pub fn merge_bases_first_vs_rest(
     Ok(selected)
 }
 
-/// Merge base of `HEAD` and one other commit, matching `git diff --merge-base <commit>`.
-///
-/// Returns an error when there is no merge base or more than one.
-pub fn merge_base_for_diff_index(
-    repo: &Repository,
-    head: ObjectId,
-    other: ObjectId,
-) -> std::result::Result<ObjectId, MergeBaseForDiffError> {
-    let bases = merge_bases_first_vs_rest(repo, other, &[head])
-        .map_err(|e| MergeBaseForDiffError::Other(e.to_string()))?;
-    match bases.len() {
-        0 => Err(MergeBaseForDiffError::None),
-        1 => Ok(bases[0]),
-        _ => Err(MergeBaseForDiffError::Multiple),
-    }
-}
-
 /// Merge base of two commits, matching `git diff --merge-base <a> <b>` / `diff-tree --merge-base`.
 ///
-/// Returns an error when there is no merge base or more than one.
-pub fn merge_base_for_diff_two_commits(
+/// Returns [`RevisionError::NoMergeBase`] or [`RevisionError::MultipleMergeBases`] when there is
+/// no merge base or more than one.
+pub(crate) fn merge_base_for_diff_two_commits(
     repo: &Repository,
     a: ObjectId,
     b: ObjectId,
-) -> std::result::Result<ObjectId, MergeBaseForDiffError> {
-    let bases = merge_bases_first_vs_rest(repo, a, &[b])
-        .map_err(|e| MergeBaseForDiffError::Other(e.to_string()))?;
+) -> Result<ObjectId> {
+    let bases = merge_bases_first_vs_rest(repo, a, &[b])?;
     match bases.len() {
-        0 => Err(MergeBaseForDiffError::None),
+        0 => Err(RevisionError::NoMergeBase { left: a, right: b }.into()),
         1 => Ok(bases[0]),
-        _ => Err(MergeBaseForDiffError::Multiple),
+        _ => Err(RevisionError::MultipleMergeBases { left: a, right: b }.into()),
     }
-}
-
-/// Failure modes for [`merge_base_for_diff_index`] and [`merge_base_for_diff_two_commits`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MergeBaseForDiffError {
-    /// No common ancestor between the commits.
-    None,
-    /// More than one minimal merge base (criss-cross history).
-    Multiple,
-    /// Resolution or object read error; message is suitable for stderr.
-    Other(String),
 }
 
 /// Compute merge bases common to all supplied commits (`--octopus` mode).
@@ -170,7 +125,10 @@ pub enum MergeBaseForDiffError {
 /// # Errors
 ///
 /// Returns parse and object read errors from commit traversal.
-pub fn merge_bases_octopus(repo: &Repository, commits: &[ObjectId]) -> Result<Vec<ObjectId>> {
+pub(crate) fn merge_bases_octopus(
+    repo: &Repository,
+    commits: &[ObjectId],
+) -> Result<Vec<ObjectId>> {
     let mut cache = CommitGraphCache::new(repo);
     let mut iter = commits.iter();
     let Some(&first) = iter.next() else {
@@ -194,7 +152,7 @@ pub fn merge_bases_octopus(repo: &Repository, commits: &[ObjectId]) -> Result<Ve
 ///
 /// For two commits the bases come newest committer date first, and bases with equal
 /// dates in the order Git reports them (the order its history walk reaches them).
-pub fn merge_bases_all(repo: &Repository, commits: &[ObjectId]) -> Result<Vec<ObjectId>> {
+pub(crate) fn merge_bases_all(repo: &Repository, commits: &[ObjectId]) -> Result<Vec<ObjectId>> {
     if commits.is_empty() {
         return Ok(Vec::new());
     }
@@ -252,7 +210,11 @@ fn all_merge_bases_vs_union(
 /// # Errors
 ///
 /// Returns parse and object read errors from commit traversal.
-pub fn is_ancestor(repo: &Repository, ancestor: ObjectId, descendant: ObjectId) -> Result<bool> {
+pub(crate) fn is_ancestor(
+    repo: &Repository,
+    ancestor: ObjectId,
+    descendant: ObjectId,
+) -> Result<bool> {
     if ancestor == descendant {
         return Ok(true);
     }
@@ -290,17 +252,34 @@ pub(crate) fn is_ancestor_unless_rewound(
     cache.is_ancestor(ancestor, descendant)
 }
 
-/// Whether `target` lies on `from`'s first-parent chain, walking only commits dated at or
-/// after `target`.
+/// Whether `target` lies on `from`'s first-parent chain, walking only commits at or above
+/// `target` (commit-graph generation when both are ranked, else committer date).
 fn first_parent_chain_reaches_newer(
     cache: &mut CommitGraphCache<'_>,
     from: ObjectId,
     target: ObjectId,
 ) -> Result<bool> {
+    let target_rank = commit_rank_for_walk(cache, target);
+    if target_rank != UNRANKED_COMMIT {
+        let from_rank = commit_rank_for_walk(cache, from);
+        if from_rank != UNRANKED_COMMIT {
+            let mut cur = from;
+            while commit_rank_for_walk(cache, cur) > target_rank {
+                let Some(parent) = cache.first_parent_of(cur)? else {
+                    return Ok(false);
+                };
+                if parent == target {
+                    return Ok(true);
+                }
+                cur = parent;
+            }
+            return Ok(false);
+        }
+    }
     let target_time = cache.commit_time(target)?;
     let mut cur = from;
     while cache.commit_time(cur)? >= target_time {
-        let Some(&parent) = cache.parents_of(cur)?.first() else {
+        let Some(parent) = cache.first_parent_of(cur)? else {
             return Ok(false);
         };
         if parent == target {
@@ -513,7 +492,7 @@ pub(crate) fn is_ancestor_odb_walk_with_graph(
                 Some(&time) => time,
                 None => {
                     let linkage = match read_commit_linkage(odb, graph, &parent) {
-                        Err(Error::ObjectNotFound(_)) => None,
+                        Err(Error::Object(ObjectError::NotFound { .. })) => None,
                         other => other?,
                     };
                     let Some((time, grandparents)) = linkage else {
@@ -564,7 +543,7 @@ fn read_commit_linkage(
 /// # Parameters
 ///
 /// - `spec` - upstream argument as given on the command line (`main`, `refs/heads/main`, `HEAD`, …).
-pub fn resolve_fork_point_reflog_ref(repo: &Repository, spec: &str) -> String {
+pub(crate) fn resolve_fork_point_reflog_ref(repo: &Repository, spec: &str) -> String {
     if spec == "HEAD" || spec.starts_with("refs/") {
         return spec.to_string();
     }
@@ -583,6 +562,108 @@ pub fn resolve_fork_point_reflog_ref(repo: &Repository, spec: &str) -> String {
     }
 
     format!("refs/heads/{spec}")
+}
+
+/// Collects commits from an upstream reflog the way Git's `get_fork_point` does.
+fn reflog_commits_for_fork_point(
+    repo: &Repository,
+    reflog_ref: &str,
+    upstream_tip: ObjectId,
+) -> Result<Vec<ObjectId>> {
+    let entries = read_reflog(repo.git_dir(), reflog_ref)?;
+    let mut commits = Vec::new();
+    let mut seen = oid_hash_set();
+    let mut initial = true;
+    for entry in &entries {
+        if initial {
+            initial = false;
+            push_reflog_fork_commit(repo, &mut commits, &mut seen, entry.old_oid);
+        }
+        push_reflog_fork_commit(repo, &mut commits, &mut seen, entry.new_oid);
+    }
+    if commits.is_empty() {
+        push_reflog_fork_commit(repo, &mut commits, &mut seen, upstream_tip);
+    }
+    Ok(commits)
+}
+
+/// Records `oid` for fork-point scanning when it is a non-null commit (Git's `add_one_commit`).
+fn push_reflog_fork_commit(
+    repo: &Repository,
+    commits: &mut Vec<ObjectId>,
+    seen: &mut OidHashSet,
+    oid: ObjectId,
+) {
+    if oid.is_zero() || seen.contains(&oid) {
+        return;
+    }
+    if ensure_is_commit(repo, oid).is_err() {
+        return;
+    }
+    seen.insert(oid);
+    commits.push(oid);
+}
+
+/// Reflog-only fork point for rebase restrict revision (matches `git get_fork_point`).
+///
+/// Returns `None` when Git would not set restrict revision (no unique merge base among
+/// reflog entries that is itself one of those entries). Unlike [`fork_point`], there is
+/// no merge-base fallback.
+///
+/// # Parameters
+///
+/// - `reflog_ref` - full ref name whose reflog is scanned (for example `refs/remotes/origin/main`).
+/// - `upstream_tip` - current tip of that ref, used when the reflog is empty.
+/// - `head` - commit being rebased (usually `HEAD`).
+pub(crate) fn try_reflog_fork_point(
+    repo: &Repository,
+    reflog_ref: &str,
+    upstream_tip: ObjectId,
+    head: ObjectId,
+) -> Result<Option<ObjectId>> {
+    let commits = reflog_commits_for_fork_point(repo, reflog_ref, upstream_tip)?;
+    let bases = merge_bases_all_vs_union(repo, head, &commits)?;
+    if bases.len() != 1 {
+        return Ok(None);
+    }
+    let base = bases[0];
+    if commits.contains(&base) {
+        Ok(Some(base))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Chooses the rebase exclude boundary from an optional reflog fork point.
+///
+/// Matches `get_rebase_newbase_and_upstream` in Git's pull/rebase path: when the fork point
+/// equals the octopus merge base of `head`, `upstream_tip`, and the fork point, the upstream
+/// tip is used instead (fast-forward upstream guard).
+pub(crate) fn rebase_boundary_from_fork_point(
+    repo: &Repository,
+    head: ObjectId,
+    upstream_tip: ObjectId,
+    fork_point: Option<ObjectId>,
+) -> Result<ObjectId> {
+    let Some(fork) = fork_point else {
+        return Ok(upstream_tip);
+    };
+    let oct = merge_bases_octopus(repo, &[head, upstream_tip, fork])?;
+    if oct.len() == 1 && oct[0] == fork {
+        return Ok(upstream_tip);
+    }
+    Ok(fork)
+}
+
+/// Whether implicit-upstream rebase should use fork-point detection (Git's `rebase.forkPoint`).
+///
+/// Defaults to `true`; `rebase.forkPoint=false` disables it.
+#[must_use]
+pub fn rebase_fork_point_enabled(config: &crate::config::ConfigSet) -> bool {
+    config
+        .value("rebase.forkPoint")
+        .and_then(|raw| crate::config::parse_git_config_maybe_bool(raw.trim()))
+        .unwrap_or(true)
 }
 
 /// Picks the fork-point candidate that is not strictly dominated by another candidate in the list.
@@ -626,7 +707,7 @@ fn select_best_fork_point(repo: &Repository, candidates: &[ObjectId]) -> Result<
 /// # Errors
 ///
 /// Propagates object read, reflog, and graph walk errors.
-pub fn fork_point(
+pub(crate) fn fork_point(
     repo: &Repository,
     upstream_spec: &str,
     upstream_tip: ObjectId,
@@ -638,8 +719,7 @@ pub fn fork_point(
         resolve_fork_point_reflog_ref(repo, upstream_spec)
     };
 
-    let entries = read_reflog(repo.git_dir(), &reflog_ref)
-        .map_err(|e| Error::Message(format!("failed to read reflog for '{reflog_ref}': {e}")))?;
+    let entries = read_reflog(repo.git_dir(), &reflog_ref)?;
 
     let mut candidates = Vec::new();
     let mut seen = oid_hash_set();
@@ -664,9 +744,11 @@ pub fn fork_point(
 
     let mut bases = merge_bases_first_vs_rest(repo, upstream_tip, &[head])?;
     if bases.is_empty() {
-        return Err(Error::Message(
-            "no merge base found between upstream and HEAD".to_owned(),
-        ));
+        return Err(RevisionError::NoMergeBase {
+            left: upstream_tip,
+            right: head,
+        }
+        .into());
     }
     bases.sort();
     Ok(bases[0])
@@ -676,8 +758,8 @@ pub fn fork_point(
 ///
 /// # Errors
 ///
-/// Returns [`Error::CorruptObject`] if an encountered object is not a commit.
-pub fn ancestor_closure(repo: &Repository, tip: ObjectId) -> Result<HashSet<ObjectId>> {
+/// Returns [`crate::error::ObjectError::Corrupt`] if an encountered object is not a commit.
+pub(crate) fn ancestor_closure(repo: &Repository, tip: ObjectId) -> Result<HashSet<ObjectId>> {
     let mut cache = CommitGraphCache::new(repo);
     Ok(cache.ancestor_closure(tip)?.into_iter().collect())
 }
@@ -690,7 +772,7 @@ pub fn ancestor_closure(repo: &Repository, tip: ObjectId) -> Result<HashSet<Obje
 /// # Errors
 ///
 /// Propagates errors from commit graph walks.
-pub fn count_symmetric_ahead_behind(
+pub(crate) fn count_symmetric_ahead_behind(
     repo: &Repository,
     local: ObjectId,
     other: ObjectId,
@@ -710,7 +792,7 @@ pub fn count_symmetric_ahead_behind(
 /// # Errors
 ///
 /// Propagates object read and parse errors from commit traversal.
-pub fn ahead_behind_of_target_commits(
+pub(crate) fn ahead_behind_of_target_commits(
     repo: &Repository,
     head: ObjectId,
     target: ObjectId,
@@ -759,7 +841,7 @@ pub fn ahead_behind_of_target_commits(
 /// applying the hide filter). Use this for bounded ahead-of-target lists and status shortlogs.
 ///
 /// Shallow boundaries (`.git/shallow`) stop parent traversal without following
-/// absent parent objects. Other missing commits propagate [`Error::ObjectNotFound`].
+/// absent parent objects. Other missing commits propagate [`crate::error::ObjectError::NotFound`].
 ///
 /// # Errors
 ///
@@ -773,14 +855,16 @@ pub struct ReachableWalkCommitterCutoffs {
     pub until: Option<i64>,
 }
 
-/// How [`walk_commits_reachable_excluding_ancestors_of`] bounds its output.
-#[derive(Debug, Clone, Copy)]
+/// How [`RevWalk::reachable_excluding`](crate::revwalk::RevWalk::reachable_excluding) bounds
+/// its output.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ReachableWalkLimit {
     /// Emit at most `n` commits and stop (rev-list `--max-count`).
     StopAfter(usize),
     /// Walk the full emitted set; return the total count and only the newest `n` OIDs.
     CountAllRetainNewest(usize),
     /// Walk and collect every emitted commit.
+    #[default]
     Unlimited,
 }
 
@@ -818,7 +902,7 @@ impl PartialOrd for WalkDateKey {
 /// waits for a commit's other children, so under clock skew a parent can print before one of
 /// its children, exactly as in Git.
 #[derive(Clone, Debug)]
-pub struct ReachableWalkState {
+pub(crate) struct ReachableWalkState {
     heap: BinaryHeap<WalkDateKey>,
     done: OidHashSet,
     queued: OidHashSet,
@@ -833,6 +917,23 @@ pub struct ReachableWalkState {
     use_commit_graph: bool,
     /// When the hide paint may stop (see [`HidePaintStop`]).
     hide_paint_stop: HidePaintStop,
+    /// Dates the hide paint requires of every commit it pops as reachable from the tips alone.
+    left_window: Option<LeftDateWindow>,
+}
+
+/// Committer dates (Unix seconds) a [`SidePaint::compute_hiding`] paint requires of every
+/// commit it pops as reachable from the tips alone: later than `after`, no later than `until`.
+/// The paint gives up at the first commit outside them ([`SidePaint::left_outside_window`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LeftDateWindow {
+    after: i64,
+    until: i64,
+}
+
+impl LeftDateWindow {
+    fn contains(self, committed_at: i64) -> bool {
+        self.after < committed_at && committed_at <= self.until
+    }
 }
 
 /// When [`SidePaint::compute_hiding`] may stop painting.
@@ -860,7 +961,7 @@ enum HidePaintStop {
 
 /// Serializable snapshot of [`ReachableWalkState`] for resuming a bounded walk.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ReachableWalkSnapshot {
+pub(crate) struct ReachableWalkSnapshot {
     /// Pending heap entries (order does not matter).
     pub heap: Vec<(i64, u64, ObjectId)>,
     /// Commits already popped from the heap (emitted or skipped as duplicate/hidden).
@@ -881,7 +982,7 @@ impl ReachableWalkState {
     /// # Errors
     ///
     /// Propagates commit read errors while seeding the heap.
-    pub fn new(repo: &Repository, tips: &[ObjectId], hide: &[ObjectId]) -> Result<Self> {
+    pub(crate) fn new(repo: &Repository, tips: &[ObjectId], hide: &[ObjectId]) -> Result<Self> {
         Self::with_commit_graph(repo, tips, hide, true)
     }
 
@@ -913,6 +1014,7 @@ impl ReachableWalkState {
             paint: None,
             use_commit_graph,
             hide_paint_stop: HidePaintStop::default(),
+            left_window: None,
         };
         for &tip in tips {
             if state.hide.contains(&tip) {
@@ -976,7 +1078,7 @@ impl ReachableWalkState {
 
     /// Restore walk state from a [`ReachableWalkSnapshot`].
     #[must_use]
-    pub fn from_snapshot(snapshot: ReachableWalkSnapshot) -> Self {
+    pub(crate) fn from_snapshot(snapshot: ReachableWalkSnapshot) -> Self {
         let ReachableWalkSnapshot {
             heap,
             done,
@@ -998,12 +1100,13 @@ impl ReachableWalkState {
             hide,
             use_commit_graph: true,
             hide_paint_stop: HidePaintStop::default(),
+            left_window: None,
         }
     }
 
     /// Capture the current walk state for later resumption.
     #[must_use]
-    pub fn snapshot(&self) -> ReachableWalkSnapshot {
+    pub(crate) fn snapshot(&self) -> ReachableWalkSnapshot {
         ReachableWalkSnapshot {
             heap: self
                 .heap
@@ -1020,7 +1123,8 @@ impl ReachableWalkState {
 
     /// Whether the heap still holds commits that might be emitted.
     #[must_use]
-    pub fn has_pending(&self) -> bool {
+    #[allow(dead_code)]
+    pub(crate) fn has_pending(&self) -> bool {
         !self.heap.is_empty()
     }
 
@@ -1030,7 +1134,7 @@ impl ReachableWalkState {
     /// older commits remain on the heap), this returns `false` even though
     /// [`Self::has_pending`] is still true.
     #[must_use]
-    pub fn has_emittable_pending(&self, cutoffs: ReachableWalkCommitterCutoffs) -> bool {
+    pub(crate) fn has_emittable_pending(&self, cutoffs: ReachableWalkCommitterCutoffs) -> bool {
         if self.heap.is_empty() {
             return false;
         }
@@ -1055,6 +1159,7 @@ impl ReachableWalkState {
             &pending,
             &self.hide,
             self.hide_paint_stop,
+            self.left_window,
         )?);
         Ok(())
     }
@@ -1131,7 +1236,8 @@ impl ReachableWalkState {
                 continue;
             }
             if cutoffs.since.is_some_and(|since| key.time < since) {
-                self.after_processed(cache, oid)?;
+                // Match Git: when every other queued commit is also older than `--since`, stop
+                // before enqueueing this commit's parents. Otherwise keep walking for clock skew.
                 let stop = self.heap.is_empty()
                     || self
                         .heap
@@ -1141,6 +1247,7 @@ impl ReachableWalkState {
                     self.heap.clear();
                     return Ok(None);
                 }
+                self.after_processed(cache, oid)?;
                 continue;
             }
             let hidden = self.is_hidden(cache, oid)?;
@@ -1162,7 +1269,7 @@ impl ReachableWalkState {
     /// # Errors
     ///
     /// Propagates object read and ancestry errors during traversal.
-    pub fn emit_until(
+    pub(crate) fn emit_until(
         &mut self,
         repo: &Repository,
         limit: Option<usize>,
@@ -1194,7 +1301,7 @@ impl ReachableWalkState {
 /// Returns `(emitted_count, collected_oids)` where `collected_oids` are newest-first.
 /// With [`ReachableWalkLimit::CountAllRetainNewest`], `emitted_count` is the full
 /// ahead count while `collected_oids` holds at most the requested number of newest tips.
-pub fn walk_commits_reachable_excluding_ancestors_of(
+pub(crate) fn walk_commits_reachable_excluding_ancestors_of(
     repo: &Repository,
     tips: &[ObjectId],
     hide: &[ObjectId],
@@ -1210,7 +1317,7 @@ pub fn walk_commits_reachable_excluding_ancestors_of(
 }
 
 /// Like [`walk_commits_reachable_excluding_ancestors_of`] with committer-date cutoffs on bounded walks.
-pub fn walk_commits_reachable_excluding_ancestors_of_cutoffs(
+pub(crate) fn walk_commits_reachable_excluding_ancestors_of_cutoffs(
     repo: &Repository,
     tips: &[ObjectId],
     hide: &[ObjectId],
@@ -1275,40 +1382,79 @@ pub(crate) fn count_commits_left_behind(
             HidePaintStop::TipsResolvedDateSlop
         };
     }
+    drain_left_behind(&mut state, &mut cache, retain_newest)
+}
+
+/// [`count_commits_left_behind`] with `hide` missing the refs a store recorded at
+/// `recorded_at` (Unix seconds), such as the records of `packed-refs`, or `None` when the
+/// answer could differ from the one the full hide set gives.
+///
+/// A recorded ref names a commit that existed at `recorded_at`, so everything it reaches was
+/// made before then and, within the clock-skew allowance the date-slop paint already relies on
+/// ([`UNRANKED_SKEW_ALLOWANCE`]), is dated at most that much after it. When every commit left
+/// behind is dated later than that, the omitted refs reach none of them. A commit dated more
+/// than the allowance past `now` says nothing about when it was made, so it ends the shortcut
+/// too. The paint stops at the first commit outside those dates, so a `None` costs no more
+/// than the history dated after `recorded_at`.
+///
+/// Also `None` when the walk does not end by date: with a commit-graph (whose exact paint
+/// needs no reads for the omitted tips), grafts, replace refs or shallow boundaries. Like
+/// [`count_commits_left_behind`] without a commit-graph, the count can be wrong under heavy
+/// clock skew.
+///
+/// # Errors
+///
+/// Propagates commit read and parse errors from the walk.
+pub(crate) fn count_commits_left_behind_after(
+    repo: &Repository,
+    tips: &[ObjectId],
+    hide: &[ObjectId],
+    retain_newest: usize,
+    recorded_at: i64,
+    now: i64,
+) -> Result<Option<(usize, Vec<ObjectId>)>> {
+    let mut cache = CommitGraphCache::new(repo);
+    if hide.is_empty()
+        || cache.graph.is_some()
+        || !cache.shallow_boundaries.is_empty()
+        || cache.has_parent_rewrites()?
+    {
+        return Ok(None);
+    }
+    let allowance = UNRANKED_SKEW_ALLOWANCE.whole_seconds();
+    let mut state = ReachableWalkState::new(repo, tips, hide)?;
+    state.hide_paint_stop = HidePaintStop::TipsResolvedDateSlop;
+    state.left_window = Some(LeftDateWindow {
+        after: recorded_at.saturating_add(allowance),
+        until: now.saturating_add(allowance),
+    });
+    state.ensure_paint(&mut cache)?;
+    if state
+        .paint
+        .as_ref()
+        .is_none_or(|paint| paint.left_outside_window)
+    {
+        return Ok(None);
+    }
+    drain_left_behind(&mut state, &mut cache, retain_newest).map(Some)
+}
+
+/// Emit every commit `state` leaves after its hide paint: the full count and the newest
+/// `retain_newest` of them.
+fn drain_left_behind(
+    state: &mut ReachableWalkState,
+    cache: &mut CommitGraphCache<'_>,
+    retain_newest: usize,
+) -> Result<(usize, Vec<ObjectId>)> {
     let mut newest = Vec::new();
     let mut total = 0usize;
-    while let Some(oid) =
-        state.pop_next_emit(&mut cache, ReachableWalkCommitterCutoffs::default())?
-    {
+    while let Some(oid) = state.pop_next_emit(cache, ReachableWalkCommitterCutoffs::default())? {
         total += 1;
         if newest.len() < retain_newest {
             newest.push(oid);
         }
     }
     Ok((total, newest))
-}
-
-/// Count commits reachable from `head` but not from `target`, and return up to `retain_newest`
-/// of those commit OIDs (newest first) without materializing the full ahead list.
-///
-/// # Errors
-///
-/// Propagates object read and parse errors from commit traversal.
-pub fn ahead_of_target_commits(
-    repo: &Repository,
-    head: ObjectId,
-    target: ObjectId,
-    retain_newest: usize,
-) -> Result<(usize, Vec<ObjectId>)> {
-    if head == target {
-        return Ok((0, Vec::new()));
-    }
-    walk_commits_reachable_excluding_ancestors_of(
-        repo,
-        std::slice::from_ref(&head),
-        &[target],
-        ReachableWalkLimit::CountAllRetainNewest(retain_newest),
-    )
 }
 
 /// Filters applied when counting reachable commits (parent count and committer dates).
@@ -1334,7 +1480,11 @@ fn try_count_diff_via_stored_commit_bitmaps(
     let Some(index) = repo
         .odb()
         .with_pack_read_context(|| BitmapIndex::open(repo))
-        .map_err(|e| Error::CorruptObject(format!("pack bitmap: {e}")))?
+        .map_err(|e| {
+            Error::Object(ObjectError::Corrupt {
+                detail: format!("pack bitmap: {e}"),
+            })
+        })?
     else {
         return Ok(None);
     };
@@ -1353,7 +1503,11 @@ fn try_count_diff_via_stored_commit_bitmaps(
     index
         .type_bitmap(ObjectKind::Commit)
         .expand_into_bitmap(&mut commit_type)
-        .map_err(|e| Error::CorruptObject(format!("pack bitmap: {e}")))?;
+        .map_err(|e| {
+            Error::Object(ObjectError::Corrupt {
+                detail: format!("pack bitmap: {e}"),
+            })
+        })?;
     commit_type.and_assign(&reachable);
     Ok(Some(commit_type.count_ones()))
 }
@@ -1370,7 +1524,7 @@ fn try_count_diff_via_stored_commit_bitmaps(
 /// # Errors
 ///
 /// Propagates object read and ancestry errors during traversal.
-pub fn count_commits_reachable_excluding_ancestors_of(
+pub(crate) fn count_commits_reachable_excluding_ancestors_of(
     repo: &Repository,
     tips: &[ObjectId],
     hide: &[ObjectId],
@@ -1396,9 +1550,11 @@ pub fn count_commits_reachable_excluding_ancestors_of(
     let paint = match (generations_bound_paint, filter.first_parent_only) {
         (true, true) => SidePaint::compute_hiding_first_parent(&mut cache, tips, hide)?,
         (true, false) => {
-            SidePaint::compute_hiding(&mut cache, tips, hide, HidePaintStop::TipsResolved)?
+            SidePaint::compute_hiding(&mut cache, tips, hide, HidePaintStop::TipsResolved, None)?
         }
-        (false, _) => SidePaint::compute_hiding(&mut cache, tips, hide, HidePaintStop::Converged)?,
+        (false, _) => {
+            SidePaint::compute_hiding(&mut cache, tips, hide, HidePaintStop::Converged, None)?
+        }
     };
     if unfiltered && !filter.first_parent_only {
         return Ok(paint.count_only(PAINT_LEFT));
@@ -1488,6 +1644,263 @@ pub(crate) fn first_parent_hidden_frontier(
     Ok(frontier)
 }
 
+/// Hide predicate for a revision range (`tips` minus ancestors of `hide` tips).
+///
+/// Computes a two-sided paint once instead of closing every ancestor of `hide`, so bounded
+/// walks with pathspecs or commit filters stop at the merge-base frontier.
+///
+/// [`Self::try_for_dense_path_hide`] seeds a lazy hide-side cursor instead of painting every
+/// commit on the included side of `A..B`, which matters for path-limited `-n` walks on large
+/// ranges when a commit-graph supplies generations.
+#[derive(Clone, Default)]
+pub(crate) struct RangeWalkHide {
+    hide_tips: OidHashSet,
+    paint: SidePaint,
+    lazy: Option<Rc<RefCell<LazyHidePaint>>>,
+}
+
+impl std::fmt::Debug for RangeWalkHide {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RangeWalkHide")
+            .field("hide_tips", &self.hide_tips)
+            .field("paint", &self.paint)
+            .field("lazy_hide", &self.lazy.is_some())
+            .finish()
+    }
+}
+
+/// Incremental hide-side paint for [`RangeWalkHide::try_for_dense_path_hide`].
+struct LazyHidePaint {
+    max_hide_rank: u64,
+    sides: OidHashMap<u8>,
+    heap: BinaryHeap<PaintKey>,
+    queued: OidHashSet,
+    popped: OidHashSet,
+    seq: u64,
+}
+
+impl LazyHidePaint {
+    fn seed(cache: &mut CommitGraphCache<'_>, hide: &[ObjectId]) -> Result<Self> {
+        let mut hide_tips = oid_hash_set();
+        let mut max_hide_rank = 0u64;
+        cache.prime_tips(hide);
+        for &tip in hide {
+            let Some(tip) = cache.peel_tip(tip)? else {
+                continue;
+            };
+            hide_tips.insert(tip);
+            max_hide_rank = max_hide_rank.max(commit_rank_for_walk(cache, tip));
+        }
+        let mut lazy = Self {
+            max_hide_rank,
+            sides: oid_hash_map(),
+            heap: BinaryHeap::new(),
+            queued: oid_hash_set(),
+            popped: oid_hash_set(),
+            seq: 0,
+        };
+        for tip in hide_tips {
+            lazy.enqueue_hide(cache, tip)?;
+        }
+        Ok(lazy)
+    }
+
+    fn enqueue_hide(&mut self, cache: &mut CommitGraphCache<'_>, oid: ObjectId) -> Result<()> {
+        self.sides.insert(oid, PAINT_RIGHT);
+        if self.queued.insert(oid) {
+            push_commit_heap_key(cache, &mut self.heap, &mut self.seq, oid)?;
+        }
+        Ok(())
+    }
+
+    fn is_hidden(
+        &mut self,
+        cache: &mut CommitGraphCache<'_>,
+        hide_tips: &OidHashSet,
+        oid: ObjectId,
+    ) -> Result<bool> {
+        if hide_tips.contains(&oid) {
+            return Ok(true);
+        }
+        let rank = commit_rank_for_walk(cache, oid);
+        if rank != UNRANKED_COMMIT && rank > self.max_hide_rank {
+            return Ok(false);
+        }
+        self.expand_until(cache, oid)?;
+        Ok(self
+            .sides
+            .get(&oid)
+            .is_some_and(|side| side & PAINT_RIGHT != 0))
+    }
+
+    /// Walk hide-side ancestry in commit-graph generation order down to `oid`'s generation.
+    fn expand_until(&mut self, cache: &mut CommitGraphCache<'_>, oid: ObjectId) -> Result<()> {
+        let target_rank = commit_rank_for_walk(cache, oid);
+        while !self.sides.contains_key(&oid) {
+            let Some(node) = self.heap.peek().copied() else {
+                break;
+            };
+            if target_rank != UNRANKED_COMMIT
+                && node.rank != UNRANKED_COMMIT
+                && node.rank < target_rank
+            {
+                break;
+            }
+            let Some(node) = self.heap.pop() else {
+                break;
+            };
+            if !self.popped.insert(node.oid) {
+                continue;
+            }
+            for parent in cache.parents_of(node.oid)? {
+                if self.queued.insert(parent) {
+                    self.sides.insert(parent, PAINT_RIGHT);
+                    push_commit_heap_key(cache, &mut self.heap, &mut self.seq, parent)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl RangeWalkHide {
+    /// No excluded tips: nothing is hidden.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    /// Whether any hide tips were configured.
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        !self.hide_tips.is_empty()
+    }
+
+    /// Whether [`Self::is_hidden_with_cache`] needs a [`CommitGraphCache`].
+    #[must_use]
+    pub fn uses_lazy_hide(&self) -> bool {
+        self.lazy.is_some()
+    }
+
+    /// Hide predicate for dense path-limited range walks when a commit-graph can bound the paint.
+    ///
+    /// Falls back to [`Self::for_range_walk`] when generations are unavailable or parent lists
+    /// may be rewritten by grafts, replacements, or shallow boundaries.
+    ///
+    /// # Errors
+    ///
+    /// Propagates commit read and parse errors while seeding the lazy hide cursor.
+    pub fn try_for_dense_path_hide(
+        repo: &Repository,
+        include: &[ObjectId],
+        hide: &[ObjectId],
+        use_commit_graph: bool,
+        list_first_parent_only: bool,
+    ) -> Result<Self> {
+        if hide.is_empty() {
+            return Ok(Self::empty());
+        }
+        let mut cache = CommitGraphCache::with_commit_graph(repo, use_commit_graph);
+        if cache.graph.is_some() && !cache.has_parent_rewrites()? {
+            let lazy = LazyHidePaint::seed(&mut cache, hide)?;
+            Ok(Self {
+                hide_tips: hide.iter().copied().collect(),
+                paint: SidePaint::default(),
+                lazy: Some(Rc::new(RefCell::new(lazy))),
+            })
+        } else {
+            Self::for_range_walk(
+                repo,
+                include,
+                hide,
+                use_commit_graph,
+                list_first_parent_only,
+            )
+        }
+    }
+
+    /// Paint `tips` against `hide` for subsequent [`Self::is_hidden`] checks.
+    ///
+    /// # Errors
+    ///
+    /// Propagates commit read and parse errors for commits not reached from `hide`.
+    pub fn for_range_walk(
+        repo: &Repository,
+        tips: &[ObjectId],
+        hide: &[ObjectId],
+        use_commit_graph: bool,
+        list_first_parent_only: bool,
+    ) -> Result<Self> {
+        if hide.is_empty() {
+            return Ok(Self::empty());
+        }
+        let mut cache = CommitGraphCache::with_commit_graph(repo, use_commit_graph);
+        if cache.graph.is_some() && cache.has_parent_rewrites()? {
+            cache = CommitGraphCache::with_commit_graph(repo, false);
+        }
+        let generations_bound = cache.graph.is_some();
+        let paint = if list_first_parent_only {
+            SidePaint::compute_hiding_first_parent(&mut cache, tips, hide)?
+        } else if generations_bound {
+            SidePaint::compute_hiding(&mut cache, tips, hide, HidePaintStop::TipsResolved, None)?
+        } else {
+            SidePaint::compute_hiding(&mut cache, tips, hide, HidePaintStop::Converged, None)?
+        };
+        Ok(Self {
+            hide_tips: hide.iter().copied().collect(),
+            paint,
+            lazy: None,
+        })
+    }
+
+    /// Whether `oid` lies in hidden history and must not be listed or traversed.
+    ///
+    /// For lazy hide predicates, pass a [`CommitGraphCache`] via [`Self::is_hidden_with_cache`].
+    #[must_use]
+    pub fn is_hidden(&self, oid: ObjectId) -> bool {
+        if self.lazy.is_some() {
+            return self.hide_tips.contains(&oid);
+        }
+        self.is_hidden_eager(oid)
+    }
+
+    /// Like [`Self::is_hidden`], but supports lazy hide-side expansion when configured.
+    ///
+    /// # Errors
+    ///
+    /// Propagates commit read and parse errors from lazy hide expansion.
+    pub fn is_hidden_with_cache(
+        &self,
+        cache: &mut Option<CommitGraphCache<'_>>,
+        oid: ObjectId,
+    ) -> Result<bool> {
+        if !self.is_active() {
+            return Ok(false);
+        }
+        if self.hide_tips.contains(&oid) {
+            return Ok(true);
+        }
+        match (&self.lazy, cache.as_mut()) {
+            (Some(lazy), Some(cache)) => lazy.borrow_mut().is_hidden(cache, &self.hide_tips, oid),
+            _ => Ok(self.is_hidden(oid)),
+        }
+    }
+
+    fn is_hidden_eager(&self, oid: ObjectId) -> bool {
+        if !self.is_active() {
+            return false;
+        }
+        if self.hide_tips.contains(&oid) {
+            return true;
+        }
+        if let Some(reached) = self.paint.reached_by(oid, PAINT_RIGHT) {
+            return reached;
+        }
+        // Unpainted commits sit below the frontier where every path is reachable from hide.
+        true
+    }
+}
+
 /// Shortcuts for [`count_commits_reachable_excluding_ancestors_of`] that avoid painting, or
 /// `None` when the paint has to run.
 fn try_count_without_paint(
@@ -1539,12 +1952,17 @@ fn try_count_without_paint(
 /// matches, but only when every visited commit has at most one parent (linear history).
 /// Returns `None` when a merge is encountered so callers can fall back to a full-graph
 /// bounded walk.
-pub fn try_linear_chain_commits_with_cutoffs(
+pub(crate) fn try_linear_chain_commits(
     repo: &Repository,
     tip: ObjectId,
     limit: usize,
     cutoffs: ReachableWalkCommitterCutoffs,
 ) -> Result<Option<Vec<ObjectId>>> {
+    // Parent-chain order is not committer-date order; `--since` needs the heap walk's frontier
+    // (see [`ReachableWalkState::pop_next_emit`]) so clock-skewed histories stay correct.
+    if cutoffs.since.is_some() {
+        return Ok(None);
+    }
     let mut cache = CommitGraphCache::new(repo);
     let mut out = Vec::with_capacity(limit.min(64));
     let mut stack = vec![tip];
@@ -1563,8 +1981,7 @@ pub fn try_linear_chain_commits_with_cutoffs(
             out.push(cur);
         }
         if below_since {
-            stack.extend(parents);
-            continue;
+            break;
         }
         if let Some(&parent) = parents.first() {
             stack.push(parent);
@@ -1606,7 +2023,7 @@ fn try_count_on_first_parent_chain_excluding_hide(
 }
 
 /// `commits_reachable_excluding_ancestors_of` function.
-pub fn commits_reachable_excluding_ancestors_of(
+pub(crate) fn commits_reachable_excluding_ancestors_of(
     repo: &Repository,
     tips: &[ObjectId],
     hide: &[ObjectId],
@@ -1622,7 +2039,7 @@ pub fn commits_reachable_excluding_ancestors_of(
 }
 
 /// Like [`commits_reachable_excluding_ancestors_of`] with committer-date cutoffs on bounded walks.
-pub fn commits_reachable_excluding_ancestors_of_cutoffs(
+pub(crate) fn commits_reachable_excluding_ancestors_of_cutoffs(
     repo: &Repository,
     tips: &[ObjectId],
     hide: &[ObjectId],
@@ -1664,7 +2081,10 @@ pub(crate) fn commits_reachable_excluding_ancestors_of_with_graph(
 /// # Errors
 ///
 /// Returns parse and object read errors from commit traversal.
-pub fn independent_commits(repo: &Repository, commits: &[ObjectId]) -> Result<Vec<ObjectId>> {
+pub(crate) fn independent_commits(
+    repo: &Repository,
+    commits: &[ObjectId],
+) -> Result<Vec<ObjectId>> {
     let mut cache = CommitGraphCache::new(repo);
     let mut out = Vec::new();
     for (i, &candidate) in commits.iter().enumerate() {
@@ -1685,82 +2105,12 @@ pub fn independent_commits(repo: &Repository, commits: &[ObjectId]) -> Result<Ve
     Ok(out)
 }
 
-/// Select the best base ref for a target tip using Git's first-parent branch-base heuristic.
-///
-/// The returned index points into `bases`. The algorithm walks the first-parent histories of
-/// `tip` and the candidate bases, picking the base whose first-parent path collides with the
-/// tip's first-parent path at the newest branch point. Ties keep the earliest candidate index.
-///
-/// # Parameters
-///
-/// - `repo` - repository used to read commit parents.
-/// - `tip` - target commit whose branch base is being queried.
-/// - `bases` - candidate base commits in caller-visible order.
-///
-/// # Errors
-///
-/// Returns object read or parse errors for malformed commit history.
-pub fn branch_base_for_tip(
-    repo: &Repository,
-    tip: ObjectId,
-    bases: &[ObjectId],
-) -> Result<Option<usize>> {
-    if bases.is_empty() {
-        return Ok(None);
-    }
-
-    let tip_chain = first_parent_chain(repo, tip)?;
-    let tip_positions: OidHashMap<usize> = tip_chain
-        .iter()
-        .copied()
-        .enumerate()
-        .map(|(index, oid)| (oid, index))
-        .collect();
-
-    let mut best: Option<(usize, usize)> = None;
-    for (base_index, &base) in bases.iter().enumerate() {
-        for oid in first_parent_chain(repo, base)? {
-            let Some(&tip_position) = tip_positions.get(&oid) else {
-                continue;
-            };
-            match best {
-                None => best = Some((tip_position, base_index)),
-                Some((best_position, best_index))
-                    if tip_position < best_position
-                        || (tip_position == best_position && base_index < best_index) =>
-                {
-                    best = Some((tip_position, base_index));
-                }
-                _ => {}
-            }
-            break;
-        }
-    }
-
-    Ok(best.map(|(_, index)| index))
-}
-
-fn first_parent_chain(repo: &Repository, start: ObjectId) -> Result<Vec<ObjectId>> {
-    let mut chain = Vec::new();
-    let mut current = Some(start);
-    while let Some(oid) = current {
-        chain.push(oid);
-        current = first_parent(repo, oid)?;
-    }
-    Ok(chain)
-}
-
-fn first_parent(repo: &Repository, oid: ObjectId) -> Result<Option<ObjectId>> {
-    let commit = repo.odb().read_commit(&oid)?;
-    Ok(commit.parents.first().copied())
-}
-
 fn ensure_is_commit(repo: &Repository, oid: ObjectId) -> Result<()> {
     let object = repo.odb().read(&oid)?;
     if object.kind != ObjectKind::Commit {
-        return Err(Error::CorruptObject(format!(
-            "object {oid} is not a commit"
-        )));
+        return Err(Error::Object(ObjectError::Corrupt {
+            detail: format!("object {oid} is not a commit"),
+        }));
     }
     Ok(())
 }
@@ -1881,10 +2231,11 @@ impl OpenQueueTally {
 
 fn first_parent_oid(cache: &mut CommitGraphCache<'_>, oid: ObjectId) -> Result<ObjectId> {
     let parents = cache.parents_of(oid)?;
-    parents
-        .first()
-        .copied()
-        .ok_or_else(|| Error::ObjectNotFound(format!("{oid} has no parent")))
+    parents.first().copied().ok_or_else(|| {
+        Error::Object(ObjectError::NotFound {
+            name: format!("{oid} has no parent"),
+        })
+    })
 }
 
 /// Classify `first` and `second` along first-parent chains, using commit-graph generations
@@ -2035,13 +2386,32 @@ fn commit_rank_for_walk(cache: &mut CommitGraphCache<'_>, oid: ObjectId) -> u64 
 
 /// Heap ordering key: commit-graph generation when present, else [`UNRANKED_COMMIT`]
 /// with [`CommitGraphCache::commit_time`] as the tie-break (see [`PaintKey`]).
-fn push_commit_heap_key(
+pub(crate) fn push_commit_heap_key(
     cache: &mut CommitGraphCache<'_>,
     heap: &mut BinaryHeap<PaintKey>,
     seq: &mut u64,
     oid: ObjectId,
 ) -> Result<()> {
-    let rank = commit_rank_for_walk(cache, oid);
+    push_describe_heap_key(cache, heap, seq, oid, None)
+}
+
+/// Like [`push_commit_heap_key`], but when commit-graph generations are unavailable uses
+/// `walk_dist` (minimum hops from the describe target) so children are processed before
+/// parents even under committer-date skew.
+pub(crate) fn push_describe_heap_key(
+    cache: &mut CommitGraphCache<'_>,
+    heap: &mut BinaryHeap<PaintKey>,
+    seq: &mut u64,
+    oid: ObjectId,
+    walk_dist: Option<&OidHashMap<u32>>,
+) -> Result<()> {
+    let mut rank = commit_rank_for_walk(cache, oid);
+    if rank == UNRANKED_COMMIT {
+        if let Some(distances) = walk_dist {
+            let hops = distances.get(&oid).copied().unwrap_or(0);
+            rank = UNRANKED_COMMIT.saturating_sub(u64::from(hops));
+        }
+    }
     let committed_at = cache.commit_time(oid)?;
     heap.push(PaintKey {
         rank,
@@ -2072,6 +2442,9 @@ const PAINT_BOTH: u8 = PAINT_LEFT | PAINT_RIGHT;
 #[derive(Clone, Debug, Default)]
 struct SidePaint {
     sides: OidHashMap<u8>,
+    /// The paint stopped at a commit reachable from the left side alone dated outside its
+    /// [`LeftDateWindow`], so `sides` is incomplete.
+    left_outside_window: bool,
 }
 
 impl SidePaint {
@@ -2100,14 +2473,17 @@ impl SidePaint {
         tips: &[ObjectId],
         hide: &[ObjectId],
         stop: HidePaintStop,
+        left_window: Option<LeftDateWindow>,
     ) -> Result<Self> {
         let walk = PaintWalk {
+            left_window,
             skip_missing_right: true,
             open_while_left_only: matches!(
                 stop,
                 HidePaintStop::TipsResolved | HidePaintStop::TipsResolvedDateSlop
             ),
             date_slop: stop == HidePaintStop::TipsResolvedDateSlop,
+            repair_left_only: stop == HidePaintStop::Converged,
             ..PaintWalk::default()
         };
         Self::paint(cache, tips, hide, walk)
@@ -2151,37 +2527,58 @@ impl SidePaint {
                 walk.mark(cache, tip, side)?;
             }
         }
-        let mut slop = PAINT_SLOP;
         loop {
-            if walk.open > 0 {
-                slop = PAINT_SLOP;
-            } else if !walk.unranked_hide_may_reach_left(&mut slop) {
-                break;
-            }
-            let Some(node) = walk.heap.pop() else {
-                break;
-            };
-            if walk.queued.remove(&node.oid) == Some(true) {
-                walk.open -= 1;
-            }
-            walk.popped.insert(node.oid);
-            let side = walk.sides.get(&node.oid).copied().unwrap_or(0);
-            if walk.date_slop && side == PAINT_LEFT && node.rank == UNRANKED_COMMIT {
-                walk.left_floor = Some(
-                    walk.left_floor
-                        .map_or(node.committed_at, |floor| floor.min(node.committed_at)),
-                );
-            }
-            for (i, parent) in cache.parents_of(node.oid)?.into_iter().enumerate() {
-                let side = if i > 0 && walk.left_first_parent_only {
-                    side & PAINT_RIGHT
-                } else {
-                    side
+            let mut slop = PAINT_SLOP;
+            loop {
+                if walk.open > 0 {
+                    slop = PAINT_SLOP;
+                } else if !walk.unranked_hide_may_reach_left(&mut slop) {
+                    break;
+                }
+                let Some(node) = walk.heap.pop() else {
+                    break;
                 };
-                walk.mark(cache, parent, side)?;
+                if walk.queued.remove(&node.oid) == Some(true) {
+                    walk.open -= 1;
+                }
+                walk.popped.insert(node.oid);
+                let side = walk.sides.get(&node.oid).copied().unwrap_or(0);
+                if side == PAINT_LEFT {
+                    walk.left_only_popped.insert(node.oid);
+                }
+                if side == PAINT_LEFT
+                    && walk
+                        .left_window
+                        .is_some_and(|window| !window.contains(node.committed_at))
+                {
+                    return Ok(Self {
+                        sides: walk.sides,
+                        left_outside_window: true,
+                    });
+                }
+                if walk.date_slop && side == PAINT_LEFT && node.rank == UNRANKED_COMMIT {
+                    walk.left_floor = Some(
+                        walk.left_floor
+                            .map_or(node.committed_at, |floor| floor.min(node.committed_at)),
+                    );
+                }
+                for (i, parent) in cache.parents_of(node.oid)?.into_iter().enumerate() {
+                    let side = if i > 0 && walk.left_first_parent_only {
+                        side & PAINT_RIGHT
+                    } else {
+                        side
+                    };
+                    walk.mark(cache, parent, side)?;
+                }
+            }
+            if !walk.repair_left_only || !walk.repaint_left_only_reachable_from_hide(cache)? {
+                break;
             }
         }
-        Ok(Self { sides: walk.sides })
+        Ok(Self {
+            sides: walk.sides,
+            left_outside_window: false,
+        })
     }
 
     /// Number of painted commits reachable from `side` only.
@@ -2203,7 +2600,10 @@ impl SidePaint {
                 (oid, flipped)
             })
             .collect();
-        Self { sides }
+        Self {
+            sides,
+            left_outside_window: self.left_outside_window,
+        }
     }
 
     /// Whether `side` reaches `oid`, or [`None`] when the walk never painted it.
@@ -2219,6 +2619,9 @@ struct PaintWalk {
     /// Queued commits, each flagged whether it keeps the walk going.
     queued: OidHashMap<bool>,
     popped: OidHashSet,
+    /// Commits popped while only the left (included) side reached them. A queued hide-side
+    /// commit dated before such a commit may still reach it after the open counter hits zero.
+    left_only_popped: OidHashSet,
     heap: BinaryHeap<PaintKey>,
     seq: u64,
     /// Queued commits that still keep the walk going (see [`Self::mark`]).
@@ -2236,6 +2639,11 @@ struct PaintWalk {
     left_floor: Option<i64>,
     /// Pass the left paint to first parents only ([`SidePaint::compute_hiding_first_parent`]).
     left_first_parent_only: bool,
+    /// Stop when a commit popped as reachable from the left side alone is dated outside it.
+    left_window: Option<LeftDateWindow>,
+    /// Run [`PaintWalk::repaint_left_only_reachable_from_hide`] when the frontier closes early
+    /// ([`HidePaintStop::Converged`] range walks without a commit-graph).
+    repair_left_only: bool,
 }
 
 /// Commits a [`HidePaintStop::TipsResolvedDateSlop`] paint pops past its date guard, so a hide
@@ -2243,12 +2651,259 @@ struct PaintWalk {
 /// the same number of commits past its "everything left is uninteresting" point.
 const PAINT_SLOP: usize = 5;
 
+#[cfg(test)]
+mod unpainted_bridge_test_hooks {
+    use std::cell::Cell;
+
+    thread_local! {
+        static UNPAINTED_BRIDGE_VISIT_CAP: Cell<Option<usize>> = const { Cell::new(None) };
+        static LEGACY_CD3F334B_SKEW_REPAIR: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub fn set_unpainted_bridge_visit_cap_for_test(cap: Option<usize>) {
+        UNPAINTED_BRIDGE_VISIT_CAP.with(|c| c.set(cap));
+    }
+
+    pub fn set_legacy_cd3f334b_skew_repair_for_test(enabled: bool) {
+        LEGACY_CD3F334B_SKEW_REPAIR.with(|c| c.set(enabled));
+    }
+
+    pub(crate) fn unpainted_bridge_visit_cap(default: usize) -> usize {
+        UNPAINTED_BRIDGE_VISIT_CAP
+            .with(|c| c.get())
+            .unwrap_or(default)
+    }
+
+    pub(crate) fn use_legacy_cd3f334b_skew_repair() -> bool {
+        LEGACY_CD3F334B_SKEW_REPAIR.with(|c| c.get())
+    }
+}
+
 /// How much older than a popped left-only commit a queued hide commit without a generation may
 /// be dated and still keep a [`HidePaintStop::TipsResolvedDateSlop`] paint going: the clock
 /// skew it tolerates exactly.
 const UNRANKED_SKEW_ALLOWANCE: time::Duration = time::Duration::DAY;
 
 impl PaintWalk {
+    /// After the paint frontier closes, propagate hide-side marks onto left-only commits that
+    /// a still-queued hide-side commit can still reach (Git's `mark_parents_uninteresting`
+    /// plus output-time uninteresting filtering).
+    ///
+    /// Returns whether any commit was repainted so the main paint loop should continue.
+    fn repaint_left_only_reachable_from_hide(
+        &mut self,
+        cache: &mut CommitGraphCache<'_>,
+    ) -> Result<bool> {
+        #[cfg(test)]
+        if unpainted_bridge_test_hooks::use_legacy_cd3f334b_skew_repair() {
+            return self.repaint_left_only_reachable_from_hide_cd3f334b(cache);
+        }
+        self.repaint_left_only_reachable_from_hide_bounded(cache)
+    }
+
+    fn repaint_left_only_reachable_from_hide_bounded(
+        &mut self,
+        cache: &mut CommitGraphCache<'_>,
+    ) -> Result<bool> {
+        if self.left_only_popped.is_empty() {
+            return Ok(false);
+        }
+        let hide_starts: Vec<ObjectId> = self
+            .queued
+            .keys()
+            .copied()
+            .filter(|oid| self.sides.get(oid).copied().unwrap_or(0) & PAINT_RIGHT != 0)
+            .collect();
+        if hide_starts.is_empty() {
+            return Ok(false);
+        }
+        let skew_probe: Vec<ObjectId> = self.left_only_popped.iter().copied().collect();
+        let allowance = UNRANKED_SKEW_ALLOWANCE.whole_seconds();
+        let clock_skewed = skew_probe.iter().any(|&left| {
+            let Ok(left_time) = cache.commit_time(left) else {
+                return false;
+            };
+            hide_starts.iter().any(|&start| {
+                cache
+                    .commit_time(start)
+                    .is_ok_and(|start_time| left_time.abs_diff(start_time) > allowance as u64)
+            })
+        });
+        if !clock_skewed {
+            return Ok(false);
+        }
+        let mut changed = self.repaint_left_only_on_frontier(cache, &hide_starts)?;
+        if changed {
+            return Ok(true);
+        }
+        loop {
+            if !self.repaint_left_only_unpainted_bridges(cache, &hide_starts)? {
+                break;
+            }
+            changed = true;
+        }
+        Ok(changed)
+    }
+
+    /// Round-2 hide-side skew repair (commit cd3f334b), for regression tests only.
+    #[cfg(test)]
+    fn repaint_left_only_reachable_from_hide_cd3f334b(
+        &mut self,
+        cache: &mut CommitGraphCache<'_>,
+    ) -> Result<bool> {
+        if self.left_only_popped.is_empty() {
+            return Ok(false);
+        }
+        let hide_starts: Vec<ObjectId> = self
+            .queued
+            .keys()
+            .copied()
+            .filter(|oid| self.sides.get(oid).copied().unwrap_or(0) & PAINT_RIGHT != 0)
+            .collect();
+        let skew_probe: Vec<ObjectId> = self.left_only_popped.iter().copied().collect();
+        let allowance = UNRANKED_SKEW_ALLOWANCE.whole_seconds();
+        let clock_skewed = skew_probe.iter().any(|&left| {
+            let Ok(left_time) = cache.commit_time(left) else {
+                return false;
+            };
+            hide_starts.iter().any(|&start| {
+                cache
+                    .commit_time(start)
+                    .is_ok_and(|start_time| left_time.abs_diff(start_time) > allowance as u64)
+            })
+        });
+        if !clock_skewed || hide_starts.is_empty() {
+            return Ok(false);
+        }
+        let visit_cap = usize::MAX / 4;
+        let mut changed = false;
+        loop {
+            let mut progress = false;
+            for &start in &hide_starts {
+                let mut stack = vec![start];
+                let mut visited = OidHashSet::default();
+                visited.insert(start);
+                while let Some(oid) = stack.pop() {
+                    if visited.len() > visit_cap {
+                        break;
+                    }
+                    for parent in cache.parents_of(oid)? {
+                        if !visited.insert(parent) {
+                            continue;
+                        }
+                        if let Some(side) = self.sides.get(&parent).copied() {
+                            if side == PAINT_LEFT {
+                                progress = true;
+                                changed = true;
+                                self.mark(cache, parent, PAINT_RIGHT)?;
+                                self.left_only_popped.remove(&parent);
+                            }
+                        }
+                        stack.push(parent);
+                    }
+                }
+            }
+            if !progress {
+                break;
+            }
+        }
+        Ok(changed)
+    }
+
+    /// Propagate hide-side paint along already-painted parents from queued hide-side starts,
+    /// stopping at commits already popped as reachable from both sides.
+    fn repaint_left_only_on_frontier(
+        &mut self,
+        cache: &mut CommitGraphCache<'_>,
+        hide_starts: &[ObjectId],
+    ) -> Result<bool> {
+        let mut visited = OidHashSet::default();
+        let mut stack = hide_starts.to_vec();
+        for &start in hide_starts {
+            visited.insert(start);
+        }
+        let mut changed = false;
+        while let Some(oid) = stack.pop() {
+            for parent in cache.parents_of(oid)? {
+                if !visited.insert(parent) {
+                    continue;
+                }
+                if self.popped.contains(&parent)
+                    && self.sides.get(&parent).copied() == Some(PAINT_BOTH)
+                {
+                    continue;
+                }
+                let painted = self.sides.get(&parent).copied();
+                if painted == Some(PAINT_BOTH) {
+                    continue;
+                }
+                let Some(side) = painted else {
+                    continue;
+                };
+                if side == PAINT_LEFT {
+                    changed = true;
+                    self.mark(cache, parent, PAINT_RIGHT)?;
+                    self.left_only_popped.remove(&parent);
+                }
+                stack.push(parent);
+            }
+        }
+        Ok(changed)
+    }
+
+    /// Walk unpainted bridges off queued hide-side starts until left-only popped commits are
+    /// repainted, stopping at already-popped [`PAINT_BOTH`] history.
+    fn repaint_left_only_unpainted_bridges(
+        &mut self,
+        cache: &mut CommitGraphCache<'_>,
+        hide_starts: &[ObjectId],
+    ) -> Result<bool> {
+        let default_cap = hide_starts.len() * 64 + PAINT_SLOP + 64;
+        #[cfg(test)]
+        let visit_cap = unpainted_bridge_test_hooks::unpainted_bridge_visit_cap(default_cap);
+        #[cfg(not(test))]
+        let visit_cap = default_cap;
+        let mut changed = false;
+        for &start in hide_starts {
+            let mut stack = vec![start];
+            let mut visited = OidHashSet::default();
+            visited.insert(start);
+            while let Some(oid) = stack.pop() {
+                if visited.len() > visit_cap {
+                    break;
+                }
+                let from_queued = self.queued.contains_key(&oid);
+                let on_unpainted = !self.sides.contains_key(&oid);
+                for parent in cache.parents_of(oid)? {
+                    if !visited.insert(parent) {
+                        continue;
+                    }
+                    if self.popped.contains(&parent)
+                        && self.sides.get(&parent).copied() == Some(PAINT_BOTH)
+                    {
+                        continue;
+                    }
+                    if let Some(side) = self.sides.get(&parent).copied() {
+                        if side == PAINT_BOTH {
+                            continue;
+                        }
+                        if side == PAINT_LEFT {
+                            changed = true;
+                            self.mark(cache, parent, PAINT_RIGHT)?;
+                            self.left_only_popped.remove(&parent);
+                        }
+                        stack.push(parent);
+                        continue;
+                    }
+                    if from_queued || on_unpainted {
+                        stack.push(parent);
+                    }
+                }
+            }
+        }
+        Ok(changed)
+    }
+
     /// Date-slop paint with nothing left-only queued: whether a queued commit without a
     /// generation may still reach a commit popped as left-only, so the walk goes on.
     ///
@@ -2301,7 +2956,7 @@ impl PaintWalk {
         let committed_at = match cache.commit_time(oid) {
             Ok(time) => time,
             // Hidden either way, and unpainted ancestors count as hidden too.
-            Err(Error::ObjectNotFound(_))
+            Err(Error::Object(ObjectError::NotFound { .. }))
                 if self.skip_missing_right && after & PAINT_RIGHT != 0 =>
             {
                 return Ok(());
@@ -2333,12 +2988,12 @@ impl PaintWalk {
 
 /// [`PaintWalk`] heap order: highest generation, then newest committer date,
 /// then first queued (Git's priority queue is stable for ties).
-#[derive(Eq, Ord, PartialEq, PartialOrd)]
-struct PaintKey {
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct PaintKey {
     rank: u64,
     committed_at: i64,
     seq: std::cmp::Reverse<u64>,
-    oid: ObjectId,
+    pub(crate) oid: ObjectId,
 }
 
 /// Newest committer timestamp first, matching `git merge-base` stdout ordering.
@@ -2529,7 +3184,11 @@ fn reduce_to_best(
 /// front; merge-base and range walks start from one or two tips and keep the plain reads.
 const PRIME_TIPS_MIN: usize = 64;
 
-struct CommitGraphCache<'r> {
+/// Fewest tips each [`CommitGraphCache::prime_tips`] worker thread reads: a header read costs
+/// a few microseconds, so smaller shares spend more on starting threads than they save.
+const PRIME_TIPS_PER_THREAD_MIN: usize = 128;
+
+pub(crate) struct CommitGraphCache<'r> {
     repo: &'r Repository,
     closures: OidHashMap<OidHashSet>,
     promisor_stop: OidHashSet,
@@ -2563,9 +3222,16 @@ impl<'r> CommitGraphCache<'r> {
         Self::with_commit_graph(repo, true)
     }
 
+    /// True when describe can rely on commit-graph generation for heap order from `tip`.
+    pub(crate) fn generation_ranked_walk_from(&mut self, tip: ObjectId) -> Result<bool> {
+        Ok(self.graph.is_some()
+            && !self.has_parent_rewrites()?
+            && commit_rank_for_walk(self, tip) != UNRANKED_COMMIT)
+    }
+
     /// `use_commit_graph: false` leaves [`Self::graph`] empty so every lookup parses the commit.
-    fn with_commit_graph(repo: &'r Repository, use_commit_graph: bool) -> Self {
-        let cfg = repo.config().unwrap_or_default();
+    pub(crate) fn with_commit_graph(repo: &'r Repository, use_commit_graph: bool) -> Self {
+        let cfg = repo.config().snapshot().unwrap_or_default();
         // Stop ancestry traversal only at genuinely-missing promisor objects, not
         // at every member of a promisor pack. The clone base commit lives in a
         // promisor pack but is fully present locally; treating it as a stop point
@@ -2574,7 +3240,7 @@ impl<'r> CommitGraphCache<'r> {
         // commits, gc works"). Missing parents are already handled by
         // `parents_of` returning no parents on `ObjectNotFound`, so we only need
         // to record the OIDs the partial clone knows are absent.
-        let promisor_stop = if repo_treats_promisor_packs(repo.git_dir(), &cfg) {
+        let promisor_stop = if repo_treats_promisor_packs(&cfg) {
             read_promisor_missing_oids(repo.git_dir())
                 .into_iter()
                 .collect::<OidHashSet>()
@@ -2613,7 +3279,7 @@ impl<'r> CommitGraphCache<'r> {
         self.ensure_single_pack_reader();
         if let Some(reader) = self.single_pack.as_mut() {
             match reader.read_object_into_with_delta_policy(oid, true, buf) {
-                Err(Error::ObjectNotFound(_)) => {}
+                Err(Error::Object(ObjectError::NotFound { .. })) => {}
                 read => return read,
             }
         }
@@ -2627,7 +3293,7 @@ impl<'r> CommitGraphCache<'r> {
         }
         let mut has_replacements = false;
         if let Some(prefix) = self.repo.replace_ref_base_if_enabled() {
-            self.repo.refs().for_each_ref(&prefix, &mut |_| {
+            self.repo.ref_store().for_each_ref(&prefix, &mut |_| {
                 has_replacements = true;
                 std::ops::ControlFlow::Break(())
             })?;
@@ -2694,7 +3360,7 @@ impl<'r> CommitGraphCache<'r> {
         Ok(visited)
     }
 
-    fn parents_of(&mut self, oid: ObjectId) -> Result<Vec<ObjectId>> {
+    pub(crate) fn parents_of(&mut self, oid: ObjectId) -> Result<Vec<ObjectId>> {
         #[cfg(test)]
         intersect_walk_test_hooks::record_commit_parent_query();
         if let Some(parents) = self.with_linkage(|link| link.parents.get(&oid).cloned()) {
@@ -2713,14 +3379,16 @@ impl<'r> CommitGraphCache<'r> {
         if self.shallow_boundaries.contains(&oid) {
             let commit_oid =
                 peel_to_commit_for_merge_base(self.repo, oid).map_err(|e| match e {
-                    Error::InvalidRef(msg) => Error::CorruptObject(msg),
+                    Error::Ref(RefError::Invalid { detail: msg }) => {
+                        Error::Object(ObjectError::Corrupt { detail: msg })
+                    }
                     other => other,
                 })?;
             let object = self.repo.odb().read(&commit_oid)?;
             if object.kind != ObjectKind::Commit {
-                return Err(Error::CorruptObject(format!(
-                    "object {commit_oid} is not a commit"
-                )));
+                return Err(Error::Object(ObjectError::Corrupt {
+                    detail: format!("object {commit_oid} is not a commit"),
+                }));
             }
             let commit = CommitRef::parse(&object.data)?;
             let time = commit.committer_timestamp();
@@ -2733,22 +3401,24 @@ impl<'r> CommitGraphCache<'r> {
         }
         // Fast path: parents + committer time from the commit-graph file (no
         // object decompression). Misses (not in graph / octopus) fall through.
-        if let Some(graph) = &self.graph {
-            if let Some((parents, ctime)) = graph.graph_commit(&oid) {
-                let parents = if self.shallow_boundaries.contains(&oid) {
-                    Vec::new()
-                } else {
-                    parents
-                        .into_iter()
-                        .filter(|p| !self.promisor_stop.contains(p))
-                        .collect()
-                };
-                let parents = self.grafted_parents(oid, parents);
-                self.with_linkage(|link| {
-                    link.times.insert(oid, ctime);
-                    link.parents.insert(oid, parents.clone());
-                });
-                return Ok(parents);
+        if self.repo.object_id_after_replace(&oid) == oid {
+            if let Some(graph) = &self.graph {
+                if let Some((parents, ctime)) = graph.graph_commit(&oid) {
+                    let parents = if self.shallow_boundaries.contains(&oid) {
+                        Vec::new()
+                    } else {
+                        parents
+                            .into_iter()
+                            .filter(|p| !self.promisor_stop.contains(p))
+                            .collect()
+                    };
+                    let parents = self.grafted_parents(oid, parents);
+                    self.with_linkage(|link| {
+                        link.times.insert(oid, ctime);
+                        link.parents.insert(oid, parents.clone());
+                    });
+                    return Ok(parents);
+                }
             }
         }
         // A plain commit without a replacement is its own peel target, so one read serves both
@@ -2770,21 +3440,23 @@ impl<'r> CommitGraphCache<'r> {
         } else {
             let commit_oid =
                 peel_to_commit_for_merge_base(self.repo, oid).map_err(|e| match e {
-                    Error::InvalidRef(msg) => Error::CorruptObject(msg),
+                    Error::Ref(RefError::Invalid { detail: msg }) => {
+                        Error::Object(ObjectError::Corrupt { detail: msg })
+                    }
                     other => other,
                 })?;
             let kind =
                 self.read_object_into(&self.repo.object_id_after_replace(&commit_oid), buf)?;
             if kind != ObjectKind::Commit {
-                return Err(Error::CorruptObject(format!(
-                    "object {commit_oid} is not a commit"
-                )));
+                return Err(Error::Object(ObjectError::Corrupt {
+                    detail: format!("object {commit_oid} is not a commit"),
+                }));
             }
             commit_oid
         };
         let linkage = CommitRef::parse(buf)?;
         let (time, parsed_parents) = (linkage.committer_timestamp(), linkage.parents().to_vec());
-        if self.retain_reads && effective_oid == oid && commit_oid == oid {
+        if self.retain_reads && commit_oid == oid {
             if let Some(retained) = self.retained.as_mut() {
                 retained.insert(oid, buf);
             }
@@ -2801,6 +3473,22 @@ impl<'r> CommitGraphCache<'r> {
         time: i64,
         parsed_parents: &[ObjectId],
     ) -> Vec<ObjectId> {
+        let parents = self.linkage_parents(oid, commit_oid, parsed_parents);
+        self.with_linkage(|link| {
+            link.times.insert(oid, time);
+            link.parents.insert(oid, parents.clone());
+        });
+        parents
+    }
+
+    /// The parents [`Self::record_linkage`] records for `oid` (read as `commit_oid`) after
+    /// shallow boundaries, promisor stops and grafts.
+    fn linkage_parents(
+        &self,
+        oid: ObjectId,
+        commit_oid: ObjectId,
+        parsed_parents: &[ObjectId],
+    ) -> Vec<ObjectId> {
         let parents: Vec<ObjectId> = if self.shallow_boundaries.contains(&commit_oid) {
             Vec::new()
         } else {
@@ -2810,12 +3498,7 @@ impl<'r> CommitGraphCache<'r> {
                 .filter(|p| !self.promisor_stop.contains(p))
                 .collect()
         };
-        let parents = self.grafted_parents(oid, parents);
-        self.with_linkage(|link| {
-            link.times.insert(oid, time);
-            link.parents.insert(oid, parents.clone());
-        });
-        parents
+        self.grafted_parents(oid, parents)
     }
 
     /// Whether `oid` names itself: no replace ref, promisor stop or shallow boundary rewrites it.
@@ -2832,7 +3515,7 @@ impl<'r> CommitGraphCache<'r> {
     }
 
     /// Record the linkage of every plain packed commit among `tips` from its header block
-    /// ([`crate::odb::Odb::read_packed_commit_header_block_into`]), reading them in parallel.
+    /// ([`crate::odb::Odb::read_packed_commit_header_blocks`]), reading them in parallel.
     ///
     /// Hide sets hold every ref in the repository, so a walk can start from hundreds of
     /// scattered tips whose dates it needs before taking a single step. Their reads are
@@ -2854,25 +3537,42 @@ impl<'r> CommitGraphCache<'r> {
             .copied()
             .collect();
         let repo = self.repo;
-        let read_linkage = |oid: &ObjectId| -> Option<(i64, Vec<ObjectId>)> {
-            let mut buf = Vec::new();
-            if !repo
+        let read_linkages = |part: &[ObjectId]| -> Vec<Option<(i64, Vec<ObjectId>)>> {
+            let mut linkages = vec![None; part.len()];
+            let _ = repo
                 .odb()
-                .read_packed_commit_header_block_into(oid, &mut buf)
-                .ok()?
-            {
-                return None;
-            }
-            let commit = CommitRef::parse(&buf).ok()?;
-            Some((commit.committer_timestamp(), commit.parents().to_vec()))
+                .read_packed_commit_header_blocks(part, |i, header| {
+                    if let (Some(slot), Ok(commit)) =
+                        (linkages.get_mut(i), CommitRef::parse(header))
+                    {
+                        *slot = Some((commit.committer_timestamp(), commit.parents().to_vec()));
+                    }
+                });
+            linkages
         };
-        let read = crate::rev_list::map_commits_in_parallel(&pending, read_linkage);
-        for (oid, linkage) in pending.into_iter().zip(read) {
-            if let Some((time, parents)) = linkage {
-                self.record_linkage(oid, oid, time, &parents);
-                self.header_primed.insert(oid);
+        let read = crate::rev_list::map_commit_chunks_in_parallel(
+            &pending,
+            PRIME_TIPS_PER_THREAD_MIN,
+            read_linkages,
+        );
+        let primed: Vec<(ObjectId, i64, Vec<ObjectId>)> = pending
+            .into_iter()
+            .zip(read)
+            .filter_map(|(oid, linkage)| {
+                let (time, parents) = linkage?;
+                Some((oid, time, self.linkage_parents(oid, oid, &parents)))
+            })
+            .collect();
+        self.header_primed
+            .extend(primed.iter().map(|(oid, _, _)| *oid));
+        self.with_linkage(|link| {
+            link.times.reserve(primed.len());
+            link.parents.reserve(primed.len());
+            for (oid, time, parents) in primed {
+                link.times.insert(oid, time);
+                link.parents.insert(oid, parents);
             }
-        }
+        });
     }
 
     /// Peel a walk tip to its commit, like [`try_peel_to_commit_for_merge_base`], without a read
@@ -2888,7 +3588,7 @@ impl<'r> CommitGraphCache<'r> {
     /// Committer timestamp (unix seconds) for `oid`, peeling tags to their commit.
     /// Populated as a side effect of [`Self::parents_of`]; missing/unreadable
     /// objects report `0` (treated as oldest, so they prune away).
-    fn commit_time(&mut self, oid: ObjectId) -> Result<i64> {
+    pub(crate) fn commit_time(&mut self, oid: ObjectId) -> Result<i64> {
         if let Some(t) = self.with_linkage(|link| link.times.get(&oid).copied()) {
             return Ok(t);
         }
@@ -2905,6 +3605,65 @@ impl<'r> CommitGraphCache<'r> {
         let time = self.commit_time(oid);
         self.retain_reads = false;
         time
+    }
+
+    /// First parent of `oid`, when present.
+    fn first_parent_of(&mut self, oid: ObjectId) -> Result<Option<ObjectId>> {
+        Ok(self.parents_of(oid)?.first().copied())
+    }
+
+    /// Walk `descendant`'s first-parent chain toward `ancestor` without a heap or visited set.
+    ///
+    /// Returns `true` when `ancestor` is found. When the commit-graph ranks both commits,
+    /// stops once generations drop to `ancestor`'s rank and returns `false` so the full walk
+    /// can follow merge parents. Otherwise walks to the root.
+    fn first_parent_forward_scan_reaches_ancestor(
+        &mut self,
+        ancestor: ObjectId,
+        descendant: ObjectId,
+    ) -> Result<bool> {
+        let ancestor_gen = commit_graph_rank(self, ancestor);
+        let ancestor_time = if ancestor_gen.is_none() {
+            Some(self.commit_time(ancestor)?)
+        } else {
+            None
+        };
+        let mut cur = descendant;
+        loop {
+            if cur == ancestor {
+                return Ok(true);
+            }
+            let Some(parent) = self.first_parent_of(cur)? else {
+                return Ok(false);
+            };
+            if parent == ancestor {
+                return Ok(true);
+            }
+            if let Some(limit) = ancestor_gen {
+                let parent_gen = commit_rank_for_walk(self, parent);
+                if parent_gen != UNRANKED_COMMIT && parent_gen <= limit {
+                    return Ok(false);
+                }
+            } else if let Some(a_time) = ancestor_time {
+                if self.commit_time(parent)? < a_time {
+                    return Ok(false);
+                }
+            }
+            cur = parent;
+        }
+    }
+
+    /// Whether `oid` is in the commit-graph at or below `ancestor`'s generation, so it cannot
+    /// reach a strictly newer `ancestor` without leaving the graph.
+    fn graph_generation_cannot_reach_ancestor(&self, ancestor: ObjectId, oid: ObjectId) -> bool {
+        if oid == ancestor {
+            return false;
+        }
+        let Some(limit) = commit_graph_rank(self, ancestor) else {
+            return false;
+        };
+        let generation = commit_graph_rank(self, oid);
+        generation.is_some_and(|g| g <= limit)
     }
 
     /// Whether `ancestor` is an ancestor of (or equal to) `descendant`.
@@ -2926,7 +3685,13 @@ impl<'r> CommitGraphCache<'r> {
             return Ok(true);
         }
 
+        if self.first_parent_forward_scan_reaches_ancestor(ancestor, descendant)? {
+            return Ok(true);
+        }
+
         let a_time = self.commit_time(ancestor)?;
+        let both_ranked = commit_graph_rank(self, ancestor).is_some()
+            && commit_graph_rank(self, descendant).is_some();
 
         // Tolerate up to this many commits below the cutoff before concluding the
         // ancestor is unreachable; absorbs realistic clock skew without walking
@@ -2944,6 +3709,9 @@ impl<'r> CommitGraphCache<'r> {
             if oid == ancestor {
                 return Ok(true);
             }
+            if both_ranked && self.graph_generation_cannot_reach_ancestor(ancestor, oid) {
+                continue;
+            }
             if time < a_time {
                 slop -= 1;
                 if slop <= 0 {
@@ -2953,6 +3721,12 @@ impl<'r> CommitGraphCache<'r> {
                 slop = SLOP;
             }
             for parent in self.parents_of(oid)? {
+                if parent == ancestor {
+                    return Ok(true);
+                }
+                if both_ranked && self.graph_generation_cannot_reach_ancestor(ancestor, parent) {
+                    continue;
+                }
                 if visited.insert(parent) {
                     let pt = self.commit_time(parent)?;
                     heap.push((pt, parent));
@@ -3175,7 +3949,7 @@ struct ContainsFrame {
 impl<'repo> RefContainsMemo<'repo> {
     /// Returns `None` for rewritten parents: ancestry need not be acyclic, so
     /// callers must use the batch walk instead of inferring negative ancestors.
-    pub(crate) fn new(repo: &'repo Repository, targets: &[ObjectId]) -> Result<Option<Self>> {
+    pub fn new(repo: &'repo Repository, targets: &[ObjectId]) -> Result<Option<Self>> {
         let mut graph = CommitGraphCache::new(repo);
         if graph.has_parent_rewrites()? {
             return Ok(None);
@@ -3188,9 +3962,9 @@ impl<'repo> RefContainsMemo<'repo> {
             // without reading its ancestors; expensive probes can extend it on demand.
             for parent in graph.parents_of(targets[0])? {
                 if parent == targets[0] {
-                    return Err(Error::CorruptObject(format!(
-                        "commit ancestry cycle at {parent}"
-                    )));
+                    return Err(Error::Object(ObjectError::Corrupt {
+                        detail: format!("commit ancestry cycle at {parent}"),
+                    }));
                 }
                 if known.insert(parent, false).is_none() {
                     negative_pending.push(parent);
@@ -3227,9 +4001,9 @@ impl<'repo> RefContainsMemo<'repo> {
             for parent in self.graph.parents_of(key.oid)? {
                 match self.known.get(&parent) {
                     Some(true) => {
-                        return Err(Error::CorruptObject(format!(
-                            "commit ancestry cycle at {parent}"
-                        )))
+                        return Err(Error::Object(ObjectError::Corrupt {
+                            detail: format!("commit ancestry cycle at {parent}"),
+                        }))
                     }
                     Some(false) => {}
                     None => {
@@ -3307,9 +4081,9 @@ impl<'repo> RefContainsMemo<'repo> {
                 None => {}
             }
             if active.insert(parent, stack.len()).is_some() {
-                return Err(Error::CorruptObject(format!(
-                    "commit ancestry cycle at {parent}"
-                )));
+                return Err(Error::Object(ObjectError::Corrupt {
+                    detail: format!("commit ancestry cycle at {parent}"),
+                }));
             }
             visited += 1;
             stack.push(ContainsFrame {
@@ -3332,7 +4106,7 @@ pub(crate) struct RefContainsBatch<'repo> {
 
 impl<'repo> RefContainsBatch<'repo> {
     /// Start a batch session on `repo`.
-    pub(crate) fn new(repo: &'repo Repository) -> Self {
+    pub fn new(repo: &'repo Repository) -> Self {
         Self {
             graph: CommitGraphCache::new(repo),
             tips: Vec::new(),
@@ -3485,8 +4259,24 @@ pub(crate) fn branch_tips_merged_into(
     bases: &[ObjectId],
     tips: &[ObjectId],
 ) -> Result<OidHashSet> {
+    // A tip that is itself a base is merged; when every tip is (listing the branch the
+    // base names), nothing needs ranking or walking.
+    if tips.iter().all(|tip| bases.contains(tip)) {
+        return Ok(tips.iter().copied().collect());
+    }
     let mut cache = CommitGraphCache::new(repo);
     cache.tips_merged_from_bases(bases, tips)
+}
+
+#[cfg(test)]
+fn clear_walk_linkage(repo: &Repository) {
+    let mut link = repo
+        .caches()
+        .commit_linkage()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    link.parents.clear();
+    link.times.clear();
 }
 
 #[cfg(test)]
@@ -3495,8 +4285,25 @@ mod tests {
     use crate::environment::RepositoryOptions;
     use crate::odb::Odb;
     use crate::repo::{InitOptions, Repository};
+    use crate::revwalk::RevWalkListOptions;
     use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    fn tips_equal_to_bases_are_merged_without_reading_history() -> Result<()> {
+        let dir = tempdir()?;
+        let repo = open_test_bare(&dir)?;
+        let root = write_commit_same_time(repo.odb(), &[], "root", 100)?;
+        let tip = write_commit_same_time(repo.odb(), &[root], "tip", 200)?;
+        let absent = ObjectId::from_hex("1111111111111111111111111111111111111111")?;
+        let merged = branch_tips_merged_into(&repo, &[tip, absent], &[absent])?;
+        assert_eq!(merged, [absent].into_iter().collect::<OidHashSet>());
+        let merged = branch_tips_merged_into(&repo, &[tip], &[tip, root])?;
+        assert_eq!(merged, [tip, root].into_iter().collect::<OidHashSet>());
+        let merged = branch_tips_merged_into(&repo, &[root], &[tip, root])?;
+        assert_eq!(merged, [root].into_iter().collect::<OidHashSet>());
+        Ok(())
+    }
 
     #[test]
     fn containment_memo_shares_successes_and_exhausted_histories() -> Result<()> {
@@ -3621,7 +4428,7 @@ mod tests {
     }
 
     fn open_test_bare(dir: &tempfile::TempDir) -> Result<Repository> {
-        Repository::init(
+        let (_, _) = Repository::init(
             dir.path(),
             &InitOptions {
                 bare: true,
@@ -3823,13 +4630,7 @@ mod tests {
     }
 
     fn clear_commit_linkage(repo: &Repository) {
-        let mut link = repo
-            .caches()
-            .commit_linkage()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        link.parents.clear();
-        link.times.clear();
+        clear_walk_linkage(repo);
     }
 
     /// Linear chain of `len` commits; `time(i)` dates commit `i` (0 is the root).
@@ -3991,7 +4792,7 @@ mod tests {
                 )?
                 .commit_count()
             } else {
-                repo.rev_walk().count(
+                repo.revwalk().count(
                     &["main~20..main"],
                     &crate::revwalk::RevWalkListOptions::default(),
                 )?
@@ -4337,8 +5138,8 @@ mod tests {
         let limited = commits_reachable_excluding_ancestors_of(&repo, &[c3], &[], Some(2))?;
         assert_eq!(limited, vec![c3, c2]);
 
-        let (total, retained) = ahead_of_target_commits(&repo, c3, c1, 1)?;
-        assert_eq!(total, 2);
+        let (total, behind, retained, _) = ahead_behind_of_target_commits(&repo, c3, c1, 1, 0)?;
+        assert_eq!((total, behind), (2, 0));
         assert_eq!(retained, vec![c3]);
 
         let ahead = commits_reachable_excluding_ancestors_of(&repo, &[c3], &[c1], None)?;
@@ -4380,7 +5181,7 @@ mod tests {
     }
 
     #[test]
-    fn count_symmetric_ahead_behind_and_branch_base() -> Result<()> {
+    fn count_symmetric_ahead_behind_and_retained_newest() -> Result<()> {
         let dir = tempdir().map_err(Error::Io)?;
         let repo = open_test_bare(&dir)?;
         let c1 = write_commit_same_time(&repo.odb(), &[], "one", 100)?;
@@ -4393,8 +5194,6 @@ mod tests {
         assert_eq!((ahead2, behind2), (2, 0));
         assert_eq!(retained.len(), 1);
         assert_eq!(retained[0], c3);
-        let idx = branch_base_for_tip(&repo, c3, &[c1, c2])?;
-        assert!(idx.is_some());
         Ok(())
     }
 
@@ -4406,8 +5205,8 @@ mod tests {
         let c2 = write_commit_same_time(&repo.odb(), &[c1], "two", 200)?;
         let mb = merge_base_for_diff_two_commits(&repo, c2, c1).expect("mb");
         assert_eq!(mb, c1);
-        let mb_idx = merge_base_for_diff_index(&repo, c2, c1).expect("mb idx");
-        assert_eq!(mb_idx, c1);
+        let mb_rev = merge_base_for_diff_two_commits(&repo, c1, c2).expect("mb reversed");
+        assert_eq!(mb_rev, c1);
         Ok(())
     }
 
@@ -4453,7 +5252,7 @@ mod tests {
         let tip = write_commit_same_time(&repo.odb(), &[missing], "tip", 100)?;
 
         let err = commits_reachable_excluding_ancestors_of(&repo, &[tip], &[], None).unwrap_err();
-        assert!(matches!(err, Error::ObjectNotFound(_)));
+        assert!(matches!(err, Error::Object(ObjectError::NotFound { .. })));
 
         Ok(())
     }
@@ -4516,7 +5315,7 @@ mod tests {
         assert!(!is_ancestor_odb_walk(&odb, base, tip)?);
         assert!(matches!(
             is_ancestor_odb_walk(&odb, missing, base),
-            Err(Error::ObjectNotFound(_))
+            Err(Error::Object(ObjectError::NotFound { .. }))
         ));
         Ok(())
     }
@@ -4759,7 +5558,8 @@ mod tests {
         for (name, oid) in refs {
             crate::refs::write_ref(repo.git_dir(), name, oid)?;
         }
-        repo.write_commit_graph(&crate::maintenance::CommitGraphOptions::default())?;
+        repo.maintenance()
+            .write_commit_graph(&crate::maintenance::CommitGraphOptions::default())?;
         drop(repo);
         Repository::open(dir.path(), &RepositoryOptions::empty())
     }
@@ -4794,6 +5594,150 @@ mod tests {
                 ("refs/heads/filler", filler),
             ],
         })
+    }
+
+    /// Range-walk paint fixture: `skewed` is dated after its child `behind`, and the hide side
+    /// reaches `skewed` only through `behind` while `positive_tip` also lists it through a
+    /// merge. A filler branch from the root lets the paint frontier close before `behind` is
+    /// popped, so `skewed` must still be marked hidden afterward.
+    struct RangeSkewPaintFixture {
+        positive_tip: ObjectId,
+        hide: Vec<ObjectId>,
+        skewed: ObjectId,
+        behind: ObjectId,
+    }
+
+    fn write_range_skew_paint_fixture(
+        repo: &Repository,
+        deep_unpainted: usize,
+    ) -> Result<RangeSkewPaintFixture> {
+        const DAY: i64 = 86_400;
+        let odb = repo.odb();
+        let base = write_commit_same_time(odb, &[], "base", 10 * DAY)?;
+        let mut deep = base;
+        for i in 0..deep_unpainted {
+            deep = write_commit_same_time(
+                odb,
+                &[deep],
+                &format!("deep unpainted {i}"),
+                11 * DAY + i as i64,
+            )?;
+        }
+        let skewed = write_commit_same_time(odb, &[base], "skewed ahead", 100 * DAY)?;
+        let mid1 = write_commit_same_time(odb, &[skewed], "hide chain 1", 100 * DAY + 600)?;
+        let mid2 = write_commit_same_time(odb, &[mid1, deep], "hide chain 2", 100 * DAY + 1_200)?;
+        // More than [`UNRANKED_SKEW_ALLOWANCE`] before `skewed` and the queued hide tip.
+        let behind = write_commit_same_time(odb, &[mid2], "behind skewed", 50 * DAY)?;
+        let held = write_commit_same_time(odb, &[behind], "held hide tip", 48 * DAY)?;
+        let mut filler = base;
+        for i in 0..10 {
+            filler = write_commit_same_time(odb, &[filler], &format!("filler {i}"), 60 * DAY + i)?;
+        }
+        let side = write_commit_same_time(odb, &[base], "side work", 70 * DAY)?;
+        let merge = write_commit_same_time(odb, &[side, skewed], "merge skewed in", 90 * DAY)?;
+        let positive_tip = write_commit_same_time(odb, &[merge, filler], "positive tip", 95 * DAY)?;
+        Ok(RangeSkewPaintFixture {
+            positive_tip,
+            hide: vec![held, filler, base],
+            skewed,
+            behind,
+        })
+    }
+
+    #[test]
+    fn range_exclude_paint_converged_under_skew_hides_ancestor_commits() -> Result<()> {
+        let dir = tempdir().map_err(Error::Io)?;
+        let repo = open_test_bare(&dir)?;
+        let fixture = write_range_skew_paint_fixture(&repo, 46)?;
+        let filter = ReachableCountFilter::default();
+
+        let count = count_commits_reachable_excluding_ancestors_of(
+            &repo,
+            &[fixture.positive_tip],
+            &fixture.hide,
+            filter,
+        )?;
+        let listed = commits_reachable_excluding_ancestors_of(
+            &repo,
+            &[fixture.positive_tip],
+            &fixture.hide,
+            None,
+        )?;
+        let tip_hex = fixture.positive_tip.to_hex();
+        let mut tokens = vec![tip_hex.clone()];
+        for hide in &fixture.hide {
+            tokens.push(format!("^{}", hide.to_hex()));
+        }
+        let token_refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
+        let revwalk = repo
+            .revwalk()
+            .commits(&token_refs, &RevWalkListOptions::default())
+            .expect("revwalk commits");
+        let revwalk_count = repo
+            .revwalk()
+            .count(&token_refs, &RevWalkListOptions::default())
+            .expect("revwalk count");
+
+        assert!(!listed.contains(&fixture.skewed));
+        assert!(!listed.contains(&fixture.behind));
+        assert_eq!(count, listed.len());
+        assert_eq!(revwalk.len(), count);
+        assert_eq!(revwalk_count, count);
+        Ok(())
+    }
+
+    const SKEW_REPAIR_PARENT_READ_CEILING: usize = 63;
+
+    fn range_skew_repair_parent_reads(
+        repo: &Repository,
+        fixture: &RangeSkewPaintFixture,
+        unpainted_visit_cap: Option<usize>,
+    ) -> Result<usize> {
+        use super::unpainted_bridge_test_hooks::{
+            set_legacy_cd3f334b_skew_repair_for_test, set_unpainted_bridge_visit_cap_for_test,
+        };
+
+        let legacy = unpainted_visit_cap == Some(usize::MAX / 4);
+        set_legacy_cd3f334b_skew_repair_for_test(legacy);
+        set_unpainted_bridge_visit_cap_for_test(unpainted_visit_cap);
+        clear_commit_linkage(repo);
+        super::intersect_walk_test_hooks::reset_commit_parent_lookups();
+        let _ = count_commits_reachable_excluding_ancestors_of(
+            repo,
+            &[fixture.positive_tip],
+            &fixture.hide,
+            ReachableCountFilter::default(),
+        )?;
+        let lookups = super::intersect_walk_test_hooks::commit_parent_lookups();
+        set_unpainted_bridge_visit_cap_for_test(None);
+        set_legacy_cd3f334b_skew_repair_for_test(false);
+        Ok(lookups)
+    }
+
+    #[test]
+    fn range_exclude_paint_converged_skew_repair_parent_reads_stay_local() -> Result<()> {
+        let dir = tempdir().map_err(Error::Io)?;
+        let repo = open_test_bare(&dir)?;
+        let fixture = write_range_skew_paint_fixture(&repo, 44)?;
+        let bounded = range_skew_repair_parent_reads(&repo, &fixture, None)?;
+        assert!(
+            bounded <= SKEW_REPAIR_PARENT_READ_CEILING,
+            "capped skew repair must stay local ({bounded} parent reads)"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn range_exclude_paint_converged_skew_repair_legacy_cd3f334b_exceeds_ceiling() -> Result<()> {
+        let dir = tempdir().map_err(Error::Io)?;
+        let repo = open_test_bare(&dir)?;
+        let fixture = write_range_skew_paint_fixture(&repo, 46)?;
+        let legacy = range_skew_repair_parent_reads(&repo, &fixture, Some(usize::MAX / 4))?;
+        assert!(
+            legacy > SKEW_REPAIR_PARENT_READ_CEILING,
+            "cd3f334b-style repair must exceed the ceiling ({legacy} parent reads)"
+        );
+        Ok(())
     }
 
     #[test]
@@ -4950,7 +5894,12 @@ mod tests {
             }),
             ..crate::maintenance::RepackOptions::default()
         };
-        crate::maintenance::repack(&repo, &opts)?;
+        crate::maintenance::repack(
+            &repo,
+            &opts,
+            &mut crate::progress::NullProgress,
+            &crate::progress::CancelToken::never(),
+        )?;
         drop(repo);
         Repository::open(dir.path(), &RepositoryOptions::empty())
     }
@@ -5035,6 +5984,7 @@ mod tests {
             tagger: Some("T <t@e.com> 1 +0000".into()),
             message: "annotated\n".into(),
             extra_headers: Vec::new(),
+            raw_message: None,
         });
         let annotated = repo.odb().write(ObjectKind::Tag, &tag_bytes)?;
         let mut tips = history.tags.clone();
@@ -5081,6 +6031,90 @@ mod tests {
     }
 
     #[test]
+    fn left_behind_walk_after_a_recording_reads_none_of_the_recorded_tips() -> Result<()> {
+        use super::intersect_walk_test_hooks::{
+            commit_parent_lookups, reset_commit_parent_lookups,
+        };
+        const DAY: i64 = 86_400;
+        let dir = tempdir().map_err(Error::Io)?;
+        let repo = open_test_bare(&dir)?;
+        let history = write_many_tags(&repo, 2 * PRIME_TIPS_MIN)?;
+        let tip = *history.trunk.last().expect("trunk");
+        let repo = packed_over_refs(&dir, repo, &history.refs)?;
+        let recorded_at = 5_000_000;
+        let now = recorded_at + 30 * DAY;
+        let hide: Vec<ObjectId> = history.refs.iter().map(|(_, oid)| *oid).collect();
+        let wip = write_commit_same_time(&repo.odb(), &[tip], "wip", recorded_at + 2 * DAY)?;
+        let next = write_commit_same_time(&repo.odb(), &[wip], "next", recorded_at + 3 * DAY)?;
+
+        for tips in [vec![wip], vec![next]] {
+            clear_commit_linkage(&repo);
+            let full = count_commits_left_behind(&repo, &tips, &hide, 20)?;
+            clear_commit_linkage(&repo);
+            reset_commit_parent_lookups();
+            let after =
+                count_commits_left_behind_after(&repo, &tips, &[tip], 20, recorded_at, now)?;
+            assert_eq!(after, Some(full), "{tips:?}");
+            assert!(
+                commit_parent_lookups() < 16,
+                "the recorded tags must not be read: {} lookups",
+                commit_parent_lookups()
+            );
+        }
+        assert_eq!(
+            count_commits_left_behind_after(&repo, &[next], &[tip], 1, recorded_at, now)?,
+            Some((2, vec![next]))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn left_behind_walk_after_a_recording_gives_up_outside_its_dates() -> Result<()> {
+        const DAY: i64 = 86_400;
+        let dir = tempdir().map_err(Error::Io)?;
+        let repo = open_test_bare(&dir)?;
+        let history = write_many_tags(&repo, 4)?;
+        let tip = *history.trunk.last().expect("trunk");
+        let repo = packed_over_refs(&dir, repo, &history.refs)?;
+        let recorded_at = 5_000_000;
+        let now = recorded_at + 30 * DAY;
+        let left = |time: i64| -> Result<Option<(usize, Vec<ObjectId>)>> {
+            let wip = write_commit_same_time(&repo.odb(), &[tip], "wip", time)?;
+            clear_commit_linkage(&repo);
+            count_commits_left_behind_after(&repo, &[wip], &[tip], 20, recorded_at, now)
+        };
+        // Within the skew allowance of the recording, or more than it past `now`.
+        assert_eq!(left(recorded_at + DAY / 2)?, None);
+        assert_eq!(left(recorded_at + DAY)?, None);
+        assert_eq!(left(now + 2 * DAY)?, None);
+        assert!(left(recorded_at + DAY + 1)?.is_some());
+        assert!(left(now + DAY)?.is_some());
+
+        // An older commit further down the left-behind history stops the walk too.
+        let old = write_commit_same_time(&repo.odb(), &[tip], "old", recorded_at - DAY)?;
+        let fresh = write_commit_same_time(&repo.odb(), &[old], "fresh", recorded_at + 2 * DAY)?;
+        clear_commit_linkage(&repo);
+        assert_eq!(
+            count_commits_left_behind_after(&repo, &[fresh], &[tip], 20, recorded_at, now)?,
+            None
+        );
+
+        // Grafts rewrite parents, so a recorded ref could reach anything.
+        std::fs::create_dir_all(repo.git_dir().join("info"))?;
+        std::fs::write(
+            repo.git_dir().join("info/grafts"),
+            format!("{} {}\n", history.trunk[1], history.trunk[0]),
+        )?;
+        let repo = Repository::open(dir.path(), &RepositoryOptions::empty())?;
+        let wip = write_commit_same_time(&repo.odb(), &[tip], "grafted", recorded_at + 2 * DAY)?;
+        assert_eq!(
+            count_commits_left_behind_after(&repo, &[wip], &[tip], 20, recorded_at, now)?,
+            None
+        );
+        Ok(())
+    }
+
+    #[test]
     fn rewound_ref_is_not_an_ancestor_without_the_slop_walk() -> Result<()> {
         use super::intersect_walk_test_hooks::{
             commit_parent_lookups, reset_commit_parent_lookups,
@@ -5122,6 +6156,67 @@ mod tests {
         assert!(slop_lookups >= 100, "the date-slop walk ({slop_lookups})");
         // The target, then `wip` and the three commits down the chain to it.
         assert!(lookups <= 5, "HEAD~3 is found on the chain ({lookups})");
+        Ok(())
+    }
+
+    #[test]
+    fn is_ancestor_with_reachable_commit_graph_finds_ancestor_at_same_generation() -> Result<()> {
+        use crate::refs::write_ref;
+
+        let dir = tempdir().map_err(Error::Io)?;
+        let repo = open_test_bare(&dir)?;
+        let chain = write_chain(&repo, 3, |i| 100 + i as i64)?;
+        write_ref(&repo.git_dir(), "refs/heads/main", &chain[2])?;
+        repo.odb().write_commit_graph()?;
+        assert!(
+            dir.path().join("objects/info/commit-graph").is_file(),
+            "reachable ref must produce a commit-graph file"
+        );
+        let repo = open_test_bare(&dir)?;
+        assert!(
+            is_ancestor(&repo, chain[0], chain[2])?,
+            "root must be an ancestor of tip when both are in the graph"
+        );
+        assert!(
+            is_ancestor(&repo, chain[1], chain[2])?,
+            "HEAD~1 must be an ancestor of HEAD when both are in the graph"
+        );
+        assert!(!is_ancestor(&repo, chain[2], chain[0])?);
+        Ok(())
+    }
+
+    #[test]
+    fn is_ancestor_long_first_parent_chain_uses_forward_scan() -> Result<()> {
+        use super::intersect_walk_test_hooks::{
+            commit_parent_lookups, reset_commit_parent_lookups,
+        };
+
+        const LEN: usize = 3_000;
+        let dir = tempdir().map_err(Error::Io)?;
+        let repo = open_test_bare(&dir)?;
+        let chain = write_chain(&repo, LEN, |i| 100 + i as i64)?;
+        let tip = chain[LEN - 1];
+        let ancestor = chain[0];
+
+        clear_commit_linkage(&repo);
+        reset_commit_parent_lookups();
+        assert!(is_ancestor(&repo, ancestor, tip)?);
+        let lookups = commit_parent_lookups();
+        assert!(
+            lookups <= LEN + 20,
+            "first-parent forward scan must walk the chain, not the slop heap ({lookups})"
+        );
+
+        repo.odb().write_commit_graph()?;
+        let repo = open_test_bare(&dir)?;
+        clear_commit_linkage(&repo);
+        reset_commit_parent_lookups();
+        assert!(is_ancestor(&repo, ancestor, tip)?);
+        let ranked_lookups = commit_parent_lookups();
+        assert!(
+            ranked_lookups <= LEN + 20,
+            "generation-ranked forward scan must stay on the chain ({ranked_lookups})"
+        );
         Ok(())
     }
 

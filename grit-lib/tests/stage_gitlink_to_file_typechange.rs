@@ -1,6 +1,6 @@
 //! Replacing a gitlink (submodule) with a regular file, then staging and committing it,
 //! records a blob in the new commit, whether the repository was opened through an absolute
-//! path, a relative path, or `RepositoryBuilder` with a relative `OdbBuilder` path.
+//! path, a relative path, or `Repository::open` with an `OdbBuilder`.
 //!
 //! This binary holds a single test because it changes the process working directory.
 
@@ -10,10 +10,10 @@ use std::process::Command;
 
 use grit_lib::config::environment::{Environment, RepositoryOptions};
 use grit_lib::objects::odb::OdbBuilder;
-use grit_lib::porcelain::add::{stage, StageMode, StageOptions};
-use grit_lib::porcelain::commit::{commit_with_scope, CommitRequest, CommitScope};
+use grit_lib::porcelain::add::{StageMode, StageOptions};
+use grit_lib::porcelain::commit::{CommitRequest, CommitScope};
 use grit_lib::progress::NullProgress;
-use grit_lib::repo::{Repository, RepositoryBuilder};
+use grit_lib::repo::Repository;
 
 fn git(dir: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
@@ -63,32 +63,35 @@ fn gitlink_replaced_by_file(root: &Path) {
 }
 
 fn stage_and_commit(repo: &Repository) {
-    stage(
-        repo,
-        &StageOptions {
-            pathspecs: vec!["sub".to_owned()],
-            pathspec_sources: vec!["sub".to_owned()],
-            mode: StageMode::All,
-            ..StageOptions::default()
-        },
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("stage sub");
+    repo.index()
+        .stage(
+            &StageOptions {
+                pathspecs: vec!["sub".to_owned()],
+                pathspec_sources: vec!["sub".to_owned()],
+                mode: StageMode::All,
+                ..StageOptions::default()
+            },
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("stage sub");
     let ident = "T <t@example.com> 1700000000 +0000".to_owned();
-    commit_with_scope(
-        repo,
-        &CommitRequest {
-            message: "replace with file".to_owned(),
-            author: Some(ident.parse().expect("signature")),
-            committer: Some(ident.parse().expect("signature")),
-            ..Default::default()
-        },
-        CommitScope::Staged,
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("the gitlink-to-file typechange must be committable");
+    repo.commits()
+        .create(
+            &grit_lib::commits::CommitOptions::new(
+                &{
+                    let mut req = CommitRequest::new("replace with file".to_owned());
+                    req.author = Some(ident.parse().expect("signature"));
+                    req.committer = Some(ident.parse().expect("signature"));
+                    req
+                }
+                .clone(),
+                CommitScope::Staged,
+            ),
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("the gitlink-to-file typechange must be committable");
 }
 
 fn assert_committed_as_blob(root: &Path) {
@@ -132,10 +135,13 @@ fn gitlink_to_file_typechange_stages_and_commits_through_every_open_path() {
 
     let built = base.join("built");
     gitlink_replaced_by_file(&built);
-    let repo = RepositoryBuilder::new(options)
-        .odb_builder(OdbBuilder::files("built/.git/objects"))
-        .open(Path::new("built/.git"), Some(Path::new("built")))
-        .expect("open through RepositoryBuilder with relative paths");
+    let repo = Repository::open(
+        Path::new("built/.git"),
+        &(options
+            .with_odb_builder(OdbBuilder::new())
+            .with_work_tree(Path::new("built"))),
+    )
+    .expect("open with an ODB builder");
     stage_and_commit(&repo);
     assert_committed_as_blob(&built);
 }

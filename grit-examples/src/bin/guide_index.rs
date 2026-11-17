@@ -4,7 +4,7 @@
 
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::index::write_tree::write_tree_from_index;
-use grit_lib::porcelain::add::{stage, StageOptions};
+use grit_lib::porcelain::add::StageOptions;
 use grit_lib::progress::NullProgress;
 use grit_lib::repo::{InitOptions, Repository};
 use std::fs;
@@ -38,7 +38,7 @@ fn main() -> Result<(), grit_lib::error::Error> {
             temp.path(),
             &InitOptions::new()
                 .with_initial_branch("main")
-                .with_ref_storage(grit_lib::RefStorageFormat::Files),
+                .with_ref_storage(grit_lib::refs::ref_storage::RefStorageFormat::Files),
         )?;
         let path = temp.path().join("hello.txt");
         fs::write(&path, b"staged from the library guide\n").map_err(grit_lib::error::Error::Io)?;
@@ -48,14 +48,15 @@ fn main() -> Result<(), grit_lib::error::Error> {
     };
     let _keep = temp_guard;
 
-    let index = repo.index_handle().load()?;
+    let index = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())?;
     println!("index_entries={}", index.entries().len());
 
-    let outcome = stage(
-        &repo,
+    let outcome = repo.index().stage(
         &StageOptions::default(),
         &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )?;
     println!(
         "staged added={} modified={} removed={}",
@@ -64,7 +65,9 @@ fn main() -> Result<(), grit_lib::error::Error> {
         outcome.removed.len()
     );
 
-    let index = repo.index_handle().load()?;
+    let index = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())?;
     let tree_oid = write_tree_from_index(repo.odb(), &index, "")?;
     println!("tree_oid={}", tree_oid.to_hex());
 

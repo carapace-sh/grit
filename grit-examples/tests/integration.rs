@@ -26,6 +26,8 @@ mod guide_config;
 #[cfg(feature = "full-tests")]
 #[path = "guide_diff.rs"]
 mod guide_diff;
+#[path = "guide_identity.rs"]
+mod guide_identity;
 #[cfg(feature = "full-tests")]
 #[path = "guide_index.rs"]
 mod guide_index;
@@ -74,6 +76,9 @@ mod simple_bins;
 #[cfg(feature = "full-tests")]
 #[path = "sqlite_odb.rs"]
 mod sqlite_odb;
+#[cfg(feature = "full-tests")]
+#[path = "sqlite_repository_conformance.rs"]
+mod sqlite_repository_conformance;
 
 /// Fails when a file in `tests/` is neither a module above nor a `[[test]]`
 /// target in Cargo.toml: with `autotests = false` cargo would never build it.
@@ -86,7 +91,7 @@ fn every_test_file_is_compiled() {
     for item in std::fs::read_dir(&dir).expect("read tests/") {
         let name = item.expect("tests/ entry").file_name();
         let Some(name) = name.to_str() else { continue };
-        if !name.ends_with(".rs") || name == "integration.rs" {
+        if !name.ends_with(".rs") || name == "integration.rs" || name.ends_with("_data.rs") {
             continue;
         }
         let module = format!("#[path = \"{name}\"]");

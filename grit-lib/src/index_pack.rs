@@ -4,9 +4,11 @@
 //! exploding every object into loose storage. Small receive-pack pushes may still
 //! use [`crate::unpack_objects`] via [`crate::receive_pack::should_use_unpack_objects`].
 
+use crate::error::ObjectError;
 use std::collections::HashSet;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
+#[cfg(any(test, feature = "test-support"))]
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use tempfile::TempPath;
@@ -20,18 +22,20 @@ use crate::odb::Odb;
 use crate::pack::{verify_pack_and_collect, write_v2_pack_index_sorting};
 use crate::pack_index_build::{build_mapped_pack_index, RESIDENT_PACK_BYTES};
 use crate::pack_map::{PackData, ResidentBudget};
-use crate::progress::{poll_cancel, Cancel, ProgressSink};
+use crate::progress::{poll_cancel, CancelToken, ProgressSink};
+use crate::remote::RemoteError;
 use crate::unpack_objects::{IngestedObjects, PackIndexRecord};
 
-pub use crate::pack_index_build::{
-    build_pack_index_records, build_pack_index_records_with_progress,
-};
+pub use crate::pack_index_build::build_pack_index_records;
 
+#[cfg(any(test, feature = "test-support"))]
 static INGEST_THREAD_RECORDING: AtomicBool = AtomicBool::new(false);
+#[cfg(any(test, feature = "test-support"))]
 static LAST_RESOLVED_INGEST_THREADS: AtomicUsize = AtomicUsize::new(0);
 
 /// Enable recording of resolved index-pack worker counts (integration tests only).
-pub fn set_ingest_thread_recording_for_tests(enabled: bool) {
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn set_ingest_thread_recording_for_tests(enabled: bool) {
     INGEST_THREAD_RECORDING.store(enabled, Ordering::SeqCst);
     if !enabled {
         LAST_RESOLVED_INGEST_THREADS.store(0, Ordering::SeqCst);
@@ -39,7 +43,8 @@ pub fn set_ingest_thread_recording_for_tests(enabled: bool) {
 }
 
 /// Last resolved worker count from pack ingest while recording is enabled.
-pub fn last_resolved_ingest_threads_for_tests() -> Option<usize> {
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn last_resolved_ingest_threads_for_tests() -> Option<usize> {
     if !INGEST_THREAD_RECORDING.load(Ordering::SeqCst) {
         return None;
     }
@@ -47,7 +52,8 @@ pub fn last_resolved_ingest_threads_for_tests() -> Option<usize> {
     (raw > 0).then(|| raw - 1)
 }
 
-fn record_resolved_ingest_threads(threads: usize) {
+fn record_resolved_ingest_threads(#[allow(unused_variables)] threads: usize) {
+    #[cfg(any(test, feature = "test-support"))]
     if INGEST_THREAD_RECORDING.load(Ordering::SeqCst) {
         LAST_RESOLVED_INGEST_THREADS.store(threads.saturating_add(1), Ordering::SeqCst);
     }
@@ -112,7 +118,7 @@ pub struct IngestedPack {
     /// Absolute path to the published `pack-*.pack` file.
     ///
     /// `None` when nothing was published: the pack was empty, or the object database
-    /// has a custom [`OdbBuilder::primary`](crate::odb::OdbBuilder::primary) store and
+    /// has a custom [`RepositoryOptions::with_object_store`](crate::environment::RepositoryOptions::with_object_store) store and
     /// the objects were written into it one by one.
     pub pack_path: Option<PathBuf>,
     /// How many objects of each type the pack holds.
@@ -194,18 +200,18 @@ fn resolve_ingest_pack_publish_policy(
         Some(crate::config::ConfigSet::load(
             &opts.environment,
             Some(git_dir),
-            true,
+            &crate::config::LoadConfigOptions::standard(&opts.environment, Some(git_dir)),
         )?)
     } else {
         None
     };
-    let shared_raw = cfg.as_ref().and_then(|c| c.get("core.sharedRepository"));
+    let shared_raw = cfg.as_ref().and_then(|c| c.value("core.sharedRepository"));
     let shared_repo =
         crate::shared_repo::shared_repository_from_config_value(shared_raw.as_deref())
             .map_err(|msg| Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, msg)))?;
     let write_rev = cfg
         .as_ref()
-        .is_none_or(|c| c.pack_write_reverse_index_default(&opts.environment));
+        .is_none_or(|c| c.pack_write_reverse_index_default());
     Ok(IngestPackPublishPolicy {
         shared_repo,
         write_rev,
@@ -224,7 +230,11 @@ impl IngestPackOptions {
                 .map_err(Error::Config);
         }
         if let Some(git_dir) = odb.config_git_dir() {
-            let cfg = crate::config::ConfigSet::load(&self.environment, Some(git_dir), true)?;
+            let cfg = crate::config::ConfigSet::load(
+                &self.environment,
+                Some(git_dir),
+                &crate::config::LoadConfigOptions::standard(&self.environment, Some(git_dir)),
+            )?;
             return crate::parallel::ThreadPolicy::default()
                 .try_resolve(crate::parallel::ParallelOp::IndexPack, &cfg)
                 .map(|o| o.parallelism())
@@ -238,7 +248,7 @@ impl IngestPackOptions {
 ///
 /// Returns the installed pack identity and indexed object ids.
 ///
-/// When `odb` has a custom [`OdbBuilder::primary`](crate::odb::OdbBuilder::primary)
+/// When `odb` has a custom [`RepositoryOptions::with_object_store`](crate::environment::RepositoryOptions::with_object_store)
 /// store, the pack is not installed: its objects are resolved and written into that
 /// store (see [`ingest_pack_into`](crate::unpack_objects::ingest_pack_into)), thin-pack
 /// bases are read through `odb`, and [`IngestedPack::pack_path`] is `None`. Only
@@ -247,7 +257,7 @@ impl IngestPackOptions {
 ///
 /// # Errors
 ///
-/// [`Error::CorruptObject`] when the bytes are not a complete pack, plus any
+/// [`crate::error::ObjectError::Corrupt`] when the bytes are not a complete pack, plus any
 /// indexing, delta-resolution, or object-store failure.
 pub fn ingest_received_pack(
     pack: Vec<u8>,
@@ -263,20 +273,20 @@ pub fn ingest_received_pack_with_progress(
     odb: &Odb,
     opts: &IngestPackOptions,
     progress: Option<&mut dyn ProgressSink>,
-    cancel: Option<&dyn Cancel>,
+    cancel: Option<&CancelToken>,
 ) -> Result<IngestedPack> {
     if pack.is_empty() {
         return Ok(IngestedPack::default());
     }
     if pack.len() < 12 || &pack[0..4] != b"PACK" {
-        return Err(Error::CorruptObject(
-            "received data is not a pack stream".to_owned(),
-        ));
+        return Err(Error::Object(ObjectError::Corrupt {
+            detail: "received data is not a pack stream".to_owned(),
+        }));
     }
     verify_trailer(odb.hash_algo(), &pack).map_err(|e| {
-        Error::CorruptObject(format!(
-            "received pack checksum mismatch (download may be incomplete): {e}"
-        ))
+        Error::Object(ObjectError::Corrupt {
+            detail: format!("received pack checksum mismatch (download may be incomplete): {e}"),
+        })
     })?;
     if !odb.uses_files_primary() {
         return ingest_into_custom_primary(&mut pack.as_slice(), odb, progress, cancel);
@@ -289,7 +299,7 @@ fn ingest_into_custom_primary(
     reader: &mut dyn std::io::Read,
     odb: &Odb,
     progress: Option<&mut dyn ProgressSink>,
-    cancel: Option<&dyn Cancel>,
+    cancel: Option<&CancelToken>,
 ) -> Result<IngestedPack> {
     crate::unpack_objects::ingest_pack_into_odb(
         reader,
@@ -303,6 +313,10 @@ fn ingest_into_custom_primary(
 
 /// Ingest a pack already written to disk (streaming fetch/clone receive path).
 ///
+/// Indexing reports [`crate::progress::ProgressPhase::IndexingObjects`] and
+/// [`crate::progress::ProgressPhase::ResolvingDeltas`] through `progress`; `cancel` is
+/// polled at phase boundaries.
+///
 /// # Errors
 ///
 /// Same as [`install_pack_path`].
@@ -310,8 +324,10 @@ pub fn ingest_received_pack_path(
     pack_path: PathBuf,
     odb: &Odb,
     opts: &IngestPackOptions,
+    progress: &mut dyn ProgressSink,
+    cancel: &CancelToken,
 ) -> Result<IngestedPack> {
-    ingest_received_pack_path_with_progress(pack_path, odb, opts, None, None)
+    ingest_received_pack_path_with_progress(pack_path, odb, opts, Some(progress), Some(cancel))
 }
 
 fn wait_for_received_pack_path(path: PathBuf) -> Result<PathBuf> {
@@ -331,7 +347,7 @@ fn wait_for_received_pack_path(path: PathBuf) -> Result<PathBuf> {
             Err(e) => return Err(Error::Io(e)),
         }
     }
-    Err(Error::ReceivedPackTempMissing { path })
+    Err(RemoteError::ReceivedPackTempMissing { path }.into())
 }
 
 /// Like [`ingest_received_pack_path`], reporting pack indexing progress on `progress` when set.
@@ -339,12 +355,12 @@ fn wait_for_received_pack_path(path: PathBuf) -> Result<PathBuf> {
 /// With a custom primary store the objects are written into it as described on
 /// [`ingest_received_pack`], and the file at `pack_path` is removed afterwards
 /// (whether or not ingestion succeeded), just as a files-backed ingest moves it.
-pub fn ingest_received_pack_path_with_progress(
+pub(crate) fn ingest_received_pack_path_with_progress(
     pack_path: PathBuf,
     odb: &Odb,
     opts: &IngestPackOptions,
     progress: Option<&mut dyn ProgressSink>,
-    cancel: Option<&dyn Cancel>,
+    cancel: Option<&CancelToken>,
 ) -> Result<IngestedPack> {
     crate::trace::trace_span!("grit.pack.index");
     let pack_path = wait_for_received_pack_path(pack_path)?;
@@ -378,9 +394,10 @@ pub fn install_pack_bytes_with_progress(
     odb: &Odb,
     opts: &IngestPackOptions,
     progress: Option<&mut dyn ProgressSink>,
-    cancel: Option<&dyn Cancel>,
+    cancel: Option<&CancelToken>,
 ) -> Result<IngestedPack> {
-    odb.require_files_primary("index_pack")?;
+    odb.primary_store()
+        .require_files_primary(crate::repo::error::FilesOnlyOperation::PackInstall)?;
     let pack_dir = odb.objects_dir().join("pack");
     std::fs::create_dir_all(&pack_dir).map_err(Error::Io)?;
     let tmp = pack_dir.join(format!("tmp_install_{}", unique_install_suffix()));
@@ -406,12 +423,18 @@ pub fn install_pack_bytes_with_progress(
 /// reported as success rather than replaced. A failed or cancelled install removes
 /// only its private staging files, never a published `.pack` or `.idx`, because a
 /// concurrent installer may already have reported success relying on it.
+///
+/// Indexing reports progress through `progress`. `cancel` is polled at phase boundaries;
+/// worker threads during parallel hashing only observe a shared atomic snapshot (see the
+/// library guide's [Parallelism](https://grit-scm.com/docs/library/parallelism) page).
 pub fn install_pack_path(
     pack_path: &Path,
     odb: &Odb,
     opts: &IngestPackOptions,
+    progress: &mut dyn ProgressSink,
+    cancel: &CancelToken,
 ) -> Result<IngestedPack> {
-    install_pack_path_with_progress(pack_path, odb, opts, None, None)
+    install_pack_path_with_progress(pack_path, odb, opts, Some(progress), Some(cancel))
 }
 
 /// Like [`install_pack_path`], reporting pack indexing progress on `progress` when set.
@@ -419,21 +442,24 @@ pub fn install_pack_path(
 /// When `cancel` is set, the coordinator polls it at phase boundaries; worker threads
 /// during parallel hashing only observe a shared atomic snapshot (see library guide
 /// [Parallelism](https://grit-scm.com/docs/library/parallelism)).
-pub fn install_pack_path_with_progress(
+pub(crate) fn install_pack_path_with_progress(
     pack_path: &Path,
     odb: &Odb,
     opts: &IngestPackOptions,
     mut progress: Option<&mut dyn ProgressSink>,
-    cancel: Option<&dyn Cancel>,
+    cancel: Option<&CancelToken>,
 ) -> Result<IngestedPack> {
-    odb.require_files_primary("index_pack")?;
+    odb.primary_store()
+        .require_files_primary(crate::repo::error::FilesOnlyOperation::PackInstall)?;
     let publish_policy = resolve_ingest_pack_publish_policy(opts, odb)?;
     let owned = pack_path.to_path_buf();
     let hb = odb.hash_algo().len();
     let meta = std::fs::metadata(&owned).map_err(Error::Io)?;
     let len = meta.len();
     if len < 12 + hb as u64 {
-        return Err(Error::CorruptObject("pack too small".to_owned()));
+        return Err(Error::Object(ObjectError::Corrupt {
+            detail: "pack too small".to_owned(),
+        }));
     }
     let mut header = [0u8; 12];
     {
@@ -442,9 +468,9 @@ pub fn install_pack_path_with_progress(
         f.read_exact(&mut header).map_err(Error::Io)?;
     }
     if &header[0..4] != b"PACK" {
-        return Err(Error::CorruptObject(
-            "received data is not a pack stream".to_owned(),
-        ));
+        return Err(Error::Object(ObjectError::Corrupt {
+            detail: "received data is not a pack stream".to_owned(),
+        }));
     }
     let mut trailer = vec![0u8; hb];
     {
@@ -485,9 +511,9 @@ pub fn install_pack_path_with_progress(
             if rows.len()
                 != u32::from_be_bytes([header[8], header[9], header[10], header[11]]) as usize
             {
-                return Err(Error::CorruptObject(
-                    "trusted index row count does not match pack header".to_owned(),
-                ));
+                return Err(Error::Object(ObjectError::Corrupt {
+                    detail: "trusted index row count does not match pack header".to_owned(),
+                }));
             }
             (rows.to_vec(), ObjectKindCounts::default())
         } else {
@@ -497,9 +523,10 @@ pub fn install_pack_path_with_progress(
             let body_len = pack_bytes.len() - hb;
             if resident.checksum(odb.hash_algo(), &pack_bytes[..body_len]) != pack_bytes[body_len..]
             {
-                return Err(Error::CorruptObject(
-                    "received pack checksum mismatch (download may be incomplete)".to_owned(),
-                ));
+                return Err(Error::Object(ObjectError::Corrupt {
+                    detail: "received pack checksum mismatch (download may be incomplete)"
+                        .to_owned(),
+                }));
             }
             poll_ingest_cancel(&mut progress, cancel)?;
             trailer = pack_bytes[body_len..].to_vec();
@@ -512,9 +539,9 @@ pub fn install_pack_path_with_progress(
                         pack_bytes[11],
                     ]) as usize
                 {
-                    return Err(Error::CorruptObject(
-                        "trusted index row count does not match pack header".to_owned(),
-                    ));
+                    return Err(Error::Object(ObjectError::Corrupt {
+                        detail: "trusted index row count does not match pack header".to_owned(),
+                    }));
                 }
                 drop(indexed);
                 (rows.clone(), ObjectKindCounts::default())
@@ -685,7 +712,7 @@ fn write_keep_marker(final_pack: &Path, opts: &IngestPackOptions) -> Result<Opti
 /// # Errors
 ///
 /// Returns [`Error::Io`] on file errors, an object-database error when a base cannot be
-/// read, and [`Error::CorruptObject`] when the object count would overflow.
+/// read, and [`crate::error::ObjectError::Corrupt`] when the object count would overflow.
 fn append_thin_bases(
     pack_path: &Path,
     odb: &Odb,
@@ -707,7 +734,11 @@ fn append_thin_bases(
         .and_then(|added| {
             u32::from_be_bytes([header[8], header[9], header[10], header[11]]).checked_add(added)
         })
-        .ok_or_else(|| Error::CorruptObject("thin pack fix: object count overflow".to_owned()))?;
+        .ok_or_else(|| {
+            Error::Object(ObjectError::Corrupt {
+                detail: "thin pack fix: object count overflow".to_owned(),
+            })
+        })?;
     header[8..12].copy_from_slice(&count.to_be_bytes());
 
     let len = file.metadata().map_err(Error::Io)?.len();
@@ -746,7 +777,7 @@ fn append_thin_bases(
 
 fn poll_ingest_cancel(
     progress: &mut Option<&mut dyn ProgressSink>,
-    cancel: Option<&dyn Cancel>,
+    cancel: Option<&CancelToken>,
 ) -> Result<()> {
     let Some(c) = cancel else {
         return Ok(());
@@ -785,8 +816,9 @@ mod tests {
     use crate::objects::ObjectKind;
     use crate::odb::Odb;
     use crate::pack::read_pack_index;
-    use crate::unpack_objects::pack_index_records_with_threads;
+    use crate::unpack_objects::pack_index_records;
     use std::process::Command;
+    use std::sync::Arc;
 
     fn git_index_pack(pack: &[u8]) -> (tempfile::TempDir, Vec<u8>) {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -899,7 +931,7 @@ mod tests {
     #[test]
     fn parallel_index_pack_zero_byte_blob_among_many() {
         use crate::hash::Parallelism;
-        use crate::unpack_objects::pack_index_records_with_threads;
+        use crate::unpack_objects::pack_index_records;
         use grit_test_support::objects::{HashAlgo as FixtureAlgo, ObjectKind as PK, PackBuilder};
 
         let mut pb = PackBuilder::new(FixtureAlgo::Sha1);
@@ -914,22 +946,21 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let odb = Odb::new(tmp.path());
         for threads in [1_usize, 8] {
-            let records =
-                pack_index_records_with_threads(&pack, &odb, Parallelism::resolve(Some(threads)))
-                    .unwrap_or_else(|e| panic!("threads={threads}: {e}"));
+            let records = pack_index_records(&pack, &odb, Parallelism::resolve(Some(threads)))
+                .unwrap_or_else(|e| panic!("threads={threads}: {e}"));
             assert_eq!(records.len(), 401, "threads={threads}");
         }
     }
 
     #[test]
     fn install_pack_cancelled_during_indexing_cleans_stage() {
-        use crate::progress::{FlagCancel, ProgressPhase, ProgressSink, ProgressUnit};
+        use crate::progress::{CancelToken, ProgressPhase, ProgressSink, ProgressUnit};
         use grit_test_support::objects::{HashAlgo, ObjectKind as PK, PackBuilder};
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
 
         struct CancelAtIndexing {
-            flag: FlagCancel,
+            flag: CancelToken,
             saw_indexing: Arc<AtomicBool>,
         }
 
@@ -961,7 +992,7 @@ mod tests {
         let pack_path = tmp.path().join("incoming.pack");
         std::fs::write(&pack_path, &pack).expect("write pack");
         let odb = Odb::new(tmp.path());
-        let flag = FlagCancel::new();
+        let flag = CancelToken::new();
         let saw = Arc::new(AtomicBool::new(false));
         let mut progress = CancelAtIndexing {
             flag: flag.clone(),
@@ -1042,9 +1073,8 @@ mod tests {
         let mapped = PackData::open(Path::new(&path)).expect("mmap");
         let tmp = tempfile::tempdir().expect("tempdir");
         let odb = Odb::new(tmp.path());
-        let _records =
-            pack_index_records_with_threads(mapped.deref(), &odb, Parallelism::resolve(Some(4)))
-                .expect("index records");
+        let _records = pack_index_records(mapped.deref(), &odb, Parallelism::resolve(Some(4)))
+            .expect("index records");
     }
 
     #[cfg_attr(
@@ -1209,7 +1239,7 @@ mod tests {
         let idx_path = pack_path.with_extension("idx");
         let fake_oid = ObjectId::from_hex("aabbccddeeff00112233445566778899aabbccdd").unwrap();
         let huge_off = 1u64 << 31;
-        crate::pack::write_v2_pack_index_with_trailer(
+        crate::pack::write_v2_pack_index_from_trailer(
             &idx_path,
             &[(fake_oid, huge_off, 0x1234_5678)],
             &pack[pack.len() - 20..],
@@ -1260,7 +1290,7 @@ mod tests {
     #[test]
     fn rejects_extra_bytes_before_pack_trailer() {
         use crate::hash::Parallelism;
-        use crate::unpack_objects::pack_index_records_with_threads;
+        use crate::unpack_objects::pack_index_records;
 
         let valid = single_blob_pack(b"one blob\n");
         let corrupted = pack_with_junk_before_trailer(&valid, b"JUNK");
@@ -1270,14 +1300,10 @@ mod tests {
         let odb = Odb::new(tmp.path());
 
         for threads in [1_usize, 4] {
-            let err = pack_index_records_with_threads(
-                &corrupted,
-                &odb,
-                Parallelism::resolve(Some(threads)),
-            )
-            .expect_err("index-pack hashing");
+            let err = pack_index_records(&corrupted, &odb, Parallelism::resolve(Some(threads)))
+                .expect_err("index-pack hashing");
             assert!(
-                matches!(err, Error::CorruptObject(_)),
+                matches!(err, Error::Object(ObjectError::Corrupt { .. })),
                 "threads={threads}: {err:?}"
             );
         }
@@ -1294,7 +1320,7 @@ mod tests {
             )
             .expect_err("install pack");
             assert!(
-                matches!(err, Error::CorruptObject(_)),
+                matches!(err, Error::Object(ObjectError::Corrupt { .. })),
                 "install threads={threads}: {err:?}"
             );
         }
@@ -1355,7 +1381,7 @@ mod tests {
     #[test]
     fn progress_reports_object_and_delta_totals() {
         use crate::hash::Parallelism;
-        use crate::unpack_objects::pack_index_records_with_threads_with_progress;
+        use crate::unpack_objects::pack_index_records_with_progress;
 
         let (pack, nr_objects, nr_deltas) = pack_with_whole_objects_and_ofs_deltas();
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -1363,7 +1389,7 @@ mod tests {
 
         for threads in [1_usize, 4] {
             let mut cap = IndexPackProgressCapture::default();
-            let records = pack_index_records_with_threads_with_progress(
+            let records = pack_index_records_with_progress(
                 &pack,
                 &odb,
                 Parallelism::resolve(Some(threads)),
@@ -1426,13 +1452,13 @@ mod tests {
     #[test]
     fn progress_counts_monotonic() {
         use crate::hash::Parallelism;
-        use crate::unpack_objects::pack_index_records_with_threads_with_progress;
+        use crate::unpack_objects::pack_index_records_with_progress;
 
         let (pack, _, _) = pack_with_whole_objects_and_ofs_deltas();
         let tmp = tempfile::tempdir().expect("tempdir");
         let odb = Odb::new(tmp.path());
         let mut cap = MonotonicPhaseCapture::default();
-        pack_index_records_with_threads_with_progress(
+        pack_index_records_with_progress(
             &pack,
             &odb,
             Parallelism::resolve(Some(4)),
@@ -1518,44 +1544,38 @@ mod tests {
     )]
     #[test]
     fn cancel_once_pack_published_never_strands_a_peer_install() {
-        use std::cell::Cell;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::thread;
+        use std::time::Duration;
 
-        /// Cancels the install as soon as its `.pack` is published, after running a
-        /// complete peer install of the same pack that relies on that file.
-        struct PeerThenCancel<'a> {
-            pack_dir: PathBuf,
-            objects: PathBuf,
-            pack: &'a [u8],
-            peer_ran: Cell<bool>,
-        }
-
-        impl Cancel for PeerThenCancel<'_> {
-            fn is_cancelled(&self) -> bool {
-                if self.peer_ran.get() {
-                    return true;
-                }
-                if published_files(&self.pack_dir, "pack") == 0 {
-                    return false;
-                }
-                self.peer_ran.set(true);
-                let peer_odb = Odb::new(&self.objects);
-                install_pack_bytes(self.pack.to_vec(), &peer_odb, &IngestPackOptions::default())
-                    .expect("peer install succeeds");
-                true
-            }
-        }
+        use crate::progress::CancelToken;
 
         let (pack, tip) = commit_pack();
         let repo = tempfile::tempdir().expect("repo");
         git_in(repo.path(), &["init", "-q", "-b", "main"]);
         let objects = repo.path().join(".git/objects");
         let pack_dir = objects.join("pack");
-        let cancel = PeerThenCancel {
-            pack_dir: pack_dir.clone(),
-            objects: objects.clone(),
-            pack: &pack,
-            peer_ran: Cell::new(false),
-        };
+        let cancel = CancelToken::new();
+        let peer_ran = Arc::new(AtomicBool::new(false));
+        let watch_cancel = cancel.clone();
+        let watch_pack_dir = pack_dir.clone();
+        let watch_objects = objects.clone();
+        let watch_pack = pack.clone();
+        let watch_peer = Arc::clone(&peer_ran);
+        thread::spawn(move || {
+            while !watch_cancel.is_cancelled() {
+                if published_files(&watch_pack_dir, "pack") > 0 {
+                    watch_peer.store(true, Ordering::Relaxed);
+                    let peer_odb = Odb::new(&watch_objects);
+                    install_pack_bytes(watch_pack, &peer_odb, &IngestPackOptions::default())
+                        .expect("peer install succeeds");
+                    watch_cancel.cancel();
+                    return;
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+        });
         let odb = Odb::new(&objects);
         let result = install_pack_bytes_with_progress(
             pack.clone(),
@@ -1566,7 +1586,7 @@ mod tests {
         );
         match result {
             Ok(_) => {}
-            Err(Error::Cancelled) => assert!(cancel.peer_ran.get()),
+            Err(Error::Cancelled) => assert!(peer_ran.load(Ordering::Relaxed)),
             Err(e) => panic!("unexpected install error: {e:?}"),
         }
         assert_eq!(published_files(&pack_dir, "pack"), 1);
@@ -1662,7 +1682,7 @@ mod tests {
         )
         .expect_err("truncated pack must fail");
         assert!(
-            matches!(err, Error::CorruptObject(_)),
+            matches!(err, Error::Object(ObjectError::Corrupt { .. })),
             "expected corrupt object, got {err:?}"
         );
         let pack_dir = tmp.path().join("pack");
@@ -1685,10 +1705,19 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let odb = Odb::new(tmp.path());
         let missing = tmp.path().join("no-such-pack");
-        let err = ingest_received_pack_path(missing.clone(), &odb, &IngestPackOptions::default())
-            .expect_err("missing spool");
+        let err = ingest_received_pack_path_with_progress(
+            missing.clone(),
+            &odb,
+            &IngestPackOptions::default(),
+            None,
+            None,
+        )
+        .expect_err("missing spool");
         assert!(
-            matches!(err, Error::ReceivedPackTempMissing { .. }),
+            matches!(
+                err,
+                Error::Remote(RemoteError::ReceivedPackTempMissing { .. })
+            ),
             "expected typed missing-pack error, got {err:?}"
         );
     }
@@ -1743,7 +1772,8 @@ mod tests {
         }
         assert_eq!(pack_sidecar_mode(&spool), 0o600);
 
-        install_pack_path(&spool, &odb, &IngestPackOptions::default()).expect("install");
+        install_pack_path_with_progress(&spool, &odb, &IngestPackOptions::default(), None, None)
+            .expect("install");
 
         let pack_dir = git_dir.join("objects/pack");
         let pack_path = std::fs::read_dir(&pack_dir)

@@ -6,8 +6,8 @@ use grit_lib::command_runner::hooks::{run_hook_opts, HookError, RunHookOptions};
 use grit_lib::command_runner::{RecordedResponse, RecordingRunner};
 use grit_lib::config::environment::{Environment, RepositoryOptions};
 use grit_lib::error::FilterError;
-use grit_lib::porcelain::add::{stage, StageOptions};
-use grit_lib::porcelain::commit::{create_commit, CommitRequest};
+use grit_lib::porcelain::add::StageOptions;
+use grit_lib::porcelain::commit::CommitRequest;
 use grit_lib::progress::NullProgress;
 use grit_lib::repo::Repository;
 use grit_lib::worktree::crlf::run_filter;
@@ -44,7 +44,7 @@ fn system_hook_receives_stdin_on_pre_push() {
     perms.set_mode(0o755);
     fs::set_permissions(&hook, perms).expect("chmod");
 
-    let config = _repo.config().expect("config");
+    let config = _repo.config().snapshot().expect("config");
     let stdin_data = b"expected hook stdin\n";
     let result = run_hook_opts(
         Some(&_repo),
@@ -91,31 +91,32 @@ fn create_commit_aborts_on_pre_commit_hook_failure() {
     .expect("open");
 
     fs::write(tmp.path().join("f.txt"), b"data\n").expect("write");
-    stage(
-        &repo,
-        &StageOptions::default(),
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("stage");
+    repo.index()
+        .stage(
+            &StageOptions::default(),
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("stage");
 
     let ident = "T <t@t> 1 +0000".to_string();
-    let err = create_commit(
-        &repo,
-        &CommitRequest {
-            message: "msg".into(),
-            author: Some(ident.parse().expect("signature")),
-            committer: Some(ident.parse().expect("signature")),
-            allow_empty: false,
-            sign_override: None,
-            amend: false,
-            assume_worktree_synced: false,
-            ..Default::default()
-        },
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect_err("commit should fail");
+    let err = repo
+        .commits()
+        .create_staged(
+            &{
+                let mut req = CommitRequest::new("msg");
+                req.author = Some(ident.parse().expect("signature"));
+                req.committer = Some(ident.parse().expect("signature"));
+                req.allow_empty = false;
+                req.sign_override = None;
+                req.amend = false;
+                req.assume_worktree_synced = false;
+                req
+            },
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect_err("commit should fail");
     assert!(matches!(
         err,
         grit_lib::error::Error::Hook(HookError::Failed { .. })
@@ -137,31 +138,31 @@ fn commit_msg_hook_receives_editmsg_path_argument() {
     perms.set_mode(0o755);
     fs::set_permissions(&hook, perms).expect("chmod");
     fs::write(tmp.path().join("a.txt"), b"x\n").expect("write");
-    stage(
-        &repo,
-        &StageOptions::default(),
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("stage");
+    repo.index()
+        .stage(
+            &StageOptions::default(),
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("stage");
 
     let ident = "T <t@t> 1 +0000".to_string();
-    create_commit(
-        &repo,
-        &CommitRequest {
-            message: "hello commit".into(),
-            author: Some(ident.parse().expect("signature")),
-            committer: Some(ident.parse().expect("signature")),
-            allow_empty: false,
-            sign_override: None,
-            amend: false,
-            assume_worktree_synced: false,
-            ..Default::default()
-        },
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("commit");
+    repo.commits()
+        .create_staged(
+            &{
+                let mut req = CommitRequest::new("hello commit");
+                req.author = Some(ident.parse().expect("signature"));
+                req.committer = Some(ident.parse().expect("signature"));
+                req.allow_empty = false;
+                req.sign_override = None;
+                req.amend = false;
+                req.assume_worktree_synced = false;
+                req
+            },
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("commit");
 
     let msg = fs::read_to_string(tmp.path().join(".git/COMMIT_EDITMSG")).expect("editmsg");
     assert!(msg.contains("hello commit"));

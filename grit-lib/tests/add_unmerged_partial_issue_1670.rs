@@ -2,12 +2,15 @@
 
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::error::Error;
+use grit_lib::merge::IntegrateBranchOutcome;
 use grit_lib::objects::ObjectId;
-use grit_lib::porcelain::add::{stage, StageOptions};
-use grit_lib::porcelain::merge::{integrate_branch, IntegrateBranchOutcome};
+use grit_lib::porcelain::add::StageOptions;
 use grit_lib::progress::NullProgress;
 use grit_lib::repo::Repository;
+use grit_lib::worktree::WorktreeError;
 use grit_test_support::git;
+use grit_test_support::integrate_branch;
+use grit_test_support::integrate_branch;
 use std::fs;
 
 fn issue_1670_repo() -> (tempfile::TempDir, Repository) {
@@ -51,7 +54,7 @@ fn add_dot_stages_resolved_and_unrelated_while_naming_marked_conflicts() {
         topic_oid,
         "topic",
         &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("merge");
     assert!(matches!(outcome, IntegrateBranchOutcome::Conflicts { .. }));
@@ -59,22 +62,26 @@ fn add_dot_stages_resolved_and_unrelated_while_naming_marked_conflicts() {
     fs::write(root.join("a.txt"), "1\n2\n3\nok\n").expect("resolve a");
     fs::write(root.join("c.txt"), "unrelated\n").expect("edit c");
 
-    let err = stage(
-        &repo,
-        &StageOptions {
-            pathspecs: vec![".".into()],
-            ..StageOptions::default()
-        },
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .unwrap_err();
-    let Error::UnmergedConflictMarkers { paths } = err else {
+    let err = repo
+        .index()
+        .stage(
+            &StageOptions {
+                pathspecs: vec![".".into()],
+                ..StageOptions::default()
+            },
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .unwrap_err();
+    let Error::Worktree(WorktreeError::UnmergedConflictMarkers { paths }) = err else {
         panic!("expected marker paths, got {err}");
     };
     assert_eq!(paths, vec!["b.txt".to_owned()]);
 
-    let index = repo.index_handle().load().expect("index");
+    let index = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("index");
     assert!(index.get(b"a.txt", 0).is_some());
     assert!(index.get(b"c.txt", 0).is_some());
     assert!(index.get(b"b.txt", 0).is_none());
@@ -95,21 +102,22 @@ fn add_single_marked_unmerged_path_names_that_path() {
         topic_oid,
         "topic",
         &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("merge");
 
-    let err = stage(
-        &repo,
-        &StageOptions {
-            pathspecs: vec!["b.txt".into()],
-            ..StageOptions::default()
-        },
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .unwrap_err();
-    let Error::UnmergedConflictMarkers { paths } = err else {
+    let err = repo
+        .index()
+        .stage(
+            &StageOptions {
+                pathspecs: vec!["b.txt".into()],
+                ..StageOptions::default()
+            },
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .unwrap_err();
+    let Error::Worktree(WorktreeError::UnmergedConflictMarkers { paths }) = err else {
         panic!("expected marker paths, got {err}");
     };
     assert_eq!(paths, vec!["b.txt".to_owned()]);

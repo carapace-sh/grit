@@ -2,6 +2,7 @@
 
 use grit_lib::diff::{DiffOptions, DiffTarget, WhitespaceMode};
 use grit_lib::repo::{InitOptions, Repository};
+use grit_lib::worktree::pathspec::{Pathspec, PathspecGlobalFlags};
 use std::process::Command;
 
 fn git(cwd: &std::path::Path, args: &[&str]) {
@@ -24,11 +25,15 @@ fn worktree_diff_w_omits_whitespace_only_modified_file() {
     git(dir.path(), &["commit", "-qm", "base"]);
     std::fs::write(dir.path().join("ws.txt"), "helloworld\n").unwrap();
 
-    let repo = Repository::init(dir.path(), &InitOptions::default()).expect("init");
+    let (repo, _) = Repository::init(dir.path(), &InitOptions::default()).expect("init");
     let opts = DiffOptions::default().with_whitespace(WhitespaceMode::ignore_all_space());
     let files = repo
         .diff()
-        .files(&DiffTarget::WorktreeVsIndex, &[], &opts)
+        .files(
+            &DiffTarget::WorktreeVsIndex,
+            &Pathspec::entire_tree(PathspecGlobalFlags::default()),
+            &opts,
+        )
         .expect("diff");
     assert!(
         files.is_empty(),

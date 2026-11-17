@@ -56,7 +56,11 @@ impl<'a> RefMapOverlay<'a> {
         match self.overlay.get(name) {
             Some(None) => None,
             Some(Some(value)) => Some(Cow::Borrowed(value)),
-            None => self.base.get(name).map(Cow::Borrowed),
+            None => {
+                #[cfg(test)]
+                super::probe::record_stored_ref_probe();
+                self.base.get(name).map(Cow::Borrowed)
+            }
         }
     }
 
@@ -127,7 +131,7 @@ fn expected_matches_for_update_read(refs: &RefsRead<'_, '_>, update: &RefUpdate)
             return reflog_old_oid_before_read(refs, update) == *want;
         }
     }
-    let actual = refs.get(&update.name);
+    let actual = refs.get(update.name.as_str());
     expected_matches(actual.as_deref(), &update.expected)
 }
 
@@ -155,7 +159,7 @@ fn check_storage_write_read(
             prior.insert(name, kind);
             Ok(())
         }
-        Some(_) => Err(RefStoreError::DuplicateUpdate { name }),
+        Some(_) => Err(RefStoreError::DuplicateUpdate { name: name.clone() }),
     }
 }
 
@@ -169,19 +173,23 @@ fn storage_write_for_update_read(
     match &update.new_value {
         None => {
             if should_deref_symref_read(refs, update) {
-                let target = symref_peel_write_target_read(refs, &update.name)?;
+                let target = symref_peel_write_target_read(refs, update.name.as_str())?;
                 Ok(Some((target, StorageWriteKind::Deleted)))
             } else {
-                Ok(Some((update.name.clone(), StorageWriteKind::Deleted)))
+                Ok(Some((
+                    update.name.as_str().to_owned(),
+                    StorageWriteKind::Deleted,
+                )))
             }
         }
         Some(RawRef::Direct(oid)) if should_deref_symref_update_read(refs, update) => {
-            let target = symref_peel_write_target_read(refs, &update.name)?;
+            let target = symref_peel_write_target_read(refs, update.name.as_str())?;
             Ok(Some((target, StorageWriteKind::Written(*oid))))
         }
-        Some(RawRef::Direct(oid)) => {
-            Ok(Some((update.name.clone(), StorageWriteKind::Written(*oid))))
-        }
+        Some(RawRef::Direct(oid)) => Ok(Some((
+            update.name.as_str().to_owned(),
+            StorageWriteKind::Written(*oid),
+        ))),
         Some(RawRef::Symbolic(_)) => Ok(None),
     }
 }
@@ -200,9 +208,9 @@ pub fn simulate_batch_apply(
         let read = RefsRead::Overlay(&overlay);
         if !expected_matches_for_update_read(&read, update) {
             return Err(RefStoreError::ExpectedMismatch {
-                name: update.name.clone(),
+                name: update.name.as_str().to_owned(),
                 expected: update.expected.clone(),
-                actual: read.get(&update.name).map(Cow::into_owned),
+                actual: read.get(update.name.as_str()).map(Cow::into_owned),
             });
         }
         check_storage_write_read(&mut storage_writes, &read, update)?;
@@ -233,21 +241,21 @@ pub fn apply_case_only_ref_rename(
     if rename.from == rename.to {
         return Ok(());
     }
-    let value = state
-        .refs
-        .remove(&rename.from)
-        .ok_or_else(|| RefStoreError::ExpectedMismatch {
-            name: rename.from.clone(),
-            expected: Expected::Exists,
-            actual: None,
-        })?;
-    if state.refs.contains_key(&rename.to) {
-        return Err(RefStoreError::Corrupt(format!(
-            "case-only rename blocked: '{}' already exists",
-            rename.to
-        )));
+    let value =
+        state
+            .refs
+            .remove(rename.from.as_str())
+            .ok_or_else(|| RefStoreError::ExpectedMismatch {
+                name: rename.from.as_str().to_owned(),
+                expected: Expected::Exists,
+                actual: None,
+            })?;
+    if state.refs.contains_key(rename.to.as_str()) {
+        return Err(RefStoreError::Corrupt {
+            detail: format!("case-only rename blocked: '{}' already exists", rename.to),
+        });
     }
-    state.refs.insert(rename.to.clone(), value);
+    state.refs.insert(rename.to.as_str().to_owned(), value);
     Ok(())
 }
 
@@ -258,24 +266,23 @@ fn apply_case_only_ref_rename_ctx(
     if rename.from == rename.to {
         return Ok(());
     }
-    let value = match ctx.refs.read().get(&rename.from) {
+    let value = match ctx.refs.read().get(rename.from.as_str()) {
         Some(v) => v.into_owned(),
         None => {
             return Err(RefStoreError::ExpectedMismatch {
-                name: rename.from.clone(),
+                name: rename.from.as_str().to_owned(),
                 expected: Expected::Exists,
                 actual: None,
             });
         }
     };
-    ctx.refs.remove(&rename.from);
-    if ctx.refs.contains_key(&rename.to) {
-        return Err(RefStoreError::Corrupt(format!(
-            "case-only rename blocked: '{}' already exists",
-            rename.to
-        )));
+    ctx.refs.remove(rename.from.as_str());
+    if ctx.refs.contains_key(rename.to.as_str()) {
+        return Err(RefStoreError::Corrupt {
+            detail: format!("case-only rename blocked: '{}' already exists", rename.to),
+        });
     }
-    ctx.refs.insert(rename.to.clone(), value);
+    ctx.refs.insert(rename.to.as_str().to_owned(), value);
     Ok(())
 }
 
@@ -288,8 +295,8 @@ fn apply_reflog_rename_map(
     reflogs: &mut BTreeMap<String, Vec<ReflogEntry>>,
     rename: &RefReflogRename,
 ) -> StoreResult<()> {
-    let mut entries = reflogs.remove(&rename.from).unwrap_or_default();
-    reflogs.remove(&rename.to);
+    let mut entries = reflogs.remove(rename.from.as_str()).unwrap_or_default();
+    reflogs.remove(rename.to.as_str());
     let old_oid = rename
         .append
         .old_oid
@@ -301,29 +308,49 @@ fn apply_reflog_rename_map(
         identity: format_reflog_identity(&rename.append.identity, rename.append.time),
         message: rename.append.message.clone(),
     });
-    reflogs.insert(rename.to.clone(), entries);
+    reflogs.insert(rename.to.as_str().to_owned(), entries);
     Ok(())
 }
 
 /// Apply one update (ref change + optional reflog) to `state`.
 pub fn apply_update(state: &mut RefBatchState, update: &RefUpdate) -> StoreResult<()> {
-    let reflog_oids = update.reflog.as_ref().map(|_| {
-        (
-            reflog_old_oid_before(state, update),
-            reflog_new_oid_before(state, update),
-        )
-    });
-    let deref_target_reflog = update.reflog.as_ref().and_then(|_| {
+    let delete_reflog_name = if !update.flags.log_only && update.new_value.is_none() {
+        ref_change_target(state, update)?
+    } else {
+        None
+    };
+    let reflog_oids = if delete_reflog_name.is_none() {
+        update.reflog.as_ref().map(|_| {
+            (
+                reflog_old_oid_before(state, update),
+                reflog_new_oid_before(state, update),
+            )
+        })
+    } else {
+        None
+    };
+    let deref_target_reflog = reflog_oids.as_ref().and_then(|_| {
         if !should_deref_symref_update(state, update) {
             return None;
         }
-        symref_peel_write_target(&state.refs, &update.name).ok()
+        symref_peel_write_target(&state.refs, update.name.as_str()).ok()
     });
 
     apply_ref_change(state, update)?;
 
+    if let Some(name) = delete_reflog_name {
+        state.reflogs.remove(&name);
+        return Ok(());
+    }
+
     if let (Some(log), Some((old_oid, new_oid))) = (&update.reflog, reflog_oids) {
-        append_reflog_entry(&mut state.reflogs, &update.name, old_oid, new_oid, log);
+        append_reflog_entry(
+            &mut state.reflogs,
+            update.name.as_str(),
+            old_oid,
+            new_oid,
+            log,
+        );
         if let Some(target) = deref_target_reflog {
             append_reflog_entry(&mut state.reflogs, &target, old_oid, new_oid, log);
         }
@@ -333,23 +360,37 @@ pub fn apply_update(state: &mut RefBatchState, update: &RefUpdate) -> StoreResul
 
 fn apply_update_ctx(ctx: &mut RefWriteCtx<'_, '_>, update: &RefUpdate) -> StoreResult<()> {
     let read = ctx.refs.read();
-    let reflog_oids = update.reflog.as_ref().map(|_| {
-        (
-            reflog_old_oid_before_read(&read, update),
-            reflog_new_oid_before_read(&read, update),
-        )
-    });
-    let deref_target_reflog = update.reflog.as_ref().and_then(|_| {
+    let delete_reflog_name = if !update.flags.log_only && update.new_value.is_none() {
+        ref_change_target_read(&read, update)?
+    } else {
+        None
+    };
+    let reflog_oids = if delete_reflog_name.is_none() {
+        update.reflog.as_ref().map(|_| {
+            (
+                reflog_old_oid_before_read(&read, update),
+                reflog_new_oid_before_read(&read, update),
+            )
+        })
+    } else {
+        None
+    };
+    let deref_target_reflog = reflog_oids.as_ref().and_then(|_| {
         if !should_deref_symref_update_read(&read, update) {
             return None;
         }
-        symref_peel_write_target_read(&read, &update.name).ok()
+        symref_peel_write_target_read(&read, update.name.as_str()).ok()
     });
 
     apply_ref_change_ctx(ctx, update)?;
 
+    if let Some(name) = delete_reflog_name {
+        ctx.reflogs.remove(&name);
+        return Ok(());
+    }
+
     if let (Some(log), Some((old_oid, new_oid))) = (&update.reflog, reflog_oids) {
-        append_reflog_entry(ctx.reflogs, &update.name, old_oid, new_oid, log);
+        append_reflog_entry(ctx.reflogs, update.name.as_str(), old_oid, new_oid, log);
         if let Some(target) = deref_target_reflog {
             append_reflog_entry(ctx.reflogs, &target, old_oid, new_oid, log);
         }
@@ -377,9 +418,9 @@ pub(crate) fn ref_change_target(
         Some(_) => should_deref_symref_update(state, update),
     };
     if deref {
-        symref_peel_write_target(&state.refs, &update.name).map(Some)
+        symref_peel_write_target(&state.refs, update.name.as_str()).map(Some)
     } else {
-        Ok(Some(update.name.clone()))
+        Ok(Some(update.name.as_str().to_owned()))
     }
 }
 
@@ -421,9 +462,9 @@ fn ref_change_target_read(
         Some(_) => should_deref_symref_update_read(refs, update),
     };
     if deref {
-        symref_peel_write_target_read(refs, &update.name).map(Some)
+        symref_peel_write_target_read(refs, update.name.as_str()).map(Some)
     } else {
-        Ok(Some(update.name.clone()))
+        Ok(Some(update.name.as_str().to_owned()))
     }
 }
 
@@ -432,7 +473,11 @@ fn should_deref_symref(state: &RefBatchState, update: &RefUpdate) -> bool {
 }
 
 fn should_deref_symref_read(refs: &RefsRead<'_, '_>, update: &RefUpdate) -> bool {
-    !update.flags.no_deref && matches!(refs.get(&update.name).as_deref(), Some(RawRef::Symbolic(_)))
+    !update.flags.no_deref
+        && matches!(
+            refs.get(update.name.as_str()).as_deref(),
+            Some(RawRef::Symbolic(_))
+        )
 }
 
 fn should_deref_symref_update(state: &RefBatchState, update: &RefUpdate) -> bool {
@@ -449,23 +494,23 @@ fn symref_peel_write_target(
     sym_name: &str,
 ) -> StoreResult<String> {
     let Some(RawRef::Symbolic(first)) = refs.get(sym_name) else {
-        return Err(RefStoreError::Corrupt(format!(
-            "not a symbolic ref: {sym_name}"
-        )));
+        return Err(RefStoreError::Corrupt {
+            detail: format!("not a symbolic ref: {sym_name}"),
+        });
     };
     resolve_symref_peel_target(refs, first)
 }
 
 fn symref_peel_write_target_read(refs: &RefsRead<'_, '_>, sym_name: &str) -> StoreResult<String> {
     let Some(value) = refs.get(sym_name) else {
-        return Err(RefStoreError::Corrupt(format!(
-            "not a symbolic ref: {sym_name}"
-        )));
+        return Err(RefStoreError::Corrupt {
+            detail: format!("not a symbolic ref: {sym_name}"),
+        });
     };
     let RawRef::Symbolic(first) = value.as_ref() else {
-        return Err(RefStoreError::Corrupt(format!(
-            "not a symbolic ref: {sym_name}"
-        )));
+        return Err(RefStoreError::Corrupt {
+            detail: format!("not a symbolic ref: {sym_name}"),
+        });
     };
     resolve_symref_peel_target_read(refs, first.as_str())
 }
@@ -538,15 +583,15 @@ pub(crate) fn snapshot_for_apply_rollback(
 ) -> ApplyRollbackGuard {
     let mut touched = ref_lock_names_for_updates(state, txn.updates());
     for update in txn.updates() {
-        touched.insert(update.name.clone());
+        touched.insert(update.name.as_str().to_owned());
     }
     for rename in txn.case_only_renames() {
-        touched.insert(rename.from.clone());
-        touched.insert(rename.to.clone());
+        touched.insert(rename.from.as_str().to_owned());
+        touched.insert(rename.to.as_str().to_owned());
     }
     for rename in txn.reflog_renames() {
-        touched.insert(rename.from.clone());
-        touched.insert(rename.to.clone());
+        touched.insert(rename.from.as_str().to_owned());
+        touched.insert(rename.to.as_str().to_owned());
     }
     let mut refs = BTreeMap::new();
     let mut reflogs = BTreeMap::new();
@@ -596,18 +641,18 @@ pub(crate) fn ref_lock_names_for_updates(
     for update in updates {
         if update.flags.log_only {
             if update.reflog.is_some() {
-                names.insert(update.name.clone());
+                names.insert(update.name.as_str().to_owned());
             }
             continue;
         }
-        names.insert(update.name.clone());
+        names.insert(update.name.as_str().to_owned());
         if should_deref_symref(state, update) {
-            if let Ok(target) = symref_peel_write_target(&state.refs, &update.name) {
+            if let Ok(target) = symref_peel_write_target(&state.refs, update.name.as_str()) {
                 names.insert(target);
             }
         }
         if should_deref_symref_update(state, update) {
-            if let Ok(target) = symref_peel_write_target(&state.refs, &update.name) {
+            if let Ok(target) = symref_peel_write_target(&state.refs, update.name.as_str()) {
                 names.insert(target);
             }
         }
@@ -623,7 +668,8 @@ fn reflog_old_oid_before_read(refs: &RefsRead<'_, '_>, update: &RefUpdate) -> Ob
     if let Some(oid) = update.reflog.as_ref().and_then(|log| log.old_oid) {
         return oid;
     }
-    resolved_oid_at_name_read(refs, &update.name, update.flags).unwrap_or_else(|_| zero_oid())
+    resolved_oid_at_name_read(refs, update.name.as_str(), update.flags)
+        .unwrap_or_else(|_| zero_oid())
 }
 
 fn reflog_new_oid_before(state: &RefBatchState, update: &RefUpdate) -> ObjectId {
@@ -689,7 +735,7 @@ fn resolve_symbolic_read(refs: &RefsRead<'_, '_>, name: &str) -> Result<ObjectId
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::refs::store::Expected;
+    use crate::refs::store::{Expected, RefName};
 
     fn oid(byte: u8) -> ObjectId {
         let mut bytes = [0u8; 20];
@@ -699,7 +745,7 @@ mod tests {
 
     fn direct_update(name: &str, value: ObjectId) -> RefUpdate {
         RefUpdate {
-            name: name.to_owned(),
+            name: RefName::from_trusted(name.to_owned()),
             new_value: Some(RawRef::Direct(value)),
             expected: Expected::Any,
             reflog: None,
@@ -803,14 +849,14 @@ mod tests {
         );
         let updates = vec![
             RefUpdate {
-                name: "HEAD".to_owned(),
+                name: RefName::from_trusted("HEAD"),
                 new_value: None,
                 expected: Expected::Any,
                 reflog: None,
                 flags: RefUpdateFlags::default(),
             },
             RefUpdate {
-                name: "refs/heads/main".to_owned(),
+                name: RefName::from_trusted("refs/heads/main"),
                 new_value: Some(RawRef::Direct(oid(2))),
                 expected: Expected::Missing,
                 reflog: None,
@@ -833,7 +879,7 @@ mod tests {
         );
         let updates = vec![
             RefUpdate {
-                name: "HEAD".to_owned(),
+                name: RefName::from_trusted("HEAD"),
                 new_value: Some(RawRef::Direct(oid(2))),
                 expected: Expected::Any,
                 reflog: Some(ReflogUpdate {
@@ -849,7 +895,7 @@ mod tests {
                 },
             },
             RefUpdate {
-                name: "refs/heads/main".to_owned(),
+                name: RefName::from_trusted("refs/heads/main"),
                 new_value: Some(RawRef::Direct(oid(2))),
                 expected: Expected::Oid(oid(1)),
                 reflog: None,
@@ -883,7 +929,7 @@ mod tests {
         };
         let updates = vec![
             RefUpdate {
-                name: "HEAD".to_owned(),
+                name: RefName::from_trusted("HEAD"),
                 new_value: Some(RawRef::Direct(oid(2))),
                 expected: Expected::Any,
                 reflog: Some(ReflogUpdate {
@@ -898,7 +944,7 @@ mod tests {
                 },
             },
             RefUpdate {
-                name: "refs/heads/main".to_owned(),
+                name: RefName::from_trusted("refs/heads/main"),
                 new_value: Some(RawRef::Direct(oid(2))),
                 expected: Expected::Oid(oid(1)),
                 reflog: Some(log),

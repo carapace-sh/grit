@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use crate::error::Result;
-use crate::objects::{parse_tree, serialize_tree, tree_entry_cmp, ObjectId, ObjectKind, TreeEntry};
+use crate::objects::{parse_tree, serialize_tree, tree_name_cmp, ObjectId, ObjectKind, TreeEntry};
 use crate::odb::Odb;
 
 pub(crate) const TREE_MODE: u32 = 0o040000;
@@ -34,7 +34,7 @@ fn entries(odb: &Odb, tree: Option<ObjectId>) -> Result<Vec<TreeEntry>> {
 }
 
 /// Every non-tree path that differs between `old` and `new`.
-pub(crate) fn diff(odb: &Odb, old: Option<ObjectId>, new: Option<ObjectId>) -> Result<Vec<Change>> {
+pub fn diff(odb: &Odb, old: Option<ObjectId>, new: Option<ObjectId>) -> Result<Vec<Change>> {
     let mut out = Vec::new();
     diff_into(odb, old, new, b"", &mut out)?;
     Ok(out)
@@ -147,7 +147,7 @@ pub(crate) fn edit(
         .into_iter()
         .map(|(name, (mode, oid))| TreeEntry { mode, name, oid })
         .collect();
-    list.sort_by(|a, b| tree_entry_cmp(&a.name, a.mode == TREE_MODE, &b.name, b.mode == TREE_MODE));
+    list.sort_by(|a, b| tree_name_cmp(&a.name, a.mode == TREE_MODE, &b.name, b.mode == TREE_MODE));
     odb.write(ObjectKind::Tree, &serialize_tree(&list))
 }
 
@@ -166,7 +166,7 @@ mod tests {
     #[test]
     fn edits_and_diffs_round_trip() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let repo = Repository::init(dir.path(), &InitOptions::default()).expect("init");
+        let (repo, _) = Repository::init(dir.path(), &InitOptions::default()).expect("init");
         let odb = repo.odb();
         let (a, b, c) = (blob(odb, "a"), blob(odb, "b"), blob(odb, "c"));
         let base = edit(
@@ -213,7 +213,7 @@ mod tests {
     #[test]
     fn a_directory_and_a_file_replace_each_other_in_one_batch() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let repo = Repository::init(dir.path(), &InitOptions::default()).expect("init");
+        let (repo, _) = Repository::init(dir.path(), &InitOptions::default()).expect("init");
         let odb = repo.odb();
         let (x, y, f) = (blob(odb, "x"), blob(odb, "y"), blob(odb, "f"));
         let with_dir = edit(

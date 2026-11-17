@@ -210,6 +210,13 @@
       "description": "Whether the clone destination is a bare repository.",
       "type": "boolean"
     },
+    "bare_gitlink_paths": {
+      "description": "Gitlink paths with no `.gitmodules` entry (empty after checkout).",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
     "blobs": {
       "anyOf": [
         {
@@ -361,6 +368,13 @@
       "description": "Whether only one branch was fetched (`git clone --single-branch` semantics).",
       "type": "boolean"
     },
+    "space": {
+      "description": "Your space's project, `<you>/<project>`, when this is a clone of an organization's project on grithub (the default grit host): pushes from the clone go there (`remote.<remote>.pushurl`), and the `space` remote fetches from it.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "stored_fields": {
       "description": "Remote fields stored from the advertisement (`promisor.storeFields`).",
       "items": {
@@ -369,7 +383,7 @@
       "type": "array"
     },
     "submodule_paths": {
-      "description": "Gitlink paths in the checked-out tree (submodules grit does not fetch).",
+      "description": "Gitlink paths listed in `.gitmodules` (submodules grit does not fetch).",
       "items": {
         "type": "string"
       },
@@ -393,6 +407,7 @@
       "type": "integer"
     },
     "url": {
+      "description": "Source URL or path, with any credentials removed.",
       "type": "string"
     },
     "worktree_bytes": {

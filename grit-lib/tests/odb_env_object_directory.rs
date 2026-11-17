@@ -13,14 +13,15 @@ use grit_lib::config::environment::{Environment, RepositoryOptions};
 use grit_lib::error::Error;
 use grit_lib::objects::odb::OdbBuilder;
 use grit_lib::objects::{ObjectId, ObjectKind};
-use grit_lib::porcelain::add::{stage, StageOptions};
-use grit_lib::porcelain::commit::{commit_worktree, CommitRequest};
-use grit_lib::progress::{NeverCancel, NullProgress};
+use grit_lib::porcelain::add::StageOptions;
+use grit_lib::porcelain::commit::CommitRequest;
+use grit_lib::progress::CancelToken;
+use grit_lib::progress::NullProgress;
 use grit_lib::remote::fetch::NoProgress;
 use grit_lib::remote::push_report::PushRefStatus;
 use grit_lib::remote::transfer::{FetchOptions, PushOptions, PushRefSpec};
 use grit_lib::remote::Remote;
-use grit_lib::repo::{Repository, RepositoryBuilder};
+use grit_lib::repo::{Repository, RepositoryError};
 
 const IDENT: &str = "Odb Env <odb-env@example.com> 1700000000 +0000";
 
@@ -109,11 +110,11 @@ fn loose_objects(objects_dir: &Path) -> Vec<PathBuf> {
 }
 
 fn commit_request(message: &str) -> CommitRequest {
-    CommitRequest {
-        message: message.to_owned(),
-        author: Some(IDENT.parse().expect("signature")),
-        committer: Some(IDENT.parse().expect("signature")),
-        ..Default::default()
+    {
+        let mut req = CommitRequest::new(message.to_owned());
+        req.author = Some(IDENT.parse().expect("signature"));
+        req.committer = Some(IDENT.parse().expect("signature"));
+        req
     }
 }
 
@@ -152,18 +153,27 @@ fn add_and_commit_write_into_env_object_directory() {
     fs::write(work.join("nb"), "new\n").unwrap();
 
     let repo = discover(environment(&work, objq.to_str().unwrap())).expect("discover");
-    stage(
-        &repo,
-        &StageOptions::default(),
-        &mut NullProgress,
-        &NeverCancel,
-    )
-    .expect("stage");
+    repo.index()
+        .stage(
+            &StageOptions::default(),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("stage");
     assert_eq!(loose_objects(&objq).len(), 1, "blob lands in the env dir");
     assert!(loose_objects(&dot_git_objects).is_empty());
 
     fs::write(work.join("second"), "two\n").unwrap();
-    let outcome = commit_worktree(&repo, &commit_request("x"), &mut NullProgress, &NeverCancel)
+    let outcome = repo
+        .commits()
+        .create(
+            &grit_lib::commits::CommitOptions::new(
+                commit_request("x"),
+                grit_lib::porcelain::commit::CommitScope::AutoStage,
+            ),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
         .expect("commit");
     // Two blobs, one tree, one commit.
     assert_eq!(loose_objects(&objq).len(), 4);
@@ -224,13 +234,17 @@ fn env_object_directory_with_alternate_main_store_keeps_history_readable() {
     env.git_alternate_object_directories = Some(dot_git_objects.to_str().unwrap().to_owned());
     let repo = discover(env).expect("discover");
     fs::write(work.join("base"), "changed\n").unwrap();
-    let outcome = commit_worktree(
-        &repo,
-        &commit_request("on top"),
-        &mut NullProgress,
-        &NeverCancel,
-    )
-    .expect("commit");
+    let outcome = repo
+        .commits()
+        .create(
+            &grit_lib::commits::CommitOptions::new(
+                commit_request("on top"),
+                grit_lib::porcelain::commit::CommitScope::AutoStage,
+            ),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("commit");
     assert_eq!(outcome.parents, vec![base.parse::<ObjectId>().unwrap()]);
     assert_eq!(loose_objects(&dot_git_objects), main_store_before);
     assert_eq!(loose_objects(&objq).len(), 3, "blob, tree and commit");
@@ -267,7 +281,10 @@ fn missing_env_object_directory_is_not_a_repository() {
     let missing = objq.join("missing");
     let err = discover(environment(&work, missing.to_str().unwrap()))
         .expect_err("missing GIT_OBJECT_DIRECTORY");
-    assert!(matches!(err, Error::NotARepository(_)), "{err:?}");
+    assert!(
+        matches!(err, Error::Repository(RepositoryError::NotARepository(_))),
+        "{err:?}"
+    );
     // Git rejects the repository the same way.
     let out = git_with(
         &work,
@@ -281,7 +298,10 @@ fn missing_env_object_directory_is_not_a_repository() {
 fn empty_env_object_directory_is_not_a_repository() {
     let (_tmp, work, _objq) = layout();
     let err = discover(environment(&work, "")).expect_err("empty GIT_OBJECT_DIRECTORY");
-    assert!(matches!(err, Error::NotARepository(_)), "{err:?}");
+    assert!(
+        matches!(err, Error::Repository(RepositoryError::NotARepository(_))),
+        "{err:?}"
+    );
     let out = git_with(
         &work,
         &[("GIT_OBJECT_DIRECTORY", Path::new(""))],
@@ -290,19 +310,19 @@ fn empty_env_object_directory_is_not_a_repository() {
     assert!(!out.status.success(), "git rejects an empty value too");
 }
 
+/// `Repository::open` resolves the env directory itself; read layers from an `OdbBuilder`
+/// sit on top of it rather than replacing it.
 #[test]
-fn odb_builder_must_name_env_object_directory() {
+fn odb_builder_layers_over_env_object_directory() {
     let (_tmp, work, objq) = layout();
     let git_dir = work.join(".git");
-    let options = || {
-        RepositoryOptions::with_environment(environment(&work, objq.to_str().unwrap()))
-            .with_work_tree(&work)
-    };
-
-    let repo = RepositoryBuilder::new(options())
-        .odb_builder(OdbBuilder::files(&objq))
-        .open(&git_dir, Some(&work))
-        .expect("builder rooted at the env dir");
+    let repo = Repository::open(
+        &git_dir,
+        &RepositoryOptions::with_environment(environment(&work, objq.to_str().unwrap()))
+            .with_odb_builder(OdbBuilder::new())
+            .with_work_tree(&work),
+    )
+    .expect("builder over the env dir");
     assert_eq!(repo.odb().objects_dir(), objq.as_path());
     let oid = repo.odb().write(ObjectKind::Blob, b"builder\n").unwrap();
     assert_eq!(loose_objects(&objq).len(), 1);
@@ -313,17 +333,6 @@ fn odb_builder_must_name_env_object_directory() {
     .unwrap()
     .odb()
     .exists(&oid));
-
-    let mismatch = RepositoryBuilder::new(options())
-        .odb_builder(OdbBuilder::files(git_dir.join("objects")))
-        .open(&git_dir, Some(&work));
-    assert!(
-        matches!(
-            mismatch,
-            Err(Error::OdbObjectsDirMismatch { ref repository, .. }) if repository == &objq
-        ),
-        "{mismatch:?}"
-    );
 }
 
 /// `up/` (work tree), `remote.git` (bare, from `up`) and the client `r/` cloned from it by
@@ -389,15 +398,14 @@ fn all_files(dir: &Path) -> Vec<PathBuf> {
 fn fetch_into_quarantine(root: &Path, url: &str) {
     let repo = discover(quarantined(root)).expect("discover");
     let remote = Remote::from_url(url).expect("remote url");
+    let mut fetch_opts = FetchOptions::new();
+    fetch_opts.refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()];
     repo.remotes()
         .fetch(
             &remote,
-            FetchOptions {
-                refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()],
-                ..Default::default()
-            },
+            fetch_opts,
             &mut NoProgress,
-            &NeverCancel,
+            &CancelToken::never(),
             None,
         )
         .expect("grit fetch");
@@ -525,13 +533,17 @@ fn commit_and_push_from_quarantine(root: &Path, url: &str) -> ObjectId {
     let work = root.join("r");
     let repo = discover(quarantined(root)).expect("discover");
     fs::write(work.join("local"), "local\n").unwrap();
-    let outcome = commit_worktree(
-        &repo,
-        &commit_request("local"),
-        &mut NullProgress,
-        &NeverCancel,
-    )
-    .expect("commit");
+    let outcome = repo
+        .commits()
+        .create(
+            &grit_lib::commits::CommitOptions::new(
+                commit_request("local"),
+                grit_lib::porcelain::commit::CommitScope::AutoStage,
+            ),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("commit");
     let plain = git_with(&work, &[], &["cat-file", "-e", &outcome.oid.to_hex()]);
     assert!(!plain.status.success(), "the new commit lives only in objq");
 
@@ -549,7 +561,7 @@ fn commit_and_push_from_quarantine(root: &Path, url: &str) -> ObjectId {
             }],
             PushOptions::default(),
             &mut NoProgress,
-            &NeverCancel,
+            &CancelToken::never(),
             None,
         )
         .expect("grit push");

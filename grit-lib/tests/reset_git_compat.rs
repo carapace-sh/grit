@@ -1,16 +1,20 @@
 //! Round-trip `grit reset` with system `git fsck` / `git status`.
 
 use crate::support;
+use grit_lib::error::ObjectError;
+use grit_lib::worktree::WorktreeError;
 
 use std::path::Path;
 
 use grit_lib::error::Error;
 use grit_lib::index::write_tree::{write_tree_update_index, WriteTreeFlags};
+use grit_lib::index::IndexError;
+use grit_lib::objects;
 use grit_lib::objects::ObjectId;
-use grit_lib::porcelain::reset::{reset_to_commit, ResetMode, ResetOptions};
+use grit_lib::porcelain::reset::{ResetMode, ResetOptions};
+use grit_lib::progress::{CancelToken, NullProgress};
+use grit_lib::refs::ref_storage::RefStorageFormat;
 use grit_lib::repo::{InitOptions, Repository};
-use grit_lib::revwalk::rev_parse::resolve_revision_as_commit_without_index_dwim;
-use grit_lib::{objects, refs, RefStorageFormat};
 use grit_test_support::git_cmd;
 use support::{
     assert_porcelain_v2_matches_git, git_status_porcelain_v2_lines, grit_status_porcelain_v2_lines,
@@ -30,7 +34,10 @@ fn commit_file(
 ) -> ObjectId {
     let wt = repo.work_tree().expect("wt");
     std::fs::write(wt.join(path), contents).expect("write");
-    let mut index = repo.index_handle().load().expect("index");
+    let mut index = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("index");
     let oid = repo
         .odb()
         .write(objects::ObjectKind::Blob, contents.as_bytes())
@@ -46,7 +53,9 @@ fn commit_file(
     index.sort();
     let tree = write_tree_update_index(repo.odb(), &mut index, "", WriteTreeFlags::silent())
         .expect("tree");
-    repo.index_handle().write(&mut index).expect("write index");
+    repo.index()
+        .write(&mut index, &grit_lib::index::IndexWriteOptions::default())
+        .expect("write index");
     let commit = objects::CommitData {
         tree,
         parents: parent.into_iter().collect(),
@@ -66,15 +75,17 @@ fn commit_file(
             &objects::serialize_commit(&commit),
         )
         .expect("commit");
-    refs::write_ref(repo.git_dir(), "refs/heads/main", &co).expect("branch");
-    refs::write_symbolic_ref(repo.git_dir(), "HEAD", "refs/heads/main").expect("symhead");
+    grit_test_support::refs::set_ref(&repo, "refs/heads/main", &co).expect("branch");
+    repo.references()
+        .update_symbolic("HEAD", "refs/heads/main")
+        .expect("symhead");
     co
 }
 
 #[test]
 fn mixed_reset_readable_by_git() {
     let dir = TempDir::new().expect("tempdir");
-    let repo = Repository::init(
+    let (repo, _) = Repository::init(
         dir.path(),
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
@@ -84,13 +95,13 @@ fn mixed_reset_readable_by_git() {
     let c1 = commit_file(&repo, "f", "1\n", None);
     commit_file(&repo, "f", "2\n", Some(c1));
 
-    reset_to_commit(
-        &repo,
-        &ResetOptions::new(c1, ResetMode::Mixed, identity(), "reset"),
-        &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("reset");
+    repo.checkout()
+        .reset(
+            &ResetOptions::new(c1, ResetMode::Mixed, identity(), "reset"),
+            &mut grit_lib::progress::NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("reset");
 
     git_cmd(&["fsck"]).in_dir(dir.path()).suc();
     git_cmd(&["status", "--porcelain"]).in_dir(dir.path()).suc();
@@ -135,19 +146,27 @@ fn reset_keep_preserves_unrelated_local_changes_like_git() {
     two_commit_history(dir2.path());
     std::fs::write(dir2.path().join("b"), "local\n").expect("local b");
     let repo = open_grit_repo(dir2.path());
-    let parent = resolve_revision_as_commit_without_index_dwim(&repo, "HEAD~1").expect("parent");
-    reset_to_commit(
-        &repo,
-        &ResetOptions::new(
-            parent,
-            ResetMode::Keep,
-            support::parse_reflog_signature("T <t@t.com> 0 +0000"),
-            "reset",
-        ),
-        &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("keep reset");
+    let parent = repo
+        .revwalk()
+        .resolve(
+            "HEAD~1",
+            &grit_lib::revwalk::ResolveOptions::default()
+                .with_peel(grit_lib::revwalk::Peel::Commit)
+                .with_index_dwim(grit_lib::revwalk::IndexDwim::Off),
+        )
+        .expect("parent");
+    repo.checkout()
+        .reset(
+            &ResetOptions::new(
+                parent,
+                ResetMode::Keep,
+                support::parse_reflog_signature("T <t@t.com> 0 +0000"),
+                "reset",
+            ),
+            &mut grit_lib::progress::NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("keep reset");
     assert_porcelain_v2_matches_git(dir2.path(), &repo);
     let grit_lines = grit_status_porcelain_v2_lines(&repo);
     assert_eq!(grit_lines, git_lines);
@@ -168,26 +187,35 @@ fn reset_keep_refuses_when_changed_file_has_local_edits() {
     two_commit_history(dir2.path());
     std::fs::write(dir2.path().join("a"), "edited\n").expect("edit a");
     let repo = open_grit_repo(dir2.path());
-    let head_before = refs::resolve_ref(repo.git_dir(), "HEAD").expect("head");
-    let parent = resolve_revision_as_commit_without_index_dwim(&repo, "HEAD~1").expect("parent");
-    let err = reset_to_commit(
-        &repo,
-        &ResetOptions::new(
-            parent,
-            ResetMode::Keep,
-            support::parse_reflog_signature("T <t@t.com> 0 +0000"),
-            "reset",
-        ),
-        &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect_err("grit should refuse");
+    let head_before = repo.references().resolve("HEAD").expect("head");
+    let parent = repo
+        .revwalk()
+        .resolve(
+            "HEAD~1",
+            &grit_lib::revwalk::ResolveOptions::default()
+                .with_peel(grit_lib::revwalk::Peel::Commit)
+                .with_index_dwim(grit_lib::revwalk::IndexDwim::Off),
+        )
+        .expect("parent");
+    let err = repo
+        .checkout()
+        .reset(
+            &ResetOptions::new(
+                parent,
+                ResetMode::Keep,
+                support::parse_reflog_signature("T <t@t.com> 0 +0000"),
+                "reset",
+            ),
+            &mut grit_lib::progress::NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect_err("grit should refuse");
     assert!(
-        matches!(err, Error::WouldOverwrite { .. }),
+        matches!(err, Error::Worktree(WorktreeError::WouldOverwrite { .. })),
         "expected WouldOverwrite, got {err:?}"
     );
     assert_eq!(
-        refs::resolve_ref(repo.git_dir(), "HEAD").expect("head"),
+        repo.references().resolve("HEAD").expect("head"),
         head_before
     );
     let git_lines = git_status_porcelain_v2_lines(dir.path());
@@ -198,7 +226,7 @@ fn reset_keep_refuses_when_changed_file_has_local_edits() {
 #[test]
 fn reset_dry_run_hard_lists_overwritten_paths_and_changes_nothing() {
     let dir = TempDir::new().expect("tempdir");
-    let repo = Repository::init(
+    let (repo, _) = Repository::init(
         dir.path(),
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
@@ -207,10 +235,10 @@ fn reset_dry_run_hard_lists_overwritten_paths_and_changes_nothing() {
     .expect("init");
     let c1 = {
         commit_file(&repo, "a", "1\n", None);
-        refs::resolve_ref(repo.git_dir(), "HEAD").expect("head")
+        repo.references().resolve("HEAD").expect("head")
     };
     commit_file(&repo, "a", "2\n", Some(c1));
-    let head_before = refs::resolve_ref(repo.git_dir(), "HEAD").expect("head");
+    let head_before = repo.references().resolve("HEAD").expect("head");
     let wt = repo.work_tree().expect("wt");
     std::fs::write(wt.join("a"), "dirty\n").expect("dirty");
 
@@ -221,17 +249,18 @@ fn reset_dry_run_hard_lists_overwritten_paths_and_changes_nothing() {
         "reset",
     );
     opts.dry_run = true;
-    let outcome = reset_to_commit(
-        &repo,
-        &opts,
-        &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("dry-run");
+    let outcome = repo
+        .checkout()
+        .reset(
+            &opts,
+            &mut grit_lib::progress::NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("dry-run");
     assert!(outcome.dry_run);
     assert!(outcome.would_overwrite.iter().any(|p| p == "a"));
     assert_eq!(
-        refs::resolve_ref(repo.git_dir(), "HEAD").expect("head"),
+        repo.references().resolve("HEAD").expect("head"),
         head_before
     );
     assert_eq!(std::fs::read(wt.join("a")).expect("disk"), b"dirty\n");
@@ -271,7 +300,15 @@ fn reset_orphaned_commits_main_only_git_init() {
         .to_owned();
 
     let repo = open_grit_repo(dir.path());
-    let c1 = resolve_revision_as_commit_without_index_dwim(&repo, "HEAD~2").expect("c1");
+    let c1 = repo
+        .revwalk()
+        .resolve(
+            "HEAD~2",
+            &grit_lib::revwalk::ResolveOptions::default()
+                .with_peel(grit_lib::revwalk::Peel::Commit)
+                .with_index_dwim(grit_lib::revwalk::IndexDwim::Off),
+        )
+        .expect("c1");
     assert_eq!(c1, ObjectId::from_hex(&c1_hex).expect("c1 hex"));
 
     let mut opts = ResetOptions::new(
@@ -281,13 +318,14 @@ fn reset_orphaned_commits_main_only_git_init() {
         "reset",
     );
     opts.dry_run = true;
-    let preview = reset_to_commit(
-        &repo,
-        &opts,
-        &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("dry-run reset");
+    let preview = repo
+        .checkout()
+        .reset(
+            &opts,
+            &mut grit_lib::progress::NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("dry-run reset");
     assert_eq!(preview.orphaned_total, 2, "c2 and c3 should orphan");
     assert_eq!(preview.orphaned_commits.len(), 2);
     assert_eq!(
@@ -305,7 +343,7 @@ fn reset_orphaned_commits_main_only_git_init() {
 #[test]
 fn reset_orphaned_commits_excludes_commits_held_by_other_refs() {
     let dir = TempDir::new().expect("tempdir");
-    let repo = Repository::init(
+    let (repo, _) = Repository::init(
         dir.path(),
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
@@ -315,20 +353,21 @@ fn reset_orphaned_commits_excludes_commits_held_by_other_refs() {
     let c1 = commit_file(&repo, "f", "1\n", None);
     let c2 = commit_file(&repo, "f", "2\n", Some(c1));
     let c3 = commit_file(&repo, "f", "3\n", Some(c2));
-    refs::write_ref(repo.git_dir(), "refs/heads/keep", &c2).expect("branch keep");
+    grit_test_support::refs::set_ref(&repo, "refs/heads/keep", &c2).expect("branch keep");
 
-    let outcome = reset_to_commit(
-        &repo,
-        &ResetOptions::new(
-            c1,
-            ResetMode::Mixed,
-            support::parse_reflog_signature("T <t@t.com> 0 +0000"),
-            "reset",
-        ),
-        &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("reset");
+    let outcome = repo
+        .checkout()
+        .reset(
+            &ResetOptions::new(
+                c1,
+                ResetMode::Mixed,
+                support::parse_reflog_signature("T <t@t.com> 0 +0000"),
+                "reset",
+            ),
+            &mut grit_lib::progress::NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("reset");
     assert_eq!(outcome.orphaned_total, 1);
     assert_eq!(outcome.orphaned_commits.len(), 1);
     assert_eq!(outcome.orphaned_commits[0].oid, c3);
@@ -338,7 +377,7 @@ fn reset_orphaned_commits_excludes_commits_held_by_other_refs() {
 #[test]
 fn reset_orphan_zero_when_other_ref_holds_old_tip() {
     let dir = TempDir::new().expect("tempdir");
-    let repo = Repository::init(
+    let (repo, _) = Repository::init(
         dir.path(),
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
@@ -348,20 +387,21 @@ fn reset_orphan_zero_when_other_ref_holds_old_tip() {
     let c1 = commit_file(&repo, "f", "1\n", None);
     let c2 = commit_file(&repo, "f", "2\n", Some(c1));
     let c3 = commit_file(&repo, "f", "3\n", Some(c2));
-    refs::write_ref(repo.git_dir(), "refs/heads/hold", &c3).expect("hold");
+    grit_test_support::refs::set_ref(&repo, "refs/heads/hold", &c3).expect("hold");
 
-    let outcome = reset_to_commit(
-        &repo,
-        &ResetOptions::new(
-            c1,
-            ResetMode::Mixed,
-            support::parse_reflog_signature("T <t@t.com> 0 +0000"),
-            "reset",
-        ),
-        &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("reset");
+    let outcome = repo
+        .checkout()
+        .reset(
+            &ResetOptions::new(
+                c1,
+                ResetMode::Mixed,
+                support::parse_reflog_signature("T <t@t.com> 0 +0000"),
+                "reset",
+            ),
+            &mut grit_lib::progress::NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("reset");
     assert_eq!(outcome.orphaned_total, 0);
 }
 
@@ -393,27 +433,28 @@ fn reset_keep_rejects_unmerged_index_like_git() {
         .with_status(128);
 
     let repo = open_grit_repo(dir.path());
-    let head = refs::resolve_ref(repo.git_dir(), "HEAD").expect("head");
-    let err = reset_to_commit(
-        &repo,
-        &ResetOptions::new(
-            head,
-            ResetMode::Keep,
-            support::parse_reflog_signature("T <t@t.com> 0 +0000"),
-            "reset",
-        ),
-        &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect_err("grit keep should refuse unmerged index");
-    assert!(matches!(err, Error::IndexUnmerged));
+    let head = repo.references().resolve("HEAD").expect("head");
+    let err = repo
+        .checkout()
+        .reset(
+            &ResetOptions::new(
+                head,
+                ResetMode::Keep,
+                support::parse_reflog_signature("T <t@t.com> 0 +0000"),
+                "reset",
+            ),
+            &mut grit_lib::progress::NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect_err("grit keep should refuse unmerged index");
+    assert!(matches!(err, Error::Index(IndexError::Unmerged { .. })));
     let _ = tip;
 }
 
 #[test]
 fn reset_forward_has_no_orphan_walk() {
     let dir = TempDir::new().expect("tempdir");
-    let repo = Repository::init(
+    let (repo, _) = Repository::init(
         dir.path(),
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
@@ -422,18 +463,19 @@ fn reset_forward_has_no_orphan_walk() {
     .expect("init");
     let c1 = commit_file(&repo, "f", "1\n", None);
     let c2 = commit_file(&repo, "f", "2\n", Some(c1));
-    let outcome = reset_to_commit(
-        &repo,
-        &ResetOptions::new(
-            c2,
-            ResetMode::Mixed,
-            support::parse_reflog_signature("T <t@t.com> 0 +0000"),
-            "reset",
-        ),
-        &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("reset");
+    let outcome = repo
+        .checkout()
+        .reset(
+            &ResetOptions::new(
+                c2,
+                ResetMode::Mixed,
+                support::parse_reflog_signature("T <t@t.com> 0 +0000"),
+                "reset",
+            ),
+            &mut grit_lib::progress::NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("reset");
     assert_eq!(outcome.orphaned_total, 0);
     assert!(outcome.orphaned_commits.is_empty());
 }
@@ -444,18 +486,30 @@ fn reset_reflog_identity_includes_signature_timestamp_and_git_reads_it() {
     use time::{OffsetDateTime, UtcOffset};
 
     let dir = TempDir::new().expect("tempdir");
-    let repo = Repository::init(
+    let (repo, _) = Repository::init(
         dir.path(),
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
             .with_ref_storage(RefStorageFormat::Files),
     )
     .expect("init");
-    repo.config_handle()
-        .set_local("user.name", "Solo Dev")
+    repo.config()
+        .set(
+            grit_lib::config::ConfigScope::Local,
+            "user.name",
+            "Solo Dev",
+            &grit_lib::config::ConfigWriteOptions::new(),
+        )
+        .map(|_| ())
         .expect("name");
-    repo.config_handle()
-        .set_local("user.email", "solo@example.com")
+    repo.config()
+        .set(
+            grit_lib::config::ConfigScope::Local,
+            "user.email",
+            "solo@example.com",
+            &grit_lib::config::ConfigWriteOptions::new(),
+        )
+        .map(|_| ())
         .expect("email");
     let repo = Repository::open(
         repo.git_dir(),
@@ -468,13 +522,13 @@ fn reset_reflog_identity_includes_signature_timestamp_and_git_reads_it() {
         .expect("time")
         .to_offset(UtcOffset::UTC);
     let sig = Signature::new("Solo Dev", "solo@example.com", time).expect("sig");
-    reset_to_commit(
-        &repo,
-        &ResetOptions::new(c1, ResetMode::Soft, sig.clone(), "reset: test"),
-        &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("reset");
+    repo.checkout()
+        .reset(
+            &ResetOptions::new(c1, ResetMode::Soft, sig.clone(), "reset: test"),
+            &mut grit_lib::progress::NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("reset");
     let log = std::fs::read_to_string(repo.git_dir().join("logs/HEAD")).expect("log");
     assert!(
         log.contains(&format!("{}", time.unix_timestamp())),
@@ -493,7 +547,7 @@ fn reset_reflog_identity_includes_signature_timestamp_and_git_reads_it() {
 #[test]
 fn append_reflog_rejects_malformed_identity() {
     let dir = TempDir::new().expect("tempdir");
-    let repo = Repository::init(
+    let (repo, _) = Repository::init(
         dir.path(),
         &InitOptions::new().with_initial_branch("main".to_owned()),
     )
@@ -501,18 +555,21 @@ fn append_reflog_rejects_malformed_identity() {
     let zero = ObjectId::zero();
     let tip = commit_file(&repo, "f.txt", "x\n", None);
     for bad in ["garbage", "Evil <a@b> 1 +0000\nfoo"] {
-        let err = refs::append_reflog(
-            repo.git_dir(),
-            "refs/heads/main",
-            &zero,
-            &tip,
-            bad,
-            "reset: test",
-            true,
-        )
-        .unwrap_err();
+        let err = repo
+            .reflogs()
+            .append(
+                "refs/heads/main",
+                &grit_lib::refs::reflog::ReflogEntry {
+                    old_oid: zero,
+                    new_oid: tip,
+                    identity: (bad).to_string(),
+                    message: ("reset: test").to_string(),
+                },
+                grit_lib::repo_handles::ReflogCreate::Always,
+            )
+            .unwrap_err();
         assert!(
-            matches!(err, Error::InvalidSignature(_)),
+            matches!(err, Error::Object(ObjectError::InvalidSignature(_))),
             "expected InvalidSignature for {bad:?}, got {err:?}"
         );
     }

@@ -20,11 +20,7 @@ use std::time::{Duration, Instant};
 
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::objects::odb::Odb;
-use grit_lib::porcelain::tag::{create_tag, CreateTagRequest};
-use grit_lib::progress::NeverCancel;
-use grit_lib::refs::resolve_ref;
-use grit_lib::remote::fetch::{fetch_remote, NoProgress};
-use grit_lib::remote::push::push_remote;
+use grit_lib::porcelain::tag::CreateTagRequest;
 use grit_lib::remote::transfer::{FetchOptions, PushOptions, PushRefSpec, TagMode, UpdateMode};
 use grit_lib::remote::transport::{ConnectOptions, GitDaemonTransport, Service, Transport};
 use grit_lib::repo::Repository;
@@ -159,29 +155,43 @@ fn fetch_over_git_daemon_lands_refs_and_objects() {
         main_oid.to_hex()
     );
 
-    let mut opts = FetchOptions {
-        refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()],
-        tags: TagMode::All,
-        ..Default::default()
-    };
-    let outcome = fetch_remote(
+    let mut opts = FetchOptions::new();
+    opts.refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()];
+    opts.tags = TagMode::All;
+    let outcome = grit_lib::repo::Repository::open(
         &local_git,
-        &mut *conn,
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&mut opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Connection(&mut *conn),
         &mut opts,
         &mut NoProgress,
-        &NeverCancel,
+        &CancelToken::never(),
     )
     .expect("fetch_remote over git daemon");
 
     // Tracking refs written.
-    let got_main = resolve_ref(&local_git, "refs/remotes/origin/main").expect("origin/main");
-    let got_topic = resolve_ref(&local_git, "refs/remotes/origin/topic").expect("origin/topic");
+    let got_main = grit_test_support::refs::at(&local_git)
+        .references()
+        .resolve("refs/remotes/origin/main")
+        .expect("origin/main");
+    let got_topic = grit_test_support::refs::at(&local_git)
+        .references()
+        .resolve("refs/remotes/origin/topic")
+        .expect("origin/topic");
     assert_eq!(got_main, main_oid, "origin/main oid mismatch vs source");
     assert_eq!(got_topic, topic_oid, "origin/topic oid mismatch vs source");
 
     // The annotated tag arrived (TagMode::All).
     let tag_oid = rev_parse(&source, "refs/tags/v1");
-    let got_tag = resolve_ref(&local_git, "refs/tags/v1").expect("tag v1 written");
+    let got_tag = grit_test_support::refs::at(&local_git)
+        .references()
+        .resolve("refs/tags/v1")
+        .expect("tag v1 written");
     assert_eq!(got_tag, tag_oid, "tag v1 oid mismatch vs source");
 
     // Objects landed in the local odb: tips and an interior commit.
@@ -301,28 +311,42 @@ fn fetch_following_lightweight_tag_at_branch_tip_downloads_branch() {
         }
     };
 
-    let mut opts = FetchOptions {
-        refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()],
-        tags: TagMode::Following,
-        ..Default::default()
-    };
-    fetch_remote(
+    let mut opts = FetchOptions::new();
+    opts.refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()];
+    opts.tags = TagMode::Following;
+    grit_lib::repo::Repository::open(
         &local_git,
-        &mut *conn,
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&mut opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Connection(&mut *conn),
         &mut opts,
         &mut NoProgress,
-        &NeverCancel,
+        &CancelToken::never(),
     )
     .expect("fetch with TagMode::Following");
 
-    let got_rel = resolve_ref(&local_git, "refs/remotes/origin/rel").expect("origin/rel");
+    let got_rel = grit_test_support::refs::at(&local_git)
+        .references()
+        .resolve("refs/remotes/origin/rel")
+        .expect("origin/rel");
     assert_eq!(got_rel, rel_oid);
     assert_eq!(
-        resolve_ref(&local_git, "refs/tags/light").expect("light tag"),
+        grit_test_support::refs::at(&local_git)
+            .references()
+            .resolve("refs/tags/light")
+            .expect("light tag"),
         light_oid
     );
     assert_eq!(
-        resolve_ref(&local_git, "refs/tags/rel-1.0").expect("annotated tag"),
+        grit_test_support::refs::at(&local_git)
+            .references()
+            .resolve("refs/tags/rel-1.0")
+            .expect("annotated tag"),
         rel10_oid
     );
 
@@ -390,17 +414,22 @@ fn fetch_remote_following_imports_annotated_tag_on_existing_tip() {
         }
     };
 
-    let mut opts = FetchOptions {
-        refspecs: vec!["+refs/heads/main:refs/remotes/origin/main".to_owned()],
-        tags: TagMode::Following,
-        ..Default::default()
-    };
-    fetch_remote(
+    let mut opts = FetchOptions::new();
+    opts.refspecs = vec!["+refs/heads/main:refs/remotes/origin/main".to_owned()];
+    opts.tags = TagMode::Following;
+    grit_lib::repo::Repository::open(
         &local_git,
-        &mut *conn,
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&mut opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Connection(&mut *conn),
         &mut opts,
         &mut NoProgress,
-        &NeverCancel,
+        &CancelToken::never(),
     )
     .expect("initial fetch");
 
@@ -412,12 +441,19 @@ fn fetch_remote_following_imports_annotated_tag_on_existing_tip() {
     let mut conn = transport
         .connect(&url, Service::UploadPack, &ConnectOptions::default())
         .expect("reconnect");
-    let outcome = fetch_remote(
+    let outcome = grit_lib::repo::Repository::open(
         &local_git,
-        &mut *conn,
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&mut opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Connection(&mut *conn),
         &mut opts,
         &mut NoProgress,
-        &NeverCancel,
+        &CancelToken::never(),
     )
     .expect("incremental fetch with new annotated tag");
 
@@ -430,7 +466,10 @@ fn fetch_remote_following_imports_annotated_tag_on_existing_tip() {
 
     let tag_oid = rev_parse(&source, "refs/tags/annotated-paired");
     assert_eq!(
-        resolve_ref(&local_git, "refs/tags/annotated-paired").expect("tag ref"),
+        grit_test_support::refs::at(&local_git)
+            .references()
+            .resolve("refs/tags/annotated-paired")
+            .expect("tag ref"),
         tag_oid
     );
     assert!(
@@ -491,25 +530,33 @@ fn push_annotated_tag_on_existing_commit_over_git_daemon() {
             return;
         }
     };
-    let mut fetch_opts = FetchOptions {
-        refspecs: vec!["+refs/heads/main:refs/remotes/origin/main".to_owned()],
-        tags: TagMode::None,
-        ..Default::default()
-    };
-    fetch_remote(
+    let mut fetch_opts = FetchOptions::new();
+    fetch_opts.refspecs = vec!["+refs/heads/main:refs/remotes/origin/main".to_owned()];
+    fetch_opts.tags = TagMode::None;
+    grit_lib::repo::Repository::open(
         &local_git,
-        &mut *conn,
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&mut fetch_opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Connection(&mut *conn),
         &mut fetch_opts,
         &mut NoProgress,
-        &NeverCancel,
+        &CancelToken::never(),
     )
     .expect("fetch main");
 
     let repo = Repository::open(&local_git, &RepositoryOptions::empty()).expect("open local repo");
-    let head = resolve_ref(&local_git, "refs/remotes/origin/main").expect("origin/main");
-    let tag_outcome = create_tag(
-        &repo,
-        &CreateTagRequest {
+    let head = grit_test_support::refs::at(&local_git)
+        .references()
+        .resolve("refs/remotes/origin/main")
+        .expect("origin/main");
+    let tag_outcome = repo
+        .tags()
+        .create(&CreateTagRequest {
             name: "v1-ann".to_owned(),
             target: head,
             message: Some("release".to_owned()),
@@ -519,9 +566,8 @@ fn push_annotated_tag_on_existing_commit_over_git_daemon() {
             tree_sha256: None,
             force: false,
             dry_run: false,
-        },
-    )
-    .expect("annotated tag");
+        })
+        .expect("annotated tag");
 
     match transport.connect(&url, Service::ReceivePack, &ConnectOptions::default()) {
         Ok(_) => {}
@@ -534,9 +580,14 @@ fn push_annotated_tag_on_existing_commit_over_git_daemon() {
     let mut conn = transport
         .connect(&url, Service::ReceivePack, &ConnectOptions::default())
         .expect("receive-pack connect");
-    push_remote(
+    grit_lib::repo::Repository::open(
         &local_git,
-        &mut *conn,
+        &grit_lib::config::environment::RepositoryOptions::empty(),
+    )
+    .expect("open push source")
+    .remotes()
+    .push_to(
+        grit_lib::remote::transfer::TransferEndpoint::Connection(&mut *conn),
         &[PushRefSpec {
             src: Some(tag_outcome.oid),
             src_ref: None,
@@ -549,12 +600,15 @@ fn push_annotated_tag_on_existing_commit_over_git_daemon() {
         }],
         &PushOptions::default(),
         &mut NoProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("push annotated tag");
 
     assert_eq!(
-        resolve_ref(&bare, "refs/tags/v1-ann").expect("tag ref on remote"),
+        grit_test_support::refs::at(&bare)
+            .references()
+            .resolve("refs/tags/v1-ann")
+            .expect("tag ref on remote"),
         tag_outcome.oid
     );
     let cat_type = git(&bare, &["cat-file", "-t", "v1-ann"]);
@@ -622,22 +676,30 @@ fn fetch_remote_dry_run_explicit_fast_forward_classifies_without_writing() {
             return;
         }
     };
-    let mut seed_opts = FetchOptions {
-        refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()],
-        tags: TagMode::None,
-        ..Default::default()
-    };
-    fetch_remote(
+    let mut seed_opts = FetchOptions::new();
+    seed_opts.refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()];
+    seed_opts.tags = TagMode::None;
+    grit_lib::repo::Repository::open(
         &local_git,
-        &mut *conn,
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&mut seed_opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Connection(&mut *conn),
         &mut seed_opts,
         &mut NoProgress,
-        &NeverCancel,
+        &CancelToken::never(),
     )
     .expect("seed fetch");
 
     git(&local, &["branch", "probe", &c1_oid.to_hex()]);
-    let probe_before = resolve_ref(&local_git, "refs/heads/probe").expect("probe");
+    let probe_before = grit_test_support::refs::at(&local_git)
+        .references()
+        .resolve("refs/heads/probe")
+        .expect("probe");
 
     std::fs::write(work.join("c.txt"), "three\n").unwrap();
     git(&work, &["add", "c.txt"]);
@@ -650,20 +712,25 @@ fn fetch_remote_dry_run_explicit_fast_forward_classifies_without_writing() {
     let mut conn = transport
         .connect(&url, Service::UploadPack, &ConnectOptions::default())
         .expect("reconnect");
-    let mut dry_run_opts = FetchOptions {
-        refspecs: vec!["refs/heads/main:refs/heads/probe".to_owned()],
-        configured_refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()],
-        remote_name: Some("origin".to_owned()),
-        dry_run: true,
-        tags: TagMode::None,
-        ..Default::default()
-    };
-    let outcome = fetch_remote(
+    let mut dry_run_opts = FetchOptions::new();
+    dry_run_opts.refspecs = vec!["refs/heads/main:refs/heads/probe".to_owned()];
+    dry_run_opts.configured_refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()];
+    dry_run_opts.remote_name = Some("origin".to_owned());
+    dry_run_opts.dry_run = true;
+    dry_run_opts.tags = TagMode::None;
+    let outcome = grit_lib::repo::Repository::open(
         &local_git,
-        &mut *conn,
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&mut dry_run_opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Connection(&mut *conn),
         &mut dry_run_opts,
         &mut NoProgress,
-        &NeverCancel,
+        &CancelToken::never(),
     )
     .expect("dry-run fetch");
 
@@ -679,7 +746,10 @@ fn fetch_remote_dry_run_explicit_fast_forward_classifies_without_writing() {
         outcome.updates
     );
     assert_eq!(
-        resolve_ref(&local_git, "refs/heads/probe").expect("probe after dry-run"),
+        grit_test_support::refs::at(&local_git)
+            .references()
+            .resolve("refs/heads/probe")
+            .expect("probe after dry-run"),
         probe_before
     );
 }

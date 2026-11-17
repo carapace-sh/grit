@@ -12,7 +12,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use grit_lib::config::environment::RepositoryOptions;
-use grit_lib::progress::NeverCancel;
+use grit_lib::progress::CancelToken;
 use grit_lib::remote::transfer::{FetchOptions, PushOptions, PushRefSpec, TagMode};
 use grit_lib::remote::Remote;
 use grit_lib::repo::Repository;
@@ -146,18 +146,16 @@ fn git_daemon_noop_fetch_and_push_send_flush_not_hangup() {
     .unwrap();
     let remote = Remote::from_url(&fixture.url).unwrap();
 
-    let fetch_opts = FetchOptions {
-        refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()],
-        tags: TagMode::Following,
-        ..Default::default()
-    };
+    let mut fetch_opts = FetchOptions::new();
+    fetch_opts.refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()];
+    fetch_opts.tags = TagMode::Following;
 
     let first = remote
         .fetch(
             &repo,
             fetch_opts.clone(),
             &mut grit_lib::remote::fetch::NoProgress,
-            &NeverCancel,
+            &CancelToken::never(),
             None,
         )
         .unwrap();
@@ -168,12 +166,12 @@ fn git_daemon_noop_fetch_and_push_send_flush_not_hangup() {
             &repo,
             fetch_opts,
             &mut grit_lib::remote::fetch::NoProgress,
-            &NeverCancel,
+            &CancelToken::never(),
             None,
         )
         .unwrap();
 
-    let main_tip = grit_lib::refs::resolve_ref(repo.git_dir(), "refs/heads/main").unwrap();
+    let main_tip = repo.references().resolve("refs/heads/main").unwrap();
     remote
         .push(
             &repo,
@@ -189,7 +187,7 @@ fn git_daemon_noop_fetch_and_push_send_flush_not_hangup() {
             }],
             PushOptions::default(),
             &mut grit_lib::remote::fetch::NoProgress,
-            &NeverCancel,
+            &CancelToken::never(),
             None,
         )
         .unwrap();

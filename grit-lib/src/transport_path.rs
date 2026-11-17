@@ -1,25 +1,26 @@
 //! Safety checks and path resolution for local transport URLs (matches Git `connect.c` / `path.c`).
 
+use crate::environment::Environment;
 use crate::git_path::CanonicalizeExt;
 use std::path::{Path, PathBuf};
 
 use thiserror::Error;
-use url::Url;
 
 use crate::error::Error;
+use crate::remote::RemoteError;
 
-/// Returns true when `s` is non-empty and begins with `-`, matching Git's
-/// `looks_like_command_line_option` (used before quoting a path for shell-backed transport).
-#[must_use]
-pub fn looks_like_command_line_option(s: &str) -> bool {
-    !s.is_empty() && s.starts_with('-')
+fn file_url_err(detail: impl Into<String>) -> Error {
+    Error::Remote(RemoteError::MalformedTransportUrl {
+        scheme: "file",
+        detail: detail.into(),
+    })
 }
 
 /// Repository root used to resolve relative `remote.<name>.url` values — the linked or main
 /// worktree directory when known, otherwise inferred from `git_dir` (including linked
 /// worktree admin dirs via `gitdir` / `commondir`).
 #[must_use]
-pub fn configured_remote_base(git_dir: &Path, work_tree: Option<&Path>) -> PathBuf {
+pub(crate) fn configured_remote_base(git_dir: &Path, work_tree: Option<&Path>) -> PathBuf {
     if let Some(wt) = work_tree {
         return wt.to_path_buf();
     }
@@ -41,7 +42,7 @@ pub fn configured_remote_base(git_dir: &Path, work_tree: Option<&Path>) -> PathB
 /// True when a clone source should be stored as an absolute filesystem path (scheme-less
 /// local paths only — not `file://`, HTTP, SSH, etc.).
 #[must_use]
-pub fn should_store_absolute_local_clone_url(url: &str) -> bool {
+pub(crate) fn should_store_absolute_local_clone_url(url: &str) -> bool {
     let url = url.trim();
     !url.starts_with("file://") && is_local_path_remote_url(url)
 }
@@ -49,7 +50,7 @@ pub fn should_store_absolute_local_clone_url(url: &str) -> bool {
 /// Git `url_is_local_not_ssh` (`connect.c`): local unless scp-style `host:path` with no directory
 /// separator before the first `:` (Windows drive letters and `\` separators included).
 #[must_use]
-pub fn url_is_local_not_ssh(url: &str) -> bool {
+pub(crate) fn url_is_local_not_ssh(url: &str) -> bool {
     let url = url.trim();
     let colon = url.find(':');
     match colon {
@@ -67,42 +68,48 @@ pub fn url_is_local_not_ssh(url: &str) -> bool {
 
 /// Strip the Windows verbatim `\\?\` prefix when present.
 #[must_use]
-pub fn strip_verbatim_path_prefix(path: &str) -> &str {
+pub(crate) fn strip_verbatim_path_prefix(path: &str) -> &str {
     path.strip_prefix(r"\\?\").unwrap_or(path)
 }
 
-/// Returns a copy of `url` with embedded username and password removed, safe for logs and errors.
+/// Returns the display form of a remote URL: `url` with any embedded username and password
+/// removed, safe for logs, errors and command output.
 ///
 /// Remote URLs may carry credentials in configuration or on the command line; user-facing output
-/// must never echo them. Well-formed `http(s)://`, `git://`, and `ssh://` URLs are parsed with
-/// the `url` crate (including percent-encoded userinfo). SCP-style `user:pass@host:path` strings
-/// and other non-URL forms fall back to Git-style scanning for the last `@` before the path.
+/// (human, JSON and Markdown alike) must never echo them. Use this for every copy of a remote
+/// address that is shown, and keep the original for transport and configuration.
+///
+/// Only the userinfo is removed: everything else is returned byte for byte (surrounding
+/// whitespace aside), so host case, ports, paths and percent-encoding are never rewritten. Local
+/// paths (see [`url_is_local_not_ssh`]) and addresses without an `@` are returned unchanged. For
+/// `scheme://` URLs the userinfo ends at the last `@` before the path, so an unescaped `@` in a
+/// password is removed too; SCP-style `user@host:path` drops everything up to that `@`.
 #[must_use]
 pub fn redact_url_for_display(url: &str) -> String {
     let trimmed = url.trim();
-    if trimmed.is_empty() {
-        return String::new();
+    if !trimmed.contains('@') || url_is_local_not_ssh(trimmed) {
+        return trimmed.to_owned();
     }
-    if let Ok(mut parsed) = Url::parse(trimmed) {
-        let scheme = parsed.scheme();
-        if matches!(scheme, "http" | "https" | "git" | "ssh" | "file" | "ftp")
-            && parsed.has_authority()
-        {
-            let _ = parsed.set_username("");
-            let _ = parsed.set_password(None);
-            return parsed.to_string();
-        }
-    }
-    redact_userinfo_fallback(trimmed)
-}
-
-fn redact_userinfo_fallback(url: &str) -> String {
-    if let Some((scheme, rest)) = url.split_once("://") {
+    if let Some((scheme, rest)) = trimmed.split_once("://") {
         let host_start = userinfo_host_start(rest);
         return format!("{scheme}://{}", &rest[host_start..]);
     }
-    let host_start = userinfo_host_start(url);
-    url[host_start..].to_string()
+    let host_start = scp_host_start(trimmed);
+    trimmed[host_start..].to_owned()
+}
+
+/// Index where `host:path` begins in an SCP-style address: just past the last `@` that is
+/// followed by a `host:` (a `:` with no `/` before it). An `@` inside the path is not userinfo.
+fn scp_host_start(url: &str) -> usize {
+    url.match_indices('@')
+        .rev()
+        .map(|(at, _)| at + 1)
+        .find(|&start| {
+            let rest = &url[start..];
+            rest.find(':')
+                .is_some_and(|colon| !rest[..colon].contains('/'))
+        })
+        .unwrap_or(0)
 }
 
 /// Index in `authority_or_url` where the host begins after optional `user:pass@` userinfo.
@@ -125,7 +132,7 @@ fn userinfo_host_start(authority_or_url: &str) -> usize {
 
 /// Normalize a local path for storage in `remote.*.url` (Git-style forward slashes, no `\\?\`).
 #[must_use]
-pub fn normalize_local_path_for_config(path: &Path) -> String {
+pub(crate) fn normalize_local_path_for_config(path: &Path) -> String {
     let lossy = path.to_string_lossy();
     let stripped = strip_verbatim_path_prefix(&lossy);
     #[cfg(windows)]
@@ -138,45 +145,83 @@ pub fn normalize_local_path_for_config(path: &Path) -> String {
     }
 }
 
-/// Absolute form of a local clone source path, matching Git's `absolute_pathdup`: prepend the
-/// current directory when relative, but leave `.`/`..`/`./` components untouched (no
-/// normalization). The parent of `source_path` is canonicalized when possible (Git resolves
-/// the cwd via `getcwd`).
+/// Absolute form of a local clone source path, matching Git's `absolute_pathdup` /
+/// `strbuf_add_absolute_path`: prepend the logical cwd when relative, but leave `.`/`..`
+/// components untouched (no lexical collapse, no realpath of the source).
 #[must_use]
-pub fn absolute_local_clone_source_url(source_path: &Path) -> String {
-    absolute_local_clone_source_url_from(source_path, &crate::environment::Environment::empty().cwd)
-}
-
-/// [`absolute_local_clone_source_url`] with a relative `source_path` taken from `cwd`.
-fn absolute_local_clone_source_url_from(source_path: &Path, cwd: &Path) -> String {
+pub(crate) fn absolute_local_clone_source_url(source_path: &Path, env: &Environment) -> String {
     let absolute = if source_path.is_absolute() {
         source_path.to_path_buf()
     } else {
-        let cwd = cwd
-            .canonicalize_simplified()
-            .unwrap_or_else(|_| cwd.to_path_buf());
-        cwd.join(source_path)
+        clone_absolute_path_prefix(env).join(source_path)
     };
     normalize_local_path_for_config(&absolute)
+}
+
+/// Working-directory prefix for [`absolute_local_clone_source_url`] (Git `strbuf_add_absolute_path`).
+fn clone_absolute_path_prefix(env: &Environment) -> PathBuf {
+    let cwd = clone_prefix_cwd(env);
+    if let Some(pwd) = env.pwd.as_deref() {
+        let pwd_path = Path::new(pwd);
+        if pwd_path.is_absolute()
+            && paths_differ(&cwd, pwd_path)
+            && paths_refer_to_same_directory(&cwd, pwd_path)
+        {
+            return pwd_path.to_path_buf();
+        }
+    }
+    cwd
+}
+
+/// Cwd string for config storage: logical absolute [`Environment::cwd`] when set, otherwise discovery resolution.
+fn clone_prefix_cwd(env: &Environment) -> PathBuf {
+    if env.cwd.is_absolute() {
+        env.cwd.clone()
+    } else {
+        env.discovery_cwd()
+    }
+}
+
+fn paths_differ(a: &Path, b: &Path) -> bool {
+    a.as_os_str() != b.as_os_str()
+}
+
+#[cfg(unix)]
+fn paths_refer_to_same_directory(cwd: &Path, pwd: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(cwd_meta) = cwd.metadata() else {
+        return false;
+    };
+    let Ok(pwd_meta) = pwd.metadata() else {
+        return false;
+    };
+    (cwd_meta.dev() != 0 || cwd_meta.ino() != 0)
+        && cwd_meta.dev() == pwd_meta.dev()
+        && cwd_meta.ino() == pwd_meta.ino()
+}
+
+#[cfg(not(unix))]
+fn paths_refer_to_same_directory(cwd: &Path, pwd: &Path) -> bool {
+    let _ = (cwd, pwd);
+    false
 }
 
 /// Decode a `file://` remote URL into a local filesystem path (percent-decoding and `/C:/` → `C:/`).
 ///
 /// # Errors
 ///
-/// Returns [`Error::Message`] when a `%` escape is truncated or invalid.
-pub fn file_url_to_local_path(url: &str) -> Result<String, Error> {
+/// Returns [`RemoteError::MalformedTransportUrl`] when a `%` escape is truncated or invalid.
+pub(crate) fn file_url_to_local_path(url: &str) -> Result<String, Error> {
     let trimmed = url.trim();
     let mut path_part = trimmed
         .strip_prefix("file://")
-        .ok_or_else(|| Error::Message("not a file:// URL".to_owned()))?;
+        .ok_or_else(|| file_url_err("not a file:// URL"))?;
     if path_part.starts_with("localhost") {
         path_part = &path_part["localhost".len()..];
     }
     let decoded = percent_decode_path(path_part)?;
-    let decoded = String::from_utf8(decoded).map_err(|_| {
-        Error::Message("file URL path is not valid UTF-8 after decoding".to_owned())
-    })?;
+    let decoded = String::from_utf8(decoded)
+        .map_err(|_| file_url_err("file URL path is not valid UTF-8 after decoding"))?;
     Ok(dos_file_url_path_to_local(&decoded))
 }
 
@@ -205,16 +250,16 @@ fn percent_decode_path(path: &str) -> Result<Vec<u8>, Error> {
         if bytes[i] == b'%' {
             let h1 = bytes
                 .get(i + 1)
-                .ok_or_else(|| Error::Message("bad % escape in file URL".to_owned()))?;
+                .ok_or_else(|| file_url_err("bad % escape in file URL"))?;
             let h2 = bytes
                 .get(i + 2)
-                .ok_or_else(|| Error::Message("bad % escape in file URL".to_owned()))?;
+                .ok_or_else(|| file_url_err("bad % escape in file URL"))?;
             let byte = u8::from_str_radix(
                 std::str::from_utf8(&[*h1, *h2])
-                    .map_err(|_| Error::Message("bad % escape in file URL".to_owned()))?,
+                    .map_err(|_| file_url_err("bad % escape in file URL"))?,
                 16,
             )
-            .map_err(|_| Error::Message("bad % escape in file URL".to_owned()))?;
+            .map_err(|_| file_url_err("bad % escape in file URL"))?;
             out.push(byte);
             i += 3;
         } else {
@@ -235,9 +280,29 @@ fn local_path_from_remote_url(url: &str) -> Result<PathBuf, Error> {
     Ok(PathBuf::from(path_str))
 }
 
+/// Filesystem path for a local clone or fetch source, with relative paths resolved from
+/// `discovery_cwd` (the caller's working directory before a clone destination exists).
+///
+/// # Errors
+///
+/// Returns [`RemoteError::MalformedTransportUrl`] when a `file://` URL is malformed.
+pub(crate) fn resolve_local_clone_source_path(
+    url: &str,
+    discovery_cwd: &Path,
+) -> Result<PathBuf, Error> {
+    let mut remote_path = local_path_from_remote_url(url.trim())?;
+    if remote_path.is_relative() {
+        let base = discovery_cwd
+            .canonicalize_simplified()
+            .unwrap_or_else(|_| discovery_cwd.to_path_buf());
+        remote_path = base.join(remote_path);
+    }
+    Ok(remote_path)
+}
+
 /// True when `url` names a local filesystem remote (not `http(s)://`, `git://`, `ssh`, or `ext::`).
 #[must_use]
-pub fn is_local_path_remote_url(url: &str) -> bool {
+pub(crate) fn is_local_path_remote_url(url: &str) -> bool {
     let url = url.trim();
     !(url.starts_with("git://")
         || url.starts_with("http://")
@@ -317,7 +382,7 @@ fn bytes_have_dir_sep(bytes: &[u8]) -> bool {
 ///
 /// Note: callers handle the `--mirror` exception (bare clone without a `.git` directory suffix)
 /// by passing `is_bare = false`, matching Git's `option_bare && !option_mirror` logic.
-pub fn git_url_basename(
+pub(crate) fn git_url_basename(
     repo: &str,
     is_bundle: bool,
     is_bare: bool,
@@ -632,13 +697,101 @@ mod tests {
         let base = std::env::temp_dir().join(format!("grit-abs-clone-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).expect("temp base");
-        // Not `set_current_dir`: that would move every test running in this process.
-        let stored = absolute_local_clone_source_url_from(Path::new("./nested/../peer"), &base);
+        let mut env = crate::environment::Environment::empty();
+        env.cwd = base.clone();
+        let stored = absolute_local_clone_source_url(Path::new("./nested/../peer"), &env);
         let _ = std::fs::remove_dir_all(&base);
         assert!(
-            stored.contains("nested/../peer") || stored.ends_with("peer"),
+            stored.contains("nested/../peer"),
             "expected dot components preserved, got {stored}"
         );
+    }
+
+    #[test]
+    fn absolute_local_clone_source_url_matches_git_prefix_for_relative_source() {
+        let base = std::env::temp_dir().join(format!("grit-abs-git-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let src = base.join("t/src");
+        let sub = base.join("t/sub");
+        std::fs::create_dir_all(&src).expect("mkdir src");
+        std::fs::create_dir_all(&sub).expect("mkdir sub");
+        std::process::Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .arg(&src)
+            .status()
+            .expect("git init src");
+        std::process::Command::new("git")
+            .current_dir(&src)
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t.test",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "seed",
+            ])
+            .status()
+            .expect("git commit");
+        let mut env = crate::environment::Environment::empty();
+        env.cwd = sub.clone();
+        let grit_stored = absolute_local_clone_source_url(Path::new("../src"), &env);
+        let git_stored = std::process::Command::new("git")
+            .current_dir(&sub)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t.test", "clone"])
+            .arg("../src")
+            .arg(base.join("git-clone"))
+            .output()
+            .expect("git clone");
+        assert!(
+            git_stored.status.success(),
+            "git clone failed: {}",
+            String::from_utf8_lossy(&git_stored.stderr)
+        );
+        let git_url = std::process::Command::new("git")
+            .args([
+                "-C",
+                base.join("git-clone").to_str().expect("utf8"),
+                "config",
+                "--get",
+                "remote.origin.url",
+            ])
+            .output()
+            .expect("git config");
+        assert!(git_url.status.success());
+        let git_url = String::from_utf8_lossy(&git_url.stdout).trim().to_owned();
+        assert_eq!(grit_stored, git_url, "stored URL should match git clone");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn absolute_local_clone_source_url_prefers_pwd_when_same_directory() {
+        use std::os::unix::fs::symlink;
+
+        let base = std::env::temp_dir().join(format!("grit-abs-pwd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let physical = base.join("physical");
+        let logical = base.join("logical");
+        std::fs::create_dir_all(&physical).expect("physical");
+        symlink(&physical, &logical).expect("symlink");
+        let sub = physical.join("t/sub");
+        std::fs::create_dir_all(&sub).expect("subdir");
+        let logical_sub = logical.join("t/sub");
+        let mut env = crate::environment::Environment::empty();
+        env.cwd = sub.canonicalize_simplified().unwrap_or(sub.clone());
+        env.pwd = Some(logical_sub.to_string_lossy().into_owned());
+        let stored = absolute_local_clone_source_url(Path::new("../src"), &env);
+        assert!(
+            stored.starts_with(logical_sub.to_str().expect("utf8")),
+            "PWD prefix should be logical path, got {stored}"
+        );
+        assert!(
+            stored.contains("/../src"),
+            "relative tail should be preserved, got {stored}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[cfg(unix)]
@@ -654,7 +807,9 @@ mod tests {
         let link = base.join("link-src");
         symlink(&real, &link).expect("symlink");
 
-        let stored = absolute_local_clone_source_url(&link);
+        let mut env = crate::environment::Environment::empty();
+        env.cwd = base.clone();
+        let stored = absolute_local_clone_source_url(&link, &env);
         let _ = std::fs::remove_dir_all(&base);
 
         assert_eq!(stored, normalize_local_path_for_config(&link));
@@ -714,5 +869,49 @@ mod tests {
             redact_url_for_display("https://host.example/foo@bar.git"),
             "https://host.example/foo@bar.git"
         );
+        assert_eq!(
+            redact_url_for_display("file:///srv/me@work/repo.git"),
+            "file:///srv/me@work/repo.git"
+        );
+        assert_eq!(
+            redact_url_for_display("git@host.example:org/repo@v1.git"),
+            "host.example:org/repo@v1.git"
+        );
+        assert_eq!(
+            redact_url_for_display("host.example:org/repo@v1.git"),
+            "host.example:org/repo@v1.git"
+        );
+    }
+
+    #[test]
+    fn redact_url_for_display_never_rewrites_credential_free_urls() {
+        for url in [
+            "http://127.0.0.1:9419/auth.git",
+            "HTTP://Host.Example:80/a%20b/Repo.git",
+            "https://host.example:443/r.git?x=1#frag",
+            "ssh://host.example:2222/~/repo.git",
+            "git://[::1]/repo",
+            "host.example:repo.git",
+            "origin",
+            "",
+        ] {
+            assert_eq!(redact_url_for_display(url), url);
+        }
+        assert_eq!(
+            redact_url_for_display("HTTP://u:p@Host.Example:80/a%20b/Repo.git"),
+            "HTTP://Host.Example:80/a%20b/Repo.git"
+        );
+    }
+
+    #[test]
+    fn redact_url_for_display_leaves_local_paths_alone() {
+        for path in [
+            "/tmp/alice@laptop/repo.git",
+            "../me@there/repo",
+            "me@there",
+            "./a:b@c",
+        ] {
+            assert_eq!(redact_url_for_display(path), path);
+        }
     }
 }

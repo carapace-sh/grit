@@ -8,6 +8,7 @@
 //!
 //! See `Documentation/gitprotocol-v2.txt` and `serve.c` / `connect.c` / `fetch-pack.c` in Git.
 
+#[cfg(any(test, feature = "test-support"))]
 use std::collections::HashSet;
 
 /// A section header in a protocol-v2 `command=fetch` response.
@@ -47,6 +48,7 @@ impl FetchResponseSection {
 ///
 /// Matches gitprotocol-v2 (and upstream `upload-pack.c` after shallow/wanted-ref order was fixed).
 /// Returns true when `shallow-info` appears before `wanted-refs` in a fetch response prelude.
+#[cfg(any(test, feature = "test-support"))]
 #[must_use]
 pub fn fetch_prelude_shallow_before_wanted_refs(section_headers: &[&str]) -> bool {
     let shallow = section_headers
@@ -62,7 +64,8 @@ pub fn fetch_prelude_shallow_before_wanted_refs(section_headers: &[&str]) -> boo
 }
 
 /// `FETCH_RESPONSE_SECTION_ORDER` constant.
-pub const FETCH_RESPONSE_SECTION_ORDER: &[FetchResponseSection] = &[
+#[allow(dead_code)]
+pub(crate) const FETCH_RESPONSE_SECTION_ORDER: &[FetchResponseSection] = &[
     FetchResponseSection::Acknowledgments,
     FetchResponseSection::ShallowInfo,
     FetchResponseSection::WantedRefs,
@@ -74,7 +77,7 @@ pub const FETCH_RESPONSE_SECTION_ORDER: &[FetchResponseSection] = &[
 ///
 /// Advertised either bare (`bundle-uri`) or with a value (`bundle-uri=...`).
 #[must_use]
-pub fn server_advertises_bundle_uri(caps: &[String]) -> bool {
+pub(crate) fn server_advertises_bundle_uri(caps: &[String]) -> bool {
     caps.iter()
         .any(|c| c == "bundle-uri" || c.starts_with("bundle-uri="))
 }
@@ -99,7 +102,7 @@ pub(crate) fn server_advertises_ls_refs_unborn(caps: &[String]) -> bool {
 /// verbatim and `object-format=<hash>` is re-emitted. Other advertised capabilities are not
 /// echoed in the per-command capability list.
 #[must_use]
-pub fn cap_lines_for_command_request(caps: &[String]) -> Vec<String> {
+pub(crate) fn cap_lines_for_command_request(caps: &[String]) -> Vec<String> {
     let mut out = Vec::new();
     for line in caps {
         if line.starts_with("agent=") {
@@ -114,6 +117,7 @@ pub fn cap_lines_for_command_request(caps: &[String]) -> Vec<String> {
 /// Collect the space-separated feature tokens advertised by the server's v2 `fetch=` capability.
 ///
 /// Returns an empty set when the server advertises no `fetch=` capability.
+#[cfg(any(test, feature = "test-support"))]
 #[must_use]
 pub fn fetch_features(caps: &[String]) -> HashSet<String> {
     let mut features = HashSet::new();
@@ -129,7 +133,7 @@ pub fn fetch_features(caps: &[String]) -> HashSet<String> {
 
 /// True when the server's v2 `fetch=` capability lists `<feature>`.
 #[must_use]
-pub fn fetch_supports_feature(caps: &[String], feature: &str) -> bool {
+pub(crate) fn fetch_supports_feature(caps: &[String], feature: &str) -> bool {
     caps.iter().any(|c| {
         c.strip_prefix("fetch=")
             .is_some_and(|rest| rest.split_whitespace().any(|w| w == feature))
@@ -138,14 +142,15 @@ pub fn fetch_supports_feature(caps: &[String], feature: &str) -> bool {
 
 /// True when the server's `fetch=` capability advertises `sideband-all`.
 #[must_use]
-pub fn fetch_supports_sideband_all(caps: &[String]) -> bool {
+pub(crate) fn fetch_supports_sideband_all(caps: &[String]) -> bool {
     fetch_supports_feature(caps, "sideband-all")
 }
 
 /// True when the server's v2 `fetch=` capability advertises `ref-in-want` (so the client may send
 /// `want-ref <name>` lines instead of resolving named refspecs to OIDs itself).
 #[must_use]
-pub fn fetch_supports_ref_in_want(caps: &[String]) -> bool {
+#[allow(dead_code)]
+pub(crate) fn fetch_supports_ref_in_want(caps: &[String]) -> bool {
     fetch_supports_feature(caps, "ref-in-want")
 }
 
@@ -157,7 +162,7 @@ pub fn fetch_supports_ref_in_want(caps: &[String]) -> bool {
 /// not advertise it, so the client must silently drop the filter and fetch unfiltered rather than
 /// send a line the server rejects with "unexpected line".
 #[must_use]
-pub fn fetch_supports_filter(caps: &[String]) -> bool {
+pub(crate) fn fetch_supports_filter(caps: &[String]) -> bool {
     fetch_supports_feature(caps, "filter")
 }
 
@@ -176,7 +181,7 @@ pub const PROMISOR_REMOTE_CAPABILITY: &str = "promisor-remote";
 ///
 /// The text after `promisor-remote=`, or `None` when the capability is absent.
 #[must_use]
-pub fn server_promisor_remote_info(caps: &[String]) -> Option<&str> {
+pub(crate) fn server_promisor_remote_info(caps: &[String]) -> Option<&str> {
     caps.iter().find_map(|c| {
         c.strip_prefix(PROMISOR_REMOTE_CAPABILITY)
             .and_then(|rest| rest.strip_prefix('='))

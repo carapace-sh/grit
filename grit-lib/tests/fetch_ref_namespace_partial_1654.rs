@@ -7,8 +7,7 @@ use std::fs;
 use std::path::Path;
 
 use grit_lib::objects::ObjectId;
-use grit_lib::refs::resolve_ref;
-use grit_lib::remote::transfer::{fetch_local, FetchOptions, TagMode, UpdateMode};
+use grit_lib::remote::transfer::{FetchOptions, TagMode, UpdateMode};
 use grit_test_support::git;
 
 fn init_bare_with_branches(tmp: &Path) -> (std::path::PathBuf, ObjectId) {
@@ -43,16 +42,31 @@ fn fetch_applies_other_refs_when_stale_nested_ref_blocks_without_prune() {
     git(&clone, &["remote", "add", "origin", bare.to_str().unwrap()]);
     let clone_git = clone.join(".git");
 
-    let first_opts = FetchOptions {
-        refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()],
-        remote_name: Some("origin".to_owned()),
-        tags: TagMode::None,
-        ..Default::default()
-    };
-    fetch_local(&clone_git, &bare, &first_opts).expect("initial fetch");
+    let mut first_opts = FetchOptions::new();
+    first_opts.refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()];
+    first_opts.remote_name = Some("origin".to_owned());
+    first_opts.tags = TagMode::None;
+    grit_lib::repo::Repository::open(
+        &clone_git,
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&first_opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Local(&bare),
+        &mut first_opts.clone(),
+        &mut grit_lib::remote::fetch::NoProgress,
+        grit_lib::progress::CancelToken::never_ref(),
+    )
+    .expect("initial fetch");
 
     assert!(
-        resolve_ref(&clone_git, "refs/remotes/origin/gone/x").is_ok(),
+        grit_test_support::refs::at(&clone_git)
+            .references()
+            .resolve("refs/remotes/origin/gone/x")
+            .is_ok(),
         "stale nested tracking ref should exist after first fetch"
     );
 
@@ -71,17 +85,37 @@ fn fetch_applies_other_refs_when_stale_nested_ref_blocks_without_prune() {
     git(&work, &["commit", "-q", "-m", "other"]);
     git(&work, &["push", "-q", "origin", "other"]);
 
-    let outcome = fetch_local(&clone_git, &bare, &first_opts).expect("fetch without prune");
+    let outcome = grit_lib::repo::Repository::open(
+        &clone_git,
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&first_opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Local(&bare),
+        &mut first_opts.clone(),
+        &mut grit_lib::remote::fetch::NoProgress,
+        grit_lib::progress::CancelToken::never_ref(),
+    )
+    .expect("fetch without prune");
     assert!(
         outcome.has_rejections(),
         "namespace conflict must be reported as rejection, not hard error"
     );
     assert!(
-        resolve_ref(&clone_git, "refs/remotes/origin/other").is_ok(),
+        grit_test_support::refs::at(&clone_git)
+            .references()
+            .resolve("refs/remotes/origin/other")
+            .is_ok(),
         "origin/other must be created despite gone conflict"
     );
     assert!(
-        resolve_ref(&clone_git, "refs/remotes/origin/gone").is_err(),
+        grit_test_support::refs::at(&clone_git)
+            .references()
+            .resolve("refs/remotes/origin/gone")
+            .is_err(),
         "origin/gone must not be created while gone/x remains"
     );
 
@@ -108,7 +142,10 @@ fn fetch_applies_other_refs_when_stale_nested_ref_blocks_without_prune() {
     git(&git_clone, &["clone", "-q", bare.to_str().unwrap(), "."]);
     git(&git_clone, &["fetch", "origin"]);
     assert!(
-        resolve_ref(&git_clone.join(".git"), "refs/remotes/origin/other").is_ok(),
+        grit_test_support::refs::at(&git_clone.join(".git"))
+            .references()
+            .resolve("refs/remotes/origin/other")
+            .is_ok(),
         "system git fetch should also create origin/other"
     );
 }
@@ -123,13 +160,25 @@ fn fetch_with_prune_resolves_namespace_conflict() {
     git(&clone, &["remote", "add", "origin", bare.to_str().unwrap()]);
     let clone_git = clone.join(".git");
 
-    let opts = FetchOptions {
-        refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()],
-        remote_name: Some("origin".to_owned()),
-        tags: TagMode::None,
-        ..Default::default()
-    };
-    fetch_local(&clone_git, &bare, &opts).expect("initial fetch");
+    let mut opts = FetchOptions::new();
+    opts.refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()];
+    opts.remote_name = Some("origin".to_owned());
+    opts.tags = TagMode::None;
+    grit_lib::repo::Repository::open(
+        &clone_git,
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Local(&bare),
+        &mut opts.clone(),
+        &mut grit_lib::remote::fetch::NoProgress,
+        grit_lib::progress::CancelToken::never_ref(),
+    )
+    .expect("initial fetch");
 
     let work = tmp.path().join("reshape");
     fs::create_dir_all(&work).unwrap();
@@ -141,16 +190,34 @@ fn fetch_with_prune_resolves_namespace_conflict() {
     git(&work, &["commit", "-q", "-m", "gone"]);
     git(&work, &["push", "-q", "origin", "gone"]);
 
-    let pruned = FetchOptions {
-        prune: true,
-        ..opts
-    };
-    let outcome = fetch_local(&clone_git, &bare, &pruned).expect("fetch with prune");
+    let mut pruned = FetchOptions::new();
+    pruned.prune = true;
+    let outcome = grit_lib::repo::Repository::open(
+        &clone_git,
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&pruned).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Local(&bare),
+        &mut pruned.clone(),
+        &mut grit_lib::remote::fetch::NoProgress,
+        grit_lib::progress::CancelToken::never_ref(),
+    )
+    .expect("fetch with prune");
     assert!(
         !outcome.has_rejections(),
         "prune should remove stale gone/x so gone can be created: {:?}",
         outcome.updates
     );
-    assert!(resolve_ref(&clone_git, "refs/remotes/origin/gone").is_ok());
-    assert!(resolve_ref(&clone_git, "refs/remotes/origin/gone/x").is_err());
+    assert!(grit_test_support::refs::at(&clone_git)
+        .references()
+        .resolve("refs/remotes/origin/gone")
+        .is_ok());
+    assert!(grit_test_support::refs::at(&clone_git)
+        .references()
+        .resolve("refs/remotes/origin/gone/x")
+        .is_err());
 }

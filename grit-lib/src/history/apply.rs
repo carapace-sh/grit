@@ -1,25 +1,33 @@
 //! Apply a [`RewritePlan`] atomically: refs, then index and worktree.
 
+use crate::error::ErrorSummary;
+use crate::error::RefError;
+use crate::worktree::WorktreeError;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::config::ConfigSet;
 use crate::diff::{mode_from_metadata, DiffEntry, DiffStatus};
 use crate::hooks::{run_post_checkout, run_post_rewrite, HookName, RewriteKind};
 use crate::index::MODE_REGULAR;
 use crate::lockfile::LockWait;
+use crate::notes::{
+    apply_prepared_notes_rewrite, prepare_notes_for_rewrite, NotesRewriteCommand, NotesRewritePlan,
+};
 use crate::objects::ObjectId;
 use crate::objects::ObjectKind;
 use crate::porcelain::checkout::{
-    materialize_gitlink_worktree, write_blob_to_worktree, LeadingDirCache,
+    materialize_gitlink_worktree, restore_checkout_rollback_paths, write_blob_to_worktree,
+    CheckoutRollbackRestore, LeadingDirCache,
 };
 use crate::porcelain::switch::{
-    checkout_tree_transition_allow_local, checkout_tree_transition_allow_local_with_preserved,
-    prepare_tree_transition_allow_local, verify_tree_transition_allow_local,
-    TreeTransitionPrepareError, TreeTransitionVerifyError,
+    checkout_tree_transition_allow_local_with_preserved, prepare_tree_transition_allow_local,
+    verify_tree_transition_allow_local, TreeTransitionPrepareError, TreeTransitionVerifyError,
 };
 use crate::porcelain::worktree_guard::prepare_tree_checkout;
+use crate::progress::{poll_cancel, CancelToken, NullProgress, ProgressSink};
 use crate::refs::prepare_with_lock_wait;
 use crate::refs::read_symbolic_ref_for_repository;
 use crate::refs::ref_update_flags;
@@ -35,7 +43,7 @@ use crate::worktree_rules::WorktreeRules;
 use similar::{capture_diff_slices, Algorithm, DiffTag};
 
 use super::absorb::{remaining_index_blob_for_path, staged_absorb_paths, AbsorbPlan};
-use super::error::HistoryError;
+use super::error::{worktree_apply_engine, worktree_apply_str, HistoryError};
 use super::last::{write_history_last, HistoryLastRecord};
 use super::types::{AppliedRewrite, ApplyOptions, PlannedRefUpdate, RewritePlan};
 use super::undo_work::{
@@ -48,7 +56,7 @@ fn maybe_record_history_last(
     opts: &ApplyOptions,
     plan: &RewritePlan,
     work: Option<&UndoWork>,
-) -> Result<(), HistoryError> {
+) -> crate::error::Result<()> {
     let Some(operation) = opts.record_operation.as_deref() else {
         return Ok(());
     };
@@ -66,7 +74,8 @@ fn complete_applied_rewrite(
     index_snapshot: Option<&IndexSnapshot>,
     worktree_snapshot: Option<&HashMap<String, WorktreePathSnapshot>>,
     work: Option<&UndoWork>,
-) -> Result<AppliedRewrite, HistoryError> {
+    notes_rewrite: Option<&NotesRewritePlan>,
+) -> crate::error::Result<AppliedRewrite> {
     if let Err(record_err) = maybe_record_history_last(repo, opts, plan, work) {
         if opts.record_operation.is_some() {
             if !plan.ref_updates.is_empty() {
@@ -82,6 +91,9 @@ fn complete_applied_rewrite(
             }
         }
         return Err(record_err);
+    }
+    if let Some(notes_plan) = notes_rewrite {
+        apply_prepared_notes_rewrite(repo, notes_plan, &plan.rewritten_pairs())?;
     }
     let hooks_run = if opts.hooks.enabled() {
         run_rewrite_hooks(repo, plan)
@@ -244,16 +256,14 @@ pub(crate) fn apply_index_to_worktree_delta(
     join_blob_lines(&out)
 }
 
-/// Apply an absorb [`AbsorbPlan`] and leave unassigned hunks staged.
-///
-/// # Errors
-///
-/// Same as [`apply_fixup_rewrite`].
-pub fn apply_absorb_rewrite(
+/// Apply an absorb [`AbsorbPlan`] and leave unassigned hunks staged; see
+/// [`History::apply_absorb`](super::History::apply_absorb).
+pub(crate) fn apply_absorb_rewrite(
     repo: &Repository,
     absorb: &AbsorbPlan,
     opts: &ApplyOptions,
-) -> Result<AppliedRewrite, HistoryError> {
+    cancel: &CancelToken,
+) -> crate::error::Result<AppliedRewrite> {
     let staged_paths = staged_absorb_paths(repo)?;
     let prestate = if !repo.is_bare() && !staged_paths.is_empty() {
         Some(FixupApplyPrestate::capture(repo, &staged_paths)?)
@@ -268,6 +278,7 @@ pub fn apply_absorb_rewrite(
         &staged_paths,
         prestate.as_ref(),
         consumed,
+        cancel,
     )
     .or_else(|err| {
         if let Some(pre) = prestate {
@@ -282,7 +293,7 @@ fn consumed_states_for_undo(
     repo: &Repository,
     opts: &ApplyOptions,
     paths: &[String],
-) -> Result<Option<Vec<PathState>>, HistoryError> {
+) -> crate::error::Result<Option<Vec<PathState>>> {
     if opts.record_operation.is_none() {
         return Ok(None);
     }
@@ -292,7 +303,7 @@ fn consumed_states_for_undo(
 fn undo_work_after_command(
     repo: &Repository,
     consumed: Option<Vec<PathState>>,
-) -> Result<Option<UndoWork>, HistoryError> {
+) -> crate::error::Result<Option<UndoWork>> {
     consumed
         .map(|states| UndoWork::after_command(repo, states))
         .transpose()
@@ -305,7 +316,8 @@ fn apply_absorb_refs_and_worktree(
     staged_paths: &[String],
     prestate: Option<&FixupApplyPrestate>,
     consumed: Option<Vec<PathState>>,
-) -> Result<AppliedRewrite, HistoryError> {
+    cancel: &CancelToken,
+) -> crate::error::Result<AppliedRewrite> {
     let plan = &absorb.plan;
     let (old_tree, new_tree) = head_tree_transition(plan);
     let needs_worktree = !repo.is_bare() && head_tree_changes(&old_tree, &new_tree);
@@ -319,10 +331,11 @@ fn apply_absorb_refs_and_worktree(
         plan,
         opts,
         rewrite_journal::RewriteApplyKind::Absorb,
-        |repo, old_tree, new_tree| {
-            let old_head_commit = old_head_commit.ok_or_else(|| HistoryError::WorktreeApply {
-                message: "missing old HEAD commit for absorb apply".into(),
-            })?;
+        &mut NullProgress,
+        cancel,
+        |repo, old_tree, new_tree, progress, apply_cancel| {
+            let old_head_commit = old_head_commit
+                .ok_or_else(|| worktree_apply_str("missing old HEAD commit for absorb apply"))?;
             apply_absorb_worktree_after_refs(
                 repo,
                 old_tree,
@@ -331,6 +344,8 @@ fn apply_absorb_refs_and_worktree(
                 absorb,
                 staged_paths,
                 prestate,
+                progress,
+                apply_cancel,
             )?;
             undo_work_after_command(repo, consumed)
         },
@@ -342,6 +357,7 @@ fn apply_absorb_refs_and_worktree(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_absorb_worktree_after_refs(
     repo: &Repository,
     from_tree: Option<&ObjectId>,
@@ -350,26 +366,34 @@ fn apply_absorb_worktree_after_refs(
     absorb: &AbsorbPlan,
     staged_paths: &[String],
     prestate: Option<&FixupApplyPrestate>,
-) -> Result<(), HistoryError> {
+    progress: &mut dyn ProgressSink,
+    cancel: &CancelToken,
+) -> crate::error::Result<()> {
     if !staged_paths.is_empty() {
         clear_fixup_staging_after_apply(repo, old_head_commit, staged_paths)?;
         let old_head_tree = commit_tree_for_apply(repo, old_head_commit)?;
         align_worktree_to_head_for_paths(repo, old_head_tree, staged_paths)?;
     }
-    checkout_tree_transition_allow_local(repo, from_tree, to_tree).map_err(|e| {
-        HistoryError::WorktreeApply {
-            message: e.to_string(),
-        }
-    })?;
+    let force_preserve = HashSet::new();
+    checkout_tree_transition_allow_local_with_preserved(
+        repo,
+        from_tree,
+        to_tree,
+        &force_preserve,
+        None,
+        progress,
+        cancel,
+    )
+    .map_err(map_checkout_history_error)?;
     if staged_paths.is_empty() {
         return Ok(());
     }
     let new_head = repo.head_commit()?;
     let new_head_tree = commit_tree_for_apply(repo, new_head)?;
     let old_head_tree = commit_tree_for_apply(repo, old_head_commit)?;
-    let mut index = repo.load_index().map_err(|e| HistoryError::WorktreeApply {
-        message: e.to_string(),
-    })?;
+    let mut index = repo
+        .load_index()
+        .map_err(crate::history::error::worktree_apply_engine)?;
     for path in staged_paths {
         let pre_index_blob = prestate
             .and_then(|p| {
@@ -387,12 +411,10 @@ fn apply_absorb_worktree_after_refs(
             path,
             &absorb.assignments,
         )?;
-        let oid =
-            repo.odb()
-                .write(ObjectKind::Blob, &blob)
-                .map_err(|e| HistoryError::WorktreeApply {
-                    message: e.to_string(),
-                })?;
+        let oid = repo
+            .odb()
+            .write(ObjectKind::Blob, &blob)
+            .map_err(crate::history::error::worktree_apply_engine)?;
         if let Some(entry) = index.get_mut(path.as_bytes(), 0) {
             entry.oid = oid;
             entry.size = blob.len() as u32;
@@ -400,28 +422,24 @@ fn apply_absorb_worktree_after_refs(
     }
     index.sort();
     repo.write_index(&mut index)
-        .map_err(|e| HistoryError::WorktreeApply {
-            message: e.to_string(),
-        })?;
+        .map_err(crate::history::error::worktree_apply_engine)?;
     if let Some(pre) = prestate {
         pre.reapply_unstaged_worktree_deltas(repo)?;
     }
     Ok(())
 }
 
-/// Apply a fixup [`RewritePlan`] and align the index with the new `HEAD` on paths that were staged.
-///
-/// # Errors
-///
-/// Same as [`apply_rewrite`], plus index update failures after a successful ref move.
-pub fn apply_fixup_rewrite(
+/// Apply a fixup [`RewritePlan`] and align the index with the new `HEAD` on paths that were
+/// staged; see [`History::apply_fixup`](super::History::apply_fixup).
+pub(crate) fn apply_fixup_rewrite(
     repo: &Repository,
     plan: &RewritePlan,
     opts: &ApplyOptions,
     staged_paths: &[String],
-) -> Result<AppliedRewrite, HistoryError> {
+    cancel: &CancelToken,
+) -> crate::error::Result<AppliedRewrite> {
     let consumed = consumed_states_for_undo(repo, opts, staged_paths)?;
-    apply_fixup_rewrite_then(repo, plan, opts, staged_paths, consumed, |_| Ok(()))
+    apply_fixup_rewrite_then(repo, plan, opts, staged_paths, consumed, cancel, |_| Ok(()))
 }
 
 /// [`apply_fixup_rewrite`] with the undo sidecar's pre-command states supplied by the caller and
@@ -434,8 +452,9 @@ pub(crate) fn apply_fixup_rewrite_then(
     opts: &ApplyOptions,
     staged_paths: &[String],
     consumed: Option<Vec<PathState>>,
-    finish: impl FnOnce(&Repository) -> Result<(), HistoryError>,
-) -> Result<AppliedRewrite, HistoryError> {
+    cancel: &CancelToken,
+    finish: impl FnOnce(&Repository) -> crate::error::Result<()>,
+) -> crate::error::Result<AppliedRewrite> {
     let prestate = if !repo.is_bare() && !staged_paths.is_empty() {
         Some(FixupApplyPrestate::capture(repo, staged_paths)?)
     } else {
@@ -448,6 +467,7 @@ pub(crate) fn apply_fixup_rewrite_then(
         staged_paths,
         prestate.as_ref(),
         consumed,
+        cancel,
         finish,
     )
     .or_else(|err| {
@@ -470,22 +490,19 @@ fn worktree_matches_staged_index(
     worktree_path: &std::path::Path,
     index_blob: &[u8],
     index_mode: u32,
-) -> Result<bool, HistoryError> {
+) -> crate::error::Result<bool> {
     if index_mode != MODE_REGULAR && index_mode != crate::index::MODE_EXECUTABLE {
         return Ok(false);
     }
     if !worktree_path.is_file() {
         return Ok(false);
     }
-    let meta = fs::metadata(worktree_path).map_err(|e| HistoryError::WorktreeApply {
-        message: e.to_string(),
-    })?;
+    let meta = fs::metadata(worktree_path).map_err(crate::history::error::worktree_apply_io)?;
     if mode_from_metadata(&meta) != index_mode {
         return Ok(false);
     }
-    let worktree_bytes = fs::read(worktree_path).map_err(|e| HistoryError::WorktreeApply {
-        message: e.to_string(),
-    })?;
+    let worktree_bytes =
+        fs::read(worktree_path).map_err(crate::history::error::worktree_apply_io)?;
     Ok(worktree_bytes == index_blob)
 }
 
@@ -495,13 +512,12 @@ struct FixupApplyPrestate {
 }
 
 impl FixupApplyPrestate {
-    fn capture(repo: &Repository, staged_paths: &[String]) -> Result<Self, HistoryError> {
-        let index_bytes = fs::read(repo.index_path()).map_err(|e| HistoryError::WorktreeApply {
-            message: e.to_string(),
-        })?;
-        let index = repo.load_index().map_err(|e| HistoryError::WorktreeApply {
-            message: e.to_string(),
-        })?;
+    fn capture(repo: &Repository, staged_paths: &[String]) -> crate::error::Result<Self> {
+        let index_bytes =
+            fs::read(repo.index_path()).map_err(crate::history::error::worktree_apply_io)?;
+        let index = repo
+            .load_index()
+            .map_err(crate::history::error::worktree_apply_engine)?;
         let worktree = repo.work_tree();
         let mut paths = Vec::with_capacity(staged_paths.len());
         for path in staged_paths {
@@ -511,9 +527,7 @@ impl FixupApplyPrestate {
             let worktree_bytes = if let Some(wt) = worktree {
                 let abs = wt.join(path);
                 if abs.is_file() {
-                    Some(fs::read(&abs).map_err(|e| HistoryError::WorktreeApply {
-                        message: e.to_string(),
-                    })?)
+                    Some(fs::read(&abs).map_err(crate::history::error::worktree_apply_io)?)
                 } else {
                     None
                 }
@@ -536,12 +550,9 @@ impl FixupApplyPrestate {
         Ok(Self { index_bytes, paths })
     }
 
-    fn restore(&self, repo: &Repository) -> Result<(), HistoryError> {
-        fs::write(repo.index_path(), &self.index_bytes).map_err(|e| {
-            HistoryError::WorktreeApply {
-                message: e.to_string(),
-            }
-        })?;
+    fn restore(&self, repo: &Repository) -> crate::error::Result<()> {
+        fs::write(repo.index_path(), &self.index_bytes)
+            .map_err(crate::history::error::worktree_apply_io)?;
         let Some(worktree) = repo.work_tree() else {
             return Ok(());
         };
@@ -550,19 +561,14 @@ impl FixupApplyPrestate {
             match &path.worktree {
                 Some(bytes) => {
                     if let Some(parent) = abs.parent() {
-                        fs::create_dir_all(parent).map_err(|e| HistoryError::WorktreeApply {
-                            message: e.to_string(),
-                        })?;
+                        fs::create_dir_all(parent)
+                            .map_err(crate::history::error::worktree_apply_io)?;
                     }
-                    fs::write(&abs, bytes).map_err(|e| HistoryError::WorktreeApply {
-                        message: e.to_string(),
-                    })?;
+                    fs::write(&abs, bytes).map_err(crate::history::error::worktree_apply_io)?;
                 }
                 None => {
                     if abs.is_file() {
-                        fs::remove_file(&abs).map_err(|e| HistoryError::WorktreeApply {
-                            message: e.to_string(),
-                        })?;
+                        fs::remove_file(&abs).map_err(crate::history::error::worktree_apply_io)?;
                     }
                 }
             }
@@ -570,7 +576,7 @@ impl FixupApplyPrestate {
         Ok(())
     }
 
-    fn restore_worktrees_not_matching_staged(&self, repo: &Repository) -> Result<(), HistoryError> {
+    fn restore_worktrees_not_matching_staged(&self, repo: &Repository) -> crate::error::Result<()> {
         let Some(worktree) = repo.work_tree() else {
             return Ok(());
         };
@@ -582,19 +588,14 @@ impl FixupApplyPrestate {
             match &path.worktree {
                 Some(bytes) => {
                     if let Some(parent) = abs.parent() {
-                        fs::create_dir_all(parent).map_err(|e| HistoryError::WorktreeApply {
-                            message: e.to_string(),
-                        })?;
+                        fs::create_dir_all(parent)
+                            .map_err(crate::history::error::worktree_apply_io)?;
                     }
-                    fs::write(&abs, bytes).map_err(|e| HistoryError::WorktreeApply {
-                        message: e.to_string(),
-                    })?;
+                    fs::write(&abs, bytes).map_err(crate::history::error::worktree_apply_io)?;
                 }
                 None => {
                     if abs.is_file() {
-                        fs::remove_file(&abs).map_err(|e| HistoryError::WorktreeApply {
-                            message: e.to_string(),
-                        })?;
+                        fs::remove_file(&abs).map_err(crate::history::error::worktree_apply_io)?;
                     }
                 }
             }
@@ -632,13 +633,13 @@ impl FixupApplyPrestate {
         &self,
         repo: &Repository,
         staged_paths: &[String],
-    ) -> Result<(), HistoryError> {
+    ) -> crate::error::Result<()> {
         let Some(worktree) = repo.work_tree() else {
             return Ok(());
         };
-        let mut index = repo.load_index().map_err(|e| HistoryError::WorktreeApply {
-            message: e.to_string(),
-        })?;
+        let mut index = repo
+            .load_index()
+            .map_err(crate::history::error::worktree_apply_engine)?;
         let mut changed = false;
         for path in staged_paths {
             let Some(pre) = self.paths.iter().find(|p| p.path == *path) else {
@@ -659,16 +660,13 @@ impl FixupApplyPrestate {
                     let oid = repo
                         .odb()
                         .write(crate::objects::ObjectKind::Blob, bytes)
-                        .map_err(|e| HistoryError::WorktreeApply {
-                            message: e.to_string(),
-                        })?;
+                        .map_err(crate::history::error::worktree_apply_engine)?;
                     let abs = worktree.join(path);
                     let mode = if abs.is_file() {
-                        mode_from_metadata(&fs::metadata(&abs).map_err(|e| {
-                            HistoryError::WorktreeApply {
-                                message: e.to_string(),
-                            }
-                        })?)
+                        mode_from_metadata(
+                            &fs::metadata(&abs)
+                                .map_err(crate::history::error::worktree_apply_io)?,
+                        )
                     } else {
                         MODE_REGULAR
                     };
@@ -702,20 +700,18 @@ impl FixupApplyPrestate {
         if changed {
             index.sort();
             repo.write_index(&mut index)
-                .map_err(|e| HistoryError::WorktreeApply {
-                    message: e.to_string(),
-                })?;
+                .map_err(crate::history::error::worktree_apply_engine)?;
         }
         Ok(())
     }
 
-    fn reapply_unstaged_worktree_deltas(&self, repo: &Repository) -> Result<(), HistoryError> {
+    fn reapply_unstaged_worktree_deltas(&self, repo: &Repository) -> crate::error::Result<()> {
         let Some(worktree) = repo.work_tree() else {
             return Ok(());
         };
-        let index = repo.load_index().map_err(|e| HistoryError::WorktreeApply {
-            message: e.to_string(),
-        })?;
+        let index = repo
+            .load_index()
+            .map_err(crate::history::error::worktree_apply_engine)?;
         for path in &self.paths {
             if !path.worktree_matches_staged {
                 continue;
@@ -732,23 +728,27 @@ impl FixupApplyPrestate {
             let Some(entry) = index.get(path.path.as_bytes(), 0) else {
                 continue;
             };
-            let head_blob =
-                repo.odb()
-                    .read(&entry.oid)
-                    .map_err(|e| HistoryError::WorktreeApply {
-                        message: e.to_string(),
-                    })?;
+            let head_blob = repo
+                .odb()
+                .read(&entry.oid)
+                .map_err(crate::history::error::worktree_apply_engine)?;
             let target =
                 apply_index_to_worktree_delta(pre_index_blob, pre_worktree, &head_blob.data);
             let abs = worktree.join(&path.path);
-            fs::write(&abs, &target).map_err(|e| HistoryError::WorktreeApply {
-                message: e.to_string(),
-            })?;
+            fs::write(&abs, &target).map_err(crate::history::error::worktree_apply_io)?;
         }
         Ok(())
     }
 }
 
+fn map_checkout_history_error(err: crate::error::Error) -> crate::error::Error {
+    match err {
+        crate::error::Error::Cancelled => err,
+        other => worktree_apply_engine(other),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn apply_fixup_refs_and_worktree(
     repo: &Repository,
     plan: &RewritePlan,
@@ -756,8 +756,9 @@ fn apply_fixup_refs_and_worktree(
     staged_paths: &[String],
     prestate: Option<&FixupApplyPrestate>,
     consumed: Option<Vec<PathState>>,
-    finish: impl FnOnce(&Repository) -> Result<(), HistoryError>,
-) -> Result<AppliedRewrite, HistoryError> {
+    cancel: &CancelToken,
+    finish: impl FnOnce(&Repository) -> crate::error::Result<()>,
+) -> crate::error::Result<AppliedRewrite> {
     let (old_tree, new_tree) = head_tree_transition(plan);
     let needs_worktree = !repo.is_bare() && head_tree_changes(&old_tree, &new_tree);
     let old_head_commit = if needs_worktree {
@@ -770,10 +771,11 @@ fn apply_fixup_refs_and_worktree(
         plan,
         opts,
         rewrite_journal::RewriteApplyKind::Fixup,
-        |repo, old_tree, new_tree| {
-            let old_head_commit = old_head_commit.ok_or_else(|| HistoryError::WorktreeApply {
-                message: "missing old HEAD commit for fixup apply".into(),
-            })?;
+        &mut NullProgress,
+        cancel,
+        |repo, old_tree, new_tree, progress, apply_cancel| {
+            let old_head_commit = old_head_commit
+                .ok_or_else(|| worktree_apply_str("missing old HEAD commit for fixup apply"))?;
             apply_fixup_worktree_after_refs(
                 repo,
                 old_tree,
@@ -781,6 +783,8 @@ fn apply_fixup_refs_and_worktree(
                 old_head_commit,
                 staged_paths,
                 prestate,
+                progress,
+                apply_cancel,
             )?;
             finish(repo)?;
             undo_work_after_command(repo, consumed)
@@ -793,6 +797,7 @@ fn apply_fixup_refs_and_worktree(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_fixup_worktree_after_refs(
     repo: &Repository,
     from_tree: Option<&ObjectId>,
@@ -800,7 +805,9 @@ fn apply_fixup_worktree_after_refs(
     old_head_commit: ObjectId,
     staged_paths: &[String],
     prestate: Option<&FixupApplyPrestate>,
-) -> Result<(), HistoryError> {
+    progress: &mut dyn ProgressSink,
+    cancel: &CancelToken,
+) -> crate::error::Result<()> {
     if !staged_paths.is_empty() {
         clear_fixup_staging_after_apply(repo, old_head_commit, staged_paths)?;
         let old_head_tree = commit_tree_for_apply(repo, old_head_commit)?;
@@ -823,12 +830,10 @@ fn apply_fixup_worktree_after_refs(
         to_tree,
         &force_preserve,
         None,
-        &mut crate::progress::NullProgress,
-        &crate::progress::NeverCancel,
+        progress,
+        cancel,
     )
-    .map_err(|e| HistoryError::WorktreeApply {
-        message: e.to_string(),
-    })?;
+    .map_err(map_checkout_history_error)?;
     if !staged_paths.is_empty() {
         let head = repo.head_commit()?;
         clear_fixup_staging_after_apply(repo, head, staged_paths)?;
@@ -844,7 +849,7 @@ fn align_worktree_to_head_for_paths(
     repo: &Repository,
     head_tree: ObjectId,
     paths: &[String],
-) -> Result<(), HistoryError> {
+) -> crate::error::Result<()> {
     let Some(worktree) = repo.work_tree() else {
         return Ok(());
     };
@@ -853,25 +858,17 @@ fn align_worktree_to_head_for_paths(
         match tree_entry_at_path(repo, head_tree, path)? {
             Some((oid, _mode)) => {
                 if let Some(parent) = abs.parent() {
-                    fs::create_dir_all(parent).map_err(|e| HistoryError::WorktreeApply {
-                        message: e.to_string(),
-                    })?;
+                    fs::create_dir_all(parent).map_err(crate::history::error::worktree_apply_io)?;
                 }
                 let blob = repo
                     .odb()
                     .read(&oid)
-                    .map_err(|e| HistoryError::WorktreeApply {
-                        message: e.to_string(),
-                    })?;
-                fs::write(&abs, &blob.data).map_err(|e| HistoryError::WorktreeApply {
-                    message: e.to_string(),
-                })?;
+                    .map_err(crate::history::error::worktree_apply_engine)?;
+                fs::write(&abs, &blob.data).map_err(crate::history::error::worktree_apply_io)?;
             }
             None => {
                 if abs.is_file() {
-                    fs::remove_file(&abs).map_err(|e| HistoryError::WorktreeApply {
-                        message: e.to_string(),
-                    })?;
+                    fs::remove_file(&abs).map_err(crate::history::error::worktree_apply_io)?;
                 }
             }
         }
@@ -883,11 +880,11 @@ fn clear_fixup_staging_after_apply(
     repo: &Repository,
     head_commit: ObjectId,
     staged_paths: &[String],
-) -> Result<(), HistoryError> {
+) -> crate::error::Result<()> {
     let head_tree = commit_tree_for_apply(repo, head_commit)?;
-    let mut index = repo.load_index().map_err(|e| HistoryError::WorktreeApply {
-        message: e.to_string(),
-    })?;
+    let mut index = repo
+        .load_index()
+        .map_err(crate::history::error::worktree_apply_engine)?;
     for path in staged_paths {
         let key = path.as_bytes();
         match tree_entry_at_path(repo, head_tree, path)? {
@@ -902,9 +899,7 @@ fn clear_fixup_staging_after_apply(
                     } else {
                         repo.odb()
                             .read(&oid)
-                            .map_err(|e| HistoryError::WorktreeApply {
-                                message: e.to_string(),
-                            })?
+                            .map_err(crate::history::error::worktree_apply_engine)?
                             .data
                             .len() as u32
                     };
@@ -934,42 +929,37 @@ fn clear_fixup_staging_after_apply(
     }
     index.sort();
     repo.write_index(&mut index)
-        .map_err(|e| HistoryError::WorktreeApply {
-            message: e.to_string(),
-        })
+        .map_err(crate::history::error::worktree_apply_engine)
 }
 
 fn tree_entry_at_path(
     repo: &Repository,
     tree: ObjectId,
     path: &str,
-) -> Result<Option<(ObjectId, u32)>, HistoryError> {
+) -> crate::error::Result<Option<(ObjectId, u32)>> {
     let entry = repo
         .odb()
         .tree_entry_at_path(&tree, path.as_bytes())
-        .map_err(|e| HistoryError::WorktreeApply {
-            message: e.to_string(),
-        })?;
+        .map_err(crate::history::error::worktree_apply_engine)?;
     Ok(entry.map(|e| (e.oid, e.mode)))
 }
 
 pub(crate) fn commit_tree_for_apply(
     repo: &Repository,
     commit: ObjectId,
-) -> Result<ObjectId, HistoryError> {
+) -> crate::error::Result<ObjectId> {
     repo.odb()
         .commit_tree(&commit)
-        .map_err(|e| HistoryError::WorktreeApply {
-            message: e.to_string(),
-        })
+        .map_err(crate::history::error::worktree_apply_engine)
 }
 
 /// Runs the same worktree safety checks as [`apply_rewrite`] without moving refs.
 ///
-/// # Errors
-///
-/// Returns [`HistoryError::LocalChangesWouldBeOverwritten`] or [`HistoryError::WorktreeApply`].
-pub fn verify_rewrite_plan(repo: &Repository, plan: &RewritePlan) -> Result<(), HistoryError> {
+/// See [`History::verify_plan`](super::History::verify_plan).
+pub(crate) fn verify_rewrite_plan(
+    repo: &Repository,
+    plan: &RewritePlan,
+) -> crate::error::Result<()> {
     let (old_tree, new_tree) = head_tree_transition(plan);
     if repo.is_bare() {
         return Ok(());
@@ -980,15 +970,16 @@ pub fn verify_rewrite_plan(repo: &Repository, plan: &RewritePlan) -> Result<(), 
     Ok(())
 }
 
-/// Returns [`HistoryError::LocalChangesWouldBeOverwritten`], [`HistoryError::HeadMovedSincePlan`],
-/// [`HistoryError::RefCasMismatch`], [`HistoryError::RefApply`], or [`HistoryError::WorktreeApply`].
-pub fn apply_rewrite(
+/// Apply `plan`: move every planned ref in one transaction, then update the work tree.
+///
+/// See [`History::apply`](super::History::apply).
+pub(crate) fn apply_rewrite(
     repo: &Repository,
     plan: &RewritePlan,
     opts: &ApplyOptions,
     progress: &mut dyn crate::progress::ProgressSink,
-    cancel: &dyn crate::progress::Cancel,
-) -> Result<AppliedRewrite, HistoryError> {
+    cancel: &crate::progress::CancelToken,
+) -> crate::error::Result<AppliedRewrite> {
     verify_live_head_matches_plan(repo, &plan.head)?;
     let (old_tree, new_tree) = head_tree_transition(plan);
     if let (Some(old), Some(new)) = (old_tree.as_ref(), new_tree.as_ref()) {
@@ -1001,7 +992,9 @@ pub fn apply_rewrite(
         plan,
         opts,
         rewrite_journal::RewriteApplyKind::Standard,
-        |repo, old_tree, new_tree| {
+        progress,
+        cancel,
+        |repo, old_tree, new_tree, progress, cancel| {
             apply_head_tree_to_worktree(repo, old_tree, new_tree, None, progress, cancel)?;
             Ok(None)
         },
@@ -1017,7 +1010,7 @@ pub(crate) fn verify_undo_worktree(
     repo: &Repository,
     plan: &RewritePlan,
     work: Option<&UndoWork>,
-) -> Result<Vec<PathState>, HistoryError> {
+) -> crate::error::Result<Vec<PathState>> {
     let Some(work) = work.filter(|_| !repo.is_bare()) else {
         verify_rewrite_plan(repo, plan)?;
         return Ok(Vec::new());
@@ -1025,13 +1018,15 @@ pub(crate) fn verify_undo_worktree(
     let live = work.unchanged_live_states(repo)?;
     let recorded = work.paths();
     match verify_rewrite_plan(repo, plan) {
-        Err(HistoryError::LocalChangesWouldBeOverwritten { paths }) => {
+        Err(crate::error::Error::History(HistoryError::LocalChangesWouldBeOverwritten {
+            paths,
+        })) => {
             let paths: Vec<String> = paths
                 .into_iter()
                 .filter(|p| !recorded.contains(p))
                 .collect();
             if !paths.is_empty() {
-                return Err(HistoryError::LocalChangesWouldBeOverwritten { paths });
+                return Err(HistoryError::LocalChangesWouldBeOverwritten { paths }.into());
             }
         }
         other => other?,
@@ -1049,7 +1044,8 @@ pub(crate) fn apply_undo_rewrite(
     plan: &RewritePlan,
     opts: &ApplyOptions,
     work: Option<&UndoWork>,
-) -> Result<AppliedRewrite, HistoryError> {
+    cancel: &CancelToken,
+) -> crate::error::Result<AppliedRewrite> {
     verify_live_head_matches_plan(repo, &plan.head)?;
     let before = verify_undo_worktree(repo, plan, work)?;
     let paths = work.map(UndoWork::paths).unwrap_or_default();
@@ -1058,16 +1054,11 @@ pub(crate) fn apply_undo_rewrite(
         plan,
         opts,
         rewrite_journal::RewriteApplyKind::Standard,
-        |repo, old_tree, new_tree| {
-            let checkout = |repo: &Repository| {
-                apply_head_tree_to_worktree(
-                    repo,
-                    old_tree,
-                    new_tree,
-                    None,
-                    &mut crate::progress::NullProgress,
-                    &crate::progress::NeverCancel,
-                )
+        &mut NullProgress,
+        cancel,
+        |repo, old_tree, new_tree, progress, apply_cancel| {
+            let mut checkout = |repo: &Repository| {
+                apply_head_tree_to_worktree(repo, old_tree, new_tree, None, progress, apply_cancel)
             };
             let Some(work) = work else {
                 checkout(repo)?;
@@ -1103,10 +1094,18 @@ fn run_planned_rewrite_apply<F>(
     plan: &RewritePlan,
     opts: &ApplyOptions,
     apply_kind: rewrite_journal::RewriteApplyKind,
+    progress: &mut dyn ProgressSink,
+    cancel: &CancelToken,
     apply_worktree: F,
-) -> Result<AppliedRewrite, HistoryError>
+) -> crate::error::Result<AppliedRewrite>
 where
-    F: FnOnce(&Repository, Option<&ObjectId>, &ObjectId) -> Result<Option<UndoWork>, HistoryError>,
+    F: FnOnce(
+        &Repository,
+        Option<&ObjectId>,
+        &ObjectId,
+        &mut dyn ProgressSink,
+        &CancelToken,
+    ) -> crate::error::Result<Option<UndoWork>>,
 {
     let mut work = None;
     let (old_tree, new_tree) = head_tree_transition(plan);
@@ -1130,22 +1129,15 @@ where
     let index_lock = needs_worktree
         .then(|| repo.begin_index_update())
         .transpose()
-        .map_err(|e| HistoryError::WorktreeApply {
-            message: e.to_string(),
-        })?;
+        .map_err(crate::history::error::worktree_apply_engine)?;
 
     if needs_worktree {
-        let index_before = index_snapshot
-            .as_ref()
-            .ok_or_else(|| HistoryError::WorktreeApply {
-                message: "missing index snapshot for rewrite apply journal".into(),
-            })?;
-        let worktree_snap =
-            worktree_snapshot
-                .as_ref()
-                .ok_or_else(|| HistoryError::WorktreeApply {
-                    message: "missing worktree snapshot for rewrite apply journal".into(),
-                })?;
+        let index_before = index_snapshot.as_ref().ok_or_else(|| {
+            worktree_apply_str("missing index snapshot for rewrite apply journal")
+        })?;
+        let worktree_snap = worktree_snapshot.as_ref().ok_or_else(|| {
+            worktree_apply_str("missing worktree snapshot for rewrite apply journal")
+        })?;
         rewrite_journal::write_rewrite_apply_journal(
             repo,
             plan,
@@ -1156,6 +1148,17 @@ where
         )?;
     }
 
+    let rewritten_pairs = plan.rewritten_pairs();
+    let notes_rewrite =
+        prepare_notes_for_rewrite(repo, NotesRewriteCommand::Rebase, &rewritten_pairs)?;
+
+    if poll_cancel(progress, cancel).is_err() {
+        if needs_worktree {
+            let _ = rewrite_journal::clear_rewrite_apply_journal(repo);
+        }
+        return Err(crate::error::Error::Cancelled);
+    }
+
     if !plan.ref_updates.is_empty() {
         commit_planned_ref_updates(repo, &plan.ref_updates, opts)?;
     }
@@ -1164,17 +1167,15 @@ where
 
     if needs_worktree {
         if crate::repo::test_inject_rewrite_apply_abort_after_refs() {
-            return Err(HistoryError::WorktreeApply {
-                message: "injected abort after rewrite ref updates".into(),
-            });
+            return Err(worktree_apply_str(
+                "injected abort after rewrite ref updates",
+            ));
         }
         let (Some(old), Some(new)) = (old_tree, new_tree) else {
             let _ = rewrite_journal::clear_rewrite_apply_journal(repo);
-            return Err(HistoryError::WorktreeApply {
-                message: "missing head tree for worktree apply".into(),
-            });
+            return Err(worktree_apply_str("missing head tree for worktree apply"));
         };
-        match apply_worktree(repo, Some(&old), &new) {
+        match apply_worktree(repo, Some(&old), &new, progress, cancel) {
             Ok(recorded) => work = recorded,
             Err(checkout_err) => {
                 let ref_rollback = rollback_ref_updates(repo, &plan.ref_updates, opts).err();
@@ -1206,6 +1207,7 @@ where
         index_snapshot.as_ref(),
         worktree_snapshot.as_ref(),
         work.as_ref(),
+        notes_rewrite.as_ref(),
     );
     if applied.is_ok() {
         let _ = rewrite_journal::clear_rewrite_apply_journal(repo);
@@ -1216,13 +1218,11 @@ where
 fn verify_live_head_matches_plan(
     repo: &Repository,
     head: &super::types::HeadEffect,
-) -> Result<(), HistoryError> {
+) -> crate::error::Result<()> {
     let Some(planned_commit) = head.old_commit else {
         return Ok(());
     };
-    let live = resolve_head_for_repository(repo).map_err(|e| HistoryError::RefApply {
-        message: e.to_string(),
-    })?;
+    let live = resolve_head_for_repository(repo)?;
     let mismatch = || HistoryError::HeadMovedSincePlan {
         planned_ref: head.head_ref.clone(),
         planned_commit,
@@ -1230,21 +1230,21 @@ fn verify_live_head_matches_plan(
     match (&head.head_ref, live) {
         (Some(planned_ref), HeadState::Branch { refname, oid, .. }) => {
             if planned_ref != &refname {
-                return Err(mismatch());
+                return Err(crate::error::Error::from(mismatch()));
             }
             if oid.as_ref() != Some(&planned_commit) {
-                return Err(mismatch());
+                return Err(crate::error::Error::from(mismatch()));
             }
         }
         (None, HeadState::Detached { oid }) => {
             if oid != planned_commit {
-                return Err(mismatch());
+                return Err(crate::error::Error::from(mismatch()));
             }
         }
         (Some(_), HeadState::Detached { .. }) | (None, HeadState::Branch { .. }) => {
-            return Err(mismatch());
+            return Err(crate::error::Error::from(mismatch()));
         }
-        (_, HeadState::Invalid) => return Err(mismatch()),
+        (_, HeadState::Invalid) => return Err(crate::error::Error::from(mismatch())),
     }
     Ok(())
 }
@@ -1272,25 +1272,21 @@ impl IndexSnapshot {
     }
 }
 
-fn capture_index_snapshot(repo: &Repository) -> Result<IndexSnapshot, HistoryError> {
-    let io_err = |e: std::io::Error| HistoryError::WorktreeApply {
-        message: e.to_string(),
-    };
+fn capture_index_snapshot(repo: &Repository) -> crate::error::Result<IndexSnapshot> {
+    let io_err = |e: std::io::Error| crate::history::error::worktree_apply_io(e);
     let path = repo.index_path();
     if path.is_file() {
         let mtime = fs::metadata(&path).and_then(|m| m.modified()).ok();
         let bytes = fs::read(path).map_err(io_err)?;
         return Ok(IndexSnapshot { bytes, mtime });
     }
-    let mut index = repo.load_index().map_err(|e| HistoryError::WorktreeApply {
-        message: e.to_string(),
-    })?;
+    let mut index = repo
+        .load_index()
+        .map_err(crate::history::error::worktree_apply_engine)?;
     let tmp = tempfile::NamedTempFile::new().map_err(io_err)?;
     index
         .write_to_path(tmp.path(), false)
-        .map_err(|e| HistoryError::WorktreeApply {
-            message: e.to_string(),
-        })?;
+        .map_err(crate::history::error::worktree_apply_engine)?;
     let bytes = fs::read(tmp.path()).map_err(io_err)?;
     Ok(IndexSnapshot { bytes, mtime: None })
 }
@@ -1310,24 +1306,22 @@ fn verify_worktree_ready_for_head_tree_change(
     repo: &Repository,
     from_tree: Option<&ObjectId>,
     to_tree: &ObjectId,
-) -> Result<(), HistoryError> {
+) -> crate::error::Result<()> {
     prepare_tree_checkout(repo, from_tree, to_tree).map_err(map_prepare_checkout_error)?;
     match verify_tree_transition_allow_local(repo, from_tree, to_tree) {
         Ok(()) => Ok(()),
         Err(TreeTransitionVerifyError::WouldOverwrite(paths)) => {
-            Err(HistoryError::LocalChangesWouldBeOverwritten { paths })
+            Err(HistoryError::LocalChangesWouldBeOverwritten { paths }.into())
         }
         Err(TreeTransitionVerifyError::Failed(err)) => Err(map_prepare_checkout_error(err)),
     }
 }
 
-fn map_prepare_checkout_error(err: crate::error::Error) -> HistoryError {
-    if let crate::error::Error::WouldOverwrite { paths, .. } = err {
-        return HistoryError::LocalChangesWouldBeOverwritten { paths };
+fn map_prepare_checkout_error(err: crate::error::Error) -> crate::error::Error {
+    if let crate::error::Error::Worktree(WorktreeError::WouldOverwrite { paths, .. }) = err {
+        return crate::error::Error::from(HistoryError::LocalChangesWouldBeOverwritten { paths });
     }
-    HistoryError::WorktreeApply {
-        message: err.to_string(),
-    }
+    worktree_apply_engine(err)
 }
 
 fn apply_head_tree_to_worktree(
@@ -1336,8 +1330,8 @@ fn apply_head_tree_to_worktree(
     to_tree: &ObjectId,
     index_lock: Option<&mut crate::index::IndexLock>,
     progress: &mut dyn crate::progress::ProgressSink,
-    cancel: &dyn crate::progress::Cancel,
-) -> Result<(), HistoryError> {
+    cancel: &crate::progress::CancelToken,
+) -> crate::error::Result<()> {
     checkout_tree_transition_allow_local_with_preserved(
         repo,
         from_tree,
@@ -1348,10 +1342,8 @@ fn apply_head_tree_to_worktree(
         cancel,
     )
     .map_err(|e| match e {
-        crate::error::Error::Cancelled => HistoryError::from(e),
-        other => HistoryError::WorktreeApply {
-            message: other.to_string(),
-        },
+        crate::error::Error::Cancelled => e,
+        other => worktree_apply_engine(other),
     })
 }
 
@@ -1359,26 +1351,27 @@ fn commit_planned_ref_updates(
     repo: &Repository,
     updates: &[PlannedRefUpdate],
     opts: &ApplyOptions,
-) -> Result<(), HistoryError> {
-    let store = repo.refs();
+) -> crate::error::Result<()> {
+    let store = repo.ref_store();
     let git_dir = repo.git_dir();
-    let config = repo.config().ok();
-    let head_target =
-        read_symbolic_ref_for_repository(repo, "HEAD").map_err(|e| HistoryError::RefApply {
-            message: e.to_string(),
-        })?;
+    let config = repo.config().snapshot().ok();
+    let head_target = read_symbolic_ref_for_repository(repo, "HEAD")?;
     let mut txn = RefTransaction::new();
     for planned in updates {
         let reflog = reflog_for_update(
             config.as_ref().map(|c| c.as_ref()),
             git_dir,
-            &planned.name,
+            planned.name.as_str(),
             opts,
         );
         if head_target.as_deref() == Some(planned.name.as_str()) {
-            if let Some(head_update) =
-                head_log_update(config.as_ref().map(|c| c.as_ref()), git_dir, planned, opts)
-            {
+            if let Some(head_update) = head_oid_log_update(
+                config.as_ref().map(|c| c.as_ref()),
+                git_dir,
+                planned.old,
+                planned.new,
+                opts,
+            ) {
                 txn = txn
                     .update(head_update)
                     .map_err(|e| map_ref_store_error(e, "HEAD"))?;
@@ -1389,12 +1382,13 @@ fn commit_planned_ref_updates(
             new_value: Some(RawRef::Direct(planned.new)),
             expected: Expected::Oid(planned.old),
             reflog,
-            flags: ref_update_flags(&planned.name),
+            flags: ref_update_flags(planned.name.as_str()),
         };
         txn = txn
             .update(update)
-            .map_err(|e| map_ref_store_error(e, &planned.name))?;
+            .map_err(|e| map_ref_store_error(e, planned.name.as_str()))?;
     }
+    repo.odb().flush_for_publish()?;
     let wait = LockWait::files_ref_lock(config.as_ref().map(|c| c.as_ref()));
     let prepared = prepare_with_lock_wait(store, txn, wait).map_err(|e| {
         map_ref_store_error(
@@ -1415,7 +1409,7 @@ fn rollback_ref_updates(
     repo: &Repository,
     updates: &[PlannedRefUpdate],
     opts: &ApplyOptions,
-) -> Result<(), HistoryError> {
+) -> crate::error::Result<()> {
     if updates.is_empty() {
         return Ok(());
     }
@@ -1430,22 +1424,57 @@ fn rollback_ref_updates(
     commit_planned_ref_updates(repo, &inverse, opts)
 }
 
-/// Append one `HEAD` reflog entry for `branch` moving `old` → `new`, as if `HEAD` had been
-/// attached to that branch when it moved.
-///
-/// Used by callers that move the checked-out branch while `HEAD` is detached (a resumed rebase)
-/// and reattach it afterwards, so the `HEAD` log still records the move. Logging follows the
-/// same policy as [`apply_rewrite`]; nothing is written when that policy skips `HEAD`.
-pub(super) fn log_head_move(
+/// Point detached `HEAD` at `new` and append a `HEAD` reflog entry when policy allows.
+pub(super) fn update_detached_head_with_reflog(
     repo: &Repository,
-    branch: &PlannedRefUpdate,
+    old: ObjectId,
+    new: ObjectId,
     opts: &ApplyOptions,
-) -> Result<(), HistoryError> {
-    let config = repo.config().ok();
-    let Some(update) = head_log_update(
+) -> crate::error::Result<()> {
+    let config = repo.config().snapshot().ok();
+    let Some(mut reflog) = reflog_for_update(
         config.as_ref().map(|c| c.as_ref()),
         repo.git_dir(),
-        branch,
+        "HEAD",
+        opts,
+    ) else {
+        return crate::refs::update_direct_ref_on_store(
+            repo.ref_store(),
+            repo.git_dir(),
+            "HEAD",
+            &new,
+        );
+    };
+    reflog.old_oid = Some(old);
+    reflog.new_oid = Some(new);
+    crate::refs::commit_ref_update_on_store(
+        repo.ref_store(),
+        RefUpdate {
+            name: crate::refs::store::RefName::from_trusted("HEAD"),
+            new_value: Some(RawRef::Direct(new)),
+            expected: Expected::Any,
+            reflog: Some(reflog),
+            flags: RefUpdateFlags {
+                no_deref: true,
+                ..Default::default()
+            },
+        },
+    )
+}
+
+/// Append one log-only `HEAD` entry for `old` → `new` without changing the ref tip.
+pub(super) fn log_head_oid_move(
+    repo: &Repository,
+    old: ObjectId,
+    new: ObjectId,
+    opts: &ApplyOptions,
+) -> crate::error::Result<()> {
+    let config = repo.config().snapshot().ok();
+    let Some(update) = head_oid_log_update(
+        config.as_ref().map(|c| c.as_ref()),
+        repo.git_dir(),
+        old,
+        new,
         opts,
     ) else {
         return Ok(());
@@ -1454,25 +1483,26 @@ pub(super) fn log_head_move(
         .update(update)
         .map_err(|e| map_ref_store_error(e, "HEAD"))?;
     let wait = LockWait::files_ref_lock(config.as_ref().map(|c| c.as_ref()));
-    prepare_with_lock_wait(repo.refs(), txn, wait)
+    prepare_with_lock_wait(repo.ref_store(), txn, wait)
         .and_then(|prepared| prepared.commit())
         .map_err(|e| map_ref_store_error(e, "HEAD"))?;
     Ok(())
 }
 
 /// Log-only `HEAD` update mirroring `branch`, or `None` when `HEAD` is not logged.
-fn head_log_update(
+fn head_oid_log_update(
     config: Option<&ConfigSet>,
     git_dir: &std::path::Path,
-    branch: &PlannedRefUpdate,
+    old: ObjectId,
+    new: ObjectId,
     opts: &ApplyOptions,
 ) -> Option<RefUpdate> {
     let mut reflog = reflog_for_update(config, git_dir, "HEAD", opts)?;
-    reflog.old_oid = Some(branch.old);
-    reflog.new_oid = Some(branch.new);
+    reflog.old_oid = Some(old);
+    reflog.new_oid = Some(new);
     Some(RefUpdate {
-        name: "HEAD".into(),
-        new_value: Some(RawRef::Direct(branch.new)),
+        name: crate::refs::store::RefName::from_trusted("HEAD"),
+        new_value: Some(RawRef::Direct(new)),
         expected: Expected::Any,
         reflog: Some(reflog),
         flags: RefUpdateFlags {
@@ -1505,12 +1535,12 @@ fn reflog_for_update(
     }
 }
 
-fn map_ref_store_error(err: RefStoreError, label: &str) -> HistoryError {
+fn map_ref_store_error(err: RefStoreError, _label: &str) -> crate::error::Error {
     match err {
-        RefStoreError::ExpectedMismatch { name, .. } => HistoryError::RefCasMismatch { name },
-        other => HistoryError::RefApply {
-            message: format!("{label}: {other}"),
-        },
+        RefStoreError::ExpectedMismatch { name, .. } => {
+            crate::error::Error::from(HistoryError::RefCasMismatch { name })
+        }
+        other => HistoryError::RefApply(other).into(),
     }
 }
 
@@ -1519,44 +1549,43 @@ fn map_ref_store_error(err: RefStoreError, label: &str) -> HistoryError {
 fn head_commit_after(
     repo: &Repository,
     updates: &[PlannedRefUpdate],
-) -> Result<ObjectId, HistoryError> {
+) -> crate::error::Result<ObjectId> {
     let head = resolve_head_for_repository(repo)?;
     let head_name = match &head {
         HeadState::Branch { refname, .. } => refname.as_str(),
         HeadState::Detached { .. } | HeadState::Invalid => "HEAD",
     };
-    if let Some(update) = updates.iter().find(|u| u.name == head_name) {
+    if let Some(update) = updates.iter().find(|u| u.name.as_str() == head_name) {
         return Ok(update.new);
     }
     match head {
         HeadState::Branch { oid: Some(oid), .. } | HeadState::Detached { oid } => Ok(oid),
-        HeadState::Branch { oid: None, .. } => Err(crate::error::Error::UnbornHead.into()),
-        HeadState::Invalid => Err(crate::error::Error::InvalidHead.into()),
+        HeadState::Branch { oid: None, .. } => Err(crate::error::Error::Ref(RefError::UnbornHead)),
+        HeadState::Invalid => Err(crate::error::Error::Ref(RefError::InvalidHead)),
     }
 }
 
 fn apply_failure_after_ref_update(
-    checkout: HistoryError,
-    ref_rollback: Option<HistoryError>,
-    worktree_restore: Option<HistoryError>,
-) -> HistoryError {
+    checkout: crate::error::Error,
+    ref_rollback: Option<crate::error::Error>,
+    worktree_restore: Option<crate::error::Error>,
+) -> crate::error::Error {
     if checkout.is_cancelled() && ref_rollback.is_none() && worktree_restore.is_none() {
         return checkout;
     }
-    let checkout_message = match checkout {
-        HistoryError::WorktreeApply { message } => message,
-        other => other.to_string(),
-    };
+    let checkout_source = ErrorSummary::from(checkout);
     if ref_rollback.is_none() && worktree_restore.is_none() {
         return HistoryError::WorktreeApply {
-            message: checkout_message,
-        };
+            source: checkout_source,
+        }
+        .into();
     }
     HistoryError::ApplyRollbackIncomplete {
-        checkout: checkout_message,
-        ref_rollback: ref_rollback.map(|e| e.to_string()),
-        worktree_restore: worktree_restore.map(|e| e.to_string()),
+        checkout: checkout_source,
+        ref_rollback: ref_rollback.map(ErrorSummary::from),
+        worktree_restore: worktree_restore.map(ErrorSummary::from),
     }
+    .into()
 }
 
 /// Worktree presence captured before a tree transition checkout.
@@ -1577,8 +1606,11 @@ pub(crate) enum WorktreePathKind {
 pub(crate) struct WorktreePathSnapshot {
     pub(crate) kind: WorktreePathKind,
     pub(crate) bytes: Option<Vec<u8>>,
-    /// When set, rollback rebuilds this path from the journal's pre-apply `head-tree` OID.
+    /// When set, rollback rebuilds this path from the pre-apply tree entry in `tree_oid`.
     pub(crate) from_old_tree: bool,
+    /// Blob or tree identity from the pre-apply tree when `from_old_tree`.
+    pub(crate) tree_oid: Option<ObjectId>,
+    pub(crate) tree_mode: u32,
     #[cfg(unix)]
     mode: u32,
 }
@@ -1611,13 +1643,34 @@ impl WorktreePathSnapshot {
             kind,
             bytes,
             from_old_tree: false,
+            tree_oid: None,
+            tree_mode: 0,
             #[cfg(unix)]
             mode: unix_mode,
         }
     }
 
     /// Pre-apply path that matches the old tree; rollback materializes it from the ODB.
-    pub(crate) fn from_old_tree(kind: WorktreePathKind) -> Self {
+    pub(crate) fn from_old_tree(kind: WorktreePathKind, oid: ObjectId, mode: u32) -> Self {
+        #[cfg(unix)]
+        let unix_mode = match kind {
+            WorktreePathKind::Directory => 0o755,
+            WorktreePathKind::Regular => 0o644,
+            _ => 0,
+        };
+        Self {
+            kind,
+            bytes: None,
+            from_old_tree: true,
+            tree_oid: Some(oid),
+            tree_mode: mode,
+            #[cfg(unix)]
+            mode: unix_mode,
+        }
+    }
+
+    /// Pre-apply tree path without stored oid/mode (legacy rewrite-apply journals).
+    pub(crate) fn from_old_tree_legacy(kind: WorktreePathKind) -> Self {
         #[cfg(unix)]
         let mode = match kind {
             WorktreePathKind::Directory => 0o755,
@@ -1628,6 +1681,8 @@ impl WorktreePathSnapshot {
             kind,
             bytes: None,
             from_old_tree: true,
+            tree_oid: None,
+            tree_mode: 0,
             #[cfg(unix)]
             mode,
         }
@@ -1668,20 +1723,20 @@ fn snapshot_worktree_for_tree_transition(
     repo: &Repository,
     from_tree: &ObjectId,
     to_tree: &ObjectId,
-) -> Result<HashMap<String, WorktreePathSnapshot>, HistoryError> {
+) -> crate::error::Result<HashMap<String, WorktreePathSnapshot>> {
     let work_tree = repo
         .work_tree()
-        .ok_or_else(|| HistoryError::WorktreeApply {
-            message: "cannot snapshot worktree in a bare repository".into(),
-        })?;
+        .ok_or_else(|| worktree_apply_str("cannot snapshot worktree in a bare repository"))?;
     let prepared =
         prepare_tree_transition_allow_local(repo, Some(from_tree), to_tree, &HashSet::new())
             .map_err(|err| match err {
-                TreeTransitionPrepareError::Failed(e) => HistoryError::WorktreeApply {
-                    message: e.to_string(),
-                },
+                TreeTransitionPrepareError::Failed(e) => {
+                    crate::history::error::worktree_apply_engine(e)
+                }
                 TreeTransitionPrepareError::OverwritePaths(paths) => {
-                    HistoryError::LocalChangesWouldBeOverwritten { paths }
+                    crate::error::Error::from(HistoryError::LocalChangesWouldBeOverwritten {
+                        paths,
+                    })
                 }
             })?;
     let preserve = prepared.preserve_worktree_paths();
@@ -1698,11 +1753,8 @@ fn snapshot_worktree_for_tree_transition(
             continue;
         }
         let snap = if preserve.contains(path) {
-            read_worktree_path_snapshot(work_tree, path).map_err(|e| {
-                HistoryError::WorktreeApply {
-                    message: format!("snapshot worktree path '{path}': {e}"),
-                }
-            })?
+            read_worktree_path_snapshot(work_tree, path)
+                .map_err(|e| worktree_apply_str(format!("snapshot worktree path '{path}': {e}")))?
         } else {
             worktree_snapshot_from_tree_change(change)?
         };
@@ -1713,10 +1765,12 @@ fn snapshot_worktree_for_tree_transition(
 
 fn worktree_snapshot_from_tree_change(
     change: &DiffEntry,
-) -> Result<WorktreePathSnapshot, HistoryError> {
+) -> crate::error::Result<WorktreePathSnapshot> {
     if change.status == DiffStatus::Added {
         return Ok(WorktreePathSnapshot::from_old_tree(
             WorktreePathKind::Absent,
+            change.old_oid,
+            change.old_mode.bits(),
         ));
     }
     let mode = change.old_mode.bits();
@@ -1725,7 +1779,11 @@ fn worktree_snapshot_from_tree_change(
         0o120000 => WorktreePathKind::Symlink,
         _ => WorktreePathKind::Regular,
     };
-    Ok(WorktreePathSnapshot::from_old_tree(kind))
+    Ok(WorktreePathSnapshot::from_old_tree(
+        kind,
+        change.old_oid,
+        mode,
+    ))
 }
 
 fn tree_transition_path(change: &crate::diff::DiffEntry) -> Option<&str> {
@@ -1744,6 +1802,8 @@ pub(crate) fn read_worktree_path_snapshot(
                 kind: WorktreePathKind::Absent,
                 bytes: None,
                 from_old_tree: false,
+                tree_oid: None,
+                tree_mode: 0,
                 #[cfg(unix)]
                 mode: 0o644,
             });
@@ -1756,6 +1816,8 @@ pub(crate) fn read_worktree_path_snapshot(
             kind: WorktreePathKind::Symlink,
             bytes: Some(target.as_os_str().as_encoded_bytes().to_vec()),
             from_old_tree: false,
+            tree_oid: None,
+            tree_mode: 0,
             #[cfg(unix)]
             mode: 0,
         });
@@ -1770,6 +1832,8 @@ pub(crate) fn read_worktree_path_snapshot(
                 kind: WorktreePathKind::Regular,
                 bytes: Some(bytes),
                 from_old_tree: false,
+                tree_oid: None,
+                tree_mode: 0,
                 mode,
             });
         }
@@ -1779,6 +1843,8 @@ pub(crate) fn read_worktree_path_snapshot(
                 kind: WorktreePathKind::Regular,
                 bytes: Some(bytes),
                 from_old_tree: false,
+                tree_oid: None,
+                tree_mode: 0,
             });
         }
     }
@@ -1786,6 +1852,8 @@ pub(crate) fn read_worktree_path_snapshot(
         kind: WorktreePathKind::Directory,
         bytes: None,
         from_old_tree: false,
+        tree_oid: None,
+        tree_mode: 0,
         #[cfg(unix)]
         mode: 0o755,
     })
@@ -1796,13 +1864,11 @@ pub(crate) fn restore_worktree_after_failed_apply(
     old_tree: Option<&ObjectId>,
     index_snapshot: Option<&IndexSnapshot>,
     worktree_snapshot: Option<&HashMap<String, WorktreePathSnapshot>>,
-) -> Result<(), HistoryError> {
+) -> crate::error::Result<()> {
     if let Some(snapshot) = index_snapshot {
         snapshot
             .restore_to(&repo.index_path())
-            .map_err(|e| HistoryError::WorktreeApply {
-                message: e.to_string(),
-            })?;
+            .map_err(crate::history::error::worktree_apply_io)?;
     }
     let Some(work_tree) = repo.work_tree() else {
         return Ok(());
@@ -1816,27 +1882,67 @@ pub(crate) fn restore_worktree_after_failed_apply(
         let saved = &snapshot[*path];
         let abs = work_tree.join(path.as_str());
         clear_worktree_path_before_restore(&abs, saved).map_err(|e| {
-            HistoryError::WorktreeApply {
-                message: format!("failed to clear '{path}' before restore: {e}"),
-            }
+            worktree_apply_str(format!("failed to clear '{path}' before restore: {e}"))
         })?;
     }
     paths.sort_by(|a, b| path_depth_cmp(a, b));
+    let mut rollback_targets: Vec<CheckoutRollbackRestore> = Vec::new();
+    let mut dir_cache = LeadingDirCache::new();
     for path in &paths {
         let saved = &snapshot[*path];
-        if saved.from_old_tree {
-            let old_tree = old_tree.ok_or_else(|| HistoryError::WorktreeApply {
-                message: "missing head-tree for from-tree worktree restore".into(),
-            })?;
-            restore_worktree_path_from_old_tree(repo, work_tree, path.as_str(), old_tree, saved)
-                .map_err(|e| HistoryError::WorktreeApply {
-                    message: format!("failed to restore '{path}' from tree: {e}"),
-                })?;
-        } else {
+        if !saved.from_old_tree {
             let abs = work_tree.join(path.as_str());
-            restore_worktree_path(&abs, saved).map_err(|e| HistoryError::WorktreeApply {
-                message: format!("failed to restore '{path}': {e}"),
-            })?;
+            restore_worktree_path(&abs, saved)
+                .map_err(|e| worktree_apply_str(format!("failed to restore '{path}': {e}")))?;
+            continue;
+        }
+        match saved.kind {
+            WorktreePathKind::Absent => {}
+            WorktreePathKind::Directory => {
+                let abs = work_tree.join(path.as_str());
+                fs::create_dir_all(&abs).map_err(|e| {
+                    worktree_apply_str(format!("failed to restore directory '{path}': {e}"))
+                })?;
+            }
+            WorktreePathKind::Regular | WorktreePathKind::Symlink => {
+                if saved.tree_mode == crate::index::MODE_GITLINK {
+                    materialize_gitlink_worktree(work_tree, path.as_str(), &mut dir_cache)
+                        .map_err(|e| {
+                            worktree_apply_str(format!("failed to restore gitlink '{path}': {e}"))
+                        })?;
+                } else if let Some(oid) = saved.tree_oid {
+                    rollback_targets.push(CheckoutRollbackRestore {
+                        path: (*path).clone(),
+                        oid,
+                        mode: saved.tree_mode,
+                    });
+                } else {
+                    let old_tree = old_tree.ok_or_else(|| {
+                        worktree_apply_str("missing head-tree for from-tree worktree restore")
+                    })?;
+                    restore_worktree_path_from_old_tree(
+                        repo,
+                        work_tree,
+                        path.as_str(),
+                        old_tree,
+                        saved,
+                    )
+                    .map_err(|e| {
+                        worktree_apply_str(format!("failed to restore '{path}' from tree: {e}"))
+                    })?;
+                }
+            }
+        }
+    }
+    if !rollback_targets.is_empty() {
+        let mut progress = NullProgress;
+        let failed =
+            restore_checkout_rollback_paths(repo, work_tree, &rollback_targets, &mut progress);
+        if !failed.is_empty() {
+            return Err(worktree_apply_str(format!(
+                "failed to restore {} path(s) from tree blobs",
+                failed.len()
+            )));
         }
     }
     Ok(())
@@ -1865,17 +1971,11 @@ fn restore_worktree_path_from_old_tree(
                 return materialize_gitlink_worktree(work_tree, path, &mut LeadingDirCache::new());
             }
             let index = repo.load_index()?;
-            let config = repo.config()?;
-            let rules = WorktreeRules::from_parts_index_attributes_only(repo, &index, config)?;
-            write_blob_to_worktree(
-                repo,
-                &rules,
-                work_tree,
-                path,
-                &oid,
-                mode,
-                &mut LeadingDirCache::new(),
-            )?;
+            let config = repo.config().snapshot()?;
+            let mut dir_cache = LeadingDirCache::for_config(config.as_ref());
+            let rules =
+                WorktreeRules::from_parts_index_attributes_only(repo, &index, Arc::clone(&config))?;
+            write_blob_to_worktree(repo, &rules, work_tree, path, &oid, mode, &mut dir_cache)?;
             Ok(())
         }
     }
@@ -1920,66 +2020,11 @@ fn clear_worktree_path_before_restore(
 }
 
 fn symlink_target_from_snapshot_bytes(bytes: &[u8]) -> std::io::Result<std::path::PathBuf> {
-    #[cfg(unix)]
-    {
-        use std::ffi::OsStr;
-        use std::os::unix::ffi::OsStrExt;
-        Ok(std::path::PathBuf::from(OsStr::from_bytes(bytes)))
-    }
-    #[cfg(windows)]
-    {
-        let text = std::str::from_utf8(bytes).map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "symlink restore requires a UTF-8 target on Windows",
-            )
-        })?;
-        Ok(std::path::PathBuf::from(text))
-    }
-    #[cfg(all(not(unix), not(windows)))]
-    {
-        let _ = bytes;
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "symlink restore is not supported on this platform",
-        ))
-    }
+    crate::worktree::symlink_target_path_from_bytes(bytes)
 }
 
 fn write_symlink_from_snapshot(abs: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let target = symlink_target_from_snapshot_bytes(bytes)?;
-    if let Some(parent) = abs.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::{symlink_dir, symlink_file};
-        let lookup = if target.is_relative() {
-            abs.parent()
-                .map(|parent| parent.join(&target))
-                .unwrap_or_else(|| target.clone())
-        } else {
-            target.clone()
-        };
-        if lookup.is_dir() {
-            symlink_dir(&target, abs)
-        } else {
-            symlink_file(&target, abs)
-        }
-    }
-    #[cfg(unix)]
-    {
-        use crate::porcelain::checkout::create_symlink_at;
-        create_symlink_at(&target, abs)
-    }
-    #[cfg(all(not(unix), not(windows)))]
-    {
-        let _ = (abs, target);
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "symlink restore is not supported on this platform",
-        ))
-    }
+    crate::worktree::create_worktree_symlink_from_blob(abs, bytes)
 }
 
 pub(crate) fn restore_worktree_path(
@@ -2036,24 +2081,27 @@ pub(crate) fn restore_worktree_path(
 #[path = "rewrite_journal.rs"]
 mod rewrite_journal;
 
-pub use rewrite_journal::{
+pub use rewrite_journal::RewriteApplyRecovery;
+pub(crate) use rewrite_journal::{
     abort_interrupted_rewrite_apply, ensure_rewrite_apply_ready, recover_interrupted_rewrite_apply,
-    rewrite_apply_journal_active, RewriteApplyRecovery,
+    rewrite_apply_journal_active,
 };
 
 #[cfg(test)]
 mod inject_and_apply_tests {
+    use crate::error::NotesError;
     use std::fs;
     use std::ops::ControlFlow;
     use std::sync::Arc;
 
-    use crate::history::{
-        plan_rewrite, CommitEdit, EmptyPolicy, HistoryEdits, RefScope, RewriteOptions,
-    };
+    use crate::error::Error;
+    use crate::history::plan::plan_rewrite;
+    use crate::history::{CommitEdit, EmptyPolicy, HistoryEdits, RefScope, RewriteOptions};
     use crate::objects::{parse_commit, ObjectKind};
     use crate::reflog::ReflogEntry;
     use crate::refs::store::{
-        MemoryRefStore, PreparedRefTransaction, RawRef, RefStore, RefStoreError, RefTransaction,
+        MemoryRefStore, PreparedRefTransaction, RawRef, RefNameRef, RefStore, RefStoreError,
+        RefTransaction,
     };
     use crate::repo::init_repository;
     use crate::RefStorageFormat;
@@ -2070,7 +2118,7 @@ mod inject_and_apply_tests {
             self.inner.format()
         }
 
-        fn read_raw(&self, name: &str) -> crate::error::Result<Option<RawRef>> {
+        fn read_raw(&self, name: &RefNameRef) -> crate::error::Result<Option<RawRef>> {
             self.inner.read_raw(name)
         }
 
@@ -2086,33 +2134,35 @@ mod inject_and_apply_tests {
             &self,
             _txn: RefTransaction,
         ) -> Result<Box<dyn PreparedRefTransaction + Send + '_>, RefStoreError> {
-            Err(RefStoreError::Corrupt("injected ref apply failure".into()))
+            Err(RefStoreError::Corrupt {
+                detail: "injected ref apply failure".into(),
+            })
         }
 
-        fn reflog_exists(&self, name: &str) -> crate::error::Result<bool> {
+        fn reflog_exists(&self, name: &RefNameRef) -> crate::error::Result<bool> {
             self.inner.reflog_exists(name)
         }
 
         fn for_each_reflog_entry(
             &self,
-            name: &str,
+            name: &RefNameRef,
             reverse: bool,
             f: &mut dyn FnMut(&ReflogEntry) -> ControlFlow<()>,
         ) -> crate::error::Result<()> {
             self.inner.for_each_reflog_entry(name, reverse, f)
         }
 
-        fn create_reflog(&self, name: &str) -> crate::error::Result<()> {
+        fn create_reflog(&self, name: &RefNameRef) -> crate::error::Result<()> {
             self.inner.create_reflog(name)
         }
 
-        fn delete_reflog(&self, name: &str) -> crate::error::Result<()> {
+        fn delete_reflog(&self, name: &RefNameRef) -> crate::error::Result<()> {
             self.inner.delete_reflog(name)
         }
 
         fn replace_reflog(
             &self,
-            name: &str,
+            name: &RefNameRef,
             entries: Vec<ReflogEntry>,
         ) -> crate::error::Result<()> {
             self.inner.replace_reflog(name, entries)
@@ -2120,7 +2170,7 @@ mod inject_and_apply_tests {
 
         fn rewrite_reflog(
             &self,
-            name: &str,
+            name: &RefNameRef,
             transform: &mut dyn FnMut(Vec<ReflogEntry>) -> crate::error::Result<Vec<ReflogEntry>>,
         ) -> crate::error::Result<()> {
             self.inner.rewrite_reflog(name, transform)
@@ -2128,10 +2178,154 @@ mod inject_and_apply_tests {
 
         fn for_each_reflog_ref(
             &self,
-            f: &mut dyn FnMut(&str) -> ControlFlow<()>,
+            f: &mut dyn FnMut(&RefNameRef) -> ControlFlow<()>,
         ) -> crate::error::Result<()> {
             self.inner.for_each_reflog_ref(f)
         }
+    }
+
+    fn git_config(dir: &std::path::Path, args: &[&str]) {
+        use std::process::Command;
+        assert!(
+            Command::new("git")
+                .current_dir(dir)
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .status()
+                .expect("git")
+                .success(),
+            "git config {:?}",
+            args
+        );
+    }
+
+    #[test]
+    fn apply_rewrite_invalid_notes_rewrite_mode_leaves_branch_tip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = init_repository(dir.path(), false, "main", None, RefStorageFormat::Files)
+            .expect("init");
+        let blob = repo.odb().write(ObjectKind::Blob, b"file\n").expect("blob");
+        let mut index = crate::index::Index::new();
+        index.hash_algo = repo.odb().hash_algo();
+        index.add_or_replace(crate::index::IndexEntry {
+            ctime_sec: 0,
+            ctime_nsec: 0,
+            mtime_sec: 0,
+            mtime_nsec: 0,
+            dev: 0,
+            ino: 0,
+            mode: crate::index::MODE_REGULAR,
+            uid: 0,
+            gid: 0,
+            size: 5,
+            oid: blob,
+            flags: 8,
+            flags_extended: None,
+            path: b"file.txt".to_vec(),
+            base_index_pos: 0,
+        });
+        let tree =
+            crate::index::write_tree::write_tree_from_index(repo.odb(), &index, "").expect("tree");
+        repo.write_index(&mut index).expect("write index");
+        fs::write(dir.path().join("file.txt"), "file\n").expect("write");
+        let commit = crate::objects::serialize_commit(&crate::objects::CommitData {
+            tree,
+            parents: vec![],
+            author: "T <t@t> 0 +0000".into(),
+            committer: "T <t@t> 0 +0000".into(),
+            author_raw: vec![],
+            committer_raw: vec![],
+            encoding: None,
+            message: "root\n".into(),
+            raw_message: None,
+            extra_headers: vec![],
+        });
+        let root = repo
+            .odb()
+            .write(ObjectKind::Commit, &commit)
+            .expect("commit");
+        crate::refs::write_ref(repo.git_dir(), "refs/heads/main", &root).expect("ref");
+        crate::refs::write_symbolic_ref(repo.git_dir(), "HEAD", "refs/heads/main").expect("head");
+
+        let child_tree = crate::index::write_tree::write_tree_from_index(
+            repo.odb(),
+            &{
+                let mut idx = index.clone();
+                let blob2 = repo.odb().write(ObjectKind::Blob, b"two\n").expect("blob");
+                idx.add_or_replace(crate::index::IndexEntry {
+                    ctime_sec: 0,
+                    ctime_nsec: 0,
+                    mtime_sec: 0,
+                    mtime_nsec: 0,
+                    dev: 0,
+                    ino: 0,
+                    mode: crate::index::MODE_REGULAR,
+                    uid: 0,
+                    gid: 0,
+                    size: 4,
+                    oid: blob2,
+                    flags: 8,
+                    flags_extended: None,
+                    path: b"two.txt".to_vec(),
+                    base_index_pos: 0,
+                });
+                idx
+            },
+            "",
+        )
+        .expect("child tree");
+        git_config(
+            dir.path(),
+            &["config", "notes.rewriteRef", "refs/notes/commits"],
+        );
+        git_config(dir.path(), &["config", "notes.rewriteMode", "invalid-mode"]);
+        let mut edits = HistoryEdits::new();
+        edits.insert(
+            root,
+            CommitEdit::Rewrite {
+                tree: Some(child_tree),
+                message: Some("rewritten\n".into()),
+                author: None,
+                parents: None,
+            },
+        );
+        let plan = plan_rewrite(
+            &repo,
+            &edits,
+            &RewriteOptions {
+                scope: RefScope::Head,
+                empty: EmptyPolicy::Drop,
+                committer: "T <t@t> 1 +0000".parse().expect("signature"),
+                preserve_committer: false,
+                sign: false,
+            },
+        )
+        .expect("plan");
+
+        let err = apply_rewrite(
+            &repo,
+            &plan,
+            &ApplyOptions {
+                identity: "T <t@t> 1 +0000".parse().expect("identity"),
+                reflog_message: "rewrite".into(),
+                record_operation: None,
+                hooks: crate::hooks::PostOperationHooks::Skip,
+            },
+            &mut crate::progress::NullProgress,
+            &crate::progress::CancelToken::never(),
+        )
+        .expect_err("invalid notes rewrite mode");
+        let notes_mode_invalid = match &err {
+            Error::Notes(NotesError::UnknownRewriteMode { .. }) => true,
+            _ => false,
+        };
+        assert!(notes_mode_invalid, "unexpected error: {err:?}");
+        assert_eq!(
+            crate::refs::resolve_ref(repo.git_dir(), "refs/heads/main").expect("main"),
+            root,
+            "branch tip must stay put when notes rewrite config is invalid"
+        );
     }
 
     #[test]
@@ -2258,10 +2452,13 @@ mod inject_and_apply_tests {
                 hooks: crate::hooks::PostOperationHooks::Run,
             },
             &mut crate::progress::NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .expect_err("inject");
-        assert!(matches!(err, HistoryError::RefApply { .. }));
+        assert!(matches!(
+            err,
+            crate::error::Error::History(HistoryError::RefApply(_))
+        ));
         assert_eq!(fs::read(repo.index_path()).expect("index"), before_index);
         assert_eq!(
             crate::refs::resolve_ref(repo.git_dir(), "refs/heads/main").expect("main"),
@@ -2286,7 +2483,7 @@ mod inject_and_apply_tests {
 
     #[test]
     fn apply_rewrite_injected_checkout_failure_restores_worktree_and_index() {
-        use crate::repo::set_test_inject_index_write_fail_remaining;
+        use crate::test_support::inject::set_test_inject_index_write_fail_remaining;
 
         let dir = tempfile::tempdir().expect("tempdir");
         let repo = init_repository(dir.path(), false, "main", None, RefStorageFormat::Files)
@@ -2390,13 +2587,14 @@ mod inject_and_apply_tests {
                 hooks: crate::hooks::PostOperationHooks::Run,
             },
             &mut crate::progress::NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .expect_err("inject checkout failure");
-        crate::repo::set_test_inject_index_write_fail(false);
+        crate::test_support::inject::set_test_inject_index_write_fail(false);
         assert!(matches!(
             err,
-            HistoryError::WorktreeApply { .. } | HistoryError::ApplyRollbackIncomplete { .. }
+            crate::error::Error::History(HistoryError::WorktreeApply { .. })
+                | crate::error::Error::History(HistoryError::ApplyRollbackIncomplete { .. })
         ));
         let tree_from_index_path = |path: &std::path::Path| {
             let index = crate::index::Index::load(path).expect("index");
@@ -2661,9 +2859,13 @@ mod inject_and_apply_tests {
                 hooks: crate::hooks::PostOperationHooks::Run,
             },
             &staged_paths,
+            &CancelToken::never(),
         )
         .expect_err("inject");
-        assert!(matches!(err, HistoryError::RefApply { .. }));
+        assert!(matches!(
+            err,
+            crate::error::Error::History(HistoryError::RefApply(_))
+        ));
         assert_eq!(fs::read(repo.index_path()).expect("index"), before_index);
         assert_eq!(
             fs::read(dir.path().join("file.txt")).expect("wt"),
@@ -2685,6 +2887,8 @@ mod inject_and_apply_tests {
             kind: WorktreePathKind::Regular,
             bytes: Some(b"original file\n".to_vec()),
             from_old_tree: false,
+            tree_oid: None,
+            tree_mode: 0,
             #[cfg(unix)]
             mode: 0o100644,
         };
@@ -2713,6 +2917,8 @@ mod inject_and_apply_tests {
             kind: WorktreePathKind::Regular,
             bytes: Some(b"original file\n".to_vec()),
             from_old_tree: false,
+            tree_oid: None,
+            tree_mode: 0,
             mode: 0o100644,
         };
         restore_worktree_path(&tracked, &saved).expect("restore");
@@ -2739,6 +2945,8 @@ mod inject_and_apply_tests {
             kind: WorktreePathKind::Symlink,
             bytes: Some(b"link-target.txt".to_vec()),
             from_old_tree: false,
+            tree_oid: None,
+            tree_mode: 0,
             mode: 0,
         };
         restore_worktree_path(&tracked, &saved).expect("restore symlink");
@@ -2774,6 +2982,8 @@ mod inject_and_apply_tests {
             kind: WorktreePathKind::Symlink,
             bytes: Some(vec![0xff]),
             from_old_tree: false,
+            tree_oid: None,
+            tree_mode: 0,
         };
         let err = restore_worktree_path(&tracked, &saved).expect_err("non-utf8 target");
         assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
@@ -2818,6 +3028,8 @@ mod inject_and_apply_tests {
                 kind: WorktreePathKind::Directory,
                 bytes: None,
                 from_old_tree: false,
+                tree_oid: None,
+                tree_mode: 0,
                 #[cfg(unix)]
                 mode: 0o755,
             },
@@ -2828,6 +3040,8 @@ mod inject_and_apply_tests {
                 kind: WorktreePathKind::Regular,
                 bytes: Some(b"child\n".to_vec()),
                 from_old_tree: false,
+                tree_oid: None,
+                tree_mode: 0,
                 #[cfg(unix)]
                 mode: 0o644,
             },
@@ -2845,7 +3059,7 @@ mod inject_and_apply_tests {
 
     #[test]
     fn apply_rewrite_injected_checkout_failure_restores_directory_after_file_transition() {
-        use crate::repo::set_test_inject_index_write_fail_remaining;
+        use crate::test_support::inject::set_test_inject_index_write_fail_remaining;
 
         let dir = tempfile::tempdir().expect("tempdir");
         let repo = init_repository(dir.path(), false, "main", None, RefStorageFormat::Files)
@@ -2958,11 +3172,14 @@ mod inject_and_apply_tests {
                 hooks: crate::hooks::PostOperationHooks::Run,
             },
             &mut crate::progress::NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .expect_err("inject checkout failure");
-        crate::repo::set_test_inject_index_write_fail(false);
-        assert!(matches!(err, HistoryError::WorktreeApply { .. }));
+        crate::test_support::inject::set_test_inject_index_write_fail(false);
+        assert!(matches!(
+            err,
+            crate::error::Error::History(HistoryError::WorktreeApply { .. })
+        ));
 
         let tree_from_index_path = |path: &std::path::Path| {
             let index = crate::index::Index::load(path).expect("index");
@@ -2990,7 +3207,7 @@ mod inject_and_apply_tests {
     #[cfg(unix)]
     #[test]
     fn apply_rewrite_injected_checkout_failure_restores_regular_file_after_symlink_transition() {
-        use crate::repo::set_test_inject_index_write_fail_remaining;
+        use crate::test_support::inject::set_test_inject_index_write_fail_remaining;
 
         let dir = tempfile::tempdir().expect("tempdir");
         let repo = init_repository(dir.path(), false, "main", None, RefStorageFormat::Files)
@@ -3098,11 +3315,14 @@ mod inject_and_apply_tests {
                 hooks: crate::hooks::PostOperationHooks::Run,
             },
             &mut crate::progress::NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .expect_err("inject checkout failure");
-        crate::repo::set_test_inject_index_write_fail(false);
-        assert!(matches!(err, HistoryError::WorktreeApply { .. }));
+        crate::test_support::inject::set_test_inject_index_write_fail(false);
+        assert!(matches!(
+            err,
+            crate::error::Error::History(HistoryError::WorktreeApply { .. })
+        ));
 
         let file_path = dir.path().join("file.txt");
         assert!(file_path.is_file());
@@ -3116,7 +3336,7 @@ mod inject_and_apply_tests {
 
     #[test]
     fn apply_rewrite_injected_checkout_failure_restores_regular_file_after_directory_transition() {
-        use crate::repo::set_test_inject_index_write_fail_remaining;
+        use crate::test_support::inject::set_test_inject_index_write_fail_remaining;
 
         let dir = tempfile::tempdir().expect("tempdir");
         let repo = init_repository(dir.path(), false, "main", None, RefStorageFormat::Files)
@@ -3224,11 +3444,14 @@ mod inject_and_apply_tests {
                 hooks: crate::hooks::PostOperationHooks::Run,
             },
             &mut crate::progress::NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .expect_err("inject checkout failure");
-        crate::repo::set_test_inject_index_write_fail(false);
-        assert!(matches!(err, HistoryError::WorktreeApply { .. }));
+        crate::test_support::inject::set_test_inject_index_write_fail(false);
+        assert!(matches!(
+            err,
+            crate::error::Error::History(HistoryError::WorktreeApply { .. })
+        ));
 
         let tree_from_index_path = |path: &std::path::Path| {
             let index = crate::index::Index::load(path).expect("index");
@@ -3338,7 +3561,7 @@ mod inject_and_apply_tests {
     #[test]
     fn apply_rewrite_checkout_failure_preserves_gitlink_worktree() {
         use crate::index::MODE_GITLINK;
-        use crate::repo::set_test_inject_index_write_fail_remaining;
+        use crate::test_support::inject::set_test_inject_index_write_fail_remaining;
 
         let dir = tempfile::tempdir().expect("tempdir");
         let repo = init_repository(dir.path(), false, "main", None, RefStorageFormat::Files)
@@ -3461,10 +3684,10 @@ mod inject_and_apply_tests {
                 hooks: crate::hooks::PostOperationHooks::Run,
             },
             &mut crate::progress::NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .expect_err("inject checkout failure");
-        crate::repo::set_test_inject_index_write_fail(false);
+        crate::test_support::inject::set_test_inject_index_write_fail(false);
 
         assert!(
             sub_dir.join("local.txt").is_file(),
@@ -3487,7 +3710,7 @@ mod inject_and_apply_tests {
 
         use std::os::unix::fs::PermissionsExt;
 
-        use crate::repo::set_test_inject_index_write_fail_remaining;
+        use crate::test_support::inject::set_test_inject_index_write_fail_remaining;
 
         let dir = tempfile::tempdir().expect("tempdir");
         let repo = init_repository(dir.path(), false, "main", None, RefStorageFormat::Files)
@@ -3602,10 +3825,10 @@ mod inject_and_apply_tests {
                 hooks: crate::hooks::PostOperationHooks::Run,
             },
             &mut crate::progress::NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .expect_err("checkout must fail");
-        crate::repo::set_test_inject_index_write_fail(false);
+        crate::test_support::inject::set_test_inject_index_write_fail(false);
 
         let mode = fs::metadata(&script_path)
             .expect("meta")
@@ -3620,6 +3843,7 @@ mod inject_and_apply_tests {
 #[cfg(test)]
 mod ref_update_lines_tests {
     use super::*;
+    use crate::refs::store::RefName;
     fn oid(byte: u8) -> ObjectId {
         let mut bytes = [0u8; 20];
         bytes[19] = byte;
@@ -3631,19 +3855,25 @@ mod ref_update_lines_tests {
         let plan = RewritePlan {
             commits: Vec::new(),
             ref_updates: vec![PlannedRefUpdate {
-                name: "refs/heads/main".into(),
+                name: RefName::from_trusted("refs/heads/main"),
                 old: oid(1),
                 new: oid(2),
             }],
             head: Default::default(),
         };
+        let update = &plan.ref_updates[0];
         assert_eq!(
-            plan.ref_update_lines(),
-            vec![format!(
+            format!(
+                "update {} {} {}",
+                update.name,
+                update.new.to_hex(),
+                update.old.to_hex()
+            ),
+            format!(
                 "update refs/heads/main {} {}",
                 oid(2).to_hex(),
                 oid(1).to_hex()
-            )]
+            )
         );
     }
 }

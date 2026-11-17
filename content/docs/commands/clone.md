@@ -31,6 +31,8 @@ Cloning a plain local path hard-links the source's packfiles, like `git clone --
 
 Without `<dir>`, the directory is named after the last path component of the URL with any `.git` suffix removed (splitting on both `/` and `\`, so Windows paths like `..\..\origin.git` clone into `origin`), so `https://github.com/gitbutlerapp/grit.git` clones into `grit`. The destination must not exist or must be empty. If the path already exists and is not empty, grit refuses the clone and leaves the directory and its files unchanged.
 
+For a local path or `file://` URL, grit checks that the source exists and is a repository (or a bundle file) **before** creating the destination directory. A typo or missing path fails with exit code **128** and leaves no new directory behind. Cloning from a real empty bare repository at another path is unchanged: grit still creates the destination and reports `empty_remote` when the remote has no commits.
+
 On an interactive terminal (human output, not `--json` or `--markdown`), each step of the clone gets one live line on stderr: **Receiving** (pack bytes), **Indexing** (objects), **Resolving** (deltas) and **Checkout** (files). Each line has a scrolling, colored graph of throughput over the last few seconds, a count, a completion bar when the total is known, the current rate and the elapsed time. When a step finishes, its line stays on screen with a graph of the whole step, the total and the average rate.
 
 While the pack streams in, grit counts its objects as they arrive (the total comes from the pack header), so the **Receiving** line shows `received/total` objects and a completion bar, as Git's does. Under the live line, an **Overall** bar estimates how far the whole clone is and how long is left:
@@ -42,11 +44,15 @@ While the pack streams in, grit counts its objects as they arrive (the total com
 
 The step under way is projected from its own pace so far. Steps that have not started are sized from the pack's object and delta counts at typical indexing, delta and checkout rates. Before any objects arrive (while the remote is still preparing the pack), the bar shows `estimating`. The percentage never goes down, but the time left can grow when objects slow down, for example when large blobs follow many small commits. The overall bar needs an ANSI terminal; it is cleared once the clone finishes, before the summary.
 
-After the clone, stdout gets a summary: total time with a bar showing where it went (including time spent connecting before any data arrives and finishing after the last step), bytes received with average and peak throughput, objects by type, branches and tags, and the files and bytes in the work tree. Colors follow the terminal and are turned off by `NO_COLOR`.
+After the clone, stdout gets a summary: total time with a bar showing where it went, bytes received with average and peak throughput, objects by type, branches and tags, and the files and bytes in the work tree. Colors follow the terminal and are turned off by `NO_COLOR`.
+
+Over the network, the bar splits the wait before any pack data arrives into three parts: **handshake** (opening the connection — TCP, TLS or SSH, and starting the server's `upload-pack` — until its advertisement is read), **negotiate** (listing refs and the `want`/`have` exchange, until the final request is sent) and **pack prep** (the server counting and compressing objects, until the first pack byte). Local clones and bundles have no such stretch; any wait before their first step shows as **connect**. Time after the last step (writing refs and config) shows as **finish**, and gaps between steps as **other**.
+
+When `core.ignorecase` is enabled, grit stores every remote branch and tag during clone, including pairs that differ only by ASCII case (for example `Release` and `release`), in one `packed-refs` write — the same layout Git uses on APFS and NTFS. Later fetches into a loose files ref store can reject the second spelling of such a pair; see [`grit fetch`](../fetch/).
 
 On a case-insensitive filesystem (`core.ignorecase`), when the repository contains paths that differ only by case (or other spellings that map to one on-disk file), grit prints a **warning** on **stderr** (human mode only) listing every colliding index path. Only one path from each group exists on disk; the summary **files** and **worktree_bytes** counts reflect distinct on-disk files, not the number of index entries. With `commit.autoStage` (the default), grit does not auto-stage collision losers — their index blobs stay as recorded in the tree even though the work tree shows them as modified.
 
-When the checked-out tree contains **submodule gitlinks** (mode `160000`), grit creates an empty directory at each path and does **not** fetch the nested repository. There is no `grit submodule` command and no `--recurse-submodules` flag. After a successful checkout, human and `--markdown` output print a one-line **note** on stderr listing how many gitlinks were found; `--json` includes a `submodule_paths` array (omitted when empty). Use the system `git` command if you need submodule checkout or updates.
+When the checked-out tree contains **gitlinks** (mode `160000`), grit creates an empty directory at each path and does **not** fetch the nested repository. There is no `grit submodule` command and no `--recurse-submodules` flag. Paths listed in `.gitmodules` are **submodules**: human and `--markdown` output print a **note** on stderr that grit does not fetch them; `--json` includes `submodule_paths` (omitted when empty). Gitlinks with **no** `.gitmodules` entry are **bare gitlinks** (often from copying a nested repo into a parent tree): a separate note explains that the checkout directory is empty and is not a submodule; `--json` includes `bare_gitlink_paths` (omitted when empty). Use the system `git` command if you need submodule checkout or updates.
 
 ### Starting from the server's bundle
 
@@ -63,6 +69,8 @@ The bundle download has its own display: an arrow and the bundle's URL, then a b
 ```
 
 When it finishes, the line becomes `✓ bundle 58.5 MiB in 8.5s · 5.23 MiB/s · resumed at 14.1 MiB`, and the summary gets a `bundle` row. Shallow (`--depth`) and partial (`--blobs`) clones never use a bundle, and `transfer.bundleURI=false` in config turns bundles off. When the bundle cannot be used, clone warns and fetches everything as usual.
+
+The advertised bundle URL usually has no credentials in it. If the clone URL carries `user:password@` (typical for CI tokens), grit reuses that authentication for the bundle download when it is on the same host as the repository. Authentication failures are not retried like a dropped connection.
 
 For private GitHub repositories over HTTPS, sign in first with [`grit auth`](../auth/). For other hosts, save a user name and token first with `grit auth <url> --username <user> --token <token>`.
 
@@ -160,23 +168,23 @@ Clone a repository from GitHub:
 ```console
 $ grit clone https://github.com/BurntSushi/ripgrep.git
 Cloning https://github.com/BurntSushi/ripgrep.git → ripgrep
-  remote: Enumerating objects: 14062, done.
-  remote: Counting objects: 100% (83/83), done.
-  remote: Compressing objects: 100% (47/47), done.
-  remote: Total 14062 (delta 51), reused 36 (delta 36), pack-reused 13979 (from 2)
-✓ Receiving  ▃▃▃▃▆▆▆███▆▆▆▆▆▆▆▆▆▆▆▆▇▇▇▅▅▅          5.67 MiB         13.0 MiB/s   435ms
-✓ Indexing   ▆▆▆▆▆▆▆▆▆▆▆▆▆▆██████████████    14,062 objects   343.1k objects/s    40ms
-✓ Resolving  ████████████████████████████      9,840 deltas    370.3k deltas/s    26ms
-✓ Checkout   ████████████████████████████         237 files       4.6k files/s    51ms
+  remote: Enumerating objects: 14184, done.
+  remote: Counting objects: 100% (182/182), done.
+  remote: Compressing objects: 100% (99/99), done.
+  remote: Total 14184 (delta 128), reused 83 (delta 83), pack-reused 14002 (from 2)
+✓ Receiving  ███████████▅▅▅▅▅▅▅▅▅▅          5.76 MiB         39.6 MiB/s   145ms
+✓ Indexing   █████████████████████    14,184 objects   288.2k objects/s    49ms
+✓ Resolving                             9,918 deltas    833.1k deltas/s    11ms
+✓ Checkout   █████████████████████         226 files      10.6k files/s    21ms
 
-✓ Cloned into ripgrep on master in 1.6s
+✓ Cloned into ripgrep on master in 1.2s
 
-  time      ················███████████·▓▒·········░  1.6s
-            · connect 651ms  █ receiving 435ms  ▓ indexing 40ms  ▒ resolving 26ms  · other 359ms  ░ checkout 51ms
-  data      5.67 MiB received · 13.0 MiB/s avg · 20.1 MiB/s peak
-  objects   14,062 · 2,327 commits · 6,351 trees · 5,112 blobs · 272 tags
-  refs      16 branches · 272 tags
-  files     237 files · 3.11 MiB in the work tree
+  time      ·······························█████·▓▓▒  1.2s
+            · handshake 475ms  · negotiate 197ms  · pack prep 312ms  █ receiving 145ms  ▓ indexing 49ms  ▒ resolving 11ms  ░ checkout 21ms
+  data      5.76 MiB received · 39.6 MiB/s avg · 45.3 MiB/s peak
+  objects   14,184 · 2,343 commits · 6,420 trees · 5,147 blobs · 274 tags
+  refs      16 branches · 274 tags
+  files     226 files · 3.09 MiB in the work tree
 ```
 
 Progress lines are written to stderr and update in place on a terminal; the time bar and legend are colored by step there. When stderr is not a TTY (for example in a CI log or with stderr redirected), only the initial `Cloning into …` line is written to stderr, and the summary still appears on stdout.
@@ -219,7 +227,7 @@ Pass `--json` for stable, scripting-friendly output:
 
 | Field | Type | Meaning |
 | ----- | ---- | ------- |
-| `url` | string | The URL or path that was cloned. |
+| `url` | string | The URL or path that was cloned. For network URLs, embedded credentials are stripped from this display copy (the configured `remote.<name>.url` keeps the caller's URL). |
 | `path` | string | Directory the clone was created in. |
 | `remote` | string | Remote name configured for the source (`origin` by default). |
 | `single_branch` | boolean | Whether only one branch was fetched. |
@@ -241,7 +249,8 @@ Pass `--json` for stable, scripting-friendly output:
 | `tags` | integer | Remote tags fetched. |
 | `files` | integer | Working-tree files checked out (distinct on-disk paths when `core.ignorecase` collapsed spellings). |
 | `path_collisions` | array of strings | Index paths that collided during checkout on a case-insensitive filesystem. Omitted when empty. |
-| `submodule_paths` | array of strings | Gitlink paths in the checked-out tree. Grit does not fetch submodule repositories. Omitted when empty. |
+| `submodule_paths` | array of strings | Gitlink paths listed in `.gitmodules`. Grit does not fetch submodule repositories. Omitted when empty. |
+| `bare_gitlink_paths` | array of strings | Gitlink paths with no `.gitmodules` entry (empty directories after checkout). Omitted when empty. |
 | `object_types` | object or null | Objects received by type: `commits`, `trees`, `blobs` and `tags` (annotated tag objects). Populated when grit indexed the received pack or can tally every object in the transfer. `null` when a local pack link installed more objects than the transfer summary tracks individually (typical for a single linked pack on clone). |
 | `worktree_bytes` | integer | Total size of the checked-out files. |
 | `seconds` | number | Wall-clock seconds for the whole clone. |
@@ -249,7 +258,8 @@ Pass `--json` for stable, scripting-friendly output:
 | `bare` | boolean | `true` when `--bare` was used. |
 | `no_checkout_reason` | string or omitted | When no files were checked out: `empty_remote`, `unborn_default_branch`, `bare`, or `no_checkout`. Omitted when checkout succeeded. |
 | `branches_with_commits` | array of strings | Remote branch names that have commits when `no_checkout_reason` is `unborn_default_branch`. Omitted when empty. |
-| `bundle` | object or omitted | The server's prebuilt bundle the clone started from: `uri`, `bytes` (its size) and `resumed_from` (bytes an earlier, interrupted clone had already downloaded). `objects` and `bytes` above include what it brought. Omitted when no bundle was used. |
+| `bundle` | object or omitted | The server's prebuilt bundle the clone started from: `uri` (credentials stripped like `url`), `bytes` (its size) and `resumed_from` (bytes an earlier, interrupted clone had already downloaded). `objects` and `bytes` above include what it brought. Omitted when no bundle was used. |
+| `space` | string or omitted | For a clone of an organization's project on grithub (the default grit host): your space's project, `<you>/<project>`. Pushes from the clone go there (`remote.origin.pushurl`), and a `space` remote fetches from it; see [`grit sync`](../sync/). Omitted otherwise, or when you aren't signed in. |
 
 Example (repository with commits):
 

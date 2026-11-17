@@ -1,9 +1,8 @@
 //! Shared revision resolution error text for commands.
 
 use anyhow::Error as AnyhowError;
-use grit_lib::error::Error as LibError;
-use grit_lib::object_inspect::ResolveError;
-use grit_lib::revwalk::rev_parse_error::{AmbiguousChangeIdHint, RevParseError};
+use grit_lib::revwalk::object_inspect::ResolveError;
+use grit_lib::revwalk::rev_parse_error::AmbiguousChangeIdHint;
 
 use crate::json_error;
 
@@ -21,54 +20,15 @@ pub fn format_ambiguous_change_id(spec: &str, candidates: &[AmbiguousChangeIdHin
     msg
 }
 
-/// Map a library [`LibError`] from revision parsing to a user-facing message.
-#[must_use]
-pub fn map_lib_revision_error(err: &LibError) -> Option<String> {
-    match err {
-        LibError::RevParse(RevParseError::AmbiguousChangeId { prefix, candidates }) => {
-            Some(format_ambiguous_change_id(prefix, candidates))
-        }
-        LibError::RevParse(RevParseError::InvalidObjectName { name }) => {
-            Some(format!("revision '{name}' not found"))
-        }
-        LibError::RevParse(RevParseError::AmbiguousArgument { spec }) => {
-            Some(format!("revision '{spec}' not found"))
-        }
-        LibError::RevParse(RevParseError::ReflogDateUnparseable { date }) => {
-            Some(format!("invalid reflog date '{date}'"))
-        }
-        LibError::ObjectNotFound(spec) => Some(format!("revision '{spec}' not found")),
-        _ => None,
-    }
-}
-
-/// Map an error from expanding commit arguments (`grit pick` / `grit revert`) to a user-facing error.
-#[must_use]
-pub fn map_commit_spec_error(err: LibError) -> AnyhowError {
-    match err {
-        LibError::RevParse(RevParseError::InvalidObjectName { name }) => {
-            json_error::structured_revision_not_found(format!("revision '{name}' not found"))
-        }
-        LibError::RevParse(RevParseError::AmbiguousArgument { spec }) => {
-            json_error::structured_revision_not_found(format!("revision '{spec}' not found"))
-        }
-        LibError::ObjectNotFound(spec) => {
-            json_error::structured_revision_not_found(format!("revision '{spec}' not found"))
-        }
-        LibError::RevParse(RevParseError::AmbiguousChangeId { prefix, candidates }) => {
-            AnyhowError::msg(format_ambiguous_change_id(&prefix, &candidates))
-        }
-        LibError::RevParse(RevParseError::ReflogDateUnparseable { date }) => {
-            AnyhowError::msg(format!("invalid reflog date '{date}'"))
-        }
-        LibError::InvalidRef(msg) => AnyhowError::msg(msg),
-        other => AnyhowError::new(other),
-    }
-}
-
 /// Map [`ResolveError`] from [`Repository::resolve`](grit_lib::repo::Repository::resolve).
 #[must_use]
-pub fn map_resolve_error(spec: &str, err: ResolveError) -> AnyhowError {
+pub fn map_resolve_error(spec: &str, err: grit_lib::error::Error) -> AnyhowError {
+    let err = match err {
+        grit_lib::error::Error::Revision(grit_lib::error::RevisionError::Resolve(resolve)) => {
+            resolve
+        }
+        other => return AnyhowError::new(other),
+    };
     match err {
         ResolveError::AmbiguousShortObject { candidates, .. } => {
             let mut msg = format!("ambiguous short object id '{spec}'");

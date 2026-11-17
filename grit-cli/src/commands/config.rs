@@ -1,23 +1,19 @@
 //! `grit config` — read, set, and list configuration values.
 
-use std::io::Write;
 use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
 use grit_lib::config::environment::Environment;
+use grit_lib::config::git_path::user_display_path;
 use grit_lib::config::{
-    add_config_value, canonical_key, canonicalize_config_write_value, remove_config_section,
-    rename_config_section, set_config_value, unset_all_config_values, unset_config_value,
-    ConfigEntry as LibConfigEntry, ConfigLocation, ConfigScope, ConfigSet, ConfigValueType,
+    canonical_key, canonicalize_config_write_value, ConfigEditor, ConfigEntry as LibConfigEntry,
+    ConfigLocation, ConfigScope, ConfigSet, ConfigValueType, ConfigWriteOptions,
     ConfigWritePreview,
 };
-use grit_lib::error::ConfigError;
-use schemars::JsonSchema;
-use serde::Serialize;
+use grit_lib::repo::Repository;
 
 use crate::context;
-use crate::markdown;
-use crate::output::{outln, HumanRender, MarkdownRender, OutputMode, RenderContext};
+pub use crate::render::config::*;
 
 /// CLI mapping for `--type`.
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
@@ -34,285 +30,6 @@ impl From<ConfigTypeArg> for ConfigValueType {
             ConfigTypeArg::Int => Self::Int,
             ConfigTypeArg::Path => Self::Path,
         }
-    }
-}
-
-/// One value in a `get_all` outcome.
-#[derive(Serialize, JsonSchema, Clone)]
-pub struct ConfigValueWithOrigin {
-    pub value: Option<String>,
-    pub scope: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schemars(skip_serializing_if = "Option::is_none")]
-    pub file: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schemars(skip_serializing_if = "Option::is_none")]
-    pub line: Option<u64>,
-}
-
-/// Result of `grit config`, tagged by `action`.
-#[derive(Serialize, JsonSchema)]
-#[serde(tag = "action", rename_all = "snake_case")]
-pub enum ConfigOutcome {
-    Get {
-        key: String,
-        value: Option<String>,
-        scope: Option<String>,
-        file: Option<String>,
-        line: Option<u64>,
-    },
-    GetAll {
-        key: String,
-        values: Vec<ConfigValueWithOrigin>,
-    },
-    List {
-        entries: Vec<ConfigEntry>,
-    },
-    Set {
-        key: String,
-        value: String,
-        #[serde(default, skip_serializing_if = "is_false")]
-        dry_run: bool,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        #[schemars(skip_serializing_if = "Option::is_none")]
-        preview: Option<String>,
-    },
-    Add {
-        key: String,
-        value: String,
-        #[serde(default, skip_serializing_if = "is_false")]
-        dry_run: bool,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        #[schemars(skip_serializing_if = "Option::is_none")]
-        preview: Option<String>,
-    },
-    Unset {
-        key: String,
-        #[serde(default, skip_serializing_if = "is_false")]
-        dry_run: bool,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        #[schemars(skip_serializing_if = "Option::is_none")]
-        preview: Option<String>,
-    },
-    UnsetAll {
-        key: String,
-        removed: u64,
-        #[serde(default, skip_serializing_if = "is_false")]
-        dry_run: bool,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        #[schemars(skip_serializing_if = "Option::is_none")]
-        preview: Option<String>,
-    },
-    RenameSection {
-        old_name: String,
-        new_name: String,
-        #[serde(default, skip_serializing_if = "is_false")]
-        dry_run: bool,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        #[schemars(skip_serializing_if = "Option::is_none")]
-        preview: Option<String>,
-    },
-    RemoveSection {
-        section: String,
-        #[serde(default, skip_serializing_if = "is_false")]
-        dry_run: bool,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        #[schemars(skip_serializing_if = "Option::is_none")]
-        preview: Option<String>,
-    },
-}
-
-fn is_false(v: &bool) -> bool {
-    !*v
-}
-
-/// One entry in a `list` outcome. `value` is `null` for a bare/valueless key.
-#[derive(Serialize, JsonSchema)]
-pub struct ConfigEntry {
-    pub key: String,
-    pub value: Option<String>,
-    pub scope: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schemars(skip_serializing_if = "Option::is_none")]
-    pub file: Option<String>,
-}
-
-impl HumanRender for ConfigOutcome {
-    fn render_human(&self, w: &mut dyn Write, _ctx: &RenderContext) -> Result<()> {
-        match self {
-            ConfigOutcome::Get {
-                value: Some(value), ..
-            } => outln!(w, "{value}"),
-            ConfigOutcome::Get { value: None, .. } => {}
-            ConfigOutcome::GetAll { values, .. } => {
-                for v in values {
-                    if let Some(value) = &v.value {
-                        outln!(w, "{value}");
-                    }
-                }
-            }
-            ConfigOutcome::List { entries } => {
-                for entry in entries {
-                    match &entry.value {
-                        Some(value) => outln!(w, "{}={value}", entry.key),
-                        None => outln!(w, "{}", entry.key),
-                    }
-                }
-            }
-            ConfigOutcome::Set {
-                preview, dry_run, ..
-            }
-            | ConfigOutcome::Add {
-                preview, dry_run, ..
-            }
-            | ConfigOutcome::Unset {
-                preview, dry_run, ..
-            }
-            | ConfigOutcome::UnsetAll {
-                preview, dry_run, ..
-            }
-            | ConfigOutcome::RenameSection {
-                preview, dry_run, ..
-            }
-            | ConfigOutcome::RemoveSection {
-                preview, dry_run, ..
-            } => {
-                if *dry_run {
-                    if let Some(p) = preview {
-                        outln!(w, "{p}");
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
-impl MarkdownRender for ConfigOutcome {
-    fn render_markdown(&self, w: &mut dyn Write, _ctx: &RenderContext) -> Result<()> {
-        match self {
-            ConfigOutcome::Get {
-                key,
-                value,
-                scope,
-                file,
-                line,
-            } => {
-                outln!(w, "# Config `{key}`");
-                outln!(w);
-                match value {
-                    Some(v) => outln!(w, "**Value:** `{v}`"),
-                    None => outln!(w, "**Value:** _not set_"),
-                }
-                if let Some(scope) = scope {
-                    outln!(w, "**Scope:** `{scope}`");
-                }
-                if let Some(file) = file {
-                    outln!(w, "**File:** `{file}`");
-                }
-                if let Some(line) = line {
-                    outln!(w, "**Line:** {line}");
-                }
-            }
-            ConfigOutcome::GetAll { key, values } => {
-                outln!(w, "# Config `{key}` (all values)");
-                outln!(w);
-                for v in values {
-                    outln!(
-                        w,
-                        "- `{}` ({})",
-                        v.value.as_deref().unwrap_or("true"),
-                        v.scope
-                    );
-                }
-            }
-            ConfigOutcome::List { entries } => markdown::print_config_entries(w, entries)?,
-            ConfigOutcome::Set {
-                key,
-                value,
-                dry_run,
-                preview,
-            }
-            | ConfigOutcome::Add {
-                key,
-                value,
-                dry_run,
-                preview,
-            } => {
-                if *dry_run {
-                    outln!(
-                        w,
-                        "Dry-run: would set `{key}` = {value}. {}",
-                        preview.as_deref().unwrap_or("")
-                    );
-                } else {
-                    outln!(w, "Set `{key}` = {value}.");
-                }
-            }
-            ConfigOutcome::Unset {
-                key,
-                dry_run,
-                preview,
-            } => {
-                if *dry_run {
-                    outln!(
-                        w,
-                        "Dry-run: would unset `{key}`. {}",
-                        preview.as_deref().unwrap_or("")
-                    );
-                } else {
-                    outln!(w, "Unset `{key}`.");
-                }
-            }
-            ConfigOutcome::UnsetAll {
-                key,
-                removed,
-                dry_run,
-                preview,
-            } => {
-                if *dry_run {
-                    outln!(
-                        w,
-                        "Dry-run: would unset-all `{key}` ({removed} values). {}",
-                        preview.as_deref().unwrap_or("")
-                    );
-                } else {
-                    outln!(w, "Unset all `{key}` ({removed} values).");
-                }
-            }
-            ConfigOutcome::RenameSection {
-                old_name,
-                new_name,
-                dry_run,
-                preview,
-            } => {
-                if *dry_run {
-                    outln!(
-                        w,
-                        "Dry-run: rename `{old_name}` → `{new_name}`. {}",
-                        preview.as_deref().unwrap_or("")
-                    );
-                } else {
-                    outln!(w, "Renamed section `{old_name}` → `{new_name}`.");
-                }
-            }
-            ConfigOutcome::RemoveSection {
-                section,
-                dry_run,
-                preview,
-            } => {
-                if *dry_run {
-                    outln!(
-                        w,
-                        "Dry-run: remove section `{section}`. {}",
-                        preview.as_deref().unwrap_or("")
-                    );
-                } else {
-                    outln!(w, "Removed section `{section}`.");
-                }
-            }
-        }
-        Ok(())
     }
 }
 
@@ -347,7 +64,7 @@ pub fn run(
     dry_run: bool,
     key: Option<String>,
     value: Option<String>,
-    mode: OutputMode,
+    human: bool,
 ) -> Result<ConfigOutcome> {
     let write_action = unset
         || unset_all
@@ -396,7 +113,7 @@ pub fn run(
         system,
         worktree,
         file.as_ref(),
-        mode,
+        human,
         dry_run,
     ) && !get_all
         && !unset_all
@@ -429,7 +146,7 @@ pub fn run(
         if value.is_some() {
             bail!("--all does not take a value");
         }
-        return get_all_values(read_location, &env, &key, value_type, default_value, mode);
+        return get_all_values(read_location, &env, &key, value_type, default_value);
     }
 
     if unset_all {
@@ -459,7 +176,7 @@ pub fn run(
         return set_value(write_location, &env, &key, &stored, dry_run);
     }
 
-    get_value(read_location, &env, &key, value_type, default_value, mode)
+    get_value(read_location, &env, &key, value_type, default_value, human)
 }
 
 fn preview_text(preview: &Option<ConfigWritePreview>) -> Option<String> {
@@ -485,16 +202,10 @@ fn default_repo_hot_path(
     system: bool,
     worktree: bool,
     file: Option<&PathBuf>,
-    mode: OutputMode,
+    human: bool,
     dry_run: bool,
 ) -> bool {
-    !dry_run
-        && !global
-        && !local
-        && !system
-        && !worktree
-        && file.is_none()
-        && matches!(mode, OutputMode::Human)
+    !dry_run && !global && !local && !system && !worktree && file.is_none() && human
 }
 
 fn hot_get_in_repo(
@@ -502,7 +213,7 @@ fn hot_get_in_repo(
     key: &str,
 ) -> Result<ConfigOutcome> {
     let config = read_merged_config(env)?;
-    match config.get(key) {
+    match crate::context::config_string(&config, key) {
         Some(value) => Ok(ConfigOutcome::Get {
             key: key.to_owned(),
             value: Some(value),
@@ -525,17 +236,11 @@ fn hot_get_in_repo(
 
 fn hot_set_in_repo(key: &str, value: &str, dry_run: bool) -> Result<ConfigOutcome> {
     let repo = context::discover()?;
-    let env = context::environment();
-    let git_dir = repo.git_dir().to_path_buf();
-    let preview = set_config_value(
-        ConfigLocation::Local,
-        &env,
-        Some(&git_dir),
-        key,
-        value,
-        dry_run,
-    )
-    .with_context(|| format!("could not set {key}"))?;
+    let options = ConfigWriteOptions::new().dry_run(dry_run);
+    let preview = repo
+        .config()
+        .set(ConfigScope::Local, key, value, &options)
+        .with_context(|| format!("could not set {key}"))?;
     Ok(ConfigOutcome::Set {
         key: key.to_owned(),
         value: value.to_owned(),
@@ -546,26 +251,27 @@ fn hot_set_in_repo(key: &str, value: &str, dry_run: bool) -> Result<ConfigOutcom
 
 fn hot_unset_in_repo(key: &str, dry_run: bool) -> Result<ConfigOutcome> {
     let repo = context::discover()?;
-    let env = context::environment();
-    let git_dir = repo.git_dir().to_path_buf();
-    match unset_config_value(ConfigLocation::Local, &env, Some(&git_dir), key, dry_run) {
+    let options = ConfigWriteOptions::new().dry_run(dry_run);
+    match repo.config().unset(ConfigScope::Local, key, &options) {
         Ok(preview) => Ok(ConfigOutcome::Unset {
             key: key.to_owned(),
             dry_run,
             preview: preview_text(&preview),
         }),
-        Err(grit_lib::error::Error::Config(ConfigError::KeyNotSet { .. })) => {
-            bail!("key '{key}' is not set");
-        }
-        Err(e) => Err(e.into()),
+        Err(e) => Err(crate::error_map::map_config_unset_error(key, e)),
     }
 }
 
 fn read_merged_config(env: &grit_lib::config::environment::Environment) -> Result<ConfigSet> {
-    if let Ok(repo) = context::discover() {
-        ConfigSet::load(env, Some(repo.git_dir()), true).context("could not load config")
+    if let Ok((_, config)) = context::locate_repository_with_config() {
+        Ok(config)
     } else {
-        ConfigSet::load(env, None, true).context("could not load config")
+        ConfigSet::load(
+            env,
+            None,
+            &grit_lib::config::LoadConfigOptions::standard(env, None),
+        )
+        .context("could not load config")
     }
 }
 
@@ -581,11 +287,55 @@ pub fn set_global(key: &str, value: &str) -> Result<()> {
     .map(|_| ())
 }
 
+fn write_options(dry_run: bool) -> ConfigWriteOptions {
+    ConfigWriteOptions::new().dry_run(dry_run)
+}
+
+fn with_write_target<R>(
+    location: ConfigLocation,
+    env: &Environment,
+    repo_op: impl FnOnce(&Repository, ConfigScope) -> grit_lib::error::Result<R>,
+    editor_op: impl FnOnce(&ConfigEditor) -> grit_lib::error::Result<R>,
+) -> grit_lib::error::Result<R> {
+    match location {
+        ConfigLocation::File(path) => {
+            let editor = ConfigEditor::open(env, path, ConfigScope::Local);
+            editor_op(&editor)
+        }
+        ConfigLocation::Local | ConfigLocation::Worktree => {
+            let repo = crate::error_map::discover_for_config_write()?;
+            let scope = match location {
+                ConfigLocation::Local => ConfigScope::Local,
+                ConfigLocation::Worktree => ConfigScope::Worktree,
+                _ => unreachable!(),
+            };
+            repo_op(&repo, scope)
+        }
+        ConfigLocation::Global | ConfigLocation::System => {
+            if let Ok(repo) = context::discover() {
+                let scope = match location {
+                    ConfigLocation::Global => ConfigScope::Global,
+                    ConfigLocation::System => ConfigScope::System,
+                    _ => unreachable!(),
+                };
+                repo_op(&repo, scope)
+            } else {
+                let editor = match location {
+                    ConfigLocation::Global => ConfigEditor::global(env)?,
+                    ConfigLocation::System => ConfigEditor::system(env),
+                    _ => unreachable!(),
+                };
+                editor_op(&editor)
+            }
+        }
+    }
+}
+
 fn map_origin(o: grit_lib::config::ConfigValueOrigin) -> ConfigValueWithOrigin {
     ConfigValueWithOrigin {
         value: o.value,
         scope: o.scope.to_string(),
-        file: o.file.as_ref().map(|p| p.display().to_string()),
+        file: o.file.as_ref().map(|p| user_display_path(p)),
         line: o.line.map(|l| l as u64),
     }
 }
@@ -596,7 +346,7 @@ fn get_value(
     key: &str,
     value_type: Option<ConfigTypeArg>,
     default_value: Option<String>,
-    mode: OutputMode,
+    human: bool,
 ) -> Result<ConfigOutcome> {
     canonical_key(key).with_context(|| format!("invalid config key {key}"))?;
     let config = load_for_read(read_location, env)?;
@@ -614,7 +364,7 @@ fn get_value(
         };
         let typed = grit_lib::config::parse_typed_value(key, ty.into(), &raw, env)?;
         let value = typed.to_canonical_string();
-        if matches!(mode, OutputMode::Human) {
+        if human {
             return Ok(ConfigOutcome::Get {
                 key: key.to_owned(),
                 value: Some(value),
@@ -624,14 +374,14 @@ fn get_value(
             });
         }
         let origin = config
-            .get_with_origin(key)
+            .origin_of(key)
             .with_context(|| format!("invalid config key {key}"))?;
         return Ok(match origin {
             Some(o) => ConfigOutcome::Get {
                 key: key.to_owned(),
                 value: Some(value),
                 scope: Some(o.scope.to_string()),
-                file: o.file.as_ref().map(|p| p.display().to_string()),
+                file: o.file.as_ref().map(|p| user_display_path(p)),
                 line: o.line.map(|l| l as u64),
             },
             None => ConfigOutcome::Get {
@@ -644,8 +394,8 @@ fn get_value(
         });
     }
 
-    if matches!(mode, OutputMode::Human) {
-        match config.get(key) {
+    if human {
+        match crate::context::config_string(&config, key) {
             Some(value) => {
                 return Ok(ConfigOutcome::Get {
                     key: key.to_owned(),
@@ -677,14 +427,14 @@ fn get_value(
     }
 
     let origin = config
-        .get_with_origin(key)
+        .origin_of(key)
         .with_context(|| format!("invalid config key {key}"))?;
     Ok(match origin {
         Some(o) => ConfigOutcome::Get {
             key: key.to_owned(),
             value: o.value,
             scope: Some(o.scope.to_string()),
-            file: o.file.as_ref().map(|p| p.display().to_string()),
+            file: o.file.as_ref().map(|p| user_display_path(p)),
             line: o.line.map(|l| l as u64),
         },
         None => ConfigOutcome::Get {
@@ -702,7 +452,7 @@ fn resolve_get_raw(
     key: &str,
     default_value: Option<&str>,
 ) -> Result<Option<String>> {
-    if let Some(v) = config.get(key) {
+    if let Some(v) = crate::context::config_string(config, key) {
         return Ok(Some(v));
     }
     Ok(default_value.map(str::to_owned))
@@ -714,10 +464,9 @@ fn get_all_values(
     key: &str,
     value_type: Option<ConfigTypeArg>,
     default_value: Option<String>,
-    _mode: OutputMode,
 ) -> Result<ConfigOutcome> {
     let config = load_for_read(read_location, env)?;
-    let mut origins = config.get_all_with_origin(key)?;
+    let mut origins = config.origins_of(key)?;
     if origins.is_empty() {
         if let Some(def) = default_value {
             origins.push(grit_lib::config::ConfigValueOrigin {
@@ -737,7 +486,7 @@ fn get_all_values(
                 Ok(ConfigValueWithOrigin {
                     value: Some(typed.to_canonical_string()),
                     scope: o.scope.to_string(),
-                    file: o.file.as_ref().map(|p| p.display().to_string()),
+                    file: o.file.as_ref().map(|p| user_display_path(p)),
                     line: o.line.map(|l| l as u64),
                 })
             })
@@ -758,7 +507,7 @@ fn list_values(
 ) -> Result<ConfigOutcome> {
     let config = load_for_read(read_location, env)?;
     let lib_entries: Vec<LibConfigEntry> = if let Some(prefix) = prefix {
-        config.entries_with_prefix(prefix)?
+        config.entries_under(prefix)?
     } else {
         config.entries().to_vec()
     };
@@ -768,8 +517,7 @@ fn list_values(
             key: entry.key.clone(),
             value: entry.value.clone(),
             scope: entry.scope.to_string(),
-            file: grit_lib::config::config_entry_origin_file(entry)
-                .map(|p| p.display().to_string()),
+            file: grit_lib::config::config_entry_origin_file(entry).map(user_display_path),
         })
         .collect();
     Ok(ConfigOutcome::List { entries })
@@ -785,9 +533,15 @@ fn set_value(
     let Some(location) = write_location else {
         bail!("internal error: write location missing");
     };
-    let git_dir = git_dir_for_location(&location)?;
-    let preview = set_config_value(location, env, git_dir.as_deref(), key, value, dry_run)
-        .with_context(|| format!("could not set {key}"))?;
+    let options = write_options(dry_run);
+    let preview = with_write_target(
+        location,
+        env,
+        |repo, scope| repo.config().set(scope, key, value, &options),
+        |editor| editor.set(key, value, &options),
+    )
+    .map_err(anyhow::Error::from)
+    .with_context(|| format!("could not set {key}"))?;
     Ok(ConfigOutcome::Set {
         key: key.to_owned(),
         value: value.to_owned(),
@@ -806,9 +560,15 @@ fn add_value(
     let Some(location) = write_location else {
         bail!("internal error: write location missing");
     };
-    let git_dir = git_dir_for_location(&location)?;
-    let preview = add_config_value(location, env, git_dir.as_deref(), key, value, dry_run)
-        .with_context(|| format!("could not add {key}"))?;
+    let options = write_options(dry_run);
+    let preview = with_write_target(
+        location,
+        env,
+        |repo, scope| repo.config().add_value(scope, key, value, &options),
+        |editor| editor.add_value(key, value, &options),
+    )
+    .map_err(anyhow::Error::from)
+    .with_context(|| format!("could not add {key}"))?;
     Ok(ConfigOutcome::Add {
         key: key.to_owned(),
         value: value.to_owned(),
@@ -826,17 +586,19 @@ fn unset_value(
     let Some(location) = write_location else {
         bail!("internal error: write location missing");
     };
-    let git_dir = git_dir_for_location(&location)?;
-    match unset_config_value(location, env, git_dir.as_deref(), key, dry_run) {
+    let options = write_options(dry_run);
+    match with_write_target(
+        location,
+        env,
+        |repo, scope| repo.config().unset(scope, key, &options),
+        |editor| editor.unset(key, &options),
+    ) {
         Ok(preview) => Ok(ConfigOutcome::Unset {
             key: key.to_owned(),
             dry_run,
             preview: preview_text(&preview),
         }),
-        Err(grit_lib::error::Error::Config(ConfigError::KeyNotSet { .. })) => {
-            bail!("key '{key}' is not set");
-        }
-        Err(e) => Err(e.into()),
+        Err(e) => Err(crate::error_map::map_config_unset_error(key, e)),
     }
 }
 
@@ -849,18 +611,20 @@ fn unset_all_cmd(
     let Some(location) = write_location else {
         bail!("internal error: write location missing");
     };
-    let git_dir = git_dir_for_location(&location)?;
-    match unset_all_config_values(location, env, git_dir.as_deref(), key, dry_run) {
+    let options = write_options(dry_run);
+    match with_write_target(
+        location,
+        env,
+        |repo, scope| repo.config().unset_all(scope, key, &options),
+        |editor| editor.unset_all(key, &options),
+    ) {
         Ok((removed, preview)) => Ok(ConfigOutcome::UnsetAll {
             key: key.to_owned(),
             removed: removed as u64,
             dry_run,
             preview: preview_text(&preview),
         }),
-        Err(grit_lib::error::Error::Config(ConfigError::KeyNotSet { .. })) => {
-            bail!("key '{key}' is not set");
-        }
-        Err(e) => Err(e.into()),
+        Err(e) => Err(crate::error_map::map_config_unset_error(key, e)),
     }
 }
 
@@ -874,8 +638,14 @@ fn rename_section_cmd(
     let Some(location) = write_location else {
         bail!("internal error: write location missing");
     };
-    let git_dir = git_dir_for_location(&location)?;
-    let preview = rename_config_section(location, env, git_dir.as_deref(), old, new, dry_run)?;
+    let options = write_options(dry_run);
+    let preview = with_write_target(
+        location,
+        env,
+        |repo, scope| repo.config().rename_section(scope, old, new, &options),
+        |editor| editor.rename_section(old, new, &options),
+    )
+    .map_err(anyhow::Error::from)?;
     Ok(ConfigOutcome::RenameSection {
         old_name: old.to_owned(),
         new_name: new.to_owned(),
@@ -893,8 +663,14 @@ fn remove_section_cmd(
     let Some(location) = write_location else {
         bail!("internal error: write location missing");
     };
-    let git_dir = git_dir_for_location(&location)?;
-    let preview = remove_config_section(location, env, git_dir.as_deref(), section, dry_run)?;
+    let options = write_options(dry_run);
+    let preview = with_write_target(
+        location,
+        env,
+        |repo, scope| repo.config().remove_section(scope, section, &options),
+        |editor| editor.remove_section(section, &options),
+    )
+    .map_err(anyhow::Error::from)?;
     Ok(ConfigOutcome::RemoveSection {
         section: section.to_owned(),
         dry_run,
@@ -918,7 +694,7 @@ fn load_for_read(
 fn git_dir_for_location(location: &ConfigLocation) -> Result<Option<PathBuf>> {
     match location {
         ConfigLocation::Local | ConfigLocation::Worktree => {
-            Ok(Some(context::discover()?.git_dir().to_path_buf()))
+            Ok(Some(context::locate_repository()?.git_dir().to_path_buf()))
         }
         ConfigLocation::Global | ConfigLocation::System | ConfigLocation::File(_) => Ok(None),
     }
@@ -928,7 +704,9 @@ fn optional_git_dir_for_read(location: &ConfigLocation) -> Result<Option<PathBuf
     match location {
         ConfigLocation::Local | ConfigLocation::Worktree => git_dir_for_location(location),
         ConfigLocation::Global | ConfigLocation::System | ConfigLocation::File(_) => {
-            Ok(context::discover().ok().map(|r| r.git_dir().to_path_buf()))
+            Ok(context::locate_repository()
+                .ok()
+                .map(|r| r.git_dir().to_path_buf()))
         }
     }
 }
@@ -968,5 +746,83 @@ fn resolve_location(
         Ok(Some(ConfigLocation::Local))
     } else {
         Ok(None)
+    }
+}
+
+/// Dispatch parsed CLI args for `Config`.
+pub fn dispatch(
+    args: crate::args::ConfigArgs,
+    env: crate::dispatch::CommandEnv<'_>,
+) -> anyhow::Result<crate::exit_status::ExitStatus> {
+    use crate::args::*;
+    use crate::commands;
+
+    use crate::dispatch::CommandEnv;
+    use crate::exit_status::ExitStatus;
+
+    use crate::output::emit;
+
+    use anyhow::bail;
+    let CommandEnv {
+        opts,
+        ctx,
+        process_env,
+    } = env;
+    let ConfigArgs {
+        global,
+        local,
+        system,
+        worktree,
+        file,
+        list,
+        all,
+        add,
+        unset,
+        unset_all,
+        rename_section,
+        rename_section_new,
+        remove_section,
+        value_type,
+        default_value,
+        dry_run,
+        key,
+        value,
+    } = args;
+    {
+        let rename_pair = match (rename_section, rename_section_new) {
+            (Some(old), Some(new)) => Some((old, new)),
+            (None, None) => None,
+            _ => {
+                bail!("--rename-section requires both OLD and --rename-section-new NEW");
+            }
+        };
+        let show_progress = opts.show_progress();
+        let outcome = commands::config::run(
+            process_env,
+            global,
+            local,
+            system,
+            worktree,
+            file,
+            list,
+            unset,
+            unset_all,
+            add,
+            all,
+            value_type,
+            default_value,
+            rename_pair,
+            remove_section,
+            dry_run,
+            key,
+            value,
+            show_progress,
+        )?;
+        let code = commands::config::exit_code(&outcome);
+        emit(outcome, opts, ctx)?;
+        if code != 0 {
+            std::process::exit(code);
+        }
+        Ok(ExitStatus::Success)
     }
 }

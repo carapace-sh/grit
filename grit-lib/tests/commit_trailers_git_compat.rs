@@ -5,6 +5,7 @@ use std::path::Path;
 
 use grit_lib::commit::trailers::{
     append_signoff_trailer, finalize_cherry_pick_message, format_signoff_line,
+    CherryPickMessageOptions,
 };
 use grit_lib::config::environment::Environment;
 use grit_lib::config::ConfigSet;
@@ -44,7 +45,15 @@ fn init_repo(config: &[(&str, &str)]) -> TempDir {
 }
 
 fn repo_config(repo: &Path) -> ConfigSet {
-    ConfigSet::load(&Environment::empty(), Some(&repo.join(".git")), false).expect("load config")
+    ConfigSet::load(
+        &Environment::empty(),
+        Some(&repo.join(".git")),
+        &crate::config::LoadConfigOptions::standard(
+            &Environment::empty(),
+            Some(&repo.join(".git")),
+        ),
+    )
+    .expect("load config")
 }
 
 /// Commits `message` verbatim on top of `base` and returns the new commit id.

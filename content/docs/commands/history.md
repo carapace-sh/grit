@@ -23,10 +23,11 @@ grit history undo [--dry-run]
 
 ## Description
 
-`grit history` groups **stateless** rewrite operations: grit plans how commits and refs should change, writes new commit objects into the object database, then applies ref updates in one atomic batch. There is no sequencer state file and no hooks run during planning. Once a rewrite is applied, grit runs `post-checkout` (`<old HEAD> <new HEAD> 1`) when `HEAD`'s tree changed, then `post-rewrite rebase` with an `<old> <new>` line per rewritten commit on stdin (dropped commits are left out), as Git does after `rebase -i`. `--dry-run` and `history undo` run no hooks. Rewrites preserve stable [change ids](../change-ids/) on surviving logical changes and store derived ids when the source commit had no header.
+`grit history` groups **stateless** rewrite operations: grit plans how commits and refs should change, writes new commit objects into the object database, then applies ref updates in one atomic batch. There is no sequencer state file and no hooks run during planning. Once a rewrite is applied, grit runs `post-checkout` (`<old HEAD> <new HEAD> 1`) when `HEAD`'s tree changed, then `post-rewrite rebase` with an `<old> <new>` line per rewritten commit on stdin (dropped commits are left out), as Git does after `rebase -i`. `--dry-run` and `history undo` run no hooks. Rewrites preserve stable [change ids](../change-ids/) on surviving logical changes and store derived ids when the source commit had no header. With `notes.rewriteRef` set, notes on rewritten commits are copied to the new objects before `post-rewrite` (see [notes](../library/notes.md)).
 
 Shared behavior for every subcommand:
 
+- **Interrupts** — while a rewrite is applying (checkout or ref updates), Ctrl+C (or `SIGTERM` / `SIGHUP` on Unix) stops with `error: operation cancelled` and exit code **130**. Partial work is rolled back and no stale `.git/index.lock` remains. A second interrupt terminates grit without that cleanup.
 - **Conflicts abort** — if replaying a descendant would conflict, nothing is applied (planned objects may already exist in the ODB from planning). The error names the commit that could not be replayed. When that commit is only on another branch that `--update-refs branches` would move (a branch built on top of the edited commit), the error also names that branch and hints at `--update-refs head`, which rewrites only the current branch and leaves the others where they are.
 - **`--dry-run`** — print which refs would move; refs, the index, and the worktree stay unchanged. New commit objects are still written during planning, matching Git’s `git history --dry-run` model. Commit signing is skipped during dry-run planning (no `gpg` / `ssh-keygen` invocation); a full run signs replacement commits when [`commit.gpgsign`](../commit/) is enabled, like [`grit commit`](../commit/).
 - **`--update-refs`** — `branches` (default) updates every local branch whose tip descends from the edited commit, except other branches at the same commit as `HEAD` (a `backup` branch made before the edit keeps the old history); `head` updates only the commit `HEAD` points at.
@@ -259,6 +260,7 @@ Pass `--json` on `grit history drop`, `grit history move`, `grit history reword`
 | `dry_run` | boolean | `true` when `--dry-run` was set. |
 | `commit` | string | `rebase` when paused: source commit for `conflicts`, or `HEAD` after the command for `exec_dirty` (full hex). |
 | `conflicts` | array | `rebase` when `result` is `conflicts`: `{path,kind,summary?}`. |
+| `rerere` | array | `rebase` when `rerere.enabled` is active at a conflict stop (`path`, `kind` as for [`grit merge`](../merge/#json-output)). Omitted when empty. |
 | `next_steps` | array | `rebase` when paused: ordered follow-up `grit` commands. |
 | `alternatives` | array | `rebase` when paused: `grit rebase --abort` and `grit rebase --skip`. |
 

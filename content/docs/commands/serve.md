@@ -8,7 +8,7 @@ order: 7
 ## Synopsis
 
 ```text
-grit serve [--root <path>] [--db <file>] [--bind <host:port>] [--bundle-interval <duration>] [--no-bundles]
+grit serve [--root <path>] [--db <file>] [--bind <host:port>] [--bundle-interval <duration>] [--no-bundles] [--header-timeout <duration>] [--idle-timeout <duration>] [--max-git-requests <n>] [--shutdown-timeout <duration>]
 grit serve --setup [--email <email>] [--root <path>] [--db <file>]
 grit serve add-user <email> [--admin] [--root <path>] [--db <file>]
 grit serve token <email> [--root <path>] [--db <file>]
@@ -20,6 +20,10 @@ grit serve users [--root <path>] [--db <file>]
 
 `grit serve` runs a Git server over HTTP. Any Git client, `git` or `grit`, can clone, fetch and push through it, and a browser shows each repository's branches and recent commits. Fetch speaks Git protocol v0, v1 and v2 (whichever the client asks for); push uses receive-pack, which has no v2 form. Everything runs in-process: the server needs no `git` or other `grit` binary.
 
+Fetch and clone POST bodies (`git-upload-pack`) are streamed as they arrive; the server rejects decoded bodies larger than 1 GiB with HTTP 413 (matching a generous reading of Git's `http.maxRequestBuffer`), which is enough for several million `want` lines. Push bodies are streamed separately and are limited only by each repository's `receive.maxInputSize`.
+
+When a client is still uploading a large POST body, early responses such as `401`, `404`, `403` or `413` drain the remainder of that body (up to the same 1 GiB cap) before the connection closes, so a reverse proxy relays the real status instead of answering `502 Bad Gateway`.
+
 `--root` names what to serve:
 
 - a **directory of repositories**: each child directory that is a repository (bare `project.git` or a working tree `project`) is served as `project`. New repositories show up without a restart.
@@ -30,6 +34,8 @@ Clients reach a repository at `http://<host>:<port>/<name>.git` (the `.git` is o
 ### Users and passwords
 
 A user is an email address with a password. Users, their access and their tokens live in a SQLite database, `grit-serve.db` in the root by default (or in the root's `.git` directory when the root is a working tree, so the file never shows up as untracked). Pick another path with `--db`.
+
+Path strings in the startup banner, errors, and `--json` fields such as `database` use forward slashes and no Windows `\\?\` verbatim prefix, matching other grit commands.
 
 - `grit serve --setup` creates the database and the first **admin** user. It asks for the admin's email (or takes `--email`) and a password. An admin can read and write every repository, and add users in the web view.
 - `grit serve add-user <email>` adds a user. Add `--admin` for another admin.
@@ -52,7 +58,7 @@ A Git request without a valid token gets `401`, and a browser without a session 
 
 The server keeps a prebuilt [bundle](https://git-scm.com/docs/git-bundle) of each repository's branches and tags in `grit-serve/bundles/` inside its Git directory. A background thread builds a repository's first bundle as soon as the server starts (or as soon as the repository gets its first branch), and builds a new one after pushes have changed its refs, once the current bundle is older than `--bundle-interval` (24 hours by default; `0s` rebuilds right after every push). Each bundle gets a new file name and the previous one is kept, so a client part way through downloading the old bundle can still finish it.
 
-Fetches over protocol v2 see the `bundle-uri` command in the server's capabilities. It answers with the current bundle's URL, `http://<host>:<port>/<name>/bundles/<file>`, which serves the file with `Range` support so an interrupted download can resume. [`grit clone`](../clone/) downloads the bundle first and then fetches only what is newer; `git clone` does the same with `-c transfer.bundleURI=true` and a credential helper that knows the token. Downloading a bundle needs read access, like fetching.
+Fetches over protocol v2 see the `bundle-uri` command in the server's capabilities. It answers with the current bundle's URL, `http://<host>:<port>/<name>/bundles/<file>`, which serves the file with `Range` support so an interrupted download can resume. [`grit clone`](../clone/) downloads the bundle first and then fetches only what is newer; credentials embedded in the clone URL apply to that same-origin bundle download as well. `git clone` does the same with `-c transfer.bundleURI=true` and a credential helper that knows the token, because Git's advertised bundle URL has no userinfo. Downloading a bundle needs read access, like fetching.
 
 `--no-bundles` turns this off: nothing is built and nothing is advertised.
 
@@ -71,6 +77,8 @@ Filter support is off by default (matching stock `git upload-pack`). Without it,
 ### Resumable pushes
 
 The push advertisement carries a `pushBundle=/push` capability: a [TUS](https://tus.io/protocols/resumable-upload) upload endpoint at `http://<host>:<port>/<name>/push`. [`grit push`](../push/) sends a large push there as a bundle, in chunks that survive a dropped connection, then posts the usual ref updates to `…/push/<id>/receive`. The server applies them exactly as for a normal push (the same checks, policy and hooks) and answers with the usual push report. Uploading needs write access, and an upload belongs to the user who started it. Unfinished uploads are deleted after a week. Git clients ignore the capability and push the usual way.
+
+Hook scripts on push see the token user's email as `REMOTE_USER` and `GRIT_USER` (not the username in the clone URL), on both `git-receive-pack` and `…/push/<id>/receive`.
 
 | Request | Answer |
 | --- | --- |
@@ -116,6 +124,9 @@ To keep a repository's big blobs out of it, host the LOP as a second repository 
 
 `grit serve` with no subcommand and no `--setup` runs the server until interrupted. It refuses to start until `--setup` has created a user. It listens on `127.0.0.1:8080`; use `--bind 0.0.0.0:8080` to accept connections from other machines. The server speaks plain HTTP, so put it behind a TLS-terminating proxy before sending passwords and tokens across a network you don't trust.
 
+Git smart HTTP connections drop peers that stop sending: `--header-timeout` (default `30s`) closes incomplete request headers, and `--idle-timeout` (default `60s`) closes POST bodies or upload-pack responses that stall between chunks (a large push that keeps sending is unaffected). When `--max-git-requests` concurrent Git operations (default `128`) are already in flight, further `info/refs`, fetch, push and resumable-push apply requests get HTTP `503` immediately instead of queuing, so the web UI and sign-in still have threads to answer.
+
+On SIGTERM, SIGINT or SIGHUP (Ctrl+C on Windows), the server logs that it is closing the listener, stops accepting new connections, and lets in-flight clone and push requests finish. The clone-bundle background thread stops after its current build. By default it waits up to `--shutdown-timeout` (30 seconds) for those requests; `--shutdown-timeout 0s` waits with no cap until they finish. When the grace period ends, remaining connections are closed and in-flight receive-pack hook processes are terminated so the server process can exit. A second signal in that window stops those hooks and exits immediately without waiting.
 ## Options
 
 | Option | Description |
@@ -127,6 +138,10 @@ To keep a repository's big blobs out of it, host the LOP as a second repository 
 | `--email <email>` | Email address of the admin `--setup` creates. Asked for on a terminal when omitted. Requires `--setup`. |
 | `--bundle-interval <duration>` | How old a changed repository's clone bundle gets before a new one is built: a number with `s`, `m`, `h` or `d`. Defaults to `24h`. |
 | `--no-bundles` | Do not build or advertise clone bundles. |
+| `--header-timeout <duration>` | How long to wait for a complete HTTP request header on a new connection before closing it. Defaults to `30s`. |
+| `--idle-timeout <duration>` | How long to wait between bytes on a Git smart HTTP POST body or upload-pack response before closing the connection. Defaults to `60s`. |
+| `--max-git-requests <n>` | Maximum concurrent Git smart HTTP operations (`info/refs`, fetch, push, resumable push). Further requests get HTTP `503`. Defaults to `128`. |
+| `--shutdown-timeout <duration>` | After a shutdown signal, how long to keep serving in-flight requests before closing remaining connections. Defaults to `30s`; `0s` waits until they finish. A second signal exits immediately. |
 | `add-user <email>` | Add a user, named by their email address. Prompts for a password, or generates a temporary one. |
 | `add-user --admin` | Make the new user an admin. |
 | `token <email>` | Create an access token for a user and print it, for scripts and CI. |

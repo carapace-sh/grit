@@ -27,7 +27,7 @@ use crate::diff::{
     diff_index_to_worktree_with_options, is_unregistered_embedded_git_repo, DiffEntry,
     DiffIndexToWorktreeOptions, DiffStatus,
 };
-use crate::error::{ConfigError, Error, Result};
+use crate::error::{ConfigError, Result};
 use crate::hash::{try_par_hash_with, ParallelHashError};
 use crate::ignore::IgnoreMatcher;
 use crate::index::{index_file_mtime, Index, MODE_GITLINK, MODE_TREE};
@@ -37,7 +37,7 @@ use crate::operation::{
 };
 use crate::parallel::ParallelOp;
 use crate::precompose_config::effective_core_precomposeunicode_with_config;
-use crate::repo::Repository;
+use crate::repo::{Repository, RepositoryError};
 use crate::state::{status_operation, HeadState, NextStep, Operation, WtStatusState};
 use crate::unicode_normalization::precompose_utf8_segment;
 
@@ -73,19 +73,6 @@ pub struct RenameDetection {
     pub copies: bool,
 }
 
-/// Test hook type so [`StatusOptions`] stays `Debug`/`Clone`.
-#[derive(Clone)]
-#[doc(hidden)]
-pub struct BeforeOpportunisticIndexWriteHook(
-    #[doc(hidden)] pub std::sync::Arc<dyn Fn() + Send + Sync>,
-);
-
-impl std::fmt::Debug for BeforeOpportunisticIndexWriteHook {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("<before_opportunistic_index_write>")
-    }
-}
-
 /// Inputs that drive **what** `status` computes.
 ///
 /// The CLI translates clap arguments and config (`status.showUntrackedFiles`,
@@ -101,8 +88,8 @@ pub struct StatusOptions {
     pub ignored: IgnoredMode,
     /// Rename/copy detection, or `None` to skip rename detection.
     pub renames: Option<RenameDetection>,
-    /// Limit the report to paths matching these pathspecs (empty = whole tree).
-    pub pathspecs: Vec<String>,
+    /// Limit the report to paths matching this pathspec (`Pathspec::is_entire_tree` = whole tree).
+    pub pathspec: crate::pathspec::Pathspec,
     /// Compute ahead/behind counts relative to the upstream branch.
     pub ahead_behind: bool,
     /// Override parallel index stat workers (`Some(1)` forces serial). Used by tests and embedders.
@@ -122,9 +109,6 @@ pub struct StatusOptions {
     /// read-only status (for example when `GIT_OPTIONAL_LOCKS=0`) set this to `false`; the
     /// default is `true`.
     pub write_index: bool,
-    /// Test hook invoked immediately before an opportunistic index write (deterministic races).
-    #[doc(hidden)]
-    pub before_opportunistic_index_write: Option<BeforeOpportunisticIndexWriteHook>,
 }
 
 /// Map `status.showUntrackedFiles` to [`UntrackedMode`].
@@ -136,9 +120,7 @@ pub struct StatusOptions {
 pub fn untracked_mode_from_config(
     config: &ConfigSet,
 ) -> std::result::Result<UntrackedMode, ConfigError> {
-    let raw = config
-        .get("status.showUntrackedFiles")
-        .or_else(|| config.get("status.showuntrackedfiles"));
+    let raw = config.value("status.showUntrackedFiles");
     match raw {
         None => Ok(UntrackedMode::Normal),
         Some(v) => untracked_mode_from_config_value(&v)
@@ -169,14 +151,15 @@ impl Default for StatusOptions {
             untracked: UntrackedMode::Normal,
             ignored: IgnoredMode::No,
             renames: None,
-            pathspecs: Vec::new(),
+            pathspec: crate::pathspec::Pathspec::entire_tree(
+                crate::pathspec::PathspecGlobalFlags::default(),
+            ),
             ahead_behind: true,
             stat_parallel_threads: None,
             fsmonitor_query_boundary: None,
             now_unix_seconds: None,
             count_stash: false,
             write_index: true,
-            before_opportunistic_index_write: None,
         }
     }
 }
@@ -187,7 +170,7 @@ const STATUS_RENAME_DEFAULT_THRESHOLD: u32 = 50;
 /// Build [`StatusOptions`] from repository config (untracked mode and rename detection).
 ///
 /// CLI callers merge command-line overrides for [`StatusOptions::untracked`],
-/// [`StatusOptions::pathspecs`], and other flags after calling this.
+/// [`StatusOptions::pathspec`], and other flags after calling this.
 pub fn status_options_from_config(
     config: &ConfigSet,
 ) -> std::result::Result<StatusOptions, ConfigError> {
@@ -204,10 +187,10 @@ pub fn status_options_from_config(
 /// `false`/`no`/`off`/`0` disables detection.
 #[must_use]
 pub fn status_renames_from_config(config: &ConfigSet) -> Option<RenameDetection> {
-    if let Some(v) = config.get("status.renames") {
+    if let Some(v) = config.value("status.renames") {
         return parse_status_renames_config_value(&v);
     }
-    if let Some(v) = config.get("diff.renames") {
+    if let Some(v) = config.value("diff.renames") {
         return parse_status_renames_config_value(&v);
     }
     Some(RenameDetection {
@@ -241,13 +224,27 @@ pub fn status_diff_entry_matches_pathspec(entry: &DiffEntry, pathspecs: &[String
     status_path_matches(entry.path(), pathspecs)
 }
 
+/// Whether a diff entry matches `pathspec` using typed pathspec evaluation (rename-aware).
+///
+/// # Errors
+///
+/// Same as [`Pathspec::matches_change`](crate::pathspec::Pathspec::matches_change) (pathspec
+/// matcher construction or attribute resolution can fail).
+pub(crate) fn status_diff_entry_matches_pathspec_typed(
+    repo: &Repository,
+    entry: &DiffEntry,
+    pathspec: &crate::pathspec::Pathspec,
+) -> Result<bool> {
+    if pathspec.is_entire_tree() {
+        return Ok(true);
+    }
+    pathspec.matches_change(repo, entry.path(), entry.old_path.as_deref())
+}
+
 /// Apply `status.renameLimit` over `diff.renameLimit` for rename scoring (Git status precedence).
 fn config_for_status_rename_detection(config: &ConfigSet) -> ConfigSet {
     let mut out = config.clone();
-    if let Some(limit) = config
-        .get("status.renameLimit")
-        .or_else(|| config.get("status.renamelimit"))
-    {
+    if let Some(limit) = config.value("status.renameLimit") {
         let _ = out.add_command_override("diff.renameLimit", &limit);
     }
     out
@@ -277,6 +274,8 @@ pub struct StatusModel {
     pub unstaged: Vec<DiffEntry>,
     /// Untracked paths (subject to [`StatusOptions::untracked`]).
     pub untracked: Vec<String>,
+    /// Untracked nested repositories that would be recorded as gitlinks if staged.
+    pub embedded_repositories: Vec<String>,
     /// Ignored paths (subject to [`StatusOptions::ignored`]).
     pub ignored: Vec<String>,
     /// Paths with unmerged index stages (1–3), sorted and deduplicated.
@@ -487,7 +486,7 @@ fn ignored_mode_to_untracked_cache(
 ///
 /// `ignored_mode` selects whether (and how) ignored paths are reported;
 /// `show_all` corresponds to `--untracked-files=all`. Results are sorted.
-pub fn collect_untracked_and_ignored(
+pub(crate) fn collect_untracked_and_ignored(
     repo: &Repository,
     index: &mut Index,
     work_tree: &Path,
@@ -510,7 +509,7 @@ pub fn collect_untracked_and_ignored(
 ///
 /// When `use_untracked_cache` is false, the index UNTR extension is not refreshed (used by
 /// staging/`git add`, which must not pay the full status-style cache rebuild).
-pub fn collect_untracked_and_ignored_with_cache(
+pub(crate) fn collect_untracked_and_ignored_with_cache(
     repo: &Repository,
     index: &mut Index,
     work_tree: &Path,
@@ -525,6 +524,7 @@ pub fn collect_untracked_and_ignored_with_cache(
         index,
         work_tree,
         pathspecs,
+        None,
         UntrackedScan {
             ignored_mode,
             show_all,
@@ -532,6 +532,7 @@ pub fn collect_untracked_and_ignored_with_cache(
             use_untracked_cache,
             cache_miss: UntrackedCacheMissAction::RefreshFull,
             clean_unit_dirs: None,
+            listing_cache: None,
         },
         &rules,
         None,
@@ -551,7 +552,7 @@ pub(crate) fn count_unstaged_and_untracked_paths(
     repo: &Repository,
     index: &mut Index,
 ) -> Result<(usize, usize)> {
-    let work_tree = repo.work_tree().ok_or(Error::RequiresWorkTree)?;
+    let work_tree = repo.work_tree().ok_or(RepositoryError::RequiresWorkTree)?;
     let index_mtime = index_file_mtime(&repo.index_path());
     let worktree_rules = crate::worktree_rules::WorktreeRules::from_repository(repo, index)?;
     let rules_arc = Arc::new(Mutex::new(worktree_rules));
@@ -559,7 +560,7 @@ pub(crate) fn count_unstaged_and_untracked_paths(
         index_mtime,
         ignore_submodule_untracked: false,
         repository_git_dir: Some(repo.git_dir().to_path_buf()),
-        config: repo.config().ok(),
+        config: repo.config().snapshot().ok(),
         worktree_rules: Some(Arc::clone(&rules_arc)),
         ..Default::default()
     };
@@ -569,47 +570,64 @@ pub(crate) fn count_unstaged_and_untracked_paths(
         .iter()
         .filter(|e| e.status != DiffStatus::Unmerged)
         .count();
-    let worktree_rules = rules_arc
-        .lock()
-        .map_err(|e| Error::Message(format!("worktree rules lock poisoned: {e}")))?;
-    let (untracked, _, _) = collect_untracked_and_ignored_inner(
-        repo,
-        index,
-        work_tree,
-        &[],
-        UntrackedScan {
-            ignored_mode: IgnoredMode::No,
-            show_all: false,
-            sort_paths: true,
-            use_untracked_cache: false,
-            cache_miss: UntrackedCacheMissAction::RefreshFull,
-            clean_unit_dirs: None,
-        },
-        &worktree_rules,
-        None,
-    )?;
-    Ok((unstaged_count, untracked.len()))
+    let untracked_count = if matches!(
+        untracked_mode_from_config(repo.config().snapshot()?.as_ref())?,
+        UntrackedMode::No
+    ) {
+        0
+    } else {
+        let worktree_rules = rules_arc
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (untracked, _, _) = collect_untracked_and_ignored_inner(
+            repo,
+            index,
+            work_tree,
+            &[],
+            None,
+            UntrackedScan {
+                ignored_mode: IgnoredMode::No,
+                show_all: false,
+                sort_paths: true,
+                use_untracked_cache: false,
+                cache_miss: UntrackedCacheMissAction::RefreshFull,
+                clean_unit_dirs: None,
+                listing_cache: None,
+            },
+            &worktree_rules,
+            None,
+        )?;
+        untracked.len()
+    };
+    Ok((unstaged_count, untracked_count))
 }
 
 /// Like [`collect_untracked_and_ignored`], reusing an existing
 /// [`crate::worktree_rules::WorktreeRules`] so ignore and attribute files already loaded by the
-/// same operation are not read again, and checking `cancel_watch` during the walk.
+/// same operation are not read again, and checking `cancel` during the walk.
 #[allow(clippy::too_many_arguments)]
-pub fn collect_untracked_and_ignored_with_rules_and_cancel(
+pub(crate) fn collect_untracked_and_ignored_with_rules_and_cancel(
     repo: &Repository,
     index: &mut Index,
     work_tree: &Path,
     ignored_mode: IgnoredMode,
     show_all: bool,
-    pathspecs: &[String],
+    pathspec: &crate::pathspec::Pathspec,
     rules: &crate::worktree_rules::WorktreeRules,
-    cancel_watch: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    cancel: Option<crate::progress::CancelToken>,
+    listing_cache: Option<std::sync::Arc<crate::windows_dir_listing::WorktreeListingCache>>,
 ) -> Result<(Vec<String>, Vec<String>, UntrackedCollectMeta)> {
+    let specs = if pathspec.is_entire_tree() {
+        &[] as &[String]
+    } else {
+        pathspec.specs()
+    };
     collect_untracked_and_ignored_inner(
         repo,
         index,
         work_tree,
-        pathspecs,
+        specs,
+        Some(pathspec),
         UntrackedScan {
             ignored_mode,
             show_all,
@@ -617,9 +635,10 @@ pub fn collect_untracked_and_ignored_with_rules_and_cancel(
             use_untracked_cache: true,
             cache_miss: UntrackedCacheMissAction::RefreshFull,
             clean_unit_dirs: None,
+            listing_cache,
         },
         rules,
-        cancel_watch,
+        cancel,
     )
 }
 
@@ -646,6 +665,8 @@ pub(crate) struct UntrackedScan {
     pub cache_miss: UntrackedCacheMissAction,
     /// When set, collapsed directories safe for `git clean` without rescanning are recorded here.
     pub clean_unit_dirs: CleanUnitDirHints,
+    /// Shared Windows directory listings for the same operation as tracked stat scan (#2566).
+    pub listing_cache: Option<std::sync::Arc<crate::windows_dir_listing::WorktreeListingCache>>,
 }
 
 /// Collapsed directory paths (`dir/`) that need no second walk for `clean` dry-run.
@@ -684,24 +705,26 @@ pub struct UntrackedCollectMeta {
     pub clean_collapsed_unit: HashSet<String>,
 }
 
-fn poll_untracked_cancel(watch: Option<&std::sync::atomic::AtomicBool>) -> Result<()> {
-    if let Some(flag) = watch {
-        crate::progress::poll_watch(flag)?;
+fn poll_untracked_cancel(cancel: Option<&crate::progress::CancelToken>) -> Result<()> {
+    if let Some(token) = cancel {
+        token.poll_result()?;
     }
     Ok(())
 }
 
 /// Shared implementation of the untracked/ignored walk.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn collect_untracked_and_ignored_inner(
     repo: &Repository,
     index: &mut Index,
     work_tree: &Path,
     pathspecs: &[String],
+    pathspec_typed: Option<&crate::pathspec::Pathspec>,
     scan: UntrackedScan,
     rules: &crate::worktree_rules::WorktreeRules,
-    cancel_watch: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    cancel: Option<crate::progress::CancelToken>,
 ) -> Result<(Vec<String>, Vec<String>, UntrackedCollectMeta)> {
-    poll_untracked_cancel(cancel_watch.as_deref())?;
+    poll_untracked_cancel(cancel.as_ref())?;
     let UntrackedScan {
         ignored_mode,
         show_all,
@@ -709,7 +732,11 @@ pub(crate) fn collect_untracked_and_ignored_inner(
         use_untracked_cache,
         cache_miss,
         clean_unit_dirs,
+        listing_cache,
     } = scan;
+    let pathspec_globals = pathspec_typed
+        .map(crate::pathspec::Pathspec::globals)
+        .unwrap_or_default();
     let clean_unit_dirs = &clean_unit_dirs;
     // Keep parity with historical status behavior in tests that rely on broad untracked scans
     // (including detached-HEAD wtstatus cases): when no explicit pathspec is requested, avoid
@@ -738,7 +765,7 @@ pub(crate) fn collect_untracked_and_ignored_inner(
                     return Ok((untracked, Vec::new(), UntrackedCollectMeta::default()));
                 }
                 if cache_miss == UntrackedCacheMissAction::RefreshFull {
-                    poll_untracked_cancel(cancel_watch.as_deref())?;
+                    poll_untracked_cancel(cancel.as_ref())?;
                     crate::untracked_cache::refresh_untracked_cache_for_status(
                         repo,
                         index,
@@ -747,9 +774,10 @@ pub(crate) fn collect_untracked_and_ignored_inner(
                         &mut uc,
                         show_all,
                         ignored_mode_to_untracked_cache(ignored_mode),
-                        cancel_watch.as_deref(),
+                        cancel.as_ref(),
+                        crate::windows_dir_listing::listing_cache_ref(&listing_cache),
                     )?;
-                    poll_untracked_cancel(cancel_watch.as_deref())?;
+                    poll_untracked_cancel(cancel.as_ref())?;
                     let untracked = crate::untracked_cache::collect_untracked_from_cache(&uc);
                     index.untracked_cache = Some(uc);
                     return Ok((
@@ -767,11 +795,7 @@ pub(crate) fn collect_untracked_and_ignored_inner(
             }
         }
     }
-    let ignorecase = rules
-        .config()
-        .get_bool("core.ignorecase")
-        .and_then(|r| r.ok())
-        .unwrap_or(false);
+    let ignorecase = rules.config().ignore_case();
     let tracked_paths =
         crate::path_icase::Stage0TrackedPaths::from_index_for_untracked_scan(index, ignorecase);
 
@@ -783,7 +807,7 @@ pub(crate) fn collect_untracked_and_ignored_inner(
         effective_core_precomposeunicode_with_config(Some(repo.git_dir()), Some(rules.config()));
 
     if effective_pathspecs.is_empty() {
-        poll_untracked_cancel(cancel_watch.as_deref())?;
+        poll_untracked_cancel(cancel.as_ref())?;
         let (mut par_untracked, mut par_ignored) = collect_untracked_parallel_top_level(
             repo,
             index,
@@ -796,7 +820,7 @@ pub(crate) fn collect_untracked_and_ignored_inner(
             &rules.ignore(),
             rules.config(),
             effective_pathspecs,
-            cancel_watch.as_deref(),
+            cancel.as_ref(),
             clean_unit_dirs,
         )?;
         if sort_paths {
@@ -813,7 +837,7 @@ pub(crate) fn collect_untracked_and_ignored_inner(
         ));
     }
 
-    poll_untracked_cancel(cancel_watch.as_deref())?;
+    poll_untracked_cancel(cancel.as_ref())?;
     visit_untracked_node(
         repo,
         index,
@@ -829,10 +853,11 @@ pub(crate) fn collect_untracked_and_ignored_inner(
         "",
         work_tree,
         effective_pathspecs,
+        pathspec_globals,
         Some(rules),
         &mut untracked,
         &mut ignored,
-        cancel_watch.as_deref(),
+        cancel.as_ref(),
         clean_unit_dirs,
     )?;
 
@@ -854,14 +879,17 @@ pub(crate) fn collect_untracked_and_ignored_inner(
 ///
 /// [`collect_untracked_and_ignored`] with `show_all = false` reports directories as a single
 /// `dir/` entry; `git add` must stage the non-ignored files inside instead of a tree placeholder.
-pub fn expand_untracked_for_staging(
+pub(crate) fn expand_untracked_for_staging(
     repo: &Repository,
     index: &mut Index,
     work_tree: &Path,
     untracked: Vec<String>,
     pathspecs: &[String],
 ) -> Result<Vec<String>> {
-    if !untracked.iter().any(|p| p.ends_with('/')) {
+    if !untracked
+        .iter()
+        .any(|p| crate::repo_relpath::stored_path_is_directory_marker(p))
+    {
         let mut files = untracked;
         files.sort();
         files.dedup();
@@ -878,7 +906,7 @@ pub fn expand_untracked_for_staging(
 /// untracked listing; files are kept only when they match `pathspecs`. Ignored directories are
 /// dropped and unregistered embedded repositories stay as `dir/` markers. The cost is linear
 /// in the size of the collapsed subtrees.
-pub fn expand_untracked_for_staging_with_rules(
+pub(crate) fn expand_untracked_for_staging_with_rules(
     repo: &Repository,
     index: &mut Index,
     work_tree: &Path,
@@ -886,14 +914,11 @@ pub fn expand_untracked_for_staging_with_rules(
     pathspecs: &[String],
     rules: &crate::worktree_rules::WorktreeRules,
 ) -> Result<Vec<String>> {
-    let (mut expanded, dirs): (Vec<String>, Vec<String>) =
-        untracked.into_iter().partition(|p| !p.ends_with('/'));
+    let (mut expanded, dirs): (Vec<String>, Vec<String>) = untracked
+        .into_iter()
+        .partition(|p| !crate::repo_relpath::stored_path_is_directory_marker(p));
     if !dirs.is_empty() {
-        let ignorecase = rules
-            .config()
-            .get_bool("core.ignorecase")
-            .and_then(|r| r.ok())
-            .unwrap_or(false);
+        let ignorecase = rules.config().ignore_case();
         let tracked_paths =
             crate::path_icase::Stage0TrackedPaths::from_index_for_untracked_scan(index, ignorecase);
         let gitlinks = stage0_gitlink_paths(index);
@@ -904,7 +929,7 @@ pub fn expand_untracked_for_staging_with_rules(
         let mut matcher = rules.ignore_mut();
         let mut ignored = Vec::new();
         for path in dirs {
-            let dir = path.trim_end_matches('/');
+            let dir = crate::repo_relpath::stored_directory_marker_parent(&path);
             if dir.is_empty() {
                 continue;
             }
@@ -920,9 +945,10 @@ pub fn expand_untracked_for_staging_with_rules(
                 None,
                 precompose_unicode,
                 &tracked_paths,
-                dir,
-                &work_tree.join(dir),
+                &dir,
+                &crate::repo_relpath::worktree_abs(work_tree, &dir),
                 pathspecs,
+                crate::pathspec::PathspecGlobalFlags::default(),
                 Some(rules),
                 &mut expanded,
                 &mut ignored,
@@ -1005,10 +1031,10 @@ fn collect_untracked_parallel_top_level(
     matcher_template: &IgnoreMatcher,
     config: &ConfigSet,
     pathspecs: &[String],
-    cancel_watch: Option<&std::sync::atomic::AtomicBool>,
+    cancel: Option<&crate::progress::CancelToken>,
     clean_unit_dirs: &CleanUnitDirHints,
 ) -> Result<(Vec<String>, Vec<String>)> {
-    poll_untracked_cancel(cancel_watch)?;
+    poll_untracked_cancel(cancel)?;
     let entries = named_entries_sorted(fs::read_dir(work_tree).map_err(crate::error::Error::Io)?);
 
     let mut root_files = Vec::new();
@@ -1053,10 +1079,11 @@ fn collect_untracked_parallel_top_level(
                 entry,
                 name,
                 pathspecs,
+                crate::pathspec::PathspecGlobalFlags::default(),
                 None,
                 local_untracked,
                 local_ignored,
-                cancel_watch,
+                cancel,
                 clean_unit_dirs,
             )?;
             Ok::<(), crate::error::Error>(())
@@ -1095,10 +1122,11 @@ fn collect_untracked_parallel_top_level(
                     entry,
                     name,
                     pathspecs,
+                    crate::pathspec::PathspecGlobalFlags::default(),
                     None,
                     &mut untracked,
                     &mut ignored,
-                    cancel_watch,
+                    cancel,
                     clean_unit_dirs,
                 )?;
             }
@@ -1176,10 +1204,11 @@ fn collect_untracked_parallel_top_level(
                 &task.entry,
                 &task.name,
                 pathspecs,
+                crate::pathspec::PathspecGlobalFlags::default(),
                 None,
                 &mut local_untracked,
                 &mut local_ignored,
-                cancel_watch,
+                cancel,
                 clean_unit_dirs,
             )?;
             Ok((local_untracked, local_ignored))
@@ -1251,8 +1280,12 @@ fn split_tracked_untracked_tasks(
             };
             split_any = true;
             let _ = matcher.note_directory_entered(repo, Some(index), &rel);
-            let Ok(entries) = fs::read_dir(task.entry.path()) else {
-                continue;
+            let entries = match fs::read_dir(task.entry.path()) {
+                Ok(entries) => entries,
+                Err(e) => {
+                    warn_if_untracked_directory_unreadable(repo, &rel, &e);
+                    continue;
+                }
             };
             let parent: Arc<str> = Arc::from(rel);
             next.extend(
@@ -1330,10 +1363,11 @@ fn visit_untracked_dir_entry(
     entry: &DirEntry,
     name: &[u8],
     pathspecs: &[String],
+    pathspec_globals: crate::pathspec::PathspecGlobalFlags,
     rules: Option<&crate::worktree_rules::WorktreeRules>,
     untracked_out: &mut Vec<String>,
     ignored_out: &mut Vec<String>,
-    cancel_watch: Option<&std::sync::atomic::AtomicBool>,
+    cancel: Option<&crate::progress::CancelToken>,
     clean_unit_dirs: &CleanUnitDirHints,
 ) -> Result<UntrackedWalkStep> {
     if name == b".git" {
@@ -1363,7 +1397,7 @@ fn visit_untracked_dir_entry(
     let child_rel_match = crate::repo_relpath::as_utf8_for_matching(&child_rel);
 
     if is_dir {
-        if !pathspec_may_match_directory(&child_rel, pathspecs) {
+        if !pathspec_may_match_directory_with_globals(&child_rel, pathspecs, pathspec_globals) {
             return Ok(UntrackedWalkStep::Continue);
         }
         let path = entry.path();
@@ -1382,10 +1416,11 @@ fn visit_untracked_dir_entry(
             &child_rel,
             &path,
             pathspecs,
+            pathspec_globals,
             rules,
             untracked_out,
             ignored_out,
-            cancel_watch,
+            cancel,
             clean_unit_dirs,
         )?;
         if check_only && visible_out.is_some_and(|out| out.get()) {
@@ -1395,8 +1430,14 @@ fn visit_untracked_dir_entry(
         if crate::read_dir_kind::entry_is_git_ignored_special(entry).unwrap_or(true) {
             return Ok(UntrackedWalkStep::Continue);
         }
-        if !status_path_matches_worktree_with_rules(
-            repo, index, work_tree, &child_rel, pathspecs, rules,
+        if !status_path_matches_worktree_with_rules_and_globals(
+            repo,
+            index,
+            work_tree,
+            &child_rel,
+            pathspecs,
+            rules,
+            pathspec_globals,
         ) {
             return Ok(UntrackedWalkStep::Continue);
         }
@@ -1431,14 +1472,15 @@ fn visit_untracked_read_dir_lazy(
     tracked_paths: &crate::path_icase::Stage0TrackedPaths,
     rel: &str,
     pathspecs: &[String],
+    pathspec_globals: crate::pathspec::PathspecGlobalFlags,
     rules: Option<&crate::worktree_rules::WorktreeRules>,
     untracked_out: &mut Vec<String>,
     ignored_out: &mut Vec<String>,
-    cancel_watch: Option<&std::sync::atomic::AtomicBool>,
+    cancel: Option<&crate::progress::CancelToken>,
     clean_unit_dirs: &CleanUnitDirHints,
 ) -> Result<()> {
     for entry in entries {
-        poll_untracked_cancel(cancel_watch)?;
+        poll_untracked_cancel(cancel)?;
         if visible_out.is_some_and(|out| out.get()) {
             return Ok(());
         }
@@ -1466,10 +1508,11 @@ fn visit_untracked_read_dir_lazy(
                 &entry,
                 &name,
                 pathspecs,
+                pathspec_globals,
                 rules,
                 untracked_out,
                 ignored_out,
-                cancel_watch,
+                cancel,
                 clean_unit_dirs,
             )?,
             UntrackedWalkStep::Stop
@@ -1478,6 +1521,22 @@ fn visit_untracked_read_dir_lazy(
         }
     }
     Ok(())
+}
+
+fn warn_if_untracked_directory_unreadable(repo: &Repository, rel: &str, err: &std::io::Error) {
+    if err.kind() == std::io::ErrorKind::PermissionDenied {
+        let path = if rel.is_empty() {
+            "./".to_owned()
+        } else if rel.ends_with('/') {
+            rel.to_owned()
+        } else {
+            format!("{rel}/")
+        };
+        repo.warn(crate::diagnostics::Warning::WorktreeAccessFailed {
+            path,
+            detail: err.to_string(),
+        });
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1496,10 +1555,11 @@ fn visit_untracked_node(
     rel: &str,
     abs: &Path,
     pathspecs: &[String],
+    pathspec_globals: crate::pathspec::PathspecGlobalFlags,
     rules: Option<&crate::worktree_rules::WorktreeRules>,
     untracked_out: &mut Vec<String>,
     ignored_out: &mut Vec<String>,
-    cancel_watch: Option<&std::sync::atomic::AtomicBool>,
+    cancel: Option<&crate::progress::CancelToken>,
     clean_unit_dirs: &CleanUnitDirHints,
 ) -> Result<()> {
     if check_only && visible_out.is_some_and(|out| out.get()) {
@@ -1508,7 +1568,10 @@ fn visit_untracked_node(
 
     let entries = match fs::read_dir(abs) {
         Ok(e) => e,
-        Err(_) => return Ok(()),
+        Err(e) => {
+            warn_if_untracked_directory_unreadable(repo, rel, &e);
+            return Ok(());
+        }
     };
     #[cfg(test)]
     untracked_walk_probe::record_dir_read();
@@ -1529,10 +1592,11 @@ fn visit_untracked_node(
             tracked_paths,
             rel,
             pathspecs,
+            pathspec_globals,
             rules,
             untracked_out,
             ignored_out,
-            cancel_watch,
+            cancel,
             clean_unit_dirs,
         );
     }
@@ -1562,10 +1626,11 @@ fn visit_untracked_node(
             tracked_paths,
             rel,
             pathspecs,
+            pathspec_globals,
             rules,
             untracked_out,
             ignored_out,
-            cancel_watch,
+            cancel,
             clean_unit_dirs,
         );
     }
@@ -1579,7 +1644,7 @@ fn visit_untracked_node(
     }
 
     for (name, entry) in &listing.candidates {
-        poll_untracked_cancel(cancel_watch)?;
+        poll_untracked_cancel(cancel)?;
         if matches!(
             visit_untracked_dir_entry(
                 repo,
@@ -1597,10 +1662,11 @@ fn visit_untracked_node(
                 entry,
                 name,
                 pathspecs,
+                pathspec_globals,
                 rules,
                 untracked_out,
                 ignored_out,
-                cancel_watch,
+                cancel,
                 clean_unit_dirs,
             )?,
             UntrackedWalkStep::Stop
@@ -1675,13 +1741,24 @@ fn visit_untracked_directory(
     rel: &str,
     abs: &Path,
     pathspecs: &[String],
+    pathspec_globals: crate::pathspec::PathspecGlobalFlags,
     rules: Option<&crate::worktree_rules::WorktreeRules>,
     untracked_out: &mut Vec<String>,
     ignored_out: &mut Vec<String>,
-    cancel_watch: Option<&std::sync::atomic::AtomicBool>,
+    cancel: Option<&crate::progress::CancelToken>,
     clean_unit_dirs: &CleanUnitDirHints,
 ) -> Result<()> {
     matcher.note_directory_known(rel);
+
+    if !rel.is_empty() {
+        match fs::read_dir(abs) {
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                warn_if_untracked_directory_unreadable(repo, rel, &e);
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
 
     if has_tracked_under(index, gitlinks, tracked_paths, rel) {
         visit_untracked_node(
@@ -1699,10 +1776,11 @@ fn visit_untracked_directory(
             rel,
             abs,
             pathspecs,
+            pathspec_globals,
             rules,
             untracked_out,
             ignored_out,
-            cancel_watch,
+            cancel,
             clean_unit_dirs,
         )?;
         return Ok(());
@@ -1715,6 +1793,12 @@ fn visit_untracked_directory(
     }
 
     if !rel.is_empty() && is_unregistered_embedded_git_repo(index, rel, abs) {
+        if check_only {
+            if let Some(out) = visible_out {
+                out.set(true);
+            }
+            return Ok(());
+        }
         untracked_out.push(format!("{rel}/"));
         return Ok(());
     }
@@ -1734,10 +1818,19 @@ fn visit_untracked_directory(
 
     if ignored_mode == IgnoredMode::Traditional
         && !show_all
-        && directory_pathspec_matches_self(rel, pathspecs)
+        && directory_pathspec_matches_self(rel, pathspecs, pathspec_globals)
     {
         if let Some(dir_line) = traditional_normal_directory_only(
-            repo, index, work_tree, gitlinks, matcher, rel, abs, pathspecs, rules,
+            repo,
+            index,
+            work_tree,
+            gitlinks,
+            matcher,
+            rel,
+            abs,
+            pathspecs,
+            pathspec_globals,
+            rules,
         )? {
             ignored_out.push(dir_line);
             return Ok(());
@@ -1760,10 +1853,11 @@ fn visit_untracked_directory(
             rel,
             abs,
             pathspecs,
+            pathspec_globals,
             rules,
             untracked_out,
             ignored_out,
-            cancel_watch,
+            cancel,
             clean_unit_dirs,
         )?;
         return Ok(());
@@ -1773,7 +1867,8 @@ fn visit_untracked_directory(
     // entry without enumerating every child, then collapse to `dir/` in normal mode.
     if !show_all
         && ignored_mode == IgnoredMode::No
-        && (pathspecs.is_empty() || directory_pathspec_matches_self(rel, pathspecs))
+        && (pathspecs.is_empty()
+            || directory_pathspec_matches_self(rel, pathspecs, pathspec_globals))
     {
         let found = Cell::new(false);
         visit_untracked_node(
@@ -1791,10 +1886,11 @@ fn visit_untracked_directory(
             rel,
             abs,
             pathspecs,
+            pathspec_globals,
             rules,
             untracked_out,
             ignored_out,
-            cancel_watch,
+            cancel,
             clean_unit_dirs,
         )?;
         if found.get() {
@@ -1826,10 +1922,11 @@ fn visit_untracked_directory(
         rel,
         abs,
         pathspecs,
+        pathspec_globals,
         rules,
         &mut sub_untracked,
         &mut sub_ignored,
-        cancel_watch,
+        cancel,
         clean_unit_dirs,
     )?;
 
@@ -1841,7 +1938,7 @@ fn visit_untracked_directory(
 
     // `--untracked-files=normal`: collapse subtrees like Git's `walk_for_untracked`.
     if !sub_untracked.is_empty() && !sub_ignored.is_empty() {
-        if !rel.is_empty() && directory_pathspec_matches_self(rel, pathspecs) {
+        if !rel.is_empty() && directory_pathspec_matches_self(rel, pathspecs, pathspec_globals) {
             untracked_out.push(format!("{rel}/"));
         } else {
             untracked_out.append(&mut sub_untracked);
@@ -1854,7 +1951,7 @@ fn visit_untracked_directory(
         let dir_excluded = matcher.is_path_ignored(repo, Some(index), rel, true)?;
         let collapse_matching = ignored_mode == IgnoredMode::Matching && dir_excluded;
         let collapse_traditional = ignored_mode == IgnoredMode::Traditional
-            && directory_pathspec_matches_self(rel, pathspecs);
+            && directory_pathspec_matches_self(rel, pathspecs, pathspec_globals);
         if collapse_matching || collapse_traditional {
             ignored_out.push(format!("{rel}/"));
         } else {
@@ -1864,7 +1961,7 @@ fn visit_untracked_directory(
     }
 
     if !sub_untracked.is_empty() && sub_ignored.is_empty() {
-        if rel.is_empty() || !directory_pathspec_matches_self(rel, pathspecs) {
+        if rel.is_empty() || !directory_pathspec_matches_self(rel, pathspecs, pathspec_globals) {
             untracked_out.append(&mut sub_untracked);
         } else {
             untracked_out.push(format!("{rel}/"));
@@ -1909,6 +2006,7 @@ fn traditional_normal_directory_only(
     rel: &str,
     abs: &Path,
     pathspecs: &[String],
+    pathspec_globals: crate::pathspec::PathspecGlobalFlags,
     rules: Option<&crate::worktree_rules::WorktreeRules>,
 ) -> Result<Option<String>> {
     let mut any_file = false;
@@ -1916,22 +2014,34 @@ fn traditional_normal_directory_only(
     while let Some(dir) = stack.pop() {
         let entries = match fs::read_dir(&dir) {
             Ok(e) => e,
-            Err(_) => continue,
+            Err(e) => {
+                if let Ok(rel) = dir.strip_prefix(work_tree) {
+                    let rel = rel.to_string_lossy();
+                    warn_if_untracked_directory_unreadable(repo, rel.as_ref(), &e);
+                }
+                continue;
+            }
         };
         let mut sorted: Vec<_> = entries.filter_map(|e| e.ok()).collect();
         sorted.sort_by_key(|e| e.file_name());
         for entry in sorted {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name == ".git" {
+            let name = dir_entry_name_bytes(&entry);
+            if name == b".git" {
                 continue;
             }
             let path = entry.path();
-            let rel_child = crate::git_path::strip_worktree_prefix(&path, work_tree)
-                .unwrap_or_else(|| name.clone());
-            if !pathspec_may_match_directory(&rel_child, pathspecs)
+            let rel_child = crate::repo_relpath::strip_worktree_prefix_stored(&path, work_tree)
+                .unwrap_or_else(|| crate::repo_relpath::storage_string(&name));
+            if !pathspec_may_match_directory_with_globals(&rel_child, pathspecs, pathspec_globals)
                 && !(entry.file_type().map(|ft| ft.is_file()).unwrap_or(false)
-                    && status_path_matches_worktree_with_rules(
-                        repo, index, work_tree, &rel_child, pathspecs, rules,
+                    && status_path_matches_worktree_with_rules_and_globals(
+                        repo,
+                        index,
+                        work_tree,
+                        &rel_child,
+                        pathspecs,
+                        rules,
+                        pathspec_globals,
                     ))
             {
                 continue;
@@ -1988,7 +2098,7 @@ fn has_tracked_under(
 
 /// Whether `dir` is the work tree of a nested submodule of the superproject at
 /// `super_git_dir` (its `.git` resolves under `super_git_dir/modules`).
-pub fn dir_is_nested_submodule_worktree(super_git_dir: &Path, dir: &Path) -> bool {
+pub(crate) fn dir_is_nested_submodule_worktree(super_git_dir: &Path, dir: &Path) -> bool {
     let gitfile = dir.join(".git");
     if gitfile.is_dir() {
         return true;
@@ -2019,15 +2129,39 @@ pub fn dir_is_nested_submodule_worktree(super_git_dir: &Path, dir: &Path) -> boo
     resolved_canon.starts_with(&modules_canon)
 }
 
+fn status_pathspec_match_context(
+    globals: crate::pathspec::PathspecGlobalFlags,
+) -> crate::pathspec::PathspecMatchContext {
+    crate::pathspec::PathspecMatchContext {
+        globals,
+        ..crate::pathspec::PathspecMatchContext::default()
+    }
+}
+
 /// Pathspec match for status using git's exclude / OR-of-positives semantics.
-pub fn status_path_matches(path: &str, pathspecs: &[String]) -> bool {
+pub(crate) fn status_path_matches(path: &str, pathspecs: &[String]) -> bool {
+    status_path_matches_with_globals(
+        path,
+        pathspecs,
+        crate::pathspec::PathspecGlobalFlags::default(),
+    )
+}
+
+/// Like [`status_path_matches`], with explicit Git global pathspec flags.
+#[must_use]
+pub(crate) fn status_path_matches_with_globals(
+    path: &str,
+    pathspecs: &[String],
+    globals: crate::pathspec::PathspecGlobalFlags,
+) -> bool {
     if pathspecs.is_empty() {
         return true;
     }
+    let ctx = status_pathspec_match_context(globals);
     let normalized = path.trim_end_matches('/');
     let excluded = pathspecs.iter().any(|spec| {
-        crate::pathspec::pathspec_exclude_matches(spec, path)
-            || crate::pathspec::pathspec_exclude_matches(spec, normalized)
+        crate::pathspec::pathspec_exclude_element_matches_with_context(spec, path, ctx)
+            || crate::pathspec::pathspec_exclude_element_matches_with_context(spec, normalized, ctx)
     });
     if excluded {
         return false;
@@ -2039,8 +2173,8 @@ pub fn status_path_matches(path: &str, pathspecs: &[String]) -> bool {
             continue;
         }
         has_positive = true;
-        if crate::pathspec::pathspec_matches(spec, path)
-            || crate::pathspec::pathspec_matches(spec, normalized)
+        if crate::pathspec::matches_pathspec_element_with_context(spec, path, ctx)
+            || crate::pathspec::matches_pathspec_element_with_context(spec, normalized, ctx)
         {
             positive_match = true;
         }
@@ -2054,31 +2188,21 @@ fn pathspecs_use_attr_magic(pathspecs: &[String]) -> bool {
         .any(|spec| crate::pathspec::pathspec_has_attr_magic(spec))
 }
 
-/// Pathspec match that also honors `:(attr:...)` magic against worktree contents.
-pub fn status_path_matches_worktree(
-    repo: &Repository,
-    index: &Index,
-    work_tree: &Path,
-    path: &str,
-    pathspecs: &[String],
-) -> bool {
-    status_path_matches_worktree_with_rules(repo, index, work_tree, path, pathspecs, None)
-}
-
-/// Like [`status_path_matches_worktree`], reusing an existing [`crate::worktree_rules::WorktreeRules`] when provided.
-pub fn status_path_matches_worktree_with_rules(
+/// Pathspec match that honors `:(attr:...)` magic against worktree contents.
+pub(crate) fn status_path_matches_worktree_with_rules_and_globals(
     repo: &Repository,
     index: &Index,
     work_tree: &Path,
     path: &str,
     pathspecs: &[String],
     rules: Option<&crate::worktree_rules::WorktreeRules>,
+    globals: crate::pathspec::PathspecGlobalFlags,
 ) -> bool {
     if pathspecs.is_empty() {
         return true;
     }
     if !pathspecs_use_attr_magic(pathspecs) {
-        return status_path_matches(path, pathspecs);
+        return status_path_matches_with_globals(path, pathspecs, globals);
     }
 
     let normalized = path.trim_end_matches('/');
@@ -2130,7 +2254,12 @@ fn is_executable_file(_meta: &fs::Metadata) -> bool {
 }
 
 /// Whether `rel_dir` could contain a path matching any of `pathspecs` (directory prune).
-pub fn pathspec_may_match_directory(rel_dir: &str, pathspecs: &[String]) -> bool {
+#[must_use]
+pub(crate) fn pathspec_may_match_directory_with_globals(
+    rel_dir: &str,
+    pathspecs: &[String],
+    globals: crate::pathspec::PathspecGlobalFlags,
+) -> bool {
     if pathspecs.is_empty() {
         return true;
     }
@@ -2141,11 +2270,12 @@ pub fn pathspec_may_match_directory(rel_dir: &str, pathspecs: &[String]) -> bool
     if rel_dir.is_empty() {
         return true;
     }
+    let ctx = status_pathspec_match_context(globals);
     let is_dir_prefix = |dir: &str, path: &str| {
         path.len() > dir.len() && path.as_bytes()[dir.len()] == b'/' && path.starts_with(dir)
     };
     pathspecs.iter().any(|spec| {
-        if crate::pathspec::has_glob_chars(spec) {
+        if crate::pathspec::simple_length(spec) < spec.len() && !globals.literal_pathspecs {
             return true;
         }
         let spec_norm = spec.trim_end_matches('/');
@@ -2155,19 +2285,25 @@ pub fn pathspec_may_match_directory(rel_dir: &str, pathspecs: &[String]) -> bool
         {
             return true;
         }
-        // Without magic or a `./` prefix, a glob-free spec matches only itself and paths
-        // under it, which the prefix checks above already cover.
         let plain_literal = !spec_norm.is_empty()
             && !spec.starts_with(':')
             && !spec.starts_with("./")
             && spec != ".";
-        !plain_literal && crate::pathspec::pathspec_matches(spec, rel_dir)
+        !plain_literal && crate::pathspec::matches_pathspec_element_with_context(spec, rel_dir, ctx)
     })
 }
 
-fn directory_pathspec_matches_self(rel_dir: &str, pathspecs: &[String]) -> bool {
+fn directory_pathspec_matches_self(
+    rel_dir: &str,
+    pathspecs: &[String],
+    globals: crate::pathspec::PathspecGlobalFlags,
+) -> bool {
     pathspecs.is_empty()
-        || status_path_matches(&format!("{}/", rel_dir.trim_end_matches('/')), pathspecs)
+        || status_path_matches_with_globals(
+            &format!("{}/", rel_dir.trim_end_matches('/')),
+            pathspecs,
+            globals,
+        )
 }
 
 #[cfg(unix)]
@@ -2228,6 +2364,33 @@ pub fn normalize_status_conflicts(
 
 use crate::progress::ProgressSink;
 
+fn embedded_unregistered_git_repositories(
+    work_tree: &Path,
+    index: &Index,
+    untracked: &[String],
+    precompose_unicode: bool,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for path in untracked {
+        let rel = path.trim_end_matches('/');
+        if rel.is_empty() {
+            continue;
+        }
+        let abs = if precompose_unicode {
+            crate::unicode_normalization::resolve_worktree_path_for_staging(work_tree, rel, true)
+                .abs
+        } else {
+            work_tree.join(rel)
+        };
+        if is_unregistered_embedded_git_repo(index, rel, &abs) {
+            out.push(format!("{rel}/"));
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// Compute the status of `repo`'s work tree as a [`StatusModel`].
 ///
 /// This is the clean library computation: load and sparse-expand the index,
@@ -2248,39 +2411,34 @@ use crate::progress::ProgressSink;
 /// concurrent commit), the opportunistic write is skipped so the fresher on-disk index is kept.
 /// Set `write_index` to `false` or capture `GIT_OPTIONAL_LOCKS=0` in the environment for
 /// read-only status that leaves the index file untouched.
-pub fn status(
+pub(crate) fn status(
     repo: &Repository,
     opts: &StatusOptions,
     progress: &mut dyn ProgressSink,
-    cancel: &dyn crate::progress::Cancel,
+    cancel: &crate::progress::CancelToken,
 ) -> Result<StatusModel> {
+    let _ = progress;
     crate::trace::trace_span!("grit.status.scan");
     let persist_index_to_disk = opts.write_index && repo.environment().git_optional_locks;
     let interrupted_rewrite = if persist_index_to_disk {
         match crate::history::recover_interrupted_rewrite_apply(repo) {
             Ok(recovery) => recovery.map(InterruptedRewrite::from),
-            Err(crate::history::HistoryError::Library(err))
-                if matches!(*err, crate::error::Error::LockHeld { .. }) =>
-            {
-                Some(InterruptedRewrite::Pending)
-            }
-            Err(err) => return Err(crate::error::Error::History(err)),
+            Err(crate::error::Error::LockHeld(_)) => Some(InterruptedRewrite::Pending),
+            Err(err) => return Err(err),
         }
     } else if crate::history::rewrite_apply_journal_active(repo.git_dir()) {
         Some(InterruptedRewrite::Pending)
     } else {
         None
     };
-    let watch = crate::progress::cancel_watch_arc(cancel);
-    let mut progress = crate::progress::WatchProgress::new(progress, std::sync::Arc::clone(&watch));
-    crate::progress::poll_cancel_watch(&mut progress, cancel, &watch)?;
-    let work_tree = repo
-        .work_tree()
-        .ok_or(crate::error::Error::RequiresWorkTree)?;
+    let cancel_token = cancel.clone();
+    let watch = cancel_token.watch_arc();
+    crate::progress::poll_cancel_watch(cancel, &watch)?;
+    let work_tree = repo.work_tree().ok_or(RepositoryError::RequiresWorkTree)?;
 
     let head = crate::state::resolve_head_for_repository(repo)?;
     let state = crate::state::wt_status_get_state(repo.git_dir(), &head, true)?;
-    let repo_config = repo.config().ok();
+    let repo_config = repo.config().snapshot().ok();
 
     // Load without expanding sparse-directory placeholders; expand only directories
     // a pathspec may reach so read-mostly status stays on Git's sparse index shape.
@@ -2298,11 +2456,11 @@ pub fn status(
         .collect();
     let index_sparse_on_disk =
         index.sparse_directories || index.has_sparse_directory_placeholders();
-    if !opts.pathspecs.is_empty() {
+    if !opts.pathspec.is_entire_tree() {
         crate::porcelain::index_from_tree::expand_sparse_for_pathspecs(
             repo,
             &mut index,
-            &opts.pathspecs,
+            opts.pathspec.specs(),
         )?;
     }
     if let Some(cfg) = repo_config.as_deref() {
@@ -2321,7 +2479,7 @@ pub fn status(
     };
 
     // Staged: index vs HEAD tree, narrowed to pathspecs before rename detection.
-    let mut staged: Vec<DiffEntry> = if opts.pathspecs.is_empty()
+    let mut staged: Vec<DiffEntry> = if opts.pathspec.is_entire_tree()
         && index.entries.iter().all(|e| e.stage() == 0)
         && head_tree
             .as_ref()
@@ -2330,10 +2488,13 @@ pub fn status(
     {
         Vec::new()
     } else {
-        crate::diff::diff_index_to_tree(repo.odb(), &index, head_tree.as_ref(), false)?
-            .into_iter()
-            .filter(|e| status_diff_entry_matches_pathspec(e, &opts.pathspecs))
-            .collect()
+        let mut out = Vec::new();
+        for e in crate::diff::diff_index_to_tree(repo.odb(), &index, head_tree.as_ref(), false)? {
+            if status_diff_entry_matches_pathspec_typed(repo, &e, &opts.pathspec)? {
+                out.push(e);
+            }
+        }
+        out
     };
 
     // Unstaged: worktree vs index, narrowed before rename detection.
@@ -2351,11 +2512,11 @@ pub fn status(
             && crate::diff::entry_is_racy_with_policy(e, diff_index_mtime, stat_policy)
             && i64::from(e.mtime_sec) < now_unix_seconds
     });
-    crate::progress::poll_cancel_watch(&mut progress, cancel, &watch)?;
+    crate::progress::poll_cancel_watch(cancel, &watch)?;
     let cancel_poll = std::sync::Arc::new(crate::progress::StackCancelPoll::new(
-        &mut progress,
         std::sync::Arc::clone(&watch),
     ));
+    let listing_cache = crate::windows_dir_listing::spawn_listing_cache();
     let (unstaged_raw, index_stat_refresh_changed) =
         crate::diff::diff_index_to_worktree_with_owner_poll(
             repo.odb(),
@@ -2373,7 +2534,9 @@ pub fn status(
                 for_status: true,
                 command_runner: Some(repo.command_runner()),
                 fsmonitor_query_boundary: opts.fsmonitor_query_boundary,
-                cancel_watch: Some(std::sync::Arc::clone(&watch)),
+                cancel: Some(cancel_token.clone()),
+                diagnostics: Some(repo.diagnostics()),
+                listing_cache: Some(std::sync::Arc::clone(&listing_cache)),
                 ..Default::default()
             },
             Some(cancel_poll),
@@ -2381,15 +2544,18 @@ pub fn status(
     let mut persist_index = index_stat_refresh_changed
         || rewrite_clears_racy_entries
         || index.entry_modes_repaired_on_load;
-    let mut unstaged: Vec<DiffEntry> = unstaged_raw
-        .into_iter()
-        .filter(|e| status_diff_entry_matches_pathspec(e, &opts.pathspecs))
-        .collect();
+    let mut unstaged: Vec<DiffEntry> = Vec::new();
+    for e in unstaged_raw {
+        if status_diff_entry_matches_pathspec_typed(repo, &e, &opts.pathspec)? {
+            unstaged.push(e);
+        }
+    }
 
     if let Some(rd) = opts.renames {
         let thread_policy = repo.thread_policy();
         let rename_config = repo
             .config()
+            .snapshot()
             .map(|c| config_for_status_rename_detection(c.as_ref()))
             .unwrap_or_default();
         staged = apply_status_renames(
@@ -2399,9 +2565,9 @@ pub fn status(
             head_tree.as_ref(),
             &rename_config,
             &thread_policy,
-            Some(&watch),
+            Some(&cancel_token),
         )?;
-        crate::progress::poll_cancel_watch(&mut progress, cancel, &watch)?;
+        crate::progress::poll_cancel_watch(cancel, &watch)?;
         unstaged = apply_status_renames(
             repo.odb(),
             unstaged,
@@ -2409,25 +2575,25 @@ pub fn status(
             head_tree.as_ref(),
             &rename_config,
             &thread_policy,
-            Some(&watch),
+            Some(&cancel_token),
         )?;
     }
 
     let mut conflict_details = conflicts_from_index(&index);
-    if !opts.pathspecs.is_empty() {
-        conflict_details.retain(|c| status_path_matches(&c.path, &opts.pathspecs));
+    if !opts.pathspec.is_entire_tree() {
+        conflict_details.retain(|c| opts.pathspec.matches(repo, &c.path).unwrap_or(false));
     }
     let conflicts: Vec<String> = conflict_details.iter().map(|c| c.path.clone()).collect();
     normalize_status_conflicts(&mut staged, &mut unstaged, &conflicts);
 
-    crate::progress::poll_cancel_watch(&mut progress, cancel, &watch)?;
+    crate::progress::poll_cancel_watch(cancel, &watch)?;
     let (untracked, ignored) =
         if opts.untracked == UntrackedMode::No && opts.ignored == IgnoredMode::No {
             (Vec::new(), Vec::new())
         } else {
-            let rules_guard = worktree_rules.lock().map_err(|e| {
-                crate::error::Error::Message(format!("worktree rules lock poisoned: {e}"))
-            })?;
+            let rules_guard = worktree_rules
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let (mut untracked, ignored, collect_meta) =
                 collect_untracked_and_ignored_with_rules_and_cancel(
                     repo,
@@ -2435,9 +2601,10 @@ pub fn status(
                     work_tree,
                     opts.ignored,
                     opts.untracked == UntrackedMode::All,
-                    &opts.pathspecs,
+                    &opts.pathspec,
                     &rules_guard,
-                    Some(std::sync::Arc::clone(&watch)),
+                    Some(cancel_token.clone()),
+                    Some(std::sync::Arc::clone(&listing_cache)),
                 )?;
             persist_index |= collect_meta.untracked_cache_refreshed;
             if opts.untracked == UntrackedMode::No {
@@ -2450,9 +2617,7 @@ pub fn status(
         // The refresh pass already re-hashed every racily clean entry and invalidated the
         // ones whose content changed, so the write must not hash them a second time.
         index.skip_racy_smudge_on_write = true;
-        if let Some(hook) = &opts.before_opportunistic_index_write {
-            (hook.0)();
-        }
+        crate::test_probe_hooks::hooks::before_opportunistic_index_write();
         let written = repo.try_write_index_at(&index_path, &mut index);
         index.skip_racy_smudge_on_write = false;
         if written? {
@@ -2467,11 +2632,15 @@ pub fn status(
         true if repo.refs_on_disk() => {
             crate::reflog::reflog_entry_count(repo.git_dir(), "refs/stash").unwrap_or(0)
         }
-        true => crate::reflog::read_reflog_on_store(repo.refs(), "refs/stash")
+        true => crate::reflog::read_reflog_on_store(repo.ref_store(), "refs/stash")
             .map_or(0, |entries| entries.len()),
     };
 
     let operation = status_operation(&state, !conflicts.is_empty());
+
+    let precompose_unicode = repo_config.as_ref().is_some_and(|c| c.precompose_unicode());
+    let embedded_repositories =
+        embedded_unregistered_git_repositories(work_tree, &index, &untracked, precompose_unicode);
 
     Ok(StatusModel {
         head,
@@ -2481,6 +2650,7 @@ pub fn status(
         staged,
         unstaged,
         untracked,
+        embedded_repositories,
         ignored,
         conflicts,
         conflict_details,
@@ -2501,14 +2671,14 @@ fn apply_status_renames(
     head_tree: Option<&ObjectId>,
     config: &crate::config::ConfigSet,
     thread_policy: &crate::parallel::ThreadPolicy,
-    cancel_watch: Option<&std::sync::atomic::AtomicBool>,
+    cancel: Option<&crate::progress::CancelToken>,
 ) -> Result<Vec<DiffEntry>> {
     use crate::diff::DiffStatus;
     const MATRIX_BUDGET: usize = 50_000;
     const CANDIDATE_LIMIT: usize = 2_000;
 
-    if let Some(watch) = cancel_watch {
-        crate::progress::poll_watch(watch)?;
+    if let Some(token) = cancel {
+        token.poll_result()?;
     }
     let mut deleted = 0usize;
     let mut added = 0usize;
@@ -2536,7 +2706,7 @@ fn apply_status_renames(
             head_tree,
             config,
             thread_policy,
-            cancel_watch,
+            cancel,
         );
     }
     crate::diff::detect_renames_with_policy(
@@ -2546,8 +2716,10 @@ fn apply_status_renames(
         rd.threshold,
         config,
         thread_policy,
-        cancel_watch,
+        cancel,
+        crate::diff::DetectRenamesOptions::default(),
     )
+    .map(|r| r.entries)
 }
 
 /// Render [`StatusModel`] as `git status --porcelain=v2` lines (no `#` headers).
@@ -2599,7 +2771,7 @@ pub fn format_porcelain_v2(
             .unwrap_or('.');
         let y = unstaged_by_path
             .get(path.as_str())
-            .map(|e| e.status.letter())
+            .map(|e| crate::diff::gitlink_unstaged_status_letter(e))
             .unwrap_or('.');
         if x == '.' && y == '.' {
             continue;
@@ -2811,7 +2983,9 @@ pub fn short_status_lines(model: &StatusModel) -> Vec<StatusShortLine> {
         let staged = staged_by_path.get(path.as_str());
         let unstaged = unstaged_by_path.get(path.as_str());
         let x = staged.map(|e| e.status.letter()).unwrap_or('.');
-        let y = unstaged.map(|e| e.status.letter()).unwrap_or('.');
+        let y = unstaged
+            .map(|e| crate::diff::gitlink_unstaged_status_letter(e))
+            .unwrap_or('.');
         if x == '.' && y == '.' {
             continue;
         }
@@ -2974,6 +3148,7 @@ mod guidance_tests {
             staged: Vec::new(),
             unstaged: Vec::new(),
             untracked: Vec::new(),
+            embedded_repositories: Vec::new(),
             ignored: Vec::new(),
             conflicts: Vec::new(),
             conflict_details: Vec::new(),
@@ -3250,7 +3425,8 @@ mod guidance_tests {
 
 #[cfg(test)]
 mod pathspec_prune_tests {
-    use super::pathspec_may_match_directory;
+    use super::pathspec_may_match_directory_with_globals;
+    use crate::pathspec::PathspecGlobalFlags;
 
     /// Directory prune without the literal fast path: every spec also goes through
     /// [`crate::pathspec::pathspec_matches`].
@@ -3303,17 +3479,32 @@ mod pathspec_prune_tests {
         for spec in specs {
             for dir in dirs {
                 assert_eq!(
-                    pathspec_may_match_directory(dir, &[spec.to_owned()]),
+                    pathspec_may_match_directory_with_globals(
+                        dir,
+                        &[spec.to_owned()],
+                        PathspecGlobalFlags::default(),
+                    ),
                     may_match_via_full_matcher(dir, spec),
                     "spec {spec:?} dir {dir:?}"
                 );
             }
         }
         let many: Vec<String> = (0..100).map(|i| format!("d{i}/f.txt")).collect();
-        assert!(pathspec_may_match_directory("d42", &many));
-        assert!(pathspec_may_match_directory("d42/f.txt", &many));
-        assert!(!pathspec_may_match_directory("d100", &many));
-        assert!(!pathspec_may_match_directory("d42/g", &many));
+        let globals = PathspecGlobalFlags::default();
+        assert!(pathspec_may_match_directory_with_globals(
+            "d42", &many, globals
+        ));
+        assert!(pathspec_may_match_directory_with_globals(
+            "d42/f.txt",
+            &many,
+            globals
+        ));
+        assert!(!pathspec_may_match_directory_with_globals(
+            "d100", &many, globals
+        ));
+        assert!(!pathspec_may_match_directory_with_globals(
+            "d42/g", &many, globals
+        ));
     }
 }
 
@@ -3321,7 +3512,7 @@ mod pathspec_prune_tests {
 mod status_op_tests {
     use super::*;
     use crate::environment::RepositoryOptions;
-    use crate::progress::{NeverCancel, NullProgress};
+    use crate::progress::{CancelToken, NullProgress};
     use std::fs;
     use tempfile::TempDir;
 
@@ -3353,7 +3544,10 @@ mod status_op_tests {
         let cfg_all = ConfigSet::load(
             &crate::environment::Environment::empty(),
             Some(cfg_dir.path()),
-            true,
+            &crate::config::LoadConfigOptions::standard(
+                &crate::environment::Environment::empty(),
+                Some(cfg_dir.path()),
+            ),
         )
         .unwrap();
         assert_eq!(
@@ -3370,7 +3564,10 @@ mod status_op_tests {
         let cfg_no = ConfigSet::load(
             &crate::environment::Environment::empty(),
             Some(cfg_dir.path()),
-            true,
+            &crate::config::LoadConfigOptions::standard(
+                &crate::environment::Environment::empty(),
+                Some(cfg_dir.path()),
+            ),
         )
         .unwrap();
         assert_eq!(
@@ -3387,7 +3584,10 @@ mod status_op_tests {
         let cfg_invalid = ConfigSet::load(
             &crate::environment::Environment::empty(),
             Some(cfg_dir.path()),
-            true,
+            &crate::config::LoadConfigOptions::standard(
+                &crate::environment::Environment::empty(),
+                Some(cfg_dir.path()),
+            ),
         )
         .unwrap();
         assert_eq!(
@@ -3404,7 +3604,10 @@ mod status_op_tests {
         let cfg_true = ConfigSet::load(
             &crate::environment::Environment::empty(),
             Some(cfg_dir.path()),
-            true,
+            &crate::config::LoadConfigOptions::standard(
+                &crate::environment::Environment::empty(),
+                Some(cfg_dir.path()),
+            ),
         )
         .unwrap();
         assert_eq!(
@@ -3462,7 +3665,7 @@ mod status_op_tests {
             &repo,
             &StatusOptions::default(),
             &mut NullProgress,
-            &NeverCancel,
+            &CancelToken::never(),
         )
         .unwrap();
 
@@ -3557,7 +3760,7 @@ mod status_op_tests {
             &repo,
             &StatusOptions::default(),
             &mut NullProgress,
-            &NeverCancel,
+            &CancelToken::never(),
         )
         .unwrap();
         assert!(
@@ -3784,7 +3987,7 @@ mod status_op_tests {
             &repo,
             &StatusOptions::default(),
             &mut NullProgress,
-            &NeverCancel,
+            &CancelToken::never(),
         )
         .unwrap();
 
@@ -3798,6 +4001,90 @@ mod status_op_tests {
             entries_read <= 8,
             "check-only probe must stop at the first visible entry, not scan all \
              3000 files (read {entries_read} directory entries during probe)"
+        );
+    }
+
+    fn open_nested_repo(nested_root: &std::path::Path) {
+        let git = nested_root.join(".git");
+        fs::create_dir_all(git.join("objects")).unwrap();
+        fs::create_dir_all(git.join("refs/heads")).unwrap();
+        fs::write(git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        fs::write(
+            git.join("config"),
+            "[core]\n\trepositoryformatversion = 0\n\tbare = false\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn status_collapses_directory_with_embedded_repo() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        init_min_repo(root);
+
+        let nested_only = root.join("tool/sub");
+        fs::create_dir_all(&nested_only).unwrap();
+        open_nested_repo(&nested_only);
+        fs::write(nested_only.join("main.rs"), b"fn main() {}\n").unwrap();
+
+        let repo = Repository::open(
+            &root.join(".git"),
+            &RepositoryOptions::empty().with_work_tree(root),
+        )
+        .unwrap();
+        let normal = status(
+            &repo,
+            &StatusOptions::default(),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .unwrap();
+        assert_eq!(normal.untracked, vec!["tool/"]);
+
+        let all = status(
+            &repo,
+            &StatusOptions {
+                untracked: UntrackedMode::All,
+                ..StatusOptions::default()
+            },
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .unwrap();
+        assert_eq!(all.untracked, vec!["tool/sub/"]);
+
+        let sibling = root.join("top");
+        fs::create_dir_all(sibling.join("inner")).unwrap();
+        open_nested_repo(&sibling.join("inner"));
+        fs::write(sibling.join("sib.txt"), b"y\n").unwrap();
+
+        let repo = Repository::open(
+            &root.join(".git"),
+            &RepositoryOptions::empty().with_work_tree(root),
+        )
+        .unwrap();
+        let normal = status(
+            &repo,
+            &StatusOptions::default(),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .unwrap();
+        assert_eq!(normal.untracked, vec!["tool/", "top/"]);
+
+        let all = status(
+            &repo,
+            &StatusOptions {
+                untracked: UntrackedMode::All,
+                ..StatusOptions::default()
+            },
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .unwrap();
+        assert_eq!(
+            all.untracked,
+            vec!["tool/sub/", "top/inner/", "top/sib.txt"]
         );
     }
 
@@ -3826,7 +4113,7 @@ mod status_op_tests {
                 ..StatusOptions::default()
             },
             &mut NullProgress,
-            &NeverCancel,
+            &CancelToken::never(),
         )
         .unwrap();
 
@@ -3890,7 +4177,7 @@ mod status_op_tests {
             &repo,
             &StatusOptions::default(),
             &mut NullProgress,
-            &NeverCancel,
+            &CancelToken::never(),
         )
         .unwrap();
         let modified = model
@@ -3911,7 +4198,9 @@ mod status_op_tests {
     )]
     #[test]
     fn status_scan_stats_each_tracked_path_once() {
-        use crate::worktree_scan::{reset_worktree_metadata_probe, worktree_metadata_probe_count};
+        use crate::test_support::counters::{
+            reset_worktree_metadata_probe, worktree_metadata_probe_count,
+        };
 
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
@@ -3939,7 +4228,7 @@ mod status_op_tests {
             &repo,
             &StatusOptions::default(),
             &mut NullProgress,
-            &NeverCancel,
+            &CancelToken::never(),
         )
         .unwrap();
         let tracked = repo.load_index().unwrap().entries.len();
@@ -3976,7 +4265,7 @@ mod status_op_tests {
             &repo,
             &StatusOptions::default(),
             &mut NullProgress,
-            &NeverCancel,
+            &CancelToken::never(),
         )
         .unwrap();
         assert!(
@@ -4004,7 +4293,7 @@ mod status_op_tests {
             ignored: IgnoredMode::Traditional,
             ..StatusOptions::default()
         };
-        let model = status(&repo, &opts, &mut NullProgress, &NeverCancel).unwrap();
+        let model = status(&repo, &opts, &mut NullProgress, &CancelToken::never()).unwrap();
         assert!(
             model.untracked.is_empty(),
             "untracked=No must omit untracked, got {:?}",
@@ -4033,7 +4322,7 @@ mod status_op_tests {
             untracked: UntrackedMode::No,
             ..StatusOptions::default()
         };
-        let model = status(&repo, &opts, &mut NullProgress, &NeverCancel).unwrap();
+        let model = status(&repo, &opts, &mut NullProgress, &CancelToken::never()).unwrap();
         assert!(
             model.untracked.is_empty(),
             "untracked=No must report nothing, got {:?}",
@@ -4079,14 +4368,14 @@ mod status_op_tests {
             &repo,
             &StatusOptions::default(),
             &mut NullProgress,
-            &NeverCancel,
+            &CancelToken::never(),
         )
         .unwrap();
         status(
             &repo,
             &StatusOptions::default(),
             &mut NullProgress,
-            &NeverCancel,
+            &CancelToken::never(),
         )
         .unwrap();
 
@@ -4095,7 +4384,7 @@ mod status_op_tests {
             &repo,
             &StatusOptions::default(),
             &mut NullProgress,
-            &NeverCancel,
+            &CancelToken::never(),
         )
         .unwrap();
         let entries_read = untracked_walk_probe::count();
@@ -4121,7 +4410,7 @@ mod status_op_tests {
             &repo,
             &StatusOptions::default(),
             &mut NullProgress,
-            &NeverCancel,
+            &CancelToken::never(),
         )
         .unwrap();
         let op = model.operation.expect("merge operation");
@@ -4160,7 +4449,7 @@ mod status_op_tests {
             &repo,
             &StatusOptions::default(),
             &mut NullProgress,
-            &NeverCancel,
+            &CancelToken::never(),
         )
         .unwrap();
         let op = model.operation.expect("merge operation");
@@ -4218,7 +4507,7 @@ mod status_op_tests {
             &repo,
             &StatusOptions::default(),
             &mut NullProgress,
-            &NeverCancel,
+            &CancelToken::never(),
         )
         .unwrap();
         assert!(model.state.cherry_pick_in_progress);
@@ -4286,7 +4575,10 @@ mod status_op_tests {
         let cfg = ConfigSet::load(
             &crate::environment::Environment::empty(),
             Some(cfg_dir.path()),
-            true,
+            &crate::config::LoadConfigOptions::standard(
+                &crate::environment::Environment::empty(),
+                Some(cfg_dir.path()),
+            ),
         )
         .unwrap();
         let opts = status_options_from_config(&cfg).unwrap();
@@ -4321,14 +4613,17 @@ mod status_op_tests {
         )
         .unwrap();
         let opts = StatusOptions {
-            pathspecs: vec!["scoped".into()],
+            pathspec: crate::pathspec::Pathspec::scoped(
+                ["scoped"],
+                crate::pathspec::PathspecGlobalFlags::default(),
+            ),
             renames: Some(RenameDetection {
                 threshold: 50,
                 copies: false,
             }),
             ..StatusOptions::default()
         };
-        let model = status(&repo, &opts, &mut NullProgress, &NeverCancel).unwrap();
+        let model = status(&repo, &opts, &mut NullProgress, &CancelToken::never()).unwrap();
 
         assert!(
             model.staged.iter().all(|e| e.path().starts_with("scoped/")),
@@ -4385,7 +4680,7 @@ mod status_op_tests {
             }),
             ..StatusOptions::default()
         };
-        let model = status(&repo, &opts, &mut NullProgress, &NeverCancel).unwrap();
+        let model = status(&repo, &opts, &mut NullProgress, &CancelToken::never()).unwrap();
         let rename_line = short_status_lines(&model)
             .into_iter()
             .find_map(|line| match line {
@@ -4430,7 +4725,7 @@ mod status_op_tests {
             }),
             ..StatusOptions::default()
         };
-        let model = status(&repo, &opts, &mut NullProgress, &NeverCancel).unwrap();
+        let model = status(&repo, &opts, &mut NullProgress, &CancelToken::never()).unwrap();
         let renamed: Vec<_> = model
             .staged
             .iter()
@@ -4508,11 +4803,14 @@ mod status_op_tests {
 
         for spec in ["old.txt", "new.txt"] {
             let opts = StatusOptions {
-                pathspecs: vec![spec.into()],
+                pathspec: crate::pathspec::Pathspec::scoped(
+                    [spec],
+                    crate::pathspec::PathspecGlobalFlags::default(),
+                ),
                 renames,
                 ..StatusOptions::default()
             };
-            let model = status(&repo, &opts, &mut NullProgress, &NeverCancel).unwrap();
+            let model = status(&repo, &opts, &mut NullProgress, &CancelToken::never()).unwrap();
             let grit_rows = staged_letters(&model);
             let git_rows = git_staged_porcelain_v2(root, spec);
             assert_eq!(
@@ -4522,11 +4820,15 @@ mod status_op_tests {
         }
 
         let opts_both = StatusOptions {
-            pathspecs: vec![".".into()],
+            pathspec: crate::pathspec::Pathspec::scoped(
+                ["."],
+                crate::pathspec::PathspecGlobalFlags::default(),
+            ),
             renames,
             ..StatusOptions::default()
         };
-        let model_both = status(&repo, &opts_both, &mut NullProgress, &NeverCancel).unwrap();
+        let model_both =
+            status(&repo, &opts_both, &mut NullProgress, &CancelToken::never()).unwrap();
         assert!(
             model_both
                 .staged
@@ -4565,12 +4867,12 @@ mod status_op_tests {
             &RepositoryOptions::empty().with_work_tree(root),
         )
         .unwrap();
-        let config = repo.config().expect("config");
+        let config = repo.config().snapshot().expect("config");
         let opts = StatusOptions {
             renames: status_renames_from_config(config.as_ref()),
             ..StatusOptions::default()
         };
-        let model = status(&repo, &opts, &mut NullProgress, &NeverCancel).unwrap();
+        let model = status(&repo, &opts, &mut NullProgress, &CancelToken::never()).unwrap();
         let grit_letters: Vec<_> = staged_letters(&model).into_iter().map(|(c, _)| c).collect();
         let git_out = std::process::Command::new("git")
             .args(["status", "--porcelain=v2"])
@@ -4636,7 +4938,7 @@ mod status_op_tests {
             &repo,
             &StatusOptions::default(),
             &mut NullProgress,
-            &NeverCancel,
+            &CancelToken::never(),
         )
         .unwrap();
         assert_eq!(model.unstaged.len(), 1, "{:?}", model.unstaged);
@@ -4676,7 +4978,7 @@ mod status_op_tests {
             }),
             ..StatusOptions::default()
         };
-        let model = status(&repo, &opts, &mut NullProgress, &NeverCancel).unwrap();
+        let model = status(&repo, &opts, &mut NullProgress, &CancelToken::never()).unwrap();
         assert!(
             model
                 .unstaged
@@ -4738,14 +5040,14 @@ mod status_op_tests {
             &repo,
             &StatusOptions::default(),
             &mut NullProgress,
-            &NeverCancel,
+            &CancelToken::never(),
         )
         .unwrap();
         status(
             &repo,
             &StatusOptions::default(),
             &mut NullProgress,
-            &NeverCancel,
+            &CancelToken::never(),
         )
         .unwrap();
 
@@ -4756,7 +5058,7 @@ mod status_op_tests {
             &repo,
             &StatusOptions::default(),
             &mut NullProgress,
-            &NeverCancel,
+            &CancelToken::never(),
         )
         .unwrap();
         let entries_read = untracked_walk_probe::count();
@@ -4802,7 +5104,7 @@ mod status_op_tests {
             ignored: IgnoredMode::Traditional,
             ..StatusOptions::default()
         };
-        let model = status(&repo, &opts, &mut NullProgress, &NeverCancel).unwrap();
+        let model = status(&repo, &opts, &mut NullProgress, &CancelToken::never()).unwrap();
         let grit_ignored: std::collections::BTreeSet<String> = model.ignored.into_iter().collect();
 
         let git_out = std::process::Command::new("git")

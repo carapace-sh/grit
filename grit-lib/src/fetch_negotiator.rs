@@ -1,5 +1,6 @@
 //! Skipping fetch negotiator — implements Git's "skipping" negotiation strategy.
 
+use crate::error::ObjectError;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
@@ -17,13 +18,15 @@ const POPPED: u8 = 1 << 5;
 fn committer_unix_seconds(committer: &str) -> Result<i64> {
     let parts: Vec<&str> = committer.rsplitn(3, ' ').collect();
     if parts.len() < 2 {
-        return Err(Error::CorruptObject(
-            "committer line missing date".to_owned(),
-        ));
+        return Err(Error::Object(ObjectError::Corrupt {
+            detail: "committer line missing date".to_owned(),
+        }));
     }
-    parts[1]
-        .parse::<i64>()
-        .map_err(|_| Error::CorruptObject("invalid committer timestamp".to_owned()))
+    parts[1].parse::<i64>().map_err(|_| {
+        Error::Object(ObjectError::Corrupt {
+            detail: "invalid committer timestamp".to_owned(),
+        })
+    })
 }
 
 fn commit_date(repo: &Repository, graph: Option<&CommitGraphChain>, oid: ObjectId) -> Result<i64> {
@@ -214,10 +217,11 @@ impl<'r> SkippingNegotiator<'r> {
 
     fn push_parent(&mut self, entry_oid: ObjectId, to_push: ObjectId) -> Result<bool> {
         let (entry_ttl, entry_orig) = {
-            let e = self
-                .entries
-                .get(&entry_oid)
-                .ok_or_else(|| Error::CorruptObject("missing queue entry".to_owned()))?;
+            let e = self.entries.get(&entry_oid).ok_or_else(|| {
+                Error::Object(ObjectError::Corrupt {
+                    detail: "missing queue entry".to_owned(),
+                })
+            })?;
             (e.ttl, e.original_ttl)
         };
 
@@ -231,10 +235,11 @@ impl<'r> SkippingNegotiator<'r> {
             self.rev_list_push(to_push, 0)?;
         }
 
-        let parent_entry = self
-            .entries
-            .get_mut(&to_push)
-            .ok_or_else(|| Error::CorruptObject("missing parent entry".to_owned()))?;
+        let parent_entry = self.entries.get_mut(&to_push).ok_or_else(|| {
+            Error::Object(ObjectError::Corrupt {
+                detail: "missing parent entry".to_owned(),
+            })
+        })?;
 
         if entry_common_or_adv {
             self.mark_common(to_push)?;
@@ -267,16 +272,21 @@ impl<'r> SkippingNegotiator<'r> {
 
             let HeapItem {
                 oid: commit_oid, ..
-            } = self
-                .heap
-                .pop()
-                .ok_or_else(|| Error::CorruptObject("negotiator heap inconsistency".to_owned()))?;
+            } = self.heap.pop().ok_or_else(|| {
+                Error::Object(ObjectError::Corrupt {
+                    detail: "negotiator heap inconsistency".to_owned(),
+                })
+            })?;
 
             let entry_ttl = self
                 .entries
                 .get(&commit_oid)
                 .map(|e| e.ttl)
-                .ok_or_else(|| Error::CorruptObject("popped missing entry".to_owned()))?;
+                .ok_or_else(|| {
+                    Error::Object(ObjectError::Corrupt {
+                        detail: "popped missing entry".to_owned(),
+                    })
+                })?;
 
             self.set_f(commit_oid, POPPED);
             if self.f(commit_oid) & COMMON == 0 {
@@ -311,13 +321,73 @@ impl<'r> SkippingNegotiator<'r> {
     /// Returns `true` if that commit was already `COMMON` before this call.
     pub fn ack(&mut self, oid: ObjectId) -> Result<bool> {
         if self.f(oid) & SEEN == 0 {
-            return Err(Error::CorruptObject(format!(
-                "ack for commit {} not sent as have",
-                oid.to_hex()
-            )));
+            return Err(Error::Object(ObjectError::Corrupt {
+                detail: format!("ack for commit {} not sent as have", oid.to_hex()),
+            }));
         }
         let known = self.f(oid) & COMMON != 0;
         self.mark_common(oid)?;
         Ok(known)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SkippingNegotiator;
+    use crate::config::environment::RepositoryOptions;
+    use crate::objects::{ObjectId, ObjectKind};
+    use crate::repo::{InitOptions, Repository};
+
+    fn write(repo: &Repository, kind: ObjectKind, data: &[u8]) -> ObjectId {
+        repo.odb().write(kind, data).expect("write object")
+    }
+
+    #[test]
+    fn add_tip_accepts_annotated_tag() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (repo, _) = Repository::init(
+            tmp.path(),
+            &InitOptions::new()
+                .with_bare(true)
+                .with_initial_branch("main".to_owned())
+                .with_ref_storage(crate::RefStorageFormat::Files),
+        )
+        .expect("init");
+
+        let tree = write(&repo, ObjectKind::Tree, &[]);
+        let commit_bytes = format!(
+            "tree {tree}\n\
+             author A U Thor <a@example.com> 0 +0000\n\
+             committer A U Thor <a@example.com> 0 +0000\n\
+             \n\
+             a commit\n"
+        );
+        let commit = write(&repo, ObjectKind::Commit, commit_bytes.as_bytes());
+        let tag_bytes = format!(
+            "object {commit}\n\
+             type commit\n\
+             tag v1\n\
+             tagger A U Thor <a@example.com> 0 +0000\n\
+             \n\
+             annotated v1\n"
+        );
+        let tag = write(&repo, ObjectKind::Tag, tag_bytes.as_bytes());
+
+        let repo = Repository::open(repo.git_dir(), &RepositoryOptions::empty()).expect("open");
+        let mut neg = SkippingNegotiator::new(&repo);
+
+        neg.add_tip(tag)
+            .expect("add_tip must accept an annotated tag");
+        neg.known_common(tag)
+            .expect("known_common must accept an annotated tag");
+
+        let have = neg.next_have().expect("next_have").expect("a have");
+        assert_eq!(have, commit, "tag tip should peel to its target commit");
+
+        let reopened = Repository::open(tmp.path(), &RepositoryOptions::empty()).expect("open");
+        let mut neg = SkippingNegotiator::new(&reopened);
+        neg.add_tip(commit).expect("commit tip ok");
+        neg.add_tip(tree)
+            .expect("tree tip must be skipped, not error");
     }
 }

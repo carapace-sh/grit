@@ -8,8 +8,6 @@ use grit_lib::diff::merge_trees::{
     merge_trees_three_way, TreeMergeConflictPresentation, WhitespaceMergeOptions,
 };
 use grit_lib::objects::{serialize_commit, CommitData, ObjectId, ObjectKind};
-use grit_lib::porcelain::checkout::checkout_between_trees;
-use grit_lib::refs;
 use grit_lib::repo::Repository;
 use grit_test_support::git;
 
@@ -64,7 +62,7 @@ fn grit_pick(repo: &Repository, source_hex: &str) -> grit_lib::error::Result<()>
     let source_oid = ObjectId::from_hex(source_hex).expect("source");
     let source_obj = repo.odb().read(&source_oid)?;
     let source = grit_lib::objects::parse_commit(&source_obj.data)?;
-    let head_oid = refs::resolve_ref(repo.git_dir(), "HEAD").expect("head");
+    let head_oid = repo.references().resolve("HEAD").expect("head");
     let head_obj = repo.odb().read(&head_oid)?;
     let head_commit = grit_lib::objects::parse_commit(&head_obj.data)?;
     let head_tree = head_commit.tree;
@@ -86,11 +84,11 @@ fn grit_pick(repo: &Repository, source_hex: &str) -> grit_lib::error::Result<()>
         grit_lib::diff::merge_trees::DirectoryRenameMode::default(),
     )?;
     let new_tree = merged.result_tree;
-    let index_handle = repo.index_handle();
-    let mut index = index_handle.load()?;
+    let index_handle = repo.index();
+    let mut index = index_handle.load(&grit_lib::index::IndexLoadOptions::default())?;
     grit_lib::diff::merge_trees::apply_tree_merge_output_to_index(&mut index, &merged);
     index_handle.write(&mut index)?;
-    checkout_between_trees(repo, Some(&head_tree), &new_tree)?;
+    repo.checkout().checkout(Some(&head_tree), &new_tree)?;
     let commit_data = CommitData {
         tree: new_tree,
         parents: vec![head_oid],
@@ -106,7 +104,7 @@ fn grit_pick(repo: &Repository, source_hex: &str) -> grit_lib::error::Result<()>
     let new_oid = repo
         .odb()
         .write(ObjectKind::Commit, &serialize_commit(&commit_data))?;
-    refs::write_ref(repo.git_dir(), "HEAD", &new_oid).expect("update head");
+    grit_test_support::refs::set_ref(&repo, "HEAD", &new_oid).expect("update head");
     Ok(())
 }
 
@@ -206,7 +204,7 @@ fn grit_stash_apply_at_3k_matches_git_without_index() {
             &stash_oid,
             &Default::default(),
             &mut grit_lib::progress::NullProgress,
-            &grit_lib::progress::NeverCancel,
+            &grit_lib::progress::CancelToken::never(),
         )
         .expect("stash apply");
 

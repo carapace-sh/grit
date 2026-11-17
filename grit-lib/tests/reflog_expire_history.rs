@@ -22,9 +22,10 @@ use grit_lib::refs::reflog::{
     expire_reflog_git, load_gc_reflog_expire_config, ReflogEntry, ReflogExpireActionKind,
     ReflogExpireParams,
 };
-use grit_lib::refs::{reflog_file_path, write_ref};
+use grit_lib::refs::store::RefNameRef;
 use grit_lib::repo::{InitOptions, Repository};
 use grit_lib::repo_handles::ExpireOptions;
+use grit_lib::test_support::refs::reflog_file_path;
 
 use support::{
     assert_reflog_tree_matches, copy_worktree, git, git_fsck_strict, git_version_at_least,
@@ -186,20 +187,21 @@ fn build_history(repo: &Repository) -> History {
         let right = b.commit(&[head], None);
         head = b.commit(&[left, right], None);
         if i == DIAMONDS / 2 {
-            write_ref(repo.git_dir(), "refs/heads/feature", &head).expect("feature ref");
+            grit_test_support::refs::set_ref(&repo, "refs/heads/feature", &head)
+                .expect("feature ref");
         }
     }
     let feature_tip = repo
-        .refs()
+        .ref_store()
         .resolve("refs/heads/feature")
         .expect("resolve feature");
     let tip = b.commit(&[head], None);
     let topic_side = b.commit(&[feature_tip], None);
     let lost = b.commit(&[tip], None);
 
-    write_ref(repo.git_dir(), "refs/heads/main", &tip).expect("main ref");
-    write_ref(repo.git_dir(), "refs/heads/topic", &topic_side).expect("topic ref");
-    write_ref(repo.git_dir(), "refs/tags/v1", &tag).expect("tag ref");
+    grit_test_support::refs::set_ref(&repo, "refs/heads/main", &tip).expect("main ref");
+    grit_test_support::refs::set_ref(&repo, "refs/heads/topic", &topic_side).expect("topic ref");
+    grit_test_support::refs::set_ref(&repo, "refs/tags/v1", &tag).expect("tag ref");
     History {
         early,
         tagged,
@@ -249,13 +251,13 @@ fn assert_logs_text_match(git_side: &Path, grit_side: &Path, refnames: &[&str]) 
 /// Compare the logs of `refnames` as text, then every log file byte for byte.
 fn assert_logs_match(git_side: &Path, grit_side: &Path, refnames: &[&str]) {
     assert_logs_text_match(git_side, grit_side, refnames);
-    assert_reflog_tree_matches(&git_side.join(".git"), &grit_side.join(".git"));
+    assert_reflog_tree_matches(git_side.join(".git"), &grit_side.join(".git"));
 }
 
 /// A files-backend repository with `main` checked out and the generated history.
 fn seed_repo() -> (tempfile::TempDir, History) {
     let dir = tempfile::tempdir().expect("tempdir");
-    let repo = Repository::init(
+    let (repo, _) = Repository::init(
         dir.path(),
         &InitOptions::new().with_initial_branch("main".to_owned()),
     )
@@ -276,8 +278,15 @@ fn grit_expire_within_limit(
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let repo = open_repo(&worktree);
-        let cfg = ConfigSet::load(&Environment::empty(), Some(repo.git_dir()), true)
-            .expect("load config");
+        let cfg = ConfigSet::load(
+            &Environment::empty(),
+            Some(repo.git_dir()),
+            &crate::config::LoadConfigOptions::standard(
+                &Environment::empty(),
+                Some(repo.git_dir()),
+            ),
+        )
+        .expect("load config");
         let gc = load_gc_reflog_expire_config(&cfg, NOW);
         let pruned = refnames
             .iter()
@@ -439,7 +448,8 @@ fn expire_many_refs_in_one_pass_judges_each_ref_by_its_own_tip_like_git() {
     let mut refnames = Vec::new();
     for (i, side) in sides.iter().enumerate() {
         let refname = format!("refs/heads/b{i}");
-        write_ref(&git_dir, &refname, side).expect("branch ref");
+        grit_test_support::refs::set_ref(&grit_test_support::refs::at(&git_dir), &refname, side)
+            .expect("branch ref");
         let other = sides[(i + 1) % BRANCHES];
         write_reflog(
             &git_dir,
@@ -510,7 +520,7 @@ fn expire_many_refs_in_one_pass_judges_each_ref_by_its_own_tip_like_git() {
 #[test]
 fn stale_fix_prunes_entries_with_missing_objects_like_git() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let repo = Repository::init(
+    let (repo, _) = Repository::init(
         dir.path(),
         &InitOptions::new().with_initial_branch("main".to_owned()),
     )

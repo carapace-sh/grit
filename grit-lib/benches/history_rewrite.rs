@@ -10,11 +10,8 @@ use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use grit_lib::index::write_tree::{write_tree_update_index, WriteTreeFlags};
 use grit_lib::index::{Index, IndexEntry, MODE_REGULAR};
 use grit_lib::objects::{parse_commit, serialize_commit, CommitData, ObjectKind};
-use grit_lib::refs::write_ref;
 use grit_lib::repo::{InitOptions, Repository};
-use grit_lib::revwalk::history::{
-    plan_rewrite, CommitEdit, EmptyPolicy, HistoryEdits, RefScope, RewriteOptions,
-};
+use grit_lib::revwalk::history::{CommitEdit, EmptyPolicy, HistoryEdits, RefScope, RewriteOptions};
 
 use s7::HistoryBenchFixtures;
 
@@ -42,11 +39,11 @@ fn build_linear_wide_repo(
     commit_count: usize,
 ) -> (tempfile::TempDir, Repository, grit_lib::objects::ObjectId) {
     let root = tempfile::tempdir().expect("tempdir");
-    let repo = Repository::init(
+    let (repo, _) = Repository::init(
         root.path(),
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
-            .with_ref_storage(grit_lib::RefStorageFormat::Files),
+            .with_ref_storage(grit_lib::refs::ref_storage::RefStorageFormat::Files),
     )
     .expect("init");
     let wide_tree = HistoryBenchFixtures::global().wide_tree;
@@ -105,7 +102,7 @@ fn build_linear_wide_repo(
         parent = Some(oid);
     }
     let head = parent.expect("head");
-    write_ref(repo.git_dir(), "refs/heads/main", &head).expect("ref");
+    grit_test_support::refs::set_ref(&repo, "refs/heads/main", &head).expect("ref");
     (root, repo, oldest.expect("oldest"))
 }
 
@@ -126,18 +123,19 @@ fn bench_history_rewrite(c: &mut Criterion) {
                     parents: None,
                 },
             );
-            let plan = plan_rewrite(
-                &repo,
-                &edits,
-                &RewriteOptions {
-                    scope: RefScope::Branches,
-                    empty: EmptyPolicy::Drop,
-                    committer: "Bench <b@grit.test> 9 +0000".parse().expect("signature"),
-                    preserve_committer: false,
-                    sign: true,
-                },
-            )
-            .expect("plan");
+            let plan = repo
+                .history()
+                .plan_rewrite(
+                    &edits,
+                    &RewriteOptions {
+                        scope: RefScope::Branches,
+                        empty: EmptyPolicy::Drop,
+                        committer: "Bench <b@grit.test> 9 +0000".parse().expect("signature"),
+                        preserve_committer: false,
+                        sign: true,
+                    },
+                )
+                .expect("plan");
             black_box(plan.commits.len())
         });
     });

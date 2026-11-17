@@ -1,9 +1,10 @@
 //! Unambiguous ref shortening (`refs_shorten_unambiguous_ref` semantics).
 
-use crate::check_ref_format::{check_refname_format, RefNameOptions};
+use crate::check_ref_format::{check_refname_format, RefFormatOptions};
 use crate::diagnostics::Warning;
+use crate::error::RefError;
 use crate::error::{Error, Result};
-use crate::refs::store::RawRef;
+use crate::refs::store::{RawRef, RefNameRef};
 use crate::refs::SYMREF_MAXDEPTH;
 use crate::repo::Repository;
 use crate::worktree_ref::DWIM_RULES;
@@ -38,15 +39,18 @@ fn expand_rule(rule_index: usize, short: &str) -> String {
 }
 
 fn ref_exists(repo: &Repository, name: &str) -> Result<bool> {
-    Ok(repo.refs().read_raw(name)?.is_some())
+    Ok(repo
+        .ref_store()
+        .read_raw(RefNameRef::from_trusted(name))?
+        .is_some())
 }
 
 /// Follow symbolic refs from `start` to the terminal ref name Git uses for DWIM output.
-pub fn peel_symref_to_terminal_ref(repo: &Repository, start: &str) -> Result<String> {
-    let refname_opts = RefNameOptions::default();
+pub(crate) fn peel_symref_to_terminal_ref(repo: &Repository, start: &str) -> Result<String> {
+    let refname_opts = RefFormatOptions::default();
     let mut name = start.to_owned();
     for _ in 0..SYMREF_MAXDEPTH {
-        let Some(raw) = repo.refs().read_raw(&name)? else {
+        let Some(raw) = repo.ref_store().read_raw(RefNameRef::from_trusted(&name))? else {
             return Ok(name);
         };
         match raw {
@@ -59,9 +63,9 @@ pub fn peel_symref_to_terminal_ref(repo: &Repository, start: &str) -> Result<Str
             }
         }
     }
-    Err(Error::RefStore(
+    Err(Error::Ref(RefError::Store(
         crate::refs::store::RefStoreError::SymrefLoop,
-    ))
+    )))
 }
 
 fn symref_target_resolves(repo: &Repository, start: &str) -> Result<bool> {
@@ -71,15 +75,11 @@ fn symref_target_resolves(repo: &Repository, start: &str) -> Result<bool> {
 
 /// Read `core.warnAmbiguousRefs` (default **true** / strict shortening).
 #[must_use]
-pub fn warn_ambiguous_refs_from_config(repo: &Repository) -> bool {
-    let Ok(config) = repo.config() else {
+pub(crate) fn warn_ambiguous_refs_from_config(repo: &Repository) -> bool {
+    let Ok(config) = repo.config().snapshot() else {
         return true;
     };
-    config
-        .get_bool("core.warnambiguousrefs")
-        .or_else(|| config.get_bool("core.warnAmbiguousRefs"))
-        .and_then(|r| r.ok())
-        .unwrap_or(true)
+    config.bool_with_default("core.warnAmbiguousRefs", true)
 }
 
 /// Expand `spec` with Git `expand_ref` / `repo_dwim_ref` rules.
@@ -89,13 +89,19 @@ pub fn warn_ambiguous_refs_from_config(repo: &Repository) -> bool {
 /// # Errors
 ///
 /// Propagates ref-store read failures.
-pub fn expand_ref_dwim_full_name(repo: &Repository, spec: &str) -> Result<(usize, Option<String>)> {
+pub(crate) fn expand_ref_dwim_full_name(
+    repo: &Repository,
+    spec: &str,
+) -> Result<(usize, Option<String>)> {
     let warn = warn_ambiguous_refs_from_config(repo);
     let mut count = 0usize;
     let mut first = None;
     for rule in DWIM_RULES {
         let candidate = rule.replace("{0}", spec);
-        let Some(raw) = repo.refs().read_raw(&candidate)? else {
+        let Some(raw) = repo
+            .ref_store()
+            .read_raw(RefNameRef::from_trusted(&candidate))?
+        else {
             continue;
         };
         let valid = match raw {
@@ -126,7 +132,11 @@ pub fn expand_ref_dwim_full_name(repo: &Repository, spec: &str) -> Result<(usize
 /// # Errors
 ///
 /// Propagates config and ref-store errors from existence checks.
-pub fn shorten_unambiguous(repo: &Repository, full_ref: &str, strict: bool) -> Result<String> {
+pub(crate) fn shorten_unambiguous(
+    repo: &Repository,
+    full_ref: &str,
+    strict: bool,
+) -> Result<String> {
     // Rule 0 always matches; start from the most specific rules.
     for i in (1..NUM_REV_PARSE_RULES).rev() {
         let Some(short) = match_parse_rule(full_ref, REV_PARSE_RULES[i]) else {
@@ -161,7 +171,7 @@ mod tests {
 
     fn init_repo() -> (tempfile::TempDir, Repository) {
         let dir = tempfile::tempdir().expect("tempdir");
-        let repo = Repository::init(dir.path(), &InitOptions::default()).expect("init");
+        let (repo, _) = Repository::init(dir.path(), &InitOptions::default()).expect("init");
         let oid = crate::refs::test_commit(repo.git_dir(), "main");
         write_ref(repo.git_dir(), "refs/heads/main", &oid).expect("main");
         write_ref(repo.git_dir(), "HEAD", &oid).expect("head");
@@ -224,7 +234,7 @@ mod tests {
     #[test]
     fn unborn_head_ref_name_unresolved_like_git() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let repo = Repository::init(
+        let (repo, _) = Repository::init(
             dir.path(),
             &InitOptions::new().with_initial_branch("main".to_owned()),
         )

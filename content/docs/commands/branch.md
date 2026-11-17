@@ -29,6 +29,8 @@ Use `-r` / `--remotes` for remote-tracking branches (`origin/main`, …) and `-a
 
 With `--json` or `--markdown`, list output includes `full_ref`, commit `subject` and `date`, upstream details, and linked `worktree` paths when present. Plain human list stays names plus upstream markers.
 
+Path strings in human, `--json`, and `--markdown` output use forward slashes and no Windows `\\?\` verbatim prefix (same spelling as [`grit worktree`](worktree.md)), so scripts can compare `branches[].worktree` with `worktrees[].path`.
+
 With a name, creates `refs/heads/<name>` at `<start>` or at `HEAD`. It does not switch to the new branch; use [`grit switch -c`](../switch/) to create and switch in one step.
 
 Branch names follow the same rules as `git check-ref-format --branch`. Invalid names fail before anything is written under `.git/refs`.
@@ -152,7 +154,7 @@ Pass `--json` for stable, scripting-friendly output. The object's `action` field
 | `name` | string | For `create` or `delete`, the branch name. |
 | `oid` | string | For `create` or `delete`, full tip id. For `rename`, tip before rename when present. |
 | `short_oid` | string | Abbreviated tip id (seven hex digits when possible). |
-| `upstream` | string or null | For `create`, configured upstream display name when tracking applies; for `set_upstream`, the upstream display name (for example `origin/main`). |
+| `upstream` | string or null | For `create`, the branch's upstream display name afterwards: the one tracking configures, or the one already configured when `--force` resets an existing branch (`--dry-run` reports what the live create would). For `set_upstream`, the upstream display name (for example `origin/main`). |
 | `old` | string | For `rename`, previous short name. |
 | `new` | string | For `rename`, new short name. |
 | `replaced` | string or null | For `rename` with `--force`, previous tip of `new` when overwritten. |

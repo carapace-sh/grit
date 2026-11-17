@@ -32,8 +32,8 @@ Revert either completes a step, stops for conflicts or an empty commit, or chang
 | `<commit>…` | Commits or revision ranges to revert (required unless continuing). |
 | `--mainline <n>` | Parent number when reverting a merge commit. |
 | `--continue` | Finish a revert stopped on conflicts or an empty commit. |
-| `--abort` | Cancel the in-progress revert and restore the saved branch tip. |
-| `--skip` | Skip the current commit and continue with the rest of the sequence. |
+| `--abort` | Cancel the in-progress revert and restore the branch tip and worktree (conflict-only files from the other side are removed). Uses `sequencer/head` when grit wrote a sequencer directory; otherwise resets the index and worktree to the current tip (including after a conflicting `git revert`). A stale `ORIG_HEAD` from an earlier operation is ignored. |
+| `--skip` | Skip the current commit and continue with the rest of the sequence; the worktree is reset to the saved tip, including removing conflict-only paths. |
 | `--no-commit` | Apply the revert to the index only; do not create a commit yet. |
 | `--empty stop\|keep\|drop` | When a step would not change the tree: stop (default), record an empty commit, or skip the step. |
 | `-m`, `--message` | Replace the revert message (**single commit only**). |
@@ -100,6 +100,7 @@ Pass `--json` for stable, scripting-friendly output:
 | `commits` | array | Each revert commit created in this invocation (newest first). |
 | `dropped` | array | Source commits skipped as empty per `--empty drop`. |
 | `conflicts` | array or null | Conflicted paths when `result` is `conflicts`, each `{path, kind}` with a [conflict kind](../status/#conflict-kinds). |
+| `rerere` | array | Rerere events when `rerere.enabled` is active and the revert stops on conflicts (`path`, `kind` as for [`grit merge`](../merge/#json-output)). Omitted when empty. |
 | `next_steps` | array or null | Suggested follow-up commands when paused. |
 | `alternatives` | array or null | `--abort` / `--skip` when paused. |
 | `dry_run` | boolean or null | True when `--dry-run` was used. |

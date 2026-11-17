@@ -1,8 +1,6 @@
 //! `grit blame` — show who last modified each line of a file.
 
 use std::collections::BTreeMap;
-use std::io::Write;
-use std::ops::Not;
 
 use anyhow::{bail, Context, Result};
 use std::fmt;
@@ -12,10 +10,10 @@ use std::fmt;
 pub struct BlameUsageError;
 
 use grit_lib::blame::{
-    blame_file, resolve_blame_line_range_with_options, BlameFinalSource, BlameOptions, BlameResult,
-    CopyDetection, IgnoreRevs, IgnoreRevsSources,
+    BlameFinalSource, BlameOptions, BlameResult, CopyDetection, IgnoreRevs, IgnoreRevsSources,
 };
 use grit_lib::diff::WhitespaceMode;
+use grit_lib::revwalk::{Peel, ResolveOptions};
 
 impl fmt::Display for BlameUsageError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -24,147 +22,17 @@ impl fmt::Display for BlameUsageError {
 }
 
 impl std::error::Error for BlameUsageError {}
-use grit_lib::objects::ObjectId;
-use grit_lib::revwalk::rev_parse::resolve_revision_as_commit;
-use schemars::JsonSchema;
-use serde::Serialize;
 
 use crate::context::{self, relative_date_from};
-use crate::markdown;
-use crate::output::{outln, HumanRender, MarkdownRender, Person, RenderContext};
+use crate::output::Person;
+use crate::render::blame::BlameDisplayLine;
 
-/// Result of `grit blame`.
-#[derive(Serialize, JsonSchema)]
-pub struct BlameOutcome {
-    pub file: String,
-    pub rev: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub lines: Option<Vec<BlameLineJson>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub hunks: Option<Vec<BlameHunkJson>>,
-    pub commits: BTreeMap<String, BlameCommitJson>,
-    #[serde(skip)]
-    #[schemars(skip)]
-    display_lines: Vec<BlameDisplayLine>,
-}
+pub use crate::render::blame::{BlameCommitJson, BlameHunkJson, BlameLineJson, BlameOutcome};
 
-#[derive(Serialize, JsonSchema)]
-pub struct BlameLineJson {
-    pub commit: String,
-    pub original_line: usize,
-    pub original_path: String,
-    pub final_line: usize,
-    pub content: String,
-    #[serde(default, skip_serializing_if = "Not::not")]
-    pub encoding_lossy: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ignored: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub unblamable: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub not_committed: Option<bool>,
-}
-
-#[derive(Serialize, JsonSchema)]
-pub struct BlameHunkJson {
-    pub commit: String,
-    pub original_path: String,
-    pub original_start: usize,
-    pub final_start: usize,
-    pub count: usize,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ignored: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub unblamable: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub not_committed: Option<bool>,
-    pub lines: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub line_encoding_lossy: Option<Vec<bool>>,
-}
-
-#[derive(Serialize, JsonSchema)]
-pub struct BlameCommitJson {
-    pub author: Person,
-    pub summary: String,
-}
-
-#[derive(Clone)]
-struct BlameDisplayLine {
-    commit: ObjectId,
-    original_line: usize,
-    final_line: usize,
-    content: String,
-    author_short: String,
-    date: String,
-    marker: char,
-}
-
-impl HumanRender for BlameOutcome {
-    fn render_human(&self, w: &mut dyn Write, _ctx: &RenderContext) -> Result<()> {
-        for line in &self.display_lines {
-            let short = short_oid(&line.commit.to_hex());
-            let prefix = if line.marker == ' ' {
-                String::new()
-            } else {
-                format!("{}", line.marker)
-            };
-            outln!(
-                w,
-                "{prefix}{short} ({author} {date} {final:>4}) {content}",
-                author = line.author_short,
-                date = line.date,
-                final = line.final_line,
-                content = line.content,
-            );
-        }
-        Ok(())
-    }
-}
-
-impl MarkdownRender for BlameOutcome {
-    fn render_markdown(&self, w: &mut dyn Write, _ctx: &RenderContext) -> Result<()> {
-        outln!(w, "## Blame: `{}`\n", self.file);
-        outln!(w, "Revision `{}`\n", self.rev);
-        if self.display_lines.is_empty() {
-            outln!(w, "No lines to show.\n");
-            return Ok(());
-        }
-        outln!(
-            w,
-            "| Line | Mark | Commit | Author | Date | Original | Content |"
-        );
-        outln!(w, "| ---: | :---: | --- | --- | --- | ---: | --- |");
-        for line in &self.display_lines {
-            let short = short_oid(&line.commit.to_hex());
-            let content = markdown::escape_table_cell(&line.content);
-            let mark = match line.marker {
-                ' ' => String::new(),
-                c => c.to_string(),
-            };
-            outln!(
-                w,
-                "| {} | {} | `{}` | {} | {} | {} | {} |",
-                line.final_line,
-                mark,
-                short,
-                line.author_short,
-                line.date,
-                line.original_line,
-                content,
-            );
-        }
-        outln!(w);
-        Ok(())
-    }
-}
-
-fn short_oid(full: &str) -> String {
-    full.chars().take(7).collect()
-}
-
-fn blame_line_marker(unblamable: bool, ignored: bool) -> char {
-    if unblamable {
+fn blame_line_marker(boundary: bool, unblamable: bool, ignored: bool) -> char {
+    if boundary {
+        '^'
+    } else if unblamable {
         '*'
     } else if ignored {
         '?'
@@ -174,7 +42,7 @@ fn blame_line_marker(unblamable: bool, ignored: bool) -> char {
 }
 
 /// Strip trailing line terminators from blamed line text for display and JSON.
-fn normalize_blame_line_content(content: String) -> String {
+fn normalize_blame_line_content(content: &str) -> String {
     content.trim_end_matches(['\n', '\r']).to_owned()
 }
 
@@ -190,6 +58,7 @@ pub fn run(
     group: bool,
     ignore_all_space: bool,
     copy_detection: u8,
+    move_detection: bool,
     contents: Option<String>,
     now: time::OffsetDateTime,
 ) -> Result<BlameOutcome> {
@@ -206,7 +75,9 @@ pub fn run(
     let rev_spec = explicit_rev.as_deref().unwrap_or("HEAD");
 
     let repo = context::discover()?;
-    let start = resolve_revision_as_commit(&repo, rev_spec)
+    let start = repo
+        .revwalk()
+        .resolve(rev_spec, &ResolveOptions::default().with_peel(Peel::Commit))
         .with_context(|| format!("could not resolve revision '{rev_spec}'"))?;
 
     let final_source = match contents.as_deref() {
@@ -221,11 +92,6 @@ pub fn run(
         ),
         None if explicit_rev.is_none() && repo.work_tree().is_some() => BlameFinalSource::Worktree,
         None => BlameFinalSource::Revision,
-    };
-    let uncommitted_label = if matches!(final_source, BlameFinalSource::Contents(_)) {
-        "External file (--contents)"
-    } else {
-        "Not Committed Yet"
     };
     let mut options = BlameOptions {
         start: Some(start),
@@ -243,7 +109,10 @@ pub fn run(
 
     options.line_range = line_range
         .as_deref()
-        .map(|spec| resolve_blame_line_range_with_options(&repo, &blame_path, spec, &options))
+        .map(|spec| {
+            repo.diff()
+                .resolve_blame_line_range_with_options(&blame_path, spec, &options)
+        })
         .transpose()
         .with_context(|| "could not parse line range")?;
 
@@ -268,43 +137,32 @@ pub fn run(
     options.ignore = ignore;
     options.whitespace = whitespace;
     options.copy_detection = copy_detection;
-    let mut result = blame_file(&repo, &blame_path, &options)?;
-    label_uncommitted(&mut result, uncommitted_label);
+    options.move_detection = move_detection || copy_detection.count() > 0;
+    let result = repo.diff().blame(&blame_path, &options)?;
 
-    Ok(outcome_from_result(
+    outcome_from_result(
+        &repo,
         blame_path,
         start.to_hex(),
-        result,
+        &result,
         group,
         now.unix_timestamp(),
-    ))
-}
-
-/// Give uncommitted lines the author identity Git's porcelain output shows for them.
-fn label_uncommitted(result: &mut BlameResult, label: &str) {
-    let uncommitted: Vec<_> = result
-        .lines
-        .iter()
-        .filter(|line| line.not_committed)
-        .map(|line| line.commit)
-        .collect();
-    for oid in uncommitted {
-        if let Some(info) = result.commits.get_mut(&oid) {
-            if info.author.is_empty() {
-                info.author = format!("{label} <not.committed.yet> {} +0000", info.author_time);
-                info.summary = label.to_owned();
-            }
-        }
-    }
+    )
 }
 
 fn outcome_from_result(
+    repo: &grit_lib::repo::Repository,
     file: String,
     rev: String,
-    result: BlameResult,
+    result: &BlameResult,
     group: bool,
     now: i64,
-) -> BlameOutcome {
+) -> Result<BlameOutcome> {
+    let mut abbrev_batch = crate::log_display::display_abbrev_batch(repo)?;
+    let mut commit_short = std::collections::HashMap::new();
+    for oid in result.commits.keys() {
+        commit_short.insert(*oid, abbrev_batch.abbrev_known(repo, *oid)?);
+    }
     let mut commits_json = BTreeMap::new();
     for (oid, info) in &result.commits {
         commits_json.insert(
@@ -329,8 +187,8 @@ fn outcome_from_result(
             })
             .unwrap_or_else(|| ("unknown".to_owned(), "?".to_owned()));
 
-        let content = normalize_blame_line_content(line.content.clone());
-        let marker = blame_line_marker(line.unblamable, line.ignored);
+        let content = normalize_blame_line_content(&line.content);
+        let marker = blame_line_marker(line.boundary, line.unblamable, line.ignored);
         lines_json.push(BlameLineJson {
             commit: commit_hex.clone(),
             original_line: line.original_line,
@@ -341,9 +199,14 @@ fn outcome_from_result(
             ignored: line.ignored.then_some(true),
             unblamable: line.unblamable.then_some(true),
             not_committed: line.not_committed.then_some(true),
+            boundary: line.boundary.then_some(true),
         });
+        let commit_short = commit_short
+            .get(&line.commit)
+            .cloned()
+            .unwrap_or_else(|| line.commit.to_short_hex());
         display_lines.push(BlameDisplayLine {
-            commit: line.commit,
+            commit_short,
             original_line: line.original_line,
             final_line: line.final_line,
             content,
@@ -354,59 +217,45 @@ fn outcome_from_result(
     }
 
     let (lines, hunks) = if group {
-        let raw_hunks = result.hunks();
-        let mut line_cursor = 0usize;
-        let mut hunks_json = Vec::with_capacity(raw_hunks.len());
-        for hunk in raw_hunks {
-            let final_end = hunk
-                .final_start
-                .saturating_add(hunk.count.saturating_sub(1));
-            let mut hunk_lines = Vec::with_capacity(hunk.count);
-            let mut hunk_encoding_lossy = Vec::with_capacity(hunk.count);
-            for _ in 0..hunk.count {
-                let line = &result.lines[line_cursor];
-                debug_assert!(
-                    line.final_line >= hunk.final_start && line.final_line <= final_end,
-                    "line final {} hunk {}..={}",
-                    line.final_line,
-                    hunk.final_start,
-                    final_end
-                );
-                line_cursor += 1;
-                hunk_lines.push(normalize_blame_line_content(line.content.clone()));
-                hunk_encoding_lossy.push(line.encoding_lossy);
-            }
-            let line_encoding_lossy = hunk_encoding_lossy
-                .iter()
-                .any(|&v| v)
-                .then_some(hunk_encoding_lossy);
-            hunks_json.push(BlameHunkJson {
-                commit: hunk.commit.to_hex(),
-                original_path: hunk.original_path,
-                original_start: hunk.original_start,
-                final_start: hunk.final_start,
-                count: hunk.count,
-                ignored: hunk.ignored.then_some(true),
-                unblamable: hunk.unblamable.then_some(true),
-                not_committed: hunk.commit.is_zero().then_some(true),
-                lines: hunk_lines,
-                line_encoding_lossy,
-            });
-        }
-        debug_assert_eq!(line_cursor, result.lines.len());
+        let hunks_json = result
+            .hunks()
+            .into_iter()
+            .map(|hunk| {
+                let hunk_lines = result.hunk_lines(&hunk);
+                let line_encoding_lossy = hunk_lines
+                    .iter()
+                    .any(|line| line.encoding_lossy)
+                    .then(|| hunk_lines.iter().map(|line| line.encoding_lossy).collect());
+                BlameHunkJson {
+                    commit: hunk.commit.to_hex(),
+                    original_start: hunk.original_start,
+                    final_start: hunk.final_start,
+                    count: hunk.count,
+                    ignored: hunk.ignored.then_some(true),
+                    unblamable: hunk.unblamable.then_some(true),
+                    not_committed: hunk.not_committed.then_some(true),
+                    lines: hunk_lines
+                        .iter()
+                        .map(|line| normalize_blame_line_content(&line.content))
+                        .collect(),
+                    line_encoding_lossy,
+                    original_path: hunk.original_path,
+                }
+            })
+            .collect();
         (None, Some(hunks_json))
     } else {
         (Some(lines_json), None)
     };
 
-    BlameOutcome {
+    Ok(BlameOutcome {
         file,
         rev,
         lines,
         hunks,
         commits: commits_json,
         display_lines,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -415,8 +264,58 @@ mod tests {
 
     #[test]
     fn normalize_blame_line_content_strips_trailing_crlf() {
-        assert_eq!(normalize_blame_line_content("x\r\n".to_owned()), "x");
-        assert_eq!(normalize_blame_line_content("y\n".to_owned()), "y");
-        assert_eq!(normalize_blame_line_content("z".to_owned()), "z");
+        assert_eq!(normalize_blame_line_content("x\r\n"), "x");
+        assert_eq!(normalize_blame_line_content("y\n"), "y");
+        assert_eq!(normalize_blame_line_content("z"), "z");
     }
+}
+
+/// Dispatch parsed CLI args for `Blame`.
+pub fn dispatch(
+    args: crate::args::BlameArgs,
+    env: crate::dispatch::CommandEnv<'_>,
+) -> anyhow::Result<crate::exit_status::ExitStatus> {
+    use crate::args::*;
+    use crate::commands;
+
+    use crate::dispatch::{emit_success, CommandEnv};
+
+    let CommandEnv {
+        opts,
+        ctx,
+        process_env: _,
+    } = env;
+    let BlameArgs {
+        rev_pos,
+        file,
+        rev,
+        line_range,
+        first_parent,
+        ignore_rev,
+        ignore_revs_file,
+        group,
+        ignore_all_space,
+        copy_detection,
+        move_detection,
+        contents,
+    } = args;
+    emit_success(
+        commands::blame::run(
+            rev_pos,
+            file,
+            rev,
+            line_range,
+            first_parent,
+            ignore_rev,
+            ignore_revs_file,
+            group,
+            ignore_all_space,
+            copy_detection,
+            move_detection,
+            contents,
+            ctx.now,
+        )?,
+        opts,
+        ctx,
+    )
 }

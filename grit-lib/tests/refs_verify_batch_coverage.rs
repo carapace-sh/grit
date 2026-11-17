@@ -9,13 +9,9 @@ use std::fs;
 
 use grit_lib::objects::ObjectId;
 use grit_lib::refs::gc::{update_refs, RefTransactionItem};
-use grit_lib::refs::resolve_ref;
-use grit_lib::refs::write_ref;
-use grit_lib::refs::{
-    verify_ref_transaction_batch, verify_refname_available_for_create, RefBatchItem,
-    RefnameUnavailable,
-};
+use grit_lib::refs::{RefBatchItem, RefnameUnavailable};
 use grit_lib::repo::{InitOptions, Repository};
+use grit_lib::test_support::refs::{verify_ref_available_for_create, verify_ref_transaction_batch};
 use tempfile::tempdir;
 
 fn oid(byte: u8) -> ObjectId {
@@ -29,7 +25,7 @@ fn verify_batch_rejects_prefix_pair_in_same_transaction() {
         dir.path(),
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
-            .with_ref_storage(grit_lib::RefStorageFormat::Files),
+            .with_ref_storage(grit_lib::refs::ref_storage::RefStorageFormat::Files),
     )
     .expect("init");
     let git_dir = dir.path().join(".git");
@@ -54,7 +50,7 @@ fn verify_refname_blocks_loose_directory_and_packed_descendant() {
         dir.path(),
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
-            .with_ref_storage(grit_lib::RefStorageFormat::Files),
+            .with_ref_storage(grit_lib::refs::ref_storage::RefStorageFormat::Files),
     )
     .expect("init");
     let git_dir = dir.path().join(".git");
@@ -69,14 +65,17 @@ fn verify_refname_blocks_loose_directory_and_packed_descendant() {
     )
     .expect("child file");
 
-    let err = verify_refname_available_for_create(&git_dir, "refs/heads/blocker", &extras, &skip)
+    let err = verify_ref_available_for_create(&git_dir, "refs/heads/blocker", &extras, &skip)
         .unwrap_err();
     assert!(matches!(err, RefnameUnavailable::DescendantExists { .. }));
 
-    write_ref(&git_dir, "refs/heads/ok", &oid(5)).expect("write");
-    assert!(
-        verify_refname_available_for_create(&git_dir, "refs/heads/ok-new", &extras, &skip).is_ok()
-    );
+    grit_test_support::refs::set_ref(
+        &grit_test_support::refs::at(&git_dir),
+        "refs/heads/ok",
+        &oid(5),
+    )
+    .expect("write");
+    assert!(verify_ref_available_for_create(&git_dir, "refs/heads/ok-new", &extras, &skip).is_ok());
 }
 
 #[test]
@@ -86,7 +85,7 @@ fn verify_refname_blocks_packed_descendant_without_loose_children() {
         dir.path(),
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
-            .with_ref_storage(grit_lib::RefStorageFormat::Files),
+            .with_ref_storage(grit_lib::refs::ref_storage::RefStorageFormat::Files),
     )
     .expect("init");
     let git_dir = dir.path().join(".git");
@@ -102,9 +101,8 @@ fn verify_refname_blocks_packed_descendant_without_loose_children() {
     )
     .expect("packed-refs");
 
-    let err =
-        verify_refname_available_for_create(&git_dir, "refs/heads/packed-parent", &extras, &skip)
-            .unwrap_err();
+    let err = verify_ref_available_for_create(&git_dir, "refs/heads/packed-parent", &extras, &skip)
+        .unwrap_err();
     assert!(matches!(err, RefnameUnavailable::DescendantExists { .. }));
 }
 
@@ -115,7 +113,7 @@ fn update_refs_create_batch_rejects_later_conflict_without_partial_write() {
         dir.path(),
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
-            .with_ref_storage(grit_lib::RefStorageFormat::Files),
+            .with_ref_storage(grit_lib::refs::ref_storage::RefStorageFormat::Files),
     )
     .expect("init");
     let git_dir = dir.path().join(".git");
@@ -142,7 +140,10 @@ fn update_refs_create_batch_rejects_later_conflict_without_partial_write() {
     let err = update_refs(&git_dir, &items).expect_err("descendant conflict");
     let _ = err;
     assert!(
-        resolve_ref(&git_dir, "refs/heads/innocent").is_err(),
+        grit_test_support::refs::at(&git_dir)
+            .references()
+            .resolve("refs/heads/innocent")
+            .is_err(),
         "batch must not leave earlier creates on disk when a later create is rejected"
     );
 }
@@ -154,7 +155,7 @@ fn update_refs_create_batch_rejects_remotes_conflict_without_partial_write() {
         dir.path(),
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
-            .with_ref_storage(grit_lib::RefStorageFormat::Files),
+            .with_ref_storage(grit_lib::refs::ref_storage::RefStorageFormat::Files),
     )
     .expect("init");
     let git_dir = dir.path().join(".git");
@@ -181,7 +182,10 @@ fn update_refs_create_batch_rejects_remotes_conflict_without_partial_write() {
     let err = update_refs(&git_dir, &items).expect_err("descendant conflict");
     let _ = err;
     assert!(
-        resolve_ref(&git_dir, "refs/heads/innocent").is_err(),
+        grit_test_support::refs::at(&git_dir)
+            .references()
+            .resolve("refs/heads/innocent")
+            .is_err(),
         "batch must not leave earlier creates when a later create hits refs/remotes D/F"
     );
 }
@@ -193,14 +197,19 @@ fn update_refs_cas_sees_loose_tag_while_heads_tree_empty() {
         dir.path(),
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
-            .with_ref_storage(grit_lib::RefStorageFormat::Files),
+            .with_ref_storage(grit_lib::refs::ref_storage::RefStorageFormat::Files),
     )
     .expect("init");
     let git_dir = dir.path().join(".git");
     let oid = |n: u8| support::stored_commit(&git_dir, n);
     let old_oid = oid(20);
     let new_oid = oid(21);
-    write_ref(&git_dir, "refs/tags/v1", &old_oid).expect("write tag");
+    grit_test_support::refs::set_ref(
+        &grit_test_support::refs::at(&git_dir),
+        "refs/tags/v1",
+        &old_oid,
+    )
+    .expect("write tag");
 
     update_refs(
         &git_dir,
@@ -211,5 +220,11 @@ fn update_refs_cas_sees_loose_tag_while_heads_tree_empty() {
         }],
     )
     .expect("CAS update tag");
-    assert_eq!(resolve_ref(&git_dir, "refs/tags/v1").unwrap(), new_oid);
+    assert_eq!(
+        grit_test_support::refs::at(&git_dir)
+            .references()
+            .resolve("refs/tags/v1")
+            .unwrap(),
+        new_oid
+    );
 }

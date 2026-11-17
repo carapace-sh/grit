@@ -1,9 +1,10 @@
 //! Compare `blame_file` attributions with `git blame --line-porcelain`.
 
+use grit_lib::error::RevisionError;
 use std::path::Path;
 use std::process::Command;
 
-use grit_lib::blame::{blame_file, BlameOptions};
+use grit_lib::blame::BlameOptions;
 use grit_lib::config::environment::{Environment, RepositoryOptions};
 use grit_lib::error::Error;
 use grit_lib::objects::ObjectId;
@@ -131,16 +132,17 @@ fn grit_blame(
     start: Option<ObjectId>,
     line_range: Option<std::ops::RangeInclusive<usize>>,
 ) -> Vec<PorcelainLine> {
-    let result = blame_file(
-        repo,
-        file,
-        &BlameOptions {
-            start,
-            line_range,
-            ..Default::default()
-        },
-    )
-    .expect("blame_file");
+    let result = repo
+        .diff()
+        .blame(
+            file,
+            &BlameOptions {
+                start,
+                line_range,
+                ..Default::default()
+            },
+        )
+        .expect("blame_file");
     let mut out: Vec<PorcelainLine> = result
         .lines
         .into_iter()
@@ -268,9 +270,14 @@ fn blame_from_subdirectory_cwd_is_repository_relative() {
 
     assert_blame_matches(&repo, root, "sub/f.txt", None, None);
 
-    let err = blame_file(&repo, "f.txt", &BlameOptions::default()).unwrap_err();
+    let err = repo
+        .diff()
+        .blame("f.txt", &BlameOptions::default())
+        .unwrap_err();
     match err {
-        Error::RevParse(RevParseError::PathNotInRevision { path, .. }) => {
+        Error::Revision(RevisionError::Parse(RevParseError::PathNotInRevision {
+            path, ..
+        })) => {
             assert_eq!(path, "f.txt");
         }
         other => panic!("expected PathNotInRevision, got {other:?}"),
@@ -496,7 +503,7 @@ fn blame_merge_and_rename_parent_path_matches_git() {
 /// After a rename, Bloom skips must query the renamed path (not a stale pathspec).
 #[test]
 fn blame_bloom_skip_after_rename_matches_git() {
-    use grit_lib::maintenance::{write_commit_graph, CommitGraphOptions};
+    use grit_lib::maintenance::CommitGraphOptions;
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = tmp.path();
@@ -520,7 +527,9 @@ fn blame_bloom_skip_after_rename_matches_git() {
     }
 
     let repo = Repository::discover(Some(root), &RepositoryOptions::empty()).expect("open");
-    write_commit_graph(&repo, &CommitGraphOptions::with_changed_paths(true)).expect("graph");
+    repo.maintenance()
+        .write_commit_graph(&CommitGraphOptions::with_changed_paths(true))
+        .expect("graph");
     let dir = repo.work_tree().expect("worktree");
     assert_blame_matches(&repo, dir, "after.txt", None, None);
 }
@@ -907,7 +916,7 @@ fn blame_consecutive_and_trailing_blank_lines_match_git() {
 /// Bloom must still skip when a sibling file in the same directory changed.
 #[test]
 fn blame_bloom_skip_when_sibling_in_directory_changed_matches_git() {
-    use grit_lib::maintenance::{write_commit_graph, CommitGraphOptions};
+    use grit_lib::maintenance::CommitGraphOptions;
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = tmp.path();
@@ -933,13 +942,15 @@ fn blame_bloom_skip_when_sibling_in_directory_changed_matches_git() {
     }
 
     let repo = Repository::discover(Some(root), &RepositoryOptions::empty()).expect("open");
-    write_commit_graph(&repo, &CommitGraphOptions::with_changed_paths(true)).expect("graph");
+    repo.maintenance()
+        .write_commit_graph(&CommitGraphOptions::with_changed_paths(true))
+        .expect("graph");
     assert_blame_matches(&repo, root, "builtin/target.c", None, None);
 }
 
 #[test]
 fn blame_respects_graft_over_commit_graph_bloom() {
-    use grit_lib::maintenance::{write_commit_graph, CommitGraphOptions};
+    use grit_lib::maintenance::CommitGraphOptions;
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = tmp.path();
@@ -972,7 +983,9 @@ fn blame_respects_graft_over_commit_graph_bloom() {
     .expect("graft");
 
     let repo = Repository::discover(Some(root), &RepositoryOptions::empty()).expect("open");
-    write_commit_graph(&repo, &CommitGraphOptions::with_changed_paths(true)).expect("graph");
+    repo.maintenance()
+        .write_commit_graph(&CommitGraphOptions::with_changed_paths(true))
+        .expect("graph");
 
     assert_blame_matches(&repo, root, "f.txt", Some(&child), None);
 }
@@ -1017,7 +1030,10 @@ fn commit_identity_and_summary(dir: &Path, commit: &ObjectId) -> (String, String
 
 /// Every attributed commit carries the same author line and summary that `git` stores.
 fn assert_commit_metadata_matches(repo: &Repository, dir: &Path, file: &str) {
-    let result = blame_file(repo, file, &BlameOptions::default()).expect("blame_file");
+    let result = repo
+        .diff()
+        .blame(file, &BlameOptions::default())
+        .expect("blame_file");
     assert!(!result.lines.is_empty());
     for line in &result.lines {
         let info = result
@@ -1324,14 +1340,20 @@ fn blame_through_commits_missing_author_or_committer_matches_git_loose_and_packe
     let tmp = build_malformed_commit_fixture();
     let root = tmp.path();
     let blame_all = |repo: &Repository| {
-        ["f.txt", "g.txt"]
-            .map(|file| blame_file(repo, file, &BlameOptions::default()).expect("blame_file"))
+        ["f.txt", "g.txt"].map(|file| {
+            repo.diff()
+                .blame(file, &BlameOptions::default())
+                .expect("blame_file")
+        })
     };
     let check = |repo: &Repository| {
         for file in ["f.txt", "g.txt"] {
             assert_blame_matches(repo, root, file, None, None);
             let git_meta = git_porcelain_metadata(root, file);
-            let result = blame_file(repo, file, &BlameOptions::default()).expect("blame_file");
+            let result = repo
+                .diff()
+                .blame(file, &BlameOptions::default())
+                .expect("blame_file");
             for line in &result.lines {
                 let info = result.commits.get(&line.commit).expect("metadata");
                 assert_eq!(
@@ -1799,7 +1821,10 @@ fn blame_final_newline_changes_match_git() {
                     assert_blame_matches(&repo, root, "a.txt", None, Some((count, count)));
                     assert_blame_matches(&repo, root, "a.txt", None, Some((1, 1)));
                 }
-                let result = blame_file(&repo, "a.txt", &BlameOptions::default()).unwrap();
+                let result = repo
+                    .diff()
+                    .blame("a.txt", &BlameOptions::default())
+                    .unwrap();
                 let bodies: Vec<_> = text
                     .split_inclusive('\n')
                     .map(|line| line.strip_suffix('\n').unwrap_or(line))
@@ -1881,20 +1906,21 @@ fn blame_copy_matching_preserves_final_newline() {
                 }
                 args.extend(["--", "target"]);
                 let oracle = parse_git_blame_porcelain(&git_output(root, &args));
-                let result = blame_file(
-                    &repo,
-                    "target",
-                    &BlameOptions {
-                        copy_detection: CopyDetection::FromAnyCommit,
-                        whitespace: if ignore_space {
-                            grit_lib::diff::WhitespaceMode::ignore_all_space()
-                        } else {
-                            Default::default()
+                let result = repo
+                    .diff()
+                    .blame(
+                        "target",
+                        &BlameOptions {
+                            copy_detection: CopyDetection::FromAnyCommit,
+                            whitespace: if ignore_space {
+                                grit_lib::diff::WhitespaceMode::ignore_all_space()
+                            } else {
+                                Default::default()
+                            },
+                            ..Default::default()
                         },
-                        ..Default::default()
-                    },
-                )
-                .unwrap();
+                    )
+                    .unwrap();
                 let lines: Vec<_> = result
                     .lines
                     .iter()

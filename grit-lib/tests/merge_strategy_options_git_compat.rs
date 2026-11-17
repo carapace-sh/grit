@@ -5,13 +5,13 @@ use crate::support;
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::diff::merge_file::{ConflictStyle, MergeFavor};
 use grit_lib::error::Error;
-use grit_lib::objects::{parse_commit, ObjectId};
-use grit_lib::porcelain::merge::{
-    integrate_branch_with, resolve_merge_conflict_style, IntegrateBranchOutcome, MergeCommitMode,
-    MergeOptions,
+use grit_lib::merge::{
+    resolve_merge_conflict_style, IntegrateBranchOutcome, MergeCommitMode, MergeOptions,
 };
+use grit_lib::objects::{parse_commit, ObjectId};
 use grit_lib::repo::Repository;
 use grit_test_support::git;
+use grit_test_support::integrate_branch_with;
 use std::fs;
 use std::process::Command;
 
@@ -163,7 +163,7 @@ fn diff3_markers_byte_equal_git() {
             ..MergeOptions::default()
         },
         &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("grit merge");
     assert!(matches!(outcome, IntegrateBranchOutcome::Conflicts { .. }));
@@ -191,7 +191,7 @@ fn zdiff3_markers_byte_equal_git() {
             ..MergeOptions::default()
         },
         &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("grit merge");
     assert!(matches!(outcome, IntegrateBranchOutcome::Conflicts { .. }));
@@ -222,7 +222,7 @@ fn conflict_style_from_config() {
             ..MergeOptions::default()
         },
         &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("grit merge");
     assert!(matches!(outcome, IntegrateBranchOutcome::Conflicts { .. }));
@@ -259,10 +259,10 @@ fn unrelated_refused_by_default() {
         "orphan",
         &MergeOptions::default(),
         &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect_err("unrelated without flag");
-    assert!(matches!(err, Error::Message(_)));
+    assert!(matches!(err, Error::Verbatim(_)));
 }
 
 #[test]
@@ -334,7 +334,7 @@ fn allow_unrelated_matches_git_tree() {
             ..MergeOptions::default()
         },
         &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("allow unrelated");
     let IntegrateBranchOutcome::Merged { oid, .. } = outcome else {

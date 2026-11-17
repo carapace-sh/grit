@@ -10,11 +10,9 @@ use std::process::Command;
 use grit_lib::index::write_tree::write_tree_from_index;
 use grit_lib::index::{Index, IndexEntry, MODE_REGULAR};
 use grit_lib::objects::{parse_commit, parse_tree, ObjectKind};
-use grit_lib::refs::reflog::read_reflog;
-use grit_lib::refs::resolve_ref;
+use grit_lib::progress::CancelToken;
 use grit_lib::repo::Repository;
 use grit_lib::revwalk::history::{
-    apply_rewrite, plan_rewrite, recover_interrupted_rewrite_apply, rewrite_apply_journal_active,
     ApplyOptions, CommitEdit, EmptyPolicy, HistoryEdits, RefScope, RewriteOptions,
 };
 
@@ -32,7 +30,7 @@ fn apply_opts() -> ApplyOptions {
         identity: support::reflog_signature("Applier <apply@grit.test>"),
         reflog_message: "history rewrite".into(),
         record_operation: None,
-        hooks: grit_lib::PostOperationHooks::Run,
+        hooks: grit_lib::command_runner::hooks::PostOperationHooks::Run,
     }
 }
 
@@ -91,7 +89,7 @@ fn tree_plus_file(
         path: path.as_bytes().to_vec(),
         base_index_pos: 0,
     });
-    write_tree_from_index(repo.odb(), &index, "")
+    write_tree_from_index(repo.odb(), &index, "").map_err(Into::into)
 }
 
 fn tree_replace_file(
@@ -145,7 +143,7 @@ fn tree_replace_file(
         path: path_bytes.to_vec(),
         base_index_pos: 0,
     });
-    write_tree_from_index(repo.odb(), &index, "")
+    write_tree_from_index(repo.odb(), &index, "").map_err(Into::into)
 }
 
 fn plan_reword_tree_from_commit(
@@ -170,18 +168,18 @@ fn plan_reword_tree_from_commit(
             parents: None,
         },
     );
-    plan_rewrite(
-        &grit,
-        &edits,
-        &RewriteOptions {
-            scope: RefScope::Branches,
-            empty: EmptyPolicy::Drop,
-            committer: committer(1).parse().expect("signature"),
-            preserve_committer: false,
-            sign: true,
-        },
-    )
-    .expect("plan")
+    grit.history()
+        .plan_rewrite(
+            &edits,
+            &RewriteOptions {
+                scope: RefScope::Branches,
+                empty: EmptyPolicy::Drop,
+                committer: committer(1).parse().expect("signature"),
+                preserve_committer: false,
+                sign: true,
+            },
+        )
+        .expect("plan")
 }
 
 fn plan_reword(
@@ -200,18 +198,18 @@ fn plan_reword(
             parents: None,
         },
     );
-    plan_rewrite(
-        &grit,
-        &edits,
-        &RewriteOptions {
-            scope: RefScope::Branches,
-            empty: EmptyPolicy::Drop,
-            committer: committer(1).parse().expect("signature"),
-            preserve_committer: false,
-            sign: true,
-        },
-    )
-    .expect("plan")
+    grit.history()
+        .plan_rewrite(
+            &edits,
+            &RewriteOptions {
+                scope: RefScope::Branches,
+                empty: EmptyPolicy::Drop,
+                committer: committer(1).parse().expect("signature"),
+                preserve_committer: false,
+                sign: true,
+            },
+        )
+        .expect("plan")
 }
 
 fn plan_reword_with_tree(
@@ -236,18 +234,18 @@ fn plan_reword_with_tree(
             parents: None,
         },
     );
-    plan_rewrite(
-        &grit,
-        &edits,
-        &RewriteOptions {
-            scope: RefScope::Branches,
-            empty: EmptyPolicy::Drop,
-            committer: committer(1).parse().expect("signature"),
-            preserve_committer: false,
-            sign: true,
-        },
-    )
-    .expect("plan")
+    grit.history()
+        .plan_rewrite(
+            &edits,
+            &RewriteOptions {
+                scope: RefScope::Branches,
+                empty: EmptyPolicy::Drop,
+                committer: committer(1).parse().expect("signature"),
+                preserve_committer: false,
+                sign: true,
+            },
+        )
+        .expect("plan")
 }
 
 fn git_fsck_strict(wt: &std::path::Path) {
@@ -282,19 +280,20 @@ fn apply_rewrite_updates_refs_atomically_files_backend() {
     let oids = build_commit_dag(wt, &[("b", "a"), ("c", "b")], &[("c", "refs/heads/main")]);
     let plan = plan_reword(wt, oids["b"], "reworded");
     let grit = open_grit(wt);
-    let applied = apply_rewrite(
-        &grit,
-        &plan,
-        &apply_opts(),
-        &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("apply");
+    let applied = grit
+        .history()
+        .apply(
+            &plan,
+            &apply_opts(),
+            &mut grit_lib::progress::NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("apply");
     assert_eq!(applied.ref_updates.len(), 1);
     let new_tip = applied.head;
     assert_ne!(new_tip, oids["c"]);
     assert_eq!(
-        resolve_ref(grit.git_dir(), "refs/heads/main").expect("main"),
+        grit.references().resolve("refs/heads/main").expect("main"),
         new_tip
     );
     assert_ne!(new_tip, oids["c"]);
@@ -311,14 +310,14 @@ fn apply_rewrite_updates_refs_atomically_reftable_backend() {
     let oids = build_commit_dag(wt, &[("b", "a"), ("c", "b")], &[("c", "refs/heads/main")]);
     let plan = plan_reword(wt, oids["b"], "reftable reword");
     let grit = open_grit(wt);
-    apply_rewrite(
-        &grit,
-        &plan,
-        &apply_opts(),
-        &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("apply");
+    grit.history()
+        .apply(
+            &plan,
+            &apply_opts(),
+            &mut grit_lib::progress::NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("apply");
     git_fsck_strict(wt);
 }
 
@@ -345,30 +344,31 @@ fn apply_rewrite_refuses_when_head_moved_since_plan() {
                 parents: None,
             },
         );
-        plan_rewrite(
-            &grit,
-            &edits,
-            &RewriteOptions {
-                scope: RefScope::Head,
-                empty: EmptyPolicy::Drop,
-                committer: committer(1).parse().expect("signature"),
-                preserve_committer: false,
-                sign: true,
-            },
-        )
-        .expect("plan")
+        grit.history()
+            .plan_rewrite(
+                &edits,
+                &RewriteOptions {
+                    scope: RefScope::Head,
+                    empty: EmptyPolicy::Drop,
+                    committer: committer(1).parse().expect("signature"),
+                    preserve_committer: false,
+                    sign: true,
+                },
+            )
+            .expect("plan")
     };
     git(wt, &["switch", "other"]);
     let main_before = git_rev_parse(wt, "refs/heads/main").expect("main");
     let grit = open_grit(wt);
-    let err = apply_rewrite(
-        &grit,
-        &plan,
-        &apply_opts(),
-        &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect_err("head moved");
+    let err = grit
+        .history()
+        .apply(
+            &plan,
+            &apply_opts(),
+            &mut grit_lib::progress::NullProgress,
+            &CancelToken::never(),
+        )
+        .expect_err("head moved");
     assert!(matches!(
         err,
         grit_lib::revwalk::history::HistoryError::HeadMovedSincePlan { .. }
@@ -390,14 +390,15 @@ fn apply_rewrite_cas_mismatch_changes_nothing() {
     commit_file(wt, "move.txt", "tip\n", "advance tip");
     let tip_after_move = git_rev_parse(wt, "refs/heads/main").expect("tip");
     let grit = open_grit(wt);
-    let err = apply_rewrite(
-        &grit,
-        &plan,
-        &apply_opts(),
-        &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect_err("stale plan");
+    let err = grit
+        .history()
+        .apply(
+            &plan,
+            &apply_opts(),
+            &mut grit_lib::progress::NullProgress,
+            &CancelToken::never(),
+        )
+        .expect_err("stale plan");
     assert!(matches!(
         err,
         grit_lib::revwalk::history::HistoryError::HeadMovedSincePlan { .. }
@@ -414,14 +415,15 @@ fn apply_rewrite_refuses_when_local_changes_would_be_overwritten() {
     let plan = plan_reword_with_tree(wt, oids["b"], "clash.txt", b"from rewrite\n", "tree change");
     fs::write(wt.join("clash.txt"), "local untracked\n").expect("write");
     let grit = open_grit(wt);
-    let err = apply_rewrite(
-        &grit,
-        &plan,
-        &apply_opts(),
-        &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect_err("blocked");
+    let err = grit
+        .history()
+        .apply(
+            &plan,
+            &apply_opts(),
+            &mut grit_lib::progress::NullProgress,
+            &CancelToken::never(),
+        )
+        .expect_err("blocked");
     match err {
         grit_lib::revwalk::history::HistoryError::LocalChangesWouldBeOverwritten { paths } => {
             assert!(paths.iter().any(|p| p.contains("clash")));
@@ -442,14 +444,14 @@ fn apply_rewrite_preserves_unrelated_staged_and_unstaged_changes() {
     fs::write(wt.join("staged.txt"), "new\n").expect("staged");
     git(wt, &["add", "staged.txt"]);
     let grit = open_grit(wt);
-    apply_rewrite(
-        &grit,
-        &plan,
-        &apply_opts(),
-        &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("apply");
+    grit.history()
+        .apply(
+            &plan,
+            &apply_opts(),
+            &mut grit_lib::progress::NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("apply");
     assert_eq!(
         fs::read_to_string(wt.join("keep.txt")).expect("read"),
         "unstaged edit\n"
@@ -490,7 +492,7 @@ fn apply_rewrite_bare_repository() {
         .odb()
         .write(ObjectKind::Commit, &commit)
         .expect("commit");
-    grit_lib::refs::write_ref(grit.git_dir(), "refs/heads/main", &oid).expect("ref");
+    grit_test_support::refs::set_ref(&grit, "refs/heads/main", &oid).expect("ref");
     let mut edits = HistoryEdits::new();
     edits.insert(
         oid,
@@ -501,26 +503,27 @@ fn apply_rewrite_bare_repository() {
             parents: None,
         },
     );
-    let plan = plan_rewrite(
-        &grit,
-        &edits,
-        &RewriteOptions {
-            scope: RefScope::Head,
-            empty: EmptyPolicy::Drop,
-            committer: committer(2).parse().expect("signature"),
-            preserve_committer: false,
-            sign: true,
-        },
-    )
-    .expect("plan");
-    apply_rewrite(
-        &grit,
-        &plan,
-        &apply_opts(),
-        &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("apply bare");
+    let plan = grit
+        .history()
+        .plan_rewrite(
+            &edits,
+            &RewriteOptions {
+                scope: RefScope::Head,
+                empty: EmptyPolicy::Drop,
+                committer: committer(2).parse().expect("signature"),
+                preserve_committer: false,
+                sign: true,
+            },
+        )
+        .expect("plan");
+    grit.history()
+        .apply(
+            &plan,
+            &apply_opts(),
+            &mut grit_lib::progress::NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("apply bare");
 }
 
 #[test]
@@ -530,15 +533,15 @@ fn apply_rewrite_writes_reflog_entries() {
     let oids = build_commit_dag(wt, &[("b", "a")], &[("b", "refs/heads/main")]);
     let plan = plan_reword(wt, oids["b"], "reworded");
     let grit = open_grit(wt);
-    apply_rewrite(
-        &grit,
-        &plan,
-        &apply_opts(),
-        &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("apply");
-    let tip = resolve_ref(grit.git_dir(), "refs/heads/main").expect("main");
+    grit.history()
+        .apply(
+            &plan,
+            &apply_opts(),
+            &mut grit_lib::progress::NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("apply");
+    let tip = grit.references().resolve("refs/heads/main").expect("main");
     let branch_reflog = git(wt, &["reflog", "show", "-1", "main"]);
     assert!(
         branch_reflog.contains("history rewrite"),
@@ -549,8 +552,11 @@ fn apply_rewrite_writes_reflog_entries() {
         head_reflog.contains("history rewrite"),
         "HEAD reflog must record apply message: {head_reflog}"
     );
-    let head_log = read_reflog(grit.git_dir(), "HEAD").expect("parse HEAD reflog");
-    let branch_log = read_reflog(grit.git_dir(), "refs/heads/main").expect("parse branch reflog");
+    let head_log = grit.references().reflog("HEAD").expect("parse HEAD reflog");
+    let branch_log = grit
+        .references()
+        .reflog("refs/heads/main")
+        .expect("parse branch reflog");
     let head_entry = head_log.last().expect("HEAD reflog entry");
     let branch_entry = branch_log.last().expect("branch reflog entry");
     assert_eq!(head_entry.new_oid, tip);
@@ -575,17 +581,23 @@ fn apply_rewrite_checked_out_branch_reflog_single_entry_per_update() {
     let pre_rewrite_tip = tips[2];
     let plan = plan_reword(wt, tips[1], "reworded");
     let grit = open_grit(wt);
-    apply_rewrite(
-        &grit,
-        &plan,
-        &apply_opts(),
-        &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("apply");
-    let new_tip = resolve_ref(grit.git_dir(), "refs/heads/main").expect("main tip");
-    let head_log = read_reflog(grit.git_dir(), "HEAD").expect("HEAD reflog");
-    let branch_log = read_reflog(grit.git_dir(), "refs/heads/main").expect("main reflog");
+    grit.history()
+        .apply(
+            &plan,
+            &apply_opts(),
+            &mut grit_lib::progress::NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("apply");
+    let new_tip = grit
+        .references()
+        .resolve("refs/heads/main")
+        .expect("main tip");
+    let head_log = grit.references().reflog("HEAD").expect("HEAD reflog");
+    let branch_log = grit
+        .references()
+        .reflog("refs/heads/main")
+        .expect("main reflog");
     assert_eq!(
         head_log.len(),
         4,
@@ -634,15 +646,15 @@ fn apply_rewrite_head_reflog_matches_git_update_ref_on_checked_out_branch() {
     );
     let plan = plan_reword(wt, oids["b"], "reworded");
     let grit = open_grit(wt);
-    apply_rewrite(
-        &grit,
-        &plan,
-        &apply_opts(),
-        &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("apply");
-    let tip = resolve_ref(grit.git_dir(), "refs/heads/main").expect("main");
+    grit.history()
+        .apply(
+            &plan,
+            &apply_opts(),
+            &mut grit_lib::progress::NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("apply");
+    let tip = grit.references().resolve("refs/heads/main").expect("main");
     let head_gs = git(wt, &["reflog", "show", "-1", "--format=%gs", "HEAD"]);
     let branch_gs = git(
         wt,
@@ -669,16 +681,19 @@ fn apply_rewrite_head_reflog_reftable_backend() {
     let oids = build_commit_dag(wt, &[("b", "a"), ("c", "b")], &[("c", "refs/heads/main")]);
     let plan = plan_reword(wt, oids["b"], "reftable reword");
     let grit = open_grit(wt);
-    apply_rewrite(
-        &grit,
-        &plan,
-        &apply_opts(),
-        &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("apply");
-    let head_log = read_reflog(grit.git_dir(), "HEAD").expect("head log");
-    let branch_log = read_reflog(grit.git_dir(), "refs/heads/main").expect("branch log");
+    grit.history()
+        .apply(
+            &plan,
+            &apply_opts(),
+            &mut grit_lib::progress::NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("apply");
+    let head_log = grit.references().reflog("HEAD").expect("head log");
+    let branch_log = grit
+        .references()
+        .reflog("refs/heads/main")
+        .expect("branch log");
     let head_entry = head_log.last().expect("HEAD reflog entry");
     let branch_entry = branch_log.last().expect("branch reflog entry");
     assert_eq!(head_entry.new_oid, branch_entry.new_oid);
@@ -693,7 +708,11 @@ fn ref_update_lines_round_trip_through_git_update_ref_stdin() {
     let wt = repo.worktree();
     let oids = build_commit_dag(wt, &[("b", "a"), ("c", "b")], &[("c", "refs/heads/main")]);
     let plan = plan_reword(wt, oids["b"], "stdin roundtrip");
-    let lines = plan.ref_update_lines();
+    let lines: Vec<String> = plan
+        .ref_updates
+        .iter()
+        .map(|u| format!("update {} {} {}", u.name, u.new.to_hex(), u.old.to_hex()))
+        .collect();
     assert_eq!(lines.len(), 1);
     let mut child = Command::new("git")
         .current_dir(wt)
@@ -725,7 +744,7 @@ fn ref_update_lines_round_trip_through_git_update_ref_stdin() {
 
 #[test]
 fn apply_rewrite_failed_checkout_restores_refs_and_preserves_dirty_worktree() {
-    use grit_lib::repo::set_test_inject_index_write_fail_remaining;
+    use grit_lib::test_support::inject::set_test_inject_index_write_fail_remaining;
 
     let repo = HistoryRepo::init();
     let wt = repo.worktree();
@@ -772,15 +791,16 @@ fn apply_rewrite_failed_checkout_restores_refs_and_preserves_dirty_worktree() {
     );
     let tip_before = git_rev_parse(wt, "refs/heads/main").expect("tip");
     set_test_inject_index_write_fail_remaining(1);
-    let err = apply_rewrite(
-        &grit,
-        &plan,
-        &apply_opts(),
-        &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect_err("injected checkout failure");
-    grit_lib::repo::set_test_inject_index_write_fail(false);
+    let err = grit
+        .history()
+        .apply(
+            &plan,
+            &apply_opts(),
+            &mut grit_lib::progress::NullProgress,
+            &CancelToken::never(),
+        )
+        .expect_err("injected checkout failure");
+    grit_lib::test_support::inject::set_test_inject_index_write_fail(false);
     assert!(matches!(
         err,
         grit_lib::revwalk::history::HistoryError::WorktreeApply { .. }
@@ -817,35 +837,39 @@ fn interrupted_rewrite_apply_recovers_and_blocks_commit_until_finished() {
     );
     assert_ne!(plan.head.old_tree, plan.head.new_tree);
     let tip_before = git_rev_parse(wt, "refs/heads/main").expect("tip");
-    grit_lib::repo::set_test_inject_rewrite_apply_abort_after_refs(true);
-    let err = apply_rewrite(
-        &grit,
-        &plan,
-        &apply_opts(),
-        &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect_err("injected abort after refs");
-    grit_lib::repo::set_test_inject_rewrite_apply_abort_after_refs(false);
-    let grit_lib::revwalk::history::HistoryError::WorktreeApply { message } = err else {
+    grit_lib::test_support::inject::set_test_inject_rewrite_apply_abort_after_refs(true);
+    let err = grit
+        .history()
+        .apply(
+            &plan,
+            &apply_opts(),
+            &mut grit_lib::progress::NullProgress,
+            &CancelToken::never(),
+        )
+        .expect_err("injected abort after refs");
+    grit_lib::test_support::inject::set_test_inject_rewrite_apply_abort_after_refs(false);
+    let grit_lib::revwalk::history::HistoryError::WorktreeApply { source } = err else {
         panic!("unexpected apply error");
     };
+    let message = source.to_string();
     assert!(
         message.contains("injected abort after rewrite ref updates"),
         "unexpected message: {message}"
     );
-    assert!(rewrite_apply_journal_active(grit.git_dir()));
+    assert!(grit.history().apply_journal_active());
     assert_ne!(git_rev_parse(wt, "refs/heads/main"), Some(tip_before));
     assert!(wt.join("rewritten-only.txt").exists() == false);
 
-    let recovery = recover_interrupted_rewrite_apply(&grit)
+    let recovery = grit
+        .history()
+        .recover_interrupted_apply()
         .expect("recover")
         .expect("recovery outcome");
     assert_eq!(
         recovery,
         grit_lib::revwalk::history::RewriteApplyRecovery::FinishedCheckout
     );
-    assert!(!rewrite_apply_journal_active(grit.git_dir()));
+    assert!(!grit.history().apply_journal_active());
     assert!(wt.join("rewritten-only.txt").exists());
 }
 
@@ -872,18 +896,18 @@ fn plan_tip_tree_edits(
             parents: None,
         },
     );
-    plan_rewrite(
-        &grit,
-        &edits,
-        &RewriteOptions {
-            scope: RefScope::Branches,
-            empty: EmptyPolicy::Drop,
-            committer: committer(1).parse().expect("signature"),
-            preserve_committer: false,
-            sign: true,
-        },
-    )
-    .expect("plan")
+    grit.history()
+        .plan_rewrite(
+            &edits,
+            &RewriteOptions {
+                scope: RefScope::Branches,
+                empty: EmptyPolicy::Drop,
+                committer: committer(1).parse().expect("signature"),
+                preserve_committer: false,
+                sign: true,
+            },
+        )
+        .expect("plan")
 }
 
 /// Commit three tracked files plus an unrelated one, dirty the unrelated file and add an
@@ -909,17 +933,17 @@ fn interrupted_partial_checkout() -> (HistoryRepo, grit_lib::revwalk::history::R
     fs::write(wt.join("scratch.txt"), "scratch\n").expect("untracked file");
 
     let grit = open_grit(wt);
-    grit_lib::repo::set_test_inject_rewrite_apply_abort_after_refs(true);
-    apply_rewrite(
-        &grit,
-        &plan,
-        &apply_opts(),
-        &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect_err("injected abort after refs");
-    grit_lib::repo::set_test_inject_rewrite_apply_abort_after_refs(false);
-    assert!(rewrite_apply_journal_active(grit.git_dir()));
+    grit_lib::test_support::inject::set_test_inject_rewrite_apply_abort_after_refs(true);
+    grit.history()
+        .apply(
+            &plan,
+            &apply_opts(),
+            &mut grit_lib::progress::NullProgress,
+            &CancelToken::never(),
+        )
+        .expect_err("injected abort after refs");
+    grit_lib::test_support::inject::set_test_inject_rewrite_apply_abort_after_refs(false);
+    assert!(grit.history().apply_journal_active());
 
     fs::write(wt.join("one.txt"), "one new\n").expect("finished path");
     fs::write(wt.join("two.txt"), "two n").expect("truncated path");
@@ -960,7 +984,9 @@ fn assert_finished_partial_checkout(
 fn interrupted_rewrite_apply_finishes_half_written_checkout() {
     let (repo, plan) = interrupted_partial_checkout();
     let wt = repo.worktree();
-    let recovery = recover_interrupted_rewrite_apply(&open_grit(wt))
+    let recovery = open_grit(wt)
+        .history()
+        .recover_interrupted_apply()
         .expect("recover")
         .expect("recovery outcome");
     assert_eq!(
@@ -975,25 +1001,27 @@ fn status_finishes_interrupted_rewrite_apply_and_reports_it() {
     let (repo, plan) = interrupted_partial_checkout();
     let wt = repo.worktree();
     let grit = open_grit(wt);
-    let model = grit_lib::porcelain::status::status(
-        &grit,
-        &grit_lib::porcelain::status::StatusOptions::default(),
-        &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("status must not fail on an interrupted rewrite");
+    let model = grit
+        .status()
+        .run(
+            &grit_lib::porcelain::status::StatusOptions::default(),
+            &mut grit_lib::progress::NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("status must not fail on an interrupted rewrite");
     assert_eq!(
         model.interrupted_rewrite,
         Some(grit_lib::porcelain::status::InterruptedRewrite::FinishedCheckout)
     );
     assert_finished_partial_checkout(wt, &plan);
-    let again = grit_lib::porcelain::status::status(
-        &grit,
-        &grit_lib::porcelain::status::StatusOptions::default(),
-        &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("second status");
+    let again = grit
+        .status()
+        .run(
+            &grit_lib::porcelain::status::StatusOptions::default(),
+            &mut grit_lib::progress::NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("second status");
     assert_eq!(again.interrupted_rewrite, None);
 }
 
@@ -1011,7 +1039,9 @@ fn interrupted_rewrite_apply_recovers_after_simulated_kill9_with_default_pid_sid
     // kill -9 leaves the lock and sidecar but the holder is gone.
     fs::write(wt.join(".git/index~pid.lock"), "pid 999999999\n").expect("dead holder");
 
-    let recovery = recover_interrupted_rewrite_apply(&grit)
+    let recovery = grit
+        .history()
+        .recover_interrupted_apply()
         .expect("recover")
         .expect("recovery outcome");
     assert_eq!(
@@ -1028,11 +1058,18 @@ fn interrupted_rewrite_apply_with_lockfile_pid_disabled_leaves_foreign_lock() {
     git(wt, &["config", "core.lockfilePid", "false"]);
     fs::write(wt.join(".git/index.lock"), "").expect("lock without sidecar");
     let grit = open_grit(wt);
-    let err = recover_interrupted_rewrite_apply(&grit).expect_err("foreign lock");
-    let grit_lib::revwalk::history::HistoryError::Library(inner) = &err else {
-        panic!("unexpected error {err:?}");
-    };
-    assert!(matches!(&**inner, grit_lib::error::Error::LockHeld { .. }));
+    let err = grit
+        .history()
+        .recover_interrupted_apply()
+        .expect_err("foreign lock");
+    assert!(matches!(
+        &err,
+        grit_lib::revwalk::history::HistoryError::Engine(e)
+            if matches!(
+                e.as_ref(),
+                grit_lib::revwalk::history::HistoryEngineError::LockHeld(_)
+            )
+    ));
     assert_eq!(
         git_rev_parse(wt, "refs/heads/main"),
         Some(plan.ref_updates[0].new)
@@ -1047,7 +1084,9 @@ fn interrupted_rewrite_apply_removes_stale_index_lock_of_dead_holder() {
     fs::write(wt.join(".git/index.lock"), "").expect("stale lock");
     let dead_pid = u64::from(u32::MAX);
     fs::write(wt.join(".git/index~pid.lock"), format!("pid {dead_pid}\n")).expect("sidecar");
-    let recovery = recover_interrupted_rewrite_apply(&open_grit(wt))
+    let recovery = open_grit(wt)
+        .history()
+        .recover_interrupted_apply()
         .expect("recover")
         .expect("recovery outcome");
     assert_eq!(
@@ -1068,31 +1107,41 @@ fn interrupted_rewrite_apply_waits_for_index_lock_holder() {
     fs::write(&sidecar, format!("pid {}\n", std::process::id())).expect("sidecar");
     let grit = open_grit(wt);
 
-    let err = recover_interrupted_rewrite_apply(&grit).expect_err("lock is held");
-    let grit_lib::revwalk::history::HistoryError::Library(inner) = &err else {
-        panic!("unexpected error {err:?}");
-    };
+    let err = grit
+        .history()
+        .recover_interrupted_apply()
+        .expect_err("lock is held");
     assert!(
-        matches!(&**inner, grit_lib::error::Error::LockHeld { path, holder: Some(h) } if *path == lock && h.running),
-        "{inner:?}"
+        matches!(
+            &err,
+            grit_lib::revwalk::history::HistoryError::Engine(e)
+                if matches!(
+                    e.as_ref(),
+                    grit_lib::revwalk::history::HistoryEngineError::LockHeld(
+                        grit_lib::error::LockHeldError { path, holder: Some(h) }
+                    ) if *path == lock && h.running
+                )
+        ),
+        "{err:?}"
     );
     assert_eq!(
         git_rev_parse(wt, "refs/heads/main"),
         Some(plan.ref_updates[0].new)
     );
-    assert!(rewrite_apply_journal_active(grit.git_dir()));
+    assert!(grit.history().apply_journal_active());
     assert!(
         lock.exists() && sidecar.exists(),
         "a live holder's lock is never removed"
     );
 
-    let model = grit_lib::porcelain::status::status(
-        &grit,
-        &grit_lib::porcelain::status::StatusOptions::default(),
-        &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("status reads while another process holds the index lock");
+    let model = grit
+        .status()
+        .run(
+            &grit_lib::porcelain::status::StatusOptions::default(),
+            &mut grit_lib::progress::NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("status reads while another process holds the index lock");
     assert_eq!(
         model.interrupted_rewrite,
         Some(grit_lib::porcelain::status::InterruptedRewrite::Pending)
@@ -1105,7 +1154,7 @@ fn interrupted_rewrite_apply_waits_for_index_lock_holder() {
     fs::remove_file(&lock).expect("release");
     fs::remove_file(&sidecar).expect("release sidecar");
     assert_eq!(
-        recover_interrupted_rewrite_apply(&grit).expect("recover"),
+        grit.history().recover_interrupted_apply().expect("recover"),
         Some(grit_lib::revwalk::history::RewriteApplyRecovery::FinishedCheckout)
     );
     assert_finished_partial_checkout(wt, &plan);
@@ -1133,20 +1182,20 @@ fn interrupted_rewrite_apply_abort_keeps_racily_clean_edit_visible() {
 
     let plan = plan_tip_tree_edits(wt, tip, &[("other.txt", b"other\n")]);
     let grit = open_grit(wt);
-    grit_lib::repo::set_test_inject_rewrite_apply_abort_after_refs(true);
-    apply_rewrite(
-        &grit,
-        &plan,
-        &apply_opts(),
-        &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect_err("injected abort");
-    grit_lib::repo::set_test_inject_rewrite_apply_abort_after_refs(false);
+    grit_lib::test_support::inject::set_test_inject_rewrite_apply_abort_after_refs(true);
+    grit.history()
+        .apply(
+            &plan,
+            &apply_opts(),
+            &mut grit_lib::progress::NullProgress,
+            &CancelToken::never(),
+        )
+        .expect_err("injected abort");
+    grit_lib::test_support::inject::set_test_inject_rewrite_apply_abort_after_refs(false);
     fs::write(wt.join("other.txt"), "oth").expect("half-written new file");
 
     assert_eq!(
-        grit_lib::revwalk::history::abort_interrupted_rewrite_apply(&grit).expect("abort"),
+        grit.history().abort_interrupted_apply().expect("abort"),
         grit_lib::revwalk::history::RewriteApplyRecovery::RolledBack
     );
     assert_eq!(git_rev_parse(wt, "refs/heads/main"), Some(tip));
@@ -1168,7 +1217,7 @@ fn rewrite_apply_journal_without_meta_is_removed() {
 
     fs::write(wt.join(".git/index.lock"), "").expect("lock of unknown holder");
     assert_eq!(
-        recover_interrupted_rewrite_apply(&grit).expect("recover"),
+        grit.history().recover_interrupted_apply().expect("recover"),
         None
     );
     assert!(
@@ -1178,7 +1227,7 @@ fn rewrite_apply_journal_without_meta_is_removed() {
 
     fs::remove_file(wt.join(".git/index.lock")).expect("unlock");
     assert_eq!(
-        recover_interrupted_rewrite_apply(&grit).expect("recover"),
+        grit.history().recover_interrupted_apply().expect("recover"),
         None
     );
     assert!(!dir.exists());
@@ -1193,14 +1242,14 @@ fn apply_rewrite_journal_accepts_git_path_with_double_dot_in_name() {
     commit_file(wt, "a..b", "", "track a..b");
     let grit = open_grit(wt);
     let plan = plan_reword_with_tree(wt, oids["b"], "side.txt", b"side\n", "side change");
-    apply_rewrite(
-        &grit,
-        &plan,
-        &apply_opts(),
-        &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("apply with a..b present");
+    grit.history()
+        .apply(
+            &plan,
+            &apply_opts(),
+            &mut grit_lib::progress::NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("apply with a..b present");
     assert!(wt.join("a..b").is_file());
     assert!(wt.join("side.txt").is_file());
 }
@@ -1228,16 +1277,16 @@ fn rewrite_apply_journal_stores_from_tree_manifest_for_wide_clean_transition() {
         .collect();
     let plan = plan_tip_tree_edits(wt, tip, &edit_refs);
     let grit = open_grit(wt);
-    grit_lib::repo::set_test_inject_rewrite_apply_abort_after_refs(true);
-    apply_rewrite(
-        &grit,
-        &plan,
-        &apply_opts(),
-        &mut grit_lib::progress::NullProgress,
-        &mut grit_lib::progress::NeverCancel,
-    )
-    .expect_err("injected abort");
-    grit_lib::repo::set_test_inject_rewrite_apply_abort_after_refs(false);
+    grit_lib::test_support::inject::set_test_inject_rewrite_apply_abort_after_refs(true);
+    grit.history()
+        .apply(
+            &plan,
+            &apply_opts(),
+            &mut grit_lib::progress::NullProgress,
+            &CancelToken::never(),
+        )
+        .expect_err("injected abort");
+    grit_lib::test_support::inject::set_test_inject_rewrite_apply_abort_after_refs(false);
     let worktree_dir = wt.join(".git/grit/rewrite-apply/worktree");
     let file_count = fs::read_dir(&worktree_dir)
         .expect("journal worktree dir")
@@ -1248,7 +1297,7 @@ fn rewrite_apply_journal_stores_from_tree_manifest_for_wide_clean_transition() {
         file_count, 1,
         "wide clean tree transitions must not write one journal payload file per path"
     );
-    grit_lib::revwalk::history::abort_interrupted_rewrite_apply(&grit).expect("abort");
+    grit.history().abort_interrupted_apply().expect("abort");
     for i in 0..40 {
         let path = wt.join(format!("wide/{i}.txt"));
         assert_eq!(
@@ -1274,18 +1323,18 @@ fn interrupted_rewrite_apply_abort_restores_empty_tracked_file() {
         b"would-be-new-content\n",
         "change empty in replayed tip",
     );
-    grit_lib::repo::set_test_inject_rewrite_apply_abort_after_refs(true);
-    apply_rewrite(
-        &grit,
-        &plan,
-        &apply_opts(),
-        &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect_err("injected abort");
-    grit_lib::repo::set_test_inject_rewrite_apply_abort_after_refs(false);
+    grit_lib::test_support::inject::set_test_inject_rewrite_apply_abort_after_refs(true);
+    grit.history()
+        .apply(
+            &plan,
+            &apply_opts(),
+            &mut grit_lib::progress::NullProgress,
+            &CancelToken::never(),
+        )
+        .expect_err("injected abort");
+    grit_lib::test_support::inject::set_test_inject_rewrite_apply_abort_after_refs(false);
     fs::remove_file(wt.join("empty.txt")).expect("simulate partial checkout deleting empty file");
-    grit_lib::revwalk::history::abort_interrupted_rewrite_apply(&grit).expect("abort");
+    grit.history().abort_interrupted_apply().expect("abort");
     assert!(wt.join("empty.txt").is_file());
     assert_eq!(fs::read(wt.join("empty.txt")).expect("read"), b"");
 }
@@ -1306,18 +1355,18 @@ fn interrupted_rewrite_apply_abort_restores_newline_filename() {
         b"after\n",
         "change newline-named file in replayed tip",
     );
-    grit_lib::repo::set_test_inject_rewrite_apply_abort_after_refs(true);
-    apply_rewrite(
-        &grit,
-        &plan,
-        &apply_opts(),
-        &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect_err("injected abort");
-    grit_lib::repo::set_test_inject_rewrite_apply_abort_after_refs(false);
+    grit_lib::test_support::inject::set_test_inject_rewrite_apply_abort_after_refs(true);
+    grit.history()
+        .apply(
+            &plan,
+            &apply_opts(),
+            &mut grit_lib::progress::NullProgress,
+            &CancelToken::never(),
+        )
+        .expect_err("injected abort");
+    grit_lib::test_support::inject::set_test_inject_rewrite_apply_abort_after_refs(false);
     fs::remove_file(wt.join(newline_path)).expect("simulate partial checkout");
-    grit_lib::revwalk::history::abort_interrupted_rewrite_apply(&grit).expect("abort");
+    grit.history().abort_interrupted_apply().expect("abort");
     assert!(wt.join(newline_path).is_file());
     assert_eq!(fs::read(wt.join(newline_path)).expect("read"), b"before\n");
 }

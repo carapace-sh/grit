@@ -105,7 +105,7 @@ impl ThreadPolicy {
         op: ParallelOp,
         config: &ConfigSet,
     ) -> Result<ParallelOptions, ConfigError> {
-        let preload = core_preload_index(config);
+        let preload = config.preload_index();
         let threads = match op {
             ParallelOp::IndexRefresh | ParallelOp::IndexLoad => {
                 if self.threads_override.is_some() || preload {
@@ -167,10 +167,25 @@ impl ThreadPolicy {
         blob_count: usize,
         stat_parallel_threads: Option<usize>,
     ) -> usize {
+        if !config.preload_index() || blob_count < PARALLEL_STAT_MIN_ENTRIES {
+            return 1;
+        }
+        self.index_stat_scan_threads(config, blob_count, stat_parallel_threads)
+    }
+
+    /// Parallel workers for directory-grouped worktree stat scans without requiring
+    /// `core.preloadIndex` (hard reset and other RSS-conscious callers).
+    #[must_use]
+    pub(crate) fn index_stat_scan_threads(
+        &self,
+        config: &ConfigSet,
+        blob_count: usize,
+        stat_parallel_threads: Option<usize>,
+    ) -> usize {
         const THREAD_COST: usize = 500;
         const MAX_PARALLEL: usize = 20;
 
-        if !core_preload_index(config) || blob_count < PARALLEL_STAT_MIN_ENTRIES {
+        if blob_count < PARALLEL_STAT_MIN_ENTRIES {
             return 1;
         }
 
@@ -215,15 +230,6 @@ impl ParallelOptions {
     }
 }
 
-#[must_use]
-fn core_preload_index(config: &ConfigSet) -> bool {
-    config
-        .get_bool("core.preloadindex")
-        .or_else(|| config.get_bool("core.preloadIndex"))
-        .and_then(|r| r.ok())
-        .unwrap_or(true)
-}
-
 /// Git `repo_config_get_index_threads` value semantics for `index.threads`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IndexThreadsSetting {
@@ -236,7 +242,7 @@ enum IndexThreadsSetting {
 
 #[must_use]
 fn index_threads_setting(config: &ConfigSet) -> IndexThreadsSetting {
-    if let Some(Ok(n)) = config.get_i64("index.threads") {
+    if let Ok(Some(n)) = config.get_i64("index.threads") {
         return match n {
             0 => IndexThreadsSetting::Auto,
             1 => IndexThreadsSetting::Serial,
@@ -244,14 +250,17 @@ fn index_threads_setting(config: &ConfigSet) -> IndexThreadsSetting {
             _ => IndexThreadsSetting::Serial,
         };
     }
-    if config.get("index.threads").is_some_and(|v| v.trim() == "0") {
+    if config
+        .value("index.threads")
+        .is_some_and(|v| v.trim() == "0")
+    {
         return IndexThreadsSetting::Auto;
     }
-    if let Some(result) = config.get_bool("index.threads") {
-        return match result {
-            Ok(true) => IndexThreadsSetting::Auto,
-            Ok(false) => IndexThreadsSetting::Serial,
-            Err(_) => IndexThreadsSetting::UnsetAuto,
+    if let Ok(Some(b)) = config.get_bool("index.threads") {
+        return if b {
+            IndexThreadsSetting::Auto
+        } else {
+            IndexThreadsSetting::Serial
         };
     }
     IndexThreadsSetting::UnsetAuto
@@ -274,17 +283,18 @@ fn resolve_index_threads(config: &ConfigSet, override_threads: Option<usize>) ->
 /// Git `pack.threads` parsing (`None` = unset → auto at resolve time).
 fn parse_pack_threads(config: &ConfigSet) -> Result<Option<usize>, ConfigError> {
     const KEY: &str = "pack.threads";
-    let Some(raw) = config.get(KEY) else {
+    let Some(raw) = config.value(KEY) else {
         return Ok(None);
     };
     let trimmed = raw.trim();
     match config.get_i64(KEY) {
-        Some(Ok(n)) if n < 0 => Err(ConfigError::Other(format!(
-            "invalid number of threads specified ({n})"
-        ))),
-        Some(Ok(0)) => Ok(None),
-        Some(Ok(n)) => Ok(Some(usize::try_from(n).unwrap_or(1))),
-        Some(Err(_)) | None => Err(ConfigError::BadNumericValue {
+        Ok(Some(n)) if n < 0 => Err(ConfigError::InvalidThreadCount {
+            key: KEY.into(),
+            value: n,
+        }),
+        Ok(Some(0)) => Ok(None),
+        Ok(Some(n)) => Ok(Some(usize::try_from(n).unwrap_or(1))),
+        Err(_) | Ok(None) => Err(ConfigError::BadNumericValue {
             key: KEY.into(),
             value: trimmed.into(),
             reason: BadNumericSource::InvalidUnit,
@@ -316,9 +326,9 @@ enum CheckoutWorkersSetting {
 #[must_use]
 fn checkout_workers_setting(config: &ConfigSet) -> CheckoutWorkersSetting {
     match config.get_i64("checkout.workers") {
-        None | Some(Err(_)) => CheckoutWorkersSetting::Unset,
-        Some(Ok(n)) if n < 1 => CheckoutWorkersSetting::Auto,
-        Some(Ok(n)) => CheckoutWorkersSetting::Count(n as usize),
+        Ok(None) | Err(_) => CheckoutWorkersSetting::Unset,
+        Ok(Some(n)) if n < 1 => CheckoutWorkersSetting::Auto,
+        Ok(Some(n)) => CheckoutWorkersSetting::Count(n as usize),
     }
 }
 
@@ -356,9 +366,8 @@ fn resolve_checkout_workers(config: &ConfigSet, override_threads: Option<usize>)
 #[must_use]
 fn checkout_parallelism_threshold(config: &ConfigSet) -> i64 {
     match config.get_i64("checkout.thresholdForParallelism") {
-        None => 100,
-        Some(Ok(n)) => n,
-        Some(Err(_)) => 100,
+        Ok(None) | Err(_) => 100,
+        Ok(Some(n)) => n,
     }
 }
 
@@ -411,7 +420,10 @@ mod tests {
             .expect_err("negative pack.threads");
         assert_eq!(
             err,
-            ConfigError::Other("invalid number of threads specified (-3)".into())
+            ConfigError::InvalidThreadCount {
+                key: "pack.threads".into(),
+                value: -3,
+            }
         );
     }
 

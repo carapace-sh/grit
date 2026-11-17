@@ -7,8 +7,8 @@ use grit_lib::diff::{
     diff_index_to_worktree_with_options, read_worktree_side_bytes_for_diff,
     DiffIndexToWorktreeOptions, DiffStatus,
 };
-use grit_lib::porcelain::status::{status, StatusOptions, UntrackedMode};
-use grit_lib::progress::{NeverCancel, NullProgress};
+use grit_lib::porcelain::status::{StatusOptions, UntrackedMode};
+use grit_lib::progress::NullProgress;
 use grit_lib::repo::Repository;
 use grit_lib::worktree::worktree_rules::WorktreeRules;
 use std::fs;
@@ -85,22 +85,25 @@ fn diff_index_to_worktree_eol_crlf_single_line_change() {
     )
     .expect("open");
     let work_tree = grit_repo.work_tree().expect("wt");
-    let mut index = grit_repo.index_handle().load().expect("index");
+    let mut index = grit_repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("index");
     let rules = WorktreeRules::from_repository(&grit_repo, &index).expect("rules");
-    let cfg =
-        ConfigSet::load(&Environment::empty(), Some(grit_repo.git_dir()), true).expect("config");
-    let rules_arc = std::sync::Arc::new(std::sync::Mutex::new(
-        WorktreeRules::from_repository(&grit_repo, &index).expect("rules arc"),
-    ));
-    let opts = DiffIndexToWorktreeOptions {
-        repository_git_dir: Some(grit_repo.git_dir().to_path_buf()),
-        config: Some(rules.config_arc()),
-        worktree_rules: Some(rules_arc),
-        ..DiffIndexToWorktreeOptions::default()
-    };
-    let (entries, _) =
-        diff_index_to_worktree_with_options(grit_repo.odb(), &mut index, work_tree, opts)
-            .expect("diff");
+    let cfg = ConfigSet::load(
+        &Environment::empty(),
+        Some(grit_repo.git_dir()),
+        &crate::config::LoadConfigOptions::standard(
+            &Environment::empty(),
+            Some(grit_repo.git_dir()),
+        ),
+    )
+    .expect("config");
+    let entries = grit_repo
+        .diff()
+        .index_to_worktree(&mut index, &TreeDiffOptions::default())
+        .expect("diff")
+        .entries;
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].status, DiffStatus::Modified);
 
@@ -203,19 +206,20 @@ fn assert_eol_only_rewrite_is_clean(
     let case = format!("{attributes:?} {committed:?} -> {rewritten:?} threads={threads}");
 
     let grit_repo = open(&repo);
-    let mut index = grit_repo.index_handle().load().expect("index");
-    let (entries, _) = diff_index_to_worktree_with_options(
-        grit_repo.odb(),
-        &mut index,
-        &repo,
-        DiffIndexToWorktreeOptions {
-            repository_git_dir: Some(grit_repo.git_dir().to_path_buf()),
-            for_status: true,
-            stat_parallel_threads: Some(threads),
-            ..DiffIndexToWorktreeOptions::default()
-        },
-    )
-    .expect("diff");
+    let mut index = grit_repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("index");
+    let options = TreeDiffOptions::default()
+        .with_for_status(true)
+        .with_threads(Some(
+            ThreadPolicy::with_threads_override(Some(threads)).min_items_override(Some(0)),
+        ));
+    let entries = grit_repo
+        .diff()
+        .index_to_worktree(&mut index, &options)
+        .expect("diff")
+        .entries;
     assert!(entries.is_empty(), "{case}: phantom change {entries:?}");
 
     let options = StatusOptions {
@@ -224,7 +228,10 @@ fn assert_eol_only_rewrite_is_clean(
         ..StatusOptions::default()
     };
     for run in 0..2 {
-        let model = status(&grit_repo, &options, &mut NullProgress, &NeverCancel).expect("status");
+        let model = grit_repo
+            .status()
+            .run(&options, &mut NullProgress, &CancelToken::never())
+            .expect("status");
         assert!(model.is_clean(), "{case} run {run}: {:?}", model.unstaged);
     }
 
@@ -239,7 +246,13 @@ fn assert_eol_only_rewrite_is_clean(
 
 #[test]
 fn eol_crlf_lf_rewrite_is_not_modified_issue_2164() {
-    for (fillers, threads) in [(0, 1), (grit_lib::PARALLEL_STAT_MIN_ENTRIES, 4)] {
+    for (fillers, threads) in [
+        (0, 1),
+        (
+            grit_lib::test_support::counters::PARALLEL_STAT_MIN_ENTRIES,
+            4,
+        ),
+    ] {
         assert_eol_only_rewrite_is_clean(
             "*.txt text eol=crlf\n",
             b"one\r\ntwo\r\n",
@@ -252,7 +265,13 @@ fn eol_crlf_lf_rewrite_is_not_modified_issue_2164() {
 
 #[test]
 fn text_auto_line_ending_rewrite_is_not_modified_issue_2164() {
-    for (fillers, threads) in [(0, 1), (grit_lib::PARALLEL_STAT_MIN_ENTRIES, 4)] {
+    for (fillers, threads) in [
+        (0, 1),
+        (
+            grit_lib::test_support::counters::PARALLEL_STAT_MIN_ENTRIES,
+            4,
+        ),
+    ] {
         assert_eol_only_rewrite_is_clean(
             "* text=auto\n",
             b"one\ntwo\n",
@@ -281,16 +300,17 @@ fn eol_crlf_real_size_change_is_still_modified() {
     fs::write(repo.join("n.txt"), "one\ntwo\nthree\n").expect("rewrite");
 
     let grit_repo = open(&repo);
-    let model = status(
-        &grit_repo,
-        &StatusOptions {
-            untracked: UntrackedMode::No,
-            ..StatusOptions::default()
-        },
-        &mut NullProgress,
-        &NeverCancel,
-    )
-    .expect("status");
+    let model = grit_repo
+        .status()
+        .run(
+            &StatusOptions {
+                untracked: UntrackedMode::No,
+                ..StatusOptions::default()
+            },
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("status");
     let unstaged: Vec<_> = model.unstaged.iter().map(|e| e.path().to_owned()).collect();
     assert_eq!(unstaged, ["n.txt"]);
     let porcelain = git_ok(&repo, &["status", "--porcelain"]);

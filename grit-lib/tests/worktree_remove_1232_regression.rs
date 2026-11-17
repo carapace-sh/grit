@@ -4,13 +4,11 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use grit_lib::config::environment::{Environment, RepositoryOptions};
-use grit_lib::porcelain::add::{stage, StageOptions};
-use grit_lib::porcelain::commit::{create_commit, CommitRequest};
+use grit_lib::porcelain::add::StageOptions;
+use grit_lib::porcelain::commit::CommitRequest;
 use grit_lib::progress::NullProgress;
 use grit_lib::repo::Repository;
-use grit_lib::worktree::{
-    add_linked_worktree, remove_linked_worktree, AddLinkedWorktreeOptions, WorktreeBranch,
-};
+use grit_lib::worktree::{AddLinkedWorktreeOptions, WorktreeBranch};
 use grit_test_support::git_cmd as git_shell;
 
 fn write_system_autocrlf_config(dir: &Path) -> PathBuf {
@@ -40,23 +38,23 @@ fn open_grit_inherited_autocrlf(root: &Path, system_cfg: &Path) -> Repository {
 }
 
 fn commit_request(message: &str) -> CommitRequest {
-    CommitRequest {
-        message: message.to_owned(),
-        author: Some(
+    {
+        let mut req = CommitRequest::new(message.to_owned());
+        req.author = Some(
             "Test <t@example.com> 1000000000 +0000"
                 .parse()
                 .expect("signature"),
-        ),
-        committer: Some(
+        );
+        req.committer = Some(
             "Test <t@example.com> 1000000000 +0000"
                 .parse()
                 .expect("signature"),
-        ),
-        allow_empty: false,
-        sign_override: None,
-        amend: false,
-        assume_worktree_synced: false,
-        ..Default::default()
+        );
+        req.allow_empty = false;
+        req.sign_override = None;
+        req.amend = false;
+        req.assume_worktree_synced = false;
+        req
     }
 }
 
@@ -88,9 +86,9 @@ fn remove_linked_worktree_with_system_inherited_autocrlf_and_crlf_worktree_file(
 
     let main_repo = open_grit_inherited_autocrlf(&main, &system_cfg);
     let linked = root.path().join("w");
-    add_linked_worktree(
-        &main_repo,
-        &AddLinkedWorktreeOptions {
+    main_repo
+        .worktrees()
+        .add(&AddLinkedWorktreeOptions {
             path: linked.clone(),
             branch: Some(WorktreeBranch::Create("f".to_owned())),
             start_point: Some("HEAD".to_owned()),
@@ -98,26 +96,27 @@ fn remove_linked_worktree_with_system_inherited_autocrlf_and_crlf_worktree_file(
             lock: None,
             no_checkout: false,
             track: false,
-        },
-    )
-    .expect("worktree add");
+        })
+        .expect("worktree add");
 
     std::fs::write(linked.join("new.txt"), b"new\r\n").expect("CRLF new file");
     let linked_repo = open_grit_inherited_autocrlf(&linked, &system_cfg);
-    stage(
-        &linked_repo,
-        &StageOptions::default(),
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("stage");
-    create_commit(
-        &linked_repo,
-        &commit_request("two"),
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("commit");
+    linked_repo
+        .index()
+        .stage(
+            &StageOptions::default(),
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("stage");
+    linked_repo
+        .commits()
+        .create_staged(
+            &commit_request("two"),
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("commit");
 
     let porcelain = git_with_system_config(&linked, &system_cfg, &["status", "--porcelain"]);
     assert!(
@@ -129,7 +128,10 @@ fn remove_linked_worktree_with_system_inherited_autocrlf_and_crlf_worktree_file(
         "git diff-files must be quiet before remove"
     );
 
-    remove_linked_worktree(&main_repo, &linked, false).expect("remove clean linked worktree");
+    main_repo
+        .worktrees()
+        .remove(&linked, false)
+        .expect("remove clean linked worktree");
     assert!(
         !linked.exists(),
         "linked worktree directory should be removed"
@@ -154,9 +156,9 @@ fn remove_linked_worktree_windows_crlf_set_content() {
 
     let main_repo = open_grit_inherited_autocrlf(&main, &system_cfg);
     let linked = root.path().join("w");
-    add_linked_worktree(
-        &main_repo,
-        &AddLinkedWorktreeOptions {
+    main_repo
+        .worktrees()
+        .add(&AddLinkedWorktreeOptions {
             path: linked.clone(),
             branch: Some(WorktreeBranch::Create("f".to_owned())),
             start_point: Some("HEAD".to_owned()),
@@ -164,14 +166,22 @@ fn remove_linked_worktree_windows_crlf_set_content() {
             lock: None,
             no_checkout: false,
             track: false,
-        },
-    )
-    .expect("worktree add");
+        })
+        .expect("worktree add");
 
     std::fs::write(linked.join("new.txt"), b"new\r\n").expect("CRLF via bytes");
     let linked_repo = open_grit_inherited_autocrlf(&linked, &system_cfg);
-    stage(&linked_repo, &StageOptions::default(), &mut NullProgress).expect("stage");
-    create_commit(&linked_repo, &commit_request("two"), &mut NullProgress).expect("commit");
+    linked_repo
+        .index()
+        .stage(&StageOptions::default(), &mut NullProgress)
+        .expect("stage");
+    linked_repo
+        .commits()
+        .create_staged(&commit_request("two"), &mut NullProgress)
+        .expect("commit");
 
-    remove_linked_worktree(&main_repo, &linked, false).expect("remove on Windows CRLF path");
+    main_repo
+        .worktrees()
+        .remove(&linked, false)
+        .expect("remove on Windows CRLF path");
 }

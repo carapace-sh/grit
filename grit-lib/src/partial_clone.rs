@@ -6,7 +6,7 @@ use thiserror::Error;
 
 use crate::config::{ConfigFile, ConfigScope, ConfigSet};
 use crate::error::{Error, Result};
-use crate::rev_list::{expand_object_filter_for_protocol, ObjectFilter};
+use crate::rev_list::{expand_object_filter_for_protocol, ObjectFilter, ObjectFilterError};
 
 /// Client-side object filter for fetch and clone (partial clone).
 ///
@@ -22,15 +22,19 @@ pub enum ObjectFilterSpec {
     BlobLimit(u64),
 }
 
-/// Errors parsing or applying partial-clone configuration.
+/// Errors parsing a partial-clone filter spec.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum PartialCloneError {
-    /// The filter string is not a supported partial-clone spec.
-    #[error("{0}")]
-    InvalidFilter(String),
-    /// Underlying I/O or config failure.
+    /// The filter string is not a filter Git accepts.
     #[error(transparent)]
-    Library(#[from] Error),
+    InvalidFilter(#[from] ObjectFilterError),
+    /// The filter is valid but partial clone only fetches with `blob:none` or `blob:limit`.
+    #[error("partial clone filter must be blob:none or blob:limit, not {filter:?}")]
+    UnsupportedFilter {
+        /// The parsed filter.
+        filter: ObjectFilter,
+    },
 }
 
 impl ObjectFilterSpec {
@@ -40,7 +44,7 @@ impl ObjectFilterSpec {
     ///
     /// Returns [`PartialCloneError::InvalidFilter`] for unsupported filter kinds.
     pub fn parse(spec: &str) -> std::result::Result<Self, PartialCloneError> {
-        let filter = ObjectFilter::parse(spec.trim()).map_err(PartialCloneError::InvalidFilter)?;
+        let filter = ObjectFilter::parse(spec.trim())?;
         Self::from_object_filter(&filter)
     }
 
@@ -55,9 +59,9 @@ impl ObjectFilterSpec {
         match filter {
             ObjectFilter::BlobNone => Ok(Self::BlobNone),
             ObjectFilter::BlobLimit(n) => Ok(Self::BlobLimit(*n)),
-            other => Err(PartialCloneError::InvalidFilter(format!(
-                "partial clone filter must be blob:none or blob:limit, not {other:?}"
-            ))),
+            other => Err(PartialCloneError::UnsupportedFilter {
+                filter: other.clone(),
+            }),
         }
     }
 
@@ -82,8 +86,7 @@ impl ObjectFilterSpec {
     ///
     /// Returns [`PartialCloneError::InvalidFilter`] when expansion fails.
     pub fn expand_for_protocol(&self) -> std::result::Result<String, PartialCloneError> {
-        expand_object_filter_for_protocol(&self.to_wire_spec())
-            .map_err(PartialCloneError::InvalidFilter)
+        Ok(expand_object_filter_for_protocol(&self.to_wire_spec())?)
     }
 
     /// Parse `grit clone --blobs` values: `none` or a size with optional `k`/`m`/`g` suffix.
@@ -177,9 +180,9 @@ pub const AUTO_FILTER_VALUE: &str = "auto";
 /// - `config`: merged config.
 /// - `remote`: remote name.
 #[must_use]
-pub fn stored_remote_filter_is_auto(config: &ConfigSet, remote: &str) -> bool {
+pub(crate) fn stored_remote_filter_is_auto(config: &ConfigSet, remote: &str) -> bool {
     config
-        .get(&format!("remote.{remote}.partialclonefilter"))
+        .value(&format!("remote.{remote}.partialclonefilter"))
         .is_some_and(|s| s.trim().eq_ignore_ascii_case(AUTO_FILTER_VALUE))
 }
 
@@ -187,18 +190,18 @@ pub fn stored_remote_filter_is_auto(config: &ConfigSet, remote: &str) -> bool {
 #[must_use]
 pub fn stored_remote_filter(config: &ConfigSet, remote: &str) -> Option<ObjectFilterSpec> {
     config
-        .get(&format!("remote.{remote}.partialclonefilter"))
+        .value(&format!("remote.{remote}.partialclonefilter"))
         .and_then(|s| ObjectFilterSpec::parse(&s).ok())
 }
 
 /// Whether `remote` is configured as a promisor partial-clone source.
 #[must_use]
-pub fn remote_is_promisor(config: &ConfigSet, remote: &str) -> bool {
+pub(crate) fn remote_is_promisor(config: &ConfigSet, remote: &str) -> bool {
     config
-        .get(&format!("remote.{remote}.promisor"))
+        .value(&format!("remote.{remote}.promisor"))
         .is_some_and(|v| v.eq_ignore_ascii_case("true"))
         || config
-            .get(&format!("remote.{remote}.partialclonefilter"))
+            .value(&format!("remote.{remote}.partialclonefilter"))
             .is_some()
 }
 
@@ -207,7 +210,7 @@ pub fn remote_is_promisor(config: &ConfigSet, remote: &str) -> bool {
 /// When the server lacks filter support, returns `(None, false)` so the client
 /// fetches unfiltered, matching Git's `fetch-pack.c` behavior.
 #[must_use]
-pub fn wire_filter_for_capabilities(
+pub(crate) fn wire_filter_for_capabilities(
     spec: Option<&ObjectFilterSpec>,
     v2_fetch_caps: Option<&[String]>,
     v0_v1_caps: Option<&str>,
@@ -234,7 +237,7 @@ pub fn wire_filter_for_capabilities(
 /// Fetch/clone must use upload-pack on the wire (not local ODB copy) when a filter
 /// is requested or the remote is already a promisor partial-clone source.
 #[must_use]
-pub fn fetch_requires_upload_pack(
+pub(crate) fn fetch_requires_upload_pack(
     opts_filter: Option<&ObjectFilterSpec>,
     config: &ConfigSet,
     remote_name: Option<&str>,
@@ -248,6 +251,7 @@ pub fn fetch_requires_upload_pack(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::environment::Environment;
 
     #[test]
     fn from_blobs_cli_rejects_overflowing_suffix() {
@@ -285,13 +289,18 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("config"), "[core]\n\tbare = true\n").expect("config");
         PartialCloneConfig::write_auto(dir.path(), "origin").expect("write");
-        let cfg = ConfigSet::load_repo_local_only(dir.path()).expect("load");
+        let cfg = ConfigSet::load(
+            &Environment::empty(),
+            Some(dir.path()),
+            &crate::config::LoadConfigOptions::repo_local_only(dir.path()),
+        )
+        .expect("load");
         assert!(stored_remote_filter_is_auto(&cfg, "origin"));
         assert!(!stored_remote_filter_is_auto(&cfg, "other"));
         assert_eq!(stored_remote_filter(&cfg, "origin"), None);
         assert!(remote_is_promisor(&cfg, "origin"));
         assert_eq!(
-            cfg.get("extensions.partialclone").as_deref(),
+            cfg.value("extensions.partialclone").as_deref(),
             Some("origin")
         );
     }

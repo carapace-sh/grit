@@ -1,11 +1,13 @@
 //! Fetch from a remote and integrate the configured upstream into the current branch.
 //!
-//! [`pull`] runs fetch, resolves the branch upstream via [`resolve_pull_integration_base`], then
+//! [`pull`] runs fetch, resolves the branch upstream via `resolve_pull_integration_base`, then
 //! fast-forwards, merges, rebases local commits onto the upstream tip, or refuses
 //! when `--ff-only` / `pull.ff=only` forbids a merge commit. Rebase conflicts stop a
-//! resumable rebase session ([`start_rebase`]) with Git-compatible `.git/rebase-merge/`
-//! state, finished with [`continue_rebase`](crate::history::continue_rebase),
-//! [`skip_rebase`](crate::history::skip_rebase) or [`abort_rebase`](crate::history::abort_rebase).
+//! resumable rebase session ([`History::start_rebase`](crate::revwalk::history::History::start_rebase))
+//! with Git-compatible `.git/rebase-merge/` state, finished with
+//! [`History::continue_rebase`](crate::revwalk::history::History::continue_rebase),
+//! [`History::skip_rebase`](crate::revwalk::history::History::skip_rebase) or
+//! [`History::abort_rebase`](crate::revwalk::history::History::abort_rebase).
 //! A caller that fetched the upstream itself passes it as [`PullOptions::upstream`].
 
 use crate::branch_tracking::resolve_pull_integration_base;
@@ -15,30 +17,35 @@ use crate::config::ident_resolve::IdentRole;
 use crate::config::parse_git_config_maybe_bool;
 use crate::config::ConfigSet;
 use crate::error::{Error, OverwriteReason};
+use crate::worktree::WorktreeError;
+
 use crate::fetch_request::{configured_remote_for_pull, resolve_remote_argument};
-use crate::merge_base::{count_symmetric_ahead_behind, is_ancestor, merge_bases_first_vs_rest};
+use crate::index::IndexError;
+use crate::merge::{BranchIntegrateRequest, MergeSource, MergeSourceKind};
+use crate::merge_base::{count_symmetric_ahead_behind, is_ancestor};
 use crate::objects::ObjectId;
 use crate::operation::Conflict;
 use crate::porcelain::checkout::checkout_between_trees;
 use crate::porcelain::checkout_reflog::checkout_reflog_identity;
 use crate::porcelain::merge::{
-    ensure_branch_tip, integrate_branch_with_options, predict_merge, update_checked_out_branch,
-    IntegrateBranchOptions, IntegrateBranchOutcome, MergePrediction, MergePredictionOptions,
+    ensure_branch_tip, predict_merge, update_checked_out_branch, IntegrateBranchOptions,
+    IntegrateBranchOutcome, MergePrediction, MergePredictionOptions,
 };
+use crate::porcelain::merge_error::MergeError;
 use crate::porcelain::stash::{
     apply_operation_autostash, push_operation_autostash, record_merge_autostash,
     restore_operation_autostash,
 };
 use crate::porcelain::switch::checkout_tree_transition_allow_local_reset;
 use crate::porcelain::worktree_guard::prepare_tree_checkout;
-use crate::progress::{Cancel, ProgressSink};
+use crate::progress::{CancelToken, ProgressSink};
 use crate::remote::fetch::Progress;
 use crate::remote::transfer::{resolve_fetch_prune, FetchOptions, TagMode, TransferStats};
-use crate::remote::{HttpClientFactory, RemoteError};
+use crate::remote::HttpClientFactory;
 use crate::repo::Repository;
 use crate::revwalk::history::{
-    plan_rebase_check, start_rebase, ApplyOptions, EmptyPolicy, HistoryError, PreRebase,
-    RebaseCheckPlan, RebaseOntoOptions, RebaseOutcome, RebaseRequest, RebaseSessionError, RefScope,
+    plan_rebase_check, rebase_request_after_fetch, start_rebase, ApplyOptions, EmptyPolicy,
+    HistoryError, PreRebase, RebaseCheckPlan, RebaseOntoOptions, RebaseOutcome, RefScope,
     RewriteOptions, StartRebaseOptions,
 };
 use crate::state::{resolve_head_for_repository, HeadState};
@@ -151,9 +158,10 @@ pub enum PullResult {
     ///
     /// A resumable rebase session is in progress (`.git/rebase-merge/`, conflict markers and
     /// unmerged index entries, as `git pull --rebase` leaves them); the branch ref still points
-    /// at its pre-pull tip. Finish it with [`continue_rebase`](crate::history::continue_rebase)
-    /// after staging the resolution, or [`skip_rebase`](crate::history::skip_rebase) /
-    /// [`abort_rebase`](crate::history::abort_rebase). With [`PullOptions::check`] this
+    /// at its pre-pull tip. Finish it with
+    /// [`History::continue_rebase`](crate::revwalk::history::History::continue_rebase) after
+    /// staging the resolution, or [`History::skip_rebase`](crate::revwalk::history::History::skip_rebase)
+    /// / [`History::abort_rebase`](crate::revwalk::history::History::abort_rebase). With [`PullOptions::check`] this
     /// predicts the stop without touching anything.
     RebaseConflicts,
     /// Integration succeeded but re-applying `--autostash` left conflicts (stash kept).
@@ -234,8 +242,12 @@ impl PullOutcome {
     }
 }
 
-/// Errors from [`pull`].
+/// Pull-specific failures from [`pull`]; fetch, merge, rebase, and repository failures are
+/// reported in their own areas.
+///
+/// Surfaced on the umbrella as [`MergeError::Pull`].
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum PullError {
     /// `HEAD` points at a detached commit.
     #[error("HEAD is detached; pull needs a branch")]
@@ -252,45 +264,9 @@ pub enum PullError {
     /// `pull.rebase=interactive` (or branch rebase) is not supported.
     #[error("interactive rebase is not supported; use grit history instead")]
     RebaseInteractive,
-    /// Starting the rebase session failed (for example a rebase is already in progress).
-    #[error(transparent)]
-    Rebase(RebaseSessionError),
-    /// Remote resolution or transport failure.
-    #[error(transparent)]
-    Remote(#[from] RemoteError),
-    /// Other repository failures.
-    #[error(transparent)]
-    Repository(#[from] Error),
-}
-
-impl PullError {
-    /// Whether the remote could not be read at all ([`Error::RemoteUnreadable`]).
-    #[must_use]
-    pub fn is_remote_unreadable(&self) -> bool {
-        match self {
-            Self::Remote(e) => e.is_remote_unreadable(),
-            Self::Repository(e) => e.is_remote_unreadable(),
-            Self::DetachedHead
-            | Self::InvalidHead
-            | Self::NoUpstream { .. }
-            | Self::RebaseInteractive
-            | Self::Rebase(_) => false,
-        }
-    }
-
-    /// Whether the pull was cancelled ([`Error::Cancelled`]).
-    #[must_use]
-    pub fn is_cancelled(&self) -> bool {
-        match self {
-            Self::Remote(e) => e.is_cancelled(),
-            Self::Repository(e) => e.is_cancelled(),
-            Self::Rebase(e) => e.is_cancelled(),
-            Self::DetachedHead
-            | Self::InvalidHead
-            | Self::NoUpstream { .. }
-            | Self::RebaseInteractive => false,
-        }
-    }
+    /// The fetch completed but the remote rejected some ref updates, so nothing was integrated.
+    #[error("some ref updates from the remote were rejected")]
+    FetchRejected,
 }
 
 /// Resolve pull integration mode from config with optional CLI override.
@@ -305,7 +281,7 @@ pub fn resolve_pull_mode(
     config: &ConfigSet,
     branch: Option<&str>,
     cli: Option<PullMode>,
-) -> std::result::Result<PullMode, PullError> {
+) -> crate::error::Result<PullMode> {
     Ok(resolve_pull_integration(config, branch, cli)?.mode)
 }
 
@@ -313,7 +289,7 @@ fn resolve_pull_integration(
     config: &ConfigSet,
     branch: Option<&str>,
     cli: Option<PullMode>,
-) -> std::result::Result<PullIntegration, PullError> {
+) -> crate::error::Result<PullIntegration> {
     if cli == Some(PullMode::FfOnly) {
         return Ok(PullIntegration {
             mode: PullMode::FfOnly,
@@ -332,7 +308,7 @@ fn resolve_pull_integration(
             allow_fast_forward: true,
         });
     }
-    if let Some(raw) = config.get("pull.ff") {
+    if let Some(raw) = config.value("pull.ff") {
         let value = raw.trim();
         if value.eq_ignore_ascii_case("only") {
             return Ok(PullIntegration {
@@ -347,7 +323,7 @@ fn resolve_pull_integration(
             allow_fast_forward: true,
         });
     }
-    if let Some(raw) = config.get("pull.ff") {
+    if let Some(raw) = config.value("pull.ff") {
         let value = raw.trim();
         if parse_git_config_maybe_bool(value) == Some(false) {
             return Ok(PullIntegration {
@@ -373,21 +349,18 @@ impl PullOptions {
         repo: &Repository,
         environment: Environment,
         cli_mode: Option<PullMode>,
-    ) -> std::result::Result<Self, PullError> {
-        if let Some(op) = crate::state::operation_blocking_switch(repo.git_dir())
-            .map_err(PullError::Repository)?
-        {
-            return Err(PullError::Repository(Error::OperationInProgress(op)));
+    ) -> crate::error::Result<Self> {
+        if let Some(op) = crate::state::operation_blocking_switch(repo.git_dir())? {
+            return Err(Error::from(MergeError::OperationInProgress(op)));
         }
-        let short_name = match resolve_head_for_repository(repo).map_err(PullError::Repository)? {
+        let short_name = match resolve_head_for_repository(repo)? {
             HeadState::Branch { short_name, .. } => short_name,
-            HeadState::Detached { .. } => return Err(PullError::DetachedHead),
-            HeadState::Invalid => return Err(PullError::InvalidHead),
+            HeadState::Detached { .. } => return Err(PullError::DetachedHead.into()),
+            HeadState::Invalid => return Err(PullError::InvalidHead.into()),
         };
-        let config = repo.config().map_err(PullError::Repository)?;
+        let config = repo.config().snapshot()?;
         let remote_name = configured_remote_for_pull(config.as_ref(), Some(&short_name));
-        let prune = resolve_fetch_prune(config.as_ref(), &remote_name, None)
-            .map_err(PullError::Repository)?;
+        let prune = resolve_fetch_prune(config.as_ref(), &remote_name, None)?;
         Ok(Self {
             remote: None,
             branch: None,
@@ -402,6 +375,7 @@ impl PullOptions {
                 opts.environment = environment;
                 opts.prune = prune;
                 opts.remote_name = Some(remote_name);
+                opts.reflog_action = "pull";
                 opts
             },
             upstream: None,
@@ -410,16 +384,13 @@ impl PullOptions {
     }
 }
 
-fn pull_rebase_enabled(
-    config: &ConfigSet,
-    branch: Option<&str>,
-) -> std::result::Result<bool, PullError> {
+fn pull_rebase_enabled(config: &ConfigSet, branch: Option<&str>) -> crate::error::Result<bool> {
     if let Some(name) = branch {
-        if let Some(raw) = config.get(&format!("branch.{name}.rebase")) {
+        if let Some(raw) = config.value(&format!("branch.{name}.rebase")) {
             return parse_pull_rebase_config(raw.as_str());
         }
     }
-    if let Some(raw) = config.get("pull.rebase") {
+    if let Some(raw) = config.value("pull.rebase") {
         return parse_pull_rebase_config(raw.as_str());
     }
     Ok(false)
@@ -436,15 +407,15 @@ pub fn resolve_pull_autostash(config: &ConfigSet, mode: PullMode, cli_autostash:
         PullMode::FfOnly | PullMode::Merge => "merge.autoStash",
     };
     config
-        .get(key)
+        .value(key)
         .and_then(|raw| parse_git_config_maybe_bool(raw.trim()))
         .unwrap_or(false)
 }
 
-fn parse_pull_rebase_config(raw: &str) -> std::result::Result<bool, PullError> {
+fn parse_pull_rebase_config(raw: &str) -> crate::error::Result<bool> {
     let value = raw.trim();
     if value.eq_ignore_ascii_case("interactive") {
-        return Err(PullError::RebaseInteractive);
+        return Err(PullError::RebaseInteractive.into());
     }
     if value.eq_ignore_ascii_case("false") || value == "0" {
         return Ok(false);
@@ -467,14 +438,14 @@ pub fn pull<P>(
     repo: &Repository,
     options: &PullOptions,
     progress: &mut P,
-    cancel: &dyn crate::progress::Cancel,
+    cancel: &crate::progress::CancelToken,
     http_factory: Option<&dyn HttpClientFactory>,
-) -> std::result::Result<PullOutcome, PullError>
+) -> crate::error::Result<PullOutcome>
 where
     P: Progress,
 {
     if let Some(op) = crate::state::operation_blocking_switch(repo.git_dir())? {
-        return Err(PullError::Repository(Error::OperationInProgress(op)));
+        return Err(Error::from(MergeError::OperationInProgress(op)));
     }
     let (refname, short_name, head_oid) = match resolve_head_for_repository(repo)? {
         HeadState::Branch {
@@ -482,11 +453,11 @@ where
             short_name,
             oid,
         } => (refname, short_name, oid),
-        HeadState::Detached { .. } => return Err(PullError::DetachedHead),
-        HeadState::Invalid => return Err(PullError::InvalidHead),
+        HeadState::Detached { .. } => return Err(PullError::DetachedHead.into()),
+        HeadState::Invalid => return Err(PullError::InvalidHead.into()),
     };
 
-    let config = repo.config().map_err(PullError::Repository)?;
+    let config = repo.config().snapshot()?;
     let remote_name = options
         .remote
         .clone()
@@ -511,26 +482,20 @@ where
     let merge_in_progress =
         || crate::state::read_merge_heads(repo.git_dir()).is_ok_and(|heads| !heads.is_empty());
     let merge_was_in_progress = merge_in_progress();
-    let stash_oid = if autostash {
-        push_operation_autostash(repo, &checkout_reflog_identity(repo))
-            .map_err(PullError::Repository)?
+    let stash_oid = if autostash && head_oid.is_some() {
+        push_operation_autostash(repo, &checkout_reflog_identity(repo))?
     } else {
         None
     };
 
     let stop_on_conflict = options.stop_on_conflict && stash_oid.is_none();
     let mut transfer = TransferStats::default();
-    let core: std::result::Result<PullOutcome, PullError> = (|| {
+    let core: crate::error::Result<PullOutcome> = (|| {
         if options.upstream.is_none() && remote_name != "." {
-            let remote = resolve_remote_argument(config.as_ref(), &remote_name)
-                .map_err(PullError::Remote)?;
-            let fetch_outcome = remote
-                .fetch(repo, fetch_opts, progress, cancel, http_factory)
-                .map_err(PullError::Remote)?;
+            let remote = resolve_remote_argument(config.as_ref(), &remote_name)?;
+            let fetch_outcome = remote.fetch(repo, fetch_opts, progress, cancel, http_factory)?;
             if fetch_outcome.has_rejections() {
-                return Err(PullError::Repository(Error::Message(
-                    "some ref updates from the remote were rejected".into(),
-                )));
+                return Err(PullError::FetchRejected.into());
             }
             transfer = fetch_outcome.transfer;
         }
@@ -545,21 +510,33 @@ where
             });
         }
 
-        let (label, upstream_oid) = match &options.upstream {
-            Some(fetched) => (fetched.label.clone(), fetched.oid),
+        let (label, upstream_oid, upstream_full_ref) = match &options.upstream {
+            Some(fetched) => (
+                fetched.label.clone(),
+                fetched.oid,
+                resolve_fork_point_upstream_ref(repo, &fetched.label),
+            ),
             None => {
                 let upstream =
                     resolve_pull_integration_base(repo, &short_name, &remote_name, explicit_fetch)
                         .ok_or(PullError::NoUpstream {
                             branch: short_name.clone(),
                         })?;
-                (upstream.name, upstream.oid)
+                (upstream.name, upstream.oid, upstream.full_ref)
             }
         };
 
         let landed = options.upstream.as_ref().and_then(|u| u.landed);
         if options.check {
-            return pull_check_outcome(repo, head_oid, upstream_oid, &label, integration, landed);
+            return pull_check_outcome(
+                repo,
+                head_oid,
+                upstream_oid,
+                &label,
+                &upstream_full_ref,
+                integration,
+                landed,
+            );
         }
 
         match head_oid {
@@ -571,6 +548,7 @@ where
                 Upstream {
                     oid: upstream_oid,
                     label: &label,
+                    full_ref: &upstream_full_ref,
                     landed,
                     copies: options
                         .upstream
@@ -595,7 +573,7 @@ where
             // waits in MERGE_AUTOSTASH, as with Git, so `merge --continue` does not auto-stage it.
             match stash_oid.as_ref() {
                 Some(oid) if !merge_was_in_progress && merge_in_progress() => {
-                    record_merge_autostash(repo, oid).map_err(PullError::Repository)?;
+                    record_merge_autostash(repo, oid)?;
                 }
                 _ => restore_autostash_after_abort(repo, stash_oid.as_ref()),
             }
@@ -649,8 +627,8 @@ fn restore_autostash_after_abort(repo: &Repository, stash_oid: Option<&ObjectId>
 fn apply_autostash_after_pull(
     repo: &Repository,
     stash_oid: Option<&ObjectId>,
-    outcome: std::result::Result<PullOutcome, PullError>,
-) -> std::result::Result<PullOutcome, PullError> {
+    outcome: crate::error::Result<PullOutcome>,
+) -> crate::error::Result<PullOutcome> {
     let mut outcome = outcome?;
     if stash_oid.is_none() {
         return Ok(outcome);
@@ -667,7 +645,7 @@ fn apply_autostash_after_pull(
         return Ok(outcome);
     }
     if let Some(stash_oid) = stash_oid {
-        if apply_operation_autostash(repo, stash_oid).map_err(PullError::Repository)? {
+        if apply_operation_autostash(repo, stash_oid)? {
             outcome.result = PullResult::AutostashConflict;
             outcome.autostash = Some(*stash_oid);
         }
@@ -680,22 +658,28 @@ fn pull_check_outcome(
     head_oid: Option<ObjectId>,
     upstream_oid: ObjectId,
     label: &str,
+    upstream_full_ref: &str,
     integration: PullIntegration,
     landed: Option<ObjectId>,
-) -> std::result::Result<PullOutcome, PullError> {
+) -> crate::error::Result<PullOutcome> {
     let (ahead, behind, would, fast_forward_possible) = match head_oid {
         None => (0, 0, PullResult::SetUpstream, true),
         Some(head_oid) => {
-            let (ahead, behind) = count_symmetric_ahead_behind(repo, head_oid, upstream_oid)
-                .map_err(PullError::Repository)?;
+            let (ahead, behind) = count_symmetric_ahead_behind(repo, head_oid, upstream_oid)?;
             let would = if landed == Some(head_oid) && diverged(repo, head_oid, upstream_oid)? {
                 PullResult::Landed
             } else {
-                predict_pull_result(repo, head_oid, upstream_oid, integration)?
+                predict_pull_result(
+                    repo,
+                    head_oid,
+                    upstream_oid,
+                    upstream_full_ref,
+                    integration,
+                    landed,
+                )?
             };
             let up_to_date = head_oid == upstream_oid || is_ancestor(repo, upstream_oid, head_oid)?;
-            let fast_forward = !up_to_date
-                && is_ancestor(repo, head_oid, upstream_oid).map_err(PullError::Repository)?;
+            let fast_forward = !up_to_date && is_ancestor(repo, head_oid, upstream_oid)?;
             (ahead, behind, would, up_to_date || fast_forward)
         }
     };
@@ -716,12 +700,18 @@ fn pull_check_outcome(
     })
 }
 
+fn resolve_fork_point_upstream_ref(repo: &Repository, label: &str) -> String {
+    crate::merge_base::resolve_fork_point_reflog_ref(repo, label)
+}
+
 fn predict_pull_result(
     repo: &Repository,
     head_oid: ObjectId,
     upstream_oid: ObjectId,
+    upstream_full_ref: &str,
     integration: PullIntegration,
-) -> std::result::Result<PullResult, PullError> {
+    landed: Option<ObjectId>,
+) -> crate::error::Result<PullResult> {
     if head_oid == upstream_oid || is_ancestor(repo, upstream_oid, head_oid)? {
         return Ok(PullResult::UpToDate);
     }
@@ -737,11 +727,15 @@ fn predict_pull_result(
             PullMode::Rebase => {
                 let mut opts = pull_rebase_options(repo)?;
                 opts.rewrite.sign = false;
-                let request = RebaseRequest {
-                    upstream: upstream_oid,
-                    onto: None,
-                    branch_tip: head_oid,
-                };
+                let request = rebase_request_after_fetch(
+                    repo,
+                    head_oid,
+                    upstream_oid,
+                    upstream_full_ref,
+                    landed,
+                    true,
+                )
+                .map_err(map_history_error)?;
                 match plan_rebase_check(repo, &request, &opts).map_err(map_history_error)? {
                     RebaseCheckPlan::UpToDate | RebaseCheckPlan::Clean { .. } => {
                         Ok(PullResult::Rebased)
@@ -758,9 +752,7 @@ fn predict_pull_result(
                     theirs_label: "upstream".into(),
                     ..Default::default()
                 },
-            )
-            .map_err(PullError::Repository)?
-            {
+            )? {
                 MergePrediction::UpToDate => Ok(PullResult::UpToDate),
                 MergePrediction::FastForward => Ok(PullResult::FastForward),
                 MergePrediction::Clean { .. } => Ok(PullResult::Merged),
@@ -778,11 +770,11 @@ fn adopt_unborn_upstream(
     short_name: &str,
     label: &str,
     upstream_oid: ObjectId,
-) -> std::result::Result<PullOutcome, PullError> {
+) -> crate::error::Result<PullOutcome> {
     ensure_branch_tip(repo, refname, None)?;
     let upstream_tree = repo.odb().commit_tree(&upstream_oid)?;
-    prepare_tree_checkout(repo, None, &upstream_tree).map_err(PullError::Repository)?;
-    checkout_between_trees(repo, None, &upstream_tree).map_err(PullError::Repository)?;
+    prepare_tree_checkout(repo, None, &upstream_tree)?;
+    checkout_between_trees(repo, None, &upstream_tree)?;
     update_checked_out_branch(repo, refname, None, upstream_oid, INITIAL_PULL_REFLOG)?;
     Ok(PullOutcome {
         upstream: Some(label.to_owned()),
@@ -795,10 +787,10 @@ fn diverged(
     repo: &Repository,
     head_oid: ObjectId,
     upstream_oid: ObjectId,
-) -> std::result::Result<bool, PullError> {
+) -> crate::error::Result<bool> {
     Ok(head_oid != upstream_oid
-        && !is_ancestor(repo, upstream_oid, head_oid).map_err(PullError::Repository)?
-        && !is_ancestor(repo, head_oid, upstream_oid).map_err(PullError::Repository)?)
+        && !is_ancestor(repo, upstream_oid, head_oid)?
+        && !is_ancestor(repo, head_oid, upstream_oid)?)
 }
 
 /// The upstream a pull integrates.
@@ -806,6 +798,8 @@ fn diverged(
 struct Upstream<'a> {
     oid: ObjectId,
     label: &'a str,
+    /// Full ref name for upstream reflog fork-point lookup.
+    full_ref: &'a str,
     /// [`FetchedUpstream::landed`].
     landed: Option<ObjectId>,
     /// [`FetchedUpstream::copies`].
@@ -821,8 +815,8 @@ fn integrate_fetched_upstream(
     integration: PullIntegration,
     stop_on_conflict: bool,
     progress: &mut dyn ProgressSink,
-    cancel: &dyn Cancel,
-) -> std::result::Result<PullOutcome, PullError> {
+    cancel: &CancelToken,
+) -> crate::error::Result<PullOutcome> {
     let Upstream {
         oid: upstream_oid,
         label,
@@ -846,8 +840,7 @@ fn integrate_fetched_upstream(
     if diverged {
         match integration.mode {
             PullMode::FfOnly => {
-                let (ahead, behind) = count_symmetric_ahead_behind(repo, head_oid, upstream_oid)
-                    .map_err(PullError::Repository)?;
+                let (ahead, behind) = count_symmetric_ahead_behind(repo, head_oid, upstream_oid)?;
                 return Ok(PullOutcome {
                     ahead: Some(ahead),
                     behind: Some(behind),
@@ -869,19 +862,23 @@ fn integrate_fetched_upstream(
         }
     }
 
-    let integrate = integrate_branch_with_options(
-        repo,
-        refname,
-        head_oid,
-        upstream_oid,
-        label,
-        IntegrateBranchOptions {
-            allow_fast_forward: integration.allow_fast_forward,
+    let integrate = repo.merge().integrate_into_branch(
+        &BranchIntegrateRequest {
+            into_ref: refname,
+            into_oid: head_oid,
+            source: &MergeSource {
+                oid: upstream_oid,
+                kind: MergeSourceKind::Commit,
+            },
+            label,
         },
+        &IntegrateBranchOptions {
+            allow_fast_forward: integration.allow_fast_forward,
+        }
+        .into(),
         progress,
         cancel,
-    )
-    .map_err(PullError::Repository)?;
+    )?;
     Ok(map_integrate_outcome(integrate, label))
 }
 
@@ -893,65 +890,37 @@ fn rebase_fetched_upstream(
     upstream: Upstream<'_>,
     stop_on_conflict: bool,
     progress: &mut dyn ProgressSink,
-    cancel: &dyn Cancel,
-) -> std::result::Result<PullOutcome, PullError> {
+    cancel: &CancelToken,
+) -> crate::error::Result<PullOutcome> {
     let Upstream {
         oid: upstream_oid,
         label,
+        full_ref,
         landed,
         copies,
     } = upstream;
-    let fork = merge_bases_first_vs_rest(repo, head_oid, &[upstream_oid])
-        .map_err(PullError::Repository)?
-        .into_iter()
-        .next()
-        .ok_or_else(|| {
-            PullError::Repository(Error::Message(format!(
-                "'{label}' has no common history with the current branch"
-            )))
-        })?;
-    // Commits up to a landed one are in the upstream already: replay only those above it,
-    // as `git rebase --onto <upstream> <landed>` does.
-    let request = match landed {
-        Some(base)
-            if base != fork
-                && is_ancestor(repo, base, head_oid).map_err(PullError::Repository)?
-                && is_ancestor(repo, fork, base).map_err(PullError::Repository)? =>
-        {
-            RebaseRequest {
-                upstream: base,
-                onto: Some(upstream_oid),
-                branch_tip: head_oid,
-            }
-        }
-        _ => RebaseRequest {
-            upstream: upstream_oid,
-            onto: None,
-            branch_tip: head_oid,
-        },
-    };
+    let request = rebase_request_after_fetch(repo, head_oid, upstream_oid, full_ref, landed, true)
+        .map_err(map_history_error)?;
 
     let mut rebase = pull_rebase_options(repo)?;
     // The upstream already has these commits: they are its copies of local ones.
     rebase.drop = copies.to_vec();
     // Git's pull hands rebase the fork point (or the fetched tip) as a commit id.
-    let pre_rebase = PreRebase::Run {
+    rebase.pre_rebase = PreRebase::Run {
         upstream: Some(request.upstream.to_hex()),
     };
     let start = StartRebaseOptions {
         request,
         rebase,
         apply: ApplyOptions {
-            identity: repo
-                .identity(IdentRole::Committer, repo.identity_now())
-                .map_err(PullError::Repository)?,
+            identity: repo.identity(IdentRole::Committer, repo.identity_now())?,
             reflog_message: format!("pull: rebase onto {label}"),
             record_operation: Some("rebase".into()),
             hooks: crate::hooks::PostOperationHooks::Run,
         },
-        pre_rebase,
+        exec: None,
     };
-    match start_rebase(repo, &start, progress, cancel).map_err(map_rebase_session_error)? {
+    match start_rebase(repo, &start, progress, cancel).map_err(map_history_error)? {
         RebaseOutcome::Stopped(stop) if stop_on_conflict => Ok(PullOutcome {
             conflicts: Some(stop.conflicts),
             stopped_commit: Some(stop.commit),
@@ -975,29 +944,31 @@ fn rebase_fetched_upstream(
         // Nothing was rewritten: integrate like `git pull --rebase`, which fast-forwards when
         // the branch is simply behind the upstream tip.
         RebaseOutcome::Done { .. } | RebaseOutcome::ExecDone { .. } => {
-            let integrate = integrate_branch_with_options(
-                repo,
-                refname,
-                head_oid,
-                upstream_oid,
-                label,
-                IntegrateBranchOptions {
-                    allow_fast_forward: true,
+            let integrate = repo.merge().integrate_into_branch(
+                &BranchIntegrateRequest {
+                    into_ref: refname,
+                    into_oid: head_oid,
+                    source: &MergeSource {
+                        oid: upstream_oid,
+                        kind: MergeSourceKind::Commit,
+                    },
+                    label,
                 },
+                &IntegrateBranchOptions {
+                    allow_fast_forward: true,
+                }
+                .into(),
                 progress,
                 cancel,
-            )
-            .map_err(PullError::Repository)?;
+            )?;
             Ok(map_integrate_outcome(integrate, label))
         }
     }
 }
 
 /// Replay options shared by the rebase pull and its `--check` prediction.
-fn pull_rebase_options(repo: &Repository) -> std::result::Result<RebaseOntoOptions, PullError> {
-    let committer = repo
-        .identity(IdentRole::Committer, repo.identity_now())
-        .map_err(PullError::Repository)?;
+fn pull_rebase_options(repo: &Repository) -> crate::error::Result<RebaseOntoOptions> {
+    let committer = repo.identity(IdentRole::Committer, repo.identity_now())?;
     let mut opts = RebaseOntoOptions::new(RewriteOptions {
         scope: RefScope::Head,
         empty: EmptyPolicy::Drop,
@@ -1021,21 +992,21 @@ fn move_landed_branch(
     upstream_oid: ObjectId,
     label: &str,
     progress: &mut dyn ProgressSink,
-    cancel: &dyn Cancel,
-) -> std::result::Result<PullOutcome, PullError> {
+    cancel: &CancelToken,
+) -> crate::error::Result<PullOutcome> {
     ensure_branch_tip(repo, refname, Some(head_oid))?;
     if repo.load_index()?.has_unmerged_entries() {
-        return Err(Error::IndexUnmerged.into());
+        return Err(IndexError::unmerged().into());
     }
     let from = repo.odb().commit_tree(&head_oid)?;
     let to = repo.odb().commit_tree(&upstream_oid)?;
     checkout_tree_transition_allow_local_reset(repo, Some(&from), &to, progress, cancel).map_err(
         |e| match e {
-            Error::WouldOverwrite {
+            Error::Worktree(WorktreeError::WouldOverwrite {
                 reason: OverwriteReason::LocalChanges,
                 paths,
                 ..
-            } => local_changes_would_be_overwritten(paths),
+            }) => local_changes_would_be_overwritten(paths),
             other => other,
         },
     )?;
@@ -1047,38 +1018,24 @@ fn move_landed_branch(
         &format!("pull: move to {label}, which has the branch's commits"),
     )?;
     crate::state::write_orig_head(repo, head_oid)?;
-    Ok(PullOutcome::at_commit(
-        PullResult::Landed,
-        label,
-        repo,
-        upstream_oid,
-    )?)
+    PullOutcome::at_commit(PullResult::Landed, label, repo, upstream_oid)
 }
 
-/// [`Error::WouldOverwrite`] for uncommitted changes to `paths` that a pull would overwrite.
+/// [`crate::worktree::WorktreeError::WouldOverwrite`] for uncommitted changes to `paths` that a pull would overwrite.
 fn local_changes_would_be_overwritten(paths: Vec<String>) -> Error {
-    Error::WouldOverwrite {
+    Error::Worktree(WorktreeError::WouldOverwrite {
         reason: OverwriteReason::LocalChanges,
         paths,
         message: "local changes would be overwritten".to_owned(),
-    }
+    })
 }
 
-fn map_history_error(err: HistoryError) -> PullError {
+fn map_history_error(err: Error) -> Error {
     match err {
-        HistoryError::Library(e) => PullError::Repository(*e),
-        HistoryError::LocalChangesWouldBeOverwritten { paths } => {
-            PullError::Repository(local_changes_would_be_overwritten(paths))
+        Error::History(HistoryError::LocalChangesWouldBeOverwritten { paths }) => {
+            local_changes_would_be_overwritten(paths)
         }
-        other => PullError::Repository(Error::Message(other.to_string())),
-    }
-}
-
-fn map_rebase_session_error(err: RebaseSessionError) -> PullError {
-    match err {
-        RebaseSessionError::Library(e) => PullError::Repository(e),
-        RebaseSessionError::History(e) => map_history_error(e),
-        other => PullError::Rebase(other),
+        other => other,
     }
 }
 
@@ -1111,7 +1068,6 @@ mod tests {
     use crate::config::environment::RepositoryOptions;
     use crate::config::ConfigSet;
     use crate::environment::Environment;
-    use crate::progress::NeverCancel;
     use crate::remote::fetch::NoProgress;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Output};
@@ -1214,7 +1170,9 @@ mod tests {
         let config = cfg(&[("pull.rebase", "interactive")]);
         assert!(matches!(
             resolve_pull_mode(&config, Some("main"), None),
-            Err(PullError::RebaseInteractive)
+            Err(crate::error::Error::Merge(
+                crate::porcelain::MergeError::Pull(PullError::RebaseInteractive)
+            ))
         ));
     }
 
@@ -1258,6 +1216,40 @@ mod tests {
         ignore = "starts system git or is heavy; run with --features full-tests"
     )]
     #[test]
+    fn fast_forward_pull_refuses_overlapping_local_changes() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (origin, clone) = origin_and_clone(&tmp);
+        let tip_before = git(&clone, &["rev-parse", "main"]);
+        commit(&origin, "a.txt", "two");
+        std::fs::write(clone.join("a.txt"), "local edit\n").expect("write");
+        let repo = open(&clone);
+        let err = pull(
+            &repo,
+            &pull_options(&repo),
+            &mut NoProgress,
+            &CancelToken::never(),
+            None,
+        )
+        .expect_err("blocked");
+        assert!(
+            matches!(
+                &err,
+                e if matches!(e, Error::Worktree(WorktreeError::WouldOverwrite { paths, .. }) if paths == &["a.txt"])
+            ),
+            "{err:?}"
+        );
+        assert_eq!(git(&clone, &["rev-parse", "main"]), tip_before);
+        assert!(
+            git(&clone, &["status", "--porcelain"]).contains("M a.txt"),
+            "worktree still dirty"
+        );
+    }
+
+    #[cfg_attr(
+        not(feature = "full-tests"),
+        ignore = "starts system git or is heavy; run with --features full-tests"
+    )]
+    #[test]
     fn pull_maps_custom_fetch_refspec() {
         let tmp = TempDir::new().expect("tempdir");
         let (origin, clone) = origin_and_clone(&tmp);
@@ -1277,7 +1269,7 @@ mod tests {
             &repo,
             &pull_options(&repo),
             &mut NoProgress,
-            &NeverCancel,
+            &CancelToken::never(),
             None,
         )
         .expect("pull succeeds");
@@ -1306,7 +1298,7 @@ mod tests {
             &repo,
             &pull_options(&repo),
             &mut NoProgress,
-            &NeverCancel,
+            &CancelToken::never(),
             None,
         )
         .expect("local pull succeeds");
@@ -1331,7 +1323,7 @@ mod tests {
             &repo,
             &pull_options(&repo),
             &mut NoProgress,
-            &NeverCancel,
+            &CancelToken::never(),
             None,
         )
         .expect("pull succeeds");
@@ -1344,7 +1336,7 @@ mod tests {
             &repo,
             &pull_options(&repo),
             &mut NoProgress,
-            &NeverCancel,
+            &CancelToken::never(),
             None,
         )
         .expect("second pull");
@@ -1373,7 +1365,7 @@ mod tests {
             &repo,
             &pull_options(&repo),
             &mut NoProgress,
-            &NeverCancel,
+            &CancelToken::never(),
             None,
         )
         .expect("pull succeeds");
@@ -1382,6 +1374,126 @@ mod tests {
         assert_eq!(
             git(&local, &["reflog", "show", "--format=%H %gs", "-1", "main"]),
             format!("{} {INITIAL_PULL_REFLOG}", tip.to_hex())
+        );
+    }
+
+    #[cfg_attr(
+        not(feature = "full-tests"),
+        ignore = "starts system git or is heavy; run with --features full-tests"
+    )]
+    #[test]
+    fn pull_unborn_branch_skips_autostash_with_cli_flag() {
+        let tmp = TempDir::new().expect("tempdir");
+        let origin = tmp.path().join("origin");
+        std::fs::create_dir_all(&origin).expect("mkdir origin");
+        git(&origin, &["init", "-q", "-b", "main"]);
+        let tip = commit(&origin, "a.txt", "one");
+        let local = tmp.path().join("local");
+        std::fs::create_dir_all(&local).expect("mkdir local");
+        git(&local, &["init", "-q", "-b", "main"]);
+        git(&local, &["remote", "add", "origin", "../origin"]);
+
+        let repo = open(&local);
+        let mut options = pull_options(&repo);
+        options.autostash = true;
+        let outcome = pull(
+            &repo,
+            &options,
+            &mut NoProgress,
+            &CancelToken::never(),
+            None,
+        )
+        .expect("pull with --autostash on unborn branch");
+        assert_eq!(outcome.result, PullResult::SetUpstream);
+        assert_eq!(outcome.oid, Some(tip));
+        assert!(
+            git_output(&local, &["rev-parse", "refs/stash"])
+                .status
+                .code()
+                == Some(128),
+            "autostash must not create refs/stash without a commit"
+        );
+    }
+
+    #[cfg_attr(
+        not(feature = "full-tests"),
+        ignore = "starts system git or is heavy; run with --features full-tests"
+    )]
+    #[test]
+    fn pull_unborn_branch_skips_autostash_from_config() {
+        let tmp = TempDir::new().expect("tempdir");
+        let origin = tmp.path().join("origin");
+        std::fs::create_dir_all(&origin).expect("mkdir origin");
+        git(&origin, &["init", "-q", "-b", "main"]);
+        let tip = commit(&origin, "a.txt", "one");
+        let local = tmp.path().join("local");
+        std::fs::create_dir_all(&local).expect("mkdir local");
+        git(&local, &["init", "-q", "-b", "main"]);
+        git(&local, &["remote", "add", "origin", "../origin"]);
+        git(&local, &["config", "rebase.autoStash", "true"]);
+        git(&local, &["config", "pull.rebase", "true"]);
+
+        let repo = open(&local);
+        let outcome = pull(
+            &repo,
+            &pull_options(&repo),
+            &mut NoProgress,
+            &CancelToken::never(),
+            None,
+        )
+        .expect("pull with rebase.autoStash on unborn branch");
+        assert_eq!(outcome.result, PullResult::SetUpstream);
+        assert_eq!(outcome.oid, Some(tip));
+        assert!(
+            git_output(&local, &["rev-parse", "refs/stash"])
+                .status
+                .code()
+                == Some(128),
+            "config autostash must not run without a commit"
+        );
+    }
+
+    #[cfg_attr(
+        not(feature = "full-tests"),
+        ignore = "starts system git or is heavy; run with --features full-tests"
+    )]
+    #[test]
+    fn pull_unborn_branch_with_autostash_still_refuses_overlapping_paths() {
+        let tmp = TempDir::new().expect("tempdir");
+        let origin = tmp.path().join("origin");
+        std::fs::create_dir_all(&origin).expect("mkdir origin");
+        git(&origin, &["init", "-q", "-b", "main"]);
+        commit(&origin, "a.txt", "upstream");
+        let local = tmp.path().join("local");
+        std::fs::create_dir_all(&local).expect("mkdir local");
+        git(&local, &["init", "-q", "-b", "main"]);
+        git(&local, &["remote", "add", "origin", "../origin"]);
+        std::fs::write(local.join("a.txt"), "local\n").expect("write");
+
+        let repo = open(&local);
+        let mut options = pull_options(&repo);
+        options.autostash = true;
+        let err = pull(
+            &repo,
+            &options,
+            &mut NoProgress,
+            &CancelToken::never(),
+            None,
+        )
+        .expect_err("checkout collision");
+        assert!(
+            matches!(
+                &err,
+                e if matches!(e, Error::Worktree(WorktreeError::WouldOverwrite { paths, .. }) if paths == &["a.txt"])
+            ),
+            "{err:?}"
+        );
+        assert!(
+            git_output(&local, &["rev-parse", "refs/stash"])
+                .status
+                .code()
+                == Some(128),
+            "must not stash when HEAD is unborn"
         );
     }
 
@@ -1410,8 +1522,14 @@ mod tests {
             landed: None,
             copies: Vec::new(),
         });
-        let outcome = pull(&repo, &options, &mut NoProgress, &NeverCancel, None)
-            .expect("pull without a fetch");
+        let outcome = pull(
+            &repo,
+            &options,
+            &mut NoProgress,
+            &CancelToken::never(),
+            None,
+        )
+        .expect("pull without a fetch");
         assert_eq!(outcome.result, PullResult::FastForward);
         assert_eq!(outcome.label, "origin/up");
         assert_eq!(git(&clone, &["rev-parse", "main"]), tip.to_hex());
@@ -1444,7 +1562,7 @@ mod tests {
 
     fn abort(repo: &Repository) {
         let identity = "T <t@example.com> 0 +0000".parse().expect("signature");
-        crate::history::abort_rebase(repo, &identity).expect("abort");
+        repo.history().abort_rebase(&identity).expect("abort");
     }
 
     #[cfg_attr(
@@ -1462,7 +1580,7 @@ mod tests {
             &repo,
             &rebase_options(&repo, upstream, false),
             &mut NoProgress,
-            &NeverCancel,
+            &CancelToken::never(),
             None,
         )
         .expect("pull");
@@ -1475,7 +1593,7 @@ mod tests {
             &repo,
             &rebase_options(&repo, upstream, true),
             &mut NoProgress,
-            &NeverCancel,
+            &CancelToken::never(),
             None,
         )
         .expect("pull");
@@ -1512,13 +1630,13 @@ mod tests {
             &repo,
             &rebase_options(&repo, upstream, true),
             &mut NoProgress,
-            &NeverCancel,
+            &CancelToken::never(),
             None,
         );
         assert!(
             matches!(
-                refused,
-                Err(PullError::Repository(Error::DirtyWorktree { .. }))
+                refused.as_ref(),
+                Err(e) if matches!(e, Error::Worktree(WorktreeError::DirtyWorktree { .. }))
             ),
             "{refused:?}"
         );
@@ -1535,33 +1653,26 @@ mod tests {
         ignore = "starts system git or is heavy; run with --features full-tests"
     )]
     #[test]
-    fn reflog_failure_after_ref_update_is_a_warning() {
+    fn reflog_failure_aborts_branch_update() {
         let tmp = TempDir::new().expect("tempdir");
         let (origin, clone) = origin_and_clone(&tmp);
-        let tip = commit(&origin, "b.txt", "two");
+        let _tip = commit(&origin, "b.txt", "two");
+        let before = git(&clone, &["rev-parse", "main"]);
         let branch_log = clone.join(".git/logs/refs/heads/main");
         std::fs::remove_file(&branch_log).expect("remove branch reflog");
         std::fs::create_dir(&branch_log).expect("replace reflog with directory");
 
-        let mut repo = open(&clone);
-        let sink = std::sync::Arc::new(crate::diagnostics::CollectingDiagnostics::new());
-        repo.set_diagnostics(sink.clone());
-        let outcome = pull(
+        let repo = open(&clone);
+        let err = pull(
             &repo,
             &pull_options(&repo),
             &mut NoProgress,
-            &NeverCancel,
+            &CancelToken::never(),
             None,
         )
-        .expect("pull completes");
-        assert_eq!(outcome.result, PullResult::FastForward);
-        assert_eq!(outcome.oid, Some(tip));
-        assert_eq!(git(&clone, &["rev-parse", "main"]), tip.to_hex());
-        assert!(sink.warnings().iter().any(|warning| matches!(
-            warning,
-            crate::diagnostics::Warning::ReflogNotWritten { refname, .. }
-                if refname == "refs/heads/main"
-        )));
+        .expect_err("pull fails when branch reflog cannot be written");
+        assert!(matches!(err, _), "{err:?}");
+        assert_eq!(git(&clone, &["rev-parse", "main"]), before);
     }
 
     /// A clone whose `main` has three commits appending to `a.txt`, and an upstream commit
@@ -1614,7 +1725,7 @@ mod tests {
             &repo,
             &rebase_options(&repo, upstream, false),
             &mut NoProgress,
-            &NeverCancel,
+            &CancelToken::never(),
             None,
         )
         .expect("pull");
@@ -1626,7 +1737,8 @@ mod tests {
         std::fs::write(clone.join("draft.txt"), "not committed\n").expect("write");
         let mut check = landed_options(&repo, upstream, tip, false);
         check.check = true;
-        let predicted = pull(&repo, &check, &mut NoProgress, &NeverCancel, None).expect("check");
+        let predicted =
+            pull(&repo, &check, &mut NoProgress, &CancelToken::never(), None).expect("check");
         assert_eq!(predicted.check.map(|c| c.would), Some(PullResult::Landed));
 
         git(&clone, &["update-ref", "-d", "ORIG_HEAD"]);
@@ -1634,7 +1746,7 @@ mod tests {
             &repo,
             &landed_options(&repo, upstream, tip, true),
             &mut NoProgress,
-            &NeverCancel,
+            &CancelToken::never(),
             None,
         )
         .expect("pull");
@@ -1670,14 +1782,14 @@ mod tests {
             &repo,
             &landed_options(&repo, upstream, tip, true),
             &mut NoProgress,
-            &NeverCancel,
+            &CancelToken::never(),
             None,
         )
         .expect_err("blocked");
         assert!(
             matches!(
                 &err,
-                PullError::Repository(Error::WouldOverwrite { paths, .. }) if paths == &["b.txt"]
+                e if matches!(e, Error::Worktree(WorktreeError::WouldOverwrite { paths, .. }) if paths == &["b.txt"])
             ),
             "{err:?}"
         );
@@ -1699,7 +1811,7 @@ mod tests {
             &repo,
             &landed_options(&repo, upstream, landed, true),
             &mut NoProgress,
-            &NeverCancel,
+            &CancelToken::never(),
             None,
         )
         .expect("pull");
@@ -1720,7 +1832,7 @@ mod tests {
             &repo,
             &landed_options(&repo, upstream, landed, true),
             &mut NoProgress,
-            &NeverCancel,
+            &CancelToken::never(),
             None,
         )
         .expect("pull");

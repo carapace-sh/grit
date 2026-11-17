@@ -8,8 +8,6 @@ use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use thiserror::Error;
-
 use crate::config::ConfigSet;
 #[cfg(feature = "http-ureq")]
 use crate::credentials::{
@@ -25,6 +23,7 @@ use crate::push::push_remote_from;
 use crate::refs::listing::{
     compare_version_names, patterns_match_ls_remote, RefQueryOptions, RefSort, SortKey,
 };
+use crate::remote::error::RemoteError;
 use crate::repo::Repository;
 use crate::transfer::{
     fetch_local_into, push_local_from, FetchOptions, FetchOutcome, PrePushGate, PushOptions,
@@ -37,6 +36,7 @@ use crate::transport_path::{
 };
 use crate::url_rewrite;
 
+use crate::progress::CancelToken;
 #[cfg(feature = "http-ureq")]
 use crate::transport::http::ureq_client::UreqHttpClient;
 
@@ -47,81 +47,19 @@ pub mod http_client {
     pub use crate::transport::http::HttpClient;
 }
 
-/// Result of a remote operation ([`RemoteError`] on failure).
-pub type RemoteResult<T> = std::result::Result<T, RemoteError>;
-
 /// Default remote name when none is configured (`origin`, matching Git).
 pub const DEFAULT_REMOTE: &str = "origin";
 
 /// Whether `name` can name a remote: its tracking refs `refs/remotes/<name>/…` must be valid.
 #[must_use]
 pub(crate) fn is_valid_remote_name(name: &str) -> bool {
-    use crate::check_ref_format::{check_refname_format, RefNameOptions};
+    use crate::check_ref_format::{check_refname_format, RefFormatOptions};
     !name.is_empty()
         && check_refname_format(
             &format!("refs/remotes/{name}/test"),
-            &RefNameOptions::default(),
+            &RefFormatOptions::default(),
         )
         .is_ok()
-}
-
-/// Errors specific to remote URL resolution and dispatch.
-#[derive(Debug, Error)]
-pub enum RemoteError {
-    /// A remote has no URL: `remote.<name>.url` is unset or blank, or a literal URL was empty.
-    #[error("{}", match remote {
-        Some(name) => format!("remote '{name}' has no URL configured"),
-        None => "remote URL is empty".to_owned(),
-    })]
-    NoUrl {
-        /// The configured remote's name; `None` when an empty literal URL was given.
-        remote: Option<String>,
-    },
-    /// The URL uses a scheme grit does not support for remotes.
-    #[error("unsupported remote URL scheme")]
-    UnsupportedScheme,
-    /// A URL or path failed to parse.
-    #[error("{0}")]
-    InvalidUrl(String),
-    /// Smart HTTP requires the `http-ureq` feature or an injected HTTP client factory.
-    #[error("HTTP remotes require the http-ureq feature or an HttpClientFactory")]
-    HttpUnavailable,
-    /// The argument is neither a configured remote name nor a URL or path.
-    #[error("unknown remote '{0}'")]
-    UnknownRemote(String),
-    /// [`RepositoryRemotes::add`](crate::repo_handles::RepositoryRemotes::add) found an
-    /// existing `remote.<name>.*` section.
-    #[error("remote '{0}' already exists")]
-    RemoteExists(String),
-    /// The name cannot be used for a remote (`refs/remotes/<name>/…` would not be a valid ref).
-    #[error("'{0}' is not a valid remote name")]
-    InvalidRemoteName(String),
-    /// An underlying library error.
-    #[error(transparent)]
-    Library(#[from] Error),
-}
-
-impl RemoteError {
-    /// Whether the remote could not be read or written at all ([`Error::RemoteUnreadable`]).
-    #[must_use]
-    pub fn is_remote_unreadable(&self) -> bool {
-        matches!(self, Self::Library(e) if e.is_remote_unreadable())
-    }
-
-    /// Whether the operation was cancelled ([`Error::Cancelled`]).
-    #[must_use]
-    pub fn is_cancelled(&self) -> bool {
-        matches!(self, Self::Library(e) if e.is_cancelled())
-    }
-}
-
-impl From<RemoteError> for Error {
-    fn from(e: RemoteError) -> Self {
-        match e {
-            RemoteError::Library(err) => err,
-            other => Error::Message(other.to_string()),
-        }
-    }
 }
 
 /// A parsed remote URL by transport kind.
@@ -170,7 +108,7 @@ impl RemoteUrl {
 }
 
 impl TryFrom<&str> for RemoteUrl {
-    type Error = RemoteError;
+    type Error = crate::error::Error;
 
     fn try_from(url: &str) -> std::result::Result<Self, Self::Error> {
         parse_remote_url(url)
@@ -178,14 +116,17 @@ impl TryFrom<&str> for RemoteUrl {
 }
 
 /// Parse `url` into a [`RemoteUrl`] without applying config rewrites.
-pub fn parse_remote_url(url: &str) -> RemoteResult<RemoteUrl> {
+pub(crate) fn parse_remote_url(url: &str) -> crate::error::Result<RemoteUrl> {
     let url = url.trim();
     if url.is_empty() {
-        return Err(RemoteError::NoUrl { remote: None });
+        return Err(RemoteError::NoUrl { remote: None }.into());
     }
     if url.starts_with("file://") {
-        let path = crate::transport_path::file_url_to_local_path(url)
-            .map_err(|e| RemoteError::InvalidUrl(e.to_string()))?;
+        let path = crate::transport_path::file_url_to_local_path(url).map_err(|e| {
+            RemoteError::InvalidUrl {
+                detail: e.to_string(),
+            }
+        })?;
         let path = PathBuf::from(path);
         if crate::bundle_remote::is_bundle_path(&path) {
             return Ok(RemoteUrl::Bundle(path));
@@ -193,7 +134,9 @@ pub fn parse_remote_url(url: &str) -> RemoteResult<RemoteUrl> {
         return Ok(RemoteUrl::File(path));
     }
     if url.starts_with("git://") {
-        crate::transport::parse_git_url(url).map_err(|e| RemoteError::InvalidUrl(e.to_string()))?;
+        crate::transport::parse_git_url(url).map_err(|e| RemoteError::InvalidUrl {
+            detail: e.to_string(),
+        })?;
         return Ok(RemoteUrl::Git(url.to_owned()));
     }
     if url.starts_with("http://") {
@@ -203,7 +146,9 @@ pub fn parse_remote_url(url: &str) -> RemoteResult<RemoteUrl> {
         return Ok(RemoteUrl::Https(url.to_owned()));
     }
     if crate::transport::is_ssh_url(url) {
-        crate::transport::parse_ssh_url(url).map_err(|e| RemoteError::InvalidUrl(e.to_string()))?;
+        crate::transport::parse_ssh_url(url).map_err(|e| RemoteError::InvalidUrl {
+            detail: e.to_string(),
+        })?;
         return Ok(RemoteUrl::Ssh(url.to_owned()));
     }
     if is_local_path_remote_url(url) && url_is_local_not_ssh(url) {
@@ -213,7 +158,7 @@ pub fn parse_remote_url(url: &str) -> RemoteResult<RemoteUrl> {
         }
         return Ok(RemoteUrl::Local(path));
     }
-    Err(RemoteError::UnsupportedScheme)
+    Err(RemoteError::UnsupportedScheme.into())
 }
 
 /// A single reference returned by [`Remote::list_refs`].
@@ -299,7 +244,7 @@ pub trait HttpClientFactory: Send + Sync {
     /// # Errors
     ///
     /// Returns an error when the client cannot be constructed.
-    fn create(&self, config: &ConfigSet) -> RemoteResult<Box<dyn HttpClient>>;
+    fn create(&self, config: &ConfigSet) -> crate::error::Result<Box<dyn HttpClient>>;
 
     /// Create a client for a best-effort request whose failure the caller ignores,
     /// such as the advertisement [`load_push_plan_context`](crate::remote::push_plan::load_push_plan_context)
@@ -315,20 +260,21 @@ pub trait HttpClientFactory: Send + Sync {
     /// # Errors
     ///
     /// Returns an error when the client cannot be constructed.
-    fn create_for_probe(&self, config: &ConfigSet) -> RemoteResult<Box<dyn HttpClient>>;
+    fn create_for_preflight(&self, config: &ConfigSet)
+        -> crate::error::Result<Box<dyn HttpClient>>;
 }
 
-/// An [`HttpClientFactory`] whose clients are all [probes](HttpClientFactory::create_for_probe)
+/// An [`HttpClientFactory`] whose clients are all [preflight clients](HttpClientFactory::create_for_preflight)
 /// of the factory a request would otherwise use (the caller's, or the default one).
-pub(crate) struct ProbeHttpClientFactory<'a> {
+pub(crate) struct PreflightHttpClientFactory<'a> {
     inner: Option<&'a dyn HttpClientFactory>,
     #[cfg(feature = "http-ureq")]
     default: DefaultHttpClientFactory,
 }
 
-impl<'a> ProbeHttpClientFactory<'a> {
-    /// Probes of `inner`, or of the default factory for `repo` when there is none.
-    pub(crate) fn new(inner: Option<&'a dyn HttpClientFactory>, repo: &Repository) -> Self {
+impl<'a> PreflightHttpClientFactory<'a> {
+    /// Preflight clients for `inner`, or for the default factory for `repo` when there is none.
+    pub fn new(inner: Option<&'a dyn HttpClientFactory>, repo: &Repository) -> Self {
         #[cfg(not(feature = "http-ureq"))]
         let _ = repo;
         Self {
@@ -339,23 +285,26 @@ impl<'a> ProbeHttpClientFactory<'a> {
     }
 }
 
-impl HttpClientFactory for ProbeHttpClientFactory<'_> {
-    fn create(&self, config: &ConfigSet) -> RemoteResult<Box<dyn HttpClient>> {
+impl HttpClientFactory for PreflightHttpClientFactory<'_> {
+    fn create(&self, config: &ConfigSet) -> crate::error::Result<Box<dyn HttpClient>> {
         if let Some(inner) = self.inner {
-            return inner.create_for_probe(config);
+            return inner.create_for_preflight(config);
         }
         #[cfg(feature = "http-ureq")]
         {
-            self.default.create_for_probe(config)
+            self.default.create_for_preflight(config)
         }
         #[cfg(not(feature = "http-ureq"))]
         {
             let _ = config;
-            Err(RemoteError::HttpUnavailable)
+            Err(RemoteError::HttpUnavailable.into())
         }
     }
 
-    fn create_for_probe(&self, config: &ConfigSet) -> RemoteResult<Box<dyn HttpClient>> {
+    fn create_for_preflight(
+        &self,
+        config: &ConfigSet,
+    ) -> crate::error::Result<Box<dyn HttpClient>> {
         self.create(config)
     }
 }
@@ -419,11 +368,18 @@ impl DefaultHttpClientFactory {
     }
 
     fn client(
+        &self,
         config: &ConfigSet,
         provider: Box<dyn CredentialProvider + Send + Sync>,
-    ) -> RemoteResult<Box<dyn HttpClient>> {
-        let client = UreqHttpClient::from_config(config)
-            .map_err(|e| RemoteError::InvalidUrl(e.to_string()))?
+    ) -> crate::error::Result<Box<dyn HttpClient>> {
+        let environment = match &self.environment {
+            Some(env) => env,
+            None => &crate::environment::Environment::empty(),
+        };
+        let client = UreqHttpClient::from_config(config, environment)
+            .map_err(|e| RemoteError::InvalidUrl {
+                detail: e.to_string(),
+            })?
             .with_credential_provider(provider);
         Ok(Box::new(client))
     }
@@ -431,12 +387,15 @@ impl DefaultHttpClientFactory {
 
 #[cfg(feature = "http-ureq")]
 impl HttpClientFactory for DefaultHttpClientFactory {
-    fn create(&self, config: &ConfigSet) -> RemoteResult<Box<dyn HttpClient>> {
-        Self::client(config, Box::new(self.credential_provider(config)))
+    fn create(&self, config: &ConfigSet) -> crate::error::Result<Box<dyn HttpClient>> {
+        self.client(config, Box::new(self.credential_provider(config)))
     }
 
-    fn create_for_probe(&self, config: &ConfigSet) -> RemoteResult<Box<dyn HttpClient>> {
-        Self::client(
+    fn create_for_preflight(
+        &self,
+        config: &ConfigSet,
+    ) -> crate::error::Result<Box<dyn HttpClient>> {
+        self.client(
             config,
             Box::new(KeepRejectedCredentials(self.credential_provider(config))),
         )
@@ -462,20 +421,20 @@ impl Remote {
     /// # Errors
     ///
     /// Returns [`RemoteError::NoUrl`] when the remote has no URL.
-    pub fn from_config(config: &ConfigSet, name: &str) -> RemoteResult<Self> {
+    pub fn from_config(config: &ConfigSet, name: &str) -> crate::error::Result<Self> {
         let raw_url = config
-            .get(&format!("remote.{name}.url"))
+            .value(&format!("remote.{name}.url"))
             .filter(|u| !u.trim().is_empty())
             .ok_or_else(|| RemoteError::NoUrl {
                 remote: Some(name.to_owned()),
             })?;
         let fetch_url = url_rewrite::rewrite_fetch_url(config, &raw_url);
         let push_source = config
-            .get(&format!("remote.{name}.pushurl"))
+            .value(&format!("remote.{name}.pushurl"))
             .filter(|u| !u.trim().is_empty())
             .unwrap_or_else(|| raw_url.clone());
         let push_url = url_rewrite::rewrite_push_url(config, push_source.as_str());
-        let mut fetch_refspecs = config.get_all(&format!("remote.{name}.fetch"));
+        let mut fetch_refspecs = config.values_all(&format!("remote.{name}.fetch"));
         fetch_refspecs.retain(|s| !s.trim().is_empty());
         if fetch_refspecs.is_empty() {
             fetch_refspecs = vec![format!("+refs/heads/*:refs/remotes/{name}/*")];
@@ -500,7 +459,7 @@ impl Remote {
     /// # Errors
     ///
     /// Returns an error when `url` is empty or unsupported.
-    pub fn from_url(url: &str) -> RemoteResult<Self> {
+    pub fn from_url(url: &str) -> crate::error::Result<Self> {
         Ok(Self {
             name: None,
             fetch_url: RemoteUrl::try_from(url)?,
@@ -529,16 +488,16 @@ impl Remote {
     /// # Errors
     ///
     /// Returns [`RemoteError`] or transport errors on failure. Received pack bytes are written
-    /// into the repository's [`OdbBuilder::primary`](crate::odb::OdbBuilder::primary) store
+    /// into the repository's [`RepositoryOptions::with_object_store`](crate::environment::RepositoryOptions::with_object_store) store
     /// (including custom backends) via [`ingest_received_pack`](crate::index_pack::ingest_received_pack).
     pub fn fetch(
         &self,
         repo: &Repository,
         mut opts: FetchOptions,
         progress: &mut dyn Progress,
-        cancel: &dyn crate::progress::Cancel,
+        cancel: &crate::progress::CancelToken,
         http_factory: Option<&dyn HttpClientFactory>,
-    ) -> RemoteResult<FetchOutcome> {
+    ) -> crate::error::Result<FetchOutcome> {
         if opts.configured_refspecs.is_empty() {
             opts.configured_refspecs = self.fetch_refspecs.clone();
         }
@@ -555,12 +514,23 @@ impl Remote {
             opts.diagnostics = Some(repo.diagnostics());
             opts.network_trace = repo.network_trace_enabled();
         }
-        let connect = ConnectOptions {
-            protocol_version: 2,
+        let protocol_version = upload_pack_protocol_version(opts.http_protocol_version, repo)?;
+        if opts.http_protocol_version.is_none() {
+            opts.http_protocol_version = Some(protocol_version);
+        }
+        let (stack_watch, _wait_guard) = crate::progress::HttpWaitGuard::bind(cancel);
+        let mut connect = ConnectOptions {
+            protocol_version,
             diagnostics: opts.diagnostics.clone(),
             network_trace: opts.network_trace,
+            cancel: Some(crate::progress::connect_cancel_arc(
+                cancel,
+                std::sync::Arc::clone(&stack_watch),
+            )),
+            stack_watch,
             ..Default::default()
         };
+        connect.bind_stack_cancel(cancel);
         self.dispatch_fetch(
             repo,
             &self.fetch_url,
@@ -584,7 +554,7 @@ impl Remote {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Cancelled`] (see [`RemoteError::is_cancelled`]) once `cancel`
+    /// Returns [`Error::Cancelled`] (see [`Error::is_cancelled`]) once `cancel`
     /// fires, or [`RemoteError`] / transport errors on failure. The pack is built from
     /// [`Odb::read_store`](crate::odb::Odb::read_store), including custom primaries.
     pub fn push(
@@ -593,17 +563,18 @@ impl Remote {
         refs: &[PushRefSpec],
         mut opts: PushOptions,
         progress: &mut dyn Progress,
-        cancel: &dyn crate::progress::Cancel,
+        cancel: &crate::progress::CancelToken,
         http_factory: Option<&dyn HttpClientFactory>,
-    ) -> RemoteResult<PushOutcome> {
+    ) -> crate::error::Result<PushOutcome> {
         if opts.tracking_remote.is_none() {
             opts.tracking_remote = self.name.clone();
         }
         if opts.resumable_threshold.is_none() {
             opts.resumable_threshold = repo
                 .config()
+                .snapshot()
                 .ok()
-                .and_then(|c| c.get_i64("push.bundleThreshold").and_then(|r| r.ok()))
+                .and_then(|c| c.get_i64("push.bundleThreshold").ok().flatten())
                 .and_then(|v| u64::try_from(v).ok());
         }
         let url = pre_push_hook_url(self.push_url());
@@ -621,11 +592,21 @@ impl Remote {
             progress,
             cancel,
             http_factory,
-            ConnectOptions {
-                protocol_version: 0,
-                diagnostics: Some(repo.diagnostics()),
-                network_trace: repo.network_trace_enabled(),
-                ..Default::default()
+            {
+                let (stack_watch, _wait_guard) = crate::progress::HttpWaitGuard::bind(cancel);
+                let mut connect = ConnectOptions {
+                    protocol_version: 0,
+                    diagnostics: Some(repo.diagnostics()),
+                    network_trace: repo.network_trace_enabled(),
+                    cancel: Some(crate::progress::connect_cancel_arc(
+                        cancel,
+                        std::sync::Arc::clone(&stack_watch),
+                    )),
+                    stack_watch,
+                    ..Default::default()
+                };
+                connect.bind_stack_cancel(cancel);
+                connect
             },
         )
     }
@@ -645,16 +626,16 @@ impl Remote {
     /// - `cancel`: checked while the bundle is downloaded and unpacked; a
     ///   cancelled seed comes back as `Failed`, so callers check `cancel` again.
     /// - `http_factory`: builds the HTTP client, as for [`Self::fetch`]. Seeding is
-    ///   best-effort, so it uses a [probe client](HttpClientFactory::create_for_probe):
+    ///   best-effort, so it uses a [preflight client](HttpClientFactory::create_for_preflight):
     ///   credentials the server refuses stay stored for the fetch that follows to
     ///   report.
     #[must_use]
-    pub fn seed_from_bundle_uri(
+    pub(crate) fn seed_from_bundle_uri(
         &self,
         repo: &Repository,
         cache_dir: &Path,
         progress: &mut dyn Progress,
-        cancel: &dyn crate::progress::Cancel,
+        cancel: &crate::progress::CancelToken,
         http_factory: Option<&dyn HttpClientFactory>,
     ) -> crate::bundle_uri::BundleSeed {
         use crate::bundle_uri::BundleSeed;
@@ -663,13 +644,13 @@ impl Remote {
         };
         let enabled = repo
             .config()
+            .snapshot()
             .ok()
-            .and_then(|c| c.get_bool("transfer.bundleURI").and_then(|r| r.ok()))
-            .unwrap_or(true);
+            .is_none_or(|c| c.bool_with_default("transfer.bundleURI", true));
         if !enabled {
             return BundleSeed::NotOffered;
         }
-        let probe = ProbeHttpClientFactory::new(http_factory, repo);
+        let probe = PreflightHttpClientFactory::new(http_factory, repo);
         let client = match http_client(Some(&probe), repo) {
             Ok(c) => c,
             Err(e) => {
@@ -679,9 +660,20 @@ impl Remote {
                 }
             }
         };
+        let (stack_watch, _wait_guard) = crate::progress::HttpWaitGuard::bind(cancel);
+        let mut connect = ConnectOptions {
+            cancel: Some(crate::progress::connect_cancel_arc(
+                cancel,
+                std::sync::Arc::clone(&stack_watch),
+            )),
+            stack_watch,
+            ..Default::default()
+        };
+        connect.bind_stack_cancel(cancel);
+        client.set_operation_cancel(connect.cancel.clone());
         crate::bundle_uri::seed_from_bundle_uri(
             repo,
-            client.as_ref(),
+            std::sync::Arc::from(client),
             url,
             cache_dir,
             progress,
@@ -701,7 +693,7 @@ impl Remote {
         repo: Option<&Repository>,
         opts: &ListRefsOptions,
         http_factory: Option<&dyn HttpClientFactory>,
-    ) -> RemoteResult<Vec<RemoteRef>> {
+    ) -> crate::error::Result<Vec<RemoteRef>> {
         let (git_dir, work_tree, odb) = repo_context(repo);
         match &self.fetch_url {
             RemoteUrl::Bundle(path) => list_refs_from_bundle(path, opts),
@@ -727,14 +719,13 @@ impl Remote {
         &self,
         repo: &Repository,
         http_factory: Option<&dyn HttpClientFactory>,
-    ) -> RemoteResult<Vec<RemoteRef>> {
+    ) -> crate::error::Result<Vec<RemoteRef>> {
         let url = self.push_url();
         match url {
-            RemoteUrl::Bundle(_) => Err(RemoteError::UnsupportedScheme),
+            RemoteUrl::Bundle(_) => Err(RemoteError::UnsupportedScheme.into()),
             RemoteUrl::Local(_) | RemoteUrl::File(_) => {
                 let remote_git = local_git_dir_from_url(url, repo.git_dir(), repo.work_tree())?;
-                let refs =
-                    crate::refs::list_refs(&remote_git, "refs/").map_err(RemoteError::Library)?;
+                let refs = crate::refs::list_refs(&remote_git, "refs/")?;
                 Ok(refs
                     .into_iter()
                     .map(|(name, oid)| RemoteRef {
@@ -762,18 +753,24 @@ impl Remote {
         url: &RemoteUrl,
         opts: &mut FetchOptions,
         progress: &mut dyn Progress,
-        cancel: &dyn crate::progress::Cancel,
+        cancel: &crate::progress::CancelToken,
         http_factory: Option<&dyn HttpClientFactory>,
         connect: ConnectOptions,
-    ) -> RemoteResult<FetchOutcome> {
+    ) -> crate::error::Result<FetchOutcome> {
         match url {
             RemoteUrl::Bundle(path) => Ok(crate::bundle_remote::fetch_from_bundle_into(
                 repo, path, opts, progress, cancel,
             )?),
             RemoteUrl::Local(_) | RemoteUrl::File(_) => {
                 let remote_git = local_git_dir_from_url(url, repo.git_dir(), repo.work_tree())?;
-                let cfg = ConfigSet::load(&opts.environment, Some(repo.git_dir()), true)
-                    .map_err(RemoteError::Library)?;
+                let cfg = ConfigSet::load(
+                    &opts.environment,
+                    Some(repo.git_dir()),
+                    &crate::config::LoadConfigOptions::standard(
+                        &opts.environment,
+                        Some(repo.git_dir()),
+                    ),
+                )?;
                 if opts.filter.is_none() {
                     if let Some(name) = opts.remote_name.as_deref().or(self.name.as_deref()) {
                         opts.filter = crate::partial_clone::stored_remote_filter(&cfg, name);
@@ -803,21 +800,21 @@ impl Remote {
                         &connect,
                         client_env,
                         repo.caches().promisor_fetcher(),
-                    )
-                    .map_err(RemoteError::Library)?;
+                    )?;
                     let fetched = fetch_remote_into(repo, &mut *conn, opts, progress, cancel);
                     // A serving side that failed knows why (the client may only have
                     // seen the stream end early, or even taken it as an empty pack), so
                     // its error comes first.
-                    conn.finish().map_err(RemoteError::Library)?;
-                    return Ok(fetched?);
+                    conn.finish()?;
+                    return fetched;
                 }
                 Ok(fetch_local_into(repo, &remote_git, opts, progress, cancel)?)
             }
             RemoteUrl::Http(u) | RemoteUrl::Https(u) => {
-                let client: Arc<dyn HttpClient> = Arc::from(http_client(http_factory, repo)?);
+                let client = http_client_for_operation(http_factory, repo, connect.cancel.clone())?;
                 let transport = SmartHttpTransport::new(client);
-                let mut conn = transport.connect(u, Service::UploadPack, &connect)?;
+                let mut conn =
+                    transport.connect_with_owner(u, Service::UploadPack, &connect, cancel)?;
                 Ok(fetch_remote_into(repo, &mut *conn, opts, progress, cancel)?)
             }
             RemoteUrl::Git(u) => {
@@ -842,10 +839,10 @@ impl Remote {
         opts: &PushOptions,
         pre_push: Option<&PrePushGate<'_>>,
         progress: &mut dyn Progress,
-        cancel: &dyn crate::progress::Cancel,
+        cancel: &crate::progress::CancelToken,
         http_factory: Option<&dyn HttpClientFactory>,
         connect: ConnectOptions,
-    ) -> RemoteResult<PushOutcome> {
+    ) -> crate::error::Result<PushOutcome> {
         let mut over_wire = |conn: &mut dyn crate::transport::Connection| {
             push_remote_from(repo, conn, refs, opts, progress, cancel, pre_push)
         };
@@ -863,9 +860,10 @@ impl Remote {
                 )?)
             }
             RemoteUrl::Http(u) | RemoteUrl::Https(u) => {
-                let client: Arc<dyn HttpClient> = Arc::from(http_client(http_factory, repo)?);
-                let transport = SmartHttpTransport::new(client.clone());
-                let mut conn = transport.connect(u, Service::ReceivePack, &connect)?;
+                let client = http_client_for_operation(http_factory, repo, connect.cancel.clone())?;
+                let transport = SmartHttpTransport::new(Arc::clone(&client));
+                let mut conn =
+                    transport.connect_with_owner(u, Service::ReceivePack, &connect, cancel)?;
                 Ok(crate::push::push_remote_with(
                     repo,
                     &mut *conn,
@@ -890,7 +888,7 @@ impl Remote {
                 let mut conn = transport.connect(u, Service::ReceivePack, &connect)?;
                 Ok(over_wire(&mut *conn)?)
             }
-            RemoteUrl::Bundle(_) => Err(RemoteError::UnsupportedScheme),
+            RemoteUrl::Bundle(_) => Err(RemoteError::UnsupportedScheme.into()),
         }
     }
 
@@ -902,8 +900,12 @@ impl Remote {
         opts: &ListRefsOptions,
         http_factory: Option<&dyn HttpClientFactory>,
         repo: Option<&Repository>,
-    ) -> RemoteResult<Vec<RemoteRef>> {
+    ) -> crate::error::Result<Vec<RemoteRef>> {
         let wire = url.as_wire_url().ok_or(RemoteError::UnsupportedScheme)?;
+        let mut opts = opts.clone();
+        if opts.protocol_version.is_none() {
+            opts.protocol_version = Some(list_refs_protocol_version(None, repo)?);
+        }
         let requested = opts.protocol_version.unwrap_or(2);
         let connect_opts = ConnectOptions {
             protocol_version: requested,
@@ -911,17 +913,17 @@ impl Remote {
         };
         match url {
             RemoteUrl::Http(_) | RemoteUrl::Https(_) => {
-                list_refs_http(wire, local_git_dir, odb, opts, http_factory, repo)
+                list_refs_http(wire, local_git_dir, odb, &opts, http_factory, repo)
             }
             RemoteUrl::Git(_) => {
                 let mut conn =
                     GitDaemonTransport::new().connect(wire, Service::UploadPack, &connect_opts)?;
-                list_refs_from_connection(&mut *conn, local_git_dir, odb, opts)
+                list_refs_from_connection(&mut *conn, local_git_dir, odb, &opts)
             }
             RemoteUrl::Ssh(_) => {
                 let transport = ssh_transport(repo, None);
                 let mut conn = transport.connect(wire, Service::UploadPack, &connect_opts)?;
-                list_refs_from_connection(&mut *conn, local_git_dir, odb, opts)
+                list_refs_from_connection(&mut *conn, local_git_dir, odb, &opts)
             }
             RemoteUrl::Local(_) | RemoteUrl::File(_) | RemoteUrl::Bundle(_) => unreachable!(),
         }
@@ -943,18 +945,47 @@ fn repo_context(repo: Option<&Repository>) -> (&Path, Option<&Path>, Option<Odb>
     }
 }
 
+fn upload_pack_protocol_version(
+    explicit: Option<u8>,
+    repo: &Repository,
+) -> crate::error::Result<u8> {
+    if let Some(v) = explicit {
+        return Ok(v);
+    }
+    crate::protocol::try_effective_client_protocol_version_from_config(
+        repo.config().snapshot()?.as_ref(),
+    )
+}
+
+fn list_refs_protocol_version(
+    explicit: Option<u8>,
+    repo: Option<&Repository>,
+) -> crate::error::Result<u8> {
+    if let Some(v) = explicit {
+        return Ok(v);
+    }
+    if let Some(repo) = repo {
+        return upload_pack_protocol_version(None, repo);
+    }
+    Ok(2)
+}
+
 /// Whether the local repository at `git_dir` has promisor remotes of its own
 /// (only its own config counts, as for any served repository's partial state).
 fn local_source_has_promisor_remotes(git_dir: &Path) -> bool {
-    ConfigSet::load_repo_local_only(git_dir)
-        .is_ok_and(|cfg| crate::promisor::repo_treats_promisor_packs(git_dir, &cfg))
+    ConfigSet::load(
+        &crate::environment::Environment::empty(),
+        Some(git_dir),
+        &crate::config::LoadConfigOptions::repo_local_only(git_dir),
+    )
+    .is_ok_and(|cfg| crate::promisor::repo_treats_promisor_packs(&cfg))
 }
 
 fn local_git_dir_from_url(
     url: &RemoteUrl,
     git_dir: &Path,
     work_tree: Option<&Path>,
-) -> RemoteResult<PathBuf> {
+) -> crate::error::Result<PathBuf> {
     let s = url.to_url_string();
     let remote_git = resolve_local_remote_git_dir(&s, git_dir, work_tree);
     crate::transfer::ensure_local_remote_repository(&remote_git)?;
@@ -972,10 +1003,14 @@ fn ssh_transport(
     let env = ssh_wire_environment(repo, fetch_env);
     transport = transport.with_ssh_environment(std::sync::Arc::new(env.clone()));
     if let Some(r) = repo {
-        if let Ok(config) = r.config() {
+        if let Ok(config) = r.config().snapshot() {
             transport = transport.with_ssh_config(config);
         }
-    } else if let Ok(config) = ConfigSet::load(&env, None, true) {
+    } else if let Ok(config) = ConfigSet::load(
+        &env,
+        None,
+        &crate::config::LoadConfigOptions::standard(&env, None),
+    ) {
         transport = transport.with_ssh_config(Arc::new(config));
     }
     transport
@@ -996,11 +1031,31 @@ fn ssh_wire_environment(
         .unwrap_or_else(crate::environment::Environment::capture_process)
 }
 
+#[cfg(feature = "http-ureq")]
+fn http_client_for_operation(
+    factory: Option<&dyn HttpClientFactory>,
+    repo: &Repository,
+    cancel: Option<std::sync::Arc<CancelToken>>,
+) -> crate::error::Result<Arc<dyn HttpClient>> {
+    let client = http_client(factory, repo)?;
+    client.set_operation_cancel(cancel);
+    Ok(Arc::from(client))
+}
+
+#[cfg(not(feature = "http-ureq"))]
+fn http_client_for_operation(
+    factory: Option<&dyn HttpClientFactory>,
+    repo: &Repository,
+    _cancel: Option<std::sync::Arc<CancelToken>>,
+) -> crate::error::Result<Arc<dyn HttpClient>> {
+    Ok(Arc::from(http_client(factory, repo)?))
+}
+
 fn http_client(
     factory: Option<&dyn HttpClientFactory>,
     repo: &Repository,
-) -> RemoteResult<Box<dyn HttpClient>> {
-    let config = repo.config().map_err(RemoteError::Library)?;
+) -> crate::error::Result<Box<dyn HttpClient>> {
+    let config = repo.config().snapshot()?;
     if let Some(f) = factory {
         return f.create(config.as_ref());
     }
@@ -1012,7 +1067,7 @@ fn http_client(
     #[cfg(not(feature = "http-ureq"))]
     {
         let _ = config;
-        Err(RemoteError::HttpUnavailable)
+        Err(RemoteError::HttpUnavailable.into())
     }
 }
 
@@ -1023,9 +1078,9 @@ fn list_refs_http(
     opts: &ListRefsOptions,
     http_factory: Option<&dyn HttpClientFactory>,
     repo: Option<&Repository>,
-) -> RemoteResult<Vec<RemoteRef>> {
+) -> crate::error::Result<Vec<RemoteRef>> {
     let config: Arc<ConfigSet> = if let Some(r) = repo {
-        r.config().map_err(RemoteError::Library)?
+        r.config().snapshot()?
     } else {
         Arc::new(ConfigSet::new())
     };
@@ -1041,7 +1096,7 @@ fn list_refs_http(
             }
             #[cfg(not(feature = "http-ureq"))]
             {
-                return Err(RemoteError::HttpUnavailable);
+                return Err(RemoteError::HttpUnavailable.into());
             }
         }
     };
@@ -1059,9 +1114,7 @@ fn list_refs_http(
 
     let info_url = crate::transport::http::smart_info_refs_discovery_url(repo_url);
     let want_v2 = opts.protocol_version.unwrap_or(2) >= 2;
-    let (body, final_url) = client
-        .get_with_final_url_exact(&info_url, git_protocol)
-        .map_err(RemoteError::Library)?;
+    let (body, final_url) = client.get_following_redirects(&info_url, git_protocol)?;
     let effective_base =
         crate::transport::http::rebased_base_from_redirect(repo_url, final_url.as_deref())
             .unwrap_or_else(|| repo_url.to_owned());
@@ -1072,27 +1125,22 @@ fn list_refs_http(
                 client.as_ref(),
                 &effective_base,
                 git_protocol,
-            )
-            .map_err(RemoteError::Library)?
+            )?
         } else {
-            crate::transport::http::discover_upload_pack_for_list_refs_from_body(&body)
-                .map_err(RemoteError::Library)?
+            crate::transport::http::discover_upload_pack_for_list_refs_from_body(&body)?
         };
 
     if protocol_version >= 2 && want_v2 {
         let local_odb = odb.cloned().unwrap_or_else(|| open_odb(local_git_dir));
         let req = build_list_refs_v2_request(&caps, &local_odb, opts)?;
         let post_url = format!("{}/git-upload-pack", effective_base.trim_end_matches('/'));
-        let body = client
-            .as_ref()
-            .post(
-                &post_url,
-                "application/x-git-upload-pack-request",
-                "application/x-git-upload-pack-result",
-                &req,
-                git_protocol,
-            )
-            .map_err(RemoteError::Library)?;
+        let body = client.as_ref().post(
+            &post_url,
+            "application/x-git-upload-pack-request",
+            "application/x-git-upload-pack-result",
+            &req,
+            git_protocol,
+        )?;
         let mut cur = Cursor::new(body);
         parse_list_refs_v2_response(&mut cur, opts, head_symref)
     } else {
@@ -1105,14 +1153,14 @@ fn list_refs_from_connection(
     local_git_dir: &Path,
     odb: Option<&Odb>,
     opts: &ListRefsOptions,
-) -> RemoteResult<Vec<RemoteRef>> {
+) -> crate::error::Result<Vec<RemoteRef>> {
     let want_v2 = opts.protocol_version.unwrap_or(2) >= 2;
     if conn.protocol_version() >= 2 && want_v2 {
         list_refs_v2_connection(conn, local_git_dir, odb, opts)
     } else {
         let out =
             list_refs_v0_advertisement(conn.advertised_refs(), conn.head_symref(), odb, opts)?;
-        crate::transport::send_client_flush(conn).map_err(RemoteError::Library)?;
+        crate::transport::send_client_flush(conn)?;
         Ok(out)
     }
 }
@@ -1126,7 +1174,7 @@ fn list_refs_v2_connection(
     local_git_dir: &Path,
     odb: Option<&Odb>,
     opts: &ListRefsOptions,
-) -> RemoteResult<Vec<RemoteRef>> {
+) -> crate::error::Result<Vec<RemoteRef>> {
     let local_odb = odb.cloned().unwrap_or_else(|| open_odb(local_git_dir));
     let req = build_list_refs_v2_request(conn.capabilities(), &local_odb, opts)?;
     conn.writer().write_all(&req).map_err(Error::Io)?;
@@ -1141,7 +1189,7 @@ fn build_list_refs_v2_request(
     server_caps: &[String],
     local_odb: &Odb,
     opts: &ListRefsOptions,
-) -> RemoteResult<Vec<u8>> {
+) -> crate::error::Result<Vec<u8>> {
     use crate::fetch::v2_object_format;
     use crate::pkt_line;
     use crate::protocol_v2;
@@ -1171,9 +1219,6 @@ fn build_list_refs_v2_request(
     if opts.peel {
         pkt_line::write_line(&mut req, "peel").map_err(Error::Io)?;
     }
-    if list_refs_includes_head(opts) {
-        pkt_line::write_line(&mut req, "ref-prefix HEAD").map_err(Error::Io)?;
-    }
     for prefix in list_ref_prefixes(opts) {
         pkt_line::write_line(&mut req, &format!("ref-prefix {prefix}")).map_err(Error::Io)?;
     }
@@ -1182,35 +1227,34 @@ fn build_list_refs_v2_request(
 }
 
 fn list_refs_includes_head(opts: &ListRefsOptions) -> bool {
-    !opts.heads && !opts.tags && opts.prefixes.is_empty()
+    !opts.heads && !opts.tags
 }
 
 fn list_ref_prefixes(opts: &ListRefsOptions) -> Vec<String> {
-    if !opts.prefixes.is_empty() {
-        if opts.heads && !opts.tags {
-            return vec!["refs/heads/".to_owned()];
-        }
-        if opts.tags && !opts.heads {
-            return vec!["refs/tags/".to_owned()];
-        }
-        return vec!["refs/heads/".to_owned(), "refs/tags/".to_owned()];
-    }
     let mut out = Vec::new();
-    let all = !opts.heads && !opts.tags;
-    if all || opts.heads {
+    if opts.heads {
         out.push("refs/heads/".to_owned());
     }
-    if all || opts.tags {
+    if opts.tags {
         out.push("refs/tags/".to_owned());
     }
     out
+}
+
+fn list_refs_scan_prefixes(opts: &ListRefsOptions) -> Vec<String> {
+    let wire = list_ref_prefixes(opts);
+    if wire.is_empty() {
+        vec!["refs/".to_owned()]
+    } else {
+        wire
+    }
 }
 
 fn parse_list_refs_v2_response(
     reader: &mut dyn Read,
     opts: &ListRefsOptions,
     mut head_symref: Option<String>,
-) -> RemoteResult<Vec<RemoteRef>> {
+) -> crate::error::Result<Vec<RemoteRef>> {
     use crate::fetch::parse_ls_refs_v2_line;
     use crate::pkt_line;
 
@@ -1224,12 +1268,7 @@ fn parse_list_refs_v2_response(
             Some(pkt_line::Packet::ResponseEnd) => break,
             Some(pkt_line::Packet::Data(line)) => {
                 let line = line.trim_end_matches('\n');
-                if let Some(msg) = line.strip_prefix("ERR ") {
-                    return Err(RemoteError::Library(Error::Message(format!(
-                        "remote error: {}",
-                        msg.trim_end()
-                    ))));
-                }
+                pkt_line::reject_err_line(line)?;
                 if let Some(t) = crate::fetch::parse_v2_ls_refs_unborn_head_symref(line) {
                     head_symref = Some(t);
                     continue;
@@ -1279,7 +1318,7 @@ fn list_refs_v0_advertisement(
     head_symref: Option<&str>,
     odb: Option<&Odb>,
     opts: &ListRefsOptions,
-) -> RemoteResult<Vec<RemoteRef>> {
+) -> crate::error::Result<Vec<RemoteRef>> {
     let mut entries: Vec<RemoteRef> = Vec::new();
     let mut peel_map: std::collections::HashMap<String, ObjectId> =
         std::collections::HashMap::new();
@@ -1305,7 +1344,7 @@ fn finalize_list_refs_output(
     opts: &ListRefsOptions,
     head_symref: Option<String>,
     odb: Option<&Odb>,
-) -> RemoteResult<Vec<RemoteRef>> {
+) -> crate::error::Result<Vec<RemoteRef>> {
     entries.retain(|e| remote_ref_matches_namespace(&e.name, opts));
     entries.retain(|e| patterns_match_ls_remote(&e.name, &opts.prefixes));
     if opts.peel {
@@ -1331,14 +1370,16 @@ fn finalize_list_refs_output(
         }
         entries.extend(peel_lines);
     }
-    if list_refs_includes_head(opts) {
+    if list_refs_includes_head(opts) && ref_matches_list_opts("HEAD", opts) {
         if let Some(sym) = head_symref {
             if let Some(oid) = entries.iter().find(|e| e.name == sym).map(|e| e.oid) {
-                entries.push(RemoteRef {
-                    name: "HEAD".to_owned(),
-                    oid,
-                    symref_target: if opts.symrefs { Some(sym) } else { None },
-                });
+                if !entries.iter().any(|e| e.name == "HEAD") {
+                    entries.push(RemoteRef {
+                        name: "HEAD".to_owned(),
+                        oid,
+                        symref_target: if opts.symrefs { Some(sym) } else { None },
+                    });
+                }
             }
         }
     }
@@ -1365,7 +1406,8 @@ fn finalize_list_refs_output(
 ///
 /// Never panics.
 #[must_use]
-pub fn query_remote_refs_in_memory(
+#[allow(dead_code)]
+pub(crate) fn query_remote_refs_in_memory(
     mut entries: Vec<RemoteRef>,
     opts: &ListRefsOptions,
     query_options: &RefQueryOptions,
@@ -1432,16 +1474,19 @@ fn ref_matches_list_opts(refname: &str, opts: &ListRefsOptions) -> bool {
 
 /// Returns `true` when `refname` matches one of `patterns`, or when `patterns` is empty.
 #[must_use]
-pub fn ref_matches_ls_remote_patterns(refname: &str, patterns: &[String]) -> bool {
+#[allow(dead_code)]
+pub(crate) fn ref_matches_ls_remote_patterns(refname: &str, patterns: &[String]) -> bool {
     patterns_match_ls_remote(refname, patterns)
 }
 
 /// List references from a on-disk git directory (local / `file://` remotes).
 ///
 /// # Errors
-fn list_refs_from_bundle(path: &Path, opts: &ListRefsOptions) -> RemoteResult<Vec<RemoteRef>> {
-    let bundle = crate::bundle::Bundle::open(path)
-        .map_err(|e| RemoteError::Library(Error::Message(e.to_string())))?;
+fn list_refs_from_bundle(
+    path: &Path,
+    opts: &ListRefsOptions,
+) -> crate::error::Result<Vec<RemoteRef>> {
+    let bundle = crate::bundle::Bundle::open(path).map_err(RemoteError::Bundle)?;
     let mut out = Vec::new();
     for (name, oid) in &bundle.header().refs {
         if !ref_matches_list_opts(name, opts) {
@@ -1468,7 +1513,7 @@ pub(crate) fn list_refs_from_git_dir_for_fetch(
     git_dir: &Path,
     odb: Option<&Odb>,
     refspecs: &[String],
-) -> RemoteResult<Vec<RemoteRef>> {
+) -> crate::error::Result<Vec<RemoteRef>> {
     let prefixes = crate::fetch::fetch_ref_list_prefixes(refspecs);
     let opts = ListRefsOptions {
         symrefs: true,
@@ -1477,14 +1522,22 @@ pub(crate) fn list_refs_from_git_dir_for_fetch(
     list_refs_from_git_dir_with_scan_prefixes(git_dir, odb, &opts, &prefixes)
 }
 
+/// List refs of the repository at `git_dir`, as `ls-remote` on a local path would.
 ///
-/// Returns [`RemoteError::Library`] on I/O or ref resolution failures.
-pub fn list_refs_from_git_dir(
+/// With [`ListRefsOptions::peel`], annotated tags are peeled through `odb`; pass the
+/// repository's [`Odb`] when one is open (for example
+/// [`Repository::odb`](crate::repo::Repository::odb)), so a custom object store is used.
+/// When `odb` is `None` the files object database of `git_dir`'s common directory is opened.
+///
+/// # Errors
+///
+/// Returns [`RemoteError::from`] on I/O or ref resolution failures.
+pub(crate) fn list_refs_from_git_dir(
     git_dir: &Path,
     odb: Option<&Odb>,
     opts: &ListRefsOptions,
-) -> RemoteResult<Vec<RemoteRef>> {
-    list_refs_from_git_dir_with_scan_prefixes(git_dir, odb, opts, &list_ref_prefixes(opts))
+) -> crate::error::Result<Vec<RemoteRef>> {
+    list_refs_from_git_dir_with_scan_prefixes(git_dir, odb, opts, &list_refs_scan_prefixes(opts))
 }
 
 fn list_refs_from_git_dir_with_scan_prefixes(
@@ -1492,7 +1545,7 @@ fn list_refs_from_git_dir_with_scan_prefixes(
     odb: Option<&Odb>,
     opts: &ListRefsOptions,
     scan_prefixes: &[String],
-) -> RemoteResult<Vec<RemoteRef>> {
+) -> crate::error::Result<Vec<RemoteRef>> {
     let mut lazy_odb: Option<Odb> = None;
 
     let mut entries = Vec::new();
@@ -1524,7 +1577,7 @@ fn list_refs_from_git_dir_with_scan_prefixes(
     }
 
     for prefix in scan_prefixes {
-        let listed = crate::refs::list_refs(git_dir, prefix).map_err(RemoteError::Library)?;
+        let listed = crate::refs::list_refs(git_dir, prefix)?;
         for (name, oid) in listed {
             if let Some(branch_tail) = name.strip_prefix("refs/heads/") {
                 if branch_tail.starts_with("refs/") {
@@ -1544,10 +1597,7 @@ fn list_refs_from_git_dir_with_scan_prefixes(
                 if should_emit_peel_line(&peel_name, &opts.prefixes) {
                     let peel_odb = match odb {
                         Some(o) => o,
-                        None => lazy_odb.get_or_insert_with(|| {
-                            Odb::new(&git_dir.join("objects"))
-                                .with_config_git_dir(git_dir.to_path_buf())
-                        }),
+                        None => lazy_odb.get_or_insert_with(|| open_odb(git_dir)),
                     };
                     if let Ok(Some(peeled)) = peel_odb.peel_tag_target(oid) {
                         entries.push(RemoteRef {
@@ -1583,12 +1633,17 @@ mod tests {
     #[test]
     fn missing_urls_name_the_remote() {
         let err = parse_remote_url("  ").expect_err("empty");
-        assert!(matches!(err, RemoteError::NoUrl { remote: None }));
+        assert!(matches!(
+            err,
+            crate::error::Error::Remote(RemoteError::NoUrl { remote: None })
+        ));
         assert_eq!(err.to_string(), "remote URL is empty");
 
         let config = ConfigSet::new();
         let err = Remote::from_config(&config, "upstream").expect_err("no url");
-        assert!(matches!(&err, RemoteError::NoUrl { remote: Some(name) } if name == "upstream"));
+        assert!(
+            matches!(&err, crate::error::Error::Remote(RemoteError::NoUrl { remote: Some(name) }) if name == "upstream")
+        );
         assert_eq!(err.to_string(), "remote 'upstream' has no URL configured");
     }
 
@@ -1652,7 +1707,7 @@ mod tests {
         ));
         assert!(matches!(
             RemoteUrl::try_from("ftp://x"),
-            Err(RemoteError::UnsupportedScheme)
+            Err(crate::error::Error::Remote(RemoteError::UnsupportedScheme))
         ));
     }
 
@@ -1779,17 +1834,60 @@ mod tests {
     }
 
     #[test]
-    fn list_ref_prefixes_broad_for_ls_remote_patterns() {
+    fn list_ref_prefixes_unrestricted_for_ls_remote_patterns() {
         let opts = super::ListRefsOptions {
             prefixes: vec!["main".to_owned()],
             ..Default::default()
         };
-        let prefixes = super::list_ref_prefixes(&opts);
+        assert!(super::list_ref_prefixes(&opts).is_empty());
         assert_eq!(
-            prefixes,
-            vec!["refs/heads/".to_owned(), "refs/tags/".to_owned()]
+            super::list_refs_scan_prefixes(&opts),
+            vec!["refs/".to_owned()]
         );
         assert!(super::ref_matches_list_opts("refs/heads/main", &opts));
         assert!(!super::ref_matches_list_opts("refs/heads/topic", &opts));
+    }
+
+    #[test]
+    fn list_ref_prefixes_heads_and_tags_only_when_requested() {
+        assert_eq!(
+            super::list_ref_prefixes(&super::ListRefsOptions {
+                heads: true,
+                ..Default::default()
+            }),
+            vec!["refs/heads/".to_owned()]
+        );
+        assert_eq!(
+            super::list_ref_prefixes(&super::ListRefsOptions {
+                tags: true,
+                ..Default::default()
+            }),
+            vec!["refs/tags/".to_owned()]
+        );
+        assert_eq!(
+            super::list_ref_prefixes(&super::ListRefsOptions {
+                heads: true,
+                tags: true,
+                ..Default::default()
+            }),
+            vec!["refs/heads/".to_owned(), "refs/tags/".to_owned()]
+        );
+        assert!(super::list_ref_prefixes(&super::ListRefsOptions::default()).is_empty());
+    }
+
+    #[test]
+    fn list_refs_includes_head_with_explicit_pattern() {
+        let opts = super::ListRefsOptions {
+            prefixes: vec!["HEAD".to_owned()],
+            ..Default::default()
+        };
+        assert!(super::list_refs_includes_head(&opts));
+        assert!(super::ref_matches_list_opts("HEAD", &opts));
+        let opts = super::ListRefsOptions {
+            prefixes: vec!["refs/pull/1/head".to_owned()],
+            ..Default::default()
+        };
+        assert!(super::list_refs_includes_head(&opts));
+        assert!(!super::ref_matches_list_opts("HEAD", &opts));
     }
 }

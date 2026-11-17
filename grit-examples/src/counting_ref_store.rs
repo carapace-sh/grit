@@ -5,10 +5,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use grit_lib::error::Result;
+use grit_lib::lockfile::LockWait;
 use grit_lib::refs::reflog::ReflogEntry;
 use grit_lib::refs::store::{
-    PreparedRefTransaction, RawRef, RefEntry, RefStorageFormat, RefStore, RefStoreError,
-    RefTransaction,
+    PreparedRefTransaction, RawRef, RefEntry, RefNameRef, RefStorageFormat, RefStore,
+    RefStoreError, RefTransaction,
 };
 
 type StoreResult<T> = std::result::Result<T, RefStoreError>;
@@ -72,7 +73,7 @@ impl RefStore for CountingRefStore {
         self.inner.format()
     }
 
-    fn read_raw(&self, name: &str) -> Result<Option<RawRef>> {
+    fn read_raw(&self, name: &RefNameRef) -> Result<Option<RawRef>> {
         self.read_raw_calls.fetch_add(1, Ordering::Relaxed);
         self.inner.read_raw(name)
     }
@@ -90,45 +91,53 @@ impl RefStore for CountingRefStore {
         &self,
         txn: RefTransaction,
     ) -> StoreResult<Box<dyn PreparedRefTransaction + Send + '_>> {
+        self.prepare_for(txn, LockWait::Immediately)
+    }
+
+    fn prepare_for(
+        &self,
+        txn: RefTransaction,
+        wait: LockWait,
+    ) -> StoreResult<Box<dyn PreparedRefTransaction + Send + '_>> {
         self.prepare_calls.fetch_add(1, Ordering::Relaxed);
-        let inner = self.inner.prepare(txn)?;
+        let inner = self.inner.prepare_for(txn, wait)?;
         Ok(Box::new(CountingPrepared { inner }))
     }
 
-    fn reflog_exists(&self, name: &str) -> Result<bool> {
+    fn reflog_exists(&self, name: &RefNameRef) -> Result<bool> {
         self.inner.reflog_exists(name)
     }
 
     fn for_each_reflog_entry(
         &self,
-        name: &str,
+        name: &RefNameRef,
         reverse: bool,
         f: &mut dyn FnMut(&ReflogEntry) -> ControlFlow<()>,
     ) -> Result<()> {
         self.inner.for_each_reflog_entry(name, reverse, f)
     }
 
-    fn create_reflog(&self, name: &str) -> Result<()> {
+    fn create_reflog(&self, name: &RefNameRef) -> Result<()> {
         self.inner.create_reflog(name)
     }
 
-    fn delete_reflog(&self, name: &str) -> Result<()> {
+    fn delete_reflog(&self, name: &RefNameRef) -> Result<()> {
         self.inner.delete_reflog(name)
     }
 
-    fn replace_reflog(&self, name: &str, entries: Vec<ReflogEntry>) -> Result<()> {
+    fn replace_reflog(&self, name: &RefNameRef, entries: Vec<ReflogEntry>) -> Result<()> {
         self.inner.replace_reflog(name, entries)
     }
 
     fn rewrite_reflog(
         &self,
-        name: &str,
+        name: &RefNameRef,
         transform: &mut dyn FnMut(Vec<ReflogEntry>) -> Result<Vec<ReflogEntry>>,
     ) -> Result<()> {
         self.inner.rewrite_reflog(name, transform)
     }
 
-    fn for_each_reflog_ref(&self, f: &mut dyn FnMut(&str) -> ControlFlow<()>) -> Result<()> {
+    fn for_each_reflog_ref(&self, f: &mut dyn FnMut(&RefNameRef) -> ControlFlow<()>) -> Result<()> {
         self.inner.for_each_reflog_ref(f)
     }
 }

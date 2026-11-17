@@ -102,6 +102,92 @@ fn copy_detection_short_move_json_original_path() {
 }
 
 #[test]
+fn move_detection_within_file_matches_git() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    git(root, &["init", "-q", "-b", "main"]);
+    let content: String = (201..=230)
+        .map(|i| format!("unique line number {i} with some padding text to be distinctive\n"))
+        .collect();
+    fs::write(root.join("m.txt"), &content).unwrap();
+    git(root, &["add", "."]);
+    git(root, &["commit", "-m", "c1"]);
+    let c1 = {
+        let mut cmd = Command::new("git");
+        cmd.current_dir(root).args(["rev-parse", "HEAD"]);
+        git_env(&mut cmd);
+        String::from_utf8_lossy(&cmd.output().unwrap().stdout)
+            .trim()
+            .to_owned()
+    };
+    let lines: Vec<&str> = content.lines().collect();
+    let moved: String = lines[10..]
+        .iter()
+        .chain(&lines[..10])
+        .map(|line| format!("{line}\n"))
+        .collect();
+    fs::write(root.join("m.txt"), moved).unwrap();
+    git(root, &["commit", "-a", "-m", "move block"]);
+    let grit = gs_json(root, &["blame", "-M", "m.txt"]);
+    for line in grit["lines"].as_array().expect("lines") {
+        assert_eq!(
+            line["commit"].as_str().map(|s| &s[..7]),
+            Some(&c1[..7]),
+            "line {} should blame c1",
+            line["final_line"]
+        );
+    }
+    let mut git_cmd = Command::new("git");
+    git_cmd
+        .current_dir(root)
+        .args(["blame", "--porcelain", "-M", "--", "m.txt"]);
+    git_env(&mut git_cmd);
+    let git_out = git_cmd.output().unwrap();
+    assert!(git_out.status.success());
+    let porcelain = String::from_utf8_lossy(&git_out.stdout);
+    assert!(
+        !porcelain.contains(&c1[..7]) || porcelain.matches(&c1[..7]).count() >= 30,
+        "git should attribute moved block to c1"
+    );
+}
+
+#[test]
+fn move_detection_repeated_lines_json_row_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    git(root, &["init", "-q", "-b", "main"]);
+    fs::write(root.join("f"), "\n").unwrap();
+    git(root, &["add", "f"]);
+    git(root, &["commit", "-m", "blank"]);
+    let long = "\tpos = cache_name_pos(name, strlen(name));";
+    fs::write(root.join("f"), format!("{long}\n")).unwrap();
+    git(root, &["commit", "-a", "-m", "one"]);
+    fs::write(root.join("f"), format!("{long}\n{long}\n")).unwrap();
+    git(root, &["commit", "-a", "-m", "two"]);
+    let file_lines = fs::read_to_string(root.join("f")).unwrap().lines().count();
+    for extra in ["-M", "-C"] {
+        let grit = gs_json(root, &["blame", extra, "f"]);
+        assert_eq!(
+            grit["lines"].as_array().map(|a| a.len()),
+            Some(file_lines),
+            "grit {extra}"
+        );
+        let mut git_cmd = Command::new("git");
+        git_cmd
+            .current_dir(root)
+            .args(["blame", "--porcelain", extra, "--", "f"]);
+        git_env(&mut git_cmd);
+        let git_out = git_cmd.output().unwrap();
+        assert!(git_out.status.success());
+        let tab_rows = String::from_utf8_lossy(&git_out.stdout)
+            .lines()
+            .filter(|l| l.starts_with('\t'))
+            .count();
+        assert_eq!(tab_rows, file_lines, "git {extra}");
+    }
+}
+
+#[test]
 fn copy_detection_rejects_more_than_three_flags() {
     let dir = tempfile::tempdir().unwrap();
     setup_copy_by_creation(dir.path());

@@ -1,18 +1,19 @@
 //! Commit-graph parse/load corruption handling (t5318/t5324 scenarios).
 
+use grit_lib::error::ObjectError;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use grit_lib::config::environment::RepositoryOptions;
-use grit_lib::diff::bloom::BloomFilterSettings;
 use grit_lib::error::Error;
+use grit_lib::objects::commit_graph::BloomFilterSettings;
 use grit_lib::objects::commit_graph::{
     build_commit_graph_bytes, collect_reachable_commit_oids, load_commit_graph_commit_info,
 };
 use grit_lib::objects::commit_graph::{CommitGraphChain, CommitGraphLayer};
 use grit_lib::objects::{HashAlgo, ObjectId};
 use grit_lib::repo::Repository;
-use grit_lib::revwalk::rev_list::{rev_list, RevListOptions};
+use grit_lib::revwalk::rev_list::RevListOptions;
 use std::collections::HashMap;
 
 fn git_cmd(dir: &Path, args: &[&str]) -> String {
@@ -93,7 +94,7 @@ fn write_verify_fixture_graph(root: &Path) -> PathBuf {
 fn expect_corrupt_parse(path: PathBuf, bytes: Vec<u8>) -> Error {
     let err = CommitGraphLayer::try_parse(path.clone(), bytes.clone()).unwrap_err();
     assert!(
-        matches!(err, Error::CorruptObject(_)),
+        matches!(err, Error::Object(ObjectError::Corrupt { .. })),
         "expected CorruptObject, got {err:?}"
     );
     err
@@ -114,7 +115,7 @@ fn expect_corrupt_load(objects: &Path, graph_path: &Path, bytes: Vec<u8>) {
     write_graph_bytes(graph_path, &bytes);
     let err = CommitGraphChain::verify_on_disk(objects).unwrap_err();
     assert!(
-        matches!(err, Error::CorruptObject(_)),
+        matches!(err, Error::Object(ObjectError::Corrupt { .. })),
         "verify_on_disk: expected CorruptObject, got {err:?}"
     );
 }
@@ -357,11 +358,14 @@ fn corrupt_chain_missing_and_mismatched_layer() {
     let layer_path = graphdir.join(format!("graph-{hash}.graph"));
     std::fs::remove_file(&layer_path).expect("remove layer");
     let err = CommitGraphChain::try_load(&objects).unwrap_err();
-    assert!(matches!(err, Error::CorruptObject(_) | Error::Io(_)));
+    assert!(matches!(
+        err,
+        Error::Object(ObjectError::Corrupt { .. }) | Error::Io(_)
+    ));
 
     std::fs::write(&layer_path, b"not a graph").expect("bad layer");
     let err = CommitGraphChain::try_load(&objects).unwrap_err();
-    assert!(matches!(err, Error::CorruptObject(_)));
+    assert!(matches!(err, Error::Object(ObjectError::Corrupt { .. })));
 }
 
 #[test]
@@ -387,7 +391,8 @@ fn grit_rev_list(repo: &Repository, tip: &str, use_graph: bool) -> Vec<ObjectId>
         use_commit_graph: use_graph,
         ..Default::default()
     };
-    rev_list(repo, &[tip.to_owned()], &[], &opts)
+    repo.revwalk()
+        .rev_list(&[tip.to_owned()], &[], &opts)
         .expect("rev_list")
         .commits
 }

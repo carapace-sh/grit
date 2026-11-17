@@ -4,6 +4,8 @@
 //! recorded stale stat fields. On Windows with `core.autocrlf=true`, open-handle metadata differs
 //! from path-based `symlink_metadata`, so checkout must stat by path after flush/close.
 
+use grit_lib::progress::CancelToken;
+use grit_lib::progress::NullProgress;
 use std::fs;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -11,8 +13,8 @@ use std::time::{Duration, Instant};
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::diff::stat_matches;
 use grit_lib::porcelain::checkout::checkout_between_trees;
-use grit_lib::porcelain::status::{status, StatusOptions};
-use grit_lib::progress::NeverCancel;
+use grit_lib::porcelain::status::StatusOptions;
+use grit_lib::progress::CancelToken;
 use grit_lib::progress::NullProgress;
 use grit_lib::repo::Repository;
 use grit_test_support::git;
@@ -36,7 +38,10 @@ fn tree_of_head(root: &Path) -> grit_lib::objects::ObjectId {
 }
 
 fn assert_index_stats_match_worktree(repo_root: &Path, repo: &Repository) {
-    let index = repo.index_handle().load().expect("index");
+    let index = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("index");
     for entry in index.entries() {
         if entry.stage() != 0 {
             continue;
@@ -65,13 +70,17 @@ fn populated_checkout_index_stat_matches_worktree_with_autocrlf() {
     .expect("open grit repo");
 
     let mut index = grit_lib::index::Index::new();
-    repo.index_handle().write(&mut index).expect("clear index");
+    repo.index()
+        .write(&mut index, &grit_lib::index::IndexWriteOptions::default())
+        .expect("clear index");
     for i in 0..FILE_COUNT {
         let name = format!("file-{i:04}.txt");
         let _ = fs::remove_file(repo_root.join(&name));
     }
 
-    checkout_between_trees(&repo, None, &tree).expect("populated checkout");
+    repo.checkout()
+        .checkout(None, &tree)
+        .expect("populated checkout");
     assert_index_stats_match_worktree(repo_root, &repo);
 
     let git_diff = git(repo_root, &["diff-files"]);
@@ -100,19 +109,26 @@ fn first_status_after_populated_checkout_does_not_rewrite_warm_index() {
     .expect("open grit repo");
 
     let mut index = grit_lib::index::Index::new();
-    repo.index_handle().write(&mut index).expect("clear index");
+    repo.index()
+        .write(&mut index, &grit_lib::index::IndexWriteOptions::default())
+        .expect("clear index");
     for i in 0..file_count {
         let name = format!("file-{i:04}.txt");
         let _ = fs::remove_file(repo_root.join(&name));
     }
-    checkout_between_trees(&repo, None, &tree).expect("populated checkout");
+    repo.checkout()
+        .checkout(None, &tree)
+        .expect("populated checkout");
     assert_index_stats_match_worktree(repo_root, &repo);
 
-    let index_path = repo.index_handle().path();
+    let index_path = repo.index().path();
     let opts = StatusOptions::default();
 
     let first_start = Instant::now();
-    let first = status(&repo, &opts, &mut NullProgress, &NeverCancel).expect("first status");
+    let first = repo
+        .status()
+        .run(&opts, &mut NullProgress, &CancelToken::never())
+        .expect("first status");
     let first_elapsed = first_start.elapsed();
     assert!(
         first.unstaged.is_empty(),
@@ -126,7 +142,10 @@ fn first_status_after_populated_checkout_does_not_rewrite_warm_index() {
         .expect("index mtime");
 
     let second_start = Instant::now();
-    let second = status(&repo, &opts, &mut NullProgress, &NeverCancel).expect("second status");
+    let second = repo
+        .status()
+        .run(&opts, &mut NullProgress, &CancelToken::never())
+        .expect("second status");
     let second_elapsed = second_start.elapsed();
     assert!(second.unstaged.is_empty());
 

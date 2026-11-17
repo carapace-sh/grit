@@ -15,6 +15,7 @@
 //! See `Documentation/technical/index-format.txt` in the Git source tree for
 //! the authoritative format specification.
 
+use crate::error::ObjectError;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
@@ -24,8 +25,62 @@ use std::path::{Path, PathBuf};
 
 use crate::hash::verify_trailer;
 
+fn index_path_io(path: &Path, source: io::Error) -> IndexError {
+    IndexError::PathIo(PathIoError {
+        operation: PathIoOperation::GitDir(GitDirPathOperation::WriteIndex),
+        path: Some(path.to_path_buf()),
+        source,
+    })
+}
+
+fn corrupt_at_ctx(
+    source_path: Option<&Path>,
+    ctx: &IndexParseContext,
+    offset: Option<usize>,
+    reason: IndexCorruptReason,
+) -> IndexError {
+    let _ = ctx;
+    IndexError::corrupt_at(source_path, offset, reason)
+}
+
+fn index_parse_err(err: Error, source_path: Option<&Path>, _ctx: &IndexParseContext) -> Error {
+    match err {
+        Error::Index(IndexError::Corrupt { corrupt, detail }) => {
+            Error::Index(IndexError::Corrupt {
+                corrupt: IndexCorrupt {
+                    path: corrupt
+                        .path
+                        .or_else(|| source_path.map(std::borrow::ToOwned::to_owned)),
+                    offset: corrupt.offset,
+                    reason: corrupt.reason,
+                },
+                detail,
+            })
+        }
+        other => other,
+    }
+}
+
+fn attach_corrupt_path(path: &Path, err: Error) -> Error {
+    match err {
+        Error::Index(IndexError::Corrupt { corrupt, detail }) if corrupt.path.is_none() => {
+            Error::Index(IndexError::Corrupt {
+                corrupt: IndexCorrupt {
+                    path: Some(path.to_path_buf()),
+                    offset: corrupt.offset,
+                    reason: corrupt.reason,
+                },
+                detail,
+            })
+        }
+        other => other,
+    }
+}
+
 use crate::config::ConfigSet;
 use crate::error::{Error, Result};
+use crate::error::{GitDirPathOperation, PathIoError, PathIoOperation};
+use crate::index::error::{IndexCorrupt, IndexCorruptReason, IndexError};
 use crate::lockfile::{grit_lockfile_pid_enabled, pid_path_for_lock};
 use crate::objects::{parse_tree, HashAlgo, ObjectId, ObjectKind, TreeEntry};
 use crate::odb::Odb;
@@ -122,20 +177,19 @@ impl StatMatchPolicy {
         let Some(cfg) = config else {
             return policy;
         };
-        if let Some(trust) = cfg.get_bool("core.trustctime").and_then(|r| r.ok()) {
+        if let Ok(Some(trust)) = cfg.get_bool("core.trustctime") {
             policy.trust_ctime = trust;
         }
-        if let Some(raw) = cfg.get("core.checkstat") {
+        if let Some(raw) = cfg.value("core.checkstat") {
             policy.check_stat = match raw.to_ascii_lowercase().as_str() {
                 "minimal" => false,
                 "default" => true,
-                other => cfg
-                    .get_bool("core.checkstat")
-                    .and_then(|r| r.ok())
-                    .unwrap_or(!other.eq_ignore_ascii_case("minimal")),
+                other => {
+                    cfg.bool_with_default("core.checkstat", !other.eq_ignore_ascii_case("minimal"))
+                }
             };
         }
-        if let Some(use_ns) = cfg.get_bool("core.usenanosec").and_then(|r| r.ok()) {
+        if let Ok(Some(use_ns)) = cfg.get_bool("core.usenanosec") {
             policy.use_nanosec = use_ns;
         }
         policy
@@ -422,12 +476,13 @@ impl IndexEntry {
 /// # Examples
 ///
 /// ```
+/// use grit_lib::index::IndexLoadOptions;
 /// use grit_lib::repo::{InitOptions, Repository};
 ///
 /// # fn main() -> grit_lib::error::Result<()> {
 /// let dir = tempfile::tempdir()?;
-/// let repo = Repository::init(dir.path(), &InitOptions::default())?;
-/// let index = repo.index_handle().load()?;
+/// let (repo, _) = Repository::init(dir.path(), &InitOptions::default())?;
+/// let index = repo.index().load(&IndexLoadOptions::default())?;
 /// assert!(index.entries().is_empty());
 /// # Ok(())
 /// # }
@@ -537,27 +592,72 @@ impl CacheTreeNode {
 
 pub use crate::index_eoie_ieot::IndexParseContext;
 
-/// Options for loading an index from disk.
-#[derive(Debug, Clone, Copy)]
-pub struct IndexLoadOptions {
-    /// If the index contains sparse directory placeholders, expand them to full file entries.
-    pub expand_sparse_directories: bool,
-    /// Thread policy for parallel index entry load (EOIE/IEOT).
+/// Options for [`Index::parse`].
+///
+/// The defaults detect the hash algorithm from the trailing checksum, read no config, attach
+/// no path to errors, and use the default thread policy for EOIE/IEOT entry loading.
+///
+/// # Examples
+///
+/// ```
+/// use grit_lib::index::{Index, IndexParseOptions};
+///
+/// # fn main() -> grit_lib::error::Result<()> {
+/// let dir = tempfile::tempdir()?;
+/// let path = dir.path().join("index");
+/// Index::new().write(&path)?;
+/// let bytes = std::fs::read(&path)?;
+/// let index = Index::parse(&bytes, &IndexParseOptions::default().with_source_path(&path))?;
+/// assert!(index.entries().is_empty());
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, Copy, Default)]
+#[non_exhaustive]
+pub struct IndexParseOptions<'a> {
+    /// Object hash of the repository (`extensions.objectFormat`), which fixes the entry id
+    /// width and the trailing checksum width. `None` detects it from the checksum length.
+    pub hash_algo: Option<HashAlgo>,
+    /// Repository config, consulted for `index.threads` and the EOIE/IEOT extensions, and by
+    /// [`Index::empty_for`] for `index.version` / `feature.manyFiles`.
+    pub config: Option<&'a ConfigSet>,
+    /// File the bytes came from, attached to [`IndexError::Corrupt`] errors.
+    pub source_path: Option<&'a Path>,
+    /// Thread policy for parallel entry loading.
     pub parse_context: IndexParseContext,
 }
 
-impl Default for IndexLoadOptions {
-    fn default() -> Self {
-        Self {
-            expand_sparse_directories: true,
-            parse_context: IndexParseContext::default(),
-        }
+impl<'a> IndexParseOptions<'a> {
+    /// Sets [`hash_algo`](Self::hash_algo).
+    #[must_use]
+    pub fn with_hash_algo(mut self, hash_algo: HashAlgo) -> Self {
+        self.hash_algo = Some(hash_algo);
+        self
+    }
+
+    /// Sets [`config`](Self::config).
+    #[must_use]
+    pub fn with_config(mut self, config: &'a ConfigSet) -> Self {
+        self.config = Some(config);
+        self
+    }
+
+    /// Sets [`source_path`](Self::source_path).
+    #[must_use]
+    pub fn with_source_path(mut self, source_path: &'a Path) -> Self {
+        self.source_path = Some(source_path);
+        self
+    }
+
+    /// Sets [`parse_context`](Self::parse_context).
+    #[must_use]
+    pub fn with_parse_context(mut self, parse_context: IndexParseContext) -> Self {
+        self.parse_context = parse_context;
+        self
     }
 }
 
-/// Version used after an invalid `GIT_INDEX_VERSION` value (matches Git stderr: "Using version 3").
-const INDEX_ENV_INVALID_FALLBACK: u32 = 3;
-/// Version used after an invalid `index.version` config value (same message as env).
+/// Version used after an invalid `index.version` config value.
 const INDEX_CONFIG_INVALID_FALLBACK: u32 = 3;
 /// Minimum supported index version.
 const INDEX_FORMAT_LB: u32 = 2;
@@ -740,19 +840,22 @@ fn dump_cache_tree_pair(
     }
 }
 
-/// Read `GIT_INDEX_VERSION` and return the requested version.
-///
-/// If the environment variable is unset, returns `None`.
-/// If it is set but invalid (non-numeric or out of range 2..=4), prints a
-/// warning to stderr and returns the default version.
-pub fn get_index_format_from_env() -> Option<u32> {
-    let val = crate::environment::Environment::empty().var("GIT_INDEX_VERSION")?;
-    if val.is_empty() {
-        return None;
-    }
-    match val.parse::<u32>() {
-        Ok(v) if (INDEX_FORMAT_LB..=INDEX_FORMAT_UB).contains(&v) => Some(v),
-        _ => Some(INDEX_ENV_INVALID_FALLBACK),
+/// Index format for a new index: `index.version` when valid, else 4 under `feature.manyFiles`,
+/// else 2. An invalid `index.version` falls back to [`INDEX_CONFIG_INVALID_FALLBACK`].
+fn version_from_config(index_version: Option<&str>, many_files: bool) -> u32 {
+    match index_version.map(str::trim).filter(|v| !v.is_empty()) {
+        None => {
+            if many_files {
+                4
+            } else {
+                2
+            }
+        }
+        Some(v) => v
+            .parse::<u32>()
+            .ok()
+            .filter(|v| (INDEX_FORMAT_LB..=INDEX_FORMAT_UB).contains(v))
+            .unwrap_or(INDEX_CONFIG_INVALID_FALLBACK),
     }
 }
 
@@ -761,23 +864,23 @@ pub(crate) fn parse_fsmonitor_extension(
     ext_data: &[u8],
 ) -> Result<(String, crate::ewah_bitmap::EwahBitmap)> {
     if ext_data.len() < 4 + 1 + 4 {
-        return Err(Error::IndexFsmonitorExtensionTruncated);
+        return Err(IndexError::FsmonitorExtensionTruncated.into());
     }
     let hdr_version = u32::from_be_bytes(
         ext_data[0..4]
             .try_into()
-            .map_err(|_| Error::IndexFsmonitorExtensionTruncated)?,
+            .map_err(|_| Error::from(IndexError::FsmonitorExtensionTruncated))?,
     );
     let mut pos = 4usize;
     let token = match hdr_version {
         FSMONITOR_EXT_VERSION1 => {
             if ext_data.len() < pos + 8 + 4 {
-                return Err(Error::IndexFsmonitorExtensionTruncated);
+                return Err(IndexError::FsmonitorExtensionTruncated.into());
             }
             let ts = u64::from_be_bytes(
                 ext_data[pos..pos + 8]
                     .try_into()
-                    .map_err(|_| Error::IndexFsmonitorExtensionTruncated)?,
+                    .map_err(|_| Error::from(IndexError::FsmonitorExtensionTruncated))?,
             );
             pos += 8;
             ts.to_string()
@@ -786,30 +889,30 @@ pub(crate) fn parse_fsmonitor_extension(
             let nul = ext_data[pos..]
                 .iter()
                 .position(|&b| b == 0)
-                .ok_or(Error::IndexFsmonitorExtensionTruncated)?;
+                .ok_or(Error::from(IndexError::FsmonitorExtensionTruncated))?;
             let token = String::from_utf8_lossy(&ext_data[pos..pos + nul]).into_owned();
             pos += nul + 1;
             token
         }
-        v => return Err(Error::IndexFsmonitorExtensionBadVersion(v)),
+        v => return Err(Error::from(IndexError::FsmonitorExtensionBadVersion(v))),
     };
     if ext_data.len() < pos + 4 {
-        return Err(Error::IndexFsmonitorExtensionTruncated);
+        return Err(IndexError::FsmonitorExtensionTruncated.into());
     }
     let ewah_size = u32::from_be_bytes(
         ext_data[pos..pos + 4]
             .try_into()
-            .map_err(|_| Error::IndexFsmonitorExtensionTruncated)?,
+            .map_err(|_| Error::from(IndexError::FsmonitorExtensionTruncated))?,
     ) as usize;
     pos += 4;
     if ext_data.len() < pos + ewah_size {
-        return Err(Error::IndexFsmonitorExtensionTruncated);
+        return Err(IndexError::FsmonitorExtensionTruncated.into());
     }
     let ewah_slice = &ext_data[pos..pos + ewah_size];
     let (dirty, consumed) = crate::ewah_bitmap::EwahBitmap::deserialize_prefix(ewah_slice)
-        .ok_or(Error::IndexFsmonitorExtensionEwahInvalid)?;
+        .ok_or(Error::from(IndexError::FsmonitorExtensionEwahInvalid))?;
     if consumed != ewah_size {
-        return Err(Error::IndexFsmonitorExtensionEwahInvalid);
+        return Err(IndexError::FsmonitorExtensionEwahInvalid.into());
     }
     Ok((token, dirty))
 }
@@ -830,36 +933,10 @@ pub(crate) fn apply_fsmonitor_dirty_to_entries(
 }
 
 impl Index {
-    /// Create a new, empty index.
-    ///
-    /// Respects `GIT_INDEX_VERSION` if set, otherwise defaults to version 2.
+    /// Create a new, empty index in format version 2.
     #[must_use]
     pub fn new() -> Self {
-        let version = get_index_format_from_env().unwrap_or(2);
-        Self {
-            version,
-            entries: Vec::new(),
-            entries_sorted: true,
-            sparse_directories: false,
-            untracked_cache: None,
-            fsmonitor_last_update: None,
-            fsmonitor_dirty: None,
-            fsmonitor_raw_extension: None,
-            resolve_undo: None,
-            split_link: None,
-            cache_tree_root: None,
-            cache_tree: None,
-            hash_algo: HashAlgo::Sha1,
-            source_mtime: None,
-            source_checksum: None,
-            source_file_len: None,
-            defer_untracked_cache_invalidation: false,
-            skip_racy_smudge_on_write: false,
-            content_verified: HashMap::new(),
-            fsmonitor_refresh_ran: false,
-            suppress_pre_write_index_housekeeping: false,
-            entry_modes_repaired_on_load: false,
-        }
+        Self::empty(2)
     }
 
     /// Normalize any legacy or non-canonical entry modes to Git index form.
@@ -900,13 +977,10 @@ impl Index {
         snap
     }
 
-    /// Create a new, empty index at a fixed version without consulting
-    /// `GIT_INDEX_VERSION` or config.
+    /// Create a new, empty index at a fixed version without consulting config.
     ///
-    /// Unlike [`Self::new`], this never reads the environment and therefore never
-    /// emits the "GIT_INDEX_VERSION set, but the value is invalid" warning. Use it
-    /// for throwaway baseline indexes (e.g. sparse-index diff references) where the
-    /// version is irrelevant and Git resolves the format only once per operation.
+    /// Use it for throwaway baseline indexes (e.g. sparse-index diff references)
+    /// where the version is irrelevant.
     #[must_use]
     pub fn empty(version: u32) -> Self {
         Self {
@@ -935,160 +1009,24 @@ impl Index {
         }
     }
 
-    /// Create a new empty index, respecting config values for version.
+    /// New empty index for the repository `options` describe.
     ///
-    /// Priority matches Git's `prepare_repo_settings`: `GIT_INDEX_VERSION` env, then
-    /// `feature.manyFiles` (implies version 4), then `index.version` (overrides version).
-    pub fn new_with_config(
-        config_index_version: Option<&str>,
-        config_many_files: Option<&str>,
-    ) -> Self {
-        if let Some(v) = get_index_format_from_env() {
-            return Self {
-                version: v,
-                entries: Vec::new(),
-                entries_sorted: true,
-                sparse_directories: false,
-                untracked_cache: None,
-                fsmonitor_last_update: None,
-                fsmonitor_dirty: None,
-                fsmonitor_raw_extension: None,
-                resolve_undo: None,
-                split_link: None,
-                cache_tree_root: None,
-                cache_tree: None,
-                hash_algo: HashAlgo::default(),
-                source_mtime: None,
-                source_checksum: None,
-                source_file_len: None,
-                defer_untracked_cache_invalidation: false,
-                skip_racy_smudge_on_write: false,
-                content_verified: HashMap::new(),
-                fsmonitor_refresh_ran: false,
-                suppress_pre_write_index_housekeeping: false,
-                entry_modes_repaired_on_load: false,
-            };
-        }
-
-        let many_files = config_truthy(config_many_files);
-        let mut version = if many_files { 4 } else { 2 };
-
-        if let Some(val) = config_index_version {
-            let trimmed = val.trim();
-            if !trimmed.is_empty() {
-                match trimmed.parse::<u32>() {
-                    Ok(v) if (INDEX_FORMAT_LB..=INDEX_FORMAT_UB).contains(&v) => {
-                        version = v;
-                    }
-                    _ => {
-                        version = INDEX_CONFIG_INVALID_FALLBACK;
-                    }
-                }
-            }
-        }
-
-        Self {
-            version,
-            entries: Vec::new(),
-            entries_sorted: true,
-            sparse_directories: false,
-            untracked_cache: None,
-            fsmonitor_last_update: None,
-            fsmonitor_dirty: None,
-            fsmonitor_raw_extension: None,
-            resolve_undo: None,
-            split_link: None,
-            cache_tree_root: None,
-            cache_tree: None,
-            hash_algo: HashAlgo::default(),
-            source_mtime: None,
-            source_checksum: None,
-            source_file_len: None,
-            defer_untracked_cache_invalidation: false,
-            skip_racy_smudge_on_write: false,
-            content_verified: HashMap::new(),
-            fsmonitor_refresh_ran: false,
-            suppress_pre_write_index_housekeeping: false,
-            entry_modes_repaired_on_load: false,
-        }
-    }
-
-    /// New empty index using a loaded [`ConfigSet`] (includes `-c` / `GIT_CONFIG_PARAMETERS`).
-    ///
-    /// Same precedence as [`Self::new_with_config`], but reads `feature.manyFiles` and
-    /// `index.version` from `config`.
+    /// The version follows Git's `prepare_repo_settings` precedence: `feature.manyFiles`
+    /// (implies version 4), then `index.version` (overrides it), read from
+    /// [`IndexParseOptions::config`] (version 2 without config). The hash algorithm is
+    /// [`IndexParseOptions::hash_algo`] (SHA-1 when unset).
     #[must_use]
-    pub fn new_from_config(config: &ConfigSet) -> Self {
-        if let Some(v) = get_index_format_from_env() {
-            return Self {
-                version: v,
-                entries: Vec::new(),
-                entries_sorted: true,
-                sparse_directories: false,
-                untracked_cache: None,
-                fsmonitor_last_update: None,
-                fsmonitor_dirty: None,
-                fsmonitor_raw_extension: None,
-                resolve_undo: None,
-                split_link: None,
-                cache_tree_root: None,
-                cache_tree: None,
-                hash_algo: HashAlgo::default(),
-                source_mtime: None,
-                source_checksum: None,
-                source_file_len: None,
-                defer_untracked_cache_invalidation: false,
-                skip_racy_smudge_on_write: false,
-                content_verified: HashMap::new(),
-                fsmonitor_refresh_ran: false,
-                suppress_pre_write_index_housekeeping: false,
-                entry_modes_repaired_on_load: false,
-            };
-        }
-
-        let many_files = config
-            .get_bool("feature.manyFiles")
-            .and_then(|r| r.ok())
-            .unwrap_or(false);
-        let mut version = if many_files { 4 } else { 2 };
-
-        if let Some(val) = config.get("index.version") {
-            let trimmed = val.trim();
-            if !trimmed.is_empty() {
-                match trimmed.parse::<u32>() {
-                    Ok(v) if (INDEX_FORMAT_LB..=INDEX_FORMAT_UB).contains(&v) => {
-                        version = v;
-                    }
-                    _ => {
-                        version = INDEX_CONFIG_INVALID_FALLBACK;
-                    }
-                }
-            }
-        }
-
+    pub fn empty_for(options: &IndexParseOptions<'_>) -> Self {
+        let version = match options.config {
+            Some(config) => version_from_config(
+                config.value("index.version").as_deref(),
+                config.bool_with_default("feature.manyFiles", false),
+            ),
+            None => version_from_config(None, false),
+        };
         Self {
-            version,
-            entries: Vec::new(),
-            entries_sorted: true,
-            sparse_directories: false,
-            untracked_cache: None,
-            fsmonitor_last_update: None,
-            fsmonitor_dirty: None,
-            fsmonitor_raw_extension: None,
-            resolve_undo: None,
-            split_link: None,
-            cache_tree_root: None,
-            cache_tree: None,
-            hash_algo: HashAlgo::default(),
-            source_mtime: None,
-            source_checksum: None,
-            source_file_len: None,
-            defer_untracked_cache_invalidation: false,
-            skip_racy_smudge_on_write: false,
-            content_verified: HashMap::new(),
-            fsmonitor_refresh_ran: false,
-            suppress_pre_write_index_housekeeping: false,
-            entry_modes_repaired_on_load: false,
+            hash_algo: options.hash_algo.unwrap_or(HashAlgo::Sha1),
+            ..Self::empty(version)
         }
     }
 
@@ -1098,11 +1036,12 @@ impl Index {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::IndexError`] if the file is present but corrupt.
-    pub fn load(path: &Path) -> Result<Self> {
+    /// Returns [`Error::Index`](crate::error::Error::Index) with [`IndexError::Corrupt`](crate::index::IndexError::Corrupt) if the file is present but corrupt.
+    pub fn load(path: &Path) -> crate::error::Result<Self> {
         match read_index_file(path) {
             Ok((data, mtime)) => {
-                let mut idx = Self::parse(&data)?;
+                let mut idx = Self::parse(&data, &IndexParseOptions::default())
+                    .map_err(|e| attach_corrupt_path(path, e))?;
                 record_loaded_index_identity(&mut idx, &data, mtime);
                 Ok(idx)
             }
@@ -1110,68 +1049,21 @@ impl Index {
                 sparse_directories: false,
                 ..Self::new()
             }),
-            Err(e) => Err(Error::Io(e)),
+            Err(e) => Err(crate::error::Error::from(index_path_io(path, e))),
         }
     }
 
-    /// Load an index and expand sparse-directory placeholders using the object database.
+    /// Load the index at `path` (empty when missing) and expand sparse-directory placeholders,
+    /// applying path protection from `config` while expanding.
     ///
-    /// After a successful return, [`Index::sparse_directories`] is cleared and every
-    /// placeholder is replaced by the blob entries from the referenced tree.
-    pub fn load_expand_sparse(path: &Path, odb: &Odb) -> Result<Self> {
-        let mut idx = match read_index_file(path) {
-            Ok((data, mtime)) => {
-                let mut idx = Self::parse_with_algo(&data, odb.hash_algo())?;
-                record_loaded_index_identity(&mut idx, &data, mtime);
-                idx
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Self {
-                sparse_directories: false,
-                hash_algo: odb.hash_algo(),
-                ..Self::new()
-            },
-            Err(e) => return Err(Error::Io(e)),
-        };
-        idx.expand_sparse_directory_placeholders(
-            odb,
-            crate::path_validate::ProtectOptions::default(),
-        )?;
-        Ok(idx)
-    }
-
-    /// Like [`Self::load_expand_sparse`], but applies path protection from `config` when expanding sparse directories.
-    pub fn load_expand_sparse_with_config(
-        path: &Path,
-        odb: &Odb,
-        config: &ConfigSet,
-    ) -> Result<Self> {
-        Self::load_expand_sparse_optional_with_context(
-            path,
-            odb,
-            Some(config),
-            IndexParseContext::default(),
-        )
-    }
-
-    /// Like [`Index::load_expand_sparse`], but treats a missing index as an empty index.
-    ///
-    /// An index file too short to hold a header and checksum is an error, as in Git.
-    pub fn load_expand_sparse_optional(path: &Path, odb: &Odb) -> Result<Self> {
-        Self::load_expand_sparse_optional_with_context(
-            path,
-            odb,
-            None,
-            IndexParseContext::default(),
-        )
-    }
-
-    /// Like [`Self::load_expand_sparse_optional`], but passes config and thread policy for EOIE/IEOT load.
-    pub fn load_expand_sparse_optional_with_context(
+    /// Repository callers go through [`crate::index::IndexFile::load`], which also resolves a
+    /// split index and clears skip-worktree bits for files present on disk.
+    pub(crate) fn load_expand_sparse(
         path: &Path,
         odb: &Odb,
         config: Option<&ConfigSet>,
         parse_context: IndexParseContext,
-    ) -> Result<Self> {
+    ) -> crate::error::Result<Self> {
         let mut idx =
             Self::load_preserving_sparse_optional_with_context(path, odb, config, parse_context)?;
         let protect = config
@@ -1188,11 +1080,16 @@ impl Index {
         odb: &Odb,
         config: Option<&ConfigSet>,
         parse_context: IndexParseContext,
-    ) -> Result<Self> {
+    ) -> crate::error::Result<Self> {
         let algo = odb.hash_algo();
         let idx = match read_index_file(path) {
             Ok((data, mtime)) => {
-                let mut idx = Self::parse_with_algo_and_config(&data, algo, config, parse_context)?;
+                let mut options = IndexParseOptions::default()
+                    .with_hash_algo(algo)
+                    .with_parse_context(parse_context);
+                options.config = config;
+                let mut idx =
+                    Self::parse(&data, &options).map_err(|e| attach_corrupt_path(path, e))?;
                 record_loaded_index_identity(&mut idx, &data, mtime);
                 idx
             }
@@ -1200,7 +1097,7 @@ impl Index {
                 hash_algo: algo,
                 ..Self::new()
             },
-            Err(e) => return Err(Error::Io(e)),
+            Err(e) => return Err(crate::error::Error::from(index_path_io(path, e))),
         };
         Ok(idx)
     }
@@ -1254,24 +1151,22 @@ impl Index {
         Ok(())
     }
 
-    /// Collapse consecutive skip-worktree subtrees into sparse-directory placeholders when
-    /// `cone_mode` is true and each directory is outside the sparse cone.
+    /// Collapse skip-worktree subtrees outside the sparse cone into sparse-directory
+    /// placeholders (Git's sparse index).
     ///
-    /// `head_tree` is the tree OID at `HEAD`. When `enable_sparse_index` is false, clears
-    /// [`Index::sparse_directories`] and returns without collapsing.
+    /// `head_tree` is the tree OID at `HEAD` and `cone_patterns` the cone-mode
+    /// `info/sparse-checkout` lines. A directory collapses only when every row under it is a
+    /// skip-worktree stage-0 entry matching `head_tree`, with no gitlink. Callers that do not
+    /// use a cone-mode sparse index clear [`Index::sparse_directories`] instead.
     pub fn try_collapse_sparse_directories(
         &mut self,
         odb: &Odb,
         head_tree: &ObjectId,
-        patterns: &[String],
-        cone_mode: bool,
-        enable_sparse_index: bool,
+        cone_patterns: &[String],
         protect: crate::path_validate::ProtectOptions,
     ) -> Result<()> {
-        if !enable_sparse_index || !cone_mode {
-            self.sparse_directories = false;
-            return Ok(());
-        }
+        let patterns = cone_patterns;
+        let cone_mode = true;
 
         self.ensure_canonical_order();
         let mut prefixes = BTreeSet::<Vec<u8>>::new();
@@ -1405,69 +1300,83 @@ impl Index {
         Ok(())
     }
 
-    /// Parse index bytes (the whole file including trailing SHA-1).
+    /// Parse index bytes (the whole file including the trailing checksum).
     ///
     /// # Errors
     ///
-    /// Returns [`Error::IndexError`] on structural problems.
-    pub fn parse(data: &[u8]) -> Result<Self> {
-        // The index file does not record its hash width; it is fixed by the
-        // repository. Detect it from the trailing checksum (callers with a
-        // repository should prefer [`Self::parse_with_algo`]).
-        Self::parse_with_algo(data, detect_index_hash_algo(data))
+    /// Returns [`IndexError::Corrupt`] on structural problems (with
+    /// [`IndexParseOptions::source_path`] attached when set).
+    pub fn parse(data: &[u8], options: &IndexParseOptions<'_>) -> crate::error::Result<Self> {
+        // The index file does not record its hash width; it is fixed by the repository.
+        let hash_algo = options
+            .hash_algo
+            .unwrap_or_else(|| detect_index_hash_algo(data));
+        Self::parse_bytes(
+            data,
+            hash_algo,
+            options.config,
+            options.source_path,
+            options.parse_context,
+        )
     }
 
-    /// Parse an index using a known hash algorithm (e.g. from the repository's
-    /// `extensions.objectformat`), which determines the entry OID width and the
-    /// trailing checksum width.
-    pub fn parse_with_algo(data: &[u8], hash_algo: HashAlgo) -> Result<Self> {
-        Self::parse_with_algo_and_config(data, hash_algo, None, IndexParseContext::default())
-    }
-
-    /// Parse an index with optional repository config and thread policy for EOIE/IEOT load.
-    pub fn parse_with_algo_and_config(
+    fn parse_bytes(
         data: &[u8],
         hash_algo: HashAlgo,
         config: Option<&ConfigSet>,
+        source_path: Option<&Path>,
         parse_context: IndexParseContext,
-    ) -> Result<Self> {
+    ) -> crate::error::Result<Self> {
         const INDEX_HEADER_LEN: usize = 12;
 
         let hash_len = hash_algo.len();
         if data.len() < INDEX_HEADER_LEN + hash_len {
-            return Err(Error::IndexError(
-                "file too short for index header and checksum".to_owned(),
-            ));
+            return Err(crate::error::Error::from(corrupt_at_ctx(
+                source_path,
+                &parse_context,
+                None,
+                IndexCorruptReason::FileTooShortForHeader,
+            )));
         }
         let (body, checksum) = data.split_at(data.len() - hash_len);
         if body.len() < INDEX_HEADER_LEN {
-            return Err(Error::IndexError(
-                "file too short for index header and checksum".to_owned(),
-            ));
+            return Err(crate::error::Error::from(corrupt_at_ctx(
+                source_path,
+                &parse_context,
+                None,
+                IndexCorruptReason::FileTooShortForHeader,
+            )));
         }
-        let trailer_error = |e: crate::hash::TrailerMismatch| {
-            Error::IndexError(format!(
-                "{} checksum mismatch: {e}",
-                hash_algo.name().to_uppercase()
-            ))
+        let ctx = parse_context;
+        let trailer_error = |_e: crate::hash::TrailerMismatch| {
+            corrupt_at_ctx(
+                source_path,
+                &ctx,
+                Some(data.len() - hash_len),
+                IndexCorruptReason::ChecksumMismatch { algo: hash_algo },
+            )
         };
         if checksum.iter().all(|&b| b == 0) {
-            return Self::parse_body(body, hash_algo, config, parse_context);
+            return Self::parse_body(body, hash_algo, config, source_path, parse_context);
         }
         let verify_in_parallel = data.len() >= PARALLEL_TRAILER_VERIFY_MIN_BYTES
-            && parse_context.thread_policy.threads_override != Some(1);
+            && ctx.thread_policy.threads_override != Some(1);
         if !verify_in_parallel {
             verify_trailer(hash_algo, data).map_err(trailer_error)?;
-            return Self::parse_body(body, hash_algo, config, parse_context);
+            return Self::parse_body(body, hash_algo, config, source_path, parse_context);
         }
         // Hashing a large index costs about as much as parsing it; overlap the two and
         // report a checksum mismatch ahead of any structural error, as the serial path does.
         std::thread::scope(|scope| {
             let verifier = scope.spawn(|| verify_trailer(hash_algo, data));
-            let parsed = Self::parse_body(body, hash_algo, config, parse_context);
+            let parsed = Self::parse_body(body, hash_algo, config, source_path, parse_context);
             verifier
                 .join()
-                .map_err(|_| Error::Message("index checksum worker thread panicked".to_owned()))?
+                .map_err(|_| {
+                    Error::from(IndexError::corrupt(IndexCorrupt::new(
+                        IndexCorruptReason::ChecksumWorkerPanicked,
+                    )))
+                })?
                 .map_err(trailer_error)?;
             parsed
         })
@@ -1478,8 +1387,9 @@ impl Index {
         body: &[u8],
         hash_algo: HashAlgo,
         config: Option<&ConfigSet>,
+        source_path: Option<&Path>,
         parse_context: IndexParseContext,
-    ) -> Result<Self> {
+    ) -> crate::error::Result<Self> {
         use crate::index_eoie_ieot::{
             index_load_worker_count, parallel_index_load_allowed, parse_entries_parallel,
             parse_entries_serial, parse_index_extensions, read_eoie_extension, read_ieot_extension,
@@ -1489,23 +1399,37 @@ impl Index {
         let hash_len = hash_algo.len();
         let magic = &body[..4];
         if magic != b"DIRC" {
-            return Err(Error::IndexError("bad magic: expected DIRC".to_owned()));
-        }
-        let version = u32::from_be_bytes(
-            body[4..8]
-                .try_into()
-                .map_err(|_| Error::IndexError("cannot read version".to_owned()))?,
-        );
-        if version != 2 && version != 3 && version != 4 {
-            return Err(Error::IndexError(format!(
-                "unsupported index version {version}"
+            return Err(crate::error::Error::from(corrupt_at_ctx(
+                source_path,
+                &parse_context,
+                Some(0),
+                IndexCorruptReason::BadSignature,
             )));
         }
-        let count = u32::from_be_bytes(
-            body[8..12]
-                .try_into()
-                .map_err(|_| Error::IndexError("cannot read entry count".to_owned()))?,
-        );
+        let version = u32::from_be_bytes(body[4..8].try_into().map_err(|_| {
+            corrupt_at_ctx(
+                source_path,
+                &parse_context,
+                Some(4),
+                IndexCorruptReason::CannotReadVersion,
+            )
+        })?);
+        if version != 2 && version != 3 && version != 4 {
+            return Err(crate::error::Error::from(corrupt_at_ctx(
+                source_path,
+                &parse_context,
+                Some(4),
+                IndexCorruptReason::UnsupportedVersion { version },
+            )));
+        }
+        let count = u32::from_be_bytes(body[8..12].try_into().map_err(|_| {
+            corrupt_at_ctx(
+                source_path,
+                &parse_context,
+                Some(8),
+                IndexCorruptReason::CannotReadEntryCount,
+            )
+        })?);
 
         let workers = index_load_worker_count(parse_context.thread_policy, config, count as usize);
         let extension_offset = if workers > 1 {
@@ -1528,26 +1452,34 @@ impl Index {
 
         let (entries, ext_fields): (Vec<IndexEntry>, ParsedIndexExtensions) = if try_parallel {
             let Some(ext_off) = extension_offset else {
-                return Err(Error::IndexError(
-                    "parallel index load missing EOIE offset".to_owned(),
-                ));
+                return Err(crate::error::Error::from(corrupt_at_ctx(
+                    source_path,
+                    &parse_context,
+                    None,
+                    IndexCorruptReason::ParallelLoadMissingEoie,
+                )));
             };
             let ieot = read_ieot_extension(body, ext_off, extensions_end);
             let mut loaded_entries = if let Some(ref ieot) = ieot {
-                parse_entries_parallel(body, version, count, hash_len, ieot, workers)?
+                parse_entries_parallel(body, version, count, hash_len, ieot, workers)
+                    .map_err(|e| index_parse_err(e, source_path, &parse_context))?
             } else {
-                parse_entries_serial(body, version, count, hash_len, 12)?.0
+                parse_entries_serial(body, version, count, hash_len, 12)
+                    .map_err(|e| index_parse_err(e, source_path, &parse_context))?
+                    .0
             };
-            let ext_fields =
-                parse_index_extensions(body, ext_off, extensions_end, hash_algo, None)?;
+            let ext_fields = parse_index_extensions(body, ext_off, extensions_end, hash_algo, None)
+                .map_err(|e| index_parse_err(e, source_path, &parse_context))?;
             if let Some(dirty) = ext_fields.fsmonitor_dirty.as_ref() {
                 apply_fsmonitor_dirty_to_entries(&mut loaded_entries, dirty);
             }
             (loaded_entries, ext_fields)
         } else {
-            let (mut entries, pos) = parse_entries_serial(body, version, count, hash_len, 12)?;
+            let (mut entries, pos) = parse_entries_serial(body, version, count, hash_len, 12)
+                .map_err(|e| index_parse_err(e, source_path, &parse_context))?;
             let ext_fields =
-                parse_index_extensions(body, pos, body.len(), hash_algo, Some(&mut entries))?;
+                parse_index_extensions(body, pos, body.len(), hash_algo, Some(&mut entries))
+                    .map_err(|e| index_parse_err(e, source_path, &parse_context))?;
             (entries, ext_fields)
         };
 
@@ -1584,39 +1516,27 @@ impl Index {
     /// # Errors
     ///
     /// Returns [`Error::Io`] on filesystem errors.
-    pub fn write(&mut self, path: &Path) -> Result<()> {
+    pub fn write(&mut self, path: &Path) -> crate::error::Result<()> {
         let git_dir = path.parent();
         let config = git_dir.and_then(|d| {
-            ConfigSet::load(&crate::environment::Environment::empty(), Some(d), true).ok()
+            ConfigSet::load(
+                &crate::environment::Environment::empty(),
+                Some(d),
+                &crate::config::LoadConfigOptions::standard(
+                    &crate::environment::Environment::empty(),
+                    Some(d),
+                ),
+            )
+            .ok()
         });
         let skip_hash = index_skip_hash_for_write(config.as_ref());
         self.write_to_path(path, skip_hash)
     }
 
-    /// Write the index using an already-loaded config snapshot (avoids re-loading the cascade).
-    ///
-    /// # Errors
-    ///
-    /// Same as [`Self::write`].
-    pub fn write_with_config(&mut self, path: &Path, config: &ConfigSet) -> Result<()> {
-        self.write_with_config_and_policy(path, config, crate::parallel::ThreadPolicy::default())
-    }
-
-    /// Write the index using config and an explicit thread policy (EOIE/IEOT emission).
-    pub fn write_with_config_and_policy(
-        &mut self,
-        path: &Path,
-        config: &ConfigSet,
-        policy: crate::parallel::ThreadPolicy,
-    ) -> Result<()> {
-        let skip_hash = index_skip_hash_for_write(Some(config));
-        self.write_to_path_with_config_and_policy(path, skip_hash, Some(config), policy)
-    }
-
     /// Write this index to `path` with an explicit trailing-checksum policy.
     ///
     /// When `skip_hash` is true, the trailing SHA-1 is written as all zeros (Git `index.skipHash`).
-    pub fn write_to_path(&mut self, path: &Path, skip_hash: bool) -> Result<()> {
+    pub fn write_to_path(&mut self, path: &Path, skip_hash: bool) -> crate::error::Result<()> {
         self.write_to_path_with_config(path, skip_hash, None)
     }
 
@@ -1626,7 +1546,7 @@ impl Index {
         path: &Path,
         skip_hash: bool,
         config: Option<&ConfigSet>,
-    ) -> Result<()> {
+    ) -> crate::error::Result<()> {
         self.write_to_path_with_config_and_policy(
             path,
             skip_hash,
@@ -1641,7 +1561,7 @@ impl Index {
         skip_hash: bool,
         config: Option<&ConfigSet>,
         policy: crate::parallel::ThreadPolicy,
-    ) -> Result<()> {
+    ) -> crate::error::Result<()> {
         self.write_to_path_with_config_and_lock_policy(path, skip_hash, config, None, policy)
     }
 
@@ -1652,7 +1572,7 @@ impl Index {
         config: Option<&ConfigSet>,
         existing_lock: Option<&mut IndexLock>,
         policy: crate::parallel::ThreadPolicy,
-    ) -> Result<()> {
+    ) -> crate::error::Result<()> {
         self.write_to_path_with_config_and_lock_mode_policy(
             path,
             skip_hash,
@@ -1671,21 +1591,22 @@ impl Index {
         existing_lock: Option<&mut IndexLock>,
         commit: bool,
         policy: crate::parallel::ThreadPolicy,
-    ) -> Result<()> {
-        let body = self.serialize_index_body(config, policy)?;
-
+    ) -> crate::error::Result<()> {
         if let Some(lock) = existing_lock {
             if lock.index_path != path {
-                return Err(Error::Message(
-                    "index lock path does not match write target".into(),
-                ));
+                use crate::error::{GitDirPathOperation, PathIoError, PathIoOperation};
+                return Err(IndexError::PathIo(PathIoError {
+                    operation: PathIoOperation::GitDir(GitDirPathOperation::WriteIndex),
+                    path: Some(path.to_path_buf()),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "index lock path does not match write target",
+                    ),
+                })
+                .into());
             }
-            let checksum: Vec<u8> = if skip_hash {
-                vec![0u8; self.hash_algo.len()]
-            } else {
-                hash_index_body(self.hash_algo, &body)
-            };
-            lock.write_index_contents(&body, &checksum)?;
+            self.stream_index_file(&mut lock.file, skip_hash, config, policy)?;
+            lock.reopen_after_write()?;
             if commit {
                 lock.commit_replace_index()?;
             }
@@ -1698,7 +1619,7 @@ impl Index {
 
         use crate::lockfile::{LockFile, LockWait};
         let wait = LockWait::files_ref_lock(config);
-        let mut lock_file = LockFile::acquire(&tmp_path, wait).map_err(Error::from)?;
+        let mut lock_file = LockFile::acquire(&tmp_path, wait)?;
         if lockfile_pid_enabled {
             if let Err(e) = lock_file
                 .write_holder_pid()
@@ -1711,14 +1632,13 @@ impl Index {
         let wrote_pid_file = lockfile_pid_enabled;
         let (tmp_path, mut lock_file) = lock_file.into_open_file()?;
 
-        if let Err(e) =
-            write_index_body_and_trailer(&mut lock_file, self.hash_algo, skip_hash, &body)
-        {
+        if let Err(e) = self.stream_index_file(&mut lock_file, skip_hash, config, policy) {
+            drop(lock_file);
             let _ = fs::remove_file(&tmp_path);
             if wrote_pid_file {
                 let _ = fs::remove_file(&pid_path);
             }
-            return Err(Error::Io(e));
+            return Err(e);
         }
         drop(lock_file);
 
@@ -1727,7 +1647,7 @@ impl Index {
             if wrote_pid_file {
                 let _ = fs::remove_file(&pid_path);
             }
-            return Err(Error::Io(e));
+            return Err(IndexError::from(e).into());
         }
         if wrote_pid_file {
             let _ = fs::remove_file(&pid_path);
@@ -1735,31 +1655,62 @@ impl Index {
         Ok(())
     }
 
-    fn serialize_index_body(
+    /// Serialize the index into `file` followed by its trailing checksum (zeros when `skip_hash`).
+    ///
+    /// The body is streamed through a buffer of at most [`INDEX_WRITE_CHUNK`] bytes (plus one
+    /// entry or extension), so writing a 100k-entry index does not hold a second full copy of it
+    /// in memory next to the parsed entries.
+    fn stream_index_file(
         &mut self,
+        file: &mut fs::File,
+        skip_hash: bool,
         config: Option<&ConfigSet>,
         policy: crate::parallel::ThreadPolicy,
-    ) -> Result<Vec<u8>> {
+    ) -> crate::error::Result<()> {
         self.ensure_canonical_order();
-        let mut body = Vec::new();
-        self.serialize_into_with_options(&mut body, config, policy)?;
-        Ok(body)
+        let mut hasher = (!skip_hash).then(|| self.hash_algo.checksum_hasher());
+        let mut sink = |chunk: &[u8]| -> io::Result<()> {
+            if let Some(hasher) = hasher.as_mut() {
+                hasher.update(chunk);
+            }
+            file.write_all(chunk)
+        };
+        let mut body = IndexBodyOut {
+            buf: Vec::new(),
+            drained: 0,
+            sink: Some(&mut sink),
+        };
+        self.serialize_body(&mut body, config, policy)?;
+        let checksum = match hasher {
+            Some(hasher) => hasher.finalize(),
+            None => vec![0u8; self.hash_algo.len()],
+        };
+        file.write_all(&checksum)?;
+        Ok(())
     }
 
     #[cfg(test)]
     /// Serialise the index body (without trailing checksum) into `out`.
     ///
     /// Callers must have sorted entries when using format 4 (path compression depends on order).
-    pub(crate) fn serialize_into(&self, out: &mut Vec<u8>) -> Result<()> {
-        self.serialize_into_with_options(out, None, crate::parallel::ThreadPolicy::default())
+    pub(crate) fn serialize_into(&self, out: &mut Vec<u8>) -> crate::error::Result<()> {
+        let mut body = IndexBodyOut {
+            buf: std::mem::take(out),
+            drained: 0,
+            sink: None,
+        };
+        let result = self.serialize_body(&mut body, None, crate::parallel::ThreadPolicy::default());
+        *out = body.buf;
+        result
     }
 
-    pub(crate) fn serialize_into_with_options(
+    /// Serialise the index body (header, entries, extensions; no trailing checksum) into `out`.
+    fn serialize_body(
         &self,
-        out: &mut Vec<u8>,
+        out: &mut IndexBodyOut<'_>,
         config: Option<&ConfigSet>,
         policy: crate::parallel::ThreadPolicy,
-    ) -> Result<()> {
+    ) -> crate::error::Result<()> {
         use crate::index_eoie_ieot::{
             entries_per_ieot_block, ieot_block_count_for_write, record_end_of_index_entries,
             write_ieot_payload, IeotEntry, IeotTable, INDEX_EXT_EOIE, INDEX_EXT_IEOT,
@@ -1777,11 +1728,17 @@ impl Index {
         } else {
             self.version
         };
-        out.reserve(self.estimate_body_capacity(write_version, config));
+        let estimate = self.estimate_body_capacity(write_version, config);
+        out.buf.reserve(if out.sink.is_some() {
+            estimate.min(INDEX_WRITE_CHUNK + INDEX_WRITE_CHUNK_SLACK)
+        } else {
+            estimate
+        });
         // Header
-        out.extend_from_slice(b"DIRC");
-        out.extend_from_slice(&write_version.to_be_bytes());
-        out.extend_from_slice(&(self.entries.len() as u32).to_be_bytes());
+        out.buf.extend_from_slice(b"DIRC");
+        out.buf.extend_from_slice(&write_version.to_be_bytes());
+        out.buf
+            .extend_from_slice(&(self.entries.len() as u32).to_be_bytes());
 
         let ieot_blocks = ieot_block_count_for_write(policy, config, self.entries.len());
         let ieot_stride = ieot_blocks.map(|b| entries_per_ieot_block(self.entries.len(), b));
@@ -1789,7 +1746,7 @@ impl Index {
             entries: Vec::new(),
         };
         let mut nr_in_block = 0u32;
-        let mut block_start_offset = out.len();
+        let mut block_start_offset = out.position();
 
         if write_version == 4 {
             let mut previous_path: Vec<u8> = Vec::new();
@@ -1806,11 +1763,12 @@ impl Index {
                         if !previous_path.is_empty() {
                             previous_path[0] = 0;
                         }
-                        block_start_offset = out.len();
+                        block_start_offset = out.position();
                     }
                 }
-                serialize_entry_v4(entry, &mut previous_path, out);
+                serialize_entry_v4(entry, &mut previous_path, &mut out.buf);
                 nr_in_block += 1;
+                out.drain_if_full()?;
             }
         } else {
             for (i, entry) in self.entries.iter().enumerate() {
@@ -1821,11 +1779,12 @@ impl Index {
                             nr: nr_in_block,
                         });
                         nr_in_block = 0;
-                        block_start_offset = out.len();
+                        block_start_offset = out.position();
                     }
                 }
-                serialize_entry(entry, write_version, out);
+                serialize_entry(entry, write_version, &mut out.buf);
                 nr_in_block += 1;
+                out.drain_if_full()?;
             }
         }
         if ieot_blocks.is_some() && nr_in_block > 0 {
@@ -1835,18 +1794,23 @@ impl Index {
             });
         }
 
-        let extension_offset = out.len();
+        let extension_offset = out.position();
         let write_eoie = record_end_of_index_entries(config);
         let mut eoie_header_bytes: Option<Vec<u8>> = write_eoie.then(Vec::new);
 
         if !ieot_table.entries.is_empty() {
             let mut payload = Vec::new();
             write_ieot_payload(&ieot_table, &mut payload);
-            append_index_extension(out, &mut eoie_header_bytes, INDEX_EXT_IEOT, &payload);
+            append_index_extension(
+                &mut out.buf,
+                &mut eoie_header_bytes,
+                INDEX_EXT_IEOT,
+                &payload,
+            );
         }
         if self.sparse_directories {
             append_index_extension(
-                out,
+                &mut out.buf,
                 &mut eoie_header_bytes,
                 INDEX_EXT_SPARSE_DIRECTORIES,
                 &[],
@@ -1854,14 +1818,19 @@ impl Index {
         }
         if let Some(uc) = &self.untracked_cache {
             let payload = untracked_cache::write_untracked_extension(uc);
-            append_index_extension(out, &mut eoie_header_bytes, INDEX_EXT_UNTRACKED, &payload);
+            append_index_extension(
+                &mut out.buf,
+                &mut eoie_header_bytes,
+                INDEX_EXT_UNTRACKED,
+                &payload,
+            );
         }
-        self.append_fsmonitor_extension(out, &mut eoie_header_bytes)?;
+        self.append_fsmonitor_extension(&mut out.buf, &mut eoie_header_bytes)?;
         if let Some(ru) = &self.resolve_undo {
             let payload = write_resolve_undo_payload(ru);
             if !payload.is_empty() {
                 append_index_extension(
-                    out,
+                    &mut out.buf,
                     &mut eoie_header_bytes,
                     INDEX_EXT_RESOLVE_UNDO,
                     &payload,
@@ -1882,20 +1851,31 @@ impl Index {
                 .unwrap_or_else(EwahBitmap::new);
             let payload =
                 crate::split_index::serialize_link_extension_payload(&sl.base_oid, &del, &rep);
-            append_index_extension(out, &mut eoie_header_bytes, INDEX_EXT_LINK, &payload);
+            append_index_extension(
+                &mut out.buf,
+                &mut eoie_header_bytes,
+                INDEX_EXT_LINK,
+                &payload,
+            );
         }
         if let Some(cache_tree) = &self.cache_tree {
             let mut payload = Vec::new();
             serialize_cache_tree_node(cache_tree, &mut payload);
-            append_index_extension(out, &mut eoie_header_bytes, INDEX_EXT_CACHE_TREE, &payload);
+            append_index_extension(
+                &mut out.buf,
+                &mut eoie_header_bytes,
+                INDEX_EXT_CACHE_TREE,
+                &payload,
+            );
         }
         if write_eoie {
             let mut eoie_payload = Vec::new();
             eoie_payload.extend_from_slice(&(extension_offset as u32).to_be_bytes());
             let headers = eoie_header_bytes.as_deref().unwrap_or(&[]);
             eoie_payload.extend_from_slice(&self.hash_algo.checksum_digest(headers));
-            append_index_extension(out, &mut None, INDEX_EXT_EOIE, &eoie_payload);
+            append_index_extension(&mut out.buf, &mut None, INDEX_EXT_EOIE, &eoie_payload);
         }
+        out.drain()?;
         Ok(())
     }
 
@@ -2186,6 +2166,38 @@ impl Index {
             .position(|e| Self::entry_matches(e, path, stage))
     }
 
+    /// Position of the stage-0 entry for `path`, for callers looking up many paths in index
+    /// order.
+    ///
+    /// On a sorted index this gallops forward from `*cursor`, so paths that arrive in index order
+    /// (a sorted set of plain paths) cost about one comparison each when they are dense; a path
+    /// sorting before the cursor restarts from the beginning. `*cursor` is left at `path`'s
+    /// position. Unsorted indexes fall back to [`Self::find_entry_pos`].
+    pub(crate) fn find_stage0_pos_from(&self, path: &[u8], cursor: &mut usize) -> Option<usize> {
+        if !self.entries_sorted {
+            return self.find_entry_pos(path, 0);
+        }
+        let entries = &self.entries;
+        let cmp = |e: &IndexEntry| Self::cmp_paths(e.path.as_slice(), path).then(e.stage().cmp(&0));
+        let start = (*cursor).min(entries.len());
+        let start = match start.checked_sub(1).map(|prev| cmp(&entries[prev])) {
+            Some(order) if !order.is_lt() => 0,
+            _ => start,
+        };
+        let tail = &entries[start..];
+        let mut bound = 1;
+        while bound < tail.len() && cmp(&tail[bound - 1]).is_lt() {
+            bound = bound.saturating_mul(2);
+        }
+        let window = &tail[..bound.min(tail.len())];
+        let pos = start + window.partition_point(|e| cmp(e).is_lt());
+        *cursor = pos;
+        entries
+            .get(pos)
+            .is_some_and(|e| Self::entry_matches(e, path, 0))
+            .then_some(pos)
+    }
+
     /// Inclusive start and exclusive end of all entries sharing `path` (sorted indexes only).
     fn path_run_range_sorted(&self, path: &[u8]) -> (usize, usize) {
         debug_assert!(self.entries_sorted);
@@ -2244,6 +2256,20 @@ impl Index {
                 .binary_search_by(|e| Self::cmp_paths(e.path.as_slice(), path))
                 .is_ok()
         })
+    }
+
+    /// Whether some entry (at any stage) records `path` as a gitlink (mode `160000`).
+    ///
+    /// Binary search on sorted indexes; a linear scan otherwise.
+    pub(crate) fn has_gitlink_at(&self, path: &[u8]) -> bool {
+        let is_gitlink = |e: &IndexEntry| e.mode == MODE_GITLINK;
+        if self.entries_sorted {
+            let (start, end) = self.path_run_range_sorted(path);
+            return self.entries[start..end].iter().any(is_gitlink);
+        }
+        self.entries
+            .iter()
+            .any(|e| e.path.as_slice() == path && is_gitlink(e))
     }
 
     /// Inclusive start and exclusive end of entries strictly under `path/` (sorted indexes only).
@@ -2556,8 +2582,13 @@ impl Index {
             self.entries = kept;
         }
 
-        for path in invalidated_paths {
-            self.invalidate_after_path_removal(&path);
+        const BULK_INDEX_EXTENSION_INVALIDATE_MIN: usize = 64;
+        if invalidated_paths.len() >= BULK_INDEX_EXTENSION_INVALIDATE_MIN {
+            self.drop_derived_index_extensions();
+        } else {
+            for path in invalidated_paths {
+                self.invalidate_after_path_removal(&path);
+            }
         }
         self.touch_fsmonitor_after_entry_change();
     }
@@ -2917,6 +2948,8 @@ impl Index {
     /// Remove all entries matching the given path (all stages).
     ///
     /// Returns `true` if at least one entry was removed.
+    ///
+    /// For many paths, prefer [`Self::remove_paths`] or [`Self::remove_paths_and_insert`].
     pub fn remove(&mut self, path: &[u8]) -> bool {
         if self.entries_sorted {
             let (start, end) = self.path_run_range_sorted(path);
@@ -3037,7 +3070,7 @@ impl Index {
     /// **subtree** node, that subtree is removed entirely. The removal is essential for the
     /// directory→file transition (e.g. tracked dir `a/b/` replaced by file `a/b`): without it,
     /// stale descendant nodes (`a/b/c`, …) keep their positive `entry_count` and later trip
-    /// [`crate::write_tree::verify_cache_tree`] with "corrupted cache-tree has entries not present
+    /// `verify_cache_tree` with "corrupted cache-tree has entries not present
     /// in index".
     pub fn invalidate_cache_tree_for_path(&mut self, path: &[u8]) {
         let Some(root) = self.cache_tree.as_mut() else {
@@ -3100,7 +3133,7 @@ impl Index {
     ///
     /// Returns an error if the reference cache-tree cannot be built (for example,
     /// if a tree object cannot be written to the object database).
-    pub fn dump_cache_tree(&self, odb: &Odb) -> Result<String> {
+    pub fn dump_cache_tree(&self, odb: &Odb) -> crate::error::Result<String> {
         let Some(it_root) = self.cache_tree.as_ref() else {
             return Ok(String::new());
         };
@@ -3220,7 +3253,9 @@ impl Index {
     ) -> Result<()> {
         let oid = rev_parse::resolve_revision(repo, treeish)?;
         let tree_oid = repo.odb().peel_to_tree(oid)?.ok_or_else(|| {
-            Error::ObjectNotFound(format!("cannot peel {oid} to tree for --with-tree"))
+            Error::Object(ObjectError::NotFound {
+                name: format!("cannot peel {oid} to tree for --with-tree"),
+            })
         })?;
         for e in self.entries.iter_mut() {
             if e.stage() != 0 {
@@ -3230,7 +3265,8 @@ impl Index {
         self.sort();
         let has_stage1 = self.entries.iter().any(|e| e.stage() == 1);
         let mut appended: Vec<IndexEntry> = Vec::new();
-        let protect = crate::path_validate::ProtectOptions::from_config(&*repo.config()?);
+        let protect =
+            crate::path_validate::ProtectOptions::from_config(&*repo.config().snapshot()?);
         read_tree_into_overlay(
             repo,
             &tree_oid,
@@ -3274,9 +3310,9 @@ fn read_tree_into_overlay(
 ) -> Result<()> {
     let obj = repo.odb().read(tree_oid)?;
     if obj.kind != ObjectKind::Tree {
-        return Err(Error::ObjectNotFound(format!(
-            "object {tree_oid} is not a tree"
-        )));
+        return Err(Error::Object(ObjectError::NotFound {
+            name: format!("object {tree_oid} is not a tree"),
+        }));
     }
     let entries = parse_tree(&obj.data)?;
     for TreeEntry { mode, name, oid } in entries {
@@ -3539,41 +3575,16 @@ fn synthetic_stage1_index_entry(mode: u32, path: &[u8], oid: ObjectId) -> IndexE
     }
 }
 
-fn config_truthy(raw: Option<&str>) -> bool {
-    let Some(val) = raw else {
-        return false;
-    };
-    let lowered = val.trim().to_lowercase();
-    matches!(lowered.as_str(), "true" | "yes" | "1" | "on")
-}
-
 /// Whether to write 20 zero bytes instead of the SHA-1 of the index body.
 ///
 /// Mirrors Git `prepare_repo_settings`: `feature.manyFiles` enables skip-hash unless
-/// `index.skipHash` / `index.skiphash` is explicitly false; otherwise honor true `index.skipHash`.
+/// `index.skipHash` is explicitly false; otherwise honor true `index.skipHash`.
 pub(crate) fn index_skip_hash_for_write(config: Option<&ConfigSet>) -> bool {
     let Some(config) = config else {
         return false;
     };
-    let many_files = config
-        .get_bool("feature.manyFiles")
-        .and_then(|r| r.ok())
-        .unwrap_or(false);
-    if many_files {
-        if let Some(Ok(false)) = config.get_bool("index.skipHash") {
-            return false;
-        }
-        if let Some(Ok(false)) = config.get_bool("index.skiphash") {
-            return false;
-        }
-        return true;
-    }
-    for key in ["index.skipHash", "index.skiphash"] {
-        if let Some(Ok(true)) = config.get_bool(key) {
-            return true;
-        }
-    }
-    false
+    let default = config.bool_with_default("feature.manyFiles", false);
+    config.bool_with_default("index.skipHash", default)
 }
 
 fn trim_trailing_slash_bytes(path: &[u8]) -> &[u8] {
@@ -3943,7 +3954,9 @@ fn flatten_tree_blobs(
 ) -> Result<Vec<IndexEntry>> {
     let obj = odb.read(tree_oid)?;
     if obj.kind != ObjectKind::Tree {
-        return Err(Error::IndexError(format!("expected tree at {}", tree_oid)));
+        return Err(Error::from(IndexError::corrupt(IndexCorrupt::new(
+            IndexCorruptReason::WriteTreeExpectedTree { oid: *tree_oid },
+        ))));
     }
     let entries = parse_tree(&obj.data)?;
     let mut out = Vec::new();
@@ -3989,8 +4002,8 @@ fn flatten_tree_blobs(
 /// Exclusive `.git/index.lock` held for a mutating porcelain operation.
 ///
 /// Acquire with [`Self::acquire`] before changing the working tree; persist the index with
-/// [`IndexHandle::commit_update`](crate::index::IndexHandle::commit_update) or
-/// [`IndexHandle::write`](crate::index::IndexHandle::write), then release on drop when
+/// [`IndexFile::commit_update`](crate::index::IndexFile::commit_update) or
+/// [`IndexFile::write`](crate::index::IndexFile::write), then release on drop when
 /// uncommitted.
 pub struct IndexLock {
     pub(crate) index_path: PathBuf,
@@ -4002,25 +4015,19 @@ pub struct IndexLock {
 }
 
 impl IndexLock {
-    /// Write serialized index bytes into the held lock file without replacing `index`.
-    pub(crate) fn write_index_contents(&mut self, body: &[u8], checksum: &[u8]) -> Result<()> {
-        self.file.write_all(body).map_err(Error::Io)?;
-        self.file.write_all(checksum).map_err(Error::Io)?;
+    /// Close the handle the index was just written through and hold the lock with a fresh one.
+    pub(crate) fn reopen_after_write(&mut self) -> crate::error::Result<()> {
         drop(std::mem::replace(
             &mut self.file,
-            fs::OpenOptions::new()
-                .write(true)
-                .open(&self.lock_path)
-                .map_err(Error::Io)?,
+            fs::OpenOptions::new().write(true).open(&self.lock_path)?,
         ));
         Ok(())
     }
 
     /// Rename the staged lock file over the on-disk index.
-    pub(crate) fn commit_replace_index(&mut self) -> Result<()> {
-        crate::atomic_replace::detach_open_handle(&mut self.file).map_err(Error::Io)?;
-        crate::atomic_replace::replace_file(&self.lock_path, &self.index_path)
-            .map_err(Error::Io)?;
+    pub(crate) fn commit_replace_index(&mut self) -> crate::error::Result<()> {
+        crate::atomic_replace::detach_open_handle(&mut self.file)?;
+        crate::atomic_replace::replace_file(&self.lock_path, &self.index_path)?;
         self.committed = true;
         if self.wrote_pid {
             let _ = fs::remove_file(&self.pid_path);
@@ -4035,14 +4042,14 @@ impl IndexLock {
     /// Returns [`Error::LockHeld`] (with the pid sidecar's [`LockHolder`](crate::lockfile::LockHolder)
     /// when one was written) when `index.lock` already exists after the
     /// `core.filesRefLockTimeout` budget, or [`Error::Io`] for other filesystem failures.
-    pub fn acquire(index_path: &Path, config: Option<&ConfigSet>) -> Result<Self> {
+    pub fn acquire(index_path: &Path, config: Option<&ConfigSet>) -> crate::error::Result<Self> {
         let lock_path = index_path.with_extension("lock");
         let pid_path = pid_path_for_lock(&lock_path);
         let lockfile_pid_enabled = grit_lockfile_pid_enabled(config, index_path.parent());
 
         use crate::lockfile::{LockFile, LockWait};
         let wait = LockWait::files_ref_lock(config);
-        let mut lock_file = LockFile::acquire(&lock_path, wait).map_err(Error::from)?;
+        let mut lock_file = LockFile::acquire(&lock_path, wait)?;
         if lockfile_pid_enabled {
             if let Err(e) = lock_file
                 .write_holder_pid()
@@ -4088,27 +4095,54 @@ fn hash_index_body(algo: HashAlgo, body: &[u8]) -> Vec<u8> {
     algo.checksum_digest(body)
 }
 
-/// Write index bytes and trailing checksum in one buffered pass, updating the digest while writing.
-fn write_index_body_and_trailer(
-    file: &mut fs::File,
-    algo: HashAlgo,
-    skip_hash: bool,
-    body: &[u8],
-) -> io::Result<()> {
-    use std::io::BufWriter;
-    let mut out = BufWriter::with_capacity(256 * 1024, file);
-    if skip_hash {
-        out.write_all(body)?;
-        out.write_all(&vec![0u8; algo.len()])?;
-        return out.flush();
+/// Bytes [`IndexBodyOut`] buffers before handing them to its sink when streaming an index write.
+const INDEX_WRITE_CHUNK: usize = 128 * 1024;
+
+/// Headroom reserved past [`INDEX_WRITE_CHUNK`] so the entry that crosses it rarely reallocates.
+const INDEX_WRITE_CHUNK_SLACK: usize = 8 * 1024;
+
+/// Receives each drained chunk of a streamed index body.
+type IndexChunkSink<'a> = &'a mut dyn FnMut(&[u8]) -> io::Result<()>;
+
+/// Serialized index body under construction.
+///
+/// Without a sink the whole body accumulates in `buf`. With a sink, `buf` is handed over and
+/// cleared each time it reaches [`INDEX_WRITE_CHUNK`] between entries, so memory stays bounded
+/// however many entries the index has. [`Self::position`] is the absolute body offset either way,
+/// which the IEOT and EOIE extensions record.
+struct IndexBodyOut<'a> {
+    buf: Vec<u8>,
+    drained: usize,
+    sink: Option<IndexChunkSink<'a>>,
+}
+
+impl IndexBodyOut<'_> {
+    /// Offset of the next byte from the start of the body.
+    fn position(&self) -> usize {
+        self.drained + self.buf.len()
     }
-    let mut hasher = algo.checksum_hasher();
-    for chunk in body.chunks(256 * 1024) {
-        hasher.update(chunk);
-        out.write_all(chunk)?;
+
+    /// Hand `buf` to the sink once it holds at least [`INDEX_WRITE_CHUNK`] bytes.
+    fn drain_if_full(&mut self) -> io::Result<()> {
+        if self.buf.len() < INDEX_WRITE_CHUNK {
+            return Ok(());
+        }
+        self.drain()
     }
-    out.write_all(&hasher.finalize())?;
-    out.flush()
+
+    /// Hand everything buffered to the sink; a no-op for in-memory serialization.
+    fn drain(&mut self) -> io::Result<()> {
+        let Some(sink) = self.sink.as_mut() else {
+            return Ok(());
+        };
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        sink(&self.buf)?;
+        self.drained += self.buf.len();
+        self.buf.clear();
+        Ok(())
+    }
 }
 
 impl Index {
@@ -4198,18 +4232,20 @@ pub(crate) fn parse_entry(
 ) -> Result<(IndexEntry, usize)> {
     // 40 bytes of stat fields + the OID + 2 flag bytes.
     if data.len() < 40 + hash_len + 2 {
-        return Err(Error::IndexError("entry too short".to_owned()));
+        return Err(Error::from(IndexError::corrupt(IndexCorrupt::new(
+            IndexCorruptReason::EntryTooShort,
+        ))));
     }
 
     let mut pos = 0;
 
     macro_rules! read_u32 {
         () => {{
-            let v = u32::from_be_bytes(
-                data[pos..pos + 4]
-                    .try_into()
-                    .map_err(|_| Error::IndexError("truncated u32".to_owned()))?,
-            );
+            let v = u32::from_be_bytes(data[pos..pos + 4].try_into().map_err(|_| {
+                Error::from(IndexError::corrupt(IndexCorrupt::new(
+                    IndexCorruptReason::TruncatedU32,
+                )))
+            })?);
             pos += 4;
             v
         }};
@@ -4229,19 +4265,24 @@ pub(crate) fn parse_entry(
     let oid = ObjectId::from_bytes(&data[pos..pos + hash_len])?;
     pos += hash_len;
 
-    let flags = u16::from_be_bytes(
-        data[pos..pos + 2]
-            .try_into()
-            .map_err(|_| Error::IndexError("truncated flags".to_owned()))?,
-    );
+    let flags = u16::from_be_bytes(data[pos..pos + 2].try_into().map_err(|_| {
+        Error::from(IndexError::corrupt(IndexCorrupt::new(
+            IndexCorruptReason::TruncatedFlags,
+        )))
+    })?);
     pos += 2;
 
     let flags_extended = if version >= 3 && flags & 0x4000 != 0 {
-        let fe = u16::from_be_bytes(
-            data[pos..pos + 2]
-                .try_into()
-                .map_err(|_| Error::IndexError("truncated extended flags".to_owned()))?,
-        );
+        if pos + 2 > data.len() {
+            return Err(Error::from(IndexError::corrupt(IndexCorrupt::new(
+                IndexCorruptReason::TruncatedExtendedFlags,
+            ))));
+        }
+        let fe = u16::from_be_bytes(data[pos..pos + 2].try_into().map_err(|_| {
+            Error::from(IndexError::corrupt(IndexCorrupt::new(
+                IndexCorruptReason::TruncatedExtendedFlags,
+            )))
+        })?);
         pos += 2;
         Some(fe)
     } else {
@@ -4253,10 +4294,11 @@ pub(crate) fn parse_entry(
         // V4: prefix-compressed path
         let (strip_len, varint_bytes) = read_varint(&data[pos..]);
         pos += varint_bytes;
-        let nul = data[pos..]
-            .iter()
-            .position(|&b| b == 0)
-            .ok_or_else(|| Error::IndexError("v4 entry path missing NUL".to_owned()))?;
+        let nul = data[pos..].iter().position(|&b| b == 0).ok_or_else(|| {
+            Error::from(IndexError::corrupt(IndexCorrupt::new(
+                IndexCorruptReason::V4PathMissingNul,
+            )))
+        })?;
         let suffix = &data[pos..pos + nul];
         pos += nul + 1;
         let keep = prev_path.len().saturating_sub(strip_len);
@@ -4266,10 +4308,11 @@ pub(crate) fn parse_entry(
         path = full_path;
     } else {
         // V2/V3: NUL-terminated full path + padding
-        let nul = data[pos..]
-            .iter()
-            .position(|&b| b == 0)
-            .ok_or_else(|| Error::IndexError("entry path missing NUL terminator".to_owned()))?;
+        let nul = data[pos..].iter().position(|&b| b == 0).ok_or_else(|| {
+            Error::from(IndexError::corrupt(IndexCorrupt::new(
+                IndexCorruptReason::PathMissingNulTerminator,
+            )))
+        })?;
         path = data[pos..pos + nul].to_vec();
         pos += nul + 1;
         let entry_start = 0usize;
@@ -4277,6 +4320,17 @@ pub(crate) fn parse_entry(
         let padded = (entry_len + 7) & !7;
         let padding = padded.saturating_sub(entry_len);
         pos += padding;
+        if pos > data.len() {
+            return Err(Error::from(IndexError::corrupt(IndexCorrupt::new(
+                IndexCorruptReason::TruncatedIndexEntry,
+            ))));
+        }
+    }
+
+    if pos > data.len() {
+        return Err(Error::from(IndexError::corrupt(IndexCorrupt::new(
+            IndexCorruptReason::TruncatedIndexEntry,
+        ))));
     }
 
     Ok((
@@ -4876,6 +4930,54 @@ impl IndexStatFields {
             && (!policy.trust_ctime || self.ctime_nsec == ie.ctime_nsec)
     }
 
+    /// Stat tuple from `WIN32_FIND_DATA` (device/inode identity fields are zero).
+    #[must_use]
+    #[cfg(windows)]
+    pub(crate) fn from_windows_directory_stat(
+        raw_size: u64,
+        ctime_sec: u32,
+        ctime_nsec: u32,
+        mtime_sec: u32,
+        mtime_nsec: u32,
+    ) -> Self {
+        Self {
+            ctime_sec,
+            ctime_nsec,
+            mtime_sec,
+            mtime_nsec,
+            dev: 0,
+            ino: 0,
+            uid: 0,
+            gid: 0,
+            size: munge_index_size(raw_size),
+        }
+    }
+
+    /// Whether a directory-listing stat disagrees enough to require a path `symlink_metadata` probe.
+    #[must_use]
+    #[cfg(windows)]
+    pub(crate) fn windows_align_path_probe_needed(
+        &self,
+        ie: &IndexEntry,
+        policy: StatMatchPolicy,
+    ) -> bool {
+        if self.size != ie.size || self.mtime_sec != ie.mtime_sec {
+            return true;
+        }
+        if policy.use_nanosec && policy.check_stat && self.mtime_nsec != ie.mtime_nsec {
+            return true;
+        }
+        if policy.trust_ctime && policy.check_stat {
+            if self.ctime_sec != ie.ctime_sec {
+                return true;
+            }
+            if policy.use_nanosec && self.ctime_nsec != ie.ctime_nsec {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Whether cached stat fields match a stage-0 index row (Git `ie_match_stat`).
     #[must_use]
     pub(crate) fn matches_index_entry(&self, ie: &IndexEntry, policy: StatMatchPolicy) -> bool {
@@ -5114,7 +5216,7 @@ mod tests {
         index.serialize_into(&mut out).unwrap();
         let checksum = hash_index_body(index.hash_algo, &out);
         out.extend_from_slice(&checksum);
-        let reread = Index::parse(&out).unwrap();
+        let reread = Index::parse(&out, &crate::index::IndexParseOptions::default()).unwrap();
         assert_eq!(reread.version, 3);
         assert!(reread
             .entries
@@ -5838,6 +5940,117 @@ mod tests {
     }
 
     #[test]
+    fn find_stage0_pos_from_matches_find_entry_pos_in_any_order() {
+        let mut idx = Index::new();
+        let names: Vec<String> = (0..200).map(|i| format!("d{}/f{i:03}", i % 7)).collect();
+        for name in &names {
+            idx.add_or_replace(make_entry(name));
+        }
+        let mut conflicted = make_entry("d3/conflict");
+        conflicted.flags |= 2 << 12;
+        idx.add_or_replace(conflicted);
+        assert!(idx.entries_sorted);
+
+        let sorted: BTreeSet<&str> = names.iter().map(String::as_str).collect();
+        let mut cursor = 0;
+        index_path_cmp::reset();
+        let found: Vec<Option<usize>> = sorted
+            .iter()
+            .map(|path| idx.find_stage0_pos_from(path.as_bytes(), &mut cursor))
+            .collect();
+        // A constant ~5 comparisons per dense in-order path, against log2(entries) for a binary
+        // search (8 here, 16 on a 48k-entry index).
+        let cmps = index_path_cmp::take();
+        assert!(cmps <= names.len() * 6, "{cmps} comparisons");
+        for (path, found) in sorted.iter().zip(found) {
+            assert!(found.is_some());
+            assert_eq!(found, idx.find_entry_pos(path.as_bytes(), 0));
+        }
+
+        let mut cursor = 0;
+        for path in [
+            "d6/f200",
+            "d0/f000",
+            "missing",
+            "d3/conflict",
+            "d5/f005",
+            "a",
+            "zzz",
+        ] {
+            assert_eq!(
+                idx.find_stage0_pos_from(path.as_bytes(), &mut cursor),
+                idx.find_entry_pos(path.as_bytes(), 0),
+                "{path}"
+            );
+        }
+
+        let mut unsorted = idx.clone();
+        unsorted.entries.reverse();
+        unsorted.entries_sorted = false;
+        let mut cursor = 0;
+        assert_eq!(
+            unsorted.find_stage0_pos_from(b"d0/f000", &mut cursor),
+            unsorted.find_entry_pos(b"d0/f000", 0)
+        );
+    }
+
+    #[test]
+    fn has_gitlink_at_matches_any_stage_sorted_and_unsorted() {
+        let gitlink = |path: &str, stage: u16| {
+            let mut e = make_entry(path);
+            e.mode = MODE_GITLINK;
+            e.flags |= stage << 12;
+            e
+        };
+        let entries = vec![
+            make_entry("a"),
+            gitlink("sub", 0),
+            make_entry("sub.txt"),
+            gitlink("theirs", 3),
+            make_entry("theirs/inner"),
+            make_entry("z"),
+        ];
+        let sorted = sorted_index(entries.clone());
+        let mut unsorted = Index::new();
+        unsorted.entries = entries.into_iter().rev().collect();
+        unsorted.entries_sorted = false;
+        for idx in [&sorted, &unsorted] {
+            assert!(idx.has_gitlink_at(b"sub"));
+            assert!(idx.has_gitlink_at(b"theirs"));
+            assert!(!idx.has_gitlink_at(b"a"));
+            assert!(!idx.has_gitlink_at(b"sub.txt"));
+            assert!(!idx.has_gitlink_at(b"su"));
+            assert!(!idx.has_gitlink_at(b"theirs/inner"));
+            assert!(!idx.has_gitlink_at(b"missing"));
+        }
+    }
+
+    /// Status and add probe every untracked path for an embedded repository; a linear index scan
+    /// per probe made `status`/`add -A` quadratic on large worktrees.
+    #[test]
+    fn has_gitlink_at_sorted_is_sublinear() {
+        const N: usize = 100_000;
+        const M: usize = 1_000;
+        let mut idx = Index::new();
+        for i in 0..N {
+            idx.add_or_replace(make_entry(&format!("file/{i:06}.txt")));
+        }
+        assert!(idx.entries_sorted);
+        let probes: Vec<Vec<u8>> = (0..M)
+            .map(|i| format!("untracked/{i:06}.txt").into_bytes())
+            .collect();
+        index_path_cmp::reset();
+        assert!(probes.iter().all(|p| !idx.has_gitlink_at(p)));
+        let cmps = index_path_cmp::take();
+        let log_n = (N as f64).log2().ceil() as usize;
+        let bound = 4 * M * log_n;
+        assert!(
+            cmps < bound,
+            "gitlink probe comparisons {cmps} should stay under {bound} (N={N}, M={M})"
+        );
+    }
+
+    #[test]
     fn remove_is_sublinear() {
         const N: usize = 100_000;
         const M: usize = 1_000;
@@ -5934,7 +6147,10 @@ mod tests {
         let cfg = crate::config::ConfigSet::load(
             &crate::environment::Environment::empty(),
             Some(&git_dir),
-            true,
+            &crate::config::LoadConfigOptions::standard(
+                &crate::environment::Environment::empty(),
+                Some(&git_dir),
+            ),
         )
         .unwrap();
         let policy = StatMatchPolicy::from_config(Some(&cfg));
@@ -5951,7 +6167,10 @@ mod tests {
         let cfg = crate::config::ConfigSet::load(
             &crate::environment::Environment::empty(),
             Some(&git_dir),
-            true,
+            &crate::config::LoadConfigOptions::standard(
+                &crate::environment::Environment::empty(),
+                Some(&git_dir),
+            ),
         )
         .unwrap();
         StatMatchPolicy::from_config(Some(&cfg))
@@ -6209,11 +6428,32 @@ mod tests {
         let cfg = crate::config::ConfigSet::load(
             &crate::environment::Environment::empty(),
             Some(&git_dir),
-            true,
+            &crate::config::LoadConfigOptions::standard(
+                &crate::environment::Environment::empty(),
+                Some(&git_dir),
+            ),
         )
         .unwrap();
-        let idx = Index::new_from_config(&cfg);
+        let idx = Index::empty_for(&IndexParseOptions::default().with_config(&cfg));
         assert_eq!(idx.version, INDEX_CONFIG_INVALID_FALLBACK);
+    }
+
+    #[test]
+    fn version_from_config_prefers_valid_index_version_over_many_files() {
+        assert_eq!(version_from_config(None, false), 2);
+        assert_eq!(version_from_config(None, true), 4);
+        assert_eq!(version_from_config(Some("  "), true), 4);
+        assert_eq!(version_from_config(Some(" 3 "), true), 3);
+        assert_eq!(version_from_config(Some("2"), true), 2);
+        assert_eq!(
+            version_from_config(Some("5"), false),
+            INDEX_CONFIG_INVALID_FALLBACK
+        );
+        assert_eq!(
+            version_from_config(Some("x"), true),
+            INDEX_CONFIG_INVALID_FALLBACK
+        );
+        assert_eq!(Index::new().version, 2);
     }
 
     #[test]
@@ -6236,13 +6476,15 @@ mod tests {
         let err = parse_fsmonitor_extension(&payload).unwrap_err();
         assert!(matches!(
             err,
-            Error::IndexFsmonitorExtensionTruncated | Error::IndexFsmonitorExtensionEwahInvalid
+            Error::Index(IndexError::FsmonitorExtensionTruncated)
+                | Error::Index(IndexError::FsmonitorExtensionEwahInvalid)
         ));
         payload[12..16].copy_from_slice(&2u32.to_be_bytes());
         let err2 = parse_fsmonitor_extension(&payload).unwrap_err();
         assert!(matches!(
             err2,
-            Error::IndexFsmonitorExtensionTruncated | Error::IndexFsmonitorExtensionEwahInvalid
+            Error::Index(IndexError::FsmonitorExtensionTruncated)
+                | Error::Index(IndexError::FsmonitorExtensionEwahInvalid)
         ));
     }
 
@@ -6269,8 +6511,81 @@ mod tests {
     #[test]
     fn parse_rejects_truncated_headers() {
         for n in 0..12 {
-            assert!(Index::parse(&vec![0u8; n]).is_err());
+            assert!(
+                Index::parse(&vec![0u8; n], &crate::index::IndexParseOptions::default()).is_err()
+            );
         }
+    }
+
+    fn patch_index_entry_count(mut data: Vec<u8>, count: u32) -> Vec<u8> {
+        data[8..12].copy_from_slice(&count.to_be_bytes());
+        let hash_len = HashAlgo::Sha1.len();
+        let body_len = data.len() - hash_len;
+        let checksum = HashAlgo::Sha1.checksum_digest(&data[..body_len]);
+        data[body_len..].copy_from_slice(&checksum);
+        data
+    }
+
+    #[test]
+    fn parse_rejects_truncated_entries_and_bogus_entry_counts() {
+        use crate::index::parse_entry;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("index");
+
+        for version in [2u32, 4] {
+            let mut idx = if version == 4 {
+                Index {
+                    version: 4,
+                    ..Index::default()
+                }
+            } else {
+                Index::new()
+            };
+            idx.add_or_replace(make_entry("abcd"));
+            if version == 4 {
+                idx.add_or_replace(make_entry("nested/ef"));
+            }
+            idx.write(&path).unwrap();
+            let data = fs::read(&path).unwrap();
+            let hash_len = HashAlgo::Sha1.len();
+            let body = &data[12..data.len() - hash_len];
+            let mut paths: Vec<Vec<u8>> = Vec::new();
+            let mut pos = 0usize;
+            while pos < body.len() {
+                let prev: &[u8] = paths.last().map_or(&[][..], Vec::as_slice);
+                let (entry, consumed) = parse_entry(&body[pos..], version, prev, hash_len).unwrap();
+                pos += consumed;
+                if version == 4 {
+                    paths.push(entry.path);
+                }
+            }
+            for cut in [12 + pos - 1, 12 + pos - 3] {
+                if cut <= 12 {
+                    continue;
+                }
+                let truncated = data[..cut].to_vec();
+                assert!(
+                    Index::parse(&truncated, &crate::index::IndexParseOptions::default()).is_err(),
+                    "v{version}: truncated at {cut} must not parse"
+                );
+            }
+
+            for bogus in [0x1000_0000u32, 0x7fff_ffff] {
+                let patched = patch_index_entry_count(data.clone(), bogus);
+                assert!(
+                    Index::parse(&patched, &crate::index::IndexParseOptions::default()).is_err(),
+                    "v{version}: bogus entry count {bogus:#x} must fail fast"
+                );
+            }
+        }
+
+        let mut idx = Index::new();
+        idx.add_or_replace(make_entry("tracked.txt"));
+        idx.write(&path).unwrap();
+        let valid = fs::read(&path).unwrap();
+        assert!(Index::load(&path).is_ok());
+        assert!(Index::parse(&valid, &crate::index::IndexParseOptions::default()).is_ok());
     }
 
     #[test]
@@ -6303,7 +6618,7 @@ mod tests {
         let lock = IndexLock::acquire(&path, None).unwrap();
         assert!(matches!(
             IndexLock::acquire(&path, None),
-            Err(Error::LockHeld { .. })
+            Err(crate::error::Error::LockHeld(..))
         ));
         drop(lock);
         idx.write(&path).unwrap(); // idx is mut in each test scope
@@ -6328,7 +6643,7 @@ mod tests {
         let write_err = Index::new().write(&path).unwrap_err();
         for err in [acquire_err, write_err] {
             match &err {
-                Error::LockHeld { path: p, holder } => {
+                crate::error::Error::LockHeld(crate::error::LockHeldError { path: p, holder }) => {
                     assert_eq!(p, &lock_path);
                     assert_eq!(
                         *holder,
@@ -6349,6 +6664,158 @@ mod tests {
         assert!(!path.exists());
     }
 
+    fn streaming_fixture(version: u32) -> Index {
+        let mut idx = Index::new();
+        idx.version = version;
+        for i in 0..6000 {
+            idx.add_or_replace(make_entry(&format!("dir{:02}/sub/file-{i:05}.txt", i % 37)));
+        }
+        idx
+    }
+
+    fn streaming_config() -> crate::config::ConfigSet {
+        use crate::config::{ConfigFile, ConfigScope};
+        let file = ConfigFile::parse(
+            Path::new("config"),
+            "[index]\n\tthreads = 4\n",
+            ConfigScope::Local,
+        )
+        .unwrap();
+        let mut cfg = crate::config::ConfigSet::new();
+        cfg.merge(&file);
+        cfg
+    }
+
+    fn in_memory_index_file(
+        idx: &Index,
+        cfg: &crate::config::ConfigSet,
+        policy: crate::parallel::ThreadPolicy,
+        skip_hash: bool,
+    ) -> Vec<u8> {
+        let mut body = IndexBodyOut {
+            buf: Vec::new(),
+            drained: 0,
+            sink: None,
+        };
+        idx.serialize_body(&mut body, Some(cfg), policy).unwrap();
+        let mut file = body.buf;
+        let checksum = if skip_hash {
+            vec![0u8; idx.hash_algo.len()]
+        } else {
+            idx.hash_algo.checksum_digest(&file)
+        };
+        file.extend_from_slice(&checksum);
+        file
+    }
+
+    #[test]
+    fn streamed_write_matches_in_memory_serialization_across_chunks() {
+        let policy = crate::parallel::ThreadPolicy::with_threads_override(Some(4));
+        let cfg = streaming_config();
+        for version in [2, 4] {
+            for skip_hash in [false, true] {
+                let dir = TempDir::new().unwrap();
+                let path = dir.path().join("index");
+                let mut idx = streaming_fixture(version);
+                let expected = in_memory_index_file(&idx, &cfg, policy, skip_hash);
+                assert!(
+                    expected.len() > 3 * INDEX_WRITE_CHUNK,
+                    "fixture must span several chunks"
+                );
+                idx.write_to_path_with_config_and_policy(&path, skip_hash, Some(&cfg), policy)
+                    .unwrap();
+                let written = fs::read(&path).unwrap();
+                assert!(
+                    written == expected,
+                    "v{version} skip_hash={skip_hash}: streamed index differs from in-memory body"
+                );
+                assert!(!path.with_extension("lock").exists());
+
+                let ctx = crate::index::IndexParseContext::from_policy(policy);
+                let loaded = Index::parse(
+                    &written,
+                    &IndexParseOptions::default()
+                        .with_hash_algo(idx.hash_algo)
+                        .with_config(&cfg)
+                        .with_source_path(path.as_path())
+                        .with_parse_context(ctx),
+                )
+                .unwrap();
+                assert_eq!(loaded.entries.len(), idx.entries.len());
+                assert!(loaded
+                    .entries
+                    .iter()
+                    .zip(&idx.entries)
+                    .all(|(a, b)| a.path == b.path && a.oid == b.oid));
+            }
+        }
+    }
+
+    #[test]
+    fn streamed_write_through_held_lock_matches_in_memory_serialization() {
+        let policy = crate::parallel::ThreadPolicy::with_threads_override(Some(4));
+        let cfg = streaming_config();
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("index");
+        let mut idx = streaming_fixture(2);
+        let expected = in_memory_index_file(&idx, &cfg, policy, false);
+
+        let mut lock = IndexLock::acquire(&path, Some(&cfg)).unwrap();
+        idx.write_to_path_with_config_and_lock_mode_policy(
+            &path,
+            false,
+            Some(&cfg),
+            Some(&mut lock),
+            false,
+            policy,
+        )
+        .unwrap();
+        assert!(
+            !path.exists(),
+            "uncommitted lock must not replace the index"
+        );
+        assert!(fs::read(path.with_extension("lock")).unwrap() == expected);
+        lock.commit_replace_index().unwrap();
+        assert!(fs::read(&path).unwrap() == expected);
+        assert!(!path.with_extension("lock").exists());
+    }
+
+    #[test]
+    fn index_body_out_drains_only_when_full_and_tracks_offsets() {
+        let mut chunks: Vec<usize> = Vec::new();
+        let mut sink = |chunk: &[u8]| -> io::Result<()> {
+            chunks.push(chunk.len());
+            Ok(())
+        };
+        let mut out = IndexBodyOut {
+            buf: Vec::new(),
+            drained: 0,
+            sink: Some(&mut sink),
+        };
+        out.buf.resize(INDEX_WRITE_CHUNK - 1, 0);
+        out.drain_if_full().unwrap();
+        assert_eq!(out.position(), INDEX_WRITE_CHUNK - 1);
+        out.buf.extend_from_slice(&[1, 2]);
+        out.drain_if_full().unwrap();
+        assert!(out.buf.is_empty());
+        assert_eq!(out.position(), INDEX_WRITE_CHUNK + 1);
+        out.buf.push(3);
+        out.drain().unwrap();
+        out.drain().unwrap();
+        assert_eq!(out.position(), INDEX_WRITE_CHUNK + 2);
+        assert_eq!(chunks, vec![INDEX_WRITE_CHUNK + 1, 1]);
+
+        let mut in_memory = IndexBodyOut {
+            buf: vec![0; INDEX_WRITE_CHUNK * 2],
+            drained: 0,
+            sink: None,
+        };
+        in_memory.drain_if_full().unwrap();
+        in_memory.drain().unwrap();
+        assert_eq!(in_memory.buf.len(), INDEX_WRITE_CHUNK * 2);
+        assert_eq!(in_memory.position(), INDEX_WRITE_CHUNK * 2);
+    }
+
     #[test]
     fn write_with_config_and_parallel_policy() {
         let dir = TempDir::new().unwrap();
@@ -6356,8 +6823,13 @@ mod tests {
         let mut idx = Index::new();
         idx.add_or_replace(make_entry("p"));
         let cfg = crate::config::ConfigSet::new();
-        idx.write_with_config_and_policy(&path, &cfg, crate::parallel::ThreadPolicy::default())
-            .unwrap();
+        idx.write_to_path_with_config_and_policy(
+            &path,
+            index_skip_hash_for_write(Some(&cfg)),
+            Some(&cfg),
+            crate::parallel::ThreadPolicy::default(),
+        )
+        .unwrap();
         assert!(path.is_file());
     }
 
@@ -6391,15 +6863,16 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let odb = crate::odb::Odb::new(dir.path());
         let path = dir.path().join("index");
-        let missing = Index::load_expand_sparse_optional(&path, &odb).unwrap();
+        let missing =
+            Index::load_expand_sparse(&path, &odb, None, IndexParseContext::default()).unwrap();
         assert!(missing.entries.is_empty());
 
         for len in [0, 12, 31] {
             std::fs::write(&path, b"DIRC\0\0\0\x02\0\0\0\0".repeat(3)[..len].to_vec()).unwrap();
             assert!(
                 matches!(
-                    Index::load_expand_sparse_optional(&path, &odb),
-                    Err(Error::IndexError(_))
+                    Index::load_expand_sparse(&path, &odb, None, IndexParseContext::default()),
+                    Err(crate::error::Error::Index(IndexError::Corrupt { .. }))
                 ),
                 "len={len}"
             );
@@ -6518,7 +6991,7 @@ mod tests {
                 .map(|(name, (mode, oid))| TreeEntry { mode, name, oid })
                 .collect();
             entries.sort_by(|a, b| {
-                crate::objects::tree_entry_cmp(
+                crate::objects::tree_name_cmp(
                     &a.name,
                     a.mode == MODE_TREE,
                     &b.name,
@@ -6562,8 +7035,6 @@ mod tests {
                     odb,
                     root,
                     &patterns(),
-                    true,
-                    true,
                     crate::path_validate::ProtectOptions::default(),
                 )
                 .unwrap();

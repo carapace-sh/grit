@@ -1,5 +1,6 @@
 //! Library-backed workloads matched to common `git` ODB-heavy commands.
 
+use grit_lib::error::ObjectError;
 use std::fmt::Write as FmtWrite;
 use std::io::{self, BufRead, BufWriter, Read, Write};
 use std::path::Path;
@@ -8,16 +9,16 @@ use anyhow::{Context, Result};
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::diff::{write_commits_log_patch, LogPatchCommitHeader, LogPatchOptions};
 use grit_lib::error::Error;
-use grit_lib::maintenance::{write_commit_graph, CommitGraphOptions};
+use grit_lib::maintenance::CommitGraphOptions;
 use grit_lib::objects::pack::{
     read_object_from_pack_at_offset, read_pack_index_cached, PackIndex, SingleLocalPackReader,
 };
 use grit_lib::objects::{parse_commit, Object, ObjectId, ObjectKind};
-use grit_lib::remote::serve::{upload_pack, ProtocolVersion, ServeOptions};
+use grit_lib::remote::serve::{ProtocolVersion, ServeOptions, UploadPack};
 use grit_lib::repo::Repository;
-use grit_lib::revwalk::filter::CommitFilterBuilder;
-use grit_lib::revwalk::rev_list::{rev_list, RevListOptions, RevListResult};
-use grit_lib::revwalk::RevWalkListOptions;
+use grit_lib::revwalk::rev_list::{RevListOptions, RevListResult};
+use grit_lib::revwalk::CommitFilterBuilder;
+use grit_lib::revwalk::{DescribeOptions, RevWalkListOptions};
 use std::sync::Arc;
 
 /// Parse one stdin line for `git cat-file --batch` / `--batch-check` (hex OID, optional trailing fields).
@@ -57,7 +58,7 @@ pub fn cat_file_batch(repo: &Repository) -> Result<()> {
             if let Some(reader) = fast.as_mut() {
                 match reader.read_object(&oid) {
                     Ok(object) => write_batch_object_body(&mut stdout, hex, &object)?,
-                    Err(Error::ObjectNotFound(_)) => {
+                    Err(Error::Object(ObjectError::NotFound { .. })) => {
                         write_batch_object(&mut stdout, repo, hex, &oid)?;
                     }
                     Err(e) => return Err(e.into()),
@@ -99,7 +100,7 @@ pub fn cat_file_batch_check(repo: &Repository) -> Result<()> {
             let info_result = if let Some(reader) = fast.as_mut() {
                 match reader.read_info(&oid) {
                     Ok(info) => Ok(info),
-                    Err(Error::ObjectNotFound(_)) => repo.odb().read_info(&oid),
+                    Err(Error::Object(ObjectError::NotFound { .. })) => repo.odb().read_info(&oid),
                     Err(e) => Err(e),
                 }
             } else {
@@ -109,7 +110,7 @@ pub fn cat_file_batch_check(repo: &Repository) -> Result<()> {
                 Ok(info) => {
                     writeln!(stdout, "{hex_str} {} {}", info.kind.as_str(), info.size)?;
                 }
-                Err(Error::ObjectNotFound(_)) => {
+                Err(Error::Object(ObjectError::NotFound { .. })) => {
                     writeln!(stdout, "{hex_str} missing")?;
                 }
                 Err(e) => return Err(e.into()),
@@ -172,7 +173,7 @@ fn write_batch_object(
     let hex_str = std::str::from_utf8(hex).context("oid line utf-8")?;
     match repo.odb().read(oid) {
         Ok(object) => write_batch_object_body(out, hex, &object),
-        Err(Error::ObjectNotFound(_)) => {
+        Err(Error::Object(ObjectError::NotFound { .. })) => {
             writeln!(out, "{hex_str} missing")?;
             Ok(())
         }
@@ -223,7 +224,7 @@ pub fn rev_list_objects(repo: &Repository) -> Result<()> {
     };
     let result = repo
         .odb()
-        .with_pack_read_context(|| rev_list(repo, &[], &[], &opts))
+        .with_pack_read_context(|| repo.revwalk().rev_list(&[], &[], &opts))
         .context("rev-list --objects --all")?;
     let mut stdout = io::stdout().lock();
     for commit in &result.commits {
@@ -247,9 +248,15 @@ pub fn log_patch(repo: &Repository, limit: usize) -> Result<()> {
             use_commit_graph: true,
             ..Default::default()
         };
-        let result =
-            rev_list(repo, &["HEAD".to_owned()], &[], &opts).context("rev-list for log")?;
-        let config = repo.config().map(|c| (*c).clone()).unwrap_or_default();
+        let result = repo
+            .revwalk()
+            .rev_list(&["HEAD".to_owned()], &[], &opts)
+            .context("rev-list for log")?;
+        let config = repo
+            .config()
+            .snapshot()
+            .map(|c| (*c).clone())
+            .unwrap_or_default();
         let mut patch_opts = LogPatchOptions::git_default(&config);
         if std::env::var_os("GRIT_BENCH_LOG_PATCH_PERCENT_H").is_some() {
             patch_opts.commit_header = LogPatchCommitHeader::FormatPercentH;
@@ -269,8 +276,29 @@ pub fn rev_walk_count_head_since(repo: &Repository, since: i64) -> Result<()> {
             limit: Some(20),
             ..RevWalkListOptions::default()
         };
-        let n = repo.rev_walk().count(&["HEAD"], &opts)?;
+        let n = repo.revwalk().count(&["HEAD"], &opts)?;
         println!("{n}");
+        Ok(())
+    })
+}
+
+/// Nearest annotated tag for `HEAD` ([`grit_lib::revwalk::RevWalk::describe`]).
+pub fn rev_walk_describe_head(repo: &Repository) -> Result<()> {
+    repo.odb().with_pack_read_context(|| {
+        let described = repo
+            .revwalk()
+            .describe("HEAD", &DescribeOptions::default())?
+            .ok_or_else(|| anyhow::anyhow!("no reachable tag"))?;
+        println!(
+            "{}-{}-{}",
+            described
+                .tag
+                .as_str()
+                .strip_prefix("refs/tags/")
+                .unwrap_or(described.tag.as_str()),
+            described.distance,
+            described.abbrev
+        );
         Ok(())
     })
 }
@@ -279,7 +307,7 @@ pub fn rev_walk_count_head_since(repo: &Repository, since: i64) -> Result<()> {
 pub fn rev_walk_left_right_count(repo: &Repository, range: &str) -> Result<()> {
     repo.odb().with_pack_read_context(|| {
         let counts = repo
-            .rev_walk()
+            .revwalk()
             .left_right_counts(&[range], &RevWalkListOptions::default())?;
         println!("{} {}", counts.left, counts.right);
         Ok(())
@@ -287,7 +315,7 @@ pub fn rev_walk_left_right_count(repo: &Repository, range: &str) -> Result<()> {
 }
 
 /// `rev-list --count HEAD` (commits reachable from `HEAD`).
-fn author_filter(pattern: &str) -> Result<Arc<grit_lib::revwalk::filter::CommitFilter>> {
+fn author_filter(pattern: &str) -> Result<Arc<grit_lib::revwalk::CommitFilter>> {
     Ok(Arc::new(
         CommitFilterBuilder::new()
             .author(pattern)
@@ -304,7 +332,9 @@ pub fn rev_list_count_author_head(repo: &Repository, author: &str) -> Result<()>
         use_commit_graph: true,
         ..Default::default()
     };
-    let result = rev_list(repo, &["HEAD".to_string()], &[], &opts)
+    let result = repo
+        .revwalk()
+        .rev_list(&["HEAD".to_string()], &[], &opts)
         .context("rev-list --count --author HEAD")?;
     println!("{}", result.commit_count());
     Ok(())
@@ -318,8 +348,10 @@ pub fn rev_list_author_n_head(repo: &Repository, author: &str, max_count: usize)
         use_commit_graph: true,
         ..Default::default()
     };
-    let result =
-        rev_list(repo, &["HEAD".to_string()], &[], &opts).context("rev-list --author -n HEAD")?;
+    let result = repo
+        .revwalk()
+        .rev_list(&["HEAD".to_string()], &[], &opts)
+        .context("rev-list --author -n HEAD")?;
     println!("{}", result.commits.len());
     Ok(())
 }
@@ -332,7 +364,10 @@ pub fn rev_list_head(repo: &Repository) -> Result<()> {
         use_commit_graph: true,
         ..Default::default()
     };
-    let result = rev_list(repo, &["HEAD".to_string()], &[], &opts).context("rev-list HEAD")?;
+    let result = repo
+        .revwalk()
+        .rev_list(&["HEAD".to_string()], &[], &opts)
+        .context("rev-list HEAD")?;
     let mut out = std::io::BufWriter::new(std::io::stdout().lock());
     for oid in &result.commits {
         writeln!(out, "{oid}")?;
@@ -347,16 +382,18 @@ pub fn rev_list_count_head(repo: &Repository) -> Result<()> {
         use_commit_graph: true,
         ..Default::default()
     };
-    let result =
-        rev_list(repo, &["HEAD".to_string()], &[], &opts).context("rev-list --count HEAD")?;
+    let result = repo
+        .revwalk()
+        .rev_list(&["HEAD".to_string()], &[], &opts)
+        .context("rev-list --count HEAD")?;
     let n = result.commit_count();
     println!("{n}");
     Ok(())
 }
 
 fn blame_head_start(repo: &Repository) -> Result<grit_lib::objects::ObjectId> {
-    use grit_lib::state::{resolve_head, HeadState};
-    match resolve_head(repo.git_dir())? {
+    use grit_lib::state::HeadState;
+    match repo.references().head()? {
         HeadState::Detached { oid } => Ok(oid),
         HeadState::Branch { oid: Some(oid), .. } => Ok(oid),
         HeadState::Branch { oid: None, .. } | HeadState::Invalid => {
@@ -371,10 +408,10 @@ pub fn parse_blame_line_range(
     path: &str,
     spec: &str,
 ) -> Result<std::ops::RangeInclusive<usize>> {
-    use grit_lib::blame::resolve_blame_line_range;
-
     let start = blame_head_start(repo)?;
-    resolve_blame_line_range(repo, start, path, spec).map_err(|e| anyhow::anyhow!("{e}"))
+    repo.diff()
+        .resolve_blame_line_range(start, path, spec)
+        .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 /// Emit `git blame --porcelain` for one worktree path at `HEAD`.
@@ -388,20 +425,21 @@ pub fn blame_porcelain_with_range(
     path: &str,
     line_range: Option<std::ops::RangeInclusive<usize>>,
 ) -> Result<()> {
-    use grit_lib::blame::{blame_file, BlameOptions};
+    use grit_lib::blame::BlameOptions;
     use std::io::{BufWriter, Write};
 
     let start = blame_head_start(repo)?;
-    let result = blame_file(
-        repo,
-        path,
-        &BlameOptions {
-            start: Some(start),
-            line_range,
-            ..Default::default()
-        },
-    )
-    .context("blame_file")?;
+    let result = repo
+        .diff()
+        .blame(
+            path,
+            &BlameOptions {
+                start: Some(start),
+                line_range,
+                ..Default::default()
+            },
+        )
+        .context("blame_file")?;
 
     let mut stdout = BufWriter::new(io::stdout().lock());
     let mut i = 0usize;
@@ -517,7 +555,10 @@ pub fn rev_list_count(repo: &Repository) -> Result<()> {
         use_commit_graph: true,
         ..Default::default()
     };
-    let result = rev_list(repo, &[], &[], &opts).context("rev-list --count --all")?;
+    let result = repo
+        .revwalk()
+        .rev_list(&[], &[], &opts)
+        .context("rev-list --count --all")?;
     let n = result.commit_count();
     println!("{n}");
     Ok(())
@@ -535,7 +576,7 @@ pub fn rev_list_count_objects(repo: &Repository) -> Result<()> {
     };
     let result = repo
         .odb()
-        .with_pack_read_context(|| rev_list(repo, &[], &[], &opts))
+        .with_pack_read_context(|| repo.revwalk().rev_list(&[], &[], &opts))
         .context("rev-list --count --objects --all")?;
     let n = result.count_with_objects_total();
     println!("{n}");
@@ -581,8 +622,9 @@ fn serve_request(repo: &Repository, request_file: &str) -> Result<()> {
         hidden_refs: Vec::new(),
         ..ServeOptions::default()
     };
-    let _summary =
-        upload_pack(repo, &mut input, &mut sink, &mut opts).context("upload-pack serve-clone")?;
+    let _summary = UploadPack::new(repo, &mut opts)
+        .run(&mut input, &mut sink)
+        .context("upload-pack serve-clone")?;
     println!("{}", sink.bytes);
     Ok(())
 }
@@ -590,9 +632,11 @@ fn serve_request(repo: &Repository, request_file: &str) -> Result<()> {
 /// Materialize `branch` in the worktree (matches `git checkout -f` after `--no-checkout`).
 pub fn checkout_branch_force(repo: &Repository, branch: &str) -> Result<()> {
     use grit_lib::objects::parse_commit;
-    use grit_lib::porcelain::checkout::checkout_between_trees;
+    use grit_lib::progress::{CancelToken, NullProgress};
     let oid = if branch.eq_ignore_ascii_case("HEAD") {
-        *grit_lib::state::resolve_head(repo.git_dir())?
+        *repo
+            .references()
+            .head()?
             .oid()
             .context("HEAD does not resolve to a commit")?
     } else {
@@ -611,7 +655,9 @@ pub fn checkout_branch_force(repo: &Repository, branch: &str) -> Result<()> {
             .data,
     )
     .context("parse commit")?;
-    checkout_between_trees(repo, None, &commit.tree).context("checkout branch")?;
+    repo.checkout()
+        .checkout(None, &commit.tree, &mut NullProgress, &CancelToken::never())
+        .context("checkout branch")?;
     Ok(())
 }
 
@@ -622,7 +668,7 @@ pub fn index_pack_records(
     threads: Option<usize>,
 ) -> Result<()> {
     use grit_lib::objects::hash::Parallelism;
-    use grit_lib::objects::unpack_objects::pack_index_records_with_threads;
+    use grit_lib::objects::unpack_objects::pack_index_records;
 
     let pack =
         std::fs::read(pack_path).with_context(|| format!("read pack {}", pack_path.display()))?;
@@ -630,11 +676,11 @@ pub fn index_pack_records(
         Some(n) => Parallelism::resolve(Some(n)),
         None => repo
             .config()
+            .snapshot()
             .map(|cfg| cfg.pack_index_parallelism())
             .unwrap_or_else(|_| Parallelism::resolve(None)),
     };
-    let _records =
-        pack_index_records_with_threads(&pack, repo.odb(), parallelism).context("index-pack")?;
+    let _records = pack_index_records(&pack, repo.odb(), parallelism).context("index-pack")?;
     Ok(())
 }
 
@@ -642,9 +688,12 @@ pub fn index_pack_records(
 pub fn pack_build_all_stdout(repo: &Repository, delta_threads: usize) -> Result<()> {
     use grit_lib::objects::hash::Parallelism;
     use grit_lib::objects::pack_objects::{PackBuildOptions, PackObjects, PackObjectsOptions};
-    use grit_lib::refs::list_refs_for_repository;
 
-    let refs = list_refs_for_repository(repo, "")?;
+    let refs = repo.references().list("").map(|refs| {
+        refs.into_iter()
+            .map(|(n, o)| (String::from(n), o))
+            .collect::<Vec<_>>()
+    })?;
     let wants: Vec<_> = refs.into_iter().map(|(_, oid)| oid).collect();
     let workers = if delta_threads == 0 {
         Parallelism::resolve(None).threads().get()
@@ -662,7 +711,7 @@ pub fn pack_build_all_stdout(repo: &Repository, delta_threads: usize) -> Result<
     let mut stdout = io::stdout().lock();
     PackObjects::new(repo.odb(), opts)
         .wants(&wants)
-        .write_to(&mut stdout)
+        .write_to(&mut stdout, &mut grit_lib::progress::NullProgress)
         .context("pack-objects --all")?;
     Ok(())
 }
@@ -674,8 +723,9 @@ pub fn diff_rename_m(
     new_rev: &str,
     threshold: u32,
 ) -> Result<()> {
-    use grit_lib::diff::{detect_renames, diff_trees};
+    use grit_lib::diff::{RenameDetection, TreeDiffOptions};
     use grit_lib::objects::parse_commit;
+    use grit_lib::parallel::ThreadPolicy;
 
     let old_oid = resolve_rev(repo, old_rev)?;
     let new_oid = resolve_rev(repo, new_rev)?;
@@ -683,13 +733,14 @@ pub fn diff_rename_m(
     let new_raw = repo.odb().read(&new_oid).context("read new commit")?;
     let old_commit = parse_commit(&old_raw.data).context("parse old commit")?;
     let new_commit = parse_commit(&new_raw.data).context("parse new commit")?;
-    let entries = diff_trees(
-        repo.odb(),
-        Some(&old_commit.tree),
-        Some(&new_commit.tree),
-        "",
-    )?;
-    let entries = detect_renames(repo.odb(), None, entries, threshold);
+    let similarity = u8::try_from(threshold.min(100)).unwrap_or(100);
+    let options = TreeDiffOptions::default()
+        .with_renames(RenameDetection::Similarity(similarity))
+        .with_threads(Some(ThreadPolicy::default()));
+    let entries = repo
+        .diff()
+        .tree_to_tree(Some(&old_commit.tree), Some(&new_commit.tree), &options)?
+        .entries;
     let mut out = io::stdout().lock();
     for entry in entries {
         let path = entry
@@ -721,7 +772,8 @@ fn resolve_rev(repo: &Repository, rev: &str) -> Result<ObjectId> {
 
 /// Write a reachable commit-graph with changed-path Bloom filters (maintenance API).
 pub fn commit_graph_write(repo: &Repository) -> Result<()> {
-    write_commit_graph(repo, &CommitGraphOptions::with_changed_paths(true))?;
+    repo.maintenance()
+        .write_commit_graph(&CommitGraphOptions::with_changed_paths(true))?;
     Ok(())
 }
 
@@ -737,11 +789,11 @@ pub fn hash_object_stdin_write(repo: &Repository) -> Result<()> {
     Ok(())
 }
 
-/// Run [`predict_merge`](grit_lib::porcelain::merge::predict_merge) for the pick/merge
-/// hot-path fixture metadata in `repo` (matches `git merge-tree --write-tree` oids).
+/// Run [`Merge::predict`](grit_lib::merge::Merge::predict) for the pick/merge hot-path fixture
+/// metadata in `repo` (matches `git merge-tree --write-tree` oids).
 pub fn merge_predict_hot_path(repo_path: &Path) -> Result<()> {
+    use grit_lib::merge::MergePredictionOptions;
     use grit_lib::objects::ObjectId;
-    use grit_lib::porcelain::merge::{predict_merge, MergePredictionOptions};
 
     let meta = crate::hot_path_fixture::load_meta(repo_path)?;
     let into: ObjectId = meta
@@ -753,7 +805,8 @@ pub fn merge_predict_hot_path(repo_path: &Path) -> Result<()> {
         .parse()
         .context("parse pick_commit from hot-path meta")?;
     let repo = open_repo(repo_path)?;
-    predict_merge(&repo, into, other, &MergePredictionOptions::default())?;
+    repo.merge()
+        .predict(into, other, &MergePredictionOptions::default())?;
     Ok(())
 }
 

@@ -1,18 +1,18 @@
 //! Server side of the Git wire protocol: answering fetches and accepting pushes.
 //!
 //! This module lets a process act as the remote end of a clone, fetch, or push.
-//! [`upload_pack`] serves objects to a fetching client (protocol v0, v1, and v2)
-//! and [`receive_pack`] accepts a pushed pack plus ref updates. Both operate on
-//! plain byte streams, so the same code serves a duplex connection (ssh, a
-//! local pipe) and the stateless request/response exchanges of smart HTTP.
+//! An [`UploadPack`] session serves objects to a fetching client (protocol v0, v1,
+//! and v2) and a [`ReceivePack`] session accepts a pushed pack plus ref updates.
+//! Both run over plain byte streams, so the same code serves a duplex connection
+//! (ssh, a local pipe) and the stateless request/response exchanges of smart HTTP.
 //!
 //! A push server decides what to accept with a [`ReceivePolicy`] (the
 //! `receive.*` settings), the repository's hook scripts, and optionally an
-//! in-process [`ReceiveHook`] passed to [`receive_pack_with_hook`]. Refusals
+//! in-process [`ReceiveHook`] passed to [`ReceivePack::with_hook`]. Refusals
 //! come back typed, as [`RefUpdateRefusal`] per ref and [`UnpackError`] for the
 //! pack.
 //!
-//! The functions take an already-opened [`Repository`] and explicit options; they
+//! The sessions take an already-opened [`Repository`] and explicit options; they
 //! never read the process environment or print to the terminal. Callers are
 //! expected to map `GIT_PROTOCOL` to a [`ProtocolVersion`] and to load
 //! configuration at their own boundary.
@@ -20,6 +20,7 @@
 mod connectivity;
 mod object_info;
 pub(crate) mod promised_objects;
+pub(crate) mod push_to_checkout;
 mod receive_pack;
 mod ref_update_policy;
 mod shallow_upload;
@@ -30,27 +31,35 @@ pub(crate) use receive_pack::ReceiveHookScripts;
 pub(crate) use shallow_upload::{compute_shallow_response, ShallowRequest};
 
 pub use receive_pack::{
-    receive_pack, receive_pack_with_hook, receive_pack_with_hook_cancellable, HookRunRecord,
-    ReceiveHook, ReceiveHookContext, ReceiveOutcome, ReceivePolicy, RefCommand, RefUpdateRefusal,
-    RefUpdateResult, RejectedObject, UnpackError,
+    ReceiveHook, ReceiveHookContext, ReceiveOutcome, ReceivePack, ReceivePolicy, RefCommand,
+    RefUpdateRefusal, RefUpdateResult, UnpackError,
 };
-pub use ref_update_policy::{checked_out_branch, head_branch, validate_ref_update, HeadBranches};
-pub use upload_pack::{upload_pack, upload_pack_cancellable, UploadOutcome};
+pub(crate) use ref_update_policy::{checked_out_branch, validate_ref_update};
+pub(crate) use ref_update_policy::{head_branch, HeadBranches};
+pub use upload_pack::{UploadOutcome, UploadPack};
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ops::ControlFlow;
 
 use crate::objects::ObjectId;
-use crate::refs::listing::PACKED_PEELS_MIN_REFS;
-use crate::refs::store::RawRef;
+use crate::refs::store::{RawRef, RefNameRef};
 use crate::refs::PackedRefPeels;
 use crate::repo::Repository;
 
-/// Errors produced while serving a fetch or a push.
+/// Protocol-level failures while serving a fetch or a push; repository failures are reported in
+/// their own areas.
+///
+/// Surfaced on the umbrella as [`RemoteError::Serve`](crate::remote::RemoteError::Serve).
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ServeError {
     /// The peer sent something that does not follow the wire protocol.
-    #[error("protocol error: {0}")]
-    Protocol(String),
+    #[error("protocol error: {detail}")]
+    Protocol {
+        /// What the client sent that broke the protocol.
+        detail: String,
+    },
     /// The client asked for an object that is not an advertised ref tip.
     #[error("not our ref: {0}")]
     NotOurRef(ObjectId),
@@ -59,7 +68,7 @@ pub enum ServeError {
     /// Only raised before any pack byte is written, so the client gets a clean
     /// `ERR` line (protocol v2) or a side-band error (v0/v1) instead of a pack cut
     /// short. Repositories without promisor remotes report missing objects the
-    /// way they always did, as a [`ServeError::Repository`] error.
+    /// way they always did, as an object store error.
     #[error("object {oid} is missing: {reason}")]
     ObjectMissing {
         /// The missing object.
@@ -68,8 +77,11 @@ pub enum ServeError {
         reason: MissingObjectReason,
     },
     /// The client requested a v2 command this server does not implement.
-    #[error("unknown command: {0}")]
-    UnknownCommand(String),
+    #[error("unknown command: {command}")]
+    UnknownCommand {
+        /// The command name the client sent.
+        command: String,
+    },
     /// A `deepen-not` argument (`--shallow-exclude`) cannot be used as a
     /// shallow-history exclusion point.
     #[error("invalid deepen-not '{spec}': {reason}")]
@@ -90,21 +102,43 @@ pub enum ServeError {
         /// Hash algorithm of the served repository.
         repository: &'static str,
     },
-    /// Reading or writing repository data failed.
-    #[error(transparent)]
-    Repository(#[from] crate::error::Error),
-    /// The underlying stream failed.
+    /// Reading the request or writing the response stream failed.
     #[error(transparent)]
     Io(#[from] std::io::Error),
-    /// The session was stopped by a cancel signal before finishing.
-    #[error("cancelled")]
-    Cancelled,
     /// Sending the pack failed after part of it had gone out, so the response
     /// cannot be turned into a clean error any more. With a side band the
     /// client was told on band 3; the transport should end the response as
     /// failed rather than complete it.
-    #[error("the pack failed partway through: {0}")]
-    PackInterrupted(Box<ServeError>),
+    #[error("the pack failed partway through: {cause}")]
+    PackInterrupted {
+        /// What stopped the pack.
+        cause: crate::error::ErrorSummary,
+        /// Whether the pack stopped because the client closed its end of the stream.
+        broken_pipe: bool,
+    },
+}
+
+/// A fetch request body grew past the transport's decoded-size limit.
+///
+/// Smart HTTP wraps upload-pack input with a byte cap. The wrapper surfaces this
+/// as the inner error of [`ServeError::Io`]. Upload-pack must return that error
+/// to the transport instead of encoding it as a protocol v2 `ERR` line.
+#[derive(Debug)]
+pub struct RequestBodyLimitExceeded;
+
+impl std::fmt::Display for RequestBodyLimitExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "fetch request body exceeds the decoded size limit")
+    }
+}
+
+impl std::error::Error for RequestBodyLimitExceeded {}
+
+/// Whether `err` is a fetch request-body limit from a transport wrapper.
+#[must_use]
+pub fn io_error_is_request_body_limit(err: &std::io::Error) -> bool {
+    err.get_ref()
+        .is_some_and(|inner| inner.is::<RequestBodyLimitExceeded>())
 }
 
 /// Why a missing object could not be served; see [`ServeError::ObjectMissing`].
@@ -137,6 +171,7 @@ pub enum MissingObjectReason {
 
 /// Why a `deepen-not` argument was rejected; see [`ServeError::InvalidDeepenNot`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum DeepenNotError {
     /// The argument names neither an existing ref nor an object in the repository.
     #[error("no such ref or object")]
@@ -150,7 +185,7 @@ pub enum DeepenNotError {
 }
 
 /// Result alias for serving operations.
-pub type Result<T> = std::result::Result<T, ServeError>;
+pub type Result<T> = crate::error::Result<T>;
 
 /// Wire protocol version requested by the client.
 ///
@@ -292,7 +327,8 @@ impl ServeOptions {
         self.lazy_fetch.unwrap_or_else(|| {
             config
                 .get_bool("uploadpack.lazyfetch")
-                .and_then(|v| v.ok())
+                .ok()
+                .flatten()
                 .unwrap_or(false)
         })
     }
@@ -309,7 +345,6 @@ impl ServeOptions {
     /// # Parameters
     ///
     /// - `repo`: the served repository.
-    /// - `config`: its configuration.
     /// - `fetcher`: the fetcher to use when lazy fetch is on.
     ///
     /// # Returns
@@ -318,10 +353,14 @@ impl ServeOptions {
     pub fn attach_promisor_fetcher(
         &self,
         repo: &Repository,
-        config: &crate::config::ConfigSet,
         fetcher: Option<std::sync::Arc<dyn crate::promisor_fetch::PromisorFetcher>>,
     ) -> bool {
-        let fetcher = fetcher.filter(|_| self.lazy_fetch_enabled(config));
+        let lazy = repo
+            .config()
+            .snapshot()
+            .map(|c| self.lazy_fetch_enabled(c.as_ref()))
+            .unwrap_or(false);
+        let fetcher = fetcher.filter(|_| lazy);
         let attached = fetcher.is_some();
         repo.caches().set_promisor_fetcher(fetcher);
         attached
@@ -330,9 +369,10 @@ impl ServeOptions {
 
 /// Name of the receive-pack capability that advertises a resumable push
 /// endpoint ([`ServeOptions::push_bundle`]).
-pub const PUSH_BUNDLE_CAPABILITY: &str = "pushBundle";
+pub(crate) const PUSH_BUNDLE_CAPABILITY: &str = "pushBundle";
 
 /// One ref as it appears in an advertisement.
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub(crate) struct AdvertisedRef {
     /// Full ref name, such as `refs/heads/main`.
@@ -343,7 +383,7 @@ pub(crate) struct AdvertisedRef {
     pub(crate) peeled: Option<ObjectId>,
 }
 
-/// Whether [`advertised_refs`] fills [`AdvertisedRef::peeled`].
+/// Whether [`for_each_advertised_ref`] peels annotated tags.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Peel {
     /// Leave `peeled` empty and read no objects.
@@ -352,7 +392,18 @@ pub(crate) enum Peel {
     Yes,
 }
 
-/// List the repository's refs in advertisement order, skipping hidden ones.
+/// One ref while streaming an advertisement (name borrows the ref store entry).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AdvertisedRefView<'a> {
+    /// Full ref name, such as `refs/heads/main`.
+    pub(crate) name: &'a str,
+    /// Object the ref points at.
+    pub(crate) oid: ObjectId,
+    /// For an annotated tag, the non-tag object it ultimately points at.
+    pub(crate) peeled: Option<ObjectId>,
+}
+
+/// Visit refs in advertisement order without retaining every name.
 ///
 /// Only refs whose names start with one of `prefixes` are listed (every ref
 /// under `refs/` when `prefixes` is empty), and the ref store is asked for
@@ -364,69 +415,110 @@ pub(crate) enum Peel {
 /// are left out. As in Git, a ref naming a missing object is still advertised;
 /// with [`Peel::Yes`] it, like any ref whose tag chain cannot be read, simply
 /// gets no peeled value.
-pub(crate) fn advertised_refs(
+pub(crate) fn for_each_advertised_ref(
     repo: &Repository,
     hidden: &[String],
     prefixes: &[&str],
     peel: Peel,
-) -> Result<Vec<AdvertisedRef>> {
-    let store = repo.refs();
+    mut f: impl FnMut(AdvertisedRefView<'_>) -> Result<ControlFlow<()>>,
+) -> Result<()> {
+    let store = repo.ref_store();
     let git_dir = repo.git_dir();
     let linked_worktree = crate::worktree_ref::is_linked_worktree_git_dir(git_dir);
-    let mut listed: Vec<(String, ObjectId)> = Vec::new();
-    for prefix in scan_prefixes(prefixes) {
-        store.for_each_ref(prefix, &mut |entry| {
-            let name = entry.name.as_str();
-            if !name.starts_with(prefix)
-                || !crate::refs::is_valid_fetch_advertised_ref(name)
-                || crate::hide_refs::ref_is_hidden(name, name, hidden)
-                || (linked_worktree
-                    && !crate::worktree_ref::ref_visible_from_worktree(git_dir, name))
-            {
-                return ControlFlow::Continue(());
-            }
-            let oid = match &entry.value {
-                RawRef::Direct(oid) => Some(*oid),
-                RawRef::Symbolic(_) => entry.peeled.or_else(|| store.resolve(name).ok()),
-            };
-            if let Some(oid) = oid {
-                listed.push((entry.name.clone(), oid));
-            }
-            ControlFlow::Continue(())
-        })?;
-    }
-    if !listed.is_sorted_by(|a, b| a.0 < b.0) {
-        listed.sort_by(|a, b| a.0.cmp(&b.0));
-        listed.dedup_by(|later, first| later.0 == first.0);
-    }
-
-    if peel == Peel::No {
-        return Ok(listed
-            .into_iter()
-            .map(|(name, oid)| AdvertisedRef {
-                name,
-                oid,
-                peeled: None,
-            })
-            .collect());
-    }
-    let odb = repo.odb();
-    // A malformed `packed-refs` only loses the shortcut; peeling falls back to the objects.
-    let packed = (listed.len() >= PACKED_PEELS_MIN_REFS)
+    let packed = (peel == Peel::Yes)
         .then(|| PackedRefPeels::for_store(store, git_dir).ok())
         .flatten();
-    Ok(odb.with_pack_read_context(|| {
-        listed
-            .into_iter()
-            .map(|(name, oid)| {
-                let peeled = packed
-                    .as_ref()
-                    .and_then(|p| p.peeled(&name, &oid))
-                    .unwrap_or_else(|| odb.peel_tag_target(oid).ok().flatten());
-                AdvertisedRef { name, oid, peeled }
-            })
-            .collect()
-    }))
+    let odb = repo.odb();
+    let mut peel_cache: HashMap<ObjectId, Option<ObjectId>> = HashMap::new();
+    let callback_err = RefCell::new(None::<Result<()>>);
+    let peel_ctx = peel == Peel::Yes;
+    let run = || {
+        for prefix in scan_prefixes(prefixes) {
+            store.for_each_ref(prefix, &mut |entry| {
+                if callback_err.borrow().is_some() {
+                    return ControlFlow::Break(());
+                }
+                let name = entry.name.as_str();
+                if !name.starts_with(prefix)
+                    || !crate::refs::is_valid_fetch_advertised_ref(name)
+                    || crate::hide_refs::ref_is_hidden(name, name, hidden)
+                    || (linked_worktree
+                        && !crate::worktree_ref::ref_visible_from_worktree(git_dir, name))
+                {
+                    return ControlFlow::Continue(());
+                }
+                let oid = match &entry.value {
+                    RawRef::Direct(oid) => Some(*oid),
+                    RawRef::Symbolic(_) => entry
+                        .peeled
+                        .or_else(|| store.resolve(RefNameRef::from_trusted(name)).ok()),
+                };
+                let Some(oid) = oid else {
+                    return ControlFlow::Continue(());
+                };
+                let entry_peeled = match &entry.value {
+                    RawRef::Direct(_) => entry.peeled,
+                    RawRef::Symbolic(_) => None,
+                };
+                let peeled: Option<ObjectId> = match peel {
+                    Peel::No => None,
+                    Peel::Yes => {
+                        if let Some(p) = entry_peeled {
+                            Some(p)
+                        } else if let Some(cached_peel) =
+                            packed.as_ref().and_then(|p| p.peeled(name, &oid))
+                        {
+                            cached_peel
+                        } else if let Some(cached) = peel_cache.get(&oid) {
+                            *cached
+                        } else {
+                            let p = odb.peel_tag_target(oid).ok().flatten();
+                            peel_cache.insert(oid, p);
+                            p
+                        }
+                    }
+                };
+                match f(AdvertisedRefView { name, oid, peeled }) {
+                    Ok(ControlFlow::Continue(())) => ControlFlow::Continue(()),
+                    Ok(ControlFlow::Break(())) => ControlFlow::Break(()),
+                    Err(e) => {
+                        *callback_err.borrow_mut() = Some(Err(e));
+                        ControlFlow::Break(())
+                    }
+                }
+            })?;
+            if callback_err.borrow().is_some() {
+                break;
+            }
+        }
+        if let Some(Err(e)) = callback_err.into_inner() {
+            return Err(e);
+        }
+        Ok(())
+    };
+    if peel_ctx {
+        odb.with_pack_read_context(run)
+    } else {
+        run()
+    }
+}
+
+/// Object ids that appear in an advertisement (direct tips and peeled targets).
+pub(crate) fn advertised_object_ids_from_repo(
+    repo: &Repository,
+    hidden: &[String],
+    prefixes: &[&str],
+    peel: Peel,
+) -> Result<std::collections::HashSet<ObjectId>> {
+    let mut ids = std::collections::HashSet::new();
+    for_each_advertised_ref(repo, hidden, prefixes, peel, |r| {
+        ids.insert(r.oid);
+        if let Some(p) = r.peeled {
+            ids.insert(p);
+        }
+        Ok(ControlFlow::Continue(()))
+    })?;
+    Ok(ids)
 }
 
 /// Ref-store prefixes to list so that every ref under `refs/` starting with one
@@ -466,11 +558,20 @@ pub(crate) struct HeadInfo {
 
 /// Read `HEAD` for the advertisement.
 pub(crate) fn head_info(repo: &Repository) -> HeadInfo {
-    HeadInfo {
-        target: crate::refs::read_symbolic_ref(repo.git_dir(), "HEAD")
-            .ok()
-            .flatten(),
-        oid: crate::refs::resolve_ref(repo.git_dir(), "HEAD").ok(),
+    if repo.refs_on_disk() {
+        HeadInfo {
+            target: crate::refs::read_symbolic_ref(repo.git_dir(), "HEAD")
+                .ok()
+                .flatten(),
+            oid: crate::refs::resolve_ref(repo.git_dir(), "HEAD").ok(),
+        }
+    } else {
+        HeadInfo {
+            target: crate::refs::read_symbolic_ref_for_repository(repo, "HEAD")
+                .ok()
+                .flatten(),
+            oid: crate::refs::resolve_ref_in(repo, "HEAD").ok(),
+        }
     }
 }
 
@@ -514,12 +615,14 @@ pub(crate) enum Packet {
 
 /// Parse a full-width hex object id for the repository's hash algorithm.
 pub(crate) fn parse_oid(repo: &Repository, hex: &str) -> Result<ObjectId> {
-    let oid = ObjectId::from_hex(hex)
-        .map_err(|_| ServeError::Protocol(format!("invalid object id '{hex}'")))?;
+    let oid = ObjectId::from_hex(hex).map_err(|_| ServeError::Protocol {
+        detail: format!("invalid object id '{hex}'"),
+    })?;
     if oid.algo() != repo.odb().hash_algo() {
-        return Err(ServeError::Protocol(format!(
-            "object id '{hex}' does not match the repository hash algorithm"
-        )));
+        return Err(ServeError::Protocol {
+            detail: format!("object id '{hex}' does not match the repository hash algorithm"),
+        }
+        .into());
     }
     Ok(oid)
 }
@@ -531,17 +634,21 @@ pub(crate) fn check_object_format(repo: &Repository, client: Option<&str>) -> Re
         Some(name) if name != ours => Err(ServeError::ObjectFormatMismatch {
             client: name.to_owned(),
             repository: ours,
-        }),
+        }
+        .into()),
         _ => Ok(()),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{advertised_refs, scan_prefixes, Peel, ProtocolVersion};
+    use super::{
+        for_each_advertised_ref, scan_prefixes, AdvertisedRef, Peel, ProtocolVersion, Result,
+    };
     use crate::config::environment::RepositoryOptions;
     use crate::objects::{ObjectId, ObjectKind};
     use crate::repo::{InitOptions, Repository};
+    use std::ops::ControlFlow;
 
     #[test]
     fn scan_prefixes_collapse_to_disjoint_sorted_ref_prefixes() {
@@ -608,7 +715,25 @@ mod tests {
         (dir, repo, commit, tag)
     }
 
-    fn listed(refs: &[super::AdvertisedRef]) -> Vec<(&str, Option<ObjectId>)> {
+    fn advertised_refs(
+        repo: &Repository,
+        hidden: &[String],
+        prefixes: &[&str],
+        peel: Peel,
+    ) -> Result<Vec<AdvertisedRef>> {
+        let mut out = Vec::new();
+        for_each_advertised_ref(repo, hidden, prefixes, peel, |r| {
+            out.push(AdvertisedRef {
+                name: r.name.to_owned(),
+                oid: r.oid,
+                peeled: r.peeled,
+            });
+            Ok(ControlFlow::Continue(()))
+        })?;
+        Ok(out)
+    }
+
+    fn listed(refs: &[AdvertisedRef]) -> Vec<(&str, Option<ObjectId>)> {
         refs.iter().map(|r| (r.name.as_str(), r.peeled)).collect()
     }
 
@@ -663,5 +788,89 @@ mod tests {
             ProtocolVersion::from_git_protocol("version=9"),
             ProtocolVersion::V0
         );
+    }
+
+    #[test]
+    fn head_info_uses_injected_ref_store_for_symbolic_head() {
+        use std::sync::Arc;
+
+        use crate::refs::store::{
+            Expected, MemoryRefStore, RawRef, RefName, RefStore, RefTransaction, RefUpdate,
+        };
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        Repository::init(
+            dir.path(),
+            &InitOptions::new()
+                .with_bare(true)
+                .with_initial_branch("master"),
+        )
+        .expect("init");
+        let store = Arc::new(MemoryRefStore::new());
+        let repo = Repository::open(
+            dir.path(),
+            &(RepositoryOptions::empty()
+                .with_ref_store(store.clone())
+                .with_initial_branch("master")),
+        )
+        .expect("open");
+        let tree = repo.odb().write(ObjectKind::Tree, b"").expect("tree");
+        let commit = repo
+            .odb()
+            .write(
+                ObjectKind::Commit,
+                format!(
+                    "tree {tree}\nauthor T <t@e.com> 1 +0000\ncommitter T <t@e.com> 1 +0000\n\ninit\n"
+                )
+                .as_bytes(),
+            )
+            .expect("commit");
+        store
+            .prepare(
+                RefTransaction::new()
+                    .update(RefUpdate {
+                        name: RefName::from_trusted("refs/heads/master"),
+                        new_value: Some(RawRef::Direct(commit)),
+                        expected: Expected::Missing,
+                        reflog: None,
+                        flags: Default::default(),
+                    })
+                    .expect("txn"),
+            )
+            .expect("prepare")
+            .commit()
+            .expect("commit");
+
+        let head = super::head_info(&repo);
+        assert_eq!(head.target.as_deref(), Some("refs/heads/master"));
+        assert_eq!(head.oid, Some(commit));
+    }
+
+    #[test]
+    fn head_info_injected_unborn_head_has_symref_without_oid() {
+        use std::sync::Arc;
+
+        use crate::refs::store::MemoryRefStore;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        Repository::init(
+            dir.path(),
+            &InitOptions::new()
+                .with_bare(true)
+                .with_initial_branch("master"),
+        )
+        .expect("init");
+        let store = Arc::new(MemoryRefStore::new());
+        let repo = Repository::open(
+            dir.path(),
+            &(RepositoryOptions::empty()
+                .with_ref_store(store.clone())
+                .with_initial_branch("master")),
+        )
+        .expect("open");
+
+        let head = super::head_info(&repo);
+        assert_eq!(head.target.as_deref(), Some("refs/heads/master"));
+        assert!(head.oid.is_none());
     }
 }

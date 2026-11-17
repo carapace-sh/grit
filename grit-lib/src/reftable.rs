@@ -26,10 +26,14 @@
 //! ```
 
 use crate::config::ConfigSet;
+use crate::error::ObjectError;
+use crate::error::RefError;
 use crate::error::{Error, Result};
 use crate::fs_publish::publish_no_clobber;
 use crate::objects::ObjectId;
-use crate::refs::store::RefStoreError;
+use crate::refs::store::RefNameRef;
+use crate::refs::store::{RefStore as _, RefStoreError};
+use memmap2::Mmap;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::Write;
@@ -79,7 +83,7 @@ const RESTART_INTERVAL: usize = 16;
 
 /// A reftable failure: malformed table bytes, a locked stack, or a rejected update.
 ///
-/// Wrapped by [`Error::Reftable`]. Corruption variants describe what was wrong
+/// Wrapped by [`crate::error::RefError::Reftable`]. Corruption variants describe what was wrong
 /// with the bytes; [`Self::Locked`] and [`Self::ExpectedMismatch`] are the
 /// conditions callers usually want to react to (retry, or re-read and redo).
 #[derive(Debug, thiserror::Error)]
@@ -168,7 +172,7 @@ pub enum ReftableError {
         name: String,
     },
 
-    /// [`ReftableWriter::add_ref`] was called out of name order.
+    /// `ReftableWriter::add_ref` was called out of name order.
     #[error("reftable: refs must be added in sorted order ('{next}' after '{previous}')")]
     UnsortedRefs {
         /// Name of the ref added before.
@@ -376,6 +380,18 @@ pub struct LogRecord {
     pub message: String,
 }
 
+/// Whether `record` is an on-disk reflog deletion tombstone (log key value type 0).
+#[must_use]
+pub(crate) fn log_record_is_deletion(record: &LogRecord) -> bool {
+    record.name.is_empty()
+        && record.email.is_empty()
+        && record.message.is_empty()
+        && record.time_seconds == 0
+        && record.tz_offset == 0
+        && record.old_id.is_zero()
+        && record.new_id.is_zero()
+}
+
 /// Write options for reftable creation.
 #[derive(Debug, Clone)]
 pub struct WriteOptions {
@@ -395,9 +411,38 @@ pub struct WriteOptions {
     /// Geometric factor for stack auto-compaction (`reftable.geometricFactor`).
     /// Defaults to 2 when unset.
     pub auto_compaction_factor: u8,
-    /// Whether to run automatic stack compaction after writes (Git test knob via
-    /// [`Environment::reftable_autocompaction_enabled`](crate::environment::Environment::reftable_autocompaction_enabled)).
+    /// Whether to run automatic stack compaction after writes (see
+    /// [`ReftableWriteOptions::autocompaction_enabled`] on [`RepositoryOptions`](crate::environment::RepositoryOptions)).
     pub autocompaction_enabled: bool,
+}
+
+/// Repository-level overrides for reftable stack writes.
+///
+/// Pass through [`RepositoryOptions::with_reftable_write`](crate::environment::RepositoryOptions::with_reftable_write)
+/// when opening a [`crate::repo::Repository`], or set fields on [`WriteOptions`] for direct
+/// `ReftableWriter` use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ReftableWriteOptions {
+    /// When false, skip automatic stack compaction after writes (default: `true`).
+    pub autocompaction_enabled: bool,
+}
+
+impl Default for ReftableWriteOptions {
+    fn default() -> Self {
+        Self {
+            autocompaction_enabled: true,
+        }
+    }
+}
+
+impl ReftableWriteOptions {
+    /// Override [`Self::autocompaction_enabled`].
+    #[must_use]
+    pub fn with_autocompaction_enabled(mut self, enabled: bool) -> Self {
+        self.autocompaction_enabled = enabled;
+        self
+    }
 }
 
 impl Default for WriteOptions {
@@ -578,9 +623,13 @@ impl EncRecord<'_> {
                 RefValue::Val2(..) => VALUE_TWO_OID,
                 RefValue::Symref(_) => VALUE_SYMREF,
             },
-            // grit only writes reflog updates (value_type 1), never the
-            // explicit-deletion form (value_type 0).
-            EncRecord::Log(_) => 1,
+            EncRecord::Log(l) => {
+                if log_record_is_deletion(l) {
+                    VALUE_DELETION
+                } else {
+                    1
+                }
+            }
             EncRecord::Obj { offsets, .. } => {
                 if !offsets.is_empty() && offsets.len() < 8 {
                     offsets.len() as u8
@@ -611,6 +660,9 @@ impl EncRecord<'_> {
                 }
             }
             EncRecord::Log(l) => {
+                if log_record_is_deletion(l) {
+                    return;
+                }
                 out.extend_from_slice(l.old_id.as_bytes());
                 out.extend_from_slice(l.new_id.as_bytes());
                 put_varint(l.name.len() as u64, out);
@@ -786,9 +838,16 @@ impl BlockWriter {
             use flate2::Compression;
             let skip = 4 + self.header_off;
             let mut enc = ZlibEncoder::new(Vec::new(), Compression::new(9));
-            enc.write_all(&self.buf[skip..])
-                .map_err(|e| Error::Zlib(e.to_string()))?;
-            let compressed = enc.finish().map_err(|e| Error::Zlib(e.to_string()))?;
+            enc.write_all(&self.buf[skip..]).map_err(|e| {
+                Error::Object(ObjectError::Zlib {
+                    detail: e.to_string(),
+                })
+            })?;
+            let compressed = enc.finish().map_err(|e| {
+                Error::Object(ObjectError::Zlib {
+                    detail: e.to_string(),
+                })
+            })?;
             self.buf.truncate(skip);
             self.buf.extend_from_slice(&compressed);
         }
@@ -1242,9 +1301,29 @@ impl WriterState {
 // Reader
 // ---------------------------------------------------------------------------
 
+/// Backing storage for a [`ReftableReader`]: owned bytes or a file mapping.
+enum TableBytes {
+    Owned(Arc<[u8]>),
+    Mapped(Arc<Mmap>),
+}
+
+impl TableBytes {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            TableBytes::Owned(data) => data.as_ref(),
+            TableBytes::Mapped(map) => map.as_ref(),
+        }
+    }
+
+    #[cfg(test)]
+    fn is_mapped(&self) -> bool {
+        matches!(self, TableBytes::Mapped(_))
+    }
+}
+
 /// Reads a single reftable file from a byte buffer.
 pub struct ReftableReader {
-    data: Arc<[u8]>,
+    data: TableBytes,
     version: u8,
     block_size: u32,
     min_update_index: u64,
@@ -1264,6 +1343,10 @@ struct Footer {
 }
 
 impl ReftableReader {
+    fn bytes(&self) -> &[u8] {
+        self.data.as_slice()
+    }
+
     /// Open a reftable from bytes.
     pub fn new(data: Vec<u8>) -> Result<Self> {
         Self::from_arc(Arc::from(data))
@@ -1271,28 +1354,44 @@ impl ReftableReader {
 
     /// Open a reftable from shared bytes (avoids cloning table payloads).
     pub fn from_arc(data: Arc<[u8]>) -> Result<Self> {
-        if data.len() < HEADER_SIZE + FOOTER_V1_SIZE {
+        Self::open(TableBytes::Owned(data))
+    }
+
+    /// Open a reftable from a shared file mapping (no anonymous copy of the table).
+    pub fn from_mapped(map: Arc<Mmap>) -> Result<Self> {
+        Self::open(TableBytes::Mapped(map))
+    }
+
+    /// Whether this reader views file-backed storage (stack cache tests).
+    #[cfg(test)]
+    pub(crate) fn table_backing_is_mapped(&self) -> bool {
+        self.data.is_mapped()
+    }
+
+    fn open(data: TableBytes) -> Result<Self> {
+        let bytes = data.as_slice();
+        if bytes.len() < HEADER_SIZE + FOOTER_V1_SIZE {
             // Could be an empty table (header + footer only = 24 + 68 = 92)
-            if data.len() < HEADER_SIZE {
-                return Err(ReftableError::TooSmall { len: data.len() }.into());
+            if bytes.len() < HEADER_SIZE {
+                return Err(ReftableError::TooSmall { len: bytes.len() }.into());
             }
         }
 
         // Parse header
-        if &data[0..4] != REFTABLE_MAGIC {
+        if &bytes[0..4] != REFTABLE_MAGIC {
             return Err(ReftableError::BadMagic.into());
         }
-        let version = data[4];
+        let version = bytes[4];
         if version != 1 && version != 2 {
             return Err(ReftableError::UnsupportedVersion { version }.into());
         }
         // Parse footer
         let footer_size = if version == 2 { 72 } else { FOOTER_V1_SIZE };
-        if data.len() < footer_size {
-            return Err(ReftableError::TooSmall { len: data.len() }.into());
+        if bytes.len() < footer_size {
+            return Err(ReftableError::TooSmall { len: bytes.len() }.into());
         }
-        let footer_start = data.len() - footer_size;
-        let footer = parse_footer(&data[footer_start..], version)?;
+        let footer_start = bytes.len() - footer_size;
+        let footer = parse_footer(&bytes[footer_start..], version)?;
 
         Ok(Self {
             data,
@@ -1353,7 +1452,7 @@ impl ReftableReader {
         } else {
             FOOTER_V1_SIZE
         };
-        let file_end = self.data.len() - footer_size;
+        let file_end = self.bytes().len() - footer_size;
 
         let ref_end = if self.ref_index_position > 0 {
             self.ref_index_position as usize
@@ -1372,10 +1471,10 @@ impl ReftableReader {
         };
 
         while pos < ref_end {
-            if pos >= self.data.len() {
+            if pos >= self.bytes().len() {
                 break;
             }
-            let block_type = self.data[pos];
+            let block_type = self.bytes()[pos];
             if block_type == 0 {
                 if self.block_size > 0 {
                     let bs = self.block_size as usize;
@@ -1388,7 +1487,7 @@ impl ReftableReader {
                 break;
             }
 
-            let block_len = read_u24(&self.data, pos + 1);
+            let block_len = read_u24(self.bytes(), pos + 1);
             let block_data_start = pos + 4;
             let is_first = pos == header_len;
             let records_end = if is_first { block_len } else { pos + block_len };
@@ -1398,14 +1497,14 @@ impl ReftableReader {
             }
 
             let restart_table_start =
-                restart_table_start_for_block(&self.data, records_end, block_data_start)?;
+                restart_table_start_for_block(self.bytes(), records_end, block_data_start)?;
 
             let mut rpos = block_data_start;
             let mut prev_name = Vec::<u8>::new();
 
             while rpos < restart_table_start {
                 let (rec, new_pos) = decode_ref_record(
-                    &self.data,
+                    self.bytes(),
                     rpos,
                     &prev_name,
                     self.min_update_index,
@@ -1460,10 +1559,10 @@ impl ReftableReader {
             return Ok(None);
         }
         for _ in 0..64 {
-            if pos >= self.data.len() {
+            if pos >= self.bytes().len() {
                 return Ok(None);
             }
-            match self.data[pos] {
+            match self.bytes()[pos] {
                 BLOCK_TYPE_REF => return Ok(Some(pos)),
                 BLOCK_TYPE_INDEX => {
                     let Some(offset) = self.index_block_seek_offset(pos, name)? else {
@@ -1489,7 +1588,7 @@ impl ReftableReader {
         let mut prev_key = Vec::<u8>::new();
         let mut last: Option<u64> = None;
         while rpos < records_end {
-            let (key, offset, new_pos) = decode_index_record(&self.data, rpos, &prev_key)?;
+            let (key, offset, new_pos) = decode_index_record(self.bytes(), rpos, &prev_key)?;
             prev_key = key;
             if prev_key.as_slice() >= name {
                 return Ok(Some(offset));
@@ -1501,10 +1600,10 @@ impl ReftableReader {
     }
 
     fn block_record_range(&self, block_pos: usize) -> Result<(usize, usize)> {
-        if block_pos + 4 > self.data.len() {
+        if block_pos + 4 > self.bytes().len() {
             return Err(truncated(ReftableField::BlockHeader));
         }
-        let block_len = read_u24(&self.data, block_pos + 1);
+        let block_len = read_u24(self.bytes(), block_pos + 1);
         let header_len = self.header_len();
         let is_first = block_pos == header_len;
         let records_end = if is_first {
@@ -1512,12 +1611,12 @@ impl ReftableReader {
         } else {
             block_pos + block_len
         };
-        if records_end > self.data.len() || records_end < 2 {
+        if records_end > self.bytes().len() || records_end < 2 {
             return Err(corrupt(ReftableError::InvalidBlockLength));
         }
         let records_data_start = block_pos + 4;
         let restart_table_start =
-            restart_table_start_for_block(&self.data, records_end, records_data_start)?;
+            restart_table_start_for_block(self.bytes(), records_end, records_data_start)?;
         Ok((records_data_start, restart_table_start))
     }
 
@@ -1528,7 +1627,7 @@ impl ReftableReader {
         } else {
             FOOTER_V1_SIZE
         };
-        let file_end = self.data.len() - footer_size;
+        let file_end = self.bytes().len() - footer_size;
 
         // Determine where the log section starts. Git records the log offset in
         // the footer, but when the log block is the *first* block in the file it
@@ -1539,8 +1638,8 @@ impl ReftableReader {
         // header) is a log block — mirroring `is_present` in git's table.c.
         let mut pos = if self.log_position > 0 {
             self.log_position as usize
-        } else if self.data.len() > self.header_len()
-            && self.data[self.header_len()] == BLOCK_TYPE_LOG
+        } else if self.bytes().len() > self.header_len()
+            && self.bytes()[self.header_len()] == BLOCK_TYPE_LOG
         {
             // Log block is the first block; it begins right after the header.
             self.header_len()
@@ -1550,10 +1649,10 @@ impl ReftableReader {
         let mut logs = Vec::new();
 
         while pos < file_end {
-            if pos >= self.data.len() {
+            if pos >= self.bytes().len() {
                 break;
             }
-            let block_type = self.data[pos];
+            let block_type = self.bytes()[pos];
             if block_type != BLOCK_TYPE_LOG {
                 break;
             }
@@ -1562,7 +1661,7 @@ impl ReftableReader {
             // includes the header bytes; the compressed payload still starts
             // right after the type+length header at `pos + 4`.
             let is_first = pos == self.header_len() && self.log_position == 0;
-            let block_len = read_u24(&self.data, pos + 1);
+            let block_len = read_u24(self.bytes(), pos + 1);
             let compressed_start = pos + 4;
 
             // The inflated size is block_len minus the 4-byte type+length header
@@ -1570,7 +1669,7 @@ impl ReftableReader {
             let header_prefix = if is_first { self.header_len() } else { 0 };
             let inflated_size = block_len.saturating_sub(4 + header_prefix);
 
-            let remaining = &self.data[compressed_start..file_end];
+            let remaining = &self.bytes()[compressed_start..file_end];
             let (inflated, consumed) = decompress_log_payload(remaining, inflated_size)?;
 
             // Parse log records from inflated data
@@ -1626,7 +1725,7 @@ impl ReftableReader {
     /// Effective ref payload size for compaction heuristics (file size minus header overhead).
     pub fn payload_size(&self) -> u64 {
         let overhead = if self.version == 2 { 28 } else { 24 };
-        self.data.len().saturating_sub(overhead) as u64
+        self.bytes().len().saturating_sub(overhead) as u64
     }
 }
 
@@ -1886,11 +1985,14 @@ fn reftable_hash_size_for_git_dir(git_dir: &Path) -> usize {
     let cfg = crate::config::ConfigSet::load(
         &crate::environment::Environment::empty(),
         Some(git_dir),
-        true,
+        &crate::config::LoadConfigOptions::standard(
+            &crate::environment::Environment::empty(),
+            Some(git_dir),
+        ),
     )
     .unwrap_or_default();
     match cfg
-        .get("extensions.objectformat")
+        .value("extensions.objectformat")
         .and_then(|v| crate::objects::HashAlgo::from_name(&v))
     {
         Some(crate::objects::HashAlgo::Sha256) => 32,
@@ -1983,7 +2085,7 @@ const STACK_TABLE_RELOAD_DEADLINE: Duration = Duration::from_secs(3);
 fn is_transient_stack_table_error(err: &Error) -> bool {
     match err {
         Error::Io(e) if e.kind() == std::io::ErrorKind::NotFound => true,
-        Error::Reftable(ReftableError::TooSmall { len: 0 }) => true,
+        Error::Ref(RefError::Reftable(ReftableError::TooSmall { len: 0 })) => true,
         _ => false,
     }
 }
@@ -2087,8 +2189,10 @@ fn build_cached_stack_tables(
     let mut readers = Vec::with_capacity(table_names.len());
     for name in table_names {
         let path = reftable_dir.join(name);
-        let data = fs::read(&path).map_err(Error::Io)?;
-        readers.push(ReftableReader::from_arc(Arc::from(data))?);
+        let file = fs::File::open(&path).map_err(Error::Io)?;
+        let len = file.metadata().map_err(Error::Io)?.len() as usize;
+        let map = Arc::new(crate::pack_map::map_read_only_file(&file, len).map_err(Error::Io)?);
+        readers.push(ReftableReader::from_mapped(map)?);
     }
     Ok(CachedStackTables {
         table_names: table_names.to_owned(),
@@ -2125,7 +2229,10 @@ fn build_cached_stack_tables_with_reload(
 
 fn load_cached_stack_tables(reftable_dir: &Path) -> Result<Arc<CachedStackTables>> {
     let key = tables_list_cache_key(reftable_dir)?;
-    if let Ok(guard) = stack_table_cache().lock() {
+    {
+        let guard = stack_table_cache()
+            .lock()
+            .map_err(|_| Error::Io(std::io::Error::other("reftable stack cache lock poisoned")))?;
         if let Some(hit) = guard.get(&key) {
             return Ok(Arc::clone(hit));
         }
@@ -2145,9 +2252,14 @@ fn load_cached_stack_tables(reftable_dir: &Path) -> Result<Arc<CachedStackTables
         reftable_dir,
         table_names,
     )?);
-    if let Ok(mut guard) = stack_table_cache().lock() {
-        guard.insert(key, Arc::clone(&cached));
+
+    let mut guard = stack_table_cache()
+        .lock()
+        .map_err(|_| Error::Io(std::io::Error::other("reftable stack cache lock poisoned")))?;
+    if let Some(hit) = guard.get(&key) {
+        return Ok(Arc::clone(hit));
     }
+    guard.insert(key, Arc::clone(&cached));
     Ok(cached)
 }
 
@@ -2296,6 +2408,7 @@ impl ReftableStack {
     }
 
     /// First ref name under `prefix` (child path), if any.
+    #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
     fn first_ref_name_with_prefix(&self, prefix: &str) -> Result<Option<String>> {
         let names = self.table_names_for_read()?;
         let cached = cached_stack_tables_for_names(&self.reftable_dir, &names)?;
@@ -2464,6 +2577,40 @@ impl ReftableStack {
         self.compact_range(start, end - 1, opts)
     }
 
+    /// Merge ref records from `table_names` for compaction output.
+    ///
+    /// Newest record wins. When the winner is a deletion, it is written into the
+    /// compacted table only if `preserve_deletion_tombstones` is set (non-bottom
+    /// compaction ranges that still have older tables below).
+    fn merge_refs_for_compaction(
+        &self,
+        table_names: &[String],
+        preserve_deletion_tombstones: bool,
+    ) -> Result<Vec<RefRecord>> {
+        let cached = cached_stack_tables_for_names(&self.reftable_dir, table_names)?;
+        let subset = Self::subset_stack(self.reftable_dir.clone(), table_names.to_vec());
+        let readers = subset.stack_readers(&cached)?;
+        let mut merged: BTreeMap<String, RefRecord> = BTreeMap::new();
+        for reader in readers {
+            reader.for_each_ref(|rec| {
+                match &rec.value {
+                    RefValue::Deletion => {
+                        if preserve_deletion_tombstones {
+                            merged.insert(rec.name.clone(), rec.clone());
+                        } else {
+                            merged.remove(&rec.name);
+                        }
+                    }
+                    _ => {
+                        merged.insert(rec.name.clone(), rec.clone());
+                    }
+                }
+                ControlFlow::<()>::Continue(())
+            })?;
+        }
+        Ok(merged.into_values().collect())
+    }
+
     fn compact_range(&mut self, first: usize, last: usize, opts: &WriteOptions) -> Result<()> {
         let mut guard = self.acquire_tables_list_lock()?;
         self.reload_table_names();
@@ -2471,8 +2618,8 @@ impl ReftableStack {
             return Ok(());
         }
         let compact_names: Vec<String> = self.table_names[first..=last].to_vec();
+        let refs = self.merge_refs_for_compaction(&compact_names, first > 0)?;
         let prefix_stack = Self::subset_stack(self.reftable_dir.clone(), compact_names.clone());
-        let refs = prefix_stack.read_refs()?;
         let logs = prefix_stack.read_all_logs()?;
 
         let mut min_idx = u64::MAX;
@@ -2568,19 +2715,62 @@ impl ReftableStack {
         table_names: &[String],
         refname: &str,
     ) -> Result<Vec<LogRecord>> {
+        let Some(min_update_index) = self.min_log_update_index_for_live_ref(refname)? else {
+            return Ok(Vec::new());
+        };
         let mut logs = Vec::new();
         for table_name in table_names {
             let path = self.reftable_dir.join(table_name);
             let data = fs::read(&path).map_err(Error::Io)?;
             let reader = ReftableReader::new(data)?;
             for log in reader.read_logs()? {
-                if log.refname == refname {
+                if log.refname == refname
+                    && log.update_index >= min_update_index
+                    && !log_record_is_deletion(&log)
+                {
                     logs.push(log);
                 }
             }
         }
         logs.sort_by_key(|a| std::cmp::Reverse(a.update_index));
         Ok(logs)
+    }
+
+    /// Lowest update index for reflog lines that belong to the ref's current life.
+    ///
+    /// After a deletion record, older log lines are ignored until the ref is created
+    /// again. Returns `None` when the ref is absent or deleted.
+    fn min_log_update_index_for_live_ref(&self, refname: &str) -> Result<Option<u64>> {
+        let names = self.table_names_for_read()?;
+        let cached = cached_stack_tables_for_names(&self.reftable_dir, &names)?;
+        let readers = self.stack_readers(&cached)?;
+        let mut events = Vec::new();
+        for reader in &readers {
+            reader.for_each_ref(|rec| {
+                if rec.name == refname {
+                    events.push(rec.clone());
+                }
+                ControlFlow::<()>::Continue(())
+            })?;
+        }
+        if events.is_empty() {
+            return Ok(Some(0));
+        }
+        events.sort_by_key(|rec| rec.update_index);
+        let mut min_log = 0u64;
+        let mut live = false;
+        for rec in events {
+            match rec.value {
+                RefValue::Deletion => {
+                    live = false;
+                    min_log = rec.update_index.saturating_add(1);
+                }
+                RefValue::Symref(_) | RefValue::Val1(_) | RefValue::Val2(..) => {
+                    live = true;
+                }
+            }
+        }
+        Ok(live.then_some(min_log))
     }
 
     /// Replace all log records for one ref and compact the stack.
@@ -2896,8 +3086,8 @@ impl ReftableStack {
 
         let locked_prefix: Vec<String> = self.table_names[..first_unlocked].to_vec();
         let old_suffix: Vec<String> = self.table_names[first_unlocked..].to_vec();
+        let refs = self.merge_refs_for_compaction(&old_suffix, first_unlocked > 0)?;
         let suffix_stack = Self::subset_stack(self.reftable_dir.clone(), old_suffix.clone());
-        let refs = suffix_stack.read_refs()?;
         let logs = suffix_stack.read_all_logs()?;
 
         let mut min_idx = u64::MAX;
@@ -3240,19 +3430,6 @@ impl ReftableStack {
         )))
     }
 
-    /// Write `tables.list` atomically.
-    ///
-    /// Acquires `tables.list.lock` exclusively for the duration of the write so
-    /// it can never race with another writer. Callers that need a read followed
-    /// by a write to be atomic (e.g. [`add_table`]) should instead acquire the
-    /// lock with [`acquire_tables_list_lock`] and call
-    /// [`write_tables_list_locked`] while holding it.
-    #[expect(dead_code)]
-    fn write_tables_list(&self) -> Result<()> {
-        let mut guard = self.acquire_tables_list_lock()?;
-        self.write_tables_list_locked(&mut guard)
-    }
-
     /// Write `tables.list` while already holding the lock guard.
     fn write_tables_list_locked(&self, guard: &mut TablesListLock) -> Result<()> {
         let tables_list = self.reftable_dir.join("tables.list");
@@ -3288,7 +3465,10 @@ impl ReftableStack {
         let config = ConfigSet::load(
             &crate::environment::Environment::empty(),
             Some(git_dir),
-            true,
+            &crate::config::LoadConfigOptions::standard(
+                &crate::environment::Environment::empty(),
+                Some(git_dir),
+            ),
         )
         .unwrap_or_else(|_| ConfigSet::new());
         let wait = LockWait::reftable_tables_list(Some(&config));
@@ -3322,12 +3502,6 @@ impl ReftableStack {
 // Integration helpers — used by refs.rs and commands
 // ---------------------------------------------------------------------------
 
-/// Resolve a ref in a reftable repo, following symbolic refs.
-pub fn reftable_resolve_ref(git_dir: &Path, refname: &str) -> Result<ObjectId> {
-    use crate::refs::store::RefStore;
-    crate::refs::store::ReftableRefStore::open(git_dir.to_path_buf())?.resolve(refname)
-}
-
 pub(crate) fn reftable_storage_location(git_dir: &Path, refname: &str) -> (PathBuf, String) {
     if let Some(rest) = refname.strip_prefix("worktrees/") {
         if let Some((worktree_id, per_worktree_ref)) = rest.split_once('/') {
@@ -3356,7 +3530,8 @@ pub(crate) fn reftable_storage_location(git_dir: &Path, refname: &str) -> (PathB
 }
 
 /// Write a ref to a reftable repo using config-derived [`WriteOptions`].
-pub fn reftable_write_ref(
+#[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
+pub(crate) fn reftable_write_ref(
     git_dir: &Path,
     refname: &str,
     oid: &ObjectId,
@@ -3369,7 +3544,8 @@ pub fn reftable_write_ref(
 }
 
 /// Write a ref to a reftable repo with explicit write options (including auto-compaction).
-pub fn reftable_write_ref_with_write_options(
+#[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
+pub(crate) fn reftable_write_ref_with_write_options(
     git_dir: &Path,
     refname: &str,
     oid: &ObjectId,
@@ -3415,7 +3591,8 @@ pub fn reftable_write_ref_with_write_options(
 /// # Errors
 ///
 /// Returns [`Error::Io`] when the repository hash width cannot be determined.
-pub fn reftable_log_record_for_commit(
+#[allow(dead_code)] // integration / re-export use only
+pub(crate) fn reftable_log_record_for_commit(
     git_dir: &Path,
     refname: &str,
     old_oid: &ObjectId,
@@ -3440,7 +3617,8 @@ pub fn reftable_log_record_for_commit(
 }
 
 /// Write a symbolic ref to a reftable repo.
-pub fn reftable_write_symref(
+#[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
+pub(crate) fn reftable_write_symref(
     git_dir: &Path,
     refname: &str,
     target: &str,
@@ -3481,7 +3659,8 @@ pub fn reftable_write_symref(
 /// Validate a ref batch for a reftable repository without per-ref filesystem scans.
 ///
 /// Loads the merged ref set once, then checks create/update naming rules in memory.
-pub fn verify_ref_transaction_batch_reftable(
+#[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
+pub(crate) fn verify_ref_transaction_batch_reftable(
     git_dir: &Path,
     items: &[crate::refs::RefBatchItem],
 ) -> std::result::Result<(), crate::refs::RefnameUnavailable> {
@@ -3546,29 +3725,9 @@ pub fn verify_ref_transaction_batch_reftable(
     Ok(())
 }
 
-/// Write multiple reftable ref updates as one transaction per backing store.
-///
-/// Ref names are routed through the same worktree/common-dir rules as the
-/// single-ref helpers. Updates targeting different reftable stacks are grouped
-/// by stack; each group is written with one shared update index.
-pub fn reftable_write_transaction(
-    git_dir: &Path,
-    updates: Vec<ReftableTransactionUpdate>,
-) -> Result<()> {
-    crate::refs::store::ReftableRefStore::open(git_dir.to_path_buf())?
-        .write_reftable_updates(updates)
-        .map_err(Into::into)
-}
-
-#[cfg(test)]
-mod reftable_tx_fail_inject {
-    use std::cell::RefCell;
-
-    // hygiene: test-only write_transaction failure injection (thread_local)
-    thread_local! {
-        pub static INJECT: RefCell<bool> = const { RefCell::new(false) };
-    }
-}
+#[cfg(any(test, feature = "test-support"))]
+#[path = "reftable/inject.rs"]
+pub(crate) mod inject;
 
 #[cfg(test)]
 mod reftable_write_test_hooks {
@@ -3602,38 +3761,28 @@ mod reftable_write_test_hooks {
     }
 }
 
-/// When enabled (tests only), the next [`ReftableStack::write_transaction`] fails before writing.
-#[cfg(test)]
-pub fn set_test_inject_reftable_transaction_fail(enabled: bool) {
-    reftable_tx_fail_inject::INJECT.with(|c| *c.borrow_mut() = enabled);
-}
-
-#[cfg(test)]
 fn test_inject_reftable_transaction_fail() -> Result<()> {
-    reftable_tx_fail_inject::INJECT.with(|c| {
-        if *c.borrow() {
-            return Err(Error::Io(std::io::Error::other(
-                "injected reftable transaction failure",
-            )));
-        }
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        inject::reftable_transaction_fail()
+    }
+    #[cfg(not(any(test, feature = "test-support")))]
+    {
         Ok(())
-    })
-}
-
-#[cfg(not(test))]
-fn test_inject_reftable_transaction_fail() -> Result<()> {
-    Ok(())
+    }
 }
 
 /// Delete a ref from a reftable repo.
-pub fn reftable_delete_ref(git_dir: &Path, refname: &str) -> Result<()> {
+#[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
+pub(crate) fn reftable_delete_ref(git_dir: &Path, refname: &str) -> Result<()> {
     let (store_git_dir, _) = reftable_storage_location(git_dir, refname);
     let opts = read_write_options(&store_git_dir);
     reftable_delete_ref_with_write_options(git_dir, refname, &opts)
 }
 
 /// Delete a ref using explicit reftable write options (for tests and callers that disable auto-compaction).
-pub fn reftable_delete_ref_with_write_options(
+#[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
+pub(crate) fn reftable_delete_ref_with_write_options(
     git_dir: &Path,
     refname: &str,
     opts: &WriteOptions,
@@ -3646,17 +3795,14 @@ pub fn reftable_delete_ref_with_write_options(
     stack.write_ref(&storage_refname, RefValue::Deletion, None, opts)
 }
 
-/// Read the symbolic target of a ref in a reftable repo.
-pub fn reftable_read_symbolic_ref(git_dir: &Path, refname: &str) -> Result<Option<String>> {
-    crate::refs::read_symbolic_ref(git_dir, refname)
-}
-
 fn push_list_ref_entry(git_dir: &Path, rec: &RefRecord, out: &mut Vec<(String, ObjectId)>) {
     match &rec.value {
         RefValue::Val1(oid) => out.push((rec.name.clone(), *oid)),
         RefValue::Val2(oid, _) => out.push((rec.name.clone(), *oid)),
         RefValue::Symref(target) => {
-            if let Ok(oid) = reftable_resolve_ref(git_dir, target) {
+            let resolved = crate::refs::store::ReftableRefStore::open(git_dir.to_path_buf())
+                .and_then(|store| store.resolve(RefNameRef::from_trusted(target)));
+            if let Ok(oid) = resolved {
                 out.push((rec.name.clone(), oid));
             }
         }
@@ -3665,35 +3811,9 @@ fn push_list_ref_entry(git_dir: &Path, rec: &RefRecord, out: &mut Vec<(String, O
 }
 
 /// List all refs in a reftable repo under a given prefix.
-pub fn reftable_list_refs(git_dir: &Path, prefix: &str) -> Result<Vec<(String, ObjectId)>> {
+pub(crate) fn reftable_list_refs(git_dir: &Path, prefix: &str) -> Result<Vec<(String, ObjectId)>> {
     let stack = ReftableStack::open(git_dir)?;
     stack.list_refs_under_prefix(git_dir, prefix)
-}
-
-/// Read reflog entries for a ref from the reftable stack.
-pub fn reftable_read_reflog(
-    git_dir: &Path,
-    refname: &str,
-) -> Result<Vec<crate::reflog::ReflogEntry>> {
-    use crate::refs::store::RefStore as _;
-    let store = crate::refs::store::ReftableRefStore::open(git_dir.to_path_buf())?;
-    let mut entries = Vec::new();
-    store.for_each_reflog_entry(refname, false, &mut |entry| {
-        entries.push(entry.clone());
-        std::ops::ControlFlow::Continue(())
-    })?;
-    Ok(entries)
-}
-
-/// Replace the reflog entries for a ref in a reftable repo.
-pub fn reftable_replace_reflog(
-    git_dir: &Path,
-    refname: &str,
-    entries: &[crate::reflog::ReflogEntry],
-) -> Result<()> {
-    use crate::refs::store::RefStore as _;
-    crate::refs::store::ReftableRefStore::open(git_dir.to_path_buf())?
-        .replace_reflog(refname, entries.to_vec())
 }
 
 /// Whether a reflog entry should be written for `storage_refname`, mirroring
@@ -3704,11 +3824,13 @@ pub fn reftable_replace_reflog(
 fn reftable_should_write_log(git_dir: &Path, storage_refname: &str) -> bool {
     let mode = crate::refs::effective_log_refs_config(git_dir);
     crate::refs::should_autocreate_reflog_for_mode(storage_refname, mode)
-        || reftable_reflog_exists(git_dir, storage_refname)
+        || crate::refs::store::ReftableRefStore::open(git_dir.to_path_buf())
+            .and_then(|store| store.reflog_exists(RefNameRef::from_trusted(storage_refname)))
+            .unwrap_or(false)
 }
 
 /// Append a reflog entry for a reftable repo.
-pub fn reftable_append_reflog(
+pub(crate) fn reftable_append_reflog(
     git_dir: &Path,
     refname: &str,
     old_oid: &ObjectId,
@@ -3766,40 +3888,6 @@ pub fn reftable_append_reflog(
     Ok(())
 }
 
-/// Check whether a reftable repo has reflogs for the given ref.
-pub fn reftable_reflog_exists(git_dir: &Path, refname: &str) -> bool {
-    use crate::refs::store::RefStore as _;
-    crate::refs::store::ReftableRefStore::open(git_dir.to_path_buf())
-        .ok()
-        .and_then(|store| store.reflog_exists(refname).ok())
-        .unwrap_or(false)
-}
-
-/// List refs that have reflogs in a reftable repo.
-pub fn reftable_list_reflog_refs(git_dir: &Path) -> Result<Vec<String>> {
-    use crate::refs::store::RefStore as _;
-    let store = crate::refs::store::ReftableRefStore::open(git_dir.to_path_buf())?;
-    let mut refs = Vec::new();
-    store.for_each_reflog_ref(&mut |name| {
-        refs.push(name.to_owned());
-        std::ops::ControlFlow::Continue(())
-    })?;
-    refs.sort();
-    Ok(refs)
-}
-
-/// Create an empty reflog marker in a reftable repo.
-pub fn reftable_create_reflog(git_dir: &Path, refname: &str) -> Result<()> {
-    use crate::refs::store::RefStore as _;
-    crate::refs::store::ReftableRefStore::open(git_dir.to_path_buf())?.create_reflog(refname)
-}
-
-/// Delete all reflog records and empty-log marker for a ref in a reftable repo.
-pub fn reftable_delete_reflog(git_dir: &Path, refname: &str) -> Result<()> {
-    use crate::refs::store::RefStore as _;
-    crate::refs::store::ReftableRefStore::open(git_dir.to_path_buf())?.delete_reflog(refname)
-}
-
 // ---------------------------------------------------------------------------
 // Write options helpers
 // ---------------------------------------------------------------------------
@@ -3814,36 +3902,45 @@ fn apply_geometric_factor_from_config(opts: &mut WriteOptions, raw: &str) {
 }
 
 /// Read reftable write options from the repository config (auto-compaction enabled).
-pub fn read_write_options(git_dir: &Path) -> WriteOptions {
-    read_write_options_with_environment(git_dir, &crate::environment::Environment::empty())
+pub(crate) fn read_write_options(git_dir: &Path) -> WriteOptions {
+    read_write_options_with_environment(
+        git_dir,
+        &crate::environment::Environment::empty(),
+        &ReftableWriteOptions::default(),
+    )
 }
 
 /// Read reftable write options from config and an explicit discovery environment.
-pub fn read_write_options_with_environment(
+pub(crate) fn read_write_options_with_environment(
     git_dir: &Path,
     env: &crate::environment::Environment,
+    reftable_write: &ReftableWriteOptions,
 ) -> WriteOptions {
     let mut opts = WriteOptions {
         hash_size: reftable_hash_size_for_git_dir(git_dir),
-        autocompaction_enabled: env.reftable_autocompaction_enabled(),
+        autocompaction_enabled: reftable_write.autocompaction_enabled,
         ..Default::default()
     };
 
-    let config = ConfigSet::load(env, Some(git_dir), true)
-        .unwrap_or_else(|_| local_config_best_effort(git_dir));
-    if let Some(Ok(v)) = config.get("reftable.blockSize").map(|v| v.parse::<u32>()) {
+    let config = ConfigSet::load(
+        env,
+        Some(git_dir),
+        &crate::config::LoadConfigOptions::standard(env, Some(git_dir)),
+    )
+    .unwrap_or_else(|_| local_config_best_effort(git_dir));
+    if let Some(Ok(v)) = config.value("reftable.blockSize").map(|v| v.parse::<u32>()) {
         opts.block_size = v;
     }
     if let Some(Ok(v)) = config
-        .get("reftable.restartInterval")
+        .value("reftable.restartInterval")
         .map(|v| v.parse::<usize>())
     {
         opts.restart_interval = v;
     }
-    if let Some(Ok(false)) = config.get_bool("reftable.indexObjects") {
+    if !config.bool_with_default("reftable.indexObjects", true) {
         opts.skip_index_objects = true;
     }
-    if let Some(value) = config.get("reftable.geometricFactor") {
+    if let Some(value) = config.value("reftable.geometricFactor") {
         apply_geometric_factor_from_config(&mut opts, &value);
     }
     if config.log_refs_config() == crate::refs::LogRefsConfig::None {
@@ -4006,15 +4103,19 @@ fn decompress_log_payload(compressed: &[u8], inflated_size: usize) -> Result<(Ve
     let mut inflated = vec![0u8; inflated_size];
     if compressed.len() >= 2 && compressed[0] == 0x78 {
         let mut decoder = ZlibDecoder::new(compressed);
-        decoder
-            .read_exact(&mut inflated)
-            .map_err(|e| Error::Zlib(e.to_string()))?;
+        decoder.read_exact(&mut inflated).map_err(|e| {
+            Error::Object(ObjectError::Zlib {
+                detail: e.to_string(),
+            })
+        })?;
         Ok((inflated, decoder.total_in() as usize))
     } else {
         let mut decoder = DeflateDecoder::new(compressed);
-        decoder
-            .read_exact(&mut inflated)
-            .map_err(|e| Error::Zlib(e.to_string()))?;
+        decoder.read_exact(&mut inflated).map_err(|e| {
+            Error::Object(ObjectError::Zlib {
+                detail: e.to_string(),
+            })
+        })?;
         Ok((inflated, decoder.total_in() as usize))
     }
 }
@@ -4258,8 +4359,151 @@ mod tests {
 
         let (_dir, git_dir) = reftable_repo_with_config("[core]\n\tlogAllRefUpdates = false\n");
         assert!(!reftable_should_write_log(&git_dir, "refs/heads/topic"));
-        reftable_create_reflog(&git_dir, "refs/heads/topic").expect("create reflog");
+        crate::refs::store::ReftableRefStore::open(git_dir.clone())
+            .and_then(|store| store.create_reflog(RefNameRef::from_trusted("refs/heads/topic")))
+            .expect("create reflog");
         assert!(reftable_should_write_log(&git_dir, "refs/heads/topic"));
+    }
+
+    #[test]
+    fn stack_table_cache_readers_use_mapped_backing() {
+        use crate::objects::ObjectId;
+        use crate::repo::init_repository;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        init_repository(
+            dir.path(),
+            false,
+            "main",
+            None,
+            crate::RefStorageFormat::Reftable,
+        )
+        .expect("init");
+        let git_dir = dir.path().join(".git");
+        let oid = ObjectId::from_bytes(&[0x44; 20]).expect("oid");
+        reftable_write_ref(&git_dir, "refs/heads/mapped-test", &oid, None, None)
+            .expect("write ref");
+        let reftable_dir = git_dir.join("reftable");
+        let cached = super::load_cached_stack_tables(&reftable_dir).expect("cache");
+        assert!(
+            cached.readers.iter().all(|r| r.table_backing_is_mapped()),
+            "stack cache must mmap tables instead of copying them into Arc<[u8]>"
+        );
+        let again = super::load_cached_stack_tables(&reftable_dir).expect("cache again");
+        assert!(
+            Arc::ptr_eq(&cached, &again),
+            "second load must hit the process-wide stack cache"
+        );
+    }
+
+    #[test]
+    fn stack_table_cache_missing_table_returns_error_without_deadlock() {
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let (_dir, git_dir) = reftable_repo_with_config("");
+        let reftable_dir = git_dir.join("reftable");
+        let tables_list = reftable_dir.join("tables.list");
+        let mut content = fs::read_to_string(&tables_list).expect("tables.list");
+        content.push_str("0x000000000099-0x000000000099-deadbeef.ref\n");
+        fs::write(&tables_list, content).expect("append missing table name");
+        super::invalidate_stack_table_cache(&reftable_dir);
+
+        let (tx, rx) = mpsc::sync_channel(1);
+        let load_dir = reftable_dir.clone();
+        thread::spawn(move || {
+            let result = super::load_cached_stack_tables(&load_dir);
+            let _ = tx.send(result);
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match rx.try_recv() {
+                Ok(result) => {
+                    assert!(result.is_err(), "missing table file must fail");
+                    return;
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    if Instant::now() >= deadline {
+                        std::process::exit(124);
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    panic!("load_cached_stack_tables thread exited without sending");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn build_cached_stack_tables_with_reload_retries_when_tables_list_compacts() {
+        let (_dir, git_dir) = reftable_repo_with_config("");
+        let reftable_dir = git_dir.join("reftable");
+        let valid = read_tables_list_names(&reftable_dir).expect("tables.list");
+        let mut stale_names = valid.clone();
+        stale_names.push("0x000000000099-0x000000000099-deadbeef.ref".to_owned());
+        let tables_list = reftable_dir.join("tables.list");
+        fs::write(&tables_list, format!("{}\n", stale_names.join("\n")))
+            .expect("stale tables.list");
+        // Compaction removed the phantom name before the reader re-reads the list.
+        fs::write(&tables_list, format!("{}\n", valid.join("\n"))).expect("compact tables.list");
+        super::invalidate_stack_table_cache(&reftable_dir);
+
+        let cached = super::build_cached_stack_tables_with_reload(&reftable_dir, stale_names)
+            .expect("reload after compaction");
+        assert_eq!(cached.table_names, valid);
+        assert!(
+            cached.readers.iter().all(|r| r.table_backing_is_mapped()),
+            "reloaded stack must still mmap tables"
+        );
+    }
+
+    #[test]
+    fn lookup_ref_missing_table_in_list_does_not_deadlock() {
+        use crate::objects::ObjectId;
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let (_dir, git_dir) = reftable_repo_with_config("");
+        let oid = ObjectId::from_bytes(&[0x55; 20]).expect("oid");
+        reftable_write_ref(&git_dir, "refs/heads/deadlock-test", &oid, None, None)
+            .expect("write ref");
+        let reftable_dir = git_dir.join("reftable");
+        let tables_list = reftable_dir.join("tables.list");
+        let mut content = fs::read_to_string(&tables_list).expect("tables.list");
+        content.push_str("0x000000000099-0x000000000099-deadbeef.ref\n");
+        fs::write(&tables_list, content).expect("append missing table name");
+        super::invalidate_stack_table_cache(&reftable_dir);
+
+        let (tx, rx) = mpsc::sync_channel(1);
+        let lookup_git_dir = git_dir.clone();
+        thread::spawn(move || {
+            let stack = ReftableStack::open(&lookup_git_dir).expect("open");
+            let result = stack.lookup_ref("refs/heads/deadlock-test");
+            let _ = tx.send(result);
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match rx.try_recv() {
+                Ok(result) => {
+                    assert!(result.is_err(), "lookup with broken tables.list must fail");
+                    return;
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    if Instant::now() >= deadline {
+                        std::process::exit(124);
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    panic!("lookup_ref thread exited without sending");
+                }
+            }
+        }
     }
 
     #[test]
@@ -4383,6 +4627,155 @@ mod tests {
         assert_eq!(full.len(), 3);
         assert!(full.iter().any(|record| record.name == "HEAD"
             && record.value == RefValue::Symref("refs/heads/main".into())));
+    }
+
+    #[test]
+    fn compact_range_non_bottom_preserves_deletion_tombstone() {
+        use crate::objects::ObjectId;
+        use crate::repo::init_repository;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        init_repository(
+            dir.path(),
+            false,
+            "main",
+            None,
+            crate::RefStorageFormat::Reftable,
+        )
+        .expect("init");
+        let git_dir = dir.path().join(".git");
+        let mut opts = read_write_options(&git_dir);
+        opts.autocompaction_enabled = false;
+        let oid_c = ObjectId::from_bytes(&[0xcc; 20]).expect("oid");
+        let oid_other = ObjectId::from_bytes(&[0xdd; 20]).expect("oid");
+        let identity = "Compact Tomb <tomb@example.com> 1700000000 +0000";
+        reftable_write_ref_with_write_options(
+            &git_dir,
+            "refs/heads/c",
+            &oid_c,
+            Some(identity),
+            None,
+            &opts,
+        )
+        .expect("create c");
+        reftable_write_ref_with_write_options(
+            &git_dir,
+            "refs/heads/unrelated",
+            &oid_other,
+            Some(identity),
+            None,
+            &opts,
+        )
+        .expect("update unrelated");
+        reftable_delete_ref_with_write_options(&git_dir, "refs/heads/c", &opts).expect("delete c");
+
+        let mut stack = ReftableStack::open(&git_dir).expect("open");
+        assert!(
+            stack.table_names.len() >= 4,
+            "need init plus three ref tables, got {}",
+            stack.table_names.len()
+        );
+        let bottom = stack.table_names[0].clone();
+        let table_with_c = stack.table_names[1].clone();
+        let last = stack.table_names.len() - 1;
+        stack
+            .compact_range(last - 1, last, &opts)
+            .expect("compact suffix with delete");
+
+        assert!(stack.lookup_ref("refs/heads/c").expect("lookup").is_none());
+        let compacted_name = stack.table_names[last - 1].clone();
+        assert_ne!(compacted_name, bottom);
+        assert_ne!(compacted_name, table_with_c);
+        let compacted_data = fs::read(stack.reftable_dir.join(&compacted_name)).expect("read");
+        let compacted_reader = ReftableReader::new(compacted_data).expect("reader");
+        let compacted_refs = compacted_reader.read_refs().expect("refs");
+        assert!(
+            compacted_refs
+                .iter()
+                .any(|rec| { rec.name == "refs/heads/c" && rec.value == RefValue::Deletion }),
+            "compacted table must retain delete tombstone: {compacted_refs:?}"
+        );
+        let bottom_data = fs::read(stack.reftable_dir.join(&bottom)).expect("bottom");
+        let bottom_reader = ReftableReader::new(bottom_data).expect("bottom reader");
+        assert!(
+            !bottom_reader
+                .read_refs()
+                .expect("bottom refs")
+                .iter()
+                .any(|rec| rec.name == "refs/heads/c"),
+            "init table must remain untouched"
+        );
+        let c_table_data = fs::read(stack.reftable_dir.join(&table_with_c)).expect("c table");
+        let c_table_reader = ReftableReader::new(c_table_data).expect("c table reader");
+        assert!(
+            c_table_reader
+                .read_refs()
+                .expect("c table refs")
+                .iter()
+                .any(|rec| rec.name == "refs/heads/c"),
+            "older table must still hold the ref until shadowed"
+        );
+    }
+
+    #[test]
+    fn compact_range_from_bottom_omits_deletion_tombstone() {
+        use crate::objects::ObjectId;
+        use crate::repo::init_repository;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        init_repository(
+            dir.path(),
+            false,
+            "main",
+            None,
+            crate::RefStorageFormat::Reftable,
+        )
+        .expect("init");
+        let git_dir = dir.path().join(".git");
+        let mut opts = read_write_options(&git_dir);
+        opts.autocompaction_enabled = false;
+        let oid_c = ObjectId::from_bytes(&[0xcc; 20]).expect("oid");
+        let oid_other = ObjectId::from_bytes(&[0xdd; 20]).expect("oid");
+        let identity = "Compact Tomb <tomb@example.com> 1700000000 +0000";
+        reftable_write_ref_with_write_options(
+            &git_dir,
+            "refs/heads/c",
+            &oid_c,
+            Some(identity),
+            None,
+            &opts,
+        )
+        .expect("create c");
+        reftable_write_ref_with_write_options(
+            &git_dir,
+            "refs/heads/unrelated",
+            &oid_other,
+            Some(identity),
+            None,
+            &opts,
+        )
+        .expect("update unrelated");
+        reftable_delete_ref_with_write_options(&git_dir, "refs/heads/c", &opts).expect("delete c");
+
+        let mut stack = ReftableStack::open(&git_dir).expect("open");
+        let table_count = stack.table_names.len();
+        stack
+            .compact_range(0, table_count - 1, &opts)
+            .expect("compact all");
+        assert!(stack.lookup_ref("refs/heads/c").expect("lookup").is_none());
+        assert_eq!(stack.table_names.len(), 1);
+        let only = ReftableReader::new(
+            fs::read(stack.reftable_dir.join(&stack.table_names[0])).expect("read"),
+        )
+        .expect("reader");
+        assert!(
+            !only
+                .read_refs()
+                .expect("refs")
+                .iter()
+                .any(|rec| rec.name == "refs/heads/c"),
+            "full-stack compaction must not store delete tombstones"
+        );
     }
 
     #[test]
@@ -4697,9 +5090,9 @@ mod tests {
         )
         .unwrap_err();
         match err {
-            Error::RefStore(RefStoreError::NameUnavailable {
+            Error::Ref(RefError::Store(RefStoreError::NameUnavailable {
                 reason: RefnameUnavailable::AncestorExists { blocking, new_ref },
-            }) => {
+            })) => {
                 assert_eq!(blocking, "refs/heads/parent");
                 assert_eq!(new_ref, "refs/heads/parent/child");
             }
@@ -4727,7 +5120,7 @@ mod tests {
         let before = fs::read_to_string(&tables_list).unwrap_or_default();
 
         let oid = ObjectId::from_bytes(&[0xcd; 20]).unwrap();
-        set_test_inject_reftable_transaction_fail(true);
+        inject::set_reftable_transaction_fail(true);
         let mut stack = ReftableStack::open(&git_dir).unwrap();
         let opts = read_write_options(&git_dir);
         let err = stack.write_transaction(
@@ -4739,7 +5132,7 @@ mod tests {
             }],
             &opts,
         );
-        set_test_inject_reftable_transaction_fail(false);
+        inject::set_reftable_transaction_fail(false);
         assert!(err.is_err());
 
         let after = fs::read_to_string(&tables_list).unwrap_or_default();
@@ -4751,15 +5144,15 @@ mod tests {
         let err = get_varint(&[0x80], 0).expect_err("continuation byte without a successor");
         assert!(matches!(
             err,
-            Error::Reftable(ReftableError::Truncated {
+            Error::Ref(RefError::Reftable(ReftableError::Truncated {
                 field: ReftableField::Varint
-            })
+            }))
         ));
         assert!(matches!(
             get_varint(&[], 0),
-            Err(Error::Reftable(ReftableError::Truncated {
+            Err(Error::Ref(RefError::Reftable(ReftableError::Truncated {
                 field: ReftableField::Varint
-            }))
+            })))
         ));
     }
 
@@ -4782,7 +5175,7 @@ mod tests {
             })
             .expect_err("out of order");
         match err {
-            Error::Reftable(ReftableError::UnsortedRefs { previous, next }) => {
+            Error::Ref(RefError::Reftable(ReftableError::UnsortedRefs { previous, next })) => {
                 assert_eq!(previous, "refs/heads/b");
                 assert_eq!(next, "refs/heads/a");
             }
@@ -4801,19 +5194,25 @@ mod tests {
         mismatched[footer_start + 4] = 2;
         assert!(matches!(
             ReftableReader::new(mismatched),
-            Err(Error::Reftable(ReftableError::FooterVersionMismatch {
-                header: 1,
-                footer: 2
-            }))
+            Err(Error::Ref(RefError::Reftable(
+                ReftableError::FooterVersionMismatch {
+                    header: 1,
+                    footer: 2
+                }
+            )))
         ));
 
         assert!(matches!(
             ReftableReader::new(data[..10].to_vec()),
-            Err(Error::Reftable(ReftableError::TooSmall { len: 10 }))
+            Err(Error::Ref(RefError::Reftable(ReftableError::TooSmall {
+                len: 10
+            })))
         ));
         assert!(matches!(
             ReftableReader::new(data[..HEADER_SIZE + 4].to_vec()),
-            Err(Error::Reftable(ReftableError::TooSmall { .. }))
+            Err(Error::Ref(RefError::Reftable(
+                ReftableError::TooSmall { .. }
+            )))
         ));
     }
 
@@ -4854,11 +5253,11 @@ mod tests {
             expected_old: Some(stale),
         };
         match stack.write_transaction(vec![update("refs/heads/topic")], &opts) {
-            Err(Error::Reftable(ReftableError::ExpectedMismatch {
+            Err(Error::Ref(RefError::Reftable(ReftableError::ExpectedMismatch {
                 refname,
                 expected,
                 actual,
-            })) => {
+            }))) => {
                 assert_eq!(refname, "refs/heads/topic");
                 assert_eq!(expected, stale);
                 assert_eq!(actual, Some(current));
@@ -4870,7 +5269,10 @@ mod tests {
             .expect_err("absent ref");
         assert!(matches!(
             &err,
-            Error::Reftable(ReftableError::ExpectedMismatch { actual: None, .. })
+            Error::Ref(RefError::Reftable(ReftableError::ExpectedMismatch {
+                actual: None,
+                ..
+            }))
         ));
         assert!(err.to_string().ends_with("but found <absent>"), "{err}");
     }

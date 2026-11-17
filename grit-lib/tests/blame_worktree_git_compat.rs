@@ -1,12 +1,11 @@
 //! `blame_file` on uncommitted content (worktree file or caller buffer) against system
 //! `git blame`, which blames such content as a fake commit on top of `HEAD`.
 
+use grit_lib::error::DiffError;
+use grit_lib::error::RevisionError;
 use std::path::Path;
 
-use grit_lib::blame::{
-    blame_file, resolve_blame_line_range_with_options, BlameFinalSource, BlameOptions, BlameResult,
-    CopyDetection,
-};
+use grit_lib::blame::{BlameFinalSource, BlameOptions, BlameResult, CopyDetection};
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::diff::WhitespaceMode;
 use grit_lib::error::Error;
@@ -91,7 +90,7 @@ fn worktree_options() -> BlameOptions {
 }
 
 fn blame(repo: &Repository, path: &str, options: &BlameOptions) -> BlameResult {
-    blame_file(repo, path, options).expect("blame_file")
+    repo.diff().blame(path, options).expect("blame_file")
 }
 
 /// Three commits touching `f.txt`, so attributions span several commits.
@@ -318,9 +317,12 @@ fn untracked_file_is_not_in_head() {
     assert!(!out.ok(), "git blames untracked files: {}", out.dump("git"));
 
     let repo = open_repo(root);
-    let err = blame_file(&repo, "untracked.txt", &worktree_options()).unwrap_err();
+    let err = repo
+        .diff()
+        .blame("untracked.txt", &worktree_options())
+        .unwrap_err();
     assert!(
-        matches!(&err, Error::RevParse(_)),
+        matches!(&err, Error::Revision(RevisionError::Parse(_))),
         "unexpected error: {err:?}"
     );
     assert!(err.to_string().contains("untracked.txt"), "{err}");
@@ -333,7 +335,7 @@ fn missing_worktree_file_is_an_error() {
     history(root);
     std::fs::remove_file(root.join("f.txt")).unwrap();
     let repo = open_repo(root);
-    assert!(blame_file(&repo, "f.txt", &worktree_options()).is_err());
+    assert!(repo.diff().blame("f.txt", &worktree_options()).is_err());
     // The committed file can still be blamed.
     assert_eq!(
         blame(&repo, "f.txt", &BlameOptions::default()).lines.len(),
@@ -478,12 +480,106 @@ fn uncommitted_commit_info_carries_the_given_time() {
     );
     let info = &result.commits[&ObjectId::zero()];
     assert_eq!(info.author_time, 1_800_000_000);
-    assert!(info.author.is_empty() && info.summary.is_empty());
+    assert_eq!(
+        info.author,
+        "Not Committed Yet <not.committed.yet> 1800000000 +0000"
+    );
+    assert_eq!(info.summary, "Not Committed Yet");
     let without_time = blame(&repo, "f.txt", &worktree_options());
     assert_eq!(without_time.commits[&ObjectId::zero()].author_time, 0);
     let hunks = result.hunks();
-    assert!(hunks[0].commit.is_zero());
+    assert!(hunks[0].commit.is_zero() && hunks[0].not_committed);
     assert_eq!((hunks[0].final_start, hunks[0].count), (1, 1));
+    assert!(result.hunk_lines(&hunks[0])[0].not_committed);
+    assert!(!hunks[1].not_committed);
+}
+
+#[test]
+fn contents_commit_info_uses_the_external_file_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    history(root);
+    let repo = open_repo(root);
+    let result = blame(
+        &repo,
+        "f.txt",
+        &BlameOptions {
+            final_source: BlameFinalSource::Contents(b"buffer only\n".to_vec()),
+            ..worktree_options()
+        },
+    );
+    let info = &result.commits[&ObjectId::zero()];
+    assert_eq!(
+        info.author,
+        "External file (--contents) <not.committed.yet> 0 +0000"
+    );
+    assert_eq!(info.summary, "External file (--contents)");
+}
+
+/// `author` of the null-commit group in `git blame --porcelain` output.
+fn git_uncommitted_author(dir: &Path, args: &[&str]) -> String {
+    let mut argv = vec!["blame", "--porcelain"];
+    argv.extend_from_slice(args);
+    let out = git(dir, &argv);
+    let mut in_null_group = false;
+    for raw in out.lines() {
+        if let Some((sha, _)) = raw.split_once(' ') {
+            if matches!(sha.len(), 40 | 64) && sha.chars().all(|c| c.is_ascii_hexdigit()) {
+                in_null_group = sha.chars().all(|c| c == '0');
+                continue;
+            }
+        }
+        if let Some(name) = raw.strip_prefix("author ").filter(|_| in_null_group) {
+            return name.to_owned();
+        }
+    }
+    panic!("no uncommitted group in git blame output:\n{out}");
+}
+
+#[test]
+fn uncommitted_author_name_matches_git_porcelain() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    history(root);
+    std::fs::write(root.join("f.txt"), "new\nzero\n").unwrap();
+    let buffer = b"zero\nbuffer only\n";
+    std::fs::write(root.join("buffer.txt"), buffer).unwrap();
+    let repo = open_repo(root);
+
+    let mut worktree = blame(&repo, "f.txt", &worktree_options());
+    worktree.name_uncommitted_author(&BlameFinalSource::Worktree);
+    let name = BlameFinalSource::Worktree.uncommitted_author_name();
+    assert_eq!(name, git_uncommitted_author(root, &["--", "f.txt"]));
+    let info = &worktree.commits[&ObjectId::zero()];
+    assert!(info
+        .author
+        .starts_with(&format!("{name} <not.committed.yet> ")));
+    assert_eq!(info.summary, name);
+
+    let source = BlameFinalSource::Contents(buffer.to_vec());
+    let mut contents = blame(
+        &repo,
+        "f.txt",
+        &BlameOptions {
+            final_source: source.clone(),
+            ..BlameOptions::default()
+        },
+    );
+    contents.name_uncommitted_author(&source);
+    assert_eq!(
+        source.uncommitted_author_name(),
+        git_uncommitted_author(root, &["--contents", "buffer.txt", "--", "f.txt"])
+    );
+    assert_eq!(
+        contents.commits[&ObjectId::zero()].summary,
+        source.uncommitted_author_name()
+    );
+    let hunks = contents.hunks();
+    let uncommitted: Vec<_> = hunks.iter().filter(|h| h.not_committed).collect();
+    assert_eq!(uncommitted.len(), 1);
+    let lines = contents.hunk_lines(uncommitted[0]);
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0].content, "buffer only");
 }
 
 #[test]
@@ -498,7 +594,9 @@ fn line_range_resolves_against_the_final_text() {
     .unwrap();
     let repo = open_repo(root);
     let mut options = worktree_options();
-    let range = resolve_blame_line_range_with_options(&repo, "f.txt", "/^two$/,+2", &options)
+    let range = repo
+        .diff()
+        .resolve_blame_line_range_with_options("f.txt", "/^two$/,+2", &options)
         .expect("range");
     assert_eq!(range, 6..=7);
     options.line_range = Some(range);
@@ -507,7 +605,9 @@ fn line_range_resolves_against_the_final_text() {
         attributions(&result),
         git_blame(root, &["-L", "/^two$/,+2", "--", "f.txt"])
     );
-    let numeric = resolve_blame_line_range_with_options(&repo, "f.txt", "9,10", &options)
+    let numeric = repo
+        .diff()
+        .resolve_blame_line_range_with_options("f.txt", "9,10", &options)
         .expect("numeric range");
     assert_eq!(numeric, 9..=10);
 }
@@ -601,9 +701,9 @@ fn bare_repository_rejects_worktree_but_accepts_contents() {
         &["clone", "-q", "--bare", ".", bare.to_str().unwrap()],
     );
     let repo = Repository::open(&bare, &RepositoryOptions::empty()).expect("open bare");
-    let err = blame_file(&repo, "f.txt", &worktree_options()).unwrap_err();
+    let err = repo.diff().blame("f.txt", &worktree_options()).unwrap_err();
     assert!(
-        matches!(err, Error::BlameWorktreeBareRepository),
+        matches!(err, Error::Diff(DiffError::BlameWorktreeBareRepository)),
         "unexpected error: {err:?}"
     );
     let result = blame(

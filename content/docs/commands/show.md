@@ -26,6 +26,8 @@ Pass several `<object>` values to show more than one commit (human and markdown 
 
 Use `--stat` (or other diff format flags below) instead of the default patch. Limit output to paths with `-- <path>…` after the commit arguments.
 
+In a shallow clone, a commit listed in `.git/shallow` is diffed like a root (against the empty tree), even when its object still names a missing parent.
+
 ## Options
 
 | Option | Description |
@@ -240,7 +242,7 @@ Example:
 
 Schema: [v1](/schemas/show/v1.json)
 
-Pass [`--markdown`](../global-options/) for headings, commit metadata, message body, and fenced `diff` blocks per file (or a diffstat table with `--stat`):
+Pass [`--markdown`](../global-options/) for headings, commit metadata, the message body in a length-adaptive `text` fence (so commit text cannot forge grit headings or tables), and fenced `diff` blocks per file (or a diffstat table with `--stat`):
 
 ```text
 # Commit `b52cca6`

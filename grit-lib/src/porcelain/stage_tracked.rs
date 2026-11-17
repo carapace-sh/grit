@@ -4,13 +4,15 @@
 //! and mode match the index (and are not racy relative to the index file mtime) are trusted without
 //! re-reading file contents — Git's `ie_match_stat` fast path.
 
+use crate::worktree::WorktreeError;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::diff::{
-    entry_is_racy, index_entry_worktree_abs, materialize_worktree_blob, read_submodule_head_oid,
-    symlink_target_bytes, worktree_blob_content, SymlinkDirCache, WorktreeBlobContent,
+    classify_embedded_git_repo_for_stage, entry_is_racy, index_entry_worktree_abs,
+    materialize_worktree_blob, read_submodule_head_oid, symlink_target_bytes,
+    worktree_blob_content, EmbeddedGitRepoStage, SymlinkDirCache, WorktreeBlobContent,
 };
 use crate::error::{Error, Result};
 use crate::hash::Parallelism;
@@ -60,6 +62,8 @@ pub struct StageTrackedSummary {
     pub untracked_invalidation_deferred: bool,
     /// Index stat cache was refreshed for at least one path without a blob/mode change.
     pub stat_refreshed: bool,
+    /// At least one stage-0 entry gained an fsmonitor-valid bit after a clean scan.
+    pub(crate) fsmonitor_valid_updated: bool,
 }
 
 impl StageTrackedSummary {
@@ -94,7 +98,11 @@ impl StageTrackedSummary {
 /// [`Error::LockHeld`] when another process holds `index.lock` past the
 /// `core.filesRefLockTimeout` wait, I/O failures, object write failures, or a missing index
 /// when one is required.
-pub fn stage_tracked_modifications(
+#[expect(
+    dead_code,
+    reason = "retained for in-crate callers; IndexFile uses the _with_thresholds entry"
+)]
+pub(crate) fn stage_tracked_modifications(
     repo: &Repository,
     work_tree: &Path,
 ) -> Result<StageTrackedSummary> {
@@ -106,7 +114,7 @@ pub fn stage_tracked_modifications(
 /// # Errors
 ///
 /// Same as [`stage_tracked_modifications`].
-pub fn stage_tracked_modifications_with_thresholds(
+pub(crate) fn stage_tracked_modifications_with_thresholds(
     repo: &Repository,
     work_tree: &Path,
     thresholds: IndexStagingThresholds,
@@ -131,7 +139,10 @@ pub fn stage_tracked_modifications_with_thresholds(
     if summary.untracked_invalidation_deferred {
         replay_deferred_untracked_invalidations(&mut index, &summary);
     }
-    if summary.change_count() > 0 || summary.stat_refreshed {
+    if summary.change_count() > 0 || summary.stat_refreshed || summary.fsmonitor_valid_updated {
+        if summary.fsmonitor_valid_updated {
+            index.fsmonitor_validity_changed();
+        }
         index.ensure_canonical_order();
         repo.write_index_with_lock(&mut lock, &mut index, false)?;
     }
@@ -159,7 +170,11 @@ pub fn stage_tracked_modifications_with_thresholds(
 ///
 /// # Errors
 /// I/O failures or object write failures while reading the worktree.
-pub fn stage_tracked_modifications_in_index(
+#[expect(
+    dead_code,
+    reason = "retained for in-crate callers; IndexFile uses the _with_thresholds entry"
+)]
+pub(crate) fn stage_tracked_modifications_in_index(
     repo: &Repository,
     work_tree: &Path,
     index_path: &Path,
@@ -175,7 +190,7 @@ pub fn stage_tracked_modifications_in_index(
 }
 
 /// Like [`stage_tracked_modifications_in_index`], with explicit staging thresholds.
-pub fn stage_tracked_modifications_in_index_with_thresholds(
+pub(crate) fn stage_tracked_modifications_in_index_with_thresholds(
     repo: &Repository,
     work_tree: &Path,
     index_path: &Path,
@@ -184,7 +199,7 @@ pub fn stage_tracked_modifications_in_index_with_thresholds(
 ) -> Result<StageTrackedSummary> {
     let mut rules = WorktreeRules::from_repository(repo, index)?;
     let mut progress = crate::progress::NullProgress;
-    let mut scope = ProgressScope::new(&mut progress, &crate::progress::NeverCancel);
+    let mut scope = ProgressScope::new(&mut progress, crate::progress::CancelToken::never_ref());
     stage_tracked_modifications_in_index_with_rules(
         repo, work_tree, index_path, index, &mut rules, thresholds, None, &mut scope,
     )
@@ -283,10 +298,11 @@ fn stage_tracked_modifications_in_index_body(
     let index_mtime = index_file_mtime(index_path);
     let precompose_unicode = effective_core_precomposeunicode_with_config(
         Some(repo.git_dir()),
-        repo.config().ok().as_deref(),
+        repo.config().snapshot().ok().as_deref(),
     );
     let mode_policy = repo
         .config()
+        .snapshot()
         .map(|cfg| WorktreeModePolicy::from_config(&cfg))
         .unwrap_or_default();
 
@@ -310,9 +326,9 @@ fn stage_tracked_modifications_in_index_body(
     };
     let ignorecase = repo
         .config()
+        .snapshot()
         .ok()
-        .and_then(|cfg| cfg.get_bool("core.ignorecase").and_then(|r| r.ok()))
-        .unwrap_or(false);
+        .is_some_and(|cfg| cfg.ignore_case());
     let icase_collisions = if ignorecase {
         Some(crate::path_icase::IcaseCheckoutCollisionMap::from_index(
             work_tree, index, true,
@@ -359,9 +375,11 @@ fn stage_tracked_modifications_in_index_body(
 
     let rules_config = repo
         .config()
+        .snapshot()
         .unwrap_or_else(|_| std::sync::Arc::new(crate::config::ConfigSet::new()));
     let mut honor_fsmonitor = false;
-    if let Ok(cfg) = repo.config() {
+    let mut fsmonitor_valid_updated = false;
+    if let Ok(cfg) = repo.config().snapshot() {
         let default_runner = crate::command_runner::system_command_runner();
         let boundary = crate::fsmonitor::FsmonitorQueryBoundary(
             crate::environment::wall_clock_unix_timestamp_nanos(),
@@ -404,24 +422,24 @@ fn stage_tracked_modifications_in_index_body(
             ignorecase,
         )
     };
-    let preload_index = rules_config
-        .get_bool("core.preloadIndex")
-        .and_then(|r| r.ok())
-        .unwrap_or(true);
+    let preload_index = rules_config.preload_index();
     let blob_count = blob_dirs.len();
     let thread_policy = repo.thread_policy();
+    let stat_scan_opts = WorktreeBlobScanOptions {
+        preload_index,
+        stat_parallel_threads: None,
+        ..WorktreeBlobScanOptions::default()
+    };
     let stat_threads = stat_scan_thread_count(
         &thread_policy,
         rules_config.as_ref(),
-        WorktreeBlobScanOptions {
-            preload_index,
-            stat_parallel_threads: None,
-        },
+        &stat_scan_opts,
         blob_count,
     );
     let blob_scan_opts = WorktreeBlobScanOptions {
         preload_index,
         stat_parallel_threads: Some(stat_threads),
+        ..WorktreeBlobScanOptions::default()
     };
     let parallelism = thread_policy
         .resolve(
@@ -508,6 +526,13 @@ fn stage_tracked_modifications_in_index_body(
                 }
             }
             BlobDiskLookup::Io(e) => {
+                if e.kind() == std::io::ErrorKind::PermissionDenied {
+                    repo.warn(crate::diagnostics::Warning::WorktreeAccessFailed {
+                        path: rel_path.to_owned(),
+                        detail: e.to_string(),
+                    });
+                    return Ok(());
+                }
                 return Err(map_worktree_io(
                     rel_path,
                     WorktreePathOperation::Metadata,
@@ -525,6 +550,7 @@ fn stage_tracked_modifications_in_index_body(
                     mode_policy,
                     rules,
                     icase_collisions: icase_collisions.as_ref(),
+                    fsmonitor_valid_updated: &mut fsmonitor_valid_updated,
                 };
                 let defer = parallel_restage.then_some(&mut deferred_restage);
                 match refresh_present_tracked_path(ctx, stat, defer, entry_index)? {
@@ -571,6 +597,7 @@ fn stage_tracked_modifications_in_index_body(
 
     summary.modified.sort();
     summary.removed.sort();
+    summary.fsmonitor_valid_updated |= fsmonitor_valid_updated;
     Ok(summary)
 }
 
@@ -584,6 +611,7 @@ struct PresentRefreshCtx<'a> {
     mode_policy: WorktreeModePolicy,
     rules: &'a mut WorktreeRules,
     icase_collisions: Option<&'a crate::path_icase::IcaseCheckoutCollisionMap>,
+    fsmonitor_valid_updated: &'a mut bool,
 }
 
 fn refresh_unmerged_tracked_path(
@@ -631,13 +659,22 @@ fn refresh_unmerged_tracked_path(
                     return Ok(());
                 }
             }
-            index.remove(raw_path);
             if idx_mode == MODE_GITLINK {
-                if let Some(oid) = read_submodule_head_oid(abs_path) {
+                let oid = if meta.is_dir() && !meta.file_type().is_symlink() {
+                    match classify_embedded_git_repo_for_stage(index, &index_relpath, abs_path)? {
+                        EmbeddedGitRepoStage::Gitlink(oid) => Some(oid),
+                        EmbeddedGitRepoStage::NotEmbedded => read_submodule_head_oid(abs_path),
+                    }
+                } else {
+                    read_submodule_head_oid(abs_path)
+                };
+                if let Some(oid) = oid {
+                    index.remove(raw_path);
                     stage_gitlink_from_stat(abs_path, raw_path, oid, index)?;
                     summary.modified.push(raw_path.to_vec());
                 }
             } else {
+                index.remove(raw_path);
                 let mode = mode_policy.index_mode_for_worktree(
                     crate::diff::mode_from_metadata(&meta),
                     Some(idx_mode),
@@ -730,6 +767,7 @@ fn stage_tracked_path_individual(
                 mode_policy,
                 rules,
                 icase_collisions,
+                fsmonitor_valid_updated: &mut summary.fsmonitor_valid_updated,
             };
             match refresh_present_tracked_path(ctx, BlobDiskStat::from_metadata(&meta), None, 0)? {
                 PresentRefresh::Unchanged => {}
@@ -805,6 +843,7 @@ fn refresh_present_tracked_path(
         mode_policy,
         rules,
         icase_collisions,
+        fsmonitor_valid_updated,
     } = ctx;
     if icase_collisions.is_some_and(|map| map.is_auto_stage_loser(raw_path)) {
         return Ok(PresentRefresh::Unchanged);
@@ -838,6 +877,9 @@ fn refresh_present_tracked_path(
     let racy = entry_is_racy(idx_e, index_mtime);
     if !idx_intent_to_add && idx_e.size != 0 && stat_same && !racy {
         if wt_mode == idx_mode {
+            if crate::fsmonitor::mark_fsmonitor_valid_proven_clean_path(index, raw_path) {
+                *fsmonitor_valid_updated = true;
+            }
             return Ok(PresentRefresh::Unchanged);
         }
         // A type change (blob ↔ symlink, etc.) falls through to restage the content.
@@ -918,7 +960,13 @@ fn refresh_present_tracked_path(
                 }
                 if stat_fields_differ(&entry, idx_e) {
                     refresh_index_stat_only(index, raw_path, staged_oid, &entry)?;
+                    if crate::fsmonitor::mark_fsmonitor_valid_proven_clean_path(index, raw_path) {
+                        *fsmonitor_valid_updated = true;
+                    }
                     return Ok(PresentRefresh::StatRefreshed);
+                }
+                if crate::fsmonitor::mark_fsmonitor_valid_proven_clean_path(index, raw_path) {
+                    *fsmonitor_valid_updated = true;
                 }
                 return Ok(PresentRefresh::Unchanged);
             }
@@ -950,6 +998,9 @@ fn refresh_present_tracked_path(
             let meta = fs::symlink_metadata(abs_path).map_err(Error::Io)?;
             let oid = read_worktree_blob_oid_raw(repo, abs_path, &meta)?;
             if !idx_intent_to_add && idx_oid == oid && wt_mode == idx_mode {
+                if crate::fsmonitor::mark_fsmonitor_valid_proven_clean_path(index, raw_path) {
+                    *fsmonitor_valid_updated = true;
+                }
                 return Ok(PresentRefresh::Unchanged);
             }
             if icase_collisions.is_some_and(|map| {
@@ -1056,8 +1107,9 @@ fn restage_deferred_chunk(
     let mut batch_inputs = Vec::with_capacity(jobs.len());
     for job in jobs {
         let raw_path = job.raw_path.as_slice();
-        let rel_path = std::str::from_utf8(raw_path)
-            .map_err(|_| Error::Message("deferred restage requires utf-8 index paths".into()))?;
+        let rel_path = std::str::from_utf8(raw_path).map_err(|_| WorktreeError::NonUtf8Path {
+            path: String::from_utf8_lossy(raw_path).into_owned(),
+        })?;
         let Some(idx_e) = index.get(raw_path, 0).cloned() else {
             continue;
         };
@@ -1431,7 +1483,7 @@ mod tests {
         impl crate::promisor_fetch::PromisorFetcher for FetchCounter {
             fn fetch_missing(&self, _: &Repository, _: &[ObjectId]) -> Result<()> {
                 self.0.fetch_add(1, Ordering::SeqCst);
-                Err(Error::Message("unexpected fetch".into()))
+                Err(Error::Io(std::io::Error::other("unexpected fetch")))
             }
         }
         let (_dir, repo) = init_repo();
@@ -1504,7 +1556,9 @@ mod tests {
 
     #[test]
     fn staging_scan_stats_each_tracked_path_once() {
-        use crate::worktree_scan::{reset_worktree_metadata_probe, worktree_metadata_probe_count};
+        use crate::test_support::counters::{
+            reset_worktree_metadata_probe, worktree_metadata_probe_count,
+        };
 
         let (_dir, repo) = init_repo();
         let wt = repo.work_tree().unwrap();
@@ -1997,7 +2051,6 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn unreadable_parent_does_not_stage_deletion() {
-        use std::io::ErrorKind;
         use std::os::unix::fs::PermissionsExt;
 
         let (_dir, repo) = init_repo();
@@ -2012,11 +2065,9 @@ mod tests {
         perms.set_mode(0o000);
         fs::set_permissions(&locked, perms).unwrap();
 
-        let err = stage_tracked_modifications(&repo, wt).unwrap_err();
-        let Error::Io(io_err) = err else {
-            panic!("expected I/O error, got {err:?}");
-        };
-        assert_eq!(io_err.kind(), ErrorKind::PermissionDenied);
+        let summary = stage_tracked_modifications(&repo, wt).unwrap();
+        assert!(summary.modified.is_empty());
+        assert!(summary.removed.is_empty());
 
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
         let index = repo.load_index().unwrap();
@@ -2156,7 +2207,7 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            crate::progress::CancelToken::never_ref(),
         )
         .unwrap();
         assert_eq!(
@@ -2290,6 +2341,41 @@ mod tests {
     fn set_branch_head(repo: &Repository, oid: ObjectId) {
         let head_path = repo.git_dir().join("refs/heads/main");
         fs::write(head_path, format!("{oid}\n")).unwrap();
+    }
+
+    #[test]
+    fn unmerged_gitlink_tracked_scan_refuses_unborn_nested_head() {
+        let (_dir, repo) = init_repo();
+        let wt = repo.work_tree().unwrap();
+        let sub = wt.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        let sub_repo = open_nested_repo(&sub);
+        let base_oid = commit_in_nested_repo(&sub_repo, "inside.txt", b"base\n", "base");
+        let ours_oid = commit_in_nested_repo(&sub_repo, "inside.txt", b"ours\n", "ours");
+        let theirs_oid = commit_in_nested_repo(&sub_repo, "inside.txt", b"theirs\n", "theirs");
+        fs::write(sub.join(".git/HEAD"), "ref: refs/heads/does-not-exist\n").unwrap();
+
+        let mut index = Index::new();
+        index
+            .entries
+            .push(conflict_index_entry("sub", 1, base_oid, MODE_GITLINK));
+        index
+            .entries
+            .push(conflict_index_entry("sub", 2, ours_oid, MODE_GITLINK));
+        index
+            .entries
+            .push(conflict_index_entry("sub", 3, theirs_oid, MODE_GITLINK));
+        repo.write_index(&mut index).unwrap();
+        let index_path = repo.index_path();
+        let index_before = fs::read(&index_path).unwrap();
+
+        let err = stage_tracked_modifications(&repo, wt).unwrap_err();
+        assert!(matches!(
+            err,
+            Error::Worktree(WorktreeError::EmbeddedRepoWithoutCommit { path }) if path == "sub"
+        ));
+        assert_eq!(fs::read(&index_path).unwrap(), index_before);
+        assert!(repo.load_index().unwrap().has_unmerged_entries());
     }
 
     #[test]

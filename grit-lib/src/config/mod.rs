@@ -6,27 +6,25 @@
 //! use grit_lib::repo::{InitOptions, Repository};
 //! # fn main() -> grit_lib::error::Result<()> {
 //! let dir = tempfile::tempdir()?;
-//! let _repo = Repository::init(dir.path(), &InitOptions::default())?;
-//! let _cfg = _repo.config()?;
+//! let (_repo, _) = Repository::init(dir.path(), &InitOptions::default())?;
+//! let _cfg = _repo.config().snapshot()?;
 //!
 //! # Ok(())
 //! # }
 //! ```
 mod core;
-pub mod handle;
+pub(crate) mod handle;
 mod location;
 mod typed;
+mod write;
 
 pub use core::*;
-pub use handle::ConfigHandle;
-pub use location::{
-    add_config_value, global_config_write_path, remove_config_section, rename_config_section,
-    set_config_value, unset_all_config_values, unset_config_value, ConfigLocation,
-    ConfigWritePreview,
-};
+pub use handle::Config;
+pub use location::{global_config_write_path, ConfigLocation, ConfigWritePreview};
 pub use typed::{
     canonicalize_config_write_value, parse_typed_value, ConfigValueType, TypedConfigValue,
 };
+pub use write::{ConfigEditor, ConfigWriteOptions};
 
 pub mod dotfile {
     //! dotfile API (re-exported at this path).
@@ -43,14 +41,6 @@ pub mod gitmodules {
     pub mod gitdir {
         pub use crate::submodule_gitdir::*;
     }
-}
-pub mod ident {
-    //! ident API (re-exported at this path).
-    pub use crate::ident::*;
-}
-pub mod ident_config {
-    //! ident_config API (re-exported at this path).
-    pub use crate::ident_config::*;
 }
 pub mod ident_resolve {
     //! ident_resolve API (re-exported at this path).

@@ -20,6 +20,45 @@ use crate::quote_path::{quote_c_style, quote_c_style_bytes};
 
 pub(crate) const STORAGE_PREFIX: &str = "grit+pathhex:";
 
+/// Repository-relative path in [`storage_string`] form (UTF-8 when possible, else `grit+pathhex:`).
+///
+/// This is the stable type for paths surfaced from index and tree operations, including
+/// non-UTF-8 file names on Unix (round-trips through [`storage_bytes`]).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct StoredRelPath(String);
+
+impl StoredRelPath {
+    /// Wrap a path already in storage form.
+    #[must_use]
+    pub fn new(stored: String) -> Self {
+        Self(stored)
+    }
+
+    /// Borrow the stored string (UTF-8 or `grit+pathhex:` encoding).
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Decode to raw repository-relative bytes (slash-separated, as in the index).
+    #[must_use]
+    pub fn to_bytes(&self) -> std::borrow::Cow<'_, [u8]> {
+        storage_bytes(&self.0)
+    }
+}
+
+impl std::fmt::Display for StoredRelPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl From<String> for StoredRelPath {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
 /// Parent directory prefix of a repository-relative path (empty when at repository root).
 #[must_use]
 pub fn parent_dir(path: &[u8]) -> Vec<u8> {
@@ -46,6 +85,7 @@ pub fn format_path_stored(prefix: &str, name: &[u8]) -> String {
     storage_string(&join_rel(&prefix_bytes, name))
 }
 
+/// Join a parent repository-relative path with a single name segment using `/`.
 #[must_use]
 pub fn join_rel(parent: &[u8], name: &[u8]) -> Vec<u8> {
     if parent.is_empty() {
@@ -73,6 +113,36 @@ pub fn storage_string(path: &[u8]) -> String {
             out
         }
     }
+}
+
+/// Canonical stored path for a sparse-directory index row (mode `040000`, trailing slash).
+#[must_use]
+pub fn sparse_directory_stored_path(dir: &str) -> String {
+    directory_marker_stored(dir.strip_suffix('/').unwrap_or(dir))
+}
+
+/// Stored path for a directory entry with a trailing slash (untracked `dir/` markers, prefixes).
+#[must_use]
+pub fn directory_marker_stored(stored: &str) -> String {
+    let mut bytes = storage_bytes(stored).into_owned();
+    if bytes.last() != Some(&b'/') {
+        bytes.push(b'/');
+    }
+    storage_string(&bytes)
+}
+
+/// Whether a stored path denotes a collapsed untracked directory (`dir/` in raw bytes).
+#[must_use]
+pub fn stored_path_is_directory_marker(stored: &str) -> bool {
+    storage_bytes(stored).ends_with(b"/")
+}
+
+/// Stored repository-relative path with a directory-marker trailing slash removed (raw bytes).
+#[must_use]
+pub fn stored_directory_marker_parent(stored: &str) -> String {
+    let bytes = storage_bytes(stored);
+    let parent = bytes.strip_suffix(b"/").unwrap_or(bytes.as_ref());
+    storage_string(parent)
 }
 
 /// Decode a path previously produced by [`storage_string`].
@@ -173,6 +243,16 @@ mod tests {
         assert_eq!(storage_bytes(&s)[..], raw[..]);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn stored_rel_path_round_trip_non_utf8() {
+        let raw: &[u8] = b"deep/b\xff/c.txt";
+        let stored = storage_string(raw);
+        let rel = StoredRelPath::new(stored.clone());
+        assert_eq!(rel.as_str(), stored);
+        assert_eq!(rel.to_bytes().as_ref(), raw);
+    }
+
     #[test]
     fn join_and_parent() {
         assert_eq!(parent_dir(b"a/b/c"), b"a/b");
@@ -187,5 +267,24 @@ mod tests {
         assert_ne!(stored, "grit+pathhex:6162");
         assert!(stored.starts_with(STORAGE_PREFIX));
         assert_eq!(storage_bytes(&stored)[..], literal[..]);
+    }
+
+    #[test]
+    fn directory_marker_stored_appends_slash_in_raw_bytes() {
+        let dir = storage_string(b"\xfe");
+        let marked = directory_marker_stored(&dir);
+        assert_eq!(marked, "grit+pathhex:fe2f");
+        assert_eq!(storage_bytes(&marked)[..], b"\xfe/"[..]);
+    }
+
+    #[test]
+    fn stored_directory_marker_detect_and_parent() {
+        let marked = directory_marker_stored(&storage_string(b"\xfe"));
+        assert!(stored_path_is_directory_marker(&marked));
+        assert!(!stored_path_is_directory_marker("plain.txt"));
+        assert_eq!(
+            stored_directory_marker_parent(&marked),
+            storage_string(b"\xfe")
+        );
     }
 }

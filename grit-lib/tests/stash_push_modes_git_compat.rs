@@ -2,6 +2,7 @@
 
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::objects::ObjectId;
+use grit_lib::progress::{CancelToken, NullProgress};
 use grit_lib::repo::Repository;
 use grit_lib::stash::{StashMode, StashPushOptions};
 use std::path::{Path, PathBuf};
@@ -140,7 +141,7 @@ fn stash_staged_only_matches_git_trees() {
         .push(
             &stash_opts(StashMode::StagedOnly, false),
             &mut grit_lib::progress::NullProgress,
-            &grit_lib::progress::NeverCancel,
+            &grit_lib::progress::CancelToken::never(),
         )
         .expect("push")
         .expect("had staged changes");
@@ -179,7 +180,7 @@ fn stash_keep_index_leaves_index_and_worktree_like_git() {
         .push(
             &stash_opts(StashMode::KeepIndex, false),
             &mut grit_lib::progress::NullProgress,
-            &grit_lib::progress::NeverCancel,
+            &grit_lib::progress::CancelToken::never(),
         )
         .expect("push")
         .expect("had changes");
@@ -216,7 +217,7 @@ fn stash_keep_index_pop_matches_git() {
         .push(
             &stash_opts(StashMode::KeepIndex, false),
             &mut grit_lib::progress::NullProgress,
-            &grit_lib::progress::NeverCancel,
+            &grit_lib::progress::CancelToken::never(),
         )
         .expect("push")
         .expect("had changes");
@@ -284,7 +285,7 @@ fn stash_staged_with_pathspec_matches_git() {
         .push(
             &opts,
             &mut grit_lib::progress::NullProgress,
-            &grit_lib::progress::NeverCancel,
+            &grit_lib::progress::CancelToken::never(),
         )
         .expect("push")
         .expect("changes");
@@ -320,7 +321,7 @@ fn stash_staged_deletion_restores_head_like_git() {
         .push(
             &stash_opts(StashMode::StagedOnly, false),
             &mut grit_lib::progress::NullProgress,
-            &grit_lib::progress::NeverCancel,
+            &grit_lib::progress::CancelToken::never(),
         )
         .expect("push")
         .expect("changes");
@@ -354,7 +355,7 @@ fn stash_staged_rejects_untracked_combo() {
         .push(
             &stash_opts(StashMode::StagedOnly, true),
             &mut grit_lib::progress::NullProgress,
-            &grit_lib::progress::NeverCancel,
+            &grit_lib::progress::CancelToken::never(),
         )
         .expect_err("staged + untracked");
     assert!(

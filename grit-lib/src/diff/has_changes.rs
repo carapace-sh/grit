@@ -1,7 +1,6 @@
 //! Fast change detection for diffs without building hunks.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crate::config::ConfigSet;
@@ -18,26 +17,16 @@ use crate::objects::odb::Odb;
 use crate::objects::{parse_commit, ObjectId};
 use crate::pathspec::PathspecMatcher;
 use crate::repo::Repository;
-use crate::state::resolve_head;
+use crate::repo::RepositoryError;
+use crate::state::resolve_head_for_repository;
 use crate::worktree::worktree_rules::WorktreeRules;
-
-/// Hook for tests that assert early exit while scanning worktree diffs.
-#[doc(hidden)]
-pub static WORKTREE_HAS_CHANGES_ENTRIES_SCANNED: AtomicUsize = AtomicUsize::new(0);
-
-/// Hook for tests that assert `Diff::has_changes` was (not) invoked.
-#[doc(hidden)]
-pub static HAS_CHANGES_CALL_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 fn opts_need_content_compare(opts: &DiffOptions) -> bool {
     opts.whitespace.is_active()
 }
 
 fn trust_filemode(config: &ConfigSet) -> bool {
-    config
-        .get_bool("core.filemode")
-        .and_then(|r| r.ok())
-        .unwrap_or(true)
+    config.file_mode()
 }
 
 fn rename_threshold(opts: &DiffOptions) -> u32 {
@@ -205,14 +194,6 @@ pub(crate) fn tree_entry_has_changes(
     Ok(false)
 }
 
-fn head_tree(repo: &Repository) -> Result<Option<ObjectId>> {
-    let head = resolve_head(repo.git_dir())?;
-    Ok(match head.oid() {
-        Some(oid) => Some(tree_oid_of_commit(repo.odb(), oid)?),
-        None => None,
-    })
-}
-
 fn worktree_has_changes(
     repo: &Repository,
     index: &mut Index,
@@ -220,8 +201,8 @@ fn worktree_has_changes(
     matcher: &PathspecMatcher<'_>,
     opts: &DiffOptions,
 ) -> Result<bool> {
-    let work_tree = repo.work_tree().ok_or(Error::RequiresWorkTree)?;
-    let config = repo.config()?;
+    let work_tree = repo.work_tree().ok_or(RepositoryError::RequiresWorkTree)?;
+    let config = repo.config().snapshot()?;
     let index_mtime = index_mtime_for_diff(index, None);
     let rules_arc = Arc::new(std::sync::Mutex::new(WorktreeRules::from_repository(
         repo, index,
@@ -242,7 +223,7 @@ fn worktree_has_changes(
     };
 
     if index_backed {
-        WORKTREE_HAS_CHANGES_ENTRIES_SCANNED.store(0, Ordering::SeqCst);
+        crate::test_probe_hooks::hooks::reset_worktree_has_changes_scan();
         let content_compare = opts_need_content_compare(opts);
         let (entries, _) = diff_index_to_worktree_with_options(
             repo.odb(),
@@ -260,7 +241,7 @@ fn worktree_has_changes(
             },
         )?;
         for entry in &entries {
-            WORKTREE_HAS_CHANGES_ENTRIES_SCANNED.fetch_add(1, Ordering::SeqCst);
+            crate::test_probe_hooks::hooks::worktree_has_changes_entry_scanned();
             if !matcher.matches_change(entry.path(), entry.old_path.as_deref()) {
                 continue;
             }
@@ -311,9 +292,9 @@ fn staged_has_changes(
     matcher: &PathspecMatcher<'_>,
     opts: &DiffOptions,
 ) -> Result<bool> {
-    let head_tree = head_tree(repo)?;
-    let index = repo.index_handle().load()?;
-    let config = repo.config()?;
+    let head_tree = resolve_head_for_repository(repo)?.tree(repo.odb())?;
+    let index = repo.load_index()?;
+    let config = repo.config().snapshot()?;
     let mut entries = diff_index_to_tree_with_renames(
         repo.odb(),
         &index,
@@ -339,7 +320,7 @@ fn unstaged_has_changes(
     matcher: &PathspecMatcher<'_>,
     opts: &DiffOptions,
 ) -> Result<bool> {
-    let mut index = repo.index_handle().load()?;
+    let mut index = repo.load_index()?;
     worktree_has_changes(repo, &mut index, None, matcher, opts)
 }
 
@@ -350,7 +331,7 @@ fn commit_trees_has_changes(
     matcher: &PathspecMatcher<'_>,
     opts: &DiffOptions,
 ) -> Result<bool> {
-    let config = repo.config()?;
+    let config = repo.config().snapshot()?;
     let base_tree = tree_oid_of_commit(repo.odb(), base)?;
     let tip_tree = tree_oid_of_commit(repo.odb(), tip)?;
     let mut entries = diff_trees_with_renames_and_policy(
@@ -386,23 +367,23 @@ impl<'repo> super::handle::Diff<'repo> {
     pub fn has_changes(
         &self,
         target: &DiffTarget,
-        pathspecs: &[String],
-        opts: DiffOptions,
+        pathspec: &crate::pathspec::Pathspec,
+        opts: &DiffOptions,
     ) -> Result<bool> {
-        HAS_CHANGES_CALL_COUNT.fetch_add(1, Ordering::SeqCst);
+        crate::test_probe_hooks::hooks::has_changes_call();
         let repo = self.repository();
-        let matcher = repo.pathspec_matcher(pathspecs)?;
+        let matcher = repo.pathspec_matcher_with_globals(pathspec.specs(), pathspec.globals())?;
         match target {
             DiffTarget::WorktreeVsHead => {
-                let mut index = repo.index_handle().load()?;
-                let head_tree = head_tree(repo)?;
-                worktree_has_changes(repo, &mut index, head_tree.as_ref(), &matcher, &opts)
+                let mut index = repo.load_index()?;
+                let head_tree = resolve_head_for_repository(repo)?.tree(repo.odb())?;
+                worktree_has_changes(repo, &mut index, head_tree.as_ref(), &matcher, opts)
             }
-            DiffTarget::IndexVsHead => staged_has_changes(repo, &matcher, &opts),
-            DiffTarget::WorktreeVsIndex => unstaged_has_changes(repo, &matcher, &opts),
+            DiffTarget::IndexVsHead => staged_has_changes(repo, &matcher, opts),
+            DiffTarget::WorktreeVsIndex => unstaged_has_changes(repo, &matcher, opts),
             DiffTarget::WorktreeVsTree(tree) => {
-                let mut index = repo.index_handle().load()?;
-                worktree_has_changes(repo, &mut index, Some(tree), &matcher, &opts)
+                let mut index = repo.load_index()?;
+                worktree_has_changes(repo, &mut index, Some(tree), &matcher, opts)
             }
             DiffTarget::Commit(commit) => {
                 let obj = repo.odb().read(commit)?;
@@ -413,13 +394,13 @@ impl<'repo> super::handle::Diff<'repo> {
                     .first()
                     .map(|parent| tree_oid_of_commit(repo.odb(), parent))
                     .transpose()?;
-                let config = repo.config()?;
+                let config = repo.config().snapshot()?;
                 let mut entries = diff_trees_with_renames_and_policy(
                     repo.odb(),
                     old_tree.as_ref(),
                     Some(&new_tree),
                     "",
-                    rename_threshold(&opts),
+                    rename_threshold(opts),
                     config.as_ref(),
                     &repo.thread_policy(),
                 )?;
@@ -431,7 +412,7 @@ impl<'repo> super::handle::Diff<'repo> {
                         repo.odb(),
                         &entry,
                         trust_filemode(config.as_ref()),
-                        &opts,
+                        opts,
                     )? {
                         return Ok(true);
                     }
@@ -439,16 +420,16 @@ impl<'repo> super::handle::Diff<'repo> {
                 Ok(false)
             }
             DiffTarget::Trees { old, new } => match old {
-                Some(base) => commit_trees_has_changes(repo, base, new, &matcher, &opts),
+                Some(base) => commit_trees_has_changes(repo, base, new, &matcher, opts),
                 None => {
-                    let config = repo.config()?;
-                    let tip_tree = tree_oid_of_commit(repo.odb(), new)?;
+                    let config = repo.config().snapshot()?;
+                    let tip_tree = super::core::tree_oid_for_diff_side(repo.odb(), new)?;
                     let mut entries = diff_trees_with_renames_and_policy(
                         repo.odb(),
                         None,
                         Some(&tip_tree),
                         "",
-                        rename_threshold(&opts),
+                        rename_threshold(opts),
                         config.as_ref(),
                         &repo.thread_policy(),
                     )?;
@@ -460,7 +441,7 @@ impl<'repo> super::handle::Diff<'repo> {
                             repo.odb(),
                             &entry,
                             trust_filemode(config.as_ref()),
-                            &opts,
+                            opts,
                         )? {
                             return Ok(true);
                         }

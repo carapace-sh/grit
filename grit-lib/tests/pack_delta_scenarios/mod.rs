@@ -4,6 +4,7 @@
 
 #![allow(dead_code)]
 
+use grit_lib::error::ObjectError;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc;
@@ -11,9 +12,9 @@ use std::time::Duration;
 
 use grit_lib::error::Error;
 use grit_lib::objects::odb::Odb;
-use grit_lib::objects::pack::clear_pack_cache;
 use grit_lib::objects::unpack_objects::{apply_delta, apply_delta_into};
 use grit_lib::objects::ObjectId;
+use grit_lib::test_support::objects_pack::clear_pack_cache;
 use grit_test_support::objects::{
     hash_loose_object, write_loose_object, write_pack_and_index, DeltaOps, HashAlgo,
     IndexPackOptions, ObjectKind as PackObjectKind, PackBuilder, PackBuilt, RepoFixture,
@@ -206,14 +207,14 @@ pub fn read_blob(odb: &Odb, hex: &str) -> Result<grit_lib::objects::Object, Erro
 
 pub fn expect_corrupt_object(err: Error) {
     assert!(
-        matches!(err, Error::CorruptObject(_)),
+        matches!(err, Error::Object(ObjectError::Corrupt { .. })),
         "expected CorruptObject, got {err:?}"
     );
 }
 
 pub fn expect_delta_chain_limit(err: Error) {
     assert!(
-        matches!(err, Error::DeltaChainTooDeep { .. }),
+        matches!(err, Error::Object(ObjectError::DeltaChainTooDeep { .. })),
         "expected DeltaChainTooDeep, got {err:?}"
     );
 }

@@ -3,12 +3,13 @@
 use std::fs;
 use std::process::Command;
 
-use grit_lib::config::environment::{ConfigOverride, Environment};
+use grit_lib::config::environment::{ConfigOverride, Environment, RepositoryOptions};
 use grit_lib::config::ident_resolve::{IdentRole, IdentityError};
 use grit_lib::error::Error;
-use grit_lib::porcelain::add::{stage, StageOptions};
-use grit_lib::porcelain::commit::{commit_worktree, CommitRequest};
-use grit_lib::progress::{NeverCancel, NullProgress};
+use grit_lib::porcelain::add::StageOptions;
+use grit_lib::porcelain::commit::CommitRequest;
+use grit_lib::progress::CancelToken;
+use grit_lib::progress::NullProgress;
 use grit_lib::repo::{InitOptions, Repository};
 use tempfile::TempDir;
 
@@ -44,23 +45,23 @@ fn write_user_global_config(dir: &TempDir) {
 
 fn stage_all_and_commit_first(repo: &Repository, wt: &std::path::Path) {
     fs::write(wt.join("a.txt"), "hello\n").expect("write");
-    stage(
-        repo,
-        &StageOptions::default(),
-        &mut NullProgress,
-        &NeverCancel,
-    )
-    .expect("stage");
-    commit_worktree(
-        repo,
-        &CommitRequest {
-            message: "first".into(),
-            ..CommitRequest::default()
-        },
-        &mut NullProgress,
-        &NeverCancel,
-    )
-    .expect("commit");
+    repo.index()
+        .stage(
+            &StageOptions::default(),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("stage");
+    repo.commits()
+        .create(
+            &grit_lib::commits::CommitOptions::new(
+                CommitRequest::new("first"),
+                grit_lib::porcelain::commit::CommitScope::AutoStage,
+            ),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("commit");
 }
 
 #[test]
@@ -69,8 +70,11 @@ fn init_with_environment_keeps_identity_for_first_commit() {
     write_user_global_config(&cfg_home);
     let env = env_with_global(&cfg_home.path().join("gitconfig"));
     let wt = TempDir::new().expect("tempdir");
-    let repo =
-        Repository::init(wt.path(), &InitOptions::new().with_environment(env)).expect("init");
+    let (repo, _) = Repository::init(
+        wt.path(),
+        &InitOptions::new().with_repository_options(RepositoryOptions::with_environment(env)),
+    )
+    .expect("init");
     let committer = repo
         .identity(IdentRole::Committer, repo.identity_now())
         .expect("committer from init environment");
@@ -82,28 +86,29 @@ fn init_with_environment_keeps_identity_for_first_commit() {
 #[test]
 fn init_default_hermetic_commit_reports_missing_identity() {
     let wt = TempDir::new().expect("tempdir");
-    let repo = Repository::init(wt.path(), &InitOptions::default()).expect("init");
+    let (repo, _) = Repository::init(wt.path(), &InitOptions::default()).expect("init");
     fs::write(wt.path().join("a.txt"), "hello\n").expect("write");
-    stage(
-        &repo,
-        &StageOptions::default(),
-        &mut NullProgress,
-        &NeverCancel,
-    )
-    .expect("stage");
-    let err = commit_worktree(
-        &repo,
-        &CommitRequest {
-            message: "first".into(),
-            ..CommitRequest::default()
-        },
-        &mut NullProgress,
-        &NeverCancel,
-    )
-    .unwrap_err();
+    repo.index()
+        .stage(
+            &StageOptions::default(),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("stage");
+    let err = repo
+        .commits()
+        .create(
+            &grit_lib::commits::CommitOptions::new(
+                CommitRequest::new("first"),
+                grit_lib::porcelain::commit::CommitScope::AutoStage,
+            ),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .unwrap_err();
     assert!(matches!(
         err,
-        Error::Identity(IdentityError::MissingConfiguredEmail {
+        CommitError::Identity(IdentityError::MissingConfiguredEmail {
             role: IdentRole::Committer
         })
     ));
@@ -115,9 +120,11 @@ fn init_bare_with_environment_resolves_identity() {
     write_user_global_config(&cfg_home);
     let env = env_with_global(&cfg_home.path().join("gitconfig"));
     let bare = TempDir::new().expect("tempdir");
-    let repo = Repository::init(
+    let (repo, _) = Repository::init(
         bare.path(),
-        &InitOptions::new().with_bare(true).with_environment(env),
+        &InitOptions::new()
+            .with_bare(true)
+            .with_repository_options(RepositoryOptions::with_environment(env)),
     )
     .expect("init bare");
     assert!(repo.work_tree().is_none());
@@ -134,10 +141,10 @@ fn init_separate_git_dir_with_environment_commits() {
     let env = env_with_global(&cfg_home.path().join("gitconfig"));
     let wt = TempDir::new().expect("tempdir");
     let separate = TempDir::new().expect("tempdir");
-    let repo = Repository::init(
+    let (repo, _) = Repository::init(
         wt.path(),
         &InitOptions::new()
-            .with_environment(env)
+            .with_repository_options(RepositoryOptions::with_environment(env))
             .with_separate_git_dir(Some(separate.path().to_path_buf())),
     )
     .expect("init separate");
@@ -158,8 +165,11 @@ fn init_honors_git_config_parameters_for_filesystem_config() {
             .parse::<ConfigOverride>()
             .expect("override"),
     );
-    let repo =
-        Repository::init(wt.path(), &InitOptions::new().with_environment(env)).expect("init");
+    let (repo, _) = Repository::init(
+        wt.path(),
+        &InitOptions::new().with_repository_options(RepositoryOptions::with_environment(env)),
+    )
+    .expect("init");
     let config = fs::read_to_string(repo.git_dir().join("config")).expect("read config");
     assert!(
         config.contains("filemode = false"),

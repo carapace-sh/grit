@@ -17,6 +17,17 @@
         },
         "status": {
           "$ref": "#/definitions/ChangeStatus"
+        },
+        "submodule": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SubmoduleChangeJson"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Present for gitlink worktree changes (`160000`)."
         }
       },
       "required": [
@@ -146,6 +157,101 @@
       ],
       "type": "object"
     },
+    "DivergenceChangeJson": {
+      "description": "One commit of a divergence: what each side did to it.",
+      "properties": {
+        "change": {
+          "description": "Its change id, or `patch:<patch id>` for a commit without one.",
+          "type": "string"
+        },
+        "paths": {
+          "description": "The paths its versions change.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "subject": {
+          "description": "Its subject line.",
+          "type": "string"
+        },
+        "them": {
+          "description": "What they did to it, in the same words.",
+          "type": "string"
+        },
+        "you": {
+          "description": "What you did to it: `unchanged`, `moved`, `reworded`, `amended`, `dropped`, `squashed`, `split`, `new`, `split_piece` or `absent`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "change",
+        "paths",
+        "subject",
+        "them",
+        "you"
+      ],
+      "type": "object"
+    },
+    "DivergenceJson": {
+      "description": "How another member's head diverged from yours ([`grit_lib::divergence`]).",
+      "properties": {
+        "also": {
+          "description": "Other scenarios that also apply, most pressing first.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "base": {
+          "description": "The last head you both had, when known.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "changes": {
+          "description": "The commits either side changed or added, oldest first.",
+          "items": {
+            "$ref": "#/definitions/DivergenceChangeJson"
+          },
+          "type": "array"
+        },
+        "conflicts": {
+          "description": "Paths where the two heads' changes conflict.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "needs_decision": {
+          "description": "Whether someone has to decide what to do. When `false`, the heads can be put together without losing anything.",
+          "type": "boolean"
+        },
+        "options": {
+          "description": "The ways out, the recommended one first.",
+          "items": {
+            "$ref": "#/definitions/ResolveOptionJson"
+          },
+          "type": "array"
+        },
+        "scenario": {
+          "description": "The scenario's stable code, such as `amended_both_conflicting`.",
+          "type": "string"
+        },
+        "summary": {
+          "description": "What happened, in a sentence.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "changes",
+        "needs_decision",
+        "scenario",
+        "summary"
+      ],
+      "type": "object"
+    },
     "GitButlerWorkspaceJson": {
       "description": "A GitButler workspace in `grit status --json`: GitButler's merge of the applied branches.",
       "properties": {
@@ -166,6 +272,46 @@
         "heads"
       ],
       "type": "object"
+    },
+    "HeadRelation": {
+      "description": "How another member's head compares with your branch here.",
+      "oneOf": [
+        {
+          "description": "The same commit as yours.",
+          "enum": [
+            "same"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "It has commits yours doesn't, and yours is in its history: `grit sync` fast-forwards to it.",
+          "enum": [
+            "ahead"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Yours has commits it doesn't, and it is in yours.",
+          "enum": [
+            "behind"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Each has commits the other lacks.",
+          "enum": [
+            "diverged"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "You have no branch here, or its commits aren't fetched.",
+          "enum": [
+            "unknown"
+          ],
+          "type": "string"
+        }
+      ]
     },
     "InterruptedRewriteJson": {
       "description": "Recovery of an interrupted rebase or history edit, in `--json` output.",
@@ -242,6 +388,95 @@
       ],
       "type": "object"
     },
+    "ResolveOptionJson": {
+      "description": "One way out of a divergence.",
+      "properties": {
+        "command": {
+          "description": "The command that applies it.",
+          "type": "string"
+        },
+        "id": {
+          "description": "Its stable id: `combine`, `keep_mine`, `keep_theirs`, `keep_both`, `keep_amended`, `drop`, `my_order`, `their_order`, `my_split`, `their_split`, `restore` or `resolve`.",
+          "type": "string"
+        },
+        "label": {
+          "description": "What it does.",
+          "type": "string"
+        },
+        "loses": {
+          "description": "What it leaves out (kept in the share's log), or `null` when it keeps every change: such an option is safe to choose without asking.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "command",
+        "id",
+        "label"
+      ],
+      "type": "object"
+    },
+    "SharedHead": {
+      "description": "Another member's head of a shared branch.",
+      "properties": {
+        "divergence": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/DivergenceJson"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "For a head that diverged from yours: what happened, and whether someone has to decide what to do."
+        },
+        "relation": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/HeadRelation"
+            }
+          ],
+          "description": "How it compares with your branch here."
+        },
+        "tip": {
+          "description": "Their head's tip.",
+          "type": "string"
+        },
+        "user": {
+          "description": "Their user name.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "relation",
+        "tip",
+        "user"
+      ],
+      "type": "object"
+    },
+    "StatusSharedJson": {
+      "description": "A shared branch's other heads in `grit status`.",
+      "properties": {
+        "heads": {
+          "description": "Each other member's head, compared with this branch.",
+          "items": {
+            "$ref": "#/definitions/SharedHead"
+          },
+          "type": "array"
+        },
+        "remote": {
+          "description": "The remote they were fetched from.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "heads",
+        "remote"
+      ],
+      "type": "object"
+    },
     "StatusUpstreamJson": {
       "description": "Upstream ahead/behind in `--json` / `--markdown` output.",
       "properties": {
@@ -270,6 +505,41 @@
       },
       "required": [
         "ref"
+      ],
+      "type": "object"
+    },
+    "SubmoduleChangeJson": {
+      "description": "Submodule detail on a gitlink change in status/diff JSON output.",
+      "properties": {
+        "modified": {
+          "type": "boolean"
+        },
+        "new_commits": {
+          "type": "boolean"
+        },
+        "untracked": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "modified",
+        "new_commits",
+        "untracked"
+      ],
+      "type": "object"
+    },
+    "WarningRecord": {
+      "properties": {
+        "kind": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "message"
       ],
       "type": "object"
     },
@@ -356,6 +626,13 @@
     "detached": {
       "type": "boolean"
     },
+    "embedded_repositories": {
+      "description": "Untracked nested repositories that would be recorded as gitlinks if staged.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
     "gitbutler_workspace": {
       "anyOf": [
         {
@@ -417,6 +694,17 @@
       ],
       "description": "Primary paused operation and suggested next commands."
     },
+    "shared": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/StatusSharedJson"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "When the branch is shared (`grit share`): the other members' heads, as last fetched."
+    },
     "staged": {
       "items": {
         "$ref": "#/definitions/ChangeJson"
@@ -458,6 +746,13 @@
         }
       ],
       "description": "Upstream tracking comparison when it differs from `target`, or `null`."
+    },
+    "warnings": {
+      "description": "Non-fatal warnings emitted while scanning the worktree (for example unreadable directories).",
+      "items": {
+        "$ref": "#/definitions/WarningRecord"
+      },
+      "type": "array"
     }
   },
   "required": [

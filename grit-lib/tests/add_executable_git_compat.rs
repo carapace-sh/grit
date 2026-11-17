@@ -4,8 +4,8 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
-use grit_lib::porcelain::add::{stage, StageMode, StageOptions};
-use grit_lib::porcelain::commit::{create_commit, CommitRequest};
+use grit_lib::porcelain::add::{StageMode, StageOptions};
+use grit_lib::porcelain::commit::CommitRequest;
 use grit_lib::porcelain::index_mode::StageExecutableHint;
 use grit_lib::progress::NullProgress;
 use grit_lib::repo::Repository;
@@ -34,15 +34,15 @@ fn ident() -> String {
 
 fn commit_req(message: &str) -> CommitRequest {
     let id = ident();
-    CommitRequest {
-        message: message.to_owned(),
-        author: Some(id.parse().expect("signature")),
-        committer: Some(id.parse().expect("signature")),
-        allow_empty: false,
-        sign_override: None,
-        amend: false,
-        assume_worktree_synced: false,
-        ..Default::default()
+    {
+        let mut req = CommitRequest::new(message.to_owned());
+        req.author = Some(id.parse().expect("signature"));
+        req.committer = Some(id.parse().expect("signature"));
+        req.allow_empty = false;
+        req.sign_override = None;
+        req.amend = false;
+        req.assume_worktree_synced = false;
+        req
     }
 }
 
@@ -55,19 +55,20 @@ fn add_executable_stages_100755_when_filemode_false() {
     fs::write(root.join("tool.sh"), "#!/bin/sh\necho hi\n").expect("write");
 
     let repo = Repository::discover(Some(root), &Default::default()).expect("open");
-    let outcome = stage(
-        &repo,
-        &StageOptions {
-            pathspecs: vec!["tool.sh".to_owned()],
-            pathspec_sources: vec!["tool.sh".to_owned()],
-            mode: StageMode::All,
-            executable_hint: StageExecutableHint::SetExecutable,
-            ..StageOptions::default()
-        },
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("stage");
+    let outcome = repo
+        .index()
+        .stage(
+            &StageOptions {
+                pathspecs: vec!["tool.sh".to_owned()],
+                pathspec_sources: vec!["tool.sh".to_owned()],
+                mode: StageMode::All,
+                executable_hint: StageExecutableHint::SetExecutable,
+                ..StageOptions::default()
+            },
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("stage");
     assert_eq!(
         outcome.total(),
         1,
@@ -79,14 +80,13 @@ fn add_executable_stages_100755_when_filemode_false() {
         staged.starts_with("100755 "),
         "index mode should be 100755, got: {staged}"
     );
-
-    create_commit(
-        &repo,
-        &commit_req("script"),
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("commit");
+    repo.commits()
+        .create_staged(
+            &commit_req("script"),
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("commit");
     let tree_mode = git_out(root, &["ls-tree", "HEAD", "tool.sh"]);
     assert!(
         tree_mode.starts_with("100755 blob"),
@@ -103,43 +103,44 @@ fn add_executable_mode_only_on_tracked_file() {
     fs::write(root.join("tool.sh"), "#!/bin/sh\n").expect("write");
 
     let repo = Repository::discover(Some(root), &Default::default()).expect("open");
-    stage(
-        &repo,
-        &StageOptions {
-            pathspecs: vec!["tool.sh".to_owned()],
-            pathspec_sources: vec!["tool.sh".to_owned()],
-            mode: StageMode::All,
-            executable_hint: StageExecutableHint::None,
-            ..StageOptions::default()
-        },
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("stage");
-    create_commit(
-        &repo,
-        &commit_req("base"),
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("commit");
+    repo.index()
+        .stage(
+            &StageOptions {
+                pathspecs: vec!["tool.sh".to_owned()],
+                pathspec_sources: vec!["tool.sh".to_owned()],
+                mode: StageMode::All,
+                executable_hint: StageExecutableHint::None,
+                ..StageOptions::default()
+            },
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("stage");
+    repo.commits()
+        .create_staged(
+            &commit_req("base"),
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("commit");
 
     let before = git_out(root, &["ls-files", "-s", "tool.sh"]);
     assert!(before.starts_with("100644 "), "baseline 644: {before}");
 
-    let outcome = stage(
-        &repo,
-        &StageOptions {
-            pathspecs: vec!["tool.sh".to_owned()],
-            pathspec_sources: vec!["tool.sh".to_owned()],
-            mode: StageMode::All,
-            executable_hint: StageExecutableHint::SetExecutable,
-            ..StageOptions::default()
-        },
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("chmod stage");
+    let outcome = repo
+        .index()
+        .stage(
+            &StageOptions {
+                pathspecs: vec!["tool.sh".to_owned()],
+                pathspec_sources: vec!["tool.sh".to_owned()],
+                mode: StageMode::All,
+                executable_hint: StageExecutableHint::SetExecutable,
+                ..StageOptions::default()
+            },
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("chmod stage");
     assert_eq!(
         outcome.modified.len(),
         1,
@@ -151,14 +152,13 @@ fn add_executable_mode_only_on_tracked_file() {
         after.starts_with("100755 "),
         "expected 755 after hint: {after}"
     );
-
-    create_commit(
-        &repo,
-        &commit_req("executable"),
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("commit");
+    repo.commits()
+        .create_staged(
+            &commit_req("executable"),
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("commit");
     let tree_line = git_out(root, &["ls-tree", "HEAD", "tool.sh"]);
     assert!(
         tree_line.starts_with("100755 blob"),
@@ -198,34 +198,33 @@ fn filemode_false_stages_regular_to_symlink_typechange() {
     fs::write(root.join("path"), "regular\n").expect("write");
 
     let repo = Repository::discover(Some(root), &Default::default()).expect("open");
-    stage(
-        &repo,
-        &StageOptions::default(),
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("stage");
-    create_commit(
-        &repo,
-        &commit_req("base"),
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("commit");
+    repo.index()
+        .stage(
+            &StageOptions::default(),
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("stage");
+    repo.commits()
+        .create_staged(
+            &commit_req("base"),
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("commit");
 
     fs::remove_file(root.join("path")).expect("remove");
     symlink(root.join("target.txt"), root.join("path")).expect("symlink");
-
-    stage(
-        &repo,
-        &StageOptions {
-            pathspecs: vec!["path".to_owned()],
-            ..StageOptions::default()
-        },
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("stage symlink");
+    repo.index()
+        .stage(
+            &StageOptions {
+                pathspecs: vec!["path".to_owned()],
+                ..StageOptions::default()
+            },
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("stage symlink");
 
     let grit_index = git_out(root, &["ls-files", "-s", "path"]);
     assert!(
@@ -295,17 +294,17 @@ fn filemode_false_stages_typechange_when_symlink_oid_matches_file() {
     replace_file_with_symlink_preserving_stat(root, target, link);
 
     let repo = Repository::discover(Some(root), &Default::default()).expect("open");
-    stage(
-        &repo,
-        &StageOptions {
-            pathspecs: vec![link.to_owned()],
-            pathspec_sources: vec![link.to_owned()],
-            ..StageOptions::default()
-        },
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("stage typechange");
+    repo.index()
+        .stage(
+            &StageOptions {
+                pathspecs: vec![link.to_owned()],
+                pathspec_sources: vec![link.to_owned()],
+                ..StageOptions::default()
+            },
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("stage typechange");
 
     let grit_index = git_out(root, &["ls-files", "-s", link]);
     assert_eq!(
@@ -324,36 +323,36 @@ fn add_does_not_clobber_existing_executable_in_index() {
     fs::write(root.join("tool.sh"), "v1\n").expect("write");
 
     let repo = Repository::discover(Some(root), &Default::default()).expect("open");
-    stage(
-        &repo,
-        &StageOptions {
-            pathspecs: vec!["tool.sh".to_owned()],
-            pathspec_sources: vec!["tool.sh".to_owned()],
-            mode: StageMode::All,
-            executable_hint: StageExecutableHint::SetExecutable,
-            ..StageOptions::default()
-        },
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("stage");
+    repo.index()
+        .stage(
+            &StageOptions {
+                pathspecs: vec!["tool.sh".to_owned()],
+                pathspec_sources: vec!["tool.sh".to_owned()],
+                mode: StageMode::All,
+                executable_hint: StageExecutableHint::SetExecutable,
+                ..StageOptions::default()
+            },
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("stage");
     let staged = git_out(root, &["ls-files", "-s", "tool.sh"]);
     assert!(staged.starts_with("100755 "));
 
     fs::write(root.join("tool.sh"), "v2\n").expect("write");
-    stage(
-        &repo,
-        &StageOptions {
-            pathspecs: vec!["tool.sh".to_owned()],
-            pathspec_sources: vec!["tool.sh".to_owned()],
-            mode: StageMode::All,
-            executable_hint: StageExecutableHint::None,
-            ..StageOptions::default()
-        },
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("restage");
+    repo.index()
+        .stage(
+            &StageOptions {
+                pathspecs: vec!["tool.sh".to_owned()],
+                pathspec_sources: vec!["tool.sh".to_owned()],
+                mode: StageMode::All,
+                executable_hint: StageExecutableHint::None,
+                ..StageOptions::default()
+            },
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("restage");
     let restaged = git_out(root, &["ls-files", "-s", "tool.sh"]);
     assert!(
         restaged.starts_with("100755 "),

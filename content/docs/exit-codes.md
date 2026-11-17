@@ -12,11 +12,12 @@ Grit uses a small set of exit codes. Command-specific yes/no checks (for example
 | `success` | 0 | Command completed successfully (including some checks that answer “yes”). |
 | `failure` | 1 | Command failed, or a yes/no check answered “no” (`diff --exit-code`, `merge --check`, `pick --check`, `revert --check`, `pull --check`, `merge-base --is-ancestor`, `fsck`, `ignore check`, `tag --verify`, conflicts after `merge` / `pick` / `revert` / `rebase`, rejected `push`, and similar). With `--json`, stdout is usually `{"error":"…"}` or a full outcome object when the failure is part of the result (for example rejected push). |
 | `usage` | 2 | Invalid flags or arguments. With `--json`, stdout is still `{"error":"…"}` (clap usage errors and subcommand usage such as `grit branch`). Hunk selection mistakes (`add` / `commit` / `stash` / `restore` with unknown or stale `--hunks` ids) also exit 2. `grit diff --exit-code` / `--quiet` uses 2 when diff itself errors. |
+| `needs_decision` | 3 | [`grit push`](../push/) or [`grit sync`](../sync/) did its work, but another member's head of a [shared branch](../share/) diverged from yours in a way someone has to decide about. The output (`shared[].heads[].divergence` in `--json`) names the scenario and what each side did; nothing is lost, since the server keeps every head. Scripts and agents should read the report rather than retry. |
 | `remote_unreadable` | 128 | `clone`, `fetch`, `pull`, `push`, or `remote refs` could not reach or read the remote: a missing repository path, a DNS, refused-connection, TLS, or timeout failure, an HTTP error status, or a transport that never spoke Git. With `--json`, stdout is `{"error":"…","kind":"remote_unreadable"}`. Rejected pushes and authentication failures are not in this class (they exit 1). |
 | `missing_prerequisite` | 128 | `grit bundle unbundle` when the repository lacks prerequisite commits. |
 | `refused_not_ff` | 128 | `grit merge --ff-only` or `grit pull --ff-only` when a fast-forward is not possible. |
 | `invalid_commit_filter` | 129 | Invalid `--author`, `--grep`, or pickaxe pattern on `grit log`, `grit revs`, or related commands (`kind`: `invalid_pattern`). |
-| `interrupted` | 130 | `grit clone` stopped by Ctrl-C, `SIGTERM`, or `SIGHUP` on Unix (or Ctrl-Break on Windows). The partial clone has already been removed, so the same command can be run again. With `--json`, stdout is `{"error":"operation cancelled"}`. |
+| `interrupted` | 130 | `grit clone`, `grit fetch`, or `grit push` stopped by Ctrl-C, `SIGTERM`, or `SIGHUP` on Unix (or Ctrl-Break on Windows). Partial work is rolled back (for example an incomplete clone directory, fetch temp pack, or push receive quarantine on the remote), so the same command can be run again. With `--json`, stdout is `{"error":"operation cancelled"}`. |
 | `custom` | *varies* | Passthrough from `grit hooks run` (hook exit code) or `grit rebase --exec` when a command fails. |
 
 ## Structured error kinds (`kind` in JSON)
@@ -37,7 +38,7 @@ $ grit push --json
 | --- | --- |
 | `conflict` | Merge, pick, rebase, or similar would introduce conflicts (`conflicts`, optional `commit`). A `grit history` rewrite or `grit rebase` that fails replaying another branch it would move also sets `refs` (full branch names) and a `hint` to pass `--update-refs head`. |
 | `hash_collision` | Refusing to store content that triggers SHA-1 collision detection (`oid`). |
-| `would_overwrite` | Checkout / switch would overwrite local or untracked files (`would_overwrite.reason`, `would_overwrite.paths`). The hint suggests `grit commit` or `grit stash` for local changes. |
+| `would_overwrite` | Checkout, switch, merge, or pull would overwrite local or untracked files (`would_overwrite.reason`, `would_overwrite.paths`). The hint suggests `grit commit` or `grit stash` for local changes. |
 | `operation_in_progress` | `grit switch` refused while a merge, rebase, pick or revert is paused (grit's or one `git` started); finish or abort it first. |
 | `invalid_pattern` | Invalid filter pattern (exit 129). |
 | `usage` | Subcommand usage mistake (exit 2), e.g. `grit branch` flag combinations. |
@@ -71,4 +72,15 @@ $ grit push --json
 | `git_dir_path_io` | Commit, gc, or ref update could not write under `.git/` (`paths`, often one path such as `.git/objects` or `.git/refs/heads/main`). Typical causes: read-only or root-owned `.git` metadata, or another thread/process updating the same index or ref (Windows often reports this as the file being in use). Hint: for permission problems check `ls -l .git` and fix ownership; when the message says the file is in use, retry after the other updater finishes. |
 | `nothing_staged` | `grit commit` with `commit.autoStage=false` or `--staged` while the index matches `HEAD` but the work tree has unstaged or untracked paths. Hint: `grit add` or `grit commit -- <path>`. |
 | `nothing_to_commit` | `grit commit` on a genuinely clean tree (or after auto-staging cancels out against `HEAD`). |
+| `not_a_repository` | Command run outside any Git repository (or parent directory). |
+| `commit_message_required` | `grit commit` without `-m`, `-F`, amend/reuse, or a pending merge message. |
+| `empty_commit_message` | `grit commit -m ''`, empty `-F`, or a hook that cleared the message. |
+| `identity_unknown` | Author or committer identity could not be resolved (`hint` names `grit config --global user.name` / `user.email`). |
+| `tag_already_exists` | Create tag when the name already exists (hint mentions `--force`). |
+| `tag_not_found` | Delete or verify a tag when `refs/tags/<name>` does not exist. |
+| `no_operation_in_progress` | `merge --abort`, `rebase --continue`, `pick --continue`, or similar when nothing is paused; the `error` text names the operation. |
+| `pathspec_no_match` | `grit add`, `rm`, `restore`, `commit -- <paths>`, or stash path selection with no matching files. |
+| `stash_not_found` | `grit stash pop` / `apply` / `drop` with an empty stash or an invalid index (`hint` for empty stash). |
+| `path_not_found` | `grit blame` (or similar) when the path is absent from the named revision and not on disk. |
 | `gitbutler_workspace` | `grit commit` while `HEAD` is on a GitButler workspace (`gitbutler/workspace`, topped by GitButler's workspace commit). GitButler rewrites that branch, so a commit there would be lost. Hint: commit with `but commit`, or switch to a branch first. |
+| `unsupported_object_store` | The operation needs the files-backed object store (loose objects and packs under `objects/`), but the repository's primary store is custom (exit 1). `operation` is the refused operation's stable name, such as `prune` (a custom store that cannot delete objects), `repack`, `commit_graph_write` or `partial_fetch`; the [object stores guide](../library/object-stores/#what-works-with-a-custom-primary) lists every name. `grit` itself always opens the files backend, so this comes from repositories opened through `grit-lib` with a custom store. |

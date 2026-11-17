@@ -7,8 +7,8 @@ use std::path::Path;
 
 use crate::crlf;
 use crate::diff::{
-    classify_worktree_entry_for_add, is_unregistered_embedded_git_repo, mode_from_metadata,
-    read_submodule_head_oid, DiffIndexToWorktreeOptions, DiffStatus, WorktreeAddRefresh,
+    classify_embedded_git_repo_for_stage, classify_worktree_entry_for_add, mode_from_metadata,
+    DiffIndexToWorktreeOptions, DiffStatus, EmbeddedGitRepoStage, WorktreeAddRefresh,
     WorktreeAddRefreshParams,
 };
 use crate::error::Result;
@@ -21,19 +21,28 @@ use crate::porcelain::status::{
 };
 use crate::precompose_config::effective_core_precomposeunicode_with_config;
 use crate::repo::Repository;
+use crate::repo::RepositoryError;
 use crate::unicode_normalization::resolve_worktree_path_for_staging;
 
+/// Result of [`stage_worktree_changes`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StageWorktreeChangesOutcome {
+    /// Index entries added, updated, or removed.
+    pub changed: usize,
+    /// Nested repositories newly recorded as gitlinks.
+    pub embedded_gitlinks: Vec<String>,
+}
+
 /// Stage paths matching `pathspecs` (empty = entire worktree).
-///
-/// Returns how many index entries were added, updated, or removed.
 ///
 /// # Errors
 ///
 /// Propagates I/O, diff, and object-database failures.
-pub fn stage_worktree_changes(repo: &Repository, pathspecs: &[String]) -> Result<usize> {
-    let work_tree = repo
-        .work_tree()
-        .ok_or(crate::error::Error::RequiresWorkTree)?;
+pub(crate) fn stage_worktree_changes(
+    repo: &Repository,
+    pathspecs: &[String],
+) -> Result<StageWorktreeChangesOutcome> {
+    let work_tree = repo.work_tree().ok_or(RepositoryError::RequiresWorkTree)?;
 
     let index_path = repo.index_path();
     let index_mtime = index_file_mtime(&index_path);
@@ -63,9 +72,10 @@ pub fn stage_worktree_changes(repo: &Repository, pathspecs: &[String]) -> Result
     )?;
     let mut worktree_rules = rules_arc
         .lock()
-        .map_err(|e| crate::error::Error::Message(format!("worktree rules lock poisoned: {e}")))?;
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let conv = worktree_rules.conversion().clone();
 
+    let mut embedded_gitlinks = Vec::new();
     let mut staged = 0usize;
     for entry in unstaged {
         let path = entry.path();
@@ -87,6 +97,7 @@ pub fn stage_worktree_changes(repo: &Repository, pathspecs: &[String]) -> Result
             &conv,
             &mut worktree_rules,
             precompose_unicode,
+            &mut embedded_gitlinks,
         )? {
             staged += 1;
         }
@@ -97,6 +108,7 @@ pub fn stage_worktree_changes(repo: &Repository, pathspecs: &[String]) -> Result
         &mut index,
         work_tree,
         pathspecs,
+        None,
         UntrackedScan {
             ignored_mode: IgnoredMode::No,
             show_all: true,
@@ -104,6 +116,7 @@ pub fn stage_worktree_changes(repo: &Repository, pathspecs: &[String]) -> Result
             use_untracked_cache: false,
             cache_miss: UntrackedCacheMissAction::RefreshFull,
             clean_unit_dirs: None,
+            listing_cache: None,
         },
         &worktree_rules,
         None,
@@ -112,21 +125,28 @@ pub fn stage_worktree_changes(repo: &Repository, pathspecs: &[String]) -> Result
         if !matcher.matches(&path) {
             continue;
         }
-        stage_new_worktree_path(
+        if stage_new_worktree_path(
             repo,
             work_tree,
             &path,
             &mut index,
             precompose_unicode,
             &worktree_rules,
-        )?;
-        staged += 1;
+            &mut embedded_gitlinks,
+        )? {
+            staged += 1;
+        }
     }
 
     if staged > 0 {
         repo.write_index(&mut index)?;
     }
-    Ok(staged)
+    embedded_gitlinks.sort();
+    embedded_gitlinks.dedup();
+    Ok(StageWorktreeChangesOutcome {
+        changed: staged,
+        embedded_gitlinks,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -139,6 +159,7 @@ fn stage_tracked_worktree_path(
     conv: &crlf::ConversionConfig,
     rules: &mut crate::worktree_rules::WorktreeRules,
     precompose_unicode: bool,
+    embedded_gitlinks: &mut Vec<String>,
 ) -> Result<bool> {
     let resolved = resolve_worktree_path_for_staging(work_tree, rel_path, precompose_unicode);
     let abs = resolved.abs;
@@ -154,8 +175,8 @@ fn stage_tracked_worktree_path(
             index,
             precompose_unicode,
             rules,
-        )
-        .map(|_| true);
+            embedded_gitlinks,
+        );
     };
 
     let staged_mode = WorktreeModePolicy::from_config(rules.config())
@@ -188,10 +209,15 @@ fn stage_tracked_worktree_path(
             index.add_or_replace(updated);
             Ok(true)
         }
-        WorktreeAddRefresh::NeedsRestage => {
-            stage_new_worktree_path(repo, work_tree, rel_path, index, precompose_unicode, rules)?;
-            Ok(true)
-        }
+        WorktreeAddRefresh::NeedsRestage => stage_new_worktree_path(
+            repo,
+            work_tree,
+            rel_path,
+            index,
+            precompose_unicode,
+            rules,
+            embedded_gitlinks,
+        ),
     }
 }
 
@@ -202,30 +228,30 @@ fn stage_new_worktree_path(
     index: &mut Index,
     precompose_unicode: bool,
     rules: &crate::worktree_rules::WorktreeRules,
-) -> Result<()> {
+    embedded_gitlinks: &mut Vec<String>,
+) -> Result<bool> {
     let resolved = resolve_worktree_path_for_staging(work_tree, rel_path, precompose_unicode);
     let abs = resolved.abs;
     let index_relpath = resolved.index_relpath.trim_end_matches('/').to_owned();
     let meta = std::fs::symlink_metadata(&abs).map_err(crate::error::Error::Io)?;
     if meta.is_dir() && !meta.file_type().is_symlink() {
-        if is_unregistered_embedded_git_repo(index, &index_relpath, &abs) {
-            let head_oid = read_submodule_head_oid(&abs).ok_or_else(|| {
-                crate::error::Error::Message(format!(
-                    "could not resolve submodule HEAD for '{index_relpath}'"
-                ))
-            })?;
+        if let EmbeddedGitRepoStage::Gitlink(head_oid) =
+            classify_embedded_git_repo_for_stage(index, &index_relpath, &abs)?
+        {
             let mut entry =
                 entry_from_metadata(&meta, index_relpath.as_bytes(), head_oid, MODE_GITLINK);
             entry.size = 0;
             index.add_or_replace(entry);
+            embedded_gitlinks.push(index_relpath);
+            return Ok(true);
         }
-        return Ok(());
+        return Ok(false);
     }
     let recorded_mode = index.get(index_relpath.as_bytes(), 0).map(|e| e.mode);
     let mode = WorktreeModePolicy::from_config(rules.config())
         .index_mode_for_worktree(mode_from_metadata(&meta), recorded_mode);
     if mode == MODE_TREE {
-        return Ok(());
+        return Ok(false);
     }
 
     let file_attrs = rules.file_attrs(&index_relpath, false);
@@ -245,10 +271,7 @@ fn stage_new_worktree_path(
             &index_relpath,
             None,
             filter_fp,
-        )
-        .map_err(|e| {
-            crate::error::Error::Message(format!("could not store {index_relpath}: {e}"))
-        })?
+        )?
     };
     let entry = crate::index::entry_from_stat(&abs, index_relpath.as_bytes(), oid, mode)?;
     index.add_or_replace(entry);
@@ -257,7 +280,7 @@ fn stage_new_worktree_path(
             staged.set_fsmonitor_valid(true);
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -309,7 +332,7 @@ mod tests {
         let repo = Repository::open(&git_dir, &RepositoryOptions::empty().with_work_tree(wt))
             .expect("open grit repo");
         let n = stage_worktree_changes(&repo, &[]).expect("stage");
-        assert_eq!(n, 1);
+        assert_eq!(n.changed, 1);
 
         let grit_index = repo.load_index().expect("grit index");
         let grit_blob = grit_index

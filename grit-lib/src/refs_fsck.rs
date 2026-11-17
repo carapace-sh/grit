@@ -8,12 +8,14 @@ use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
-use crate::check_ref_format::{check_refname_format, RefNameOptions};
+use crate::check_ref_format::{check_refname_format, RefFormatOptions};
 use crate::config::ConfigSet;
 use crate::error::Result;
 use crate::objects::ObjectId;
 use crate::odb::Odb;
-use crate::refs::store::{open_ref_store, RawRef, RefEntry, RefStorageFormat, RefStore};
+use crate::refs::store::{
+    open_ref_store, RawRef, RefEntry, RefNameRef, RefStorageFormat, RefStore,
+};
 use crate::repo::Repository;
 use std::ops::ControlFlow;
 
@@ -40,7 +42,7 @@ pub enum RefsFsckSeverity {
     Warning,
 }
 
-/// One diagnostic (use [`format_refs_fsck_line`] for Git-compatible output).
+/// One diagnostic (use `format_refs_fsck_line` for Git-compatible output).
 #[derive(Debug, Clone)]
 pub struct RefsFsckIssue {
     /// `severity` field.
@@ -139,7 +141,7 @@ fn fsck_refs_msg_severity(
     strict: bool,
 ) -> Option<RefsFsckSeverity> {
     let key = format!("fsck.{camel_id}");
-    let v = config.get(&key).map(|s| s.to_ascii_lowercase());
+    let v = config.value(&key).map(|s| s.to_ascii_lowercase());
     if matches!(v.as_deref(), Some("ignore")) {
         return None;
     }
@@ -187,12 +189,8 @@ fn push_issue(
 ///
 /// Returns [`crate::error::Error::Io`] when the ref store cannot be read, and propagates
 /// [`Odb::contains`] failures rather than reporting a ref as pointing to a missing object.
-pub fn refs_fsck(
-    repo: &Repository,
-    odb: &Odb,
-    config: &ConfigSet,
-    strict: bool,
-) -> Result<Vec<RefsFsckIssue>> {
+pub fn refs_fsck(repo: &Repository, odb: &Odb, strict: bool) -> Result<Vec<RefsFsckIssue>> {
+    let config = repo.config().snapshot()?;
     let mut issues = Vec::new();
     let common = canonical_git_dir(repo.git_dir());
 
@@ -213,7 +211,7 @@ pub fn refs_fsck(
             wt_id.as_deref(),
             &common,
             odb,
-            config,
+            config.as_ref(),
             strict,
             &mut issues,
         )?;
@@ -324,7 +322,7 @@ fn fsck_reftable_store(
 
     let mut backend_err: Option<crate::error::Error> = None;
     let mut visit = |entry: &RefEntry| -> ControlFlow<()> {
-        let path = display(&entry.name);
+        let path = display(entry.name.as_str());
         check_ref_file_name(&path, config, strict, issues);
         if let Err(e) = fsck_stored_ref(&path, &entry.value, odb, config, strict, issues) {
             backend_err = Some(e);
@@ -342,7 +340,7 @@ fn fsck_reftable_store(
         return Err(e);
     }
 
-    if let Some(head) = store.read_raw("HEAD")? {
+    if let Some(head) = store.read_raw(RefNameRef::from_trusted("HEAD"))? {
         let path = display("HEAD");
         fsck_stored_ref(&path, &head, odb, config, strict, issues)?;
     }
@@ -668,7 +666,7 @@ fn check_ref_file_name(
     }
     if check_refname_format(
         check_path,
-        &RefNameOptions {
+        &RefFormatOptions {
             allow_onelevel: false,
             refspec_pattern: false,
             normalize: false,
@@ -753,7 +751,7 @@ fn refs_fsck_symref(
 
     if check_refname_format(
         target,
-        &RefNameOptions {
+        &RefFormatOptions {
             allow_onelevel: false,
             refspec_pattern: false,
             normalize: false,
@@ -971,7 +969,7 @@ fn fsck_packed_refs(
 
         if check_refname_format(
             refname,
-            &RefNameOptions {
+            &RefFormatOptions {
                 allow_onelevel: false,
                 refspec_pattern: false,
                 normalize: false,

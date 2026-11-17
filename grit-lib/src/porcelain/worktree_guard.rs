@@ -19,11 +19,13 @@ use crate::error::{Error, OverwriteReason, Result, WorktreeOperation};
 use crate::index::StatMatchPolicy;
 use crate::index::{index_file_mtime, Index, IndexEntry};
 use crate::objects::FileMode;
-use crate::objects::{parse_commit, ObjectId};
+use crate::objects::ObjectId;
 use crate::parallel::{try_par_map, ParallelHashError, ParallelOp};
+use crate::path_icase::{DentrySpellingCache, ScheduledDeletePathLookup, Stage0TrackedPaths};
 use crate::porcelain::checkout::tree_changes_touch_gitattributes;
 use crate::porcelain::status::{collect_untracked_and_ignored_with_cache, IgnoredMode};
 use crate::repo::Repository;
+use crate::repo::RepositoryError;
 use crate::sparse_checkout::SparseCheckout;
 use crate::state::resolve_head_for_repository;
 use crate::worktree_rules::WorktreeRules;
@@ -41,11 +43,10 @@ pub struct WorktreeSnapshot {
 /// # Errors
 ///
 /// Returns errors from index I/O, ODB reads, or when the repository has no work tree.
-pub fn load_worktree_snapshot(repo: &Repository) -> Result<WorktreeSnapshot> {
-    let _work_tree = repo.work_tree().ok_or(Error::RequiresWorkTree)?;
+pub(crate) fn load_worktree_snapshot(repo: &Repository) -> Result<WorktreeSnapshot> {
+    let _work_tree = repo.work_tree().ok_or(RepositoryError::RequiresWorkTree)?;
 
-    let head = resolve_head_for_repository(repo)?;
-    let head_tree = head_tree_from_head_commit(repo, head.oid())?;
+    let head_tree = resolve_head_for_repository(repo)?.tree(repo.odb())?;
     let index = load_worktree_index(repo)?;
     Ok(WorktreeSnapshot { index, head_tree })
 }
@@ -55,25 +56,15 @@ pub fn load_worktree_snapshot(repo: &Repository) -> Result<WorktreeSnapshot> {
 /// The cache-tree extension is kept: the staged-change check walks it instead of flattening
 /// the whole `HEAD` tree, and index writes after a checkout carry it forward.
 pub(crate) fn load_worktree_index(repo: &Repository) -> Result<Index> {
-    let _work_tree = repo.work_tree().ok_or(Error::RequiresWorkTree)?;
+    let _work_tree = repo.work_tree().ok_or(RepositoryError::RequiresWorkTree)?;
     let index_path = repo.index_path_for_env()?;
     let mut index = repo.load_index_at(&index_path)?;
     if index.has_sparse_directory_placeholders() {
-        let protect = crate::path_validate::ProtectOptions::from_config(&*repo.config()?);
+        let protect =
+            crate::path_validate::ProtectOptions::from_config(&*repo.config().snapshot()?);
         index.expand_sparse_directory_placeholders(repo.odb(), protect)?;
     }
     Ok(index)
-}
-
-fn head_tree_from_head_commit(
-    repo: &Repository,
-    head_oid: Option<&ObjectId>,
-) -> Result<Option<ObjectId>> {
-    let Some(oid) = head_oid else {
-        return Ok(None);
-    };
-    let obj = repo.odb().read(oid)?;
-    Ok(Some(parse_commit(&obj.data)?.tree))
 }
 
 /// Staged and unstaged diffs for the current worktree (no rename detection), with stat refresh
@@ -85,16 +76,20 @@ pub(crate) fn local_change_diffs(
 ) -> Result<(Vec<DiffEntry>, Vec<DiffEntry>, bool)> {
     index.expand_sparse_directory_placeholders(
         repo.odb(),
-        crate::path_validate::ProtectOptions::from_config(&*repo.config()?),
+        crate::path_validate::ProtectOptions::from_config(&*repo.config().snapshot()?),
     )?;
-    let work_tree = repo.work_tree().ok_or(Error::RequiresWorkTree)?;
+    let work_tree = repo.work_tree().ok_or(RepositoryError::RequiresWorkTree)?;
     let index_path = repo.index_path_for_env()?;
     let index_mtime = index_file_mtime(&index_path);
-    let config = ConfigSet::load(repo.environment(), Some(repo.git_dir()), true)
-        .ok()
-        .map(Arc::new);
+    let config = ConfigSet::load(
+        repo.environment(),
+        Some(repo.git_dir()),
+        &crate::config::LoadConfigOptions::standard(repo.environment(), Some(repo.git_dir())),
+    )
+    .ok()
+    .map(Arc::new);
     let worktree_rules = match config.as_ref() {
-        Some(cfg) => Some(Arc::new(Mutex::new(WorktreeRules::from_parts(
+        Some(cfg) => Some(Arc::new(Mutex::new(WorktreeRules::from_parts_with_config(
             repo,
             index,
             cfg.clone(),
@@ -145,10 +140,10 @@ pub(crate) fn local_change_diffs_for_tree_changes(
     let head_by_path = head_tree_sides_from_changes(tree_changes);
     let staged = staged_diff_for_tree_switch_paths(index, &head_by_path, path_filter.as_ref())?;
 
-    let work_tree = repo.work_tree().ok_or(Error::RequiresWorkTree)?;
+    let work_tree = repo.work_tree().ok_or(RepositoryError::RequiresWorkTree)?;
     let index_path = repo.index_path_for_env()?;
     let index_mtime = index_mtime_for_diff(index, index_file_mtime(&index_path));
-    let stat_policy = StatMatchPolicy::from_config(repo.config().ok().as_deref());
+    let stat_policy = StatMatchPolicy::from_config(repo.config().snapshot().ok().as_deref());
     let added_tree_paths: HashSet<String> = tree_changes
         .iter()
         .filter(|change| change.status == DiffStatus::Added)
@@ -172,7 +167,10 @@ pub(crate) fn local_change_diffs_for_tree_changes(
         );
         base.into_iter()
             .filter(|path| {
-                index.get(path.as_bytes(), 0).is_some() || added_tree_paths.contains(path)
+                index
+                    .get(crate::repo_relpath::storage_bytes(path).as_ref(), 0)
+                    .is_some()
+                    || added_tree_paths.contains(path)
             })
             .filter(|path| {
                 !delete_path_trusted_without_worktree_stat(
@@ -210,11 +208,11 @@ pub(crate) fn local_change_diffs_for_tree_changes(
         }
     }
 
-    let config = repo.config().ok();
+    let config = repo.config().snapshot().ok();
     let worktree_rules = match config.as_ref() {
         Some(cfg) => {
             let rules = if tree_changes_touch_gitattributes(tree_changes) {
-                WorktreeRules::from_parts(repo, index, Arc::clone(cfg))?
+                WorktreeRules::from_parts_with_config(repo, index, Arc::clone(cfg))?
             } else {
                 WorktreeRules::from_parts_index_attributes_only(repo, index, Arc::clone(cfg))?
             };
@@ -266,7 +264,7 @@ fn touched_paths_include_gitlinks(index: &Index, paths: &BTreeSet<String>) -> bo
     use crate::index::MODE_GITLINK;
     paths.iter().any(|path| {
         index
-            .get(path.as_bytes(), 0)
+            .get(crate::repo_relpath::storage_bytes(path).as_ref(), 0)
             .is_some_and(|ie| ie.stage() == 0 && ie.mode == MODE_GITLINK)
     })
 }
@@ -288,7 +286,6 @@ fn switch_worktree_clean_for_paths(
     index_mtime: Option<(u32, u32)>,
     stat_policy: StatMatchPolicy,
 ) -> Result<SwitchWorktreeClean> {
-    use crate::diff::index_entry_worktree_abs;
     use crate::index::MODE_GITLINK;
     use crate::worktree_scan::{
         collect_blob_lookup_batches, for_each_blob_by_directory,
@@ -296,27 +293,21 @@ fn switch_worktree_clean_for_paths(
         BlobScanSparseMode, WorktreeBlobScanOptions,
     };
 
-    let work_tree = repo.work_tree().ok_or(Error::RequiresWorkTree)?;
-    let config = repo.config().ok();
-    let precompose_unicode = config
-        .as_ref()
-        .and_then(|c| c.get_bool("core.precomposeunicode").and_then(|r| r.ok()))
-        .unwrap_or(false);
-    let ignorecase = config
-        .as_ref()
-        .and_then(|c| c.get_bool("core.ignorecase").and_then(|r| r.ok()))
-        .unwrap_or(false);
+    let work_tree = repo.work_tree().ok_or(RepositoryError::RequiresWorkTree)?;
+    let config = repo.config().snapshot().ok();
+    let precompose_unicode = config.as_ref().is_some_and(|c| c.precompose_unicode());
+    let ignorecase = config.as_ref().is_some_and(|c| c.ignore_case());
     let small = paths.len() < SWITCH_TREE_DIFF_STAT_SKIP_MIN;
     let mut dirty: BTreeSet<String> = BTreeSet::new();
     if small {
         for path in paths {
-            let Some(ie) = index.get(path.as_bytes(), 0) else {
+            let Some(ie) = index.get(crate::repo_relpath::storage_bytes(path).as_ref(), 0) else {
                 continue;
             };
             if !indexed_path_needs_worktree_stat_check(ie) || ie.mode != MODE_GITLINK {
                 continue;
             }
-            let abs = index_entry_worktree_abs(work_tree, path, precompose_unicode, ignorecase);
+            let abs = crate::repo_relpath::worktree_abs(work_tree, path);
             if !fs::symlink_metadata(&abs).is_ok_and(|meta| meta.is_dir()) {
                 dirty.insert(path.clone());
             }
@@ -330,9 +321,11 @@ fn switch_worktree_clean_for_paths(
         }
         match lookup {
             BlobDiskLookup::Missing => {
-                dirty.insert(String::from_utf8_lossy(&ie.path).into_owned());
+                dirty.insert(crate::repo_relpath::storage_string(&ie.path));
             }
-            BlobDiskLookup::Io(e) => return Err(Error::Io(e)),
+            BlobDiskLookup::Io(_) => {
+                dirty.insert(crate::repo_relpath::storage_string(&ie.path));
+            }
             BlobDiskLookup::Present(stat) => {
                 let mismatch = if ie.mode == MODE_GITLINK {
                     !stat.is_dir
@@ -346,7 +339,7 @@ fn switch_worktree_clean_for_paths(
                     !crate::diff::stat_matches_blob_stat(ie, &stat, stat_policy)
                 };
                 if mismatch {
-                    dirty.insert(String::from_utf8_lossy(&ie.path).into_owned());
+                    dirty.insert(crate::repo_relpath::storage_string(&ie.path));
                 } else if entry_is_racy_with_policy(ie, index_mtime, stat_policy) {
                     racy.push((entry_index, stat.git_mode));
                 }
@@ -383,10 +376,7 @@ fn switch_worktree_clean_for_paths(
         if blob_dirs.is_empty() {
             return Ok(SwitchWorktreeClean::Clean);
         }
-        let preload_index = config
-            .as_ref()
-            .and_then(|c| c.get_bool("core.preloadIndex").and_then(|r| r.ok()))
-            .unwrap_or(true);
+        let preload_index = config.as_ref().is_none_or(|c| c.preload_index());
         let stat_parallel_threads =
             switch_prepare_stat_parallel_threads(repo, config.as_deref(), paths.len());
         let guard_batches = collect_blob_lookup_batches(
@@ -395,6 +385,7 @@ fn switch_worktree_clean_for_paths(
             WorktreeBlobScanOptions {
                 preload_index,
                 stat_parallel_threads,
+                ..WorktreeBlobScanOptions::default()
             },
             &Default::default(),
             config.as_deref().unwrap_or(&ConfigSet::new()),
@@ -441,7 +432,7 @@ fn racy_entries_with_changed_content(
     ignorecase: bool,
 ) -> Result<Vec<String>> {
     use crate::crlf;
-    use crate::diff::index_entry_worktree_abs;
+    use crate::diff::index_entry_worktree_abs_bytes;
 
     struct RacyCheck<'a> {
         entry: &'a IndexEntry,
@@ -461,12 +452,12 @@ fn racy_entries_with_changed_content(
         .iter()
         .map(|&(entry_index, worktree_mode)| {
             let entry = &index.entries[entry_index];
-            let rel_path = String::from_utf8_lossy(&entry.path).into_owned();
+            let rel_path = crate::repo_relpath::storage_string(&entry.path);
             RacyCheck {
                 entry,
-                abs_path: index_entry_worktree_abs(
+                abs_path: index_entry_worktree_abs_bytes(
                     work_tree,
-                    &rel_path,
+                    &entry.path,
                     precompose_unicode,
                     ignorecase,
                 ),
@@ -554,12 +545,12 @@ fn added_tree_path_missing_on_disk(
     if !added_tree_paths.contains(path) {
         return false;
     }
-    !work_tree.join(path).exists()
+    !crate::repo_relpath::worktree_abs(work_tree, path).exists()
 }
 
 /// True when the path has no directory entry in the work tree (symlinks are not followed).
 pub(crate) fn worktree_path_absent_for_trusted_delete(work_tree: &Path, path: &str) -> bool {
-    match fs::symlink_metadata(work_tree.join(path)) {
+    match fs::symlink_metadata(crate::repo_relpath::worktree_abs(work_tree, path)) {
         Err(err) => err.kind() == std::io::ErrorKind::NotFound,
         Ok(_) => false,
     }
@@ -579,10 +570,10 @@ fn index_matches_head_without_worktree_stat(
     else {
         return false;
     };
-    let Some(ie) = index.get(path.as_bytes(), 0) else {
+    let Some(ie) = index.get(crate::repo_relpath::storage_bytes(path).as_ref(), 0) else {
         return false;
     };
-    if ie.oid != oid || ie.mode != mode {
+    if ie.oid != oid || crate::index::canon_mode(ie.mode) != crate::index::canon_mode(mode) {
         return false;
     }
     !entry_is_racy_with_policy(ie, index_mtime, stat_policy)
@@ -619,8 +610,8 @@ fn staged_diff_for_tree_switch_paths(
 ) -> Result<Vec<DiffEntry>> {
     let mut staged = Vec::new();
     for path in paths {
-        let path_bytes = path.as_bytes();
-        let index_entry = index.get(path_bytes, 0);
+        let path_bytes = crate::repo_relpath::storage_bytes(path);
+        let index_entry = index.get(path_bytes.as_ref(), 0);
         if index_entry.is_some_and(|e| e.intent_to_add()) {
             continue;
         }
@@ -654,7 +645,10 @@ fn staged_diff_for_tree_switch_paths(
                     score: None,
                 });
             }
-            (HeadTreeSide::Present { oid, mode }, Some(ie)) if ie.oid != oid || ie.mode != mode => {
+            (HeadTreeSide::Present { oid, mode }, Some(ie))
+                if ie.oid != oid
+                    || crate::index::canon_mode(ie.mode) != crate::index::canon_mode(mode) =>
+            {
                 staged.push(DiffEntry {
                     status: DiffStatus::for_content_change(mode, ie.mode),
                     old_path: Some(path.clone()),
@@ -723,15 +717,84 @@ pub(crate) fn untracked_scan_pathspecs_for_deletes(tree_changes: &[DiffEntry]) -
     specs.into_iter().collect()
 }
 
-/// Exact added paths (and ancestor directories) for untracked overwrite checks during fast wholesale scan.
-///
-/// Top-level pathspec roots would walk entire trees under each root; this list stays proportional to
-/// the number of added paths in the tree diff.
 #[must_use]
-pub(crate) fn untracked_scan_paths_for_added_tree_changes(
+fn removed_or_replaced_old_paths(tree_changes: &[DiffEntry]) -> HashSet<String> {
+    let mut paths = HashSet::new();
+    for change in tree_changes {
+        match change.status {
+            DiffStatus::Deleted => {
+                if let Some(p) = &change.old_path {
+                    paths.insert(p.clone());
+                }
+            }
+            DiffStatus::Added | DiffStatus::Modified | DiffStatus::TypeChanged => {
+                if let Some(p) = &change.old_path {
+                    paths.insert(p.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    paths
+}
+
+/// Context for the added-path lstat untracked scan (built once per tree diff).
+struct AddedTreeChangeUntrackedScan<'a, 'i> {
+    ignorecase: bool,
+    tracked: Stage0TrackedPaths<'i>,
+    remove_lookup: ScheduledDeletePathLookup<'a>,
+    dentries: DentrySpellingCache<'a>,
+}
+
+impl AddedTreeChangeUntrackedScan<'_, '_> {
+    fn path_removed_by_tree_change(&self, rel: &str) -> bool {
+        self.remove_lookup.contains(rel)
+    }
+
+    fn classify_worktree_path(&mut self, rel: &str) -> String {
+        if !self.ignorecase {
+            return rel.to_owned();
+        }
+        self.dentries
+            .spelling(rel)
+            .map(std::borrow::Cow::into_owned)
+            .unwrap_or_else(|| rel.to_owned())
+    }
+
+    fn path_is_tracked(&self, rel: &str) -> bool {
+        self.tracked.contains_bytes(rel.as_bytes())
+    }
+}
+
+/// Untracked paths that [`DiffStatus::Added`] tree rows would overwrite, without a worktree walk.
+///
+/// Used with the wholesale-delete scan when thousands of adds share existing directory prefixes
+/// (issue #2380): pathspec roots would re-walk entire populated trees.
+fn collect_untracked_for_added_tree_changes_lstat(
+    repo: &Repository,
+    index: &Index,
+    work_tree: &Path,
     tree_changes: &[DiffEntry],
-) -> Vec<String> {
-    let mut specs = BTreeSet::new();
+    ignorecase: bool,
+) -> Result<Vec<String>> {
+    let config = ConfigSet::load(
+        repo.environment(),
+        Some(repo.git_dir()),
+        &crate::config::LoadConfigOptions::standard(repo.environment(), Some(repo.git_dir())),
+    )
+    .ok()
+    .map(Arc::new)
+    .unwrap_or_else(|| Arc::new(ConfigSet::new()));
+    let rules = WorktreeRules::from_parts_index_attributes_only(repo, index, config)?;
+    let mut matcher = rules.ignore_mut();
+    let removed_paths = removed_or_replaced_old_paths(tree_changes);
+    let mut scan = AddedTreeChangeUntrackedScan {
+        ignorecase,
+        tracked: Stage0TrackedPaths::from_index_for_untracked_scan(index, ignorecase),
+        remove_lookup: ScheduledDeletePathLookup::new(&removed_paths, ignorecase),
+        dentries: DentrySpellingCache::new(work_tree),
+    };
+    let mut untracked = Vec::new();
     for change in tree_changes {
         if change.status != DiffStatus::Added {
             continue;
@@ -743,14 +806,164 @@ pub(crate) fn untracked_scan_paths_for_added_tree_changes(
         if trimmed.is_empty() {
             continue;
         }
-        specs.insert(trimmed.to_owned());
-        let mut rest = trimmed;
-        while let Some((prefix, _)) = rest.rsplit_once('/') {
-            specs.insert(prefix.to_owned());
-            rest = prefix;
+        collect_untracked_collisions_for_added_path(
+            repo,
+            index,
+            work_tree,
+            trimmed,
+            &mut scan,
+            &mut matcher,
+            &mut untracked,
+        )?;
+    }
+    untracked.sort();
+    untracked.dedup();
+    Ok(untracked)
+}
+
+fn push_untracked_collision_if_present(
+    repo: &Repository,
+    index: &Index,
+    scan: &AddedTreeChangeUntrackedScan<'_, '_>,
+    matcher: &mut crate::ignore::IgnoreMatcher,
+    rel: &str,
+    untracked: &mut Vec<String>,
+) -> Result<()> {
+    if scan.path_is_tracked(rel) {
+        return Ok(());
+    }
+    if matcher.is_path_ignored(repo, Some(index), rel, false)? {
+        return Ok(());
+    }
+    untracked.push(rel.to_owned());
+    Ok(())
+}
+
+fn existing_worktree_path_for_untracked_scan(work_tree: &Path, rel: &str) -> Option<String> {
+    let mut candidate = rel.to_owned();
+    loop {
+        if work_tree.join(&candidate).symlink_metadata().is_ok() {
+            return Some(candidate);
+        }
+        candidate = candidate
+            .rsplit_once('/')
+            .map(|(prefix, _)| prefix.to_owned())
+            .unwrap_or_default();
+        if candidate.is_empty() {
+            return None;
         }
     }
-    specs.into_iter().collect()
+}
+
+fn collect_untracked_collisions_for_added_path(
+    repo: &Repository,
+    index: &Index,
+    work_tree: &Path,
+    added: &str,
+    scan: &mut AddedTreeChangeUntrackedScan<'_, '_>,
+    matcher: &mut crate::ignore::IgnoreMatcher,
+    untracked: &mut Vec<String>,
+) -> Result<()> {
+    match fs::symlink_metadata(work_tree.join(added)) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotADirectory => {
+            if let Some(existing) = existing_worktree_path_for_untracked_scan(work_tree, added) {
+                let classify = scan.classify_worktree_path(&existing);
+                if scan.path_removed_by_tree_change(&classify) {
+                    return Ok(());
+                }
+                push_untracked_collision_if_present(
+                    repo, index, scan, matcher, &classify, untracked,
+                )?;
+            }
+            return Ok(());
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(Error::Io(e)),
+        Ok(meta) if meta.is_dir() => {
+            collect_untracked_files_under_dir(
+                repo, index, scan, matcher, work_tree, added, untracked,
+            )?;
+            return Ok(());
+        }
+        Ok(_) => {}
+    }
+    let mut prefix_len = 0usize;
+    for component in added.split('/') {
+        if prefix_len == 0 {
+            prefix_len = component.len();
+        } else {
+            prefix_len += 1 + component.len();
+        }
+        let rel = &added[..prefix_len];
+        let abs = work_tree.join(rel);
+        let Ok(meta) = fs::symlink_metadata(&abs) else {
+            continue;
+        };
+        let classify = scan.classify_worktree_path(rel);
+        if meta.file_type().is_symlink() {
+            if scan.path_removed_by_tree_change(&classify) {
+                return Ok(());
+            }
+            push_untracked_collision_if_present(repo, index, scan, matcher, &classify, untracked)?;
+            return Ok(());
+        }
+        if meta.is_dir() {
+            if prefix_len >= added.len() {
+                collect_untracked_files_under_dir(
+                    repo, index, scan, matcher, work_tree, rel, untracked,
+                )?;
+            }
+            continue;
+        }
+        if meta.is_file() {
+            if scan.path_removed_by_tree_change(&classify) {
+                continue;
+            }
+            push_untracked_collision_if_present(repo, index, scan, matcher, &classify, untracked)?;
+        }
+    }
+    Ok(())
+}
+
+fn collect_untracked_files_under_dir(
+    repo: &Repository,
+    index: &Index,
+    scan: &AddedTreeChangeUntrackedScan<'_, '_>,
+    matcher: &mut crate::ignore::IgnoreMatcher,
+    work_tree: &Path,
+    dir_rel: &str,
+    untracked: &mut Vec<String>,
+) -> Result<()> {
+    let abs_root = work_tree.join(dir_rel);
+    let mut stack = vec![(abs_root, dir_rel.to_owned())];
+    while let Some((abs, rel)) = stack.pop() {
+        let read_dir = match fs::read_dir(&abs) {
+            Ok(rd) => rd,
+            Err(_) => continue,
+        };
+        for entry in read_dir.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let child_rel = if rel.is_empty() {
+                name.clone()
+            } else {
+                format!("{rel}/{name}")
+            };
+            let file_type = match entry.file_type() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            if file_type.is_dir() {
+                stack.push((entry.path(), child_rel));
+                continue;
+            }
+            if file_type.is_file() || file_type.is_symlink() {
+                push_untracked_collision_if_present(
+                    repo, index, scan, matcher, &child_rel, untracked,
+                )?;
+            }
+        }
+    }
+    Ok(())
 }
 
 const WHOLESALE_FAST_UNTRACKED_SCAN_MIN: usize = 32;
@@ -838,20 +1051,6 @@ fn delete_paths_from_tree_changes(tree_changes: &[DiffEntry]) -> HashSet<String>
         .collect()
 }
 
-fn delete_path_scheduled_for_removal(
-    rel: &str,
-    delete_paths: &HashSet<String>,
-    ignorecase: bool,
-) -> bool {
-    if ignorecase {
-        delete_paths
-            .iter()
-            .any(|del| crate::path_icase::paths_equal(rel.as_bytes(), del.as_bytes(), true))
-    } else {
-        delete_paths.contains(rel)
-    }
-}
-
 /// Scan wholesale-delete directory trees for extra untracked/ignored files without a full status walk.
 ///
 /// Every on-disk file under `delete_roots` must appear in `delete_paths` (scheduled removal). Any
@@ -866,16 +1065,21 @@ fn index_entry_under_root(path: &[u8], root: &[u8]) -> bool {
 }
 
 fn count_indexed_paths_under_root(index: &Index, root: &str) -> usize {
-    let root_bytes = root.as_bytes();
-    let prefix = format!("{root}/");
-    let prefix_bytes = prefix.as_bytes();
+    let root_owned = crate::repo_relpath::storage_bytes(root).into_owned();
+    let prefix_bytes: std::borrow::Cow<'_, [u8]> = if root_owned.is_empty() {
+        std::borrow::Cow::Borrowed(b"")
+    } else {
+        let mut p = root_owned.clone();
+        p.push(b'/');
+        std::borrow::Cow::Owned(p)
+    };
     if index.entries_sorted {
         let mut count = 0usize;
         let start = index
             .entries
-            .partition_point(|e| e.path.as_slice() < prefix_bytes);
+            .partition_point(|e| e.path.as_slice() < prefix_bytes.as_ref());
         for entry in &index.entries[start..] {
-            if !entry.path.starts_with(prefix_bytes) {
+            if !entry.path.starts_with(prefix_bytes.as_ref()) {
                 break;
             }
             if entry.stage() == 0 {
@@ -884,7 +1088,7 @@ fn count_indexed_paths_under_root(index: &Index, root: &str) -> usize {
         }
         if let Ok(pos) = index
             .entries
-            .binary_search_by(|e| e.path.as_slice().cmp(root_bytes))
+            .binary_search_by(|e| e.path.as_slice().cmp(root_owned.as_slice()))
         {
             if index.entries[pos].stage() == 0 {
                 count += 1;
@@ -896,7 +1100,7 @@ fn count_indexed_paths_under_root(index: &Index, root: &str) -> usize {
         .entries
         .iter()
         .filter(|e| e.stage() == 0)
-        .filter(|e| index_entry_under_root(&e.path, root_bytes))
+        .filter(|e| index_entry_under_root(&e.path, root_owned.as_slice()))
         .count()
 }
 
@@ -1022,6 +1226,7 @@ fn scan_wholesale_delete_root(
         )
     });
     let index_aligned = indexed > 0 && indexed == deletes;
+    let delete_lookup = ScheduledDeletePathLookup::new(delete_paths, ignorecase);
     let mut untracked = Vec::new();
     let mut needs_ignore_rules = Vec::new();
     let abs_root = work_tree.join(root);
@@ -1048,7 +1253,7 @@ fn scan_wholesale_delete_root(
             }
             rel_buf.push_str(&name);
             let rel = rel_buf.as_str();
-            if index_aligned && delete_path_scheduled_for_removal(rel, delete_paths, ignorecase) {
+            if index_aligned && delete_lookup.contains(rel) {
                 // Indexed file deletes need no file_type (issue #1613). Always descend when
                 // other scheduled deletes live under this path; otherwise probe only when the
                 // path is not a known indexed blob (directory deletes, missing index rows).
@@ -1057,10 +1262,7 @@ fn scan_wholesale_delete_root(
                     rel,
                     delete_prefix_dirs,
                     ignorecase,
-                ) || (!skip_probe
-                    && (delete_paths.contains(rel)
-                        || (ignorecase
-                            && delete_paths.iter().any(|del| del.eq_ignore_ascii_case(rel)))));
+                ) || (!skip_probe && delete_lookup.contains(rel));
                 if needs_descent {
                     let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
                     if is_dir {
@@ -1083,7 +1285,7 @@ fn scan_wholesale_delete_root(
                 continue;
             }
             if !file_type.is_file() && !file_type.is_symlink() {
-                if delete_path_scheduled_for_removal(rel, delete_paths, ignorecase) {
+                if delete_lookup.contains(rel) {
                     rel_buf.truncate(rel_start);
                     continue;
                 }
@@ -1096,7 +1298,7 @@ fn scan_wholesale_delete_root(
                 rel_buf.truncate(rel_start);
                 continue;
             }
-            if delete_path_scheduled_for_removal(rel, delete_paths, ignorecase) {
+            if delete_lookup.contains(rel) {
                 rel_buf.truncate(rel_start);
                 continue;
             }
@@ -1139,7 +1341,7 @@ fn collect_untracked_for_wholesale_delete_roots(
     let delete_paths_shared = Arc::new(delete_paths.clone());
     const PARALLEL_WHOLESALE_ROOT_SCAN_MIN: usize = 16;
     let scans: Vec<WholesaleDeleteRootScan> = if roots.len() >= PARALLEL_WHOLESALE_ROOT_SCAN_MIN {
-        let config = repo.config().ok();
+        let config = repo.config().snapshot().ok();
         let default_cfg = ConfigSet::new();
         let cfg = config.as_deref().unwrap_or(&default_cfg);
         let options = repo.thread_policy().resolve(ParallelOp::Checkout, cfg);
@@ -1200,10 +1402,14 @@ fn collect_untracked_for_wholesale_delete_roots(
         return Ok((untracked, Vec::new()));
     }
 
-    let config = ConfigSet::load(repo.environment(), Some(repo.git_dir()), true)
-        .ok()
-        .map(Arc::new)
-        .unwrap_or_else(|| Arc::new(ConfigSet::new()));
+    let config = ConfigSet::load(
+        repo.environment(),
+        Some(repo.git_dir()),
+        &crate::config::LoadConfigOptions::standard(repo.environment(), Some(repo.git_dir())),
+    )
+    .ok()
+    .map(Arc::new)
+    .unwrap_or_else(|| Arc::new(ConfigSet::new()));
     let rules = WorktreeRules::from_parts_index_attributes_only(repo, index, config)?;
     let mut matcher = rules.ignore_mut();
     let mut ignored = Vec::new();
@@ -1253,9 +1459,9 @@ pub(crate) fn collect_untracked_and_wholesale_trust_for_tree_changes(
     let all_specs: Vec<String> = pathspecs.into_iter().collect();
     let ignorecase = repo
         .config()
+        .snapshot()
         .ok()
-        .and_then(|c| c.get_bool("core.ignorecase").and_then(|r| r.ok()))
-        .unwrap_or(false);
+        .is_some_and(|c| c.ignore_case());
     let under_delete_root = |path: &str| {
         let root = path.split('/').next().unwrap_or(path);
         if ignorecase {
@@ -1293,22 +1499,23 @@ pub(crate) fn collect_untracked_and_wholesale_trust_for_tree_changes(
         untracked.extend(u);
         ignored.extend(i);
     }
-    let scan_specs: Vec<String> = if use_fast_wholesale_scan {
-        untracked_scan_paths_for_added_tree_changes(tree_changes)
-            .into_iter()
-            .filter(|spec| work_tree.join(spec).exists())
-            .collect()
-    } else {
-        all_specs.clone()
-    };
-    if !scan_specs.is_empty() {
+    if use_fast_wholesale_scan {
+        let u = collect_untracked_for_added_tree_changes_lstat(
+            repo,
+            index,
+            work_tree,
+            tree_changes,
+            ignorecase,
+        )?;
+        untracked.extend(u);
+    } else if !all_specs.is_empty() {
         let (u, mut ign) = collect_untracked_and_ignored_with_cache(
             repo,
             index,
             work_tree,
             IgnoredMode::No,
             true,
-            &scan_specs,
+            &all_specs,
             true,
         )?;
         untracked.extend(u);
@@ -1368,7 +1575,7 @@ fn ensure_worktree_clean_for(
     Ok(())
 }
 
-/// [`Error::DirtyWorktree`] naming every path in `staged` and `unstaged`.
+/// [`crate::worktree::WorktreeError::DirtyWorktree`] naming every path in `staged` and `unstaged`.
 fn dirty_worktree_error(
     operation: WorktreeOperation,
     staged: &[DiffEntry],
@@ -1420,8 +1627,8 @@ pub(crate) fn prepare_worktree_for_pick(repo: &Repository) -> Result<Option<Work
 ///
 /// # Errors
 ///
-/// Returns [`Error::DirtyWorktree`] naming the changed paths.
-pub fn ensure_worktree_clean_for_pick(repo: &Repository) -> Result<()> {
+/// Returns [`crate::worktree::WorktreeError::DirtyWorktree`] naming the changed paths.
+pub(crate) fn ensure_worktree_clean_for_pick(repo: &Repository) -> Result<()> {
     ensure_worktree_clean_for(repo, WorktreeOperation::Pick, false)
 }
 
@@ -1429,8 +1636,9 @@ pub fn ensure_worktree_clean_for_pick(repo: &Repository) -> Result<()> {
 ///
 /// # Errors
 ///
-/// Returns [`Error::DirtyWorktree`] naming the changed paths.
-pub fn ensure_worktree_clean_for_merge(repo: &Repository) -> Result<()> {
+/// Returns [`crate::worktree::WorktreeError::DirtyWorktree`] naming the changed paths.
+#[allow(dead_code)]
+pub(crate) fn ensure_worktree_clean_for_merge(repo: &Repository) -> Result<()> {
     ensure_worktree_clean_for(repo, WorktreeOperation::Merge, true)
 }
 
@@ -1438,8 +1646,8 @@ pub fn ensure_worktree_clean_for_merge(repo: &Repository) -> Result<()> {
 ///
 /// # Errors
 ///
-/// Returns [`Error::DirtyWorktree`] naming the changed paths.
-pub fn ensure_worktree_clean_for_rebase_exec(repo: &Repository) -> Result<()> {
+/// Returns [`crate::worktree::WorktreeError::DirtyWorktree`] naming the changed paths.
+pub(crate) fn ensure_worktree_clean_for_rebase_exec(repo: &Repository) -> Result<()> {
     ensure_worktree_clean_for(repo, WorktreeOperation::RebaseExec, false)
 }
 
@@ -1455,8 +1663,9 @@ pub struct TreeSwitchPlan {
 ///
 /// # Errors
 ///
-/// Returns [`Error::DirtyWorktree`] when staged or unstaged changes exist, or I/O/ODB failures.
-pub fn prepare_tree_switch(
+/// Returns [`crate::worktree::WorktreeError::DirtyWorktree`] when staged or unstaged changes exist, or I/O/ODB failures.
+#[allow(dead_code)]
+pub(crate) fn prepare_tree_switch(
     repo: &Repository,
     from_tree: Option<&ObjectId>,
     to_tree: &ObjectId,
@@ -1471,7 +1680,7 @@ pub fn prepare_tree_switch(
 ///
 /// # Errors
 ///
-/// Returns [`Error::DirtyWorktree`] for local changes and [`Error::Message`] when an untracked
+/// Returns [`crate::worktree::WorktreeError::DirtyWorktree`] for local changes and [`crate::worktree::WorktreeError::WouldOverwrite`] when an untracked
 /// file would be overwritten.
 pub(crate) fn ensure_safe_for_rebase_stop(
     repo: &Repository,
@@ -1504,7 +1713,7 @@ fn prepare_tree_switch_for(
     } else {
         diff_trees(repo.odb(), from_tree, Some(to_tree), "")?
     };
-    let work_tree = repo.work_tree().ok_or(Error::RequiresWorkTree)?;
+    let work_tree = repo.work_tree().ok_or(RepositoryError::RequiresWorkTree)?;
     let untracked =
         collect_untracked_for_tree_changes(repo, &mut snapshot.index, work_tree, &tree_changes)?;
     Ok(TreeSwitchPlan {
@@ -1535,7 +1744,7 @@ fn added_path_collides_with_untracked(added: &str, untracked: &str) -> bool {
 /// exact matches and file/directory clashes at component boundaries (e.g. added `slot` vs
 /// untracked `slot/precious.txt`, or the reverse).
 #[must_use]
-pub fn untracked_would_be_overwritten_by_tree_changes(
+pub(crate) fn untracked_would_be_overwritten_by_tree_changes(
     untracked_paths: &[String],
     tree_changes: &[DiffEntry],
 ) -> Vec<String> {
@@ -1569,9 +1778,9 @@ pub fn untracked_would_be_overwritten_by_tree_changes(
 ///
 /// # Errors
 ///
-/// Returns [`Error::WouldOverwrite`] with [`OverwriteReason::Untracked`] and every
+/// Returns [`crate::worktree::WorktreeError::WouldOverwrite`] with [`OverwriteReason::Untracked`] and every
 /// colliding path (same display wording as `grit switch`).
-pub fn ensure_no_untracked_overwrite(
+pub(crate) fn ensure_no_untracked_overwrite(
     untracked_paths: &[String],
     tree_changes: &[DiffEntry],
 ) -> Result<()> {
@@ -1593,9 +1802,9 @@ pub fn ensure_no_untracked_overwrite(
 ///
 /// # Errors
 ///
-/// Returns [`Error::WouldOverwrite`] when an untracked path would be overwritten, or on
+/// Returns [`crate::worktree::WorktreeError::WouldOverwrite`] when an untracked path would be overwritten, or on
 /// I/O/ODB failures.
-pub fn prepare_tree_checkout(
+pub(crate) fn prepare_tree_checkout(
     repo: &Repository,
     from_tree: Option<&ObjectId>,
     to_tree: &ObjectId,
@@ -1608,13 +1817,13 @@ pub fn prepare_tree_checkout(
 ///
 /// # Errors
 ///
-/// Returns [`Error::WouldOverwrite`] when an untracked path would be overwritten.
+/// Returns [`crate::worktree::WorktreeError::WouldOverwrite`] when an untracked path would be overwritten.
 pub(crate) fn prepare_tree_checkout_with_changes(
     repo: &Repository,
     tree_changes: &[DiffEntry],
 ) -> Result<()> {
     let mut snapshot = load_worktree_snapshot(repo)?;
-    let work_tree = repo.work_tree().ok_or(Error::RequiresWorkTree)?;
+    let work_tree = repo.work_tree().ok_or(RepositoryError::RequiresWorkTree)?;
     let untracked =
         collect_untracked_for_tree_changes(repo, &mut snapshot.index, work_tree, tree_changes)?;
     ensure_no_untracked_overwrite(&untracked, tree_changes)
@@ -1625,6 +1834,7 @@ mod tests {
     use super::*;
     use crate::diff::diff_trees;
     use crate::repo::{init_repository, Repository};
+    use crate::worktree::WorktreeError;
     use tempfile::TempDir;
 
     fn init_repo() -> (TempDir, Repository) {
@@ -1730,18 +1940,300 @@ mod tests {
     }
 
     #[test]
-    fn untracked_scan_paths_for_added_include_path_and_ancestors() {
+    fn added_lstat_untracked_skips_file_replaced_by_tree_add() {
+        let (dir, repo) = init_repo();
+        let work_tree = repo.work_tree().expect("work tree");
+        std::fs::write(dir.path().join("dir0"), "file\n").expect("write dir0 file");
+        let index = load_worktree_index(&repo).expect("index");
         let changes = vec![
-            added_entry("dir/sub/new.txt"),
-            modified_entry("tracked.txt"),
-            added_entry("top"),
+            DiffEntry {
+                status: DiffStatus::Deleted,
+                old_path: Some("dir0".into()),
+                new_path: None,
+                old_mode: FileMode::REGULAR,
+                new_mode: FileMode::ABSENT,
+                old_oid: ObjectId::zero(),
+                new_oid: ObjectId::zero(),
+                score: None,
+            },
+            added_entry("dir0/sub/f"),
         ];
-        let specs = super::untracked_scan_paths_for_added_tree_changes(&changes);
-        assert!(specs.contains(&"dir/sub/new.txt".to_owned()));
-        assert!(specs.contains(&"dir/sub".to_owned()));
-        assert!(specs.contains(&"dir".to_owned()));
-        assert!(specs.contains(&"top".to_owned()));
-        assert!(!specs.contains(&"tracked.txt".to_owned()));
+        let hits = super::collect_untracked_for_added_tree_changes_lstat(
+            &repo, &index, work_tree, &changes, false,
+        )
+        .expect("scan");
+        assert!(
+            hits.is_empty(),
+            "tracked file dir0 removed by diff: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn added_lstat_untracked_detects_file_and_dir_clash() {
+        let (dir, repo) = init_repo();
+        let work_tree = repo.work_tree().expect("work tree");
+        std::fs::create_dir_all(dir.path().join("slot")).expect("mkdir");
+        std::fs::write(dir.path().join("slot/precious.txt"), "u\n").expect("write");
+        let index = load_worktree_index(&repo).expect("index");
+        let hits = super::collect_untracked_for_added_tree_changes_lstat(
+            &repo,
+            &index,
+            work_tree,
+            &[added_entry("slot")],
+            false,
+        )
+        .expect("scan");
+        assert_eq!(hits, vec!["slot/precious.txt".to_owned()]);
+
+        std::fs::remove_dir_all(dir.path().join("slot")).expect("rm slot");
+        std::fs::write(dir.path().join("slot"), "file\n").expect("write slot file");
+        let hits = super::collect_untracked_for_added_tree_changes_lstat(
+            &repo,
+            &index,
+            work_tree,
+            &[added_entry("slot/incoming.txt")],
+            false,
+        )
+        .expect("scan");
+        assert_eq!(hits, vec!["slot".to_owned()]);
+    }
+
+    #[test]
+    fn added_lstat_untracked_skips_ignored_exact_file() {
+        let (dir, repo) = init_repo();
+        let work_tree = repo.work_tree().expect("work tree");
+        std::fs::write(dir.path().join(".gitignore"), "victim\n").expect("gitignore");
+        std::fs::write(dir.path().join("victim"), "ignored\n").expect("victim");
+        let index = load_worktree_index(&repo).expect("index");
+        let hits = super::collect_untracked_for_added_tree_changes_lstat(
+            &repo,
+            &index,
+            work_tree,
+            &[added_entry("victim")],
+            false,
+        )
+        .expect("scan");
+        assert!(hits.is_empty(), "ignored victim should not block: {hits:?}");
+    }
+
+    #[test]
+    fn added_lstat_untracked_tracked_symlink_does_not_follow_target() {
+        let (dir, repo) = init_repo();
+        let work_tree = repo.work_tree().expect("work tree");
+        std::fs::create_dir_all(dir.path().join("t/z.in")).expect("mkdir z.in");
+        std::fs::write(dir.path().join("t/z.in/Cargo.toml"), "tracked\n").expect("write target");
+        std::fs::create_dir_all(dir.path().join("t/inv")).expect("mkdir inv");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("../z.in", dir.path().join("t/inv/in")).expect("symlink");
+        #[cfg(not(unix))]
+        return;
+
+        let mut index = load_worktree_index(&repo).expect("index");
+        let link_oid = repo
+            .odb()
+            .write(crate::objects::ObjectKind::Blob, b"../z.in")
+            .expect("blob");
+        let link_entry = crate::index::entry_from_stat(
+            &dir.path().join("t/inv/in"),
+            b"t/inv/in",
+            link_oid,
+            crate::index::MODE_SYMLINK,
+        )
+        .expect("link entry");
+        index.add_or_replace(link_entry);
+        index.sort();
+
+        let hits = super::collect_untracked_for_added_tree_changes_lstat(
+            &repo,
+            &index,
+            work_tree,
+            &[added_entry("t/inv/in/Cargo.toml")],
+            false,
+        )
+        .expect("scan");
+        assert!(
+            hits.is_empty(),
+            "tracked symlink must not follow target: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn added_lstat_untracked_untracked_symlink_reports_link_not_child() {
+        let (dir, repo) = init_repo();
+        let work_tree = repo.work_tree().expect("work tree");
+        std::fs::create_dir_all(dir.path().join("real")).expect("mkdir");
+        std::fs::write(dir.path().join("real/inside.txt"), "x\n").expect("write");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("real", dir.path().join("link")).expect("symlink");
+        #[cfg(not(unix))]
+        return;
+
+        let index = load_worktree_index(&repo).expect("index");
+        let hits = super::collect_untracked_for_added_tree_changes_lstat(
+            &repo,
+            &index,
+            work_tree,
+            &[added_entry("link/inside.txt")],
+            false,
+        )
+        .expect("scan");
+        assert_eq!(hits, vec!["link".to_owned()]);
+    }
+
+    #[test]
+    fn added_lstat_untracked_symlink_to_dir_does_not_walk_target() {
+        let (dir, repo) = init_repo();
+        let work_tree = repo.work_tree().expect("work tree");
+        std::fs::create_dir_all(dir.path().join("target/nested")).expect("mkdir");
+        std::fs::write(dir.path().join("target/nested/file.txt"), "x\n").expect("write");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("target", dir.path().join("link")).expect("symlink");
+        #[cfg(not(unix))]
+        return;
+
+        let index = load_worktree_index(&repo).expect("index");
+        let hits = super::collect_untracked_for_added_tree_changes_lstat(
+            &repo,
+            &index,
+            work_tree,
+            &[added_entry("link/nested/file.txt")],
+            false,
+        )
+        .expect("scan");
+        assert_eq!(hits, vec!["link".to_owned()]);
+    }
+
+    #[test]
+    fn icase_added_lstat_lookup_treats_case_only_rename_as_tracked() {
+        use crate::index::entry_from_stat;
+        use crate::objects::ObjectKind;
+
+        let (dir, repo) = init_repo();
+        std::fs::create_dir_all(dir.path().join("d")).expect("mkdir");
+        std::fs::write(dir.path().join("d/README.md"), "y\n").expect("readme");
+        let oid = repo.odb().write(ObjectKind::Blob, b"y\n").expect("blob");
+        let mut index = load_worktree_index(&repo).expect("index");
+        let readme_entry = entry_from_stat(
+            &dir.path().join("d/README.md"),
+            b"d/README.md",
+            oid,
+            crate::index::MODE_REGULAR,
+        )
+        .expect("entry");
+        index.add_or_replace(readme_entry);
+        index.sort();
+
+        let removed = super::removed_or_replaced_old_paths(&[
+            DiffEntry {
+                status: DiffStatus::Deleted,
+                old_path: Some("d/README.md".into()),
+                new_path: None,
+                old_mode: FileMode::REGULAR,
+                new_mode: FileMode::ABSENT,
+                old_oid: ObjectId::zero(),
+                new_oid: ObjectId::zero(),
+                score: None,
+            },
+            added_entry("d/Readme.md"),
+        ]);
+        let lookup = ScheduledDeletePathLookup::new(&removed, true);
+        assert!(lookup.contains("d/Readme.md"));
+        let tracked = Stage0TrackedPaths::from_index_for_untracked_scan(&index, true);
+        assert!(tracked.contains_bytes(b"d/Readme.md"));
+    }
+
+    fn deleted_entry(path: &str) -> DiffEntry {
+        DiffEntry {
+            status: DiffStatus::Deleted,
+            old_path: Some(path.to_owned()),
+            new_path: None,
+            old_mode: FileMode::REGULAR,
+            new_mode: FileMode::ABSENT,
+            old_oid: ObjectId::zero(),
+            new_oid: ObjectId::zero(),
+            score: None,
+        }
+    }
+
+    #[test]
+    fn added_lstat_untracked_icase_rename_with_wholesale_delete_count() {
+        use crate::index::entry_from_stat;
+        use crate::objects::ObjectKind;
+
+        let (dir, repo) = init_repo();
+        let work_tree = repo.work_tree().expect("work tree");
+        std::fs::create_dir_all(work_tree.join("d")).expect("mkdir");
+        std::fs::write(work_tree.join("d/README.md"), "y\n").expect("readme");
+        let oid = repo.odb().write(ObjectKind::Blob, b"y\n").expect("blob");
+        let mut index = load_worktree_index(&repo).expect("index");
+        index.add_or_replace(
+            entry_from_stat(
+                &work_tree.join("d/README.md"),
+                b"d/README.md",
+                oid,
+                crate::index::MODE_REGULAR,
+            )
+            .expect("entry"),
+        );
+        for i in 1..=40 {
+            let rel = format!("d/f{i}");
+            std::fs::write(work_tree.join(&rel), format!("{i}\n")).expect("write");
+            let file_oid = repo
+                .odb()
+                .write(ObjectKind::Blob, format!("{i}\n").as_bytes())
+                .expect("blob");
+            index.add_or_replace(
+                entry_from_stat(
+                    &work_tree.join(&rel),
+                    rel.as_bytes(),
+                    file_oid,
+                    crate::index::MODE_REGULAR,
+                )
+                .expect("entry"),
+            );
+        }
+        index.sort();
+
+        let mut changes = vec![deleted_entry("d/README.md"), added_entry("d/Readme.md")];
+        for i in 1..=40 {
+            changes.push(deleted_entry(&format!("d/f{i}")));
+        }
+
+        let hits_31 = {
+            let mut subset = changes.clone();
+            subset.retain(|c| {
+                c.old_path.as_deref() != Some("d/f40") && c.new_path.as_deref() != Some("d/f40")
+            });
+            super::collect_untracked_for_added_tree_changes_lstat(
+                &repo, &index, work_tree, &subset, true,
+            )
+            .expect("scan 31 deletes")
+        };
+        assert!(
+            hits_31.is_empty(),
+            "31-delete path should not report case rename: {hits_31:?}"
+        );
+
+        let hits_32 = super::collect_untracked_for_added_tree_changes_lstat(
+            &repo, &index, work_tree, &changes, true,
+        )
+        .expect("scan 32+ deletes");
+        assert!(
+            hits_32.is_empty(),
+            "wholesale fast-path lstat must not treat case rename as untracked: {hits_32:?}"
+        );
+
+        changes.push(added_entry("d/collision.txt"));
+        std::fs::write(work_tree.join("d/collision.txt"), "x\n").expect("collision");
+        let hits_extra = super::collect_untracked_for_added_tree_changes_lstat(
+            &repo, &index, work_tree, &changes, true,
+        )
+        .expect("scan with collision");
+        assert!(
+            hits_extra.iter().any(|p| p == "d/collision.txt"),
+            "distinct untracked file must still block: {hits_extra:?}"
+        );
+        let _ = dir;
     }
 
     #[test]
@@ -1749,11 +2241,11 @@ mod tests {
         let err = ensure_no_untracked_overwrite(&["x.txt".into()], &[added_entry("x.txt")])
             .expect_err("collision");
         match err {
-            Error::WouldOverwrite {
+            Error::Worktree(WorktreeError::WouldOverwrite {
                 reason: OverwriteReason::Untracked,
                 paths,
                 message,
-            } => {
+            }) => {
                 assert_eq!(paths, vec!["x.txt".to_owned()]);
                 assert!(message.contains("untracked file 'x.txt' would be overwritten"));
             }
@@ -2227,7 +2719,7 @@ mod tests {
                 hooks: crate::hooks::PostOperationHooks::Run,
             },
             &mut crate::progress::NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         );
         assert!(
             switch_err.is_err(),
@@ -2314,7 +2806,7 @@ mod tests {
     fn delete_only_tree_diff_paths_skip_worktree_stat_when_index_matches_head() {
         use crate::objects::{serialize_commit, CommitData, ObjectKind};
         use crate::refs;
-        use crate::worktree_scan::{
+        use crate::test_support::counters::{
             reset_worktree_metadata_probe, worktree_metadata_probe_count,
             worktree_read_dir_probe_count,
         };
@@ -2608,7 +3100,7 @@ mod tests {
                 hooks: crate::hooks::PostOperationHooks::Run,
             },
             &mut crate::progress::NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         );
         assert!(
             switch_err.is_err(),
@@ -2625,7 +3117,9 @@ mod tests {
     fn local_change_diffs_for_tree_changes_limits_worktree_probes() {
         use crate::objects::{serialize_commit, CommitData, ObjectKind};
         use crate::refs;
-        use crate::worktree_scan::{reset_worktree_metadata_probe, worktree_metadata_probe_count};
+        use crate::test_support::counters::{
+            reset_worktree_metadata_probe, worktree_metadata_probe_count,
+        };
         use crate::write_tree::{write_tree_update_index, WriteTreeFlags};
 
         let tmp = TempDir::new().expect("tempdir");
@@ -2808,7 +3302,7 @@ mod tests {
             assert!(
                 matches!(
                     &err,
-                    Error::DirtyWorktree { operation: op, paths }
+                    Error::Worktree(WorktreeError::DirtyWorktree { operation: op, paths })
                         if *op == operation && paths == &["tracked.txt"]
                 ),
                 "{err:?}"
@@ -2823,10 +3317,10 @@ mod tests {
             .expect("dirty switch");
         assert!(matches!(
             err,
-            Error::DirtyWorktree {
+            Error::Worktree(WorktreeError::DirtyWorktree {
                 operation: WorktreeOperation::Switch,
                 ..
-            }
+            })
         ));
     }
 
@@ -2921,6 +3415,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn scan_wholesale_delete_root_ignorecase_matches_scheduled_spelling() {
+        use crate::index::entry_from_stat;
+        use crate::objects::ObjectKind;
+
+        let (_dir, repo) = init_repo();
+        let wt = repo.work_tree().expect("wt");
+        let root = "ic";
+        std::fs::create_dir_all(wt.join(root)).expect("mkdir");
+        let mut delete_paths = HashSet::new();
+        let mut index = repo.load_index().expect("index");
+        for i in 0..8 {
+            let scheduled = format!("{root}/file{i}.txt");
+            let disk = format!("{root}/File{i}.txt");
+            let abs = wt.join(&disk);
+            std::fs::write(&abs, format!("v{i}\n")).expect("write");
+            let oid = repo
+                .odb()
+                .write(ObjectKind::Blob, format!("v{i}\n").as_bytes())
+                .expect("blob");
+            index.add_or_replace(
+                entry_from_stat(&abs, scheduled.as_bytes(), oid, crate::index::MODE_REGULAR)
+                    .expect("entry"),
+            );
+            delete_paths.insert(scheduled);
+        }
+        index.sort();
+        let prefix_dirs = delete_path_directory_prefixes(&delete_paths, true);
+        let scan =
+            scan_wholesale_delete_root(&index, wt, root, &delete_paths, &prefix_dirs, true, None);
+        assert!(scan.untracked.is_empty());
+        assert!(scan.needs_ignore_rules.is_empty());
+    }
+
     fn git_in(dir: &Path, args: &[&str]) -> String {
         let out = std::process::Command::new("git")
             .current_dir(dir)
@@ -2998,7 +3526,7 @@ mod tests {
                 hooks: crate::hooks::PostOperationHooks::Run,
             },
             &mut crate::progress::NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .map(|_| ())
     }

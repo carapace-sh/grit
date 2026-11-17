@@ -3,6 +3,7 @@
 //!
 //! `GRIT_CHECKOUT_CANCEL_PERF=1 cargo test -p grit-lib --test checkout_cancel_rollback_wide_perf --release`
 
+use grit_lib::worktree::WorktreeError;
 use std::process::Command;
 use std::sync::Arc;
 use std::thread;
@@ -11,10 +12,10 @@ use std::time::{Duration, Instant};
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::error::Error;
 use grit_lib::objects::ObjectId;
-use grit_lib::porcelain::merge::{integrate_branch, resolve_merge_source};
-use grit_lib::progress::{FlagCancel, NullProgress};
+use grit_lib::progress::{CancelToken, NullProgress};
 use grit_lib::refs::store::RefName;
 use grit_lib::repo::Repository;
+use grit_test_support::{integrate_branch, resolve_merge_source};
 
 const DIRS: u32 = 150;
 const FILES: u32 = 150;
@@ -85,11 +86,15 @@ fn git_rev_parse(root: &std::path::Path, rev: &str) -> String {
 
 fn run_integrate(root: &std::path::Path, cancel_ms: u64) -> Result<Duration, Error> {
     let repo = Repository::discover(Some(root), &RepositoryOptions::from_process())?;
-    let into = repo.references().resolve(
-        &RefName::try_from("refs/heads/main").map_err(|e| Error::PathError(e.to_string()))?,
-    )?;
+    let into = repo
+        .references()
+        .resolve(&RefName::try_from("refs/heads/main").map_err(|e| {
+            Error::Worktree(WorktreeError::Path {
+                detail: e.to_string(),
+            })
+        })?)?;
     let other = resolve_merge_source(&repo, "other")?.oid;
-    let cancel = FlagCancel::new();
+    let cancel = CancelToken::new();
     if cancel_ms > 0 {
         let c = Arc::new(cancel.clone());
         thread::spawn(move || {
@@ -111,9 +116,9 @@ fn run_integrate(root: &std::path::Path, cancel_ms: u64) -> Result<Duration, Err
     match result {
         Ok(_) if cancel_ms == 0 => Ok(elapsed),
         Err(Error::Cancelled) if cancel_ms > 0 => Ok(elapsed),
-        Ok(_) => Err(Error::PathError(
-            "expected cancelled integrate_branch".into(),
-        )),
+        Ok(_) => Err(Error::Worktree(WorktreeError::Path {
+            detail: "expected cancelled integrate_branch".into(),
+        })),
         Err(e) => Err(e),
     }
 }
@@ -140,7 +145,9 @@ fn late_cancel_rollback_wall_time_bounded() {
     let late_cancel_ms = baseline_ms * 4 / 5;
     let cancelled = match run_integrate(root.path(), late_cancel_ms) {
         Ok(elapsed) => elapsed,
-        Err(Error::PathError(msg)) if msg.contains("expected cancelled") => {
+        Err(Error::Worktree(WorktreeError::Path { detail: msg }))
+            if msg.contains("expected cancelled") =>
+        {
             eprintln!(
                 "skip ratio check: checkout finished before cancel at {late_cancel_ms}ms (baseline {baseline:?})"
             );

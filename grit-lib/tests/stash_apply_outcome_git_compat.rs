@@ -3,10 +3,9 @@
 use std::path::Path;
 
 use grit_lib::config::environment::RepositoryOptions;
-use grit_lib::error::Error;
 use grit_lib::operation::ConflictKind;
-use grit_lib::porcelain::status::{status, StatusOptions};
-use grit_lib::progress::{NeverCancel, NullProgress};
+use grit_lib::porcelain::status::StatusOptions;
+use grit_lib::progress::NullProgress;
 use grit_lib::repo::Repository;
 use grit_lib::stash::{StashApplyOptions, StashApplyOutcome};
 use grit_test_support::git;
@@ -108,7 +107,7 @@ fn apply_entry_reports_conflicts_git_also_sees() {
             0,
             &StashApplyOptions::default(),
             &mut grit_lib::progress::NullProgress,
-            &grit_lib::progress::NeverCancel,
+            &grit_lib::progress::CancelToken::never(),
         )
         .expect("apply");
     assert!(outcome.has_conflicts());
@@ -117,13 +116,14 @@ fn apply_entry_reports_conflicts_git_also_sees() {
         .conflicts
         .iter()
         .all(|c| c.kind == ConflictKind::BothModified));
-    let model = status(
-        &repo,
-        &StatusOptions::default(),
-        &mut NullProgress,
-        &NeverCancel,
-    )
-    .expect("status");
+    let model = repo
+        .status()
+        .run(
+            &StatusOptions::default(),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("status");
     assert_eq!(model.conflict_details, outcome.conflicts);
 
     // git reads the index grit wrote and sees the same unmerged paths.
@@ -161,7 +161,7 @@ fn pop_entry_with_conflicts_keeps_entry() {
             0,
             &StashApplyOptions::default(),
             &mut grit_lib::progress::NullProgress,
-            &grit_lib::progress::NeverCancel,
+            &grit_lib::progress::CancelToken::never(),
         )
         .expect("pop");
     assert_eq!(conflicted_paths(&outcome), ["a.txt", "dir/b.txt"]);
@@ -188,7 +188,7 @@ fn clean_apply_and_pop_report_no_conflicts() {
             1,
             &StashApplyOptions::default(),
             &mut grit_lib::progress::NullProgress,
-            &grit_lib::progress::NeverCancel,
+            &grit_lib::progress::CancelToken::never(),
         )
         .expect("apply older");
     assert_eq!(applied, StashApplyOutcome::default());
@@ -206,7 +206,7 @@ fn clean_apply_and_pop_report_no_conflicts() {
             0,
             &StashApplyOptions::default(),
             &mut grit_lib::progress::NullProgress,
-            &grit_lib::progress::NeverCancel,
+            &grit_lib::progress::CancelToken::never(),
         )
         .expect("pop newer");
     assert!(!popped.has_conflicts());
@@ -234,18 +234,24 @@ fn entry_out_of_range_is_stash_not_found() {
             0,
             &StashApplyOptions::default(),
             &mut grit_lib::progress::NullProgress,
-            &grit_lib::progress::NeverCancel,
+            &grit_lib::progress::CancelToken::never(),
         )
         .unwrap_err();
-    assert!(matches!(err, Error::StashNotFound { n: 0 }), "{err:?}");
+    assert!(
+        matches!(err, grit_lib::stash::StashError::NotFound { n: 0 }),
+        "{err:?}"
+    );
     let err = repo
         .stash()
         .pop(
             3,
             &StashApplyOptions::default(),
             &mut grit_lib::progress::NullProgress,
-            &grit_lib::progress::NeverCancel,
+            &grit_lib::progress::CancelToken::never(),
         )
         .unwrap_err();
-    assert!(matches!(err, Error::StashNotFound { n: 3 }), "{err:?}");
+    assert!(
+        matches!(err, grit_lib::stash::StashError::NotFound { n: 3 }),
+        "{err:?}"
+    );
 }

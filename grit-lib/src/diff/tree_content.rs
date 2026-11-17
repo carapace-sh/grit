@@ -1,32 +1,32 @@
 //! Parallel blob loads for tree-to-tree diffs (commit ranges, `grit diff A B`).
 
 use crate::config::ConfigSet;
+#[cfg(test)]
 use crate::diff_rename_parallel::parallel_map_indices;
-use crate::error::{Error, Result};
+#[cfg(test)]
+use crate::error::Error;
+use crate::error::Result;
 use crate::merge_diff::{diff_attr_forces_text, diff_driver_forces_text, diff_textconv_active};
-use crate::objects::pack_store::PackReadContextGuard;
 use crate::objects::FileMode;
 use crate::objects::ObjectId;
 use crate::objects::ObjectKind;
 use crate::objects::OidHashSet;
 use crate::odb::Odb;
+use crate::pack_store::PackReadContextGuard;
 use crate::parallel::run_ordered_batches;
 use crate::parallel::{try_par_map_with_local, ParallelHashError};
 use crate::parallel::{ParallelOp, ParallelOptions, ThreadPolicy};
 use std::num::NonZeroUsize;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use super::detail::{line_change_counts, LineStat};
+use super::detail::{line_stat_for_options, LineStat};
 use super::structured::{structured_file_diff, SideBytes, StructuredFileDiff};
 use super::DiffEntry;
 use super::DiffOptions;
 
-fn note_blob_read(counter: Option<&AtomicUsize>) {
-    if let Some(c) = counter {
-        c.fetch_add(1, Ordering::Relaxed);
-    }
+fn note_blob_read() {
+    crate::test_probe_hooks::hooks::diff_blob_read();
 }
 
 fn collect_tree_diff_blob_oids(entries: &[DiffEntry]) -> Vec<ObjectId> {
@@ -55,16 +55,29 @@ pub(crate) fn prefetch_tree_diff_blobs(odb: &Odb, entries: &[DiffEntry]) -> Resu
     odb.prefetch_promisor_read_batch(collect_tree_diff_blob_oids(entries))
 }
 
-/// Pool options for per-entry content work that should fan out whenever it can.
+/// Fewest changed entries for which per-entry blob loads and line diffs use worker threads.
 ///
-/// A single entry always runs on the calling thread, so the policy (which probes the
-/// CPU count and cgroup quota) is only consulted when there is more than one.
+/// Starting workers (stacks, allocator arenas, per-thread pack inflaters) costs more than
+/// loading and diffing a small commit's blobs on the calling thread: showing git.git commits
+/// that touch up to 17 files ran faster serially, while from about 18 files the pool won.
+/// Fewer, larger files gain nothing either, since each entry is diffed by one thread.
+const PER_ENTRY_POOL_MIN_ITEMS: usize = 16;
+
+/// Pool options for per-entry content work, fanning out once there are enough entries.
+///
+/// Below [`PER_ENTRY_POOL_MIN_ITEMS`] entries (or the policy's
+/// [`ThreadPolicy::min_items_override`], never below two) the work runs on the calling
+/// thread and the policy, which probes the CPU count and cgroup quota, is not consulted.
 fn per_entry_parallel_options(
     thread_policy: &ThreadPolicy,
     config: &ConfigSet,
     entry_count: usize,
 ) -> ParallelOptions {
-    if entry_count < 2 {
+    let min_items = thread_policy
+        .min_items_override
+        .unwrap_or(PER_ENTRY_POOL_MIN_ITEMS)
+        .max(2);
+    if entry_count < min_items {
         return ParallelOptions {
             threads: NonZeroUsize::MIN,
             min_items: 0,
@@ -87,16 +100,21 @@ pub struct TreeDiffStructured {
     pub structured: StructuredFileDiff,
     /// `true` when either side looks like a binary blob (NUL in the first 8 KiB).
     pub binary: bool,
+    /// Old-side byte length (for binary `--stat` rows).
+    pub old_size: u64,
+    /// New-side byte length (for binary `--stat` rows).
+    pub new_size: u64,
     /// Worktree/index side bytes when content is not materialized in the ODB.
     pub patch_bytes: Option<(SideBytes, SideBytes)>,
 }
 
 /// One tree diff entry with both sides loaded for line-level diffing.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TreeDiffContent {
+#[cfg(test)]
+pub(crate) struct TreeDiffContent {
     /// Tree diff metadata (paths, modes, oids, status).
     pub entry: DiffEntry,
-    /// Old-side bytes prepared for [`super::structured::structured_text_diff`].
+    /// Old-side bytes prepared for structured text diffing.
     pub old_bytes: SideBytes,
     /// New-side bytes prepared for structured diffing.
     pub new_bytes: SideBytes,
@@ -112,7 +130,8 @@ pub struct TreeDiffContent {
 /// # Errors
 ///
 /// Propagates object database read failures.
-pub fn tree_diff_contents_parallel(
+#[cfg(test)]
+pub(crate) fn tree_diff_contents_parallel(
     odb: &Odb,
     entries: Vec<DiffEntry>,
     config: &ConfigSet,
@@ -127,8 +146,8 @@ pub fn tree_diff_contents_parallel(
     let est_bytes = entries.len().saturating_mul(8192);
     let rows = parallel_map_indices(odb, entries.len(), par_opts, est_bytes, |i| {
         let entry = &entries[i];
-        let (old_bytes, old_bin) = load_old_side(odb, entry, None)?;
-        let (new_bytes, new_bin) = load_new_side(odb, entry, None)?;
+        let (old_bytes, old_bin) = load_old_side(odb, entry)?;
+        let (new_bytes, new_bin) = load_new_side(odb, entry)?;
         Ok::<TreeDiffContent, Error>(TreeDiffContent {
             entry: entry.clone(),
             old_bytes,
@@ -139,25 +158,30 @@ pub fn tree_diff_contents_parallel(
     Ok(rows)
 }
 
+/// One tree diff entry's stat row: metadata, binary flag, line counts, side byte lengths.
+pub(crate) type TreeDiffStatRow = (DiffEntry, bool, Option<LineStat>, u64, u64);
+
 /// Per-file line counts for stat modes (loads blobs, no hunk allocation).
+///
+/// Worker threads are used only for 16 or more entries (or the policy's
+/// [`ThreadPolicy::min_items_override`]); smaller diffs run on the calling thread.
 ///
 /// # Errors
 ///
 /// Propagates object database read failures.
-pub fn tree_diff_stat_parallel(
+pub(crate) fn tree_diff_stat_parallel(
     odb: &Odb,
     entries: Vec<DiffEntry>,
     config: &ConfigSet,
     thread_policy: &ThreadPolicy,
     diff_options: DiffOptions,
-) -> Result<Vec<(DiffEntry, bool, Option<LineStat>)>> {
+) -> Result<Vec<TreeDiffStatRow>> {
     if entries.is_empty() {
         return Ok(Vec::new());
     }
     prefetch_tree_diff_blobs(odb, &entries)?;
     let par_opts = per_entry_parallel_options(thread_policy, config, entries.len());
     let line_diff_opts = diff_options;
-    let blob_counter = line_diff_opts.blob_read_counter.clone();
     let store = odb.pack_store_for(odb.objects_dir());
     let rows = try_par_map_with_local(
         &entries,
@@ -165,13 +189,13 @@ pub fn tree_diff_stat_parallel(
         0,
         || PackReadContextGuard::install(Arc::clone(&store)),
         move |_ctx, entry| {
-            let blob_reads = blob_counter.as_deref();
             if !entry.old_oid.is_zero()
                 && entry.old_oid == entry.new_oid
                 && entry.old_mode == entry.new_mode
             {
-                let (_, old_bin) = load_old_side(odb, entry, blob_reads)?;
+                let (old_bytes, old_bin) = load_old_side(odb, entry)?;
                 let binary = old_bin;
+                let size = old_bytes.byte_len();
                 return Ok((
                     entry.clone(),
                     binary,
@@ -180,21 +204,25 @@ pub fn tree_diff_stat_parallel(
                     } else {
                         Some(LineStat::default())
                     },
+                    size,
+                    size,
                 ));
             }
-            let (old_bytes, old_bin) = load_old_side(odb, entry, blob_reads)?;
-            let (new_bytes, new_bin) = load_new_side(odb, entry, blob_reads)?;
+            let (old_bytes, old_bin) = load_old_side(odb, entry)?;
+            let (new_bytes, new_bin) = load_new_side(odb, entry)?;
             let binary = old_bin || new_bin;
+            let old_size = old_bytes.byte_len();
+            let new_size = new_bytes.byte_len();
             let stat = if binary {
                 None
             } else {
-                Some(line_change_counts(
+                Some(line_stat_for_options(
                     &String::from_utf8_lossy(&old_bytes.data),
                     &String::from_utf8_lossy(&new_bytes.data),
                     &line_diff_opts,
                 ))
             };
-            Ok((entry.clone(), binary, stat))
+            Ok((entry.clone(), binary, stat, old_size, new_size))
         },
     );
     match rows {
@@ -213,12 +241,12 @@ pub fn tree_diff_structured_entry(
     entry: &DiffEntry,
     diff_options: &DiffOptions,
 ) -> Result<TreeDiffStructured> {
-    let blob_reads = diff_options.blob_read_counter.as_deref();
     if !entry.old_oid.is_zero()
         && entry.old_oid == entry.new_oid
         && entry.old_mode == entry.new_mode
     {
-        let (old_bytes, old_bin) = load_old_side(odb, entry, blob_reads)?;
+        let (old_bytes, old_bin) = load_old_side(odb, entry)?;
+        let size = old_bytes.byte_len();
         return Ok(TreeDiffStructured {
             entry: entry.clone(),
             structured: StructuredFileDiff {
@@ -229,12 +257,16 @@ pub fn tree_diff_structured_entry(
                 hunks: Vec::new(),
             },
             binary: old_bin,
+            old_size: size,
+            new_size: size,
             patch_bytes: None,
         });
     }
-    let (old_bytes, old_bin) = load_old_side(odb, entry, blob_reads)?;
-    let (new_bytes, new_bin) = load_new_side(odb, entry, blob_reads)?;
+    let (old_bytes, old_bin) = load_old_side(odb, entry)?;
+    let (new_bytes, new_bin) = load_new_side(odb, entry)?;
     let binary = old_bin || new_bin;
+    let old_size = old_bytes.byte_len();
+    let new_size = new_bytes.byte_len();
     let structured = if binary {
         StructuredFileDiff {
             old_mode: entry.old_mode.octal_if_present(),
@@ -256,6 +288,8 @@ pub fn tree_diff_structured_entry(
         entry: entry.clone(),
         structured,
         binary,
+        old_size,
+        new_size,
         patch_bytes: None,
     })
 }
@@ -265,10 +299,13 @@ pub fn tree_diff_structured_entry(
 /// When thread policy allows, workers compute up to about `2 × threads` entries ahead while
 /// the callback consumes results strictly in order.
 ///
+/// Worker threads are used only for 16 or more entries (or the policy's
+/// [`ThreadPolicy::min_items_override`]); smaller diffs run on the calling thread.
+///
 /// # Errors
 ///
 /// Propagates object database read failures and callback errors.
-pub fn for_each_tree_diff_structured(
+pub(crate) fn for_each_tree_diff_structured(
     odb: &Odb,
     entries: &[DiffEntry],
     diff_options: DiffOptions,
@@ -308,10 +345,13 @@ pub fn for_each_tree_diff_structured(
 
 /// Load sides and compute structured line diffs for each entry in parallel.
 ///
+/// Worker threads are used only for 16 or more entries (or the policy's
+/// [`ThreadPolicy::min_items_override`]); smaller diffs run on the calling thread.
+///
 /// # Errors
 ///
 /// Propagates object database read failures.
-pub fn tree_diff_structured_parallel(
+pub(crate) fn tree_diff_structured_parallel(
     odb: &Odb,
     entries: Vec<DiffEntry>,
     config: &ConfigSet,
@@ -339,11 +379,7 @@ pub fn tree_diff_structured_parallel(
     }
 }
 
-pub(crate) fn load_old_side(
-    odb: &Odb,
-    e: &DiffEntry,
-    blob_reads: Option<&AtomicUsize>,
-) -> Result<(SideBytes, bool)> {
+pub(crate) fn load_old_side(odb: &Odb, e: &DiffEntry) -> Result<(SideBytes, bool)> {
     if e.old_mode == FileMode::GITLINK {
         return Ok((
             SideBytes::from_bytes(gitlink_line(&e.old_oid).into_bytes()),
@@ -354,14 +390,10 @@ pub(crate) fn load_old_side(
         return Ok((SideBytes::from_bytes(Vec::new()), false));
     }
     let path = e.old_path.as_deref().or(e.new_path.as_deref());
-    load_odb_blob_side_for_diff(odb, &e.old_oid, path, blob_reads, false)
+    load_odb_blob_side_for_diff(odb, &e.old_oid, path, false)
 }
 
-pub(crate) fn load_new_side(
-    odb: &Odb,
-    e: &DiffEntry,
-    blob_reads: Option<&AtomicUsize>,
-) -> Result<(SideBytes, bool)> {
+pub(crate) fn load_new_side(odb: &Odb, e: &DiffEntry) -> Result<(SideBytes, bool)> {
     if e.new_mode == FileMode::GITLINK {
         return Ok((
             SideBytes::from_bytes(gitlink_line(&e.new_oid).into_bytes()),
@@ -372,7 +404,7 @@ pub(crate) fn load_new_side(
         return Ok((SideBytes::from_bytes(Vec::new()), false));
     }
     let path = e.new_path.as_deref().or(e.old_path.as_deref());
-    load_odb_blob_side_for_diff(odb, &e.new_oid, path, blob_reads, false)
+    load_odb_blob_side_for_diff(odb, &e.new_oid, path, false)
 }
 
 /// Text a gitlink side contributes to a patch: `Subproject commit <hex>\n`,
@@ -400,7 +432,10 @@ fn diff_side_must_read_large_blob(odb: &Odb, path: &str) -> Result<bool> {
     let config = crate::config::ConfigSet::load(
         &crate::environment::Environment::empty(),
         Some(git_dir),
-        true,
+        &crate::config::LoadConfigOptions::standard(
+            &crate::environment::Environment::empty(),
+            Some(git_dir),
+        ),
     )?;
     if diff_textconv_active(git_dir, &config, path) {
         return Ok(true);
@@ -439,9 +474,10 @@ pub(crate) fn side_bytes_after_blob_read(
     data: Vec<u8>,
     retain_binary_payload: bool,
 ) -> (SideBytes, bool) {
-    let binary = data.iter().take(8000).any(|&b| b == 0);
+    let binary = crate::crlf::is_binary(&data);
+    let size = data.len() as u64;
     if binary && !retain_binary_payload {
-        (SideBytes::from_bytes(Vec::new()), true)
+        (SideBytes::unread(size), true)
     } else {
         (SideBytes::from_bytes(data), binary)
     }
@@ -449,7 +485,7 @@ pub(crate) fn side_bytes_after_blob_read(
 
 /// Load ODB blob bytes for diffing, skipping inflation when over `core.bigFileThreshold`.
 ///
-/// Returns empty [`SideBytes`] with `binary = true` when content is not read. When
+/// Returns empty side bytes with `binary = true` when content is not read. When
 /// `force_read_content` is true, large blobs are inflated and binary payload bytes are retained
 /// (for `GIT binary patch` / `git apply`).
 ///
@@ -460,21 +496,20 @@ pub fn load_odb_blob_side_for_diff(
     odb: &Odb,
     oid: &ObjectId,
     path: Option<&str>,
-    blob_reads: Option<&AtomicUsize>,
     force_read_content: bool,
 ) -> Result<(SideBytes, bool)> {
     if *oid == ObjectId::zero() {
-        return Ok((SideBytes::from_bytes(Vec::new()), false));
+        return Ok((SideBytes::unread(0), false));
     }
     if !force_read_content {
         let info = odb.read_info(oid)?;
         if info.kind == ObjectKind::Blob
             && treat_side_as_binary_without_reading(odb, info.size, path, false)?
         {
-            return Ok((SideBytes::from_bytes(Vec::new()), true));
+            return Ok((SideBytes::unread(info.size), true));
         }
     }
-    note_blob_read(blob_reads);
+    note_blob_read();
     #[cfg(test)]
     odb.hot_path_metrics().record_blob_content_read();
     let data = odb.read(oid)?.data;
@@ -484,8 +519,9 @@ pub fn load_odb_blob_side_for_diff(
 /// Classify raw blob bytes for line diffs (NUL in the first 8 KiB ⇒ binary).
 #[must_use]
 pub fn bytes_for_diff(data: Vec<u8>) -> (SideBytes, bool) {
-    if data.iter().take(8000).any(|&b| b == 0) {
-        (SideBytes::from_bytes(Vec::new()), true)
+    let size = data.len() as u64;
+    if crate::crlf::is_binary(&data) {
+        (SideBytes::unread(size), true)
     } else {
         (SideBytes::from_bytes(data), false)
     }
@@ -502,13 +538,13 @@ mod tests {
 
     fn init_repo() -> (tempfile::TempDir, Repository) {
         let dir = tempfile::tempdir().expect("tempdir");
-        let repo = Repository::init(dir.path(), &InitOptions::default()).expect("init");
+        let (repo, _) = Repository::init(dir.path(), &InitOptions::default()).expect("init");
         (dir, repo)
     }
 
     fn init_repo_with_core_config(snippet: &str) -> (tempfile::TempDir, Repository) {
         let dir = tempfile::tempdir().expect("tempdir");
-        let repo = Repository::init(dir.path(), &InitOptions::default()).expect("init");
+        let (repo, _) = Repository::init(dir.path(), &InitOptions::default()).expect("init");
         std::fs::write(repo.git_dir().join("config"), snippet).expect("config");
         (dir, repo)
     }
@@ -541,7 +577,7 @@ mod tests {
             .expect("tree b");
         let raw = diff_trees(odb, Some(&tree_a), Some(&tree_b), "").expect("diff");
         assert_eq!(raw.len(), 2);
-        let config = repo.config().expect("config");
+        let config = repo.config().snapshot().expect("config");
         let serial = tree_diff_contents_parallel(
             odb,
             raw.clone(),
@@ -610,20 +646,89 @@ mod tests {
     }
 
     #[test]
-    fn single_entry_runs_serially_without_consulting_the_policy() {
+    fn small_entry_counts_run_serially_without_consulting_the_policy() {
         let config = ConfigSet::new();
         let policy = ThreadPolicy::with_threads_override(Some(4));
-        for count in [0, 1] {
+        for count in [0, 1, 2, PER_ENTRY_POOL_MIN_ITEMS - 1] {
             let opts = per_entry_parallel_options(&policy, &config, count);
-            assert_eq!(opts.threads, NonZeroUsize::MIN);
+            assert_eq!(opts.threads, NonZeroUsize::MIN, "{count} entries");
         }
-        let opts = per_entry_parallel_options(&policy, &config, 2);
-        assert_eq!(opts.min_items, 0);
-        assert_eq!(opts.min_total_bytes, None);
+        for count in [PER_ENTRY_POOL_MIN_ITEMS, PER_ENTRY_POOL_MIN_ITEMS * 4] {
+            let opts = per_entry_parallel_options(&policy, &config, count);
+            assert_eq!(opts.min_items, 0);
+            assert_eq!(opts.min_total_bytes, None);
+            assert_eq!(
+                opts.threads,
+                policy.resolve(ParallelOp::DiffContent, &config).threads
+            );
+        }
+    }
+
+    #[test]
+    fn min_items_override_moves_the_pool_threshold() {
+        let config = ConfigSet::new();
+        let threads = ThreadPolicy::with_threads_override(Some(4))
+            .resolve(ParallelOp::DiffContent, &config)
+            .threads;
+        let forced = ThreadPolicy::with_threads_override(Some(4)).min_items_override(Some(0));
         assert_eq!(
-            opts.threads,
-            policy.resolve(ParallelOp::DiffContent, &config).threads
+            per_entry_parallel_options(&forced, &config, 1).threads,
+            NonZeroUsize::MIN
         );
+        assert_eq!(
+            per_entry_parallel_options(&forced, &config, 2).threads,
+            threads
+        );
+        let raised = ThreadPolicy::with_threads_override(Some(4)).min_items_override(Some(100));
+        assert_eq!(
+            per_entry_parallel_options(&raised, &config, 99).threads,
+            NonZeroUsize::MIN
+        );
+        assert_eq!(
+            per_entry_parallel_options(&raised, &config, 100).threads,
+            threads
+        );
+    }
+
+    #[test]
+    fn structured_diff_below_and_above_pool_threshold_matches_serial() {
+        let (_dir, repo) = init_repo();
+        let odb = repo.odb();
+        let tree_of = |version: &str, files: usize| {
+            let entries: Vec<TreeEntry> = (0..files)
+                .map(|i| TreeEntry {
+                    mode: 0o100644,
+                    name: format!("f{i:03}.txt").into_bytes(),
+                    oid: odb
+                        .write(
+                            ObjectKind::Blob,
+                            format!("file {i}\n{version}\nend\n").as_bytes(),
+                        )
+                        .expect("blob"),
+                })
+                .collect();
+            odb.write(ObjectKind::Tree, &serialize_tree(&entries))
+                .expect("tree")
+        };
+        let config = repo.config().snapshot().expect("config");
+        for files in [PER_ENTRY_POOL_MIN_ITEMS - 1, PER_ENTRY_POOL_MIN_ITEMS + 1] {
+            let (old, new) = (tree_of("old", files), tree_of("new", files));
+            let entries = diff_trees(odb, Some(&old), Some(&new), "").expect("entries");
+            assert_eq!(entries.len(), files);
+            let run = |threads| {
+                tree_diff_structured_parallel(
+                    odb,
+                    entries.clone(),
+                    &config,
+                    &ThreadPolicy::with_threads_override(Some(threads)),
+                    DiffOptions::default(),
+                )
+                .expect("structured diff")
+            };
+            let serial = run(1);
+            assert_eq!(serial, run(4), "{files} files");
+            assert!(serial.iter().all(|f| f.structured.hunks.len() == 1));
+        }
     }
 
     #[test]
@@ -713,7 +818,7 @@ mod tests {
         let metrics = odb.hot_path_metrics();
         metrics.set_blob_counting(true);
         metrics.reset_blob_content_reads();
-        let config = repo.config().expect("config");
+        let config = repo.config().snapshot().expect("config");
         let _ = tree_diff_stat_parallel(
             odb,
             entries,
@@ -759,7 +864,7 @@ mod tests {
         let metrics = odb.hot_path_metrics();
         metrics.set_blob_counting(true);
         metrics.reset_blob_content_reads();
-        let config = repo.config().expect("config");
+        let config = repo.config().snapshot().expect("config");
         let _ = tree_diff_stat_parallel(
             odb,
             entries,
@@ -805,7 +910,7 @@ mod tests {
         let metrics = odb.hot_path_metrics();
         metrics.set_blob_counting(true);
         metrics.reset_blob_content_reads();
-        let config = repo.config().expect("config");
+        let config = repo.config().snapshot().expect("config");
         let _ = tree_diff_stat_parallel(
             odb,
             entries,
@@ -840,7 +945,7 @@ mod tests {
         let (old, new) = (tree(a), tree(b));
         let entries = diff_trees(odb, Some(&old), Some(&new), "").expect("entries");
         assert_eq!(entries.len(), 1);
-        let config = repo.config().expect("config");
+        let config = repo.config().snapshot().expect("config");
         let run = |threads| {
             tree_diff_structured_parallel(
                 odb,

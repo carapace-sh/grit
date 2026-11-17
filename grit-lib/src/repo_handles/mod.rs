@@ -9,36 +9,39 @@
 //! use grit_lib::repo::{InitOptions, Repository};
 //! # fn main() -> grit_lib::error::Result<()> {
 //! let dir = tempfile::tempdir()?;
-//! let _repo = Repository::init(dir.path(), &InitOptions::default())?;
+//! let (_repo, _) = Repository::init(dir.path(), &InitOptions::default())?;
 //! let _ = _repo.remotes();
 //!
 //! # Ok(())
 //! # }
 //! ```
 
+mod branches;
 mod bundle;
+mod checkout;
 mod hooks;
 mod notes;
 mod reflog;
 mod remote;
 mod remote_rename;
 mod stash;
+mod tags;
 mod workspace_snapshot;
 mod worktree;
 
 pub use crate::reflog::MessageMatcher;
-pub use crate::remote::{
-    InspectOptions, RemoteBranchState, RemoteBranchStateKind, RemotePullBranch, RemoteSummary,
-};
+pub use crate::snapshot_checkout::handle::RepositorySnapshotCheckouts;
+pub use branches::Branches;
 pub use bundle::RepositoryBundles;
+pub use checkout::Checkout;
 pub use hooks::{HookInfo, HookSource, RepositoryHooks};
 pub use notes::{
     Note, NoteAddOutcome, NoteAddPlan, NoteListing, NoteRemoveManyPlan, NoteRemovePlan,
     NotesWriteOptions, RepositoryNotes,
 };
 pub use reflog::{
-    ExpireOptions, IndexedReflogEntry, RefExpireResult, ReflogExpireOutcome, ReflogPage,
-    ReflogQuery, RepositoryReflogs,
+    ExpireOptions, IndexedReflogEntry, RefExpireResult, ReflogCreate, ReflogExpireOutcome,
+    ReflogPage, ReflogQuery, RepositoryReflogs,
 };
 pub use remote::has_remote_section;
 pub use remote::{
@@ -48,5 +51,15 @@ pub use remote::{
 };
 pub use remote_rename::RemoteRename;
 pub use stash::RepositoryStash;
+pub use tags::{TagListOptions, Tags};
 pub use workspace_snapshot::RepositoryWorkspaceSnapshot;
 pub use worktree::{LockWorktreeOptions, RepositoryWorktrees};
+
+/// Short alias for [`RepositoryBundles`].
+pub type Bundles<'repo> = RepositoryBundles<'repo>;
+/// Short alias for [`RepositorySnapshotCheckouts`].
+pub type SnapshotCheckouts<'repo> = RepositorySnapshotCheckouts<'repo>;
+/// Short alias for [`RepositoryRemotes`].
+pub type Remotes<'repo> = RepositoryRemotes<'repo>;
+/// Short alias for [`RepositoryWorktrees`].
+pub type Worktrees<'repo> = RepositoryWorktrees<'repo>;

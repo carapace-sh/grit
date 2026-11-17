@@ -16,10 +16,11 @@ use grit_lib::diff::merge_file::MergeFavor;
 use grit_lib::diff::merge_trees::{
     merge_trees_three_way, TreeMergeConflictPresentation, WhitespaceMergeOptions,
 };
+use grit_lib::merge::IntegrateBranchOutcome;
 use grit_lib::objects::ObjectId;
-use grit_lib::porcelain::merge::{integrate_branch, IntegrateBranchOutcome};
 use grit_lib::repo::Repository;
 use grit_test_support::git;
+use grit_test_support::integrate_branch;
 
 const FILES: usize = 20_000;
 // Fresh-process debug measurements: loose tree/full merges use about 56/59 MiB;
@@ -82,7 +83,7 @@ fn content_merge_child() {
                 other,
                 "feat",
                 &mut grit_lib::progress::NullProgress,
-                &grit_lib::progress::NeverCancel
+                &grit_lib::progress::CancelToken::never()
             )
             .expect("merge"),
             IntegrateBranchOutcome::Merged { .. }

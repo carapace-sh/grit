@@ -6,6 +6,7 @@
 //! system `git`.
 
 use crate::support;
+use grit_lib::progress::NullProgress;
 
 use std::fs;
 use std::path::Path;
@@ -14,9 +15,8 @@ use std::thread;
 use std::time::Duration;
 
 use grit_lib::error::Error;
-use grit_lib::porcelain::add::{stage, stage_on_index, StageOptions};
+use grit_lib::porcelain::add::StageOptions;
 use grit_lib::porcelain::paths::{remove_paths, RemoveOptions};
-use grit_lib::porcelain::stage_tracked::stage_tracked_modifications;
 use grit_lib::progress::NullProgress;
 
 use support::{assert_git_fsck_strict, git, git_ls_files_stage0_map, open_grit_repo};
@@ -40,23 +40,25 @@ fn stage_paths(paths: &[&str]) -> StageOptions {
 }
 
 fn is_lock_contention(err: &Error) -> bool {
-    matches!(err, Error::LockHeld { .. })
+    matches!(err, Error::LockHeld(..))
 }
 
 /// Stage `path` into the on-disk index from outside grit's staging entry points, while the
 /// caller already holds `index.lock`: what a concurrent `grit add` / `git add` would leave behind.
 fn write_entry_under_lock(dir: &Path, path: &str, lock: &mut grit_lib::index::IndexLock) {
     let repo = open_grit_repo(dir);
-    let handle = repo.index_handle();
-    let mut index = handle.load().expect("load index under lock");
-    stage_on_index(
-        &repo,
-        &mut index,
-        &stage_paths(&[path]),
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("stage in memory");
+    let handle = repo.index();
+    let mut index = handle
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("load index under lock");
+    repo.index()
+        .stage_on(
+            &mut index,
+            &stage_paths(&[path]),
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("stage in memory");
     handle
         .commit_update(lock, &mut index, false)
         .expect("commit held lock");
@@ -75,13 +77,14 @@ fn run_parallel_stage(dir: &Path, writers: usize) -> Vec<(String, Result<(), Err
                 let path = format!("n{i}.txt");
                 let repo = open_grit_repo(&dir);
                 start.wait();
-                let res = stage(
-                    &repo,
-                    &stage_paths(&[&path]),
-                    &mut NullProgress,
-                    &grit_lib::progress::NeverCancel,
-                )
-                .map(|_| ());
+                let res = repo
+                    .index()
+                    .stage(
+                        &stage_paths(&[&path]),
+                        &mut NullProgress,
+                        &grit_lib::progress::CancelToken::never(),
+                    )
+                    .map(|_| ());
                 (path, res)
             })
         })
@@ -148,18 +151,18 @@ fn stage_reads_index_after_waiting_for_lock() {
     fs::write(dir.join("b.txt"), "b\n").expect("write b");
 
     let repo = open_grit_repo(dir);
-    let mut lock = repo.index_handle().begin_update().expect("hold index.lock");
+    let mut lock = repo.index().begin_update().expect("hold index.lock");
 
     let racer_dir = dir.to_path_buf();
     let racer = thread::spawn(move || {
         let repo = open_grit_repo(&racer_dir);
-        stage(
-            &repo,
-            &stage_paths(&["b.txt"]),
-            &mut NullProgress,
-            &grit_lib::progress::NeverCancel,
-        )
-        .map(|o| o.added)
+        repo.index()
+            .stage(
+                &stage_paths(&["b.txt"]),
+                &mut NullProgress,
+                &grit_lib::progress::CancelToken::never(),
+            )
+            .map(|o| o.added)
     });
     thread::sleep(HOLD_LOCK_FOR);
     write_entry_under_lock(dir, "a.txt", &mut lock);
@@ -185,7 +188,7 @@ fn remove_reads_index_after_waiting_for_lock() {
     fs::write(dir.join("a.txt"), "a\n").expect("write a");
 
     let repo = open_grit_repo(dir);
-    let mut lock = repo.index_handle().begin_update().expect("hold index.lock");
+    let mut lock = repo.index().begin_update().expect("hold index.lock");
 
     let racer_dir = dir.to_path_buf();
     let racer = thread::spawn(move || {
@@ -196,7 +199,11 @@ fn remove_reads_index_after_waiting_for_lock() {
             force: true,
             ..RemoveOptions::default()
         };
-        remove_paths(&repo, &opts).map(|o| o.removed)
+        repo.checkout()
+            .opts
+            .checkout()
+            .remove_paths(&grit_lib::progress::CancelToken::never())
+            .map(|o| o.removed)
     });
     thread::sleep(HOLD_LOCK_FOR);
     write_entry_under_lock(dir, "a.txt", &mut lock);
@@ -223,13 +230,15 @@ fn stage_tracked_reads_index_after_waiting_for_lock() {
     fs::write(dir.join("base"), "changed\n").expect("modify base");
 
     let repo = open_grit_repo(dir);
-    let mut lock = repo.index_handle().begin_update().expect("hold index.lock");
+    let mut lock = repo.index().begin_update().expect("hold index.lock");
 
     let racer_dir = dir.to_path_buf();
     let racer = thread::spawn(move || {
         let repo = open_grit_repo(&racer_dir);
         let work_tree = repo.work_tree().expect("work tree").to_path_buf();
-        stage_tracked_modifications(&repo, &work_tree).map(|s| s.modified)
+        repo.index()
+            .stage_tracked_modifications(&work_tree)
+            .map(|s| s.modified)
     });
     thread::sleep(HOLD_LOCK_FOR);
     write_entry_under_lock(dir, "a.txt", &mut lock);
@@ -257,14 +266,15 @@ fn stage_fails_without_writing_when_lock_stays_held() {
     fs::write(dir.join("a.txt"), "a\n").expect("write a");
 
     let repo = open_grit_repo(dir);
-    let lock = repo.index_handle().begin_update().expect("hold index.lock");
-    let err = stage(
-        &repo,
-        &stage_paths(&["a.txt"]),
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect_err("stage must not proceed while index.lock is held");
+    let lock = repo.index().begin_update().expect("hold index.lock");
+    let err = repo
+        .index()
+        .stage(
+            &stage_paths(&["a.txt"]),
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect_err("stage must not proceed while index.lock is held");
     assert!(is_lock_contention(&err), "unexpected error {err}");
     drop(lock);
 

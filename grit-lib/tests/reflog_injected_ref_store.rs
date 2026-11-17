@@ -2,6 +2,7 @@
 //! reflog through the repository's ref store (issue #2131): an injected store lists, deletes
 //! and expires its own reflog.
 
+use grit_lib::error::RefError;
 use std::fs;
 use std::ops::ControlFlow;
 use std::path::Path;
@@ -9,13 +10,13 @@ use std::sync::Arc;
 
 use grit_lib::config::environment::{Environment, RepositoryOptions};
 use grit_lib::error::Error;
-use grit_lib::objects::odb::{store::MemoryStore, OdbBuilder};
+use grit_lib::objects::odb::store::MemoryStore;
 use grit_lib::objects::{HashAlgo, ObjectId};
-use grit_lib::porcelain::add::{stage, StageOptions};
-use grit_lib::porcelain::commit::{commit_with_scope, CommitScope};
+use grit_lib::porcelain::add::StageOptions;
+use grit_lib::porcelain::commit::CommitScope;
 use grit_lib::progress::NullProgress;
-use grit_lib::refs::store::{MemoryRefStore, RefName, RefStore};
-use grit_lib::repo::{Repository, RepositoryBuilder};
+use grit_lib::refs::store::{MemoryRefStore, RefName, RefNameRef, RefStore};
+use grit_lib::repo::Repository;
 use grit_lib::repo_handles::{ExpireOptions, ReflogQuery};
 
 const IDENT_TS: &str = "T <t@e.x> 1700000000 +0000";
@@ -37,16 +38,15 @@ fn open_injected(root: &Path) -> (Repository, Arc<MemoryRefStore>) {
     )
     .expect("config");
     let store = Arc::new(MemoryRefStore::new());
-    let repo = RepositoryBuilder::new(RepositoryOptions::with_environment(environment()))
-        .odb_builder(
-            OdbBuilder::files(git_dir.join("objects"))
-                .primary(Arc::new(MemoryStore::new(HashAlgo::Sha1)))
-                .alternates(false),
-        )
-        .ref_store(store.clone())
-        .initial_branch("main")
-        .open(&git_dir, Some(&work_tree))
-        .expect("open with injected stores");
+    let repo = Repository::open(
+        &git_dir,
+        &(RepositoryOptions::with_environment(environment())
+            .with_object_store(Arc::new(MemoryStore::new(HashAlgo::Sha1)))
+            .with_ref_store(store.clone())
+            .with_initial_branch("main")
+            .with_work_tree(&work_tree)),
+    )
+    .expect("open with injected stores");
     (repo, store)
 }
 
@@ -54,22 +54,24 @@ fn commit_n(repo: &Repository, work_tree: &Path, n: usize) -> Vec<ObjectId> {
     (0..n)
         .map(|i| {
             fs::write(work_tree.join("a"), format!("{i}\n")).expect("write");
-            stage(
-                repo,
-                &StageOptions::default(),
-                &mut NullProgress,
-                &grit_lib::progress::NeverCancel,
-            )
-            .expect("stage");
-            commit_with_scope(
-                repo,
-                &grit_test_support::commit_request(format!("c{i}"), IDENT_TS),
-                CommitScope::Staged,
-                &mut NullProgress,
-                &grit_lib::progress::NeverCancel,
-            )
-            .expect("commit")
-            .oid
+            repo.index()
+                .stage(
+                    &StageOptions::default(),
+                    &mut NullProgress,
+                    &grit_lib::progress::CancelToken::never(),
+                )
+                .expect("stage");
+            repo.commits()
+                .create(
+                    &grit_lib::commits::CommitOptions::new(
+                        grit_test_support::commit_request(format!("c{i}"), IDENT_TS),
+                        CommitScope::Staged,
+                    ),
+                    &mut NullProgress,
+                    &grit_lib::progress::CancelToken::never(),
+                )
+                .expect("commit")
+                .oid
         })
         .collect()
 }
@@ -77,7 +79,7 @@ fn commit_n(repo: &Repository, work_tree: &Path, n: usize) -> Vec<ObjectId> {
 fn store_count(store: &dyn RefStore, name: &str) -> usize {
     let mut n = 0;
     store
-        .for_each_reflog_entry(name, false, &mut |_| {
+        .for_each_reflog_entry(RefNameRef::from_trusted(name), false, &mut |_| {
             n += 1;
             ControlFlow::Continue(())
         })
@@ -108,10 +110,10 @@ fn injected_store_reflog_is_listed_and_read() {
 
     let names: Vec<String> = repo
         .reflogs()
-        .refs()
-        .expect("refs")
-        .iter()
-        .map(ToString::to_string)
+        .list_reflog_refs()
+        .expect("list reflog refs")
+        .into_iter()
+        .map(|r| r.to_string())
         .collect();
     assert_eq!(names, ["HEAD", "refs/heads/main"]);
 
@@ -162,7 +164,9 @@ fn injected_store_unknown_ref_is_a_typed_error() {
     commit_n(&repo, &tmp.path().join("wt"), 1);
     let missing = RefName::try_from("refs/heads/missing").expect("name");
     match repo.reflogs().entries(&missing) {
-        Err(Error::ReflogUnknownRef { refname }) => assert_eq!(refname, "refs/heads/missing"),
+        Err(Error::Ref(RefError::ReflogUnknownRef { refname })) => {
+            assert_eq!(refname, "refs/heads/missing")
+        }
         other => panic!("expected ReflogUnknownRef, got {other:?}"),
     }
 }
@@ -194,7 +198,7 @@ fn injected_store_delete_rewrites_the_store() {
     );
 
     match repo.reflogs().delete(&head(), &[5], false) {
-        Err(Error::ReflogIndexOutOfRange { refname, index }) => {
+        Err(Error::Ref(RefError::ReflogIndexOutOfRange { refname, index })) => {
             assert_eq!((refname.as_str(), index), ("HEAD", 5));
         }
         other => panic!("expected ReflogIndexOutOfRange, got {other:?}"),

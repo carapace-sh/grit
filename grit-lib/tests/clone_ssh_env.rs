@@ -8,9 +8,8 @@ use std::process::Command;
 
 use grit_lib::config::environment::{Environment, RepositoryOptions};
 use grit_lib::config::{ConfigFile, ConfigScope};
-use grit_lib::progress::NeverCancel;
+use grit_lib::progress::{CancelToken, NullProgress};
 use grit_lib::remote::clone::{clone, CloneOptions};
-use grit_lib::remote::fetch::NoProgress;
 use grit_lib::remote::transfer::{FetchOptions, TagMode};
 use grit_lib::remote::{ListRefsOptions, Remote};
 use grit_lib::repo::Repository;
@@ -126,7 +125,7 @@ fn clone_uses_git_ssh_command() {
     let mut opts = CloneOptions::new(url, tmp.path().join("dest"));
     opts.environment = env_with_ssh_var("GIT_SSH_COMMAND", script.to_str().unwrap());
 
-    clone(opts, &mut NoProgress, &NeverCancel, None).expect("clone");
+    clone(opts, &mut NullProgress, &CancelToken::never(), None).expect("clone");
     let calls = std::fs::read_to_string(&log).expect("log");
     assert!(
         !calls.trim().is_empty(),
@@ -145,7 +144,7 @@ fn clone_uses_git_ssh_program() {
     let mut opts = CloneOptions::new(url, tmp.path().join("dest"));
     opts.environment = env_with_ssh_var("GIT_SSH", script.to_str().unwrap());
 
-    clone(opts, &mut NoProgress, &NeverCancel, None).expect("clone");
+    clone(opts, &mut NullProgress, &CancelToken::never(), None).expect("clone");
     let calls = std::fs::read_to_string(&log).expect("log");
     assert!(
         !calls.trim().is_empty(),
@@ -185,13 +184,13 @@ fn fetch_with_default_options_uses_repository_git_ssh_command() {
     )
     .unwrap();
 
-    let remote = Remote::from_config(&repo.config().unwrap(), "origin").unwrap();
+    let remote = Remote::from_config(&repo.config().snapshot().unwrap(), "origin").unwrap();
     remote
         .fetch(
             &repo,
             FetchOptions::default(),
-            &mut NoProgress,
-            &NeverCancel,
+            &mut NullProgress,
+            &CancelToken::never(),
             None,
         )
         .expect("fetch");
@@ -237,18 +236,17 @@ fn fetch_honors_core_ssh_command_when_env_unset() {
     )
     .unwrap();
 
-    let remote = Remote::from_config(&repo.config().unwrap(), "origin").unwrap();
+    let remote = Remote::from_config(&repo.config().snapshot().unwrap(), "origin").unwrap();
+    let mut fetch_opts = FetchOptions::new();
+    fetch_opts.refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()];
+    fetch_opts.tags = TagMode::Following;
+    fetch_opts.environment = Environment::empty();
     remote
         .fetch(
             &repo,
-            FetchOptions {
-                refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()],
-                tags: TagMode::Following,
-                environment: Environment::empty(),
-                ..Default::default()
-            },
-            &mut NoProgress,
-            &NeverCancel,
+            fetch_opts,
+            &mut NullProgress,
+            &CancelToken::never(),
             None,
         )
         .expect("fetch");

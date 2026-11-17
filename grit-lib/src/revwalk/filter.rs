@@ -14,7 +14,7 @@
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! let dir = tempfile::tempdir()?;
-//! let repo = Repository::init(dir.path(), &InitOptions::default())?;
+//! let (repo, _) = Repository::init(dir.path(), &InitOptions::default())?;
 //! let filter = CommitFilterBuilder::new()
 //!     .author("Alice")
 //!     .build()?;
@@ -24,6 +24,7 @@
 //! # }
 //! ```
 
+use crate::error::ObjectError;
 use std::borrow::Cow;
 use std::sync::Arc;
 
@@ -39,18 +40,18 @@ use crate::repo::Repository;
 
 /// A single user-supplied match pattern (BRE or fixed string).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Pattern(String);
+pub(crate) struct Pattern(String);
 
 impl Pattern {
-    /// Wrap a pattern string from the caller.
     #[must_use]
-    pub fn new(raw: impl Into<String>) -> Self {
+    #[allow(dead_code)] // used by unit tests in this module
+    pub(crate) fn new(raw: impl Into<String>) -> Self {
         Self(raw.into())
     }
 
     /// Borrow the raw pattern text.
     #[must_use]
-    pub fn as_str(&self) -> &str {
+    pub(crate) fn as_str(&self) -> &str {
         &self.0
     }
 }
@@ -69,6 +70,7 @@ impl From<&str> for Pattern {
 
 /// Invalid commit-filter pattern or compilation failure.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum CommitFilterError {
     /// A pattern could not be compiled.
     #[error("invalid commit filter pattern `{pattern}`: {detail}")]
@@ -97,12 +99,6 @@ struct CommitFilterInner {
 }
 
 impl CommitFilter {
-    /// Start building a filter.
-    #[must_use]
-    pub fn builder() -> CommitFilterBuilder {
-        CommitFilterBuilder::new()
-    }
-
     /// Returns true when any author, committer, or grep pattern is configured.
     #[must_use]
     pub fn is_active(&self) -> bool {
@@ -110,18 +106,26 @@ impl CommitFilter {
         i.author.is_some() || i.committer.is_some() || !i.grep.is_empty()
     }
 
+    /// Whether matching may inspect bytes beyond the first subject line (for example `--grep`).
+    ///
+    /// Walks that keep only a through-subject prefix for traversal must still load whole
+    /// objects when this is true so [`Self::matches_bytes`] can search the full message body.
+    #[must_use]
+    pub(crate) fn needs_full_commit_bytes(&self) -> bool {
+        !self.inner.grep.is_empty()
+    }
+
     /// Test whether `oid` satisfies this filter (author/committer/grep/mailmap rules).
     ///
     /// # Errors
     ///
     /// Returns repository and object read errors from the ODB.
-    pub fn matches(&self, repo: &Repository, oid: ObjectId) -> Result<bool> {
+    pub(crate) fn matches(&self, repo: &Repository, oid: ObjectId) -> Result<bool> {
         let object = repo.odb().read(&oid)?;
         if object.kind != ObjectKind::Commit {
-            return Err(Error::CorruptObject(format!(
-                "expected commit object for {oid}, found {:?}",
-                object.kind
-            )));
+            return Err(Error::Object(ObjectError::Corrupt {
+                detail: format!("expected commit object for {oid}, found {:?}", object.kind),
+            }));
         }
         Ok(self.matches_bytes(&object.data))
     }
@@ -184,22 +188,22 @@ impl CommitFilterBuilder {
 
     /// Add an `--author` pattern (multiple patterns OR together).
     #[must_use]
-    pub fn author(mut self, pattern: impl Into<Pattern>) -> Self {
-        self.author.push(pattern.into());
+    pub fn author(mut self, pattern: impl Into<String>) -> Self {
+        self.author.push(Pattern(pattern.into()));
         self
     }
 
     /// Add a `--committer` pattern (multiple patterns OR together).
     #[must_use]
-    pub fn committer(mut self, pattern: impl Into<Pattern>) -> Self {
-        self.committer.push(pattern.into());
+    pub fn committer(mut self, pattern: impl Into<String>) -> Self {
+        self.committer.push(Pattern(pattern.into()));
         self
     }
 
     /// Add a `--grep` pattern (OR unless [`Self::all_match`], then AND).
     #[must_use]
-    pub fn grep(mut self, pattern: impl Into<Pattern>) -> Self {
-        self.grep.push(pattern.into());
+    pub fn grep(mut self, pattern: impl Into<String>) -> Self {
+        self.grep.push(Pattern(pattern.into()));
         self
     }
 

@@ -1,248 +1,403 @@
-//! Typed failures for linked worktree add, remove, move, lock and repair.
+//! Worktree-area failures: checkout, paths, pathspecs, filters, and linked worktrees.
 
-use std::fmt;
-use std::path::PathBuf;
+pub use super::linked_worktree_error::{LinkedWorktreeError, LinkedWorktreeOperation};
 
-use crate::git_path::user_display_path;
+#[cfg(doc)]
+use crate::error::Error;
+use crate::error::{
+    AttrPathspecError, ErrorSummary, FilterError, OverwriteReason, PathOutsideRepoError,
+    PathspecFromFileParseError, SubmoduleError, WorktreeOperation as DirtyWorktreeOperation,
+};
 
-/// Linked worktree mutation that was pointed at the main working tree.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WorktreeOperation {
-    /// [`remove_linked_worktree`](crate::worktree::remove_linked_worktree).
-    Remove,
-    /// [`move_linked_worktree`](crate::worktree::move_linked_worktree).
-    Move,
-    /// [`RepositoryWorktrees::lock`](crate::repo_handles::RepositoryWorktrees::lock).
-    Lock,
-    /// [`RepositoryWorktrees::unlock`](crate::repo_handles::RepositoryWorktrees::unlock).
-    Unlock,
+/// Worktree-area failure (checkout, status, add/rm/mv/restore/clean, pathspec, filters, linked worktrees).
+///
+/// Surfaced on the umbrella as [`Error::Worktree`](crate::error::Error::Worktree).
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum WorktreeError {
+    /// Linked worktree registry add/remove/move/lock/repair failure.
+    #[error(transparent)]
+    Linked(#[from] LinkedWorktreeError),
+
+    /// Filesystem I/O on a repository-relative worktree path.
+    #[error("{0}")]
+    PathIo(#[from] crate::error::PathIoError),
+
+    /// A worktree file changed while it was being hashed and stored.
+    #[error("{path} changed while it was being added")]
+    FileChanged {
+        /// Index-relative path of the file.
+        path: String,
+    },
+
+    /// General path resolution failure (invalid UTF-8, out-of-bounds, etc.).
+    #[error("path error: {detail}")]
+    Path {
+        /// What went wrong with the path.
+        detail: String,
+    },
+
+    /// A path that must be UTF-8 for this operation is not.
+    #[error("path is not valid UTF-8: {path}")]
+    NonUtf8Path {
+        /// The path with invalid bytes replaced.
+        path: String,
+    },
+
+    /// A path string failed validation (legacy invalid-path checks).
+    #[error("invalid path '{path}'")]
+    InvalidPath {
+        /// Offending path text.
+        path: String,
+    },
+
+    /// A repository-relative path failed component validation.
+    #[error("invalid path '{path}': {reason}")]
+    InvalidPathComponent {
+        /// Full repository-relative path that was rejected.
+        path: String,
+        /// Which component rule failed.
+        reason: crate::path_validate::PathComponentError,
+    },
+
+    /// Path resolves outside the repository.
+    #[error(transparent)]
+    OutsideRepo(#[from] PathOutsideRepoError),
+
+    /// `--pathspec-from-file` parse failure.
+    #[error(transparent)]
+    PathspecFromFile(#[from] PathspecFromFileParseError),
+
+    /// Malformed `:(attr:...)` pathspec magic.
+    #[error("invalid attr magic in pathspec '{spec}': {reason}")]
+    InvalidAttrPathspec {
+        /// The offending pathspec as given.
+        spec: String,
+        /// What is wrong with its attr clause.
+        #[source]
+        reason: AttrPathspecError,
+    },
+
+    /// Pathspec matched no tracked or indexed file.
+    #[error("pathspec '{spec}' did not match any file(s) known to git")]
+    PathspecNoMatch {
+        /// User-supplied pathspec that matched nothing.
+        spec: String,
+    },
+
+    /// Literal pathspec crosses a symlink directory component.
+    #[error("pathspec '{spec}' is beyond a symbolic link")]
+    PathspecBeyondSymlink {
+        /// User-supplied pathspec that crosses a symlink directory.
+        spec: String,
+    },
+
+    /// Explicit pathspecs name ignored paths.
+    #[error("the following paths are ignored:\n{}", paths.join("\n"))]
+    PathspecIgnored {
+        /// Repository-relative paths that cannot be staged while ignored.
+        paths: Vec<String>,
+    },
+
+    /// Restore conflict options combined with `--staged`.
+    #[error("conflict restore options cannot be used with --staged")]
+    RestoreConflictWithStaged,
+
+    /// Restore conflict options combined with `--source`.
+    #[error("conflict restore options cannot be used with --source")]
+    RestoreConflictWithSource,
+
+    /// Missing "theirs" stage for a conflict restore path.
+    #[error("path '{path}' does not have their version")]
+    RestoreConflictMissingTheirs {
+        /// Repository-relative path.
+        path: String,
+    },
+
+    /// Missing "ours" stage for a conflict restore path.
+    #[error("path '{path}' does not have our version")]
+    RestoreConflictMissingOurs {
+        /// Repository-relative path.
+        path: String,
+    },
+
+    /// Path is not unmerged when remerge was requested.
+    #[error("path '{path}' is not unmerged")]
+    RestoreConflictNotUnmerged {
+        /// Repository-relative path.
+        path: String,
+    },
+
+    /// Worktree restore requested for paths that still have conflict stages.
+    #[error("{}", crate::error::restore_unmerged_message(paths))]
+    RestorePathUnmerged {
+        /// Matched repository-relative paths with conflict stages (sorted, deduplicated).
+        paths: Vec<String>,
+    },
+
+    /// Nested `.git` checkout has no commit on its current branch.
+    #[error("embedded git repository '{path}' has no commit checked out")]
+    EmbeddedRepoWithoutCommit {
+        /// Repository-relative path to the nested checkout directory.
+        path: String,
+    },
+
+    /// Remove refused paths with unsaved content without `--force`.
+    #[error(
+        "refusing to remove paths with unsaved content:\n{}",
+        paths.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n")
+    )]
+    RemoveBlocked {
+        /// Each refused path with the reason it was refused.
+        paths: Vec<crate::porcelain::paths::BlockedRemoval>,
+    },
+
+    /// Directory pathspec without `-r` on remove.
+    #[error("not removing '{path}' recursively without -r")]
+    NotRemovingRecursively {
+        /// Directory path that requires `-r`.
+        path: String,
+    },
+
+    /// Remove called with no pathspecs.
+    #[error("you must specify path(s) to remove")]
+    RemovePathsRequired,
+
+    /// Clean refused to remove a directory that contains the current working directory.
+    #[error("refusing to remove '{path}' because it contains the current directory")]
+    RemoveContainsCurrentDirectory {
+        /// Repository-relative directory path.
+        path: String,
+    },
+
+    /// Restore called with no pathspecs.
+    #[error("you must specify path(s) to restore")]
+    RestorePathsRequired,
+
+    /// Restore was asked both to pick a conflict side and to rebuild conflict markers.
+    #[error("cannot combine choosing a conflict side with rebuilding the conflict")]
+    RestoreStageWithRemerge,
+
+    /// Operation requires a checked-out work tree.
+    #[error("this operation must be run in a work tree")]
+    RequiresWorkTree,
+
+    /// Move source is not tracked.
+    #[error("'{src}' is not under version control")]
+    MoveSourceNotTracked {
+        /// Untracked or missing source path.
+        src: String,
+    },
+
+    /// Move destination exists without `--force`.
+    #[error("destination '{destination}' already exists")]
+    MoveDestinationExists {
+        /// Source path in the move request.
+        src: String,
+        /// Existing destination path.
+        destination: String,
+    },
+
+    /// Trailing slash named a destination that is not a directory.
+    #[error("destination '{destination}' is not a directory")]
+    MoveDestinationNotDirectory {
+        /// Destination path (trailing slash already removed).
+        destination: String,
+    },
+
+    /// Destination lies under the source directory.
+    #[error("cannot move '{src}' to a subdirectory of itself, '{destination}'")]
+    MoveIntoSubdirectory {
+        /// Source directory path.
+        src: String,
+        /// Invalid destination under the source.
+        destination: String,
+    },
+
+    /// Source and destination are the same path.
+    #[error("cannot move '{src}' into itself")]
+    MoveIntoSelf {
+        /// Source path.
+        src: String,
+        /// Destination equal to the source.
+        destination: String,
+    },
+
+    /// Source has no index entries to move.
+    #[error("nothing to move from '{src}'")]
+    MoveNothingToMove {
+        /// Source path with no index entries.
+        src: String,
+    },
+
+    /// Multiple sources would move to the same destination.
+    #[error("multiple sources would move to '{destination}'")]
+    MoveDuplicateDestination {
+        /// Destination path that would receive more than one source.
+        destination: String,
+    },
+
+    /// Move source path is missing or not a file, directory, or symlink.
+    #[error("cannot move '{src}' to '{destination}': bad source path")]
+    MoveBadSource {
+        /// Source path.
+        src: String,
+        /// Planned destination path.
+        destination: String,
+    },
+
+    /// Internal invariant: missing index entry during a move.
+    #[error("internal error: missing index entry for '{path}'")]
+    MoveMissingIndexEntry {
+        /// Index path that should exist during a move.
+        path: String,
+    },
+
+    /// Checkout or switch would overwrite local or untracked content.
+    #[error("{message}")]
+    WouldOverwrite {
+        /// Whether tracked local edits or untracked paths block the operation.
+        reason: OverwriteReason,
+        /// Repository-relative paths that would be overwritten (sorted, deduplicated).
+        paths: Vec<String>,
+        /// Human-readable summary (depends on [`OverwriteReason`]).
+        message: String,
+    },
+
+    /// Staged or unstaged changes block an operation that needs a clean worktree.
+    #[error("you have uncommitted changes — commit them before {operation}")]
+    DirtyWorktree {
+        /// The operation that was refused.
+        operation: DirtyWorktreeOperation,
+        /// Repository-relative paths with staged or unstaged changes (sorted, deduplicated).
+        paths: Vec<String>,
+    },
+
+    /// A checkout failed or was cancelled before it finished, and putting the work tree back
+    /// failed for some paths.
+    ///
+    /// Refs and the index are unchanged, as after any failed checkout; only `unrestored`
+    /// differ from the index. [`Error::is_cancelled`] reports whether `source` was a
+    /// cancellation.
+    #[error("{source}; {} work-tree path(s) could not be restored", unrestored.len())]
+    CheckoutRollbackIncomplete {
+        /// Why the checkout stopped.
+        source: ErrorSummary,
+        /// Repository-relative paths left different from the index (sorted, deduplicated).
+        unrestored: Vec<String>,
+    },
+
+    /// A move failed, and putting the work tree back failed too.
+    ///
+    /// The index is unchanged; renames that could not be reversed and forced-destination
+    /// backups that could not be restored are left as they are on disk.
+    #[error("{}", move_rollback_incomplete_message(source, *unreversed, backup_restore.as_ref()))]
+    MoveRollbackIncomplete {
+        /// Why the move stopped.
+        source: ErrorSummary,
+        /// Number of completed renames that could not be reversed.
+        unreversed: usize,
+        /// Why restoring the destinations a forced move replaced failed, when it did.
+        backup_restore: Option<ErrorSummary>,
+    },
+
+    /// Staging refused paths that still contain conflict markers.
+    #[error("unmerged paths still have conflict markers")]
+    UnmergedConflictMarkers {
+        /// Repository-relative paths that were not staged because markers remain.
+        paths: Vec<String>,
+    },
+
+    /// Clean/smudge filter or EOL conversion failure.
+    #[error(transparent)]
+    Filter(#[from] FilterError),
+
+    /// Submodule layout or state failure during worktree operations.
+    #[error(transparent)]
+    Submodule(#[from] SubmoduleError),
 }
 
-impl WorktreeOperation {
-    /// Lowercase verb for the operation (`remove`, `move`, `lock`, `unlock`).
+impl WorktreeError {
+    /// Whether this failure records a cancellation (a checkout whose rollback was incomplete
+    /// after it was cancelled).
     #[must_use]
-    pub fn as_str(self) -> &'static str {
+    pub fn is_cancelled(&self) -> bool {
         match self {
-            Self::Remove => "remove",
-            Self::Move => "move",
-            Self::Lock => "lock",
-            Self::Unlock => "unlock",
+            Self::CheckoutRollbackIncomplete { source, .. }
+            | Self::MoveRollbackIncomplete { source, .. } => source.is_cancelled(),
+            _ => false,
+        }
+    }
+
+    /// Stable snake_case slug for this failure (matches former [`Error::kind_name`] values).
+    #[must_use]
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            Self::Linked(_) => "worktree",
+            Self::PathIo(path_io) => match path_io.operation {
+                crate::error::PathIoOperation::Worktree(_) => "worktree_path_io",
+                crate::error::PathIoOperation::GitDir(_) => "git_dir_path_io",
+            },
+            Self::FileChanged { .. } => "worktree_file_changed",
+            Self::Path { .. } => "path_error",
+            Self::NonUtf8Path { .. } => "non_utf8_path",
+            Self::InvalidPath { .. } => "invalid_path",
+            Self::InvalidPathComponent { .. } => "invalid_path_component",
+            Self::OutsideRepo(_) => "path_outside_repo",
+            Self::PathspecFromFile(_) => "pathspec_from_file",
+            Self::InvalidAttrPathspec { .. } => "invalid_attr_pathspec",
+            Self::PathspecNoMatch { .. } => "pathspec_no_match",
+            Self::PathspecBeyondSymlink { .. } => "pathspec_beyond_symlink",
+            Self::PathspecIgnored { .. } => "pathspec_ignored",
+            Self::RestoreConflictWithStaged => "restore_conflict_with_staged",
+            Self::RestoreConflictWithSource => "restore_conflict_with_source",
+            Self::RestoreConflictMissingTheirs { .. } => "restore_conflict_missing_theirs",
+            Self::RestoreConflictMissingOurs { .. } => "restore_conflict_missing_ours",
+            Self::RestoreConflictNotUnmerged { .. } => "restore_conflict_not_unmerged",
+            Self::RestorePathUnmerged { .. } => "restore_path_unmerged",
+            Self::EmbeddedRepoWithoutCommit { .. } => "embedded_repo_without_commit",
+            Self::RemoveBlocked { .. } => "remove_blocked",
+            Self::NotRemovingRecursively { .. } => "not_removing_recursively",
+            Self::RemovePathsRequired => "remove_paths_required",
+            Self::RemoveContainsCurrentDirectory { .. } => "remove_contains_current_directory",
+            Self::RestorePathsRequired => "restore_paths_required",
+            Self::RestoreStageWithRemerge => "restore_stage_with_remerge",
+            Self::MoveRollbackIncomplete { .. } => "move_rollback_incomplete",
+            Self::RequiresWorkTree => "requires_work_tree",
+            Self::MoveSourceNotTracked { .. } => "move_source_not_tracked",
+            Self::MoveDestinationExists { .. } => "move_destination_exists",
+            Self::MoveDestinationNotDirectory { .. } => "move_destination_not_directory",
+            Self::MoveIntoSubdirectory { .. } => "move_into_subdirectory",
+            Self::MoveIntoSelf { .. } => "move_into_self",
+            Self::MoveNothingToMove { .. } => "move_nothing_to_move",
+            Self::MoveDuplicateDestination { .. } => "move_duplicate_destination",
+            Self::MoveBadSource { .. } => "move_bad_source",
+            Self::MoveMissingIndexEntry { .. } => "move_missing_index_entry",
+            Self::WouldOverwrite { .. } => "would_overwrite",
+            Self::DirtyWorktree { .. } => "dirty_worktree",
+            Self::CheckoutRollbackIncomplete { .. } => "checkout_rollback_incomplete",
+            Self::UnmergedConflictMarkers { .. } => "unmerged_conflict_markers",
+            Self::Filter(_) => "filter",
+            Self::Submodule(_) => "submodule",
         }
     }
 }
 
-impl fmt::Display for WorktreeOperation {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
+fn move_rollback_incomplete_message(
+    source: &ErrorSummary,
+    unreversed: usize,
+    backup_restore: Option<&ErrorSummary>,
+) -> String {
+    let mut message = source.to_string();
+    if unreversed > 0 {
+        message.push_str(&format!(
+            "; incomplete worktree rollback ({unreversed} rename(s) could not be reversed)"
+        ));
     }
-}
-
-/// Linked worktree failures, wrapped by [`Error::Worktree`](crate::error::Error::Worktree).
-///
-/// Branch problems met while adding a worktree (invalid, missing or existing branch names)
-/// are reported as [`BranchError`](crate::porcelain::branch_error::BranchError) instead, and a
-/// branch held by another worktree as
-/// [`Error::BranchCheckedOutInWorktree`](crate::error::Error::BranchCheckedOutInWorktree).
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[non_exhaustive]
-pub enum WorktreeError {
-    /// Linked worktrees cannot be added to a bare repository.
-    #[error("cannot add a worktree to a bare repository")]
-    BareRepository,
-
-    /// No registered worktree has `path` as its working tree root.
-    #[error("'{}' is not a registered worktree", user_display_path(.path))]
-    NotRegistered {
-        /// Normalized path that matched no registry entry.
-        path: PathBuf,
-    },
-
-    /// The operation only applies to linked worktrees.
-    #[error("cannot {operation} the main working tree")]
-    MainWorktree {
-        /// Operation that was refused.
-        operation: WorktreeOperation,
-    },
-
-    /// The worktree is locked and the caller did not force the operation.
-    #[error("{}", with_reason("worktree is locked", .reason))]
-    Locked {
-        /// Contents of the `locked` file, when non-empty.
-        reason: Option<String>,
-    },
-
-    /// Lock was requested for a worktree that is already locked.
-    #[error("{}", with_reason("worktree is already locked", .reason))]
-    AlreadyLocked {
-        /// Contents of the existing `locked` file, when non-empty.
-        reason: Option<String>,
-    },
-
-    /// Unlock was requested for a worktree that is not locked.
-    #[error("worktree is not locked")]
-    NotLocked,
-
-    /// Remove without force found staged, unstaged, conflicted or untracked changes.
-    #[error("worktree contains modified or untracked files; use -f or --force to remove")]
-    HasLocalChanges,
-
-    /// Move found populated submodules inside the worktree.
-    #[error("working trees containing submodules cannot be moved or removed")]
-    HasSubmodules,
-
-    /// The path is registered to a worktree whose directory still exists.
-    #[error("'{}' is already a registered worktree", user_display_path(.path))]
-    PathRegistered {
-        /// Registered working tree path.
-        path: PathBuf,
-    },
-
-    /// The path is registered to a worktree whose directory is missing, and add was not forced.
-    #[error(
-        "'{}' is a missing but already registered worktree; use add with --force to override, or prune or remove to clear",
-        user_display_path(.path)
-    )]
-    PathRegisteredMissing {
-        /// Registered working tree path that is missing on disk.
-        path: PathBuf,
-    },
-
-    /// The target directory exists and is not empty (add) or exists at all (move).
-    #[error("'{}' already exists", user_display_path(.path))]
-    PathExists {
-        /// Occupied path.
-        path: PathBuf,
-    },
-
-    /// The add target exists and is a file or other non-directory.
-    #[error("'{}' already exists and is not a directory", user_display_path(.path))]
-    PathExistsNotDirectory {
-        /// Occupied path.
-        path: PathBuf,
-    },
-
-    /// A path that must be a directory (repair target, move destination parent) is not one.
-    #[error("'{}' is not a directory", user_display_path(.path))]
-    NotADirectory {
-        /// Offending path.
-        path: PathBuf,
-    },
-
-    /// A repair target does not exist.
-    #[error("'{}' is not a valid path", user_display_path(.path))]
-    PathNotFound {
-        /// Missing path.
-        path: PathBuf,
-    },
-
-    /// The path has no final component to name the worktree after (for example `/`).
-    #[error("invalid worktree path '{}'", user_display_path(.path))]
-    NoFileName {
-        /// Path without a final component.
-        path: PathBuf,
-    },
-
-    /// A worktree admin directory has no parent directory.
-    #[error("invalid worktree admin directory '{}'", user_display_path(.path))]
-    InvalidAdminDir {
-        /// Admin directory path.
-        path: PathBuf,
-    },
-
-    /// An existing branch used for the worktree `HEAD` does not point at the start commit.
-    #[error("branch '{branch}' does not match start commit")]
-    BranchTipMismatch {
-        /// Short branch name.
-        branch: String,
-    },
-
-    /// Repair expected a `.git` gitfile but found a directory.
-    #[error("'{}' is a directory, not a worktree gitfile", user_display_path(.path))]
-    DotGitIsDirectory {
-        /// The worktree's `.git` path.
-        path: PathBuf,
-    },
-
-    /// Repair could not map a worktree's `.git` gitfile to a registered admin directory.
-    #[error("'{}' does not point at a registered worktree", user_display_path(.path))]
-    BrokenGitFile {
-        /// The worktree's `.git` path.
-        path: PathBuf,
-    },
-
-    /// Another process holds the lock file guarding a worktree link file.
-    #[error("could not acquire lock for '{}'", user_display_path(.path))]
-    LockHeld {
-        /// Lock file path.
-        path: PathBuf,
-    },
-
-    /// A gitlink entry in the worktree index has a path that is not valid UTF-8.
-    #[error(
-        "submodule path in index is not valid UTF-8: {}",
-        String::from_utf8_lossy(.path)
-    )]
-    NonUtf8SubmodulePath {
-        /// Raw index path bytes.
-        path: Vec<u8>,
-    },
-}
-
-fn with_reason(prefix: &str, reason: &Option<String>) -> String {
-    match reason {
-        Some(r) => format!("{prefix}: {r}"),
-        None => prefix.to_owned(),
+    if let Some(err) = backup_restore {
+        message.push_str(&format!(
+            "; restoring forced-destination backups failed: {err}"
+        ));
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn locked_messages_include_reason_when_present() {
-        assert_eq!(
-            WorktreeError::Locked { reason: None }.to_string(),
-            "worktree is locked"
-        );
-        assert_eq!(
-            WorktreeError::AlreadyLocked {
-                reason: Some("hold".into())
-            }
-            .to_string(),
-            "worktree is already locked: hold"
-        );
-    }
-
-    #[test]
-    fn main_worktree_message_names_operation() {
-        let msgs: Vec<String> = [
-            WorktreeOperation::Remove,
-            WorktreeOperation::Move,
-            WorktreeOperation::Lock,
-            WorktreeOperation::Unlock,
-        ]
-        .into_iter()
-        .map(|operation| WorktreeError::MainWorktree { operation }.to_string())
-        .collect();
-        assert_eq!(
-            msgs,
-            [
-                "cannot remove the main working tree",
-                "cannot move the main working tree",
-                "cannot lock the main working tree",
-                "cannot unlock the main working tree",
-            ]
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn path_variants_display_the_path() {
-        let path = PathBuf::from("/tmp/wt");
-        let err = WorktreeError::NotRegistered { path: path.clone() };
-        assert_eq!(err.to_string(), "'/tmp/wt' is not a registered worktree");
-        let err = WorktreeError::PathExists { path };
-        assert_eq!(err.to_string(), "'/tmp/wt' already exists");
-    }
+    message
 }

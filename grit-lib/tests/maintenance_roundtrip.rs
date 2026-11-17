@@ -1,17 +1,19 @@
 //! Commit-graph, MIDX, and pack-refs maintenance vs system `git`.
 
 use crate::support;
+use grit_lib::error::ObjectError;
+use grit_lib::progress::CancelToken;
+use grit_lib::progress::NullProgress;
 
 use std::fs;
 use std::path::Path;
 use std::process::Command;
 
 use grit_lib::config::environment::RepositoryOptions;
-use grit_lib::maintenance::repository_fsck::{fsck, FsckIssue, FsckOptions};
-use grit_lib::maintenance::{write_commit_graph, CommitGraphOptions, MidxOptions, PackRefsOptions};
+use grit_lib::maintenance::repository_fsck::{FsckIssue, FsckOptions};
+use grit_lib::maintenance::{CommitGraphOptions, MidxOptions, PackRefsOptions};
 use grit_lib::objects::commit_graph::CommitGraphChain;
 use grit_lib::objects::ObjectId;
-use grit_lib::progress::{NeverCancel, NullProgress};
 use grit_lib::repo::Repository;
 
 use support::{git_init_reftable_repo, git_refs_verify, require_reftable_git};
@@ -118,7 +120,9 @@ fn commit_graph_git_verify_clean_without_changed_paths() {
     let dir = tempfile::tempdir().expect("tempdir");
     merge_history_repo(dir.path());
     let repo = Repository::discover(Some(dir.path()), &RepositoryOptions::empty()).expect("open");
-    write_commit_graph(&repo, &CommitGraphOptions::with_changed_paths(false)).expect("write graph");
+    repo.maintenance()
+        .write_commit_graph(&CommitGraphOptions::with_changed_paths(false))
+        .expect("write graph");
     git_cmd(dir.path(), &["commit-graph", "verify"]);
     let chain = CommitGraphChain::load(repo.odb().objects_dir()).expect("load");
     assert!(chain.top_layer_bloom_settings().is_none());
@@ -133,7 +137,9 @@ fn commit_graph_git_verify_clean_with_changed_paths() {
     let dir = tempfile::tempdir().expect("tempdir");
     merge_history_repo(dir.path());
     let repo = Repository::discover(Some(dir.path()), &RepositoryOptions::empty()).expect("open");
-    let report = write_commit_graph(&repo, &CommitGraphOptions::with_changed_paths(true))
+    let report = repo
+        .maintenance()
+        .write_commit_graph(&CommitGraphOptions::with_changed_paths(true))
         .expect("write graph");
     assert!(report.bloom_stats.is_some());
     git_cmd(dir.path(), &["commit-graph", "verify"]);
@@ -150,7 +156,9 @@ fn git_log_uses_grit_bloom_filters() {
     let dir = tempfile::tempdir().expect("tempdir");
     merge_history_repo(dir.path());
     let repo = Repository::discover(Some(dir.path()), &RepositoryOptions::empty()).expect("open");
-    write_commit_graph(&repo, &CommitGraphOptions::with_changed_paths(true)).expect("write graph");
+    repo.maintenance()
+        .write_commit_graph(&CommitGraphOptions::with_changed_paths(true))
+        .expect("write graph");
     let trace = dir.path().join("trace2.json");
     let _ = fs::remove_file(&trace);
     let out = Command::new("git")
@@ -193,6 +201,7 @@ fn commit_graph_write_is_atomic_and_replaces_chain() {
 
     let repo = Repository::discover(Some(dir.path()), &RepositoryOptions::empty()).expect("open");
     let report = repo
+        .maintenance()
         .write_commit_graph(&CommitGraphOptions::with_changed_paths(true))
         .expect("grit write");
     assert!(report.removed_chain);
@@ -209,6 +218,7 @@ fn commit_graph_write_is_atomic_and_replaces_chain() {
     let lock = dir.path().join(".git/objects/info/commit-graph.lock");
     fs::write(&lock, b"held").expect("lock");
     assert!(repo
+        .maintenance()
         .write_commit_graph(&CommitGraphOptions::with_changed_paths(false))
         .is_err());
     fs::remove_file(&lock).expect("unlock");
@@ -230,13 +240,16 @@ fn midx_git_verify_clean() {
     git_cmd(dir.path(), &["commit", "-q", "-m", "extra"]);
     let repo = Repository::discover(Some(dir.path()), &RepositoryOptions::empty()).expect("open");
     let report = repo
+        .maintenance()
         .write_midx(&MidxOptions::with_bitmap(false))
         .expect("write midx");
     assert!(report.path.is_file());
     assert!(report.pack_count >= 1);
     let fsck_opts = FsckOptions::connectivity_and_refs(true);
-    let report_fsck =
-        fsck(&repo, &fsck_opts, &mut NullProgress, &NeverCancel).expect("grit fsck midx");
+    let report_fsck = repo
+        .maintenance()
+        .fsck(&fsck_opts, &mut NullProgress, &CancelToken::never())
+        .expect("grit fsck midx");
     assert!(
         !report_fsck
             .issues
@@ -246,7 +259,7 @@ fn midx_git_verify_clean() {
         report_fsck.issues
     );
     assert!(
-        report_fsck.ok(&repo.config().expect("config"), &fsck_opts),
+        report_fsck.ok(&repo.config().snapshot().expect("config"), &fsck_opts),
         "{:?}",
         report_fsck.issues
     );
@@ -280,7 +293,7 @@ fn midx_header_version(root: &Path) -> u8 {
 
 fn write_midx_with(root: &Path, opts: &MidxOptions) -> grit_lib::error::Result<()> {
     let repo = Repository::discover(Some(root), &RepositoryOptions::empty()).expect("open");
-    repo.write_midx(opts).map(|_| ())
+    repo.maintenance().write_midx(opts).map(|_| ())
 }
 
 /// Issue #1876: `Repository::write_midx` writes v1 unless asked otherwise, so the stock
@@ -346,7 +359,9 @@ fn write_midx_rejects_invalid_midx_version() {
     assert!(
         matches!(
             err,
-            Error::Midx(MidxError::UnknownWriteVersion { version: 3 })
+            Error::Object(ObjectError::Midx(MidxError::UnknownWriteVersion {
+                version: 3
+            }))
         ),
         "{err:?}"
     );
@@ -354,7 +369,9 @@ fn write_midx_rejects_invalid_midx_version() {
     assert!(
         matches!(
             err,
-            Error::Midx(MidxError::UnknownWriteVersion { version: 3 })
+            Error::Object(ObjectError::Midx(MidxError::UnknownWriteVersion {
+                version: 3
+            }))
         ),
         "{err:?}"
     );
@@ -373,7 +390,9 @@ fn write_midx_rejects_invalid_midx_version() {
     assert!(
         matches!(
             err,
-            Error::Midx(MidxError::UnknownWriteVersion { version: 0 })
+            Error::Object(ObjectError::Midx(MidxError::UnknownWriteVersion {
+                version: 0
+            }))
         ),
         "{err:?}"
     );
@@ -382,7 +401,9 @@ fn write_midx_rejects_invalid_midx_version() {
     assert!(
         matches!(
             err,
-            Error::Midx(MidxError::UnknownWriteVersion { version: 0 })
+            Error::Object(ObjectError::Midx(MidxError::UnknownWriteVersion {
+                version: 0
+            }))
         ),
         "{err:?}"
     );
@@ -450,6 +471,101 @@ fn pack_refs_peeled_tags() {
     git_cmd(dir.path(), &["show-ref", "--tags"]);
 }
 
+/// A repository whose tags git has already packed (with peel lines), plus new loose tags
+/// sorting before, inside and after the packed range, loose tags replacing packed ones, and
+/// a loose branch that a tags-only pack must leave alone.
+fn seed_packed_tags_with_loose_updates(root: &Path) {
+    git_cmd(root, &["init", "-q", "-b", "main"]);
+    fs::write(root.join("a.txt"), b"a\n").unwrap();
+    git_cmd(root, &["add", "a.txt"]);
+    git_cmd(root, &["commit", "-q", "-m", "one"]);
+    for i in 0..40 {
+        let name = format!("t{i:02}");
+        if i % 5 == 0 {
+            git_cmd(root, &["tag", "-a", &name, "-m", &name]);
+        } else {
+            git_cmd(root, &["tag", &name]);
+        }
+    }
+    git_cmd(root, &["branch", "packed-branch"]);
+    git_cmd(root, &["pack-refs", "--all"]);
+
+    git_cmd(root, &["commit", "-q", "--allow-empty", "-m", "two"]);
+    git_cmd(root, &["tag", "a-first"]);
+    git_cmd(root, &["tag", "-a", "t25a", "-m", "between"]);
+    git_cmd(root, &["tag", "zz-last"]);
+    git_cmd(root, &["tag", "-f", "t10"]);
+    git_cmd(root, &["tag", "-f", "-a", "t11", "-m", "now annotated"]);
+    git_cmd(root, &["tag", "-a", "nested-outer", "-m", "outer", "t05"]);
+    git_cmd(root, &["branch", "loose-branch"]);
+}
+
+/// The record and peel lines of `packed-refs`, without the header comment.
+fn packed_refs_records(git_dir: &Path) -> String {
+    fs::read_to_string(git_dir.join("packed-refs"))
+        .expect("packed-refs")
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .map(|line| format!("{line}\n"))
+        .collect()
+}
+
+fn loose_ref_files(git_dir: &Path) -> Vec<String> {
+    fn walk(dir: &Path, prefix: &str, out: &mut Vec<String>) {
+        for entry in fs::read_dir(dir).expect("read_dir").flatten() {
+            let name = format!("{prefix}{}", entry.file_name().to_string_lossy());
+            if entry.path().is_dir() {
+                walk(&entry.path(), &format!("{name}/"), out);
+            } else {
+                out.push(name);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(&git_dir.join("refs"), "refs/", &mut out);
+    out.sort();
+    out
+}
+
+#[test]
+fn pack_refs_merges_into_git_packed_refs_like_git() {
+    if !git_available() {
+        eprintln!("SKIP: git unavailable");
+        return;
+    }
+    let grit_dir = tempfile::tempdir().expect("tempdir");
+    let git_dir = tempfile::tempdir().expect("tempdir");
+    seed_packed_tags_with_loose_updates(grit_dir.path());
+    seed_packed_tags_with_loose_updates(git_dir.path());
+
+    let repo =
+        Repository::discover(Some(grit_dir.path()), &RepositoryOptions::empty()).expect("open");
+    let report = repo
+        .references()
+        .pack(&PackRefsOptions::with_all(false))
+        .expect("pack");
+    assert_eq!(report.refs_packed, 6, "the six loose tags");
+    assert_eq!(report.refs_pruned, 6);
+
+    git_cmd(git_dir.path(), &["pack-refs"]);
+    let grit_git_dir = grit_dir.path().join(".git");
+    let git_git_dir = git_dir.path().join(".git");
+    assert_eq!(
+        packed_refs_records(&grit_git_dir),
+        packed_refs_records(&git_git_dir),
+        "packed records and peel lines must match git pack-refs"
+    );
+    assert_eq!(
+        loose_ref_files(&grit_git_dir),
+        loose_ref_files(&git_git_dir)
+    );
+    assert_eq!(
+        git_out(grit_dir.path(), &["show-ref", "-d"]),
+        git_out(git_dir.path(), &["show-ref", "-d"])
+    );
+    git_cmd(grit_dir.path(), &["fsck", "--strict", "--no-dangling"]);
+}
+
 #[test]
 fn commit_graph_write_reftable_includes_reachable_commits() {
     if !git_available() {
@@ -474,7 +590,9 @@ fn commit_graph_write_reftable_includes_reachable_commits() {
     let head_oid =
         ObjectId::from_hex(git_out(dir.path(), &["rev-parse", "HEAD"]).trim()).expect("head");
     let repo = Repository::discover(Some(dir.path()), &RepositoryOptions::empty()).expect("open");
-    let report = write_commit_graph(&repo, &CommitGraphOptions::with_changed_paths(false))
+    let report = repo
+        .maintenance()
+        .write_commit_graph(&CommitGraphOptions::with_changed_paths(false))
         .expect("write graph");
     assert_eq!(
         report.commit_count, expected_count,
@@ -524,7 +642,9 @@ fn commit_graph_write_linked_worktree_includes_common_refs() {
 
     let repo =
         Repository::discover(Some(&linked), &RepositoryOptions::empty()).expect("open linked");
-    let report = write_commit_graph(&repo, &CommitGraphOptions::with_changed_paths(false))
+    let report = repo
+        .maintenance()
+        .write_commit_graph(&CommitGraphOptions::with_changed_paths(false))
         .expect("write graph");
     assert_eq!(
         report.commit_count, expected_count,
@@ -537,37 +657,37 @@ fn commit_graph_write_linked_worktree_includes_common_refs() {
 fn commit_graph_write_injected_ref_store_head_when_disk_unborn() {
     use std::sync::Arc;
 
-    use grit_lib::porcelain::add::stage_for_commit;
-    use grit_lib::porcelain::commit::{create_commit, CommitRequest};
+    use grit_lib::porcelain::commit::CommitRequest;
     use grit_lib::progress::NullProgress;
-    use grit_lib::refs;
-    use grit_lib::refs::store::{MemoryRefStore, RawRef};
+    use grit_lib::refs::store::{MemoryRefStore, RawRef, RefNameRef};
     use grit_lib::repo::{InitOptions, Repository};
 
     let dir = tempfile::tempdir().expect("tempdir");
-    let repo = Repository::init(dir.path(), &InitOptions::default()).expect("init");
+    let (repo, _) = Repository::init(dir.path(), &InitOptions::default()).expect("init");
     let wt = repo.work_tree().expect("worktree");
     fs::write(wt.join("a.txt"), b"a\n").unwrap();
-    stage_for_commit(&repo, &mut NullProgress, &NeverCancel).expect("stage");
+    repo.index()
+        .stage_for_commit(&mut NullProgress, &CancelToken::never())
+        .expect("stage");
     let ident = "T <t@example.com> 1 +0000".to_string();
-    create_commit(
-        &repo,
-        &CommitRequest {
-            message: "one".into(),
-            author: Some(ident.parse().expect("signature")),
-            committer: Some(ident.parse().expect("signature")),
-            allow_empty: false,
-            sign_override: None,
-            amend: false,
-            assume_worktree_synced: false,
-            ..Default::default()
-        },
-        &mut NullProgress,
-        &NeverCancel,
-    )
-    .expect("commit");
+    repo.commits()
+        .create_staged(
+            &{
+                let mut req = CommitRequest::new("one");
+                req.author = Some(ident.parse().expect("signature"));
+                req.committer = Some(ident.parse().expect("signature"));
+                req.allow_empty = false;
+                req.sign_override = None;
+                req.amend = false;
+                req.assume_worktree_synced = false;
+                req
+            },
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("commit");
 
-    let tip = refs::resolve_ref(repo.git_dir(), "HEAD").expect("tip");
+    let tip = repo.references().resolve("HEAD").expect("tip");
     let git_dir = repo.git_dir();
     let branch_ref = git_dir.join("refs/heads/main");
     if branch_ref.is_file() {
@@ -575,7 +695,10 @@ fn commit_graph_write_injected_ref_store_head_when_disk_unborn() {
     }
     fs::write(git_dir.join("HEAD"), b"ref: refs/heads/main\n").expect("unborn head");
     assert!(
-        refs::resolve_ref(git_dir, "HEAD").is_err(),
+        grit_test_support::refs::at(git_dir)
+            .references()
+            .resolve("HEAD")
+            .is_err(),
         "on-disk HEAD should be unborn after removing the branch ref"
     );
 
@@ -584,9 +707,14 @@ fn commit_graph_write_injected_ref_store_head_when_disk_unborn() {
         .set_ref("HEAD", RawRef::Direct(tip))
         .expect("inject detached HEAD");
     let repo = repo.with_ref_store(store);
-    assert_eq!(repo.refs().resolve("HEAD").expect("injected HEAD"), tip);
+    assert_eq!(
+        repo.ref_store().resolve("HEAD").expect("injected HEAD"),
+        tip
+    );
 
-    let report = write_commit_graph(&repo, &CommitGraphOptions::with_changed_paths(false))
+    let report = repo
+        .maintenance()
+        .write_commit_graph(&CommitGraphOptions::with_changed_paths(false))
         .expect("write graph");
     assert_eq!(
         report.commit_count, 1,

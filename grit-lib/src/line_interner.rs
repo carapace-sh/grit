@@ -78,6 +78,61 @@ impl<'a> LineInterner<'a> {
     }
 }
 
+/// Intern byte line slices to dense `u32` ids (equal id iff equal bytes).
+///
+/// Like [`LineInterner`], records are borrowed — never copied into owned storage.
+#[derive(Default)]
+pub struct ByteLineInterner<'a> {
+    lines: Vec<&'a [u8]>,
+    table: HashTable<u32>,
+    hasher: DefaultHashBuilder,
+}
+
+impl<'a> ByteLineInterner<'a> {
+    #[must_use]
+    pub fn with_capacity(lines: usize) -> Self {
+        Self {
+            lines: Vec::new(),
+            table: HashTable::with_capacity(lines),
+            hasher: DefaultHashBuilder::default(),
+        }
+    }
+
+    #[must_use]
+    pub fn intern(&mut self, line: &'a [u8]) -> u32 {
+        let hash = self.hasher.hash_one(line);
+        let entry = self.table.entry(
+            hash,
+            |&id| self.lines[id as usize] == line,
+            |&id| self.hasher.hash_one(self.lines[id as usize]),
+        );
+        match entry {
+            Entry::Occupied(found) => *found.get(),
+            Entry::Vacant(slot) => {
+                let id = u32::try_from(self.lines.len()).unwrap_or(u32::MAX);
+                self.lines.push(line);
+                slot.insert(id);
+                id
+            }
+        }
+    }
+
+    pub fn intern_all_bytes(&mut self, lines: &[&'a [u8]]) -> Vec<u32> {
+        lines
+            .iter()
+            .copied()
+            .map(|line| self.intern(line))
+            .collect()
+    }
+
+    pub fn intern_all_vecs(&mut self, lines: &'a [Vec<u8>]) -> Vec<u32> {
+        lines
+            .iter()
+            .map(|line| self.intern(line.as_slice()))
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::LineInterner;

@@ -1,6 +1,7 @@
 //! Alternate ordering when an earlier store cannot serve an OID (system git oracle).
 
 use grit_lib::error::Error;
+use grit_lib::error::ObjectError;
 use grit_lib::objects::odb::Odb;
 use grit_lib::objects::ObjectKind;
 use std::fs;
@@ -71,7 +72,15 @@ fn corrupt_object_only_in_alternate_is_reported_as_corrupt_not_missing() {
     .expect("alternates");
 
     let odb = Odb::new(&primary_objects);
-    let is_damage = |err: &Error| matches!(err, Error::Zlib(_) | Error::CorruptObject(_));
+    let is_damage = |err: &Error| {
+        matches!(
+            err,
+            Error::Object(ObjectError::Zlib { .. })
+                | Error::Object(ObjectError::Corrupt { .. })
+                | Error::Object(ObjectError::CorruptLoose { .. })
+                | Error::Object(ObjectError::CorruptPacked { .. })
+        )
+    };
     let err = odb.read(&oid).unwrap_err();
     assert!(is_damage(&err), "read: {err:?}");
     let err = odb.read_into(&oid, &mut Vec::new()).unwrap_err();

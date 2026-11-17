@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::ops::ControlFlow;
 use std::sync::Arc;
 
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::objects::{HashAlgo, Object, ObjectId, ObjectInfo, ObjectKind};
 
 use super::{ObjectStore, ObjectStream};
@@ -14,7 +14,7 @@ use super::{ObjectStore, ObjectStream};
 /// # Errors
 ///
 /// Reads ([`ObjectStore::read`], `read_into`, `read_info`, `open_stream`) skip past a backend
-/// whose copy is damaged ([`Error::Zlib`] or [`Error::CorruptObject`]) and return a later
+/// whose copy is damaged ([`crate::error::Error::is_damaged_object`]) and return a later
 /// backend's good copy. When no backend returns the object, the first such corruption error is
 /// returned instead of `Ok(None)`. Any other backend error is returned immediately.
 #[derive(Debug)]
@@ -40,7 +40,7 @@ impl CompositeStore {
 
     /// Ask each child in order and return the first hit.
     ///
-    /// A child that reports a damaged copy ([`Error::Zlib`] or [`Error::CorruptObject`]) does not
+    /// A child that reports a damaged copy ([`crate::error::Error::is_damaged_object`]) does not
     /// stop the lookup, since a later child may hold a good copy. If none does, the first such
     /// error is returned so a damaged object is never reported as missing. Any other error stops
     /// the lookup immediately.
@@ -53,7 +53,7 @@ impl CompositeStore {
             match lookup(store.as_ref()) {
                 Ok(Some(found)) => return Ok(Some(found)),
                 Ok(None) => {}
-                Err(err @ (Error::Zlib(_) | Error::CorruptObject(_))) => {
+                Err(err) if err.is_damaged_object() => {
                     damaged.get_or_insert(err);
                 }
                 Err(err) => return Err(err),
@@ -162,6 +162,8 @@ impl ObjectStore for CompositeStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::Error;
+    use crate::error::ObjectError;
     use crate::objects::ObjectKind;
     use crate::odb::store::{MemoryStore, WritableObjectStore};
     use crate::odb::WriteOptions;
@@ -270,11 +272,15 @@ mod tests {
     }
 
     fn corrupt() -> Error {
-        Error::CorruptObject("checksum mismatch".to_owned())
+        Error::Object(ObjectError::Corrupt {
+            detail: "checksum mismatch".to_owned(),
+        })
     }
 
     fn zlib() -> Error {
-        Error::Zlib("invalid stored block lengths".to_owned())
+        Error::Object(ObjectError::Zlib {
+            detail: "invalid stored block lengths".to_owned(),
+        })
     }
 
     fn assert_every_read_fails(
@@ -299,7 +305,9 @@ mod tests {
         let (rotten, oid) = rotten_with(b"precious data", corrupt);
         let empty = Arc::new(MemoryStore::new(HashAlgo::Sha1)) as Arc<dyn ObjectStore>;
         let composite = CompositeStore::new(vec![rotten, empty], HashAlgo::Sha1);
-        assert_every_read_fails(&composite, &oid, |e| matches!(e, Error::CorruptObject(_)));
+        assert_every_read_fails(&composite, &oid, |e| {
+            matches!(e, Error::Object(ObjectError::Corrupt { .. }))
+        });
     }
 
     #[test]
@@ -307,7 +315,9 @@ mod tests {
         let empty = Arc::new(MemoryStore::new(HashAlgo::Sha1)) as Arc<dyn ObjectStore>;
         let (rotten, oid) = rotten_with(b"precious data", zlib);
         let composite = CompositeStore::new(vec![empty, rotten], HashAlgo::Sha1);
-        assert_every_read_fails(&composite, &oid, |e| matches!(e, Error::Zlib(_)));
+        assert_every_read_fails(&composite, &oid, |e| {
+            matches!(e, Error::Object(ObjectError::Zlib { .. }))
+        });
     }
 
     #[test]
@@ -315,7 +325,9 @@ mod tests {
         let (zlib_store, oid) = rotten_with(b"precious data", zlib);
         let (corrupt_store, _) = rotten_with(b"precious data", corrupt);
         let composite = CompositeStore::new(vec![zlib_store, corrupt_store], HashAlgo::Sha1);
-        assert_every_read_fails(&composite, &oid, |e| matches!(e, Error::Zlib(_)));
+        assert_every_read_fails(&composite, &oid, |e| {
+            matches!(e, Error::Object(ObjectError::Zlib { .. }))
+        });
     }
 
     #[test]

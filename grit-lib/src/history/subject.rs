@@ -7,6 +7,7 @@ use crate::repo::Repository;
 use super::error::HistoryError;
 use super::load_commit;
 use super::types::RewrittenCommit;
+use super::PlanningError;
 
 /// First line of a commit message, without trailing newline on that line.
 ///
@@ -31,7 +32,7 @@ pub(crate) fn subject_for_rewrite_row(
     repo: &Repository,
     old: &CommitData,
     new: Option<ObjectId>,
-) -> Result<Option<String>, HistoryError> {
+) -> crate::error::Result<Option<String>> {
     Ok(Some(if let Some(new) = new {
         message_first_line(&load_commit(repo, new)?.message)
     } else {
@@ -41,13 +42,11 @@ pub(crate) fn subject_for_rewrite_row(
 
 /// Subject for a [`RewrittenCommit`] row (uses stored subject when present).
 ///
-/// # Errors
-///
-/// Returns [`super::HistoryError`] when a replacement commit cannot be read from the object database.
-pub fn rewritten_row_subject(
+/// See [`History::rewritten_row_subject`](super::History::rewritten_row_subject).
+pub(crate) fn rewritten_row_subject(
     repo: &Repository,
     row: &RewrittenCommit,
-) -> Result<Option<String>, HistoryError> {
+) -> crate::error::Result<Option<String>> {
     if let Some(subject) = row.subject.as_ref() {
         return Ok(Some(subject.clone()));
     }
@@ -55,18 +54,16 @@ pub fn rewritten_row_subject(
         let old = load_commit(repo, row.old)?;
         return Ok(Some(message_first_line(&old.message)));
     }
-    let new = row.new.ok_or(HistoryError::Planning {
-        message: "rewrite row missing replacement oid".into(),
-    })?;
+    let new = row.new.ok_or(HistoryError::Planning(
+        PlanningError::RewriteRowMissingReplacementOid,
+    ))?;
     let commit = load_commit(repo, new)?;
     Ok(Some(message_first_line(&commit.message)))
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::history::{
-        drop as history_drop, reword, EmptyPolicy, RefScope, RewriteOptions, RewritePlan,
-    };
+    use crate::history::{EmptyPolicy, RefScope, RewordOptions, RewriteOptions};
     use crate::objects::{serialize_commit, CommitData};
     use crate::repo::init_repository;
     use crate::RefStorageFormat;
@@ -124,28 +121,25 @@ mod tests {
         }
     }
 
-    fn row_subjects(repo: &Repository, plan: &RewritePlan) -> Vec<Option<String>> {
-        plan.subjects(repo).expect("subjects")
-    }
-
     #[test]
     fn rewrite_row_subject_uses_replacement_message() {
         let (_dir, repo, middle, _tip) = linear_repo();
-        let plan =
-            reword(&repo, middle, "reworded subject\n".into(), &rewrite_opts()).expect("reword");
+        let plan = repo
+            .history()
+            .reword(
+                middle,
+                &RewordOptions::default().with_message("reworded subject\n"),
+                &rewrite_opts(),
+            )
+            .expect("reword");
         let row = plan
             .commits
             .iter()
             .find(|r| r.old == middle)
             .expect("middle row");
         assert_eq!(row.subject.as_deref(), Some("reworded subject"));
-        let idx = plan.commits.iter().position(|r| r.old == middle).unwrap();
         assert_eq!(
-            row_subjects(&repo, &plan)[idx].as_deref(),
-            Some("reworded subject")
-        );
-        assert_eq!(
-            rewritten_row_subject(&repo, row).expect("lookup"),
+            repo.history().rewritten_row_subject(row).expect("lookup"),
             Some("reworded subject".into())
         );
     }
@@ -153,13 +147,15 @@ mod tests {
     #[test]
     fn rewrite_row_subject_uses_first_line_only_for_multiline_message() {
         let (_dir, repo, middle, _tip) = linear_repo();
-        let plan = reword(
-            &repo,
-            middle,
-            "replacement first\nreplacement continuation\n\nbody".into(),
-            &rewrite_opts(),
-        )
-        .expect("reword");
+        let plan = repo
+            .history()
+            .reword(
+                middle,
+                &RewordOptions::default()
+                    .with_message("replacement first\nreplacement continuation\n\nbody"),
+                &rewrite_opts(),
+            )
+            .expect("reword");
         let row = plan
             .commits
             .iter()
@@ -167,7 +163,7 @@ mod tests {
             .expect("middle row");
         assert_eq!(row.subject.as_deref(), Some("replacement first"));
         assert_eq!(
-            rewritten_row_subject(&repo, row).expect("lookup"),
+            repo.history().rewritten_row_subject(row).expect("lookup"),
             Some("replacement first".into())
         );
     }
@@ -183,7 +179,10 @@ mod tests {
         let tip = write_commit(&repo, tree, &[middle], "tip\n");
         crate::refs::write_ref(repo.git_dir(), "refs/heads/main", &tip).expect("ref");
         crate::refs::write_symbolic_ref(repo.git_dir(), "HEAD", "refs/heads/main").expect("head");
-        let plan = history_drop(&repo, middle, &rewrite_opts()).expect("drop");
+        let plan = repo
+            .history()
+            .drop_commit(middle, &rewrite_opts())
+            .expect("drop");
         let row = plan
             .commits
             .iter()
@@ -195,7 +194,10 @@ mod tests {
     #[test]
     fn dropped_row_subject_uses_original_message() {
         let (_dir, repo, middle, _tip) = linear_repo();
-        let plan = history_drop(&repo, middle, &rewrite_opts()).expect("drop");
+        let plan = repo
+            .history()
+            .drop_commit(middle, &rewrite_opts())
+            .expect("drop");
         let row = plan
             .commits
             .iter()
@@ -204,7 +206,7 @@ mod tests {
         assert!(row.new.is_none());
         assert_eq!(row.subject.as_deref(), Some("second subject"));
         assert_eq!(
-            rewritten_row_subject(&repo, row).expect("lookup"),
+            repo.history().rewritten_row_subject(row).expect("lookup"),
             Some("second subject".into())
         );
     }

@@ -5,18 +5,22 @@
 //! embeddable in-memory implementation used by tests and callers that keep refs
 //! outside a repository directory.
 //!
-//! To write your own backend, build `prepare` and `commit` on the [`backend`] helpers and
-//! check it with the `grit_test_support::refstore_conformance` suite.
+//! To write your own backend, build `prepare` and `commit` on the [`backend`] helpers,
+//! implement [`RefStore::rewrite_reflog`] with the same writer exclusion as `prepare`/`commit`,
+//! and check it with the `grit_test_support::refstore_conformance` suite.
 
 mod apply;
 pub mod backend;
 mod checked;
 mod error;
 mod files;
+pub(crate) mod gate;
 mod linked_worktree;
 mod memory;
 mod open;
 pub mod paths;
+#[cfg(test)]
+mod probe;
 pub(crate) mod reference_transaction;
 mod reftable;
 mod routing;
@@ -28,21 +32,23 @@ mod validation;
 pub(crate) use checked::{open_checked_ref_store, ObjectCheckedRefStore};
 pub use error::{BackendError, RefStoreError};
 pub use files::{FilesRefStore, FilesRefStoreConfig};
+pub use gate::{SingleWriterGate, SingleWriterTicket};
 pub(crate) use linked_worktree::LinkedWorktreeRefStore;
 pub use memory::MemoryRefStore;
-pub use open::open_ref_store;
+pub(crate) use open::open_ref_store;
 pub(crate) use open::{initialize_head, open_files_ref_store, open_ref_store_uncached};
 pub use reftable::ReftableRefStore;
 pub(crate) use semantics::format_reflog_identity;
 pub use transaction::RefTransaction;
 pub use types::{
-    Expected, RawRef, RefCaseOnlyRename, RefEntry, RefName, RefReflogRename, RefStorageFormat,
-    RefUpdate, RefUpdateFlags, ReflogUpdate,
+    Expected, RawRef, RefCaseOnlyRename, RefEntry, RefName, RefNameRef, RefReflogRename,
+    RefStorageFormat, RefUpdate, RefUpdateFlags, ReflogUpdate,
 };
 pub(crate) use validation::{
     validate_reflog_identity_string, validate_reflog_message, validate_reflog_update,
 };
 
+use crate::error::RefError;
 use std::fmt::Debug;
 use std::ops::ControlFlow;
 
@@ -65,7 +71,8 @@ pub trait PreparedRefTransaction: Send {
     /// Apply queued updates and release locks.
     ///
     /// Every update becomes visible to readers, or (on error) none does where the backend
-    /// can guarantee it.
+    /// can guarantee it. On the files backend, a compare-and-swap failure writes neither the
+    /// ref nor its reflog entry.
     ///
     /// # Errors
     ///
@@ -75,7 +82,7 @@ pub trait PreparedRefTransaction: Send {
     /// Updates [`RefTransaction::allowing_failures`] skipped during [`Self::commit`]'s prepare.
     ///
     /// Empty when the transaction was not prepared with [`RefTransaction::allowing_failures`].
-    fn rejected_updates(&self) -> &[(String, RefStoreError)] {
+    fn rejected_updates(&self) -> &[(RefName, RefStoreError)] {
         &[]
     }
 
@@ -104,8 +111,10 @@ pub trait PreparedRefTransaction: Send {
 /// through [`Self::prepare`]; see its documentation for the checks it must make. The
 /// [`backend`] module implements those checks and the commit semantics, and the
 /// `grit_test_support::refstore_conformance` suite verifies a store agrees with the built-in
-/// backends. Report failures of your own storage as [`RefStoreError::Backend`] (or
-/// [`crate::error::Error::RefStore`] wrapping it from the `Result` methods).
+/// backends. You must implement [`Self::rewrite_reflog`] with the same writer exclusion as
+/// `prepare`/`commit` for that ref; the suite includes a case that fails unsafe read-transform-write
+/// paths. Report failures of your own storage as [`RefStoreError::Backend`] (or
+/// [`crate::error::RefError::Store`] wrapping it from the `Result` methods).
 pub trait RefStore: Send + Sync + Debug {
     /// Which on-disk or logical format this store uses.
     ///
@@ -115,7 +124,15 @@ pub trait RefStore: Send + Sync + Debug {
     /// Read the stored value for `name` without resolving symbolic targets.
     ///
     /// A missing ref returns `Ok(None)` without allocating a new name string.
-    fn read_raw(&self, name: &str) -> Result<Option<RawRef>>;
+    fn read_raw(&self, name: &RefNameRef) -> Result<Option<RawRef>>;
+
+    /// [`Self::read_raw`] with a trusted UTF-8 name string (from the caller or storage).
+    ///
+    /// Default implementation delegates to [`Self::read_raw`]. Prefer
+    /// [`Self::read_raw`] when you already hold a [`RefName`] / [`RefNameRef`].
+    fn read_raw_str(&self, name: &RefNameRef) -> Result<Option<RawRef>> {
+        self.read_raw(name)
+    }
 
     /// Resolve `name` to an object id, following symbolic refs.
     ///
@@ -126,7 +143,12 @@ pub trait RefStore: Send + Sync + Debug {
     ///
     /// Returns [`RefStoreError::SymrefLoop`] when the chain is too deep and
     /// [`RefStoreError::NotFound`] when `name` or a symbolic target is missing.
-    fn resolve(&self, name: &str) -> Result<ObjectId> {
+    fn resolve(&self, name: &RefNameRef) -> Result<ObjectId> {
+        resolve_store(self, name)
+    }
+
+    /// [`Self::resolve`] for a trusted UTF-8 ref name string.
+    fn resolve_str(&self, name: &RefNameRef) -> Result<ObjectId> {
         resolve_store(self, name)
     }
 
@@ -166,12 +188,17 @@ pub trait RefStore: Send + Sync + Debug {
     ///    [`RefStoreError::NullOid`], and malformed reflog identity or message fields with
     ///    [`RefStoreError::InvalidReflog`].
     /// 2. While another writer holds a lock this transaction needs, fail promptly with
-    ///    [`RefStoreError::LockHeld`] naming this transaction's first ref. Do not spin or
-    ///    queue: grit-lib's ref writes go through [`crate::refs::prepare_with_lock_wait`],
-    ///    which retries with backoff for `core.filesRefLockTimeout`. The files backend takes
-    ///    one lock per ref (plus packed-refs when needed), so only the same ref contends.
-    ///    A store with one writer slot for everything may report every overlap this way, so
-    ///    disjoint refs serialize but still all succeed.
+    ///    [`RefStoreError::LockHeld`] naming this transaction's first ref when the caller
+    ///    uses [`Self::prepare`] or [`Self::prepare_for`] with [`LockWait::Immediately`].
+    ///    Cross-process contention (another process holding a ref lock file) should fail fast
+    ///    so grit-lib can retry with jittered backoff for `core.filesRefLockTimeout`. The
+    ///    files backend takes one lock per ref (plus packed-refs when needed), so only the
+    ///    same ref contends in that case. A store with one in-process writer slot for
+    ///    everything must wait inside [`Self::prepare_for`] using [`SingleWriterGate`] (or
+    ///    equivalent FIFO queueing) for the supplied [`LockWait`]; exponential backoff between
+    ///    immediate [`RefStoreError::LockHeld`] responses is not fair and will starve waiters
+    ///    under load. Only return [`RefStoreError::LockHeld`] from `prepare_for` after the
+    ///    wait budget elapses or for immediate attempts while the slot is busy.
     /// 3. Reject a created ref whose name is a directory prefix of a stored ref or of
     ///    another ref in the batch, or the other way round (`a` vs `a/b`), with
     ///    [`RefStoreError::NameUnavailable`]. Deletes in the same batch do not free a name.
@@ -181,14 +208,14 @@ pub trait RefStore: Send + Sync + Debug {
     /// 5. Reject two updates that write the same stored ref, including through symbolic
     ///    refs, with [`RefStoreError::DuplicateUpdate`].
     ///
-    /// [`backend::check_transaction`] performs steps 1 and 3–5 and
-    /// [`backend::apply_transaction`] defines what [`PreparedRefTransaction::commit`] stores,
-    /// including reflog lines.
+    /// `backend::check_transaction` performs steps 1 and 3–5 and
+    /// `backend::apply_transaction` defines what [`PreparedRefTransaction::commit`] stores,
+    /// including appended reflog lines and removing a deleted ref's reflog.
     ///
     /// A backend does not look at objects. The store
-    /// [`Repository::refs`](crate::repo::Repository::refs) returns (whatever backend it
+    /// [`Repository::ref_store`](crate::repo::Repository::ref_store) returns (whatever backend it
     /// wraps, including one injected with
-    /// [`RepositoryBuilder::ref_store`](crate::repo::RepositoryBuilder::ref_store)) adds one
+    /// [`RepositoryOptions::with_ref_store`](crate::environment::RepositoryOptions::with_ref_store)) adds one
     /// more check before calling the backend. Each direct value must name an object the
     /// repository stores ([`RefStoreError::MissingObject`]). A branch (`refs/heads/…`) or
     /// `HEAD` must name a commit ([`RefStoreError::NotACommit`]). An object that cannot be
@@ -200,10 +227,25 @@ pub trait RefStore: Send + Sync + Debug {
         txn: RefTransaction,
     ) -> StoreResult<Box<dyn PreparedRefTransaction + Send + '_>>;
 
+    /// Like [`Self::prepare`], waiting up to `wait` for an in-process writer slot.
+    ///
+    /// Backends with one writer slot should block here (typically via [`SingleWriterGate`])
+    /// until the slot is free or `wait` expires. Backends that already wait on lock files
+    /// inside `prepare` may ignore `wait` and delegate to [`Self::prepare`]; grit-lib passes
+    /// a shrinking remaining budget when it retries cross-process [`RefStoreError::LockHeld`].
+    fn prepare_for(
+        &self,
+        txn: RefTransaction,
+        wait: LockWait,
+    ) -> StoreResult<Box<dyn PreparedRefTransaction + Send + '_>> {
+        let _ = wait;
+        self.prepare(txn)
+    }
+
     /// Check the objects `updates` would point refs at, without taking any lock or writing.
     ///
     /// This is the object check [`Self::prepare`] makes on the store
-    /// [`Repository::refs`](crate::repo::Repository::refs) returns. Writers that update a ref
+    /// [`Repository::ref_store`](crate::repo::Repository::ref_store) returns. Writers that update a ref
     /// without a transaction (the files-backend fast path behind
     /// [`update_branch_for_commit_on_store`](crate::refs::update_branch_for_commit_on_store))
     /// call it before locking. Backends do not look at objects, so the default accepts
@@ -233,34 +275,64 @@ pub trait RefStore: Send + Sync + Debug {
     }
 
     /// Whether a reflog is present for `name`.
-    fn reflog_exists(&self, name: &str) -> Result<bool>;
+    fn reflog_exists(&self, name: &RefNameRef) -> Result<bool>;
+
+    /// [`Self::reflog_exists`] for a trusted UTF-8 ref name string.
+    fn reflog_exists_str(&self, name: &RefNameRef) -> Result<bool> {
+        self.reflog_exists(name)
+    }
 
     /// Iterate reflog entries for `name` (oldest first unless `reverse`).
     ///
     /// `f` may call back into the store; see [re-entrant callbacks](Self#re-entrant-callbacks).
     fn for_each_reflog_entry(
         &self,
-        name: &str,
+        name: &RefNameRef,
         reverse: bool,
         f: &mut dyn FnMut(&ReflogEntry) -> ControlFlow<()>,
     ) -> Result<()>;
 
+    /// [`Self::for_each_reflog_entry`] for a trusted UTF-8 ref name string.
+    fn for_each_reflog_entry_str(
+        &self,
+        name: &RefNameRef,
+        reverse: bool,
+        f: &mut dyn FnMut(&ReflogEntry) -> ControlFlow<()>,
+    ) -> Result<()> {
+        self.for_each_reflog_entry(name, reverse, f)
+    }
+
     /// Create an empty reflog file/record for `name`.
-    fn create_reflog(&self, name: &str) -> Result<()>;
+    fn create_reflog(&self, name: &RefNameRef) -> Result<()>;
+
+    /// [`Self::create_reflog`] for a trusted UTF-8 ref name string.
+    fn create_reflog_str(&self, name: &RefNameRef) -> Result<()> {
+        self.create_reflog(name)
+    }
 
     /// Remove the reflog for `name`.
-    fn delete_reflog(&self, name: &str) -> Result<()>;
+    fn delete_reflog(&self, name: &RefNameRef) -> Result<()>;
+
+    /// [`Self::delete_reflog`] for a trusted UTF-8 ref name string.
+    fn delete_reflog_str(&self, name: &RefNameRef) -> Result<()> {
+        self.delete_reflog(name)
+    }
 
     /// Replace the entire reflog (used by expire/delete-entries).
-    fn replace_reflog(&self, name: &str, entries: Vec<ReflogEntry>) -> Result<()>;
+    fn replace_reflog(&self, name: &RefNameRef, entries: Vec<ReflogEntry>) -> Result<()>;
+
+    /// [`Self::replace_reflog`] for a trusted UTF-8 ref name string.
+    fn replace_reflog_str(&self, name: &RefNameRef, entries: Vec<ReflogEntry>) -> Result<()> {
+        self.replace_reflog(name, entries)
+    }
 
     /// Read a reflog under the backend writer lock, transform it, and write it back atomically.
     ///
-    /// The closure must not call back into this store. Implementations hold the per-ref lock
-    /// (files backend) or an equivalent writer lock for the whole read-transform-write.
-    ///
-    /// The default reads entries, runs `transform`, and calls [`Self::replace_reflog`], which is
-    /// not safe under concurrent ref updates; built-in backends override this method.
+    /// Custom backends must implement this method; there is no default. Hold the same writer
+    /// exclusion as [`Self::prepare`] / [`PreparedRefTransaction::commit`] for the whole
+    /// read-transform-write on `name`, pass the locked re-read of entries into `transform`, and
+    /// do not call back into this store from `transform` (that deadlocks backends that hold a
+    /// mutex across the call).
     ///
     /// # Errors
     ///
@@ -269,22 +341,23 @@ pub trait RefStore: Send + Sync + Debug {
     /// matches (retry the outer operation).
     fn rewrite_reflog(
         &self,
-        name: &str,
+        name: &RefNameRef,
+        transform: &mut dyn FnMut(Vec<ReflogEntry>) -> Result<Vec<ReflogEntry>>,
+    ) -> Result<()>;
+
+    /// [`Self::rewrite_reflog`] for a trusted UTF-8 ref name string.
+    fn rewrite_reflog_str(
+        &self,
+        name: &RefNameRef,
         transform: &mut dyn FnMut(Vec<ReflogEntry>) -> Result<Vec<ReflogEntry>>,
     ) -> Result<()> {
-        let mut entries = Vec::new();
-        self.for_each_reflog_entry(name, false, &mut |entry| {
-            entries.push(entry.clone());
-            ControlFlow::Continue(())
-        })?;
-        let rewritten = transform(entries)?;
-        self.replace_reflog(name, rewritten)
+        self.rewrite_reflog(name, transform)
     }
 
     /// Invoke `f` for each ref name that has a reflog, in sorted order.
     ///
     /// `f` may call back into the store; see [re-entrant callbacks](Self#re-entrant-callbacks).
-    fn for_each_reflog_ref(&self, f: &mut dyn FnMut(&str) -> ControlFlow<()>) -> Result<()>;
+    fn for_each_reflog_ref(&self, f: &mut dyn FnMut(&RefNameRef) -> ControlFlow<()>) -> Result<()>;
 
     /// The files backend behind this store, when it is one.
     ///
@@ -299,7 +372,7 @@ pub trait RefStore: Send + Sync + Debug {
     ///
     /// The files backend reads `core.filesRefLockTimeout` from its git directory. Injected
     /// backends return Git's 100 ms default unless a wrapper (such as the store returned by
-    /// [`crate::repo::Repository::refs`]) overrides this from the repository git directory.
+    /// [`crate::repo::Repository::ref_store`]) overrides this from the repository git directory.
     fn ref_lock_wait(&self) -> LockWait {
         self.as_files()
             .map(|files| LockWait::files_ref_lock_for_git_dir(files.git_dir()))
@@ -308,24 +381,28 @@ pub trait RefStore: Send + Sync + Debug {
 }
 
 /// Resolve `name` through `store`, following symbolic refs.
-pub fn resolve_store<S: RefStore + ?Sized>(store: &S, name: &str) -> Result<ObjectId> {
+pub fn resolve_store<S: RefStore + ?Sized>(store: &S, name: &RefNameRef) -> Result<ObjectId> {
     resolve_via_raw(store, name, 0).map_err(Into::into)
 }
 
 fn resolve_via_raw<S: RefStore + ?Sized>(
     store: &S,
-    name: &str,
+    name: &RefNameRef,
     depth: usize,
 ) -> StoreResult<ObjectId> {
     if depth >= SYMREF_MAXDEPTH {
         return Err(RefStoreError::SymrefLoop);
     }
     match store.read_raw(name).map_err(|err| match err {
-        crate::error::Error::RefStore(err) => err,
-        other => RefStoreError::Corrupt(other.to_string()),
+        crate::error::Error::Ref(RefError::Store(err)) => err,
+        other => RefStoreError::Corrupt {
+            detail: other.to_string(),
+        },
     })? {
-        None => Err(RefStoreError::not_found(name)),
+        None => Err(RefStoreError::not_found(name.as_str())),
         Some(RawRef::Direct(oid)) => Ok(oid),
-        Some(RawRef::Symbolic(target)) => resolve_via_raw(store, &target, depth + 1),
+        Some(RawRef::Symbolic(target)) => {
+            resolve_via_raw(store, RefNameRef::from_trusted(&target), depth + 1)
+        }
     }
 }

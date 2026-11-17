@@ -10,6 +10,7 @@ use grit_lib::config::environment::{Environment, RepositoryOptions};
 use grit_lib::objects::ObjectId;
 use grit_lib::repo::Repository;
 use grit_lib::revwalk::RevWalkListOptions;
+use grit_lib::worktree::pathspec::{Pathspec, PathspecGlobalFlags};
 
 use support::{git, git_rev_list, open_grit_repo, HistoryRepo};
 
@@ -72,11 +73,11 @@ fn grit_path_commits(
     limit: Option<usize>,
 ) -> Vec<ObjectId> {
     let repo = open_grit_repo(wt);
-    repo.rev_walk()
+    repo.revwalk()
         .commits(
             tokens,
             &RevWalkListOptions {
-                paths: vec![path.to_owned()],
+                pathspec: Pathspec::scoped(vec![path.to_owned()], PathspecGlobalFlags::default()),
                 limit,
                 ..RevWalkListOptions::default()
             },
@@ -132,11 +133,11 @@ fn path_limited_count_and_limit_match_git() {
         .parse::<usize>()
         .expect("git count");
     let grit_count = repo
-        .rev_walk()
+        .revwalk()
         .count(
             &["HEAD"],
             &RevWalkListOptions {
-                paths: vec![path.to_owned()],
+                pathspec: Pathspec::scoped(vec![path.to_owned()], PathspecGlobalFlags::default()),
                 ..RevWalkListOptions::default()
             },
         )
@@ -144,11 +145,11 @@ fn path_limited_count_and_limit_match_git() {
     assert_eq!(grit_count, git_count);
 
     let listed = repo
-        .rev_walk()
+        .revwalk()
         .commits(
             &["HEAD"],
             &RevWalkListOptions {
-                paths: vec![path.to_owned()],
+                pathspec: Pathspec::scoped(vec![path.to_owned()], PathspecGlobalFlags::default()),
                 ..RevWalkListOptions::default()
             },
         )
@@ -157,11 +158,11 @@ fn path_limited_count_and_limit_match_git() {
 
     let git_limit = git(wt, &["rev-list", "-3", "HEAD", "--", path]);
     let grit_limit = repo
-        .rev_walk()
+        .revwalk()
         .commits(
             &["HEAD"],
             &RevWalkListOptions {
-                paths: vec![path.to_owned()],
+                pathspec: Pathspec::scoped(vec![path.to_owned()], PathspecGlobalFlags::default()),
                 limit: Some(3),
                 ..RevWalkListOptions::default()
             },
@@ -284,11 +285,11 @@ fn path_limited_exclude_only_pathspec_matches_git() {
         .expect("git count");
     let repo = open_grit_repo(wt);
     let grit_count = repo
-        .rev_walk()
+        .revwalk()
         .count(
             &["HEAD"],
             &RevWalkListOptions {
-                paths: vec![spec.into()],
+                pathspec: Pathspec::scoped(vec![spec.to_owned()], PathspecGlobalFlags::default()),
                 ..RevWalkListOptions::default()
             },
         )
@@ -329,11 +330,11 @@ fn path_limited_root_gitlink_matches_git() {
         .expect("git count");
     let repo = open_grit_repo(wt);
     let grit_count = repo
-        .rev_walk()
+        .revwalk()
         .count(
             &[orphan.as_str()],
             &RevWalkListOptions {
-                paths: vec!["sub".into()],
+                pathspec: Pathspec::scoped(["sub"], PathspecGlobalFlags::default()),
                 ..RevWalkListOptions::default()
             },
         )
@@ -344,11 +345,11 @@ fn path_limited_root_gitlink_matches_git() {
 
 fn grit_path_count(wt: &std::path::Path, path: &str) -> usize {
     open_grit_repo(wt)
-        .rev_walk()
+        .revwalk()
         .count(
             &["HEAD"],
             &RevWalkListOptions {
-                paths: vec![path.to_owned()],
+                pathspec: Pathspec::scoped(vec![path.to_owned()], PathspecGlobalFlags::default()),
                 ..RevWalkListOptions::default()
             },
         )
@@ -629,11 +630,11 @@ fn path_limited_from_subdirectory_cwd_matches_git() {
 
     let repo = open_grit_repo_from_cwd(wt, &sub);
     let grit_count_file = repo
-        .rev_walk()
+        .revwalk()
         .count(
             &["HEAD"],
             &RevWalkListOptions {
-                paths: vec!["f.txt".to_owned()],
+                pathspec: Pathspec::scoped(["f.txt"], PathspecGlobalFlags::default()),
                 ..RevWalkListOptions::default()
             },
         )
@@ -641,11 +642,11 @@ fn path_limited_from_subdirectory_cwd_matches_git() {
     assert_eq!(grit_count_file, git_count_file);
 
     let grit_count_dot = repo
-        .rev_walk()
+        .revwalk()
         .count(
             &["HEAD"],
             &RevWalkListOptions {
-                paths: vec![".".to_owned()],
+                pathspec: Pathspec::scoped(["."], PathspecGlobalFlags::default()),
                 ..RevWalkListOptions::default()
             },
         )
@@ -668,11 +669,11 @@ fn path_limited_from_subdirectory_cwd_matches_git() {
         .collect();
 
     let grit_commits = repo
-        .rev_walk()
+        .revwalk()
         .commits(
             &["HEAD"],
             &RevWalkListOptions {
-                paths: vec!["f.txt".to_owned()],
+                pathspec: Pathspec::scoped(["f.txt"], PathspecGlobalFlags::default()),
                 ..RevWalkListOptions::default()
             },
         )
@@ -701,11 +702,11 @@ fn path_limited_from_subdirectory_cwd_matches_git() {
     assert_eq!(git_top_count, git_count_file);
 
     let grit_top_count = repo
-        .rev_walk()
+        .revwalk()
         .count(
             &["HEAD"],
             &RevWalkListOptions {
-                paths: vec![top_spec],
+                pathspec: Pathspec::scoped(vec![top_spec], PathspecGlobalFlags::default()),
                 ..RevWalkListOptions::default()
             },
         )
@@ -726,11 +727,14 @@ fn path_limited_from_subdirectory_cwd_matches_git() {
             .parse()
             .expect("git count");
         let grit_count = repo
-            .rev_walk()
+            .revwalk()
             .count(
                 &["HEAD"],
                 &RevWalkListOptions {
-                    paths: vec![path_spec.to_owned()],
+                    pathspec: Pathspec::scoped(
+                        vec![path_spec.to_owned()],
+                        PathspecGlobalFlags::default(),
+                    ),
                     ..RevWalkListOptions::default()
                 },
             )
@@ -877,7 +881,7 @@ fn path_limited_packed_delta_trees_match_git_log() {
 
 #[test]
 fn packed_path_history_modes_match_git_with_bloom_and_both_hashes() {
-    use grit_lib::revwalk::rev_list::{rev_list, RevListOptions};
+    use grit_lib::revwalk::rev_list::RevListOptions;
 
     for hash in ["sha1", "sha256"] {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -913,21 +917,22 @@ fn packed_path_history_modes_match_git_with_bloom_and_both_hashes() {
                     }
                     args.extend(["--", path]);
                     let expected: Vec<String> = git(wt, &args).lines().map(str::to_owned).collect();
-                    let actual = rev_list(
-                        &repo,
-                        &["HEAD".to_owned()],
-                        &[],
-                        &RevListOptions {
-                            paths: vec![path.to_owned()],
-                            sparse,
-                            show_pulls,
-                            first_parent,
-                            use_commit_graph: with_graph,
-                            use_commit_graph_bloom: with_graph,
-                            ..RevListOptions::default()
-                        },
-                    )
-                    .expect("path history");
+                    let actual = repo
+                        .revwalk()
+                        .rev_list(
+                            &["HEAD".to_owned()],
+                            &[],
+                            &RevListOptions {
+                                paths: vec![path.to_owned()],
+                                sparse,
+                                show_pulls,
+                                first_parent,
+                                use_commit_graph: with_graph,
+                                use_commit_graph_bloom: with_graph,
+                                ..RevListOptions::default()
+                            },
+                        )
+                        .expect("path history");
                     assert_eq!(
                         actual
                             .commits

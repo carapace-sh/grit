@@ -43,11 +43,38 @@ ENTRY = "integration.rs"
 
 # Integration modules that must stay in the default suite despite using system git.
 DEFAULT_SUITE_OVERRIDE: set[tuple[str, str]] = {
+    ("grit-lib", "fetch_reflog_git_compat"),
+    ("grit-lib", "merge_df_integrate_issue_2359"),
+    ("grit-lib", "merge_file_issue_2369_git_compat"),
+    ("grit-lib", "push_packed_tag_regression"),
+    ("grit-lib", "refs_handle_git_roundtrip"),
+    ("grit-lib", "push_tag_update_git_compat"),
+    ("grit-cli", "push_tag_exists"),
+    ("grit-lib", "push_path_tracking_git_compat"),
+    ("grit-cli", "push_path_destination_tracking"),
+    ("grit-cli", "switch_create_upstream"),
     ("grit-lib", "reset_hard_at_head_restores_worktree"),
+    ("grit-lib", "reset_hard_gitlink_stat_2559"),
+    ("grit-lib", "pathspec_attr_porcelain"),
+    ("grit-lib", "rev_list_attr_pathspec"),
+    ("grit-lib", "serve_upload_pack_advertise"),
     ("grit-lib", "status_index_refresh_race"),
+    ("grit-lib", "clean_dir_mode_clean_tree_perf_git_compat"),
+    ("grit-lib", "commit_show_untracked_no_2523"),
+    ("grit-cli", "clone_url_redaction"),
+    ("grit-lib", "clone_stored_origin_url_2562"),
+    ("grit-lib", "refname_policy"),
+    ("grit-lib", "revwalk_resolve_options_git_compat"),
+    ("grit-lib", "repository_conformance_files"),
+    ("grit-lib", "repository_conformance_memory"),
+    ("grit-lib", "repository_conformance_parity"),
+    ("grit-lib", "stash_pop_untracked_rollback"),
+    ("grit-lib", "one_form_handles_git_compat"),
+    ("grit-lib", "text_diff_options"),
 }
 MODULE_CFG_OVERRIDE: dict[tuple[str, str], str] = {
     ("grit-cli", "rebase_exec_interrupt"): "unix",
+    ("grit-lib", "release_unused_heap"): 'all(target_os = "linux", target_env = "gnu")',
 }
 
 GUARD = '''
@@ -62,7 +89,7 @@ fn every_test_file_is_compiled() {
     for item in std::fs::read_dir(&dir).expect("read tests/") {
         let name = item.expect("tests/ entry").file_name();
         let Some(name) = name.to_str() else { continue };
-        if !name.ends_with(".rs") || name == "integration.rs" {
+        if !name.ends_with(".rs") || name == "integration.rs" || name.ends_with("_data.rs") {
             continue;
         }
         let module = format!("#[path = \\"{name}\\"]");
@@ -121,6 +148,12 @@ def render(crate: str, modules: list[tuple[str, bool]], helpers: list[str]) -> s
         lines.append("// Helpers the test modules share, compiled once.")
         lines += [f"mod {h};" for h in helpers]
         lines.append("")
+    if crate == "grit-lib":
+        lines.append(
+            "// Integration modules refer to `crate::config` for load options and types."
+        )
+        lines.append("pub use grit_lib::config;")
+        lines.append("")
     for stem, full in modules:
         if (crate, stem) in DEFAULT_SUITE_OVERRIDE:
             pass
@@ -156,7 +189,11 @@ def sync(crate: str, shared: set[str]) -> bool:
     full_separate = {n for n in separate if classify_tests.file_is_full(tests / n, shared)}
     new_manifest = require_full_tests(manifest, full_separate)
     files = sorted(
-        p for p in tests.glob("*.rs") if p.name != ENTRY and p.name not in separate
+        p
+        for p in tests.glob("*.rs")
+        if p.name != ENTRY
+        and p.name not in separate
+        and not p.name.endswith("_data.rs")
     )
     modules = [(p.stem, classify_tests.file_is_full(p, shared) is not None) for p in files]
     text = render(crate, modules, hoisted_helpers(tests, files))

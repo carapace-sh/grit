@@ -9,12 +9,8 @@ use grit_lib::command_runner::hooks::HookError;
 use grit_lib::error::{Error as LibError, OverwriteReason};
 use grit_lib::lockfile::LockHolder;
 use grit_lib::objects::ObjectId;
-use grit_lib::porcelain::pull::PullError;
-use grit_lib::remote::clone::CloneError;
-use grit_lib::remote::RemoteError;
 use grit_lib::repo::Repository;
-use grit_lib::revwalk::rev_parse_error::RevParseError;
-use grit_lib::state::{wt_status_get_state, HeadState, InProgressOperation, NextStep, Operation};
+use grit_lib::state::{InProgressOperation, NextStep, Operation};
 use schemars::JsonSchema;
 use serde::Serialize;
 
@@ -125,6 +121,11 @@ pub struct StructuredJsonError {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(skip_serializing_if = "Option::is_none")]
     pub clone_checkout: Option<CloneCheckoutJson>,
+    /// The refused operation's stable snake_case name (`gc`, `commit_graph_write`, …), when
+    /// `kind == "unsupported_object_store"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(skip_serializing_if = "Option::is_none")]
+    pub operation: Option<&'static str>,
 }
 
 impl StructuredJsonError {
@@ -144,6 +145,7 @@ impl StructuredJsonError {
             hint: None,
             lock: None,
             clone_checkout: None,
+            operation: None,
         }
     }
 }
@@ -161,7 +163,7 @@ pub struct HookFailureJson {
     pub stderr: String,
 }
 
-/// A [`HookError`] anywhere in `err`'s chain, bare or wrapped in [`LibError::Hook`].
+/// A [`HookError`] anywhere in `err`'s chain, bare or wrapped in the library hook error.
 pub fn hook_error_from_chain(err: &Error) -> Option<&HookError> {
     err.chain()
         .find_map(|cause| match cause.downcast_ref::<LibError>() {
@@ -170,7 +172,7 @@ pub fn hook_error_from_chain(err: &Error) -> Option<&HookError> {
         })
 }
 
-/// A failed hook with the next step as `hint`. The [`LibError::Hook`] stays in the chain, so
+/// A failed hook with the next step as `hint`. The library hook error stays in the chain, so
 /// the hook's captured output is still rendered.
 pub fn hook_failed_with_hint(err: LibError, hint: &str) -> Error {
     let err = Error::new(err);
@@ -182,7 +184,7 @@ pub fn hook_failed_with_hint(err: LibError, hint: &str) -> Error {
     err.context(StructuredCliError { payload, human })
 }
 
-fn hook_failure_payload(err: &Error) -> Option<StructuredJsonError> {
+pub(crate) fn hook_failure_payload(err: &Error) -> Option<StructuredJsonError> {
     let hook = hook_error_from_chain(err)?;
     let HookError::Failed {
         hook_name,
@@ -311,10 +313,21 @@ pub fn operation_in_progress_for_repo(
     action: &str,
     kind: InProgressOperation,
 ) -> Error {
-    let operation = wt_status_get_state(repo.git_dir(), &HeadState::Invalid, false)
+    let operation = repo
+        .operation()
+        .status_state()
         .ok()
         .and_then(|state| grit_lib::state::status_operation(&state, false));
     operation_in_progress(action, kind, operation.as_ref())
+}
+
+/// Structured failure when merge/rebase/pick/revert `--continue` or `--abort` has nothing paused.
+pub fn no_operation_in_progress(human: impl Into<String>) -> Error {
+    let human = human.into();
+    Error::new(StructuredCliError {
+        payload: StructuredJsonError::new(human.clone(), ErrorKind::NoOperationInProgress),
+        human,
+    })
 }
 
 pub fn operation_in_progress(
@@ -380,47 +393,7 @@ pub fn structured_revision_not_found(human: impl Into<String>) -> Error {
     })
 }
 
-/// Detect rev-parse misses that should surface as `revision_not_found` (not every [`LibError`]).
-fn revision_not_found_payload_from_chain(err: &Error) -> Option<StructuredJsonError> {
-    for cause in err.chain() {
-        let Some(lib) = cause.downcast_ref::<LibError>() else {
-            continue;
-        };
-        match lib {
-            LibError::RevParse(RevParseError::InvalidObjectName { name }) => {
-                return Some(StructuredJsonError::new(
-                    format!("revision '{name}' not found"),
-                    ErrorKind::RevisionNotFound,
-                ));
-            }
-            LibError::RevParse(RevParseError::AmbiguousArgument { spec }) => {
-                return Some(StructuredJsonError::new(
-                    format!("revision '{spec}' not found"),
-                    ErrorKind::RevisionNotFound,
-                ));
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-/// Map a library error to `anyhow`, using structured JSON for typed failures.
-pub fn map_lib_error(err: LibError) -> Error {
-    match err {
-        LibError::HashCollision { oid } => hash_collision(oid),
-        LibError::RevisionNotFound(spec) => revision_not_found(&spec),
-        LibError::UnbornHead => crate::unborn_errors::unborn_head_from_cwd()
-            .unwrap_or_else(|| crate::unborn_errors::unborn_head_error(None)),
-        LibError::WouldOverwrite {
-            reason,
-            paths,
-            message,
-        } => would_overwrite_error(reason, paths, message),
-        LibError::LockHeld { path, holder } => lock_held(&path, holder),
-        other => Error::new(other),
-    }
-}
+pub use crate::error_map::map_lib_error;
 
 /// Build a structured CLI error for a lock file that already exists.
 #[cold]
@@ -455,131 +428,21 @@ pub fn lock_held(path: &Path, holder: Option<LockHolder>) -> Error {
     })
 }
 
-/// Wrap [`LibError::LockHeld`] anywhere in the chain as [`StructuredCliError`].
-fn lock_held_from_chain(err: &Error) -> Option<Error> {
-    err.chain()
-        .find_map(|cause| match cause.downcast_ref::<LibError>() {
-            Some(LibError::LockHeld { path, holder }) => Some(lock_held(path, *holder)),
-            _ => None,
-        })
-}
-
-fn hash_collision_from_chain(err: &Error) -> Option<ObjectId> {
-    if let Some(LibError::HashCollision { oid }) = err.downcast_ref::<LibError>() {
-        return Some(*oid);
-    }
-    for cause in err.chain() {
-        if let Some(LibError::HashCollision { oid }) = cause.downcast_ref::<LibError>() {
-            return Some(*oid);
-        }
-    }
-    None
-}
-
-/// Wrap [`LibError::HashCollision`] anywhere in the chain as [`StructuredCliError`].
-fn would_overwrite_from_chain(err: &Error) -> Option<Error> {
-    if let Some(LibError::WouldOverwrite {
-        reason,
-        paths,
-        message,
-    }) = err.downcast_ref::<LibError>()
-    {
-        return Some(would_overwrite_error(
-            *reason,
-            paths.clone(),
-            message.clone(),
-        ));
-    }
-    for cause in err.chain() {
-        if let Some(LibError::WouldOverwrite {
-            reason,
-            paths,
-            message,
-        }) = cause.downcast_ref::<LibError>()
-        {
-            return Some(would_overwrite_error(
-                *reason,
-                paths.clone(),
-                message.clone(),
-            ));
-        }
-    }
-    None
-}
-
 /// Wrap typed library failures anywhere in the chain as [`StructuredCliError`].
 pub fn ensure_structured(err: Error) -> Error {
     if err.downcast_ref::<StructuredCliError>().is_some() {
         return err;
     }
-    if let Some(guided) = error_hints::guided_error(&err) {
-        return guided;
-    }
-    if let Some(structured) = lock_held_from_chain(&err) {
-        return structured;
-    }
-    if structured_json_payload(&err).is_some() {
-        return err;
-    }
-    if let Some(oid) = hash_collision_from_chain(&err) {
-        return hash_collision(oid);
-    }
-    if let Some(structured) = would_overwrite_from_chain(&err) {
-        return structured;
-    }
-    if let Some(payload) = revision_not_found_payload_from_chain(&err) {
-        let human = payload.error.clone();
-        return Error::new(StructuredCliError { payload, human });
+    let classified = crate::error_map::classify(&err);
+    if classified.payload.is_some() {
+        return classified.into_anyhow();
     }
     crate::unborn_errors::enrich_unborn_head(err)
 }
 
-/// Whether `err` carries a library failure to reach or read the remote.
-///
-/// Wrapper errors such as [`CloneError`] forward their message transparently, which hides the
-/// inner [`LibError`] from [`Error::chain`], so each wrapper is asked directly.
-fn is_remote_unreadable(err: &Error) -> bool {
-    err.chain().any(|cause| {
-        cause
-            .downcast_ref::<LibError>()
-            .is_some_and(LibError::is_remote_unreadable)
-            || cause
-                .downcast_ref::<RemoteError>()
-                .is_some_and(RemoteError::is_remote_unreadable)
-            || cause
-                .downcast_ref::<CloneError>()
-                .is_some_and(CloneError::is_remote_unreadable)
-            || cause
-                .downcast_ref::<PullError>()
-                .is_some_and(PullError::is_remote_unreadable)
-    })
-}
-
 /// If `err` wraps a [`StructuredCliError`], return its JSON payload.
 pub fn structured_json_payload(err: &Error) -> Option<StructuredJsonError> {
-    if let Some(e) = err.downcast_ref::<StructuredCliError>() {
-        return Some(e.payload.clone());
-    }
-    if let Some(payload) = hook_failure_payload(err) {
-        return Some(payload);
-    }
-    if is_remote_unreadable(err) {
-        return Some(StructuredJsonError::new(
-            crate::cli_messages::human_error_message(err),
-            ErrorKind::RemoteUnreadable,
-        ));
-    }
-    hash_collision_from_chain(err)
-        .map(|oid| StructuredJsonError {
-            oid: Some(oid.to_hex()),
-            ..StructuredJsonError::new("SHA-1 hash collision", ErrorKind::HashCollision)
-        })
-        .or_else(|| {
-            lock_held_from_chain(err)?
-                .downcast_ref::<StructuredCliError>()
-                .map(|structured| structured.payload.clone())
-        })
-        .or_else(|| revision_not_found_payload_from_chain(err))
+    crate::error_map::classify(err).payload
 }
 
 /// Build a structured error for incompatible `--json` / `--markdown` flag combinations.
@@ -603,8 +466,8 @@ impl fmt::Display for InvalidCommitFilterExit {
 
 impl StdError for InvalidCommitFilterExit {}
 
-/// Build a structured CLI error from [`grit_lib::revwalk::filter::CommitFilterError`].
-pub fn invalid_commit_filter(err: grit_lib::revwalk::filter::CommitFilterError) -> Error {
+/// Build a structured CLI error from [`grit_lib::revwalk::CommitFilterError`].
+pub fn invalid_commit_filter(err: grit_lib::revwalk::CommitFilterError) -> Error {
     let human = err.to_string();
     Error::new(StructuredCliError {
         payload: StructuredJsonError::new(human.clone(), ErrorKind::InvalidPattern),

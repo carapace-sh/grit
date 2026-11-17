@@ -1,4 +1,4 @@
-//! `RepositoryRemotes::set_url` and verbose remote metadata vs the system `git`.
+//! `Remotes::set_url` and verbose remote metadata vs the system `git`.
 
 use std::path::Path;
 use std::process::Command;
@@ -109,7 +109,7 @@ fn set_url_unknown_remote_typed_error() {
     assert!(matches!(
         repo.remotes()
             .set_url("missing", "x", RemoteUrlKind::Fetch, false),
-        Err(RemoteError::UnknownRemote(name)) if name == "missing"
+        Err(RemoteError::UnknownRemote { name }) if name == "missing"
     ));
 }
 
@@ -269,11 +269,15 @@ fn push_after_set_url_uses_new_pushurl() {
         .expect("set push url");
 
     let client_repo = open(&client);
-    let main_oid =
-        grit_lib::refs::resolve_ref(client_repo.git_dir(), "refs/heads/main").expect("main oid");
-    let remote =
-        grit_lib::remote::Remote::from_config(&client_repo.config().expect("config"), "origin")
-            .expect("remote");
+    let main_oid = client_repo
+        .references()
+        .resolve("refs/heads/main")
+        .expect("main oid");
+    let remote = grit_lib::remote::Remote::from_config(
+        &client_repo.config().snapshot().expect("config"),
+        "origin",
+    )
+    .expect("remote");
     client_repo
         .remotes()
         .push(
@@ -287,7 +291,7 @@ fn push_after_set_url_uses_new_pushurl() {
             }],
             grit_lib::remote::transfer::PushOptions::default(),
             &mut grit_lib::remote::fetch::NoProgress,
-            &grit_lib::progress::NeverCancel,
+            &grit_lib::progress::CancelToken::never(),
             None,
         )
         .expect("push");

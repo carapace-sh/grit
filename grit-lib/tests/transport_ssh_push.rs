@@ -35,9 +35,6 @@ use std::process::Command;
 
 use grit_lib::objects::odb::Odb;
 use grit_lib::objects::ObjectId;
-use grit_lib::refs::resolve_ref;
-use grit_lib::remote::fetch::NoProgress;
-use grit_lib::remote::push::push_remote;
 use grit_lib::remote::push_report::PushRefStatus;
 use grit_lib::remote::transfer::{PushOptions, PushRefSpec};
 use grit_lib::remote::transport::{ConnectOptions, Service, SshTransport, Transport};
@@ -161,13 +158,18 @@ fn push_over_ssh_lands_ref_and_objects_and_reports_nonff_rejection() {
         conn.advertised_refs()
     );
 
-    let outcome = push_remote(
+    let outcome = grit_lib::repo::Repository::open(
         &local_git,
-        &mut *conn,
+        &grit_lib::config::environment::RepositoryOptions::empty(),
+    )
+    .expect("open push source")
+    .remotes()
+    .push_to(
+        grit_lib::remote::transfer::TransferEndpoint::Connection(&mut *conn),
         &[spec_update(main_oid, "refs/heads/main", false)],
         &PushOptions::default(),
         &mut NoProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("push_remote over ssh");
     drop(conn);
@@ -185,7 +187,10 @@ fn push_over_ssh_lands_ref_and_objects_and_reports_nonff_rejection() {
     assert!(r.old_oid.is_none(), "new ref has no old value");
 
     // The remote ref now points at our main, and the objects are present.
-    let remote_main = resolve_ref(&bare, "refs/heads/main").expect("remote main written");
+    let remote_main = grit_test_support::refs::at(&bare)
+        .references()
+        .resolve("refs/heads/main")
+        .expect("remote main written");
     assert_eq!(remote_main, main_oid, "remote main oid mismatch");
 
     let remote_odb = open_odb(&bare);
@@ -237,13 +242,18 @@ fn push_over_ssh_lands_ref_and_objects_and_reports_nonff_rejection() {
         main_oid.to_hex()
     );
 
-    let outcome2 = push_remote(
+    let outcome2 = grit_lib::repo::Repository::open(
         &local_git,
-        &mut *conn2,
+        &grit_lib::config::environment::RepositoryOptions::empty(),
+    )
+    .expect("open push source")
+    .remotes()
+    .push_to(
+        grit_lib::remote::transfer::TransferEndpoint::Connection(&mut *conn2),
         &[spec_update(diverged, "refs/heads/main", false)],
         &PushOptions::default(),
         &mut NoProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("non-ff push_remote over ssh completes");
     drop(conn2);
@@ -257,12 +267,15 @@ fn push_over_ssh_lands_ref_and_objects_and_reports_nonff_rejection() {
     );
     assert_eq!(
         r2.status,
-        PushRefStatus::RejectNonFastForward,
-        "client-side non-ff detection should reject before sending"
+        PushRefStatus::RejectNeedsForce,
+        "client-side diverged non-ff detection should reject before sending"
     );
 
     // The remote ref must be unchanged by the rejected push.
-    let remote_main_after = resolve_ref(&bare, "refs/heads/main").expect("remote main still set");
+    let remote_main_after = grit_test_support::refs::at(&bare)
+        .references()
+        .resolve("refs/heads/main")
+        .expect("remote main still set");
     assert_eq!(
         remote_main_after, main_oid,
         "rejected non-ff ssh push must not move the remote ref"
@@ -275,13 +288,18 @@ fn push_over_ssh_lands_ref_and_objects_and_reports_nonff_rejection() {
     let mut conn3 = transport
         .connect(&url, Service::ReceivePack, &ConnectOptions::default())
         .expect("reconnect for forced ssh push");
-    let outcome3 = push_remote(
+    let outcome3 = grit_lib::repo::Repository::open(
         &local_git,
-        &mut *conn3,
+        &grit_lib::config::environment::RepositoryOptions::empty(),
+    )
+    .expect("open push source")
+    .remotes()
+    .push_to(
+        grit_lib::remote::transfer::TransferEndpoint::Connection(&mut *conn3),
         &[spec_update(diverged, "refs/heads/main", true)],
         &PushOptions::default(),
         &mut NoProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("forced push_remote over ssh completes");
     drop(conn3);
@@ -298,8 +316,10 @@ fn push_over_ssh_lands_ref_and_objects_and_reports_nonff_rejection() {
     assert!(r3.forced, "forced update should be flagged forced");
     assert_eq!(r3.new_oid, Some(diverged));
 
-    let remote_main_forced =
-        resolve_ref(&bare, "refs/heads/main").expect("remote main after force");
+    let remote_main_forced = grit_test_support::refs::at(&bare)
+        .references()
+        .resolve("refs/heads/main")
+        .expect("remote main after force");
     assert_eq!(
         remote_main_forced, diverged,
         "forced ssh push must advance the remote ref to the divergent tip"
@@ -360,13 +380,18 @@ fn incremental_ssh_push_with_advertised_blob_and_tree_tags() {
         .connect(&url, Service::ReceivePack, &ConnectOptions::default())
         .expect("receive-pack connection");
     assert_eq!(conn.advertised_refs().len(), 3);
-    let outcome = push_remote(
+    let outcome = grit_lib::repo::Repository::open(
         &local.join(".git"),
-        &mut *conn,
+        &grit_lib::config::environment::RepositoryOptions::empty(),
+    )
+    .expect("open push source")
+    .remotes()
+    .push_to(
+        grit_lib::remote::transfer::TransferEndpoint::Connection(&mut *conn),
         &[spec_update(tip, "refs/heads/main", false)],
         &PushOptions::default(),
         &mut NoProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("incremental push with non-commit tags");
     drop(conn);
@@ -434,13 +459,18 @@ fn one_commit_ssh_push_over_many_advertised_tips_sends_a_thin_pack() {
         .connect(&url, Service::ReceivePack, &ConnectOptions::default())
         .expect("receive-pack connection");
     assert_eq!(conn.advertised_refs().len(), 61);
-    let outcome = push_remote(
+    let outcome = grit_lib::repo::Repository::open(
         &local.join(".git"),
-        &mut *conn,
+        &grit_lib::config::environment::RepositoryOptions::empty(),
+    )
+    .expect("open push source")
+    .remotes()
+    .push_to(
+        grit_lib::remote::transfer::TransferEndpoint::Connection(&mut *conn),
         &[spec_update(tip, "refs/heads/main", false)],
         &PushOptions::default(),
         &mut NoProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("push one commit");
     drop(conn);

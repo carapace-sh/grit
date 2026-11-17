@@ -6,8 +6,9 @@ use std::hint::black_box;
 use std::io::Cursor;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
-use grit_lib::{read_sideband_pack_to, PackReceiveTarget};
+use grit_lib::objects::pack_receive::{read_sideband_pack_to, PackReceiveTarget};
 
+use crate::progress::CancelToken;
 use grit_lib::remote::fetch::NoProgress;
 
 fn sideband_band1_stream(pack_bytes: usize) -> Vec<u8> {
@@ -46,11 +47,12 @@ fn bench_sideband_demux(c: &mut Criterion) {
             b.iter(|| {
                 let mut target_buf = Vec::with_capacity(size);
                 let mut target = PackReceiveTarget::Memory(&mut target_buf);
-                let mut progress = NoProgress;
+                let mut progress = NullProgress;
                 read_sideband_pack_to(
                     &mut Cursor::new(stream.as_slice()),
                     &mut target,
                     &mut progress,
+                    &CancelToken::never(),
                 )
                 .expect("demux");
                 black_box(target_buf.len())

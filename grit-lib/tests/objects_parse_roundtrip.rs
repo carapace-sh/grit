@@ -1,5 +1,6 @@
 //! Parse/serialize round-trips for Git objects (t1006/t1007 object bodies).
 
+use grit_lib::error::ObjectError;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
@@ -96,8 +97,7 @@ fn git_mktree(repo: &RepoFixture, lines: &str) -> String {
 }
 
 fn sort_tree_entries(entries: &mut [TreeEntry]) {
-    entries
-        .sort_by(|a, b| tree_entry_cmp(&a.name, a.mode == 0o040000, &b.name, b.mode == 0o040000));
+    entries.sort_by(|a, b| tree_entry_cmp(&a.name, a.mode, &b.name, b.mode));
 }
 
 #[test]
@@ -273,21 +273,21 @@ fn tree_sorting_gitlinks_symlinks_and_mode_100664() {
 fn object_id_from_hex_errors_are_typed() {
     assert!(matches!(
         ObjectId::from_hex("not-hex"),
-        Err(Error::InvalidObjectId(_))
+        Err(Error::Object(ObjectError::InvalidId { .. }))
     ));
     assert!(matches!(
         ObjectId::from_hex("abc"),
-        Err(Error::InvalidObjectId(_))
+        Err(Error::Object(ObjectError::InvalidId { .. }))
     ));
     let short = "a".repeat(39);
     assert!(matches!(
         ObjectId::from_hex(&short),
-        Err(Error::InvalidObjectId(_))
+        Err(Error::Object(ObjectError::InvalidId { .. }))
     ));
     let valid_len_non_hex = "g".repeat(40);
     assert!(matches!(
         ObjectId::from_hex(&valid_len_non_hex),
-        Err(Error::InvalidObjectId(_))
+        Err(Error::Object(ObjectError::InvalidId { .. }))
     ));
 }
 
@@ -302,6 +302,39 @@ fn hash_algo_name_and_len_parse_failures() {
 }
 
 #[test]
+fn parse_tag_non_utf8_message_roundtrip_preserves_bytes() {
+    let repo = init_repo(HashAlgo::Sha1);
+    git_trim(&repo, &["config", "user.email", "a@b"]);
+    git_trim(&repo, &["config", "user.name", "T"]);
+    std::fs::write(repo.path().join("f"), "1\n").unwrap();
+    git_trim(&repo, &["add", "f"]);
+    git_trim(&repo, &["commit", "-qm", "init"]);
+    let out = Command::new("bash")
+        .current_dir(repo.path())
+        .args(["-c", "git tag -a -m $'release caf\\xe9' v1"])
+        .output()
+        .expect("git tag");
+    assert!(
+        out.status.success(),
+        "git tag: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let tag_oid = git_trim(&repo, &["rev-parse", "v1"]);
+    let original = git_cat_file_object(&repo, "tag", &tag_oid);
+    let parsed = parse_tag(&original).expect("parse non-UTF-8 tag");
+    assert!(
+        parsed.message.contains('\u{FFFD}'),
+        "lossy decode: {:?}",
+        parsed.message
+    );
+    assert!(parsed.raw_message.is_some());
+    let round = serialize_tag(&parsed);
+    assert_eq!(round, original);
+    let git_oid = git_hash_object_stdin(&repo, "tag", &round);
+    assert_eq!(git_oid, tag_oid);
+}
+
+#[test]
 fn serialize_tag_empty_message_has_no_extra_blank_line() {
     let tree = ObjectId::from_hex("4b825dc642cb6eb9a060e54bf8d69288fbee4904").unwrap();
     let tag = TagData {
@@ -311,6 +344,7 @@ fn serialize_tag_empty_message_has_no_extra_blank_line() {
         tagger: None,
         extra_headers: Vec::new(),
         message: String::new(),
+        raw_message: None,
     };
     let bytes = serialize_tag(&tag);
     let parsed = parse_tag(&bytes).expect("parse");
@@ -345,6 +379,7 @@ fn serialize_parse_commit_tag_tree_identity() {
         tagger: Some("T <t@example.com> 1 +0000".to_string()),
         extra_headers: Vec::new(),
         message: "tag msg".to_string(),
+        raw_message: None,
     };
     let tag_bytes = serialize_tag(&tag);
     let tag_back = parse_tag(&tag_bytes).unwrap();
@@ -404,37 +439,37 @@ fn object_id_display_and_is_full_hex() {
 fn parse_errors_use_typed_variants() {
     assert!(matches!(
         parse_commit(b"author x\n\n".as_ref()),
-        Err(Error::CorruptObject(_))
+        Err(Error::Object(ObjectError::Corrupt { .. }))
     ));
     assert!(matches!(
         parse_tag(b"object".as_ref()),
-        Err(Error::CorruptObject(_))
+        Err(Error::Object(ObjectError::Corrupt { .. }))
     ));
     assert!(matches!(
         parse_tag(
             b"object 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n\
 type not-a-kind\ntag t\n\n"
         ),
-        Err(Error::CorruptObject(_))
+        Err(Error::Object(ObjectError::Corrupt { .. }))
     ));
     assert!(matches!(
         parse_tree(b"100644 incomplete".as_ref()),
-        Err(Error::CorruptObject(_))
+        Err(Error::Object(ObjectError::Corrupt { .. }))
     ));
     assert!(matches!(
         ObjectKind::from_bytes(b"not-a-type"),
-        Err(Error::UnknownObjectType(_))
+        Err(Error::Object(ObjectError::UnknownType { .. }))
     ));
 }
 
 #[test]
 fn tree_entry_cmp_matches_git_directory_ordering() {
     assert_eq!(
-        tree_entry_cmp(b"foo", true, b"foo-bar", false),
+        tree_entry_cmp(b"foo", 0o040000, b"foo-bar", 0o100644),
         std::cmp::Ordering::Greater
     );
     assert_eq!(
-        tree_entry_cmp(b"foo", false, b"foo", true),
+        tree_entry_cmp(b"foo", 0o100644, b"foo", 0o040000),
         std::cmp::Ordering::Less
     );
 }

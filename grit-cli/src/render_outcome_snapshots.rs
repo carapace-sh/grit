@@ -2,6 +2,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use grit_test_support::CliFixture;
@@ -17,9 +18,9 @@ use crate::commands::checkout::{
 };
 use crate::commands::pull::{PullOutcome, PullResult};
 use crate::commands::serve_http::{ServeGrantJson, ServeUserJson, ServeUsersOutcome};
-use crate::commands::slice::{SliceJson, SliceListOutcome};
 use crate::commands::update::UpdateOutcome;
 use crate::output::{render_to_string, HumanRender, MarkdownRender, OutputMode, RenderContext};
+use crate::render::slice::{SliceJson, SliceListOutcome};
 use grit_test_support::ModeCapture;
 use serde::Serialize;
 
@@ -30,6 +31,8 @@ fn snapshot_dir() -> &'static Path {
 fn sample_ctx() -> RenderContext {
     RenderContext {
         now: OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("valid timestamp"),
+        mode: OutputMode::Human,
+        color: false,
     }
 }
 
@@ -240,6 +243,14 @@ fn checkin_render() {
     snapshot_modes("checkin_render", &sample_checkin());
 }
 
+#[test]
+fn checkin_refused_render() {
+    let mut outcome = sample_checkin();
+    outcome.branches.retain(|b| b.status == "refused");
+    outcome.gave_change_ids = 0;
+    snapshot_modes("checkin_refused_render", &outcome);
+}
+
 /// The refresh `grit integrate` runs after the merge, as `grit pull` reports it.
 fn sample_refresh() -> PullOutcome {
     PullOutcome {
@@ -285,6 +296,8 @@ fn sample_refresh() -> PullOutcome {
         }),
         server_branch: None,
         transfer: Default::default(),
+        conflict_sources: None,
+        conflict_merge_label: None,
     }
 }
 
@@ -336,6 +349,8 @@ fn pull_branch_render() {
             gave_change_ids: 1,
         }),
         transfer: Default::default(),
+        conflict_sources: None,
+        conflict_merge_label: None,
     };
     snapshot_modes("pull_branch_render", &outcome);
 }
@@ -359,6 +374,11 @@ fn integrate_render() {
         moved_to: Some("alice/maple-elm".to_owned()),
         follows: None,
         refresh_error: None,
+        project: None,
+        pull: None,
+        url: None,
+        local: None,
+        unshared: Vec::new(),
     };
     snapshot_modes("integrate_render", &outcome);
 }
@@ -390,6 +410,11 @@ fn integrate_elsewhere_render() {
         moved_to: None,
         follows: Some("main".to_owned()),
         refresh_error: None,
+        project: None,
+        pull: None,
+        url: None,
+        local: None,
+        unshared: Vec::new(),
     };
     snapshot_modes("integrate_elsewhere_render", &outcome);
 }
@@ -409,6 +434,11 @@ fn integrate_refresh_failed_render() {
         moved_to: None,
         follows: None,
         refresh_error: Some("local changes would be overwritten: src/deep/b.rs".to_owned()),
+        project: None,
+        pull: None,
+        url: None,
+        local: None,
+        unshared: Vec::new(),
     };
     snapshot_modes("integrate_refresh_failed_render", &outcome);
 }
@@ -464,4 +494,534 @@ fn serve_render() {
     let markdown = render_to_string(&outcome, OutputMode::Markdown, &ctx).expect("markdown");
 
     CliFixture::snapshot_rendered_modes("serve_render", snapshot_dir(), &human, &json, &markdown);
+}
+
+/// carol amended the same commit as you did, overlapping in src/rpc.rs.
+fn sample_divergence() -> crate::commands::share::DivergenceJson {
+    use crate::render::shared_branch::{DivergenceChangeJson, DivergenceJson};
+    DivergenceJson {
+        scenario: "amended_both_conflicting".to_owned(),
+        summary: "You and carol both amended \"Add the history RPC\", and the edits overlap in src/rpc.rs."
+            .to_owned(),
+        needs_decision: true,
+        base: Some("1c3e9a0b2d4f6a8c0e2b4d6f8a0c2e4b6d8f0a2c".to_owned()),
+        changes: vec![DivergenceChangeJson {
+            change: "mzkqvnrwtlpxsoymuqkrnlwtzqmxsvpo".to_owned(),
+            subject: "Add the history RPC".to_owned(),
+            you: "amended".to_owned(),
+            them: "amended".to_owned(),
+            paths: vec!["src/rpc.rs".to_owned()],
+        }],
+        conflicts: vec!["src/rpc.rs".to_owned()],
+        also: Vec::new(),
+        options: sample_options(),
+    }
+}
+
+fn sample_integrated() -> crate::commands::share::IntegratedJson {
+    use crate::commands::share::{IntegratedJson, ResolveOptionJson};
+    let opt = |id: &str, label: &str, command: &str| ResolveOptionJson {
+        id: id.to_owned(),
+        label: label.to_owned(),
+        loses: None,
+        command: command.to_owned(),
+    };
+    IntegratedJson {
+        scenario: "pushed_to_integrated".to_owned(),
+        summary: "pairing was shared, and alice integrated it into example.com/widget main; 3 of its commits are there already, 1 is new".to_owned(),
+        by: "alice".to_owned(),
+        at: "2023-11-14T22:13:20Z".to_owned(),
+        into: "example.com/widget".to_owned(),
+        target_branch: "main".to_owned(),
+        pull: Some(31),
+        url: Some("https://grithub.dev/example.com/widget/pulls/31".to_owned()),
+        integrated: 3,
+        new: 1,
+        options: vec![
+            opt("rebase", "rebase onto main: keep only the 1 new commit", "grit share resolve pairing rebase"),
+            opt("rename", "keep it as pairing-2", "grit share resolve pairing rename pairing-2"),
+            opt("reshare", "share it again with bob", "grit share resolve pairing reshare"),
+        ],
+    }
+}
+
+fn sample_options() -> Vec<crate::commands::share::ResolveOptionJson> {
+    use crate::commands::share::ResolveOptionJson;
+    let opt = |id: &str, label: &str, loses: Option<&str>| ResolveOptionJson {
+        id: id.to_owned(),
+        label: label.to_owned(),
+        loses: loses.map(str::to_owned),
+        command: if id == "resolve" {
+            "grit rebase origin/shared/pairing/carol".to_owned()
+        } else {
+            format!("grit share resolve pairing {id} --with carol")
+        },
+    };
+    vec![
+        opt(
+            "keep_both",
+            "keep both: carol's version, then yours as a commit on top",
+            None,
+        ),
+        opt(
+            "resolve",
+            "rebase onto carol's head and resolve the conflicts yourself",
+            None,
+        ),
+        opt(
+            "keep_mine",
+            "keep yours",
+            Some("carol's changes since you last agreed"),
+        ),
+        opt(
+            "keep_theirs",
+            "keep carol's",
+            Some("your changes since you last agreed"),
+        ),
+    ]
+}
+
+/// A sync of a clone of an organization's project: the target fast-forwarded,
+/// branches pushed, pulled, created, and one diverged.
+#[test]
+fn sync_render() {
+    use crate::commands::share::HeadRelation;
+    use crate::commands::sync::SharedHead;
+    use crate::commands::sync::{SyncAction, SyncBranch, SyncOutcome, SyncTarget, TargetAction};
+    let branch = |name: &str, action, tip: &str, message: Option<&str>| SyncBranch {
+        name: name.to_owned(),
+        action,
+        tip: Some(tip.to_owned()),
+        message: message.map(str::to_owned),
+        shared: Vec::new(),
+        integrated: None,
+    };
+    let outcome = SyncOutcome {
+        space: "alice/widget".to_owned(),
+        upstream: Some("example.com/widget".to_owned()),
+        remote: "space".to_owned(),
+        configured: true,
+        target: Some(SyncTarget {
+            name: "main".to_owned(),
+            action: TargetAction::FastForwarded,
+            tip: Some("7f51f16b2cb0e4d3c2b1a0f9e8d7c6b5a4f3e2d1".to_owned()),
+        }),
+        branches: vec![
+            branch("feature", SyncAction::Pushed, "538e7ad0c3b2a1f0e9d8c7b6a5f4e3d2c1b0a9f8", None),
+            branch("docs", SyncAction::Pulled, "1c3e9a0b2d4f6a8c0e2b4d6f8a0c2e4b6d8f0a2c", None),
+            branch("from-laptop", SyncAction::Created, "9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b", None),
+            branch(
+                "spike",
+                SyncAction::Diverged,
+                "2b12f15c0d9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a",
+                Some("spike and space/spike each have commits the other lacks: switch to it and run `grit pull --rebase`, then sync again"),
+            ),
+            SyncBranch {
+                shared: vec![
+                    SharedHead {
+                        user: "bob".to_owned(),
+                        tip: "4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e".to_owned(),
+                        relation: HeadRelation::Same,
+                        divergence: None,
+                    },
+                    SharedHead {
+                        user: "carol".to_owned(),
+                        tip: "8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d".to_owned(),
+                        relation: HeadRelation::Diverged,
+                        divergence: Some(sample_divergence()),
+                    },
+                ],
+                ..branch(
+                    "pairing",
+                    SyncAction::Pulled,
+                    "4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e",
+                    Some("took bob's head, which builds on yours"),
+                )
+            },
+            SyncBranch {
+                integrated: Some(sample_integrated()),
+                ..branch(
+                    "pairing-old",
+                    SyncAction::Pushed,
+                    "5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f",
+                    None,
+                )
+            },
+        ],
+    };
+    snapshot_modes("sync_render", &outcome);
+}
+
+/// Sync stopped on diverged and refused branches only (`needs_attention`, not
+/// `needs_decision`).
+#[test]
+fn sync_attention_render() {
+    use crate::commands::sync::{SyncAction, SyncBranch, SyncOutcome, TargetAction};
+    let outcome = SyncOutcome {
+        space: "alice/widget".to_owned(),
+        upstream: None,
+        remote: "origin".to_owned(),
+        configured: false,
+        target: Some(crate::commands::sync::SyncTarget {
+            name: "main".to_owned(),
+            action: TargetAction::Diverged,
+            tip: Some("7f51f16b2cb0e4d3c2b1a0f9e8d7c6b5a4f3e2d1".to_owned()),
+        }),
+        branches: vec![
+            SyncBranch {
+                name: "spike".to_owned(),
+                action: SyncAction::Diverged,
+                tip: Some("2b12f15c0d9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a".to_owned()),
+                message: Some(
+                    "spike and origin/spike each have commits the other lacks".to_owned(),
+                ),
+                shared: Vec::new(),
+                integrated: None,
+            },
+            SyncBranch {
+                name: "blocked".to_owned(),
+                action: SyncAction::Refused,
+                tip: Some("538e7ad0c3b2a1f0e9d8c7b6a5f4e3d2c1b0a9f8".to_owned()),
+                message: Some("non-fast-forward".to_owned()),
+                shared: Vec::new(),
+                integrated: None,
+            },
+        ],
+    };
+    snapshot_modes("sync_attention_render", &outcome);
+}
+
+/// `grit share`: sharing a branch with a link, listing it with each
+/// member's head, and accepting a link.
+#[test]
+fn share_render() {
+    use crate::commands::share::{
+        HeadRelation, ShareAcceptOutcome, ShareBranchJson, ShareLinkJson, ShareMemberJson,
+        ShareOutcome,
+    };
+    let member = |user: &str, you: bool, head: Option<&str>, relation| ShareMemberJson {
+        divergence: (relation == Some(HeadRelation::Diverged)).then(sample_divergence),
+        user: user.to_owned(),
+        sharer: user == "alice",
+        you,
+        head: head.map(str::to_owned),
+        project: head.map(|_| format!("{user}/widget")),
+        relation,
+        snapshot: (user == "carol").then(|| vec!["src/rpc".to_owned()]),
+    };
+    let share = ShareBranchJson {
+        branch: "feature".to_owned(),
+        origin: "alice/widget".to_owned(),
+        sharer: "alice".to_owned(),
+        state: "active".to_owned(),
+        mode: "full".to_owned(),
+        base_branch: Some("main".to_owned()),
+        members: vec![
+            member(
+                "alice",
+                true,
+                Some("538e7ad0c3b2a1f0e9d8c7b6a5f4e3d2c1b0a9f8"),
+                None,
+            ),
+            member(
+                "bob",
+                false,
+                Some("1c3e9a0b2d4f6a8c0e2b4d6f8a0c2e4b6d8f0a2c"),
+                Some(HeadRelation::Ahead),
+            ),
+            member(
+                "carol",
+                false,
+                Some("2b12f15c0d9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a"),
+                Some(HeadRelation::Diverged),
+            ),
+            member("dave", false, None, None),
+        ],
+        invited: vec!["erin@example.net".to_owned()],
+        links: vec![ShareLinkJson {
+            id: "12".to_owned(),
+            url: None,
+            uses_left: Some(1),
+            expires_at: "2026-11-11T12:00:00Z".to_owned(),
+            snapshot: None,
+        }],
+        url: "https://grithub.dev/alice/widget".to_owned(),
+    };
+    let added = ShareOutcome {
+        action: "add".to_owned(),
+        project: "alice/widget".to_owned(),
+        shares: vec![share.clone()],
+        link: Some(ShareLinkJson {
+            id: "12".to_owned(),
+            url: Some("https://grithub.dev/share/0f3a9c".to_owned()),
+            uses_left: Some(1),
+            expires_at: "2026-11-11T12:00:00Z".to_owned(),
+            snapshot: Some(vec!["src/rpc".to_owned()]),
+        }),
+        added: vec!["dave".to_owned(), "erin@example.net".to_owned()],
+        removed: Vec::new(),
+        pushed: true,
+    };
+    snapshot_modes("share_add_render", &added);
+    let listed = ShareOutcome {
+        action: "list".to_owned(),
+        project: "alice/widget".to_owned(),
+        shares: vec![share.clone()],
+        link: None,
+        added: Vec::new(),
+        removed: Vec::new(),
+        pushed: false,
+    };
+    snapshot_modes("share_render", &listed);
+    let removed = ShareOutcome {
+        action: "remove".to_owned(),
+        project: "alice/widget".to_owned(),
+        shares: vec![share],
+        link: None,
+        added: Vec::new(),
+        removed: vec!["dave".to_owned()],
+        pushed: false,
+    };
+    snapshot_modes("share_remove_render", &removed);
+    let accepted = ShareAcceptOutcome {
+        status: "accepted".to_owned(),
+        branch: "feature".to_owned(),
+        sharer: "alice".to_owned(),
+        origin: "alice/widget".to_owned(),
+        project: "bob/widget".to_owned(),
+        url: "https://grithub.dev/bob/widget.git".to_owned(),
+        path: Some("/home/bob/widget".to_owned()),
+        cloned: true,
+    };
+    snapshot_modes("share_accept_render", &accepted);
+
+    use crate::commands::share::ShareResolveOutcome;
+    let asked = ShareResolveOutcome {
+        branch: "pairing".to_owned(),
+        with: "carol".to_owned(),
+        scenario: "amended_both_conflicting".to_owned(),
+        summary: "You and carol both amended \"Add the history RPC\", and the edits overlap in src/rpc.rs."
+            .to_owned(),
+        option: None,
+        previous: "538e7ad0c3b2a1f0e9d8c7b6a5f4e3d2c1b0a9f8".to_owned(),
+        head: None,
+        pushed: false,
+        next: None,
+        options: sample_options(),
+        renamed: None,
+        shared_with: Vec::new(),
+    };
+    snapshot_modes("share_resolve_render", &asked);
+    let applied = ShareResolveOutcome {
+        option: Some("keep_both".to_owned()),
+        head: Some("9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b".to_owned()),
+        pushed: true,
+        options: Vec::new(),
+        ..asked
+    };
+    snapshot_modes("share_resolve_applied_render", &applied);
+    let integrated = sample_integrated();
+    let pushed_again = ShareResolveOutcome {
+        branch: "pairing".to_owned(),
+        with: "alice".to_owned(),
+        scenario: integrated.scenario.clone(),
+        summary: integrated.summary.clone(),
+        option: None,
+        previous: "4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e".to_owned(),
+        head: None,
+        pushed: false,
+        next: None,
+        options: integrated.options,
+        renamed: None,
+        shared_with: Vec::new(),
+    };
+    snapshot_modes("share_resolve_integrated_render", &pushed_again);
+    let renamed = ShareResolveOutcome {
+        option: Some("rename".to_owned()),
+        pushed: true,
+        options: Vec::new(),
+        renamed: Some("pairing-2".to_owned()),
+        ..pushed_again
+    };
+    snapshot_modes("share_resolve_renamed_render", &renamed);
+}
+
+#[test]
+fn maintenance_render() {
+    use crate::render::config::{ConfigEntry, ConfigOutcome};
+    use crate::render::fsck::{DanglingJson, FsckIssueJson, FsckOutcome};
+    use crate::render::gc::{
+        GcAutoReport, GcOutcome, GcTaskReport, OffloadPackJson, OffloadPackRoleJson, OffloadSummary,
+    };
+    use crate::render::hooks::HooksOutcome;
+    use crate::render::ignore::{
+        IgnoreCheckEntryJson, IgnoreCheckOutcome, IgnoreMatchJson, IgnoreSourceJson,
+    };
+    use crate::render::repack::RepackOutcome;
+    use grit_lib::maintenance::repository_fsck::FsckSeverity;
+
+    snapshot_modes(
+        "gc_auto_skip_render",
+        &GcOutcome {
+            quiet: false,
+            dry_run: false,
+            auto: Some(GcAutoReport::NotNeeded),
+            tasks: Vec::new(),
+        },
+    );
+
+    snapshot_modes(
+        "gc_offload_render",
+        &GcOutcome {
+            quiet: false,
+            dry_run: true,
+            auto: None,
+            tasks: vec![GcTaskReport::Offload {
+                duration_ms: 1204,
+                report: OffloadSummary {
+                    remote: "lop".to_owned(),
+                    lop_git_dir: ".git/lop".to_owned(),
+                    filter: "blob:limit=1048576".to_owned(),
+                    candidates: 12,
+                    candidate_bytes: 48_000_000,
+                    copied_to_lop: 10,
+                    already_in_lop: 2,
+                    dropped_from_main: 10,
+                    skipped_checked_out: 0,
+                    skipped_kept_pack: 0,
+                    lop_pack: Some("objects/pack/pack-lop.pack".to_owned()),
+                    main_pack: Some("objects/pack/pack-main.pack".to_owned()),
+                    packs: vec![
+                        OffloadPackJson {
+                            role: OffloadPackRoleJson::Lop,
+                            path: "lop/objects/pack/pack-a.pack".to_owned(),
+                            objects: 10,
+                            bytes: 40_000_000,
+                        },
+                        OffloadPackJson {
+                            role: OffloadPackRoleJson::MainPromisor,
+                            path: "objects/pack/pack-b.pack".to_owned(),
+                            objects: 500,
+                            bytes: 8_000_000,
+                        },
+                    ],
+                    main_bytes_before: 52_000_000,
+                    main_bytes_after: 8_500_000,
+                    config_changes: Vec::new(),
+                    lop_ready: crate::render::gc::LopReadyJson {
+                        allow_filter: true,
+                        allow_any_sha1_in_want: true,
+                    },
+                    advertised: false,
+                },
+            }],
+        },
+    );
+
+    snapshot_modes(
+        "repack_dry_run_render",
+        &RepackOutcome {
+            quiet: false,
+            dry_run: true,
+            loose_before: 307,
+            packs_before: 2,
+            objects_packed: Some(307),
+            pack_bytes: None,
+            pack_path: None,
+            removed_pack_files: 0,
+            pruned_loose: 0,
+        },
+    );
+
+    snapshot_modes(
+        "fsck_problems_render",
+        &FsckOutcome {
+            ok: false,
+            objects_checked: 1204,
+            has_warnings: true,
+            issues: vec![
+                FsckIssueJson {
+                    kind: "badTree".to_owned(),
+                    severity: FsckSeverity::Error,
+                    oid: Some("7f51f16b2cb0e4d3c2b1a0f9e8d7c6b5a4f3e2d1".to_owned()),
+                    path: None,
+                    detail: "tree entry not sorted".to_owned(),
+                    visible: true,
+                },
+                FsckIssueJson {
+                    kind: "missingTaggerEntry".to_owned(),
+                    severity: FsckSeverity::Info,
+                    oid: Some("538e7ad0c3b2a1f0e9d8c7b6a5f4e3d2c1b0a9f8".to_owned()),
+                    path: None,
+                    detail: "tagger entry is missing".to_owned(),
+                    visible: true,
+                },
+            ],
+            dangling: vec![DanglingJson {
+                kind: "blob".to_owned(),
+                oid: "9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b".to_owned(),
+            }],
+            visible_issue_groups: BTreeMap::from([
+                ("badTree".to_owned(), vec![0]),
+                ("missingTaggerEntry".to_owned(), vec![1]),
+            ]),
+        },
+    );
+
+    snapshot_modes(
+        "config_list_scopes_render",
+        &ConfigOutcome::List {
+            entries: vec![
+                ConfigEntry {
+                    key: "user.name".to_owned(),
+                    value: Some("alice".to_owned()),
+                    scope: "local".to_owned(),
+                    file: Some(".git/config".to_owned()),
+                },
+                ConfigEntry {
+                    key: "user.email".to_owned(),
+                    value: Some("alice@example.net".to_owned()),
+                    scope: "global".to_owned(),
+                    file: Some("/home/alice/.gitconfig".to_owned()),
+                },
+            ],
+        },
+    );
+
+    snapshot_modes(
+        "hooks_run_failure_render",
+        &HooksOutcome::Run {
+            name: "pre-commit".to_owned(),
+            exit_code: 1,
+            executed: true,
+            stdout: String::new(),
+            stderr: "hook declined the commit".to_owned(),
+        },
+    );
+
+    snapshot_modes(
+        "ignore_check_all_render",
+        &IgnoreCheckOutcome {
+            any_ignored: true,
+            entries: vec![
+                IgnoreCheckEntryJson {
+                    path: "build/output.o".to_owned(),
+                    ignored: true,
+                    matched: Some(IgnoreMatchJson {
+                        source: IgnoreSourceJson::PerDirectory {
+                            path: ".gitignore".to_owned(),
+                        },
+                        line_number: 4,
+                        pattern_text: "/build/".to_owned(),
+                        negative: false,
+                    }),
+                },
+                IgnoreCheckEntryJson {
+                    path: "src/main.rs".to_owned(),
+                    ignored: false,
+                    matched: None,
+                },
+            ],
+        },
+    );
 }

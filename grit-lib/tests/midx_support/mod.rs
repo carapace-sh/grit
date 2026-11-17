@@ -11,11 +11,13 @@ use std::process::{Command, Stdio};
 
 use grit_lib::objects::midx::{
     midx_lookup_pack_and_offset, read_midx_objects, try_read_info_via_midx,
-    try_read_object_via_midx, write_multi_pack_index_with_options, WriteMultiPackIndexOptions,
+    try_read_object_via_midx, write_multi_pack_index, WriteMultiPackIndexOptions,
 };
 use grit_lib::objects::odb::Odb;
-use grit_lib::objects::pack::{clear_pack_cache, read_idx_object_ids, read_pack_index_cached};
 use grit_lib::objects::{ObjectId, ObjectKind};
+use grit_lib::test_support::objects_pack::{
+    clear_pack_cache, read_idx_object_ids, read_pack_index_cached,
+};
 use grit_test_support::objects::{git_supports_sha256, HashAlgo};
 
 pub use grit_test_support::objects::RepoFixture;
@@ -111,8 +113,8 @@ fn append_pack_blob(body: &mut Vec<u8>, data: &[u8]) {
 /// The large blob lives at offset `1 << 32`; grit writes a v2 `.idx` Git accepts.
 pub fn install_git_large_offset_pack(repo: &RepoFixture) -> Option<ObjectId> {
     use grit_lib::objects::odb::Odb;
-    use grit_lib::objects::pack::{skip_one_pack_object, write_v2_pack_index};
     use grit_lib::objects::ObjectKind;
+    use grit_lib::test_support::objects_pack::{skip_one_pack_object, write_v2_pack_index};
     use std::io::{Read, Seek, SeekFrom, Write};
 
     let objects = repo.objects_dir();
@@ -391,7 +393,7 @@ pub fn assert_git_midx_verify(repo: &RepoFixture) {
 /// Write a MIDX with grit using `opts` as given (an unset `version` exercises the
 /// library default), then drop cached pack state so later reads see the new file.
 pub fn grit_write_midx(pack_dir: &Path, opts: &WriteMultiPackIndexOptions) {
-    write_multi_pack_index_with_options(pack_dir, opts).expect("grit write MIDX");
+    write_multi_pack_index(pack_dir, opts).expect("grit write MIDX");
     clear_pack_cache();
 }
 

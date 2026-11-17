@@ -2,40 +2,48 @@
 //!
 //! Source for the library guide "History rewrite" page.
 
+use anyhow::Result;
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::objects::ObjectId;
+use grit_lib::progress::CancelToken;
 use grit_lib::repo::Repository;
 use grit_lib::revwalk::history::{
-    apply_rewrite, reword, ApplyOptions, EmptyPolicy, RefScope, RewriteOptions,
+    ApplyOptions, EmptyPolicy, RefScope, RewordOptions, RewriteOptions,
 };
-use grit_lib::revwalk::rev_parse::resolve_revision_as_commit;
+use grit_lib::revwalk::{Peel, ResolveOptions};
+
 use std::path::{Path, PathBuf};
 
-fn open_repo(root: &Path) -> Result<Repository, grit_lib::error::Error> {
-    Repository::discover(Some(root), &RepositoryOptions::from_process())
+fn open_repo(root: &Path) -> Result<Repository> {
+    Ok(Repository::discover(
+        Some(root),
+        &RepositoryOptions::from_process(),
+    )?)
 }
 
-fn main() -> Result<(), grit_lib::error::Error> {
+fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let root: PathBuf = args
         .next()
         .map(PathBuf::from)
         .or_else(|| std::env::current_dir().ok())
-        .ok_or_else(|| grit_lib::error::Error::Message("missing repository path".into()))?;
+        .ok_or_else(|| anyhow::anyhow!("missing repository path"))?;
     let spec = args
         .next()
-        .ok_or_else(|| grit_lib::error::Error::Message("missing commit spec".into()))?;
+        .ok_or_else(|| anyhow::anyhow!("missing commit spec"))?;
     let message = args
         .next()
-        .ok_or_else(|| grit_lib::error::Error::Message("missing new message".into()))?;
+        .ok_or_else(|| anyhow::anyhow!("missing new message"))?;
 
     let repo = open_repo(&root)?;
-    let commit: ObjectId = resolve_revision_as_commit(&repo, &spec)?;
+    let commit: ObjectId = repo
+        .revwalk()
+        .resolve(&spec, &ResolveOptions::default().with_peel(Peel::Commit))?;
 
-    let plan = reword(
-        &repo,
+    let history = repo.history();
+    let plan = history.reword(
         commit,
-        message,
+        &RewordOptions::default().with_message(message),
         &RewriteOptions {
             scope: RefScope::Head,
             empty: EmptyPolicy::Drop,
@@ -43,27 +51,29 @@ fn main() -> Result<(), grit_lib::error::Error> {
             preserve_committer: false,
             sign: true,
         },
-    )
-    .map_err(grit_lib::error::Error::History)?;
+    )?;
 
-    for line in plan.ref_update_lines() {
-        println!("dry-run: {line}");
+    for update in &plan.ref_updates {
+        println!(
+            "dry-run: {} {} -> {}",
+            update.name,
+            update.old.to_short_hex(),
+            update.new.to_short_hex(),
+        );
     }
 
-    let applied = apply_rewrite(
-        &repo,
+    let applied = history.apply(
         &plan,
         &ApplyOptions {
             identity: grit_lib::ident::parse_signature("History Guide <guide@grit.test> 1 +0000")
                 .unwrap_or_else(|| panic!("guide identity must parse as a signature")),
             reflog_message: "history reword".into(),
             record_operation: None,
-            hooks: grit_lib::PostOperationHooks::Run,
+            hooks: grit_lib::command_runner::hooks::PostOperationHooks::Run,
         },
         &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .map_err(grit_lib::error::Error::History)?;
+        &CancelToken::never(),
+    )?;
 
     println!("head={}", applied.head.to_hex());
     Ok(())

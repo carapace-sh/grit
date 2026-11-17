@@ -22,9 +22,9 @@ mod tests {
     use crate::porcelain::checkout::checkout_between_trees;
     use crate::porcelain::commit::{create_commit, CommitRequest};
     use crate::porcelain::status::{status, StatusOptions};
-    use crate::progress::{NeverCancel, NullProgress};
+    use crate::progress::{CancelToken, NullProgress};
     use crate::ref_storage::RefStorageFormat;
-    use crate::repo::{init_repository, init_repository_separate_git_dir, Repository};
+    use crate::repo::{init_repository, Repository};
     use crate::rev_list::{rev_list, RevListOptions};
 
     fn init_repo(root: &Path) -> Repository {
@@ -56,7 +56,7 @@ mod tests {
                 &repo,
                 &StatusOptions::default(),
                 &mut NullProgress,
-                &NeverCancel,
+                &CancelToken::never(),
             )
             .unwrap();
         });
@@ -70,7 +70,7 @@ mod tests {
                 &repo2,
                 &StageOptions::default(),
                 &mut NullProgress,
-                &NeverCancel,
+                &CancelToken::never(),
             )
             .unwrap();
         });
@@ -83,7 +83,7 @@ mod tests {
             &repo3,
             &StageOptions::default(),
             &mut NullProgress,
-            &NeverCancel,
+            &CancelToken::never(),
         )
         .unwrap();
         let req = CommitRequest {
@@ -99,7 +99,7 @@ mod tests {
             ..Default::default()
         };
         cascade_load_counters::measure(|| {
-            create_commit(&repo3, &req, &mut NullProgress, &NeverCancel).unwrap();
+            create_commit(&repo3, &req, &mut NullProgress, &CancelToken::never()).unwrap();
         });
         // Index write, ref update, and object-format / MIDX config probes may each revalidate
         // the repository config cache once when using a shared repository snapshot.
@@ -115,7 +115,7 @@ mod tests {
             &repo3,
             &StageOptions::default(),
             &mut NullProgress,
-            &NeverCancel,
+            &CancelToken::never(),
         )
         .unwrap();
         let mut index = repo3.load_index().unwrap();
@@ -175,7 +175,7 @@ mod tests {
         );
 
         let shared = repo.odb().load_config_cascade().expect("odb config");
-        let session = repo.config().expect("repository config");
+        let session = repo.config().snapshot().expect("repository config");
         assert!(
             std::sync::Arc::ptr_eq(&shared, &session),
             "the object database must reuse the repository's config snapshot"
@@ -208,7 +208,12 @@ mod tests {
         )
         .expect("open");
         assert_eq!(
-            reopened.config().unwrap().get("core.bigFileThreshold"),
+            reopened
+                .config()
+                .snapshot()
+                .unwrap()
+                .get("core.bigFileThreshold")
+                .unwrap(),
             Some("4k".to_owned())
         );
         assert_eq!(reopened.odb().big_file_threshold().unwrap(), 4096);
@@ -237,7 +242,11 @@ mod tests {
         )
         .expect("open");
         assert_eq!(
-            repo.config().expect("config").get("user.name").as_deref(),
+            repo.config()
+                .snapshot()
+                .expect("config")
+                .value("user.name")
+                .as_deref(),
             Some("Alice")
         );
 
@@ -247,7 +256,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            repo.config().expect("config").get("user.name").as_deref(),
+            repo.config()
+                .snapshot()
+                .expect("config")
+                .value("user.name")
+                .as_deref(),
             Some("Alice With A Much Longer Name For Stamp Change")
         );
     }
@@ -257,7 +270,12 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
         let repo = init_repo(root);
-        assert!(repo.config().unwrap().get("grit.rewriteKey").is_none());
+        assert!(repo
+            .config()
+            .snapshot()
+            .unwrap()
+            .value("grit.rewriteKey")
+            .is_none());
 
         let config_path = repo.git_dir().join("config");
         let existing = fs::read_to_string(&config_path).expect("read config");
@@ -267,7 +285,11 @@ mod tests {
         fs::write(&config_path, lines.join("\n")).expect("rewrite config");
 
         assert_eq!(
-            repo.config().unwrap().get("grit.rewriteKey").as_deref(),
+            repo.config()
+                .snapshot()
+                .unwrap()
+                .value("grit.rewriteKey")
+                .as_deref(),
             Some("replaced")
         );
     }
@@ -279,8 +301,9 @@ mod tests {
         let repo = init_repo(root);
         assert!(repo
             .config()
+            .snapshot()
             .unwrap()
-            .get("grit.externalAppendKey")
+            .value("grit.externalAppendKey")
             .is_none());
 
         let config_path = repo.git_dir().join("config");
@@ -294,8 +317,9 @@ mod tests {
 
         assert_eq!(
             repo.config()
+                .snapshot()
                 .unwrap()
-                .get("grit.externalAppendKey")
+                .value("grit.externalAppendKey")
                 .as_deref(),
             Some("seen")
         );
@@ -307,7 +331,12 @@ mod tests {
         let root = tmp.path();
         let repo = init_repo(root);
 
-        assert!(repo.config().unwrap().get("grit.factoryTestKey").is_none());
+        assert!(repo
+            .config()
+            .snapshot()
+            .unwrap()
+            .value("grit.factoryTestKey")
+            .is_none());
 
         let config_path = repo.git_dir().join("config");
         let mut cfg = ConfigFile::from_path(&config_path, ConfigScope::Local)
@@ -317,7 +346,11 @@ mod tests {
         cfg.write().unwrap();
         repo.reload_config().unwrap();
         assert_eq!(
-            repo.config().unwrap().get("grit.factoryTestKey"),
+            repo.config()
+                .snapshot()
+                .unwrap()
+                .get("grit.factoryTestKey")
+                .unwrap(),
             Some("before".to_string())
         );
 
@@ -325,7 +358,11 @@ mod tests {
         cfg.write().unwrap();
         repo.reload_config().unwrap();
         assert_eq!(
-            repo.config().unwrap().get("grit.factoryTestKey"),
+            repo.config()
+                .snapshot()
+                .unwrap()
+                .get("grit.factoryTestKey")
+                .unwrap(),
             Some("after".to_string())
         );
     }
@@ -400,7 +437,7 @@ mod tests {
         let tree_oid =
             crate::write_tree::write_tree_from_index(linked_repo.odb(), &index, "").expect("tree");
 
-        let cfg = linked_repo.config().unwrap();
+        let cfg = linked_repo.config().snapshot().unwrap();
         let entries = diff_tree_to_worktree_with_git_dir(
             linked_repo.odb(),
             Some(&tree_oid),
@@ -418,15 +455,13 @@ mod tests {
         // Gitfile + separate git dir layout.
         let wt = root.join("gitfile-wt");
         let gd = root.join("gitfile-store.git");
-        let gitfile_repo = init_repository_separate_git_dir(
+        let gitfile_repo = crate::repo::Repository::init(
             &wt,
-            &gd,
-            "main",
-            None,
-            crate::RefStorageFormat::Files,
-            crate::objects::HashAlgo::Sha1,
-            &crate::environment::Environment::empty(),
+            &crate::repo::InitOptions::new()
+                .with_initial_branch("main")
+                .with_separate_git_dir(Some(gd.to_path_buf())),
         )
+        .map(|(repo, _)| repo)
         .unwrap();
         fs::write(
             gd.join("config"),
@@ -443,7 +478,7 @@ mod tests {
         );
         let tree =
             crate::write_tree::write_tree_from_index(gitfile_repo.odb(), &idx, "").expect("tree");
-        let cfg = gitfile_repo.config().unwrap();
+        let cfg = gitfile_repo.config().snapshot().unwrap();
         let clean = diff_tree_to_worktree_with_git_dir(
             gitfile_repo.odb(),
             Some(&tree),
@@ -478,20 +513,25 @@ mod tests {
             )
             .unwrap();
             repo.reload_config().unwrap();
-            let cfg = repo.config().unwrap();
+            let cfg = repo.config().snapshot().unwrap();
 
             fs::write(root.join("f.txt"), format!("v-{label}\n").as_bytes()).unwrap();
             stage(
                 &repo,
                 &StageOptions::default(),
                 &mut NullProgress,
-                &NeverCancel,
+                &CancelToken::never(),
             )
             .unwrap();
             let mut index = repo.load_index().unwrap();
             let path = repo.index_path();
             index
-                .write_with_config(&path, cfg.as_ref())
+                .write_to_path_with_config_and_policy(
+                    &path,
+                    crate::index::index_skip_hash_for_write(Some(cfg.as_ref())),
+                    Some(cfg.as_ref()),
+                    crate::parallel::ThreadPolicy::default(),
+                )
                 .expect("write index");
 
             let status = Command::new("git")
@@ -550,7 +590,7 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &NeverCancel,
+            &CancelToken::never(),
         )
         .unwrap();
 
@@ -565,7 +605,7 @@ mod tests {
             &discovered,
             &StatusOptions::default(),
             &mut NullProgress,
-            &NeverCancel,
+            &CancelToken::never(),
         );
 
         if let Some(v) = prev_global {
@@ -590,11 +630,21 @@ mod tests {
     fn config_set_local_visible_on_next_config_without_extra_reload() {
         let tmp = TempDir::new().unwrap();
         let repo = init_repo(tmp.path());
-        repo.config_handle()
-            .set_local("grit.sessionKey", "one")
+        repo.config()
+            .set(
+                crate::config::ConfigScope::Local,
+                "grit.sessionKey",
+                "one",
+                &crate::config::ConfigWriteOptions::new(),
+            )
+            .map(|_| ())
             .unwrap();
         assert_eq!(
-            repo.config().unwrap().get("grit.sessionKey"),
+            repo.config()
+                .snapshot()
+                .unwrap()
+                .get("grit.sessionKey")
+                .unwrap(),
             Some("one".to_string())
         );
     }
@@ -645,11 +695,20 @@ printf '%s\n' '	hookKey = from-hook' >> "$cfg"
             &RepositoryOptions::empty().with_work_tree(root.to_path_buf()),
         )
         .unwrap();
-        assert!(repo.config().unwrap().get("grit.hookKey").is_none());
+        assert!(repo
+            .config()
+            .snapshot()
+            .unwrap()
+            .value("grit.hookKey")
+            .is_none());
 
         crate::hooks::run_hook(&repo, "post-checkout", &["a", "b", "c"], None).unwrap();
         assert_eq!(
-            repo.config().unwrap().get("grit.hookKey"),
+            repo.config()
+                .snapshot()
+                .unwrap()
+                .get("grit.hookKey")
+                .unwrap(),
             Some("from-hook".to_string())
         );
     }
@@ -759,13 +818,15 @@ printf '%s\n' '	hookKey = from-hook' >> "$cfg"
         assert!(
             opened
                 .config()
+                .snapshot()
                 .expect("config session")
-                .get("user.name")
+                .value("user.name")
                 .is_some()
                 || opened
                     .config()
+                    .snapshot()
                     .expect("config")
-                    .get("core.repositoryformatversion")
+                    .value("core.repositoryformatversion")
                     .is_some()
         );
     }
@@ -794,10 +855,13 @@ printf '%s\n' '	hookKey = from-hook' >> "$cfg"
         let cfg = ConfigSet::load(
             &crate::environment::Environment::empty(),
             Some(&git_dir),
-            true,
+            &crate::config::LoadConfigOptions::standard(
+                &crate::environment::Environment::empty(),
+                Some(&git_dir),
+            ),
         )
         .expect("load cascade");
-        assert_eq!(cfg.get("snapshotTest.key"), Some("onmain".to_string()));
+        assert_eq!(cfg.value("snapshotTest.key"), Some("onmain".to_string()));
         assert!(!probe.join().expect("probe thread panicked"));
     }
 }

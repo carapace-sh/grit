@@ -1,19 +1,17 @@
 //! Rename a configured remote: tracking refs, then config (see [`RepositoryRemotes::rename`]).
-use std::collections::BTreeSet;
-use std::ops::ControlFlow;
-
 use crate::config::{canonical_key, ConfigFile, ConfigScope, ConfigSet};
 use crate::porcelain::checkout_reflog::checkout_reflog_identity;
 use crate::refs::commit_ref_batch_on_store;
 use crate::refs::store::{
-    Expected, RawRef, RefEntry, RefReflogRename, RefUpdate, RefUpdateFlags, ReflogUpdate,
+    Expected, RawRef, RefEntry, RefName, RefReflogRename, RefUpdate, RefUpdateFlags, ReflogUpdate,
 };
 use crate::remote::RemoteError;
 use crate::repo::Repository;
+use std::collections::BTreeSet;
+use std::ops::ControlFlow;
 
-use super::remote::{
-    has_local_remote_section, has_remote_section, is_valid_remote_name, RepositoryRemotes,
-};
+use super::remote::{has_local_remote_section, has_remote_section, RepositoryRemotes};
+use crate::remote::is_valid_remote_name;
 
 /// Result of [`RepositoryRemotes::rename`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,20 +45,26 @@ impl<'repo> RepositoryRemotes<'repo> {
     /// - [`RemoteError::UnknownRemote`] when `old` has no local `remote.<old>.*` section.
     /// - [`RemoteError::RemoteExists`] when `new` is already configured.
     /// - [`RemoteError::InvalidRemoteName`] when `new` is not a valid remote name.
-    /// - [`RemoteError::Library`] for config, ref, or I/O failures.
+    /// - [`RemoteError::from`] for config, ref, or I/O failures.
     pub fn rename(
         &self,
         old: &str,
         new: &str,
         dry_run: bool,
-    ) -> std::result::Result<RemoteRename, RemoteError> {
+    ) -> crate::error::Result<RemoteRename> {
         if !is_valid_remote_name(new) {
-            return Err(RemoteError::InvalidRemoteName(new.to_owned()));
+            return Err(RemoteError::InvalidRemoteName {
+                name: new.to_owned(),
+            }
+            .into());
         }
         let repo = self.repository();
-        let config = repo.config().map_err(RemoteError::Library)?;
+        let config = repo.config().snapshot()?;
         if !has_local_remote_section(config.as_ref(), old) {
-            return Err(RemoteError::UnknownRemote(old.to_owned()));
+            return Err(RemoteError::UnknownRemote {
+                name: old.to_owned(),
+            }
+            .into());
         }
         if old == new {
             return Ok(RemoteRename {
@@ -73,12 +77,15 @@ impl<'repo> RepositoryRemotes<'repo> {
             });
         }
         if has_remote_section(config.as_ref(), new) {
-            return Err(RemoteError::RemoteExists(new.to_owned()));
+            return Err(RemoteError::RemoteExists {
+                name: new.to_owned(),
+            }
+            .into());
         }
 
         let refspec_marker = format!(":refs/remotes/{old}/");
         let refspecs_need_update = config
-            .get_all(&format!("remote.{old}.fetch"))
+            .values_all(&format!("remote.{old}.fetch"))
             .iter()
             .any(|spec| spec.contains(&refspec_marker));
 
@@ -129,31 +136,33 @@ fn rename_remote_ref(old: &str, new: &str, refname: &str) -> Option<String> {
         .map(|tail| format!("{}{tail}", remote_ref_prefix(new)))
 }
 
-fn count_remote_tracking_refs(repo: &Repository, old: &str) -> Result<usize, RemoteError> {
+fn count_remote_tracking_refs(repo: &Repository, old: &str) -> crate::error::Result<usize> {
     let prefix = remote_ref_prefix(old);
     let mut count = 0usize;
-    repo.refs()
+    repo.ref_store()
         .for_each_ref(&prefix, &mut |entry: &RefEntry| {
-            if entry.name.starts_with(&prefix) {
+            if entry.name.as_str().starts_with(&prefix) {
                 count += 1;
             }
             ControlFlow::Continue(())
-        })
-        .map_err(RemoteError::Library)?;
+        })?;
     Ok(count)
 }
 
-fn rename_remote_tracking_refs(repo: &Repository, old: &str, new: &str) -> Result<(), RemoteError> {
+fn rename_remote_tracking_refs(
+    repo: &Repository,
+    old: &str,
+    new: &str,
+) -> crate::error::Result<()> {
     let prefix = remote_ref_prefix(old);
     let mut entries = Vec::new();
-    repo.refs()
+    repo.ref_store()
         .for_each_ref(&prefix, &mut |entry: &RefEntry| {
-            if entry.name.starts_with(&prefix) {
+            if entry.name.as_str().starts_with(&prefix) {
                 entries.push(entry.clone());
             }
             ControlFlow::Continue(())
-        })
-        .map_err(RemoteError::Library)?;
+        })?;
 
     let identity = checkout_reflog_identity(repo);
     let time = repo.identity_now();
@@ -161,7 +170,7 @@ fn rename_remote_tracking_refs(repo: &Repository, old: &str, new: &str) -> Resul
     let mut reflog_renames = Vec::with_capacity(entries.len());
 
     for entry in entries {
-        let Some(new_name) = rename_remote_ref(old, new, &entry.name) else {
+        let Some(new_name) = rename_remote_ref(old, new, entry.name.as_str()) else {
             continue;
         };
         let (new_value, delete_expected, symref) = match &entry.value {
@@ -171,7 +180,7 @@ fn rename_remote_tracking_refs(repo: &Repository, old: &str, new: &str) -> Resul
                     rename_remote_ref(old, new, target).unwrap_or_else(|| target.clone());
                 (
                     Some(RawRef::Symbolic(new_target)),
-                    Expected::Symref(target.clone()),
+                    Expected::Symref(RefName::from_trusted(target.clone())),
                     true,
                 )
             }
@@ -182,7 +191,7 @@ fn rename_remote_tracking_refs(repo: &Repository, old: &str, new: &str) -> Resul
         });
 
         updates.push(RefUpdate {
-            name: new_name.clone(),
+            name: RefName::from_trusted(new_name.clone()),
             new_value,
             expected: Expected::Missing,
             reflog: None,
@@ -204,7 +213,7 @@ fn rename_remote_tracking_refs(repo: &Repository, old: &str, new: &str) -> Resul
 
         reflog_renames.push(RefReflogRename {
             from: entry.name.clone(),
-            to: new_name.clone(),
+            to: RefName::from_trusted(new_name.clone()),
             append: ReflogUpdate {
                 identity: identity.clone(),
                 message: format!("remote: renamed {} to {new_name}", entry.name),
@@ -215,8 +224,7 @@ fn rename_remote_tracking_refs(repo: &Repository, old: &str, new: &str) -> Resul
         });
     }
 
-    commit_ref_batch_on_store(repo.refs(), &updates, &reflog_renames, &[])
-        .map_err(RemoteError::Library)
+    commit_ref_batch_on_store(repo.ref_store(), &updates, &reflog_renames, &[])
 }
 
 fn plan_config_updates(
@@ -228,7 +236,7 @@ fn plan_config_updates(
     let refspec_marker = format!(":refs/remotes/{old}/");
     let mut refspecs_updated = Vec::new();
     if refspecs_need_update {
-        for spec in config.get_all(&format!("remote.{old}.fetch")) {
+        for spec in config.values_all(&format!("remote.{old}.fetch")) {
             if spec.contains(&refspec_marker) {
                 refspecs_updated.push(update_fetch_refspec(&spec, old, new));
             }
@@ -266,17 +274,17 @@ fn apply_remote_rename_config(
     new: &str,
     refspecs_need_update: bool,
     branches_updated: &[String],
-) -> Result<(), RemoteError> {
+) -> crate::error::Result<()> {
     let path = crate::repo::common_git_dir_for_config(repo.git_dir()).join("config");
     let content = std::fs::read_to_string(&path).map_err(crate::error::Error::Io)?;
-    let mut file =
-        ConfigFile::parse(&path, &content, ConfigScope::Local).map_err(RemoteError::Library)?;
+    let mut file = ConfigFile::parse(&path, &content, ConfigScope::Local)?;
     let old_section = format!("remote.{old}");
     let new_section = format!("remote.{new}");
     if !file.rename_section(&old_section, &new_section)? {
-        return Err(RemoteError::Library(crate::error::Error::Message(format!(
-            "could not rename config section {old_section} to {new_section}"
-        ))));
+        return Err(crate::error::ConfigError::SectionNotFound {
+            section: old_section,
+        }
+        .into());
     }
 
     if refspecs_need_update {
@@ -296,21 +304,21 @@ fn apply_remote_rename_config(
 
     for branch in branches_updated {
         let remote_key = format!("branch.{branch}.remote");
-        if merged.get(&remote_key).as_deref() == Some(old) {
+        if merged.value(&remote_key).as_deref() == Some(old) {
             file.set(&remote_key, new)?;
         }
         let push_key = format!("branch.{branch}.pushRemote");
-        if merged.get(&push_key).as_deref() == Some(old) {
+        if merged.value(&push_key).as_deref() == Some(old) {
             file.set(&push_key, new)?;
         }
     }
 
-    if merged.get("remote.pushDefault").as_deref() == Some(old) {
+    if merged.value("remote.pushDefault").as_deref() == Some(old) {
         file.set("remote.pushDefault", new)?;
     }
 
-    file.write().map_err(RemoteError::Library)?;
-    repo.reload_config().map_err(RemoteError::Library)?;
+    file.write()?;
+    repo.reload_config()?;
     Ok(())
 }
 

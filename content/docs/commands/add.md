@@ -13,9 +13,9 @@ grit add [-u | --update] [--dry-run] [--hunks <id,...>] [--lines <path:start-end
 
 ## Description
 
-Stages changes so they show up under **Staged** in [`grit status`](../status/). With no paths, `grit add` stages everything `grit status` reports: modified files, deleted files and untracked files. A tracked file replaced by a directory, or a tracked directory replaced by a file, is staged the way Git does it: the old path as a deletion and the new files as additions. With paths, it stages only those files, or everything under those directories.
+Stages changes so they show up under **Staged** in [`grit status`](../status/). Pathnames in human and `--markdown` output use the same quoting rules as [`grit status`](../status/) (see **Description** there). With no paths, `grit add` stages everything `grit status` reports: modified files, deleted files and untracked files. A tracked file replaced by a directory, or a tracked directory replaced by a file, is staged the way Git does it: the old path as a deletion and the new files as additions. With paths, it stages only those files, or everything under those directories.
 
-Paths are relative to your current directory, so from inside `src/`, `grit add main.rs` stages `src/main.rs`. Paths like `../README.md` and absolute paths inside the repository work too. A path that matches nothing is an error, and nothing is staged. A path that crosses a symlinked directory (for example `link/file` when `link` is a symlink) is an error: nothing is staged. Naming a path that exists but is excluded by `.gitignore`, `.git/info/exclude`, or `core.excludesfile` is also an error: nothing is staged and the command lists the ignored paths (pathless `grit add` still skips ignored files silently, like Git). With `core.ignorecase=true`, ignore patterns match without regard to case (see [`grit ignore`](ignore.md)). On a case-folding work tree (typical macOS and Windows volumes), `grit add` keeps the spelling already recorded in the index and stores new paths under those directory names; rename a path's case only with [`grit mv`](mv.md). Explicitly staging an **unmerged** path fails while Git-style conflict markers remain in the worktree file (the same rule as [`grit commit`](../commit/) auto-staging); remove the markers or use a resolved file, then run `grit add` again. When a broad pathspec (for example `grit add .` after a merge) matches both resolved and still-marked unmerged files, Grit stages every path it can and exits with status **1**, naming each remaining conflict (`path: conflict markers remain; not staged`). Git may stage marker-bearing files in the same situation; Grit refuses to record conflict markers in the index.
+Paths are relative to your current directory, so from inside `src/`, `grit add main.rs` stages `src/main.rs`. Paths like `../README.md` and absolute paths inside the repository work too. Attribute pathspecs such as `:(attr:myattr)` stage every matching path under the same `.gitattributes` rules as [`grit diff`](../diff/) and [`grit status`](../status/). A path that matches nothing is an error, and nothing is staged. A path that crosses a symlinked directory (for example `link/file` when `link` is a symlink) is an error: nothing is staged. Naming a path that exists but is excluded by `.gitignore`, `.git/info/exclude`, or `core.excludesfile` is also an error: nothing is staged and the command lists the ignored paths (pathless `grit add` still skips ignored files silently, like Git). With `core.ignorecase=true`, ignore patterns match without regard to case (see [`grit ignore`](ignore.md)). On a case-folding work tree (typical macOS and Windows volumes), `grit add` keeps the spelling already recorded in the index and stores new paths under those directory names; rename a path's case only with [`grit mv`](mv.md). Explicitly staging an **unmerged** path fails while Git-style conflict markers remain in the worktree file (the same rule as [`grit commit`](../commit/) auto-staging); remove the markers or use a resolved file, then run `grit add` again. When a broad pathspec (for example `grit add .` after a merge) matches both resolved and still-marked unmerged files, Grit stages every path it can and exits with status **1**, naming each remaining conflict (`path: conflict markers remain; not staged`). Git may stage marker-bearing files in the same situation; Grit refuses to record conflict markers in the index.
 
 Files with a `filter=<driver>` attribute (Git LFS, for example) are staged through the driver's clean filter, which runs through `sh` the way Git runs it. On Windows that is the `sh` bundled with Git for Windows, so you don't need it on `PATH`. If the driver sets `filter.<driver>.required=true` and the filter fails or cannot be started, `grit add` fails, says why, and stages nothing. It never stores the unfiltered file. When an optional filter fails, the file is staged unfiltered, as Git does.
 
@@ -25,7 +25,11 @@ On filesystems where Grit sets `core.filemode=false` (typical on Windows), every
 
 [`grit commit`](../commit/) stages every change before it records a commit, so you don't need `grit add` to commit. It's useful for starting to track a new file and checking what will be committed.
 
+Copying or cloning another Git repository into your tree (a directory that contains its own `.git`) is recorded as a **gitlink** (mode `160000`), not as ordinary files. Clones of your repository get an empty directory at that path. When `grit add` newly records such a path, human and `--markdown` output print a **warning** on stderr; `--json` includes `embedded_gitlinks` (omitted when empty). Remove `<path>/.git` and stage again if you meant to vendor the files inside. A symlink (including one aimed at a repository directory) is staged as mode `120000` and does not trigger this warning.
+
 Touching a tracked file's timestamp without changing its bytes or mode is not a stage: `grit add` refreshes the index stat cache silently (same as Git) and reports nothing to stage.
+
+A directory that contains an embedded git repository (for example after `git init` inside the tree, or `cargo new` in a subdirectory) is staged as a **gitlink** (mode `160000`) when that nested repository has at least one commit checked out on its current branch. When the nested repository has **no commits yet**, `grit add` refuses with `embedded_repo_without_commit`, leaves the index unchanged, and does not record the path as a regular file.
 
 On Unix, explicit path operands must be valid UTF-8. An operand containing invalid UTF-8 bytes is rejected before the command runs, with exit status **2** and no changes to the repository. Human output reports the usage error on stderr; `--json` writes an error object with `kind: "usage"` on stdout, and `--markdown` writes `**Error:**` on stdout. The argument is never replaced with a similar Unicode filename.
 
@@ -105,6 +109,7 @@ Pass `--json` for stable, scripting-friendly output.
 | `staged` | number | Same as `count` for successful staging. |
 | `staged_hunks` | object | Path → hunk ids when `--hunks` staged something (empty object when unused). |
 | `staged_lines` | object | Path → line ranges when `--lines` staged something (empty object when unused). |
+| `embedded_gitlinks` | array | Nested repositories newly recorded as gitlinks. Omitted when empty. |
 
 ```json
 {
@@ -116,7 +121,8 @@ Pass `--json` for stable, scripting-friendly output.
   "count": 2,
   "staged": 2,
   "staged_hunks": {},
-  "staged_lines": {}
+  "staged_lines": {},
+  "embedded_gitlinks": ["vendor-hello"]
 }
 ```
 

@@ -10,12 +10,11 @@ use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::lockfile::LockWait;
 use grit_lib::objects::ObjectId;
 use grit_lib::refs::prepare_with_lock_wait;
-use grit_lib::refs::reflog::expire_reflog;
-use grit_lib::refs::reflog::read_reflog;
 use grit_lib::refs::store::{
     Expected, RawRef, RefStore, RefTransaction, RefUpdate, RefUpdateFlags, ReflogUpdate,
 };
 use grit_lib::repo::Repository;
+use grit_lib::test_support::refs::expire_reflog;
 
 fn append_on_store(
     store: &dyn RefStore,
@@ -52,9 +51,9 @@ fn expire_reflog_keeps_concurrent_append_files() {
     let repo = Repository::discover(Some(test.worktree()), &RepositoryOptions::from_process())
         .expect("open");
     let git_dir = repo.git_dir();
-    let store = repo.refs();
+    let store = repo.ref_store();
     let tip = repo.head_commit().expect("head");
-    let wait = LockWait::files_ref_lock(repo.config().ok().as_deref());
+    let wait = LockWait::files_ref_lock(repo.config().snapshot().ok().as_deref());
     append_on_store(store, "refs/heads/race", tip, 1_500_000_000, wait).expect("old");
     let b_dir = git_dir.to_path_buf();
     let b = thread::spawn(move || {
@@ -69,6 +68,10 @@ fn expire_reflog_keeps_concurrent_append_files() {
         fresh += 1;
     }
     b.join().expect("join");
-    let kept = read_reflog(git_dir, "refs/heads/race").expect("read").len();
+    let kept = grit_test_support::refs::at(git_dir)
+        .references()
+        .reflog("refs/heads/race")
+        .expect("read")
+        .len();
     assert!(kept >= fresh, "expire_reflog lost concurrent appends");
 }

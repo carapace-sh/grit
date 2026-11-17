@@ -3,8 +3,12 @@
 use std::process::Command;
 
 use grit_lib::config::environment::RepositoryOptions;
-use grit_lib::diff::{DiffOptions, DiffTarget, WORKTREE_HAS_CHANGES_ENTRIES_SCANNED};
+use grit_lib::diff::{DiffOptions, DiffTarget};
 use grit_lib::repo::Repository;
+use grit_lib::test_support::counters::{
+    reset_worktree_has_changes_entries_scanned, worktree_has_changes_entries_scanned,
+};
+use grit_lib::worktree::pathspec::{Pathspec, PathspecGlobalFlags};
 use grit_test_support::git;
 
 fn open_repo(root: &std::path::Path) -> Repository {
@@ -26,9 +30,18 @@ fn git_diff_exit(root: &std::path::Path, args: &[&str]) -> i32 {
         .unwrap_or(1)
 }
 
+fn every_path() -> Pathspec {
+    Pathspec::entire_tree(PathspecGlobalFlags::default())
+}
+
 fn grit_has_changes(repo: &Repository, target: &DiffTarget, paths: &[String]) -> bool {
+    let pathspec = if paths.is_empty() {
+        every_path()
+    } else {
+        Pathspec::scoped(paths, PathspecGlobalFlags::default())
+    };
     repo.diff()
-        .has_changes(target, paths, DiffOptions::default())
+        .has_changes(target, &pathspec, &DiffOptions::default())
         .expect("has_changes")
 }
 
@@ -226,7 +239,7 @@ fn has_changes_matches_git_exit_code_whitespace_only_unstaged_with_ignore_all_sp
     opts.whitespace.ignore_all_space = true;
     let grit_changed = repo
         .diff()
-        .has_changes(&DiffTarget::WorktreeVsIndex, &[], opts)
+        .has_changes(&DiffTarget::WorktreeVsIndex, &every_path(), &opts)
         .expect("has_changes");
     assert_eq!(grit_changed, git_code == 1);
 }
@@ -249,7 +262,7 @@ fn has_changes_matches_git_exit_code_whitespace_only_with_ignore_all_space() {
     opts.whitespace.ignore_all_space = true;
     let grit_changed = repo
         .diff()
-        .has_changes(&DiffTarget::IndexVsHead, &[], opts)
+        .has_changes(&DiffTarget::IndexVsHead, &every_path(), &opts)
         .expect("has_changes");
     assert_eq!(grit_changed, git_code == 1);
 }
@@ -292,12 +305,16 @@ fn has_changes_short_circuits_after_first_changed_entry() {
     git(root, &["commit", "-qm", "init"]);
     std::fs::write(root.join("a.txt"), "a-dirty\n").expect("write");
     let repo = open_repo(root);
-    WORKTREE_HAS_CHANGES_ENTRIES_SCANNED.store(0, std::sync::atomic::Ordering::SeqCst);
+    reset_worktree_has_changes_entries_scanned();
     assert!(repo
         .diff()
-        .has_changes(&DiffTarget::WorktreeVsIndex, &[], DiffOptions::default())
+        .has_changes(
+            &DiffTarget::WorktreeVsIndex,
+            &every_path(),
+            &DiffOptions::default()
+        )
         .expect("has_changes"));
-    let scanned = WORKTREE_HAS_CHANGES_ENTRIES_SCANNED.load(std::sync::atomic::Ordering::SeqCst);
+    let scanned = worktree_has_changes_entries_scanned();
     assert!(
         scanned <= 1,
         "expected early stop after first changed file, scanned {scanned} entries"

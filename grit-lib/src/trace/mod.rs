@@ -21,7 +21,7 @@ pub(crate) use trace_span;
 mod tests {
     use crate::environment::RepositoryOptions;
     use crate::porcelain::status::{status, StatusOptions};
-    use crate::progress::{NeverCancel, NullProgress};
+    use crate::progress::{CancelToken, NullProgress};
     use crate::repo::{InitOptions, Repository};
     use crate::rev_list::RevListOptions;
     use std::sync::{Arc, Mutex};
@@ -61,7 +61,7 @@ mod tests {
 
         tracing::subscriber::with_default(subscriber, || {
             let dir = tempfile::tempdir().unwrap();
-            let repo = Repository::init(dir.path(), &InitOptions::default()).unwrap();
+            let (repo, _) = Repository::init(dir.path(), &InitOptions::default()).unwrap();
             let ident = "T <t@example.com> 1 +0000".to_string();
             let sig: crate::ident::Signature = ident.parse().unwrap();
             let mut req = crate::porcelain::commit::CommitRequest::new("trace test");
@@ -72,7 +72,7 @@ mod tests {
                 &repo,
                 &req,
                 &mut NullProgress,
-                &NeverCancel,
+                &CancelToken::never(),
             )
             .unwrap();
 
@@ -82,11 +82,11 @@ mod tests {
                 &opened,
                 &StatusOptions::default(),
                 &mut NullProgress,
-                &NeverCancel,
+                &CancelToken::never(),
             )
             .unwrap();
             let _ = opened
-                .rev_walk()
+                .revwalk()
                 .walk("HEAD", &RevListOptions::default())
                 .unwrap();
         });

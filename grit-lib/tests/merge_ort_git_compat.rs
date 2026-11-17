@@ -6,12 +6,15 @@ use std::fs;
 use std::os::unix::fs::symlink;
 
 use grit_lib::objects::ObjectId;
+use grit_lib::progress::{CancelToken, NullProgress};
 use grit_test_support::git;
+use grit_test_support::integrate_branch;
 
 use support::git as hist_git;
 use support::{
     assert_merge_commits_match_git, commit_file, commit_tree, criss_cross_conflicting_resolutions,
-    grit_merge_result_tree, open_grit_repo, skip_merge_tree_git, CommitMergeLabels, HistoryRepo,
+    grit_merge_result_tree, open_grit_repo, skip_merge_tree_git, tree_blob_map, CommitMergeLabels,
+    HistoryRepo,
 };
 
 #[test]
@@ -764,7 +767,8 @@ fn assert_integrate_matches_git_merge(
     ours_branch: &str,
     theirs_branch: &str,
 ) -> MergeState {
-    use grit_lib::porcelain::merge::{integrate_branch, IntegrateBranchOutcome};
+    use grit_lib::merge::IntegrateBranchOutcome;
+    use grit_test_support::integrate_branch;
 
     hist_git(root, &["switch", "-q", "-f", ours_branch]);
     hist_git(root, &["reset", "-q", "--hard"]);
@@ -779,7 +783,7 @@ fn assert_integrate_matches_git_merge(
         theirs,
         theirs_branch,
         &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("integrate_branch");
     drop(repo);
@@ -846,14 +850,14 @@ fn criss_cross_conflicting_resolutions_integrate_matches_git_merge() {
         let repo = open_grit_repo(root);
         let ours_oid: ObjectId = git(root, &["rev-parse", ours]).trim().parse().unwrap();
         let theirs_oid: ObjectId = git(root, &["rev-parse", theirs]).trim().parse().unwrap();
-        grit_lib::porcelain::merge::integrate_branch(
+        integrate_branch(
             &repo,
             &format!("refs/heads/{ours}"),
             ours_oid,
             theirs_oid,
             theirs,
             &mut grit_lib::progress::NullProgress,
-            &grit_lib::progress::NeverCancel,
+            &grit_lib::progress::CancelToken::never(),
         )
         .expect("integrate_branch");
         let stage1 = git(root, &["show", ":1:f"]);
@@ -872,7 +876,8 @@ fn criss_cross_integrate_with_favor_matches_git_merge_tree() {
         return;
     }
     use grit_lib::diff::merge_file::MergeFavor;
-    use grit_lib::porcelain::merge::{integrate_branch_with, IntegrateBranchOutcome, MergeOptions};
+    use grit_lib::merge::{IntegrateBranchOutcome, MergeOptions};
+    use grit_test_support::integrate_branch_with;
 
     for favor in [MergeFavor::Ours, MergeFavor::Theirs] {
         let cc = criss_cross_conflicting_resolutions();
@@ -895,7 +900,7 @@ fn criss_cross_integrate_with_favor_matches_git_merge_tree() {
                 ..MergeOptions::default()
             },
             &mut grit_lib::progress::NullProgress,
-            &grit_lib::progress::NeverCancel,
+            &grit_lib::progress::CancelToken::never(),
         )
         .expect("integrate_branch_with");
         let IntegrateBranchOutcome::Merged { oid, .. } = outcome else {
@@ -1093,11 +1098,10 @@ fn t6404_recursive_merge_matches_git() {
         .lines()
         .map(|l| l.parse().unwrap())
         .collect();
-    let grit_bases = grit_lib::revwalk::merge_base::merge_bases_all(
-        &open_grit_repo(root),
-        &[rev("F"), rev("G")],
-    )
-    .unwrap();
+    let grit_bases = (open_grit_repo(root))
+        .revwalk()
+        .merge_bases(&[rev("F"), rev("G")], grit_lib::revwalk::MergeBaseMode::All)
+        .unwrap();
     assert_eq!(
         grit_bases, git_bases,
         "tied merge bases must keep git's order"
@@ -1324,4 +1328,119 @@ fn criss_cross_diff3_inner_markers_match_git() {
     hist_git(cc.dir.path(), &["config", "merge.conflictStyle", "diff3"]);
     assert_integrate_matches_git_merge(cc.dir.path(), "ours", "theirs");
     assert_integrate_matches_git_merge(cc.dir.path(), "theirs", "ours");
+}
+
+/// Issue #2431: rust-lang/cargo `workspaces.md` — ort merges cleanly; `merge-file` conflicts.
+#[test]
+fn issue_2431_cargo_workspaces_md_tree_merge_matches_git_ort() {
+    if !skip_merge_tree_git() {
+        return;
+    }
+    use grit_lib::diff::merge_file::{merge, ConflictStyle, MergeFavor, MergeInput};
+    use grit_lib::diff::merge_trees::{merge_trees_three_way, WhitespaceMergeOptions};
+    use std::process::Command;
+
+    let base_bytes = include_bytes!("fixtures/cargo_workspaces_md_merge/base.md");
+    let ours_bytes = include_bytes!("fixtures/cargo_workspaces_md_merge/ours.md");
+    let theirs_bytes = include_bytes!("fixtures/cargo_workspaces_md_merge/theirs.md");
+    let expected_merged = include_bytes!("fixtures/cargo_workspaces_md_merge/expected_merged.md");
+    let path = "src/doc/src/reference/workspaces.md";
+    let base_text = std::str::from_utf8(base_bytes).expect("utf8 base");
+    let ours_text = std::str::from_utf8(ours_bytes).expect("utf8 ours");
+    let theirs_text = std::str::from_utf8(theirs_bytes).expect("utf8 theirs");
+
+    let history = init_repo();
+    let base = commit_file(history.worktree(), path, base_text, "base");
+    hist_git(history.worktree(), &["switch", "-c", "ours-side"]);
+    let ours = commit_file(history.worktree(), path, ours_text, "ours");
+    hist_git(
+        history.worktree(),
+        &["switch", "-c", "theirs-side", &base.to_hex()],
+    );
+    let theirs = commit_file(history.worktree(), path, theirs_text, "theirs");
+    hist_git(history.worktree(), &["switch", "ours-side"]);
+
+    let grit = open_grit_repo(history.worktree());
+    let labels = CommitMergeLabels::from_commits(&ours, &theirs);
+    assert_merge_commits_match_git(
+        &history,
+        &grit,
+        &base,
+        &ours,
+        &theirs,
+        labels.presentation(),
+        "issue #2431 cargo workspaces.md",
+    );
+
+    let base_tree = commit_tree(&grit, &base).expect("base tree");
+    let ours_tree = commit_tree(&grit, &ours).expect("ours tree");
+    let theirs_tree = commit_tree(&grit, &theirs).expect("theirs tree");
+    let merged = merge_trees_three_way(
+        &grit,
+        base_tree,
+        ours_tree,
+        theirs_tree,
+        MergeFavor::None,
+        WhitespaceMergeOptions::default(),
+        None,
+        labels.presentation(),
+        grit_lib::diff::merge_trees::DirectoryRenameMode::default(),
+    )
+    .expect("tree merge");
+    assert!(
+        merged.conflict_content.is_empty(),
+        "expected clean tree merge, got conflicts: {:?}",
+        merged.conflict_content.keys().collect::<Vec<_>>()
+    );
+    let result_tree = grit_merge_result_tree(&grit, &merged).expect("result tree");
+    let blobs = tree_blob_map(&grit, &result_tree);
+    let merged_oid = blobs.get(path).expect("merged blob in result tree");
+    let merged_blob = grit.odb().read(merged_oid).expect("read merged");
+    assert_eq!(
+        merged_blob.data.as_slice(),
+        expected_merged.as_slice(),
+        "merged blob must match git merge-tree"
+    );
+
+    let merge_file_out = merge(&MergeInput {
+        base: base_bytes,
+        ours: ours_bytes,
+        theirs: theirs_bytes,
+        label_ours: "ours",
+        label_base: "base",
+        label_theirs: "theirs",
+        favor: MergeFavor::None,
+        style: ConflictStyle::Merge,
+        marker_size: 7,
+        diff_algorithm: None,
+        ignore_all_space: false,
+        ignore_space_change: false,
+        ignore_space_at_eol: false,
+        ignore_cr_at_eol: false,
+    })
+    .expect("merge-file path");
+    assert!(
+        merge_file_out.conflicts > 0,
+        "merge() with default Myers must still conflict like git merge-file"
+    );
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("base"), base_bytes).expect("base");
+    std::fs::write(dir.path().join("ours"), ours_bytes).expect("ours");
+    std::fs::write(dir.path().join("theirs"), theirs_bytes).expect("theirs");
+    let git_mf = Command::new("git")
+        .current_dir(dir.path())
+        .args(["merge-file", "-p"])
+        .args([
+            "-L", "ours", "-L", "base", "-L", "theirs", "ours", "base", "theirs",
+        ])
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .output()
+        .expect("git merge-file");
+    assert_eq!(
+        git_mf.status.code(),
+        Some(1),
+        "git merge-file must conflict on this fixture"
+    );
 }

@@ -8,9 +8,8 @@ use std::path::{Path, PathBuf};
 
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::objects::ObjectId;
-use grit_lib::progress::NeverCancel;
+use grit_lib::progress::CancelToken;
 use grit_lib::remote::clone::{clone as clone_repo, CloneOptions};
-use grit_lib::remote::fetch::NoProgress;
 use grit_lib::remote::push_report::PushRefStatus;
 use grit_lib::remote::transfer::{FetchOptions, PushOptions, PushRefSpec, TagMode};
 use grit_lib::remote::Remote;
@@ -103,17 +102,16 @@ fn open_work_repo(dir: &Path) -> Repository {
 fn fetch_heads(dest: &Path, url: &str) {
     init_work_repo(dest);
     let repo = open_work_repo(dest);
+    let mut fetch_opts = FetchOptions::new();
+    fetch_opts.refspecs = vec!["+refs/heads/*:refs/remotes/o/*".to_owned()];
+    fetch_opts.tags = TagMode::None;
     Remote::from_url(url)
         .expect("url")
         .fetch(
             &repo,
-            FetchOptions {
-                refspecs: vec!["+refs/heads/*:refs/remotes/o/*".to_owned()],
-                tags: TagMode::None,
-                ..Default::default()
-            },
+            fetch_opts,
             &mut NoProgress,
-            &NeverCancel,
+            &CancelToken::never(),
             None,
         )
         .expect("fetch");
@@ -146,7 +144,7 @@ fn file_url_push_sends_only_objects_reachable_from_pushed_ref() {
             }],
             PushOptions::default(),
             &mut NoProgress,
-            &NeverCancel,
+            &CancelToken::never(),
             None,
         )
         .expect("push");
@@ -239,7 +237,7 @@ fn file_url_clone_matches_git_and_plain_path_clone_links_whole_store() {
         clone_repo(
             CloneOptions::new(url, dest),
             &mut NoProgress,
-            &NeverCancel,
+            &CancelToken::never(),
             None,
         )
         .expect("clone");
@@ -259,7 +257,7 @@ fn file_url_clone_matches_git_and_plain_path_clone_links_whole_store() {
     );
     assert_eq!(object_count(&git_url_clone.join(".git")), 3);
     assert_eq!(object_count(&url_clone.join(".git")), 3);
-    assert_fsck_no_dangling(&url_clone.join(".git"));
+    assert_fsck_no_dangling(url_clone.join(".git"));
 
     // A plain-path clone links the source pack wholesale, like `git clone --local`.
     let path_clone = tmp.path().join("path-clone");

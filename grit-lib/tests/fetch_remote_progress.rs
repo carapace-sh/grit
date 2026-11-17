@@ -14,8 +14,6 @@ use std::rc::Rc;
 
 use grit_lib::objects::ObjectId;
 use grit_lib::progress::ProgressSink;
-use grit_lib::refs::resolve_ref;
-use grit_lib::remote::fetch::{fetch_remote, Progress};
 use grit_lib::remote::transfer::{FetchOptions, TagMode};
 use grit_lib::remote::transport::{ConnectOptions, Connection, Service, SshTransport, Transport};
 
@@ -127,9 +125,7 @@ impl Connection for TeeConn {
 
 struct RemoteCap(Vec<u8>);
 
-impl ProgressSink for RemoteCap {}
-
-impl Progress for RemoteCap {
+impl ProgressSink for RemoteCap {
     fn message(&mut self, bytes: &[u8]) {
         self.0.extend_from_slice(bytes);
     }
@@ -164,10 +160,7 @@ fn run_case(protocol_v2: bool, remote_progress: bool) -> (Vec<u8>, Vec<u8>) {
     let local_git = local_root.join(".git");
 
     let connect_opts = if protocol_v2 {
-        ConnectOptions {
-            protocol_version: 2,
-            ..Default::default()
-        }
+        ConnectOptions::with_protocol_version(2)
     } else {
         ConnectOptions::default()
     };
@@ -183,22 +176,29 @@ fn run_case(protocol_v2: bool, remote_progress: bool) -> (Vec<u8>, Vec<u8>) {
 
     let main_oid = rev_parse(&source, "refs/heads/main");
     let mut cap = RemoteCap(Vec::new());
-    let mut opts = FetchOptions {
-        refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()],
-        tags: TagMode::Following,
-        remote_progress,
-        ..Default::default()
-    };
-    fetch_remote(
+    let mut opts = FetchOptions::new();
+    opts.refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()];
+    opts.tags = TagMode::Following;
+    grit_lib::repo::Repository::open(
         &local_git,
-        &mut conn,
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&mut opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Connection(&mut conn),
         &mut opts,
         &mut cap,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("fetch");
 
-    let got = resolve_ref(&local_git, "refs/remotes/origin/main").expect("origin/main");
+    let got = grit_test_support::refs::at(&local_git)
+        .references()
+        .resolve("refs/remotes/origin/main")
+        .expect("origin/main");
     assert_eq!(got, main_oid);
 
     let fsck = Command::new("git")

@@ -1,8 +1,8 @@
 //! Object database alternates (`info/alternates`, env overrides) — t5613/t5615/t1060 object-level scenarios.
 
 use grit_lib::objects::odb::Odb;
-use grit_lib::objects::pack::read_alternates_recursive;
 use grit_lib::objects::{ObjectId, ObjectKind};
+use grit_lib::test_support::objects_pack::read_alternates_recursive;
 use grit_test_support::git_cmd;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -241,7 +241,7 @@ fn alternates_cycle_and_self_reference_finish_without_hang() {
         &cycle_git.join("objects"),
         &format!("{}\n", a_canon.display()),
     );
-    assert_alternate_order_matches_git(&cycle_git.join("objects"), &cycle_git, "cycle");
+    assert_alternate_order_matches_git(cycle_git.join("objects"), &cycle_git, "cycle");
 
     fs::write(
         a.join("info/alternates"),
@@ -254,7 +254,7 @@ fn alternates_cycle_and_self_reference_finish_without_hang() {
         &self_git.join("objects"),
         &format!("{}\n", a_canon.display()),
     );
-    assert_alternate_order_matches_git(&self_git.join("objects"), &self_git, "self-ref");
+    assert_alternate_order_matches_git(self_git.join("objects"), &self_git, "self-ref");
 }
 
 #[test]

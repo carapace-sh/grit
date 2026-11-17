@@ -5,24 +5,20 @@ use grit_lib::error::Error;
 use grit_lib::index::entry_from_stat;
 use grit_lib::index::write_tree::{write_tree_update_index, WriteTreeFlags};
 use grit_lib::objects::{serialize_commit, CommitData, ObjectId, ObjectKind};
-use grit_lib::porcelain::branch::{create_branch, CreateBranchOptions};
-use grit_lib::porcelain::branch_error::BranchError;
-use grit_lib::porcelain::switch::{
-    resolve_create_branch, resolve_revision_spec, resolve_switch_target, switch_repository,
-    SwitchMode, SwitchOptions,
-};
-use grit_lib::porcelain::tag::{create_tag, CreateTagRequest};
-use grit_lib::refs;
-use grit_lib::refs::reflog::read_reflog;
+use grit_lib::porcelain::branch::BranchCreateOptions;
+use grit_lib::porcelain::branch::BranchError;
+use grit_lib::porcelain::switch::{SwitchMode, SwitchOptions};
+use grit_lib::porcelain::tag::CreateTagRequest;
+use grit_lib::progress::{CancelToken, NullProgress};
 use grit_lib::repo::{InitOptions, Repository};
-use grit_lib::state::{resolve_head, HeadState};
+use grit_lib::state::HeadState;
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 use tempfile::TempDir;
 
 fn init_repo() -> (TempDir, Repository) {
     let dir = tempfile::tempdir().expect("tempdir");
-    let repo = Repository::init(dir.path(), &InitOptions::default()).expect("init");
+    let (repo, _) = Repository::init(dir.path(), &InitOptions::default()).expect("init");
     (dir, repo)
 }
 
@@ -47,7 +43,10 @@ fn grit_commit(
 ) -> ObjectId {
     let work_tree = repo.work_tree().expect("wt");
     std::fs::write(work_tree.join(path), contents).expect("write");
-    let mut index = repo.index_handle().load().expect("index");
+    let mut index = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("index");
     let oid = repo
         .odb()
         .write(ObjectKind::Blob, contents.as_bytes())
@@ -64,7 +63,9 @@ fn grit_commit(
     index.sort();
     let tree = write_tree_update_index(repo.odb(), &mut index, "", WriteTreeFlags::silent())
         .expect("tree");
-    repo.index_handle().write(&mut index).expect("write index");
+    repo.index()
+        .write(&mut index, &grit_lib::index::IndexWriteOptions::default())
+        .expect("write index");
     let commit = CommitData {
         tree,
         parents: parent.into_iter().collect(),
@@ -81,8 +82,10 @@ fn grit_commit(
         .odb()
         .write(ObjectKind::Commit, &serialize_commit(&commit))
         .expect("commit");
-    refs::write_ref(repo.git_dir(), "refs/heads/main", &co).expect("branch");
-    refs::write_symbolic_ref(repo.git_dir(), "HEAD", "refs/heads/main").expect("head");
+    grit_test_support::refs::set_ref(&repo, "refs/heads/main", &co).expect("branch");
+    repo.references()
+        .update_symbolic("HEAD", "refs/heads/main")
+        .expect("head");
     co
 }
 
@@ -95,7 +98,10 @@ fn grit_commit_to_ref(
 ) -> ObjectId {
     let work_tree = repo.work_tree().expect("wt");
     std::fs::write(work_tree.join(path), contents).expect("write");
-    let mut index = repo.index_handle().load().expect("index");
+    let mut index = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("index");
     let oid = repo
         .odb()
         .write(ObjectKind::Blob, contents.as_bytes())
@@ -112,7 +118,9 @@ fn grit_commit_to_ref(
     index.sort();
     let tree = write_tree_update_index(repo.odb(), &mut index, "", WriteTreeFlags::silent())
         .expect("tree");
-    repo.index_handle().write(&mut index).expect("write index");
+    repo.index()
+        .write(&mut index, &grit_lib::index::IndexWriteOptions::default())
+        .expect("write index");
     let commit = CommitData {
         tree,
         parents: parent.into_iter().collect(),
@@ -129,7 +137,7 @@ fn grit_commit_to_ref(
         .odb()
         .write(ObjectKind::Commit, &serialize_commit(&commit))
         .expect("commit");
-    refs::write_ref(repo.git_dir(), branch_ref, &co).expect("branch");
+    grit_test_support::refs::set_ref(&repo, branch_ref, &co).expect("branch");
     co
 }
 
@@ -169,66 +177,75 @@ fn run_repro_sequence(repo: &Repository) {
     let c1 = grit_commit(repo, "f", "1\n", None);
     let _c2 = grit_commit(repo, "f", "1\n2\n", Some(c1));
 
-    switch_repository(
-        repo,
-        &SwitchOptions {
-            mode: resolve_create_branch(repo, "topic", None).unwrap(),
-            dry_run: false,
-            hooks: grit_lib::PostOperationHooks::Run,
-        },
-        &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("switch -c topic");
-
-    let main_oid = refs::resolve_ref(repo.git_dir(), "refs/heads/main").unwrap();
-    switch_repository(
-        repo,
-        &SwitchOptions {
-            mode: SwitchMode::Existing {
-                branch: "main".into(),
-                oid: main_oid,
+    repo.checkout()
+        .switch(
+            &SwitchOptions {
+                mode: repo
+                    .branches()
+                    .resolve_create_for_switch(
+                        "topic",
+                        None,
+                        grit_lib::porcelain::branch::TrackMode::Auto,
+                    )
+                    .unwrap(),
+                dry_run: false,
+                hooks: grit_lib::command_runner::hooks::PostOperationHooks::Run,
             },
-            dry_run: false,
-            hooks: grit_lib::PostOperationHooks::Run,
-        },
-        &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("switch main");
+            &mut grit_lib::progress::NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("switch -c topic");
 
-    let detach = resolve_revision_spec(repo, "HEAD~1").unwrap();
-    switch_repository(
-        repo,
-        &SwitchOptions {
-            mode: SwitchMode::Detached {
-                commit: detach,
-                reflog_to_label: "HEAD~1".into(),
+    let main_oid = repo.references().resolve("refs/heads/main").unwrap();
+    repo.checkout()
+        .switch(
+            &SwitchOptions {
+                mode: SwitchMode::Existing {
+                    branch: "main".into(),
+                    oid: main_oid,
+                },
+                dry_run: false,
+                hooks: grit_lib::command_runner::hooks::PostOperationHooks::Run,
             },
-            dry_run: false,
-            hooks: grit_lib::PostOperationHooks::Run,
-        },
-        &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("detach");
+            &mut grit_lib::progress::NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("switch main");
 
-    switch_repository(
-        repo,
-        &SwitchOptions {
-            mode: SwitchMode::Existing {
-                branch: "main".into(),
-                oid: main_oid,
+    let detach = repo.checkout().resolve_revision_spec("HEAD~1").unwrap();
+    repo.checkout()
+        .switch(
+            &SwitchOptions {
+                mode: SwitchMode::Detached {
+                    commit: detach,
+                    reflog_to_label: "HEAD~1".into(),
+                },
+                dry_run: false,
+                hooks: grit_lib::command_runner::hooks::PostOperationHooks::Run,
             },
-            dry_run: false,
-            hooks: grit_lib::PostOperationHooks::Run,
-        },
-        &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("switch main");
+            &mut grit_lib::progress::NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("detach");
 
-    create_branch(repo, &CreateBranchOptions::at_head("b2")).expect("branch b2");
+    repo.checkout()
+        .switch(
+            &SwitchOptions {
+                mode: SwitchMode::Existing {
+                    branch: "main".into(),
+                    oid: main_oid,
+                },
+                dry_run: false,
+                hooks: grit_lib::command_runner::hooks::PostOperationHooks::Run,
+            },
+            &mut grit_lib::progress::NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("switch main");
+
+    repo.branches()
+        .create(&BranchCreateOptions::at_head("b2"))
+        .expect("branch b2");
 }
 
 #[test]
@@ -236,9 +253,8 @@ fn detach_at_annotated_tag_matches_git() {
     let (dir, repo) = init_repo();
     git_config(dir.path());
     let tip = grit_commit(&repo, "a.txt", "hi\n", None);
-    create_tag(
-        &repo,
-        &CreateTagRequest {
+    repo.tags()
+        .create(&CreateTagRequest {
             name: "v1".into(),
             target: tip,
             message: Some("annotated".into()),
@@ -248,29 +264,31 @@ fn detach_at_annotated_tag_matches_git() {
             tree_sha256: None,
             force: false,
             dry_run: false,
-        },
-    )
-    .expect("annotated tag");
+        })
+        .expect("annotated tag");
 
-    let commit = resolve_revision_spec(&repo, "v1").expect("resolve tag to commit");
+    let commit = repo
+        .checkout()
+        .resolve_revision_spec("v1")
+        .expect("resolve tag to commit");
     assert_eq!(commit, tip);
 
-    switch_repository(
-        &repo,
-        &SwitchOptions {
-            mode: SwitchMode::Detached {
-                commit,
-                reflog_to_label: "v1".into(),
+    repo.checkout()
+        .switch(
+            &SwitchOptions {
+                mode: SwitchMode::Detached {
+                    commit,
+                    reflog_to_label: "v1".into(),
+                },
+                dry_run: false,
+                hooks: grit_lib::command_runner::hooks::PostOperationHooks::Run,
             },
-            dry_run: false,
-            hooks: grit_lib::PostOperationHooks::Run,
-        },
-        &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("grit switch --detach v1");
+            &mut grit_lib::progress::NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("grit switch --detach v1");
 
-    let grit_head = match resolve_head(repo.git_dir()).expect("head") {
+    let grit_head = match repo.references().head().expect("head") {
         HeadState::Detached { oid } => oid,
         other => panic!("expected detached HEAD, got {other:?}"),
     };
@@ -299,7 +317,9 @@ fn detach_at_annotated_tag_matches_git() {
         String::from_utf8_lossy(&fsck.stderr)
     );
 
-    refs::write_symbolic_ref(repo.git_dir(), "HEAD", "refs/heads/main").expect("reattach");
+    repo.references()
+        .update_symbolic("HEAD", "refs/heads/main")
+        .expect("reattach");
     let git_switch = Command::new("git")
         .args(["switch", "--detach", "v1"])
         .current_dir(dir.path())
@@ -328,7 +348,7 @@ fn switch_sequence_reflog_matches_git() {
     git_config(dir.path());
     run_repro_sequence(&repo);
 
-    let head_log = read_reflog(repo.git_dir(), "HEAD").expect("head reflog");
+    let head_log = repo.references().reflog("HEAD").expect("head reflog");
     let checkout_msgs: Vec<_> = head_log
         .iter()
         .filter_map(|e| {
@@ -340,11 +360,14 @@ fn switch_sequence_reflog_matches_git() {
     assert_eq!(checkout_msgs.len(), 4);
     assert!(checkout_msgs.iter().any(|m| m.contains(" to HEAD~1")));
 
-    let topic_log = read_reflog(repo.git_dir(), "refs/heads/topic").expect("topic log");
+    let topic_log = repo
+        .references()
+        .reflog("refs/heads/topic")
+        .expect("topic log");
     assert_eq!(topic_log.len(), 1);
     assert_eq!(topic_log[0].message, "branch: Created from HEAD");
 
-    let b2_log = read_reflog(repo.git_dir(), "refs/heads/b2").expect("b2 log");
+    let b2_log = repo.references().reflog("refs/heads/b2").expect("b2 log");
     assert_eq!(b2_log.len(), 1);
     assert_eq!(b2_log[0].message, "branch: Created from main");
 
@@ -370,67 +393,80 @@ fn switch_minus_and_at_minus_one_return_previous_branch() {
     let c1 = grit_commit(&repo, "f", "1\n", None);
     let _c2 = grit_commit(&repo, "f", "1\n2\n", Some(c1));
 
-    switch_repository(
-        &repo,
-        &SwitchOptions {
-            mode: resolve_create_branch(&repo, "topic", None).unwrap(),
-            dry_run: false,
-            hooks: grit_lib::PostOperationHooks::Run,
-        },
-        &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("topic");
-    let main_oid = refs::resolve_ref(repo.git_dir(), "refs/heads/main").unwrap();
-    switch_repository(
-        &repo,
-        &SwitchOptions {
-            mode: SwitchMode::Existing {
-                branch: "main".into(),
-                oid: main_oid,
+    repo.checkout()
+        .switch(
+            &SwitchOptions {
+                mode: repo
+                    .branches()
+                    .resolve_create_for_switch(
+                        "topic",
+                        None,
+                        grit_lib::porcelain::branch::TrackMode::Auto,
+                    )
+                    .unwrap(),
+                dry_run: false,
+                hooks: grit_lib::command_runner::hooks::PostOperationHooks::Run,
             },
-            dry_run: false,
-            hooks: grit_lib::PostOperationHooks::Run,
-        },
-        &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("main");
+            &mut grit_lib::progress::NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("topic");
+    let main_oid = repo.references().resolve("refs/heads/main").unwrap();
+    repo.checkout()
+        .switch(
+            &SwitchOptions {
+                mode: SwitchMode::Existing {
+                    branch: "main".into(),
+                    oid: main_oid,
+                },
+                dry_run: false,
+                hooks: grit_lib::command_runner::hooks::PostOperationHooks::Run,
+            },
+            &mut grit_lib::progress::NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("main");
 
-    let mode_minus = resolve_switch_target(&repo, "-").expect("@{-1} via -");
+    let mode_minus = repo
+        .checkout()
+        .resolve_switch_target("-")
+        .expect("@{-1} via -");
     match &mode_minus {
         SwitchMode::Existing { branch, .. } => assert_eq!(branch, "topic"),
         other => panic!("expected existing topic, got {other:?}"),
     }
 
-    switch_repository(
-        &repo,
-        &SwitchOptions {
-            mode: mode_minus,
-            dry_run: false,
-            hooks: grit_lib::PostOperationHooks::Run,
-        },
-        &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("switch -");
-
-    switch_repository(
-        &repo,
-        &SwitchOptions {
-            mode: SwitchMode::Existing {
-                branch: "main".into(),
-                oid: main_oid,
+    repo.checkout()
+        .switch(
+            &SwitchOptions {
+                mode: mode_minus,
+                dry_run: false,
+                hooks: grit_lib::command_runner::hooks::PostOperationHooks::Run,
             },
-            dry_run: false,
-            hooks: grit_lib::PostOperationHooks::Run,
-        },
-        &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("main again");
+            &mut grit_lib::progress::NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("switch -");
 
-    let mode_at = resolve_switch_target(&repo, "@{-1}").expect("@{-1}");
+    repo.checkout()
+        .switch(
+            &SwitchOptions {
+                mode: SwitchMode::Existing {
+                    branch: "main".into(),
+                    oid: main_oid,
+                },
+                dry_run: false,
+                hooks: grit_lib::command_runner::hooks::PostOperationHooks::Run,
+            },
+            &mut grit_lib::progress::NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("main again");
+
+    let mode_at = repo
+        .checkout()
+        .resolve_switch_target("@{-1}")
+        .expect("@{-1}");
     match mode_at {
         SwitchMode::Existing { branch, .. } => assert_eq!(branch, "topic"),
         other => panic!("expected topic, got {other:?}"),
@@ -458,22 +494,29 @@ fn checkout_appends_existing_head_reflog_when_log_all_ref_updates_false() {
         .status()
         .expect("git config");
 
-    let before = read_reflog(repo.git_dir(), "HEAD").expect("head log");
+    let before = repo.references().reflog("HEAD").expect("head log");
     assert_eq!(before.len(), 1, "git commit should seed HEAD reflog");
 
-    switch_repository(
-        &repo,
-        &SwitchOptions {
-            mode: resolve_create_branch(&repo, "topic", None).expect("x"),
-            dry_run: false,
-            hooks: grit_lib::PostOperationHooks::Run,
-        },
-        &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("switch -c topic");
+    repo.checkout()
+        .switch(
+            &SwitchOptions {
+                mode: repo
+                    .branches()
+                    .resolve_create_for_switch(
+                        "topic",
+                        None,
+                        grit_lib::porcelain::branch::TrackMode::Auto,
+                    )
+                    .expect("x"),
+                dry_run: false,
+                hooks: grit_lib::command_runner::hooks::PostOperationHooks::Run,
+            },
+            &mut grit_lib::progress::NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("switch -c topic");
 
-    let after = read_reflog(repo.git_dir(), "HEAD").expect("head log after");
+    let after = repo.references().reflog("HEAD").expect("head log after");
     assert_eq!(
         after.len(),
         2,
@@ -491,24 +534,24 @@ fn same_branch_switch_appends_head_checkout_reflog() {
     let (_dir, repo) = init_repo();
     let c1 = grit_commit(&repo, "f", "1\n", None);
     let _c2 = grit_commit(&repo, "f", "1\n2\n", Some(c1));
-    let main_oid = refs::resolve_ref(repo.git_dir(), "refs/heads/main").unwrap();
+    let main_oid = repo.references().resolve("refs/heads/main").unwrap();
 
-    switch_repository(
-        &repo,
-        &SwitchOptions {
-            mode: SwitchMode::Existing {
-                branch: "main".into(),
-                oid: main_oid,
+    repo.checkout()
+        .switch(
+            &SwitchOptions {
+                mode: SwitchMode::Existing {
+                    branch: "main".into(),
+                    oid: main_oid,
+                },
+                dry_run: false,
+                hooks: grit_lib::command_runner::hooks::PostOperationHooks::Run,
             },
-            dry_run: false,
-            hooks: grit_lib::PostOperationHooks::Run,
-        },
-        &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("same-branch switch");
+            &mut grit_lib::progress::NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("same-branch switch");
 
-    let head_log = read_reflog(repo.git_dir(), "HEAD").expect("head log");
+    let head_log = repo.references().reflog("HEAD").expect("head log");
     assert!(
         head_log
             .iter()
@@ -525,9 +568,12 @@ fn same_branch_switch_appends_head_checkout_reflog() {
 fn remote_dwim_create_uses_remote_ref_in_branch_reflog() {
     let (dir, repo) = init_repo();
     let tip = grit_commit(&repo, "f", "1\n", None);
-    refs::write_ref(repo.git_dir(), "refs/remotes/origin/topic", &tip).expect("remote");
+    grit_test_support::refs::set_ref(&repo, "refs/remotes/origin/topic", &tip).expect("remote");
 
-    let mode = resolve_switch_target(&repo, "topic").expect("resolve");
+    let mode = repo
+        .checkout()
+        .resolve_switch_target("topic")
+        .expect("resolve");
     match &mode {
         SwitchMode::Create {
             create_source_label,
@@ -536,29 +582,35 @@ fn remote_dwim_create_uses_remote_ref_in_branch_reflog() {
         other => panic!("expected create from remote, got {other:?}"),
     }
 
-    switch_repository(
-        &repo,
-        &SwitchOptions {
-            mode,
-            dry_run: false,
-            hooks: grit_lib::PostOperationHooks::Run,
-        },
-        &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("switch");
+    repo.checkout()
+        .switch(
+            &SwitchOptions {
+                mode,
+                dry_run: false,
+                hooks: grit_lib::command_runner::hooks::PostOperationHooks::Run,
+            },
+            &mut grit_lib::progress::NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("switch");
 
-    let topic_log = read_reflog(repo.git_dir(), "refs/heads/topic").expect("topic log");
+    let topic_log = repo
+        .references()
+        .reflog("refs/heads/topic")
+        .expect("topic log");
     assert_eq!(topic_log.len(), 1);
     assert_eq!(
         topic_log[0].message,
         "branch: Created from refs/remotes/origin/topic"
     );
 
-    let config = repo.config().expect("config");
-    assert_eq!(config.get("branch.topic.remote").as_deref(), Some("origin"));
+    let config = repo.config().snapshot().expect("config");
     assert_eq!(
-        config.get("branch.topic.merge").as_deref(),
+        config.get("branch.topic.remote").unwrap().as_deref(),
+        Some("origin")
+    );
+    assert_eq!(
+        config.get("branch.topic.merge").unwrap().as_deref(),
         Some("refs/heads/topic")
     );
 
@@ -586,9 +638,11 @@ fn remote_dwim_create_uses_remote_ref_in_branch_reflog() {
 fn unborn_symbolic_head_switch_writes_zero_to_tip_checkout_reflog() {
     let (dir, repo) = init_repo();
     git_config(dir.path());
-    refs::write_symbolic_ref(repo.git_dir(), "HEAD", "refs/heads/main").expect("symhead");
+    repo.references()
+        .update_symbolic("HEAD", "refs/heads/main")
+        .expect("symhead");
     let _ = std::fs::remove_file(repo.git_dir().join("refs/heads/main"));
-    let head = resolve_head(repo.git_dir()).expect("head");
+    let head = repo.references().head().expect("head");
     assert!(matches!(
         head,
         HeadState::Branch {
@@ -600,22 +654,22 @@ fn unborn_symbolic_head_switch_writes_zero_to_tip_checkout_reflog() {
 
     let tip = grit_commit_to_ref(&repo, "refs/heads/feature", "f", "1\n", None);
 
-    switch_repository(
-        &repo,
-        &SwitchOptions {
-            mode: SwitchMode::Existing {
-                branch: "feature".into(),
-                oid: tip,
+    repo.checkout()
+        .switch(
+            &SwitchOptions {
+                mode: SwitchMode::Existing {
+                    branch: "feature".into(),
+                    oid: tip,
+                },
+                dry_run: false,
+                hooks: grit_lib::command_runner::hooks::PostOperationHooks::Run,
             },
-            dry_run: false,
-            hooks: grit_lib::PostOperationHooks::Run,
-        },
-        &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("switch to feature");
+            &mut grit_lib::progress::NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("switch to feature");
 
-    let head_after = resolve_head(repo.git_dir()).expect("head after");
+    let head_after = repo.references().head().expect("head after");
     assert!(matches!(
         head_after,
         HeadState::Branch {
@@ -625,7 +679,7 @@ fn unborn_symbolic_head_switch_writes_zero_to_tip_checkout_reflog() {
         } if refname == "refs/heads/feature" && oid == tip
     ));
 
-    let head_log = read_reflog(repo.git_dir(), "HEAD").expect("head log");
+    let head_log = repo.references().reflog("HEAD").expect("head log");
     assert_eq!(head_log.len(), 1);
     assert!(head_log[0].old_oid.is_zero() || head_log[0].old_oid == zero_oid());
     assert_eq!(head_log[0].new_oid, tip);
@@ -649,14 +703,16 @@ fn create_branch_leaves_no_ref_when_reflog_dir_not_writable() {
     std::fs::create_dir_all(&logs_heads).expect("logs dir");
     std::fs::set_permissions(&logs_heads, std::fs::Permissions::from_mode(0o500)).expect("chmod");
 
-    let err = create_branch(&repo, &CreateBranchOptions::at_head("fail"))
+    let err = repo
+        .branches()
+        .create(&BranchCreateOptions::at_head("fail"))
         .expect_err("reflog should fail");
     assert!(!err.to_string().is_empty());
 
     std::fs::set_permissions(&logs_heads, std::fs::Permissions::from_mode(0o755))
         .expect("restore chmod");
     assert!(
-        refs::resolve_ref(repo.git_dir(), "refs/heads/fail").is_err(),
+        repo.references().resolve("refs/heads/fail").is_err(),
         "branch ref must not exist when reflog write fails"
     );
 }
@@ -664,7 +720,10 @@ fn create_branch_leaves_no_ref_when_reflog_dir_not_writable() {
 #[test]
 fn switch_minus_without_prior_checkout_is_no_previous_branch() {
     let (_dir, repo) = init_repo();
-    let err = resolve_switch_target(&repo, "-").expect_err("fresh repo has no reflog checkout");
+    let err = repo
+        .checkout()
+        .resolve_switch_target("-")
+        .expect_err("fresh repo has no reflog checkout");
     assert!(
         matches!(err, Error::Branch(BranchError::NoPreviousBranch)),
         "{err:?}"

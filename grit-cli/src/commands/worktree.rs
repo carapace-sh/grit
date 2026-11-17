@@ -5,184 +5,26 @@ use grit_lib::config::git_path::{
     absolute_path_for_gitfile_stored_path, path_for_disk_compare, path_lexical_for_disk_compare,
     user_display_path,
 };
-use grit_lib::refs::check_ref_format::validate_branch_short_name;
+use grit_lib::refs::check_ref_format::RefName;
 use grit_lib::repo_handles::LockWorktreeOptions;
 use grit_lib::state::HeadState;
 use grit_lib::worktree::{
-    add_linked_worktree, list_worktrees, move_linked_worktree, prune_linked_worktrees,
-    remove_linked_worktree, resolve_linked_worktree_add_path, resolve_move_destination,
-    AddLinkedWorktreeOptions, MoveWorktreeOptions, PrunableReason, PruneWorktreesOptions,
-    WorktreeBranch, WorktreeRepairKind,
+    resolve_linked_worktree_add_path, resolve_move_destination, AddLinkedWorktreeOptions,
+    MoveWorktreeOptions, PrunableReason, PruneWorktreesOptions, WorktreeBranch, WorktreeRepairKind,
 };
-use schemars::JsonSchema;
-use serde::Serialize;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::context;
-use crate::markdown;
-use crate::output::{outln, HumanRender, MarkdownRender, RenderContext};
 use crate::ref_name_messages::branch_short_name_error_message;
 
-/// Result of `grit worktree`, tagged by `action`.
-#[derive(Serialize, JsonSchema)]
-#[serde(tag = "action", rename_all = "snake_case")]
-pub enum WorktreeOutcome {
-    List {
-        worktrees: Vec<WorktreeRow>,
-    },
-    Add {
-        path: String,
-        branch: Option<String>,
-        head: String,
-        locked: bool,
-        checked_out: bool,
-    },
-    Remove {
-        path: String,
-    },
-    Prune {
-        dry_run: bool,
-        pruned: Vec<PrunedWorktreeRow>,
-    },
-    Lock {
-        path: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        #[schemars(skip_serializing_if = "Option::is_none")]
-        reason: Option<String>,
-    },
-    Unlock {
-        path: String,
-    },
-    Move {
-        from: String,
-        to: String,
-        dry_run: bool,
-    },
-    Repair {
-        repairs: Vec<WorktreeRepairRow>,
-        dry_run: bool,
-    },
-}
-
-#[derive(Serialize, JsonSchema)]
-pub struct WorktreeRepairRow {
-    pub path: String,
-    pub kind: String,
-}
-
-#[derive(Serialize, JsonSchema)]
-pub struct WorktreeRow {
-    pub path: String,
-    pub head: String,
-    pub branch: Option<String>,
-    pub detached: bool,
-    pub bare: bool,
-    pub locked: bool,
-    pub lock_reason: Option<String>,
-    pub prunable: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schemars(skip_serializing_if = "Option::is_none")]
-    pub prunable_reason: Option<String>,
-    pub is_current: bool,
-}
-
-#[derive(Serialize, JsonSchema)]
-pub struct PrunedWorktreeRow {
-    pub path: String,
-    pub reason: String,
-}
-
-impl HumanRender for WorktreeOutcome {
-    fn render_human(&self, w: &mut dyn Write, _ctx: &RenderContext) -> Result<()> {
-        match self {
-            WorktreeOutcome::List { worktrees } => {
-                for wt in worktrees {
-                    if wt.bare {
-                        outln!(w, "  {}  (bare)", wt.path);
-                        continue;
-                    }
-                    let branch = wt
-                        .branch
-                        .as_deref()
-                        .map(|b| format!(" [{b}]"))
-                        .unwrap_or_else(|| {
-                            if wt.detached {
-                                " (detached HEAD)".to_owned()
-                            } else {
-                                String::new()
-                            }
-                        });
-                    let current = if wt.is_current { "*" } else { " " };
-                    let lock = if wt.locked { " (locked)" } else { "" };
-                    let prunable = if wt.prunable { " prunable" } else { "" };
-                    outln!(w, "{current} {}{branch}{lock}{prunable}", wt.path);
-                }
-            }
-            WorktreeOutcome::Add { path, branch, .. } => {
-                if let Some(b) = branch {
-                    outln!(w, "Created worktree at {path} on branch {b}");
-                } else {
-                    outln!(w, "Created worktree at {path} (detached)");
-                }
-            }
-            WorktreeOutcome::Remove { path } => outln!(w, "Removed worktree {path}"),
-            WorktreeOutcome::Prune { dry_run, pruned } => {
-                if pruned.is_empty() {
-                    outln!(w, "No prunable worktrees");
-                } else if *dry_run {
-                    for row in pruned {
-                        outln!(w, "Would prune worktree {} ({})", row.path, row.reason);
-                    }
-                } else {
-                    for row in pruned {
-                        outln!(w, "Pruned worktree {} ({})", row.path, row.reason);
-                    }
-                }
-            }
-            WorktreeOutcome::Lock { path, reason } => {
-                if let Some(r) = reason {
-                    outln!(w, "Locked worktree {path} ({r})");
-                } else {
-                    outln!(w, "Locked worktree {path}");
-                }
-            }
-            WorktreeOutcome::Unlock { path } => outln!(w, "Unlocked worktree {path}"),
-            WorktreeOutcome::Move { from, to, dry_run } => {
-                if *dry_run {
-                    outln!(w, "Would move worktree {from} -> {to}");
-                } else {
-                    outln!(w, "Moved worktree {from} -> {to}");
-                }
-            }
-            WorktreeOutcome::Repair { repairs, dry_run } => {
-                if repairs.is_empty() {
-                    outln!(w, "No worktree links to repair");
-                } else if *dry_run {
-                    for r in repairs {
-                        outln!(w, "Would repair {} ({})", r.path, r.kind);
-                    }
-                } else {
-                    for r in repairs {
-                        outln!(w, "Repaired {} ({})", r.path, r.kind);
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
-impl MarkdownRender for WorktreeOutcome {
-    fn render_markdown(&self, w: &mut dyn Write, _ctx: &RenderContext) -> Result<()> {
-        markdown::print_worktree_outcome(w, self)?;
-        Ok(())
-    }
-}
+pub use crate::render::worktree::*;
 
 pub fn run_list() -> Result<WorktreeOutcome> {
     let repo = context::discover()?;
-    let entries = list_worktrees(&repo).context("could not list worktrees")?;
+    let entries = repo
+        .worktrees()
+        .list()
+        .context("could not list worktrees")?;
     let worktrees = entries.into_iter().map(map_row).collect();
     Ok(WorktreeOutcome::List { worktrees })
 }
@@ -208,7 +50,7 @@ pub fn run_add(
         bail!("use only one of `-b`, `-B`, or `--detach`");
     }
     if let Some(b) = branch.as_deref().or(force_branch.as_deref()) {
-        if let Err(err) = validate_branch_short_name(b) {
+        if let Err(err) = RefName::branch(b).map(|_| ()) {
             bail!(branch_short_name_error_message(b, &err));
         }
     }
@@ -227,24 +69,27 @@ pub fn run_add(
     let repo = context::discover()?;
     let relative_to = std::env::current_dir().context("could not read working directory")?;
     let path = resolve_linked_worktree_add_path(&path, &relative_to).map_err(anyhow::Error::new)?;
-    let entry = add_linked_worktree(
-        &repo,
-        &AddLinkedWorktreeOptions {
-            path,
-            branch: branch_mode,
-            start_point,
-            force,
-            lock: lock.then(|| LockWorktreeOptions {
-                reason: lock_reason.clone(),
-            }),
-            no_checkout,
-            track,
-        },
-    )
-    .map_err(anyhow::Error::new)?;
+    let _interrupt = crate::interrupt::InterruptCancel::install();
+    let entry = repo
+        .worktrees()
+        .add_with_cancel(
+            &AddLinkedWorktreeOptions {
+                path,
+                branch: branch_mode,
+                start_point,
+                force,
+                lock: lock.then(|| LockWorktreeOptions {
+                    reason: lock_reason.clone(),
+                }),
+                no_checkout,
+                track,
+            },
+            &crate::interrupt::process_cancel_token(),
+        )
+        .map_err(anyhow::Error::new)?;
     let (branch_name, head_hex) = head_summary(&entry.head);
     Ok(WorktreeOutcome::Add {
-        path: entry.path.display().to_string(),
+        path: user_display_path(&entry.path),
         branch: branch_name,
         head: head_hex,
         locked: entry.is_locked,
@@ -255,22 +100,26 @@ pub fn run_add(
 pub fn run_remove(path: PathBuf, force: bool) -> Result<WorktreeOutcome> {
     let repo = context::discover()?;
     let canonical = path_for_disk_compare(&path);
-    remove_linked_worktree(&repo, &canonical, force).map_err(anyhow::Error::new)?;
+    repo.worktrees()
+        .remove(&canonical, force)
+        .map_err(anyhow::Error::new)?;
     Ok(WorktreeOutcome::Remove {
-        path: canonical.display().to_string(),
+        path: user_display_path(&canonical),
     })
 }
 
 pub fn run_prune(dry_run: bool) -> Result<WorktreeOutcome> {
     let repo = context::discover()?;
-    let pruned = prune_linked_worktrees(&repo, &PruneWorktreesOptions { dry_run })
+    let pruned = repo
+        .worktrees()
+        .prune(&PruneWorktreesOptions { dry_run })
         .map_err(anyhow::Error::new)?;
     Ok(WorktreeOutcome::Prune {
         dry_run,
         pruned: pruned
             .into_iter()
             .map(|e| PrunedWorktreeRow {
-                path: e.path.display().to_string(),
+                path: user_display_path(&e.path),
                 reason: e.reason,
             })
             .collect(),
@@ -289,7 +138,7 @@ pub fn run_lock(path: PathBuf, reason: Option<String>) -> Result<WorktreeOutcome
         )
         .map_err(anyhow::Error::new)?;
     Ok(WorktreeOutcome::Lock {
-        path: canonical.display().to_string(),
+        path: user_display_path(&canonical),
         reason,
     })
 }
@@ -300,13 +149,13 @@ pub fn run_move(from: PathBuf, to: PathBuf, force: bool, dry_run: bool) -> Resul
     let to_abs = std::path::absolute(&to).unwrap_or(to);
     let to_lexical = path_lexical_for_disk_compare(&to_abs);
     let dest = resolve_move_destination(&from_canon, &to_lexical).map_err(anyhow::Error::new)?;
-    move_linked_worktree(
-        &repo,
-        &from_canon,
-        &to_lexical,
-        &MoveWorktreeOptions { force, dry_run },
-    )
-    .map_err(anyhow::Error::new)?;
+    repo.worktrees()
+        .move_linked(
+            &from_canon,
+            &to_lexical,
+            &MoveWorktreeOptions { force, dry_run },
+        )
+        .map_err(anyhow::Error::new)?;
     Ok(WorktreeOutcome::Move {
         from: absolute_path_for_gitfile_stored_path(&from_canon),
         to: absolute_path_for_gitfile_stored_path(&dest),
@@ -350,7 +199,7 @@ pub fn run_unlock(path: PathBuf) -> Result<WorktreeOutcome> {
         .unlock(&canonical)
         .map_err(anyhow::Error::new)?;
     Ok(WorktreeOutcome::Unlock {
-        path: canonical.display().to_string(),
+        path: user_display_path(&canonical),
     })
 }
 
@@ -391,5 +240,91 @@ fn head_summary(head: &HeadState) -> (Option<String>, String) {
         } => (Some(short_name.clone()), oid.to_hex()),
         HeadState::Detached { oid } => (None, oid.to_hex()),
         _ => (None, String::new()),
+    }
+}
+
+#[cfg(test)]
+mod user_path_tests {
+    use super::*;
+
+    #[test]
+    fn add_outcome_path_uses_forward_slashes() {
+        let path = PathBuf::from(r"\\?\C:\Users\x\wt");
+        let shown = user_display_path(&path);
+        assert_eq!(shown, "C:/Users/x/wt");
+        assert!(!shown.contains('\\'));
+    }
+}
+
+/// Dispatch parsed CLI args for `Worktree`.
+pub fn dispatch(
+    args: crate::args::WorktreeArgs,
+    env: crate::dispatch::CommandEnv<'_>,
+) -> anyhow::Result<crate::exit_status::ExitStatus> {
+    use crate::args::*;
+    use crate::commands;
+
+    use crate::dispatch::{emit_success, CommandEnv};
+
+    let CommandEnv {
+        opts,
+        ctx,
+        process_env: _,
+    } = env;
+    let WorktreeArgs { action } = args;
+    match action {
+        WorktreeAction::List => emit_success(commands::worktree::run_list()?, opts, ctx),
+        WorktreeAction::Add {
+            path,
+            start_point,
+            branch,
+            force_branch,
+            detach,
+            force,
+            lock,
+            reason,
+            no_checkout,
+            track,
+        } => emit_success(
+            commands::worktree::run_add(
+                path,
+                start_point,
+                branch,
+                force_branch,
+                detach,
+                force,
+                lock,
+                reason,
+                no_checkout,
+                track,
+            )?,
+            opts,
+            ctx,
+        ),
+        WorktreeAction::Remove { path, force } => {
+            emit_success(commands::worktree::run_remove(path, force)?, opts, ctx)
+        }
+        WorktreeAction::Prune { dry_run } => {
+            emit_success(commands::worktree::run_prune(dry_run)?, opts, ctx)
+        }
+        WorktreeAction::Lock { path, reason } => {
+            emit_success(commands::worktree::run_lock(path, reason)?, opts, ctx)
+        }
+        WorktreeAction::Unlock { path } => {
+            emit_success(commands::worktree::run_unlock(path)?, opts, ctx)
+        }
+        WorktreeAction::Move {
+            worktree,
+            new_path,
+            force,
+            dry_run,
+        } => emit_success(
+            commands::worktree::run_move(worktree, new_path, force, dry_run)?,
+            opts,
+            ctx,
+        ),
+        WorktreeAction::Repair { paths, dry_run } => {
+            emit_success(commands::worktree::run_repair(paths, dry_run)?, opts, ctx)
+        }
     }
 }

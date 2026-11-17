@@ -4,7 +4,7 @@ use std::path::Path;
 use std::process::Command;
 
 use grit_lib::config::environment::RepositoryOptions;
-use grit_lib::porcelain::commit::{commit_worktree, CommitRequest, HookPolicy};
+use grit_lib::porcelain::commit::{CommitRequest, HookPolicy};
 use grit_lib::progress::NullProgress;
 use grit_lib::repo::Repository;
 
@@ -14,16 +14,16 @@ fn ident() -> String {
 
 fn commit_req(message: &str) -> CommitRequest {
     let id = ident();
-    CommitRequest {
-        message: message.to_owned(),
-        author: Some(id.parse().expect("signature")),
-        committer: Some(id.parse().expect("signature")),
-        allow_empty: false,
-        sign_override: None,
-        amend: false,
-        assume_worktree_synced: false,
-        hooks: HookPolicy::SkipVerify,
-        ..Default::default()
+    {
+        let mut req = CommitRequest::new(message.to_owned());
+        req.author = Some(id.parse().expect("signature"));
+        req.committer = Some(id.parse().expect("signature"));
+        req.allow_empty = false;
+        req.sign_override = None;
+        req.amend = false;
+        req.assume_worktree_synced = false;
+        req.hooks = HookPolicy::SkipVerify;
+        req
     }
 }
 
@@ -69,13 +69,17 @@ fn grit_commit_on_detached_head_matches_git() {
     std::fs::write(root.path().join("d.txt"), b"d\n").unwrap();
 
     let repo = open_grit(root.path());
-    let outcome = commit_worktree(
-        &repo,
-        &commit_req("detached"),
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .unwrap();
+    let outcome = repo
+        .commits()
+        .create(
+            &grit_lib::commits::CommitOptions::new(
+                commit_req("detached"),
+                grit_lib::porcelain::commit::CommitScope::AutoStage,
+            ),
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .unwrap();
     assert_eq!(outcome.branch, None);
 
     let grit_head = outcome.oid.to_hex();

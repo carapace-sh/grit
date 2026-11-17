@@ -8,14 +8,13 @@ use filetime::FileTime;
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::error::Error;
 use grit_lib::index::Index;
-use grit_lib::maintenance::{repack, repack_all, RepackOptions};
+use grit_lib::maintenance::RepackOptions;
 use grit_lib::objects::odb::store::MemoryStore;
-use grit_lib::objects::odb::OdbBuilder;
 use grit_lib::objects::{ObjectId, ObjectKind};
-use grit_lib::porcelain::add::stage_for_commit;
-use grit_lib::porcelain::commit::{create_commit, CommitRequest};
+use grit_lib::porcelain::commit::CommitRequest;
 use grit_lib::progress::NullProgress;
-use grit_lib::repo::{InitOptions, Repository, RepositoryBuilder};
+use grit_lib::repo::error::FilesOnlyOperation;
+use grit_lib::repo::{InitOptions, Repository, RepositoryError};
 use grit_test_support::git_fsck;
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -57,32 +56,40 @@ fn many_commits(repo: &Repository, n: usize) {
     let ident = "Test <t@example.com> 1 +0000".to_string();
     for i in 0..n {
         std::fs::write(wt.join(format!("f{i}.txt")), format!("body-{i}\n")).expect("write");
-        stage_for_commit(repo, &mut NullProgress, &grit_lib::progress::NeverCancel).expect("stage");
-        create_commit(
-            repo,
-            &CommitRequest {
-                message: format!("c{i}"),
-                author: Some(ident.parse().expect("signature")),
-                committer: Some(ident.parse().expect("signature")),
-                allow_empty: false,
-                sign_override: None,
-                amend: false,
-                assume_worktree_synced: false,
-                ..Default::default()
-            },
-            &mut NullProgress,
-            &grit_lib::progress::NeverCancel,
-        )
-        .expect("commit");
+        repo.index()
+            .stage_for_commit(&mut NullProgress, &grit_lib::progress::CancelToken::never())
+            .expect("stage");
+        repo.commits()
+            .create_staged(
+                &{
+                    let mut req = CommitRequest::new(format!("c{i}"));
+                    req.author = Some(ident.parse().expect("signature"));
+                    req.committer = Some(ident.parse().expect("signature"));
+                    req.allow_empty = false;
+                    req.sign_override = None;
+                    req.amend = false;
+                    req.assume_worktree_synced = false;
+                    req
+                },
+                &mut NullProgress,
+                &grit_lib::progress::CancelToken::never(),
+            )
+            .expect("commit");
     }
 }
 
 #[test]
 fn repack_all_into_one_git_fsck_strict_clean() {
     let dir = TempDir::new().expect("tempdir");
-    let repo = Repository::init(dir.path(), &InitOptions::default()).expect("init");
+    let (repo, _) = Repository::init(dir.path(), &InitOptions::default()).expect("init");
     many_commits(&repo, 25);
-    repack_all(&repo, &RepackOptions::default()).expect("repack");
+    repo.maintenance()
+        .repack_all(
+            &RepackOptions::default(),
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("repack");
     let packs = std::fs::read_dir(dir.path().join(".git/objects/pack"))
         .expect("pack dir")
         .filter_map(|e| e.ok())
@@ -96,10 +103,16 @@ fn repack_all_into_one_git_fsck_strict_clean() {
 #[test]
 fn repack_preserves_rev_list_objects_all() {
     let dir = TempDir::new().expect("tempdir");
-    let repo = Repository::init(dir.path(), &InitOptions::default()).expect("init");
+    let (repo, _) = Repository::init(dir.path(), &InitOptions::default()).expect("init");
     many_commits(&repo, 15);
     let before = git_rev_list_objects_all(dir.path());
-    repack_all(&repo, &RepackOptions::default()).expect("repack");
+    repo.maintenance()
+        .repack_all(
+            &RepackOptions::default(),
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("repack");
     let after = git_rev_list_objects_all(dir.path());
     assert_eq!(before, after);
 }
@@ -126,7 +139,9 @@ fn repack_keeps_reflog_index_and_worktree_head_objects() {
 
     let wt = repo.work_tree().expect("wt");
     std::fs::write(wt.join("staged-only.txt"), b"staged\n").expect("write");
-    stage_for_commit(&repo, &mut NullProgress, &grit_lib::progress::NeverCancel).expect("stage");
+    repo.index()
+        .stage_for_commit(&mut NullProgress, &grit_lib::progress::CancelToken::never())
+        .expect("stage");
     let index = Index::load(&repo.git_dir().join("index")).expect("index");
     let staged_oid = index
         .entries()
@@ -135,7 +150,13 @@ fn repack_keeps_reflog_index_and_worktree_head_objects() {
         .expect("entry")
         .oid;
 
-    repack_all(&repo, &RepackOptions::default()).expect("repack");
+    repo.maintenance()
+        .repack_all(
+            &RepackOptions::default(),
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("repack");
     assert!(repo.odb().read(&reflog_only).is_ok());
     assert!(repo.odb().read(&staged_oid).is_ok());
 }
@@ -143,7 +164,7 @@ fn repack_keeps_reflog_index_and_worktree_head_objects() {
 #[test]
 fn keep_packs_untouched() {
     let dir = TempDir::new().expect("tempdir");
-    let repo = Repository::init(dir.path(), &InitOptions::default()).expect("init");
+    let (repo, _) = Repository::init(dir.path(), &InitOptions::default()).expect("init");
     many_commits(&repo, 3);
     git(dir.path(), &["repack", "-a", "-d"]);
     let pack_dir = dir.path().join(".git/objects/pack");
@@ -155,18 +176,31 @@ fn keep_packs_untouched() {
         .expect("pack");
     std::fs::write(kept.with_extension("keep"), b"hold").expect("keep");
 
-    repack_all(&repo, &RepackOptions::default()).expect("repack");
+    repo.maintenance()
+        .repack_all(
+            &RepackOptions::default(),
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("repack");
     assert!(kept.is_file(), "pack with .keep must remain");
 }
 
 #[test]
 fn bitmap_written_and_git_rev_list_use_bitmap_index_count_matches() {
     let dir = TempDir::new().expect("tempdir");
-    let repo = Repository::init(dir.path(), &InitOptions::default()).expect("init");
+    let (repo, _) = Repository::init(dir.path(), &InitOptions::default()).expect("init");
     many_commits(&repo, 40);
     let mut opts = RepackOptions::default();
     opts.write_bitmap = true;
-    let report = repack(&repo, &opts).expect("repack bitmap");
+    let report = repo
+        .maintenance()
+        .repack(
+            &opts,
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("repack bitmap");
     assert_eq!(report.packs_written, 1);
     let pack_dir = dir.path().join(".git/objects/pack");
     let has_bitmap = std::fs::read_dir(&pack_dir)
@@ -196,9 +230,15 @@ fn bitmap_written_and_git_rev_list_use_bitmap_index_count_matches() {
 #[test]
 fn git_verify_pack_accepts_output() {
     let dir = TempDir::new().expect("tempdir");
-    let repo = Repository::init(dir.path(), &InitOptions::default()).expect("init");
+    let (repo, _) = Repository::init(dir.path(), &InitOptions::default()).expect("init");
     many_commits(&repo, 10);
-    repack_all(&repo, &RepackOptions::default()).expect("repack");
+    repo.maintenance()
+        .repack_all(
+            &RepackOptions::default(),
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("repack");
     let pack = std::fs::read_dir(dir.path().join(".git/objects/pack"))
         .expect("pack dir")
         .filter_map(|e| e.ok())
@@ -221,7 +261,13 @@ fn repack_git_written_repo() {
     git(dir.path(), &["multi-pack-index", "write"]);
 
     let repo = Repository::discover(Some(dir.path()), &RepositoryOptions::empty()).expect("open");
-    repack_all(&repo, &RepackOptions::default()).expect("repack");
+    repo.maintenance()
+        .repack_all(
+            &RepackOptions::default(),
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("repack");
     let packs = std::fs::read_dir(dir.path().join(".git/objects/pack"))
         .expect("pack dir")
         .filter_map(|e| e.ok())
@@ -234,7 +280,7 @@ fn repack_git_written_repo() {
 #[test]
 fn rootless_repo_prunes_unreachable_loose_when_pruning_enabled() {
     let dir = TempDir::new().expect("tempdir");
-    let repo = Repository::init(dir.path(), &InitOptions::default()).expect("init");
+    let (repo, _) = Repository::init(dir.path(), &InitOptions::default()).expect("init");
 
     let orphan = repo
         .odb()
@@ -243,7 +289,14 @@ fn rootless_repo_prunes_unreachable_loose_when_pruning_enabled() {
 
     let mut opts = RepackOptions::default();
     opts.keep_unreachable = false;
-    let report = repack(&repo, &opts).expect("repack");
+    let report = repo
+        .maintenance()
+        .repack(
+            &opts,
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("repack");
     assert_eq!(report.packs_written, 0);
     assert!(
         report.loose_removed >= 1,
@@ -290,7 +343,13 @@ fn keep_unreachable_preserves_packed_unreachable_like_git_repack_ad() {
     let git_only = TempDir::new().expect("git-only tempdir");
     copy_repo_tree(dir.path(), git_only.path()).expect("copy repo");
 
-    repack_all(&repo, &RepackOptions::default()).expect("grit repack");
+    repo.maintenance()
+        .repack_all(
+            &RepackOptions::default(),
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("grit repack");
     git(git_only.path(), &["repack", "-ad", "--keep-unreachable"]);
 
     fn cat_file_exists(repo_path: &Path, hex: &str) -> bool {
@@ -365,7 +424,13 @@ fn default_repack_preserves_unreachable_loose_like_git_repack_ad() {
     copy_repo_tree(dir.path(), git_only.path()).expect("copy repo");
 
     let repo = Repository::discover(Some(dir.path()), &RepositoryOptions::empty()).expect("open");
-    repack_all(&repo, &RepackOptions::default()).expect("grit repack");
+    repo.maintenance()
+        .repack_all(
+            &RepackOptions::default(),
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("grit repack");
     git(git_only.path(), &["repack", "-ad"]);
 
     fn cat_file_exists(repo_path: &Path, hex: &str) -> bool {
@@ -396,7 +461,7 @@ fn default_repack_preserves_unreachable_loose_like_git_repack_ad() {
 #[test]
 fn prune_respects_cutoff() {
     let dir = TempDir::new().expect("tempdir");
-    let repo = Repository::init(dir.path(), &InitOptions::default()).expect("init");
+    let (repo, _) = Repository::init(dir.path(), &InitOptions::default()).expect("init");
     many_commits(&repo, 1);
 
     let orphan = repo
@@ -434,7 +499,13 @@ fn prune_respects_cutoff() {
     let mut opts = RepackOptions::default();
     opts.prune_older_than = Some(cutoff);
     opts.keep_unreachable = false;
-    repack(&repo, &opts).expect("repack prune");
+    repo.maintenance()
+        .repack(
+            &opts,
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("repack prune");
 
     assert!(
         !orphan_path.exists(),
@@ -452,19 +523,25 @@ fn custom_backend_unsupported_error() {
     Repository::init(dir.path(), &InitOptions::default()).expect("init");
     let git_dir = dir.path().join(".git");
     let store = Arc::new(MemoryStore::new(grit_lib::objects::HashAlgo::Sha1));
-    let custom = RepositoryBuilder::new(RepositoryOptions::empty())
-        .odb_builder(
-            OdbBuilder::files(git_dir.join("objects"))
-                .primary(store)
-                .alternates(false),
+    let custom = Repository::open(
+        &git_dir,
+        &(RepositoryOptions::empty()
+            .with_object_store(store)
+            .with_work_tree(dir.path())),
+    )
+    .expect("open");
+    let err = custom
+        .maintenance()
+        .repack(
+            &RepackOptions::default(),
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
         )
-        .open(&git_dir, Some(dir.path()))
-        .expect("open");
-    let err = repack(&custom, &RepackOptions::default()).expect_err("custom backend");
+        .expect_err("custom backend");
     assert!(matches!(
         err,
-        Error::UnsupportedObjectStore {
-            operation: "repack"
-        }
+        Error::Repository(RepositoryError::UnsupportedObjectStore {
+            operation: FilesOnlyOperation::Repack,
+        })
     ));
 }

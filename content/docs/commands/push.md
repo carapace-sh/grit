@@ -19,6 +19,9 @@ grit push -u [--set-upstream]
 grit push --atomic
 grit push -o <option> [--push-option <option>]
 grit push --follow-tags
+grit push --all
+grit push --mirror
+grit push --prune
 grit push -q [--quiet]
 grit push --remote <name>   # hidden alias for one release
 ```
@@ -27,15 +30,21 @@ grit push --remote <name>   # hidden alias for one release
 
 Pushes refs to a remote over SSH, smart HTTP, or the `file://` transport. With no refspecs, grit pushes the current branch using the same remote-selection rules as Git (`branch.<name>.pushRemote`, `remote.pushDefault`, `branch.<name>.remote`, then `origin`) and applies `remote.<name>.push` refspecs when configured.
 
+When you pass refspecs, the optional `<remote>` may be a configured remote name, a URL, an scp-style `host:path`, or a filesystem path (including relative paths such as `../bare`), the same as [`grit fetch`](../fetch/) and [`grit pull`](../pull/). A lone positional that is not one of those is still a refspec pushed to the default remote. With several positionals, the first must name a remote, URL, or path; anything else fails with `unknown remote`. A push to a URL or filesystem path (such as `C:\t\remote.git` or `../bare`) creates and updates no remote-tracking refs, as with Git; only a configured remote's `refs/remotes/<name>/…` refs follow the push.
+
 A remote written as `<owner>/<project>` and followed by at least one refspec is a repository on the default grit host: `grit push me/app main` pushes to `https://grithub.dev/me/app.git`, or to that path under `$GRIT_DEFAULT_HOST` when it is set. A configured remote with the same name takes precedence. After a push like this from a repository with no remotes yet, grit saves the URL as `origin`, so later `grit push` and `grit fetch` go there. A lone `<owner>/<project>` argument is still a refspec, so `grit push topic/x` pushes a branch to the default remote.
 
 Incremental SSH and HTTP pushes stop exploring advertised commit history once the new commit frontier is exhausted. A one-commit push does not need to walk every advertised branch and tag back to its root. Annotated tags targeting blobs or trees may be advertised alongside commit refs without preventing a push.
 
 On the remote, `receive.denyNonFastForwards`, `receive.denyDeletes`, and `receive.denyCurrentBranch` are enforced for every transport, including local-path remotes (not only [`grit receive-pack`](../receive-pack/) over HTTP).
 
+From a shallow clone, grit announces each shallow boundary in the push command stream (like Git) and sends only the reachable commits. When the remote does not already have the history below those boundaries, the remote must set `receive.shallowUpdate=true` or the update is refused with `shallow update not allowed`; see [`grit receive-pack`](../receive-pack/).
+
 A push to a local path or `file://` URL runs the remote repository's `pre-receive`, `update`, `post-receive` and `post-update` hooks just as [`grit receive-pack`](../receive-pack/) and Git do: the pushed objects wait in a quarantine that `pre-receive` can read, a non-zero `pre-receive` refuses every update (`pre-receive hook declined`) and keeps the objects out of the repository, a non-zero `update` refuses its own ref (`hook declined`), and `post-receive` and `post-update` run after the refs are written. Hook output is reported like any remote's messages. `--dry-run` runs none of these hooks, as with Git.
 
-Explicit refspecs follow Git push rules: any revision on the left (`HEAD`, tags, branches), optional `+` for force, `:dst` to delete, and a bare branch name DWIMs to the matching local ref (then through configured push refspecs when present).
+Explicit refspecs follow Git push rules: any revision on the left (`HEAD`, tags, branches), optional `+` for force, `:dst` to delete, and a bare branch name DWIMs to the matching local ref (then through configured push refspecs when present). Wildcard refspecs such as `refs/heads/*:refs/heads/*` or `refs/remotes/origin/*:refs/heads/*` expand against local refs the same way as `remote.<name>.push` entries in config.
+
+`--all` pushes every local branch (`refs/heads/*:refs/heads/*`), including branches the remote does not have yet. `--mirror` pushes all refs under `refs/*`, forces updates, and deletes remote refs under `refs/` with no local counterpart (it implies `--prune` and force). `--prune` deletes stale refs only in the destination namespace of a wildcard or matching refspec (for example with `--all` or `refs/heads/*:refs/heads/*`, including `refs/heads/*:refs/tmp/*`). Pushing a single branch with `--prune` does not remove other remote branches. `--all`, `--mirror`, and `--delete` cannot be combined with each other or with positional refspecs.
 
 `--dry-run` negotiates with the remote and reports what would change without updating refs or sending objects.
 
@@ -44,6 +53,8 @@ With `--tags`, pushes every local tag under `refs/tags/`.
 With `--delete`, every positional after the remote names a remote branch or tag to delete (short names map like Git), and nothing is pushed. All of them are deleted in one push, with one result per ref. They must be plain ref names: a `src:dst` refspec next to `--delete` is an error and nothing is sent, as is `--delete` with no ref. To publish one ref and delete another, run two pushes or use a `:dst` refspec without `--delete` (`grit push origin HEAD:release :old`). `--delete` cannot be combined with `--tags`.
 
 `--force-with-lease` updates a remote ref only when it still matches the local remote-tracking ref mapped from the push destination (or when the ref is absent if there is no tracking ref). Use `--force-with-lease=<rev>` when pushing exactly one ref to compare against a specific commit. `--force` overwrites the remote ref unconditionally. The two flags cannot be combined.
+
+A branch you [share](../share/) (`branch.<name>.shared` is `true`) is pushed with `--force-with-lease` without your asking: your head of it is yours alone, so replacing it after an amend or rebase is safe, as long as the server's head is still the one you last fetched. After the push, grit fetches the other members' heads: one that diverged from yours but goes together with it without losing anything is combined with your branch here and pushed again (`combined` in `--json`); one that needs a decision is reported with its options, and the push exits `3`.
 
 `-u` / `--set-upstream` writes `branch.<name>.remote` and `branch.<name>.merge` for each successfully pushed branch (skipped with `--dry-run`).
 
@@ -54,6 +65,8 @@ With `--delete`, every positional after the remote names a remote branch or tag 
 `--follow-tags` pushes annotated tags that point to commits reachable from the refs being pushed (lightweight tags and unreachable annotated tags are skipped). The config key `push.followTags` enables the same behavior by default.
 
 In human output, messages the remote sends while it processes the push (hook output, CI links, policy text) are shown on stderr as `remote: …` lines, including when stderr is not a terminal. `-q` / `--quiet` hides them and the human summary, so a successful push prints nothing; a rejected push is still reported and exits `1`. With `--json` or `--markdown`, the same lines appear in `remote_messages` (omitted when empty).
+
+On a TTY, grit draws live progress on stderr while it builds and streams the pack (enumerating objects, then writing/compressing), then prints a short time/data summary after the ref results when anything was sent — the same style as [`grit fetch`](../fetch/) and [`grit pull`](../pull/). `--json` and `--markdown` omit the live lines and summary; phase timings are not exported in JSON today.
 
 Before anything is sent, grit runs the repository's `pre-push` hook (see [`grit hooks`](../hooks/)) once the remote's current refs are known, on every transport and with `--dry-run` too. The hook gets the remote name (or the URL, for an unnamed remote) and the push URL as arguments, and one line per ref update on stdin, `<local ref> <local oid> <remote ref> <remote oid>`, in Git's format: `(delete)` and a zero object id for deletions, a zero remote object id for new refs, and no line for refs that are up to date or already rejected. If the hook exits non-zero, the push stops, the remote is left untouched and grit exits `1`. The hook's stdout is sent to stderr so `--json` and `--markdown` output stays clean. `--no-verify` skips the hook.
 
@@ -68,16 +81,21 @@ When a smart-HTTP server advertises a resumable push endpoint (the `pushBundle` 
 
 Set `push.bundleThreshold` (bytes, with optional `k`, `m` or `g`) to change the size at which this starts.
 
+When a push is interrupted (`SIGINT`, `SIGTERM`, or `SIGHUP`, including Ctrl+C from a terminal), grit cancels the in-progress transfer, removes any partial receive quarantine or `tmp_pack_*` file it was writing on the remote, and exits **130** without updating remote refs. Stale temp files from a hard kill (`SIGKILL`) are removed later by [`grit gc`](gc.md) once they are older than `gc.pruneExpire`, the same way `git gc` prunes abandoned quarantine directories.
+
 For GitHub over HTTPS, if a push fails because you aren't signed in, `grit` offers to run [`grit auth`](../auth/) and then tries again.
 
 ## Options
 
 | Option | Description |
 | --- | --- |
-| `<remote>` | Remote name (optional; defaults from branch / config). |
+| `<remote>` | Remote name, URL, or filesystem path (optional; defaults from branch / config). |
 | `<refspec>...` | Push refspecs (`feature`, `HEAD:refs/heads/x`, `+main:main`, `:gone`, …). |
 | `-t`, `--tags` | Push all local tags instead of the current branch. |
 | `--delete` | Delete the remote refs named by the positionals instead of pushing (plain names only). |
+| `--all` | Push every local branch (`refs/heads/*:refs/heads/*`). |
+| `--mirror` | Mirror all refs under `refs/` (force + prune remote-only refs). |
+| `--prune` | Delete stale refs in the wildcard refspec destination namespace (not on single-ref pushes). |
 | `--dry-run` | Contact the remote but do not update refs or send objects. |
 | `-f`, `--force` | Overwrite remote refs when the update is not a fast-forward. |
 | `--force-with-lease` | Push only if the remote ref matches the local remote-tracking ref (or is absent when there is no tracking ref). |
@@ -103,13 +121,13 @@ $ grit push origin v1
   pushed v1 → origin refs/tags/v1
 
 $ grit push origin HEAD:refs/heads/bench
-  pushed refs → origin refs/heads/bench
+  pushed main → origin refs/heads/bench
 
 $ grit push --dry-run
   would push main → origin refs/heads/main
 
 $ grit push --tags
-  pushed refs → origin refs/tags/v0.1
+  pushed v0.1 → origin refs/tags/v0.1
 
 $ grit push --delete v0.1
   deleted v0.1 from origin
@@ -128,18 +146,25 @@ $ echo $?
 1
 ```
 
-When someone else pushed first:
+When someone else pushed first (your branch is behind the remote):
 
 ```console
 $ grit push
   rejected origin refs/heads/main: not a fast-forward — run `grit pull` first
 ```
 
+When your branch was rewritten and no longer fast-forwards (for example after a rebase):
+
+```console
+$ grit push
+  rejected origin refs/heads/main: not a fast-forward — run `grit push --force-with-lease` after integrating, or `grit pull` first
+```
+
 When the remote moved since your last fetch:
 
 ```console
 $ grit push --force-with-lease
-  rejected origin refs/heads/main: stale remote ref — run `grit fetch` and try again
+  rejected origin refs/heads/main: stale remote ref — run `grit fetch --prune` and try again
 ```
 
 When another push created the same new branch while yours was in flight (each ref update is compare-and-swapped against what the push saw, so the other push's commit is never overwritten, even with `--force`):
@@ -192,15 +217,17 @@ Pass `--json` for stable, scripting-friendly output:
 
 | Field | Type | Meaning |
 | ----- | ---- | ------- |
-| `remote` | string | Remote that was pushed to. |
+| `remote` | string | Remote that was pushed to: its name, or the URL given with any `user:password@` removed. Human and Markdown output show the same value. |
 | `kind` | string | `branch`, `tags`, `delete`, or `refspecs`. |
 | `branch` | string or null | Short branch name when `kind` is `branch`, or the deleted branch’s short name when `kind` is `delete` and exactly one branch is deleted. Omitted for tag and other explicit refspec pushes (`kind`: `refspecs`). |
 | `dry_run` | boolean | `true` when `--dry-run` was used (no refs or objects written). |
-| `results` | array | Per-ref outcomes; each object has `ref`, `status` (`ok`, `up_to_date`, or `rejected`), optional `reason` (`stale` for a failed lease or a ref another push moved meanwhile, `already_exists` when another push created the new ref first, `remote_ref_missing` when `--delete` targets a ref absent on the remote), optional `deleted` (`true` when the ref was removed), `old_oid`, `new_oid`, `src`, and `forced`. |
+| `results` | array | Per-ref outcomes; each object has `ref`, `status` (`ok`, `up_to_date`, or `rejected`), optional `reason` (`stale` for a failed lease or a ref another push moved meanwhile, `already_exists` when another push created the new ref first, `tag_exists` when the remote already has that tag and the push did not use `--force`, `remote_ref_missing` when `--delete` targets a ref absent on the remote), optional `deleted` (`true` when the ref was removed), `old_oid`, `new_oid`, `src`, and `forced`. |
 | `rejected` | boolean | `true` if any ref was rejected (exit status is also `1`). |
 | `upstream_set` | array of strings | Branch short names whose upstream config was written (`-u` only; omitted when empty). |
 | `origin_added` | string | URL saved as `origin` after an `<owner>/<project>` push from a repository with no remotes (omitted otherwise). |
 | `remote_messages` | array of strings | Hook and diagnostic text from the remote (same lines as `remote: …` on stderr in human mode; omitted when empty). |
+| `shared` | array | For each [shared](../share/) branch pushed: `branch`, `combined` (members whose heads were combined into yours and pushed again), `head` (your head after combining) and `heads`, the other members' heads fetched right after the push, each with `user`, `tip`, `relation` to your branch (`same`, `ahead`, `behind`, `diverged` or `unknown`), and for a head that diverged from yours `divergence`: `scenario` (a stable code such as `amended_both_conflicting`; see [Divergence scenarios](../share/#divergence-scenarios)), `summary`, `needs_decision`, `base`, `changes` (each commit's `change`, `subject`, and what `you` and `them` did to it), `conflicts` and `also`. Omitted when no shared branch was pushed. |
+| `pushed_to_integrated` | array | Branches this push made again after a share of them was integrated, bringing integrated commits: nobody shares them now (see [After integrating](../share/#after-integrating)). Each has `branch`, `scenario` (`pushed_to_integrated`), `summary`, `by`, `at`, `into`, `target_branch`, `pull`, `url`, `integrated` and `new` (how many of its commits were integrated, and how many are new) and `options` (`rebase`, `rename`, `reshare`, each with `id`, `label`, `loses` and `command`). Omitted when empty. |
 
 Example:
 
@@ -249,6 +276,7 @@ Markdown uses headings, bullet lists, and fenced blocks; pipe characters inside 
 | `0` | Success ([`success`](../exit-codes/)). |
 | `1` | Command failed, a ref was rejected, or the `pre-push` hook exited non-zero ([`failure`](../exit-codes/)). |
 | `2` | Invalid flags or arguments ([`usage`](../exit-codes/)). |
+| `3` | Pushed, but a [shared](../share/) branch's heads diverged in a way someone has to decide about, or the push made a branch again that was shared and integrated (`pushed_to_integrated`) ([`needs_decision`](../exit-codes/)). |
 | `128` | Could not reach or read the remote: missing repository, DNS or connection failure, HTTP error status ([`remote_unreadable`](../exit-codes/)). |
 
 See [Exit codes](../exit-codes/) for shared rules and structured `--json` `kind` values.

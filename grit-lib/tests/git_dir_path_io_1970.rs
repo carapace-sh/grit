@@ -4,16 +4,13 @@
 
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::error::{Error, GitDirPathOperation};
-use grit_lib::maintenance::{gc, GcOptions};
-use grit_lib::porcelain::add::{stage, StageOptions};
-use grit_lib::porcelain::commit::{commit_with_scope, create_commit, CommitRequest, CommitScope};
+use grit_lib::maintenance::GcOptions;
+use grit_lib::porcelain::add::StageOptions;
+use grit_lib::porcelain::commit::{CommitRequest, CommitScope};
 use grit_lib::progress::NullProgress;
-use grit_lib::refs::{write_ref, write_ref_cas};
-use grit_lib::repo::{InitOptions, Repository};
-use grit_lib::state::{resolve_head, HeadState};
-use grit_lib::worktree::{
-    add_linked_worktree, list_worktrees, AddLinkedWorktreeOptions, WorktreeBranch,
-};
+use grit_lib::repo::{InitOptions, Repository, RepositoryError};
+use grit_lib::state::HeadState;
+use grit_lib::worktree::{AddLinkedWorktreeOptions, WorktreeBranch};
 use std::fs;
 use std::io;
 use std::os::unix::fs::PermissionsExt;
@@ -54,14 +51,20 @@ fn assert_git_dir_io(err: &Error) {
     );
 }
 
-fn assert_git_dir_path_io(err: &Error) -> String {
+fn git_dir_path_io_path(err: &Error) -> String {
     match err {
-        Error::GitDirPathIo { path, .. } => {
-            assert_git_dir_io(err);
-            path.clone()
-        }
+        Error::Repository(RepositoryError::GitDirPathIo(io)) => io
+            .path
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default(),
         other => panic!("expected GitDirPathIo, got {other}"),
     }
+}
+
+fn assert_git_dir_path_io(err: &Error) -> String {
+    assert_git_dir_io(err);
+    git_dir_path_io_path(err)
 }
 
 fn chmod_dir_readonly(path: &Path) {
@@ -83,7 +86,7 @@ fn commit_request(message: &str) -> CommitRequest {
 }
 
 fn init_repo(root: &Path) -> Repository {
-    let repo = Repository::init(root, &InitOptions::new()).expect("init");
+    let (repo, _) = Repository::init(root, &InitOptions::new()).expect("init");
     fs::write(
         repo.git_dir().join("config"),
         "[user]\n\tname = T\n\temail = t@e.com\n",
@@ -94,39 +97,39 @@ fn init_repo(root: &Path) -> Repository {
 
 fn seed_commit(repo: &Repository, root: &Path, message: &str) {
     fs::write(root.join("a"), format!("{message}\n")).expect("write");
-    stage(
-        repo,
-        &StageOptions::default(),
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("stage");
-    create_commit(
-        repo,
-        &commit_request(message),
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("commit");
+    repo.index()
+        .stage(
+            &StageOptions::default(),
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("stage");
+    repo.commits()
+        .create_staged(
+            &commit_request(message),
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("commit");
 }
 
 fn commit_should_fail_with_git_dir_io(repo: &Repository, root: &Path) -> Error {
     fs::write(root.join("a"), "change\n").expect("write");
-    stage(
-        repo,
-        &StageOptions::default(),
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("stage");
-    commit_with_scope(
-        repo,
-        &commit_request("next"),
-        CommitScope::Staged,
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect_err("commit should fail")
+    repo.index()
+        .stage(
+            &StageOptions::default(),
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("stage");
+    repo.commits()
+        .create(
+            &grit_lib::commits::CommitOptions::new(commit_request("next"), CommitScope::Staged),
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect_err("commit should fail")
+        .into()
 }
 
 #[test]
@@ -138,13 +141,14 @@ fn read_only_objects_on_commit_names_git_path() {
     let objects = repo.git_dir().join("objects");
     chmod_tree_readonly(&objects);
     fs::write(dir.path().join("a"), "change\n").expect("write");
-    let err = stage(
-        &repo,
-        &StageOptions::default(),
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect_err("stage");
+    let err = repo
+        .index()
+        .stage(
+            &StageOptions::default(),
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect_err("stage");
     assert_git_dir_io(&err);
     restore_tree_write(&objects);
 }
@@ -181,24 +185,38 @@ fn read_only_existing_pack_dir_on_gc_names_git_path() {
     let repo = init_repo(dir.path());
     seed_commit(&repo, dir.path(), "base");
     let now = OffsetDateTime::now_utc().unix_timestamp();
-    gc(&repo, &GcOptions::full_run(false, now)).expect("initial gc creates pack");
+    repo.maintenance()
+        .gc(
+            &GcOptions::full_run(false, now),
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("initial gc creates pack");
     let pack_dir = repo.git_dir().join("objects/pack");
     assert!(pack_dir.is_dir(), "expected pack directory after gc");
 
     seed_commit(&repo, dir.path(), "more");
     chmod_tree_readonly(&pack_dir);
-    let err = gc(&repo, &GcOptions::full_run(false, now)).expect_err("gc should fail");
+    let err = repo
+        .maintenance()
+        .gc(
+            &GcOptions::full_run(false, now),
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect_err("gc should fail");
     match &err {
-        Error::GitDirPathIo {
-            path,
-            operation: GitDirPathOperation::GcPack,
-            ..
-        } => {
+        Error::Repository(RepositoryError::GitDirPathIo(io)) => {
+            let path = git_dir_path_io_path(&err);
             assert!(
                 path.contains("objects/pack"),
                 "expected pack path in {path}"
             );
             assert!(path.contains(".git/") || path.starts_with("objects/pack"));
+            assert!(matches!(
+                io.operation,
+                grit_lib::error::PathIoOperation::GitDir(GitDirPathOperation::GcPack)
+            ));
         }
         other => panic!("expected GitDirPathIo, got {other}"),
     }
@@ -211,7 +229,7 @@ fn read_only_linked_worktree_metadata_on_detached_commit_names_head_lock() {
     let dir = tempdir().expect("tempdir");
     let main_wt = dir.path().join("main");
     fs::create_dir_all(&main_wt).expect("main wt");
-    let repo = Repository::init(&main_wt, &InitOptions::new()).expect("init");
+    let (repo, _) = Repository::init(&main_wt, &InitOptions::new()).expect("init");
     fs::write(
         repo.git_dir().join("config"),
         "[user]\n\tname = T\n\temail = t@e.com\n",
@@ -220,9 +238,8 @@ fn read_only_linked_worktree_metadata_on_detached_commit_names_head_lock() {
     seed_commit(&repo, &main_wt, "base");
 
     let linked_wt = dir.path().join("linked");
-    add_linked_worktree(
-        &repo,
-        &AddLinkedWorktreeOptions {
+    repo.worktrees()
+        .add(&AddLinkedWorktreeOptions {
             path: linked_wt.clone(),
             branch: None,
             start_point: Some("HEAD".into()),
@@ -230,25 +247,27 @@ fn read_only_linked_worktree_metadata_on_detached_commit_names_head_lock() {
             lock: None,
             no_checkout: false,
             track: false,
-        },
-    )
-    .expect("add linked worktree");
+        })
+        .expect("add linked worktree");
 
     let linked_repo = Repository::discover(Some(linked_wt.as_path()), &RepositoryOptions::empty())
         .expect("discover linked");
-    let head_oid = match resolve_head(linked_repo.git_dir()).expect("head") {
+    let head_oid = match linked_repo.references().head().expect("head") {
         HeadState::Branch { oid: Some(oid), .. } | HeadState::Detached { oid } => oid,
         other => panic!("unexpected head state: {other:?}"),
     };
-    write_ref(linked_repo.git_dir(), "HEAD", &head_oid).expect("detach head");
+    grit_test_support::refs::set_ref(&linked_repo, "HEAD", &head_oid).expect("detach head");
 
     let admin = linked_repo.git_dir().to_path_buf();
     chmod_tree_readonly(&admin);
 
-    let err = write_ref_cas(linked_repo.git_dir(), "HEAD", &head_oid, head_oid)
+    let err = linked_repo
+        .references()
+        .compare_and_swap("HEAD", &head_oid, &head_oid)
         .expect_err("HEAD update should fail");
     match &err {
-        Error::GitDirPathIo { path, .. } => {
+        Error::Repository(RepositoryError::GitDirPathIo(_)) => {
+            let path = git_dir_path_io_path(&err);
             assert!(
                 path.contains(".git/worktrees/") && path.contains("HEAD.lock"),
                 "expected linked worktree HEAD.lock path, got {path}"
@@ -268,9 +287,8 @@ fn linked_worktree_commit_readonly_admin_names_git_path() {
     seed_commit(&repo, &main_wt, "base");
 
     let linked_wt = dir.path().join("linked");
-    add_linked_worktree(
-        &repo,
-        &AddLinkedWorktreeOptions {
+    repo.worktrees()
+        .add(&AddLinkedWorktreeOptions {
             path: linked_wt.clone(),
             branch: Some(WorktreeBranch::Detach),
             start_point: Some("HEAD".into()),
@@ -278,22 +296,24 @@ fn linked_worktree_commit_readonly_admin_names_git_path() {
             lock: None,
             no_checkout: false,
             track: false,
-        },
-    )
-    .expect("add linked worktree");
+        })
+        .expect("add linked worktree");
 
     let linked_repo = Repository::discover(Some(linked_wt.as_path()), &RepositoryOptions::empty())
         .expect("discover linked");
     fs::write(linked_wt.join("a"), "linked change\n").expect("write");
-    stage(
-        &linked_repo,
-        &StageOptions::default(),
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("stage");
+    linked_repo
+        .index()
+        .stage(
+            &StageOptions::default(),
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("stage");
 
-    let admin = list_worktrees(&repo)
+    let admin = repo
+        .worktrees()
+        .list()
         .expect("list")
         .into_iter()
         .find(|e| e.path == linked_wt.canonicalize().unwrap_or(linked_wt.clone()))
@@ -301,14 +321,15 @@ fn linked_worktree_commit_readonly_admin_names_git_path() {
         .admin_dir;
     chmod_dir_readonly(&admin);
 
-    let err = commit_with_scope(
-        &linked_repo,
-        &commit_request("linked"),
-        CommitScope::Staged,
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect_err("commit should fail");
+    let err = linked_repo
+        .commits()
+        .create(
+            &grit_lib::commits::CommitOptions::new(commit_request("linked"), CommitScope::Staged),
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect_err("commit should fail");
+    let err: Error = err.into();
     let path = assert_git_dir_path_io(&err);
     assert!(
         path.contains(".git/worktrees/") && path.contains("index"),
@@ -321,10 +342,10 @@ fn linked_worktree_commit_readonly_admin_names_git_path() {
 #[test]
 fn git_dir_path_io_variant_roundtrip() {
     let source = io::Error::from_raw_os_error(libc::EACCES as i32);
-    let err = Error::GitDirPathIo {
-        path: ".git/objects".to_owned(),
-        operation: GitDirPathOperation::WriteObject,
+    let err = Error::Repository(RepositoryError::git_dir_path_io(
+        ".git/objects",
+        GitDirPathOperation::WriteObject,
         source,
-    };
+    ));
     assert_git_dir_io(&err);
 }

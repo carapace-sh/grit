@@ -15,7 +15,7 @@ grit pick --continue | --abort | --skip
 
 ## Description
 
-Replays commits from another branch (or arbitrary revisions) onto the current branch, like `git cherry-pick`. Each new commit keeps the original **author** and message (unless you pass `--message` / `--message-file` for a single commit), gets a fresh **`change-id`**, and records a normal reflog entry.
+Replays commits from another branch (or arbitrary revisions) onto the current branch, like `git cherry-pick`. Each new commit keeps the original **author** and message (unless you pass `--message` / `--message-file` for a single commit), gets a fresh **`change-id`**, and records a normal reflog entry. Textual merges use the histogram diff algorithm, matching Git merge-ort (same as [`grit merge`](../merge/)).
 
 Positional arguments are applied **oldest first**. Each argument is either:
 
@@ -26,7 +26,7 @@ Positional arguments are applied **oldest first**. Each argument is either:
 
 - a step has **merge conflicts** (conflict markers in the worktree, `CHERRY_PICK_HEAD`, `MERGE_MSG`, `.git/sequencer/`)
 - a step would be **empty** and `--empty stop` (default)
-- the worktree is **dirty**, `HEAD` is **detached**, or the branch has **no commits**
+- the worktree is **dirty**, or the branch has **no commits** (detached `HEAD` is allowed, like `git cherry-pick`)
 - a commit is a **merge** without `--mainline` (not yet exposed on the CLI)
 
 Resolve conflicts, then either run [`grit commit`](../commit/) (auto-stages the worktree and finishes the step, keeping the picked author) or stage with [`grit add`](../add/) and run `grit pick --continue`. Use `grit pick --skip` to drop the current step, or `grit pick --abort` to cancel. If the branch tip moved because you already committed the resolution, `--abort` clears replay state without moving the branch (Git warns and exits 0 in the same situation).
@@ -39,15 +39,15 @@ Pick either completes a step, stops for conflicts or an empty commit, or changes
 | --- | --- |
 | `<commit>`… | Commits or ranges to replay (oldest first). |
 | `--continue` | Finish the paused pick after conflicts are resolved and staged. |
-| `--abort` | Cancel the in-progress pick and restore the saved branch tip. |
-| `--skip` | Skip the current todo step and continue with the rest. |
+| `--abort` | Cancel the in-progress pick and restore the branch tip and worktree (conflict-only files from the other side are removed). Uses `sequencer/head` when grit wrote a sequencer directory; otherwise resets the index and worktree to the current tip (including after a conflicting `git cherry-pick`). A stale `ORIG_HEAD` from an earlier operation is ignored. |
+| `--skip` | Skip the current todo step and continue with the rest; the worktree is reset to the saved tip, including removing conflict-only paths. |
 | `-x`, `--record-origin` | Append `(cherry picked from commit …)` to each new message. |
 | `--no-commit` | Apply the patch to the index and worktree without committing. |
 | `--empty` | When a step would not change the tree: `stop` (default), `keep` (empty commit), or `drop`. |
 | `-m`, `--message` | Replace the message (only with exactly one commit). |
 | `-F`, `--message-file` | Read the message from a file, or `-` for stdin (only with exactly one commit). |
 | `--mainline` | Parent number when replaying a merge commit (library support; CLI wiring pending). |
-| `--check` | Predict whether the pick would succeed without changing refs, the index, or the worktree. Exit **0** when every step would apply cleanly; exit **1** when a step would conflict or stop as empty (with `--empty stop`). Conflicts with `--continue`, `--abort`, `--skip`, and `--dry-run`. |
+| `--check` | Predict whether the pick would succeed without changing refs, the index, or the worktree. Exit **0** when every step would apply cleanly; exit **1** when a step would conflict or stop as empty (with `--empty stop`), including rename/delete conflicts at the new path (same as [`grit merge`](merge.md)). Conflicts with `--continue`, `--abort`, `--skip`, and `--dry-run`. |
 | `--dry-run` | Print the commits that would be replayed without changing refs or the worktree. Conflicts with `--check`. |
 | `-X ours\|theirs` | Auto-resolve replay conflicts: keep the current branch side (`ours`) or the picked change (`theirs`). |
 | `--conflict merge\|diff3\|zdiff3` | Conflict marker style when a step stops with conflicts (default from `merge.conflictStyle`). |
@@ -101,6 +101,7 @@ Pass `--json` for stable, scripting-friendly output:
 | `commits` | array | Each picked or attempted step: `source`, `oid`, `change_id`, `subject`. |
 | `dropped` | array | Source commit oids skipped as empty (`--empty drop`). |
 | `conflicts` | array or null | Conflicted paths when `result` is `conflicts`, each `{path, kind}` with a [conflict kind](../status/#conflict-kinds). |
+| `rerere` | array | Rerere events when `rerere.enabled` is active and the pick stops on conflicts (`path`, `kind` as for [`grit merge`](../merge/#json-output)). Omitted when empty. |
 | `next_steps` | array or null | Suggested commands when stopped (`conflicts` or `empty`). |
 | `alternatives` | array or null | `grit pick --abort` / `--skip` when a sequence is paused. |
 | `dry_run` | boolean or null | `true` when `--dry-run` was set (no refs or objects were updated). |

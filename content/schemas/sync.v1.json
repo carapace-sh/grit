@@ -1,0 +1,492 @@
+{
+  "$id": "https://grit-scm.com/schemas/sync/v1.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "definitions": {
+    "DivergenceChangeJson": {
+      "description": "One commit of a divergence: what each side did to it.",
+      "properties": {
+        "change": {
+          "description": "Its change id, or `patch:<patch id>` for a commit without one.",
+          "type": "string"
+        },
+        "paths": {
+          "description": "The paths its versions change.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "subject": {
+          "description": "Its subject line.",
+          "type": "string"
+        },
+        "them": {
+          "description": "What they did to it, in the same words.",
+          "type": "string"
+        },
+        "you": {
+          "description": "What you did to it: `unchanged`, `moved`, `reworded`, `amended`, `dropped`, `squashed`, `split`, `new`, `split_piece` or `absent`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "change",
+        "paths",
+        "subject",
+        "them",
+        "you"
+      ],
+      "type": "object"
+    },
+    "DivergenceJson": {
+      "description": "How another member's head diverged from yours ([`grit_lib::divergence`]).",
+      "properties": {
+        "also": {
+          "description": "Other scenarios that also apply, most pressing first.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "base": {
+          "description": "The last head you both had, when known.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "changes": {
+          "description": "The commits either side changed or added, oldest first.",
+          "items": {
+            "$ref": "#/definitions/DivergenceChangeJson"
+          },
+          "type": "array"
+        },
+        "conflicts": {
+          "description": "Paths where the two heads' changes conflict.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "needs_decision": {
+          "description": "Whether someone has to decide what to do. When `false`, the heads can be put together without losing anything.",
+          "type": "boolean"
+        },
+        "options": {
+          "description": "The ways out, the recommended one first.",
+          "items": {
+            "$ref": "#/definitions/ResolveOptionJson"
+          },
+          "type": "array"
+        },
+        "scenario": {
+          "description": "The scenario's stable code, such as `amended_both_conflicting`.",
+          "type": "string"
+        },
+        "summary": {
+          "description": "What happened, in a sentence.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "changes",
+        "needs_decision",
+        "scenario",
+        "summary"
+      ],
+      "type": "object"
+    },
+    "HeadRelation": {
+      "description": "How another member's head compares with your branch here.",
+      "oneOf": [
+        {
+          "description": "The same commit as yours.",
+          "enum": [
+            "same"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "It has commits yours doesn't, and yours is in its history: `grit sync` fast-forwards to it.",
+          "enum": [
+            "ahead"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Yours has commits it doesn't, and it is in yours.",
+          "enum": [
+            "behind"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Each has commits the other lacks.",
+          "enum": [
+            "diverged"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "You have no branch here, or its commits aren't fetched.",
+          "enum": [
+            "unknown"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "IntegratedJson": {
+      "description": "A branch pushed (or synced) again after its share was integrated, bringing integrated commits: scenario `pushed_to_integrated`. It is a branch nobody shares now.",
+      "properties": {
+        "at": {
+          "description": "When, RFC 3339.",
+          "type": "string"
+        },
+        "by": {
+          "description": "Who integrated it.",
+          "type": "string"
+        },
+        "integrated": {
+          "description": "How many of the branch's commits were integrated already.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "into": {
+          "description": "The project it was merged into, `<owner>/<project>`.",
+          "type": "string"
+        },
+        "new": {
+          "description": "How many are new.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "options": {
+          "description": "The ways forward, recommended first.",
+          "items": {
+            "$ref": "#/definitions/ResolveOptionJson"
+          },
+          "type": "array"
+        },
+        "pull": {
+          "description": "The pull request it went through, for an organization's project.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "scenario": {
+          "description": "Always `pushed_to_integrated`.",
+          "type": "string"
+        },
+        "summary": {
+          "description": "What happened, in a sentence.",
+          "type": "string"
+        },
+        "target_branch": {
+          "description": "The branch it was merged into.",
+          "type": "string"
+        },
+        "url": {
+          "description": "The pull request's page.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "at",
+        "by",
+        "integrated",
+        "into",
+        "new",
+        "options",
+        "scenario",
+        "summary",
+        "target_branch"
+      ],
+      "type": "object"
+    },
+    "ResolveOptionJson": {
+      "description": "One way out of a divergence.",
+      "properties": {
+        "command": {
+          "description": "The command that applies it.",
+          "type": "string"
+        },
+        "id": {
+          "description": "Its stable id: `combine`, `keep_mine`, `keep_theirs`, `keep_both`, `keep_amended`, `drop`, `my_order`, `their_order`, `my_split`, `their_split`, `restore` or `resolve`.",
+          "type": "string"
+        },
+        "label": {
+          "description": "What it does.",
+          "type": "string"
+        },
+        "loses": {
+          "description": "What it leaves out (kept in the share's log), or `null` when it keeps every change: such an option is safe to choose without asking.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "command",
+        "id",
+        "label"
+      ],
+      "type": "object"
+    },
+    "SharedHead": {
+      "description": "Another member's head of a shared branch.",
+      "properties": {
+        "divergence": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/DivergenceJson"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "For a head that diverged from yours: what happened, and whether someone has to decide what to do."
+        },
+        "relation": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/HeadRelation"
+            }
+          ],
+          "description": "How it compares with your branch here."
+        },
+        "tip": {
+          "description": "Their head's tip.",
+          "type": "string"
+        },
+        "user": {
+          "description": "Their user name.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "relation",
+        "tip",
+        "user"
+      ],
+      "type": "object"
+    },
+    "SyncAction": {
+      "description": "What happened to one branch.",
+      "oneOf": [
+        {
+          "description": "Pushed to your space.",
+          "enum": [
+            "pushed"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Fast-forwarded here to your space's.",
+          "enum": [
+            "pulled"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Made here from your space's.",
+          "enum": [
+            "created"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The same here and in your space.",
+          "enum": [
+            "up_to_date"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Here and in your space, each with commits the other lacks.",
+          "enum": [
+            "diverged"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The server refused the push.",
+          "enum": [
+            "refused"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "SyncBranch": {
+      "description": "One branch `grit sync` looked at.",
+      "properties": {
+        "action": {
+          "$ref": "#/definitions/SyncAction"
+        },
+        "integrated": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/IntegratedJson"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "For a branch this sync made again after a share of it was integrated (scenario `pushed_to_integrated`): what happened, and the options. Nobody shares it now."
+        },
+        "message": {
+          "description": "Why it was refused, or what to do about a divergence.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "shared": {
+          "description": "For a shared branch: the other members' heads, compared with yours afterwards.",
+          "items": {
+            "$ref": "#/definitions/SharedHead"
+          },
+          "type": "array"
+        },
+        "tip": {
+          "description": "Its tip afterwards.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "action",
+        "name"
+      ],
+      "type": "object"
+    },
+    "SyncTarget": {
+      "description": "What `grit sync` did with the target branch.",
+      "properties": {
+        "action": {
+          "$ref": "#/definitions/TargetAction"
+        },
+        "name": {
+          "description": "The branch, such as `main`.",
+          "type": "string"
+        },
+        "tip": {
+          "description": "Its tip here afterwards.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "action",
+        "name"
+      ],
+      "type": "object"
+    },
+    "TargetAction": {
+      "description": "What happened to the target branch.",
+      "oneOf": [
+        {
+          "description": "It was already the project's.",
+          "enum": [
+            "up_to_date"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Moved forward to the project's.",
+          "enum": [
+            "fast_forwarded"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Made here at the project's.",
+          "enum": [
+            "created"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "It has commits the project doesn't; left alone.",
+          "enum": [
+            "ahead"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "It and the project's both have commits the other lacks; left alone.",
+          "enum": [
+            "diverged"
+          ],
+          "type": "string"
+        }
+      ]
+    }
+  },
+  "description": "Result of `grit sync`.",
+  "properties": {
+    "branches": {
+      "description": "What happened to each active branch.",
+      "items": {
+        "$ref": "#/definitions/SyncBranch"
+      },
+      "type": "array"
+    },
+    "configured": {
+      "description": "Whether this run set the clone up to push to your space.",
+      "type": "boolean"
+    },
+    "remote": {
+      "description": "The remote branches are pushed to and pulled from.",
+      "type": "string"
+    },
+    "space": {
+      "description": "Your space's project, `<you>/<project>`.",
+      "type": "string"
+    },
+    "target": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/SyncTarget"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "What happened to the target branch."
+    },
+    "upstream": {
+      "description": "The project it follows, `<owner>/<project>`, for a copy.",
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "branches",
+    "configured",
+    "remote",
+    "space"
+  ],
+  "title": "SyncOutcome",
+  "type": "object"
+}

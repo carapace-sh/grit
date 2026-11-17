@@ -2,90 +2,22 @@
 
 use crate::commands::replay_merge_args::{mainline_parent, EmptyStepArg, ReplayMergeArgs};
 use crate::context;
-use crate::markdown;
 use crate::message_input::{read_message_input, MessageInputArgs};
-use crate::operation_output::{
-    render_conflicts_human, render_pick_check_conflicts_human, render_pick_conflict_footer_human,
-    ConflictJson, OperationConflictBlock,
-};
-use crate::output::{outln, HumanRender, MarkdownRender, RenderContext};
-use crate::revision_errors::map_commit_spec_error;
+use crate::render::operation::OperationConflictBlock;
+pub use crate::render::pick::{PickCommitRecord, PickOutcome, PickResult};
 use anyhow::{bail, Result};
 use grit_lib::config::ident_resolve::IdentRole;
 use grit_lib::error::Error;
+use grit_lib::error::RefError;
+use grit_lib::merge::{
+    ReplayAbortOutcome, ReplayCreated, ReplayOptions, ReplaySequenceRequest, SequenceOutcome,
+    SequencePrediction,
+};
 use grit_lib::objects::ObjectId;
-use grit_lib::operation::{
-    next_step_grit_commands, operation_alternatives, operation_next_steps_empty,
-};
+use grit_lib::operation::next_step_grit_commands;
 use grit_lib::porcelain::replay::ReplayDirection;
-use grit_lib::porcelain::replay_sequence::{
-    abort_replay_sequence, commits_to_replay, continue_replay_sequence, predict_replay_sequence,
-    skip_replay_step, start_replay_sequence, ReplayAbortOutcome, ReplayCreated, ReplayOptions,
-    ReplaySequenceRequest, SequenceOutcome, SequencePrediction,
-};
 use grit_lib::state::InProgressOperation;
-use schemars::JsonSchema;
-use serde::Serialize;
-use std::io::Write;
-
-/// Integration result for `grit pick` (`--json` contract).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum PickResult {
-    Picked,
-    /// Every step would apply cleanly (`grit pick --check` only).
-    Clean,
-    Conflicts,
-    Empty,
-    Aborted,
-    Skipped,
-}
-
-/// One commit recorded in pick `--json` output.
-#[derive(Clone, Debug, Serialize, JsonSchema)]
-pub struct PickCommitRecord {
-    /// Source commit that was replayed (full hex oid).
-    pub source: String,
-    /// New commit on the current branch, or JSON `null` when `--no-commit` or stopped early.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schemars(skip_serializing_if = "Option::is_none")]
-    pub oid: Option<String>,
-    /// Stored `change-id` on `oid` when present.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schemars(skip_serializing_if = "Option::is_none")]
-    pub change_id: Option<String>,
-    /// Subject line from the source commit (or the new commit when available).
-    pub subject: String,
-}
-
-/// Result of `grit pick`.
-#[derive(Serialize, JsonSchema)]
-pub struct PickOutcome {
-    pub result: PickResult,
-    /// Commits picked or attempted in this invocation.
-    pub commits: Vec<PickCommitRecord>,
-    /// Source commits skipped as empty/redundant (`--empty drop` or already applied).
-    pub dropped: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schemars(skip_serializing_if = "Option::is_none")]
-    pub conflicts: Option<Vec<ConflictJson>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schemars(skip_serializing_if = "Option::is_none")]
-    pub next_steps: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schemars(skip_serializing_if = "Option::is_none")]
-    pub alternatives: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schemars(skip_serializing_if = "Option::is_none")]
-    pub dry_run: Option<bool>,
-    /// Predicted result tree (full hex) when `result` is `clean` from `--check`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schemars(skip_serializing_if = "Option::is_none")]
-    pub oid: Option<String>,
-    /// True when this outcome is from `grit pick --check` (nothing was picked).
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub check: bool,
-}
+use grit_lib::state::{operation_alternatives, operation_next_steps_empty};
 
 /// Options for [`run`].
 pub struct PickRunOptions {
@@ -103,92 +35,6 @@ pub struct PickRunOptions {
     pub replay_merge: ReplayMergeArgs,
 }
 
-impl HumanRender for PickOutcome {
-    fn render_human(&self, w: &mut dyn Write, _ctx: &RenderContext) -> Result<()> {
-        match self.result {
-            PickResult::Picked | PickResult::Skipped => {
-                if self.dry_run == Some(true) {
-                    outln!(w, "Would pick {} commit(s)", self.commits.len());
-                    for row in &self.commits {
-                        let src = row.source.get(..7).unwrap_or(&row.source);
-                        outln!(w, "  {src}");
-                    }
-                    return Ok(());
-                }
-                for row in &self.commits {
-                    if let Some(oid) = &row.oid {
-                        let src = row.source.get(..7).unwrap_or(&row.source);
-                        let new = oid.get(..7).unwrap_or(oid.as_str());
-                        outln!(w, "Picked {src} → {new} {}", row.subject);
-                    } else {
-                        let src = row.source.get(..7).unwrap_or(&row.source);
-                        outln!(w, "Applied {src} {} (no commit)", row.subject);
-                    }
-                }
-                if !self.dropped.is_empty() {
-                    outln!(w, "Dropped {} empty commit(s)", self.dropped.len());
-                }
-            }
-            PickResult::Clean => {
-                if let Some(oid) = &self.oid {
-                    outln!(w, "Would pick cleanly (tree {oid})");
-                } else {
-                    outln!(w, "Would pick cleanly");
-                }
-            }
-            PickResult::Conflicts => {
-                if self.check {
-                    if let Some(conflicts) = &self.conflicts {
-                        render_pick_check_conflicts_human(conflicts, w)?;
-                    }
-                } else if let Some(conflicts) = &self.conflicts {
-                    render_conflicts_human(conflicts, w)?;
-                    render_pick_conflict_footer_human();
-                }
-                if !self.check {
-                    if let Some(steps) = &self.next_steps {
-                        eprintln!();
-                        for step in steps {
-                            eprintln!("→ {step}");
-                        }
-                    }
-                    if let Some(alt) = &self.alternatives {
-                        let joined = alt.join(" or ");
-                        eprintln!("→ or {joined}");
-                    }
-                }
-            }
-            PickResult::Empty => {
-                if self.check {
-                    if let Some(row) = self.commits.last() {
-                        let src = row.source.get(..7).unwrap_or(&row.source);
-                        outln!(w, "Would stop on an empty pick step ({src})");
-                    } else {
-                        outln!(w, "Would stop on an empty pick step");
-                    }
-                } else if let Some(row) = self.commits.last() {
-                    let src = row.source.get(..7).unwrap_or(&row.source);
-                    outln!(w, "Stopped on empty commit {src} — {}", row.subject);
-                }
-                if let Some(steps) = &self.next_steps {
-                    for step in steps {
-                        eprintln!("→ {step}");
-                    }
-                }
-            }
-            PickResult::Aborted => outln!(w, "Pick aborted."),
-        }
-        Ok(())
-    }
-}
-
-impl MarkdownRender for PickOutcome {
-    fn render_markdown(&self, w: &mut dyn Write, _ctx: &RenderContext) -> Result<()> {
-        markdown::print_pick_outcome(w, self)?;
-        Ok(())
-    }
-}
-
 /// Cherry-pick commits onto the current branch, or resume/cancel an in-progress pick.
 pub fn run(opts: PickRunOptions) -> Result<PickOutcome> {
     let repo = context::discover()?;
@@ -201,7 +47,11 @@ pub fn run(opts: PickRunOptions) -> Result<PickOutcome> {
     }
 
     if opts.abort {
-        match abort_replay_sequence(&repo).map_err(|e| map_replay_error(&repo, e))? {
+        match repo
+            .merge()
+            .abort_sequence()
+            .map_err(|e| map_replay_error(&repo, e))?
+        {
             ReplayAbortOutcome::Rewound => {}
             ReplayAbortOutcome::ClearedInPlace => {
                 eprintln!(
@@ -212,17 +62,29 @@ pub fn run(opts: PickRunOptions) -> Result<PickOutcome> {
         return Ok(PickOutcome::new(PickResult::Aborted));
     }
 
-    let interrupt = crate::interrupt::InterruptCancel::install();
+    let _interrupt = crate::interrupt::InterruptCancel::install();
     let mut progress = grit_lib::progress::NullProgress;
 
     if opts.continue_pick {
-        let outcome = continue_replay_sequence(&repo, &committer, &mut progress, &interrupt)
+        let outcome = repo
+            .merge()
+            .continue_sequence(
+                &committer,
+                &mut progress,
+                &crate::interrupt::process_cancel_token(),
+            )
             .map_err(|e| map_replay_error(&repo, e))?;
         return Ok(map_sequence_outcome(outcome, PickResult::Picked));
     }
 
     if opts.skip {
-        let outcome = skip_replay_step(&repo, &committer, &mut progress, &interrupt)
+        let outcome = repo
+            .merge()
+            .skip_sequence_step(
+                &committer,
+                &mut progress,
+                &crate::interrupt::process_cancel_token(),
+            )
             .map_err(|e| map_replay_error(&repo, e))?;
         return Ok(map_sequence_outcome(outcome, PickResult::Skipped));
     }
@@ -231,7 +93,10 @@ pub fn run(opts: PickRunOptions) -> Result<PickOutcome> {
         bail!("at least one commit or `--continue` / `--abort` / `--skip` is required");
     }
 
-    let sources = commits_to_replay(&repo, &opts.commits).map_err(map_commit_spec_error)?;
+    let sources = repo
+        .merge()
+        .commits_to_pick(&opts.commits)
+        .map_err(crate::error_map::map_commit_spec_error)?;
     if opts.dry_run {
         return Ok(PickOutcome {
             commits: sources
@@ -272,29 +137,21 @@ pub fn run(opts: PickRunOptions) -> Result<PickOutcome> {
         },
     };
     if opts.check {
-        let prediction =
-            predict_replay_sequence(&repo, &req).map_err(|e| map_replay_error(&repo, e))?;
+        let prediction = repo
+            .merge()
+            .predict_sequence(&req)
+            .map_err(|e| map_replay_error(&repo, e))?;
         return Ok(map_prediction_outcome(prediction));
     }
-    let outcome = start_replay_sequence(&repo, &req, &mut progress, &interrupt)
+    let outcome = repo
+        .merge()
+        .start_sequence(
+            &req,
+            &mut progress,
+            &crate::interrupt::process_cancel_token(),
+        )
         .map_err(|e| map_replay_error(&repo, e))?;
     Ok(map_sequence_outcome(outcome, PickResult::Picked))
-}
-
-impl PickOutcome {
-    fn new(result: PickResult) -> Self {
-        Self {
-            result,
-            commits: Vec::new(),
-            dropped: Vec::new(),
-            conflicts: None,
-            next_steps: None,
-            alternatives: None,
-            dry_run: None,
-            oid: None,
-            check: false,
-        }
-    }
 }
 
 impl From<&ReplayCreated> for PickCommitRecord {
@@ -319,20 +176,28 @@ fn source_record(source: ObjectId, subject: &str) -> PickCommitRecord {
 
 fn map_sequence_outcome(outcome: SequenceOutcome, ok_result: PickResult) -> PickOutcome {
     match outcome {
-        SequenceOutcome::Completed { created, dropped } => PickOutcome {
+        SequenceOutcome::Completed {
+            created,
+            dropped,
+            rerere,
+        } => PickOutcome {
             commits: created.iter().map(PickCommitRecord::from).collect(),
             dropped: dropped.iter().map(ObjectId::to_hex).collect(),
+            rerere: crate::render::operation::rerere_events_json(&rerere),
             ..PickOutcome::new(ok_result)
         },
         SequenceOutcome::Conflicts {
             conflicts,
             created_so_far,
+            rerere,
             ..
         } => {
             let block = OperationConflictBlock::for_pick(&conflicts);
             PickOutcome {
                 commits: created_so_far.iter().map(PickCommitRecord::from).collect(),
                 conflicts: Some(block.conflicts),
+                conflict_sources: Some(conflicts),
+                rerere: crate::render::operation::rerere_events_json(&rerere),
                 next_steps: Some(block.next_steps),
                 alternatives: block.alternatives,
                 ..PickOutcome::new(PickResult::Conflicts)
@@ -376,6 +241,7 @@ fn map_prediction_outcome(prediction: SequencePrediction) -> PickOutcome {
         } => PickOutcome {
             commits: vec![source_record(commit, &subject)],
             conflicts: Some(OperationConflictBlock::for_pick(&conflicts).conflicts),
+            conflict_sources: Some(conflicts),
             ..PickOutcome::new(PickResult::Conflicts)
         },
         SequencePrediction::Empty { commit, subject } => PickOutcome {
@@ -391,33 +257,96 @@ fn map_prediction_outcome(prediction: SequencePrediction) -> PickOutcome {
 
 fn map_replay_error(repo: &grit_lib::repo::Repository, err: Error) -> anyhow::Error {
     match err {
-        Error::OperationInProgress(kind) => {
-            crate::json_error::operation_in_progress_for_repo(repo, "pick", kind)
+        Error::Merge(merge_err) => map_merge_replay_error(repo, "pick", merge_err),
+        Error::Ref(RefError::UnbornHead) => {
+            anyhow::anyhow!("no commits yet on this branch to pick onto")
         }
-        Error::DetachedHead => anyhow::anyhow!("HEAD is detached; grit pick needs a branch"),
-        Error::UnbornHead => anyhow::anyhow!("no commits yet on this branch to pick onto"),
-        Error::MergeCommit { oid } => {
-            let s = &oid.to_hex()[..7];
+        other => anyhow::Error::new(other),
+    }
+}
+
+fn map_merge_replay_error(
+    repo: &grit_lib::repo::Repository,
+    verb: &str,
+    err: grit_lib::porcelain::MergeError,
+) -> anyhow::Error {
+    use grit_lib::porcelain::MergeError;
+    match err {
+        MergeError::OperationInProgress(kind) => {
+            crate::json_error::operation_in_progress_for_repo(repo, verb, kind)
+        }
+        MergeError::MergeCommit { oid } => {
+            let s = oid.to_short_hex();
             anyhow::anyhow!(
                 "{s} is a merge commit — pass `--mainline <n>` to pick a merge commit (not yet supported on the CLI)"
             )
         }
-        Error::ReplaySourceAtHead => {
+        MergeError::ReplaySourceAtHead => {
             anyhow::anyhow!("nothing to pick — that commit is already the current HEAD")
         }
-        Error::NoReplayInProgress => {
-            anyhow::anyhow!("no cherry-pick in progress")
+        MergeError::NoReplayInProgress => {
+            crate::json_error::no_operation_in_progress("no cherry-pick in progress")
         }
-        Error::ReplayContinueUnmerged => anyhow::anyhow!(
+        MergeError::ReplayContinueUnmerged => anyhow::anyhow!(
             "cannot continue: resolve conflicts and stage the result (`grit add`), then run `grit pick --continue`"
         ),
-        Error::ReplaySkipAlreadyCommitted => anyhow::anyhow!(
+        MergeError::ReplaySkipAlreadyCommitted => anyhow::anyhow!(
             "nothing to skip: current step already committed; run `grit pick --continue` instead"
         ),
-        Error::ReplayContinueDirtyIndex => anyhow::anyhow!(
+        MergeError::ReplayContinueDirtyIndex => anyhow::anyhow!(
             "cannot continue: index differs from HEAD after the step was committed"
         ),
-        Error::Message(msg) => anyhow::anyhow!(msg),
         other => anyhow::Error::new(other),
+    }
+}
+
+/// Dispatch parsed CLI args for `Pick`.
+pub fn dispatch(
+    args: crate::args::PickArgs,
+    env: crate::dispatch::CommandEnv<'_>,
+) -> anyhow::Result<crate::exit_status::ExitStatus> {
+    use crate::args::*;
+    use crate::commands;
+
+    use crate::dispatch::{emit_success, CommandEnv};
+    use crate::exit_status::ExitStatus;
+
+    let CommandEnv {
+        opts,
+        ctx,
+        process_env: _,
+    } = env;
+    let PickArgs {
+        commits,
+        mainline,
+        continue_pick,
+        abort,
+        skip,
+        record_origin,
+        no_commit,
+        empty,
+        message,
+        check,
+        dry_run,
+        replay_merge,
+    } = args;
+    {
+        let outcome = commands::pick::run(commands::pick::PickRunOptions {
+            commits,
+            continue_pick,
+            abort,
+            skip,
+            record_origin,
+            no_commit,
+            empty,
+            message,
+            mainline,
+            check,
+            dry_run,
+            replay_merge,
+        })?;
+        let result = outcome.result;
+        emit_success(outcome, opts, ctx)?;
+        Ok(ExitStatus::from_pick_result(result))
     }
 }

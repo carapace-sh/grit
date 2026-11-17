@@ -6,27 +6,35 @@ use std::hint::black_box;
 use std::sync::OnceLock;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use grit_lib::config::{ConfigFile, ConfigScope, ConfigSet};
-use grit_lib::diff::{detect_renames_with_policy, zero_oid, DiffEntry, DiffStatus};
-use grit_lib::objects::odb::Odb;
+use grit_lib::diff::{zero_oid, DiffEntry, DiffStatus, RenameDetection, TreeDiffOptions};
 use grit_lib::objects::{FileMode, ObjectKind};
 use grit_lib::parallel::ThreadPolicy;
-use std::path::Path;
+use grit_lib::prelude::RepositoryOptions;
+use grit_lib::repo::{InitOptions, Repository};
 use tempfile::TempDir;
 
-fn bench_config() -> ConfigSet {
-    let text = "[diff]\n\trenameLimit = 5000\n[index]\n\tthreads = 4\n";
-    let file = ConfigFile::parse(Path::new("bench"), text, ConfigScope::Local).expect("parse");
-    let mut set = ConfigSet::new();
-    set.merge(&file);
-    set
+const BENCH_CONFIG: &str = "[diff]\n\trenameLimit = 5000\n[index]\n\tthreads = 4\n";
+
+/// A repository under `root` whose local config ends with `extra_config`.
+fn bench_repo(root: &TempDir, extra_config: &str) -> Repository {
+    Repository::init(root.path(), &InitOptions::default()).expect("init");
+    let config_path = root.path().join(".git/config");
+    let mut text = std::fs::read_to_string(&config_path).expect("read config");
+    text.push_str(extra_config);
+    std::fs::write(&config_path, text).expect("write config");
+    Repository::discover(Some(root.path()), &RepositoryOptions::empty()).expect("open")
+}
+
+fn rename_options(policy: ThreadPolicy) -> TreeDiffOptions {
+    TreeDiffOptions::default()
+        .with_renames(RenameDetection::Similarity(50))
+        .with_threads(Some(policy))
 }
 
 struct RenameBenchFixture {
     _root: TempDir,
-    odb: Odb,
+    repo: Repository,
     entries: Vec<DiffEntry>,
-    config: ConfigSet,
 }
 
 static FIXTURE: OnceLock<RenameBenchFixture> = OnceLock::new();
@@ -34,9 +42,8 @@ static FIXTURE: OnceLock<RenameBenchFixture> = OnceLock::new();
 fn fixture() -> &'static RenameBenchFixture {
     FIXTURE.get_or_init(|| {
         let root = TempDir::new().expect("tempdir");
-        let git_dir = root.path().join(".git");
-        std::fs::create_dir_all(git_dir.join("objects")).expect("objects");
-        let odb = Odb::new(&git_dir.join("objects"));
+        let repo = bench_repo(&root, BENCH_CONFIG);
+        let odb = repo.odb();
 
         const N: usize = 2000;
         let mut deleted = Vec::with_capacity(N);
@@ -76,13 +83,10 @@ fn fixture() -> &'static RenameBenchFixture {
             });
         }
 
-        let config = bench_config();
-
         RenameBenchFixture {
             _root: root,
-            odb,
+            repo,
             entries,
-            config,
         }
     })
 }
@@ -103,16 +107,11 @@ fn bench_diff_renames(c: &mut Criterion) {
             |b, _| {
                 b.iter(|| {
                     black_box(
-                        detect_renames_with_policy(
-                            &fx.odb,
-                            None,
-                            fx.entries.clone(),
-                            50,
-                            &fx.config,
-                            &policy,
-                            None,
-                        )
-                        .expect("detect renames"),
+                        fx.repo
+                            .diff()
+                            .detect_renames(fx.entries.clone(), None, &rename_options(policy))
+                            .expect("detect renames")
+                            .entries,
                     );
                 });
             },
@@ -135,10 +134,10 @@ fn adoc_like_body(seed: usize, lines: usize, unique: bool) -> Vec<u8> {
 }
 
 fn adoc_fixture(count: usize, lines: usize, unique: bool) -> RenameBenchFixture {
+    let extra_config = BENCH_CONFIG;
     let root = TempDir::new().expect("tempdir");
-    let git_dir = root.path().join(".git");
-    std::fs::create_dir_all(git_dir.join("objects")).expect("objects");
-    let odb = Odb::new(&git_dir.join("objects"));
+    let repo = bench_repo(&root, extra_config);
+    let odb = repo.odb();
 
     let mut entries: Vec<DiffEntry> = Vec::with_capacity(count * 2);
     for i in 0..count {
@@ -177,9 +176,8 @@ fn adoc_fixture(count: usize, lines: usize, unique: bool) -> RenameBenchFixture 
 
     RenameBenchFixture {
         _root: root,
-        odb,
+        repo,
         entries,
-        config: bench_config(),
     }
 }
 
@@ -200,16 +198,180 @@ fn bench_diff_renames_adoc_similar(c: &mut Criterion) {
         group.bench_function(name, |b| {
             b.iter(|| {
                 black_box(
-                    detect_renames_with_policy(
-                        &fx.odb,
-                        None,
-                        fx.entries.clone(),
-                        50,
-                        &fx.config,
-                        &policy,
-                        None,
-                    )
-                    .expect("detect renames"),
+                    fx.repo
+                        .diff()
+                        .detect_renames(fx.entries.clone(), None, &rename_options(policy))
+                        .expect("detect renames")
+                        .entries,
+                );
+            });
+        });
+    }
+    group.finish();
+}
+
+/// Duplicate `readme.txt` basenames with directory votes seeded by exact renames.
+fn basename_duplicate_fixture(count: usize, rename_limit: i64) -> RenameBenchFixture {
+    let extra_config = &format!("{BENCH_CONFIG}[diff]\n\trenameLimit = {rename_limit}\n");
+    let root = TempDir::new().expect("tempdir");
+    let repo = bench_repo(&root, extra_config);
+    let odb = repo.odb();
+
+    let mut entries: Vec<DiffEntry> = Vec::with_capacity(count * 4);
+    for i in 0..count {
+        let anchor = format!("anchor {i}\n").into_bytes();
+        let anchor_oid = odb.write(ObjectKind::Blob, &anchor).expect("anchor");
+
+        entries.push(DiffEntry {
+            status: DiffStatus::Deleted,
+            old_path: Some(format!("old/{i}/anchor.txt")),
+            new_path: None,
+            old_mode: FileMode::REGULAR,
+            new_mode: FileMode::ABSENT,
+            old_oid: anchor_oid,
+            new_oid: zero_oid(),
+            score: None,
+        });
+        entries.push(DiffEntry {
+            status: DiffStatus::Added,
+            old_path: None,
+            new_path: Some(format!("new/{i}/anchor.txt")),
+            old_mode: FileMode::ABSENT,
+            new_mode: FileMode::REGULAR,
+            old_oid: zero_oid(),
+            new_oid: anchor_oid,
+            score: None,
+        });
+
+        let old_readme = format!("readme body {i} line one\nline two\n").into_bytes();
+        let mut new_readme = old_readme.clone();
+        new_readme.extend_from_slice(b"line three edited\n");
+        let old_oid = odb
+            .write(ObjectKind::Blob, &old_readme)
+            .expect("old readme");
+        let new_oid = odb
+            .write(ObjectKind::Blob, &new_readme)
+            .expect("new readme");
+
+        entries.push(DiffEntry {
+            status: DiffStatus::Deleted,
+            old_path: Some(format!("old/{i}/readme.txt")),
+            new_path: None,
+            old_mode: FileMode::REGULAR,
+            new_mode: FileMode::ABSENT,
+            old_oid,
+            new_oid: zero_oid(),
+            score: None,
+        });
+        entries.push(DiffEntry {
+            status: DiffStatus::Added,
+            old_path: None,
+            new_path: Some(format!("new/{i}/readme.txt")),
+            old_mode: FileMode::ABSENT,
+            new_mode: FileMode::REGULAR,
+            old_oid: zero_oid(),
+            new_oid,
+            score: None,
+        });
+    }
+
+    RenameBenchFixture {
+        _root: root,
+        repo,
+        entries,
+    }
+}
+
+/// Issue #2436: repeated but disjoint basenames (`f*` delete vs `g*` add).
+fn basename_disjoint_duplicate_fixture(count: usize) -> RenameBenchFixture {
+    let extra_config = BENCH_CONFIG;
+    let root = TempDir::new().expect("tempdir");
+    let repo = bench_repo(&root, extra_config);
+    let odb = repo.odb();
+    let mut entries: Vec<DiffEntry> = Vec::with_capacity(count * 2);
+    for i in 0..count {
+        let old_oid = odb
+            .write(ObjectKind::Blob, format!("old payload {i}\n").as_bytes())
+            .expect("write old");
+        let new_oid = odb
+            .write(ObjectKind::Blob, format!("new payload {i}\n").as_bytes())
+            .expect("write new");
+        entries.push(DiffEntry {
+            status: DiffStatus::Deleted,
+            old_path: Some(format!("a/d{}/f{}.txt", i / 50, i % 50)),
+            new_path: None,
+            old_mode: FileMode::REGULAR,
+            new_mode: FileMode::ABSENT,
+            old_oid,
+            new_oid: zero_oid(),
+            score: None,
+        });
+        entries.push(DiffEntry {
+            status: DiffStatus::Added,
+            old_path: None,
+            new_path: Some(format!("b/d{}/g{}.txt", i / 50, i % 50)),
+            old_mode: FileMode::ABSENT,
+            new_mode: FileMode::REGULAR,
+            old_oid: zero_oid(),
+            new_oid,
+            score: None,
+        });
+    }
+    RenameBenchFixture {
+        _root: root,
+        repo,
+        entries,
+    }
+}
+
+fn bench_diff_renames_basename_disjoint_duplicates(c: &mut Criterion) {
+    let policy = ThreadPolicy::with_threads_override(Some(1))
+        .min_items_override(Some(0))
+        .min_total_bytes_override(Some(0));
+    let mut group = c.benchmark_group("diff_renames_basename_disjoint_duplicates");
+    group.sample_size(10);
+    for count in [512_usize, 2048] {
+        let fx = basename_disjoint_duplicate_fixture(count);
+        group.throughput(Throughput::Elements(
+            u64::try_from(count * 2).expect("count"),
+        ));
+        group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, _| {
+            b.iter(|| {
+                black_box(
+                    fx.repo
+                        .diff()
+                        .detect_renames(fx.entries.clone(), None, &rename_options(policy))
+                        .expect("detect renames")
+                        .entries,
+                );
+            });
+        });
+    }
+    group.finish();
+}
+
+fn bench_diff_renames_basename_duplicates(c: &mut Criterion) {
+    let policy = ThreadPolicy::with_threads_override(Some(1))
+        .min_items_override(Some(0))
+        .min_total_bytes_override(Some(0));
+    let mut group = c.benchmark_group("diff_renames_basename_duplicates");
+    group.sample_size(10);
+    for (name, count, limit) in [
+        ("limited_128", 128, 500_i64),
+        ("unlimited_64", 64, 5000_i64),
+    ] {
+        let fx = basename_duplicate_fixture(count, limit);
+        group.throughput(Throughput::Elements(
+            u64::try_from(count * 4).expect("count"),
+        ));
+        group.bench_function(name, |b| {
+            b.iter(|| {
+                black_box(
+                    fx.repo
+                        .diff()
+                        .detect_renames(fx.entries.clone(), None, &rename_options(policy))
+                        .expect("detect renames")
+                        .entries,
                 );
             });
         });
@@ -220,6 +382,8 @@ fn bench_diff_renames_adoc_similar(c: &mut Criterion) {
 criterion_group!(
     diff_renames,
     bench_diff_renames,
-    bench_diff_renames_adoc_similar
+    bench_diff_renames_adoc_similar,
+    bench_diff_renames_basename_disjoint_duplicates,
+    bench_diff_renames_basename_duplicates
 );
 criterion_main!(diff_renames);

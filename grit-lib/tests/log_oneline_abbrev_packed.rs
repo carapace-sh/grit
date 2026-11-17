@@ -3,10 +3,11 @@
 use std::path::Path;
 use std::process::Command;
 
+use grit_lib::commit::resolve_core_abbrev_len;
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::objects::ObjectKind;
 use grit_lib::repo::Repository;
-use grit_lib::OidAbbrevBatch;
+use grit_lib::revwalk::object_inspect::OidAbbrevBatch;
 use tempfile::TempDir;
 
 fn git(dir: &Path, args: &[&str]) -> String {
@@ -72,7 +73,12 @@ PY"#;
         .expect("walk");
     commits.sort_by_key(|o| o.to_hex());
 
-    let mut batch = OidAbbrevBatch::new(7);
+    let min_len = resolve_core_abbrev_len(
+        &repo.config().snapshot().expect("config").clone(),
+        repo.odb(),
+    )
+    .expect("abbrev len");
+    let mut batch = OidAbbrevBatch::new(min_len);
     let mut git_lines: Vec<String> = git(dir, &["log", "--format=%h %s"])
         .lines()
         .map(str::to_owned)
@@ -87,4 +93,69 @@ PY"#;
     grit_lines.sort();
     git_lines.sort();
     assert_eq!(grit_lines, git_lines);
+}
+
+#[test]
+fn loose_objects_do_not_lengthen_auto_abbrev_like_git() {
+    let root = TempDir::new().expect("tempdir");
+    let source = root.path().join("source");
+    let dir = root.path().join("loose");
+    std::fs::create_dir_all(&source).expect("mkdir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    git(&source, &["init", "-q", "-b", "main"]);
+    // Enough objects that counting loose ones would raise the automatic length past 7.
+    let import = r#"python3 - <<'PY' | git fast-import --quiet
+for i in range(1, 17001):
+    b = 'blob %d\n' % i
+    print('blob\nmark :%d\ndata %d\n%s' % (i, len(b), b))
+print('commit refs/heads/main\nauthor A <a@e.t> 1500000000 +0000\ncommitter A <a@e.t> 1500000000 +0000\ndata 3\none')
+print('M 100644 :1 f.txt')
+PY"#;
+    let out = Command::new("bash")
+        .current_dir(&source)
+        .args(["-c", import])
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .output()
+        .expect("import");
+    assert!(
+        out.status.success(),
+        "fast-import: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let head = git(&source, &["rev-parse", "main"]);
+
+    git(&dir, &["init", "-q", "-b", "main"]);
+    let unpack = format!(
+        "cat {}/.git/objects/pack/*.pack | git unpack-objects -q",
+        source.display()
+    );
+    let out = Command::new("bash")
+        .current_dir(&dir)
+        .args(["-c", &unpack])
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .output()
+        .expect("unpack");
+    assert!(
+        out.status.success(),
+        "unpack-objects: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    git(&dir, &["update-ref", "refs/heads/main", &head]);
+    let git_short = git(&dir, &["rev-parse", "--short", "main"]);
+
+    let repo = Repository::discover(Some(&dir), &RepositoryOptions::empty()).expect("open");
+    assert!(repo.odb().count_loose_objects().expect("count") > 1 << 14);
+    let min_len = resolve_core_abbrev_len(
+        &repo.config().snapshot().expect("config").clone(),
+        repo.odb(),
+    )
+    .expect("abbrev len");
+    assert_eq!(min_len, git_short.len());
+    let oid = head.parse().expect("oid");
+    let abbrev = OidAbbrevBatch::new(min_len)
+        .abbrev_known(&repo, oid)
+        .expect("abbrev");
+    assert_eq!(abbrev, git_short);
 }

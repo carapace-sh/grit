@@ -1,6 +1,7 @@
 //! Hostile tree entry names must be rejected at checkout/index population, matching system `git`.
 
 use crate::support;
+use grit_lib::worktree::WorktreeError;
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -11,16 +12,13 @@ use grit_lib::config::environment::Environment;
 use grit_lib::error::Error;
 use grit_lib::objects::parse_commit;
 use grit_lib::objects::ObjectId;
-use grit_lib::porcelain::checkout::checkout_between_trees;
-use grit_lib::porcelain::merge::tree_to_index_entries;
-use grit_lib::porcelain::reset::{reset_to_commit, ResetMode, ResetOptions};
-use grit_lib::porcelain::restore::{restore_paths, RestoreOptions, RestoreSource};
-use grit_lib::porcelain::switch::{resolve_switch_target, switch_repository, SwitchOptions};
-use grit_lib::progress::NeverCancel;
+use grit_lib::porcelain::reset::{ResetMode, ResetOptions};
+use grit_lib::porcelain::restore::{RestoreOptions, RestoreSource};
+use grit_lib::porcelain::switch::SwitchOptions;
+use grit_lib::progress::{CancelToken, NullProgress};
 use grit_lib::remote::clone::{clone as clone_repo, CloneError, CloneOptions};
-use grit_lib::remote::fetch::NoProgress;
 use grit_lib::repo::{InitOptions, Repository};
-use grit_test_support::{git, git_hash_object_literally, HashAlgo};
+use grit_test_support::{git, git_hash_object_literally, tree_to_index_entries, HashAlgo};
 
 fn grit_bin() -> std::path::PathBuf {
     if let Ok(p) = std::env::var("GRIT_BIN") {
@@ -232,7 +230,10 @@ fn snapshot_walk(base: &Path, dir: &Path, out: &mut BTreeMap<String, Vec<u8>>) {
 
 fn assert_invalid_path_component(err: Error) {
     assert!(
-        matches!(err, Error::InvalidPathComponent { .. }),
+        matches!(
+            err,
+            Error::Worktree(WorktreeError::InvalidPathComponent { .. })
+        ),
         "expected InvalidPathComponent, got {err:?}"
     );
 }
@@ -256,21 +257,26 @@ fn grit_lib_clone_hostile_path_rejected(
     // also skips clone-failure assertions for this case (see below).
     if case_label == "hfs dotgit" {
         opts.checkout = false;
-        let outcome = clone_repo(opts, &mut NoProgress, &NeverCancel, None)
+        let outcome = clone_repo(opts, &mut NoProgress, &CancelToken::never(), None)
             .unwrap_or_else(|e| panic!("{case_label}: clone fetch: {e:?}"));
         if !local_config.is_empty() {
             append_local_config(outcome.repo.git_dir(), local_config);
             outcome.repo.reload_config().expect("reload config");
         }
         let tree_oid: ObjectId = evil_tree.parse().expect("tree oid");
-        let checkout_result = checkout_between_trees(&outcome.repo, None, &tree_oid);
+        let checkout_result = outcome.repo.checkout().checkout(
+            None,
+            &tree_oid,
+            &mut grit_lib::progress::NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        );
         assert!(
             checkout_result.is_err(),
             "{case_label}: checkout should fail for hostile tree {evil_tree}: {checkout_result:?}"
         );
         return checkout_result.unwrap_err();
     }
-    match clone_repo(opts, &mut NoProgress, &NeverCancel, None) {
+    match clone_repo(opts, &mut NoProgress, &CancelToken::never(), None) {
         Ok(outcome) => panic!(
             "{case_label}: clone should not succeed with hostile default branch (checked out {} files)",
             outcome.files
@@ -330,14 +336,24 @@ fn open_cloned_main(parent: &Path, upstream: &Path) -> Repository {
         environment: Environment::empty(),
         ..CloneOptions::new(upstream.to_string_lossy(), dest.clone())
     };
-    let outcome = clone_repo(opts, &mut NoProgress, &NeverCancel, None).expect("clone main");
+    let outcome =
+        clone_repo(opts, &mut NoProgress, &CancelToken::never(), None).expect("clone main");
     let commit = outcome
         .repo
         .odb()
         .read(&outcome.checkout_oid)
         .expect("commit");
     let parsed = parse_commit(&commit.data).expect("parse");
-    checkout_between_trees(&outcome.repo, None, &parsed.tree).expect("checkout main");
+    outcome
+        .repo
+        .checkout()
+        .checkout(
+            None,
+            &parsed.tree,
+            &mut grit_lib::progress::NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("checkout main");
     outcome.repo
 }
 
@@ -365,7 +381,7 @@ fn dotdot_tree_rejected_at_index_population() {
             ..CloneOptions::new(upstream.path().to_string_lossy(), dest.path().to_path_buf())
         },
         &mut NoProgress,
-        &NeverCancel,
+        &CancelToken::never(),
         None,
     )
     .expect("clone");
@@ -463,53 +479,59 @@ fn hostile_paths_rejected_on_clone_switch_reset_restore() {
         let wt_snap = dir_bytes_snapshot(repo.work_tree().expect("wt"));
         let git_snap = dir_bytes_snapshot(repo.git_dir());
 
-        let mode = resolve_switch_target(&repo, "evil").expect("resolve evil");
-        let switch_err = switch_repository(
-            &repo,
-            &SwitchOptions {
-                mode,
-                dry_run: false,
-                hooks: grit_lib::PostOperationHooks::Run,
-            },
-            &mut grit_lib::progress::NullProgress,
-            &grit_lib::progress::NeverCancel,
-        )
-        .unwrap_err();
+        let mode = repo
+            .checkout()
+            .resolve_switch_target("evil")
+            .expect("resolve evil");
+        let switch_err = repo
+            .checkout()
+            .switch(
+                &SwitchOptions {
+                    mode,
+                    dry_run: false,
+                    hooks: grit_lib::command_runner::hooks::PostOperationHooks::Run,
+                },
+                &mut grit_lib::progress::NullProgress,
+                &grit_lib::progress::CancelToken::never(),
+            )
+            .unwrap_err();
         assert_invalid_path_component(switch_err);
         assert_eq!(dir_bytes_snapshot(repo.work_tree().expect("wt")), wt_snap);
         assert_eq!(dir_bytes_snapshot(repo.git_dir()), git_snap);
 
-        let reset_err = reset_to_commit(
-            &repo,
-            &ResetOptions::new(
-                evil_commit_oid,
-                ResetMode::Hard,
-                support::parse_reflog_signature("T <t@e.com>"),
-                "reset test",
-            ),
-            &mut grit_lib::progress::NullProgress,
-            &grit_lib::progress::NeverCancel,
-        )
-        .unwrap_err();
+        let reset_err = repo
+            .checkout()
+            .reset(
+                &ResetOptions::new(
+                    evil_commit_oid,
+                    ResetMode::Hard,
+                    support::parse_reflog_signature("T <t@e.com>"),
+                    "reset test",
+                ),
+                &mut grit_lib::progress::NullProgress,
+                &grit_lib::progress::CancelToken::never(),
+            )
+            .unwrap_err();
         assert_invalid_path_component(reset_err);
         assert_eq!(dir_bytes_snapshot(repo.work_tree().expect("wt")), wt_snap);
         assert_eq!(dir_bytes_snapshot(repo.git_dir()), git_snap);
 
-        let restore_err = restore_paths(
-            &repo,
-            &RestoreOptions {
-                pathspecs: vec![".".into()],
-                pathspec_sources: vec![".".into()],
-                source: RestoreSource::Tree(evil_tree_oid),
-                staged: false,
-                worktree: true,
-                stage: None,
-                remerge: None,
-            },
-            &mut grit_lib::progress::NullProgress,
-            &NeverCancel,
-        )
-        .unwrap_err();
+        let restore_err = repo
+            .checkout()
+            .restore(
+                &RestoreOptions {
+                    pathspecs: vec![".".into()],
+                    pathspec_sources: vec![".".into()],
+                    source: RestoreSource::Tree(evil_tree_oid),
+                    staged: false,
+                    worktree: true,
+                    stage: None,
+                    remerge: None,
+                },
+                &mut grit_lib::progress::NullProgress,
+                &CancelToken::never(),
+            )
+            .unwrap_err();
         assert_invalid_path_component(restore_err);
         assert_eq!(dir_bytes_snapshot(repo.work_tree().expect("wt")), wt_snap);
         assert_eq!(dir_bytes_snapshot(repo.git_dir()), git_snap);
@@ -546,7 +568,7 @@ fn win32_only_names_check_out_off_windows_like_git() {
             environment: Environment::empty(),
             ..CloneOptions::new(url, dest.clone())
         };
-        clone_repo(opts, &mut NoProgress, &NeverCancel, None)
+        clone_repo(opts, &mut NoProgress, &CancelToken::never(), None)
             .unwrap_or_else(|e| panic!("{label}: grit clone should succeed: {e:?}"));
         assert_eq!(
             dir_bytes_snapshot(&dest)
@@ -565,7 +587,7 @@ fn win32_only_names_check_out_off_windows_like_git() {
 #[test]
 fn git_tilde1_allowed_when_protect_ntfs_disabled() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let repo = Repository::init(dir.path(), &InitOptions::default()).expect("init");
+    let (repo, _) = Repository::init(dir.path(), &InitOptions::default()).expect("init");
     git(dir.path(), &["config", "core.protectNTFS", "false"]);
     repo.reload_config().expect("reload config");
 
@@ -573,5 +595,7 @@ fn git_tilde1_allowed_when_protect_ntfs_disabled() {
     let tree_body = tree_entry("100644", b"git~1", &blob);
     let tree = write_tree(repo.git_dir(), &tree_body);
     let tree_oid: ObjectId = tree.parse().expect("oid");
-    checkout_between_trees(&repo, None, &tree_oid).expect("checkout git~1 with protectNTFS off");
+    repo.checkout()
+        .checkout(None, &tree_oid)
+        .expect("checkout git~1 with protectNTFS off");
 }

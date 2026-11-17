@@ -5,22 +5,21 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use grit_lib::commits::{CommitOptions, CommitRequest, CommitScope};
 use grit_lib::config::environment::RepositoryOptions;
-use grit_lib::error::Error;
-use grit_lib::porcelain::commit::{
-    commit_with_scope, default_commit_scope, CommitRequest, CommitScope,
-};
+use grit_lib::porcelain::CommitError;
+use grit_lib::progress::CancelToken;
 use grit_lib::progress::NullProgress;
 use grit_lib::repo::Repository;
-use grit_lib::worktree::pathspec::ResolvedPathspecs;
+use grit_lib::worktree::pathspec::{Pathspec, PathspecGlobalFlags};
 
 fn commit_req(message: &str) -> CommitRequest {
     let id = "Test <t@example.com> 1700000000 +0000";
-    CommitRequest {
-        message: message.to_owned(),
-        author: Some(id.parse().expect("signature")),
-        committer: Some(id.parse().expect("signature")),
-        ..Default::default()
+    {
+        let mut req = CommitRequest::new(message.to_owned());
+        req.author = Some(id.parse().expect("signature"));
+        req.committer = Some(id.parse().expect("signature"));
+        req
     }
 }
 
@@ -53,6 +52,16 @@ fn open_grit(root: &Path) -> Repository {
     .expect("open grit repo")
 }
 
+fn try_staged_commit(repo: &Repository, req: CommitRequest) -> grit_lib::error::Error {
+    repo.commits()
+        .create(
+            &CommitOptions::new(req, CommitScope::Staged),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect_err("commit")
+}
+
 fn repo_with_autostage_off() -> (tempfile::TempDir, PathBuf) {
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = tmp.path().to_path_buf();
@@ -70,19 +79,12 @@ fn repo_with_autostage_off() -> (tempfile::TempDir, PathBuf) {
 fn staged_scope_reports_nothing_staged_when_worktree_dirty() {
     let (_tmp, root) = repo_with_autostage_off();
     let repo = open_grit(&root);
-    let err = commit_with_scope(
-        &repo,
-        &commit_req("x"),
-        CommitScope::Staged,
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect_err("commit");
+    let err = try_staged_commit(&repo, commit_req("x"));
     match err {
-        Error::NothingStagedToCommit {
+        grit_lib::error::Error::Commit(CommitError::NothingStagedToCommit {
             unstaged,
             untracked,
-        } => {
+        }) => {
             assert_eq!(unstaged, 1, "modified a");
             assert_eq!(untracked, 1, "untracked n");
         }
@@ -95,19 +97,25 @@ fn default_scope_with_autostage_off_is_staged_and_reports_nothing_staged() {
     let (_tmp, root) = repo_with_autostage_off();
     let repo = open_grit(&root);
     assert_eq!(
-        default_commit_scope(&repo).expect("scope"),
+        repo.commits().default_scope().expect("scope"),
         CommitScope::Staged
     );
-    let err = commit_with_scope(
-        &repo,
-        &commit_req("x"),
-        default_commit_scope(&repo).expect("scope"),
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect_err("commit");
+    let err = repo
+        .commits()
+        .create(
+            &CommitOptions::new(
+                commit_req("x"),
+                repo.commits().default_scope().expect("scope"),
+            ),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect_err("commit");
     assert!(
-        matches!(err, Error::NothingStagedToCommit { .. }),
+        matches!(
+            err,
+            grit_lib::error::Error::Commit(CommitError::NothingStagedToCommit { .. })
+        ),
         "got {err:?}"
     );
 }
@@ -125,21 +133,20 @@ fn paths_scope_with_other_paths_staged_reports_nothing_to_commit_not_false_unsta
     git_out(root, &["add", "b.txt"]);
 
     let repo = open_grit(root);
-    let paths = ResolvedPathspecs {
-        specs: vec!["a.txt".into()],
-        sources: vec!["a.txt".into()],
-        scoped: true,
-    };
-    let err = commit_with_scope(
-        &repo,
-        &commit_req("nope"),
-        CommitScope::Paths(paths),
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect_err("path a.txt has nothing to commit");
+    let paths = Pathspec::scoped(["a.txt"], PathspecGlobalFlags::default());
+    let err = repo
+        .commits()
+        .create(
+            &CommitOptions::new(commit_req("nope"), CommitScope::Paths(paths)),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect_err("path a.txt has nothing to commit");
     assert!(
-        matches!(err, Error::NothingToCommit),
+        matches!(
+            err,
+            grit_lib::error::Error::Commit(CommitError::NothingToCommit)
+        ),
         "must not treat staged b.txt as unstaged in the path index: {err:?}"
     );
 }
@@ -154,15 +161,14 @@ fn clean_tree_still_reports_nothing_to_commit() {
     git_out(root, &["commit", "-q", "-m", "base"]);
     git_out(root, &["config", "commit.autoStage", "false"]);
     let repo = open_grit(root);
-    let err = commit_with_scope(
-        &repo,
-        &commit_req("x"),
-        CommitScope::Staged,
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect_err("commit");
-    assert!(matches!(err, Error::NothingToCommit), "got {err:?}");
+    let err = try_staged_commit(&repo, commit_req("x"));
+    assert!(
+        matches!(
+            err,
+            grit_lib::error::Error::Commit(CommitError::NothingToCommit)
+        ),
+        "got {err:?}"
+    );
 }
 
 fn init_nested_repo(path: &Path) {
@@ -195,16 +201,9 @@ fn staged_scope_counts_submodule_untracked_as_unstaged() {
     std::fs::write(inner.join("untracked.txt"), "new\n").expect("untracked in submodule");
 
     let repo = open_grit(root);
-    let err = commit_with_scope(
-        &repo,
-        &commit_req("x"),
-        CommitScope::Staged,
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect_err("commit");
+    let err = try_staged_commit(&repo, commit_req("x"));
     match err {
-        Error::NothingStagedToCommit { unstaged, .. } => {
+        grit_lib::error::Error::Commit(CommitError::NothingStagedToCommit { unstaged, .. }) => {
             assert!(
                 unstaged >= 1,
                 "submodule untracked content must count as unstaged, got {err:?}"

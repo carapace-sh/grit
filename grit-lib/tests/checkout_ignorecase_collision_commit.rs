@@ -1,5 +1,7 @@
 //! Case-insensitive checkout collisions: warn and auto-stage safety for loser paths.
 
+use grit_lib::progress::CancelToken;
+use grit_lib::progress::NullProgress;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -8,14 +10,14 @@ use grit_lib::index::write_tree::{write_tree_update_index, WriteTreeFlags};
 use grit_lib::index::{entry_from_stat, Index, MODE_REGULAR};
 use grit_lib::objects::ObjectKind;
 use grit_lib::porcelain::checkout::checkout_between_trees_with_progress;
-use grit_lib::porcelain::commit::{commit_with_scope, CommitRequest, CommitScope};
-use grit_lib::porcelain::stage_tracked::stage_tracked_modifications;
-use grit_lib::porcelain::status::{status, StatusOptions};
+use grit_lib::porcelain::commit::{CommitRequest, CommitScope};
+use grit_lib::porcelain::status::StatusOptions;
 use grit_lib::porcelain::switch::{switch_repository, SwitchMode, SwitchOptions};
-use grit_lib::progress::{NeverCancel, NullProgress};
+use grit_lib::progress::CancelToken;
+use grit_lib::progress::NullProgress;
+use grit_lib::refs::ref_storage::RefStorageFormat;
 use grit_lib::repo::{InitOptions, Repository};
-use grit_lib::worktree::pathspec::ResolvedPathspecs;
-use grit_lib::RefStorageFormat;
+use grit_lib::worktree::pathspec::{Pathspec, PathspecGlobalFlags};
 
 fn enable_ignorecase(repo: &Repository, root: &Path) {
     fs::write(
@@ -52,7 +54,7 @@ fn populated_checkout_reports_collisions_and_auto_stage_skips_losers() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let dest = tmp.path().join("grit-wt");
     fs::create_dir(&dest).expect("mkdir");
-    let repo = Repository::init(
+    let (repo, _) = Repository::init(
         &dest,
         &InitOptions::new()
             .with_initial_branch("master".to_owned())
@@ -67,9 +69,10 @@ fn populated_checkout_reports_collisions_and_auto_stage_skips_losers() {
         let _ = fs::remove_file(dest.join(name));
     }
 
-    let checkout =
-        checkout_between_trees_with_progress(&repo, None, &tree, &mut NullProgress, &NeverCancel)
-            .expect("checkout");
+    let checkout = repo
+        .checkout()
+        .checkout(None, &tree, &mut NullProgress, &CancelToken::never())
+        .expect("checkout");
 
     assert_eq!(
         checkout.path_collisions,
@@ -81,7 +84,10 @@ fn populated_checkout_reports_collisions_and_auto_stage_skips_losers() {
         ]
     );
 
-    let index = repo.index_handle().load().expect("index");
+    let index = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("index");
     assert!(
         index.get(b"File.txt", 0).is_some(),
         "checkout must keep File.txt in index"
@@ -94,8 +100,13 @@ fn populated_checkout_reports_collisions_and_auto_stage_skips_losers() {
 
     fs::write(dest.join("unrelated.txt"), "edit\n").expect("unrelated");
 
-    stage_tracked_modifications(&repo, &dest).expect("stage tracked");
-    let mid = repo.index_handle().load().expect("mid index");
+    repo.index()
+        .stage_tracked_modifications(&dest)
+        .expect("stage tracked");
+    let mid = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("mid index");
     assert!(
         mid.get(b"File.txt", 0).is_some(),
         "auto-stage scan must keep collision loser File.txt in the index"
@@ -107,23 +118,25 @@ fn populated_checkout_reports_collisions_and_auto_stage_skips_losers() {
     );
 
     let id = "Tester <t@example.com> 1700000000 +0000".to_owned();
-    let req = CommitRequest {
-        message: "unrelated change".to_owned(),
-        author: Some(id.parse().expect("sig")),
-        committer: Some(id.parse().expect("sig")),
-        allow_empty: false,
-        ..Default::default()
+    let req = {
+        let mut req = CommitRequest::new("unrelated change".to_owned());
+        req.author = Some(id.parse().expect("sig"));
+        req.committer = Some(id.parse().expect("sig"));
+        req.allow_empty = false;
+        req
     };
-    commit_with_scope(
-        &repo,
-        &req,
-        CommitScope::AutoStage,
-        &mut NullProgress,
-        &NeverCancel,
-    )
-    .expect("commit");
+    repo.commits()
+        .create(
+            &grit_lib::commits::CommitOptions::new(req.clone(), CommitScope::AutoStage),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("commit");
 
-    let post = repo.index_handle().load().expect("index after");
+    let post = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("index after");
     assert_eq!(
         post.get(b"File.txt", 0).expect("File.txt").oid,
         file_txt_oid
@@ -141,7 +154,7 @@ fn init_collision_repo() -> TestRepo {
     let tmp = tempfile::tempdir().expect("tempdir");
     let dest = tmp.path().join("grit-wt");
     fs::create_dir(&dest).expect("mkdir");
-    let repo = Repository::init(
+    let (repo, _) = Repository::init(
         &dest,
         &InitOptions::new()
             .with_initial_branch("master".to_owned())
@@ -161,7 +174,8 @@ fn checkout_collision_tree(repo: &Repository, dest: &Path) {
     for name in ["File.txt", "file.txt", "dir/A.txt", "Dir/a.txt"] {
         let _ = fs::remove_file(dest.join(name));
     }
-    checkout_between_trees_with_progress(repo, None, &tree, &mut NullProgress, &NeverCancel)
+    repo.checkout()
+        .checkout(None, &tree, &mut NullProgress, &CancelToken::never())
         .expect("checkout");
 }
 
@@ -172,23 +186,24 @@ fn keep_one_spelling_per_collision_group(dest: &Path) {
 
 fn auto_stage_unrelated_and_commit(repo: &Repository, dest: &Path) {
     fs::write(dest.join("unrelated.txt"), "edit\n").expect("unrelated");
-    stage_tracked_modifications(repo, dest).expect("stage tracked");
+    repo.index()
+        .stage_tracked_modifications(dest)
+        .expect("stage tracked");
     let id = "Tester <t@example.com> 1700000000 +0000".to_owned();
-    let req = CommitRequest {
-        message: "unrelated change".to_owned(),
-        author: Some(id.parse().expect("sig")),
-        committer: Some(id.parse().expect("sig")),
-        allow_empty: false,
-        ..Default::default()
+    let req = {
+        let mut req = CommitRequest::new("unrelated change".to_owned());
+        req.author = Some(id.parse().expect("sig"));
+        req.committer = Some(id.parse().expect("sig"));
+        req.allow_empty = false;
+        req
     };
-    commit_with_scope(
-        repo,
-        &req,
-        CommitScope::AutoStage,
-        &mut NullProgress,
-        &NeverCancel,
-    )
-    .expect("commit");
+    repo.commits()
+        .create(
+            &grit_lib::commits::CommitOptions::new(req.clone(), CommitScope::AutoStage),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("commit");
 }
 
 #[test]
@@ -197,7 +212,11 @@ fn auto_stage_updates_edited_winner_and_preserves_loser_oids() {
     checkout_collision_tree(&fx.repo, &fx.dest);
     keep_one_spelling_per_collision_group(&fx.dest);
 
-    let index = fx.repo.index_handle().load().expect("index");
+    let index = fx
+        .repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("index");
     let file_loser_oid = index.get(b"File.txt", 0).expect("File.txt").oid;
     let dir_loser_oid = index.get(b"Dir/a.txt", 0).expect("Dir/a.txt").oid;
     let winner_before = index.get(b"file.txt", 0).expect("file.txt").oid;
@@ -205,7 +224,11 @@ fn auto_stage_updates_edited_winner_and_preserves_loser_oids() {
     fs::write(fx.dest.join("file.txt"), b"edited winner\n").expect("edit winner");
     auto_stage_unrelated_and_commit(&fx.repo, &fx.dest);
 
-    let post = fx.repo.index_handle().load().expect("index after");
+    let post = fx
+        .repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("index after");
     assert_ne!(
         post.get(b"file.txt", 0).expect("file.txt").oid,
         winner_before,
@@ -227,15 +250,26 @@ fn deleting_dentry_winner_stages_removal_and_keeps_losers() {
     checkout_collision_tree(&fx.repo, &fx.dest);
     keep_one_spelling_per_collision_group(&fx.dest);
 
-    let index = fx.repo.index_handle().load().expect("index");
+    let index = fx
+        .repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("index");
     let file_loser_oid = index.get(b"File.txt", 0).expect("File.txt").oid;
     let dir_loser_oid = index.get(b"Dir/a.txt", 0).expect("Dir/a.txt").oid;
 
     fs::remove_file(fx.dest.join("file.txt")).expect("delete winner");
     fs::remove_file(fx.dest.join("dir/A.txt")).expect("delete nested winner");
-    stage_tracked_modifications(&fx.repo, &fx.dest).expect("stage tracked");
+    fx.repo
+        .index()
+        .stage_tracked_modifications(&fx.dest)
+        .expect("stage tracked");
 
-    let mid = fx.repo.index_handle().load().expect("mid index");
+    let mid = fx
+        .repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("mid index");
     assert!(
         mid.get(b"file.txt", 0).is_none(),
         "winner removed from index"
@@ -254,34 +288,38 @@ fn deleting_dentry_winner_stages_removal_and_keeps_losers() {
 fn collision_clone_worktree(fx: &TestRepo) {
     checkout_collision_tree(&fx.repo, &fx.dest);
     keep_one_spelling_per_collision_group(&fx.dest);
-    let pre = fx.repo.index_handle().load().expect("index");
+    let pre = fx
+        .repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("index");
     assert!(
         pre.get(b"File.txt", 0).is_some() && pre.get(b"file.txt", 0).is_some(),
         "checkout index must keep both collision spellings"
     );
-    commit_with_scope(
-        &fx.repo,
-        &commit_request("base"),
-        CommitScope::Staged,
-        &mut NullProgress,
-        &NeverCancel,
-    )
-    .expect("seed HEAD from collision index");
+    &fx.repo
+        .commits()
+        .create(
+            &grit_lib::commits::CommitOptions::new(commit_request("base"), CommitScope::Staged),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("seed HEAD from collision index");
 }
 
 fn commit_request(message: &str) -> CommitRequest {
     let id = "Tester <t@example.com> 1700000000 +0000".to_owned();
-    CommitRequest {
-        message: message.to_owned(),
-        author: Some(id.parse().expect("sig")),
-        committer: Some(id.parse().expect("sig")),
-        allow_empty: false,
-        ..Default::default()
+    {
+        let mut req = CommitRequest::new(message.to_owned());
+        req.author = Some(id.parse().expect("sig"));
+        req.committer = Some(id.parse().expect("sig"));
+        req.allow_empty = false;
+        req
     }
 }
 
 fn head_oid(repo: &Repository) -> grit_lib::objects::ObjectId {
-    grit_lib::refs::resolve_ref(repo.git_dir(), "HEAD").expect("head")
+    repo.references().resolve("HEAD").expect("head")
 }
 
 #[test]
@@ -289,33 +327,44 @@ fn collision_loser_path_commit_leaves_index_and_head_unchanged() {
     let fx = init_collision_repo();
     collision_clone_worktree(&fx);
 
-    let before = fx.repo.index_handle().load().expect("index");
+    let before = fx
+        .repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("index");
     assert!(before.get(b"file.txt", 0).is_some(), "pre: file.txt");
     let file_loser_oid = before.get(b"File.txt", 0).expect("File.txt").oid;
     let head_before = head_oid(&fx.repo);
 
-    let err = commit_with_scope(
-        &fx.repo,
-        &commit_request("e"),
-        CommitScope::Paths(ResolvedPathspecs {
-            specs: vec!["File.txt".into()],
-            sources: vec!["File.txt".into()],
-            scoped: true,
-        }),
-        &mut NullProgress,
-        &NeverCancel,
-    )
-    .expect_err("path commit must not delete collision loser");
+    let err = &fx
+        .repo
+        .commits()
+        .create(
+            &grit_lib::commits::CommitOptions::new(
+                commit_request("e"),
+                CommitScope::Paths(
+                    Pathspec::scoped(["File.txt"].clone()),
+                    PathspecGlobalFlags::default(),
+                ),
+            ),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect_err("path commit must not delete collision loser");
     assert!(
         matches!(
             err,
-            Error::NothingToCommit | Error::NothingStagedToCommit { .. }
+            CommitError::NothingToCommit | CommitError::NothingStagedToCommit { .. }
         ),
         "{err:?}"
     );
 
     assert_eq!(head_oid(&fx.repo), head_before);
-    let after = fx.repo.index_handle().load().expect("index after");
+    let after = fx
+        .repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("index after");
     assert_eq!(
         after.get(b"File.txt", 0).expect("File.txt").oid,
         file_loser_oid
@@ -328,25 +377,37 @@ fn collision_loser_auto_stage_commit_is_noop() {
     let fx = init_collision_repo();
     collision_clone_worktree(&fx);
 
-    let before = fx.repo.index_handle().load().expect("index");
+    let before = fx
+        .repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("index");
     let file_loser_oid = before.get(b"File.txt", 0).expect("File.txt").oid;
     let head_before = head_oid(&fx.repo);
 
-    let err = commit_with_scope(
-        &fx.repo,
-        &commit_request("e"),
-        CommitScope::AutoStage,
-        &mut NullProgress,
-        &NeverCancel,
-    )
-    .expect_err("auto-stage must not commit phantom loser changes");
+    let err = &fx
+        .repo
+        .commits()
+        .create(
+            &grit_lib::commits::CommitOptions::new(commit_request("e"), CommitScope::AutoStage),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect_err("auto-stage must not commit phantom loser changes");
     assert!(
-        matches!(err, Error::NothingStagedToCommit { .. }),
+        matches!(
+            err,
+            grit_lib::error::Error::Commit(CommitError::NothingStagedToCommit { .. })
+        ),
         "collision drift must not read as a clean worktree: {err:?}"
     );
 
     assert_eq!(head_oid(&fx.repo), head_before);
-    let after = fx.repo.index_handle().load().expect("index after");
+    let after = fx
+        .repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("index after");
     assert_eq!(
         after.get(b"File.txt", 0).expect("File.txt").oid,
         file_loser_oid
@@ -382,7 +443,9 @@ fn build_directory_name_collision_index(
     );
     index.sort();
     write_tree_update_index(repo.odb(), &mut index, "", WriteTreeFlags::silent()).expect("tree");
-    repo.index_handle().write(&mut index).expect("write index");
+    repo.index()
+        .write(&mut index, &grit_lib::index::IndexWriteOptions::default())
+        .expect("write index");
     (oid_one, oid_two)
 }
 
@@ -390,14 +453,14 @@ fn commit_directory_collision_head(
     fx: &TestRepo,
 ) -> (grit_lib::objects::ObjectId, grit_lib::objects::ObjectId) {
     let oids = build_directory_name_collision_index(&fx.repo, &fx.dest);
-    commit_with_scope(
-        &fx.repo,
-        &commit_request("base"),
-        CommitScope::Staged,
-        &mut NullProgress,
-        &NeverCancel,
-    )
-    .expect("seed HEAD");
+    &fx.repo
+        .commits()
+        .create(
+            &grit_lib::commits::CommitOptions::new(commit_request("base"), CommitScope::Staged),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("seed HEAD");
     oids
 }
 
@@ -407,9 +470,16 @@ fn directory_collision_auto_stage_commit_preserves_both_index_oids() {
     let (docs_upper_oid, docs_lower_oid) = commit_directory_collision_head(&fx);
 
     fs::write(fx.dest.join("unrelated.txt"), "edit\n").expect("unrelated");
-    stage_tracked_modifications(&fx.repo, &fx.dest).expect("stage tracked");
+    fx.repo
+        .index()
+        .stage_tracked_modifications(&fx.dest)
+        .expect("stage tracked");
 
-    let mid = fx.repo.index_handle().load().expect("mid index");
+    let mid = fx
+        .repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("mid index");
     assert_eq!(
         mid.get(b"Docs/guide.md", 0).expect("Docs/guide.md").oid,
         docs_upper_oid,
@@ -422,7 +492,11 @@ fn directory_collision_auto_stage_commit_preserves_both_index_oids() {
 
     auto_stage_unrelated_and_commit(&fx.repo, &fx.dest);
 
-    let post = fx.repo.index_handle().load().expect("post commit");
+    let post = fx
+        .repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("post commit");
     assert_eq!(
         post.get(b"Docs/guide.md", 0).expect("Docs/guide.md").oid,
         docs_upper_oid
@@ -438,13 +512,15 @@ fn directory_collision_winner_omitted_from_status_when_bytes_match_sibling() {
     let fx = init_collision_repo();
     commit_directory_collision_head(&fx);
 
-    let model = status(
-        &fx.repo,
-        &StatusOptions::default(),
-        &mut NullProgress,
-        &NeverCancel,
-    )
-    .expect("status");
+    let model = &fx
+        .repo
+        .status()
+        .run(
+            &StatusOptions::default(),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("status");
     assert!(
         model.unstaged.iter().any(|e| e.path() == "Docs/guide.md"),
         "index row whose oid differs from on-disk bytes must be unstaged: {:?}",
@@ -458,9 +534,16 @@ fn directory_collision_edited_winner_updates_only_dentry_spelling() {
     let (docs_upper_oid, docs_lower_oid) = commit_directory_collision_head(&fx);
 
     fs::write(fx.dest.join("Docs/guide.md"), b"brand-new\n").expect("edit");
-    stage_tracked_modifications(&fx.repo, &fx.dest).expect("stage");
+    fx.repo
+        .index()
+        .stage_tracked_modifications(&fx.dest)
+        .expect("stage");
 
-    let mid = fx.repo.index_handle().load().expect("mid");
+    let mid = fx
+        .repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("mid");
     assert_ne!(
         mid.get(b"Docs/guide.md", 0).expect("Docs/guide.md").oid,
         docs_upper_oid
@@ -478,13 +561,15 @@ fn collision_loser_omitted_from_status_unstaged() {
     let _ = fs::remove_file(fx.dest.join("file.txt"));
     let _ = fs::remove_file(fx.dest.join("dir/A.txt"));
 
-    let model = status(
-        &fx.repo,
-        &StatusOptions::default(),
-        &mut NullProgress,
-        &NeverCancel,
-    )
-    .expect("status");
+    let model = &fx
+        .repo
+        .status()
+        .run(
+            &StatusOptions::default(),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("status");
     assert!(
         !model.unstaged.iter().any(|e| e.path() == "File.txt"),
         "missing collision loser must not appear as unstaged or deleted: {:?}",
@@ -509,64 +594,71 @@ fn build_flat_name_collision_tree(repo: &Repository, dest: &Path) -> grit_lib::o
     index.sort();
     let tree = write_tree_update_index(repo.odb(), &mut index, "", WriteTreeFlags::silent())
         .expect("tree");
-    repo.index_handle().write(&mut index).expect("write index");
+    repo.index()
+        .write(&mut index, &grit_lib::index::IndexWriteOptions::default())
+        .expect("write index");
     tree
 }
 
 #[test]
 fn switch_reports_collisions_and_status_lists_mismatched_index_row() {
     let fx = init_collision_repo();
-    let empty = CommitRequest {
-        message: "empty".into(),
-        allow_empty: true,
-        ..commit_request("empty")
-    };
-    commit_with_scope(
-        &fx.repo,
-        &empty,
-        CommitScope::Staged,
-        &mut NullProgress,
-        &NeverCancel,
-    )
-    .expect("empty main");
+    let mut empty = commit_request("empty");
+    empty.message = "empty".into();
+    empty.allow_empty = true;
+    &fx.repo
+        .commits()
+        .create(
+            &grit_lib::commits::CommitOptions::new(empty.clone(), CommitScope::Staged),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("empty main");
     let main_tip = head_oid(&fx.repo);
 
     build_flat_name_collision_tree(&fx.repo, &fx.dest);
-    commit_with_scope(
-        &fx.repo,
-        &commit_request("collide"),
-        CommitScope::Staged,
-        &mut NullProgress,
-        &NeverCancel,
-    )
-    .expect("collide commit");
+    &fx.repo
+        .commits()
+        .create(
+            &grit_lib::commits::CommitOptions::new(commit_request("collide"), CommitScope::Staged),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("collide commit");
     let collide_tip = head_oid(&fx.repo);
-    grit_lib::refs::write_ref(fx.repo.git_dir(), "refs/heads/collide", &collide_tip)
+    grit_test_support::refs::set_ref(&fx.repo, "refs/heads/collide", &collide_tip)
         .expect("collide ref");
-    grit_lib::refs::write_ref(fx.repo.git_dir(), "refs/heads/master", &main_tip).expect("main");
-    grit_lib::refs::write_symbolic_ref(fx.repo.git_dir(), "HEAD", "refs/heads/master")
+    grit_test_support::refs::set_ref(&fx.repo, "refs/heads/master", &main_tip).expect("main");
+    fx.repo
+        .references()
+        .update_symbolic("HEAD", "refs/heads/master")
         .expect("head main");
     let _ = fs::remove_file(fx.dest.join("A.txt"));
     let _ = fs::remove_file(fx.dest.join("a.txt"));
     fx.repo
-        .index_handle()
-        .write(&mut Index::new())
+        .index()
+        .write(
+            &mut Index::new(),
+            &grit_lib::index::IndexWriteOptions::default(),
+        )
         .expect("empty index");
 
-    let outcome = switch_repository(
-        &fx.repo,
-        &SwitchOptions {
-            mode: SwitchMode::Existing {
-                branch: "collide".into(),
-                oid: collide_tip,
+    let outcome = fx
+        .repo
+        .checkout()
+        .switch(
+            &SwitchOptions {
+                mode: SwitchMode::Existing {
+                    branch: "collide".into(),
+                    oid: collide_tip,
+                },
+                dry_run: false,
+                hooks: Default::default(),
             },
-            dry_run: false,
-            hooks: Default::default(),
-        },
-        &mut NullProgress,
-        &NeverCancel,
-    )
-    .expect("switch");
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("switch");
     assert!(
         outcome
             .path_collisions
@@ -580,13 +672,15 @@ fn switch_reports_collisions_and_status_lists_mismatched_index_row() {
         fs::write(fx.dest.join("a.txt"), b"twotwotwo\n").expect("a.txt");
     }
 
-    let model = status(
-        &fx.repo,
-        &StatusOptions::default(),
-        &mut NullProgress,
-        &NeverCancel,
-    )
-    .expect("status");
+    let model = &fx
+        .repo
+        .status()
+        .run(
+            &StatusOptions::default(),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("status");
     assert!(
         model.unstaged.iter().any(|e| e.path() == "A.txt"),
         "mismatched collision member must be unstaged: {:?}",

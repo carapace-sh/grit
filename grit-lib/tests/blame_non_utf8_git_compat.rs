@@ -5,18 +5,16 @@
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 
-use grit_lib::blame::{
-    compute_blame, resolve_blame_line_range, BlameDiffAlgorithm, BlameResult, CopyDetection,
-};
+use grit_lib::blame::{compute_blame, BlameDiffAlgorithm, BlameResult, CopyDetection};
 use grit_lib::diff::merge_diff::{blob_oid_at_path, read_blob_at_path};
 use grit_lib::objects::{parse_commit, ObjectId};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::process::Command;
 
-use grit_lib::blame::{blame_file, BlameOptions};
+use grit_lib::blame::BlameOptions;
 use grit_lib::config::environment::RepositoryOptions;
-use grit_lib::porcelain::status::{status, StatusOptions};
+use grit_lib::porcelain::status::StatusOptions;
 use grit_lib::repo::Repository;
 use grit_lib::repo_relpath::{storage_bytes, storage_string};
 use grit_test_support::git;
@@ -35,24 +33,28 @@ fn status_path_can_be_passed_to_blame() {
     git(root, &["commit", "-qm", "initial"]);
     let repo = Repository::discover(Some(root), &RepositoryOptions::empty()).unwrap();
     let path = storage_string(raw);
-    let result = blame_file(&repo, &path, &BlameOptions::default()).unwrap();
+    let result = repo.diff().blame(&path, &BlameOptions::default()).unwrap();
     assert_eq!(result.lines.len(), 1);
     assert_eq!(storage_bytes(&result.lines[0].original_path), raw);
 
     std::fs::write(&file, "hello\nmodified\n").unwrap();
-    let model = status(
-        &repo,
-        &StatusOptions::default(),
-        &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .unwrap();
+    let model = repo
+        .status()
+        .run(
+            &StatusOptions::default(),
+            &mut grit_lib::progress::NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .unwrap();
     let reported = model
         .unstaged
         .iter()
         .find(|e| storage_bytes(e.path()) == raw)
         .unwrap();
-    let result = blame_file(&repo, reported.path(), &BlameOptions::default()).unwrap();
+    let result = repo
+        .diff()
+        .blame(reported.path(), &BlameOptions::default())
+        .unwrap();
     assert_eq!(result.lines[0].content, "hello");
     assert_eq!(storage_bytes(&result.lines[0].original_path), raw);
 }
@@ -254,7 +256,7 @@ fn distinct_byte_paths_match_git_with_and_without_bloom_filters() {
         for (i, raw) in paths.iter().enumerate() {
             let path = storage_string(raw);
             let expected = git_blame(root, raw, false);
-            let result = blame_file(&repo, &path, &BlameOptions::default()).unwrap();
+            let result = repo.diff().blame(&path, &BlameOptions::default()).unwrap();
             assert_attribution(&result, &expected);
             assert_eq!(
                 read_blob_at_path(repo.odb(), &tree, &path).unwrap(),
@@ -268,14 +270,16 @@ fn distinct_byte_paths_match_git_with_and_without_bloom_filters() {
                 read_blob_at_path(repo.odb(), &tree, &path).unwrap()
             );
             assert_eq!(
-                resolve_blame_line_range(&repo, start, &path, "/second/,+1").unwrap(),
+                repo.diff()
+                    .resolve_blame_line_range(&start, &path, "/second/, +1")
+                    .unwrap(),
                 2..=2
             );
             let range = BlameOptions {
                 line_range: Some(2..=2),
                 ..Default::default()
             };
-            assert_attribution(&blame_file(&repo, &path, &range).unwrap(), &expected[1..]);
+            assert_attribution(&repo.diff().blame(&path, &range).unwrap(), &expected[1..]);
             let computed = compute_blame(
                 repo.odb(),
                 start,
@@ -285,6 +289,7 @@ fn distinct_byte_paths_match_git_with_and_without_bloom_filters() {
                 None,
                 false,
                 0,
+                false,
                 false,
                 &HashMap::new(),
                 false,
@@ -347,7 +352,7 @@ fn rename_and_copy_origins_preserve_bytes_and_hunks() {
                 },
                 ..Default::default()
             };
-            let result = blame_file(&repo, &storage_string(path), &options).unwrap();
+            let result = repo.diff().blame(&storage_string(path), &options).unwrap();
             let expected = git_blame(root, path, copies);
             assert_attribution(&result, &expected);
             assert_eq!(expected[0].3, source);
@@ -366,7 +371,7 @@ fn grit_written_raw_path_objects_are_readable_by_git_blame() {
     use grit_lib::repo::InitOptions;
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
-    let repo = Repository::init(root, &InitOptions::default()).unwrap();
+    let (repo, _) = Repository::init(root, &InitOptions::default()).unwrap();
     let blob = repo
         .odb()
         .write(ObjectKind::Blob, b"hello from grit\n")
@@ -400,7 +405,10 @@ fn grit_written_raw_path_objects_are_readable_by_git_blame() {
         .unwrap();
     git(root, &["update-ref", "HEAD", &tip.to_hex()]);
     let raw = b"dir\xfe/raw\xff.txt";
-    let result = blame_file(&repo, &storage_string(raw), &BlameOptions::default()).unwrap();
+    let result = repo
+        .diff()
+        .blame(&storage_string(raw), &BlameOptions::default())
+        .unwrap();
     assert_attribution(&result, &git_blame(root, raw, false));
     assert_eq!(result.lines[0].commit, tip);
     git(root, &["fsck", "--strict"]);
@@ -410,21 +418,28 @@ fn assert_literal_prefix_blame(root: &Path, cwd: &Path, operand: &str) {
     let mut options = RepositoryOptions::empty();
     options.environment.cwd = cwd.to_owned();
     let repo = Repository::discover(Some(root), &options).unwrap();
-    let result = blame_file(&repo, operand, &BlameOptions::default()).unwrap();
+    let result = repo
+        .diff()
+        .blame(operand, &BlameOptions::default())
+        .unwrap();
     assert_eq!(result.lines[0].content, "literal");
     let expected = git_blame(root, b"grit+pathhex:6162", false);
     assert_attribution(&result, &expected);
-    let range = resolve_blame_line_range(&repo, head(root), operand, "/literal/,+1").unwrap();
+    let range = repo
+        .diff()
+        .resolve_blame_line_range(head(root), operand, "/literal/,+1")
+        .unwrap();
     assert_eq!(range, 1..=1);
-    let ranged = blame_file(
-        &repo,
-        operand,
-        &BlameOptions {
-            line_range: Some(range),
-            ..Default::default()
-        },
-    )
-    .unwrap();
+    let ranged = repo
+        .diff()
+        .blame(
+            operand,
+            &BlameOptions {
+                line_range: Some(range),
+                ..Default::default()
+            },
+        )
+        .unwrap();
     assert_attribution(&ranged, &expected);
 }
 

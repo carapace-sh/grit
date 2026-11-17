@@ -15,7 +15,8 @@ use grit_lib::objects::odb::store::{MemoryStore, ObjectStore, WritableObjectStor
 use grit_lib::objects::odb::{Odb, OdbBuilder, WriteOptions};
 use grit_lib::objects::{HashAlgo, Object, ObjectId, ObjectInfo, ObjectKind};
 use grit_lib::refs::store::MemoryRefStore;
-use grit_lib::repo::{Repository, RepositoryBuilder};
+use grit_lib::repo::error::FilesOnlyOperation;
+use grit_lib::repo::{Repository, RepositoryError};
 use grit_test_support::odb_conformance::run_read_suite;
 use grit_test_support::{git, git_packed_history, rev_parse};
 
@@ -28,18 +29,31 @@ fn isolated_options() -> RepositoryOptions {
 
 /// A repository with no on-disk layout: memory primary, memory refs, the given read sources.
 fn memory_repo(git_dir: &Path, read_sources: Vec<Arc<dyn ObjectStore>>) -> Repository {
-    let mut odb = OdbBuilder::files(git_dir.join("objects"))
-        .primary(Arc::new(MemoryStore::new(HashAlgo::Sha1)))
-        .alternates(false);
-    for source in read_sources {
-        odb = odb.push_read_source(source);
-    }
-    RepositoryBuilder::new(isolated_options())
-        .odb_builder(odb)
-        .ref_store(Arc::new(MemoryRefStore::new()))
-        .initial_branch("main")
-        .open(git_dir, None)
-        .expect("open memory repository")
+    layered_repo(
+        git_dir,
+        Arc::new(MemoryStore::new(HashAlgo::Sha1)),
+        read_sources,
+    )
+}
+
+/// A repository over `primary` and `read_sources` with memory refs and no alternates.
+fn layered_repo(
+    git_dir: &Path,
+    primary: Arc<dyn WritableObjectStore>,
+    read_sources: Vec<Arc<dyn ObjectStore>>,
+) -> Repository {
+    let layers = read_sources
+        .into_iter()
+        .fold(OdbBuilder::new(), OdbBuilder::push_read_source);
+    Repository::open(
+        git_dir,
+        &(isolated_options()
+            .with_object_store(primary)
+            .with_odb_builder(layers)
+            .with_ref_store(Arc::new(MemoryRefStore::new()))
+            .with_initial_branch("main")),
+    )
+    .expect("open memory repository")
 }
 
 fn write_blob(store: &dyn WritableObjectStore, data: &[u8]) -> ObjectId {
@@ -58,7 +72,8 @@ fn read_store_covers_primary_read_sources_and_alternates() {
     let alt_oid = Odb::new(&alt_objects)
         .write(ObjectKind::Blob, b"from alternate")
         .expect("write alternate");
-    let objects = tmp.path().join("main/objects");
+    let git_dir = tmp.path().join("main");
+    let objects = git_dir.join("objects");
     fs::create_dir_all(objects.join("info")).expect("info dir");
     fs::write(
         objects.join("info/alternates"),
@@ -68,10 +83,15 @@ fn read_store_covers_primary_read_sources_and_alternates() {
 
     let extra = Arc::new(MemoryStore::new(HashAlgo::Sha1));
     let extra_oid = write_blob(extra.as_ref(), b"from read source");
-    let odb = OdbBuilder::files(&objects)
-        .primary(Arc::new(MemoryStore::new(HashAlgo::Sha1)))
-        .push_read_source(extra)
-        .build();
+    let repo = Repository::open(
+        &git_dir,
+        &(isolated_options()
+            .with_object_store(Arc::new(MemoryStore::new(HashAlgo::Sha1)))
+            .with_odb_builder(OdbBuilder::new().push_read_source(extra).alternates(true))
+            .with_ref_store(Arc::new(MemoryRefStore::new()))),
+    )
+    .expect("open");
+    let odb = repo.odb();
     let primary_oid = odb.write(ObjectKind::Blob, b"from primary").expect("write");
 
     let store = odb.read_store();
@@ -126,14 +146,13 @@ fn read_store_covers_primary_read_sources_and_alternates() {
     assert!(!sources.contains(&extra_oid).expect("read source"));
     assert!(matches!(
         odb.primary(),
-        Err(Error::UnsupportedObjectStore {
-            operation: "primary"
-        })
+        Err(Error::Repository(RepositoryError::UnsupportedObjectStore {
+            operation: FilesOnlyOperation::FilesSource,
+        }))
     ));
 }
 
-/// Exactly the reported program: a repository opened through `RepositoryBuilder` with a
-/// memory primary and no alternates.
+/// Exactly the reported program: a repository opened with a memory primary and no alternates.
 #[test]
 fn read_store_of_custom_primary_repository_sees_written_object() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -199,11 +218,8 @@ fn read_store_of_custom_primary_passes_read_conformance() {
                 .write(*kind, data, WriteOptions::default())
                 .expect("seed");
         }
-        OdbBuilder::files("/nonexistent/read-store/objects")
-            .primary(primary)
-            .push_read_source(extra)
-            .alternates(false)
-            .build()
+        layered_repo(Path::new("/nonexistent/read-store"), primary, vec![extra])
+            .odb()
             .read_store()
     });
 }

@@ -1,12 +1,13 @@
 //! In-process concurrent `create_commit` must not surface spurious permission errors.
 
+use grit_lib::error::RefError;
 use std::sync::Arc;
 use std::thread;
 
 use grit_lib::error::Error;
 use grit_lib::ident::Signature;
-use grit_lib::porcelain::commit::{create_commit, CommitRequest};
-use grit_lib::progress::{NeverCancel, NullProgress};
+use grit_lib::progress::CancelToken;
+use grit_lib::progress::NullProgress;
 use grit_lib::refs::lock_path_for_ref;
 use grit_lib::repo::{InitOptions, Repository};
 
@@ -17,7 +18,8 @@ struct Harness {
 
 fn init_repo() -> Harness {
     let dir = tempfile::tempdir().expect("tempdir");
-    let repo = Arc::new(Repository::init(dir.path(), &InitOptions::default()).expect("init"));
+    let (repo, _) = Repository::init(dir.path(), &InitOptions::default()).expect("init");
+    let repo = Arc::new(repo);
     let ident: Signature = "Test User <test@example.com> 0 +0000"
         .parse()
         .expect("ident");
@@ -25,7 +27,9 @@ fn init_repo() -> Harness {
         grit_test_support::empty_commit_request("root", "Test User <test@example.com> 0 +0000");
     root.author = Some(ident.clone());
     root.committer = Some(ident);
-    create_commit(&repo, &root, &mut NullProgress, &NeverCancel).expect("root commit");
+    repo.commits()
+        .create_staged(&root, &mut NullProgress, &CancelToken::never())
+        .expect("root commit");
     Harness { _dir: dir, repo }
 }
 
@@ -49,7 +53,10 @@ fn concurrent_allow_empty_commits_avoid_permission_errors() {
                     );
                     req.author = Some(ident.clone());
                     req.committer = Some(ident.clone());
-                    if let Err(e) = create_commit(&repo, &req, &mut NullProgress, &NeverCancel) {
+                    if let Err(e) =
+                        repo.commits()
+                            .create_staged(&req, &mut NullProgress, &CancelToken::never())
+                    {
                         errors.push(e);
                     }
                 }
@@ -71,7 +78,7 @@ fn concurrent_allow_empty_commits_avoid_permission_errors() {
             "unexpected permission error: {text}"
         );
         match err {
-            Error::RefStore(store) => {
+            Error::Ref(RefError::Store(store)) => {
                 assert!(
                     matches!(
                         store,
@@ -81,7 +88,7 @@ fn concurrent_allow_empty_commits_avoid_permission_errors() {
                     "unexpected ref store error: {store:?}"
                 );
             }
-            Error::LockHeld { .. } => {}
+            Error::LockHeld(..) => {}
             other => panic!("unexpected concurrent commit error: {other:?}"),
         }
     }
@@ -131,7 +138,10 @@ fn concurrent_commit_while_index_and_ref_handles_open() {
                     );
                     req.author = Some(ident.clone());
                     req.committer = Some(ident.clone());
-                    if let Err(e) = create_commit(&repo, &req, &mut NullProgress, &NeverCancel) {
+                    if let Err(e) =
+                        repo.commits()
+                            .create_staged(&req, &mut NullProgress, &CancelToken::never())
+                    {
                         errors.push(e);
                     }
                 }
@@ -155,7 +165,7 @@ fn concurrent_commit_while_index_and_ref_handles_open() {
             "unexpected permission error: {text}"
         );
         match err {
-            Error::RefStore(store) => assert!(
+            Error::Ref(RefError::Store(store)) => assert!(
                 matches!(
                     store,
                     grit_lib::refs::store::RefStoreError::ExpectedMismatch { .. }
@@ -163,9 +173,9 @@ fn concurrent_commit_while_index_and_ref_handles_open() {
                 ),
                 "unexpected ref store error: {store:?}"
             ),
-            Error::LockHeld { .. } | Error::GitDirPathIo { .. } if err.is_git_dir_file_in_use() => {
-            }
-            Error::GitDirPathIo { .. } => {
+            Error::LockHeld(..) | Error::Repository(RepositoryError::GitDirPathIo(_))
+                if err.is_git_dir_file_in_use() => {}
+            Error::Repository(RepositoryError::GitDirPathIo(_)) => {
                 panic!("unexpected git-dir I/O (not in-use): {err:?}")
             }
             other => panic!("unexpected concurrent commit error: {other:?}"),

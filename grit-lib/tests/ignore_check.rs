@@ -8,6 +8,7 @@ mod t0008;
 use grit_lib::index::Index;
 use grit_lib::repo::Repository;
 use grit_lib::worktree::ignore::{IgnoreCheck, IgnoreSource};
+use grit_lib::worktree::WorktreeError;
 use t0008::{assert_match_eq, git_check_ignore_verbose_batch, t0008_corpus, T0008Repo};
 
 fn grit_ignore_check(repo: &Repository, index: &Index, paths: &[String]) -> Vec<IgnoreCheck> {
@@ -45,7 +46,7 @@ fn normalize_ignore_paths_preserves_boundaries_and_directory_hints() {
     for input in ["../../outside", "../a/../../outside"] {
         assert!(matches!(
             normalize_repo_relative(&repo, &cwd, input),
-            Err(grit_lib::error::Error::PathError(_))
+            Err(grit_lib::error::Error::Worktree(WorktreeError::Path { .. }))
         ));
     }
     let sibling = root.with_file_name(format!(
@@ -54,7 +55,7 @@ fn normalize_ignore_paths_preserves_boundaries_and_directory_hints() {
     ));
     assert!(matches!(
         normalize_repo_relative(&repo, &cwd, sibling.join("file").to_str().expect("path")),
-        Err(grit_lib::error::Error::PathError(_))
+        Err(grit_lib::error::Error::Worktree(WorktreeError::Path { .. }))
     ));
 }
 
@@ -77,7 +78,10 @@ fn normalized_ignore_query_keeps_symlink_spelling_and_matches_git() {
             .expect("normalize missing descendant lexically"),
         "ignored-link/missing.txt"
     );
-    let index = repo.index_handle().load().expect("index");
+    let index = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("index");
     let results = repo.ignore_check(&[path.clone()], &index).expect("check");
     let git = git_check_ignore_verbose_batch(&fx.home, root, &[&path]);
     assert_match_eq(&path, &git[&path], results[0].ignored, &results[0].matched);
@@ -106,7 +110,10 @@ fn normalize_ignore_query_accepts_macos_tmp_alias() {
 fn matches_git_check_ignore_verbose() {
     let fx = T0008Repo::setup();
     let repo = fx.open_grit();
-    let index = repo.index_handle().load().expect("index");
+    let index = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("index");
     let corpus = t0008_corpus();
     let paths: Vec<String> = corpus.iter().map(|(p, _)| (*p).to_owned()).collect();
     let path_refs: Vec<&str> = paths.iter().map(String::as_str).collect();
@@ -131,7 +138,10 @@ fn matches_git_check_ignore_verbose() {
 fn tracked_paths_never_ignored() {
     let fx = T0008Repo::setup();
     let repo = fx.open_grit();
-    let index = repo.index_handle().load().expect("index");
+    let index = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("index");
     for path in ["ignored-but-in-index", "a/ignored-but-in-index"] {
         let results = grit_ignore_check(&repo, &index, &[path.to_owned()]);
         assert_eq!(results.len(), 1);
@@ -180,7 +190,10 @@ fn trailing_slash_on_existing_file_matches_git() {
         &RepositoryOptions::empty().with_work_tree(&root),
     )
     .expect("open");
-    let index = repo.index_handle().load().expect("index");
+    let index = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("index");
 
     for path in ["untracked.txt/", "tracked.txt/"] {
         let git_map = git_check_ignore_verbose_batch(&home, &root, &[path]);
@@ -189,6 +202,48 @@ fn trailing_slash_on_existing_file_matches_git() {
             .unwrap_or_else(|| panic!("git missing {path}"));
         let results = grit_ignore_check(&repo, &index, &[path.to_owned()]);
         assert_eq!(results.len(), 1, "one result for {path}");
+        assert_match_eq(path, git, results[0].ignored, &results[0].matched);
+    }
+}
+
+#[test]
+fn root_anchored_star_suffix_matches_git_check_ignore() {
+    use std::fs;
+
+    use grit_lib::config::environment::RepositoryOptions;
+    use grit_test_support::unique_tmp;
+
+    let home = unique_tmp("ignore", "anchor-suffix-home");
+    let root = unique_tmp("ignore", "anchor-suffix");
+    fs::create_dir_all(&home).expect("home");
+    assert!(
+        t0008::hermetic_git(&home, &root, &["init"])
+            .status
+            .success(),
+        "git init"
+    );
+    fs::create_dir_all(root.join("sub")).expect("sub dir");
+    fs::write(root.join(".gitignore"), "/*.log\n").expect("gitignore");
+    fs::write(root.join("root.log"), b"a").expect("root.log");
+    fs::write(root.join("sub/nested.log"), b"b").expect("nested.log");
+
+    let repo = Repository::open(
+        &root.join(".git"),
+        &RepositoryOptions::empty().with_work_tree(&root),
+    )
+    .expect("open");
+    let index = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("index");
+
+    for path in ["root.log", "sub/nested.log"] {
+        let git_map = git_check_ignore_verbose_batch(&home, &root, &[path]);
+        let git = git_map
+            .get(path)
+            .unwrap_or_else(|| panic!("git missing {path}"));
+        let results = grit_ignore_check(&repo, &index, &[path.to_owned()]);
+        assert_eq!(results.len(), 1);
         assert_match_eq(path, git, results[0].ignored, &results[0].matched);
     }
 }
@@ -216,7 +271,10 @@ fn trailing_slash_directory_hint_matches_git() {
         &RepositoryOptions::empty().with_work_tree(&root),
     )
     .expect("open");
-    let index = repo.index_handle().load().expect("index");
+    let index = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("index");
     let path = "missing-dir/";
     let git_map = git_check_ignore_verbose_batch(&home, &root, &[path]);
     let git = git_map.get(path).expect("git result for missing-dir/");
@@ -235,7 +293,10 @@ fn trailing_slash_directory_hint_matches_git() {
 fn ignore_source_is_typed() {
     let fx = T0008Repo::setup();
     let repo = fx.open_grit();
-    let index = repo.index_handle().load().expect("index");
+    let index = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("index");
     let results = grit_ignore_check(
         &repo,
         &index,
@@ -266,4 +327,98 @@ fn ignore_source_is_typed() {
         nested.matched.as_ref().map(|m| &m.source),
         Some(IgnoreSource::PerDirectory(p)) if p == "a/.gitignore"
     ));
+}
+
+#[test]
+fn batch_over_many_nested_gitignores_matches_git_in_any_order() {
+    use std::fs;
+
+    use grit_lib::config::environment::RepositoryOptions;
+    use grit_test_support::unique_tmp;
+
+    let home = unique_tmp("ignore", "nested-batch-home");
+    let root = unique_tmp("ignore", "nested-batch");
+    fs::create_dir_all(&home).expect("home");
+    assert!(t0008::hermetic_git(&home, &root, &["init"])
+        .status
+        .success());
+    fs::write(
+        root.join(".gitignore"),
+        "*.o\n/target/\nbuild/\n*.log\n!keep.log\n**/cache/**\n*.sw[op]\nvendor\n!vendor/\n",
+    )
+    .expect("root gitignore");
+    fs::write(root.join(".git/info/exclude"), "*.local\nsrc/*.env\n").expect("info exclude");
+    fs::write(root.join("blob"), "x\n").expect("file ancestor");
+    let mut paths = vec![
+        "blob/a.o".to_owned(),
+        "blob/sub/a.c".to_owned(),
+        "target/x".to_owned(),
+        "src/target/x".to_owned(),
+        "src/.env".to_owned(),
+        "src/a.env".to_owned(),
+        "vendor/lib.rs".to_owned(),
+        "keep.log".to_owned(),
+    ];
+    for d in 0..12 {
+        let dir = format!("src/d{d:02}");
+        fs::create_dir_all(root.join(&dir).join("gen")).expect("dir");
+        fs::write(
+            root.join(&dir).join(".gitignore"),
+            format!("*.bak\nscratch-*\n!scratch-keep\ngen/\n!keep.log\n*.{d}\nnested/*.c\n"),
+        )
+        .expect("nested gitignore");
+        for name in [
+            "f.txt",
+            "f.o",
+            "f.bak",
+            "scratch-1",
+            "scratch-keep",
+            "gen/out.c",
+            "gen/keep.log",
+            "cache/x/y.dat",
+            "build/z",
+            "new.log",
+            "keep.log",
+            "nested/a.c",
+            "nested/deeper/a.c",
+            "a.swp",
+            "a.local",
+            "Build/z",
+        ] {
+            paths.push(format!("{dir}/{name}"));
+        }
+        paths.push(format!("{dir}/x.{d}"));
+        paths.push(format!("{dir}/gen/"));
+    }
+    // Interleave directories so the matcher keeps switching between cached states, and ask
+    // every path twice.
+    let mut interleaved: Vec<String> = Vec::new();
+    for i in 0..paths.len() {
+        interleaved.push(paths[(i * 7) % paths.len()].clone());
+    }
+    interleaved.sort_by_key(|p| p.rsplit('/').next().map(str::to_owned));
+    interleaved.extend(paths.iter().cloned());
+
+    let repo = Repository::open(
+        &root.join(".git"),
+        &RepositoryOptions::empty().with_work_tree(&root),
+    )
+    .expect("open");
+    let index = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("index");
+    let path_refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+    let git_map = git_check_ignore_verbose_batch(&home, &root, &path_refs);
+    let results = grit_ignore_check(&repo, &index, &interleaved);
+    assert_eq!(results.len(), interleaved.len());
+    let mut ignored = 0;
+    for result in &results {
+        let git = git_map
+            .get(&result.path)
+            .unwrap_or_else(|| panic!("git missing {}", result.path));
+        assert_match_eq(result.path, git, result.ignored, &result.matched);
+        ignored += usize::from(result.ignored);
+    }
+    assert!(ignored > results.len() / 2, "corpus should mostly ignore");
 }

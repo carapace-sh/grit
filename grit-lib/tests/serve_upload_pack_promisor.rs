@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::config::ConfigSet;
-use grit_lib::maintenance::{offload_blobs, OffloadOptions};
+use grit_lib::maintenance::OffloadOptions;
 use grit_lib::objects::index_pack::{ingest_received_pack, IngestPackOptions};
 use grit_lib::objects::promisor::{DefaultPromisorFetcher, PromisorFetcher};
 use grit_lib::objects::{ObjectId, ObjectKind};
@@ -20,11 +20,11 @@ use grit_lib::refs::ref_storage::RefStorageFormat;
 use grit_lib::remote::partial_clone::ObjectFilterSpec;
 use grit_lib::remote::pkt_line::{read_packet, Packet};
 use grit_lib::remote::serve::{
-    receive_pack, upload_pack, MissingObjectReason, ProtocolVersion, ReceiveOutcome, ReceivePolicy,
-    ServeError, ServeOptions,
+    MissingObjectReason, ProtocolVersion, ReceiveOutcome, ReceivePack, ReceivePolicy, ServeError,
+    ServeOptions, UploadPack,
 };
 use grit_lib::remote::transport::http::HttpClient;
-use grit_lib::remote::{HttpClientFactory, RemoteError, RemoteResult};
+use grit_lib::remote::{HttpClientFactory, RemoteError};
 use grit_lib::repo::{InitOptions, Repository};
 
 const BIG: usize = 20 * 1024;
@@ -33,12 +33,12 @@ const BIG: usize = 20 * 1024;
 struct NoHttp;
 
 impl HttpClientFactory for NoHttp {
-    fn create(&self, _: &ConfigSet) -> RemoteResult<Box<dyn HttpClient>> {
-        Err(RemoteError::UnsupportedScheme)
+    fn create(&self, _: &ConfigSet) -> grit_lib::error::Result<Box<dyn HttpClient>> {
+        Err(grit_lib::error::Error::from(RemoteError::UnsupportedScheme))
     }
 
-    fn create_for_probe(&self, _: &ConfigSet) -> RemoteResult<Box<dyn HttpClient>> {
-        Err(RemoteError::UnsupportedScheme)
+    fn create_for_preflight(&self, _: &ConfigSet) -> grit_lib::error::Result<Box<dyn HttpClient>> {
+        Err(grit_lib::error::Error::from(RemoteError::UnsupportedScheme))
     }
 }
 
@@ -62,6 +62,7 @@ fn init_bare(dir: &Path) -> Repository {
             .with_ref_storage(RefStorageFormat::Files),
     )
     .unwrap()
+    .0
 }
 
 /// A main repository (`main` holds a small and a 20 KiB blob) whose big blob was
@@ -109,7 +110,7 @@ impl Offloaded {
         let mut opts = OffloadOptions::new("lop", 1_700_000_000);
         opts.filter = Some(ObjectFilterSpec::BlobLimit(5 * 1024));
         opts.configure_lop = true;
-        let report = offload_blobs(&repo, &opts).expect("offload");
+        let report = repo.maintenance().offload_blobs(&opts).expect("offload");
         assert_eq!(report.dropped_from_main, 1);
         Self {
             _dir: dir,
@@ -230,9 +231,11 @@ fn serve(
     repo: &Repository,
     request: Vec<u8>,
     opts: &mut ServeOptions,
-) -> (Vec<u8>, Result<(), ServeError>) {
+) -> (Vec<u8>, grit_lib::error::Result<()>) {
     let mut out = Vec::new();
-    let result = upload_pack(repo, &mut Cursor::new(request), &mut out, opts).map(|_| ());
+    let result = UploadPack::new(repo, opts)
+        .run(&mut Cursor::new(request), &mut out)
+        .map(|_| ());
     (out, result)
 }
 
@@ -276,10 +279,10 @@ fn client_that_accepts_nothing_gets_an_err_line_naming_the_lop() {
     let (out, result) = serve(&repo, fetch_request(&[], &[want(fx.tip)]), &mut v2(false));
     assert!(matches!(
         result,
-        Err(ServeError::ObjectMissing {
+        Err(grit_lib::error::Error::Remote(grit_lib::remote::RemoteError::Serve(ServeError::ObjectMissing {
             oid,
             reason: MissingObjectReason::Promised
-        }) if oid == fx.big
+        }))) if oid == fx.big
     ));
     // Skip the advertisement; the response ends with the ERR line.
     let text = String::from_utf8_lossy(&out);
@@ -408,23 +411,25 @@ fn a_session_without_lazy_fetch_drops_the_repositorys_fetcher() {
     let repo = fx.open(Some(fetcher.clone()));
     let config = ConfigSet::new();
     let off = v2(true);
-    assert!(!off.attach_promisor_fetcher(&repo, &config, Some(fetcher.clone())));
+    assert!(!off.attach_promisor_fetcher(&repo, Some(fetcher.clone())));
     // Forcing lazy fetch afterwards finds no fetcher: the session's choice stuck.
     let mut forced = v2(false);
     forced.lazy_fetch = Some(true);
     let (_, result) = serve(&repo, fetch_request(&[], &[want(fx.tip)]), &mut forced);
     assert!(matches!(
         result,
-        Err(ServeError::ObjectMissing {
-            reason: MissingObjectReason::NoFetcher,
-            ..
-        })
+        Err(grit_lib::error::Error::Remote(
+            grit_lib::remote::RemoteError::Serve(ServeError::ObjectMissing {
+                reason: MissingObjectReason::NoFetcher,
+                ..
+            })
+        ))
     ));
     assert!(!repo.odb().exists_stored(&fx.big));
 
     let mut on = v2(true);
     on.lazy_fetch = Some(true);
-    assert!(on.attach_promisor_fetcher(&repo, &config, Some(fetcher)));
+    assert!(on.attach_promisor_fetcher(&repo, Some(fetcher)));
     let (out, result) = serve(&repo, fetch_request(&[], &[want(fx.tip)]), &mut on);
     result.unwrap();
     assert!(pack_objects(parse_v2(&out).pack.expect("pack")).contains(&fx.big));
@@ -450,10 +455,12 @@ fn lazy_fetch_without_a_fetcher_says_so() {
     let (_, result) = serve(&repo, fetch_request(&[], &[want(fx.tip)]), &mut opts);
     assert!(matches!(
         result,
-        Err(ServeError::ObjectMissing {
-            reason: MissingObjectReason::NoFetcher,
-            ..
-        })
+        Err(grit_lib::error::Error::Remote(
+            grit_lib::remote::RemoteError::Serve(ServeError::ObjectMissing {
+                reason: MissingObjectReason::NoFetcher,
+                ..
+            })
+        ))
     ));
 }
 
@@ -489,10 +496,12 @@ fn v0_client_is_told_on_the_error_band() {
     let (out, result) = serve(&repo, request, &mut opts);
     assert!(matches!(
         result,
-        Err(ServeError::ObjectMissing {
-            reason: MissingObjectReason::Promised,
-            ..
-        })
+        Err(grit_lib::error::Error::Remote(
+            grit_lib::remote::RemoteError::Serve(ServeError::ObjectMissing {
+                reason: MissingObjectReason::Promised,
+                ..
+            })
+        ))
     ));
     let text = String::from_utf8_lossy(&out);
     assert!(text.contains("\u{3}object"), "{text}");
@@ -514,10 +523,12 @@ fn v0_want_of_a_promised_blob_gets_an_err_line() {
     let (out, result) = serve(&repo, request, &mut opts);
     assert!(matches!(
         result,
-        Err(ServeError::ObjectMissing {
-            reason: MissingObjectReason::Promised,
-            ..
-        })
+        Err(grit_lib::error::Error::Remote(
+            grit_lib::remote::RemoteError::Serve(ServeError::ObjectMissing {
+                reason: MissingObjectReason::Promised,
+                ..
+            })
+        ))
     ));
     let mut reader = Cursor::new(out);
     match read_packet(&mut reader).unwrap() {
@@ -556,10 +567,10 @@ fn a_truly_missing_blob_is_not_promised() {
     );
     assert!(matches!(
         result,
-        Err(ServeError::ObjectMissing {
+        Err(grit_lib::error::Error::Remote(grit_lib::remote::RemoteError::Serve(ServeError::ObjectMissing {
             oid,
             reason: MissingObjectReason::NotPromised
-        }) if oid == ghost
+        }))) if oid == ghost
     ));
 }
 
@@ -583,7 +594,9 @@ fn repositories_without_promisor_remotes_keep_the_old_path() {
     let repo = Repository::open(dir.path(), &RepositoryOptions::empty().for_serving()).unwrap();
     let (_, result) = serve(&repo, fetch_request(&[], &[want(tip)]), &mut v2(false));
     match result {
-        Err(ServeError::ObjectMissing { .. }) => panic!("planner ran for an ordinary repository"),
+        Err(grit_lib::error::Error::Remote(grit_lib::remote::RemoteError::Serve(
+            ServeError::ObjectMissing { .. },
+        ))) => panic!("planner ran for an ordinary repository"),
         Err(_) => {}
         Ok(()) => panic!("a missing blob cannot be served"),
     }
@@ -634,18 +647,19 @@ fn environment_maps_git_no_lazy_fetch() {
 
 #[test]
 fn fsck_of_an_offloaded_repository_never_fetches() {
-    use grit_lib::maintenance::repository_fsck::{fsck, FsckOptions};
+    use grit_lib::maintenance::repository_fsck::FsckOptions;
     let fx = Offloaded::new();
     // A fetcher is installed, as the CLI does for every command; fsck must not use it.
     let fetcher: Arc<dyn PromisorFetcher> = Arc::new(DefaultPromisorFetcher::new(Arc::new(NoHttp)));
     let repo = fx.open(Some(fetcher));
-    let report = fsck(
-        &repo,
-        &FsckOptions::default(),
-        &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .unwrap();
+    let report = repo
+        .maintenance()
+        .fsck(
+            &FsckOptions::default(),
+            &mut grit_lib::progress::NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .unwrap();
     assert!(report.issues.is_empty(), "{:?}", report.issues);
     assert!(
         !repo.odb().exists_stored(&fx.big),
@@ -698,14 +712,9 @@ fn push_edit(fx: &Offloaded, extra: Option<(&str, ObjectId)>) -> (ObjectId, Rece
     };
     let repo = fx.open(None);
     let mut out = Vec::new();
-    let outcome = receive_pack(
-        &repo,
-        &mut Cursor::new(body),
-        &mut out,
-        &opts,
-        &ReceivePolicy::default(),
-    )
-    .unwrap();
+    let outcome = ReceivePack::new(&repo, &opts, &ReceivePolicy::default())
+        .run(&mut Cursor::new(body), &mut out)
+        .unwrap();
     (commit, outcome)
 }
 
@@ -720,19 +729,20 @@ fn small_push_naming_an_offloaded_blob_is_accepted() {
     );
     let repo = fx.open(None);
     assert_eq!(
-        grit_lib::refs::resolve_ref(repo.git_dir(), "refs/heads/main").unwrap(),
+        repo.references().resolve("refs/heads/main").unwrap(),
         commit
     );
     assert!(!repo.odb().exists_stored(&fx.big), "nothing was fetched");
 
     // fsck accepts the pushed tree's promised blob (Git's is_promisor_object).
-    let report = grit_lib::maintenance::repository_fsck::fsck(
-        &repo,
-        &grit_lib::maintenance::repository_fsck::FsckOptions::default(),
-        &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .unwrap();
+    let report = repo
+        .maintenance()
+        .fsck(
+            &grit_lib::maintenance::repository_fsck::FsckOptions::default(),
+            &mut grit_lib::progress::NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .unwrap();
     assert!(report.issues.is_empty(), "{:?}", report.issues);
 
     // An accepting client still gets the new tip without the blob.

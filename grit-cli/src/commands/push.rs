@@ -3,68 +3,27 @@
 use anyhow::{Context, Result};
 use grit_lib::config::ConfigSet;
 use grit_lib::objects::ObjectId;
+use grit_lib::progress::CancelToken;
 use grit_lib::remote::push_plan::{
-    apply_set_upstream_after_push, expand_repository_shorthand, load_push_plan_context,
-    open_push_destination, parse_force_mode, push_follow_tags_config, resolve_push,
-    resolve_push_invocation, PushPlanError, PushPlanKind, PushRequest,
+    expand_repository_shorthand, open_push_destination, push_follow_tags_config,
+    resolve_push_invocation, PushPlanKind, PushRequest,
 };
 use grit_lib::remote::push_report::PushRefStatus;
+use grit_lib::remote::redact_url_for_display;
 use grit_lib::remote::transfer::PushOptions;
 use grit_lib::remote::DefaultHttpClientFactory;
-use schemars::JsonSchema;
-use serde::Serialize;
-use std::io::Write;
 
 use crate::commands::auth;
 use crate::commands::fetch::map_remote_error;
 use crate::context;
-use crate::markdown;
-use crate::output::{outln, HumanRender, MarkdownRender, OutputMode, RenderContext};
+use crate::progress::summary::{transfer_header, TransferSummary};
 use crate::progress::TerminalProgress;
 use crate::quiet_args::QuietArgs;
-use grit_lib::progress::NeverCancel;
-
-/// Result of `grit push`: the per-ref outcomes for the remote.
-#[derive(Serialize, JsonSchema)]
-pub struct PushOutcome {
-    pub remote: String,
-    /// High-level push kind (`branch`, `tags`, `delete`, `refspecs`).
-    pub kind: PushKind,
-    /// Local branch short name when [`Self::kind`] is `branch` or `delete` (legacy `branch` field).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schemars(skip_serializing_if = "Option::is_none")]
-    pub branch: Option<String>,
-    /// Short ref name for human and markdown summaries (branch, tag, or `--tags`).
-    #[serde(skip)]
-    #[schemars(skip)]
-    pub summary_label: Option<String>,
-    pub results: Vec<PushRefResult>,
-    pub rejected: bool,
-    /// True when `--dry-run` was used (no refs or objects written).
-    pub dry_run: bool,
-    /// Branch short names whose upstream was configured (`-u` / `--set-upstream`).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schemars(skip_serializing_if = "Option::is_none")]
-    pub upstream_set: Option<Vec<String>>,
-    /// URL saved as `origin`: a `<owner>/<project>` push from a repository with no remotes.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schemars(skip_serializing_if = "Option::is_none")]
-    pub origin_added: Option<String>,
-    /// Hook and diagnostic lines from the remote (`remote: …` in human output).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    #[schemars(skip_serializing_if = "Vec::is_empty")]
-    pub remote_messages: Vec<String>,
-}
-
-/// JSON classification for [`PushOutcome`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum PushKind {
-    Branch,
-    Tags,
-    Delete,
-    Refspecs,
-}
+pub use crate::render::push::{
+    PushKind, PushOutcome, PushRefOutcomeStatus, PushRefResult, PushSharedBranch,
+    PushedToIntegrated,
+};
+use grit_lib::remote::transfer::TransferStats;
 
 impl From<PushPlanKind> for PushKind {
     fn from(k: PushPlanKind) -> Self {
@@ -77,15 +36,6 @@ impl From<PushPlanKind> for PushKind {
     }
 }
 
-/// Per-ref push status in JSON (`ok`, `up_to_date`, or `rejected`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum PushRefOutcomeStatus {
-    Ok,
-    UpToDate,
-    Rejected,
-}
-
 impl From<&PushRefStatus> for PushRefOutcomeStatus {
     fn from(status: &PushRefStatus) -> Self {
         match status {
@@ -93,110 +43,6 @@ impl From<&PushRefStatus> for PushRefOutcomeStatus {
             PushRefStatus::UpToDate => Self::UpToDate,
             _ => Self::Rejected,
         }
-    }
-}
-
-/// One ref's push result.
-#[derive(Serialize, JsonSchema)]
-pub struct PushRefResult {
-    #[serde(rename = "ref")]
-    pub ref_name: String,
-    pub status: PushRefOutcomeStatus,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schemars(skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schemars(skip_serializing_if = "Option::is_none")]
-    pub old_oid: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schemars(skip_serializing_if = "Option::is_none")]
-    pub new_oid: Option<String>,
-    pub forced: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schemars(skip_serializing_if = "Option::is_none")]
-    pub src: Option<String>,
-    /// True when this ref was deleted on the remote (omit when false).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schemars(skip_serializing_if = "Option::is_none")]
-    pub deleted: Option<bool>,
-}
-
-/// Short display name for a pushed remote ref (`refs/heads/foo` → `foo`).
-pub(crate) fn ref_short_display(full_ref: &str) -> &str {
-    for prefix in ["refs/heads/", "refs/tags/", "refs/remotes/"] {
-        if let Some(rest) = full_ref.strip_prefix(prefix) {
-            return rest;
-        }
-    }
-    full_ref
-}
-
-impl HumanRender for PushOutcome {
-    fn render_human(&self, w: &mut dyn Write, _ctx: &RenderContext) -> Result<()> {
-        let label = match (self.summary_label.as_deref(), self.kind) {
-            (Some(b), _) => b,
-            (_, PushKind::Tags) => "--tags",
-            (_, PushKind::Delete) => "--delete",
-            _ => "refs",
-        };
-        for result in &self.results {
-            let target = format!("{} {}", self.remote, result.ref_name);
-            match result.status {
-                PushRefOutcomeStatus::Ok => {
-                    if result.deleted == Some(true) {
-                        let short = ref_short_display(&result.ref_name);
-                        if self.dry_run {
-                            outln!(w, "  would delete {short} from {}", self.remote);
-                        } else {
-                            outln!(w, "  deleted {short} from {}", self.remote);
-                        }
-                    } else if self.dry_run {
-                        outln!(w, "  would push {label} → {target}");
-                    } else {
-                        outln!(w, "  pushed {label} → {target}");
-                    }
-                }
-                PushRefOutcomeStatus::UpToDate => outln!(w, "  {target} already up to date"),
-                PushRefOutcomeStatus::Rejected => {
-                    let detail = result.reason.as_deref().unwrap_or("rejected");
-                    if detail == "stale" {
-                        outln!(
-                            w,
-                            "  rejected {target}: stale remote ref — run `grit fetch` and try again"
-                        );
-                    } else if detail == "remote_ref_missing" {
-                        outln!(w, "  rejected {target}: remote ref does not exist");
-                    } else if detail == "already_exists" {
-                        outln!(
-                            w,
-                            "  rejected {target}: created on the remote meanwhile — run `grit fetch` and try again"
-                        );
-                    } else {
-                        outln!(w, "  rejected {target}: {detail}");
-                    }
-                }
-            }
-        }
-        if let Some(url) = &self.origin_added {
-            outln!(w, "  added remote origin → {url}");
-        }
-        Ok(())
-    }
-}
-
-impl MarkdownRender for PushOutcome {
-    fn render_markdown(&self, w: &mut dyn Write, _ctx: &RenderContext) -> Result<()> {
-        let label = self
-            .summary_label
-            .as_deref()
-            .or(self.branch.as_deref())
-            .unwrap_or("refs");
-        markdown::print_remote_push_messages(w, &self.remote_messages)?;
-        markdown::print_push_results(w, &self.remote, label, self.dry_run, &self.results)?;
-        if let Some(url) = &self.origin_added {
-            writeln!(w, "\nAdded remote `origin` → `{url}`.")?;
-        }
-        Ok(())
     }
 }
 
@@ -214,6 +60,9 @@ struct PushWireOptions<'a> {
 pub fn run(
     tags: bool,
     delete_refs: bool,
+    all: bool,
+    mirror: bool,
+    prune: bool,
     remote_flag: Option<String>,
     positionals: &[String],
     dry_run: bool,
@@ -224,12 +73,19 @@ pub fn run(
     push_options: &[String],
     follow_tags: bool,
     quiet: &QuietArgs,
-    mode: OutputMode,
+    human_interactive: bool,
     no_verify: bool,
 ) -> Result<PushOutcome> {
     let repo = context::discover()?;
-    let config = ConfigSet::load(&crate::context::environment(), Some(repo.git_dir()), true)
-        .context("could not load config")?;
+    let config = ConfigSet::load(
+        &crate::context::environment(),
+        Some(repo.git_dir()),
+        &grit_lib::config::LoadConfigOptions::standard(
+            &crate::context::environment(),
+            Some(repo.git_dir()),
+        ),
+    )
+    .context("could not load config")?;
 
     // `grit push <owner>/<project> main` pushes to that repository on the default grit host.
     let shorthand_url = remote_flag
@@ -244,11 +100,15 @@ pub fn run(
         .map_err(plan_error)?;
 
     let factory = crate::context::http_client_factory();
-    let plan_ctx =
-        load_push_plan_context(&repo, &config, invocation.remote.as_deref(), Some(&factory))
-            .map_err(plan_error)?;
+    let plan_ctx = repo
+        .remotes()
+        .push_plan_context(invocation.remote.as_deref(), Some(&factory))
+        .map_err(plan_error)?;
 
-    let force_mode = parse_force_mode(&repo, force, force_with_lease).map_err(plan_error)?;
+    let force_mode = repo
+        .remotes()
+        .force_mode(force, force_with_lease)
+        .map_err(plan_error)?;
 
     let follow = follow_tags || push_follow_tags_config(&config);
 
@@ -261,9 +121,39 @@ pub fn run(
         force: force_mode,
         follow_tags: follow,
         set_upstream,
+        all,
+        mirror,
+        prune,
     };
 
-    let plan = resolve_push(&repo, &config, &push_request, &plan_ctx).map_err(plan_error)?;
+    let mut plan = repo
+        .remotes()
+        .resolve_push(&push_request, &plan_ctx)
+        .map_err(plan_error)?;
+    // Your head of a shared branch is yours alone (grit share): replacing it
+    // after an amend or rebase needs no --force, only that it still be the
+    // head this clone last fetched.
+    for spec in plan.specs.iter_mut() {
+        let shared = spec
+            .dst
+            .strip_prefix("refs/heads/")
+            .is_some_and(|b| crate::commands::sync::is_shared(&config, b));
+        if shared && !spec.force && !spec.delete {
+            // A clone of an organization's project pushes `origin` to your
+            // space (its pushurl), which the `space` remote fetches.
+            let space = crate::commands::sync::SPACE_REMOTE;
+            let pushurl =
+                crate::context::config_string(&config, &format!("remote.{}.pushurl", plan.remote));
+            let tracking = if pushurl.is_some()
+                && pushurl == crate::context::config_string(&config, &format!("remote.{space}.url"))
+            {
+                space
+            } else {
+                plan.remote.as_str()
+            };
+            repo.remotes().apply_tracking_lease(tracking, spec);
+        }
+    }
 
     let wire = PushWireOptions {
         dry_run,
@@ -272,7 +162,21 @@ pub fn run(
         remote_ref_tips: plan_ctx.remote_tips,
         no_verify,
     };
-    let mut progress = quiet.progress(mode);
+    let _interrupt = crate::interrupt::InterruptCancel::install();
+    let mut progress = quiet.progress(human_interactive).with_overall(false);
+    let url = crate::context::config_string(&config, &format!("remote.{}.url", plan.remote))
+        .or_else(|| shorthand_url.clone());
+    if progress.is_drawing() {
+        eprintln!(
+            "{}",
+            transfer_header(
+                "Pushing",
+                &plan.remote,
+                url.as_deref(),
+                progress.uses_color()
+            )
+        );
+    }
     let report = match push_once(
         &repo,
         &config,
@@ -281,12 +185,13 @@ pub fn run(
         &wire,
         &factory,
         &mut progress,
+        &crate::interrupt::process_cancel_token(),
     ) {
         Ok(report) => report,
         Err(err) => {
-            let url = config
-                .get(&format!("remote.{}.url", plan.remote))
-                .unwrap_or_default();
+            let url =
+                crate::context::config_string(&config, &format!("remote.{}.url", plan.remote))
+                    .unwrap_or_default();
             if auth::offer_reauth(&err, &url)? {
                 push_once(
                     &repo,
@@ -296,6 +201,7 @@ pub fn run(
                     &wire,
                     &factory,
                     &mut progress,
+                    &crate::interrupt::process_cancel_token(),
                 )?
             } else {
                 return Err(err);
@@ -303,22 +209,16 @@ pub fn run(
         }
     };
 
-    let upstream_set = apply_set_upstream_after_push(
-        &repo,
-        &plan.remote,
-        push_request.set_upstream,
-        dry_run,
-        &plan.specs,
-        &report.results,
-    )
-    .map_err(|e| anyhow::Error::msg(e.to_string()))?;
+    let upstream_set = if push_request.set_upstream && !dry_run {
+        repo.remotes()
+            .set_upstream_after_push(&plan.remote, &plan.specs, &report.results)
+            .map_err(|e| anyhow::Error::msg(e.to_string()))?
+    } else {
+        Vec::new()
+    };
 
-    let pushed = report
-        .results
-        .iter()
-        .any(|r| matches!(r.status, PushRefStatus::Ok));
     let origin_added = match shorthand_url {
-        Some(url) if pushed && !dry_run => repo
+        Some(url) if report.has_updates() && !dry_run => repo
             .remotes()
             .add_origin_if_none(&url)
             .map_err(map_remote_error)?
@@ -326,8 +226,8 @@ pub fn run(
         _ => None,
     };
 
-    let mut rejected = false;
-    let results = report
+    let rejected = report.has_rejections();
+    let results: Vec<PushRefResult> = report
         .results
         .iter()
         .map(|result| {
@@ -335,30 +235,27 @@ pub fn run(
             let reason = match result.status {
                 PushRefStatus::Ok | PushRefStatus::UpToDate => None,
                 PushRefStatus::RejectNonFastForward => {
-                    rejected = true;
                     Some("not a fast-forward — run `grit pull` first".to_owned())
                 }
-                PushRefStatus::RejectStale => {
-                    rejected = true;
-                    Some("stale".to_owned())
-                }
-                PushRefStatus::RejectRemoteRefMissing => {
-                    rejected = true;
-                    Some("remote_ref_missing".to_owned())
-                }
+                PushRefStatus::RejectNeedsForce => Some(
+                    "not a fast-forward — run `grit push --force-with-lease` after integrating, or `grit pull` first"
+                        .to_owned(),
+                ),
+                PushRefStatus::RejectStale => Some("stale".to_owned()),
+                PushRefStatus::RejectRemoteRefMissing => Some("remote_ref_missing".to_owned()),
                 PushRefStatus::RejectAlreadyExists => {
-                    rejected = true;
-                    Some("already_exists".to_owned())
+                    if result.message.as_deref() == Some("tag already exists") {
+                        Some("tag_exists".to_owned())
+                    } else {
+                        Some("already_exists".to_owned())
+                    }
                 }
-                _ => {
-                    rejected = true;
-                    Some(
-                        result
-                            .message
-                            .clone()
-                            .unwrap_or_else(|| "rejected".to_owned()),
-                    )
-                }
+                _ => Some(
+                    result
+                        .message
+                        .clone()
+                        .unwrap_or_else(|| "rejected".to_owned()),
+                ),
             };
             PushRefResult {
                 ref_name: result.remote_ref.clone(),
@@ -369,32 +266,184 @@ pub fn run(
                 forced: result.forced,
                 src: result.local_ref.clone(),
                 deleted: result.deletion.then_some(true),
+                detail: result.status.clone(),
             }
         })
         .collect();
 
-    let summary_label = plan.branch_label.clone();
     let branch = match plan.kind {
         PushPlanKind::Branch | PushPlanKind::Delete => plan.branch_label,
         _ => None,
     };
 
+    // After replacing your head of a shared branch, see where the others are.
+    let mut shared = Vec::new();
+    let mut pushed_to_integrated = Vec::new();
+    if !dry_run {
+        for result in &results {
+            let Some(name) = result.ref_name.strip_prefix("refs/heads/") else {
+                continue;
+            };
+            let pushed = matches!(
+                result.status,
+                PushRefOutcomeStatus::Ok | PushRefOutcomeStatus::UpToDate
+            );
+            if !pushed || result.deleted == Some(true) {
+                continue;
+            }
+            // A branch made again: was it shared, and integrated since?
+            if result.old_oid.is_none() {
+                if let Some(report) = integrated_again(&repo, &config, &plan.remote, name) {
+                    let _ = crate::commands::sync::unmark_shared(&repo, name);
+                    pushed_to_integrated.push(PushedToIntegrated {
+                        branch: name.to_owned(),
+                        report,
+                    });
+                    continue;
+                }
+            }
+            if !crate::commands::sync::is_shared(&config, name) {
+                continue;
+            }
+            let space = crate::commands::sync::SPACE_REMOTE;
+            let pushurl =
+                crate::context::config_string(&config, &format!("remote.{}.pushurl", plan.remote));
+            let tracking = if pushurl.is_some()
+                && pushurl == crate::context::config_string(&config, &format!("remote.{space}.url"))
+            {
+                space.to_owned()
+            } else {
+                plan.remote.clone()
+            };
+            if crate::commands::sync::fetch_shared_heads(&repo, &tracking, false).is_err() {
+                continue;
+            }
+            let heads_now =
+                |ours: Option<ObjectId>| -> Vec<crate::render::shared_branch::SharedHead> {
+                    crate::commands::sync::shared_heads(&repo, &tracking, name)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|(user, tip)| {
+                            crate::commands::sync::SharedHead::new(
+                                &repo, &tracking, name, user, ours, tip,
+                            )
+                        })
+                        .collect()
+                };
+            let mut ours = repo.references().resolve(format!("refs/heads/{name}")).ok();
+            let mut heads = heads_now(ours);
+            // Heads that go together with yours without losing anything:
+            // combine them here, and push the result.
+            let mut combined = Vec::new();
+            for h in &heads {
+                let (Some(mine), Some(d)) = (ours, &h.divergence) else {
+                    continue;
+                };
+                if d.needs_decision {
+                    continue;
+                }
+                let Ok(tip) = h.tip.parse::<ObjectId>() else {
+                    continue;
+                };
+                if let Some(head) =
+                    crate::commands::share::auto_combine(&repo, &tracking, name, &h.user, mine, tip)
+                {
+                    ours = Some(head);
+                    combined.push(h.user.clone());
+                }
+            }
+            let mut head = None;
+            if !combined.is_empty() {
+                let again = crate::commands::sync::push(&plan.remote, &[name.to_owned()], false)?;
+                if let Some(Some(why)) = again.get(name) {
+                    anyhow::bail!(
+                        "combined {name} with {}'s head here, but pushing it was refused: {why}",
+                        combined.join(" and ")
+                    );
+                }
+                head = ours.map(|o| o.to_hex());
+                heads = heads_now(ours);
+            }
+            shared.push(PushSharedBranch {
+                branch: name.to_owned(),
+                heads,
+                combined,
+                head,
+            });
+        }
+    }
+
+    let mut transfer = TransferSummary::new(
+        push_transfer_stats(progress.phases(), &report.sent),
+        progress.phases().to_vec(),
+        progress.elapsed(),
+    );
+    transfer.transfer_sent = true;
+
     Ok(PushOutcome {
-        remote: plan.remote,
+        remote: redact_url_for_display(&plan.remote),
         kind: plan.kind.into(),
         branch,
-        summary_label,
         results,
         rejected,
         dry_run,
         upstream_set: (!upstream_set.is_empty()).then_some(upstream_set),
         origin_added,
         remote_messages: report.remote_messages,
+        shared,
+        pushed_to_integrated,
+        transfer,
     })
 }
 
-fn plan_error(err: PushPlanError) -> anyhow::Error {
+/// When `branch`, just made on `remote`, was shared there and integrated
+/// since, and brings integrated commits: the report. Asking the server is
+/// best-effort; a push never fails on it.
+fn integrated_again(
+    repo: &grit_lib::repo::Repository,
+    config: &ConfigSet,
+    remote: &str,
+    branch: &str,
+) -> Option<crate::render::shared_branch::IntegratedJson> {
+    let url = crate::context::config_string(config, &format!("remote.{remote}.pushurl"))
+        .or_else(|| crate::context::config_string(config, &format!("remote.{remote}.url")))?;
+    let (server, project) = grit_lib::remote::grit_server_space::hosted_project(&url)?;
+    let tip = repo
+        .references()
+        .resolve(format!("refs/heads/{branch}"))
+        .ok()?;
+    crate::commands::share::integrated_on(repo, config, &server, &project, branch, tip)
+        .ok()
+        .flatten()
+}
+
+fn plan_error(err: grit_lib::error::Error) -> anyhow::Error {
     anyhow::Error::new(err)
+}
+
+fn push_transfer_stats(
+    records: &[crate::progress::PhaseRecord],
+    sent: &TransferStats,
+) -> TransferStats {
+    use grit_lib::progress::{ProgressPhase, ProgressUnit};
+    let mut objects = 0u64;
+    let mut bytes = 0u64;
+    for rec in records {
+        match (rec.phase, rec.unit) {
+            (ProgressPhase::CopyingObjects, ProgressUnit::Objects) => {
+                objects = objects.max(rec.count);
+            }
+            (ProgressPhase::SendingObjects, ProgressUnit::Bytes) => {
+                bytes = bytes.max(rec.count);
+            }
+            _ => {}
+        }
+    }
+    TransferStats {
+        objects: objects.max(sent.objects),
+        bytes: bytes.max(sent.bytes),
+        kinds: sent.kinds,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -406,6 +455,7 @@ fn push_once(
     wire: &PushWireOptions<'_>,
     factory: &DefaultHttpClientFactory,
     progress: &mut TerminalProgress,
+    cancel: &CancelToken,
 ) -> Result<grit_lib::remote::transfer::PushOutcome> {
     let remote = open_push_destination(config, remote_name).map_err(map_remote_error)?;
     let options = PushOptions {
@@ -413,38 +463,10 @@ fn push_once(
         atomic: wire.atomic,
         push_options: wire.push_options.to_vec(),
         remote_ref_tips: wire.remote_ref_tips.clone(),
-        tracking_remote: Some(remote_name.to_owned()),
         no_verify: wire.no_verify,
         ..Default::default()
     };
     remote
-        .push(repo, specs, options, progress, &NeverCancel, Some(factory))
+        .push(repo, specs, options, progress, cancel, Some(factory))
         .map_err(map_remote_error)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn push_status_serializes_snake_case() {
-        for (status, expected) in [
-            (PushRefOutcomeStatus::Ok, "ok"),
-            (PushRefOutcomeStatus::UpToDate, "up_to_date"),
-            (PushRefOutcomeStatus::Rejected, "rejected"),
-        ] {
-            let result = PushRefResult {
-                ref_name: "refs/heads/main".to_owned(),
-                status,
-                reason: None,
-                old_oid: None,
-                new_oid: None,
-                forced: false,
-                src: None,
-                deleted: None,
-            };
-            let value = serde_json::to_value(&result).expect("json");
-            assert_eq!(value["status"].as_str(), Some(expected));
-        }
-    }
 }

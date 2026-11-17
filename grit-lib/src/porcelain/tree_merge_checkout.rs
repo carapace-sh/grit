@@ -3,6 +3,7 @@
 //! Pick and revert already computed [`TreeMergeOutput`]; this module reuses that result for
 //! untracked guards, worktree checkout, and sparse index updates instead of separate full-tree diffs.
 
+use crate::worktree::WorktreeError;
 use std::collections::{BTreeSet, HashSet};
 
 use crate::diff::{diff_trees, diff_trees_with_index, DiffEntry, DiffStatus};
@@ -22,8 +23,9 @@ use crate::porcelain::worktree_guard::{
     collect_untracked_for_tree_changes, ensure_no_untracked_overwrite, load_worktree_snapshot,
     WorktreeSnapshot,
 };
-use crate::progress::{poll_cancel, Cancel, ProgressSink};
+use crate::progress::{poll_cancel, CancelToken, ProgressSink};
 use crate::repo::Repository;
+use crate::repo::RepositoryError;
 use crate::worktree_rules::WorktreeRules;
 
 fn tree_changes_for_clean_merge_with_snapshot(
@@ -48,6 +50,7 @@ fn tree_changes_for_clean_merge_with_snapshot(
             Some(&to_tree),
             "",
             true,
+            None,
         )
     } else {
         diff_trees(repo.odb(), Some(from_tree), Some(&to_tree), "")
@@ -67,7 +70,7 @@ pub(crate) fn apply_clean_tree_merge_to_worktree(
     from_tree: &ObjectId,
     merged: &TreeMergeOutput,
     progress: &mut dyn ProgressSink,
-    cancel: &dyn Cancel,
+    cancel: &CancelToken,
 ) -> Result<()> {
     let mut snapshot = load_worktree_snapshot(repo)?;
     apply_clean_tree_merge_to_worktree_with_snapshot(
@@ -87,9 +90,9 @@ pub(crate) fn apply_clean_tree_merge_to_worktree_with_snapshot(
     merged: &TreeMergeOutput,
     snapshot: &mut WorktreeSnapshot,
     progress: &mut dyn ProgressSink,
-    cancel: &dyn Cancel,
+    cancel: &CancelToken,
 ) -> Result<()> {
-    let work_tree = repo.work_tree().ok_or(Error::RequiresWorkTree)?;
+    let work_tree = repo.work_tree().ok_or(RepositoryError::RequiresWorkTree)?;
     let tree_changes =
         tree_changes_for_clean_merge_with_snapshot(repo, from_tree, merged, snapshot)?;
     let untracked =
@@ -170,17 +173,19 @@ pub(crate) fn apply_conflict_tree_merge_to_worktree(
     materialized: &ObjectId,
     conflict_paths: &BTreeSet<Vec<u8>>,
     progress: &mut dyn ProgressSink,
-    cancel: &dyn Cancel,
+    cancel: &CancelToken,
 ) -> Result<()> {
-    let work_tree = repo.work_tree().ok_or(Error::RequiresWorkTree)?;
+    let work_tree = repo.work_tree().ok_or(RepositoryError::RequiresWorkTree)?;
     let prepared =
         prepare_tree_transition_allow_local(repo, Some(head_tree), materialized, &HashSet::new())
             .map_err(|err| match err {
-            TreeTransitionPrepareError::OverwritePaths(paths) => Error::WouldOverwrite {
-                reason: crate::error::OverwriteReason::LocalChanges,
-                paths,
-                message: "local changes would be overwritten by merge".into(),
-            },
+            TreeTransitionPrepareError::OverwritePaths(paths) => {
+                Error::Worktree(WorktreeError::WouldOverwrite {
+                    reason: crate::error::OverwriteReason::LocalChanges,
+                    paths,
+                    message: "local changes would be overwritten by merge".into(),
+                })
+            }
             TreeTransitionPrepareError::Failed(err) => err,
         })?;
 

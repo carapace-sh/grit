@@ -22,6 +22,8 @@ use crate::config::parse_git_config_maybe_bool;
 use crate::diagnostics::{DiagnosticsHandle, NullDiagnostics};
 use crate::git_date::tm::{local_tzoffset_with_tz, TzHhmm};
 use crate::ident_resolve::IdentityEnv;
+use crate::ownership_check::{default_ownership_check, is_default_ownership_check, OwnershipCheck};
+use crate::reftable::ReftableWriteOptions;
 
 /// Discovery and config variables that affect repository open/discover and `ConfigSet` loading.
 ///
@@ -48,6 +50,14 @@ pub struct Environment {
     /// When false, opportunistic index updates that take optional locks are skipped (Git
     /// `GIT_OPTIONAL_LOCKS=0` / `--no-optional-locks`). Defaults to true when unset.
     pub git_optional_locks: bool,
+    /// `GIT_LITERAL_PATHSPECS` — argv pathspecs treat `*` and `?` as literal.
+    pub git_literal_pathspecs: bool,
+    /// `GIT_GLOB_PATHSPECS` — argv pathspecs are globs.
+    pub git_glob_pathspecs: bool,
+    /// `GIT_NOGLOB_PATHSPECS` — disable glob interpretation in argv pathspecs.
+    pub git_noglob_pathspecs: bool,
+    /// `GIT_ICASE_PATHSPECS` — case-fold argv pathspec patterns.
+    pub git_icase_pathspecs: bool,
     /// Override for `GIT_ALTERNATE_OBJECT_DIRECTORIES` when set (see Git environment variable of the same name).
     pub git_alternate_object_directories: Option<String>,
     /// Override for `GIT_OBJECT_DIRECTORY` when set (see Git environment variable of the same name).
@@ -55,7 +65,7 @@ pub struct Environment {
     /// When set, a [`Repository`](crate::repo::Repository) opened with this environment reads
     /// and writes objects in this directory instead of `<git-dir>/objects` (a relative path
     /// resolves against [`Self::cwd`]). The directory must exist, or opening fails with
-    /// [`Error::NotARepository`](crate::error::Error::NotARepository); an empty value fails
+    /// [`RepositoryError::NotARepository`](crate::repo::RepositoryError::NotARepository); an empty value fails
     /// the same way, as in Git. `<git-dir>/objects` is not consulted unless it is listed in
     /// [`Self::git_alternate_object_directories`] or in this directory's `info/alternates`.
     pub git_object_directory: Option<String>,
@@ -91,24 +101,10 @@ pub struct Environment {
     pub git_exec_path: Option<OsString>,
     /// `$PWD` when set (symlink-preserving absolute path for include matching).
     pub pwd: Option<String>,
-    /// Override for `GIT_TEST_ASSUME_DIFFERENT_OWNER` when set (see Git environment variable of the same name).
-    pub git_test_assume_different_owner: Option<String>,
-    /// When true, relaxes safe-directory checks for debugging.
-    pub grit_debug_safe_dir: bool,
-    /// Override for `GIT_TRACE_SETUP` when set (see Git environment variable of the same name).
-    pub git_trace_setup: Option<String>,
-    /// Override for `GIT_TRACE2_PERF` when set (see Git environment variable of the same name).
-    pub git_trace2_perf: Option<String>,
     /// Original working directory of the `grit` invocation (for messages).
     pub grit_invocation_cwd: Option<String>,
     /// Override for `SUDO_UID` when set (see Git environment variable of the same name).
     pub sudo_uid: Option<String>,
-    /// Override for `GIT_TEST_UTF8_NFD_TO_NFC` when set (see Git environment variable of the same name).
-    pub git_test_utf8_nfd_to_nfc: Option<String>,
-    /// Override for `GIT_TEST_NO_WRITE_REV_INDEX` when set (see Git environment variable of the same name).
-    pub git_test_no_write_rev_index: Option<String>,
-    /// Test knob: when `"false"`, reftable auto-compaction is disabled (CLI captures at open).
-    pub git_test_reftable_autocompaction: Option<String>,
     /// Override for `GIT_AUTHOR_NAME` when set (see Git environment variable of the same name).
     pub git_author_name: Option<String>,
     /// Override for `GIT_AUTHOR_EMAIL` when set (see Git environment variable of the same name).
@@ -157,6 +153,10 @@ impl Environment {
             git_replace_ref_base: None,
             git_no_replace_objects: false,
             git_optional_locks: true,
+            git_literal_pathspecs: false,
+            git_glob_pathspecs: false,
+            git_noglob_pathspecs: false,
+            git_icase_pathspecs: false,
             git_alternate_object_directories: None,
             git_object_directory: None,
             git_prefix: None,
@@ -175,15 +175,8 @@ impl Environment {
             git_install_root: None,
             git_exec_path: None,
             pwd: None,
-            git_test_assume_different_owner: None,
-            grit_debug_safe_dir: false,
-            git_trace_setup: None,
-            git_trace2_perf: None,
             grit_invocation_cwd: None,
             sudo_uid: None,
-            git_test_utf8_nfd_to_nfc: None,
-            git_test_no_write_rev_index: None,
-            git_test_reftable_autocompaction: None,
             git_author_name: None,
             git_author_email: None,
             git_author_date: None,
@@ -217,6 +210,10 @@ impl Environment {
             && self.git_replace_ref_base == e.git_replace_ref_base
             && self.git_no_replace_objects == e.git_no_replace_objects
             && self.git_optional_locks == e.git_optional_locks
+            && self.git_literal_pathspecs == e.git_literal_pathspecs
+            && self.git_glob_pathspecs == e.git_glob_pathspecs
+            && self.git_noglob_pathspecs == e.git_noglob_pathspecs
+            && self.git_icase_pathspecs == e.git_icase_pathspecs
             && self.git_alternate_object_directories == e.git_alternate_object_directories
             && self.git_object_directory == e.git_object_directory
             && self.git_prefix == e.git_prefix
@@ -235,15 +232,8 @@ impl Environment {
             && self.git_install_root == e.git_install_root
             && self.git_exec_path == e.git_exec_path
             && self.pwd == e.pwd
-            && self.git_test_assume_different_owner == e.git_test_assume_different_owner
-            && self.grit_debug_safe_dir == e.grit_debug_safe_dir
-            && self.git_trace_setup == e.git_trace_setup
-            && self.git_trace2_perf == e.git_trace2_perf
             && self.grit_invocation_cwd == e.grit_invocation_cwd
             && self.sudo_uid == e.sudo_uid
-            && self.git_test_utf8_nfd_to_nfc == e.git_test_utf8_nfd_to_nfc
-            && self.git_test_no_write_rev_index == e.git_test_no_write_rev_index
-            && self.git_test_reftable_autocompaction == e.git_test_reftable_autocompaction
             && self.git_author_name == e.git_author_name
             && self.git_author_email == e.git_author_email
             && self.git_author_date == e.git_author_date
@@ -295,6 +285,10 @@ impl Environment {
             git_replace_ref_base: get("GIT_REPLACE_REF_BASE"),
             git_no_replace_objects: map.contains_key("GIT_NO_REPLACE_OBJECTS"),
             git_optional_locks: git_optional_locks_from_env(get("GIT_OPTIONAL_LOCKS").as_deref()),
+            git_literal_pathspecs: map.contains_key("GIT_LITERAL_PATHSPECS"),
+            git_glob_pathspecs: map.contains_key("GIT_GLOB_PATHSPECS"),
+            git_noglob_pathspecs: map.contains_key("GIT_NOGLOB_PATHSPECS"),
+            git_icase_pathspecs: map.contains_key("GIT_ICASE_PATHSPECS"),
             git_alternate_object_directories: get("GIT_ALTERNATE_OBJECT_DIRECTORIES"),
             git_object_directory: get("GIT_OBJECT_DIRECTORY"),
             git_prefix: get("GIT_PREFIX"),
@@ -313,15 +307,8 @@ impl Environment {
             git_install_root: get_os("GIT_INSTALL_ROOT"),
             git_exec_path: get_os("GIT_EXEC_PATH"),
             pwd: get("PWD"),
-            git_test_assume_different_owner: get("GIT_TEST_ASSUME_DIFFERENT_OWNER"),
-            grit_debug_safe_dir: map.contains_key("GRIT_DEBUG_SAFE_DIR"),
-            git_trace_setup: get("GIT_TRACE_SETUP"),
-            git_trace2_perf: get("GIT_TRACE2_PERF"),
             grit_invocation_cwd: get("GRIT_INVOCATION_CWD"),
             sudo_uid: get("SUDO_UID"),
-            git_test_utf8_nfd_to_nfc: get("GIT_TEST_UTF8_NFD_TO_NFC"),
-            git_test_no_write_rev_index: get("GIT_TEST_NO_WRITE_REV_INDEX"),
-            git_test_reftable_autocompaction: get("GIT_TEST_REFTABLE_AUTOCOMPACTION"),
             git_author_name: get("GIT_AUTHOR_NAME"),
             git_author_email: get("GIT_AUTHOR_EMAIL"),
             git_author_date: get("GIT_AUTHOR_DATE"),
@@ -347,30 +334,6 @@ impl Environment {
         raw.split_whitespace()
             .next()
             .and_then(|p| p.parse::<i64>().ok())
-    }
-
-    /// Whether reftable auto-compaction is enabled for this process snapshot.
-    ///
-    /// Defaults to `true`. Set `GIT_TEST_REFTABLE_AUTOCOMPACTION=false` at the CLI
-    /// boundary to disable (see site global-options docs).
-    #[must_use]
-    pub fn reftable_autocompaction_enabled(&self) -> bool {
-        self.git_test_reftable_autocompaction
-            .as_deref()
-            .map(|value| value != "false")
-            .unwrap_or(true)
-    }
-
-    /// Whether `GIT_TEST_ASSUME_DIFFERENT_OWNER` is enabled.
-    #[must_use]
-    pub fn test_assume_different_owner(&self) -> bool {
-        self.git_test_assume_different_owner
-            .as_deref()
-            .map(|v| {
-                let lower = v.to_ascii_lowercase();
-                v == "1" || lower == "true" || lower == "yes" || lower == "on"
-            })
-            .unwrap_or(false)
     }
 
     /// Use `path` as the repository directory, like setting `GIT_DIR`.
@@ -405,6 +368,34 @@ impl Environment {
     #[must_use]
     pub fn with_work_tree(mut self, path: impl AsRef<Path>) -> Self {
         self.git_work_tree = Some(self.absolute_from_cwd(path.as_ref()));
+        self
+    }
+
+    /// Set or override one subprocess variable without resnapshotting the process.
+    ///
+    /// The value is stored in the shared captured map (cloned on first use) and
+    /// exported through [`Self::subprocess_environment`] like any other untyped
+    /// variable. Typed fields on this environment still win over the same key.
+    ///
+    /// # Parameters
+    ///
+    /// - `key`: variable name (for example `REMOTE_USER`).
+    /// - `value`: UTF-8 value to export to hook and filter subprocesses.
+    ///
+    /// # Returns
+    ///
+    /// This environment with `key` set to `value`.
+    #[must_use]
+    pub fn with_var(mut self, key: impl Into<String>, value: impl Into<OsString>) -> Self {
+        let key = key.into();
+        let value = value.into();
+        let mut map = self
+            .captured_vars
+            .as_ref()
+            .map(|vars| (**vars).clone())
+            .unwrap_or_default();
+        map.insert(key, value);
+        self.captured_vars = Some(Arc::new(map));
         self
     }
 
@@ -543,8 +534,6 @@ impl Environment {
             "GIT_CONFIG_PARAMETERS" => self.git_config_parameters.clone(),
             "GIT_CONFIG_COUNT" => self.git_config_count.clone(),
             "GIT_PREFIX" => self.git_prefix.clone(),
-            "GIT_TEST_UTF8_NFD_TO_NFC" => self.git_test_utf8_nfd_to_nfc.clone(),
-            "GIT_TEST_REFTABLE_AUTOCOMPACTION" => self.git_test_reftable_autocompaction.clone(),
             "GIT_AUTHOR_NAME" => self.git_author_name.clone(),
             "GIT_AUTHOR_EMAIL" => self.git_author_email.clone(),
             "GIT_AUTHOR_DATE" => self.git_author_date.clone(),
@@ -773,32 +762,10 @@ impl Environment {
         subprocess_push_str(&mut set, "PWD", self.pwd.as_deref());
         subprocess_push_str(
             &mut set,
-            "GIT_TEST_ASSUME_DIFFERENT_OWNER",
-            self.git_test_assume_different_owner.as_deref(),
-        );
-        subprocess_push_str(&mut set, "GIT_TRACE_SETUP", self.git_trace_setup.as_deref());
-        subprocess_push_str(&mut set, "GIT_TRACE2_PERF", self.git_trace2_perf.as_deref());
-        subprocess_push_str(
-            &mut set,
             "GRIT_INVOCATION_CWD",
             self.grit_invocation_cwd.as_deref(),
         );
         subprocess_push_str(&mut set, "SUDO_UID", self.sudo_uid.as_deref());
-        subprocess_push_str(
-            &mut set,
-            "GIT_TEST_UTF8_NFD_TO_NFC",
-            self.git_test_utf8_nfd_to_nfc.as_deref(),
-        );
-        subprocess_push_str(
-            &mut set,
-            "GIT_TEST_NO_WRITE_REV_INDEX",
-            self.git_test_no_write_rev_index.as_deref(),
-        );
-        subprocess_push_str(
-            &mut set,
-            "GIT_TEST_REFTABLE_AUTOCOMPACTION",
-            self.git_test_reftable_autocompaction.as_deref(),
-        );
         subprocess_push_str(&mut set, "GIT_AUTHOR_NAME", self.git_author_name.as_deref());
         subprocess_push_str(
             &mut set,
@@ -835,9 +802,6 @@ impl Environment {
         }
         if !self.git_optional_locks {
             set.push((OsString::from("GIT_OPTIONAL_LOCKS"), OsString::from("0")));
-        }
-        if self.grit_debug_safe_dir {
-            set.push((OsString::from("GRIT_DEBUG_SAFE_DIR"), OsString::new()));
         }
         set
     }
@@ -948,7 +912,7 @@ impl IdentityEnv for Environment {
 /// Callers pass this into [`crate::fsmonitor::FsmonitorRefreshOptions`] so fsmonitor hook
 /// protocol v1 tokens are sampled before the hook subprocess runs.
 #[must_use]
-pub fn wall_clock_unix_timestamp_nanos() -> u64 {
+pub(crate) fn wall_clock_unix_timestamp_nanos() -> u64 {
     u64::try_from(OffsetDateTime::now_utc().unix_timestamp_nanos()).unwrap_or(u64::MAX)
 }
 
@@ -1004,15 +968,8 @@ const TYPED_ENVIRONMENT_VARS: &[&str] = &[
     "GIT_INSTALL_ROOT",
     "GIT_EXEC_PATH",
     "PWD",
-    "GIT_TEST_ASSUME_DIFFERENT_OWNER",
-    "GRIT_DEBUG_SAFE_DIR",
-    "GIT_TRACE_SETUP",
-    "GIT_TRACE2_PERF",
     "GRIT_INVOCATION_CWD",
     "SUDO_UID",
-    "GIT_TEST_UTF8_NFD_TO_NFC",
-    "GIT_TEST_NO_WRITE_REV_INDEX",
-    "GIT_TEST_REFTABLE_AUTOCOMPACTION",
     "GIT_AUTHOR_NAME",
     "GIT_AUTHOR_EMAIL",
     "GIT_AUTHOR_DATE",
@@ -1051,7 +1008,83 @@ fn subprocess_push_os(out: &mut Vec<(OsString, OsString)>, key: &str, val: Optio
     }
 }
 
-/// Options passed to repository open/discover with an explicit [`Environment`].
+/// Options passed to [`crate::repo::Repository::open`], [`crate::repo::Repository::discover`],
+/// and related entry points.
+///
+/// # Opening a normal repository
+///
+/// ```
+/// use grit_lib::config::environment::RepositoryOptions;
+/// use grit_lib::repo::{InitOptions, Repository};
+///
+/// # fn main() -> grit_lib::error::Result<()> {
+/// let dir = tempfile::tempdir()?;
+/// let (repo, _) = Repository::init(dir.path(), &InitOptions::default())?;
+/// let again = Repository::open(
+///     repo.git_dir(),
+///     &RepositoryOptions::empty().with_work_tree(dir.path()),
+/// )?;
+/// assert_eq!(again.git_dir(), repo.git_dir());
+/// # Ok(())
+/// # }
+/// ```
+///
+/// # Discovering from a working directory
+///
+/// ```
+/// use grit_lib::config::environment::RepositoryOptions;
+/// use grit_lib::repo::{InitOptions, Repository};
+///
+/// # fn main() -> grit_lib::error::Result<()> {
+/// let dir = tempfile::tempdir()?;
+/// Repository::init(dir.path(), &InitOptions::default())?;
+/// let repo = Repository::discover(Some(dir.path()), &RepositoryOptions::empty())?;
+/// assert!(repo.work_tree().is_some());
+/// # Ok(())
+/// # }
+/// ```
+///
+/// # Bare repository
+///
+/// Open the bare git directory; leave [`Self::work_tree`] unset.
+///
+/// # Linked worktree
+///
+/// Open the worktree's admin directory (under `worktrees/`) and set [`Self::work_tree`] to the
+/// linked checkout path, or call [`Repository::discover`](crate::repo::Repository::discover) from
+/// the linked checkout with environment overrides cleared (no `GIT_DIR` / `GIT_WORK_TREE`).
+///
+/// # Injected ref store and custom object store
+///
+/// With both stores injected the git directory may be missing: nothing is read from its
+/// layout, though config and the index are still looked up there.
+///
+/// ```
+/// use std::sync::Arc;
+///
+/// use grit_lib::config::environment::RepositoryOptions;
+/// use grit_lib::objects::odb::store::MemoryStore;
+/// use grit_lib::objects::{HashAlgo, ObjectKind};
+/// use grit_lib::refs::store::MemoryRefStore;
+/// use grit_lib::repo::Repository;
+///
+/// # fn main() -> grit_lib::error::Result<()> {
+/// let dir = tempfile::tempdir()?;
+/// let git_dir = dir.path().join("in-memory.git");
+/// let store = Arc::new(MemoryStore::new(HashAlgo::Sha1));
+/// let repo = Repository::open(
+///     &git_dir,
+///     &RepositoryOptions::empty()
+///         .with_object_store(store.clone())
+///         .with_ref_store(Arc::new(MemoryRefStore::new()))
+///         .with_initial_branch("main"),
+/// )?;
+/// let oid = repo.odb().write(ObjectKind::Blob, b"hello")?;
+/// assert!(grit_lib::objects::odb::store::ObjectStore::contains(store.as_ref(), &oid)?);
+/// assert!(!git_dir.exists());
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct RepositoryOptions {
@@ -1065,14 +1098,23 @@ pub struct RepositoryOptions {
     pub diagnostics: DiagnosticsHandle,
     /// When true, network operations may emit [`crate::diagnostics::Trace::Network`] events.
     pub network_trace: bool,
-    /// When true, treat repository ownership as a different user (`safe.directory` tests).
-    pub test_assume_different_owner: bool,
+    /// Injectable ownership checks for discovery (`safe.directory`).
+    pub(crate) ownership_check: Arc<dyn OwnershipCheck>,
     /// Wall-clock reference for rev-parse date selectors; embedders set explicitly.
     pub reference_unix_time: Option<i64>,
     /// Parallel worker overrides (`--threads` in the CLI).
     pub thread_policy: crate::parallel::ThreadPolicy,
     /// Work tree path for [`crate::repo::Repository::open`] (non-bare repos).
     pub work_tree: Option<std::path::PathBuf>,
+    /// Primary object store to use instead of the files layout under `objects/`
+    /// (see [`Self::with_object_store`]).
+    pub object_store: Option<Arc<dyn crate::odb::store::WritableObjectStore>>,
+    /// Read layers, attached commit-graph and alternates policy (see [`crate::odb::OdbBuilder`]).
+    pub odb_builder: Option<crate::odb::OdbBuilder>,
+    /// Ref backend to use instead of opening one from the git directory.
+    pub ref_store: Option<std::sync::Arc<dyn crate::refs::store::RefStore>>,
+    /// When the ref store has no `HEAD` after open, seed an unborn branch at `refs/heads/<name>`.
+    pub initial_branch: Option<String>,
     /// When false, skip [`crate::repo::validate_repo_format`] during open.
     pub validate_repository_format: bool,
     /// When true, [`crate::repo::Repository::open`] resolves `path` like wire-protocol serving.
@@ -1081,6 +1123,8 @@ pub struct RepositoryOptions {
     pub promisor_fetcher: Option<std::sync::Arc<dyn crate::promisor_fetch::PromisorFetcher>>,
     /// Where hook subprocesses write their output (captured by default).
     pub hook_stdio: crate::hooks::HookStdio,
+    /// Overrides for reftable stack writes on repositories opened with these options.
+    pub reftable_write: ReftableWriteOptions,
 }
 
 impl std::fmt::Debug for RepositoryOptions {
@@ -1101,14 +1145,19 @@ impl Default for RepositoryOptions {
             change_id_generator: Arc::new(OsChangeIdGenerator),
             diagnostics: Arc::new(NullDiagnostics),
             network_trace: false,
-            test_assume_different_owner: false,
+            ownership_check: default_ownership_check(),
             reference_unix_time: None,
             thread_policy: crate::parallel::ThreadPolicy::default(),
             work_tree: None,
+            object_store: None,
+            odb_builder: None,
+            ref_store: None,
+            initial_branch: None,
             validate_repository_format: true,
             open_for_serving: false,
             promisor_fetcher: None,
             hook_stdio: crate::hooks::HookStdio::default(),
+            reftable_write: ReftableWriteOptions::default(),
         }
     }
 }
@@ -1171,6 +1220,153 @@ impl RepositoryOptions {
         self
     }
 
+    /// Use `store` as the repository's primary object store instead of the files layout
+    /// under `objects/`.
+    ///
+    /// Writes and primary reads go through this backend, including commits, staging
+    /// ([`crate::porcelain::add::stage`]), merges, stash, notes, and bundle creation.
+    /// [`Maintenance::fsck`](crate::maintenance::Maintenance::fsck) validates the objects this store
+    /// lists. Received packs are written into it object by object:
+    /// [`ingest_received_pack`](crate::index_pack::ingest_received_pack) and
+    /// [`Bundle::unbundle`](crate::bundle::Bundle::unbundle) resolve every delta and call
+    /// [`WritableObjectStore::write`](crate::odb::store::WritableObjectStore::write) instead
+    /// of installing a pack under `objects/pack/`. Fetch, push, pull, bundles and
+    /// [`clone_into`](crate::clone::clone_into) read and write objects through it.
+    ///
+    /// [`Repository::open`](crate::repo::Repository::open) still resolves the `objects/`
+    /// directory (honoring `GIT_OBJECT_DIRECTORY`), but never reads or writes objects there,
+    /// and the directory need not exist. Alternates are off unless
+    /// [`OdbBuilder::alternates`](crate::odb::OdbBuilder::alternates) turns them on. Partial
+    /// clone filters and filesystem maintenance ([`crate::odb::Odb::write_commit_graph`],
+    /// repack, multi-pack-index) refuse with
+    /// [`RepositoryError::UnsupportedObjectStore`](crate::repo::RepositoryError::UnsupportedObjectStore).
+    /// Garbage collection and pruning ([`crate::odb::Odb::gc`], [`crate::maintenance::gc`],
+    /// [`crate::maintenance::prune_loose_objects`]) work when the store can delete objects
+    /// ([`WritableObjectStore::as_prunable`](crate::odb::store::WritableObjectStore::as_prunable))
+    /// and refuse with [`FilesOnlyOperation::Prune`](crate::repo::error::FilesOnlyOperation::Prune)
+    /// otherwise.
+    ///
+    /// The store's [`ObjectStore::hash_algo`](crate::odb::store::ObjectStore::hash_algo) must
+    /// match the repository's object format, or [`Repository::open`](crate::repo::Repository::open)
+    /// fails with [`RepositoryError::ObjectFormatMismatch`](crate::repo::RepositoryError::ObjectFormatMismatch).
+    ///
+    /// # Without a git directory
+    ///
+    /// A bare repository opened with this store, a [`Self::with_ref_store`] backend and its
+    /// config in the [`Environment`] (through [`Environment::push_config_override`], with
+    /// [`Environment::git_config_nosystem`] set to keep `/etc/gitconfig` out) needs nothing on
+    /// disk. The git directory may be a path that does not exist, and grit-lib does not create
+    /// it. `<git_dir>/config` is still read when it exists.
+    ///
+    /// | Area | Without a git directory |
+    /// | ---- | ----------------------- |
+    /// | Objects, trees and commits ([`Repository::objects`](crate::repo::Repository::objects)) | Work through the store. |
+    /// | Refs, reflogs, `HEAD` and ref transactions ([`Repository::references`](crate::repo::Repository::references)) | Work through the ref store. |
+    /// | Config ([`Repository::config`](crate::repo::Repository::config)) | Comes from the [`Environment`]. |
+    /// | Rev-parse, revwalk and log | Work. |
+    /// | Tree diff, [`write_merge_tree`](crate::porcelain::merge::write_merge_tree) and blame at a commit | Work. |
+    /// | Notes, and bundles written to any [`std::io::Write`] ([`RepositoryBundles::write_to`](crate::repo_handles::RepositoryBundles::write_to)) | Work. |
+    /// | History edits ([`History::reword`](crate::revwalk::history::History::reword), [`History::apply`](crate::revwalk::history::History::apply)) | Work. |
+    /// | Fetch from a path or URL | Works. The pack is spooled in the system temp directory and removed after ingest, and `FETCH_HEAD` is not written. |
+    /// | Hooks | A missing hooks directory means no hooks. |
+    /// | The index, staging and worktree commits | Out of scope: the index, `COMMIT_EDITMSG` and merge, revert and rebase state live in the git directory, which staging creates. |
+    /// | Work-tree operations (checkout, switch, status, reset, stash) | Out of scope: they need a work tree and an index. |
+    /// | Linked worktrees | Out of scope: their admin directories live under `worktrees/`. |
+    /// | rerere and sparse-checkout | Out of scope: their state is kept in files in the git directory. |
+    /// | Hooks that expect `GIT_DIR` on disk | Out of scope: objects and refs held by the stores are invisible to other programs, such as the system `git`. |
+    /// | gc and prune | Work when the store can delete objects ([`WritableObjectStore::as_prunable`](crate::odb::store::WritableObjectStore::as_prunable)), as described above. |
+    /// | Repack, commit-graph and multi-pack-index files | Refused with [`RepositoryError::UnsupportedObjectStore`](crate::repo::RepositoryError::UnsupportedObjectStore). |
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    ///
+    /// use grit_lib::config::environment::RepositoryOptions;
+    /// use grit_lib::objects::odb::store::{MemoryStore, ObjectStore};
+    /// use grit_lib::objects::{HashAlgo, ObjectKind};
+    /// use grit_lib::repo::{InitOptions, Repository};
+    ///
+    /// # fn main() -> grit_lib::error::Result<()> {
+    /// let dir = tempfile::tempdir()?;
+    /// Repository::init(dir.path(), &InitOptions::default())?;
+    /// let store = Arc::new(MemoryStore::new(HashAlgo::Sha1));
+    /// let repo = Repository::open(
+    ///     &dir.path().join(".git"),
+    ///     &RepositoryOptions::empty()
+    ///         .with_object_store(store.clone())
+    ///         .with_work_tree(dir.path()),
+    /// )?;
+    /// let oid = repo.odb().write(ObjectKind::Blob, b"hello")?;
+    /// assert!(store.contains(&oid)?);
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// A bare repository with no git directory, its config held in the [`Environment`]:
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    ///
+    /// use grit_lib::config::environment::{ConfigOverride, Environment, RepositoryOptions};
+    /// use grit_lib::objects::odb::store::MemoryStore;
+    /// use grit_lib::objects::HashAlgo;
+    /// use grit_lib::refs::store::MemoryRefStore;
+    /// use grit_lib::repo::Repository;
+    ///
+    /// # fn main() -> grit_lib::error::Result<()> {
+    /// let mut env = Environment::empty();
+    /// env.git_config_nosystem = Some("1".to_owned());
+    /// env.push_config_override(&ConfigOverride::new("user.name", Some("Ada".to_owned()))?);
+    /// let dir = tempfile::tempdir()?;
+    /// let git_dir = dir.path().join("never-created.git");
+    /// let repo = Repository::open(
+    ///     &git_dir,
+    ///     &RepositoryOptions::with_environment(env)
+    ///         .with_object_store(Arc::new(MemoryStore::new(HashAlgo::Sha1)))
+    ///         .with_ref_store(Arc::new(MemoryRefStore::new()))
+    ///         .with_initial_branch("main"),
+    /// )?;
+    /// assert!(repo.is_bare());
+    /// assert_eq!(repo.config().snapshot()?.get("user.name")?.as_deref(), Some("Ada"));
+    /// assert!(!git_dir.exists());
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn with_object_store(
+        mut self,
+        store: Arc<dyn crate::odb::store::WritableObjectStore>,
+    ) -> Self {
+        self.object_store = Some(store);
+        self
+    }
+
+    /// Layer read-only stores, a commit-graph, or an alternates override over the primary
+    /// object store (see [`crate::odb::OdbBuilder`]).
+    #[must_use]
+    pub fn with_odb_builder(mut self, builder: crate::odb::OdbBuilder) -> Self {
+        self.odb_builder = Some(builder);
+        self
+    }
+
+    /// Use `store` as the ref backend instead of opening one from the git directory.
+    #[must_use]
+    pub fn with_ref_store(
+        mut self,
+        store: std::sync::Arc<dyn crate::refs::store::RefStore>,
+    ) -> Self {
+        self.ref_store = Some(store);
+        self
+    }
+
+    /// Seed `HEAD` at `refs/heads/<branch>` when the ref store has no `HEAD` after open.
+    #[must_use]
+    pub fn with_initial_branch(mut self, branch: impl Into<String>) -> Self {
+        self.initial_branch = Some(branch.into());
+        self
+    }
+
     /// Skip repository format validation when opening (discovery follow-up paths).
     #[must_use]
     pub fn without_format_validation(mut self) -> Self {
@@ -1190,6 +1386,42 @@ impl RepositoryOptions {
     pub fn with_diagnostics(mut self, diagnostics: DiagnosticsHandle) -> Self {
         self.diagnostics = diagnostics;
         self
+    }
+
+    /// Override reftable write behavior (for example disable auto-compaction in tests).
+    #[must_use]
+    pub fn with_reftable_write(mut self, reftable_write: ReftableWriteOptions) -> Self {
+        self.reftable_write = reftable_write;
+        self
+    }
+
+    /// Reftable write overrides installed on these options.
+    #[must_use]
+    pub fn reftable_write(&self) -> ReftableWriteOptions {
+        self.reftable_write
+    }
+
+    /// Replace the ownership check used during discovery and clone safety checks.
+    ///
+    /// The default [`crate::ownership_check::SystemOwnershipCheck`] compares the effective Unix
+    /// uid against repository paths. Custom implementations can treat repositories as always
+    /// foreign so `safe.directory` always applies (sandboxes and tests).
+    #[must_use]
+    pub fn with_ownership_check(mut self, check: Arc<dyn OwnershipCheck>) -> Self {
+        self.ownership_check = check;
+        self
+    }
+
+    /// Ownership check installed on these options.
+    #[must_use]
+    pub fn ownership_check(&self) -> Arc<dyn OwnershipCheck> {
+        Arc::clone(&self.ownership_check)
+    }
+
+    /// Whether these options still use the shared default [`SystemOwnershipCheck`](crate::ownership_check::SystemOwnershipCheck).
+    #[must_use]
+    pub fn uses_default_ownership_check(&self) -> bool {
+        is_default_ownership_check(&self.ownership_check)
     }
 
     /// Choose whether hooks run by repositories opened with these options have their output
@@ -1423,6 +1655,21 @@ mod tests {
     }
 
     #[test]
+    fn with_var_overlays_without_resnapshotting_process() {
+        let env = Environment::empty()
+            .with_var("REMOTE_USER", "alice@example.com")
+            .with_var("GRIT_USER", "alice@example.com");
+        let set = env.subprocess_environment();
+        let get = |key: &str| {
+            set.iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.to_string_lossy().into_owned())
+        };
+        assert_eq!(get("REMOTE_USER").as_deref(), Some("alice@example.com"));
+        assert_eq!(get("GRIT_USER").as_deref(), Some("alice@example.com"));
+    }
+
+    #[test]
     fn from_vars_parses_config_count_pairs() {
         let vars = [
             ("GIT_CONFIG_COUNT", "1"),
@@ -1560,10 +1807,15 @@ mod tests {
         env.push_config_override(&override_of("user.name=Second"));
         env.push_config_override(&override_of("core.bare"));
 
-        let config = crate::config::ConfigSet::load(&env, Some(&git_dir), false).unwrap();
-        assert_eq!(config.get("user.name").as_deref(), Some("Second"));
-        assert_eq!(config.get("user.email").as_deref(), Some("repo@x.y"));
-        assert_eq!(config.get_bool("core.bare"), Some(Ok(true)));
+        let config = crate::config::ConfigSet::load(
+            &env,
+            Some(&git_dir),
+            &crate::config::LoadConfigOptions::standard(&env, Some(&git_dir)),
+        )
+        .unwrap();
+        assert_eq!(config.value("user.name").as_deref(), Some("Second"));
+        assert_eq!(config.value("user.email").as_deref(), Some("repo@x.y"));
+        assert_eq!(config.get_bool("core.bare").unwrap(), Some(true));
     }
 
     #[test]

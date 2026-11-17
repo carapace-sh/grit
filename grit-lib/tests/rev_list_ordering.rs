@@ -1,6 +1,7 @@
 //! Rev-list ordering, limiting, and range tests vs system `git` (history harness).
 
 use crate::support;
+use grit_lib::error::RevisionError;
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -9,10 +10,11 @@ use std::process::Command;
 
 use grit_lib::objects::ObjectId;
 use grit_lib::revwalk::rev_list::{
-    split_revision_token, ObjectFilter, OrderingMode, OutputMode, RevListOptions, RevListResult,
+    split_revision_token, ObjectFilter, OrderingMode, RevListOptions, RevListResult,
 };
 use grit_lib::revwalk::rev_list_error::RevListError;
-use grit_lib::revwalk::RevWalkListOptions;
+use grit_lib::revwalk::{RevWalkCommitIterOptions, RevWalkListOptions};
+use grit_lib::worktree::pathspec::{Pathspec, PathspecGlobalFlags};
 use support::{
     assert_rev_list_commits_match_git, build_commit_dag, commit_file, commit_labeled_with_dates,
     expand_token_for_rev_list, git, git_commit_graph_write, git_merge_base_is_ancestor,
@@ -116,6 +118,152 @@ fn cherry_symmetric_fixture(worktree: &Path) -> (String, String) {
     ("main".to_owned(), "side".to_owned())
 }
 
+fn equal_date_merge_fanout_fixture(worktree: &Path) {
+    const DATE: &str = "2024-01-01T00:00:00Z";
+    fn run(worktree: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .current_dir(worktree)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "a")
+            .env("GIT_AUTHOR_EMAIL", "a@b")
+            .env("GIT_COMMITTER_NAME", "a")
+            .env("GIT_COMMITTER_EMAIL", "a@b")
+            .env("GIT_AUTHOR_DATE", DATE)
+            .env("GIT_COMMITTER_DATE", DATE)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .status()
+            .expect("spawn git");
+        assert!(status.success(), "git {} failed", args.join(" "));
+    }
+    run(worktree, &["commit", "-q", "--allow-empty", "-m", "root"]);
+    for branch in ["x", "y", "z"] {
+        run(worktree, &["checkout", "-q", "-b", branch, "main"]);
+        for i in 1..=3 {
+            run(
+                worktree,
+                &[
+                    "commit",
+                    "-q",
+                    "--allow-empty",
+                    "-m",
+                    &format!("{branch}{i}"),
+                ],
+            );
+        }
+    }
+    run(worktree, &["checkout", "-q", "main"]);
+    for branch in ["x", "y", "z"] {
+        run(
+            worktree,
+            &[
+                "merge",
+                "-q",
+                "--no-ff",
+                "-m",
+                &format!("m{branch}"),
+                branch,
+            ],
+        );
+    }
+}
+
+#[test]
+fn default_order_unlimited_matches_bounded_and_git() {
+    let repo = HistoryRepo::init();
+    let wt = repo.worktree();
+    equal_date_merge_fanout_fixture(wt);
+    let git_oids = git_rev_list(wt, &["HEAD"]);
+    let grit = open_grit_repo(wt);
+    let walk = grit.revwalk();
+
+    let unlimited = walk
+        .commits(&["HEAD"], &RevWalkListOptions::default())
+        .expect("commits unlimited");
+    let huge_limit = RevWalkListOptions {
+        limit: Some(1_000_000),
+        ..RevWalkListOptions::default()
+    };
+    let bounded = walk
+        .commits(&["HEAD"], &huge_limit)
+        .expect("commits huge limit");
+    let rev_walk = walk
+        .walk("HEAD", &RevListOptions::default())
+        .expect("RevWalk::walk")
+        .commits;
+    let iter: Vec<ObjectId> = walk
+        .commits_iter("HEAD", &RevWalkCommitIterOptions::default())
+        .expect("commits_iter")
+        .collect::<Result<_, _>>()
+        .expect("commits_iter items");
+
+    assert_eq!(unlimited, git_oids, "RevWalk::commits limit None");
+    assert_eq!(bounded, git_oids, "RevWalk::commits huge limit");
+    assert_eq!(rev_walk, git_oids, "RevWalk::walk default");
+    assert_eq!(iter, git_oids, "RevWalk::commits_iter");
+
+    assert_rev_list_commits_match_git(
+        wt,
+        &grit,
+        &[],
+        &[String::from("HEAD")],
+        &[],
+        RevListOptions::default(),
+        "equal-date merge fanout rev_list",
+    );
+
+    for n in [1, 3, 5, git_oids.len()] {
+        let prefix: Vec<ObjectId> = unlimited.iter().copied().take(n).collect();
+        let limited = walk
+            .commits(
+                &["HEAD"],
+                &RevWalkListOptions {
+                    limit: Some(n),
+                    ..RevWalkListOptions::default()
+                },
+            )
+            .expect("limited prefix");
+        assert_eq!(prefix, limited, "prefix {n}");
+    }
+}
+
+#[test]
+fn default_order_differs_from_date_order_on_skew_dag() {
+    let repo = HistoryRepo::init();
+    let wt = repo.worktree();
+    let (_tip, _oids) = topo_skew_dag(wt);
+    let grit = open_grit_repo(wt);
+
+    let default_git = git_rev_list(wt, &["main"]);
+    let date_git = git_rev_list(wt, &["--date-order", "main"]);
+    assert_ne!(
+        default_git, date_git,
+        "fixture should distinguish default and --date-order"
+    );
+
+    assert_rev_list_commits_match_git(
+        wt,
+        &grit,
+        &[],
+        &[String::from("main")],
+        &[],
+        RevListOptions::default(),
+        "skew dag default unlimited",
+    );
+    assert_rev_list_commits_match_git(
+        wt,
+        &grit,
+        &["--date-order"],
+        &[String::from("main")],
+        &[],
+        RevListOptions {
+            ordering: OrderingMode::DateOrderWalk,
+            ..RevListOptions::default()
+        },
+        "skew dag --date-order",
+    );
+}
+
 #[test]
 fn t6003_topo_date_author_date_order_match_git() {
     let repo = HistoryRepo::init();
@@ -198,7 +346,7 @@ fn t6013_reverse_matches_git() {
     let path_opts = RevListOptions {
         reverse: true,
         full_history: true,
-        output_mode: OutputMode::Parents,
+        parent_rewrite: true,
         paths: vec!["foo".to_owned()],
         ..RevListOptions::default()
     };
@@ -249,7 +397,7 @@ fn t6013_reverse_matches_git() {
         reverse: true,
         full_history: true,
         boundary: true,
-        output_mode: OutputMode::Parents,
+        parent_rewrite: true,
         paths: vec!["foo".to_owned()],
         ..RevListOptions::default()
     };
@@ -259,13 +407,10 @@ fn t6013_reverse_matches_git() {
         }
         let mut opts = boundary_opts.clone();
         opts.use_commit_graph = use_graph;
-        let result = grit_lib::revwalk::rev_list::rev_list(
-            &grit,
-            &[String::from("main")],
-            &[root_hex.clone()],
-            &opts,
-        )
-        .expect("boundary rev_list");
+        let result = grit
+            .revwalk()
+            .rev_list(&[String::from("main")], &[root_hex.clone()], &opts)
+            .expect("boundary rev_list");
         let grit_seq: Vec<ObjectId> = if opts.reverse {
             result
                 .boundary_commits
@@ -318,7 +463,7 @@ fn t6013_max_count_boundary_path_limited_parents_match_git() {
         max_count: Some(1),
         boundary: true,
         full_history: true,
-        output_mode: OutputMode::Parents,
+        parent_rewrite: true,
         paths: vec!["foo".to_owned()],
         ..RevListOptions::default()
     };
@@ -328,13 +473,10 @@ fn t6013_max_count_boundary_path_limited_parents_match_git() {
         }
         let mut run_opts = opts.clone();
         run_opts.use_commit_graph = use_graph;
-        let result = grit_lib::revwalk::rev_list::rev_list(
-            &grit,
-            &[String::from("main")],
-            &[root_hex.clone()],
-            &run_opts,
-        )
-        .expect("max-count boundary rev_list");
+        let result = grit
+            .revwalk()
+            .rev_list(&[String::from("main")], &[root_hex.clone()], &run_opts)
+            .expect("max-count boundary rev_list");
         let mut grit_seq = result.commits;
         grit_seq.extend(result.boundary_commits);
         assert_eq!(
@@ -390,10 +532,11 @@ fn t6005_max_count_skip_match_git() {
         count: true,
         ..RevListOptions::default()
     };
-    let grit_count =
-        grit_lib::revwalk::rev_list::rev_list(&grit, &[String::from("main")], &[], &opts)
-            .expect("count")
-            .commit_count();
+    let grit_count = grit
+        .revwalk()
+        .rev_list(&[String::from("main")], &[], &opts)
+        .expect("count")
+        .commit_count();
     assert_eq!(grit_count, count_git);
 }
 
@@ -532,9 +675,10 @@ fn t6100_in_order_matches_git() {
         }
         let mut opts = opts.clone();
         opts.use_commit_graph = use_graph;
-        let result =
-            grit_lib::revwalk::rev_list::rev_list(&grit, &[String::from("HEAD")], &[], &opts)
-                .expect("in-order walk");
+        let result = grit
+            .revwalk()
+            .rev_list(&[String::from("HEAD")], &[], &opts)
+            .expect("in-order walk");
         let mut grit_oids = Vec::new();
         for (i, commit) in result.commits.iter().enumerate() {
             grit_oids.push(*commit);
@@ -590,7 +734,7 @@ fn t6001_grafts_and_replace_refs_match_git() {
         &[String::from("main")],
         &[],
         RevListOptions {
-            output_mode: OutputMode::Parents,
+            parent_rewrite: true,
             ..RevListOptions::default()
         },
         "t6001 graft --parents",
@@ -607,6 +751,127 @@ fn t6001_grafts_and_replace_refs_match_git() {
         RevListOptions::default(),
         "t6001 replace ref",
     );
+}
+
+fn seed_replace_graft_fixture(wt: &Path) {
+    git(wt, &["config", "commit.gpgsign", "false"]);
+    for i in 1..=4 {
+        fs::write(wt.join("f"), format!("{i}\n")).expect("write f");
+        git(wt, &["add", "f"]);
+        git(wt, &["commit", "-qm", &format!("c{i}")]);
+    }
+    git(wt, &["replace", "HEAD~1", "HEAD~3"]);
+}
+
+fn assert_replace_graft_history_matches_git(
+    wt: &Path,
+    grit: &grit_lib::repo::Repository,
+    label: &str,
+) {
+    use grit_lib::config::ConfigSet;
+    use grit_lib::diff::{DiffDetail, DiffMerges, DiffOptions};
+    let git_subjects: Vec<String> = git(wt, &["log", "--format=%s"])
+        .lines()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(
+        git_subjects,
+        vec!["c4".to_owned(), "c1".to_owned()],
+        "{label}: log subjects"
+    );
+    assert_eq!(
+        git(wt, &["rev-list", "--count", "HEAD"]).trim(),
+        "2",
+        "{label}: git count"
+    );
+
+    let result = grit
+        .revwalk()
+        .rev_list(&[String::from("HEAD")], &[], &RevListOptions::default())
+        .expect("revs");
+    assert_eq!(result.commits.len(), 2, "{label}: grit count");
+
+    let parent = git_rev_parse(wt, "HEAD~1").expect("HEAD~1");
+    let commits = grit
+        .revwalk()
+        .load_commits(&[parent], &Default::default(), &mut ())
+        .expect("load parent commit");
+    assert_eq!(commits[0].message.trim(), "c1", "{label}: show subject");
+
+    let config = ConfigSet::default();
+    let thread_policy = grit.thread_policy();
+    let diff = grit
+        .diff()
+        .commit_files(
+            &parent,
+            DiffMerges::FirstParent,
+            DiffDetail::NameOnly,
+            &DiffOptions::default(),
+            &Pathspec::entire_tree(PathspecGlobalFlags::default()),
+        )
+        .expect("commit diff");
+    assert!(
+        diff.files.iter().any(|f| f.path == "f"),
+        "{label}: commit diff uses replaced tree"
+    );
+}
+
+#[test]
+fn replace_graft_on_ancestor_stitches_history_issue_2473() {
+    let repo = HistoryRepo::init();
+    let wt = repo.worktree();
+    seed_replace_graft_fixture(wt);
+
+    let grit = open_grit_repo(wt);
+    for use_graph in [false, true] {
+        if use_graph {
+            git_commit_graph_write(wt);
+        }
+        let mut opts = RevListOptions::default();
+        opts.use_commit_graph = use_graph;
+        assert_rev_list_commits_match_git(
+            wt,
+            &grit,
+            &["HEAD"],
+            &[String::from("HEAD")],
+            &[],
+            opts.clone(),
+            &format!("issue 2473 rev-list (graph={use_graph})"),
+        );
+    }
+
+    assert_replace_graft_history_matches_git(wt, &grit, "loose refs");
+
+    git(wt, &["pack-refs", "--all"]);
+    let grit_packed = open_grit_repo(wt);
+    assert_replace_graft_history_matches_git(wt, &grit_packed, "packed-refs");
+
+    let mut env = grit_lib::config::environment::Environment::empty();
+    env.git_no_replace_objects = true;
+    let grit_raw = grit_lib::repo::Repository::discover(
+        Some(wt),
+        &grit_lib::config::environment::RepositoryOptions::with_environment(env),
+    )
+    .expect("open no-replace");
+    let raw = grit_raw
+        .revwalk()
+        .rev_list(&[String::from("HEAD")], &[], &RevListOptions::default())
+        .expect("raw revs");
+    assert_eq!(raw.commits.len(), 4);
+}
+
+#[test]
+fn replace_graft_on_ancestor_reftable_storage_issue_2473() {
+    if !support::require_reftable_git() {
+        return;
+    }
+    let root = support::git_init_reftable_repo("main");
+    let wt = root.path();
+    seed_replace_graft_fixture(wt);
+    let grit = open_grit_repo(wt);
+    assert_replace_graft_history_matches_git(wt, &grit, "reftable");
 }
 
 #[test]
@@ -635,7 +900,7 @@ fn symmetric_diff_left_right_cherry_mark_match_git() {
         "symmetric cherry-mark order",
     );
 
-    let result = grit_lib::revwalk::rev_list::rev_list(&grit, &pos, &neg, &opts).expect("cherry");
+    let result = grit.revwalk().rev_list(&pos, &neg, &opts).expect("cherry");
     for line in git_lines {
         let stripped = line.trim_start_matches(['<', '>', '=', ' '].as_ref());
         let oid: ObjectId = stripped.split_whitespace().next().unwrap().parse().unwrap();
@@ -653,7 +918,7 @@ fn cherry_mark_walk(repo: &grit_lib::repo::Repository, token: &str) -> RevListRe
         cherry_mark: true,
         ..RevWalkListOptions::default()
     };
-    repo.rev_walk()
+    repo.revwalk()
         .rev_list_result(&[token], &opts)
         .expect("cherry-mark walk")
 }
@@ -767,7 +1032,7 @@ fn cherry_mark_and_left_right_require_one_symmetric_range() {
     let wt = repo.worktree();
     rewritten_branch_fixture(wt);
     let grit = open_grit_repo(wt);
-    let walk = grit.rev_walk();
+    let walk = grit.revwalk();
     for opts in [
         RevWalkListOptions {
             cherry_mark: true,
@@ -784,7 +1049,9 @@ fn cherry_mark_and_left_right_require_one_symmetric_range() {
             assert!(
                 matches!(
                     err,
-                    grit_lib::error::Error::RevList(RevListError::SymmetricRangeRequired)
+                    grit_lib::error::Error::Revision(RevisionError::List(
+                        RevListError::SymmetricRangeRequired
+                    ))
                 ),
                 "{tokens:?}: {err:?}"
             );
@@ -792,7 +1059,9 @@ fn cherry_mark_and_left_right_require_one_symmetric_range() {
             assert!(
                 matches!(
                     err,
-                    grit_lib::error::Error::RevList(RevListError::SymmetricRangeRequired)
+                    grit_lib::error::Error::Revision(RevisionError::List(
+                        RevListError::SymmetricRangeRequired
+                    ))
                 ),
                 "symmetric_range_tips {tokens:?}: {err:?}"
             );
@@ -874,13 +1143,10 @@ fn t6000_misc_ranges_and_boundary_match_git() {
         }
         let mut opts = opts.clone();
         opts.use_commit_graph = use_graph;
-        let result = grit_lib::revwalk::rev_list::rev_list(
-            &grit,
-            &[String::from("main")],
-            &[String::from("root")],
-            &opts,
-        )
-        .expect("boundary walk");
+        let result = grit
+            .revwalk()
+            .rev_list(&[String::from("main")], &[String::from("root")], &opts)
+            .expect("boundary walk");
         let mut grit_seq = result.commits;
         grit_seq.extend(result.boundary_commits);
         assert_eq!(grit_seq, git_boundary, "t6000 boundary (graph={use_graph})");
@@ -994,9 +1260,10 @@ fn t4217_boundary_since_until_match_git() {
         }
         let mut opts = since_opts.clone();
         opts.use_commit_graph = use_graph;
-        let result =
-            grit_lib::revwalk::rev_list::rev_list(&grit, &[String::from("main")], &[], &opts)
-                .expect("since boundary rev_list");
+        let result = grit
+            .revwalk()
+            .rev_list(&[String::from("main")], &[], &opts)
+            .expect("since boundary rev_list");
         let mut grit_seq = result.commits;
         grit_seq.extend(result.boundary_commits);
         assert_eq!(
@@ -1018,9 +1285,10 @@ fn t4217_boundary_since_until_match_git() {
         }
         let mut opts = until_opts.clone();
         opts.use_commit_graph = use_graph;
-        let result =
-            grit_lib::revwalk::rev_list::rev_list(&grit, &[String::from("main")], &[], &opts)
-                .expect("until boundary rev_list");
+        let result = grit
+            .revwalk()
+            .rev_list(&[String::from("main")], &[], &opts)
+            .expect("until boundary rev_list");
         let mut grit_seq = result.commits;
         grit_seq.extend(result.boundary_commits);
         assert_eq!(
@@ -1060,9 +1328,10 @@ fn simplify_by_decoration_boundary_match_git() {
         }
         let mut walk_opts = opts.clone();
         walk_opts.use_commit_graph = use_graph;
-        let result =
-            grit_lib::revwalk::rev_list::rev_list(&grit, &[String::from("main")], &[], &walk_opts)
-                .expect("simplify-by-decoration boundary rev_list");
+        let result = grit
+            .revwalk()
+            .rev_list(&[String::from("main")], &[], &walk_opts)
+            .expect("simplify-by-decoration boundary rev_list");
         let mut grit_seq = result.commits;
         grit_seq.extend(result.boundary_commits);
         assert_eq!(
@@ -1294,17 +1563,18 @@ fn rev_list_broad_ordering_and_limit_flags_match_git() {
         .trim()
         .parse()
         .expect("git count");
-    let grit_count = grit_lib::revwalk::rev_list::rev_list(
-        &grit,
-        &[String::from("main")],
-        &[],
-        &RevListOptions {
-            count: true,
-            ..RevListOptions::default()
-        },
-    )
-    .expect("grit count")
-    .commit_count();
+    let grit_count = grit
+        .revwalk()
+        .rev_list(
+            &[String::from("main")],
+            &[],
+            &RevListOptions {
+                count: true,
+                ..RevListOptions::default()
+            },
+        )
+        .expect("grit count")
+        .commit_count();
     assert_eq!(grit_count, git_count);
 
     let (pos, neg) = split_revision_token(&range);
@@ -1446,16 +1716,17 @@ fn rev_list_objects_and_filters_match_git() {
     let grit = open_grit_repo(wt);
 
     let git_objects = support::git_rev_list(wt, &["--objects", "HEAD"]);
-    let grit_objects = grit_lib::revwalk::rev_list::rev_list(
-        &grit,
-        &[String::from("HEAD")],
-        &[],
-        &RevListOptions {
-            objects: true,
-            ..RevListOptions::default()
-        },
-    )
-    .expect("grit objects walk");
+    let grit_objects = grit
+        .revwalk()
+        .rev_list(
+            &[String::from("HEAD")],
+            &[],
+            &RevListOptions {
+                objects: true,
+                ..RevListOptions::default()
+            },
+        )
+        .expect("grit objects walk");
     let mut grit_set: std::collections::BTreeSet<ObjectId> =
         grit_objects.commits.into_iter().collect();
     for (oid, _) in grit_objects.objects {
@@ -1465,17 +1736,18 @@ fn rev_list_objects_and_filters_match_git() {
     assert_eq!(grit_set, git_set);
 
     let git_blob_none = support::git_rev_list(wt, &["--objects", "--filter=blob:none", "HEAD"]);
-    let grit_blob_none = grit_lib::revwalk::rev_list::rev_list(
-        &grit,
-        &[String::from("HEAD")],
-        &[],
-        &RevListOptions {
-            objects: true,
-            filter: Some(ObjectFilter::BlobNone),
-            ..RevListOptions::default()
-        },
-    )
-    .expect("blob none");
+    let grit_blob_none = grit
+        .revwalk()
+        .rev_list(
+            &[String::from("HEAD")],
+            &[],
+            &RevListOptions {
+                objects: true,
+                filter: Some(ObjectFilter::BlobNone),
+                ..RevListOptions::default()
+            },
+        )
+        .expect("blob none");
     let mut grit_bn: std::collections::BTreeSet<ObjectId> =
         grit_blob_none.commits.into_iter().collect();
     for (oid, _) in grit_blob_none.objects {
@@ -1500,18 +1772,19 @@ fn rev_list_objects_and_filters_match_git() {
         .trim()
         .parse()
         .expect("git object count");
-    let grit_count = grit_lib::revwalk::rev_list::rev_list(
-        &grit,
-        &[String::from("HEAD")],
-        &[],
-        &RevListOptions {
-            count: true,
-            objects: true,
-            ..RevListOptions::default()
-        },
-    )
-    .expect("grit count objects")
-    .count_with_objects_total();
+    let grit_count = grit
+        .revwalk()
+        .rev_list(
+            &[String::from("HEAD")],
+            &[],
+            &RevListOptions {
+                count: true,
+                objects: true,
+                ..RevListOptions::default()
+            },
+        )
+        .expect("grit count objects")
+        .count_with_objects_total();
     assert_eq!(grit_count, git_count_objects);
 }
 
@@ -1528,7 +1801,6 @@ fn rev_list_option_smoke_exercises_library_paths() {
             ..RevListOptions::default()
         },
         RevListOptions {
-            output_mode: grit_lib::revwalk::rev_list::OutputMode::Parents,
             parent_rewrite: true,
             ..RevListOptions::default()
         },
@@ -1573,16 +1845,11 @@ fn rev_list_option_smoke_exercises_library_paths() {
         },
     ];
     for opts in combos {
-        let _ = grit_lib::revwalk::rev_list::rev_list(&grit, &specs, &[], &opts)
+        let _ = grit
+            .revwalk()
+            .rev_list(&specs, &[], &opts)
             .expect("rev_list smoke");
     }
-    let _ = grit_lib::revwalk::rev_list::select_bisect_commits(
-        &grit,
-        &grit_rev_list_commits_in_repo(&grit, &specs, &[], &RevListOptions::default())
-            .expect("tips"),
-        false,
-    )
-    .expect("bisect");
 }
 
 const ISSUE_1067_DATE: &str = "2026-01-01T00:00:00Z";

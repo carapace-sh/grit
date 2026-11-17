@@ -103,9 +103,10 @@ impl DirectoryRenameMode {
     ///
     /// [`ConfigError::InvalidDirectoryRenames`] when the value is not recognised.
     pub fn from_config(config: &ConfigSet) -> std::result::Result<Self, ConfigError> {
-        config
-            .get(Self::CONFIG_KEY)
-            .map_or(Ok(Self::default()), |value| Self::from_config_value(&value))
+        match config.value(Self::CONFIG_KEY) {
+            None => Ok(Self::default()),
+            Some(value) => Self::from_config_value(&value),
+        }
     }
 
     /// [`Self::from_config`] for the configuration of `repo`.
@@ -114,7 +115,7 @@ impl DirectoryRenameMode {
     ///
     /// Config load failures, and [`ConfigError::InvalidDirectoryRenames`].
     pub fn from_repo(repo: &Repository) -> crate::error::Result<Self> {
-        let config = repo.config()?;
+        let config = repo.config().snapshot()?;
         Ok(Self::from_config(&config)?)
     }
 }
@@ -269,8 +270,8 @@ pub(crate) struct ReplayConflictLabels {
 
 impl ReplayConflictLabels {
     /// Labels for replaying `commit`, whose message subject line is `subject`.
-    pub(crate) fn new(commit: ObjectId, subject: &str) -> Self {
-        let theirs = format!("{} ({subject})", &commit.to_hex()[..7]);
+    pub fn new(commit: ObjectId, subject: &str) -> Self {
+        let theirs = format!("{} ({subject})", commit.to_short_hex());
         let base = format!("parent of {theirs}");
         Self { theirs, base }
     }
@@ -304,7 +305,8 @@ impl ReplayConflictLabels {
 /// - `ours_tree` — current branch tree (HEAD during pick/revert).
 /// - `theirs_tree` — tree being applied (picked commit for cherry-pick, parent of reverted commit for revert).
 /// - `favor` / `ws` — merge strategy favour and whitespace options for textual merges.
-/// - `diff_algorithm` — optional line diff algorithm name used for textual merges.
+/// - `diff_algorithm` — optional line diff algorithm for textual merges; [`None`] uses
+///   histogram, matching Git merge-ort (see `merge_file::TREE_MERGE_DIFF_ALGORITHM`).
 /// - `presentation` — conflict marker labels and style (`label_base` is the diff3 "base" name).
 /// - `directory_renames` — whether files one side added inside a directory the other side
 ///   renamed follow the rename ([`DirectoryRenameMode`]; callers usually pass
@@ -472,7 +474,10 @@ pub(crate) fn merge_trees_at_depth(
     call_depth: usize,
     replay_upstream: Option<ReplayUpstreamRenames<'_>>,
 ) -> crate::error::Result<TreeMergeOutput> {
+    use crate::merge_file::tree_merge_diff_algorithm;
     use crate::porcelain::cherry_pick::directory_renames_from_file_renames;
+
+    let diff_algorithm = Some(tree_merge_diff_algorithm(diff_algorithm));
 
     let directory_renames = if call_depth > 0 {
         DirectoryRenameMode::Off
@@ -542,7 +547,7 @@ pub(crate) fn merge_trees_at_depth(
         (touched, ours_old_to_new_pairs, theirs_pairs)
     };
 
-    let (mut base, mut ours, mut theirs) = merge_trees_walk::build_sparse_maps(
+    let (base, mut ours, mut theirs) = merge_trees_walk::build_sparse_maps(
         cache,
         repo,
         base_tree,
@@ -555,22 +560,20 @@ pub(crate) fn merge_trees_at_depth(
     augment_renames_with_same_blob(&base, &theirs, &mut theirs_pairs);
 
     let mut df_escapes = DfEscapes::default();
-    if let (Some(ours_commit), Some(theirs_commit)) = (
-        presentation.df_directory_ours_commit,
-        presentation.df_directory_theirs_commit,
-    ) {
+    if presentation.df_directory_ours_commit.is_some()
+        && presentation.df_directory_theirs_commit.is_some()
+    {
         df_escapes = apply_df_file_directory_conflicts_trees(
             cache,
             repo,
             &base_tree,
             &ours_tree,
             &theirs_tree,
-            &mut base,
+            &base,
             &mut ours,
             &mut theirs,
             &mut touched,
-            ours_commit,
-            theirs_commit,
+            presentation,
         )?;
     }
 
@@ -649,6 +652,7 @@ pub(crate) fn merge_trees_at_depth(
     };
 
     drop(ours_old_to_new_pairs);
+    let df_skip = df_escapes.skip_paths();
     let mut output = merge_trees_walk::three_way_on_touched_paths(
         cache,
         repo,
@@ -662,25 +666,14 @@ pub(crate) fn merge_trees_at_depth(
         &ours_new_to_old,
         &theirs_old_to_new,
         rename_conflicts,
+        &df_skip,
         favor,
         ws,
         diff_algorithm,
         presentation,
         call_depth,
     )?;
-    for orig in &df_escapes.relocated_from {
-        output.index.remove_path_all_stages(orig);
-    }
-    for (path, entry) in df_escapes.stage2 {
-        output.index.remove_path_all_stages(&path);
-        stage_entry(&mut output.index, &path, &entry, 2);
-        output.touched_paths.insert(path);
-    }
-    for (path, entry) in df_escapes.stage3 {
-        output.index.remove_path_all_stages(&path);
-        stage_entry(&mut output.index, &path, &entry, 3);
-        output.touched_paths.insert(path);
-    }
+    df_escapes.apply_to_output(&mut output);
     output.index.sort();
     drop((base, ours, theirs, touched));
     let mut renamed_away = HashSet::new();
@@ -739,20 +732,24 @@ fn augment_renames_with_same_blob(
     pairs: &mut Vec<RenamePathPair>,
 ) {
     use crate::porcelain::cherry_pick::same_blob_renames_from_entries;
-    for (old, new) in same_blob_renames_from_entries(
+    let candidates: Vec<(Vec<u8>, Vec<u8>)> = same_blob_renames_from_entries(
         base.iter(),
         side.iter(),
         |path| base.contains_key(path),
         |path| side.contains_key(path),
-    ) {
-        if pairs
+    );
+    let additions: Vec<RenamePathPair> = {
+        let known: HashSet<(&[u8], &[u8])> = pairs
             .iter()
-            .any(|(o, n, _)| o.as_slice() == old.as_slice() && n.as_slice() == new.as_slice())
-        {
-            continue;
-        }
-        pairs.push((old, new, 100));
-    }
+            .map(|(o, n, _)| (o.as_slice(), n.as_slice()))
+            .collect();
+        candidates
+            .into_iter()
+            .filter(|(old, new)| !known.contains(&(old.as_slice(), new.as_slice())))
+            .map(|(old, new)| (old, new, 100))
+            .collect()
+    };
+    pairs.extend(additions);
 }
 
 /// Base files each side renamed to a different, otherwise unoccupied destination.
@@ -926,11 +923,44 @@ fn renamed_file_content(
     Ok(Some(entry))
 }
 
+struct DfParkedFile {
+    orig: Vec<u8>,
+    escaped: Vec<u8>,
+    base: Option<IndexEntry>,
+    side: IndexEntry,
+    side_stage: u8,
+}
+
 #[derive(Default)]
 struct DfEscapes {
-    stage2: BTreeMap<Vec<u8>, IndexEntry>,
-    stage3: BTreeMap<Vec<u8>, IndexEntry>,
-    relocated_from: Vec<Vec<u8>>,
+    parked: Vec<DfParkedFile>,
+}
+
+impl DfEscapes {
+    fn skip_paths(&self) -> HashSet<Vec<u8>> {
+        self.parked.iter().map(|p| p.orig.clone()).collect()
+    }
+
+    fn apply_to_output(&self, output: &mut TreeMergeOutput) {
+        for parked in &self.parked {
+            output.conflict_content.remove(&parked.orig);
+            output.index.remove_path_all_stages(&parked.orig);
+            output.index.remove_path_all_stages(&parked.escaped);
+            if let Some(be) = &parked.base {
+                stage_entry(&mut output.index, &parked.escaped, be, 1);
+            }
+            stage_entry(
+                &mut output.index,
+                &parked.escaped,
+                &parked.side,
+                parked.side_stage,
+            );
+            output
+                .conflict_content
+                .insert(parked.escaped.clone(), parked.side.oid);
+            output.touched_paths.insert(parked.escaped.clone());
+        }
+    }
 }
 
 fn side_has_descendant(side: &BTreeMap<Vec<u8>, IndexEntry>, prefix: &[u8]) -> bool {
@@ -945,12 +975,11 @@ fn apply_df_file_directory_conflicts_trees(
     base_tree: &ObjectId,
     ours_tree: &ObjectId,
     theirs_tree: &ObjectId,
-    base: &mut BTreeMap<Vec<u8>, IndexEntry>,
+    base: &BTreeMap<Vec<u8>, IndexEntry>,
     ours: &mut BTreeMap<Vec<u8>, IndexEntry>,
     theirs: &mut BTreeMap<Vec<u8>, IndexEntry>,
     touched: &mut HashSet<Vec<u8>>,
-    ours_commit: ObjectId,
-    theirs_commit: ObjectId,
+    presentation: TreeMergeConflictPresentation<'_>,
 ) -> crate::error::Result<DfEscapes> {
     use merge_tree_cache::MergeTreeSide;
 
@@ -987,11 +1016,12 @@ fn apply_df_file_directory_conflicts_trees(
         if directory_unchanged_from_base(cache, odb, base_tree, theirs_tree, path)? {
             continue;
         }
-        let escaped = escape_df_path_side(ours, path, ours_commit, &mut out.stage2);
-        out.relocated_from.push(path.clone());
-        touched.insert(path.clone());
-        if let Some(p) = escaped {
-            touched.insert(p);
+        let label = presentation.label_ours.as_bytes();
+        let side_entry = ours.remove(path);
+        if let Some(parked) = park_df_file_side(base, ours, theirs, path, label, 2, side_entry) {
+            touched.insert(path.clone());
+            touched.insert(parked.escaped.clone());
+            out.parked.push(parked);
         }
     }
     for path in &theirs_paths {
@@ -1020,15 +1050,88 @@ fn apply_df_file_directory_conflicts_trees(
         if directory_unchanged_from_base(cache, odb, base_tree, ours_tree, path)? {
             continue;
         }
-        let escaped = escape_df_path_side(theirs, path, theirs_commit, &mut out.stage3);
-        out.relocated_from.push(path.clone());
-        touched.insert(path.clone());
-        if let Some(p) = escaped {
-            touched.insert(p);
+        let label = df_theirs_escape_label(presentation, path);
+        let side_entry = theirs.remove(path);
+        if let Some(parked) =
+            park_df_file_side(base, ours, theirs, path, label.as_bytes(), 3, side_entry)
+        {
+            touched.insert(path.clone());
+            touched.insert(parked.escaped.clone());
+            out.parked.push(parked);
         }
     }
-    let _ = base;
     Ok(out)
+}
+
+fn df_theirs_escape_label<'a>(
+    presentation: TreeMergeConflictPresentation<'a>,
+    path: &[u8],
+) -> std::borrow::Cow<'a, str> {
+    match presentation.label_theirs {
+        TheirsConflictLabel::Fixed(label) => std::borrow::Cow::Borrowed(label),
+        TheirsConflictLabel::PathUtf8 => {
+            std::borrow::Cow::Owned(String::from_utf8_lossy(path).into_owned())
+        }
+    }
+}
+
+fn occupied_paths(
+    base: &BTreeMap<Vec<u8>, IndexEntry>,
+    ours: &BTreeMap<Vec<u8>, IndexEntry>,
+    theirs: &BTreeMap<Vec<u8>, IndexEntry>,
+) -> HashSet<Vec<u8>> {
+    base.keys()
+        .chain(ours.keys())
+        .chain(theirs.keys())
+        .cloned()
+        .collect()
+}
+
+fn uniquify_df_escape_path(path: &[u8], label: &[u8], occupied: &HashSet<Vec<u8>>) -> Vec<u8> {
+    let mut candidate = Vec::with_capacity(path.len() + 1 + label.len());
+    candidate.extend_from_slice(path);
+    candidate.push(b'~');
+    candidate.extend_from_slice(label);
+    if !occupied.contains(&candidate) {
+        return candidate;
+    }
+    let mut n = 2u32;
+    loop {
+        let mut alt = candidate.clone();
+        alt.push(b'~');
+        alt.extend_from_slice(n.to_string().as_bytes());
+        if !occupied.contains(&alt) {
+            return alt;
+        }
+        n += 1;
+    }
+}
+
+fn park_df_file_side(
+    base: &BTreeMap<Vec<u8>, IndexEntry>,
+    ours: &BTreeMap<Vec<u8>, IndexEntry>,
+    theirs: &BTreeMap<Vec<u8>, IndexEntry>,
+    path: &[u8],
+    label: &[u8],
+    side_stage: u8,
+    side_entry: Option<IndexEntry>,
+) -> Option<DfParkedFile> {
+    let mut side_entry = side_entry?;
+    if side_entry.mode == 0o040000 {
+        return None;
+    }
+    let occupied = occupied_paths(base, ours, theirs);
+    let escaped = uniquify_df_escape_path(path, label, &occupied);
+    side_entry.path = escaped.clone();
+    side_entry.flags = path_len_flags(&escaped);
+    let base_at_path = base.get(path).filter(|e| e.mode != 0o040000).cloned();
+    Some(DfParkedFile {
+        orig: path.to_vec(),
+        escaped,
+        base: base_at_path,
+        side: side_entry,
+        side_stage,
+    })
 }
 
 /// True when `side_tree` holds exactly the base's directory at `path`.
@@ -1052,24 +1155,6 @@ fn directory_unchanged_from_base(
         return Ok(false);
     };
     Ok(base.mode == 0o040000 && side.mode == 0o040000 && base.oid == side.oid)
-}
-
-fn escape_df_path_side(
-    side: &mut BTreeMap<Vec<u8>, IndexEntry>,
-    path: &[u8],
-    side_commit: ObjectId,
-    staged: &mut BTreeMap<Vec<u8>, IndexEntry>,
-) -> Option<Vec<u8>> {
-    let mut entry = side.remove(path)?;
-    let hex = side_commit.to_hex();
-    let mut escaped_path = path.to_vec();
-    escaped_path.extend_from_slice(b"~");
-    escaped_path.extend_from_slice(hex.as_bytes());
-    entry.path = escaped_path.clone();
-    entry.flags = path_len_flags(&escaped_path);
-    staged.insert(escaped_path.clone(), entry.clone());
-    side.insert(escaped_path.clone(), entry);
-    Some(escaped_path)
 }
 
 /// Git skips D/F relocation when one side only expanded a base file into `path/…`.
@@ -1288,7 +1373,7 @@ pub(crate) fn merge_one_path(
         }
         (Some(_), None, None) => {}
         (Some(be), Some(oe), None) if same_blob(be, oe) && be.path.as_slice() == out_path => {}
-        (Some(be), None, Some(te)) if same_blob(be, te) => {}
+        (Some(be), None, Some(te)) if same_blob(be, te) && be.path.as_slice() == out_path => {}
         (Some(be), Some(_), None) | (Some(be), None, Some(_)) if ctx.virtual_base() => {
             push_stage0(index, out_path, be);
         }
@@ -1355,7 +1440,7 @@ pub(crate) struct PathMergeContext<'r> {
 }
 
 impl<'r> PathMergeContext<'r> {
-    pub(crate) fn new(repo: &'r Repository, call_depth: usize) -> Self {
+    pub fn new(repo: &'r Repository, call_depth: usize) -> Self {
         Self {
             repo,
             rules: OnceCell::new(),
@@ -1907,11 +1992,13 @@ fn pending_tree_merge_index_rows(index: &Index, merged: &TreeMergeOutput) -> Tre
                 row.stage() == 0 && existing.oid == row.oid && existing.mode == row.mode
             }
             (Some([row]), Some(existing)) => {
+                const FLAG_ASSUME_UNCHANGED: u16 = 0x8000;
                 row.stage() == 0
                     && (row.mode == MODE_REGULAR || row.mode == crate::index::MODE_EXECUTABLE)
                     && existing.oid == row.oid
                     && existing.mode == row.mode
-                    && existing.flags == row.flags
+                    && (existing.flags & !FLAG_ASSUME_UNCHANGED)
+                        == (row.flags & !FLAG_ASSUME_UNCHANGED)
                     && IndexEntry::extended_flags_equal_ignoring_volatile(
                         existing.flags_extended,
                         row.flags_extended,
@@ -1946,7 +2033,10 @@ fn pending_tree_merge_index_rows(index: &Index, merged: &TreeMergeOutput) -> Tre
     }
 }
 
-/// Tree OID to record in a commit after a three-way merge (applies conflict-marker policy).
+/// Tree OID for checkout after a conflicted three-way merge (applies conflict-marker policy).
+///
+/// Callers that only need a transient layout for worktree checkout should build this while a
+/// mem overlay is active on the ODB so marker blobs and the composed tree are not persisted.
 pub fn materialized_merge_result_tree(
     odb: &Odb,
     merged: &TreeMergeOutput,
@@ -2017,6 +2107,33 @@ pub fn materialized_merge_result_tree(
     write_tree_partial_from_index(odb, &patch_index, &merged.result_tree, &patch_paths)
 }
 
+/// Persist merge objects that stay referenced from stage-0 index rows after a conflict stop.
+///
+/// Marker blobs and the ephemeral materialized checkout tree remain in the mem overlay only.
+pub(crate) fn persist_referenced_stage0_merge_objects(
+    odb: &Odb,
+    merged: &TreeMergeOutput,
+) -> crate::error::Result<()> {
+    use std::collections::HashSet;
+
+    let mut unmerged_paths = HashSet::new();
+    unmerged_paths.extend(merged.conflict_content.keys().cloned());
+    for entry in merged.index.entries() {
+        if entry.stage() != 0 {
+            unmerged_paths.insert(entry.path.clone());
+        }
+    }
+
+    let mut oids = HashSet::new();
+    for entry in merged.index.entries() {
+        if entry.stage() != 0 || unmerged_paths.contains(&entry.path) {
+            continue;
+        }
+        oids.insert(entry.oid);
+    }
+    odb.persist_mem_overlay_objects(oids)
+}
+
 /// True when the index tree matches `head_tree_oid` (used for empty pick detection).
 pub fn index_tree_oid_matches_head(
     odb: &Odb,
@@ -2035,6 +2152,95 @@ mod tests {
     use crate::index::{IndexEntry, MODE_REGULAR};
     use crate::objects::{parse_commit, ObjectId};
     use crate::repo::Repository;
+
+    /// Issue #2431: cargo `workspaces.md` — histogram tree merge is clean; Myers `merge()` conflicts.
+    #[cfg_attr(
+        not(feature = "full-tests"),
+        ignore = "starts system git or is heavy; run with --features full-tests"
+    )]
+    #[test]
+    fn issue_2431_cargo_workspaces_md_tree_merge_clean() {
+        let base_bytes = include_bytes!("../tests/fixtures/cargo_workspaces_md_merge/base.md");
+        let ours_bytes = include_bytes!("../tests/fixtures/cargo_workspaces_md_merge/ours.md");
+        let theirs_bytes = include_bytes!("../tests/fixtures/cargo_workspaces_md_merge/theirs.md");
+        let expected =
+            include_bytes!("../tests/fixtures/cargo_workspaces_md_merge/expected_merged.md");
+        let path = "src/doc/src/reference/workspaces.md";
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let git = |args: &[&str]| grit_test_support::git(tmp.path(), args);
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "core.autocrlf", "false"]);
+        let write_commit = |content: &[u8], msg: &str| -> ObjectId {
+            let full = tmp.path().join(path);
+            if let Some(parent) = full.parent() {
+                std::fs::create_dir_all(parent).expect("mkdir");
+            }
+            std::fs::write(&full, content).expect("write");
+            git(&["add", path]);
+            git(&["commit", "-m", msg]);
+            git(&["rev-parse", "HEAD"]).trim().parse().expect("oid")
+        };
+        let base = write_commit(base_bytes, "base");
+        git(&["switch", "-c", "ours-side"]);
+        let ours = write_commit(ours_bytes, "ours");
+        git(&["switch", "-c", "theirs-side", &base.to_hex()]);
+        let theirs = write_commit(theirs_bytes, "theirs");
+        let repo =
+            Repository::discover(Some(tmp.path()), &RepositoryOptions::empty()).expect("repo");
+        let tree_of = |commit: &ObjectId| -> ObjectId {
+            let obj = repo.odb().read(commit).expect("read");
+            parse_commit(&obj.data).expect("parse").tree
+        };
+        let ours_label = ours.to_hex();
+        let theirs_label = theirs.to_hex();
+        let presentation = TreeMergeConflictPresentation {
+            label_ours: &ours_label,
+            label_theirs: TheirsConflictLabel::Fixed(&theirs_label),
+            ..TreeMergeConflictPresentation::default()
+        };
+        let out = merge_trees_three_way(
+            &repo,
+            tree_of(&base),
+            tree_of(&ours),
+            tree_of(&theirs),
+            MergeFavor::None,
+            WhitespaceMergeOptions::default(),
+            None,
+            presentation,
+            DirectoryRenameMode::default(),
+        )
+        .expect("merge");
+        assert!(
+            out.conflict_content.is_empty(),
+            "expected clean merge, conflicts: {:?}",
+            out.conflict_content.keys().collect::<Vec<_>>()
+        );
+        let merged_oid = out.index.get(path.as_bytes(), 0).expect("merged entry").oid;
+        let merged = repo.odb().read(&merged_oid).expect("blob");
+        assert_eq!(merged.data.as_slice(), expected.as_slice());
+
+        let merge_file = merge(&MergeInput {
+            base: base_bytes,
+            ours: ours_bytes,
+            theirs: theirs_bytes,
+            label_ours: "ours",
+            label_base: "base",
+            label_theirs: "theirs",
+            favor: MergeFavor::None,
+            style: ConflictStyle::Merge,
+            marker_size: 7,
+            diff_algorithm: None,
+            ignore_all_space: false,
+            ignore_space_change: false,
+            ignore_space_at_eol: false,
+            ignore_cr_at_eol: false,
+        })
+        .expect("merge-file");
+        assert!(
+            merge_file.conflicts > 0,
+            "Myers merge-file path must still conflict on this fixture"
+        );
+    }
 
     #[cfg_attr(
         not(feature = "full-tests"),
@@ -2776,6 +2982,101 @@ mod tests {
     }
 
     #[test]
+    fn persist_referenced_stage0_merge_objects_flushes_overlay_blobs() {
+        use crate::objects::ObjectKind;
+        use crate::odb::Odb;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().expect("tempdir");
+        let objects = dir.path().join("objects");
+        let odb = Odb::new(&objects);
+        odb.enable_mem_overlay();
+        let stage0_blob = odb
+            .write(ObjectKind::Blob, b"auto-merged")
+            .expect("overlay blob");
+        assert!(!odb.exists_local(&stage0_blob));
+        let marker_blob = odb.write(ObjectKind::Blob, b"<<<<").expect("marker");
+
+        let conflict_path = b"conflict.txt".to_vec();
+        let auto_path = b"auto.txt".to_vec();
+        let mut merge_index = Index::new();
+        merge_index.push_entry_unsorted(sparse_merge_test_entry("auto.txt", stage0_blob, 0));
+        merge_index.push_entry_unsorted(sparse_merge_test_entry("conflict.txt", zero_oid(), 2));
+        merge_index.push_entry_unsorted(sparse_merge_test_entry("conflict.txt", zero_oid(), 3));
+        merge_index.sort();
+        let mut conflict_content = BTreeMap::new();
+        conflict_content.insert(conflict_path.clone(), marker_blob);
+        let mut touched = HashSet::new();
+        touched.insert(conflict_path);
+        touched.insert(auto_path);
+        let merged = TreeMergeOutput {
+            index: merge_index,
+            conflict_content,
+            result_tree: zero_oid(),
+            touched_paths: touched,
+            rename_conflicts: Vec::new(),
+            directory_rename_conflicts: Vec::new(),
+        };
+
+        persist_referenced_stage0_merge_objects(&odb, &merged).expect("persist stage-0");
+        assert!(odb.exists_local(&stage0_blob));
+        assert!(!odb.exists_local(&marker_blob));
+    }
+
+    #[test]
+    fn persist_referenced_stage0_merge_objects_flushes_custom_primary_overlay_blobs() {
+        use crate::objects::odb::store::{MemoryStore, ObjectStore};
+        use crate::objects::odb::OdbBuilder;
+        use crate::objects::HashAlgo;
+        use std::fs;
+        use std::sync::Arc;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().expect("tempdir");
+        let objects = dir.path().join("objects");
+        fs::create_dir_all(&objects).expect("mkdir objects");
+        let store = Arc::new(MemoryStore::new(HashAlgo::Sha1));
+        let odb = OdbBuilder::new().build(&objects, Some(store.clone()));
+        odb.enable_mem_overlay();
+        let stage0_blob = odb
+            .write(ObjectKind::Blob, b"auto-merged")
+            .expect("overlay blob");
+        assert!(!store.contains(&stage0_blob).expect("contains"));
+        let marker_blob = odb.write(ObjectKind::Blob, b"<<<<").expect("marker");
+
+        let conflict_path = b"conflict.txt".to_vec();
+        let auto_path = b"auto.txt".to_vec();
+        let mut merge_index = Index::new();
+        merge_index.push_entry_unsorted(sparse_merge_test_entry("auto.txt", stage0_blob, 0));
+        merge_index.push_entry_unsorted(sparse_merge_test_entry("conflict.txt", zero_oid(), 2));
+        merge_index.push_entry_unsorted(sparse_merge_test_entry("conflict.txt", zero_oid(), 3));
+        merge_index.sort();
+        let mut conflict_content = BTreeMap::new();
+        conflict_content.insert(conflict_path.clone(), marker_blob);
+        let mut touched = HashSet::new();
+        touched.insert(conflict_path);
+        touched.insert(auto_path);
+        let merged = TreeMergeOutput {
+            index: merge_index,
+            conflict_content,
+            result_tree: zero_oid(),
+            touched_paths: touched,
+            rename_conflicts: Vec::new(),
+            directory_rename_conflicts: Vec::new(),
+        };
+
+        persist_referenced_stage0_merge_objects(&odb, &merged).expect("persist stage-0");
+        assert!(store.contains(&stage0_blob).expect("stage-0 in primary"));
+        assert!(!store.contains(&marker_blob).expect("marker not in primary"));
+        assert_eq!(
+            fs::read_dir(&objects).expect("read objects dir").count(),
+            0,
+            "no loose shards beside a custom primary"
+        );
+        assert!(odb.read(&stage0_blob).expect("read stage-0").data == b"auto-merged");
+    }
+
+    #[test]
     fn apply_tree_merge_output_to_index_sparse_updates_keep_sorted() {
         let oid = zero_oid();
         let changed_oid =
@@ -2831,7 +3132,7 @@ mod tests {
         grit_test_support::git(dir.path(), &["add", "tracked.txt"]);
         let repo =
             Repository::discover(Some(dir.path()), &RepositoryOptions::empty()).expect("repo");
-        let mut index = repo.index_handle().load().expect("index");
+        let mut index = repo.load_index().expect("index");
         let row = index.get(b"tracked.txt", 0).expect("row").clone();
         let oid = row.oid;
         let mut indexed = row.clone();
@@ -2877,7 +3178,7 @@ mod tests {
         grit_test_support::git(dir.path(), &["add", "tracked.txt"]);
         let repo =
             Repository::discover(Some(dir.path()), &RepositoryOptions::empty()).expect("repo");
-        let mut index = repo.index_handle().load().expect("index");
+        let mut index = repo.load_index().expect("index");
         let old_oid = index.get(b"tracked.txt", 0).expect("row").oid;
         let mut indexed = index.get(b"tracked.txt", 0).expect("row").clone();
         indexed.set_fsmonitor_valid(true);

@@ -1,14 +1,14 @@
 //! [`create_commit`] identities must pass `git fsck --strict`, and typed identities that cannot
 //! be written are rejected before anything is recorded.
 
+use grit_lib::error::ObjectError;
 use std::process::Command;
 
 use grit_lib::config::environment::{Environment, RepositoryOptions};
 use grit_lib::config::ident_resolve::{IdentRole, IdentityError};
 use grit_lib::error::Error;
 use grit_lib::ident::{Signature, SignatureError};
-use grit_lib::porcelain::commit::{create_commit, CommitRequest};
-use grit_lib::porcelain::staging::stage_worktree_changes;
+use grit_lib::porcelain::commit::CommitRequest;
 use grit_lib::progress::NullProgress;
 use grit_lib::repo::{InitOptions, Repository};
 use time::OffsetDateTime;
@@ -43,6 +43,7 @@ fn init(root: &std::path::Path) -> Repository {
         &InitOptions::default().with_initial_branch("main".to_owned()),
     )
     .expect("init")
+    .0
 }
 
 /// Reopen `root` with an explicit identity environment (no process environment reads).
@@ -68,7 +69,7 @@ fn create_commit_signature_passes_git_fsck_strict() {
     let root = td.path();
     let repo = init(root);
     std::fs::write(root.join("a.txt"), "hi\n").expect("file");
-    stage_worktree_changes(&repo, &[]).expect("stage");
+    &repo.index().stage_worktree_paths(&[]).expect("stage");
 
     let doc = Signature::new(
         "Doc",
@@ -76,19 +77,19 @@ fn create_commit_signature_passes_git_fsck_strict() {
         OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("time"),
     )
     .expect("signature");
-    let req = CommitRequest {
-        message: "first\n".into(),
-        author: Some(doc.clone()),
-        committer: Some(doc),
-        ..Default::default()
+    let req = {
+        let mut req = CommitRequest::new("first\n");
+        req.author = Some(doc.clone());
+        req.committer = Some(doc);
+        req
     };
-    create_commit(
-        &repo,
-        &req,
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("create_commit");
+    repo.commits()
+        .create_staged(
+            &req,
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("create_commit");
 
     git_stdout(root, &["fsck", "--strict"]);
     assert_eq!(
@@ -131,18 +132,18 @@ fn create_commit_defaults_to_repository_identity() {
     );
 
     std::fs::write(root.join("a.txt"), "hi\n").expect("file");
-    stage_worktree_changes(&repo, &[]).expect("stage");
-    let req = CommitRequest {
-        message: "first\n".into(),
-        ..Default::default()
+    &repo.index().stage_worktree_paths(&[]).expect("stage");
+    let req = {
+        let mut req = CommitRequest::new("first\n");
+        req
     };
-    create_commit(
-        &repo,
-        &req,
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("create_commit");
+    repo.commits()
+        .create_staged(
+            &req,
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("create_commit");
 
     git_stdout(root, &["fsck", "--strict"]);
     assert_eq!(
@@ -163,26 +164,33 @@ fn repository_identity_reports_missing_configuration() {
     assert!(
         matches!(
             err,
-            Error::Identity(IdentityError::MissingConfiguredEmail {
+            CommitError::Identity(IdentityError::MissingConfiguredEmail {
                 role: IdentRole::Author
             })
         ),
         "unexpected error: {err}"
     );
 
-    let req = CommitRequest {
-        message: "x\n".into(),
-        allow_empty: true,
-        ..Default::default()
+    let req = {
+        let mut req = CommitRequest::new("x\n");
+        req.allow_empty = true;
+        req
     };
-    let err = create_commit(
-        &repo,
-        &req,
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect_err("no identity");
-    assert!(matches!(err, Error::Identity(_)), "unexpected error: {err}");
+    let err = repo
+        .commits()
+        .create_staged(
+            &req,
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect_err("no identity");
+    assert!(
+        matches!(
+            err,
+            grit_lib::error::Error::Commit(CommitError::Identity(_))
+        ),
+        "unexpected error: {err}"
+    );
 }
 
 #[test]
@@ -197,29 +205,32 @@ fn create_commit_rejects_unwritable_signatures() {
         time,
     };
 
-    let bad = CommitRequest {
-        message: "x\n".into(),
-        author: Some(injected.clone()),
-        committer: Some(injected),
-        allow_empty: true,
-        ..Default::default()
+    let bad = {
+        let mut req = CommitRequest::new("x\n");
+        req.author = Some(injected.clone());
+        req.committer = Some(injected);
+        req.allow_empty = true;
+        req
     };
-    let err = create_commit(
-        &repo,
-        &bad,
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect_err("invalid identity");
+    let err = repo
+        .commits()
+        .create_staged(
+            &bad,
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect_err("invalid identity");
     assert!(
         matches!(
             err,
-            Error::InvalidSignature(SignatureError::ForbiddenCharacter { .. })
+            Error::Object(ObjectError::InvalidSignature(
+                SignatureError::ForbiddenCharacter { .. }
+            ))
         ),
         "unexpected error: {err}"
     );
     assert!(
-        grit_lib::refs::resolve_ref(repo.git_dir(), "refs/heads/main").is_err(),
+        repo.references().resolve("refs/heads/main").is_err(),
         "nothing may be committed with an invalid identity"
     );
 }

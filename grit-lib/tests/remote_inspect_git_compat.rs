@@ -1,4 +1,4 @@
-//! `RepositoryRemotes::inspect` compared with `git remote show`.
+//! `Remotes::inspect` compared with `git remote show`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -317,7 +317,7 @@ fn inspect_tracked_with_non_directory_destination_prefix_reftable() {
     let head = ObjectId::from_hex(git(&upstream, &["rev-parse", "HEAD"]).trim()).expect("oid");
 
     let client = tmp.path().join("client");
-    let repo = Repository::init(
+    let (repo, _) = Repository::init(
         &client,
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
@@ -338,7 +338,7 @@ fn inspect_tracked_with_non_directory_destination_prefix_reftable() {
     )
     .expect("write alternates");
     for name in ["refs/remotes/origin-main", "refs/remotes/origin-topic"] {
-        grit_lib::refs::write_ref(&repo.git_dir(), name, &head).expect("write tracking ref");
+        grit_test_support::refs::set_ref(&repo, name, &head).expect("write tracking ref");
     }
 
     let repo = open_repo(&client);
@@ -408,7 +408,7 @@ fn inspect_unknown_remote_typed_error() {
         .expect_err("missing remote");
     assert!(matches!(
         err,
-        grit_lib::remote::RemoteError::UnknownRemote(name) if name == "nosuch"
+        grit_lib::remote::RemoteError::UnknownRemote { name } if name == "nosuch"
     ));
 }
 

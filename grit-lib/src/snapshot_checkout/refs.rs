@@ -3,9 +3,10 @@
 //! reflogs.
 
 use crate::error::Error;
+use crate::error::RefError;
 use crate::ident::Signature;
 use crate::objects::ObjectId;
-use crate::refs::store::{Expected, RawRef, RefStoreError, ReflogUpdate};
+use crate::refs::store::{Expected, RawRef, RefNameRef, RefStoreError, ReflogUpdate};
 use crate::repo::Repository;
 
 use super::Result;
@@ -71,14 +72,16 @@ pub(crate) fn log_head_move_as(
     identity: &str,
     message: &str,
 ) -> Result<()> {
-    let config = repo.config()?;
+    let config = repo.config().snapshot()?;
     if !crate::refs::should_autocreate_reflog_with_config(&config, repo.git_dir(), "HEAD")
-        && !repo.refs().reflog_exists("HEAD")?
+        && !repo
+            .ref_store()
+            .reflog_exists(RefNameRef::from_trusted("HEAD"))?
     {
         return Ok(());
     }
     crate::refs::append_reflog_on_store(
-        repo.refs(),
+        repo.ref_store(),
         "HEAD",
         &old,
         &new,
@@ -104,10 +107,12 @@ pub(crate) fn swap_ref_as(
     identity: &str,
     message: &str,
 ) -> Result<Swap> {
-    let config = repo.config()?;
+    let config = repo.config().snapshot()?;
     let logged =
         crate::refs::should_autocreate_reflog_with_config(&config, repo.git_dir(), refname)
-            || repo.refs().reflog_exists(refname)?;
+            || repo
+                .ref_store()
+                .reflog_exists(RefNameRef::from_trusted(refname))?;
     let reflog = logged.then(|| ReflogUpdate {
         identity: identity.to_owned(),
         message: message.to_owned(),
@@ -117,7 +122,7 @@ pub(crate) fn swap_ref_as(
         new_oid: None,
     });
     match crate::refs::store_write_value_on_store(
-        repo.refs(),
+        repo.ref_store(),
         repo.git_dir(),
         refname,
         Some(RawRef::Direct(new)),
@@ -125,8 +130,8 @@ pub(crate) fn swap_ref_as(
         reflog,
     ) {
         Ok(()) => Ok(Swap::Done),
-        Err(Error::RefStore(RefStoreError::ExpectedMismatch { .. })) => Ok(Swap::Moved),
-        Err(e) => Err(e.into()),
+        Err(Error::Ref(RefError::Store(RefStoreError::ExpectedMismatch { .. }))) => Ok(Swap::Moved),
+        Err(e) => Err(e),
     }
 }
 
@@ -144,7 +149,7 @@ mod tests {
     #[test]
     fn swaps_are_create_only_or_compare_and_swap_and_logged() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let repo = Repository::init(dir.path(), &InitOptions::default()).expect("init");
+        let (repo, _) = Repository::init(dir.path(), &InitOptions::default()).expect("init");
         let a = crate::refs::test_commit(repo.git_dir(), "a");
         let b = crate::refs::test_commit(repo.git_dir(), "b");
         let name = "refs/heads/topic";

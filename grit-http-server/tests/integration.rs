@@ -15,6 +15,9 @@ mod git_smart_http;
 #[cfg(feature = "full-tests")]
 #[path = "serve.rs"]
 mod serve;
+#[cfg(feature = "full-tests")]
+#[path = "shutdown_slow_hook.rs"]
+mod shutdown_slow_hook;
 
 /// Fails when a file in `tests/` is neither a module above nor a `[[test]]`
 /// target in Cargo.toml: with `autotests = false` cargo would never build it.
@@ -27,7 +30,7 @@ fn every_test_file_is_compiled() {
     for item in std::fs::read_dir(&dir).expect("read tests/") {
         let name = item.expect("tests/ entry").file_name();
         let Some(name) = name.to_str() else { continue };
-        if !name.ends_with(".rs") || name == "integration.rs" {
+        if !name.ends_with(".rs") || name == "integration.rs" || name.ends_with("_data.rs") {
             continue;
         }
         let module = format!("#[path = \"{name}\"]");

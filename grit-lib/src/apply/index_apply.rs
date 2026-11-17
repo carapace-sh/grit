@@ -131,14 +131,23 @@ pub fn apply_patch_to_index_and_write(
     repo: &Repository,
     patches: &[FilePatch],
     opts: &IndexApplyOptions,
+    cancel: &crate::progress::CancelToken,
 ) -> std::result::Result<IndexApplyOutcome, ApplyError> {
-    let handle = repo.index_handle();
+    let handle = repo.index();
     let mut lock = handle.begin_update().map_err(|e| library_err_path("", e))?;
-    let mut index = handle.load().map_err(|e| library_err_path("", e))?;
+    crate::progress::poll_cancel(&mut crate::progress::NullProgress, cancel)
+        .map_err(|e| library_err_path("", e))?;
+    let mut index = handle
+        .load(&crate::index::IndexLoadOptions::default())
+        .map_err(|e| library_err_path("", e))?;
     let outcome = apply_patch_to_index(repo, &mut index, patches, opts)?;
+    crate::progress::poll_cancel(&mut crate::progress::NullProgress, cancel)
+        .map_err(|e| library_err_path("", e))?;
     if opts.dry_run {
         return Ok(outcome);
     }
+    crate::progress::poll_cancel(&mut crate::progress::NullProgress, cancel)
+        .map_err(|e| library_err_path("", e))?;
     handle
         .commit_update(&mut lock, &mut index, false)
         .map_err(|e| library_err_path("", e))?;
@@ -435,6 +444,9 @@ fn upsert_index_entry(index: &mut Index, path: &str, oid: ObjectId, mode: u32) {
 }
 
 fn library_err_path(path: &str, err: Error) -> ApplyError {
+    if matches!(err, Error::Cancelled) {
+        return ApplyError::Cancelled;
+    }
     ApplyError::Failed {
         path: path.to_string(),
         message: err.to_string(),
@@ -485,7 +497,7 @@ mod tests {
         )
         .unwrap();
         let repo = Repository::discover(Some(dir.path()), &RepositoryOptions::default()).unwrap();
-        let mut index = repo.index_handle().load().unwrap();
+        let mut index = repo.load_index().unwrap();
         apply_patch_to_index(&repo, &mut index, &patch, &IndexApplyOptions::default()).unwrap();
         let entry = index.get(b"f.txt", 0).unwrap();
         let blob = repo.odb().read(&entry.oid).unwrap();
@@ -505,7 +517,7 @@ mod tests {
 
     fn repo_with_index(files: &[(&str, &[u8])]) -> (tempfile::TempDir, Repository, Index) {
         let dir = tempfile::tempdir().unwrap();
-        let repo =
+        let (repo, _) =
             Repository::init(dir.path(), &crate::repo::InitOptions::default()).expect("init");
         let mut index = Index::new();
         for (path, data) in files {
@@ -513,6 +525,24 @@ mod tests {
             upsert_index_entry(&mut index, path, oid, MODE_REGULAR);
         }
         (dir, repo, index)
+    }
+
+    #[test]
+    fn apply_patch_to_index_and_write_cancelled_leaves_index_untouched() {
+        use crate::progress::CancelToken;
+        use std::fs;
+
+        let (_dir, repo, mut index) = repo_with_index(&[("f.txt", b"a\n")]);
+        repo.write_index(&mut index).expect("write index");
+        let before = fs::read(repo.index_path()).expect("read index");
+        let cancel = CancelToken::new();
+        cancel.cancel();
+        let patch = one_line_patch("f.txt", "a", "b");
+        let err =
+            apply_patch_to_index_and_write(&repo, &[patch], &IndexApplyOptions::default(), &cancel)
+                .expect_err("cancelled");
+        assert_eq!(err, ApplyError::Cancelled);
+        assert_eq!(fs::read(repo.index_path()).expect("read index"), before);
     }
 
     fn blob_at(repo: &Repository, index: &Index, path: &str) -> Vec<u8> {

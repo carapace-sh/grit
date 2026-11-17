@@ -9,7 +9,6 @@ use std::process::{Command, Stdio};
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::objects::{HashAlgo, ObjectId, ObjectKind};
 use grit_lib::repo::{InitOptions, Repository};
-use grit_lib::revwalk::rev_parse::abbreviate_object_id;
 use tempfile::TempDir;
 
 fn git(dir: &Path, args: &[&str]) {
@@ -83,7 +82,7 @@ fn abbrev_extends_prefix_when_collision_lives_in_alternate_pack() {
     let alt_work = root.path().join("alt");
     fs::create_dir_all(&alt_work).expect("alt dir");
     git(&alt_work, &["init", "-q", "-b", "main"]);
-    let alt_repo = Repository::init(&alt_work, &InitOptions::default()).expect("alt init");
+    let (alt_repo, _) = Repository::init(&alt_work, &InitOptions::default()).expect("alt init");
     assert_eq!(
         alt_repo
             .odb()
@@ -96,7 +95,7 @@ fn abbrev_extends_prefix_when_collision_lives_in_alternate_pack() {
     let primary_work = root.path().join("primary");
     fs::create_dir_all(&primary_work).expect("primary dir");
     git(&primary_work, &["init", "-q", "-b", "main"]);
-    let primary_repo =
+    let (primary_repo, _) =
         Repository::init(&primary_work, &InitOptions::default()).expect("primary init");
     assert_eq!(
         primary_repo
@@ -135,7 +134,10 @@ fn abbrev_extends_prefix_when_collision_lives_in_alternate_pack() {
     assert!(git_short.status.success());
     let git_short = String::from_utf8_lossy(&git_short.stdout).trim().to_owned();
 
-    let grit_short = abbreviate_object_id(&repo, second_oid, 7).expect("abbrev");
+    let grit_short = repo
+        .revwalk()
+        .abbreviate(second_oid, grit_lib::revwalk::AbbrevLength::AtLeast(7))
+        .expect("abbrev");
     assert_eq!(
         grit_short, git_short,
         "grit must match git when a 7-hex collision spans primary and alternate packs"

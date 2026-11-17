@@ -1,23 +1,33 @@
 //! Typed failures for history rewrite planning.
 
-use crate::error::Error;
+use crate::error::{Error, ErrorSummary};
 use crate::objects::ObjectId;
 use crate::operation::Conflict;
-use thiserror::Error;
+use crate::refs::store::RefStoreError;
+
+use super::PlanningError;
 
 /// Failure modes while building a [`super::RewritePlan`](crate::history::RewritePlan).
-#[derive(Debug, Error)]
+///
+/// Surfaced on the umbrella as [`Error::History`](crate::error::Error::History); repository,
+/// object, ref, and I/O failures during a rewrite are reported in their own areas.
+#[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum HistoryError {
-    /// Underlying object database, revision walk, or ref operation failed.
+    /// Invalid or inconsistent planning inputs (distinct from repository read failures, which
+    /// surface as their own [`Error`](enum@crate::error::Error) area).
     #[error(transparent)]
-    Library(Box<Error>),
+    Planning(#[from] PlanningError),
+
+    /// A resumable rebase session failed before or after invoking the rewrite engine.
+    #[error(transparent)]
+    RebaseSession(Box<super::RebaseSessionError>),
 
     /// The replacement commit message is empty after whitespace cleanup.
     #[error("commit message cannot be empty")]
     EmptyMessage,
 
-    /// [`super::reword::reword_with`](crate::history::reword::reword_with) needs a message and/or author change.
+    /// [`History::reword`](super::History::reword) needs a message and/or author change.
     #[error("reword requires a new message or author")]
     NothingToReword,
 
@@ -57,15 +67,6 @@ pub enum HistoryError {
     #[error("pathspec selected every change in the commit")]
     SplitSelectsEverything,
 
-    /// A planning input is invalid (for example a squash range that is not `<base>..<tip>`), or
-    /// [`plan_rewrite`](crate::history::plan_rewrite) hit a repository read failure other than a
-    /// missing object. Other entry points report library failures as [`Self::Library`].
-    #[error("history rewrite planning failed: {message}")]
-    Planning {
-        /// Underlying failure summary.
-        message: String,
-    },
-
     /// `InsertBefore` was requested on a merge commit.
     #[error("insert-before on merge commit {commit} is not supported")]
     InsertBeforeOnMerge {
@@ -81,7 +82,7 @@ pub enum HistoryError {
         /// First line of that commit's message.
         subject: String,
         /// Conflicted paths and how they conflicted, sorted by path.
-        conflicts: Vec<Conflict>,
+        conflicts: Box<Vec<Conflict>>,
         /// Full names of the scoped branches whose replay failed, sorted, when `commit` is not
         /// on `HEAD`'s history: under [`RefScope::Branches`](super::RefScope::Branches) another
         /// branch built on the edited commits could not be moved onto the new history, and
@@ -153,10 +154,14 @@ pub enum HistoryError {
     },
 
     /// Commit signing failed while writing a replacement commit object.
-    #[error("commit signing failed: {message}")]
+    #[error("commit signing failed")]
     Signing {
-        /// Underlying signing or config failure summary.
-        message: String,
+        /// Signing program invoked (`gpg`, `ssh-keygen`, …).
+        program: String,
+        /// Subprocess exit status when the program ran.
+        status: Option<i32>,
+        /// Subprocess stderr (or a short summary when spawn failed).
+        stderr: Box<String>,
     },
 
     /// Applying the plan would overwrite staged or unstaged worktree changes on affected paths.
@@ -188,8 +193,9 @@ pub enum HistoryError {
     /// Replaying a later commit onto one that an `--exec` command amended or extended
     /// produced conflicts. The conflicted replay is checked out with conflict markers on
     /// top of the rewritten commit, branch refs are unchanged, and recovery state is
-    /// persisted: resolve and stage, then [`super::continue_rebase`]; or
-    /// [`super::skip_rebase`] to drop the commit, or [`super::abort_rebase`].
+    /// persisted: resolve and stage, then [`History::continue_rebase`](super::History::continue_rebase);
+    /// or [`History::skip_rebase`](super::History::skip_rebase) to drop the commit, or
+    /// [`History::abort_rebase`](super::History::abort_rebase).
     #[error(
         "replay of commit {commit} onto the commit rewritten by rebase --exec produced conflicts"
     )]
@@ -197,7 +203,7 @@ pub enum HistoryError {
         /// Original commit that could not be replayed cleanly.
         commit: ObjectId,
         /// Conflicted paths and how they conflicted, sorted by path.
-        conflicts: Vec<Conflict>,
+        conflicts: Box<Vec<Conflict>>,
         /// Captured invocations before the conflict, in execution order.
         runs: Vec<super::ExecRunRecord>,
     },
@@ -268,17 +274,23 @@ pub enum HistoryError {
     },
 
     /// Ref storage rejected the update batch.
-    #[error("ref update failed: {message}")]
-    RefApply {
-        /// Backend error summary.
-        message: String,
-    },
+    #[error(transparent)]
+    RefApply(#[from] RefStoreError),
 
     /// Index or worktree update failed after refs were already moved.
-    #[error("worktree update failed: {message}")]
+    #[error("worktree update failed: {source}")]
     WorktreeApply {
-        /// Underlying failure.
-        message: String,
+        /// Underlying failure after ref updates.
+        #[source]
+        source: ErrorSummary,
+    },
+
+    /// The worktree update after refs moved could not proceed (missing snapshot data, a path
+    /// that could not be restored, or no work tree).
+    #[error("worktree update failed: {detail}")]
+    WorktreeApplyFailed {
+        /// What could not be done.
+        detail: String,
     },
 
     /// No `.git/grit/history-last` record exists.
@@ -292,18 +304,35 @@ pub enum HistoryError {
         name: String,
     },
 
-    /// Failed to read `.git/grit/history-last`.
-    #[error("could not read history undo record: {message}")]
+    /// Failed to read `.git/grit/history-last` or rewrite journal files.
+    #[error("could not read history undo record: {source}")]
     UndoRecordRead {
-        /// Parse or I/O failure summary.
-        message: String,
+        /// Underlying I/O failure.
+        #[source]
+        source: ErrorSummary,
     },
 
-    /// Failed to write `.git/grit/history-last`.
-    #[error("could not write history undo record: {message}")]
+    /// `.git/grit/history-last` or a rewrite journal file is malformed.
+    #[error("history undo record is malformed: {detail}")]
+    UndoRecordCorrupt {
+        /// What is wrong with the record.
+        detail: String,
+    },
+
+    /// Failed to write `.git/grit/history-last` or rewrite journal files.
+    #[error("could not write history undo record: {source}")]
     UndoRecordWrite {
-        /// I/O or lock failure summary.
-        message: String,
+        /// Underlying I/O or lock failure.
+        #[source]
+        source: ErrorSummary,
+    },
+
+    /// A history undo record or rewrite journal could not be written because its contents
+    /// are invalid (for example a snapshot path that is not repository-relative).
+    #[error("could not write history undo record: {detail}")]
+    UndoRecordUnwritable {
+        /// What is wrong with the contents.
+        detail: String,
     },
 
     /// Refs were updated but the worktree checkout did not finish (see `.git/grit/rewrite-apply/`).
@@ -311,35 +340,98 @@ pub enum HistoryError {
     RewriteApplyIncomplete,
 
     /// Checkout failed after refs were updated; rollback or worktree restore may also have failed.
-    #[error("checkout failed after refs were updated")]
+    #[error("checkout failed after refs were updated: {checkout}")]
     ApplyRollbackIncomplete {
         /// Primary checkout failure.
-        checkout: String,
+        #[source]
+        checkout: ErrorSummary,
         /// Ref rollback error, when rolling back failed.
-        ref_rollback: Option<String>,
+        ref_rollback: Option<ErrorSummary>,
         /// Worktree/index restore error after checkout failed.
-        worktree_restore: Option<String>,
+        worktree_restore: Option<ErrorSummary>,
     },
 }
 
+/// [`HistoryError::WorktreeApply`] for an I/O failure.
+#[must_use]
+pub(crate) fn worktree_apply_io(err: std::io::Error) -> Error {
+    worktree_apply_engine(Error::Io(err))
+}
+
+/// [`HistoryError::WorktreeApply`] for a library failure.
+#[must_use]
+pub(crate) fn worktree_apply_engine(err: impl Into<Error>) -> Error {
+    HistoryError::WorktreeApply {
+        source: ErrorSummary::from(err.into()),
+    }
+    .into()
+}
+
+/// [`HistoryError::WorktreeApplyFailed`] with `detail`.
+#[must_use]
+pub(crate) fn worktree_apply_str(detail: impl Into<String>) -> Error {
+    HistoryError::WorktreeApplyFailed {
+        detail: detail.into(),
+    }
+    .into()
+}
+
+#[must_use]
+pub(crate) fn undo_record_write_engine(err: impl Into<Error>) -> Error {
+    HistoryError::UndoRecordWrite {
+        source: ErrorSummary::from(err.into()),
+    }
+    .into()
+}
+
+#[must_use]
+pub(crate) fn undo_record_read_io(err: std::io::Error) -> Error {
+    HistoryError::UndoRecordRead {
+        source: ErrorSummary::from(Error::Io(err)),
+    }
+    .into()
+}
+
+#[must_use]
+pub(crate) fn undo_record_write_io(err: std::io::Error) -> Error {
+    undo_record_write_engine(Error::Io(err))
+}
+
+#[must_use]
+pub(crate) fn undo_record_read_str(detail: impl Into<String>) -> Error {
+    HistoryError::UndoRecordCorrupt {
+        detail: detail.into(),
+    }
+    .into()
+}
+
+#[must_use]
+pub(crate) fn undo_record_write_str(detail: impl Into<String>) -> Error {
+    HistoryError::UndoRecordUnwritable {
+        detail: detail.into(),
+    }
+    .into()
+}
+
 impl HistoryError {
-    /// Whether the rewrite was cancelled ([`Error::Cancelled`]).
+    /// Whether the rewrite was cancelled (a cancellation recorded as the cause of a failed
+    /// worktree update, undo-record access, or rollback).
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
         match self {
-            Self::Library(e) => e.is_cancelled(),
+            Self::WorktreeApply { source }
+            | Self::UndoRecordRead { source }
+            | Self::UndoRecordWrite { source } => source.is_cancelled(),
+            Self::ApplyRollbackIncomplete {
+                checkout,
+                ref_rollback,
+                worktree_restore,
+            } => {
+                checkout.is_cancelled()
+                    || ref_rollback.as_ref().is_some_and(|e| e.is_cancelled())
+                    || worktree_restore.as_ref().is_some_and(|e| e.is_cancelled())
+            }
             _ => false,
-        }
-    }
-}
-
-impl From<Error> for HistoryError {
-    /// Unwraps [`Error::History`] back to the history failure it carries; every other library
-    /// error becomes [`HistoryError::Library`].
-    fn from(err: Error) -> Self {
-        match err {
-            Error::History(inner) => inner,
-            other => Self::Library(Box::new(other)),
         }
     }
 }

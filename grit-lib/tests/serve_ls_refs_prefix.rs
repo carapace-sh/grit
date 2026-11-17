@@ -15,13 +15,13 @@ use std::sync::{Arc, RwLock};
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::error::Result;
 use grit_lib::objects::odb::store::{ObjectStore, WritableObjectStore};
-use grit_lib::objects::odb::{OdbBuilder, WriteOptions};
+use grit_lib::objects::odb::WriteOptions;
 use grit_lib::objects::{HashAlgo, Object, ObjectId, ObjectInfo, ObjectKind};
 use grit_lib::remote::pkt_line;
 use grit_lib::remote::serve::{
-    receive_pack, upload_pack, ProtocolVersion, ReceivePolicy, ServeOptions,
+    ProtocolVersion, ReceivePack, ReceivePolicy, ServeOptions, UploadPack,
 };
-use grit_lib::repo::{InitOptions, Repository, RepositoryBuilder};
+use grit_lib::repo::{InitOptions, Repository};
 
 /// In-memory object store that counts every lookup the server makes.
 #[derive(Debug, Default)]
@@ -114,13 +114,9 @@ fn serve_opts(protocol: ProtocolVersion, stateless_rpc: bool, hidden: &[&str]) -
 fn grit_ls_refs(repo: &Repository, args: &[&str], hidden: &[&str]) -> Vec<u8> {
     let mut out = Vec::new();
     let mut opts = serve_opts(ProtocolVersion::V2, true, hidden);
-    upload_pack(
-        repo,
-        &mut Cursor::new(ls_refs_request(args)),
-        &mut out,
-        &mut opts,
-    )
-    .expect("grit ls-refs");
+    UploadPack::new(repo, &mut opts)
+        .run(&mut Cursor::new(ls_refs_request(args)), &mut out)
+        .expect("grit ls-refs");
     out
 }
 
@@ -148,14 +144,12 @@ fn many_ref_repo(n: usize) -> (tempfile::TempDir, Repository, Arc<CountingStore>
             .with_initial_branch("main"),
     )
     .expect("init");
-    let repo = RepositoryBuilder::new(RepositoryOptions::empty())
-        .odb_builder(
-            OdbBuilder::files(dir.path().join("objects"))
-                .primary(Arc::clone(&store) as Arc<dyn WritableObjectStore>)
-                .alternates(false),
-        )
-        .open(dir.path(), None)
-        .expect("open over counting store");
+    let repo = Repository::open(
+        dir.path(),
+        &(RepositoryOptions::empty()
+            .with_object_store(Arc::clone(&store) as Arc<dyn WritableObjectStore>)),
+    )
+    .expect("open over counting store");
     let tree = repo.odb().write(ObjectKind::Tree, b"").expect("tree");
     let commit = repo
         .odb()
@@ -175,6 +169,18 @@ fn many_ref_repo(n: usize) -> (tempfile::TempDir, Repository, Arc<CountingStore>
     std::fs::write(dir.path().join("packed-refs"), packed).expect("packed-refs");
     std::fs::write(dir.path().join("refs/heads/main"), format!("{commit}\n")).expect("main");
     (dir, repo, store, commit)
+}
+
+#[test]
+fn ls_refs_peel_many_branches_at_one_commit_reads_objects_once() {
+    let (_dir, repo, store, _commit) = many_ref_repo(500);
+    let before = store.lookups();
+    let out = grit_ls_refs(&repo, &["peel"], &[]);
+    assert_eq!(pkt_lines(&out).len(), 501);
+    assert!(
+        store.lookups() - before <= 1,
+        "peeling 500 branch refs at one commit must not read the commit per ref"
+    );
 }
 
 #[test]
@@ -393,7 +399,8 @@ fn v0_advertisements_match_git_apart_from_capabilities() {
     );
     let mut actual = Vec::new();
     let mut opts = serve_opts(ProtocolVersion::V0, false, &[hidden]);
-    upload_pack(&repo, &mut Cursor::new(b""), &mut actual, &mut opts)
+    UploadPack::new(&repo, &mut opts)
+        .run(&mut Cursor::new(b""), &mut actual)
         .expect("grit upload-pack advertisement");
     assert_eq!(
         without_capabilities(&actual),
@@ -412,13 +419,12 @@ fn v0_advertisements_match_git_apart_from_capabilities() {
         b"",
     );
     let mut actual = Vec::new();
-    receive_pack(
+    ReceivePack::new(
         &repo,
-        &mut Cursor::new(b""),
-        &mut actual,
         &serve_opts(ProtocolVersion::V0, false, &[hidden]),
         &ReceivePolicy::default(),
     )
+    .run(&mut Cursor::new(b""), &mut actual)
     .expect("grit receive-pack advertisement");
     assert_eq!(
         without_capabilities(&actual),
@@ -454,5 +460,38 @@ fn ls_refs_unborn_head_matches_git() {
             String::from_utf8_lossy(&expected),
             "ls-refs {args:?}"
         );
+    }
+}
+
+#[test]
+fn ls_refs_peel_on_memory_primary_clone_matches_files_clone() {
+    let (upstream, history) = crate::support::tagged_upstream();
+    let (_files_dir, files_repo, _) = crate::support::clone_upstream(upstream.path(), false);
+    let (_memory_dir, memory_repo, _) = crate::support::clone_upstream(upstream.path(), true);
+    let requests: &[&[&str]] = &[
+        &["peel"],
+        &["peel", "symrefs"],
+        &["peel", "ref-prefix refs/tags/"],
+        &["peel", "ref-prefix refs/tags/nested"],
+    ];
+    for args in requests {
+        assert_eq!(
+            String::from_utf8_lossy(&grit_ls_refs(&memory_repo, args, &[])),
+            String::from_utf8_lossy(&grit_ls_refs(&files_repo, args, &[])),
+            "ls-refs {args:?}"
+        );
+    }
+    let lines = pkt_lines(&grit_ls_refs(
+        &memory_repo,
+        &["peel", "ref-prefix refs/tags/"],
+        &[],
+    ));
+    for (name, tag, peel) in [
+        ("nested", history.nested, history.commit),
+        ("treetag", history.treetag, history.tree),
+        ("v1", history.v1, history.commit),
+    ] {
+        let line = format!("{tag} refs/tags/{name} peeled:{peel}");
+        assert!(lines.contains(&Some(line.clone())), "missing {line}");
     }
 }

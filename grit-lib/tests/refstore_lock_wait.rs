@@ -1,15 +1,16 @@
 //! Concurrent ref writers: memory/reftable single slot (issue #2181) and files per-ref locks (#2250).
 //!
-//! [`MemoryRefStore`] (like a database backend with a single write transaction) lets one
-//! prepared transaction hold the whole store, so `prepare` for a disjoint ref fails fast with
-//! [`RefStoreError::LockHeld`]. grit-lib's ref writes retry that for
-//! `core.filesRefLockTimeout`, so concurrent updates to different refs all land, while a lock
-//! that is never released still fails once the budget is spent.
+//! [`MemoryRefStore`] (like a database backend with a single write transaction) holds one
+//! prepared transaction at a time and queues concurrent writers on [`SingleWriterGate`] inside
+//! [`RefStore::prepare_for`]. grit-lib passes `core.filesRefLockTimeout` into that wait, so
+//! concurrent updates to different refs all land, while a lock that is never released still
+//! fails once the budget is spent.
 //!
 //! The default [`FilesRefStore`](grit_lib::refs::store::FilesRefStore) takes one lock file per
 //! ref, so disjoint refs prepare and commit concurrently; only the same ref (or packed-refs)
 //! contends.
 
+use grit_lib::error::RefError;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Barrier};
@@ -20,21 +21,20 @@ use grit_lib::error::Error;
 use grit_lib::ident::Signature;
 use grit_lib::lockfile::LockWait;
 use grit_lib::objects::odb::store::MemoryStore;
-use grit_lib::objects::odb::OdbBuilder;
 use grit_lib::objects::{HashAlgo, NewCommit, ObjectId, ObjectKind, TreeEntry};
-use grit_lib::porcelain::add::{stage, StageOptions};
-use grit_lib::porcelain::branch::{create_branch, CreateBranchOptions, TrackMode};
-use grit_lib::porcelain::commit::{commit_with_scope, CommitScope};
-use grit_lib::progress::{NeverCancel, NullProgress};
+use grit_lib::porcelain::add::StageOptions;
+use grit_lib::porcelain::branch::{BranchCreateOptions, TrackMode};
+use grit_lib::porcelain::commit::CommitScope;
+use grit_lib::progress::{CancelToken, NullProgress};
 use grit_lib::refs::store::RefName;
 use grit_lib::refs::store::{
-    Expected, FilesRefStore, FilesRefStoreConfig, MemoryRefStore, RawRef, RefStore, RefStoreError,
-    RefTransaction, RefUpdate, RefUpdateFlags,
+    Expected, FilesRefStore, FilesRefStoreConfig, MemoryRefStore, RawRef, RefNameRef, RefStore,
+    RefStoreError, RefTransaction, RefUpdate, RefUpdateFlags,
 };
 use grit_lib::refs::{
     commit_ref_update_on_store, commit_ref_updates_on_store, prepare_with_lock_wait,
 };
-use grit_lib::repo::{InitOptions, Repository, RepositoryBuilder};
+use grit_lib::repo::{InitOptions, Repository};
 use grit_lib::worktree::{AddLinkedWorktreeOptions, WorktreeBranch};
 use time::OffsetDateTime;
 
@@ -49,7 +49,7 @@ fn oid(n: u32) -> ObjectId {
 
 fn set(name: &str, value: ObjectId, expected: Expected) -> RefUpdate {
     RefUpdate {
-        name: name.to_owned(),
+        name: RefName::from_trusted(name),
         new_value: Some(RawRef::Direct(value)),
         expected,
         reflog: None,
@@ -64,7 +64,7 @@ fn txn(name: &str, value: ObjectId) -> RefTransaction {
 }
 
 fn is_lock_held(err: &Error, ref_name: &str) -> bool {
-    matches!(err, Error::RefStore(RefStoreError::LockHeld { name }) if name == ref_name)
+    matches!(err, Error::Ref(RefError::Store(RefStoreError::LockHeld { name })) if name == ref_name)
 }
 
 #[test]
@@ -92,7 +92,9 @@ fn concurrent_batches_on_disjoint_refs_all_commit() {
     });
     for t in 0..THREADS {
         assert_eq!(
-            store.read_raw(&format!("refs/heads/b{t}")).expect("read"),
+            store
+                .read_raw(RefNameRef::from_trusted(&format!("refs/heads/b{t}")))
+                .expect("read"),
             Some(RawRef::Direct(oid(t * UPDATES + UPDATES)))
         );
     }
@@ -168,7 +170,12 @@ fn held_transaction_still_fails_after_the_budget() {
     assert!(is_lock_held(&err, "refs/heads/waiter"), "{err:?}");
 
     held.commit().expect("commit holder");
-    assert_eq!(store.read_raw("refs/heads/waiter").expect("read"), None);
+    assert_eq!(
+        store
+            .read_raw(RefNameRef::from_trusted("refs/heads/waiter"))
+            .expect("read"),
+        None
+    );
 }
 
 #[test]
@@ -198,11 +205,15 @@ fn waiter_proceeds_once_the_holder_releases() {
         .expect("commit waiter");
     });
     assert_eq!(
-        store.read_raw("refs/heads/waiter").expect("read"),
+        store
+            .read_raw(RefNameRef::from_trusted("refs/heads/waiter"))
+            .expect("read"),
         Some(RawRef::Direct(oid(2)))
     );
     assert_eq!(
-        store.read_raw("refs/heads/holder").expect("read"),
+        store
+            .read_raw(RefNameRef::from_trusted("refs/heads/holder"))
+            .expect("read"),
         Some(RawRef::Direct(oid(1)))
     );
 }
@@ -265,19 +276,16 @@ fn stage_and_commit(
     content: &str,
 ) -> grit_lib::error::Result<()> {
     fs::write(work_tree.join("f.txt"), content)?;
-    stage(
-        repo,
+    repo.index().stage(
         &StageOptions::default(),
         &mut NullProgress,
-        &NeverCancel,
+        &CancelToken::never(),
     )?;
     let request = grit_test_support::commit_request(content, IDENT_TS);
-    commit_with_scope(
-        repo,
-        &request,
-        CommitScope::Staged,
+    repo.commits().create(
+        &grit_lib::commits::CommitOptions::new(request.clone(), CommitScope::Staged),
         &mut NullProgress,
-        &NeverCancel,
+        &CancelToken::never(),
     )?;
     Ok(())
 }
@@ -300,17 +308,16 @@ fn repository_injected_store_uses_core_files_ref_lock_timeout_from_git_dir() {
         "[user]\n\tname = T\n\temail = t@e.x\n[core]\n\tfilesRefLockTimeout = 7500\n",
     )
     .expect("config");
-    let repo = RepositoryBuilder::new(options())
-        .odb_builder(
-            OdbBuilder::files(git_dir.join("objects"))
-                .primary(Arc::new(MemoryStore::new(HashAlgo::Sha1)))
-                .alternates(false),
-        )
-        .ref_store(Arc::new(MemoryRefStore::new()))
-        .initial_branch("main")
-        .open(&git_dir, Some(&work_tree))
-        .expect("open");
-    match repo.refs().ref_lock_wait() {
+    let repo = Repository::open(
+        &git_dir,
+        &(options()
+            .with_object_store(Arc::new(MemoryStore::new(HashAlgo::Sha1)))
+            .with_ref_store(Arc::new(MemoryRefStore::new()))
+            .with_initial_branch("main")
+            .with_work_tree(&work_tree)),
+    )
+    .expect("open");
+    match repo.ref_store().ref_lock_wait() {
         LockWait::Backoff { budget } => assert_eq!(budget, Duration::from_millis(7500)),
         other => panic!("expected Backoff from config, got {other:?}"),
     }
@@ -332,16 +339,15 @@ fn concurrent_create_branch_on_injected_store_never_lock_held() {
     )
     .expect("config");
     let repo = Arc::new(
-        RepositoryBuilder::new(options())
-            .odb_builder(
-                OdbBuilder::files(git_dir.join("objects"))
-                    .primary(Arc::new(MemoryStore::new(HashAlgo::Sha1)))
-                    .alternates(false),
-            )
-            .ref_store(Arc::new(MemoryRefStore::new()))
-            .initial_branch("main")
-            .open(&git_dir, Some(&work_tree))
-            .expect("open"),
+        Repository::open(
+            &git_dir,
+            &(options()
+                .with_object_store(Arc::new(MemoryStore::new(HashAlgo::Sha1)))
+                .with_ref_store(Arc::new(MemoryRefStore::new()))
+                .with_initial_branch("main")
+                .with_work_tree(&work_tree)),
+        )
+        .expect("open"),
     );
     stage_and_commit(&repo, &work_tree, "base").expect("base commit");
 
@@ -356,14 +362,15 @@ fn concurrent_create_branch_on_injected_store_never_lock_held() {
                     (0..CREATES)
                         .filter_map(|k| {
                             let name = format!("t{t}/b{k}");
-                            let opts = CreateBranchOptions {
+                            let opts = BranchCreateOptions {
                                 name,
                                 start: None,
                                 force: false,
                                 track: TrackMode::Never,
                                 dry_run: false,
                             };
-                            create_branch(&repo, &opts)
+                            repo.branches()
+                                .create(&opts)
                                 .err()
                                 .map(|e| format!("thread {t} create {k}: {e}"))
                         })
@@ -395,16 +402,16 @@ fn concurrent_commits_in_linked_worktrees_over_shared_stores() {
     )
     .expect("config");
     let refs = Arc::new(MemoryRefStore::new());
-    let main = RepositoryBuilder::new(options())
-        .odb_builder(
-            OdbBuilder::files(git_dir.join("objects"))
-                .primary(Arc::new(MemoryStore::new(HashAlgo::Sha1)))
-                .alternates(false),
-        )
-        .ref_store(refs.clone())
-        .initial_branch("main")
-        .open(&git_dir, Some(&main_wt))
-        .expect("open over injected stores");
+    let odb = Arc::new(MemoryStore::new(HashAlgo::Sha1));
+    let main = Repository::open(
+        &git_dir,
+        &(options()
+            .with_object_store(odb.clone())
+            .with_ref_store(refs.clone())
+            .with_initial_branch("main")
+            .with_work_tree(&main_wt)),
+    )
+    .expect("open over injected stores");
     stage_and_commit(&main, &main_wt, "base").expect("base commit");
 
     let handles: Vec<(Repository, PathBuf)> = (0..THREADS)
@@ -422,9 +429,15 @@ fn concurrent_commits_in_linked_worktrees_over_shared_stores() {
                     track: false,
                 })
                 .expect("add worktree");
-            let repo = main
-                .open_linked_worktree(&entry.admin_dir, &path)
-                .expect("open linked worktree");
+            let repo = Repository::open(
+                &entry.admin_dir,
+                &(options()
+                    .with_object_store(odb.clone())
+                    .with_ref_store(refs.clone())
+                    .with_initial_branch("main")
+                    .with_work_tree(&path)),
+            )
+            .expect("open linked worktree");
             (repo, path)
         })
         .collect();
@@ -457,7 +470,10 @@ fn concurrent_commits_in_linked_worktrees_over_shared_stores() {
 
     for i in 0..THREADS {
         let mut depth = 0;
-        let mut tip = Some(refs.resolve(&format!("refs/heads/b{i}")).expect("branch"));
+        let mut tip = Some(
+            refs.resolve(RefNameRef::from_trusted(&format!("refs/heads/b{i}")))
+                .expect("branch"),
+        );
         while let Some(commit) = tip {
             depth += 1;
             tip = main
@@ -486,7 +502,8 @@ fn files_concurrent_disjoint_ref_updates_through_repository_never_lock_held() {
     const THREADS: usize = 8;
     const ITERS: usize = 500;
     let tmp = tempfile::tempdir().expect("tempdir");
-    let repo = Arc::new(Repository::init(tmp.path(), &InitOptions::default()).expect("init"));
+    let (repo, _) = Repository::init(tmp.path(), &InitOptions::default()).expect("init");
+    let repo = Arc::new(repo);
     let sig = Signature::new(
         "A",
         "a@example.com",
@@ -559,13 +576,40 @@ fn files_prepare_disjoint_ref_while_another_transaction_is_open() {
     waiter.commit().expect("commit b");
     held.commit().expect("commit a");
     assert_eq!(
-        store.read_raw("refs/heads/a").expect("read"),
+        store
+            .read_raw(RefNameRef::from_trusted("refs/heads/a"))
+            .expect("read"),
         Some(RawRef::Direct(oid(1)))
     );
     assert_eq!(
-        store.read_raw("refs/heads/b").expect("read"),
+        store
+            .read_raw(RefNameRef::from_trusted("refs/heads/b"))
+            .expect("read"),
         Some(RawRef::Direct(oid(2)))
     );
+}
+
+#[test]
+fn files_create_over_stale_empty_directory_at_exact_ref_path() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let path = tmp.path();
+    fs::create_dir_all(path.join("refs/heads")).expect("refs");
+    fs::write(path.join("HEAD"), "ref: refs/heads/main\n").expect("HEAD");
+    let stale = path.join("refs/tags/empty");
+    fs::create_dir_all(&stale).expect("stale empty directory at ref path");
+    assert!(stale.is_dir());
+
+    let store = files_store(path);
+    let value = oid(42);
+    commit_ref_update_on_store(&store, set("refs/tags/empty", value, Expected::Missing))
+        .expect("empty directory at ref path must not block create");
+    assert_eq!(
+        store
+            .read_raw(RefNameRef::from_trusted("refs/tags/empty"))
+            .expect("read"),
+        Some(RawRef::Direct(value))
+    );
+    assert!(stale.is_file(), "ref file replaces the empty directory");
 }
 
 fn assert_a_vs_a_slash_b_create_race_once(path: &Path) {
@@ -600,7 +644,9 @@ fn assert_a_vs_a_slash_b_create_race_once(path: &Path) {
         .filter(|r| {
             matches!(
                 r,
-                Err(Error::RefStore(RefStoreError::NameUnavailable { .. }))
+                Err(Error::Ref(RefError::Store(
+                    RefStoreError::NameUnavailable { .. }
+                )))
             )
         })
         .count();
@@ -609,7 +655,10 @@ fn assert_a_vs_a_slash_b_create_race_once(path: &Path) {
     for outcome in &outcomes {
         if let Err(err) = outcome {
             assert!(
-                matches!(err, Error::RefStore(RefStoreError::NameUnavailable { .. })),
+                matches!(
+                    err,
+                    Error::Ref(RefError::Store(RefStoreError::NameUnavailable { .. }))
+                ),
                 "commit-time D/F races must return NameUnavailable, not {err:?}"
             );
         }

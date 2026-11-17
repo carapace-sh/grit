@@ -12,15 +12,16 @@ use filetime::{set_file_mtime, FileTime};
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::diff::structured::StructuredLineKind;
 use grit_lib::diff::{DiffOptions, DiffStatus, DiffTarget};
-use grit_lib::porcelain::add::{stage, StageMode, StageOptions};
-use grit_lib::porcelain::commit::{commit_with_scope, CommitRequest, CommitScope};
+use grit_lib::porcelain::add::{StageMode, StageOptions};
+use grit_lib::porcelain::commit::{CommitRequest, CommitScope};
 use grit_lib::porcelain::stage_tracked::{
     stage_tracked_modifications_with_thresholds, IndexStagingThresholds,
 };
-use grit_lib::porcelain::status::{status, StatusOptions, UntrackedMode};
-use grit_lib::progress::{NeverCancel, NullProgress};
+use grit_lib::porcelain::status::{StatusOptions, UntrackedMode};
+use grit_lib::progress::NullProgress;
 use grit_lib::repo::Repository;
-use grit_lib::PARALLEL_STAT_MIN_ENTRIES;
+use grit_lib::test_support::counters::PARALLEL_STAT_MIN_ENTRIES;
+use grit_lib::worktree::pathspec::{Pathspec, PathspecGlobalFlags};
 use grit_test_support::git;
 
 /// Worktree mtime well before the index write, so entries are not racily clean.
@@ -29,11 +30,11 @@ const LINK_TARGET: &str = "a.txt";
 
 fn commit_req(message: &str) -> CommitRequest {
     let id = "Link Test <link@example.com> 1700000000 +0000".to_owned();
-    CommitRequest {
-        message: message.to_owned(),
-        author: Some(id.parse().expect("signature")),
-        committer: Some(id.parse().expect("signature")),
-        ..Default::default()
+    {
+        let mut req = CommitRequest::new(message.to_owned());
+        req.author = Some(id.parse().expect("signature"));
+        req.committer = Some(id.parse().expect("signature"));
+        req
     }
 }
 
@@ -166,14 +167,13 @@ fn append(root: &Path, rel: &str, text: &str) {
 
 fn autostage_commit(root: &Path, message: &str) -> grit_lib::porcelain::commit::CommitOutcome {
     let repo = open(root);
-    commit_with_scope(
-        &repo,
-        &commit_req(message),
-        CommitScope::AutoStage,
-        &mut NullProgress,
-        &NeverCancel,
-    )
-    .expect("grit commit")
+    repo.commits()
+        .create(
+            &grit_lib::commits::CommitOptions::new(commit_req(message), CommitScope::AutoStage),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("grit commit")
 }
 
 /// `rewrite_link` rewrites the link file with identical content, so its stat cache no longer
@@ -288,7 +288,10 @@ fn unstaged_status(root: &Path, threads: usize) -> Vec<(String, DiffStatus, Stri
         stat_parallel_threads: Some(threads),
         ..StatusOptions::default()
     };
-    let model = status(&repo, &options, &mut NullProgress, &NeverCancel).expect("status");
+    let model = repo
+        .status()
+        .run(&options, &mut NullProgress, &CancelToken::never())
+        .expect("status");
     model
         .unstaged
         .iter()
@@ -357,18 +360,18 @@ fn add_all_keeps_link_mode_and_matches_git_add() {
     let grit = clone_without_symlinks(&src, tmp.path(), "grit", true);
     fs::write(grit.join("link"), "b.txt").expect("write grit link");
     let repo = open(&grit);
-    stage(
-        &repo,
-        &StageOptions {
-            pathspecs: vec![".".to_owned()],
-            pathspec_sources: vec![".".to_owned()],
-            mode: StageMode::All,
-            ..StageOptions::default()
-        },
-        &mut NullProgress,
-        &NeverCancel,
-    )
-    .expect("stage");
+    repo.index()
+        .stage(
+            &StageOptions {
+                pathspecs: vec![".".to_owned()],
+                pathspec_sources: vec![".".to_owned()],
+                mode: StageMode::All,
+                ..StageOptions::default()
+            },
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("stage");
 
     assert_eq!(ls_files_stage(&grit, "link"), ls_files_stage(&twin, "link"));
     assert!(ls_files_stage(&grit, "link").starts_with("120000 "));
@@ -416,7 +419,11 @@ fn worktree_diff_of_edited_link_is_a_symlink_patch() {
     opts.word_level_inline = false;
     let files = repo
         .diff()
-        .files(&DiffTarget::WorktreeVsIndex, &[], &opts)
+        .files(
+            &DiffTarget::WorktreeVsIndex,
+            &Pathspec::entire_tree(PathspecGlobalFlags::default()),
+            &opts,
+        )
         .expect("worktree diff");
     assert_eq!(files.len(), 1, "{files:?}");
     let file = &files[0];

@@ -2,19 +2,20 @@
 
 use grit_lib::error::Error;
 use grit_lib::index::Index;
-use grit_lib::porcelain::add::{stage, StageMode, StageOptions};
+use grit_lib::porcelain::add::{StageMode, StageOptions};
 use grit_lib::progress::NullProgress;
 use grit_lib::repo::{InitOptions, Repository};
+use grit_lib::worktree::WorktreeError;
 use std::fs;
 
 fn init_repo() -> (tempfile::TempDir, Repository) {
     let dir = tempfile::tempdir().expect("tempdir");
-    let repo = Repository::init(dir.path(), &InitOptions::default()).expect("init");
+    let (repo, _) = Repository::init(dir.path(), &InitOptions::default()).expect("init");
     (dir, repo)
 }
 
 fn load_repo_index(repo: &Repository) -> Index {
-    Index::load(&repo.index_handle().path()).expect("load index")
+    Index::load(&repo.index().path()).expect("load index")
 }
 
 fn stage_paths(repo: &Repository, pathspecs: &[&str]) -> grit_lib::error::Result<()> {
@@ -24,11 +25,10 @@ fn stage_paths(repo: &Repository, pathspecs: &[&str]) -> grit_lib::error::Result
         mode: StageMode::All,
         ..StageOptions::default()
     };
-    stage(
-        repo,
+    repo.index().stage(
         &opts,
         &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )?;
     Ok(())
 }
@@ -61,6 +61,62 @@ fn add_directory_trailing_slash_pathspec_stages_under_prefix() {
     stage_paths(&repo, &["dir/"]).expect("add dir/");
     let index = load_repo_index(&repo);
     assert!(index.get(b"dir/inside.txt", 0).is_some());
+}
+
+#[test]
+fn add_attr_pathspec_stages_matching_modified_and_errors_when_nothing_matches() {
+    let (_dir, repo) = init_repo();
+    let wt = repo.work_tree().unwrap();
+    fs::write(wt.join(".gitattributes"), "*.c myattr\n").unwrap();
+    fs::write(wt.join("a.c"), b"v1\n").unwrap();
+    fs::write(wt.join("b.txt"), b"note\n").unwrap();
+    grit_test_support::git(wt, &["add", "."]);
+    grit_test_support::git(wt, &["commit", "-m", "init"]);
+
+    fs::write(wt.join("a.c"), b"v2\n").unwrap();
+    fs::write(wt.join("b.txt"), b"changed\n").unwrap();
+    stage_paths(&repo, &[":(attr:myattr)"]).expect("stage attr");
+    let wt = repo.work_tree().unwrap();
+    let staged = grit_test_support::git(wt, &["diff", "--cached", "--name-only"]);
+    assert_eq!(staged.trim(), "a.c", "only *.c paths match :(attr:myattr)");
+    let unstaged = grit_test_support::git(wt, &["diff", "--name-only"]);
+    assert!(
+        unstaged.lines().any(|l| l == "b.txt"),
+        "b.txt should remain unstaged: {unstaged}"
+    );
+
+    fs::write(wt.join("b.txt"), b"again\n").unwrap();
+    let err = stage_paths(&repo, &[":(attr:no-such)"]).expect_err("no match");
+    assert!(
+        matches!(
+            err,
+            Error::Worktree(grit_lib::worktree::WorktreeError::PathspecNoMatch { ref spec })
+                if spec == ":(attr:no-such)"
+        ),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn add_attr_pathspec_with_trailing_directory_pattern_stages_under_prefix() {
+    let (_dir, repo) = init_repo();
+    let wt = repo.work_tree().unwrap();
+    fs::create_dir_all(wt.join("a")).unwrap();
+    fs::write(wt.join(".gitattributes"), "*.c myattr\n").unwrap();
+    fs::write(wt.join("a/g.c"), b"v1\n").unwrap();
+    fs::write(wt.join("b.txt"), b"note\n").unwrap();
+    grit_test_support::git(wt, &["add", "."]);
+    grit_test_support::git(wt, &["commit", "-m", "init"]);
+
+    fs::write(wt.join("a/g.c"), b"v2\n").unwrap();
+    fs::write(wt.join("b.txt"), b"changed\n").unwrap();
+    stage_paths(&repo, &[":(attr:myattr)a/"]).expect("stage attr under a/");
+    let staged = grit_test_support::git(wt, &["diff", "--cached", "--name-only"]);
+    assert_eq!(
+        staged.trim(),
+        "a/g.c",
+        "attr + directory prefix must stage matching paths"
+    );
 }
 
 #[test]
@@ -98,7 +154,10 @@ fn pathless_add_rejects_hostile_expanded_path() {
     fs::write(wt.join("ok.txt"), b"ok\n").unwrap();
     let err = stage_paths(&repo, &[]).expect_err("pathless add with git~1");
     assert!(
-        matches!(err, Error::InvalidPathComponent { .. }),
+        matches!(
+            err,
+            Error::Worktree(WorktreeError::InvalidPathComponent { .. })
+        ),
         "expected InvalidPathComponent, got {err:?}"
     );
 }
@@ -111,7 +170,10 @@ fn glob_add_rejects_hostile_match_before_index_insert() {
     fs::write(wt.join("good.txt"), b"ok\n").unwrap();
     let err = stage_paths(&repo, &["*"]).expect_err("glob should still validate git~1");
     assert!(
-        matches!(err, Error::InvalidPathComponent { .. }),
+        matches!(
+            err,
+            Error::Worktree(WorktreeError::InvalidPathComponent { .. })
+        ),
         "expected InvalidPathComponent, got {err:?}"
     );
 }

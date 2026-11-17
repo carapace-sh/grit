@@ -2,10 +2,9 @@
 
 #[cfg(unix)]
 mod unix {
-    use grit_lib::porcelain::add::{stage, StageMode, StageOptions};
-    use grit_lib::porcelain::commit::{commit_with_scope, CommitRequest, CommitScope};
-    use grit_lib::porcelain::status::{status, StatusOptions};
-    use grit_lib::progress::NeverCancel;
+    use grit_lib::porcelain::add::{StageMode, StageOptions};
+    use grit_lib::porcelain::commit::{CommitRequest, CommitScope};
+    use grit_lib::porcelain::status::StatusOptions;
     use grit_lib::progress::NullProgress;
     use grit_lib::repo::Repository;
     use grit_test_support::git;
@@ -24,13 +23,14 @@ mod unix {
 
     fn grit_untracked(root: &Path) -> Vec<String> {
         let repo = Repository::discover(Some(root), &Default::default()).expect("open");
-        let model = status(
-            &repo,
-            &StatusOptions::default(),
-            &mut NullProgress,
-            &NeverCancel,
-        )
-        .expect("status");
+        let model = repo
+            .status()
+            .run(
+                &StatusOptions::default(),
+                &mut NullProgress,
+                &CancelToken::never(),
+            )
+            .expect("status");
         model.untracked.clone()
     }
 
@@ -40,15 +40,15 @@ mod unix {
 
     fn commit_req(message: &str) -> CommitRequest {
         let id = ident();
-        CommitRequest {
-            message: message.to_owned(),
-            author: Some(id.parse().expect("signature")),
-            committer: Some(id.parse().expect("signature")),
-            allow_empty: false,
-            sign_override: None,
-            amend: false,
-            assume_worktree_synced: false,
-            ..Default::default()
+        {
+            let mut req = CommitRequest::new(message.to_owned());
+            req.author = Some(id.parse().expect("signature"));
+            req.committer = Some(id.parse().expect("signature"));
+            req.allow_empty = false;
+            req.sign_override = None;
+            req.amend = false;
+            req.assume_worktree_synced = false;
+            req
         }
     }
 
@@ -114,16 +114,17 @@ mod unix {
         fs::write(root.join("new.txt"), "new\n").expect("write new");
 
         let repo = Repository::discover(Some(root), &Default::default()).expect("open");
-        let outcome = stage(
-            &repo,
-            &StageOptions {
-                mode: StageMode::All,
-                ..StageOptions::default()
-            },
-            &mut NullProgress,
-            &NeverCancel,
-        )
-        .expect("stage must not hang or fail on fifo");
+        let outcome = repo
+            .index()
+            .stage(
+                &StageOptions {
+                    mode: StageMode::All,
+                    ..StageOptions::default()
+                },
+                &mut NullProgress,
+                &CancelToken::never(),
+            )
+            .expect("stage must not hang or fail on fifo");
         assert_eq!(
             outcome.added.len(),
             1,
@@ -155,14 +156,16 @@ mod unix {
         fs::write(root.join("new.txt"), "new\n").expect("write new");
 
         let repo = Repository::discover(Some(root), &Default::default()).expect("open");
-        commit_with_scope(
-            &repo,
-            &commit_req("second"),
-            CommitScope::AutoStage,
-            &mut NullProgress,
-            &NeverCancel,
-        )
-        .expect("auto-stage commit with socket present");
+        repo.commits()
+            .create(
+                &grit_lib::commits::CommitOptions::new(
+                    commit_req("second"),
+                    CommitScope::AutoStage,
+                ),
+                &mut NullProgress,
+                &CancelToken::never(),
+            )
+            .expect("auto-stage commit with socket present");
         git(root, &["fsck"]);
         let log = git(root, &["log", "--oneline", "-2"]);
         assert!(

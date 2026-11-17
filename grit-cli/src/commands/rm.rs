@@ -2,59 +2,14 @@
 
 use crate::pathspec_args::PathspecArgs;
 use anyhow::{bail, Result};
-use grit_lib::porcelain::paths::{remove_paths, BlockedRemoval, RemoveOptions, RemoveOutcome};
+use grit_lib::porcelain::paths::{RemoveOptions, RemoveOutcome};
 use grit_lib::repo::Repository;
-use grit_lib::worktree::pathspec::ResolvedPathspecs;
-use schemars::JsonSchema;
-use serde::Serialize;
-use std::io::Write;
+use grit_lib::worktree::pathspec::Pathspec;
 
 use crate::context;
-use crate::output::{outln, HumanRender, MarkdownRender, RenderContext};
+use crate::ui::PathDisplayOptions;
 
-/// CLI outcome for `grit rm`.
-#[derive(Serialize, JsonSchema)]
-pub struct RmOutcome {
-    /// Paths removed from the index (and work tree unless `--cached`).
-    pub removed: Vec<String>,
-    /// Whether this run only previewed removals.
-    pub dry_run: bool,
-}
-
-impl HumanRender for RmOutcome {
-    fn render_human(&self, w: &mut dyn Write, _ctx: &RenderContext) -> Result<()> {
-        let prefix = if self.dry_run {
-            "Would remove"
-        } else {
-            "Removed"
-        };
-        match self.removed.len() {
-            0 => {}
-            1 => outln!(w, "{prefix} {}.", self.removed[0]),
-            n => outln!(w, "{prefix} {n} paths."),
-        }
-        Ok(())
-    }
-}
-
-impl MarkdownRender for RmOutcome {
-    fn render_markdown(&self, w: &mut dyn Write, _ctx: &RenderContext) -> Result<()> {
-        let heading = if self.dry_run {
-            "Would remove"
-        } else {
-            "Removed"
-        };
-        if self.removed.is_empty() {
-            outln!(w, "- **{heading}**: _(none)_");
-            return Ok(());
-        }
-        outln!(w, "- **{heading}**:");
-        for path in &self.removed {
-            outln!(w, "  - `{path}`");
-        }
-        Ok(())
-    }
-}
+pub use crate::render::rm::RmOutcome;
 
 pub fn run(
     args: &PathspecArgs,
@@ -66,57 +21,78 @@ pub fn run(
     if args.paths.is_empty() && args.pathspec_from_file.is_none() {
         bail!("you must specify path(s) to remove");
     }
+    let _interrupt = crate::interrupt::InterruptCancel::install();
     let repo = context::discover()?;
+    let path_display = PathDisplayOptions::from_repo(&repo).ok();
     let resolved = args.resolve(&repo)?;
-    let outcome = rm(&repo, resolved, cached, force, dry_run, ignore_unmatch)?;
-    Ok(RmOutcome {
-        removed: outcome.removed,
+    let outcome = rm(
+        &repo,
+        resolved,
+        cached,
+        force,
         dry_run,
-    })
+        ignore_unmatch,
+        &crate::interrupt::process_cancel_token(),
+        path_display.as_ref(),
+    )?;
+    Ok(RmOutcome::new(outcome.removed, dry_run, path_display))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn rm(
     repo: &Repository,
-    resolved: ResolvedPathspecs,
+    resolved: Pathspec,
     cached: bool,
     force: bool,
     dry_run: bool,
     ignore_unmatch: bool,
+    cancel: &grit_lib::progress::CancelToken,
+    path_display: Option<&PathDisplayOptions>,
 ) -> Result<RemoveOutcome> {
+    let pathspec_sources: Vec<String> = resolved.iter().map(str::to_owned).collect();
     let opts = RemoveOptions {
-        pathspecs: resolved.specs,
-        pathspec_sources: resolved.sources,
+        pathspecs: resolved.specs().to_vec(),
+        pathspec_sources: if pathspec_sources.is_empty() {
+            resolved.specs().to_vec()
+        } else {
+            pathspec_sources
+        },
         cached,
         force,
         recursive: false,
         dry_run,
         ignore_unmatch,
     };
-    remove_paths(repo, &opts).map_err(|err| map_paths_error(err, cached))
+    repo.checkout()
+        .remove_paths(&opts, cancel)
+        .map_err(|err| crate::error_map::map_remove_paths_error(err, cached, path_display))
 }
 
-fn map_paths_error(err: grit_lib::error::Error, cached: bool) -> anyhow::Error {
-    match err {
-        grit_lib::error::Error::RemoveBlocked { paths } => {
-            anyhow::anyhow!(blocked_message(&paths, cached))
-        }
-        other => anyhow::anyhow!("{other}"),
-    }
-}
+/// Dispatch parsed CLI args for `Rm`.
+pub fn dispatch(
+    args: crate::args::RmArgs,
+    env: crate::dispatch::CommandEnv<'_>,
+) -> anyhow::Result<crate::exit_status::ExitStatus> {
+    use crate::args::*;
+    use crate::commands;
 
-fn blocked_message(paths: &[BlockedRemoval], cached: bool) -> String {
-    let mut msg = String::from("not removed, these files have content that would be lost:\n");
-    for blocked in paths {
-        msg.push_str(&format!("    {} ({})\n", blocked.path, blocked.reason));
-    }
-    let cached_would_help = !cached
-        && paths
-            .iter()
-            .all(|blocked| blocked.reason.allowed_with_cached());
-    msg.push_str(if cached_would_help {
-        "(use --cached to stop tracking them and keep the files, or --force to remove them anyway)"
-    } else {
-        "(use --force to remove them anyway)"
-    });
-    msg
+    use crate::dispatch::{emit_success, CommandEnv};
+
+    let CommandEnv {
+        opts,
+        ctx,
+        process_env: _,
+    } = env;
+    let RmArgs {
+        pathspecs,
+        cached,
+        force,
+        dry_run,
+        ignore_unmatch,
+    } = args;
+    emit_success(
+        commands::rm::run(&pathspecs, cached, force, dry_run, ignore_unmatch)?,
+        opts,
+        ctx,
+    )
 }

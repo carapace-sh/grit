@@ -1,5 +1,6 @@
 //! Parallel checkout planning and execution (`checkout.workers` policy).
 
+use crate::worktree::WorktreeError;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -12,8 +13,8 @@ use crate::crlf::{self, ConversionConfig};
 use crate::error::{Error, Result};
 use crate::filter_process::{DelayedProcessCheckout, FilterSmudgeMeta};
 use crate::index::{IndexEntry, MODE_EXECUTABLE, MODE_REGULAR, MODE_SYMLINK};
-use crate::objects::pack_store::PackReadContextGuard;
 use crate::objects::ObjectId;
+use crate::pack_store::PackReadContextGuard;
 use crate::parallel::{
     run_ordered_batches, try_par_map_with_local, ParallelHashError, ParallelOp, ParallelOptions,
 };
@@ -57,7 +58,7 @@ pub(crate) struct CheckoutWriteJob<'a> {
 
 impl<'a> CheckoutWriteJob<'a> {
     /// Job writing `change`'s new blob to `path` with `mode`.
-    pub(crate) fn new(
+    pub fn new(
         path: String,
         mode: u32,
         change: &'a crate::diff::DiffEntry,
@@ -118,24 +119,9 @@ fn normalized_path_key(path: &str, precompose: bool, ignorecase: bool) -> String
     }
 }
 
-/// Paths that must not share a parallel worker pool with any colliding spelling.
+/// Indices into `paths` that must not run on the parallel checkout pool.
 ///
 /// Runs in O(n × average path depth) via prefix lookup, not O(n²) pairwise comparison.
-#[must_use]
-#[allow(dead_code)]
-pub(crate) fn paths_needing_serial_checkout(
-    paths: &[String],
-    ignorecase: bool,
-    precompose: bool,
-) -> HashSet<String> {
-    let borrowed: Vec<&str> = paths.iter().map(String::as_str).collect();
-    paths_needing_serial_checkout_str(&borrowed, ignorecase, precompose)
-        .into_iter()
-        .map(|i| paths[i].clone())
-        .collect()
-}
-
-/// Indices into `paths` that must not run on the parallel checkout pool.
 #[must_use]
 pub(crate) fn paths_needing_serial_checkout_str(
     paths: &[&str],
@@ -266,11 +252,25 @@ pub(crate) fn cancellable_chunks<T>(
     items: &[T],
     options: ParallelOptions,
 ) -> (impl Iterator<Item = &[T]>, ParallelOptions) {
+    cancellable_chunks_with_sizes(items, options, ChunkSizes::new())
+}
+
+pub(crate) fn cancellable_chunks_cancel_friendly<T>(
+    items: &[T],
+    options: ParallelOptions,
+) -> (impl Iterator<Item = &[T]>, ParallelOptions) {
+    cancellable_chunks_with_sizes(items, options, ChunkSizes::cancel_friendly())
+}
+
+fn cancellable_chunks_with_sizes<T>(
+    items: &[T],
+    options: ParallelOptions,
+    mut sizes: ChunkSizes,
+) -> (impl Iterator<Item = &[T]>, ParallelOptions) {
     let chunk_options = chunk_pool_options(options, items.len()).unwrap_or(ParallelOptions {
         threads: std::num::NonZeroUsize::MIN,
         ..options
     });
-    let mut sizes = ChunkSizes::new();
     let mut rest = items;
     let chunks = std::iter::from_fn(move || {
         if rest.is_empty() {
@@ -295,6 +295,11 @@ impl ChunkSizes {
         Self {
             current: PARALLEL_WRITE_FIRST_CHUNK,
         }
+    }
+
+    /// One item per chunk first, so cancellation can stop before a large parallel batch.
+    fn cancel_friendly() -> Self {
+        Self { current: 1 }
     }
 
     /// Sizes that start at the cap, for callers that do not need a quick first stop.
@@ -371,6 +376,7 @@ fn prepare_write_job(
 
 fn write_prepared_job(
     repo: &Repository,
+    conv: &ConversionConfig,
     work_tree: &Path,
     job: &CheckoutWriteJob<'_>,
     bytes: Option<&[u8]>,
@@ -379,7 +385,15 @@ fn write_prepared_job(
     job.mark_touched();
     let Some(bytes) = bytes else {
         return stream_checkout_entry(
-            repo, work_tree, &job.path, job.mode, job.change, dir_cache, job.oid,
+            repo,
+            work_tree,
+            &job.path,
+            job.mode,
+            job.change,
+            dir_cache,
+            job.oid,
+            conv,
+            &job.file_attrs,
         );
     };
     write_checkout_entry(
@@ -396,18 +410,20 @@ fn write_prepared_job(
 #[allow(clippy::too_many_arguments)]
 fn flush_prepared_writes_serial(
     repo: &Repository,
+    conv: &ConversionConfig,
     work_tree: &Path,
     jobs: &[CheckoutWriteJob<'_>],
     prepared: &[PreparedWrite],
     dir_cache: &mut LeadingDirCache,
     outcomes: &mut [Option<WriteJobOutcome>],
     progress: &mut dyn crate::progress::ProgressSink,
-    cancel: &dyn crate::progress::Cancel,
+    cancel: &crate::progress::CancelToken,
 ) -> Result<()> {
     for item in prepared {
         crate::progress::poll_cancel(progress, cancel)?;
         let entry = write_prepared_job(
             repo,
+            conv,
             work_tree,
             &jobs[item.idx],
             item.bytes.as_deref(),
@@ -418,8 +434,10 @@ fn flush_prepared_writes_serial(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn flush_prepared_writes_parallel(
     repo: &Repository,
+    conv: &ConversionConfig,
     options: ParallelOptions,
     work_tree: &Path,
     jobs: &[CheckoutWriteJob<'_>],
@@ -429,6 +447,8 @@ fn flush_prepared_writes_parallel(
 ) -> Result<()> {
     let work_tree = work_tree.to_path_buf();
     let parent_dirs = LeadingDirCache::with_ready_from(parent_dirs);
+    // Creating files contends in the kernel: lease workers from the filesystem budget.
+    let _filesystem = crate::parallel::FilesystemWork::enter();
     let entries = try_par_map_with_local(
         prepared,
         options,
@@ -440,6 +460,7 @@ fn flush_prepared_writes_parallel(
         |worker, item| {
             write_prepared_job(
                 repo,
+                conv,
                 &worker.work_tree,
                 &jobs[item.idx],
                 item.bytes.as_deref(),
@@ -475,7 +496,15 @@ fn materialize_write_job_serial(
     )?
     else {
         return stream_checkout_entry(
-            repo, work_tree, &job.path, job.mode, job.change, dir_cache, job.oid,
+            repo,
+            work_tree,
+            &job.path,
+            job.mode,
+            job.change,
+            dir_cache,
+            job.oid,
+            rules.conversion(),
+            &job.file_attrs,
         )
         .map(WriteJobOutcome::Index);
     };
@@ -525,7 +554,7 @@ fn flush_parallel_batch(
     pool: Option<ParallelOptions>,
     parallel_prepare_blobs: bool,
     progress: &mut dyn crate::progress::ProgressSink,
-    cancel: &dyn crate::progress::Cancel,
+    cancel: &crate::progress::CancelToken,
 ) -> Result<()> {
     if batch.is_empty() {
         return Ok(());
@@ -555,7 +584,7 @@ fn flush_parallel_batch(
                         prepared.push(item);
                         if prepared_bytes >= PREPARED_WRITE_BYTES {
                             flush_prepared_batch(
-                                repo, pool, work_tree, jobs, &prepared, dir_cache, outcomes,
+                                repo, conv, pool, work_tree, jobs, &prepared, dir_cache, outcomes,
                                 progress, cancel,
                             )?;
                             prepared.clear();
@@ -574,8 +603,8 @@ fn flush_parallel_batch(
                         Ok(bytes) => bytes,
                         Err(err) => {
                             flush_prepared_writes_serial(
-                                repo, work_tree, jobs, &prepared, dir_cache, outcomes, progress,
-                                cancel,
+                                repo, conv, work_tree, jobs, &prepared, dir_cache, outcomes,
+                                progress, cancel,
                             )?;
                             return Err(err);
                         }
@@ -585,8 +614,8 @@ fn flush_parallel_batch(
                     prepared.push(item);
                     if prepared_bytes >= PREPARED_WRITE_BYTES {
                         flush_prepared_batch(
-                            repo, pool, work_tree, jobs, &prepared, dir_cache, outcomes, progress,
-                            cancel,
+                            repo, conv, pool, work_tree, jobs, &prepared, dir_cache, outcomes,
+                            progress, cancel,
                         )?;
                         prepared.clear();
                         prepared_bytes = 0;
@@ -597,13 +626,14 @@ fn flush_parallel_batch(
         }
     }
     flush_prepared_batch(
-        repo, pool, work_tree, jobs, &prepared, dir_cache, outcomes, progress, cancel,
+        repo, conv, pool, work_tree, jobs, &prepared, dir_cache, outcomes, progress, cancel,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
 fn flush_prepared_batch(
     repo: &Repository,
+    conv: &ConversionConfig,
     pool: Option<ParallelOptions>,
     work_tree: &Path,
     jobs: &[CheckoutWriteJob],
@@ -611,7 +641,7 @@ fn flush_prepared_batch(
     dir_cache: &mut LeadingDirCache,
     outcomes: &mut [Option<WriteJobOutcome>],
     progress: &mut dyn crate::progress::ProgressSink,
-    cancel: &dyn crate::progress::Cancel,
+    cancel: &crate::progress::CancelToken,
 ) -> Result<()> {
     if prepared.is_empty() {
         return Ok(());
@@ -620,6 +650,7 @@ fn flush_prepared_batch(
         let parent_snapshot = LeadingDirCache::with_ready_from(&*dir_cache);
         flush_prepared_writes_parallel(
             repo,
+            conv,
             options,
             work_tree,
             jobs,
@@ -629,7 +660,7 @@ fn flush_prepared_batch(
         )?;
     } else {
         flush_prepared_writes_serial(
-            repo, work_tree, jobs, prepared, dir_cache, outcomes, progress, cancel,
+            repo, conv, work_tree, jobs, prepared, dir_cache, outcomes, progress, cancel,
         )?;
     }
     for _ in prepared {
@@ -662,7 +693,7 @@ pub(crate) fn execute_write_jobs(
     checkout_parallel_threshold: Option<i64>,
     skip_chunk_ramp: bool,
     progress: &mut dyn crate::progress::ProgressSink,
-    cancel: &dyn crate::progress::Cancel,
+    cancel: &crate::progress::CancelToken,
     journal: &mut CheckoutJournal,
 ) -> Result<Vec<WriteJobOutcome>> {
     let result = execute_write_jobs_unrecorded(
@@ -706,7 +737,7 @@ pub(crate) fn execute_write_jobs_unrecorded(
     checkout_parallel_threshold: Option<i64>,
     skip_chunk_ramp: bool,
     progress: &mut dyn crate::progress::ProgressSink,
-    cancel: &dyn crate::progress::Cancel,
+    cancel: &crate::progress::CancelToken,
 ) -> Result<Vec<WriteJobOutcome>> {
     let mut outcomes: Vec<Option<WriteJobOutcome>> = (0..jobs.len()).map(|_| None).collect();
     let pool = parallel_pool_for_checkout(
@@ -782,7 +813,11 @@ pub(crate) fn execute_write_jobs_unrecorded(
         .into_iter()
         .enumerate()
         .map(|(i, o)| {
-            o.ok_or_else(|| Error::PathError(format!("missing checkout outcome for job {i}")))
+            o.ok_or_else(|| {
+                Error::Worktree(WorktreeError::Path {
+                    detail: format!("missing checkout outcome for job {i}"),
+                })
+            })
         })
         .collect()
 }
@@ -790,6 +825,18 @@ pub(crate) fn execute_write_jobs_unrecorded(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn paths_needing_serial_checkout(
+        paths: &[String],
+        ignorecase: bool,
+        precompose: bool,
+    ) -> HashSet<String> {
+        let borrowed: Vec<&str> = paths.iter().map(String::as_str).collect();
+        paths_needing_serial_checkout_str(&borrowed, ignorecase, precompose)
+            .into_iter()
+            .map(|i| paths[i].clone())
+            .collect()
+    }
 
     #[test]
     fn ignorecase_basename_collision_marks_serial() {

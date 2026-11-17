@@ -1,8 +1,9 @@
-// API docs: https://docs.rs/grit-lib/latest/grit_lib/remote/fn.list_refs_from_git_dir.html
+// API docs: https://docs.rs/grit-lib/latest/grit_lib/repo_handles/struct.RepositoryRemotes.html#method.ls_remote
+use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::objects::odb::Odb;
 use grit_lib::objects::{parse_commit, parse_tree, tag_object_line_oid, ObjectId, ObjectKind};
-use grit_lib::refs::write_ref;
-use grit_lib::remote::{list_refs_from_git_dir, ListRefsOptions};
+use grit_lib::remote::{ListRefsOptions, Remote};
+use grit_lib::repo::Repository;
 use std::collections::HashSet;
 use std::env;
 use std::path::PathBuf;
@@ -10,24 +11,28 @@ use std::path::PathBuf;
 fn main() -> grit_lib::error::Result<()> {
     let local_git = arg_path(1, ".git");
     let remote_git = arg_path(2, "../remote.git");
+    let local = Repository::open(&local_git, &RepositoryOptions::from_process())?;
     let local_odb = Odb::new(&local_git.join("objects"));
     let remote_odb = Odb::new(&remote_git.join("objects"));
 
-    let refs = list_refs_from_git_dir(
-        &remote_git,
-        Some(&remote_odb),
-        &ListRefsOptions {
-            heads: true,
-            ..Default::default()
-        },
-    )
-    .map_err(|e| grit_lib::error::Error::from(e))?;
+    let local = Repository::open(&local_git, &RepositoryOptions::from_process())?;
+    let refs = local
+        .remotes()
+        .ls_remote(
+            &Remote::from_url(&remote_git.to_string_lossy())?,
+            &ListRefsOptions {
+                heads: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .map_err(grit_lib::error::Error::from)?;
 
     for remote_ref in refs {
         copy_reachable(&remote_odb, &local_odb, remote_ref.oid)?;
         if let Some(branch) = remote_ref.name.strip_prefix("refs/heads/") {
             let tracking_ref = format!("refs/remotes/origin/{branch}");
-            write_ref(&local_git, &tracking_ref, &remote_ref.oid)?;
+            local.references().update(&tracking_ref, &remote_ref.oid)?;
             println!("fetched {} -> {}", remote_ref.name, tracking_ref);
         }
     }

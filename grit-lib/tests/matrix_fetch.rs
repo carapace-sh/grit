@@ -53,12 +53,9 @@ use std::time::{Duration, Instant};
 
 use grit_lib::error::Result as GritResult;
 use grit_lib::objects::odb::Odb;
-use grit_lib::progress::NeverCancel;
-use grit_lib::refs::resolve_ref;
-use grit_lib::remote::fetch::{fetch_remote, NoProgress};
 use grit_lib::remote::transfer::{FetchDepth, FetchOptions, FetchOutcome, TagMode, UpdateMode};
+use grit_lib::remote::transport::http::http_client_arc;
 use grit_lib::remote::transport::http::ureq_client::UreqHttpClient;
-use grit_lib::remote::transport::http::{http_client_arc, http_fetch};
 use grit_lib::remote::transport::{
     ConnectOptions, GitDaemonTransport, Service, SshTransport, Transport,
 };
@@ -305,12 +302,22 @@ fn daemon_driver(protocol: u8) -> Driver {
         }),
         fetch: Box::new(move |url, local_git, opts| {
             let transport = GitDaemonTransport::new();
-            let copts = ConnectOptions {
-                protocol_version: protocol,
-                ..Default::default()
-            };
+            let copts = ConnectOptions::with_protocol_version(protocol);
             let mut conn = transport.connect(url, Service::UploadPack, &copts)?;
-            fetch_remote(local_git, &mut *conn, opts, &mut NoProgress, &NeverCancel)
+            grit_lib::repo::Repository::open(
+                local_git,
+                &grit_lib::config::environment::RepositoryOptions::with_environment(
+                    (opts).environment.clone(),
+                ),
+            )
+            .expect("open fetch target")
+            .remotes()
+            .fetch_from(
+                grit_lib::remote::transfer::TransferEndpoint::Connection(&mut *conn),
+                opts,
+                &mut NoProgress,
+                &CancelToken::never(),
+            )
         }),
     }
 }
@@ -341,12 +348,22 @@ fn ssh_driver(protocol: u8, scratch: PathBuf) -> Option<Driver> {
         }),
         fetch: Box::new(move |url, local_git, opts| {
             let transport = SshTransport::with_program(fake_ssh.as_os_str());
-            let copts = ConnectOptions {
-                protocol_version: protocol,
-                ..Default::default()
-            };
+            let copts = ConnectOptions::with_protocol_version(protocol);
             let mut conn = transport.connect(url, Service::UploadPack, &copts)?;
-            fetch_remote(local_git, &mut *conn, opts, &mut NoProgress, &NeverCancel)
+            grit_lib::repo::Repository::open(
+                local_git,
+                &grit_lib::config::environment::RepositoryOptions::with_environment(
+                    (opts).environment.clone(),
+                ),
+            )
+            .expect("open fetch target")
+            .remotes()
+            .fetch_from(
+                grit_lib::remote::transfer::TransferEndpoint::Connection(&mut *conn),
+                opts,
+                &mut NoProgress,
+                &CancelToken::never(),
+            )
         }),
     })
 }
@@ -413,7 +430,23 @@ fn http_driver(protocol: u8) -> Option<Driver> {
             } else {
                 UreqHttpClient::new()
             });
-            http_fetch(client, local_git, url, opts, &mut NoProgress)
+            grit_lib::repo::Repository::open(
+                local_git,
+                &grit_lib::config::environment::RepositoryOptions::with_environment(
+                    (opts).environment.clone(),
+                ),
+            )
+            .expect("open fetch target")
+            .remotes()
+            .fetch_from(
+                grit_lib::remote::transfer::TransferEndpoint::Http {
+                    client: client,
+                    url: url,
+                },
+                opts,
+                &mut NullProgress,
+                grit_lib::progress::CancelToken::never_ref(),
+            )
         }),
     })
 }
@@ -552,24 +585,28 @@ fn matrix_wildcard_refspec_all_heads() {
         &|driver, fetch, served, local_git| {
             let main_oid = rev_parse(served, "refs/heads/main");
             let topic_oid = rev_parse(served, "refs/heads/topic");
-            let mut opts = FetchOptions {
-                refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()],
-                tags: TagMode::None,
-                ..Default::default()
-            };
+            let mut opts = FetchOptions::new();
+            opts.refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()];
+            opts.tags = TagMode::None;
             let outcome = fetch(local_git, &mut opts)
                 .unwrap_or_else(|e| panic!("[{}] wildcard fetch failed: {e}", driver.name));
 
-            let got_main = resolve_ref(local_git, "refs/remotes/origin/main")
+            let got_main = grit_test_support::refs::at(local_git)
+                .references()
+                .resolve("refs/remotes/origin/main")
                 .unwrap_or_else(|_| panic!("[{}] origin/main missing", driver.name));
-            let got_topic = resolve_ref(local_git, "refs/remotes/origin/topic")
+            let got_topic = grit_test_support::refs::at(local_git)
+                .references()
+                .resolve("refs/remotes/origin/topic")
                 .unwrap_or_else(|_| panic!("[{}] origin/topic missing", driver.name));
             assert_eq!(got_main, main_oid, "[{}] origin/main oid", driver.name);
             assert_eq!(got_topic, topic_oid, "[{}] origin/topic oid", driver.name);
 
             // side branch also matched the wildcard.
             let side_oid = rev_parse(served, "refs/heads/side");
-            let got_side = resolve_ref(local_git, "refs/remotes/origin/side")
+            let got_side = grit_test_support::refs::at(local_git)
+                .references()
+                .resolve("refs/remotes/origin/side")
                 .unwrap_or_else(|_| panic!("[{}] origin/side missing", driver.name));
             assert_eq!(got_side, side_oid, "[{}] origin/side oid", driver.name);
 
@@ -629,16 +666,16 @@ fn matrix_exact_refspec_single_head() {
         &|w| build_source_work(w),
         &|driver, fetch, served, local_git| {
             let main_oid = rev_parse(served, "refs/heads/main");
-            let mut opts = FetchOptions {
-                refspecs: vec!["+refs/heads/main:refs/remotes/origin/main".to_owned()],
-                tags: TagMode::None,
-                ..Default::default()
-            };
+            let mut opts = FetchOptions::new();
+            opts.refspecs = vec!["+refs/heads/main:refs/remotes/origin/main".to_owned()];
+            opts.tags = TagMode::None;
             fetch(local_git, &mut opts)
                 .unwrap_or_else(|e| panic!("[{}] exact fetch failed: {e}", driver.name));
 
             assert_eq!(
-                resolve_ref(local_git, "refs/remotes/origin/main")
+                grit_test_support::refs::at(local_git)
+                    .references()
+                    .resolve("refs/remotes/origin/main")
                     .unwrap_or_else(|_| panic!("[{}] origin/main missing", driver.name)),
                 main_oid,
                 "[{}] exact main oid",
@@ -646,12 +683,18 @@ fn matrix_exact_refspec_single_head() {
             );
             // No other head was written by the exact refspec.
             assert!(
-                resolve_ref(local_git, "refs/remotes/origin/topic").is_err(),
+                grit_test_support::refs::at(local_git)
+                    .references()
+                    .resolve("refs/remotes/origin/topic")
+                    .is_err(),
                 "[{}] exact refspec must NOT write origin/topic",
                 driver.name
             );
             assert!(
-                resolve_ref(local_git, "refs/remotes/origin/side").is_err(),
+                grit_test_support::refs::at(local_git)
+                    .references()
+                    .resolve("refs/remotes/origin/side")
+                    .is_err(),
                 "[{}] exact refspec must NOT write origin/side",
                 driver.name
             );
@@ -676,32 +719,38 @@ fn matrix_negative_refspec_excludes_head() {
         &|driver, fetch, served, local_git| {
             let main_oid = rev_parse(served, "refs/heads/main");
             let topic_oid = rev_parse(served, "refs/heads/topic");
-            let mut opts = FetchOptions {
-                refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()],
-                // Exclude `topic` from the wildcard.
-                negative_refspecs: vec!["^refs/heads/topic".to_owned()],
-                tags: TagMode::None,
-                ..Default::default()
-            };
+            let mut opts = FetchOptions::new();
+            opts.refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()];
+            // Exclude `topic` from the wildcard.
+            opts.negative_refspecs = vec!["^refs/heads/topic".to_owned()];
+            opts.tags = TagMode::None;
             fetch(local_git, &mut opts)
                 .unwrap_or_else(|e| panic!("[{}] negative fetch failed: {e}", driver.name));
 
             assert_eq!(
-                resolve_ref(local_git, "refs/remotes/origin/main")
+                grit_test_support::refs::at(local_git)
+                    .references()
+                    .resolve("refs/remotes/origin/main")
                     .unwrap_or_else(|_| panic!("[{}] origin/main missing", driver.name)),
                 main_oid,
                 "[{}] main kept",
                 driver.name
             );
             assert!(
-                resolve_ref(local_git, "refs/remotes/origin/topic").is_err(),
+                grit_test_support::refs::at(local_git)
+                    .references()
+                    .resolve("refs/remotes/origin/topic")
+                    .is_err(),
                 "[{}] negative refspec must exclude origin/topic (got {})",
                 driver.name,
                 topic_oid.to_hex()
             );
             // side was not excluded -> still present.
             assert!(
-                resolve_ref(local_git, "refs/remotes/origin/side").is_ok(),
+                grit_test_support::refs::at(local_git)
+                    .references()
+                    .resolve("refs/remotes/origin/side")
+                    .is_ok(),
                 "[{}] non-excluded head origin/side must remain",
                 driver.name
             );
@@ -731,25 +780,28 @@ fn matrix_tag_modes_all_following_none() {
 
             // --- TagMode::All: both tags land (vside is unreachable from main). ---
             {
-                let mut opts = FetchOptions {
-                    refspecs: vec!["+refs/heads/main:refs/remotes/origin/main".to_owned()],
-                    tags: TagMode::All,
-                    ..Default::default()
-                };
+                let mut opts = FetchOptions::new();
+                opts.refspecs = vec!["+refs/heads/main:refs/remotes/origin/main".to_owned()];
+                opts.tags = TagMode::All;
                 fetch(local_git, &mut opts)
                     .unwrap_or_else(|e| panic!("[{}] tags=All fetch failed: {e}", driver.name));
                 assert_eq!(
-                    resolve_ref(local_git, "refs/tags/v1")
+                    grit_test_support::refs::at(local_git)
+                        .references()
+                        .resolve("refs/tags/v1")
                         .unwrap_or_else(|_| panic!("[{}] v1 (All) missing", driver.name)),
                     v1_oid,
                     "[{}] tag v1 (All)",
                     driver.name
                 );
                 assert_eq!(
-                    resolve_ref(local_git, "refs/tags/vside").unwrap_or_else(|_| panic!(
-                        "[{}] vside (All) missing: TagMode::All must fetch unreachable tags",
-                        driver.name
-                    )),
+                    grit_test_support::refs::at(local_git)
+                        .references()
+                        .resolve("refs/tags/vside")
+                        .unwrap_or_else(|_| panic!(
+                            "[{}] vside (All) missing: TagMode::All must fetch unreachable tags",
+                            driver.name
+                        )),
                     vside_oid,
                     "[{}] tag vside (All)",
                     driver.name
@@ -768,22 +820,25 @@ fn matrix_tag_modes_all_following_none() {
             let v1_oid = rev_parse(served, "refs/tags/v1");
             let side_tip = rev_parse(served, "refs/heads/side");
             // --- TagMode::Following: v1 reachable from main kept; vside dropped. ---
-            let mut opts = FetchOptions {
-                refspecs: vec!["+refs/heads/main:refs/remotes/origin/main".to_owned()],
-                tags: TagMode::Following,
-                ..Default::default()
-            };
+            let mut opts = FetchOptions::new();
+            opts.refspecs = vec!["+refs/heads/main:refs/remotes/origin/main".to_owned()];
+            opts.tags = TagMode::Following;
             fetch(local_git, &mut opts)
                 .unwrap_or_else(|e| panic!("[{}] tags=Following fetch failed: {e}", driver.name));
             assert_eq!(
-                resolve_ref(local_git, "refs/tags/v1")
+                grit_test_support::refs::at(local_git)
+                    .references()
+                    .resolve("refs/tags/v1")
                     .unwrap_or_else(|_| panic!("[{}] v1 (Following) missing", driver.name)),
                 v1_oid,
                 "[{}] Following keeps reachable v1",
                 driver.name
             );
             assert!(
-                resolve_ref(local_git, "refs/tags/vside").is_err(),
+                grit_test_support::refs::at(local_git)
+                    .references()
+                    .resolve("refs/tags/vside")
+                    .is_err(),
                 "[{}] Following must drop the unreachable vside tag",
                 driver.name
             );
@@ -806,20 +861,24 @@ fn matrix_tag_modes_all_following_none() {
         &|w| build_source_work(w),
         &|driver, fetch, _served, local_git| {
             // --- TagMode::None: no tags at all. ---
-            let mut opts = FetchOptions {
-                refspecs: vec!["+refs/heads/main:refs/remotes/origin/main".to_owned()],
-                tags: TagMode::None,
-                ..Default::default()
-            };
+            let mut opts = FetchOptions::new();
+            opts.refspecs = vec!["+refs/heads/main:refs/remotes/origin/main".to_owned()];
+            opts.tags = TagMode::None;
             fetch(local_git, &mut opts)
                 .unwrap_or_else(|e| panic!("[{}] tags=None fetch failed: {e}", driver.name));
             assert!(
-                resolve_ref(local_git, "refs/tags/v1").is_err(),
+                grit_test_support::refs::at(local_git)
+                    .references()
+                    .resolve("refs/tags/v1")
+                    .is_err(),
                 "[{}] tags=None must NOT write v1",
                 driver.name
             );
             assert!(
-                resolve_ref(local_git, "refs/tags/vside").is_err(),
+                grit_test_support::refs::at(local_git)
+                    .references()
+                    .resolve("refs/tags/vside")
+                    .is_err(),
                 "[{}] tags=None must NOT write vside",
                 driver.name
             );
@@ -841,16 +900,17 @@ fn matrix_prune_vanished_wildcard_ref() {
         &h,
         &|w| build_source_work(w),
         &|driver, fetch, served, local_git| {
-            let mut wildcard = FetchOptions {
-                refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()],
-                tags: TagMode::None,
-                ..Default::default()
-            };
+            let mut wildcard = FetchOptions::new();
+            wildcard.refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()];
+            wildcard.tags = TagMode::None;
             // Initial fetch establishes origin/topic.
             fetch(local_git, &mut wildcard)
                 .unwrap_or_else(|e| panic!("[{}] initial wildcard fetch failed: {e}", driver.name));
             assert!(
-                resolve_ref(local_git, "refs/remotes/origin/topic").is_ok(),
+                grit_test_support::refs::at(local_git)
+                    .references()
+                    .resolve("refs/remotes/origin/topic")
+                    .is_ok(),
                 "[{}] origin/topic must exist before prune",
                 driver.name
             );
@@ -859,23 +919,27 @@ fn matrix_prune_vanished_wildcard_ref() {
             git(served, &["branch", "-D", "topic"]);
 
             // Re-fetch with prune.
-            let mut pruning = FetchOptions {
-                refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()],
-                prune: true,
-                tags: TagMode::None,
-                ..Default::default()
-            };
+            let mut pruning = FetchOptions::new();
+            pruning.refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()];
+            pruning.prune = true;
+            pruning.tags = TagMode::None;
             let outcome = fetch(local_git, &mut pruning)
                 .unwrap_or_else(|e| panic!("[{}] pruning fetch failed: {e}", driver.name));
 
             assert!(
-                resolve_ref(local_git, "refs/remotes/origin/topic").is_err(),
+                grit_test_support::refs::at(local_git)
+                    .references()
+                    .resolve("refs/remotes/origin/topic")
+                    .is_err(),
                 "[{}] origin/topic must be pruned after it vanished on the remote",
                 driver.name
             );
             // main survives (still on the remote).
             assert!(
-                resolve_ref(local_git, "refs/remotes/origin/main").is_ok(),
+                grit_test_support::refs::at(local_git)
+                    .references()
+                    .resolve("refs/remotes/origin/main")
+                    .is_ok(),
                 "[{}] origin/main must survive the prune",
                 driver.name
             );
@@ -911,15 +975,16 @@ fn matrix_prune_vanished_exact_ref() {
         &|w| build_source_work(w),
         &|driver, fetch, served, local_git| {
             // Seed origin/topic via its exact refspec.
-            let mut seed = FetchOptions {
-                refspecs: vec!["+refs/heads/topic:refs/remotes/origin/topic".to_owned()],
-                tags: TagMode::None,
-                ..Default::default()
-            };
+            let mut seed = FetchOptions::new();
+            seed.refspecs = vec!["+refs/heads/topic:refs/remotes/origin/topic".to_owned()];
+            seed.tags = TagMode::None;
             fetch(local_git, &mut seed)
                 .unwrap_or_else(|e| panic!("[{}] seed exact fetch failed: {e}", driver.name));
             assert!(
-                resolve_ref(local_git, "refs/remotes/origin/topic").is_ok(),
+                grit_test_support::refs::at(local_git)
+                    .references()
+                    .resolve("refs/remotes/origin/topic")
+                    .is_ok(),
                 "[{}] origin/topic must exist before exact prune",
                 driver.name
             );
@@ -929,16 +994,17 @@ fn matrix_prune_vanished_exact_ref() {
 
             // Re-fetch the SAME exact refspec with prune: the source is gone, so
             // the destination tracking ref is pruned.
-            let mut prune_exact = FetchOptions {
-                refspecs: vec!["+refs/heads/topic:refs/remotes/origin/topic".to_owned()],
-                prune: true,
-                tags: TagMode::None,
-                ..Default::default()
-            };
+            let mut prune_exact = FetchOptions::new();
+            prune_exact.refspecs = vec!["+refs/heads/topic:refs/remotes/origin/topic".to_owned()];
+            prune_exact.prune = true;
+            prune_exact.tags = TagMode::None;
             let outcome = fetch(local_git, &mut prune_exact)
                 .unwrap_or_else(|e| panic!("[{}] exact pruning fetch failed: {e}", driver.name));
             assert!(
-                resolve_ref(local_git, "refs/remotes/origin/topic").is_err(),
+                grit_test_support::refs::at(local_git)
+                    .references()
+                    .resolve("refs/remotes/origin/topic")
+                    .is_err(),
                 "[{}] exact-refspec prune must remove origin/topic",
                 driver.name
             );
@@ -976,11 +1042,9 @@ fn matrix_prune_before_update_df_conflict() {
         git(w, &["branch", "feature"]);
     };
     let ran = for_each_driver(&h, &build, &|driver, fetch, served, local_git| {
-        let mut wildcard = FetchOptions {
-            refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()],
-            tags: TagMode::None,
-            ..Default::default()
-        };
+        let mut wildcard = FetchOptions::new();
+        wildcard.refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()];
+        wildcard.tags = TagMode::None;
         // 1. Fetch -> origin/feature exists as a loose FILE.
         fetch(local_git, &mut wildcard)
             .unwrap_or_else(|e| panic!("[{}] initial DF fetch failed: {e}", driver.name));
@@ -998,12 +1062,10 @@ fn matrix_prune_before_update_df_conflict() {
 
         // 3. Prune-enabled fetch: prune `origin/feature` first, then write
         //    `origin/feature/sub`. Both must succeed.
-        let mut pruning = FetchOptions {
-            refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()],
-            prune: true,
-            tags: TagMode::None,
-            ..Default::default()
-        };
+        let mut pruning = FetchOptions::new();
+        pruning.refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()];
+        pruning.prune = true;
+        pruning.tags = TagMode::None;
         fetch(local_git, &mut pruning).unwrap_or_else(|e| {
             panic!(
                 "[{}] prune-before-update D/F fetch failed (D/F conflict not resolved?): {e}",
@@ -1012,17 +1074,23 @@ fn matrix_prune_before_update_df_conflict() {
         });
 
         assert!(
-            resolve_ref(local_git, "refs/remotes/origin/feature").is_err(),
+            grit_test_support::refs::at(local_git)
+                .references()
+                .resolve("refs/remotes/origin/feature")
+                .is_err(),
             "[{}] stale origin/feature ref must be pruned",
             driver.name
         );
         assert_eq!(
-            resolve_ref(local_git, "refs/remotes/origin/feature/sub").unwrap_or_else(|_| {
-                panic!(
-                    "[{}] origin/feature/sub must be written after the prune cleared the D/F",
-                    driver.name
-                )
-            }),
+            grit_test_support::refs::at(local_git)
+                .references()
+                .resolve("refs/remotes/origin/feature/sub")
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "[{}] origin/feature/sub must be written after the prune cleared the D/F",
+                        driver.name
+                    )
+                }),
             sub_oid,
             "[{}] feature/sub oid",
             driver.name
@@ -1048,11 +1116,9 @@ fn matrix_empty_unborn_remote() {
         // No commits; HEAD is unborn. bare_clone will mirror this empty repo.
     };
     let ran = for_each_driver(&h, &build, &|driver, fetch, _served, local_git| {
-        let mut opts = FetchOptions {
-            refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()],
-            tags: TagMode::All,
-            ..Default::default()
-        };
+        let mut opts = FetchOptions::new();
+        opts.refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()];
+        opts.tags = TagMode::All;
         let outcome = fetch(local_git, &mut opts).unwrap_or_else(|e| {
             panic!(
                 "[{}] empty-remote fetch failed (should be a clean no-op): {e}",
@@ -1066,7 +1132,10 @@ fn matrix_empty_unborn_remote() {
             outcome.updates
         );
         assert!(
-            resolve_ref(local_git, "refs/remotes/origin/main").is_err(),
+            grit_test_support::refs::at(local_git)
+                .references()
+                .resolve("refs/remotes/origin/main")
+                .is_err(),
             "[{}] no tracking ref should be written for an unborn remote",
             driver.name
         );
@@ -1092,11 +1161,9 @@ fn matrix_incremental_shared_history() {
         &|w| build_source_work(w),
         &|driver, fetch, served, local_git| {
             // 1. Seed: fetch main + topic so local shares their history.
-            let mut seed = FetchOptions {
-                refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()],
-                tags: TagMode::None,
-                ..Default::default()
-            };
+            let mut seed = FetchOptions::new();
+            seed.refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()];
+            seed.tags = TagMode::None;
             fetch(local_git, &mut seed)
                 .unwrap_or_else(|e| panic!("[{}] seed fetch failed: {e}", driver.name));
             // Materialize a local branch at the fetched tip so the negotiator has a
@@ -1127,16 +1194,16 @@ fn matrix_incremental_shared_history() {
 
             // 3. Incremental fetch: pull the new topic tip. Local already holds the
             //    base history, so the new tip is what must arrive.
-            let mut inc = FetchOptions {
-                refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()],
-                tags: TagMode::None,
-                ..Default::default()
-            };
+            let mut inc = FetchOptions::new();
+            inc.refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()];
+            inc.tags = TagMode::None;
             fetch(local_git, &mut inc)
                 .unwrap_or_else(|e| panic!("[{}] incremental fetch failed: {e}", driver.name));
 
-            let got_topic =
-                resolve_ref(local_git, "refs/remotes/origin/topic").unwrap_or_else(|_| {
+            let got_topic = grit_test_support::refs::at(local_git)
+                .references()
+                .resolve("refs/remotes/origin/topic")
+                .unwrap_or_else(|_| {
                     panic!("[{}] origin/topic missing after incremental", driver.name)
                 });
             assert_eq!(
@@ -1154,7 +1221,9 @@ fn matrix_incremental_shared_history() {
             // The pre-existing shared main commit is still there (not re-fetched
             // away); cross-check it equals git's view.
             assert_eq!(
-                resolve_ref(local_git, "refs/remotes/origin/main")
+                grit_test_support::refs::at(local_git)
+                    .references()
+                    .resolve("refs/remotes/origin/main")
                     .unwrap()
                     .to_hex(),
                 git(served, &["rev-parse", "refs/heads/main"]).trim(),
@@ -1185,15 +1254,19 @@ fn matrix_incremental_following_with_tags_already_local() {
         &|driver, fetch, served, local_git| {
             let local_root = local_git.parent().unwrap();
             let refspec = "+refs/heads/main:refs/remotes/origin/main";
-            let mut opts = FetchOptions {
-                refspecs: vec![refspec.to_owned()],
-                tags: TagMode::Following,
-                ..Default::default()
-            };
+            let mut opts = FetchOptions::new();
+            opts.refspecs = vec![refspec.to_owned()];
+            opts.tags = TagMode::Following;
             fetch(local_git, &mut opts)
                 .unwrap_or_else(|e| panic!("[{}] seed fetch failed: {e}", driver.name));
             let v1_oid = rev_parse(served, "refs/tags/v1");
-            assert_eq!(resolve_ref(local_git, "refs/tags/v1").unwrap(), v1_oid);
+            assert_eq!(
+                grit_test_support::refs::at(local_git)
+                    .references()
+                    .resolve("refs/tags/v1")
+                    .unwrap(),
+                v1_oid
+            );
 
             let git_local = h
                 .path()
@@ -1221,7 +1294,13 @@ fn matrix_incremental_following_with_tags_already_local() {
                 .find(|u| u.remote_ref == "refs/tags/v2")
                 .unwrap_or_else(|| panic!("[{}] v2 missing from outcome", driver.name));
             assert_eq!(v2.mode, UpdateMode::New, "[{}] v2 mode", driver.name);
-            assert_eq!(resolve_ref(local_git, "refs/tags/v2").unwrap(), v2_oid);
+            assert_eq!(
+                grit_test_support::refs::at(local_git)
+                    .references()
+                    .resolve("refs/tags/v2")
+                    .unwrap(),
+                v2_oid
+            );
             assert!(
                 outcome
                     .updates
@@ -1232,7 +1311,10 @@ fn matrix_incremental_following_with_tags_already_local() {
                 driver.name
             );
             assert!(
-                resolve_ref(local_git, "refs/tags/vside").is_err(),
+                grit_test_support::refs::at(local_git)
+                    .references()
+                    .resolve("refs/tags/vside")
+                    .is_err(),
                 "[{}] unreachable vside must stay out",
                 driver.name
             );
@@ -1296,11 +1378,9 @@ fn matrix_following_matches_git_for_tree_blob_and_side_tags() {
         &|driver, fetch, served, local_git| {
             let local_root = local_git.parent().unwrap();
             let refspec = "+refs/heads/main:refs/remotes/origin/main";
-            let mut opts = FetchOptions {
-                refspecs: vec![refspec.to_owned()],
-                tags: TagMode::Following,
-                ..Default::default()
-            };
+            let mut opts = FetchOptions::new();
+            opts.refspecs = vec![refspec.to_owned()];
+            opts.tags = TagMode::Following;
             let git_local = h
                 .path()
                 .join(format!("git-object-tags-{}", driver.name.replace('/', "-")));
@@ -1415,11 +1495,9 @@ fn matrix_head_symref_nondefault_branch() {
             git(served, &["symbolic-ref", "HEAD", "refs/heads/topic"]);
         },
         &|driver, fetch, served, local_git| {
-            let mut opts = FetchOptions {
-                refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()],
-                tags: TagMode::None,
-                ..Default::default()
-            };
+            let mut opts = FetchOptions::new();
+            opts.refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()];
+            opts.tags = TagMode::None;
             let outcome = fetch(local_git, &mut opts)
                 .unwrap_or_else(|e| panic!("[{}] symref fetch failed: {e}", driver.name));
             assert_eq!(
@@ -1430,7 +1508,9 @@ fn matrix_head_symref_nondefault_branch() {
             );
             // Sanity: topic landed and equals git's view.
             assert_eq!(
-                resolve_ref(local_git, "refs/remotes/origin/topic")
+                grit_test_support::refs::at(local_git)
+                    .references()
+                    .resolve("refs/remotes/origin/topic")
                     .unwrap()
                     .to_hex(),
                 git(served, &["rev-parse", "refs/heads/topic"]).trim(),
@@ -1522,32 +1602,29 @@ fn fetch_outcome_identical_git_daemon_and_smart_http() {
     let scratch = tempfile::tempdir().expect("tempdir");
     let all = drivers(scratch.path());
 
+    let shallow_v1 = {
+        let mut opts = FetchOptions::new();
+        opts.refspecs = vec!["+refs/heads/main:refs/remotes/origin/main".to_owned()];
+        opts.fetch_depth = FetchDepth::depth(1);
+        opts.tags = TagMode::Following;
+        opts
+    };
+    let tags_v1 = {
+        let mut opts = FetchOptions::new();
+        opts.refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()];
+        opts.tags = TagMode::All;
+        opts
+    };
+    let tags_v2 = {
+        let mut opts = FetchOptions::new();
+        opts.refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()];
+        opts.tags = TagMode::All;
+        opts
+    };
     let mut scenarios: [(&str, FetchOptions); 3] = [
-        (
-            "shallow-v1",
-            FetchOptions {
-                refspecs: vec!["+refs/heads/main:refs/remotes/origin/main".to_owned()],
-                fetch_depth: FetchDepth::depth(1),
-                tags: TagMode::Following,
-                ..Default::default()
-            },
-        ),
-        (
-            "tags-v1",
-            FetchOptions {
-                refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()],
-                tags: TagMode::All,
-                ..Default::default()
-            },
-        ),
-        (
-            "tags-v2",
-            FetchOptions {
-                refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()],
-                tags: TagMode::All,
-                ..Default::default()
-            },
-        ),
+        ("shallow-v1", shallow_v1),
+        ("tags-v1", tags_v1),
+        ("tags-v2", tags_v2),
     ];
 
     let mut ran = 0usize;

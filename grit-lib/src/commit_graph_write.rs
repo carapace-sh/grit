@@ -1,18 +1,21 @@
 //! Serialize Git commit-graph v1 files with GDA2 + optional Bloom chunks (`commit-graph.c` compatible).
 
-use std::collections::{HashMap, HashSet};
-use std::io::Write;
+#![allow(dead_code)]
 
 use crate::bloom::{BloomBuildOutcome, BloomFilterSettings};
 use crate::commit_graph_file::CommitGraphChain;
+use crate::error::ObjectError;
 #[cfg(windows)]
 use crate::fs_readonly::clear_readonly_attribute;
 use crate::fs_readonly::clear_readonly_tree;
 use crate::objects::{
-    oid_hash_map_from, oid_hash_set, parse_commit, tag_object_line_oid, HashAlgo, ObjectId,
-    ObjectKind, OidHashMap, OidHashSet,
+    oid_hash_map, oid_hash_map_from, oid_hash_set, tag_object_line_oid, CommitRef, HashAlgo,
+    ObjectId, ObjectKind, OidHashMap, OidHashSet,
 };
 use crate::odb::Odb;
+use crate::refs::store::RefNameRef;
+use std::collections::{HashMap, HashSet};
+use std::io::Write;
 
 const SIGNATURE: &[u8; 4] = b"CGPH";
 const VERSION: u8 = 1;
@@ -38,9 +41,9 @@ const CORRECTED_COMMIT_DATE_OFFSET_OVERFLOW: u32 = 1u32 << 31;
 /// Per-commit data needed to write CDAT / Bloom.
 #[derive(Debug, Clone)]
 pub struct CommitGraphCommitInfo {
-    /// Tree for this item.
+    /// Root tree object id for this commit.
     pub tree: ObjectId,
-    /// Parents for this item.
+    /// Parent commit object ids (empty for root commits).
     pub parents: Vec<ObjectId>,
     /// Committer Unix timestamp (Git `timestamp_t`; may exceed `u32`).
     pub commit_time: u64,
@@ -51,12 +54,24 @@ fn hash_file_body(body: &[u8], algo: HashAlgo) -> Vec<u8> {
     algo.checksum_digest(body)
 }
 
-fn parse_commit_time(committer: &str) -> u64 {
-    let parts: Vec<&str> = committer.rsplitn(3, ' ').collect();
-    if parts.len() >= 2 {
-        parts[1].parse::<u64>().unwrap_or(0)
-    } else {
-        0
+/// Committer timestamp from a `committer` header payload (`Name <email> <time> <tz>`); `0` when
+/// the second-to-last field is not an unsigned integer.
+fn parse_commit_time(committer: &[u8]) -> u64 {
+    let mut fields = committer.rsplitn(3, |&b| b == b' ');
+    let (Some(_), Some(time)) = (fields.next(), fields.next()) else {
+        return 0;
+    };
+    std::str::from_utf8(time)
+        .ok()
+        .and_then(|t| t.parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+fn commit_info_from_ref(commit: &CommitRef<'_>) -> CommitGraphCommitInfo {
+    CommitGraphCommitInfo {
+        tree: commit.tree(),
+        parents: commit.parents().to_vec(),
+        commit_time: parse_commit_time(commit.committer_raw()),
     }
 }
 
@@ -64,22 +79,24 @@ fn parse_commit_time(committer: &str) -> u64 {
 ///
 /// # Errors
 ///
-/// [`crate::error::Error::CorruptObject`] when `oid` is not a commit, plus any read or
+/// [`crate::error::ObjectError::Corrupt`] when `oid` is not a commit, plus any read or
 /// parse error from [`Odb::read_commit`].
-pub fn load_commit_graph_commit_info(
+pub(crate) fn load_commit_graph_commit_info(
     odb: &Odb,
     oid: ObjectId,
 ) -> crate::error::Result<CommitGraphCommitInfo> {
     let c = odb.read_commit(&oid).map_err(|err| match err {
-        crate::error::Error::UnexpectedObjectKind { .. } => {
-            crate::error::Error::CorruptObject(format!("object {oid} is not a commit"))
+        crate::error::Error::Object(ObjectError::UnexpectedKind { .. }) => {
+            crate::error::Error::Object(ObjectError::Corrupt {
+                detail: format!("object {oid} is not a commit"),
+            })
         }
         other => other,
     })?;
     Ok(CommitGraphCommitInfo {
         tree: c.tree,
         parents: c.parents.clone(),
-        commit_time: parse_commit_time(&c.committer),
+        commit_time: parse_commit_time(c.committer.as_bytes()),
     })
 }
 
@@ -217,6 +234,80 @@ fn compute_corrected_generations(
     gen_date
 }
 
+/// Bloom filters computed by [`compute_new_bloom_filters`], packed into one buffer.
+///
+/// Tens of thousands of separately allocated filters would stay live across every tree diff
+/// and fragment the heap those diffs churn through; one growing buffer does not.
+struct ComputedBloomFilters {
+    /// Filter bytes of every computed commit, in computation order.
+    data: Vec<u8>,
+    /// Per `sorted_oids` index: the commit's range in `data` and how its filter was built.
+    filters: Vec<Option<(std::ops::Range<usize>, BloomBuildOutcome)>>,
+}
+
+impl ComputedBloomFilters {
+    /// Filter bytes and outcome for `sorted_oids[i]`, when one was computed.
+    fn get(&self, i: usize) -> Option<(&[u8], BloomBuildOutcome)> {
+        let (range, outcome) = self.filters.get(i)?.as_ref()?;
+        Some((&self.data[range.clone()], *outcome))
+    }
+}
+
+/// Changed-path Bloom filters for the commits of `sorted_oids` that have no reusable filter.
+///
+/// Only the first `max_new` such commits in `sorted_oids` order get a filter, the commits
+/// Git's `--max-new-filters` budget selects. They are diffed in generation order (`topo`), so
+/// consecutive diffs share most of their trees and find them in the object database's tree
+/// cache; OID order would visit history at random. A first parent outside `infos` (a commit
+/// of a base layer) has its tree read from the object database.
+#[expect(clippy::too_many_arguments)]
+fn compute_new_bloom_filters(
+    sorted_oids: &[ObjectId],
+    infos: &OidHashMap<CommitGraphCommitInfo>,
+    odb: &Odb,
+    bloom_settings: &BloomFilterSettings,
+    existing_filters: &OidHashMap<Vec<u8>>,
+    upgraded_filters: &OidHashMap<Vec<u8>>,
+    max_new: u32,
+    topo: &[u32],
+) -> crate::error::Result<ComputedBloomFilters> {
+    let mut order: Vec<usize> = sorted_oids
+        .iter()
+        .enumerate()
+        .filter(|(_, oid)| {
+            !existing_filters.contains_key(*oid) && !upgraded_filters.contains_key(*oid)
+        })
+        .map(|(i, _)| i)
+        .take(max_new as usize)
+        .collect();
+    order.sort_unstable_by_key(|&i| (topo[i], i));
+
+    let mut computed = ComputedBloomFilters {
+        data: Vec::new(),
+        filters: vec![None; sorted_oids.len()],
+    };
+    for i in order {
+        let info = &infos[&sorted_oids[i]];
+        let parent_tree = match info.parents.first() {
+            Some(parent) => Some(match infos.get(parent) {
+                Some(parent_info) => parent_info.tree,
+                None => odb.commit_tree(parent)?,
+            }),
+            None => None,
+        };
+        let (bytes, outcome) = crate::commit_graph_file::bloom_filter_for_tree_diff(
+            odb,
+            parent_tree,
+            info.tree,
+            bloom_settings,
+        )?;
+        let start = computed.data.len();
+        computed.data.extend_from_slice(&bytes);
+        computed.filters[i] = Some((start..computed.data.len(), outcome));
+    }
+    Ok(computed)
+}
+
 fn resolve_parent_edge(
     commit: ObjectId,
     parent: ObjectId,
@@ -229,26 +320,28 @@ fn resolve_parent_edge(
     }
     chain
         .and_then(|c| c.global_position(&parent))
-        .ok_or(crate::error::Error::CommitGraphParentMissing { commit, parent })
+        .ok_or(crate::error::Error::Object(
+            ObjectError::CommitGraphParentMissing { commit, parent },
+        ))
 }
 
 /// Counters emitted as `GIT_TRACE2_EVENT` for Bloom generation (`commit-graph.c`).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct BloomWriteStats {
-    /// Filter computed for this item.
+    /// Commits that received a newly computed Bloom filter chunk.
     pub filter_computed: u32,
-    /// Filter not computed for this item.
+    /// Commits skipped because a filter already existed or Bloom was disabled.
     pub filter_not_computed: u32,
-    /// Filter trunc empty for this item.
+    /// Filters omitted because the changed-path set was empty.
     pub filter_trunc_empty: u32,
-    /// Filter trunc large for this item.
+    /// Filters omitted because changed paths exceeded the size limit.
     pub filter_trunc_large: u32,
-    /// Filter upgraded for this item.
+    /// Filters rebuilt at a higher setting than a previous generation.
     pub filter_upgraded: u32,
 }
 #[expect(clippy::too_many_arguments)]
 /// Build raw commit-graph bytes (without touching the filesystem).
-pub fn build_commit_graph_bytes(
+pub(crate) fn build_commit_graph_bytes(
     sorted_oids: &[ObjectId],
     infos: &HashMap<ObjectId, CommitGraphCommitInfo>,
     odb: &Odb,
@@ -383,11 +476,20 @@ pub(crate) fn build_commit_graph_bytes_from_oid_maps(
     let mut bloom_stats = BloomWriteStats::default();
     let max_new = max_new_filters.unwrap_or(u32::MAX);
     let (bidx, bdat, bloom_total_payload) = if changed_paths {
+        let computed = compute_new_bloom_filters(
+            sorted_oids,
+            infos,
+            odb,
+            bloom_settings,
+            existing_filters,
+            upgraded_filters,
+            max_new,
+            &topo,
+        )?;
         let mut indexes: Vec<u32> = Vec::with_capacity(sorted_oids.len());
         let mut data_payload = Vec::new();
         let mut cur = 0u32;
-        for oid in sorted_oids {
-            let info = &infos[oid];
+        for (i, oid) in sorted_oids.iter().enumerate() {
             // Reuse a filter already present (in a compatible layer) for this commit
             // instead of recomputing it. Git counts these as `filter_not_computed`.
             if let Some(existing) = existing_filters.get(oid) {
@@ -407,17 +509,9 @@ pub(crate) fn build_commit_graph_bytes_from_oid_maps(
                 data_payload.extend_from_slice(upgraded);
                 continue;
             }
-            let compute = bloom_stats.filter_computed < max_new;
-            let (bytes, outcome) = if compute {
-                crate::commit_graph_file::bloom_filter_for_commit_write(
-                    odb,
-                    &info.parents,
-                    info.tree,
-                    bloom_settings,
-                )?
-            } else {
-                (Vec::new(), BloomBuildOutcome::Normal)
-            };
+            let filter = computed.get(i);
+            let compute = filter.is_some();
+            let (bytes, outcome) = filter.unwrap_or((&[], BloomBuildOutcome::Normal));
             if compute {
                 bloom_stats.filter_computed += 1;
                 match outcome {
@@ -430,7 +524,7 @@ pub(crate) fn build_commit_graph_bytes_from_oid_maps(
             }
             cur += bytes.len() as u32;
             indexes.push(cur);
-            data_payload.extend_from_slice(&bytes);
+            data_payload.extend_from_slice(bytes);
         }
         let mut bdat_chunk = Vec::with_capacity(12 + data_payload.len());
         bdat_chunk.extend_from_slice(&bloom_settings.hash_version.to_be_bytes());
@@ -505,37 +599,63 @@ pub(crate) fn build_commit_graph_bytes_from_oid_maps(
     Ok((out, bloom_stats))
 }
 
-fn walk_reachable_commits_from_tip_stack(
+/// Commits reachable from `stack`, each with the graph data [`load_commit_graph_commit_info`]
+/// would load for it, reading every commit once.
+///
+/// Each object is read whole, so a commit only enters the graph once its full stored form
+/// (zlib stream and checksum included) has been read; a header-only read would accept a commit
+/// whose body is damaged. Missing objects are skipped, as for a ref whose target is absent, but
+/// an object that exists and cannot be read or parsed fails the walk, as it fails Git's writer.
+fn walk_reachable_commit_infos(
     odb: &Odb,
     mut stack: Vec<ObjectId>,
-) -> crate::error::Result<OidHashSet> {
-    let mut commits: OidHashSet = oid_hash_set();
-    while let Some(oid) = stack.pop() {
-        if commits.contains(&oid) {
-            continue;
-        }
-        let obj = match odb.try_read_once(&oid) {
-            Ok(Some(o)) => o,
-            Ok(None) | Err(_) => continue,
-        };
-        if obj.kind != ObjectKind::Commit {
-            if obj.kind == ObjectKind::Tag {
-                stack.extend(tag_object_line_oid(&obj.data));
+) -> crate::error::Result<OidHashMap<CommitGraphCommitInfo>> {
+    odb.with_pack_read_context(|| {
+        let mut commits: OidHashMap<CommitGraphCommitInfo> = oid_hash_map();
+        let mut buf = Vec::new();
+        // One reader for the whole walk instead of one per read; anything it does not serve
+        // (other packs, loose objects, read errors) goes through the object database.
+        let mut pack = odb.open_session_pack_reader().ok().flatten();
+        while let Some(oid) = stack.pop() {
+            if commits.contains_key(&oid) {
+                continue;
             }
-            continue;
+            let from_pack = pack
+                .as_mut()
+                .and_then(|reader| reader.read_object_into(&oid, &mut buf).ok());
+            let kind = match from_pack {
+                Some(kind) => Some(kind),
+                None => odb.try_read_into_once(&oid, &mut buf)?,
+            };
+            match kind {
+                Some(ObjectKind::Commit) => {
+                    let info = commit_info_from_ref(&CommitRef::parse(&buf)?);
+                    stack.extend_from_slice(&info.parents);
+                    commits.insert(oid, info);
+                }
+                Some(ObjectKind::Tag) => stack.extend(tag_object_line_oid(&buf)),
+                Some(_) | None => {}
+            }
         }
-        let commit = parse_commit(&obj.data)?;
-        for parent in &commit.parents {
-            stack.push(*parent);
-        }
-        commits.insert(oid);
+        Ok(commits)
+    })
+}
+
+/// `HEAD` and every ref under `refs/`, through the repository's ref store.
+fn ref_tips_for_repository(repo: &crate::repo::Repository) -> crate::error::Result<Vec<ObjectId>> {
+    let mut stack: Vec<ObjectId> = Vec::new();
+    if let Ok(oid) = repo.ref_store().resolve(RefNameRef::from_trusted("HEAD")) {
+        stack.push(oid);
     }
-    Ok(commits)
+    for (_, oid) in crate::refs::list_refs_for_repository(repo, "refs/")? {
+        stack.push(oid);
+    }
+    Ok(stack)
 }
 
 /// Collect reachable commit OIDs from ref tips via the repository [`RefStore`](crate::refs::store::RefStore).
 ///
-/// Resolves `HEAD` through [`Repository::refs`](crate::repo::Repository::refs), lists refs under
+/// Resolves `HEAD` through [`Repository::ref_store`](crate::repo::Repository::ref_store), lists refs under
 /// `refs/` (reftable, packed-refs, and linked-worktree rules),
 /// peels annotated tags while walking, and traverses commit parents. Missing targets
 /// are skipped without fetching from a promisor remote.
@@ -543,31 +663,45 @@ fn walk_reachable_commits_from_tip_stack(
 /// # Errors
 ///
 /// Propagates ref listing or object read/parse failures.
-pub fn collect_reachable_commit_oids_for_repository(
+pub(crate) fn collect_reachable_commit_oids_for_repository(
     repo: &crate::repo::Repository,
 ) -> crate::error::Result<HashSet<ObjectId>> {
-    use crate::refs;
-    let odb = repo.odb();
-    let mut stack: Vec<ObjectId> = Vec::new();
-    if let Ok(oid) = repo.refs().resolve("HEAD") {
-        stack.push(oid);
-    }
-    for (_, oid) in refs::list_refs_for_repository(repo, "refs/")? {
-        stack.push(oid);
-    }
-    Ok(walk_reachable_commits_from_tip_stack(odb, stack)?
-        .into_iter()
+    Ok(collect_reachable_commit_infos_for_repository(repo)?
+        .into_keys()
         .collect())
+}
+
+/// [`collect_reachable_commit_oids_for_repository`], keeping the graph data of each commit read
+/// during the walk so the writer does not read every commit a second time.
+pub(crate) fn collect_reachable_commit_infos_for_repository(
+    repo: &crate::repo::Repository,
+) -> crate::error::Result<OidHashMap<CommitGraphCommitInfo>> {
+    walk_reachable_commit_infos(repo.odb(), ref_tips_for_repository(repo)?)
 }
 
 /// Collect reachable commit OIDs from on-disk ref tips under `git_dir`.
 ///
 /// Prefer [`collect_reachable_commit_oids_for_repository`] when a [`crate::repo::Repository`] is
 /// available (reftable and linked worktrees require the ref store).
-pub fn collect_reachable_commit_oids(
+pub(crate) fn collect_reachable_commit_oids(
     git_dir: &std::path::Path,
     odb: &Odb,
 ) -> crate::error::Result<HashSet<ObjectId>> {
+    Ok(collect_reachable_commit_infos(git_dir, odb)?
+        .into_keys()
+        .collect())
+}
+
+/// [`collect_reachable_commit_oids`], keeping the graph data of each commit read during the walk.
+pub(crate) fn collect_reachable_commit_infos(
+    git_dir: &std::path::Path,
+    odb: &Odb,
+) -> crate::error::Result<OidHashMap<CommitGraphCommitInfo>> {
+    walk_reachable_commit_infos(odb, ref_tips_under_git_dir(git_dir)?)
+}
+
+/// Loose refs, `packed-refs` and `HEAD` read straight from `git_dir`.
+fn ref_tips_under_git_dir(git_dir: &std::path::Path) -> crate::error::Result<Vec<ObjectId>> {
     use std::fs;
     let mut stack: Vec<ObjectId> = Vec::new();
 
@@ -629,9 +763,7 @@ pub fn collect_reachable_commit_oids(
         }
     }
 
-    Ok(walk_reachable_commits_from_tip_stack(odb, stack)?
-        .into_iter()
-        .collect())
+    Ok(stack)
 }
 
 /// Directory in the repository tree, not a symlink/junction entry.
@@ -691,9 +823,9 @@ pub fn atomic_replace_commit_graph(
         drop(file);
         #[cfg(test)]
         if test_inject::should_fail_rename() {
-            return Err(crate::error::Error::Message(
-                "injected commit-graph rename failure".into(),
-            ));
+            return Err(crate::error::Error::Io(std::io::Error::other(
+                "injected commit-graph rename failure",
+            )));
         }
         #[cfg(windows)]
         if fs::symlink_metadata(&graph_path)
@@ -753,7 +885,7 @@ pub(crate) fn remove_commit_graph_files(
 /// Count unique commit OIDs that refs point to directly (peeling annotated tags), matching Git's
 /// `add_ref_to_set` accounting for the "Collecting referenced commits" progress meter. Unlike
 /// [`collect_reachable_commit_oids`], this does not walk commit parents.
-pub fn count_referenced_commit_tips(
+pub(crate) fn count_referenced_commit_tips(
     git_dir: &std::path::Path,
     odb: &Odb,
 ) -> crate::error::Result<usize> {
@@ -848,6 +980,7 @@ mod test_inject {
 
 #[cfg(test)]
 mod tests {
+    use crate::error::ObjectError;
     use std::collections::HashMap;
     use std::sync::Mutex;
 
@@ -899,7 +1032,10 @@ mod tests {
         .expect("init");
         let blob = repo.odb().write(ObjectKind::Blob, b"x").expect("blob");
         let err = super::load_commit_graph_commit_info(&repo.odb(), blob).unwrap_err();
-        assert!(matches!(err, crate::error::Error::CorruptObject(_)));
+        assert!(matches!(
+            err,
+            crate::error::Error::Object(ObjectError::Corrupt { .. })
+        ));
     }
 
     #[test]
@@ -986,7 +1122,7 @@ mod tests {
         .expect_err("first parent is not in the graph");
         assert!(matches!(
             err,
-            crate::error::Error::CommitGraphParentMissing { commit, parent }
+            crate::error::Error::Object(ObjectError::CommitGraphParentMissing { commit, parent })
                 if commit == merge && parent == root
         ));
     }
@@ -1063,6 +1199,85 @@ mod tests {
         .expect("write");
         assert!(stats.filter_computed <= 1);
         assert!(stats.filter_not_computed >= 1);
+    }
+
+    #[test]
+    fn max_new_filters_budget_goes_to_first_unfiltered_commits_in_oid_order() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = init_repository(
+            dir.path(),
+            false,
+            "main",
+            None,
+            crate::RefStorageFormat::Files,
+        )
+        .expect("init");
+        let odb = repo.odb();
+        let mut parents = Vec::new();
+        let mut infos = oid_hash_map();
+        for t in 1..=4i64 {
+            let blob = odb
+                .write(ObjectKind::Blob, format!("{t}\n").as_bytes())
+                .expect("blob");
+            let mut tree_raw = b"100644 a.txt\0".to_vec();
+            tree_raw.extend_from_slice(blob.as_bytes());
+            let tree = odb.write(ObjectKind::Tree, &tree_raw).expect("tree");
+            let ident = format!("T <t@example.com> {t} +0000");
+            let raw = serialize_commit(&CommitData {
+                tree,
+                parents: parents.clone(),
+                author: ident.clone(),
+                committer: ident,
+                author_raw: Vec::new(),
+                committer_raw: Vec::new(),
+                encoding: None,
+                message: "m\n".into(),
+                raw_message: None,
+                extra_headers: Vec::new(),
+            });
+            let c = odb.write(ObjectKind::Commit, &raw).expect("commit");
+            infos.insert(
+                c,
+                super::load_commit_graph_commit_info(odb, c).expect("info"),
+            );
+            parents = vec![c];
+        }
+        let mut sorted: Vec<ObjectId> = infos.keys().copied().collect();
+        sorted.sort_unstable();
+        let bloom = BloomFilterSettings::default();
+        let build = |existing: &crate::objects::OidHashMap<Vec<u8>>| {
+            let (bytes, stats) = super::build_commit_graph_bytes_from_oid_maps(
+                &sorted,
+                &infos,
+                odb,
+                true,
+                &bloom,
+                None,
+                &[],
+                Some(2),
+                existing,
+                &oid_hash_map(),
+                true,
+            )
+            .expect("build");
+            let chain =
+                crate::commit_graph_file::CommitGraphChain::from_bytes(bytes).expect("parse graph");
+            let filtered: Vec<bool> = sorted
+                .iter()
+                .map(|oid| chain.existing_filter_bytes(oid, &bloom).is_some())
+                .collect();
+            (filtered, stats)
+        };
+
+        let (filtered, stats) = build(&oid_hash_map());
+        assert_eq!(filtered, [true, true, false, false]);
+        assert_eq!((stats.filter_computed, stats.filter_not_computed), (2, 2));
+
+        let mut existing = oid_hash_map();
+        existing.insert(sorted[0], vec![0u8]);
+        let (filtered, stats) = build(&existing);
+        assert_eq!(filtered, [true, true, true, false]);
+        assert_eq!((stats.filter_computed, stats.filter_not_computed), (2, 2));
     }
 
     #[test]

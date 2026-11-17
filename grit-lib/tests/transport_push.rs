@@ -20,9 +20,7 @@ use std::time::{Duration, Instant};
 
 use grit_lib::objects::odb::Odb;
 use grit_lib::objects::ObjectId;
-use grit_lib::refs::resolve_ref;
 use grit_lib::remote::fetch::NoProgress;
-use grit_lib::remote::push::push_remote;
 use grit_lib::remote::push_report::PushRefStatus;
 use grit_lib::remote::transfer::{PushOptions, PushRefSpec};
 use grit_lib::remote::transport::{ConnectOptions, GitDaemonTransport, Service, Transport};
@@ -142,16 +140,21 @@ fn push_over_git_daemon_lands_ref_and_objects_and_reports_rejection() {
         expect_absent: false,
         ..Default::default()
     };
-    let outcome = push_remote(
+    let outcome = grit_lib::repo::Repository::open(
         &local_git,
-        &mut *conn,
+        &grit_lib::config::environment::RepositoryOptions::empty(),
+    )
+    .expect("open push source")
+    .remotes()
+    .push_to(
+        grit_lib::remote::transfer::TransferEndpoint::Connection(&mut *conn),
         &[spec],
         &PushOptions {
             tracking_remote: Some("origin".to_owned()),
             ..PushOptions::default()
         },
         &mut NoProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("push_remote over git daemon");
     drop(conn);
@@ -168,14 +171,20 @@ fn push_over_git_daemon_lands_ref_and_objects_and_reports_rejection() {
     assert_eq!(r.new_oid, Some(main_oid));
     assert!(r.old_oid.is_none(), "new ref has no old value");
 
-    let tracking = resolve_ref(&local_git, "refs/remotes/origin/main").expect("tracking ref");
+    let tracking = grit_test_support::refs::at(&local_git)
+        .references()
+        .resolve("refs/remotes/origin/main")
+        .expect("tracking ref");
     assert_eq!(
         tracking, main_oid,
         "PushOptions.tracking_remote must update refs/remotes/origin/main"
     );
 
     // The remote ref now points at our main, and the objects are present.
-    let remote_main = resolve_ref(&bare, "refs/heads/main").expect("remote main written");
+    let remote_main = grit_test_support::refs::at(&bare)
+        .references()
+        .resolve("refs/heads/main")
+        .expect("remote main written");
     assert_eq!(remote_main, main_oid, "remote main oid mismatch");
 
     let remote_odb = open_odb(&bare);
@@ -237,13 +246,18 @@ fn push_over_git_daemon_lands_ref_and_objects_and_reports_rejection() {
         expect_absent: false,
         ..Default::default()
     };
-    let outcome2 = push_remote(
+    let outcome2 = grit_lib::repo::Repository::open(
         &local_git,
-        &mut *conn2,
+        &grit_lib::config::environment::RepositoryOptions::empty(),
+    )
+    .expect("open push source")
+    .remotes()
+    .push_to(
+        grit_lib::remote::transfer::TransferEndpoint::Connection(&mut *conn2),
         &[nonff],
         &PushOptions::default(),
         &mut NoProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("non-ff push_remote completes");
     drop(conn2);
@@ -257,12 +271,15 @@ fn push_over_git_daemon_lands_ref_and_objects_and_reports_rejection() {
     );
     assert_eq!(
         r2.status,
-        PushRefStatus::RejectNonFastForward,
-        "client-side non-ff detection should reject before sending"
+        PushRefStatus::RejectNeedsForce,
+        "client-side diverged non-ff detection should reject before sending"
     );
 
     // The remote ref must be unchanged by the rejected push.
-    let remote_main_after = resolve_ref(&bare, "refs/heads/main").expect("remote main still set");
+    let remote_main_after = grit_test_support::refs::at(&bare)
+        .references()
+        .resolve("refs/heads/main")
+        .expect("remote main still set");
     assert_eq!(
         remote_main_after, main_oid,
         "rejected non-ff push must not move the remote ref"
@@ -284,13 +301,18 @@ fn push_over_git_daemon_lands_ref_and_objects_and_reports_rejection() {
         expect_absent: false,
         ..Default::default()
     };
-    let outcome3 = push_remote(
+    let outcome3 = grit_lib::repo::Repository::open(
         &local_git,
-        &mut *conn3,
+        &grit_lib::config::environment::RepositoryOptions::empty(),
+    )
+    .expect("open push source")
+    .remotes()
+    .push_to(
+        grit_lib::remote::transfer::TransferEndpoint::Connection(&mut *conn3),
         &[forced],
         &PushOptions::default(),
         &mut NoProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("forced push_remote completes");
     drop(conn3);
@@ -305,8 +327,10 @@ fn push_over_git_daemon_lands_ref_and_objects_and_reports_rejection() {
     );
     assert!(r3.forced, "forced update should be flagged forced");
     assert_eq!(r3.new_oid, Some(diverged));
-    let remote_main_forced =
-        resolve_ref(&bare, "refs/heads/main").expect("remote main after force");
+    let remote_main_forced = grit_test_support::refs::at(&bare)
+        .references()
+        .resolve("refs/heads/main")
+        .expect("remote main after force");
     assert_eq!(
         remote_main_forced, diverged,
         "forced push must advance the remote ref to the divergent tip"
@@ -346,18 +370,26 @@ fn push_over_git_daemon_lands_ref_and_objects_and_reports_rejection() {
         expect_absent: false,
         ..Default::default()
     };
-    push_remote(
+    grit_lib::repo::Repository::open(
         &local_git,
-        &mut *conn_mk,
+        &grit_lib::config::environment::RepositoryOptions::empty(),
+    )
+    .expect("open push source")
+    .remotes()
+    .push_to(
+        grit_lib::remote::transfer::TransferEndpoint::Connection(&mut *conn_mk),
         &[mk],
         &PushOptions::default(),
         &mut NoProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("create scratch ref");
     drop(conn_mk);
     assert_eq!(
-        resolve_ref(&bare, "refs/heads/scratch").expect("scratch created"),
+        grit_test_support::refs::at(&bare)
+            .references()
+            .resolve("refs/heads/scratch")
+            .expect("scratch created"),
         diverged,
         "scratch ref should be created before deletion"
     );
@@ -375,13 +407,18 @@ fn push_over_git_daemon_lands_ref_and_objects_and_reports_rejection() {
         expect_absent: false,
         ..Default::default()
     };
-    let outcome_del = push_remote(
+    let outcome_del = grit_lib::repo::Repository::open(
         &local_git,
-        &mut *conn_del,
+        &grit_lib::config::environment::RepositoryOptions::empty(),
+    )
+    .expect("open push source")
+    .remotes()
+    .push_to(
+        grit_lib::remote::transfer::TransferEndpoint::Connection(&mut *conn_del),
         &[del],
         &PushOptions::default(),
         &mut NoProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("deletion push_remote completes");
     drop(conn_del);
@@ -401,7 +438,10 @@ fn push_over_git_daemon_lands_ref_and_objects_and_reports_rejection() {
         rdel.new_oid
     );
     assert!(
-        resolve_ref(&bare, "refs/heads/scratch").is_err(),
+        grit_test_support::refs::at(&bare)
+            .references()
+            .resolve("refs/heads/scratch")
+            .is_err(),
         "scratch ref must be gone after a deletion push"
     );
 }
@@ -411,8 +451,7 @@ fn push_over_git_daemon_lands_ref_and_objects_and_reports_rejection() {
 #[test]
 fn push_new_branch_without_local_copy_of_advanced_remote_main() {
     use grit_lib::config::environment::RepositoryOptions;
-    use grit_lib::porcelain::add::stage_for_commit;
-    use grit_lib::porcelain::commit::{create_commit, CommitRequest};
+    use grit_lib::porcelain::commit::CommitRequest;
     use grit_lib::progress::NullProgress;
     use grit_lib::repo::Repository;
 
@@ -451,24 +490,27 @@ fn push_new_branch_without_local_copy_of_advanced_remote_main() {
     fn grit_commit(repo: &Repository, filename: &str, message: &str) -> ObjectId {
         let wt = repo.work_tree().expect("worktree");
         std::fs::write(wt.join(filename), format!("{message}\n")).unwrap();
-        stage_for_commit(repo, &mut NullProgress, &grit_lib::progress::NeverCancel).expect("stage");
+        repo.index()
+            .stage_for_commit(&mut NullProgress, &grit_lib::progress::CancelToken::never())
+            .expect("stage");
         let ident = "Test <t@example.com> 1 +0000".to_string();
-        let out = create_commit(
-            repo,
-            &CommitRequest {
-                message: message.to_owned(),
-                author: Some(ident.parse().expect("signature")),
-                committer: Some(ident.parse().expect("signature")),
-                allow_empty: false,
-                sign_override: None,
-                amend: false,
-                assume_worktree_synced: false,
-                ..Default::default()
-            },
-            &mut NullProgress,
-            &grit_lib::progress::NeverCancel,
-        )
-        .expect("commit");
+        let out = repo
+            .commits()
+            .create_staged(
+                &{
+                    let mut req = CommitRequest::new(message.to_owned());
+                    req.author = Some(ident.parse().expect("signature"));
+                    req.committer = Some(ident.parse().expect("signature"));
+                    req.allow_empty = false;
+                    req.sign_override = None;
+                    req.amend = false;
+                    req.assume_worktree_synced = false;
+                    req
+                },
+                &mut NullProgress,
+                &grit_lib::progress::CancelToken::never(),
+            )
+            .expect("commit");
         out.oid
     }
 
@@ -494,9 +536,14 @@ fn push_new_branch_without_local_copy_of_advanced_remote_main() {
     let mut conn_a = transport
         .connect(&url, Service::ReceivePack, &ConnectOptions::default())
         .expect("connect a");
-    let outcome_a = push_remote(
+    let outcome_a = grit_lib::repo::Repository::open(
         &clone_a.join(".git"),
-        &mut *conn_a,
+        &grit_lib::config::environment::RepositoryOptions::empty(),
+    )
+    .expect("open push source")
+    .remotes()
+    .push_to(
+        grit_lib::remote::transfer::TransferEndpoint::Connection(&mut *conn_a),
         &[PushRefSpec {
             src: Some(advanced),
             src_ref: None,
@@ -509,7 +556,7 @@ fn push_new_branch_without_local_copy_of_advanced_remote_main() {
         }],
         &PushOptions::default(),
         &mut NoProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("clone A advances main");
     drop(conn_a);
@@ -520,7 +567,10 @@ fn push_new_branch_without_local_copy_of_advanced_remote_main() {
         "clone A ff push to main should succeed, got {:?}",
         outcome_a.results[0].message
     );
-    let remote_main_after_a = resolve_ref(&bare, "refs/heads/main").expect("remote main");
+    let remote_main_after_a = grit_test_support::refs::at(&bare)
+        .references()
+        .resolve("refs/heads/main")
+        .expect("remote main");
     assert_eq!(
         remote_main_after_a, advanced,
         "remote main must advance after clone A push"
@@ -538,9 +588,14 @@ fn push_new_branch_without_local_copy_of_advanced_remote_main() {
     let mut conn_b = transport
         .connect(&url, Service::ReceivePack, &ConnectOptions::default())
         .expect("connect b");
-    let outcome = push_remote(
+    let outcome = grit_lib::repo::Repository::open(
         &clone_b.join(".git"),
-        &mut *conn_b,
+        &grit_lib::config::environment::RepositoryOptions::empty(),
+    )
+    .expect("open push source")
+    .remotes()
+    .push_to(
+        grit_lib::remote::transfer::TransferEndpoint::Connection(&mut *conn_b),
         &[PushRefSpec {
             src: Some(new_tip),
             src_ref: None,
@@ -553,7 +608,7 @@ fn push_new_branch_without_local_copy_of_advanced_remote_main() {
         }],
         &PushOptions::default(),
         &mut NoProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("clone B pushes new branch without fetch");
     drop(conn_b);
@@ -566,7 +621,10 @@ fn push_new_branch_without_local_copy_of_advanced_remote_main() {
         outcome.results[0].status,
         outcome.results[0].message
     );
-    let remote_newbr = resolve_ref(&bare, "refs/heads/newbr").expect("remote newbr");
+    let remote_newbr = grit_test_support::refs::at(&bare)
+        .references()
+        .resolve("refs/heads/newbr")
+        .expect("remote newbr");
     assert_eq!(remote_newbr, new_tip);
     assert!(
         open_odb(&bare).exists(&new_tip),
@@ -581,9 +639,14 @@ fn push_new_branch_without_local_copy_of_advanced_remote_main() {
         !clone_b_odb.exists(&remote_main_after_a),
         "clone B still lacks the advertised main tip"
     );
-    let outcome_force = push_remote(
+    let outcome_force = grit_lib::repo::Repository::open(
         &clone_b.join(".git"),
-        &mut *conn_force,
+        &grit_lib::config::environment::RepositoryOptions::empty(),
+    )
+    .expect("open push source")
+    .remotes()
+    .push_to(
+        grit_lib::remote::transfer::TransferEndpoint::Connection(&mut *conn_force),
         &[PushRefSpec {
             src: Some(new_tip),
             src_ref: None,
@@ -596,7 +659,7 @@ fn push_new_branch_without_local_copy_of_advanced_remote_main() {
         }],
         &PushOptions::default(),
         &mut NoProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("forced main push without local copy of old tip");
     drop(conn_force);
@@ -609,7 +672,10 @@ fn push_new_branch_without_local_copy_of_advanced_remote_main() {
     );
     assert!(outcome_force.results[0].forced);
     assert_eq!(
-        resolve_ref(&bare, "refs/heads/main").expect("main after force"),
+        grit_test_support::refs::at(&bare)
+            .references()
+            .resolve("refs/heads/main")
+            .expect("main after force"),
         new_tip
     );
 

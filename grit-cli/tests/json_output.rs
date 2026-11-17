@@ -796,6 +796,24 @@ fn revs_json_truncated() -> TestResult {
 }
 
 #[test]
+fn revs_json_exact_limit_not_truncated() -> TestResult {
+    let scratch = Scratch::new("revs-exact-limit")?;
+    let repo = scratch.child("repo");
+    fs::create_dir_all(&repo)?;
+    gs_ok(&repo, &["init", "."]);
+    for i in 0..2 {
+        write_file(&repo.join("a.txt"), &format!("v{i}\n"));
+        gs_ok(&repo, &["add", "a.txt"]);
+        gs_ok(&repo, &["commit", &format!("c{i}")]);
+    }
+    let v = gs_json(&repo, &["revs", "HEAD", "--limit", "2"]);
+    assert_eq!(v["commits"].as_array().unwrap().len(), 2);
+    assert_eq!(v["truncated"], Value::Bool(false));
+    assert_eq!(v["next"], Value::Null);
+    Ok(())
+}
+
+#[test]
 fn log_json_paging_through_merge_matches_git_order() -> TestResult {
     let scratch = Scratch::new("log-merge-page")?;
     let repo = scratch.child("repo");
@@ -2486,6 +2504,30 @@ fn json_filter_selects_fields() -> TestResult {
 }
 
 #[test]
+fn json_filter_rejects_non_json_filter_output() -> TestResult {
+    let scratch = Scratch::new("filter-nonjson")?;
+    let repo = scratch.child("repo");
+    fs::create_dir_all(&repo)?;
+    gs_ok(&repo, &["init", "."]);
+    write_file(&repo.join("a.txt"), "hi\n");
+    gs_ok(&repo, &["commit", "first"]);
+
+    for filter in ["nan", "infinite", "{(1): 2}"] {
+        let out = gs(&repo, ["--json", "--filter", filter, "status"]);
+        assert_eq!(out.status, Some(1), "filter={filter}: {}", out.dump());
+        let v: Value = serde_json::from_str(out.stdout.trim()).unwrap_or_else(|_| {
+            panic!("filter={filter}: stdout is not JSON: {}", out.dump());
+        });
+        assert!(
+            v.get("error").and_then(Value::as_str).is_some(),
+            "filter={filter}: {}",
+            out.dump()
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn json_filter_maps_commit_subjects() -> TestResult {
     let scratch = Scratch::new("filter-log")?;
     let repo = scratch.child("repo");
@@ -2506,6 +2548,40 @@ fn json_filter_maps_commit_subjects() -> TestResult {
         .map(|s| s.as_str().unwrap())
         .collect();
     assert_eq!(subjects, ["commit 2", "commit 1", "commit 0"]);
+    Ok(())
+}
+
+#[test]
+fn json_filter_one_commit_oid_is_array() -> TestResult {
+    let scratch = Scratch::new("filter-one")?;
+    let repo = scratch.child("repo");
+    fs::create_dir_all(&repo)?;
+    gs_ok(&repo, &["init", "."]);
+    write_file(&repo.join("a.txt"), "v0\n");
+    gs_ok(&repo, &["commit", "only"]);
+
+    let out = gs(&repo, ["--json", "--filter", ".commits[].oid", "log"]);
+    assert_eq!(out.status, Some(0), "{}", out.dump());
+    let v: Value = serde_json::from_str(&out.stdout).unwrap();
+    assert!(
+        v.is_array(),
+        "iterator filter must always be an array: {}",
+        out.stdout
+    );
+    assert_eq!(v.as_array().unwrap().len(), 1);
+
+    let empty = gs(
+        &repo,
+        [
+            "--json",
+            "--filter",
+            ".commits[] | select(.subject == \"missing\")",
+            "log",
+        ],
+    );
+    assert_eq!(empty.status, Some(0), "{}", empty.dump());
+    let v: Value = serde_json::from_str(&empty.stdout).unwrap();
+    assert_eq!(v, serde_json::json!([]));
     Ok(())
 }
 

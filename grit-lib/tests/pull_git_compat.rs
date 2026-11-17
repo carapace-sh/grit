@@ -9,12 +9,8 @@ use grit_lib::objects::ObjectId;
 use grit_lib::porcelain::pull::{
     pull, resolve_pull_mode, PullError, PullMode, PullOptions, PullResult,
 };
-use grit_lib::progress::NeverCancel;
-use grit_lib::refs::resolve_ref;
-use grit_lib::remote::fetch::NoProgress;
 use grit_lib::remote::transfer::{FetchOptions, TagMode};
 use grit_lib::repo::Repository;
-use grit_lib::state::resolve_head;
 use grit_test_support::{git, git_fsck, unique_tmp, write_file};
 
 fn commit(dir: &Path, file: &str, message: &str) {
@@ -81,24 +77,23 @@ fn setup_tracked_pair(tag: &str) -> (PathBuf, PathBuf) {
 }
 
 fn fetch_opts(env: &Environment) -> FetchOptions {
-    FetchOptions {
-        tags: TagMode::Following,
-        environment: env.clone(),
-        ..Default::default()
-    }
+    let mut opts = FetchOptions::new();
+    opts.tags = TagMode::Following;
+    opts.environment = env.clone();
+    opts
 }
 
 fn pull_grit(repo: &Repository, options: &PullOptions) -> grit_lib::porcelain::pull::PullOutcome {
     let mut progress = NoProgress;
-    pull(repo, options, &mut progress, &NeverCancel, None).expect("grit pull")
+    pull(repo, options, &mut progress, &CancelToken::never(), None).expect("grit pull")
 }
 
 fn try_pull_grit(
     repo: &Repository,
     options: &PullOptions,
-) -> Result<grit_lib::porcelain::pull::PullOutcome, PullError> {
+) -> grit_lib::error::Result<grit_lib::porcelain::pull::PullOutcome> {
     let mut progress = NoProgress;
-    pull(repo, options, &mut progress, &NeverCancel, None)
+    pull(repo, options, &mut progress, &CancelToken::never(), None)
 }
 
 fn assert_fsck(dir: &Path) {
@@ -218,14 +213,16 @@ fn pull_refuses_when_configured_merge_ref_did_not_fetch() {
 
     let head_before = rev(&grit_dir, "HEAD");
     assert!(
-        resolve_ref(grit_dir.join(".git").as_path(), "refs/remotes/origin/main").is_ok(),
+        grit_test_support::refs::at(grit_dir.join(".git").as_path())
+            .references()
+            .resolve("refs/remotes/origin/main")
+            .is_ok(),
         "origin/main exists but configured upstream is missing"
     );
-    assert!(resolve_ref(
-        grit_dir.join(".git").as_path(),
-        "refs/remotes/origin/missing"
-    )
-    .is_err());
+    assert!(grit_test_support::refs::at(grit_dir.join(".git").as_path())
+        .references()
+        .resolve("refs/remotes/origin/missing")
+        .is_err());
 
     let repo = open(&grit_dir);
     let err = try_pull_grit(
@@ -354,7 +351,12 @@ fn pull_ff_only_from_config_matches_git() {
 
     let repo = open(&grit_dir);
     assert_eq!(
-        resolve_pull_mode(&repo.config().expect("config"), Some("main"), None).expect("mode"),
+        resolve_pull_mode(
+            &repo.config().snapshot().expect("config"),
+            Some("main"),
+            None
+        )
+        .expect("mode"),
         PullMode::FfOnly
     );
     let outcome = pull_grit(
@@ -440,13 +442,73 @@ fn pull_unborn_adoption_matches_git() {
         },
     );
     assert_eq!(outcome.result, PullResult::SetUpstream);
-    assert!(resolve_head(repo.git_dir()).expect("head").oid().is_some());
+    assert!(repo.references().head().expect("head").oid().is_some());
     git_pull(&git_dir);
     assert_repo_matches_git(&grit_dir, &git_dir);
     assert_eq!(
-        resolve_ref(repo.git_dir(), "refs/heads/main").expect("main"),
+        repo.references().resolve("refs/heads/main").expect("main"),
         rev(&git_dir, "HEAD")
     );
+}
+
+#[test]
+fn pull_unborn_adoption_with_autostash_matches_git() {
+    let root = unique_tmp("pull-git", "unborn-autostash");
+    let origin = root.join("origin");
+    fs::create_dir_all(&origin).expect("origin");
+    git(&origin, &["init", "-q", "-b", "main"]);
+    commit(&origin, "f", "seed");
+
+    let grit_dir = root.join("grit");
+    fs::create_dir_all(&grit_dir).expect("grit dir");
+    git(&grit_dir, &["init", "-q", "-b", "main"]);
+    git(
+        &grit_dir,
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+    );
+    git(&grit_dir, &["config", "branch.main.remote", "origin"]);
+    git(
+        &grit_dir,
+        &["config", "branch.main.merge", "refs/heads/main"],
+    );
+    git(&grit_dir, &["config", "rebase.autoStash", "true"]);
+    git(&grit_dir, &["config", "pull.rebase", "true"]);
+    grit_identity(&grit_dir);
+
+    let git_dir = root.join("git");
+    fs::create_dir_all(&git_dir).expect("git dir");
+    git(&git_dir, &["init", "-q", "-b", "main"]);
+    git(
+        &git_dir,
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+    );
+    git(&git_dir, &["config", "branch.main.remote", "origin"]);
+    git(
+        &git_dir,
+        &["config", "branch.main.merge", "refs/heads/main"],
+    );
+    git(&git_dir, &["config", "rebase.autoStash", "true"]);
+    git(&git_dir, &["config", "pull.rebase", "true"]);
+    grit_identity(&git_dir);
+
+    let repo = open(&grit_dir);
+    let outcome = pull_grit(
+        &repo,
+        &PullOptions {
+            autostash: true,
+            fetch: fetch_opts(&Environment::empty()),
+            ..PullOptions::default()
+        },
+    );
+    assert_eq!(outcome.result, PullResult::SetUpstream);
+    assert!(repo.references().head().expect("head").oid().is_some());
+    git_allow_fail(&grit_dir, &["rev-parse", "refs/stash"]);
+
+    git(&git_dir, &["pull", "-q", "--autostash"]);
+    git_allow_fail(&git_dir, &["rev-parse", "refs/stash"]);
+    assert_repo_matches_git(&grit_dir, &git_dir);
+    git_fsck(&grit_dir, false);
+    git_fsck(&git_dir, false);
 }
 
 #[test]

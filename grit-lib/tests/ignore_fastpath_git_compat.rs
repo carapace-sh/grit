@@ -2,16 +2,14 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use grit_lib::progress::NullProgress;
 use std::fs;
 use std::process::Command;
 
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::index::Index;
-use grit_lib::porcelain::status::{
-    collect_untracked_and_ignored, status, IgnoredMode, StatusOptions,
-};
-use grit_lib::progress::NeverCancel;
-use grit_lib::progress::NullProgress;
+use grit_lib::porcelain::status::{IgnoredMode, StatusOptions};
+use grit_lib::progress::{CancelToken, NullProgress};
 use grit_lib::repo::Repository;
 use grit_test_support::unique_tmp;
 
@@ -44,19 +42,23 @@ fn backslash_escaped_literal_matches_git_check_ignore_and_status() {
         &RepositoryOptions::empty().with_work_tree(&root),
     )
     .expect("open");
-    let index = repo.index_handle().load().expect("index");
+    let index = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("index");
     let check = repo
         .ignore_check(&["foo bar".into()], &index)
         .expect("ignore_check");
     assert!(check[0].ignored, "grit must ignore foo bar like git");
 
-    let model = status(
-        &repo,
-        &StatusOptions::default(),
-        &mut NullProgress,
-        &NeverCancel,
-    )
-    .expect("status");
+    let model = repo
+        .status()
+        .run(
+            &StatusOptions::default(),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("status");
     assert!(
         !model.untracked.iter().any(|p| p == "foo bar"),
         "status must not list ignored file, got {:?}",
@@ -101,11 +103,22 @@ fn slash_containing_prefix_glob_respects_pathname_boundaries() {
         &RepositoryOptions::empty().with_work_tree(&root),
     )
     .expect("open");
-    let mut index: Index = repo.index_handle().load().expect("index");
+    let mut index: Index = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("index");
     let work_tree = repo.work_tree().expect("work tree");
-    let (untracked, _) =
-        collect_untracked_and_ignored(&repo, &mut index, work_tree, IgnoredMode::No, true, &[])
-            .expect("collect untracked");
+    let (untracked, _) = repo
+        .status()
+        .untracked(
+            &mut index,
+            &grit_lib::status::UntrackedOptions::default()
+                .with_ignored_mode(IgnoredMode::No)
+                .with_show_all(true),
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("collect untracked");
     assert!(
         untracked.iter().any(|p| p == "foo/bar/baz"),
         "grit must list foo/bar/baz like git, got {untracked:?}"

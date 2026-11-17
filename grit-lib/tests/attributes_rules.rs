@@ -3,6 +3,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use crate::support;
+use grit_lib::error::RefError;
 
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::error::Error;
@@ -585,7 +586,7 @@ fn t0003_resolve_attr_treeish_and_tree_oid_errors() {
     let repo2 =
         Repository::open(&wt.join(".git"), &options.clone().with_work_tree(wt)).expect("open2");
     let err = load_gitattributes_for_diff(&repo2).unwrap_err();
-    assert!(matches!(err, Error::InvalidRef(_)));
+    assert!(matches!(err, Error::Ref(RefError::Invalid { .. })));
 }
 
 fn null_dev() -> &'static str {
@@ -628,7 +629,7 @@ fn t0003_gitattributes_blob_literal_backslash_n_not_invented_from_index() {
     let index = Index::load(&wt.join(".git/index")).expect("index");
     let parsed = load_gitattributes_from_index(&index, repo.odb(), wt).expect("from index");
     let map = collect_attrs_for_path(&parsed.rules, &parsed.macros, "file", false);
-    assert!(map.get("text").is_none());
+    assert!(map.get("text").unwrap().is_none());
     assert_attrs_match(wt, &repo, &parsed, "text", &["file"], &["--cached"]);
 }
 
@@ -835,7 +836,7 @@ fn t0003_cached_without_index_entries_is_empty() {
 
 #[test]
 fn quoted_attribute_patterns_roundtrip_with_git() {
-    use grit_lib::quote_path::quote_c_style;
+    use grit_lib::porcelain::quote_path::quote_c_style;
 
     let root = tempfile::tempdir().expect("tempdir");
     let wt = root.path();

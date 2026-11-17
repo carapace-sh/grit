@@ -10,13 +10,22 @@ use grit_lib::config::environment::{Environment, RepositoryOptions};
 use grit_lib::objects::ObjectId;
 use grit_lib::repo::Repository;
 use grit_lib::revwalk::rev_list::RevListOptions;
-use grit_lib::revwalk::{LeftRightCounts, MergeFilter, RefSelection, RevWalkListOptions};
+use grit_lib::revwalk::{
+    LeftRightCounts, MergeBaseMode, MergeFilter, Peel, RefSelection, ResolveOptions, RevWalk,
+    RevWalkListOptions,
+};
+use grit_lib::worktree::pathspec::{Pathspec, PathspecGlobalFlags};
 
 use support::{
-    assert_rev_list_commits_match_git, build_commit_dag, git, git_commit_graph_write,
-    git_merge_base, git_merge_base_is_ancestor, git_rev_list, setup_path_simplify_history,
-    HistoryRepo,
+    assert_rev_list_commits_match_git, build_commit_dag, commit_labeled_with_dates, git,
+    git_commit_graph_write, git_merge_base, git_merge_base_is_ancestor, git_rev_list,
+    setup_path_simplify_history, HistoryRepo,
 };
+
+fn commit(walk: &RevWalk<'_>, spec: &str) -> ObjectId {
+    walk.resolve(spec, &ResolveOptions::default().with_peel(Peel::Commit))
+        .unwrap_or_else(|e| panic!("resolve {spec}: {e}"))
+}
 
 fn open_grit(wt: &Path) -> Repository {
     let mut env = Environment::empty();
@@ -37,11 +46,11 @@ fn grit_rev_list_oids(
     tokens: &[&str],
     opts: &RevWalkListOptions,
 ) -> Vec<ObjectId> {
-    repo.rev_walk().commits(tokens, opts).expect("grit commits")
+    repo.revwalk().commits(tokens, opts).expect("grit commits")
 }
 
 fn grit_rev_list_count(repo: &Repository, tokens: &[&str], opts: &RevWalkListOptions) -> usize {
-    repo.rev_walk().count(tokens, opts).expect("grit count")
+    repo.revwalk().count(tokens, opts).expect("grit count")
 }
 
 #[test]
@@ -98,7 +107,7 @@ fn revs_matches_git_rev_list() {
         &repo,
         &["rw6012-l"],
         &RevWalkListOptions {
-            paths: vec!["content.txt".into()],
+            pathspec: Pathspec::scoped(["content.txt"], PathspecGlobalFlags::default()),
             ..RevWalkListOptions::default()
         },
     );
@@ -165,18 +174,29 @@ fn merge_bases_match_git_merge_base_all() {
     let wt = hist.worktree();
     let oids = criss_cross_fixture(wt);
     let repo = open_grit(wt);
-    let walk = repo.rev_walk();
+    let walk = repo.revwalk();
 
     let g = oids["G"];
     let h = oids["H"];
     let git_single = git_merge_base(wt, &["G", "H"]);
     assert_eq!(
-        walk.merge_bases("G", "H", false).expect("single"),
+        walk.merge_bases(
+            &[commit(&walk, "G"), commit(&walk, "H")],
+            MergeBaseMode::Best
+        )
+        .expect("single"),
         git_single
     );
 
     let git_all = git_merge_base(wt, &["--all", "G", "H"]);
-    assert_eq!(walk.merge_bases("G", "H", true).expect("all"), git_all);
+    assert_eq!(
+        walk.merge_bases(
+            &[commit(&walk, "G"), commit(&walk, "H")],
+            MergeBaseMode::All
+        )
+        .expect("all"),
+        git_all
+    );
     let _ = (g, h);
 }
 
@@ -204,7 +224,7 @@ fn merge_bases_default_one_base_when_two_minimal_bases_exist() {
         &[("tip", "refs/heads/main")],
     );
     let repo = open_grit(wt);
-    let walk = repo.rev_walk();
+    let walk = repo.revwalk();
 
     let m1 = oids["m1"].to_hex();
     let m2 = oids["m2"].to_hex();
@@ -217,13 +237,19 @@ fn merge_bases_default_one_base_when_two_minimal_bases_exist() {
     );
 
     let grit_default = walk
-        .merge_bases(m1.as_str(), m2.as_str(), false)
+        .merge_bases(
+            &[commit(&walk, &m1), commit(&walk, &m2)],
+            MergeBaseMode::Best,
+        )
         .expect("default");
     assert_eq!(grit_default, git_default);
     assert_eq!(grit_default.len(), 1);
 
     let grit_all = walk
-        .merge_bases(m1.as_str(), m2.as_str(), true)
+        .merge_bases(
+            &[commit(&walk, &m1), commit(&walk, &m2)],
+            MergeBaseMode::All,
+        )
         .expect("all");
     assert_eq!(grit_all, git_all);
 }
@@ -234,10 +260,14 @@ fn merge_bases_criss_cross_side_exhaustion_matches_git() {
     let wt = hist.worktree();
     t6099_criss_cross(wt);
     let repo = open_grit(wt);
-    let walk = repo.rev_walk();
+    let walk = repo.revwalk();
     let git_all = git_merge_base(wt, &["--all", "A", "X"]);
     assert_eq!(
-        walk.merge_bases("A", "X", true).expect("criss-cross"),
+        walk.merge_bases(
+            &[commit(&walk, "A"), commit(&walk, "X")],
+            MergeBaseMode::All
+        )
+        .expect("criss-cross"),
         git_all
     );
 }
@@ -248,16 +278,18 @@ fn is_ancestor_matches_git() {
     let wt = hist.worktree();
     let oids = criss_cross_fixture(wt);
     let repo = open_grit(wt);
-    let walk = repo.rev_walk();
+    let walk = repo.revwalk();
     let b = oids["B"];
     let h = oids["H"];
     assert_eq!(
         git_merge_base_is_ancestor(wt, "B", "H"),
-        walk.is_ancestor("B", "H").expect("ancestor")
+        walk.is_ancestor(commit(&walk, "B"), commit(&walk, "H"))
+            .expect("ancestor")
     );
     assert_eq!(
         git_merge_base_is_ancestor(wt, "H", "B"),
-        walk.is_ancestor("H", "B").expect("not ancestor")
+        walk.is_ancestor(commit(&walk, "H"), commit(&walk, "B"))
+            .expect("not ancestor")
     );
     let _ = (b, h);
 }
@@ -458,6 +490,41 @@ fn merges_and_no_merges_match_git() {
 }
 
 #[test]
+fn no_merges_unlimited_order_matches_git_equal_committer_dates() {
+    let hist = HistoryRepo::init();
+    let wt = hist.worktree();
+    let oids = setup_revwalk_filter_fixture(wt);
+    let tip = oids["tip"];
+    let first = commit_labeled_with_dates(
+        wt,
+        "tie-a",
+        &[tip],
+        "@1700000000 +0000",
+        "@1700000000 +0000",
+    );
+    let second = commit_labeled_with_dates(
+        wt,
+        "tie-b",
+        &[first],
+        "@1700000000 +0000",
+        "@1700000000 +0000",
+    );
+    git(wt, &["update-ref", "refs/heads/main", &second.to_hex()]);
+
+    let repo = open_grit(wt);
+    let opts = RevWalkListOptions {
+        merges: MergeFilter::NoMerges,
+        ..RevWalkListOptions::default()
+    };
+    let git_oids = git_rev_list(wt, &["--no-merges", "main"]);
+    let grit_oids = grit_rev_list_oids(&repo, &["main"], &opts);
+    assert_eq!(
+        grit_oids.iter().map(ObjectId::to_hex).collect::<Vec<_>>(),
+        git_oids.iter().map(ObjectId::to_hex).collect::<Vec<_>>(),
+    );
+}
+
+#[test]
 fn reverse_matches_git() {
     let hist = HistoryRepo::init();
     let wt = hist.worktree();
@@ -562,6 +629,34 @@ fn branches_glob_matches_git() {
 }
 
 #[test]
+fn ref_set_only_empty_positive_specs_yields_empty_walk() {
+    let hist = HistoryRepo::init();
+    let wt = hist.worktree();
+    let oids = build_commit_dag(wt, &[("a", "root"), ("b", "a"), ("c", "b")], &[]);
+    git(wt, &["update-ref", "refs/heads/main", &oids["c"].to_hex()]);
+    let repo = open_grit(wt);
+
+    for (label, selection) in [
+        ("remotes", RefSelection::Remotes(None)),
+        (
+            "branches-glob",
+            RefSelection::Branches(Some("no-such-branch-*".into())),
+        ),
+        (
+            "tags-glob",
+            RefSelection::Tags(Some("no-such-tag-*".into())),
+        ),
+    ] {
+        let opts = RevWalkListOptions {
+            refs: vec![selection],
+            ..RevWalkListOptions::default()
+        };
+        assert_eq!(grit_rev_list_count(&repo, &[], &opts), 0, "{label}");
+        assert!(grit_rev_list_oids(&repo, &[], &opts).is_empty(), "{label}");
+    }
+}
+
+#[test]
 fn left_right_counts_no_merges_match_git() {
     let hist = HistoryRepo::init();
     let wt = hist.worktree();
@@ -584,7 +679,7 @@ fn left_right_counts_no_merges_match_git() {
     let token = "left...right";
     let git_counts = git_rev_list_left_right_count(wt, &[token, "--no-merges"]);
     let grit_counts = repo
-        .rev_walk()
+        .revwalk()
         .left_right_counts(
             &[token],
             &RevWalkListOptions {
@@ -786,7 +881,7 @@ fn merge_heavy_range_counts_match_git_with_filters() {
             let mut args: Vec<&str> = flags.iter().map(String::as_str).collect();
             args.push("old...topic");
             assert_eq!(
-                repo.rev_walk()
+                repo.revwalk()
                     .left_right_counts(&["old...topic"], opts)
                     .expect("left/right counts"),
                 git_rev_list_left_right_count(wt, &args),
@@ -810,7 +905,7 @@ fn left_right_counts_match_git_rev_list_left_right_count() {
     build_commit_dag(wt, &[("s1", "b"), ("s2", "s1")], &[]);
     git(wt, &["checkout", "main"]);
     let repo = open_grit(wt);
-    let walk = repo.rev_walk();
+    let walk = repo.revwalk();
     let token = "main...side";
     let git_counts = git_rev_list_left_right_count(wt, &[token]);
     let grit_counts = walk
@@ -865,7 +960,7 @@ fn left_right_counts_first_parent_shapes_match_git() {
     }
 
     let repo = open_grit(wt);
-    let walk = repo.rev_walk();
+    let walk = repo.revwalk();
     for token in [
         "old...trunk",
         "trunk...old",
@@ -928,7 +1023,7 @@ fn upstream_range_at_u_matches_git() {
     let token = "@{u}...HEAD";
     let git_counts = git_rev_list_left_right_count(wt, &[token]);
     let grit_counts = repo
-        .rev_walk()
+        .revwalk()
         .left_right_counts(&[token], &RevWalkListOptions::default())
         .expect("upstream symmetric counts");
     assert_eq!(grit_counts, git_counts);
@@ -991,7 +1086,7 @@ fn grit_rev_list_sides(
         ..opts.clone()
     };
     let result = repo
-        .rev_walk()
+        .revwalk()
         .rev_list_result(&[token], &opts)
         .unwrap_or_else(|e| panic!("{token}: {e}"));
     result
@@ -1057,7 +1152,7 @@ fn exclude_first_parent_only_keeps_second_parent_ancestry_of_exclusions() {
         "--exclude-first-parent-only R..main",
     );
     let listed = repo
-        .rev_walk()
+        .revwalk()
         .walk("R..main", &opts)
         .expect("rev_list")
         .commits;

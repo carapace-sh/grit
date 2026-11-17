@@ -13,7 +13,7 @@
 //! `remote.<name>.push` config) can use [`valid_fetch_refspec`] and
 //! [`valid_push_refspec`].
 
-use crate::check_ref_format::{check_refname_format, RefNameOptions};
+use crate::check_ref_format::{check_refname_format, RefFormatOptions};
 
 /// A parsed refspec item.
 ///
@@ -39,15 +39,19 @@ pub struct RefspecItem {
 
 /// Error returned when a refspec cannot be parsed.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RefspecError {
     /// The refspec string is invalid.
-    Invalid(String),
+    Invalid {
+        /// The refspec as given.
+        spec: String,
+    },
 }
 
 impl std::fmt::Display for RefspecError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            RefspecError::Invalid(s) => write!(f, "invalid refspec '{s}'"),
+            RefspecError::Invalid { spec: s } => write!(f, "invalid refspec '{s}'"),
         }
     }
 }
@@ -68,7 +72,7 @@ fn is_exact_sha1_hex(s: &str) -> bool {
 ///
 /// Returns `true` when the name is well-formed.
 fn refname_ok(name: &str, is_glob: bool) -> bool {
-    let opts = RefNameOptions {
+    let opts = RefFormatOptions {
         allow_onelevel: true,
         refspec_pattern: is_glob,
         normalize: false,
@@ -82,7 +86,9 @@ fn refname_ok(name: &str, is_glob: bool) -> bool {
 /// This is a direct port of `parse_refspec()` in `git/refspec.c`.
 fn parse_refspec(refspec: &str, fetch: bool) -> Result<RefspecItem, RefspecError> {
     let bytes = refspec.as_bytes();
-    let invalid = || RefspecError::Invalid(refspec.to_owned());
+    let invalid = || RefspecError::Invalid {
+        spec: refspec.to_owned(),
+    };
 
     let mut item = RefspecItem::default();
     let mut is_glob = false;
@@ -224,7 +230,7 @@ fn parse_refspec(refspec: &str, fetch: bool) -> Result<RefspecItem, RefspecError
 }
 
 /// Parse a fetch refspec, returning the parsed item or an error.
-pub fn parse_fetch_refspec(refspec: &str) -> Result<RefspecItem, RefspecError> {
+pub(crate) fn parse_fetch_refspec(refspec: &str) -> Result<RefspecItem, RefspecError> {
     parse_refspec(refspec, true)
 }
 
@@ -234,12 +240,14 @@ pub fn parse_push_refspec(refspec: &str) -> Result<RefspecItem, RefspecError> {
 }
 
 /// Returns `true` when `refspec` is a valid fetch refspec.
-pub fn valid_fetch_refspec(refspec: &str) -> bool {
+#[allow(dead_code)] // integration / re-export use only
+pub(crate) fn valid_fetch_refspec(refspec: &str) -> bool {
     parse_refspec(refspec, true).is_ok()
 }
 
 /// Returns `true` when `refspec` is a valid push refspec.
-pub fn valid_push_refspec(refspec: &str) -> bool {
+#[allow(dead_code)] // integration / re-export use only
+pub(crate) fn valid_push_refspec(refspec: &str) -> bool {
     parse_refspec(refspec, false).is_ok()
 }
 

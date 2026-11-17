@@ -4,16 +4,17 @@ use std::fs;
 
 use super::absorb::{blob_at_path, index_blob_at_path, remaining_index_blob_for_path};
 use super::apply::{apply_fixup_rewrite_then, apply_index_to_worktree_delta};
-use super::error::HistoryError;
+use super::error::{worktree_apply_engine, worktree_apply_io, HistoryError};
 use super::plan::{conflict_error, plan_rewrite};
 use super::reword::normalize_rewrite_message;
 use super::types::{AppliedRewrite, ApplyOptions};
 use super::types::{CommitEdit, EmptyPolicy, HistoryEdits, RewriteOptions, RewritePlan};
 use super::undo_work::capture_path_states;
+use super::PlanningError;
 use super::{commit_tree, load_commit};
 use crate::apply::{apply_patch_to_blob, BlobApplyOptions};
 use crate::diff::diff_index_to_tree;
-use crate::diff::hunk_id::DiffSide;
+use crate::diff::DiffSide;
 use crate::index::write_tree::write_tree_from_index;
 use crate::index::{Index, IndexEntry, MODE_REGULAR};
 use crate::merge_file::MergeFavor;
@@ -28,7 +29,7 @@ use crate::porcelain::hunk_select::{
 use crate::porcelain::index_from_tree::index_from_tree;
 use crate::repo::Repository;
 
-/// Options for [`fixup`].
+/// Options for [`History::fixup`](super::History::fixup).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FixupOptions {
     /// Replacement message for the target commit; `None` keeps the existing message.
@@ -45,22 +46,14 @@ pub struct FixupOptions {
 
 /// Plan a fixup of `target`: merge staged index changes onto `target`'s tree and replay descendants.
 ///
-/// When [`FixupOptions::selection`] is set, only the selected unstaged hunks are folded; the on-disk
-/// index is unchanged until [`apply_fixup_hunk_selection`].
-///
-/// Writes new commit objects into the ODB; refs are updated only when the caller applies the plan.
-///
-/// # Errors
-///
-/// Returns [`HistoryError::BareRepository`], [`HistoryError::NothingStaged`], merge
-/// [`HistoryError::Conflict`], empty-policy failures, and other planning errors.
-pub fn fixup(
+/// See [`History::fixup`](super::History::fixup).
+pub(crate) fn fixup(
     repo: &Repository,
     target: ObjectId,
     opts: &FixupOptions,
-) -> Result<RewritePlan, HistoryError> {
+) -> crate::error::Result<RewritePlan> {
     if repo.is_bare() {
-        return Err(HistoryError::BareRepository);
+        return Err(HistoryError::BareRepository.into());
     }
 
     let head_oid = repo.head_commit()?;
@@ -71,14 +64,13 @@ pub fn fixup(
         let index = repo.load_index()?;
         let staged = diff_index_to_tree(repo.odb(), &index, Some(&head_tree), false)?;
         if staged.is_empty() {
-            return Err(HistoryError::NothingStaged);
+            return Err(HistoryError::NothingStaged.into());
         }
         write_tree_from_index(repo.odb(), &index, "")?
     };
     let target_commit = load_commit(repo, target)?;
     let target_tree = target_commit.tree;
 
-    record_fixup_merge();
     let merge = merge_trees_three_way(
         repo,
         head_tree,
@@ -107,7 +99,7 @@ pub fn fixup(
     if became_empty {
         match opts.empty {
             EmptyPolicy::Abort => {
-                return Err(HistoryError::FixupMakesTargetEmpty { commit: target });
+                return Err(HistoryError::FixupMakesTargetEmpty { commit: target }.into());
             }
             EmptyPolicy::Drop => {
                 edits.insert(target, CommitEdit::Drop);
@@ -141,16 +133,14 @@ pub fn fixup(
     plan_rewrite(repo, &edits, &rewrite_opts)
 }
 
-/// Repository-relative paths touched by a hunk selection (for [`apply_fixup_rewrite`](super::apply_fixup_rewrite)).
+/// Repository-relative paths touched by a hunk selection (for [`History::apply_fixup`](super::History::apply_fixup)).
 ///
-/// # Errors
-///
-/// Returns [`HistoryError::HunkSelect`] when ids or line ranges cannot be resolved.
-pub fn fixup_selection_paths(
+/// See [`History::fixup_selection_paths`](super::History::fixup_selection_paths).
+pub(crate) fn fixup_selection_paths(
     repo: &Repository,
     selection: &HunkSelection,
     pathspecs: &[String],
-) -> Result<Vec<String>, HistoryError> {
+) -> crate::error::Result<Vec<String>> {
     let diff_opts = diff_options_for_hunk_select(repo)?;
     let patches = resolve_selection(repo, DiffSide::Unstaged, selection, pathspecs, diff_opts)?;
     let mut paths: Vec<String> = patches
@@ -162,21 +152,16 @@ pub fn fixup_selection_paths(
     Ok(paths)
 }
 
-/// Apply a fixup plan built with [`FixupOptions::selection`]: stage selected hunks, then run [`apply_fixup_rewrite`](super::apply_fixup_rewrite).
-///
-/// Pre-existing staged edits on the same path as a selected unstaged hunk are preserved in the
-/// index and worktree after apply. On failure, the index is restored to its pre-call state.
-///
-/// # Errors
-///
-/// Same as [`apply_fixup_rewrite`](super::apply_fixup_rewrite), plus hunk resolution and staging failures.
-pub fn apply_fixup_hunk_selection(
+/// Stage the selected hunks, then apply a fixup plan built with [`FixupOptions::selection`]; see
+/// [`History::apply_fixup_hunks`](super::History::apply_fixup_hunks).
+pub(crate) fn apply_fixup_hunk_selection(
     repo: &Repository,
     plan: &RewritePlan,
     apply_opts: &ApplyOptions,
     selection: &HunkSelection,
     pathspecs: &[String],
-) -> Result<AppliedRewrite, HistoryError> {
+    cancel: &crate::progress::CancelToken,
+) -> crate::error::Result<AppliedRewrite> {
     let paths = fixup_selection_paths(repo, selection, pathspecs)?;
     let snapshot = capture_hunk_fixup_apply_snapshot(repo, &paths)?;
     let consumed = match apply_opts.record_operation {
@@ -184,17 +169,16 @@ pub fn apply_fixup_hunk_selection(
         None => None,
     };
     let diff_opts = diff_options_for_hunk_select(repo)?;
-    if let Err(err) = stage_hunks(
+    stage_hunks(
         repo,
         DiffSide::Unstaged,
         selection,
         pathspecs,
         diff_opts,
         false,
-    ) {
-        return Err(err.into());
-    }
-    apply_fixup_rewrite_then(repo, plan, apply_opts, &paths, consumed, |repo| {
+        cancel,
+    )?;
+    apply_fixup_rewrite_then(repo, plan, apply_opts, &paths, consumed, cancel, |repo| {
         restore_after_hunk_fixup_apply(repo, &snapshot)
     })
     .or_else(|err| {
@@ -221,10 +205,8 @@ struct HunkFixupApplySnapshot {
 fn capture_hunk_fixup_apply_snapshot(
     repo: &Repository,
     paths: &[String],
-) -> Result<HunkFixupApplySnapshot, HistoryError> {
-    let index_bytes = fs::read(repo.index_path()).map_err(|e| HistoryError::WorktreeApply {
-        message: e.to_string(),
-    })?;
+) -> crate::error::Result<HunkFixupApplySnapshot> {
+    let index_bytes = fs::read(repo.index_path()).map_err(worktree_apply_io)?;
     let pre_head_tree = commit_tree(repo, repo.head_commit()?)?;
     let index = repo.load_index()?;
     let mut path_states = Vec::with_capacity(paths.len());
@@ -250,16 +232,14 @@ fn capture_hunk_fixup_apply_snapshot(
     })
 }
 
-fn restore_index_bytes(repo: &Repository, bytes: &[u8]) -> Result<(), HistoryError> {
-    fs::write(repo.index_path(), bytes).map_err(|e| HistoryError::WorktreeApply {
-        message: e.to_string(),
-    })
+fn restore_index_bytes(repo: &Repository, bytes: &[u8]) -> crate::error::Result<()> {
+    fs::write(repo.index_path(), bytes).map_err(worktree_apply_io)
 }
 
 fn restore_full_hunk_fixup_snapshot(
     repo: &Repository,
     snapshot: &HunkFixupApplySnapshot,
-) -> Result<(), HistoryError> {
+) -> crate::error::Result<()> {
     restore_index_bytes(repo, &snapshot.index_bytes)?;
     let Some(worktree) = repo.work_tree() else {
         return Ok(());
@@ -269,18 +249,12 @@ fn restore_full_hunk_fixup_snapshot(
         match &path_state.pre_worktree_bytes {
             Some(bytes) => {
                 if let Some(parent) = abs.parent() {
-                    fs::create_dir_all(parent).map_err(|e| HistoryError::WorktreeApply {
-                        message: e.to_string(),
-                    })?;
+                    fs::create_dir_all(parent).map_err(worktree_apply_io)?;
                 }
-                fs::write(&abs, bytes).map_err(|e| HistoryError::WorktreeApply {
-                    message: e.to_string(),
-                })?;
+                fs::write(&abs, bytes).map_err(worktree_apply_io)?;
             }
             None if abs.exists() => {
-                fs::remove_file(&abs).map_err(|e| HistoryError::WorktreeApply {
-                    message: e.to_string(),
-                })?;
+                fs::remove_file(&abs).map_err(worktree_apply_io)?;
             }
             None => {}
         }
@@ -291,7 +265,7 @@ fn restore_full_hunk_fixup_snapshot(
 fn restore_after_hunk_fixup_apply(
     repo: &Repository,
     snapshot: &HunkFixupApplySnapshot,
-) -> Result<(), HistoryError> {
+) -> crate::error::Result<()> {
     let post_head_tree = commit_tree(repo, repo.head_commit()?)?;
     let mut index = repo.load_index()?;
     let mut index_changed = false;
@@ -322,21 +296,15 @@ fn restore_after_hunk_fixup_apply(
             );
             let abs = wt.join(&path_state.path);
             if let Some(parent) = abs.parent() {
-                fs::create_dir_all(parent).map_err(|e| HistoryError::WorktreeApply {
-                    message: e.to_string(),
-                })?;
+                fs::create_dir_all(parent).map_err(worktree_apply_io)?;
             }
-            fs::write(&abs, &new_worktree).map_err(|e| HistoryError::WorktreeApply {
-                message: e.to_string(),
-            })?;
+            fs::write(&abs, &new_worktree).map_err(worktree_apply_io)?;
         }
     }
     if index_changed {
         index.sort();
         repo.write_index(&mut index)
-            .map_err(|e| HistoryError::WorktreeApply {
-                message: e.to_string(),
-            })?;
+            .map_err(worktree_apply_engine)?;
     }
     Ok(())
 }
@@ -346,7 +314,7 @@ fn upsert_index_blob(
     index: &mut Index,
     path: &str,
     bytes: &[u8],
-) -> Result<(), HistoryError> {
+) -> crate::error::Result<()> {
     let oid = repo.odb().write(ObjectKind::Blob, bytes)?;
     let key = path.as_bytes();
     if let Some(entry) = index.get_mut(key, 0) {
@@ -382,7 +350,7 @@ fn planning_blob_for_fixup_selection(
     head_blob: &[u8],
     index_blob: &[u8],
     after_index_blob: &[u8],
-) -> Result<Vec<u8>, HistoryError> {
+) -> crate::error::Result<Vec<u8>> {
     Ok(apply_index_to_worktree_delta(
         index_blob,
         after_index_blob,
@@ -395,21 +363,24 @@ fn index_tree_for_fixup_selection(
     head_tree: ObjectId,
     selection: &HunkSelection,
     pathspecs: &[String],
-) -> Result<ObjectId, HistoryError> {
+) -> crate::error::Result<ObjectId> {
     let diff_opts = diff_options_for_hunk_select(repo)?;
     let patches = resolve_selection(repo, DiffSide::Unstaged, selection, pathspecs, diff_opts)
-        .map_err(HistoryError::HunkSelect)?;
+        .map_err(|err| match err {
+            crate::error::Error::Diff(crate::error::DiffError::HunkSelection(e)) => {
+                HistoryError::HunkSelect(e).into()
+            }
+            other => other,
+        })?;
     if patches.is_empty() {
-        return Err(HistoryError::NothingStaged);
+        return Err(HistoryError::NothingStaged.into());
     }
     let disk_index = repo.load_index()?;
     let mut index = index_from_tree(repo, &head_tree)?;
     for patch in &patches {
         let path = patch
             .effective_path()
-            .ok_or_else(|| HistoryError::Planning {
-                message: "fixup selection patch missing path".into(),
-            })?;
+            .ok_or_else(|| HistoryError::Planning(PlanningError::FixupSelectionPatchMissingPath))?;
         let head_blob = blob_at_path(repo, head_tree, path)?;
         let index_blob = index_blob_at_path(repo, &disk_index, path);
         let after_index = apply_patch_to_blob(&index_blob, patch, &BlobApplyOptions::default())
@@ -418,14 +389,14 @@ fn index_tree_for_fixup_selection(
             planning_blob_for_fixup_selection(&head_blob, &index_blob, &after_index)?;
         upsert_index_blob(repo, &mut index, path, &planning_blob)?;
     }
-    Ok(write_tree_from_index(repo.odb(), &index, "")?)
+    write_tree_from_index(repo.odb(), &index, "")
 }
 
-fn empty_tree_oid(repo: &Repository) -> Result<ObjectId, HistoryError> {
-    Ok(repo.odb().empty_tree_oid()?)
+fn empty_tree_oid(repo: &Repository) -> crate::error::Result<ObjectId> {
+    repo.odb().empty_tree_oid()
 }
 
-fn first_parent_tree(repo: &Repository, commit: &CommitData) -> Result<ObjectId, HistoryError> {
+fn first_parent_tree(repo: &Repository, commit: &CommitData) -> crate::error::Result<ObjectId> {
     let empty = empty_tree_oid(repo)?;
     if commit.parents.is_empty() {
         return Ok(empty);
@@ -437,27 +408,17 @@ fn fixup_target_became_empty(
     repo: &Repository,
     target: &CommitData,
     merged_tree: ObjectId,
-) -> Result<bool, HistoryError> {
+) -> crate::error::Result<bool> {
     let parent_tree = first_parent_tree(repo, target)?;
     Ok(merged_tree == parent_tree)
 }
 
-#[cfg(any(test, feature = "unstable-bench-helpers"))]
-static FIXUP_MERGE_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0); // hygiene: merge-call counter for tests and unstable-bench-helpers
-
-fn record_fixup_merge() {
-    #[cfg(any(test, feature = "unstable-bench-helpers"))]
-    FIXUP_MERGE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-}
-
 /// Repository-relative paths that differ between the index and `HEAD`'s tree (stage 0).
 ///
-/// # Errors
-///
-/// Returns [`HistoryError::BareRepository`] or planning failures when the index or `HEAD` cannot be read.
-pub fn staged_fixup_paths(repo: &Repository) -> Result<Vec<String>, HistoryError> {
+/// See [`History::staged_paths`](super::History::staged_paths).
+pub(crate) fn staged_fixup_paths(repo: &Repository) -> crate::error::Result<Vec<String>> {
     if repo.is_bare() {
-        return Err(HistoryError::BareRepository);
+        return Err(HistoryError::BareRepository.into());
     }
     let head_oid = repo.head_commit()?;
     let head_tree = commit_tree(repo, head_oid)?;
@@ -477,12 +438,13 @@ mod hunk_selection_restore_tests {
     use super::super::apply::apply_fixup_rewrite;
     use super::*;
     use crate::config::environment::RepositoryOptions;
-    use crate::diff::hunk_id::hunk_ids_with_duplicate_peers;
+    use crate::diff::hunk_ids;
     use crate::diff::DiffOptions;
     use crate::history::RefScope;
     use crate::objects::ObjectId;
     use crate::porcelain::hunk_select::{unstaged_file_diffs, LineRange};
-    use crate::repo::{init_repository, set_test_inject_index_write_fail_remaining};
+    use crate::repo::init_repository;
+    use crate::test_support::inject::set_test_inject_index_write_fail_remaining;
     use crate::RefStorageFormat;
     use std::process::Command;
 
@@ -546,7 +508,7 @@ mod hunk_selection_restore_tests {
         fs::write(wt.join("f.txt"), &edited).expect("edit");
         let grit = Repository::discover(Some(wt), &RepositoryOptions::empty()).expect("discover");
         let files = unstaged_file_diffs(&grit, &[]).expect("diff");
-        let ids = hunk_ids_with_duplicate_peers(
+        let ids = hunk_ids(
             DiffSide::Unstaged,
             &files[0].0.path,
             &files[0].0.hunks,
@@ -562,6 +524,7 @@ mod hunk_selection_restore_tests {
             &[],
             DiffOptions::default(),
             false,
+            &crate::progress::CancelToken::never(),
         )
         .expect("stage line-5");
         let selection = HunkSelection {
@@ -598,6 +561,7 @@ mod hunk_selection_restore_tests {
             &[],
             DiffOptions::default(),
             false,
+            &crate::progress::CancelToken::never(),
         )
         .expect("stage line-18");
         let apply_opts = ApplyOptions {
@@ -606,12 +570,22 @@ mod hunk_selection_restore_tests {
             record_operation: None,
             hooks: crate::hooks::PostOperationHooks::Run,
         };
-        apply_fixup_rewrite(&grit, &plan, &apply_opts, &paths).expect("apply rewrite");
+        apply_fixup_rewrite(
+            &grit,
+            &plan,
+            &apply_opts,
+            &paths,
+            &crate::progress::CancelToken::never(),
+        )
+        .expect("apply rewrite");
         set_test_inject_index_write_fail_remaining(1);
         let err = restore_after_hunk_fixup_apply(&grit, &snapshot).expect_err("restore fails");
         restore_full_hunk_fixup_snapshot(&grit, &snapshot).expect("rollback snapshot");
-        crate::repo::set_test_inject_index_write_fail(false);
-        assert!(matches!(err, HistoryError::WorktreeApply { .. }));
+        crate::test_support::inject::set_test_inject_index_write_fail(false);
+        assert!(matches!(
+            err,
+            crate::error::Error::History(HistoryError::WorktreeApply { .. })
+        ));
         assert_ne!(
             grit.head_commit().expect("head after"),
             head_before,

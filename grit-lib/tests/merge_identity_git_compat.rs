@@ -7,9 +7,10 @@ use std::path::PathBuf;
 use grit_lib::config::environment::{Environment, RepositoryOptions};
 use grit_lib::index::Index;
 use grit_lib::objects::ObjectId;
-use grit_lib::porcelain::merge::integrate_branch;
+use grit_lib::progress::{CancelToken, NullProgress};
 use grit_lib::repo::Repository;
 use grit_test_support::git;
+use grit_test_support::integrate_branch;
 
 fn index_bytes(root: &std::path::Path) -> Vec<u8> {
     fs::read(root.join(".git/index")).expect("read index")
@@ -68,7 +69,7 @@ fn clean_merge_missing_identity_leaves_repo_unchanged() {
         feature_oid,
         "feature",
         &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect_err("merge without identity");
     assert!(

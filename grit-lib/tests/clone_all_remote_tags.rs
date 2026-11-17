@@ -4,10 +4,8 @@
 use std::path::Path;
 use std::process::Command;
 
-use grit_lib::progress::NeverCancel;
-use grit_lib::refs;
+use grit_lib::progress::CancelToken;
 use grit_lib::remote::clone::{clone as clone_repo, CloneOptions};
-use grit_lib::remote::fetch::NoProgress;
 
 fn git_in(dir: &Path, args: &[&str]) -> bool {
     Command::new("git")
@@ -123,14 +121,20 @@ fn clone_fetches_tags_on_unreachable_commits() {
             )
         },
         &mut NoProgress,
-        &NeverCancel,
+        &CancelToken::never(),
         None,
     )
     .expect("grit clone");
 
     let git_dir = grit_dest.path().join(".git");
-    refs::resolve_ref(&git_dir, "refs/tags/side-tag").expect("lightweight side-tag");
-    refs::resolve_ref(&git_dir, "refs/tags/side-ann").expect("annotated side-ann");
+    grit_test_support::refs::at(&git_dir)
+        .references()
+        .resolve("refs/tags/side-tag")
+        .expect("lightweight side-tag");
+    grit_test_support::refs::at(&git_dir)
+        .references()
+        .resolve("refs/tags/side-ann")
+        .expect("annotated side-ann");
 
     assert_eq!(git_tags(grit_dest.path()), expected);
     assert_packed_tags(grit_dest.path());
@@ -153,13 +157,19 @@ fn clone_file_url_fetches_unreachable_tags() {
             ..CloneOptions::new(url, grit_dest.path().to_path_buf())
         },
         &mut NoProgress,
-        &NeverCancel,
+        &CancelToken::never(),
         None,
     )
     .expect("grit clone file://");
 
     let git_dir = grit_dest.path().join(".git");
-    refs::resolve_ref(&git_dir, "refs/tags/side-tag").expect("side-tag via file://");
-    refs::resolve_ref(&git_dir, "refs/tags/side-ann").expect("side-ann via file://");
+    grit_test_support::refs::at(&git_dir)
+        .references()
+        .resolve("refs/tags/side-tag")
+        .expect("side-tag via file://");
+    grit_test_support::refs::at(&git_dir)
+        .references()
+        .resolve("refs/tags/side-ann")
+        .expect("side-ann via file://");
     assert_packed_tags(grit_dest.path());
 }

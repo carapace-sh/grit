@@ -6,9 +6,7 @@ use std::process::Command;
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::notes::NotesRef;
 use grit_lib::objects::{ObjectId, ObjectKind};
-use grit_lib::progress::NeverCancel;
-use grit_lib::refs;
-use grit_lib::remote::fetch::NoProgress;
+use grit_lib::progress::CancelToken;
 use grit_lib::remote::transfer::{FetchOptions, PushOptions, PushRefSpec};
 use grit_lib::remote::ListRefsOptions;
 use grit_lib::repo::Repository;
@@ -67,7 +65,7 @@ fn handle_stash_roundtrip_with_git() {
                 mode: StashMode::default(),
             },
             &mut grit_lib::progress::NullProgress,
-            &NeverCancel,
+            &CancelToken::never(),
         )
         .expect("push")
         .expect("changes");
@@ -104,7 +102,7 @@ fn git_stash_applies_via_handle() {
                 ..Default::default()
             },
             &mut grit_lib::progress::NullProgress,
-            &NeverCancel,
+            &CancelToken::never(),
         )
         .expect("apply");
     assert!(!conflicts.has_conflicts());
@@ -176,12 +174,14 @@ fn handle_bundle_verify_and_git_unbundle() {
     let bundle_path = dir.path().join("x.bundle");
     let repo = open_grit(dir.path());
     repo.bundles()
-        .create(
+        .write(
             &grit_lib::bundle::BundleSpec {
                 include: vec![(head, "refs/heads/main".into())],
                 ..Default::default()
             },
             &bundle_path,
+            &mut grit_lib::progress::NullProgress,
+            grit_lib::progress::CancelToken::never_ref(),
         )
         .expect("create");
 
@@ -206,7 +206,11 @@ fn handle_bundle_verify_and_git_unbundle() {
     let consumer_repo = open_grit(consumer.path());
     consumer_repo
         .bundles()
-        .unbundle(&bundle_path)
+        .unbundle(
+            &bundle_path,
+            &mut grit_lib::progress::NullProgress,
+            grit_lib::progress::CancelToken::never_ref(),
+        )
         .expect("unbundle");
     assert_fsck_strict(consumer.path());
 }
@@ -234,7 +238,13 @@ fn git_bundle_unbundles_via_handle() {
     let repo = open_grit(dst.path());
     let report = repo.bundles().verify(&bundle).expect("verify");
     assert!(report.is_ok(), "{report:?}");
-    repo.bundles().unbundle(&bundle).expect("unbundle");
+    repo.bundles()
+        .unbundle(
+            &bundle,
+            &mut grit_lib::progress::NullProgress,
+            grit_lib::progress::CancelToken::never_ref(),
+        )
+        .expect("unbundle");
     assert_fsck_strict(dst.path());
 }
 
@@ -359,7 +369,7 @@ fn handle_fetch_push_local_bare_remote() {
     repo.reload_config().expect("reload");
 
     let remote = repo.remotes().get("origin").expect("get remote");
-    let mut progress = NoProgress;
+    let mut progress = NullProgress;
     let head: ObjectId = git_cmd(consumer.path(), &["rev-parse", "HEAD"])
         .trim()
         .parse()
@@ -379,7 +389,7 @@ fn handle_fetch_push_local_bare_remote() {
             }],
             PushOptions::default(),
             &mut progress,
-            &NeverCancel,
+            &CancelToken::never(),
             None,
         )
         .expect("push");
@@ -406,7 +416,13 @@ fn handle_fetch_push_local_bare_remote() {
     fetch_opts.remote_name = Some("origin".into());
     fetch_opts.refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".into()];
     repo.remotes()
-        .fetch(&remote, fetch_opts, &mut progress, &NeverCancel, None)
+        .fetch(
+            &remote,
+            fetch_opts,
+            &mut progress,
+            &CancelToken::never(),
+            None,
+        )
         .expect("fetch");
 
     let after: ObjectId = git_cmd(consumer.path(), &["rev-parse", "refs/remotes/origin/main"])
@@ -468,7 +484,8 @@ fn handle_notes_add_rejects_invalid_existing_notes_ref() {
         .odb()
         .write(ObjectKind::Blob, b"not a commit\n")
         .expect("blob");
-    refs::write_ref(repo.git_dir(), "refs/notes/commits", &blob).expect("seed bad notes ref");
+    grit_test_support::refs::set_ref(&repo, "refs/notes/commits", &blob)
+        .expect("seed bad notes ref");
 
     let notes_before = git_cmd(dir.path(), &["rev-parse", "refs/notes/commits"]);
     let err = repo

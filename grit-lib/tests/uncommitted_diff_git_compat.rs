@@ -7,13 +7,14 @@ use std::path::Path;
 
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::diff::{
-    load_object_changes, name_status_line, resolve_diff_request, DiffOptions, DiffRequest,
-    DiffTarget, FileChange, RenameDetection, ResolveDiffArgumentsError, UncommittedDiff,
+    name_status_line, DiffOptions, DiffRequest, DiffSide, DiffTarget, FileChange, RenameDetection,
+    ResolveDiffArgumentsError, UncommittedDiff,
 };
 use grit_lib::error::Error;
 use grit_lib::index::Index;
 use grit_lib::objects::ObjectId;
-use grit_lib::repo::Repository;
+use grit_lib::repo::{Repository, RepositoryError};
+use grit_lib::worktree::pathspec::{Pathspec, PathspecGlobalFlags};
 use grit_test_support::{git, rev_parse};
 
 const RENAMES: RenameDetection = RenameDetection::Similarity(50);
@@ -107,7 +108,7 @@ fn staged_entries_and_contents_match_git_diff_cached() {
         git_lines(dir.path(), &["diff", "--cached", "--name-status", "-M"])
     );
 
-    let changes = load_object_changes(&repo, &entries).expect("load");
+    let changes = repo.diff().object_changes(&entries).expect("load");
     assert_eq!(numstat(&changes), git_numstat(dir.path(), &["--cached"]));
     let both = changes.iter().find(|c| c.path == "both.txt").expect("both");
     assert_eq!(both.new_bytes.data, b"1\nTWO\n3\n4\n");
@@ -191,12 +192,173 @@ fn worktree_entries_match_git_diff_against_a_tree() {
     );
 }
 
+/// [`fixture`] with its staged state committed as a second commit, then a staged edit and an
+/// addition, and an unstaged edit on top of the staged `keep.txt`.
+fn history_fixture(root: &Path) {
+    fixture(root);
+    git(root, &["commit", "-q", "-m", "second"]);
+    write(root, "keep.txt", "a\nB\nc\n");
+    write(root, "new.txt", "n\n");
+    git(root, &["add", "keep.txt", "new.txt"]);
+    write(root, "keep.txt", "a\nB\nc\nd\n");
+}
+
+#[test]
+fn entries_for_every_target_match_git_name_status() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    history_fixture(dir.path());
+    let repo = open(dir.path());
+    let head = rev_parse(dir.path(), "HEAD");
+    let parent = rev_parse(dir.path(), "HEAD~1");
+    let parent_tree = rev_parse(dir.path(), "HEAD~1^{tree}");
+    let empty_tree = git(dir.path(), &["hash-object", "-t", "tree", "/dev/null"]);
+    let empty_tree = empty_tree.trim();
+    let parent_hex = parent.to_hex();
+
+    let targets: [(DiffTarget, Vec<&str>); 7] = [
+        (DiffTarget::IndexVsHead, vec!["--cached"]),
+        (DiffTarget::WorktreeVsIndex, vec![]),
+        (DiffTarget::WorktreeVsHead, vec!["HEAD"]),
+        (DiffTarget::WorktreeVsTree(parent_tree), vec![&parent_hex]),
+        (DiffTarget::Commit(head), vec![&parent_hex, "HEAD"]),
+        (
+            DiffTarget::Trees {
+                old: Some(parent),
+                new: head,
+            },
+            vec![&parent_hex, "HEAD"],
+        ),
+        (
+            DiffTarget::Trees {
+                old: None,
+                new: head,
+            },
+            vec![empty_tree, "HEAD"],
+        ),
+    ];
+    let limits: [(&[&str], Option<&str>); 4] = [
+        (&[], None),
+        (&["dir"], None),
+        (&[], Some("AD")),
+        (&["*.txt"], Some("m")),
+    ];
+    for (target, git_args) in &targets {
+        for (pathspecs, filter) in limits {
+            let mut options = DiffOptions::default().with_renames(RENAMES);
+            let mut args = vec!["diff", "--name-status", "-M"];
+            if let Some(letters) = filter {
+                options = options.with_filter(Some(letters.parse().expect("filter")));
+                args.extend(["--diff-filter", letters]);
+            }
+            args.extend(git_args.iter().copied());
+            args.push("--");
+            args.extend(pathspecs.iter().copied());
+            let expected = git_lines(dir.path(), &args);
+            let pathspec_vec: Vec<String> = pathspecs.iter().map(|p| (*p).to_owned()).collect();
+            let ps = if pathspec_vec.is_empty() {
+                Pathspec::entire_tree(PathspecGlobalFlags::default())
+            } else {
+                Pathspec::scoped(pathspec_vec, PathspecGlobalFlags::default())
+            };
+            let context = format!("{target:?} {:?} {filter:?}", ps.specs());
+
+            let via_handle = repo
+                .diff()
+                .entries(target, &ps, &options)
+                .expect("Diff::entries");
+            assert_eq!(
+                names(&via_handle.entries),
+                expected,
+                "Diff::entries {context}"
+            );
+
+            let mut uncommitted = repo.diff().uncommitted().expect("uncommitted");
+            let via_uncommitted = uncommitted
+                .entries(target, &ps, &options)
+                .expect("UncommittedDiff::entries");
+            assert_eq!(
+                names(&via_uncommitted.entries),
+                expected,
+                "uncommitted {context}"
+            );
+        }
+    }
+}
+
+#[test]
+fn peer_changes_load_the_other_side_of_the_index() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    history_fixture(dir.path());
+    let repo = open(dir.path());
+    let mut diff = repo.diff().uncommitted().expect("uncommitted");
+    let empty_ps = Pathspec::entire_tree(PathspecGlobalFlags::default());
+
+    let unstaged_peers = diff
+        .peer_changes(
+            DiffSide::Staged,
+            &empty_ps,
+            RENAMES,
+            ["keep.txt", "new.txt"],
+        )
+        .expect("peers of staged changes");
+    assert_eq!(
+        unstaged_peers
+            .iter()
+            .map(|c| c.path.as_str())
+            .collect::<Vec<_>>(),
+        ["keep.txt"],
+        "new.txt has no unstaged change"
+    );
+    assert_eq!(unstaged_peers[0].old_bytes.data, b"a\nB\nc\n");
+    assert_eq!(unstaged_peers[0].new_bytes.data, b"a\nB\nc\nd\n");
+
+    let staged_peers = diff
+        .peer_changes(
+            DiffSide::Unstaged,
+            &empty_ps,
+            RENAMES,
+            ["keep.txt", "both.txt"],
+        )
+        .expect("peers of unstaged changes");
+    assert_eq!(
+        staged_peers
+            .iter()
+            .map(|c| c.path.as_str())
+            .collect::<Vec<_>>(),
+        ["keep.txt"],
+        "both.txt has no staged change"
+    );
+    assert_eq!(staged_peers[0].old_bytes.data, b"a\nb\nc\n");
+    assert_eq!(staged_peers[0].new_bytes.data, b"a\nB\nc\n");
+
+    let limited = diff
+        .peer_changes(
+            DiffSide::Staged,
+            &Pathspec::scoped(["other"], PathspecGlobalFlags::default()),
+            RENAMES,
+            ["keep.txt"],
+        )
+        .expect("pathspec-limited peers");
+    assert!(limited.is_empty());
+    assert!(diff
+        .peer_changes(DiffSide::Other, &empty_ps, RENAMES, ["keep.txt"])
+        .expect("other side")
+        .is_empty());
+    assert!(diff
+        .peer_changes(DiffSide::Staged, &empty_ps, RENAMES, [])
+        .expect("no primaries")
+        .is_empty());
+}
+
 #[test]
 fn index_accessor_reuses_the_loaded_index() {
     let dir = tempfile::tempdir().expect("tempdir");
     fixture(dir.path());
     let repo = open(dir.path());
-    let index = repo.index_handle().load().expect("index");
+    let index = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("index");
     let count = index.entries().len();
     let mut diff = UncommittedDiff::new(&repo, index);
     diff.unstaged_entries(RenameDetection::Off)
@@ -234,7 +396,7 @@ fn bare_repository_rejects_working_tree_diffs() {
         },
     ] {
         assert!(matches!(
-            resolve_diff_request(&repo, None, &request),
+            repo.diff().resolve_request(None, &request),
             Err(ResolveDiffArgumentsError::NoWorkTree)
         ));
     }
@@ -242,12 +404,48 @@ fn bare_repository_rejects_working_tree_diffs() {
         staged: true,
         ..DiffRequest::default()
     };
-    let arguments = resolve_diff_request(&repo, None, &staged).expect("staged works bare");
+    let arguments = repo
+        .diff()
+        .resolve_request(None, &staged)
+        .expect("staged works bare");
     assert_eq!(arguments.target, DiffTarget::IndexVsHead);
 
     let mut diff = UncommittedDiff::new(&repo, Index::default());
     assert!(matches!(
         diff.worktree_entries(Some(&ObjectId::zero()), RenameDetection::Off),
-        Err(Error::RequiresWorkTree)
+        Err(Error::Repository(RepositoryError::RequiresWorkTree))
+    ));
+
+    let head = rev_parse(&bare, "HEAD");
+    let options = DiffOptions::default();
+    let commit = repo
+        .diff()
+        .entries(
+            &DiffTarget::Commit(head),
+            &Pathspec::entire_tree(PathspecGlobalFlags::default()),
+            &options,
+        )
+        .expect("commit target needs no work tree");
+    assert_eq!(
+        names(&commit.entries),
+        git_lines(
+            &bare,
+            &[
+                "diff-tree",
+                "-r",
+                "--root",
+                "--no-commit-id",
+                "--name-status",
+                "HEAD"
+            ]
+        )
+    );
+    assert!(matches!(
+        repo.diff().entries(
+            &DiffTarget::WorktreeVsHead,
+            &Pathspec::entire_tree(PathspecGlobalFlags::default()),
+            &options
+        ),
+        Err(Error::Repository(RepositoryError::RequiresWorkTree))
     ));
 }

@@ -19,10 +19,10 @@
 //! run of each ref line, so SHA-256 (64-hex) advertisements parse the same way
 //! SHA-1 (40-hex) ones do.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::{BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout};
 use std::sync::Arc;
 
@@ -35,10 +35,36 @@ use std::time::Duration;
 use crate::error::{Error, RemoteUnreadableReason, Result};
 use crate::objects::ObjectId;
 use crate::pkt_line;
+use crate::progress::CancelToken;
+use crate::remote::RemoteError;
+
+fn remote_err(err: RemoteError) -> Error {
+    Error::Remote(err)
+}
+
+fn git_url_err(detail: impl Into<String>) -> Error {
+    remote_err(RemoteError::MalformedTransportUrl {
+        scheme: "git",
+        detail: detail.into(),
+    })
+}
+
+fn ssh_transport_err(detail: impl Into<String>) -> Error {
+    remote_err(RemoteError::Ssh {
+        detail: detail.into(),
+    })
+}
+
+fn transport_io_err(detail: impl Into<String>) -> Error {
+    remote_err(RemoteError::Transport {
+        url: None,
+        detail: detail.into(),
+    })
+}
 
 pub mod http;
-pub(crate) mod rpc_channel;
-pub mod stateless_http;
+pub(crate) mod pending_http;
+pub(crate) mod stateless_http;
 
 /// The Git service a [`Connection`] speaks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,7 +90,7 @@ impl Service {
 ///
 /// The default requests protocol version 0 (the classic advertisement) with no
 /// server options.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct ConnectOptions {
     /// Requested protocol version (`0`, `1`, or `2`). The server may downgrade.
     pub protocol_version: u8,
@@ -75,6 +101,40 @@ pub struct ConnectOptions {
     pub diagnostics: Option<crate::diagnostics::DiagnosticsHandle>,
     /// When true with [`Self::diagnostics`], connect paths may emit network traces.
     pub network_trace: bool,
+    /// When set, smart-HTTP connect and stateless POST rounds poll this while waiting
+    /// on the HTTP stack (discovery GET, upload-pack POST, receive-pack report).
+    pub cancel: Option<std::sync::Arc<crate::progress::CancelToken>>,
+    /// Flag mirrored from the stack [`CancelToken`] on the owning thread during HTTP waits.
+    pub(crate) stack_watch: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Default for ConnectOptions {
+    fn default() -> Self {
+        Self {
+            protocol_version: 0,
+            server_options: Vec::new(),
+            diagnostics: None,
+            network_trace: false,
+            cancel: None,
+            stack_watch: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+}
+
+impl ConnectOptions {
+    /// Returns options with the given [`Self::protocol_version`]; other fields match [`Default`].
+    #[must_use]
+    pub fn with_protocol_version(protocol_version: u8) -> Self {
+        Self {
+            protocol_version,
+            ..Self::default()
+        }
+    }
+
+    /// Seed `stack_watch` from a stack-scoped [`CancelToken`] before connect/fetch.
+    pub(crate) fn bind_stack_cancel(&mut self, cancel: &CancelToken) {
+        crate::progress::mirror_stack_cancel(cancel, &self.stack_watch);
+    }
 }
 
 /// A live, bidirectional pkt-line connection to a Git service, with the
@@ -124,6 +184,21 @@ pub trait Connection {
     /// (v0/v1 connections, where the server closes after the single response).
     fn finish_send(&mut self) {}
 
+    /// Mirror a stack-scoped [`CancelToken`] into the connection's HTTP wait flag before
+    /// writes that may block on smart HTTP (upload-pack POST on flush).
+    fn mirror_http_cancel(&mut self, cancel: &CancelToken) {
+        let _ = cancel;
+    }
+
+    /// Complete any deferred smart-HTTP request still waiting on the owning thread.
+    ///
+    /// Stateless upload-pack POSTs are started on flush and finished here so the
+    /// scoped `cancel` borrow can be polled while the HTTP worker blocks.
+    fn drain_pending_http(&mut self, cancel: &CancelToken) -> crate::error::Result<()> {
+        let _ = cancel;
+        Ok(())
+    }
+
     /// End the session and report how the server side ended, for transports whose
     /// server runs in this process.
     ///
@@ -154,7 +229,7 @@ pub trait Connection {
     /// transport error that ended the request.
     fn wait_for_response(
         &mut self,
-        cancel: &dyn crate::progress::Cancel,
+        cancel: &crate::progress::CancelToken,
     ) -> crate::error::Result<()> {
         let _ = cancel;
         Ok(())
@@ -163,6 +238,11 @@ pub trait Connection {
     /// Smart HTTP stateless RPC (`gitprotocol-http`): each POST carries a full
     /// command body rather than appending to one duplex stream.
     fn stateless_rpc(&self) -> bool {
+        false
+    }
+
+    /// True when the v0/v1 ref advertisement ended with a flush pkt-line (`0000`) on connect.
+    fn saw_ref_advertisement_flush(&self) -> bool {
         false
     }
 }
@@ -216,16 +296,23 @@ pub struct Advertisement {
     pub head_symref: Option<String>,
     /// Negotiated protocol version.
     pub protocol_version: u8,
+    /// Set when a v0/v1 ref advertisement ended with a flush pkt-line (`0000`).
+    pub(crate) saw_ref_advertisement_flush: bool,
 }
 
 /// True when the connect-time advertisement shows a completed Git protocol handshake.
 ///
 /// An empty repository still advertises server capabilities (v0/v1 zero-oid carrier or a v2
-/// capability block). A completely empty [`Advertisement`] means the transport never spoke Git.
+/// capability block). Some older servers (notably Apple Git on empty bare repos) send only a
+/// flush pkt-line with no refs or capabilities; [`Advertisement::saw_ref_advertisement_flush`]
+/// records that case. A completely empty [`Advertisement`] with no flush means the transport
+/// never spoke Git.
 #[must_use]
 pub(crate) fn remote_handshake_complete(adv: &Advertisement) -> bool {
     if adv.protocol_version >= 2 {
         !adv.capabilities.is_empty()
+    } else if adv.saw_ref_advertisement_flush {
+        true
     } else {
         !adv.capabilities.is_empty() || !adv.refs.is_empty() || adv.head_symref.is_some()
     }
@@ -235,6 +322,8 @@ pub(crate) fn remote_handshake_complete(adv: &Advertisement) -> bool {
 pub(crate) fn connection_handshake_complete(conn: &dyn Connection) -> bool {
     if conn.protocol_version() >= 2 {
         !conn.capabilities().is_empty()
+    } else if conn.saw_ref_advertisement_flush() {
+        true
     } else {
         !conn.capabilities().is_empty()
             || !conn.advertised_refs().is_empty()
@@ -261,7 +350,7 @@ fn verify_ssh_child_after_advertisement(
             Ok(Some(_)) => return Err(no_handshake()),
             Ok(None) => std::thread::sleep(Duration::from_millis(10)),
             Err(e) => {
-                return Err(Error::Message(format!("ssh wait failed: {e}")));
+                return Err(transport_io_err(format!("ssh wait failed: {e}")));
             }
         }
     }
@@ -278,7 +367,8 @@ fn verify_ssh_child_after_advertisement(
 ///
 /// # Errors
 ///
-/// Returns an error on I/O failure or if the server sends an `ERR` packet.
+/// Returns an error on I/O failure, or [`RemoteError::Fatal`] if the server sends an
+/// `ERR` packet.
 pub fn read_advertisement(reader: &mut dyn Read) -> Result<Advertisement> {
     let mut adv = Advertisement {
         protocol_version: 0,
@@ -294,8 +384,11 @@ pub fn read_advertisement(reader: &mut dyn Read) -> Result<Advertisement> {
     loop {
         match pkt_line::read_packet(&mut reader)? {
             None => break,
-            Some(pkt_line::Packet::Flush) | Some(pkt_line::Packet::Delim) => break,
-            Some(pkt_line::Packet::ResponseEnd) => break,
+            Some(pkt_line::Packet::Flush) => {
+                adv.saw_ref_advertisement_flush = true;
+                break;
+            }
+            Some(pkt_line::Packet::Delim) | Some(pkt_line::Packet::ResponseEnd) => break,
             Some(pkt_line::Packet::Data(line)) => {
                 let line = line.trim_end_matches('\n');
                 if let Some(ver) = line.strip_prefix("version ") {
@@ -307,17 +400,12 @@ pub fn read_advertisement(reader: &mut dyn Read) -> Result<Advertisement> {
                         continue;
                     }
                 }
+                pkt_line::reject_err_line(line)?;
                 if v2 {
                     // v2 capability block: collect every line verbatim and leave
-                    // `advertised_refs` empty. `ERR` is still fatal.
-                    if let Some(msg) = line.strip_prefix("ERR ") {
-                        return Err(Error::Message(format!("remote error: {}", msg.trim_end())));
-                    }
+                    // `advertised_refs` empty.
                     adv.capabilities.push(line.to_string());
                     continue;
-                }
-                if let Some(msg) = line.strip_prefix("ERR ") {
-                    return Err(Error::Message(format!("remote error: {}", msg.trim_end())));
                 }
                 let Some((oid, refname, caps)) = parse_ref_advertisement_line(line) else {
                     continue;
@@ -394,7 +482,7 @@ fn parse_ref_advertisement_line(line: &str) -> Option<(ObjectId, String, &str)> 
 
 /// Parsed `git://host[:port]/path` (path includes the leading `/`).
 #[derive(Clone, Debug)]
-pub struct GitDaemonUrl {
+pub(crate) struct GitDaemonUrl {
     /// Host name or IP literal.
     pub host: String,
     /// TCP port (defaults to 9418).
@@ -412,16 +500,16 @@ pub struct GitDaemonUrl {
 ///
 /// Returns an error if the URL is not `git://`, has an empty host, or is missing
 /// a repository path.
-pub fn parse_git_url(url: &str) -> Result<GitDaemonUrl> {
+pub(crate) fn parse_git_url(url: &str) -> Result<GitDaemonUrl> {
     let rest = url
         .strip_prefix("git://")
-        .ok_or_else(|| Error::Message(format!("not a git:// URL: {url}")))?;
+        .ok_or_else(|| git_url_err(format!("not a git:// URL: {url}")))?;
     let (authority, path_part) = rest
         .find('/')
         .map(|i| (&rest[..i], &rest[i..]))
         .unwrap_or((rest, "/"));
     if path_part.is_empty() || path_part == "/" {
-        return Err(Error::Message(
+        return Err(transport_io_err(
             "git:// URL missing repository path".to_owned(),
         ));
     }
@@ -429,12 +517,12 @@ pub fn parse_git_url(url: &str) -> Result<GitDaemonUrl> {
     let (host, port) = if let Some(stripped) = authority.strip_prefix('[') {
         let end = stripped
             .find(']')
-            .ok_or_else(|| Error::Message(format!("invalid git:// authority: {authority}")))?;
+            .ok_or_else(|| git_url_err(format!("invalid git:// authority: {authority}")))?;
         let host = stripped[..end].to_string();
         let after = &stripped[end + 1..];
         let port = if let Some(p) = after.strip_prefix(':') {
             p.parse::<u16>()
-                .map_err(|_| Error::Message(format!("invalid port in git:// URL: {url}")))?
+                .map_err(|_| git_url_err(format!("invalid port in git:// URL: {url}")))?
         } else {
             9418
         };
@@ -447,7 +535,7 @@ pub fn parse_git_url(url: &str) -> Result<GitDaemonUrl> {
             (
                 h.to_string(),
                 p.parse::<u16>()
-                    .map_err(|_| Error::Message(format!("invalid port in git:// URL: {url}")))?,
+                    .map_err(|_| git_url_err(format!("invalid port in git:// URL: {url}")))?,
             )
         } else {
             (authority.to_string(), 9418)
@@ -456,7 +544,7 @@ pub fn parse_git_url(url: &str) -> Result<GitDaemonUrl> {
         (authority.to_string(), 9418)
     };
     if host.is_empty() {
-        return Err(Error::Message("git:// URL has empty host".to_owned()));
+        return Err(git_url_err("git:// URL has empty host"));
     }
     Ok(GitDaemonUrl { host, port, path })
 }
@@ -465,7 +553,7 @@ pub fn parse_git_url(url: &str) -> Result<GitDaemonUrl> {
 ///
 /// Holds the read and write halves of the socket (duplicated file descriptors of
 /// the same connection) plus the advertisement read on connect.
-pub struct GitDaemonConnection {
+pub(crate) struct GitDaemonConnection {
     reader: BufReader<TcpStream>,
     writer: TcpStream,
     adv: Advertisement,
@@ -498,6 +586,10 @@ impl Connection for GitDaemonConnection {
 
     fn advertised_tag_peel(&self) -> Option<&std::collections::HashMap<String, ObjectId>> {
         Some(&self.adv.advertised_peel)
+    }
+
+    fn saw_ref_advertisement_flush(&self) -> bool {
+        self.adv.saw_ref_advertisement_flush
     }
 
     fn finish_send(&mut self) {
@@ -585,7 +677,7 @@ impl Transport for GitDaemonTransport {
             })?
             .next()
             .ok_or_else(|| {
-                Error::Message(format!(
+                transport_io_err(format!(
                     "no addresses for git://{}:{}",
                     parsed.host, parsed.port
                 ))
@@ -610,7 +702,7 @@ impl Transport for GitDaemonTransport {
 
         let mut writer = stream
             .try_clone()
-            .map_err(|e| Error::Message(format!("dup git:// socket: {e}")))?;
+            .map_err(|e| transport_io_err(format!("dup git:// socket: {e}")))?;
         let broken_connection = |e: Error| match e {
             Error::Io(io) => Error::remote_unreadable(
                 url,
@@ -673,7 +765,7 @@ impl Transport for GitDaemonTransport {
 /// already stripped for IPv6 literals); `path` is the repository path sent to
 /// the remote `git-upload-pack`.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SshUrl {
+pub(crate) struct SshUrl {
     /// Host (and optional `user@`) as passed to ssh, with IPv6 brackets removed.
     pub ssh_host: String,
     /// Repository path on the remote (passed to `git-upload-pack`).
@@ -690,7 +782,7 @@ pub struct SshUrl {
 /// Mirrors Git's `url_is_local_not_ssh` (`connect.c`): a string is local unless
 /// it is `host:path` with no `/` before the first `:`.
 #[must_use]
-pub fn is_ssh_url(url: &str) -> bool {
+pub(crate) fn is_ssh_url(url: &str) -> bool {
     let u = url.trim();
     if u.starts_with("ext::") {
         return false;
@@ -715,7 +807,7 @@ pub fn is_ssh_url(url: &str) -> bool {
 ///
 /// Returns an error if the URL has an empty host or path, the host starts with
 /// `-`, or a percent-escape is malformed.
-pub fn parse_ssh_url(url: &str) -> Result<SshUrl> {
+pub(crate) fn parse_ssh_url(url: &str) -> Result<SshUrl> {
     let u = url.trim();
     if let Some(rest) = u.strip_prefix("git+ssh://") {
         return parse_ssh_url_form(rest);
@@ -731,7 +823,9 @@ fn parse_ssh_url_form(rest: &str) -> Result<SshUrl> {
     let (authority, path_with_sep) = split_ssh_authority_and_path(after_slashes);
     let (user_host, port) = parse_authority_host_port(authority)?;
     if user_host.starts_with('-') {
-        return Err(Error::Message("ssh: hostname starts with '-'".to_owned()));
+        return Err(ssh_transport_err(
+            "ssh: hostname starts with '-'".to_owned(),
+        ));
     }
     // Git: for PROTO_SSH, if `path[1] == '~'`, advance past the leading separator
     // so `ssh://host/~repo` yields `~repo` (server-side home-dir expansion).
@@ -850,7 +944,7 @@ fn get_port(host: String) -> (String, Option<String>) {
 fn parse_authority_host_port(authority: &str) -> Result<(String, Option<String>)> {
     let auth = authority.trim();
     if auth.is_empty() {
-        return Err(Error::Message("ssh: empty host".to_owned()));
+        return Err(ssh_transport_err("ssh: empty host".to_owned()));
     }
     let (ssh_host, port) = get_host_and_port(host_end_remove_brackets(auth));
     let (ssh_host, port) = match port {
@@ -858,10 +952,12 @@ fn parse_authority_host_port(authority: &str) -> Result<(String, Option<String>)
         None => get_port(ssh_host),
     };
     if ssh_host.is_empty() {
-        return Err(Error::Message("ssh: empty host".to_owned()));
+        return Err(ssh_transport_err("ssh: empty host".to_owned()));
     }
     if ssh_host.starts_with('-') {
-        return Err(Error::Message("ssh: hostname starts with '-'".to_owned()));
+        return Err(ssh_transport_err(
+            "ssh: hostname starts with '-'".to_owned(),
+        ));
     }
     Ok((ssh_host, port))
 }
@@ -871,28 +967,30 @@ fn parse_scp_style(u: &str) -> Result<SshUrl> {
     let sep_search_start = if he.bracketed {
         u.find(']')
             .map(|i| i + 1)
-            .ok_or_else(|| Error::Message("ssh: malformed host".to_owned()))?
+            .ok_or_else(|| ssh_transport_err("ssh: malformed host".to_owned()))?
     } else {
         0
     };
     let rel_colon = u[sep_search_start..]
         .find(':')
-        .ok_or_else(|| Error::Message("ssh: no ':' in scp-style url".to_owned()))?;
+        .ok_or_else(|| ssh_transport_err("ssh: no ':' in scp-style url".to_owned()))?;
     let colon_pos = sep_search_start + rel_colon;
     let host = &u[..colon_pos];
     let mut path = &u[colon_pos + 1..];
 
     if host.is_empty() || path.is_empty() {
-        return Err(Error::Message("ssh: empty host or path".to_owned()));
+        return Err(ssh_transport_err("ssh: empty host or path".to_owned()));
     }
     if host.starts_with('-') {
-        return Err(Error::Message("ssh: hostname starts with '-'".to_owned()));
+        return Err(ssh_transport_err(
+            "ssh: hostname starts with '-'".to_owned(),
+        ));
     }
     if path.as_bytes().get(1) == Some(&b'~') {
         path = &path[1..];
     }
     if path.starts_with('-') {
-        return Err(Error::Message("ssh: path starts with '-'".to_owned()));
+        return Err(ssh_transport_err("ssh: path starts with '-'".to_owned()));
     }
     let (ssh_host, port) = parse_authority_host_port(host)?;
     Ok(SshUrl {
@@ -909,7 +1007,7 @@ fn normalize_ssh_url_path(path_part: &str) -> Result<String> {
     }
     let decoded = percent_decode_path(path_part)?;
     if decoded.starts_with('-') {
-        return Err(Error::Message("ssh: path starts with '-'".to_owned()));
+        return Err(ssh_transport_err("ssh: path starts with '-'".to_owned()));
     }
     Ok(decoded)
 }
@@ -921,12 +1019,12 @@ fn percent_decode_path(path: &str) -> Result<String> {
         if c == '%' {
             let h1 = chars
                 .next()
-                .ok_or_else(|| Error::Message("ssh: bad % escape".to_owned()))?;
+                .ok_or_else(|| ssh_transport_err("ssh: bad % escape".to_owned()))?;
             let h2 = chars
                 .next()
-                .ok_or_else(|| Error::Message("ssh: bad % escape".to_owned()))?;
+                .ok_or_else(|| ssh_transport_err("ssh: bad % escape".to_owned()))?;
             let byte = u8::from_str_radix(&format!("{h1}{h2}"), 16)
-                .map_err(|_| Error::Message("ssh: bad % escape".to_owned()))?;
+                .map_err(|_| ssh_transport_err("ssh: bad % escape".to_owned()))?;
             out.push(byte as char);
         } else {
             out.push(c);
@@ -954,6 +1052,55 @@ pub(crate) fn sq_quote_shell_arg(s: &str) -> String {
 /// `git-upload-pack '<path>'` (or `<service> '<path>'`).
 fn remote_service_cmd(service: Service, quoted_path: &str) -> String {
     format!("{} {quoted_path}", service.wire_name())
+}
+
+const OPENSSH_SENDENV_GIT_PROTOCOL: &str = "SendEnv=GIT_PROTOCOL";
+
+fn is_ssh_program_basename(name: &OsStr) -> bool {
+    name.to_string_lossy().eq_ignore_ascii_case("ssh")
+        || name.to_string_lossy().eq_ignore_ascii_case("ssh.exe")
+}
+
+fn shell_command_leading_program(cmd: &OsStr) -> Option<&OsStr> {
+    let s = cmd.to_str()?;
+    let token = s.split_whitespace().next()?;
+    Some(OsStr::new(token))
+}
+
+/// Whether the resolved ssh invocation should receive `-o SendEnv=GIT_PROTOCOL` (OpenSSH only).
+///
+/// Matches Git: basename `ssh` / `ssh.exe` (case-insensitive) or a shell command whose leading
+/// token resolves to that basename is treated as OpenSSH without running `ssh -V`.
+fn ssh_invocation_is_openssh(env: &crate::environment::Environment, resolved: &SshCommand) -> bool {
+    if let Some(variant) = env.var_os("GIT_SSH_VARIANT") {
+        let v = variant.to_string_lossy();
+        if v.eq_ignore_ascii_case("ssh") {
+            return true;
+        }
+        if !v.eq_ignore_ascii_case("auto") {
+            return false;
+        }
+    }
+    let program = match resolved {
+        SshCommand::Program(prog) => Path::new(prog),
+        SshCommand::ShellCommand(cmd) => {
+            let Some(token) = shell_command_leading_program(cmd) else {
+                return false;
+            };
+            Path::new(token)
+        }
+        SshCommand::Auto => return false,
+    };
+    program.file_name().is_some_and(is_ssh_program_basename)
+}
+
+fn push_openssh_sendenv_args(args: &mut Vec<OsString>) {
+    args.push(OsString::from("-o"));
+    args.push(OsString::from(OPENSSH_SENDENV_GIT_PROTOCOL));
+}
+
+fn openssh_sendenv_option_fragment() -> &'static str {
+    " -o SendEnv=GIT_PROTOCOL"
 }
 
 /// How the [`SshTransport`] invokes ssh.
@@ -1003,7 +1150,7 @@ pub fn resolve_effective_ssh_command(
         return SshCommand::ShellCommand(c);
     }
     if let Some(cfg) = config {
-        if let Some(cmd) = cfg.get("core.sshCommand").filter(|s| !s.is_empty()) {
+        if let Some(cmd) = cfg.value("core.sshCommand").filter(|s| !s.is_empty()) {
             return SshCommand::ShellCommand(OsString::from(cmd));
         }
     }
@@ -1018,7 +1165,7 @@ pub fn resolve_effective_ssh_command(
 /// The child's stdin/stdout are the pkt-line stream; the advertisement is read
 /// on connect. Dropping the connection closes the pipes (signalling EOF to the
 /// remote) and reaps the child.
-pub struct SshConnection {
+pub(crate) struct SshConnection {
     child: Child,
     // `Option` so [`Connection::finish_send`] can drop stdin (sending EOF to the
     // remote `git-upload-pack`) without consuming the connection.
@@ -1062,6 +1209,10 @@ impl Connection for SshConnection {
         Some(&self.adv.advertised_peel)
     }
 
+    fn saw_ref_advertisement_flush(&self) -> bool {
+        self.adv.saw_ref_advertisement_flush
+    }
+
     fn finish_send(&mut self) {
         // Dropping the child's stdin closes the pipe, signalling EOF so the
         // remote `git-upload-pack` v2 `serve_loop` exits instead of blocking for
@@ -1073,7 +1224,7 @@ impl Connection for SshConnection {
 /// Serve a fetch from a local repository over the wire protocol, in-process
 /// (Git's `file://` transport, which runs `git upload-pack` on the path).
 ///
-/// The fetch side talks pkt-lines to [`crate::serve::upload_pack`] running on its own
+/// The fetch side talks pkt-lines to [`crate::serve::UploadPack`] running on its own
 /// thread over a pair of pipes, so filtered and promisor fetches from local paths use
 /// the same exchange as a remote server: filters, the `promisor-remote`
 /// capability, `want`s of single objects. Only fetches are supported.
@@ -1097,7 +1248,7 @@ pub(crate) fn connect_local_upload_pack(
 ) -> Result<Box<dyn Connection>> {
     use crate::serve::{ProtocolVersion, ServeOptions};
     if service != Service::UploadPack {
-        return Err(Error::Message(
+        return Err(transport_io_err(
             "local upload-pack connect supports fetch only".to_owned(),
         ));
     }
@@ -1112,29 +1263,33 @@ pub(crate) fn connect_local_upload_pack(
     let served_env = client_env.for_local_transport();
     let server = std::thread::Builder::new()
         .name("grit-local-upload-pack".to_owned())
-        .spawn(
-            move || -> std::result::Result<(), crate::serve::ServeError> {
-                let lazy_fetch = ServeOptions::lazy_fetch_from_environment(&served_env);
-                let repo = crate::repo::Repository::open(
-                    &dir,
-                    &crate::environment::RepositoryOptions::with_environment(served_env)
-                        .for_serving(),
-                )?;
-                let config =
-                    crate::config::ConfigSet::load(repo.environment(), Some(repo.git_dir()), true)
-                        .unwrap_or_default();
-                let mut serve = ServeOptions {
-                    protocol,
-                    agent: format!("grit/{}", env!("CARGO_PKG_VERSION")),
-                    hidden_refs: crate::hide_refs::hide_ref_patterns_uploadpack(&config),
-                    lazy_fetch,
-                    ..ServeOptions::default()
-                };
-                serve.attach_promisor_fetcher(&repo, &config, promisor_fetcher);
-                crate::serve::upload_pack(&repo, &mut server_input, &mut server_output, &mut serve)
-                    .map(|_| ())
-            },
-        )?;
+        .spawn(move || -> crate::error::Result<()> {
+            let lazy_fetch = ServeOptions::lazy_fetch_from_environment(&served_env);
+            let repo = crate::repo::Repository::open(
+                &dir,
+                &crate::environment::RepositoryOptions::with_environment(served_env).for_serving(),
+            )?;
+            let config = crate::config::ConfigSet::load(
+                repo.environment(),
+                Some(repo.git_dir()),
+                &crate::config::LoadConfigOptions::standard(
+                    repo.environment(),
+                    Some(repo.git_dir()),
+                ),
+            )
+            .unwrap_or_default();
+            let mut serve = ServeOptions {
+                protocol,
+                agent: format!("grit/{}", env!("CARGO_PKG_VERSION")),
+                hidden_refs: crate::hide_refs::hide_ref_patterns_uploadpack(&config),
+                lazy_fetch,
+                ..ServeOptions::default()
+            };
+            serve.attach_promisor_fetcher(&repo, promisor_fetcher);
+            crate::serve::UploadPack::new(&repo, &mut serve)
+                .run(&mut server_input, &mut server_output)
+                .map(|_| ())
+        })?;
     let mut conn = LocalUploadPackConnection {
         writer: Some(client_writer),
         reader: Some(BufReader::new(client_reader)),
@@ -1157,16 +1312,17 @@ pub(crate) fn connect_local_upload_pack(
             match (served, other) {
                 (Err(err), _) => Err(err),
                 (Ok(()), Err(err)) => Err(err),
-                (Ok(()), Ok(_)) => Err(Error::RemoteUnreadable {
+                (Ok(()), Ok(_)) => Err(RemoteError::Unreadable {
                     url: Some(remote_git_dir.display().to_string()),
                     reason: RemoteUnreadableReason::NoHandshake,
-                }),
+                }
+                .into()),
             }
         }
     }
 }
 
-/// A [`Connection`] to [`crate::serve::upload_pack`] serving a local repository on
+/// A [`Connection`] to [`crate::serve::UploadPack`] serving a local repository on
 /// another thread; see [`connect_local_upload_pack`].
 ///
 /// The two directions are in-memory pipes ([`crate::mem_pipe`]), not OS pipes, so a
@@ -1177,7 +1333,7 @@ struct LocalUploadPackConnection {
     /// Server → client pipe. `None` only while being torn down.
     reader: Option<BufReader<crate::mem_pipe::MemPipeReader>>,
     adv: Advertisement,
-    server: Option<std::thread::JoinHandle<std::result::Result<(), crate::serve::ServeError>>>,
+    server: Option<std::thread::JoinHandle<crate::error::Result<()>>>,
 }
 
 impl LocalUploadPackConnection {
@@ -1196,21 +1352,25 @@ impl LocalUploadPackConnection {
         match server.join() {
             Ok(Ok(())) => Ok(()),
             Ok(Err(err)) if stopped_by_closed_pipe(&err) => Ok(()),
-            Ok(Err(crate::serve::ServeError::Repository(err))) => Err(err),
-            Ok(Err(err)) => Err(Error::LocalUploadPack(Box::new(err))),
-            Err(_) => Err(Error::LocalUploadPackPanicked),
+            Ok(Err(Error::Remote(RemoteError::Serve(err)))) => {
+                Err(RemoteError::LocalUploadPack(Box::new(err)).into())
+            }
+            Ok(Err(err)) => Err(err),
+            Err(_) => Err(RemoteError::LocalUploadPackPanicked.into()),
         }
     }
 }
 
 /// Whether `err` is the server failing to write because the client closed its end.
-fn stopped_by_closed_pipe(err: &crate::serve::ServeError) -> bool {
+fn stopped_by_closed_pipe(err: &Error) -> bool {
     use crate::serve::ServeError;
     match err {
-        ServeError::Io(e) | ServeError::Repository(Error::Io(e)) => {
+        Error::Io(e) | Error::Remote(RemoteError::Serve(ServeError::Io(e))) => {
             e.kind() == std::io::ErrorKind::BrokenPipe
         }
-        ServeError::PackInterrupted(inner) => stopped_by_closed_pipe(inner),
+        Error::Remote(RemoteError::Serve(ServeError::PackInterrupted { broken_pipe, .. })) => {
+            *broken_pipe
+        }
         _ => false,
     }
 }
@@ -1250,6 +1410,10 @@ impl Connection for LocalUploadPackConnection {
 
     fn advertised_tag_peel(&self) -> Option<&std::collections::HashMap<String, ObjectId>> {
         Some(&self.adv.advertised_peel)
+    }
+
+    fn saw_ref_advertisement_flush(&self) -> bool {
+        self.adv.saw_ref_advertisement_flush
     }
 
     fn finish_send(&mut self) {
@@ -1393,15 +1557,23 @@ impl SshTransport {
             ));
         }
 
-        match self
+        let resolved = self
             .ssh_command
-            .resolve(self.ssh_env.as_ref(), self.ssh_config.as_deref())
-        {
+            .resolve(self.ssh_env.as_ref(), self.ssh_config.as_deref());
+        let openssh_sendenv = opts.protocol_version > 0
+            && ssh_invocation_is_openssh(self.ssh_env.as_ref(), &resolved);
+
+        match resolved {
             SshCommand::ShellCommand(cmd) => {
                 let cmd = cmd.to_string_lossy();
+                let sendenv = if openssh_sendenv {
+                    openssh_sendenv_option_fragment()
+                } else {
+                    ""
+                };
                 let port_opt = match port {
-                    Some(p) => format!(" -p {}", shell_words::quote(p)),
-                    None => String::new(),
+                    Some(p) => format!("{sendenv} -p {}", shell_words::quote(p)),
+                    None => sendenv.to_string(),
                 };
                 let script = format!(
                     "{cmd}{port_opt} {} {}",
@@ -1425,6 +1597,9 @@ impl SshTransport {
             }
             SshCommand::Program(prog) => {
                 let mut args = Vec::new();
+                if openssh_sendenv {
+                    push_openssh_sendenv_args(&mut args);
+                }
                 if let Some(p) = port {
                     args.push(OsString::from("-p"));
                     args.push(OsString::from(p));
@@ -1464,14 +1639,14 @@ impl Transport for SshTransport {
         let spec = parse_ssh_url(url)?;
         let cmd_spec = self.ssh_command_spec(&spec, service, opts);
         let running = self.command_runner.spawn(&cmd_spec).map_err(|e| {
-            Error::Message(format!("failed to spawn ssh for {}: {e}", spec.ssh_host))
+            transport_io_err(format!("failed to spawn ssh for {}: {e}", spec.ssh_host))
         })?;
-        let (mut child, writer, reader, _stderr) = running
-            .into_system_parts()
-            .map_err(|_| Error::Message("ssh child is not backed by a live process".to_owned()))?;
-        let writer = writer.ok_or_else(|| Error::Message("ssh child has no stdin".to_owned()))?;
+        let (mut child, writer, reader, _stderr) = running.into_system_parts().map_err(|_| {
+            transport_io_err("ssh child is not backed by a live process".to_owned())
+        })?;
+        let writer = writer.ok_or_else(|| transport_io_err("ssh child has no stdin".to_owned()))?;
         let mut reader = BufReader::new(
-            reader.ok_or_else(|| Error::Message("ssh child has no stdout".to_owned()))?,
+            reader.ok_or_else(|| transport_io_err("ssh child has no stdout".to_owned()))?,
         );
 
         let adv = read_advertisement(&mut reader)?;
@@ -1749,9 +1924,83 @@ mod tests {
     }
 
     #[test]
+    fn read_advertisement_flush_only_empty_repo_completes_handshake() {
+        let mut cur = std::io::Cursor::new(b"0000");
+        let adv = read_advertisement(&mut cur).expect("flush-only advertisement");
+        assert!(adv.saw_ref_advertisement_flush);
+        assert!(adv.capabilities.is_empty());
+        assert!(adv.refs.is_empty());
+        assert!(remote_handshake_complete(&adv));
+    }
+
+    #[test]
+    fn read_advertisement_immediate_eof_is_not_handshake() {
+        let mut cur = std::io::Cursor::new([]);
+        let adv = read_advertisement(&mut cur).expect("empty read");
+        assert!(!adv.saw_ref_advertisement_flush);
+        assert!(!remote_handshake_complete(&adv));
+    }
+
+    #[test]
+    fn read_advertisement_delim_only_is_not_handshake() {
+        let mut cur = std::io::Cursor::new(b"0001");
+        let adv = read_advertisement(&mut cur).expect("delim-only advertisement");
+        assert!(!adv.saw_ref_advertisement_flush);
+        assert!(!remote_handshake_complete(&adv));
+    }
+
+    #[test]
+    fn read_advertisement_response_end_only_is_not_handshake() {
+        let mut cur = std::io::Cursor::new(b"0002");
+        let adv = read_advertisement(&mut cur).expect("response-end-only advertisement");
+        assert!(!adv.saw_ref_advertisement_flush);
+        assert!(!remote_handshake_complete(&adv));
+    }
+
+    #[test]
+    fn read_advertisement_err_line_is_remote_fatal() {
+        use crate::error::Error;
+        let mut wire = b"003dERR access denied or repository not exported: /srv/x.git\n".to_vec();
+        wire.extend_from_slice(b"0000");
+        let err = read_advertisement(&mut std::io::Cursor::new(wire)).expect_err("ERR");
+        assert_eq!(err.kind_name(), "remote_fatal");
+        assert_eq!(
+            err.to_string(),
+            "remote error: access denied or repository not exported: /srv/x.git"
+        );
+        assert!(matches!(err, Error::Remote(RemoteError::Fatal { .. })));
+        assert_eq!(
+            match err {
+                Error::Remote(RemoteError::Fatal { message }) => message,
+                other => panic!("expected RemoteFatal, got {other:?}"),
+            },
+            "access denied or repository not exported: /srv/x.git"
+        );
+    }
+
+    #[test]
+    fn read_advertisement_v2_capability_block_err_is_remote_fatal() {
+        use crate::error::Error;
+        let mut wire = Vec::new();
+        pkt_line::write_line_to_vec(&mut wire, "version 2").unwrap();
+        pkt_line::write_line_to_vec(&mut wire, "agent=git/2.99").unwrap();
+        pkt_line::write_line_to_vec(&mut wire, "ERR service not enabled").unwrap();
+        wire.extend_from_slice(b"0000");
+        let err = read_advertisement(&mut std::io::Cursor::new(wire)).expect_err("v2 ERR");
+        assert!(matches!(
+            err,
+            Error::Remote(RemoteError::Fatal { message }) if message == "service not enabled"
+        ));
+    }
+
+    #[test]
     fn remote_handshake_complete_empty_vs_capabilities_carrier() {
         let empty = Advertisement::default();
         assert!(!remote_handshake_complete(&empty));
+
+        let mut flush_only = Advertisement::default();
+        flush_only.saw_ref_advertisement_flush = true;
+        assert!(remote_handshake_complete(&flush_only));
 
         let mut empty_repo = Advertisement::default();
         empty_repo.capabilities = vec!["multi_ack".to_owned()];
@@ -1784,12 +2033,256 @@ mod tests {
         assert!(
             matches!(
                 err,
-                Error::RemoteUnreadable {
+                Error::Remote(RemoteError::Unreadable {
                     reason: RemoteUnreadableReason::NoHandshake,
                     ..
-                }
+                })
             ),
             "expected NoHandshake, got {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[cfg_attr(
+        not(feature = "full-tests"),
+        ignore = "starts system git or is heavy; run with --features full-tests"
+    )]
+    #[test]
+    fn system_git_upload_pack_refusing_a_want_is_remote_fatal() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if Command::new("git").arg("--version").output().is_err() {
+            eprintln!("SKIP: no system git");
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let source = tmp.path().join("source");
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&source)
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .env("GIT_AUTHOR_NAME", "A")
+                .env("GIT_AUTHOR_EMAIL", "a@example.com")
+                .env("GIT_COMMITTER_NAME", "A")
+                .env("GIT_COMMITTER_EMAIL", "a@example.com")
+                .output()
+                .expect("run git");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_owned()
+        };
+        std::fs::create_dir_all(&source).expect("mkdir");
+        git(&["init", "-q", "-b", "main"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "base"]);
+        let missing = "b".repeat(40);
+
+        let script = tmp.path().join("fake-ssh.sh");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+while [ "$1" = "-p" ]; do shift 2; done
+shift
+cmd=$*
+case "$cmd" in
+  "git-upload-pack "*) cmd="git upload-pack ${cmd#git-upload-pack }" ;;
+esac
+eval "$cmd"
+"#,
+        )
+        .expect("write fake ssh");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let source_path = source.to_str().expect("utf8 path");
+
+        for protocol_version in [0u8, 2] {
+            let (transport, url) = if protocol_version == 2 {
+                (
+                    SshTransport::with_program(&script),
+                    format!("ssh://git@fakehost{source_path}"),
+                )
+            } else {
+                (
+                    SshTransport::with_shell_command(&script),
+                    format!("fakehost:{source_path}"),
+                )
+            };
+            let opts = ConnectOptions {
+                protocol_version,
+                ..Default::default()
+            };
+            let mut conn = transport
+                .connect(&url, Service::UploadPack, &opts)
+                .expect("connect to git upload-pack");
+            assert_eq!(conn.protocol_version(), protocol_version);
+
+            let local = tmp.path().join(format!("local-v{protocol_version}"));
+            let (repo, _) = crate::repo::Repository::init(&local, &crate::repo::InitOptions::new())
+                .expect("init local");
+            let mut fetch = crate::transfer::FetchOptions::new();
+            fetch.refspecs = vec![format!("{missing}:refs/heads/missing")];
+            let err = repo
+                .remotes()
+                .fetch_from(
+                    crate::transfer::TransferEndpoint::Connection(conn.as_mut()),
+                    &mut fetch,
+                    &mut crate::fetch::NoProgress,
+                    &crate::progress::CancelToken::never(),
+                )
+                .expect_err("git refuses a want for an object it does not have");
+            match err {
+                Error::Remote(RemoteError::Fatal { message }) => assert!(
+                    message.contains("not our ref") && message.contains(&missing),
+                    "v{protocol_version}: {message}"
+                ),
+                other => panic!("v{protocol_version}: expected RemoteFatal, got {other:?}"),
+            }
+        }
+    }
+
+    fn command_spec_has_sendenv(spec: &CommandSpec) -> bool {
+        if spec
+            .args
+            .windows(2)
+            .any(|w| w[0] == "-o" && w[1] == OPENSSH_SENDENV_GIT_PROTOCOL)
+        {
+            return true;
+        }
+        match &spec.shell {
+            Some(ShellInvocation::DashC { script, .. }) => {
+                script.contains("-o SendEnv=GIT_PROTOCOL")
+            }
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn ssh_basename_program_adds_sendenv_without_git_ssh_variant() {
+        use crate::command_runner::RecordingRunner;
+
+        let runner = RecordingRunner::always_success();
+        let transport = SshTransport::with_program("ssh").with_command_runner(runner.clone());
+        let opts = ConnectOptions {
+            protocol_version: 2,
+            ..Default::default()
+        };
+        let _ = transport.connect("example.com:repo.git", Service::UploadPack, &opts);
+        let specs = runner.specs();
+        assert_eq!(specs.len(), 1, "ssh spawn must be recorded");
+        assert!(
+            command_spec_has_sendenv(&specs[0]),
+            "program named ssh must get SendEnv without ssh -V probe or GIT_SSH_VARIANT"
+        );
+        assert!(
+            specs[0]
+                .env
+                .set
+                .iter()
+                .any(|(k, v)| { k == "GIT_PROTOCOL" && v.to_string_lossy() == "version=2" }),
+            "GIT_PROTOCOL must be set on the ssh child for v2"
+        );
+    }
+
+    #[test]
+    fn ssh_basename_shell_command_adds_sendenv_without_git_ssh_variant() {
+        use crate::command_runner::RecordingRunner;
+
+        let runner = RecordingRunner::always_success();
+        let transport = SshTransport::with_shell_command("ssh -o BatchMode=yes")
+            .with_command_runner(runner.clone());
+        let opts = ConnectOptions {
+            protocol_version: 2,
+            ..Default::default()
+        };
+        let _ = transport.connect("example.com:repo.git", Service::UploadPack, &opts);
+        let specs = runner.specs();
+        assert_eq!(specs.len(), 1);
+        assert!(
+            command_spec_has_sendenv(&specs[0]),
+            "shell command starting with ssh must inject SendEnv in the script"
+        );
+    }
+
+    #[test]
+    fn ssh_plink_variant_skips_sendenv_even_for_ssh_basename() {
+        use crate::command_runner::RecordingRunner;
+        use crate::environment::Environment;
+
+        let runner = RecordingRunner::always_success();
+        let env = Arc::new(Environment::from_vars(
+            [("GIT_SSH_VARIANT", "plink")].map(|(k, v)| (OsString::from(k), OsString::from(v))),
+            PathBuf::from("."),
+        ));
+        let transport = SshTransport::with_program("ssh")
+            .with_command_runner(runner.clone())
+            .with_ssh_environment(env);
+        let opts = ConnectOptions {
+            protocol_version: 2,
+            ..Default::default()
+        };
+        let _ = transport.connect("example.com:repo.git", Service::UploadPack, &opts);
+        assert!(
+            !command_spec_has_sendenv(&runner.specs()[0]),
+            "GIT_SSH_VARIANT=plink must not add SendEnv"
+        );
+    }
+
+    #[test]
+    fn ssh_non_openssh_program_omits_sendenv_but_keeps_git_protocol_env() {
+        use crate::command_runner::RecordingRunner;
+
+        let runner = RecordingRunner::always_success();
+        let transport = SshTransport::with_program("/usr/local/bin/fake-ssh")
+            .with_command_runner(runner.clone());
+        let opts = ConnectOptions {
+            protocol_version: 2,
+            ..Default::default()
+        };
+        let _ = transport.connect("example.com:repo.git", Service::UploadPack, &opts);
+        let specs = runner.specs();
+        assert_eq!(specs.len(), 1);
+        let args: Vec<String> = specs[0]
+            .args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !args.iter().any(|a| a.contains("SendEnv")),
+            "non-OpenSSH programs must not get SendEnv, got {args:?}"
+        );
+        assert!(
+            specs[0].env.set.iter().any(|(k, _)| k == "GIT_PROTOCOL"),
+            "GIT_PROTOCOL env must still be set for the child process"
+        );
+    }
+
+    #[test]
+    fn ssh_v0_omits_git_protocol_env() {
+        use crate::command_runner::RecordingRunner;
+        use crate::environment::Environment;
+
+        let runner = RecordingRunner::always_success();
+        let env = Arc::new(Environment::from_vars(
+            [("GIT_SSH_VARIANT", "ssh")].map(|(k, v)| (OsString::from(k), OsString::from(v))),
+            PathBuf::from("."),
+        ));
+        let transport = SshTransport::with_program("ssh")
+            .with_command_runner(runner.clone())
+            .with_ssh_environment(env);
+        let _ = transport.connect(
+            "example.com:repo.git",
+            Service::ReceivePack,
+            &ConnectOptions::default(),
+        );
+        let specs = runner.specs();
+        assert_eq!(specs.len(), 1);
+        assert!(
+            !specs[0].env.set.iter().any(|(k, _)| k == "GIT_PROTOCOL"),
+            "protocol v0 must not set GIT_PROTOCOL on the ssh child"
         );
     }
 

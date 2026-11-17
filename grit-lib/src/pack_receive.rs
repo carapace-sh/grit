@@ -4,6 +4,9 @@
 //! (channel 1). These helpers demux that stream without holding the full pack in
 //! a `Vec` when the caller writes to disk instead.
 
+#![allow(dead_code)]
+
+use crate::error::ObjectError;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -17,7 +20,9 @@ use crate::error::{Error, Result};
 use crate::fetch::Progress;
 use crate::objects::HashAlgo;
 use crate::pack_stream_scan::PackStreamScanner;
-use crate::progress::{poll_cancel, Cancel, ProgressPhase, ProgressUnit, ReceivedObjects};
+use crate::pkt_line;
+use crate::progress::{poll_cancel, CancelToken, ProgressPhase, ProgressUnit, ReceivedObjects};
+use crate::remote::RemoteError;
 
 /// Where demuxed pack bytes are stored.
 pub enum PackReceiveTarget<'a> {
@@ -243,7 +248,7 @@ pub fn read_sideband_pack_to(
     r: &mut dyn Read,
     target: &mut PackReceiveTarget<'_>,
     progress: &mut dyn Progress,
-    cancel: &dyn Cancel,
+    cancel: &CancelToken,
 ) -> Result<()> {
     crate::trace::trace_span!("grit.pack.receive");
     let mut pending = Vec::new();
@@ -269,21 +274,36 @@ fn pkt_line_payload_len(len_buf: &[u8; 4]) -> Result<usize> {
             b'0'..=b'9' => (b - b'0') as usize,
             b'a'..=b'f' => (b - b'a' + 10) as usize,
             b'A'..=b'F' => (b - b'A' + 10) as usize,
-            _ => return Err(Error::Message("bad pkt length".to_owned())),
+            _ => {
+                return Err(Error::Object(ObjectError::Corrupt {
+                    detail: "bad pkt length".to_owned(),
+                }))
+            }
         };
         len = (len << 4) | digit;
     }
     Ok(len)
 }
 
-fn read_interrupted(reader: &mut dyn Read, buf: &mut [u8]) -> Result<usize> {
+fn read_interrupted(
+    reader: &mut dyn Read,
+    buf: &mut [u8],
+    cancel: &crate::progress::CancelToken,
+) -> Result<usize> {
     const ATTEMPTS: usize = 3;
     let mut attempt = 0usize;
     loop {
         match reader.read(buf) {
             Ok(n) => return Ok(n),
-            Err(e) if e.kind() == io::ErrorKind::Interrupted && attempt + 1 < ATTEMPTS => {
-                attempt += 1;
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {
+                if cancel.is_cancelled() {
+                    return Err(Error::Cancelled);
+                }
+                if attempt + 1 < ATTEMPTS {
+                    attempt += 1;
+                    continue;
+                }
+                return Err(Error::Io(e));
             }
             Err(e) => return Err(Error::Io(e)),
         }
@@ -292,10 +312,20 @@ fn read_interrupted(reader: &mut dyn Read, buf: &mut [u8]) -> Result<usize> {
 
 /// Copy `reader` to `writer` with a large buffer (faster than [`io::copy`]'s 8 KiB default).
 pub fn copy_reader_to_writer(reader: &mut dyn Read, writer: &mut dyn Write) -> Result<u64> {
+    copy_reader_to_writer_cancellable(reader, writer, &crate::progress::CancelToken::never())
+}
+
+/// Like [`copy_reader_to_writer`], but stops with [`Error::Cancelled`] when `cancel` is set
+/// after an interrupted read.
+pub fn copy_reader_to_writer_cancellable(
+    reader: &mut dyn Read,
+    writer: &mut dyn Write,
+    cancel: &crate::progress::CancelToken,
+) -> Result<u64> {
     let mut buf = vec![0u8; 1024 * 1024];
     let mut total = 0u64;
     loop {
-        let n = read_interrupted(reader, &mut buf)?;
+        let n = read_interrupted(reader, &mut buf, cancel)?;
         if n == 0 {
             break;
         }
@@ -338,12 +368,12 @@ impl SidebandStreamBuf {
         self.pos = 0;
     }
 
-    fn refill(&mut self, r: &mut dyn Read) -> Result<bool> {
+    fn refill(&mut self, r: &mut dyn Read, cancel: &crate::progress::CancelToken) -> Result<bool> {
         self.compact();
         if self.end >= self.storage.len() {
             return Ok(false);
         }
-        let n = read_interrupted(r, &mut self.storage[self.end..])?;
+        let n = read_interrupted(r, &mut self.storage[self.end..], cancel)?;
         self.end += n;
         Ok(n > 0)
     }
@@ -358,7 +388,7 @@ pub fn read_sideband_pack_tail(
     r: &mut dyn Read,
     target: &mut PackReceiveTarget<'_>,
     progress: &mut dyn Progress,
-    cancel: &dyn Cancel,
+    cancel: &CancelToken,
     pending: &mut Vec<u8>,
     seen_pack: &mut bool,
     payload_buf: &mut Vec<u8>,
@@ -380,7 +410,7 @@ fn read_sideband_pack_tail_buffered(
     r: &mut dyn Read,
     target: &mut PackReceiveTarget<'_>,
     progress: &mut dyn Progress,
-    cancel: &dyn Cancel,
+    cancel: &CancelToken,
     pending: &mut Vec<u8>,
     seen_pack: &mut bool,
     _payload_buf: &mut Vec<u8>,
@@ -395,7 +425,7 @@ fn read_sideband_pack_tail_buffered(
     loop {
         poll_cancel(progress, cancel)?;
         while stream.available() < 4 {
-            if !stream.refill(r)? {
+            if !stream.refill(r, cancel)? {
                 if stream.available() == 0 {
                     flush_coalesced_progress(progress, &mut receiving, &mut progress_pending);
                     finish_receiving(progress, receiving);
@@ -430,15 +460,15 @@ fn read_sideband_pack_tail_buffered(
                 continue;
             }
             n if n <= 4 => {
-                return Err(Error::Message(format!(
-                    "invalid pkt-line length in side-band stream: {n}"
-                )))
+                return Err(Error::Object(ObjectError::Corrupt {
+                    detail: format!("invalid pkt-line length in side-band stream: {n}"),
+                }))
             }
             _ => {}
         }
         let payload_len = len - 4;
         while stream.available() < 4 + payload_len {
-            if !stream.refill(r)? {
+            if !stream.refill(r, cancel)? {
                 return Err(sideband_unexpected_eof());
             }
         }
@@ -467,12 +497,7 @@ fn read_sideband_pack_tail_buffered(
                 }
             }
             2 => progress.message(&payload[1..]),
-            3 => {
-                return Err(Error::Message(format!(
-                    "remote error: {}",
-                    String::from_utf8_lossy(&payload[1..]).trim_end()
-                )))
-            }
+            3 => return Err(pkt_line::sideband_fatal(&payload[1..])),
             _ => {
                 let nbytes = append_pack_data_counted(
                     payload,
@@ -524,9 +549,9 @@ fn read_sideband_pack_tail_read_exact_loop(
             }
             1 | 2 => continue,
             n if n <= 4 => {
-                return Err(Error::Message(format!(
-                    "invalid pkt-line length in side-band stream: {n}"
-                )))
+                return Err(Error::Object(ObjectError::Corrupt {
+                    detail: format!("invalid pkt-line length in side-band stream: {n}"),
+                }))
             }
             _ => {}
         }
@@ -553,12 +578,7 @@ fn read_sideband_pack_tail_read_exact_loop(
                 note_received_pack_bytes(progress, &mut receiving, nbytes);
             }
             2 => progress.message(&payload_buf[1..]),
-            3 => {
-                return Err(Error::Message(format!(
-                    "remote error: {}",
-                    String::from_utf8_lossy(&payload_buf[1..]).trim_end()
-                )))
-            }
+            3 => return Err(pkt_line::sideband_fatal(&payload_buf[1..])),
             _ => {
                 let nbytes = append_pack_data(payload_buf, target, pending, seen_pack)?;
                 note_received_pack_bytes(progress, &mut receiving, nbytes);
@@ -673,18 +693,21 @@ fn assert_received_pack_durable(path: &Path, expected_len: u64) -> Result<()> {
             Err(e) => return Err(Error::Io(e)),
         };
         if !meta.is_file() {
-            return Err(Error::ReceivedPackTempMissing {
+            return Err(RemoteError::ReceivedPackTempMissing {
                 path: path.to_path_buf(),
-            });
+            }
+            .into());
         }
         if meta.len() != expected_len {
             if attempt + 1 < MAX_ATTEMPTS {
                 continue;
             }
-            return Err(Error::CorruptObject(format!(
-                "received pack size mismatch: expected {expected_len}, got {}",
-                meta.len()
-            )));
+            return Err(Error::Object(ObjectError::Corrupt {
+                detail: format!(
+                    "received pack size mismatch: expected {expected_len}, got {}",
+                    meta.len()
+                ),
+            }));
         }
         let mut header = [0u8; 4];
         let mut f = match File::open(path) {
@@ -698,15 +721,16 @@ fn assert_received_pack_durable(path: &Path, expected_len: u64) -> Result<()> {
             Err(e) => return Err(Error::Io(e)),
         }
         if &header != b"PACK" {
-            return Err(Error::CorruptObject(
-                "received data is not a pack stream".to_owned(),
-            ));
+            return Err(Error::Object(ObjectError::Corrupt {
+                detail: "received data is not a pack stream".to_owned(),
+            }));
         }
         return Ok(());
     }
-    Err(Error::ReceivedPackTempMissing {
+    Err(RemoteError::ReceivedPackTempMissing {
         path: path.to_path_buf(),
-    })
+    }
+    .into())
 }
 
 impl TempPackReceive {
@@ -744,6 +768,20 @@ impl TempPackReceive {
         })
     }
 
+    /// Like [`Self::create`], but as a private `grit-pack-receive-*` file in the system temp
+    /// directory, for a repository whose primary object store is not the files layout: its
+    /// git directory may not exist, and the pack is ingested into the store and removed.
+    pub(crate) fn create_in_system_temp() -> Result<Self> {
+        let temp = std::env::temp_dir();
+        Self::create_named(|seq| {
+            let path = temp.join(format!(
+                "grit-pack-receive-{}_{seq}.tmp",
+                std::process::id()
+            ));
+            create_private_spool_file(&path).map(|file| (path, file))
+        })
+    }
+
     /// Create the spool with the first `open(seq)` whose name is not taken yet.
     fn create_named(open: impl Fn(u64) -> Result<(PathBuf, File)>) -> Result<Self> {
         static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -777,7 +815,7 @@ impl TempPackReceive {
         &mut self,
         reader: &mut dyn Read,
         progress: &mut dyn Progress,
-        cancel: &dyn Cancel,
+        cancel: &CancelToken,
     ) -> Result<()> {
         let mut target = PackReceiveTarget::File(&mut self.file);
         let mut pending = Vec::new();
@@ -893,7 +931,7 @@ mod tests {
             &mut Cursor::new(stream),
             &mut target,
             &mut rec,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .expect("read");
 
@@ -956,7 +994,7 @@ mod tests {
             &mut Cursor::new(stream),
             &mut opt_target,
             &mut opt_rec,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
             &mut opt_pending,
             &mut opt_seen,
             &mut opt_scratch,
@@ -1023,7 +1061,7 @@ mod tests {
             &mut Cursor::new(wire),
             &mut target,
             &mut rec,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .expect("receive");
         assert_eq!(out, pack);
@@ -1047,7 +1085,7 @@ mod tests {
             &mut Cursor::new(wire),
             &mut target,
             &mut rec,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .expect("receive");
         assert_eq!(out.len(), 12);
@@ -1067,7 +1105,7 @@ mod tests {
             &mut Cursor::new(stream),
             &mut target,
             &mut ReceiveRecorder::default(),
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
             &mut pending,
             &mut seen,
             &mut scratch,
@@ -1101,6 +1139,21 @@ mod tests {
         let path = recv.path().to_path_buf();
         assert!(recv.finish().expect("finish").is_none());
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn system_temp_spool_is_private_and_dropped_when_unfinished() {
+        let recv = TempPackReceive::create_in_system_temp().expect("create");
+        let path = recv.path().to_path_buf();
+        assert!(path.starts_with(std::env::temp_dir()));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
+            assert_eq!(mode & 0o077, 0, "spool must not be readable by others");
+        }
+        drop(recv);
+        assert!(!path.exists(), "an unfinished spool is removed");
     }
 
     #[test]
@@ -1151,10 +1204,13 @@ mod tests {
             .read_sideband(
                 &mut Cursor::new(stream),
                 &mut rec,
-                &crate::progress::NeverCancel,
+                &crate::progress::CancelToken::never(),
             )
             .expect_err("remote side-band error");
-        assert!(matches!(err, Error::Message(_)));
+        assert!(
+            matches!(&err, Error::Remote(RemoteError::Fatal { message }) if message == "network interrupted"),
+            "{err:?}"
+        );
         drop(recv);
         assert!(
             !path.exists(),
@@ -1188,6 +1244,9 @@ mod tests {
         let len = std::fs::metadata(&path).expect("meta").len();
         std::fs::remove_file(&path).expect("remove");
         let err = assert_received_pack_durable(&path, len).expect_err("missing pack");
-        assert!(matches!(err, Error::ReceivedPackTempMissing { .. }));
+        assert!(matches!(
+            err,
+            Error::Remote(RemoteError::ReceivedPackTempMissing { .. })
+        ));
     }
 }

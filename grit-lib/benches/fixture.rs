@@ -5,6 +5,7 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used, dead_code)]
 
+use grit_lib::progress::NullProgress;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
@@ -15,16 +16,15 @@ use grit_lib::error::Result;
 use grit_lib::index::write_tree::{write_tree_update_index, WriteTreeFlags};
 use grit_lib::objects::delta_encode::encode_lcp_delta;
 use grit_lib::objects::odb::Odb;
-use grit_lib::objects::pack::{
-    clear_pack_cache, max_verify_pack_delta_depth, read_pack_index, verify_pack_and_collect,
-    PackIndex, PackedType,
-};
+use grit_lib::objects::pack::{clear_pack_cache, read_pack_index, PackIndex};
 use grit_lib::objects::{serialize_commit, CommitData, ObjectId, ObjectKind};
 use grit_lib::porcelain::add::{stage, StageOptions};
-use grit_lib::progress::NullProgress;
 use grit_lib::refs;
 use grit_lib::remote::transfer::{build_pack, PackBuildOptions};
 use grit_lib::repo::{InitOptions, Repository};
+use grit_lib::test_support::objects_pack::{
+    max_verify_pack_delta_depth, verify_pack_and_collect, PackedType,
+};
 use tempfile::TempDir;
 
 const GIT_ENV: &[(&str, &str)] = &[
@@ -64,10 +64,10 @@ fn git_index_pack(dir: &Path, pack_path: &Path) -> Result<()> {
     }
     let out = cmd.output().map_err(grit_lib::error::Error::Io)?;
     if !out.status.success() {
-        return Err(grit_lib::error::Error::Message(format!(
+        return Err(grit_lib::error::Error::Io(std::io::Error::other(format!(
             "git index-pack failed: {}",
             String::from_utf8_lossy(&out.stderr)
-        )));
+        ))));
     }
     Ok(())
 }
@@ -96,10 +96,10 @@ pub fn git_repack_with_window(
     }
     let out = cmd.output().map_err(grit_lib::error::Error::Io)?;
     if !out.status.success() {
-        return Err(grit_lib::error::Error::Message(format!(
+        return Err(grit_lib::error::Error::Io(std::io::Error::other(format!(
             "git repack failed: {}",
             String::from_utf8_lossy(&out.stderr)
-        )));
+        ))));
     }
     Ok(())
 }
@@ -182,9 +182,12 @@ fn grit_record_commit(
     parent: Option<ObjectId>,
     message: &str,
 ) -> Result<ObjectId> {
-    let mut index = repo.index_handle().load()?;
+    let mut index = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())?;
     let tree = write_tree_update_index(repo.odb(), &mut index, "", WriteTreeFlags::silent())?;
-    repo.index_handle().write(&mut index)?;
+    repo.index()
+        .write(&mut index, &grit_lib::index::IndexWriteOptions::default())?;
     let commit_data = CommitData {
         tree,
         parents: parent.into_iter().collect(),
@@ -199,7 +202,7 @@ fn grit_record_commit(
     };
     let bytes = serialize_commit(&commit_data);
     let oid = repo.odb().write(ObjectKind::Commit, &bytes)?;
-    refs::write_ref(repo.git_dir(), "refs/heads/main", &oid)?;
+    grit_test_support::refs::set_ref(&repo, "refs/heads/main", &oid)?;
     Ok(oid)
 }
 
@@ -224,7 +227,7 @@ fn grit_commit_file(
             ..StageOptions::default()
         },
         &mut progress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )?;
     grit_record_commit(repo, parent, message)
 }
@@ -344,11 +347,11 @@ pub fn build_parallel_packed_blob_fixture(count: usize) -> (TempDir, Odb, Vec<Ob
 
 fn build_large_pack_index(objects_dir: &Path, object_count: usize) -> (PackIndex, ObjectId) {
     let tmp = tempfile::tempdir().expect("large pack tempdir");
-    let repo = Repository::init(
+    let (repo, _) = Repository::init(
         tmp.path(),
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
-            .with_ref_storage(grit_lib::RefStorageFormat::Files),
+            .with_ref_storage(grit_lib::refs::ref_storage::RefStorageFormat::Files),
     )
     .expect("init repo");
     let mut parent = None;
@@ -736,12 +739,12 @@ fn pack_only_hit_oid(repo_root: &Path, objects_dir: &Path) -> Result<ObjectId> {
         .output()
         .map_err(grit_lib::error::Error::Io)?;
     if !out.status.success() {
-        return Err(grit_lib::error::Error::Message(
-            "rev-parse HEAD for pack-only hit".into(),
-        ));
+        return Err(grit_lib::error::Error::Io(std::io::Error::other(
+            "rev-parse HEAD for pack-only hit",
+        )));
     }
     let hit = ObjectId::from_hex(std::str::from_utf8(&out.stdout).expect("utf8").trim())
-        .map_err(|_| grit_lib::error::Error::Message("HEAD oid hex".into()))?;
+        .map_err(|_| grit_lib::error::Error::Io(std::io::Error::other("HEAD oid hex")))?;
     if loose_object_path(objects_dir, &hit).is_file() {
         let pack_dir = objects_dir.join("pack");
         for entry in std::fs::read_dir(&pack_dir).map_err(grit_lib::error::Error::Io)? {
@@ -760,9 +763,9 @@ fn pack_only_hit_oid(repo_root: &Path, objects_dir: &Path) -> Result<ObjectId> {
                 }
             }
         }
-        return Err(grit_lib::error::Error::Message(
-            "no pack-only oid after prune-packed".into(),
-        ));
+        return Err(grit_lib::error::Error::Io(std::io::Error::other(
+            "no pack-only oid after prune-packed",
+        )));
     }
     Ok(hit)
 }

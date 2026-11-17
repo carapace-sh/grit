@@ -5,13 +5,12 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 
-use grit_lib::porcelain::commit::create_commit;
-use grit_lib::porcelain::status::{
-    status, BeforeOpportunisticIndexWriteHook, StatusOptions, UntrackedMode,
-};
-use grit_lib::progress::{NeverCancel, NullProgress};
+use grit_lib::porcelain::status::{StatusOptions, UntrackedMode};
+use grit_lib::progress::NullProgress;
+use grit_lib::test_support::status::set_before_opportunistic_index_write_hook;
 
 use crate::support::{assert_git_fsck_strict, git, open_grit_repo};
+use grit_lib::progress::CancelToken;
 
 fn git_diff_cached_names(repo_root: &Path) -> String {
     let root = repo_root.to_str().expect("utf-8 path");
@@ -43,15 +42,21 @@ fn status_skips_stale_opportunistic_write_after_concurrent_commit() {
     let hook = Arc::new(move || {
         let repo = open_grit_repo(&hook_dir);
         let req = grit_test_support::commit_request("race", "A <a@b.c> 1 +0000");
-        create_commit(&repo, &req, &mut NullProgress, &NeverCancel).expect("commit in hook");
+        repo.commits()
+            .create_staged(&req, &mut NullProgress, &CancelToken::never())
+            .expect("commit in hook");
     });
+    set_before_opportunistic_index_write_hook(Some(hook));
 
     let repo = open_grit_repo(dir);
     let mut opts = StatusOptions::default();
     opts.untracked = UntrackedMode::No;
     opts.ahead_behind = false;
-    opts.before_opportunistic_index_write = Some(BeforeOpportunisticIndexWriteHook(hook));
-    status(&repo, &opts, &mut NullProgress, &NeverCancel).expect("status");
+    &repo
+        .status()
+        .run(&opts, &mut NullProgress, &CancelToken::never())
+        .expect("status");
+    set_before_opportunistic_index_write_hook(None);
 
     assert!(
         git_diff_cached_names(dir).is_empty(),
@@ -67,7 +72,7 @@ fn try_write_index_at_skips_when_disk_index_identity_changed() {
     init_repo(dir);
 
     let repo = open_grit_repo(dir);
-    let handle = repo.index_handle();
+    let handle = repo.index();
     let index_path = handle.path().to_path_buf();
     let mut index = grit_lib::index::Index::load(&index_path).expect("load index");
     fs::write(dir.join("file.txt"), "v2\n").expect("modify");

@@ -378,8 +378,8 @@ pub fn shell_git_apply_cached(git: &Path) -> String {
 /// Ensure `large.txt` (50k lines) exists and is committed, then write 500 one-line hunks and bench artifacts.
 pub fn prepare_add_hunks_large(git: &Path) -> Result<()> {
     use grit_lib::config::environment::RepositoryOptions;
-    use grit_lib::diff::hunk_id::{hunk_ids_with_duplicate_peers, DiffSide};
-    use grit_lib::porcelain::hunk_select::{resolve_selection, unstaged_file_diffs, HunkSelection};
+    use grit_lib::diff::{hunk_ids, DiffSide};
+    use grit_lib::porcelain::hunk_select::HunkSelection;
     use grit_lib::repo::Repository;
 
     let repo = active_worktree_repo();
@@ -387,12 +387,11 @@ pub fn prepare_add_hunks_large(git: &Path) -> Result<()> {
     modify_large_file_five_hundred_hunks(&repo)?;
     let grit_repo = Repository::discover(Some(&repo), &RepositoryOptions::default())?;
     let pathspec = vec![LARGE_HUNKS_FILE.to_string()];
-    let snapshots = unstaged_file_diffs(&grit_repo, &pathspec)?;
+    let snapshots = grit_repo.index().unstaged_file_diffs(&pathspec)?;
     let (file, peer) = snapshots
         .first()
         .context("large.txt should appear in unstaged diff")?;
-    let ids =
-        hunk_ids_with_duplicate_peers(DiffSide::Unstaged, LARGE_HUNKS_FILE, &file.hunks, peer);
+    let ids = hunk_ids(DiffSide::Unstaged, LARGE_HUNKS_FILE, &file.hunks, peer);
     let half_len = ids.len() / 2;
     let half_ids: Vec<_> = ids.iter().take(half_len).cloned().collect();
     let id_line = half_ids
@@ -405,17 +404,18 @@ pub fn prepare_add_hunks_large(git: &Path) -> Result<()> {
         id_line.as_bytes(),
     )
     .context("write hunk ids")?;
-    let patches = resolve_selection(
-        &grit_repo,
-        DiffSide::Unstaged,
-        &HunkSelection {
-            ids: half_ids,
-            ranges: Vec::new(),
-        },
-        &pathspec,
-        grit_lib::diff::DiffOptions::default(),
-    )
-    .map_err(|e| anyhow::anyhow!("resolve hunk selection: {e}"))?;
+    let patches = grit_repo
+        .index()
+        .resolve_hunk_selection(
+            DiffSide::Unstaged,
+            &HunkSelection {
+                ids: half_ids,
+                ranges: Vec::new(),
+            },
+            &pathspec,
+            grit_lib::diff::DiffOptions::default(),
+        )
+        .map_err(|e| anyhow::anyhow!("resolve hunk selection: {e}"))?;
     let mut patch_text = String::new();
     for patch in &patches {
         patch_text.push_str(&format_file_patch_for_git(patch));
@@ -522,8 +522,8 @@ fn write_hunk_patch_line(out: &mut String, prefix: char, text: &str) {
 /// Ensure bench artifacts for `grit add --lines` on the first 25k new-side lines of `large.txt`.
 pub fn prepare_add_lines_large(git: &Path) -> Result<()> {
     use grit_lib::config::environment::RepositoryOptions;
-    use grit_lib::diff::hunk_id::DiffSide;
-    use grit_lib::porcelain::hunk_select::{resolve_selection, HunkSelection, LineRange};
+    use grit_lib::diff::DiffSide;
+    use grit_lib::porcelain::hunk_select::{HunkSelection, LineRange};
     use grit_lib::repo::Repository;
 
     let repo = active_worktree_repo();
@@ -531,21 +531,22 @@ pub fn prepare_add_lines_large(git: &Path) -> Result<()> {
     modify_large_file_five_hundred_hunks(&repo)?;
     let grit_repo = Repository::discover(Some(&repo), &RepositoryOptions::default())?;
     let pathspec = vec![LARGE_HUNKS_FILE.to_string()];
-    let patches = resolve_selection(
-        &grit_repo,
-        DiffSide::Unstaged,
-        &HunkSelection {
-            ids: Vec::new(),
-            ranges: vec![LineRange {
-                path: LARGE_HUNKS_FILE.to_string(),
-                start: 1,
-                end: 25_000,
-            }],
-        },
-        &pathspec,
-        grit_lib::diff::DiffOptions::default(),
-    )
-    .map_err(|e| anyhow::anyhow!("resolve line selection: {e}"))?;
+    let patches = grit_repo
+        .index()
+        .resolve_hunk_selection(
+            DiffSide::Unstaged,
+            &HunkSelection {
+                ids: Vec::new(),
+                ranges: vec![LineRange {
+                    path: LARGE_HUNKS_FILE.to_string(),
+                    start: 1,
+                    end: 25_000,
+                }],
+            },
+            &pathspec,
+            grit_lib::diff::DiffOptions::default(),
+        )
+        .map_err(|e| anyhow::anyhow!("resolve line selection: {e}"))?;
     let mut patch_text = String::new();
     for patch in &patches {
         patch_text.push_str(&format_file_patch_for_git(patch));

@@ -6,6 +6,9 @@
 //! and installs it as thread-local context during [`Odb::read`](crate::odb::Odb::read).
 //! After repack or index-pack, call [`Odb::invalidate_packs`](crate::odb::Odb::invalidate_packs)
 //! on any handle for that repository so cached listings do not outlive removed pack files.
+//!
+//! When the last [`Arc`] to a [`PackStore`] is dropped, thread-local pack and index mappings
+//! for that store on the dropping thread are released so mmap-backed bytes do not accumulate.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -13,37 +16,16 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
-/// Counters and hooks for pack-store integration tests.
-pub mod test_hooks {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) use crate::test_support::pack_store::{
+    record_implicit_store_created, record_legacy_store_created,
+};
 
-    static LEGACY_STORES_CREATED: AtomicUsize = AtomicUsize::new(0);
-    static IMPLICIT_STORES_CREATED: AtomicUsize = AtomicUsize::new(0);
+#[cfg(not(any(test, feature = "test-support")))]
+pub(crate) fn record_legacy_store_created() {}
 
-    /// `reset` function.
-    pub fn reset() {
-        LEGACY_STORES_CREATED.store(0, Ordering::Release);
-        IMPLICIT_STORES_CREATED.store(0, Ordering::Release);
-    }
-
-    /// `legacy_stores_created` function.
-    pub fn legacy_stores_created() -> usize {
-        LEGACY_STORES_CREATED.load(Ordering::Acquire)
-    }
-
-    /// `implicit_stores_created` function.
-    pub fn implicit_stores_created() -> usize {
-        IMPLICIT_STORES_CREATED.load(Ordering::Acquire)
-    }
-
-    pub(crate) fn record_legacy_store_created() {
-        LEGACY_STORES_CREATED.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub(crate) fn record_implicit_store_created() {
-        IMPLICIT_STORES_CREATED.fetch_add(1, Ordering::Relaxed);
-    }
-}
+#[cfg(not(any(test, feature = "test-support")))]
+pub(crate) fn record_implicit_store_created() {}
 
 /// Per-`objects/` cache of pack indexes, bytes, MIDX views, and delta-base LRU state.
 ///
@@ -55,6 +37,8 @@ pub struct PackStore {
     /// Unique for the life of the process, so thread-local pack caches can tell stores apart:
     /// a dropped store's address can be reused by a later store for the same directory.
     id: u64,
+    /// Dropped with the last [`Arc`] to this store so thread-local pack caches release mmap state.
+    lifetime: Arc<()>,
     pub(crate) sparse_read_files: crate::pack_map::SparseReadFiles,
     bounded_reads: bool,
     /// Bumped on every invalidation so other threads drop trusted thread-local pack caches.
@@ -74,13 +58,42 @@ const _: () = {
     let _ = assert_send_sync::<PackStore>;
 };
 
+/// Holds the active [`PackStore`] for this thread; suppresses TLS release while the slot drops.
+struct CurrentPackStore(Option<Arc<PackStore>>);
+
+impl Drop for CurrentPackStore {
+    fn drop(&mut self) {
+        crate::pack::pack_cache::set_skip_store_tls_release(true);
+        self.0.take();
+    }
+}
+
+struct LegacyStoresByDir(HashMap<PathBuf, Arc<PackStore>>);
+
+impl Drop for LegacyStoresByDir {
+    fn drop(&mut self) {
+        crate::pack::pack_cache::set_skip_store_tls_release(true);
+        self.0.clear();
+    }
+}
+
+struct ImplicitPackStore(Option<Arc<PackStore>>);
+
+impl Drop for ImplicitPackStore {
+    fn drop(&mut self) {
+        crate::pack::pack_cache::set_skip_store_tls_release(true);
+        self.0.take();
+    }
+}
+
 // hygiene: scoped read contexts and legacy standalone caches must not cross threads
 thread_local! {
-    static CURRENT: RefCell<Option<Arc<PackStore>>> = const { RefCell::new(None) };
+    static CURRENT: RefCell<CurrentPackStore> = const { RefCell::new(CurrentPackStore(None)) };
     static ACTIVE_OBJECTS_DIR: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
     /// Standalone pack reads (no [`crate::odb::Odb`]) reuse one store per `objects/` on this thread.
-    static LEGACY_BY_DIR: RefCell<HashMap<PathBuf, Arc<PackStore>>> = RefCell::new(HashMap::new());
-    static IMPLICIT: RefCell<Option<Arc<PackStore>>> = const { RefCell::new(None) };
+    static LEGACY_BY_DIR: RefCell<LegacyStoresByDir> =
+        RefCell::new(LegacyStoresByDir(HashMap::new()));
+    static IMPLICIT: RefCell<ImplicitPackStore> = const { RefCell::new(ImplicitPackStore(None)) };
 }
 
 impl PackStore {
@@ -91,6 +104,7 @@ impl PackStore {
         Self {
             objects_dir,
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            lifetime: Arc::new(()),
             sparse_read_files: crate::pack_map::SparseReadFiles::default(),
             bounded_reads: false,
             cache_epoch: AtomicU64::new(0),
@@ -141,6 +155,7 @@ impl PackStore {
         }
         LEGACY_BY_DIR.with(|map| {
             map.borrow()
+                .0
                 .get(objects_dir)
                 .and_then(|store| store.repo_caches())
         })
@@ -157,6 +172,10 @@ impl PackStore {
     /// Process-unique id of this store (never 0).
     pub(crate) fn id(&self) -> u64 {
         self.id
+    }
+
+    pub(crate) fn lifetime_weak(&self) -> std::sync::Weak<()> {
+        Arc::downgrade(&self.lifetime)
     }
 
     /// Generation counter incremented when pack caches are invalidated.
@@ -201,19 +220,19 @@ impl PackStore {
 
     /// Resolve the [`PackStore`] used for pack-cache reads on this thread.
     pub(crate) fn active_for_reads() -> Arc<Self> {
-        if let Some(store) = CURRENT.with(|c| c.borrow().clone()) {
+        if let Some(store) = CURRENT.with(|c| c.borrow().0.clone()) {
             return store;
         }
         if let Some(dir) = ACTIVE_OBJECTS_DIR.with(|d| d.borrow().clone()) {
             return Self::legacy_for_objects_dir(&dir);
         }
         IMPLICIT.with(|i| {
-            if let Some(s) = i.borrow().as_ref() {
+            if let Some(s) = i.borrow().0.as_ref() {
                 return Arc::clone(s);
             }
-            test_hooks::record_implicit_store_created();
+            record_implicit_store_created();
             let s = Arc::new(Self::new(PathBuf::from("__grit_implicit_pack_store")));
-            *i.borrow_mut() = Some(Arc::clone(&s));
+            i.borrow_mut().0 = Some(Arc::clone(&s));
             s
         })
     }
@@ -222,12 +241,12 @@ impl PackStore {
     pub(crate) fn legacy_for_objects_dir(objects_dir: &Path) -> Arc<Self> {
         LEGACY_BY_DIR.with(|map| {
             let key = objects_dir.to_path_buf();
-            if let Some(s) = map.borrow().get(&key) {
+            if let Some(s) = map.borrow().0.get(&key) {
                 return Arc::clone(s);
             }
-            test_hooks::record_legacy_store_created();
+            record_legacy_store_created();
             let store = Arc::new(Self::new(key.clone()));
-            map.borrow_mut().insert(key, Arc::clone(&store));
+            map.borrow_mut().0.insert(key, Arc::clone(&store));
             store
         })
     }
@@ -242,12 +261,12 @@ impl PackStore {
         match objects_dir {
             Some(dir) => Self::legacy_for_objects_dir(dir),
             None => IMPLICIT.with(|i| {
-                if let Some(s) = i.borrow().as_ref() {
+                if let Some(s) = i.borrow().0.as_ref() {
                     return Arc::clone(s);
                 }
-                test_hooks::record_implicit_store_created();
+                record_implicit_store_created();
                 let s = Arc::new(Self::new(PathBuf::from("__grit_nonstandard_pack_cache")));
-                *i.borrow_mut() = Some(Arc::clone(&s));
+                i.borrow_mut().0 = Some(Arc::clone(&s));
                 s
             }),
         }
@@ -262,7 +281,7 @@ impl PackStore {
     /// Whether this thread already has an active pack-read store context.
     #[must_use]
     pub fn has_context() -> bool {
-        CURRENT.with(|c| c.borrow().is_some())
+        CURRENT.with(|c| c.borrow().0.is_some())
     }
 
     /// Whether the active read context is scoped to `objects_dir`.
@@ -280,6 +299,7 @@ impl PackStore {
         if CURRENT.with(|current| {
             current
                 .borrow()
+                .0
                 .as_ref()
                 .is_some_and(|active| Arc::ptr_eq(active, &store))
         }) {
@@ -295,6 +315,7 @@ impl PackStore {
         self.delta_bases.clear();
         self.sparse_read_files.clear();
         let epoch = self.bump_cache_epoch();
+        crate::pack::pack_cache::drop_store_tls_snapshot(self.id());
         crate::pack::pack_cache::clear_thread_local_after_invalidation(epoch);
     }
 
@@ -338,7 +359,7 @@ impl PackStore {
     pub(crate) fn with_current_or_implicit_midx<R>(
         f: impl FnOnce(&mut crate::midx::midx_cache::State) -> R,
     ) -> R {
-        if let Some(store) = CURRENT.with(|c| c.borrow().clone()) {
+        if let Some(store) = CURRENT.with(|c| c.borrow().0.clone()) {
             return store.with_midx(f);
         }
         if let Some(dir) = ACTIVE_OBJECTS_DIR.with(|d| d.borrow().clone()) {
@@ -350,21 +371,27 @@ impl PackStore {
     /// Clear legacy thread-local stores (tests/benches calling [`crate::pack::clear_pack_cache`]).
     pub fn invalidate_all_legacy() {
         LEGACY_BY_DIR.with(|map| {
-            for store in map.borrow().values() {
+            for store in map.borrow().0.values() {
                 store.invalidate_all();
             }
-            map.borrow_mut().clear();
+            map.borrow_mut().0.clear();
         });
-        IMPLICIT.with(|i| *i.borrow_mut() = None);
+        IMPLICIT.with(|i| i.borrow_mut().0 = None);
     }
 
     /// Drop cached pack state for legacy standalone reads of `objects_dir`.
     pub(crate) fn invalidate_legacy_for_objects_dir(objects_dir: &Path) {
         LEGACY_BY_DIR.with(|map| {
-            if let Some(store) = map.borrow().get(objects_dir) {
+            if let Some(store) = map.borrow().0.get(objects_dir) {
                 store.invalidate_all();
             }
         });
+    }
+}
+
+impl Drop for PackStore {
+    fn drop(&mut self) {
+        crate::pack::pack_cache::release_store_thread_local(self.id);
     }
 }
 
@@ -376,7 +403,7 @@ pub(crate) struct PackReadContextGuard {
 
 impl PackReadContextGuard {
     pub(crate) fn install(store: Arc<PackStore>) -> Self {
-        let prev_store = CURRENT.with(|c| c.borrow_mut().replace(Arc::clone(&store)));
+        let prev_store = CURRENT.with(|c| c.borrow_mut().0.replace(Arc::clone(&store)));
         let prev_dir =
             ACTIVE_OBJECTS_DIR.with(|d| d.borrow_mut().replace(store.objects_dir().to_path_buf()));
         crate::pack::pack_cache::warm_thread_local_from_store(&store);
@@ -389,13 +416,22 @@ impl PackReadContextGuard {
 
 impl Drop for PackReadContextGuard {
     fn drop(&mut self) {
-        if CURRENT.with(|c| c.borrow().as_ref().is_some_and(|s| s.bounded_reads())) {
+        crate::pack::pack_cache::clear_alternate_pack_read_store();
+        let bounded = CURRENT.with(|c| c.borrow().0.as_ref().is_some_and(|s| s.bounded_reads()));
+        if bounded {
             // Operation-local pack bytes/indexes must not outlive their cache through
             // thread-local fast paths, including when the allocator reuses a store address.
             crate::pack::pack_cache::clear_thread_local_after_invalidation(0);
+            crate::pack::clear_pack_read_info_cache();
         }
-        crate::pack::clear_pack_read_info_cache();
         ACTIVE_OBJECTS_DIR.with(|d| *d.borrow_mut() = self.prev_dir.take());
-        CURRENT.with(|c| *c.borrow_mut() = self.prev_store.take());
+        let prev_store = self.prev_store.take();
+        CURRENT.with(|c| c.borrow_mut().0 = prev_store.clone());
+        if bounded {
+            return;
+        }
+        if let Some(store) = prev_store {
+            crate::pack::pack_cache::switch_tls_for_store(&store);
+        }
     }
 }

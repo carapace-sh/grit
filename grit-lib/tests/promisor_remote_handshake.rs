@@ -8,15 +8,14 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-use grit_lib::config::environment::RepositoryOptions;
+use grit_lib::config::environment::{Environment, RepositoryOptions};
 use grit_lib::config::ConfigSet;
 use grit_lib::objects::promisor_remote::{PromisorField, PromisorRejection};
 use grit_lib::objects::{ObjectId, ObjectKind};
-use grit_lib::progress::NeverCancel;
+use grit_lib::progress::{CancelToken, NullProgress};
 use grit_lib::refs::ref_storage::RefStorageFormat;
-use grit_lib::remote::fetch::{fetch_remote, NoProgress};
 use grit_lib::remote::partial_clone::ObjectFilterSpec;
-use grit_lib::remote::serve::{upload_pack, ProtocolVersion, ServeOptions};
+use grit_lib::remote::serve::{ProtocolVersion, ServeOptions, UploadPack};
 use grit_lib::remote::transfer::{FetchOptions, FetchOutcome};
 use grit_lib::remote::transport::{read_advertisement, Advertisement, Connection};
 use grit_lib::repo::{InitOptions, Repository};
@@ -60,7 +59,9 @@ impl InProcessConn {
             };
             let mut input = to_server_r;
             let mut output = to_client_w;
-            upload_pack(&repo, &mut input, &mut output, &mut opts).unwrap();
+            UploadPack::new(&repo, &mut opts)
+                .run(&mut input, &mut output)
+                .unwrap();
             opts
         });
         let mut reader = BufReader::new(to_client_r);
@@ -126,6 +127,7 @@ fn init(dir: &Path, bare: bool) -> Repository {
             .with_ref_storage(RefStorageFormat::Files),
     )
     .unwrap()
+    .0
 }
 
 fn append_config(git_dir: &Path, text: &str) {
@@ -223,8 +225,21 @@ fn fetch_from(
     opts.remote_name = Some(remote.to_owned());
     opts.filter = filter;
     opts.auto_filter = auto_filter;
-    let outcome =
-        fetch_remote(client, &mut conn, &mut opts, &mut NoProgress, &NeverCancel).expect("fetch");
+    let outcome = grit_lib::repo::Repository::open(
+        client,
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&mut opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Connection(&mut conn),
+        &mut opts,
+        &mut NullProgress,
+        &CancelToken::never(),
+    )
+    .expect("fetch");
     let served = conn.finish();
     let sent = String::from_utf8_lossy(&sent.lock().unwrap()).into_owned();
     (outcome, sent, served)
@@ -398,14 +413,22 @@ fn store_fields_updates_the_known_lop() {
         stored,
         [PromisorField::PartialCloneFilter, PromisorField::Token]
     );
-    let cfg = ConfigSet::load_repo_local_only(client.path()).unwrap();
+    let cfg = ConfigSet::load(
+        &Environment::empty(),
+        Some(client.path()),
+        &crate::config::LoadConfigOptions::repo_local_only(client.path()),
+    )
+    .unwrap();
     assert_eq!(
-        cfg.get("remote.lop.partialclonefilter").as_deref(),
+        cfg.get("remote.lop.partialclonefilter").unwrap().as_deref(),
         Some("blob:limit=5k")
     );
-    assert_eq!(cfg.get("remote.lop.token").as_deref(), Some("s3cret-token"));
     assert_eq!(
-        cfg.get("remote.lop.url").as_deref(),
+        cfg.get("remote.lop.token").unwrap().as_deref(),
+        Some("s3cret-token")
+    );
+    assert_eq!(
+        cfg.get("remote.lop.url").unwrap().as_deref(),
         Some("file:///srv/lop")
     );
     // The reply names the remote, never its token.
@@ -425,15 +448,25 @@ fn object_want_fetch_sends_no_reply() {
     assert!(!has_object(client.path(), &server.big));
 
     let (mut conn, sent) = InProcessConn::connect(&server.git_dir);
-    let mut opts = FetchOptions::new().promisor_object_wants(vec![server.big]);
+    let mut opts = grit_lib::test_support::knobs::fetch_options_promisor_object_wants(
+        FetchOptions::new(),
+        vec![server.big],
+    );
     opts.remote_name = Some("origin".to_owned());
     opts.filter = Some(ObjectFilterSpec::BlobNone);
-    let outcome = fetch_remote(
+    let outcome = grit_lib::repo::Repository::open(
         client.path(),
-        &mut conn,
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&mut opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Connection(&mut conn),
         &mut opts,
-        &mut NoProgress,
-        &NeverCancel,
+        &mut NullProgress,
+        &CancelToken::never(),
     )
     .expect("object fetch");
     conn.finish();

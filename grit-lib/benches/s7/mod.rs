@@ -5,23 +5,16 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used, dead_code)]
 
-use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
 use std::sync::OnceLock;
 
-use grit_lib::diff::bloom::BloomFilterSettings;
 use grit_lib::index::write_tree::{write_tree_from_index, write_tree_update_index, WriteTreeFlags};
 use grit_lib::index::{Index, IndexEntry, MODE_REGULAR};
-use grit_lib::objects::commit_graph::{
-    build_commit_graph_bytes, collect_reachable_commit_oids, load_commit_graph_commit_info,
-    CommitGraphCommitInfo,
-};
 use grit_lib::objects::odb::Odb;
 use grit_lib::objects::{
     serialize_commit, serialize_tag, CommitData, ObjectId, ObjectKind, TagData,
 };
-use grit_lib::refs::write_ref;
 use grit_lib::repo::{InitOptions, Repository};
 use tempfile::TempDir;
 
@@ -68,39 +61,8 @@ fn git_commit_graph_write(repo_root: &Path) -> std::result::Result<(), String> {
     ))
 }
 
-fn write_grit_commit_graph(objects_dir: &Path, odb: &Odb) -> std::result::Result<(), String> {
-    let git_dir = objects_dir
-        .parent()
-        .expect("objects dir has parent git_dir");
-    let commits = collect_reachable_commit_oids(git_dir, odb).map_err(|e| e.to_string())?;
-    let mut sorted: Vec<ObjectId> = commits.into_iter().collect();
-    sorted.sort();
-    let mut infos: HashMap<ObjectId, CommitGraphCommitInfo> = HashMap::new();
-    for oid in &sorted {
-        infos.insert(
-            *oid,
-            load_commit_graph_commit_info(odb, *oid).map_err(|e| e.to_string())?,
-        );
-    }
-    let bloom = BloomFilterSettings::default();
-    let (bytes, _stats) = build_commit_graph_bytes(
-        &sorted,
-        &infos,
-        odb,
-        true,
-        &bloom,
-        None,
-        &[],
-        None,
-        &HashMap::new(),
-        &HashMap::new(),
-        true,
-    )
-    .map_err(|e| e.to_string())?;
-    let info_dir = objects_dir.join("info");
-    std::fs::create_dir_all(&info_dir).map_err(|e| e.to_string())?;
-    std::fs::write(info_dir.join("commit-graph"), bytes).map_err(|e| e.to_string())?;
-    Ok(())
+fn write_grit_commit_graph(_objects_dir: &Path, odb: &Odb) -> std::result::Result<(), String> {
+    odb.write_commit_graph().map_err(|e| e.to_string())
 }
 
 fn index_entry(path: &[u8], oid: ObjectId, size: usize, mode: u32) -> IndexEntry {
@@ -124,11 +86,11 @@ fn index_entry(path: &[u8], oid: ObjectId, size: usize, mode: u32) -> IndexEntry
 }
 
 fn build_history_repo(dir: &Path, commit_count: usize) -> Repository {
-    let repo = Repository::init(
+    let (repo, _) = Repository::init(
         dir,
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
-            .with_ref_storage(grit_lib::RefStorageFormat::Files),
+            .with_ref_storage(grit_lib::refs::ref_storage::RefStorageFormat::Files),
     )
     .expect("init history repo");
     let mut index = Index::new();
@@ -183,13 +145,13 @@ fn build_history_repo(dir: &Path, commit_count: usize) -> Repository {
         parent = Some(oid);
     }
     let head = *commits.last().expect("commits");
-    write_ref(repo.git_dir(), "refs/heads/main", &head).expect("write main");
+    grit_test_support::refs::set_ref(&repo, "refs/heads/main", &head).expect("write main");
 
     let branch_refs = 200usize.min(commits.len());
     let step = commits.len() / branch_refs.max(1);
     for i in 0..branch_refs {
         let oid = commits[i * step];
-        write_ref(repo.git_dir(), &format!("refs/heads/bench/b{i:05}"), &oid)
+        grit_test_support::refs::set_ref(&repo, &format!("refs/heads/bench/b{i:05}"), &oid)
             .expect("write branch ref");
     }
 
@@ -201,12 +163,14 @@ fn build_history_repo(dir: &Path, commit_count: usize) -> Repository {
         tagger: Some(bench_ident(1_700_050_000)),
         extra_headers: Vec::new(),
         message: "history bench tag\n".to_owned(),
+        raw_message: None,
     };
     let tag_oid = repo
         .odb()
         .write(ObjectKind::Tag, &serialize_tag(&tag))
         .expect("write tag");
-    write_ref(repo.git_dir(), "refs/tags/bench-tag", &tag_oid).expect("write tag ref");
+    grit_test_support::refs::set_ref(&repo, "refs/tags/bench-tag", &tag_oid)
+        .expect("write tag ref");
 
     repo
 }
@@ -350,8 +314,10 @@ impl HistoryBenchFixtures {
         let commit_count = history_commit_count();
         let root = tempfile::tempdir().expect("history tempdir");
         let repo = build_history_repo(root.path(), commit_count);
-        let head =
-            grit_lib::refs::resolve_ref(repo.git_dir(), "refs/heads/main").expect("read head");
+        let head = repo
+            .references()
+            .resolve("refs/heads/main")
+            .expect("read head");
 
         if git_commit_graph_write(root.path()).is_err() {
             write_grit_commit_graph(repo.odb().objects_dir(), repo.odb())

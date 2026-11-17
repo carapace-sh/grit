@@ -9,7 +9,6 @@ use crate::parallel::{
     ParallelOptions,
 };
 
-pub use crate::parallel::index_parallelism_from_config;
 pub use crate::parallel::{ParallelHashError, Parallelism};
 
 use super::hash_object;
@@ -48,7 +47,7 @@ fn hash_parallel_options(threads: NonZeroUsize) -> ParallelOptions {
 ///
 /// # Errors
 ///
-/// Returns [`ParallelHashError::Task`] with [`Error::HashCollision`] when sha1dc
+/// Returns [`ParallelHashError::Task`] with [`crate::error::ObjectError::HashCollision`] when sha1dc
 /// detects a chosen-prefix collision in any item.
 pub fn hash_objects_parallel(
     algo: HashAlgo,
@@ -97,7 +96,7 @@ where
 }
 
 /// Like [`try_par_hash_with`], but ignores batch thresholds.
-pub fn try_par_hash_with_force<T, R, E, F>(
+pub fn try_par_hash_forced<T, R, E, F>(
     items: &[T],
     threads: NonZeroUsize,
     f: F,

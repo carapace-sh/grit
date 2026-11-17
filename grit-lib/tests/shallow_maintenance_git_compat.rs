@@ -5,6 +5,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use grit_lib::progress::NullProgress;
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::process::Command;
@@ -12,14 +13,12 @@ use std::time::{Duration, SystemTime};
 
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::maintenance::repository_fsck::{self as fsck, FsckIssue, FsckOptions};
-use grit_lib::maintenance::{
-    gc, prune_loose_objects, repack_all, GcOptions, PruneOptions, RepackOptions,
-};
-use grit_lib::objects::pack::{clear_pack_cache, test_pack_cache_guard};
+use grit_lib::maintenance::{GcOptions, PruneOptions, RepackOptions};
 use grit_lib::objects::{ObjectId, ObjectKind};
-use grit_lib::progress::{NeverCancel, NullProgress};
 use grit_lib::refs::gc::prune_loose_unreachable;
 use grit_lib::repo::Repository;
+use grit_lib::test_support::objects_pack::clear_pack_cache;
+use grit_lib::test_support::pack::pack_cache_guard;
 use tempfile::TempDir;
 
 fn git_output(dir: &Path, args: &[&str]) -> std::process::Output {
@@ -211,12 +210,18 @@ fn parents_of(work: &Path, commit: ObjectId) -> Vec<String> {
 }
 
 fn grit_fsck(repo: &Repository, opts: &FsckOptions) -> fsck::FsckReport {
-    fsck::fsck(repo, opts, &mut NullProgress, &NeverCancel).expect("grit fsck")
+    repo.maintenance()
+        .fsck(
+            opts,
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("grit fsck")
 }
 
 /// Repack packs the history down to the boundary and nothing below it.
 fn assert_repack_stops_at_boundary(depth: usize) {
-    let _pack_guard = test_pack_cache_guard();
+    let _pack_guard = pack_cache_guard();
     let tmp = TempDir::new().expect("tempdir");
     let src = source_repo(tmp.path(), 5);
     let work = shallow_clone(tmp.path(), &src, "clone", depth, false);
@@ -226,7 +231,14 @@ fn assert_repack_stops_at_boundary(depth: usize) {
     assert_eq!(parents.len(), 1, "boundary commit records its parent");
 
     let repo = open(&work);
-    let stats = repack_all(&repo, &RepackOptions::default()).expect("repack in shallow clone");
+    let stats = repo
+        .maintenance()
+        .repack_all(
+            &RepackOptions::default(),
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("repack in shallow clone");
     assert!(stats.objects_packed.is_some(), "{stats:?}");
     clear_pack_cache();
 
@@ -256,7 +268,7 @@ fn repack_in_depth_two_clone_packs_down_to_the_boundary() {
 
 #[test]
 fn repack_dry_run_counts_only_objects_above_the_boundary() {
-    let _pack_guard = test_pack_cache_guard();
+    let _pack_guard = pack_cache_guard();
     let tmp = TempDir::new().expect("tempdir");
     let src = source_repo(tmp.path(), 4);
     let work = shallow_clone(tmp.path(), &src, "clone", 2, false);
@@ -265,7 +277,14 @@ fn repack_dry_run_counts_only_objects_above_the_boundary() {
     let repo = open(&work);
     let mut opts = RepackOptions::default();
     opts.dry_run = true;
-    let stats = repack_all(&repo, &opts).expect("dry-run repack");
+    let stats = repo
+        .maintenance()
+        .repack_all(
+            &opts,
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("dry-run repack");
     assert_eq!(
         stats.objects_packed,
         Some(git_reachable_objects(&work).len())
@@ -274,7 +293,7 @@ fn repack_dry_run_counts_only_objects_above_the_boundary() {
 
 #[test]
 fn gc_packs_loose_shallow_clone_and_git_fsck_is_clean() {
-    let _pack_guard = test_pack_cache_guard();
+    let _pack_guard = pack_cache_guard();
     let tmp = TempDir::new().expect("tempdir");
     let src = source_repo(tmp.path(), 6);
     let work = shallow_clone(tmp.path(), &src, "clone", 2, false);
@@ -283,7 +302,13 @@ fn gc_packs_loose_shallow_clone_and_git_fsck_is_clean() {
     assert_eq!(loose_object_count(&work), reachable.len());
 
     let repo = open(&work);
-    let stats = gc(&repo, &GcOptions::with_reflog_policy(1_700_000_000, false))
+    let stats = repo
+        .maintenance()
+        .gc(
+            &GcOptions::with_reflog_policy(1_700_000_000, false),
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
         .expect("gc in shallow clone");
     assert!(stats.repack.pack_path.is_some(), "{stats:?}");
     clear_pack_cache();
@@ -295,14 +320,19 @@ fn gc_packs_loose_shallow_clone_and_git_fsck_is_clean() {
 
 #[test]
 fn gc_in_bare_shallow_clone_writes_bitmap_git_accepts() {
-    let _pack_guard = test_pack_cache_guard();
+    let _pack_guard = pack_cache_guard();
     let tmp = TempDir::new().expect("tempdir");
     let src = source_repo(tmp.path(), 5);
     let bare = shallow_clone(tmp.path(), &src, "clone.git", 2, true);
     explode_packs(&bare);
 
     let repo = open(&bare);
-    gc(&repo, &GcOptions::with_reflog_policy(1_700_000_000, false))
+    repo.maintenance()
+        .gc(
+            &GcOptions::with_reflog_policy(1_700_000_000, false),
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
         .expect("gc in bare shallow clone");
     clear_pack_cache();
 
@@ -326,7 +356,7 @@ fn gc_in_bare_shallow_clone_writes_bitmap_git_accepts() {
 
 #[test]
 fn prune_keeps_everything_reachable_down_to_the_boundary() {
-    let _pack_guard = test_pack_cache_guard();
+    let _pack_guard = pack_cache_guard();
     let tmp = TempDir::new().expect("tempdir");
     let src = source_repo(tmp.path(), 5);
     let work = shallow_clone(tmp.path(), &src, "clone", 2, false);
@@ -337,7 +367,10 @@ fn prune_keeps_everything_reachable_down_to_the_boundary() {
     let future = SystemTime::now() + Duration::from_secs(3600);
     let mut opts = PruneOptions::default();
     opts.older_than = Some(future);
-    let stats = prune_loose_objects(&repo, &opts).expect("prune in shallow clone");
+    let stats = repo
+        .maintenance()
+        .prune_loose_objects(&opts)
+        .expect("prune in shallow clone");
     assert_eq!(stats.pruned, 0, "{stats:?}");
     assert_eq!(loose_object_count(&work), loose_before);
 
@@ -351,7 +384,7 @@ fn prune_keeps_everything_reachable_down_to_the_boundary() {
 
 #[test]
 fn prune_still_removes_unreachable_loose_objects_in_shallow_clone() {
-    let _pack_guard = test_pack_cache_guard();
+    let _pack_guard = pack_cache_guard();
     let tmp = TempDir::new().expect("tempdir");
     let src = source_repo(tmp.path(), 3);
     let work = shallow_clone(tmp.path(), &src, "clone", 1, false);
@@ -370,7 +403,7 @@ fn prune_still_removes_unreachable_loose_objects_in_shallow_clone() {
 
 #[test]
 fn fsck_reports_no_issues_in_packed_and_loose_shallow_clones() {
-    let _pack_guard = test_pack_cache_guard();
+    let _pack_guard = pack_cache_guard();
     let tmp = TempDir::new().expect("tempdir");
     let src = source_repo(tmp.path(), 5);
     for depth in [1, 2] {
@@ -400,7 +433,7 @@ fn fsck_reports_no_issues_in_packed_and_loose_shallow_clones() {
 
 #[test]
 fn fsck_still_reports_a_missing_blob_inside_shallow_history() {
-    let _pack_guard = test_pack_cache_guard();
+    let _pack_guard = pack_cache_guard();
     let tmp = TempDir::new().expect("tempdir");
     let src = source_repo(tmp.path(), 4);
     let work = shallow_clone(tmp.path(), &src, "clone", 2, false);
@@ -432,7 +465,7 @@ fn fsck_still_reports_a_missing_blob_inside_shallow_history() {
 
 #[test]
 fn fsck_treats_history_below_boundary_as_unreachable_like_git() {
-    let _pack_guard = test_pack_cache_guard();
+    let _pack_guard = pack_cache_guard();
     let tmp = TempDir::new().expect("tempdir");
     let src = source_repo(tmp.path(), 4);
     let work = tmp.path().join("full");
@@ -505,7 +538,7 @@ fn linked_worktree(root: &Path, main: &Path) -> std::path::PathBuf {
 
 #[test]
 fn fsck_in_linked_worktree_of_shallow_clone_reports_no_issues() {
-    let _pack_guard = test_pack_cache_guard();
+    let _pack_guard = pack_cache_guard();
     let tmp = TempDir::new().expect("tempdir");
     let src = source_repo(tmp.path(), 4);
     let main = shallow_clone(tmp.path(), &src, "clone", 2, false);
@@ -526,14 +559,21 @@ fn fsck_in_linked_worktree_of_shallow_clone_reports_no_issues() {
 
 #[test]
 fn repack_gc_and_prune_in_linked_worktree_of_shallow_clone() {
-    let _pack_guard = test_pack_cache_guard();
+    let _pack_guard = pack_cache_guard();
     let tmp = TempDir::new().expect("tempdir");
     let src = source_repo(tmp.path(), 5);
     let main = shallow_clone(tmp.path(), &src, "clone", 2, false);
     let linked = linked_worktree(tmp.path(), &main);
     let repo = open(&linked);
 
-    let stats = repack_all(&repo, &RepackOptions::default()).expect("repack in linked worktree");
+    let stats = repo
+        .maintenance()
+        .repack_all(
+            &RepackOptions::default(),
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("repack in linked worktree");
     assert!(stats.objects_packed.is_some(), "{stats:?}");
     clear_pack_cache();
     assert_eq!(packed_objects(&main), git_reachable_objects(&main));
@@ -547,11 +587,20 @@ fn repack_gc_and_prune_in_linked_worktree_of_shallow_clone() {
     assert_eq!(pruned.pruned, 0, "{pruned:?}");
     let mut opts = PruneOptions::default();
     opts.older_than = Some(SystemTime::now() + Duration::from_secs(3600));
-    let pruned = prune_loose_objects(&repo, &opts).expect("prune in linked worktree");
+    let pruned = repo
+        .maintenance()
+        .prune_loose_objects(&opts)
+        .expect("prune in linked worktree");
     assert_eq!(pruned.pruned, 0, "{pruned:?}");
     assert_eq!(loose_object_count(&main), loose_before);
 
-    gc(&repo, &GcOptions::with_reflog_policy(1_700_000_000, false)).expect("gc in linked worktree");
+    repo.maintenance()
+        .gc(
+            &GcOptions::with_reflog_policy(1_700_000_000, false),
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("gc in linked worktree");
     clear_pack_cache();
     assert_eq!(packed_objects(&main), git_reachable_objects(&main));
     assert_eq!(loose_object_count(&main), 0);
@@ -560,7 +609,7 @@ fn repack_gc_and_prune_in_linked_worktree_of_shallow_clone() {
 
 #[test]
 fn repack_with_bitmap_in_linked_worktree_of_shallow_clone() {
-    let _pack_guard = test_pack_cache_guard();
+    let _pack_guard = pack_cache_guard();
     let tmp = TempDir::new().expect("tempdir");
     let src = source_repo(tmp.path(), 5);
     let main = shallow_clone(tmp.path(), &src, "clone", 2, false);
@@ -570,7 +619,13 @@ fn repack_with_bitmap_in_linked_worktree_of_shallow_clone() {
     let repo = open(&linked);
     let mut opts = RepackOptions::default();
     opts.write_bitmap = true;
-    repack_all(&repo, &opts).expect("bitmap repack in linked worktree");
+    repo.maintenance()
+        .repack_all(
+            &opts,
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("bitmap repack in linked worktree");
     clear_pack_cache();
     git(&linked, &["rev-list", "--test-bitmap", "HEAD"]);
     assert_git_fsck_clean(&linked);

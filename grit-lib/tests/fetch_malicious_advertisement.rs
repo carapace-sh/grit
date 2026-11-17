@@ -7,9 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use grit_lib::objects::ObjectId;
-use grit_lib::progress::NeverCancel;
-use grit_lib::refs::resolve_ref;
-use grit_lib::remote::fetch::{fetch_remote, NoProgress};
+use grit_lib::progress::CancelToken;
 use grit_lib::remote::pkt_line;
 use grit_lib::remote::transfer::{FetchOptions, TagMode};
 use grit_lib::remote::transport::{read_advertisement, Connection};
@@ -121,7 +119,10 @@ fn assert_config_unchanged(git_dir: &Path, before: &[u8]) {
 
 fn assert_no_tracking_ref_for_traversal(git_dir: &Path) {
     assert!(
-        resolve_ref(git_dir, "refs/remotes/origin/../../../config").is_err(),
+        grit_test_support::refs::at(git_dir)
+            .references()
+            .resolve("refs/remotes/origin/../../../config")
+            .is_err(),
         "must not create a tracking ref for traversal-shaped names"
     );
 }
@@ -137,19 +138,24 @@ fn fetch_v0_malicious_advertisement_preserves_config() {
         .with_caps(&["multi_ack_detailed", "side-band-64k", "ofs-delta"])
         .with_version(0);
 
-    let mut opts = FetchOptions {
-        refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()],
-        tags: TagMode::None,
-        ..Default::default()
-    };
+    let mut opts = FetchOptions::new();
+    opts.refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()];
+    opts.tags = TagMode::None;
 
     let mut conn = conn;
-    fetch_remote(
+    grit_lib::repo::Repository::open(
         &git_dir,
-        &mut conn,
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&mut opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Connection(&mut conn),
         &mut opts,
         &mut NoProgress,
-        &NeverCancel,
+        &CancelToken::never(),
     )
     .expect("fetch completes");
     assert_config_unchanged(&git_dir, &config_before);
@@ -163,7 +169,7 @@ fn fetch_v2_malicious_ls_refs_preserves_config() {
     let config_before = config_bytes(&git_dir);
 
     let mut script = Vec::new();
-    pkt_line::write_line(&mut script, &format!("{oid} {MALICIOUS}")).unwrap();
+    pkt_line::write_line_to_vec(&mut script, &format!("{oid} {MALICIOUS}")).unwrap();
     pkt_line::write_flush(&mut script).unwrap();
 
     let conn = ScriptedConn::new(script)
@@ -175,19 +181,24 @@ fn fetch_v2_malicious_ls_refs_preserves_config() {
         ])
         .with_version(2);
 
-    let mut opts = FetchOptions {
-        refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()],
-        tags: TagMode::None,
-        ..Default::default()
-    };
+    let mut opts = FetchOptions::new();
+    opts.refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()];
+    opts.tags = TagMode::None;
 
     let mut conn = conn;
-    fetch_remote(
+    grit_lib::repo::Repository::open(
         &git_dir,
-        &mut conn,
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&mut opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Connection(&mut conn),
         &mut opts,
         &mut NoProgress,
-        &NeverCancel,
+        &CancelToken::never(),
     )
     .expect("v2 fetch completes");
     assert_config_unchanged(&git_dir, &config_before);
@@ -199,8 +210,8 @@ fn read_advertisement_v0_filters_malicious_ref_and_symref() {
     let oid = "aabbccddeeff00112233445566778899aabbccdd";
     let mut buf = Vec::new();
     let head = format!("{oid} HEAD\0symref=HEAD:{MALICIOUS} multi_ack");
-    pkt_line::write_line(&mut buf, &head).unwrap();
-    pkt_line::write_line(&mut buf, &format!("{oid} {MALICIOUS}")).unwrap();
+    pkt_line::write_line_to_vec(&mut buf, &head).unwrap();
+    pkt_line::write_line_to_vec(&mut buf, &format!("{oid} {MALICIOUS}")).unwrap();
     pkt_line::write_flush(&mut buf).unwrap();
 
     let adv = read_advertisement(&mut Cursor::new(buf)).unwrap();

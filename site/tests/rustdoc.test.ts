@@ -1,5 +1,12 @@
 import { beforeAll, describe, expect, it } from "vitest";
-import { resolveRustdocPath, rustdocAvailable, unresolvedGritLibPaths, unresolvedRustdocLinks } from "../lib/rustdoc";
+import {
+  enumVariantRows,
+  expandVariantTables,
+  resolveRustdocPath,
+  rustdocAvailable,
+  unresolvedGritLibPaths,
+  unresolvedRustdocLinks,
+} from "../lib/rustdoc";
 
 beforeAll(() => {
   if (!rustdocAvailable()) {
@@ -21,15 +28,15 @@ describe("resolveRustdocPath associated items", () => {
   });
 
   it("links methods (not struct fields)", () => {
-    expect(resolveRustdocPath("grit_lib::revwalk::history::RewritePlan::ref_update_lines")).toBe(
-      "revwalk/history/struct.RewritePlan.html#method.ref_update_lines",
+    expect(resolveRustdocPath("grit_lib::revwalk::history::RewritePlan::rewritten_pairs")).toBe(
+      "revwalk/history/struct.RewritePlan.html#method.rewritten_pairs",
     );
   });
 
   it("follows re-exports of items that are public elsewhere", () => {
-    expect(resolveRustdocPath("grit_lib::config::ConfigHandle")).toBe("config/handle/struct.ConfigHandle.html");
-    expect(resolveRustdocPath("grit_lib::porcelain::branch::DeleteMode::Safe")).toBe(
-      "porcelain/branch_error/enum.DeleteMode.html#variant.Safe",
+    expect(resolveRustdocPath("grit_lib::config::Config")).toBe("config/struct.Config.html");
+    expect(resolveRustdocPath("grit_lib::porcelain::branch::BranchDeleteMode::Safe")).toBe(
+      "porcelain/branch/enum.BranchDeleteMode.html#variant.Safe",
     );
   });
 
@@ -50,15 +57,46 @@ describe("resolveRustdocPath associated items", () => {
   });
 });
 
+describe("variant tables", () => {
+  it("lists every variant with its snake_case name and rustdoc", () => {
+    const rows = enumVariantRows("grit_lib::repo::error::FilesOnlyOperation");
+    const gc = rows.find((r) => r.variant === "Gc")!;
+    expect(gc.name).toBe("gc");
+    expect(gc.url).toMatch(/repo\/error\/enum\.FilesOnlyOperation\.html#variant\.Gc$/);
+    expect(gc.doc).toContain("[`Odb::gc`](https://docs.rs/grit-lib/latest/grit_lib/objects/odb/struct.Odb.html#method.gc)");
+    expect(rows.find((r) => r.variant === "CommitGraphWrite")!.name).toBe("commit_graph_write");
+  });
+
+  it("expands the marker into a Markdown table", () => {
+    const table = expandVariantTables("<!-- grit:variant-table grit_lib::repo::error::FilesOnlyOperation -->");
+    expect(table.split("\n")[0]).toBe("| Name | Variant | Description |");
+    expect(table).toContain("| `partial_fetch` | [`PartialFetch`](");
+  });
+
+  it("rejects paths that are not enums", () => {
+    expect(() => enumVariantRows("grit_lib::objects::odb::Odb")).toThrow(/not an enum/);
+  });
+});
+
 describe("unresolvedGritLibPaths", () => {
   it("accepts public paths in prose, code and use groups", () => {
     const markdown = [
-      "Serve with `grit_lib::remote::serve::upload_pack` and [`Odb`](rustdoc:grit_lib::objects::odb::Odb).",
+      "Serve with `grit_lib::remote::serve::UploadPack` and [`Odb`](rustdoc:grit_lib::objects::odb::Odb).",
       "```rust",
       "use grit_lib::objects::{HashAlgo, ObjectKind as Kind, hash::hash_object};",
-      "use grit_lib::config::ConfigHandle;",
+      "use grit_lib::config::Config;",
       "```",
       "[docs](https://docs.rs/grit-lib/latest/grit_lib/remote/serve/struct.ServeOptions.html#method.default)",
+    ].join("\n");
+    expect(unresolvedGritLibPaths(markdown)).toEqual([]);
+  });
+
+  it("skips generated api-migration tables listing removed 0.5 paths", () => {
+    const markdown = [
+      "Guide text uses `grit_lib::repo::Repository`.",
+      "<!-- api-migration:begin -->",
+      "| `grit_lib::config::set_config_value` | gone |",
+      "<!-- api-migration:end -->",
     ].join("\n");
     expect(unresolvedGritLibPaths(markdown)).toEqual([]);
   });

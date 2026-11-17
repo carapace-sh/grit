@@ -25,8 +25,8 @@ use std::time::{Duration, Instant};
 
 use grit_lib::objects::odb::Odb;
 use grit_lib::objects::ObjectId;
-use grit_lib::progress::NeverCancel;
-use grit_lib::remote::fetch::{fetch_remote, NoProgress};
+use grit_lib::progress::CancelToken;
+use grit_lib::remote::fetch::NoProgress;
 use grit_lib::remote::transfer::{FetchDepth, FetchOptions};
 use grit_lib::remote::transport::{ConnectOptions, GitDaemonTransport, Service, Transport};
 
@@ -142,10 +142,7 @@ fn shallow_depth1_over_daemon(protocol_version: u8) {
     let local_git = local.join(".git");
 
     let transport = GitDaemonTransport::new();
-    let connect_opts = ConnectOptions {
-        protocol_version,
-        ..Default::default()
-    };
+    let connect_opts = ConnectOptions::with_protocol_version(protocol_version);
     let mut conn = match transport.connect(&url, Service::UploadPack, &connect_opts) {
         Ok(c) => c,
         Err(e) => {
@@ -154,17 +151,22 @@ fn shallow_depth1_over_daemon(protocol_version: u8) {
         }
     };
 
-    let mut opts = FetchOptions {
-        refspecs: vec!["+refs/heads/main:refs/remotes/origin/main".to_owned()],
-        fetch_depth: FetchDepth::depth(1),
-        ..Default::default()
-    };
-    let outcome = fetch_remote(
+    let mut opts = FetchOptions::new();
+    opts.refspecs = vec!["+refs/heads/main:refs/remotes/origin/main".to_owned()];
+    opts.fetch_depth = FetchDepth::depth(1);
+    let outcome = grit_lib::repo::Repository::open(
         &local_git,
-        &mut *conn,
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&mut opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Connection(&mut *conn),
         &mut opts,
         &mut NoProgress,
-        &NeverCancel,
+        &CancelToken::never(),
     )
     .expect("shallow depth=1 fetch over git daemon");
 
@@ -319,10 +321,7 @@ fn shallow_then_unshallow_over_git_daemon_v2() {
     let local_git = local.join(".git");
 
     let transport = GitDaemonTransport::new();
-    let v2 = ConnectOptions {
-        protocol_version: 2,
-        ..Default::default()
-    };
+    let v2 = ConnectOptions::with_protocol_version(2);
 
     // 1. Shallow depth=1 fetch.
     let mut conn = match transport.connect(&url, Service::UploadPack, &v2) {
@@ -332,17 +331,22 @@ fn shallow_then_unshallow_over_git_daemon_v2() {
             return;
         }
     };
-    let mut shallow_opts = FetchOptions {
-        refspecs: vec!["+refs/heads/main:refs/remotes/origin/main".to_owned()],
-        fetch_depth: FetchDepth::depth(1),
-        ..Default::default()
-    };
-    fetch_remote(
+    let mut shallow_opts = FetchOptions::new();
+    shallow_opts.refspecs = vec!["+refs/heads/main:refs/remotes/origin/main".to_owned()];
+    shallow_opts.fetch_depth = FetchDepth::depth(1);
+    grit_lib::repo::Repository::open(
         &local_git,
-        &mut *conn,
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&mut shallow_opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Connection(&mut *conn),
         &mut shallow_opts,
         &mut NoProgress,
-        &NeverCancel,
+        &CancelToken::never(),
     )
     .expect("initial shallow fetch");
     drop(conn);
@@ -367,17 +371,22 @@ fn shallow_then_unshallow_over_git_daemon_v2() {
             return;
         }
     };
-    let mut unshallow_opts = FetchOptions {
-        refspecs: vec!["+refs/heads/main:refs/remotes/origin/main".to_owned()],
-        fetch_depth: Some(FetchDepth::Unshallow),
-        ..Default::default()
-    };
-    let outcome = fetch_remote(
+    let mut unshallow_opts = FetchOptions::new();
+    unshallow_opts.refspecs = vec!["+refs/heads/main:refs/remotes/origin/main".to_owned()];
+    unshallow_opts.fetch_depth = Some(FetchDepth::Unshallow);
+    let outcome = grit_lib::repo::Repository::open(
         &local_git,
-        &mut *conn,
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&mut unshallow_opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Connection(&mut *conn),
         &mut unshallow_opts,
         &mut NoProgress,
-        &NeverCancel,
+        &CancelToken::never(),
     )
     .expect("unshallow fetch");
     drop(conn);
@@ -424,7 +433,6 @@ fn shallow_then_unshallow_over_git_daemon_v2() {
 
 #[test]
 fn git_daemon_shallow_depth_two_keeps_parent_tag() {
-    use grit_lib::refs::resolve_ref;
     use grit_lib::remote::clone::{clone as clone_repo, CloneOptions};
 
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -473,11 +481,13 @@ fn git_daemon_shallow_depth_two_keeps_parent_tag() {
             ..CloneOptions::new(url, dest.clone())
         },
         &mut NoProgress,
-        &NeverCancel,
+        &CancelToken::never(),
         None,
     )
     .expect("git:// depth-2 clone");
 
-    resolve_ref(&dest.join(".git"), "refs/tags/parent-tag")
+    grit_test_support::refs::at(&dest.join(".git"))
+        .references()
+        .resolve("refs/tags/parent-tag")
         .expect("parent-tag after depth-2 clone over git://");
 }

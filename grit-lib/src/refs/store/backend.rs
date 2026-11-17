@@ -4,23 +4,23 @@
 //! service, an in-process map) does not have to re-derive Git's ref-update rules. The helpers
 //! here are the ones the built-in backends use:
 //!
-//! - [`check_transaction`] runs every check [`RefStore::prepare`](super::RefStore::prepare)
-//!   must make: ref names and null ids ([`validate_transaction`]), directory/file conflicts
-//!   ([`verify_create_conflicts`]), compare-and-swap expectations ([`expected_matches`],
+//! - `check_transaction` runs every check [`RefStore::prepare`](super::RefStore::prepare)
+//!   must make: ref names and null ids (`validate_transaction`), directory/file conflicts
+//!   (`verify_create_conflicts`), compare-and-swap expectations (`expected_matches`,
 //!   through symbolic refs) and two updates writing the same stored ref.
-//! - [`apply_transaction`] computes the refs and reflogs after a commit, including
+//! - `apply_transaction` computes the refs and reflogs after a commit, including
 //!   symbolic-ref dereferencing and the reflog lines appended to both the symbolic ref and
 //!   its target.
-//! - [`resolve_symbolic`] follows symbolic refs inside a [`RefBatchState`].
+//! - `resolve_symbolic` follows symbolic refs inside a [`RefBatchState`].
 //!
 //! A typical store loads the refs (and reflogs) a transaction touches into a
-//! [`RefBatchState`], calls [`check_transaction`] in `prepare` while holding its lock, and
-//! at commit applies [`apply_transaction`] in place on that map when it owns the state (or
+//! [`RefBatchState`], calls `check_transaction` in `prepare` while holding its lock, and
+//! at commit applies `apply_transaction` in place on that map when it owns the state (or
 //! on a copy while iterators still share it) and persists the difference.
 //! `MemoryRefStore` is implemented exactly this way. Run the
 //! `grit_test_support::refstore_conformance` suite to check a backend against the built-ins.
 
-use std::collections::BTreeMap;
+use std::collections::{hash_map::Entry, BTreeMap, HashMap};
 
 use crate::objects::{ObjectId, ObjectKind};
 use crate::refs::SYMREF_MAXDEPTH;
@@ -31,13 +31,19 @@ use super::apply::{
 use super::error::{BackendError, RefStoreError};
 use super::transaction::RefTransaction;
 use super::validation::validate_storable_refname as validate_name;
-use super::{RawRef, RefUpdate};
+use super::{RawRef, RefName, RefUpdate};
 
-type PartitionUpdatesResult = (Vec<RefUpdate>, Vec<(String, RefStoreError)>);
+type PartitionUpdatesResult = (Vec<RefUpdate>, Vec<(RefName, RefStoreError)>);
+
+pub(crate) type CasefoldLookup<'a> =
+    Option<&'a dyn Fn(&str) -> std::result::Result<Option<String>, RefStoreError>>;
 
 pub use super::apply::RefBatchState;
 pub use super::transaction::expected_matches;
-pub use super::validation::verify_create_conflicts;
+pub use super::validation::{
+    verify_create_casefold_against_existing, verify_create_casefold_conflicts,
+    verify_create_casefold_same_batch, verify_create_casefold_with_lookup, verify_create_conflicts,
+};
 
 /// Reject `name` when Git refuses to store it (path traversal, illegal components, a
 /// `.lock` suffix, an empty `refs/` name, …).
@@ -47,7 +53,8 @@ pub use super::validation::verify_create_conflicts;
 /// # Errors
 ///
 /// Returns [`RefStoreError::InvalidRefName`] naming the rejected ref.
-pub fn validate_storable_refname(name: &str) -> Result<(), RefStoreError> {
+#[allow(dead_code)] // integration / re-export use only
+pub(crate) fn validate_storable_refname(name: &str) -> Result<(), RefStoreError> {
     validate_name(name)
 }
 
@@ -64,7 +71,8 @@ pub fn validate_storable_refname(name: &str) -> Result<(), RefStoreError> {
 /// [`RefStoreError::InvalidSymrefTarget`] for a symbolic value Git would refuse,
 /// [`RefStoreError::NullOid`] for an update pointing a ref at the null id, or
 /// [`RefStoreError::InvalidReflog`] for forged reflog metadata.
-pub fn validate_transaction(txn: &RefTransaction) -> Result<(), RefStoreError> {
+#[allow(dead_code)] // integration / re-export use only
+pub(crate) fn validate_transaction(txn: &RefTransaction) -> Result<(), RefStoreError> {
     txn.validate()
 }
 
@@ -119,12 +127,13 @@ pub(crate) fn verify_direct_targets(
     updates: &[RefUpdate],
     mut kind_of: impl FnMut(&ObjectId) -> crate::error::Result<Option<ObjectKind>>,
 ) -> Result<(), RefStoreError> {
+    let mut kind_cache: HashMap<ObjectId, Option<ObjectKind>> = HashMap::new();
     for update in updates {
         if update.flags.skip_oid_verification {
             continue;
         }
         for oid in oids_to_verify_for_update(update) {
-            verify_stored_oid_for_ref(&update.name, oid, &mut kind_of)?;
+            verify_stored_oid_for_ref(update.name.as_str(), oid, &mut kind_of, &mut kind_cache)?;
         }
     }
     Ok(())
@@ -163,12 +172,20 @@ fn verify_stored_oid_for_ref(
     name: &str,
     oid: ObjectId,
     kind_of: &mut impl FnMut(&ObjectId) -> crate::error::Result<Option<ObjectKind>>,
+    kind_cache: &mut HashMap<ObjectId, Option<ObjectKind>>,
 ) -> Result<(), RefStoreError> {
-    let kind = kind_of(&oid).map_err(|err| RefStoreError::ObjectLookup {
-        name: name.to_owned(),
-        oid,
-        source: BackendError::new(err),
-    })?;
+    let kind = match kind_cache.entry(oid) {
+        Entry::Occupied(entry) => *entry.get(),
+        Entry::Vacant(entry) => {
+            let kind = kind_of(entry.key()).map_err(|err| RefStoreError::ObjectLookup {
+                name: name.to_owned(),
+                oid,
+                source: BackendError::new(err),
+            })?;
+            entry.insert(kind);
+            kind
+        }
+    };
     match kind {
         None => Err(RefStoreError::MissingObject {
             name: name.to_owned(),
@@ -195,18 +212,24 @@ fn names_branch(name: &str) -> bool {
 pub(crate) fn check_transaction_updates(
     state: &RefBatchState,
     updates: &[RefUpdate],
+    ascii_casefold_lookup: CasefoldLookup<'_>,
 ) -> Result<(), RefStoreError> {
     verify_create_conflicts(&state.refs, updates)?;
+    if let Some(lookup) = ascii_casefold_lookup {
+        verify_create_casefold_with_lookup(true, &state.refs, updates, |name| lookup(name))?;
+    }
     simulate_batch_apply(state, updates, &[], &[])
 }
 
 /// Whether a ref-store error may reject a single update while siblings still commit.
 #[must_use]
-pub fn is_per_ref_rejectable(err: &RefStoreError) -> bool {
+pub(crate) fn is_per_ref_rejectable(err: &RefStoreError) -> bool {
     matches!(
         err,
         RefStoreError::ExpectedMismatch { .. }
             | RefStoreError::NameUnavailable { .. }
+            | RefStoreError::CreateExists { .. }
+            | RefStoreError::CaseConflict { .. }
             | RefStoreError::MissingObject { .. }
             | RefStoreError::NotACommit { .. }
     )
@@ -216,16 +239,24 @@ pub fn is_per_ref_rejectable(err: &RefStoreError) -> bool {
 ///
 /// Simulates accepted updates on `state` so later creates see earlier ones in the same batch.
 /// Non-rejectable errors fail the whole call.
-pub fn partition_updates_allowing_failures(
+pub(crate) fn partition_updates_allowing_failures(
     state: &RefBatchState,
     updates: Vec<RefUpdate>,
+    ascii_casefold_lookup: CasefoldLookup<'_>,
 ) -> Result<PartitionUpdatesResult, RefStoreError> {
+    if ascii_casefold_lookup.is_some() {
+        verify_create_casefold_same_batch(&updates)?;
+    }
     let mut working = state.clone();
     let mut accepted = Vec::with_capacity(updates.len());
     let mut rejected = Vec::new();
     for update in updates {
         let name = update.name.clone();
-        match check_transaction_updates(&working, std::slice::from_ref(&update)) {
+        match check_transaction_updates(
+            &working,
+            std::slice::from_ref(&update),
+            ascii_casefold_lookup,
+        ) {
             Ok(()) => {
                 apply_update(&mut working, &update)?;
                 accepted.push(update);
@@ -242,10 +273,12 @@ pub fn partition_updates_allowing_failures(
 ///
 /// Updates apply in transaction order. A direct-value update through a symbolic ref (without
 /// [`RefUpdateFlags::no_deref`](super::RefUpdateFlags::no_deref)) writes the end of the
-/// symbolic chain and logs the same entry on the symbolic ref and on that target. A delete
-/// with a [`ReflogUpdate`](super::ReflogUpdate) appends an entry whose new id is zero and
-/// keeps the reflog. Call [`check_transaction`] first; this function does not re-check
-/// expectations, so on error `state` may be partially updated (apply to a copy).
+/// symbolic chain and logs the same entry on the symbolic ref and on that target. A ref
+/// delete (not [`RefUpdateFlags::log_only`](super::RefUpdateFlags::log_only)) removes the
+/// deleted ref's reflog from `state.reflogs`, matching Git's files backend; a
+/// [`ReflogUpdate`](super::ReflogUpdate) on that delete does not append a line or keep the
+/// log. Call [`check_transaction`] first; this function does not re-check expectations, so on
+/// error `state` may be partially updated (apply to a copy).
 ///
 /// # Errors
 ///
@@ -277,9 +310,9 @@ pub fn apply_transaction(
 /// [`SYMREF_MAXDEPTH`] hops.
 pub fn resolve_symbolic(
     refs: &BTreeMap<String, RawRef>,
-    name: &str,
+    starting_ref: &str,
 ) -> Result<ObjectId, RefStoreError> {
-    let mut current = name;
+    let mut current = starting_ref;
     for _ in 0..SYMREF_MAXDEPTH {
         match refs.get(current) {
             None => return Err(RefStoreError::not_found(current)),
@@ -293,6 +326,7 @@ pub fn resolve_symbolic(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::ObjectError;
     use crate::refs::store::{Expected, RefUpdateFlags, ReflogUpdate};
     use crate::refs::RefnameUnavailable;
 
@@ -304,7 +338,7 @@ mod tests {
 
     fn put(name: &str, value: RawRef, expected: Expected) -> RefUpdate {
         RefUpdate {
-            name: name.to_owned(),
+            name: RefName::from_trusted(name.to_owned()),
             new_value: Some(value),
             expected,
             reflog: None,
@@ -341,7 +375,7 @@ mod tests {
 
     #[test]
     fn check_transaction_cost_is_flat_in_store_size() {
-        use std::time::Instant;
+        use super::super::probe::take_stored_ref_probes;
 
         fn oid_n(n: u32) -> ObjectId {
             let mut b = [0u8; 20];
@@ -359,7 +393,7 @@ mod tests {
         let txn = |i: u32| {
             RefTransaction::new()
                 .update(RefUpdate {
-                    name: format!("refs/heads/new{i}"),
+                    name: RefName::from_trusted(format!("refs/heads/new{i}")),
                     new_value: Some(RawRef::Direct(oid_n(i))),
                     expected: Expected::Missing,
                     reflog: None,
@@ -367,29 +401,19 @@ mod tests {
                 })
                 .expect("txn")
         };
-        let samples = 30u32;
-        let start = Instant::now();
-        for i in 0..samples {
+        for i in 0..30u32 {
+            take_stored_ref_probes();
             check_transaction(&large, &txn(i)).expect("large");
+            let large_probes = take_stored_ref_probes();
+            check_transaction(&small, &txn(i)).expect("small");
+            let small_probes = take_stored_ref_probes();
+            assert!(large_probes > 0, "stored-ref lookups are not being counted");
+            assert_eq!(
+                large_probes, small_probes,
+                "checking one create against 20000 stored refs must do the same lookups as \
+                 against an empty store"
+            );
         }
-        let large_elapsed = start.elapsed();
-        let start = Instant::now();
-        for i in 0..samples {
-            check_transaction(&small, &txn(i + samples)).expect("small");
-        }
-        let small_elapsed = start.elapsed();
-        assert!(
-            large_elapsed.as_secs() < 1,
-            "large map checks took {:?}",
-            large_elapsed
-        );
-        assert!(
-            large_elapsed
-                <= small_elapsed * 8 + small_elapsed / 2 + std::time::Duration::from_millis(1),
-            "large {:?} vs small {:?}",
-            large_elapsed,
-            small_elapsed
-        );
     }
 
     #[test]
@@ -578,7 +602,7 @@ mod tests {
     #[test]
     fn verify_direct_targets_checks_log_only_explicit_reflog_oids_without_new_value() {
         let log_only = RefUpdate {
-            name: "refs/heads/main".to_owned(),
+            name: RefName::from_trusted("refs/heads/main"),
             new_value: None,
             expected: Expected::Any,
             reflog: Some(super::super::ReflogUpdate {
@@ -601,7 +625,7 @@ mod tests {
             })
         );
         let ok = RefUpdate {
-            name: "refs/heads/main".to_owned(),
+            name: RefName::from_trusted("refs/heads/main"),
             new_value: None,
             expected: Expected::Any,
             reflog: Some(super::super::ReflogUpdate {
@@ -634,7 +658,9 @@ mod tests {
             seen.push(*id);
             match id.as_bytes()[19] {
                 1 => Ok(Some(ObjectKind::Commit)),
-                _ => Err(crate::error::Error::CorruptObject("bad header".to_owned())),
+                _ => Err(crate::error::Error::Object(ObjectError::Corrupt {
+                    detail: "bad header".to_owned(),
+                })),
             }
         })
         .expect_err("lookup failure");
@@ -649,9 +675,46 @@ mod tests {
         assert_eq!((name.as_str(), id), ("refs/heads/b", oid(2)));
         assert!(matches!(
             source.downcast_ref::<crate::error::Error>(),
-            Some(crate::error::Error::CorruptObject(_))
+            Some(crate::error::Error::Object(ObjectError::Corrupt { .. }))
         ));
         assert_eq!(seen, vec![oid(1), oid(2)]);
+    }
+
+    #[test]
+    fn verify_direct_targets_memoizes_kind_lookup_by_oid() {
+        const N: usize = 512;
+        let shared = oid(1);
+        let updates: Vec<_> = (0..N)
+            .map(|i| {
+                put(
+                    &format!("refs/heads/b/{i}"),
+                    RawRef::Direct(shared),
+                    Expected::Any,
+                )
+            })
+            .collect();
+        let mut probes = 0;
+        verify_direct_targets(&updates, |id| {
+            probes += 1;
+            assert_eq!(*id, shared);
+            Ok(Some(ObjectKind::Commit))
+        })
+        .expect("all commits");
+        assert_eq!(probes, 1, "one oid must cost one kind lookup");
+
+        probes = 0;
+        let updates = [
+            put("refs/heads/x/a", RawRef::Direct(oid(1)), Expected::Any),
+            put("refs/heads/x/b", RawRef::Direct(oid(1)), Expected::Any),
+            put("refs/heads/y/a", RawRef::Direct(oid(2)), Expected::Any),
+            put("refs/heads/y/b", RawRef::Direct(oid(2)), Expected::Any),
+        ];
+        verify_direct_targets(&updates, |_| {
+            probes += 1;
+            Ok(Some(ObjectKind::Commit))
+        })
+        .expect("two oids");
+        assert_eq!(probes, 2);
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! [`RepositoryRemotes::inspect`](crate::repo_handles::RepositoryRemotes::inspect) types and logic.
+//! [`Remotes::inspect`](crate::repo_handles::Remotes::inspect) types and logic.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
@@ -13,7 +13,7 @@ use crate::repo::Repository;
 use crate::repo_handles::has_remote_section;
 use crate::transfer::{match_positive, ref_excluded, tracking_refs_gone_in};
 
-/// Options for [`RepositoryRemotes::inspect`](crate::repo_handles::RepositoryRemotes::inspect).
+/// Options for [`Remotes::inspect`](crate::repo_handles::Remotes::inspect).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InspectOptions {
     /// When `true`, contact the remote (or read its git dir) to classify branch states.
@@ -85,7 +85,7 @@ struct FetchRefspecs {
 impl FetchRefspecs {
     fn load(config: &ConfigSet, remote_name: &str) -> Self {
         let (negative, mut positive): (Vec<RefspecItem>, Vec<RefspecItem>) = config
-            .get_all(&format!("remote.{remote_name}.fetch"))
+            .values_all(&format!("remote.{remote_name}.fetch"))
             .iter()
             .filter_map(|spec| parse_fetch_refspec(spec).ok())
             .partition(|item| item.negative);
@@ -106,16 +106,19 @@ impl FetchRefspecs {
 ///
 /// - [`RemoteError::UnknownRemote`] when no `remote.<name>.*` section exists.
 /// - [`RemoteError::NoUrl`] when the remote has no URL.
-/// - Propagates transport, config, and ref I/O failures as [`RemoteError::Library`].
-pub fn inspect_remote(
+/// - Propagates transport, config, and ref I/O failures as [`RemoteError::from`].
+pub(crate) fn inspect_remote(
     repo: &Repository,
     name: &str,
     options: &InspectOptions,
     http_factory: Option<&dyn HttpClientFactory>,
-) -> std::result::Result<RemoteSummary, RemoteError> {
-    let config = repo.config().map_err(RemoteError::Library)?;
+) -> crate::error::Result<RemoteSummary> {
+    let config = repo.config().snapshot()?;
     if !has_remote_section(config.as_ref(), name) {
-        return Err(RemoteError::UnknownRemote(name.to_owned()));
+        return Err(RemoteError::UnknownRemote {
+            name: name.to_owned(),
+        }
+        .into());
     }
     let remote = Remote::from_config(config.as_ref(), name)?;
     let fetch_url = remote.fetch_url().to_url_string();
@@ -300,7 +303,7 @@ fn remote_head_branch_names(
 ) -> BTreeSet<String> {
     let mut names = BTreeSet::new();
     for entry in remote_refs {
-        if !entry.name.starts_with("refs/heads/") {
+        if !entry.name.as_str().starts_with("refs/heads/") {
             continue;
         }
         if ref_excluded(&entry.name, &refspecs.negative) {
@@ -404,7 +407,7 @@ fn collect_pull_branches(config: &ConfigSet, remote_name: &str) -> Vec<RemotePul
             continue;
         }
         let merge = config
-            .get(&format!("branch.{branch}.merge"))
+            .value(&format!("branch.{branch}.merge"))
             .unwrap_or_default();
         by_branch.insert(
             branch.to_owned(),
@@ -466,9 +469,11 @@ mod tests {
     #[test]
     fn inspect_unknown_remote_errors() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let repo = Repository::init(dir.path(), &InitOptions::default()).expect("init");
+        let (repo, _) = Repository::init(dir.path(), &InitOptions::default()).expect("init");
         let err = inspect_remote(&repo, "missing", &InspectOptions::default(), None)
             .expect_err("unknown");
-        assert!(matches!(err, RemoteError::UnknownRemote(name) if name == "missing"));
+        assert!(
+            matches!(err, crate::error::Error::Remote(RemoteError::UnknownRemote { name }) if name == "missing")
+        );
     }
 }

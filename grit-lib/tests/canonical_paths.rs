@@ -7,7 +7,7 @@ use grit_lib::{
     objects::odb::store::MemoryStore,
     objects::{bitmap::BitmapIndex, hash::ObjectHasher, odb::Odb},
     parallel::ThreadPolicy,
-    refs::{check_ref_format::RefNameOptions, reflog::ReflogEntry},
+    refs::{check_ref_format::RefNamePolicy, reflog::ReflogEntry},
     remote::credentials::Credential,
     repo::Repository,
     revwalk::rev_list::RevListOptions,
@@ -26,7 +26,7 @@ fn canonical_paths_cover_external_uses() {
     let _ = std::any::type_name::<ObjectHasher>();
     let _ = std::any::type_name::<ThreadPolicy>();
     let _ = std::any::type_name::<ReflogEntry>();
-    let _ = std::any::type_name::<RefNameOptions>();
+    let _ = std::any::type_name::<RefNamePolicy>();
     let _ = std::any::type_name::<MemoryStore>();
     let _ = std::any::type_name::<Credential>();
     let _ = std::any::type_name::<RevListOptions>();
@@ -56,18 +56,37 @@ fn canonical_layout_script_covers_workspace_imports() {
 /// Maximum root-level `pub mod` declarations in `grit-lib/src/lib.rs` (excluding `prelude`).
 ///
 /// Raise only when adding a new top-level domain module. The canonical layout on
-/// `origin/main` currently declares **36** root `pub mod` lines; this budget leaves
-/// headroom without reintroducing flat compatibility roots.
-const ROOT_PUB_MOD_BUDGET: usize = 36;
+/// `origin/main` declares embedder-facing roots (including **`divergence`** and **`commits`**);
+/// **`test_support`** is feature-gated and excluded via [`ROOT_PUB_MOD_CFG_EXEMPT`].
+const ROOT_PUB_MOD_BUDGET: usize = 39;
+
+/// Root modules gated behind `test` / `test-support` / other non-default features
+/// do not count toward the embedder-surface budget.
+const ROOT_PUB_MOD_CFG_EXEMPT: &[&str] = &["test_support"];
 
 #[test]
 fn root_public_module_count_within_budget() {
     let lib_rs = include_str!("../src/lib.rs");
+    let mut prev_cfg_gated = false;
     let count = lib_rs
         .lines()
         .filter(|line| {
             let t = line.trim();
-            t.starts_with("pub mod ") && !t.starts_with("pub mod prelude")
+            if t.starts_with("#[cfg") {
+                prev_cfg_gated = t.contains("test-support") || t.contains("test,");
+                return false;
+            }
+            if t.starts_with("pub mod ") && !t.starts_with("pub mod prelude") {
+                let name = t
+                    .strip_prefix("pub mod ")
+                    .and_then(|rest| rest.split_whitespace().next());
+                let exempt = name.is_some_and(|n| ROOT_PUB_MOD_CFG_EXEMPT.contains(&n));
+                let count_this = !prev_cfg_gated && !exempt;
+                prev_cfg_gated = false;
+                return count_this;
+            }
+            prev_cfg_gated = false;
+            false
         })
         .count();
     assert!(

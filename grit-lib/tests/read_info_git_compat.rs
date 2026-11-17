@@ -1,11 +1,12 @@
 //! [`Odb::read_info`] matches `git cat-file --batch-check` across storage layouts.
 
 use grit_lib::error::Error;
+use grit_lib::error::ObjectError;
 use grit_lib::objects::delta_encode::encode_lcp_delta;
-use grit_lib::objects::midx::{write_multi_pack_index_with_options, WriteMultiPackIndexOptions};
+use grit_lib::objects::midx::{write_multi_pack_index, WriteMultiPackIndexOptions};
 use grit_lib::objects::odb::Odb;
-use grit_lib::objects::pack::{clear_pack_cache, read_idx_object_ids};
 use grit_lib::objects::{HashAlgo, ObjectId, ObjectKind};
+use grit_lib::test_support::objects_pack::{clear_pack_cache, read_idx_object_ids};
 use grit_test_support::{git, git_cmd};
 use std::collections::HashSet;
 use std::io::Write;
@@ -308,8 +309,7 @@ fn read_info_midx_matches_full_read() {
     clear_pack_cache();
     let (_root, git_dir, odb, ids, _fx) = build_fixture();
     let pack_dir = git_dir.join("objects/pack");
-    write_multi_pack_index_with_options(&pack_dir, &WriteMultiPackIndexOptions::default())
-        .expect("write midx");
+    write_multi_pack_index(&pack_dir, &WriteMultiPackIndexOptions::default()).expect("write midx");
     std::fs::write(
         git_dir.join("config"),
         "[core]\n\trepositoryformatversion = 0\n\tmultiPackIndex = true\n",
@@ -339,7 +339,7 @@ fn read_info_missing_object_is_not_found() {
     let odb = Odb::new(&objects);
     let missing = ObjectId::from_hex("0123456789abcdef0123456789abcdef01234567").expect("oid");
     match odb.read_info(&missing) {
-        Err(Error::ObjectNotFound(_)) => {}
+        Err(Error::Object(ObjectError::NotFound { .. })) => {}
         other => panic!("expected ObjectNotFound, got {other:?}"),
     }
 }
@@ -362,7 +362,8 @@ fn read_info_corrupt_loose_header_is_typed_error() {
 
     let odb = Odb::new(&objects);
     match odb.read_info(&oid) {
-        Err(Error::CorruptObject(_)) | Err(Error::ObjectHeaderTooLong { .. }) => {}
+        Err(Error::Object(ObjectError::Corrupt { .. }))
+        | Err(Error::Object(ObjectError::HeaderTooLong { .. })) => {}
         other => panic!("expected corrupt header error, got {other:?}"),
     }
 }

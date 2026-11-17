@@ -3,16 +3,16 @@
 /// Collect hide-ref patterns from config for receive-pack (transfer + receive).
 #[must_use]
 pub fn hide_ref_patterns_receive(config: &crate::config::ConfigSet) -> Vec<String> {
-    let mut v = config.get_all("transfer.hideRefs");
-    v.extend(config.get_all("receive.hideRefs"));
+    let mut v = config.values_all("transfer.hideRefs");
+    v.extend(config.values_all("receive.hideRefs"));
     normalize_patterns(v)
 }
 
 /// Collect hide-ref patterns for upload-pack (transfer + uploadpack).
 #[must_use]
 pub fn hide_ref_patterns_uploadpack(config: &crate::config::ConfigSet) -> Vec<String> {
-    let mut v = config.get_all("transfer.hideRefs");
-    v.extend(config.get_all("uploadpack.hideRefs"));
+    let mut v = config.values_all("transfer.hideRefs");
+    v.extend(config.values_all("uploadpack.hideRefs"));
     normalize_patterns(v)
 }
 
@@ -29,7 +29,7 @@ fn normalize_patterns(mut pats: Vec<String>) -> Vec<String> {
 ///
 /// `patterns` are in config order; **later** entries win (matches Git's reverse scan).
 #[must_use]
-pub fn ref_is_hidden(refname: &str, refname_full: &str, patterns: &[String]) -> bool {
+pub(crate) fn ref_is_hidden(refname: &str, refname_full: &str, patterns: &[String]) -> bool {
     let mut i = patterns.len();
     while i > 0 {
         i -= 1;

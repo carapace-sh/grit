@@ -5,13 +5,11 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use grit_lib::objects::pack::verify_pack_and_collect;
-use grit_lib::porcelain::checkout::checkout_between_trees;
-use grit_lib::progress::NeverCancel;
+use grit_lib::progress::CancelToken;
 use grit_lib::remote::clone::{clone as clone_repo, CloneOptions};
-use grit_lib::remote::fetch::NoProgress;
-use grit_lib::remote::transfer::{fetch_local, CloneReflog, FetchOptions, TagMode};
+use grit_lib::remote::transfer::{CloneReflog, FetchOptions, TagMode};
 use grit_lib::repo::{InitOptions, Repository};
+use grit_lib::test_support::objects_pack::verify_pack_and_collect;
 
 fn git_in(dir: &Path, args: &[&str]) -> bool {
     Command::new("git")
@@ -176,43 +174,78 @@ fn clone_fetch_keeps_pack_and_matches_git_layout() {
         clone.path(),
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
-            .with_ref_storage(grit_lib::RefStorageFormat::Files),
+            .with_ref_storage(grit_lib::refs::ref_storage::RefStorageFormat::Files),
     )
     .expect("init");
     let clone_git = clone.path().join(".git");
 
-    fetch_local(
+    let mut fetch_opts = FetchOptions::new().initial_remote_fetch(true);
+    fetch_opts.refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()];
+    fetch_opts.tags = TagMode::All;
+    fetch_opts.remote_name = Some("origin".to_owned());
+    fetch_opts.clone_reflog = Some(CloneReflog {
+        identity: "T <t@e.com> 1 +0000".parse().expect("identity"),
+        message: "clone: from file://fixture".to_owned(),
+    });
+    grit_lib::repo::Repository::open(
         &clone_git,
-        &upstream.path().join(".git"),
-        &FetchOptions {
-            refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()],
-            tags: TagMode::All,
-            initial_remote_fetch: true,
-            remote_name: Some("origin".to_owned()),
-            clone_reflog: Some(CloneReflog {
-                identity: "T <t@e.com> 1 +0000".parse().expect("identity"),
-                message: "clone: from file://fixture".to_owned(),
-            }),
-            ..Default::default()
-        },
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&fetch_opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Local(&upstream.path().join(".git")),
+        &mut fetch_opts.clone(),
+        &mut grit_lib::remote::fetch::NoProgress,
+        grit_lib::progress::CancelToken::never_ref(),
     )
     .expect("fetch");
 
     let default_branch = "main";
     let tracking = format!("refs/remotes/origin/{default_branch}");
-    let oid_hex = grit_lib::refs::resolve_ref(&clone_git, &tracking)
+    let oid_hex = grit_test_support::refs::at(&clone_git)
+        .references()
+        .resolve(&tracking)
         .expect("main tracking ref")
         .to_hex();
     let branch_ref = format!("refs/heads/{default_branch}");
     let oid = grit_lib::objects::ObjectId::from_hex(&oid_hex).unwrap();
-    grit_lib::refs::write_ref(&clone_git, &branch_ref, &oid).expect("local branch");
+    grit_test_support::refs::set_ref(&grit_test_support::refs::at(&clone_git), &branch_ref, &oid)
+        .expect("local branch");
     let zero = grit_lib::objects::ObjectId::zero();
     let identity = "T <t@e.com> 1 +0000";
     let msg = "clone: from file://fixture";
-    grit_lib::refs::append_reflog(&clone_git, &branch_ref, &zero, &oid, identity, msg, false)
+    grit_test_support::refs::at(&clone_git)
+        .reflogs()
+        .append(
+            &branch_ref,
+            &grit_lib::refs::reflog::ReflogEntry {
+                old_oid: zero,
+                new_oid: oid,
+                identity: (identity).to_string(),
+                message: (msg).to_string(),
+            },
+            grit_lib::repo_handles::ReflogCreate::IfAllowed,
+        )
         .expect("branch reflog");
-    grit_lib::refs::write_symbolic_ref(&clone_git, "HEAD", &branch_ref).expect("HEAD");
-    grit_lib::refs::append_reflog(&clone_git, "HEAD", &zero, &oid, identity, msg, false)
+    grit_test_support::refs::at(&clone_git)
+        .references()
+        .update_symbolic("HEAD", &branch_ref)
+        .expect("HEAD");
+    grit_test_support::refs::at(&clone_git)
+        .reflogs()
+        .append(
+            "HEAD",
+            &grit_lib::refs::reflog::ReflogEntry {
+                old_oid: zero,
+                new_oid: oid,
+                identity: (identity).to_string(),
+                message: (msg).to_string(),
+            },
+            grit_lib::repo_handles::ReflogCreate::IfAllowed,
+        )
         .expect("HEAD reflog");
 
     let count = git_out(&clone.path(), &["count-objects", "-v"]).expect("count-objects");
@@ -323,7 +356,7 @@ fn library_clone_api_passes_fsck_and_status() {
             ..CloneOptions::new(upstream.path().to_string_lossy(), dest.path().to_path_buf())
         },
         &mut NoProgress,
-        &NeverCancel,
+        &CancelToken::never(),
         None,
     )
     .expect("library clone");
@@ -334,7 +367,16 @@ fn library_clone_api_passes_fsck_and_status() {
         .read(&outcome.checkout_oid)
         .expect("commit obj");
     let parsed = grit_lib::objects::parse_commit(&commit.data).expect("parse commit");
-    checkout_between_trees(&outcome.repo, None, &parsed.tree).expect("checkout");
+    outcome
+        .repo
+        .checkout()
+        .checkout(
+            None,
+            &parsed.tree,
+            &mut grit_lib::progress::NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("checkout");
 
     assert!(git_in(dest.path(), &["fsck", "--strict"]));
     let status = git_out(dest.path(), &["status", "--porcelain"]).unwrap_or_default();
@@ -405,7 +447,7 @@ fn clone_tag_layout_covers_bare_no_tags_shallow_and_empty() {
         }
         git_args.extend([&url, "."]);
         assert!(git_in(control.path(), &git_args));
-        let result = clone_repo(opts, &mut NoProgress, &NeverCancel, None).unwrap();
+        let result = clone_repo(opts, &mut NoProgress, &CancelToken::never(), None).unwrap();
         let git_dir = result.repo.git_dir();
         let tags = git_out(
             dest.path(),
@@ -456,7 +498,7 @@ fn clone_tag_layout_covers_bare_no_tags_shallow_and_empty() {
     let result = clone_repo(
         CloneOptions::new(empty.path().to_string_lossy(), dest.path().to_path_buf()),
         &mut NoProgress,
-        &NeverCancel,
+        &CancelToken::never(),
         None,
     )
     .unwrap();
@@ -562,7 +604,7 @@ fn clone_of_many_branches_packs_them_in_one_file_like_git() {
         }
         git_args.extend([url.as_str(), "."]);
         assert!(git_in(control.path(), &git_args));
-        let result = clone_repo(opts, &mut NoProgress, &NeverCancel, None).unwrap();
+        let result = clone_repo(opts, &mut NoProgress, &CancelToken::never(), None).unwrap();
         let git_dir = result.repo.git_dir().to_path_buf();
 
         let imported = if bare {

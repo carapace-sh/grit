@@ -5,11 +5,8 @@ use std::path::Path;
 use std::process::Command;
 
 use grit_lib::objects::{ObjectId, ObjectKind};
-use grit_lib::porcelain::checkout::checkout_between_trees;
-use grit_lib::progress::NeverCancel;
-use grit_lib::refs::resolve_ref;
+use grit_lib::progress::CancelToken;
 use grit_lib::remote::clone::{clone as clone_repo, CloneOptions};
-use grit_lib::remote::fetch::NoProgress;
 use grit_lib::remote::shallow::load_shallow_oids;
 use grit_test_support::git;
 
@@ -123,7 +120,7 @@ fn clone_depth_one_lightweight_tag_matches_git() {
             ..CloneOptions::new(url, grit_dest.clone())
         },
         &mut NoProgress,
-        &NeverCancel,
+        &CancelToken::never(),
         None,
     )
     .expect("shallow tag clone");
@@ -149,7 +146,10 @@ fn clone_depth_one_lightweight_tag_matches_git() {
         shallow_file_lines(&git_dest.join(".git"))
     );
     assert_eq!(
-        resolve_ref(&grit_dest.join(".git"), "HEAD").unwrap(),
+        grit_test_support::refs::at(&grit_dest.join(".git"))
+            .references()
+            .resolve("HEAD")
+            .unwrap(),
         tag_tip
     );
     git_fsck_clean(&git_dest);
@@ -187,7 +187,7 @@ fn clone_depth_one_annotated_tag_matches_git() {
             ..CloneOptions::new(url, grit_dest.clone())
         },
         &mut NoProgress,
-        &NeverCancel,
+        &CancelToken::never(),
         None,
     )
     .expect("shallow annotated tag clone");
@@ -213,7 +213,10 @@ fn clone_depth_one_annotated_tag_matches_git() {
         shallow_file_lines(&git_dest.join(".git"))
     );
     assert_eq!(
-        resolve_ref(&grit_dest.join(".git"), "HEAD").unwrap(),
+        grit_test_support::refs::at(&grit_dest.join(".git"))
+            .references()
+            .resolve("HEAD")
+            .unwrap(),
         tag_tip
     );
     git_fsck_clean(&git_dest);
@@ -236,7 +239,7 @@ fn clone_depth_one_records_shallow_boundary_and_limits_history() {
             ..CloneOptions::new(bare.to_string_lossy(), dest.clone())
         },
         &mut NoProgress,
-        &NeverCancel,
+        &CancelToken::never(),
         None,
     )
     .expect("shallow clone");
@@ -258,7 +261,16 @@ fn clone_depth_one_records_shallow_boundary_and_limits_history() {
         .read(&outcome.checkout_oid)
         .expect("commit");
     let parsed = grit_lib::objects::parse_commit(&commit.data).expect("parse commit");
-    checkout_between_trees(&outcome.repo, None, &parsed.tree).expect("checkout");
+    outcome
+        .repo
+        .checkout()
+        .checkout(
+            None,
+            &parsed.tree,
+            &mut grit_lib::progress::NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("checkout");
 
     let log = git(&dest, &["log", "--oneline"]);
     assert_eq!(log.lines().count(), 1, "expected single commit: {log}");
@@ -270,7 +282,10 @@ fn clone_depth_one_records_shallow_boundary_and_limits_history() {
     );
 
     assert_eq!(
-        resolve_ref(&dest.join(".git"), "refs/remotes/origin/main").expect("origin/main"),
+        grit_test_support::refs::at(&dest.join(".git"))
+            .references()
+            .resolve("refs/remotes/origin/main")
+            .expect("origin/main"),
         tip
     );
 
@@ -355,7 +370,7 @@ fn shallow_clone_matches_git_single_branch_on_multi_branch_remote() {
             ..CloneOptions::new(url, grit_dest.clone())
         },
         &mut NoProgress,
-        &NeverCancel,
+        &CancelToken::never(),
         None,
     )
     .expect("grit shallow clone");
@@ -379,7 +394,10 @@ fn shallow_clone_matches_git_single_branch_on_multi_branch_remote() {
         "grit shallow boundaries must match git"
     );
     assert!(
-        resolve_ref(&grit_git, "refs/remotes/origin/side").is_err(),
+        grit_test_support::refs::at(&grit_git)
+            .references()
+            .resolve("refs/remotes/origin/side")
+            .is_err(),
         "side branch must not be fetched"
     );
 
@@ -452,7 +470,7 @@ fn shallow_clone_with_root_annotated_tag_matches_git_shallow_file() {
             ..CloneOptions::new(url, grit_dest.clone())
         },
         &mut NoProgress,
-        &NeverCancel,
+        &CancelToken::never(),
         None,
     )
     .expect("grit shallow clone");
@@ -500,7 +518,7 @@ fn shallow_clone_includes_annotated_tag_on_tip_not_on_old_commit() {
             ..CloneOptions::new(url, grit_dest.clone())
         },
         &mut NoProgress,
-        &NeverCancel,
+        &CancelToken::never(),
         None,
     )
     .expect("grit shallow clone");
@@ -564,12 +582,14 @@ fn shallow_depth_two_keeps_annotated_tag_on_fetched_parent() {
             ..CloneOptions::new(bare.to_string_lossy(), dest.clone())
         },
         &mut NoProgress,
-        &NeverCancel,
+        &CancelToken::never(),
         None,
     )
     .expect("depth-2 shallow clone");
 
-    let tag_oid = resolve_ref(&dest.join(".git"), "refs/tags/parent-tag")
+    let tag_oid = grit_test_support::refs::at(&dest.join(".git"))
+        .references()
+        .resolve("refs/tags/parent-tag")
         .expect("refs/tags/parent-tag must exist like git clone --depth=2");
     assert!(
         outcome
@@ -595,7 +615,9 @@ fn shallow_depth_two_keeps_annotated_tag_on_fetched_parent() {
         .status()
         .expect("git clone");
     assert!(status.success(), "git clone --depth=2 failed");
-    let git_tag = resolve_ref(&git_dest.join(".git"), "refs/tags/parent-tag")
+    let git_tag = grit_test_support::refs::at(&git_dest.join(".git"))
+        .references()
+        .resolve("refs/tags/parent-tag")
         .expect("git must keep parent-tag");
     assert_eq!(tag_oid, git_tag, "grit and git must agree on tag oid");
 }

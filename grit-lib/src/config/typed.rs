@@ -69,11 +69,9 @@ pub fn parse_typed_value(
     env: &Environment,
 ) -> Result<TypedConfigValue> {
     match ty {
-        ConfigValueType::Bool => parse_bool(value).map(TypedConfigValue::Bool).map_err(|_| {
-            Error::Config(ConfigError::Other(format!(
-                "bad boolean config value '{value}' for '{key}'"
-            )))
-        }),
+        ConfigValueType::Bool => parse_bool(value)
+            .map(TypedConfigValue::Bool)
+            .map_err(|e| e.for_key(key).into()),
         ConfigValueType::Int => parse_git_config_int_strict(value)
             .map(TypedConfigValue::Int)
             .map_err(|e| int_parse_error(key, value, e)),
@@ -111,7 +109,7 @@ impl ConfigSet {
     /// Returns [`ConfigError::BadNumericValue`] (as [`Error::Config`]) when the value is
     /// not an integer or does not fit in an `i64`.
     pub(crate) fn get_i64_strict(&self, key: &str) -> Result<Option<i64>> {
-        let Some(raw) = self.get(key) else {
+        let Some(raw) = self.value(key) else {
             return Ok(None);
         };
         parse_git_config_int_strict(&raw)
@@ -126,7 +124,7 @@ impl ConfigSet {
     /// # Errors
     ///
     /// Returns [`Error::Config`] when `prefix` is empty or invalid.
-    pub fn entries_with_prefix(&self, prefix: &str) -> Result<Vec<super::ConfigEntry>> {
+    pub fn entries_under(&self, prefix: &str) -> Result<Vec<super::ConfigEntry>> {
         let matcher = list_prefix_match(prefix)?;
         Ok(self
             .entries()
@@ -141,20 +139,21 @@ impl ConfigSet {
 }
 
 fn list_prefix_match(prefix: &str) -> Result<ListPrefixMatch> {
+    let invalid = || {
+        Error::Config(ConfigError::InvalidListPrefix {
+            prefix: prefix.to_owned(),
+        })
+    };
     let prefix = prefix.trim();
     if prefix.is_empty() {
-        return Err(Error::Config(ConfigError::Other(
-            "list prefix must not be empty".into(),
-        )));
+        return Err(invalid());
     }
     if let Ok(canon) = canonical_key(prefix) {
         return Ok(ListPrefixMatch::ExactKey(canon));
     }
     let section_part = prefix.trim_end_matches('.');
     if section_part.is_empty() {
-        return Err(Error::Config(ConfigError::Other(
-            "list prefix must not be empty".into(),
-        )));
+        return Err(invalid());
     }
     let (sec, sub) = match section_part.find('.') {
         Some(i) => (&section_part[..i], Some(&section_part[i + 1..])),
@@ -165,18 +164,14 @@ fn list_prefix_match(prefix: &str) -> Result<ListPrefixMatch> {
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
     {
-        return Err(Error::Config(ConfigError::Other(format!(
-            "invalid list prefix '{prefix}'"
-        ))));
+        return Err(invalid());
     }
     let sec_lower = sec.to_ascii_lowercase();
     let needle = match sub {
         None => format!("{sec_lower}."),
         Some(sub) if !sub.is_empty() => format!("{sec_lower}.{sub}."),
         Some(_) => {
-            return Err(Error::Config(ConfigError::Other(format!(
-                "invalid list prefix '{prefix}'"
-            ))));
+            return Err(invalid());
         }
     };
     Ok(ListPrefixMatch::KeyPrefix(needle))

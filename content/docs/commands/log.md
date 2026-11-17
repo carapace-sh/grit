@@ -12,7 +12,7 @@ grit log [<REV>…] [-n <N>] [--cursor <token>] [--no-pager]
   [-p] [--stat | --numstat | --shortstat | --name-only | --name-status] [-U<N>]
   [--oneline] [--decorate] [--graph] [--graph-ascii] [--graph-unicode] [--group-by author] [--count]
   [--skip <N>] [--since|--after <date>] [--until|--before <date>]
-  [--first-parent] [--merges | --no-merges] [--reverse]
+  [--first-parent] [--follow] [--merges | --no-merges] [--reverse]
   [--author <pat>] [--committer <pat>] [--grep <pat>]
   [-S <string>] [-G <pat>] [--pickaxe-regex]
   [-i] [--all-match] [--invert-grep] [-F] [--no-mailmap]
@@ -23,18 +23,20 @@ grit log [<REV>…] [-n <N>] [--cursor <token>] [--no-pager]
 
 ## Description
 
-Lists commits reachable from the selected revisions (default `HEAD`), newest first. Each line shows the short commit id, the change id, the author, when the commit was made and its subject (the first line of its message). The author is the commit's author name when present, otherwise the part of their email address before the `@`.
+Lists commits reachable from the selected revisions (default `HEAD`), newest first. Each line shows the short commit id, the change id, the author, when the commit was made and its subject (the first line of its message). Short ids follow `core.abbrev` (Git’s auto length from the number of packed objects when unset) and extend when needed so they always resolve with `grit show` or `grit log <id>`. The author is the commit's author name when present, otherwise the part of their email address before the `@`.
 
 How much it shows depends on who is reading:
 
 - **On a terminal**, `grit log` shows the whole history, one line per commit, through the pager, and cuts every row to the terminal width so nothing wraps. Each row ends at the right edge with the lines the commit added and removed (`+12 -3`, against its first parent; merges and commits that change no lines show none). History is walked a batch at a time, so the first screen appears at once, and the walk stops when you quit the pager. `--no-pager` writes straight to the terminal. `-n` still limits the listing.
 - **For scripts and agents** (`--json`, `--markdown`, or output piped or redirected), it shows a page of twenty commits (or `-n`). When there is more history, the last line gives the command for the next page, `→ more: grit log --cursor=<token>` (in Markdown, ``More history: run `grit log --cursor=<token>` ``), and `--json` puts the same token in `next`.
 
-The pager is `GRIT_PAGER`, then the `core.pager` config, then `PAGER`, then `less`; an empty value or `cat` turns paging off. As in Git, `LESS=FRX` and `LV=-c` are set unless you set them, so a history that fits on one screen prints and exits.
+The pager is `GRIT_PAGER`, then the `core.pager` config, then `PAGER`, then `less`; an empty value or `cat` turns paging off. As in Git, `LESS=FRX` and `LV=-c` are set unless you set them, so a history that fits on one screen prints and exits. When the pager executable is missing or the shell cannot start it, grit prints a short note on stderr and writes the log straight to the terminal instead.
 
 On a [GitButler workspace](../status/#gitbutler-workspaces), `grit log` with no revision starts from the applied branches instead of `HEAD`, so GitButler's workspace commit is not listed. Naming a revision (`grit log HEAD`) walks exactly that.
 
-Revision selection matches [`grit revs`](../revs/): plain tips, `A..B`, `A...B`, `^tip`, and the same ref-set flags (`--all`, `--branches`, and so on). Path operands after `--` limit to commits that touch those paths (same cwd rules as [`grit diff`](../diff/)). Path filters use the same author/date output as the default log, not the bare oid list from `grit revs`. Without `-n`, every matching commit is listed when paths are set (not capped at a page).
+In a shallow clone, commits listed in `.git/shallow` are treated as roots for `-p` and `--stat`: their patch is against the empty tree, the same as [`grit show`](../show/).
+
+Revision selection matches [`grit revs`](../revs/): plain tips, `A..B`, `A...B`, `^tip`, and the same ref-set flags (`--all`, `--branches`, and so on). With no revision arguments, `--branches`, `--tags`, and `--remotes` (and optional globs) replace the usual default start at `HEAD`; they do not add `HEAD` on top. If the selection matches no refs, the log is empty (exit 0), like `git log`. Path operands after `--` limit to commits that touch those paths (same cwd rules as [`grit diff`](../diff/)). Attribute pathspecs such as `:(attr:myattr)` use the repository's current `.gitattributes` stack, like diff and status; they do not read historical attribute files from each commit's tree. Long-form magic pathspecs (`:(...)`) can appear as trailing operands without `--` (they are not treated as revision names). When a path filter matches no commits on a repository that already has history, human output is blank (not "No commits yet."). Path filters use the same author/date output as the default log, not the bare oid list from `grit revs`. Without `-n`, every matching commit is listed when paths are set (not capped at a page).
 
 The continuation token is short and local to the repository (`lw1.s.` plus eight characters, stored under `.git/grit/log-walk/`; in a read-only repository it is the longer self-contained `lw1.` form instead); it encodes the revision selection, so the next page needs only `--cursor=<token>`. Path filters, commit filters (`--author`, `--grep`, …), pickaxe filters (`-S`, `-G`), `--reverse`, `--first-parent`, merge filters, `--skip`, and a one-shot `-n` without `--cursor` do not emit a continuation cursor; when such a listing stops early, the hint is ``→ more: rerun with a larger `-n` ``.
 
@@ -46,7 +48,7 @@ Author, committer, and message filters match [`grit revs`](../revs/): patterns u
 
 Diff detail flags (same family as [`grit diff`](../diff/)) append output under each commit line: `-p` / `--patch` (unified patch), `--stat`, `--numstat`, `--shortstat`, `--name-only`, or `--name-status`. Only one format at a time. `-U` sets unified context lines for patches (default from `diff.context`).
 
-With `--stat`, each commit is also summarized in JSON under `stat` (legacy shape matching [`grit show`](../show/)). Merge commits show the change against their first parent for stat and name modes; `-p` skips merge patches (like `git log -p`). Path operands limit both which commits appear and the paths included in each patch.
+With `--stat`, each commit is also summarized in JSON under `stat` (legacy shape matching [`grit show`](../show/)). By default, merge commits include no diff in any detail mode (same as `git log` without `-m`, `-c`, or `--cc`); there is no grit flag for a first-parent or combined merge diff yet. Path operands limit both which commits appear and the paths included in each patch.
 
 With `--graph`, human output draws a commit graph in the left margin (Unicode box-drawing by default, or ASCII `*|` with `--graph-ascii`). `--graph-unicode` is accepted as an alias for the default Unicode graph and implies `--graph`. Graph mode uses topological ordering like Git's `log --graph`, including with path and author/committer/grep filters (filtered commits are skipped while keeping lane connectivity). `--json` rejects `--graph` (exit **1**, `kind: "incompatible_flags"`) because graph columns are human-only; `--markdown` lists commits without graph columns and includes a note that `--graph` is human-only. `--graph` cannot be combined with diff format flags, `--group-by`, or `--cursor`.
 
@@ -62,9 +64,10 @@ With `--graph`, human output draws a commit graph in the left margin (Unicode bo
 | `--since`, `--after <date>` | Exclude commits older than this date (committer date). Accepts Git approxidate strings (for example `2024-01-01`, `1 week ago`, `yesterday`) as well as ISO/RFC forms. |
 | `--until`, `--before <date>` | Exclude commits newer than this date. |
 | `--first-parent` | Follow only the first parent at merges (disables cursor paging). |
+| `--follow` | With exactly one literal file path after `--`, include commits before a rename of that file (Git `log --follow`). Still walks when the path no longer exists at the start commit. |
 | `--merges` | Only merge commits (conflicts with `--no-merges`; disables cursor paging). |
 | `--no-merges` | Exclude merge commits (conflicts with `--merges`; disables cursor paging). |
-| `--reverse` | Oldest commits first (disables cursor paging). |
+| `--reverse` | Print the selected window oldest-first. `-n`, `--skip`, and date filters choose the window (newest `N` commits after skip); `--reverse` only flips that window (disables cursor paging). |
 | `--all` | Include every ref tip. |
 | `--branches[=<glob>]` | Branch tips, optionally filtered by glob under `refs/heads/`. |
 | `--tags[=<glob>]` | Tag tips, optionally filtered by glob under `refs/tags/`. |
@@ -79,7 +82,7 @@ With `--graph`, human output draws a commit graph in the left margin (Unicode bo
 | `--name-status` | Status letter and path(s) per line per commit. |
 | `-U`, `--unified <N>` | Context lines for `-p` (Git `-U`). |
 | `-W`, `--function-context` | Expand patch hunks to enclosing function boundaries when `-p` is set. |
-| `--oneline` | One line per commit: short oid and subject (`--json` unchanged). With `--decorate`, refs appear in parentheses after the oid. |
+| `--oneline` | One line per commit: collision-aware short oid and subject (`--json` unchanged). With `--decorate`, refs appear in parentheses after the oid. |
 | `--graph` | Draw a commit graph beside each commit in human output only (implies topological order; Unicode lanes by default). |
 | `--no-pager` | On a terminal, write straight to it instead of through the pager. |
 | `--graph-ascii` | Use ASCII `*|` lane characters in `--graph` output instead of Unicode. |
@@ -184,7 +187,7 @@ Pass `--json` for stable, scripting-friendly output:
 | ----- | ---- | ------- |
 | `commits` | array | Up to twenty commits by default, or up to `-n` when set, newest first. Each entry uses the shared [`CommitJson`](../README.md#commit-json-object-commitjson) shape (`oid`, `parents`, `author`, `committer`, `subject`, `message`, `refs`, `change_id`, `change_id_stored`, optional `relative_date`). Defaults to `[]` when omitted (for example with `--group-by author`, which fills `groups` instead). |
 | `commits[].files` | array | With any diff detail flag: same [`FileDiff`](/schemas/diff/v1.json) objects as [`grit diff`](../diff/) (including `stat` sub-objects for `--stat` / `--numstat`). |
-| `commits[].totals` | object | With stat-style flags: `files_changed`, `insertions`, `deletions`. |
+| `commits[].totals` | object | With `--stat`, `--numstat`, `--shortstat`, or `-p`: `files_changed`, `insertions`, `deletions` (for `-p`, summed from patch hunks). Omitted with `--name-only` and `--name-status`. |
 | `commits[].stat` | object | Only with `--stat`: duplicate summary in the legacy [`grit show`](../show/) `stat` shape (`files`, `files_changed`, …). |
 | `groups` | array | With `--group-by author`: `{name, email, count, commits?}` sorted like `git shortlog -sne`. `commits` holds full [`CommitJson`](../README.md#commit-json-object-commitjson) rows unless `--count` is set. |
 | `next` | string or null | Opaque continuation cursor (prefix `lw1.`) to pass to `--cursor` for the next page, or `null` when there is no more history or when the walk does not support paging (paths, `--reverse`, `--group-by`, and similar). |

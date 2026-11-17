@@ -3,7 +3,7 @@
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::index::write_tree::{cache_tree_extension_valid, cache_tree_fully_valid};
 use grit_lib::index::Index;
-use grit_lib::porcelain::commit::{commit_worktree, CommitRequest};
+use grit_lib::porcelain::commit::CommitRequest;
 use grit_lib::porcelain::stage_tracked::{
     stage_tracked_modifications_with_thresholds, IndexStagingThresholds,
 };
@@ -55,7 +55,11 @@ fn noop_tracked_restage_preserves_cache_tree_at_campaign_scale() {
 
     let repo = open_repo(root);
     let index_path = root.join(".git/index");
-    let before = Index::parse(&std::fs::read(&index_path).expect("read index")).expect("parse");
+    let before = Index::parse(
+        &std::fs::read(&index_path).expect("read index"),
+        &grit_lib::index::IndexParseOptions::default(),
+    )
+    .expect("parse");
     assert!(
         before.cache_tree.is_some(),
         "git commit should leave a TREE extension on the index"
@@ -69,8 +73,11 @@ fn noop_tracked_restage_preserves_cache_tree_at_campaign_scale() {
         "clean worktree should not restage"
     );
 
-    let index =
-        Index::parse(&std::fs::read(&index_path).expect("read index after")).expect("parse");
+    let index = Index::parse(
+        &std::fs::read(&index_path).expect("read index after"),
+        &grit_lib::index::IndexParseOptions::default(),
+    )
+    .expect("parse");
     assert!(
         index.cache_tree.is_some(),
         "no-op tracked scan must not drop cache-tree upfront (issue #1184)"
@@ -87,12 +94,12 @@ fn noop_tracked_restage_preserves_cache_tree_at_campaign_scale() {
 
 fn commit_worktree_req(message: &str, allow_empty: bool) -> CommitRequest {
     let mut req = CommitRequest::new(message);
-    let sig = ident().parse().expect("signature");
+    let sig: grit_lib::ident::Signature = ident().parse().expect("signature");
     req.author = Some(sig.clone());
     req.committer = Some(sig);
     req.allow_empty = allow_empty;
     req.assume_worktree_synced = true;
-    req.skip_pre_commit_tree_match(true)
+    grit_lib::test_support::knobs::commit_skip_pre_commit_tree_match(req, true)
 }
 
 #[test]
@@ -104,19 +111,26 @@ fn allow_empty_commit_preserves_cache_tree_without_full_restage() {
     let repo = open_repo(root);
     let index_path = root.join(".git/index");
     let before = std::fs::read(&index_path).expect("index bytes");
-    let before_idx = Index::parse(&before).expect("parse");
+    let before_idx =
+        Index::parse(&before, &grit_lib::index::IndexParseOptions::default()).expect("parse");
     assert!(before_idx.cache_tree.is_some());
-
-    commit_worktree(
-        &repo,
-        &commit_worktree_req("empty", true),
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("allow-empty commit");
+    repo.commits()
+        .create(
+            &grit_lib::commits::CommitOptions::new(
+                commit_worktree_req(
+                    "empty".clone(),
+                    grit_lib::porcelain::commit::CommitScope::AutoStage,
+                ),
+                true,
+            ),
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("allow-empty commit");
 
     let after = std::fs::read(&index_path).expect("index after");
-    let after_idx = Index::parse(&after).expect("parse after");
+    let after_idx =
+        Index::parse(&after, &grit_lib::index::IndexParseOptions::default()).expect("parse after");
     assert!(
         after_idx.cache_tree.is_some(),
         "allow-empty on clean tree should keep cache-tree for incremental write-tree"

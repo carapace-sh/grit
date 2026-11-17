@@ -1,19 +1,20 @@
 //! Concurrent [`Odb::read`] from worker threads (pack store context and byte identity).
 
+use grit_lib::error::ObjectError;
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier};
 
 use grit_lib::error::Error;
-use grit_lib::objects::midx::{write_multi_pack_index_with_options, WriteMultiPackIndexOptions};
+use grit_lib::objects::midx::{write_multi_pack_index, WriteMultiPackIndexOptions};
 use grit_lib::objects::odb::Odb;
-use grit_lib::objects::pack::{clear_pack_cache, read_pack_index};
-use grit_lib::objects::pack_store::test_hooks;
 use grit_lib::objects::{ObjectId, ObjectKind};
+use grit_lib::refs::ref_storage::RefStorageFormat;
 use grit_lib::remote::transfer::{build_pack, PackBuildOptions};
 use grit_lib::repo::{InitOptions, Repository};
-use grit_lib::RefStorageFormat;
+use grit_lib::test_support::objects_pack::{clear_pack_cache, read_pack_index};
+use grit_lib::test_support::pack_store;
 use tempfile::TempDir;
 
 fn assert_send_sync<T: Send + Sync>() {}
@@ -63,10 +64,10 @@ fn install_pack(objects_dir: &Path, stem: &str, pack: &[u8]) -> Vec<ObjectId> {
 #[test]
 fn odb_concurrent_reads() {
     clear_pack_cache();
-    test_hooks::reset();
+    pack_store::reset();
 
     let root = TempDir::new().expect("tempdir");
-    let repo = Repository::init(
+    let (repo, _) = Repository::init(
         root.path(),
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
@@ -126,8 +127,7 @@ fn odb_concurrent_reads() {
     .expect("alternates");
 
     let pack_dir = primary_objects.join("pack");
-    write_multi_pack_index_with_options(&pack_dir, &WriteMultiPackIndexOptions::default())
-        .expect("write midx");
+    write_multi_pack_index(&pack_dir, &WriteMultiPackIndexOptions::default()).expect("write midx");
     let probe = packed_blob_oids[0];
     grit_lib::objects::midx::try_read_object_via_midx(&primary_objects, &probe)
         .expect("midx read probe")
@@ -150,7 +150,7 @@ fn odb_concurrent_reads() {
         })
         .collect();
 
-    test_hooks::reset();
+    pack_store::reset();
 
     let stop = Arc::new(AtomicBool::new(false));
     let odb_inv = odb.clone();
@@ -186,12 +186,12 @@ fn odb_concurrent_reads() {
     invalidator.join().expect("invalidator");
 
     assert_eq!(
-        test_hooks::legacy_stores_created(),
+        pack_store::legacy_stores_created(),
         0,
         "Odb reads must not create legacy thread-local pack stores"
     );
     assert_eq!(
-        test_hooks::implicit_stores_created(),
+        pack_store::implicit_stores_created(),
         0,
         "Odb reads must not create implicit pack stores"
     );
@@ -206,8 +206,8 @@ fn odb_concurrent_reads() {
         }
     });
 
-    assert_eq!(test_hooks::legacy_stores_created(), 0);
-    assert_eq!(test_hooks::implicit_stores_created(), 0);
+    assert_eq!(pack_store::legacy_stores_created(), 0);
+    assert_eq!(pack_store::implicit_stores_created(), 0);
 }
 
 /// Regression: a thread holding `with_pack_read_context` must not return bytes after another
@@ -215,10 +215,10 @@ fn odb_concurrent_reads() {
 #[test]
 fn stale_read_after_invalidation() {
     clear_pack_cache();
-    test_hooks::reset();
+    pack_store::reset();
 
     let root = TempDir::new().expect("tempdir");
-    let repo = Repository::init(
+    let (repo, _) = Repository::init(
         root.path(),
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
@@ -255,7 +255,7 @@ fn stale_read_after_invalidation() {
             ready_tx.send(()).expect("ready");
             done_rx.recv().expect("wait for invalidation");
             match odb_reader.read(&oid) {
-                Err(Error::ObjectNotFound(_)) => false,
+                Err(Error::Object(ObjectError::NotFound { .. })) => false,
                 Ok(_) => true,
                 Err(other) => panic!("unexpected read error: {other}"),
             }
@@ -278,7 +278,10 @@ fn stale_read_after_invalidation() {
         "read after cross-thread invalidation must not return removed pack objects"
     );
     assert!(
-        matches!(odb.read(&oid), Err(Error::ObjectNotFound(_))),
+        matches!(
+            odb.read(&oid),
+            Err(Error::Object(ObjectError::NotFound { .. }))
+        ),
         "serial read after pack removal must miss"
     );
 }
@@ -323,8 +326,158 @@ fn pack_thread_local_warm_follows_active_store_on_one_thread() {
     .expect("pack b");
     install_pack(&objects_a, "a", &pack_a);
     install_pack(&objects_b, "b", &pack_b);
-    grit_lib::objects::pack::read_object_from_packs(&objects_a, &oid_a)
+    grit_lib::test_support::objects_pack::read_object_from_packs(&objects_a, &oid_a)
         .expect("prime legacy store a");
     let got_b = odb_b.read(&oid_b).expect("read via odb b store");
     assert_eq!(got_b.data, b"store-b\n");
+}
+
+#[cfg(target_os = "linux")]
+fn proc_maps_regions_for(path: &Path) -> usize {
+    let needle = path.to_string_lossy();
+    std::fs::read_to_string("/proc/self/maps")
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| line.contains(needle.as_ref()))
+        .count()
+}
+
+/// Regression (#2495): repeated open/read/drop on one thread must not retain pack/idx mmaps.
+#[test]
+#[cfg(target_os = "linux")]
+fn pack_thread_local_released_when_store_dropped_on_same_thread() {
+    clear_pack_cache();
+    let root = TempDir::new().expect("tempdir");
+    let (repo, _) = Repository::init(
+        root.path(),
+        &InitOptions::new()
+            .with_initial_branch("main".to_owned())
+            .with_ref_storage(RefStorageFormat::Files),
+    )
+    .expect("init repo");
+    let objects = repo.git_dir().join("objects");
+    let mut blob_oids = Vec::new();
+    for i in 0..64 {
+        let mut payload = vec![0u8; 16 * 1024];
+        for (j, b) in payload.iter_mut().enumerate() {
+            *b = ((i * 997 + j) & 0xff) as u8;
+        }
+        let oid = repo
+            .odb()
+            .write(ObjectKind::Blob, &payload)
+            .expect("write blob");
+        blob_oids.push(oid);
+    }
+    let pack = build_pack(
+        repo.odb(),
+        &blob_oids,
+        &[],
+        &PackBuildOptions {
+            delta: false,
+            ..PackBuildOptions::default()
+        },
+    )
+    .expect("build pack");
+    assert!(
+        pack.len() > 8192,
+        "pack must exceed mmap ownership threshold for this regression"
+    );
+    install_pack(&objects, "big", &pack);
+    let probe = blob_oids[0];
+    let pack_path = objects.join("pack/big.pack");
+    let idx_path = objects.join("pack/big.idx");
+
+    let mut baseline = None;
+    for _ in 0..20 {
+        let odb = Odb::with_work_tree(&objects, root.path());
+        odb.read_info(&probe).expect("read in loop");
+        let pack_regions = proc_maps_regions_for(&pack_path);
+        let idx_regions = proc_maps_regions_for(&idx_path);
+        if let Some((base_pack, base_idx)) = baseline {
+            assert_eq!(
+                pack_regions, base_pack,
+                "pack mmap regions must not grow with repeated store drops"
+            );
+            assert_eq!(
+                idx_regions, base_idx,
+                "idx mmap regions must not grow with repeated store drops"
+            );
+        } else {
+            baseline = Some((pack_regions, idx_regions));
+        }
+    }
+}
+
+/// Dropping one store on a thread must not release another live store's warm TLS.
+#[test]
+#[cfg(target_os = "linux")]
+fn pack_thread_local_drop_one_store_leaves_sibling_warm() {
+    clear_pack_cache();
+    let tmp_a = TempDir::new().expect("tempdir a");
+    let tmp_b = TempDir::new().expect("tempdir b");
+    let objects_a = tmp_a.path().join("objects");
+    let objects_b = tmp_b.path().join("objects");
+    std::fs::create_dir_all(objects_a.join("pack")).expect("pack a");
+    std::fs::create_dir_all(objects_b.join("pack")).expect("pack b");
+    let odb_a = Odb::new(&objects_a);
+    let odb_b = Odb::new(&objects_b);
+    let payload = format!("{}\n", "y".repeat(9000));
+    let oid_a = odb_a
+        .write(ObjectKind::Blob, payload.as_bytes())
+        .expect("write a");
+    let oid_b = odb_b
+        .write(ObjectKind::Blob, b"store-b sibling\n")
+        .expect("write b");
+    let pack_a = build_pack(
+        &odb_a,
+        &[oid_a],
+        &[],
+        &PackBuildOptions {
+            delta: false,
+            ..PackBuildOptions::default()
+        },
+    )
+    .expect("pack a");
+    let pack_b = build_pack(
+        &odb_b,
+        &[oid_b],
+        &[],
+        &PackBuildOptions {
+            delta: false,
+            ..PackBuildOptions::default()
+        },
+    )
+    .expect("pack b");
+    install_pack(&objects_a, "a", &pack_a);
+    install_pack(&objects_b, "b", &pack_b);
+
+    odb_b.read(&oid_b).expect("warm store b");
+    {
+        let odb_a_short = Odb::new(&objects_a);
+        odb_a_short.read(&oid_a).expect("warm store a");
+    }
+    let got_b = odb_b.read(&oid_b).expect("store b still readable");
+    assert_eq!(got_b.data, b"store-b sibling\n");
+
+    let pack_b_path = objects_b.join("pack/b.pack");
+    let idx_b_path = objects_b.join("pack/b.idx");
+    let baseline_pack_b = proc_maps_regions_for(&pack_b_path);
+    let baseline_idx_b = proc_maps_regions_for(&idx_b_path);
+    for _ in 0..10 {
+        let odb_a_short = Odb::new(&objects_a);
+        odb_a_short.read(&oid_a).expect("read a");
+    }
+    assert_eq!(
+        proc_maps_regions_for(&pack_b_path),
+        baseline_pack_b,
+        "sibling store b pack mapping must survive drops of store a"
+    );
+    assert_eq!(
+        proc_maps_regions_for(&idx_b_path),
+        baseline_idx_b,
+        "sibling store b idx mapping must survive drops of store a"
+    );
+    odb_b
+        .read(&oid_b)
+        .expect("store b still warm after a drops");
 }

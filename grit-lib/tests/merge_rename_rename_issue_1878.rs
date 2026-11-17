@@ -11,18 +11,19 @@ use std::path::Path;
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::diff::merge_file::MergeFavor;
 use grit_lib::diff::merge_trees::{merge_trees_three_way, RenameRenameConflict};
+use grit_lib::merge::{
+    IntegrateBranchOutcome, MergeOptions, MergePrediction, MergePredictionOptions,
+};
 use grit_lib::objects::ObjectId;
 use grit_lib::operation::{conflicts_from_tree_merge, Conflict, ConflictKind, RenamedPaths};
-use grit_lib::porcelain::merge::{
-    integrate_branch_with, predict_merge, IntegrateBranchOutcome, MergeOptions, MergePrediction,
-    MergePredictionOptions,
-};
 use grit_lib::porcelain::replay::{replay_commit, ReplayDirection, ReplayOutcome, ReplayRequest};
+use grit_lib::progress::CancelToken;
 use grit_lib::repo::Repository;
 use grit_lib::revwalk::history::{
-    rebase_onto, EmptyPolicy, HistoryError, RebaseOntoOptions, RefScope, RewriteOptions,
+    EmptyPolicy, HistoryError, RebaseOntoOptions, RefScope, RewriteOptions,
 };
 use grit_test_support::git;
+use grit_test_support::{integrate_branch_with, predict_merge};
 use support::{
     assert_git_fsck_strict, assert_merge_output_matches_oracle, commit_tree, git_ls_files_stage,
     git_merge_tree_oracle, CommitMergeLabels,
@@ -158,7 +159,7 @@ fn assert_tree_merge_matches_git(fx: &Fixture, context: &str) {
         "{context}: git must report rename/rename:\n{}",
         oracle.stdout
     );
-    assert_merge_output_matches_oracle(&fx.repo, &merged, &oracle, context);
+    assert_merge_output_matches_oracle(fx.repo, &merged, &oracle, context);
 }
 
 #[test]
@@ -221,10 +222,10 @@ fn integrate_branch_stops_with_git_index_stages() {
         "topic",
         &MergeOptions::default(),
         &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
+        &CancelToken::never(),
     )
     .expect("merge");
-    let IntegrateBranchOutcome::Conflicts { paths, details } = outcome else {
+    let IntegrateBranchOutcome::Conflicts { paths, details, .. } = outcome else {
         panic!("expected conflicts, got {outcome:?}");
     };
     assert_eq!(paths, vec!["a", "b", "c"]);
@@ -282,7 +283,7 @@ fn pick_of_the_other_rename_conflicts() {
             message_override: None,
         },
         &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
+        &CancelToken::never(),
     )
     .expect("pick");
     let ReplayOutcome::Conflicts { paths } = outcome else {
@@ -301,7 +302,10 @@ fn rebase_onto_the_other_rename_conflicts() {
         preserve_committer: false,
         sign: true,
     });
-    let err = rebase_onto(&fx.repo, fx.base, fx.topic, &[fx.main], &opts)
+    let err = fx
+        .repo
+        .history()
+        .rebase_onto(fx.base, fx.topic, &[fx.main], &opts)
         .expect_err("rebase must stop on the rename/rename conflict");
     let HistoryError::Conflict {
         commit,
@@ -393,7 +397,7 @@ fn assert_clean_merge_matches_git(root: &Path) {
         "topic",
         &MergeOptions::default(),
         &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
+        &CancelToken::never(),
     )
     .expect("merge");
     let IntegrateBranchOutcome::Merged { oid, .. } = outcome else {

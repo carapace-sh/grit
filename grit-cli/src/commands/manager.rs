@@ -88,3 +88,26 @@ fn not_windows() -> Result<()> {
         "`grit manager` stores credentials in the Windows Credential Manager and is only available on Windows"
     )
 }
+
+/// Dispatch parsed CLI args for `Manager`.
+pub fn dispatch(
+    args: crate::args::ManagerArgs,
+    env: crate::dispatch::CommandEnv<'_>,
+) -> anyhow::Result<crate::exit_status::ExitStatus> {
+    use crate::args::*;
+    use crate::commands;
+
+    use crate::dispatch::CommandEnv;
+    use crate::exit_status::ExitStatus;
+
+    let CommandEnv {
+        opts: _,
+        ctx: _,
+        process_env: _,
+    } = env;
+    let ManagerArgs { operation } = args;
+    {
+        commands::manager::run(&operation)?;
+        Ok(ExitStatus::Success)
+    }
+}

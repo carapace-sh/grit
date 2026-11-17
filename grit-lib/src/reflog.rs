@@ -8,6 +8,18 @@
 //! <old-sha> <new-sha> <name> <<email>> <timestamp> <timezone>\t<message>
 //! ```
 
+use crate::commit_graph_file::CommitGraphChain;
+use crate::config::ConfigSet;
+use crate::error::RefError;
+use crate::error::{Error, Result};
+use crate::ident::Signature;
+use crate::index::MODE_TREE;
+use crate::merge_base;
+use crate::objects::{parse_commit, parse_tree, CommitRef, ObjectId, ObjectKind, OidHashMap};
+use crate::refs::store::{RefNameRef, RefStore as _, RefStoreError};
+use crate::refs::{self, reflog_file_path};
+use crate::repo::Repository;
+use crate::wildmatch::{wildmatch, WM_PATHNAME};
 use std::cell::{OnceCell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -17,18 +29,6 @@ use std::io::{Read, Seek, SeekFrom};
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-
-use crate::commit_graph_file::CommitGraphChain;
-use crate::config::ConfigSet;
-use crate::error::{Error, Result};
-use crate::ident::Signature;
-use crate::index::MODE_TREE;
-use crate::merge_base;
-use crate::objects::{parse_commit, parse_tree, CommitRef, ObjectId, ObjectKind, OidHashMap};
-use crate::refs::store::{RefStore as _, RefStoreError};
-use crate::refs::{self, reflog_file_path};
-use crate::repo::Repository;
-use crate::wildmatch::{wildmatch, WM_PATHNAME};
 
 mod selector;
 pub use selector::{parse_reflog_ref, ReflogSelector};
@@ -92,7 +92,7 @@ impl MessageMatcher {
 ///
 /// Uses the same storage rules as [`refs::append_reflog`] (branch reflogs under the
 /// repository common directory for linked worktrees).
-pub fn reflog_path(git_dir: &Path, refname: &str) -> PathBuf {
+pub(crate) fn reflog_path(git_dir: &Path, refname: &str) -> PathBuf {
     reflog_file_path(git_dir, refname)
 }
 
@@ -103,7 +103,7 @@ pub fn reflog_path(git_dir: &Path, refname: &str) -> PathBuf {
 /// # Errors
 ///
 /// Returns I/O errors from reading or writing the reflog file.
-pub fn truncate_last_reflog_line(git_dir: &Path, refname: &str) -> Result<()> {
+pub(crate) fn truncate_last_reflog_line(git_dir: &Path, refname: &str) -> Result<()> {
     if crate::refs::store::open_ref_store(git_dir)?.format()
         != crate::refs::store::RefStorageFormat::Files
     {
@@ -141,11 +141,14 @@ fn adjust_reflog_shared_perm(git_dir: &Path, path: &Path) {
     let Ok(config) = ConfigSet::load(
         &crate::environment::Environment::empty(),
         Some(git_dir),
-        true,
+        &crate::config::LoadConfigOptions::standard(
+            &crate::environment::Environment::empty(),
+            Some(git_dir),
+        ),
     ) else {
         return;
     };
-    let raw = config.get("core.sharedRepository");
+    let raw = config.value("core.sharedRepository");
     let Ok(perm) = crate::shared_repo::shared_repository_from_config_value(raw.as_deref()) else {
         return;
     };
@@ -154,22 +157,12 @@ fn adjust_reflog_shared_perm(git_dir: &Path, path: &Path) {
     }
 }
 
-/// Check whether a reflog exists for the given ref.
-pub fn reflog_exists(git_dir: &Path, refname: &str) -> bool {
-    if let Ok(store) = crate::refs::store::open_ref_store(git_dir) {
-        if store.format() != crate::refs::store::RefStorageFormat::Files {
-            return store.reflog_exists(refname).unwrap_or(false);
-        }
-    }
-    let path = reflog_path(git_dir, refname);
-    path.is_file()
-}
-
 /// Read a reflog using Git's loose ref DWIM rules when the direct path is missing.
 ///
 /// Tries `refname`, then `refs/<refname>`, then `refs/heads/<refname>` (when `refname` is not
 /// already under `refs/`). Matches `read_complete_reflog` in Git's `reflog-walk.c`.
-pub fn read_reflog_dwim(git_dir: &Path, refname: &str) -> Result<Vec<ReflogEntry>> {
+#[allow(dead_code)] // integration / re-export use only
+pub(crate) fn read_reflog_dwim(git_dir: &Path, refname: &str) -> Result<Vec<ReflogEntry>> {
     let mut entries = read_reflog(git_dir, refname)?;
     if !entries.is_empty() {
         return Ok(entries);
@@ -187,16 +180,20 @@ pub fn read_reflog_dwim(git_dir: &Path, refname: &str) -> Result<Vec<ReflogEntry
 /// Read all reflog entries for the given ref, in file order (oldest first).
 ///
 /// Returns an empty vec if the reflog file does not exist.
-pub fn read_reflog(git_dir: &Path, refname: &str) -> Result<Vec<ReflogEntry>> {
+pub(crate) fn read_reflog(git_dir: &Path, refname: &str) -> Result<Vec<ReflogEntry>> {
     if crate::refs::store::open_ref_store(git_dir)?.format()
         != crate::refs::store::RefStorageFormat::Files
     {
         let store = crate::refs::store::ReftableRefStore::open(git_dir.to_path_buf())?;
         let mut entries = Vec::new();
-        store.for_each_reflog_entry(refname, false, &mut |entry| {
-            entries.push(entry.clone());
-            std::ops::ControlFlow::Continue(())
-        })?;
+        store.for_each_reflog_entry_str(
+            RefNameRef::from_trusted(refname),
+            false,
+            &mut |entry| {
+                entries.push(entry.clone());
+                std::ops::ControlFlow::Continue(())
+            },
+        )?;
         return Ok(entries);
     }
     let path = reflog_path(git_dir, refname);
@@ -227,7 +224,7 @@ pub(crate) fn reflog_entry_count(git_dir: &Path, refname: &str) -> Result<usize>
     {
         let store = crate::refs::store::ReftableRefStore::open(git_dir.to_path_buf())?;
         let mut count = 0usize;
-        store.for_each_reflog_entry(refname, false, &mut |_| {
+        store.for_each_reflog_entry_str(RefNameRef::from_trusted(refname), false, &mut |_| {
             count += 1;
             std::ops::ControlFlow::Continue(())
         })?;
@@ -383,7 +380,7 @@ fn parse_reflog_line(line: &str) -> Option<ReflogEntry> {
 /// Collect every non-null object ID mentioned in any reflog.
 ///
 /// Used by `fsck` to validate reflog entries across loose-file and reftable backends.
-pub fn all_reflog_oids(git_dir: &Path) -> Result<HashSet<ObjectId>> {
+pub(crate) fn all_reflog_oids(git_dir: &Path) -> Result<HashSet<ObjectId>> {
     if crate::refs::store::open_ref_store(git_dir)?.format()
         != crate::refs::store::RefStorageFormat::Files
     {
@@ -406,7 +403,7 @@ pub fn all_reflog_oids(git_dir: &Path) -> Result<HashSet<ObjectId>> {
 /// of each OID wins (later duplicates are dropped). `--reflog` on `git log`/`git rev-list` relies
 /// on this order so that commits sharing a committer timestamp are emitted in a stable,
 /// Git-compatible sequence.
-pub fn all_reflog_oids_ordered(git_dir: &Path) -> Result<Vec<ObjectId>> {
+pub(crate) fn all_reflog_oids_ordered(git_dir: &Path) -> Result<Vec<ObjectId>> {
     if crate::refs::store::open_ref_store(git_dir)?.format()
         != crate::refs::store::RefStorageFormat::Files
     {
@@ -480,7 +477,12 @@ fn walk_reflog_files(dir: &Path, out: &mut HashSet<ObjectId>) -> Result<()> {
 ///
 /// Rewrites the reflog through the ref store for `git_dir`, omitting entries at the given
 /// indices.
-pub fn delete_reflog_entries(git_dir: &Path, refname: &str, indices: &[usize]) -> Result<()> {
+#[allow(dead_code)] // integration / re-export use only
+pub(crate) fn delete_reflog_entries(
+    git_dir: &Path,
+    refname: &str,
+    indices: &[usize],
+) -> Result<()> {
     let store = crate::refs::store::open_ref_store(git_dir)?;
     delete_reflog_entries_on_store(store.as_ref(), refname, indices)
 }
@@ -522,14 +524,14 @@ fn rechain_reflog_after_delete(
 }
 
 /// [`delete_reflog_entries`] through an already-selected ref store (for example
-/// [`crate::repo::Repository::refs`], which may be an injected store).
+/// [`crate::repo::Repository::ref_store`], which may be an injected store).
 pub(crate) fn delete_reflog_entries_on_store(
     store: &dyn crate::refs::store::RefStore,
     refname: &str,
     indices: &[usize],
 ) -> Result<()> {
     let indices: Vec<usize> = indices.to_vec();
-    store.rewrite_reflog(refname, &mut move |current| {
+    store.rewrite_reflog_str(RefNameRef::from_trusted(refname), &mut move |current| {
         Ok(filter_reflog_without_indices(current, &indices)
             .map(|(kept, _)| kept)
             .unwrap_or_default())
@@ -544,7 +546,7 @@ pub(crate) fn delete_reflog_entries_rechain_on_store(
     indices: &[usize],
 ) -> Result<()> {
     let indices: Vec<usize> = indices.to_vec();
-    store.rewrite_reflog(refname, &mut move |current| {
+    store.rewrite_reflog_str(RefNameRef::from_trusted(refname), &mut move |current| {
         Ok(filter_reflog_without_indices(current, &indices)
             .map(|(kept, removed_oldest)| rechain_reflog_after_delete(kept, removed_oldest))
             .unwrap_or_default())
@@ -564,7 +566,7 @@ pub(crate) fn read_reflog_on_store(
         return files.read_reflog_entries(refname);
     }
     let mut entries = Vec::new();
-    store.for_each_reflog_entry(refname, false, &mut |entry| {
+    store.for_each_reflog_entry_str(RefNameRef::from_trusted(refname), false, &mut |entry| {
         entries.push(entry.clone());
         std::ops::ControlFlow::Continue(())
     })?;
@@ -574,10 +576,15 @@ pub(crate) fn read_reflog_on_store(
 /// Expire (prune) reflog entries older than a given timestamp (Unix seconds).
 ///
 /// If `expire_time` is `None`, removes all entries.
-pub fn expire_reflog(git_dir: &Path, refname: &str, expire_time: Option<i64>) -> Result<usize> {
+#[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
+pub(crate) fn expire_reflog(
+    git_dir: &Path,
+    refname: &str,
+    expire_time: Option<i64>,
+) -> Result<usize> {
     let store = crate::refs::store::open_ref_store(git_dir)?;
     let mut pruned = 0usize;
-    store.rewrite_reflog(refname, &mut |current| {
+    store.rewrite_reflog_str(RefNameRef::from_trusted(refname), &mut |current| {
         if current.is_empty() {
             return Ok(current);
         }
@@ -607,7 +614,8 @@ pub fn expire_reflog(git_dir: &Path, refname: &str, expire_time: Option<i64>) ->
 ///
 /// When `cutoff` is `None`, no entries are removed.
 ///
-pub fn expire_reflog_unreachable(
+#[allow(dead_code)] // integration / re-export use only
+pub(crate) fn expire_reflog_unreachable(
     repo: &Repository,
     _git_dir: &Path,
     refname: &str,
@@ -625,7 +633,7 @@ pub fn expire_reflog_unreachable(
         Err(_) => return Ok(0),
     };
 
-    let store = repo.refs();
+    let store = repo.ref_store();
     let snapshot = read_reflog_on_store(store, refname)?;
     if snapshot.is_empty() {
         return Ok(0);
@@ -645,19 +653,6 @@ pub fn expire_reflog_unreachable(
     }
     rewrite_reflog_from_snapshot(store, refname, &snapshot, &drop_flags)?;
     Ok(pruned)
-}
-
-/// Format a reflog entry back into the on-disk line format.
-#[cfg_attr(not(test), allow(dead_code))]
-fn format_reflog_entry(entry: &ReflogEntry) -> String {
-    if entry.message.is_empty() {
-        format!("{} {} {}\n", entry.old_oid, entry.new_oid, entry.identity)
-    } else {
-        format!(
-            "{} {} {}\t{}\n",
-            entry.old_oid, entry.new_oid, entry.identity, entry.message
-        )
-    }
 }
 
 /// Extract the Unix timestamp from an identity string.
@@ -680,7 +675,8 @@ fn parse_timestamp_from_identity(identity: &str) -> Option<i64> {
 
 /// Copy `logs/<branch_refname>` to `logs/HEAD` when keeping symbolic-HEAD reflogs aligned with
 /// the checked-out branch (matches Git).
-pub fn mirror_branch_reflog_to_head(git_dir: &Path, branch_refname: &str) -> Result<()> {
+#[allow(dead_code)] // integration / re-export use only
+pub(crate) fn mirror_branch_reflog_to_head(git_dir: &Path, branch_refname: &str) -> Result<()> {
     if crate::refs::store::open_ref_store(git_dir)?.format()
         != crate::refs::store::RefStorageFormat::Files
     {
@@ -709,7 +705,7 @@ pub(crate) fn reflog_refs_on_store(
 ) -> Result<Vec<String>> {
     let mut names = Vec::new();
     store.for_each_reflog_ref(&mut |name| {
-        names.push(name.to_owned());
+        names.push(name.as_str().to_owned());
         ControlFlow::Continue(())
     })?;
     names.sort();
@@ -717,15 +713,38 @@ pub(crate) fn reflog_refs_on_store(
     Ok(names)
 }
 
+/// Every non-zero object id mentioned in any reflog on `store`.
+///
+/// # Errors
+///
+/// Propagates backend read failures.
+pub(crate) fn reflog_oids_on_store(
+    store: &dyn crate::refs::store::RefStore,
+) -> Result<HashSet<ObjectId>> {
+    let mut out = HashSet::new();
+    for name in reflog_refs_on_store(store)? {
+        store.for_each_reflog_entry_str(RefNameRef::from_trusted(&name), false, &mut |entry| {
+            if !entry.old_oid.is_zero() {
+                out.insert(entry.old_oid);
+            }
+            if !entry.new_oid.is_zero() {
+                out.insert(entry.new_oid);
+            }
+            ControlFlow::Continue(())
+        })?;
+    }
+    Ok(out)
+}
+
 /// List all refs that have reflogs.
-pub fn list_reflog_refs(git_dir: &Path) -> Result<Vec<String>> {
+pub(crate) fn list_reflog_refs(git_dir: &Path) -> Result<Vec<String>> {
     if crate::refs::store::open_ref_store(git_dir)?.format()
         != crate::refs::store::RefStorageFormat::Files
     {
         let store = crate::refs::store::ReftableRefStore::open(git_dir.to_path_buf())?;
         let mut refs = Vec::new();
         store.for_each_reflog_ref(&mut |name| {
-            refs.push(name.to_owned());
+            refs.push(name.as_str().to_owned());
             std::ops::ControlFlow::Continue(())
         })?;
         refs.sort();
@@ -804,7 +823,8 @@ fn collect_reflog_refs(
 
 /// Options for [`expire_reflog_git`].
 #[derive(Debug, Clone)]
-pub struct ReflogExpireParams {
+#[allow(dead_code)]
+pub(crate) struct ReflogExpireParams {
     /// Also prune entries whose commits, or any commit, tree or blob reachable from them, are
     /// missing. This walks full history once per expiry; ordinary expiry never does.
     pub stale_fix: bool,
@@ -814,7 +834,7 @@ pub struct ReflogExpireParams {
     pub verbose: bool,
 }
 
-/// What happened to one reflog entry during [`expire_reflog_git`].
+/// What happened to one reflog entry during `expire_reflog_git`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReflogExpireActionKind {
     /// Entry was kept in the reflog.
@@ -827,7 +847,7 @@ pub enum ReflogExpireActionKind {
 
 /// Per-entry report from [`expire_reflog_git`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReflogExpireAction {
+pub(crate) struct ReflogExpireAction {
     /// Ref whose reflog was processed.
     pub refname: String,
     /// The reflog entry that was considered.
@@ -838,7 +858,7 @@ pub struct ReflogExpireAction {
 
 /// Result of [`expire_reflog_git`]: prune count plus a per-entry action list.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReflogExpireResult {
+pub(crate) struct ReflogExpireResult {
     /// Number of entries pruned (or that would be pruned in dry-run mode).
     pub pruned: usize,
     /// One action per reflog entry that was scanned.
@@ -847,7 +867,7 @@ pub struct ReflogExpireResult {
 
 /// Per-ref `gc.<pattern>.reflogExpire*` rule from config.
 #[derive(Debug, Clone)]
-pub struct GcReflogPattern {
+pub(crate) struct GcReflogPattern {
     pattern: String,
     expire_total: Option<i64>,
     expire_unreachable: Option<i64>,
@@ -906,16 +926,16 @@ fn collect_gc_reflog_patterns(config: &ConfigSet, now: i64) -> Vec<GcReflogPatte
 
 fn global_gc_reflog_expiry(config: &ConfigSet, now: i64) -> (Option<i64>, Option<i64>) {
     let total = config
-        .get("gc.reflogExpire")
+        .value("gc.reflogExpire")
         .and_then(|v| parse_reflog_expire_spec(&v, now).ok());
     let unreach = config
-        .get("gc.reflogExpireUnreachable")
+        .value("gc.reflogExpireUnreachable")
         .and_then(|v| parse_reflog_expire_spec(&v, now).ok());
     (total, unreach)
 }
 
 /// Parse `gc.reflogExpire` / `--expire` values: `never` / `false` → keep forever (`0`), else days or epoch.
-pub fn parse_reflog_expire_spec(raw: &str, now: i64) -> Result<i64> {
+pub(crate) fn parse_reflog_expire_spec(raw: &str, now: i64) -> Result<i64> {
     let s = raw.trim();
     if s.eq_ignore_ascii_case("never") || s.eq_ignore_ascii_case("false") {
         return Ok(0);
@@ -923,8 +943,12 @@ pub fn parse_reflog_expire_spec(raw: &str, now: i64) -> Result<i64> {
     if s.eq_ignore_ascii_case("now") || s.eq_ignore_ascii_case("all") {
         return Ok(i64::MAX);
     }
-    crate::git_date::parse_date_cutoff(s, now)
-        .map_err(|_| Error::Message(format!("invalid reflog expiry: {raw:?}")))
+    crate::git_date::parse_date_cutoff(s, now).map_err(|_| {
+        RefError::InvalidReflogExpiry {
+            value: raw.to_owned(),
+        }
+        .into()
+    })
 }
 
 /// Default `gc.reflogExpire`: reachable reflog entries older than this are dropped.
@@ -1202,9 +1226,9 @@ fn is_head_ref(refname: &str) -> bool {
 /// Every ref tip that peels to a commit: the starting points for the reachability check of
 /// a `HEAD` reflog.
 fn head_reflog_tips(repo: &Repository, promised: &HashSet<ObjectId>) -> Vec<ObjectId> {
-    let store = repo.refs();
+    let store = repo.ref_store();
     let mut tips = Vec::new();
-    if let Ok(oid) = store.resolve("HEAD") {
+    if let Ok(oid) = store.resolve(RefNameRef::from_trusted("HEAD")) {
         tips.push(oid);
     }
     if let Ok(refs) = refs::collect_resolved_refs(store, "refs/") {
@@ -1260,7 +1284,7 @@ impl<'r> ReachableCommits<'r> {
         if tips.is_empty() {
             return reachable;
         }
-        reachable.graph = repo.caches().commit_graph_chain(repo.odb().objects_dir());
+        reachable.graph = repo.odb().commit_graph_chain();
         {
             let mut commits = cache.commits.borrow_mut();
             let mut shallow = crate::shallow::load_shallow_boundaries(repo.git_dir())
@@ -1413,7 +1437,7 @@ fn should_drop_reflog_entry(
 /// each entry are present, in one memoised walk. Neither check fetches missing objects:
 /// partial-clone promises count as present.
 ///
-/// The reflog is read from and rewritten through [`Repository::refs`], and ref tips for the
+/// The reflog is read from and rewritten through [`Repository::ref_store`], and ref tips for the
 /// reachability check are resolved there too, so an injected ref store is expired like the
 /// built-in backends. A dry run writes nothing. On the files backend a fully pruned log is
 /// kept as an empty file and gets `core.sharedRepository` permissions, as Git does.
@@ -1422,7 +1446,8 @@ fn should_drop_reflog_entry(
 ///
 /// Propagates ref-store read and write failures and promisor-boundary lookup failures.
 #[expect(clippy::too_many_arguments)]
-pub fn expire_reflog_git(
+#[allow(dead_code)] // integration / re-export use only
+pub(crate) fn expire_reflog_git(
     repo: &Repository,
     refname: &str,
     params: &ReflogExpireParams,
@@ -1462,7 +1487,7 @@ pub(crate) fn expire_reflog_git_with_cache(
     now: i64,
     cache: &ReflogExpiryCache,
 ) -> Result<ReflogExpireResult> {
-    let store = repo.refs();
+    let store = repo.ref_store();
     let base_total = gc_global_total.unwrap_or_else(|| default_expire_total(now));
     let base_unreachable = gc_global_unreachable.unwrap_or_else(|| default_expire_unreachable(now));
     let (expire_total, expire_unreachable) = resolve_expire_for_ref(
@@ -1525,7 +1550,7 @@ pub(crate) fn expire_reflog_git_with_cache(
     } else {
         let promised = cache.promised(repo)?;
         store
-            .resolve(refname)
+            .resolve(RefNameRef::from_trusted(refname))
             .ok()
             .and_then(|tip| peel_tip_to_commit(repo, promised, tip))
             .map(|tip| vec![tip])
@@ -1586,11 +1611,11 @@ fn rewrite_reflog_from_snapshot(
         let snap = snapshot.to_vec();
         let drops = drop_flags.to_vec();
         let name = refname.to_owned();
-        match store.rewrite_reflog(refname, &mut move |current| {
+        match store.rewrite_reflog_str(RefNameRef::from_trusted(refname), &mut move |current| {
             if current.len() < snap.len() || current[..snap.len()] != snap[..] {
-                return Err(Error::RefStore(RefStoreError::ReflogRewriteStale {
-                    name: name.clone(),
-                }));
+                return Err(Error::Ref(RefError::Store(
+                    RefStoreError::ReflogRewriteStale { name: name.clone() },
+                )));
             }
             let mut kept = Vec::new();
             for (i, entry) in current.into_iter().enumerate() {
@@ -1605,7 +1630,7 @@ fn rewrite_reflog_from_snapshot(
             Ok(kept)
         }) {
             Ok(()) => return Ok(()),
-            Err(Error::RefStore(RefStoreError::ReflogRewriteStale { .. }))
+            Err(Error::Ref(RefError::Store(RefStoreError::ReflogRewriteStale { .. })))
                 if attempt + 1 < REFLOG_REWRITE_RETRIES =>
             {
                 continue;
@@ -1613,14 +1638,14 @@ fn rewrite_reflog_from_snapshot(
             Err(err) => return Err(err),
         }
     }
-    Err(Error::RefStore(RefStoreError::Corrupt(format!(
-        "reflog '{refname}' kept changing during rewrite"
-    ))))
+    Err(Error::Ref(RefError::Store(RefStoreError::Corrupt {
+        detail: format!("reflog '{refname}' kept changing during rewrite"),
+    })))
 }
 
 /// Per-ref `gc.<pattern>.reflogExpire*` rules plus global `gc.reflogExpire` / `gc.reflogExpireUnreachable`.
 #[derive(Debug, Clone)]
-pub struct GcReflogExpireConfig {
+pub(crate) struct GcReflogExpireConfig {
     /// `patterns` field.
     pub patterns: Vec<GcReflogPattern>,
     /// `global_total` field.
@@ -1631,7 +1656,7 @@ pub struct GcReflogExpireConfig {
 
 /// Load gc reflog expiry rules from merged config (same layering as Git `reflog_expire_config`).
 #[must_use]
-pub fn load_gc_reflog_expire_config(config: &ConfigSet, now: i64) -> GcReflogExpireConfig {
+pub(crate) fn load_gc_reflog_expire_config(config: &ConfigSet, now: i64) -> GcReflogExpireConfig {
     let (global_total, global_unreachable) = global_gc_reflog_expiry(config, now);
     GcReflogExpireConfig {
         patterns: collect_gc_reflog_patterns(config, now),
@@ -1641,7 +1666,11 @@ pub fn load_gc_reflog_expire_config(config: &ConfigSet, now: i64) -> GcReflogExp
 }
 
 /// Best-effort object set for `--stale-fix` (refs + reflog mentions).
-pub fn mark_stalefix_reachable(repo: &Repository, git_dir: &Path) -> Result<HashSet<ObjectId>> {
+#[allow(dead_code)] // integration / re-export use only
+pub(crate) fn mark_stalefix_reachable(
+    repo: &Repository,
+    git_dir: &Path,
+) -> Result<HashSet<ObjectId>> {
     let mut seeds: Vec<ObjectId> = Vec::new();
     if let Ok(oid) = refs::resolve_ref_in(repo, "HEAD") {
         seeds.push(oid);
@@ -1783,7 +1812,12 @@ mod default_expire_tests {
             "[core]\nrepositoryformatversion = 0\n[gc \"refs/heads/main*suffix\"]\n\treflogExpire = now\n",
         )
         .expect("write config");
-        let cfg = ConfigSet::load(&Environment::empty(), Some(&git_dir), true).expect("cfg");
+        let cfg = ConfigSet::load(
+            &Environment::empty(),
+            Some(&git_dir),
+            &crate::config::LoadConfigOptions::standard(&Environment::empty(), Some(&git_dir)),
+        )
+        .expect("cfg");
         let gc = load_gc_reflog_expire_config(&cfg, now);
         assert_eq!(gc.patterns.len(), 1);
         assert_eq!(gc.patterns[0].pattern, "refs/heads/main*suffix");
@@ -1943,7 +1977,12 @@ mod default_expire_tests {
         )
         .expect("stash log");
 
-        let cfg = ConfigSet::load(&Environment::empty(), Some(git_dir), true).expect("cfg");
+        let cfg = ConfigSet::load(
+            &Environment::empty(),
+            Some(git_dir),
+            &crate::config::LoadConfigOptions::standard(&Environment::empty(), Some(git_dir)),
+        )
+        .expect("cfg");
         let gc = load_gc_reflog_expire_config(&cfg, now);
         let dry = expire_reflog_git(
             &repo,
@@ -2121,7 +2160,12 @@ mod default_expire_tests {
         )
         .expect("log");
         let now = 2_000_000_i64;
-        let cfg = ConfigSet::load(&Environment::empty(), Some(git_dir), true).expect("cfg");
+        let cfg = ConfigSet::load(
+            &Environment::empty(),
+            Some(git_dir),
+            &crate::config::LoadConfigOptions::standard(&Environment::empty(), Some(git_dir)),
+        )
+        .expect("cfg");
         let gc = load_gc_reflog_expire_config(&cfg, now);
         let result = expire_reflog_git(
             &repo,
@@ -2158,8 +2202,8 @@ mod rewrite_concurrency_tests {
     use crate::objects::ObjectId;
     use crate::refs::prepare_with_lock_wait;
     use crate::refs::store::{
-        Expected, MemoryRefStore, RawRef, RefStore, RefTransaction, RefUpdate, RefUpdateFlags,
-        ReflogUpdate,
+        Expected, MemoryRefStore, RawRef, RefName, RefNameRef, RefStore, RefTransaction, RefUpdate,
+        RefUpdateFlags, ReflogUpdate,
     };
 
     use super::{
@@ -2179,7 +2223,7 @@ mod rewrite_concurrency_tests {
         ts: i64,
     ) -> crate::error::Result<()> {
         let txn = RefTransaction::new().update(RefUpdate {
-            name: refname.to_owned(),
+            name: RefName::from_trusted(refname.to_owned()),
             new_value: Some(RawRef::Direct(oid)),
             expected: Expected::Any,
             reflog: Some(ReflogUpdate {
@@ -2198,7 +2242,7 @@ mod rewrite_concurrency_tests {
     fn read_entries(store: &dyn RefStore, refname: &str) -> Vec<ReflogEntry> {
         let mut out = Vec::new();
         store
-            .for_each_reflog_entry(refname, false, &mut |e| {
+            .for_each_reflog_entry_str(RefNameRef::from_trusted(refname), false, &mut |e| {
                 out.push(e.clone());
                 std::ops::ControlFlow::Continue(())
             })
@@ -2214,8 +2258,8 @@ mod rewrite_concurrency_tests {
         let o2 = oid(2);
         let o3 = oid(3);
         store
-            .replace_reflog(
-                refname,
+            .replace_reflog_str(
+                RefNameRef::from_trusted(refname),
                 vec![
                     ReflogEntry {
                         old_oid: ObjectId::zero(),
@@ -2263,8 +2307,8 @@ mod rewrite_concurrency_tests {
         let o2 = oid(2);
         let o3 = oid(3);
         store
-            .replace_reflog(
-                refname,
+            .replace_reflog_str(
+                RefNameRef::from_trusted(refname),
                 vec![
                     ReflogEntry {
                         old_oid: ObjectId::zero(),

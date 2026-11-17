@@ -2,16 +2,17 @@
 //! the system `git` on files (packed), reftable, and injected memory ref stores.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use grit_lib::error::RefError;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::error::Error;
 use grit_lib::objects::ObjectId;
-use grit_lib::porcelain::branch::{list_branches, rename_branch, BranchError, RenameBranchOptions};
+use grit_lib::porcelain::branch::{BranchError, BranchRenameOptions};
 use grit_lib::refs::store::{
-    Expected, MemoryRefStore, RawRef, RefStore, RefTransaction, RefUpdate, RefUpdateFlags,
-    ReflogUpdate,
+    Expected, MemoryRefStore, RawRef, RefNameRef, RefStore, RefTransaction, RefUpdate,
+    RefUpdateFlags, ReflogUpdate,
 };
 use grit_lib::repo::Repository;
 use grit_test_support::{git, git_cmd};
@@ -89,20 +90,18 @@ fn grit_rename_files_packed_git_compat() {
     let topic_tip = oid(&dir, "topic");
     let repo = open(&dir);
 
-    rename_branch(
-        &repo,
-        &RenameBranchOptions {
+    repo.branches()
+        .rename(&BranchRenameOptions {
             old: "topic".into(),
             new: "new".into(),
             force: false,
             dry_run: false,
-        },
-    )
-    .unwrap();
+        })
+        .unwrap();
 
     assert_git_rename_checks(&dir, "topic", "new");
     assert_eq!(oid(&dir, "new"), topic_tip);
-    let list = list_branches(&repo).unwrap();
+    let list = repo.branches().list_simple().unwrap();
     assert!(list.branches.iter().any(|b| b.name == "new"));
     assert!(!list.branches.iter().any(|b| b.name == "topic"));
 
@@ -119,7 +118,9 @@ fn git_rename_roundtrip_list_and_reflog() {
     git(&dir, &["branch", "-m", "topic", "renamed"]);
 
     let repo = open(&dir);
-    let names: Vec<String> = list_branches(&repo)
+    let names: Vec<String> = repo
+        .branches()
+        .list_simple()
         .unwrap()
         .branches
         .into_iter()
@@ -140,32 +141,29 @@ fn rename_force_overwrite_and_dry_run() {
     git(&dir, &["branch", "other", "main"]);
     let repo = open(&dir);
 
-    let preview = rename_branch(
-        &repo,
-        &RenameBranchOptions {
+    let preview = repo
+        .branches()
+        .rename(&BranchRenameOptions {
             old: "topic".into(),
             new: "other".into(),
             force: true,
             dry_run: true,
-        },
-    )
-    .unwrap();
+        })
+        .unwrap();
     assert!(preview.dry_run);
     assert!(git_cmd(&["show-ref", "--verify", "refs/heads/topic"])
         .in_dir(&dir)
         .exec()
         .ok());
 
-    rename_branch(
-        &repo,
-        &RenameBranchOptions {
+    repo.branches()
+        .rename(&BranchRenameOptions {
             old: "topic".into(),
             new: "other".into(),
             force: true,
             dry_run: false,
-        },
-    )
-    .unwrap();
+        })
+        .unwrap();
     assert!(!git_cmd(&["show-ref", "--verify", "refs/heads/topic"])
         .in_dir(&dir)
         .exec()
@@ -182,16 +180,15 @@ fn rename_refuses_without_force_when_target_exists() {
     let dir = git_fixture(tmp.path());
     git(&dir, &["branch", "other", "main"]);
     let repo = open(&dir);
-    let err = rename_branch(
-        &repo,
-        &RenameBranchOptions {
+    let err = repo
+        .branches()
+        .rename(&BranchRenameOptions {
             old: "topic".into(),
             new: "other".into(),
             force: false,
             dry_run: false,
-        },
-    )
-    .unwrap_err();
+        })
+        .unwrap_err();
     assert!(
         matches!(&err, Error::Branch(BranchError::AlreadyExists { name }) if name == "other"),
         "{err:?}"
@@ -205,16 +202,14 @@ fn rename_unborn_head_on_current_branch() {
     std::fs::create_dir_all(&dir).unwrap();
     git(&dir, &["init", "-q", "-b", "main"]);
     let repo = open(&dir);
-    rename_branch(
-        &repo,
-        &RenameBranchOptions {
+    repo.branches()
+        .rename(&BranchRenameOptions {
             old: "main".into(),
             new: "start".into(),
             force: false,
             dry_run: false,
-        },
-    )
-    .unwrap();
+        })
+        .unwrap();
     assert_eq!(
         git(&dir, &["symbolic-ref", "HEAD"]).trim(),
         "refs/heads/start"
@@ -229,16 +224,14 @@ fn rename_updates_linked_worktree_head_when_checked_out() {
     let wt = tmp.path().join("wt");
     git(&wt, &["switch", "-q", "wt"]);
     let repo = open(&wt);
-    rename_branch(
-        &repo,
-        &RenameBranchOptions {
+    repo.branches()
+        .rename(&BranchRenameOptions {
             old: "wt".into(),
             new: "working".into(),
             force: false,
             dry_run: false,
-        },
-    )
-    .unwrap();
+        })
+        .unwrap();
     assert_eq!(
         git(&wt, &["symbolic-ref", "HEAD"]).trim(),
         "refs/heads/working"
@@ -254,18 +247,17 @@ fn rename_force_refuses_when_target_checked_out_in_worktree() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = git_fixture(tmp.path());
     let repo = open(&dir);
-    let err = rename_branch(
-        &repo,
-        &RenameBranchOptions {
+    let err = repo
+        .branches()
+        .rename(&BranchRenameOptions {
             old: "topic".into(),
             new: "wt".into(),
             force: true,
             dry_run: false,
-        },
-    )
-    .unwrap_err();
+        })
+        .unwrap_err();
     assert!(
-        matches!(err, Error::BranchCheckedOutInWorktree { .. }),
+        matches!(err, Error::Branch(BranchError::CheckedOut { .. })),
         "{err:?}"
     );
 }
@@ -285,16 +277,14 @@ fn rename_on_reftable_backend() {
     git(dir, &["remote", "add", "origin", "/dev/null"]);
     git(dir, &["config", "branch.topic.merge", "refs/heads/topic"]);
     let repo = open(dir);
-    rename_branch(
-        &repo,
-        &RenameBranchOptions {
+    repo.branches()
+        .rename(&BranchRenameOptions {
             old: "topic".into(),
             new: "new".into(),
             force: false,
             dry_run: false,
-        },
-    )
-    .unwrap();
+        })
+        .unwrap();
     assert_git_rename_checks(dir, "topic", "new");
 }
 
@@ -345,29 +335,42 @@ fn rename_on_injected_memory_ref_store() {
         .unwrap();
 
     let repo = open(&dir).with_ref_store(store.clone());
-    rename_branch(
-        &repo,
-        &RenameBranchOptions {
+    repo.branches()
+        .rename(&BranchRenameOptions {
             old: "topic".into(),
             new: "renamed".into(),
             force: false,
             dry_run: false,
-        },
-    )
-    .unwrap();
+        })
+        .unwrap();
     assert_eq!(
-        store.read_raw("refs/heads/renamed").unwrap(),
+        store
+            .read_raw(RefNameRef::from_trusted("refs/heads/renamed"))
+            .unwrap(),
         Some(RawRef::Direct(tip))
     );
-    assert_eq!(store.read_raw("refs/heads/topic").unwrap(), None);
-    assert!(store.reflog_exists("refs/heads/renamed").unwrap());
-    assert!(!store.reflog_exists("refs/heads/topic").unwrap());
+    assert_eq!(
+        store
+            .read_raw(RefNameRef::from_trusted("refs/heads/topic"))
+            .unwrap(),
+        None
+    );
+    assert!(store
+        .reflog_exists(RefNameRef::from_trusted("refs/heads/renamed"))
+        .unwrap());
+    assert!(!store
+        .reflog_exists(RefNameRef::from_trusted("refs/heads/topic"))
+        .unwrap());
     let mut last_message = None;
     store
-        .for_each_reflog_entry("refs/heads/renamed", true, &mut |entry| {
-            last_message = Some(entry.message.clone());
-            std::ops::ControlFlow::Break(())
-        })
+        .for_each_reflog_entry(
+            RefNameRef::from_trusted("refs/heads/renamed"),
+            true,
+            &mut |entry| {
+                last_message = Some(entry.message.clone());
+                std::ops::ControlFlow::Break(())
+            },
+        )
         .unwrap();
     assert_eq!(
         last_message.as_deref(),
@@ -414,18 +417,16 @@ fn rename_retargets_head_on_injected_store_when_branch_checked_out() {
         .unwrap();
 
     let repo = open(&dir).with_ref_store(store.clone());
-    rename_branch(
-        &repo,
-        &RenameBranchOptions {
+    repo.branches()
+        .rename(&BranchRenameOptions {
             old: "topic".into(),
             new: "renamed".into(),
             force: false,
             dry_run: false,
-        },
-    )
-    .unwrap();
+        })
+        .unwrap();
     assert_eq!(
-        store.read_raw("HEAD").unwrap(),
+        store.read_raw(RefNameRef::from_trusted("HEAD")).unwrap(),
         Some(RawRef::Symbolic("refs/heads/renamed".to_owned()))
     );
 }
@@ -437,16 +438,15 @@ fn rename_same_missing_branch_returns_not_found() {
     std::fs::create_dir_all(&dir).unwrap();
     git(&dir, &["init", "-q", "-b", "main"]);
     let repo = open(&dir);
-    let err = rename_branch(
-        &repo,
-        &RenameBranchOptions {
+    let err = repo
+        .branches()
+        .rename(&BranchRenameOptions {
             old: "nope".into(),
             new: "nope".into(),
             force: false,
             dry_run: false,
-        },
-    )
-    .unwrap_err();
+        })
+        .unwrap_err();
     assert!(
         matches!(&err, Error::Branch(BranchError::NotFound { name }) if name == "nope"),
         "{err:?}"
@@ -461,16 +461,15 @@ fn rename_same_invalid_name_returns_invalid() {
     git(&dir, &["init", "-q", "-b", "main"]);
     commit(&dir, "c1");
     let repo = open(&dir);
-    let err = rename_branch(
-        &repo,
-        &RenameBranchOptions {
+    let err = repo
+        .branches()
+        .rename(&BranchRenameOptions {
             old: "bad name".into(),
             new: "bad name".into(),
             force: false,
             dry_run: false,
-        },
-    )
-    .unwrap_err();
+        })
+        .unwrap_err();
     assert!(
         matches!(&err, Error::Branch(BranchError::InvalidName { .. })),
         "{err:?}"
@@ -485,22 +484,21 @@ fn rename_aborts_when_destination_reflog_path_is_directory() {
     std::fs::create_dir_all(log_dir.join("x")).unwrap();
     std::fs::write(log_dir.join("x/y"), "").unwrap();
     let repo = open(&dir);
-    let err = rename_branch(
-        &repo,
-        &RenameBranchOptions {
+    let err = repo
+        .branches()
+        .rename(&BranchRenameOptions {
             old: "topic".into(),
             new: "new".into(),
             force: false,
             dry_run: false,
-        },
-    )
-    .unwrap_err();
+        })
+        .unwrap_err();
     assert!(
         matches!(
             err,
-            Error::RefStore(grit_lib::refs::store::RefStoreError::NameUnavailable {
+            Error::Ref(RefError::Store(grit_lib::refs::store::RefStoreError::NameUnavailable {
                 reason: grit_lib::refs::RefnameUnavailable::DescendantExists { ref blocking, .. }
-            }) if blocking == "refs/heads/new/x/y"
+            })) if blocking == "refs/heads/new/x/y"
         ),
         "{err:?}"
     );
@@ -536,16 +534,15 @@ fn rename_clears_an_empty_directory_at_the_destination_reflog_path() {
     std::fs::create_dir_all(git_side.join(".git/logs/refs/heads/new/x")).unwrap();
     git(&git_side, &["branch", "-m", "topic", "new"]);
 
-    rename_branch(
-        &open(&dir),
-        &RenameBranchOptions {
+    open(&dir)
+        .branches()
+        .rename(&BranchRenameOptions {
             old: "topic".into(),
             new: "new".into(),
             force: false,
             dry_run: false,
-        },
-    )
-    .expect("rename over an empty log directory, as git does");
+        })
+        .expect("rename over an empty log directory, as git does");
     assert!(dir.join(".git/logs/refs/heads/new").is_file());
     git(&dir, &["show-ref", "--verify", "refs/heads/new"]);
     git(&dir, &["fsck", "--no-progress"]);

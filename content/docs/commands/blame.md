@@ -9,12 +9,12 @@ order: 2
 
 ```text
 grit blame [<rev>] [--rev <commit>] [--contents <file>] [-L RANGE] [--first-parent]
-  [--group] [-w] [-C]... [--ignore-rev <REV>]... [--ignore-revs-file <FILE>]... [--] <file>
+  [--group] [-w] [-M] [-C]... [--ignore-rev <REV>]... [--ignore-revs-file <FILE>]... [--] <file>
 ```
 
 ## Description
 
-Walks history for one file and prints each line with the commit that last modified it, the author, when that commit was made, and the line number in the blamed file. The file operand uses Git pathspec cwd rules (same as [`grit diff`](../diff/)): from a subdirectory, a bare name like `f.txt` refers to that path under your current directory.
+Walks history for one file and prints each line with the commit that last modified it, the author, when that commit was made, and the line number in the blamed file. Human and `--markdown` output use collision-aware short commit ids (`core.abbrev`); `--json` always includes full oids. The file operand uses Git pathspec cwd rules (same as [`grit diff`](../diff/)): from a subdirectory, a bare name like `f.txt` refers to that path under your current directory.
 
 Paths returned by `grit status --json` can be passed directly as the file operand, including reversible `grit+pathhex:` strings for non-UTF-8 filenames. These encoded paths are repository-relative, even when invoked from a subdirectory. Blame decodes one storage layer and compares exact filename bytes, so raw invalid-byte names, valid Unicode names, and literal names beginning with `grit+pathhex:` remain distinct. JSON `original_path` values (both lines and grouped hunks) use the same reversible encoding, including rename and copy origins. In Rust, use `repo_relpath::storage_bytes` to recover the original bytes; use `storage_string` when supplying raw names that begin with the reserved prefix.
 
@@ -37,6 +37,8 @@ When a commit renamed or moved the file (including rename-and-edit in the same c
 On Unix, explicit file operands must be valid UTF-8. An operand containing invalid UTF-8 bytes is rejected before the command runs, with exit status **2** and no changes to the repository. Human output reports the usage error on stderr; `--json` writes an error object with `kind: "usage"` on stdout, and `--markdown` writes `**Error:**` on stdout. The argument is never replaced with a similar Unicode filename.
 
 Adding or removing the final newline attributes the last line to the commit that changed it. With `-w` / `--ignore-all-space`, newline-only changes are ignored along with other whitespace-only changes. Line content in the output excludes LF in either mode.
+
+Lines attributed to a commit with no effective parents (a repository root or a shallow boundary in `.git/shallow`) are prefixed with `^` in human output, the same marker Git uses. `--json` sets `"boundary": true` on those lines.
 
 ### Benchmarking
 
@@ -107,7 +109,8 @@ main's path errors provide no comparable successful-operation timing.
 | `--ignore-rev <REV>` | Treat this commit as transparent while walking history (repeatable). Unknown revisions are an error. |
 | `--ignore-revs-file <FILE>` | Read full-length commit oids to ignore, one per line (`#` comments, blank lines skipped). Repeatable; `""` clears entries loaded from config or earlier files. Missing files are an error. Relative paths are resolved from the repository root. Config `blame.ignoreRevsFile` (multi-valued) is applied before CLI files. |
 | `-w`, `--ignore-all-space` | Ignore whitespace when comparing lines between revisions (same rules as [`grit diff -w`](../diff/)). Whitespace-only edits do not move blame to a newer commit. |
-| `-C`, `--copy-detection` | Detect lines copied from other files (repeat up to three times for deeper search, matching `git blame -C` / `-C -C` / `-C -C -C`). A fourth `-C` is rejected with exit code 2. |
+| `-M`, `--move-detection` | Detect lines moved within the same file (`git blame -M`). Relocated blocks are blamed on the commit that originally wrote them when the move scores above Git's default threshold. |
+| `-C`, `--copy-detection` | Detect lines copied from other files (repeat up to three times for deeper search, matching `git blame -C` / `-C -C` / `-C -C -C`). A fourth `-C` is rejected with exit code 2. Using `-C` also enables move detection, matching Git (`-C` implies `-M`). |
 
 Human output prefixes ignored lines with `?` and lines that cannot be blamed past an ignored commit with `*` (same markers Git uses when `blame.markIgnoredLines` / `blame.markUnblamableLines` are enabled).
 
@@ -164,6 +167,7 @@ Pass `--json` for stable, scripting-friendly output:
 | `lines[].encoding_lossy` | boolean | Present and `true` when the line bytes were not valid UTF-8 and `content` used lossy decoding. Raw bytes are not included in JSON; use [`grit_lib::blame::BlameAttributedLine::content_bytes`](rustdoc:grit_lib::blame::BlameAttributedLine::content_bytes) from the library when you need them. |
 | `lines[].ignored` | boolean | Present and `true` when the line was attributed through an ignored revision. |
 | `lines[].unblamable` | boolean | Present and `true` when the line was added in an ignored revision and cannot be blamed further back. |
+| `lines[].boundary` | boolean | Present and `true` when the attributed commit has no effective parents (root or shallow boundary). Human output prefixes the line with `^`. |
 | `lines[].not_committed` | boolean | Present and `true` when the line exists only in the working tree or `--contents` buffer. `commit` is then all zeros and `original_line` equals `final_line`. |
 | `commits` | object | Map of commit oid → metadata for every line. |
 | `commits.<oid>.author` | object | Author with `name`, `email`, and `date` (RFC 3339 — same shape as [`grit show`](../show/)). Author date is only here, not repeated on each line or hunk. |

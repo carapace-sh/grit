@@ -1,6 +1,8 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 #![deny(missing_docs)]
 #![warn(rustdoc::unescaped_backticks)]
+#![allow(rustdoc::private_intra_doc_links)]
+#![allow(deprecated)] // repository handles call legacy free functions during the 0.6 migration
 
 //! grit-lib — fast, linkable Git engine for Rust.
 //!
@@ -27,13 +29,13 @@
 //! ```
 //! use grit_lib::config::environment::RepositoryOptions;
 //! use grit_lib::repo::{InitOptions, Repository};
-//! use grit_lib::state::resolve_head;
 //!
 //! # fn main() -> grit_lib::error::Result<()> {
 //! let dir = tempfile::tempdir()?;
-//! let repo = Repository::init(dir.path(), &InitOptions::default())?;
-//! let head = resolve_head(repo.git_dir())?;
-//! assert!(matches!(head, grit_lib::state::HeadState::Branch { short_name, oid: None, .. } if short_name == "main"));
+//! let (repo, _) = Repository::init(dir.path(), &InitOptions::default())?;
+//! let head = repo.references().head()?;
+//! assert!(head.is_unborn());
+//! assert_eq!(head.branch_name(), Some("main"));
 //! let _ = Repository::open(
 //!     repo.git_dir(),
 //!     &RepositoryOptions::empty().with_work_tree(dir.path()),
@@ -43,11 +45,11 @@
 //! ```
 //!
 //! - [`Repository`](repo::Repository) exposes typed handles for objects, refs, the
-//!   index, config, revision walking, and diffs ([`objects::Objects`],
-//!   [`refs::References`], [`index::IndexHandle`],
-//!   [`config::ConfigHandle`], [`revwalk::RevWalk`],
-//!   [`diff::Diff`]), plus [`repo_handles`] for remotes, worktrees, stash,
-//!   notes, reflogs, and bundles.
+//!   index, config, revision walking, diffs, and maintenance ([`objects::Objects`],
+//!   [`refs::References`], [`index::IndexFile`],
+//!   [`config::Config`], [`revwalk::RevWalk`],
+//!   [`diff::Diff`], [`maintenance::Maintenance`]), plus [`repo_handles`] for remotes,
+//!   worktrees, stash, notes, reflogs, and bundles.
 //! - [`prelude`] re-exports the types most call sites need.
 //! - [`porcelain`] holds user-facing operations that return structured result
 //!   *models* (the CLI renders them).
@@ -59,6 +61,15 @@
 //! - [`progress`] defines how long-running operations report progress and
 //!   observe cancellation without touching the terminal.
 //!
+//! # API stability
+//!
+//! This documentation is for **grit-lib** 0.5 (major.minor tracks the published crate).
+//!
+//! Conventions, semver policy, and a checklist for new public items are in
+//! [`API.md`](https://github.com/gitbutlerapp/grit/blob/main/grit-lib/API.md).
+//! Canonical module paths are described on
+//! [grit-scm.com/docs/library/api-layout](https://grit-scm.com/docs/library/api-layout).
+//!
 //! # API layout (canonical domains)
 //!
 //! | Flat path | Canonical path |
@@ -68,7 +79,8 @@
 //! | `sparse_checkout`, `split_index`, `untracked_cache`, `resolve_undo`, … | [`index`] |
 //! | `rev_list`, `rev_parse`, `merge_base`, `commit_graph_file`, … | [`revwalk`] |
 //! | `bloom`, `patch_ids`, `merge_trees`, `rerere`, … | [`diff`] |
-//! | `dotfile`, `ident`, `init_filesystem`, … | [`config`] |
+//! | `dotfile`, `init_filesystem`, … | [`config`] |
+//! | `ident` | [`ident`] (root) |
 //! | `fetch`, `push`, `transport`, `credentials`, … | [`remote`] |
 //! | `ignore`, `attributes`, `pathspec`, … | [`worktree`] |
 //! | porcelain stash types | [`stash`] |
@@ -90,7 +102,7 @@
 //!   Backends are pluggable via the ODB abstraction on [`objects::Objects`].
 //! - **References ([`refs`])** — loose files, `packed-refs`, and reftable stacks;
 //!   reflog read/write and ref storage format selection live in the same module.
-//!   [`RefStorageFormat`] selects the on-disk ref layout at init.
+//!   [`refs::ref_storage::RefStorageFormat`] selects the on-disk ref layout at init.
 //!
 //! # Network and bundles
 //!
@@ -105,11 +117,12 @@
 //! | *(none)* | — | Core library: ODB, refs, index, diff, merge, local transport |
 //! | `http-ureq` | disabled | [`ureq`](https://docs.rs/ureq) HTTP client for smart-HTTP fetch/push (rustls) |
 //! | `http-ureq-native-tls` | disabled | Platform TLS for `http-ureq` (Secure Transport on macOS); use instead of rustls on Apple targets |
+//! | `test-support` | disabled | Unstable test_support module for workspace tests and internal tooling only (outside semver) |
 //!
 //! Enable HTTP in `Cargo.toml`:
 //!
 //! ```toml
-//! grit-lib = { version = "0.1", features = ["http-ureq"] }
+//! grit-lib = { version = "0.5", features = ["http-ureq"] }
 //! ```
 //!
 //! # Errors and progress
@@ -134,13 +147,14 @@ pub mod progress;
 ///
 /// ```rust
 /// use grit_lib::prelude::*;
+/// use grit_lib::refs::store::RefNameRef;
 /// use grit_lib::repo::InitOptions;
 ///
 /// # fn main() -> Result<()> {
 /// let dir = tempfile::tempdir()?;
-/// let repo = Repository::init(dir.path(), &InitOptions::default())?;
-/// let _cfg = repo.config()?;
-/// assert!(repo.refs().read_raw("HEAD")?.is_some());
+/// let (repo, _) = Repository::init(dir.path(), &InitOptions::default())?;
+/// let _cfg = repo.config().snapshot()?;
+/// assert!(repo.ref_store().read_raw(RefNameRef::from_trusted("HEAD"))?.is_some());
 /// # Ok(())
 /// # }
 /// ```
@@ -151,13 +165,15 @@ pub mod prelude {
         CollectingDiagnostics, DiagnosticSink, NullDiagnostics, Trace, Warning,
     };
     pub use crate::environment::{Environment, RepositoryOptions};
-    pub use crate::error::{Error, MidxError, Result};
+    pub use crate::error::{Error, MidxError, RepositoryError, Result};
     pub use crate::index::Index;
     pub use crate::objects::odb::Odb;
     pub use crate::objects::{Object, ObjectId, ObjectInfo, ObjectKind};
+    pub use crate::ownership_check::{
+        OwnershipCheck, OwnershipContext, OwnershipError, OwnershipStatus, SystemOwnershipCheck,
+    };
     pub use crate::repo::{
         resolve_initial_branch, DiscoveryInfo, InitOptions, InitOutcome, Repository,
-        RepositoryBuilder,
     };
 }
 
@@ -185,6 +201,7 @@ pub(crate) mod commit_graph_file;
 pub(crate) mod commit_graph_write;
 pub(crate) mod commit_pretty;
 pub(crate) mod commit_trailers;
+pub mod commits;
 pub mod config;
 pub(crate) mod connectivity;
 pub(crate) mod credentials;
@@ -196,6 +213,7 @@ pub mod diagnostics;
 pub mod diff;
 pub(crate) mod diff_indent_heuristic;
 mod diff_rename_parallel;
+pub mod divergence;
 pub(crate) mod dotfile;
 pub(crate) mod environment;
 pub mod error;
@@ -204,15 +222,18 @@ pub(crate) mod git_dir;
 pub mod gitbutler;
 pub(crate) mod github_auth;
 pub(crate) mod grit_server_auth;
+pub(crate) mod grit_server_share;
+pub(crate) mod grit_server_space;
+pub(crate) mod grit_server_sync;
+mod heap;
 pub(crate) mod line_interner;
 pub mod line_range;
 mod oid_abbrev;
 pub(crate) mod oid_abbrev_cache;
 pub(crate) mod pack_roll_delta;
 pub(crate) mod partial_clone;
+pub mod status;
 
-#[path = "bench_fixture/mod.rs"]
-mod bench_fixture_root;
 pub(crate) mod bitmap_walk;
 pub(crate) mod fetch;
 pub(crate) mod fetch_head;
@@ -236,6 +257,7 @@ pub(crate) mod hash;
 pub(crate) mod hide_refs;
 #[path = "history/mod.rs"]
 mod history_root;
+pub(crate) mod submodule_ignore;
 pub(crate) use history_root as history;
 pub(crate) mod alternate_boundary;
 pub(crate) mod atomic_replace;
@@ -257,6 +279,7 @@ pub(crate) mod log_walk;
 pub(crate) mod mailmap;
 pub mod maintenance;
 pub(crate) mod mem_pipe;
+pub mod merge;
 pub(crate) mod merge_base;
 pub(crate) mod merge_diff;
 pub(crate) mod merge_driver;
@@ -272,6 +295,7 @@ pub mod objects;
 pub(crate) mod odb;
 pub(crate) mod offload;
 pub mod operation;
+pub mod ownership_check;
 pub(crate) mod pack;
 pub(crate) mod pack_bitmap;
 mod pack_delta;
@@ -290,6 +314,7 @@ pub(crate) mod pack_rev;
 pub(crate) mod pack_store;
 pub(crate) mod pack_stream_scan;
 mod pack_thin_bases;
+mod pack_tree_read_ahead;
 #[path = "pack_write.rs"]
 mod pack_write_root;
 pub(crate) mod pack_zlib;
@@ -298,7 +323,7 @@ pub(crate) mod patch_ids;
 pub(crate) mod path_icase;
 pub(crate) mod path_population;
 pub mod path_validate;
-pub mod pathspec;
+pub(crate) mod pathspec;
 pub(crate) mod pkt_line;
 pub(crate) mod precompose_config;
 pub(crate) mod promisor;
@@ -315,7 +340,6 @@ mod quote_path_root;
 mod read_dir_kind;
 pub(crate) mod receive_pack;
 pub(crate) mod receive_quarantine;
-pub(crate) mod ref_exclusions;
 pub(crate) mod ref_namespace;
 pub(crate) mod ref_storage;
 pub(crate) mod reflog;
@@ -325,6 +349,7 @@ pub(crate) mod refspec;
 pub(crate) mod reftable;
 pub mod remote;
 pub(crate) mod repack_pack;
+pub(crate) mod replay_merge_session;
 pub mod repo;
 pub(crate) mod repo_caches;
 pub mod repo_handles;
@@ -342,6 +367,7 @@ pub(crate) mod shallow;
 pub(crate) mod shared_repo;
 pub(crate) mod sideband_lines;
 pub(crate) mod signing;
+pub(crate) mod sigpipe;
 pub(crate) mod snapshot_checkout;
 pub(crate) mod sparse_checkout;
 pub(crate) mod split_index;
@@ -363,6 +389,7 @@ pub(crate) mod upload_filter;
 pub(crate) mod url_rewrite;
 pub(crate) mod userdiff;
 pub(crate) mod wildmatch;
+mod windows_dir_listing;
 pub mod worktree;
 mod worktree_batch;
 pub(crate) mod worktree_cwd;
@@ -370,31 +397,22 @@ pub(crate) mod worktree_ref;
 pub(crate) mod worktree_rules;
 mod worktree_rules_tests;
 mod worktree_scan;
-pub use crate::hooks::{HookName, PostOperationHooks};
-pub use worktree_scan::PARALLEL_STAT_MIN_ENTRIES;
-#[doc(hidden)]
-pub use worktree_scan::{
-    reset_worktree_metadata_probe, worktree_metadata_probe_count, worktree_path_resolve_probe_count,
-};
+pub use crate::heap::release_unused_heap;
 pub(crate) mod write_tree;
 pub(crate) mod ws;
 pub(crate) mod zlib_inflate;
 
-#[doc(hidden)]
-pub mod fuzz;
+pub(crate) mod test_probe_hooks;
 
-pub use ref_storage::RefStorageFormat;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 
-pub use crate::oid_abbrev::OidAbbrevBatch;
-pub use objects::bench_fixture;
-pub use objects::pack_reuse;
-pub use objects::pack_write;
-pub use porcelain::quote_path;
-pub use revwalk::object_inspect;
-pub use worktree::fsmonitor;
-
-#[cfg(feature = "unstable-bench-helpers")]
-pub use pack_receive::{read_sideband_pack_to, PackReceiveTarget};
+pub(crate) use crate::oid_abbrev::OidAbbrevBatch;
+pub(crate) use objects::pack_reuse;
+pub(crate) use porcelain::quote_path;
+pub(crate) use ref_storage::RefStorageFormat;
+pub(crate) use revwalk::object_inspect;
+pub(crate) use worktree::fsmonitor;
 
 #[cfg(test)]
 pub(crate) mod hot_path_test_metrics;
@@ -404,4 +422,8 @@ mod object_write_regression;
 #[cfg(test)]
 mod repository_config_snapshot_tests;
 #[cfg(test)]
+mod rustdoc_placeholder_guard;
+#[cfg(test)]
 mod status_clean_tree_regression;
+#[cfg(test)]
+mod storage_backend_guard;

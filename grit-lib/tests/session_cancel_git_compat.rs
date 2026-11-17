@@ -11,14 +11,11 @@ use crate::support::{assert_git_fsck_strict, git, open_grit_repo};
 
 use grit_lib::error::Error;
 use grit_lib::objects::ObjectId;
-use grit_lib::porcelain::commit::{commit_with_scope, CommitRequest, CommitScope};
-use grit_lib::porcelain::merge::integrate_branch;
-use grit_lib::progress::{
-    Cancel, FlagCancel, NeverCancel, NullProgress, ProgressPhase, ProgressSink,
-};
+use grit_lib::porcelain::commit::{CommitRequest, CommitScope};
+use grit_lib::progress::{CancelToken, NullProgress, ProgressPhase, ProgressSink};
 use grit_lib::revwalk::history::{
-    start_rebase, ApplyOptions, EmptyPolicy, RebaseOntoOptions, RebaseRequest, RefScope,
-    RewriteOptions, StartRebaseOptions,
+    ApplyOptions, EmptyPolicy, RebaseOntoOptions, RebaseRequest, RefScope, RewriteOptions,
+    StartRebaseOptions,
 };
 use grit_lib::stash::{StashMode, StashPushOptions};
 
@@ -31,7 +28,7 @@ struct CancelAfter {
     limit: u64,
     active: Option<ProgressPhase>,
     seen: u64,
-    flag: FlagCancel,
+    flag: CancelToken,
 }
 
 impl CancelAfter {
@@ -41,7 +38,7 @@ impl CancelAfter {
             limit,
             active: None,
             seen: 0,
-            flag: FlagCancel::new(),
+            flag: CancelToken::new(),
         }
     }
 }
@@ -58,10 +55,6 @@ impl ProgressSink for CancelAfter {
                 self.flag.cancel();
             }
         }
-    }
-
-    fn should_cancel(&self) -> bool {
-        self.flag.is_cancelled()
     }
 }
 
@@ -100,11 +93,11 @@ fn status(root: &Path) -> String {
 }
 
 fn commit_req(message: &str) -> CommitRequest {
-    CommitRequest {
-        message: message.to_owned(),
-        author: Some(IDENT.parse().expect("signature")),
-        committer: Some(IDENT.parse().expect("signature")),
-        ..Default::default()
+    {
+        let mut req = CommitRequest::new(message.to_owned());
+        req.author = Some(IDENT.parse().expect("signature"));
+        req.committer = Some(IDENT.parse().expect("signature"));
+        req
     }
 }
 
@@ -119,27 +112,26 @@ fn cancelled_auto_stage_commit_leaves_git_view_unchanged() {
 
     let repo = open_grit_repo(root);
     let mut sink = CancelAfter::new(ProgressPhase::StagingFiles, 10);
-    let err = commit_with_scope(
-        &repo,
-        &commit_req("change"),
-        CommitScope::AutoStage,
-        &mut sink,
-        &NeverCancel,
-    )
-    .expect_err("cancelled");
-    assert!(matches!(err, Error::Cancelled), "got {err:?}");
+    let cancel = sink.flag.clone();
+    let err = repo
+        .commits()
+        .create(
+            &grit_lib::commits::CommitOptions::new(commit_req("change"), CommitScope::AutoStage),
+            &mut sink,
+            &cancel,
+        )
+        .expect_err("cancelled");
+    assert!(err.is_cancelled(), "got {err:?}");
     assert_eq!(rev(root, "HEAD"), head);
     assert_eq!(status(root), status_before, "nothing became staged");
     assert_git_fsck_strict(root);
-
-    commit_with_scope(
-        &repo,
-        &commit_req("change"),
-        CommitScope::AutoStage,
-        &mut NullProgress,
-        &NeverCancel,
-    )
-    .expect("commit");
+    repo.commits()
+        .create(
+            &grit_lib::commits::CommitOptions::new(commit_req("change"), CommitScope::AutoStage),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("commit");
     assert_eq!(rev(root, "HEAD~1"), head);
     assert_eq!(status(root), "");
     assert_git_fsck_strict(root);
@@ -163,17 +155,21 @@ fn cancelled_stash_push_leaves_no_entry_and_git_pops_a_finished_one() {
     };
 
     let mut sink = CancelAfter::new(ProgressPhase::StagingFiles, 10);
+    let cancel = sink.flag.clone();
     let err = repo
         .stash()
-        .push(&opts, &mut sink, &NeverCancel)
+        .push(&opts, &mut sink, &cancel)
         .expect_err("cancelled");
-    assert!(matches!(err, Error::Cancelled), "got {err:?}");
+    assert!(
+        matches!(err, grit_lib::stash::StashError::Cancelled),
+        "got {err:?}"
+    );
     assert_eq!(git(root, &["stash", "list"]), "");
     assert_eq!(status(root), status_before);
     assert_git_fsck_strict(root);
 
     repo.stash()
-        .push(&opts, &mut NullProgress, &NeverCancel)
+        .push(&opts, &mut NullProgress, &CancelToken::never())
         .expect("push")
         .expect("stashed");
     assert_eq!(git(root, &["stash", "list"]).lines().count(), 1);
@@ -197,6 +193,7 @@ fn cancelled_merge_and_rebase_keep_branches_where_git_left_them() {
 
     let repo = open_grit_repo(root);
     let mut sink = CancelAfter::new(ProgressPhase::CheckingOutFiles, 5);
+    let cancel = sink.flag.clone();
     let err = integrate_branch(
         &repo,
         "refs/heads/main",
@@ -204,7 +201,7 @@ fn cancelled_merge_and_rebase_keep_branches_where_git_left_them() {
         side,
         "side",
         &mut sink,
-        &NeverCancel,
+        &cancel,
     )
     .expect_err("cancelled");
     assert!(matches!(err, Error::Cancelled), "got {err:?}");
@@ -225,6 +222,7 @@ fn cancelled_merge_and_rebase_keep_branches_where_git_left_them() {
             branch_tip: topic,
         },
         rebase: RebaseOntoOptions {
+            pre_rebase: grit_lib::revwalk::history::PreRebase::Skip,
             rewrite: RewriteOptions {
                 scope: RefScope::Head,
                 empty: EmptyPolicy::Drop,
@@ -241,20 +239,31 @@ fn cancelled_merge_and_rebase_keep_branches_where_git_left_them() {
             identity: IDENT.parse().expect("signature"),
             reflog_message: "rebase".into(),
             record_operation: None,
-            hooks: grit_lib::PostOperationHooks::Skip,
+            hooks: grit_lib::command_runner::hooks::PostOperationHooks::Skip,
         },
-        pre_rebase: grit_lib::revwalk::history::PreRebase::Skip,
+        exec: None,
     };
     let repo = open_grit_repo(root);
     let mut sink = CancelAfter::new(ProgressPhase::CheckingOutFiles, 5);
-    let err = start_rebase(&repo, &start, &mut sink, &NeverCancel).expect_err("cancelled");
+    let cancel = sink.flag.clone();
+    let err = repo
+        .history()
+        .start_rebase(&start, repo.command_runner().as_ref(), &mut sink, &cancel)
+        .expect_err("cancelled");
     assert!(err.is_cancelled(), "got {err:?}");
     assert_eq!(oid(root, "topic"), topic);
     assert_eq!(status(root), "", "rollback leaves a clean work tree");
     assert!(!root.join(".git/rebase-merge").exists());
     assert_git_fsck_strict(root);
 
-    start_rebase(&repo, &start, &mut NullProgress, &NeverCancel).expect("rebase");
+    repo.history()
+        .start_rebase(
+            &start,
+            repo.command_runner().as_ref(),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("rebase");
     assert_eq!(rev(root, "topic~1"), side.to_hex());
     assert_eq!(status(root), "");
     assert_git_fsck_strict(root);

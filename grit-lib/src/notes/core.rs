@@ -13,6 +13,7 @@
 //! [`RefStore`](crate::refs::store::RefStore), so every ref backend (loose/packed,
 //! reftable, or an injected store) sees the same notes.
 
+use crate::error::NotesError;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 
@@ -25,14 +26,16 @@ use crate::ident::parse_signature_times;
 use crate::ident_resolve::{IdentRole, IdentityEnv};
 use crate::merge_base::merge_bases_first_vs_rest;
 use crate::objects::{
-    parse_commit, parse_tree, serialize_commit, serialize_tree, tree_entry_cmp, CommitData,
+    parse_commit, parse_tree, serialize_commit, serialize_tree, tree_name_cmp, CommitData,
     ObjectId, ObjectKind, TreeEntry,
 };
+use crate::refs::list_refs_for_repository;
 use crate::refs::should_autocreate_reflog_with_config;
-use crate::refs::store::{Expected, RawRef, ReflogUpdate};
+use crate::refs::store::{Expected, RawRef, RefNameRef, ReflogUpdate};
 use crate::refs::store_write_value_on_store;
 use crate::repo::Repository;
 use crate::rev_parse::resolve_revision;
+use crate::wildmatch::wildmatch;
 use merge3::{Merge3, StandardMarkers};
 
 /// Per-worktree subdirectory holding the conflicted note blobs during a notes merge.
@@ -88,11 +91,11 @@ fn collect_notes_tree_entries(
     }
     let tree_obj = repo.odb().read(tree_oid)?;
     if tree_obj.kind != ObjectKind::Tree {
-        return Err(Error::NotesObjectKind {
+        return Err(Error::Notes(NotesError::UnexpectedObjectKind {
             oid: *tree_oid,
             expected: ObjectKind::Tree,
             found: tree_obj.kind,
-        });
+        }));
     }
 
     for entry in parse_tree(&tree_obj.data)? {
@@ -143,10 +146,16 @@ fn collect_notes_tree_entries(
 
 /// Current target of `notes_ref` in the repository's ref store, or `None` when the ref is absent.
 fn notes_ref_tip(repo: &Repository, notes_ref: &str) -> Result<Option<ObjectId>> {
-    match repo.refs().read_raw(notes_ref)? {
+    match repo
+        .ref_store()
+        .read_raw(RefNameRef::from_trusted(notes_ref))?
+    {
         None => Ok(None),
         Some(RawRef::Direct(oid)) => Ok(Some(oid)),
-        Some(RawRef::Symbolic(_)) => repo.refs().resolve(notes_ref).map(Some),
+        Some(RawRef::Symbolic(_)) => repo
+            .ref_store()
+            .resolve(RefNameRef::from_trusted(notes_ref))
+            .map(Some),
     }
 }
 
@@ -158,12 +167,12 @@ fn notes_ref_tip(repo: &Repository, notes_ref: &str) -> Result<Option<ObjectId>>
 ///
 /// # Errors
 ///
-/// - [`Error::NotesRefNotCommit`] when the target is neither a commit nor a tree.
-/// - [`Error::NotesObjectKind`] when a subtree entry is not a tree.
+/// - [`crate::error::NotesError::RefNotCommit`] when the target is neither a commit nor a tree.
+/// - [`crate::error::NotesError::UnexpectedObjectKind`] when a subtree entry is not a tree.
 /// - Ref store and object read failures.
 ///
 /// Returns an empty vec when neither a ref nor a revision named `notes_ref` exists.
-pub fn read_notes_tree(repo: &Repository, notes_ref: &str) -> Result<Vec<NotesTreeEntry>> {
+pub(crate) fn read_notes_tree(repo: &Repository, notes_ref: &str) -> Result<Vec<NotesTreeEntry>> {
     Ok(read_notes_snapshot(repo, notes_ref)?.entries)
 }
 
@@ -196,10 +205,10 @@ pub(crate) fn read_notes_snapshot(repo: &Repository, notes_ref: &str) -> Result<
         ObjectKind::Commit => parse_commit(&obj.data)?.tree,
         ObjectKind::Tree => tip,
         found => {
-            return Err(Error::NotesRefNotCommit {
+            return Err(Error::Notes(NotesError::RefNotCommit {
                 notes_ref: notes_ref.to_owned(),
                 found,
-            })
+            }))
         }
     };
     let mut entries = Vec::new();
@@ -227,7 +236,7 @@ pub(crate) fn read_notes_snapshot(repo: &Repository, notes_ref: &str) -> Result<
 ///
 /// Returns `(entries, truncated)` where `truncated` is true when the tree held more listable
 /// notes than returned.
-pub fn read_notes_tree_limited(
+pub(crate) fn read_notes_tree_limited(
     repo: &Repository,
     notes_ref: &str,
     max_entries: Option<usize>,
@@ -245,10 +254,10 @@ pub fn read_notes_tree_limited(
         ObjectKind::Commit => parse_commit(&obj.data)?.tree,
         ObjectKind::Tree => tip,
         found => {
-            return Err(Error::NotesRefNotCommit {
+            return Err(Error::Notes(NotesError::RefNotCommit {
                 notes_ref: notes_ref.to_owned(),
                 found,
-            })
+            }))
         }
     };
     let mut entries = Vec::new();
@@ -290,6 +299,402 @@ fn path_with_fanout(hex: &str, fanout: usize) -> Vec<u8> {
     }
     path.extend_from_slice(&bytes[split * 2..]);
     path
+}
+
+/// Notes ref tip and root notes tree when the ref exists.
+pub(crate) fn resolve_notes_ref_tree(
+    repo: &Repository,
+    notes_ref: &str,
+) -> Result<(Option<ObjectId>, Option<ObjectId>)> {
+    let tip = notes_ref_tip(repo, notes_ref)?;
+    let Some(tip) = tip else {
+        return Ok((None, None));
+    };
+    Ok((Some(tip), Some(notes_tree_oid(repo, &tip)?)))
+}
+
+fn notes_tree_oid(repo: &Repository, tip: &ObjectId) -> Result<ObjectId> {
+    let obj = repo.odb().read(tip)?;
+    match obj.kind {
+        ObjectKind::Commit => Ok(parse_commit(&obj.data)?.tree),
+        ObjectKind::Tree => Ok(*tip),
+        found => Err(Error::Notes(NotesError::RefNotCommit {
+            notes_ref: String::new(),
+            found,
+        })),
+    }
+}
+
+fn read_tree_entries(repo: &Repository, tree_oid: &ObjectId) -> Result<Vec<TreeEntry>> {
+    let tree_obj = repo.odb().read(tree_oid)?;
+    if tree_obj.kind != ObjectKind::Tree {
+        return Err(Error::Notes(NotesError::UnexpectedObjectKind {
+            oid: *tree_oid,
+            expected: ObjectKind::Tree,
+            found: tree_obj.kind,
+        }));
+    }
+    parse_tree(&tree_obj.data)
+}
+
+fn is_fanout_tree_name(name: &[u8]) -> bool {
+    name.len() == 2 && name.iter().all(u8::is_ascii_hexdigit)
+}
+
+fn is_full_note_blob_name(name: &[u8]) -> bool {
+    ObjectId::is_hex_len(name.len()) && name.iter().all(u8::is_ascii_hexdigit)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NotesTreeLayout {
+    Empty,
+    FlatNotes,
+    FanoutNotes,
+    Irregular,
+}
+
+fn classify_notes_tree(entries: &[TreeEntry]) -> NotesTreeLayout {
+    if entries.is_empty() {
+        return NotesTreeLayout::Empty;
+    }
+    let mut flat = false;
+    let mut fanout = false;
+    for entry in entries {
+        if entry.mode == 0o040000 {
+            if is_fanout_tree_name(&entry.name) {
+                fanout = true;
+            }
+        } else if is_full_note_blob_name(&entry.name) {
+            flat = true;
+        }
+    }
+    match (flat, fanout) {
+        (true, true) => NotesTreeLayout::Irregular,
+        (true, false) => NotesTreeLayout::FlatNotes,
+        (false, true) => NotesTreeLayout::FanoutNotes,
+        (false, false) => NotesTreeLayout::Empty,
+    }
+}
+
+fn count_flat_note_entries(entries: &[TreeEntry]) -> usize {
+    entries
+        .iter()
+        .filter(|e| e.mode != 0o040000 && is_full_note_blob_name(&e.name))
+        .count()
+}
+
+fn store_tree_entries(repo: &Repository, entries: &[TreeEntry]) -> Result<ObjectId> {
+    let mut sorted = entries.to_vec();
+    sorted.sort_by(|a, b| tree_name_cmp(&a.name, a.mode == 0o040000, &b.name, b.mode == 0o040000));
+    repo.odb().write(ObjectKind::Tree, &serialize_tree(&sorted))
+}
+
+/// One hop on the path from the notes root to a note blob.
+struct NoteTreeHop {
+    entries: Vec<TreeEntry>,
+    child_index: usize,
+}
+
+/// ASCII case-insensitive equality for hex path segments (Git may store `AB` vs `ab`).
+fn hex_name_eq(left: &[u8], right: &[u8]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(a, b)| a.eq_ignore_ascii_case(b))
+}
+
+/// Locate a note blob in an existing fanout or flat tree without reading sibling subtrees.
+pub(crate) fn lookup_note_blob_oid(
+    repo: &Repository,
+    root_tree: &ObjectId,
+    object_hex: &str,
+) -> Result<Option<ObjectId>> {
+    let hex = object_hex.as_bytes();
+    let mut tree_oid = *root_tree;
+    let mut offset = 0usize;
+    loop {
+        let entries = read_tree_entries(repo, &tree_oid)?;
+        if let Some(entry) = entries
+            .iter()
+            .find(|e| e.mode != 0o040000 && hex_name_eq(e.name.as_slice(), &hex[offset..]))
+        {
+            return Ok(Some(entry.oid));
+        }
+        if offset + 2 > hex.len() {
+            return Ok(None);
+        }
+        let prefix = &hex[offset..offset + 2];
+        let Some(child) = entries
+            .iter()
+            .find(|e| e.mode == 0o040000 && hex_name_eq(e.name.as_slice(), prefix))
+        else {
+            return Ok(None);
+        };
+        offset += 2;
+        tree_oid = child.oid;
+    }
+}
+
+/// Result of an in-place notes tree splice; [`NotesSpliceResult::Fallback`] means callers should
+/// rebuild with [`write_notes_tree`].
+pub(crate) enum NotesSpliceResult {
+    Tree(ObjectId),
+    Fallback,
+}
+
+pub(crate) fn splice_note_upsert(
+    repo: &Repository,
+    root_tree: Option<ObjectId>,
+    object_hex: &str,
+    blob_oid: ObjectId,
+) -> Result<NotesSpliceResult> {
+    let hex = object_hex.as_bytes();
+    if !ObjectId::is_hex_len(hex.len()) {
+        return Ok(NotesSpliceResult::Fallback);
+    }
+    let Some(root) = root_tree else {
+        let tree = store_tree_entries(
+            repo,
+            &[TreeEntry {
+                mode: 0o100644,
+                name: hex.to_vec(),
+                oid: blob_oid,
+            }],
+        )?;
+        return Ok(NotesSpliceResult::Tree(tree));
+    };
+
+    let root_entries = read_tree_entries(repo, &root)?;
+    match classify_notes_tree(&root_entries) {
+        NotesTreeLayout::Irregular => Ok(NotesSpliceResult::Fallback),
+        NotesTreeLayout::FlatNotes => {
+            if let Some((mode, old)) = find_note_in_flat_tree(&root_entries, hex) {
+                if old == blob_oid {
+                    Ok(NotesSpliceResult::Tree(root))
+                } else {
+                    let mut entries = root_entries;
+                    replace_blob_in_entries(&mut entries, hex, mode, blob_oid);
+                    Ok(NotesSpliceResult::Tree(store_tree_entries(repo, &entries)?))
+                }
+            } else if count_flat_note_entries(&root_entries) >= 0xff {
+                Ok(NotesSpliceResult::Fallback)
+            } else {
+                let mut entries = root_entries;
+                entries.push(TreeEntry {
+                    mode: 0o100644,
+                    name: hex.to_vec(),
+                    oid: blob_oid,
+                });
+                Ok(NotesSpliceResult::Tree(store_tree_entries(repo, &entries)?))
+            }
+        }
+        NotesTreeLayout::Empty | NotesTreeLayout::FanoutNotes => {
+            match walk_note_for_upsert(repo, root, hex, blob_oid)? {
+                Some(tree) => Ok(NotesSpliceResult::Tree(tree)),
+                None => Ok(NotesSpliceResult::Fallback),
+            }
+        }
+    }
+}
+
+pub(crate) fn splice_note_remove(
+    repo: &Repository,
+    root_tree: ObjectId,
+    object_hex: &str,
+) -> Result<NotesSpliceResult> {
+    let hex = object_hex.as_bytes();
+    if !ObjectId::is_hex_len(hex.len()) {
+        return Ok(NotesSpliceResult::Fallback);
+    }
+    let root_entries = read_tree_entries(repo, &root_tree)?;
+    match classify_notes_tree(&root_entries) {
+        NotesTreeLayout::Irregular => Ok(NotesSpliceResult::Fallback),
+        NotesTreeLayout::FlatNotes => {
+            let mut entries = root_entries;
+            if remove_blob_named(&mut entries, hex) {
+                Ok(NotesSpliceResult::Tree(store_tree_entries(repo, &entries)?))
+            } else {
+                Ok(NotesSpliceResult::Tree(root_tree))
+            }
+        }
+        NotesTreeLayout::Empty | NotesTreeLayout::FanoutNotes => {
+            match walk_note_for_remove(repo, root_tree, hex)? {
+                Some(tree) => Ok(NotesSpliceResult::Tree(tree)),
+                None => Ok(NotesSpliceResult::Fallback),
+            }
+        }
+    }
+}
+
+fn find_note_in_flat_tree(entries: &[TreeEntry], hex: &[u8]) -> Option<(u32, ObjectId)> {
+    entries
+        .iter()
+        .find(|e| e.mode != 0o040000 && hex_name_eq(e.name.as_slice(), hex))
+        .map(|e| (e.mode, e.oid))
+}
+
+fn replace_blob_in_entries(entries: &mut [TreeEntry], hex: &[u8], mode: u32, blob: ObjectId) {
+    for entry in entries.iter_mut() {
+        if entry.mode != 0o040000 && hex_name_eq(entry.name.as_slice(), hex) {
+            entry.mode = mode;
+            entry.oid = blob;
+            return;
+        }
+    }
+}
+
+fn remove_blob_named(entries: &mut Vec<TreeEntry>, name: &[u8]) -> bool {
+    let before = entries.len();
+    entries.retain(|e| !(e.mode != 0o040000 && hex_name_eq(e.name.as_slice(), name)));
+    entries.len() < before
+}
+
+fn walk_note_for_upsert(
+    repo: &Repository,
+    root_tree: ObjectId,
+    hex: &[u8],
+    blob_oid: ObjectId,
+) -> Result<Option<ObjectId>> {
+    let mut path: Vec<NoteTreeHop> = Vec::new();
+    let mut tree_oid = root_tree;
+    let mut offset = 0usize;
+    loop {
+        let entries = read_tree_entries(repo, &tree_oid)?;
+        let layout = classify_notes_tree(&entries);
+        if layout == NotesTreeLayout::Irregular {
+            return Ok(None);
+        }
+        if let Some(idx) = entries
+            .iter()
+            .position(|e| e.mode != 0o040000 && hex_name_eq(e.name.as_slice(), &hex[offset..]))
+        {
+            if entries[idx].oid == blob_oid {
+                return Ok(Some(root_tree));
+            }
+            let mut new_entries = entries;
+            new_entries[idx].oid = blob_oid;
+            return Ok(Some(rewrite_note_path(repo, &path, new_entries)?));
+        }
+
+        let can_descend = layout == NotesTreeLayout::FanoutNotes
+            || (layout == NotesTreeLayout::Empty && offset == 0);
+        if can_descend && offset + 2 <= hex.len() {
+            let prefix = &hex[offset..offset + 2];
+            if let Some(child_idx) = entries
+                .iter()
+                .position(|e| e.mode == 0o040000 && hex_name_eq(e.name.as_slice(), prefix))
+            {
+                let child_oid = entries[child_idx].oid;
+                path.push(NoteTreeHop {
+                    entries,
+                    child_index: child_idx,
+                });
+                offset += 2;
+                tree_oid = child_oid;
+                continue;
+            }
+            let leaf = store_tree_entries(
+                repo,
+                &[TreeEntry {
+                    mode: 0o100644,
+                    name: hex[offset + 2..].to_vec(),
+                    oid: blob_oid,
+                }],
+            )?;
+            let mut parent_entries = entries;
+            parent_entries.push(TreeEntry {
+                mode: 0o040000,
+                name: prefix.to_vec(),
+                oid: leaf,
+            });
+            return Ok(Some(rewrite_note_path(repo, &path, parent_entries)?));
+        }
+
+        if layout == NotesTreeLayout::FlatNotes && offset == 0 {
+            return Ok(None);
+        }
+
+        let mut new_entries = entries;
+        new_entries.push(TreeEntry {
+            mode: 0o100644,
+            name: hex[offset..].to_vec(),
+            oid: blob_oid,
+        });
+        return Ok(Some(rewrite_note_path(repo, &path, new_entries)?));
+    }
+}
+
+fn walk_note_for_remove(
+    repo: &Repository,
+    root_tree: ObjectId,
+    hex: &[u8],
+) -> Result<Option<ObjectId>> {
+    let mut path: Vec<NoteTreeHop> = Vec::new();
+    let mut tree_oid = root_tree;
+    let mut offset = 0usize;
+    loop {
+        let entries = read_tree_entries(repo, &tree_oid)?;
+        if classify_notes_tree(&entries) == NotesTreeLayout::Irregular {
+            return Ok(None);
+        }
+        if let Some(idx) = entries
+            .iter()
+            .position(|e| e.mode != 0o040000 && hex_name_eq(e.name.as_slice(), &hex[offset..]))
+        {
+            let mut new_entries = entries;
+            new_entries.remove(idx);
+            return Ok(Some(rewrite_note_path_or_drop(repo, &path, new_entries)?));
+        }
+        if offset + 2 > hex.len() {
+            return Ok(Some(root_tree));
+        }
+        let prefix = &hex[offset..offset + 2];
+        let Some(child_idx) = entries
+            .iter()
+            .position(|e| e.mode == 0o040000 && hex_name_eq(e.name.as_slice(), prefix))
+        else {
+            return Ok(Some(root_tree));
+        };
+        let child_oid = entries[child_idx].oid;
+        path.push(NoteTreeHop {
+            entries,
+            child_index: child_idx,
+        });
+        offset += 2;
+        tree_oid = child_oid;
+    }
+}
+
+fn rewrite_note_path(
+    repo: &Repository,
+    path: &[NoteTreeHop],
+    leaf_entries: Vec<TreeEntry>,
+) -> Result<ObjectId> {
+    let mut oid = store_tree_entries(repo, &leaf_entries)?;
+    for hop in path.iter().rev() {
+        let mut entries = hop.entries.clone();
+        entries[hop.child_index].oid = oid;
+        oid = store_tree_entries(repo, &entries)?;
+    }
+    Ok(oid)
+}
+
+fn rewrite_note_path_or_drop(
+    repo: &Repository,
+    path: &[NoteTreeHop],
+    leaf_entries: Vec<TreeEntry>,
+) -> Result<ObjectId> {
+    if leaf_entries.is_empty() {
+        if let Some(hop) = path.last() {
+            let mut parent = hop.entries.clone();
+            parent.remove(hop.child_index);
+            let parent_path = &path[..path.len().saturating_sub(1)];
+            return rewrite_note_path_or_drop(repo, parent_path, parent);
+        }
+        return store_tree_entries(repo, &leaf_entries);
+    }
+    rewrite_note_path(repo, path, leaf_entries)
 }
 
 fn write_notes_subtree(repo: &Repository, entries: &[NotesTreeEntry]) -> Result<ObjectId> {
@@ -338,13 +743,20 @@ fn write_notes_subtree(repo: &Repository, entries: &[NotesTreeEntry]) -> Result<
     }
 
     tree_entries
-        .sort_by(|a, b| tree_entry_cmp(&a.name, a.mode == 0o040000, &b.name, b.mode == 0o040000));
+        .sort_by(|a, b| tree_name_cmp(&a.name, a.mode == 0o040000, &b.name, b.mode == 0o040000));
 
     let tree_data = serialize_tree(&tree_entries);
     repo.odb().write(ObjectKind::Tree, &tree_data)
 }
 
 /// Write `entries` as a notes tree, re-laying out note paths with the fanout their count needs.
+pub(crate) fn materialize_notes_tree(
+    repo: &Repository,
+    entries: &[NotesTreeEntry],
+) -> Result<ObjectId> {
+    write_notes_tree(repo, entries)
+}
+
 fn write_notes_tree(repo: &Repository, entries: &[NotesTreeEntry]) -> Result<ObjectId> {
     let fanout = notes_fanout(entries);
     let rewritten_entries: Vec<_> = entries
@@ -386,6 +798,15 @@ fn write_notes_commit_object(
     parents: Vec<ObjectId>,
 ) -> Result<ObjectId> {
     let tree = write_notes_tree(repo, entries)?;
+    write_notes_commit_object_on_tree(repo, tree, commit, parents)
+}
+
+fn write_notes_commit_object_on_tree(
+    repo: &Repository,
+    tree: ObjectId,
+    commit: &NotesCommit<'_>,
+    parents: Vec<ObjectId>,
+) -> Result<ObjectId> {
     let message = if commit.message.ends_with('\n') {
         commit.message.to_owned()
     } else {
@@ -405,6 +826,50 @@ fn write_notes_commit_object(
     };
     repo.odb()
         .write(ObjectKind::Commit, &serialize_commit(&data))
+}
+
+/// Like [`preview_notes_commit`], but the notes tree is already materialized.
+pub(crate) fn preview_notes_commit_on_tree(
+    repo: &Repository,
+    parent: Option<ObjectId>,
+    tree_oid: ObjectId,
+    commit: &NotesCommit<'_>,
+) -> Result<ObjectId> {
+    write_notes_commit_object_on_tree(repo, tree_oid, commit, parent.into_iter().collect())
+}
+
+pub(crate) fn write_notes_commit_idents_on_tree(
+    repo: &Repository,
+    notes_ref: &str,
+    parent: Option<ObjectId>,
+    tree_oid: ObjectId,
+    message: &str,
+    author: &str,
+    committer: &str,
+) -> Result<()> {
+    let oid = write_notes_commit_object_on_tree(
+        repo,
+        tree_oid,
+        &NotesCommit {
+            message,
+            author,
+            committer,
+        },
+        parent.into_iter().collect(),
+    )?;
+    repo.odb().flush_for_publish()?;
+    update_notes_ref(
+        repo,
+        notes_ref,
+        parent,
+        oid,
+        &NotesCommit {
+            message,
+            author,
+            committer,
+        },
+    )?;
+    Ok(())
 }
 
 /// Timestamp of a full identity line, for the reflog entry written next to it.
@@ -428,9 +893,11 @@ fn update_notes_ref(
     new: ObjectId,
     commit: &NotesCommit<'_>,
 ) -> Result<()> {
-    let config = repo.config()?;
+    let config = repo.config().snapshot()?;
     let log = should_autocreate_reflog_with_config(config.as_ref(), repo.git_dir(), notes_ref)
-        || repo.refs().reflog_exists(notes_ref)?;
+        || repo
+            .ref_store()
+            .reflog_exists(RefNameRef::from_trusted(notes_ref))?;
     let reflog = log.then(|| ReflogUpdate {
         identity: commit.committer.to_owned(),
         message: format!("notes: {}", commit.message.trim_end_matches('\n')),
@@ -439,7 +906,7 @@ fn update_notes_ref(
         new_oid: None,
     });
     store_write_value_on_store(
-        repo.refs(),
+        repo.ref_store(),
         repo.git_dir(),
         notes_ref,
         Some(RawRef::Direct(new)),
@@ -460,6 +927,7 @@ fn commit_notes_tree(
     commit: &NotesCommit<'_>,
 ) -> Result<ObjectId> {
     let oid = write_notes_commit_object(repo, entries, commit, parent.into_iter().collect())?;
+    repo.odb().flush_for_publish()?;
     update_notes_ref(repo, notes_ref, parent, oid, commit)?;
     Ok(oid)
 }
@@ -480,7 +948,7 @@ fn commit_notes_tree(
 /// - Ref store errors, including a compare-and-swap failure when `notes_ref` moves while the
 ///   commit is written.
 /// - Object write and config load failures.
-pub fn write_notes_commit(
+pub(crate) fn write_notes_commit(
     repo: &Repository,
     notes_ref: &str,
     entries: &[NotesTreeEntry],
@@ -539,7 +1007,7 @@ pub fn remove_note_entry(entries: &mut Vec<NotesTreeEntry>, object_hex: &str) ->
 
 /// Author and committer lines for notes commits written without explicit identities.
 fn wall_clock_notes_idents(repo: &Repository) -> Result<(String, String)> {
-    let config = repo.config()?;
+    let config = repo.config().snapshot()?;
     let now = repo.identity_now();
     Ok((
         notes_ident(repo.environment(), config.as_ref(), IdentRole::Author, now),
@@ -576,11 +1044,11 @@ fn notes_ident<E: IdentityEnv>(
 
     let name = non_blank(name_key)
         .or_else(|| author_fallback("GIT_AUTHOR_NAME"))
-        .or_else(|| config.get("user.name"))
+        .or_else(|| config.value("user.name"))
         .unwrap_or_else(|| "Unknown".to_owned());
     let email = non_blank(email_key)
         .or_else(|| author_fallback("GIT_AUTHOR_EMAIL"))
-        .or_else(|| config.get("user.email"))
+        .or_else(|| config.value("user.email"))
         .unwrap_or_default();
     assemble_identity(&name, &email, non_blank(date_key).as_deref(), now)
 }
@@ -646,16 +1114,20 @@ impl NotesRef {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidNotesRef`](crate::error::Error::InvalidNotesRef) when
+    /// Returns [`crate::error::NotesError::InvalidRef`](crate::error::NotesError::InvalidRef) when
     /// `full` is not prefixed with `refs/notes/` or is not a valid ref name (env/config
     /// values are not trimmed or otherwise normalized).
     pub fn from_full(full: &str) -> Result<Self> {
         if !full.starts_with("refs/notes/") {
-            return Err(Error::InvalidNotesRef(full.to_owned()));
+            return Err(Error::Notes(NotesError::InvalidRef {
+                name: full.to_owned(),
+            }));
         }
-        use crate::check_ref_format::{check_refname_format, RefNameOptions};
-        if check_refname_format(full, &RefNameOptions::default()).is_err() {
-            return Err(Error::InvalidNotesRef(full.to_owned()));
+        use crate::check_ref_format::{check_refname_format, RefFormatOptions};
+        if check_refname_format(full, &RefFormatOptions::default()).is_err() {
+            return Err(Error::Notes(NotesError::InvalidRef {
+                name: full.to_owned(),
+            }));
         }
         Ok(Self(full.to_owned()))
     }
@@ -688,7 +1160,7 @@ impl std::fmt::Display for NotesRef {
 ///
 /// # Errors
 ///
-/// Returns [`Error::InvalidNotesRef`](crate::error::Error::InvalidNotesRef) when a
+/// Returns [`crate::error::NotesError::InvalidRef`](crate::error::NotesError::InvalidRef) when a
 /// configured value is empty or outside `refs/notes/`.
 pub fn resolve_configured_notes_ref<E: IdentityEnv>(
     env: &E,
@@ -697,7 +1169,7 @@ pub fn resolve_configured_notes_ref<E: IdentityEnv>(
     if let Some(value) = env.var("GIT_NOTES_REF") {
         return NotesRef::from_full(&value);
     }
-    if let Some(value) = config.get("core.notesRef") {
+    if let Some(value) = config.value("core.notesRef") {
         return NotesRef::from_full(&value);
     }
     Ok(NotesRef::commits())
@@ -838,15 +1310,15 @@ fn build_merge_pairs(
 ///
 /// # Errors
 ///
-/// [`Error::NotesObjectKind`] when `oid` is not a blob, or object read failures.
+/// [`crate::error::NotesError::UnexpectedObjectKind`] when `oid` is not a blob, or object read failures.
 pub(crate) fn read_blob_bytes(repo: &Repository, oid: &ObjectId) -> Result<Vec<u8>> {
     let obj = repo.odb().read(oid)?;
     if obj.kind != ObjectKind::Blob {
-        return Err(Error::NotesObjectKind {
+        return Err(Error::Notes(NotesError::UnexpectedObjectKind {
             oid: *oid,
             expected: ObjectKind::Blob,
             found: obj.kind,
-        });
+        }));
     }
     Ok(obj.data)
 }
@@ -869,12 +1341,10 @@ fn combine_notes_concatenate(
         None => Vec::new(),
     };
     if new_data.is_empty() {
-        let Some(c) = cur else {
-            return Err(Error::Message(
-                "combine_notes_concatenate: empty new and no current".into(),
-            ));
+        return match (cur, new_oid) {
+            (Some(c), _) | (None, Some(c)) => Ok(*c),
+            (None, None) => Ok(repo.odb().write(ObjectKind::Blob, b"")?),
         };
-        return Ok(*c);
     }
 
     let cur_data = match cur {
@@ -1029,9 +1499,9 @@ fn merge_one_note_change(
             };
             if !*has_worktree {
                 if notes_merge_worktree_nonempty(worktree) {
-                    return Err(Error::NotesMergeInProgress {
+                    return Err(Error::Notes(NotesError::MergeInProgress {
                         path: worktree.to_path_buf(),
-                    });
+                    }));
                 }
                 fs::create_dir_all(worktree)?;
                 *has_worktree = true;
@@ -1141,11 +1611,11 @@ fn merge_changes_into_entries(
 fn resolve_commit_tree(repo: &Repository, commit_oid: &ObjectId) -> Result<ObjectId> {
     let obj = repo.odb().read(commit_oid)?;
     if obj.kind != ObjectKind::Commit {
-        return Err(Error::NotesObjectKind {
+        return Err(Error::Notes(NotesError::UnexpectedObjectKind {
             oid: *commit_oid,
             expected: ObjectKind::Commit,
             found: obj.kind,
-        });
+        }));
     }
     Ok(parse_commit(&obj.data)?.tree)
 }
@@ -1156,10 +1626,10 @@ fn resolve_notes_commit_optional(repo: &Repository, notes_ref: &str) -> Result<O
     };
     let kind = repo.odb().read(&oid)?.kind;
     if kind != ObjectKind::Commit {
-        return Err(Error::NotesRefNotCommit {
+        return Err(Error::Notes(NotesError::RefNotCommit {
             notes_ref: notes_ref.to_owned(),
             found: kind,
-        });
+        }));
     }
     Ok(Some(oid))
 }
@@ -1190,6 +1660,7 @@ fn write_notes_commit_with_parents(
     };
     let oid = write_notes_commit_object(repo, entries, &commit, parents.to_vec())?;
     if let NotesRefUpdate::From(old) = update {
+        repo.odb().flush_for_publish()?;
         update_notes_ref(repo, notes_ref, old, oid, &commit)?;
     }
     Ok(oid)
@@ -1199,12 +1670,12 @@ fn write_notes_commit_with_parents(
 ///
 /// # Errors
 ///
-/// - [`Error::NotesMergeBothEmpty`] when neither ref has a notes commit.
-/// - [`Error::NotesRefNotCommit`] when either ref points at something other than a commit.
-/// - [`Error::NotesMergeInProgress`] when [`NotesMergeStrategy::Manual`] finds conflict files
+/// - [`crate::error::NotesError::MergeBothEmpty`] when neither ref has a notes commit.
+/// - [`crate::error::NotesError::RefNotCommit`] when either ref points at something other than a commit.
+/// - [`crate::error::NotesError::MergeInProgress`] when [`NotesMergeStrategy::Manual`] finds conflict files
 ///   left by an earlier merge.
 /// - Ref store, object, and merge-base failures, or a failure while combining blobs.
-pub fn notes_merge_inner(
+pub(crate) fn notes_merge_inner(
     repo: &Repository,
     local_ref: &str,
     remote_ref: &str,
@@ -1213,10 +1684,10 @@ pub fn notes_merge_inner(
     let local_commit = resolve_notes_commit_optional(repo, local_ref)?;
     let remote_commit = resolve_notes_commit_optional(repo, remote_ref)?;
     match (local_commit, remote_commit) {
-        (None, None) => Err(Error::NotesMergeBothEmpty {
+        (None, None) => Err(Error::Notes(NotesError::MergeBothEmpty {
             local: local_ref.to_owned(),
             remote: remote_ref.to_owned(),
-        }),
+        })),
         (None, Some(r)) => Ok(Ok(r)),
         (Some(l), None) => Ok(Ok(l)),
         (Some(local_oid), Some(remote_oid)) => {
@@ -1287,12 +1758,272 @@ pub fn notes_merge_inner(
     }
 }
 
+/// History command that may copy notes onto rewritten commits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NotesRewriteCommand {
+    /// Rebase and other history rewrites (`notes.rewrite.rebase`, default on).
+    Rebase,
+    /// Commit amend (`notes.rewrite.amend`, default on).
+    Amend,
+}
+
+/// How to combine note blobs when several rewritten commits map onto one target.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NotesRewriteMode {
+    /// Append the source note after the destination with a blank line between (Git default).
+    Concatenate,
+    /// Concatenate, sort lines, and deduplicate.
+    CatSortUniq,
+    /// Replace the destination note with the source.
+    Overwrite,
+    /// Keep an existing destination note; copy only when the destination had none.
+    Ignore,
+}
+
+impl NotesRewriteMode {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "concatenate" => Ok(Self::Concatenate),
+            "cat_sort_uniq" => Ok(Self::CatSortUniq),
+            "overwrite" => Ok(Self::Overwrite),
+            "ignore" => Ok(Self::Ignore),
+            other => Err(Error::Notes(NotesError::UnknownRewriteMode {
+                mode: other.to_owned(),
+            })),
+        }
+    }
+}
+
+fn notes_rewrite_command_enabled(config: &ConfigSet, command: NotesRewriteCommand) -> bool {
+    let key = match command {
+        NotesRewriteCommand::Rebase => "notes.rewrite.rebase",
+        NotesRewriteCommand::Amend => "notes.rewrite.amend",
+    };
+    config.bool_with_default(key, true)
+}
+
+fn resolve_notes_rewrite_mode<E: IdentityEnv>(
+    config: &ConfigSet,
+    env: &E,
+) -> Result<NotesRewriteMode> {
+    if let Some(value) = env.var("GIT_NOTES_REWRITE_MODE") {
+        return NotesRewriteMode::parse(value.trim());
+    }
+    if let Some(value) = config.value("notes.rewriteMode") {
+        return NotesRewriteMode::parse(value.trim());
+    }
+    Ok(NotesRewriteMode::Concatenate)
+}
+
+fn notes_rewrite_pattern_is_glob(pattern: &str) -> bool {
+    pattern
+        .bytes()
+        .any(|byte| matches!(byte, b'*' | b'?' | b'[' | b'\\'))
+}
+
+fn resolve_notes_rewrite_refs<E: IdentityEnv>(
+    repo: &Repository,
+    config: &ConfigSet,
+    env: &E,
+) -> Result<Vec<String>> {
+    let patterns: Vec<String> = if let Some(value) = env.var("GIT_NOTES_REWRITE_REF") {
+        value
+            .split(':')
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .map(str::to_owned)
+            .collect()
+    } else {
+        config.values_all("notes.rewriteRef")
+    };
+    if patterns.is_empty() {
+        return Ok(Vec::new());
+    }
+    let all_refs = list_refs_for_repository(repo, "refs/")?;
+    let mut resolved = BTreeSet::new();
+    for pattern in patterns {
+        if !pattern.starts_with("refs/notes/") {
+            continue;
+        }
+        if notes_rewrite_pattern_is_glob(&pattern) {
+            for (name, _) in &all_refs {
+                if wildmatch(pattern.as_bytes(), name.as_bytes(), 0) {
+                    resolved.insert(name.clone());
+                }
+            }
+        } else {
+            resolved.insert(pattern);
+        }
+    }
+    Ok(resolved.into_iter().collect())
+}
+
+fn note_blob_for_object(entries: &[NotesTreeEntry], object: &ObjectId) -> Option<ObjectId> {
+    let hex = object.to_hex();
+    entries
+        .iter()
+        .find(|entry| note_object_name(&entry.path).as_deref() == Some(hex.as_str()))
+        .map(|entry| entry.oid)
+}
+
+fn combine_note_for_rewrite(
+    repo: &Repository,
+    mode: NotesRewriteMode,
+    current: Option<ObjectId>,
+    source: ObjectId,
+) -> Result<ObjectId> {
+    match mode {
+        NotesRewriteMode::Overwrite => Ok(source),
+        NotesRewriteMode::Ignore => current.map_or(Ok(source), Ok),
+        NotesRewriteMode::Concatenate => {
+            combine_notes_concatenate(repo, current.as_ref(), Some(&source))
+        }
+        NotesRewriteMode::CatSortUniq => {
+            combine_notes_cat_sort_uniq(repo, current.as_ref(), Some(&source))
+        }
+    }
+}
+
+fn notes_rewrite_commit_message(command: NotesRewriteCommand) -> &'static str {
+    match command {
+        NotesRewriteCommand::Rebase => "Notes added by 'git notes copy'",
+        NotesRewriteCommand::Amend => "Notes added by 'git commit --amend'",
+    }
+}
+
+fn copy_notes_for_rewrite_on_ref(
+    repo: &Repository,
+    notes_ref: &str,
+    pairs: &[(ObjectId, ObjectId)],
+    mode: NotesRewriteMode,
+    message: &str,
+) -> Result<()> {
+    let snapshot = read_notes_snapshot(repo, notes_ref)?;
+    let mut entries = snapshot.entries;
+    let mut changed = false;
+    for &(old, new) in pairs {
+        if old == new {
+            continue;
+        }
+        let Some(source) = note_blob_for_object(&entries, &old) else {
+            continue;
+        };
+        let current = note_blob_for_object(&entries, &new);
+        let combined = combine_note_for_rewrite(repo, mode, current, source)?;
+        if current != Some(combined) {
+            upsert_note_entry(&mut entries, &new.to_hex(), combined);
+            changed = true;
+        }
+    }
+    if !changed {
+        return Ok(());
+    }
+    let (author, committer) = wall_clock_notes_idents(repo)?;
+    write_notes_commit_idents(
+        repo,
+        notes_ref,
+        snapshot.tip,
+        &entries,
+        message,
+        &author,
+        &committer,
+    )
+}
+
+/// Resolved settings for a notes copy during a rewrite (refs, mode, commit message).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NotesRewritePlan {
+    /// Notes refs that will receive copied notes.
+    pub refs: Vec<String>,
+    /// How to combine blobs when several sources map to one target.
+    pub mode: NotesRewriteMode,
+    message: &'static str,
+}
+
+impl NotesRewritePlan {
+    fn message(&self) -> &str {
+        self.message
+    }
+}
+
+/// Validate notes-rewrite configuration for `command` when copies would run for `pairs`.
+///
+/// Returns [`None`] when `pairs` is empty, no refs are selected, or the command is disabled.
+/// Otherwise resolves refs and mode without reading or writing note trees.
+///
+/// # Errors
+///
+/// Returns [`crate::error::NotesError::UnknownRewriteMode`] when the configured rewrite mode is unknown.
+pub(crate) fn prepare_notes_for_rewrite(
+    repo: &Repository,
+    command: NotesRewriteCommand,
+    pairs: &[(ObjectId, ObjectId)],
+) -> Result<Option<NotesRewritePlan>> {
+    if pairs.is_empty() {
+        return Ok(None);
+    }
+    let config = repo.config().snapshot()?;
+    let notes_refs = resolve_notes_rewrite_refs(repo, config.as_ref(), repo.environment())?;
+    if notes_refs.is_empty() {
+        return Ok(None);
+    }
+    if !notes_rewrite_command_enabled(config.as_ref(), command) {
+        return Ok(None);
+    }
+    let mode = resolve_notes_rewrite_mode(config.as_ref(), repo.environment())?;
+    Ok(Some(NotesRewritePlan {
+        refs: notes_refs,
+        mode,
+        message: notes_rewrite_commit_message(command),
+    }))
+}
+
+/// Apply a prepared plan from [`prepare_notes_for_rewrite`].
+///
+/// # Errors
+///
+/// Propagates notes read/write and ref compare-and-swap failures.
+pub(crate) fn apply_prepared_notes_rewrite(
+    repo: &Repository,
+    plan: &NotesRewritePlan,
+    pairs: &[(ObjectId, ObjectId)],
+) -> Result<()> {
+    for notes_ref in &plan.refs {
+        copy_notes_for_rewrite_on_ref(repo, notes_ref, pairs, plan.mode, plan.message())?;
+    }
+    Ok(())
+}
+
+/// Copy notes from rewritten commits to their replacements (Git `git notes copy --for-rewrite`).
+///
+/// Honors `notes.rewriteRef` / `GIT_NOTES_REWRITE_REF`, `notes.rewriteMode` /
+/// `GIT_NOTES_REWRITE_MODE`, and `notes.rewrite.rebase` / `notes.rewrite.amend`. Notes on the
+/// original object ids are left in place; only the listed `(old, new)` pairs are considered.
+///
+/// # Errors
+///
+/// Returns [`crate::error::NotesError::UnknownRewriteMode`] when the configured rewrite mode is unknown, and other
+/// notes or ref store errors while reading or writing notes refs.
+pub(crate) fn copy_notes_for_rewrite(
+    repo: &Repository,
+    command: NotesRewriteCommand,
+    pairs: &[(ObjectId, ObjectId)],
+) -> Result<()> {
+    if let Some(plan) = prepare_notes_for_rewrite(repo, command, pairs)? {
+        apply_prepared_notes_rewrite(repo, &plan, pairs)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::environment::RepositoryOptions;
+    use crate::error::RefError;
     use crate::objects::ObjectKind;
+    use crate::refs::store::RefNameRef;
     use crate::repo::Repository;
+    use std::io::Write;
     use std::process::Command;
     use tempfile::TempDir;
 
@@ -1342,9 +2073,9 @@ mod tests {
     #[test]
     fn from_full_rejects_whitespace_padded_ref() {
         let err = NotesRef::from_full(" refs/notes/spaced ").expect_err("padded");
-        assert!(matches!(err, Error::InvalidNotesRef(_)));
+        assert!(matches!(err, Error::Notes(NotesError::InvalidRef { .. })));
         let err = NotesRef::from_full("refs/notes/spaced ").expect_err("trailing");
-        assert!(matches!(err, Error::InvalidNotesRef(_)));
+        assert!(matches!(err, Error::Notes(NotesError::InvalidRef { .. })));
         let ok = NotesRef::from_full("refs/notes/spaced").expect("valid");
         assert_eq!(ok.as_str(), "refs/notes/spaced");
     }
@@ -1368,7 +2099,7 @@ mod tests {
         let env = MapEnv(HashMap::from([("GIT_NOTES_REF".to_owned(), String::new())]));
         let err = resolve_configured_notes_ref(&env, &ConfigSet::default())
             .expect_err("empty GIT_NOTES_REF");
-        assert!(matches!(err, Error::InvalidNotesRef(_)));
+        assert!(matches!(err, Error::Notes(NotesError::InvalidRef { .. })));
     }
 
     #[test]
@@ -1591,7 +2322,7 @@ mod tests {
         .expect_err("earlier conflicts are still unresolved");
         assert!(matches!(
             err,
-            Error::NotesMergeInProgress { ref path } if *path == notes_merge_worktree_path(&repo)
+            Error::Notes(NotesError::MergeInProgress { ref path }) if *path == notes_merge_worktree_path(&repo)
         ));
     }
 
@@ -1652,7 +2383,7 @@ mod tests {
         .expect_err("nothing to merge");
         assert!(matches!(
             err,
-            Error::NotesMergeBothEmpty { ref local, ref remote }
+            Error::Notes(NotesError::MergeBothEmpty { ref local, ref remote })
                 if local == "refs/notes/commits" && remote == "refs/notes/missing"
         ));
     }
@@ -1673,7 +2404,7 @@ mod tests {
         let err = read_notes_tree(&repo, "refs/notes/blob").expect_err("blob tip");
         assert!(matches!(
             err,
-            Error::NotesRefNotCommit { ref notes_ref, found: ObjectKind::Blob }
+            Error::Notes(NotesError::RefNotCommit { ref notes_ref, found: ObjectKind::Blob })
                 if notes_ref == "refs/notes/blob"
         ));
         let err = notes_merge_inner(
@@ -1685,10 +2416,10 @@ mod tests {
         .expect_err("blob remote");
         assert!(matches!(
             err,
-            Error::NotesRefNotCommit {
+            Error::Notes(NotesError::RefNotCommit {
                 found: ObjectKind::Blob,
                 ..
-            }
+            })
         ));
     }
 
@@ -1706,9 +2437,15 @@ mod tests {
         let mut entries = Vec::new();
         upsert_note_entry(&mut entries, &"ab".repeat(20), blob);
         write_notes_commit(&repo, "refs/notes/commits", &entries, "first").unwrap();
-        let first = repo.refs().resolve("refs/notes/commits").unwrap();
+        let first = repo
+            .ref_store()
+            .resolve(RefNameRef::from_trusted("refs/notes/commits"))
+            .unwrap();
         write_notes_commit(&repo, "refs/notes/commits", &[], "second").unwrap();
-        let second = repo.refs().resolve("refs/notes/commits").unwrap();
+        let second = repo
+            .ref_store()
+            .resolve(RefNameRef::from_trusted("refs/notes/commits"))
+            .unwrap();
 
         let commit = parse_commit(&repo.odb().read(&second).unwrap().data).unwrap();
         assert_eq!(commit.parents, vec![first]);
@@ -1719,6 +2456,294 @@ mod tests {
             !tmp.path().join(".git/refs/notes/commits").exists(),
             "notes ref must live in the injected store, not on disk"
         );
+    }
+
+    #[cfg_attr(
+        not(feature = "full-tests"),
+        ignore = "starts system git or is heavy; run with --features full-tests"
+    )]
+    #[test]
+    fn notes_rewrite_write_fails_cas_when_ref_moves_after_snapshot() {
+        let tmp = TempDir::new().unwrap();
+        let repo = open_repo(tmp.path());
+        let head = Command::new("git")
+            .current_dir(tmp.path())
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        let commit = ObjectId::from_hex(std::str::from_utf8(&head.stdout).unwrap().trim()).unwrap();
+        let blob = repo.odb().write(ObjectKind::Blob, b"note\n").unwrap();
+        upsert_note_entry(&mut vec![], &commit.to_hex(), blob);
+        write_notes_commit(&repo, "refs/notes/commits", &[], "seed").unwrap();
+        let snapshot = read_notes_snapshot(&repo, "refs/notes/commits").unwrap();
+        let other = repo.odb().write(ObjectKind::Blob, b"other\n").unwrap();
+        let mut entries = read_notes_tree(&repo, "refs/notes/commits").unwrap();
+        upsert_note_entry(&mut entries, &"ab".repeat(20), other);
+        write_notes_commit(&repo, "refs/notes/commits", &entries, "concurrent").unwrap();
+        let (author, committer) = wall_clock_notes_idents(&repo).unwrap();
+        let err = write_notes_commit_idents(
+            &repo,
+            "refs/notes/commits",
+            snapshot.tip,
+            &entries,
+            "stale",
+            &author,
+            &committer,
+        )
+        .expect_err("stale parent must not overwrite a newer notes tip");
+        assert!(
+            matches!(err, Error::Ref(RefError::Store(_))),
+            "expected ref compare-and-swap failure, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn notes_rewrite_mode_parses_git_values() {
+        assert_eq!(
+            NotesRewriteMode::parse("concatenate").expect("concatenate"),
+            NotesRewriteMode::Concatenate
+        );
+        assert!(matches!(
+            NotesRewriteMode::parse("nope").expect_err("bad"),
+            Error::Notes(NotesError::UnknownRewriteMode { .. })
+        ));
+    }
+
+    #[cfg_attr(
+        not(feature = "full-tests"),
+        ignore = "starts system git or is heavy; run with --features full-tests"
+    )]
+    #[test]
+    fn uppercase_hex_note_leaf_matches_git() {
+        let tmp = TempDir::new().unwrap();
+        let repo = open_repo(tmp.path());
+        let commit = ObjectId::from_hex(
+            std::str::from_utf8(
+                &Command::new("git")
+                    .current_dir(tmp.path())
+                    .args(["rev-parse", "HEAD"])
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                    .output()
+                    .unwrap()
+                    .stdout,
+            )
+            .unwrap()
+            .trim(),
+        )
+        .unwrap();
+        let note_blob = {
+            let mut child = Command::new("git")
+                .current_dir(tmp.path())
+                .args(["hash-object", "-w", "--stdin"])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(b"upper note\n")
+                .unwrap();
+            String::from_utf8_lossy(&child.wait_with_output().unwrap().stdout)
+                .trim()
+                .to_owned()
+        };
+        let upper = commit.to_hex().to_ascii_uppercase();
+        let tree_in = format!("100644 blob {note_blob}\t{upper}\n");
+        let tree_oid = {
+            let mut child = Command::new("git")
+                .current_dir(tmp.path())
+                .args(["mktree"])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(tree_in.as_bytes())
+                .unwrap();
+            String::from_utf8_lossy(&child.wait_with_output().unwrap().stdout)
+                .trim()
+                .to_owned()
+        };
+        let notes_commit = String::from_utf8_lossy(
+            &Command::new("git")
+                .current_dir(tmp.path())
+                .args(["commit-tree", &tree_oid, "-m", "uppercase leaf"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .trim()
+        .to_owned();
+        git(
+            tmp.path(),
+            &["update-ref", "refs/notes/commits", &notes_commit],
+        );
+        assert_eq!(
+            repo.notes()
+                .read(&NotesRef::commits(), &commit)
+                .unwrap()
+                .as_deref(),
+            Some(b"upper note\n" as &[u8])
+        );
+        assert!(matches!(
+            repo.notes()
+                .add(
+                    &NotesRef::commits(),
+                    &commit,
+                    b"x\n",
+                    &crate::repo_handles::NotesWriteOptions {
+                        message: "dup".into(),
+                        committer: "Test <t@example.com> 1700000000 +0000".parse().unwrap(),
+                        author: None,
+                    },
+                    false,
+                )
+                .expect_err("exists"),
+            Error::Notes(NotesError::AlreadyExists { .. })
+        ));
+    }
+
+    #[cfg_attr(
+        not(feature = "full-tests"),
+        ignore = "starts system git or is heavy; run with --features full-tests"
+    )]
+    #[test]
+    fn splice_replace_touches_one_fanout_subtree() {
+        let tmp = TempDir::new().unwrap();
+        git(tmp.path(), &["init", "-q", "-b", "main", "."]);
+        git(tmp.path(), &["config", "user.email", "t@example.com"]);
+        git(tmp.path(), &["config", "user.name", "Test"]);
+        std::fs::write(tmp.path().join("seed"), b"s\n").unwrap();
+        git(tmp.path(), &["add", "seed"]);
+        git(tmp.path(), &["commit", "-qm", "seed"]);
+        for i in 0..300 {
+            std::fs::write(tmp.path().join("f"), format!("v{i}\n")).unwrap();
+            git(tmp.path(), &["add", "f"]);
+            git(tmp.path(), &["commit", "-qm", &format!("c{i}")]);
+            git(
+                tmp.path(),
+                &["notes", "add", "-m", &format!("note-{i}"), "HEAD"],
+            );
+        }
+        let head = ObjectId::from_hex(
+            std::str::from_utf8(
+                &Command::new("git")
+                    .current_dir(tmp.path())
+                    .args(["rev-parse", "HEAD"])
+                    .output()
+                    .unwrap()
+                    .stdout,
+            )
+            .unwrap()
+            .trim(),
+        )
+        .unwrap();
+        let repo = open_repo(tmp.path());
+        let before = root_tree_child_oids(&repo, "refs/notes/commits");
+        let opts = crate::repo_handles::NotesWriteOptions {
+            message: "replace".into(),
+            committer: "Test <t@example.com> 1700000000 +0000".parse().unwrap(),
+            author: None,
+        };
+        repo.notes()
+            .add(&NotesRef::commits(), &head, b"replaced\n", &opts, true)
+            .unwrap();
+        let after = root_tree_child_oids(&repo, "refs/notes/commits");
+        assert_eq!(before.len(), after.len());
+        let changed = before
+            .iter()
+            .zip(after.iter())
+            .filter(|((n0, o0), (n1, o1))| n0 == n1 && o0 != o1)
+            .count();
+        assert_eq!(changed, 1);
+        let show = Command::new("git")
+            .current_dir(tmp.path())
+            .args(["notes", "show", &head.to_hex()])
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&show.stdout).trim(), "replaced");
+    }
+
+    #[cfg_attr(
+        not(feature = "full-tests"),
+        ignore = "benchmark; run with --features full-tests"
+    )]
+    #[test]
+    fn bench_notes_add_matches_git_order_of_magnitude() {
+        let tmp = TempDir::new().unwrap();
+        git(tmp.path(), &["init", "-q", "-b", "main", "."]);
+        git(tmp.path(), &["config", "user.email", "t@example.com"]);
+        git(tmp.path(), &["config", "user.name", "Test"]);
+        std::fs::write(tmp.path().join("seed"), b"s\n").unwrap();
+        git(tmp.path(), &["add", "seed"]);
+        git(tmp.path(), &["commit", "-qm", "seed"]);
+        for i in 0..500 {
+            std::fs::write(tmp.path().join("f"), format!("v{i}\n")).unwrap();
+            git(tmp.path(), &["add", "f"]);
+            git(tmp.path(), &["commit", "-qm", &format!("c{i}")]);
+            git(
+                tmp.path(),
+                &["notes", "add", "-m", &format!("note-{i}"), "HEAD"],
+            );
+        }
+        let head = std::str::from_utf8(
+            &Command::new("git")
+                .current_dir(tmp.path())
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_owned();
+        let git_start = std::time::Instant::now();
+        for _ in 0..5 {
+            git(tmp.path(), &["notes", "add", "-f", "-m", "x", &head]);
+        }
+        let git_per = git_start.elapsed() / 5;
+
+        let repo = open_repo(tmp.path());
+        let object = ObjectId::from_hex(&head).unwrap();
+        let opts = crate::repo_handles::NotesWriteOptions {
+            message: "x".into(),
+            committer: "Test <t@example.com> 1700000000 +0000".parse().unwrap(),
+            author: None,
+        };
+        let grit_start = std::time::Instant::now();
+        for _ in 0..5 {
+            repo.notes()
+                .add(&NotesRef::commits(), &object, b"x\n", &opts, true)
+                .unwrap();
+        }
+        let grit_per = grit_start.elapsed() / 5;
+
+        eprintln!("git notes add: {git_per:?} per op");
+        eprintln!("grit notes add: {grit_per:?} per op");
+        assert!(
+            grit_per <= git_per * 10,
+            "grit add should stay within 10x of git, git={git_per:?} grit={grit_per:?}"
+        );
+        assert!(
+            grit_per.as_millis() < 50,
+            "grit add on ~500-note fanout should stay under 50ms, got {grit_per:?}"
+        );
+    }
+
+    fn root_tree_child_oids(repo: &Repository, notes_ref: &str) -> Vec<(Vec<u8>, ObjectId)> {
+        let tip = crate::refs::resolve_ref(repo.git_dir(), notes_ref).unwrap();
+        let tree_oid = notes_tree_oid(repo, &tip).unwrap();
+        read_tree_entries(repo, &tree_oid)
+            .unwrap()
+            .into_iter()
+            .map(|e| (e.name, e.oid))
+            .collect()
     }
 
     #[test]

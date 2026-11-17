@@ -4,11 +4,11 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
-use grit_lib::porcelain::status::{status, StatusOptions, UntrackedMode};
-use grit_lib::progress::NeverCancel;
+use grit_lib::porcelain::status::{StatusOptions, UntrackedMode};
+use grit_lib::progress::CancelToken;
 use grit_lib::progress::NullProgress;
 use grit_lib::repo::{InitOptions, Repository};
-use grit_lib::PARALLEL_STAT_MIN_ENTRIES;
+use grit_lib::test_support::counters::PARALLEL_STAT_MIN_ENTRIES;
 
 fn assert_git_diff_files_clean(repo_root: &Path) {
     let root = repo_root.to_str().expect("utf-8 path");
@@ -52,11 +52,11 @@ fn append_repo_config(repo: &Repository, section: &str, key: &str, value: &str) 
 }
 
 fn seed_repo(root: &Path, preload_index: bool) -> Repository {
-    let repo = Repository::init(
+    let (repo, _) = Repository::init(
         root,
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
-            .with_ref_storage(grit_lib::RefStorageFormat::Files),
+            .with_ref_storage(grit_lib::refs::ref_storage::RefStorageFormat::Files),
     )
     .expect("init");
     if !preload_index {
@@ -67,24 +67,26 @@ fn seed_repo(root: &Path, preload_index: bool) -> Repository {
         let rel = format!("mix/{i:05}.txt");
         fs::write(root.join(&rel), format!("payload {i}\n")).expect("write");
     }
-    grit_lib::porcelain::add::stage(
-        &repo,
-        &grit_lib::porcelain::add::StageOptions::default(),
-        &mut NullProgress,
-        &NeverCancel,
-    )
-    .expect("stage");
-    let req = grit_lib::porcelain::commit::CommitRequest {
-        message: "seed".into(),
-        author: Some("T <t@e.com> 1 +0000".parse().expect("signature")),
-        committer: Some("T <t@e.com> 1 +0000".parse().expect("signature")),
-        allow_empty: false,
-        sign_override: None,
-        amend: false,
-        assume_worktree_synced: false,
-        ..Default::default()
+    &repo
+        .index()
+        .stage(
+            &grit_lib::porcelain::add::StageOptions::default(),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("stage");
+    let req = {
+        let mut req = grit_lib::porcelain::commit::CommitRequest::new("seed");
+        req.author = Some("T <t@e.com> 1 +0000".parse().expect("signature"));
+        req.committer = Some("T <t@e.com> 1 +0000".parse().expect("signature"));
+        req.allow_empty = false;
+        req.sign_override = None;
+        req.amend = false;
+        req.assume_worktree_synced = false;
+        req
     };
-    grit_lib::porcelain::commit::create_commit(&repo, &req, &mut NullProgress, &NeverCancel)
+    repo.commits()
+        .create_staged(&req, &mut NullProgress, &CancelToken::never())
         .expect("commit");
 
     // Content matches HEAD; mtimes differ so stat refresh runs (including racy re-verify).
@@ -103,8 +105,11 @@ fn run_status(
     opts.untracked = UntrackedMode::No;
     opts.ahead_behind = false;
     opts.stat_parallel_threads = Some(threads);
-    let model = status(repo, &opts, &mut NullProgress, &NeverCancel).expect("status");
-    let index_bytes = fs::read(repo.index_handle().path()).expect("index bytes");
+    let model = repo
+        .status()
+        .run(&opts, &mut NullProgress, &CancelToken::never())
+        .expect("status");
+    let index_bytes = fs::read(repo.index().path()).expect("index bytes");
     (model, index_bytes)
 }
 
@@ -113,14 +118,14 @@ fn parallel_refresh_matches_serial() {
     assert!(PARALLEL_STAT_MIN_ENTRIES <= 5000);
     let tmp = tempfile::tempdir().expect("tempdir");
     let repo = seed_repo(tmp.path(), true);
-    let baseline_index = fs::read(repo.index_handle().path()).expect("baseline index");
+    let baseline_index = fs::read(repo.index().path()).expect("baseline index");
 
     let (serial_model, serial_index) = {
-        fs::write(repo.index_handle().path(), &baseline_index).expect("restore index");
+        fs::write(repo.index().path(), &baseline_index).expect("restore index");
         run_status(&repo, 1)
     };
     let (parallel_model, parallel_index) = {
-        fs::write(repo.index_handle().path(), &baseline_index).expect("restore index");
+        fs::write(repo.index().path(), &baseline_index).expect("restore index");
         run_status(&repo, 4)
     };
 

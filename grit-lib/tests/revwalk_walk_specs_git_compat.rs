@@ -6,15 +6,16 @@
 //! Symmetric ranges list commits in Git's exact order and only read history down to the
 //! merge-base frontier (issue #2109).
 
+use grit_lib::error::RevisionError;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use grit_lib::config::environment::{Environment, RepositoryOptions};
 use grit_lib::error::Error;
 use grit_lib::repo::Repository;
-use grit_lib::revwalk::rev_list::{rev_list, RevListOptions};
+use grit_lib::revwalk::rev_list::RevListOptions;
 use grit_lib::revwalk::rev_list_error::RevListError;
-use grit_lib::revwalk::{parse_rev_walk_tokens, RevWalkListOptions};
+use grit_lib::revwalk::RevWalkListOptions;
 use grit_test_support::{git, git_cmd, unique_tmp, write_file};
 
 /// The issue's scratch repository: three base commits, `topic` with two commits, `main` with
@@ -56,7 +57,7 @@ fn git_rev_list(wt: &Path, spec: &str) -> Vec<String> {
 }
 
 fn walk_hex(repo: &Repository, spec: &str) -> Vec<String> {
-    repo.rev_walk()
+    repo.revwalk()
         .walk(spec, &RevListOptions::default())
         .unwrap_or_else(|e| panic!("walk({spec}): {e}"))
         .commits
@@ -66,7 +67,7 @@ fn walk_hex(repo: &Repository, spec: &str) -> Vec<String> {
 }
 
 fn commits_hex(repo: &Repository, spec: &str) -> Vec<String> {
-    repo.rev_walk()
+    repo.revwalk()
         .commits(&[spec], &RevWalkListOptions::default())
         .unwrap_or_else(|e| panic!("commits([{spec}]): {e}"))
         .iter()
@@ -130,7 +131,7 @@ fn walk_symmetric_range_honours_max_count_and_left_right() {
     let wt = diverged_repo();
     let repo = open(&wt);
     let limited = repo
-        .rev_walk()
+        .revwalk()
         .walk(
             "main...topic",
             &RevListOptions {
@@ -147,7 +148,7 @@ fn walk_symmetric_range_honours_max_count_and_left_right() {
     assert_eq!(got, expected);
 
     let left_right = repo
-        .rev_walk()
+        .revwalk()
         .walk(
             "main...topic",
             &RevListOptions {
@@ -188,11 +189,13 @@ fn walk_rejects_specs_that_need_the_token_api() {
         "main\ttopic",
     ] {
         let err = repo
-            .rev_walk()
+            .revwalk()
             .walk(spec, &RevListOptions::default())
             .expect_err(spec);
         match err {
-            Error::RevList(RevListError::UnsupportedWalkSpec { spec: got }) => {
+            Error::Revision(RevisionError::List(RevListError::UnsupportedWalkSpec {
+                spec: got,
+            })) => {
                 assert_eq!(got, spec, "error keeps the full spec");
             }
             other => panic!("walk({spec:?}): expected UnsupportedWalkSpec, got {other:?}"),
@@ -243,24 +246,28 @@ fn walk_keeps_literal_ellipses_in_selectors_and_paths() {
     }
 
     let path_spec = "HEAD:dir/a...b";
-    let parsed = parse_rev_walk_tokens(&repo, &[path_spec]).expect("parse path spec");
+    let parsed = repo
+        .revwalk()
+        .parse_tokens(&[path_spec])
+        .expect("parse path spec");
     assert_eq!(parsed.positive, vec![path_spec.to_owned()]);
     assert!(parsed.negative.is_empty() && parsed.symmetric_left.is_none());
     assert_eq!(
-        repo.rev_walk()
-            .resolve(path_spec)
+        repo.revwalk()
+            .resolve(path_spec, &grit_lib::revwalk::ResolveOptions::default())
             .expect("resolve")
             .to_hex(),
         git(&wt, &["rev-parse", path_spec]).trim()
     );
 
-    let direct = rev_list(
-        &repo,
-        &[":/fix...up".to_owned(), "main^{/fix...up}".to_owned()],
-        &[],
-        &RevListOptions::default(),
-    )
-    .expect("selectors with literal dots are single revisions");
+    let direct = repo
+        .revwalk()
+        .rev_list(
+            &[":/fix...up".to_owned(), "main^{/fix...up}".to_owned()],
+            &[],
+            &RevListOptions::default(),
+        )
+        .expect("selectors with literal dots are single revisions");
     assert_eq!(
         direct
             .commits
@@ -275,17 +282,18 @@ fn walk_keeps_literal_ellipses_in_selectors_and_paths() {
 fn rev_list_rejects_unexpanded_symmetric_range() {
     let wt = diverged_repo();
     let repo = open(&wt);
-    let err = rev_list(
-        &repo,
-        &["main...topic".to_owned()],
-        &[],
-        &RevListOptions::default(),
-    )
-    .expect_err("raw A...B must not resolve to its merge base");
+    let err = repo
+        .revwalk()
+        .rev_list(
+            &["main...topic".to_owned()],
+            &[],
+            &RevListOptions::default(),
+        )
+        .expect_err("raw A...B must not resolve to its merge base");
     assert!(
         matches!(
             &err,
-            Error::RevList(RevListError::UnexpandedSymmetricRange { spec }) if spec == "main...topic"
+            Error::Revision(RevisionError::List(RevListError::UnexpandedSymmetricRange { spec })) if spec == "main...topic"
         ),
         "{err:?}"
     );
@@ -414,7 +422,7 @@ fn assert_symmetric_ranges_match_git(wt: &Path) {
             .parse()
             .expect("git count");
         assert_eq!(
-            repo.rev_walk()
+            repo.revwalk()
                 .count(&[spec], &RevWalkListOptions::default())
                 .expect("count"),
             count,
@@ -424,7 +432,7 @@ fn assert_symmetric_ranges_match_git(wt: &Path) {
             let n = limit.to_string();
             let expected = git_lines(wt, &["rev-list", "-n", &n, spec]);
             let listed: Vec<String> = repo
-                .rev_walk()
+                .revwalk()
                 .commits(
                     &[spec],
                     &RevWalkListOptions {
@@ -497,7 +505,7 @@ fn symmetric_range_walk_stops_at_merge_base_frontier() {
             continue;
         }
         assert_eq!(
-            repo.rev_walk()
+            repo.revwalk()
                 .count(&[spec], &RevWalkListOptions::default())
                 .unwrap_or_else(|e| panic!("count([{spec}]): {e}")),
             expected.len(),
@@ -505,7 +513,7 @@ fn symmetric_range_walk_stops_at_merge_base_frontier() {
         );
     }
     let listed: Vec<String> = repo
-        .rev_walk()
+        .revwalk()
         .commits(
             &["main...topic"],
             &RevWalkListOptions {
@@ -518,4 +526,65 @@ fn symmetric_range_walk_stops_at_merge_base_frontier() {
         .map(|oid| oid.to_hex())
         .collect();
     assert_eq!(listed, limited);
+}
+
+/// History where a hide-side commit reaches an ancestor only through a child dated before it,
+/// while the positive tip also lists that ancestor through a merge (issue #2373).
+fn range_skew_paint_repo() -> (PathBuf, String, String, String) {
+    let wt = unique_tmp("revwalk-walk-specs", "range-skew-paint");
+    git(&wt, &["init", "-q", "-b", "main", "."]);
+    let mut s = ImportStream::default();
+    let base = s.commit("main", 100, &[]);
+    let skewed = s.commit("skewed", 1_000, &[base]);
+    let mid1 = s.commit("chain", 1_010, &[skewed]);
+    let mid2 = s.commit("chain", 1_020, &[mid1]);
+    let behind = s.commit("held", 150, &[mid2]);
+    let _held = s.commit("held", 200, &[behind]);
+    let mut filler = base;
+    for i in 0..10 {
+        filler = s.commit("filler", 500 + i, &[filler]);
+    }
+    let side = s.commit("side", 600, &[base]);
+    let merge = s.commit("positive", 900, &[side, skewed]);
+    s.commit("positive", 950, &[merge, filler]);
+    s.import(&wt);
+    let hide = git(&wt, &["rev-parse", "held"]).trim().to_owned();
+    let positive = git(&wt, &["rev-parse", "positive"]).trim().to_owned();
+    let skewed = git(&wt, &["rev-parse", "skewed"]).trim().to_owned();
+    (wt, hide, positive, skewed)
+}
+
+#[test]
+fn double_dot_range_under_committer_date_skew_matches_git_without_commit_graph() {
+    let (wt, hide, positive, skewed) = range_skew_paint_repo();
+    let expected = git_rev_list(&wt, &format!("{positive} ^{hide}"));
+    let expected_count: usize = git(
+        &wt,
+        &["rev-list", "--count", &positive, &format!("^{hide}")],
+    )
+    .trim()
+    .parse()
+    .expect("git count");
+    let repo = open(&wt);
+    let hide_token = format!("^{hide}");
+    let tokens = [positive.as_str(), hide_token.as_str()];
+    let listed = repo
+        .revwalk()
+        .commits(&tokens, &RevWalkListOptions::default())
+        .expect("commits");
+    assert_eq!(listed.len(), expected_count);
+    assert_eq!(
+        listed.iter().map(|oid| oid.to_hex()).collect::<Vec<_>>(),
+        expected
+    );
+    assert_eq!(
+        repo.revwalk()
+            .count(&tokens, &RevWalkListOptions::default())
+            .expect("count"),
+        expected_count
+    );
+    assert!(
+        !expected.contains(&skewed),
+        "git must not list the skewed ancestor in the range"
+    );
 }

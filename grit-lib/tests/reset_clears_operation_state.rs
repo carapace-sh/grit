@@ -5,23 +5,28 @@
 #[path = "support/reset_snapshot.rs"]
 mod reset_snapshot;
 
+use grit_lib::error::ObjectError;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
 
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::error::Error;
+use grit_lib::merge::IntegrateBranchOutcome;
+use grit_lib::merge::{ReplayEmptyPolicy, ReplayOptions, ReplaySequenceRequest, SequenceOutcome};
 use grit_lib::objects::{parse_commit, ObjectId};
-use grit_lib::porcelain::commit::{create_commit, CommitRequest};
-use grit_lib::porcelain::merge::{integrate_branch, IntegrateBranchOutcome};
+use grit_lib::porcelain::commit::CommitRequest;
 use grit_lib::porcelain::replay::ReplayDirection;
 use grit_lib::porcelain::replay_sequence::{
     start_replay_sequence, ReplayEmptyPolicy, ReplayOptions, ReplaySequenceRequest, SequenceOutcome,
 };
-use grit_lib::porcelain::reset::{reset_to_commit, ResetMode, ResetOptions};
-use grit_lib::progress::{NeverCancel, NullProgress};
+use grit_lib::porcelain::reset::{ResetMode, ResetOptions};
+use grit_lib::progress::NullProgress;
 use grit_lib::repo::Repository;
 use grit_lib::state::{primary_in_progress_operation, resolve_head_for_repository};
+use grit_test_support::integrate_branch;
+use grit_test_support::integrate_branch;
+use grit_test_support::start_replay_sequence;
 
 const IDENT: &str = "Test User <t@example.com> 1700000000 +0000";
 /// Fixed git author/committer date so twin repositories (and the stash commits
@@ -77,12 +82,12 @@ fn commit_file(root: &Path, path: &str, contents: &str, msg: &str) -> ObjectId {
 }
 
 fn commit_req(message: &str) -> CommitRequest {
-    CommitRequest {
-        message: message.to_owned(),
-        author: Some(IDENT.parse().expect("author")),
-        committer: Some(IDENT.parse().expect("committer")),
-        allow_empty: false,
-        ..Default::default()
+    {
+        let mut req = CommitRequest::new(message.to_owned());
+        req.author = Some(IDENT.parse().expect("author"));
+        req.committer = Some(IDENT.parse().expect("committer"));
+        req.allow_empty = false;
+        req
     }
 }
 
@@ -105,7 +110,7 @@ fn conflicted_merge_repo() -> (tempfile::TempDir, Repository, ObjectId) {
         other,
         "o",
         &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("merge");
     assert!(matches!(outcome, IntegrateBranchOutcome::Conflicts { .. }));
@@ -141,7 +146,7 @@ fn conflicted_pick_repo() -> (tempfile::TempDir, Repository, ObjectId) {
         &repo,
         &pick_req(vec![pick]),
         &mut NullProgress,
-        &NeverCancel,
+        &CancelToken::never(),
     )
     .expect("pick");
     assert!(matches!(out, SequenceOutcome::Conflicts { .. }));
@@ -152,8 +157,7 @@ fn conflicted_pick_repo() -> (tempfile::TempDir, Repository, ObjectId) {
 fn assert_no_operation_state(repo: &Repository) {
     assert!(!repo.git_dir().join("MERGE_HEAD").exists());
     assert!(!repo.git_dir().join("CHERRY_PICK_HEAD").exists());
-    let head = resolve_head_for_repository(repo).expect("head");
-    let state = grit_lib::state::wt_status_get_state(repo.git_dir(), &head, false).expect("state");
+    let state = repo.operation().status_state().expect("state");
     assert!(
         !state.merge_in_progress && !state.cherry_pick_in_progress,
         "expected no merge/pick in progress: {state:?}"
@@ -165,13 +169,13 @@ fn assert_no_operation_state(repo: &Repository) {
 }
 
 fn reset_head(repo: &Repository, head: ObjectId, mode: ResetMode) {
-    reset_to_commit(
-        repo,
-        &ResetOptions::new(head, mode, test_ident(), "reset"),
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("reset");
+    repo.checkout()
+        .reset(
+            &ResetOptions::new(head, mode, test_ident(), "reset"),
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("reset");
 }
 
 #[test]
@@ -180,15 +184,19 @@ fn hard_reset_to_head_after_conflicted_merge_clears_state() {
     reset_head(&repo, main, ResetMode::Hard);
     assert_no_operation_state(&repo);
 
-    let err = create_commit(
-        &repo,
-        &commit_req("oops"),
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .unwrap_err();
+    let err = repo
+        .commits()
+        .create_staged(
+            &commit_req("oops"),
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .unwrap_err();
     assert!(
-        matches!(err, Error::NothingToCommit),
+        matches!(
+            err,
+            grit_lib::error::Error::Commit(CommitError::NothingToCommit)
+        ),
         "commit after reset must not create a merge: {err}"
     );
 }
@@ -213,14 +221,21 @@ fn hard_reset_to_head_after_conflicted_pick_clears_state() {
     reset_head(&repo, main, ResetMode::Hard);
     assert_no_operation_state(&repo);
 
-    let err = create_commit(
-        &repo,
-        &commit_req("oops"),
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .unwrap_err();
-    assert!(matches!(err, Error::NothingToCommit), "{err}");
+    let err = repo
+        .commits()
+        .create_staged(
+            &commit_req("oops"),
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            grit_lib::error::Error::Commit(CommitError::NothingToCommit)
+        ),
+        "{err}"
+    );
 }
 
 #[test]
@@ -248,7 +263,7 @@ fn grit_reset_matches_git_porcelain_after_conflicted_merge() {
         other,
         "o",
         &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("grit merge");
     assert!(matches!(outcome, IntegrateBranchOutcome::Conflicts { .. }));
@@ -367,19 +382,26 @@ fn assert_invalid_reset_preserves_operation(root: &Path, repo: &Repository, head
         ResetMode::Keep,
     ] {
         let mut opts = ResetOptions::new(head, mode, identity.clone(), "invalid reset");
-        let err = grit_lib::porcelain::reset::preview_reset(repo, &opts).unwrap_err();
-        assert!(matches!(err, Error::InvalidSignature(_)), "{err:?}");
+        let err = repo.checkout().preview_reset(&opts).unwrap_err();
+        assert!(
+            matches!(err, Error::Object(ObjectError::InvalidSignature(_))),
+            "{err:?}"
+        );
         reset_snapshot::assert_unchanged(root, &before);
         for dry_run in [true, false] {
             opts.dry_run = dry_run;
-            let err = reset_to_commit(
-                repo,
-                &opts,
-                &mut NullProgress,
-                &grit_lib::progress::NeverCancel,
-            )
-            .unwrap_err();
-            assert!(matches!(err, Error::InvalidSignature(_)), "{err:?}");
+            let err = repo
+                .checkout()
+                .reset(
+                    &opts,
+                    &mut NullProgress,
+                    &grit_lib::progress::CancelToken::never(),
+                )
+                .unwrap_err();
+            assert!(
+                matches!(err, Error::Object(ObjectError::InvalidSignature(_))),
+                "{err:?}"
+            );
             reset_snapshot::assert_unchanged(root, &before);
         }
     }
@@ -400,11 +422,7 @@ fn invalid_reset_preserves_conflicted_merge_and_autostash() {
         ],
     );
     let repo = open_repo(root.path());
-    let head = resolve_head_for_repository(&repo)
-        .unwrap()
-        .oid()
-        .copied()
-        .unwrap();
+    let head = repo.references().head().unwrap().oid().copied().unwrap();
     assert_invalid_reset_preserves_operation(root.path(), &repo, head);
     git(root.path(), &["fsck", "--strict"]);
 }

@@ -105,7 +105,9 @@ fn stash_list_json() {
 
     let (code, stdout, _) = grit(&dir, &["stash", "list", "--json"]);
     assert_eq!(code, 0);
-    let entries: Vec<serde_json::Value> = serde_json::from_str(stdout.trim()).expect("json array");
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).expect("json object");
+    assert_eq!(parsed["action"], "list");
+    let entries = parsed["entries"].as_array().expect("entries array");
     assert_eq!(entries.len(), 2);
     assert_eq!(entries[0]["index"], 0);
     assert!(entries[0]["oid"].as_str().unwrap().len() >= 40);
@@ -114,6 +116,21 @@ fn stash_list_json() {
         entries[0].get("stashed").is_none(),
         "list items must not include stashed"
     );
+}
+
+#[test]
+fn stash_list_json_empty() {
+    let dir = scratch("list-json-empty");
+    init_repo(&dir);
+    fs::write(dir.join("a"), "v\n").expect("write");
+    git(&dir, &["add", "a"]);
+    git(&dir, &["commit", "-qm", "init"]);
+
+    let (code, stdout, _) = grit(&dir, &["stash", "list", "--json"]);
+    assert_eq!(code, 0);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).expect("json object");
+    assert_eq!(parsed["action"], "list");
+    assert_eq!(parsed["entries"], serde_json::json!([]));
 }
 
 #[test]
@@ -332,7 +349,9 @@ fn stash_interop_with_git() {
 
     let (code, stdout, _) = grit(&dir, &["stash", "list", "--json"]);
     assert_eq!(code, 0);
-    let entries: Vec<serde_json::Value> = serde_json::from_str(stdout.trim()).expect("json array");
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).expect("json object");
+    assert_eq!(parsed["action"], "list");
+    let entries = parsed["entries"].as_array().expect("entries array");
     assert_eq!(entries.len(), 1);
 
     let (code, _, _) = grit(&dir, &["stash", "pop"]);
@@ -385,8 +404,37 @@ fn stash_branch_json() {
     assert_eq!(v["branch"], "wip-branch");
     assert_eq!(v["base"], base);
     assert_eq!(v["index"], 0);
+    assert!(v.get("oid").and_then(|o| o.as_str()).is_some());
     assert_eq!(v["conflicts"], false);
     assert!(git(&dir, &["stash", "list"]).trim().is_empty());
+}
+
+#[test]
+fn stash_drop_prints_oid_and_apply_by_oid_after_drop() {
+    let dir = scratch("drop-oid-recover");
+    init_repo(&dir);
+    fs::write(dir.join("f"), "1\n").expect("write");
+    git(&dir, &["add", "f"]);
+    git(&dir, &["commit", "-qm", "init"]);
+    fs::write(dir.join("f"), "2\n").expect("modify");
+
+    let (code, stdout, stderr) = grit(&dir, &["stash", "-m", "important", "--json"]);
+    assert_eq!(code, 0, "{stderr}");
+    let saved_oid = serde_json::from_str::<serde_json::Value>(stdout.trim()).expect("json")["oid"]
+        .as_str()
+        .expect("oid")
+        .to_owned();
+
+    let (code, stdout, stderr) = grit(&dir, &["stash", "drop", "--json"]);
+    assert_eq!(code, 0, "{stderr}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("json");
+    assert_eq!(v["index"], 0);
+    assert_eq!(v["oid"].as_str(), Some(saved_oid.as_str()));
+    assert_eq!(v["oid"].as_str().unwrap().len(), 40);
+
+    let (code, _, stderr) = grit(&dir, &["stash", "apply", &saved_oid]);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(fs::read_to_string(dir.join("f")).expect("read"), "2\n");
 }
 
 #[test]

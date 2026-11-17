@@ -2,14 +2,18 @@
 
 pub mod approx;
 pub(crate) mod compat;
-pub mod parse;
-pub mod show;
-pub mod tm;
+pub(crate) mod parse;
+pub(crate) mod show;
+pub(crate) mod tm;
+
+pub use show::{parse_date_format, show_date, show_date_relative, DateMode, DateModeType};
+pub use tm::{local_tzoffset, refresh_process_tz, TzHhmm};
 
 use thiserror::Error;
 
 /// Failure to interpret a Git-style date cutoff string (for example `--since` / `--until`).
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
+#[non_exhaustive]
 pub enum DateSpecError {
     /// The specification could not be parsed as a date.
     #[error("unparseable date spec: {spec:?}")]

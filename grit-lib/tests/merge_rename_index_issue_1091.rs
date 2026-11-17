@@ -1,31 +1,34 @@
 //! Issue #1091: clean merge must not duplicate index entries when the other side renamed paths.
 
 use crate::support;
+use grit_lib::progress::NullProgress;
 
 use std::collections::HashSet;
 use std::fs;
 
 use grit_lib::config::environment::RepositoryOptions;
+use grit_lib::merge::IntegrateBranchOutcome;
 use grit_lib::objects::ObjectId;
-use grit_lib::porcelain::commit::{create_commit, CommitRequest};
-use grit_lib::porcelain::merge::{integrate_branch, IntegrateBranchOutcome};
+use grit_lib::porcelain::commit::CommitRequest;
 use grit_lib::progress::NullProgress;
 use grit_lib::repo::Repository;
 use grit_test_support::git;
+use grit_test_support::integrate_branch;
+use grit_test_support::integrate_branch;
 
 use support::{assert_grit_index_matches_git_ls_files, git_ls_files_stage};
 
 fn commit_req(message: &str) -> CommitRequest {
     let ident = "T <t@e.com> 1700000000 +0000".to_owned();
-    CommitRequest {
-        message: message.to_owned(),
-        author: Some(ident.parse().expect("signature")),
-        committer: Some(ident.parse().expect("signature")),
-        allow_empty: false,
-        sign_override: None,
-        amend: false,
-        assume_worktree_synced: false,
-        ..Default::default()
+    {
+        let mut req = CommitRequest::new(message.to_owned());
+        req.author = Some(ident.parse().expect("signature"));
+        req.committer = Some(ident.parse().expect("signature"));
+        req.allow_empty = false;
+        req.sign_override = None;
+        req.amend = false;
+        req.assume_worktree_synced = false;
+        req
     }
 }
 
@@ -67,7 +70,10 @@ fn assert_git_fsck_no_duplicate_entries(worktree: &std::path::Path) {
 }
 
 fn assert_unique_stage0_paths(repo: &Repository) {
-    let index = repo.index_handle().load().expect("index");
+    let index = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("index");
     let mut seen = HashSet::new();
     for entry in index.entries() {
         if entry.stage() == 0 {
@@ -122,7 +128,7 @@ fn incoming_directory_rename_does_not_duplicate_merged_index() {
         main_oid,
         "main",
         &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("merge");
     assert!(
@@ -132,21 +138,23 @@ fn incoming_directory_rename_does_not_duplicate_merged_index() {
 
     assert_unique_stage0_paths(&repo);
 
-    let index = repo.index_handle().load().expect("index after merge");
+    let index = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("index after merge");
     assert_grit_index_matches_git_ls_files(root, &index);
 
     let mut side_body = fs::read_to_string(root.join("side.txt")).expect("read side.txt");
     side_body.push_str("more\n");
     fs::write(root.join("side.txt"), &side_body).expect("write side.txt");
     git(root, &["add", "side.txt"]);
-
-    create_commit(
-        &repo,
-        &commit_req("next"),
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("follow-up commit");
+    repo.commits()
+        .create_staged(
+            &commit_req("next"),
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("follow-up commit");
     assert_git_fsck_no_duplicate_entries(root);
     let ls_tree = git(root, &["ls-tree", "-r", "HEAD"]);
     let mut paths = Vec::new();
@@ -198,7 +206,7 @@ fn incoming_single_file_rename_does_not_duplicate_merged_index() {
         main_oid,
         "main",
         &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("merge");
     assert!(
@@ -207,7 +215,10 @@ fn incoming_single_file_rename_does_not_duplicate_merged_index() {
     );
 
     assert_unique_stage0_paths(&repo);
-    let index = repo.index_handle().load().expect("index");
+    let index = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("index");
     assert_grit_index_matches_git_ls_files(root, &index);
 }
 
@@ -245,7 +256,7 @@ fn incoming_rename_destination_conflicts_with_independent_ours_add() {
         main_oid,
         "main",
         &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("merge");
     let IntegrateBranchOutcome::Conflicts { paths, .. } = outcome else {
@@ -256,7 +267,10 @@ fn incoming_rename_destination_conflicts_with_independent_ours_add() {
         "expected renamed.txt in conflict paths, got {paths:?}"
     );
 
-    let index = repo.index_handle().load().expect("index");
+    let index = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("index");
     assert_eq!(
         git_ls_files_stage(root),
         grit_index_all_stages(&index),

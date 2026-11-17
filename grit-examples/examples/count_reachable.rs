@@ -8,12 +8,13 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use grit_lib::config::environment::RepositoryOptions;
+use grit_lib::error::{Error, ObjectError};
 use grit_lib::objects::bitmap::BitmapIndex;
 use grit_lib::objects::bitmap::{BitmapWalkError, ReachabilityQuery};
 use grit_lib::objects::ObjectId;
 use grit_lib::repo::Repository;
 use grit_lib::revwalk::rev_list::MissingAction;
-use grit_lib::revwalk::rev_parse::resolve_revision_for_range_end;
+use grit_lib::revwalk::{ResolveOptions, ResolvePurpose};
 
 fn main() -> ExitCode {
     let mut args = env::args().skip(1);
@@ -36,7 +37,10 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let commit: ObjectId = match resolve_revision_for_range_end(&repo, &rev) {
+    let commit: ObjectId = match repo.revwalk().resolve(
+        &rev,
+        &ResolveOptions::default().with_purpose(ResolvePurpose::RangeEnd),
+    ) {
         Ok(oid) => oid,
         Err(err) => {
             eprintln!("resolve {rev}: {err}");
@@ -86,7 +90,7 @@ fn main() -> ExitCode {
             );
             ExitCode::SUCCESS
         }
-        Err(BitmapWalkError::Unsupported(_)) => {
+        Err(Error::Object(ObjectError::BitmapWalk(BitmapWalkError::Unsupported(_)))) => {
             eprintln!("bitmap walk unsupported for this query (use rev-list without bitmaps)");
             ExitCode::from(1)
         }

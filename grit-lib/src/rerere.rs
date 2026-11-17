@@ -2,6 +2,7 @@
 //!
 //! Behaviour matches `git/rerere.c` for upstream harness tests.
 
+use crate::worktree::WorktreeError;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -28,29 +29,32 @@ pub enum RerereAutoupdate {
 
 /// Outcome of rerere handling one path (replaces stderr status lines).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde-models", derive(serde::Serialize))]
+#[cfg_attr(feature = "serde-models", serde(rename_all = "snake_case"))]
 pub enum RerereEventKind {
-    /// Returned when recorded preimage.
+    /// Recorded a new conflict preimage under `rr-cache/`.
     RecordedPreimage,
-    /// Returned when recorded resolution.
+    /// Recorded the user's resolution for this conflict id.
     RecordedResolution,
-    /// Returned when resolved from previous.
+    /// Applied a resolution remembered from a previous merge.
     ResolvedFromPrevious,
-    /// Returned when staged from previous.
+    /// Staged a resolution that rerere recovered from cache.
     StagedFromPrevious,
-    /// Returned when updated preimage.
+    /// Updated the stored preimage because the conflict hunk changed.
     UpdatedPreimage,
-    /// Returned when forgot.
+    /// Dropped remembered state for this path (`rerere forget`).
     Forgot,
-    /// Returned when no remembered.
+    /// No remembered resolution was available for this conflict.
     NoRemembered,
 }
 
 /// One rerere status event for a path.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde-models", derive(serde::Serialize))]
 pub struct RerereEvent {
-    /// Repository-relative or filesystem path related to the failure.
+    /// Repository-relative path whose conflict rerere handled.
     pub path: String,
-    /// Object type name when known (`commit`, `tree`, etc.).
+    /// What rerere did for this path.
     pub kind: RerereEventKind,
 }
 
@@ -75,7 +79,7 @@ fn rr_root(git_dir: &Path) -> PathBuf {
 
 /// Rerere enabled.
 pub fn rerere_enabled(config: &ConfigSet, git_dir: &Path) -> bool {
-    if let Some(val) = config.get("rerere.enabled") {
+    if let Some(val) = config.value("rerere.enabled") {
         let v = val.to_ascii_lowercase();
         if matches!(v.as_str(), "false" | "0" | "no" | "off") {
             return false;
@@ -92,7 +96,7 @@ fn autoupdate_flag(config: &ConfigSet, o: RerereAutoupdate) -> bool {
         RerereAutoupdate::Yes => true,
         RerereAutoupdate::No => false,
         RerereAutoupdate::FromConfig => config
-            .get("rerere.autoupdate")
+            .value("rerere.autoupdate")
             .map(|v| {
                 let l = v.to_ascii_lowercase();
                 matches!(l.as_str(), "true" | "1" | "yes" | "on")
@@ -572,7 +576,7 @@ fn synthesize_conflict_from_index(
                 favor: MergeFavor::None,
                 style: ConflictStyle::Merge,
                 marker_size,
-                diff_algorithm: None,
+                diff_algorithm: Some(crate::merge_file::TREE_MERGE_DIFF_ALGORITHM.to_string()),
                 ignore_all_space: false,
                 ignore_space_change: false,
                 ignore_space_at_eol: false,
@@ -592,7 +596,7 @@ fn synthesize_conflict_from_index(
                 favor: MergeFavor::None,
                 style: ConflictStyle::Merge,
                 marker_size,
-                diff_algorithm: None,
+                diff_algorithm: Some(crate::merge_file::TREE_MERGE_DIFF_ALGORITHM.to_string()),
                 ignore_all_space: false,
                 ignore_space_change: false,
                 ignore_space_at_eol: false,
@@ -630,7 +634,7 @@ fn try_replay_merge(
         favor: MergeFavor::None,
         style: ConflictStyle::Merge,
         marker_size,
-        diff_algorithm: None,
+        diff_algorithm: Some(crate::merge_file::TREE_MERGE_DIFF_ALGORITHM.to_string()),
         ignore_all_space: false,
         ignore_space_change: false,
         ignore_space_at_eol: false,
@@ -743,9 +747,11 @@ fn write_preimage_normalized(
 }
 
 fn stage_resolved_path(repo: &Repository, index: &mut Index, path: &str) -> Result<()> {
-    let wt = repo
-        .work_tree()
-        .ok_or_else(|| crate::error::Error::PathError("no work tree".to_string()))?;
+    let wt = repo.work_tree().ok_or_else(|| {
+        crate::error::Error::Worktree(WorktreeError::Path {
+            detail: "no work tree".to_string(),
+        })
+    })?;
     let abs = wt.join(path);
     let data = fs::read(&abs)?;
     let oid = repo.odb().write(ObjectKind::Blob, &data)?;
@@ -795,8 +801,11 @@ fn stage_resolved_path(repo: &Repository, index: &mut Index, path: &str) -> Resu
 }
 
 /// Invoked after mergy operations with conflicts (`merge`, `rebase`, …).
-pub fn repo_rerere(repo: &Repository, autoupdate: RerereAutoupdate) -> Result<Vec<RerereEvent>> {
-    let config = repo.config()?;
+pub(crate) fn repo_rerere(
+    repo: &Repository,
+    autoupdate: RerereAutoupdate,
+) -> Result<Vec<RerereEvent>> {
+    let config = repo.config().snapshot()?;
     if !rerere_enabled(&config, repo.git_dir()) {
         return Ok(Vec::new());
     }
@@ -1015,8 +1024,8 @@ pub fn repo_rerere(repo: &Repository, autoupdate: RerereAutoupdate) -> Result<Ve
 }
 
 /// After successful commit: record postimages, clear `MERGE_RR` entries.
-pub fn rerere_post_commit(repo: &Repository) -> Result<Vec<RerereEvent>> {
-    let config = repo.config()?;
+pub(crate) fn rerere_post_commit(repo: &Repository) -> Result<Vec<RerereEvent>> {
+    let config = repo.config().snapshot()?;
     if !rerere_enabled(&config, repo.git_dir()) {
         return Ok(Vec::new());
     }
@@ -1078,7 +1087,7 @@ pub fn rerere_post_commit(repo: &Repository) -> Result<Vec<RerereEvent>> {
 /// # Errors
 ///
 /// Propagates rerere and I/O failures.
-pub fn finish_merge_rerere(repo: &Repository) -> Result<Vec<RerereEvent>> {
+pub(crate) fn finish_merge_rerere(repo: &Repository) -> Result<Vec<RerereEvent>> {
     let events = rerere_post_commit(repo)?;
     let path = merge_rr_path(repo.git_dir());
     if path.exists() {
@@ -1088,7 +1097,7 @@ pub fn finish_merge_rerere(repo: &Repository) -> Result<Vec<RerereEvent>> {
 }
 
 /// `git rerere clear` — drop unresolved preimages tracked in `MERGE_RR`, remove `MERGE_RR`.
-pub fn rerere_clear(git_dir: &Path) -> Result<()> {
+pub(crate) fn rerere_clear(git_dir: &Path) -> Result<()> {
     let merge_rr = read_merge_rr(git_dir)?;
     for ent in merge_rr.values() {
         let Some(id) = &ent.id else {
@@ -1108,7 +1117,7 @@ pub fn rerere_clear(git_dir: &Path) -> Result<()> {
 }
 
 fn parse_expiry_days_now(config: &ConfigSet, key: &str, now: i64) -> Option<i64> {
-    let s = config.get(key)?;
+    let s = config.value(key)?;
     if let Ok(days) = s.parse::<i64>() {
         return Some(now - days * 86400);
     }
@@ -1141,7 +1150,11 @@ fn parse_expiry_days_now(config: &ConfigSet, key: &str, now: i64) -> Option<i64>
 
 /// `git rerere gc`
 pub fn rerere_gc(env: &crate::environment::Environment, git_dir: &Path, now: i64) -> Result<()> {
-    let config = ConfigSet::load(env, Some(git_dir), true)?;
+    let config = ConfigSet::load(
+        env,
+        Some(git_dir),
+        &crate::config::LoadConfigOptions::standard(env, Some(git_dir)),
+    )?;
     if !rerere_enabled(&config, git_dir) {
         return Ok(());
     }
@@ -1220,8 +1233,8 @@ pub fn rerere_gc(env: &crate::environment::Environment, git_dir: &Path, now: i64
 }
 
 /// Lines for `git rerere status` (paths listed in `MERGE_RR`).
-pub fn rerere_status_lines(repo: &Repository) -> Result<Vec<String>> {
-    let config = repo.config()?;
+pub(crate) fn rerere_status_lines(repo: &Repository) -> Result<Vec<String>> {
+    let config = repo.config().snapshot()?;
     if !rerere_enabled(&config, repo.git_dir()) {
         return Ok(Vec::new());
     }
@@ -1230,8 +1243,8 @@ pub fn rerere_status_lines(repo: &Repository) -> Result<Vec<String>> {
 }
 
 /// Unified diff: recorded preimage vs working tree (Git/xdiff style header).
-pub fn rerere_diff_for_path(repo: &Repository, path: &str) -> Result<Option<String>> {
-    let config = repo.config()?;
+pub(crate) fn rerere_diff_for_path(repo: &Repository, path: &str) -> Result<Option<String>> {
+    let config = repo.config().snapshot()?;
     if !rerere_enabled(&config, repo.git_dir()) {
         return Ok(None);
     }
@@ -1272,8 +1285,8 @@ pub fn rerere_diff_for_path(repo: &Repository, path: &str) -> Result<Option<Stri
 /// resolved; a PUNTED conflict (unmerged but not rerere-handled, e.g.
 /// rename/rename) is inserted into the list. Finally emit every MERGE_RR entry
 /// that was not marked resolved.
-pub fn rerere_remaining_lines(repo: &Repository) -> Result<Vec<String>> {
-    let config = repo.config()?;
+pub(crate) fn rerere_remaining_lines(repo: &Repository) -> Result<Vec<String>> {
+    let config = repo.config().snapshot()?;
     if !rerere_enabled(&config, repo.git_dir()) {
         return Ok(Vec::new());
     }
@@ -1327,15 +1340,17 @@ pub fn rerere_remaining_lines(repo: &Repository) -> Result<Vec<String>> {
 }
 
 /// Drop recorded resolution for `path` (working tree must show conflict markers).
-pub fn rerere_forget_path(repo: &Repository, path: &str) -> Result<Vec<RerereEvent>> {
+pub(crate) fn rerere_forget_path(repo: &Repository, path: &str) -> Result<Vec<RerereEvent>> {
     let mut events = Vec::new();
-    let config = repo.config()?;
+    let config = repo.config().snapshot()?;
     if !rerere_enabled(&config, repo.git_dir()) {
         return Ok(events);
     }
-    let wt = repo
-        .work_tree()
-        .ok_or_else(|| crate::error::Error::PathError("no work tree".to_string()))?;
+    let wt = repo.work_tree().ok_or_else(|| {
+        crate::error::Error::Worktree(WorktreeError::Path {
+            detail: "no work tree".to_string(),
+        })
+    })?;
     let path = {
         let cwd = repo.environment().cwd.clone();
         if let Ok(prefix) = cwd.strip_prefix(wt) {
@@ -1352,9 +1367,9 @@ pub fn rerere_forget_path(repo: &Repository, path: &str) -> Result<Vec<RerereEve
     let path = path.as_str();
     let fp = wt.join(path);
     if !fp.exists() {
-        return Err(crate::error::Error::PathError(format!(
-            "no such path '{path}' in the working tree"
-        )));
+        return Err(crate::error::Error::Worktree(WorktreeError::Path {
+            detail: format!("no such path '{path}' in the working tree"),
+        }));
     }
     let index_path = repo.git_dir().join("index");
     let index = repo.load_index_at(&index_path)?;
@@ -1377,9 +1392,9 @@ pub fn rerere_forget_path(repo: &Repository, path: &str) -> Result<Vec<RerereEve
     let synth = match synthesize_conflict_from_index(repo, &index, path)? {
         Some(s) => s,
         None => {
-            return Err(crate::error::Error::PathError(format!(
-                "could not parse conflict hunks in '{path}'"
-            )));
+            return Err(crate::error::Error::Worktree(WorktreeError::Path {
+                detail: format!("could not parse conflict hunks in '{path}'"),
+            }));
         }
     };
     let marker_size = conflict_marker_size(path);
@@ -1387,9 +1402,9 @@ pub fn rerere_forget_path(repo: &Repository, path: &str) -> Result<Vec<RerereEve
     let digest_len = algo.len();
     let mut hash = [0u8; 32];
     if handle_path(&synth, marker_size, algo, Some(&mut hash[..digest_len])) != 1 {
-        return Err(crate::error::Error::PathError(format!(
-            "could not parse conflict hunks in '{path}'"
-        )));
+        return Err(crate::error::Error::Worktree(WorktreeError::Path {
+            detail: format!("could not parse conflict hunks in '{path}'"),
+        }));
     }
     let hex = hex::encode(&hash[..digest_len]);
     let work = fs::read_to_string(&fp)?;

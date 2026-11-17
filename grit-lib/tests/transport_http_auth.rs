@@ -9,7 +9,7 @@
 //!   * with the RIGHT credentials → fetch/push succeed (refs + objects land, the
 //!     pack `fsck`s clean, the tracking tip matches `git rev-parse`);
 //!   * with WRONG / NO credentials → the call fails fast with the typed
-//!     [`grit_lib::error::Error::Auth`] (never a hang);
+//!     [`grit_lib::error::Error::Remote(grit_lib::remote::RemoteError::Auth { .. })`] (never a hang);
 //!   * the provider's `approve` / `reject` hooks fire as Git's would.
 //!
 //! The test skips gracefully when `git`, the `grit` binary, or the
@@ -32,14 +32,13 @@ use std::time::{Duration, Instant};
 use grit_lib::config::ConfigSet;
 use grit_lib::error::{AuthFailure, Error, RemoteUnreadableReason, Result as GritResult};
 use grit_lib::objects::odb::Odb;
-use grit_lib::refs::resolve_ref;
+use grit_lib::progress::NullProgress;
 use grit_lib::remote::credentials::{Credential, CredentialProvider, HelperCredentialProvider};
 use grit_lib::remote::fetch::NoProgress;
-use grit_lib::remote::push::push_http;
 use grit_lib::remote::push_report::PushRefStatus;
 use grit_lib::remote::transfer::{FetchOptions, PushOptions, PushRefSpec, TagMode};
+use grit_lib::remote::transport::http::http_client_arc;
 use grit_lib::remote::transport::http::ureq_client::UreqHttpClient;
-use grit_lib::remote::transport::http::{http_client_arc, http_fetch};
 
 const USER: &str = "alice";
 const PASS: &str = "s3cr3t";
@@ -236,25 +235,39 @@ fn fetch_over_authed_http_succeeds_with_right_credentials_and_fails_typed_otherw
     let url_with_embedded_creds =
         format!("http://{USER}:wrong-embedded-pass@127.0.0.1:{port}/repo.git");
 
-    let mut opts = FetchOptions {
-        refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()],
-        tags: TagMode::All,
-        ..Default::default()
-    };
+    let mut opts = FetchOptions::new();
+    opts.refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()];
+    opts.tags = TagMode::All;
 
     // --- 0. Sanity: the server really demands auth. An unauthenticated client
-    // must fail with the typed `Error::Auth` (NOT a hang, NOT a generic error). --
+    // must fail with the typed `Error::Remote(grit_lib::remote::RemoteError::Auth { .. })` (NOT a hang, NOT a generic error). --
     {
         let local = tmp.path().join("noauth");
         std::fs::create_dir_all(&local).unwrap();
         git(&local, &["init", "-q", "-b", "main", "."]);
         let local_git = local.join(".git");
         let client = http_client_arc(UreqHttpClient::new().with_git_protocol("version=2"));
-        let err = http_fetch(client.clone(), &local_git, &url, &mut opts, &mut NoProgress)
-            .expect_err("fetch with no credentials against an authed server must fail");
+        let err = grit_lib::repo::Repository::open(
+            &local_git,
+            &grit_lib::config::environment::RepositoryOptions::with_environment(
+                (&mut opts).environment.clone(),
+            ),
+        )
+        .expect("open fetch target")
+        .remotes()
+        .fetch_from(
+            grit_lib::remote::transfer::TransferEndpoint::Http {
+                client: client.clone(),
+                url: &url,
+            },
+            &mut opts,
+            &mut NullProgress,
+            grit_lib::progress::CancelToken::never_ref(),
+        )
+        .expect_err("fetch with no credentials against an authed server must fail");
         assert!(
-            matches!(&err, Error::Auth { reason, .. } if !reason.is_rejected()),
-            "expected a typed Error::Auth without credentials, got: {err:?}"
+            matches!(&err, Error::Remote(grit_lib::remote::RemoteError::Auth { reason, .. }) if !reason.is_rejected()),
+            "expected a typed Error::Remote(grit_lib::remote::RemoteError::Auth {{ .. }}) without credentials, got: {err:?}"
         );
     }
 
@@ -265,15 +278,28 @@ fn fetch_over_authed_http_succeeds_with_right_credentials_and_fails_typed_otherw
         git(&local, &["init", "-q", "-b", "main", "."]);
         let local_git = local.join(".git");
         let client = http_client_arc(UreqHttpClient::new().with_git_protocol("version=2"));
-        let err = http_fetch(
-            client,
+        let err = grit_lib::repo::Repository::open(
             &local_git,
-            &url_with_embedded_creds,
+            &grit_lib::config::environment::RepositoryOptions::with_environment(
+                (&mut opts).environment.clone(),
+            ),
+        )
+        .expect("open fetch target")
+        .remotes()
+        .fetch_from(
+            grit_lib::remote::transfer::TransferEndpoint::Http {
+                client: client,
+                url: &url_with_embedded_creds,
+            },
             &mut opts,
-            &mut NoProgress,
+            &mut NullProgress,
+            grit_lib::progress::CancelToken::never_ref(),
         )
         .expect_err("fetch with embedded wrong creds in URL must fail");
-        assert!(matches!(err, Error::Auth { .. }));
+        assert!(matches!(
+            err,
+            Error::Remote(grit_lib::remote::RemoteError::Auth { .. })
+        ));
         let msg = err.to_string();
         assert!(
             !msg.contains("wrong-embedded-pass"),
@@ -297,17 +323,33 @@ fn fetch_over_authed_http_succeeds_with_right_credentials_and_fails_typed_otherw
             UreqHttpClient::with_credentials(Box::new(provider.clone()))
                 .with_git_protocol("version=2"),
         );
-        let err = http_fetch(client.clone(), &local_git, &url, &mut opts, &mut NoProgress)
-            .expect_err("fetch with wrong credentials must fail");
+        let err = grit_lib::repo::Repository::open(
+            &local_git,
+            &grit_lib::config::environment::RepositoryOptions::with_environment(
+                (&mut opts).environment.clone(),
+            ),
+        )
+        .expect("open fetch target")
+        .remotes()
+        .fetch_from(
+            grit_lib::remote::transfer::TransferEndpoint::Http {
+                client: client.clone(),
+                url: &url,
+            },
+            &mut opts,
+            &mut NullProgress,
+            grit_lib::progress::CancelToken::never_ref(),
+        )
+        .expect_err("fetch with wrong credentials must fail");
         assert!(
             matches!(
                 err,
-                Error::Auth {
+                Error::Remote(grit_lib::remote::RemoteError::Auth {
                     reason: AuthFailure::Rejected,
                     ..
-                }
+                })
             ),
-            "expected a typed Error::Auth for wrong credentials, got: {err:?}"
+            "expected a typed Error::Remote(grit_lib::remote::RemoteError::Auth {{ .. }}) for wrong credentials, got: {err:?}"
         );
         let msg = err.to_string();
         assert!(
@@ -331,7 +373,10 @@ fn fetch_over_authed_http_succeeds_with_right_credentials_and_fails_typed_otherw
             "wrong credentials must never be approved"
         );
         // Nothing was fetched.
-        assert!(resolve_ref(&local_git, "refs/remotes/origin/main").is_err());
+        assert!(grit_test_support::refs::at(&local_git)
+            .references()
+            .resolve("refs/remotes/origin/main")
+            .is_err());
     }
 
     // --- 2. RIGHT credentials → fetch succeeds, approve() fired -----------------
@@ -344,8 +389,24 @@ fn fetch_over_authed_http_succeeds_with_right_credentials_and_fails_typed_otherw
     let client = http_client_arc(
         UreqHttpClient::with_credentials(Box::new(provider.clone())).with_git_protocol("version=2"),
     );
-    let outcome = http_fetch(client.clone(), &local_git, &url, &mut opts, &mut NoProgress)
-        .expect("authed fetch with correct credentials must succeed");
+    let outcome = grit_lib::repo::Repository::open(
+        &local_git,
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&mut opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Http {
+            client: client.clone(),
+            url: &url,
+        },
+        &mut opts,
+        &mut NullProgress,
+        grit_lib::progress::CancelToken::never_ref(),
+    )
+    .expect("authed fetch with correct credentials must succeed");
 
     // Credentials were filled and approved (Git's credential_approve on success);
     // a connection-level auth cache means at most one fill regardless of POSTs.
@@ -365,15 +426,24 @@ fn fetch_over_authed_http_succeeds_with_right_credentials_and_fails_typed_otherw
 
     // Refs + tag landed.
     assert_eq!(
-        resolve_ref(&local_git, "refs/remotes/origin/main").expect("origin/main"),
+        grit_test_support::refs::at(&local_git)
+            .references()
+            .resolve("refs/remotes/origin/main")
+            .expect("origin/main"),
         main_oid
     );
     assert_eq!(
-        resolve_ref(&local_git, "refs/remotes/origin/topic").expect("origin/topic"),
+        grit_test_support::refs::at(&local_git)
+            .references()
+            .resolve("refs/remotes/origin/topic")
+            .expect("origin/topic"),
         topic_oid
     );
     assert_eq!(
-        resolve_ref(&local_git, "refs/tags/v1").expect("tag v1"),
+        grit_test_support::refs::at(&local_git)
+            .references()
+            .resolve("refs/tags/v1")
+            .expect("tag v1"),
         tag_oid
     );
     assert!(outcome
@@ -393,7 +463,9 @@ fn fetch_over_authed_http_succeeds_with_right_credentials_and_fails_typed_otherw
 
     // Cross-check the fetched main tip against system git's view of the source.
     assert_eq!(
-        resolve_ref(&local_git, "refs/remotes/origin/main")
+        grit_test_support::refs::at(&local_git)
+            .references()
+            .resolve("refs/remotes/origin/main")
             .unwrap()
             .to_hex(),
         git(&source, &["rev-parse", "refs/heads/main"]).trim()
@@ -436,11 +508,9 @@ fn fetch_missing_repo_with_valid_credentials_does_not_reject_them() {
     let good_url = format!("http://127.0.0.1:{port}/repo.git");
     let typo_url = format!("http://127.0.0.1:{port}/repo-typo.git");
 
-    let mut opts = FetchOptions {
-        refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()],
-        tags: TagMode::All,
-        ..Default::default()
-    };
+    let mut opts = FetchOptions::new();
+    opts.refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()];
+    opts.tags = TagMode::All;
 
     let provider = SharedProvider(Arc::new(StaticCredentialProvider::new(USER, PASS)));
     let client = http_client_arc(
@@ -452,21 +522,31 @@ fn fetch_missing_repo_with_valid_credentials_does_not_reject_them() {
     git(&local, &["init", "-q", "-b", "main", "."]);
     let local_git = local.join(".git");
 
-    let err = http_fetch(
-        client.clone(),
+    let err = grit_lib::repo::Repository::open(
         &local_git,
-        &typo_url,
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&mut opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Http {
+            client: client.clone(),
+            url: &typo_url,
+        },
         &mut opts,
-        &mut NoProgress,
+        &mut NullProgress,
+        grit_lib::progress::CancelToken::never_ref(),
     )
     .expect_err("fetch of a missing repo must fail");
     assert!(
         matches!(
             err,
-            Error::RemoteUnreadable {
+            Error::Remote(grit_lib::remote::RemoteError::Unreadable {
                 reason: RemoteUnreadableReason::HttpStatus { status: 404 },
                 ..
-            }
+            })
         ),
         "expected HTTP 404 remote_unreadable, got: {err:?}"
     );
@@ -485,8 +565,24 @@ fn fetch_missing_repo_with_valid_credentials_does_not_reject_them() {
     std::fs::create_dir_all(&local_ok).unwrap();
     git(&local_ok, &["init", "-q", "-b", "main", "."]);
     let local_ok_git = local_ok.join(".git");
-    http_fetch(client, &local_ok_git, &good_url, &mut opts, &mut NoProgress)
-        .expect("fetch of the real repo must still work with the same provider");
+    grit_lib::repo::Repository::open(
+        &local_ok_git,
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&mut opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Http {
+            client: client,
+            url: &good_url,
+        },
+        &mut opts,
+        &mut NullProgress,
+        grit_lib::progress::CancelToken::never_ref(),
+    )
+    .expect("fetch of the real repo must still work with the same provider");
     assert!(
         provider.0.approves.load(Ordering::SeqCst) >= 1,
         "correct credentials should be approved after a successful fetch"
@@ -536,22 +632,32 @@ fn push_over_authed_http_succeeds_with_right_credentials_and_fails_typed_otherwi
     // --- 1. NO credentials → typed auth error, remote ref untouched -------------
     {
         let client = http_client_arc(UreqHttpClient::new());
-        let err = push_http(
-            client.clone(),
+        let err = grit_lib::repo::Repository::open(
             &local_git,
-            &url,
+            &grit_lib::config::environment::RepositoryOptions::empty(),
+        )
+        .expect("open push source")
+        .remotes()
+        .push_to(
+            grit_lib::remote::transfer::TransferEndpoint::Http {
+                client: client.clone(),
+                url: &url,
+            },
             std::slice::from_ref(&spec),
             &PushOptions::default(),
             &mut NoProgress,
-            &grit_lib::progress::NeverCancel,
+            &grit_lib::progress::CancelToken::never(),
         )
         .expect_err("push with no credentials against an authed server must fail");
         assert!(
-            matches!(&err, Error::Auth { reason, .. } if !reason.is_rejected()),
-            "expected a typed Error::Auth for an unauthenticated push, got: {err:?}"
+            matches!(&err, Error::Remote(grit_lib::remote::RemoteError::Auth { reason, .. }) if !reason.is_rejected()),
+            "expected a typed Error::Remote(grit_lib::remote::RemoteError::Auth {{ .. }}) for an unauthenticated push, got: {err:?}"
         );
         assert!(
-            resolve_ref(&bare, "refs/heads/main").is_err(),
+            grit_test_support::refs::at(&bare)
+                .references()
+                .resolve("refs/heads/main")
+                .is_err(),
             "rejected push must not create the remote ref"
         );
     }
@@ -559,14 +665,21 @@ fn push_over_authed_http_succeeds_with_right_credentials_and_fails_typed_otherwi
     // --- 2. RIGHT credentials → push succeeds, objects land, fsck clean ---------
     let provider = SharedProvider(Arc::new(StaticCredentialProvider::new(USER, PASS)));
     let client = http_client_arc(UreqHttpClient::with_credentials(Box::new(provider.clone())));
-    let outcome = push_http(
-        client.clone(),
+    let outcome = grit_lib::repo::Repository::open(
         &local_git,
-        &url,
+        &grit_lib::config::environment::RepositoryOptions::empty(),
+    )
+    .expect("open push source")
+    .remotes()
+    .push_to(
+        grit_lib::remote::transfer::TransferEndpoint::Http {
+            client: client.clone(),
+            url: &url,
+        },
         std::slice::from_ref(&spec),
         &PushOptions::default(),
         &mut NoProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("authed push with correct credentials must succeed");
 
@@ -581,7 +694,10 @@ fn push_over_authed_http_succeeds_with_right_credentials_and_fails_typed_otherwi
     assert!(provider.0.approves.load(Ordering::SeqCst) >= 1);
     assert_eq!(provider.0.rejects.load(Ordering::SeqCst), 0);
 
-    let remote_main = resolve_ref(&bare, "refs/heads/main").expect("remote main written");
+    let remote_main = grit_test_support::refs::at(&bare)
+        .references()
+        .resolve("refs/heads/main")
+        .expect("remote main written");
     assert_eq!(remote_main, main_oid);
 
     let remote_odb = open_odb(&bare);
@@ -683,9 +799,12 @@ fn credential_store_host_entry_authenticates_fetch_and_push() {
         .unwrap();
     let client = || {
         http_client_arc(
-            UreqHttpClient::from_config(&config)
-                .expect("client from config")
-                .with_credential_provider(Box::new(HelperCredentialProvider::new(config.clone()))),
+            UreqHttpClient::from_config(
+                &config,
+                &grit_lib::config::environment::Environment::empty(),
+            )
+            .expect("client from config")
+            .with_credential_provider(Box::new(HelperCredentialProvider::new(config.clone()))),
         )
     };
 
@@ -693,21 +812,32 @@ fn credential_store_host_entry_authenticates_fetch_and_push() {
     std::fs::create_dir_all(&local).unwrap();
     git(&local, &["init", "-q", "-b", "main", "."]);
     let local_git = local.join(".git");
-    let mut opts = FetchOptions {
-        refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()],
-        tags: TagMode::All,
-        ..Default::default()
-    };
-    http_fetch(
-        client(),
+    let mut opts = FetchOptions::new();
+    opts.refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()];
+    opts.tags = TagMode::All;
+    grit_lib::repo::Repository::open(
         &local_git,
-        &format!("http://{host}/hw.git"),
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&mut opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Http {
+            client: client(),
+            url: &format!("http://{host}/hw.git"),
+        },
         &mut opts,
-        &mut NoProgress,
+        &mut NullProgress,
+        grit_lib::progress::CancelToken::never_ref(),
     )
     .expect("fetch authenticated by the host-level store entry");
     assert_eq!(
-        resolve_ref(&local_git, "refs/remotes/origin/main").expect("origin/main"),
+        grit_test_support::refs::at(&local_git)
+            .references()
+            .resolve("refs/remotes/origin/main")
+            .expect("origin/main"),
         main_oid
     );
 
@@ -721,19 +851,29 @@ fn credential_store_host_entry_authenticates_fetch_and_push() {
         expect_absent: false,
         ..Default::default()
     };
-    let outcome = push_http(
-        client(),
+    let outcome = grit_lib::repo::Repository::open(
         &local_git,
-        &format!("http://{host}/push.git"),
+        &grit_lib::config::environment::RepositoryOptions::empty(),
+    )
+    .expect("open push source")
+    .remotes()
+    .push_to(
+        grit_lib::remote::transfer::TransferEndpoint::Http {
+            client: client(),
+            url: &format!("http://{host}/push.git"),
+        },
         std::slice::from_ref(&spec),
         &PushOptions::default(),
         &mut NoProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("push authenticated by the host-level store entry");
     assert_eq!(outcome.results[0].status, PushRefStatus::Ok);
     assert_eq!(
-        resolve_ref(&push_target, "refs/heads/main").expect("pushed main"),
+        grit_test_support::refs::at(&push_target)
+            .references()
+            .resolve("refs/heads/main")
+            .expect("pushed main"),
         main_oid
     );
 
@@ -868,21 +1008,32 @@ fn git_askpass_authenticates_fetch_with_the_prompts_system_git_uses() {
     std::fs::create_dir_all(&local).unwrap();
     git(&local, &["init", "-q", "-b", "main", "."]);
     let local_git = local.join(".git");
-    let mut opts = FetchOptions {
-        refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()],
-        tags: TagMode::All,
-        ..Default::default()
-    };
-    http_fetch(
-        shared_client(&factory, &config),
+    let mut opts = FetchOptions::new();
+    opts.refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()];
+    opts.tags = TagMode::All;
+    grit_lib::repo::Repository::open(
         &local_git,
-        &url,
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&mut opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Http {
+            client: shared_client(&factory, &config),
+            url: &url,
+        },
         &mut opts,
-        &mut NoProgress,
+        &mut NullProgress,
+        grit_lib::progress::CancelToken::never_ref(),
     )
     .expect("fetch authenticated through GIT_ASKPASS");
     assert_eq!(
-        resolve_ref(&local_git, "refs/remotes/origin/main").expect("origin/main"),
+        grit_test_support::refs::at(&local_git)
+            .references()
+            .resolve("refs/remotes/origin/main")
+            .expect("origin/main"),
         main_oid
     );
     git_fsck(&local_git);
@@ -957,14 +1108,21 @@ fn core_askpass_authenticates_push_through_the_default_factory() {
         dst: "refs/heads/main".to_owned(),
         ..Default::default()
     };
-    let outcome = push_http(
-        shared_client(&factory, &config),
+    let outcome = grit_lib::repo::Repository::open(
         &work.join(".git"),
-        &format!("http://127.0.0.1:{port}/push.git"),
+        &grit_lib::config::environment::RepositoryOptions::empty(),
+    )
+    .expect("open push source")
+    .remotes()
+    .push_to(
+        grit_lib::remote::transfer::TransferEndpoint::Http {
+            client: shared_client(&factory, &config),
+            url: &format!("http://127.0.0.1:{port}/push.git"),
+        },
         std::slice::from_ref(&spec),
         &PushOptions::default(),
         &mut NoProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("push authenticated through core.askPass");
     assert_eq!(outcome.results[0].status, PushRefStatus::Ok);
@@ -1011,25 +1169,36 @@ fn wrong_credentials_in_the_url_are_rejected_without_asking_askpass() {
     let local = tmp.path().join("clone");
     std::fs::create_dir_all(&local).unwrap();
     git(&local, &["init", "-q", "-b", "main", "."]);
-    let mut opts = FetchOptions {
-        refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()],
-        ..Default::default()
+    let mut opts = {
+        let mut o = FetchOptions::new();
+        o.refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()];
+        o
     };
-    let err = http_fetch(
-        shared_client(&factory, &config),
+    let err = grit_lib::repo::Repository::open(
         &local.join(".git"),
-        &format!("http://{USER}:wrong@127.0.0.1:{port}/hello.git"),
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&mut opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Http {
+            client: shared_client(&factory, &config),
+            url: &format!("http://{USER}:wrong@127.0.0.1:{port}/hello.git"),
+        },
         &mut opts,
-        &mut NoProgress,
+        &mut NullProgress,
+        grit_lib::progress::CancelToken::never_ref(),
     )
     .expect_err("wrong URL credentials must fail");
     assert!(
         matches!(
             &err,
-            Error::Auth {
+            Error::Remote(grit_lib::remote::RemoteError::Auth {
                 reason: AuthFailure::Rejected,
                 ..
-            }
+            })
         ),
         "expected a rejected-credentials error, got: {err:?}"
     );
@@ -1047,7 +1216,7 @@ fn wrong_credentials_in_the_url_are_rejected_without_asking_askpass() {
 #[test]
 fn a_rejected_stored_credential_is_reported_by_the_push_not_erased_by_the_plan() {
     use grit_lib::config::environment::{Environment, RepositoryOptions};
-    use grit_lib::remote::push_plan::{load_push_plan_context, open_push_destination};
+    use grit_lib::remote::push_plan::open_push_destination;
     use grit_lib::remote::RemoteError;
     use grit_lib::repo::Repository;
 
@@ -1106,9 +1275,12 @@ fn a_rejected_stored_credential_is_reported_by_the_push_not_erased_by_the_plan()
         &RepositoryOptions::with_environment(env).with_work_tree(&work),
     )
     .expect("open repo");
-    let config = repo.config().expect("config");
+    let config = repo.config().snapshot().expect("config");
 
-    let ctx = load_push_plan_context(&repo, &config, Some("origin"), None).expect("context");
+    let ctx = repo
+        .remotes()
+        .push_plan_context(Some("origin"), None)
+        .expect("context");
     assert!(ctx.remote_tips.is_none(), "the advertisement was refused");
     assert_eq!(
         std::fs::read_to_string(&store_file).unwrap(),
@@ -1129,7 +1301,7 @@ fn a_rejected_stored_credential_is_reported_by_the_push_not_erased_by_the_plan()
                 std::slice::from_ref(&spec),
                 PushOptions::default(),
                 &mut NoProgress,
-                &grit_lib::progress::NeverCancel,
+                &grit_lib::progress::CancelToken::never(),
                 None,
             )
     };
@@ -1137,10 +1309,10 @@ fn a_rejected_stored_credential_is_reported_by_the_push_not_erased_by_the_plan()
     assert!(
         matches!(
             &err,
-            RemoteError::Library(Error::Auth {
+            RemoteError::Auth {
                 reason: AuthFailure::Rejected,
                 ..
-            })
+            }
         ),
         "expected the push to report rejected credentials, got: {err:?}"
     );
@@ -1155,7 +1327,10 @@ fn a_rejected_stored_credential_is_reported_by_the_push_not_erased_by_the_plan()
         format!("http://{USER}:{PASS}@127.0.0.1%3a{port}\n"),
     )
     .unwrap();
-    let ctx = load_push_plan_context(&repo, &config, Some("origin"), None).expect("context");
+    let ctx = repo
+        .remotes()
+        .push_plan_context(Some("origin"), None)
+        .expect("context");
     assert_eq!(
         ctx.remote_tips,
         Some(Vec::new()),
@@ -1174,11 +1349,11 @@ fn a_rejected_stored_credential_is_reported_by_the_push_not_erased_by_the_plan()
 /// asked for a probe client for the push-plan advertisement and a normal client
 /// for the push, so only the push rejects the refused credential.
 #[test]
-fn custom_factories_build_the_push_plan_probe_with_create_for_probe() {
+fn custom_factories_build_the_push_plan_probe_with_create_for_preflight() {
     use grit_lib::config::environment::{Environment, RepositoryOptions};
-    use grit_lib::remote::push_plan::{load_push_plan_context, open_push_destination};
+    use grit_lib::remote::push_plan::open_push_destination;
     use grit_lib::remote::transport::http::HttpClient;
-    use grit_lib::remote::{HttpClientFactory, RemoteError, RemoteResult};
+    use grit_lib::remote::{HttpClientFactory, RemoteError};
     use grit_lib::repo::Repository;
 
     /// Fills like the shared provider but drops `reject`.
@@ -1201,20 +1376,29 @@ fn custom_factories_build_the_push_plan_probe_with_create_for_probe() {
         probes: AtomicUsize,
     }
     impl HttpClientFactory for CountingFactory {
-        fn create(&self, config: &ConfigSet) -> RemoteResult<Box<dyn HttpClient>> {
+        fn create(&self, config: &ConfigSet) -> grit_lib::error::Result<Box<dyn HttpClient>> {
             self.creates.fetch_add(1, Ordering::SeqCst);
             Ok(Box::new(
-                UreqHttpClient::from_config(config)
-                    .expect("client")
-                    .with_credential_provider(Box::new(self.provider.clone())),
+                UreqHttpClient::from_config(
+                    config,
+                    &grit_lib::config::environment::Environment::empty(),
+                )
+                .expect("client")
+                .with_credential_provider(Box::new(self.provider.clone())),
             ))
         }
-        fn create_for_probe(&self, config: &ConfigSet) -> RemoteResult<Box<dyn HttpClient>> {
+        fn create_for_preflight(
+            &self,
+            config: &ConfigSet,
+        ) -> grit_lib::error::Result<Box<dyn HttpClient>> {
             self.probes.fetch_add(1, Ordering::SeqCst);
             Ok(Box::new(
-                UreqHttpClient::from_config(config)
-                    .expect("client")
-                    .with_credential_provider(Box::new(NoReject(self.provider.clone()))),
+                UreqHttpClient::from_config(
+                    config,
+                    &grit_lib::config::environment::Environment::empty(),
+                )
+                .expect("client")
+                .with_credential_provider(Box::new(NoReject(self.provider.clone()))),
             ))
         }
     }
@@ -1256,7 +1440,7 @@ fn custom_factories_build_the_push_plan_probe_with_create_for_probe() {
             .with_work_tree(&work),
     )
     .expect("open repo");
-    let config = repo.config().expect("config");
+    let config = repo.config().snapshot().expect("config");
 
     let counters = Arc::new(StaticCredentialProvider::new(USER, "WRONG"));
     let factory = CountingFactory {
@@ -1264,8 +1448,10 @@ fn custom_factories_build_the_push_plan_probe_with_create_for_probe() {
         creates: AtomicUsize::new(0),
         probes: AtomicUsize::new(0),
     };
-    let ctx =
-        load_push_plan_context(&repo, &config, Some("origin"), Some(&factory)).expect("context");
+    let ctx = repo
+        .remotes()
+        .push_plan_context(Some("origin"), Some(&factory))
+        .expect("context");
     assert!(ctx.remote_tips.is_none());
     assert_eq!(factory.probes.load(Ordering::SeqCst), 1);
     assert_eq!(factory.creates.load(Ordering::SeqCst), 0);
@@ -1284,17 +1470,17 @@ fn custom_factories_build_the_push_plan_probe_with_create_for_probe() {
             std::slice::from_ref(&spec),
             PushOptions::default(),
             &mut NoProgress,
-            &grit_lib::progress::NeverCancel,
+            &grit_lib::progress::CancelToken::never(),
             Some(&factory),
         )
         .expect_err("wrong credentials");
     assert!(
         matches!(
             &err,
-            RemoteError::Library(Error::Auth {
+            RemoteError::Auth {
                 reason: AuthFailure::Rejected,
                 ..
-            })
+            }
         ),
         "{err:?}"
     );

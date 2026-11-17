@@ -1,9 +1,8 @@
 //! Push `--delete` of a ref absent on the remote is rejected (issue #1616).
 
 use grit_lib::remote::push_report::PushRefStatus;
-use grit_lib::remote::transfer::{push_local, resolve_push_delete_ref, PushOptions, PushRefSpec};
+use grit_lib::remote::transfer::{PushOptions, PushRefSpec};
 use grit_test_support::{git, git_cmd};
-use std::collections::HashSet;
 use std::path::Path;
 
 fn git_try(dir: &Path, args: &[&str]) -> bool {
@@ -32,16 +31,22 @@ fn delete_missing_remote_branch_errors_like_git() {
     git(&local, &["push", "-u", "origin", "main"]);
 
     let local_git = local.join(".git");
-    let outcome = push_local(
+    let outcome = grit_lib::repo::Repository::open(
         &local_git,
-        &remote,
+        &grit_lib::config::environment::RepositoryOptions::empty(),
+    )
+    .expect("open push source")
+    .remotes()
+    .push_to(
+        grit_lib::remote::transfer::TransferEndpoint::Local(&remote),
         &[PushRefSpec {
             dst: "refs/heads/no-such-branch".to_owned(),
             delete: true,
             ..Default::default()
         }],
         &PushOptions::default(),
-        &grit_lib::progress::NeverCancel,
+        &mut grit_lib::remote::fetch::NoProgress,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("push_local");
     assert_eq!(outcome.results.len(), 1);
@@ -81,22 +86,23 @@ fn delete_resolves_local_tag_when_remote_tag_gone() {
     git(&local, &["push", "origin", "--delete", "v3.0.0"]);
 
     let local_git = local.join(".git");
-    let remote_names = HashSet::new();
-    assert_eq!(
-        resolve_push_delete_ref(&local_git, &remote_names, "v3.0.0"),
-        "refs/tags/v3.0.0"
-    );
 
-    let outcome = push_local(
+    let outcome = grit_lib::repo::Repository::open(
         &local_git,
-        &remote,
+        &grit_lib::config::environment::RepositoryOptions::empty(),
+    )
+    .expect("open push source")
+    .remotes()
+    .push_to(
+        grit_lib::remote::transfer::TransferEndpoint::Local(&remote),
         &[PushRefSpec {
             dst: "refs/tags/v3.0.0".to_owned(),
             delete: true,
             ..Default::default()
         }],
         &PushOptions::default(),
-        &grit_lib::progress::NeverCancel,
+        &mut grit_lib::remote::fetch::NoProgress,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("push_local");
     assert_eq!(outcome.results.len(), 1);

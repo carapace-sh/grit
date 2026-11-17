@@ -1,9 +1,11 @@
 //! Bounded-memory object hashing and writing from a byte stream.
 //!
-//! Objects at or above `core.bigFileThreshold` are never held in memory: the payload is read
-//! in fixed-size chunks that feed the object hasher and a zlib encoder writing a
-//! single-object pack, which is how Git stores big files too.
+//! Payloads of at least [`STREAMED_WRITE_MIN_SIZE`] (1 MiB) are read in fixed-size chunks
+//! instead of being buffered whole: below [`crate::Odb::big_file_threshold`] they become loose
+//! objects; at or above the threshold they are written as a single-object pack, matching Git's
+//! large-file storage split.
 
+use crate::error::ObjectError;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -16,9 +18,52 @@ use crate::error::{Error, Result};
 use crate::hash::{ChecksumHasher, ObjectPayloadHasher};
 use crate::objects::{HashAlgo, ObjectId, ObjectKind};
 use crate::pack_objects::{encode_pack_object_header, pack_type_code};
+use crate::progress::CancelSignal;
 
 /// Bytes read from the source per step; the only payload-sized buffer a stream holds.
 const CHUNK: usize = 128 * 1024;
+
+/// Payloads at least this large are written from a stream without buffering the whole body.
+pub(crate) const STREAMED_WRITE_MIN_SIZE: u64 = 1024 * 1024;
+
+/// When the first chunk does not shrink at the configured level, store the payload at zlib level 0.
+pub(crate) fn compression_after_first_chunk(first: &[u8], configured: Compression) -> Compression {
+    if first.is_empty() || configured.level() == 0 {
+        return configured;
+    }
+    let mut trial = Vec::new();
+    let mut enc = ZlibEncoder::new(&mut trial, configured);
+    if enc.write_all(first).is_err() || enc.finish().is_err() {
+        return configured;
+    }
+    if trial.len() >= first.len() {
+        Compression::none()
+    } else {
+        configured
+    }
+}
+
+/// Read up to one [`CHUNK`] of the first `size` payload bytes from `reader`.
+pub(crate) fn read_first_payload_chunk(reader: &mut dyn Read, size: u64) -> Result<(Vec<u8>, u64)> {
+    if size == 0 {
+        return Ok((Vec::new(), 0));
+    }
+    let take = usize::try_from(size.min(CHUNK as u64)).map_err(|_| {
+        Error::Object(ObjectError::Corrupt {
+            detail: format!("object size {size} exceeds address space"),
+        })
+    })?;
+    let mut first = vec![0u8; take];
+    let n = reader.read(&mut first)?;
+    first.truncate(n);
+    if n == 0 {
+        return Err(Error::Object(ObjectError::StreamTruncated {
+            expected: size,
+            actual: 0,
+        }));
+    }
+    Ok((first, size - n as u64))
+}
 
 /// Offset of the single object in a pack: right after the 12-byte `PACK` header.
 const OBJECT_OFFSET: u64 = 12;
@@ -29,9 +74,10 @@ pub(crate) fn deflate_stream_to_writer(
     size: u64,
     w: &mut dyn Write,
     compression: Compression,
+    stop: &CancelSignal<'_>,
 ) -> Result<()> {
     let mut enc = ZlibEncoder::new(w, compression);
-    for_each_chunk(reader, size, |chunk| {
+    for_each_chunk(reader, size, Some(stop), |chunk| {
         enc.write_all(chunk).map_err(Error::Io)
     })?;
     enc.finish().map_err(Error::Io)?;
@@ -42,18 +88,22 @@ pub(crate) fn deflate_stream_to_writer(
 fn for_each_chunk(
     reader: &mut dyn Read,
     size: u64,
+    stop: Option<&CancelSignal<'_>>,
     mut sink: impl FnMut(&[u8]) -> Result<()>,
 ) -> Result<()> {
     let mut buf = vec![0u8; usize::try_from(size).map_or(CHUNK, |s| s.min(CHUNK))];
     let mut remaining = size;
     while remaining > 0 {
+        if let Some(stop) = stop {
+            stop.poll()?;
+        }
         let want = usize::try_from(remaining).map_or(buf.len(), |r| r.min(buf.len()));
         let n = match reader.read(&mut buf[..want]) {
             Ok(0) => {
-                return Err(Error::ObjectStreamTruncated {
+                return Err(Error::Object(ObjectError::StreamTruncated {
                     expected: size,
                     actual: size - remaining,
-                })
+                }))
             }
             Ok(n) => n,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
@@ -73,7 +123,7 @@ pub(crate) fn hash_stream(
     reader: &mut dyn Read,
 ) -> Result<ObjectId> {
     let mut hasher = ObjectPayloadHasher::new(algo, kind, size);
-    for_each_chunk(reader, size, |chunk| {
+    for_each_chunk(reader, size, None, |chunk| {
         hasher.update(chunk);
         Ok(())
     })?;
@@ -123,8 +173,12 @@ impl StagedPack {
         reader: &mut dyn Read,
         compression: Compression,
     ) -> Result<Self> {
+        let (first, tail) = read_first_payload_chunk(reader, size)?;
+        let compression = compression_after_first_chunk(&first, compression);
         let payload_len = usize::try_from(size).map_err(|_| {
-            Error::CorruptObject(format!("object size {size} exceeds address space"))
+            Error::Object(ObjectError::Corrupt {
+                detail: format!("object size {size} exceeds address space"),
+            })
         })?;
         fs::create_dir_all(pack_dir)?;
         let tmp = tempfile::Builder::new()
@@ -150,10 +204,14 @@ impl StagedPack {
         sink.write_all(&entry_header)?;
         let mut hasher = ObjectPayloadHasher::new(algo, kind, size);
         let mut encoder = ZlibEncoder::new(&mut sink, compression);
-        for_each_chunk(reader, size, |chunk| {
-            hasher.update(chunk);
-            encoder.write_all(chunk).map_err(Error::Io)
-        })?;
+        hasher.update(&first);
+        encoder.write_all(&first).map_err(Error::Io)?;
+        if tail > 0 {
+            for_each_chunk(reader, tail, None, |chunk| {
+                hasher.update(chunk);
+                encoder.write_all(chunk).map_err(Error::Io)
+            })?;
+        }
         encoder.finish()?;
         let oid = hasher.finish()?;
 
@@ -262,10 +320,10 @@ mod tests {
         .unwrap_err();
         assert!(matches!(
             err,
-            Error::ObjectStreamTruncated {
+            Error::Object(ObjectError::StreamTruncated {
                 expected: 10,
                 actual: 3
-            }
+            })
         ));
     }
 
@@ -535,10 +593,10 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             err,
-            Error::ObjectStreamTruncated {
+            Error::Object(ObjectError::StreamTruncated {
                 expected: 100_000,
                 actual: 4_000
-            }
+            })
         ));
         assert!(pack_files(&odb).is_empty(), "{:?}", pack_files(&odb));
     }
@@ -553,10 +611,7 @@ mod tests {
         let objects = dir.path().join("objects");
         fs::create_dir_all(&objects).unwrap();
         let store = Arc::new(MemoryStore::new(HashAlgo::Sha1));
-        let odb = OdbBuilder::files(&objects)
-            .primary(store.clone())
-            .alternates(false)
-            .build();
+        let odb = OdbBuilder::new().build(&objects, Some(store.clone()));
         let data = generated(20_000);
         let oid = odb
             .write_stream(

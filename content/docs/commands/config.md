@@ -29,6 +29,8 @@ With just a key, `grit config` prints its value. By default, reads use the full 
 
 Keys are written as `section.name`, for example `user.email`.
 
+Path strings in human, `--json`, and `--markdown` output (the `file` field on reads and list entries) use forward slashes and no Windows `\\?\` verbatim prefix, matching other grit commands.
+
 ### Settings grit uses
 
 | Key | Used for |
@@ -43,7 +45,7 @@ Keys are written as `section.name`, for example `user.email`.
 | `grit.testing.changeId` | Test-only: `content-hash` makes change ids deterministic from commit bytes; any other value is used verbatim. |
 | `receive.denyNonFastForwards` | Refuse pushes that would discard commits. Enforced on the remote for [`grit receive-pack`](../receive-pack/), smart HTTP, and local-path [`grit push`](../push/). |
 | `receive.denyDeletes` | Refuse pushes that delete branches or tags. Same enforcement as `receive.denyNonFastForwards`. |
-| `receive.denyCurrentBranch` | Refuse pushes to the branch checked out in a non-bare repository. On by default; same enforcement as the other `receive.deny*` keys. |
+| `receive.denyCurrentBranch` | `refuse` (default) rejects pushes to the checked-out branch. `ignore` / `false` allow the ref to move without updating the worktree. `warn` allows the update and may warn. `updateInstead` updates the worktree via the `push-to-checkout` hook or grit's built-in deploy (same checks as Git). Enforced by [`grit receive-pack`](../receive-pack/), smart HTTP, and local-path [`grit push`](../push/). |
 | `receive.denyDeleteCurrent` | Refuse pushes that delete the branch `HEAD` points at, bare repository or not. On by default; same enforcement as the other `receive.deny*` keys. |
 | `receive.fsckObjects`, `transfer.fsckObjects` | Refuse pushes that contain malformed commits, trees or tags. Tune single checks with `receive.fsck.<msg-id>` and `receive.fsck.skipList`. Enforced by [`grit receive-pack`](../receive-pack/) and smart HTTP; local-path [`grit push`](../push/) does not check objects. |
 

@@ -12,12 +12,14 @@ grit rebase [<upstream>]
 grit rebase [--onto <rev>] [<upstream>]
 grit rebase --continue | --abort | --skip
 grit history rebase [<upstream>]
-grit rebase|history rebase … [--check] [-X ours|theirs] [--dry-run] [--exec <cmd>]… [--update-refs=(branches|head)] [--empty=(drop|keep|abort)] [--keep-committer] [--no-verify]
+grit rebase|history rebase … [--check] [-X ours|theirs] [--dry-run] [--exec <cmd>]… [--fork-point] [--no-fork-point] [--update-refs=(branches|head)] [--empty=(drop|keep|abort)] [--keep-committer] [--no-verify]
 ```
 
 ## Description
 
 `grit rebase` replays commits reachable from `HEAD` but not from `<upstream>` onto `<upstream>` (or onto `--onto` when set). It uses the same history engine as [`grit history`](history.md). When every commit replays cleanly, grit writes new commit objects and updates refs in one batch.
+
+During checkout or replay, Ctrl+C (or `SIGTERM` / `SIGHUP` on Unix) stops with `error: operation cancelled` and exit code **130**. Partial ref moves and the worktree are rolled back, and no stale `.git/index.lock` is left behind. A second interrupt exits immediately without cleanup.
 
 Before it replays anything, grit runs the `pre-rebase` hook with the upstream as you typed it (`pre-rebase main`), or the configured upstream's full ref name (`pre-rebase refs/remotes/origin/main`) when you omitted it, as Git does. It runs once there is something to replay and before any commit is replayed, so a refusal comes before a replay conflict on every path (`-X` and `--exec` included): not when the branch is already up to date, and not for `--check`, `--dry-run`, `--continue`, `--skip` or `--abort`. When the hook exits non-zero, the rebase stops with exit **1** and a `hook_failed` error, and nothing changes. `--no-verify` skips it.
 
@@ -32,11 +34,13 @@ Rebased 1 commit(s)
 
 When the rebase moves the branch, grit runs the `post-checkout` hook with Git's arguments, `<old tip> <onto> 1`: Git checks out the onto commit before replaying, and the hook names that commit even though grit applies the rebase in one step. This also happens when a rebase stops on conflicts. When the rebase finishes, grit runs `post-rewrite rebase` with one `<old> <new>` line per replayed commit on stdin, oldest first. Dropped commits, commits already upstream, and fast-forwards are not listed, so a fast-forward rebase runs only `post-checkout`. Unlike Git, grit does not run `post-commit` for each replayed commit. Hook exit statuses never change the result. See [`grit hooks`](hooks.md).
 
+When `notes.rewriteRef` is configured, grit copies notes from each replayed commit to its replacement (same rules as Git's `git notes copy --for-rewrite`) before `post-rewrite` runs. See the [notes library guide](../library/notes.md).
+
 A commit whose patch is already upstream (for example one you cherry-picked from the upstream branch) is skipped, as `git rebase` skips it. The commits before and after it are still replayed in order on top of the new base, and a branch that pointed at the skipped commit moves to the replayed commit before it, or to the new base when nothing came before. In the output and the `rewritten` JSON rows, the skipped commit maps to the upstream commit that carries its patch.
 
-When `<upstream>` is omitted, grit uses `@{upstream}` of the current branch. If no upstream is configured, the command fails with a hint to run [`grit branch -u`](branch.md).
+When `<upstream>` is omitted, grit uses `@{upstream}` of the current branch. If no upstream is configured, the command fails with a hint to run [`grit branch -u`](branch.md). On a **detached `HEAD`**, an explicit `<upstream>` is required (same as `git rebase`); omitting it fails with `cannot rebase detached HEAD without an upstream argument`. With implicit upstream on a branch, grit uses the upstream tracking ref's reflog to find where your branch forked (`rebase.forkPoint`, default true), matching `git rebase` with `--fork-point`. An explicit `<upstream>` uses the merge base unless you pass `--fork-point`; `--no-fork-point` disables reflog fork detection even for implicit upstream.
 
-When replay stops on conflicts, grit writes Git-compatible `.git/rebase-merge/` state (including `grit-plan`), leaves conflict markers in the worktree, and exits **1**. As with [`grit pick`](pick.md) (and `git rebase`), the incoming `>>>>>>>` marker names the commit being replayed as `<abbrev> (<subject>)`, so each stop shows which commit it came from; the current side is `HEAD`. The branch tip recorded in `orig-head` is unchanged until you `--continue`, `--skip`, or `--abort`. Resume with the same conflict model as [`grit pick`](pick.md) and [`grit revert`](revert.md): inspect (`grit diff`), resolve, then either stage and `grit rebase --continue` (`grit add` + `--continue`) or record the resolution with [`grit commit`](commit.md) (auto-staging applies) and run `grit rebase --continue` to replay only the remaining commits. Use `--skip` / `--abort` to drop the stopped pick or restore the branch. [`grit pull --rebase`](pull.md) stops the same way.
+When replay stops on conflicts, grit writes Git-compatible `.git/rebase-merge/` state (including `grit-plan`), leaves conflict markers in the worktree, and exits **1**. As with [`grit pick`](pick.md) (and `git rebase`), the incoming `>>>>>>>` marker names the commit being replayed as `<abbrev> (<subject>)`, so each stop shows which commit it came from; the current side is `HEAD`. The branch tip recorded in `orig-head` is unchanged until you `--continue`, `--skip`, or `--abort`. While stopped (and after `--abort` re-attaches the branch), grit appends `HEAD` reflog entries for each detach and reattach so `HEAD@{0}` always matches the current `HEAD` and `HEAD@{n}` recovery stays consistent. Resume with the same conflict model as [`grit pick`](pick.md) and [`grit revert`](revert.md): inspect (`grit diff`), resolve, then either stage and `grit rebase --continue` (`grit add` + `--continue`) or record the resolution with [`grit commit`](commit.md) (auto-staging applies) and run `grit rebase --continue` to replay only the remaining commits. Use `--skip` / `--abort` to drop the stopped pick or restore `orig-head` (the checked-out branch, or detached `HEAD` when the rebase started detached). [`grit pull --rebase`](pull.md) stops the same way.
 
 When the replayed range contains merge commits (the default, unlike `git pull --rebase`), grit keeps merge topology like `git rebase --rebase-merges`: the first-parent chain from your branch tip is replayed onto the new base; a side branch that forked at the rebase boundary is replayed onto the new base, while one that forked inside the range follows its rewritten parent until mapping moves it, and resolving a conflict on a merge commit with `--continue` keeps every parent (the current `HEAD` as the first parent, mapped originals for the rest). Merged-in files and refs on side branches are not dropped silently.
 
@@ -96,8 +100,10 @@ anywhere else (switching branches, resetting the commit away) fails the rebase: 
 restores `HEAD`, the index, and the worktree without moving refs, and the commits the
 command made stay in the object database.
 
-If a later commit no longer applies on top of an amended one, replay stops with
-`result: "conflicts"` and conflict markers, like any rebase conflict, without
+If the first replayed commit conflicts before any `--exec` command runs, grit stops the same
+way as a plain rebase: conflict markers, `rebase-merge/grit-plan`, and the branch ref left at
+its pre-rebase tip. If a later commit no longer applies on top of an amended one, replay
+stops with `result: "conflicts"` and conflict markers, like any rebase conflict, without
 undoing the commits already rewritten. Resolve and stage the paths, then run
 `grit rebase --continue` (the exec commands run at the resolved commit), or use
 `--skip` to drop that commit (its exec commands still run, at the current `HEAD`, as
@@ -177,7 +183,7 @@ the moved tip and `new` the restored one. An abort of an unmoved branch has no `
 | `<upstream>` | Exclude commits reachable from this revision (default: `@{upstream}`). |
 | `--onto` | Replay onto this revision instead of `<upstream>`. |
 | `--continue` | Finish the current conflict resolution (including a replay conflict after an amending exec), or resume exec after saving its edits. |
-| `--abort` | Cancel the rebase and restore the branch to `orig-head`, even if something moved it during the stop (the overwritten tip is reported). Also cancels a rebase that `git` started. |
+| `--abort` | Cancel the rebase and restore the branch or detached `HEAD` to `orig-head`, even if something moved it during the stop (the overwritten tip is reported). Also cancels a rebase that `git` started. |
 | `--skip` | Skip a conflicted commit, or remaining exec commands at an exec stop (save edits first). |
 | `--dry-run` | List ref updates without moving refs (no session). |
 | `--update-refs` | `branches` (default: the checked-out branch and every stacked branch on or above the replayed commits, but not other branches at the `HEAD` commit) or `head`. |
@@ -185,6 +191,8 @@ the moved tip and `new` the restored one. An abort of an unmoved branch has no `
 | `--keep-committer` | Preserve committer ident and timestamp on replayed commits. |
 | `--exec` | After each replayed commit is checked out, run `CMD` via `sh -c` in the worktree (repeatable; runs in order at every commit). Requires a clean index and worktree. Incompatible with `--dry-run`, `--check`, and `-X`. Command output goes to stderr. On nonzero command exit, grit restores `HEAD`, the index, and the worktree without moving refs; exit code is the command's exit code. A successful command may amend the replayed commit or add commits on top of it; later commits are replayed onto the result. A successful command that leaves tracked edits stops with `exec_dirty` and preserves them for recovery. |
 | `--check` | Predict success or conflicts without changing refs, index, or worktree (conflicts with `--dry-run`). |
+| `--fork-point` | Use the upstream reflog to find where the branch forked (on by default when `<upstream>` is omitted). |
+| `--no-fork-point` | Use the merge base with `<upstream>` instead of the reflog fork point. |
 | `-X ours\|theirs` | Auto-resolve replay conflicts in favor of the onto side (`ours`) or replayed commits (`theirs`). |
 | `--no-verify` | Skip the `pre-rebase` hook. |
 
@@ -226,6 +234,7 @@ Pass `--json` on `grit rebase` or `grit history rebase`:
 | `command` | string | Successful command that left edits, for `exec_dirty`. |
 | `paths` | array of strings | Changed tracked paths at an exec stop. |
 | `conflicts` | array | `{path,kind,summary?}` when `result` is `conflicts`; `kind` is a [conflict kind](../status/#conflict-kinds). |
+| `rerere` | array | Rerere events when `rerere.enabled` is active at a conflict stop (`path`, `kind` as for [`grit merge`](../merge/#json-output)). Omitted when empty. |
 | `next_steps` | array | Ordered `grit` commands after a stop. |
 | `alternatives` | array | `grit rebase --abort` and `grit rebase --skip` when paused. |
 

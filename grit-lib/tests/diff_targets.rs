@@ -1,10 +1,11 @@
 //! Git compatibility tests for diff target selection and `Diff::files`.
 
 use grit_lib::config::environment::RepositoryOptions;
-use grit_lib::diff::{resolve_diff_arguments, DiffTarget, ResolveDiffArgumentsError};
+use grit_lib::diff::{DiffRequest, DiffTarget, ResolveDiffArgumentsError};
 use grit_lib::objects::FileMode;
 use grit_lib::objects::ObjectId;
 use grit_lib::repo::Repository;
+use grit_lib::worktree::pathspec::{Pathspec, PathspecGlobalFlags};
 use grit_test_support::git;
 use tempfile::TempDir;
 
@@ -40,9 +41,22 @@ fn resolve_diff_default_target_is_worktree_vs_head() {
     let repo = open_repo(dir.path());
     std::fs::write(dir.path().join("a.txt"), "y\n").expect("write");
 
-    let args = resolve_diff_arguments(&repo, None, false, false, None, &[], &[]).expect("resolve");
+    let args = repo
+        .diff()
+        .resolve_request(
+            None,
+            &DiffRequest {
+                staged: false,
+                unstaged: false,
+                against: None,
+                positionals: (&[]).to_vec(),
+                paths: (&[]).to_vec(),
+                ..DiffRequest::default()
+            },
+        )
+        .expect("resolve");
     assert_eq!(args.target, DiffTarget::WorktreeVsHead);
-    assert!(args.pathspecs.is_empty());
+    assert!(args.pathspec.is_empty());
 }
 
 #[test]
@@ -50,7 +64,20 @@ fn resolve_diff_staged_and_unstaged_conflict() {
     let dir = TempDir::new().expect("tempdir");
     init_repo(dir.path());
     let repo = open_repo(dir.path());
-    let err = resolve_diff_arguments(&repo, None, true, true, None, &[], &[]).unwrap_err();
+    let err = repo
+        .diff()
+        .resolve_request(
+            None,
+            &DiffRequest {
+                staged: true,
+                unstaged: true,
+                against: None,
+                positionals: (&[]).to_vec(),
+                paths: (&[]).to_vec(),
+                ..DiffRequest::default()
+            },
+        )
+        .unwrap_err();
     assert!(matches!(err, ResolveDiffArgumentsError::StagedAndUnstaged));
 }
 
@@ -66,10 +93,23 @@ fn files_staged_matches_git_name_only() {
     let repo = open_repo(dir.path());
     let mut opts = grit_lib::diff::DiffOptions::default();
     opts.word_level_inline = false;
-    let args = resolve_diff_arguments(&repo, None, true, false, None, &[], &[]).expect("resolve");
+    let args = repo
+        .diff()
+        .resolve_request(
+            None,
+            &DiffRequest {
+                staged: true,
+                unstaged: false,
+                against: None,
+                positionals: (&[]).to_vec(),
+                paths: (&[]).to_vec(),
+                ..DiffRequest::default()
+            },
+        )
+        .expect("resolve");
     let files = repo
         .diff()
-        .files(&args.target, &args.pathspecs, &opts)
+        .files(&args.target, &args.pathspec, &opts)
         .expect("files");
     let grit_paths: Vec<_> = files.iter().map(|f| f.path.as_str()).collect();
 
@@ -98,7 +138,8 @@ fn files_commit_range_matches_git_name_only() {
         old: Some(base),
         new: tip,
     };
-    let files = repo.diff().files(&target, &[], &opts).expect("files");
+    let empty = Pathspec::entire_tree(PathspecGlobalFlags::default());
+    let files = repo.diff().files(&target, &empty, &opts).expect("files");
     let mut grit_paths: Vec<_> = files.iter().map(|f| f.path.clone()).collect();
     grit_paths.sort();
 
@@ -122,7 +163,12 @@ fn grit_files(
 ) -> Vec<grit_lib::diff::FileDiff> {
     let mut opts = grit_lib::diff::DiffOptions::default();
     opts.word_level_inline = false;
-    repo.diff().files(&target, pathspecs, &opts).expect("files")
+    let ps = if pathspecs.is_empty() {
+        Pathspec::entire_tree(PathspecGlobalFlags::default())
+    } else {
+        Pathspec::scoped(pathspecs.clone(), PathspecGlobalFlags::default())
+    };
+    repo.diff().files(&target, &ps, &opts).expect("files")
 }
 
 fn git_raw(repo: &std::path::Path, args: &[&str]) -> Vec<String> {
@@ -264,16 +310,20 @@ fn triple_dot_uses_merge_base_like_git() {
     let main_tip = commit_all(dir.path(), "main");
 
     let repo = open_repo(dir.path());
-    let args = resolve_diff_arguments(
-        &repo,
-        None,
-        false,
-        false,
-        None,
-        &["main...topic".into()],
-        &[],
-    )
-    .expect("resolve");
+    let args = repo
+        .diff()
+        .resolve_request(
+            None,
+            &DiffRequest {
+                staged: false,
+                unstaged: false,
+                against: None,
+                positionals: (&["main...topic".into()]).to_vec(),
+                paths: (&[]).to_vec(),
+                ..DiffRequest::default()
+            },
+        )
+        .expect("resolve");
     let grit = grit_raw(&repo, args.target);
     let git = git_raw(
         dir.path(),
@@ -319,16 +369,20 @@ fn resolve_diff_arguments_too_many_revisions() {
     std::fs::write(dir.path().join("f.txt"), "c\n").expect("write");
     commit_all(dir.path(), "c");
     let repo = open_repo(dir.path());
-    let err = resolve_diff_arguments(
-        &repo,
-        None,
-        false,
-        false,
-        None,
-        &["HEAD~2".into(), "HEAD~1".into(), "HEAD".into()],
-        &[],
-    )
-    .unwrap_err();
+    let err = repo
+        .diff()
+        .resolve_request(
+            None,
+            &DiffRequest {
+                staged: false,
+                unstaged: false,
+                against: None,
+                positionals: (&["HEAD~2".into(), "HEAD~1".into(), "HEAD".into()]).to_vec(),
+                paths: (&[]).to_vec(),
+                ..DiffRequest::default()
+            },
+        )
+        .unwrap_err();
     assert!(matches!(err, ResolveDiffArgumentsError::TooManyRevisions));
 }
 
@@ -343,9 +397,14 @@ fn worktree_vs_head_one_row_per_path_with_stale_cache_tree() {
     std::fs::write(dir.path().join("f.txt"), "worktree\n").expect("write");
 
     let repo = open_repo(dir.path());
-    let mut index = repo.index_handle().load().expect("index");
+    let mut index = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("index");
     index.invalidate_cache_tree_for_path(b"f.txt");
-    repo.index_handle().write(&mut index).expect("write index");
+    repo.index()
+        .write(&mut index, &grit_lib::index::IndexWriteOptions::default())
+        .expect("write index");
 
     let files = grit_files(&repo, DiffTarget::WorktreeVsHead, &[]);
     let grit_paths: Vec<_> = files.iter().map(|f| f.path.as_str()).collect();
@@ -390,16 +449,20 @@ fn resolve_diff_arguments_against_with_commits() {
     let dir = TempDir::new().expect("tempdir");
     init_repo(dir.path());
     let repo = open_repo(dir.path());
-    let err = resolve_diff_arguments(
-        &repo,
-        None,
-        false,
-        false,
-        Some("HEAD"),
-        &["HEAD~1".into()],
-        &[],
-    )
-    .unwrap_err();
+    let err = repo
+        .diff()
+        .resolve_request(
+            None,
+            &DiffRequest {
+                staged: false,
+                unstaged: false,
+                against: Some("HEAD").map(str::to_owned),
+                positionals: (&["HEAD~1".into()]).to_vec(),
+                paths: (&[]).to_vec(),
+                ..DiffRequest::default()
+            },
+        )
+        .unwrap_err();
     assert!(matches!(err, ResolveDiffArgumentsError::AgainstWithCommits));
 }
 

@@ -1,7 +1,8 @@
 //! Repository maintenance: repack, fsck, and garbage collection orchestration.
 //!
-//! These APIs wrap existing pack, prune, and fsck primitives for embedders and the
-//! `grit` CLI. They never shell out to the system `git` binary.
+//! Every operation runs through [`Repository::maintenance`], which returns a
+//! [`Maintenance`] handle; this module holds its options and result types. Nothing here
+//! shells out to the system `git` binary.
 //!
 //! Library guide: [maintenance](https://grit-scm.com/docs/library/maintenance)
 //!
@@ -9,11 +10,14 @@
 //! use grit_lib::repo::{InitOptions, Repository};
 //! # fn main() -> grit_lib::error::Result<()> {
 //! let dir = tempfile::tempdir()?;
-//! let _repo = Repository::init(dir.path(), &InitOptions::default())?;
+//! let (repo, _) = Repository::init(dir.path(), &InitOptions::default())?;
+//! // A fresh repository is below every `gc.auto` threshold.
+//! assert!(repo.maintenance().auto_gc_needed()?.is_none());
 //! # Ok(())
 //! # }
 //! ```
 
+use crate::error::ObjectError;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
@@ -24,8 +28,8 @@ use crate::alternate_boundary::AlternateSources;
 use crate::commit_graph_file::CommitGraphChain;
 use crate::commit_graph_write::{
     atomic_replace_commit_graph, build_commit_graph_bytes_from_oid_maps,
-    collect_reachable_commit_oids_for_repository, load_commit_graph_commit_info,
-    remove_commit_graph_chain_dir, remove_commit_graph_files, BloomWriteStats,
+    collect_reachable_commit_infos_for_repository, remove_commit_graph_chain_dir,
+    remove_commit_graph_files, BloomWriteStats, CommitGraphCommitInfo,
 };
 use crate::config::{canonical_key, parse_bool, ConfigSet};
 use crate::diff::bloom::BloomFilterSettings;
@@ -34,18 +38,19 @@ use crate::error::{ConfigError, Error, Result};
 use crate::fsck as repo_fsck;
 use crate::gc::{prune_loose_unreachable_with, LazyReachable, PruneStats, S_IFDIR, S_IFMT};
 use crate::git_date::approx::approxidate_careful_at;
-use crate::index_pack::{install_pack_bytes, install_pack_path, IngestPackOptions};
+use crate::index_pack::{
+    install_pack_bytes_with_progress, install_pack_path_with_progress, IngestPackOptions,
+};
 use crate::midx::{
-    clear_pack_midx_state, midx_version_from_config, midx_write_version,
-    write_multi_pack_index_with_options, MidxBitmapWriteOutcome, WriteMultiPackIndexOptions,
-    WriteMultiPackIndexResult,
+    clear_pack_midx_state, midx_version_from_config, midx_write_version, write_multi_pack_index,
+    MidxBitmapWriteOutcome, WriteMultiPackIndexOptions, WriteMultiPackIndexResult,
 };
 use crate::objects::{
-    oid_hash_map, tag_object_line_oid, CommitRef, FileMode, ObjectId, ObjectKind, OidHashSet,
-    TreeRefIter,
+    oid_hash_map, tag_object_line_oid, CommitRef, FileMode, ObjectId, ObjectKind, OidHashMap,
+    OidHashSet, TreeRefIter,
 };
-use crate::odb::Odb;
 use crate::odb::UnreachablePackRetention;
+use crate::odb::{Odb, PruneTarget};
 use crate::pack_bitmap::{PackBitmapWriteError, PackBitmapWriteOptions, PackBitmapWriter};
 use crate::pack_delta::{pack_delta_search_parallel_options, pack_write_parallel_options};
 use crate::pack_name_hash::pack_name_hash_child;
@@ -54,29 +59,35 @@ use crate::pack_object_select::{
 };
 use crate::pack_objects::{PackBuildOptions, SerializedDeltaPack};
 use crate::pack_rev::write_pack_rev_sidecar_for_index_path;
+use crate::progress::{poll_cancel, CancelToken, ProgressSink};
 use crate::prune_packed::{prune_packed_objects, PrunePackedOptions};
 use crate::reflog::{
     expire_reflog_git_with_cache, load_gc_reflog_expire_config, reflog_refs_on_store,
     ReflogExpireParams, ReflogExpiryCache,
 };
 use crate::repack_pack::{write_repack_pack, RepackPackSettings};
+use crate::repo::error::FilesOnlyOperation;
 use crate::repo::Repository;
+use crate::repo::RepositoryError;
 use crate::shallow::load_shallow_boundaries;
 use time::OffsetDateTime;
 
 mod drop_blobs;
+mod handle;
+
+pub use handle::Maintenance;
 
 pub use crate::offload::{
-    offload_blobs, LopReadiness, OffloadConfigChange, OffloadError, OffloadOptions, OffloadPack,
-    OffloadPackRole, OffloadRepo, OffloadReport, LOP_GIT_DIR_KEY, LOP_KEEP_MESSAGE,
+    LopReadiness, OffloadConfigChange, OffloadError, OffloadOptions, OffloadPack, OffloadPackRole,
+    OffloadRepo, OffloadReport, LOP_GIT_DIR_KEY, LOP_KEEP_MESSAGE,
 };
 pub use drop_blobs::{
-    drop_large_blobs_enabled, drop_promised_blobs, DropExpiry, DropPromisedBlobsOptions,
-    DropPromisedBlobsReport, DropPromisedBlobsSkip, DroppedBlob, KeptBlobCounts,
-    DEFAULT_DROP_EXPIRE, DEFAULT_DROP_MIN_SIZE, DROP_LARGE_BLOBS_TASK,
+    drop_large_blobs_enabled, DropExpiry, DropPromisedBlobsOptions, DropPromisedBlobsReport,
+    DropPromisedBlobsSkip, DroppedBlob, KeptBlobCounts, DEFAULT_DROP_EXPIRE, DEFAULT_DROP_MIN_SIZE,
+    DROP_LARGE_BLOBS_TASK,
 };
 
-/// Options for [`repack_all()`].
+/// Options for [`Maintenance::repack_all`](crate::maintenance::Maintenance::repack_all).
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct RepackOptions {
@@ -114,9 +125,9 @@ pub struct RepackOptions {
     /// written via a multi-pack-index sidecar instead of a per-pack `.bitmap` on the new pack alone.
     /// Bitmaps are omitted when known promises prevent a complete closure.
     pub incremental: bool,
-    /// When true, [`gc()`] may skip repack on a single pack with no loose objects when every
+    /// When true, [`Maintenance::gc`](crate::maintenance::Maintenance::gc) may skip repack on a single pack with no loose objects when every
     /// packed object is still reachable and none would be dropped by the active prune policy.
-    /// Explicit [`repack_all`] / [`repack`] leave this false so maintenance still runs.
+    /// Explicit [`Maintenance::repack_all`](crate::maintenance::Maintenance::repack_all) / [`Maintenance::repack`](crate::maintenance::Maintenance::repack) leave this false so maintenance still runs.
     pub auto_skip: bool,
     /// When true, recompute every delta instead of keeping the ones stored in packs
     /// (`git repack -f`, `grit repack --force`). Whole objects that stay whole are
@@ -164,7 +175,7 @@ struct RepackDetail {
     unreachable_prune_ran: bool,
 }
 
-/// Counters produced by [`repack`].
+/// Counters produced by [`Maintenance::repack`](crate::maintenance::Maintenance::repack).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct RepackReport {
@@ -178,7 +189,7 @@ pub struct RepackReport {
     pub objects: usize,
 }
 
-/// Extended counters and paths produced by [`repack_all`].
+/// Extended counters and paths produced by [`Maintenance::repack_all`](crate::maintenance::Maintenance::repack_all).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct RepackStats {
@@ -208,7 +219,7 @@ pub struct RepackStats {
     pub unreachable_prune_ran: bool,
 }
 
-/// Options for [`Repository::write_commit_graph`].
+/// Options for [`Maintenance::write_commit_graph`](crate::maintenance::Maintenance::write_commit_graph).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct CommitGraphOptions {
@@ -255,7 +266,7 @@ pub struct CommitGraphWriteReport {
     pub skipped: Option<CommitGraphSkipReason>,
 }
 
-/// Why [`write_commit_graph`] wrote no graph.
+/// Why [`Maintenance::write_commit_graph`](crate::maintenance::Maintenance::write_commit_graph) wrote no graph.
 ///
 /// A commit-graph stores each commit's parents as recorded in the commit object. When the
 /// repository overrides those parents, a graph would disagree with what Git sees: Git
@@ -313,7 +324,7 @@ impl CommitGraphSkipReason {
     }
 }
 
-/// Options for [`Repository::write_midx`].
+/// Options for [`Maintenance::write_midx`](crate::maintenance::Maintenance::write_midx).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct MidxOptions {
@@ -401,7 +412,7 @@ pub struct PackRefsReport {
     pub refs_pruned: usize,
 }
 
-/// Options for [`gc()`].
+/// Options for [`Maintenance::gc`](crate::maintenance::Maintenance::gc).
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct GcOptions {
@@ -419,7 +430,7 @@ pub struct GcOptions {
     /// added otherwise, matching `git gc`.
     pub write_commit_graph: bool,
     /// When true (the default), run the drop-large-blobs phase after repack if
-    /// `maintenance.drop-large-blobs.enabled` is set (see [`drop_promised_blobs`]).
+    /// `maintenance.drop-large-blobs.enabled` is set (see [`Maintenance::drop_promised_blobs`](crate::maintenance::Maintenance::drop_promised_blobs)).
     /// False never runs it. The phase takes its recency cutoff from
     /// [`Self::now_unix`] and is skipped ([`DropPromisedBlobsSkip::NoCurrentTime`])
     /// when that is 0.
@@ -499,6 +510,27 @@ impl PruneOptions {
             ..Self::default()
         }
     }
+
+    /// Measure a relative `gc.pruneExpire` from `now` instead of the current time.
+    #[must_use]
+    pub fn with_now(mut self, now: OffsetDateTime) -> Self {
+        self.now = Some(now);
+        self
+    }
+}
+
+/// Fail with [`RepositoryError::PreciousObjectsRepository`] naming `operation` when
+/// `extensions.preciousObjects` is set, since `operation` would delete objects.
+pub(crate) fn refuse_precious_objects(repo: &Repository, operation: &'static str) -> Result<()> {
+    if precious_objects(&*repo.config().snapshot()?) {
+        return Err(RepositoryError::PreciousObjectsRepository { operation }.into());
+    }
+    Ok(())
+}
+
+/// Whether `extensions.preciousObjects` forbids deleting objects.
+fn precious_objects(config: &ConfigSet) -> bool {
+    config.bool_with_default("extensions.preciousobjects", false)
 }
 
 /// Object ids that must stay reachable during repack, prune, and fsck walks.
@@ -509,7 +541,7 @@ impl PruneOptions {
 /// # Errors
 ///
 /// Propagates ref, reflog, or index load failures.
-pub fn collect_maintenance_object_roots(repo: &Repository) -> Result<Vec<ObjectId>> {
+pub(crate) fn collect_maintenance_object_roots(repo: &Repository) -> Result<Vec<ObjectId>> {
     repo_fsck::reachability_roots(repo)
 }
 
@@ -522,7 +554,7 @@ pub(crate) fn bloom_settings_for_commit_graph_write(
         return bloom;
     }
     if let Some(v) = config
-        .get("commitgraph.changedpathsversion")
+        .value("commitgraph.changedpathsversion")
         .and_then(|s| s.trim().parse::<i32>().ok())
     {
         if v == 2 {
@@ -548,13 +580,13 @@ fn existing_commit_graph_has_changed_paths(repo: &Repository) -> bool {
 
 pub(crate) fn commit_graph_writes_generation_data(config: &ConfigSet) -> bool {
     config
-        .get("commitgraph.generationversion")
+        .value("commitgraph.generationversion")
         .and_then(|s| s.trim().parse::<i32>().ok())
         .map(|v| v >= 2)
         .unwrap_or(true)
 }
 
-/// A commit-graph file built in memory by [`build_commit_graph`].
+/// A commit-graph file built in memory by [`Maintenance::build_commit_graph`](crate::maintenance::Maintenance::build_commit_graph).
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct BuiltCommitGraph {
@@ -572,14 +604,14 @@ impl BuiltCommitGraph {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::CorruptObject`] if the bytes fail verification (see
+    /// Returns [`crate::error::ObjectError::Corrupt`] if the bytes fail verification (see
     /// [`CommitGraphChain::from_bytes`]).
     pub fn to_chain(&self) -> Result<CommitGraphChain> {
         CommitGraphChain::from_bytes(self.bytes.clone())
     }
 }
 
-/// Outcome of [`build_commit_graph`].
+/// Outcome of [`Maintenance::build_commit_graph`](crate::maintenance::Maintenance::build_commit_graph).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommitGraphBuild {
     /// The graph of every commit reachable from the repository's refs.
@@ -590,13 +622,13 @@ pub enum CommitGraphBuild {
 
 /// Build a reachable commit-graph in memory, for any object store.
 ///
-/// Reachable commits are discovered from [`Repository::refs`](crate::repo::Repository::refs)
+/// Reachable commits are discovered from [`Repository::ref_store`](crate::repo::Repository::ref_store)
 /// and read through [`Repository::odb`](crate::repo::Repository::odb), so this works for a
-/// custom primary ([`crate::odb::OdbBuilder::primary`]) as well as the files backend. Nothing is
+/// custom primary ([`crate::environment::RepositoryOptions::with_object_store`]) as well as the files backend. Nothing is
 /// written: a custom store persists [`BuiltCommitGraph::bytes`] in its own storage and attaches
 /// the graph when it next opens the repository, with
 /// [`OdbBuilder::commit_graph`](crate::odb::OdbBuilder::commit_graph) and
-/// [`CommitGraphChain::from_bytes`]. For a files-backed repository [`write_commit_graph`] builds
+/// [`CommitGraphChain::from_bytes`]. For a files-backed repository [`Maintenance::write_commit_graph`](crate::maintenance::Maintenance::write_commit_graph) builds
 /// the same bytes and installs them under `objects/info/`.
 ///
 /// With [`CommitGraphOptions::changed_paths`], changed-path Bloom filters are added, reusing
@@ -609,7 +641,7 @@ pub enum CommitGraphBuild {
 /// # Errors
 ///
 /// Propagates ref, object read and config errors.
-pub fn build_commit_graph(
+pub(crate) fn build_commit_graph(
     repo: &Repository,
     opts: &CommitGraphOptions,
 ) -> Result<CommitGraphBuild> {
@@ -618,38 +650,34 @@ pub fn build_commit_graph(
     }
     let odb = repo.odb();
     let existing = odb.commit_graph_chain();
-    let commits = collect_reachable_commit_oids_for_repository(repo)?;
+    let commits = collect_reachable_commit_infos_for_repository(repo)?;
     build_commit_graph_for_commits(
         odb,
-        commits,
-        &*repo.config()?,
+        &commits,
+        &*repo.config().snapshot()?,
         opts.changed_paths,
         existing.as_deref(),
     )
     .map(CommitGraphBuild::Built)
 }
 
-/// Encode a commit-graph of `commits`, read through `odb`.
+/// Encode a commit-graph of the commits in `infos` (as collected by
+/// [`collect_reachable_commit_infos_for_repository`]); `odb` serves the trees Bloom filters diff.
 ///
 /// Bloom filters and generation data follow `config` (`commitGraph.changedPathsVersion`,
 /// `commitGraph.generationVersion`); with `changed_paths`, filters already in `existing` are
 /// reused where their settings match.
 pub(crate) fn build_commit_graph_for_commits(
     odb: &Odb,
-    commits: impl IntoIterator<Item = ObjectId>,
+    infos: &OidHashMap<CommitGraphCommitInfo>,
     config: &ConfigSet,
     changed_paths: bool,
     existing: Option<&CommitGraphChain>,
 ) -> Result<BuiltCommitGraph> {
     let bloom = bloom_settings_for_commit_graph_write(config, changed_paths);
     let write_generation = commit_graph_writes_generation_data(config);
-    let mut sorted: Vec<ObjectId> = commits.into_iter().collect();
+    let mut sorted: Vec<ObjectId> = infos.keys().copied().collect();
     sorted.sort_unstable();
-
-    let mut infos = oid_hash_map();
-    for oid in &sorted {
-        infos.insert(*oid, load_commit_graph_commit_info(odb, *oid)?);
-    }
 
     let mut existing_filters = oid_hash_map();
     let mut upgraded_filters = oid_hash_map();
@@ -665,7 +693,7 @@ pub(crate) fn build_commit_graph_for_commits(
 
     let (bytes, bloom_stats) = build_commit_graph_bytes_from_oid_maps(
         &sorted,
-        &infos,
+        infos,
         odb,
         changed_paths,
         &bloom,
@@ -685,8 +713,11 @@ pub(crate) fn build_commit_graph_for_commits(
 
 /// Write a monolithic reachable commit-graph under `objects/info/commit-graph`.
 ///
-/// Reachable commits are discovered from [`Repository::refs`](crate::repo::Repository::refs)
+/// Reachable commits are discovered from [`Repository::ref_store`](crate::repo::Repository::ref_store)
 /// (reftable, packed-refs, and linked-worktree visibility), not by scanning `git_dir/refs` alone.
+///
+/// When there are no reachable commits, nothing is written (matching `git commit-graph write`).
+/// An existing graph is left in place.
 ///
 /// In a shallow repository, with `info/grafts`, or with enabled replace refs, nothing is
 /// written and [`CommitGraphWriteReport::skipped`] says why (see [`CommitGraphSkipReason`]).
@@ -695,22 +726,23 @@ pub(crate) fn build_commit_graph_for_commits(
 /// [`CommitGraphOptions::dry_run`]).
 ///
 /// Only a files-backed repository has an `objects/info/` directory to install the graph in.
-/// A custom primary builds the same graph with [`build_commit_graph`] and stores it itself.
+/// A custom primary builds the same graph with [`Maintenance::build_commit_graph`](crate::maintenance::Maintenance::build_commit_graph) and stores it itself.
 ///
 /// # Errors
 ///
-/// Returns [`Error::UnsupportedObjectStore`] for non-files ODB backends, or errors from graph
+/// Returns [`RepositoryError::UnsupportedObjectStore`] for non-files ODB backends, or errors from graph
 /// generation and atomic I/O.
-pub fn write_commit_graph(
+pub(crate) fn write_commit_graph(
     repo: &Repository,
     opts: &CommitGraphOptions,
 ) -> Result<CommitGraphWriteReport> {
     let odb = repo.odb();
-    odb.require_files_primary("commit-graph write")?;
+    odb.primary_store()
+        .require_files_primary(FilesOnlyOperation::CommitGraphWrite)?;
     let objects_dir = odb
         .files_objects_dir()
-        .ok_or(Error::UnsupportedObjectStore {
-            operation: "commit-graph write",
+        .ok_or(RepositoryError::UnsupportedObjectStore {
+            operation: FilesOnlyOperation::CommitGraphWrite,
         })?;
     let path = objects_dir.join("info").join("commit-graph");
 
@@ -731,7 +763,7 @@ pub fn write_commit_graph(
         });
     }
 
-    let commits = collect_reachable_commit_oids_for_repository(repo)?;
+    let commits = collect_reachable_commit_infos_for_repository(repo)?;
     if opts.dry_run {
         return Ok(CommitGraphWriteReport {
             path,
@@ -741,12 +773,21 @@ pub fn write_commit_graph(
             skipped: None,
         });
     }
+    if commits.is_empty() {
+        return Ok(CommitGraphWriteReport {
+            path,
+            commit_count: 0,
+            removed_chain: false,
+            bloom_stats: None,
+            skipped: None,
+        });
+    }
 
     let existing = CommitGraphChain::try_load(objects_dir).ok().flatten();
     let built = build_commit_graph_for_commits(
         odb,
-        commits,
-        &*repo.config()?,
+        &commits,
+        &*repo.config().snapshot()?,
         opts.changed_paths,
         existing.as_ref(),
     )?;
@@ -770,21 +811,22 @@ pub fn write_commit_graph(
 ///
 /// # Errors
 ///
-/// Returns [`Error::UnsupportedObjectStore`] for non-files backends, [`Error::Config`] when
+/// Returns [`RepositoryError::UnsupportedObjectStore`] for non-files backends, [`Error::Config`] when
 /// `midx.version` is not an integer, [`crate::error::MidxError::UnknownWriteVersion`] (as
-/// [`Error::Midx`]) when the version is not `1` or `2`, or MIDX write failures.
-pub fn write_midx(repo: &Repository, opts: &MidxOptions) -> Result<MidxWriteReport> {
+/// [`crate::error::ObjectError::Midx`]) when the version is not `1` or `2`, or MIDX write failures.
+pub(crate) fn write_midx(repo: &Repository, opts: &MidxOptions) -> Result<MidxWriteReport> {
     let odb = repo.odb();
-    odb.require_files_primary("midx write")?;
+    odb.primary_store()
+        .require_files_primary(FilesOnlyOperation::MidxWrite)?;
     let requested = match opts.version {
         Some(v) => Some(v),
-        None => midx_version_from_config(&*repo.config()?)?,
+        None => midx_version_from_config(&*repo.config().snapshot()?)?,
     };
     let version = Some(midx_write_version(requested)?);
     let objects_dir = odb
         .files_objects_dir()
-        .ok_or(Error::UnsupportedObjectStore {
-            operation: "midx write",
+        .ok_or(RepositoryError::UnsupportedObjectStore {
+            operation: FilesOnlyOperation::MidxWrite,
         })?;
     let pack_dir = objects_dir.join("pack");
     let pack_count = fs::read_dir(&pack_dir)
@@ -809,8 +851,7 @@ pub fn write_midx(repo: &Repository, opts: &MidxOptions) -> Result<MidxWriteRepo
         version,
         ..WriteMultiPackIndexOptions::default()
     };
-    let WriteMultiPackIndexResult { bitmap } =
-        write_multi_pack_index_with_options(&pack_dir, &write_opts)?;
+    let WriteMultiPackIndexResult { bitmap } = write_multi_pack_index(&pack_dir, &write_opts)?;
     Ok(MidxWriteReport {
         path,
         pack_count,
@@ -818,7 +859,7 @@ pub fn write_midx(repo: &Repository, opts: &MidxOptions) -> Result<MidxWriteRepo
     })
 }
 
-/// Options for [`prune_loose_objects`].
+/// Options for [`Maintenance::prune_loose_objects`](crate::maintenance::Maintenance::prune_loose_objects).
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct PruneOptions {
@@ -828,13 +869,16 @@ pub struct PruneOptions {
     pub older_than: Option<SystemTime>,
     /// Report without deleting objects.
     pub dry_run: bool,
+    /// Wall clock a relative `gc.pruneExpire` (`2.weeks.ago`) is measured from; `None`
+    /// uses the current time. Ignored when [`Self::older_than`] is set.
+    pub now: Option<OffsetDateTime>,
 }
 
-/// Wall-clock milliseconds for each phase of [`gc`].
+/// Wall-clock milliseconds for each phase of [`Maintenance::gc`](crate::maintenance::Maintenance::gc).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct GcPhaseTimings {
-    /// [`pack_refs`] when run as part of gc.
+    /// [`Maintenance::pack_refs`](crate::maintenance::Maintenance::pack_refs) when run as part of gc.
     pub pack_refs_ms: u64,
     /// Reflog expiry before repack.
     pub reflog_ms: u64,
@@ -848,7 +892,7 @@ pub struct GcPhaseTimings {
     pub drop_large_blobs_ms: u64,
 }
 
-/// Result of [`gc`].
+/// Result of [`Maintenance::gc`](crate::maintenance::Maintenance::gc).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GcStats {
     /// Loose refs packed during gc (`None` when skipped).
@@ -871,9 +915,123 @@ pub struct GcStats {
     pub phase_timings: GcPhaseTimings,
 }
 
+/// One maintenance phase from a full [`Maintenance::gc`](crate::maintenance::Maintenance::gc) run.
+///
+/// Paths are repository-relative filesystem locations; callers format them for display.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum GcPhaseReport {
+    /// Loose refs packed into `packed-refs` or a reftable directory.
+    PackRefs {
+        /// Wall time for the pack-refs phase.
+        duration_ms: u64,
+        /// Loose refs merged into the packed store.
+        refs_packed: usize,
+        /// Loose ref files removed or tables merged.
+        refs_pruned: usize,
+        /// `packed-refs` path or the `reftable/` directory.
+        path: PathBuf,
+    },
+    /// Reflog expiry before repack.
+    ReflogExpire {
+        /// Wall time for reflog expiry.
+        duration_ms: u64,
+        /// Reflog lines removed by expiry.
+        entries_pruned: usize,
+    },
+    /// Repack work excluding embedded unreachable prune.
+    Repack {
+        /// Wall time for repack work.
+        duration_ms: u64,
+        /// Counters from the repack phase.
+        stats: RepackStats,
+    },
+    /// Unreachable loose-object prune during full gc.
+    Prune {
+        /// Wall time for unreachable loose-object pruning.
+        duration_ms: u64,
+        /// Loose objects removed.
+        pruned: usize,
+        /// Loose objects kept.
+        kept: usize,
+    },
+    /// Optional drop-large-blobs phase after repack.
+    DropLargeBlobs {
+        /// Wall time for the drop-large-blobs phase.
+        duration_ms: u64,
+        /// Drop phase counters and blob list.
+        report: DropPromisedBlobsReport,
+    },
+    /// Commit-graph write after repack/prune.
+    CommitGraph {
+        /// Wall time for commit-graph generation.
+        duration_ms: u64,
+        /// Commits encoded in the graph (`0` when skipped).
+        commit_count: usize,
+        /// Path to the monolithic commit-graph file.
+        path: PathBuf,
+        /// Whether a split `commit-graphs/` chain was removed.
+        removed_chain: bool,
+        /// Why no graph was written, when applicable.
+        skipped: Option<CommitGraphSkipReason>,
+    },
+}
+
+impl GcStats {
+    /// Ordered phase reports for a full gc run, using [`Self::phase_timings`].
+    #[must_use]
+    pub fn phase_reports(&self) -> Vec<GcPhaseReport> {
+        let timings = self.phase_timings;
+        let mut phases = Vec::new();
+        if let Some(pack) = &self.pack_refs {
+            phases.push(GcPhaseReport::PackRefs {
+                duration_ms: timings.pack_refs_ms,
+                refs_packed: pack.refs_packed,
+                refs_pruned: pack.refs_pruned,
+                path: pack.path.clone(),
+            });
+        }
+        phases.push(GcPhaseReport::ReflogExpire {
+            duration_ms: timings.reflog_ms,
+            entries_pruned: self.reflog_entries_pruned,
+        });
+        phases.push(GcPhaseReport::Repack {
+            duration_ms: timings.repack_ms,
+            stats: self.repack.clone(),
+        });
+        if self.prune_ran {
+            phases.push(GcPhaseReport::Prune {
+                duration_ms: timings.prune_ms,
+                pruned: self.prune.pruned,
+                kept: self.prune.kept,
+            });
+        }
+        if let Some(report) = self
+            .drop_large_blobs
+            .as_ref()
+            .filter(|r| r.skipped != Some(DropPromisedBlobsSkip::Disabled))
+        {
+            phases.push(GcPhaseReport::DropLargeBlobs {
+                duration_ms: timings.drop_large_blobs_ms,
+                report: report.clone(),
+            });
+        }
+        if let Some(graph) = &self.commit_graph {
+            phases.push(GcPhaseReport::CommitGraph {
+                duration_ms: timings.commit_graph_ms,
+                commit_count: graph.commit_count,
+                path: graph.path.clone(),
+                removed_chain: graph.removed_chain,
+                skipped: graph.skipped,
+            });
+        }
+        phases
+    }
+}
+
 /// Repack local objects into a single new pack and drop redundant storage.
 ///
-/// Mirrors a minimal `git repack -ad`: one pack for [`reachability_roots`](crate::fsck::reachability_roots), optional `.rev` /
+/// Mirrors a minimal `git repack -ad`: one pack for [`reachability_roots`](crate::maintenance::Maintenance::reachability_roots), optional `.rev` /
 /// `.bitmap` sidecars, delete other packs, [`prune_packed_objects`], and optional unreachable
 /// loose-object pruning. Existing promisor packs and all their sidecars are retained
 /// separately, as are ordinary packs holding promised objects unavailable in those
@@ -884,17 +1042,29 @@ pub struct GcStats {
 /// # Errors
 ///
 /// Propagates pack build/install failures, unsupported custom ODB backends, and I/O errors.
-pub fn repack(repo: &Repository, opts: &RepackOptions) -> Result<RepackReport> {
-    Ok(repack_detail(repo, opts)?.report)
+pub(crate) fn repack(
+    repo: &Repository,
+    opts: &RepackOptions,
+    progress: &mut dyn ProgressSink,
+    cancel: &CancelToken,
+) -> Result<RepackReport> {
+    Ok(repack_detail(repo, opts, progress, cancel)?.report)
 }
 
-fn repack_detail(repo: &Repository, opts: &RepackOptions) -> Result<RepackDetail> {
+fn repack_detail(
+    repo: &Repository,
+    opts: &RepackOptions,
+    progress: &mut dyn ProgressSink,
+    cancel: &CancelToken,
+) -> Result<RepackDetail> {
+    poll_cancel(progress, cancel)?;
     let odb = repo.odb();
-    odb.require_files_primary("repack")?;
+    odb.primary_store()
+        .require_files_primary(FilesOnlyOperation::Repack)?;
     let objects_dir = odb
         .files_objects_dir()
-        .ok_or(Error::UnsupportedObjectStore {
-            operation: "repack",
+        .ok_or(RepositoryError::UnsupportedObjectStore {
+            operation: FilesOnlyOperation::Repack,
         })?;
     let pack_dir = objects_dir.join("pack");
 
@@ -924,7 +1094,7 @@ fn repack_detail(repo: &Repository, opts: &RepackOptions) -> Result<RepackDetail
     let cfg = opts
         .merged_config
         .clone()
-        .or_else(|| repo.config().ok().map(|c| (*c).clone()));
+        .or_else(|| repo.config().snapshot().ok().map(|c| (*c).clone()));
     let mut pack_opts = opts
         .pack_build
         .unwrap_or_else(|| PackBuildOptions::for_local_copy(cfg.as_ref()));
@@ -963,9 +1133,9 @@ fn repack_detail(repo: &Repository, opts: &RepackOptions) -> Result<RepackDetail
     }
     let promised = reachable.promised()?;
     let partial_clone = !promised.is_empty()
-        || cfg.as_ref().is_some_and(|config| {
-            crate::promisor::repo_treats_promisor_packs(repo.git_dir(), config)
-        });
+        || cfg
+            .as_ref()
+            .is_some_and(crate::promisor::repo_treats_promisor_packs);
     if partial_clone {
         // Validate local reachability without giving the pack enumerator a chance to
         // lazy-fetch genuinely missing local objects in a partial clone.
@@ -1002,6 +1172,7 @@ fn repack_detail(repo: &Repository, opts: &RepackOptions) -> Result<RepackDetail
     } else {
         packs_holding_available_promises(odb, promised)?
     };
+    poll_cancel(progress, cancel)?;
     let built_pack = if run_incremental {
         let (loose, name_hashes) = named_reachable_loose_objects(odb, &reachable, &roots)?;
         write_staged_repack_pack(
@@ -1037,6 +1208,7 @@ fn repack_detail(repo: &Repository, opts: &RepackOptions) -> Result<RepackDetail
     let mut installed_pack = None;
     let pack_trailer_len = 12 + odb.hash_algo().len();
     if pack_bytes_len > pack_trailer_len {
+        poll_cancel(progress, cancel)?;
         clear_pack_midx_state(&pack_dir)?;
 
         let trusted_rows = (!built_pack.index_rows.is_empty()).then_some(built_pack.index_rows);
@@ -1051,20 +1223,34 @@ fn repack_detail(repo: &Repository, opts: &RepackOptions) -> Result<RepackDetail
             ..IngestPackOptions::default()
         };
         let ingested = if let Some(staging) = built_pack.staging_path.as_ref() {
-            install_pack_path(staging, odb, &ingest_opts)?
+            install_pack_path_with_progress(
+                staging,
+                odb,
+                &ingest_opts,
+                Some(&mut *progress),
+                Some(cancel),
+            )?
         } else {
-            install_pack_bytes(built_pack.bytes, odb, &ingest_opts)?
+            install_pack_bytes_with_progress(
+                built_pack.bytes,
+                odb,
+                &ingest_opts,
+                Some(&mut *progress),
+                Some(cancel),
+            )?
         };
         report.packs_written = 1;
         report.objects = ingested.object_ids.len();
-        let pack_path = ingested.pack_path.ok_or(Error::UnsupportedObjectStore {
-            operation: "repack",
-        })?;
+        let pack_path = ingested
+            .pack_path
+            .ok_or(RepositoryError::UnsupportedObjectStore {
+                operation: FilesOnlyOperation::Repack,
+            })?;
 
         let idx_path = pack_path.with_extension("idx");
         if cfg
             .as_ref()
-            .is_none_or(|c| c.pack_write_reverse_index_default(&opts.environment))
+            .is_none_or(|c| c.pack_write_reverse_index_default())
         {
             write_pack_rev_sidecar_for_index_path(&idx_path)?;
         }
@@ -1084,7 +1270,7 @@ fn repack_detail(repo: &Repository, opts: &RepackOptions) -> Result<RepackDetail
                     ..WriteMultiPackIndexOptions::default()
                 };
                 let WriteMultiPackIndexResult { bitmap: _ } =
-                    write_multi_pack_index_with_options(&pack_dir, &midx_opts)?;
+                    write_multi_pack_index(&pack_dir, &midx_opts)?;
             } else {
                 let bitmap_opts = PackBitmapWriteOptions {
                     reachability_roots: Some(roots.clone()),
@@ -1100,7 +1286,11 @@ fn repack_detail(repo: &Repository, opts: &RepackOptions) -> Result<RepackDetail
                         // Pack was built from an earlier root snapshot; live tips moved on
                         // (concurrent receive-pack). Skip the bitmap this run.
                     }
-                    Err(e) => return Err(Error::CorruptObject(e.to_string())),
+                    Err(e) => {
+                        return Err(Error::Object(ObjectError::Corrupt {
+                            detail: e.to_string(),
+                        }))
+                    }
                 }
             }
         }
@@ -1174,13 +1364,19 @@ fn repack_detail(repo: &Repository, opts: &RepackOptions) -> Result<RepackDetail
     })
 }
 
-/// Like [`repack`], with legacy [`RepackStats`] fields for the CLI.
-pub fn repack_all(repo: &Repository, opts: &RepackOptions) -> Result<RepackStats> {
+/// Like [`Maintenance::repack`](crate::maintenance::Maintenance::repack), with detailed [`RepackStats`]; returns [`Error::Cancelled`] before
+/// publishing a new pack.
+pub(crate) fn repack_all(
+    repo: &Repository,
+    opts: &RepackOptions,
+    progress: &mut dyn ProgressSink,
+    cancel: &CancelToken,
+) -> Result<RepackStats> {
     let odb = repo.odb();
     let objects_dir = odb
         .files_objects_dir()
-        .ok_or(Error::UnsupportedObjectStore {
-            operation: "repack",
+        .ok_or(RepositoryError::UnsupportedObjectStore {
+            operation: FilesOnlyOperation::Repack,
         })?;
     let pack_dir = objects_dir.join("pack");
     let mut stats = RepackStats {
@@ -1189,11 +1385,11 @@ pub fn repack_all(repo: &Repository, opts: &RepackOptions) -> Result<RepackStats
         ..RepackStats::default()
     };
     if opts.dry_run {
-        let count = repack_detail(repo, opts)?.report.objects;
+        let count = repack_detail(repo, opts, progress, cancel)?.report.objects;
         stats.objects_packed = (count > 0).then_some(count);
         return Ok(stats);
     }
-    let detail = repack_detail(repo, opts)?;
+    let detail = repack_detail(repo, opts, progress, cancel)?;
     let report = detail.report;
     stats.objects_packed = (report.packs_written > 0).then_some(report.objects);
     stats.removed_pack_files = report.packs_removed;
@@ -1231,16 +1427,6 @@ fn apply_gc_prune_policy_to_repack(repack: &mut RepackOptions, policy: &GcLooseP
     }
 }
 
-fn config_bool_or_error(config: &ConfigSet, key: &str) -> Result<Option<bool>> {
-    match config.get_bool(key) {
-        None => Ok(None),
-        Some(Ok(v)) => Ok(Some(v)),
-        Some(Err(e)) => Err(Error::Config(ConfigError::Other(format!(
-            "bad config value for '{key}': {e}"
-        )))),
-    }
-}
-
 /// Last `repack.writeBitmaps` or `pack.writeBitmaps` entry in load order (Git synonym).
 fn gc_repack_writes_bitmap(repo: &Repository, config: &ConfigSet) -> Result<bool> {
     let repack_key = canonical_key("repack.writeBitmaps").ok();
@@ -1250,35 +1436,27 @@ fn gc_repack_writes_bitmap(repo: &Repository, config: &ConfigSet) -> Result<bool
         let key = entry.key.as_str();
         if repack_key.as_deref() == Some(key) || pack_key.as_deref() == Some(key) {
             let raw = entry.value.as_deref().unwrap_or("true").trim().to_owned();
-            last = Some(parse_bool(&raw).map_err(|_| {
-                Error::Config(ConfigError::Other(format!(
-                    "bad config value '{raw}' for '{key}'"
-                )))
-            })?);
+            last = Some(parse_bool(&raw).map_err(|e| e.for_key(key))?);
         }
     }
     Ok(last.unwrap_or_else(|| repo.work_tree().is_none()))
 }
 
 fn gc_should_pack_refs(repo: &Repository, config: &ConfigSet) -> Result<bool> {
-    let Some(spec) = config.get("gc.packRefs") else {
+    let Some(spec) = config.value("gc.packRefs") else {
         return Ok(true);
     };
     if spec.eq_ignore_ascii_case("notbare") {
         return Ok(repo.work_tree().is_some());
     }
-    parse_bool(&spec).map_err(|e| {
-        Error::Config(ConfigError::Other(format!(
-            "bad config value '{spec}' for 'gc.packRefs': {e}"
-        )))
-    })
+    Ok(parse_bool(&spec).map_err(|e| e.for_key("gc.packRefs"))?)
 }
 
 fn gc_should_write_commit_graph(config: &ConfigSet) -> Result<bool> {
-    if config_bool_or_error(config, "gc.writeCommitGraph")? == Some(false) {
+    if config.get_bool("gc.writeCommitGraph")? == Some(false) {
         return Ok(false);
     }
-    Ok(config_bool_or_error(config, "core.commitGraph")? != Some(false))
+    Ok(config.get_bool("core.commitGraph")? != Some(false))
 }
 
 /// Loose objects reachable from the maintenance roots: what Git's incremental `repack -d`
@@ -1389,7 +1567,7 @@ fn named_reachable_loose_objects(
 
 /// Whether maintenance should skip rebuilding packs when [`RepackOptions::auto_skip`] is set.
 ///
-/// Used by [`gc`]: skip when a single pack already holds all objects and nothing is loose.
+/// Used by [`Maintenance::gc`](crate::maintenance::Maintenance::gc): skip when a single pack already holds all objects and nothing is loose.
 /// Multiple packs never skip (consolidation required), even when `gc.autoPackLimit` is zero.
 fn should_auto_skip_repack(
     loose_objects: usize,
@@ -1459,14 +1637,34 @@ fn skipping_repack_would_retain_prunable_packed_objects(
 
 /// Delete unreachable loose objects using `gc.pruneExpire` or an explicit cutoff.
 ///
+/// Reachability starts from [`collect_maintenance_object_roots`]: refs, reflogs, every
+/// worktree's index and `HEAD`. Also removes stale temporary object paths (interrupted
+/// fetch/repack/index-pack leftovers) under the same expiry rules as Git's `git gc` /
+/// `git prune` temporary-file sweep.
+///
+/// A custom primary that can delete objects
+/// ([`WritableObjectStore::as_prunable`](crate::odb::store::WritableObjectStore::as_prunable))
+/// is pruned through that capability instead: every object it lists is a candidate, and
+/// the grace period uses [`PrunableObjectStore::object_mtime`](crate::odb::store::PrunableObjectStore::object_mtime),
+/// keeping objects whose time the store does not record unless the cutoff is `now`.
+///
 /// # Errors
 ///
-/// Propagates config parse failures, unsupported ODB backends, and I/O errors.
-pub fn prune_loose_objects(repo: &Repository, opts: &PruneOptions) -> Result<PruneStats> {
+/// - [`RepositoryError::UnsupportedObjectStore`] with [`FilesOnlyOperation::Prune`] for a
+///   custom primary without the prune capability;
+/// - [`RepositoryError::PreciousObjectsRepository`] (`operation: "prune"`) when
+///   `extensions.preciousObjects` is set;
+/// - config parse failures, store failures and I/O errors.
+pub(crate) fn prune_loose_objects(repo: &Repository, opts: &PruneOptions) -> Result<PruneStats> {
     let odb = repo.odb();
-    odb.require_files_primary("prune")?;
-    let cfg = repo.config()?;
-    let now = gc_now_unix(0);
+    let target = odb.prune_target()?;
+    let cfg = repo.config().snapshot()?;
+    if precious_objects(&cfg) {
+        return Err(RepositoryError::PreciousObjectsRepository { operation: "prune" }.into());
+    }
+    let now = opts
+        .now
+        .map_or_else(|| gc_now_unix(0), OffsetDateTime::unix_timestamp);
     let keep_newer_than = match opts.older_than {
         Some(t) => Some(t),
         None => match gc_loose_prune_policy(&cfg, now)? {
@@ -1476,12 +1674,125 @@ pub fn prune_loose_objects(repo: &Repository, opts: &PruneOptions) -> Result<Pru
     };
     let roots = collect_maintenance_object_roots(repo)?;
     let shallow = load_shallow_boundaries(repo.git_dir());
-    prune_loose_unreachable_with(
+    let mut stats = prune_loose_unreachable_with(
         odb,
         &LazyReachable::new(odb, &roots, &shallow),
         keep_newer_than,
         opts.dry_run,
-    )
+    )?;
+    let (PruneTarget::Files, Some(objects_dir)) = (target, odb.files_objects_dir()) else {
+        return Ok(stats);
+    };
+    let temp =
+        prune_stale_temporary_objects_with_cutoff(objects_dir, keep_newer_than, opts.dry_run)?;
+    stats.pruned += temp.pruned;
+    stats.kept += temp.kept;
+    Ok(stats)
+}
+
+/// Remove stale temporary object files and directories left by interrupted maintenance or
+/// fetch operations.
+///
+/// Uses the same cutoff semantics as unreachable loose-object pruning: when
+/// `keep_newer_than` is `None` (`gc.pruneExpire=now|all`), every temporary entry is
+/// eligible; otherwise only entries whose modification time is not newer than the cutoff
+/// are removed.
+fn prune_stale_temporary_objects_with_cutoff(
+    objects_dir: &Path,
+    keep_newer_than: Option<SystemTime>,
+    dry_run: bool,
+) -> Result<PruneStats> {
+    let mut stats = PruneStats::default();
+    let mut consider = |path: &Path| -> Result<()> {
+        let meta = match fs::symlink_metadata(path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(Error::Io(e)),
+        };
+        if temporary_object_expired(&meta, keep_newer_than) {
+            if dry_run {
+                stats.pruned += 1;
+            } else if meta.is_dir() {
+                fs::remove_dir_all(path).map_err(Error::Io)?;
+                stats.pruned += 1;
+            } else {
+                fs::remove_file(path).map_err(Error::Io)?;
+                stats.pruned += 1;
+            }
+        } else {
+            stats.kept += 1;
+        }
+        Ok(())
+    };
+
+    if let Ok(entries) = fs::read_dir(objects_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("tmp_") {
+                consider(&entry.path())?;
+            } else if name.len() == 2 && name.as_bytes().iter().all(|b| b.is_ascii_hexdigit()) {
+                if let Ok(loose) = fs::read_dir(entry.path()) {
+                    for loose_entry in loose.flatten() {
+                        let loose_name = loose_entry.file_name();
+                        if loose_name.to_string_lossy().starts_with("tmp_obj_") {
+                            consider(&loose_entry.path())?;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let pack_dir = objects_dir.join("pack");
+    if let Ok(entries) = fs::read_dir(&pack_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("tmp_") {
+                consider(&entry.path())?;
+                continue;
+            }
+            if !is_grit_pack_install_stage_name(&name) {
+                continue;
+            }
+            let meta = match fs::symlink_metadata(entry.path()) {
+                Ok(m) => m,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(Error::Io(e)),
+            };
+            if meta.is_dir() {
+                consider(&entry.path())?;
+            }
+        }
+    }
+
+    let incoming = objects_dir.join("incoming");
+    if let Ok(entries) = fs::read_dir(&incoming) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("pack-receive-") && name.ends_with(".tmp") {
+                consider(&entry.path())?;
+            }
+        }
+    }
+    Ok(stats)
+}
+
+/// Grit index-pack staging directory: `.pack-<oid>-install-<pid>_<seq>`.
+fn is_grit_pack_install_stage_name(name: &str) -> bool {
+    name.starts_with(".pack-") && name.contains("-install-")
+}
+
+fn temporary_object_expired(meta: &fs::Metadata, keep_newer_than: Option<SystemTime>) -> bool {
+    match keep_newer_than {
+        None => true,
+        Some(cutoff) => meta
+            .modified()
+            .ok()
+            .is_none_or(|modified| modified <= cutoff),
+    }
 }
 
 fn duration_ms(d: std::time::Duration) -> u64 {
@@ -1490,31 +1801,126 @@ fn duration_ms(d: std::time::Duration) -> u64 {
 
 /// Run pack-refs, reflog expiry, repack, prune, and commit-graph maintenance.
 ///
+/// Reclaims stale `next-index-<pid>` hook index copies (from interrupted commits) before any
+/// phase, including when [`RepackOptions::dry_run`] is set (dry-run counts but does not delete).
+///
 /// Unless [`RepackOptions::dry_run`] is set, holds the repository's `gc.pid` lock for the
 /// whole run, so it never overlaps another grit or Git gc (see [`GcLock`]).
 ///
+/// A custom primary that can delete objects
+/// ([`WritableObjectStore::as_prunable`](crate::odb::store::WritableObjectStore::as_prunable))
+/// gets pack-refs, reflog expiry and the unreachable prune of [`prune_loose_objects`] under
+/// `gc.pruneExpire` measured from [`GcOptions::now_unix`]. Repack, the drop-large-blobs
+/// phase and the commit-graph write need the files layout and are skipped
+/// ([`GcStats::repack`] stays empty, [`GcStats::commit_graph`] `None`). With
+/// `extensions.preciousObjects` such a run deletes nothing and [`GcStats::prune_ran`] is false.
+///
 /// # Errors
 ///
-/// [`Error::MaintenanceRunning`] when another process holds the `gc.pid` lock, plus failures
-/// from each maintenance step.
-pub fn gc(repo: &Repository, opts: &GcOptions) -> Result<GcStats> {
-    repo.odb().require_files_primary("gc")?;
+/// [`crate::repo::RepositoryError::MaintenanceRunning`] when another process holds the `gc.pid`
+/// lock, [`RepositoryError::UnsupportedObjectStore`] with [`FilesOnlyOperation::Prune`] for a
+/// custom primary without the prune capability, plus failures from each maintenance step.
+///
+/// Returns [`Error::Cancelled`] between maintenance phases and before publishing a new pack.
+pub(crate) fn gc(
+    repo: &Repository,
+    opts: &GcOptions,
+    progress: &mut dyn ProgressSink,
+    cancel: &CancelToken,
+) -> Result<GcStats> {
+    let target = repo.odb().prune_target()?;
     let now = gc_now_unix(opts.now_unix);
     let _lock = if opts.repack.dry_run {
         None
     } else {
         match GcLock::try_acquire(repo, now)? {
             GcLockAttempt::Acquired(lock) => Some(lock),
-            GcLockAttempt::Held(holder) => return Err(Error::MaintenanceRunning { holder }),
+            GcLockAttempt::Held(holder) => {
+                return Err(Error::Repository(RepositoryError::MaintenanceRunning {
+                    holder,
+                }))
+            }
         }
     };
-    gc_locked(repo, opts, now)
+    match target {
+        PruneTarget::Files => gc_locked(repo, opts, now, progress, cancel),
+        PruneTarget::Store(_) => gc_store_locked(repo, opts, now, progress, cancel),
+    }
 }
 
-/// Why automatic maintenance is due, as decided by [`auto_gc_needed`].
+/// [`gc_locked`] for a custom primary that can delete objects: pack-refs, reflog expiry,
+/// then pruning unreachable objects through the store. Repack, the drop-large-blobs phase
+/// and the commit-graph write need the files layout and are skipped.
+///
+/// With `extensions.preciousObjects` nothing is deleted and [`GcStats::prune_ran`] stays
+/// false, as Git's gc skips pruning there.
+fn gc_store_locked(
+    repo: &Repository,
+    opts: &GcOptions,
+    now: i64,
+    progress: &mut dyn ProgressSink,
+    cancel: &CancelToken,
+) -> Result<GcStats> {
+    poll_cancel(progress, cancel)?;
+    let mut stats = GcStats::default();
+    let dry_run = opts.repack.dry_run;
+    let _ = crate::porcelain::commit::reap_stale_next_index_files(repo, dry_run)?;
+    let cfg = repo.config().snapshot()?;
+    let prune_policy = gc_loose_prune_policy(&cfg, now)?;
+    gc_ref_phases(repo, opts, &cfg, now, progress, cancel, &mut stats)?;
+
+    let GcLoosePrunePolicy::Enabled { keep_newer_than } = prune_policy else {
+        return Ok(stats);
+    };
+    if precious_objects(&cfg) {
+        return Ok(stats);
+    }
+    poll_cancel(progress, cancel)?;
+    let start = Instant::now();
+    let odb = repo.odb();
+    let roots = collect_maintenance_object_roots(repo)?;
+    let shallow = load_shallow_boundaries(repo.git_dir());
+    stats.prune = prune_loose_unreachable_with(
+        odb,
+        &LazyReachable::new(odb, &roots, &shallow),
+        keep_newer_than,
+        dry_run,
+    )?;
+    stats.prune_ran = !dry_run;
+    stats.phase_timings.prune_ms = duration_ms(start.elapsed());
+    Ok(stats)
+}
+
+/// The pack-refs and reflog-expiry phases of a gc run, as `opts` asks for them.
+fn gc_ref_phases(
+    repo: &Repository,
+    opts: &GcOptions,
+    cfg: &ConfigSet,
+    now: i64,
+    progress: &mut dyn ProgressSink,
+    cancel: &CancelToken,
+    stats: &mut GcStats,
+) -> Result<()> {
+    let dry_run = opts.repack.dry_run;
+    if opts.pack_refs && gc_should_pack_refs(repo, cfg)? && !dry_run {
+        poll_cancel(progress, cancel)?;
+        let start = Instant::now();
+        stats.pack_refs = Some(pack_refs(repo, &PackRefsOptions::with_all(true))?);
+        stats.phase_timings.pack_refs_ms = duration_ms(start.elapsed());
+    }
+
+    if opts.expire_reflog {
+        let start = Instant::now();
+        stats.reflog_entries_pruned = expire_reflogs_for_gc(repo, dry_run, now)?;
+        stats.phase_timings.reflog_ms = duration_ms(start.elapsed());
+    }
+    Ok(())
+}
+
+/// Why automatic maintenance is due, as decided by [`Maintenance::auto_gc_needed`](crate::maintenance::Maintenance::auto_gc_needed).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AutoGcReason {
-    /// The loose-object estimate is above `gc.auto`. [`gc_auto`] packs the reachable loose
+    /// The loose-object estimate is above `gc.auto`. [`Maintenance::gc_auto`](crate::maintenance::Maintenance::gc_auto) packs the reachable loose
     /// objects into one new pack and leaves existing packs alone.
     TooManyLoose {
         /// Loose objects in the sampled fan-out directory (`objects/17`) times 256.
@@ -1522,7 +1928,7 @@ pub enum AutoGcReason {
         /// Effective `gc.auto` threshold.
         limit: usize,
     },
-    /// There are more non-`.keep` packs than `gc.autoPackLimit`. [`gc_auto`] consolidates
+    /// There are more non-`.keep` packs than `gc.autoPackLimit`. [`Maintenance::gc_auto`](crate::maintenance::Maintenance::gc_auto) consolidates
     /// every pack into one.
     TooManyPacks {
         /// Local packs without a `.keep` marker.
@@ -1549,8 +1955,8 @@ const AUTO_GC_SAMPLE_FANOUT: &str = "17";
 /// # Errors
 ///
 /// Config load failures and I/O errors other than a missing directory.
-pub fn auto_gc_needed(repo: &Repository) -> Result<Option<AutoGcReason>> {
-    let cfg = repo.config()?;
+pub(crate) fn auto_gc_needed(repo: &Repository) -> Result<Option<AutoGcReason>> {
+    let cfg = repo.config().snapshot()?;
     let Some(threshold) = cfg.gc_auto_threshold() else {
         return Ok(None);
     };
@@ -1591,7 +1997,7 @@ fn count_loose_in_fanout(dir: &Path, name_len: usize) -> Result<usize> {
         .count())
 }
 
-/// Result of [`gc_auto`].
+/// Result of [`Maintenance::gc_auto`](crate::maintenance::Maintenance::gc_auto).
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum AutoGcOutcome {
@@ -1615,14 +2021,14 @@ pub enum AutoGcOutcome {
     },
 }
 
-/// Run maintenance only when Git's `gc --auto` heuristics say it is due ([`auto_gc_needed`]).
+/// Run maintenance only when Git's `gc --auto` heuristics say it is due ([`Maintenance::auto_gc_needed`](crate::maintenance::Maintenance::auto_gc_needed)).
 ///
 /// When too many loose objects triggered the run, the reachable ones are packed into one new
 /// pack without rewriting existing packs and without a bitmap, so the cost scales with the
 /// loose objects rather than the repository. Unreachable loose objects stay loose until
-/// `gc.pruneExpire` lets the prune step delete them, as in Git. Too many packs runs a full consolidating [`gc`]. Either way the
+/// `gc.pruneExpire` lets the prune step delete them, as in Git. Too many packs runs a full consolidating [`Maintenance::gc`](crate::maintenance::Maintenance::gc). Either way the
 /// other `opts` steps (pack-refs, reflog expiry, unreachable prune under `gc.pruneExpire`,
-/// commit-graph) run as in [`gc`].
+/// commit-graph) run as in [`Maintenance::gc`](crate::maintenance::Maintenance::gc).
 ///
 /// Before doing any work this takes the `gc.pid` lock ([`GcLock`]) and runs the `pre-auto-gc`
 /// hook; a held lock or a failing hook ends the call without changes. With
@@ -1634,7 +2040,12 @@ pub enum AutoGcOutcome {
 /// # Errors
 ///
 /// Config, hook spawn, lock and I/O failures, and any error from the maintenance steps.
-pub fn gc_auto(repo: &Repository, opts: &GcOptions) -> Result<AutoGcOutcome> {
+pub(crate) fn gc_auto(
+    repo: &Repository,
+    opts: &GcOptions,
+    progress: &mut dyn ProgressSink,
+    cancel: &CancelToken,
+) -> Result<AutoGcOutcome> {
     let Some(reason) = auto_gc_needed(repo)? else {
         return Ok(AutoGcOutcome::NotNeeded);
     };
@@ -1660,7 +2071,7 @@ pub fn gc_auto(repo: &Repository, opts: &GcOptions) -> Result<AutoGcOutcome> {
         run_opts.repack.incremental = true;
         run_opts.repack.write_bitmap = false;
     }
-    let stats = gc_locked(repo, &run_opts, now)?;
+    let stats = gc_locked(repo, &run_opts, now, progress, cancel)?;
     Ok(AutoGcOutcome::Ran {
         reason,
         stats: Box::new(stats),
@@ -1676,7 +2087,7 @@ pub struct GcLockHolder {
     pub host: Option<String>,
 }
 
-/// Outcome of [`GcLock::try_acquire`].
+/// Outcome of [`Maintenance::try_lock`](crate::maintenance::Maintenance::try_lock).
 #[derive(Debug)]
 #[must_use]
 pub enum GcLockAttempt {
@@ -1707,7 +2118,7 @@ impl GcLock {
     /// # Errors
     ///
     /// I/O failures while creating, writing or renaming the lock file.
-    pub fn try_acquire(repo: &Repository, now_unix: i64) -> Result<GcLockAttempt> {
+    pub(crate) fn try_acquire(repo: &Repository, now_unix: i64) -> Result<GcLockAttempt> {
         let path = repo.common_git_dir().join("gc.pid");
         let mut lock = match crate::lockfile::LockFile::acquire(
             &path.with_extension("pid.lock"),
@@ -1744,7 +2155,7 @@ impl GcLock {
     /// most likely succeed. Lets a caller avoid starting a process that would only find the
     /// lock held.
     #[must_use]
-    pub fn current_holder(repo: &Repository, now_unix: i64) -> Option<GcLockHolder> {
+    pub(crate) fn current_holder(repo: &Repository, now_unix: i64) -> Option<GcLockHolder> {
         let path = repo.common_git_dir().join("gc.pid");
         live_gc_pid_holder(&path, &local_host_name(), now_unix)
     }
@@ -1819,9 +2230,18 @@ fn windows_dns_host_name() -> Option<String> {
     (ok != 0).then(|| String::from_utf16_lossy(&buf[..len as usize]))
 }
 
-fn gc_locked(repo: &Repository, opts: &GcOptions, now: i64) -> Result<GcStats> {
+fn gc_locked(
+    repo: &Repository,
+    opts: &GcOptions,
+    now: i64,
+    progress: &mut dyn ProgressSink,
+    cancel: &CancelToken,
+) -> Result<GcStats> {
+    poll_cancel(progress, cancel)?;
     let mut stats = GcStats::default();
-    let cfg = repo.config()?;
+    let dry_run = opts.repack.dry_run;
+    let _ = crate::porcelain::commit::reap_stale_next_index_files(repo, dry_run)?;
+    let cfg = repo.config().snapshot()?;
     let prune_policy = gc_loose_prune_policy(&cfg, now)?;
     // Settled before any phase, so a bad config value changes nothing.
     let drop_plan = if opts.drop_large_blobs {
@@ -1829,19 +2249,7 @@ fn gc_locked(repo: &Repository, opts: &GcOptions, now: i64) -> Result<GcStats> {
     } else {
         None
     };
-    let dry_run = opts.repack.dry_run;
-
-    if opts.pack_refs && gc_should_pack_refs(repo, &cfg)? && !dry_run {
-        let start = Instant::now();
-        stats.pack_refs = Some(pack_refs(repo, &PackRefsOptions::with_all(true))?);
-        stats.phase_timings.pack_refs_ms = duration_ms(start.elapsed());
-    }
-
-    if opts.expire_reflog {
-        let start = Instant::now();
-        stats.reflog_entries_pruned = expire_reflogs_for_gc(repo, dry_run, now)?;
-        stats.phase_timings.reflog_ms = duration_ms(start.elapsed());
-    }
+    gc_ref_phases(repo, opts, &cfg, now, progress, cancel, &mut stats)?;
 
     let mut repack_opts = opts.repack.clone();
     apply_gc_prune_policy_to_repack(&mut repack_opts, &prune_policy);
@@ -1854,8 +2262,9 @@ fn gc_locked(repo: &Repository, opts: &GcOptions, now: i64) -> Result<GcStats> {
     if !repack_opts.write_bitmap && !repack_opts.incremental {
         repack_opts.write_bitmap = gc_repack_writes_bitmap(repo, &cfg)?;
     }
+    poll_cancel(progress, cancel)?;
     let repack_start = Instant::now();
-    stats.repack = repack_all(repo, &repack_opts)?;
+    stats.repack = repack_all(repo, &repack_opts, progress, cancel)?;
     let repack_total_ms = duration_ms(repack_start.elapsed());
     stats.phase_timings.prune_ms = stats.repack.unreachable_prune_ms;
     stats.phase_timings.repack_ms = repack_total_ms.saturating_sub(stats.phase_timings.prune_ms);
@@ -1873,10 +2282,6 @@ fn gc_locked(repo: &Repository, opts: &GcOptions, now: i64) -> Result<GcStats> {
         stats.phase_timings.drop_large_blobs_ms = duration_ms(start.elapsed());
     }
 
-    if dry_run {
-        return Ok(stats);
-    }
-
     // Repack prunes unreachable loose objects itself (sharing its reachability walk), so gc
     // only reports the outcome.
     stats.prune_ran = stats.repack.unreachable_prune_ran;
@@ -1884,6 +2289,24 @@ fn gc_locked(repo: &Repository, opts: &GcOptions, now: i64) -> Result<GcStats> {
         pruned: stats.repack.unreachable_loose_pruned,
         kept: stats.repack.unreachable_loose_kept,
     };
+
+    if let GcLoosePrunePolicy::Enabled { keep_newer_than } = &prune_policy {
+        let temp = prune_stale_temporary_objects_with_cutoff(
+            repo.odb()
+                .files_objects_dir()
+                .ok_or(RepositoryError::UnsupportedObjectStore {
+                    operation: FilesOnlyOperation::Gc,
+                })?,
+            *keep_newer_than,
+            dry_run,
+        )?;
+        stats.prune.pruned += temp.pruned;
+        stats.prune.kept += temp.kept;
+    }
+
+    if dry_run {
+        return Ok(stats);
+    }
 
     if opts.write_commit_graph && gc_should_write_commit_graph(&cfg)? {
         let start = Instant::now();
@@ -1896,7 +2319,7 @@ fn gc_locked(repo: &Repository, opts: &GcOptions, now: i64) -> Result<GcStats> {
     Ok(stats)
 }
 
-/// How [`gc`] applies loose-object pruning for `gc.pruneExpire`.
+/// How [`Maintenance::gc`](crate::maintenance::Maintenance::gc) applies loose-object pruning for `gc.pruneExpire`.
 enum GcLoosePrunePolicy {
     /// `gc.pruneExpire=never` — do not delete unreachable loose objects.
     Disabled,
@@ -1909,7 +2332,7 @@ enum GcLoosePrunePolicy {
 
 fn gc_loose_prune_policy(config: &ConfigSet, now_unix: i64) -> Result<GcLoosePrunePolicy> {
     let spec = config
-        .get("gc.pruneExpire")
+        .value("gc.pruneExpire")
         .map(|s| s.trim().to_owned())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "2.weeks.ago".to_owned());
@@ -1925,9 +2348,10 @@ fn gc_loose_prune_policy(config: &ConfigSet, now_unix: i64) -> Result<GcLoosePru
     let mut err = 0;
     let cutoff_sec = approxidate_careful_at(&spec, now_unix, Some(&mut err)) as i64;
     if err != 0 {
-        return Err(Error::Config(ConfigError::Other(format!(
-            "bad config value '{spec}' for 'gc.pruneExpire'"
-        ))));
+        return Err(Error::Config(ConfigError::InvalidDate {
+            key: "gc.pruneExpire".to_owned(),
+            value: spec,
+        }));
     }
     let keep_newer_than = SystemTime::UNIX_EPOCH
         .checked_add(std::time::Duration::from_secs(cutoff_sec.max(0) as u64));
@@ -1942,7 +2366,7 @@ fn gc_now_unix(now_unix: i64) -> i64 {
 }
 
 fn expire_reflogs_for_gc(repo: &Repository, dry_run: bool, now: i64) -> Result<usize> {
-    let cfg = repo.config()?;
+    let cfg = repo.config().snapshot()?;
     let gc_cfg = load_gc_reflog_expire_config(&cfg, now);
     let params = ReflogExpireParams {
         stale_fix: false,
@@ -1951,7 +2375,7 @@ fn expire_reflogs_for_gc(repo: &Repository, dry_run: bool, now: i64) -> Result<u
     };
     let mut total = 0usize;
     let cache = ReflogExpiryCache::default();
-    for refname in reflog_refs_on_store(repo.refs())? {
+    for refname in reflog_refs_on_store(repo.ref_store())? {
         let result = expire_reflog_git_with_cache(
             repo,
             &refname,
@@ -2319,7 +2743,7 @@ pub(crate) enum PromisorRewriteWhen {
 /// and `gc` keep only those promised objects that sit in a promisor pack, so a
 /// kept blob in an ordinary pack beside it would be deleted. Maintenance that
 /// drops promised blobs must therefore check the promisor holds each one (see
-/// [`drop_promised_blobs`]). `.keep` packs and alternates are left alone, so
+/// [`Maintenance::drop_promised_blobs`](crate::maintenance::Maintenance::drop_promised_blobs)). `.keep` packs and alternates are left alone, so
 /// objects stored there stay. That is not enough for an object only an ordinary
 /// (not `.promisor`) `.keep` pack holds when the new pack names it: Git then
 /// counts it as promised and deletes it once the marker goes, and leaves a copy
@@ -2342,7 +2766,7 @@ pub(crate) enum PromisorRewriteWhen {
 ///
 /// # Errors
 ///
-/// [`Error::UnsupportedObjectStore`] without a files-backed object store, and pack
+/// [`RepositoryError::UnsupportedObjectStore`] without a files-backed object store, and pack
 /// read, write and file removal failures.
 pub(crate) fn rewrite_local_objects_without(
     repo: &Repository,
@@ -2351,7 +2775,8 @@ pub(crate) fn rewrite_local_objects_without(
     when: PromisorRewriteWhen,
 ) -> Result<PromisorRewrite> {
     let odb = repo.odb();
-    odb.require_files_primary("promisor rewrite")?;
+    odb.primary_store()
+        .require_files_primary(FilesOnlyOperation::PromisorRewrite)?;
     if omit.is_empty() && when == PromisorRewriteWhen::Dropping {
         return Ok(PromisorRewrite::default());
     }
@@ -2395,7 +2820,7 @@ pub(crate) fn rewrite_local_objects_without(
     let cfg = opts
         .merged_config
         .clone()
-        .or_else(|| repo.config().ok().map(|c| (*c).clone()));
+        .or_else(|| repo.config().snapshot().ok().map(|c| (*c).clone()));
     let pack_opts = opts
         .pack_build
         .unwrap_or_else(|| PackBuildOptions::for_local_copy(cfg.as_ref()));
@@ -2415,7 +2840,7 @@ pub(crate) fn rewrite_local_objects_without(
     };
     if let Some(staging) = built.staging_path.as_ref() {
         let trusted_rows = (!built.index_rows.is_empty()).then_some(built.index_rows);
-        let ingested = install_pack_path(
+        let ingested = install_pack_path_with_progress(
             staging,
             odb,
             &IngestPackOptions {
@@ -2427,12 +2852,14 @@ pub(crate) fn rewrite_local_objects_without(
                 mark_promisor_pack: true,
                 ..IngestPackOptions::default()
             },
+            None,
+            None,
         )?;
         rewrite.objects = ingested.object_ids.len();
         if let Some(pack_path) = &ingested.pack_path {
             if cfg
                 .as_ref()
-                .is_none_or(|c| c.pack_write_reverse_index_default(&opts.environment))
+                .is_none_or(|c| c.pack_write_reverse_index_default())
             {
                 write_pack_rev_sidecar_for_index_path(&pack_path.with_extension("idx"))?;
             }
@@ -2503,7 +2930,7 @@ fn pack_has_keep_marker(pack_dir: &Path, pack_path: &Path) -> bool {
 /// # Errors
 ///
 /// Propagates ref-store, locking, and I/O failures.
-pub fn pack_refs(repo: &Repository, opts: &PackRefsOptions) -> Result<PackRefsReport> {
+pub(crate) fn pack_refs(repo: &Repository, opts: &PackRefsOptions) -> Result<PackRefsReport> {
     let (path, refs_packed, refs_pruned) =
         crate::refs::pack_refs_for_repository(repo, opts.all, opts.dry_run)?;
     Ok(PackRefsReport {
@@ -2513,46 +2940,20 @@ pub fn pack_refs(repo: &Repository, opts: &PackRefsOptions) -> Result<PackRefsRe
     })
 }
 
-impl Repository {
-    /// Write a reachable commit-graph file for this repository.
-    ///
-    /// # Errors
-    ///
-    /// See [`write_commit_graph`].
-    pub fn write_commit_graph(&self, opts: &CommitGraphOptions) -> Result<CommitGraphWriteReport> {
-        write_commit_graph(self, opts)
-    }
-
-    /// Build a reachable commit-graph in memory, for any object store.
-    ///
-    /// # Errors
-    ///
-    /// See [`build_commit_graph`].
-    pub fn build_commit_graph(&self, opts: &CommitGraphOptions) -> Result<CommitGraphBuild> {
-        build_commit_graph(self, opts)
-    }
-
-    /// Write or refresh the multi-pack index for this repository's pack directory.
-    ///
-    /// # Errors
-    ///
-    /// See [`write_midx`].
-    pub fn write_midx(&self, opts: &MidxOptions) -> Result<MidxWriteReport> {
-        write_midx(self, opts)
-    }
-}
-
-/// Standalone object fsck helpers.
+/// Standalone object fsck helpers (single-object checks).
 pub mod fsck {
     pub use crate::fsck_msg_policy::{
         FsckMsgLevel, ObjectFsckChecker, ObjectFsckPolicy, SkipListError,
     };
-    pub use crate::fsck_standalone::*;
+    pub use crate::fsck_standalone::{fsck_object, fsck_object_with, FsckError, FsckObjectOptions};
 }
 
 /// Repository-wide fsck (object store, connectivity, refs).
 pub mod repository_fsck {
-    pub use crate::fsck::*;
+    pub use crate::fsck::{
+        format_fsck_line, issue_msg_id, issue_severity, issue_visible_by_default, FsckDiagnostic,
+        FsckIssue, FsckOptions, FsckReport, FsckSeverity, FsckSummary, MissingObjectReferrer,
+    };
 }
 
 #[cfg(test)]
@@ -2599,10 +3000,13 @@ mod tests {
 
     use super::*;
     use crate::config::{ConfigFile, ConfigScope, ConfigSet};
+    use crate::index_pack::install_pack_bytes;
     use crate::porcelain::add::stage_for_commit;
     use crate::porcelain::commit::{create_commit, CommitRequest};
-    use crate::progress::{NeverCancel, NullProgress};
+    use crate::progress::NullProgress;
     use crate::repo::InitOptions;
+    use filetime::FileTime;
+    use std::time::SystemTime;
     use tempfile::TempDir;
 
     /// Pack `oids` (already stored) into one new pack of `repo`, with a `.keep` marker
@@ -2632,7 +3036,7 @@ mod tests {
     #[test]
     fn promisor_rewrite_drops_only_the_omitted_objects() {
         let dir = TempDir::new().unwrap();
-        let repo = Repository::init(dir.path(), &InitOptions::new().with_bare(true)).unwrap();
+        let (repo, _) = Repository::init(dir.path(), &InitOptions::new().with_bare(true)).unwrap();
         let odb = repo.odb();
         let big = odb.write(ObjectKind::Blob, b"big blob").unwrap();
         let packed = odb.write(ObjectKind::Blob, b"packed").unwrap();
@@ -2689,7 +3093,7 @@ mod tests {
     #[test]
     fn promisor_rewrite_without_anything_to_drop_changes_nothing() {
         let dir = TempDir::new().unwrap();
-        let repo = Repository::init(dir.path(), &InitOptions::new().with_bare(true)).unwrap();
+        let (repo, _) = Repository::init(dir.path(), &InitOptions::new().with_bare(true)).unwrap();
         let blob = repo.odb().write(ObjectKind::Blob, b"x").unwrap();
         let absent = ObjectId::from_hex("0123456789abcdef0123456789abcdef01234567").unwrap();
         for omit in [OidHashSet::default(), [absent].into_iter().collect()] {
@@ -2708,7 +3112,7 @@ mod tests {
     #[test]
     fn promisor_rewrite_always_folds_until_one_promisor_pack_is_left() {
         let dir = TempDir::new().unwrap();
-        let repo = Repository::init(dir.path(), &InitOptions::new().with_bare(true)).unwrap();
+        let (repo, _) = Repository::init(dir.path(), &InitOptions::new().with_bare(true)).unwrap();
         let odb = repo.odb();
         let pushed = odb.write(ObjectKind::Blob, b"pushed").unwrap();
         let packed = odb.write(ObjectKind::Blob, b"packed").unwrap();
@@ -2791,9 +3195,9 @@ mod tests {
     #[test]
     fn gc_auto_skip_single_pack_without_loose() {
         let dir = TempDir::new().unwrap();
-        let repo = Repository::init(dir.path(), &InitOptions::default()).expect("init");
+        let (repo, _) = Repository::init(dir.path(), &InitOptions::default()).expect("init");
         std::fs::write(repo.work_tree().unwrap().join("a"), b"x").unwrap();
-        stage_for_commit(&repo, &mut NullProgress, &NeverCancel).expect("stage");
+        stage_for_commit(&repo, &mut NullProgress, &CancelToken::never()).expect("stage");
         let ident = "Test <t@example.com> 1 +0000".to_string();
         create_commit(
             &repo,
@@ -2810,7 +3214,7 @@ mod tests {
                 ..Default::default()
             },
             &mut NullProgress,
-            &NeverCancel,
+            &CancelToken::never(),
         )
         .expect("commit");
         git_cmd(dir.path(), &["repack", "-a", "-d"]);
@@ -2833,7 +3237,7 @@ mod tests {
 
     fn repo_with_config(snippet: &str) -> (TempDir, Repository) {
         let dir = TempDir::new().unwrap();
-        let repo = Repository::init(dir.path(), &InitOptions::default()).expect("init");
+        let (repo, _) = Repository::init(dir.path(), &InitOptions::default()).expect("init");
         let config_path = repo.git_dir().join("config");
         let mut config = fs::read_to_string(&config_path).unwrap();
         config.push_str(snippet);
@@ -2886,7 +3290,13 @@ mod tests {
         fs::write(pack_dir.join("pack-bbb.pack"), b"PACK").unwrap();
         assert_eq!(auto_gc_needed(&repo).unwrap(), None);
         assert_eq!(
-            gc_auto(&repo, &GcOptions::default()).unwrap(),
+            gc_auto(
+                &repo,
+                &GcOptions::default(),
+                &mut crate::progress::NullProgress,
+                &crate::progress::CancelToken::never()
+            )
+            .unwrap(),
             AutoGcOutcome::NotNeeded
         );
     }
@@ -2958,8 +3368,15 @@ mod tests {
         }
         assert_eq!(GcLock::current_holder(&repo, now), Some(recorded));
         assert!(matches!(
-            gc(&repo, &GcOptions::default()),
-            Err(Error::MaintenanceRunning { .. })
+            gc(
+                &repo,
+                &GcOptions::default(),
+                &mut crate::progress::NullProgress,
+                &crate::progress::CancelToken::never()
+            ),
+            Err(Error::Repository(
+                RepositoryError::MaintenanceRunning { .. }
+            ))
         ));
         assert!(!repo.git_dir().join("gc.pid.lock").exists());
         drop(lock);
@@ -3008,7 +3425,13 @@ mod tests {
         let (_dir, repo) = repo_with_config("[gc]\n\tauto = 1\n");
         fake_loose(&repo, "17", &[NAME_A, NAME_B]);
         fs::write(repo.git_dir().join("gc.pid"), "4242 some-other-host").unwrap();
-        let outcome = gc_auto(&repo, &GcOptions::default()).unwrap();
+        let outcome = gc_auto(
+            &repo,
+            &GcOptions::default(),
+            &mut crate::progress::NullProgress,
+            &crate::progress::CancelToken::never(),
+        )
+        .unwrap();
         assert!(
             matches!(&outcome, AutoGcOutcome::AlreadyRunning(holder) if holder.pid == Some(4242)),
             "{outcome:?}"
@@ -3026,7 +3449,13 @@ mod tests {
         fs::create_dir_all(hook.parent().unwrap()).unwrap();
         fs::write(&hook, "#!/bin/sh\nexit 3\n").unwrap();
         fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
-        let outcome = gc_auto(&repo, &GcOptions::default()).unwrap();
+        let outcome = gc_auto(
+            &repo,
+            &GcOptions::default(),
+            &mut crate::progress::NullProgress,
+            &crate::progress::CancelToken::never(),
+        )
+        .unwrap();
         assert!(
             matches!(outcome, AutoGcOutcome::DeclinedByHook { status: 3, .. }),
             "{outcome:?}"
@@ -3047,9 +3476,10 @@ mod tests {
 
     fn assert_fsck_clean(repo: &Repository) {
         let opts = repo_fsck::FsckOptions::full_repository(true).with_check_dangling(false);
-        let report = repo_fsck::fsck(repo, &opts, &mut NullProgress, &NeverCancel).expect("fsck");
+        let report =
+            repo_fsck::fsck(repo, &opts, &mut NullProgress, &CancelToken::never()).expect("fsck");
         assert!(
-            report.ok(&repo.config().expect("config"), &opts),
+            report.ok(&repo.config().snapshot().expect("config"), &opts),
             "{:?}",
             report.issues
         );
@@ -3058,9 +3488,9 @@ mod tests {
     #[test]
     fn fsck_clean_repo_ok() {
         let dir = TempDir::new().unwrap();
-        let repo = Repository::init(dir.path(), &InitOptions::default()).expect("init");
+        let (repo, _) = Repository::init(dir.path(), &InitOptions::default()).expect("init");
         std::fs::write(repo.work_tree().unwrap().join("a"), b"x").unwrap();
-        stage_for_commit(&repo, &mut NullProgress, &NeverCancel).expect("stage");
+        stage_for_commit(&repo, &mut NullProgress, &CancelToken::never()).expect("stage");
         let ident = "Test <t@example.com> 1 +0000".to_string();
         create_commit(
             &repo,
@@ -3077,7 +3507,7 @@ mod tests {
                 ..Default::default()
             },
             &mut NullProgress,
-            &NeverCancel,
+            &CancelToken::never(),
         )
         .expect("commit");
         assert_fsck_clean(&repo);
@@ -3086,10 +3516,10 @@ mod tests {
     #[test]
     fn incremental_repack_with_bitmap_keeps_base_pack_and_writes_midx_bitmap() {
         let dir = TempDir::new().unwrap();
-        let repo = Repository::init(dir.path(), &InitOptions::default()).expect("init");
+        let (repo, _) = Repository::init(dir.path(), &InitOptions::default()).expect("init");
         let wt = repo.work_tree().unwrap();
         std::fs::write(wt.join("base"), b"v1").unwrap();
-        stage_for_commit(&repo, &mut NullProgress, &NeverCancel).expect("stage");
+        stage_for_commit(&repo, &mut NullProgress, &CancelToken::never()).expect("stage");
         let ident = "Test <t@example.com> 1 +0000".to_string();
         create_commit(
             &repo,
@@ -3106,7 +3536,7 @@ mod tests {
                 ..Default::default()
             },
             &mut NullProgress,
-            &NeverCancel,
+            &CancelToken::never(),
         )
         .expect("commit");
         repack_all(
@@ -3115,13 +3545,15 @@ mod tests {
                 keep_unreachable: false,
                 ..RepackOptions::default()
             },
+            &mut crate::progress::NullProgress,
+            &crate::progress::CancelToken::never(),
         )
         .expect("repack base");
         let pack_dir = repo.git_dir().join("objects/pack");
         assert_eq!(count_pack_files(&pack_dir), 1);
 
         std::fs::write(wt.join("child"), b"v2").unwrap();
-        stage_for_commit(&repo, &mut NullProgress, &NeverCancel).expect("stage child");
+        stage_for_commit(&repo, &mut NullProgress, &CancelToken::never()).expect("stage child");
         create_commit(
             &repo,
             &CommitRequest {
@@ -3137,7 +3569,7 @@ mod tests {
                 ..Default::default()
             },
             &mut NullProgress,
-            &NeverCancel,
+            &CancelToken::never(),
         )
         .expect("child commit");
         assert!(count_loose_objects(repo.odb()).expect("loose") >= 2);
@@ -3150,6 +3582,8 @@ mod tests {
                 write_bitmap: true,
                 ..RepackOptions::default()
             },
+            &mut crate::progress::NullProgress,
+            &crate::progress::CancelToken::never(),
         )
         .expect("incremental repack with bitmap must not fail after installing a pack");
 
@@ -3185,10 +3619,10 @@ mod tests {
     #[test]
     fn incremental_repack_adds_pack_without_removing_base() {
         let dir = TempDir::new().unwrap();
-        let repo = Repository::init(dir.path(), &InitOptions::default()).expect("init");
+        let (repo, _) = Repository::init(dir.path(), &InitOptions::default()).expect("init");
         let wt = repo.work_tree().unwrap();
         std::fs::write(wt.join("base"), b"v1").unwrap();
-        stage_for_commit(&repo, &mut NullProgress, &NeverCancel).expect("stage");
+        stage_for_commit(&repo, &mut NullProgress, &CancelToken::never()).expect("stage");
         let ident = "Test <t@example.com> 1 +0000".to_string();
         create_commit(
             &repo,
@@ -3205,7 +3639,7 @@ mod tests {
                 ..Default::default()
             },
             &mut NullProgress,
-            &NeverCancel,
+            &CancelToken::never(),
         )
         .expect("commit");
         repack_all(
@@ -3214,6 +3648,8 @@ mod tests {
                 keep_unreachable: false,
                 ..RepackOptions::default()
             },
+            &mut crate::progress::NullProgress,
+            &crate::progress::CancelToken::never(),
         )
         .expect("repack");
         let pack_dir = repo.git_dir().join("objects/pack");
@@ -3235,7 +3671,7 @@ mod tests {
                     ..Default::default()
                 },
                 &mut NullProgress,
-                &NeverCancel,
+                &CancelToken::never(),
             )
             .expect("empty");
         }
@@ -3247,6 +3683,8 @@ mod tests {
                 write_bitmap: false,
                 ..RepackOptions::default()
             },
+            &mut crate::progress::NullProgress,
+            &crate::progress::CancelToken::never(),
         )
         .expect("incremental repack");
         assert!(
@@ -3258,11 +3696,11 @@ mod tests {
     #[test]
     fn gc_full_run_records_per_phase_timings() {
         let dir = TempDir::new().unwrap();
-        let repo = Repository::init(dir.path(), &InitOptions::default()).expect("init");
+        let (repo, _) = Repository::init(dir.path(), &InitOptions::default()).expect("init");
         let wt = repo.work_tree().unwrap();
         for i in 0..5 {
             std::fs::write(wt.join(format!("f{i}.txt")), format!("{i}\n")).unwrap();
-            stage_for_commit(&repo, &mut NullProgress, &NeverCancel).expect("stage");
+            stage_for_commit(&repo, &mut NullProgress, &CancelToken::never()).expect("stage");
             let ident = "Test <t@example.com> 1 +0000".to_string();
             create_commit(
                 &repo,
@@ -3279,13 +3717,15 @@ mod tests {
                     ..Default::default()
                 },
                 &mut NullProgress,
-                &NeverCancel,
+                &CancelToken::never(),
             )
             .expect("commit");
         }
         let stats = gc(
             &repo,
             &GcOptions::full_run(false, OffsetDateTime::now_utc().unix_timestamp()),
+            &mut crate::progress::NullProgress,
+            &crate::progress::CancelToken::never(),
         )
         .expect("gc");
         let t = stats.phase_timings;
@@ -3302,6 +3742,13 @@ mod tests {
         );
         // Cached ref/config paths can finish pack-refs or commit-graph in under 1 ms (0 in
         // millisecond buckets). Require repack timing plus evidence the other phases ran.
+        let phases = stats.phase_reports();
+        assert!(phases
+            .iter()
+            .any(|p| matches!(p, GcPhaseReport::Repack { .. })));
+        assert!(phases
+            .iter()
+            .any(|p| matches!(p, GcPhaseReport::PackRefs { .. })));
         assert!(
             t.repack_ms > 0 && stats.pack_refs.is_some() && stats.commit_graph.is_some(),
             "full gc must time repack and run pack-refs + commit-graph, got {t:?}"
@@ -3374,6 +3821,8 @@ mod tests {
                 write_bitmap: false,
                 ..RepackOptions::default()
             },
+            &mut crate::progress::NullProgress,
+            &crate::progress::CancelToken::never(),
         )
         .expect("repack");
         assert!(
@@ -3423,6 +3872,8 @@ mod tests {
                 keep_unreachable: false,
                 ..RepackOptions::default()
             },
+            &mut crate::progress::NullProgress,
+            &crate::progress::CancelToken::never(),
         )
         .expect("repack");
         assert!(
@@ -3547,6 +3998,8 @@ mod tests {
                 write_bitmap: false,
                 ..RepackOptions::default()
             },
+            &mut crate::progress::NullProgress,
+            &crate::progress::CancelToken::never(),
         )
         .expect("repack");
 
@@ -3562,5 +4015,205 @@ mod tests {
             .status()
             .expect("fsck")
             .success());
+    }
+
+    #[test]
+    fn pack_install_stage_name_matches_only_grit_staging_dirs() {
+        assert!(is_grit_pack_install_stage_name(
+            ".pack-deadbeef-install-1_0"
+        ));
+        assert!(!is_grit_pack_install_stage_name(".notes-install-backup"));
+        assert!(!is_grit_pack_install_stage_name(".cache-install-state"));
+        assert!(is_grit_pack_install_stage_name(
+            ".pack-deadbeef-install-stale-file"
+        ));
+    }
+
+    #[test]
+    fn gc_prunes_stale_tmp_pack_and_install_dirs() {
+        let (_dir, repo) = repo_with_config("");
+        let pack_dir = repo.git_dir().join("objects/pack");
+        fs::write(pack_dir.join("tmp_pack_old"), b"old").unwrap();
+        fs::write(pack_dir.join("tmp_pack_fresh"), b"new").unwrap();
+        fs::create_dir(pack_dir.join(".pack-deadbeef-install-9_0")).unwrap();
+        fs::write(pack_dir.join(".notes-install-backup"), b"notes").unwrap();
+        fs::create_dir(pack_dir.join(".cache-install-state")).unwrap();
+        fs::write(
+            pack_dir.join(".pack-deadbeef-install-stale-file"),
+            b"not a stage dir",
+        )
+        .unwrap();
+        let cutoff = SystemTime::now() - std::time::Duration::from_secs(21 * 86400);
+        filetime::set_file_mtime(pack_dir.join("tmp_pack_old"), FileTime::from(cutoff)).unwrap();
+        filetime::set_file_mtime(
+            pack_dir.join(".pack-deadbeef-install-9_0"),
+            FileTime::from(cutoff),
+        )
+        .unwrap();
+        for path in [
+            pack_dir.join(".notes-install-backup"),
+            pack_dir.join(".cache-install-state"),
+            pack_dir.join(".pack-deadbeef-install-stale-file"),
+        ] {
+            filetime::set_file_mtime(&path, FileTime::from(cutoff)).unwrap();
+        }
+        gc(
+            &repo,
+            &GcOptions::default(),
+            &mut crate::progress::NullProgress,
+            &crate::progress::CancelToken::never(),
+        )
+        .expect("gc");
+        assert!(!pack_dir.join("tmp_pack_old").exists());
+        assert!(!pack_dir.join(".pack-deadbeef-install-9_0").exists());
+        assert!(pack_dir.join("tmp_pack_fresh").exists());
+        assert!(pack_dir.join(".notes-install-backup").exists());
+        assert!(pack_dir.join(".cache-install-state").is_dir());
+        assert!(pack_dir.join(".pack-deadbeef-install-stale-file").is_file());
+
+        fs::write(pack_dir.join("tmp_pack_old"), b"old").unwrap();
+        filetime::set_file_mtime(pack_dir.join("tmp_pack_old"), FileTime::from(cutoff)).unwrap();
+        let stats = gc(
+            &repo,
+            &GcOptions {
+                repack: RepackOptions {
+                    dry_run: true,
+                    ..RepackOptions::default()
+                },
+                ..GcOptions::default()
+            },
+            &mut crate::progress::NullProgress,
+            &crate::progress::CancelToken::never(),
+        )
+        .expect("dry-run gc");
+        assert!(stats.prune.pruned >= 1);
+        assert!(pack_dir.join("tmp_pack_old").exists());
+    }
+
+    #[test]
+    fn gc_prunes_stale_tmp_objdir_incoming_quarantine() {
+        let (_dir, repo) = repo_with_config("");
+        let objects = repo.git_dir().join("objects");
+        let stale = objects.join("tmp_objdir-incoming-99999-0");
+        fs::create_dir_all(stale.join("pack")).unwrap();
+        fs::write(stale.join("pack/tmp_pack_stale"), b"partial pack").unwrap();
+        let fresh = objects.join("tmp_objdir-incoming-1-0");
+        fs::create_dir_all(fresh.join("pack")).unwrap();
+        fs::write(fresh.join("pack/tmp_pack_fresh"), b"new").unwrap();
+        let cutoff = SystemTime::now() - std::time::Duration::from_secs(21 * 86400);
+        filetime::set_file_mtime(&stale, FileTime::from(cutoff)).unwrap();
+        filetime::set_file_mtime(stale.join("pack/tmp_pack_stale"), FileTime::from(cutoff))
+            .unwrap();
+        gc(
+            &repo,
+            &GcOptions::default(),
+            &mut crate::progress::NullProgress,
+            &crate::progress::CancelToken::never(),
+        )
+        .expect("gc");
+        assert!(!stale.exists(), "stale receive quarantine should be pruned");
+        assert!(fresh.exists(), "fresh receive quarantine should be kept");
+    }
+
+    #[test]
+    fn gc_reaps_stale_next_index_files_in_git_and_linked_worktree() {
+        use crate::worktree::{add_linked_worktree, AddLinkedWorktreeOptions, WorktreeBranch};
+
+        let (dir, repo) = repo_with_config("");
+        std::fs::write(repo.work_tree().unwrap().join("a"), b"x").unwrap();
+        stage_for_commit(&repo, &mut NullProgress, &CancelToken::never()).expect("stage");
+        let ident = "Test <t@example.com> 1 +0000".to_string();
+        create_commit(
+            &repo,
+            &CommitRequest {
+                message: "init".into(),
+                author: Some(ident.parse().expect("signature")),
+                committer: Some(ident.parse().expect("signature")),
+                allow_empty: false,
+                sign_override: None,
+                amend: false,
+                assume_worktree_synced: false,
+                skip_pre_commit_tree_match: false,
+                staged_change_count: None,
+                ..Default::default()
+            },
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("commit");
+        let main_git = repo.git_dir().to_path_buf();
+        let dead_pid = 99_999_997_u64;
+        let live_pid = u64::from(std::process::id());
+        fs::write(
+            main_git.join(format!("next-index-{dead_pid}")),
+            b"main orphan",
+        )
+        .unwrap();
+        fs::write(
+            main_git.join(format!("next-index-{live_pid}")),
+            b"main live",
+        )
+        .unwrap();
+
+        let linked_path = dir.path().join("linked-wt");
+        repo.worktrees()
+            .add(&AddLinkedWorktreeOptions {
+                path: linked_path.clone(),
+                branch: Some(WorktreeBranch::Create("linked".into())),
+                start_point: Some("HEAD".into()),
+                force: false,
+                lock: None,
+                no_checkout: true,
+                track: false,
+            })
+            .expect("linked worktree");
+        let linked_git = repo
+            .worktrees()
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|e| e.path == linked_path)
+            .expect("linked entry")
+            .admin_dir;
+        fs::write(
+            linked_git.join(format!("next-index-{dead_pid}")),
+            b"linked orphan",
+        )
+        .unwrap();
+
+        gc(
+            &repo,
+            &GcOptions::default(),
+            &mut crate::progress::NullProgress,
+            &crate::progress::CancelToken::never(),
+        )
+        .expect("gc");
+        assert!(!main_git.join(format!("next-index-{dead_pid}")).exists());
+        assert!(main_git.join(format!("next-index-{live_pid}")).exists());
+        assert!(!linked_git.join(format!("next-index-{dead_pid}")).exists());
+
+        fs::write(main_git.join(format!("next-index-{dead_pid}")), b"again").unwrap();
+        gc(
+            &repo,
+            &GcOptions {
+                repack: RepackOptions {
+                    dry_run: true,
+                    ..RepackOptions::default()
+                },
+                ..GcOptions::default()
+            },
+            &mut crate::progress::NullProgress,
+            &crate::progress::CancelToken::never(),
+        )
+        .expect("dry-run gc");
+        assert!(main_git.join(format!("next-index-{dead_pid}")).exists());
+        gc(
+            &repo,
+            &GcOptions::default(),
+            &mut crate::progress::NullProgress,
+            &crate::progress::CancelToken::never(),
+        )
+        .expect("gc again");
+        assert!(!main_git.join(format!("next-index-{dead_pid}")).exists());
     }
 }

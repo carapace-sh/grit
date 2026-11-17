@@ -4,10 +4,10 @@ use std::path::Path;
 use std::process::Command;
 
 use grit_lib::config::environment::RepositoryOptions;
-use grit_lib::porcelain::commit::{commit_with_scope, CommitRequest, CommitScope};
+use grit_lib::porcelain::commit::{CommitRequest, CommitScope};
 use grit_lib::progress::NullProgress;
 use grit_lib::repo::Repository;
-use grit_lib::worktree::pathspec::ResolvedPathspecs;
+use grit_lib::worktree::pathspec::{Pathspec, PathspecGlobalFlags};
 
 fn ident() -> String {
     "Scope Compat <scope@example.com> 1700000000 +0000".to_owned()
@@ -15,15 +15,15 @@ fn ident() -> String {
 
 fn commit_req(message: &str) -> CommitRequest {
     let id = ident();
-    CommitRequest {
-        message: message.to_owned(),
-        author: Some(id.parse().expect("signature")),
-        committer: Some(id.parse().expect("signature")),
-        allow_empty: false,
-        sign_override: None,
-        amend: false,
-        assume_worktree_synced: false,
-        ..Default::default()
+    {
+        let mut req = CommitRequest::new(message.to_owned());
+        req.author = Some(id.parse().expect("signature"));
+        req.committer = Some(id.parse().expect("signature"));
+        req.allow_empty = false;
+        req.sign_override = None;
+        req.amend = false;
+        req.assume_worktree_synced = false;
+        req
     }
 }
 
@@ -136,19 +136,17 @@ fn paths_commit_matches_git_only() {
     }
 
     let repo = open_grit(grit_root);
-    let paths = ResolvedPathspecs {
-        specs: vec!["file".into()],
-        sources: vec!["file".into()],
-        scoped: true,
-    };
-    commit_with_scope(
-        &repo,
-        &commit_req("file only"),
-        CommitScope::Paths(paths),
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("grit paths commit");
+    let paths = Pathspec::scoped(["file"], PathspecGlobalFlags::default());
+    repo.commits()
+        .create(
+            &grit_lib::commits::CommitOptions::new(
+                commit_req("file only"),
+                CommitScope::Paths(paths),
+            ),
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("grit paths commit");
     git(
         git_root,
         &["commit", "-m", "file only", "--only", "--", "file"],
@@ -175,19 +173,17 @@ fn paths_commit_force_added_ignored_file_matches_git() {
     }
 
     let repo = open_grit(grit_root);
-    let paths = ResolvedPathspecs {
-        specs: vec!["build/x.o".into()],
-        sources: vec!["build/x.o".into()],
-        scoped: true,
-    };
-    commit_with_scope(
-        &repo,
-        &commit_req("one"),
-        CommitScope::Paths(paths.clone()),
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("grit paths commit force-added ignored");
+    let paths = Pathspec::scoped(["build/x.o"], PathspecGlobalFlags::default());
+    repo.commits()
+        .create(
+            &grit_lib::commits::CommitOptions::new(
+                commit_req("one"),
+                CommitScope::Paths(paths.clone()),
+            ),
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("grit paths commit force-added ignored");
     git(
         git_root,
         &["commit", "-m", "one", "--only", "--", "build/x.o"],
@@ -200,15 +196,13 @@ fn paths_commit_force_added_ignored_file_matches_git() {
     for root in [grit_root, git_root] {
         std::fs::write(root.join("build/x.o"), b"o\nmore\n").expect("modify ignored tracked");
     }
-
-    commit_with_scope(
-        &repo,
-        &commit_req("two"),
-        CommitScope::Paths(paths),
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("grit paths commit modified ignored tracked");
+    repo.commits()
+        .create(
+            &grit_lib::commits::CommitOptions::new(commit_req("two"), CommitScope::Paths(paths)),
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("grit paths commit modified ignored tracked");
     git(
         git_root,
         &["commit", "-m", "two", "--only", "--", "build/x.o"],
@@ -240,19 +234,17 @@ fn paths_commit_tracked_ignored_after_initial_commit_matches_git() {
     }
 
     let repo = open_grit(grit_root);
-    let paths = ResolvedPathspecs {
-        specs: vec!["build/x.o".into()],
-        sources: vec!["build/x.o".into()],
-        scoped: true,
-    };
-    commit_with_scope(
-        &repo,
-        &commit_req("path only"),
-        CommitScope::Paths(paths),
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("grit paths commit tracked ignored");
+    let paths = Pathspec::scoped(["build/x.o"], PathspecGlobalFlags::default());
+    repo.commits()
+        .create(
+            &grit_lib::commits::CommitOptions::new(
+                commit_req("path only"),
+                CommitScope::Paths(paths),
+            ),
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("grit paths commit tracked ignored");
     git(
         git_root,
         &["commit", "-m", "path only", "--only", "--", "build/x.o"],
@@ -276,20 +268,15 @@ fn paths_commit_directory_pathspec_on_ignored_tree_matches_git() {
         git(root, &["add", "-f", "build/x.o"]);
     }
 
-    let paths = ResolvedPathspecs {
-        specs: vec!["build".into()],
-        sources: vec!["build".into()],
-        scoped: true,
-    };
+    let paths = Pathspec::scoped(["build"], PathspecGlobalFlags::default());
     let repo = open_grit(grit_root);
-    commit_with_scope(
-        &repo,
-        &commit_req("one"),
-        CommitScope::Paths(paths),
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("grit commit with directory pathspec on ignored tree");
+    repo.commits()
+        .create(
+            &grit_lib::commits::CommitOptions::new(commit_req("one"), CommitScope::Paths(paths)),
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("grit commit with directory pathspec on ignored tree");
     git(git_root, &["commit", "-m", "one", "--only", "--", "build"]);
 
     assert_eq!(tree_oid(grit_root), tree_oid(git_root));
@@ -316,21 +303,19 @@ fn paths_commit_exclude_pathspec_matches_git() {
         git(root, &["add", "-f", "build/y.o"]);
     }
 
-    let paths = ResolvedPathspecs {
-        specs: vec![":(glob)build/*.o".into(), ":(exclude)build/y.o".into()],
-        sources: vec![":(glob)build/*.o".into(), ":(exclude)build/y.o".into()],
-        scoped: true,
-    };
+    let paths = Pathspec::scoped(
+        [":(glob)build/*.o", ":(exclude)build/y.o"],
+        PathspecGlobalFlags::default(),
+    );
 
     let repo = open_grit(grit_root);
-    commit_with_scope(
-        &repo,
-        &commit_req("scoped"),
-        CommitScope::Paths(paths),
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("grit paths commit with exclude");
+    repo.commits()
+        .create(
+            &grit_lib::commits::CommitOptions::new(commit_req("scoped"), CommitScope::Paths(paths)),
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("grit paths commit with exclude");
     git(
         git_root,
         &[
@@ -366,14 +351,13 @@ fn staged_commit_matches_git_without_auto_stage() {
     }
 
     let repo = open_grit(grit_root);
-    commit_with_scope(
-        &repo,
-        &commit_req("staged"),
-        CommitScope::Staged,
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("grit staged");
+    repo.commits()
+        .create(
+            &grit_lib::commits::CommitOptions::new(commit_req("staged"), CommitScope::Staged),
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("grit staged");
     git(git_root, &["commit", "-m", "staged"]);
 
     assert_eq!(tree_oid(grit_root), tree_oid(git_root));

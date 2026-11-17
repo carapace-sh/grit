@@ -1,23 +1,22 @@
 //! SHA-1 collision detection on object ingestion paths (sha1dc).
 
+use grit_lib::error::ObjectError;
+use grit_lib::progress::NullProgress;
 use std::io::Write;
 use std::num::NonZeroUsize;
 use std::process::{Command, Stdio};
 
 use grit_lib::error::Error;
-use grit_lib::maintenance::repository_fsck::{
-    fsck, issue_msg_id, FsckIssue, FsckOptions, FsckReport,
-};
+use grit_lib::maintenance::repository_fsck::{issue_msg_id, FsckIssue, FsckOptions, FsckReport};
 use grit_lib::objects::hash::{
-    hash_object, hash_objects_parallel, try_par_hash_with_force, ParallelHashError,
+    hash_object, hash_objects_parallel, try_par_hash_forced, ParallelHashError,
 };
 use grit_lib::objects::index_pack::{install_pack_bytes, IngestPackOptions};
 use grit_lib::objects::odb::Odb;
-use grit_lib::objects::pack::verify_pack_and_collect;
 use grit_lib::objects::unpack_objects::{unpack_objects, UnpackOptions};
 use grit_lib::objects::{HashAlgo, ObjectId, ObjectKind};
-use grit_lib::progress::{NeverCancel, NullProgress};
 use grit_lib::repo::{InitOptions, Repository};
+use grit_lib::test_support::objects_pack::verify_pack_and_collect;
 use grit_test_support::{
     git_fsck, HashAlgo as FixtureAlgo, ObjectKind as PackKind, PackBuilder, RepoFixture,
 };
@@ -33,7 +32,10 @@ fn shattered_prefix(which: u8) -> Vec<u8> {
 }
 
 fn assert_hash_collision<T: std::fmt::Debug>(result: Result<T, Error>) {
-    assert!(matches!(result, Err(Error::HashCollision { .. })));
+    assert!(matches!(
+        result,
+        Err(Error::Object(ObjectError::HashCollision { .. }))
+    ));
 }
 
 fn shattered_blob_store_bytes(which: u8) -> Vec<u8> {
@@ -149,7 +151,7 @@ fn unpack_objects_accepts_shattered_prefix_blob() {
 #[test]
 fn fsck_accepts_git_written_shattered_prefix_blob() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let repo = Repository::init(dir.path(), &InitOptions::default()).expect("init");
+    let (repo, _) = Repository::init(dir.path(), &InitOptions::default()).expect("init");
     let data = shattered_prefix(1);
     let hex = grit_test_support::write_loose_object(
         repo.odb().objects_dir(),
@@ -164,13 +166,14 @@ fn fsck_accepts_git_written_shattered_prefix_blob() {
         oid
     );
 
-    let report = fsck(
-        &repo,
-        &FsckOptions::default(),
-        &mut NullProgress,
-        &NeverCancel,
-    )
-    .expect("fsck");
+    let report = repo
+        .maintenance()
+        .fsck(
+            &FsckOptions::default(),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("fsck");
     assert_no_collision_finding(&report, &oid);
 }
 
@@ -190,10 +193,10 @@ fn parallel_hash_surfaces_collision() {
     let data = shattered_prefix(1);
     let items = [data.as_slice(), b"plain".as_slice()];
     let threads = NonZeroUsize::new(2).expect("threads");
-    let err = try_par_hash_with_force(&items, threads, |bytes| HashAlgo::Sha1.digest(bytes))
+    let err = try_par_hash_forced(&items, threads, |bytes| HashAlgo::Sha1.digest(bytes))
         .expect_err("parallel");
     match err {
-        ParallelHashError::Task(Error::HashCollision { .. }) => {}
+        ParallelHashError::Task(Error::Object(ObjectError::HashCollision { .. })) => {}
         other => panic!("unexpected error: {other:?}"),
     }
 

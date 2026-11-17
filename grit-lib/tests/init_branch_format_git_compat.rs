@@ -1,13 +1,14 @@
 //! Init initial branch, separate git dir, and object format (task 3527 / t0001-init core cases).
 
+use grit_lib::error::RefError;
 use std::fs;
 use std::process::Command;
 
-use grit_lib::config::environment::Environment;
+use grit_lib::config::environment::{Environment, RepositoryOptions};
 use grit_lib::error::Error;
 use grit_lib::objects::HashAlgo;
 use grit_lib::progress::NullProgress;
-use grit_lib::repo::{resolve_initial_branch, InitOptions, Repository};
+use grit_lib::repo::{resolve_initial_branch, InitOptions, Repository, RepositoryError};
 use tempfile::TempDir;
 
 fn git_fsck_ok(git_dir: &std::path::Path) {
@@ -36,7 +37,7 @@ fn env_with_global(global_config: &std::path::Path) -> Environment {
 #[test]
 fn init_uses_explicit_initial_branch() {
     let td = TempDir::new().expect("tempdir");
-    let repo = Repository::init(
+    let (repo, _) = Repository::init(
         td.path(),
         &InitOptions::new().with_initial_branch("develop"),
     )
@@ -55,8 +56,11 @@ fn init_honors_init_default_branch_from_global_config() {
         "production"
     );
     let wt = TempDir::new().expect("tempdir");
-    let repo =
-        Repository::init(wt.path(), &InitOptions::new().with_environment(env)).expect("init");
+    let (repo, _) = Repository::init(
+        wt.path(),
+        &InitOptions::new().with_repository_options(RepositoryOptions::with_environment(env)),
+    )
+    .expect("init");
     let head = fs::read_to_string(repo.git_dir().join("HEAD")).expect("read HEAD");
     assert_eq!(head.trim(), "ref: refs/heads/production");
 }
@@ -70,14 +74,14 @@ fn init_falls_back_to_main() {
 #[test]
 fn init_invalid_branch_name_is_typed_error() {
     let err = resolve_initial_branch(&Environment::empty(), Some("-bad")).unwrap_err();
-    assert!(matches!(err, Error::InvalidRef(_)));
+    assert!(matches!(err, Error::Ref(RefError::Invalid { .. })));
 }
 
 #[test]
 fn reinit_keeps_existing_head_branch() {
     let td = TempDir::new().expect("tempdir");
     Repository::init(td.path(), &InitOptions::new().with_initial_branch("first")).expect("init");
-    let (_, outcome) = Repository::init_with_outcome(
+    let (_, outcome) = Repository::init(
         td.path(),
         &InitOptions::new().with_initial_branch("ignored"),
     )
@@ -92,7 +96,7 @@ fn reinit_keeps_existing_head_branch() {
 fn init_separate_git_dir_git_status_works() {
     let wt = TempDir::new().expect("tempdir");
     let separate = TempDir::new().expect("tempdir");
-    let repo = Repository::init(
+    let (repo, _) = Repository::init(
         wt.path(),
         &InitOptions::new()
             .with_initial_branch("main")
@@ -117,7 +121,7 @@ fn init_separate_git_dir_git_status_works() {
 #[test]
 fn init_sha256_then_commit_git_fsck_clean() {
     let td = TempDir::new().expect("tempdir");
-    let repo = Repository::init(
+    let (repo, _) = Repository::init(
         td.path(),
         &InitOptions::new()
             .with_initial_branch("main")
@@ -138,30 +142,31 @@ fn init_sha256_then_commit_git_fsck_clean() {
     assert_eq!(String::from_utf8_lossy(&format.stdout).trim(), "sha256");
 
     fs::write(td.path().join("file.txt"), "hello\n").expect("write");
-    grit_lib::porcelain::add::stage(
-        &repo,
-        &grit_lib::porcelain::add::StageOptions::default(),
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("stage");
-    let req = grit_lib::porcelain::commit::CommitRequest {
-        message: "test".into(),
-        author: Some("T <t@e.com> 1 +0000".parse().expect("signature")),
-        committer: Some("T <t@e.com> 1 +0000".parse().expect("signature")),
-        allow_empty: false,
-        sign_override: None,
-        amend: false,
-        assume_worktree_synced: false,
-        ..Default::default()
+    &repo
+        .index()
+        .stage(
+            &grit_lib::porcelain::add::StageOptions::default(),
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("stage");
+    let req = {
+        let mut req = grit_lib::porcelain::commit::CommitRequest::new("test");
+        req.author = Some("T <t@e.com> 1 +0000".parse().expect("signature"));
+        req.committer = Some("T <t@e.com> 1 +0000".parse().expect("signature"));
+        req.allow_empty = false;
+        req.sign_override = None;
+        req.amend = false;
+        req.assume_worktree_synced = false;
+        req
     };
-    grit_lib::porcelain::commit::create_commit(
-        &repo,
-        &req,
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("commit");
+    repo.commits()
+        .create_staged(
+            &req,
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("commit");
     git_fsck_ok(repo.git_dir());
 }
 
@@ -175,10 +180,10 @@ fn init_reinit_preserves_sha256_when_object_format_omitted() {
             .with_object_format(HashAlgo::Sha256),
     )
     .expect("init sha256");
-    let (_, outcome) = Repository::init_with_outcome(td.path(), &InitOptions::new())
-        .expect("reinit without object format");
+    let (_, outcome) =
+        Repository::init(td.path(), &InitOptions::new()).expect("reinit without object format");
     assert!(outcome.reinitialized);
-    let repo = Repository::init(td.path(), &InitOptions::new()).expect("open");
+    let (repo, _) = Repository::init(td.path(), &InitOptions::new()).expect("open");
     assert_eq!(repo.odb().hash_algo(), HashAlgo::Sha256);
 }
 
@@ -186,14 +191,17 @@ fn init_reinit_preserves_sha256_when_object_format_omitted() {
 fn init_rejects_bare_with_separate_git_dir() {
     let wt = TempDir::new().expect("tempdir");
     let separate = TempDir::new().expect("tempdir");
-    let err = Repository::init_with_outcome(
+    let err = Repository::init(
         wt.path(),
         &InitOptions::new()
             .with_bare(true)
             .with_separate_git_dir(Some(separate.path().to_path_buf())),
     )
     .unwrap_err();
-    assert!(matches!(err, Error::InitBareWithSeparateGitDir));
+    assert!(matches!(
+        err,
+        Error::Repository(RepositoryError::InitBareWithSeparateGitDir)
+    ));
 }
 
 #[test]
@@ -208,7 +216,7 @@ fn init_reinit_rediscovers_gitfile_without_separate_flag() {
     )
     .expect("init separate");
     let (_, outcome) =
-        Repository::init_with_outcome(wt.path(), &InitOptions::new()).expect("reinit via gitfile");
+        Repository::init(wt.path(), &InitOptions::new()).expect("reinit via gitfile");
     assert!(outcome.reinitialized);
     assert_eq!(outcome.initial_branch, "main");
     let gitfile = fs::read_to_string(wt.path().join(".git")).expect("gitfile");
@@ -218,15 +226,14 @@ fn init_reinit_rediscovers_gitfile_without_separate_flag() {
 #[test]
 fn reinit_allows_detached_head() {
     let td = TempDir::new().expect("tempdir");
-    let repo =
+    let (repo, _) =
         Repository::init(td.path(), &InitOptions::new().with_initial_branch("main")).expect("init");
     fs::write(
         repo.git_dir().join("HEAD"),
         "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n",
     )
     .expect("write detached HEAD");
-    let (_, outcome) =
-        Repository::init_with_outcome(td.path(), &InitOptions::new()).expect("reinit detached");
+    let (_, outcome) = Repository::init(td.path(), &InitOptions::new()).expect("reinit detached");
     assert!(outcome.reinitialized);
     assert_eq!(outcome.initial_branch, "deadbee");
 }

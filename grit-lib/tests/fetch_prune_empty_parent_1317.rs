@@ -5,8 +5,7 @@
 
 use std::fs;
 
-use grit_lib::refs::resolve_ref;
-use grit_lib::remote::transfer::{fetch_local, FetchOptions, TagMode};
+use grit_lib::remote::transfer::{FetchOptions, TagMode};
 use grit_test_support::git;
 
 #[test]
@@ -41,21 +40,53 @@ fn fetch_prune_removes_empty_parent_then_fetch_succeeds() {
     git(&local, &["init", "-q", "-b", "main", "."]);
     let local_git = local.join(".git");
 
-    let wildcard = FetchOptions {
-        refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()],
-        tags: TagMode::None,
-        ..Default::default()
-    };
-    fetch_local(&local_git, &remote, &wildcard).expect("initial fetch");
-    resolve_ref(&local_git, "refs/remotes/origin/feature/x").expect("nested tracking ref");
+    let mut wildcard = FetchOptions::new();
+    wildcard.refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()];
+    wildcard.tags = TagMode::None;
+    grit_lib::repo::Repository::open(
+        &local_git,
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&wildcard).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Local(&remote),
+        &mut wildcard.clone(),
+        &mut grit_lib::remote::fetch::NoProgress,
+        grit_lib::progress::CancelToken::never_ref(),
+    )
+    .expect("initial fetch");
+    grit_test_support::refs::at(&local_git)
+        .references()
+        .resolve("refs/remotes/origin/feature/x")
+        .expect("nested tracking ref");
 
     git(&work, &["push", "-q", "origin", "--delete", "feature/x"]);
 
     let mut pruning = wildcard.clone();
     pruning.prune = true;
-    fetch_local(&local_git, &remote, &pruning).expect("prune fetch");
+    grit_lib::repo::Repository::open(
+        &local_git,
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&pruning).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Local(&remote),
+        &mut pruning.clone(),
+        &mut grit_lib::remote::fetch::NoProgress,
+        grit_lib::progress::CancelToken::never_ref(),
+    )
+    .expect("prune fetch");
     assert!(
-        resolve_ref(&local_git, "refs/remotes/origin/feature/x").is_err(),
+        grit_test_support::refs::at(&local_git)
+            .references()
+            .resolve("refs/remotes/origin/feature/x")
+            .is_err(),
         "nested tracking ref must be gone"
     );
 
@@ -68,8 +99,23 @@ fn fetch_prune_removes_empty_parent_then_fetch_succeeds() {
 
     git(&work, &["push", "-q", "origin", "main:feature"]);
 
-    fetch_local(&local_git, &remote, &wildcard)
-        .expect("fetch after remote republished feature at former parent path");
-    resolve_ref(&local_git, "refs/remotes/origin/feature")
+    grit_lib::repo::Repository::open(
+        &local_git,
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&wildcard).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Local(&remote),
+        &mut wildcard.clone(),
+        &mut grit_lib::remote::fetch::NoProgress,
+        grit_lib::progress::CancelToken::never_ref(),
+    )
+    .expect("fetch after remote republished feature at former parent path");
+    grit_test_support::refs::at(&local_git)
+        .references()
+        .resolve("refs/remotes/origin/feature")
         .expect("new origin/feature tracking ref");
 }

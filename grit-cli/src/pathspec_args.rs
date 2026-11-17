@@ -1,14 +1,14 @@
 //! Shared `--pathspec-from-file` / trailing path arguments for porcelain commands.
 
-use crate::completions::grit;
+use crate::rev_select::RevSelectArgs;
 use anyhow::{bail, Context, Result};
-use carapace_rs::Action;
-use carapace_rs_clap::completer;
 use clap::Args;
 use grit_lib::error::PathspecFromFileParseError;
 use grit_lib::repo::Repository;
+use grit_lib::worktree::pathspec::is_long_magic_pathspec_token;
 use grit_lib::worktree::pathspec::{
-    parse_pathspecs_from_source, PathspecInput, PathspecResolveError, ResolvedPathspecs,
+    parse_pathspecs_from_source, Pathspec, PathspecFile, PathspecGlobalFlags, PathspecOptions,
+    PathspecResolveError,
 };
 use std::io::Read;
 use std::sync::OnceLock;
@@ -18,17 +18,13 @@ static PATHSPEC_STDIN_BYTES: OnceLock<Vec<u8>> = OnceLock::new();
 #[derive(Debug, Clone, Default, Args)]
 pub struct PathspecArgs {
     /// Files or directories to limit the command to.
-    #[arg(
-        value_name = "PATH",
-        add = completer!(grit::action_paths())
-    )]
+    #[arg(value_name = "PATH")]
     pub paths: Vec<String>,
     /// Read pathspecs from a file (`-` for stdin) instead of or in addition to argv paths.
     #[arg(
         long = "pathspec-from-file",
         value_name = "FILE|-",
-        allow_hyphen_values = true,
-        add = completer!(Action::files([]))
+        allow_hyphen_values = true
     )]
     pub pathspec_from_file: Option<String>,
     /// `--pathspec-from-file` entries are NUL-separated.
@@ -40,19 +36,13 @@ pub struct PathspecArgs {
 #[derive(Debug, Clone, Default, Args)]
 pub struct TrailingPathspecArgs {
     /// Limit the command to these paths (after `--`).
-    #[arg(
-        value_name = "PATH",
-        last = true,
-        allow_hyphen_values = true,
-        add = completer!(grit::action_paths())
-    )]
+    #[arg(value_name = "PATH", last = true, allow_hyphen_values = true)]
     pub paths: Vec<String>,
     /// Read pathspecs from a file (`-` for stdin) instead of or in addition to argv paths.
     #[arg(
         long = "pathspec-from-file",
         value_name = "FILE|-",
-        allow_hyphen_values = true,
-        add = completer!(Action::files([]))
+        allow_hyphen_values = true
     )]
     pub pathspec_from_file: Option<String>,
     /// `--pathspec-from-file` entries are NUL-separated.
@@ -60,10 +50,43 @@ pub struct TrailingPathspecArgs {
     pub pathspec_file_nul: bool,
 }
 
+fn pathspec_options_from_repo(
+    repo: &Repository,
+    from_file: Option<PathspecFile>,
+) -> PathspecOptions {
+    let mut options = PathspecOptions::default();
+    options.globals = PathspecGlobalFlags::from_environment(repo.environment());
+    options.from_file = from_file;
+    options
+}
+
+fn resolve_typed_pathspec(
+    repo: &Repository,
+    paths: &[String],
+    pathspec_from_file: Option<&str>,
+    pathspec_file_nul: bool,
+) -> Result<Pathspec> {
+    let from_file = match pathspec_from_file {
+        None => None,
+        Some(path) => {
+            let data = read_pathspec_source(path)?;
+            Some(PathspecFile::new(data, pathspec_file_nul))
+        }
+    };
+    let options = pathspec_options_from_repo(repo, from_file);
+    repo.pathspec(paths, &options).map_err(map_pathspec_resolve)
+}
+
 impl PathspecArgs {
     /// Resolve argv and optional from-file pathspecs against `repo` and the process cwd.
-    pub fn resolve(&self, repo: &Repository) -> Result<ResolvedPathspecs> {
-        resolve_pathspec_args(
+    /// Resolve argv and optional from-file pathspecs against `repo` and the process cwd.
+    pub fn resolve(&self, repo: &Repository) -> Result<Pathspec> {
+        self.resolve_pathspec(repo)
+    }
+
+    /// Resolve into a [`Pathspec`] (preferred for porcelain options).
+    pub fn resolve_pathspec(&self, repo: &Repository) -> Result<Pathspec> {
+        resolve_typed_pathspec(
             repo,
             &self.paths,
             self.pathspec_from_file.as_deref(),
@@ -122,20 +145,24 @@ impl TrailingPathspecArgs {
             .map_err(map_pathspec_from_file_parse)
     }
 
-    /// Pathspec tokens for rev walks (`RevWalkListOptions::paths`): argv plus file lines.
-    ///
-    /// Returns unresolved tokens; [`Repository::resolve_rev_walk_pathspecs`] runs once when the
-    /// walk is built in `grit-lib`.
-    pub fn rev_walk_tokens(&self, _repo: &Repository) -> Result<Vec<String>> {
+    /// Path limit for rev walks ([`grit_lib::revwalk::RevWalkListOptions::pathspec`]).
+    pub fn rev_walk_pathspec(&self, repo: &Repository) -> Result<Pathspec> {
         if !self.has_any() {
-            return Ok(Vec::new());
+            return Ok(Pathspec::entire_tree(
+                PathspecGlobalFlags::from_environment(repo.environment()),
+            ));
         }
-        self.pathspec_source_tokens(&[])
+        self.resolve_pathspec(repo)
     }
 
     /// Resolve argv and optional from-file pathspecs against `repo` and the process cwd.
-    pub fn resolve(&self, repo: &Repository) -> Result<ResolvedPathspecs> {
-        resolve_pathspec_args(
+    pub fn resolve(&self, repo: &Repository) -> Result<Pathspec> {
+        self.resolve_pathspec(repo)
+    }
+
+    /// Resolve into a [`Pathspec`].
+    pub fn resolve_pathspec(&self, repo: &Repository) -> Result<Pathspec> {
+        resolve_typed_pathspec(
             repo,
             &self.paths,
             self.pathspec_from_file.as_deref(),
@@ -152,21 +179,24 @@ impl TrailingPathspecArgs {
     }
 }
 
-fn resolve_pathspec_args(
-    repo: &Repository,
-    paths: &[String],
-    pathspec_from_file: Option<&str>,
-    pathspec_file_nul: bool,
-) -> Result<ResolvedPathspecs> {
-    let cwd = std::env::current_dir().context("could not read the current directory")?;
-    let from_file = match pathspec_from_file {
-        None => None,
-        Some(path) => {
-            let data = read_pathspec_source(path)?;
-            Some(PathspecInput::new(data, pathspec_file_nul))
+/// Moves long-form magic pathspec tokens (`:(...)`) from `rev.revs` onto `pathspecs.paths`.
+///
+/// Clap places trailing operands in `revs` when no `--` separator is given; history commands treat
+/// these as path limits instead of revision names.
+pub fn promote_long_magic_pathspecs_from_revs(
+    rev: &mut RevSelectArgs,
+    pathspecs: &mut TrailingPathspecArgs,
+) {
+    let mut moved = Vec::new();
+    rev.revs.retain(|token| {
+        if is_long_magic_pathspec_token(token) {
+            moved.push(token.clone());
+            false
+        } else {
+            true
         }
-    };
-    ResolvedPathspecs::resolve(repo, &cwd, paths, from_file).map_err(map_pathspec_resolve)
+    });
+    pathspecs.paths.extend(moved);
 }
 
 fn read_pathspec_source(path: &str) -> Result<Vec<u8>> {

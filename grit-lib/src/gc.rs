@@ -16,14 +16,17 @@
 //! Scope note: only the local / on-disk path is in scope here. `git://`,
 //! `http(s)`, and `ssh` remotes are out of scope and left as TODOs.
 
+use crate::error::ObjectError;
 use std::cell::OnceCell;
 use std::collections::{HashSet, VecDeque};
+use std::ops::ControlFlow;
 use std::path::Path;
 use std::time::SystemTime;
 
 use crate::error::{Error, Result};
 use crate::objects::{parse_commit, parse_tag, ObjectId, ObjectKind, OidHashSet, TreeRefIter};
-use crate::odb::Odb;
+use crate::odb::store::PrunableObjectStore;
+use crate::odb::{Odb, PruneTarget};
 use crate::refs::store::{Expected, RawRef, RefUpdate, RefUpdateFlags};
 use crate::refs::{self, Ref};
 
@@ -43,6 +46,13 @@ pub struct PruneStats {
 /// annotated tags → their target) and then removes every **loose** object whose
 /// id is not in that closure. Packed objects are never touched — only loose
 /// object files under `objects/??/` are candidates for deletion.
+///
+/// When the primary is a custom store, every object it lists is a candidate instead,
+/// and the unreachable ones are deleted through its [`PrunableObjectStore`] capability
+/// (see [`WritableObjectStore::as_prunable`](crate::odb::store::WritableObjectStore::as_prunable)),
+/// with [`PrunableObjectStore::object_mtime`] standing in for the file time. This
+/// primitive does not check `extensions.preciousObjects`;
+/// [`crate::maintenance::prune_loose_objects`] does.
 ///
 /// When `keep_newer_than` is `Some(t)`, a loose object is only deleted if its
 /// file modification time is strictly older than `t`. This mirrors Git's
@@ -68,9 +78,13 @@ pub struct PruneStats {
 ///
 /// # Errors
 ///
-/// Returns [`Error::ObjectNotFound`] if a non-promised root is missing, an error if the walk runs
+/// Returns [`crate::error::ObjectError::NotFound`] if a non-promised root is missing, an error if the walk runs
 /// and a reachable object is missing or cannot be read or parsed, or on I/O failure
 /// while enumerating or deleting loose object files.
+/// [`RepositoryError::UnsupportedObjectStore`](crate::repo::RepositoryError::UnsupportedObjectStore)
+/// with [`FilesOnlyOperation::Prune`](crate::repo::error::FilesOnlyOperation::Prune) when the
+/// primary is a custom store without the prune capability; that store's own failures
+/// propagate.
 pub fn prune_loose_unreachable(
     odb: &Odb,
     reachable_roots: &[ObjectId],
@@ -110,7 +124,79 @@ pub(crate) fn prune_loose_unreachable_with(
     keep_newer_than: Option<SystemTime>,
     dry_run: bool,
 ) -> Result<PruneStats> {
-    odb.require_files_primary("gc")?;
+    match odb.prune_target()? {
+        PruneTarget::Files => prune_files_unreachable(odb, reachable, keep_newer_than, dry_run),
+        PruneTarget::Store(store) => {
+            prune_store_unreachable(odb, store, reachable, keep_newer_than, dry_run)
+        }
+    }
+}
+
+/// Objects passed to one [`PrunableObjectStore::remove`] call.
+const PRUNE_REMOVE_BATCH: usize = 1024;
+
+/// Prune a custom primary through its [`PrunableObjectStore`] capability.
+///
+/// Every object the store lists is a candidate; the grace period uses
+/// [`PrunableObjectStore::object_mtime`], keeping objects without a known time.
+fn prune_store_unreachable(
+    odb: &Odb,
+    store: &dyn PrunableObjectStore,
+    reachable: &LazyReachable<'_>,
+    keep_newer_than: Option<SystemTime>,
+    dry_run: bool,
+) -> Result<PruneStats> {
+    let mut stats = PruneStats::default();
+    let mut listed = Vec::new();
+    store.for_each_object(&mut |oid| {
+        listed.push(*oid);
+        ControlFlow::Continue(())
+    })?;
+    let mut candidates = Vec::with_capacity(listed.len());
+    for oid in listed {
+        let too_new = match keep_newer_than {
+            None => false,
+            Some(cutoff) => store
+                .object_mtime(&oid)?
+                .is_none_or(|mtime| mtime >= cutoff),
+        };
+        if too_new {
+            stats.kept += 1;
+        } else {
+            candidates.push(oid);
+        }
+    }
+    if candidates.is_empty() {
+        reachable.require_roots_exist()?;
+        return Ok(stats);
+    }
+
+    let reachable = reachable.get()?;
+    let (kept, unreachable): (Vec<_>, Vec<_>) = candidates
+        .into_iter()
+        .partition(|oid| reachable.contains(oid));
+    stats.kept += kept.len();
+    if dry_run {
+        stats.pruned += unreachable.len();
+        return Ok(stats);
+    }
+    for batch in unreachable.chunks(PRUNE_REMOVE_BATCH) {
+        stats.pruned += store.remove(batch)?;
+    }
+    store.flush()?;
+    if !unreachable.is_empty() {
+        odb.forget_session_reads();
+    }
+    Ok(stats)
+}
+
+/// Prune unreachable loose object files of a files-backed primary.
+fn prune_files_unreachable(
+    odb: &Odb,
+    reachable: &LazyReachable<'_>,
+    keep_newer_than: Option<SystemTime>,
+    dry_run: bool,
+) -> Result<PruneStats> {
     let mut stats = PruneStats::default();
 
     // Respect the grace window first: objects whose mtime is not strictly older than
@@ -157,15 +243,21 @@ pub(crate) fn prune_loose_unreachable_with(
     Ok(stats)
 }
 
-/// Object ids named directly by refs (any kind), used as roots for [`prune_loose_unreachable`].
+/// Ref tips and symbolic-`HEAD`-less detached oids only — not a safe root set for prune.
 ///
-/// Includes annotated tag objects, blob/tree tips, and detached-HEAD oids. Does not peel tags to
-/// commits only — the reachability walk expands each root through the object graph.
+/// Includes annotated tag objects, blob/tree tips, and detached-HEAD oids when `HEAD` is not
+/// symbolic. Does not walk reflogs, indexes, stash, or linked worktrees. Embedders pruning loose
+/// objects should use [`crate::maintenance::collect_maintenance_object_roots`] and
+/// [`Maintenance::prune_loose_objects`](crate::maintenance::Maintenance::prune_loose_objects) instead; pass extra roots to
+/// [`prune_loose_unreachable`] only when unioning with that set (for example Jujutsu).
+///
+/// Pack bitmap generation uses this narrower set so unreachable blobs staged only in an index do
+/// not inflate the bitmap.
 ///
 /// # Errors
 ///
 /// Propagates ref listing or HEAD read failures.
-pub fn collect_referenced_object_roots(git_dir: &Path) -> Result<Vec<ObjectId>> {
+pub(crate) fn collect_referenced_object_roots(git_dir: &Path) -> Result<Vec<ObjectId>> {
     let mut roots = HashSet::new();
     for (_, oid) in refs::list_refs(git_dir, "refs/")? {
         roots.insert(oid);
@@ -198,7 +290,7 @@ pub(crate) struct LazyReachable<'a> {
 impl<'a> LazyReachable<'a> {
     /// Closure of `roots` in `odb`, not following the parents of the `shallow` boundary
     /// commits; nothing is read until [`Self::get`].
-    pub(crate) fn new(odb: &'a Odb, roots: &'a [ObjectId], shallow: &'a HashSet<ObjectId>) -> Self {
+    pub fn new(odb: &'a Odb, roots: &'a [ObjectId], shallow: &'a HashSet<ObjectId>) -> Self {
         Self {
             odb,
             roots,
@@ -212,7 +304,7 @@ impl<'a> LazyReachable<'a> {
     ///
     /// # Errors
     ///
-    /// Same as the reachability walk: [`Error::ObjectNotFound`] for a missing non-promised
+    /// Same as the reachability walk: [`crate::error::ObjectError::NotFound`] for a missing non-promised
     /// object, and read or parse errors.
     pub(crate) fn get(&self) -> Result<&OidHashSet> {
         if let Some(closure) = self.closure.get() {
@@ -222,13 +314,13 @@ impl<'a> LazyReachable<'a> {
         Ok(self.closure.get_or_init(|| closure))
     }
 
-    /// Fail with [`Error::ObjectNotFound`] when a non-promised root is missing.
+    /// Fail with [`crate::error::ObjectError::NotFound`] when a non-promised root is missing.
     pub(crate) fn require_roots_exist(&self) -> Result<()> {
         if self.closure.get().is_some() {
             return Ok(());
         }
         match require_objects_exist(self.odb, self.roots, &HashSet::new()) {
-            Err(Error::ObjectNotFound(_)) => {
+            Err(Error::Object(ObjectError::NotFound { .. })) => {
                 require_objects_exist(self.odb, self.roots, self.promised()?)
             }
             result => result,
@@ -258,7 +350,7 @@ pub(crate) const S_IFDIR: u32 = 0o040000;
 ///
 /// # Errors
 ///
-/// [`Error::ObjectNotFound`] when a reachable object is missing, and read or parse
+/// [`crate::error::ObjectError::NotFound`] when a reachable object is missing, and read or parse
 /// errors for the objects that are walked.
 fn reachable_closure(
     odb: &Odb,
@@ -285,7 +377,7 @@ fn reachable_closure(
         }
         let obj = odb
             .try_read_once(&oid)?
-            .ok_or_else(|| Error::ObjectNotFound(oid.to_hex()))?;
+            .ok_or_else(|| Error::Object(ObjectError::NotFound { name: oid.to_hex() }))?;
         match obj.kind {
             ObjectKind::Commit => {
                 let commit = parse_commit(&obj.data)?;
@@ -336,7 +428,7 @@ fn reachable_closure(
     Ok(seen)
 }
 
-/// Fail with [`Error::ObjectNotFound`] for the first of `oids` that does not exist.
+/// Fail with [`crate::error::ObjectError::NotFound`] for the first of `oids` that does not exist.
 ///
 /// Local pack indexes are loaded once and searched directly: going through
 /// [`Odb::exists`] or [`Odb::read_info`] per object revalidates the pack directory
@@ -349,7 +441,7 @@ fn require_objects_exist(odb: &Odb, oids: &[ObjectId], promised: &HashSet<Object
         }
         let packed = indexes.iter().any(|idx| idx.find_position(oid).is_some());
         if !packed && !odb.contains(oid)? {
-            return Err(Error::ObjectNotFound(oid.to_hex()));
+            return Err(Error::Object(ObjectError::NotFound { name: oid.to_hex() }));
         }
     }
     Ok(())
@@ -366,7 +458,7 @@ fn require_objects_exist(odb: &Odb, oids: &[ObjectId], promised: &HashSet<Object
 /// target), e.g. `main` for a `HEAD` pointing at `refs/heads/main`.
 ///
 /// This is the `git remote show <remote>` default-branch lookup for a local /
-/// `file://` remote. It reuses [`crate::remote::list_refs_from_git_dir`]'s symref handling
+/// `file://` remote. It reuses `crate::remote::list_refs_from_git_dir`'s symref handling
 /// to read the remote `HEAD` and strips the `refs/heads/` prefix from its
 /// target. Returns `None` when the remote has no symbolic `HEAD` (e.g. a
 /// detached or absent `HEAD`).
@@ -388,8 +480,7 @@ pub fn remote_default_branch_local(remote_git_dir: &Path) -> Result<Option<Strin
             symrefs: true,
             ..Default::default()
         },
-    )
-    .map_err(crate::error::Error::from)?;
+    )?;
 
     for entry in &entries {
         if entry.name == "HEAD" {
@@ -430,9 +521,9 @@ pub struct RefTransactionItem {
 /// and **nothing** is written (all-or-nothing). Only once all CAS checks pass
 /// are the changes applied:
 ///
-/// * `new_oid = Some(oid)` writes (creates or updates) the ref to `oid` via
-///   [`crate::refs::write_ref`].
-/// * `new_oid = None` deletes the ref via [`crate::refs::delete_ref`].
+/// * `new_oid = Some(oid)` writes (creates or updates) the ref to `oid`, with the same
+///   object checks as [`References::update`](crate::refs::References::update).
+/// * `new_oid = None` deletes the ref.
 ///
 /// This is a thin transactional wrapper over the [`crate::refs`] primitives,
 /// matching the in-process ref-update path jj built on `gix::refs::transaction`.
@@ -458,7 +549,7 @@ fn ref_transaction_item_to_store_update(item: &RefTransactionItem) -> RefUpdate 
         flags.no_deref = true;
     }
     RefUpdate {
-        name: item.name.clone(),
+        name: crate::refs::store::RefName::from_trusted(item.name.clone()),
         new_value: item.new_oid.map(RawRef::Direct),
         expected: match item.expected_old {
             Some(oid) => Expected::Oid(oid),
@@ -473,6 +564,7 @@ fn ref_transaction_item_to_store_update(item: &RefTransactionItem) -> RefUpdate 
 mod update_refs_tests {
     use super::*;
     use crate::error::Error;
+    use crate::error::RefError;
     use crate::refs::store::RefStoreError;
     use crate::repo::init_repository;
     use tempfile::TempDir;
@@ -507,7 +599,7 @@ mod update_refs_tests {
         ];
         let err = update_refs(&repo.git_dir(), &items).expect_err("duplicate");
         match &err {
-            Error::RefStore(RefStoreError::DuplicateUpdate { name }) => {
+            Error::Ref(RefError::Store(RefStoreError::DuplicateUpdate { name })) => {
                 assert_eq!(name, "refs/heads/dup");
             }
             other => panic!("expected DuplicateUpdate, got {other}"),
@@ -540,7 +632,7 @@ mod update_refs_tests {
         )
         .expect_err("stale cas");
         match &err {
-            Error::RefStore(RefStoreError::ExpectedMismatch { name, .. }) => {
+            Error::Ref(RefError::Store(RefStoreError::ExpectedMismatch { name, .. })) => {
                 assert_eq!(name, "refs/heads/cas");
             }
             other => panic!("expected ExpectedMismatch, got {other}"),
@@ -573,7 +665,10 @@ mod update_refs_tests {
         )
         .expect_err("stale cas");
         assert!(
-            matches!(err, Error::RefStore(RefStoreError::ExpectedMismatch { .. })),
+            matches!(
+                err,
+                Error::Ref(RefError::Store(RefStoreError::ExpectedMismatch { .. }))
+            ),
             "{err}"
         );
         assert_eq!(
@@ -588,13 +683,13 @@ mod update_refs_tests {
     )]
     #[test]
     fn apply_cas_rejects_after_concurrent_packed_delete() {
-        let _pause_serial = refs::test_pause_injection_serial_guard();
+        let _pause_serial = refs::inject::pause_injection_test_scope();
         use std::path::Path;
         use std::process::Command;
         use std::sync::Arc;
         use std::thread;
 
-        let _pause_scope = refs::ref_store_batch_pause_test_scope();
+        let _pause_scope = refs::inject::ref_store_batch_pause_test_scope();
 
         fn git(dir: &Path, args: &[&str]) {
             let out = Command::new("git")
@@ -656,12 +751,8 @@ mod update_refs_tests {
             let _ = std::fs::remove_file(git_dir.join(format!("refs/heads/{name}")));
         }
 
-        let gate = refs::new_ref_store_batch_pause_gate();
-        refs::set_test_inject_ref_store_batch_pause_after_apply(
-            0,
-            &git_dir,
-            Some(Arc::clone(&gate)),
-        );
+        let gate = refs::inject::ref_store_batch_pause_gate();
+        refs::inject::set_ref_store_batch_pause_after_apply(0, &git_dir, Some(Arc::clone(&gate)));
 
         let updates = vec![
             RefTransactionItem {
@@ -701,7 +792,7 @@ mod update_refs_tests {
 
         let err = worker.join().expect("join").expect_err("stale CAS");
         match &err {
-            Error::RefStore(RefStoreError::ExpectedMismatch { name, .. }) => {
+            Error::Ref(RefError::Store(RefStoreError::ExpectedMismatch { name, .. })) => {
                 assert_eq!(name, "refs/heads/last");
             }
             other => panic!("expected ExpectedMismatch for last ref, got {other}"),
@@ -712,7 +803,7 @@ mod update_refs_tests {
             c2
         );
 
-        refs::set_test_inject_ref_store_batch_pause_after_apply(0, &git_dir, None);
+        refs::inject::set_ref_store_batch_pause_after_apply(0, &git_dir, None);
     }
 
     #[cfg_attr(
@@ -721,13 +812,13 @@ mod update_refs_tests {
     )]
     #[test]
     fn unconditional_create_rejects_after_concurrent_packed_parent() {
-        let _pause_serial = refs::test_pause_injection_serial_guard();
+        let _pause_serial = refs::inject::pause_injection_test_scope();
         use std::path::Path;
         use std::process::Command;
         use std::sync::Arc;
         use std::thread;
 
-        let _pause_scope = refs::ref_store_batch_pause_test_scope();
+        let _pause_scope = refs::inject::ref_store_batch_pause_test_scope();
 
         fn git(dir: &Path, args: &[&str]) {
             let out = Command::new("git")
@@ -776,12 +867,8 @@ mod update_refs_tests {
         git(&repo, &["commit", "-q", "-m", "c1"]);
         let c1 = rev_parse(&repo, "HEAD");
 
-        let gate = refs::new_ref_store_batch_pause_gate();
-        refs::set_test_inject_ref_store_batch_pause_after_apply(
-            0,
-            &git_dir,
-            Some(Arc::clone(&gate)),
-        );
+        let gate = refs::inject::ref_store_batch_pause_gate();
+        refs::inject::set_ref_store_batch_pause_after_apply(0, &git_dir, Some(Arc::clone(&gate)));
 
         let updates = vec![
             RefTransactionItem {
@@ -829,7 +916,7 @@ mod update_refs_tests {
         assert!(crate::refs::resolve_ref(&git_dir, "refs/heads/conflict").is_ok());
         assert!(crate::refs::resolve_ref(&git_dir, "refs/heads/conflict/child").is_err());
 
-        refs::set_test_inject_ref_store_batch_pause_after_apply(0, &git_dir, None);
+        refs::inject::set_ref_store_batch_pause_after_apply(0, &git_dir, None);
     }
 }
 
@@ -868,7 +955,10 @@ mod prune_walk_tests {
             .expect("cached promises")
             .contains(&missing));
         let next = LazyReachable::new(repo.odb(), &roots, &shallow);
-        assert!(matches!(next.get(), Err(Error::ObjectNotFound(_))));
+        assert!(matches!(
+            next.get(),
+            Err(Error::Object(ObjectError::NotFound { .. }))
+        ));
     }
 
     #[test]
@@ -903,7 +993,13 @@ mod prune_walk_tests {
             format!("{}\n", commit.to_hex()),
         )
         .expect("ref");
-        repack(&repo, &RepackOptions::default()).expect("repack");
+        repack(
+            &repo,
+            &RepackOptions::default(),
+            &mut crate::progress::NullProgress,
+            &crate::progress::CancelToken::never(),
+        )
+        .expect("repack");
         assert!(odb
             .enumerate_local_loose_objects()
             .expect("loose")

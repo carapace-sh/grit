@@ -1,15 +1,18 @@
 //! Forced multi-source move rollback when a later source is missing from the work tree.
 
+use grit_lib::worktree::WorktreeError;
 use std::fs;
 use std::path::Path;
 
-use grit_lib::porcelain::add::{stage, StageOptions};
-use grit_lib::porcelain::paths::{move_paths, MoveOptions};
+use grit_lib::porcelain::add::StageOptions;
+use grit_lib::porcelain::paths::MoveOptions;
 use grit_lib::progress::NullProgress;
 use grit_lib::repo::{InitOptions, Repository};
 
 fn init_repo(root: &Path) -> Repository {
-    Repository::init(root, &InitOptions::default()).expect("init")
+    Repository::init(root, &InitOptions::default())
+        .expect("init")
+        .0
 }
 
 #[test]
@@ -24,29 +27,34 @@ fn multi_source_missing_later_source_rolls_back_earlier_forced_move() {
     fs::write(root.join("src/f0001"), b"SOURCE-1\n").expect("source 1");
     fs::write(root.join("dest/f0000"), b"OLDDEST-0\n").expect("old 0");
     fs::write(root.join("dest/f0001"), b"OLDDEST-1\n").expect("old 1");
-    stage(
-        &repo,
-        &StageOptions::default(),
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("stage");
+    repo.index()
+        .stage(
+            &StageOptions::default(),
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("stage");
 
     fs::remove_file(root.join("src/f0001")).expect("drop later source");
 
-    let err = move_paths(
-        &repo,
-        &MoveOptions {
-            sources: vec!["src/f0000".into(), "src/f0001".into()],
-            destination: "dest".into(),
-            force: true,
-            dry_run: false,
-        },
-    )
-    .expect_err("missing later source");
+    let err = repo
+        .checkout()
+        .move_paths(
+            &MoveOptions {
+                sources: vec!["src/f0000".into(), "src/f0001".into()],
+                destination: "dest".into(),
+                force: true,
+                dry_run: false,
+            },
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect_err("missing later source");
 
     assert!(
-        matches!(err, grit_lib::error::Error::MoveBadSource { .. }),
+        matches!(
+            err,
+            grit_lib::error::Error::Worktree(WorktreeError::MoveBadSource { .. })
+        ),
         "unexpected error: {err:?}"
     );
     assert_eq!(

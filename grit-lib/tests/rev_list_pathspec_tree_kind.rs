@@ -5,12 +5,12 @@ use std::process::Command;
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::objects::{serialize_commit, serialize_tree, CommitData, ObjectKind, TreeEntry};
 use grit_lib::repo::{InitOptions, Repository};
-use grit_lib::revwalk::rev_list::{rev_list, RevListOptions};
+use grit_lib::revwalk::rev_list::RevListOptions;
 
 #[test]
 fn pathspec_log_skips_commit_when_tree_header_points_at_blob() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let repo = Repository::init(dir.path(), &InitOptions::new().with_initial_branch("main"))
+    let (repo, _) = Repository::init(dir.path(), &InitOptions::new().with_initial_branch("main"))
         .expect("init");
     let blob_oid = repo
         .objects()
@@ -41,7 +41,7 @@ fn pathspec_log_skips_commit_when_tree_header_points_at_blob() {
         .objects()
         .write(ObjectKind::Commit, &serialize_commit(&commit))
         .expect("commit");
-    grit_lib::refs::write_ref(repo.git_dir(), "refs/heads/main", &commit_oid).expect("update ref");
+    grit_test_support::refs::set_ref(&repo, "refs/heads/main", &commit_oid).expect("update ref");
 
     let git_log = Command::new("git")
         .current_dir(dir.path())
@@ -61,7 +61,7 @@ fn pathspec_log_skips_commit_when_tree_header_points_at_blob() {
         paths: vec!["tracked.txt".to_owned()],
         ..Default::default()
     };
-    let result = rev_list(&open, &["HEAD".to_owned()], &[], &opts);
+    let result = open.revwalk().rev_list(&["HEAD".to_owned()], &[], &opts);
     match result {
         Err(_) => {}
         Ok(out) => assert!(

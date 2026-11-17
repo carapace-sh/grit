@@ -4,7 +4,7 @@ Grit compares library micro-benchmarks (Criterion) and command-level scenarios (
 
 ## `make bench-lib`
 
-Runs every Criterion bench under `grit-lib/benches/` (including `unstable-bench-helpers` where required), then writes a JSON summary:
+Runs every Criterion bench under `grit-lib/benches/` (with the `test-support` feature where a bench needs fixtures or hooks), then writes a JSON summary:
 
 | Output | Description |
 | --- | --- |
@@ -289,3 +289,100 @@ near zero. The native block includes paired-bootstrap 95% intervals from 5,000
 resamples of the 60 round indices (reset RNG seed 4626 per case), taking
 `median(candidate) - median(stock)`. Loader-only and GNU-time cross-checks use
 the runner's isolated environment, recorded in `isolated_env_overrides`.
+
+## Hot text layout
+
+Short commands' peak RSS is mostly the binary's own code: the kernel maps file-backed text
+in 64 KB fault-around windows, so a function run once makes its whole window resident, and
+the library functions an operation runs are otherwise scattered over the whole `.text`.
+`grit-lib`'s `hot-text-layout` feature lays the library's hot code path out contiguously in
+every binary that links it; `grit` enables it and lays out its own hot code the same way
+(see [Benchmarks](benchmarks.md#status-memory-is-code-layout-2026-10-31) and
+[Benchmarks](benchmarks.md#the-cli-joins-the-hot-text-layout-2026-10-31)).
+
+- [`grit-lib/hot-text.ld`](https://github.com/gitbutlerapp/grit/blob/main/grit-lib/hot-text.ld)
+  lists the functions of grit-lib, the Rust runtime and grit-lib's own dependencies that the
+  library's common operations run. Anything that names another crate, such as a CLI type
+  or clap, is left out.
+- `grit-lib/build.rs` publishes the fragment as a native library. LLD reads it as an
+  implicit linker script and places the listed functions in one `.text.grit_hot` output
+  section ahead of `.text`.
+- [`grit-cli/hot-text.ld`](https://github.com/gitbutlerapp/grit/blob/main/grit-cli/hot-text.ld)
+  lists everything else the same workloads run in the `grit` binary: the CLI's own code,
+  clap, and library generics the CLI instantiates. `grit-cli/build.rs` passes it to the
+  final link of `grit` only, which places those functions in `.text.grit_cli_hot`, also
+  ahead of `.text`. Every command runs argument parsing and CLI start-up first, so this
+  half matters as much as the library's for short commands.
+- GNU ld rejects `SECTIONS` in implicit scripts, so both fragments only act on
+  `x86_64-unknown-linux-gnu`, where rustc links with LLD by default. Set
+  `GRIT_HOT_TEXT_LAYOUT=0` to turn them off, for example when linking with another linker.
+- Patterns glob input-section names with crate hashes wildcarded, so version bumps keep
+  them matching. A function that is renamed or no longer runs simply stays in `.text`.
+- Every function matches with and without a local-copy suffix. ThinLTO in the `release`
+  profile renames a function it shares between codegen units to `name.llvm.<n>`, while the
+  single-unit `dist` build keeps most names bare, so a list that pinned either form would
+  miss much of the other build.
+- The instantiating crate at the end of a generic's symbol is wildcarded as well. LLVM
+  merges identical instantiations from different crates into one copy, and which crate's
+  name the survivor keeps changes between builds: the stripped `dist` binary can name
+  `<String as Display>::fmt` after `serde_json` where the profiled unstripped one named it
+  after `grit`. About one pattern in eight names an instantiating crate; with it pinned,
+  `grit branch` on the shipped build still faulted in 12 windows of plain `.text`, against
+  5 with the wildcard.
+- Every alias of an executed function is listed. LLVM merges functions with identical code
+  (`RawVec<T>::grow_one` for every same-sized `T`) into one body and keeps the other names
+  as aliases at the same address. The body's input section is named after one of them,
+  while callgrind reports whichever name it picks for the address, so listing only that
+  name left 15 such bodies in `.text` on a `release` build of `grit status`.
+- Impl disambiguators (`Ms<n>_`) are kept, and they depend on grit-lib's features. Building
+  `grit` together with `grit-utils`, as the daily census does, turns on `serde-models`,
+  whose extra impls renumber them, while shipped binaries build `grit-cli` alone. The
+  generator profiles both builds of both profiles, so the lists match either one (see
+  [Benchmarks](benchmarks.md#pick-revert-and-merge-join-the-hot-text-layout-2026-11-02)).
+- The `hot_text_layout` test fails if either section is missing, smaller than its floor
+  (256 KiB for the library, 128 KiB for the CLI, the sign that most patterns stopped
+  matching), or not ahead of `.text`.
+
+Regenerate both lists after large library or CLI changes, from an unstripped `dist` build
+and a `release` build:
+
+```bash
+CARGO_PROFILE_DIST_STRIP=false CARGO_TARGET_DIR=target/hot-text \
+  cargo build --profile dist -p grit-cli
+CARGO_TARGET_DIR=target/hot-text cargo build --release -p grit-cli
+python3 scripts/gen_hot_text_layout.py \
+  --grit target/hot-text/dist/grit --grit target/hot-text/release/grit
+```
+
+The script needs `valgrind`. It builds a 10,000-file clone (packed objects and refs, tags,
+an upstream) and runs the library's common operations through each binary, so inlining
+matches what is linked: status, diff, log (one page and a streamed `--json` listing), show,
+revision walks, blame, refs, branch listing and edits, config, add, commit, stash, and
+switch twice: to a branch about 300 files away (the parallel checkout) and to one 50 files
+away, below `checkout.thresholdForParallelism`, which writes files on the serial path every
+small switch takes. Each workload starts right after a reset, so its first step also takes the
+index-refresh path. Callgrind records every function each step runs; the script merges what
+the builds ran and splits it into the library's functions and the rest. Each list keeps the
+functions that the same set of workloads runs together, and orders those groups in reflected
+binary (Gray code) order over the workloads, status first: neighbouring groups differ in as
+few workloads as possible, so each command's code forms a few long runs. Sorting by how many
+workloads share a function, as the lists did before, cut a command's code into one slice per
+sharing count. The order of `WORKLOADS` matters: the first two workloads' code is one run
+each, and the further down the list a workload is, the more runs its code splits into, so
+the commands whose memory matters most come first. The CLI's list keeps the older sort by
+sharing count and uses the Gray order only between equally shared functions: every command
+runs the CLI's start-up and argument parsing, so that shared core stays dense at the front,
+and the full Gray order there cost config and ref listings a window each.
+
+Both orders are then refined by a search: it moves whole groups and keeps a move when the
+64 KB windows all workloads touch, counted with each build's code sizes and averaged over
+four section start offsets, do not rise in total and no workload's own count rises above
+what the starting order gave it. The search is seeded, so a regeneration from the same
+builds is reproducible; `--search-iterations 0` keeps the plain Gray order. Both builds
+matter: the shipped `dist` binary inlines more under fat LTO, while the `release` build that
+development and local benchmarking use keeps functions such as clap's command construction
+separate, and those are cold in a list taken from `dist` alone.
+
+To see where a run's resident pages are, stop the process at `exit_group` under `gdb` and
+read `/proc/<pid>/smaps` (per mapping) or `/proc/<pid>/pagemap` (per page, to map back to
+symbols with `nm`).

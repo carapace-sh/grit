@@ -1,30 +1,12 @@
 //! `grit repack` — pack loose objects and remove redundant packs.
 
-use std::io::Write;
-
 use anyhow::Result;
-use grit_lib::maintenance::{repack_all, RepackOptions, RepackStats};
-use schemars::JsonSchema;
-use serde::Serialize;
+use grit_lib::maintenance::{RepackOptions, RepackStats};
 
 use crate::context;
-use crate::output::{outln, HumanRender, MarkdownRender, RenderContext};
 use crate::ui::filesystem_path_for_user;
 
-/// Result of `grit repack`.
-#[derive(Serialize, JsonSchema)]
-pub struct RepackOutcome {
-    #[serde(skip)]
-    pub quiet: bool,
-    pub dry_run: bool,
-    pub loose_before: usize,
-    pub packs_before: usize,
-    pub objects_packed: Option<usize>,
-    pub pack_bytes: Option<u64>,
-    pub pack_path: Option<String>,
-    pub removed_pack_files: usize,
-    pub pruned_loose: usize,
-}
+pub use crate::render::repack::RepackOutcome;
 
 impl From<(RepackStats, bool, bool)> for RepackOutcome {
     fn from((stats, dry_run, quiet): (RepackStats, bool, bool)) -> Self {
@@ -42,63 +24,19 @@ impl From<(RepackStats, bool, bool)> for RepackOutcome {
     }
 }
 
-impl HumanRender for RepackOutcome {
-    fn render_human(&self, w: &mut dyn Write, _ctx: &RenderContext) -> Result<()> {
-        if self.quiet {
-            return Ok(());
-        }
-        if self.dry_run {
-            outln!(
-                w,
-                "Would pack {} objects ({} loose, {} pack files now).",
-                self.objects_packed.unwrap_or(0),
-                self.loose_before,
-                self.packs_before
-            );
-            return Ok(());
-        }
-        if let Some(path) = &self.pack_path {
-            outln!(
-                w,
-                "Packed {} objects into {} ({} redundant pack files removed, {} loose objects pruned).",
-                self.objects_packed.unwrap_or(0),
-                path,
-                self.removed_pack_files,
-                self.pruned_loose
-            );
-        } else {
-            outln!(w, "Nothing to repack.");
-        }
-        Ok(())
-    }
-}
-
-impl MarkdownRender for RepackOutcome {
-    fn render_markdown(&self, w: &mut dyn Write, _ctx: &RenderContext) -> Result<()> {
-        outln!(w, "## Repack\n");
-        outln!(w, "- **dry_run:** {}", self.dry_run);
-        outln!(w, "- **loose_before:** {}", self.loose_before);
-        outln!(w, "- **packs_before:** {}", self.packs_before);
-        if let Some(n) = self.objects_packed {
-            outln!(w, "- **objects_packed:** {n}");
-        }
-        if let Some(bytes) = self.pack_bytes {
-            outln!(w, "- **pack_bytes:** {bytes}");
-        }
-        if let Some(path) = &self.pack_path {
-            outln!(w, "- **pack_path:** `{path}`");
-        }
-        outln!(w, "- **removed_pack_files:** {}", self.removed_pack_files);
-        outln!(w, "- **pruned_loose:** {}", self.pruned_loose);
-        Ok(())
-    }
-}
-
 pub fn run(force: bool, dry_run: bool, quiet: bool) -> Result<RepackOutcome> {
     let repo = context::discover()?;
     let mut opts = RepackOptions::with_dry_run(dry_run);
     opts.force_recompress = force;
-    let stats = repack_all(&repo, &opts).map_err(crate::json_error::map_lib_error)?;
+    let _interrupt = crate::interrupt::InterruptCancel::install();
+    let stats = repo
+        .maintenance()
+        .repack_all(
+            &opts,
+            &mut grit_lib::progress::NullProgress,
+            &crate::interrupt::process_cancel_token(),
+        )
+        .map_err(crate::json_error::map_lib_error)?;
     Ok((stats, dry_run, quiet).into())
 }
 
@@ -109,12 +47,10 @@ mod tests {
     use time::OffsetDateTime;
 
     use super::*;
-    use crate::output::RenderContext;
+    use crate::output::{HumanRender, RenderContext};
 
     fn sample_ctx() -> RenderContext {
-        RenderContext {
-            now: OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("valid timestamp"),
-        }
+        crate::render::RenderContext::human_for_tests()
     }
 
     #[test]
@@ -137,4 +73,27 @@ mod tests {
         assert!(!line.contains(r"\\?\"));
         assert!(line.contains("C:/repo/.git/objects/pack/pack-abc.pack"));
     }
+}
+
+/// Dispatch parsed CLI args for `Repack`.
+pub fn dispatch(
+    args: crate::args::RepackArgs,
+    env: crate::dispatch::CommandEnv<'_>,
+) -> anyhow::Result<crate::exit_status::ExitStatus> {
+    use crate::args::*;
+    use crate::commands;
+
+    use crate::dispatch::{emit_success, CommandEnv};
+
+    let CommandEnv {
+        opts,
+        ctx,
+        process_env: _,
+    } = env;
+    let RepackArgs {
+        force,
+        dry_run,
+        quiet,
+    } = args;
+    emit_success(commands::repack::run(force, dry_run, quiet)?, opts, ctx)
 }

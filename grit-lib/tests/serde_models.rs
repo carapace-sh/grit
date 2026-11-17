@@ -22,17 +22,35 @@ fn result_models_implement_serialize() {
     assert_serialize::<grit_lib::porcelain::branch::BranchList>();
     assert_serialize::<grit_lib::remote::transfer::FetchOutcome>();
     assert_serialize::<grit_lib::remote::transfer::PushOutcome>();
-    assert_serialize::<grit_lib::porcelain::stash::StashEntry>();
-    assert_serialize::<grit_lib::porcelain::stash::StashApplyOutcome>();
+    assert_serialize::<grit_lib::stash::StashEntry>();
+    assert_serialize::<grit_lib::stash::StashApplyOutcome>();
     assert_serialize::<grit_lib::ident::Signature>();
     assert_serialize::<grit_lib::revwalk::history::RewritePlan>();
     assert_serialize::<grit_lib::revwalk::history::RebaseOutcome>();
-    assert_serialize::<grit_lib::operation::Operation>();
+    assert_serialize::<grit_lib::state::Operation>();
     assert_serialize::<grit_lib::operation::Conflict>();
     assert_serialize::<grit_lib::error::Error>();
     assert_serialize::<grit_lib::porcelain::status::StatusModel>();
     assert_serialize::<grit_lib::porcelain::log::LoadedCommit>();
     assert_serialize::<grit_lib::diff::DiffEntry>();
+    assert_serialize::<grit_lib::porcelain::tag::TagSummary>();
+    assert_serialize::<grit_lib::porcelain::tag::TagList>();
+    assert_serialize::<grit_lib::blame::BlameResult>();
+    assert_serialize::<grit_lib::blame::BlameHunk>();
+    assert_serialize::<grit_lib::blame::BlameCommitInfo>();
+    assert_serialize::<grit_lib::blame::BlameAttributedLine>();
+    assert_serialize::<grit_lib::worktree::WorktreeEntry>();
+    assert_serialize::<grit_lib::refs::store::RefName>();
+    assert_serialize::<grit_lib::objects::ObjectKind>();
+    assert_serialize::<grit_lib::porcelain::workspace_snapshot::WorkspaceSnapshot>();
+    assert_serialize::<grit_lib::revwalk::DescribedCommit>();
+}
+
+fn assert_deserialize<T: serde::de::DeserializeOwned>() {}
+
+#[test]
+fn workspace_snapshot_implement_deserialize() {
+    assert_deserialize::<grit_lib::porcelain::workspace_snapshot::WorkspaceSnapshot>();
 }
 
 fn sample_signature() -> grit_lib::ident::Signature {
@@ -104,6 +122,7 @@ fn porcelain_dtos_serialize_to_stable_json_shapes() {
         staged: vec![],
         unstaged: vec![],
         untracked: vec![],
+        embedded_repositories: vec![],
         ignored: vec![],
         conflicts: vec!["a.txt".into()],
         conflict_details: vec![Conflict {
@@ -190,38 +209,59 @@ fn diff_entry_modes_serialize_as_octal_strings() {
 
 #[test]
 fn errors_serialize_with_kind_and_message() {
-    let err = grit_lib::error::Error::NothingToCommit;
+    let err = grit_lib::error::Error::Commit(grit_lib::porcelain::CommitError::NothingToCommit);
     let json = serde_json::to_value(&err).expect("Error");
     assert_eq!(json["kind"], "nothing_to_commit");
     assert_eq!(json["message"], err.to_string());
+    assert_eq!(json["area"], "commit");
 
     let err = grit_lib::error::Error::Cancelled;
     assert_eq!(err.kind_name(), "cancelled");
 
-    let err = grit_lib::error::Error::LockHeld {
+    let err = grit_lib::error::Error::LockHeld(grit_lib::error::LockHeldError {
         path: std::path::PathBuf::from(".git/index.lock"),
         holder: Some(grit_lib::lockfile::LockHolder {
             pid: 42,
             running: true,
         }),
-    };
+    });
     let json = serde_json::to_value(&err).expect("LockHeld");
     assert_eq!(json["kind"], "lock_held");
+    assert_eq!(json["area"], "lock_held");
     assert_eq!(json["path"], ".git/index.lock");
     assert_eq!(json["holder"]["pid"], 42);
     assert_eq!(json["holder"]["running"], true);
 
-    let err = grit_lib::error::Error::StashCouldNotRestoreUntracked {
+    let err = grit_lib::stash::StashError::CouldNotRestoreUntracked {
         path: "u.txt".into(),
     };
     let json = serde_json::to_value(&err).expect("stash untracked");
+    assert_eq!(json["kind"], "stash_could_not_restore_untracked");
     assert_eq!(json["path"], "u.txt");
+}
+
+#[test]
+fn commit_author_info_serializes_rfc3339_date() {
+    let info = grit_lib::porcelain::commit::CommitAuthorInfo {
+        name: "Ada Lovelace".into(),
+        email: "ada@example.com".into(),
+        date: "1700000000 -0800".into(),
+    };
+    let json = serde_json::to_value(&info).expect("CommitAuthorInfo");
+    assert_eq!(
+        json,
+        serde_json::json!({
+            "name": "Ada Lovelace",
+            "email": "ada@example.com",
+            "date": "2023-11-14T14:13:20-08:00",
+        })
+    );
 }
 
 #[test]
 fn stash_and_branch_outcomes_serialize() {
     let oid = ObjectId::from_hex("4b825dc642cb6eb9a060e54bf8d69288fbee4904").expect("oid");
-    let entry = grit_lib::porcelain::stash::StashEntry {
+    let entry = grit_lib::stash::StashEntry {
         index: 0,
         oid,
         message: "WIP on main".into(),

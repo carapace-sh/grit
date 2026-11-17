@@ -1,9 +1,10 @@
 //! Restore working tree and/or index paths from the index, `HEAD`, or another tree
 //! (`git restore` semantics).
 
-use std::collections::{BTreeSet, HashSet};
+use crate::worktree::WorktreeError;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::diff::{
@@ -11,25 +12,30 @@ use crate::diff::{
     submodule_embedded_git_dir,
 };
 use crate::environment::RepositoryOptions;
-use crate::error::{Error, Result};
-use crate::index::{
-    entry_from_metadata, Index, IndexEntry, IndexLock, MODE_EXECUTABLE, MODE_GITLINK,
-};
+use crate::error::{Error, FilterError, Result, SubmoduleError};
+use crate::index::{Index, IndexEntry, IndexLock, MODE_EXECUTABLE, MODE_GITLINK, MODE_SYMLINK};
+use crate::index_name_hash_lazy::memihash;
 use crate::merge_file::{is_binary, merge, ConflictStyle, MergeFavor, MergeInput};
 use crate::objects::ObjectKind;
 use crate::objects::{parse_commit, ObjectId};
-use crate::pathspec::{
-    pathspec_is_exclude, sorted_paths_match_pathspec, PathspecListMatcher, PathspecMatchContext,
-};
+use crate::path_icase::{paths_equal, IcaseIndexCollisionGroups};
+use crate::pathspec::{pathspec_is_exclude, PathspecMatchContext};
 use crate::porcelain::checkout::{
-    checkout_between_trees, remove_empty_parent_dirs, write_blob_to_worktree,
-    write_smudged_blob_to_worktree, CheckoutJournal, LeadingDirCache,
+    checkout_between_trees, index_entry_from_worktree_write, remove_empty_parent_dirs,
+    remove_empty_parent_dirs_batch, write_blob_to_worktree, write_smudged_blob_to_worktree,
+    CheckoutJournal, LeadingDirCache,
 };
 use crate::porcelain::index_from_tree::refresh_stage0_index_stats_for_paths;
+use crate::porcelain::paths::case_only_worktree_rename;
+use crate::porcelain::pathspec_match::{
+    index_path_mode_for_pathspec, positive_pathspec_matches_any_path,
+    positive_spec_matches_any_entries, PathspecMatchEntry, RepositoryPathspecFilter,
+};
 use crate::porcelain::stash::{flat_tree_lookup, flatten_tree_full, FlatTreeEntry};
-use crate::progress::{poll_cancel, Cancel, ProgressPhase, ProgressSink};
+use crate::progress::{poll_cancel, CancelToken, ProgressPhase, ProgressSink};
 use crate::repo::Repository;
-use crate::state::{resolve_head_for_repository, HeadState};
+use crate::repo::RepositoryError;
+use crate::state::resolve_head_for_repository;
 use crate::worktree_rules::WorktreeRules;
 
 /// Unmerged index side to check out into the worktree (`git restore --ours|--theirs`).
@@ -88,34 +94,34 @@ pub struct RestoreOutcome {
 ///
 /// # Errors
 ///
-/// Returns [`Error::PathspecNoMatch`] when a positive pathspec matches nothing, and
-/// [`Error::RestorePathUnmerged`] (before writing anything) when a matched path has conflict
+/// Returns [`crate::worktree::WorktreeError::PathspecNoMatch`] when a positive pathspec matches nothing, and
+/// [`crate::worktree::WorktreeError::RestorePathUnmerged`] (before writing anything) when a matched path has conflict
 /// stages and the restore would either write the worktree from the index or, with `--staged`
 /// alone, replace the stages while the worktree keeps its conflict markers. Use
 /// [`RestoreOptions::stage`] or [`RestoreOptions::remerge`] for those paths, or stage the
 /// edited file. `--staged --worktree` replaces the stages and the worktree file together, and
 /// `--source` without `--staged` writes only the worktree, leaving the stages in place.
 /// Conflict options ([`RestoreOptions::stage`], [`RestoreOptions::remerge`]) also
-/// return [`Error::RestoreConflictWithStaged`], [`Error::RestoreConflictWithSource`],
-/// [`Error::RestoreConflictMissingOurs`], [`Error::RestoreConflictMissingTheirs`],
-/// or [`Error::RestoreConflictNotUnmerged`] when the index shape does not allow
+/// return [`crate::worktree::WorktreeError::RestoreConflictWithStaged`], [`crate::worktree::WorktreeError::RestoreConflictWithSource`],
+/// [`crate::worktree::WorktreeError::RestoreConflictMissingOurs`], [`crate::worktree::WorktreeError::RestoreConflictMissingTheirs`],
+/// or [`crate::worktree::WorktreeError::RestoreConflictNotUnmerged`] when the index shape does not allow
 /// the requested checkout. [`Error::LockHeld`] means another process holds `index.lock`;
 /// the lock is taken before the index is read, so nothing was changed. [`Error::Cancelled`]
-/// means `cancel` (or [`ProgressSink::should_cancel`]) fired while restoring the work tree:
+/// means `cancel` fired while restoring the work tree:
 /// every work-tree change is rolled back (including directories replaced by files), and the
 /// index is not written. Other failures are I/O or object-store errors.
 ///
 /// Work-tree writes report [`crate::progress::ProgressPhase::CheckingOutFiles`] to `progress`.
-pub fn restore_paths(
+pub(crate) fn restore_paths(
     repo: &Repository,
     opts: &RestoreOptions,
     progress: &mut dyn ProgressSink,
-    cancel: &dyn Cancel,
+    cancel: &CancelToken,
 ) -> Result<RestoreOutcome> {
-    let work_tree = repo.work_tree().ok_or(Error::RequiresWorkTree)?;
+    let work_tree = repo.work_tree().ok_or(RepositoryError::RequiresWorkTree)?;
 
     if opts.pathspecs.is_empty() {
-        return Err(Error::Message("you must specify path(s) to restore".into()));
+        return Err(WorktreeError::RestorePathsRequired.into());
     }
 
     if opts.stage.is_some() || opts.remerge.is_some() {
@@ -135,25 +141,26 @@ pub(crate) fn restore_paths_with_lock(
     lock: &mut IndexLock,
     mut index: Index,
     progress: &mut dyn ProgressSink,
-    cancel: &dyn Cancel,
+    cancel: &CancelToken,
 ) -> Result<RestoreOutcome> {
-    let work_tree = repo.work_tree().ok_or(Error::RequiresWorkTree)?;
+    let work_tree = repo.work_tree().ok_or(RepositoryError::RequiresWorkTree)?;
     let pathspec_ctx = repo.pathspec_match_context();
+    let pathspec_filter = RepositoryPathspecFilter::try_new(repo, &opts.pathspecs)?;
     let restore_staged = opts.staged;
     // An index-only restore would collapse the conflict stages while the worktree keeps its
     // markers, so the next auto-staging commit would record them as the resolution.
     let index_only = restore_staged && !opts.worktree;
     let worktree_from_index = !restore_staged && matches!(opts.source, RestoreSource::Index);
     if index_only || worktree_from_index {
-        let unmerged = collect_conflict_matched_paths(&index, &opts.pathspecs, false, pathspec_ctx);
+        let unmerged = collect_conflict_matched_paths(&index, &pathspec_filter, false);
         if !unmerged.is_empty() {
-            return Err(Error::RestorePathUnmerged {
+            return Err(Error::Worktree(WorktreeError::RestorePathUnmerged {
                 paths: unmerged.into_iter().collect(),
-            });
+            }));
         }
     }
 
-    let protect = crate::path_validate::ProtectOptions::from_config(&*repo.config()?);
+    let protect = crate::path_validate::ProtectOptions::from_config(&*repo.config().snapshot()?);
     let restore_worktree = opts.worktree || !opts.staged;
     let worktree_from_tree = matches!(opts.source, RestoreSource::Tree(_)) && !restore_staged;
 
@@ -163,7 +170,7 @@ pub(crate) fn restore_paths_with_lock(
     };
 
     let head_entries = if needs_head_tree_entries(restore_staged, opts.source) {
-        match resolve_head_tree(repo)? {
+        match repo.head_tree()? {
             Some(tree) => flatten_tree_full(repo.odb(), &tree, "", protect)?,
             None => Vec::new(),
         }
@@ -176,14 +183,20 @@ pub(crate) fn restore_paths_with_lock(
         &index,
         head_entries.as_slice(),
         explicit_source_entries.as_deref(),
-        &opts.pathspecs,
+        &pathspec_filter,
         restore_staged,
         worktree_from_tree,
         opts.source,
         select_all_tracked,
-        pathspec_ctx,
     );
-    validate_pathspecs(opts, &matched, &index, select_all_tracked, pathspec_ctx)?;
+    validate_pathspecs(
+        repo,
+        opts,
+        &matched,
+        &index,
+        select_all_tracked,
+        pathspec_ctx,
+    )?;
 
     let index_source_entries = index_source_tree(
         opts,
@@ -198,8 +211,12 @@ pub(crate) fn restore_paths_with_lock(
     let tracked_before_index_restore: HashSet<Vec<u8>> = if restore_worktree {
         matched
             .iter()
-            .filter(|path| index.get(path.as_bytes(), 0).is_some())
-            .map(|path| path.as_bytes().to_vec())
+            .filter(|path| {
+                index
+                    .get(crate::repo_relpath::storage_bytes(path).as_ref(), 0)
+                    .is_some()
+            })
+            .map(|path| crate::repo_relpath::storage_bytes(path).into_owned())
             .collect()
     } else {
         HashSet::new()
@@ -223,7 +240,7 @@ pub(crate) fn restore_paths_with_lock(
             work_tree,
             worktree_from_tree,
             tree_source: explicit_source_entries.as_deref(),
-            pathspecs: &opts.pathspecs,
+            pathspec_filter: &pathspec_filter,
             matched: &matched,
             tracked_for_worktree_deletion: &tracked_before_index_restore,
             index_out: &mut index,
@@ -256,15 +273,13 @@ pub(crate) fn restore_paths_with_lock(
 
 fn validate_conflict_restore_options(opts: &RestoreOptions) -> Result<()> {
     if opts.staged {
-        return Err(Error::RestoreConflictWithStaged);
+        return Err(Error::Worktree(WorktreeError::RestoreConflictWithStaged));
     }
     if !matches!(opts.source, RestoreSource::Index) {
-        return Err(Error::RestoreConflictWithSource);
+        return Err(Error::Worktree(WorktreeError::RestoreConflictWithSource));
     }
     if opts.stage.is_some() && opts.remerge.is_some() {
-        return Err(Error::Message(
-            "cannot combine --ours/--theirs with --merge".into(),
-        ));
+        return Err(WorktreeError::RestoreStageWithRemerge.into());
     }
     Ok(())
 }
@@ -276,14 +291,10 @@ fn restore_conflict_paths(
 ) -> Result<RestoreOutcome> {
     let (mut lock, index) = repo.lock_and_load_index()?;
     let pathspec_ctx = repo.pathspec_match_context();
+    let pathspec_filter = RepositoryPathspecFilter::try_new(repo, &opts.pathspecs)?;
     let include_resolved_undo = opts.remerge.is_some();
-    let matched = collect_conflict_matched_paths(
-        &index,
-        &opts.pathspecs,
-        include_resolved_undo,
-        pathspec_ctx,
-    );
-    validate_unmerged_pathspecs(opts, &matched, pathspec_ctx)?;
+    let matched = collect_conflict_matched_paths(&index, &pathspec_filter, include_resolved_undo);
+    validate_unmerged_pathspecs(repo, opts, &matched, &index, pathspec_ctx)?;
 
     let mut outcome = RestoreOutcome::default();
     let rules = WorktreeRules::from_repository(repo, &index)?;
@@ -320,11 +331,11 @@ fn restore_conflict_paths(
 
 /// Default conflict-marker style from `merge.conflictStyle` (Git default: `merge`).
 #[must_use]
-pub fn conflict_style_from_config(repo: &Repository) -> ConflictStyle {
-    let Ok(config) = repo.config() else {
+pub(crate) fn conflict_style_from_config(repo: &Repository) -> ConflictStyle {
+    let Ok(config) = repo.config().snapshot() else {
         return ConflictStyle::Merge;
     };
-    let Some(value) = config.get("merge.conflictStyle") else {
+    let Some(value) = config.value("merge.conflictStyle") else {
         return ConflictStyle::Merge;
     };
     match value.as_str() {
@@ -336,27 +347,28 @@ pub fn conflict_style_from_config(repo: &Repository) -> ConflictStyle {
 
 fn collect_conflict_matched_paths(
     index: &Index,
-    pathspecs: &[String],
+    matcher: &RepositoryPathspecFilter<'_>,
     include_resolved_undo: bool,
-    pathspec_ctx: PathspecMatchContext,
 ) -> BTreeSet<String> {
-    let matcher = PathspecListMatcher::new(pathspecs, pathspec_ctx);
     let mut paths = BTreeSet::new();
     for entry in &index.entries {
         if entry.stage() == 0 {
             continue;
         }
-        let path = String::from_utf8_lossy(&entry.path);
-        if matcher.matches(&path) {
-            paths.insert(path.into_owned());
+        let path = crate::repo_relpath::storage_string(&entry.path);
+        if matcher.matches_entry(&path, entry.mode) {
+            paths.insert(path);
         }
     }
     if include_resolved_undo {
         if let Some(undo) = &index.resolve_undo {
             for path_bytes in undo.keys() {
-                let path = String::from_utf8_lossy(path_bytes);
-                if matcher.matches(&path) {
-                    paths.insert(path.into_owned());
+                let path = crate::repo_relpath::storage_string(path_bytes);
+                let mode = index.get(path_bytes, 0).map(|e| e.mode).unwrap_or(
+                    crate::porcelain::pathspec_match::index_stage0_mode_or_regular(index, &path),
+                );
+                if matcher.matches_entry(&path, mode) {
+                    paths.insert(path);
                 }
             }
         }
@@ -365,8 +377,10 @@ fn collect_conflict_matched_paths(
 }
 
 fn validate_unmerged_pathspecs(
+    repo: &Repository,
     opts: &RestoreOptions,
     matched: &BTreeSet<String>,
+    index: &Index,
     pathspec_ctx: PathspecMatchContext,
 ) -> Result<()> {
     let sources = if opts.pathspec_sources.is_empty() {
@@ -374,15 +388,22 @@ fn validate_unmerged_pathspecs(
     } else {
         &opts.pathspec_sources
     };
-    let matched_sorted: Vec<&str> = matched.iter().map(String::as_str).collect();
+    let matched_entries: Vec<PathspecMatchEntry<'_>> = matched
+        .iter()
+        .map(|path| PathspecMatchEntry {
+            path: path.as_str(),
+            mode: index_path_mode_for_pathspec(index, path),
+        })
+        .collect();
     for (label, resolved) in sources.iter().zip(opts.pathspecs.iter()) {
         if pathspec_is_exclude(label) {
             continue;
         }
-        if !sorted_paths_match_pathspec(resolved, &matched_sorted, pathspec_ctx) {
-            return Err(Error::PathspecNoMatch {
+        if !positive_spec_matches_any_entries(repo, resolved, &matched_entries, pathspec_ctx, None)?
+        {
+            return Err(Error::Worktree(WorktreeError::PathspecNoMatch {
                 spec: label.clone(),
-            });
+            }));
         }
     }
     Ok(())
@@ -401,19 +422,22 @@ fn restore_conflict_side(
         ConflictSide::Ours => 2u8,
         ConflictSide::Theirs => 3u8,
     };
-    let path_bytes = path.as_bytes();
-    let Some(entry) = index.get(path_bytes, stage) else {
+    let path_bytes = crate::repo_relpath::storage_bytes(path);
+    let Some(entry) = index.get(path_bytes.as_ref(), stage) else {
         return Err(match side {
-            ConflictSide::Ours => Error::RestoreConflictMissingOurs {
+            ConflictSide::Ours => Error::Worktree(WorktreeError::RestoreConflictMissingOurs {
                 path: path.to_string(),
-            },
-            ConflictSide::Theirs => Error::RestoreConflictMissingTheirs {
+            }),
+            ConflictSide::Theirs => Error::Worktree(WorktreeError::RestoreConflictMissingTheirs {
                 path: path.to_string(),
-            },
+            }),
         });
     };
     if entry.mode == MODE_GITLINK {
-        checkout_submodule_worktree_to_commit(&work_tree.join(path), entry.oid)?;
+        checkout_submodule_worktree_to_commit(
+            &crate::repo_relpath::worktree_abs(work_tree, path),
+            entry.oid,
+        )?;
         outcome.restored.push(path.to_string());
         return Ok(());
     }
@@ -424,10 +448,10 @@ fn restore_conflict_side(
 
 fn checkout_submodule_worktree_to_commit(sub_worktree: &Path, oid: ObjectId) -> Result<()> {
     let Some(git_dir) = submodule_embedded_git_dir(sub_worktree) else {
-        return Err(Error::Message(format!(
-            "submodule at '{}' is not checked out",
-            sub_worktree.display()
-        )));
+        return Err(SubmoduleError::NotCheckedOut {
+            path: sub_worktree.display().to_string(),
+        }
+        .into());
     };
     let sub_repo = Repository::open(
         &git_dir,
@@ -446,7 +470,14 @@ fn checkout_submodule_worktree_to_commit(sub_worktree: &Path, oid: ObjectId) -> 
                 .and_then(|c| parse_commit(&c.data).ok().map(|p| p.tree))
         });
     checkout_between_trees(&sub_repo, from_tree.as_ref(), &tree)?;
-    crate::refs::write_ref(&git_dir, "HEAD", &oid)?;
+    crate::refs::store_write_value_on_store(
+        sub_repo.ref_store(),
+        sub_repo.git_dir(),
+        "HEAD",
+        Some(crate::refs::store::RawRef::Direct(oid)),
+        crate::refs::store::Expected::Any,
+        None,
+    )?;
     Ok(())
 }
 
@@ -461,23 +492,26 @@ fn restore_conflict_remerge(
     outcome: &mut RestoreOutcome,
     index_dirty: &mut bool,
 ) -> Result<()> {
-    let path_bytes = path.as_bytes();
-    if index.get(path_bytes, 0).is_some()
-        && !path_has_unmerged(index, path_bytes)
-        && index.unmerge_path_from_resolve_undo(path_bytes)
+    let path_bytes = crate::repo_relpath::storage_bytes(path);
+    if index.get(path_bytes.as_ref(), 0).is_some()
+        && !path_has_unmerged(index, path_bytes.as_ref())
+        && index.unmerge_path_from_resolve_undo(path_bytes.as_ref())
     {
         *index_dirty = true;
     }
-    let (Some(ours), Some(theirs)) = (index.get(path_bytes, 2), index.get(path_bytes, 3)) else {
-        return Err(Error::RestoreConflictNotUnmerged {
+    let (Some(ours), Some(theirs)) = (
+        index.get(path_bytes.as_ref(), 2),
+        index.get(path_bytes.as_ref(), 3),
+    ) else {
+        return Err(Error::Worktree(WorktreeError::RestoreConflictNotUnmerged {
             path: path.to_string(),
-        });
+        }));
     };
     if ours.mode == MODE_GITLINK || theirs.mode == MODE_GITLINK {
         return Ok(());
     }
     if index
-        .get(path_bytes, 1)
+        .get(path_bytes.as_ref(), 1)
         .is_some_and(|e| e.mode == MODE_GITLINK)
     {
         return Ok(());
@@ -485,7 +519,7 @@ fn restore_conflict_remerge(
 
     let ours_blob = repo.odb().read(&ours.oid)?;
     let theirs_blob = repo.odb().read(&theirs.oid)?;
-    let base_bytes = match index.get(path_bytes, 1) {
+    let base_bytes = match index.get(path_bytes.as_ref(), 1) {
         None => Vec::new(),
         Some(base) => repo.odb().read(&base.oid)?.data,
     };
@@ -496,6 +530,7 @@ fn restore_conflict_remerge(
         return Ok(());
     }
 
+    use crate::merge_file::TREE_MERGE_DIFF_ALGORITHM;
     let input = MergeInput {
         base: &base_bytes,
         ours: &ours_blob.data,
@@ -506,7 +541,7 @@ fn restore_conflict_remerge(
         favor: MergeFavor::None,
         style,
         marker_size: 7,
-        diff_algorithm: None,
+        diff_algorithm: Some(TREE_MERGE_DIFF_ALGORITHM.to_string()),
         ignore_all_space: false,
         ignore_space_change: false,
         ignore_space_at_eol: false,
@@ -543,18 +578,6 @@ fn pathspecs_select_all_tracked(pathspecs: &[String]) -> bool {
         && !pathspecs.iter().any(|s| pathspec_is_exclude(s))
 }
 
-fn resolve_head_tree(repo: &Repository) -> Result<Option<ObjectId>> {
-    match resolve_head_for_repository(repo)? {
-        HeadState::Branch { oid: Some(oid), .. } | HeadState::Detached { oid } => {
-            let obj = repo.odb().read(&oid)?;
-            let commit = parse_commit(&obj.data)?;
-            Ok(Some(commit.tree))
-        }
-        HeadState::Branch { .. } => Ok(None),
-        HeadState::Invalid => Err(Error::Message("HEAD is in an unknown state".into())),
-    }
-}
-
 fn needs_head_tree_entries(restore_staged: bool, source: RestoreSource) -> bool {
     restore_staged && matches!(source, RestoreSource::Index)
 }
@@ -564,24 +587,22 @@ fn collect_matched_paths(
     index: &Index,
     head_entries: &[FlatTreeEntry],
     source_entries: Option<&[FlatTreeEntry]>,
-    pathspecs: &[String],
+    matcher: &RepositoryPathspecFilter<'_>,
     restore_staged: bool,
     worktree_from_tree: bool,
     source: RestoreSource,
     select_all_tracked: bool,
-    pathspec_ctx: PathspecMatchContext,
 ) -> BTreeSet<String> {
-    let matcher = PathspecListMatcher::new(pathspecs, pathspec_ctx);
     let mut paths = BTreeSet::new();
     let skip_index_union = select_all_tracked && !restore_staged && !worktree_from_tree;
     if !skip_index_union {
         for entry in &index.entries {
-            if entry.stage() != 0 {
+            if entry.stage() != 0 || entry.skip_worktree() {
                 continue;
             }
-            let path = String::from_utf8_lossy(&entry.path);
-            if matcher.matches(&path) {
-                paths.insert(path.into_owned());
+            let path = crate::repo_relpath::storage_string(&entry.path);
+            if matcher.matches_entry(&path, entry.mode) {
+                paths.insert(path);
             }
         }
     }
@@ -591,7 +612,7 @@ fn collect_matched_paths(
             RestoreSource::Tree(_) => source_entries.unwrap_or(&[]),
         };
         for entry in staged_source {
-            if matcher.matches(&entry.path) {
+            if matcher.matches_entry(&entry.path, entry.mode) {
                 paths.insert(entry.path.clone());
             }
         }
@@ -599,7 +620,7 @@ fn collect_matched_paths(
     if worktree_from_tree {
         if let Some(src) = source_entries {
             for entry in src {
-                if matcher.matches(&entry.path) {
+                if matcher.matches_entry(&entry.path, entry.mode) {
                     paths.insert(entry.path.clone());
                 }
             }
@@ -609,6 +630,7 @@ fn collect_matched_paths(
 }
 
 fn validate_pathspecs(
+    repo: &Repository,
     opts: &RestoreOptions,
     matched: &BTreeSet<String>,
     index: &Index,
@@ -628,12 +650,19 @@ fn validate_pathspecs(
         let hits = if select_all_tracked && matches!(resolved.as_str(), "." | ":/.") {
             index.entries.iter().any(|e| e.stage() == 0)
         } else {
-            sorted_paths_match_pathspec(resolved, &matched_sorted, pathspec_ctx)
+            positive_pathspec_matches_any_path(
+                repo,
+                resolved,
+                &matched_sorted,
+                Some(index),
+                pathspec_ctx,
+                None,
+            )?
         };
         if !hits {
-            return Err(Error::PathspecNoMatch {
+            return Err(Error::Worktree(WorktreeError::PathspecNoMatch {
                 spec: label.clone(),
-            });
+            }));
         }
     }
     Ok(())
@@ -662,25 +691,40 @@ fn apply_index_restore(
     outcome: &mut RestoreOutcome,
     index_dirty: &mut bool,
 ) -> Result<()> {
+    let mut paths_to_remove: Vec<Vec<u8>> = Vec::new();
+    let mut replacements: Vec<IndexEntry> = Vec::new();
+
     for path in matched {
-        let path_bytes = path.as_bytes();
+        let path_bytes = crate::repo_relpath::storage_bytes(path);
         if let Some(src) = flat_tree_lookup(source_entries, path) {
             if index
-                .get(path_bytes, 0)
+                .get(path_bytes.as_ref(), 0)
                 .is_some_and(|e| e.oid == src.oid && e.mode == src.mode)
             {
                 continue;
             }
             let size = blob_index_size(repo, src)?;
-            index.stage_file(index_entry_from_flat(path, src, size));
+            let mut entry = index_entry_from_flat(path, src, size);
+            if let Some(existing) = index.get(path_bytes.as_ref(), 0) {
+                entry.base_index_pos = existing.base_index_pos;
+            }
+            paths_to_remove.push(path_bytes.into_owned());
+            replacements.push(entry);
             outcome.restored.push(path.clone());
             *index_dirty = true;
-        } else if index.get(path_bytes, 0).is_some() {
-            index.remove(path_bytes);
+        } else if index.get(path_bytes.as_ref(), 0).is_some() {
+            paths_to_remove.push(path_bytes.into_owned());
             outcome.removed.push(path.clone());
             *index_dirty = true;
         }
     }
+
+    if paths_to_remove.is_empty() && replacements.is_empty() {
+        return Ok(());
+    }
+
+    let path_refs: Vec<&[u8]> = paths_to_remove.iter().map(|p| p.as_slice()).collect();
+    index.remove_paths_and_insert(path_refs, replacements);
     Ok(())
 }
 
@@ -689,14 +733,208 @@ struct WorktreeRestoreContext<'a> {
     work_tree: &'a Path,
     worktree_from_tree: bool,
     tree_source: Option<&'a [FlatTreeEntry]>,
-    pathspecs: &'a [String],
+    pathspec_filter: &'a RepositoryPathspecFilter<'a>,
     matched: &'a BTreeSet<String>,
     tracked_for_worktree_deletion: &'a HashSet<Vec<u8>>,
     index_out: &'a mut Index,
     outcome: &'a mut RestoreOutcome,
     index_dirty: &'a mut bool,
     progress: &'a mut dyn ProgressSink,
-    cancel: &'a dyn Cancel,
+    cancel: &'a CancelToken,
+}
+
+/// Ignorecase collision cleanup planned once per work-tree restore pass (issue #2522).
+#[derive(Debug, Default)]
+struct RestoreIcaseCollisionPlan {
+    enabled: bool,
+    file_removals: Vec<String>,
+    directory_renames: Vec<(String, String)>,
+}
+
+/// Case-insensitive lookup of restore destination paths keyed by [`memihash`].
+struct RestoreDestinationFoldLookup<'a> {
+    by_fold: HashMap<u32, Vec<&'a str>>,
+}
+
+impl<'a> RestoreDestinationFoldLookup<'a> {
+    fn new(destinations: &'a [String]) -> Self {
+        let mut by_fold: HashMap<u32, Vec<&'a str>> = HashMap::with_capacity(destinations.len());
+        for dest in destinations {
+            by_fold
+                .entry(memihash(dest.as_bytes()))
+                .or_default()
+                .push(dest.as_str());
+        }
+        Self { by_fold }
+    }
+
+    fn icase_match(&self, path: &[u8]) -> Option<&'a str> {
+        let bucket = self.by_fold.get(&memihash(path))?;
+        bucket
+            .iter()
+            .find(|dest| path.eq_ignore_ascii_case(dest.as_bytes()))
+            .copied()
+    }
+
+    fn is_colliding_index_spelling(&self, index_path: &[u8]) -> bool {
+        let Some(dest) = self.icase_match(index_path) else {
+            return false;
+        };
+        index_path != dest.as_bytes()
+    }
+}
+
+fn index_stage0_paths_under(index: &Index, prefix: &str) -> Vec<String> {
+    let plen = prefix.len();
+    index
+        .entries
+        .iter()
+        .filter(|e| e.stage() == 0)
+        .filter_map(|e| {
+            let path = String::from_utf8_lossy(&e.path);
+            if path == prefix {
+                return Some(path.into_owned());
+            }
+            if path.len() > plen && path.starts_with(prefix) && path.as_bytes()[plen] == b'/' {
+                Some(path.into_owned())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn build_restore_icase_collision_plan(
+    work_tree: &Path,
+    index: &Index,
+    ignorecase: bool,
+    write_destinations: &[String],
+) -> RestoreIcaseCollisionPlan {
+    let mut plan = RestoreIcaseCollisionPlan::default();
+    if !ignorecase || write_destinations.is_empty() {
+        return plan;
+    }
+    if !crate::path_icase::worktree_filesystem_case_insensitive(work_tree) {
+        return plan;
+    }
+    plan.enabled = true;
+    let dest_lookup = RestoreDestinationFoldLookup::new(write_destinations);
+    let groups = IcaseIndexCollisionGroups::from_index(index, true);
+    let mut to_remove = BTreeSet::new();
+    for dest in write_destinations {
+        for member in groups.collision_sibling_paths_except(dest) {
+            to_remove.insert(member);
+        }
+    }
+    for entry in index.entries.iter().filter(|e| e.stage() == 0) {
+        if dest_lookup.is_colliding_index_spelling(&entry.path) {
+            to_remove.insert(String::from_utf8_lossy(&entry.path).into_owned());
+        }
+    }
+    if to_remove.is_empty() {
+        plan.enabled = false;
+        return plan;
+    }
+
+    let mut dir_pairs: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
+    for old in &to_remove {
+        let Some(old_dir) = old.split('/').next() else {
+            continue;
+        };
+        let Some(dest) = dest_lookup.icase_match(old.as_bytes()) else {
+            continue;
+        };
+        let Some(new_dir) = dest.split('/').next() else {
+            continue;
+        };
+        if old_dir == new_dir {
+            continue;
+        }
+        dir_pairs
+            .entry((old_dir.to_owned(), new_dir.to_owned()))
+            .or_default()
+            .insert(old.clone());
+    }
+
+    let mut dir_renamed_paths = BTreeSet::new();
+    for ((old_dir, new_dir), paired_old_paths) in dir_pairs {
+        if !paths_equal(old_dir.as_bytes(), new_dir.as_bytes(), true) {
+            continue;
+        }
+        let indexed_under_old = index_stage0_paths_under(index, &old_dir);
+        if indexed_under_old.is_empty() {
+            continue;
+        }
+        if !indexed_under_old
+            .iter()
+            .all(|path| to_remove.contains(path))
+        {
+            continue;
+        }
+        if paired_old_paths.len() != indexed_under_old.len() {
+            continue;
+        }
+        let expected_dests: BTreeSet<String> = indexed_under_old
+            .iter()
+            .filter_map(|old_path| {
+                dest_lookup
+                    .icase_match(old_path.as_bytes())
+                    .map(str::to_owned)
+            })
+            .collect();
+        if expected_dests.len() != indexed_under_old.len() {
+            continue;
+        }
+        if !expected_dests
+            .iter()
+            .all(|dest| dest.starts_with(&format!("{new_dir}/")) || dest == &new_dir)
+        {
+            continue;
+        }
+        plan.directory_renames.push((old_dir, new_dir));
+        dir_renamed_paths.extend(indexed_under_old);
+    }
+
+    plan.file_removals = to_remove
+        .into_iter()
+        .filter(|path| !dir_renamed_paths.contains(path))
+        .collect();
+    plan
+}
+
+fn apply_restore_icase_collision_plan(
+    work_tree: &Path,
+    index_out: &mut Index,
+    plan: &RestoreIcaseCollisionPlan,
+    journal: &mut CheckoutJournal,
+    outcome: &mut RestoreOutcome,
+    index_dirty: &mut bool,
+) -> Result<()> {
+    if !plan.enabled {
+        return Ok(());
+    }
+    for (old_dir, new_dir) in &plan.directory_renames {
+        let from = work_tree.join(old_dir);
+        let to = work_tree.join(new_dir);
+        if from.is_dir() {
+            case_only_worktree_rename(&from, &to).map_err(Error::Io)?;
+        }
+        for path in index_stage0_paths_under(index_out, old_dir) {
+            index_out.remove_path_all_stages(path.as_bytes());
+            *index_dirty = true;
+            outcome.removed.push(path);
+        }
+    }
+    let mut removed_abs: Vec<PathBuf> = Vec::with_capacity(plan.file_removals.len());
+    for path in &plan.file_removals {
+        journal.spool_remove(path)?;
+        removed_abs.push(work_tree.join(path));
+        index_out.remove_path_all_stages(path.as_bytes());
+        *index_dirty = true;
+        outcome.removed.push(path.clone());
+    }
+    remove_empty_parent_dirs_batch(work_tree, &removed_abs);
+    Ok(())
 }
 
 fn apply_worktree_restore(ctx: WorktreeRestoreContext<'_>) -> Result<()> {
@@ -716,7 +954,7 @@ fn apply_worktree_restore_inner(
         work_tree,
         worktree_from_tree,
         tree_source,
-        pathspecs,
+        pathspec_filter,
         matched,
         tracked_for_worktree_deletion,
         index_out,
@@ -725,22 +963,21 @@ fn apply_worktree_restore_inner(
         progress,
         cancel,
     } = ctx;
-    let config = repo.config()?;
-    let protect = crate::path_validate::ProtectOptions::from_config(&config);
-    let mut dir_cache = LeadingDirCache::with_protect(protect);
+    let config = repo.config().snapshot()?;
+    let ignorecase = config.ignore_case();
+    let mut dir_cache = LeadingDirCache::for_config(config.as_ref());
 
     if !worktree_from_tree {
         let attr_index = index_out.gitattributes_snapshot();
-        let rules = WorktreeRules::from_parts(repo, &attr_index, Arc::clone(&config))?;
+        let rules = WorktreeRules::from_parts_with_config(repo, &attr_index, Arc::clone(&config))?;
         let index_mtime = index_mtime_for_diff(index_out, None);
-        let matcher = PathspecListMatcher::new(pathspecs, repo.pathspec_match_context());
         let mut to_write: Vec<usize> = Vec::new();
         for (pos, entry) in index_out.entries.iter().enumerate() {
-            if entry.stage() != 0 {
+            if entry.stage() != 0 || entry.skip_worktree() {
                 continue;
             }
             let path = crate::repo_relpath::storage_string(&entry.path);
-            if !matcher.matches(&path) {
+            if !pathspec_filter.matches_entry(&path, entry.mode) {
                 continue;
             }
             if entry.mode == MODE_GITLINK {
@@ -752,6 +989,24 @@ fn apply_worktree_restore_inner(
             }
             to_write.push(pos);
         }
+        let write_destinations: Vec<String> = to_write
+            .iter()
+            .map(|&pos| crate::repo_relpath::storage_string(&index_out.entries[pos].path))
+            .collect();
+        let icase_plan = build_restore_icase_collision_plan(
+            work_tree,
+            index_out,
+            ignorecase,
+            &write_destinations,
+        );
+        apply_restore_icase_collision_plan(
+            work_tree,
+            index_out,
+            &icase_plan,
+            journal,
+            outcome,
+            index_dirty,
+        )?;
         if !to_write.is_empty() {
             outcome.restored.reserve(to_write.len());
         }
@@ -779,13 +1034,17 @@ fn apply_worktree_restore_inner(
         progress.finish();
         for path in matched {
             poll_cancel(progress, cancel)?;
-            if index_out.get(path.as_bytes(), 0).is_some() {
+            if index_out
+                .get(crate::repo_relpath::storage_bytes(path).as_ref(), 0)
+                .is_some()
+            {
                 continue;
             }
-            if !tracked_for_worktree_deletion.contains(path.as_bytes()) {
+            let path_bytes = crate::repo_relpath::storage_bytes(path);
+            if !tracked_for_worktree_deletion.contains(path_bytes.as_ref()) {
                 continue;
             }
-            let abs = work_tree.join(path);
+            let abs = crate::repo_relpath::worktree_abs(work_tree, path);
             let Ok(meta) = fs::symlink_metadata(&abs) else {
                 continue;
             };
@@ -800,16 +1059,43 @@ fn apply_worktree_restore_inner(
     }
 
     let rules = WorktreeRules::from_repository(repo, index_out)?;
+    let write_destinations: Vec<String> = matched
+        .iter()
+        .filter(|path| {
+            tree_source
+                .and_then(|entries| flat_tree_lookup(entries, path))
+                .is_some()
+        })
+        .cloned()
+        .collect();
+    let icase_plan =
+        build_restore_icase_collision_plan(work_tree, index_out, ignorecase, &write_destinations);
+    apply_restore_icase_collision_plan(
+        work_tree,
+        index_out,
+        &icase_plan,
+        journal,
+        outcome,
+        index_dirty,
+    )?;
     progress.start(ProgressPhase::CheckingOutFiles, Some(matched.len() as u64));
     for path in matched {
         poll_cancel(progress, cancel)?;
         progress.inc(1);
+        if index_out
+            .get(crate::repo_relpath::storage_bytes(path).as_ref(), 0)
+            .is_some_and(|e| e.skip_worktree())
+        {
+            continue;
+        }
         let src = tree_source
             .and_then(|entries| flat_tree_lookup(entries, path))
             .cloned();
         match src {
             Some(entry) => {
-                let existing = index_out.get(path.as_bytes(), 0).cloned();
+                let existing = index_out
+                    .get(crate::repo_relpath::storage_bytes(path).as_ref(), 0)
+                    .cloned();
                 restore_worktree_entry(
                     repo,
                     work_tree,
@@ -826,7 +1112,8 @@ fn apply_worktree_restore_inner(
                 )?;
             }
             None => {
-                if !tracked_for_worktree_deletion.contains(path.as_bytes()) {
+                let path_bytes = crate::repo_relpath::storage_bytes(path);
+                if !tracked_for_worktree_deletion.contains(path_bytes.as_ref()) {
                     continue;
                 }
                 if remove_worktree_path_for_restore(work_tree, path, journal)? {
@@ -846,7 +1133,7 @@ fn remove_worktree_path_for_restore(
     path: &str,
     journal: &CheckoutJournal,
 ) -> Result<bool> {
-    let abs = work_tree.join(path);
+    let abs = crate::repo_relpath::worktree_abs(work_tree, path);
     let Ok(meta) = fs::symlink_metadata(&abs) else {
         return Ok(false);
     };
@@ -877,7 +1164,7 @@ fn worktree_index_entry_up_to_date(
     if !meta.is_file() || !stat_matches(entry, &meta) {
         return Ok(false);
     }
-    if !crate::index::WorktreeModePolicy::from_config(&*repo.config()?)
+    if !crate::index::WorktreeModePolicy::from_config(&*repo.config().snapshot()?)
         .worktree_mode_matches(crate::diff::mode_from_metadata(&meta), entry.mode)
     {
         return Ok(false);
@@ -909,9 +1196,9 @@ fn restore_blob_to_worktree(
     dir_cache: &mut LeadingDirCache,
 ) -> Result<fs::Metadata> {
     write_blob_to_worktree(repo, rules, work_tree, path, oid, mode, dir_cache)?.ok_or_else(|| {
-        Error::Message(format!(
-            "filter delayed checkout for '{path}' is not supported by grit restore"
-        ))
+        Error::from(FilterError::DelayedCheckoutUnsupported {
+            path: path.to_string(),
+        })
     })
 }
 
@@ -935,7 +1222,14 @@ fn restore_worktree_blob_from_index(
     journal.preserve_before_write(path)?;
     let meta = restore_blob_to_worktree(repo, rules, work_tree, path, &oid, mode, dir_cache)?;
     let index_path = crate::repo_relpath::storage_bytes(path);
-    index_out.add_or_replace(entry_from_metadata(&meta, index_path.as_ref(), oid, mode));
+    let symlink_target_len = symlink_target_byte_len(repo, &oid, mode)?;
+    index_out.add_or_replace(index_entry_from_worktree_write(
+        &meta,
+        index_path.as_ref(),
+        oid,
+        mode,
+        symlink_target_len,
+    ));
     *index_dirty = true;
     outcome.restored.push(path.to_string());
     Ok(())
@@ -965,25 +1259,36 @@ fn restore_worktree_entry(
     )?;
     if worktree_from_tree {
         if let Some(existing) = existing_index {
-            index_out.add_or_replace(entry_from_metadata(
+            let symlink_target_len = symlink_target_byte_len(repo, &existing.oid, existing.mode)?;
+            index_out.add_or_replace(index_entry_from_worktree_write(
                 &meta,
-                path.as_bytes(),
+                crate::repo_relpath::storage_bytes(path).as_ref(),
                 existing.oid,
                 existing.mode,
+                symlink_target_len,
             ));
             *index_dirty = true;
         }
     } else {
-        index_out.add_or_replace(entry_from_metadata(
+        let symlink_target_len = symlink_target_byte_len(repo, &entry.oid, entry.mode)?;
+        index_out.add_or_replace(index_entry_from_worktree_write(
             &meta,
-            path.as_bytes(),
+            crate::repo_relpath::storage_bytes(path).as_ref(),
             entry.oid,
             entry.mode,
+            symlink_target_len,
         ));
         *index_dirty = true;
     }
     outcome.restored.push(path.to_string());
     Ok(())
+}
+
+fn symlink_target_byte_len(repo: &Repository, oid: &ObjectId, mode: u32) -> Result<Option<usize>> {
+    if mode != MODE_SYMLINK {
+        return Ok(None);
+    }
+    Ok(Some(repo.odb().read(oid)?.data.len()))
 }
 
 fn index_entry_from_flat(path: &str, src: &FlatTreeEntry, size: u32) -> IndexEntry {
@@ -1001,7 +1306,7 @@ fn index_entry_from_flat(path: &str, src: &FlatTreeEntry, size: u32) -> IndexEnt
         oid: src.oid,
         flags: path.len().min(0xFFF) as u16,
         flags_extended: None,
-        path: path.as_bytes().to_vec(),
+        path: crate::repo_relpath::storage_bytes(path).into_owned(),
         base_index_pos: 0,
     }
 }
@@ -1033,7 +1338,7 @@ mod tests {
     use super::*;
     use crate::objects::{serialize_commit, CommitData, ObjectKind};
     use crate::porcelain::status::{status, StatusOptions};
-    use crate::progress::{NeverCancel, NullProgress};
+    use crate::progress::NullProgress;
     use crate::repo::{init_repository, Repository};
     use crate::write_tree::{write_tree_update_index, WriteTreeFlags};
     use crate::RefStorageFormat;
@@ -1044,6 +1349,16 @@ mod tests {
         let repo = init_repository(dir.path(), false, "main", None, RefStorageFormat::Files)
             .expect("init");
         (dir, repo)
+    }
+
+    #[test]
+    fn restore_destination_fold_lookup_detects_colliding_spelling() {
+        let dests = vec!["foo/a.txt".to_string(), "foo/b.txt".to_string()];
+        let lookup = RestoreDestinationFoldLookup::new(&dests);
+        assert!(lookup.is_colliding_index_spelling(b"Foo/a.txt"));
+        assert!(lookup.is_colliding_index_spelling(b"Foo/b.txt"));
+        assert!(!lookup.is_colliding_index_spelling(b"foo/a.txt"));
+        assert_eq!(lookup.icase_match(b"Foo/a.txt"), Some("foo/a.txt"));
     }
 
     #[cfg(unix)]
@@ -1100,7 +1415,7 @@ mod tests {
                 remerge: None,
             },
             &mut NullProgress,
-            &NeverCancel,
+            &CancelToken::never(),
         )
         .expect("restore");
 
@@ -1116,7 +1431,7 @@ mod tests {
             &repo,
             &StatusOptions::default(),
             &mut NullProgress,
-            &NeverCancel,
+            &CancelToken::never(),
         )
         .expect("status");
         assert!(st.unstaged.is_empty(), "{st:?}");
@@ -1174,9 +1489,10 @@ mod tests {
     #[test]
     fn restore_from_index_refuses_unmerged_path() {
         let (dir, repo) = conflicted_repo();
-        let err = restore_paths(&repo, &opts("f"), &mut NullProgress, &NeverCancel).unwrap_err();
+        let err =
+            restore_paths(&repo, &opts("f"), &mut NullProgress, &CancelToken::never()).unwrap_err();
         assert!(
-            matches!(&err, Error::RestorePathUnmerged { paths } if paths == &["f"]),
+            matches!(&err, Error::Worktree(WorktreeError::RestorePathUnmerged { paths }) if paths == &["f"]),
             "{err:?}"
         );
         assert!(err.to_string().contains("path 'f' is unmerged"), "{err}");
@@ -1189,8 +1505,15 @@ mod tests {
     #[test]
     fn restore_dot_with_unmerged_path_writes_nothing() {
         let (dir, repo) = conflicted_repo();
-        let err = restore_paths(&repo, &opts("."), &mut NullProgress, &NeverCancel).unwrap_err();
-        assert!(matches!(err, Error::RestorePathUnmerged { .. }), "{err:?}");
+        let err =
+            restore_paths(&repo, &opts("."), &mut NullProgress, &CancelToken::never()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::Worktree(WorktreeError::RestorePathUnmerged { .. })
+            ),
+            "{err:?}"
+        );
         assert_eq!(std::fs::read(dir.path().join("g")).expect("g"), b"edited\n");
     }
 
@@ -1206,11 +1529,11 @@ mod tests {
                     ..opts(pathspec)
                 },
                 &mut NullProgress,
-                &NeverCancel,
+                &CancelToken::never(),
             )
             .unwrap_err();
             assert!(
-                matches!(&err, Error::RestorePathUnmerged { paths } if paths == &["f"]),
+                matches!(&err, Error::Worktree(WorktreeError::RestorePathUnmerged { paths }) if paths == &["f"]),
                 "{err:?}"
             );
         }
@@ -1227,8 +1550,8 @@ mod tests {
     #[test]
     fn restore_merged_path_beside_unmerged_one_succeeds() {
         let (dir, repo) = conflicted_repo();
-        let outcome =
-            restore_paths(&repo, &opts("g"), &mut NullProgress, &NeverCancel).expect("restore g");
+        let outcome = restore_paths(&repo, &opts("g"), &mut NullProgress, &CancelToken::never())
+            .expect("restore g");
         assert_eq!(outcome.restored, vec!["g".to_string()]);
         assert_eq!(std::fs::read(dir.path().join("g")).expect("g"), b"g\n");
     }
@@ -1247,7 +1570,7 @@ mod tests {
                     ..opts("f")
                 },
                 &mut NullProgress,
-                &NeverCancel,
+                &CancelToken::never(),
             )
             .expect("restore side");
             assert_eq!(std::fs::read(dir.path().join("f")).expect("f"), want);
@@ -1259,7 +1582,7 @@ mod tests {
                 ..opts("f")
             },
             &mut NullProgress,
-            &NeverCancel,
+            &CancelToken::never(),
         )
         .expect("restore --merge");
         let merged = std::fs::read_to_string(dir.path().join("f")).expect("f");
@@ -1268,9 +1591,9 @@ mod tests {
 
     #[test]
     fn restore_unmerged_message_lists_every_path() {
-        let err = Error::RestorePathUnmerged {
+        let err = Error::Worktree(WorktreeError::RestorePathUnmerged {
             paths: vec!["a".into(), "b".into()],
-        };
+        });
         assert_eq!(err.to_string(), "paths are unmerged: 'a', 'b'");
     }
 
@@ -1356,7 +1679,7 @@ mod tests {
                 ..opts("sub")
             },
             &mut NullProgress,
-            &NeverCancel,
+            &CancelToken::never(),
         )
         .expect("restore theirs");
 
@@ -1368,5 +1691,139 @@ mod tests {
             "submodule worktree should match stage 3"
         );
         let _ = dir;
+    }
+
+    fn apply_index_restore_sequential(
+        repo: &Repository,
+        source_entries: &[FlatTreeEntry],
+        matched: &BTreeSet<String>,
+        index: &mut Index,
+        outcome: &mut RestoreOutcome,
+        index_dirty: &mut bool,
+    ) -> Result<()> {
+        for path in matched {
+            let path_bytes = path.as_bytes();
+            if let Some(src) = flat_tree_lookup(source_entries, path) {
+                if index
+                    .get(path_bytes, 0)
+                    .is_some_and(|e| e.oid == src.oid && e.mode == src.mode)
+                {
+                    continue;
+                }
+                let size = blob_index_size(repo, src)?;
+                index.stage_file(index_entry_from_flat(path, src, size));
+                outcome.restored.push(path.clone());
+                *index_dirty = true;
+            } else if index.get(path_bytes, 0).is_some() {
+                index.remove(path_bytes);
+                outcome.removed.push(path.clone());
+                *index_dirty = true;
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn apply_index_restore_matches_sequential_stage_and_remove() {
+        let (_dir, repo) = init_repo();
+        let blob_a = repo.odb().write(ObjectKind::Blob, b"a\n").expect("blob");
+        let blob_b = repo.odb().write(ObjectKind::Blob, b"b\n").expect("blob");
+        let blob_c = repo.odb().write(ObjectKind::Blob, b"c\n").expect("blob");
+        let blob_f = repo.odb().write(ObjectKind::Blob, b"f\n").expect("blob");
+
+        let source = vec![
+            FlatTreeEntry {
+                path: "conflict.txt".into(),
+                mode: crate::index::MODE_REGULAR,
+                oid: blob_f,
+            },
+            FlatTreeEntry {
+                path: "replace.txt".into(),
+                mode: crate::index::MODE_REGULAR,
+                oid: blob_b,
+            },
+            FlatTreeEntry {
+                path: "same.txt".into(),
+                mode: crate::index::MODE_REGULAR,
+                oid: blob_a,
+            },
+        ];
+
+        let build = || {
+            let mut index = Index::new();
+            let mut same = staged_entry(&repo, "same.txt", b"a\n", 0);
+            same.oid = blob_a;
+            same.base_index_pos = 0;
+            let mut replace = staged_entry(&repo, "replace.txt", b"old\n", 0);
+            replace.base_index_pos = 99;
+            index.entries.push(same);
+            index.entries.push(replace);
+            index
+                .entries
+                .push(staged_entry(&repo, "drop.txt", b"d\n", 0));
+            for stage in 1..=3u16 {
+                index
+                    .entries
+                    .push(staged_entry(&repo, "conflict.txt", b"x\n", stage));
+            }
+            index
+                .entries
+                .push(staged_entry(&repo, "only-stage.txt", b"z\n", 2));
+            index.sort();
+            index
+        };
+
+        let matched = BTreeSet::from([
+            "same.txt".into(),
+            "replace.txt".into(),
+            "drop.txt".into(),
+            "conflict.txt".into(),
+            "only-stage.txt".into(),
+            "missing.txt".into(),
+        ]);
+
+        let mut batch_index = build();
+        let mut batch_outcome = RestoreOutcome::default();
+        let mut batch_dirty = false;
+        apply_index_restore(
+            &repo,
+            &source,
+            &matched,
+            &mut batch_index,
+            &mut batch_outcome,
+            &mut batch_dirty,
+        )
+        .expect("batch");
+
+        let mut seq_index = build();
+        let mut seq_outcome = RestoreOutcome::default();
+        let mut seq_dirty = false;
+        apply_index_restore_sequential(
+            &repo,
+            &source,
+            &matched,
+            &mut seq_index,
+            &mut seq_outcome,
+            &mut seq_dirty,
+        )
+        .expect("sequential");
+
+        assert_eq!(batch_outcome.restored, seq_outcome.restored);
+        assert_eq!(batch_outcome.removed, seq_outcome.removed);
+        assert_eq!(batch_index.entries, seq_index.entries);
+        assert_eq!(batch_index.resolve_undo, seq_index.resolve_undo);
+        assert_eq!(batch_index.get(b"replace.txt", 0).unwrap().oid, blob_b);
+        assert_eq!(
+            batch_index.get(b"replace.txt", 0).unwrap().base_index_pos,
+            99
+        );
+        assert!(batch_index.get(b"drop.txt", 0).is_none());
+        assert!(batch_index.get(b"conflict.txt", 0).is_some());
+        assert!(batch_index.get(b"conflict.txt", 1).is_none());
+        assert!(batch_index.resolve_undo.is_some());
+        assert!(batch_index.get(b"only-stage.txt", 2).is_some());
+        assert!(batch_index.get(b"only-stage.txt", 0).is_none());
+        let _ = blob_c;
+        assert!(batch_dirty);
     }
 }

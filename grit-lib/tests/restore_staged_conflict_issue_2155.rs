@@ -4,19 +4,23 @@
 //! rebase and stash pop, and the auto-staging commit refuses a file whose stages were already
 //! dropped (by system `git restore --staged`) while its worktree copy still has markers.
 
+use grit_lib::worktree::WorktreeError;
 use std::fs;
 use std::path::Path;
 
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::error::Error;
+use grit_lib::index::IndexError;
+use grit_lib::merge::IntegrateBranchOutcome;
 use grit_lib::objects::ObjectId;
-use grit_lib::porcelain::add::{stage, StageOptions};
-use grit_lib::porcelain::commit::{commit_with_scope, CommitRequest, CommitScope};
-use grit_lib::porcelain::merge::{integrate_branch, IntegrateBranchOutcome};
-use grit_lib::porcelain::restore::{restore_paths, RestoreOptions, RestoreSource};
-use grit_lib::progress::{NeverCancel, NullProgress};
+use grit_lib::porcelain::add::StageOptions;
+use grit_lib::porcelain::commit::{CommitRequest, CommitScope};
+use grit_lib::porcelain::restore::{RestoreOptions, RestoreSource};
+use grit_lib::progress::CancelToken;
+use grit_lib::progress::NullProgress;
 use grit_lib::repo::Repository;
-use grit_test_support::{git, git_cmd};
+use grit_test_support::integrate_branch;
+use grit_test_support::{git, git_cmd, integrate_branch};
 
 /// Operation files that must survive a refused restore or commit.
 const STATE_FILES: [&str; 6] = [
@@ -73,7 +77,7 @@ fn merge_conflict(root: &Path) -> Repository {
         oid(root, "other"),
         "other",
         &mut NullProgress,
-        &NeverCancel,
+        &CancelToken::never(),
     )
     .expect("merge");
     assert!(matches!(outcome, IntegrateBranchOutcome::Conflicts { .. }));
@@ -126,11 +130,11 @@ fn staged_only(pathspec: &str) -> RestoreOptions {
 
 fn commit_req() -> CommitRequest {
     let id = "T <t@e.test> 1700000000 +0000";
-    CommitRequest {
-        message: "after".to_owned(),
-        author: Some(id.parse().expect("signature")),
-        committer: Some(id.parse().expect("signature")),
-        ..Default::default()
+    {
+        let mut req = CommitRequest::new("after".to_owned());
+        req.author = Some(id.parse().expect("signature"));
+        req.committer = Some(id.parse().expect("signature"));
+        req
     }
 }
 
@@ -150,15 +154,16 @@ fn assert_conflict_survives(root: &Path, repo: &Repository) {
     let state = state_snapshot(root);
 
     for pathspec in ["f", "."] {
-        let err = restore_paths(
-            repo,
-            &staged_only(pathspec),
-            &mut NullProgress,
-            &NeverCancel,
-        )
-        .unwrap_err();
+        let err = repo
+            .checkout()
+            .restore(
+                &staged_only(pathspec),
+                &mut NullProgress,
+                &CancelToken::never(),
+            )
+            .unwrap_err();
         assert!(
-            matches!(&err, Error::RestorePathUnmerged { paths } if paths == &["f"]),
+            matches!(&err, Error::Worktree(WorktreeError::RestorePathUnmerged { paths }) if paths == &["f"]),
             "{err:?}"
         );
     }
@@ -166,15 +171,18 @@ fn assert_conflict_survives(root: &Path, repo: &Repository) {
     assert_eq!(fs::read(root.join("f")).expect("f"), worktree);
     assert_eq!(state_snapshot(root), state);
 
-    let err = commit_with_scope(
-        repo,
-        &commit_req(),
-        CommitScope::AutoStage,
-        &mut NullProgress,
-        &NeverCancel,
-    )
-    .unwrap_err();
-    assert!(matches!(err, Error::IndexUnmerged), "{err:?}");
+    let err = repo
+        .commits()
+        .create(
+            &grit_lib::commits::CommitOptions::new(commit_req(), CommitScope::AutoStage),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, Error::Index(IndexError::Unmerged { .. })),
+        "{err:?}"
+    );
     assert_eq!(git(root, &["rev-parse", "HEAD"]), head);
     assert_eq!(git(root, &["ls-files", "-u"]), unmerged);
     assert_eq!(state_snapshot(root), state);
@@ -231,15 +239,15 @@ fn assert_collapsed_markers_refused(root: &Path, repo: &Repository) {
     let index = git(root, &["ls-files", "-s"]);
     let state = state_snapshot(root);
 
-    let err = commit_with_scope(
-        repo,
-        &commit_req(),
-        CommitScope::AutoStage,
-        &mut NullProgress,
-        &NeverCancel,
-    )
-    .unwrap_err();
-    let Error::UnmergedConflictMarkers { paths } = err else {
+    let err = repo
+        .commits()
+        .create(
+            &grit_lib::commits::CommitOptions::new(commit_req(), CommitScope::AutoStage),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .unwrap_err();
+    let Error::Worktree(WorktreeError::UnmergedConflictMarkers { paths }) = err else {
         panic!("expected conflict markers refusal, got {err:?}");
     };
     assert_eq!(paths, ["f"]);
@@ -247,18 +255,22 @@ fn assert_collapsed_markers_refused(root: &Path, repo: &Repository) {
     assert_eq!(git(root, &["ls-files", "-s"]), index);
     assert_eq!(state_snapshot(root), state);
 
-    let err = stage(
-        repo,
-        &StageOptions {
-            pathspecs: vec!["f".into()],
-            ..StageOptions::default()
-        },
-        &mut NullProgress,
-        &NeverCancel,
-    )
-    .unwrap_err();
+    let err = repo
+        .index()
+        .stage(
+            &StageOptions {
+                pathspecs: vec!["f".into()],
+                ..StageOptions::default()
+            },
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .unwrap_err();
     assert!(
-        matches!(err, Error::UnmergedConflictMarkers { .. }),
+        matches!(
+            err,
+            Error::Worktree(WorktreeError::UnmergedConflictMarkers { .. })
+        ),
         "{err:?}"
     );
     assert_eq!(git(root, &["ls-files", "-s"]), index);
@@ -274,14 +286,14 @@ fn commit_refuses_markers_after_git_drops_merge_stages() {
     assert_collapsed_markers_refused(root, &repo);
 
     fs::write(root.join("f"), "resolved\n").expect("resolve");
-    let outcome = commit_with_scope(
-        &repo,
-        &commit_req(),
-        CommitScope::AutoStage,
-        &mut NullProgress,
-        &NeverCancel,
-    )
-    .expect("commit resolved merge");
+    let outcome = repo
+        .commits()
+        .create(
+            &grit_lib::commits::CommitOptions::new(commit_req(), CommitScope::AutoStage),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("commit resolved merge");
     assert_eq!(git(root, &["show", "HEAD:f"]), "resolved\n");
     assert_eq!(
         git(root, &["rev-list", "--parents", "-n1", "HEAD"])
@@ -332,14 +344,13 @@ fn markers_already_committed_do_not_block_commit() {
     let doc = format!("{}appended\n", git(root, &["show", "HEAD:f"]));
     fs::write(root.join("f"), &doc).expect("edit around the committed block");
     let repo = open(root);
-    commit_with_scope(
-        &repo,
-        &commit_req(),
-        CommitScope::AutoStage,
-        &mut NullProgress,
-        &NeverCancel,
-    )
-    .expect("markers are already committed");
+    repo.commits()
+        .create(
+            &grit_lib::commits::CommitOptions::new(commit_req(), CommitScope::AutoStage),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("markers are already committed");
     assert_eq!(git(root, &["show", "HEAD:f"]), doc);
 }
 
@@ -377,16 +388,19 @@ fn stale_resolve_undo_with_new_markers_is_refused() {
 
     fs::write(root.join("f"), "<<<<<<< a\nx\n=======\ny\n>>>>>>> b\n").expect("markers");
     let repo = open(root);
-    let err = commit_with_scope(
-        &repo,
-        &commit_req(),
-        CommitScope::AutoStage,
-        &mut NullProgress,
-        &NeverCancel,
-    )
-    .unwrap_err();
+    let err = repo
+        .commits()
+        .create(
+            &grit_lib::commits::CommitOptions::new(commit_req(), CommitScope::AutoStage),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .unwrap_err();
     assert!(
-        matches!(err, Error::UnmergedConflictMarkers { .. }),
+        matches!(
+            err,
+            Error::Worktree(WorktreeError::UnmergedConflictMarkers { .. })
+        ),
         "{err:?}"
     );
     assert_eq!(git(root, &["rev-parse", "HEAD"]), head);

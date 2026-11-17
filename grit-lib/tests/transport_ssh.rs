@@ -26,9 +26,7 @@ use std::path::Path;
 use std::process::Command;
 
 use grit_lib::objects::odb::Odb;
-use grit_lib::progress::NeverCancel;
-use grit_lib::refs::resolve_ref;
-use grit_lib::remote::fetch::{fetch_remote, NoProgress};
+use grit_lib::progress::CancelToken;
 use grit_lib::remote::transfer::{FetchOptions, TagMode, UpdateMode};
 use grit_lib::remote::transport::{ConnectOptions, Service, SshTransport, Transport};
 
@@ -109,26 +107,40 @@ fn run_fetch_and_assert(transport: &SshTransport, url: &str, source: &Path, loca
         main_oid.to_hex()
     );
 
-    let mut opts = FetchOptions {
-        refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()],
-        tags: TagMode::All,
-        ..Default::default()
-    };
-    let outcome = fetch_remote(
+    let mut opts = FetchOptions::new();
+    opts.refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()];
+    opts.tags = TagMode::All;
+    let outcome = grit_lib::repo::Repository::open(
         &local_git,
-        &mut *conn,
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&mut opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Connection(&mut *conn),
         &mut opts,
         &mut NoProgress,
-        &NeverCancel,
+        &CancelToken::never(),
     )
     .expect("fetch_remote over ssh");
 
-    let got_main = resolve_ref(&local_git, "refs/remotes/origin/main").expect("origin/main");
-    let got_topic = resolve_ref(&local_git, "refs/remotes/origin/topic").expect("origin/topic");
+    let got_main = grit_test_support::refs::at(&local_git)
+        .references()
+        .resolve("refs/remotes/origin/main")
+        .expect("origin/main");
+    let got_topic = grit_test_support::refs::at(&local_git)
+        .references()
+        .resolve("refs/remotes/origin/topic")
+        .expect("origin/topic");
     assert_eq!(got_main, main_oid, "origin/main oid mismatch vs source");
     assert_eq!(got_topic, topic_oid, "origin/topic oid mismatch vs source");
 
-    let got_tag = resolve_ref(&local_git, "refs/tags/v1").expect("tag v1 written");
+    let got_tag = grit_test_support::refs::at(&local_git)
+        .references()
+        .resolve("refs/tags/v1")
+        .expect("tag v1 written");
     assert_eq!(got_tag, tag_oid, "tag v1 oid mismatch vs source");
 
     // Objects landed and are readable in the local odb.
@@ -238,10 +250,7 @@ fn fetch_over_ssh_v2_lands_refs_and_objects() {
     git(&local_root, &["init", "-q", "-b", "main", "."]);
     let local_git = local_root.join(".git");
 
-    let opts_v2 = ConnectOptions {
-        protocol_version: 2,
-        ..Default::default()
-    };
+    let opts_v2 = ConnectOptions::with_protocol_version(2);
     let mut conn = transport
         .connect(&url, Service::UploadPack, &opts_v2)
         .expect("SshTransport::connect v2");
@@ -269,25 +278,39 @@ fn fetch_over_ssh_v2_lands_refs_and_objects() {
         conn.capabilities()
     );
 
-    let mut opts = FetchOptions {
-        refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()],
-        tags: TagMode::All,
-        ..Default::default()
-    };
-    let outcome = fetch_remote(
+    let mut opts = FetchOptions::new();
+    opts.refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()];
+    opts.tags = TagMode::All;
+    let outcome = grit_lib::repo::Repository::open(
         &local_git,
-        &mut *conn,
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&mut opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Connection(&mut *conn),
         &mut opts,
         &mut NoProgress,
-        &NeverCancel,
+        &CancelToken::never(),
     )
     .expect("v2 fetch over ssh");
 
-    let got_main = resolve_ref(&local_git, "refs/remotes/origin/main").expect("origin/main");
-    let got_topic = resolve_ref(&local_git, "refs/remotes/origin/topic").expect("origin/topic");
+    let got_main = grit_test_support::refs::at(&local_git)
+        .references()
+        .resolve("refs/remotes/origin/main")
+        .expect("origin/main");
+    let got_topic = grit_test_support::refs::at(&local_git)
+        .references()
+        .resolve("refs/remotes/origin/topic")
+        .expect("origin/topic");
     assert_eq!(got_main, main_oid);
     assert_eq!(got_topic, topic_oid);
-    let got_tag = resolve_ref(&local_git, "refs/tags/v1").expect("tag v1");
+    let got_tag = grit_test_support::refs::at(&local_git)
+        .references()
+        .resolve("refs/tags/v1")
+        .expect("tag v1");
     assert_eq!(got_tag, tag_oid);
     assert_eq!(outcome.default_branch.as_deref(), Some("main"));
 
@@ -335,4 +358,65 @@ fn fetch_over_ssh_program_lands_refs_and_objects() {
     let url = format!("ssh://git@fakehost{abs_path}");
 
     run_fetch_and_assert(&transport, &url, &source, &tmp.path().join("local-prog"));
+}
+
+#[test]
+fn fake_ssh_inherits_git_protocol_env_for_v2_upload_pack() {
+    if Command::new("sh").arg("-c").arg("exit 0").status().is_err() {
+        eprintln!("SKIP: no POSIX sh available");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let probe = tmp.path().join("git-protocol.txt");
+    let script = tmp.path().join("probe-ssh.sh");
+    let body = format!(
+        r#"#!/bin/sh
+if [ -n "$GIT_PROTOCOL" ]; then
+  printf '%s' "$GIT_PROTOCOL" > {probe}
+fi
+cmd=
+for cmd in "$@"; do :; done
+case "$cmd" in
+  "git-upload-pack "*) cmd="git upload-pack ${{cmd#git-upload-pack }}" ;;
+esac
+eval "exec $cmd"
+"#,
+        probe = shell_escape_path(&probe)
+    );
+    write_executable(&script, &body);
+
+    let source = tmp.path().join("source");
+    std::fs::create_dir_all(&source).unwrap();
+    build_source(&source);
+
+    let transport = SshTransport::with_program(&script);
+    let url = format!("fakehost:{}", source.to_str().expect("utf8 path"));
+    let opts = ConnectOptions::with_protocol_version(2);
+    let conn = transport
+        .connect(&url, Service::UploadPack, &opts)
+        .expect("connect");
+    let _ = conn.protocol_version();
+    drop(conn);
+
+    let recorded = std::fs::read_to_string(&probe).unwrap_or_default();
+    assert_eq!(
+        recorded, "version=2",
+        "ssh child must inherit GIT_PROTOCOL=version=2 for upload-pack v2"
+    );
+}
+
+fn shell_escape_path(path: &Path) -> String {
+    path.to_str()
+        .map(|s| format!("'{s}'"))
+        .unwrap_or_else(|| "'?'".to_owned())
+}
+
+fn write_executable(script: &Path, body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::write(script, body).expect("write script");
+    let mut perms = std::fs::metadata(script).expect("metadata").permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(script, perms).expect("chmod");
 }

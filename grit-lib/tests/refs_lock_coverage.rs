@@ -3,17 +3,16 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use crate::support;
+use grit_lib::error::RefError;
 
 use std::fs;
 
 use grit_lib::error::Error;
 use grit_lib::objects::ObjectId;
 use grit_lib::refs::store::RefStoreError;
-use grit_lib::refs::{
-    delete_ref, delete_ref_cas, lock_path_for_ref, read_raw_ref,
-    verify_refname_available_for_create, write_ref, RawRefLookup,
-};
+use grit_lib::refs::{lock_path_for_ref, RawRefLookup};
 use grit_lib::repo::{InitOptions, Repository};
+use grit_lib::test_support::refs::{read_raw_ref, verify_ref_available_for_create};
 use std::collections::{BTreeSet, HashSet};
 use tempfile::tempdir;
 
@@ -28,7 +27,7 @@ fn read_raw_ref_reports_directory_at_ref_path() {
         dir.path(),
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
-            .with_ref_storage(grit_lib::RefStorageFormat::Files),
+            .with_ref_storage(grit_lib::refs::ref_storage::RefStorageFormat::Files),
     )
     .expect("init");
     let git_dir = dir.path().join(".git");
@@ -50,7 +49,7 @@ fn write_ref_fails_when_lock_file_exists() {
         dir.path(),
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
-            .with_ref_storage(grit_lib::RefStorageFormat::Files),
+            .with_ref_storage(grit_lib::refs::ref_storage::RefStorageFormat::Files),
     )
     .expect("init");
     let git_dir = dir.path().join(".git");
@@ -61,21 +60,38 @@ fn write_ref_fails_when_lock_file_exists() {
     let lock_path = lock_path_for_ref(&ref_path);
     fs::write(&lock_path, b"held").expect("lock");
     let is_lock_held = |err: &Error| match err {
-        Error::LockHeld { path, .. } => *path == lock_path,
-        Error::RefStore(RefStoreError::LockHeld { name }) => name == "refs/heads/locked",
+        Error::LockHeld(grit_lib::error::LockHeldError { path, holder: None })
+            if **path == lock_path =>
+        {
+            true
+        }
+        Error::Ref(RefError::Store(RefStoreError::LockHeld { name })) => {
+            name == "refs/heads/locked"
+        }
         _ => false,
     };
-    let err = write_ref(&git_dir, "refs/heads/locked", &oid(2)).expect_err("lock held");
+    let err = grit_test_support::refs::set_ref(
+        &grit_test_support::refs::at(&git_dir),
+        "refs/heads/locked",
+        &oid(2),
+    )
+    .expect_err("lock held");
     assert!(
         is_lock_held(&err),
         "expected a typed lock error, got {err:?}"
     );
-    let err = delete_ref_cas(&git_dir, "refs/heads/locked", oid(1)).expect_err("lock held");
+    let err = grit_test_support::refs::at(&git_dir)
+        .references()
+        .compare_and_delete("refs/heads/locked", &oid(1))
+        .expect_err("lock held");
     assert!(
         is_lock_held(&err),
         "expected a typed lock error, got {err:?}"
     );
-    let err = delete_ref(&git_dir, "refs/heads/locked").expect_err("lock held");
+    let err = grit_test_support::refs::at(&git_dir)
+        .references()
+        .delete("refs/heads/locked")
+        .expect_err("lock held");
     assert!(
         is_lock_held(&err),
         "expected a typed lock error, got {err:?}"
@@ -94,12 +110,17 @@ fn write_ref_rejects_broken_existing_ref_file() {
         dir.path(),
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
-            .with_ref_storage(grit_lib::RefStorageFormat::Files),
+            .with_ref_storage(grit_lib::refs::ref_storage::RefStorageFormat::Files),
     )
     .expect("init");
     let git_dir = dir.path().join(".git");
     fs::write(git_dir.join("refs/heads/broken"), b"not-a-valid-oid\n").expect("broken");
-    assert!(write_ref(&git_dir, "refs/heads/broken", &oid(3)).is_err());
+    assert!(grit_test_support::refs::set_ref(
+        &grit_test_support::refs::at(&git_dir),
+        "refs/heads/broken",
+        &oid(3)
+    )
+    .is_err());
 }
 
 #[test]
@@ -109,19 +130,38 @@ fn delete_ref_cas_and_directory_in_the_way() {
         dir.path(),
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
-            .with_ref_storage(grit_lib::RefStorageFormat::Files),
+            .with_ref_storage(grit_lib::refs::ref_storage::RefStorageFormat::Files),
     )
     .expect("init");
     let git_dir = dir.path().join(".git");
     let oid = |n: u8| support::stored_commit(&git_dir, n);
-    write_ref(&git_dir, "refs/heads/del", &oid(4)).expect("seed");
-    delete_ref_cas(&git_dir, "refs/heads/del", oid(4)).expect("delete");
-    write_ref(&git_dir, "refs/heads/parent/leaf", &oid(5)).expect("child");
-    assert!(write_ref(&git_dir, "refs/heads/parent", &oid(6)).is_err());
-    delete_ref(&git_dir, "refs/heads/parent/leaf").expect("cleanup");
+    grit_test_support::refs::set_ref(
+        &grit_test_support::refs::at(&git_dir),
+        "refs/heads/del",
+        &oid(4),
+    )
+    .expect("seed");
+    grit_test_support::refs::at(&git_dir)
+        .references()
+        .compare_and_delete("refs/heads/del", &oid(4))
+        .expect("delete");
+    grit_test_support::refs::set_ref(
+        &grit_test_support::refs::at(&git_dir),
+        "refs/heads/parent/leaf",
+        &oid(5),
+    )
+    .expect("child");
+    assert!(grit_test_support::refs::set_ref(
+        &grit_test_support::refs::at(&git_dir),
+        "refs/heads/parent",
+        &oid(6)
+    )
+    .is_err());
+    grit_test_support::refs::at(&git_dir)
+        .references()
+        .delete("refs/heads/parent/leaf")
+        .expect("cleanup");
     let extras = BTreeSet::new();
     let skip = HashSet::new();
-    assert!(
-        verify_refname_available_for_create(&git_dir, "refs/heads/new", &extras, &skip).is_ok()
-    );
+    assert!(verify_ref_available_for_create(&git_dir, "refs/heads/new", &extras, &skip).is_ok());
 }

@@ -5,6 +5,7 @@
 //! `OdbBuilder::commit_graph` gives its walks the same answers as the files backend without
 //! reading commit objects. Graph bytes are cross-checked with the system `git`.
 
+use grit_lib::error::ObjectError;
 use std::ops::ControlFlow;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -13,14 +14,13 @@ use std::sync::Arc;
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::error::{Error, Result};
 use grit_lib::maintenance::{CommitGraphBuild, CommitGraphOptions};
+use grit_lib::objects::commit_graph::CommitGraphChain;
 use grit_lib::objects::odb::store::{MemoryStore, ObjectStore, WritableObjectStore};
 use grit_lib::objects::odb::{OdbBuilder, WriteOptions};
 use grit_lib::objects::{HashAlgo, Object, ObjectId, ObjectInfo, ObjectKind};
-use grit_lib::refs::write_ref;
-use grit_lib::repo::{Repository, RepositoryBuilder};
-use grit_lib::revwalk::commit_graph::CommitGraphChain;
-use grit_lib::revwalk::merge_base::merge_bases_first_vs_rest;
+use grit_lib::repo::{Repository, RepositoryError};
 use grit_lib::revwalk::RevWalkListOptions;
+use grit_lib::worktree::pathspec::{Pathspec, PathspecGlobalFlags};
 use grit_test_support::{git, git_cmd, rev_parse};
 
 /// Memory store that counts how often a commit object is read, by either read method.
@@ -181,19 +181,22 @@ fn open_custom(
     graph: Option<Arc<CommitGraphChain>>,
 ) -> Result<Repository> {
     let git_dir = dir.join(".git");
-    let mut builder = OdbBuilder::files(git_dir.join("objects"))
-        .primary(store)
-        .alternates(false);
+    let mut builder = OdbBuilder::new();
     if let Some(graph) = graph {
         builder = builder.commit_graph(graph);
     }
-    RepositoryBuilder::new(RepositoryOptions::empty())
-        .odb_builder(builder)
-        .open(&git_dir, Some(dir))
+    Repository::open(
+        &git_dir,
+        &(RepositoryOptions::empty()
+            .with_object_store(store)
+            .with_odb_builder(builder)
+            .with_work_tree(dir)),
+    )
 }
 
 fn built_graph(repo: &Repository, changed_paths: bool) -> grit_lib::maintenance::BuiltCommitGraph {
     match repo
+        .maintenance()
         .build_commit_graph(&CommitGraphOptions::with_changed_paths(changed_paths))
         .expect("build commit-graph")
     {
@@ -212,10 +215,10 @@ fn git_count(dir: &Path, range: &str) -> usize {
 fn path_log(repo: &Repository, path: &str) -> Vec<ObjectId> {
     let options = RevWalkListOptions {
         limit: Some(5),
-        paths: vec![path.to_owned()],
+        pathspec: Pathspec::scoped(vec![path.to_owned()], PathspecGlobalFlags::default()),
         ..RevWalkListOptions::default()
     };
-    repo.rev_walk()
+    repo.revwalk()
         .commits(&["main"], &options)
         .expect("log -- path")
 }
@@ -228,7 +231,7 @@ fn graph_file_under_objects_does_not_invent_commits_for_a_custom_store() {
     let files = files_repo(dir.path());
     assert_eq!(
         files
-            .rev_walk()
+            .revwalk()
             .count(&["main"], &RevWalkListOptions::default())
             .expect("files"),
         git_count(dir.path(), "main")
@@ -245,10 +248,10 @@ fn graph_file_under_objects_does_not_invent_commits_for_a_custom_store() {
     let custom = open_custom(dir.path(), Arc::clone(&store), None).expect("open");
 
     let counted = custom
-        .rev_walk()
+        .revwalk()
         .count(&["main"], &RevWalkListOptions::default());
     assert!(
-        matches!(counted, Err(Error::ObjectNotFound(_))),
+        matches!(counted, Err(Error::Object(ObjectError::NotFound { .. }))),
         "the walk must reach the store's missing parent, not take it from the graph file: {counted:?}"
     );
     let bounded = RevWalkListOptions {
@@ -257,7 +260,7 @@ fn graph_file_under_objects_does_not_invent_commits_for_a_custom_store() {
     };
     assert_eq!(
         custom
-            .rev_walk()
+            .revwalk()
             .commits(&["main"], &bounded)
             .expect("bounded walk"),
         kept
@@ -289,11 +292,11 @@ fn attached_graph_answers_walks_like_the_files_backend_without_commit_reads() {
     for (range, endpoint_reads) in [("main", 0), ("main~40..main", 1), ("side..main", 0)] {
         let expected = git_count(dir.path(), range);
         assert_eq!(
-            files.rev_walk().count(&[range], &all).expect("files"),
+            files.revwalk().count(&[range], &all).expect("files"),
             expected
         );
         assert_eq!(
-            custom.rev_walk().count(&[range], &all).expect("custom"),
+            custom.revwalk().count(&[range], &all).expect("custom"),
             expected
         );
         assert_eq!(
@@ -310,11 +313,17 @@ fn attached_graph_answers_walks_like_the_files_backend_without_commit_reads() {
         git(dir.path(), &["merge-base", "main~5", "side~1"]).trim(),
     )];
     assert_eq!(
-        merge_bases_first_vs_rest(&files, tip, &[other]).expect("files"),
+        files
+            .revwalk()
+            .merge_bases(&[tip, other], grit_lib::revwalk::MergeBaseMode::Best)
+            .expect("files"),
         expected
     );
     assert_eq!(
-        merge_bases_first_vs_rest(&custom, tip, &[other]).expect("custom"),
+        custom
+            .revwalk()
+            .merge_bases(&[tip, other], grit_lib::revwalk::MergeBaseMode::Best)
+            .expect("custom"),
         expected
     );
     assert_eq!(
@@ -354,13 +363,13 @@ fn commits_newer_than_the_attached_graph_are_still_walked() {
             .write(ObjectKind::Commit, body.as_bytes())
             .expect("commit");
     }
-    write_ref(plain.git_dir(), "refs/heads/main", &tip).expect("move main");
+    grit_test_support::refs::set_ref(&plain, "refs/heads/main", &tip).expect("move main");
 
     let custom = open_custom(dir.path(), Arc::clone(&store), Some(graph)).expect("open");
     store.take_commit_reads();
     assert_eq!(
         custom
-            .rev_walk()
+            .revwalk()
             .count(&["main"], &RevWalkListOptions::default())
             .expect("count"),
         expected
@@ -384,6 +393,7 @@ fn built_graph_is_byte_identical_to_the_files_writer_and_verified_by_git() {
     for changed_paths in [false, true] {
         let built = built_graph(&custom, changed_paths);
         files
+            .maintenance()
             .write_commit_graph(&CommitGraphOptions::with_changed_paths(changed_paths))
             .expect("files write");
         assert_eq!(
@@ -399,7 +409,7 @@ fn built_graph_is_byte_identical_to_the_files_writer_and_verified_by_git() {
         for range in ["main", "main~25..main", "side..main"] {
             assert_eq!(
                 reopened
-                    .rev_walk()
+                    .revwalk()
                     .count(&[range], &RevWalkListOptions::default())
                     .expect("grit count"),
                 git_count(dir.path(), range),
@@ -428,7 +438,7 @@ fn graph_written_by_git_attaches_to_a_custom_store() {
     store.take_commit_reads();
     assert_eq!(
         custom
-            .rev_walk()
+            .revwalk()
             .count(&["main"], &RevWalkListOptions::default())
             .expect("count"),
         git_count(dir.path(), "main")
@@ -457,7 +467,7 @@ fn graph_written_by_git_attaches_to_a_custom_store() {
             commit_body(rev_parse(dir.path(), "main")).as_bytes(),
         )
         .expect("commit");
-    write_ref(files.git_dir(), "refs/heads/main", &next).expect("ref");
+    grit_test_support::refs::set_ref(&files, "refs/heads/main", &next).expect("ref");
     git(
         dir.path(),
         &["commit-graph", "write", "--reachable", "--split=no-merge"],
@@ -474,7 +484,7 @@ fn graph_written_by_git_attaches_to_a_custom_store() {
     assert!(chain.lines().count() > 1, "{chain}");
     assert!(matches!(
         CommitGraphChain::from_bytes(layer),
-        Err(Error::CorruptObject(_))
+        Err(Error::Object(ObjectError::Corrupt { .. }))
     ));
 }
 
@@ -496,11 +506,11 @@ fn attached_graph_of_another_object_format_is_refused_on_open() {
     let store = Arc::new(CountingStore::new(HashAlgo::Sha1));
     assert!(matches!(
         open_custom(sha1.path(), store, Some(graph)),
-        Err(Error::ObjectFormatMismatch {
+        Err(Error::Repository(RepositoryError::ObjectFormatMismatch {
             repository: HashAlgo::Sha1,
             store: HashAlgo::Sha256,
             ..
-        })
+        }))
     ));
 }
 
@@ -547,6 +557,6 @@ fn octopus_graph_without_its_edge_chunk_is_rejected_like_git() {
     assert!(verify.stderr.contains("extra-edges"), "{}", verify.stderr);
     assert!(matches!(
         CommitGraphChain::from_bytes(mutated),
-        Err(Error::CorruptObject(_))
+        Err(Error::Object(ObjectError::Corrupt { .. }))
     ));
 }

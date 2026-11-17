@@ -1,5 +1,6 @@
 //! Index-level patch apply vs `git apply --cached`.
 
+use grit_lib::progress::NullProgress;
 use std::process::Command;
 
 use grit_lib::apply::{
@@ -8,8 +9,7 @@ use grit_lib::apply::{
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::index::write_tree::write_tree_from_index;
 use grit_lib::objects::ObjectId;
-use grit_lib::porcelain::status::{status, StatusOptions};
-use grit_lib::progress::NeverCancel;
+use grit_lib::porcelain::status::StatusOptions;
 use grit_lib::progress::NullProgress;
 use grit_lib::repo::Repository;
 use tempfile::TempDir;
@@ -68,7 +68,10 @@ fn index_apply_create_delete() {
          +hello\n",
     );
     let repo = Repository::discover(Some(dir.path()), &RepositoryOptions::default()).unwrap();
-    let mut index = repo.index_handle().load().unwrap();
+    let mut index = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .unwrap();
     apply_patch_to_index(&repo, &mut index, &add_patch, &IndexApplyOptions::default()).unwrap();
     assert!(index.get(b"new.txt", 0).is_some());
 
@@ -100,7 +103,10 @@ fn index_apply_mode_change() {
          +++ b/run.sh\n",
     );
     let repo = Repository::discover(Some(dir.path()), &RepositoryOptions::default()).unwrap();
-    let mut index = repo.index_handle().load().unwrap();
+    let mut index = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .unwrap();
     apply_patch_to_index(&repo, &mut index, &patch, &IndexApplyOptions::default()).unwrap();
     assert_eq!(index.get(b"run.sh", 0).unwrap().mode, 0o100755);
 }
@@ -120,7 +126,10 @@ fn index_apply_rename() {
          rename to new.txt\n",
     );
     let repo = Repository::discover(Some(dir.path()), &RepositoryOptions::default()).unwrap();
-    let mut index = repo.index_handle().load().unwrap();
+    let mut index = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .unwrap();
     apply_patch_to_index(&repo, &mut index, &patch, &IndexApplyOptions::default()).unwrap();
     assert!(index.get(b"old.txt", 0).is_none());
     assert!(index.get(b"new.txt", 0).is_some());
@@ -141,7 +150,10 @@ fn index_apply_binary() {
     let patch = parse(&patch_text);
 
     let repo = Repository::discover(Some(dir.path()), &RepositoryOptions::default()).unwrap();
-    let mut index = repo.index_handle().load().unwrap();
+    let mut index = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .unwrap();
     apply_patch_to_index(&repo, &mut index, &patch, &IndexApplyOptions::default()).unwrap();
     let oid = index.get(b"b.bin", 0).unwrap().oid;
     assert_eq!(repo.odb().read(&oid).unwrap().data, new);
@@ -172,7 +184,10 @@ fn index_apply_atomic_on_failure() {
          +nope2\n",
     );
     let repo = Repository::discover(Some(dir.path()), &RepositoryOptions::default()).unwrap();
-    let mut index = repo.index_handle().load().unwrap();
+    let mut index = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .unwrap();
     let before = index.get(b"a.txt", 0).unwrap().oid;
     let mut batch = good.clone();
     batch.extend(bad);
@@ -202,16 +217,23 @@ fn index_apply_keeps_worktree_dirty_in_status() {
          +index\n",
     );
     let repo = Repository::discover(Some(dir.path()), &RepositoryOptions::default()).unwrap();
-    apply_patch_to_index_and_write(&repo, &patch, &IndexApplyOptions::default()).unwrap();
+    apply_patch_to_index_and_write(
+        &repo,
+        &patch,
+        &IndexApplyOptions::default(),
+        &CancelToken::never(),
+    )
+    .unwrap();
 
     let mut progress = NullProgress;
-    let st = status(
-        &repo,
-        &StatusOptions::default(),
-        &mut progress,
-        &NeverCancel,
-    )
-    .expect("status");
+    let st = repo
+        .status()
+        .run(
+            &StatusOptions::default(),
+            &mut progress,
+            &CancelToken::never(),
+        )
+        .expect("status");
     assert!(
         st.staged.iter().any(|e| e.path() == "f.txt"),
         "expected staged index change: {:?}",
@@ -244,8 +266,17 @@ fn index_apply_no_newline_preimage() {
     assert!(patch.contains("No newline"), "{patch}");
     let repo = Repository::discover(Some(dir.path()), &RepositoryOptions::default()).unwrap();
     let patches = parse(&patch);
-    apply_patch_to_index_and_write(&repo, &patches, &IndexApplyOptions::default()).unwrap();
-    let entry = repo.index_handle().load().unwrap();
+    apply_patch_to_index_and_write(
+        &repo,
+        &patches,
+        &IndexApplyOptions::default(),
+        &CancelToken::never(),
+    )
+    .unwrap();
+    let entry = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .unwrap();
     let e = entry.get(b"f.txt", 0).expect("indexed");
     assert_eq!(repo.odb().read(&e.oid).unwrap().data, b"new\n");
 }
@@ -266,7 +297,10 @@ fn index_apply_deletion_rejects_stale_preimage() {
          -expected\n",
     );
     let repo = Repository::discover(Some(dir.path()), &RepositoryOptions::default()).unwrap();
-    let mut index = repo.index_handle().load().unwrap();
+    let mut index = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .unwrap();
     let before = index.get(b"f.txt", 0).is_some();
     assert!(before);
     let err = apply_patch_to_index(&repo, &mut index, &patch, &IndexApplyOptions::default())
@@ -304,8 +338,20 @@ fn index_apply_sha256_write_tree_roundtrip() {
     .to_string();
     let repo = Repository::discover(Some(dir.path()), &RepositoryOptions::default()).unwrap();
     assert_eq!(repo.odb().hash_algo(), grit_lib::objects::HashAlgo::Sha256);
-    apply_patch_to_index_and_write(&repo, &parse(&patch), &IndexApplyOptions::default()).unwrap();
-    let grit_oid = grit_tree(&repo, &repo.index_handle().load().unwrap());
+    apply_patch_to_index_and_write(
+        &repo,
+        &parse(&patch),
+        &IndexApplyOptions::default(),
+        &CancelToken::never(),
+    )
+    .unwrap();
+    let grit_oid = grit_tree(
+        &repo,
+        &repo
+            .index()
+            .load(&grit_lib::index::IndexLoadOptions::default())
+            .unwrap(),
+    );
     git(dir.path(), &["reset", "--hard", "HEAD"]);
     std::fs::write(dir.path().join("patch.diff"), &patch).unwrap();
     git(dir.path(), &["apply", "--cached", "patch.diff"]);
@@ -336,8 +382,20 @@ fn index_apply_git_diff_roundtrip_write_tree() {
 
     let repo = Repository::discover(Some(dir.path()), &RepositoryOptions::default()).unwrap();
     let patches = parse(&patch);
-    apply_patch_to_index_and_write(&repo, &patches, &IndexApplyOptions::default()).unwrap();
-    let grit_oid = grit_tree(&repo, &repo.index_handle().load().unwrap());
+    apply_patch_to_index_and_write(
+        &repo,
+        &patches,
+        &IndexApplyOptions::default(),
+        &CancelToken::never(),
+    )
+    .unwrap();
+    let grit_oid = grit_tree(
+        &repo,
+        &repo
+            .index()
+            .load(&grit_lib::index::IndexLoadOptions::default())
+            .unwrap(),
+    );
 
     git(dir.path(), &["reset", "--hard", "HEAD"]);
     std::fs::write(dir.path().join("patch.diff"), &patch).unwrap();
@@ -353,13 +411,14 @@ fn index_apply_git_diff_roundtrip_write_tree() {
         .expect("status");
     assert!(porcelain.status.success());
     let mut progress = NullProgress;
-    let grit_status = status(
-        &repo,
-        &StatusOptions::default(),
-        &mut progress,
-        &NeverCancel,
-    )
-    .unwrap();
+    let grit_status = repo
+        .status()
+        .run(
+            &StatusOptions::default(),
+            &mut progress,
+            &CancelToken::never(),
+        )
+        .unwrap();
     let git_p = String::from_utf8_lossy(&porcelain.stdout);
     assert_eq!(
         grit_status.staged.len() + grit_status.unstaged.len(),

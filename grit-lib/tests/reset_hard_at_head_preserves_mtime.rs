@@ -7,15 +7,15 @@ use crate::support;
 
 use grit_lib::index::write_tree::{write_tree_update_index, WriteTreeFlags};
 use grit_lib::objects::{serialize_commit, CommitData, ObjectKind};
-use grit_lib::porcelain::reset::{reset_to_commit, ResetMode, ResetOptions};
-use grit_lib::refs;
+use grit_lib::porcelain::reset::{ResetMode, ResetOptions};
+use grit_lib::progress::{CancelToken, NullProgress};
 use grit_lib::repo::{InitOptions, Repository};
 use grit_test_support::git;
 use tempfile::TempDir;
 
 fn init_repo() -> (TempDir, Repository) {
     let dir = TempDir::new().expect("tempdir");
-    let repo = Repository::init(dir.path(), &InitOptions::default()).expect("init");
+    let (repo, _) = Repository::init(dir.path(), &InitOptions::default()).expect("init");
     (dir, repo)
 }
 
@@ -25,7 +25,10 @@ fn commit_many_files(repo: &Repository, count: usize) -> grit_lib::objects::Obje
     for i in 0..count {
         std::fs::write(work_tree.join(format!("f{i}.txt")), format!("body {i}\n")).expect("write");
     }
-    let mut index = repo.index_handle().load().expect("index");
+    let mut index = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("index");
     for i in 0..count {
         let rel = format!("f{i}.txt");
         let abs = work_tree.join(&rel);
@@ -37,7 +40,9 @@ fn commit_many_files(repo: &Repository, count: usize) -> grit_lib::objects::Obje
     index.sort();
     let tree = write_tree_update_index(repo.odb(), &mut index, "", WriteTreeFlags::silent())
         .expect("tree");
-    repo.index_handle().write(&mut index).expect("write index");
+    repo.index()
+        .write(&mut index, &grit_lib::index::IndexWriteOptions::default())
+        .expect("write index");
     let commit = CommitData {
         tree,
         parents: vec![],
@@ -54,8 +59,10 @@ fn commit_many_files(repo: &Repository, count: usize) -> grit_lib::objects::Obje
         .odb()
         .write(ObjectKind::Commit, &serialize_commit(&commit))
         .expect("commit");
-    refs::write_ref(repo.git_dir(), "refs/heads/main", &co).expect("branch");
-    refs::write_symbolic_ref(repo.git_dir(), "HEAD", "refs/heads/main").expect("symhead");
+    grit_test_support::refs::set_ref(&repo, "refs/heads/main", &co).expect("branch");
+    repo.references()
+        .update_symbolic("HEAD", "refs/heads/main")
+        .expect("symhead");
     co
 }
 
@@ -84,13 +91,13 @@ fn hard_reset_at_head_preserves_file_mtimes_on_clean_tree() {
         })
         .collect();
 
-    reset_to_commit(
-        &repo,
-        &reset_opts(head, ResetMode::Hard),
-        &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("hard reset at HEAD");
+    repo.checkout()
+        .reset(
+            &reset_opts(head, ResetMode::Hard),
+            &mut grit_lib::progress::NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("hard reset at HEAD");
 
     for (rel, old_mtime) in before {
         let path = work_tree.join(&rel);

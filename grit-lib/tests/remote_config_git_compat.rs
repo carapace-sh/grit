@@ -1,4 +1,4 @@
-//! `RepositoryRemotes::{add, configured}`, `resolve_remote_argument` and `fold_peeled_refs`
+//! `Remotes::{add, configured}`, `resolve_remote_argument` and `fold_peeled_refs`
 //! checked against the system `git` (config round-trip, worktrees, `git ls-remote`).
 
 use std::path::Path;
@@ -92,7 +92,7 @@ fn configured_remotes_match_git_remote_listing() {
         [None, Some("/srv/origin.git"), Some("/srv/prod.git")]
     );
 
-    let config = open(tmp.path()).config().expect("config");
+    let config = open(tmp.path()).config().snapshot().expect("config");
     assert!(matches!(
         resolve_remote_argument(&config, "half"),
         Err(RemoteError::NoUrl { remote: Some(name) }) if name == "half"
@@ -119,7 +119,7 @@ fn add_refuses_what_git_refuses() {
     ));
     assert!(matches!(
         repo.remotes().add("origin", "/srv/other.git"),
-        Err(RemoteError::RemoteExists(_))
+        Err(RemoteError::RemoteExists { .. })
     ));
 
     for bad in ["bad name", "a..b", "x:y"] {
@@ -130,7 +130,7 @@ fn add_refuses_what_git_refuses() {
         assert!(
             matches!(
                 repo.remotes().add(bad, "/srv/x.git"),
-                Err(RemoteError::InvalidRemoteName(_))
+                Err(RemoteError::InvalidRemoteName { .. })
             ),
             "grit accepted {bad}"
         );
@@ -212,7 +212,7 @@ fn fold_peeled_refs_matches_git_ls_remote() {
         .filter_map(|line| line.split_once('\t'))
         .collect();
 
-    let config = open(tmp.path()).config().expect("config");
+    let config = open(tmp.path()).config().snapshot().expect("config");
     let remote = resolve_remote_argument(&config, tmp.path().to_str().unwrap()).expect("remote");
     let raw = remote
         .list_refs(
@@ -273,7 +273,7 @@ fn local_ls_remote_peels_nested_tags_like_git() {
         .collect();
     git_lines.sort();
 
-    let config = open(tmp.path()).config().expect("config");
+    let config = open(tmp.path()).config().snapshot().expect("config");
     let remote = resolve_remote_argument(&config, tmp.path().to_str().unwrap()).expect("remote");
     let mut grit_lines: Vec<(String, String)> = remote
         .list_refs(

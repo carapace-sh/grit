@@ -38,16 +38,16 @@ Embedders inject randomness with [`ChangeIdGenerator`](rustdoc:grit_lib::change_
 
 ## Where ids are assigned
 
-[`create_commit`](rustdoc:grit_lib::porcelain::commit::create_commit) (and the CLI `grit commit` built on it) applies [`ChangeIdPolicy`](rustdoc:grit_lib::change_id::ChangeIdPolicy) before serializing: new commits, the initial commit, merge conclusions, and amends that need a stored id. Amends keep an existing `change-id` / `gitbutler-change-id` header; when the replaced tip had none, the derived id from that tip is stored.
+[`create_commit`](rustdoc:grit_lib::porcelain::commit::CommitRequest) (and the CLI `grit commit` built on it) applies [`ChangeIdPolicy`](rustdoc:grit_lib::change_id::ChangeIdPolicy) before serializing: new commits, the initial commit, merge conclusions, and amends that need a stored id. Amends keep an existing `change-id` / `gitbutler-change-id` header; when the replaced tip had none, the derived id from that tip is stored.
 
-[`prepare_commit_bytes`](rustdoc:grit_lib::porcelain::commit::prepare_commit_bytes) and [`write_commit_object`](rustdoc:grit_lib::porcelain::commit::write_commit_object) do **not** add change ids — stash, notes, and other auxiliary commits stay header-free unless the caller sets one.
+[`prepare_commit_bytes`](rustdoc:grit_lib::objects::Objects::write_commit) and [`write_commit_object`](rustdoc:grit_lib::objects::Objects::write_commit) do **not** add change ids — stash, notes, and other auxiliary commits stay header-free unless the caller sets one.
 
 ## Revisions
 
 After refs and abbreviated object ids, grit resolves **change ids** as revision tokens:
 
 - **Alphabet:** reverse-hex ids use `k`–`z` (4–32 characters). A token in that range is treated as a change-id prefix, not a Git object id.
-- **Lookup:** [`find_commits_by_change_id_prefix`](rustdoc:grit_lib::change_id::find_commits_by_change_id_prefix) walks commits reachable from all refs and `HEAD` (not reflogs), compares [`resolved_change_id`](rustdoc:grit_lib::change_id::resolved_change_id) on each commit, and returns a unique match or [`RevParseError::AmbiguousChangeId`](rustdoc:grit_lib::revwalk::rev_parse_error::RevParseError::AmbiguousChangeId).
+- **Lookup:** [`find_commits_by_change_id_prefix`](rustdoc:grit_lib::change_id::find_commits_by_change_id_prefix) walks commits reachable from all refs and `HEAD` (not reflogs), compares [`resolved_change_id`](rustdoc:grit_lib::change_id::resolved_change_id) on each commit, and returns a unique match or [`RevParseError::AmbiguousChangeId`](rustdoc:grit_lib::revwalk::rev_parse_error::RevParseError::AmbiguousChangeId). Stored headers are found on a custom object store too; see [Change ids and author counts](../object-stores/#change-ids-and-author-counts) for what each lookup reads there.
 - **Composition:** change ids compose with the usual suffixes — `\<cid\>~1`, `\<cid\>^`, `\<cid\>..main`, peel suffixes, and path suffixes — because they plug into the same base-name resolution as branches and short oids.
 - **Precedence:** a branch or tag named like a change-id token wins (for example `refs/heads/zzzz` before the change-id `zzzz…`).
 

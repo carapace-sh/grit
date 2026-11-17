@@ -7,11 +7,13 @@ use std::fs;
 use std::path::Path;
 
 use grit_lib::config::environment::RepositoryOptions;
-use grit_lib::porcelain::add::{stage, stage_for_commit, StageMode, StageOptions, StageOutcome};
-use grit_lib::porcelain::commit::{commit_worktree, CommitRequest, HookPolicy};
+use grit_lib::porcelain::add::{StageMode, StageOptions, StageOutcome};
+use grit_lib::porcelain::commit::{CommitRequest, HookPolicy};
 use grit_lib::porcelain::stage_tracked::IndexStagingThresholds;
-use grit_lib::progress::{NeverCancel, NullProgress};
+use grit_lib::progress::CancelToken;
+use grit_lib::progress::NullProgress;
 use grit_lib::repo::Repository;
+use grit_lib::test_support::knobs::stage_options_staging_thresholds;
 use grit_test_support::git;
 
 fn init_repo(root: &Path) {
@@ -34,12 +36,18 @@ fn open_repo(root: &Path) -> Repository {
 }
 
 fn stage_all(root: &Path, thresholds: Option<IndexStagingThresholds>) -> StageOutcome {
-    let opts = StageOptions {
+    let base = StageOptions {
         mode: StageMode::All,
-        staging_thresholds: thresholds,
         ..StageOptions::default()
     };
-    stage(&open_repo(root), &opts, &mut NullProgress, &NeverCancel).expect("stage")
+    let opts = match thresholds {
+        Some(t) => stage_options_staging_thresholds(base, t),
+        None => base,
+    };
+    &open_repo(root)
+        .index()
+        .stage(&opts, &mut NullProgress, &CancelToken::never())
+        .expect("stage")
 }
 
 fn cached_name_status(root: &Path) -> String {
@@ -76,23 +84,27 @@ fn dir_became_file_repo(root: &Path) {
 
 fn commit_request() -> CommitRequest {
     let ident = "Test <t@example.com> 1 +0000".to_string();
-    CommitRequest {
-        message: "flip".into(),
-        author: Some(ident.parse().expect("signature")),
-        committer: Some(ident.parse().expect("signature")),
-        hooks: HookPolicy::SkipVerify,
-        ..Default::default()
+    {
+        let mut req = CommitRequest::new("flip");
+        req.author = Some(ident.parse().expect("signature"));
+        req.committer = Some(ident.parse().expect("signature"));
+        req.hooks = HookPolicy::SkipVerify;
+        req
     }
 }
 
 fn commit_and_check(root: &Path, expected: &str) {
-    commit_worktree(
-        &open_repo(root),
-        &commit_request(),
-        &mut NullProgress,
-        &NeverCancel,
-    )
-    .expect("commit");
+    &open_repo(root)
+        .commits()
+        .create(
+            &grit_lib::commits::CommitOptions::new(
+                commit_request(),
+                grit_lib::porcelain::commit::CommitScope::AutoStage,
+            ),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("commit");
     assert_eq!(
         git(
             root,
@@ -185,15 +197,19 @@ fn stage_directory_replaced_by_file_with_later_sibling() {
 fn stage_for_commit_records_both_flips() {
     let tmp = tempfile::tempdir().expect("tempdir");
     file_became_dir_repo(tmp.path(), true);
-    let outcome =
-        stage_for_commit(&open_repo(tmp.path()), &mut NullProgress, &NeverCancel).expect("stage");
+    let outcome = &open_repo(tmp.path())
+        .index()
+        .stage_for_commit(&mut NullProgress, &CancelToken::never())
+        .expect("stage");
     assert_eq!(outcome.removed, ["f"]);
     assert_eq!(outcome.added, ["f/i"]);
 
     let tmp = tempfile::tempdir().expect("tempdir");
     dir_became_file_repo(tmp.path());
-    let outcome =
-        stage_for_commit(&open_repo(tmp.path()), &mut NullProgress, &NeverCancel).expect("stage");
+    let outcome = &open_repo(tmp.path())
+        .index()
+        .stage_for_commit(&mut NullProgress, &CancelToken::never())
+        .expect("stage");
     assert_eq!(outcome.removed, ["d/x"]);
     assert_eq!(outcome.added, ["d"]);
 }

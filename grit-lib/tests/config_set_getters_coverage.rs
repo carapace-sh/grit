@@ -39,17 +39,69 @@ fn typed_getters_and_merge_set() {
     set.merge(&f1);
     let mut set2 = ConfigSet::new();
     set2.merge_set(&set);
-    assert_eq!(set2.get("core.bare").as_deref(), Some("false"));
-    assert_eq!(set2.get_all("remote.origin.fetch").len(), 1);
+    assert_eq!(set2.get("core.bare").unwrap().as_deref(), Some("false"));
+    assert_eq!(set2.get_all("remote.origin.fetch").unwrap().len(), 1);
     assert!(set2.has_key("branch.main.remote"));
-    assert_eq!(set2.get_bool("core.bare"), Some(Ok(false)));
+    assert_eq!(set2.get_bool("core.bare").unwrap(), Some(false));
     let env = Environment::empty();
-    assert!(set2.pack_write_reverse_index_default(&env));
+    assert!(set2.pack_write_reverse_index_default());
     assert!(set2.pack_read_reverse_index_default());
     assert_eq!(set2.pack_index_threads(), Some(2));
     assert_eq!(set2.loose_objects_zlib_level().unwrap(), 1);
     assert_eq!(set2.pack_objects_zlib_level().unwrap(), 7);
     let _ = set2.pack_index_parallelism();
+}
+
+#[test]
+fn bool_or_and_core_bool_accessors_read_repo_config() {
+    let dir = tempdir().expect("tempdir");
+    Repository::init(
+        dir.path(),
+        &InitOptions::new()
+            .with_initial_branch("main".to_owned())
+            .with_ref_storage(grit_lib::refs::ref_storage::RefStorageFormat::Files),
+    )
+    .expect("init");
+    let git_dir = dir.path().join(".git");
+    let defaults = ConfigSet::load(
+        &Environment::empty(),
+        Some(&git_dir),
+        &crate::config::LoadConfigOptions::repo_local_only(&git_dir),
+    )
+    .expect("load");
+    assert!(defaults.preload_index());
+    assert!(!defaults.precompose_unicode());
+    assert!(support::config_bool_with_default(
+        &defaults,
+        "grit.missing",
+        true
+    ));
+
+    let mut cfg = fs::read_to_string(git_dir.join("config")).expect("read");
+    cfg.push_str(
+        "[core]\n\tignoreCase = true\n\tpreloadIndex = false\n\tfileMode = false\n\tprecomposeUnicode = true\n[grit]\n\tchangeIds = nope\n",
+    );
+    fs::write(git_dir.join("config"), cfg).expect("write");
+    let set = ConfigSet::load(
+        &Environment::empty(),
+        Some(&git_dir),
+        &crate::config::LoadConfigOptions::repo_local_only(&git_dir),
+    )
+    .expect("load");
+    assert!(set.ignore_case());
+    assert!(!set.preload_index());
+    assert!(!set.file_mode());
+    assert!(set.precompose_unicode());
+    assert!(support::config_bool_with_default(
+        &set,
+        "grit.changeIds",
+        true
+    ));
+    assert!(!support::config_bool_with_default(
+        &set,
+        "grit.changeIds",
+        false
+    ));
 }
 
 #[test]
@@ -67,7 +119,7 @@ fn load_cascade_hits_local_and_global_layers() {
         &repo,
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
-            .with_ref_storage(grit_lib::RefStorageFormat::Files),
+            .with_ref_storage(grit_lib::refs::ref_storage::RefStorageFormat::Files),
     )
     .expect("init");
     let git_dir = repo.join(".git");
@@ -82,10 +134,13 @@ fn load_cascade_hits_local_and_global_layers() {
         include_system: false,
         ..support::default_load_opts(&git_dir, &env)
     };
-    let set = ConfigSet::load_with_options(&env, Some(&git_dir), &opts).expect("load");
-    assert_eq!(set.get("user.email").as_deref(), Some("local@example.com"));
-    assert_eq!(set.get("user.name").as_deref(), Some("Global"));
-    assert_eq!(set.get("core.autocrlf").as_deref(), Some("true"));
+    let set = ConfigSet::load(&env, Some(&git_dir), &opts).expect("load");
+    assert_eq!(
+        set.get("user.email").unwrap().as_deref(),
+        Some("local@example.com")
+    );
+    assert_eq!(set.get("user.name").unwrap().as_deref(), Some("Global"));
+    assert_eq!(set.get("core.autocrlf").unwrap().as_deref(), Some("true"));
 }
 
 #[test]
@@ -114,17 +169,55 @@ fn effective_log_refs_config_and_i64_errors() {
         dir.path(),
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
-            .with_ref_storage(grit_lib::RefStorageFormat::Files),
+            .with_ref_storage(grit_lib::refs::ref_storage::RefStorageFormat::Files),
     )
     .expect("init");
     let git_dir = dir.path().join(".git");
     let mut cfg = fs::read_to_string(git_dir.join("config")).expect("read");
     cfg.push_str("[core]\n\tlogAllRefUpdates = always\n[invalid]\n\ti = not-int\n");
     fs::write(git_dir.join("config"), cfg).expect("write");
-    let set = ConfigSet::load_repo_local_only(&git_dir).expect("local");
+    let set = ConfigSet::load(
+        &Environment::empty(),
+        Some(&git_dir),
+        &crate::config::LoadConfigOptions::repo_local_only(&git_dir),
+    )
+    .expect("local");
     assert_eq!(
         set.effective_log_refs_config(),
         grit_lib::refs::LogRefsConfig::Always
     );
-    assert!(set.get_i64("invalid.i").unwrap().is_err());
+    assert!(set.get_i64("invalid.i").is_err());
+}
+
+#[test]
+fn invalid_typed_values_are_typed_errors_naming_the_key() {
+    use grit_lib::error::{ConfigError, ConfigValueError, Error};
+    use grit_lib::remote::transfer::resolve_fetch_prune;
+
+    let text = "[fetch]\n\tprune = often\n[core]\n\tcompressionLevel = 3q\n";
+    let file = ConfigFile::parse(Path::new("a"), text, ConfigScope::Local).expect("parse");
+    let mut set = ConfigSet::new();
+    set.merge(&file);
+
+    match resolve_fetch_prune(&set, "origin", None) {
+        Err(Error::Config(ConfigError::InvalidValue { key, source })) => {
+            assert_eq!(key, "fetch.prune");
+            assert_eq!(
+                source,
+                ConfigValueError::InvalidBool {
+                    value: "often".to_owned()
+                }
+            );
+        }
+        other => panic!("expected an invalid fetch.prune value, got {other:?}"),
+    }
+    assert!(resolve_fetch_prune(&set, "origin", Some(true)).expect("override wins"));
+
+    let err = set
+        .get_i64("core.compressionLevel")
+        .expect_err("not an integer");
+    assert_eq!(
+        err.to_string(),
+        "invalid integer: '3q' for 'core.compressionLevel'"
+    );
 }

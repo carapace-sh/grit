@@ -36,7 +36,7 @@ impl WorktreeModePolicy {
     /// unset or not a boolean.
     #[must_use]
     pub fn from_config(config: &ConfigSet) -> Self {
-        let flag = |key: &str| config.get_bool(key).and_then(|r| r.ok()).unwrap_or(true);
+        let flag = |key: &str| config.bool_with_default(key, true);
         Self {
             trust_filemode: flag("core.filemode"),
             has_symlinks: flag("core.symlinks"),
@@ -56,7 +56,7 @@ impl WorktreeModePolicy {
     ///
     /// # Parameters
     ///
-    /// - `worktree_mode` — Git mode derived from `lstat` (see [`crate::diff::mode_from_metadata`]).
+    /// - `worktree_mode` — Git mode derived from `lstat` (same mapping as the diff worktree helpers).
     /// - `recorded_mode` — the index entry's mode, or `None` for a path not yet tracked (the
     ///   worktree mode is then returned unchanged).
     ///

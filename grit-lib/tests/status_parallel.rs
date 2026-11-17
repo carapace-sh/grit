@@ -5,11 +5,11 @@ use std::path::Path;
 use std::process::Command;
 
 use grit_lib::config::environment::RepositoryOptions;
-use grit_lib::porcelain::status::{status, IgnoredMode, StatusModel, StatusOptions, UntrackedMode};
-use grit_lib::progress::NeverCancel;
+use grit_lib::porcelain::status::{IgnoredMode, StatusModel, StatusOptions, UntrackedMode};
+use grit_lib::progress::CancelToken;
 use grit_lib::progress::NullProgress;
+use grit_lib::refs::ref_storage::RefStorageFormat;
 use grit_lib::repo::{InitOptions, Repository};
-use grit_lib::RefStorageFormat;
 use grit_test_support::forced_parallel_policy;
 use grit_test_support::git;
 
@@ -35,11 +35,11 @@ fn assert_models_equal(a: &StatusModel, b: &StatusModel) {
 }
 
 fn baseline_index_bytes(repo: &Repository) -> Vec<u8> {
-    match fs::read(repo.index_handle().path()) {
+    match fs::read(repo.index().path()) {
         Ok(bytes) => bytes,
         Err(_) => {
             let mut empty = grit_lib::index::Index::new();
-            let index_path = repo.index_handle().path();
+            let index_path = repo.index().path();
             empty.write(&index_path).expect("write empty index");
             fs::read(index_path).expect("read empty index")
         }
@@ -51,14 +51,16 @@ fn run_status_pair(
     opts: &StatusOptions,
     baseline_index: &[u8],
 ) -> (StatusModel, StatusModel, Vec<u8>, Vec<u8>) {
-    fs::write(repo.index_handle().path(), baseline_index).expect("restore index");
+    fs::write(repo.index().path(), baseline_index).expect("restore index");
     let mut serial_opts = opts.clone();
     serial_opts.stat_parallel_threads = Some(1);
-    let serial =
-        status(repo, &serial_opts, &mut NullProgress, &NeverCancel).expect("serial status");
-    let serial_index = fs::read(repo.index_handle().path()).expect("serial index");
+    let serial = repo
+        .status()
+        .run(&serial_opts, &mut NullProgress, &CancelToken::never())
+        .expect("serial status");
+    let serial_index = fs::read(repo.index().path()).expect("serial index");
 
-    fs::write(repo.index_handle().path(), baseline_index).expect("restore index");
+    fs::write(repo.index().path(), baseline_index).expect("restore index");
     let parallel_repo = Repository::open(
         repo.git_dir(),
         &RepositoryOptions::empty()
@@ -68,14 +70,11 @@ fn run_status_pair(
     .with_thread_policy(forced_parallel_policy());
     let mut parallel_opts = opts.clone();
     parallel_opts.stat_parallel_threads = Some(4);
-    let parallel = status(
-        &parallel_repo,
-        &parallel_opts,
-        &mut NullProgress,
-        &NeverCancel,
-    )
-    .expect("parallel status");
-    let parallel_index = fs::read(parallel_repo.index_handle().path()).expect("parallel index");
+    let parallel = parallel_repo
+        .status()
+        .run(&parallel_opts, &mut NullProgress, &CancelToken::never())
+        .expect("parallel status");
+    let parallel_index = fs::read(parallel_repo.index().path()).expect("parallel index");
 
     (serial, parallel, serial_index, parallel_index)
 }
@@ -100,7 +99,7 @@ fn assert_git_diff_files_clean(repo_root: &Path) {
 fn nested_ignores_and_negation_match_serial() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = tmp.path();
-    let repo = Repository::init(
+    let (repo, _) = Repository::init(
         root,
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
@@ -130,7 +129,7 @@ fn nested_ignores_and_negation_match_serial() {
 fn untracked_directory_markers_match_serial() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = tmp.path();
-    let repo = Repository::init(
+    let (repo, _) = Repository::init(
         root,
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
@@ -163,7 +162,7 @@ fn symlinked_directory_untracked_match_serial() {
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = tmp.path();
-    let repo = Repository::init(
+    let (repo, _) = Repository::init(
         root,
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
@@ -203,7 +202,7 @@ fn racy_timestamp_refresh_matches_serial_and_git() {
         ahead_behind: false,
         ..StatusOptions::default()
     };
-    let baseline = fs::read(repo.index_handle().path()).expect("index");
+    let baseline = fs::read(repo.index().path()).expect("index");
     let (serial, parallel, serial_index, parallel_index) = run_status_pair(&repo, &opts, &baseline);
     assert_models_equal(&serial, &parallel);
     assert_eq!(serial_index, parallel_index, "index bytes must match");
@@ -236,7 +235,7 @@ fn skip_worktree_sparse_entry_status_matches_serial() {
         ahead_behind: false,
         ..StatusOptions::default()
     };
-    let baseline = fs::read(repo.index_handle().path()).expect("index");
+    let baseline = fs::read(repo.index().path()).expect("index");
     let (serial, parallel, serial_index, parallel_index) = run_status_pair(&repo, &opts, &baseline);
     assert_models_equal(&serial, &parallel);
     assert_eq!(serial_index, parallel_index);
@@ -272,7 +271,7 @@ fn gitlink_submodule_untracked_scan_matches_serial() {
         ahead_behind: false,
         ..StatusOptions::default()
     };
-    let baseline = fs::read(repo.index_handle().path()).expect("index");
+    let baseline = fs::read(repo.index().path()).expect("index");
     let (serial, parallel, _, _) = run_status_pair(&repo, &opts, &baseline);
     assert_models_equal(&serial, &parallel);
 }
@@ -299,23 +298,23 @@ fn untracked_cache_enabled_matches_serial() {
         ahead_behind: false,
         ..StatusOptions::default()
     };
-    let baseline = fs::read(repo.index_handle().path()).expect("index");
+    let baseline = fs::read(repo.index().path()).expect("index");
     let (serial, parallel, _, _) = run_status_pair(&repo, &opts, &baseline);
     assert_models_equal(&serial, &parallel);
 
     // Warm UNTR: second pair must still match.
-    let baseline2 = fs::read(repo.index_handle().path()).expect("index after first run");
+    let baseline2 = fs::read(repo.index().path()).expect("index after first run");
     let (serial2, parallel2, _, _) = run_status_pair(&repo, &opts, &baseline2);
     assert_models_equal(&serial2, &parallel2);
 }
 
 #[test]
 fn large_index_stat_refresh_parallel_matches_serial() {
-    use grit_lib::PARALLEL_STAT_MIN_ENTRIES;
+    use grit_lib::test_support::counters::PARALLEL_STAT_MIN_ENTRIES;
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = tmp.path();
-    let repo = Repository::init(
+    let (repo, _) = Repository::init(
         root,
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
@@ -331,24 +330,26 @@ fn large_index_stat_refresh_parallel_matches_serial() {
         )
         .expect("write");
     }
-    grit_lib::porcelain::add::stage(
-        &repo,
-        &grit_lib::porcelain::add::StageOptions::default(),
-        &mut NullProgress,
-        &NeverCancel,
-    )
-    .expect("stage");
-    let req = grit_lib::porcelain::commit::CommitRequest {
-        message: "seed".into(),
-        author: Some("T <t@e.com> 1 +0000".parse().expect("signature")),
-        committer: Some("T <t@e.com> 1 +0000".parse().expect("signature")),
-        allow_empty: false,
-        sign_override: None,
-        amend: false,
-        assume_worktree_synced: false,
-        ..Default::default()
+    &repo
+        .index()
+        .stage(
+            &grit_lib::porcelain::add::StageOptions::default(),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("stage");
+    let req = {
+        let mut req = grit_lib::porcelain::commit::CommitRequest::new("seed");
+        req.author = Some("T <t@e.com> 1 +0000".parse().expect("signature"));
+        req.committer = Some("T <t@e.com> 1 +0000".parse().expect("signature"));
+        req.allow_empty = false;
+        req.sign_override = None;
+        req.amend = false;
+        req.assume_worktree_synced = false;
+        req
     };
-    grit_lib::porcelain::commit::create_commit(&repo, &req, &mut NullProgress, &NeverCancel)
+    repo.commits()
+        .create_staged(&req, &mut NullProgress, &CancelToken::never())
         .expect("commit");
     for rel in ["mix/00030.txt", "mix/00040.txt", "mix/00050.txt"] {
         filetime::set_file_mtime(root.join(rel), filetime::FileTime::now()).expect("touch");
@@ -359,7 +360,7 @@ fn large_index_stat_refresh_parallel_matches_serial() {
         ahead_behind: false,
         ..StatusOptions::default()
     };
-    let baseline = fs::read(repo.index_handle().path()).expect("index");
+    let baseline = fs::read(repo.index().path()).expect("index");
     let (serial, parallel, serial_index, parallel_index) = run_status_pair(&repo, &opts, &baseline);
     assert_models_equal(&serial, &parallel);
     assert_eq!(serial_index, parallel_index);
@@ -394,7 +395,7 @@ fn git_untracked_and_ignored(root: &Path, untracked_files: &str) -> (Vec<String>
 /// to split below the top level; its result must match the serial walk and system `git`.
 #[test]
 fn single_top_level_directory_split_walk_matches_serial_and_git() {
-    use grit_lib::PARALLEL_STAT_MIN_ENTRIES;
+    use grit_lib::test_support::counters::PARALLEL_STAT_MIN_ENTRIES;
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = tmp.path();
@@ -442,7 +443,7 @@ fn single_top_level_directory_split_walk_matches_serial_and_git() {
         &RepositoryOptions::empty().with_work_tree(root),
     )
     .expect("open");
-    let baseline = fs::read(repo.index_handle().path()).expect("index");
+    let baseline = fs::read(repo.index().path()).expect("index");
 
     for (untracked, git_mode) in [
         (UntrackedMode::Normal, "normal"),

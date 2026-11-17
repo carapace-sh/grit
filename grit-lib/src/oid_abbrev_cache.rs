@@ -24,7 +24,7 @@ impl Default for OidAbbrevCache {
 
 impl OidAbbrevCache {
     #[must_use]
-    pub(crate) fn new(min_len: usize) -> Self {
+    pub fn new(min_len: usize) -> Self {
         Self {
             batch: OidAbbrevBatch::new(min_len),
         }
@@ -135,12 +135,12 @@ mod tests {
     #[test]
     fn warm_for_patch_batch_disambiguates_against_full_odb() -> Result<()> {
         let dir = TempDir::new().expect("tempdir");
-        let repo = Repository::init(dir.path(), &InitOptions::default()).expect("init");
+        let (repo, _) = Repository::init(dir.path(), &InitOptions::default()).expect("init");
         let (referenced, dangling, data_ref, data_dang) = two_blobs_sharing_seven_hex_prefix();
         assert_eq!(referenced.to_hex()[..7], dangling.to_hex()[..7]);
         repo.odb().write(ObjectKind::Blob, &data_ref)?;
         repo.odb().write(ObjectKind::Blob, &data_dang)?;
-        let config = repo.config()?.clone();
+        let config = repo.config().snapshot()?.clone();
         let thread_policy = repo.thread_policy();
         let mut cache = OidAbbrevCache::new(7);
         cache.warm_for_patch_batch(&repo, [referenced, dangling], &thread_policy, &config)?;
@@ -154,7 +154,7 @@ mod tests {
     #[test]
     fn abbrev_extends_prefix_when_seven_hex_collide() -> Result<()> {
         let dir = TempDir::new().expect("tempdir");
-        let repo = Repository::init(dir.path(), &InitOptions::default()).expect("init");
+        let (repo, _) = Repository::init(dir.path(), &InitOptions::default()).expect("init");
         let (a, b, data_a, data_b) = two_blobs_sharing_seven_hex_prefix();
         assert_eq!(a.to_hex()[..7], b.to_hex()[..7]);
         assert_eq!(repo.odb().write(ObjectKind::Blob, &data_a)?, a);

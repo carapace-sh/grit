@@ -1,4 +1,4 @@
-//! Cancel signals as a library [`Cancel`] signal.
+//! Cancel signals as a library [`CancelToken`] handle.
 //!
 //! Without handlers, `SIGINT`, `SIGTERM`, and `SIGHUP` on Unix (or `CTRL_C_EVENT` /
 //! `CTRL_BREAK_EVENT` on a Windows console) kill the process mid-write, so library rollbacks
@@ -8,11 +8,12 @@
 //! [`DUPLICATE_WINDOW_NS`] of the first: tools such as `timeout` signal both the child and
 //! its process group, and that duplicate must not cut the rollback short.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::LazyLock;
 
-use grit_lib::progress::Cancel;
+use grit_lib::progress::CancelToken;
 
-static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+static PROCESS_CANCEL: LazyLock<CancelToken> = LazyLock::new(CancelToken::new);
 
 /// Monotonic time of the first interrupt, in nanoseconds.
 static FIRST_INTERRUPT_NS: AtomicU64 = AtomicU64::new(0);
@@ -22,6 +23,11 @@ const DUPLICATE_WINDOW_NS: u64 = 100_000_000;
 
 #[cfg(unix)]
 const HANDLED_SIGNALS: [libc::c_int; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
+
+/// Shared cancel handle wired to the signal handler; pass [`process_cancel_token`] into library calls.
+pub fn process_cancel_token() -> CancelToken {
+    PROCESS_CANCEL.clone()
+}
 
 /// Cancels the running library operation on the first interrupt; restores the previous handlers
 /// when dropped.
@@ -36,7 +42,8 @@ pub struct InterruptCancel {
 /// Returns `true` when the interrupt is absorbed (the first one, or a duplicate of it) and
 /// `false` when the process should terminate.
 fn absorb_interrupt(now_ns: u64) -> bool {
-    if !INTERRUPTED.swap(true, Ordering::Relaxed) {
+    if !PROCESS_CANCEL.is_cancelled() {
+        PROCESS_CANCEL.cancel();
         FIRST_INTERRUPT_NS.store(now_ns, Ordering::Relaxed);
         return true;
     }
@@ -90,11 +97,12 @@ extern "system" fn on_console_ctrl(ctrl_type: u32) -> windows_sys::core::BOOL {
 }
 
 impl InterruptCancel {
-    /// Route the next `SIGINT`, `SIGTERM`, or `SIGHUP` to [`Cancel::is_cancelled`] instead of
+    /// Route the next `SIGINT`, `SIGTERM`, or `SIGHUP` to [`CancelToken::is_cancelled`] instead of
     /// terminating.
     #[cfg(unix)]
     pub fn install() -> Self {
-        INTERRUPTED.store(false, Ordering::Relaxed);
+        process_cancel_token().reset();
+        FIRST_INTERRUPT_NS.store(0, Ordering::Relaxed);
         // SAFETY: the handler only touches atomics and async-signal-safe libc calls, and
         // both `sigaction` structs are fully initialized before the call.
         unsafe {
@@ -112,14 +120,15 @@ impl InterruptCancel {
         }
     }
 
-    /// Route the next console Ctrl+C or Ctrl+Break to [`Cancel::is_cancelled`] instead of
+    /// Route the next console Ctrl+C or Ctrl+Break to [`CancelToken::is_cancelled`] instead of
     /// terminating.
     ///
     /// When the process has no console the registration still succeeds and simply never
     /// fires.
     #[cfg(windows)]
     pub fn install() -> Self {
-        INTERRUPTED.store(false, Ordering::Relaxed);
+        process_cancel_token().reset();
+        FIRST_INTERRUPT_NS.store(0, Ordering::Relaxed);
         monotonic_ns();
         // SAFETY: registers a handler that only touches atomics; it is removed in `drop`.
         unsafe {
@@ -132,12 +141,6 @@ impl InterruptCancel {
     #[cfg(not(any(unix, windows)))]
     pub fn install() -> Self {
         Self {}
-    }
-}
-
-impl Cancel for InterruptCancel {
-    fn is_cancelled(&self) -> bool {
-        INTERRUPTED.load(Ordering::Relaxed)
     }
 }
 
@@ -168,10 +171,10 @@ mod tests {
     #[test]
     fn first_interrupt_and_its_duplicate_are_absorbed_a_later_one_terminates() {
         let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-        INTERRUPTED.store(false, Ordering::Relaxed);
+        PROCESS_CANCEL.reset();
         let start = 5_000_000_000;
         assert!(absorb_interrupt(start), "the first interrupt cancels");
-        assert!(INTERRUPTED.load(Ordering::Relaxed));
+        assert!(PROCESS_CANCEL.is_cancelled());
         assert!(
             absorb_interrupt(start + DUPLICATE_WINDOW_NS - 1),
             "a duplicate delivery is absorbed"
@@ -180,7 +183,7 @@ mod tests {
             !absorb_interrupt(start + DUPLICATE_WINDOW_NS),
             "a deliberate second Ctrl+C terminates"
         );
-        INTERRUPTED.store(false, Ordering::Relaxed);
+        PROCESS_CANCEL.reset();
     }
 
     #[cfg(unix)]
@@ -193,22 +196,45 @@ mod tests {
         }
     }
 
+    #[test]
+    fn process_cancel_token_shares_state_with_the_signal_handler() {
+        #[cfg(unix)]
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        process_cancel_token().reset();
+        let token = process_cancel_token();
+        assert!(!token.is_cancelled());
+        let _install = InterruptCancel::install();
+        assert!(!process_cancel_token().is_cancelled());
+        #[cfg(unix)]
+        unsafe {
+            libc::raise(libc::SIGINT);
+        }
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::System::Console::CTRL_C_EVENT;
+            assert_eq!(on_console_ctrl(CTRL_C_EVENT), 1);
+        }
+        assert!(token.is_cancelled());
+        assert!(process_cancel_token().is_cancelled());
+    }
+
     #[cfg(unix)]
     fn first_signal_cancels_a_duplicate_is_absorbed_and_drop_restores(signal: libc::c_int) {
         let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let before = current_handler(signal);
         let cancel = InterruptCancel::install();
-        assert!(!cancel.is_cancelled());
+        let token = process_cancel_token();
+        assert!(!token.is_cancelled());
         // SAFETY: the installed handler only sets atomic flags for these signals.
         unsafe {
             libc::raise(signal);
         }
-        assert!(cancel.is_cancelled());
+        assert!(token.is_cancelled());
         // SAFETY: as above; a duplicate right after the first is absorbed.
         unsafe {
             libc::raise(signal);
         }
-        assert!(cancel.is_cancelled());
+        assert!(token.is_cancelled());
         let ours = on_interrupt as extern "C" fn(libc::c_int) as libc::sighandler_t;
         assert_eq!(
             current_handler(signal),
@@ -245,29 +271,28 @@ mod tests {
         };
 
         let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-        let cancel = InterruptCancel::install();
-        assert!(!cancel.is_cancelled());
+        let _cancel = InterruptCancel::install();
+        let token = process_cancel_token();
+        assert!(!token.is_cancelled());
         assert_eq!(on_console_ctrl(CTRL_CLOSE_EVENT), 0);
-        assert!(
-            !cancel.is_cancelled(),
-            "closing the console is not a cancel"
-        );
+        assert!(!token.is_cancelled(), "closing the console is not a cancel");
         assert_eq!(on_console_ctrl(CTRL_C_EVENT), 1, "Ctrl+C is handled");
-        assert!(cancel.is_cancelled());
+        assert!(token.is_cancelled());
         assert_eq!(
             on_console_ctrl(CTRL_BREAK_EVENT),
             1,
             "a duplicate is absorbed"
         );
-        drop(cancel);
+        drop(_cancel);
 
-        let cancel = InterruptCancel::install();
-        assert!(!cancel.is_cancelled(), "install starts uncancelled");
+        let _cancel = InterruptCancel::install();
+        let token = process_cancel_token();
+        assert!(!token.is_cancelled(), "install starts uncancelled");
         assert_eq!(
             on_console_ctrl(CTRL_BREAK_EVENT),
             1,
             "Ctrl+Break is handled"
         );
-        assert!(cancel.is_cancelled());
+        assert!(token.is_cancelled());
     }
 }

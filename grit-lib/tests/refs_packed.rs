@@ -4,6 +4,7 @@
 //! `t1409-avoid-packing-refs`, and `t0600` delete cases.
 
 use crate::support;
+use grit_lib::error::RefError;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -11,13 +12,12 @@ use std::path::{Path, PathBuf};
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::error::{Error, RefLockError};
 use grit_lib::objects::ObjectId;
-use grit_lib::porcelain::branch::list_branches;
-use grit_lib::refs::{
-    delete_ref, list_refs, list_refs_glob, list_refs_physical, pack_remote_tracking_refs_for_clone,
-    packed_refs_entry_exists, resolve_ref, resolve_ref_cached, write_ref, write_ref_cached,
-    PackedRefs,
-};
+use grit_lib::refs::PackedRefs;
 use grit_lib::repo::Repository;
+use grit_lib::test_support::refs::{
+    list_refs_physical, pack_remote_tracking_refs_for_clone, packed_refs_entry_exists,
+    resolve_ref_cached, write_ref_cached,
+};
 
 use support::{
     assert_list_refs_match_git, files_repo, git, git_empty_commit_oid, git_for_each_ref,
@@ -26,7 +26,14 @@ use support::{
 
 /// Grit ref listing and `git for-each-ref` must succeed or fail together, and match when both succeed.
 fn assert_ref_listing_parity(wt: &Path, git_dir: &Path, prefix: &str) {
-    let grit_result = list_refs(git_dir, prefix);
+    let grit_result = grit_test_support::refs::at(git_dir)
+        .references()
+        .list(prefix)
+        .map(|refs| {
+            refs.into_iter()
+                .map(|(n, o)| (String::from(n), o))
+                .collect::<Vec<_>>()
+        });
     let git_out = git_for_each_ref_output(wt, prefix);
     match (grit_result, git_out.status.success()) {
         (Ok(grit_rows), true) => {
@@ -92,6 +99,52 @@ fn t0601_peeled_and_sorted_traits_match_git() {
     assert_list_refs_match_git(wt_path(&repo), "refs/");
 }
 
+/// `list_refs` must report the tag object for packed annotated tags (git
+/// `for-each-ref %(objectname)`), not the peeled commit from the `^` line.
+#[test]
+fn packed_annotated_tag_list_refs_uses_tag_object_not_peel() {
+    let repo = files_repo();
+    let wt = wt_path(&repo);
+    let git_dir = git_dir(&repo);
+    let commit = git_empty_commit_oid(wt);
+    git(wt, &["tag", "-a", "ann-packed", "-m", "release"]);
+    let tag_oid: ObjectId = git(wt, &["rev-parse", "refs/tags/ann-packed"])
+        .trim()
+        .parse()
+        .unwrap();
+    write_packed_refs(
+        &git_dir,
+        &format!(
+            "# pack-refs with: peeled fully-peeled sorted\n\
+             {} refs/tags/ann-packed\n\
+             ^{}\n",
+            tag_oid.to_hex(),
+            commit.to_hex()
+        ),
+    );
+    fs::remove_file(git_dir.join("refs/tags/ann-packed")).ok();
+    git(
+        wt,
+        &["update-ref", "refs/tags/loose-ann", &tag_oid.to_hex()],
+    );
+    assert_list_refs_match_git(wt, "refs/tags/");
+    for (name, oid) in grit_test_support::refs::at(&git_dir)
+        .references()
+        .list("refs/tags/")
+        .map(|refs| {
+            refs.into_iter()
+                .map(|(n, o)| (String::from(n), o))
+                .collect::<Vec<_>>()
+        })
+        .expect("list_refs")
+    {
+        assert_eq!(
+            oid, tag_oid,
+            "{name} must list the annotated tag object, not ^{commit}"
+        );
+    }
+}
+
 fn wt_path(repo: &TestRepo) -> &Path {
     repo.worktree()
 }
@@ -106,10 +159,18 @@ fn t1408_stale_packed_entry_no_error() {
     git(wt, &["pack-refs", "--all"]);
 
     let oid2 = git_empty_commit_oid(wt);
-    write_ref(&git_dir, "refs/heads/stale-test", &oid2).expect("update loose over packed");
+    grit_test_support::refs::set_ref(
+        &grit_test_support::refs::at(&git_dir),
+        "refs/heads/stale-test",
+        &oid2,
+    )
+    .expect("update loose over packed");
 
     assert_eq!(
-        resolve_ref(&git_dir, "refs/heads/stale-test").expect("resolve"),
+        grit_test_support::refs::at(&git_dir)
+            .references()
+            .resolve("refs/heads/stale-test")
+            .expect("resolve"),
         oid2
     );
     assert_list_refs_match_git(wt, "refs/heads/");
@@ -145,7 +206,8 @@ fn t1408_unicode_ref_names_in_packed_refs() {
     let git_dir = git_dir(&repo);
     let oid = git_empty_commit_oid(wt);
     let name = "refs/heads/unicode-分支";
-    write_ref(&git_dir, name, &oid).expect("write unicode ref");
+    grit_test_support::refs::set_ref(&grit_test_support::refs::at(&git_dir), name, &oid)
+        .expect("write unicode ref");
     git(wt, &["pack-refs", "--all"]);
     assert_list_refs_match_git(wt, "refs/heads/");
     let packed = PackedRefs::load(&git_dir).expect("load");
@@ -158,7 +220,12 @@ fn packed_refs_get_has_namespace_and_entry_exists() {
     let wt = wt_path(&repo);
     let git_dir = git_dir(&repo);
     let oid = git_empty_commit_oid(wt);
-    write_ref(&git_dir, "refs/heads/parent", &oid).unwrap();
+    grit_test_support::refs::set_ref(
+        &grit_test_support::refs::at(&git_dir),
+        "refs/heads/parent",
+        &oid,
+    )
+    .unwrap();
     git(wt, &["pack-refs", "--all"]);
 
     let packed = PackedRefs::load(&git_dir).unwrap();
@@ -179,14 +246,27 @@ fn list_refs_physical_and_glob_merge_loose_over_packed() {
     git(wt, &["pack-refs", "--all"]);
 
     let oid_loose = git_empty_commit_oid(wt);
-    write_ref(&git_dir, "refs/heads/dup", &oid_loose).unwrap();
+    grit_test_support::refs::set_ref(
+        &grit_test_support::refs::at(&git_dir),
+        "refs/heads/dup",
+        &oid_loose,
+    )
+    .unwrap();
 
     assert_list_refs_match_git(wt, "refs/heads/");
     let physical = list_refs_physical(&git_dir, "refs/heads/").unwrap();
     let git_physical = git_for_each_ref(wt, "refs/heads/");
     assert_eq!(physical, git_physical);
 
-    let globbed = list_refs_glob(&git_dir, "refs/heads/d*").unwrap();
+    let globbed = grit_test_support::refs::at(&git_dir)
+        .references()
+        .list_glob("refs/heads/d*")
+        .map(|refs| {
+            refs.into_iter()
+                .map(|(n, o)| (String::from(n), o))
+                .collect::<Vec<_>>()
+        })
+        .unwrap();
     let mut expected: Vec<_> = git_for_each_ref(wt, "refs/heads/")
         .into_iter()
         .filter(|(n, _)| n.starts_with("refs/heads/d"))
@@ -211,10 +291,18 @@ fn t0600_delete_loose_and_packed_removes_both_and_fsck_clean() {
     let oid = git_empty_commit_oid(wt);
     git(wt, &["branch", "to-delete"]);
     git(wt, &["pack-refs", "--all"]);
-    write_ref(&git_dir, "refs/heads/to-delete", &oid).unwrap();
+    grit_test_support::refs::set_ref(
+        &grit_test_support::refs::at(&git_dir),
+        "refs/heads/to-delete",
+        &oid,
+    )
+    .unwrap();
 
     let before_packed = read_bytes(&git_dir.join("packed-refs"));
-    delete_ref(&git_dir, "refs/heads/to-delete").expect("delete");
+    grit_test_support::refs::at(&git_dir)
+        .references()
+        .delete("refs/heads/to-delete")
+        .expect("delete");
     assert!(!git_dir.join("refs/heads/to-delete").exists());
     assert!(!packed_refs_entry_exists(&git_dir, "refs/heads/to-delete").unwrap());
     assert_list_refs_match_git(wt, "refs/");
@@ -236,7 +324,10 @@ fn t0600_delete_packed_only_ref() {
     git(wt, &["pack-refs", "--all"]);
     assert!(!git_dir.join("refs/heads/packed-only").exists());
 
-    delete_ref(&git_dir, "refs/heads/packed-only").expect("delete packed-only");
+    grit_test_support::refs::at(&git_dir)
+        .references()
+        .delete("refs/heads/packed-only")
+        .expect("delete packed-only");
     assert!(!packed_refs_entry_exists(&git_dir, "refs/heads/packed-only").unwrap());
     assert_list_refs_match_git(wt, "refs/");
     assert!(git_fsck_strict(wt));
@@ -248,11 +339,22 @@ fn t0600_delete_symref_target() {
     let wt = wt_path(&repo);
     let git_dir = git_dir(&repo);
     let oid = git_empty_commit_oid(wt);
-    write_ref(&git_dir, "refs/heads/target", &oid).unwrap();
-    grit_lib::refs::write_symbolic_ref(&git_dir, "refs/heads/sym", "refs/heads/target").unwrap();
+    grit_test_support::refs::set_ref(
+        &grit_test_support::refs::at(&git_dir),
+        "refs/heads/target",
+        &oid,
+    )
+    .unwrap();
+    grit_test_support::refs::at(&git_dir)
+        .references()
+        .update_symbolic("refs/heads/sym", "refs/heads/target")
+        .unwrap();
     git(wt, &["pack-refs", "--all"]);
 
-    delete_ref(&git_dir, "refs/heads/target").expect("delete symref target");
+    grit_test_support::refs::at(&git_dir)
+        .references()
+        .delete("refs/heads/target")
+        .expect("delete symref target");
     assert!(!packed_refs_entry_exists(&git_dir, "refs/heads/target").unwrap());
     assert_list_refs_match_git(wt, "refs/");
 }
@@ -264,12 +366,15 @@ fn t0600_delete_packed_only_does_not_create_parent_directories() {
     let git_dir = git_dir(&repo);
     let oid = git_empty_commit_oid(wt);
     let nested = "refs/heads/nested/only";
-    write_ref(&git_dir, nested, &oid).unwrap();
+    grit_test_support::refs::set_ref(&grit_test_support::refs::at(&git_dir), nested, &oid).unwrap();
     git(wt, &["pack-refs", "--all"]);
     let parent = git_dir.join("refs/heads/nested");
     let _ = fs::remove_dir_all(&parent);
 
-    delete_ref(&git_dir, nested).expect("delete");
+    grit_test_support::refs::at(&git_dir)
+        .references()
+        .delete(nested)
+        .expect("delete");
     assert!(
         !parent.exists(),
         "must not mkdir parent when deleting packed ref"
@@ -288,7 +393,12 @@ fn t0600_delete_fails_cleanly_when_packed_refs_locked() {
         .trim()
         .parse()
         .unwrap();
-    write_ref(&git_dir, "refs/heads/locked", &oid).expect("loose copy over packed");
+    grit_test_support::refs::set_ref(
+        &grit_test_support::refs::at(&git_dir),
+        "refs/heads/locked",
+        &oid,
+    )
+    .expect("loose copy over packed");
 
     let packed_path = git_dir.join("packed-refs");
     let loose_path = git_dir.join("refs/heads/locked");
@@ -306,11 +416,14 @@ fn t0600_delete_fails_cleanly_when_packed_refs_locked() {
         .open(&lock_path)
         .expect("hold lock");
 
-    let err = delete_ref(&git_dir, "refs/heads/locked").expect_err("delete must fail");
+    let err = grit_test_support::refs::at(&git_dir)
+        .references()
+        .delete("refs/heads/locked")
+        .expect_err("delete must fail");
     assert!(
         matches!(
             &err,
-            Error::RefLock(RefLockError::PackedRefsLockHeld { lock_path })
+            Error::Ref(RefError::Lock(RefLockError::PackedRefsLockHeld { lock_path }))
                 if lock_path.ends_with("packed-refs.lock")
         ),
         "expected typed packed-refs lock error, got {err:?}"
@@ -335,7 +448,10 @@ fn t0600_delete_success_leaves_no_stray_lock_files() {
     git_empty_commit_oid(wt);
     git(wt, &["branch", "gone"]);
     git(wt, &["pack-refs", "--all"]);
-    delete_ref(&git_dir, "refs/heads/gone").unwrap();
+    grit_test_support::refs::at(&git_dir)
+        .references()
+        .delete("refs/heads/gone")
+        .unwrap();
     assert!(!git_dir.join("packed-refs.lock").exists());
     assert!(!git_dir.join("packed-refs.new").exists());
 }
@@ -374,14 +490,13 @@ fn pack_remote_tracking_refs_for_clone_matches_git() {
     );
     for name in ["refs/remotes/origin/main", "refs/remotes/origin/feature"] {
         let oid: ObjectId = git(up_wt, &["rev-parse", name]).trim().parse().unwrap();
-        write_ref(&clone_git, name, &oid).unwrap();
+        grit_test_support::refs::set_ref(&grit_test_support::refs::at(&clone_git), name, &oid)
+            .unwrap();
     }
-    grit_lib::refs::write_symbolic_ref(
-        &clone_git,
-        "refs/remotes/origin/HEAD",
-        "refs/remotes/origin/main",
-    )
-    .unwrap();
+    grit_test_support::refs::at(&clone_git)
+        .references()
+        .update_symbolic("refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+        .unwrap();
 
     pack_remote_tracking_refs_for_clone(&clone_git, "origin").expect("pack remote-tracking");
 
@@ -403,7 +518,12 @@ fn pack_remote_tracking_refs_for_clone_fully_peels_nested_tags() {
     git(wt, &["tag", "-a", "inner", "-m", "inner"]);
     git(wt, &["tag", "-a", "outer", "inner", "-m", "outer"]);
     let outer: ObjectId = git(wt, &["rev-parse", "outer"]).trim().parse().unwrap();
-    write_ref(&git_dir, "refs/remotes/origin/nested", &outer).unwrap();
+    grit_test_support::refs::set_ref(
+        &grit_test_support::refs::at(&git_dir),
+        "refs/remotes/origin/nested",
+        &outer,
+    )
+    .unwrap();
 
     pack_remote_tracking_refs_for_clone(&git_dir, "origin").expect("pack remote-tracking");
 
@@ -428,13 +548,13 @@ fn resolve_ref_cached_and_write_ref_cached_reload_after_git_pack_refs() {
     git(wt, &["branch", "cached-a"]);
     git(wt, &["pack-refs", "--all"]);
     let mut snapshot = PackedRefs::load(&git_dir).unwrap();
-    assert!(snapshot.get("refs/heads/cached-a").is_some());
+    assert!(snapshot.value("refs/heads/cached-a").is_some());
 
     git(wt, &["branch", "cached-b"]);
     git(wt, &["pack-refs", "--all"]);
 
     assert!(
-        snapshot.get("refs/heads/cached-b").is_none(),
+        snapshot.value("refs/heads/cached-b").is_none(),
         "stale snapshot omits newly packed ref"
     );
     assert!(
@@ -443,7 +563,10 @@ fn resolve_ref_cached_and_write_ref_cached_reload_after_git_pack_refs() {
             .is_none()
     );
     assert_eq!(
-        resolve_ref(&git_dir, "refs/heads/cached-b").expect("fresh resolve"),
+        grit_test_support::refs::at(&git_dir)
+            .references()
+            .resolve("refs/heads/cached-b")
+            .expect("fresh resolve"),
         git(wt, &["rev-parse", "refs/heads/cached-b"])
             .trim()
             .parse()
@@ -451,12 +574,15 @@ fn resolve_ref_cached_and_write_ref_cached_reload_after_git_pack_refs() {
     );
 
     snapshot = PackedRefs::load(&git_dir).unwrap();
-    assert!(snapshot.get("refs/heads/cached-b").is_some());
+    assert!(snapshot.value("refs/heads/cached-b").is_some());
     assert_eq!(
         resolve_ref_cached(&git_dir, "refs/heads/cached-b", &snapshot)
             .unwrap()
             .unwrap(),
-        resolve_ref(&git_dir, "refs/heads/cached-b").unwrap()
+        grit_test_support::refs::at(&git_dir)
+            .references()
+            .resolve("refs/heads/cached-b")
+            .unwrap()
     );
 
     let new_oid = git_empty_commit_oid(wt);
@@ -472,14 +598,19 @@ fn t1408_packed_refs_garbage_line_rejected_like_git() {
     git_empty_commit_oid(wt);
     git(wt, &["branch", "good"]);
     git(wt, &["pack-refs", "--all"]);
-    let mut content = fs::read_to_string(git_dir.join("packed-refs")).unwrap();
-    content.push_str("this is not a valid packed-refs line\n");
-    write_packed_refs(&git_dir, &content);
+    let content = fs::read_to_string(git_dir.join("packed-refs")).unwrap();
+    let mut lines: Vec<&str> = content.split('\n').collect();
+    let insert_at = lines
+        .iter()
+        .position(|l| l.contains(" refs/heads/"))
+        .map_or(lines.len(), |i| i + 1);
+    lines.insert(insert_at, "this is not a valid packed-refs line");
+    write_packed_refs(&git_dir, &format!("{}\n", lines.join("\n")));
 
     assert!(
         matches!(
             PackedRefs::load(&git_dir),
-            Err(Error::PackedRefsUnexpectedLine { .. })
+            Err(Error::Ref(RefError::PackedRefsUnexpectedLine { .. }))
         ),
         "PackedRefs::load must reject garbage lines"
     );
@@ -517,13 +648,35 @@ fn sorted_packed_refs_corrupt_record_only_breaks_listings_that_cover_it() {
     assert_ne!(corrupted, content);
     write_packed_refs(&git_dir, &corrupted);
 
-    let heads = list_refs(&git_dir, "refs/heads/").expect("branches stay listable");
+    let heads = grit_test_support::refs::at(&git_dir)
+        .references()
+        .list("refs/heads/")
+        .map(|refs| {
+            refs.into_iter()
+                .map(|(n, o)| (String::from(n), o))
+                .collect::<Vec<_>>()
+        })
+        .expect("branches stay listable");
     assert_eq!(heads.len(), 2);
-    assert!(list_refs(&git_dir, "refs/tags/").is_err());
-    assert!(list_refs(&git_dir, "refs/").is_err());
+    assert!(grit_test_support::refs::at(&git_dir)
+        .references()
+        .list("refs/tags/")
+        .map(|refs| refs
+            .into_iter()
+            .map(|(n, o)| (String::from(n), o))
+            .collect::<Vec<_>>())
+        .is_err());
+    assert!(grit_test_support::refs::at(&git_dir)
+        .references()
+        .list("refs/")
+        .map(|refs| refs
+            .into_iter()
+            .map(|(n, o)| (String::from(n), o))
+            .collect::<Vec<_>>())
+        .is_err());
     assert!(matches!(
         PackedRefs::load(&git_dir),
-        Err(Error::PackedRefsUnexpectedLine { .. })
+        Err(Error::Ref(RefError::PackedRefsUnexpectedLine { .. }))
     ));
     for prefix in ["refs/heads/", "refs/tags/", "refs/"] {
         assert_ref_listing_parity(wt, &git_dir, prefix);
@@ -544,8 +697,14 @@ fn sorted_packed_refs_short_last_record_breaks_every_listing() {
     for prefix in ["refs/heads/", "refs/tags/", "refs/"] {
         assert!(
             matches!(
-                list_refs(&git_dir, prefix),
-                Err(Error::PackedRefsUnexpectedLine { .. })
+                grit_test_support::refs::at(&git_dir)
+                    .references()
+                    .list(prefix)
+                    .map(|refs| refs
+                        .into_iter()
+                        .map(|(n, o)| (String::from(n), o))
+                        .collect::<Vec<_>>()),
+                Err(Error::Ref(RefError::PackedRefsUnexpectedLine { .. }))
             ),
             "{prefix}"
         );
@@ -565,7 +724,18 @@ fn sha256_packed_refs_short_last_record_rejected_like_git() {
     git(wt, &["pack-refs", "--all"]);
     let git_dir = wt.join(".git");
     let mut content = fs::read_to_string(git_dir.join("packed-refs")).unwrap();
-    assert!(list_refs(&git_dir, "refs/heads/").unwrap().len() == 2);
+    assert!(
+        grit_test_support::refs::at(&git_dir)
+            .references()
+            .list("refs/heads/")
+            .map(|refs| refs
+                .into_iter()
+                .map(|(n, o)| (String::from(n), o))
+                .collect::<Vec<_>>())
+            .unwrap()
+            .len()
+            == 2
+    );
     content.push_str(&"x".repeat(49));
     content.push('\n');
     write_packed_refs(&git_dir, &content);
@@ -573,8 +743,14 @@ fn sha256_packed_refs_short_last_record_rejected_like_git() {
     for prefix in ["refs/heads/", "refs/tags/", "refs/"] {
         assert!(
             matches!(
-                list_refs(&git_dir, prefix),
-                Err(Error::PackedRefsUnexpectedLine { .. })
+                grit_test_support::refs::at(&git_dir)
+                    .references()
+                    .list(prefix)
+                    .map(|refs| refs
+                        .into_iter()
+                        .map(|(n, o)| (String::from(n), o))
+                        .collect::<Vec<_>>()),
+                Err(Error::Ref(RefError::PackedRefsUnexpectedLine { .. }))
             ),
             "{prefix}"
         );
@@ -583,8 +759,8 @@ fn sha256_packed_refs_short_last_record_rejected_like_git() {
     let repo = Repository::open(&git_dir, &RepositoryOptions::empty().with_work_tree(wt))
         .expect("open sha256 repo");
     assert!(matches!(
-        list_branches(&repo),
-        Err(Error::PackedRefsUnexpectedLine { .. })
+        repo.branches().list_simple(),
+        Err(Error::Ref(RefError::PackedRefsUnexpectedLine { .. }))
     ));
 }
 
@@ -642,7 +818,11 @@ fn lying_sorted_header_lookups_match_git() {
             .status
             .success()
             .then(|| String::from_utf8_lossy(&git_out.stdout).trim().to_owned());
-        let grit_oid = resolve_ref(&git_dir, name).ok().map(|oid| oid.to_hex());
+        let grit_oid = grit_test_support::refs::at(&git_dir)
+            .references()
+            .resolve(name)
+            .ok()
+            .map(|oid| oid.to_hex());
         assert_eq!(grit_oid, git_oid, "{name}");
         found += usize::from(git_oid.is_some());
     }
@@ -669,7 +849,15 @@ fn lying_sorted_header_prefix_scan_recovers_all_matching_refs() {
              {oid} refs/heads/b\n{oid} refs/heads/a\n{oid} refs/tags/t\n"
         ),
     );
-    let heads = list_refs(&git_dir, "refs/heads/").expect("fallback");
+    let heads = grit_test_support::refs::at(&git_dir)
+        .references()
+        .list("refs/heads/")
+        .map(|refs| {
+            refs.into_iter()
+                .map(|(n, o)| (String::from(n), o))
+                .collect::<Vec<_>>()
+        })
+        .expect("fallback");
     assert_eq!(
         heads
             .iter()
@@ -689,7 +877,12 @@ fn lying_sorted_header_prefix_scan_recovers_all_matching_refs() {
          {oid} refs/heads/a\n{oid} refs/heads/b\n{oid} refs/heads/main\n{oid} refs/tags/t\n"
     );
     write_packed_refs(&git_dir, &sorted);
-    write_ref(&git_dir, "refs/heads/from-grit", &oid.parse().unwrap()).unwrap();
+    grit_test_support::refs::set_ref(
+        &grit_test_support::refs::at(&git_dir),
+        "refs/heads/from-grit",
+        &oid.parse().unwrap(),
+    )
+    .unwrap();
     assert_list_refs_match_git(wt, "refs/");
     assert!(git_fsck_strict(wt));
 }
@@ -710,15 +903,33 @@ fn non_utf8_packed_tag_leaves_branches_readable_like_git() {
     assert_ref_listing_parity(wt, &git_dir, "refs/heads/");
     for name in ["refs/heads/topic", "refs/tags/t1"] {
         assert_eq!(
-            resolve_ref(&git_dir, name).expect("resolve").to_hex(),
+            grit_test_support::refs::at(&git_dir)
+                .references()
+                .resolve(name)
+                .expect("resolve")
+                .to_hex(),
             git(wt, &["rev-parse", name]).trim(),
             "{name}"
         );
     }
     let repo = Repository::open(&git_dir, &RepositoryOptions::empty().with_work_tree(wt))
         .expect("open repo");
-    assert_eq!(list_branches(&repo).expect("branches").branches.len(), 2);
-    assert!(list_refs(&git_dir, "refs/tags/").is_err());
+    assert_eq!(
+        repo.branches()
+            .list_simple()
+            .expect("branches")
+            .branches
+            .len(),
+        2
+    );
+    assert!(grit_test_support::refs::at(&git_dir)
+        .references()
+        .list("refs/tags/")
+        .map(|refs| refs
+            .into_iter()
+            .map(|(n, o)| (String::from(n), o))
+            .collect::<Vec<_>>())
+        .is_err());
 }
 
 /// A corrupt line between records of the listed range is reported, never skipped. (System git
@@ -741,10 +952,24 @@ fn corrupt_line_among_branches_fails_branch_listing() {
     write_packed_refs(&git_dir, &corrupted);
 
     assert!(matches!(
-        list_refs(&git_dir, "refs/heads/"),
-        Err(Error::PackedRefsUnexpectedLine { .. })
+        grit_test_support::refs::at(&git_dir)
+            .references()
+            .list("refs/heads/")
+            .map(|refs| refs
+                .into_iter()
+                .map(|(n, o)| (String::from(n), o))
+                .collect::<Vec<_>>()),
+        Err(Error::Ref(RefError::PackedRefsUnexpectedLine { .. }))
     ));
-    let tags = list_refs(&git_dir, "refs/tags/").expect("tags are outside the corrupt range");
+    let tags = grit_test_support::refs::at(&git_dir)
+        .references()
+        .list("refs/tags/")
+        .map(|refs| {
+            refs.into_iter()
+                .map(|(n, o)| (String::from(n), o))
+                .collect::<Vec<_>>()
+        })
+        .expect("tags are outside the corrupt range");
     assert_eq!(tags.len(), 1);
     assert_ref_listing_parity(wt, &git_dir, "refs/tags/");
 }
@@ -777,12 +1002,19 @@ fn assert_packed_refs_unreadable_like_git_show_ref(wt: &Path, git_dir: &Path) {
     assert!(
         matches!(
             PackedRefs::load(git_dir),
-            Err(Error::PackedRefsUnexpectedLine { .. })
+            Err(Error::Ref(RefError::PackedRefsUnexpectedLine { .. }))
         ),
         "PackedRefs::load must reject packed-refs Git cannot read"
     );
     assert!(
-        list_refs(git_dir, "refs/").is_err(),
+        grit_test_support::refs::at(git_dir)
+            .references()
+            .list("refs/")
+            .map(|refs| refs
+                .into_iter()
+                .map(|(n, o)| (String::from(n), o))
+                .collect::<Vec<_>>())
+            .is_err(),
         "list_refs must fail when packed-refs is unreadable"
     );
     let git_show = support::git_for_each_ref_output(wt, "refs/");
@@ -886,12 +1118,19 @@ fn assert_git_show_ref_and_grit_load_both_reject(wt: &Path, git_dir: &Path) {
     assert!(
         matches!(
             PackedRefs::load(git_dir),
-            Err(Error::PackedRefsUnexpectedLine { .. })
+            Err(Error::Ref(RefError::PackedRefsUnexpectedLine { .. }))
         ),
         "PackedRefs::load must reject malformed packed-refs"
     );
     assert!(
-        list_refs(git_dir, "refs/").is_err(),
+        grit_test_support::refs::at(git_dir)
+            .references()
+            .list("refs/")
+            .map(|refs| refs
+                .into_iter()
+                .map(|(n, o)| (String::from(n), o))
+                .collect::<Vec<_>>())
+            .is_err(),
         "list_refs must fail on malformed packed-refs"
     );
     let show = std::process::Command::new("git")

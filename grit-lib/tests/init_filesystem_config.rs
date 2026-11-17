@@ -2,10 +2,7 @@
 
 use std::fs;
 
-use grit_lib::config::environment::Environment;
-use grit_lib::config::init_filesystem::{
-    apply_init_filesystem_config, InitFilesystemConfigOptions,
-};
+use grit_lib::config::init_filesystem::{InitFilesystemConfigOptions, PrecomposeDetection};
 use grit_lib::repo::{InitOptions, Repository};
 use tempfile::TempDir;
 
@@ -16,18 +13,13 @@ fn init_sets_precomposeunicode_when_options_force_probe() {
         td.path(),
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
-            .with_ref_storage(grit_lib::RefStorageFormat::Files),
+            .with_ref_storage(grit_lib::refs::ref_storage::RefStorageFormat::Files)
+            .with_init_filesystem(InitFilesystemConfigOptions {
+                precompose_detection: PrecomposeDetection::Always,
+                ..InitFilesystemConfigOptions::default()
+            }),
     )
     .expect("init");
-    apply_init_filesystem_config(
-        &td.path().join(".git"),
-        InitFilesystemConfigOptions {
-            force_precompose_probe: true,
-            ..InitFilesystemConfigOptions::default()
-        },
-        &Environment::empty(),
-    )
-    .expect("apply");
     let config = fs::read_to_string(td.path().join(".git/config")).expect("config");
     assert!(
         config.contains("precomposeunicode = true"),
@@ -42,7 +34,7 @@ fn second_init_does_not_overwrite_local_config() {
         td.path(),
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
-            .with_ref_storage(grit_lib::RefStorageFormat::Files),
+            .with_ref_storage(grit_lib::refs::ref_storage::RefStorageFormat::Files),
     )
     .expect("init");
     let config_path = td.path().join(".git/config");
@@ -54,7 +46,7 @@ fn second_init_does_not_overwrite_local_config() {
         td.path(),
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
-            .with_ref_storage(grit_lib::RefStorageFormat::Files),
+            .with_ref_storage(grit_lib::refs::ref_storage::RefStorageFormat::Files),
     )
     .expect("reinit");
 

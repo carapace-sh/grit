@@ -20,10 +20,10 @@ use grit_lib::error::Result;
 use grit_lib::objects::odb::store::{MemoryStore, ObjectStore, WritableObjectStore};
 use grit_lib::objects::odb::{Odb, OdbBuilder, WriteOptions};
 use grit_lib::objects::{HashAlgo, Object, ObjectId, ObjectInfo, ObjectKind};
-use grit_lib::porcelain::add::{stage, StageOptions};
-use grit_lib::porcelain::commit::{commit_with_scope, CommitRequest, CommitScope};
+use grit_lib::porcelain::add::StageOptions;
+use grit_lib::porcelain::commit::{CommitRequest, CommitScope};
 use grit_lib::progress::NullProgress;
-use grit_lib::repo::{InitOptions, Repository, RepositoryBuilder};
+use grit_lib::repo::{InitOptions, Repository};
 use grit_lib::stash::{StashMode, StashPushOptions};
 
 const IDENT: &str = "A U Thor <author@example.com> 1700000000 +0000";
@@ -125,26 +125,29 @@ impl Calls {
 }
 
 fn commit_all(repo: &Repository, message: &str) {
-    stage(
-        repo,
-        &StageOptions::default(),
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("stage");
-    commit_with_scope(
-        repo,
-        &CommitRequest {
-            message: message.to_owned(),
-            author: Some(IDENT.parse().expect("signature")),
-            committer: Some(IDENT.parse().expect("signature")),
-            ..Default::default()
-        },
-        CommitScope::Staged,
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("commit");
+    repo.index()
+        .stage(
+            &StageOptions::default(),
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("stage");
+    repo.commits()
+        .create(
+            &grit_lib::commits::CommitOptions::new(
+                &{
+                    let mut req = CommitRequest::new(message.to_owned());
+                    req.author = Some(IDENT.parse().expect("signature"));
+                    req.committer = Some(IDENT.parse().expect("signature"));
+                    req
+                }
+                .clone(),
+                CommitScope::Staged,
+            ),
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("commit");
 }
 
 struct OneFileCommit {
@@ -165,14 +168,13 @@ fn one_file_commit(dirs: usize, batched: bool) -> OneFileCommit {
     .expect("init");
     let git_dir = root.join(".git");
     let store = Arc::new(CountingStore::new(batched));
-    let repo = RepositoryBuilder::new(RepositoryOptions::empty())
-        .odb_builder(
-            OdbBuilder::files(git_dir.join("objects"))
-                .primary(store.clone())
-                .alternates(false),
-        )
-        .open(&git_dir, Some(&root))
-        .expect("open");
+    let repo = Repository::open(
+        &git_dir,
+        &(RepositoryOptions::empty()
+            .with_object_store(store.clone())
+            .with_work_tree(&root)),
+    )
+    .expect("open");
     for d in 0..dirs {
         fs::create_dir_all(root.join(format!("d{d}"))).expect("mkdir");
     }
@@ -291,13 +293,17 @@ fn layered_repo(dirs: usize) -> Layered {
     .expect("init");
     let git_dir = root.join(".git");
     let remote = Arc::new(CountingStore::new(true));
-    let open = |builder: OdbBuilder| {
-        RepositoryBuilder::new(RepositoryOptions::empty())
-            .odb_builder(builder.alternates(false))
-            .open(&git_dir, Some(&root))
-            .expect("open")
+    let open = |store: Arc<dyn WritableObjectStore>, builder: OdbBuilder| {
+        Repository::open(
+            &git_dir,
+            &(RepositoryOptions::empty()
+                .with_object_store(store)
+                .with_odb_builder(builder)
+                .with_work_tree(&root)),
+        )
+        .expect("open")
     };
-    let history = open(OdbBuilder::files(git_dir.join("objects")).primary(remote.clone()));
+    let history = open(remote.clone(), OdbBuilder::new());
     for d in 0..dirs {
         fs::create_dir_all(root.join(format!("d{d}"))).expect("mkdir");
     }
@@ -308,9 +314,8 @@ fn layered_repo(dirs: usize) -> Layered {
     drop(history);
     let primary = Arc::new(MemoryStore::new(HashAlgo::Sha1));
     let repo = open(
-        OdbBuilder::files(git_dir.join("objects"))
-            .primary(primary.clone())
-            .push_read_source(remote.clone()),
+        primary.clone(),
+        OdbBuilder::new().push_read_source(remote.clone()),
     );
     Layered {
         dir,
@@ -388,7 +393,7 @@ fn layered_stash_push_round_trips_do_not_grow_with_directory_count() {
             .push(
                 &options,
                 &mut NullProgress,
-                &grit_lib::progress::NeverCancel,
+                &grit_lib::progress::CancelToken::never(),
             )
             .expect("stash push")
             .expect("changes to stash");

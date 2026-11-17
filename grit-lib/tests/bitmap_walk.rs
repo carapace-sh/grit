@@ -11,7 +11,7 @@ use grit_lib::objects::bitmap::{BitmapWalkError, ReachabilityQuery, ReachableSet
 use grit_lib::objects::pack_rev::append_hashfile_checksum;
 use grit_lib::objects::ObjectId;
 use grit_lib::repo::Repository;
-use grit_lib::revwalk::rev_list::{rev_list, MissingAction, ObjectFilter, RevListOptions};
+use grit_lib::revwalk::rev_list::{MissingAction, ObjectFilter, RevListOptions};
 use grit_test_support::{HashAlgo, RepoFixture};
 
 fn git_ok(repo: &RepoFixture, args: &[&str]) {
@@ -63,7 +63,10 @@ fn grit_object_set(
         filter: filter.cloned(),
         ..Default::default()
     };
-    let result = rev_list(repo, &wants, &haves, &opts).expect("rev-list");
+    let result = repo
+        .revwalk()
+        .rev_list(&wants, &haves, &opts)
+        .expect("rev-list");
     let mut set = HashSet::new();
     for oid in &result.commits {
         set.insert(*oid);
@@ -121,7 +124,7 @@ fn bitmap_query(
     wants: &[ObjectId],
     haves: &[ObjectId],
     filter: Option<&ObjectFilter>,
-) -> Result<ReachableSet, BitmapWalkError> {
+) -> grit_lib::error::Result<ReachableSet> {
     index.reachability(
         repo,
         ReachabilityQuery {
@@ -397,8 +400,7 @@ fn unsupported_filter_and_shallow_fall_back() {
     let shallow_index = BitmapIndex::open(&shallow_repo)
         .expect("open")
         .expect("bitmap on shallow-marked repo");
-    use grit_lib::revwalk::rev_list::shallow_boundary_oids;
-    assert!(!shallow_boundary_oids(shallow_repo.git_dir()).is_empty());
+    assert!(!shallow_repo.revwalk().shallow_boundary_oids().is_empty());
     assert!(matches!(
         bitmap_query(&shallow_repo, &shallow_index, &[head], &[], None),
         Err(BitmapWalkError::Unsupported(_))

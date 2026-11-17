@@ -1,5 +1,6 @@
 //! Checkout rollback must finish delayed process-filter smudges (#2330 review).
 
+use grit_lib::worktree::WorktreeError;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -7,10 +8,8 @@ use std::process::Command;
 use grit_lib::config::environment::{Environment, RepositoryOptions};
 use grit_lib::error::Error;
 use grit_lib::objects::ObjectId;
-use grit_lib::porcelain::checkout::checkout_between_trees_with_progress;
-use grit_lib::progress::{
-    Cancel, FlagCancel, NeverCancel, NullProgress, ProgressPhase, ProgressSink,
-};
+use grit_lib::progress::{CancelToken, NullProgress};
+use grit_lib::progress::{CancelToken, NullProgress, ProgressPhase, ProgressSink};
 use grit_lib::repo::Repository;
 
 fn have_python3() -> bool {
@@ -69,7 +68,7 @@ fn tree_of(root: &Path, rev: &str) -> ObjectId {
 }
 
 struct CancelAfter {
-    cancel: FlagCancel,
+    cancel: CancelToken,
     limit: u64,
     seen: u64,
     in_checkout: bool,
@@ -144,15 +143,15 @@ fn cancelled_checkout_restores_process_filtered_file() {
 
     let from = tree_of(root, "main");
     let to = tree_of(root, "next");
-    let cancel = FlagCancel::new();
+    let cancel = CancelToken::new();
     let mut progress = CancelAfter {
         cancel: cancel.clone(),
         limit: 4,
         seen: 0,
         in_checkout: false,
     };
-    let err = checkout_between_trees_with_progress(
-        &open(root, &state_file),
+    let err = open(
+        root.checkout().checkout(&state_file),
         Some(&from),
         &to,
         &mut progress,
@@ -162,7 +161,7 @@ fn cancelled_checkout_restores_process_filtered_file() {
     assert!(
         matches!(
             err,
-            Error::Cancelled | Error::CheckoutRollbackIncomplete { .. }
+            Error::Cancelled | Error::Worktree(WorktreeError::CheckoutRollbackIncomplete { .. })
         ),
         "unexpected error: {err:?}"
     );

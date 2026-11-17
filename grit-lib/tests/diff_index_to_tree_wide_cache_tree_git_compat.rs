@@ -10,9 +10,8 @@ use std::path::Path;
 use std::process::Command;
 
 use grit_lib::config::environment::RepositoryOptions;
-use grit_lib::diff::{diff_index_to_tree, tree_oid_of_commit, DiffStatus};
+use grit_lib::diff::{tree_oid_of_commit, DiffStatus, TreeDiffOptions};
 use grit_lib::repo::Repository;
-use grit_lib::state::resolve_head;
 
 const DIRS: usize = 300;
 
@@ -95,17 +94,24 @@ fn staged_diff_on_wide_git_written_cache_tree_matches_git() {
     git(root, &["add", "-A"]);
 
     let repo = Repository::discover(Some(root), &RepositoryOptions::empty()).expect("open");
-    let index = repo.index_handle().load().expect("index");
+    let index = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("index");
     let cache = index.cache_tree.as_ref().expect("git wrote a cache-tree");
     assert!(
         cache.children.len() > 100,
         "expected a wide cache-tree root, got {} children",
         cache.children.len()
     );
-    let head = resolve_head(repo.git_dir()).expect("head");
+    let head = repo.references().head().expect("head");
     let head_tree = tree_oid_of_commit(repo.odb(), head.oid().expect("commit")).expect("tree");
 
-    let entries = diff_index_to_tree(repo.odb(), &index, Some(&head_tree), false).expect("diff");
+    let entries = repo
+        .diff()
+        .index_to_tree(&index, Some(&head_tree), &TreeDiffOptions::default())
+        .map(|r| r.entries)
+        .expect("diff");
     let grit_rows: BTreeSet<Row> = entries
         .iter()
         .map(|e| {

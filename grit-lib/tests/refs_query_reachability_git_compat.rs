@@ -6,7 +6,7 @@ use crate::support;
 
 use grit_lib::maintenance::CommitGraphOptions;
 use grit_lib::objects::ObjectId;
-use grit_lib::refs::listing::{query_refs, RefNamespace, RefQuery, RefQueryError, RefQueryOptions};
+use grit_lib::refs::listing::{RefNamespace, RefQuery, RefQueryError, RefQueryOptions};
 use grit_lib::refs::query_reachability::resolve_commit_filter_target;
 use grit_lib::repo::{InitOptions, Repository};
 use support::{git, git_interop_available, require_reftable_git, Backend};
@@ -22,7 +22,8 @@ fn git_refnames(worktree: &std::path::Path, extra: &[&str]) -> Vec<String> {
 }
 
 fn grit_refnames(repo: &Repository, query: RefQuery) -> Vec<String> {
-    query_refs(repo, &query, &RefQueryOptions::default())
+    repo.references()
+        .query(&query, &RefQueryOptions::default())
         .expect("query_refs")
         .into_iter()
         .map(|r| r.full_name)
@@ -34,7 +35,7 @@ fn init_repo(worktree: &std::path::Path, backend: Backend) -> Repository {
     if backend == Backend::Reftable {
         opts = opts.with_ref_storage(grit_lib::refs::ref_storage::RefStorageFormat::Reftable);
     }
-    let repo = Repository::init(worktree, &opts).expect("init");
+    let (repo, _) = Repository::init(worktree, &opts).expect("init");
     if backend == Backend::Reftable {
         // Seed HEAD in the table too: system Git ignores the loose HEAD in a reftable repo.
         git(worktree, &["symbolic-ref", "HEAD", "refs/heads/main"]);
@@ -87,7 +88,8 @@ fn assert_same(worktree: &std::path::Path, repo: &Repository, git_args: &[&str],
 
 fn maybe_write_graph(worktree: &std::path::Path, repo: &Repository, with_graph: bool) {
     if with_graph {
-        repo.write_commit_graph(&CommitGraphOptions::default())
+        repo.maintenance()
+            .write_commit_graph(&CommitGraphOptions::default())
             .expect("write commit-graph");
         git(worktree, &["commit-graph", "write"]);
     }
@@ -184,7 +186,7 @@ fn contains_rejects_non_commit_target() {
         return;
     }
     let root = tempfile::tempdir().expect("tempdir");
-    let repo = Repository::init(root.path(), &InitOptions::default()).expect("init");
+    let (repo, _) = Repository::init(root.path(), &InitOptions::default()).expect("init");
     git(root.path(), &["commit", "--allow-empty", "-q", "-m", "c"]);
     let blob = repo
         .odb()
@@ -429,7 +431,7 @@ fn contains_missing_object_is_typed() {
         return;
     }
     let root = tempfile::tempdir().expect("tempdir");
-    let repo = Repository::init(root.path(), &InitOptions::default()).expect("init");
+    let (repo, _) = Repository::init(root.path(), &InitOptions::default()).expect("init");
     let missing = ObjectId::from_hex("0000000000000000000000000000000000000001").expect("oid");
     let err = resolve_commit_filter_target(&repo, missing).unwrap_err();
     assert!(matches!(err, RefQueryError::MissingObject(_)));
@@ -493,17 +495,14 @@ impl grit_lib::objects::odb::store::WritableObjectStore for CountingObjects {
 
 fn counted_repo(root: &std::path::Path, objects: std::sync::Arc<CountingObjects>) -> Repository {
     use grit_lib::config::environment::RepositoryOptions;
-    use grit_lib::objects::odb::OdbBuilder;
-    use grit_lib::repo::RepositoryBuilder;
     init_repo(root, Backend::Files);
-    RepositoryBuilder::new(RepositoryOptions::empty())
-        .odb_builder(
-            OdbBuilder::files(root.join(".git/objects"))
-                .primary(objects)
-                .alternates(false),
-        )
-        .open(&root.join(".git"), Some(root))
-        .unwrap()
+    Repository::open(
+        &root.join(".git"),
+        &(RepositoryOptions::empty()
+            .with_object_store(objects)
+            .with_work_tree(root)),
+    )
+    .unwrap()
 }
 
 fn counted_commit(repo: &Repository, parent: Option<ObjectId>, n: usize) -> ObjectId {
@@ -532,16 +531,17 @@ fn bounded_contains_does_not_load_irrelevant_trailing_tips() {
     std::fs::write(repo.git_dir().join("packed-refs"), packed).unwrap();
     objects.reads.lock().unwrap().clear();
     objects.info.lock().unwrap().clear();
-    let rows = query_refs(
-        &repo,
-        &RefQuery {
-            contains: vec![target],
-            limit: Some(100),
-            ..RefQuery::default()
-        },
-        &RefQueryOptions::default(),
-    )
-    .unwrap();
+    let rows = repo
+        .references()
+        .query(
+            &RefQuery {
+                contains: vec![target],
+                limit: Some(100),
+                ..RefQuery::default()
+            },
+            &RefQueryOptions::default(),
+        )
+        .unwrap();
     assert_eq!(
         rows.iter().map(|r| r.full_name.clone()).collect::<Vec<_>>(),
         (0..100)
@@ -680,6 +680,144 @@ fn merged_with_shared_tips_matches_git() {
     }
 }
 
+/// With too few refs for the `packed-refs` peel shortcut, the filter's tip resolution is
+/// also the listing's tag peel: a branch tip's header is read once, not once to peel and
+/// again to find its commit.
+#[test]
+fn merged_filter_peels_loose_tips_with_one_header_read() {
+    let root = tempfile::tempdir().unwrap();
+    let objects = std::sync::Arc::new(CountingObjects::new());
+    let repo = counted_repo(root.path(), objects.clone());
+    let mut trunk = Vec::new();
+    for i in 0..12 {
+        trunk.push(counted_commit(&repo, trunk.last().copied(), i));
+    }
+    let base = trunk[8];
+    let tips = [trunk[2], trunk[5], trunk[11]];
+    for (i, tip) in tips.iter().enumerate() {
+        std::fs::write(
+            repo.git_dir().join(format!("refs/heads/b{i}")),
+            format!("{tip}\n"),
+        )
+        .unwrap();
+    }
+    objects.info.lock().unwrap().clear();
+    let rows = repo
+        .references()
+        .query(
+            &RefQuery {
+                merged: vec![base],
+                ..RefQuery::default()
+            },
+            &RefQueryOptions::default(),
+        )
+        .unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|r| r.full_name.as_str())
+            .collect::<Vec<_>>(),
+        ["refs/heads/b0", "refs/heads/b1"]
+    );
+    assert!(rows.iter().all(|r| r.peeled.is_none()));
+    let info = objects.info.lock().unwrap();
+    for tip in tips {
+        let n = info.get(&tip).copied().unwrap_or(0);
+        assert!(n <= 1, "tip {tip} header read {n} times");
+    }
+}
+
+/// Listings that went through a reachability filter carry the full tag peel Git computes
+/// (`<ref>^{}`, the `packed-refs` peel line) for annotated tags, loose and packed.
+#[test]
+fn filtered_listings_report_git_peels() {
+    if !git_interop_available(Backend::Files) {
+        return;
+    }
+    let root = tempfile::tempdir().expect("tempdir");
+    let worktree = root.path();
+    let repo = init_repo(worktree, Backend::Files);
+    let tip = seed_linear(worktree);
+    seed_tag_of_tag(worktree);
+    let tree = git(worktree, &["rev-parse", "HEAD^{tree}"])
+        .trim()
+        .to_owned();
+    git(worktree, &["tag", "-a", "tree-tag", "-m", "t", &tree]);
+    let mid = ObjectId::from_hex(git(worktree, &["rev-parse", "HEAD~1"]).trim()).expect("mid");
+    let all = vec![RefNamespace::Custom("refs/".to_owned())];
+    for pack in [false, true] {
+        if pack {
+            git(worktree, &["pack-refs", "--all"]);
+        }
+        let cases: Vec<(Vec<String>, RefQuery)> = vec![
+            (
+                vec![format!("--merged={tip}")],
+                RefQuery {
+                    merged: vec![tip],
+                    namespaces: all.clone(),
+                    ..RefQuery::default()
+                },
+            ),
+            (
+                vec![format!("--no-merged={mid}")],
+                RefQuery {
+                    no_merged: vec![mid],
+                    namespaces: all.clone(),
+                    ..RefQuery::default()
+                },
+            ),
+            (
+                vec![format!("--points-at={mid}")],
+                RefQuery {
+                    points_at: vec![mid],
+                    namespaces: all.clone(),
+                    ..RefQuery::default()
+                },
+            ),
+            (
+                vec![format!("--contains={mid}"), "--count=2".to_owned()],
+                RefQuery {
+                    contains: vec![mid],
+                    limit: Some(2),
+                    namespaces: all.clone(),
+                    ..RefQuery::default()
+                },
+            ),
+        ];
+        for (filter, query) in cases {
+            let mut args = vec![
+                "for-each-ref".to_owned(),
+                "--format=%(refname) %(objecttype)".to_owned(),
+            ];
+            args.extend(filter.iter().cloned());
+            args.push("refs/".to_owned());
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            let expected: Vec<String> = git(worktree, &args)
+                .lines()
+                .filter(|l| !l.is_empty())
+                .map(|l| match l.split_once(' ') {
+                    Some((name, "tag")) => {
+                        let peeled = git(worktree, &["rev-parse", &format!("{name}^{{}}")]);
+                        format!("{name} {}", peeled.trim())
+                    }
+                    Some((name, _)) => name.to_owned(),
+                    None => l.to_owned(),
+                })
+                .collect();
+            let got: Vec<String> = repo
+                .references()
+                .query(&query, &RefQueryOptions::default())
+                .expect("query_refs")
+                .into_iter()
+                .map(|r| match r.peeled {
+                    Some(p) => format!("{} {p}", r.full_name),
+                    None => r.full_name,
+                })
+                .collect();
+            assert_eq!(got, expected, "pack={pack} {filter:?}");
+        }
+    }
+}
+
 #[test]
 fn bounded_contains_memoizes_shared_negative_history() {
     let root = tempfile::tempdir().unwrap();
@@ -698,16 +836,17 @@ fn bounded_contains_memoizes_shared_negative_history() {
     packed.push_str(&format!("{target} refs/heads/z-match\n"));
     std::fs::write(repo.git_dir().join("packed-refs"), packed).unwrap();
     objects.reads.lock().unwrap().clear();
-    let rows = query_refs(
-        &repo,
-        &RefQuery {
-            contains: vec![target],
-            limit: Some(1),
-            ..RefQuery::default()
-        },
-        &RefQueryOptions::default(),
-    )
-    .unwrap();
+    let rows = repo
+        .references()
+        .query(
+            &RefQuery {
+                contains: vec![target],
+                limit: Some(1),
+                ..RefQuery::default()
+            },
+            &RefQueryOptions::default(),
+        )
+        .unwrap();
     assert_eq!(rows[0].short_name, "z-match");
     let reads = objects.reads.lock().unwrap();
     for oid in trunk {
@@ -851,16 +990,17 @@ fn bounded_contains_validates_targets_even_with_zero_limit_or_no_candidates() {
     let missing = ObjectId::from_hex("0000000000000000000000000000000000000001").unwrap();
     for limit in [0, 1] {
         for target in [blob, missing] {
-            let err = query_refs(
-                &repo,
-                &RefQuery {
-                    contains: vec![target],
-                    limit: Some(limit),
-                    ..RefQuery::default()
-                },
-                &RefQueryOptions::default(),
-            )
-            .unwrap_err();
+            let err = repo
+                .references()
+                .query(
+                    &RefQuery {
+                        contains: vec![target],
+                        limit: Some(limit),
+                        ..RefQuery::default()
+                    },
+                    &RefQueryOptions::default(),
+                )
+                .unwrap_err();
             match target {
                 t if t == blob => assert!(matches!(err, RefQueryError::NotCommit(_))),
                 _ => assert!(matches!(err, RefQueryError::MissingObject(_))),

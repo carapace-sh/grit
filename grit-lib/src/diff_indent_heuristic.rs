@@ -271,10 +271,11 @@ fn recs_match(xdf: &XdFile<'_>, i: isize, j: isize, ws: WhitespaceMode) -> bool 
     if ui >= xdf.nrec() || uj >= xdf.nrec() {
         return false;
     }
+    if let Some(ids) = xdf.compare_ids {
+        return ids[ui] == ids[uj];
+    }
     if ws.normalizes_line_compare() {
         ws.normalize_line_for_compare(xdf.keys[ui]) == ws.normalize_line_for_compare(xdf.keys[uj])
-    } else if let Some(ids) = xdf.compare_ids {
-        ids[ui] == ids[uj]
     } else {
         xdf.keys[ui] == xdf.keys[uj]
     }
@@ -323,10 +324,17 @@ fn apply_myers_rediff_region(
     if o_start >= o_end && n_start >= n_end {
         return;
     }
-    let old_slice = &xdf.keys[o_start..o_end];
-    let new_slice = &xdfo.keys[n_start..n_end];
     let (sub_old, sub_new) =
-        crate::diff::myers_rediff_changed_masks_for_region(old_slice, new_slice, ws);
+        if let (Some(old_ids), Some(new_ids)) = (xdf.compare_ids, xdfo.compare_ids) {
+            crate::diff::myers_rediff_changed_masks_for_region_ids(
+                &old_ids[o_start..o_end],
+                &new_ids[n_start..n_end],
+            )
+        } else {
+            let old_slice = &xdf.keys[o_start..o_end];
+            let new_slice = &xdfo.keys[n_start..n_end];
+            crate::diff::myers_rediff_changed_masks_for_region(old_slice, new_slice, ws)
+        };
     for (i, changed) in sub_old.iter().enumerate() {
         xdf.set_changed(o_start + i, *changed);
     }
@@ -726,24 +734,8 @@ pub(crate) fn apply_change_compact_to_ops_with_ws_histogram(
     ops_from_masks(old.lines, new.lines, &c1, &c2)
 }
 
-/// Line-diff then Git-style compaction; used by unified diff generation.
-pub fn diff_lines_ops_compacted(
-    old_content: &str,
-    new_content: &str,
-    algorithm: Algorithm,
-    indent_heuristic: bool,
-) -> Vec<DiffOp> {
-    let diff = TextDiff::configure()
-        .algorithm(algorithm)
-        .diff_lines(old_content, new_content);
-    let old_lines: Vec<&str> = old_content.lines().collect();
-    let new_lines: Vec<&str> = new_content.lines().collect();
-    let raw = diff.ops().to_vec();
-    apply_change_compact_to_ops(&raw, &old_lines, &new_lines, indent_heuristic)
-}
-
-/// Like [`diff_lines_ops_compacted`] but for pre-split line slices (e.g. `--no-index` compare keys).
-pub fn diff_slice_ops_compacted(
+/// Line diff of pre-split line slices (e.g. `--no-index` compare keys), then Git-style compaction.
+pub(crate) fn diff_slice_ops_compacted(
     old_lines: &[&str],
     new_lines: &[&str],
     algorithm: Algorithm,

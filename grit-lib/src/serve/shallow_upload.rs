@@ -5,9 +5,8 @@ use std::collections::{HashMap, HashSet};
 use crate::objects::{ObjectId, ObjectKind};
 use crate::repo::Repository;
 use crate::rev_list::{
-    shallow_boundary_oids, shallow_grafts_for_upload_pack_deepen,
-    shallow_grafts_for_upload_pack_rev_list, shallow_grafts_for_upload_pack_target_depth,
-    shallow_grafts_for_upload_pack_target_depth_with_policy,
+    shallow_boundary_oids, upload_pack_shallow_depth_state, upload_pack_shallow_rev_list_state,
+    UploadPackDepthShallowState,
 };
 use crate::shallow::INFINITE_DEPTH;
 
@@ -28,6 +27,13 @@ impl ShallowRequest {
             || self.deepen_since.is_some()
             || !self.deepen_not.is_empty()
             || !self.client_shallow.is_empty()
+    }
+
+    /// Whether v0/v1 stateless RPC must emit the flush-terminated shallow section
+    /// before negotiation ACKs (Git `send_shallow_list` for deepen arguments).
+    #[must_use]
+    pub fn sends_v0_shallow_list(&self) -> bool {
+        self.depth.is_some() || self.deepen_since.is_some() || !self.deepen_not.is_empty()
     }
 }
 
@@ -67,7 +73,8 @@ pub(crate) fn compute_shallow_response(
         return Ok(out);
     }
 
-    let mut new_shallow = Vec::new();
+    let deepening = req.depth.is_some() || req.deepen_since.is_some() || !req.deepen_not.is_empty();
+    let mut depth_state = UploadPackDepthShallowState::default();
     if let Some(depth) = req.depth.filter(|d| *d > 0 && *d != INFINITE_DEPTH) {
         let depth = usize::try_from(depth).unwrap_or(usize::MAX);
         let depth = if req.deepen_relative {
@@ -78,61 +85,33 @@ pub(crate) fn compute_shallow_response(
         } else {
             depth
         };
-        // Relative vs absolute deepen stay split so `FetchDepth::Deepen` and `FetchDepth::Depth`
-        // can diverge without another call-site audit.
-        if req.deepen_relative {
-            new_shallow = shallow_grafts_for_upload_pack_target_depth(
-                repo,
-                wants,
-                &req.client_shallow,
-                depth,
-            );
-        } else {
-            new_shallow =
-                shallow_grafts_for_upload_pack_deepen(repo, wants, &req.client_shallow, depth);
+        let tips = crate::rev_list::peel_to_commit_tips(repo, wants);
+        depth_state = upload_pack_shallow_depth_state(repo, &tips, depth, &server_shallow);
+        for oid in &depth_state.border_commits {
+            if !client_set.contains(oid) {
+                out.shallow.push(*oid);
+            }
         }
     } else if req.deepen_since.is_some() || !req.deepen_not.is_empty() {
-        new_shallow = shallow_grafts_for_upload_pack_rev_list(
-            repo,
-            wants,
-            &req.client_shallow,
-            req.deepen_since,
-            &req.deepen_not,
-        )?;
+        depth_state =
+            upload_pack_shallow_rev_list_state(repo, wants, req.deepen_since, &req.deepen_not)?;
+        for oid in &depth_state.border_commits {
+            if !client_set.contains(oid) {
+                out.shallow.push(*oid);
+            }
+        }
     } else if !server_shallow.is_empty() {
-        new_shallow = crate::rev_list::shallow_borders_reachable_from_wants(repo, wants);
-    }
-
-    for oid in &new_shallow {
-        if !client_set.contains(oid) {
-            out.shallow.push(*oid);
+        let new_shallow = crate::rev_list::shallow_borders_reachable_from_wants(repo, wants);
+        for oid in &new_shallow {
+            if !client_set.contains(oid) {
+                out.shallow.push(*oid);
+            }
         }
     }
 
-    let deepening = req.depth.is_some() || req.deepen_since.is_some() || !req.deepen_not.is_empty();
-    let new_shallow_set: HashSet<ObjectId> = if deepening && !req.deepen_relative {
-        if let Some(depth) = req.depth.filter(|d| *d > 0 && *d != INFINITE_DEPTH) {
-            let depth = usize::try_from(depth).unwrap_or(usize::MAX);
-            shallow_grafts_for_upload_pack_target_depth_with_policy(
-                repo,
-                wants,
-                &req.client_shallow,
-                depth,
-                false,
-            )
-            .into_iter()
-            .collect()
-        } else {
-            out.shallow.iter().copied().collect()
-        }
-    } else if deepening {
-        out.shallow.iter().copied().collect()
-    } else {
-        HashSet::new()
-    };
     if deepening {
         for oid in &req.client_shallow {
-            if new_shallow_set.contains(oid) {
+            if !depth_state.interior_commits.contains(oid) {
                 continue;
             }
             if parents_in_repo(repo, *oid)? {
@@ -209,4 +188,107 @@ fn relative_deepen_depth_for_request(
         return None;
     }
     Some(max_to_shallow.saturating_add(deepen))
+}
+
+#[cfg(test)]
+mod depth_tests {
+    use std::path::Path;
+    use std::process::Command;
+
+    use super::{compute_shallow_response, ShallowRequest};
+    use crate::objects::{ObjectId, ObjectKind};
+    use crate::repo::{InitOptions, Repository};
+
+    const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+
+    fn init_single_commit_bare(dir: &Path) -> (Repository, ObjectId) {
+        let (repo, _) = Repository::init(
+            dir,
+            &InitOptions::new()
+                .with_bare(true)
+                .with_initial_branch("main".to_owned()),
+        )
+        .expect("init");
+        let commit_body = format!(
+            "tree {EMPTY_TREE}\nauthor T <t@x> 1 +0000\ncommitter T <t@x> 1 +0000\n\nonly\n"
+        );
+        let tip = repo
+            .odb()
+            .write_loose_materialize(ObjectKind::Commit, commit_body.as_bytes())
+            .expect("commit");
+        crate::refs::write_ref(dir, "refs/heads/main", &tip).expect("ref");
+        (repo, tip)
+    }
+
+    fn shallow_for_depth(repo: &Repository, wants: &[ObjectId], depth: u32) -> Vec<ObjectId> {
+        let req = ShallowRequest {
+            depth: Some(depth),
+            ..ShallowRequest::default()
+        };
+        compute_shallow_response(repo, wants, &req)
+            .expect("shallow response")
+            .shallow
+    }
+
+    #[test]
+    fn deepen_one_on_root_commit_advertises_it_shallow() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (repo, tip) = init_single_commit_bare(dir.path());
+        assert_eq!(shallow_for_depth(&repo, &[tip], 1), vec![tip]);
+    }
+
+    #[test]
+    fn deepen_beyond_history_advertises_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (repo, tip) = init_single_commit_bare(dir.path());
+        assert!(shallow_for_depth(&repo, &[tip], 5).is_empty());
+    }
+
+    #[test]
+    fn tag_wants_count_from_the_tagged_commit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (repo, tip) = init_single_commit_bare(dir.path());
+        let tag_body = format!(
+            "object {}\ntype commit\ntag v1\ntagger T <t@x> 1 +0000\n\nv1\n",
+            tip.to_hex()
+        );
+        let tag = repo
+            .odb()
+            .write_loose_materialize(ObjectKind::Tag, tag_body.as_bytes())
+            .expect("tag");
+        assert_eq!(shallow_for_depth(&repo, &[tag], 1), vec![tip]);
+        assert_eq!(shallow_for_depth(&repo, &[tip, tag], 1), vec![tip]);
+        let tree = ObjectId::from_hex(EMPTY_TREE).expect("empty tree");
+        assert!(shallow_for_depth(&repo, &[tree], 1).is_empty());
+    }
+
+    fn git_clone_depth(bare: &Path, dest: &Path, depth: u32) -> bool {
+        Command::new("git")
+            .args(["clone", "-q", "--depth", &depth.to_string()])
+            .arg(format!("file://{}", bare.display()))
+            .arg(dest)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+
+    #[cfg_attr(
+        not(feature = "full-tests"),
+        ignore = "starts system git or is heavy; run with --features full-tests"
+    )]
+    #[test]
+    fn single_commit_shallow_borders_match_git_clone_depth() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (repo, tip) = init_single_commit_bare(dir.path());
+        assert_eq!(shallow_for_depth(&repo, &[tip], 1).len(), 1);
+        assert!(shallow_for_depth(&repo, &[tip], 5).is_empty());
+
+        let d1 = dir.path().join("git-d1");
+        let d5 = dir.path().join("git-d5");
+        assert!(git_clone_depth(dir.path(), &d1, 1), "git clone --depth 1");
+        assert!(git_clone_depth(dir.path(), &d5, 5), "git clone --depth 5");
+        assert!(d1.join(".git/shallow").is_file());
+        assert!(!d5.join(".git/shallow").is_file());
+    }
 }

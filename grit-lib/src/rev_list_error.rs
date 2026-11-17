@@ -48,7 +48,7 @@ pub enum RevListError {
     /// option such as `--all`, the `--` separator, or several whitespace-separated tokens.
     ///
     /// Use [`crate::revwalk::RevWalk::commits`] with
-    /// [`crate::revwalk::RevWalkListOptions::refs`] / [`crate::revwalk::RevWalkListOptions::paths`]
+    /// [`crate::revwalk::RevWalkListOptions::refs`] / [`crate::revwalk::RevWalkListOptions::pathspec`]
     /// for ref selections, path limits, and multiple tokens.
     #[error("'{spec}' is not a single revision or range; list several tokens, refs or paths with RevWalk::commits")]
     UnsupportedWalkSpec {
@@ -56,11 +56,12 @@ pub enum RevListError {
         spec: String,
     },
 
-    /// [`crate::rev_list::rev_list`] got a raw `A...B` spec; symmetric ranges must be expanded
-    /// first with [`crate::revwalk::parse_rev_walk_tokens`] (positive tips, merge-base
-    /// exclusions, and the `symmetric_left` / `symmetric_right` options).
+    /// [`RevWalk::rev_list`](crate::revwalk::RevWalk::rev_list) got a raw `A...B` spec;
+    /// symmetric ranges must be expanded first with
+    /// [`RevWalk::parse_tokens`](crate::revwalk::RevWalk::parse_tokens) (positive tips,
+    /// merge-base exclusions, and the `symmetric_left` / `symmetric_right` options).
     #[error(
-        "symmetric range '{spec}' must be expanded with parse_rev_walk_tokens before rev_list"
+        "symmetric range '{spec}' must be expanded with RevWalk::parse_tokens before rev_list"
     )]
     UnexpandedSymmetricRange {
         /// The unexpanded `A...B` spec.
@@ -75,12 +76,21 @@ pub enum RevListError {
         /// Expected object type name (`tree`, `blob`, `commit`, `tag`).
         expected: &'static str,
     },
+
+    /// [`crate::rev_list::RevListOptions::follow`] requires exactly one path after `--`.
+    #[error("--follow can only be used with exactly one path")]
+    FollowRequiresSinglePath,
+
+    /// [`crate::rev_list::RevListOptions::follow`] requires a plain file path (no globs or magic).
+    #[error("--follow requires a single literal file path")]
+    FollowRequiresLiteralPath,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::error::Error;
+    use crate::error::RevisionError;
 
     #[test]
     fn variant_sparse_filter_unparsable() {
@@ -89,7 +99,9 @@ mod tests {
         });
         assert!(matches!(
             err,
-            Error::RevList(RevListError::SparseFilterUnparsable { .. })
+            Error::Revision(RevisionError::List(
+                RevListError::SparseFilterUnparsable { .. }
+            ))
         ));
     }
 
@@ -100,7 +112,7 @@ mod tests {
         });
         assert!(matches!(
             err,
-            Error::RevList(RevListError::MissingOptionValue { .. })
+            Error::Revision(RevisionError::List(RevListError::MissingOptionValue { .. }))
         ));
     }
 
@@ -123,7 +135,9 @@ mod tests {
         assert!(symmetric.to_string().contains("'a...b'"));
         assert!(matches!(
             Error::from(symmetric),
-            Error::RevList(RevListError::UnexpandedSymmetricRange { .. })
+            Error::Revision(RevisionError::List(
+                RevListError::UnexpandedSymmetricRange { .. }
+            ))
         ));
     }
 

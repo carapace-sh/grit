@@ -6,7 +6,9 @@ use crate::error::Result;
 use crate::ident_resolve::resolve_loose_committer_identity_with;
 use crate::objects::ObjectId;
 use crate::refs::handle::ExistingRef;
-use crate::refs::store::{Expected, RawRef, RefUpdate, RefUpdateFlags, ReflogUpdate};
+use crate::refs::store::{
+    Expected, RawRef, RefName, RefNameRef, RefUpdate, RefUpdateFlags, ReflogUpdate,
+};
 use crate::refs::{
     append_reflog_on_store, commit_ref_update_on_store, create_ref_with_reflog_on_store,
     delete_ref_on_store, update_direct_ref_on_store, write_symbolic_ref_on_store,
@@ -15,9 +17,14 @@ use crate::repo::Repository;
 use crate::state::{resolve_head_for_repository, HeadState};
 
 /// Committer identity line for reflog updates (`Name <email> epoch tz`).
-pub fn checkout_reflog_identity(repo: &Repository) -> String {
+pub(crate) fn checkout_reflog_identity(repo: &Repository) -> String {
     let env = repo.environment();
-    let config = ConfigSet::load(env, Some(repo.git_dir()), true).unwrap_or_default();
+    let config = ConfigSet::load(
+        env,
+        Some(repo.git_dir()),
+        &crate::config::LoadConfigOptions::standard(env, Some(repo.git_dir())),
+    )
+    .unwrap_or_default();
     resolve_loose_committer_identity_with(env, &config, repo.identity_now())
 }
 
@@ -58,19 +65,23 @@ pub fn switch_create_reflog_source_label(start_point: Option<&str>) -> String {
 ///
 /// Respects `core.logAllRefUpdates` for auto-creating a new log, but still appends when
 /// `HEAD` already has a reflog (Git `append_reflog` semantics).
-pub fn append_head_checkout_reflog(
+pub(crate) fn append_head_checkout_reflog(
     repo: &Repository,
     old_oid: ObjectId,
     new_oid: ObjectId,
     from_label: &str,
     to_label: &str,
 ) -> Result<()> {
-    let config =
-        ConfigSet::load(repo.environment(), Some(repo.git_dir()), true).unwrap_or_default();
+    let config = ConfigSet::load(
+        repo.environment(),
+        Some(repo.git_dir()),
+        &crate::config::LoadConfigOptions::standard(repo.environment(), Some(repo.git_dir())),
+    )
+    .unwrap_or_default();
     let identity = checkout_reflog_identity(repo);
     let message = format!("checkout: moving from {from_label} to {to_label}");
     append_reflog_on_store(
-        repo.refs(),
+        repo.ref_store(),
         "HEAD",
         &old_oid,
         &new_oid,
@@ -82,18 +93,18 @@ pub fn append_head_checkout_reflog(
 }
 
 /// Create a branch ref and `branch: Created from …` reflog atomically.
-pub fn create_branch_ref_with_reflog(
+pub(crate) fn create_branch_ref_with_reflog(
     repo: &Repository,
     branch_ref: &str,
     start_oid: ObjectId,
     source_label: &str,
 ) -> Result<()> {
-    let config = repo.config()?;
+    let config = repo.config().snapshot()?;
     let identity =
         resolve_loose_committer_identity_with(repo.environment(), &config, repo.identity_now());
     let message = format!("branch: Created from {source_label}");
     create_ref_with_reflog_on_store(
-        repo.refs(),
+        repo.ref_store(),
         repo.git_dir(),
         &config,
         branch_ref,
@@ -113,11 +124,17 @@ pub(crate) fn reset_branch_ref_with_reflog(
 ) -> Result<()> {
     let identity = checkout_reflog_identity(repo);
     let message = format!("branch: Reset to {source_label}");
-    let config =
-        ConfigSet::load(repo.environment(), Some(repo.git_dir()), true).unwrap_or_default();
+    let config = ConfigSet::load(
+        repo.environment(),
+        Some(repo.git_dir()),
+        &crate::config::LoadConfigOptions::standard(repo.environment(), Some(repo.git_dir())),
+    )
+    .unwrap_or_default();
     let reflog =
         if crate::refs::should_autocreate_reflog_with_config(&config, repo.git_dir(), branch_ref)
-            || repo.refs().reflog_exists(branch_ref)?
+            || repo
+                .ref_store()
+                .reflog_exists(RefNameRef::from_trusted(branch_ref))?
         {
             Some(ReflogUpdate {
                 identity,
@@ -130,13 +147,16 @@ pub(crate) fn reset_branch_ref_with_reflog(
             None
         };
     let (expected, no_deref) = match &existing.raw {
-        RawRef::Symbolic(target) => (Expected::Symref(target.clone()), true),
+        RawRef::Symbolic(target) => (
+            Expected::Symref(RefName::from_trusted(target.clone())),
+            true,
+        ),
         RawRef::Direct(oid) => (Expected::Oid(*oid), false),
     };
     commit_ref_update_on_store(
-        repo.refs(),
+        repo.ref_store(),
         RefUpdate {
-            name: branch_ref.to_owned(),
+            name: RefName::from_trusted(branch_ref.to_owned()),
             new_value: Some(RawRef::Direct(new_oid)),
             expected,
             reflog,
@@ -151,9 +171,11 @@ pub(crate) fn reset_branch_ref_with_reflog(
 fn write_head(repo: &Repository, value: &RawRef) -> Result<()> {
     match value {
         RawRef::Symbolic(target) => {
-            write_symbolic_ref_on_store(repo.refs(), repo.git_dir(), "HEAD", target)
+            write_symbolic_ref_on_store(repo.ref_store(), repo.git_dir(), "HEAD", target)
         }
-        RawRef::Direct(oid) => update_direct_ref_on_store(repo.refs(), repo.git_dir(), "HEAD", oid),
+        RawRef::Direct(oid) => {
+            update_direct_ref_on_store(repo.ref_store(), repo.git_dir(), "HEAD", oid)
+        }
     }
 }
 
@@ -167,7 +189,7 @@ fn restore_head(repo: &Repository, head_before: &HeadState) -> Result<()> {
 
 /// Create branch (if needed), move `HEAD`, append checkout reflog; roll back branch on failure.
 #[allow(clippy::too_many_arguments)]
-pub fn finish_switch_ref_updates(
+pub(crate) fn finish_switch_ref_updates(
     repo: &Repository,
     head_before: &HeadState,
     branch_create: Option<(String, ObjectId, String)>,
@@ -189,7 +211,7 @@ pub fn finish_switch_ref_updates(
     };
     if let Err(err) = write_head(repo, &head_after) {
         if let Some(refname) = created_branch {
-            let _ = delete_ref_on_store(repo.refs(), &refname);
+            let _ = delete_ref_on_store(repo.ref_store(), &refname);
         }
         return Err(err);
     }
@@ -202,7 +224,7 @@ pub fn finish_switch_ref_updates(
     if let Err(err) = append_head_checkout_reflog(repo, old_oid, target_oid, from_label, to_label) {
         let _ = restore_head(repo, head_before);
         if let Some(refname) = created_branch {
-            let _ = delete_ref_on_store(repo.refs(), &refname);
+            let _ = delete_ref_on_store(repo.ref_store(), &refname);
         }
         return Err(err);
     }
@@ -210,7 +232,7 @@ pub fn finish_switch_ref_updates(
 }
 
 /// Whether `HEAD` already points at this attached branch tip (no checkout reflog).
-pub fn is_already_on_branch(
+pub(crate) fn is_already_on_branch(
     repo: &Repository,
     branch_ref: &str,
     target_oid: ObjectId,
@@ -227,7 +249,7 @@ pub fn is_already_on_branch(
 }
 
 /// Whether detached `HEAD` already points at `target_oid`.
-pub fn is_already_detached_at(repo: &Repository, target_oid: ObjectId) -> Result<bool> {
+pub(crate) fn is_already_detached_at(repo: &Repository, target_oid: ObjectId) -> Result<bool> {
     let head = resolve_head_for_repository(repo)?;
     Ok(matches!(
         head,

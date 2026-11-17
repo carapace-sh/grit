@@ -6,10 +6,8 @@ use std::io::Read;
 use std::sync::Once;
 
 use anyhow::{Context, Result};
-use carapace_rs::Action;
-use carapace_rs_clap::completer;
 use clap::Args;
-use grit_lib::config::ident::parse_author_arg;
+use grit_lib::ident::parse_author_arg;
 use grit_lib::ident::AuthorContact;
 use grit_lib::porcelain::commit::normalize_commit_message;
 
@@ -36,8 +34,7 @@ pub struct MessageInputArgs {
         long = "message-file",
         value_name = "PATH|-",
         conflicts_with = "message",
-        allow_hyphen_values = true,
-        add = completer!(Action::files([]))
+        allow_hyphen_values = true
     )]
     pub message_file: Option<String>,
 }

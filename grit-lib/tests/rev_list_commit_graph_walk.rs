@@ -12,9 +12,8 @@ use std::process::Command;
 use grit_lib::index::write_tree::write_tree_from_index;
 use grit_lib::index::{Index, IndexEntry, MODE_REGULAR};
 use grit_lib::objects::{serialize_commit, CommitData, ObjectId, ObjectKind};
-use grit_lib::refs::write_ref;
 use grit_lib::repo::{InitOptions, Repository};
-use grit_lib::revwalk::rev_list::{rev_list, OrderingMode, RevListOptions};
+use grit_lib::revwalk::rev_list::{OrderingMode, RevListOptions};
 use support::{commit_labeled_with_dates, git, git_rev_list, open_grit_repo, HistoryRepo};
 use tempfile::TempDir;
 
@@ -60,7 +59,7 @@ fn write_linear_commits(repo: &Repository, count: usize) -> grit_lib::objects::O
         tip = repo.odb().write(ObjectKind::Commit, &raw).expect("commit");
         parent = Some(tip);
     }
-    write_ref(repo.git_dir(), "refs/heads/main", &tip).expect("ref");
+    grit_test_support::refs::set_ref(&repo, "refs/heads/main", &tip).expect("ref");
     tip
 }
 
@@ -83,11 +82,11 @@ fn git_commit_graph_write(repo_root: &tempfile::TempDir) {
 #[test]
 fn rev_list_commit_graph_walk_matches_object_walk() {
     let dir = TempDir::new().expect("tempdir");
-    let repo = Repository::init(
+    let (repo, _) = Repository::init(
         dir.path(),
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
-            .with_ref_storage(grit_lib::RefStorageFormat::Files),
+            .with_ref_storage(grit_lib::refs::ref_storage::RefStorageFormat::Files),
     )
     .expect("init");
     write_linear_commits(&repo, 80);
@@ -99,13 +98,32 @@ fn rev_list_commit_graph_walk_matches_object_walk() {
         use_commit_graph: false,
         ..Default::default()
     };
-    let without = rev_list(&repo, &["HEAD".to_owned()], &[], &opts_base).expect("walk");
+    let without = repo
+        .revwalk()
+        .rev_list(&["HEAD".to_owned()], &[], &opts_base)
+        .expect("walk");
     let with_graph = RevListOptions {
         count: true,
         ..Default::default()
     };
-    let with = rev_list(&repo, &["HEAD".to_owned()], &[], &with_graph).expect("graph walk");
-    assert_eq!(without.commits.len(), 80);
+    let with = repo
+        .revwalk()
+        .rev_list(&["HEAD".to_owned()], &[], &with_graph)
+        .expect("graph walk");
+    // A count may come from a count-only walk that lists nothing; the listing is checked apart.
+    let listed = repo
+        .revwalk()
+        .rev_list(
+            &["HEAD".to_owned()],
+            &[],
+            &RevListOptions {
+                use_commit_graph: false,
+                ..Default::default()
+            },
+        )
+        .expect("list walk");
+    assert_eq!(listed.commits.len(), 80);
+    assert_eq!(without.commit_count(), 80);
     assert_eq!(without.commit_count(), with.commit_count());
     assert_eq!(with.commit_count(), 80);
 }
@@ -171,7 +189,8 @@ fn list(
         use_commit_graph: use_graph,
         ..options.clone()
     };
-    rev_list(repo, &["HEAD".to_owned()], &[], &options)
+    repo.revwalk()
+        .rev_list(&["HEAD".to_owned()], &[], &options)
         .expect("rev_list")
         .commits
 }

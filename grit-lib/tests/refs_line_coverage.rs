@@ -6,8 +6,10 @@ use crate::support;
 
 use std::fs;
 
-use grit_lib::refs::{collect_alternate_ref_oids, list_refs_glob, ref_matches_glob, write_ref};
+use grit_lib::refs::check_ref_format::{RefName, RefNameError, RefNamePolicy, RefNameRef};
+use grit_lib::refs::ref_matches_glob;
 use grit_lib::repo::{InitOptions, Repository};
+use grit_lib::test_support::refs::collect_alternate_ref_oids;
 use tempfile::tempdir;
 
 #[test]
@@ -30,18 +32,49 @@ fn list_refs_glob_prefix_and_pattern() {
         root,
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
-            .with_ref_storage(grit_lib::RefStorageFormat::Files),
+            .with_ref_storage(grit_lib::refs::ref_storage::RefStorageFormat::Files),
     )
     .expect("init");
     let git_dir = root.join(".git");
     let oid = support::stored_commit(&git_dir, 1);
-    write_ref(&git_dir, "refs/heads/topic/one", &oid).expect("write");
-    write_ref(&git_dir, "refs/heads/topic/two", &oid).expect("write");
-    write_ref(&git_dir, "refs/heads/other", &oid).expect("write");
+    grit_test_support::refs::set_ref(
+        &grit_test_support::refs::at(&git_dir),
+        "refs/heads/topic/one",
+        &oid,
+    )
+    .expect("write");
+    grit_test_support::refs::set_ref(
+        &grit_test_support::refs::at(&git_dir),
+        "refs/heads/topic/two",
+        &oid,
+    )
+    .expect("write");
+    grit_test_support::refs::set_ref(
+        &grit_test_support::refs::at(&git_dir),
+        "refs/heads/other",
+        &oid,
+    )
+    .expect("write");
 
-    let globbed = list_refs_glob(&git_dir, "refs/heads/topic/*").expect("glob");
+    let globbed = grit_test_support::refs::at(&git_dir)
+        .references()
+        .list_glob("refs/heads/topic/*")
+        .map(|refs| {
+            refs.into_iter()
+                .map(|(n, o)| (String::from(n), o))
+                .collect::<Vec<_>>()
+        })
+        .expect("glob");
     assert_eq!(globbed.len(), 2);
-    let prefix = list_refs_glob(&git_dir, "refs/heads/o*").expect("prefix glob");
+    let prefix = grit_test_support::refs::at(&git_dir)
+        .references()
+        .list_glob("refs/heads/o*")
+        .map(|refs| {
+            refs.into_iter()
+                .map(|(n, o)| (String::from(n), o))
+                .collect::<Vec<_>>()
+        })
+        .expect("prefix glob");
     assert_eq!(prefix.len(), 1);
 }
 
@@ -54,19 +87,24 @@ fn collect_alternate_ref_oids_reads_linked_object_store() {
         &primary,
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
-            .with_ref_storage(grit_lib::RefStorageFormat::Files),
+            .with_ref_storage(grit_lib::refs::ref_storage::RefStorageFormat::Files),
     )
     .expect("init primary");
     Repository::init(
         &alt,
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
-            .with_ref_storage(grit_lib::RefStorageFormat::Files),
+            .with_ref_storage(grit_lib::refs::ref_storage::RefStorageFormat::Files),
     )
     .expect("init alt");
     let alt_git = alt.join(".git");
     let oid = support::stored_commit(&alt_git, 2);
-    write_ref(&alt_git, "refs/heads/from-alt", &oid).expect("alt ref");
+    grit_test_support::refs::set_ref(
+        &grit_test_support::refs::at(&alt_git),
+        "refs/heads/from-alt",
+        &oid,
+    )
+    .expect("alt ref");
 
     let primary_git = primary.join(".git");
     let objects = primary_git.join("objects");
@@ -89,20 +127,30 @@ fn collect_alternate_ref_oids_honors_prefix_config() {
         &primary,
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
-            .with_ref_storage(grit_lib::RefStorageFormat::Files),
+            .with_ref_storage(grit_lib::refs::ref_storage::RefStorageFormat::Files),
     )
     .expect("init primary");
     Repository::init(
         &alt,
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
-            .with_ref_storage(grit_lib::RefStorageFormat::Files),
+            .with_ref_storage(grit_lib::refs::ref_storage::RefStorageFormat::Files),
     )
     .expect("init alt");
     let alt_git = alt.join(".git");
     let oid = support::stored_commit(&alt_git, 3);
-    write_ref(&alt_git, "refs/heads/picked", &oid).expect("alt ref");
-    write_ref(&alt_git, "refs/tags/skipped", &oid).expect("tag");
+    grit_test_support::refs::set_ref(
+        &grit_test_support::refs::at(&alt_git),
+        "refs/heads/picked",
+        &oid,
+    )
+    .expect("alt ref");
+    grit_test_support::refs::set_ref(
+        &grit_test_support::refs::at(&alt_git),
+        "refs/tags/skipped",
+        &oid,
+    )
+    .expect("tag");
 
     let primary_git = primary.join(".git");
     fs::write(
@@ -123,54 +171,46 @@ fn collect_alternate_ref_oids_honors_prefix_config() {
 }
 
 #[test]
-fn check_ref_format_edge_cases_for_coverage() {
-    use grit_lib::refs::check_ref_format::{
-        check_refname_format, collapse_slashes, is_valid_advertised_symref_target,
-        is_valid_fetch_advertised_ref, receive_pack_refname_ok, refname_is_safe,
-        validate_branch_short_name, validate_tag_short_name, RefNameError, RefNameOptions,
-    };
+fn ref_name_policy_edge_cases_for_coverage() {
+    let format = RefNamePolicy::default();
+    let storable = RefNamePolicy::default().storable();
+    let safe = RefNamePolicy::default().safe_for_fs();
+    let fetch_ad = RefNamePolicy::default().advertised_fetch();
+    let receive = RefNamePolicy::default().receive_pack(false);
+    let symref = RefNamePolicy::new().allow_onelevel();
 
     assert!(matches!(
-        check_refname_format("", &RefNameOptions::default()),
+        RefName::parse("", &format),
         Err(RefNameError::Empty)
     ));
-    assert!(!refname_is_safe("refs/"));
-    assert!(!refname_is_safe("refs/heads/../escape"));
-    assert!(!refname_is_safe("not_upper"));
-    assert!(receive_pack_refname_ok("refs/heads/main", false));
-    assert!(!receive_pack_refname_ok("heads/main", false));
+    assert!(RefName::parse("refs/heads/../escape", &safe).is_err());
+    assert!(RefName::parse("not_upper", &safe).is_err());
+    assert!(RefName::parse("refs/heads/main", &receive).is_ok());
+    assert!(RefName::parse("heads/main", &receive).is_err());
+    assert!(matches!(RefName::branch(""), Err(RefNameError::Empty)));
     assert!(matches!(
-        validate_branch_short_name(""),
-        Err(RefNameError::Empty)
-    ));
-    assert!(matches!(
-        validate_branch_short_name("-bad"),
+        RefName::branch("-bad"),
         Err(RefNameError::BranchStartsWithDash)
     ));
+    assert!(matches!(RefName::tag(""), Err(RefNameError::Empty)));
+    assert!(RefName::tag("v1.0").is_ok());
+    assert!(RefName::parse("refs/heads/main", &fetch_ad).is_ok());
+    assert!(RefName::parse("HEAD", &fetch_ad).is_err());
+    assert!(RefNameRef::parse("HEAD", &symref).is_ok());
+    assert!(RefNameRef::parse("@", &symref).is_err());
+    assert_eq!(
+        RefName::parse("refs//heads///x", &RefNamePolicy::default().normalize())
+            .expect("normalize")
+            .as_str(),
+        "refs/heads/x"
+    );
     assert!(matches!(
-        validate_tag_short_name(""),
-        Err(RefNameError::Empty)
-    ));
-    assert!(validate_tag_short_name("v1.0").is_ok());
-    assert!(is_valid_fetch_advertised_ref("refs/heads/main"));
-    assert!(!is_valid_fetch_advertised_ref("HEAD"));
-    assert!(is_valid_advertised_symref_target("HEAD"));
-    assert!(!is_valid_advertised_symref_target("@"));
-    assert_eq!(collapse_slashes("refs//heads///x"), "refs/heads/x");
-    assert!(check_refname_format(
-        "refs/heads/x",
-        &RefNameOptions {
-            normalize: true,
-            ..Default::default()
-        },
-    )
-    .is_ok());
-    assert!(matches!(
-        check_refname_format("@", &RefNameOptions::default()),
+        RefName::parse("@", &format),
         Err(RefNameError::LoneAt)
     ));
     assert!(matches!(
-        validate_branch_short_name("HEAD"),
+        RefName::branch("HEAD"),
         Err(RefNameError::ReservedBranchName)
     ));
+    assert!(RefName::parse("HEAD", &storable).is_ok());
 }

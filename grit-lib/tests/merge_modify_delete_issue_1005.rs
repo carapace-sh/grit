@@ -1,14 +1,16 @@
 //! Issue #1005: modify/delete merge conflicts must be resolvable via grit add/rm.
 
 use grit_lib::config::environment::RepositoryOptions;
+use grit_lib::merge::IntegrateBranchOutcome;
 use grit_lib::objects::ObjectId;
 use grit_lib::operation::ConflictKind;
-use grit_lib::porcelain::add::{stage, StageOptions};
-use grit_lib::porcelain::merge::{integrate_branch, IntegrateBranchOutcome};
-use grit_lib::porcelain::paths::{remove_paths, RemoveOptions};
+use grit_lib::porcelain::add::StageOptions;
+use grit_lib::porcelain::paths::RemoveOptions;
 use grit_lib::progress::NullProgress;
 use grit_lib::repo::Repository;
 use grit_test_support::git;
+use grit_test_support::integrate_branch;
+use grit_test_support::integrate_branch;
 use std::fs;
 
 fn issue_1005_repo() -> (tempfile::TempDir, Repository) {
@@ -51,10 +53,10 @@ fn modify_delete_conflict_materializes_incoming_version_and_resolves_with_add_or
         feat_oid,
         "feat",
         &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("merge");
-    let IntegrateBranchOutcome::Conflicts { paths, details } = outcome else {
+    let IntegrateBranchOutcome::Conflicts { paths, details, .. } = outcome else {
         panic!("expected conflicts");
     };
     assert_eq!(paths, vec!["f".to_owned()]);
@@ -71,22 +73,29 @@ fn modify_delete_conflict_materializes_incoming_version_and_resolves_with_add_or
         "base\nfeat\n"
     );
 
-    let index = repo.index_handle().load().expect("index");
+    let index = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("index");
     assert!(index.has_unmerged_entries());
 
     // grit add f — keep the file
-    let add_keep = stage(
-        &repo,
-        &StageOptions {
-            pathspecs: vec!["f".into()],
-            ..StageOptions::default()
-        },
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("add keep");
+    let add_keep = repo
+        .index()
+        .stage(
+            &StageOptions {
+                pathspecs: vec!["f".into()],
+                ..StageOptions::default()
+            },
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("add keep");
     assert_eq!(add_keep.modified.len(), 1);
-    let index = repo.index_handle().load().expect("index after add");
+    let index = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("index after add");
     assert!(!index.has_unmerged_entries());
     assert!(index.get(b"f", 0).is_some());
 }
@@ -104,21 +113,26 @@ fn modify_delete_conflict_resolves_by_accepting_deletion() {
         feat_oid,
         "feat",
         &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("merge");
     assert!(matches!(outcome, IntegrateBranchOutcome::Conflicts { .. }));
 
-    let rm_out = remove_paths(
-        &repo,
-        &RemoveOptions {
-            pathspecs: vec!["f".into()],
-            ..RemoveOptions::default()
-        },
-    )
-    .expect("rm f");
+    let rm_out = repo
+        .checkout()
+        .remove_paths(
+            &RemoveOptions {
+                pathspecs: vec!["f".into()],
+                ..RemoveOptions::default()
+            },
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("rm f");
     assert_eq!(rm_out.removed, vec!["f".to_owned()]);
-    let index = repo.index_handle().load().expect("index after rm");
+    let index = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("index after rm");
     assert!(!index.has_unmerged_entries());
     assert!(index.get(b"f", 0).is_none());
     assert!(!root.join("f").exists());
@@ -137,19 +151,19 @@ fn modify_delete_merge_does_not_mark_unrelated_files_modified() {
         feat_oid,
         "feat",
         &mut NullProgress,
-        &NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("merge");
 
-    use grit_lib::porcelain::status::{status, StatusOptions};
-    use grit_lib::progress::NeverCancel;
-    let model = status(
-        &repo,
-        &StatusOptions::default(),
-        &mut grit_lib::progress::NullProgress,
-        &NeverCancel,
-    )
-    .expect("status");
+    use grit_lib::porcelain::status::StatusOptions;
+    let model = repo
+        .status()
+        .run(
+            &StatusOptions::default(),
+            &mut grit_lib::progress::NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("status");
     assert!(
         model.unstaged.iter().all(|e| e.path() != "g"),
         "g should not be unstaged-modified after conflict merge: {:?}",

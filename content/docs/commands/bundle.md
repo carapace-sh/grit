@@ -22,11 +22,13 @@ Git bundles pack refs and objects into a single file. Use them to move history w
 
 When the repository's objects are already packed, `create` copies the existing deltas and whole objects straight from the packs instead of recomputing them, and streams the pack into the file. A bundle of a packed repository is close to a copy of its pack: it takes seconds and its memory is bounded by the pack index, not by the size of the history. Bundles with prerequisites are thin, so an object can be sent as a delta against a prerequisite's blob. Only objects that are not already stored as deltas (for example, loose objects from recent commits) go through a new delta search, as `git bundle create` does; it covers blobs, trees and commits and reads each object only while it is in the search window.
 
-`verify` checks the pack checksum and, when run inside a repository, confirms prerequisite commits are present and connected to your history.
+`create` and `unbundle` honor Ctrl+C (and `SIGTERM` / `SIGHUP` on Unix) with `error: operation cancelled` and exit code **130**. A failed or cancelled `create` leaves an existing destination file unchanged and removes only the temporary `*.bundle.part` file; `unbundle` rolls back before refs are updated.
+
+`verify` checks the pack checksum and, when run inside a repository, confirms prerequisite commits are present and their exclusive history is readable. Prerequisites already reachable from your refs satisfy this immediately; otherwise an unreferenced but complete object graph in the repository is enough (for example after `unbundle` of a full bundle leaves dangling prerequisites).
 
 `list` prints the refs recorded in the bundle header.
 
-`unbundle` ingests the embedded pack into the current repository (objects only; refs in the header are reported but not updated on disk). Run inside the destination repository.
+`unbundle` ingests the embedded pack into the current repository (objects only; refs in the header are reported but not updated on disk). Run inside the destination repository. When prerequisite commits from an incremental bundle are missing locally, `unbundle` refuses before reading the pack (same checks as `verify`) with exit **128** and a message listing the missing commit ids—it does not report pack corruption or leave partial objects behind.
 
 You can also treat a bundle path like a remote: [`grit fetch`](../fetch/) and [`grit clone`](../clone/) accept a path to a bundle file.
 

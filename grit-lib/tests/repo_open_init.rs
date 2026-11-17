@@ -1,17 +1,16 @@
 //! Open, discover, and init entry points (task 1304).
 
+use std::fs;
 use std::process::Command;
 use std::sync::OnceLock;
 
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::objects::ObjectId;
-use grit_lib::refs::list_refs_for_repository;
+use grit_lib::refs::ref_storage::RefStorageFormat;
 use grit_lib::refs::store::{
     Expected, MemoryRefStore, RawRef, RefStore, RefTransaction, RefUpdate,
 };
-use grit_lib::repo::{InitOptions, Repository, RepositoryBuilder};
-use grit_lib::revwalk::rev_parse::resolve_revision;
-use grit_lib::RefStorageFormat;
+use grit_lib::repo::{InitOptions, Repository};
 use tempfile::TempDir;
 
 fn git_fsck_ok(git_dir: &std::path::Path) {
@@ -69,7 +68,7 @@ fn open_discover_and_init_roundtrip_fsck() {
     let td = TempDir::new().expect("tempdir");
 
     let normal = td.path().join("normal");
-    let repo = Repository::init(
+    let (repo, _) = Repository::init(
         &normal,
         &InitOptions::new().with_initial_branch("main".to_owned()),
     )
@@ -77,7 +76,7 @@ fn open_discover_and_init_roundtrip_fsck() {
     git_fsck_ok(repo.git_dir());
 
     let bare = td.path().join("bare.git");
-    let bare_repo = Repository::init(
+    let (bare_repo, _) = Repository::init(
         &bare,
         &InitOptions::new()
             .with_bare(true)
@@ -88,7 +87,7 @@ fn open_discover_and_init_roundtrip_fsck() {
 
     let sep_wt = td.path().join("sep-wt");
     let sep_git = td.path().join("sep.git");
-    let sep_repo = Repository::init(
+    let (sep_repo, _) = Repository::init(
         &sep_wt,
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
@@ -98,7 +97,7 @@ fn open_discover_and_init_roundtrip_fsck() {
     git_fsck_ok(sep_repo.git_dir());
 
     let bare_wt = td.path().join("bare-wt-layout");
-    let bare_wt_repo = Repository::init(
+    let (bare_wt_repo, _) = Repository::init(
         &bare_wt,
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
@@ -108,7 +107,7 @@ fn open_discover_and_init_roundtrip_fsck() {
     git_fsck_ok(bare_wt_repo.git_dir());
 
     let reftable = td.path().join("reftable");
-    let rt_repo = Repository::init(
+    let (rt_repo, _) = Repository::init(
         &reftable,
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
@@ -168,16 +167,28 @@ fn open_discover_and_init_roundtrip_fsck() {
         .commit()
         .expect("commit");
 
-    let built = RepositoryBuilder::new(RepositoryOptions::empty().with_work_tree(normal.clone()))
-        .ref_store(store)
-        .open(repo.git_dir(), Some(normal.as_path()))
-        .expect("builder open");
+    let built = Repository::open(
+        repo.git_dir(),
+        &(RepositoryOptions::empty()
+            .with_work_tree(normal.clone())
+            .with_ref_store(store)
+            .with_work_tree(normal.as_path())),
+    )
+    .expect("builder open");
     assert_eq!(built.git_dir(), repo.git_dir());
     assert_eq!(
-        built.refs().format(),
+        built.ref_store().format(),
         grit_lib::refs::store::RefStorageFormat::Memory
     );
-    let listed = list_refs_for_repository(&built, "refs/heads/").expect("list");
+    let listed = built
+        .references()
+        .list("refs/heads/")
+        .map(|refs| {
+            refs.into_iter()
+                .map(|(n, o)| (String::from(n), o))
+                .collect::<Vec<_>>()
+        })
+        .expect("list");
     assert!(
         listed
             .iter()
@@ -185,7 +196,131 @@ fn open_discover_and_init_roundtrip_fsck() {
         "builder ref_store injection should list injected ref"
     );
     assert_eq!(
-        resolve_revision(&built, "refs/heads/builder-injected").expect("rev-parse"),
+        built
+            .revwalk()
+            .resolve(
+                "refs/heads/builder-injected",
+                &grit_lib::revwalk::ResolveOptions::default()
+            )
+            .expect("rev-parse"),
         oid
+    );
+}
+
+fn git_env() -> [(&'static str, &'static str); 2] {
+    [
+        ("GIT_CONFIG_GLOBAL", "/dev/null"),
+        ("GIT_CONFIG_SYSTEM", "/dev/null"),
+    ]
+}
+
+#[test]
+fn open_and_discover_git_created_layouts() {
+    let td = TempDir::new().expect("tempdir");
+
+    let normal = td.path().join("git-normal");
+    fs::create_dir_all(&normal).expect("git-normal dir");
+    assert!(Command::new("git")
+        .current_dir(&normal)
+        .args(["init", "-q"])
+        .envs(git_env())
+        .status()
+        .expect("git init")
+        .success());
+    let git_dir = normal.join(".git");
+    Repository::open(
+        &git_dir,
+        &RepositoryOptions::empty().with_work_tree(&normal),
+    )
+    .expect("open git init work tree");
+    Repository::discover(Some(&normal), &RepositoryOptions::empty())
+        .expect("discover git init work tree");
+
+    let bare = td.path().join("git-bare.git");
+    assert!(Command::new("git")
+        .args(["init", "-q", "--bare"])
+        .arg(&bare)
+        .envs(git_env())
+        .status()
+        .expect("git init --bare")
+        .success());
+    Repository::open(&bare, &RepositoryOptions::empty()).expect("open git bare");
+    Repository::discover(Some(&bare), &RepositoryOptions::empty()).expect("discover git bare");
+
+    let linked_root = td.path().join("git-linked");
+    fs::create_dir_all(&linked_root).expect("git-linked dir");
+    assert!(Command::new("git")
+        .current_dir(&linked_root)
+        .args(["init", "-q"])
+        .envs(git_env())
+        .status()
+        .expect("git init for worktree")
+        .success());
+    let linked_path = td.path().join("git-linked-checkout");
+    assert!(Command::new("git")
+        .current_dir(&linked_root)
+        .args(["worktree", "add", "-q"])
+        .arg(&linked_path)
+        .envs(git_env())
+        .status()
+        .expect("git worktree add")
+        .success());
+    Repository::discover(Some(&linked_path), &RepositoryOptions::empty())
+        .expect("discover git worktree");
+    let admin = fs::read_to_string(linked_path.join(".git"))
+        .expect("gitfile")
+        .trim()
+        .strip_prefix("gitdir: ")
+        .expect("gitdir prefix")
+        .to_owned();
+    Repository::open(
+        admin.as_ref(),
+        &RepositoryOptions::empty().with_work_tree(&linked_path),
+    )
+    .expect("open git worktree admin");
+
+    if git_supports_reftable_fsck() {
+        let reftable = td.path().join("git-reftable");
+        fs::create_dir_all(&reftable).expect("git-reftable dir");
+        assert!(Command::new("git")
+            .current_dir(&reftable)
+            .args(["init", "-q", "--ref-format=reftable"])
+            .envs(git_env())
+            .status()
+            .expect("git init reftable")
+            .success());
+        let rt_git = reftable.join(".git");
+        Repository::open(
+            &rt_git,
+            &RepositoryOptions::empty().with_work_tree(&reftable),
+        )
+        .expect("open git reftable");
+        Repository::discover(Some(&reftable), &RepositoryOptions::empty())
+            .expect("discover git reftable");
+    }
+}
+
+#[test]
+fn grit_init_passes_git_fsck_and_status() {
+    let td = TempDir::new().expect("tempdir");
+    let root = td.path().join("grit-init");
+    let (repo, _) = Repository::init(
+        &root,
+        &InitOptions::new().with_initial_branch("main".to_owned()),
+    )
+    .expect("grit init");
+    git_fsck_ok(repo.git_dir());
+    let status = Command::new("git")
+        .current_dir(&root)
+        .args(["-C", &root.to_string_lossy()])
+        .arg("status")
+        .env("GIT_DIR", repo.git_dir())
+        .envs(git_env())
+        .output()
+        .expect("git status");
+    assert!(
+        status.status.success(),
+        "git status failed: {}",
+        String::from_utf8_lossy(&status.stderr)
     );
 }

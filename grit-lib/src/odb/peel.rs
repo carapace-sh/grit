@@ -4,11 +4,13 @@
 //! negotiation, bundles, bitmaps, commit-graph tips, `packed-refs` and `ls-remote` peel lines,
 //! `--with-tree`) shares these [`Odb`] methods instead of its own tag loop.
 
+use crate::error::ObjectError;
 use std::collections::HashSet;
 
 use crate::error::{Error, Result};
-use crate::objects::{tag_object_line_oid, CommitRef, ObjectId, ObjectKind};
+use crate::objects::{tag_object_line_oid, CommitRef, Object, ObjectId, ObjectKind};
 
+use super::store::ObjectStore;
 use super::Odb;
 
 impl Odb {
@@ -29,8 +31,8 @@ impl Odb {
     ///
     /// # Errors
     ///
-    /// - [`Error::ObjectNotFound`] when `oid` or any object the chain names is missing.
-    /// - [`Error::CorruptObject`] when a tag has no valid `object` header, or the chain names
+    /// - [`crate::error::ObjectError::NotFound`] when `oid` or any object the chain names is missing.
+    /// - [`crate::error::ObjectError::Corrupt`] when a tag has no valid `object` header, or the chain names
     ///   a tag it already passed through. Chains of any length are followed; content-addressed
     ///   ids make a cycle impossible in a real repository, but a pluggable store can serve one.
     /// - Any other error [`Self::read`] / [`Self::read_info`] reports for the objects read.
@@ -43,13 +45,15 @@ impl Odb {
                 return Ok((current, kind));
             }
             if !visited.get_or_insert_with(HashSet::new).insert(current) {
-                return Err(Error::CorruptObject(format!(
-                    "tag chain from {oid} loops back to {current}"
-                )));
+                return Err(Error::Object(ObjectError::Corrupt {
+                    detail: format!("tag chain from {oid} loops back to {current}"),
+                }));
             }
             let tag = self.read(&current)?;
             current = tag_object_line_oid(&tag.data).ok_or_else(|| {
-                Error::CorruptObject(format!("tag {current} has no valid object header"))
+                Error::Object(ObjectError::Corrupt {
+                    detail: format!("tag {current} has no valid object header"),
+                })
             })?;
         }
     }
@@ -83,8 +87,8 @@ impl Odb {
     ///
     /// # Errors
     ///
-    /// - [`Error::ObjectNotFound`] when `oid` or an intermediate tag is missing.
-    /// - [`Error::CorruptObject`] when a tag has no valid `object` header, a `type tag` header
+    /// - [`crate::error::ObjectError::NotFound`] when `oid` or an intermediate tag is missing.
+    /// - [`crate::error::ObjectError::Corrupt`] when a tag has no valid `object` header, a `type tag` header
     ///   names an object that is not a tag, or the chain loops.
     pub(crate) fn peel_tag_target(&self, oid: ObjectId) -> Result<Option<ObjectId>> {
         self.peel_tag_target_from(oid, false)
@@ -112,39 +116,76 @@ impl Odb {
         if self.read_info(&oid)?.kind != ObjectKind::Tag {
             return Ok(None);
         }
-        let mut current = oid;
-        let mut visited: Option<HashSet<ObjectId>> = None;
-        loop {
-            if stored_only && !self.contains(&current)? {
+        follow_tag_chain(oid, |id| {
+            if stored_only && !self.contains(id)? {
                 return Ok(None);
             }
-            let tag = self.read(&current)?;
-            if tag.kind != ObjectKind::Tag {
-                return Err(Error::CorruptObject(format!(
-                    "{current} is named as a tag but is a {}",
-                    tag.kind
-                )));
-            }
-            let (target, names_tag) = tag_target_header(&tag.data);
-            let target = target.ok_or_else(|| {
-                Error::CorruptObject(format!("tag {current} has no valid object header"))
-            })?;
-            if !names_tag {
-                return Ok(Some(target));
-            }
-            if !visited.get_or_insert_with(HashSet::new).insert(current) {
-                return Err(Error::CorruptObject(format!(
-                    "tag chain from {oid} loops back to {current}"
-                )));
-            }
-            current = target;
-        }
+            self.read(id).map(Some)
+        })
     }
+}
 
+/// [`Odb::peel_stored_tag_target`] over a bare [`ObjectStore`]: the `packed-refs` peel value
+/// of `oid`, reading only objects `store` holds.
+///
+/// Returns `None` when `oid` is not a tag stored in `store`, or when an intermediate tag of
+/// the chain is missing. The final target comes from the last tag's header and may be missing.
+///
+/// # Errors
+///
+/// Backend failures from `store`, and [`grit_lib::error::ObjectError::Corrupt`] for the malformed chains
+/// [`Odb::peel_tag_target`] rejects.
+pub(crate) fn peel_stored_tag_target_in(
+    store: &dyn ObjectStore,
+    oid: ObjectId,
+) -> Result<Option<ObjectId>> {
+    if store.read_info(&oid)?.map(|info| info.kind) != Some(ObjectKind::Tag) {
+        return Ok(None);
+    }
+    follow_tag_chain(oid, |id| store.read(id))
+}
+
+/// Walk the annotated tag chain from `oid` (known to be a tag) to its first non-tag target,
+/// deciding from each tag's `type` header whether to continue. `read` returns `None` for a
+/// tag that is not available, which ends the walk with `Ok(None)`.
+fn follow_tag_chain(
+    oid: ObjectId,
+    mut read: impl FnMut(&ObjectId) -> Result<Option<Object>>,
+) -> Result<Option<ObjectId>> {
+    let mut current = oid;
+    let mut visited: Option<HashSet<ObjectId>> = None;
+    loop {
+        let Some(tag) = read(&current)? else {
+            return Ok(None);
+        };
+        if tag.kind != ObjectKind::Tag {
+            return Err(Error::Object(ObjectError::Corrupt {
+                detail: format!("{current} is named as a tag but is a {}", tag.kind),
+            }));
+        }
+        let (target, names_tag) = tag_target_header(&tag.data);
+        let target = target.ok_or_else(|| {
+            Error::Object(ObjectError::Corrupt {
+                detail: format!("tag {current} has no valid object header"),
+            })
+        })?;
+        if !names_tag {
+            return Ok(Some(target));
+        }
+        if !visited.get_or_insert_with(HashSet::new).insert(current) {
+            return Err(Error::Object(ObjectError::Corrupt {
+                detail: format!("tag chain from {oid} loops back to {current}"),
+            }));
+        }
+        current = target;
+    }
+}
+
+impl Odb {
     /// Peel `oid` through annotated tags and a commit to a tree.
     ///
     /// Returns `None` when the chain ends at a blob. Errors are those of [`Self::peel_tags`],
-    /// plus [`Error::CorruptObject`] for a commit without a valid `tree` header.
+    /// plus [`crate::error::ObjectError::Corrupt`] for a commit without a valid `tree` header.
     pub(crate) fn peel_to_tree(&self, oid: ObjectId) -> Result<Option<ObjectId>> {
         match self.peel_tags(oid)? {
             (tree, ObjectKind::Tree) => Ok(Some(tree)),
@@ -242,12 +283,12 @@ mod tests {
         let missing = ObjectId::from_hex("1111111111111111111111111111111111111111").unwrap();
         assert!(matches!(
             odb.peel_tags(missing),
-            Err(Error::ObjectNotFound(_))
+            Err(Error::Object(ObjectError::NotFound { .. }))
         ));
         let dangling = tag(&odb, missing, "commit", "dangling");
         assert!(matches!(
             odb.peel_to_commit(dangling),
-            Err(Error::ObjectNotFound(_))
+            Err(Error::Object(ObjectError::NotFound { .. }))
         ));
     }
 
@@ -267,7 +308,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let odb = Odb::new(dir.path());
         let bad = odb.write(ObjectKind::Tag, b"not a tag\n").unwrap();
-        assert!(matches!(odb.peel_tags(bad), Err(Error::CorruptObject(_))));
+        assert!(matches!(
+            odb.peel_tags(bad),
+            Err(Error::Object(ObjectError::Corrupt { .. }))
+        ));
     }
 
     #[test]
@@ -303,11 +347,11 @@ mod tests {
         let dangling_outer = tag(&odb, missing, "tag", "dangling-outer");
         assert!(matches!(
             odb.peel_tag_target(dangling_outer),
-            Err(Error::ObjectNotFound(_))
+            Err(Error::Object(ObjectError::NotFound { .. }))
         ));
         assert!(matches!(
             odb.peel_tag_target(missing),
-            Err(Error::ObjectNotFound(_))
+            Err(Error::Object(ObjectError::NotFound { .. }))
         ));
     }
 
@@ -341,7 +385,7 @@ mod tests {
         let lying = tag(&odb, c, "tag", "lying");
         assert!(matches!(
             odb.peel_tag_target(lying),
-            Err(Error::CorruptObject(_))
+            Err(Error::Object(ObjectError::Corrupt { .. }))
         ));
     }
 
@@ -355,13 +399,10 @@ mod tests {
             store.insert_object(from, ObjectKind::Tag, Arc::from(body.into_bytes()));
         }
         let dir = TempDir::new().unwrap();
-        let odb = OdbBuilder::files(dir.path())
-            .primary(store)
-            .alternates(false)
-            .build();
+        let odb = OdbBuilder::new().build(dir.path(), Some(store));
         assert!(matches!(
             odb.peel_tag_target(a),
-            Err(Error::CorruptObject(_))
+            Err(Error::Object(ObjectError::Corrupt { .. }))
         ));
     }
 
@@ -395,7 +436,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             odb.peel_to_tree(bad),
-            Err(Error::CorruptObject(_))
+            Err(Error::Object(ObjectError::Corrupt { .. }))
         ));
     }
 
@@ -409,10 +450,10 @@ mod tests {
             store.insert_object(from, ObjectKind::Tag, Arc::from(body.into_bytes()));
         }
         let dir = TempDir::new().unwrap();
-        let odb = OdbBuilder::files(dir.path())
-            .primary(store)
-            .alternates(false)
-            .build();
-        assert!(matches!(odb.peel_tags(a), Err(Error::CorruptObject(_))));
+        let odb = OdbBuilder::new().build(dir.path(), Some(store));
+        assert!(matches!(
+            odb.peel_tags(a),
+            Err(Error::Object(ObjectError::Corrupt { .. }))
+        ));
     }
 }

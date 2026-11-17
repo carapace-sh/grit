@@ -61,22 +61,32 @@ fn write_index_file(index: &Index, path: &Path) {
     index.write(path).expect("write index fixture");
 }
 
-fn ieot_write_config(base: &Path) -> ConfigSet {
+/// Bare repository whose config asks for EOIE/IEOT extensions, used to write IEOT fixtures.
+fn ieot_write_repo(base: &Path) -> Repository {
     let git_dir = base.join("ieot-config.git");
-    std::fs::create_dir_all(&git_dir).expect("ieot config dir");
+    let (repo, _) = Repository::init(&git_dir, &InitOptions::new().with_bare(true))
+        .expect("init ieot config repo");
     std::fs::write(
         git_dir.join("config"),
-        "[index]\n\tthreads = 4\n\trecordOffsetTable = true\n\trecordEndOfIndexEntries = true\n",
+        "[core]\n\trepositoryformatversion = 0\n\tbare = true\n[index]\n\tthreads = 4\n\trecordOffsetTable = true\n\trecordEndOfIndexEntries = true\n",
     )
     .expect("ieot config");
-    ConfigSet::load(&Environment::empty(), Some(&git_dir), true).expect("load ieot config")
+    drop(repo);
+    Repository::open(
+        &git_dir,
+        &grit_lib::config::environment::RepositoryOptions::empty(),
+    )
+    .expect("open ieot config repo")
+    .with_thread_policy(ThreadPolicy::with_threads_override(Some(4)))
 }
 
-fn write_index_file_ieot(index: &Index, path: &Path, cfg: &ConfigSet) {
-    let policy = ThreadPolicy::with_threads_override(Some(4));
+fn write_index_file_ieot(index: &Index, path: &Path, repo: &Repository) {
     let mut index = index.clone();
-    index
-        .write_with_config_and_policy(path, cfg, policy)
+    repo.index()
+        .write(
+            &mut index,
+            &grit_lib::index::IndexWriteOptions::default().with_path(path),
+        )
         .expect("write ieot index fixture");
 }
 
@@ -136,18 +146,18 @@ fn build_status_nested_l_fixtures(base: &Path) -> (Repository, Repository) {
 
     let nested_root = base.join("status-nested-L");
     let plain_root = base.join("status-plain-L");
-    let nested_repo = Repository::init(
+    let (nested_repo, _) = Repository::init(
         &nested_root,
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
-            .with_ref_storage(grit_lib::RefStorageFormat::Files),
+            .with_ref_storage(grit_lib::refs::ref_storage::RefStorageFormat::Files),
     )
     .expect("nested status repo");
-    let plain_repo = Repository::init(
+    let (plain_repo, _) = Repository::init(
         &plain_root,
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
-            .with_ref_storage(grit_lib::RefStorageFormat::Files),
+            .with_ref_storage(grit_lib::refs::ref_storage::RefStorageFormat::Files),
     )
     .expect("plain status repo");
     populate(nested_repo.work_tree().expect("wt"), true);
@@ -211,8 +221,6 @@ pub struct WorktreeBenchFixtures {
     pub attr_stack: ParsedGitAttributes,
     pub attr_paths: Vec<String>,
     pub index_write_scratch: PathBuf,
-    /// Repository with 10k tracked files on disk for status/staging scan benchmarks.
-    pub scan_repo_10k: Repository,
     /// Repository with 100k tracked files for add/index staging benchmarks.
     pub scan_repo_100k: Repository,
     /// Repository with one `.gitattributes` per directory (L-sized status fixture).
@@ -246,9 +254,9 @@ impl WorktreeBenchFixtures {
         write_index_file(&index_v4_10k, &index_v4_10k_path);
         write_index_file(&index_v4_100k, &index_v4_100k_path);
 
-        let ieot_cfg = ieot_write_config(base);
+        let ieot_repo = ieot_write_repo(base);
         let index_v4_100k_ieot_path = index_dir.join("index-v4-100k-ieot");
-        write_index_file_ieot(&index_v4_100k, &index_v4_100k_ieot_path, &ieot_cfg);
+        write_index_file_ieot(&index_v4_100k, &index_v4_100k_ieot_path, &ieot_repo);
 
         let index_v4_1m_ieot_path = std::env::var("GRIT_BENCH_INDEX_1M")
             .ok()
@@ -256,7 +264,7 @@ impl WorktreeBenchFixtures {
             .map(|_| {
                 let index_v4_1m = build_index(1_000_000, 4);
                 let path = index_dir.join("index-v4-1m-ieot");
-                write_index_file_ieot(&index_v4_1m, &path, &ieot_cfg);
+                write_index_file_ieot(&index_v4_1m, &path, &ieot_repo);
                 path
             });
 
@@ -301,11 +309,11 @@ impl WorktreeBenchFixtures {
         };
 
         let ignore_root = base.join("ignore-repo");
-        let ignore_repo = Repository::init(
+        let (ignore_repo, _) = Repository::init(
             &ignore_root,
             &InitOptions::new()
                 .with_initial_branch("main".to_owned())
-                .with_ref_storage(grit_lib::RefStorageFormat::Files),
+                .with_ref_storage(grit_lib::refs::ref_storage::RefStorageFormat::Files),
         )
         .expect("ignore repo init");
         let wt = ignore_repo.work_tree().expect("work tree");
@@ -323,11 +331,11 @@ impl WorktreeBenchFixtures {
         let ignore_paths = generate_probe_paths(100_000);
 
         let attr_root = base.join("attr-repo");
-        let attr_repo = Repository::init(
+        let (attr_repo, _) = Repository::init(
             &attr_root,
             &InitOptions::new()
                 .with_initial_branch("main".to_owned())
-                .with_ref_storage(grit_lib::RefStorageFormat::Files),
+                .with_ref_storage(grit_lib::refs::ref_storage::RefStorageFormat::Files),
         )
         .expect("attr repo init");
         let attr_wt = attr_repo.work_tree().expect("work tree");
@@ -343,44 +351,12 @@ impl WorktreeBenchFixtures {
 
         let index_write_scratch = index_dir.join("write-scratch");
 
-        let scan_root = base.join("scan-10k");
-        let scan_repo = Repository::init(
-            &scan_root,
-            &InitOptions::new()
-                .with_initial_branch("main".to_owned())
-                .with_ref_storage(grit_lib::RefStorageFormat::Files),
-        )
-        .expect("scan repo init");
-        let scan_wt = scan_repo.work_tree().expect("work tree");
-        let mut scan_index = Index::empty(2);
-        for i in 0..10_000 {
-            let dir = format!("d{:04}", i / 100);
-            let rel = format!("{dir}/f{:05}.txt", i % 100);
-            let path = scan_wt.join(&rel);
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).expect("scan subdir");
-            }
-            let bytes = format!("payload {i}\n");
-            std::fs::write(&path, &bytes).expect("scan blob");
-            let oid = scan_repo
-                .odb()
-                .write(grit_lib::objects::ObjectKind::Blob, bytes.as_bytes())
-                .expect("hash scan blob");
-            let meta = std::fs::symlink_metadata(&path).expect("stat scan file");
-            let entry =
-                grit_lib::index::entry_from_metadata(&meta, rel.as_bytes(), oid, MODE_REGULAR);
-            scan_index.add_or_replace(entry);
-        }
-        scan_index
-            .write(&scan_repo.index_handle().path())
-            .expect("write scan index");
-
         let scan_100k_root = base.join("scan-100k");
-        let scan_repo_100k = Repository::init(
+        let (scan_repo_100k, _) = Repository::init(
             &scan_100k_root,
             &InitOptions::new()
                 .with_initial_branch("main".to_owned())
-                .with_ref_storage(grit_lib::RefStorageFormat::Files),
+                .with_ref_storage(grit_lib::refs::ref_storage::RefStorageFormat::Files),
         )
         .expect("scan 100k repo init");
         let scan_100k_wt = scan_repo_100k.work_tree().expect("work tree");
@@ -404,17 +380,17 @@ impl WorktreeBenchFixtures {
             scan_100k_index.add_or_replace(entry);
         }
         scan_100k_index
-            .write(&scan_repo_100k.index_handle().path())
+            .write(&scan_repo_100k.index().path())
             .expect("write scan 100k index");
 
         let (status_nested_attr_repo, status_plain_l_repo) = build_status_nested_l_fixtures(base);
 
         let untracked_root = base.join("untracked-walk-100k");
-        let untracked_walk_repo = Repository::init(
+        let (untracked_walk_repo, _) = Repository::init(
             &untracked_root,
             &InitOptions::new()
                 .with_initial_branch("main".to_owned())
-                .with_ref_storage(grit_lib::RefStorageFormat::Files),
+                .with_ref_storage(grit_lib::refs::ref_storage::RefStorageFormat::Files),
         )
         .expect("untracked walk repo init");
         let untracked_wt = untracked_walk_repo.work_tree().expect("work tree");
@@ -455,7 +431,6 @@ impl WorktreeBenchFixtures {
             attr_stack,
             attr_paths,
             index_write_scratch,
-            scan_repo_10k: scan_repo,
             scan_repo_100k,
             status_nested_attr_repo,
             status_plain_l_repo,
@@ -472,7 +447,7 @@ impl WorktreeBenchFixtures {
 
     /// Load the layered config fixture (global + includes + local).
     pub fn load_config_cascade(&self) -> ConfigSet {
-        ConfigSet::load_with_options(
+        ConfigSet::load(
             &Environment::capture_process(),
             Some(&self.config_git_dir),
             &self.config_load_opts,

@@ -8,9 +8,9 @@ use std::sync::OnceLock;
 use grit_lib::objects::hash::Parallelism;
 use grit_lib::objects::index_pack::{install_pack_bytes, IngestPackOptions};
 use grit_lib::objects::odb::Odb;
-use grit_lib::objects::pack::write_v2_pack_index_with_trailer;
-use grit_lib::objects::unpack_objects::pack_index_records_with_threads;
+use grit_lib::objects::unpack_objects::pack_index_records;
 use grit_lib::objects::HashAlgo;
+use grit_lib::test_support::objects_pack::write_v2_pack_index_from_trailer;
 
 const GIT_ENV: &[(&str, &str)] = &[
     ("GIT_CONFIG_GLOBAL", "/dev/null"),
@@ -227,7 +227,7 @@ fn git_index_pack_idx(pack: &[u8], hash_algo: HashAlgo, threads: usize) -> (Vec<
 
 fn grit_index_bytes(pack: &[u8], odb: &Odb, threads: usize) -> Vec<u8> {
     let parallelism = Parallelism::resolve(Some(threads));
-    let records = pack_index_records_with_threads(pack, odb, parallelism).expect("grit index");
+    let records = pack_index_records(pack, odb, parallelism).expect("grit index");
     let hb = odb.hash_algo().len();
     let trailer = &pack[pack.len() - hb..];
     let entries: Vec<_> = records
@@ -236,7 +236,7 @@ fn grit_index_bytes(pack: &[u8], odb: &Odb, threads: usize) -> Vec<u8> {
         .collect();
     let dir = tempfile::tempdir().expect("idx scratch");
     let idx_path = dir.path().join("grit.idx");
-    write_v2_pack_index_with_trailer(&idx_path, &entries, trailer, hb, Some(threads))
+    write_v2_pack_index_from_trailer(&idx_path, &entries, trailer, hb, Some(threads))
         .expect("write idx");
     std::fs::read(&idx_path).expect("read grit idx")
 }
@@ -301,8 +301,8 @@ fn assert_idx_matches_git(pack: &[u8], hash_algo: HashAlgo, threads: usize) {
 #[test]
 fn parallel_index_pack_matches_git_sha1_threads_1_and_8() {
     let fx = shared_fixture_sha1();
-    assert_idx_matches_git(&fx.pack, fx.hash_algo, 1);
-    assert_idx_matches_git(&fx.pack, fx.hash_algo, 8);
+    assert_idx_matches_git(fx.pack, fx.hash_algo, 1);
+    assert_idx_matches_git(fx.pack, fx.hash_algo, 8);
 }
 
 #[test]
@@ -311,8 +311,8 @@ fn parallel_index_pack_matches_git_sha256_threads_1_and_8() {
         eprintln!("skip: sha256 object format unavailable");
         return;
     };
-    assert_idx_matches_git(&fx.pack, fx.hash_algo, 1);
-    assert_idx_matches_git(&fx.pack, fx.hash_algo, 8);
+    assert_idx_matches_git(fx.pack, fx.hash_algo, 1);
+    assert_idx_matches_git(fx.pack, fx.hash_algo, 8);
 }
 
 /// Deep OFS + REF delta chain: `.idx` / `.rev` must match across thread counts.
@@ -371,7 +371,8 @@ fn idx_rev_identical_threads_1_2_4_8_deep_delta_chain() {
         let scratch = tempfile::tempdir().expect("idx");
         let idx_path = scratch.path().join("t.idx");
         std::fs::write(&idx_path, &grit_idx).expect("write idx");
-        let index = grit_lib::objects::pack::read_pack_index(&idx_path).expect("parse");
+        let index =
+            grit_lib::test_support::objects_pack::read_pack_index(&idx_path).expect("parse");
         let offsets: Vec<u64> = index.iter().map(|e| e.offset().expect("offset")).collect();
         let grit_rev =
             build_pack_rev_bytes_from_index_order_offsets_and_checksum(&offsets, trailer);

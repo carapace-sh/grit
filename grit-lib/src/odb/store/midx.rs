@@ -3,6 +3,7 @@
 //! OID membership and prefix search use the prepared MIDX chain; object bytes are read at the
 //! layer-resolved pack offset via [`PreparedMidxChain::try_read_object`].
 
+use crate::error::ObjectError;
 use std::collections::HashSet;
 use std::io::Cursor;
 use std::ops::ControlFlow;
@@ -85,12 +86,6 @@ impl MidxObjects {
             .unwrap_or(MidxObjectsStatus::Unusable)
     }
 
-    /// Whether `core.multiPackIndex` was enabled when this store was built.
-    #[must_use]
-    pub fn multi_pack_index_enabled(&self) -> bool {
-        self.multi_pack_index
-    }
-
     /// Pack index basenames covered by the active MIDX chain (empty when inactive).
     ///
     /// Callers skip these indexes in [`PackedObjects`] so MIDX-covered OIDs are not scanned twice.
@@ -120,7 +115,7 @@ impl MidxObjects {
             prepared_midx_chain_strict(store.objects_dir())
         }) {
             Ok(chain) => Ok(chain),
-            Err(Error::Midx(_)) => Ok(None),
+            Err(Error::Object(ObjectError::Midx(_))) => Ok(None),
             Err(err) => Err(err),
         }
     }
@@ -168,7 +163,9 @@ impl ObjectStore for MidxObjects {
             return Ok(None);
         };
         let size = u64::try_from(obj.data.len()).map_err(|_| {
-            Error::CorruptObject(format!("object size overflow for {}", oid.to_hex()))
+            Error::Object(ObjectError::Corrupt {
+                detail: format!("object size overflow for {}", oid.to_hex()),
+            })
         })?;
         Ok(Some(ObjectStream {
             kind: info.kind,
@@ -217,9 +214,9 @@ impl ObjectStore for MidxObjects {
 fn classify_midx_status(objects_dir: &std::path::Path) -> Result<MidxObjectsStatus> {
     match prepared_midx_chain_strict(objects_dir) {
         Ok(Some(_)) => Ok(MidxObjectsStatus::Active),
-        Ok(None) | Err(Error::Midx(_)) | Err(Error::CorruptObject(_)) => {
-            Ok(MidxObjectsStatus::Unusable)
-        }
+        Ok(None)
+        | Err(Error::Object(ObjectError::Midx(_)))
+        | Err(Error::Object(ObjectError::Corrupt { .. })) => Ok(MidxObjectsStatus::Unusable),
         Err(err) => Err(err),
     }
 }

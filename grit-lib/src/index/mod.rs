@@ -6,18 +6,23 @@
 //! use grit_lib::repo::{InitOptions, Repository};
 //! # fn main() -> grit_lib::error::Result<()> {
 //! let dir = tempfile::tempdir()?;
-//! let _repo = Repository::init(dir.path(), &InitOptions::default())?;
-//! let _ = _repo.index_handle().load()?;
+//! let (_repo, _) = Repository::init(dir.path(), &InitOptions::default())?;
+//! let _ = _repo.index().load(&grit_lib::index::IndexLoadOptions::default())?;
 //!
 //! # Ok(())
 //! # }
 //! ```
 mod core;
-pub mod handle;
+pub mod error;
+pub(crate) mod handle;
 mod mode_policy;
 
 pub use core::*;
-pub use handle::IndexHandle;
+pub use error::{IndexChmodReason, IndexCorrupt, IndexCorruptReason, IndexError};
+pub use handle::{IndexFile, IndexLoadOptions, IndexWriteOptions, SparseIndexLoad};
+
+/// Legacy name for [`IndexFile`].
+pub type IndexHandle<'repo> = IndexFile<'repo>;
 pub use mode_policy::WorktreeModePolicy;
 
 pub mod sparse_checkout {

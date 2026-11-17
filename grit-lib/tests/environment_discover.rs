@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use grit_lib::config::environment::{Environment, RepositoryOptions};
-use grit_lib::repo::Repository;
+use grit_lib::repo::{Repository, RepositoryError};
 use tempfile::TempDir;
 
 #[test]
@@ -36,7 +36,11 @@ fn cloned_environment_config_overrides_match_git() {
         let options = RepositoryOptions::with_environment(env);
         let repo = Repository::discover(None, &options.clone()).expect("discover");
         assert_eq!(
-            repo.config().expect("config").get("user.name").as_deref(),
+            repo.config()
+                .snapshot()
+                .expect("config")
+                .get("user.name")
+                .as_deref(),
             Some(expected)
         );
         assert_eq!(
@@ -81,8 +85,11 @@ fn discover_with_global_config_from_environment_not_process() {
 
     let repo = Repository::discover(Some(&repo_root), &RepositoryOptions::with_environment(env))
         .expect("discover");
-    let cfg = repo.config().expect("config");
-    assert_eq!(cfg.get("user.name").as_deref(), Some("FromEnvGlobal"));
+    let cfg = repo.config().snapshot().expect("config");
+    assert_eq!(
+        cfg.get("user.name").unwrap().as_deref(),
+        Some("FromEnvGlobal")
+    );
 
     assert!(
         std::env::var("GIT_CONFIG_GLOBAL").is_err(),
@@ -149,7 +156,10 @@ fn ceiling_directories_stop_discovery() {
 
     let err = Repository::discover(Some(&child), &RepositoryOptions::with_environment(env))
         .expect_err("ceiling blocks parent .git");
-    assert!(matches!(err, grit_lib::error::Error::NotARepository(_)));
+    assert!(matches!(
+        err,
+        grit_lib::error::Error::Repository(RepositoryError::NotARepository(_))
+    ));
 }
 
 #[test]
@@ -237,8 +247,11 @@ fn relative_global_config_resolved_from_environment_cwd() {
         &RepositoryOptions::with_environment(env.clone()),
     )
     .expect("discover");
-    let cfg = repo.config().expect("config");
-    assert_eq!(cfg.get("user.name").as_deref(), Some("RelativeGlobal"));
+    let cfg = repo.config().snapshot().expect("config");
+    assert_eq!(
+        cfg.get("user.name").unwrap().as_deref(),
+        Some("RelativeGlobal")
+    );
 
     let git_out = Command::new("git")
         .args(["config", "user.name"])
@@ -293,8 +306,27 @@ fn safe_directory_from_environment_global_config() {
     );
     assert!(std::env::var("GIT_TEST_ASSUME_DIFFERENT_OWNER").is_err());
 
-    let mut options = RepositoryOptions::with_environment(env);
-    options.test_assume_different_owner = true;
+    use grit_lib::ownership_check::{OwnershipCheck, OwnershipContext, OwnershipStatus};
+    use std::path::Path;
+    use std::sync::Arc;
+
+    #[derive(Default)]
+    struct TreatAllForeign;
+    impl OwnershipCheck for TreatAllForeign {
+        fn always_apply_safe_directory(&self) -> bool {
+            true
+        }
+        fn status(
+            &self,
+            _path: &Path,
+            _context: &OwnershipContext,
+        ) -> Result<OwnershipStatus, grit_lib::ownership_check::OwnershipError> {
+            Ok(OwnershipStatus::NotOwned)
+        }
+    }
+
+    let options =
+        RepositoryOptions::with_environment(env).with_ownership_check(Arc::new(TreatAllForeign));
     let repo = Repository::discover(Some(&repo_root), &options)
         .expect("discover must honor safe.directory from Environment global config");
     repo.enforce_safe_directory()

@@ -1,13 +1,18 @@
 //! Upload-pack protocol handler (server side of fetch/clone).
 //!
-//! Serves fetch and clone over smart HTTP by calling [`grit_lib::remote::serve::upload_pack`]
+//! Serves fetch and clone over smart HTTP by calling [`grit_lib::remote::serve::UploadPack`]
 //! in-process.
 
+use std::io::Read;
 use std::path::Path;
 
 use grit_lib::config::environment::RepositoryOptions;
 
-use crate::{run_upload_pack, run_upload_pack_to, Extensions, Result};
+use crate::{
+    run_upload_pack, run_upload_pack_to, run_upload_pack_with_session, Extensions, Result,
+    ServeSession,
+};
+use grit_lib::remote::serve::UploadOutcome;
 
 /// Run upload-pack ref advertisement (for `GET /info/refs?service=git-upload-pack`).
 ///
@@ -60,6 +65,32 @@ pub fn advertise_refs_with(
     )
 }
 
+/// Like [`advertise_refs_with`], but writes pkt-lines to `output` as they are
+/// produced instead of buffering the full advertisement in memory.
+///
+/// # Errors
+///
+/// Same as [`advertise_refs_with`].
+pub fn advertise_refs_to(
+    repo_path: &Path,
+    protocol_version: Option<u8>,
+    repository_options: &RepositoryOptions,
+    extensions: &Extensions,
+    output: &mut dyn std::io::Write,
+) -> Result<()> {
+    let mut empty: &[u8] = &[];
+    run_upload_pack_to(
+        repo_path,
+        protocol_version,
+        false,
+        true,
+        &mut empty,
+        repository_options,
+        extensions,
+        output,
+    )
+}
+
 /// Run a stateless upload-pack RPC exchange (for `POST /git-upload-pack`).
 ///
 /// Takes the request body as input and returns the response body.
@@ -74,15 +105,49 @@ pub fn stateless_rpc(
     protocol_version: Option<u8>,
     repository_options: &RepositoryOptions,
 ) -> Result<Vec<u8>> {
-    run_upload_pack(
+    stateless_rpc_from_reader(
         repo_path,
+        &mut &*request_body,
         protocol_version,
-        true,
-        false,
+        repository_options,
+    )
+}
+
+/// Run a stateless upload-pack RPC exchange, reading the request body from a
+/// stream.
+///
+/// Fetch and clone POST bodies can list one `want` line per ref, so the decoded
+/// request may be much larger than the HTTP body when it is gzip-compressed.
+/// The caller should apply its own decoded-size limit while reading; this
+/// function consumes the body incrementally and never buffers it whole.
+///
+/// # Parameters
+///
+/// - `repo_path`: the repository to fetch from.
+/// - `request_body`: the decoded request body (wants, haves, capabilities).
+/// - `protocol_version`: the wire version from the `Git-Protocol` header.
+/// - `repository_options`: environment used to load global/system config.
+///
+/// # Errors
+///
+/// Fails when the repository cannot be opened, the request cannot be read, or
+/// the exchange fails before any response is produced.
+pub fn stateless_rpc_from_reader(
+    repo_path: &Path,
+    request_body: &mut dyn Read,
+    protocol_version: Option<u8>,
+    repository_options: &RepositoryOptions,
+) -> Result<Vec<u8>> {
+    let mut output = Vec::new();
+    stateless_rpc_to_reader(
+        repo_path,
         request_body,
+        protocol_version,
         repository_options,
         &Extensions::default(),
-    )
+        &mut output,
+    )?;
+    Ok(output)
 }
 
 /// [`stateless_rpc`] with [`Extensions`], so `command=bundle-uri` is answered.
@@ -97,15 +162,16 @@ pub fn stateless_rpc_with(
     repository_options: &RepositoryOptions,
     extensions: &Extensions,
 ) -> Result<Vec<u8>> {
-    run_upload_pack(
+    let mut output = Vec::new();
+    stateless_rpc_to_reader(
         repo_path,
+        &mut &*request_body,
         protocol_version,
-        true,
-        false,
-        request_body,
         repository_options,
         extensions,
-    )
+        &mut output,
+    )?;
+    Ok(output)
 }
 
 /// Run a stateless upload-pack RPC exchange (for `POST /git-upload-pack`),
@@ -136,7 +202,56 @@ pub fn stateless_rpc_to(
     extensions: &Extensions,
     output: &mut dyn std::io::Write,
 ) -> Result<()> {
-    run_upload_pack_to(
+    stateless_rpc_to_reader(
+        repo_path,
+        &mut &*request_body,
+        protocol_version,
+        repository_options,
+        extensions,
+        output,
+    )
+}
+
+/// [`stateless_rpc_to`] with a streaming request body.
+///
+/// # Errors
+///
+/// Same as [`stateless_rpc_to`].
+pub fn stateless_rpc_to_reader(
+    repo_path: &Path,
+    request_body: &mut dyn Read,
+    protocol_version: Option<u8>,
+    repository_options: &RepositoryOptions,
+    extensions: &Extensions,
+    output: &mut dyn std::io::Write,
+) -> Result<()> {
+    stateless_rpc_to_reader_with_session(
+        repo_path,
+        request_body,
+        protocol_version,
+        repository_options,
+        extensions,
+        output,
+        &ServeSession::none(),
+    )
+    .map(|_| ())
+}
+
+/// Like [`stateless_rpc_to_reader`], returning [`UploadOutcome`] when the exchange finishes.
+///
+/// # Errors
+///
+/// Same as [`stateless_rpc_to_reader`].
+pub fn stateless_rpc_to_reader_with_session(
+    repo_path: &Path,
+    request_body: &mut dyn Read,
+    protocol_version: Option<u8>,
+    repository_options: &RepositoryOptions,
+    extensions: &Extensions,
+    output: &mut dyn std::io::Write,
+    session: &ServeSession,
+) -> Result<UploadOutcome> {
+    run_upload_pack_with_session(
         repo_path,
         protocol_version,
         true,
@@ -145,5 +260,6 @@ pub fn stateless_rpc_to(
         repository_options,
         extensions,
         output,
+        session,
     )
 }

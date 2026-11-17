@@ -8,6 +8,9 @@
 //! `pack-abc.pack`) match Git's promisor packs: objects in those packs are treated as
 //! promised by the remote for `fsck` and `rev-list --exclude-promisor-objects`.
 
+#![allow(dead_code)]
+
+use crate::error::ObjectError;
 use std::collections::{HashSet, VecDeque};
 use std::fs;
 use std::path::Path;
@@ -65,8 +68,8 @@ pub fn write_promisor_marker(git_dir: &Path, oids: &HashSet<ObjectId>) -> Result
 /// `repo_has_promisor_remote`): `extensions.partialclone` is set or some
 /// `remote.*.promisor=true`.
 #[must_use]
-pub fn repo_treats_promisor_packs(_git_dir: &Path, config: &ConfigSet) -> bool {
-    if config.get("extensions.partialclone").is_some() {
+pub fn repo_treats_promisor_packs(config: &ConfigSet) -> bool {
+    if config.value("extensions.partialclone").is_some() {
         return true;
     }
     config
@@ -78,7 +81,12 @@ pub fn repo_treats_promisor_packs(_git_dir: &Path, config: &ConfigSet) -> bool {
 /// All object IDs stored in packfiles that have a sibling `.promisor` marker file.
 #[must_use]
 pub fn promisor_pack_object_ids(objects_dir: &Path) -> HashSet<ObjectId> {
-    let odb = Odb::new(objects_dir);
+    promisor_pack_object_ids_in(&Odb::new(objects_dir))
+}
+
+/// [`promisor_pack_object_ids`] for `odb`'s own files primary; empty for a custom primary,
+/// which has no packs.
+fn promisor_pack_object_ids_in(odb: &Odb) -> HashSet<ObjectId> {
     let Ok(primary) = odb.primary() else {
         return HashSet::new();
     };
@@ -98,7 +106,7 @@ pub fn promisor_pack_object_ids(objects_dir: &Path) -> HashSet<ObjectId> {
 /// annotated tag object still in the promisor pack (t0410).
 #[must_use]
 pub fn promisor_pack_peeled_tag_targets(repo: &Repository) -> HashSet<ObjectId> {
-    let seeds = promisor_pack_object_ids(repo.odb().objects_dir());
+    let seeds = promisor_pack_object_ids_in(repo.odb());
     let mut out = HashSet::new();
     for oid in seeds {
         let Ok(obj) = repo.odb().read(&oid) else {
@@ -117,7 +125,7 @@ pub fn promisor_pack_peeled_tag_targets(repo: &Repository) -> HashSet<ObjectId> 
 
 /// Promisor pack member OIDs plus peeled tag targets (one hop from each tag in the pack).
 pub fn promisor_pack_and_tag_targets(repo: &Repository) -> Result<HashSet<ObjectId>> {
-    let seeds = promisor_pack_object_ids(repo.odb().objects_dir());
+    let seeds = promisor_pack_object_ids_in(repo.odb());
     let mut out = seeds.clone();
     for oid in seeds {
         let obj = match repo.odb().read(&oid) {
@@ -175,7 +183,7 @@ pub(crate) fn promisor_referenced_objects(odb: &Odb) -> Result<HashSet<ObjectId>
         set.insert(oid);
         match odb.read_info_without_fetch(&oid) {
             Ok(info) if info.kind == ObjectKind::Blob => continue,
-            Err(crate::error::Error::ObjectNotFound(_)) => continue,
+            Err(crate::error::Error::Object(ObjectError::NotFound { .. })) => continue,
             Err(err) => return Err(err),
             Ok(_) => {}
         }
@@ -227,7 +235,7 @@ pub(crate) fn maintenance_promise_boundary(odb: &Odb) -> Result<HashSet<ObjectId
         }
         match odb.read_info_without_fetch(&oid) {
             Ok(info) if info.kind == ObjectKind::Blob => continue,
-            Err(crate::error::Error::ObjectNotFound(_)) => continue,
+            Err(crate::error::Error::Object(ObjectError::NotFound { .. })) => continue,
             Err(err) => return Err(err),
             Ok(_) => {}
         }
@@ -343,11 +351,11 @@ mod checkout_blob_tests {
     use super::*;
     use crate::porcelain::add::stage_for_commit;
     use crate::porcelain::commit::{create_commit, CommitRequest};
-    use crate::progress::{NeverCancel, NullProgress};
+    use crate::progress::{CancelToken, NullProgress};
     use crate::repo::InitOptions;
 
     fn commit_all(repo: &Repository, message: &str) {
-        stage_for_commit(repo, &mut NullProgress, &NeverCancel).unwrap();
+        stage_for_commit(repo, &mut NullProgress, &CancelToken::never()).unwrap();
         let ident = "T <t@example.com> 1 +0000".to_string();
         create_commit(
             repo,
@@ -358,7 +366,7 @@ mod checkout_blob_tests {
                 ..Default::default()
             },
             &mut NullProgress,
-            &NeverCancel,
+            &CancelToken::never(),
         )
         .unwrap();
     }
@@ -366,7 +374,7 @@ mod checkout_blob_tests {
     #[test]
     fn checkout_blobs_cover_index_and_head_but_not_history() {
         let dir = tempfile::tempdir().unwrap();
-        let repo = Repository::init(dir.path(), &InitOptions::default()).unwrap();
+        let (repo, _) = Repository::init(dir.path(), &InitOptions::default()).unwrap();
         let work = repo.work_tree().unwrap().to_path_buf();
         let blob = |data: &[u8]| repo.odb().hash(ObjectKind::Blob, data).unwrap();
         std::fs::write(work.join("a"), b"old\n").unwrap();
@@ -374,7 +382,7 @@ mod checkout_blob_tests {
         std::fs::write(work.join("a"), b"new\n").unwrap();
         commit_all(&repo, "two");
         std::fs::write(work.join("a"), b"staged\n").unwrap();
-        stage_for_commit(&repo, &mut NullProgress, &NeverCancel).unwrap();
+        stage_for_commit(&repo, &mut NullProgress, &CancelToken::never()).unwrap();
 
         let needed = blobs_needed_by_checkouts(&repo).unwrap();
         assert!(needed.contains(&blob(b"staged\n")), "index");
@@ -385,7 +393,7 @@ mod checkout_blob_tests {
     #[test]
     fn bare_repositories_need_no_blobs() {
         let dir = tempfile::tempdir().unwrap();
-        let repo = Repository::init(dir.path(), &InitOptions::new().with_bare(true)).unwrap();
+        let (repo, _) = Repository::init(dir.path(), &InitOptions::new().with_bare(true)).unwrap();
         assert!(blobs_needed_by_checkouts(&repo).unwrap().is_empty());
     }
 }

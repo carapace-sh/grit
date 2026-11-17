@@ -4,8 +4,7 @@ use std::path::Path;
 use std::process::Command;
 
 use grit_lib::objects::ObjectId;
-use grit_lib::refs::check_ref_format::{validate_branch_short_name, validate_tag_short_name};
-use grit_lib::refs::write_ref;
+use grit_lib::refs::check_ref_format::{RefName, RefNamePolicy};
 use grit_lib::repo::{InitOptions, Repository};
 use tempfile::tempdir;
 
@@ -91,7 +90,7 @@ fn branch_short_names_match_git_check_ref_format() {
         "a*b",
     ];
     for name in samples {
-        let grit_ok = validate_branch_short_name(name).is_ok();
+        let grit_ok = RefName::branch(name).is_ok();
         let git_ok = git_check_ref_format_branch(name);
         assert_eq!(
             grit_ok, git_ok,
@@ -112,7 +111,7 @@ fn tag_short_names_match_git_check_ref_format() {
         "HEAD",
     ];
     for name in samples {
-        let grit_ok = validate_tag_short_name(name).is_ok();
+        let grit_ok = RefName::tag(name).is_ok();
         let git_ok = git_check_ref_format_tag(name);
         assert_eq!(
             grit_ok, git_ok,
@@ -124,11 +123,11 @@ fn tag_short_names_match_git_check_ref_format() {
 #[test]
 fn write_ref_rejects_invalid_branch_names_without_loose_files() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(
+    let (repo, _) = Repository::init(
         dir.path(),
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
-            .with_ref_storage(grit_lib::RefStorageFormat::Files),
+            .with_ref_storage(grit_lib::refs::ref_storage::RefStorageFormat::Files),
     )
     .expect("init");
     let git_dir = repo.git_dir().to_path_buf();
@@ -136,7 +135,12 @@ fn write_ref_rejects_invalid_branch_names_without_loose_files() {
     for name in invalid {
         let refname = format!("refs/heads/{name}");
         assert!(
-            write_ref(&git_dir, &refname, &sample_oid()).is_err(),
+            grit_test_support::refs::set_ref(
+                &grit_test_support::refs::at(&git_dir),
+                &refname,
+                &sample_oid()
+            )
+            .is_err(),
             "write_ref must reject {refname}"
         );
         let loose = git_dir.join("refs/heads").join(name);
@@ -153,15 +157,16 @@ fn write_ref_rejects_invalid_branch_names_without_loose_files() {
 fn write_ref_accepts_refs_heads_head_like_git() {
     let dir = tempdir().unwrap();
     let worktree = dir.path();
-    let repo = Repository::init(
+    let (repo, _) = Repository::init(
         worktree,
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
-            .with_ref_storage(grit_lib::RefStorageFormat::Files),
+            .with_ref_storage(grit_lib::refs::ref_storage::RefStorageFormat::Files),
     )
     .expect("init");
     let tip = seed_empty_commit(worktree);
-    write_ref(repo.git_dir(), "refs/heads/HEAD", &tip).expect("plumbing may write refs/heads/HEAD");
+    grit_test_support::refs::set_ref(&repo, "refs/heads/HEAD", &tip)
+        .expect("plumbing may write refs/heads/HEAD");
     assert!(
         git_fsck_strict(worktree),
         "git fsck --strict must pass on refs/heads/HEAD"

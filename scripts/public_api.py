@@ -1,13 +1,37 @@
-"""Pins and snapshot comparison for scripts/public-api.sh."""
+"""Pins, snapshot comparison, and public API test-item ratchet for scripts/public-api.sh."""
 from __future__ import annotations
 
 import difflib
+import json
+import os
 import re
+import subprocess
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 PUBLIC_API_SCRIPT = Path(__file__).resolve().parent / "public-api.sh"
 SNAPSHOT_PATH = ROOT / "grit-lib" / "public-api.txt"
+HIDDEN_OFFENDERS_PATH = ROOT / "grit-lib" / "public-api-test-items.hidden-offenders"
+# Isolated from `target/doc/grit_lib.json` (e.g. llvm-cov / public-fn coverage)
+# and from `target/api-ratchet-doc/grit_lib.json` (api quality ratchet) so each
+# gate always rebuilds from its own pinned RUSTDOCFLAGS + features.
+DEFAULT_RUSTDOC_JSON = (
+    ROOT / "target" / "public-api-test-items-doc" / "grit_lib.json"
+)
+
+TEST_ITEM_FORBIDDEN_WORDS = frozenset(
+    {
+        "test",
+        "tests",
+        "probe",
+        "probes",
+        "fixture",
+        "fixtures",
+        "bench",
+        "benches",
+    }
+)
 
 
 def parse_cargo_public_api_version_output(text: str) -> str | None:
@@ -50,6 +74,160 @@ def unified_diff(
     return "".join(lines)
 
 
+def segment_words(segment: str) -> list[str]:
+    """Split a Rust path segment on ``_`` and CamelCase into lowercase words."""
+    words: list[str] = []
+    for chunk in segment.split("_"):
+        if not chunk:
+            continue
+        split = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", chunk)
+        split = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", split)
+        words.extend(part for part in split.split() if part)
+    return [word.lower() for word in words]
+
+
+def path_violates_test_item_rule(path: str) -> bool:
+    """Return whether any path segment looks like a test/bench/fixture hook name."""
+    for segment in path.split("::"):
+        for word in segment_words(segment):
+            if word in TEST_ITEM_FORBIDDEN_WORDS:
+                return True
+    return False
+
+
+def normalize_grit_lib_path(raw: str) -> str:
+    """Normalize one ``grit_lib::…`` fragment from a snapshot line."""
+    tail = raw
+    if "(" in tail:
+        tail = re.sub(r"\(.*", "", tail)
+    elif ": " in tail:
+        tail = tail.rsplit(": ", 1)[0]
+    tail = re.sub(r"\s:.*", "", tail)
+    return tail.rstrip(":").strip()
+
+
+def item_paths_from_snapshot_line(line: str) -> list[str]:
+    """Extract every ``grit_lib::…`` path referenced on one snapshot line."""
+    line = line.strip()
+    if not line:
+        return []
+    paths: list[str] = []
+    for match in re.finditer(r"grit_lib::[^\s(,)>-]+", line):
+        paths.append(normalize_grit_lib_path(match.group(0)))
+    return paths
+
+
+def offending_paths_from_snapshot_text(text: str) -> set[str]:
+    """Collect unique snapshot paths that violate the test-item word rule."""
+    paths: set[str] = set()
+    for line in text.splitlines():
+        for path in item_paths_from_snapshot_line(line):
+            if path_violates_test_item_rule(path):
+                paths.add(path)
+    return paths
+
+
+def offending_paths_from_rustdoc_json(rustdoc_path: Path) -> set[str]:
+    """Collect public rustdoc paths (including ``#[doc(hidden)]``) that violate the rule."""
+    payload = json.loads(rustdoc_path.read_text(encoding="utf-8"))
+    index = payload.get("index", {})
+    paths_meta = payload.get("paths", {})
+    out: set[str] = set()
+    for _pid, meta in paths_meta.items():
+        if meta.get("crate_id") != 0:
+            continue
+        parts = meta.get("path") or []
+        if not parts or parts[0] != "grit_lib":
+            continue
+        item = index.get(str(_pid)) or index.get(int(_pid))  # type: ignore[arg-type]
+        if item is not None and item.get("visibility") != "public":
+            continue
+        full = "::".join(parts)
+        if path_violates_test_item_rule(full):
+            out.add(full)
+    return out
+
+
+def ensure_rustdoc_json_with_hidden_items(*, nightly: str, output: Path) -> None:
+    """Build rustdoc JSON documenting hidden items (cargo-public-api has no flag in 0.52)."""
+    src_root = ROOT / "grit-lib" / "src"
+    newest_src = max(p.stat().st_mtime for p in src_root.rglob("*.rs"))
+    if output.is_file() and output.stat().st_mtime >= newest_src:
+        return
+    output.parent.mkdir(parents=True, exist_ok=True)
+    env = dict(os.environ)
+    env["RUSTDOCFLAGS"] = (
+        "--document-hidden-items "
+        "-A rustdoc::broken_intra_doc_links "
+        "-A rustdoc::private_intra_doc_links"
+    )
+    cmd = [
+        "cargo",
+        f"+nightly-{nightly}",
+        "doc",
+        "-p",
+        "grit-lib",
+        "--features",
+        "http-ureq",
+        "--no-deps",
+        "-Z",
+        "unstable-options",
+        "--output-format",
+        "json",
+    ]
+    result = subprocess.run(
+        cmd,
+        cwd=ROOT,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        sys.stderr.write(result.stdout)
+        sys.stderr.write(result.stderr)
+        raise SystemExit(result.returncode)
+    generated = ROOT / "target" / "doc" / "grit_lib.json"
+    if not generated.is_file():
+        msg = f"expected rustdoc JSON at {generated}"
+        raise SystemExit(msg)
+    if generated.resolve() != output.resolve():
+        output.write_bytes(generated.read_bytes())
+
+
+def check_test_items_zero() -> tuple[bool, str]:
+    """Fail when snapshot or hidden rustdoc paths look like test/bench/fixture hooks."""
+    snapshot_text = SNAPSHOT_PATH.read_text(encoding="utf-8")
+    snapshot_offenders = offending_paths_from_snapshot_text(snapshot_text)
+    pins = parse_pins()
+    ensure_rustdoc_json_with_hidden_items(
+        nightly=pins["nightly_date"],
+        output=DEFAULT_RUSTDOC_JSON,
+    )
+    offenders = set(snapshot_offenders)
+    offenders |= offending_paths_from_rustdoc_json(DEFAULT_RUSTDOC_JSON)
+
+    if HIDDEN_OFFENDERS_PATH.is_file():
+        hidden_file = {
+            line.strip()
+            for line in HIDDEN_OFFENDERS_PATH.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        }
+        if hidden_file:
+            return (
+                False,
+                "public-api-test-items.hidden-offenders must be empty; remove hooks instead",
+            )
+
+    if not offenders:
+        return True, ""
+    return (
+        False,
+        "public API must not expose test/bench/fixture hooks (see TESTING.md); offenders:\n"
+        + "\n".join(f"  {path}" for path in sorted(offenders)),
+    )
+
+
 def compare_snapshot_files(
     expected_path: Path,
     actual_path: Path,
@@ -64,12 +242,18 @@ def compare_snapshot_files(
 
 def main(argv: list[str] | None = None) -> int:
     """CLI helpers for scripts/public-api.sh (check exit code, diff text)."""
-    import sys
-
     args = list(sys.argv[1:] if argv is None else argv)
     if len(args) == 1 and args[0] in {"--print-pins", "print-pins"}:
         for key, value in parse_pins().items():
             print(f"{key}={value}")
+        return 0
+    if len(args) == 1 and args[0] == "check-test-items":
+        ok, message = check_test_items_zero()
+        if not ok:
+            sys.stderr.write(message)
+            if not message.endswith("\n"):
+                sys.stderr.write("\n")
+            return 1
         return 0
     if len(args) == 3 and args[0] == "check":
         ok, _ = compare_snapshot_files(Path(args[1]), Path(args[2]))
@@ -78,7 +262,10 @@ def main(argv: list[str] | None = None) -> int:
         _, diff = compare_snapshot_files(Path(args[1]), Path(args[2]))
         sys.stdout.write(diff)
         return 0
-    print("usage: public_api.py check|diff <expected> <actual>", file=sys.stderr)
+    print(
+        "usage: public_api.py check|diff|check-test-items …",
+        file=sys.stderr,
+    )
     return 2
 
 

@@ -5,38 +5,18 @@ use crate::repo::Repository;
 use crate::state::{resolve_head_for_repository, HeadState};
 
 use super::apply::{apply_undo_rewrite, verify_undo_worktree};
-use super::error::HistoryError;
+use super::error::{undo_record_read_str, HistoryError};
 use super::last::{read_history_last, HistoryLastRecord};
-use super::types::{ApplyOptions, UndoOutcome};
+use super::types::{ApplyOptions, UndoMode, UndoOutcome};
 use super::undo_work::{read_undo_work, UndoWork};
 
-/// Revert the last recorded history rewrite when refs are still at the post-rewrite tips.
-///
-/// Builds the inverse ref plan from [`.git/grit/history-last`](super::last::read_history_last),
-/// verifies each ref is still at its recorded `new` OID ([`HistoryError::UndoStale`]), then applies
-/// ref updates and the matching worktree transition. On success, writes the inverse as the new
-/// record so a second call redoes the original rewrite. Like `reset`, undo runs no
-/// post-operation hooks, whatever [`ApplyOptions::hooks`] says.
-///
-/// Fixup and absorb fold staged (or selected unstaged) edits into history. Undoing them puts those
-/// edits back: every consumed path gets the index entry and work tree file it had before the
-/// command ([`UndoOutcome::restored_paths`]), and a second undo returns to the post-command
-/// state. Records written before grit kept that state still move refs;
-/// [`UndoOutcome::unrestored_edits`] then names the commit that holds the edits.
-///
-/// Refs and `HEAD` are read and moved through the repository's ref store
-/// ([`Repository::refs`]); the undo record itself is a file under the git directory.
-///
-/// # Errors
-///
-/// Returns [`HistoryError::NoUndoRecord`], [`HistoryError::UndoStale`],
-/// [`HistoryError::LocalChangesWouldBeOverwritten`] (including a restored path edited since the
-/// command), and other apply failures.
-pub fn undo_last_rewrite(
+/// Revert the last recorded history rewrite; see [`History::undo_last`](super::History::undo_last).
+pub(crate) fn undo_last_rewrite(
     repo: &Repository,
     opts: &ApplyOptions,
-    dry_run: bool,
-) -> Result<UndoOutcome, HistoryError> {
+    mode: UndoMode,
+    cancel: &crate::progress::CancelToken,
+) -> crate::error::Result<UndoOutcome> {
     let record = read_history_last(repo)?.ok_or(HistoryError::NoUndoRecord)?;
     verify_record_still_valid(repo, &record)?;
     let work = if repo.is_bare() {
@@ -52,14 +32,12 @@ pub fn undo_last_rewrite(
     } else {
         None
     };
-    if dry_run {
+    if mode == UndoMode::DryRun {
         verify_undo_worktree(repo, &plan, work.as_ref())?;
         let head_after = head_change
             .map(|(_, new)| new)
             .or(record.head_old_commit)
-            .ok_or_else(|| HistoryError::UndoRecordRead {
-                message: "record missing head commit for dry-run".into(),
-            })?;
+            .ok_or_else(|| undo_record_read_str("record missing head commit for dry-run"))?;
         return Ok(UndoOutcome {
             ref_updates: plan.ref_updates.clone(),
             head: head_after,
@@ -73,7 +51,7 @@ pub fn undo_last_rewrite(
     apply_opts.record_operation = Some("undo".into());
     apply_opts.reflog_message = "history undo".into();
     apply_opts.hooks = PostOperationHooks::Skip;
-    let applied = apply_undo_rewrite(repo, &plan, &apply_opts, work.as_ref())?;
+    let applied = apply_undo_rewrite(repo, &plan, &apply_opts, work.as_ref(), cancel)?;
     Ok(UndoOutcome {
         ref_updates: applied.ref_updates,
         head: applied.head,
@@ -97,13 +75,14 @@ fn consumed_local_edits(repo: &Repository, record: &HistoryLastRecord) -> bool {
 fn verify_record_still_valid(
     repo: &Repository,
     record: &HistoryLastRecord,
-) -> Result<(), HistoryError> {
+) -> crate::error::Result<()> {
     for update in &record.ref_updates {
-        let live = repo.references().resolve_if_exists(&update.name);
+        let live = repo.references().resolve_if_exists(update.name.as_str());
         if !matches!(live, Ok(Some(oid)) if oid == update.new) {
             return Err(HistoryError::UndoStale {
-                name: update.name.clone(),
-            });
+                name: update.name.as_str().to_owned(),
+            }
+            .into());
         }
     }
     if let Some(expected) = record.head_new_commit {
@@ -112,7 +91,8 @@ fn verify_record_still_valid(
             Err(_) => {
                 return Err(HistoryError::UndoStale {
                     name: record.head_ref.clone().unwrap_or_else(|| "HEAD".into()),
-                })
+                }
+                .into())
             }
         };
         let live_commit = match head {
@@ -122,7 +102,7 @@ fn verify_record_still_valid(
         };
         if live_commit != Some(expected) {
             let label = record.head_ref.clone().unwrap_or_else(|| "HEAD".into());
-            return Err(HistoryError::UndoStale { name: label });
+            return Err(HistoryError::UndoStale { name: label }.into());
         }
     }
     Ok(())
@@ -133,6 +113,7 @@ mod tests {
     use super::*;
     use crate::history::types::{HeadEffect, PlannedRefUpdate};
     use crate::objects::ObjectId;
+    use crate::refs::store::RefName;
 
     #[test]
     fn undo_plan_swaps_refs_and_head_trees() {
@@ -152,7 +133,7 @@ mod tests {
                 ObjectId::from_hex("0000000000000000000000000000000000000004").unwrap(),
             ),
             ref_updates: vec![PlannedRefUpdate {
-                name: "refs/heads/main".into(),
+                name: RefName::from_trusted("refs/heads/main"),
                 old: ObjectId::from_hex("0000000000000000000000000000000000000001").unwrap(),
                 new: ObjectId::from_hex("0000000000000000000000000000000000000002").unwrap(),
             }],

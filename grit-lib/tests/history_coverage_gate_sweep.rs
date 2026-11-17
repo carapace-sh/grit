@@ -2,24 +2,13 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use grit_lib::config::ConfigSet;
-use grit_lib::diff::{
-    diff_commits_with_renames, diff_index_to_tree, diff_index_to_worktree_with_options,
-    diff_tree_to_worktree_with_git_dir, diff_trees, diff_trees_with_renames,
-    postprocess_diff_entries, DiffIndexToWorktreeOptions, DiffPostprocessOptions, DiffStatus,
-};
+use grit_lib::diff::{CopyDetection, DiffStatus, RenameDetection, TreeDiffOptions};
 use grit_lib::index::write_tree::write_tree_from_index;
 use grit_lib::index::{Index, IndexEntry, MODE_REGULAR};
 use grit_lib::objects::{ObjectId, ObjectKind};
 use grit_lib::parallel::ThreadPolicy;
 use grit_lib::repo::{InitOptions, Repository};
-use grit_lib::revwalk::rev_list::{
-    merge_bases, resolve_object_walk_roots, rev_list, OrderingMode, OutputMode, RevListOptions,
-};
-use grit_lib::revwalk::rev_parse::{
-    resolve_revision, resolve_revision_as_commit, resolve_revision_for_range_end,
-    resolve_revision_for_verify, try_parse_double_dot_log_range,
-};
+use grit_lib::revwalk::rev_list::{OrderingMode, RevListOptions};
 use std::fs;
 use tempfile::tempdir;
 
@@ -72,7 +61,7 @@ fn index_entry(path: &str, oid: ObjectId) -> IndexEntry {
 #[test]
 fn history_walk_diff_and_resolve_sweep() -> grit_lib::error::Result<()> {
     let dir = tempdir().map_err(grit_lib::error::Error::Io)?;
-    let repo = Repository::init(dir.path(), &InitOptions::default())?;
+    let (repo, _) = Repository::init(dir.path(), &InitOptions::default())?;
     let mut tip = repo
         .odb()
         .write_loose_materialize(ObjectKind::Blob, b"v0\n")?;
@@ -109,18 +98,36 @@ fn history_walk_diff_and_resolve_sweep() -> grit_lib::error::Result<()> {
             format!("HEAD~{n}^{{commit}}"),
             format!(":/c{n}"),
         ] {
-            let _ = resolve_revision_for_verify(&repo, &spec)?;
-            let _ = resolve_revision(&repo, &spec)?;
-            let _ = resolve_revision_for_range_end(&repo, &spec)?;
+            let _ = repo.revwalk().resolve(
+                &spec,
+                &grit_lib::revwalk::ResolveOptions::default()
+                    .with_index_dwim(grit_lib::revwalk::IndexDwim::Off)
+                    .with_purpose(grit_lib::revwalk::ResolvePurpose::RangeEnd),
+            )?;
+            let _ = repo
+                .revwalk()
+                .resolve(&spec, &grit_lib::revwalk::ResolveOptions::default())?;
+            let _ = repo.revwalk().resolve(
+                &spec,
+                &grit_lib::revwalk::ResolveOptions::default()
+                    .with_purpose(grit_lib::revwalk::ResolvePurpose::RangeEnd),
+            )?;
         }
         for spec in [format!("HEAD~{n}"), format!("main~{n}"), format!(":/c{n}")] {
-            let _ = resolve_revision_as_commit(&repo, &spec)?;
+            let _ = repo.revwalk().resolve(
+                &spec,
+                &grit_lib::revwalk::ResolveOptions::default()
+                    .with_peel(grit_lib::revwalk::Peel::Commit),
+            )?;
         }
     }
-    let _ = try_parse_double_dot_log_range(&repo, "main~10..main")?;
-    let _ = merge_bases(&repo, tip, tip, false)?;
-    let roots = resolve_object_walk_roots(&repo, &[String::from("main")])?;
-    assert!(!roots.0.is_empty());
+    let _ = repo.revwalk().resolve(
+        "main~10..main",
+        &grit_lib::revwalk::ResolveOptions::default().with_peel(grit_lib::revwalk::Peel::Commit),
+    )?;
+    let _ = repo
+        .revwalk()
+        .merge_bases(&[tip, tip], grit_lib::revwalk::MergeBaseMode::All)?;
 
     let orderings = [
         OrderingMode::Default,
@@ -131,7 +138,6 @@ fn history_walk_diff_and_resolve_sweep() -> grit_lib::error::Result<()> {
     for ordering in orderings {
         let opts = RevListOptions {
             ordering,
-            output_mode: OutputMode::Format(String::from("oneline")),
             paths: vec!["tracked.txt".to_owned()],
             cherry_pick: false,
             left_right: true,
@@ -140,7 +146,9 @@ fn history_walk_diff_and_resolve_sweep() -> grit_lib::error::Result<()> {
             max_count: Some(20),
             ..RevListOptions::default()
         };
-        let out = rev_list(&repo, &[String::from("main")], &[], &opts)?;
+        let out = repo
+            .revwalk()
+            .rev_list(&[String::from("main")], &[], &opts)?;
         assert!(!out.commits.is_empty());
     }
 
@@ -154,50 +162,29 @@ fn history_walk_diff_and_resolve_sweep() -> grit_lib::error::Result<()> {
     let new_tree = write_tree(repo.odb(), "other.txt", blob_b)?;
     let base = write_commit(repo.odb(), old_tree, &[], "base")?;
     let head = write_commit(repo.odb(), new_tree, &[base], "head")?;
-    let raw = diff_trees(repo.odb(), Some(&old_tree), Some(&new_tree), "")?;
+    let diff = repo.diff();
+    let raw = diff
+        .tree_to_tree(
+            Some(&old_tree),
+            Some(&new_tree),
+            &TreeDiffOptions::default(),
+        )?
+        .entries;
     assert!(raw.iter().any(|e| e.status == DiffStatus::Modified));
-    let _ = diff_trees_with_renames(repo.odb(), Some(&old_tree), Some(&new_tree), "", 50)?;
-    let _ = diff_commits_with_renames(repo.odb(), &base, &head, 50)?;
-    let config = ConfigSet::new();
-    let policy = ThreadPolicy::default();
-    let opts = DiffPostprocessOptions {
-        rename_threshold: 50,
-        copy_threshold: Some(50),
-        find_copies_harder: true,
-        ..DiffPostprocessOptions::default()
-    };
-    let _ = postprocess_diff_entries(
-        repo.odb(),
-        raw,
-        Some(&old_tree),
-        None,
-        None,
-        &config,
-        &policy,
-        &opts,
-    )?;
+    let renames = TreeDiffOptions::default().with_renames(RenameDetection::Similarity(50));
+    let _ = diff.tree_to_tree(Some(&old_tree), Some(&new_tree), &renames)?;
+    let _ = diff.commits(&base, &head, &renames)?;
+    let copies = renames
+        .with_copies(CopyDetection::FindHarder(50))
+        .with_threads(Some(ThreadPolicy::default()));
+    let _ = diff.tree_to_tree(Some(&old_tree), Some(&new_tree), &copies)?;
 
     let mut index = Index::new();
     index.entries_mut().push(index_entry("tracked.txt", blob_b));
     index.write_to_path(&repo.git_dir().join("index"), false)?;
     let head_tree = write_tree_from_index(repo.odb(), &index, "")?;
-    let _ = diff_index_to_tree(repo.odb(), &index, Some(&head_tree), false)?;
-    let _ = diff_index_to_worktree_with_options(
-        repo.odb(),
-        &mut index.clone(),
-        dir.path(),
-        DiffIndexToWorktreeOptions {
-            repository_git_dir: Some(repo.git_dir().to_path_buf()),
-            ..DiffIndexToWorktreeOptions::default()
-        },
-    )?;
-    let _ = diff_tree_to_worktree_with_git_dir(
-        repo.odb(),
-        Some(&head_tree),
-        dir.path(),
-        repo.git_dir(),
-        &index,
-        Some(&config),
-    )?;
+    let _ = diff.index_to_tree(&index, Some(&head_tree), &TreeDiffOptions::default())?;
+    let _ = diff.index_to_worktree(&mut index.clone(), &TreeDiffOptions::default())?;
+    let _ = diff.tree_to_worktree(Some(&head_tree), &index, &TreeDiffOptions::default())?;
     Ok(())
 }

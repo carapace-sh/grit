@@ -11,7 +11,7 @@
 //! * [`SmartHttpTransport`] — a [`Transport`] that performs the `info/refs`
 //!   discovery on [`Transport::connect`] and exposes the parsed advertisement
 //!   through a [`Connection`].
-//! * [`http_fetch`] — drives the stateless-RPC negotiation (`want`/`have`/`done`
+//! * `http_fetch` — drives the stateless-RPC negotiation (`want`/`have`/`done`
 //!   over repeated POSTs), demultiplexes the side-band pack, ingests it, and
 //!   returns a fetch outcome using the same refspec/tag/prune helpers as other
 //!   fetch paths.
@@ -23,20 +23,23 @@
 //! Both protocol v0/v1 (the classic stateless RPC) and protocol v2 (the
 //! stateless multi-POST flow) are implemented here. A v2 server is detected from
 //! the `version 2` capability advertisement returned by `info/refs` (requested
-//! with the `Git-Protocol: version=2` header); [`http_fetch`] then runs the v2
+//! with the `Git-Protocol: version=2` header); `http_fetch` then runs the v2
 //! `command=ls-refs` + `command=fetch` rounds as separate POSTs — each round
 //! resends the capability echo, all `want`s, and the accumulated `have`s —
 //! reusing the shared v2 request framing and side-band demuxer from the fetch module.
 
+use crate::error::ObjectError;
 use std::collections::HashSet;
 use std::io::{Cursor, Read};
-use std::path::Path;
 
 use crate::error::{Error, RemoteUnreadableReason, Result};
 use crate::fetch::Progress;
 use crate::objects::ObjectId;
 use crate::pkt_line;
+use crate::progress::CancelToken;
+use crate::remote::RemoteError;
 use crate::transfer::{FetchOptions, FetchOutcome};
+use crate::transport::pending_http::PendingHttp;
 use crate::transport::stateless_http::StatelessHttpConnection;
 use crate::transport::{ConnectOptions, Connection, Service, Transport};
 
@@ -60,7 +63,7 @@ pub trait HttpClient: Send + Sync {
     /// # Errors
     ///
     /// Returns an error on a transport failure or a non-success HTTP status.
-    fn get(&self, url: &str, git_protocol: Option<&str>) -> Result<Vec<u8>>;
+    fn get(&self, url: &str, git_protocol: Option<&str>) -> crate::error::Result<Vec<u8>>;
 
     /// Issue a `POST` to `url` with the given `content_type`, `accept` header,
     /// and request `body`, returning the response body bytes.
@@ -75,7 +78,7 @@ pub trait HttpClient: Send + Sync {
         accept: &str,
         body: &[u8],
         git_protocol: Option<&str>,
-    ) -> Result<Vec<u8>>;
+    ) -> crate::error::Result<Vec<u8>>;
 
     /// Issue a `POST` and return the response body as a readable stream.
     ///
@@ -92,7 +95,7 @@ pub trait HttpClient: Send + Sync {
         accept: &str,
         body: &[u8],
         git_protocol: Option<&str>,
-    ) -> Result<Box<dyn Read + Send>> {
+    ) -> crate::error::Result<Box<dyn Read + Send>> {
         Ok(Box::new(Cursor::new(self.post(
             url,
             content_type,
@@ -127,9 +130,10 @@ pub trait HttpClient: Send + Sync {
         accept: &str,
         body: &mut dyn Read,
         git_protocol: Option<&str>,
-    ) -> Result<Box<dyn Read + Send>> {
+    ) -> crate::error::Result<Box<dyn Read + Send>> {
         let mut buffered = Vec::new();
-        body.read_to_end(&mut buffered).map_err(Error::Io)?;
+        body.read_to_end(&mut buffered)
+            .map_err(RemoteError::from_io)?;
         self.post_into_reader(url, content_type, accept, &buffered, git_protocol)
     }
 
@@ -148,22 +152,12 @@ pub trait HttpClient: Send + Sync {
     /// # Errors
     ///
     /// Returns an error on a transport failure or a non-success HTTP status.
-    fn get_with_final_url(
+    fn get_following_redirects(
         &self,
         url: &str,
         git_protocol: Option<&str>,
-    ) -> Result<(Vec<u8>, Option<String>)> {
+    ) -> crate::error::Result<(Vec<u8>, Option<String>)> {
         Ok((self.get(url, git_protocol)?, None))
-    }
-
-    /// Like [`Self::get_with_final_url`], but does not merge [`Self::git_protocol_header`]
-    /// when `git_protocol` is `None` (used for forced v0/v1 `list_refs`).
-    fn get_with_final_url_exact(
-        &self,
-        url: &str,
-        git_protocol: Option<&str>,
-    ) -> Result<(Vec<u8>, Option<String>)> {
-        self.get_with_final_url(url, git_protocol)
     }
 
     /// The default `Git-Protocol` request-header value to apply when the caller
@@ -193,17 +187,29 @@ pub trait HttpClient: Send + Sync {
     /// resolve, is an error. Clients that authenticate should do so here as
     /// they do for [`Self::get`].
     ///
-    /// The default implementation reports [`Error::Message`] saying the client
+    /// The default implementation reports [`RemoteError::Http`] saying the client
     /// cannot send such requests, which turns resumable transfers off.
     ///
     /// # Errors
     ///
     /// A transport or authentication failure.
-    fn send(&self, request: &HttpRequest<'_>) -> Result<HttpResponse> {
-        Err(Error::Message(format!(
-            "this HTTP client cannot send {} requests",
-            request.method.as_str()
-        )))
+    fn send(&self, request: &HttpRequest<'_>) -> crate::error::Result<HttpResponse> {
+        Err(RemoteError::Http {
+            detail: format!(
+                "this HTTP client cannot send {} requests",
+                request.method.as_str()
+            ),
+        }
+        .into())
+    }
+
+    /// Wire an operation [`CancelToken`] checked during blocking HTTP reads (when supported).
+    fn set_operation_cancel(&self, _cancel: Option<std::sync::Arc<CancelToken>>) {}
+
+    /// When set, worker-thread HTTP waits abort after this duration with no response
+    /// (Git `http.lowSpeedTime` with zero bytes transferred).
+    fn low_speed_stall_window(&self) -> Option<std::time::Duration> {
+        None
     }
 }
 
@@ -340,7 +346,7 @@ impl std::fmt::Debug for HttpResponse {
 /// Forward [`HttpClient`] through a shared [`std::sync::Arc`], so one client can
 /// back several transports (and be observed by the caller) without moving it.
 impl HttpClient for std::sync::Arc<dyn HttpClient> {
-    fn get(&self, url: &str, git_protocol: Option<&str>) -> Result<Vec<u8>> {
+    fn get(&self, url: &str, git_protocol: Option<&str>) -> crate::error::Result<Vec<u8>> {
         (**self).get(url, git_protocol)
     }
 
@@ -351,7 +357,7 @@ impl HttpClient for std::sync::Arc<dyn HttpClient> {
         accept: &str,
         body: &[u8],
         git_protocol: Option<&str>,
-    ) -> Result<Vec<u8>> {
+    ) -> crate::error::Result<Vec<u8>> {
         (**self).post(url, content_type, accept, body, git_protocol)
     }
 
@@ -362,7 +368,7 @@ impl HttpClient for std::sync::Arc<dyn HttpClient> {
         accept: &str,
         body: &[u8],
         git_protocol: Option<&str>,
-    ) -> Result<Box<dyn Read + Send>> {
+    ) -> crate::error::Result<Box<dyn Read + Send>> {
         (**self).post_into_reader(url, content_type, accept, body, git_protocol)
     }
 
@@ -373,24 +379,16 @@ impl HttpClient for std::sync::Arc<dyn HttpClient> {
         accept: &str,
         body: &mut dyn Read,
         git_protocol: Option<&str>,
-    ) -> Result<Box<dyn Read + Send>> {
+    ) -> crate::error::Result<Box<dyn Read + Send>> {
         (**self).post_streaming(url, content_type, accept, body, git_protocol)
     }
 
-    fn get_with_final_url(
+    fn get_following_redirects(
         &self,
         url: &str,
         git_protocol: Option<&str>,
-    ) -> Result<(Vec<u8>, Option<String>)> {
-        (**self).get_with_final_url(url, git_protocol)
-    }
-
-    fn get_with_final_url_exact(
-        &self,
-        url: &str,
-        git_protocol: Option<&str>,
-    ) -> Result<(Vec<u8>, Option<String>)> {
-        (**self).get_with_final_url_exact(url, git_protocol)
+    ) -> crate::error::Result<(Vec<u8>, Option<String>)> {
+        (**self).get_following_redirects(url, git_protocol)
     }
 
     fn git_protocol_header(&self) -> Option<&str> {
@@ -405,13 +403,17 @@ impl HttpClient for std::sync::Arc<dyn HttpClient> {
         (**self).reset_auth_after_redirect_rebase();
     }
 
-    fn send(&self, request: &HttpRequest<'_>) -> Result<HttpResponse> {
+    fn send(&self, request: &HttpRequest<'_>) -> crate::error::Result<HttpResponse> {
         (**self).send(request)
+    }
+
+    fn low_speed_stall_window(&self) -> Option<std::time::Duration> {
+        (**self).low_speed_stall_window()
     }
 }
 
 impl<C: HttpClient> HttpClient for std::sync::Arc<C> {
-    fn get(&self, url: &str, git_protocol: Option<&str>) -> Result<Vec<u8>> {
+    fn get(&self, url: &str, git_protocol: Option<&str>) -> crate::error::Result<Vec<u8>> {
         (**self).get(url, git_protocol)
     }
 
@@ -422,7 +424,7 @@ impl<C: HttpClient> HttpClient for std::sync::Arc<C> {
         accept: &str,
         body: &[u8],
         git_protocol: Option<&str>,
-    ) -> Result<Vec<u8>> {
+    ) -> crate::error::Result<Vec<u8>> {
         (**self).post(url, content_type, accept, body, git_protocol)
     }
 
@@ -433,7 +435,7 @@ impl<C: HttpClient> HttpClient for std::sync::Arc<C> {
         accept: &str,
         body: &[u8],
         git_protocol: Option<&str>,
-    ) -> Result<Box<dyn Read + Send>> {
+    ) -> crate::error::Result<Box<dyn Read + Send>> {
         (**self).post_into_reader(url, content_type, accept, body, git_protocol)
     }
 
@@ -444,24 +446,16 @@ impl<C: HttpClient> HttpClient for std::sync::Arc<C> {
         accept: &str,
         body: &mut dyn Read,
         git_protocol: Option<&str>,
-    ) -> Result<Box<dyn Read + Send>> {
+    ) -> crate::error::Result<Box<dyn Read + Send>> {
         (**self).post_streaming(url, content_type, accept, body, git_protocol)
     }
 
-    fn get_with_final_url(
+    fn get_following_redirects(
         &self,
         url: &str,
         git_protocol: Option<&str>,
-    ) -> Result<(Vec<u8>, Option<String>)> {
-        (**self).get_with_final_url(url, git_protocol)
-    }
-
-    fn get_with_final_url_exact(
-        &self,
-        url: &str,
-        git_protocol: Option<&str>,
-    ) -> Result<(Vec<u8>, Option<String>)> {
-        (**self).get_with_final_url_exact(url, git_protocol)
+    ) -> crate::error::Result<(Vec<u8>, Option<String>)> {
+        (**self).get_following_redirects(url, git_protocol)
     }
 
     fn git_protocol_header(&self) -> Option<&str> {
@@ -476,8 +470,12 @@ impl<C: HttpClient> HttpClient for std::sync::Arc<C> {
         (**self).reset_auth_after_redirect_rebase();
     }
 
-    fn send(&self, request: &HttpRequest<'_>) -> Result<HttpResponse> {
+    fn send(&self, request: &HttpRequest<'_>) -> crate::error::Result<HttpResponse> {
         (**self).send(request)
+    }
+
+    fn low_speed_stall_window(&self) -> Option<std::time::Duration> {
+        (**self).low_speed_stall_window()
     }
 }
 
@@ -524,13 +522,14 @@ pub(crate) fn not_git_server_error(
     status: u16,
     content_type: Option<String>,
 ) -> Error {
-    Error::RemoteUnreadable {
+    RemoteError::Unreadable {
         url,
         reason: RemoteUnreadableReason::NotGitServer {
             status,
             content_type,
         },
     }
+    .into()
 }
 
 fn reject_non_git_discovery_http(http: &InfoRefsDiscoveryHttp, body: &[u8]) -> Result<()> {
@@ -616,6 +615,7 @@ struct Discovery {
     caps: HashSet<String>,
     head_symref: Option<String>,
     object_format: String,
+    saw_ref_advertisement_flush: bool,
 }
 
 /// Parse a v0/v1 ref advertisement (after the service preamble is stripped).
@@ -630,23 +630,36 @@ fn parse_advertisement(body: &[u8]) -> Result<Discovery> {
 
     // Peek the first packet to distinguish v2 from v0/v1.
     let first = match pkt_line::read_packet(&mut cur)? {
-        None | Some(pkt_line::Packet::Flush) => {
-            // Empty advertisement (empty repo on an older server): no refs.
+        None => {
+            // EOF before any pkt-line: not a completed handshake.
             return Ok(Discovery {
                 protocol_version: 0,
                 refs: Vec::new(),
                 caps: HashSet::new(),
                 head_symref: None,
                 object_format: "sha1".to_owned(),
+                saw_ref_advertisement_flush: false,
+            });
+        }
+        Some(pkt_line::Packet::Flush) => {
+            // Empty advertisement (empty repo on an older server): flush only, no refs.
+            return Ok(Discovery {
+                protocol_version: 0,
+                refs: Vec::new(),
+                caps: HashSet::new(),
+                head_symref: None,
+                object_format: "sha1".to_owned(),
+                saw_ref_advertisement_flush: true,
             });
         }
         Some(pkt_line::Packet::Data(s)) => s,
         Some(other) => {
-            return Err(Error::Message(format!(
-                "unexpected first advertisement packet: {other:?}"
-            )))
+            return Err(Error::Object(ObjectError::Corrupt {
+                detail: format!("unexpected first advertisement packet: {other:?}"),
+            }))
         }
     };
+    pkt_line::reject_err_line(&first)?;
     if first.trim_end() == "version 2" {
         // Detect v2 so the caller can report it as unsupported in this pass.
         let mut caps = HashSet::new();
@@ -654,6 +667,7 @@ fn parse_advertisement(body: &[u8]) -> Result<Discovery> {
             match pkt_line::read_packet(&mut cur)? {
                 None | Some(pkt_line::Packet::Flush) => break,
                 Some(pkt_line::Packet::Data(s)) => {
+                    pkt_line::reject_err_line(&s)?;
                     caps.insert(s.trim_end().to_owned());
                 }
                 Some(_) => break,
@@ -670,6 +684,7 @@ fn parse_advertisement(body: &[u8]) -> Result<Discovery> {
             caps,
             head_symref: None,
             object_format,
+            saw_ref_advertisement_flush: false,
         });
     }
 
@@ -684,6 +699,7 @@ fn parse_advertisement(body: &[u8]) -> Result<Discovery> {
             None | Some(pkt_line::Packet::Flush) => break,
             Some(pkt_line::Packet::Data(line)) => {
                 let line = line.trim_end_matches('\n');
+                pkt_line::reject_err_line(line)?;
                 if line.starts_with("version ") {
                     continue;
                 }
@@ -722,7 +738,9 @@ fn parse_advertisement(body: &[u8]) -> Result<Discovery> {
                     continue;
                 }
                 let oid = ObjectId::from_hex(oid_hex).map_err(|e| {
-                    Error::Message(format!("bad oid in advertisement: {oid_hex}: {e}"))
+                    Error::Object(ObjectError::InvalidId {
+                        input: format!("bad oid in advertisement: {oid_hex}: {e}"),
+                    })
                 })?;
                 let valid_ref = refname == "HEAD"
                     || crate::refs::is_valid_fetch_advertised_ref(refname)
@@ -737,9 +755,9 @@ fn parse_advertisement(body: &[u8]) -> Result<Discovery> {
                 }
             }
             Some(other) => {
-                return Err(Error::Message(format!(
-                    "unexpected packet in advertisement: {other:?}"
-                )))
+                return Err(Error::Object(ObjectError::Corrupt {
+                    detail: format!("unexpected packet in advertisement: {other:?}"),
+                }))
             }
         }
     }
@@ -754,6 +772,7 @@ fn parse_advertisement(body: &[u8]) -> Result<Discovery> {
         caps,
         head_symref,
         object_format,
+        saw_ref_advertisement_flush: false,
     })
 }
 
@@ -786,13 +805,21 @@ fn upload_pack_discovery_from_body_with_http(
 }
 
 /// Parse a smart-HTTP `info/refs` response body for `git-upload-pack`.
-pub fn discover_upload_pack_from_body(body: &[u8]) -> Result<UploadPackDiscovery> {
+///
+/// # Errors
+///
+/// [`RemoteError::Fatal`] when the server answers with an `ERR` packet instead of an
+/// advertisement; other malformed advertisements fail with parse errors.
+#[allow(dead_code)]
+pub(crate) fn discover_upload_pack_from_body(body: &[u8]) -> Result<UploadPackDiscovery> {
     upload_pack_discovery_from_body(body)
 }
 
 /// Like [`discover_upload_pack_from_body`], but retains annotated-tag `^{}` peel lines
 /// (for `git ls-remote`-style ref listing).
-pub fn discover_upload_pack_for_list_refs_from_body(body: &[u8]) -> Result<UploadPackDiscovery> {
+pub(crate) fn discover_upload_pack_for_list_refs_from_body(
+    body: &[u8],
+) -> Result<UploadPackDiscovery> {
     let stripped = strip_service_advertisement_for_discovery(body, None)?;
     let disc = parse_advertisement(stripped)?;
     let refs: Vec<(String, ObjectId)> = disc
@@ -806,20 +833,21 @@ pub fn discover_upload_pack_for_list_refs_from_body(body: &[u8]) -> Result<Uploa
 }
 
 /// Discover upload-pack for ref listing (peel lines preserved).
-pub fn discover_upload_pack_for_list_refs(
+pub(crate) fn discover_upload_pack_for_list_refs(
     client: &dyn HttpClient,
     repo_url: &str,
     git_protocol: Option<&str>,
 ) -> Result<UploadPackDiscovery> {
     let url = info_refs_url(repo_url);
-    let (body, _) = client.get_with_final_url_exact(&url, git_protocol)?;
+    let (body, _) = client.get_following_redirects(&url, git_protocol)?;
     discover_upload_pack_for_list_refs_from_body(&body)
 }
 
 /// Discover `git-upload-pack` capabilities and (for v0/v1) advertised refs.
 ///
 /// For protocol v2 the ref list is empty; use `command=ls-refs` to enumerate refs.
-pub fn discover_upload_pack(
+#[allow(dead_code)]
+pub(crate) fn discover_upload_pack(
     client: &dyn HttpClient,
     repo_url: &str,
     git_protocol: Option<&str>,
@@ -831,19 +859,19 @@ pub fn discover_upload_pack(
 }
 
 /// Discover upload-pack using an exact `Git-Protocol` header (no client default).
-pub fn discover_upload_pack_exact(
+pub(crate) fn discover_upload_pack_exact(
     client: &dyn HttpClient,
     repo_url: &str,
     git_protocol: Option<&str>,
 ) -> Result<UploadPackDiscovery> {
     let url = info_refs_url(repo_url);
-    let (body, _) = client.get_with_final_url_exact(&url, git_protocol)?;
+    let (body, _) = client.get_following_redirects(&url, git_protocol)?;
     upload_pack_discovery_from_body(&body)
 }
 
 /// Build the smart-HTTP `info/refs?service=git-upload-pack` discovery URL for a repo base.
 #[must_use]
-pub fn smart_info_refs_discovery_url(repo_base: &str) -> String {
+pub(crate) fn smart_info_refs_discovery_url(repo_base: &str) -> String {
     let base = repo_base.trim_end_matches('/');
     let mut url = format!("{base}/info/refs");
     url.push_str(if url.contains('?') { "&" } else { "?" });
@@ -854,7 +882,8 @@ pub fn smart_info_refs_discovery_url(repo_base: &str) -> String {
 
 /// Strip the `/info/refs` suffix (and query) from a discovery URL, returning the repo base.
 #[must_use]
-pub fn repo_base_from_info_refs_url(info_refs_url: &str) -> Option<String> {
+#[cfg_attr(not(any(test, feature = "http-ureq")), allow(dead_code))]
+pub(crate) fn repo_base_from_info_refs_url(info_refs_url: &str) -> Option<String> {
     let path = info_refs_url.split('?').next()?;
     let base = path.strip_suffix("/info/refs")?.trim_end_matches('/');
     (!base.is_empty()).then(|| base.to_string())
@@ -864,7 +893,8 @@ pub fn repo_base_from_info_refs_url(info_refs_url: &str) -> Option<String> {
 /// discovery URL whose path matches the effective repository base (Git's
 /// `credential_from_url` after `update_url_from_redirect`).
 #[must_use]
-pub fn effective_info_refs_url_after_redirect(
+#[cfg_attr(not(any(test, feature = "http-ureq")), allow(dead_code))]
+pub(crate) fn effective_info_refs_url_after_redirect(
     requested_info_refs_url: &str,
     final_url: Option<&str>,
 ) -> String {
@@ -891,7 +921,10 @@ pub fn effective_info_refs_url_after_redirect(
 /// preserve the `/info/refs` path suffix; the new base is the final URL with
 /// that suffix (and any query) removed.
 #[must_use]
-pub fn rebased_base_from_redirect(original_base: &str, final_url: Option<&str>) -> Option<String> {
+pub(crate) fn rebased_base_from_redirect(
+    original_base: &str,
+    final_url: Option<&str>,
+) -> Option<String> {
     let final_url = final_url?;
     let final_path = final_url.split('?').next().unwrap_or(final_url);
     let new_base = final_path.strip_suffix("/info/refs")?.trim_end_matches('/');
@@ -908,7 +941,8 @@ pub fn rebased_base_from_redirect(original_base: &str, final_url: Option<&str>) 
 /// distinct). Non-default ports are always included; default ports for the scheme
 /// are filled in when omitted from the URL.
 #[must_use]
-pub fn http_origin_key(url: &str) -> Option<String> {
+#[cfg_attr(not(any(test, feature = "http-ureq")), allow(dead_code))]
+pub(crate) fn http_origin_key(url: &str) -> Option<String> {
     let parsed = url::Url::parse(url).ok()?;
     let scheme = parsed.scheme().to_ascii_lowercase();
     let host = parsed.host_str()?.to_ascii_lowercase();
@@ -918,7 +952,8 @@ pub fn http_origin_key(url: &str) -> Option<String> {
 
 /// Returns whether two URLs share the same HTTP origin (scheme, host, port).
 #[must_use]
-pub fn http_origins_match(a: &str, b: &str) -> bool {
+#[cfg_attr(not(any(test, feature = "http-ureq")), allow(dead_code))]
+pub(crate) fn http_origins_match(a: &str, b: &str) -> bool {
     match (http_origin_key(a), http_origin_key(b)) {
         (Some(left), Some(right)) => left == right,
         _ => false,
@@ -929,8 +964,8 @@ pub fn http_origins_match(a: &str, b: &str) -> bool {
 ///
 /// [`Transport::connect`] performs the `info/refs?service=git-upload-pack`
 /// discovery GET and parses the advertisement; the returned [`Connection`]
-/// exposes the advertised refs/capabilities. Use [`http_fetch`] to drive the
-/// fetch negotiation over the same client.
+/// exposes the advertised refs/capabilities. Fetch over the same client with
+/// [`TransferEndpoint::Http`](crate::transfer::TransferEndpoint::Http).
 pub struct SmartHttpTransport<C: HttpClient> {
     client: C,
 }
@@ -946,43 +981,6 @@ impl<C: HttpClient + Clone + 'static> SmartHttpTransport<C> {
         &self.client
     }
 
-    /// Push `refs` to `repo_url` over smart HTTP (`git-receive-pack`), returning a
-    /// [`crate::transfer::PushOutcome`].
-    ///
-    /// This is the push counterpart to [`http_fetch`]: it discovers the
-    /// receive-pack advertisement, decides each update, builds the command block +
-    /// pack, POSTs `git-receive-pack`, and parses the `report-status` reply —
-    /// reusing the same decision/pack/report machinery as the duplex
-    /// [`crate::push::push_remote`]. Delegates to [`crate::push::push_http`].
-    ///
-    /// Protocol v0/v1 only (a v2 receive-pack advertisement is rejected).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if discovery fails, the advertisement is protocol v2, a
-    /// source object is missing locally, the pack build fails, or on wire/parse
-    /// I/O failure.
-    pub fn push(
-        &self,
-        local_git_dir: &Path,
-        repo_url: &str,
-        refs: &[crate::transfer::PushRefSpec],
-        opts: &crate::transfer::PushOptions,
-        progress: &mut dyn Progress,
-        cancel: &dyn crate::progress::Cancel,
-    ) -> Result<crate::transfer::PushOutcome> {
-        use crate::push::push_remote;
-        use crate::transport::{ConnectOptions, Transport};
-        let connect = ConnectOptions {
-            protocol_version: 0,
-            diagnostics: opts.diagnostics.clone(),
-            network_trace: opts.network_trace,
-            ..Default::default()
-        };
-        let mut conn = self.connect(repo_url, Service::ReceivePack, &connect)?;
-        push_remote(local_git_dir, &mut *conn, refs, opts, progress, cancel)
-    }
-
     /// Perform the `info/refs` discovery for `repo_url` and `service`, returning
     /// the parsed [`Discovery`].
     ///
@@ -995,15 +993,25 @@ impl<C: HttpClient + Clone + 'static> SmartHttpTransport<C> {
         repo_url: &str,
         service: Service,
         git_protocol: Option<&str>,
+        cancel: &CancelToken,
+        owner: &CancelToken,
+        stack_watch: &std::sync::atomic::AtomicBool,
     ) -> Result<(String, Discovery)> {
         let info_url = info_refs_url_for_service(repo_url, service);
         let gp = git_protocol.or_else(|| self.client.git_protocol_header());
-        let (body, final_url) = self.client.get_with_final_url(&info_url, gp)?;
+        let (body, final_url) = get_following_redirects_interruptible(
+            &self.client,
+            &info_url,
+            gp,
+            cancel,
+            owner,
+            stack_watch,
+        )?;
         if let Some(new_base) = rebased_base_from_redirect(repo_url, final_url.as_deref()) {
             let _redirect = format!("http(s): redirected base {repo_url} -> {new_base}");
             self.client.reset_auth_after_redirect_rebase();
             let url = info_refs_url_for_service(&new_base, service);
-            let body = self.client.get(&url, gp)?;
+            let body = get_interruptible(&self.client, &url, gp, cancel, owner, stack_watch)?;
             let stripped = strip_service_advertisement_for_discovery(&body, None)?;
             let disc = parse_advertisement(stripped)?;
             return Ok((new_base, disc));
@@ -1012,6 +1020,40 @@ impl<C: HttpClient + Clone + 'static> SmartHttpTransport<C> {
         let disc = parse_advertisement(stripped)?;
         Ok((repo_url.to_owned(), disc))
     }
+}
+
+fn connect_cancel(opts: &ConnectOptions) -> &CancelToken {
+    opts.cancel.as_deref().unwrap_or(CancelToken::never_ref())
+}
+
+fn get_interruptible<C: HttpClient + Clone + 'static>(
+    client: &C,
+    url: &str,
+    git_protocol: Option<&str>,
+    cancel: &CancelToken,
+    owner: &CancelToken,
+    stack_watch: &std::sync::atomic::AtomicBool,
+) -> crate::error::Result<Vec<u8>> {
+    get_following_redirects_interruptible(client, url, git_protocol, cancel, owner, stack_watch)
+        .map(|(body, _)| body)
+}
+
+fn get_following_redirects_interruptible<C: HttpClient + Clone + 'static>(
+    client: &C,
+    url: &str,
+    git_protocol: Option<&str>,
+    cancel: &CancelToken,
+    owner: &CancelToken,
+    stack_watch: &std::sync::atomic::AtomicBool,
+) -> Result<(Vec<u8>, Option<String>)> {
+    let client = client.clone();
+    let url = url.to_owned();
+    let git_protocol = git_protocol.map(str::to_owned);
+    PendingHttp::spawn("grit-http-get", move || {
+        client.get_following_redirects(&url, git_protocol.as_deref())
+    })
+    .map_err(Error::Io)?
+    .wait_with_watch(cancel, Some(owner), Some(stack_watch), None)
 }
 
 fn info_refs_url_for_service(repo_url: &str, service: Service) -> String {
@@ -1033,12 +1075,14 @@ fn git_protocol_for_version(version: u8) -> Option<String> {
     }
 }
 
-impl<C: HttpClient + Clone + 'static> Transport for SmartHttpTransport<C> {
-    fn connect(
+impl<C: HttpClient + Clone + 'static> SmartHttpTransport<C> {
+    /// Connect while `owner` remains in scope for interruptible discovery GETs.
+    pub(crate) fn connect_with_owner(
         &self,
         url: &str,
         service: Service,
         opts: &ConnectOptions,
+        owner: &CancelToken,
     ) -> Result<Box<dyn Connection>> {
         crate::net_trace::net_trace!(
             opts.network_trace,
@@ -1048,7 +1092,15 @@ impl<C: HttpClient + Clone + 'static> Transport for SmartHttpTransport<C> {
             opts.protocol_version
         );
         let gp = git_protocol_for_version(opts.protocol_version);
-        let (repo_url, disc) = self.discover_with_redirect(url, service, gp.as_deref())?;
+        let cancel = connect_cancel(opts);
+        let (repo_url, disc) = self.discover_with_redirect(
+            url,
+            service,
+            gp.as_deref(),
+            cancel,
+            owner,
+            opts.stack_watch.as_ref(),
+        )?;
         let adv_refs: Vec<(String, ObjectId)> = disc
             .refs
             .iter()
@@ -1072,18 +1124,34 @@ impl<C: HttpClient + Clone + 'static> Transport for SmartHttpTransport<C> {
             caps,
             disc.head_symref,
             disc.object_format,
+            disc.saw_ref_advertisement_flush,
             gp,
+            opts.cancel.clone(),
+            std::sync::Arc::clone(&opts.stack_watch),
         )))
     }
 }
 
-/// Wrap an owned HTTP client for [`http_fetch`] / [`SmartHttpTransport`].
+impl<C: HttpClient + Clone + 'static> Transport for SmartHttpTransport<C> {
+    fn connect(
+        &self,
+        url: &str,
+        service: Service,
+        opts: &ConnectOptions,
+    ) -> Result<Box<dyn Connection>> {
+        let cancel = connect_cancel(opts);
+        self.connect_with_owner(url, service, opts, cancel)
+    }
+}
+
+/// Wrap an owned HTTP client for [`SmartHttpTransport`] or
+/// [`TransferEndpoint::Http`](crate::transfer::TransferEndpoint::Http).
 pub fn http_client_arc(client: impl HttpClient + 'static) -> std::sync::Arc<dyn HttpClient> {
     let boxed: Box<dyn HttpClient> = Box::new(client);
     std::sync::Arc::from(boxed)
 }
 
-/// Fetch from a smart-HTTP remote via the shared [`crate::fetch::fetch_remote`] engine.
+/// Fetch from a smart-HTTP remote into `local` via the shared fetch engine.
 ///
 /// Performs `info/refs` discovery (with redirect re-basing) and drives stateless
 /// `git-upload-pack` POSTs through a [`crate::transport::stateless_http::StatelessHttpConnection`].
@@ -1091,14 +1159,14 @@ pub fn http_client_arc(client: impl HttpClient + 'static) -> std::sync::Arc<dyn 
 /// # Errors
 ///
 /// Returns an error if discovery, negotiation, pack ingest, or ref updates fail.
-pub fn http_fetch(
+pub(crate) fn http_fetch(
     client: std::sync::Arc<dyn HttpClient>,
-    local_git_dir: &Path,
+    local: &crate::repo::Repository,
     repo_url: &str,
     opts: &mut FetchOptions,
     progress: &mut dyn Progress,
+    cancel: &CancelToken,
 ) -> Result<FetchOutcome> {
-    use crate::fetch::fetch_remote;
     use crate::transport::Transport;
     let protocol_version = client
         .git_protocol_header()
@@ -1113,15 +1181,13 @@ pub fn http_fetch(
     };
     let transport = SmartHttpTransport::new(client);
     let mut conn = transport.connect(repo_url, Service::UploadPack, &connect)?;
-    fetch_remote(
-        local_git_dir,
-        &mut *conn,
-        opts,
-        progress,
-        &crate::progress::NeverCancel,
-    )
+    crate::fetch::fetch_remote_into(local, &mut *conn, opts, progress, cancel)
 }
 
 #[cfg(test)]
 #[path = "http_discovery_tests.rs"]
 mod discovery_tests;
+
+#[cfg(test)]
+#[path = "http_cancel_tests.rs"]
+mod cancel_tests;

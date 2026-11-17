@@ -5,9 +5,10 @@
 //! keeps pushes off the target branch of a repository with snapshot checkouts.
 
 pub mod receive_pack;
+pub mod session;
 pub mod upload_pack;
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use grit_lib::config::git_path::path_for_error_message;
@@ -16,11 +17,13 @@ use grit_lib::config::ConfigSet;
 pub use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::objects::odb::Odb;
 use grit_lib::remote::serve::{
-    self, ProtocolVersion, ReceiveHook, ReceivePolicy, RefCommand, RefUpdateRefusal,
-    RefUpdateResult, ServeOptions,
+    self, ProtocolVersion, ReceiveHook, ReceiveHookContext, ReceiveOutcome, ReceivePolicy,
+    RefCommand, RefUpdateRefusal, RefUpdateResult, ServeOptions, UploadOutcome,
 };
 use grit_lib::remote::snapshot_checkout::TargetGuard;
 use grit_lib::repo::Repository;
+
+pub use session::{ReceiveRpcResult, ServeSession};
 
 /// Errors from smart-protocol handlers.
 #[derive(Debug, thiserror::Error)]
@@ -33,7 +36,7 @@ pub enum Error {
     Serve(#[from] serve::ServeError),
     /// Opening or reading repository state failed.
     #[error(transparent)]
-    Repository(#[from] grit_lib::error::Error),
+    Repository(Box<grit_lib::error::Error>),
     /// Buffered I/O failed while collecting the response.
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -48,9 +51,9 @@ impl Error {
     /// error rather than a server error. During receive-pack that is the only source of
     /// stream errors: the response is collected in memory, and repository failures are
     /// reported as other [`serve::ServeError`] variants or inside the status report.
-    /// Upload-pack can
-    /// also return stream errors while reading repository data, so do not use this to
-    /// classify upload-pack failures.
+    /// Upload-pack can also return stream errors while reading repository data. When the
+    /// inner error is [`grit_lib::remote::serve::RequestBodyLimitExceeded`], smart HTTP
+    /// maps the failure to 413; other upload-pack stream errors are usually server faults.
     ///
     /// # Returns
     ///
@@ -60,6 +63,18 @@ impl Error {
         match self {
             Self::Serve(serve::ServeError::Io(e)) => Some(e),
             _ => None,
+        }
+    }
+}
+
+impl From<grit_lib::error::Error> for Error {
+    fn from(value: grit_lib::error::Error) -> Self {
+        match value {
+            grit_lib::error::Error::Remote(grit_lib::remote::RemoteError::Serve(serve)) => {
+                Self::Serve(serve)
+            }
+            grit_lib::error::Error::Io(io) => Self::Serve(serve::ServeError::Io(io)),
+            other => Self::Repository(Box::new(other)),
         }
     }
 }
@@ -120,6 +135,74 @@ impl ReceiveHook for PushGuard {
             .iter()
             .any(|u| u.error.is_some() && guard.guards(&u.refname))
             .then(|| target_push_advice(guard.target()))
+    }
+}
+
+struct GuardedHook {
+    guard: PushGuard,
+    extra: Option<std::sync::Arc<dyn ReceiveHook + Send + Sync>>,
+}
+
+impl ReceiveHook for GuardedHook {
+    fn pre_receive_ctx(
+        &self,
+        commands: &[RefCommand],
+        odb: &Odb,
+        ctx: &ReceiveHookContext<'_>,
+    ) -> std::result::Result<(), RefUpdateRefusal> {
+        self.guard.pre_receive_ctx(commands, odb, ctx)?;
+        if let Some(h) = self.extra.as_deref() {
+            h.pre_receive_ctx(commands, odb, ctx)?;
+        }
+        Ok(())
+    }
+
+    fn update_ctx(
+        &self,
+        command: &RefCommand,
+        odb: &Odb,
+        ctx: &ReceiveHookContext<'_>,
+    ) -> std::result::Result<(), RefUpdateRefusal> {
+        self.guard.update_ctx(command, odb, ctx)?;
+        if let Some(h) = self.extra.as_deref() {
+            h.update_ctx(command, odb, ctx)?;
+        }
+        Ok(())
+    }
+
+    fn message(&self, updates: &[RefUpdateResult]) -> Option<String> {
+        match (
+            self.guard.message(updates),
+            self.extra.as_deref().and_then(|h| h.message(updates)),
+        ) {
+            (None, None) => None,
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (Some(a), Some(b)) => Some(format!("{a}{b}")),
+        }
+    }
+
+    fn post_receive(
+        &self,
+        commands: &[&RefCommand],
+        odb: &Odb,
+        ctx: &ReceiveHookContext<'_>,
+    ) -> std::result::Result<(), RefUpdateRefusal> {
+        if let Some(h) = self.extra.as_deref() {
+            h.post_receive(commands, odb, ctx)?;
+        }
+        Ok(())
+    }
+
+    fn post_update(
+        &self,
+        commands: &[&RefCommand],
+        odb: &Odb,
+    ) -> std::result::Result<(), RefUpdateRefusal> {
+        if let Some(h) = self.extra.as_deref() {
+            h.post_update(commands, odb)?;
+        }
+        Ok(())
     }
 }
 
@@ -189,7 +272,7 @@ pub(crate) fn run_upload_pack(
         protocol_version,
         stateless_rpc,
         advertise_refs,
-        input,
+        &mut &*input,
         repository_options,
         extensions,
         &mut output,
@@ -203,18 +286,48 @@ pub(crate) fn run_upload_pack_to(
     protocol_version: Option<u8>,
     stateless_rpc: bool,
     advertise_refs: bool,
-    input: &[u8],
+    input: &mut dyn Read,
     repository_options: &RepositoryOptions,
     extensions: &Extensions,
     output: &mut dyn std::io::Write,
 ) -> Result<()> {
+    run_upload_pack_with_session(
+        repo_path,
+        protocol_version,
+        stateless_rpc,
+        advertise_refs,
+        input,
+        repository_options,
+        extensions,
+        output,
+        &ServeSession::none(),
+    )
+    .map(|_| ())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_upload_pack_with_session(
+    repo_path: &Path,
+    protocol_version: Option<u8>,
+    stateless_rpc: bool,
+    advertise_refs: bool,
+    input: &mut dyn Read,
+    repository_options: &RepositoryOptions,
+    extensions: &Extensions,
+    output: &mut dyn std::io::Write,
+    session: &ServeSession,
+) -> Result<UploadOutcome> {
     let without_fetcher = repository_options
         .clone()
         .with_promisor_fetcher(None)
         .for_serving();
     let repo = Repository::open(repo_path, &without_fetcher)?;
-    let config =
-        ConfigSet::load(repo.environment(), Some(repo.git_dir()), true).unwrap_or_default();
+    let config = ConfigSet::load(
+        repo.environment(),
+        Some(repo.git_dir()),
+        &grit_lib::config::LoadConfigOptions::standard(repo.environment(), Some(repo.git_dir())),
+    )
+    .unwrap_or_default();
     let hidden_refs = grit_lib::refs::hide_refs::hide_ref_patterns_uploadpack(&config);
     let mut opts = ServeOptions {
         protocol: protocol_version_from_header(protocol_version),
@@ -229,9 +342,11 @@ pub(crate) fn run_upload_pack_to(
     };
     // The promisor fetcher in `repository_options` is used only when this request may
     // fetch missing promised objects; otherwise the served repository fetches nothing.
-    opts.attach_promisor_fetcher(&repo, &config, repository_options.promisor_fetcher.clone());
-    let _summary = serve::upload_pack(&repo, &mut &*input, output, &mut opts)?;
-    Ok(())
+    opts.attach_promisor_fetcher(&repo, repository_options.promisor_fetcher.clone());
+    serve::UploadPack::new(&repo, &mut opts)
+        .with_cancel(session.cancel())
+        .run(input, output)
+        .map_err(Error::from)
 }
 
 pub(crate) fn run_receive_pack(
@@ -242,13 +357,63 @@ pub(crate) fn run_receive_pack(
     repository_options: &RepositoryOptions,
     extensions: &Extensions,
 ) -> Result<Vec<u8>> {
+    let mut output = Vec::new();
+    run_receive_pack_to(
+        repo_path,
+        stateless_rpc,
+        advertise_refs,
+        input,
+        repository_options,
+        extensions,
+        &mut output,
+    )?;
+    Ok(output)
+}
+
+pub(crate) fn run_receive_pack_to(
+    repo_path: &Path,
+    stateless_rpc: bool,
+    advertise_refs: bool,
+    input: &mut dyn Read,
+    repository_options: &RepositoryOptions,
+    extensions: &Extensions,
+    output: &mut dyn Write,
+) -> Result<()> {
+    run_receive_pack_with_session(
+        repo_path,
+        stateless_rpc,
+        advertise_refs,
+        input,
+        repository_options,
+        extensions,
+        output,
+        &ServeSession::none(),
+    )
+    .map(|_| ())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_receive_pack_with_session(
+    repo_path: &Path,
+    stateless_rpc: bool,
+    advertise_refs: bool,
+    input: &mut dyn Read,
+    repository_options: &RepositoryOptions,
+    extensions: &Extensions,
+    output: &mut dyn Write,
+    session: &ServeSession,
+) -> Result<ReceiveOutcome> {
     let options = repository_options
         .clone()
         .with_promisor_fetcher(None)
         .for_serving();
     let repo = Repository::open(repo_path, &options)?;
-    let config =
-        ConfigSet::load(repo.environment(), Some(repo.git_dir()), true).unwrap_or_default();
+    let config = ConfigSet::load(
+        repo.environment(),
+        Some(repo.git_dir()),
+        &grit_lib::config::LoadConfigOptions::standard(repo.environment(), Some(repo.git_dir())),
+    )
+    .unwrap_or_default();
     let hidden_refs = grit_lib::refs::hide_refs::hide_ref_patterns_receive(&config);
     let opts = ServeOptions {
         protocol: ProtocolVersion::V0,
@@ -262,9 +427,15 @@ pub(crate) fn run_receive_pack(
     };
     let policy = ReceivePolicy::from_config(&config);
     let guard = PushGuard::for_repository(&repo);
-    let mut output = Vec::new();
-    serve::receive_pack_with_hook(&repo, input, &mut output, &opts, &policy, &guard)?;
-    Ok(output)
+    let hook = GuardedHook {
+        guard,
+        extra: session.receive_hook.clone(),
+    };
+    serve::ReceivePack::new(&repo, &opts, &policy)
+        .with_hook(&hook)
+        .with_cancel(session.cancel())
+        .run(input, output)
+        .map_err(Error::from)
 }
 
 #[cfg(test)]

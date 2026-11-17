@@ -142,6 +142,8 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-on-failure: true
 
+      - run: cargo check -p grit-lib
+      - run: cargo check -p grit-cli
       - run: cargo clippy --workspace -- -D warnings
 
   check-windows-msvc:
@@ -195,6 +197,38 @@ jobs:
           cache-on-failure: true
 
       - run: make public-api-check
+      - run: make api-ratchet-check
+      - run: make api-audit-check
+
+  # Required check: blocks merges on breaking grit-lib API changes (additive-only within 0.6.x).
+  semver-check:
+    name: semver-check
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Use all CPU cores for Cargo (override .cargo/config.toml jobs = 2)
+        run: echo "CARGO_BUILD_JOBS=$(nproc)" >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@1.99.0
+
+      - name: Install cargo-semver-checks (see scripts/semver-check.sh)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev pkg-config
+          CARGO_SEMVER_CHECKS_VERSION="$(grep 'CARGO_SEMVER_CHECKS_VERSION=' scripts/semver-check.sh | cut -d'"' -f2)"
+          cargo install cargo-semver-checks --version "${CARGO_SEMVER_CHECKS_VERSION}" --locked
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: semver-check
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
+
+      - run: make semver-check
 
   rustdoc:
     name: rustdoc
@@ -420,8 +454,8 @@ jobs:
         # so most never ran) in parallel, each test in its own process
         # (.config/nextest.toml); doctests still need cargo test.
         run: |
-          cargo nextest run --workspace --profile ci
-          cargo test --workspace --doc
+          cargo nextest run --workspace --profile ci --features grit-lib/test-support
+          cargo test --workspace --doc --features grit-lib/test-support
 
   test-full:
     name: test-full

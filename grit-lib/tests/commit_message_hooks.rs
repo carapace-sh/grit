@@ -12,22 +12,21 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use grit_lib::command_runner::hooks::HookError;
+use grit_lib::command_runner::hooks::{HookName, PostOperationHooks};
 use grit_lib::config::environment::{Environment, RepositoryOptions};
 use grit_lib::error::Error;
+use grit_lib::merge::{ContinueOptions, IntegrateBranchOutcome, MergeCommitMode, MergeOptions};
 use grit_lib::objects::ObjectId;
-use grit_lib::porcelain::commit::{create_commit, CommitOutcome, CommitRequest, HookPolicy};
-use grit_lib::porcelain::merge::{
-    continue_merge, integrate_branch_with, ContinueOptions, IntegrateBranchOutcome,
-    MergeCommitMode, MergeOptions,
-};
-use grit_lib::progress::{NeverCancel, NullProgress};
+use grit_lib::porcelain::commit::{CommitOutcome, CommitRequest, HookPolicy};
+use grit_lib::progress::CancelToken;
+use grit_lib::progress::NullProgress;
 use grit_lib::repo::Repository;
 use grit_lib::revwalk::history::{
-    plan_rebase_with_hook, start_rebase, ApplyOptions, EmptyPolicy, HistoryError, PreRebase,
-    RebaseOntoOptions, RebaseOutcome, RebasePlan, RebaseRequest, RebaseSessionError, RefScope,
-    RewriteOptions, StartRebaseOptions,
+    ApplyOptions, EmptyPolicy, HistoryEngineError, HistoryError, PreRebase, RebaseOntoOptions,
+    RebaseOutcome, RebasePlan, RebaseRequest, RebaseSessionError, RefScope, RewriteOptions,
+    StartRebaseOptions,
 };
-use grit_lib::{HookName, PostOperationHooks};
+use grit_test_support::{continue_merge, integrate_branch_with};
 
 const IDENT: &str = "Hook Tester <hooks@grit.test> 1700000000 +0000";
 const LOGGED_HOOKS: [&str; 6] = [
@@ -144,22 +143,30 @@ impl Fixture {
 }
 
 fn request(message: &str) -> CommitRequest {
-    CommitRequest {
-        message: message.into(),
-        author: Some(IDENT.parse().expect("signature")),
-        committer: Some(IDENT.parse().expect("signature")),
-        allow_empty: true,
-        ..Default::default()
+    {
+        let mut req = CommitRequest::new(message);
+        req.author = Some(IDENT.parse().expect("signature"));
+        req.committer = Some(IDENT.parse().expect("signature"));
+        req.allow_empty = true;
+        req
     }
 }
 
 fn commit(repo: &Repository, req: &CommitRequest) -> grit_lib::error::Result<CommitOutcome> {
-    create_commit(repo, req, &mut NullProgress, &NeverCancel)
+    repo.commits()
+        .create_staged(&req, &mut NullProgress, &CancelToken::never())
 }
 
 fn hook_failed(err: &Error) -> Option<&str> {
     match err {
         Error::Hook(HookError::Failed { hook_name, .. }) => Some(hook_name.as_str()),
+        _ => None,
+    }
+}
+
+fn hook_failed_from_hook(err: &HookError) -> Option<&str> {
+    match err {
+        HookError::Failed { hook_name, .. } => Some(hook_name.as_str()),
         _ => None,
     }
 }
@@ -187,7 +194,7 @@ fn merge(
         "side",
         options,
         &mut NullProgress,
-        &NeverCancel,
+        &CancelToken::never(),
     )
 }
 
@@ -232,10 +239,8 @@ fn no_verify_still_runs_prepare_commit_msg() {
     fx.commit("f", "1\n", "c1");
     let repo = fx.repo();
 
-    let req = CommitRequest {
-        hooks: HookPolicy::SkipVerify,
-        ..request("skip verify")
-    };
+    let mut req = request("skip verify");
+    req.hooks = HookPolicy::SkipVerify;
     let outcome = commit(&repo, &req).expect("commit");
     assert_eq!(outcome.hooks_run, vec![HookName::PrepareCommitMsg]);
     assert_eq!(
@@ -250,15 +255,11 @@ fn reused_and_amended_messages_name_their_source_commit() {
     let c1 = fx.commit("f", "1\n", "c1");
     let repo = fx.repo();
 
-    let reuse = CommitRequest {
-        reuse_message_from: Some(c1),
-        ..request("")
-    };
+    let mut reuse = request("");
+    reuse.reuse_message_from = Some(c1);
     let reused = commit(&repo, &reuse).expect("reuse");
-    let amend = CommitRequest {
-        amend: true,
-        ..request("")
-    };
+    let mut amend = request("");
+    amend.amend = true;
     commit(&repo, &amend).expect("amend");
     let log = fx.take_log();
     let prepares: Vec<&String> = log
@@ -287,10 +288,8 @@ fn amend_with_message_reports_message_like_git() {
     fx.commit("f", "1\n", "c1");
     let repo = fx.repo();
 
-    let amend = CommitRequest {
-        amend: true,
-        ..request("reworded")
-    };
+    let mut amend = request("reworded");
+    amend.amend = true;
     commit(&repo, &amend).expect("amend");
     let grit_log = fx.take_log();
 
@@ -350,7 +349,7 @@ fn finishing_a_squash_or_merge_names_squash_or_merge() {
             committer: None,
         },
         &mut NullProgress,
-        &NeverCancel,
+        &CancelToken::never(),
     )
     .expect("continue");
     assert!(fx
@@ -447,10 +446,8 @@ fn failing_prepare_commit_msg_leaves_head_unchanged() {
     fx.write_hook("prepare-commit-msg", "exit 7");
     let repo = fx.repo();
 
-    let req = CommitRequest {
-        hooks: HookPolicy::SkipVerify,
-        ..request("refused")
-    };
+    let mut req = request("refused");
+    req.hooks = HookPolicy::SkipVerify;
     let err = commit(&repo, &req).expect_err("prepare-commit-msg refuses");
     assert_eq!(hook_failed(&err), Some("prepare-commit-msg"));
     assert_eq!(fx.oid("HEAD"), c1);
@@ -633,33 +630,41 @@ fn rebase_opts(upstream: ObjectId, tip: ObjectId, pre_rebase: PreRebase) -> Star
             onto: None,
             branch_tip: tip,
         },
-        rebase: RebaseOntoOptions::new(RewriteOptions {
-            scope: RefScope::Head,
-            empty: EmptyPolicy::Drop,
-            committer: IDENT.parse().expect("signature"),
-            preserve_committer: false,
-            sign: false,
-        }),
+        rebase: RebaseOntoOptions {
+            pre_rebase,
+            ..RebaseOntoOptions::new(RewriteOptions {
+                scope: RefScope::Head,
+                empty: EmptyPolicy::Drop,
+                committer: IDENT.parse().expect("signature"),
+                preserve_committer: false,
+                sign: false,
+            })
+        },
         apply: ApplyOptions {
             identity: IDENT.parse().expect("signature"),
             reflog_message: "rebase".into(),
             record_operation: None,
             hooks: PostOperationHooks::Skip,
         },
-        pre_rebase,
+        exec: None,
     }
 }
 
-fn rebase(
-    repo: &Repository,
-    opts: &StartRebaseOptions,
-) -> Result<RebaseOutcome, RebaseSessionError> {
-    start_rebase(repo, opts, &mut NullProgress, &NeverCancel)
+fn rebase(repo: &Repository, opts: &StartRebaseOptions) -> grit_lib::error::Result<RebaseOutcome> {
+    repo.history().start_rebase(
+        opts,
+        repo.command_runner().as_ref(),
+        &mut NullProgress,
+        &CancelToken::never(),
+    )
 }
 
 fn history_hook_failed(err: &HistoryError) -> Option<&str> {
     match err {
-        HistoryError::Library(lib) => hook_failed(lib),
+        HistoryError::Engine(e) => match e.as_ref() {
+            HistoryEngineError::Hook(h) => hook_failed_from_hook(h),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -704,8 +709,11 @@ fn refused_pre_rebase_wins_over_a_replay_conflict_like_git() {
         onto: None,
         branch_tip: topic,
     };
-    let opts = rebase_opts(main, topic, PreRebase::Skip).rebase;
-    let err = plan_rebase_with_hook(&repo, &request, &opts, &hook).expect_err("refused");
+    let hooked = rebase_opts(main, topic, hook).rebase;
+    let err = repo
+        .history()
+        .plan_rebase(&request, &hooked)
+        .expect_err("refused");
     assert_eq!(history_hook_failed(&err), Some("pre-rebase"), "{err:?}");
     assert_eq!(
         fx.git(&["count-objects"]),
@@ -713,7 +721,9 @@ fn refused_pre_rebase_wins_over_a_replay_conflict_like_git() {
         "a refused rebase writes no objects"
     );
     assert!(matches!(
-        plan_rebase_with_hook(&repo, &request, &opts, &PreRebase::Skip).expect("plan"),
+        repo.history()
+            .plan_rebase(&request, &rebase_opts(main, topic, PreRebase::Skip).rebase)
+            .expect("plan"),
         RebasePlan::Conflict { .. }
     ));
     assert_eq!(

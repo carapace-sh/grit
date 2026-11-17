@@ -1,5 +1,5 @@
 //! Rev-walk queries, `:/text` searches and linked worktree add/list/remove read and write
-//! refs through [`Repository::refs`] (issue #1889): an injected [`MemoryRefStore`] gives the
+//! refs through [`Repository::ref_store`] (issue #1889): an injected [`MemoryRefStore`] gives the
 //! same answers as a files repository with the same history, and the files variant agrees
 //! with the system `git`.
 
@@ -10,17 +10,15 @@ use std::sync::Arc;
 
 use grit_lib::config::environment::{Environment, RepositoryOptions};
 use grit_lib::objects::odb::store::MemoryStore;
-use grit_lib::objects::odb::OdbBuilder;
 use grit_lib::objects::{HashAlgo, ObjectId};
-use grit_lib::porcelain::add::{stage, StageOptions};
-use grit_lib::porcelain::branch::{create_branch, CreateBranchOptions};
-use grit_lib::porcelain::commit::{commit_with_scope, CommitRequest, CommitScope};
+use grit_lib::porcelain::add::StageOptions;
+use grit_lib::porcelain::branch::{create_branch, BranchCreateOptions};
+use grit_lib::porcelain::commit::{CommitRequest, CommitScope};
 use grit_lib::porcelain::tag::{create_tag, CreateTagRequest};
 use grit_lib::progress::NullProgress;
-use grit_lib::refs::store::{MemoryRefStore, RawRef, RefStore};
-use grit_lib::repo::{InitOptions, Repository, RepositoryBuilder};
-use grit_lib::revwalk::queries::{RefSelection, RevWalkListOptions};
-use grit_lib::revwalk::rev_list::{collect_revision_specs_from_stdin_lines, tag_targets};
+use grit_lib::refs::store::{MemoryRefStore, RawRef, RefNameRef, RefStore};
+use grit_lib::repo::{InitOptions, Repository};
+use grit_lib::revwalk::{RefSelection, RevWalkListOptions};
 use grit_lib::state::HeadState;
 use grit_lib::worktree::{AddLinkedWorktreeOptions, WorktreeBranch, WorktreeEntry};
 
@@ -41,16 +39,15 @@ fn memory_repo(git_dir: &Path, work_tree: &Path) -> (Repository, Arc<MemoryRefSt
     fs::create_dir_all(work_tree).expect("work tree");
     fs::write(git_dir.join("config"), USER_CONFIG).expect("config");
     let store = Arc::new(MemoryRefStore::new());
-    let repo = RepositoryBuilder::new(options())
-        .odb_builder(
-            OdbBuilder::files(git_dir.join("objects"))
-                .primary(Arc::new(MemoryStore::new(HashAlgo::Sha1)))
-                .alternates(false),
-        )
-        .ref_store(store.clone())
-        .initial_branch("main")
-        .open(git_dir, Some(work_tree))
-        .expect("open in-memory repository");
+    let repo = Repository::open(
+        git_dir,
+        &(options()
+            .with_object_store(Arc::new(MemoryStore::new(HashAlgo::Sha1)))
+            .with_ref_store(store.clone())
+            .with_initial_branch("main")
+            .with_work_tree(work_tree)),
+    )
+    .expect("open in-memory repository");
     (repo, store)
 }
 
@@ -68,27 +65,30 @@ fn files_repo(work_tree: &Path) -> Repository {
 }
 
 fn commit_all(repo: &Repository, message: &str) -> ObjectId {
-    stage(
-        repo,
-        &StageOptions::default(),
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("stage");
-    commit_with_scope(
-        repo,
-        &CommitRequest {
-            message: message.into(),
-            author: Some(IDENT_TS.parse().expect("signature")),
-            committer: Some(IDENT_TS.parse().expect("signature")),
-            ..Default::default()
-        },
-        CommitScope::Staged,
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("commit")
-    .oid
+    repo.index()
+        .stage(
+            &StageOptions::default(),
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("stage");
+    repo.commits()
+        .create(
+            &grit_lib::commits::CommitOptions::new(
+                &{
+                    let mut req = CommitRequest::new(message);
+                    req.author = Some(IDENT_TS.parse().expect("signature"));
+                    req.committer = Some(IDENT_TS.parse().expect("signature"));
+                    req
+                }
+                .clone(),
+                CommitScope::Staged,
+            ),
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("commit")
+        .oid
 }
 
 /// Everything [`battery`] observed, compared across ref backends.
@@ -115,7 +115,7 @@ fn count(repo: &Repository, refs: Vec<RefSelection>) -> usize {
         refs,
         ..RevWalkListOptions::default()
     };
-    repo.rev_walk().count(&[], &options).expect("count")
+    repo.revwalk().count(&[], &options).expect("count")
 }
 
 fn sorted(mut v: Vec<String>) -> Vec<String> {
@@ -128,10 +128,11 @@ fn sorted(mut v: Vec<String>) -> Vec<String> {
 fn battery(repo: &Repository, wt: &Path, linked: &Path) -> Observed {
     fs::write(wt.join("f"), "x\n").expect("write");
     let first = commit_all(repo, "hello world");
-    create_branch(repo, &CreateBranchOptions::at_head("side")).expect("side");
-    create_tag(
-        repo,
-        &CreateTagRequest {
+    repo.branches()
+        .create(&BranchCreateOptions::at_head("side"))
+        .expect("side");
+    repo.tags()
+        .create(&CreateTagRequest {
             name: "v1".into(),
             target: first,
             message: None,
@@ -141,26 +142,41 @@ fn battery(repo: &Repository, wt: &Path, linked: &Path) -> Observed {
             tree_sha256: None,
             force: false,
             dry_run: false,
-        },
-    )
-    .expect("tag");
+        })
+        .expect("tag");
     fs::write(wt.join("g"), "y\n").expect("write");
     let second = commit_all(repo, "second change");
 
-    let walk = repo.rev_walk();
-    let main = walk.resolve("main").expect("resolve main");
-    let hello = walk.resolve(":/hello").expect("resolve :/hello");
+    let walk = repo.revwalk();
+    let main = walk
+        .resolve("main", &grit_lib::revwalk::ResolveOptions::default())
+        .expect("resolve main");
+    let hello = walk
+        .resolve(":/hello", &grit_lib::revwalk::ResolveOptions::default())
+        .expect("resolve :/hello");
     assert_eq!(hello, first);
-    assert_eq!(walk.resolve(":/second").expect(":/second"), second);
+    assert_eq!(
+        walk.resolve(":/second", &grit_lib::revwalk::ResolveOptions::default())
+            .expect(":/second"),
+        second
+    );
 
     let stdin = |lines: &[&str]| {
-        collect_revision_specs_from_stdin_lines(repo, &[], lines).expect("stdin specs")
+        repo.revwalk()
+            .parse_stdin_specs(&[], lines)
+            .expect("stdin specs")
     };
-    let (_, stdin_all_negated, all_flag, _) = stdin(&["--not", "--all"]);
-    assert!(!all_flag);
-    let (stdin_branches, _, _, _) = stdin(&["--branches"]);
-    let (stdin_tags_glob, _, _, _) = stdin(&["--tags=v*"]);
-    let mut tags: Vec<ObjectId> = tag_targets(repo).expect("tags").into_iter().collect();
+    let negated = stdin(&["--not", "--all"]);
+    assert!(!negated.all_refs);
+    let stdin_all_negated = negated.negative;
+    let stdin_branches = stdin(&["--branches"]).positive;
+    let stdin_tags_glob = stdin(&["--tags=v*"]).positive;
+    let mut tags: Vec<ObjectId> = repo
+        .revwalk()
+        .tag_targets()
+        .expect("tags")
+        .into_iter()
+        .collect();
     tags.sort();
 
     let added: WorktreeEntry = repo
@@ -204,7 +220,9 @@ fn battery(repo: &Repository, wt: &Path, linked: &Path) -> Observed {
         stdin_tags_glob,
         linked_head: added.head.clone(),
         linked_listed_head: linked_row.head.clone(),
-        linked_branch_tip: walk.resolve("linked").expect("linked branch"),
+        linked_branch_tip: walk
+            .resolve("linked", &grit_lib::revwalk::ResolveOptions::default())
+            .expect("linked branch"),
     };
 
     repo.worktrees()
@@ -279,11 +297,15 @@ fn assert_nothing_on_disk(git_dir: &Path) {
 
 fn assert_store(store: &MemoryRefStore, observed: &Observed) {
     assert_eq!(
-        store.read_raw("refs/heads/linked").expect("linked"),
+        store
+            .read_raw(RefNameRef::from_trusted("refs/heads/linked"))
+            .expect("linked"),
         Some(RawRef::Direct(observed.hello))
     );
     assert_eq!(
-        store.read_raw("HEAD").expect("HEAD"),
+        store
+            .read_raw(RefNameRef::from_trusted("HEAD"))
+            .expect("HEAD"),
         Some(RawRef::Symbolic("refs/heads/main".into())),
         "adding a linked worktree must not move the main worktree's HEAD"
     );
@@ -334,11 +356,17 @@ fn mid_component_ref_globs_match_packed_refs() {
     git(wt, &["pack-refs", "--all"]);
     let repo = Repository::open(&wt.join(".git"), &options().with_work_tree(wt)).expect("open");
 
-    let (tags, _, _, _) =
-        collect_revision_specs_from_stdin_lines(&repo, &[], &["--tags=v*"]).expect("stdin");
+    let specs = repo
+        .revwalk()
+        .parse_stdin_specs(&[], &["--tags=v*"])
+        .expect("stdin");
+    let tags = specs.positive;
     assert_eq!(tags, vec![tip.to_hex()]);
-    let (branches, _, _, _) =
-        collect_revision_specs_from_stdin_lines(&repo, &[], &["--branches=b05*"]).expect("stdin");
+    let specs = repo
+        .revwalk()
+        .parse_stdin_specs(&[], &["--branches=b05*"])
+        .expect("stdin");
+    let branches = specs.positive;
     assert_eq!(branches, vec![tip.to_hex()]);
     assert_eq!(count(&repo, vec![RefSelection::Tags(Some("v*".into()))]), 1);
     assert_eq!(

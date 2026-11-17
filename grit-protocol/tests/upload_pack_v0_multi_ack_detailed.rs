@@ -26,7 +26,7 @@ fn stateless_v0_done_emits_bare_ack_before_sideband_pack() {
     let dir =
         std::env::temp_dir().join(format!("grit-v0-multi-ack-detailed-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    Repository::init(
+    let (_, _) = Repository::init(
         &dir,
         &InitOptions::new()
             .with_bare(true)
@@ -38,7 +38,9 @@ fn stateless_v0_done_emits_bare_ack_before_sideband_pack() {
     let tree = ObjectId::from_hex("4b825dc642cb6eb9a060e54bf8d69288fbee4904").expect("tree");
     let parent = write_commit(&repo, tree, None, "root");
     let tip = write_commit(&repo, tree, Some(parent), "child");
-    grit_lib::refs::write_ref(&dir, "refs/heads/main", &tip).expect("ref");
+    repo.references()
+        .update("refs/heads/main", &tip)
+        .expect("ref");
 
     let caps = " multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta";
     let mut body = Vec::new();

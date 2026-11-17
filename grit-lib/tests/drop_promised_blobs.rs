@@ -4,6 +4,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use grit_lib::error::ObjectError;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -11,26 +12,28 @@ use std::time::{Duration, SystemTime};
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::config::ConfigSet;
 use grit_lib::error::Error;
-use grit_lib::maintenance::repository_fsck::{fsck, FsckOptions};
+use grit_lib::maintenance::repository_fsck::FsckOptions;
 use grit_lib::maintenance::{
-    drop_promised_blobs, gc, gc_auto, offload_blobs, AutoGcOutcome, DropPromisedBlobsOptions,
-    DropPromisedBlobsReport, DropPromisedBlobsSkip, GcOptions, MidxOptions, OffloadOptions,
-    LOP_KEEP_MESSAGE,
+    AutoGcOutcome, DropPromisedBlobsOptions, DropPromisedBlobsReport, DropPromisedBlobsSkip,
+    GcOptions, MidxOptions, OffloadOptions, LOP_KEEP_MESSAGE,
 };
 use grit_lib::objects::index_pack::{install_pack_bytes, IngestPackOptions};
-use grit_lib::objects::pack::{clear_pack_cache, read_pack_index, read_packed_delta_dependency};
 use grit_lib::objects::pack_objects::{build_pack_from_send_list, PackBuildOptions};
 use grit_lib::objects::promisor::{DefaultPromisorFetcher, PromisorFetcher};
 use grit_lib::objects::{ObjectId, ObjectKind};
-use grit_lib::progress::{NeverCancel, NullProgress};
+use grit_lib::porcelain::MergeError;
+use grit_lib::progress::{CancelToken, NullProgress};
 use grit_lib::refs::ref_storage::RefStorageFormat;
 use grit_lib::remote::clone::{clone, CloneOptions};
 use grit_lib::remote::fetch::NoProgress;
 use grit_lib::remote::partial_clone::ObjectFilterSpec;
 use grit_lib::remote::transport::http::HttpClient;
-use grit_lib::remote::{HttpClientFactory, RemoteError, RemoteResult};
-use grit_lib::repo::{InitOptions, Repository};
+use grit_lib::remote::{HttpClientFactory, RemoteError};
+use grit_lib::repo::{InitOptions, Repository, RepositoryError};
 use grit_lib::state::InProgressOperation;
+use grit_lib::test_support::objects_pack::{
+    clear_pack_cache, read_pack_index, read_packed_delta_dependency,
+};
 use time::OffsetDateTime;
 
 /// The fixed "current time" of every run: far after any file these tests write.
@@ -51,12 +54,12 @@ fn days_ago(days: u64) -> SystemTime {
 struct NoHttp;
 
 impl HttpClientFactory for NoHttp {
-    fn create(&self, _: &ConfigSet) -> RemoteResult<Box<dyn HttpClient>> {
-        Err(RemoteError::UnsupportedScheme)
+    fn create(&self, _: &ConfigSet) -> grit_lib::error::Result<Box<dyn HttpClient>> {
+        Err(grit_lib::error::Error::from(RemoteError::UnsupportedScheme))
     }
 
-    fn create_for_probe(&self, _: &ConfigSet) -> RemoteResult<Box<dyn HttpClient>> {
-        Err(RemoteError::UnsupportedScheme)
+    fn create_for_preflight(&self, _: &ConfigSet) -> grit_lib::error::Result<Box<dyn HttpClient>> {
+        Err(grit_lib::error::Error::from(RemoteError::UnsupportedScheme))
     }
 }
 
@@ -128,7 +131,7 @@ impl Fixture {
     fn build(tag_stray: bool) -> Self {
         let tmp = tempfile::tempdir().unwrap();
         let server_dir = tmp.path().join("server.git");
-        let server = Repository::init(
+        let (server, _) = Repository::init(
             &server_dir,
             &InitOptions::new()
                 .with_bare(true)
@@ -177,7 +180,7 @@ impl Fixture {
         let mut opts = CloneOptions::new(format!("file://{}", server_dir.display()), dest);
         opts.filter = Some(ObjectFilterSpec::BlobLimit(LIMIT));
         opts.checkout = false;
-        let outcome = clone(opts, &mut NoProgress, &NeverCancel, None).expect("clone");
+        let outcome = clone(opts, &mut NullProgress, &CancelToken::never(), None).expect("clone");
         let git_dir = outcome.repo.git_dir().to_path_buf();
         drop(outcome);
         clear_pack_cache();
@@ -263,7 +266,11 @@ impl Fixture {
     }
 
     fn run(&self, opts: &DropPromisedBlobsOptions) -> DropPromisedBlobsReport {
-        let report = drop_promised_blobs(&self.offline(), opts).expect("drop");
+        let report = self
+            .offline()
+            .maintenance()
+            .drop_promised_blobs(opts)
+            .expect("drop");
         clear_pack_cache();
         report
     }
@@ -336,14 +343,15 @@ fn old_versions_go_and_the_checked_out_one_stays() {
             pack.display()
         );
     }
-    let fsck_report = fsck(
-        &repo,
-        &FsckOptions::full_repository(false),
-        &mut NullProgress,
-        &NeverCancel,
-    )
-    .expect("fsck");
-    let config = repo.config().unwrap();
+    let fsck_report = repo
+        .maintenance()
+        .fsck(
+            &FsckOptions::full_repository(false),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("fsck");
+    let config = repo.config().snapshot().unwrap();
     assert!(
         fsck_report.ok(&config, &FsckOptions::full_repository(false)),
         "{:?}",
@@ -562,10 +570,10 @@ fn small_blobs_are_not_candidates() {
 #[test]
 fn refusals_are_typed() {
     let tmp = tempfile::tempdir().unwrap();
-    let plain = Repository::init(tmp.path(), &InitOptions::default()).unwrap();
+    let (plain, _) = Repository::init(tmp.path(), &InitOptions::default()).unwrap();
     assert!(matches!(
-        drop_promised_blobs(&plain, &opts(LIMIT, None)),
-        Err(Error::NoPromisorRemote { .. })
+        plain.maintenance().drop_promised_blobs(&opts(LIMIT, None)),
+        Err(Error::Object(ObjectError::NoPromisorRemote { .. }))
     ));
 
     let fx = Fixture::new().with_old_versions_fetched();
@@ -575,8 +583,12 @@ fn refusals_are_typed() {
     )
     .unwrap();
     assert!(matches!(
-        drop_promised_blobs(&fx.offline(), &opts(LIMIT, None)),
-        Err(Error::OperationInProgress(InProgressOperation::Merge))
+        fx.offline()
+            .maintenance()
+            .drop_promised_blobs(&opts(LIMIT, None)),
+        Err(Error::Merge(MergeError::OperationInProgress(
+            InProgressOperation::Merge,
+        )))
     ));
     std::fs::remove_file(fx.git_dir.join("MERGE_HEAD")).unwrap();
 
@@ -588,15 +600,23 @@ fn refusals_are_typed() {
     )
     .unwrap();
     assert!(matches!(
-        drop_promised_blobs(&fx.offline(), &opts(LIMIT, None)),
-        Err(Error::MaintenanceRunning { .. })
+        fx.offline()
+            .maintenance()
+            .drop_promised_blobs(&opts(LIMIT, None)),
+        Err(Error::Repository(
+            RepositoryError::MaintenanceRunning { .. }
+        ))
     ));
     std::fs::remove_file(fx.git_dir.join("gc.pid")).unwrap();
 
     append_config(&fx.git_dir, "[extensions]\n\tpreciousObjects = true\n");
     assert!(matches!(
-        drop_promised_blobs(&fx.offline(), &opts(LIMIT, None)),
-        Err(Error::PreciousObjectsRepository { .. })
+        fx.offline()
+            .maintenance()
+            .drop_promised_blobs(&opts(LIMIT, None)),
+        Err(Error::Repository(
+            RepositoryError::PreciousObjectsRepository { .. }
+        ))
     ));
     assert!(fx.offline().odb().exists_stored(&fx.big[0]));
 }
@@ -604,7 +624,10 @@ fn refusals_are_typed() {
 #[test]
 fn a_multi_pack_index_is_rewritten_for_the_remaining_packs() {
     let fx = Fixture::new().with_old_versions_fetched();
-    fx.offline().write_midx(&MidxOptions::default()).unwrap();
+    fx.offline()
+        .maintenance()
+        .write_midx(&MidxOptions::default())
+        .unwrap();
     clear_pack_cache();
     let report = fx.run(&opts(LIMIT, None));
     assert_eq!(report.dropped.len(), 3);
@@ -632,7 +655,11 @@ fn a_multi_pack_index_is_rewritten_for_the_remaining_packs() {
 fn gc_runs_the_phase_only_when_enabled() {
     let fx = Fixture::new().with_old_versions_fetched();
     let gc_opts = GcOptions::full_run(false, NOW);
-    let stats = gc(&fx.offline(), &gc_opts).expect("gc");
+    let stats = fx
+        .offline()
+        .maintenance()
+        .gc(&gc_opts, &mut NullProgress, &CancelToken::never())
+        .expect("gc");
     assert_eq!(
         stats.drop_large_blobs.as_ref().and_then(|r| r.skipped),
         Some(DropPromisedBlobsSkip::Disabled)
@@ -645,7 +672,11 @@ fn gc_runs_the_phase_only_when_enabled() {
         "[maintenance \"drop-large-blobs\"]\n\tenabled = true\n\tminSize = 100k\n",
     );
     fx.set_all_pack_mtimes(days_ago(30));
-    let stats = gc(&fx.offline(), &gc_opts).expect("gc");
+    let stats = fx
+        .offline()
+        .maintenance()
+        .gc(&gc_opts, &mut NullProgress, &CancelToken::never())
+        .expect("gc");
     clear_pack_cache();
     let report = stats.drop_large_blobs.expect("phase ran");
     assert_eq!(report.skipped, None);
@@ -665,7 +696,15 @@ fn gc_skips_the_phase_during_a_merge() {
         format!("{}\n", fx.commits[0]),
     )
     .unwrap();
-    let stats = gc(&fx.offline(), &GcOptions::full_run(false, NOW)).expect("gc");
+    let stats = fx
+        .offline()
+        .maintenance()
+        .gc(
+            &GcOptions::full_run(false, NOW),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("gc");
     assert_eq!(
         stats.drop_large_blobs.and_then(|r| r.skipped),
         Some(DropPromisedBlobsSkip::OperationInProgress(
@@ -683,7 +722,15 @@ fn auto_gc_dry_run_reports_the_phase_and_changes_nothing() {
          [maintenance \"drop-large-blobs\"]\n\tenabled = true\n\tminSize = 100k\n",
     );
     let before = fx.packs();
-    let outcome = gc_auto(&fx.offline(), &GcOptions::full_run(true, NOW)).expect("gc --auto");
+    let outcome = fx
+        .offline()
+        .maintenance()
+        .gc_auto(
+            &GcOptions::full_run(true, NOW),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("gc --auto");
     let AutoGcOutcome::Ran { stats, .. } = outcome else {
         panic!("auto gc should run with two packs and autoPackLimit = 1");
     };
@@ -705,7 +752,7 @@ fn main_with_lop(sizes: &[usize], bare: bool) -> (tempfile::TempDir, PathBuf, Ve
         let work = tmp.path().join("main");
         (work.clone(), work.join(".git"))
     };
-    let main = Repository::init(&main_path, &init.clone().with_bare(bare)).unwrap();
+    let (main, _) = Repository::init(&main_path, &init.clone().with_bare(bare)).unwrap();
     Repository::init(&tmp.path().join("lop.git"), &init.with_bare(true)).unwrap();
     let blobs: Vec<ObjectId> = sizes
         .iter()
@@ -738,7 +785,7 @@ fn offload_at(main_dir: &Path, limit: u64) -> grit_lib::maintenance::OffloadRepo
     let main = Repository::open(main_dir, &RepositoryOptions::empty()).unwrap();
     let mut offload = OffloadOptions::new("lop", NOW);
     offload.filter = Some(ObjectFilterSpec::BlobLimit(limit));
-    let report = offload_blobs(&main, &offload).expect("offload");
+    let report = main.maintenance().offload_blobs(&offload).expect("offload");
     drop(main);
     clear_pack_cache();
     report
@@ -813,7 +860,10 @@ fn blobs_an_offload_left_in_main_are_never_dropped() {
     assert!(in_promisor_pack(&main_dir, &blobs[0]));
 
     // A threshold below the offload's: f0 is a candidate the LOP cannot supply.
-    let report = drop_promised_blobs(&main, &opts(1024, None)).expect("drop");
+    let report = main
+        .maintenance()
+        .drop_promised_blobs(&opts(1024, None))
+        .expect("drop");
     clear_pack_cache();
     assert_eq!(report.candidates, 1, "{report:?}");
     assert!(report.dropped.is_empty(), "{report:?}");
@@ -823,7 +873,10 @@ fn blobs_an_offload_left_in_main_are_never_dropped() {
 
     // Once the LOP has a copy, it can go.
     copy_into(&main_dir, &lop_dir, &blobs[..1]);
-    let report = drop_promised_blobs(&main, &opts(1024, None)).expect("drop");
+    let report = main
+        .maintenance()
+        .drop_promised_blobs(&opts(1024, None))
+        .expect("drop");
     clear_pack_cache();
     assert_eq!(dropped_oids(&report), blobs[..1], "{report:?}");
     let main = Repository::open(&main_dir, &RepositoryOptions::empty()).unwrap();
@@ -850,7 +903,10 @@ fn a_blob_an_offload_kept_for_a_checkout_is_never_dropped() {
     let c = commit(&main, t, Some(parent), 2);
     std::fs::write(main_dir.join("refs/heads/main"), format!("{c}\n")).unwrap();
 
-    let report = drop_promised_blobs(&main, &opts(LIMIT, None)).expect("drop");
+    let report = main
+        .maintenance()
+        .drop_promised_blobs(&opts(LIMIT, None))
+        .expect("drop");
     clear_pack_cache();
     assert_eq!(report.candidates, 1, "{report:?}");
     assert!(report.dropped.is_empty(), "{report:?}");
@@ -869,7 +925,10 @@ fn an_offloaded_repository_keeps_what_it_cannot_confirm_over_the_network() {
         "[remote \"lop\"]\n\turl = https://lop.invalid/lop.git\n",
     );
     let main = Repository::open(&main_dir, &RepositoryOptions::empty()).unwrap();
-    let report = drop_promised_blobs(&main, &opts(1024, None)).expect("drop");
+    let report = main
+        .maintenance()
+        .drop_promised_blobs(&opts(1024, None))
+        .expect("drop");
     clear_pack_cache();
     assert!(report.dropped.is_empty(), "{report:?}");
     assert_eq!(report.kept.unverified, 1, "{report:?}");
@@ -878,7 +937,10 @@ fn an_offloaded_repository_keeps_what_it_cannot_confirm_over_the_network() {
 
     // The recorded LOP directory is checked too: once it has f0, f0 can go.
     copy_into(&main_dir, &tmp.path().join("lop.git"), &blobs[..1]);
-    let report = drop_promised_blobs(&main, &opts(1024, None)).expect("drop");
+    let report = main
+        .maintenance()
+        .drop_promised_blobs(&opts(1024, None))
+        .expect("drop");
     assert_eq!(dropped_oids(&report), blobs[..1], "{report:?}");
 }
 
@@ -931,7 +993,15 @@ fn gc_without_a_time_skips_the_phase() {
         &fx.git_dir,
         "[maintenance \"drop-large-blobs\"]\n\tenabled = true\n\texpire = now\n",
     );
-    let stats = gc(&fx.offline(), &GcOptions::default()).expect("gc");
+    let stats = fx
+        .offline()
+        .maintenance()
+        .gc(
+            &GcOptions::default(),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("gc");
     assert_eq!(
         stats.drop_large_blobs.and_then(|r| r.skipped),
         Some(DropPromisedBlobsSkip::NoCurrentTime)
@@ -953,7 +1023,14 @@ fn gc_with_an_invalid_expire_fails_before_repacking() {
         .write_loose_materialize(ObjectKind::Blob, b"loose before gc\n")
         .unwrap();
     let packs = fx.packs();
-    let err = gc(&repo, &GcOptions::full_run(false, NOW)).expect_err("bad expire");
+    let err = repo
+        .maintenance()
+        .gc(
+            &GcOptions::full_run(false, NOW),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect_err("bad expire");
     assert!(
         matches!(
             &err,
@@ -1027,7 +1104,10 @@ fn only_packs_offload_wrote_count_as_held_by_a_lop() {
     let lop_dir = tmp.path().join("lop.git");
     let main = Repository::open(&main_dir, &RepositoryOptions::empty()).unwrap();
     let drop_f0 = || {
-        let report = drop_promised_blobs(&main, &opts(1024, None)).expect("drop");
+        let report = main
+            .maintenance()
+            .drop_promised_blobs(&opts(1024, None))
+            .expect("drop");
         clear_pack_cache();
         report
     };

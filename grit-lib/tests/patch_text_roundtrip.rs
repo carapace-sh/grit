@@ -8,13 +8,11 @@ use grit_lib::apply::{materialize_binary_patch_forward, parse_patch};
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::diff::merge_diff::read_blob_at_path;
 use grit_lib::diff::{
-    diff_commits_with_renames_and_policy, tree_diff_structured_parallel, write_patch_resolved,
-    write_patch_structured, DiffEntry, DiffOptions, DiffStatus, PatchResolvedSide, PatchSide,
-    PatchTextOptions,
+    write_patch_resolved, write_patch_structured, DiffEntry, DiffOptions, DiffStatus,
+    PatchResolvedSide, PatchSide, PatchTextOptions, RenameDetection, TreeDiffOptions,
 };
 use grit_lib::objects::{parse_commit, ObjectId};
-use grit_lib::repo::Repository;
-use grit_lib::revwalk::rev_parse::resolve_revision;
+use grit_lib::repo::{Repository, RepositoryError};
 use tempfile::TempDir;
 
 fn git_in(dir: &std::path::Path, args: &[&str]) {
@@ -64,29 +62,26 @@ fn git_diff_binary(dir: &std::path::Path, base: &str, tip: &str) -> Vec<u8> {
 }
 
 fn grit_patch_structured(repo: &Repository, base: &str, tip: &str) -> Vec<u8> {
-    let base_oid = resolve_revision(repo, base).expect("base");
-    let tip_oid = resolve_revision(repo, tip).expect("tip");
-    let config = repo.config().expect("config").clone();
-    let thread_policy = repo.thread_policy();
-    let mut entries = diff_commits_with_renames_and_policy(
-        repo.odb(),
-        &base_oid,
-        &tip_oid,
-        50,
-        &config,
-        &thread_policy,
-    )
-    .expect("diff");
+    let base_oid = repo
+        .revwalk()
+        .resolve(base, &grit_lib::revwalk::ResolveOptions::default())
+        .expect("base");
+    let tip_oid = repo
+        .revwalk()
+        .resolve(tip, &grit_lib::revwalk::ResolveOptions::default())
+        .expect("tip");
+    let renames = TreeDiffOptions::default().with_renames(RenameDetection::Similarity(50));
+    let mut entries = repo
+        .diff()
+        .commits(&base_oid, &tip_oid, &renames)
+        .expect("diff")
+        .entries;
     entries.sort_by(|a, b| a.path().cmp(b.path()));
     let diff_opts = DiffOptions::default();
-    let structured = tree_diff_structured_parallel(
-        repo.odb(),
-        entries,
-        &config,
-        &thread_policy,
-        diff_opts.clone(),
-    )
-    .expect("structured");
+    let structured = repo
+        .diff()
+        .structured(entries, &diff_opts)
+        .expect("structured");
     let patch_opts = PatchTextOptions::from_repo(repo, diff_opts).expect("patch opts");
     let mut out = Cursor::new(Vec::new());
     write_patch_structured(repo, &structured, &patch_opts, &mut out)
@@ -117,8 +112,14 @@ fn apply_patch_git_index(
 fn assert_lib_apply_materializes_binary(repo: &Repository, base: &str, patch: &[u8], tip: &str) {
     let text = std::str::from_utf8(patch).expect("utf8 patch");
     let files = parse_patch(text, 1, "patch", false, None).expect("parse grit patch");
-    let base_oid = resolve_revision(repo, base).expect("base");
-    let tip_oid = resolve_revision(repo, tip).expect("tip");
+    let base_oid = repo
+        .revwalk()
+        .resolve(base, &grit_lib::revwalk::ResolveOptions::default())
+        .expect("base");
+    let tip_oid = repo
+        .revwalk()
+        .resolve(tip, &grit_lib::revwalk::ResolveOptions::default())
+        .expect("tip");
     let tip_tree = parse_commit(&repo.odb().read(&tip_oid).expect("read tip").data)
         .expect("parse tip")
         .tree;
@@ -377,7 +378,123 @@ fn write_patch_resolved_reads_worktree_binary_sides() {
 
     git_in(dir.path(), &["add", "-A"]);
     let want = ObjectId::from_hex(&git_out(dir.path(), &["write-tree"])).expect("tree");
+    let new_txt =
+        ObjectId::from_hex(&git_out(dir.path(), &["hash-object", "-w", "t.txt"])).expect("hash");
+    assert!(
+        text.contains(&format!(
+            "index {}..{} 100644\n--- a/t.txt\n",
+            &old_txt.to_hex()[..7],
+            &new_txt.to_hex()[..7]
+        )),
+        "text index line must name postimage blob, not zeros:\n{text}"
+    );
+    assert!(
+        !text.contains("..0000000 100644\n--- a/t.txt"),
+        "must not emit placeholder new oid for text worktree side:\n{text}"
+    );
+
     assert_eq!(git_apply_index_in_clone(dir.path(), &patch), want);
+}
+
+fn git_hash_object_stdin(dir: &std::path::Path, bytes: &[u8]) -> ObjectId {
+    let mut child = Command::new("git")
+        .current_dir(dir)
+        .args(["hash-object", "-w", "--stdin"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn git hash-object");
+    use std::io::Write;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(bytes).expect("stdin");
+    }
+    let out = child.wait_with_output().expect("wait");
+    assert!(
+        out.status.success(),
+        "git hash-object: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    ObjectId::from_hex(String::from_utf8_lossy(&out.stdout).trim()).expect("oid")
+}
+
+#[test]
+fn write_patch_resolved_hashes_text_bytes_when_new_oid_zero() {
+    let dir = binary_fixture();
+    let old_txt = git_oid(dir.path(), "HEAD:t.txt");
+    let new_bytes = b"one\ntwo\n".to_vec();
+    let new_oid = git_hash_object_stdin(dir.path(), &new_bytes);
+
+    let repo = Repository::discover(Some(dir.path()), &RepositoryOptions::default()).expect("open");
+    let files = vec![PatchResolvedSide {
+        entry: entry(
+            DiffStatus::Modified,
+            "t.txt",
+            ("100644", old_txt),
+            ("100644", ObjectId::zero()),
+        ),
+        old: PatchSide::Bytes(b"one\n".to_vec()),
+        new: PatchSide::Bytes(new_bytes),
+    }];
+    let patch = resolved_patch(&repo, &files);
+    let text = String::from_utf8(patch.clone()).expect("utf8");
+    assert!(
+        !text.contains("..0000000 100644"),
+        "index line must not use placeholder new oid:\n{text}"
+    );
+    assert!(
+        text.contains(&format!("..{} 100644", &new_oid.to_hex()[..7])),
+        "index line must abbreviate hashed postimage:\n{text}"
+    );
+
+    std::fs::write(dir.path().join("t.txt"), b"one\ntwo\n").unwrap();
+    git_in(dir.path(), &["add", "t.txt"]);
+    let want = ObjectId::from_hex(&git_out(dir.path(), &["write-tree"])).expect("tree");
+    assert_eq!(git_apply_index_in_clone(dir.path(), &patch), want);
+
+    let scratch = TempDir::new().expect("tempdir");
+    git_in(
+        scratch.path(),
+        &["clone", "-q", dir.path().to_str().expect("utf8"), "dst"],
+    );
+    let dst = scratch.path().join("dst");
+    std::fs::write(scratch.path().join("p.diff"), &patch).expect("write patch");
+    git_in(&dst, &["apply", "--3way", "--index", "../p.diff"]);
+    assert_eq!(
+        ObjectId::from_hex(&git_out(&dst, &["write-tree"])).expect("tree"),
+        want
+    );
+}
+
+#[test]
+fn write_patch_resolved_gitlink_index_line_keeps_commit_ids() {
+    let dir = TempDir::new().expect("tempdir");
+    git_in(dir.path(), &["init", "-q", "--initial-branch=main", "."]);
+    let old_commit = ObjectId::from_hex("1111111111111111111111111111111111111111").expect("oid");
+    let new_commit = ObjectId::from_hex("2222222222222222222222222222222222222222").expect("oid");
+    let old_line = format!("Subproject commit {}\n", old_commit.to_hex());
+    let new_line = format!("Subproject commit {}\n", new_commit.to_hex());
+
+    let repo = Repository::discover(Some(dir.path()), &RepositoryOptions::default()).expect("open");
+    let files = vec![PatchResolvedSide {
+        entry: entry(
+            DiffStatus::Modified,
+            "sub",
+            ("160000", old_commit),
+            ("160000", new_commit),
+        ),
+        old: PatchSide::Bytes(old_line.into_bytes()),
+        new: PatchSide::Bytes(new_line.into_bytes()),
+    }];
+    let patch = resolved_patch(&repo, &files);
+    let text = String::from_utf8(patch).expect("utf8");
+    assert!(
+        text.contains(&format!(
+            "index {}..{} 160000",
+            &old_commit.to_hex()[..7],
+            &new_commit.to_hex()[..7]
+        )),
+        "gitlink index line must keep commit oids:\n{text}"
+    );
 }
 
 #[test]
@@ -446,7 +563,7 @@ fn write_patch_resolved_hashes_in_memory_binary_bytes_for_index_line() {
 #[test]
 fn write_patch_resolved_worktree_side_needs_work_tree() {
     let dir = TempDir::new().expect("tempdir");
-    let repo = Repository::init(
+    let (repo, _) = Repository::init(
         dir.path(),
         &grit_lib::repo::InitOptions::new().with_bare(true),
     )
@@ -465,7 +582,10 @@ fn write_patch_resolved_worktree_side_needs_work_tree() {
     let err = write_patch_resolved(&repo, &files, &opts, &mut std::io::sink())
         .expect_err("bare repository has no work tree");
     assert!(
-        matches!(err, grit_lib::error::Error::RequiresWorkTree),
+        matches!(
+            err,
+            grit_lib::error::Error::Repository(RepositoryError::RequiresWorkTree)
+        ),
         "unexpected error: {err:?}"
     );
 }

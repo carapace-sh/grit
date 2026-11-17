@@ -12,14 +12,14 @@ use std::path::Path;
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::diff::merge_file::MergeFavor;
 use grit_lib::diff::merge_trees::merge_trees_three_way;
+use grit_lib::merge::{
+    IntegrateBranchOutcome, MergeOptions, MergePrediction, MergePredictionOptions,
+};
 use grit_lib::objects::ObjectId;
 use grit_lib::operation::{Conflict, ConflictKind};
-use grit_lib::porcelain::merge::{
-    integrate_branch_with, predict_merge, IntegrateBranchOutcome, MergeOptions, MergePrediction,
-    MergePredictionOptions,
-};
 use grit_lib::repo::Repository;
 use grit_test_support::git;
+use grit_test_support::{integrate_branch_with, predict_merge};
 use support::{
     assert_git_fsck_strict, assert_merge_output_matches_oracle, commit_tree, git_ls_files_stage,
     git_merge_tree_oracle, CommitMergeLabels,
@@ -133,7 +133,7 @@ fn assert_tree_merge_matches_git(fx: &Fixture, context: &str) -> (ObjectId, Obje
         "{context}: git must report add/add:\n{}",
         oracle.stdout
     );
-    assert_merge_output_matches_oracle(&fx.repo, &merged, &oracle, context);
+    assert_merge_output_matches_oracle(fx.repo, &merged, &oracle, context);
     let stages: Vec<(u32, &str, ObjectId)> = oracle
         .unmerged
         .iter()
@@ -316,10 +316,10 @@ fn integrate_branch_stops_with_both_versions_in_the_index() {
         "topic",
         &MergeOptions::default(),
         &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("merge");
-    let IntegrateBranchOutcome::Conflicts { paths, details } = outcome else {
+    let IntegrateBranchOutcome::Conflicts { paths, details, .. } = outcome else {
         panic!("expected conflicts, got {outcome:?}");
     };
     assert_eq!(paths, vec!["c"]);

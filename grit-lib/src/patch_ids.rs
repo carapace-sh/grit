@@ -19,9 +19,9 @@
 //! [`crate::diff::structured`] text diffs so context lines stay aligned with `git diff`.
 
 use crate::diff::{
-    diff_trees_with_renames, gitlink_line, structured::text_bytes_for_diff,
-    unified_diff_with_prefix_and_funcname, unified_hunk_body_for_diff_options, zero_oid, DiffEntry,
-    DiffOptions, DiffStatus,
+    diff_trees_with_renames, gitlink_line, structured::text_bytes_for_diff, unified_diff,
+    unified_hunk_body_for_diff_options, zero_oid, DiffEntry, DiffLabel, DiffOptions, DiffStatus,
+    UnifiedDiffOptions,
 };
 use crate::error::Result;
 use crate::hash::ChecksumHasher;
@@ -464,10 +464,10 @@ pub fn compute_patch_id_for_paths(
     algo: HashAlgo,
     odb: &Odb,
     commit_oid: &ObjectId,
-    paths: &[String],
+    pathspec: &crate::pathspec::Pathspec,
     mode: PatchIdMode,
 ) -> Result<Option<ObjectId>> {
-    compute_patch_id_filtered(algo, odb, commit_oid, paths, mode)
+    compute_patch_id_filtered(algo, odb, commit_oid, pathspec.specs(), mode)
 }
 
 fn compute_patch_id_filtered(
@@ -625,8 +625,8 @@ fn write_patch_id_binary_entry(out: &mut Vec<u8>, entry: &DiffEntry) -> Result<(
         out,
         &format!(
             "index {}..{}",
-            patch_id_index_oid(&entry.old_oid),
-            patch_id_index_oid(&entry.new_oid),
+            entry.old_oid.to_short_hex(),
+            entry.new_oid.to_short_hex(),
         ),
     );
     let old_side = entry
@@ -644,13 +644,6 @@ fn write_patch_id_binary_entry(out: &mut Vec<u8>, entry: &DiffEntry) -> Result<(
         &format!("Binary files {old_side} and {new_side} differ"),
     );
     Ok(())
-}
-
-fn patch_id_index_oid(oid: &ObjectId) -> String {
-    if *oid == zero_oid() {
-        return "0000000".to_owned();
-    }
-    oid.to_hex().chars().take(7).collect()
 }
 
 fn patch_id_add_string(ctx: &mut ChecksumHasher, s: &[u8]) {
@@ -720,8 +713,8 @@ fn patch_id_append_git_show_entry(odb: &Odb, entry: &DiffEntry, out: &mut Vec<u8
         out,
         &format!(
             "index {}..{} {}",
-            patch_id_index_oid(&entry.old_oid),
-            patch_id_index_oid(&entry.new_oid),
+            entry.old_oid.to_short_hex(),
+            entry.new_oid.to_short_hex(),
             index_mode,
         ),
     );
@@ -762,19 +755,14 @@ fn patch_id_append_git_show_entry(odb: &Odb, entry: &DiffEntry, out: &mut Vec<u8
     } else {
         format!("b/{git_new}")
     };
-    let unified = unified_diff_with_prefix_and_funcname(
-        old_str.as_ref(),
-        new_str.as_ref(),
-        &old_path,
-        &new_path,
-        3,
-        0,
-        "",
-        "",
-        None,
-        true,
-        false,
+    let options = UnifiedDiffOptions::new().with_labels(
+        DiffLabel::Verbatim(&old_path),
+        DiffLabel::Verbatim(&new_path),
     );
+    let unified = unified_diff(old_str.as_ref(), new_str.as_ref(), &options);
+    if unified.is_empty() {
+        out.extend_from_slice(format!("--- {old_path}\n+++ {new_path}\n").as_bytes());
+    }
     out.extend_from_slice(unified.as_bytes());
     Ok(())
 }
@@ -851,8 +839,8 @@ fn patch_id_hash_file_entry_into_ctx(
     let (old_bytes, new_bytes) = read_sides(odb, entry)?;
 
     if merge_file::is_binary(&old_bytes) || merge_file::is_binary(&new_bytes) {
-        let a = patch_id_index_oid(&entry.old_oid);
-        let b = patch_id_index_oid(&entry.new_oid);
+        let a = entry.old_oid.to_short_hex();
+        let b = entry.new_oid.to_short_hex();
         ctx.update(a.as_bytes());
         ctx.update(b.as_bytes());
     } else {
@@ -1346,7 +1334,10 @@ mod tests {
             HashAlgo::Sha1,
             &repo.odb(),
             &add_h,
-            &[String::from("h.txt")],
+            &crate::pathspec::Pathspec::scoped(
+                ["h.txt"],
+                crate::pathspec::PathspecGlobalFlags::default(),
+            ),
             PatchIdMode::Stable,
         )
         .expect("filtered h.txt")
@@ -1365,7 +1356,10 @@ mod tests {
                 HashAlgo::Sha1,
                 &repo.odb(),
                 &add_h,
-                &[String::from("f.txt")],
+                &crate::pathspec::Pathspec::scoped(
+                    ["f.txt"],
+                    crate::pathspec::PathspecGlobalFlags::default()
+                ),
                 PatchIdMode::Stable,
             )
             .expect("filtered f.txt")

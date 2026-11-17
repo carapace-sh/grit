@@ -1,5 +1,5 @@
 //! Transport, fsck, unbundle, and staging behavior for repositories whose object database
-//! uses a custom [`OdbBuilder::primary`] store (issues #1735, #1892, #2288).
+//! uses a custom `RepositoryOptions::with_object_store` store (issues #1735, #1892, #2288).
 //!
 //! Fetch and push read and write through the custom primary. Unbundling writes every object
 //! of the bundle's pack into the custom primary. Staging writes go through the custom primary,
@@ -15,17 +15,17 @@ use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::error::Error;
 use grit_lib::maintenance::repository_fsck::FsckOptions;
 use grit_lib::objects::odb::store::{MemoryStore, ObjectStore};
-use grit_lib::objects::odb::OdbBuilder;
 use grit_lib::objects::{HashAlgo, ObjectId, ObjectKind};
-use grit_lib::porcelain::add::{stage, StageMode, StageOptions};
-use grit_lib::porcelain::commit::{commit_with_scope, CommitRequest, CommitScope};
+use grit_lib::porcelain::add::{StageMode, StageOptions};
+use grit_lib::porcelain::commit::{CommitRequest, CommitScope};
 use grit_lib::porcelain::stage_tracked::IndexStagingThresholds;
-use grit_lib::progress::{NeverCancel, NullProgress};
-use grit_lib::refs::resolve_ref;
-use grit_lib::remote::fetch::NoProgress;
+use grit_lib::progress::CancelToken;
+use grit_lib::progress::NullProgress;
 use grit_lib::remote::transfer::{FetchOptions, PushOptions, PushRefSpec, UpdateMode};
 use grit_lib::remote::{Remote, RemoteError};
-use grit_lib::repo::{InitOptions, Repository, RepositoryBuilder};
+use grit_lib::repo::error::FilesOnlyOperation;
+use grit_lib::repo::RepositoryError;
+use grit_lib::repo::{InitOptions, Repository};
 
 /// Non-bare upstream with two commits on `main`, written by the system `git`.
 fn git_upstream() -> tempfile::TempDir {
@@ -51,7 +51,7 @@ fn init_files_repo(dir: &Path) {
         dir,
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
-            .with_ref_storage(grit_lib::RefStorageFormat::Files),
+            .with_ref_storage(grit_lib::refs::ref_storage::RefStorageFormat::Files),
     )
     .expect("init");
 }
@@ -61,14 +61,13 @@ fn memory_repo() -> (tempfile::TempDir, Repository, Arc<MemoryStore>) {
     init_files_repo(dir.path());
     let git_dir = dir.path().join(".git");
     let store = Arc::new(MemoryStore::new(HashAlgo::Sha1));
-    let repo = RepositoryBuilder::new(RepositoryOptions::empty())
-        .odb_builder(
-            OdbBuilder::files(git_dir.join("objects"))
-                .primary(store.clone())
-                .alternates(false),
-        )
-        .open(&git_dir, Some(dir.path()))
-        .expect("open");
+    let repo = Repository::open(
+        &git_dir,
+        &(RepositoryOptions::empty()
+            .with_object_store(store.clone())
+            .with_work_tree(dir.path())),
+    )
+    .expect("open");
     (dir, repo, store)
 }
 
@@ -100,10 +99,15 @@ fn object_files(git_dir: &Path) -> Vec<String> {
 }
 
 fn fetch_all_branches() -> FetchOptions {
-    FetchOptions {
-        refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".into()],
-        ..Default::default()
-    }
+    let mut opts = FetchOptions::new();
+    opts.refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".into()];
+    opts
+}
+
+fn fetch_main_tracking() -> FetchOptions {
+    let mut opts = FetchOptions::new();
+    opts.refspecs = vec!["+refs/heads/main:refs/remotes/origin/main".into()];
+    opts
 }
 
 /// Commit `blob` as `f.txt` on `refs/heads/main` through the repository's ODB.
@@ -128,7 +132,7 @@ fn commit_into(repo: &Repository, content: &[u8]) -> ObjectId {
         .write(ObjectKind::Commit, body.as_bytes())
         .expect("commit");
     grit_lib::refs::update_direct_ref_on_store(
-        repo.refs(),
+        repo.ref_store(),
         repo.git_dir(),
         "refs/heads/main",
         &commit,
@@ -160,12 +164,15 @@ fn fetch_into_custom_primary_round_trips_with_git() {
             &remote,
             fetch_all_branches(),
             &mut NoProgress,
-            &NeverCancel,
+            &CancelToken::never(),
             None,
         )
         .expect("fetch into custom primary");
 
-    let tip = resolve_ref(repo.git_dir(), "refs/remotes/origin/main").expect("tracking ref");
+    let tip = repo
+        .references()
+        .resolve("refs/remotes/origin/main")
+        .expect("tracking ref");
     assert_eq!(tip, rev_parse(upstream.path(), "main"));
     assert!(store.contains(&tip).expect("contains"));
     assert!(repo.odb().read(&tip).is_ok());
@@ -195,11 +202,14 @@ fn fetch_from_bundle_into_custom_primary_succeeds() {
             &remote,
             fetch_all_branches(),
             &mut NoProgress,
-            &NeverCancel,
+            &CancelToken::never(),
             None,
         )
         .expect("bundle fetch into custom primary");
-    let tip = resolve_ref(repo.git_dir(), "refs/remotes/origin/main").expect("tracking ref");
+    let tip = repo
+        .references()
+        .resolve("refs/remotes/origin/main")
+        .expect("tracking ref");
     assert_eq!(tip, rev_parse(upstream.path(), "main"));
     assert!(store.contains(&tip).expect("contains"));
     assert_eq!(object_files(repo.git_dir()), before);
@@ -213,12 +223,9 @@ fn fetch_incremental_into_custom_primary_uses_haves_from_store() {
     repo.remotes()
         .fetch(
             &remote,
-            FetchOptions {
-                refspecs: vec!["+refs/heads/main:refs/remotes/origin/main".into()],
-                ..Default::default()
-            },
+            fetch_main_tracking(),
             &mut NoProgress,
-            &NeverCancel,
+            &CancelToken::never(),
             None,
         )
         .expect("initial fetch");
@@ -231,17 +238,17 @@ fn fetch_incremental_into_custom_primary_uses_haves_from_store() {
     repo.remotes()
         .fetch(
             &remote,
-            FetchOptions {
-                refspecs: vec!["+refs/heads/main:refs/remotes/origin/main".into()],
-                ..Default::default()
-            },
+            fetch_main_tracking(),
             &mut NoProgress,
-            &NeverCancel,
+            &CancelToken::never(),
             None,
         )
         .expect("incremental fetch");
     assert!(count_store_objects(&store) > after_first);
-    let tip = resolve_ref(repo.git_dir(), "refs/remotes/origin/main").expect("tracking ref");
+    let tip = repo
+        .references()
+        .resolve("refs/remotes/origin/main")
+        .expect("tracking ref");
     assert_eq!(tip, rev_parse(upstream.path(), "main"));
 }
 
@@ -256,19 +263,22 @@ fn fetch_dry_run_into_custom_primary_classifies_without_persisting() {
         .remotes()
         .fetch(
             &remote,
-            FetchOptions {
-                refspecs: vec!["+refs/heads/main:refs/remotes/origin/main".into()],
-                dry_run: true,
-                ..Default::default()
+            {
+                let mut opts = fetch_main_tracking();
+                opts.dry_run = true;
+                opts
             },
             &mut NoProgress,
-            &NeverCancel,
+            &CancelToken::never(),
             None,
         )
         .expect("dry-run fetch");
     assert!(outcome.updates.iter().any(|u| u.mode == UpdateMode::New));
     assert_eq!(count_store_objects(&store), before_count);
-    assert!(resolve_ref(repo.git_dir(), "refs/remotes/origin/main").is_err());
+    assert!(repo
+        .references()
+        .resolve("refs/remotes/origin/main")
+        .is_err());
 }
 
 #[test]
@@ -282,7 +292,14 @@ fn unbundle_into_custom_primary_writes_every_object_into_the_store() {
     let (_dir, repo, store) = memory_repo();
     let before = object_files(repo.git_dir());
 
-    let outcome = repo.bundles().unbundle(&bundle).expect("unbundle");
+    let outcome = repo
+        .bundles()
+        .unbundle(
+            &bundle,
+            &mut grit_lib::progress::NullProgress,
+            grit_lib::progress::CancelToken::never_ref(),
+        )
+        .expect("unbundle");
     let tip = rev_parse(upstream.path(), "main");
     assert_eq!(outcome.refs.len(), 1);
     assert_eq!(outcome.refs[0].oid, tip);
@@ -334,19 +351,32 @@ fn unbundle_into_custom_primary_writes_every_object_into_the_store() {
         ],
     );
     let opened = grit_lib::bundle::Bundle::open(&incremental).expect("open bundle");
-    assert!(opened
-        .verify(&repo)
-        .expect("verify")
-        .missing_prerequisites
-        .is_empty());
+    let report = opened.verify(&repo).expect("verify");
+    assert!(report.missing_prerequisites.is_empty());
+    assert!(
+        report.is_ok(),
+        "prerequisite objects in the store should verify even without local refs: {report:?}"
+    );
     let new_tip = rev_parse(upstream.path(), "main");
-    let outcome = repo
-        .bundles()
-        .unbundle(&incremental)
-        .expect("unbundle incremental");
-    assert_eq!(outcome.refs[0].oid, new_tip);
+    repo.bundles()
+        .unbundle(
+            &incremental,
+            &mut grit_lib::progress::NullProgress,
+            grit_lib::progress::CancelToken::never_ref(),
+        )
+        .expect("unbundle incremental without local refs connecting prerequisite");
     assert!(store.contains(&new_tip).expect("contains"));
     assert!(repo.odb().read(&new_tip).is_ok());
+
+    grit_lib::refs::update_direct_ref_on_store(
+        repo.ref_store(),
+        repo.git_dir(),
+        "refs/heads/main",
+        &tip,
+    )
+    .expect("connect prerequisite to local ref");
+    let connected = opened.verify(&repo).expect("verify after ref");
+    assert!(connected.is_ok(), "{connected:?}");
 }
 
 #[test]
@@ -365,10 +395,14 @@ fn unbundle_into_custom_primary_reports_a_corrupt_pack() {
 
     let err = repo
         .bundles()
-        .unbundle(&bundle)
+        .unbundle(
+            &bundle,
+            &mut grit_lib::progress::NullProgress,
+            grit_lib::progress::CancelToken::never_ref(),
+        )
         .expect_err("corrupt trailer must fail");
     assert!(
-        matches!(&err, BundleError::Io(msg) if msg.contains("checksum")),
+        matches!(&err, BundleError::Io { detail: msg } if msg.contains("checksum")),
         "unexpected error: {err:?}"
     );
 }
@@ -380,17 +414,16 @@ fn fetch_all_succeeds_with_custom_primary() {
     repo.remotes()
         .add("origin", upstream.path().to_str().expect("utf8"))
         .expect("add remote");
-    let config = repo.config().expect("config");
+    let config = repo.config().snapshot().expect("config");
 
     let results = repo
         .remotes()
         .fetch_all(
-            &config,
-            &FetchOptions::default(),
-            None,
-            None,
+            &grit_lib::remote::transfer::FetchAllOptions::new((&FetchOptions::default()).clone())
+                .with_prune(None)
+                .with_tags(None),
             &mut NoProgress,
-            &NeverCancel,
+            &CancelToken::never(),
             None,
         )
         .expect("fetch_all");
@@ -398,7 +431,10 @@ fn fetch_all_succeeds_with_custom_primary() {
     let (name, outcome) = &results[0];
     assert_eq!(name, "origin");
     outcome.as_ref().expect("custom primary fetch");
-    assert!(resolve_ref(repo.git_dir(), "refs/remotes/origin/main").is_ok());
+    assert!(repo
+        .references()
+        .resolve("refs/remotes/origin/main")
+        .is_ok());
 }
 
 #[test]
@@ -425,7 +461,7 @@ fn push_from_custom_primary_round_trips_with_git() {
             &[spec],
             PushOptions::default(),
             &mut NoProgress,
-            &NeverCancel,
+            &CancelToken::never(),
             None,
         )
         .expect("push from custom primary");
@@ -446,20 +482,25 @@ fn partial_fetch_custom_primary_is_refused() {
         .remotes()
         .fetch(
             &remote,
-            FetchOptions {
-                refspecs: vec!["+refs/heads/main:refs/remotes/origin/main".into()],
-                filter: Some(grit_lib::remote::partial_clone::ObjectFilterSpec::BlobNone),
-                ..Default::default()
+            {
+                let mut opts = fetch_main_tracking();
+                opts.filter = Some(grit_lib::remote::partial_clone::ObjectFilterSpec::BlobNone);
+                opts
             },
             &mut NoProgress,
-            &NeverCancel,
+            &CancelToken::never(),
             None,
         )
         .expect_err("partial fetch");
     assert!(
         matches!(
             err,
-            RemoteError::Library(Error::UnsupportedObjectStore { operation }) if operation == "partial fetch"
+            RemoteError::Nested(boxed)
+                if matches!(
+                    boxed.as_ref(),
+                    Error::Repository(RepositoryError::UnsupportedObjectStore { operation })
+                        if *operation == FilesOnlyOperation::PartialFetch
+                )
         ),
         "{err:?}"
     );
@@ -471,11 +512,12 @@ fn fsck_on_custom_primary_validates_the_store() {
     commit_into(&repo, b"x\n");
     let options = FsckOptions::default();
     let report = repo
-        .fsck(&options, &mut NullProgress, &NeverCancel)
+        .maintenance()
+        .fsck(&options, &mut NullProgress, &CancelToken::never())
         .expect("fsck reads objects through the custom primary");
     assert!(report.objects_checked > 0);
     assert!(report.issues.is_empty(), "{:?}", report.issues);
-    assert!(report.ok(&repo.config().expect("config"), &options));
+    assert!(report.ok(&repo.config().snapshot().expect("config"), &options));
 }
 
 #[test]
@@ -486,16 +528,17 @@ fn stage_and_auto_stage_commit_write_through_custom_primary() {
     fs::create_dir_all(dir.path().join("sub")).expect("mkdir");
     fs::write(dir.path().join("sub/deep.txt"), "deep\n").expect("write");
 
-    let outcome = stage(
-        &repo,
-        &StageOptions {
-            mode: StageMode::All,
-            ..StageOptions::default()
-        },
-        &mut NullProgress,
-        &NeverCancel,
-    )
-    .expect("stage into custom primary");
+    let outcome = repo
+        .index()
+        .stage(
+            &StageOptions {
+                mode: StageMode::All,
+                ..StageOptions::default()
+            },
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("stage into custom primary");
     assert_eq!(outcome.added.len(), 2, "{outcome:?}");
     for content in [&b"fresh\n"[..], b"deep\n"] {
         let oid = grit_lib::objects::hash::hash_object(HashAlgo::Sha1, ObjectKind::Blob, content)
@@ -506,37 +549,39 @@ fn stage_and_auto_stage_commit_write_through_custom_primary() {
         );
     }
 
-    let req = CommitRequest {
-        message: "first".into(),
-        author: Some("T <t@example.com> 1 +0000".parse().expect("signature")),
-        committer: Some("T <t@example.com> 1 +0000".parse().expect("signature")),
-        ..Default::default()
+    let req = {
+        let mut req = CommitRequest::new("first");
+        req.author = Some("T <t@example.com> 1 +0000".parse().expect("signature"));
+        req.committer = Some("T <t@example.com> 1 +0000".parse().expect("signature"));
+        req
     };
-    let first = commit_with_scope(
-        &repo,
-        &req,
-        CommitScope::Staged,
-        &mut NullProgress,
-        &NeverCancel,
-    )
-    .expect("commit staged");
+    let first = repo
+        .commits()
+        .create(
+            &grit_lib::commits::CommitOptions::new(req.clone(), CommitScope::Staged),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("commit staged");
 
     // Force the parallel tracked-restage batch path for one modification.
     fs::write(dir.path().join("sub/deep.txt"), "deeper\n").expect("write");
-    stage(
-        &repo,
-        &StageOptions {
-            mode: StageMode::Update,
-            staging_thresholds: Some(IndexStagingThresholds {
-                large_index_restage: 0,
-                parallel_tracked_restage: 0,
-            }),
-            ..StageOptions::default()
-        },
-        &mut NullProgress,
-        &NeverCancel,
-    )
-    .expect("parallel restage into custom primary");
+    repo.index()
+        .stage(
+            &grit_lib::test_support::knobs::stage_options_staging_thresholds(
+                StageOptions {
+                    mode: StageMode::Update,
+                    ..StageOptions::default()
+                },
+                IndexStagingThresholds {
+                    large_index_restage: 0,
+                    parallel_tracked_restage: 0,
+                },
+            ),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("parallel restage into custom primary");
     let deeper =
         grit_lib::objects::hash::hash_object(HashAlgo::Sha1, ObjectKind::Blob, b"deeper\n")
             .expect("hash");
@@ -544,18 +589,17 @@ fn stage_and_auto_stage_commit_write_through_custom_primary() {
 
     // The auto-staging commit restages the other modification on the default path.
     fs::write(dir.path().join("new.txt"), "changed\n").expect("write");
-    let req = CommitRequest {
-        message: "second".into(),
-        ..req
-    };
-    let second = commit_with_scope(
-        &repo,
-        &req,
-        CommitScope::AutoStage,
-        &mut NullProgress,
-        &NeverCancel,
-    )
-    .expect("auto-stage commit into custom primary");
+    let mut second_req = req;
+    second_req.message = "second".into();
+    let req = second_req;
+    let second = repo
+        .commits()
+        .create(
+            &grit_lib::commits::CommitOptions::new(req.clone(), CommitScope::AutoStage),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("auto-stage commit into custom primary");
     assert_ne!(first.oid, second.oid);
     let changed =
         grit_lib::objects::hash::hash_object(HashAlgo::Sha1, ObjectKind::Blob, b"changed\n")
@@ -587,11 +631,14 @@ fn files_primary_fetch_and_push_still_round_trip_with_git() {
             &remote,
             fetch_all_branches(),
             &mut NoProgress,
-            &NeverCancel,
+            &CancelToken::never(),
             None,
         )
         .expect("files-primary fetch");
-    let tip = resolve_ref(repo.git_dir(), "refs/remotes/origin/main").expect("tracking ref");
+    let tip = repo
+        .references()
+        .resolve("refs/remotes/origin/main")
+        .expect("tracking ref");
     assert_eq!(tip, rev_parse(upstream.path(), "main"));
     assert!(repo.odb().read(&tip).is_ok());
     git(dir.path(), &["fsck", "--full"]);
@@ -614,7 +661,7 @@ fn files_primary_fetch_and_push_still_round_trip_with_git() {
             &[spec],
             PushOptions::default(),
             &mut NoProgress,
-            &NeverCancel,
+            &CancelToken::never(),
             None,
         )
         .expect("files-primary push");

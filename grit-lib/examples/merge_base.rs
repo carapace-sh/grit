@@ -6,7 +6,6 @@ use grit_lib::index::write_tree::write_tree_from_index;
 use grit_lib::objects::{serialize_commit, CommitData, ObjectKind};
 use grit_lib::refs;
 use grit_lib::repo::{InitOptions, Repository};
-use grit_lib::revwalk::merge_base::merge_bases_first_vs_rest;
 
 fn commit_tree(
     repo: &grit_lib::repo::Repository,
@@ -36,8 +35,11 @@ fn commit_tree(
     };
     let mut index = Index::new();
     index.add_or_replace(entry);
-    repo.index_handle().write(&mut index)?;
-    let index = repo.index_handle().load()?;
+    repo.index()
+        .write(&mut index, &grit_lib::index::IndexWriteOptions::default())?;
+    let index = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())?;
     let tree_oid = write_tree_from_index(repo.odb(), &index, "")?;
 
     let mut parents = Vec::new();
@@ -62,21 +64,25 @@ fn commit_tree(
 
 fn main() -> grit_lib::error::Result<()> {
     let root = tempfile::tempdir()?;
-    let repo = Repository::init(
+    let (repo, _) = Repository::init(
         root.path(),
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
-            .with_ref_storage(grit_lib::RefStorageFormat::Files),
+            .with_ref_storage(grit_lib::refs::ref_storage::RefStorageFormat::Files),
     )?;
 
     let base = commit_tree(&repo, None, "common root")?;
-    refs::write_ref(repo.git_dir(), "refs/heads/main", &base)?;
+    repo.references().update("refs/heads/main", &base)?;
 
     let feature_tip = commit_tree(&repo, Some(base), "feature work")?;
-    refs::write_ref(repo.git_dir(), "refs/heads/feature", &feature_tip)?;
+    repo.references()
+        .update("refs/heads/feature", &feature_tip)?;
 
     let main_tip = base;
-    let bases = merge_bases_first_vs_rest(&repo, feature_tip, &[main_tip])?;
+    let bases = repo.revwalk().merge_bases(
+        &[feature_tip, main_tip],
+        grit_lib::revwalk::MergeBaseMode::Best,
+    )?;
     println!("merge base(s) of feature and main: {bases:?}");
     assert!(bases.contains(&main_tip));
 

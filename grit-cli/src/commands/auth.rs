@@ -69,127 +69,8 @@ use grit_lib::remote::grit_server_auth::{
 };
 use grit_lib::remote::http_client::UreqHttpClient;
 use grit_lib::repo::Repository;
-use schemars::JsonSchema;
-use serde::Serialize;
 
-use crate::markdown;
-use crate::output::{outln, HumanRender, MarkdownRender, RenderContext};
-
-fn is_false(value: &bool) -> bool {
-    !*value
-}
-
-/// Result of `grit auth` (sign-in).
-#[derive(Serialize, JsonSchema)]
-pub struct AuthOutcome {
-    pub authenticated: bool,
-    pub host: String,
-    /// The user the token belongs to on a `grit serve` host, or the `--username`
-    /// it was stored for (absent for GitHub).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schemars(skip_serializing_if = "Option::is_none")]
-    pub user: Option<String>,
-    /// Whether the host confirmed the token. `false` for `--username`/`--token`,
-    /// which stores it without contacting the host.
-    pub verified: bool,
-}
-
-impl HumanRender for AuthOutcome {
-    fn render_human(&self, w: &mut dyn Write, _ctx: &RenderContext) -> Result<()> {
-        match &self.user {
-            Some(user) if !self.verified => outln!(
-                w,
-                "✓ Stored the token for {user} on {} — the next push or fetch uses it.",
-                self.host
-            ),
-            Some(user) => outln!(w, "✓ Signed in to {} as {user} — token stored.", self.host),
-            None => outln!(
-                w,
-                "\n✓ Signed in to GitHub — token stored for {}.",
-                self.host
-            ),
-        }
-        Ok(())
-    }
-}
-
-impl MarkdownRender for AuthOutcome {
-    fn render_markdown(&self, w: &mut dyn Write, _ctx: &RenderContext) -> Result<()> {
-        markdown::print_auth_outcome(w, self)?;
-        Ok(())
-    }
-}
-
-/// Stored credential fields reported by `grit auth logout --dry-run`.
-#[derive(Serialize, JsonSchema)]
-pub struct LogoutCredentialPreview {
-    pub protocol: String,
-    pub host: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub username: Option<String>,
-}
-
-/// Result of `grit auth logout`.
-#[derive(Serialize, JsonSchema)]
-pub struct LogoutOutcome {
-    pub logged_out: bool,
-    pub host: String,
-    #[serde(default, skip_serializing_if = "is_false")]
-    #[schemars(skip_serializing_if = "is_false")]
-    pub dry_run: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schemars(skip_serializing_if = "Option::is_none")]
-    pub credential: Option<LogoutCredentialPreview>,
-}
-
-impl HumanRender for LogoutOutcome {
-    fn render_human(&self, w: &mut dyn Write, _ctx: &RenderContext) -> Result<()> {
-        if self.dry_run {
-            if let Some(cred) = &self.credential {
-                outln!(
-                    w,
-                    "Dry run: would remove stored credential for {} ({}) on {}.",
-                    cred.host,
-                    cred.username.as_deref().unwrap_or("(no username)"),
-                    cred.protocol
-                );
-            } else {
-                outln!(
-                    w,
-                    "Dry run: no stored credential for {} would be removed.",
-                    self.host
-                );
-            }
-            return Ok(());
-        }
-        if self.logged_out {
-            let service = if self.host == GITHUB_HOST {
-                "GitHub"
-            } else {
-                &self.host
-            };
-            outln!(
-                w,
-                "✓ Signed out of {service} — removed the stored token for {}.",
-                self.host
-            );
-        } else {
-            outln!(
-                w,
-                "No credential helper is configured, so there's no stored token for {} to remove.",
-                self.host
-            );
-        }
-        Ok(())
-    }
-}
-
-impl MarkdownRender for LogoutOutcome {
-    fn render_markdown(&self, w: &mut dyn Write, _ctx: &RenderContext) -> Result<()> {
-        markdown::print_logout_outcome(w, self)?;
-        Ok(())
-    }
-}
+pub use crate::render::auth::*;
 
 /// GitHub OAuth App client id used for the device flow. This is grit's
 /// registered OAuth App; the device flow uses no client secret, so the id is not
@@ -218,9 +99,9 @@ pub enum DefaultHost {
 /// Fails when `GRIT_DEFAULT_HOST` is not an `http`/`https` URL.
 pub fn default_host() -> Result<DefaultHost> {
     let config = load_config();
-    if config
-        .get("remote.origin.url")
-        .is_some_and(|url| is_github_url(&url))
+    if crate::context::config_string(&config, "remote.origin.url")
+        .as_deref()
+        .is_some_and(is_github_url)
     {
         return Ok(DefaultHost::GitHub);
     }
@@ -263,7 +144,11 @@ pub fn run() -> Result<AuthOutcome> {
         config = ensure_credential_helper()?;
     }
 
-    let http = UreqHttpClient::from_config(&config).context("could not set up HTTP client")?;
+    let http = UreqHttpClient::from_config(
+        &config,
+        &grit_lib::config::environment::Environment::empty(),
+    )
+    .context("could not set up HTTP client")?;
     let flow = DeviceFlow::new(&http, &client_id);
 
     let device = flow.request_device_code().map_err(device_flow_error)?;
@@ -315,8 +200,11 @@ pub fn grit_server(url: &str) -> Result<Option<ServerUrl>> {
 /// Fails when no credential helper can be set up, the server cannot be
 /// reached or is not a grit server, the user declines, or the code expires.
 pub fn run_server_login(server: &ServerUrl) -> Result<AuthOutcome> {
-    let http =
-        UreqHttpClient::from_config(&load_config()).context("could not set up HTTP client")?;
+    let http = UreqHttpClient::from_config(
+        &load_config(),
+        &grit_lib::config::environment::Environment::empty(),
+    )
+    .context("could not set up HTTP client")?;
     let flow = LoginFlow::new(&http, server);
     let login = flow.start().map_err(|e| server_error(server, e))?;
     let config = credential_config(server)?;
@@ -355,9 +243,12 @@ pub fn run_server_login(server: &ServerUrl) -> Result<AuthOutcome> {
 /// Fails when no credential helper can be set up, the server rejects the
 /// token or cannot be reached, or the helper cannot store it.
 pub fn run_server_token(server: &ServerUrl, token: &str) -> Result<AuthOutcome> {
-    let http = UreqHttpClient::from_config(&load_config())
-        .context("could not set up HTTP client")?
-        .with_credential_provider(Box::new(TokenCredentialProvider::new(token)));
+    let http = UreqHttpClient::from_config(
+        &load_config(),
+        &grit_lib::config::environment::Environment::empty(),
+    )
+    .context("could not set up HTTP client")?
+    .with_credential_provider(Box::new(TokenCredentialProvider::new(token)));
     let identity = fetch_identity(&http, server).map_err(|e| server_error(server, e))?;
 
     HelperCredentialProvider::new(credential_config(server)?)
@@ -425,7 +316,7 @@ fn server_error(server: &ServerUrl, err: ServerAuthError) -> anyhow::Error {
         ServerAuthError::LoginExpired => {
             anyhow!("the code expired before you approved it. Run `grit auth {root}` to try again.")
         }
-        ServerAuthError::NotGritServer(_) => anyhow!(
+        ServerAuthError::NotGritServer { .. } => anyhow!(
             "{root} is not a `grit serve` host; `grit auth <url>` signs in only to GitHub and grit serve.\n\
              Store a user name and token (or password) for it with \
              `grit auth {root} --username <user> --token <token>`, \
@@ -549,7 +440,12 @@ fn is_auth_error(err: &anyhow::Error) -> bool {
         || err.chain().any(|cause| {
             cause
                 .downcast_ref::<grit_lib::error::Error>()
-                .is_some_and(|e| matches!(e, grit_lib::error::Error::Auth { .. }))
+                .is_some_and(|e| {
+                    matches!(
+                        e,
+                        grit_lib::error::Error::Remote(grit_lib::remote::RemoteError::Auth { .. })
+                    )
+                })
         })
 }
 
@@ -574,11 +470,23 @@ fn load_config() -> ConfigSet {
         None,
         &grit_lib::config::environment::RepositoryOptions::with_environment(env.clone()),
     ) {
-        if let Ok(config) = ConfigSet::load(repo.environment(), Some(repo.git_dir()), true) {
+        if let Ok(config) = ConfigSet::load(
+            repo.environment(),
+            Some(repo.git_dir()),
+            &grit_lib::config::LoadConfigOptions::standard(
+                repo.environment(),
+                Some(repo.git_dir()),
+            ),
+        ) {
             return config;
         }
     }
-    ConfigSet::load(&env, None, true).unwrap_or_default()
+    ConfigSet::load(
+        &env,
+        None,
+        &grit_lib::config::LoadConfigOptions::standard(&env, None),
+    )
+    .unwrap_or_default()
 }
 
 /// Resolve the OAuth App client id (env, then config, then the baked-in value).
@@ -587,8 +495,7 @@ fn client_id(config: &ConfigSet) -> Result<String> {
         .ok()
         .map(|v| v.trim().to_owned())
         .filter(|v| !v.is_empty());
-    let from_config = config
-        .get("grit.githubClientId")
+    let from_config = crate::context::config_string(config, "grit.githubClientId")
         .map(|v| v.trim().to_owned())
         .filter(|v| !v.is_empty());
     let baked = (!DEFAULT_GITHUB_CLIENT_ID.is_empty()).then(|| DEFAULT_GITHUB_CLIENT_ID.to_owned());
@@ -618,10 +525,8 @@ fn has_token_helper(config: &ConfigSet, credential: &Credential) -> bool {
 fn ensure_credential_helper() -> Result<ConfigSet> {
     let exe = std::env::current_exe()
         .context("could not locate the grit executable to set up the credential helper")?;
-    // Git accepts forward slashes in helper paths on Windows, and they avoid the
-    // backslash-escaping pitfalls of the helper string being shell-split.
-    let exe = exe.to_string_lossy().replace('\\', "/");
-    let helper = format!("\"{exe}\" manager");
+    let helper = grit_lib::remote::credentials::helper_config_value(&exe, &["manager"])
+        .context("could not express the grit executable path as a credential helper")?;
     crate::commands::config::set_global("credential.helper", &helper)
         .context("setting up the Windows credential helper")?;
     eprintln!("Set credential.helper to `grit manager` (Windows Credential Manager).");
@@ -660,7 +565,7 @@ fn device_flow_error(err: DeviceFlowError) -> anyhow::Error {
             };
             anyhow::Error::new(source).context(doing)
         }
-        DeviceFlowError::DeviceCodeRejected(code) => {
+        DeviceFlowError::DeviceCodeRejected { code } => {
             anyhow!("GitHub rejected the device-code request: {code}")
         }
         DeviceFlowError::MissingField(field) => anyhow!("GitHub response had no {field}"),
@@ -671,7 +576,7 @@ fn device_flow_error(err: DeviceFlowError) -> anyhow::Error {
             anyhow!("the code expired before you authorized. Run `grit auth` to try again.")
         }
         DeviceFlowError::AccessDenied => anyhow!("authorization was denied on GitHub."),
-        DeviceFlowError::TokenRejected(code) => {
+        DeviceFlowError::TokenRejected { code } => {
             anyhow!("GitHub returned an error while authorizing: {code}")
         }
         DeviceFlowError::UnexpectedResponse => {
@@ -703,6 +608,75 @@ mod tests {
             "https://github.com.evil.example/o/r",
         ] {
             assert!(!is_github_url(url), "{url}");
+        }
+    }
+}
+
+/// Dispatch parsed CLI args for `Auth`.
+pub fn dispatch(
+    args: crate::args::AuthArgs,
+    env: crate::dispatch::CommandEnv<'_>,
+) -> anyhow::Result<crate::exit_status::ExitStatus> {
+    use crate::args::*;
+    use crate::commands;
+
+    use crate::dispatch::{emit_success, CommandEnv};
+
+    let CommandEnv {
+        opts,
+        ctx,
+        process_env: _,
+    } = env;
+    let AuthArgs {
+        url,
+        token,
+        username,
+        action,
+    } = args;
+    match action {
+        None => {
+            let outcome = if let (Some(url), Some(token), Some(username)) =
+                (url.as_deref(), token.as_deref(), username.as_deref())
+            {
+                commands::auth::store_token(url, username, token)?
+            } else {
+                let server = url
+                    .as_deref()
+                    .map(commands::auth::grit_server)
+                    .transpose()?;
+                match (server.flatten(), token) {
+                    (Some(server), Some(token)) => {
+                        commands::auth::run_server_token(&server, &token)?
+                    }
+                    (Some(server), None) => commands::auth::run_server_login(&server)?,
+                    (None, Some(_)) if url.is_some() => {
+                        anyhow::bail!("--token is for `grit serve` hosts; GitHub signs in with the browser, or store a personal access token with `--username <user> --token <token>`")
+                    }
+                    (None, token) => match (commands::auth::default_host()?, token) {
+                        (commands::auth::DefaultHost::Grit(server), Some(token)) => {
+                            commands::auth::run_server_token(&server, &token)?
+                        }
+                        (commands::auth::DefaultHost::Grit(server), None) => {
+                            commands::auth::run_server_login(&server)?
+                        }
+                        (commands::auth::DefaultHost::GitHub, Some(_)) => {
+                            anyhow::bail!("--token is for `grit serve` hosts; GitHub signs in with the browser, or store a personal access token with `--username <user> --token <token>`")
+                        }
+                        (commands::auth::DefaultHost::GitHub, None) => commands::auth::run()?,
+                    },
+                }
+            };
+            emit_success(outcome, opts, ctx)
+        }
+        Some(AuthAction::Logout { url, dry_run }) => {
+            let server = match url.as_deref() {
+                Some(url) => commands::auth::grit_server(url)?,
+                None => match commands::auth::default_host()? {
+                    commands::auth::DefaultHost::Grit(server) => Some(server),
+                    commands::auth::DefaultHost::GitHub => None,
+                },
+            };
+            emit_success(commands::auth::logout(server.as_ref(), dry_run)?, opts, ctx)
         }
     }
 }

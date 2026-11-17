@@ -1,5 +1,6 @@
 //! Git-compatible `log -p` / `show` patch output streamed to a [`Write`](std::io::Write).
 
+use crate::error::ObjectError;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::Write;
@@ -7,23 +8,22 @@ use std::sync::Arc;
 
 use super::structured::{StructuredFileDiff, StructuredLine, StructuredLineKind};
 use crate::attributes::load_gitattributes_for_check_attr_source;
-use crate::commit_pretty::{
-    abbrev_hex, approximate_object_count, auto_abbrev_len_for_object_count,
-};
+use crate::commit_pretty::{abbrev_hex, resolve_core_abbrev_len};
 use crate::config::ConfigSet;
 use crate::diff::options::DiffOptions;
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::index::Index;
 use crate::merge_file;
-use crate::objects::pack_store::PackReadContextGuard;
 use crate::objects::CommitData;
 use crate::objects::FileMode;
 use crate::objects::{parse_commit, ObjectId, ObjectKind};
 use crate::odb::Odb;
 use crate::oid_abbrev_cache::OidAbbrevCache;
+use crate::pack_store::PackReadContextGuard;
 use crate::parallel::{run_ordered_batches, ParallelOp};
 use crate::quote_path::format_diff_path_with_prefix;
 use crate::repo::Repository;
+use crate::repo::RepositoryError;
 use crate::userdiff::{matcher_for_path_parsed, FuncnameMatcher};
 use crate::worktree_rules::WorktreeRules;
 
@@ -63,8 +63,8 @@ pub struct LogPatchOptions {
     pub commit_header: LogPatchCommitHeader,
     /// How to encode binary file changes in the patch body.
     pub binary_format: LogPatchBinaryFormat,
-    /// Limit patches to these pathspecs (empty = all paths).
-    pub pathspecs: Vec<String>,
+    /// Limit patches to these paths (entire tree when unscoped).
+    pub pathspec: crate::pathspec::Pathspec,
     /// How to diff merge commits (`combined` omits apply-ready patch bodies).
     pub diff_merges: DiffMerges,
 }
@@ -78,7 +78,9 @@ impl LogPatchOptions {
             abbrev_len: 7,
             commit_header: LogPatchCommitHeader::Full,
             binary_format: LogPatchBinaryFormat::default(),
-            pathspecs: Vec::new(),
+            pathspec: crate::pathspec::Pathspec::entire_tree(
+                crate::pathspec::PathspecGlobalFlags::default(),
+            ),
             diff_merges: DiffMerges::Combined,
         }
     }
@@ -100,7 +102,7 @@ impl PatchTextOptions {
     ///
     /// Propagates config and ODB errors from abbrev resolution.
     pub fn from_repo(repo: &Repository, diff: DiffOptions) -> Result<Self> {
-        let config = repo.config()?.clone();
+        let config = repo.config().snapshot()?.clone();
         Ok(Self {
             diff,
             abbrev_len: resolve_core_abbrev_len(&config, repo.odb())?,
@@ -126,14 +128,16 @@ pub fn write_patch<W: Write>(
     }
     let odb = repo.odb();
     super::tree_content::prefetch_tree_diff_blobs(odb, entries)?;
-    let config = repo.config()?.clone();
+    let config = repo.config().snapshot()?.clone();
     let thread_policy = repo.thread_policy();
     let log_opts = LogPatchOptions {
         diff: opts.diff.clone(),
         abbrev_len: opts.abbrev_len,
         commit_header: LogPatchCommitHeader::FormatPercentH,
         binary_format: LogPatchBinaryFormat::GitApplyBinaryPatch,
-        pathspecs: Vec::new(),
+        pathspec: crate::pathspec::Pathspec::entire_tree(
+            crate::pathspec::PathspecGlobalFlags::default(),
+        ),
         diff_merges: DiffMerges::FirstParent,
     };
     let abbrev_len = opts.abbrev_len;
@@ -200,7 +204,7 @@ pub fn write_patch<W: Write>(
 
 /// Write patch text from precomputed [`TreeDiffStructured`](super::tree_content::TreeDiffStructured) rows.
 ///
-/// Use after [`super::tree_diff_structured_parallel`] (or `grit diff`'s commit-range path) to avoid
+/// Use after [`Diff::structured`](super::Diff::structured) (or `grit diff`'s commit-range path) to avoid
 /// recomputing line diffs.
 ///
 /// # Errors
@@ -216,14 +220,16 @@ pub fn write_patch_structured<W: Write>(
         return Ok(());
     }
     let odb = repo.odb();
-    let config = repo.config()?.clone();
+    let config = repo.config().snapshot()?.clone();
     let thread_policy = repo.thread_policy();
     let log_opts = LogPatchOptions {
         diff: opts.diff.clone(),
         abbrev_len: opts.abbrev_len,
         commit_header: LogPatchCommitHeader::FormatPercentH,
         binary_format: LogPatchBinaryFormat::GitApplyBinaryPatch,
-        pathspecs: Vec::new(),
+        pathspec: crate::pathspec::Pathspec::entire_tree(
+            crate::pathspec::PathspecGlobalFlags::default(),
+        ),
         diff_merges: DiffMerges::FirstParent,
     };
     let mut abbrev_cache = OidAbbrevCache::new(opts.abbrev_len);
@@ -381,10 +387,16 @@ fn write_patch_unified_body_from_bytes<W: Write>(
             crate::commit_encoding::decode_latin1(new_bytes),
         )
     } else {
-        let old_s = std::str::from_utf8(old_bytes)
-            .map_err(|_| crate::error::Error::CorruptObject("blob is not valid UTF-8".into()))?;
-        let new_s = std::str::from_utf8(new_bytes)
-            .map_err(|_| crate::error::Error::CorruptObject("blob is not valid UTF-8".into()))?;
+        let old_s = std::str::from_utf8(old_bytes).map_err(|_| {
+            crate::error::Error::Object(ObjectError::Corrupt {
+                detail: "blob is not valid UTF-8".into(),
+            })
+        })?;
+        let new_s = std::str::from_utf8(new_bytes).map_err(|_| {
+            crate::error::Error::Object(ObjectError::Corrupt {
+                detail: "blob is not valid UTF-8".into(),
+            })
+        })?;
         (old_s.to_owned(), new_s.to_owned())
     };
     let old_path = if old_mode == 0 {
@@ -412,8 +424,11 @@ fn write_patch_unified_body_from_bytes<W: Write>(
             d,
             QUOTE_FULLY,
         )?;
-        let patch_str = std::str::from_utf8(&patch_buf)
-            .map_err(|_| crate::error::Error::CorruptObject("patch re-encoding failed".into()))?;
+        let patch_str = std::str::from_utf8(&patch_buf).map_err(|_| {
+            crate::error::Error::Object(ObjectError::Corrupt {
+                detail: "patch re-encoding failed".into(),
+            })
+        })?;
         out.write_all(&crate::commit_encoding::encode_latin1_lossy(patch_str))?;
     } else {
         super::write_unified_diff_from_diff_options(
@@ -432,25 +447,11 @@ fn write_patch_unified_body_from_bytes<W: Write>(
     Ok(())
 }
 
-fn resolve_core_abbrev_len(config: &ConfigSet, odb: &Odb) -> Result<usize> {
-    if let Some(v) = config.get("core.abbrev") {
-        if v.eq_ignore_ascii_case("auto") {
-            let count = approximate_object_count(odb)?;
-            return Ok(auto_abbrev_len_for_object_count(count));
-        }
-        if let Ok(n) = v.parse::<i64>() {
-            return Ok((n as usize).clamp(4, 40));
-        }
-    }
-    let count = approximate_object_count(odb)?;
-    Ok(auto_abbrev_len_for_object_count(count))
-}
-
 fn effective_log_patch_options(
     repo: &Repository,
     opts: &LogPatchOptions,
 ) -> Result<LogPatchOptions> {
-    let config = repo.config()?.clone();
+    let config = repo.config().snapshot()?.clone();
     let mut out = opts.clone();
     out.abbrev_len = resolve_core_abbrev_len(&config, repo.odb())?;
     Ok(out)
@@ -463,8 +464,13 @@ fn log_patch_funcname_matcher(
     rel_path: &str,
 ) -> Result<Option<FuncnameMatcher>> {
     let parsed = load_gitattributes_for_check_attr_source(repo, tree_oid)?;
-    matcher_for_path_parsed(config, &parsed.rules, &parsed.macros, rel_path, false)
-        .map_err(crate::error::Error::Message)
+    Ok(matcher_for_path_parsed(
+        config,
+        &parsed.rules,
+        &parsed.macros,
+        rel_path,
+        false,
+    )?)
 }
 
 /// Write one commit in `git log -p --no-color --format=%H` shape (no patch for merges).
@@ -481,7 +487,8 @@ pub fn write_commit_log_patch<W: Write>(
     let odb = repo.odb();
     let raw = odb.read(oid)?;
     let commit = parse_commit(&raw.data)?;
-    let parent_tree = parent_tree_for_commit(odb, &commit, None)?;
+    let parent_ctx = crate::shallow::EffectiveCommitParents::load(repo);
+    let parent_tree = parent_tree_for_commit(repo, &parent_ctx, oid, &commit, None)?;
     let opts = effective_log_patch_options(repo, opts)?;
     let mut abbrev_cache = OidAbbrevCache::new(opts.abbrev_len);
     write_parsed_commit_log_patch(
@@ -491,6 +498,7 @@ pub fn write_commit_log_patch<W: Write>(
         oid,
         &commit,
         parent_tree,
+        &parent_ctx,
         &opts,
         &mut abbrev_cache,
     )
@@ -524,12 +532,14 @@ pub fn write_commits_log_patch<W: Write>(
         parsed.push((*oid, commit));
     }
     let opts = effective_log_patch_options(repo, opts)?;
+    let parent_ctx = crate::shallow::EffectiveCommitParents::load(repo);
     let mut abbrev_cache = OidAbbrevCache::new(opts.abbrev_len);
     for (i, (oid, commit)) in parsed.iter().enumerate() {
         if i > 0 && opts.commit_header == LogPatchCommitHeader::Full {
             writeln!(out)?;
         }
-        let parent_tree = parent_tree_for_commit(odb, commit, Some(&trees_by_commit))?;
+        let parent_tree =
+            parent_tree_for_commit(repo, &parent_ctx, oid, commit, Some(&trees_by_commit))?;
         write_parsed_commit_log_patch(
             out,
             repo,
@@ -537,6 +547,7 @@ pub fn write_commits_log_patch<W: Write>(
             oid,
             commit,
             parent_tree,
+            &parent_ctx,
             &opts,
             &mut abbrev_cache,
         )?;
@@ -545,14 +556,18 @@ pub fn write_commits_log_patch<W: Write>(
 }
 
 fn parent_tree_for_commit(
-    odb: &Odb,
+    repo: &Repository,
+    parent_ctx: &crate::shallow::EffectiveCommitParents,
+    commit_oid: &ObjectId,
     commit: &CommitData,
     trees_by_commit: Option<&HashMap<ObjectId, ObjectId>>,
 ) -> Result<Option<ObjectId>> {
-    if commit.parents.is_empty() {
+    let effective_parents = parent_ctx.for_commit(*commit_oid, &commit.parents);
+    if effective_parents.is_empty() {
         return Ok(None);
     }
-    let parent = commit.parents[0];
+    let parent = effective_parents[0];
+    let odb = repo.odb();
     if let Some(map) = trees_by_commit {
         if let Some(tree) = map.get(&parent) {
             return Ok(Some(*tree));
@@ -602,17 +617,19 @@ fn write_parsed_commit_log_patch<W: Write>(
     oid: &ObjectId,
     commit: &CommitData,
     _parent_tree: Option<ObjectId>,
+    parent_ctx: &crate::shallow::EffectiveCommitParents,
     opts: &LogPatchOptions,
     abbrev_cache: &mut OidAbbrevCache,
 ) -> Result<()> {
-    let is_merge = commit.parents.len() > 1;
+    let effective_parents = parent_ctx.for_commit(*oid, &commit.parents);
+    let is_merge = effective_parents.len() > 1;
     let omit_merge_patch = is_merge && opts.diff_merges == DiffMerges::Combined;
     match opts.commit_header {
         LogPatchCommitHeader::Full => {
             writeln!(out, "commit {oid}")?;
             if is_merge {
-                let mut parts = Vec::with_capacity(commit.parents.len());
-                for parent in &commit.parents {
+                let mut parts = Vec::with_capacity(effective_parents.len());
+                for parent in &effective_parents {
                     parts.push(abbrev_for_index_line(
                         abbrev_cache,
                         repo,
@@ -636,10 +653,16 @@ fn write_parsed_commit_log_patch<W: Write>(
             writeln!(out)?;
         }
     }
-    let config = repo.config()?.clone();
+    let config = repo.config().snapshot()?.clone();
     let thread_policy = repo.thread_policy();
-    let entries =
-        commit_first_parent_diff_entries(repo, commit, &opts.pathspecs, &config, &thread_policy)?;
+    let entries = commit_first_parent_diff_entries(
+        repo,
+        oid,
+        commit,
+        opts.pathspec.specs(),
+        &config,
+        &thread_policy,
+    )?;
     for entry in entries {
         write_diff_entry_patch(
             out,
@@ -747,7 +770,7 @@ pub fn write_diff_entry_log_patch<W: Write>(
     entry: &DiffEntry,
     opts: &LogPatchOptions,
 ) -> Result<()> {
-    let config = repo.config()?.clone();
+    let config = repo.config().snapshot()?.clone();
     let mut abbrev_cache = OidAbbrevCache::new(opts.abbrev_len);
     write_diff_entry_patch(
         out,
@@ -969,10 +992,16 @@ fn write_diff_entry_patch_with_resolved_bytes<W: Write>(
             crate::commit_encoding::decode_latin1(new_bytes),
         )
     } else {
-        let old_s = std::str::from_utf8(old_bytes)
-            .map_err(|_| crate::error::Error::CorruptObject("blob is not valid UTF-8".into()))?;
-        let new_s = std::str::from_utf8(new_bytes)
-            .map_err(|_| crate::error::Error::CorruptObject("blob is not valid UTF-8".into()))?;
+        let old_s = std::str::from_utf8(old_bytes).map_err(|_| {
+            crate::error::Error::Object(ObjectError::Corrupt {
+                detail: "blob is not valid UTF-8".into(),
+            })
+        })?;
+        let new_s = std::str::from_utf8(new_bytes).map_err(|_| {
+            crate::error::Error::Object(ObjectError::Corrupt {
+                detail: "blob is not valid UTF-8".into(),
+            })
+        })?;
         (old_s.to_owned(), new_s.to_owned())
     };
     let old_path = if old_mode == 0 {
@@ -1006,8 +1035,11 @@ fn write_diff_entry_patch_with_resolved_bytes<W: Write>(
             d,
             QUOTE_FULLY,
         )?;
-        let patch_str = std::str::from_utf8(&patch_buf)
-            .map_err(|_| crate::error::Error::CorruptObject("patch re-encoding failed".into()))?;
+        let patch_str = std::str::from_utf8(&patch_buf).map_err(|_| {
+            crate::error::Error::Object(ObjectError::Corrupt {
+                detail: "patch re-encoding failed".into(),
+            })
+        })?;
         out.write_all(&crate::commit_encoding::encode_latin1_lossy(patch_str))?;
     } else {
         super::write_unified_diff_from_diff_options(
@@ -1059,10 +1091,11 @@ pub struct PatchResolvedSide {
 /// Write `git diff --binary`-compatible patch text for files whose sides may live in memory,
 /// the object database, or the work tree (index and work-tree diffs).
 ///
-/// Binary files are written as `GIT binary patch` sections. Their `index` line always carries
-/// full ids of the content actually written, hashed from the bytes for [`PatchSide::Bytes`] and
-/// [`PatchSide::Worktree`] sides, because `git apply` refuses a binary patch without one and
-/// work-tree entries often carry no blob id for the work-tree side.
+/// Binary files are written as `GIT binary patch` sections. The `index` line carries abbreviated
+/// blob ids for the content actually written: [`PatchSide::Blob`] keeps the entry oid,
+/// [`PatchSide::Bytes`] and [`PatchSide::Worktree`] are hashed at render time (no ODB write),
+/// gitlinks keep their commit oids, and absent sides stay zero. Work-tree diffs often arrive
+/// with a zero new oid even for text files; filling ids here keeps `git apply --3way` usable.
 ///
 /// # Parameters
 ///
@@ -1074,7 +1107,7 @@ pub struct PatchResolvedSide {
 ///
 /// # Errors
 ///
-/// Returns [`Error::RequiresWorkTree`](crate::error::Error::RequiresWorkTree) when a
+/// Returns [`RepositoryError::RequiresWorkTree`](RepositoryError::RequiresWorkTree) when a
 /// [`PatchSide::Worktree`] side is requested in a bare repository, and propagates index, ODB,
 /// work-tree, hashing and I/O errors.
 pub fn write_patch_resolved<W: Write>(
@@ -1086,30 +1119,30 @@ pub fn write_patch_resolved<W: Write>(
     if files.is_empty() {
         return Ok(());
     }
-    let config = repo.config()?.clone();
+    let config = repo.config().snapshot()?.clone();
     let thread_policy = repo.thread_policy();
     let log_opts = LogPatchOptions {
         diff: opts.diff.clone(),
         abbrev_len: opts.abbrev_len,
         commit_header: LogPatchCommitHeader::FormatPercentH,
         binary_format: LogPatchBinaryFormat::GitApplyBinaryPatch,
-        pathspecs: Vec::new(),
+        pathspec: crate::pathspec::Pathspec::entire_tree(
+            crate::pathspec::PathspecGlobalFlags::default(),
+        ),
         diff_merges: DiffMerges::FirstParent,
     };
     let mut abbrev_cache = OidAbbrevCache::new(opts.abbrev_len);
-    let oids = files
-        .iter()
-        .flat_map(|f| [f.entry.old_oid, f.entry.new_oid]);
-    abbrev_cache.warm_for_patch_batch(repo, oids, &thread_policy, &config)?;
     let mut worktree = None;
     for file in files {
         let old = resolve_patch_side(repo, file, EntrySide::Old, &mut worktree)?;
         let new = resolve_patch_side(repo, file, EntrySide::New, &mut worktree)?;
-        let entry = if merge_file::is_binary(&old) || merge_file::is_binary(&new) {
-            Cow::Owned(entry_with_content_ids(repo, file, &old, &new)?)
-        } else {
-            Cow::Borrowed(&file.entry)
-        };
+        let entry = entry_with_content_ids(repo, file, &old, &new)?;
+        abbrev_cache.warm_for_patch_batch(
+            repo,
+            [entry.old_oid, entry.new_oid],
+            &thread_policy,
+            &config,
+        )?;
         write_diff_entry_patch_with_resolved_bytes(
             out,
             repo,
@@ -1159,8 +1192,8 @@ struct WorktreeSideReader<'r> {
 
 impl<'r> WorktreeSideReader<'r> {
     fn open(repo: &'r Repository) -> Result<Self> {
-        let work_tree = repo.work_tree().ok_or(Error::RequiresWorkTree)?;
-        let index = repo.index_handle().load()?;
+        let work_tree = repo.work_tree().ok_or(RepositoryError::RequiresWorkTree)?;
+        let index = repo.load_index()?;
         let rules = WorktreeRules::from_repository(repo, &index)?;
         Ok(Self {
             work_tree,
@@ -1232,6 +1265,9 @@ fn entry_with_content_ids(
         if mode.is_absent() {
             return Ok(zero_oid());
         }
+        if mode.is_gitlink() {
+            return Ok(oid);
+        }
         match source {
             PatchSide::Blob => Ok(oid),
             PatchSide::Bytes(_) | PatchSide::Worktree => {
@@ -1255,7 +1291,7 @@ fn load_patch_blob_side(
     if is_missing || oid == zero_oid() || oid == empty_blob_oid() {
         return Ok((Vec::new(), false));
     }
-    let (side, binary) = load_odb_blob_side_for_diff(odb, &oid, path, None, force_read_content)?;
+    let (side, binary) = load_odb_blob_side_for_diff(odb, &oid, path, force_read_content)?;
     Ok((side.data, binary))
 }
 
@@ -1280,7 +1316,7 @@ mod tests {
     #[test]
     fn log_short_message_skips_big_blob_reads() -> Result<()> {
         let dir = tempfile::tempdir().expect("tempdir");
-        let repo = Repository::init(dir.path(), &crate::repo::InitOptions::default())?;
+        let (repo, _) = Repository::init(dir.path(), &crate::repo::InitOptions::default())?;
         std::fs::write(
             repo.git_dir().join("config"),
             "[core]\n\tbigFileThreshold = 4k\n",
@@ -1326,7 +1362,7 @@ mod tests {
             score: Some(100),
         };
         let dir = tempfile::tempdir().expect("tempdir");
-        let repo = Repository::init(dir.path(), &crate::repo::InitOptions::default())?;
+        let (repo, _) = Repository::init(dir.path(), &crate::repo::InitOptions::default())?;
         repo.odb().write(ObjectKind::Blob, b"x")?;
         let mut out = Cursor::new(Vec::new());
         let opts = LogPatchOptions::git_default(&ConfigSet::default());
@@ -1335,6 +1371,82 @@ mod tests {
         assert!(text.contains("copy from src/a.txt"));
         assert!(text.contains("copy to dst/b.txt"));
         assert!(!text.contains("rename from"));
+        Ok(())
+    }
+
+    #[test]
+    fn write_patch_resolved_index_line_hashes_text_bytes_when_new_oid_zero() -> Result<()> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (repo, _) = Repository::init(dir.path(), &crate::repo::InitOptions::default())?;
+        let old_oid = repo.odb().write(ObjectKind::Blob, b"one\n")?;
+        let new_bytes = b"one\ntwo\n".to_vec();
+        let new_oid = repo
+            .odb()
+            .hash_algo()
+            .hash_object(ObjectKind::Blob, &new_bytes)?;
+        let files = [PatchResolvedSide {
+            entry: DiffEntry {
+                status: DiffStatus::Modified,
+                old_path: Some("t.txt".into()),
+                new_path: Some("t.txt".into()),
+                old_oid,
+                new_oid: zero_oid(),
+                old_mode: FileMode::REGULAR,
+                new_mode: FileMode::REGULAR,
+                score: None,
+            },
+            old: PatchSide::Bytes(b"one\n".to_vec()),
+            new: PatchSide::Bytes(new_bytes),
+        }];
+        let opts = PatchTextOptions::from_repo(&repo, DiffOptions::default())?;
+        let mut out = Cursor::new(Vec::new());
+        write_patch_resolved(&repo, &files, &opts, &mut out)?;
+        let text = String::from_utf8(out.into_inner()).expect("utf-8");
+        assert!(
+            !text.contains("..0000000 100644"),
+            "must not emit placeholder new oid:\n{text}"
+        );
+        assert!(
+            text.contains(&format!("..{} 100644", &new_oid.to_hex()[..7])),
+            "index line must abbreviate hashed postimage:\n{text}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn write_patch_resolved_gitlink_index_line_keeps_commit_ids() -> Result<()> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (repo, _) = Repository::init(dir.path(), &crate::repo::InitOptions::default())?;
+        let old_commit =
+            ObjectId::from_hex("1111111111111111111111111111111111111111").expect("oid");
+        let new_commit =
+            ObjectId::from_hex("2222222222222222222222222222222222222222").expect("oid");
+        let files = [PatchResolvedSide {
+            entry: DiffEntry {
+                status: DiffStatus::Modified,
+                old_path: Some("sub".into()),
+                new_path: Some("sub".into()),
+                old_oid: old_commit,
+                new_oid: new_commit,
+                old_mode: FileMode::GITLINK,
+                new_mode: FileMode::GITLINK,
+                score: None,
+            },
+            old: PatchSide::Bytes(format!("Subproject commit {}\n", old_commit.to_hex()).into()),
+            new: PatchSide::Bytes(format!("Subproject commit {}\n", new_commit.to_hex()).into()),
+        }];
+        let opts = PatchTextOptions::from_repo(&repo, DiffOptions::default())?;
+        let mut out = Cursor::new(Vec::new());
+        write_patch_resolved(&repo, &files, &opts, &mut out)?;
+        let text = String::from_utf8(out.into_inner()).expect("utf-8");
+        assert!(
+            text.contains(&format!(
+                "index {}..{} 160000",
+                &old_commit.to_hex()[..7],
+                &new_commit.to_hex()[..7]
+            )),
+            "gitlink index line must keep commit oids:\n{text}"
+        );
         Ok(())
     }
 }

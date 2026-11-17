@@ -51,7 +51,7 @@ fn grit_init_add_nfd_untracked_stores_nfc_in_index() {
     }
     fs::write(&config_path, config).expect("write config");
 
-    let nfd = format!("cafe\u{0301}.txt");
+    let nfd = "cafe\u{0301}.txt".to_string();
     fs::write(dir.path().join(&nfd), b"x\n").expect("write nfd file");
 
     let add = run_grit(grit, dir.path(), &["add"], &null);
@@ -99,12 +99,11 @@ fn grit_init_add_nfd_untracked_stores_nfc_in_index() {
     use grit_lib::config::environment::RepositoryOptions;
     use grit_lib::objects::{parse_commit, parse_tree};
     use grit_lib::repo::Repository;
-    use grit_lib::state::resolve_head;
 
     let repo =
         Repository::discover(Some(dir.path()), &RepositoryOptions::empty()).expect("discover repo");
-    let head_state = resolve_head(repo.git_dir()).expect("resolve head");
-    let head = head_state.oid().expect("HEAD after commit").clone();
+    let head_state = repo.references().head().expect("resolve head");
+    let head = *head_state.oid().expect("HEAD after commit");
     let commit_obj = repo.odb().read(&head).expect("read commit");
     let commit_data = parse_commit(&commit_obj.data).expect("parse commit");
     let tree_obj = repo.odb().read(&commit_data.tree).expect("read tree");

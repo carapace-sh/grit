@@ -23,7 +23,7 @@ fn nested_includes_three_levels() {
         &repo,
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
-            .with_ref_storage(grit_lib::RefStorageFormat::Files),
+            .with_ref_storage(grit_lib::refs::ref_storage::RefStorageFormat::Files),
     )
     .expect("init");
     let git_dir = repo.join(".git");
@@ -35,9 +35,8 @@ fn nested_includes_three_levels() {
 
     let env = Environment::empty();
     let set =
-        ConfigSet::load_with_options(&env, Some(&git_dir), &default_load_opts(&git_dir, &env))
-            .expect("load");
-    assert_eq!(set.get("leaf.k").as_deref(), Some("deep"));
+        ConfigSet::load(&env, Some(&git_dir), &default_load_opts(&git_dir, &env)).expect("load");
+    assert_eq!(set.get("leaf.k").unwrap().as_deref(), Some("deep"));
 }
 
 #[test]
@@ -58,7 +57,7 @@ fn compression_and_pack_accessor_matrix() {
         let _ = set.loose_objects_zlib_level();
         let _ = set.pack_objects_zlib_level();
         let _ = set.pack_index_threads();
-        let _ = set.pack_write_reverse_index_default(&Environment::empty());
+        let _ = set.pack_write_reverse_index_default();
         let _ = set.pack_read_reverse_index_default();
         let _ = set.get_regexp("core");
     }
@@ -75,7 +74,7 @@ fn load_with_env_pairs_and_global_override() {
         &repo,
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
-            .with_ref_storage(grit_lib::RefStorageFormat::Files),
+            .with_ref_storage(grit_lib::refs::ref_storage::RefStorageFormat::Files),
     )
     .expect("init");
     let git_dir = repo.join(".git");
@@ -86,7 +85,7 @@ fn load_with_env_pairs_and_global_override() {
     env.git_config_pairs = vec![("fromenv.k".into(), "e".into())];
     env.cwd = repo.clone();
 
-    let set = ConfigSet::load_with_options(
+    let set = ConfigSet::load(
         &env,
         Some(&git_dir),
         &LoadConfigOptions {
@@ -95,6 +94,6 @@ fn load_with_env_pairs_and_global_override() {
         },
     )
     .expect("load");
-    assert_eq!(set.get("fromenv.k").as_deref(), Some("e"));
-    assert_eq!(set.get("fromglobal.k").as_deref(), Some("g"));
+    assert_eq!(set.get("fromenv.k").unwrap().as_deref(), Some("e"));
+    assert_eq!(set.get("fromglobal.k").unwrap().as_deref(), Some("g"));
 }

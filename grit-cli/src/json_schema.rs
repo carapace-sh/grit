@@ -64,6 +64,10 @@ const SCHEMA_V2_COMMANDS: &[&str] = &[
     "remote.set-url",
     "remote.show",
     "switch",
+    "stash.apply",
+    "stash.branch",
+    "stash.drop",
+    "stash.list",
     "tag",
     "worktree.prune",
 ];
@@ -161,6 +165,14 @@ fn build_schema_registry() -> Vec<SchemaRegistryEntry> {
         entry::<CheckoutOutcome>("checkout"),
         entry::<CheckinOutcome>("checkin"),
         entry::<IntegrateOutcome>("integrate"),
+        entry::<crate::commands::sync::SyncOutcome>("sync"),
+        entry::<crate::commands::share::ShareOutcome>("share.add"),
+        entry::<crate::commands::share::ShareOutcome>("share.list"),
+        entry::<crate::commands::share::ShareAcceptOutcome>("share.accept"),
+        entry::<crate::commands::share::ShareOutcome>("share.remove"),
+        entry::<crate::commands::share::ShareOutcome>("share.leave"),
+        entry::<crate::commands::share::ShareOutcome>("share.revoke"),
+        entry::<crate::commands::share::ShareResolveOutcome>("share.resolve"),
         entry::<SliceListOutcome>("slice.list"),
         entry::<SliceChangeOutcome>("slice.new"),
         entry::<SliceChangeOutcome>("slice.edit"),
@@ -182,6 +194,7 @@ fn build_schema_registry() -> Vec<SchemaRegistryEntry> {
         entry::<ReflogDeleteOutcome>("reflog.delete"),
         entry::<ReflogExpireOutcome>("reflog.expire"),
         entry::<BlameOutcome>("blame"),
+        entry::<crate::commands::describe::DescribeOutcome>("describe"),
         entry::<DiffOutcome>("diff"),
         entry::<ShowRunResult>("show"),
         entry::<ShortlogOutcome>("shortlog"),
@@ -359,6 +372,16 @@ pub fn schema_command_key(args: &[&str]) -> Option<String> {
             // `grit auth` or `grit auth <url>`.
             _ => "auth",
         },
+        "share" => match positional.get(1).copied() {
+            Some("add") => "share.add",
+            Some("list") => "share.list",
+            Some("accept") => "share.accept",
+            Some("remove") => "share.remove",
+            Some("leave") => "share.leave",
+            Some("revoke") => "share.revoke",
+            Some("resolve") => "share.resolve",
+            _ => return None,
+        },
         "slice" => match positional.get(1).copied() {
             Some("list") => "slice.list",
             Some("new") => "slice.new",
@@ -402,14 +425,14 @@ pub fn schema_command_key(args: &[&str]) -> Option<String> {
             _ => return None,
         },
         "rebase" => {
-            if args.iter().any(|a| *a == "--check") {
+            if args.contains(&"--check") {
                 "rebase.check"
             } else {
                 "rebase"
             }
         }
         "fetch" => {
-            if args.iter().any(|a| *a == "--all") {
+            if args.contains(&"--all") {
                 "fetch.all"
             } else {
                 "fetch"
@@ -502,10 +525,8 @@ pub fn schema_key_for_doc_example(
             return Some("reflog.list".into());
         }
     }
-    if page_command == "rebase" {
-        if instance.get("check").and_then(|v| v.as_bool()) == Some(true) {
-            return Some("rebase.check".into());
-        }
+    if page_command == "rebase" && instance.get("check").and_then(|v| v.as_bool()) == Some(true) {
+        return Some("rebase.check".into());
     }
     if page_command == "stash" {
         if instance.is_array() {
@@ -522,6 +543,18 @@ pub fn schema_key_for_doc_example(
         }
         if let Some(obj) = instance.as_object() {
             if obj.len() == 1 && obj.contains_key("index") {
+                return Some("stash.drop".into());
+            }
+            if obj.contains_key("index")
+                && obj.contains_key("oid")
+                && !obj.contains_key("conflicts")
+                && !obj.contains_key("dropped")
+                && !obj.contains_key("branch")
+                && !obj.contains_key("base")
+                && !obj.contains_key("index_restored")
+                && !obj.contains_key("message")
+                && !obj.contains_key("stashed")
+            {
                 return Some("stash.drop".into());
             }
         }
@@ -743,16 +776,35 @@ pub const SNAPSHOT_FILE_PREFIX: &str = "grit_test_support__cli_fixture__";
 /// fixtures, jq filter slices, and similar). Skipped by [`json_snapshots_match_schemas`] only;
 /// output snapshot coverage still requires human/json/markdown sections for render stems.
 pub const SNAPSHOT_JSON_SCHEMA_SKIP: &[&str] = &[
+    "help_output",
     "auth_render",
     "log_json_filter_commits_oid",
     "checkin_render",
+    "checkin_refused_render",
     "checkout_render",
     "integrate_render",
     "integrate_elsewhere_render",
     "integrate_refresh_failed_render",
+    "share_render",
+    "share_add_render",
+    "share_accept_render",
+    "share_resolve_render",
+    "share_resolve_applied_render",
+    "share_resolve_integrated_render",
+    "share_resolve_renamed_render",
+    "share_remove_render",
     "slice_render",
+    "sync_render",
+    "sync_attention_render",
     "serve_render",
     "update_render",
+    "gc_auto_skip_render",
+    "gc_offload_render",
+    "repack_dry_run_render",
+    "fsck_problems_render",
+    "config_list_scopes_render",
+    "hooks_run_failure_render",
+    "ignore_check_all_render",
 ];
 
 /// Snapshot stems (insta name) for every `*.snap` in `dir`.
@@ -841,6 +893,11 @@ pub fn snapshot_command_args() -> &'static [(&'static str, &'static [&'static st
         ),
         ("repack", &["repack", "--dry-run"]),
         ("status", &["status"]),
+        ("status_merge_in_progress", &["status"]),
+        ("status_no_ahead_behind", &["status", "--no-ahead-behind"]),
+        ("status_ignored", &["status", "--ignored"]),
+        ("status_upstream", &["status"]),
+        ("status_workspace", &["status"]),
         ("log", &["log"]),
         ("log_oneline", &["log", "--oneline", "--limit", "3"]),
         (
@@ -856,6 +913,7 @@ pub fn snapshot_command_args() -> &'static [(&'static str, &'static [&'static st
             &["log", "--graph", "--oneline", "-n", "5"],
         ),
         ("reflog", &["reflog"]),
+        ("describe", &["describe"]),
         ("diff", &["diff"]),
         ("diff_staged", &["diff", "--staged"]),
         ("show_head", &["show", "HEAD"]),
@@ -991,6 +1049,7 @@ pub fn snapshot_command_args() -> &'static [(&'static str, &'static [&'static st
         ("remote_refs_tags", &["remote", "refs", "origin", "--tags"]),
         ("stash_push", &["stash", "push", "-m", "wip"]),
         ("stash_list", &["stash", "list"]),
+        ("stash_list_multiple", &["stash", "list"]),
         ("stash_show", &["stash", "show"]),
         ("stash_apply", &["stash", "apply"]),
         ("stash_pop", &["stash", "pop"]),
@@ -1005,6 +1064,7 @@ pub fn snapshot_command_args() -> &'static [(&'static str, &'static [&'static st
         ),
         ("ignore_check_json", &["ignore", "check", "keep.txt"]),
         ("worktree_list", &["worktree", "list"]),
+        ("worktree_list_multiple", &["worktree", "list"]),
         (
             "worktree_add",
             &["worktree", "add", "linked-wt", "-b", "wt-new"],
@@ -1065,6 +1125,7 @@ pub fn snapshot_command_args() -> &'static [(&'static str, &'static [&'static st
         ("reflog_list", &["reflog", "list"]),
         ("worktree_prune", &["worktree", "prune"]),
         ("error_usage", &["branch", "--delete"]),
+        ("error_clap_habit", &["checkout", "-b", "feature"]),
         ("error_invalid_pattern", &["log", "--author", "["]),
         ("error_would_overwrite", &["switch", "br"]),
         ("error_conflict", &["history", "drop", "HEAD~1"]),

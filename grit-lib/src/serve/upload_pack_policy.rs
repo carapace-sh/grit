@@ -2,7 +2,7 @@
 
 use std::collections::{HashSet, VecDeque};
 
-use super::{AdvertisedRef, Result, ServeError};
+use super::{Result, ServeError};
 use crate::config::ConfigSet;
 use crate::objects::{ObjectId, ObjectKind};
 use crate::repo::Repository;
@@ -31,7 +31,7 @@ pub(crate) struct UploadPackPolicy {
 
 impl UploadPackPolicy {
     pub fn from_config(config: &ConfigSet) -> Self {
-        let flag = |key: &str| config.get_bool(key).and_then(|v| v.ok()).unwrap_or(false);
+        let flag = |key: &str| config.get_bool(key).ok().flatten().unwrap_or(false);
         Self {
             allow_filter: flag("uploadpack.allowfilter"),
             allow_tip_sha1_in_want: flag("uploadpack.allowtipsha1inwant"),
@@ -79,28 +79,28 @@ impl UploadPackPolicy {
 
     pub fn parse_filter(&self, config: &ConfigSet, spec: &str) -> Result<ObjectFilter> {
         if !self.allow_filter {
-            return Err(ServeError::Protocol(
-                "filter not supported (uploadpack.allowFilter is false)".into(),
-            ));
+            return Err(ServeError::Protocol {
+                detail: "filter not supported (uploadpack.allowFilter is false)".into(),
+            }
+            .into());
         }
         validate_upload_filter_request(config, spec).map_err(ServeError::UploadFilter)?;
-        ObjectFilter::parse(spec)
-            .map_err(|e| ServeError::UploadFilter(UploadFilterError::InvalidFilterSpec(e)))
+        Ok(ObjectFilter::parse(spec)
+            .map_err(|e| ServeError::UploadFilter(UploadFilterError::InvalidFilterSpec(e)))?)
     }
 }
 
 /// Resolve `want-ref` names to OIDs and record them for the `wanted-refs` section.
 pub(crate) fn resolve_want_ref(
     repo: &Repository,
-    refs: &[AdvertisedRef],
     hidden: &[String],
     name: &str,
 ) -> Result<ObjectId> {
     if matches!(name, "HEAD" | "refs/HEAD") {
         let head = super::head_info(repo);
-        return head
-            .oid
-            .ok_or_else(|| ServeError::Protocol("unknown ref HEAD".into()));
+        return Ok(head.oid.ok_or_else(|| ServeError::Protocol {
+            detail: "unknown ref HEAD".into(),
+        })?);
     }
     let full = if name.starts_with("refs/") {
         name.to_owned()
@@ -108,22 +108,23 @@ pub(crate) fn resolve_want_ref(
         format!("refs/{name}")
     };
     if crate::hide_refs::ref_is_hidden(name, &full, hidden) {
-        return Err(ServeError::Protocol(format!("unknown ref {name}")));
+        return Err(ServeError::Protocol {
+            detail: format!("unknown ref {name}"),
+        }
+        .into());
     }
-    let allowed: HashSet<&str> = refs.iter().map(|r| r.name.as_str()).collect();
-    if !allowed.contains(full.as_str()) && !allowed.contains(name) {
-        return Err(ServeError::Protocol(format!("unknown ref {name}")));
-    }
-    crate::refs::resolve_ref(repo.git_dir(), &full)
-        .or_else(|_| crate::refs::resolve_ref(repo.git_dir(), name))
-        .map_err(|_| ServeError::Protocol(format!("unknown ref {name}")))
+    Ok(crate::refs::resolve_ref_in(repo, &full)
+        .or_else(|_| crate::refs::resolve_ref_in(repo, name))
+        .map_err(|_| ServeError::Protocol {
+            detail: format!("unknown ref {name}"),
+        })?)
 }
 
 /// Validate `want` OIDs for a filtered fetch (object must exist in the ODB).
 pub(crate) fn validate_wants_filtered(repo: &Repository, wants: &[ObjectId]) -> Result<()> {
     for w in wants {
         if !repo.odb().contains(w)? {
-            return Err(ServeError::NotOurRef(*w));
+            return Err(ServeError::NotOurRef(*w).into());
         }
     }
     Ok(())
@@ -137,7 +138,7 @@ pub(crate) fn validate_wants_filtered(repo: &Repository, wants: &[ObjectId]) -> 
 /// already advertised ref tips skip reachability work.
 pub(crate) fn validate_wants(
     repo: &Repository,
-    refs: &[AdvertisedRef],
+    advertised_tips: &HashSet<ObjectId>,
     head: Option<ObjectId>,
     wants: &[ObjectId],
     policy: &UploadPackPolicy,
@@ -150,13 +151,13 @@ pub(crate) fn validate_wants(
         let reachable = reachable_from_repository_tips(repo)?;
         for w in wants {
             if !reachable.contains(w) {
-                return Err(ServeError::NotOurRef(*w));
+                return Err(ServeError::NotOurRef(*w).into());
             }
         }
         return Ok(());
     }
 
-    let advertised = advertised_object_ids(refs, head);
+    let advertised = advertised_object_ids(advertised_tips, head);
     let extra: Vec<ObjectId> = wants
         .iter()
         .copied()
@@ -175,20 +176,17 @@ pub(crate) fn validate_wants(
         let tips = repository_tip_commits(repo)?;
         for w in &extra {
             if !tips.contains(w) {
-                return Err(ServeError::NotOurRef(*w));
+                return Err(ServeError::NotOurRef(*w).into());
             }
         }
         return Ok(());
     }
 
-    Err(ServeError::NotOurRef(extra[0]))
+    Err(ServeError::NotOurRef(extra[0]).into())
 }
 
-fn advertised_object_ids(refs: &[AdvertisedRef], head: Option<ObjectId>) -> HashSet<ObjectId> {
-    let mut allowed: HashSet<ObjectId> = refs
-        .iter()
-        .flat_map(|r| std::iter::once(r.oid).chain(r.peeled))
-        .collect();
+fn advertised_object_ids(tips: &HashSet<ObjectId>, head: Option<ObjectId>) -> HashSet<ObjectId> {
+    let mut allowed = tips.clone();
     if let Some(h) = head {
         allowed.insert(h);
     }
@@ -204,7 +202,7 @@ fn validate_stateless_extra_wants(repo: &Repository, wants: &[ObjectId]) -> Resu
             continue;
         }
         if !object_reachable_from_tip_commits(repo, *w, &tips)? {
-            return Err(ServeError::NotOurRef(*w));
+            return Err(ServeError::NotOurRef(*w).into());
         }
     }
     Ok(())
@@ -213,10 +211,10 @@ fn validate_stateless_extra_wants(repo: &Repository, wants: &[ObjectId]) -> Resu
 /// Direct ref targets (unpeeled), including annotated tag objects on refs.
 fn repository_ref_object_ids(repo: &Repository) -> Result<HashSet<ObjectId>> {
     let mut ids = HashSet::new();
-    for (_, oid) in crate::refs::list_refs(repo.git_dir(), "refs/")? {
+    for (_, oid) in crate::refs::list_refs_in(repo, "refs/")? {
         ids.insert(oid);
     }
-    if let Ok(head) = crate::refs::resolve_ref(repo.git_dir(), "HEAD") {
+    if let Ok(head) = crate::refs::resolve_ref_in(repo, "HEAD") {
         ids.insert(head);
     }
     Ok(ids)
@@ -335,12 +333,12 @@ fn object_reachable_in_tip_closure(
 /// Peeled commit tips for every ref in the repository (including hidden refs).
 fn repository_tip_commits(repo: &Repository) -> Result<HashSet<ObjectId>> {
     let mut tips = HashSet::new();
-    for (_, oid) in crate::refs::list_refs(repo.git_dir(), "refs/")? {
+    for (_, oid) in crate::refs::list_refs_in(repo, "refs/")? {
         if let Ok(p) = repo.odb().peel_tags(oid).map(|(p, _)| p) {
             tips.insert(p);
         }
     }
-    if let Ok(head) = crate::refs::resolve_ref(repo.git_dir(), "HEAD") {
+    if let Ok(head) = crate::refs::resolve_ref_in(repo, "HEAD") {
         if let Ok(p) = repo.odb().peel_tags(head).map(|(p, _)| p) {
             tips.insert(p);
         }
@@ -382,4 +380,100 @@ fn reachable_from_repository_tips(repo: &Repository) -> Result<HashSet<ObjectId>
         }
     }
     Ok(seen)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use crate::config::environment::RepositoryOptions;
+    use crate::objects::{ObjectId, ObjectKind};
+    use crate::refs::store::{
+        Expected, MemoryRefStore, RawRef, RefName, RefStore, RefTransaction, RefUpdate,
+    };
+    use crate::repo::{InitOptions, Repository};
+
+    use super::{repository_ref_object_ids, resolve_want_ref};
+
+    fn memory_serve_repo() -> (tempfile::TempDir, Repository, Arc<MemoryRefStore>, ObjectId) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        Repository::init(
+            dir.path(),
+            &InitOptions::new()
+                .with_bare(true)
+                .with_initial_branch("master"),
+        )
+        .expect("init");
+        let store = Arc::new(MemoryRefStore::new());
+        let repo = Repository::open(
+            dir.path(),
+            &(RepositoryOptions::empty()
+                .with_ref_store(store.clone())
+                .with_initial_branch("master")),
+        )
+        .expect("open");
+        let tree = repo.odb().write(ObjectKind::Tree, b"").expect("tree");
+        let commit = repo
+            .odb()
+            .write(
+                ObjectKind::Commit,
+                format!(
+                    "tree {tree}\nauthor T <t@e.com> 1 +0000\ncommitter T <t@e.com> 1 +0000\n\ninit\n"
+                )
+                .as_bytes(),
+            )
+            .expect("commit");
+        store
+            .prepare(
+                RefTransaction::new()
+                    .update(RefUpdate {
+                        name: RefName::from_trusted("refs/heads/master"),
+                        new_value: Some(RawRef::Direct(commit)),
+                        expected: Expected::Missing,
+                        reflog: None,
+                        flags: Default::default(),
+                    })
+                    .expect("txn"),
+            )
+            .expect("prepare")
+            .commit()
+            .expect("commit");
+        (dir, repo, store, commit)
+    }
+
+    #[test]
+    fn resolve_want_ref_head_uses_injected_store() {
+        let (_dir, repo, _store, commit) = memory_serve_repo();
+        let oid = resolve_want_ref(&repo, &[], "HEAD").expect("HEAD");
+        assert_eq!(oid, commit);
+    }
+
+    #[test]
+    fn resolve_want_ref_memory_only_branch() {
+        let (_dir, repo, store, commit) = memory_serve_repo();
+        store
+            .prepare(
+                RefTransaction::new()
+                    .update(RefUpdate {
+                        name: RefName::from_trusted("refs/heads/only-memory"),
+                        new_value: Some(RawRef::Direct(commit)),
+                        expected: Expected::Missing,
+                        reflog: None,
+                        flags: Default::default(),
+                    })
+                    .expect("txn"),
+            )
+            .expect("prepare")
+            .commit()
+            .expect("commit");
+        let oid = resolve_want_ref(&repo, &[], "heads/only-memory").expect("ref");
+        assert_eq!(oid, commit);
+    }
+
+    #[test]
+    fn repository_ref_object_ids_includes_injected_head() {
+        let (_dir, repo, _store, commit) = memory_serve_repo();
+        let ids = repository_ref_object_ids(&repo).expect("ids");
+        assert!(ids.contains(&commit));
+    }
 }

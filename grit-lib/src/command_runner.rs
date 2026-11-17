@@ -10,14 +10,14 @@
 //! use grit_lib::repo::{InitOptions, Repository};
 //! # fn main() -> grit_lib::error::Result<()> {
 //! let dir = tempfile::tempdir()?;
-//! let _repo = Repository::init(dir.path(), &InitOptions::default())?;
+//! let (_repo, _) = Repository::init(dir.path(), &InitOptions::default())?;
 //! # Ok(())
 //! # }
 //! ```
 
 use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
-use std::io::{self, Cursor, Read, Write};
+use std::io::{self, Cursor, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
@@ -25,7 +25,7 @@ use thiserror::Error;
 
 use crate::environment::Environment;
 
-/// Returned when an operation requires a live OS child but the handle is synthetic.
+/// Error when an operation requires a live OS child but the handle is synthetic.
 #[derive(Debug, Error)]
 #[error("command handle is not backed by a live OS process")]
 pub struct CommandHandleError;
@@ -80,11 +80,11 @@ impl CommandEnvironment {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CommandStdio {
     #[default]
-    /// Returned when inherit.
+    /// Inherit this process's corresponding stream.
     Inherit,
-    /// Returned when null.
+    /// Discard the stream (`/dev/null`).
     Null,
-    /// Returned when pipe.
+    /// Open a pipe for read or write via [`RunningCommand`].
     Pipe,
     /// Connect the stream to this process's stderr (hooks write their stdout there, as in Git).
     ParentStderr,
@@ -94,11 +94,11 @@ pub enum CommandStdio {
 #[derive(Debug, Clone, Default)]
 pub enum CommandStdin {
     #[default]
-    /// Returned when inherit.
+    /// Inherit this process's stdin.
     Inherit,
-    /// Returned when null.
+    /// No stdin (`/dev/null`).
     Null,
-    /// Returned when pipe.
+    /// Bytes written to the child's stdin before it is closed.
     Pipe(Vec<u8>),
 }
 
@@ -107,18 +107,18 @@ pub enum CommandStdin {
 pub enum ShellInvocation {
     /// `program` is `sh`: `-c script`, optional `argv0` positional (`hook`), then `args`.
     DashC {
-        /// Script for this error or warning.
+        /// Shell script passed to `sh -c`.
         script: String,
-        /// Argv0 for this error or warning.
+        /// Optional `argv[0]` for the shell (Git hook name).
         argv0: Option<String>,
-        /// Args for this error or warning.
+        /// Extra arguments after the script positional.
         args: Vec<OsString>,
     },
     /// Run `sh script_path` with `args` (traditional hook ENOEXEC retry).
     ScriptPath {
-        /// Script path for this error or warning.
+        /// Hook or filter script on disk.
         script_path: PathBuf,
-        /// Args for this error or warning.
+        /// Arguments appended after the script path.
         args: Vec<OsString>,
     },
 }
@@ -139,13 +139,13 @@ pub struct CommandSpec {
     pub shell: Option<ShellInvocation>,
     /// Process working directory used during repository discovery.
     pub cwd: Option<PathBuf>,
-    /// Env for this item.
+    /// Child environment (inherit and overrides).
     pub env: CommandEnvironment,
-    /// Stdin for this item.
+    /// Stdin source for the child.
     pub stdin: CommandStdin,
-    /// Stdout for this item.
+    /// Stdout disposition.
     pub stdout: CommandStdio,
-    /// Stderr for this item.
+    /// Stderr disposition.
     pub stderr: CommandStdio,
 }
 
@@ -193,9 +193,9 @@ impl From<ExitStatus> for CommandExit {
 pub struct CommandOutput {
     /// Subprocess exit status from the filter command.
     pub status: CommandExit,
-    /// Stdout for this item.
+    /// Captured stdout bytes.
     pub stdout: Vec<u8>,
-    /// Stderr for this item.
+    /// Captured stderr bytes.
     pub stderr: Vec<u8>,
 }
 
@@ -205,6 +205,7 @@ enum RunningCommandInner {
         stdin: Option<ChildStdin>,
         stdout: Option<ChildStdout>,
         stderr: Option<ChildStderr>,
+        kill_process_group: bool,
     },
     Recording {
         state: Arc<Mutex<RecordingState>>,
@@ -235,6 +236,14 @@ pub struct RunningCommand {
     inner: RunningCommandInner,
 }
 
+/// Stdin written while stdout and stderr pipes are drained concurrently.
+pub(crate) enum ConcurrentStdinFeed<'a> {
+    /// Bytes copied to the child's stdin pipe.
+    Bytes(&'a [u8]),
+    /// File copied to stdin on a background thread ([`std::fs::File`] is [`Send`]).
+    File(std::fs::File),
+}
+
 impl RunningCommand {
     /// Build a handle from a spawned OS child and taken stdio pipes.
     #[must_use]
@@ -243,6 +252,7 @@ impl RunningCommand {
         stdin: Option<ChildStdin>,
         stdout: Option<ChildStdout>,
         stderr: Option<ChildStderr>,
+        kill_process_group: bool,
     ) -> Self {
         Self {
             inner: RunningCommandInner::System {
@@ -250,6 +260,7 @@ impl RunningCommand {
                 stdin,
                 stdout,
                 stderr,
+                kill_process_group,
             },
         }
     }
@@ -294,16 +305,54 @@ impl RunningCommand {
         }
     }
 
-    /// Readable stdout when the spec requested a pipe.
-    pub fn stdout_mut(&mut self) -> Option<&mut dyn Read> {
-        match &mut self.inner {
-            RunningCommandInner::System { stdout, .. } => {
-                stdout.as_mut().map(|s| s as &mut dyn Read)
-            }
+    /// OS pid when this handle wraps a live child; `None` for synthetic recording handles.
+    #[must_use]
+    pub fn child_pid(&self) -> Option<u32> {
+        match &self.inner {
+            RunningCommandInner::System { child, .. } => Some(child.id()),
             RunningCommandInner::Recording { .. } => None,
         }
     }
 
+    /// Whether [`wait_hook_command`] should signal the child's process group on cancel.
+    #[must_use]
+    pub(crate) fn kill_process_group(&self) -> bool {
+        match &self.inner {
+            RunningCommandInner::System {
+                kill_process_group, ..
+            } => *kill_process_group,
+            RunningCommandInner::Recording { .. } => false,
+        }
+    }
+
+    /// Poll whether the child has exited without blocking.
+    ///
+    /// # Errors
+    ///
+    /// Returns I/O errors from [`Child::try_wait`].
+    pub fn try_wait(&mut self) -> io::Result<Option<CommandExit>> {
+        match &mut self.inner {
+            RunningCommandInner::System { child, .. } => {
+                child.try_wait().map(|opt| opt.map(Into::into))
+            }
+            RunningCommandInner::Recording { state, .. } => {
+                let guard = state.lock().unwrap_or_else(|e| e.into_inner());
+                Ok(Some(guard.exit))
+            }
+        }
+    }
+
+    /// Send `SIGKILL` to a live child (Unix) or terminate it (Windows).
+    ///
+    /// # Errors
+    ///
+    /// Returns I/O errors from [`Child::kill`].
+    pub fn kill(&mut self) -> io::Result<()> {
+        match &mut self.inner {
+            RunningCommandInner::System { child, .. } => child.kill(),
+            RunningCommandInner::Recording { .. } => Ok(()),
+        }
+    }
     /// Wait for the child and return its exit status.
     ///
     /// # Errors
@@ -315,6 +364,69 @@ impl RunningCommand {
             RunningCommandInner::Recording { state, .. } => {
                 let guard = state.lock().unwrap_or_else(|e| e.into_inner());
                 Ok(guard.exit)
+            }
+        }
+    }
+
+    /// Feed stdin while draining stdout/stderr so hooks cannot deadlock on full pipes.
+    ///
+    /// Use this instead of writing to [`Self::stdin_mut`] before [`Self::wait_with_output`]
+    /// when the child may emit substantial stderr while still reading stdin (receive hooks).
+    ///
+    /// A [`ErrorKind::BrokenPipe`] from stdin writes is ignored (the child exited early).
+    ///
+    /// # Errors
+    ///
+    /// Returns I/O errors from pipe reads or [`Child::wait`], other than broken pipe on stdin.
+    pub(crate) fn feed_stdin_and_wait_with_output(
+        self,
+        stdin_feed: Option<ConcurrentStdinFeed<'_>>,
+    ) -> io::Result<CommandOutput> {
+        match self.inner {
+            RunningCommandInner::System {
+                mut child,
+                stdin,
+                stdout,
+                stderr,
+                kill_process_group: _,
+            } => std::thread::scope(|scope| {
+                let drain = scope.spawn(move || drain_child_pipes(stdout, stderr));
+
+                if let Some(mut stdin_pipe) = stdin {
+                    if let Some(feed) = stdin_feed {
+                        let _ = scope.spawn(move || {
+                            write_stdin_feed(feed, &mut stdin_pipe);
+                            drop(stdin_pipe);
+                        });
+                    } else {
+                        drop(stdin_pipe);
+                    }
+                }
+
+                let (stdout_bytes, stderr_bytes) =
+                    drain.join().unwrap_or(Ok((Vec::new(), Vec::new())))?;
+                let status = child.wait()?.into();
+                Ok(CommandOutput {
+                    status,
+                    stdout: stdout_bytes,
+                    stderr: stderr_bytes,
+                })
+            }),
+            RunningCommandInner::Recording { state, mut stdin } => {
+                if let (Some(stdin_mut), Some(feed)) = (stdin.as_mut(), stdin_feed) {
+                    write_stdin_feed(feed, stdin_mut);
+                }
+                drop(stdin);
+                let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+                let mut stdout_bytes = Vec::new();
+                if let Some(cursor) = &mut guard.stdout {
+                    let _ = cursor.read_to_end(&mut stdout_bytes);
+                }
+                Ok(CommandOutput {
+                    status: guard.exit,
+                    stdout: stdout_bytes,
+                    stderr: guard.stderr.clone(),
+                })
             }
         }
     }
@@ -378,8 +490,21 @@ impl RunningCommand {
                 stdin,
                 stdout,
                 stderr,
+                kill_process_group: _,
             } => Ok((child, stdin, stdout, stderr)),
             RunningCommandInner::Recording { .. } => Err(CommandHandleError),
+        }
+    }
+}
+
+fn write_stdin_feed(feed: ConcurrentStdinFeed<'_>, stdin: &mut dyn Write) {
+    let write_result = match feed {
+        ConcurrentStdinFeed::Bytes(data) => stdin.write_all(data).map(|_| ()),
+        ConcurrentStdinFeed::File(mut file) => io::copy(&mut file, stdin).map(|_| ()),
+    };
+    if let Err(e) = write_result {
+        if e.kind() != ErrorKind::BrokenPipe {
+            let _ = e;
         }
     }
 }
@@ -421,6 +546,13 @@ pub trait CommandRunner: Send + Sync {
     ///
     /// Returns I/O errors from spawn or missing piped stdio when requested.
     fn spawn(&self, spec: &CommandSpec) -> io::Result<RunningCommand>;
+
+    /// Spawn a server-side receive-pack hook subprocess (isolated process group on Unix).
+    ///
+    /// Default implementation delegates to [`Self::spawn`].
+    fn spawn_server_receive_hook(&self, spec: &CommandSpec) -> io::Result<RunningCommand> {
+        self.spawn(spec)
+    }
 }
 
 /// Runs commands with the real OS process API.
@@ -665,9 +797,29 @@ fn is_path_var(key: &OsStr) -> bool {
     }
 }
 
-impl CommandRunner for SystemCommandRunner {
-    fn spawn(&self, spec: &CommandSpec) -> io::Result<RunningCommand> {
+impl SystemCommandRunner {
+    fn spawn_with_process_group(
+        &self,
+        spec: &CommandSpec,
+        isolate_process_group: bool,
+    ) -> io::Result<RunningCommand> {
         let mut cmd = Self::build_command(spec);
+        if isolate_process_group {
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                unsafe {
+                    cmd.pre_exec(|| {
+                        // SAFETY: called in the child between fork and exec.
+                        if libc::setpgid(0, 0) != 0 {
+                            return Err(io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                }
+            }
+        }
+        let kill_process_group = isolate_process_group;
         let mut child = cmd.spawn()?;
 
         let mut stdin = child.stdin.take();
@@ -683,7 +835,71 @@ impl CommandRunner for SystemCommandRunner {
 
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
-        Ok(RunningCommand::from_system(child, stdin, stdout, stderr))
+        Ok(RunningCommand::from_system(
+            child,
+            stdin,
+            stdout,
+            stderr,
+            kill_process_group,
+        ))
+    }
+}
+
+impl CommandRunner for SystemCommandRunner {
+    fn spawn(&self, spec: &CommandSpec) -> io::Result<RunningCommand> {
+        self.spawn_with_process_group(spec, false)
+    }
+
+    fn spawn_server_receive_hook(&self, spec: &CommandSpec) -> io::Result<RunningCommand> {
+        self.spawn_with_process_group(spec, true)
+    }
+}
+
+/// Force-terminate a process by pid (process group on Unix, tree on Windows).
+pub(crate) fn force_kill_process_pid(pid: u32, kill_process_group: bool) {
+    #[cfg(unix)]
+    {
+        if let Ok(pid_t) = libc::pid_t::try_from(pid) {
+            // SAFETY: `pid` names a hook child this process spawned or tracked.
+            unsafe {
+                if kill_process_group {
+                    let pgid = libc::getpgid(pid_t);
+                    if pgid > 0 {
+                        libc::kill(-pgid, libc::SIGKILL);
+                        return;
+                    }
+                }
+                libc::kill(pid_t, libc::SIGKILL);
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        let mut args = vec![
+            OsString::from("/F"),
+            OsString::from("/PID"),
+            OsString::from(pid.to_string()),
+        ];
+        if kill_process_group {
+            args.push(OsString::from("/T"));
+        }
+        let spec = CommandSpec {
+            program: PathBuf::from("taskkill"),
+            args,
+            shell: None,
+            cwd: None,
+            env: CommandEnvironment::inherit_process_only(),
+            stdin: CommandStdin::Null,
+            stdout: CommandStdio::Null,
+            stderr: CommandStdio::Null,
+        };
+        let _ = SystemCommandRunner
+            .spawn(&spec)
+            .and_then(|child| child.wait().map(|_| ()));
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (pid, kill_process_group);
     }
 }
 
@@ -696,15 +912,15 @@ pub fn system_command_runner() -> Arc<dyn CommandRunner> {
 /// Scripted responses for [`RecordingRunner`].
 #[derive(Debug, Clone)]
 pub enum RecordedResponse {
-    /// Returned when success.
+    /// Exit status 0 with empty stdout/stderr.
     Success,
-    /// Returned when exit.
+    /// Exit with the given non-zero code and empty output.
     Exit(i32),
-    /// Returned when output.
+    /// Exit with the given code and stdout payload.
     Output {
-        /// Stdout disposition for the child process.
+        /// Stdout bytes returned to the caller.
         stdout: Vec<u8>,
-        /// Code.
+        /// Process exit code.
         code: i32,
     },
 }
@@ -712,7 +928,7 @@ pub enum RecordedResponse {
 /// Records [`CommandSpec`] invocations and returns configurable exit statuses.
 #[derive(Debug, Default)]
 pub struct RecordingRunner {
-    /// Recorded for this item.
+    /// Every [`CommandSpec`] passed to [`CommandRunner::spawn`], in order.
     pub recorded: Mutex<Vec<CommandSpec>>,
     stdin_payloads: Mutex<Vec<Arc<Mutex<Vec<u8>>>>>,
     responses: Mutex<VecDeque<RecordedResponse>>,
@@ -857,7 +1073,7 @@ pub fn run_program(
     runner.spawn(&spec)?.wait_with_output()
 }
 
-/// Git hook execution helpers.
+/// Git hook execution helpers (legacy free functions; prefer [`crate::repo_handles::RepositoryHooks`]).
 pub mod hooks {
     pub use crate::hooks::*;
 }
@@ -1195,6 +1411,71 @@ mod tests {
             "direct stdout={:?}",
             direct.stdout
         );
+    }
+
+    #[test]
+    fn feed_stdin_and_wait_with_output_avoids_hook_pipe_deadlock() {
+        let script = "while read line; do printf 'checking %s\\n' \"$line\" >&2; done";
+        let stdin_lines: String = (1..=3000)
+            .map(|i| format!("1111111111111111111111111111111111111111 2222222222222222222222222222222222222222 refs/heads/b{i}\n"))
+            .collect();
+        let spec = CommandSpec {
+            program: "sh".into(),
+            args: Vec::new(),
+            shell: Some(ShellInvocation::DashC {
+                script: script.into(),
+                argv0: None,
+                args: Vec::new(),
+            }),
+            cwd: None,
+            env: CommandEnvironment::inherit_process_only(),
+            stdin: CommandStdin::Pipe(Vec::new()),
+            stdout: CommandStdio::Pipe,
+            stderr: CommandStdio::Pipe,
+        };
+        let started = std::time::Instant::now();
+        let out = SystemCommandRunner
+            .spawn(&spec)
+            .expect("spawn")
+            .feed_stdin_and_wait_with_output(Some(ConcurrentStdinFeed::Bytes(
+                stdin_lines.as_bytes(),
+            )))
+            .expect("wait");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "hook I/O took {:?}",
+            started.elapsed()
+        );
+        assert!(out.status.success);
+        assert!(out.stderr.len() > 64 * 1024);
+        assert!(out.stderr.starts_with(b"checking "));
+    }
+
+    #[test]
+    fn feed_stdin_and_wait_with_output_treats_broken_pipe_as_early_exit() {
+        let script = "exit 1";
+        let payload = vec![b'x'; 128 * 1024];
+        let spec = CommandSpec {
+            program: "sh".into(),
+            args: Vec::new(),
+            shell: Some(ShellInvocation::DashC {
+                script: script.into(),
+                argv0: None,
+                args: Vec::new(),
+            }),
+            cwd: None,
+            env: CommandEnvironment::inherit_process_only(),
+            stdin: CommandStdin::Pipe(Vec::new()),
+            stdout: CommandStdio::Pipe,
+            stderr: CommandStdio::Pipe,
+        };
+        let out = SystemCommandRunner
+            .spawn(&spec)
+            .expect("spawn")
+            .feed_stdin_and_wait_with_output(Some(ConcurrentStdinFeed::Bytes(&payload)))
+            .expect("wait");
+        assert!(!out.status.success);
+        assert_eq!(out.status.code, Some(1));
     }
 
     #[test]

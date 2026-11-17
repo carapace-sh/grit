@@ -4,15 +4,17 @@
 
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::error::Error;
-use grit_lib::maintenance::{repack_all, RepackOptions};
+use grit_lib::error::ObjectError;
+use grit_lib::maintenance::RepackOptions;
 use grit_lib::objects::odb::Odb;
-use grit_lib::objects::pack::{
-    clear_pack_cache, parse_pack_index_bytes, read_object_from_pack, read_pack_index,
-    read_pack_index_cached, read_pack_index_no_verify, test_pack_cache_guard,
-    verify_pack_and_collect, write_v2_pack_index_with_trailer,
-};
 use grit_lib::objects::ObjectId;
 use grit_lib::repo::Repository;
+use grit_lib::test_support::objects_pack::{
+    clear_pack_cache, parse_pack_index_bytes, read_object_from_pack, read_pack_index,
+    read_pack_index_cached, read_pack_index_no_verify, verify_pack_and_collect,
+    write_v2_pack_index_from_trailer,
+};
+use grit_lib::test_support::pack::pack_cache_guard;
 use grit_test_support::objects::{
     write_pack_and_index, IndexPackOptions, IndexVersion, ObjectKind as FixtureKind, PackBuilder,
     RepoFixture,
@@ -124,7 +126,8 @@ fn lazy_v2_out_of_range_large_offset_slot_returns_corruption_not_panic() {
     let mut body = Vec::new();
     body.extend_from_slice(b"\xfftOc");
     body.extend_from_slice(&2u32.to_be_bytes());
-    let fanout = grit_lib::objects::pack::compute_fanout_from_oid_slices(&[oid.as_bytes()]);
+    let fanout =
+        grit_lib::test_support::objects_pack::compute_fanout_from_oid_slices(&[oid.as_bytes()]);
     for f in fanout {
         body.extend_from_slice(&f.to_be_bytes());
     }
@@ -135,7 +138,7 @@ fn lazy_v2_out_of_range_large_offset_slot_returns_corruption_not_panic() {
     body.extend_from_slice(&[0u8; 20]);
     let idx = parse_pack_index_bytes(Path::new("bad-large-slot.idx"), body, false).expect("lazy");
     let err = idx.find_offset(&oid).expect_err("corrupt slot");
-    assert!(matches!(err, Error::CorruptObject(_)));
+    assert!(matches!(err, Error::Object(ObjectError::Corrupt { .. })));
 }
 
 #[test]
@@ -144,7 +147,8 @@ fn lazy_v2_out_of_range_large_offset_slot_returns_corruption_on_lookup() {
     let mut body = Vec::new();
     body.extend_from_slice(b"\xfftOc");
     body.extend_from_slice(&2u32.to_be_bytes());
-    let fanout = grit_lib::objects::pack::compute_fanout_from_oid_slices(&[oid.as_bytes()]);
+    let fanout =
+        grit_lib::test_support::objects_pack::compute_fanout_from_oid_slices(&[oid.as_bytes()]);
     for f in fanout {
         body.extend_from_slice(&f.to_be_bytes());
     }
@@ -158,7 +162,7 @@ fn lazy_v2_out_of_range_large_offset_slot_returns_corruption_on_lookup() {
     let err = idx
         .find_offset(&oid)
         .expect_err("slot 1 with one large entry");
-    assert!(matches!(err, Error::CorruptObject(_)));
+    assert!(matches!(err, Error::Object(ObjectError::Corrupt { .. })));
 }
 
 #[test]
@@ -168,7 +172,7 @@ fn corrupt_large_offset_read_object_from_pack_propagates_error() {
     let pack_path = tmp.path().join("c.pack");
     std::fs::write(&pack_path, b"PACK\x00\x00\x00\x02\x00\x00\x00\x00").expect("pack");
     let oid = ObjectId::from_bytes(&[0x01; 20]).expect("oid");
-    write_v2_pack_index_with_trailer(&idx_path, &[(oid, 0x8000_0000u64, 0)], &[0u8; 20], 20, None)
+    write_v2_pack_index_from_trailer(&idx_path, &[(oid, 0x8000_0000u64, 0)], &[0u8; 20], 20, None)
         .expect("write");
     let mut raw = std::fs::read(&idx_path).expect("read");
     let hb = 20;
@@ -179,7 +183,7 @@ fn corrupt_large_offset_read_object_from_pack_propagates_error() {
     let mut idx = idx;
     idx.pack_path = pack_path;
     let err = read_object_from_pack(&idx, &oid).expect_err("typed corruption");
-    assert!(matches!(err, Error::CorruptObject(_)));
+    assert!(matches!(err, Error::Object(ObjectError::Corrupt { .. })));
 }
 
 #[test]
@@ -214,11 +218,11 @@ fn misordered_oid_lazy_open_verify_and_fsck_reject() {
     read_pack_index_no_verify(&corrupt_path).expect("lazy open accepts swapped oids");
     assert!(matches!(
         read_pack_index(&corrupt_path),
-        Err(Error::CorruptObject(msg)) if msg.contains("out of order")
+        Err(Error::Object(ObjectError::Corrupt { detail: msg })) if msg.contains("out of order")
     ));
     assert!(matches!(
         verify_pack_and_collect(&corrupt_path),
-        Err(Error::CorruptObject(_))
+        Err(Error::Object(ObjectError::Corrupt { .. }))
     ));
 
     let lazy = read_pack_index_no_verify(&corrupt_path).expect("lazy idx");
@@ -233,7 +237,7 @@ fn misordered_oid_lazy_open_verify_and_fsck_reject() {
 
 #[test]
 fn repack_with_cached_mmap_index_succeeds() {
-    let _guard = test_pack_cache_guard();
+    let _guard = pack_cache_guard();
     let repo = RepoFixture::init(grit_test_support::objects::HashAlgo::Sha1).expect("init");
     let mut builder = PackBuilder::new(grit_test_support::objects::HashAlgo::Sha1);
     for i in 0..32u8 {
@@ -258,7 +262,14 @@ fn repack_with_cached_mmap_index_succeeds() {
     });
     let grit_repo = Repository::open(&repo.path().join(".git"), &RepositoryOptions::default())
         .expect("open repo");
-    repack_all(&grit_repo, &RepackOptions::default()).expect("repack");
+    grit_repo
+        .maintenance()
+        .repack_all(
+            &RepackOptions::default(),
+            &mut grit_lib::progress::NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("repack");
     clear_pack_cache();
     git_fsck(repo.path());
 }

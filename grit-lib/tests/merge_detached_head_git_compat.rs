@@ -1,15 +1,16 @@
 //! Merge into detached `HEAD` — compatibility with system `git`.
 
 use grit_lib::config::environment::RepositoryOptions;
-use grit_lib::objects::{parse_commit, ObjectId};
-use grit_lib::porcelain::merge::{
-    abort_branch_merge, integrate_detached_head_with, ContinueOptions, FastForwardPolicy,
-    IntegrateBranchOutcome, MergeCommitMode, MergeOptions,
+use grit_lib::merge::{
+    ContinueOptions, FastForwardPolicy, IntegrateBranchOutcome, MergeCommitMode, MergeOptions,
+    MergeSource, MergeSourceKind,
 };
-use grit_lib::porcelain::merge::{continue_merge, integrate_detached_head};
+use grit_lib::objects::{parse_commit, ObjectId};
 use grit_lib::progress::NullProgress;
 use grit_lib::repo::Repository;
+use grit_test_support::abort_branch_merge;
 use grit_test_support::git;
+use grit_test_support::{continue_merge, integrate_detached_head, integrate_detached_head_with};
 use std::process::Command;
 
 fn grit_repo(tmp: &tempfile::TempDir) -> Repository {
@@ -78,7 +79,7 @@ fn fast_forward_moves_only_head_and_matches_git() {
         topic,
         "topic",
         &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("integrate");
     assert!(matches!(
@@ -129,7 +130,7 @@ fn no_ff_merge_commit_on_detached_head() {
             ..MergeOptions::default()
         },
         &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("merge");
     let IntegrateBranchOutcome::Merged { oid, change_id } = outcome else {
@@ -173,7 +174,7 @@ fn conflict_then_continue_and_abort_on_detached_head() {
         topic,
         "topic",
         &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("merge");
     assert!(matches!(outcome, IntegrateBranchOutcome::Conflicts { .. }));
@@ -190,7 +191,7 @@ fn conflict_then_continue_and_abort_on_detached_head() {
             committer: Some(id.parse().expect("sig")),
         },
         &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("continue");
     assert_ne!(cont.oid, head_at_conflict_start);
@@ -223,7 +224,7 @@ fn conflict_then_continue_and_abort_on_detached_head() {
         topic2,
         "topic",
         &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("merge");
     abort_branch_merge(&repo2).expect("abort");

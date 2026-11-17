@@ -79,6 +79,9 @@ mod parallel_scenario_e2e;
 #[path = "push_http_cargo_shape_budget.rs"]
 mod push_http_cargo_shape_budget;
 #[cfg(feature = "full-tests")]
+#[path = "push_local_cargo_shape_budget.rs"]
+mod push_local_cargo_shape_budget;
+#[cfg(feature = "full-tests")]
 #[path = "refs_driver_git_compat.rs"]
 mod refs_driver_git_compat;
 #[cfg(feature = "full-tests")]
@@ -114,7 +117,7 @@ fn every_test_file_is_compiled() {
     for item in std::fs::read_dir(&dir).expect("read tests/") {
         let name = item.expect("tests/ entry").file_name();
         let Some(name) = name.to_str() else { continue };
-        if !name.ends_with(".rs") || name == "integration.rs" {
+        if !name.ends_with(".rs") || name == "integration.rs" || name.ends_with("_data.rs") {
             continue;
         }
         let module = format!("#[path = \"{name}\"]");

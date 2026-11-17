@@ -9,8 +9,9 @@ use std::process::Command;
 use std::time::Duration;
 
 use grit_lib::config::environment::{Environment, RepositoryOptions};
-use grit_lib::porcelain::status::{status, InterruptedRewrite, StatusOptions};
-use grit_lib::progress::{NeverCancel, NullProgress};
+use grit_lib::porcelain::status::{InterruptedRewrite, StatusOptions};
+use grit_lib::progress::CancelToken;
+use grit_lib::progress::NullProgress;
 use grit_lib::repo::Repository;
 use grit_test_support::git;
 
@@ -58,23 +59,24 @@ fn repo_with_stale_index_stat(file_count: usize) -> (tempfile::TempDir, Reposito
 #[test]
 fn status_write_index_false_leaves_index_bytes_and_mtime() {
     let (_tmp, grit_repo) = repo_with_stale_index_stat(50);
-    let index_path = grit_repo.index_handle().path();
+    let index_path = grit_repo.index().path();
     let digest_before = index_digest(&index_path);
     let mtime_before = fs::metadata(&index_path)
         .expect("index metadata")
         .modified()
         .expect("mtime");
 
-    let model = status(
-        &grit_repo,
-        &StatusOptions {
-            write_index: false,
-            ..StatusOptions::default()
-        },
-        &mut NullProgress,
-        &NeverCancel,
-    )
-    .expect("status");
+    let model = grit_repo
+        .status()
+        .run(
+            &StatusOptions {
+                write_index: false,
+                ..StatusOptions::default()
+            },
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("status");
     assert!(model.unstaged.is_empty());
 
     assert_eq!(index_digest(&index_path), digest_before);
@@ -113,16 +115,17 @@ fn status_honors_git_optional_locks_zero_in_environment() {
     let grit_repo =
         Repository::discover(Some(repo_root), &RepositoryOptions::with_environment(env))
             .expect("discover");
-    let index_path = grit_repo.index_handle().path();
+    let index_path = grit_repo.index().path();
     let digest_before = index_digest(&index_path);
 
-    let _model = status(
-        &grit_repo,
-        &StatusOptions::default(),
-        &mut NullProgress,
-        &NeverCancel,
-    )
-    .expect("status");
+    let _model = grit_repo
+        .status()
+        .run(
+            &StatusOptions::default(),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("status");
 
     assert_eq!(index_digest(&index_path), digest_before);
 }
@@ -131,7 +134,7 @@ fn status_honors_git_optional_locks_zero_in_environment() {
 fn grit_cli_no_optional_locks_leaves_index_unchanged() {
     let (_tmp, grit_repo) = repo_with_stale_index_stat(20);
     let repo_root = grit_repo.work_tree().expect("work tree");
-    let index_path = grit_repo.index_handle().path();
+    let index_path = grit_repo.index().path();
     let digest_before = index_digest(&index_path);
 
     let grit_bin = std::env::var("CARGO_BIN_EXE_grit")
@@ -160,8 +163,7 @@ fn status_read_only_reports_pending_rewrite_without_touching_journal() {
     use grit_lib::index::{Index, IndexEntry, MODE_REGULAR};
     use grit_lib::objects::{parse_commit, parse_tree, ObjectKind};
     use grit_lib::revwalk::history::{
-        apply_rewrite, plan_rewrite, rewrite_apply_journal_active, ApplyOptions, CommitEdit,
-        EmptyPolicy, HistoryEdits, RefScope, RewriteOptions,
+        ApplyOptions, CommitEdit, EmptyPolicy, HistoryEdits, RefScope, RewriteOptions,
     };
 
     use support::{build_commit_dag, git_rev_parse, HistoryRepo};
@@ -175,7 +177,7 @@ fn status_read_only_reports_pending_rewrite_without_touching_journal() {
             identity: support::reflog_signature("Applier <apply@grit.test>"),
             reflog_message: "history rewrite".into(),
             record_operation: None,
-            hooks: grit_lib::PostOperationHooks::Run,
+            hooks: grit_lib::command_runner::hooks::PostOperationHooks::Run,
         }
     }
 
@@ -226,7 +228,7 @@ fn status_read_only_reports_pending_rewrite_without_touching_journal() {
             path: path.as_bytes().to_vec(),
             base_index_pos: 0,
         });
-        write_tree_from_index(repo.odb(), &index, "")
+        write_tree_from_index(repo.odb(), &index, "").map_err(Into::into)
     }
 
     let repo = HistoryRepo::init();
@@ -249,38 +251,47 @@ fn status_read_only_reports_pending_rewrite_without_touching_journal() {
             parents: None,
         },
     );
-    let plan = plan_rewrite(
-        &grit,
-        &edits,
-        &RewriteOptions {
-            scope: RefScope::Branches,
-            empty: EmptyPolicy::Drop,
-            committer: "Applier <apply@grit.test> 1 +0000"
-                .parse()
-                .expect("signature"),
-            preserve_committer: false,
-            sign: true,
-        },
-    )
-    .expect("plan");
+    let plan = grit
+        .history()
+        .plan_rewrite(
+            &edits,
+            &RewriteOptions {
+                scope: RefScope::Branches,
+                empty: EmptyPolicy::Drop,
+                committer: "Applier <apply@grit.test> 1 +0000"
+                    .parse()
+                    .expect("signature"),
+                preserve_committer: false,
+                sign: true,
+            },
+        )
+        .expect("plan");
     let tip_before = git_rev_parse(wt, "refs/heads/main").expect("tip");
-    grit_lib::repo::set_test_inject_rewrite_apply_abort_after_refs(true);
-    let _err = apply_rewrite(&grit, &plan, &apply_opts(), &mut NullProgress, &NeverCancel)
+    grit_lib::test_support::inject::set_test_inject_rewrite_apply_abort_after_refs(true);
+    let _err = grit
+        .history()
+        .apply(
+            &plan,
+            &apply_opts(),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
         .expect_err("injected abort");
-    grit_lib::repo::set_test_inject_rewrite_apply_abort_after_refs(false);
-    assert!(rewrite_apply_journal_active(grit.git_dir()));
+    grit_lib::test_support::inject::set_test_inject_rewrite_apply_abort_after_refs(false);
+    assert!(grit.history().apply_journal_active());
     assert_ne!(git_rev_parse(wt, "refs/heads/main"), Some(tip_before));
 
-    let model = status(
-        &grit,
-        &StatusOptions {
-            write_index: false,
-            ..StatusOptions::default()
-        },
-        &mut NullProgress,
-        &NeverCancel,
-    )
-    .expect("status");
+    let model = grit
+        .status()
+        .run(
+            &StatusOptions {
+                write_index: false,
+                ..StatusOptions::default()
+            },
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("status");
     assert_eq!(model.interrupted_rewrite, Some(InterruptedRewrite::Pending));
-    assert!(rewrite_apply_journal_active(grit.git_dir()));
+    assert!(grit.history().apply_journal_active());
 }

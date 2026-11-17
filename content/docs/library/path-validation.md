@@ -53,9 +53,10 @@ With `core.protectNTFS` on, every platform rejects the NTFS spellings of `.git` 
 
 ## Errors
 
-[`PathComponentError`](rustdoc:grit_lib::path_validate::PathComponentError) is a typed, non-exhaustive enum (empty, `.`, `..`, slash/NUL, ASCII and platform `.git` aliases, NTFS backslash/drive/stream spellings, NTFS illegal characters, trailing space/period, reserved DOS device names, and symlinked dot-files). Checkout and index population return [`Error::InvalidPathComponent`](rustdoc:grit_lib::error::Error::InvalidPathComponent) with the full path and reason. User-facing `add`/`mv` path arguments use the same typed error; legacy [`Error::InvalidPath`](rustdoc:grit_lib::error::Error) remains for empty or escaping paths.
+[`PathComponentError`](rustdoc:grit_lib::path_validate::PathComponentError) is a typed, non-exhaustive enum (empty, `.`, `..`, slash/NUL, ASCII and platform `.git` aliases, NTFS backslash/drive/stream spellings, NTFS illegal characters, trailing space/period, reserved DOS device names, and symlinked dot-files). Checkout and index population return [`WorktreeError::InvalidPathComponent`](rustdoc:grit_lib::worktree::WorktreeError::InvalidPathComponent) with the full path and reason. User-facing `add`/`mv` path arguments use the same typed error; legacy [`Error::InvalidPath`](rustdoc:grit_lib::error::Error) remains for empty or escaping paths.
 
 ## Related
 
+- Ref names under `refs/` use [`RefName::parse`](rustdoc:grit_lib::refs::check_ref_format::RefName::parse) with [`RefNamePolicy::storable`](rustdoc:grit_lib::refs::check_ref_format::RefNamePolicy::storable) or [`safe_for_fs`](rustdoc:grit_lib::refs::check_ref_format::RefNamePolicy::safe_for_fs) instead of the old free validators. See [Refs](refs.md#ref-names-refname--refnamepolicy).
 - Tree object fsck uses the same rules via `grit-lib` maintenance APIs.
 - Index population, checkout, restore, and `grit add` staging run these validators internally with [`ProtectOptions::from_config`](rustdoc:grit_lib::path_validate::ProtectOptions::from_config). Code that writes its own tree or index entries calls [`validate_path`](rustdoc:grit_lib::path_validate::validate_path) or [`validate_component`](rustdoc:grit_lib::path_validate::validate_component) directly.

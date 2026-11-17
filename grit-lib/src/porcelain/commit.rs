@@ -16,36 +16,44 @@ use crate::config::ident_resolve::IdentRole;
 use crate::config::ConfigSet;
 use crate::diff::refresh_index_stat_content_verified_with_rules;
 use crate::diff::{
-    diff_tree_path_change_count, diff_trees_with_renames, flatten_tree_entries,
-    materialize_worktree_blob, zero_oid, DiffEntry, DiffStatus,
+    diff_index_to_tree, diff_tree_path_change_count, diff_trees_with_renames, zero_oid, DiffEntry,
+    DiffStatus,
 };
-use crate::error::ApplyError;
+use crate::error::ObjectError;
+use crate::error::RefError;
 use crate::error::{Error, Result};
 use crate::history::{
     ensure_rewrite_apply_ready, persist_rebase_stopped_head_if_missing, HistoryError,
 };
 use crate::hooks::{
-    run_advisory_hook, run_commit_hook, run_post_rewrite, CommitHookEnv, HookError, HookName,
-    PostOperationHooks, RewriteKind,
+    run_advisory_hook, run_post_rewrite, CommitHookEnv, HookName, PostOperationHooks, RewriteKind,
 };
 use crate::ident::{
     fsck_commit_idents, parse_signature_times, prepare_commit_author_from_parent,
     prepare_commit_identity_line, replace_identity_date_suffix, Signature,
 };
+use crate::index::IndexError;
 use crate::index::{Index, IndexLock};
+use crate::notes::{
+    apply_prepared_notes_rewrite, prepare_notes_for_rewrite, NotesRewriteCommand, NotesRewritePlan,
+};
 use crate::objects::odb::Odb;
-use crate::objects::{parse_commit, serialize_commit, CommitData, FileMode, ObjectId, ObjectKind};
-use crate::pathspec::{matches_pathspec_list_with_context, pathspec_is_exclude, ResolvedPathspecs};
+use crate::objects::{parse_commit, serialize_commit, CommitData, ObjectId, ObjectKind};
+use crate::pathspec::{matches_pathspec_list_with_context, pathspec_is_exclude, Pathspec};
 use crate::porcelain::add::{
     stage_on_index, validate_commit_staging_pathspecs, StageMode, StageOptions,
 };
+use crate::porcelain::commit_error::CommitError;
 use crate::porcelain::hunk_select::{
-    diff_options_for_hunk_select, resolve_selection, HunkSelectError, HunkSelection,
+    diff_options_for_hunk_select, resolve_selection, HunkSelection,
 };
 use crate::porcelain::index_from_tree::index_from_tree_with_seeded_worktree_stats;
+use crate::porcelain::merge::squash_conflict_merge_in_progress;
+use crate::porcelain::merge_error::MergeError;
 use crate::porcelain::pathspec_match::KnownPathspecChecker;
 use crate::porcelain::replay_sequence::finish_replay_commit_state;
-use crate::progress::{poll_cancel, Cancel, ProgressSink};
+use crate::progress::{poll_cancel, CancelToken, ProgressSink};
+use crate::refs::store::RefNameRef;
 use crate::refs::{
     update_branch_for_commit_on_store, update_detached_head_for_commit_on_store,
     BranchCommitRefUpdate,
@@ -69,7 +77,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::{Arc, Mutex};
-use thiserror::Error;
 
 /// Whether the verifying hooks run before a commit object is written.
 ///
@@ -107,7 +114,7 @@ pub(crate) enum MessageSource {
 /// # Errors
 ///
 /// [`Error::Hook`] when a hook fails or cannot start, [`Error::Io`] when the file cannot be
-/// read back, and [`Error::EmptyCommitMessage`] when a hook left it empty.
+/// read back, and [`CommitError::EmptyCommitMessage`] when a hook left it empty.
 pub(crate) fn run_commit_message_hooks(
     repo: &Repository,
     msg_path: &Path,
@@ -115,6 +122,7 @@ pub(crate) fn run_commit_message_hooks(
     verify: HookPolicy,
     commit_env: &CommitHookEnv<'_>,
     hooks_run: &mut Vec<HookName>,
+    cancel: &CancelToken,
 ) -> Result<Option<String>> {
     let path_arg = commit_editmsg_hook_argument(repo, msg_path);
     let source_oid;
@@ -134,11 +142,19 @@ pub(crate) fn run_commit_message_hooks(
         &prepare_args,
         None,
         commit_env,
+        cancel,
     )? {
         hooks_run.push(HookName::PrepareCommitMsg);
     }
     if verify != HookPolicy::SkipVerify
-        && run_commit_hook_recorded(repo, HookName::CommitMsg, &[&path_arg], None, commit_env)?
+        && run_commit_hook_recorded(
+            repo,
+            HookName::CommitMsg,
+            &[&path_arg],
+            None,
+            commit_env,
+            cancel,
+        )?
     {
         hooks_run.push(HookName::CommitMsg);
     }
@@ -147,7 +163,7 @@ pub(crate) fn run_commit_message_hooks(
     }
     let mut message = fs::read_to_string(msg_path).map_err(Error::Io)?;
     if message.trim().is_empty() {
-        return Err(Error::EmptyCommitMessage);
+        return Err(CommitError::EmptyCommitMessage.into());
     }
     if !message.ends_with('\n') {
         message.push('\n');
@@ -157,7 +173,6 @@ pub(crate) fn run_commit_message_hooks(
 
 /// Author name, email, and date suffix from a written commit header line.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "serde-models", derive(serde::Serialize))]
 pub struct CommitAuthorInfo {
     /// Author display name.
     pub name: String,
@@ -167,12 +182,35 @@ pub struct CommitAuthorInfo {
     pub date: String,
 }
 
+impl CommitAuthorInfo {
+    /// Parse [`Self::name`], [`Self::email`], and [`Self::date`] as a [`Signature`].
+    #[must_use]
+    pub fn signature(&self) -> Signature {
+        let line = if self.date.is_empty() {
+            format!("{} <{}>", self.name, self.email)
+        } else {
+            format!("{} <{}> {}", self.name, self.email, self.date)
+        };
+        Signature::from_header_lossy(&line)
+    }
+}
+
+#[cfg(feature = "serde-models")]
+impl serde::Serialize for CommitAuthorInfo {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.signature().serialize(serializer)
+    }
+}
+
 fn guard_incomplete_rewrite_apply(repo: &Repository) -> Result<()> {
     ensure_rewrite_apply_ready(repo).map_err(|err| match err {
-        HistoryError::RewriteApplyIncomplete => {
-            Error::OperationInProgress(InProgressOperation::RewriteApply)
+        crate::error::Error::History(HistoryError::RewriteApplyIncomplete) => {
+            MergeError::OperationInProgress(InProgressOperation::RewriteApply).into()
         }
-        other => Error::History(other),
+        other => other,
     })
 }
 
@@ -229,9 +267,11 @@ pub struct CommitRequest {
     pub reset_author: bool,
     /// Reuse log message and author from this commit (`-C` / `--reuse-message`); copies get a new change id.
     pub reuse_message_from: Option<ObjectId>,
-    /// When true, compute the commit tree and file list without writing objects, updating refs, or running hooks.
+    /// When true, stage in memory and report the files the commit would change (index against the
+    /// parent tree, by object id and mode) without writing objects, the index or refs, or running
+    /// hooks.
     pub dry_run: bool,
-    /// When true, a [`Error::NothingToCommit`] is upgraded to [`Error::NothingStagedToCommit`] if the
+    /// When true, a [`CommitError::NothingToCommit`] is upgraded to [`CommitError::NothingStagedToCommit`] if the
     /// work tree still has unstaged or untracked paths (index-only commit).
     pub(crate) index_only: bool,
     /// Whether an amend runs `post-rewrite amend` ([`PostOperationHooks::Skip`] is Git's
@@ -247,20 +287,6 @@ impl CommitRequest {
             message: message.into(),
             ..Self::default()
         }
-    }
-
-    /// Skip the pre-commit index↔parent tree match (integration tests and scoped commits).
-    #[doc(hidden)]
-    pub fn skip_pre_commit_tree_match(mut self, skip: bool) -> Self {
-        self.skip_pre_commit_tree_match = skip;
-        self
-    }
-
-    /// Index-only commit scope (see [`Self::index_only`]).
-    #[doc(hidden)]
-    pub fn index_only_commit(mut self, index_only: bool) -> Self {
-        self.index_only = index_only;
-        self
     }
 }
 
@@ -292,12 +318,18 @@ pub struct CommitPlan {
 /// Which paths are included when recording a commit ([`commit_with_scope`]).
 #[derive(Debug, Clone)]
 pub enum CommitScope {
-    /// Stage every worktree change, then commit (default `grit commit` behavior).
+    /// Stage worktree changes, then commit (default `grit commit` behavior).
+    ///
+    /// Stages tracked modifications and deletions plus untracked files, except when
+    /// `status.showUntrackedFiles` is `no` (or a Git boolean false synonym): then only tracked
+    /// paths are staged, matching `git commit -a` and what [`crate::porcelain::status`] shows.
+    /// Explicit path commits ([`CommitScope::Paths`]) and [`crate::porcelain::add::stage`] are
+    /// unchanged.
     AutoStage,
     /// Commit the index as-is (`git commit` without `-a`).
     Staged,
     /// Commit only matching paths from the worktree (`git commit --only --` paths).
-    Paths(ResolvedPathspecs),
+    Paths(crate::pathspec::Pathspec),
     /// Commit only hunks from a unified diff or stable hunk ids (`grit commit --hunks` / `--patch-file`).
     Patch {
         /// Hunk ids or pre-parsed file patches (exactly one is populated).
@@ -311,7 +343,9 @@ impl PartialEq for CommitScope {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::AutoStage, Self::AutoStage) | (Self::Staged, Self::Staged) => true,
-            (Self::Paths(a), Self::Paths(b)) => a == b,
+            (Self::Paths(a), Self::Paths(b)) => {
+                a.specs() == b.specs() && a.globals() == b.globals()
+            }
             (
                 Self::Patch {
                     input: a,
@@ -346,27 +380,13 @@ pub enum CommitPatchInput {
     Patches(Vec<FilePatch>),
 }
 
-/// Failure while resolving or applying a patch-scoped commit.
-#[derive(Debug, Error)]
-pub enum CommitPatchError {
-    /// Hunk id resolution failed (unknown, stale, wrong side, binary).
-    #[error(transparent)]
-    Select(#[from] HunkSelectError),
-    /// Index apply failed after resolution.
-    #[error(transparent)]
-    Apply(#[from] ApplyError),
-    /// Commit, index, or repository error.
-    #[error(transparent)]
-    Commit(#[from] Error),
-}
-
 /// Default [`CommitScope`] from `commit.autoStage` (default true → [`CommitScope::AutoStage`]).
 ///
 /// # Errors
 ///
 /// Propagates config read failures from [`Repository::config`].
-pub fn default_commit_scope(repo: &Repository) -> Result<CommitScope> {
-    let config = repo.config()?;
+pub(crate) fn default_commit_scope(repo: &Repository) -> Result<CommitScope> {
+    let config = repo.config().snapshot()?;
     Ok(default_commit_scope_from_config(config.as_ref()))
 }
 
@@ -375,7 +395,8 @@ pub fn default_commit_scope(repo: &Repository) -> Result<CommitScope> {
 pub fn default_commit_scope_from_config(config: &ConfigSet) -> CommitScope {
     let auto_stage = config
         .get_bool("commit.autoStage")
-        .and_then(|r| r.ok())
+        .ok()
+        .flatten()
         .unwrap_or(true);
     if auto_stage {
         CommitScope::AutoStage
@@ -409,7 +430,7 @@ pub(crate) fn clear_squash_commit_state(git_dir: &std::path::Path) -> Result<()>
 /// # Errors
 ///
 /// Propagates I/O and merge-state read failures.
-pub fn pending_commit_message(repo: &Repository) -> Result<Option<String>> {
+pub(crate) fn pending_commit_message(repo: &Repository) -> Result<Option<String>> {
     let git_dir = repo.git_dir();
     let squash = git_dir.join("SQUASH_MSG");
     let merge_msg = git_dir.join("MERGE_MSG");
@@ -428,7 +449,8 @@ pub fn pending_commit_message(repo: &Repository) -> Result<Option<String>> {
             return Ok(None);
         };
         let processed = process(raw.as_bytes(), &Mode::StripComments("#".to_owned()));
-        let message = String::from_utf8(processed).map_err(|_| Error::EmptyCommitMessage)?;
+        let message = String::from_utf8(processed)
+            .map_err(|_| Error::from(CommitError::EmptyCommitMessage))?;
         if message.trim().is_empty() {
             return Ok(None);
         }
@@ -439,7 +461,8 @@ pub fn pending_commit_message(repo: &Repository) -> Result<Option<String>> {
             return Ok(None);
         };
         let processed = process(raw.as_bytes(), &Mode::StripComments("#".to_owned()));
-        let message = String::from_utf8(processed).map_err(|_| Error::EmptyCommitMessage)?;
+        let message = String::from_utf8(processed)
+            .map_err(|_| Error::from(CommitError::EmptyCommitMessage))?;
         if message.trim().is_empty() {
             return Ok(None);
         }
@@ -454,46 +477,53 @@ fn replay_blocks_partial_commit(git_dir: &std::path::Path) -> Result<bool> {
 
 /// Record a commit using `scope` to decide how the index is prepared.
 ///
-/// Staging reports [`crate::progress::ProgressPhase::StagingFiles`] to `progress`; `cancel` (or
-/// [`ProgressSink::should_cancel`]) stops the commit with [`Error::Cancelled`] up to the point
+/// Staging reports [`crate::progress::ProgressPhase::StagingFiles`] to `progress`; `cancel` stops
+/// the commit with [`Error::Cancelled`] up to the point
 /// the commit object is written, leaving `HEAD` and the branch where they were.
 ///
 /// # Errors
 ///
 /// Same as [`create_commit`] and [`commit_worktree`], plus:
 ///
-/// - [`Error::CommitPathsRequired`] for an empty [`CommitScope::Paths`] list.
-/// - [`Error::PartialCommitDuringMerge`] for [`CommitScope::Paths`] or [`CommitScope::Patch`]
+/// - [`CommitError::CommitPathsRequired`] for an empty [`CommitScope::Paths`] list.
+/// - [`CommitError::PartialCommitDuringMerge`] for [`CommitScope::Paths`] or [`CommitScope::Patch`]
 ///   during an in-progress merge, and pathspec validation errors.
-/// - [`Error::HunkSelection`] when a [`CommitScope::Patch`] hunk id is unknown, stale, binary, or
-///   for the wrong side, and [`Error::Apply`] when the selected patch does not apply to the
-///   index. These carry the same values as [`CommitPatchError::Select`] and
-///   [`CommitPatchError::Apply`] from [`commit_with_patch`].
-pub fn commit_with_scope(
+/// - [`CommitError::HunkSelect`] when a [`CommitScope::Patch`] hunk id is unknown, stale, binary,
+///   or for the wrong side, and [`CommitError::PatchApply`] when the selected patch does not apply
+///   to the index, as from [`commit_with_patch`].
+///
+/// Underlying repository, hook, index, and I/O failures are returned in their own areas.
+pub(crate) fn commit_with_scope(
     repo: &Repository,
     req: &CommitRequest,
     scope: CommitScope,
     progress: &mut dyn ProgressSink,
-    cancel: &dyn Cancel,
+    cancel: &CancelToken,
 ) -> Result<CommitOutcome> {
     guard_incomplete_rewrite_apply(repo)?;
     match scope {
-        CommitScope::AutoStage => commit_worktree(repo, req, progress, cancel),
+        CommitScope::AutoStage => Ok(commit_worktree(repo, req, progress, cancel)?),
         CommitScope::Staged => {
             let mut req = req.clone();
             // Index stats were refreshed when paths were staged; skip full-tree refresh (#1622).
             req.assume_worktree_synced = true;
             req.index_only = true;
-            create_commit(repo, &req, progress, cancel)
+            Ok(create_commit(repo, &req, progress, cancel)?)
         }
-        CommitScope::Paths(paths) => commit_paths_scope(repo, req, &paths, progress, cancel),
-        CommitScope::Patch { input, pathspecs } => {
-            commit_with_patch(repo, req, input, &pathspecs, progress, cancel).map_err(|e| match e {
-                CommitPatchError::Select(err) => Error::HunkSelection(err),
-                CommitPatchError::Apply(err) => Error::Apply(err),
-                CommitPatchError::Commit(err) => err,
-            })
+        CommitScope::Paths(paths) => Ok(commit_paths_scope(repo, req, &paths, progress, cancel)?),
+        CommitScope::Patch { input, pathspecs } => Ok(commit_with_patch(
+            repo, req, input, &pathspecs, progress, cancel,
+        )?),
+    }
+}
+
+/// File hunk-selection failures of a partial commit under the commit area.
+fn commit_patch_error(err: Error) -> Error {
+    match err {
+        Error::Diff(crate::error::DiffError::HunkSelection(sel)) => {
+            CommitError::HunkSelect(sel).into()
         }
+        other => other,
     }
 }
 
@@ -504,17 +534,17 @@ pub fn commit_with_scope(
 ///
 /// # Errors
 ///
-/// [`CommitPatchError::Select`] for hunk id failures; [`CommitPatchError::Apply`] for patch apply;
+/// [`CommitError::HunkSelect`] for hunk id failures; [`CommitError::PatchApply`] for patch apply;
 /// same commit errors as [`create_commit`].
-pub fn commit_with_patch(
+pub(crate) fn commit_with_patch(
     repo: &Repository,
     req: &CommitRequest,
     input: CommitPatchInput,
     pathspecs: &[String],
     progress: &mut dyn ProgressSink,
-    cancel: &dyn Cancel,
-) -> std::result::Result<CommitOutcome, CommitPatchError> {
-    guard_incomplete_rewrite_apply(repo).map_err(CommitPatchError::Commit)?;
+    cancel: &CancelToken,
+) -> Result<CommitOutcome> {
+    guard_incomplete_rewrite_apply(repo)?;
     commit_patch_scope(repo, req, input, pathspecs, progress, cancel)
 }
 
@@ -524,13 +554,13 @@ fn commit_patch_scope(
     input: CommitPatchInput,
     pathspecs: &[String],
     progress: &mut dyn ProgressSink,
-    cancel: &dyn Cancel,
-) -> std::result::Result<CommitOutcome, CommitPatchError> {
+    cancel: &CancelToken,
+) -> Result<CommitOutcome> {
     if !read_merge_heads(repo.git_dir())?.is_empty() {
-        return Err(Error::PartialCommitDuringMerge.into());
+        return Err(CommitError::PartialCommitDuringMerge.into());
     }
     if replay_blocks_partial_commit(repo.git_dir())? {
-        return Err(Error::PartialCommitDuringReplay.into());
+        return Err(CommitError::PartialCommitDuringReplay.into());
     }
     let index_lock = (!req.dry_run)
         .then(|| repo.begin_index_update())
@@ -539,28 +569,29 @@ fn commit_patch_scope(
     let patches = match input {
         CommitPatchInput::Hunks(selection) => {
             if selection.ids.is_empty() && selection.ranges.is_empty() {
-                return Err(Error::NothingToCommit.into());
+                return Err(CommitError::NothingToCommit.into());
             }
             resolve_selection(
                 repo,
-                crate::diff::hunk_id::DiffSide::Unstaged,
+                crate::diff::DiffSide::Unstaged,
                 &selection,
                 pathspecs,
-                diff_options_for_hunk_select(repo).map_err(CommitPatchError::Commit)?,
-            )?
+                diff_options_for_hunk_select(repo)?,
+            )
+            .map_err(commit_patch_error)?
         }
         CommitPatchInput::Patches(patches) => {
             if patches.is_empty() {
-                return Err(Error::NothingToCommit.into());
+                return Err(CommitError::NothingToCommit.into());
             }
             patches
         }
     };
 
-    let head = resolve_head_for_repository(repo).map_err(CommitPatchError::Commit)?;
-    let mut index = repo.load_index().map_err(CommitPatchError::Commit)?;
+    let head = resolve_head_for_repository(repo)?;
+    let mut index = repo.load_index()?;
     if index.has_unmerged_entries() {
-        return Err(Error::IndexUnmerged.into());
+        return Err(Error::from(IndexError::unmerged()));
     }
 
     let dry_run = req.dry_run;
@@ -579,13 +610,16 @@ fn commit_patch_scope(
             dry_run: false,
             ..IndexApplyOptions::default()
         },
-    )?;
+    )
+    .map_err(|err| match err {
+        crate::error::ApplyError::Cancelled => Error::Cancelled,
+        other => CommitError::PatchApply(other).into(),
+    })?;
 
     let mut req = req.clone();
     req.assume_worktree_synced = true;
     let persist = index_lock.map(|lock| LockedIndex { index: None, lock });
     create_commit_with_index(repo, head, &mut index, &req, progress, cancel, persist)
-        .map_err(CommitPatchError::Commit)
 }
 
 /// Preview a commit for `scope` without mutating the repository (objects, index on disk, refs, hooks).
@@ -596,12 +630,12 @@ fn commit_patch_scope(
 /// # Errors
 ///
 /// Same as [`commit_with_scope`].
-pub fn plan_commit(
+pub(crate) fn plan_commit(
     repo: &Repository,
     req: &CommitRequest,
     scope: CommitScope,
     progress: &mut dyn ProgressSink,
-    cancel: &dyn Cancel,
+    cancel: &CancelToken,
 ) -> Result<CommitPlan> {
     let mut req = req.clone();
     req.dry_run = true;
@@ -625,9 +659,9 @@ fn seed_commit_index_stage0_from_index(
     repo: &Repository,
     commit_index: &mut Index,
     source: &Index,
-    paths: &ResolvedPathspecs,
+    paths: &Pathspec,
 ) -> Result<()> {
-    if paths.specs.is_empty() {
+    if paths.is_entire_tree() {
         return Ok(());
     }
     let ctx = repo.pathspec_match_context();
@@ -643,7 +677,7 @@ fn seed_commit_index_stage0_from_index(
         if commit_index.get(path.as_bytes(), 0).is_some() {
             continue;
         }
-        if !matches_pathspec_list_with_context(path, &paths.specs, ctx) {
+        if !matches_pathspec_list_with_context(path, paths.specs(), ctx) {
             continue;
         }
         commit_index.stage_file(entry.clone());
@@ -658,18 +692,18 @@ fn seed_commit_index_stage0_from_index(
 fn commit_paths_scope(
     repo: &Repository,
     req: &CommitRequest,
-    paths: &ResolvedPathspecs,
+    paths: &Pathspec,
     progress: &mut dyn ProgressSink,
-    cancel: &dyn Cancel,
+    cancel: &CancelToken,
 ) -> Result<CommitOutcome> {
-    if paths.specs.is_empty() {
-        return Err(Error::CommitPathsRequired);
+    if paths.is_entire_tree() {
+        return Err(CommitError::CommitPathsRequired.into());
     }
     if !read_merge_heads(repo.git_dir())?.is_empty() {
-        return Err(Error::PartialCommitDuringMerge);
+        return Err(CommitError::PartialCommitDuringMerge.into());
     }
     if replay_blocks_partial_commit(repo.git_dir())? {
-        return Err(Error::PartialCommitDuringReplay);
+        return Err(CommitError::PartialCommitDuringReplay.into());
     }
     validate_commit_pathspecs(repo, paths)?;
 
@@ -679,26 +713,22 @@ fn commit_paths_scope(
         .then(|| repo.begin_index_update())
         .transpose()?;
     let head = resolve_head_for_repository(repo)?;
-    let parent_tree = match &head {
-        HeadState::Branch { oid: Some(p), .. } | HeadState::Detached { oid: p } => {
-            Some(repo.odb().commit_tree(p)?)
-        }
-        HeadState::Branch { oid: None, .. } => None,
-        HeadState::Invalid => {
-            return Err(Error::InvalidHead);
-        }
-    };
+    if head == HeadState::Invalid {
+        return Err(Error::Ref(RefError::InvalidHead));
+    }
+    let parent_tree = head.tree(repo.odb())?;
 
     let mut real_index = repo.load_index()?;
     if real_index.has_unmerged_entries() {
-        return Err(Error::IndexUnmerged);
+        return Err(IndexError::unmerged().into());
     }
+    let path_sources: Vec<String> = paths.iter().map(str::to_owned).collect();
     let mut stage_opts = StageOptions {
-        pathspecs: paths.specs.clone(),
-        pathspec_sources: if paths.sources.is_empty() {
-            paths.specs.clone()
+        pathspecs: paths.specs().to_vec(),
+        pathspec_sources: if path_sources.is_empty() {
+            paths.specs().to_vec()
         } else {
-            paths.sources.clone()
+            path_sources
         },
         mode: StageMode::All,
         dry_run: req.dry_run,
@@ -755,22 +785,18 @@ struct LockedIndex {
     lock: IndexLock,
 }
 
-fn validate_commit_pathspecs(repo: &Repository, paths: &ResolvedPathspecs) -> Result<()> {
-    let pairs: Vec<(&str, &str)> =
-        if paths.sources.len() == paths.specs.len() && !paths.sources.is_empty() {
-            paths
-                .sources
-                .iter()
-                .zip(paths.specs.iter())
-                .map(|(a, b)| (a.as_str(), b.as_str()))
-                .collect()
-        } else {
-            paths
-                .specs
-                .iter()
-                .map(|s| (s.as_str(), s.as_str()))
-                .collect()
-        };
+fn validate_commit_pathspecs(repo: &Repository, paths: &Pathspec) -> Result<()> {
+    let specs = paths.specs();
+    let sources: Vec<&str> = paths.iter().collect();
+    let pairs: Vec<(&str, &str)> = if sources.len() == specs.len() && !sources.is_empty() {
+        sources
+            .into_iter()
+            .zip(specs.iter())
+            .map(|(a, b)| (a, b.as_str()))
+            .collect()
+    } else {
+        specs.iter().map(|s| (s.as_str(), s.as_str())).collect()
+    };
     let mut checker = KnownPathspecChecker::new(repo);
     for (source, resolved) in pairs {
         if pathspec_is_exclude(source) {
@@ -786,14 +812,14 @@ fn validate_commit_pathspecs(repo: &Repository, paths: &ResolvedPathspecs) -> Re
 ///
 /// # Errors
 ///
-/// Returns [`Error::EmptyCommitMessage`] when the cleaned body would be empty.
+/// Returns [`CommitError::EmptyCommitMessage`] when the cleaned body would be empty.
 pub fn normalize_commit_message(raw: &str) -> Result<String> {
     let normalized = raw.replace("\r\n", "\n").replace('\r', "\n");
     let processed = process(normalized.as_bytes(), &Mode::Default);
-    let message = String::from_utf8(processed)
-        .map_err(|_| Error::Message("invalid commit message".into()))?;
+    let message =
+        String::from_utf8(processed).map_err(|_| Error::from(CommitError::InvalidCommitMessage))?;
     if message.is_empty() {
-        return Err(Error::EmptyCommitMessage);
+        return Err(CommitError::EmptyCommitMessage.into());
     }
     let mut message = message;
     while message.ends_with("\n\n") {
@@ -811,8 +837,17 @@ fn run_commit_hook_recorded(
     args: &[&str],
     stdin_data: Option<&[u8]>,
     commit_env: &CommitHookEnv<'_>,
-) -> std::result::Result<bool, HookError> {
-    run_commit_hook(repo, hook.as_str(), args, stdin_data, commit_env)?.check(hook.as_str())
+    cancel: &CancelToken,
+) -> Result<bool> {
+    crate::hooks::run_commit_hook_with_cancel(
+        repo,
+        hook.as_str(),
+        args,
+        stdin_data,
+        commit_env,
+        cancel,
+    )?
+    .check(hook.as_str())
 }
 
 fn author_info_from_header_line(line: &str) -> CommitAuthorInfo {
@@ -907,6 +942,10 @@ pub struct CommitOutcome {
     pub parents: Vec<ObjectId>,
     /// Author recorded on the commit object.
     pub author: CommitAuthorInfo,
+    /// Committer recorded on the commit object.
+    pub committer: CommitAuthorInfo,
+    /// Full commit message body written to the object (including trailing newline).
+    pub message: String,
     /// Hooks that were installed and ran during this commit, in order: `pre-commit`,
     /// `prepare-commit-msg`, `commit-msg`, `post-commit`, and `post-rewrite` (with `amend`) when
     /// [`CommitRequest::amend`] is set.
@@ -917,6 +956,11 @@ pub struct CommitOutcome {
     pub change_id: Option<ChangeId>,
     /// Path-level changes vs the parent tree (`git diff --name-status` between parent and new tree).
     pub files: Vec<CommitFile>,
+    /// Gitlink paths introduced while auto-staging before this commit (empty when nothing new was
+    /// recorded as a nested repository).
+    pub embedded_gitlinks: Vec<String>,
+    /// Rerere postimage events when this commit concluded a conflict resolution.
+    pub rerere: Vec<crate::rerere::RerereEvent>,
 }
 
 impl CommitOutcome {
@@ -943,20 +987,20 @@ impl CommitOutcome {
 ///
 /// # Errors
 ///
-/// - [`Error::Cancelled`] when `cancel` or [`ProgressSink::should_cancel`] fired before the
+/// - [`Error::Cancelled`] when `cancel` fired before the
 ///   commit object was written; `HEAD` and the branch are unchanged. Hook failures and cancel
 ///   after hooks leave the on-disk index unchanged when the caller holds an index lock (for
 ///   example [`commit_worktree`] and path-scoped commits).
-/// - [`Error::AmendUnborn`] when [`CommitRequest::amend`] is set but the branch has no commits yet.
-/// - [`Error::NothingToCommit`] when the new tree is empty (unborn branch) or matches the parent tree and [`CommitRequest::allow_empty`] is false (not applied when amending).
-/// - [`Error::IndexUnmerged`] when the index has conflict stages.
+/// - [`crate::porcelain::CommitError::AmendUnborn`] when [`CommitRequest::amend`] is set but the branch has no commits yet.
+/// - [`CommitError::NothingToCommit`] when the new tree is empty (unborn branch) or matches the parent tree and [`CommitRequest::allow_empty`] is false (not applied when amending).
+/// - [`IndexError::unmerged()`] when the index has conflict stages.
 /// - Index write or diff failures before the branch is updated; the branch tip is not advanced.
 /// - Ref/reflog failures from [`crate::refs::update_branch_for_commit_on_store`]; the branch tip is not left advanced without reflogs when logging is enabled.
-pub fn create_commit(
+pub(crate) fn create_commit(
     repo: &Repository,
     req: &CommitRequest,
     progress: &mut dyn ProgressSink,
-    cancel: &dyn Cancel,
+    cancel: &CancelToken,
 ) -> Result<CommitOutcome> {
     guard_incomplete_rewrite_apply(repo)?;
     let head = resolve_head_for_repository(repo)?;
@@ -972,7 +1016,7 @@ pub fn create_commit(
 ///
 /// When staging changed the index but the result matches the parent tree (for example a new
 /// file that was staged and then deleted from the work tree), the staged index is still written
-/// before [`Error::NothingToCommit`] is returned, so the on-disk index matches `HEAD` afterwards.
+/// before [`CommitError::NothingToCommit`] is returned, so the on-disk index matches `HEAD` afterwards.
 /// [`CommitRequest::dry_run`] never writes the index, refs, or stored objects. Symlinks are
 /// compared and previewed as link-target bytes, including directory and dangling links.
 ///
@@ -985,14 +1029,14 @@ pub fn create_commit(
 /// # Errors
 ///
 /// Same as [`create_commit`], plus staging failures from [`crate::porcelain::add::stage_for_commit`],
-/// including [`Error::UnmergedConflictMarkers`] when a path's conflict stages were dropped
+/// including [`crate::worktree::WorktreeError::UnmergedConflictMarkers`] when a path's conflict stages were dropped
 /// (after a merge, pick, revert, rebase or stash pop) while its worktree file still has
 /// a conflict-marker block that its `HEAD` version does not. Neither the index nor `HEAD` moves in that case.
-pub fn commit_worktree(
+pub(crate) fn commit_worktree(
     repo: &Repository,
     req: &CommitRequest,
     progress: &mut dyn ProgressSink,
-    cancel: &dyn Cancel,
+    cancel: &CancelToken,
 ) -> Result<CommitOutcome> {
     guard_incomplete_rewrite_apply(repo)?;
     let index_lock = (!req.dry_run)
@@ -1010,22 +1054,27 @@ pub fn commit_worktree(
     let staged_count = staged.total();
     let stat_refreshed = staged.stat_refreshed;
     if index.has_unmerged_entries() {
-        return Err(Error::IndexUnmerged);
+        return Err(IndexError::unmerged().into());
     }
     let mut req = req.clone();
     req.assume_worktree_synced = true;
     if req.skip_pre_commit_tree_match {
         req.staged_change_count = Some(staged_count);
     }
+    let embedded_gitlinks = staged.embedded_gitlinks.clone();
     let persist = index_lock.map(|lock| LockedIndex { index: None, lock });
     let result = create_commit_with_index(repo, head, &mut index, &req, progress, cancel, persist);
-    if matches!(result, Err(Error::NothingToCommit))
+    let result = result.map(|mut outcome| {
+        outcome.embedded_gitlinks = embedded_gitlinks;
+        outcome
+    });
+    if matches!(result, Err(Error::Commit(CommitError::NothingToCommit)))
         && !req.dry_run
         && (staged_count > 0 || stat_refreshed)
     {
         repo.write_index(&mut index)?;
     }
-    if matches!(result, Err(Error::NothingToCommit)) && staged_count == 0 {
+    if matches!(result, Err(Error::Commit(CommitError::NothingToCommit))) && staged_count == 0 {
         let mut worktree_index = match repo.load_index() {
             Ok(real) => real,
             Err(_) => index.clone(),
@@ -1034,10 +1083,11 @@ pub fn commit_worktree(
             crate::porcelain::status::count_unstaged_and_untracked_paths(repo, &mut worktree_index)
         {
             if unstaged + untracked > 0 {
-                return Err(Error::NothingStagedToCommit {
+                return Err(CommitError::NothingStagedToCommit {
                     unstaged,
                     untracked,
-                });
+                }
+                .into());
             }
         }
     }
@@ -1105,41 +1155,93 @@ fn commit_files_index_vs_parent_tree(
     index: &Index,
     parent_tree: Option<&ObjectId>,
 ) -> Result<Vec<CommitFile>> {
-    let mut parent: BTreeMap<String, (FileMode, ObjectId)> = BTreeMap::new();
-    if let Some(tree) = parent_tree {
-        for (path, mode, oid) in flatten_tree_entries(odb, tree)? {
-            parent.insert(path, (mode, oid));
+    if parent_tree.is_none() {
+        if let Some(files) = root_commit_files_from_index(index) {
+            return Ok(files);
         }
+    }
+    // The diff pairs and reports paths as lossy UTF-8: distinct non-UTF-8 names can collide, and
+    // file lists must carry the `storage_string` form.
+    if index
+        .entries()
+        .iter()
+        .any(|e| std::str::from_utf8(&e.path).is_err())
+    {
+        return commit_files_from_raw_paths(odb, index, parent_tree);
+    }
+    let entries = diff_index_to_tree(odb, index, parent_tree, false)?;
+    if entries.iter().all(diff_entry_paths_are_stored_exactly) {
+        return Ok(commit_files_from_diff_entries(&entries));
+    }
+    commit_files_from_raw_paths(odb, index, parent_tree)
+}
+
+/// Whether the lossy UTF-8 paths [`diff_index_to_tree`] reports equal the
+/// [`crate::repo_relpath::storage_string`] form commit file lists use (tree-only paths can still
+/// be non-UTF-8 when the index paths are not).
+fn diff_entry_paths_are_stored_exactly(entry: &DiffEntry) -> bool {
+    [entry.old_path.as_deref(), entry.new_path.as_deref()]
+        .into_iter()
+        .flatten()
+        .all(|path| {
+            !path.contains(char::REPLACEMENT_CHARACTER)
+                && !path.starts_with(crate::repo_relpath::STORAGE_PREFIX)
+        })
+}
+
+/// Files that differ between `index` and `parent_tree`, comparing raw path bytes.
+///
+/// Reads every tree under `parent_tree`; used only when a changed path does not round-trip
+/// through UTF-8.
+fn commit_files_from_raw_paths(
+    odb: &crate::odb::Odb,
+    index: &Index,
+    parent_tree: Option<&ObjectId>,
+) -> Result<Vec<CommitFile>> {
+    fn collect(
+        odb: &crate::odb::Odb,
+        tree: &ObjectId,
+        prefix: &[u8],
+        out: &mut BTreeMap<Vec<u8>, (u32, ObjectId)>,
+    ) -> Result<()> {
+        for entry in crate::objects::parse_tree(&odb.read(tree)?.data)? {
+            let path = crate::repo_relpath::join_rel(prefix, &entry.name);
+            if entry.mode == crate::index::MODE_TREE {
+                collect(odb, &entry.oid, &path, out)?;
+            } else {
+                out.insert(path, (entry.mode, entry.oid));
+            }
+        }
+        Ok(())
+    }
+
+    let mut parent = BTreeMap::new();
+    if let Some(tree) = parent_tree {
+        collect(odb, tree, b"", &mut parent)?;
     }
     let mut files = Vec::new();
     for entry in index.entries() {
         if entry.stage() != 0 || entry.intent_to_add() {
             continue;
         }
-        let path = String::from_utf8_lossy(&entry.path).into_owned();
-        match parent.remove(&path) {
-            None => files.push(CommitFile {
-                path,
-                status: DiffStatus::Added,
-                old_path: None,
-            }),
-            Some((old_mode, old_oid)) if old_oid != entry.oid || entry.mode != old_mode.bits() => {
-                files.push(CommitFile {
-                    path,
-                    status: DiffStatus::for_content_change(old_mode.bits(), entry.mode),
-                    old_path: None,
-                });
+        let status = match parent.remove(entry.path.as_slice()) {
+            None => DiffStatus::Added,
+            Some((old_mode, old_oid)) if old_oid != entry.oid || old_mode != entry.mode => {
+                DiffStatus::for_content_change(old_mode, entry.mode)
             }
-            _ => {}
-        }
-    }
-    for (path, _) in parent {
+            Some(_) => continue,
+        };
         files.push(CommitFile {
-            path,
-            status: DiffStatus::Deleted,
+            path: crate::repo_relpath::storage_string(&entry.path),
+            status,
             old_path: None,
         });
     }
+    files.extend(parent.into_keys().map(|path| CommitFile {
+        path: crate::repo_relpath::storage_string(&path),
+        status: DiffStatus::Deleted,
+        old_path: None,
+    }));
     files.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(files)
 }
@@ -1150,41 +1252,6 @@ impl Drop for MemOverlayGuard<'_> {
     fn drop(&mut self) {
         self.0.disable_mem_overlay();
     }
-}
-
-fn materialize_missing_index_blobs_for_overlay(repo: &Repository, index: &Index) -> Result<()> {
-    let odb = repo.odb();
-    let work_tree = repo.work_tree().ok_or(Error::RequiresWorkTree)?;
-    let rules = WorktreeRules::from_repository(repo, index)?;
-    for entry in index
-        .entries
-        .iter()
-        .filter(|e| e.stage() == 0 && !e.intent_to_add())
-    {
-        if odb.contains(&entry.oid)? {
-            continue;
-        }
-        let rel = String::from_utf8_lossy(&entry.path);
-        let abs = crate::index::worktree_path_from_index_rel(work_tree, &entry.path);
-        let meta = fs::symlink_metadata(&abs).map_err(Error::Io)?;
-        let file_attrs = rules.file_attrs(&rel, false);
-        let stored = materialize_worktree_blob(
-            odb,
-            &abs,
-            &meta,
-            rules.conversion(),
-            &file_attrs,
-            &rel,
-            Some(entry),
-            Some(rules.filter_process()),
-        )?;
-        if stored != entry.oid {
-            return Err(Error::Message(format!(
-                "internal error: staged oid mismatch for {rel}"
-            )));
-        }
-    }
-    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1206,11 +1273,7 @@ fn finish_commit_dry_run(
     reuse_author_raw: Vec<u8>,
     reuse_message: Option<String>,
 ) -> Result<CommitOutcome> {
-    let odb = repo.odb();
-    odb.enable_mem_overlay();
-    let _overlay = MemOverlayGuard(odb);
-    materialize_missing_index_blobs_for_overlay(repo, index)?;
-    let files = commit_files_index_vs_parent_tree(odb, index, parent_tree.as_ref())?;
+    let files = commit_files_index_vs_parent_tree(repo.odb(), index, parent_tree.as_ref())?;
 
     if !req.allow_empty && !req_amend {
         if parent_tree.is_none() && index.entries.is_empty() {
@@ -1230,18 +1293,18 @@ fn finish_commit_dry_run(
     } else if let Some(pending) = pending_commit_message(repo)? {
         normalize_commit_message(&pending)?
     } else {
-        return Err(Error::EmptyCommitMessage);
+        return Err(CommitError::EmptyCommitMessage.into());
     };
     if message.trim().is_empty() {
-        return Err(Error::EmptyCommitMessage);
+        return Err(CommitError::EmptyCommitMessage.into());
     }
     if !message.ends_with('\n') {
         message.push('\n');
     }
-    let config = repo.config()?;
+    let config = repo.config().snapshot()?;
     let now = repo.identity_now();
     let committer = commit_identity_line(repo, req.committer.as_ref(), IdentRole::Committer, now)?;
-    let _message_with_trailers = enrich_commit_message(
+    let message_with_trailers = enrich_commit_message(
         message,
         &req.trailers,
         req.signoff,
@@ -1273,6 +1336,7 @@ fn finish_commit_dry_run(
         }
     }
     let author_info = author_info_from_header_line(&author);
+    let committer_info = author_info_from_header_line(&committer);
     let changes = files.len();
 
     Ok(CommitOutcome {
@@ -1281,10 +1345,14 @@ fn finish_commit_dry_run(
         parent,
         parents: commit_parents,
         author: author_info,
+        committer: committer_info,
+        message: message_with_trailers,
         hooks_run: Vec::new(),
         changes,
         change_id: None,
         files,
+        embedded_gitlinks: Vec::new(),
+        rerere: Vec::new(),
     })
 }
 
@@ -1394,6 +1462,78 @@ fn commit_identity_line(
     }
 }
 
+const NEXT_INDEX_FILE_PREFIX: &str = "next-index-";
+
+/// Reclaim `next-index-<pid>` hook index copies left when a commit process was killed.
+///
+/// Scans [`Repository::git_dir`], the common git directory when it differs, and each linked
+/// worktree admin directory. Only removes files whose suffix is a decimal PID that is not the
+/// current process and is not running on this host; non-numeric suffixes are left alone.
+pub(crate) fn reap_stale_next_index_files(repo: &Repository, dry_run: bool) -> Result<usize> {
+    let mut reaped = 0;
+    for dir in next_index_git_dirs(repo)? {
+        reaped += reap_stale_next_index_files_in_dir(&dir, dry_run)?;
+    }
+    Ok(reaped)
+}
+
+fn next_index_git_dirs(repo: &Repository) -> Result<Vec<PathBuf>> {
+    use crate::worktree::list_worktrees;
+
+    let git_dir = repo.git_dir().to_path_buf();
+    let common = repo.common_git_dir().to_path_buf();
+    let mut dirs = vec![git_dir.clone()];
+    if common != git_dir {
+        dirs.push(common);
+    }
+    for wt in list_worktrees(repo)? {
+        if !dirs.iter().any(|d| d == &wt.admin_dir) {
+            dirs.push(wt.admin_dir);
+        }
+    }
+    Ok(dirs)
+}
+
+fn reap_stale_next_index_files_in_dir(dir: &Path, dry_run: bool) -> Result<usize> {
+    use crate::lockfile::is_process_running;
+
+    let current = u64::from(process::id());
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e.into()),
+    };
+    let mut reaped = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let Some(pid_str) = name.strip_prefix(NEXT_INDEX_FILE_PREFIX) else {
+            continue;
+        };
+        if pid_str.is_empty() || !pid_str.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let Ok(pid) = pid_str.parse::<u64>() else {
+            continue;
+        };
+        if pid == current || is_process_running(pid) {
+            continue;
+        }
+        if dry_run {
+            reaped += 1;
+            continue;
+        }
+        let path = entry.path();
+        if is_process_running(pid) {
+            continue;
+        }
+        if fs::remove_file(&path).is_ok() {
+            reaped += 1;
+        }
+    }
+    Ok(reaped)
+}
+
 /// Removes a partial-commit hook index file on drop (Git `next-index-<pid>`).
 struct TempHookIndexFile(PathBuf);
 
@@ -1411,10 +1551,10 @@ pub(crate) fn create_commit_with_loaded_index(
     index: &mut Index,
     req: &CommitRequest,
     progress: &mut dyn ProgressSink,
-    cancel: &dyn Cancel,
+    cancel: &CancelToken,
 ) -> Result<CommitOutcome> {
     if index.has_unmerged_entries() {
-        return Err(Error::IndexUnmerged);
+        return Err(IndexError::unmerged().into());
     }
     let head = resolve_head_for_repository(repo)?;
     create_commit_with_index(repo, head, index, req, progress, cancel, None)
@@ -1426,9 +1566,9 @@ pub(crate) fn create_commit_with_loaded_index(
 /// compares against that same tip, so a commit landed by another process in between makes this
 /// one fail instead of silently reverting it.
 ///
-/// Cancellation is checked before anything is written and again after the pre-commit and
-/// commit-msg hooks, before the commit object; once the object is written the ref update always
-/// follows.
+/// Cancellation is checked before anything is written, while commit hooks run (including a
+/// long-running `pre-commit`), and again before the commit object is written; once the object is
+/// written the ref update always follows.
 #[allow(clippy::too_many_arguments)]
 fn create_commit_with_index(
     repo: &Repository,
@@ -1436,7 +1576,7 @@ fn create_commit_with_index(
     index: &mut Index,
     req: &CommitRequest,
     progress: &mut dyn ProgressSink,
-    cancel: &dyn Cancel,
+    cancel: &CancelToken,
     persist_index: Option<LockedIndex>,
 ) -> Result<CommitOutcome> {
     poll_cancel(progress, cancel)?;
@@ -1448,7 +1588,7 @@ fn create_commit_with_index(
         } => (refname, Some(short_name), oid),
         HeadState::Detached { oid } => ("HEAD".to_owned(), None, Some(oid)),
         HeadState::Invalid => {
-            return Err(Error::InvalidHead);
+            return Err(Error::Ref(RefError::InvalidHead));
         }
     };
 
@@ -1469,10 +1609,10 @@ fn create_commit_with_index(
     }
     if req.amend {
         if replay_blocks_partial_commit(repo.git_dir())? {
-            return Err(Error::PartialCommitDuringReplay);
+            return Err(CommitError::PartialCommitDuringReplay.into());
         }
         let Some(tip) = parent.take() else {
-            return Err(Error::AmendUnborn);
+            return Err(CommitError::AmendUnborn.into());
         };
         let old = repo.odb().read_commit(&tip)?;
         amend_parents = old.parents.clone();
@@ -1485,17 +1625,19 @@ fn create_commit_with_index(
     }
 
     if index.has_unmerged_entries() {
-        return Err(Error::IndexUnmerged);
+        return Err(IndexError::unmerged().into());
     }
     let merge_heads = read_merge_heads(repo.git_dir())?;
     let concluding_merge = !merge_heads.is_empty();
-    let index_path = repo.git_dir().join("index");
+    let index_path = repo.index_path_for_env()?;
     let parent_tree = parent
         .as_ref()
         .map(|parent_oid| repo.odb().commit_tree(parent_oid))
         .transpose()?;
 
-    if !req.allow_empty && !req.amend && !concluding_merge {
+    // A dry run derives its file list from the same index-vs-parent diff and rejects an empty
+    // one there, so it skips this pass.
+    if !req.dry_run && !req.allow_empty && !req.amend && !concluding_merge {
         let skip_tree_match = req.assume_worktree_synced && req.skip_pre_commit_tree_match;
         if !skip_tree_match {
             if let Some(ref old) = parent_tree {
@@ -1553,14 +1695,13 @@ fn create_commit_with_index(
     };
     let mut hooks_run = Vec::new();
     if req.hooks != HookPolicy::SkipVerify
-        && run_commit_hook_recorded(repo, HookName::PreCommit, &[], None, &commit_env)?
+        && run_commit_hook_recorded(repo, HookName::PreCommit, &[], None, &commit_env, cancel)?
     {
         hooks_run.push(HookName::PreCommit);
     }
 
     if !req.amend && grit_rebase_conflict_stop_active(repo.git_dir()) {
-        persist_rebase_stopped_head_if_missing(repo)
-            .map_err(|e| Error::Message(format!("rebase resolution commit: {e}")))?;
+        persist_rebase_stopped_head_if_missing(repo)?;
     }
 
     let message_source = if req.message_from_merge {
@@ -1583,15 +1724,15 @@ fn create_commit_with_index(
     } else if let Some(pending) = pending_commit_message(repo)? {
         normalize_commit_message(&pending)?
     } else {
-        return Err(Error::EmptyCommitMessage);
+        return Err(CommitError::EmptyCommitMessage.into());
     };
     if message.trim().is_empty() {
-        return Err(Error::EmptyCommitMessage);
+        return Err(CommitError::EmptyCommitMessage.into());
     }
     if !message.ends_with('\n') {
         message.push('\n');
     }
-    let config = repo.config()?;
+    let config = repo.config().snapshot()?;
     let now = repo.identity_now();
     let committer = commit_identity_line(repo, req.committer.as_ref(), IdentRole::Committer, now)?;
     message = enrich_commit_message(
@@ -1613,6 +1754,7 @@ fn create_commit_with_index(
         req.hooks,
         &commit_env,
         &mut hooks_run,
+        cancel,
     )? {
         message = edited;
     }
@@ -1693,11 +1835,21 @@ fn create_commit_with_index(
             stamp_change_id_on_new_commit(repo, &policy, &mut commit_data)?;
         }
     }
-    let bytes = prepare_commit_bytes(repo, config.as_ref(), &commit_data, req.sign_override)?;
-    fsck_commit_idents(&bytes, repo.odb().hash_algo())
-        .map_err(|detail| Error::CorruptObject(format!("commit would fail fsck: {detail}")))?;
+    let bytes = prepare_commit_bytes(repo, &commit_data, req.sign_override)?;
+    fsck_commit_idents(&bytes, repo.odb().hash_algo()).map_err(|check| ObjectError::Invalid {
+        kind: ObjectKind::Commit,
+        check,
+    })?;
     poll_cancel(progress, cancel)?;
     let oid = repo.odb().write(ObjectKind::Commit, &bytes)?;
+    repo.odb().flush_for_publish()?;
+
+    let amend_notes_rewrite: Option<NotesRewritePlan> =
+        if let Some(old_tip) = replaced_tip.filter(|_| req.amend && req.post_rewrite.enabled()) {
+            prepare_notes_for_rewrite(repo, NotesRewriteCommand::Amend, &[(old_tip, oid)])?
+        } else {
+            None
+        };
 
     let concluding_replay = read_cherry_pick_head(repo.git_dir())?.is_some()
         || read_revert_head(repo.git_dir())?.is_some();
@@ -1762,7 +1914,7 @@ fn create_commit_with_index(
 
     if short_name.is_none() {
         update_detached_head_for_commit_on_store(
-            repo.refs(),
+            repo.ref_store(),
             expected_old,
             oid,
             &committer,
@@ -1771,9 +1923,9 @@ fn create_commit_with_index(
         )?;
     } else {
         update_branch_for_commit_on_store(
-            repo.refs(),
+            repo.ref_store(),
             &BranchCommitRefUpdate {
-                branch_ref: &refname,
+                branch_ref: RefNameRef::from_trusted(refname.as_str()),
                 expected_old,
                 new_oid: oid,
                 identity: &committer,
@@ -1783,8 +1935,16 @@ fn create_commit_with_index(
         )?;
     }
 
+    let mut rerere_events = Vec::new();
     if concluding_merge {
-        let _ = finish_merge_state(repo)?;
+        rerere_events = finish_merge_state(repo)?.rerere;
+    } else {
+        let conclude_rerere = squash_conflict_merge_in_progress(repo.git_dir())
+            || grit_rebase_conflict_stop_active(repo.git_dir())
+            || concluding_replay;
+        if conclude_rerere {
+            rerere_events = crate::rerere::finish_merge_rerere(repo)?;
+        }
     }
     if concluding_replay {
         finish_replay_commit_state(repo, oid)?;
@@ -1836,22 +1996,30 @@ fn create_commit_with_index(
         hooks_run.push(HookName::PostCommit);
     }
     if let Some(old_tip) = replaced_tip.filter(|_| req.post_rewrite.enabled()) {
+        if let Some(notes_plan) = amend_notes_rewrite.as_ref() {
+            apply_prepared_notes_rewrite(repo, notes_plan, &[(old_tip, oid)])?;
+        }
         if run_post_rewrite(repo, RewriteKind::Amend, &[(old_tip, oid)]) {
             hooks_run.push(HookName::PostRewrite);
         }
     }
 
     let stored_change_id = change_id(&commit_data);
+    let committer_info = author_info_from_header_line(&commit_data.committer);
     Ok(CommitOutcome {
         oid,
         branch: short_name,
         parent,
         parents: commit_data.parents,
         author: author_info,
+        committer: committer_info,
+        message: commit_data.message.clone(),
         hooks_run,
         changes,
         change_id: stored_change_id,
         files: commit_files,
+        embedded_gitlinks: Vec::new(),
+        rerere: rerere_events,
     })
 }
 
@@ -1862,7 +2030,7 @@ fn create_commit_with_index(
 ///
 /// # Errors
 ///
-/// Propagates change-id generation failures as [`Error::Message`].
+/// Propagates change-id generation failures as [`CommitError::ChangeId`].
 pub(crate) fn stamp_change_id_on_new_commit(
     repo: &Repository,
     policy: &ChangeIdPolicy,
@@ -1874,7 +2042,7 @@ pub(crate) fn stamp_change_id_on_new_commit(
             repo.odb().hash_algo(),
             repo.change_id_generator().as_ref(),
         )
-        .map_err(|e| Error::Message(format!("change id: {e}")))?
+        .map_err(CommitError::ChangeId)?
     {
         set_change_id(data, &id);
     }
@@ -1891,17 +2059,17 @@ pub(crate) fn stamp_change_id_on_new_commit(
 ///
 /// Propagates signing and config errors from [`GpgConfig::from_config`] and
 /// [`sign_serialized_commit`].
-pub fn prepare_commit_bytes(
+pub(crate) fn prepare_commit_bytes(
     repo: &Repository,
-    config: &ConfigSet,
     data: &CommitData,
     sign_override: Option<bool>,
 ) -> Result<Vec<u8>> {
+    let config = repo.config().snapshot()?;
     let unsigned = serialize_commit(data);
-    if !should_sign_commit(config, sign_override)? {
+    if !should_sign_commit(config.as_ref(), sign_override)? {
         return Ok(unsigned);
     }
-    let gpg = GpgConfig::from_config(config)?.with_command_runner(repo.command_runner());
+    let gpg = GpgConfig::from_config(config.as_ref())?.with_command_runner(repo.command_runner());
     sign_serialized_commit(
         &gpg,
         &unsigned,
@@ -1918,14 +2086,15 @@ pub fn prepare_commit_bytes(
 /// # Errors
 ///
 /// Same as [`prepare_commit_bytes`], plus object-database write failures.
-pub fn write_commit_object(
+pub(crate) fn write_commit_object(
     repo: &Repository,
     data: &CommitData,
     sign_override: Option<bool>,
 ) -> Result<ObjectId> {
-    let config = repo.config()?;
-    let bytes = prepare_commit_bytes(repo, config.as_ref(), data, sign_override)?;
-    repo.odb().write(ObjectKind::Commit, &bytes)
+    let bytes = prepare_commit_bytes(repo, data, sign_override)?;
+    let oid = repo.odb().write(ObjectKind::Commit, &bytes)?;
+    repo.odb().flush_for_publish()?;
+    Ok(oid)
 }
 
 fn empty_commit_error(repo: &Repository, index: &mut Index, req: &CommitRequest) -> Error {
@@ -1938,14 +2107,15 @@ fn empty_commit_error(repo: &Repository, index: &mut Index, req: &CommitRequest)
             crate::porcelain::status::count_unstaged_and_untracked_paths(repo, &mut worktree_index)
         {
             if unstaged + untracked > 0 {
-                return Error::NothingStagedToCommit {
+                return CommitError::NothingStagedToCommit {
                     unstaged,
                     untracked,
-                };
+                }
+                .into();
             }
         }
     }
-    Error::NothingToCommit
+    CommitError::NothingToCommit.into()
 }
 
 /// True when stage-0 index entries describe `tree_oid`, using a valid cache-tree when present.
@@ -1984,18 +2154,22 @@ fn commit_editmsg_hook_argument(repo: &Repository, editmsg_path: &Path) -> Strin
 #[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
+    use crate::worktree::WorktreeError;
 
     use crate::environment::RepositoryOptions;
 
     use super::*;
+    use crate::error::Error;
     use crate::index::{entry_from_stat, Index, MODE_REGULAR};
     use crate::objects::ObjectKind;
-    use crate::pathspec::ResolvedPathspecs;
+    use crate::pathspec::{Pathspec, PathspecGlobalFlags};
     use crate::porcelain::add::{stage, StageOptions};
     use crate::progress::NullProgress;
     use crate::reflog::read_reflog;
-    use crate::refs::{resolve_ref, set_test_inject_reflog_fail};
-    use crate::repo::set_test_inject_index_write_fail;
+    use crate::refs::resolve_ref;
+    use crate::test_support::inject::{
+        set_test_inject_index_write_fail, set_test_inject_reflog_fail,
+    };
     use crate::write_tree::{cache_tree_fully_valid, verify_cache_tree};
     use std::fs;
     use std::io::Write;
@@ -2036,6 +2210,32 @@ mod tests {
     fn write_index(repo: &Repository, index: &mut Index) {
         index.sort();
         repo.write_index(index).unwrap();
+    }
+
+    #[test]
+    fn reap_stale_next_index_files_removes_dead_pid_only() {
+        let dir = TempDir::new().unwrap();
+        let repo = init_repo(dir.path());
+        let git = repo.git_dir();
+        let dead_pid = 99_999_999_u64;
+        let live_pid = u64::from(std::process::id());
+        fs::write(git.join(format!("next-index-{dead_pid}")), b"orphan").unwrap();
+        fs::write(git.join(format!("next-index-{live_pid}")), b"live").unwrap();
+        fs::write(git.join("next-index-not-a-pid"), b"weird").unwrap();
+        assert_eq!(reap_stale_next_index_files(&repo, false).unwrap(), 1);
+        assert!(!git.join(format!("next-index-{dead_pid}")).exists());
+        assert!(git.join(format!("next-index-{live_pid}")).exists());
+        assert!(git.join("next-index-not-a-pid").exists());
+    }
+
+    #[test]
+    fn begin_index_update_reaps_stale_next_index_file() {
+        let dir = TempDir::new().unwrap();
+        let repo = init_repo(dir.path());
+        let dead = repo.git_dir().join("next-index-99999998");
+        fs::write(&dead, b"x").unwrap();
+        let _lock = repo.begin_index_update().unwrap();
+        assert!(!dead.exists());
     }
 
     #[test]
@@ -2114,6 +2314,23 @@ mod tests {
         req
     }
 
+    fn assert_commit_with_scope_err(
+        repo: &Repository,
+        req: &CommitRequest,
+        scope: CommitScope,
+        f: impl FnOnce(&Error),
+    ) {
+        let err = commit_with_scope(
+            repo,
+            req,
+            scope,
+            &mut NullProgress,
+            &crate::progress::CancelToken::never(),
+        )
+        .unwrap_err();
+        f(&err);
+    }
+
     #[cfg(unix)]
     #[test]
     fn dry_run_includes_mode_only_and_mixed_worktree_changes() {
@@ -2128,7 +2345,7 @@ mod tests {
             &repo,
             &commit_req("base"),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         let before = repo_snapshot(&repo);
@@ -2142,7 +2359,7 @@ mod tests {
             &repo,
             &dry_run_req("mode"),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         assert_eq!(preview.changes, 1);
@@ -2166,7 +2383,7 @@ mod tests {
             &repo,
             &dry_run_req("mixed"),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         assert_eq!(preview.changes, 2);
@@ -2178,7 +2395,7 @@ mod tests {
             &repo,
             &commit_req("mixed"),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         assert_eq!(committed.files, preview.files);
@@ -2208,7 +2425,7 @@ mod tests {
             &repo,
             &commit_req("initial"),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         let mut index = repo.load_index().unwrap();
@@ -2231,10 +2448,13 @@ mod tests {
                 &repo,
                 &dry_run_req("clean"),
                 &mut NullProgress,
-                &crate::progress::NeverCancel,
+                &crate::progress::CancelToken::never(),
             )
             .unwrap_err();
-            assert!(matches!(err, Error::NothingToCommit), "{err:?}");
+            assert!(
+                matches!(err, Error::Commit(CommitError::NothingToCommit)),
+                "{err:?}"
+            );
             assert_eq!(repo_snapshot(&repo), before);
             assert_eq!(
                 resolve_ref(repo.git_dir(), "refs/heads/main").unwrap(),
@@ -2261,7 +2481,7 @@ mod tests {
                 &repo,
                 &dry_run_req("retarget"),
                 &mut NullProgress,
-                &crate::progress::NeverCancel,
+                &crate::progress::CancelToken::never(),
             )
             .unwrap();
             assert_eq!(preview.changes, 3);
@@ -2279,7 +2499,7 @@ mod tests {
             &repo,
             &commit_req("retarget"),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         assert_eq!(Some(committed.files), preview_files);
@@ -2295,7 +2515,7 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
 
@@ -2303,7 +2523,7 @@ mod tests {
             &repo,
             &commit_req("initial"),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         assert!(outcome.parent.is_none());
@@ -2324,10 +2544,10 @@ mod tests {
             &repo,
             &commit_req("empty"),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap_err();
-        assert!(matches!(err, Error::NothingToCommit));
+        assert!(matches!(err, Error::Commit(CommitError::NothingToCommit)));
         assert!(resolve_ref(&repo.git_dir(), "refs/heads/main").is_err());
     }
 
@@ -2341,14 +2561,14 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         create_commit(
             &repo,
             &commit_req("first"),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
 
@@ -2357,14 +2577,14 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         let outcome = create_commit(
             &repo,
             &commit_req("second"),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         assert_eq!(outcome.changes, 1);
@@ -2381,14 +2601,14 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         create_commit(
             &repo,
             &commit_req("first"),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
 
@@ -2396,10 +2616,10 @@ mod tests {
             &repo,
             &commit_req("noop"),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap_err();
-        assert!(matches!(err, Error::NothingToCommit));
+        assert!(matches!(err, Error::Commit(CommitError::NothingToCommit)));
     }
 
     #[test]
@@ -2412,7 +2632,7 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         let objects_before = fs::read_dir(repo.git_dir().join("objects"))
@@ -2426,14 +2646,14 @@ mod tests {
                 ..CommitRequest::default()
             },
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap_err();
         assert!(matches!(
             err,
-            Error::Identity(
+            Error::Commit(CommitError::Identity(
                 crate::config::ident_resolve::IdentityError::MissingConfiguredEmail { .. }
-            )
+            ))
         ));
         let objects_after = fs::read_dir(repo.git_dir().join("objects"))
             .unwrap()
@@ -2469,7 +2689,7 @@ mod tests {
             &repo,
             &commit_req("first"),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
 
@@ -2482,20 +2702,20 @@ mod tests {
             &repo,
             &dry_run_req("noop"),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap_err();
-        assert!(matches!(err, Error::NothingToCommit));
+        assert!(matches!(err, Error::Commit(CommitError::NothingToCommit)));
         assert!(repo.load_index().unwrap().get(b"n.txt", 0).is_some());
 
         let err = commit_worktree(
             &repo,
             &commit_req("noop"),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap_err();
-        assert!(matches!(err, Error::NothingToCommit));
+        assert!(matches!(err, Error::Commit(CommitError::NothingToCommit)));
         let index = repo.load_index().unwrap();
         assert!(index.get(b"n.txt", 0).is_none());
         assert!(index.get(b"a.txt", 0).is_some());
@@ -2511,14 +2731,14 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         let first = create_commit(
             &repo,
             &commit_req("first"),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         fs::write(repo.git_dir().join("HEAD"), first.oid.to_hex()).unwrap();
@@ -2528,14 +2748,14 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         let second = create_commit(
             &repo,
             &commit_req("second"),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         assert_eq!(second.branch, None);
@@ -2557,14 +2777,14 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         let outcome = create_commit(
             &repo,
             &commit_req("subject line"),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
 
@@ -2588,7 +2808,7 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
 
@@ -2597,11 +2817,11 @@ mod tests {
             &repo,
             &commit_req("fail"),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap_err();
         set_test_inject_index_write_fail(false);
-        assert!(!matches!(err, Error::NothingToCommit));
+        assert!(!matches!(err, Error::Commit(CommitError::NothingToCommit)));
 
         assert!(
             resolve_ref(&repo.git_dir(), "refs/heads/main").is_err(),
@@ -2619,7 +2839,7 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
 
@@ -2628,11 +2848,11 @@ mod tests {
             &repo,
             &commit_req("fail"),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap_err();
         set_test_inject_reflog_fail(None);
-        assert!(!matches!(err, Error::NothingToCommit));
+        assert!(!matches!(err, Error::Commit(CommitError::NothingToCommit)));
 
         assert!(
             resolve_ref(&repo.git_dir(), "refs/heads/main").is_err(),
@@ -2658,7 +2878,7 @@ mod tests {
             &repo,
             &commit_req("tree"),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
 
@@ -2683,14 +2903,14 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         create_commit(
             &repo,
             &commit_req("first"),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         fs::write(root.join("a.txt"), b"2\n").unwrap();
@@ -2698,14 +2918,14 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         create_commit(
             &repo,
             &commit_req("second"),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
 
@@ -2716,7 +2936,7 @@ mod tests {
             &repo,
             &req,
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         assert_eq!(
@@ -2740,14 +2960,14 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         create_commit(
             &repo,
             &commit_req("oneline subject"),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         let baseline = {
@@ -2763,7 +2983,7 @@ mod tests {
                 &repo,
                 &StageOptions::default(),
                 &mut NullProgress,
-                &crate::progress::NeverCancel,
+                &crate::progress::CancelToken::never(),
             )
             .unwrap();
             let mut req = commit_req("");
@@ -2772,7 +2992,7 @@ mod tests {
                 &repo,
                 &req,
                 &mut NullProgress,
-                &crate::progress::NeverCancel,
+                &crate::progress::CancelToken::never(),
             )
             .unwrap();
             let oid = resolve_ref(&repo.git_dir(), "refs/heads/main").unwrap();
@@ -2792,7 +3012,7 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         let mut req = commit_req("nope");
@@ -2801,10 +3021,10 @@ mod tests {
             &repo,
             &req,
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap_err();
-        assert!(matches!(err, Error::AmendUnborn));
+        assert!(matches!(err, Error::Commit(CommitError::AmendUnborn)));
     }
 
     #[test]
@@ -2817,14 +3037,14 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         create_commit(
             &repo,
             &commit_req("first"),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
 
@@ -2835,7 +3055,7 @@ mod tests {
             &repo,
             &req,
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         assert_eq!(outcome.changes, 0);
@@ -2854,14 +3074,14 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         create_commit(
             &repo,
             &commit_req("first"),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
 
@@ -2876,7 +3096,7 @@ mod tests {
             &commit_req("only a"),
             CommitScope::Staged,
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         assert_eq!(outcome.changes, 1);
@@ -2897,14 +3117,14 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         create_commit(
             &repo,
             &commit_req("initial"),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         bytes.push(b'y');
@@ -2913,13 +3133,9 @@ mod tests {
         let result = commit_with_scope(
             &repo,
             &commit_req("selected path"),
-            CommitScope::Paths(ResolvedPathspecs {
-                specs: vec!["large".into()],
-                sources: vec!["large".into()],
-                scoped: true,
-            }),
+            CommitScope::Paths(Pathspec::scoped(["large"], PathspecGlobalFlags::default())),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         assert_eq!(result.changes, 1);
@@ -2942,14 +3158,14 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         create_commit(
             &repo,
             &commit_req("initial"),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
 
@@ -2962,21 +3178,17 @@ mod tests {
                 ..StageOptions::default()
             },
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
 
-        let paths = ResolvedPathspecs {
-            specs: vec!["file".into()],
-            sources: vec!["file".into()],
-            scoped: true,
-        };
+        let paths = Pathspec::scoped(["file"], PathspecGlobalFlags::default());
         commit_with_scope(
             &repo,
             &commit_req("file only"),
             CommitScope::Paths(paths),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
 
@@ -2995,31 +3207,27 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         create_commit(
             &repo,
             &commit_req("first"),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
 
         fs::write(root.join("new.txt"), b"new\n").unwrap();
         fs::remove_file(root.join("tracked.txt")).unwrap();
 
-        let paths = ResolvedPathspecs {
-            specs: vec!["new.txt".into(), "tracked.txt".into()],
-            sources: vec!["new.txt".into(), "tracked.txt".into()],
-            scoped: true,
-        };
+        let paths = Pathspec::scoped(["new.txt", "tracked.txt"], PathspecGlobalFlags::default());
         commit_with_scope(
             &repo,
             &commit_req("add and remove"),
             CommitScope::Paths(paths),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
 
@@ -3083,13 +3291,12 @@ mod tests {
         commit_with_scope(
             &repo,
             &commit_req("partial"),
-            CommitScope::Paths(ResolvedPathspecs {
-                specs: specs.clone(),
-                sources: specs,
-                scoped: true,
-            }),
+            CommitScope::Paths(Pathspec::scoped(
+                specs.clone(),
+                PathspecGlobalFlags::default(),
+            )),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
 
@@ -3119,31 +3326,29 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         create_commit(
             &repo,
             &commit_req("first"),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
 
-        let paths = ResolvedPathspecs {
-            specs: vec!["missing.txt".into()],
-            sources: vec!["missing.txt".into()],
-            scoped: true,
-        };
-        let err = commit_with_scope(
+        let paths = Pathspec::scoped(["missing.txt"], PathspecGlobalFlags::default());
+        assert_commit_with_scope_err(
             &repo,
             &commit_req("nope"),
             CommitScope::Paths(paths),
-            &mut NullProgress,
-            &crate::progress::NeverCancel,
-        )
-        .unwrap_err();
-        assert!(matches!(err, Error::PathspecNoMatch { .. }));
+            |err| {
+                assert!(matches!(
+                    err,
+                    Error::Worktree(WorktreeError::PathspecNoMatch { .. })
+                ));
+            },
+        );
     }
 
     #[test]
@@ -3156,33 +3361,32 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         create_commit(
             &repo,
             &commit_req("first"),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         let tip = resolve_ref(&repo.git_dir(), "refs/heads/main").unwrap();
         fs::write(repo.git_dir().join("MERGE_HEAD"), format!("{tip}\n")).unwrap();
 
-        let paths = ResolvedPathspecs {
-            specs: vec!["a.txt".into()],
-            sources: vec!["a.txt".into()],
-            scoped: true,
-        };
+        let paths = Pathspec::scoped(["a.txt"], PathspecGlobalFlags::default());
         let err = commit_with_scope(
             &repo,
             &commit_req("partial"),
             CommitScope::Paths(paths),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap_err();
-        assert!(matches!(err, Error::PartialCommitDuringMerge));
+        assert!(matches!(
+            err,
+            crate::error::Error::Commit(CommitError::PartialCommitDuringMerge)
+        ));
     }
 
     fn system_git(root: &Path, args: &[&str]) -> String {
@@ -3231,12 +3435,201 @@ mod tests {
         Repository::discover(Some(root), &RepositoryOptions::empty()).unwrap()
     }
 
-    fn f1_paths() -> ResolvedPathspecs {
-        ResolvedPathspecs {
-            specs: vec!["f1.txt".into()],
-            sources: vec!["f1.txt".into()],
-            scoped: true,
+    #[cfg(unix)]
+    #[test]
+    #[cfg_attr(
+        not(feature = "full-tests"),
+        ignore = "starts system git or is heavy; run with --features full-tests"
+    )]
+    fn dry_run_files_match_commit_and_git_with_and_without_cache_tree() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for keep_cache_tree in [true, false] {
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path();
+            system_git(root, &["init", "-q", "-b", "main"]);
+            for dir in ["a", "b", "c", "e"] {
+                fs::create_dir(root.join(dir)).unwrap();
+            }
+            for (path, body) in [
+                ("a/x", "x\n"),
+                ("a/y", "y\n"),
+                ("b/z", "z\n"),
+                ("c/w", "w\n"),
+                ("e/keep", "keep\n"),
+                ("top", "top\n"),
+            ] {
+                fs::write(root.join(path), body).unwrap();
+            }
+            system_git(root, &["add", "."]);
+            system_git(root, &["commit", "-qm", "init"]);
+            let repo = Repository::discover(Some(root), &RepositoryOptions::empty()).unwrap();
+            let mut index = repo.load_index().unwrap();
+            assert!(index.cache_tree.is_some(), "git writes a cache-tree");
+            if !keep_cache_tree {
+                index.cache_tree = None;
+                index.cache_tree_root = None;
+                repo.write_index(&mut index).unwrap();
+            }
+
+            fs::write(root.join("a/x"), b"x changed\n").unwrap();
+            fs::remove_file(root.join("b/z")).unwrap();
+            fs::create_dir(root.join("d")).unwrap();
+            fs::write(root.join("d/new"), b"brand new\n").unwrap();
+            fs::write(root.join("added-top"), b"also new\n").unwrap();
+            let mut perms = fs::metadata(root.join("c/w")).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(root.join("c/w"), perms).unwrap();
+
+            let before = repo_snapshot(&repo);
+            let preview = commit_worktree(
+                &repo,
+                &dry_run_req("mixed"),
+                &mut NullProgress,
+                &crate::progress::CancelToken::never(),
+            )
+            .unwrap();
+            assert_eq!(repo_snapshot(&repo), before, "dry run must not write");
+            let listed: Vec<(&str, DiffStatus)> = preview
+                .files
+                .iter()
+                .map(|f| (f.path.as_str(), f.status))
+                .collect();
+            assert_eq!(
+                listed,
+                vec![
+                    ("a/x", DiffStatus::Modified),
+                    ("added-top", DiffStatus::Added),
+                    ("b/z", DiffStatus::Deleted),
+                    ("c/w", DiffStatus::Modified),
+                    ("d/new", DiffStatus::Added),
+                ],
+                "cache-tree kept: {keep_cache_tree}"
+            );
+            assert_eq!(preview.changes, preview.files.len());
+
+            let committed = commit_worktree(
+                &repo,
+                &commit_req("mixed"),
+                &mut NullProgress,
+                &crate::progress::CancelToken::never(),
+            )
+            .unwrap();
+            assert_eq!(committed.files, preview.files);
+            let git_listed = system_git(root, &["diff", "--name-status", "--no-renames", "HEAD~1"]);
+            let expected: Vec<String> = preview
+                .files
+                .iter()
+                .map(|f| format!("{}\t{}", f.status.letter(), f.path))
+                .collect();
+            assert_eq!(git_listed.lines().collect::<Vec<_>>(), expected);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dry_run_lists_non_utf8_paths_in_storage_form_like_commit() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let raw = |root: &Path, name: &[u8]| root.join(std::ffi::OsStr::from_bytes(name));
+        let check = |repo: &Repository, expected: &[(&[u8], DiffStatus)]| {
+            let preview = commit_worktree(
+                repo,
+                &dry_run_req("preview"),
+                &mut NullProgress,
+                &crate::progress::CancelToken::never(),
+            )
+            .unwrap();
+            let listed: Vec<(String, DiffStatus)> = preview
+                .files
+                .iter()
+                .map(|f| (f.path.clone(), f.status))
+                .collect();
+            let mut want: Vec<(String, DiffStatus)> = expected
+                .iter()
+                .map(|(p, s)| (crate::repo_relpath::storage_string(p), *s))
+                .collect();
+            want.sort_by(|a, b| a.0.cmp(&b.0));
+            assert_eq!(listed, want);
+            let committed = commit_worktree(
+                repo,
+                &commit_req("commit"),
+                &mut NullProgress,
+                &crate::progress::CancelToken::never(),
+            )
+            .unwrap();
+            assert_eq!(committed.files, preview.files);
+        };
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let repo = init_repo(root);
+        fs::create_dir(root.join("dir")).unwrap();
+        fs::write(raw(root, b"dir/keep\xff"), b"keep\n").unwrap();
+        fs::write(raw(root, b"dir/mod\xfe"), b"before\n").unwrap();
+        fs::write(raw(root, b"dir/del\xfd"), b"gone\n").unwrap();
+        fs::write(root.join("plain"), b"plain\n").unwrap();
+        commit_worktree(
+            &repo,
+            &commit_req("initial"),
+            &mut NullProgress,
+            &crate::progress::CancelToken::never(),
+        )
+        .unwrap();
+
+        fs::write(raw(root, b"dir/mod\xfe"), b"after\n").unwrap();
+        fs::remove_file(raw(root, b"dir/del\xfd")).unwrap();
+        fs::write(root.join("plain"), b"plain changed\n").unwrap();
+        check(
+            &repo,
+            &[
+                (b"dir/mod\xfe", DiffStatus::Modified),
+                (b"dir/del\xfd", DiffStatus::Deleted),
+                (b"plain", DiffStatus::Modified),
+            ],
+        );
+
+        fs::remove_file(raw(root, b"dir/keep\xff")).unwrap();
+        fs::remove_file(raw(root, b"dir/mod\xfe")).unwrap();
+        check(
+            &repo,
+            &[
+                (b"dir/keep\xff", DiffStatus::Deleted),
+                (b"dir/mod\xfe", DiffStatus::Deleted),
+            ],
+        );
+    }
+
+    #[test]
+    fn dry_run_root_commit_lists_every_index_path() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let repo = init_repo(root);
+        fs::create_dir(root.join("dir")).unwrap();
+        fs::write(root.join("dir/b"), b"b\n").unwrap();
+        fs::write(root.join("a"), b"a\n").unwrap();
+        let preview = commit_worktree(
+            &repo,
+            &dry_run_req("root"),
+            &mut NullProgress,
+            &crate::progress::CancelToken::never(),
+        )
+        .unwrap();
+        let listed: Vec<(&str, DiffStatus)> = preview
+            .files
+            .iter()
+            .map(|f| (f.path.as_str(), f.status))
+            .collect();
+        assert_eq!(
+            listed,
+            vec![("a", DiffStatus::Added), ("dir/b", DiffStatus::Added)]
+        );
+        assert!(preview.parents.is_empty());
+        assert!(resolve_ref(repo.git_dir(), "refs/heads/main").is_err());
+    }
+
+    fn f1_paths() -> Pathspec {
+        Pathspec::scoped(["f1.txt"], PathspecGlobalFlags::default())
     }
 
     /// Run `scope` while a foreign `index.lock` exists and check nothing became visible.
@@ -3259,14 +3652,14 @@ mod tests {
             &commit_req("x"),
             scope,
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap_err();
         match &err {
-            Error::LockHeld {
+            Error::LockHeld(crate::error::LockHeldError {
                 path: reported,
                 holder,
-            } => {
+            }) => {
                 assert_eq!(reported, &lock_path);
                 assert_eq!(*holder, None);
             }
@@ -3318,7 +3711,7 @@ mod tests {
             &commit_req("x"),
             CommitScope::Paths(f1_paths()),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         assert!(!repo.git_dir().join("index.lock").exists());
@@ -3345,18 +3738,12 @@ mod tests {
         let lock_path = repo.git_dir().join("index.lock");
         fs::write(&lock_path, b"foreign\n").unwrap();
         let tip_before = resolve_ref(&repo.git_dir(), "refs/heads/main").unwrap();
-        let err = commit_with_scope(
-            &repo,
-            &commit_req("x"),
-            CommitScope::Staged,
-            &mut NullProgress,
-            &crate::progress::NeverCancel,
-        )
-        .unwrap_err();
-        assert!(
-            matches!(&err, Error::LockHeld { path, .. } if *path == repo.git_dir().join("index.lock")),
-            "{err:?}"
-        );
+        assert_commit_with_scope_err(&repo, &commit_req("x"), CommitScope::Staged, |inner| {
+            assert!(
+                matches!(inner, Error::LockHeld(lock) if lock.path == repo.git_dir().join("index.lock")),
+                "{inner:?}"
+            );
+        });
         assert_eq!(
             resolve_ref(&repo.git_dir(), "refs/heads/main").unwrap(),
             tip_before
@@ -3370,7 +3757,7 @@ mod tests {
     )]
     #[test]
     fn scope_patch_with_held_index_lock_creates_nothing() {
-        use crate::diff::hunk_id::{hunk_ids_with_duplicate_peers, DiffSide};
+        use crate::diff::{hunk_ids, DiffSide};
         use crate::diff::{unstaged_file_diffs_with_peer_hunks, DiffOptions};
         use crate::porcelain::hunk_select::HunkSelection;
 
@@ -3379,7 +3766,7 @@ mod tests {
         let repo = git_repo_with_modified_file(root);
         let (files, peers) =
             unstaged_file_diffs_with_peer_hunks(&repo, &[], DiffOptions::default()).unwrap();
-        let ids = hunk_ids_with_duplicate_peers(
+        let ids = hunk_ids(
             DiffSide::Unstaged,
             "f1.txt",
             &files[0].hunks,
@@ -3399,7 +3786,7 @@ mod tests {
             &commit_req("x"),
             scope,
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         assert!(!repo.git_dir().join("index.lock").exists());
@@ -3446,13 +3833,12 @@ mod tests {
         commit_with_scope(
             &repo,
             &commit_req("partial"),
-            CommitScope::Paths(ResolvedPathspecs {
-                specs: specs.clone(),
-                sources: specs,
-                scoped: true,
-            }),
+            CommitScope::Paths(Pathspec::scoped(
+                specs.clone(),
+                PathspecGlobalFlags::default(),
+            )),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
 
@@ -3499,7 +3885,7 @@ mod tests {
             &repo,
             &commit_req("one file"),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
 
@@ -3553,7 +3939,7 @@ mod tests {
             &repo,
             &commit_req("many new files"),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
 
@@ -3612,7 +3998,7 @@ mod tests {
             &repo,
             &req,
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .is_err());
 
@@ -3653,7 +4039,7 @@ mod tests {
                 &commit_req("g"),
                 CommitScope::AutoStage,
                 &mut NullProgress,
-                &crate::progress::NeverCancel,
+                &crate::progress::CancelToken::never(),
             )
             .unwrap();
 
@@ -3799,7 +4185,7 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
 
@@ -3809,7 +4195,7 @@ mod tests {
             &repo,
             &req,
             &mut NullProgress,
-            &crate::progress::NeverCancel
+            &crate::progress::CancelToken::never()
         )
         .is_err());
 
@@ -3818,7 +4204,7 @@ mod tests {
             &repo,
             &req,
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         assert!(outcome.hooks_run.is_empty());
@@ -3841,14 +4227,14 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         let outcome = create_commit(
             &repo,
             &commit_req("after post"),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         assert_eq!(
@@ -3875,14 +4261,14 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         let outcome = create_commit(
             &repo,
             &commit_req("hooks"),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         assert_eq!(
@@ -3902,7 +4288,7 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         let mut req = commit_req("skip verify");
@@ -3911,7 +4297,7 @@ mod tests {
             &repo,
             &req,
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         assert_eq!(
@@ -3930,7 +4316,7 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         let mut req = commit_req("dated");
@@ -3939,7 +4325,7 @@ mod tests {
             &repo,
             &req,
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         assert_eq!(outcome.author.date, "946684800 +0000");
@@ -3955,7 +4341,7 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         let mut req = commit_req("trailers");
@@ -3967,7 +4353,7 @@ mod tests {
             &repo,
             &req,
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         let msg = parse_commit(&repo.odb().read(&outcome.oid).unwrap().data)
@@ -3986,7 +4372,7 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         let mut req = commit_req("signoff");
@@ -4000,7 +4386,7 @@ mod tests {
             &repo,
             &req,
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         let msg = parse_commit(&repo.odb().read(&outcome.oid).unwrap().data)
@@ -4019,7 +4405,7 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         let mut req = commit_req("subject\n");
@@ -4034,7 +4420,7 @@ mod tests {
             &repo,
             &req,
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         let msg = parse_commit(&repo.odb().read(&outcome.oid).unwrap().data)
@@ -4055,7 +4441,7 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         let mut source = commit_req("source subject\n");
@@ -4069,7 +4455,7 @@ mod tests {
             &repo,
             &source,
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
 
@@ -4078,7 +4464,7 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         let mut tip = commit_req("tip subject\n");
@@ -4091,7 +4477,7 @@ mod tests {
             &repo,
             &tip,
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
 
@@ -4100,7 +4486,7 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         let mut amend = commit_req("");
@@ -4111,7 +4497,7 @@ mod tests {
             &repo,
             &amend,
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         let author = author_info_from_commit(&repo, outcome.oid);
@@ -4134,7 +4520,7 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         let mut source = commit_req("source subject\n");
@@ -4147,7 +4533,7 @@ mod tests {
             &repo,
             &source,
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
 
@@ -4156,14 +4542,14 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         create_commit(
             &repo,
             &commit_req("tip"),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
 
@@ -4172,7 +4558,7 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         let mut amend = commit_req("");
@@ -4189,7 +4575,7 @@ mod tests {
             &repo,
             &amend,
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         let author = author_info_from_commit(&repo, outcome.oid);
@@ -4207,7 +4593,7 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         let mut first = commit_req("source");
@@ -4221,7 +4607,7 @@ mod tests {
             &repo,
             &first,
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
 
@@ -4230,7 +4616,7 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         let mut req = commit_req("");
@@ -4240,7 +4626,7 @@ mod tests {
             &repo,
             &req,
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         let author = author_info_from_commit(&repo, outcome.oid);
@@ -4259,7 +4645,7 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         let mut first = commit_req("source");
@@ -4268,7 +4654,7 @@ mod tests {
             &repo,
             &first,
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
 
@@ -4277,14 +4663,14 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         create_commit(
             &repo,
             &commit_req("second"),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
 
@@ -4301,7 +4687,7 @@ mod tests {
             &repo,
             &amend,
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         let author = author_info_from_commit(&repo, outcome.oid);
@@ -4345,14 +4731,14 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         let source = create_commit(
             &repo,
             &commit_req("source"),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         let source_data = parse_commit(&repo.odb().read(&source.oid).unwrap().data).unwrap();
@@ -4371,7 +4757,7 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         let mut req = commit_req("");
@@ -4381,7 +4767,7 @@ mod tests {
             &repo,
             &req,
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         let copy_data = parse_commit(&repo.odb().read(&copy.oid).unwrap().data).unwrap();
@@ -4399,14 +4785,14 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         let first = create_commit(
             &repo,
             &commit_req("first"),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
 
@@ -4415,14 +4801,14 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         let second = create_commit(
             &repo,
             &commit_req("second"),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
 
@@ -4436,14 +4822,14 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         let merge = create_commit(
             &repo,
             &commit_req("merge"),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         assert_eq!(merge.parents.len(), 2);
@@ -4467,7 +4853,7 @@ mod tests {
         let repo =
             Repository::open(&git, &RepositoryOptions::empty().with_work_tree(root)).unwrap();
         assert_eq!(
-            default_commit_scope_from_config(&repo.config().unwrap()),
+            default_commit_scope_from_config(&repo.config().snapshot().unwrap()),
             CommitScope::Staged
         );
     }
@@ -4482,29 +4868,25 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         create_commit(
             &repo,
             &commit_req("first"),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         fs::write(root.join("new.txt"), b"new\n").unwrap();
-        let paths = ResolvedPathspecs {
-            specs: vec!["new.txt".into()],
-            sources: vec!["new.txt".into()],
-            scoped: true,
-        };
+        let paths = Pathspec::scoped(["new.txt"], PathspecGlobalFlags::default());
         let before = repo_snapshot(&repo);
         let plan = plan_commit(
             &repo,
             &dry_run_req("add new"),
             CommitScope::Paths(paths),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         assert_eq!(plan.files.len(), 1);
@@ -4522,14 +4904,14 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         create_commit(
             &repo,
             &commit_req("first"),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         fs::write(root.join("a.txt"), b"2\n").unwrap();
@@ -4537,7 +4919,7 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         let mut req = dry_run_req("amend");
@@ -4552,7 +4934,7 @@ mod tests {
             &req,
             CommitScope::Staged,
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         assert_eq!(outcome.author.email, "o@example.com");
@@ -4586,7 +4968,7 @@ mod tests {
     }
 
     fn tree_blob(repo: &Repository, tree_oid: &ObjectId, path: &str) -> Vec<u8> {
-        for (p, _mode, oid) in flatten_tree_entries(repo.odb(), tree_oid).unwrap() {
+        for (p, _mode, oid) in crate::diff::flatten_tree_entries(repo.odb(), tree_oid).unwrap() {
             if p == path {
                 return repo.odb().read(&oid).unwrap().data;
             }
@@ -4596,7 +4978,7 @@ mod tests {
 
     #[test]
     fn commit_hunks_only_selected_in_tree() {
-        use crate::diff::hunk_id::{hunk_ids_with_duplicate_peers, DiffSide};
+        use crate::diff::{hunk_ids, DiffSide};
         use crate::diff::{unstaged_file_diffs_with_peer_hunks, DiffOptions};
         use crate::porcelain::hunk_select::HunkSelection;
 
@@ -4609,21 +4991,21 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         create_commit(
             &repo,
             &commit_req("init"),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         fs::write(root.join("f.txt"), edited).unwrap();
 
         let (files, peers) =
             unstaged_file_diffs_with_peer_hunks(&repo, &[], DiffOptions::default()).unwrap();
-        let ids = hunk_ids_with_duplicate_peers(
+        let ids = hunk_ids(
             DiffSide::Unstaged,
             "f.txt",
             &files[0].hunks,
@@ -4638,7 +5020,7 @@ mod tests {
             }),
             &[],
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
 
@@ -4661,7 +5043,7 @@ mod tests {
     )]
     #[test]
     fn commit_hunks_leaves_other_unstaged() {
-        use crate::diff::hunk_id::{hunk_ids_with_duplicate_peers, DiffSide};
+        use crate::diff::{hunk_ids, DiffSide};
         use crate::diff::{unstaged_file_diffs_with_peer_hunks, DiffOptions};
         use crate::porcelain::hunk_select::HunkSelection;
 
@@ -4674,21 +5056,21 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         create_commit(
             &repo,
             &commit_req("init"),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         fs::write(root.join("f.txt"), edited).unwrap();
 
         let (files, peers) =
             unstaged_file_diffs_with_peer_hunks(&repo, &[], DiffOptions::default()).unwrap();
-        let ids = hunk_ids_with_duplicate_peers(
+        let ids = hunk_ids(
             DiffSide::Unstaged,
             "f.txt",
             &files[0].hunks,
@@ -4703,7 +5085,7 @@ mod tests {
             }),
             &[],
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
 
@@ -4787,7 +5169,7 @@ mod tests {
     )]
     #[test]
     fn commit_patch_file_matches_git_apply_cached_then_commit() {
-        use crate::diff::hunk_id::{hunk_ids_with_duplicate_peers, DiffSide};
+        use crate::diff::{hunk_ids, DiffSide};
         use crate::diff::{unstaged_file_diffs_with_peer_hunks, DiffOptions};
         use crate::porcelain::hunk_select::{resolve_selection, HunkSelection};
 
@@ -4800,21 +5182,21 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         create_commit(
             &repo,
             &commit_req("init"),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         fs::write(root.join("f.txt"), edited.clone()).unwrap();
 
         let (files, peers) =
             unstaged_file_diffs_with_peer_hunks(&repo, &[], DiffOptions::default()).unwrap();
-        let ids = hunk_ids_with_duplicate_peers(
+        let ids = hunk_ids(
             DiffSide::Unstaged,
             "f.txt",
             &files[0].hunks,
@@ -4839,7 +5221,7 @@ mod tests {
             CommitPatchInput::Patches(patch),
             &[],
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         let grit_tip = resolve_ref(&repo.git_dir(), "refs/heads/main").unwrap();
@@ -4875,7 +5257,7 @@ mod tests {
 
     #[test]
     fn commit_patch_dry_run_writes_no_loose_objects() {
-        use crate::diff::hunk_id::{hunk_ids_with_duplicate_peers, DiffSide};
+        use crate::diff::{hunk_ids, DiffSide};
         use crate::diff::{unstaged_file_diffs_with_peer_hunks, DiffOptions};
         use crate::porcelain::hunk_select::{resolve_selection, HunkSelection};
 
@@ -4888,14 +5270,14 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         create_commit(
             &repo,
             &commit_req("init"),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         fs::write(root.join("f.txt"), edited).unwrap();
@@ -4903,7 +5285,7 @@ mod tests {
         let before_loose = loose_object_count(&repo);
         let (files, peers) =
             unstaged_file_diffs_with_peer_hunks(&repo, &[], DiffOptions::default()).unwrap();
-        let ids = hunk_ids_with_duplicate_peers(
+        let ids = hunk_ids(
             DiffSide::Unstaged,
             "f.txt",
             &files[0].hunks,
@@ -4931,7 +5313,7 @@ mod tests {
             CommitPatchInput::Patches(patch),
             &[],
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
 
@@ -4945,7 +5327,7 @@ mod tests {
 
     #[test]
     fn commit_hunks_stale_id_no_commit() {
-        use crate::diff::hunk_id::HunkId;
+        use crate::diff::HunkId;
         use crate::porcelain::hunk_select::HunkSelection;
 
         let tmp = TempDir::new().unwrap();
@@ -4956,14 +5338,14 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         create_commit(
             &repo,
             &commit_req("init"),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         let before_tip = resolve_ref(&repo.git_dir(), "refs/heads/main").unwrap();
@@ -4979,10 +5361,13 @@ mod tests {
             }),
             &[],
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap_err();
-        assert!(matches!(err, CommitPatchError::Select(_)));
+        assert!(matches!(
+            err,
+            crate::error::Error::Commit(CommitError::HunkSelect(_))
+        ));
         assert_eq!(
             resolve_ref(&repo.git_dir(), "refs/heads/main").unwrap(),
             before_tip
@@ -4992,7 +5377,7 @@ mod tests {
 
     #[test]
     fn commit_with_scope_stale_hunk_id_is_typed() {
-        use crate::diff::hunk_id::HunkId;
+        use crate::diff::HunkId;
         use crate::porcelain::hunk_select::{HunkSelectError, HunkSelection};
 
         let tmp = TempDir::new().unwrap();
@@ -5004,7 +5389,7 @@ mod tests {
             &commit_req("first"),
             CommitScope::AutoStage,
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         let before_tip = resolve_ref(&repo.git_dir(), "refs/heads/main").unwrap();
@@ -5023,11 +5408,16 @@ mod tests {
                 pathspecs: Vec::new(),
             },
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap_err();
         match &err {
-            Error::HunkSelection(HunkSelectError::StaleId { id, .. }) => assert_eq!(id, &stale),
+            crate::error::Error::Commit(CommitError::HunkSelect(HunkSelectError::StaleId {
+                id,
+                ..
+            })) => {
+                assert_eq!(id, &stale)
+            }
             other => panic!("expected stale hunk id error, got {other:?}"),
         }
         assert_eq!(err.to_string(), "stale hunk id 000000000000");
@@ -5049,18 +5439,18 @@ mod tests {
                 pathspecs: Vec::new(),
             },
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap_err();
         assert!(matches!(
             plan_err,
-            Error::HunkSelection(HunkSelectError::StaleId { .. })
+            Error::Commit(CommitError::HunkSelect(HunkSelectError::StaleId { .. }))
         ));
     }
 
     #[test]
     fn commit_with_scope_patch_apply_failure_is_typed() {
-        use crate::diff::hunk_id::{hunk_ids_with_duplicate_peers, DiffSide};
+        use crate::diff::{hunk_ids, DiffSide};
         use crate::diff::{unstaged_file_diffs_with_peer_hunks, DiffOptions};
         use crate::porcelain::hunk_select::{resolve_selection, HunkSelection};
 
@@ -5073,21 +5463,21 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         create_commit(
             &repo,
             &commit_req("init"),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         fs::write(root.join("f.txt"), edited).unwrap();
 
         let (files, peers) =
             unstaged_file_diffs_with_peer_hunks(&repo, &[], DiffOptions::default()).unwrap();
-        let ids = hunk_ids_with_duplicate_peers(
+        let ids = hunk_ids(
             DiffSide::Unstaged,
             "f.txt",
             &files[0].hunks,
@@ -5113,7 +5503,7 @@ mod tests {
             &commit_req("first hunk"),
             patch_scope(patch.clone()),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         let before_tip = resolve_ref(&repo.git_dir(), "refs/heads/main").unwrap();
@@ -5124,10 +5514,13 @@ mod tests {
             &commit_req("again"),
             patch_scope(patch),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap_err();
-        assert!(matches!(err, Error::Apply(_)), "got {err:?}");
+        assert!(
+            matches!(err, crate::error::Error::Commit(CommitError::PatchApply(_))),
+            "got {err:?}"
+        );
         assert_eq!(err.kind_name(), "apply");
         assert_eq!(
             resolve_ref(&repo.git_dir(), "refs/heads/main").unwrap(),
@@ -5146,7 +5539,7 @@ mod tests {
             &commit_req("first"),
             CommitScope::AutoStage,
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         let before_tip = resolve_ref(&repo.git_dir(), "refs/heads/main").unwrap();
@@ -5155,17 +5548,85 @@ mod tests {
         let err = commit_with_scope(
             &repo,
             &commit_req("x"),
-            CommitScope::Paths(ResolvedPathspecs::default()),
+            CommitScope::Paths(Pathspec::entire_tree(PathspecGlobalFlags::default())),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap_err();
-        assert!(matches!(err, Error::CommitPathsRequired), "got {err:?}");
+        assert!(
+            matches!(
+                err,
+                crate::error::Error::Commit(CommitError::CommitPathsRequired)
+            ),
+            "got {err:?}"
+        );
         assert_eq!(err.to_string(), "you must specify path(s)");
         assert_eq!(err.kind_name(), "commit_paths_required");
         assert_eq!(
             resolve_ref(&repo.git_dir(), "refs/heads/main").unwrap(),
             before_tip
         );
+    }
+
+    fn init_nested_git_repo(inner: &Path) {
+        Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(inner)
+            .output()
+            .expect("git init nested");
+        Command::new("git")
+            .args(["config", "user.email", "t@example.com"])
+            .current_dir(inner)
+            .output()
+            .expect("git config email");
+        Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(inner)
+            .output()
+            .expect("git config name");
+        fs::write(inner.join("inside.txt"), b"inside\n").expect("write nested file");
+        Command::new("git")
+            .args(["add", "inside.txt"])
+            .current_dir(inner)
+            .output()
+            .expect("git add nested");
+        Command::new("git")
+            .args(["commit", "-qm", "nested"])
+            .current_dir(inner)
+            .output()
+            .expect("git commit nested");
+    }
+
+    #[test]
+    fn commit_worktree_dry_run_reports_embedded_gitlink() {
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        let repo = init_repo(dir.path());
+        fs::write(dir.path().join("a"), b"a\n").unwrap();
+        commit_worktree(
+            &repo,
+            &commit_req("seed"),
+            &mut NullProgress,
+            &crate::progress::CancelToken::never(),
+        )
+        .expect("seed commit");
+
+        let vendor = dir.path().join("vendor");
+        fs::create_dir_all(&vendor).unwrap();
+        init_nested_git_repo(&vendor);
+
+        let mut req = commit_req("nested\n");
+        req.dry_run = true;
+        req.hooks = HookPolicy::SkipVerify;
+        let outcome = commit_worktree(
+            &repo,
+            &req,
+            &mut NullProgress,
+            &crate::progress::CancelToken::never(),
+        )
+        .expect("dry-run commit with embedded repo");
+        assert_eq!(outcome.embedded_gitlinks, vec!["vendor".to_owned()]);
     }
 }

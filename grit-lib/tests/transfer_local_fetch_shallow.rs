@@ -8,8 +8,7 @@ use grit_test_support::rev_parse;
 use std::path::Path;
 use std::process::Command;
 
-use grit_lib::refs::resolve_ref;
-use grit_lib::remote::transfer::{fetch_local, FetchDepth, FetchOptions, TagMode, UpdateMode};
+use grit_lib::remote::transfer::{FetchDepth, FetchOptions, TagMode, UpdateMode};
 use grit_test_support::git;
 
 fn git_fsck_clean(work_tree: &Path) {
@@ -60,23 +59,44 @@ fn fetch_local_in_git_shallow_clone_does_not_create_broken_tags() {
     );
 
     let shallow_git = shallow.join(".git");
-    let opts = FetchOptions {
-        refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()],
-        tags: TagMode::Following,
-        ..Default::default()
-    };
-    fetch_local(&shallow_git, &bare, &opts).expect("fetch_local");
+    let mut opts = FetchOptions::new();
+    opts.refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()];
+    opts.tags = TagMode::Following;
+    grit_lib::repo::Repository::open(
+        &shallow_git,
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Local(&bare),
+        &mut opts.clone(),
+        &mut grit_lib::remote::fetch::NoProgress,
+        grit_lib::progress::CancelToken::never_ref(),
+    )
+    .expect("fetch_local");
 
     assert!(
-        resolve_ref(&shallow_git, "refs/tags/v1").is_err(),
+        grit_test_support::refs::at(&shallow_git)
+            .references()
+            .resolve("refs/tags/v1")
+            .is_err(),
         "v1 must not be created in a depth-1 shallow clone"
     );
     assert!(
-        resolve_ref(&shallow_git, "refs/tags/v2").is_err(),
+        grit_test_support::refs::at(&shallow_git)
+            .references()
+            .resolve("refs/tags/v2")
+            .is_err(),
         "v2 must not be created in a depth-1 shallow clone"
     );
     assert_eq!(
-        resolve_ref(&shallow_git, "refs/tags/v3").expect("v3"),
+        grit_test_support::refs::at(&shallow_git)
+            .references()
+            .resolve("refs/tags/v3")
+            .expect("v3"),
         rev_parse(&shallow, "HEAD")
     );
 
@@ -111,25 +131,42 @@ fn fetch_local_clone_from_shallow_source_propagates_shallow_file() {
     git(&dest, &["init", "-q", "-b", "main", "."]);
     let dest_git = dest.join(".git");
 
-    let opts = FetchOptions {
-        refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()],
-        tags: TagMode::Following,
-        initial_remote_fetch: true,
-        remote_name: Some("origin".to_owned()),
-        ..Default::default()
-    };
-    fetch_local(&dest_git, &shallow_src.join(".git"), &opts).expect("fetch_local from shallow");
+    let mut opts = FetchOptions::new().initial_remote_fetch(true);
+    opts.refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()];
+    opts.tags = TagMode::Following;
+    opts.remote_name = Some("origin".to_owned());
+    grit_lib::repo::Repository::open(
+        &dest_git,
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Local(&shallow_src.join(".git")),
+        &mut opts.clone(),
+        &mut grit_lib::remote::fetch::NoProgress,
+        grit_lib::progress::CancelToken::never_ref(),
+    )
+    .expect("fetch_local from shallow");
 
     assert!(
         dest_git.join("shallow").is_file(),
         "clone fetch must copy shallow boundaries from a shallow source"
     );
     assert_eq!(
-        resolve_ref(&dest_git, "refs/tags/v3").expect("v3 on shallow clone"),
+        grit_test_support::refs::at(&dest_git)
+            .references()
+            .resolve("refs/tags/v3")
+            .expect("v3 on shallow clone"),
         rev_parse(&shallow_src, "HEAD")
     );
     assert!(
-        resolve_ref(&dest_git, "refs/tags/v1").is_err(),
+        grit_test_support::refs::at(&dest_git)
+            .references()
+            .resolve("refs/tags/v1")
+            .is_err(),
         "v1 must not be imported from a depth-1 source"
     );
     let log = git(&dest, &["log", "--oneline", "refs/remotes/origin/main"]);
@@ -164,16 +201,23 @@ fn fetch_local_initial_fetch_following_imports_reachable_tags() {
     let local_git = local.join(".git");
     let upstream_git = upstream.join(".git");
 
-    fetch_local(
+    let mut fetch_opts = FetchOptions::new().initial_remote_fetch(true);
+    fetch_opts.refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()];
+    fetch_opts.tags = TagMode::Following;
+    fetch_opts.remote_name = Some("origin".to_owned());
+    grit_lib::repo::Repository::open(
         &local_git,
-        &upstream_git,
-        &FetchOptions {
-            refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()],
-            tags: TagMode::Following,
-            initial_remote_fetch: true,
-            remote_name: Some("origin".to_owned()),
-            ..Default::default()
-        },
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&fetch_opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Local(&upstream_git),
+        &mut fetch_opts.clone(),
+        &mut grit_lib::remote::fetch::NoProgress,
+        grit_lib::progress::CancelToken::never_ref(),
     )
     .expect("initial fetch");
 
@@ -182,7 +226,10 @@ fn fetch_local_initial_fetch_following_imports_reachable_tags() {
         "refs/tags/lightweight-tip",
         "refs/tags/on-topic",
     ] {
-        resolve_ref(&local_git, tag).unwrap_or_else(|_| panic!("missing {tag}"));
+        grit_test_support::refs::at(&local_git)
+            .references()
+            .resolve(tag)
+            .unwrap_or_else(|_| panic!("missing {tag}"));
     }
     git_fsck_clean(&local);
 }
@@ -250,15 +297,23 @@ fn unshallow_follows_historical_tags_in_one_fetch() {
     let client = depth_one_client(tmp.path(), &source, "client");
     let comparison = depth_one_client(tmp.path(), &source, "comparison");
     git(&comparison, &["fetch", "--unshallow"]);
-    let outcome = fetch_local(
+    let mut fetch_opts = FetchOptions::new();
+    fetch_opts.refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".into()];
+    fetch_opts.tags = TagMode::Following;
+    fetch_opts.fetch_depth = Some(FetchDepth::Unshallow);
+    let outcome = grit_lib::repo::Repository::open(
         &client.join(".git"),
-        &source,
-        &FetchOptions {
-            refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".into()],
-            tags: TagMode::Following,
-            fetch_depth: Some(FetchDepth::Unshallow),
-            ..Default::default()
-        },
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&fetch_opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Local(&source),
+        &mut fetch_opts.clone(),
+        &mut grit_lib::remote::fetch::NoProgress,
+        grit_lib::progress::CancelToken::never_ref(),
     )
     .unwrap();
     assert_tag_history_matches_git(&client, &comparison);
@@ -346,20 +401,31 @@ fn shallow_tag_following_uses_requested_history_and_tag_mode() {
         let mut git_args = vec!["fetch"];
         git_args.extend(args);
         git(&comparison, &git_args);
-        fetch_local(
+        let mut fetch_opts = FetchOptions::new();
+        fetch_opts.refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".into()];
+        fetch_opts.fetch_depth = fetch_depth;
+        fetch_opts.tags = tags;
+        grit_lib::repo::Repository::open(
             &client.join(".git"),
-            &source,
-            &FetchOptions {
-                refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".into()],
-                fetch_depth,
-                tags,
-                ..Default::default()
-            },
+            &grit_lib::config::environment::RepositoryOptions::with_environment(
+                (&fetch_opts).environment.clone(),
+            ),
+        )
+        .expect("open fetch target")
+        .remotes()
+        .fetch_from(
+            grit_lib::remote::transfer::TransferEndpoint::Local(&source),
+            &mut fetch_opts.clone(),
+            &mut grit_lib::remote::fetch::NoProgress,
+            grit_lib::progress::CancelToken::never_ref(),
         )
         .unwrap();
         assert_tag_history_matches_git(&client, &comparison);
         if tags == TagMode::Following {
-            assert!(resolve_ref(&client.join(".git"), "refs/tags/side-tag").is_err());
+            assert!(grit_test_support::refs::at(&client.join(".git"))
+                .references()
+                .resolve("refs/tags/side-tag")
+                .is_err());
         }
     }
 }
@@ -385,15 +451,23 @@ fn unshallow_follows_tags_only_as_far_as_shallow_source_can_supply() {
     let client = depth_one_client(tmp.path(), &source, "client");
     let comparison = depth_one_client(tmp.path(), &source, "comparison");
     git(&comparison, &["fetch", "--unshallow"]);
-    fetch_local(
+    let mut fetch_opts = FetchOptions::new();
+    fetch_opts.refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".into()];
+    fetch_opts.tags = TagMode::Following;
+    fetch_opts.fetch_depth = Some(FetchDepth::Unshallow);
+    grit_lib::repo::Repository::open(
         &client.join(".git"),
-        &source,
-        &FetchOptions {
-            refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".into()],
-            tags: TagMode::Following,
-            fetch_depth: Some(FetchDepth::Unshallow),
-            ..Default::default()
-        },
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&fetch_opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Local(&source),
+        &mut fetch_opts.clone(),
+        &mut grit_lib::remote::fetch::NoProgress,
+        grit_lib::progress::CancelToken::never_ref(),
     )
     .unwrap();
     assert_tag_history_matches_git(&client, &comparison);
@@ -409,7 +483,7 @@ fn unshallow_preserves_negative_refspecs_and_existing_tags() {
     build_historical_tag_source(&source);
     for existing in [false, true] {
         let client = depth_one_client(tmp.path(), &source, &format!("client-{existing}"));
-        let mut refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".into()];
+        let mut refspecs: Vec<String> = vec!["+refs/heads/*:refs/remotes/origin/*".into()];
         if existing {
             git(&client, &["tag", "v1", "HEAD"]);
             git(&client, &["tag", "shared-tip", "HEAD"]);
@@ -417,15 +491,23 @@ fn unshallow_preserves_negative_refspecs_and_existing_tags() {
         } else {
             refspecs.push("^refs/tags/v1".into());
         }
-        let outcome = fetch_local(
+        let mut fetch_opts = FetchOptions::new();
+        fetch_opts.refspecs = refspecs;
+        fetch_opts.tags = TagMode::Following;
+        fetch_opts.fetch_depth = Some(FetchDepth::Unshallow);
+        let outcome = grit_lib::repo::Repository::open(
             &client.join(".git"),
-            &source,
-            &FetchOptions {
-                refspecs,
-                tags: TagMode::Following,
-                fetch_depth: Some(FetchDepth::Unshallow),
-                ..Default::default()
-            },
+            &grit_lib::config::environment::RepositoryOptions::with_environment(
+                (&fetch_opts).environment.clone(),
+            ),
+        )
+        .expect("open fetch target")
+        .remotes()
+        .fetch_from(
+            grit_lib::remote::transfer::TransferEndpoint::Local(&source),
+            &mut fetch_opts.clone(),
+            &mut grit_lib::remote::fetch::NoProgress,
+            grit_lib::progress::CancelToken::never_ref(),
         )
         .unwrap();
         if existing {
@@ -454,7 +536,10 @@ fn unshallow_preserves_negative_refspecs_and_existing_tags() {
                 .updates
                 .iter()
                 .any(|u| u.remote_ref == "refs/tags/v1"));
-            assert!(resolve_ref(&client.join(".git"), "refs/tags/v1").is_err());
+            assert!(grit_test_support::refs::at(&client.join(".git"))
+                .references()
+                .resolve("refs/tags/v1")
+                .is_err());
         }
         assert_eq!(
             rev_parse(&client, "refs/tags/v2"),
@@ -462,4 +547,125 @@ fn unshallow_preserves_negative_refspecs_and_existing_tags() {
         );
         git(&client, &["fsck", "--strict"]);
     }
+}
+
+fn count_pack_files(git_dir: &Path) -> usize {
+    std::fs::read_dir(git_dir.join("objects/pack"))
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .filter(|e| e.path().extension().is_some_and(|x| x == "pack"))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// Shallow local fetch then `--unshallow` over a repacked multi-commit remote with on-disk
+/// deltas must transfer history, stay fsck-clean, and match system `git`.
+#[test]
+fn unshallow_from_repacked_remote_with_deltas_matches_git() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let remote_wt = tmp.path().join("remote-wt");
+    std::fs::create_dir_all(&remote_wt).unwrap();
+    git(&remote_wt, &["init", "-q", "-b", "main", "."]);
+    for i in 0..8 {
+        let mut body = String::from("shared prefix for delta reuse\n");
+        body.push_str(&"x".repeat(2048));
+        body.push_str(&format!("-{i}\n"));
+        std::fs::write(remote_wt.join("blob.txt"), body).unwrap();
+        git(&remote_wt, &["add", "blob.txt"]);
+        git(
+            &remote_wt,
+            &["commit", "-qm", &format!("similar blobs {i}")],
+        );
+    }
+    git(
+        &remote_wt,
+        &[
+            "repack",
+            "-q",
+            "-a",
+            "-d",
+            "-f",
+            "--window=10",
+            "--depth=50",
+        ],
+    );
+    let remote_git = remote_wt.join(".git");
+    assert_eq!(
+        git(&remote_wt, &["rev-list", "--count", "HEAD"]).trim(),
+        "8",
+        "fixture must have eight commits"
+    );
+
+    let shallow = tmp.path().join("shallow");
+    git(
+        tmp.path(),
+        &[
+            "clone",
+            "-q",
+            "--depth",
+            "1",
+            &format!("file://{}", remote_git.display()),
+            shallow.to_str().unwrap(),
+        ],
+    );
+    let shallow_git = shallow.join(".git");
+    assert!(shallow_git.join("shallow").is_file());
+    assert_eq!(git(&shallow, &["rev-list", "--count", "HEAD"]).trim(), "1");
+    let packs_before = count_pack_files(&shallow_git);
+
+    let comparison = tmp.path().join("comparison");
+    git(
+        tmp.path(),
+        &[
+            "clone",
+            "-q",
+            "--depth",
+            "1",
+            &format!("file://{}", remote_git.display()),
+            comparison.to_str().unwrap(),
+        ],
+    );
+    git(&comparison, &["fetch", "--unshallow"]);
+
+    let mut fetch_opts = FetchOptions::new();
+    fetch_opts.refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".into()];
+    fetch_opts.fetch_depth = Some(FetchDepth::Unshallow);
+    let outcome = grit_lib::repo::Repository::open(
+        &shallow_git,
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&fetch_opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Local(&remote_git),
+        &mut fetch_opts.clone(),
+        &mut grit_lib::remote::fetch::NoProgress,
+        grit_lib::progress::CancelToken::never_ref(),
+    )
+    .expect("unshallow fetch_local");
+    assert!(
+        outcome.transfer.objects > 0,
+        "unshallow must install objects from the remote; got {:?}",
+        outcome.transfer
+    );
+    assert!(
+        count_pack_files(&shallow_git) > packs_before,
+        "unshallow must add at least one pack"
+    );
+
+    assert!(
+        !shallow_git.join("shallow").exists(),
+        "unshallow must remove shallow boundaries"
+    );
+    assert_eq!(
+        git(&shallow, &["rev-list", "--count", "HEAD"]).trim(),
+        git(&comparison, &["rev-list", "--count", "HEAD"]).trim(),
+        "history depth must match git after unshallow"
+    );
+    assert_eq!(git(&shallow, &["rev-list", "--count", "HEAD"]).trim(), "8");
+    git_fsck_clean(&shallow);
+    git_fsck_clean(&comparison);
 }

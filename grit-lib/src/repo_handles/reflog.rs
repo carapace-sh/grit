@@ -1,5 +1,6 @@
 //! Reflog listing, deletion, and expiry for one [`Repository`](crate::repo::Repository).
 
+use crate::error::RefError;
 use std::ops::ControlFlow;
 
 use crate::error::{Error, Result};
@@ -9,7 +10,8 @@ use crate::reflog::{
     read_reflog_on_store, reflog_identity_timestamp, reflog_refs_on_store, MessageMatcher,
     ReflogEntry, ReflogExpireParams, ReflogExpireResult, ReflogExpiryCache,
 };
-use crate::refs::store::{RefName, RefStore};
+use crate::refs::append_reflog_on_store;
+use crate::refs::store::{RefName, RefNameRef, RefStore};
 use crate::repo::Repository;
 use crate::worktree_ref::resolve_ref_dwim;
 
@@ -81,10 +83,23 @@ pub struct ReflogPage {
     pub truncated: bool,
 }
 
+/// When [`RepositoryReflogs::append`] may start a reflog that does not exist yet.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ReflogCreate {
+    /// Append only when the reflog already exists or `core.logAllRefUpdates` allows creating
+    /// one for this ref (branches, remote-tracking refs, notes and `HEAD` by default in a
+    /// repository with a work tree; every ref with `always`).
+    #[default]
+    IfAllowed,
+    /// Create the reflog when it is missing, whatever `core.logAllRefUpdates` says.
+    Always,
+}
+
 /// Reflog read/write helpers scoped to an open repository.
 ///
 /// Every operation reads and rewrites reflogs through the repository's ref store
-/// ([`Repository::refs`]), so a repository opened with an injected
+/// ([`Repository::ref_store`]), so a repository opened with an injected
 /// [`RefStore`](crate::refs::store::RefStore) lists, deletes and expires the reflog that
 /// store holds, exactly like the files and reftable backends.
 #[derive(Debug, Copy, Clone)]
@@ -108,15 +123,88 @@ impl<'repo> RepositoryReflogs<'repo> {
     /// # Errors
     ///
     /// Propagates ref-store and I/O errors while scanning logs.
-    pub fn refs(&self) -> Result<Vec<RefName>> {
+    pub fn list_reflog_refs(&self) -> Result<Vec<RefName>> {
         Ok(reflog_refs_on_store(self.store())?
             .iter()
-            .filter_map(|name| RefName::try_from(name.as_str()).ok())
+            .map(RefName::from_trusted)
             .collect())
     }
 
     fn store(&self) -> &'repo dyn RefStore {
-        self.repo.refs()
+        self.repo.ref_store()
+    }
+
+    /// Whether `ref_name` has a reflog in the repository's ref store (an empty one counts).
+    ///
+    /// # Errors
+    ///
+    /// Propagates ref-store and I/O errors.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # fn main() -> grit_lib::error::Result<()> {
+    /// use grit_lib::repo::{InitOptions, Repository};
+    /// let dir = tempfile::tempdir()?;
+    /// let (repo, _) = Repository::init(dir.path(), &InitOptions::default())?;
+    /// assert!(!repo.reflogs().exists("refs/heads/main")?);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn exists(&self, ref_name: impl AsRef<RefNameRef>) -> Result<bool> {
+        self.store().reflog_exists(ref_name.as_ref())
+    }
+
+    /// Append `entry` to the reflog of `ref_name` without moving the ref.
+    ///
+    /// [`ReflogEntry::identity`] is a full `Name <email> <epoch> <tz>` line; `old_oid` and
+    /// `new_oid` are recorded as given (a zero id for a ref that did not exist). Whether a
+    /// missing reflog is started follows `create`.
+    ///
+    /// # Errors
+    ///
+    /// [`ObjectError::InvalidSignature`](crate::error::ObjectError::InvalidSignature) for an identity or message that would corrupt the log
+    /// line, [`RefError::Invalid`](crate::error::RefError::Invalid) when `ref_name` is not safe to store, and lock and I/O
+    /// failures from the ref backend.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # fn main() -> grit_lib::error::Result<()> {
+    /// use grit_lib::objects::ObjectId;
+    /// use grit_lib::refs::reflog::ReflogEntry;
+    /// use grit_lib::repo::{InitOptions, Repository};
+    /// use grit_lib::repo_handles::ReflogCreate;
+    /// let dir = tempfile::tempdir()?;
+    /// let (repo, _) = Repository::init(dir.path(), &InitOptions::default())?;
+    /// let entry = ReflogEntry {
+    ///     old_oid: ObjectId::zero(),
+    ///     new_oid: ObjectId::zero(),
+    ///     identity: "Doc <doc@example.com> 1700000000 +0000".to_owned(),
+    ///     message: "note".to_owned(),
+    /// };
+    /// repo.reflogs().append("refs/notes/demo", &entry, ReflogCreate::Always)?;
+    /// assert!(repo.reflogs().exists("refs/notes/demo")?);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn append(
+        &self,
+        ref_name: impl AsRef<RefNameRef>,
+        entry: &ReflogEntry,
+        create: ReflogCreate,
+    ) -> Result<()> {
+        let config = self.repo.config().snapshot()?;
+        append_reflog_on_store(
+            self.store(),
+            ref_name.as_ref().as_str(),
+            &entry.old_oid,
+            &entry.new_oid,
+            &entry.identity,
+            &entry.message,
+            create == ReflogCreate::Always,
+            config.as_ref(),
+        )
     }
 
     /// Reflog entries for `ref_name`, newest first with indices starting at `0`.
@@ -125,7 +213,7 @@ impl<'repo> RepositoryReflogs<'repo> {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::ReflogUnknownRef`] when the ref cannot be resolved and has no reflog.
+    /// Returns [`crate::error::RefError::ReflogUnknownRef`] when the ref cannot be resolved and has no reflog.
     pub fn entries(&self, ref_name: &RefName) -> Result<Vec<IndexedReflogEntry>> {
         let page = self.query(ref_name, &ReflogQuery::default())?;
         Ok(page.entries)
@@ -138,7 +226,7 @@ impl<'repo> RepositoryReflogs<'repo> {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::ReflogUnknownRef`] when the ref cannot be resolved and has no reflog.
+    /// Returns [`crate::error::RefError::ReflogUnknownRef`] when the ref cannot be resolved and has no reflog.
     pub fn query(&self, ref_name: &RefName, query: &ReflogQuery) -> Result<ReflogPage> {
         let canonical = self.resolve_reflog_canonical(ref_name.as_str())?;
         if query.limit == Some(0) {
@@ -154,12 +242,15 @@ impl<'repo> RepositoryReflogs<'repo> {
             truncated: false,
         };
         let mut index = 0usize;
-        self.store()
-            .for_each_reflog_entry(&canonical, true, &mut |entry| {
+        self.store().for_each_reflog_entry_str(
+            RefNameRef::from_trusted(&canonical),
+            true,
+            &mut |entry| {
                 let flow = state.visit(index, entry);
                 index += 1;
                 flow
-            })?;
+            },
+        )?;
         Ok(ReflogPage {
             entries: state.entries,
             truncated: state.truncated,
@@ -182,8 +273,8 @@ impl<'repo> RepositoryReflogs<'repo> {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::ReflogIndexOutOfRange`] when any index is out of range, or
-    /// [`Error::ReflogUnknownRef`] when the ref does not exist.
+    /// Returns [`crate::error::RefError::ReflogIndexOutOfRange`] when any index is out of range, or
+    /// [`crate::error::RefError::ReflogUnknownRef`] when the ref does not exist.
     pub fn delete(&self, ref_name: &RefName, indices: &[usize], rewrite: bool) -> Result<()> {
         if indices.is_empty() {
             return Ok(());
@@ -192,10 +283,10 @@ impl<'repo> RepositoryReflogs<'repo> {
         let len = entries.len();
         for &idx in indices {
             if idx >= len {
-                return Err(Error::ReflogIndexOutOfRange {
+                return Err(Error::Ref(RefError::ReflogIndexOutOfRange {
                     refname: canonical,
                     index: idx,
-                });
+                }));
             }
         }
         if rewrite {
@@ -211,7 +302,7 @@ impl<'repo> RepositoryReflogs<'repo> {
     ///
     /// Propagates config load failures, invalid expiry strings, and reflog rewrite errors.
     pub fn expire(&self, options: &ExpireOptions) -> Result<ReflogExpireOutcome> {
-        let cfg = self.repo.config()?;
+        let cfg = self.repo.config().snapshot()?;
         let gc = load_gc_reflog_expire_config(&cfg, options.now);
         let explicit_total = options
             .expire
@@ -323,7 +414,7 @@ fn entry_matches_query(entry: &ReflogEntry, query: &ReflogQuery) -> bool {
 /// Whether `refname`'s reflog in `store` has at least one entry (reads only the newest one).
 fn reflog_has_entries(store: &dyn RefStore, refname: &str) -> Result<bool> {
     let mut found = false;
-    store.for_each_reflog_entry(refname, true, &mut |_| {
+    store.for_each_reflog_entry_str(RefNameRef::from_trusted(refname), true, &mut |_| {
         found = true;
         ControlFlow::Break(())
     })?;
@@ -343,14 +434,14 @@ fn dwim_reflog_candidates(user_ref: &str) -> Vec<String> {
 /// reflog, else the full name of a ref that exists without one.
 fn canonical_reflog_ref(store: &dyn RefStore, user_ref: &str) -> Result<String> {
     for candidate in dwim_reflog_candidates(user_ref) {
-        if store.reflog_exists(&candidate)? {
+        if store.reflog_exists(RefNameRef::from_trusted(&candidate))? {
             return Ok(candidate);
         }
     }
     if !ref_exists_dwim(store, user_ref)? {
-        return Err(Error::ReflogUnknownRef {
+        return Err(Error::Ref(RefError::ReflogUnknownRef {
             refname: user_ref.to_owned(),
-        });
+        }));
     }
     if user_ref.starts_with("refs/") || user_ref == "HEAD" {
         return Ok(user_ref.to_owned());
@@ -362,9 +453,12 @@ fn canonical_reflog_ref(store: &dyn RefStore, user_ref: &str) -> Result<String> 
 /// is stored, even unborn).
 fn ref_exists_dwim(store: &dyn RefStore, user_ref: &str) -> Result<bool> {
     if user_ref == "HEAD" {
-        return Ok(store.read_raw("HEAD")?.is_some());
+        return Ok(store.read_raw(RefNameRef::from_trusted("HEAD"))?.is_some());
     }
-    let (_, oid) = resolve_ref_dwim(|candidate| store.resolve(candidate).ok(), user_ref);
+    let (_, oid) = resolve_ref_dwim(
+        |candidate| store.resolve(RefNameRef::from_trusted(candidate)).ok(),
+        user_ref,
+    );
     Ok(oid.is_some())
 }
 
@@ -378,7 +472,7 @@ fn expire_target_refs(store: &dyn RefStore, all: bool) -> Result<Vec<String>> {
         .into_iter()
         .map(|(name, _)| name)
         .collect();
-    if store.reflog_exists("HEAD")? {
+    if store.reflog_exists(RefNameRef::from_trusted("HEAD"))? {
         names.push("HEAD".to_owned());
     }
     names.sort();
@@ -396,7 +490,7 @@ mod tests {
 
     fn init_repo() -> (tempfile::TempDir, Repository) {
         let dir = tempfile::tempdir().expect("tempdir");
-        let repo = Repository::init(dir.path(), &InitOptions::default()).expect("init");
+        let (repo, _) = Repository::init(dir.path(), &InitOptions::default()).expect("init");
         (dir, repo)
     }
 
@@ -502,7 +596,7 @@ mod tests {
             .delete(&name, &[1], false)
             .expect_err("out of range");
         match err {
-            Error::ReflogIndexOutOfRange { refname, index } => {
+            Error::Ref(RefError::ReflogIndexOutOfRange { refname, index }) => {
                 assert_eq!(refname, "refs/heads/main");
                 assert_eq!(index, 1);
             }

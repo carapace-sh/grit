@@ -1,14 +1,13 @@
 //! Exercise supporting-module APIs for line coverage (crlf, gitmodules, submodule, state).
 
 use grit_lib::config::environment::RepositoryOptions;
-use grit_lib::config::gitmodules::gitdir::{submodule_modules_git_dir, validate_submodule_path};
+use grit_lib::config::gitmodules::gitdir::validate_submodule_path;
 use grit_lib::config::gitmodules::{
     check_submodule_name, check_submodule_url, validate_gitmodules_blob_line,
 };
 use grit_lib::config::{ConfigFile, ConfigScope, ConfigSet};
 use grit_lib::repo::Repository;
 use grit_lib::revwalk::rev_parse::abbreviate_ref_name;
-use grit_lib::state::{detect_in_progress, repo_state, resolve_head};
 use grit_lib::worktree::crlf::{
     convert_to_git, convert_to_worktree_eager, ConversionConfig, FileAttrs,
 };
@@ -42,8 +41,6 @@ fn gitmodules_and_submodule_gitdir_helpers() {
     let dir = TempDir::new().expect("tempdir");
     let git_dir = dir.path().join(".git");
     std::fs::create_dir_all(&git_dir).unwrap();
-    let modules = submodule_modules_git_dir(&git_dir, "sub/path");
-    assert!(modules.to_string_lossy().contains("modules"));
     validate_submodule_path(dir.path(), "sub").expect("validate path");
 }
 
@@ -53,10 +50,17 @@ fn state_detect_and_repo_state_on_fresh_repo() {
     grit_lib::repo::Repository::init(dir.path(), &grit_lib::repo::InitOptions::default())
         .expect("init");
     let git_dir = dir.path().join(".git");
-    assert!(detect_in_progress(&git_dir).is_empty());
-    let _head = resolve_head(&git_dir).expect("head");
+    assert!(grit_test_support::refs::at(&git_dir)
+        .operation()
+        .in_progress()
+        .is_empty());
+    let _head = grit_test_support::refs::at(&git_dir)
+        .references()
+        .head()
+        .expect("head");
     let _repo = Repository::discover(Some(dir.path()), &RepositoryOptions::empty()).expect("open");
-    let _rs = repo_state(&git_dir, false).expect("repo_state");
+    let state = _repo.operation().state().expect("operation state");
+    assert!(state.is_clean());
     assert_eq!(
         abbreviate_ref_name("refs/remotes/origin/main"),
         "origin/main"

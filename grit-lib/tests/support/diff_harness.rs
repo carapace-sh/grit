@@ -9,22 +9,14 @@ use std::process::Command;
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::config::{ConfigFile, ConfigScope, ConfigSet};
 use grit_lib::diff::merge_file;
-use grit_lib::diff::ws::ws_blank_line;
 use grit_lib::diff::{
-    anchored_unified_diff, count_git_lines, diff_commits, diff_index_to_tree,
-    diff_index_to_worktree, diff_tree_to_worktree, diff_trees, format_raw, format_raw_abbrev,
-    normalize_ignore_space_change, postprocess_diff_entries, tree_oid_of_commit,
-    unified_diff_histogram_ignore_with_prefix_and_funcname,
-    unified_diff_with_prefix_and_funcname_and_algorithm, DiffEntry, DiffPostprocessOptions,
-    DiffPostprocessWorktree,
+    count_git_lines, format_raw, format_raw_abbrev, tree_oid_of_commit, unified_diff,
+    DiffAlgorithm, DiffEntry, HunkExtent, IndentHeuristic, TreeDiffOptions, UnifiedDiffOptions,
 };
 use grit_lib::index::Index;
 use grit_lib::objects::odb::Odb;
 use grit_lib::objects::{ObjectId, ObjectKind};
-use grit_lib::parallel::ThreadPolicy;
 use grit_lib::repo::Repository;
-use grit_lib::state::resolve_head;
-use similar::Algorithm;
 
 use super::history_harness::git;
 use super::refs_harness::null_device_for_tests;
@@ -39,17 +31,13 @@ pub enum LineDiffAlgo {
 }
 
 impl LineDiffAlgo {
-    fn similar_algorithm(self) -> Algorithm {
+    fn diff_algorithm(self) -> DiffAlgorithm {
         match self {
-            LineDiffAlgo::Myers => Algorithm::Myers,
-            LineDiffAlgo::Histogram => Algorithm::Myers,
-            LineDiffAlgo::Patience => Algorithm::Patience,
-            LineDiffAlgo::Minimal => Algorithm::Lcs,
+            LineDiffAlgo::Myers => DiffAlgorithm::Myers,
+            LineDiffAlgo::Histogram => DiffAlgorithm::Histogram,
+            LineDiffAlgo::Patience => DiffAlgorithm::Patience,
+            LineDiffAlgo::Minimal => DiffAlgorithm::Minimal,
         }
-    }
-
-    fn use_git_histogram(self) -> bool {
-        matches!(self, LineDiffAlgo::Histogram)
     }
 
     fn git_extra_args(self) -> Vec<&'static str> {
@@ -75,6 +63,20 @@ pub enum WhitespaceMode {
 }
 
 impl WhitespaceMode {
+    /// The grit-lib comparison rules for this mode (`--ignore-cr-at-eol` has none; the harness
+    /// strips the carriage returns from the input instead).
+    fn library_mode(self) -> grit_lib::diff::WhitespaceMode {
+        let mut mode = grit_lib::diff::WhitespaceMode::default();
+        match self {
+            WhitespaceMode::None | WhitespaceMode::IgnoreCrAtEol => {}
+            WhitespaceMode::IgnoreSpaceChange => mode.ignore_space_change = true,
+            WhitespaceMode::IgnoreAllSpace => mode.ignore_all_space = true,
+            WhitespaceMode::IgnoreSpaceAtEol => mode.ignore_space_at_eol = true,
+            WhitespaceMode::IgnoreBlankLines => mode.ignore_blank_lines = true,
+        }
+        mode
+    }
+
     fn git_args(self) -> Vec<&'static str> {
         match self {
             WhitespaceMode::None => vec![],
@@ -211,54 +213,11 @@ fn strip_trailing_cr_line(s: &str) -> String {
     }
 }
 
-fn trim_trailing_ws_line(s: &str) -> String {
-    s.trim_end_matches(|c: char| c.is_whitespace()).to_string()
-}
-
-fn strip_all_whitespace_line(s: &str) -> String {
-    s.chars().filter(|c| !c.is_whitespace()).collect()
-}
-
-fn preprocess_for_whitespace(old: &str, new: &str, ws: WhitespaceMode) -> (String, String) {
-    match ws {
-        WhitespaceMode::None | WhitespaceMode::IgnoreBlankLines => {
-            (old.to_string(), new.to_string())
-        }
-        WhitespaceMode::IgnoreSpaceChange => (
-            normalize_ignore_space_change(old),
-            normalize_ignore_space_change(new),
-        ),
-        WhitespaceMode::IgnoreAllSpace => (
-            old.lines()
-                .map(strip_all_whitespace_line)
-                .collect::<Vec<_>>()
-                .join("\n"),
-            new.lines()
-                .map(strip_all_whitespace_line)
-                .collect::<Vec<_>>()
-                .join("\n"),
-        ),
-        WhitespaceMode::IgnoreSpaceAtEol => (
-            old.lines()
-                .map(trim_trailing_ws_line)
-                .collect::<Vec<_>>()
-                .join("\n"),
-            new.lines()
-                .map(trim_trailing_ws_line)
-                .collect::<Vec<_>>()
-                .join("\n"),
-        ),
-        WhitespaceMode::IgnoreCrAtEol => (
-            old.lines()
-                .map(strip_trailing_cr_line)
-                .collect::<Vec<_>>()
-                .join("\n"),
-            new.lines()
-                .map(strip_trailing_cr_line)
-                .collect::<Vec<_>>()
-                .join("\n"),
-        ),
-    }
+fn strip_cr_at_eol(text: &str) -> String {
+    text.lines()
+        .map(strip_trailing_cr_line)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn text_or_lossy(bytes: &[u8]) -> String {
@@ -278,77 +237,32 @@ pub fn grit_blob_patch(old: &[u8], new: &[u8], path: &str, opts: &GritBlobPatchO
 
     let old_t = text_or_lossy(old);
     let new_t = text_or_lossy(new);
-    let (old_in, new_in) = preprocess_for_whitespace(&old_t, &new_t, opts.ws);
+    let (old_in, new_in) = if opts.ws == WhitespaceMode::IgnoreCrAtEol {
+        (strip_cr_at_eol(&old_t), strip_cr_at_eol(&new_t))
+    } else {
+        (old_t, new_t)
+    };
 
-    let old_path = format!("a/{path}");
-    let new_path = format!("b/{path}");
-    let algo = opts.algo.similar_algorithm();
-    let histogram = opts.algo.use_git_histogram();
-
+    let mut options = UnifiedDiffOptions::new()
+        .with_paths(path, path)
+        .with_algorithm(opts.algo.diff_algorithm())
+        .with_context_lines(opts.context_lines)
+        .with_inter_hunk_context(opts.inter_hunk_context)
+        .with_indent_heuristic(if opts.indent_heuristic {
+            IndentHeuristic::Enabled
+        } else {
+            IndentHeuristic::Disabled
+        })
+        .with_extent(if opts.function_context {
+            HunkExtent::Function
+        } else {
+            HunkExtent::Context
+        })
+        .with_whitespace(opts.ws.library_mode());
     if opts.use_anchored {
-        return grit_lib::diff::annotate_unified_diff_no_newline_at_eof(
-            &anchored_unified_diff(
-                &old_in,
-                &new_in,
-                &old_path,
-                &new_path,
-                opts.context_lines,
-                &opts.anchors,
-                algo,
-                histogram,
-                opts.indent_heuristic,
-                false,
-            ),
-            &old_t,
-            &new_t,
-        );
+        options = options.with_anchors(opts.anchors.iter().cloned());
     }
-
-    if matches!(opts.ws, WhitespaceMode::IgnoreBlankLines) && histogram {
-        return grit_lib::diff::annotate_unified_diff_no_newline_at_eof(
-            &unified_diff_histogram_ignore_with_prefix_and_funcname(
-                &old_in,
-                &new_in,
-                &old_path,
-                &new_path,
-                opts.context_lines,
-                opts.inter_hunk_context,
-                "",
-                "",
-                None,
-                false,
-                false,
-                opts.indent_heuristic,
-                |removed, added| {
-                    removed.iter().all(|l| ws_blank_line(l))
-                        && added.iter().all(|l| ws_blank_line(l))
-                },
-            ),
-            &old_t,
-            &new_t,
-        );
-    }
-
-    grit_lib::diff::annotate_unified_diff_no_newline_at_eof(
-        &unified_diff_with_prefix_and_funcname_and_algorithm(
-            &old_in,
-            &new_in,
-            &old_path,
-            &new_path,
-            opts.context_lines,
-            opts.inter_hunk_context,
-            "",
-            "",
-            None,
-            algo,
-            opts.function_context,
-            histogram,
-            opts.indent_heuristic,
-            false,
-        ),
-        &old_t,
-        &new_t,
-    )
+    unified_diff(&old_in, &new_in, &options)
 }
 
 /// Strip a patch to comparable hunk bodies (from first `@@` through end), normalizing line endings.
@@ -466,7 +380,7 @@ pub fn config_from_snippet(text: &str) -> ConfigSet {
 }
 
 pub fn resolve_indent(config: &ConfigSet, cli_on: bool, cli_off: bool) -> bool {
-    grit_lib::diff::resolve_indent_heuristic(config, cli_on, cli_off)
+    grit_lib::diff::DiffOptions::resolve_indent_heuristic(config, cli_on, cli_off)
 }
 
 /// Ported blob pairs from upstream `t4033`, `t4050`, `t4071`, `t4065`, `t4061`, `t4015`, etc.
@@ -647,14 +561,8 @@ fn pathological_pairs() -> Vec<BlobPair> {
 }
 
 pub fn grit_numstat(old: &str, new: &str, algo: LineDiffAlgo) -> (usize, usize) {
-    use grit_lib::diff::{line_change_counts, DiffOptions};
-    let algorithm = match algo {
-        LineDiffAlgo::Myers => grit_lib::diff::DiffAlgorithm::Myers,
-        LineDiffAlgo::Minimal => grit_lib::diff::DiffAlgorithm::Minimal,
-        LineDiffAlgo::Patience => grit_lib::diff::DiffAlgorithm::Patience,
-        LineDiffAlgo::Histogram => grit_lib::diff::DiffAlgorithm::Histogram,
-    };
-    let stat = line_change_counts(old, new, &DiffOptions::default().with_algorithm(algorithm));
+    let options = UnifiedDiffOptions::new().with_algorithm(algo.diff_algorithm());
+    let stat = grit_lib::diff::line_change_counts(old, new, &options);
     (stat.insertions, stat.deletions)
 }
 
@@ -760,28 +668,6 @@ pub fn assert_raw_matches_git(grit_lines: &[String], git_lines: &[String], conte
     );
 }
 
-pub fn postprocess(
-    odb: &Odb,
-    entries: Vec<DiffEntry>,
-    source_tree: Option<&ObjectId>,
-    work_root: Option<&Path>,
-    worktree: Option<&DiffPostprocessWorktree<'_>>,
-    config: &ConfigSet,
-    opts: &DiffPostprocessOptions,
-) -> Vec<DiffEntry> {
-    postprocess_diff_entries(
-        odb,
-        entries,
-        source_tree,
-        work_root,
-        worktree,
-        config,
-        &ThreadPolicy::default(),
-        opts,
-    )
-    .expect("postprocess")
-}
-
 pub struct DiffRepo {
     _guard: tempfile::TempDir,
     pub worktree: PathBuf,
@@ -803,7 +689,10 @@ impl DiffRepo {
     }
 
     pub fn load_index(&self) -> Index {
-        self.repo.index_handle().load().expect("index")
+        self.repo
+            .index()
+            .load(&grit_lib::index::IndexLoadOptions::default())
+            .expect("index")
     }
 }
 
@@ -811,118 +700,85 @@ pub fn tree_diff_raw(
     repo: &Repository,
     old_tree: Option<&ObjectId>,
     new_tree: Option<&ObjectId>,
-    config: &ConfigSet,
-    opts: &DiffPostprocessOptions,
+    opts: &TreeDiffOptions,
 ) -> Vec<String> {
-    let raw = diff_trees(repo.odb(), old_tree, new_tree, "").expect("diff_trees");
-    let entries = postprocess(repo.odb(), raw, old_tree, None, None, config, opts);
-    grit_raw_lines(&entries)
+    let result = repo
+        .diff()
+        .tree_to_tree(old_tree, new_tree, opts)
+        .expect("tree_to_tree");
+    grit_raw_lines(&result.entries)
 }
 
 pub fn index_to_tree_raw(
     repo: &Repository,
     index: &Index,
     tree: &ObjectId,
-    config: &ConfigSet,
-    opts: &DiffPostprocessOptions,
+    opts: &TreeDiffOptions,
 ) -> Vec<String> {
-    let raw = diff_index_to_tree(repo.odb(), index, Some(tree), false).expect("diff_index_to_tree");
-    let entries = postprocess(repo.odb(), raw, Some(tree), None, None, config, opts);
-    grit_raw_lines(&entries)
+    let result = repo
+        .diff()
+        .index_to_tree(index, Some(tree), opts)
+        .expect("index_to_tree");
+    grit_raw_lines(&result.entries)
 }
 
 pub fn index_to_worktree_raw(
     repo: &Repository,
-    worktree: &Path,
     index: &mut Index,
-    head_tree: Option<&ObjectId>,
-    config: &ConfigSet,
-    opts: &DiffPostprocessOptions,
+    opts: &TreeDiffOptions,
 ) -> Vec<String> {
-    let raw = diff_index_to_worktree(repo.odb(), index, worktree, false, false)
-        .expect("diff_index_to_worktree");
-    let entries = postprocess(
-        repo.odb(),
-        raw,
-        head_tree,
-        Some(worktree),
-        None,
-        config,
-        opts,
-    );
-    grit_raw_lines(&entries)
-}
-
-fn tree_worktree_side<'a>(repo: &'a Repository, index: &'a Index) -> DiffPostprocessWorktree<'a> {
-    DiffPostprocessWorktree {
-        repository_git_dir: repo.git_dir(),
-        index,
-    }
+    let result = repo
+        .diff()
+        .index_to_worktree(index, opts)
+        .expect("index_to_worktree");
+    grit_raw_lines(&result.entries)
 }
 
 pub fn tree_to_worktree_raw(
     repo: &Repository,
-    worktree: &Path,
     index: &Index,
     tree: Option<&ObjectId>,
-    config: &ConfigSet,
-    opts: &DiffPostprocessOptions,
+    opts: &TreeDiffOptions,
 ) -> Vec<String> {
-    let raw =
-        diff_tree_to_worktree(repo.odb(), tree, worktree, index).expect("diff_tree_to_worktree");
-    let wctx = tree_worktree_side(repo, index);
-    let entries = postprocess(
-        repo.odb(),
-        raw,
-        tree,
-        Some(worktree),
-        Some(&wctx),
-        config,
-        opts,
-    );
-    grit_raw_lines(&entries)
+    let result = repo
+        .diff()
+        .tree_to_worktree(tree, index, opts)
+        .expect("tree_to_worktree");
+    grit_raw_lines(&result.entries)
 }
 
 /// Like [`tree_to_worktree_raw`], but abbreviates OIDs like `git diff <tree> --raw`.
 pub fn tree_to_worktree_raw_abbrev(
     repo: &Repository,
-    worktree: &Path,
     index: &Index,
     tree: Option<&ObjectId>,
-    config: &ConfigSet,
-    opts: &DiffPostprocessOptions,
+    opts: &TreeDiffOptions,
     abbrev: usize,
 ) -> Vec<String> {
-    let raw =
-        diff_tree_to_worktree(repo.odb(), tree, worktree, index).expect("diff_tree_to_worktree");
-    let wctx = tree_worktree_side(repo, index);
-    let entries = postprocess(
-        repo.odb(),
-        raw,
-        tree,
-        Some(worktree),
-        Some(&wctx),
-        config,
-        opts,
-    );
-    grit_raw_lines_abbrev(&entries, abbrev)
+    let result = repo
+        .diff()
+        .tree_to_worktree(tree, index, opts)
+        .expect("tree_to_worktree");
+    grit_raw_lines_abbrev(&result.entries, abbrev)
 }
 
 pub fn commits_diff_raw(
     repo: &Repository,
     base: &ObjectId,
     tip: &ObjectId,
-    config: &ConfigSet,
-    opts: &DiffPostprocessOptions,
+    opts: &TreeDiffOptions,
 ) -> Vec<String> {
-    let raw = diff_commits(repo.odb(), base, tip).expect("diff_commits");
-    let base_tree = tree_oid_of_commit(repo.odb(), base).expect("base tree");
-    let entries = postprocess(repo.odb(), raw, Some(&base_tree), None, None, config, opts);
-    grit_raw_lines(&entries)
+    let result = repo.diff().commits(base, tip, opts).expect("commits");
+    grit_raw_lines(&result.entries)
+}
+
+/// Set `key` to `value` in the repository's local config through the system `git`.
+pub fn set_repo_config(worktree: &Path, key: &str, value: &str) {
+    git_quiet(worktree, &["config", key, value]);
 }
 
 pub fn head_tree_oid(repo: &Repository) -> Option<ObjectId> {
-    let head = resolve_head(repo.git_dir()).ok()?;
+    let head = repo.references().head().ok()?;
     let commit = head.oid()?;
     tree_oid_of_commit(repo.odb(), commit).ok()
 }

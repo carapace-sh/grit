@@ -1,8 +1,7 @@
-//! Criterion bench: [`plan_rebase`](grit_lib::revwalk::history::plan_rebase) patch-id scan cost.
+//! Criterion bench: [`History::plan_rebase`](grit_lib::revwalk::history::History::plan_rebase)
+//! patch-id scan cost.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
-
-mod s7;
 
 use std::hint::black_box;
 
@@ -10,14 +9,21 @@ use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use grit_lib::index::write_tree::write_tree_from_index;
 use grit_lib::index::{Index, IndexEntry, MODE_REGULAR};
 use grit_lib::objects::{serialize_commit, CommitData, ObjectKind};
-use grit_lib::refs::write_ref;
 use grit_lib::repo::{InitOptions, Repository};
 use grit_lib::revwalk::history::{
-    plan_rebase, test_patch_id_compute_call_count, test_reset_patch_id_compute_call_count,
     EmptyPolicy, RebaseOntoOptions, RebaseRequest, RefScope, RewriteOptions,
 };
+use grit_lib::test_support::inject::{
+    test_patch_id_compute_call_count, test_reset_patch_id_compute_call_count,
+};
 
-use s7::history_commit_count;
+/// Onto-side commit count (override with `GRIT_HISTORY_BENCH_COMMITS`; at least 10 000).
+fn history_commit_count() -> usize {
+    std::env::var("GRIT_HISTORY_BENCH_COMMITS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10_000)
+}
 
 fn index_entry(path: &[u8], oid: grit_lib::objects::ObjectId, size: usize) -> IndexEntry {
     IndexEntry {
@@ -49,17 +55,25 @@ fn build_rebase_plan_fixture(
     grit_lib::objects::ObjectId,
 ) {
     let root = tempfile::tempdir().expect("tempdir");
-    let repo = Repository::init(
+    let (repo, _) = Repository::init(
         root.path(),
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
-            .with_ref_storage(grit_lib::RefStorageFormat::Files),
+            .with_ref_storage(grit_lib::refs::ref_storage::RefStorageFormat::Files),
     )
     .expect("init");
     let mut index = Index::new();
     index.hash_algo = repo.odb().hash_algo();
     let base_blob = repo.odb().write(ObjectKind::Blob, b"base\n").expect("blob");
     index.add_or_replace(index_entry(b"f.txt", base_blob, 5));
+    for path in [
+        b"wide/shared/a.txt",
+        b"wide/shared/b.txt",
+        b"wide/shared/c.txt",
+    ] {
+        let blob = repo.odb().write(ObjectKind::Blob, b"x\n").expect("blob");
+        index.add_or_replace(index_entry(path, blob, 2));
+    }
     let fork_tree = write_tree_from_index(repo.odb(), &index, "").expect("tree");
     let ident = "Bench <b@grit.test> 1 +0000";
     let fork_raw = serialize_commit(&CommitData {
@@ -85,14 +99,13 @@ fn build_rebase_plan_fixture(
             .odb()
             .write(ObjectKind::Blob, body.as_bytes())
             .expect("blob");
-        let mut idx = Index::new();
-        idx.hash_algo = repo.odb().hash_algo();
-        idx.add_or_replace(index_entry(
+        // Each noise commit adds one file to its parent's tree.
+        index.add_or_replace(index_entry(
             format!("n/{i}.txt").as_bytes(),
             blob,
             body.len(),
         ));
-        let tree = write_tree_from_index(repo.odb(), &idx, "").expect("tree");
+        let tree = write_tree_from_index(repo.odb(), &index, "").expect("tree");
         let raw = serialize_commit(&CommitData {
             tree,
             parents: vec![parent],
@@ -129,7 +142,7 @@ fn build_rebase_plan_fixture(
         extra_headers: Vec::new(),
     });
     let tip = repo.odb().write(ObjectKind::Commit, &tip_raw).expect("tip");
-    write_ref(repo.git_dir(), "refs/heads/main", &tip).expect("ref");
+    grit_test_support::refs::set_ref(&repo, "refs/heads/main", &tip).expect("ref");
     (root, repo, fork, onto, tip)
 }
 
@@ -153,7 +166,7 @@ fn bench_history_plan_rebase(c: &mut Criterion) {
     group.bench_function("plan_with_10k_onto_side", |b| {
         b.iter(|| {
             test_reset_patch_id_compute_call_count();
-            let plan = plan_rebase(&repo, &request, &opts).expect("plan");
+            let plan = repo.history().plan_rebase(&request, &opts).expect("plan");
             black_box((plan, test_patch_id_compute_call_count()))
         });
     });

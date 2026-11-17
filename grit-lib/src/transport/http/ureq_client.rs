@@ -9,14 +9,14 @@
 //! credential, and retries once. On the retry, `reject` runs only when the
 //! server still answers `401` (Git's `credential_reject`); a working credential
 //! that gets 403, 404, 429 or 5xx is left alone — neither `approve` nor
-//! `reject` — and the request fails with [`Error::RemoteUnreadable`].
+//! `reject` — and the request fails with [`RemoteError::Unreadable`].
 //! Successful retries call `approve` and cache the auth header (Git's
 //! `credential_approve`).
 //!
 //! When authentication is required but cannot be satisfied — no provider wired,
 //! the provider cannot supply a usable username/password, an unsupported auth
 //! scheme, or rejected credentials — the request fails with the typed
-//! [`Error::Auth`] (never a hang), so embedders can detect an auth failure and
+//! [`RemoteError::Auth`](crate::remote::RemoteError::Auth) (never a hang), so embedders can detect an auth failure and
 //! fall back (e.g. to an interactive/subprocess path) without string-matching.
 //!
 //! ## Proxy, cookies, and extra headers (config-driven)
@@ -56,14 +56,13 @@ use base64::Engine;
 
 use crate::config::{self, parse_i64, ConfigSet};
 use crate::credentials::{self, Credential, CredentialProvider};
+use crate::environment::Environment;
 use crate::error::{AuthFailure, Error, RemoteUnreadableReason, Result};
+use crate::progress::CancelToken;
 use crate::protocol::client_git_protocol_header_from_config;
+use crate::remote::RemoteError;
 use crate::transport::http::{HttpMethod, HttpRequest, HttpResponse};
 use crate::transport_path::redact_url_for_display;
-
-fn url_for_display(url: &str) -> String {
-    redact_url_for_display(url)
-}
 
 /// Repository URL for error reports: credentials redacted and the smart-HTTP endpoint
 /// (`/info/refs?service=…`, `/git-upload-pack`, `/git-receive-pack`) removed.
@@ -76,14 +75,14 @@ fn repository_url_for_display(url: &str) -> String {
                 .map(str::to_owned)
         })
         .unwrap_or_else(|| url.to_owned());
-    url_for_display(&base)
+    redact_url_for_display(&base)
 }
 
 fn auth_error(url: &str, reason: AuthFailure) -> Error {
-    Error::Auth {
+    Error::Remote(RemoteError::Auth {
         url: repository_url_for_display(url),
         reason,
-    }
+    })
 }
 
 use super::{
@@ -103,6 +102,14 @@ use super::{
 struct CachedAuthHeader {
     header: String,
     origin: String,
+}
+
+/// Authorization header chosen for a request's first attempt.
+struct InitialAuth {
+    header: Option<String>,
+    /// True when the header came from complete `user:password@` in the URL
+    /// (not from the origin cache or a credential helper).
+    from_complete_url_userinfo: bool,
 }
 
 /// `UreqHttpClient` struct.
@@ -130,6 +137,8 @@ pub struct UreqHttpClient {
     credential_config: ConfigSet,
     /// HTTP read timeouts and low-speed abort thresholds (`http.*` config).
     transport_timeouts: HttpTransportTimeouts,
+    /// Per-fetch cancel, checked during timed-out socket reads.
+    operation_cancel: Mutex<Option<std::sync::Arc<crate::progress::CancelToken>>>,
 }
 
 impl UreqHttpClient {
@@ -153,6 +162,7 @@ impl UreqHttpClient {
             extra_headers: Vec::new(),
             credential_config: ConfigSet::default(),
             transport_timeouts: HttpTransportTimeouts::default(),
+            operation_cancel: Mutex::new(None),
         }
     }
 
@@ -177,9 +187,12 @@ impl UreqHttpClient {
     /// cannot honor (e.g. a SOCKS proxy, which `ureq`'s built-in SOCKS support is
     /// not compiled in for here), `protocol.version` is invalid, or the cookie
     /// file cannot be read.
-    pub fn from_config(config: &ConfigSet) -> Result<Self> {
+    ///
+    /// `GIT_HTTP_LOW_SPEED_LIMIT` / `GIT_HTTP_LOW_SPEED_TIME` are read from `environment`;
+    /// pass [`Environment::empty`] to use only the config.
+    pub fn from_config(config: &ConfigSet, environment: &Environment) -> Result<Self> {
         let proxy = build_proxy(config)?;
-        let transport_timeouts = HttpTransportTimeouts::from_config(config);
+        let transport_timeouts = HttpTransportTimeouts::from_config(config, environment);
         let agent = agent_from_timeouts(proxy, &transport_timeouts);
         let mut client = Self::with_agent(agent);
 
@@ -190,7 +203,7 @@ impl UreqHttpClient {
 
         // Cookies: parse the cookie file (if any) and decide whether to persist.
         client.cookie_file_path = config
-            .get("http.cookieFile")
+            .value("http.cookieFile")
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
             .map(PathBuf::from);
@@ -198,7 +211,8 @@ impl UreqHttpClient {
         client.save_cookies = client.cookie_file_path.is_some()
             && config
                 .get_bool("http.saveCookies")
-                .and_then(std::result::Result::ok)
+                .ok()
+                .flatten()
                 .unwrap_or(false);
 
         // Extra headers (`http.extraHeader`, optionally URL-scoped).
@@ -243,6 +257,60 @@ impl UreqHttpClient {
             .map(|entry| entry.header.clone())
     }
 
+    /// Cached basic auth for `url`, or a complete `user:password@` from the request URL.
+    ///
+    /// URL credentials are stored in the in-memory origin cache only (never in a
+    /// credential helper) so later same-origin requests such as a `bundle-uri`
+    /// download can authenticate without embedding secrets in the bundle URL.
+    fn auth_header_for_url(&self, url: &str) -> InitialAuth {
+        if let Some(header) = self.cached_auth_header_for_url(url) {
+            return InitialAuth {
+                header: Some(header),
+                from_complete_url_userinfo: false,
+            };
+        }
+        let repo = repo_url_from_request_url(url);
+        let Some(cred) = Credential::from_url(repo, &self.credential_config) else {
+            return InitialAuth {
+                header: None,
+                from_complete_url_userinfo: false,
+            };
+        };
+        if !cred.is_complete() {
+            return InitialAuth {
+                header: None,
+                from_complete_url_userinfo: false,
+            };
+        }
+        let Some(header) = basic_auth_header(&cred) else {
+            return InitialAuth {
+                header: None,
+                from_complete_url_userinfo: false,
+            };
+        };
+        self.store_auth_header(header.clone(), repo);
+        InitialAuth {
+            header: Some(header),
+            from_complete_url_userinfo: true,
+        }
+    }
+
+    /// Handle an initial `401` before any credential helper runs.
+    ///
+    /// Wrong complete URL userinfo is rejected immediately; otherwise a missing
+    /// provider yields [`AuthFailure::NoCredentialProvider`].
+    fn fail_initial_401_before_helper(&self, url: &str, initial: &InitialAuth) -> Result<()> {
+        if initial.from_complete_url_userinfo {
+            self.clear_auth_header();
+            return Err(auth_error(url, AuthFailure::Rejected));
+        }
+        if self.credentials.is_none() {
+            self.clear_auth_header();
+            return Err(auth_error(url, AuthFailure::NoCredentialProvider));
+        }
+        Ok(())
+    }
+
     fn store_auth_header(&self, header: String, url: &str) {
         if let Some(origin) = http_origin_key(url) {
             if let Ok(mut g) = self.cached_auth.lock() {
@@ -257,8 +325,8 @@ impl UreqHttpClient {
         }
     }
 
-    /// Seed cached basic auth for a URL origin (integration tests only).
-    #[doc(hidden)]
+    /// Seed cached basic auth for a URL origin (integration tests only; `test-support` feature).
+    #[cfg(any(test, feature = "test-support"))]
     pub fn seed_cached_basic_auth(&self, url: &str, username: &str, password: &str) {
         use base64::Engine as _;
         let encoded =
@@ -376,12 +444,14 @@ fn default_user_agent() -> String {
 }
 
 /// Git-shaped HTTP timeouts and optional low-speed abort thresholds (`http.*` config).
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct HttpTransportTimeouts {
     connect: Duration,
     /// Whole-request ceiling (`http.timeout`, Git default 600s; `None` when disabled).
     global: Option<Duration>,
     low_speed: Option<LowSpeedSettings>,
+    /// Checked on timed-out socket reads so library cancel is observed mid-transfer.
+    cancel: Option<std::sync::Arc<crate::progress::CancelToken>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -396,14 +466,15 @@ impl Default for HttpTransportTimeouts {
             connect: Duration::from_secs(30),
             global: Some(Duration::from_secs(600)),
             low_speed: None,
+            cancel: None,
         }
     }
 }
 
 impl HttpTransportTimeouts {
-    fn from_config(config: &ConfigSet) -> Self {
+    fn from_config(config: &ConfigSet, environment: &Environment) -> Self {
         let global = config
-            .get("http.timeout")
+            .value("http.timeout")
             .as_deref()
             .and_then(|v| parse_i64(v).ok())
             .map(|secs| {
@@ -418,26 +489,27 @@ impl HttpTransportTimeouts {
         Self {
             connect: Duration::from_secs(30),
             global,
-            low_speed: parse_low_speed(config),
+            low_speed: parse_low_speed(config, environment),
+            cancel: None,
         }
     }
 }
 
-fn parse_low_speed(config: &ConfigSet) -> Option<LowSpeedSettings> {
-    let limit = crate::environment::Environment::empty()
+fn parse_low_speed(config: &ConfigSet, environment: &Environment) -> Option<LowSpeedSettings> {
+    let limit = environment
         .var("GIT_HTTP_LOW_SPEED_LIMIT")
         .and_then(|v| parse_i64(v.trim()).ok())
         .or_else(|| {
             config
-                .get("http.lowSpeedLimit")
+                .value("http.lowSpeedLimit")
                 .and_then(|v| parse_i64(v.trim()).ok())
         });
-    let time_secs = crate::environment::Environment::empty()
+    let time_secs = environment
         .var("GIT_HTTP_LOW_SPEED_TIME")
         .and_then(|v| parse_i64(v.trim()).ok())
         .or_else(|| {
             config
-                .get("http.lowSpeedTime")
+                .value("http.lowSpeedTime")
                 .and_then(|v| parse_i64(v.trim()).ok())
         });
 
@@ -458,6 +530,16 @@ struct LowSpeedReader<R> {
     window_start: Instant,
     window_bytes: u64,
     global_deadline: Option<Instant>,
+    cancel: Option<std::sync::Arc<crate::progress::CancelToken>>,
+}
+
+fn is_per_read_idle_timeout(err: &io::Error) -> bool {
+    if err.kind() == io::ErrorKind::TimedOut {
+        return true;
+    }
+    err.get_ref()
+        .and_then(|inner| inner.downcast_ref::<ureq::Error>())
+        .is_some_and(|e| matches!(e, ureq::Error::Timeout(ureq::Timeout::PerRead)))
 }
 
 impl<R: Read> LowSpeedReader<R> {
@@ -469,7 +551,15 @@ impl<R: Read> LowSpeedReader<R> {
             window_start: Instant::now(),
             window_bytes: 0,
             global_deadline,
+            cancel: timeouts.cancel.clone(),
         }
+    }
+
+    fn check_cancel(&self) -> io::Result<()> {
+        if self.cancel.as_ref().is_some_and(|c| c.is_cancelled()) {
+            return Err(io::Error::from(io::ErrorKind::Interrupted));
+        }
+        Ok(())
     }
 
     fn check_global(&self) -> io::Result<()> {
@@ -500,6 +590,12 @@ impl<R: Read> LowSpeedReader<R> {
             self.window_bytes = 0;
             return Ok(());
         }
+        if self.window_bytes == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "HTTP transfer speed below http.lowSpeedLimit for http.lowSpeedTime",
+            ));
+        }
         let rate = self.window_bytes as f64 / secs;
         if rate < settings.bytes_per_second as f64 {
             return Err(io::Error::new(
@@ -515,16 +611,31 @@ impl<R: Read> LowSpeedReader<R> {
 
 impl<R: Read> Read for LowSpeedReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if self.settings.is_some() || self.global_deadline.is_some() {
-            self.check_global()?;
-            self.finish_window()?;
+        loop {
+            if self.settings.is_some() || self.global_deadline.is_some() || self.cancel.is_some() {
+                self.check_cancel()?;
+                self.check_global()?;
+                self.finish_window()?;
+            }
+            match self.inner.read(buf) {
+                Ok(n) => {
+                    if n > 0 && self.settings.is_some() {
+                        self.window_bytes += n as u64;
+                        self.finish_window()?;
+                    }
+                    return Ok(n);
+                }
+                Err(e) if is_per_read_idle_timeout(&e) => {
+                    self.check_cancel()?;
+                    self.check_global()?;
+                    match self.finish_window() {
+                        Err(window_err) => return Err(window_err),
+                        Ok(()) => continue,
+                    }
+                }
+                Err(e) => return Err(e),
+            }
         }
-        let n = self.inner.read(buf)?;
-        if n > 0 && self.settings.is_some() {
-            self.window_bytes += n as u64;
-            self.finish_window()?;
-        }
-        Ok(n)
     }
 }
 
@@ -553,9 +664,18 @@ fn agent_from_timeouts(
     proxy: Option<ureq::Proxy>,
     timeouts: &HttpTransportTimeouts,
 ) -> ureq::Agent {
-    ureq::Agent::config_builder()
+    let mut builder = ureq::Agent::config_builder()
         .timeout_connect(Some(timeouts.connect))
-        .timeout_global(timeouts.global)
+        .timeout_global(timeouts.global);
+    if let Some(low) = &timeouts.low_speed {
+        builder = builder
+            .timeout_per_read(Some(low.window))
+            // Abort waits when the server accepts but sends no response headers for
+            // longer than `http.lowSpeedTime` (Git counts time-to-first-byte). Body
+            // throughput stays on [`LowSpeedReader`] once headers arrive.
+            .timeout_recv_response(Some(low.window));
+    }
+    builder
         // Return >= 400 responses as `Ok` so the auth-retry logic can inspect the
         // status and `WWW-Authenticate` headers rather than treating them as hard
         // transport errors (ureq's default surfaces them as `Error::StatusCode`).
@@ -576,7 +696,7 @@ fn agent_from_timeouts(
 /// silently fail at request time — fail loudly instead. Lifts the relevant parts
 /// of the CLI's `build_transport` / `build_transport_from_proxy`.
 fn build_proxy(config: &ConfigSet) -> Result<Option<ureq::Proxy>> {
-    let Some(raw) = config.get("http.proxy") else {
+    let Some(raw) = config.value("http.proxy") else {
         return Ok(None);
     };
     let raw = raw.trim();
@@ -595,18 +715,23 @@ fn build_proxy(config: &ConfigSet) -> Result<Option<ureq::Proxy>> {
         .map(|(s, _)| s.to_ascii_lowercase())
         .unwrap_or_default();
     if scheme.starts_with("socks") {
-        return Err(Error::Message(format!(
+        return Err(Error::Remote(RemoteError::Http {
+            detail: format!(
             "http.proxy '{raw}': SOCKS proxies are not supported by the default ureq HTTP client; \
              implement a custom HttpClient or use an HTTP proxy"
-        )));
+        ),
+        }));
     }
     if scheme != "http" && scheme != "https" {
-        return Err(Error::Message(format!(
-            "http.proxy '{raw}': unsupported proxy scheme '{scheme}'"
-        )));
+        return Err(Error::Remote(RemoteError::Http {
+            detail: format!("http.proxy '{raw}': unsupported proxy scheme '{scheme}'"),
+        }));
     }
-    let proxy = ureq::Proxy::new(&with_scheme)
-        .map_err(|e| Error::Message(format!("invalid http.proxy '{raw}': {e}")))?;
+    let proxy = ureq::Proxy::new(&with_scheme).map_err(|e| {
+        Error::Remote(RemoteError::Http {
+            detail: format!("invalid http.proxy '{raw}': {e}"),
+        })
+    })?;
     Ok(Some(proxy))
 }
 
@@ -671,7 +796,9 @@ impl UreqHttpClient {
         git_protocol: Option<&str>,
         auth: Option<&str>,
     ) -> Result<RawResponse> {
-        let result = retry_interrupted(true, || {
+        let cancel = self.operation_cancel_ref();
+        let cancel_ref = cancel.as_deref();
+        let result = retry_interrupted(true, cancel_ref, || {
             let mut req = self.agent.get(url).header("User-Agent", &self.user_agent);
             if let Some(v) = resolve_git_protocol_header(git_protocol, self.git_protocol.as_deref())
             {
@@ -688,7 +815,7 @@ impl UreqHttpClient {
             }
             req.call()
         });
-        finish(url, result, &self.transport_timeouts)
+        finish(url, result, &self.effective_timeouts())
     }
 
     /// A `POST` to `url` carrying the headers every smart-HTTP request sends.
@@ -731,13 +858,15 @@ impl UreqHttpClient {
         auth: Option<&str>,
     ) -> Result<(RawResponseHead, LowSpeedReader<Box<dyn Read + Send>>)> {
         let idempotent = content_type == "application/x-git-upload-pack-request";
-        let result = retry_interrupted(idempotent, || {
+        let cancel = self.operation_cancel_ref();
+        let cancel_ref = cancel.as_deref();
+        let result = retry_interrupted(idempotent, cancel_ref, || {
             self.post_request(url, content_type, accept, git_protocol, auth)
                 .send(body)
         });
         match result {
-            Ok(resp) => open_response_body(resp, &self.transport_timeouts),
-            Err(e) => Err(http_transport_error(url, &e)),
+            Ok(resp) => open_response_body(resp, &self.effective_timeouts()),
+            Err(e) => Err(map_ureq_transport_error(url, e, &self.effective_timeouts())),
         }
     }
 
@@ -753,11 +882,13 @@ impl UreqHttpClient {
         // A fetch negotiation request only reads from the server, so it is safe to resend; a
         // push (receive-pack) request is not.
         let idempotent = content_type == "application/x-git-upload-pack-request";
-        let result = retry_interrupted(idempotent, || {
+        let cancel = self.operation_cancel_ref();
+        let cancel_ref = cancel.as_deref();
+        let result = retry_interrupted(idempotent, cancel_ref, || {
             self.post_request(url, content_type, accept, git_protocol, auth)
                 .send(body)
         });
-        finish(url, result, &self.transport_timeouts)
+        finish(url, result, &self.effective_timeouts())
     }
 
     fn with_auth_retry_post_stream(
@@ -768,14 +899,14 @@ impl UreqHttpClient {
         body: &[u8],
         git_protocol: Option<&str>,
     ) -> Result<LowSpeedReader<Box<dyn Read + Send>>> {
-        let initial_auth = self.cached_auth_header_for_url(url);
+        let initial_auth = self.auth_header_for_url(url);
         let (head, reader) = self.do_post_open(
             url,
             content_type,
             accept,
             body,
             git_protocol,
-            initial_auth.as_deref(),
+            initial_auth.header.as_deref(),
         )?;
         if head.status != 401 {
             self.invalidate_auth_on_cross_origin_redirect(url, &head.final_url);
@@ -787,10 +918,11 @@ impl UreqHttpClient {
             return Ok(reader);
         }
         drain_response_body(reader);
-        let Some(provider) = self.credentials.as_ref() else {
-            self.clear_auth_header();
-            return Err(auth_error(url, AuthFailure::NoCredentialProvider));
-        };
+        self.fail_initial_401_before_helper(url, &initial_auth)?;
+        let provider = self
+            .credentials
+            .as_ref()
+            .ok_or_else(|| auth_error(url, AuthFailure::NoCredentialProvider))?;
         if !offers_basic(&head.www_authenticate) {
             return Err(auth_error(
                 url,
@@ -859,6 +991,20 @@ impl UreqHttpClient {
         req
     }
 
+    fn effective_timeouts(&self) -> HttpTransportTimeouts {
+        let mut timeouts = self.transport_timeouts.clone();
+        if let Ok(guard) = self.operation_cancel.lock() {
+            if guard.is_some() {
+                timeouts.cancel = guard.clone();
+            }
+        }
+        timeouts
+    }
+
+    fn operation_cancel_ref(&self) -> Option<std::sync::Arc<crate::progress::CancelToken>> {
+        self.operation_cancel.lock().ok().and_then(|g| g.clone())
+    }
+
     /// One attempt at [`HttpClient::send`]: the response head and an open body.
     fn do_send(
         &self,
@@ -868,7 +1014,20 @@ impl UreqHttpClient {
         let url = request.url;
         // Only reads may be resent after an interrupted socket call.
         let idempotent = matches!(request.method, HttpMethod::Get | HttpMethod::Head);
-        let result = retry_interrupted(idempotent, || match request.method {
+        let cancel = self.operation_cancel_ref();
+        let cancel_ref = cancel.as_deref();
+        let mut timeouts = if request.long_running {
+            HttpTransportTimeouts {
+                global: None,
+                ..self.effective_timeouts()
+            }
+        } else {
+            self.effective_timeouts()
+        };
+        if request.long_running {
+            timeouts.global = None;
+        }
+        let result = retry_interrupted(idempotent, cancel_ref, || match request.method {
             HttpMethod::Get => self.decorate(self.agent.get(url), request, auth).call(),
             HttpMethod::Head => self.decorate(self.agent.head(url), request, auth).call(),
             HttpMethod::Post => self
@@ -884,7 +1043,7 @@ impl UreqHttpClient {
                 .decorate(self.agent.delete(url).force_send_body(), request, auth)
                 .send(request.body),
         });
-        let resp = result.map_err(|e| http_transport_error(url, &e))?;
+        let resp = result.map_err(|e| map_ureq_transport_error(url, e, &timeouts))?;
         let headers = resp
             .headers()
             .iter()
@@ -895,14 +1054,6 @@ impl UreqHttpClient {
                 ))
             })
             .collect();
-        let timeouts = if request.long_running {
-            HttpTransportTimeouts {
-                global: None,
-                ..self.transport_timeouts.clone()
-            }
-        } else {
-            self.transport_timeouts.clone()
-        };
         let (head, reader) = open_response_body(resp, &timeouts)?;
         let response = HttpResponse {
             status: head.status,
@@ -915,8 +1066,8 @@ impl UreqHttpClient {
     /// [`HttpClient::send`] with the same `401` handling as the other requests.
     fn send_with_auth_retry(&self, request: &HttpRequest<'_>) -> Result<HttpResponse> {
         let url = request.url;
-        let initial_auth = self.cached_auth_header_for_url(url);
-        let (head, response) = self.do_send(request, initial_auth.as_deref())?;
+        let initial_auth = self.auth_header_for_url(url);
+        let (head, response) = self.do_send(request, initial_auth.header.as_deref())?;
         if head.status != 401 {
             self.invalidate_auth_on_cross_origin_redirect(url, &head.final_url);
             self.save_response_cookies(&head.set_cookie);
@@ -924,10 +1075,11 @@ impl UreqHttpClient {
         }
         let mut body = response.body;
         let _ = std::io::copy(&mut body, &mut io::sink());
-        let Some(provider) = self.credentials.as_ref() else {
-            self.clear_auth_header();
-            return Err(auth_error(url, AuthFailure::NoCredentialProvider));
-        };
+        self.fail_initial_401_before_helper(url, &initial_auth)?;
+        let provider = self
+            .credentials
+            .as_ref()
+            .ok_or_else(|| auth_error(url, AuthFailure::NoCredentialProvider))?;
         if !offers_basic(&head.www_authenticate) {
             return Err(auth_error(
                 url,
@@ -967,8 +1119,8 @@ impl UreqHttpClient {
     where
         F: Fn(&str, Option<&str>) -> Result<RawResponse>,
     {
-        let initial_auth = self.cached_auth_header_for_url(url);
-        let first = attempt(url, initial_auth.as_deref())?;
+        let initial_auth = self.auth_header_for_url(url);
+        let first = attempt(url, initial_auth.header.as_deref())?;
         if first.status != 401 {
             self.invalidate_auth_on_cross_origin_redirect(url, &first.final_url);
             self.save_response_cookies(&first.set_cookie);
@@ -983,10 +1135,11 @@ impl UreqHttpClient {
         // 401: need credentials. Without a provider, surface a typed auth error
         // (so embedders can detect it and e.g. fall back to a subprocess path)
         // rather than a generic message — and never block.
-        let Some(provider) = self.credentials.as_ref() else {
-            self.clear_auth_header();
-            return Err(auth_error(url, AuthFailure::NoCredentialProvider));
-        };
+        self.fail_initial_401_before_helper(url, &initial_auth)?;
+        let provider = self
+            .credentials
+            .as_ref()
+            .ok_or_else(|| auth_error(url, AuthFailure::NoCredentialProvider))?;
         if !offers_basic(&first.www_authenticate) {
             return Err(auth_error(
                 url,
@@ -1038,7 +1191,13 @@ impl UreqHttpClient {
 }
 
 impl HttpClient for UreqHttpClient {
-    fn get(&self, url: &str, git_protocol: Option<&str>) -> Result<Vec<u8>> {
+    fn low_speed_stall_window(&self) -> Option<Duration> {
+        self.transport_timeouts
+            .low_speed
+            .map(|settings| settings.window)
+    }
+
+    fn get(&self, url: &str, git_protocol: Option<&str>) -> crate::error::Result<Vec<u8>> {
         self.with_auth_retry(url, |target, auth| self.do_get(target, git_protocol, auth))
             .map(|(body, _)| body)
     }
@@ -1050,7 +1209,7 @@ impl HttpClient for UreqHttpClient {
         accept: &str,
         body: &[u8],
         git_protocol: Option<&str>,
-    ) -> Result<Vec<u8>> {
+    ) -> crate::error::Result<Vec<u8>> {
         self.with_auth_retry(url, |target, auth| {
             self.do_post(target, content_type, accept, body, git_protocol, auth)
         })
@@ -1064,7 +1223,7 @@ impl HttpClient for UreqHttpClient {
         accept: &str,
         body: &[u8],
         git_protocol: Option<&str>,
-    ) -> Result<Box<dyn Read + Send>> {
+    ) -> crate::error::Result<Box<dyn Read + Send>> {
         Ok(Box::new(self.with_auth_retry_post_stream(
             url,
             content_type,
@@ -1081,14 +1240,22 @@ impl HttpClient for UreqHttpClient {
         accept: &str,
         body: &mut dyn Read,
         git_protocol: Option<&str>,
-    ) -> Result<Box<dyn Read + Send>> {
-        let auth = self.cached_auth_header_for_url(url);
+    ) -> crate::error::Result<Box<dyn Read + Send>> {
+        let auth = self.auth_header_for_url(url);
         let result = self
-            .post_request(url, content_type, accept, git_protocol, auth.as_deref())
+            .post_request(
+                url,
+                content_type,
+                accept,
+                git_protocol,
+                auth.header.as_deref(),
+            )
             .send(ureq::SendBody::from_reader(body));
         let (head, reader) = match result {
-            Ok(resp) => open_response_body(resp, &self.transport_timeouts)?,
-            Err(e) => return Err(http_transport_error(url, &e)),
+            Ok(resp) => open_response_body(resp, &self.effective_timeouts())?,
+            Err(e) => {
+                return Err(map_ureq_transport_error(url, e, &self.effective_timeouts()));
+            }
         };
         self.invalidate_auth_on_cross_origin_redirect(url, &head.final_url);
         self.save_response_cookies(&head.set_cookie);
@@ -1104,20 +1271,11 @@ impl HttpClient for UreqHttpClient {
         Ok(Box::new(reader))
     }
 
-    fn get_with_final_url(
+    fn get_following_redirects(
         &self,
         url: &str,
         git_protocol: Option<&str>,
-    ) -> Result<(Vec<u8>, Option<String>)> {
-        self.with_auth_retry(url, |target, auth| self.do_get(target, git_protocol, auth))
-            .map(|(body, final_url)| (body, Some(final_url)))
-    }
-
-    fn get_with_final_url_exact(
-        &self,
-        url: &str,
-        git_protocol: Option<&str>,
-    ) -> Result<(Vec<u8>, Option<String>)> {
+    ) -> crate::error::Result<(Vec<u8>, Option<String>)> {
         self.with_auth_retry(url, |target, auth| self.do_get(target, git_protocol, auth))
             .map(|(body, final_url)| (body, Some(final_url)))
     }
@@ -1130,8 +1288,14 @@ impl HttpClient for UreqHttpClient {
         self.clear_auth_header();
     }
 
-    fn send(&self, request: &HttpRequest<'_>) -> Result<HttpResponse> {
+    fn send(&self, request: &HttpRequest<'_>) -> crate::error::Result<HttpResponse> {
         self.send_with_auth_retry(request)
+    }
+
+    fn set_operation_cancel(&self, cancel: Option<std::sync::Arc<crate::progress::CancelToken>>) {
+        if let Ok(mut guard) = self.operation_cancel.lock() {
+            *guard = cancel;
+        }
     }
 }
 
@@ -1142,6 +1306,7 @@ const INTERRUPTED_ATTEMPTS: usize = 3;
 /// request is `idempotent`. `EINTR` means "try again", not a transport failure.
 fn retry_interrupted<T>(
     idempotent: bool,
+    cancel: Option<&CancelToken>,
     mut send: impl FnMut() -> std::result::Result<T, ureq::Error>,
 ) -> std::result::Result<T, ureq::Error> {
     let attempts = if idempotent { INTERRUPTED_ATTEMPTS } else { 1 };
@@ -1149,6 +1314,9 @@ fn retry_interrupted<T>(
     for _ in 1..attempts {
         match &result {
             Err(ureq::Error::Io(e)) if e.kind() == std::io::ErrorKind::Interrupted => {
+                if cancel.is_some_and(CancelToken::is_cancelled) {
+                    break;
+                }
                 result = send();
             }
             _ => break,
@@ -1169,18 +1337,21 @@ fn finish(
     timeouts: &HttpTransportTimeouts,
 ) -> Result<RawResponse> {
     match result {
-        Ok(resp) => read_response(resp, timeouts),
-        Err(e) => Err(http_transport_error(url, &e)),
+        Ok(resp) => read_response(url, resp, timeouts),
+        Err(e) => Err(map_ureq_transport_error(url, e, timeouts)),
     }
 }
 
 fn read_response(
+    url: &str,
     resp: ureq::http::Response<ureq::Body>,
     timeouts: &HttpTransportTimeouts,
 ) -> Result<RawResponse> {
     let (head, mut reader) = open_response_body(resp, timeouts)?;
     let mut body = Vec::new();
-    reader.read_to_end(&mut body).map_err(Error::Io)?;
+    reader
+        .read_to_end(&mut body)
+        .map_err(|e| map_http_read_error(url, e, timeouts))?;
     Ok(RawResponse {
         status: head.status,
         content_type: head.content_type,
@@ -1266,19 +1437,59 @@ fn finalize_status(
     Ok((body, final_url))
 }
 
+const LOW_SPEED_TRANSPORT_DETAIL: &str =
+    "HTTP transfer speed below http.lowSpeedLimit for http.lowSpeedTime";
+
+fn low_speed_transport_error(url: &str) -> Error {
+    Error::remote_unreadable(
+        redact_url_for_display(url),
+        RemoteUnreadableReason::Transport {
+            detail: LOW_SPEED_TRANSPORT_DETAIL.to_owned(),
+        },
+    )
+}
+
+fn map_ureq_transport_error(
+    url: &str,
+    err: ureq::Error,
+    timeouts: &HttpTransportTimeouts,
+) -> Error {
+    if timeouts.low_speed.is_some()
+        && matches!(
+            err,
+            ureq::Error::Timeout(ureq::Timeout::PerRead | ureq::Timeout::RecvResponse)
+        )
+    {
+        return low_speed_transport_error(url);
+    }
+    http_transport_error(url, &err)
+}
+
 fn http_transport_error(url: &str, err: impl std::fmt::Display) -> Error {
     let detail = credentials::redact_embedded_url_credentials(&err.to_string());
     Error::remote_unreadable(
-        url_for_display(url),
+        redact_url_for_display(url),
         RemoteUnreadableReason::Transport { detail },
     )
 }
 
+fn map_http_read_error(url: &str, err: std::io::Error, timeouts: &HttpTransportTimeouts) -> Error {
+    if err.kind() == std::io::ErrorKind::Interrupted {
+        Error::Cancelled
+    } else if timeouts.low_speed.is_some()
+        && (err.to_string().contains(LOW_SPEED_TRANSPORT_DETAIL) || is_per_read_idle_timeout(&err))
+    {
+        low_speed_transport_error(url)
+    } else {
+        http_transport_error(url, err)
+    }
+}
+
 fn http_status_error(url: &str, status: u16) -> Error {
-    Error::remote_unreadable(
-        repository_url_for_display(url),
-        RemoteUnreadableReason::HttpStatus { status },
-    )
+    Error::Remote(RemoteError::Unreadable {
+        url: Some(repository_url_for_display(url)),
+        reason: RemoteUnreadableReason::HttpStatus { status },
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1428,8 +1639,11 @@ fn build_cookie_specs(path: Option<&std::path::Path>) -> Result<Vec<CookieSpec>>
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let data = std::fs::read_to_string(path)
-        .map_err(|e| Error::Message(format!("read cookie file '{}': {e}", path.display())))?;
+    let data = std::fs::read_to_string(path).map_err(|e| {
+        Error::Remote(RemoteError::Http {
+            detail: format!("read cookie file '{}': {e}", path.display()),
+        })
+    })?;
     let mut out = Vec::new();
     for line in data.lines() {
         let trimmed = line.trim();
@@ -1525,6 +1739,9 @@ fn parse_header_cookie(line: &str) -> Option<CookieSpec> {
 
 #[cfg(test)]
 mod tests {
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
 
     fn interrupted() -> ureq::Error {
@@ -1534,7 +1751,7 @@ mod tests {
     #[test]
     fn idempotent_request_is_resent_after_eintr() {
         let mut calls = 0;
-        let result = retry_interrupted(true, || {
+        let result = retry_interrupted(true, None, || {
             calls += 1;
             if calls < 3 {
                 Err(interrupted())
@@ -1548,7 +1765,7 @@ mod tests {
     #[test]
     fn non_idempotent_request_is_not_resent_after_eintr() {
         let mut calls = 0;
-        let result: std::result::Result<(), _> = retry_interrupted(false, || {
+        let result: std::result::Result<(), _> = retry_interrupted(false, None, || {
             calls += 1;
             Err(interrupted())
         });
@@ -1559,7 +1776,7 @@ mod tests {
     #[test]
     fn other_errors_are_not_retried() {
         let mut calls = 0;
-        let result: std::result::Result<(), _> = retry_interrupted(true, || {
+        let result: std::result::Result<(), _> = retry_interrupted(true, None, || {
             calls += 1;
             Err(ureq::Error::Io(std::io::Error::from(
                 std::io::ErrorKind::ConnectionRefused,
@@ -1567,6 +1784,159 @@ mod tests {
         });
         assert!(result.is_err());
         assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn delayed_info_refs_404_uses_one_connection() {
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::thread;
+
+        let connections = Arc::new(AtomicUsize::new(0));
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        listener.set_nonblocking(true).ok();
+        let port = listener.local_addr().expect("addr").port();
+        let count = Arc::clone(&connections);
+        thread::spawn(move || {
+            accept_once_and_serve(
+                listener,
+                &count,
+                Duration::from_millis(100),
+                404,
+                b"missing",
+            )
+        });
+
+        let url = format!("http://127.0.0.1:{port}/x.git/info/refs?service=git-upload-pack");
+        let client = UreqHttpClient::new();
+        let err = client
+            .get(&url, None)
+            .expect_err("404 must fail at HTTP layer");
+        assert!(
+            matches!(
+                err,
+                Error::Remote(RemoteError::Unreadable {
+                    reason: RemoteUnreadableReason::HttpStatus { status: 404 },
+                    ..
+                })
+            ),
+            "{err:?}"
+        );
+        assert_eq!(connections.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn response_body_arriving_after_20ms_succeeds() {
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::thread;
+
+        let connections = Arc::new(AtomicUsize::new(0));
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        listener.set_nonblocking(true).ok();
+        let port = listener.local_addr().expect("addr").port();
+        let count = Arc::clone(&connections);
+        let body = b"hello-pack-bytes";
+        thread::spawn(move || {
+            accept_once_and_serve(listener, &count, Duration::from_millis(80), 200, body);
+        });
+
+        let url = format!("http://127.0.0.1:{port}/git-upload-pack");
+        let client = UreqHttpClient::new();
+        let got = client
+            .post(
+                &url,
+                "application/x-git-upload-pack-request",
+                "application/x-git-upload-pack-result",
+                b"0000",
+                None,
+            )
+            .expect("slow body must complete");
+        assert_eq!(got, body);
+        assert_eq!(connections.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn delayed_receive_pack_report_uses_one_connection() {
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::thread;
+
+        let connections = Arc::new(AtomicUsize::new(0));
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        listener.set_nonblocking(true).ok();
+        let port = listener.local_addr().expect("addr").port();
+        let count = Arc::clone(&connections);
+        thread::spawn(move || {
+            accept_once_and_serve(listener, &count, Duration::from_millis(100), 200, b"0000");
+        });
+
+        let url = format!("http://127.0.0.1:{port}/git-receive-pack");
+        let client = UreqHttpClient::new();
+        let got = client
+            .post(
+                &url,
+                "application/x-git-receive-pack-request",
+                "application/x-git-receive-pack-result",
+                b"0000",
+                None,
+            )
+            .expect("delayed receive-pack report must succeed");
+        assert_eq!(got, b"0000");
+        assert_eq!(connections.load(Ordering::Relaxed), 1);
+    }
+
+    fn accept_once_and_serve(
+        listener: TcpListener,
+        count: &AtomicUsize,
+        delay: Duration,
+        status: u16,
+        body: &[u8],
+    ) {
+        loop {
+            let Ok((mut stream, _)) = listener.accept() else {
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            };
+            count.fetch_add(1, Ordering::Relaxed);
+            serve_delayed_http(&mut stream, delay, status, body);
+            return;
+        }
+    }
+
+    fn serve_delayed_http(
+        stream: &mut std::net::TcpStream,
+        delay: Duration,
+        status: u16,
+        body: &[u8],
+    ) {
+        use std::io::{Read, Write};
+        stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+        let mut buf = [0u8; 4096];
+        let mut got = 0usize;
+        while got < buf.len() {
+            let Ok(n) = stream.read(&mut buf[got..]) else {
+                return;
+            };
+            if n == 0 {
+                return;
+            }
+            got += n;
+            if buf[..got].windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+        std::thread::sleep(delay);
+        let reason = if status == 404 { "Not Found" } else { "OK" };
+        let header = format!(
+            "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let _ = stream.write_all(header.as_bytes());
+        let _ = stream.write_all(body);
     }
 
     #[test]
@@ -1646,7 +2016,7 @@ mod tests {
             .unwrap();
         cfg.add_command_override("http.https://example.com.extraHeader", "X-Scoped: s")
             .unwrap();
-        let client = UreqHttpClient::from_config(&cfg).expect("from_config");
+        let client = UreqHttpClient::from_config(&cfg, &Environment::empty()).expect("from_config");
         let scoped = client.extra_headers_for_url("https://example.com/repo.git/info/refs");
         assert!(
             scoped.iter().any(|(n, v)| n == "X-Global" && v == "g"),
@@ -1670,7 +2040,7 @@ mod tests {
         cfg.add_command_override("http.extraHeader", "").unwrap();
         cfg.add_command_override("http.extraHeader", "X-Two: 2")
             .unwrap();
-        let client = UreqHttpClient::from_config(&cfg).expect("from_config");
+        let client = UreqHttpClient::from_config(&cfg, &Environment::empty()).expect("from_config");
         let h = client.extra_headers_for_url("https://example.com/");
         assert!(
             !h.iter().any(|(n, _)| n == "X-One"),
@@ -1684,7 +2054,7 @@ mod tests {
         let mut cfg = ConfigSet::new();
         cfg.add_command_override("http.proxy", "socks5://localhost:1080")
             .unwrap();
-        match UreqHttpClient::from_config(&cfg) {
+        match UreqHttpClient::from_config(&cfg, &Environment::empty()) {
             Ok(_) => panic!("SOCKS proxy must be rejected, not silently accepted"),
             Err(e) => {
                 let msg = format!("{e}");
@@ -1700,7 +2070,7 @@ mod tests {
             .unwrap();
         // Building a client with an HTTP proxy must succeed (it just configures
         // the ureq agent; no connection is attempted here).
-        UreqHttpClient::from_config(&cfg).expect("http proxy config builds");
+        UreqHttpClient::from_config(&cfg, &Environment::empty()).expect("http proxy config builds");
     }
 
     #[test]
@@ -1788,7 +2158,7 @@ mod tests {
         let mut cfg = ConfigSet::new();
         cfg.add_command_override("protocol.version", "bogus")
             .expect("override");
-        match UreqHttpClient::from_config(&cfg) {
+        match UreqHttpClient::from_config(&cfg, &Environment::empty()) {
             Ok(_) => panic!("invalid protocol.version must be rejected"),
             Err(err) => assert!(
                 matches!(err, Error::Config(_)),
@@ -1802,7 +2172,7 @@ mod tests {
         let mut cfg = ConfigSet::new();
         cfg.add_command_override("protocol.version", "2")
             .expect("override");
-        let client = UreqHttpClient::from_config(&cfg).expect("from_config");
+        let client = UreqHttpClient::from_config(&cfg, &Environment::empty()).expect("from_config");
         assert_eq!(
             client.git_protocol.as_deref(),
             Some("version=2"),
@@ -1851,6 +2221,36 @@ mod tests {
     }
 
     #[test]
+    fn low_speed_reader_retries_idle_per_read_until_low_speed_window() {
+        struct AlwaysTimedOut;
+        impl Read for AlwaysTimedOut {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "simulated per-read idle timeout",
+                ))
+            }
+        }
+        let timeouts = HttpTransportTimeouts {
+            connect: Duration::from_secs(30),
+            global: Some(Duration::from_secs(600)),
+            low_speed: Some(LowSpeedSettings {
+                bytes_per_second: 1000,
+                window: Duration::from_millis(100),
+            }),
+            cancel: None,
+        };
+        let started = Instant::now();
+        let err = LowSpeedReader::new(AlwaysTimedOut, &timeouts)
+            .read_to_end(&mut Vec::new())
+            .expect_err("idle reads must hit the low-speed window");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(err.to_string().contains(super::LOW_SPEED_TRANSPORT_DETAIL));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(started.elapsed() >= Duration::from_millis(90));
+    }
+
+    #[test]
     fn low_speed_reader_aborts_stalled_body_read() {
         struct BytePerSecond(u8);
         impl Read for BytePerSecond {
@@ -1868,6 +2268,7 @@ mod tests {
                 bytes_per_second: 100,
                 window: Duration::from_millis(200),
             }),
+            cancel: None,
         };
         let mut reader = LowSpeedReader::new(BytePerSecond(1), &timeouts);
         let mut sink = Vec::new();
@@ -1898,10 +2299,10 @@ mod tests {
             assert!(
                 matches!(
                     &err,
-                    Error::RemoteUnreadable {
+                    Error::Remote(RemoteError::Unreadable {
                         url: Some(u),
                         reason: RemoteUnreadableReason::HttpStatus { status: 404 },
-                    } if u == "https://github.com/o/r.git"
+                    }) if u == "https://github.com/o/r.git"
                 ),
                 "{err:?}"
             );
@@ -1919,7 +2320,7 @@ mod tests {
             let err = super::auth_error(endpoint, AuthFailure::Rejected);
             assert!(matches!(
                 &err,
-                Error::Auth { url, reason: AuthFailure::Rejected }
+                Error::Remote(RemoteError::Auth { url, reason: AuthFailure::Rejected })
                     if url == "https://example.com/team/r.git"
             ));
             assert_eq!(
@@ -1936,5 +2337,278 @@ mod tests {
         let msg = format!("{err}");
         assert!(msg.contains("org/repo@v1.git"));
         assert!(!msg.contains("user:pass"));
+    }
+
+    #[test]
+    fn complete_url_credentials_are_cached_for_same_origin() {
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        fn read_request(stream: &mut TcpStream) -> String {
+            stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 1024];
+            loop {
+                let n = stream.read(&mut chunk).expect("read");
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            String::from_utf8_lossy(&buf).into_owned()
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let other = TcpListener::bind("127.0.0.1:0").expect("bind other");
+        let other_port = other.local_addr().expect("addr").port();
+        let auths: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let auths_repo = auths.clone();
+        let auths_other = auths.clone();
+
+        std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let req = read_request(&mut stream);
+                let auth = req.lines().find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("Authorization")
+                        .then(|| format!("{name}:{value}"))
+                });
+                auths_repo.lock().expect("lock").push(auth);
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                    .expect("write");
+            }
+        });
+        std::thread::spawn(move || {
+            let (mut stream, _) = other.accept().expect("accept other");
+            let req = read_request(&mut stream);
+            let auth = req.lines().find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("Authorization")
+                    .then(|| format!("{name}:{value}"))
+            });
+            auths_other.lock().expect("lock").push(auth);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .expect("write");
+        });
+
+        let client = UreqHttpClient::new();
+        let repo = format!("http://u%40x:p%40ss@127.0.0.1:{port}/repo.git/info/refs");
+        let bundle = format!("http://127.0.0.1:{port}/repo/bundles/x.bundle");
+        let foreign = format!("http://127.0.0.1:{other_port}/else.bundle");
+        client.get(&repo, None).expect("repo get");
+        client.get(&bundle, None).expect("bundle get");
+        client.get(&foreign, None).expect("foreign get");
+
+        let seen = auths.lock().expect("lock");
+        assert_eq!(seen.len(), 3, "expected three HTTP requests: {seen:?}");
+        assert!(
+            seen[1].as_ref().is_some_and(|h| h.contains("Basic")),
+            "same-origin bundle should reuse cached auth: {seen:?}"
+        );
+        assert!(
+            seen[2].is_none(),
+            "a different origin must not receive the repo token: {:?}",
+            seen[2]
+        );
+    }
+
+    #[test]
+    fn wrong_url_credentials_without_helper_are_rejected() {
+        use base64::Engine;
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::time::Duration;
+
+        fn read_request(stream: &mut TcpStream) -> String {
+            stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 1024];
+            loop {
+                let n = stream.read(&mut chunk).expect("read");
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            String::from_utf8_lossy(&buf).into_owned()
+        }
+
+        let expected = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode("alice:good")
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let req = read_request(&mut stream);
+            let ok = req.lines().any(|line| {
+                line.split_once(':').is_some_and(|(name, value)| {
+                    name.eq_ignore_ascii_case("Authorization") && value.trim() == expected
+                })
+            });
+            if ok {
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                    .expect("write");
+            } else {
+                stream
+                    .write_all(
+                        b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"git\"\r\nContent-Length: 0\r\n\r\n",
+                    )
+                    .expect("write");
+            }
+        });
+
+        let client = UreqHttpClient::new();
+        let url = format!("http://alice:bad@127.0.0.1:{port}/repo.git/info/refs");
+        let err = client.get(&url, None).expect_err("wrong URL creds");
+        assert!(
+            matches!(
+                err,
+                Error::Remote(RemoteError::Auth {
+                    reason: AuthFailure::Rejected,
+                    ..
+                })
+            ),
+            "expected Rejected without a credential helper, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn wrong_url_credentials_with_helper_are_rejected_without_consulting_it() {
+        use crate::credentials::CredentialProvider;
+        use crate::transport::http::{HttpClient, HttpMethod, HttpRequest};
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        fn read_request(stream: &mut TcpStream) -> String {
+            stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 1024];
+            loop {
+                let n = stream.read(&mut chunk).expect("read");
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            String::from_utf8_lossy(&buf).into_owned()
+        }
+
+        fn assert_rejected(err: Error) {
+            assert!(
+                matches!(
+                    err,
+                    Error::Remote(RemoteError::Auth {
+                        reason: AuthFailure::Rejected,
+                        ..
+                    })
+                ),
+                "expected Rejected, got {err:?}"
+            );
+        }
+
+        #[derive(Clone)]
+        struct CountingProvider {
+            fills: Arc<AtomicUsize>,
+            approves: Arc<AtomicUsize>,
+            rejects: Arc<AtomicUsize>,
+        }
+
+        impl CountingProvider {
+            fn new() -> Self {
+                Self {
+                    fills: Arc::new(AtomicUsize::new(0)),
+                    approves: Arc::new(AtomicUsize::new(0)),
+                    rejects: Arc::new(AtomicUsize::new(0)),
+                }
+            }
+        }
+
+        impl CredentialProvider for CountingProvider {
+            fn fill(&self, input: &Credential) -> Result<Credential> {
+                self.fills.fetch_add(1, Ordering::SeqCst);
+                Ok(input.clone())
+            }
+
+            fn approve(&self, _cred: &Credential) -> Result<()> {
+                self.approves.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+
+            fn reject(&self, _cred: &Credential) -> Result<()> {
+                self.rejects.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let _req = read_request(&mut stream);
+                stream
+                    .write_all(
+                        b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"git\"\r\nContent-Length: 0\r\n\r\n",
+                    )
+                    .expect("write");
+            }
+        });
+
+        let provider = CountingProvider::new();
+        let fills = provider.fills.clone();
+        let approves = provider.approves.clone();
+        let rejects = provider.rejects.clone();
+        let client = UreqHttpClient::with_credentials(Box::new(provider));
+
+        let base = format!("http://alice:bad@127.0.0.1:{port}/repo.git");
+        assert_rejected(
+            client
+                .get(&format!("{base}/info/refs"), None)
+                .expect_err("get"),
+        );
+
+        let send_url = format!("{base}/git-upload-pack");
+        let request = HttpRequest::new(HttpMethod::Get, &send_url);
+        let send_err = client.send(&request).expect_err("send");
+        assert_rejected(send_err);
+
+        assert_rejected(
+            client
+                .post_into_reader(
+                    &send_url,
+                    "application/x-git-upload-pack-request",
+                    "application/x-git-upload-pack-result",
+                    b"0000",
+                    None,
+                )
+                .err()
+                .expect("post_into_reader"),
+        );
+
+        assert_eq!(fills.load(Ordering::SeqCst), 0, "fill must not run");
+        assert_eq!(approves.load(Ordering::SeqCst), 0, "approve must not run");
+        assert_eq!(rejects.load(Ordering::SeqCst), 0, "reject must not run");
     }
 }

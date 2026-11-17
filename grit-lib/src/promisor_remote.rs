@@ -26,6 +26,8 @@
 //! The older string-based helpers ([`promisor_remote_info`], [`promisor_remote_reply`],
 //! [`parse_advertisement`]) are thin wrappers over these types.
 
+#![allow(dead_code)]
+
 use std::path::Path;
 
 use crate::config::{parse_bool, ConfigFile, ConfigScope, ConfigSet};
@@ -214,7 +216,7 @@ impl PromisorAcceptPolicy {
     #[must_use]
     pub fn from_config(cfg: &ConfigSet) -> (Self, Vec<PromisorConfigWarning>) {
         let mut warnings = Vec::new();
-        let accept = match cfg.get("promisor.acceptFromServer") {
+        let accept = match cfg.value("promisor.acceptFromServer") {
             None => AcceptFromServer::None,
             Some(raw) => AcceptFromServer::parse(&raw).unwrap_or_else(|| {
                 warnings.push(PromisorConfigWarning::UnknownAcceptValue(raw));
@@ -222,7 +224,7 @@ impl PromisorAcceptPolicy {
             }),
         };
         let mut fields = |key: &'static str| {
-            let (known, unknown) = PromisorField::parse_list(&cfg.get(key).unwrap_or_default());
+            let (known, unknown) = PromisorField::parse_list(&cfg.value(key).unwrap_or_default());
             warnings.extend(
                 unknown
                     .into_iter()
@@ -323,15 +325,12 @@ impl PromisorAdvertisement {
     /// `None` when `promisor.advertise` is not true or there is no remote to advertise.
     #[must_use]
     pub fn from_server_config(cfg: &ConfigSet) -> Option<Self> {
-        let advertise = cfg
-            .get_bool("promisor.advertise")
-            .and_then(|r| r.ok())
-            .unwrap_or(false);
+        let advertise = cfg.bool_with_default("promisor.advertise", false);
         if !advertise {
             return None;
         }
         let (fields, _unknown) =
-            PromisorField::parse_list(&cfg.get("promisor.sendFields").unwrap_or_default());
+            PromisorField::parse_list(&cfg.value("promisor.sendFields").unwrap_or_default());
         let remotes = configured_promisor_remotes(cfg, &fields);
         (!remotes.is_empty()).then_some(Self { remotes })
     }
@@ -471,7 +470,10 @@ fn promisor_remote_names(cfg: &ConfigSet) -> Vec<String> {
             }
         }
     }
-    if let Some(pc) = cfg.get("extensions.partialclone").filter(|s| !s.is_empty()) {
+    if let Some(pc) = cfg
+        .value("extensions.partialclone")
+        .filter(|s| !s.is_empty())
+    {
         names.retain(|n| *n != pc);
         names.push(pc);
     }
@@ -497,7 +499,7 @@ pub(crate) fn request_filter_omits_promised_blobs(cfg: &ConfigSet, request: &Obj
     let mut floor = u64::MAX;
     for name in names {
         let filter = cfg
-            .get(&format!("remote.{name}.partialclonefilter"))
+            .value(&format!("remote.{name}.partialclonefilter"))
             .and_then(|spec| ObjectFilter::parse(&spec).ok());
         match filter {
             Some(ObjectFilter::BlobNone) => floor = 0,
@@ -540,7 +542,7 @@ pub fn configured_promisor_remotes(cfg: &ConfigSet, fields: &[PromisorField]) ->
         .into_iter()
         .filter_map(|name| {
             let url = cfg
-                .get(&format!("remote.{name}.url"))
+                .value(&format!("remote.{name}.url"))
                 .filter(|u| !u.is_empty())?;
             let mut info = PromisorInfo {
                 name,
@@ -549,7 +551,7 @@ pub fn configured_promisor_remotes(cfg: &ConfigSet, fields: &[PromisorField]) ->
             };
             for &field in fields {
                 if let Some(v) = cfg
-                    .get(&format!("remote.{}.{}", info.name, field.config_key()))
+                    .value(&format!("remote.{}.{}", info.name, field.config_key()))
                     .filter(|v| !v.is_empty())
                 {
                     field.set_on(&mut info, v);
@@ -914,29 +916,57 @@ pub struct PromisorHandshake {
     pub warnings: Vec<PromisorConfigWarning>,
 }
 
+/// Options for [`PromisorHandshake::evaluate`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PromisorHandshakeOptions {
+    /// The fetch is filtered or is from a promisor remote; otherwise nothing is accepted.
+    pub partial_fetch: bool,
+    /// Resolve the fetch's filter from the accepted remotes (`--filter=auto`).
+    pub auto_filter: bool,
+}
+
+impl PromisorHandshakeOptions {
+    /// Sets [`partial_fetch`](Self::partial_fetch).
+    #[must_use]
+    pub fn with_partial_fetch(mut self, partial_fetch: bool) -> Self {
+        self.partial_fetch = partial_fetch;
+        self
+    }
+
+    /// Sets [`auto_filter`](Self::auto_filter).
+    #[must_use]
+    pub fn with_auto_filter(mut self, auto_filter: bool) -> Self {
+        self.auto_filter = auto_filter;
+        self
+    }
+}
+
 impl PromisorHandshake {
     /// Decide the client side of the exchange.
     ///
     /// Reads the client's policy from `cfg`, decides against its configured promisor remotes,
     /// and declines everything with [`PromisorRejection::NotPartialFetch`] unless
-    /// `partial_fetch`: a client that is not doing a partial fetch needs every object from
-    /// this server. With `auto_filter`, also picks the filter for the fetch from the accepted
-    /// remotes ([`PromisorDecision::combined_filter`]). Writes nothing; see
-    /// [`Self::store_fields`].
+    /// [`PromisorHandshakeOptions::partial_fetch`]: a client that is not doing a partial fetch
+    /// needs every object from this server. With [`PromisorHandshakeOptions::auto_filter`],
+    /// also picks the filter for the fetch from the accepted remotes
+    /// ([`PromisorDecision::combined_filter`]). Writes nothing; see [`Self::store_fields`].
     ///
     /// # Parameters
     ///
     /// - `cfg`: the client's merged config.
     /// - `advertisement`: what the server advertised.
-    /// - `partial_fetch`: whether the fetch is filtered or is from a promisor remote.
-    /// - `auto_filter`: whether to resolve the filter from the accepted remotes.
+    /// - `options`: what kind of fetch this is.
     #[must_use]
     pub fn evaluate(
         cfg: &ConfigSet,
         advertisement: &PromisorAdvertisement,
-        partial_fetch: bool,
-        auto_filter: bool,
+        options: &PromisorHandshakeOptions,
     ) -> Self {
+        let PromisorHandshakeOptions {
+            partial_fetch,
+            auto_filter,
+        } = *options;
         let (policy, mut warnings) = PromisorAcceptPolicy::from_config(cfg);
         let local = configured_promisor_remotes(cfg, &policy.check_fields);
         let mut decision = PromisorDecision::decide(&policy, &local, advertisement);
@@ -1072,6 +1102,7 @@ pub fn promisor_remote_reply(cfg: &ConfigSet, info: &str) -> PromisorReply {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::environment::Environment;
 
     fn cfg(pairs: &[(&str, &str)]) -> ConfigSet {
         let mut c = ConfigSet::default();
@@ -1625,25 +1656,49 @@ mod tests {
         let c = cfg(&client);
         let a = adv("name=lop,url=file:///lop,partialCloneFilter=blob:limit=5k");
 
-        let h = PromisorHandshake::evaluate(&c, &a, false, true);
+        let h = PromisorHandshake::evaluate(
+            &c,
+            &a,
+            &PromisorHandshakeOptions::default()
+                .with_partial_fetch(false)
+                .with_auto_filter(true),
+        );
         assert_eq!(
             rejection(&h.decision),
             Some(PromisorRejection::NotPartialFetch)
         );
         assert_eq!(h.resolved_filter, None);
 
-        let h = PromisorHandshake::evaluate(&c, &a, true, true);
+        let h = PromisorHandshake::evaluate(
+            &c,
+            &a,
+            &PromisorHandshakeOptions::default()
+                .with_partial_fetch(true)
+                .with_auto_filter(true),
+        );
         assert!(h.decision.any_accepted());
         assert_eq!(
             h.resolved_filter,
             Some(ObjectFilterSpec::BlobLimit(5 * 1024))
         );
 
-        let h = PromisorHandshake::evaluate(&c, &a, true, false);
+        let h = PromisorHandshake::evaluate(
+            &c,
+            &a,
+            &PromisorHandshakeOptions::default()
+                .with_partial_fetch(true)
+                .with_auto_filter(false),
+        );
         assert_eq!(h.resolved_filter, None);
 
         let a = adv("name=lop,url=file:///lop,partialCloneFilter=tree:0");
-        let h = PromisorHandshake::evaluate(&c, &a, true, true);
+        let h = PromisorHandshake::evaluate(
+            &c,
+            &a,
+            &PromisorHandshakeOptions::default()
+                .with_partial_fetch(true)
+                .with_auto_filter(true),
+        );
         assert_eq!(
             h.warnings,
             [PromisorConfigWarning::UnusableAutoFilter("tree:0".into())]
@@ -1658,12 +1713,18 @@ mod tests {
         );
         let c = load(dir.path());
         let a = adv("name=lop,url=file:///lop,partialCloneFilter=blob:none");
-        let mut h = PromisorHandshake::evaluate(&c, &a, true, false);
+        let mut h = PromisorHandshake::evaluate(
+            &c,
+            &a,
+            &PromisorHandshakeOptions::default()
+                .with_partial_fetch(true)
+                .with_auto_filter(false),
+        );
         h.store_fields(dir.path(), &c).unwrap();
         assert_eq!(h.stored.len(), 1);
         assert_eq!(
             load(dir.path())
-                .get("remote.lop.partialclonefilter")
+                .value("remote.lop.partialclonefilter")
                 .as_deref(),
             Some("blob:none")
         );
@@ -1676,7 +1737,12 @@ mod tests {
     }
 
     fn load(dir: &Path) -> ConfigSet {
-        ConfigSet::load_repo_local_only(dir).unwrap()
+        ConfigSet::load(
+            &Environment::empty(),
+            Some(dir),
+            &crate::config::LoadConfigOptions::repo_local_only(dir),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -1717,12 +1783,15 @@ mod tests {
         );
         let after = load(dir.path());
         assert_eq!(
-            after.get("remote.lop.partialclonefilter").as_deref(),
+            after.value("remote.lop.partialclonefilter").as_deref(),
             Some("blob:limit=5k")
         );
-        assert_eq!(after.get("remote.lop.token").as_deref(), Some("new"));
-        assert_eq!(after.get("remote.lop.url").as_deref(), Some("file:///lop"));
-        assert_eq!(after.get("remote.unknown.url"), None);
+        assert_eq!(after.value("remote.lop.token").as_deref(), Some("new"));
+        assert_eq!(
+            after.value("remote.lop.url").as_deref(),
+            Some("file:///lop")
+        );
+        assert_eq!(after.value("remote.unknown.url"), None);
 
         // Unchanged values are a no-op.
         let (stored, _) = store_advertised_fields(dir.path(), &policy, &after, &d).unwrap();
@@ -1747,7 +1816,7 @@ mod tests {
         assert!(stored.is_empty());
         assert_eq!(warnings.len(), 2);
         let after = load(dir.path());
-        assert_eq!(after.get("remote.lop.token"), None);
-        assert_eq!(after.get("remote.lop.partialclonefilter"), None);
+        assert_eq!(after.value("remote.lop.token"), None);
+        assert_eq!(after.value("remote.lop.partialclonefilter"), None);
     }
 }

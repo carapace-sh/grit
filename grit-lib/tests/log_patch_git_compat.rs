@@ -8,12 +8,12 @@ use std::process::Command;
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::config::ConfigSet;
 use grit_lib::diff::{
-    write_commits_log_patch, DiffAlgorithm, DiffOptions, DiffPostprocessOptions,
-    LogPatchCommitHeader, LogPatchOptions,
+    write_commits_log_patch, DiffAlgorithm, DiffOptions, LogPatchCommitHeader, LogPatchOptions,
+    TreeDiffOptions,
 };
 use grit_lib::objects::ObjectId;
 use grit_lib::repo::Repository;
-use grit_lib::revwalk::rev_list::{rev_list, RevListOptions};
+use grit_lib::revwalk::rev_list::RevListOptions;
 use support::{assert_raw_matches_git, git_raw_lines, tree_diff_raw};
 use tempfile::TempDir;
 
@@ -63,8 +63,15 @@ fn grit_log_patch(repo: &Repository, limit: usize, diff: DiffOptions) -> Vec<u8>
         max_count: Some(limit),
         ..Default::default()
     };
-    let result = rev_list(repo, &["HEAD".to_owned()], &[], &opts).expect("rev-list");
-    let config = repo.config().map(|c| (*c).clone()).unwrap_or_default();
+    let result = repo
+        .revwalk()
+        .rev_list(&["HEAD".to_owned()], &[], &opts)
+        .expect("rev-list");
+    let config = repo
+        .config()
+        .snapshot()
+        .map(|c| (*c).clone())
+        .unwrap_or_default();
     let patch_opts = LogPatchOptions {
         diff,
         ..LogPatchOptions::git_default(&config)
@@ -110,17 +117,22 @@ fn log_patch_full_header_separates_commits_like_git() {
     init_corpus_repo(std::path::Path::new("git"), dir.path());
     let git_out = git_in(dir.path(), &["log", "-p", "--no-color", "-15"]);
     let repo = Repository::discover(Some(dir.path()), &RepositoryOptions::empty()).expect("open");
-    let result = rev_list(
-        &repo,
-        &["HEAD".to_owned()],
-        &[],
-        &RevListOptions {
-            max_count: Some(15),
-            ..Default::default()
-        },
-    )
-    .expect("rev-list");
-    let config = repo.config().map(|c| (*c).clone()).unwrap_or_default();
+    let result = repo
+        .revwalk()
+        .rev_list(
+            &["HEAD".to_owned()],
+            &[],
+            &RevListOptions {
+                max_count: Some(15),
+                ..Default::default()
+            },
+        )
+        .expect("rev-list");
+    let config = repo
+        .config()
+        .snapshot()
+        .map(|c| (*c).clone())
+        .unwrap_or_default();
     let patch_opts = LogPatchOptions::git_default(&config);
     assert_eq!(patch_opts.commit_header, LogPatchCommitHeader::Full);
     let mut out = Cursor::new(Vec::new());
@@ -235,8 +247,13 @@ fn log_patch_git_git_corpus_matches_git_default_and_histogram() {
         );
         let repo =
             Repository::discover(Some(&corpus), &RepositoryOptions::empty()).expect("open git.git");
-        let mut diff =
-            DiffOptions::from_config(&repo.config().map(|c| (*c).clone()).unwrap_or_default());
+        let mut diff = DiffOptions::from_config(
+            &repo
+                .config()
+                .snapshot()
+                .map(|c| (*c).clone())
+                .unwrap_or_default(),
+        );
         if histogram {
             diff.algorithm = DiffAlgorithm::Histogram;
         }
@@ -276,11 +293,7 @@ fn log_patch_git_git_diff_tree_no_renames_matches_git() {
         .trim()
         .parse()
         .expect("head oid");
-    let config = ConfigSet::new();
-    let opts = DiffPostprocessOptions {
-        rename_threshold: grit_lib::diff::RENAME_DETECTION_DISABLED,
-        ..Default::default()
-    };
+    let opts = TreeDiffOptions::default();
     let git_raw = git_raw_lines(
         corpus.as_path(),
         &[
@@ -293,7 +306,7 @@ fn log_patch_git_git_diff_tree_no_renames_matches_git() {
             &head.to_hex(),
         ],
     );
-    let grit_raw = tree_diff_raw(&repo, Some(&parent), Some(&head), &config, &opts);
+    let grit_raw = tree_diff_raw(&repo, Some(&parent), Some(&head), &opts);
     assert_raw_matches_git(&grit_raw, &git_raw, "git.git HEAD tree diff (no renames)");
 }
 

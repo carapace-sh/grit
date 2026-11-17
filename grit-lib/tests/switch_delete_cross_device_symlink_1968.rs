@@ -8,7 +8,7 @@ mod unix {
     use grit_lib::config::environment::RepositoryOptions;
     use grit_lib::error::{Error, WorktreePathOperation};
     use grit_lib::objects::ObjectId;
-    use grit_lib::porcelain::switch::{switch_repository, SwitchMode, SwitchOptions};
+    use grit_lib::porcelain::switch::{SwitchMode, SwitchOptions};
     use grit_lib::repo::Repository;
     use grit_test_support::git;
 
@@ -55,20 +55,21 @@ mod unix {
         .expect("open grit repo");
 
         std::env::set_var("TMPDIR", "/dev/shm");
-        let err = switch_repository(
-            &repo,
-            &SwitchOptions {
-                mode: SwitchMode::Existing {
-                    branch: "del".into(),
-                    oid: del_oid,
+        let err = repo
+            .checkout()
+            .switch(
+                &SwitchOptions {
+                    mode: SwitchMode::Existing {
+                        branch: "del".into(),
+                        oid: del_oid,
+                    },
+                    dry_run: false,
+                    hooks: grit_lib::command_runner::hooks::PostOperationHooks::Skip,
                 },
-                dry_run: false,
-                hooks: grit_lib::PostOperationHooks::Skip,
-            },
-            &mut grit_lib::progress::NullProgress,
-            &grit_lib::progress::NeverCancel,
-        )
-        .expect_err("switch must fail when z/blocked cannot be removed");
+                &mut grit_lib::progress::NullProgress,
+                &grit_lib::progress::CancelToken::never(),
+            )
+            .expect_err("switch must fail when z/blocked cannot be removed");
         std::env::remove_var("TMPDIR");
 
         let msg = err.to_string();
@@ -76,14 +77,17 @@ mod unix {
             msg.contains("z/blocked"),
             "error must name the blocking path, got: {msg}"
         );
-        match &err {
-            Error::WorktreePathIo {
-                path,
-                operation: WorktreePathOperation::Remove,
-                ..
-            } => assert_eq!(path, "z/blocked"),
-            other => panic!("unexpected error: {other:?}"),
-        }
+        let path_io = err
+            .path_io()
+            .unwrap_or_else(|| panic!("unexpected error: {err:?}"));
+        assert_eq!(
+            path_io.operation,
+            grit_lib::error::PathIoOperation::Worktree(WorktreePathOperation::Remove)
+        );
+        assert_eq!(
+            path_io.path.as_deref(),
+            Some(std::path::Path::new("z/blocked"))
+        );
 
         assert_eq!(
             git(tmp.path(), &["rev-parse", "HEAD"]),

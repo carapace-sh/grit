@@ -1,15 +1,17 @@
 //! `resolve` / `read_object_for_display` compatibility with system `git`.
 
 use crate::support;
+use grit_lib::error::ObjectError;
 
 use std::io::Write;
 use std::process::{Command, Stdio};
 
 use grit_lib::config::environment::Environment;
 use grit_lib::config::environment::RepositoryOptions;
-use grit_lib::object_inspect::{format_tree_cat_file_p, ObjectContents, ResolveError};
 use grit_lib::objects::ObjectKind;
+use grit_lib::refs::store::RefNameRef;
 use grit_lib::repo::Repository;
+use grit_lib::revwalk::object_inspect::{format_tree_cat_file_p, ObjectContents, ResolveError};
 
 use support::{
     bare_repo_with_ambiguous_prefix, commit_file, git, git_rev_parse_verify, open_grit_repo,
@@ -464,7 +466,7 @@ fn display_stream_reports_missing_objects_and_callback_errors() {
     let missing = ObjectId::from_hex("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef").expect("oid");
     assert!(matches!(
         repo.read_object_info_for_display(&missing),
-        Err(Error::ObjectNotFound(_))
+        Err(Error::Object(ObjectError::NotFound { .. }))
     ));
     let result = repo
         .with_object_stream_for_display(&missing, |_| -> grit_lib::error::Result<()> {

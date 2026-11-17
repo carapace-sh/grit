@@ -5,30 +5,28 @@ use std::path::Path;
 use std::sync::Arc;
 
 use grit_lib::config::environment::RepositoryOptions;
+use grit_lib::merge::MergeSourceKind;
 use grit_lib::objects::odb::store::MemoryStore;
-use grit_lib::objects::odb::OdbBuilder;
 use grit_lib::objects::{HashAlgo, ObjectId, ObjectKind};
-use grit_lib::porcelain::merge::{resolve_merge_source, MergeSourceKind};
 use grit_lib::refs::list_refs_for_repository;
 use grit_lib::refs::store::{
-    Expected, MemoryRefStore, RawRef, RefName, RefStore, RefTransaction, RefUpdate, ReflogUpdate,
+    Expected, MemoryRefStore, RawRef, RefName, RefNameRef, RefStore, RefTransaction, RefUpdate,
+    ReflogUpdate,
 };
-use grit_lib::repo::{Repository, RepositoryBuilder};
-use grit_lib::revwalk::rev_parse::resolve_revision;
+use grit_lib::repo::Repository;
+use grit_test_support::resolve_merge_source;
 use time::OffsetDateTime;
 
 fn open_memory_ref_repo(git_dir: &Path) -> Repository {
     fs::create_dir_all(git_dir).expect("git dir");
-    RepositoryBuilder::new(RepositoryOptions::empty())
-        .odb_builder(
-            OdbBuilder::files(git_dir.join("objects"))
-                .primary(Arc::new(MemoryStore::new(HashAlgo::Sha1)))
-                .alternates(false),
-        )
-        .ref_store(Arc::new(MemoryRefStore::new()))
-        .initial_branch("main")
-        .open(git_dir, None)
-        .expect("open")
+    Repository::open(
+        git_dir,
+        &(RepositoryOptions::empty()
+            .with_object_store(Arc::new(MemoryStore::new(HashAlgo::Sha1)))
+            .with_ref_store(Arc::new(MemoryRefStore::new()))
+            .with_initial_branch("main")),
+    )
+    .expect("open")
 }
 
 fn store_commit(repo: &Repository, message: &str) -> ObjectId {
@@ -80,11 +78,19 @@ fn repository_with_memory_ref_store() {
 
     let repo = repo.with_ref_store(store);
     assert_eq!(
-        repo.refs().format(),
+        repo.ref_store().format(),
         grit_lib::refs::store::RefStorageFormat::Memory
     );
 
-    let listed = list_refs_for_repository(&repo, "refs/heads/").expect("list");
+    let listed = repo
+        .references()
+        .list("refs/heads/")
+        .map(|refs| {
+            refs.into_iter()
+                .map(|(n, o)| (String::from(n), o))
+                .collect::<Vec<_>>()
+        })
+        .expect("list");
     assert!(
         listed
             .iter()
@@ -92,10 +98,22 @@ fn repository_with_memory_ref_store() {
         "list_refs_for_repository should list injected ref"
     );
 
-    let resolved = resolve_revision(&repo, "refs/heads/injected").expect("rev-parse");
+    let resolved = repo
+        .revwalk()
+        .resolve(
+            "refs/heads/injected",
+            &grit_lib::revwalk::ResolveOptions::default(),
+        )
+        .expect("rev-parse");
     assert_eq!(resolved, oid);
 
-    let at_zero = resolve_revision(&repo, "refs/heads/injected@{0}").expect("reflog @{0}");
+    let at_zero = repo
+        .revwalk()
+        .resolve(
+            "refs/heads/injected@{0}",
+            &grit_lib::revwalk::ResolveOptions::default(),
+        )
+        .expect("reflog @{0}");
     assert_eq!(at_zero, oid);
 }
 
@@ -152,7 +170,10 @@ fn repository_injected_head_reflog_uses_ref_store() {
             .expect("HEAD"),
         oid
     );
-    let head_at_zero = resolve_revision(&repo, "HEAD@{0}").expect("HEAD reflog");
+    let head_at_zero = repo
+        .revwalk()
+        .resolve("HEAD@{0}", &grit_lib::revwalk::ResolveOptions::default())
+        .expect("HEAD reflog");
     assert_eq!(head_at_zero, oid);
 }
 
@@ -174,8 +195,8 @@ fn injected_ref_updates_never_write_head_or_refs_directory() {
         "injected ref update must not create refs/ on disk"
     );
     assert_eq!(
-        repo.refs()
-            .read_raw("HEAD")
+        repo.ref_store()
+            .read_raw(RefNameRef::from_trusted("HEAD"))
             .expect("HEAD")
             .and_then(|raw| match raw {
                 RawRef::Symbolic(target) => Some(target),
@@ -192,7 +213,7 @@ fn resolve_merge_source_uses_injected_branch_refs() {
     let git_dir = dir.path().join("merge-memory.git");
     let repo = open_memory_ref_repo(&git_dir);
     let tip = store_commit(&repo, "topic tip");
-    let store = repo.refs();
+    let store = repo.ref_store();
     store
         .prepare(
             RefTransaction::new()

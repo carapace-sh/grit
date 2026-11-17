@@ -3,6 +3,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use crate::midx_support;
+use grit_lib::error::ObjectError;
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
@@ -15,13 +16,13 @@ use std::sync::Arc;
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use grit_lib::objects::hash;
-use grit_lib::objects::midx::{write_multi_pack_index_with_options, WriteMultiPackIndexOptions};
+use grit_lib::objects::midx::{write_multi_pack_index, WriteMultiPackIndexOptions};
 use grit_lib::objects::odb::store::{
     MidxObjects, MidxObjectsStatus, ObjectStore, ObjectStream, PackedObjects,
 };
-use grit_lib::objects::pack::{clear_pack_cache, write_v2_pack_index};
 use grit_lib::objects::pack_store::PackStore;
 use grit_lib::objects::{HashAlgo, Object, ObjectId, ObjectKind};
+use grit_lib::test_support::objects_pack::{clear_pack_cache, write_v2_pack_index};
 use grit_test_support::git_supports_sha256;
 use grit_test_support::objects::HashAlgo as FixtureHashAlgo;
 use grit_test_support::odb_conformance::run_read_suite;
@@ -170,8 +171,7 @@ fn install_specs_only_pack(objects: &Path, specs: &[(ObjectKind, Vec<u8>)], algo
     fs::write(&pack_path, &pack).expect("write pack");
     write_v2_pack_index(&idx_path, &pack_path, &entries, hash_bytes).expect("write idx");
     clear_pack_cache();
-    write_multi_pack_index_with_options(&pack_dir, &WriteMultiPackIndexOptions::default())
-        .expect("write midx");
+    write_multi_pack_index(&pack_dir, &WriteMultiPackIndexOptions::default()).expect("write midx");
     clear_pack_cache();
 }
 
@@ -348,7 +348,7 @@ fn grit_two_layer_incremental_fixture(
 ) -> Option<(midx_support::RepoFixture, PathBuf, ObjectId, ObjectId)> {
     let (repo, objects, base_oids) = multi_pack_repo(FixtureHashAlgo::Sha1, 2)?;
     let pack_dir = objects.join("pack");
-    write_multi_pack_index_with_options(
+    write_multi_pack_index(
         &pack_dir,
         &WriteMultiPackIndexOptions {
             version: Some(1),
@@ -364,7 +364,7 @@ fn grit_two_layer_incremental_fixture(
     if !pack_objects_layer(repo.path(), 50) {
         return None;
     }
-    write_multi_pack_index_with_options(
+    write_multi_pack_index(
         &pack_dir,
         &WriteMultiPackIndexOptions {
             incremental: true,
@@ -556,7 +556,10 @@ fn partial_permissive_chain_never_satisfies_strict_store_and_refresh_recovers() 
             try_read_object_via_midx_with_diagnostics(&objects, &new, &sink)
         });
         if failure == "structure" {
-            assert!(matches!(permissive, Err(grit_lib::error::Error::Midx(_))));
+            assert!(matches!(
+                permissive,
+                Err(grit_lib::error::Error::Object(ObjectError::Midx(_)))
+            ));
         } else {
             assert!(permissive.expect("partial chain").is_some());
         }

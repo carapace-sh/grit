@@ -33,7 +33,7 @@ fn t1305_include_and_includeif_match_git_show_origin() {
         root,
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
-            .with_ref_storage(grit_lib::RefStorageFormat::Files),
+            .with_ref_storage(grit_lib::refs::ref_storage::RefStorageFormat::Files),
     )
     .expect("initialize repository");
     let gd = root.join(".git");
@@ -52,8 +52,11 @@ fn t1305_include_and_includeif_match_git_show_origin() {
     let mut set = ConfigSet::new();
     let env = Environment::empty();
     let ctx = include_ctx(&gd, &env);
-    set.merge_file_with_includes(&file, true, &ctx)
-        .expect("merge includes");
+    set.merge_file(
+        &file,
+        &grit_lib::config::IncludeOptions::default().with_context(ctx.clone()),
+    )
+    .expect("merge includes");
 
     let git_corpus = normalize_config_corpus(&git_lines);
     let grit_corpus = normalize_config_corpus(&grit_list_lines(&set));
@@ -78,8 +81,8 @@ fn include_relative_absolute_and_home() {
     let mut env = isolated_env(&home);
     env.cwd = repo.clone();
     let opts = support::default_load_opts(&repo.join(".git"), &env);
-    let set = ConfigSet::load_with_options(&env, Some(&repo.join(".git")), &opts).expect("load");
-    assert_eq!(set.get("a.k").as_deref(), Some("rel"));
+    let set = ConfigSet::load(&env, Some(&repo.join(".git")), &opts).expect("load");
+    assert_eq!(set.get("a.k").unwrap().as_deref(), Some("rel"));
 
     let abs_conf = dir.path().join("abs.conf");
     fs::write(
@@ -88,8 +91,8 @@ fn include_relative_absolute_and_home() {
     )
     .expect("config");
     fs::write(&abs_conf, "[b]\n\tk = abs\n").expect("abs");
-    let set2 = ConfigSet::load_with_options(&env, Some(&repo.join(".git")), &opts).expect("load2");
-    assert_eq!(set2.get("b.k").as_deref(), Some("abs"));
+    let set2 = ConfigSet::load(&env, Some(&repo.join(".git")), &opts).expect("load2");
+    assert_eq!(set2.get("b.k").unwrap().as_deref(), Some("abs"));
     assert_eq!(
         git_file_get_includes(&repo.join(".git/config"), "b.k", Some(&repo.join(".git")))
             .as_deref(),
@@ -111,7 +114,10 @@ fn include_cycle_is_typed_error() {
     let env = Environment::empty();
     let ctx = include_ctx(dir.path(), &env);
     let err = set
-        .merge_file_with_includes(&file, true, &ctx)
+        .merge_file(
+            &file,
+            &grit_lib::config::IncludeOptions::default().with_context(ctx.clone()),
+        )
         .expect_err("cycle");
     match err {
         Error::Config(ConfigError::IncludeDepthExceeded { depth, limit }) => {
@@ -131,9 +137,12 @@ fn missing_include_is_ignored() {
     let file = grit_file_from_content(&cfg, &content, ConfigScope::Local);
     let mut set = ConfigSet::new();
     let env = Environment::empty();
-    set.merge_file_with_includes(&file, true, &include_ctx(dir.path(), &env))
-        .expect("missing include ok");
-    assert_eq!(set.get("ok.y").as_deref(), Some("1"));
+    set.merge_file(
+        &file,
+        &grit_lib::config::IncludeOptions::default().with_context(include_ctx(dir.path(), &env)),
+    )
+    .expect("missing include ok");
+    assert_eq!(set.get("ok.y").unwrap().as_deref(), Some("1"));
     assert!(git_file_get(&cfg, "ok.y").as_deref() == Some("1"));
 }
 
@@ -177,9 +186,18 @@ fn load_repo_local_only_ignores_global() {
     )
     .expect("local");
 
-    let set = ConfigSet::load_repo_local_only(&repo.join(".git")).expect("local only");
-    assert_eq!(set.get("remote.pushdefault").as_deref(), Some("local"));
-    assert!(set.get("remote.pushdefault").as_deref() != Some("global"));
+    let git_dir = repo.join(".git");
+    let set = ConfigSet::load(
+        &Environment::empty(),
+        Some(&git_dir),
+        &crate::config::LoadConfigOptions::repo_local_only(&git_dir),
+    )
+    .expect("local only");
+    assert_eq!(
+        set.get("remote.pushdefault").unwrap().as_deref(),
+        Some("local")
+    );
+    assert!(set.get("remote.pushdefault").unwrap().as_deref() != Some("global"));
 }
 
 #[test]
@@ -202,13 +220,18 @@ fn load_protected_skips_repo_config() {
 
     let mut env = isolated_env(&home);
     env.git_config_global = Some(home.join(".gitconfig").display().to_string());
-    let set = ConfigSet::load_protected(&env, false).expect("protected");
+    let set = ConfigSet::load(
+        &env,
+        None,
+        &crate::config::LoadConfigOptions::protected(&env, false),
+    )
+    .expect("protected");
     assert_eq!(
-        set.get("uploadpack.packobjectshook").as_deref(),
+        set.get("uploadpack.packobjectshook").unwrap().as_deref(),
         Some("global-hook")
     );
     assert_ne!(
-        set.get("uploadpack.packobjectshook").as_deref(),
+        set.get("uploadpack.packobjectshook").unwrap().as_deref(),
         Some("local-hook")
     );
 }
@@ -223,7 +246,7 @@ fn includeif_gitdir_trailing_slash_and_wildcard() {
         &repo,
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
-            .with_ref_storage(grit_lib::RefStorageFormat::Files),
+            .with_ref_storage(grit_lib::refs::ref_storage::RefStorageFormat::Files),
     )
     .expect("init");
     let git_dir = repo.join(".git");
@@ -241,8 +264,8 @@ fn includeif_gitdir_trailing_slash_and_wildcard() {
     env.pwd = Some(repo.display().to_string());
 
     let opts = support::default_load_opts(&git_dir, &env);
-    let set = ConfigSet::load_with_options(&env, Some(&git_dir), &opts).expect("load");
-    assert_eq!(set.get("mark.k").as_deref(), Some("hit"));
+    let set = ConfigSet::load(&env, Some(&git_dir), &opts).expect("load");
+    assert_eq!(set.get("mark.k").unwrap().as_deref(), Some("hit"));
     assert_eq!(
         support::git_file_get_includes_with_home(
             &git_dir.join("config"),
@@ -262,7 +285,7 @@ fn extensions_worktree_config_layering() {
         dir.path(),
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
-            .with_ref_storage(grit_lib::RefStorageFormat::Files),
+            .with_ref_storage(grit_lib::refs::ref_storage::RefStorageFormat::Files),
     )
     .expect("init");
     let git_dir = dir.path().join(".git");
@@ -275,8 +298,8 @@ fn extensions_worktree_config_layering() {
 
     let env = Environment::empty();
     let opts = support::default_load_opts(&git_dir, &env);
-    let set = ConfigSet::load_with_options(&env, Some(&git_dir), &opts).expect("load");
-    assert_eq!(set.get("wt.key").as_deref(), Some("worktree"));
+    let set = ConfigSet::load(&env, Some(&git_dir), &opts).expect("load");
+    assert_eq!(set.get("wt.key").unwrap().as_deref(), Some("worktree"));
 }
 
 #[test]
@@ -293,9 +316,12 @@ fn optional_include_git_parity() {
     let file = grit_file_from_content(&cfg, &content, ConfigScope::Local);
     let mut set = ConfigSet::new();
     let env = Environment::empty();
-    set.merge_file_with_includes(&file, true, &include_ctx(dir.path(), &env))
-        .expect("optional include");
-    assert_eq!(set.get("set.x").as_deref(), git_val.as_deref());
+    set.merge_file(
+        &file,
+        &grit_lib::config::IncludeOptions::default().with_context(include_ctx(dir.path(), &env)),
+    )
+    .expect("optional include");
+    assert_eq!(set.get("set.x").unwrap().as_deref(), git_val.as_deref());
 }
 
 fn normalize_git_lines(lines: &[GitConfigLine]) -> Vec<(String, String)> {
@@ -321,8 +347,11 @@ fn show_origin_order_matches_git_for_simple_include() {
     );
     let mut set = ConfigSet::new();
     let env = Environment::empty();
-    set.merge_file_with_includes(&file, true, &include_ctx(dir.path(), &env))
-        .expect("merge");
+    set.merge_file(
+        &file,
+        &grit_lib::config::IncludeOptions::default().with_context(include_ctx(dir.path(), &env)),
+    )
+    .expect("merge");
     let grit_lines: Vec<_> = grit_list_lines(&set)
         .into_iter()
         .filter(|l| !l.key.starts_with("include"))

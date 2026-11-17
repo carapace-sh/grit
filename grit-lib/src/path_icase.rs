@@ -1,7 +1,7 @@
 //! Case-insensitive path identity when `core.ignorecase` is enabled.
 
 use std::borrow::Cow;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -323,6 +323,42 @@ pub(crate) fn fold_untracked_staging_path(
     dir_map.fold_directory_prefixes(rel_path)
 }
 
+/// Membership test for scheduled wholesale-delete paths under `core.ignorecase`.
+///
+/// When ignorecase is enabled, paths are matched by ASCII lowercasing (same rule as
+/// [`paths_equal`] with `ignorecase = true`), built once for O(1) lookups during directory walks.
+#[derive(Debug)]
+pub(crate) enum ScheduledDeletePathLookup<'a> {
+    Exact(&'a HashSet<String>),
+    Folded(HashSet<String>),
+}
+
+impl<'a> ScheduledDeletePathLookup<'a> {
+    /// View of `delete_paths` suitable for repeated membership checks while walking the work tree.
+    #[must_use]
+    pub fn new(delete_paths: &'a HashSet<String>, ignorecase: bool) -> Self {
+        if ignorecase {
+            Self::Folded(
+                delete_paths
+                    .iter()
+                    .map(|path| path.to_ascii_lowercase())
+                    .collect(),
+            )
+        } else {
+            Self::Exact(delete_paths)
+        }
+    }
+
+    /// True when `rel` is listed for removal (case-insensitive when configured).
+    #[must_use]
+    pub fn contains(&self, rel: &str) -> bool {
+        match self {
+            Self::Exact(set) => set.contains(rel),
+            Self::Folded(set) => set.contains(&rel.to_ascii_lowercase()),
+        }
+    }
+}
+
 /// Compare two repository-relative paths for identity.
 #[must_use]
 pub fn paths_equal(path_a: &[u8], path_b: &[u8], ignorecase: bool) -> bool {
@@ -410,7 +446,7 @@ pub(crate) struct DentrySpellingCache<'w> {
 impl<'w> DentrySpellingCache<'w> {
     /// Cache for paths under `work_tree`; nothing is read until a path is resolved.
     #[must_use]
-    pub(crate) fn new(work_tree: &'w Path) -> Self {
+    pub fn new(work_tree: &'w Path) -> Self {
         Self {
             work_tree,
             listings: HashMap::new(),
@@ -620,6 +656,18 @@ impl IcaseIndexCollisionGroups {
     pub(crate) fn has_collision_sibling(&self, index_rel: &str) -> bool {
         self.path_to_group.contains_key(index_rel.as_bytes())
     }
+
+    /// Other members of this path's ignorecase collision group, excluding `path` itself.
+    pub(crate) fn collision_sibling_paths_except(&self, path: &str) -> Vec<String> {
+        let Some(&group_id) = self.path_to_group.get(path.as_bytes()) else {
+            return Vec::new();
+        };
+        self.members_by_group[group_id]
+            .iter()
+            .filter(|member| member.as_str() != path)
+            .cloned()
+            .collect()
+    }
 }
 
 /// Ignorecase checkout collision map for auto-stage: group membership and dentry winner.
@@ -718,10 +766,7 @@ pub(crate) fn smudge_ignorecase_collision_stat_mismatches(
     config: &crate::config::ConfigSet,
     filter_process: Option<&crate::filter_process::FilterProcessState>,
 ) -> bool {
-    let ignorecase = config
-        .get_bool("core.ignorecase")
-        .and_then(|r| r.ok())
-        .unwrap_or(false);
+    let ignorecase = config.ignore_case();
     if !ignorecase {
         return false;
     }

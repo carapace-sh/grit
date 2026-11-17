@@ -6,7 +6,7 @@
 //! use grit_lib::repo::{InitOptions, Repository};
 //! # fn main() -> grit_lib::error::Result<()> {
 //! let dir = tempfile::tempdir()?;
-//! let _repo = Repository::init(dir.path(), &InitOptions::default())?;
+//! let (_repo, _) = Repository::init(dir.path(), &InitOptions::default())?;
 //! let _ = _repo.bundles();
 //!
 //! # Ok(())
@@ -17,6 +17,6 @@ mod core;
 pub use core::*;
 
 pub mod bundle_remote {
-    //! bundle_remote API (re-exported at this path).
-    pub use crate::bundle_remote::*;
+    //! Revision options for writing bundles from `grit bundle create`-style arguments.
+    pub use crate::bundle_remote::BundleCreateOptions;
 }

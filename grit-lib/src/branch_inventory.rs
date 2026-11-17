@@ -6,12 +6,11 @@ use std::path::PathBuf;
 use time::OffsetDateTime;
 
 use crate::config::ConfigSet;
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::objects::{read_commit_subject_pretty, ObjectId, ObjectKind};
 use crate::parallel::{try_par_map, ParallelHashError, ParallelOp};
 use crate::refs::listing::{
-    query_refs_peeling, PeelTips, RefKind, RefNamespace, RefQuery, RefQueryError, RefQueryOptions,
-    SortKey,
+    query_refs_peeling, PeelTips, RefKind, RefNamespace, RefQuery, RefQueryOptions,
 };
 use crate::repo::Repository;
 use crate::rev_parse::abbreviate_ref_name;
@@ -98,11 +97,11 @@ pub struct BranchSummary {
 /// # Errors
 ///
 /// Propagates configuration, ref resolution, and rev-walk errors.
-pub fn upstream_status(repo: &Repository, branch: &str) -> Result<Option<UpstreamStatus>> {
+pub(crate) fn upstream_status(repo: &Repository, branch: &str) -> Result<Option<UpstreamStatus>> {
     let tip = repo
         .references()
         .resolve_if_exists(&format!("refs/heads/{branch}"))?;
-    let config = repo.config()?;
+    let config = repo.config().snapshot()?;
     build_upstream_status(repo, &config, branch, tip, BranchDetail::Full)
 }
 
@@ -112,25 +111,25 @@ pub fn upstream_status(repo: &Repository, branch: &str) -> Result<Option<Upstrea
 /// [`BranchDetail::Full`] loads commit headers in parallel and computes upstream
 /// ahead/behind via [`crate::branch_tracking::TipComparison`]. Worktree paths are resolved once per call.
 ///
+/// Re-exported as [`crate::refs::branch_tracking::list_branches`] (what `grit branch` uses).
+/// For a minimal local name/oid/current list without object reads, see
+/// [`crate::porcelain::branch::list_branches`].
+///
 /// # Errors
 ///
 /// Propagates ref listing, configuration, object read, and walk errors.
-pub fn list_branches(
+pub(crate) fn list_branches(
     repo: &Repository,
     query: &BranchListQuery,
     detail: BranchDetail,
 ) -> Result<Vec<BranchSummary>> {
-    if detail == BranchDetail::Names && matches!(query.refs.sort.key, SortKey::Date) {
-        return Err(Error::BranchListNamesDateSort);
-    }
-    let config = repo.config()?;
+    let config = repo.config().snapshot()?;
     let listings = query_refs_peeling(
         repo,
         &ref_query_for_branch_list(query),
         &ref_query_options(&config),
         PeelTips::WhenFiltering,
-    )
-    .map_err(ref_query_error)?;
+    )?;
 
     let current = match resolve_head_for_repository(repo)? {
         HeadState::Branch { short_name, .. } => Some(short_name),
@@ -210,25 +209,11 @@ fn ref_query_for_branch_list(query: &BranchListQuery) -> RefQuery {
 fn ref_query_options(config: &ConfigSet) -> RefQueryOptions {
     RefQueryOptions {
         versionsort_suffixes: config
-            .get_all("versionsort.suffix")
+            .values_all("versionsort.suffix")
             .iter()
             .map(|s| s.to_owned())
             .collect(),
-        ignore_case: config
-            .get_bool("core.ignorecase")
-            .and_then(|r| r.ok())
-            .unwrap_or(false),
-    }
-}
-
-fn ref_query_error(err: RefQueryError) -> Error {
-    match err {
-        RefQueryError::Store(e) => e,
-        RefQueryError::MissingObjectDatabase => {
-            Error::Message("creator-date sort requires commit objects".into())
-        }
-        RefQueryError::MissingObject(oid) => Error::ObjectNotFound(oid.to_string()),
-        RefQueryError::NotCommit(oid) => Error::Message(format!("not a commit: {oid}")),
+        ignore_case: config.ignore_case(),
     }
 }
 
@@ -256,9 +241,9 @@ fn build_upstream_status(
     else {
         return Ok(None);
     };
-    let remote = config.get(&remote_key).unwrap_or_else(|| ".".to_owned());
+    let remote = config.value(&remote_key).unwrap_or_else(|| ".".to_owned());
     let merge = config
-        .get(&merge_key)
+        .value(&merge_key)
         .unwrap_or_else(|| format!("refs/heads/{branch_short}"));
     let resolved = repo.references().resolve_if_exists(&full_ref)?;
     let gone = resolved.is_none();
@@ -294,7 +279,7 @@ fn load_commit_metadata(
     if oids.is_empty() {
         return Ok(Vec::new());
     }
-    let config = repo.config()?;
+    let config = repo.config().snapshot()?;
     let par_opts = repo
         .thread_policy()
         .resolve(ParallelOp::DiffContent, &config);

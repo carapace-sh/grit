@@ -6,11 +6,11 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 
-use grit_lib::config::mailmap::load_mailmap_table;
 use grit_lib::objects::ObjectId;
 use grit_lib::repo::Repository;
-use grit_lib::revwalk::filter::{CommitFilter, CommitFilterBuilder};
-use grit_lib::revwalk::rev_list::{rev_list, MissingAction, RevListOptions};
+use grit_lib::revwalk::rev_list::{MissingAction, RevListOptions};
+use grit_lib::revwalk::{CommitFilter, CommitFilterBuilder};
+use grit_lib::worktree::pathspec::{Pathspec, PathspecGlobalFlags};
 use support::{
     commit_file, git, git_commit_graph_write, git_rev_list, open_grit_repo, HistoryRepo,
 };
@@ -174,32 +174,28 @@ fn parse_rev_list_cli(args: &[&str]) -> ParsedRevListCli {
             continue;
         }
         if arg == "--since" || arg == "--after" {
-            let ts = grit_lib::revwalk::queries::committer_cutoff_from_date(args[i + 1], 0)
-                .expect("since");
+            let ts = grit_lib::revwalk::committer_cutoff_from_date(args[i + 1], 0).expect("since");
             since_cutoff = Some(ts);
             i += 2;
             continue;
         }
         if let Some(rest) = arg.strip_prefix("--since=") {
             let date = rest.strip_prefix('@').unwrap_or(rest);
-            since_cutoff = Some(
-                grit_lib::revwalk::queries::committer_cutoff_from_date(date, 0).expect("since"),
-            );
+            since_cutoff =
+                Some(grit_lib::revwalk::committer_cutoff_from_date(date, 0).expect("since"));
             i += 1;
             continue;
         }
         if arg == "--until" || arg == "--before" {
-            let ts = grit_lib::revwalk::queries::committer_cutoff_from_date(args[i + 1], 0)
-                .expect("until");
+            let ts = grit_lib::revwalk::committer_cutoff_from_date(args[i + 1], 0).expect("until");
             until_cutoff = Some(ts);
             i += 2;
             continue;
         }
         if let Some(rest) = arg.strip_prefix("--until=") {
             let date = rest.strip_prefix('@').unwrap_or(rest);
-            until_cutoff = Some(
-                grit_lib::revwalk::queries::committer_cutoff_from_date(date, 0).expect("until"),
-            );
+            until_cutoff =
+                Some(grit_lib::revwalk::committer_cutoff_from_date(date, 0).expect("until"));
             i += 1;
             continue;
         }
@@ -237,9 +233,12 @@ fn assert_rev_list_filter_matches_git(worktree: &Path, repo: &Repository, args: 
             .map(String::as_str)
             .collect::<Vec<_>>(),
     );
-    let paths = repo
-        .resolve_rev_walk_pathspecs(&parsed.paths)
-        .expect("paths");
+    let path_ps = if parsed.paths.is_empty() {
+        Pathspec::entire_tree(PathspecGlobalFlags::default())
+    } else {
+        Pathspec::scoped(parsed.paths.clone(), PathspecGlobalFlags::default())
+    };
+    let paths = repo.resolve_rev_walk_pathspecs(&path_ps).expect("paths");
     let mut opts = RevListOptions {
         max_count: parsed.max_count,
         min_parents: parsed.min_parents,
@@ -259,7 +258,10 @@ fn assert_rev_list_filter_matches_git(worktree: &Path, repo: &Repository, args: 
             git_commit_graph_write(worktree);
         }
         opts.use_commit_graph = use_graph;
-        let result = rev_list(repo, &positive, &negative, &opts).expect("rev_list");
+        let result = repo
+            .revwalk()
+            .rev_list(&positive, &negative, &opts)
+            .expect("rev_list");
         if parsed.count {
             let git_n = git_rev_list_count(worktree, args);
             let grit_n = result.commit_count();
@@ -540,7 +542,7 @@ fn mailmap_author_matches_git() {
     );
     git(wt, &["update-ref", "refs/heads/main", &tip.to_hex()]);
     let repo = open_grit_repo(wt);
-    let table = load_mailmap_table(&repo).expect("mailmap");
+    let table = repo.config().mailmap().expect("mailmap");
     let filter = Arc::new(
         CommitFilterBuilder::new()
             .author("Proper Name")
@@ -567,21 +569,22 @@ fn mailmap_author_matches_git() {
         if use_graph {
             git_commit_graph_write(wt);
         }
-        let grit_oids = rev_list(
-            &repo,
-            &[String::from("main")],
-            &[],
-            &RevListOptions {
-                commit_filter: Some(filter.clone()),
-                use_commit_graph: use_graph,
-                ..RevListOptions::default()
-            },
-        )
-        .expect("rev_list")
-        .commits;
+        let grit_oids = repo
+            .revwalk()
+            .rev_list(
+                &[String::from("main")],
+                &[],
+                &RevListOptions {
+                    commit_filter: Some(filter.clone()),
+                    use_commit_graph: use_graph,
+                    ..RevListOptions::default()
+                },
+            )
+            .expect("rev_list")
+            .commits;
         assert_eq!(grit_oids, git_oids, "mailmap (graph={use_graph})");
         let count = repo
-            .rev_walk()
+            .revwalk()
             .count(
                 &["main"],
                 &grit_lib::revwalk::RevWalkListOptions {
@@ -659,9 +662,6 @@ fn count_with_filter_matches_git() {
 #[test]
 fn bounded_filters_retain_only_selected_rows_across_git_storage_formats() {
     use grit_lib::objects::{parse_commit, ObjectKind};
-    use grit_lib::porcelain::log::{
-        load_commits_with_decorations, load_commits_with_decorations_reusing,
-    };
 
     let hist = HistoryRepo::init();
     let wt = hist.worktree();
@@ -735,21 +735,22 @@ fn bounded_filters_retain_only_selected_rows_across_git_storage_formats() {
                     }
                     let expected = git_rev_list(wt, &args);
                     for retain in [false, true] {
-                        let mut result = rev_list(
-                            &repo,
-                            &["main".to_owned()],
-                            &[base.to_hex()],
-                            &RevListOptions {
-                                max_count: Some(2),
-                                skip,
-                                reverse,
-                                commit_filter: Some(Arc::clone(&filter)),
-                                retain_commit_data: retain,
-                                use_commit_graph: storage == "commit-graph",
-                                ..Default::default()
-                            },
-                        )
-                        .expect("bounded walk");
+                        let mut result = repo
+                            .revwalk()
+                            .rev_list(
+                                &["main".to_owned()],
+                                &[base.to_hex()],
+                                &RevListOptions {
+                                    max_count: Some(2),
+                                    skip,
+                                    reverse,
+                                    commit_filter: Some(Arc::clone(&filter)),
+                                    retain_commit_data: retain,
+                                    use_commit_graph: storage == "commit-graph",
+                                    ..Default::default()
+                                },
+                            )
+                            .expect("bounded walk");
                         assert_eq!(
                             result.commits, expected,
                             "{storage}, skip={skip}, reverse={reverse}"
@@ -767,16 +768,14 @@ fn bounded_filters_retain_only_selected_rows_across_git_storage_formats() {
                             );
                         }
                         let decorations = Default::default();
-                        let loaded = load_commits_with_decorations_reusing(
-                            &repo,
-                            &result.commits,
-                            &decorations,
-                            &mut result.commit_data,
-                        )
-                        .expect("reused rows");
+                        let loaded = repo
+                            .revwalk()
+                            .load_commits(&result.commits, &decorations, &mut result.commit_data)
+                            .expect("reused rows");
                         assert_eq!(
                             loaded,
-                            load_commits_with_decorations(&repo, &expected, &decorations)
+                            repo.revwalk()
+                                .load_commits(&expected, &decorations, &mut ())
                                 .expect("rows")
                         );
                     }
@@ -831,7 +830,7 @@ fn filtered_counts_across_shared_ancestry_and_exclusions_match_git() {
                 .expect("filter"),
         );
         let n = repo
-            .rev_walk()
+            .revwalk()
             .count(
                 &["main", "side"],
                 &grit_lib::revwalk::RevWalkListOptions {
@@ -1008,7 +1007,10 @@ fn bounded_filter_since_until_matches_git() {
         use_commit_graph: false,
         ..RevListOptions::default()
     };
-    let result = rev_list(&repo, &positive, &negative, &opts).expect("rev_list without max_count");
+    let result = repo
+        .revwalk()
+        .rev_list(&positive, &negative, &opts)
+        .expect("rev_list without max_count");
     assert_eq!(result.commits, git_oids);
 }
 
@@ -1111,7 +1113,10 @@ fn bounded_filter_since_frontier_avoids_missing_ancestor() {
         use_commit_graph: false,
         ..RevListOptions::default()
     };
-    let result = rev_list(&repo, &positive, &negative, &opts).expect("rev_list");
+    let result = repo
+        .revwalk()
+        .rev_list(&positive, &negative, &opts)
+        .expect("rev_list");
     assert_eq!(result.commits, git_oids);
 
     let parsed_count = parse_rev_list_cli(&[
@@ -1143,7 +1148,9 @@ fn bounded_filter_since_frontier_avoids_missing_ancestor() {
             "main",
         ],
     );
-    let grit_n = rev_list(&repo, &positive, &negative, &opts)
+    let grit_n = repo
+        .revwalk()
+        .rev_list(&positive, &negative, &opts)
         .expect("count rev_list")
         .commit_count();
     assert_eq!(grit_n, git_n);
@@ -1160,7 +1167,9 @@ fn bounded_filter_since_frontier_avoids_missing_ancestor() {
         ..RevListOptions::default()
     };
     assert!(
-        rev_list(&repo, &["main".to_owned()], &[], &opts).is_err(),
+        repo.revwalk()
+            .rev_list(&["main".to_owned()], &[], &opts)
+            .is_err(),
         "unbounded walk must read the missing grandparent"
     );
     let list_filter = CommitFilterBuilder::new()
@@ -1175,7 +1184,10 @@ fn bounded_filter_since_frontier_avoids_missing_ancestor() {
         use_commit_graph: false,
         ..RevListOptions::default()
     };
-    let result = rev_list(&repo, &positive, &negative, &opts).expect("since-bounded without -n");
+    let result = repo
+        .revwalk()
+        .rev_list(&positive, &negative, &opts)
+        .expect("since-bounded without -n");
     assert_eq!(result.commits, git_oids);
     let count_filter = CommitFilterBuilder::new()
         .author("Alice")
@@ -1189,7 +1201,9 @@ fn bounded_filter_since_frontier_avoids_missing_ancestor() {
         ..RevListOptions::default()
     };
     assert!(
-        rev_list(&repo, &["main".to_owned()], &[], &opts).is_err(),
+        repo.revwalk()
+            .rev_list(&["main".to_owned()], &[], &opts)
+            .is_err(),
         "count without --since must read the missing grandparent"
     );
 }
@@ -1269,6 +1283,208 @@ fn bounded_path_since_with_large_limit_matches_git() {
             "path.txt",
         ],
     );
+    assert_rev_list_filter_matches_git(
+        wt,
+        &repo,
+        &[
+            "-n",
+            "5000",
+            "--author=Refs Harness",
+            "--since=1970-01-01 00:41:40 +0000",
+            "main",
+            "--",
+            "path.txt",
+        ],
+    );
+}
+
+fn commit_tree_with_committer_timestamps(
+    worktree: &Path,
+    label: &str,
+    parents: &[ObjectId],
+    author: (&str, &str),
+    committer_ts: i64,
+    message: &str,
+    tree_oid: &str,
+) -> ObjectId {
+    let mut args: Vec<String> = vec![
+        "commit-tree".into(),
+        tree_oid.into(),
+        "-m".into(),
+        message.into(),
+    ];
+    for p in parents {
+        args.push("-p".into());
+        args.push(p.to_hex());
+    }
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let ts = format!("@{committer_ts} +0000");
+    let out = Command::new("git")
+        .current_dir(worktree)
+        .args(&arg_refs)
+        .env("GIT_AUTHOR_NAME", author.0)
+        .env("GIT_AUTHOR_EMAIL", author.1)
+        .env("GIT_COMMITTER_NAME", author.0)
+        .env("GIT_COMMITTER_EMAIL", author.1)
+        .env("GIT_AUTHOR_DATE", &ts)
+        .env("GIT_COMMITTER_DATE", &ts)
+        .env("GIT_CONFIG_GLOBAL", support::null_device_for_tests())
+        .env("GIT_CONFIG_SYSTEM", support::null_device_for_tests())
+        .output()
+        .expect("commit-tree");
+    assert!(
+        out.status.success(),
+        "commit-tree: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let commit = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    git(
+        worktree,
+        &["update-ref", &format!("refs/history/{label}"), &commit],
+    );
+    commit.parse().expect("oid")
+}
+
+#[test]
+fn bounded_path_filter_since_frontier_avoids_missing_ancestor() {
+    let hist = HistoryRepo::init();
+    let wt = hist.worktree();
+    let c_anc = commit_with_committer_timestamps(wt, "anc", &[], ("Alice", "a@x.com"), 500, "anc");
+    let c0 = commit_with_committer_timestamps(
+        wt,
+        "c0",
+        &[c_anc],
+        ("Alice", "a@x.com"),
+        1000,
+        "keep for treesame",
+    );
+    std::fs::write(wt.join("frontier-path.txt"), "v0").expect("write");
+    git(wt, &["add", "frontier-path.txt"]);
+    let tree = git(wt, &["write-tree"]).trim().to_string();
+    let c1 = commit_tree_with_committer_timestamps(
+        wt,
+        "c1",
+        &[c0],
+        ("Alice", "a@x.com"),
+        2000,
+        "past cutoff path touch",
+        &tree,
+    );
+    let c2 = commit_with_committer_timestamps(wt, "c2", &[c1], ("Alice", "a@x.com"), 4000, "tip");
+    git(wt, &["update-ref", "refs/heads/main", &c2.to_hex()]);
+    commit_file(wt, "frontier-path.txt", "v1", "touch path");
+    let repo = open_grit_repo(wt);
+    assert_rev_list_filter_matches_git(
+        wt,
+        &repo,
+        &[
+            "-n",
+            "5000",
+            "--author=Alice",
+            "--since=1970-01-01 00:41:40 +0000",
+            "main",
+            "--",
+            "frontier-path.txt",
+        ],
+    );
+    assert_rev_list_filter_matches_git(
+        wt,
+        &repo,
+        &[
+            "-n",
+            "5000",
+            "--author=Refs Harness",
+            "--since=1970-01-01 00:41:40 +0000",
+            "main",
+            "--",
+            "frontier-path.txt",
+        ],
+    );
+
+    remove_loose_object(wt, c_anc);
+
+    let parsed = parse_rev_list_cli(&[
+        "-n",
+        "5000",
+        "--author=Alice",
+        "--since=1970-01-01 00:41:40 +0000",
+        "main",
+        "--",
+        "frontier-path.txt",
+    ]);
+    let (positive, negative) = support::expand_revision_tokens(
+        &parsed
+            .rev_args
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+    );
+    let list_filter = CommitFilterBuilder::new()
+        .author("Alice")
+        .build()
+        .expect("filter");
+    let path_ps = if parsed.paths.is_empty() {
+        Pathspec::entire_tree(PathspecGlobalFlags::default())
+    } else {
+        Pathspec::scoped(parsed.paths.clone(), PathspecGlobalFlags::default())
+    };
+    let paths = repo.resolve_rev_walk_pathspecs(&path_ps).expect("paths");
+    let opts = RevListOptions {
+        max_count: Some(5000),
+        since_cutoff: parsed.since_cutoff,
+        commit_filter: Some(Arc::new(list_filter)),
+        paths,
+        paths_resolved_from_argv: true,
+        missing_action: MissingAction::Error,
+        use_commit_graph: false,
+        ..RevListOptions::default()
+    };
+    let result = repo
+        .revwalk()
+        .rev_list(&positive, &negative, &opts)
+        .expect("since path filter walk");
+    let git_oids = git_rev_list(
+        wt,
+        &[
+            "-n",
+            "5000",
+            "--author=Alice",
+            "--since=1970-01-01 00:41:40 +0000",
+            "main",
+            "--",
+            "frontier-path.txt",
+        ],
+    );
+    assert_eq!(result.commits, git_oids);
+    assert!(
+        !result.commits.contains(&c1),
+        "commit before --since must not be listed even when path-visible"
+    );
+
+    let list_filter = CommitFilterBuilder::new()
+        .author("Alice")
+        .build()
+        .expect("filter");
+    let opts = RevListOptions {
+        max_count: Some(5000),
+        commit_filter: Some(Arc::new(list_filter)),
+        paths: repo
+            .resolve_rev_walk_pathspecs(&Pathspec::scoped(
+                ["frontier-path.txt".to_owned()],
+                PathspecGlobalFlags::default(),
+            ))
+            .expect("paths"),
+        paths_resolved_from_argv: true,
+        missing_action: MissingAction::Error,
+        use_commit_graph: false,
+        ..RevListOptions::default()
+    };
+    assert!(
+        repo.revwalk()
+            .rev_list(&["main".to_owned()], &[], &opts)
+            .is_err(),
+        "unbounded path filter walk must read the missing grandparent"
+    );
 }
 
 #[test]
@@ -1324,7 +1540,7 @@ fn left_right_count_with_author_filter_matches_git() {
     let git_left: usize = parts.next().unwrap().parse().unwrap();
     let git_right: usize = parts.next().unwrap().parse().unwrap();
     let grit = repo
-        .rev_walk()
+        .revwalk()
         .left_right_counts(
             &["left...right"],
             &RevWalkListOptions {

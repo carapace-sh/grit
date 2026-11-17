@@ -13,50 +13,51 @@
 //! When `extensions.refStorage = reftable`, the reftable backend is used
 //! instead.  The public API is the same; dispatch is handled internally.
 //!
-//! ## On-disk ref helpers vs `Repository::refs`
+//! ## Working with refs
 //!
-//! Many public functions take `git_dir: &Path` and open a fresh files or reftable backend via
-//! `store::open_ref_store` (writes also use an internal object-checked open). They bypass
-//! [`crate::repo::Repository::refs`] and any injected [`store::RefStore`]. Use them for bare git
-//! directories (alternates, receive-pack physical listings, tests). When you hold a
-//! [`crate::repo::Repository`], prefer [`crate::refs::References`] (`resolve`, `list`,
-//! `update`), [`list_refs_for_repository`], [`read_symbolic_ref_for_repository`],
-//! [`update_branch_for_commit_on_store`], [`commit_ref_update_on_store`], and
-//! [`crate::state::resolve_head_for_repository`].
+//! Every ref operation on a repository goes through [`References`]
+//! (`repo.references()`): `head`, `resolve`, `symbolic`, `dwim`, `list`, `list_glob`,
+//! `update`, `update_direct`, `update_symbolic`, `compare_and_swap`, `delete`,
+//! `compare_and_delete`, `apply` and `apply_each`. Reflogs are on
+//! [`crate::repo_handles::RepositoryReflogs`] (`repo.reflogs()`). All of them use
+//! [`crate::repo::Repository::ref_store`], so an injected [`store::RefStore`] is honoured.
+//! A custom backend implements [`store::RefStore`]; the free functions here that take a
+//! store ([`commit_ref_update_on_store`], [`update_branch_for_commit_on_store`], …) are the
+//! building blocks for that.
 //!
 //! Library guide: [mod](https://grit-scm.com/docs/library/refs)
 //!
 //! ```rust
+//! use grit_lib::refs::store::RefNameRef;
 //! use grit_lib::repo::{InitOptions, Repository};
 //! # fn main() -> grit_lib::error::Result<()> {
 //! let dir = tempfile::tempdir()?;
-//! let _repo = Repository::init(dir.path(), &InitOptions::default())?;
-//! assert!(_repo.refs().read_raw("HEAD")?.is_some());
+//! let (_repo, _) = Repository::init(dir.path(), &InitOptions::default())?;
+//! assert!(_repo.ref_store().read_raw(RefNameRef::from_trusted("HEAD"))?.is_some());
 //!
 //! # Ok(())
 //! # }
 //! ```
 
-pub mod handle;
+pub(crate) mod handle;
 pub mod listing;
 pub mod query_reachability;
-pub mod shorten;
+pub(crate) mod shorten;
 pub mod store;
 pub mod version_sort;
 
-pub use shorten::{
-    expand_ref_dwim_full_name, peel_symref_to_terminal_ref, shorten_unambiguous,
-    warn_ambiguous_refs_from_config,
+pub(crate) use shorten::{
+    expand_ref_dwim_full_name, shorten_unambiguous, warn_ambiguous_refs_from_config,
 };
 
 mod domain_reexports;
 mod on_store;
 pub use domain_reexports::*;
-pub use handle::References;
+pub use handle::{DwimMatch, References};
 pub use on_store::update_branch_for_commit_on_store;
 pub(crate) use on_store::{
-    append_reflog_on_store, delete_ref_on_store, update_detached_head_for_commit_on_store,
-    verify_new_tip, write_symbolic_ref_on_store,
+    append_reflog_on_store, delete_ref_on_store, reflog_wanted,
+    update_detached_head_for_commit_on_store, verify_new_tip, write_symbolic_ref_on_store,
 };
 
 /// In-process ref-transaction and loose-object prune helpers.
@@ -64,6 +65,8 @@ pub mod gc {
     pub use crate::gc::*;
 }
 
+use crate::error::ObjectError;
+use crate::error::RefError;
 use crate::git_path::CanonicalizeExt;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
@@ -72,26 +75,26 @@ use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use store::{
     open_ref_store, Expected, PreparedRefTransaction, RawRef as StoreRawRef, RefCaseOnlyRename,
-    RefEntry, RefReflogRename, RefStorageFormat, RefStore, RefStoreError, RefTransaction,
-    RefUpdate, RefUpdateFlags, ReflogUpdate,
+    RefEntry, RefName, RefNameRef, RefReflogRename, RefStorageFormat, RefStore, RefStoreError,
+    RefTransaction, RefUpdate, RefUpdateFlags, ReflogUpdate,
 };
 
-use crate::check_ref_format::{check_refname_format_borrowed, RefNameOptions};
+use crate::check_ref_format::{check_refname_format_borrowed, RefFormatOptions};
 use crate::config::ConfigSet;
 use crate::error::{Error, RefLockError, Result};
-use crate::ident::Signature;
 use crate::lockfile::LockWait;
 use crate::objects::{HashAlgo, ObjectId};
 use crate::pack;
-use store::format_reflog_identity;
 
 /// Maximum symbolic ref hops when resolving a ref (Git `SYMREF_MAXDEPTH`).
 pub const SYMREF_MAXDEPTH: usize = 5;
 
 fn map_public_ref_store_error(err: Error, refname: &str) -> Error {
     match err {
-        Error::RefStore(store::RefStoreError::SymrefLoop) => {
-            Error::InvalidRef(format!("ref symlink too deep: {refname}"))
+        Error::Ref(RefError::Store(store::RefStoreError::SymrefLoop)) => {
+            Error::Ref(RefError::Invalid {
+                detail: format!("ref symlink too deep: {refname}"),
+            })
         }
         other => other,
     }
@@ -111,10 +114,15 @@ fn files_legacy_write_precheck(git_dir: &Path, refname: &str) -> Result<()> {
     {
         return Err(directory_in_the_way(git_dir, refname, &path));
     }
-    if path.is_file() && matches!(read_ref_file(&path), Err(Error::InvalidRef(_))) {
-        return Err(Error::InvalidRef(format!(
-            "cannot update ref '{refname}': reference broken"
-        )));
+    if path.is_file()
+        && matches!(
+            read_ref_file(&path),
+            Err(Error::Ref(RefError::Invalid { .. }))
+        )
+    {
+        return Err(Error::Ref(RefError::Invalid {
+            detail: format!("cannot update ref '{refname}': reference broken"),
+        }));
     }
     Ok(())
 }
@@ -126,8 +134,10 @@ fn files_legacy_write_precheck(git_dir: &Path, refname: &str) -> Result<()> {
 /// A directory that holds no ref (stray files or lock files only) is
 /// [`RefLockError::DirectoryInTheWay`].
 fn directory_in_the_way(git_dir: &Path, refname: &str, path: &Path) -> Error {
-    match verify_refname_available_for_create(git_dir, refname, &BTreeSet::new(), &HashSet::new()) {
-        Err(reason) => Error::RefStore(store::RefStoreError::NameUnavailable { reason }),
+    match verify_ref_available_for_create(git_dir, refname, &BTreeSet::new(), &HashSet::new()) {
+        Err(reason) => Error::Ref(RefError::Store(store::RefStoreError::NameUnavailable {
+            reason,
+        })),
         Ok(()) => RefLockError::DirectoryInTheWay {
             refname: refname.to_owned(),
             path: ref_path_for_display(path),
@@ -169,7 +179,7 @@ pub(crate) fn commit_ref_update_on_store_with_wait(
     if let Some(ref log) = update.reflog {
         validate_reflog_update(log)?;
     }
-    let refname = update.name.clone();
+    let refname = update.name.as_str().to_owned();
     let txn = RefTransaction::new()
         .update(update)
         .map_err(crate::error::Error::from)?;
@@ -183,31 +193,33 @@ pub(crate) fn commit_ref_update_on_store_with_wait(
 /// Prepare `txn` on `store`, retrying while the store reports [`RefStoreError::LockHeld`]
 /// until `wait` runs out.
 ///
-/// [`RefStore::prepare`] fails fast when another transaction holds the lock it needs. A
-/// backend with one writer slot for the whole store (such as
-/// [`store::MemoryRefStore`], or a database with a single write transaction) therefore
-/// rejects concurrent updates even to disjoint refs. This helper turns that into a bounded
-/// wait, sleeping a short jittered backoff between attempts: [`LockWait::Immediately`] tries
+/// [`RefStore::prepare_for`] with a bounded [`LockWait`]. Backends with one in-process writer
+/// slot (such as [`store::MemoryRefStore`] or a database with a single write transaction)
+/// must wait fairly inside `prepare_for` (typically with [`store::SingleWriterGate`]); this
+/// helper passes the wait budget through on each attempt and only retries jittered backoff
+/// when the store still reports [`RefStoreError::LockHeld`] after that wait (usually
+/// cross-process ref lock files on the files backend). [`LockWait::Immediately`] tries
 /// once, [`LockWait::Backoff`] retries until its budget elapses, and
 /// [`LockWait::Indefinitely`] retries until the lock is free. Use
 /// [`LockWait::files_ref_lock`] to follow `core.filesRefLockTimeout` like Git. The budget
-/// includes time spent inside `prepare`, so a backend that already waits for its own locks
-/// (the files and reftable backends) is not waited for twice. grit-lib's own ref writes
-/// (commits, branch updates, history rewrites, fetch and push) go through this retry.
+/// includes time spent inside `prepare_for`, so backends that already wait for their own
+/// lock files are not waited for twice when they ignore the passed `wait`. grit-lib's own ref
+/// writes (commits, branch updates, history rewrites, fetch and push) go through this path.
 ///
 /// ```rust
 /// use grit_lib::lockfile::LockWait;
 /// use grit_lib::objects::ObjectId;
 /// use grit_lib::refs::prepare_with_lock_wait;
 /// use grit_lib::refs::store::{
-///     Expected, MemoryRefStore, RawRef, RefStore, RefStoreError, RefTransaction, RefUpdate,
+///     Expected, MemoryRefStore, RawRef, RefName, RefNameRef, RefStore, RefStoreError,
+///     RefTransaction, RefUpdate,
 /// };
 /// # fn main() -> grit_lib::error::Result<()> {
 /// let store = MemoryRefStore::new();
 /// let oid = ObjectId::from_hex("1111111111111111111111111111111111111111")?;
 /// let txn = |name: &str| {
 ///     RefTransaction::new().update(RefUpdate {
-///         name: name.into(),
+///         name: RefName::from_trusted(name),
 ///         new_value: Some(RawRef::Direct(oid)),
 ///         expected: Expected::Any,
 ///         reflog: None,
@@ -217,11 +229,14 @@ pub(crate) fn commit_ref_update_on_store_with_wait(
 ///
 /// let held = store.prepare(txn("refs/heads/a")?)?;
 /// let busy = prepare_with_lock_wait(&store, txn("refs/heads/b")?, LockWait::Immediately);
-/// assert!(matches!(busy.map(|_| ()), Err(RefStoreError::LockHeld { name }) if name == "refs/heads/b"));
+/// assert!(matches!(
+///     busy.map(|_| ()),
+///     Err(RefStoreError::LockHeld { name }) if name.as_str() == "refs/heads/b"
+/// ));
 /// held.commit()?;
 ///
 /// prepare_with_lock_wait(&store, txn("refs/heads/b")?, LockWait::files_ref_lock(None))?.commit()?;
-/// assert_eq!(store.read_raw("refs/heads/b")?, Some(RawRef::Direct(oid)));
+/// assert_eq!(store.read_raw(RefNameRef::from_trusted("refs/heads/b"))?, Some(RawRef::Direct(oid)));
 /// # Ok(())
 /// # }
 /// ```
@@ -243,15 +258,41 @@ fn prepare_retrying(
     txn: RefTransaction,
     wait: impl FnOnce() -> LockWait,
 ) -> std::result::Result<Box<dyn PreparedRefTransaction + Send + '_>, RefStoreError> {
-    use crate::lockfile::{retry_while_held, SystemLockClock, SystemLockJitter};
-    retry_while_held(
-        Path::new("refs"),
-        wait,
-        &SystemLockClock,
-        &SystemLockJitter,
-        || store.prepare(txn.clone()),
-        |err| matches!(err, RefStoreError::LockHeld { .. }),
-    )
+    use crate::lockfile::{backoff_delay, LockClock, SystemLockClock, SystemLockJitter};
+    let clock = &SystemLockClock;
+    let jitter = &SystemLockJitter;
+    let key = Path::new("refs");
+    let start = clock.now();
+
+    let mut err = match store.prepare_for(txn.clone(), LockWait::Immediately) {
+        Ok(prepared) => return Ok(prepared),
+        Err(err) if matches!(err, RefStoreError::LockHeld { .. }) => err,
+        other => return other,
+    };
+
+    let wait_policy = wait();
+    let deadline = match wait_policy {
+        LockWait::Immediately => return Err(err),
+        LockWait::Backoff { budget } => Some(start + budget),
+        LockWait::Indefinitely => None,
+    };
+    let mut tries: u32 = 0;
+    loop {
+        if deadline.is_some_and(|deadline| clock.now() >= deadline) {
+            return Err(err);
+        }
+        let delay = backoff_delay(key, tries, jitter);
+        tries = tries.saturating_add(1);
+        clock.sleep(match deadline {
+            Some(deadline) => delay.min(deadline.saturating_duration_since(clock.now())),
+            None => delay,
+        });
+        match store.prepare_for(txn.clone(), wait_policy.remaining_from(start, clock.now())) {
+            Ok(prepared) => return Ok(prepared),
+            Err(held) if matches!(held, RefStoreError::LockHeld { .. }) => err = held,
+            other => return other,
+        }
+    }
 }
 
 /// How long ref writes wait for a busy store when the caller has no config at hand.
@@ -259,19 +300,24 @@ fn default_ref_lock_wait(store: &dyn RefStore) -> LockWait {
     store.ref_lock_wait()
 }
 
-/// Point `refname` at `oid` using `store`, optionally running loose-files prechecks when
-/// `store` uses the files backend under `git_dir`.
+/// Point `refname` at `oid` using `store`, without a reflog entry, optionally running
+/// loose-files prechecks when `store` uses the files backend under `git_dir`.
+///
+/// `HEAD` is written itself (detached) rather than the branch it points at; any other symbolic
+/// ref is followed.
 ///
 /// # Errors
 ///
-/// Same as [`write_ref`], except updates go through `store` instead of reopening storage from
-/// `git_dir`.
+/// [`RefError::Invalid`] when `refname` is not safe to store, a namespace conflict, and the
+/// object, lock and I/O errors of `store`'s transaction (for the repository's store,
+/// [`store::RefStoreError::MissingObject`] and [`store::RefStoreError::NotACommit`]).
 pub fn update_direct_ref_on_store(
     store: &dyn RefStore,
     git_dir: &Path,
-    refname: &str,
+    refname: impl AsRef<RefNameRef>,
     oid: &ObjectId,
 ) -> Result<()> {
+    let refname = refname.as_ref().as_str();
     store_write_value_on_store(
         store,
         git_dir,
@@ -297,7 +343,7 @@ pub(crate) fn store_write_value_on_store(
     commit_ref_update_on_store(
         store,
         RefUpdate {
-            name: refname.to_owned(),
+            name: RefName::from_trusted(refname.to_owned()),
             new_value,
             expected,
             reflog,
@@ -309,13 +355,13 @@ pub(crate) fn store_write_value_on_store(
 /// Apply several ref updates in one [`RefStore::prepare`] / commit (all-or-nothing).
 ///
 /// Opens a fresh on-disk ref store for `git_dir` (object-checked open used internally)
-/// and bypasses [`crate::repo::Repository::refs`] and any injected
-/// [`crate::refs::store::RefStore`]. Prefer [`commit_ref_updates_on_store`] with
-/// [`crate::repo::Repository::refs`] when you already have a
+/// and bypasses [`crate::repo::Repository::ref_store`] and any injected
+/// [`crate::refs::store::RefStore`]. Prefer `commit_ref_updates_on_store` with
+/// [`crate::repo::Repository::ref_store`] when you already have a
 /// [`crate::repo::Repository`].
 ///
 /// Used by batch ref paths (`fetch`, `push`, `receive-pack`, [`crate::gc::update_refs`]).
-/// Like [`crate::repo::Repository::refs`], the batch is checked against `git_dir`'s objects
+/// Like [`crate::repo::Repository::ref_store`], the batch is checked against `git_dir`'s objects
 /// first.
 ///
 /// # Errors
@@ -325,28 +371,16 @@ pub(crate) fn store_write_value_on_store(
 /// ([`MissingObject`](store::RefStoreError::MissingObject)) or, on a branch or `HEAD`, a
 /// non-commit ([`NotACommit`](store::RefStoreError::NotACommit)). Propagates I/O and
 /// corrupt-store failures.
-pub fn commit_ref_store_batch(git_dir: &Path, updates: &[RefUpdate]) -> Result<()> {
+pub(crate) fn commit_ref_store_batch(git_dir: &Path, updates: &[RefUpdate]) -> Result<()> {
     if updates.is_empty() {
         return Ok(());
     }
     commit_ref_updates_on_store(&store::open_checked_ref_store(git_dir)?, updates, &[])
 }
 
-/// [`commit_ref_updates_non_atomic_on_store`] for a repository git directory.
-///
-/// # Errors
-///
-/// Same as [`commit_ref_updates_non_atomic_on_store`].
-pub fn commit_ref_updates_non_atomic(
-    git_dir: &Path,
-    updates: Vec<RefUpdate>,
-) -> Result<Vec<RefUpdateCommitOutcome>> {
-    commit_ref_updates_non_atomic_on_store(&store::open_checked_ref_store(git_dir)?, updates)
-}
-
 /// Apply several ref updates atomically through an existing [`crate::refs::store::RefStore`].
 ///
-/// Object checks are those of `store`: the store from [`crate::repo::Repository::refs`]
+/// Object checks are those of `store`: the store from [`crate::repo::Repository::ref_store`]
 /// verifies direct values against the repository's objects, a bare backend does not.
 ///
 /// # Errors
@@ -365,7 +399,7 @@ pub fn commit_ref_updates_on_store(
 /// # Errors
 ///
 /// Propagates validation, compare-and-swap, and backend errors from [`RefStore::prepare`].
-pub fn commit_ref_batch_on_store(
+pub(crate) fn commit_ref_batch_on_store(
     store: &dyn RefStore,
     updates: &[RefUpdate],
     reflog_renames: &[RefReflogRename],
@@ -380,11 +414,12 @@ pub fn commit_ref_batch_on_store(
         reflog_renames.to_vec(),
         case_only_renames.to_vec(),
         false,
+        false,
         || default_ref_lock_wait(store),
     )
 }
 
-/// Per-ref result from [`commit_ref_updates_non_atomic_on_store`].
+/// Per-ref result from `commit_ref_updates_non_atomic_on_store`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefUpdateCommitOutcome {
     /// Full ref name from the input batch.
@@ -403,14 +438,14 @@ pub struct RefUpdateCommitOutcome {
 /// # Errors
 ///
 /// Propagates whole-transaction failures (duplicate names in the batch, I/O, lock timeout).
-pub fn commit_ref_updates_non_atomic_on_store(
+pub(crate) fn commit_ref_updates_non_atomic_on_store(
     store: &dyn RefStore,
     updates: Vec<RefUpdate>,
 ) -> Result<Vec<RefUpdateCommitOutcome>> {
     if updates.is_empty() {
         return Ok(Vec::new());
     }
-    let order: Vec<String> = updates.iter().map(|u| u.name.clone()).collect();
+    let order: Vec<String> = updates.iter().map(|u| u.name.as_str().to_owned()).collect();
     let (deletes, rest): (Vec<_>, Vec<_>) = updates
         .into_iter()
         .partition(|u| u.new_value.is_none() && !u.flags.log_only);
@@ -422,7 +457,7 @@ pub fn commit_ref_updates_non_atomic_on_store(
         }
         for outcome in commit_ref_updates_allowing_failures_on_store(store, phase)? {
             if let Err(err) = outcome.result {
-                results.insert(outcome.name, err);
+                results.insert(outcome.name.as_str().to_owned(), err);
             }
         }
     }
@@ -441,14 +476,14 @@ pub fn commit_ref_updates_non_atomic_on_store(
 /// # Errors
 ///
 /// Propagates whole-transaction failures from [`RefStore::prepare`] or commit.
-pub fn commit_ref_updates_allowing_failures_on_store(
+pub(crate) fn commit_ref_updates_allowing_failures_on_store(
     store: &dyn RefStore,
     updates: Vec<RefUpdate>,
 ) -> Result<Vec<RefUpdateCommitOutcome>> {
     if updates.is_empty() {
         return Ok(Vec::new());
     }
-    let order: Vec<String> = updates.iter().map(|u| u.name.clone()).collect();
+    let order: Vec<String> = updates.iter().map(|u| u.name.as_str().to_owned()).collect();
     for update in &updates {
         if let Some(ref log) = update.reflog {
             validate_reflog_update(log)?;
@@ -456,7 +491,7 @@ pub fn commit_ref_updates_allowing_failures_on_store(
     }
     let label = updates
         .first()
-        .map(|u| u.name.clone())
+        .map(|u| u.name.as_str().to_owned())
         .unwrap_or_else(|| "refs".to_owned());
     let txn = RefTransaction::from_updates(updates).map_err(|e| {
         let name = match &e {
@@ -471,7 +506,7 @@ pub fn commit_ref_updates_allowing_failures_on_store(
     let rejections: std::collections::HashMap<String, store::RefStoreError> = prepared
         .rejected_updates()
         .iter()
-        .map(|(name, err)| (name.clone(), err.clone()))
+        .map(|(name, err)| (name.as_str().to_owned(), err.clone()))
         .collect();
     prepared
         .commit()
@@ -496,7 +531,15 @@ pub(crate) fn commit_ref_updates_on_store_with_wait(
     if updates.is_empty() {
         return Ok(());
     }
-    commit_owned_ref_batch_on_store(store, updates.to_vec(), Vec::new(), Vec::new(), false, wait)
+    commit_owned_ref_batch_on_store(
+        store,
+        updates.to_vec(),
+        Vec::new(),
+        Vec::new(),
+        false,
+        false,
+        wait,
+    )
 }
 
 /// [`commit_ref_updates_on_store`] taking ownership of `updates`, so a large batch is not copied.
@@ -511,7 +554,7 @@ pub(crate) fn commit_owned_ref_updates_on_store(
     if updates.is_empty() {
         return Ok(());
     }
-    commit_owned_ref_batch_on_store(store, updates, Vec::new(), Vec::new(), false, || {
+    commit_owned_ref_batch_on_store(store, updates, Vec::new(), Vec::new(), false, false, || {
         default_ref_lock_wait(store)
     })
 }
@@ -523,11 +566,14 @@ pub(crate) fn commit_owned_ref_updates_on_store(
 /// # Errors
 ///
 /// Same as [`commit_ref_updates_on_store`].
-pub(crate) fn commit_initial_ref_updates_on_store(
+/// [`commit_initial_ref_updates_on_store_with_wait`] for the first fetch of a clone (case variant pairs).
+pub(crate) fn commit_initial_clone_ref_updates_on_store(
     store: &dyn RefStore,
     updates: Vec<RefUpdate>,
 ) -> Result<()> {
-    commit_initial_ref_updates_on_store_with_wait(store, updates, || default_ref_lock_wait(store))
+    commit_initial_clone_ref_updates_on_store_with_wait(store, updates, || {
+        default_ref_lock_wait(store)
+    })
 }
 
 /// [`commit_initial_ref_updates_on_store`] retrying a busy store for `wait` (see
@@ -537,10 +583,37 @@ pub(crate) fn commit_initial_ref_updates_on_store_with_wait(
     updates: Vec<RefUpdate>,
     wait: impl FnOnce() -> LockWait,
 ) -> Result<()> {
+    commit_initial_ref_updates_on_store_with_wait_impl(store, updates, wait, false)
+}
+
+/// Like [`commit_initial_ref_updates_on_store_with_wait`], but allows ASCII case variant
+/// pairs in one initial `packed-refs` write (remote-tracking refs on clone).
+pub(crate) fn commit_initial_clone_ref_updates_on_store_with_wait(
+    store: &dyn RefStore,
+    updates: Vec<RefUpdate>,
+    wait: impl FnOnce() -> LockWait,
+) -> Result<()> {
+    commit_initial_ref_updates_on_store_with_wait_impl(store, updates, wait, true)
+}
+
+fn commit_initial_ref_updates_on_store_with_wait_impl(
+    store: &dyn RefStore,
+    updates: Vec<RefUpdate>,
+    wait: impl FnOnce() -> LockWait,
+    allow_ignorecase_same_batch_refs: bool,
+) -> Result<()> {
     if updates.is_empty() {
         return Ok(());
     }
-    commit_owned_ref_batch_on_store(store, updates, Vec::new(), Vec::new(), true, wait)
+    commit_owned_ref_batch_on_store(
+        store,
+        updates,
+        Vec::new(),
+        Vec::new(),
+        true,
+        allow_ignorecase_same_batch_refs,
+        wait,
+    )
 }
 
 fn commit_owned_ref_batch_on_store(
@@ -549,6 +622,7 @@ fn commit_owned_ref_batch_on_store(
     reflog_renames: Vec<RefReflogRename>,
     case_only_renames: Vec<RefCaseOnlyRename>,
     initial: bool,
+    initial_ignorecase_same_batch_refs: bool,
     wait: impl FnOnce() -> LockWait,
 ) -> Result<()> {
     for update in &updates {
@@ -561,9 +635,13 @@ fn commit_owned_ref_batch_on_store(
     }
     let label = updates
         .first()
-        .map(|u| u.name.clone())
-        .or_else(|| reflog_renames.first().map(|r| r.from.clone()))
-        .or_else(|| case_only_renames.first().map(|r| r.from.clone()))
+        .map(|u| u.name.as_str().to_owned())
+        .or_else(|| reflog_renames.first().map(|r| r.from.as_str().to_owned()))
+        .or_else(|| {
+            case_only_renames
+                .first()
+                .map(|r| r.from.as_str().to_owned())
+        })
         .unwrap_or_else(|| "refs".to_owned());
     let mut txn = RefTransaction::from_updates(updates).map_err(|e| {
         let name = match &e {
@@ -580,6 +658,9 @@ fn commit_owned_ref_batch_on_store(
     }
     if initial {
         txn = txn.initial();
+        if initial_ignorecase_same_batch_refs {
+            txn = txn.initial_ignorecase_same_batch_refs();
+        }
     }
     let prepared = prepare_retrying(store, txn, wait)
         .map_err(|e| map_public_ref_store_error(Error::from(e), &label))?;
@@ -619,15 +700,16 @@ fn collect_resolved_ref_entries(
 ) -> Result<Vec<(String, ObjectId)>> {
     let mut results = Vec::new();
     for_each(&mut |entry: &RefEntry| {
-        let oid = entry
-            .peeled
-            .or_else(|| match &entry.value {
-                StoreRawRef::Direct(oid) => Some(*oid),
-                StoreRawRef::Symbolic(target) => store.resolve(target).ok(),
-            })
-            .or_else(|| store.resolve(&entry.name).ok());
+        let oid = match &entry.value {
+            StoreRawRef::Direct(oid) => Some(*oid),
+            StoreRawRef::Symbolic(target) => entry.peeled.or_else(|| {
+                store
+                    .resolve(RefNameRef::from_trusted(target.as_str()))
+                    .ok()
+            }),
+        };
         if let Some(oid) = oid {
-            results.push((entry.name.clone(), oid));
+            results.push((entry.name.as_str().to_owned(), oid));
         }
         ControlFlow::Continue(())
     })?;
@@ -647,7 +729,7 @@ pub enum Ref {
 ///
 /// # Errors
 ///
-/// - [`Error::InvalidRef`] if the file content is not a valid ref.
+/// - [`crate::error::RefError::Invalid`] if the file content is not a valid ref.
 /// - [`Error::Io`] on filesystem errors.
 pub fn read_ref_file(path: &Path) -> Result<Ref> {
     // One `lstat` answers the common "no such ref" probe and finds legacy symlink refs.
@@ -712,17 +794,21 @@ pub(crate) fn parse_ref_content(content: &str) -> Result<Ref> {
             let oid = ObjectId::from_bytes(PLACEHOLDER)?;
             Ok(Ref::Direct(oid))
         } else {
-            Err(Error::InvalidRef(content.to_owned()))
+            Err(Error::Ref(RefError::Invalid {
+                detail: content.to_owned(),
+            }))
         }
     } else {
-        Err(Error::InvalidRef(content.to_owned()))
+        Err(Error::Ref(RefError::Invalid {
+            detail: content.to_owned(),
+        }))
     }
 }
 
 /// Resolve a reference to its target [`ObjectId`], following symbolic refs.
 ///
 /// Opens a fresh on-disk ref store via [`crate::refs::store::open_ref_store`] and
-/// bypasses [`crate::repo::Repository::refs`] and any injected
+/// bypasses [`crate::repo::Repository::ref_store`] and any injected
 /// [`crate::refs::store::RefStore`]. Prefer [`crate::refs::References::resolve`]
 /// when you already have a [`crate::repo::Repository`].
 ///
@@ -735,12 +821,13 @@ pub(crate) fn parse_ref_content(content: &str) -> Result<Ref> {
 ///
 /// # Errors
 ///
-/// - [`Error::RefStore`] with [`RefStoreError::NotFound`] if
+/// - [`crate::error::RefError::Store`] with [`RefStoreError::NotFound`] if
 ///   `refname`, or the target at the end of its symbolic chain, does not exist.
-/// - [`Error::InvalidRef`] if the ref is malformed or forms a cycle.
-pub fn resolve_ref(git_dir: &Path, refname: &str) -> Result<ObjectId> {
+/// - [`crate::error::RefError::Invalid`] if the ref is malformed or forms a cycle.
+pub(crate) fn resolve_ref(git_dir: &Path, refname: impl AsRef<RefNameRef>) -> Result<ObjectId> {
+    let refname = refname.as_ref().as_str();
     open_ref_store(git_dir)?
-        .resolve(refname)
+        .resolve(RefNameRef::from_trusted(refname))
         .map_err(|err| map_public_ref_store_error(err, refname))
 }
 
@@ -748,7 +835,7 @@ pub fn resolve_ref(git_dir: &Path, refname: &str) -> Result<ObjectId> {
 ///
 /// If `<git_dir>/commondir` exists, its contents point to the shared
 /// git directory. Returns `None` when git_dir is already the common dir.
-pub fn common_dir(git_dir: &Path) -> Option<PathBuf> {
+pub(crate) fn common_dir(git_dir: &Path) -> Option<PathBuf> {
     let commondir_file = git_dir.join("commondir");
     if !commondir_file.is_file() {
         return None;
@@ -783,9 +870,9 @@ pub enum RawRefLookup {
 /// Return whether `refname` exists as a ref in the repository's ref storage.
 ///
 /// Opens a fresh on-disk ref store via [`crate::refs::store::open_ref_store`] and
-/// bypasses [`crate::repo::Repository::refs`] and any injected
+/// bypasses [`crate::repo::Repository::ref_store`] and any injected
 /// [`crate::refs::store::RefStore`]. Prefer [`crate::refs::store::RefStore::read_raw`]
-/// on [`crate::repo::Repository::refs`] when you already have a
+/// on [`crate::repo::Repository::ref_store`] when you already have a
 /// [`crate::repo::Repository`].
 ///
 /// This matches `git refs exists` / `git show-ref --exists`: no DWIM, no
@@ -800,9 +887,13 @@ pub enum RawRefLookup {
 /// # Errors
 ///
 /// Propagates I/O and reftable errors other than "not found".
-pub fn read_raw_ref(git_dir: &Path, refname: &str) -> Result<RawRefLookup> {
+pub(crate) fn read_raw_ref(
+    git_dir: &Path,
+    refname: impl AsRef<RefNameRef>,
+) -> Result<RawRefLookup> {
+    let refname = refname.as_ref().as_str();
     let store = open_ref_store(git_dir)?;
-    match store.read_raw(refname)? {
+    match store.read_raw(RefNameRef::from_trusted(refname))? {
         Some(_) => Ok(RawRefLookup::Exists),
         None => {
             let (storage_dir, stor_name) =
@@ -888,7 +979,7 @@ fn packed_ref_namespace_conflict(git_dir: &Path, refname: &str) -> Result<bool> 
 /// Returns true if `packed-refs` in the ref storage directory for `refname` contains that name.
 ///
 /// Opens a fresh on-disk ref store via [`crate::refs::store::open_ref_store`] and
-/// bypasses [`crate::repo::Repository::refs`] and any injected
+/// bypasses [`crate::repo::Repository::ref_store`] and any injected
 /// [`crate::refs::store::RefStore`].
 ///
 /// Used to mirror Git's `is_packed_transaction_needed` behaviour: deleting a ref may open a nested
@@ -900,7 +991,11 @@ fn packed_ref_namespace_conflict(git_dir: &Path, refname: &str) -> Result<bool> 
 /// # Errors
 ///
 /// Propagates I/O errors reading `packed-refs`.
-pub fn packed_refs_entry_exists(git_dir: &Path, refname: &str) -> Result<bool> {
+pub(crate) fn packed_refs_entry_exists(
+    git_dir: &Path,
+    refname: impl AsRef<RefNameRef>,
+) -> Result<bool> {
+    let refname = refname.as_ref().as_str();
     if refname == "HEAD" {
         return Ok(false);
     }
@@ -984,28 +1079,19 @@ fn find_descendant_in_sorted_extras(
 ///
 /// Delegates to [`crate::check_ref_format::is_valid_fetch_advertised_ref`].
 #[must_use]
-pub fn is_valid_fetch_advertised_ref(name: &str) -> bool {
+pub(crate) fn is_valid_fetch_advertised_ref(name: &str) -> bool {
     crate::check_ref_format::is_valid_fetch_advertised_ref(name)
-}
-
-/// Whether a name from a protocol-v2 `ls-refs` response should be kept.
-///
-/// `HEAD` is valid without a `refs/` prefix; every other name must pass
-/// [`is_valid_fetch_advertised_ref`].
-#[must_use]
-pub fn is_valid_ls_refs_advertised_name(name: &str) -> bool {
-    name == "HEAD" || is_valid_fetch_advertised_ref(name)
 }
 
 /// Whether a ref name is safe to store under the ref backend (post-refspec mapping).
 #[must_use]
-pub fn is_valid_storable_ref_name(name: &str) -> bool {
-    is_valid_fetch_advertised_ref(name)
+pub(crate) fn is_valid_storable_ref_name(name: &str) -> bool {
+    crate::check_ref_format::is_storable_ref_name(name)
 }
 
 /// Whether a symref target from a ref advertisement is safe to record.
 #[must_use]
-pub fn is_valid_advertised_symref_target(name: &str) -> bool {
+pub(crate) fn is_valid_advertised_symref_target(name: &str) -> bool {
     crate::check_ref_format::is_valid_advertised_symref_target(name)
 }
 
@@ -1021,12 +1107,13 @@ pub fn is_valid_advertised_symref_target(name: &str) -> bool {
 /// - `refname` — full ref name to create.
 /// - `extras` — other refnames touched in the same stdin batch / transaction (sorted set).
 /// - `skip` — refnames that may be deleted or updated away in the same batch.
-pub fn verify_refname_available_for_create(
+pub(crate) fn verify_ref_available_for_create(
     git_dir: &Path,
-    refname: &str,
+    refname: impl AsRef<RefNameRef>,
     extras: &BTreeSet<String>,
     skip: &HashSet<String>,
 ) -> std::result::Result<(), RefnameUnavailable> {
+    let refname = refname.as_ref().as_str();
     // `Repository::git_dir` may be a relative path (e.g. `.git`); resolve so lookups match the
     // on-disk ref store regardless of process cwd (test harness runs from `trash/.git/...`).
     let git_dir = git_dir
@@ -1185,7 +1272,8 @@ pub struct RefBatchItem {
 /// # Errors
 ///
 /// Returns [`RefnameUnavailable`] describing the first conflict.
-pub fn verify_ref_transaction_batch(
+#[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
+pub(crate) fn verify_ref_transaction_batch(
     git_dir: &Path,
     items: &[RefBatchItem],
 ) -> std::result::Result<(), RefnameUnavailable> {
@@ -1211,12 +1299,13 @@ pub fn verify_ref_transaction_batch(
         if resolve_ref(git_dir, &item.name).is_ok() {
             continue;
         }
-        verify_refname_available_for_create(git_dir, &item.name, &extras, &empty_skip)?;
+        verify_ref_available_for_create(git_dir, &item.name, &extras, &empty_skip)?;
     }
     Ok(())
 }
 
 /// First strict prefix conflict in a batch, if any (sorted adjacent scan).
+#[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
 pub(crate) fn batch_refname_prefix_conflict<'a>(
     names: impl Iterator<Item = &'a str>,
 ) -> Option<(String, String)> {
@@ -1234,6 +1323,7 @@ pub(crate) fn batch_refname_prefix_conflict<'a>(
     None
 }
 
+#[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
 fn refname_is_strict_prefix(parent: &str, child: &str) -> bool {
     child.len() > parent.len()
         && child.as_bytes().get(parent.len()) == Some(&b'/')
@@ -1241,17 +1331,17 @@ fn refname_is_strict_prefix(parent: &str, child: &str) -> bool {
 }
 
 fn packed_refs_unexpected_line(path: &Path, line: impl Into<String>) -> Error {
-    Error::PackedRefsUnexpectedLine {
+    Error::Ref(RefError::PackedRefsUnexpectedLine {
         path: path.display().to_string(),
         line: line.into(),
-    }
+    })
 }
 
 fn packed_refs_unterminated_line(path: &Path, line: impl Into<String>) -> Error {
-    Error::PackedRefsUnexpectedLine {
+    Error::Ref(RefError::PackedRefsUnexpectedLine {
         path: path.display().to_string(),
         line: line.into(),
-    }
+    })
 }
 
 /// Validate a `^<peeled-oid>` line and return the peeled id.
@@ -1294,7 +1384,7 @@ fn packed_ref_data_line_refname(line: &str) -> Option<&str> {
 fn parse_packed_ref_data_line(
     path: &Path,
     line: &str,
-    ref_opts: &RefNameOptions,
+    ref_opts: &RefFormatOptions,
 ) -> Result<(String, ObjectId)> {
     let (refname, oid) = parse_packed_ref_data_line_borrowed(path, line, ref_opts)?;
     Ok((refname.to_owned(), oid))
@@ -1303,7 +1393,7 @@ fn parse_packed_ref_data_line(
 fn parse_packed_ref_data_line_borrowed<'a>(
     path: &Path,
     line: &'a str,
-    ref_opts: &RefNameOptions,
+    ref_opts: &RefFormatOptions,
 ) -> Result<(&'a str, ObjectId)> {
     let Some((hex_len, oid)) = packed_line_oid(line) else {
         return Err(packed_refs_unexpected_line(path, line));
@@ -1336,6 +1426,11 @@ fn parse_packed_ref_data_line_borrowed<'a>(
 ///
 /// Full scans (no prefix, or all of `refs/`) and files without the trait read every line:
 /// they reject a carriage return or invalid UTF-8 anywhere in the file.
+enum StreamRecordsError {
+    OutOfOrder,
+    Packed(Error),
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct PackedRefsFileView {
     data: std::sync::Arc<crate::pack_map::PackData>,
@@ -1509,7 +1604,7 @@ impl PackedRefsFileView {
         path: &Path,
         refname: &str,
     ) -> Result<Option<(ObjectId, Option<ObjectId>)>> {
-        let ref_opts = RefNameOptions {
+        let ref_opts = RefFormatOptions {
             allow_onelevel: false,
             refspec_pattern: false,
             normalize: false,
@@ -1612,6 +1707,231 @@ impl PackedRefsFileView {
         Ok(map)
     }
 
+    /// Walk `packed-refs` records in file order without building a map.
+    ///
+    /// Names are borrowed from the mapped file bytes. When the header declares `sorted` and
+    /// the requested range is in order, only that byte range is read; otherwise the file is
+    /// scanned from the start or the walk falls back to [`Self::map_for_prefix_filtered`].
+    ///
+    /// # Errors
+    ///
+    /// Malformed lines propagate like other packed-refs parsers. A sorted range that is out
+    /// of order falls back to the map path instead of failing.
+    pub(crate) fn for_each_record(
+        &self,
+        path: &Path,
+        prefix: Option<&str>,
+        keep: Option<PackedRecordFilter<'_>>,
+        mut f: impl FnMut(&str, ObjectId, PackedPeel) -> ControlFlow<()>,
+    ) -> Result<ControlFlow<()>> {
+        if !self.sorted {
+            return self.for_each_record_fallback(path, prefix, keep, &BTreeSet::new(), &mut f);
+        }
+        if keep.is_some() {
+            return self.for_each_kept_record(path, prefix, keep, f);
+        }
+        let mut prove = |_: &str, _: ObjectId, _: PackedPeel| ControlFlow::Continue(());
+        match self.walk_records(path, prefix, keep, false, &mut prove) {
+            Err(StreamRecordsError::OutOfOrder) => {
+                return self.for_each_record_fallback(path, prefix, keep, &BTreeSet::new(), &mut f);
+            }
+            Err(StreamRecordsError::Packed(e)) => return Err(e),
+            Ok(_) => {}
+        }
+        match self.walk_records(path, prefix, keep, true, &mut f) {
+            Ok(flow) => Ok(flow),
+            Err(StreamRecordsError::OutOfOrder) => {
+                self.for_each_record_fallback(path, prefix, keep, &BTreeSet::new(), &mut f)
+            }
+            Err(StreamRecordsError::Packed(e)) => Err(e),
+        }
+    }
+
+    /// [`Self::for_each_record`] for a filtered scan of a sorted file, in one strict pass.
+    ///
+    /// A filter usually rejects most records, so the ones it keeps are held (borrowed from
+    /// the file) until the whole range has parsed and proved in order, instead of parsing
+    /// the range a second time to emit them. `f` sees nothing when the range is corrupt or
+    /// out of order, as with the unfiltered two-pass walk.
+    fn for_each_kept_record(
+        &self,
+        path: &Path,
+        prefix: Option<&str>,
+        keep: Option<PackedRecordFilter<'_>>,
+        mut f: impl FnMut(&str, ObjectId, PackedPeel) -> ControlFlow<()>,
+    ) -> Result<ControlFlow<()>> {
+        let mut kept = Vec::new();
+        let mut hold = |name, oid, peel| {
+            kept.push((name, oid, peel));
+            ControlFlow::Continue(())
+        };
+        match self.walk_records(path, prefix, keep, true, &mut hold) {
+            Ok(_) => {}
+            Err(StreamRecordsError::OutOfOrder) => {
+                return self.for_each_record_fallback(path, prefix, keep, &BTreeSet::new(), &mut f);
+            }
+            Err(StreamRecordsError::Packed(e)) => return Err(e),
+        }
+        for (name, oid, peel) in kept {
+            if f(name, oid, peel).is_break() {
+                return Ok(ControlFlow::Break(()));
+            }
+        }
+        Ok(ControlFlow::Continue(()))
+    }
+
+    fn for_each_record_fallback(
+        &self,
+        path: &Path,
+        prefix: Option<&str>,
+        keep: Option<PackedRecordFilter<'_>>,
+        already_emitted: &BTreeSet<String>,
+        f: &mut impl FnMut(&str, ObjectId, PackedPeel) -> ControlFlow<()>,
+    ) -> Result<ControlFlow<()>> {
+        let map = self.map_for_prefix_filtered(path, prefix, keep)?;
+        let mut names: Vec<String> = map.keys().cloned().collect();
+        names.sort();
+        for name in names {
+            if already_emitted.contains(&name) {
+                continue;
+            }
+            let oid = map[&name];
+            if f(&name, oid, PackedPeel::Unknown).is_break() {
+                return Ok(ControlFlow::Break(()));
+            }
+        }
+        Ok(ControlFlow::Continue(()))
+    }
+
+    fn walk_records<'s>(
+        &'s self,
+        path: &Path,
+        prefix: Option<&str>,
+        keep: Option<PackedRecordFilter<'_>>,
+        emit: bool,
+        f: &mut impl FnMut(&'s str, ObjectId, PackedPeel) -> ControlFlow<()>,
+    ) -> std::result::Result<ControlFlow<()>, StreamRecordsError> {
+        let prefix_trim = prefix.map(|p| p.trim_end_matches('/'));
+        let prefix_upper = if self.sorted {
+            prefix_trim.and_then(list_prefix_upper_bound)
+        } else {
+            None
+        };
+        let ref_opts = RefFormatOptions {
+            allow_onelevel: false,
+            refspec_pattern: false,
+            normalize: false,
+        };
+        let (mut pos, end) = self.record_scan_range(prefix_trim, prefix_upper.as_deref());
+        let mut prev_name = "";
+        let mut expect_peel = false;
+        let mut pending: Option<(&'s str, ObjectId, Option<ObjectId>)> = None;
+        let mut flush = |pending: &mut Option<(&'s str, ObjectId, Option<ObjectId>)>| {
+            let Some((refname, oid, peeled)) = pending.take() else {
+                return Ok(ControlFlow::Continue(()));
+            };
+            let peel = if self.peel_trait.covers(refname) {
+                peeled.map_or(PackedPeel::NotTag, PackedPeel::Peeled)
+            } else {
+                PackedPeel::Unknown
+            };
+            if keep.is_some_and(|keep| !keep(refname, &oid, peel)) {
+                return Ok(ControlFlow::Continue(()));
+            }
+            if !emit {
+                return Ok(ControlFlow::Continue(()));
+            }
+            if f(refname, oid, peel).is_break() {
+                Ok(ControlFlow::Break(()))
+            } else {
+                Ok(ControlFlow::Continue(()))
+            }
+        };
+
+        while pos < end {
+            let line_end = packed_line_end(&self.data, pos).min(end);
+            if self.data[pos..line_end].contains(&b'\r') {
+                return Err(StreamRecordsError::Packed(packed_refs_unexpected_line(
+                    path,
+                    "<contains carriage return>",
+                )));
+            }
+            let line = std::str::from_utf8(&self.data[pos..line_end]).map_err(|_| {
+                StreamRecordsError::Packed(packed_refs_unexpected_line(path, "<invalid utf-8>"))
+            })?;
+            if line.is_empty() {
+                if pos + 1 < end {
+                    return Err(StreamRecordsError::Packed(packed_refs_unexpected_line(
+                        path, line,
+                    )));
+                }
+                break;
+            }
+            if line.starts_with('#') {
+                if flush(&mut pending)?.is_break() {
+                    return Ok(ControlFlow::Break(()));
+                }
+                expect_peel = false;
+                pos = line_end + 1;
+                continue;
+            }
+            if line.starts_with('^') {
+                let peel = parse_packed_ref_peel_line(path, line, expect_peel)
+                    .map_err(StreamRecordsError::Packed)?;
+                if let Some((_, _, stored)) = pending.as_mut() {
+                    *stored = Some(peel);
+                }
+                expect_peel = false;
+                pos = line_end + 1;
+                continue;
+            }
+            let (refname, oid) = parse_packed_ref_data_line_borrowed(path, line, &ref_opts)
+                .map_err(StreamRecordsError::Packed)?;
+            if self.sorted && !prev_name.is_empty() && refname < prev_name {
+                return Err(StreamRecordsError::OutOfOrder);
+            }
+            if flush(&mut pending)?.is_break() {
+                return Ok(ControlFlow::Break(()));
+            }
+            prev_name = refname;
+            let in_prefix = prefix_trim.is_none_or(|p| ref_name_matches_list_prefix(refname, p));
+            if in_prefix {
+                pending = Some((refname, oid, None));
+            } else if self.sorted {
+                if let Some(upper) = prefix_upper.as_deref() {
+                    if refname >= upper {
+                        break;
+                    }
+                }
+            }
+            expect_peel = true;
+            pos = line_end + 1;
+        }
+        if flush(&mut pending)?.is_break() {
+            return Ok(ControlFlow::Break(()));
+        }
+        Ok(ControlFlow::Continue(()))
+    }
+
+    fn record_scan_range(
+        &self,
+        prefix_trim: Option<&str>,
+        prefix_upper: Option<&str>,
+    ) -> (usize, usize) {
+        let len = self.data.len();
+        if self.sorted {
+            if let Some(p) = prefix_trim.filter(|p| !p.is_empty() && *p != "refs") {
+                let first = self.lower_bound(p);
+                let end = prefix_upper.map_or(len, |upper| self.lower_bound(upper));
+                if end < first {
+                    return (len, len);
+                }
+                return (first, end);
+            }
+        }
+        (self.body_start, len)
+    }
+
     /// Byte range a prefix scan of a sorted file covers, including the neighbouring records
     /// and their peel lines. Parsing these neighbours validates their contents as well as
     /// their order without scanning the rest of the file.
@@ -1708,7 +2028,7 @@ fn parse_packed_refs_region<C: Default + Extend<(String, ObjectId)>>(
     keep: Option<PackedRecordFilter<'_>>,
     peel_trait: PackedPeelTrait,
 ) -> Result<(C, bool)> {
-    let ref_opts = RefNameOptions {
+    let ref_opts = RefFormatOptions {
         allow_onelevel: false,
         refspec_pattern: false,
         normalize: false,
@@ -1821,7 +2141,7 @@ fn parse_packed_line_at(
     path: &Path,
     data: &[u8],
     line_start: usize,
-    ref_opts: &RefNameOptions,
+    ref_opts: &RefFormatOptions,
 ) -> Result<(String, ObjectId)> {
     let line = packed_line_as_str(data, line_start);
     parse_packed_ref_data_line(path, line, ref_opts)
@@ -1877,11 +2197,62 @@ fn parse_packed_refs_to_map_with_prefix(
 }
 
 /// Validate every scanned record, passing borrowed names to a caller that need not keep them.
-fn visit_packed_refs_with_prefix(
+fn visit_packed_refs_with_prefix<'a>(
     path: &Path,
-    data: &[u8],
+    data: &'a [u8],
     prefix_filter: Option<&str>,
-    mut visit: impl FnMut(&str, ObjectId),
+    mut visit: impl FnMut(&'a str, ObjectId),
+) -> Result<()> {
+    scan_packed_refs(path, data, prefix_filter, |line| {
+        if let PackedLine::Record(name, oid) = line {
+            visit(name, oid);
+        }
+    })
+}
+
+/// A line of a `packed-refs` file reported by [`scan_packed_refs`].
+enum PackedLine<'a> {
+    /// A record: the ref name and its object id.
+    Record(&'a str, ObjectId),
+    /// The `^` peeled id of the record reported just before it.
+    Peel(ObjectId),
+}
+
+/// A validated `packed-refs` record borrowing its name from the file bytes.
+#[derive(Clone, Copy)]
+struct PackedEntry<'a> {
+    name: &'a str,
+    oid: ObjectId,
+    peel: Option<ObjectId>,
+}
+
+/// Every record of `data` with its `^` peel line, in file order.
+///
+/// Validates the whole file exactly as a full [`visit_packed_refs_with_prefix`] scan does.
+fn packed_entries_with_peel<'a>(path: &Path, data: &'a [u8]) -> Result<Vec<PackedEntry<'a>>> {
+    let mut entries: Vec<PackedEntry<'a>> = Vec::with_capacity(data.len() / 64);
+    scan_packed_refs(path, data, None, |line| match line {
+        PackedLine::Record(name, oid) => entries.push(PackedEntry {
+            name,
+            oid,
+            peel: None,
+        }),
+        PackedLine::Peel(peel) => {
+            if let Some(entry) = entries.last_mut() {
+                entry.peel = Some(peel);
+            }
+        }
+    })?;
+    Ok(entries)
+}
+
+/// The full validating scan behind [`visit_packed_refs_with_prefix`]. Peel lines are reported
+/// only after a record that was reported, never after one the prefix filter skipped.
+fn scan_packed_refs<'a>(
+    path: &Path,
+    data: &'a [u8],
+    prefix_filter: Option<&str>,
+    mut visit: impl FnMut(PackedLine<'a>),
 ) -> Result<()> {
     if data.is_empty() {
         return Ok(());
@@ -1901,13 +2272,14 @@ fn visit_packed_refs_with_prefix(
     let text = std::str::from_utf8(data)
         .map_err(|_| packed_refs_unexpected_line(path, "<invalid utf-8>"))?;
 
-    let ref_opts = RefNameOptions {
+    let ref_opts = RefFormatOptions {
         allow_onelevel: false,
         refspec_pattern: false,
         normalize: false,
     };
 
     let mut expect_peel = false;
+    let mut peel_follows_visited = false;
     let prefix_trim = prefix_filter.map(|p| p.trim_end_matches('/'));
     let packed_sorted = packed_refs_file_declares_sorted(text);
     let prefix_upper = if packed_sorted {
@@ -1928,10 +2300,15 @@ fn visit_packed_refs_with_prefix(
             continue;
         }
         if line.starts_with('^') {
-            parse_packed_ref_peel_line(path, line, expect_peel)?;
+            let peel = parse_packed_ref_peel_line(path, line, expect_peel)?;
+            if peel_follows_visited {
+                visit(PackedLine::Peel(peel));
+            }
             expect_peel = false;
+            peel_follows_visited = false;
             continue;
         }
+        peel_follows_visited = false;
 
         if let Some(prefix) = prefix_trim {
             let Some(refname) = packed_ref_data_line_refname(line) else {
@@ -1954,8 +2331,9 @@ fn visit_packed_refs_with_prefix(
             }
         }
         let (refname, oid) = parse_packed_ref_data_line_borrowed(path, line, &ref_opts)?;
-        visit(refname, oid);
+        visit(PackedLine::Record(refname, oid));
         expect_peel = true;
+        peel_follows_visited = true;
     }
     Ok(())
 }
@@ -2039,8 +2417,8 @@ impl PackedRefPeels {
     /// # Errors
     ///
     /// Returns [`Error::Io`] when `packed-refs` exists but cannot be read, or
-    /// [`Error::PackedRefsUnexpectedLine`] when it is malformed.
-    pub(crate) fn load(git_dir: &Path, format: RefStorageFormat) -> Result<Self> {
+    /// [`crate::error::RefError::PackedRefsUnexpectedLine`] when it is malformed.
+    pub fn load(git_dir: &Path, format: RefStorageFormat) -> Result<Self> {
         if format != RefStorageFormat::Files {
             return Ok(Self::from_view(None));
         }
@@ -2074,9 +2452,6 @@ impl PackedRefPeels {
             return empty;
         };
         let peel_trait = view.peel_trait;
-        if peel_trait == PackedPeelTrait::None {
-            return empty;
-        }
         let unsorted = (!view.sorted).then(|| {
             view.records()
                 .map(|start| (Box::<[u8]>::from(view.record_name(start)), start))
@@ -2108,6 +2483,15 @@ impl PackedRefPeels {
         if !self.peel_trait.covers(refname) {
             return None;
         }
+        self.record(refname, oid)?.peeled
+    }
+
+    /// What `packed-refs` says about `refname` when it records `oid`, the ref's current value.
+    ///
+    /// Answers whatever the peel trait, so it also tells a listing which values come from (or
+    /// agree with) `packed-refs`. `None` when the file has no record for `refname` or records
+    /// another value (a loose ref overrides it).
+    pub(crate) fn record(&self, refname: &str, oid: &ObjectId) -> Option<PackedRecord> {
         let view = self.view.as_ref()?;
         let start = match &self.unsorted {
             Some(map) => *map.get(refname.as_bytes())?,
@@ -2126,8 +2510,20 @@ impl PackedRefPeels {
         };
         let hex = std::str::from_utf8(&view.data[start..start + view.hex_len]).ok()?;
         let packed_oid = ObjectId::from_hex(hex).ok()?;
-        (packed_oid == *oid).then(|| peel_oid_following_line(&view.data, start))
+        (packed_oid == *oid).then(|| PackedRecord {
+            peeled: self
+                .peel_trait
+                .covers(refname)
+                .then(|| peel_oid_following_line(&view.data, start)),
+        })
     }
+}
+
+/// A `packed-refs` record that holds a ref's current value ([`PackedRefPeels::record`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PackedRecord {
+    /// Same as [`PackedRefPeels::peeled`]: `None` when the peel trait does not cover the ref.
+    pub(crate) peeled: Option<Option<ObjectId>>,
 }
 
 /// The peel guarantee declared by the `# pack-refs with:` header of `text`.
@@ -2147,17 +2543,24 @@ fn packed_refs_peel_trait(text: &str) -> PackedPeelTrait {
     peel_trait
 }
 
+/// Take `git_dir`'s `packed-refs.lock`, waiting per `wait`. A held lock is reported by
+/// its absolute path.
 fn acquire_packed_refs_lock(
     git_dir: &Path,
-    lock: &Path,
-    lock_display: &Path,
+    wait: crate::lockfile::LockWait,
 ) -> Result<crate::lockfile::LockFile> {
-    use crate::lockfile::{LockError, LockFile, LockWait};
-    let wait = LockWait::packed_refs_for_git_dir(git_dir);
-    LockFile::acquire(lock, wait).map_err(|err| match err {
-        LockError::Held { .. } => Error::from(RefLockError::PackedRefsLockHeld {
-            lock_path: lock_display.display().to_string(),
-        }),
+    use crate::lockfile::{LockError, LockFile};
+    let lock = lock_path_for_ref(&store::paths::packed_refs_path(git_dir));
+    LockFile::acquire(&lock, wait).map_err(|err| match err {
+        LockError::Held { .. } => {
+            let lock_path = git_dir
+                .canonicalize_simplified()
+                .map(|d| d.join("packed-refs.lock"))
+                .unwrap_or(lock);
+            Error::from(RefLockError::PackedRefsLockHeld {
+                lock_path: lock_path.display().to_string(),
+            })
+        }
         LockError::Io { source, .. } => Error::Io(source),
     })
 }
@@ -2202,18 +2605,23 @@ pub(crate) fn test_commit(git_dir: &Path, message: &str) -> ObjectId {
 /// Write a symbolic ref (e.g. `NOTES_MERGE_REF` → `refs/notes/m`).
 ///
 /// Opens a fresh on-disk ref store via [`crate::refs::store::open_ref_store`] and
-/// bypasses [`crate::repo::Repository::refs`] and any injected
+/// bypasses [`crate::repo::Repository::ref_store`] and any injected
 /// [`crate::refs::store::RefStore`]. Prefer [`commit_ref_update_on_store`] with a
-/// symbolic [`crate::refs::store::RawRef`] on [`crate::repo::Repository::refs`]
+/// symbolic [`crate::refs::store::RawRef`] on [`crate::repo::Repository::ref_store`]
 /// when you already have a [`crate::repo::Repository`].
 ///
 /// For reftable-backed repositories this dispatches to the reftable writer.
 ///
 /// # Errors
 ///
-/// Returns [`Error::InvalidRef`] when `refname` is not safe for ref storage (e.g. path
+/// Returns [`crate::error::RefError::Invalid`] when `refname` is not safe for ref storage (e.g. path
 /// traversal under `refs/`), on a namespace conflict, or [`Error::Io`] on filesystem errors.
-pub fn write_symbolic_ref(git_dir: &Path, refname: &str, target: &str) -> Result<()> {
+pub(crate) fn write_symbolic_ref(
+    git_dir: &Path,
+    refname: impl AsRef<RefNameRef>,
+    target: &str,
+) -> Result<()> {
+    let refname = refname.as_ref().as_str();
     store_write_value(
         git_dir,
         refname,
@@ -2226,25 +2634,25 @@ pub fn write_symbolic_ref(git_dir: &Path, refname: &str, target: &str) -> Result
 pub(crate) fn ensure_refname_safe_for_storage(refname: &str) -> Result<()> {
     if let Some(rest) = refname.strip_prefix("refs/") {
         if rest.is_empty() || !crate::check_ref_format::is_valid_fetch_advertised_ref(refname) {
-            return Err(Error::InvalidRef(format!(
-                "refusing to update ref with bad name '{refname}'"
-            )));
+            return Err(Error::Ref(RefError::Invalid {
+                detail: format!("refusing to update ref with bad name '{refname}'"),
+            }));
         }
         return Ok(());
     }
     if crate::check_ref_format::refname_is_safe(refname) {
         Ok(())
     } else {
-        Err(Error::InvalidRef(format!(
-            "refusing to update ref with bad name '{refname}'"
-        )))
+        Err(Error::Ref(RefError::Invalid {
+            detail: format!("refusing to update ref with bad name '{refname}'"),
+        }))
     }
 }
 
 /// Write a ref, creating parent directories as needed.
 ///
 /// Opens a fresh on-disk ref store via [`crate::refs::store::open_ref_store`] and
-/// bypasses [`crate::repo::Repository::refs`] and any injected
+/// bypasses [`crate::repo::Repository::ref_store`] and any injected
 /// [`crate::refs::store::RefStore`]. Prefer [`crate::refs::References::update`]
 /// or [`update_direct_ref_on_store`] when you already have a [`crate::repo::Repository`].
 ///
@@ -2258,12 +2666,17 @@ pub(crate) fn ensure_refname_safe_for_storage(refname: &str) -> Result<()> {
 ///
 /// # Errors
 ///
-/// Returns [`Error::InvalidRef`] when `refname` is not safe for ref storage (e.g. path
+/// Returns [`crate::error::RefError::Invalid`] when `refname` is not safe for ref storage (e.g. path
 /// traversal under `refs/`), on a namespace conflict, or [`Error::Io`] on filesystem errors.
 /// Returns [`store::RefStoreError::MissingObject`] when `git_dir`'s objects do not include
 /// `oid`, and [`store::RefStoreError::NotACommit`] when `refname` is a branch or `HEAD` and
-/// `oid` is not a commit (both as [`Error::RefStore`]).
-pub fn write_ref(git_dir: &Path, refname: &str, oid: &ObjectId) -> Result<()> {
+/// `oid` is not a commit (both as [`crate::error::RefError::Store`]).
+pub(crate) fn write_ref(
+    git_dir: &Path,
+    refname: impl AsRef<RefNameRef>,
+    oid: &ObjectId,
+) -> Result<()> {
+    let refname = refname.as_ref().as_str();
     store_write_value(
         git_dir,
         refname,
@@ -2275,7 +2688,7 @@ pub fn write_ref(git_dir: &Path, refname: &str, oid: &ObjectId) -> Result<()> {
 
 /// Per-ref update flags for [`RefUpdate`] (e.g. `REF_NO_DEREF` on `HEAD`).
 #[must_use]
-pub fn ref_update_flags(refname: &str) -> RefUpdateFlags {
+pub(crate) fn ref_update_flags(refname: &str) -> RefUpdateFlags {
     legacy_ref_update_flags(refname)
 }
 
@@ -2311,6 +2724,7 @@ pub(crate) fn create_ref_with_reflog_on_store(
 
 /// Write a loose ref file under `storage_dir`: the body shared by [`write_ref`]
 /// and [`write_ref_cached`], run after the packed-refs namespace-conflict check.
+#[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
 fn write_ref_at_storage(
     git_dir: &Path,
     storage_dir: &Path,
@@ -2334,10 +2748,15 @@ fn write_ref_at_storage(
     {
         return Err(directory_in_the_way(git_dir, refname, &path));
     }
-    if path.is_file() && matches!(read_ref_file(&path), Err(Error::InvalidRef(_))) {
-        return Err(Error::InvalidRef(format!(
-            "cannot update ref '{refname}': reference broken"
-        )));
+    if path.is_file()
+        && matches!(
+            read_ref_file(&path),
+            Err(Error::Ref(RefError::Invalid { .. }))
+        )
+    {
+        return Err(Error::Ref(RefError::Invalid {
+            detail: format!("cannot update ref '{refname}': reference broken"),
+        }));
     }
     if let Some(parent) = path.parent() {
         crate::git_dir::io_error::io_with_git_path(
@@ -2385,21 +2804,22 @@ fn write_ref_at_storage(
 /// while the loose-ref lock is held (atomic CAS for concurrent updaters).
 ///
 /// Opens a fresh on-disk ref store via [`crate::refs::store::open_ref_store`] and
-/// bypasses [`crate::repo::Repository::refs`] and any injected
+/// bypasses [`crate::repo::Repository::ref_store`] and any injected
 /// [`crate::refs::store::RefStore`]. Prefer [`commit_ref_update_on_store`] with
-/// [`crate::refs::store::Expected::Oid`] on [`crate::repo::Repository::refs`]
+/// [`crate::refs::store::Expected::Oid`] on [`crate::repo::Repository::ref_store`]
 /// when you already have a [`crate::repo::Repository`].
 ///
 /// # Errors
 ///
 /// Same as [`write_ref`], plus [`store::RefStoreError::ExpectedMismatch`] when the CAS check
 /// fails under lock.
-pub fn write_ref_cas(
+pub(crate) fn write_ref_cas(
     git_dir: &Path,
-    refname: &str,
+    refname: impl AsRef<RefNameRef>,
     oid: &ObjectId,
     expected_old: ObjectId,
 ) -> Result<()> {
+    let refname = refname.as_ref().as_str();
     store_write_value(
         git_dir,
         refname,
@@ -2409,24 +2829,8 @@ pub fn write_ref_cas(
     )
 }
 
-/// Like [`delete_ref`], but requires `expected_old` to match under the ref lock.
-///
-/// Opens a fresh on-disk ref store via [`crate::refs::store::open_ref_store`] and
-/// bypasses [`crate::repo::Repository::refs`] and any injected
-/// [`crate::refs::store::RefStore`]. Prefer [`commit_ref_update_on_store`] with
-/// [`crate::refs::store::Expected::Oid`] on [`crate::repo::Repository::refs`]
-/// when you already have a [`crate::repo::Repository`].
-///
-/// # Errors
-///
-/// Same as [`delete_ref`], plus [`store::RefStoreError::ExpectedMismatch`] when the CAS check
-/// fails.
-pub fn delete_ref_cas(git_dir: &Path, refname: &str, expected_old: ObjectId) -> Result<()> {
-    store_write_value(git_dir, refname, None, Expected::Oid(expected_old), None)
-}
-
 /// Unlink a loose ref file after `packed-refs` was updated, when the file still contains
-/// `expected`. Does not modify `packed-refs` (unlike [`delete_ref`] / [`delete_ref_cas`]).
+/// `expected`. Does not modify `packed-refs` (unlike [`delete_ref`]).
 ///
 /// Returns `Ok(true)` when the loose file was removed, `Ok(false)` when the OID differed or the
 /// file was already absent.
@@ -2493,7 +2897,7 @@ impl PackedRefs {
     /// # Errors
     ///
     /// Returns [`Error::Io`] if `packed-refs` exists but cannot be read, or
-    /// [`Error::PackedRefsUnexpectedLine`] when the file contains lines Git would reject.
+    /// [`crate::error::RefError::PackedRefsUnexpectedLine`] when the file contains lines Git would reject.
     pub fn load(git_dir: &Path) -> Result<Self> {
         let store = common_dir(git_dir).unwrap_or_else(|| git_dir.to_path_buf());
         let map = read_packed_refs_map(&store)?;
@@ -2502,20 +2906,21 @@ impl PackedRefs {
 
     /// The packed value recorded for `refname`, if any.
     #[must_use]
-    pub fn get(&self, refname: &str) -> Option<ObjectId> {
-        self.map.get(refname).copied()
+    pub fn get(&self, refname: impl AsRef<RefNameRef>) -> Option<ObjectId> {
+        self.map.get(refname.as_ref().as_str()).copied()
     }
 
     /// Whether any packed ref name conflicts with `refname` as a path prefix
     /// (e.g. an existing `refs/heads/x` blocks creating `refs/heads/x/y`).
     /// Mirrors the internal `packed_ref_namespace_conflict` helper against the snapshot.
     #[must_use]
-    pub fn has_namespace_conflict(&self, refname: &str) -> bool {
-        packed_refname_namespace_conflict(&self.sorted_names, refname)
+    pub fn has_namespace_conflict(&self, refname: impl AsRef<RefNameRef>) -> bool {
+        packed_refname_namespace_conflict(&self.sorted_names, refname.as_ref().as_str())
     }
 
     /// Record a ref written as loose during a cached apply batch so later
     /// namespace checks in the same batch see it without reloading `packed-refs`.
+    #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
     pub(crate) fn record_loose_write(&mut self, refname: &str, oid: ObjectId) {
         self.map.insert(refname.to_owned(), oid);
         self.sorted_names.insert(refname.to_owned());
@@ -2531,13 +2936,14 @@ impl PackedRefs {
 /// # Errors
 ///
 /// Returns an error on ref-file I/O failures other than "not found".
-pub fn resolve_ref_cached(
+pub(crate) fn resolve_ref_cached(
     git_dir: &Path,
-    refname: &str,
+    refname: impl AsRef<RefNameRef>,
     packed: &PackedRefs,
 ) -> Result<Option<ObjectId>> {
+    let refname = refname.as_ref().as_str();
     if open_ref_store(git_dir)?.format() != RefStorageFormat::Files {
-        return Ok(resolve_ref(git_dir, refname).ok());
+        return Ok(resolve_ref(git_dir, RefNameRef::from_trusted(refname)).ok());
     }
     resolve_files_ref_cached(git_dir, refname, packed)
 }
@@ -2579,22 +2985,24 @@ fn resolve_files_ref_cached(
 ///
 /// # Errors
 ///
-/// Returns [`Error::InvalidRef`] when `refname` is not safe for ref storage, on a namespace
-/// conflict, or [`Error::Io`] / [`Error::Message`] on filesystem errors.
-pub fn write_ref_cached(
+/// Returns [`crate::error::RefError::Invalid`] when `refname` is not safe for ref storage, on a namespace
+/// conflict, or [`Error::Io`] on filesystem errors.
+#[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
+pub(crate) fn write_ref_cached(
     git_dir: &Path,
-    refname: &str,
+    refname: impl AsRef<RefNameRef>,
     oid: &ObjectId,
     packed: &mut PackedRefs,
 ) -> Result<()> {
+    let refname = refname.as_ref().as_str();
     if open_ref_store(git_dir)?.format() != RefStorageFormat::Files {
-        return write_ref(git_dir, refname, oid);
+        return write_ref(git_dir, RefNameRef::from_trusted(refname), oid);
     }
     ensure_refname_safe_for_storage(refname)?;
     if packed.has_namespace_conflict(refname) {
-        return Err(Error::InvalidRef(format!(
-            "cannot update ref '{refname}': reference namespace conflict"
-        )));
+        return Err(Error::Ref(RefError::Invalid {
+            detail: format!("cannot update ref '{refname}': reference namespace conflict"),
+        }));
     }
     let storage_dir = ref_storage_dir(git_dir, refname);
     write_ref_at_storage(git_dir, &storage_dir, refname, oid)?;
@@ -2644,7 +3052,7 @@ pub(crate) fn remove_empty_ref_directory(path: &Path) {
 }
 
 /// Return true if the directory tree rooted at `dir` contains any non-directory entry.
-fn dir_tree_has_files(dir: &Path) -> bool {
+pub(crate) fn dir_tree_has_files(dir: &Path) -> bool {
     let Ok(entries) = fs::read_dir(dir) else {
         // Unreadable: treat conservatively as "has files" so we do not delete it.
         return true;
@@ -2711,9 +3119,9 @@ fn remove_dir_tree(dir: &Path) -> io::Result<()> {
 /// Delete a ref.
 ///
 /// Opens a fresh on-disk ref store via [`crate::refs::store::open_ref_store`] and
-/// bypasses [`crate::repo::Repository::refs`] and any injected
+/// bypasses [`crate::repo::Repository::ref_store`] and any injected
 /// [`crate::refs::store::RefStore`]. Prefer [`commit_ref_update_on_store`] with
-/// `new_value: None` on [`crate::repo::Repository::refs`] when you already have a
+/// `new_value: None` on [`crate::repo::Repository::ref_store`] when you already have a
 /// [`crate::repo::Repository`].
 ///
 /// Dispatches to the reftable backend when `extensions.refStorage = reftable`.
@@ -2721,24 +3129,30 @@ fn remove_dir_tree(dir: &Path) -> io::Result<()> {
 /// # Errors
 ///
 /// Returns [`RefStoreError::NotFound`] (inside
-/// [`Error::RefStore`]) when `refname` does not exist, [`Error::InvalidRef`] when it is not
+/// [`crate::error::RefError::Store`]) when `refname` does not exist, [`crate::error::RefError::Invalid`] when it is not
 /// safe for ref storage, or [`Error::Io`] for filesystem failures.
-pub fn delete_ref(git_dir: &Path, refname: &str) -> Result<()> {
-    if matches!(read_raw_ref(git_dir, refname)?, RawRefLookup::NotFound) {
+pub(crate) fn delete_ref(git_dir: &Path, refname: impl AsRef<RefNameRef>) -> Result<()> {
+    let refname = refname.as_ref().as_str();
+    if matches!(
+        read_raw_ref(git_dir, RefNameRef::from_trusted(refname))?,
+        RawRefLookup::NotFound
+    ) {
         return Err(store::RefStoreError::not_found(refname).into());
     }
     if open_ref_store(git_dir)?.format() != RefStorageFormat::Files {
         let store = open_ref_store(git_dir)?;
         let mut flags = legacy_ref_update_flags(refname);
         if refname != "HEAD" {
-            if let Ok(Some(StoreRawRef::Symbolic(_))) = store.read_raw(refname) {
+            if let Ok(Some(StoreRawRef::Symbolic(_))) =
+                store.read_raw(RefNameRef::from_trusted(refname))
+            {
                 flags.no_deref = true;
             }
         }
         return commit_store_update(
             git_dir,
             RefUpdate {
-                name: refname.to_owned(),
+                name: RefName::from_trusted(refname.to_owned()),
                 new_value: None,
                 expected: Expected::Exists,
                 reflog: None,
@@ -2995,17 +3409,20 @@ fn replace_packed_refs_file(
     // `update-ref -d` fails cleanly — leaving the reference intact — when either file is
     // already present (t0600 "delete fails cleanly if packed-refs file is locked / .new
     // write fails").
-    let lock = lock_path_for_ref(packed_path); // packed-refs.lock
     let _packed_lock = if !lock_already_held {
-        let abs_lock = git_dir
-            .canonicalize_simplified()
-            .map(|d| d.join("packed-refs.lock"))
-            .unwrap_or_else(|_| lock.clone());
-        Some(acquire_packed_refs_lock(git_dir, &lock, &abs_lock)?)
+        Some(acquire_packed_refs_lock(
+            git_dir,
+            crate::lockfile::LockWait::packed_refs_for_git_dir(git_dir),
+        )?)
     } else {
         None
     };
+    write_packed_refs_tmp_and_rename(packed_path, body)
+}
 
+/// Publish `body` as `packed_path` through the `packed-refs.new` tempfile. The caller holds
+/// `packed-refs.lock`.
+fn write_packed_refs_tmp_and_rename(packed_path: &Path, body: &str) -> Result<()> {
     let tmp = packed_path.with_extension("new");
     let mut created_tmp = false;
     let write_result = (|| -> Result<()> {
@@ -3030,26 +3447,10 @@ fn replace_packed_refs_file(
     write_result
 }
 
-/// Read the symbolic ref target of `HEAD`.
-///
-/// Opens a fresh on-disk ref store via [`crate::refs::store::open_ref_store`] and
-/// bypasses [`crate::repo::Repository::refs`] and any injected
-/// [`crate::refs::store::RefStore`]. Prefer [`read_symbolic_ref_for_repository`] with `refname` `"HEAD"`
-/// when you already have a [`crate::repo::Repository`].
-///
-/// Returns `None` if HEAD is detached (points directly to a commit hash).
-///
-/// # Errors
-///
-/// Returns [`Error::Io`] or [`Error::InvalidRef`] on failures.
-pub fn read_head(git_dir: &Path) -> Result<Option<String>> {
-    read_symbolic_ref(git_dir, "HEAD")
-}
-
 /// Read symbolic target of any ref.
 ///
 /// Opens a fresh on-disk ref store via [`crate::refs::store::open_ref_store`] and
-/// bypasses [`crate::repo::Repository::refs`] and any injected
+/// bypasses [`crate::repo::Repository::ref_store`] and any injected
 /// [`crate::refs::store::RefStore`]. Prefer [`read_symbolic_ref_for_repository`]
 /// when you already have a [`crate::repo::Repository`].
 ///
@@ -3057,19 +3458,27 @@ pub fn read_head(git_dir: &Path) -> Result<Option<String>> {
 ///
 /// Returns `Ok(Some(target))` when `refname` exists and is symbolic,
 /// `Ok(None)` when it is direct or missing.
-pub fn read_symbolic_ref(git_dir: &Path, refname: &str) -> Result<Option<String>> {
-    match open_ref_store(git_dir)?.read_raw(refname)? {
+pub(crate) fn read_symbolic_ref(
+    git_dir: &Path,
+    refname: impl AsRef<RefNameRef>,
+) -> Result<Option<String>> {
+    let refname = refname.as_ref().as_str();
+    match open_ref_store(git_dir)?.read_raw(RefNameRef::from_trusted(refname))? {
         Some(StoreRawRef::Symbolic(target)) => Ok(Some(target)),
         Some(StoreRawRef::Direct(_)) | None => Ok(None),
     }
 }
 
 /// Like [`read_symbolic_ref`] but uses an open [`crate::repo::Repository`] ref store (no format re-detection).
-pub fn read_symbolic_ref_for_repository(
+pub(crate) fn read_symbolic_ref_for_repository(
     repo: &crate::repo::Repository,
-    refname: &str,
+    refname: impl AsRef<RefNameRef>,
 ) -> Result<Option<String>> {
-    match repo.refs().read_raw(refname)? {
+    let refname = refname.as_ref().as_str();
+    match repo
+        .ref_store()
+        .read_raw(RefNameRef::from_trusted(refname))?
+    {
         Some(StoreRawRef::Symbolic(target)) => Ok(Some(target)),
         Some(StoreRawRef::Direct(_)) | None => Ok(None),
     }
@@ -3103,11 +3512,15 @@ impl LogRefsConfig {
 /// Read `[core] logAllRefUpdates` from the repository config.
 ///
 /// Returns [`LogRefsConfig::Unset`] when the key is absent.
-pub fn read_log_refs_config(git_dir: &Path) -> LogRefsConfig {
+#[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
+pub(crate) fn read_log_refs_config(git_dir: &Path) -> LogRefsConfig {
     ConfigSet::load(
         &crate::environment::Environment::empty(),
         Some(git_dir),
-        true,
+        &crate::config::LoadConfigOptions::standard(
+            &crate::environment::Environment::empty(),
+            Some(git_dir),
+        ),
     )
     .map(|cfg| cfg.log_refs_config())
     .unwrap_or(LogRefsConfig::Unset)
@@ -3116,11 +3529,14 @@ pub fn read_log_refs_config(git_dir: &Path) -> LogRefsConfig {
 /// Effective `logAllRefUpdates` after applying Git's `LOG_REFS_UNSET` rule.
 ///
 /// Falls back to [`LogRefsConfig::Normal`] when the config cannot be loaded.
-pub fn effective_log_refs_config(git_dir: &Path) -> LogRefsConfig {
+pub(crate) fn effective_log_refs_config(git_dir: &Path) -> LogRefsConfig {
     ConfigSet::load(
         &crate::environment::Environment::empty(),
         Some(git_dir),
-        true,
+        &crate::config::LoadConfigOptions::standard(
+            &crate::environment::Environment::empty(),
+            Some(git_dir),
+        ),
     )
     .map(|cfg| cfg.effective_log_refs_config())
     .unwrap_or(LogRefsConfig::Normal)
@@ -3129,7 +3545,11 @@ pub fn effective_log_refs_config(git_dir: &Path) -> LogRefsConfig {
 /// Whether a new reflog file may be auto-created for `refname` given an already-resolved
 /// `core.logAllRefUpdates` mode (including command-line config).
 #[must_use]
-pub fn should_autocreate_reflog_for_mode(refname: &str, mode: LogRefsConfig) -> bool {
+pub fn should_autocreate_reflog_for_mode(
+    refname: impl AsRef<RefNameRef>,
+    mode: LogRefsConfig,
+) -> bool {
+    let refname = refname.as_ref().as_str();
     match mode {
         LogRefsConfig::Always => true,
         LogRefsConfig::Normal => {
@@ -3144,13 +3564,13 @@ pub fn should_autocreate_reflog_for_mode(refname: &str, mode: LogRefsConfig) -> 
 
 /// Whether a new reflog file may be auto-created for `refname` (Git `should_autocreate_reflog`).
 #[must_use]
-pub fn should_autocreate_reflog(git_dir: &Path, refname: &str) -> bool {
+pub(crate) fn should_autocreate_reflog(git_dir: &Path, refname: impl AsRef<RefNameRef>) -> bool {
     should_autocreate_reflog_for_mode(refname, effective_log_refs_config(git_dir))
 }
 
 /// Like [`should_autocreate_reflog`], using an already-loaded repository config snapshot.
 #[must_use]
-pub fn should_autocreate_reflog_with_config(
+pub(crate) fn should_autocreate_reflog_with_config(
     config: &ConfigSet,
     _git_dir: &Path,
     refname: &str,
@@ -3224,7 +3644,9 @@ pub(crate) fn reflog_oid_hex_pair(old: &ObjectId, new: &ObjectId) -> (String, St
 
 fn map_reflog_store_validation(err: store::RefStoreError) -> Error {
     match err {
-        store::RefStoreError::InvalidReflog(sig) => Error::InvalidSignature(sig),
+        store::RefStoreError::InvalidReflog(sig) => {
+            Error::Object(ObjectError::InvalidSignature(sig))
+        }
         other => Error::from(other),
     }
 }
@@ -3242,34 +3664,6 @@ fn validate_reflog_update(log: &ReflogUpdate) -> Result<()> {
     store::validate_reflog_update(log).map_err(map_reflog_store_validation)
 }
 
-/// Append one line to the reflog for `refname` using a validated [`Signature`].
-///
-/// # Errors
-///
-/// Propagates I/O failures, invalid refname errors, and [`Error::InvalidSignature`].
-pub fn append_reflog_with_signature(
-    git_dir: &Path,
-    refname: &str,
-    old_oid: &ObjectId,
-    new_oid: &ObjectId,
-    identity: &Signature,
-    message: &str,
-    force_create: bool,
-) -> Result<()> {
-    identity.validate().map_err(Error::InvalidSignature)?;
-    let formatted = format_reflog_identity(&identity.reflog_name_email(), identity.time);
-    append_reflog_with_config(
-        git_dir,
-        refname,
-        old_oid,
-        new_oid,
-        &formatted,
-        message,
-        force_create,
-        None,
-    )
-}
-
 /// Append one line to the reflog for `refname`.
 ///
 /// Creates the reflog file when `force_create` is true or when the ref already
@@ -3278,15 +3672,17 @@ pub fn append_reflog_with_signature(
 /// # Errors
 ///
 /// Propagates I/O failures and invalid refname errors.
-pub fn append_reflog(
+#[cfg(test)]
+pub(crate) fn append_reflog(
     git_dir: &Path,
-    refname: &str,
+    refname: impl AsRef<RefNameRef>,
     old_oid: &ObjectId,
     new_oid: &ObjectId,
     identity: &str,
     message: &str,
     force_create: bool,
 ) -> Result<()> {
+    let refname = refname.as_ref().as_str();
     append_reflog_with_config(
         git_dir,
         refname,
@@ -3301,7 +3697,7 @@ pub fn append_reflog(
 
 /// Like [`append_reflog`], reusing `config` for reflog auto-create policy when provided.
 #[allow(clippy::too_many_arguments)]
-pub fn append_reflog_with_config(
+pub(crate) fn append_reflog_with_config(
     git_dir: &Path,
     refname: &str,
     old_oid: &ObjectId,
@@ -3415,57 +3811,68 @@ fn collect_loose_ref_files(
         let name = entry.file_name().to_string_lossy().to_string();
         let refname = format!("{prefix}{name}");
         let path = entry.path();
-        if path.is_dir() {
+        // The directory entry's type needs no stat; symlinks are followed like `is_dir`.
+        let file_type = match entry.file_type() {
+            Ok(ft) if ft.is_symlink() => fs::metadata(&path).map(|m| m.file_type()),
+            other => other,
+        };
+        let Ok(file_type) = file_type else {
+            continue;
+        };
+        if file_type.is_dir() {
             collect_loose_ref_files(&path, &format!("{refname}/"), out)?;
-        } else if path.is_file() {
+        } else if file_type.is_file() {
             out.push((refname, path));
         }
     }
     Ok(())
 }
 
-fn load_packed_refs_with_peel(
-    packed_path: &Path,
-    merged: &mut HashMap<String, (ObjectId, Option<ObjectId>)>,
-) -> Result<()> {
+/// The bytes of `packed_path`, or nothing when it is not a regular file.
+fn read_packed_refs_bytes(packed_path: &Path) -> Result<Vec<u8>> {
     if !packed_path.is_file() {
-        return Ok(());
+        return Ok(Vec::new());
     }
-    let data = fs::read(packed_path)?;
-    parse_packed_refs_to_map(packed_path, &data)?;
-    let content = String::from_utf8(data)
-        .map_err(|_| packed_refs_unexpected_line(packed_path, "<invalid utf-8>"))?;
-    let mut last_name: Option<String> = None;
-    for line in content.lines() {
-        if line.starts_with('#') {
-            continue;
-        }
-        if let Some(hex) = line.strip_prefix('^') {
-            let Ok(peel_oid) = ObjectId::from_hex(hex.trim()) else {
-                continue;
-            };
-            if let Some(name) = &last_name {
-                if let Some(entry) = merged.get_mut(name) {
-                    entry.1 = Some(peel_oid);
-                }
+    Ok(fs::read(packed_path)?)
+}
+
+/// `existing` (validated `packed-refs` records in file order) with `loose` (sorted by name,
+/// unique) merged in, as a complete sorted `packed-refs` body. A loose ref replaces the
+/// packed record of the same name; when the file repeats a name, its last record wins.
+fn merged_packed_refs_body(
+    mut existing: Vec<PackedEntry<'_>>,
+    loose: &[(String, ObjectId, Option<ObjectId>)],
+) -> String {
+    if !existing.windows(2).all(|w| w[0].name < w[1].name) {
+        existing.sort_by(|a, b| a.name.cmp(b.name));
+        existing.dedup_by(|later, earlier| {
+            if later.name != earlier.name {
+                return false;
             }
-            continue;
-        }
-        let mut parts = line.splitn(2, ' ');
-        let Some(hex) = parts.next() else {
-            continue;
-        };
-        let Some(name) = parts.next() else {
-            continue;
-        };
-        let name = name.trim();
-        let Ok(oid) = ObjectId::from_hex(hex) else {
-            continue;
-        };
-        merged.insert(name.to_owned(), (oid, None));
-        last_name = Some(name.to_owned());
+            *earlier = *later;
+            true
+        });
     }
-    Ok(())
+    // Each record line is an id, a space, a name and a newline; peel lines are rare.
+    let estimate = |name: &str| name.len() + 2 + HashAlgo::Sha256.hex_len();
+    let capacity = PACKED_REFS_HEADER.len()
+        + existing.iter().map(|e| estimate(e.name)).sum::<usize>()
+        + loose.iter().map(|(name, ..)| estimate(name)).sum::<usize>();
+    let mut body = String::with_capacity(capacity);
+    body.push_str(PACKED_REFS_HEADER);
+
+    let mut packed = existing.iter().peekable();
+    for (name, oid, peel) in loose {
+        while let Some(entry) = packed.next_if(|e| e.name < name.as_str()) {
+            push_packed_record(&mut body, entry.name, &entry.oid, entry.peel.as_ref());
+        }
+        packed.next_if(|e| e.name == name.as_str());
+        push_packed_record(&mut body, name, oid, peel.as_ref());
+    }
+    for entry in packed {
+        push_packed_record(&mut body, entry.name, &entry.oid, entry.peel.as_ref());
+    }
+    body
 }
 
 /// Pack loose refs for `repo` (files `packed-refs` or reftable compaction).
@@ -3475,10 +3882,16 @@ pub(crate) fn pack_refs_for_repository(
     dry_run: bool,
 ) -> Result<(PathBuf, usize, usize)> {
     let git_dir = repo.git_dir();
-    if open_ref_store(git_dir)?.format() != RefStorageFormat::Files {
+    let format = if repo.refs_on_disk() {
+        repo.ref_store().format()
+    } else {
+        open_ref_store(git_dir)?.format()
+    };
+    if format != RefStorageFormat::Files {
         return pack_refs_reftable(git_dir, dry_run);
     }
-    pack_refs_files(git_dir, repo.odb(), all, dry_run)
+    let config = repo.config().snapshot().ok();
+    pack_refs_files(git_dir, repo.odb(), config.as_deref(), all, dry_run)
 }
 
 fn pack_refs_reftable(git_dir: &Path, dry_run: bool) -> Result<(PathBuf, usize, usize)> {
@@ -3503,37 +3916,39 @@ fn pack_refs_reftable(git_dir: &Path, dry_run: bool) -> Result<(PathBuf, usize, 
 fn pack_refs_files(
     git_dir: &Path,
     odb: &crate::odb::Odb,
+    config: Option<&crate::config::ConfigSet>,
     all: bool,
     dry_run: bool,
 ) -> Result<(PathBuf, usize, usize)> {
     pack_refs_files_matching(
         git_dir,
         odb,
+        config,
         |name| ref_matches_pack_include(name, all),
         dry_run,
         false,
     )
 }
 
+/// Pack the loose refs `include` accepts into `packed-refs` and prune them. `config` supplies
+/// the `packed-refs` and ref lock timeouts (Git's defaults when `None`).
 fn pack_refs_files_matching(
     git_dir: &Path,
     odb: &crate::odb::Odb,
+    config: Option<&crate::config::ConfigSet>,
     include: impl Fn(&str) -> bool,
     dry_run: bool,
     allow_missing: bool,
 ) -> Result<(PathBuf, usize, usize)> {
+    use crate::lockfile::LockWait;
+
     let storage_git_dir = common_dir(git_dir).unwrap_or_else(|| git_dir.to_path_buf());
     let packed_path = store::paths::packed_refs_path(&storage_git_dir);
-
-    let mut merged: HashMap<String, (ObjectId, Option<ObjectId>)> = HashMap::new();
-    load_packed_refs_with_peel(&packed_path, &mut merged)?;
 
     let mut loose_files = Vec::new();
     collect_loose_ref_files(&storage_git_dir.join("refs"), "refs/", &mut loose_files)?;
 
-    let mut packed_loose = 0usize;
-    let mut to_prune: Vec<(String, ObjectId)> = Vec::new();
-
+    let mut loose: Vec<(String, ObjectId, Option<ObjectId>)> = Vec::new();
     for (refname, path) in loose_files {
         if crate::worktree_ref::is_per_worktree_ref(&refname) {
             continue;
@@ -3544,57 +3959,49 @@ fn pack_refs_files_matching(
         let Ok(Ref::Direct(oid)) = read_ref_file(&path) else {
             continue;
         };
-        let object = odb.try_read_once(&oid).ok().flatten();
-        if object.is_none() && !allow_missing {
+        // Only the kind is needed (to peel tags), so the object body is never inflated.
+        let kind = odb
+            .try_read_info_once(&oid)
+            .ok()
+            .flatten()
+            .map(|info| info.kind);
+        if kind.is_none() && !allow_missing {
             continue;
         }
-        let peel = if object.is_some_and(|object| object.kind == crate::objects::ObjectKind::Tag) {
+        let peel = if kind == Some(crate::objects::ObjectKind::Tag) {
             packed_ref_peel(odb, oid)
         } else {
             None
         };
-        merged.insert(refname.clone(), (oid, peel));
-        to_prune.push((refname, oid));
-        let _ = path;
-        packed_loose += 1;
+        loose.push((refname, oid, peel));
+    }
+    loose.sort_by(|a, b| a.0.cmp(&b.0));
+    let packed_loose = loose.len();
+
+    if packed_loose == 0 || dry_run {
+        // Still reject a malformed `packed-refs`, as a real pack would.
+        let data = read_packed_refs_bytes(&packed_path)?;
+        visit_packed_refs_with_prefix(&packed_path, &data, None, |_, _| {})?;
+        return Ok((packed_path, packed_loose, packed_loose));
     }
 
-    if packed_loose == 0 {
-        return Ok((packed_path, 0, 0));
+    {
+        // Read under the lock so a concurrent `packed-refs` rewrite is not lost.
+        let _packed_lock =
+            acquire_packed_refs_lock(&storage_git_dir, LockWait::packed_refs(config))?;
+        let data = read_packed_refs_bytes(&packed_path)?;
+        let existing = packed_entries_with_peel(&packed_path, &data)?;
+        let body = merged_packed_refs_body(existing, &loose);
+        write_packed_refs_tmp_and_rename(&packed_path, &body)?;
     }
-
-    if dry_run {
-        return Ok((packed_path, packed_loose, to_prune.len()));
-    }
-
-    let mut names: Vec<String> = merged.keys().cloned().collect();
-    names.sort();
-
-    let mut body = String::from("# pack-refs with: peeled fully-peeled sorted\n");
-    for name in &names {
-        let Some((oid, peel)) = merged.get(name) else {
-            continue;
-        };
-        body.push_str(&oid.to_hex());
-        body.push(' ');
-        body.push_str(name);
-        body.push('\n');
-        if let Some(p) = peel {
-            body.push('^');
-            body.push_str(&p.to_hex());
-            body.push('\n');
-        }
-    }
-
-    atomic_rewrite_packed_refs(&storage_git_dir, &body)?;
 
     #[cfg(test)]
     pack_refs_test_hooks::run_before_prune();
 
     let mut pruned = 0usize;
     let mut parents = HashSet::new();
-    let wait = crate::lockfile::LockWait::files_ref_lock_for_git_dir(git_dir);
-    for (refname, expected) in &to_prune {
+    let wait = LockWait::files_ref_lock(config);
+    for (refname, expected, _) in &loose {
         match prune_loose_ref_cas(git_dir, refname, *expected, wait) {
             Ok(true) => {
                 pruned += 1;
@@ -3641,40 +4048,20 @@ mod pack_refs_test_hooks {
     }
 }
 
-/// Test hook: when set to a ref name, the next [`append_reflog`] for that ref fails.
-///
-/// Only active in debug builds; used by regression tests for commit ref/reflog atomicity.
-#[cfg(test)]
-mod reflog_fail_inject {
-    use std::cell::RefCell;
+#[cfg(any(test, feature = "test-support"))]
+#[path = "inject.rs"]
+pub(crate) mod inject;
 
-    // hygiene: test-only reflog failure injection hook
-    thread_local! {
-        pub static INJECT: RefCell<Option<String>> = const { RefCell::new(None) };
-    }
-}
-
-/// Test hook: fail the next reflog append for `refname` (or any ref when `None`).
-#[cfg(test)]
-pub fn set_test_inject_reflog_fail(refname: Option<&str>) {
-    reflog_fail_inject::INJECT.with(|c| {
-        *c.borrow_mut() = refname.map(str::to_owned);
-    });
-}
-
-#[cfg(test)]
 fn test_inject_reflog_fail(refname: &str) -> Result<()> {
-    reflog_fail_inject::INJECT.with(|c| {
-        if c.borrow().as_deref() == Some(refname) {
-            return Err(Error::Io(std::io::Error::other("injected reflog failure")));
-        }
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        inject::reflog_fail(refname)
+    }
+    #[cfg(not(any(test, feature = "test-support")))]
+    {
+        let _ = refname;
         Ok(())
-    })
-}
-
-#[cfg(not(test))]
-fn test_inject_reflog_fail(_refname: &str) -> Result<()> {
-    Ok(())
+    }
 }
 
 /// Move a checked-out branch to `new_oid` and append matching branch and `HEAD` reflogs.
@@ -3686,12 +4073,12 @@ fn test_inject_reflog_fail(_refname: &str) -> Result<()> {
 ///
 /// # Errors
 ///
-/// Returns [`Error::Message`] when `HEAD` does not point at `branch_ref`,
+/// Returns [`crate::error::RefError::HeadNotOnBranch`] when `HEAD` does not point at `branch_ref`,
 /// [`store::RefStoreError::ExpectedMismatch`] (see [`verify_branch_commit_cas`]) when the
 /// CAS check fails, or an I/O error when ref/reflog writes fail.
 pub struct BranchCommitRefUpdate<'a> {
     /// Branch ref to update (e.g. `refs/heads/main`).
-    pub branch_ref: &'a str,
+    pub branch_ref: &'a RefNameRef,
     /// Expected current tip; `None` when the branch must not exist yet (unborn).
     pub expected_old: Option<ObjectId>,
     /// New commit OID for the branch tip.
@@ -3708,15 +4095,15 @@ pub struct BranchCommitRefUpdate<'a> {
 ///
 /// # Errors
 ///
-/// Returns [`Error::RefStore`] with [`store::RefStoreError::ExpectedMismatch`] when
+/// Returns [`crate::error::RefError::Store`] with [`store::RefStoreError::ExpectedMismatch`] when
 /// `current` does not match `expected`; `expected` is [`Expected::Missing`] when the branch
 /// had to be absent, and `actual` is `None` when it was.
 pub fn verify_branch_commit_cas(
     expected: Option<ObjectId>,
     current: Option<ObjectId>,
-    refname: &str,
+    refname: impl AsRef<RefNameRef>,
 ) -> Result<()> {
-    verify_branch_cas(expected, current, refname)
+    verify_branch_cas(expected, current, refname.as_ref().as_str())
 }
 
 fn verify_branch_cas(
@@ -3755,192 +4142,28 @@ fn read_loose_or_packed_oid(git_dir: &Path, refname: &str) -> Result<Option<Obje
     Ok(None)
 }
 
-#[cfg(test)]
-mod test_pause_inject_serial {
-    use std::sync::{Mutex, OnceLock};
-
-    // hygiene: test-only pause injection serialization
-    static SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
-
-    pub fn lock() -> std::sync::MutexGuard<'static, ()> {
-        SERIAL
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-    }
-}
-
-/// Serialize tests that install global ref pause injection hooks (parallel `cargo test` safe).
-#[cfg(test)]
-pub fn test_pause_injection_serial_guard() -> std::sync::MutexGuard<'static, ()> {
-    test_pause_inject_serial::lock()
-}
-
-#[cfg(test)]
-mod branch_ref_pause_inject {
-    use std::sync::{Condvar, Mutex, OnceLock};
-
-    pub struct PauseGate {
-        pub wait: Mutex<bool>,
-        pub cv: Condvar,
-    }
-
-    // hygiene: test-only branch-ref commit pause injection
-    static PAUSE_BEFORE_COMMIT: OnceLock<Mutex<Option<std::sync::Arc<PauseGate>>>> =
-        OnceLock::new();
-
-    pub fn pause_slot() -> &'static Mutex<Option<std::sync::Arc<PauseGate>>> {
-        PAUSE_BEFORE_COMMIT.get_or_init(|| Mutex::new(None))
-    }
-}
-
-/// Synchronization gate used with [`set_test_inject_branch_ref_pause_before_commit`].
-#[cfg(test)]
-pub type BranchRefPauseGate = std::sync::Arc<branch_ref_pause_inject::PauseGate>;
-
-/// Test-only: pause [`update_branch_for_commit`] on the files backend after reflogs, before committing the ref.
-#[cfg(test)]
-pub fn set_test_inject_branch_ref_pause_before_commit(gate: Option<BranchRefPauseGate>) {
-    *branch_ref_pause_inject::pause_slot()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner()) = gate;
-}
-
-#[cfg(test)]
 fn test_branch_ref_pause_before_commit() {
-    let gate = branch_ref_pause_inject::pause_slot()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone();
-    if let Some(gate) = gate {
-        let mut wait = gate.wait.lock().unwrap_or_else(|e| e.into_inner());
-        *wait = true;
-        gate.cv.notify_all();
-        while *wait {
-            wait = gate.cv.wait(wait).unwrap_or_else(|e| e.into_inner());
-        }
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        inject::branch_ref_pause_before_commit();
     }
 }
 
-#[cfg(not(test))]
-fn test_branch_ref_pause_before_commit() {}
-
-#[cfg(test)]
-mod ref_store_batch_pause_inject {
-    use std::sync::{Condvar, Mutex, OnceLock};
-
-    pub struct PauseGate {
-        pub wait: Mutex<bool>,
-        pub cv: Condvar,
-    }
-
-    // hygiene: test-only ref-store batch commit pause injection
-    /// Armed pause: ref index, the repository it applies to, and the gate.
-    pub type PauseSlot = Option<(usize, std::path::PathBuf, std::sync::Arc<PauseGate>)>;
-
-    static PAUSE_AFTER_REF_WRITE: OnceLock<Mutex<PauseSlot>> = OnceLock::new();
-
-    pub fn pause_slot() -> &'static Mutex<PauseSlot> {
-        PAUSE_AFTER_REF_WRITE.get_or_init(|| Mutex::new(None))
-    }
-}
-
-/// Synchronization gate used with [`set_test_inject_ref_store_batch_pause_after_apply`].
-#[cfg(test)]
-pub type RefStoreBatchPauseGate = std::sync::Arc<ref_store_batch_pause_inject::PauseGate>;
-
-/// Test-only: build a pause gate for [`set_test_inject_ref_store_batch_pause_after_apply`].
-#[cfg(test)]
-pub fn new_ref_store_batch_pause_gate() -> RefStoreBatchPauseGate {
-    std::sync::Arc::new(ref_store_batch_pause_inject::PauseGate {
-        wait: std::sync::Mutex::new(false),
-        cv: std::sync::Condvar::new(),
-    })
-}
-
-/// Test-only: pause files ref-store batch commit after persisting the ref at `apply_index` (0-based).
-///
-/// Only ref stores for `git_dir` pause, so tests running in parallel against
-/// other repositories are unaffected.
-#[cfg(test)]
-pub fn set_test_inject_ref_store_batch_pause_after_apply(
-    apply_index: usize,
-    git_dir: &Path,
-    gate: Option<RefStoreBatchPauseGate>,
-) {
-    *ref_store_batch_pause_inject::pause_slot()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner()) = gate.map(|g| (apply_index, git_dir.to_path_buf(), g));
-}
-
-#[cfg(test)]
-struct RefStorePauseTestSerial {
-    /// Held while one test owns ref-store batch pause injection.
-    holder: Option<std::thread::ThreadId>,
-}
-
-#[cfg(test)]
-static REF_STORE_PAUSE_TEST_SERIAL: std::sync::Mutex<RefStorePauseTestSerial> =
-    std::sync::Mutex::new(RefStorePauseTestSerial { holder: None });
-
-/// Serialize ref-store batch pause injection tests and clear injection on drop.
-#[cfg(test)]
-pub(crate) struct RefStoreBatchPauseTestScope {
-    _serial: std::sync::MutexGuard<'static, RefStorePauseTestSerial>,
-}
-
-#[cfg(test)]
-pub(crate) fn ref_store_batch_pause_test_scope() -> RefStoreBatchPauseTestScope {
-    let mut serial = REF_STORE_PAUSE_TEST_SERIAL
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    assert!(
-        serial.holder.is_none(),
-        "ref_store_batch_pause_test_scope must not nest"
-    );
-    serial.holder = Some(std::thread::current().id());
-    set_test_inject_ref_store_batch_pause_after_apply(0, Path::new(""), None);
-    RefStoreBatchPauseTestScope { _serial: serial }
-}
-
-#[cfg(test)]
-impl Drop for RefStoreBatchPauseTestScope {
-    fn drop(&mut self) {
-        set_test_inject_ref_store_batch_pause_after_apply(0, Path::new(""), None);
-        self._serial.holder = None;
-    }
-}
-
-#[cfg(test)]
 pub(crate) fn test_ref_store_batch_pause_after_ref_write(idx: usize, git_dir: &Path) {
-    let slot = ref_store_batch_pause_inject::pause_slot()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone();
-    if let Some((target, target_dir, gate)) = slot {
-        let same_repo = |a: &Path, b: &Path| {
-            a == b
-                || matches!((a.canonicalize_simplified(), b.canonicalize_simplified()), (Ok(a), Ok(b)) if a == b)
-        };
-        if idx != target || !same_repo(git_dir, &target_dir) {
-            return;
-        }
-        let mut wait = gate.wait.lock().unwrap_or_else(|e| e.into_inner());
-        *wait = true;
-        gate.cv.notify_all();
-        while *wait {
-            wait = gate.cv.wait(wait).unwrap_or_else(|e| e.into_inner());
-        }
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        inject::ref_store_batch_pause_after_ref_write(idx, git_dir);
+    }
+    #[cfg(not(any(test, feature = "test-support")))]
+    {
+        let _ = (idx, git_dir);
     }
 }
-
-#[cfg(not(test))]
-pub(crate) fn test_ref_store_batch_pause_after_ref_write(_idx: usize, _git_dir: &Path) {}
 
 /// Loose branch ref lock held between CAS validation and the ref file commit.
 ///
 /// Dropping without [`commit_branch_commit_ref_lock`](Self::commit) aborts the lock file.
-pub struct BranchCommitRefLock {
+pub(crate) struct BranchCommitRefLock {
     lock: Option<crate::lockfile::LockFile>,
     disarmed: bool,
 }
@@ -3953,25 +4176,28 @@ impl BranchCommitRefLock {
     /// Same as [`update_branch_for_commit_with_config`], except no reflogs or ref write occur yet.
     pub fn acquire(
         git_dir: &Path,
-        branch_ref: &str,
+        branch_ref: &RefNameRef,
         expected_old: Option<ObjectId>,
     ) -> Result<Self> {
-        ensure_refname_safe_for_storage(branch_ref)?;
-        let storage_dir = ref_storage_dir(git_dir, branch_ref);
-        if packed_ref_namespace_conflict(&storage_dir, branch_ref)? {
-            return Err(Error::InvalidRef(format!(
-                "cannot update ref '{}': reference namespace conflict",
-                branch_ref
-            )));
+        let branch_s = branch_ref.as_str();
+        ensure_refname_safe_for_storage(branch_s)?;
+        let storage_dir = ref_storage_dir(git_dir, branch_s);
+        if packed_ref_namespace_conflict(&storage_dir, branch_s)? {
+            return Err(Error::Ref(RefError::Invalid {
+                detail: format!(
+                    "cannot update ref '{}': reference namespace conflict",
+                    branch_s
+                ),
+            }));
         }
-        let stor = crate::ref_namespace::storage_ref_name(branch_ref);
+        let stor = crate::ref_namespace::storage_ref_name(branch_s);
         let path = storage_dir.join(&stor);
         remove_empty_ref_directory(&path);
         if fs::symlink_metadata(&path)
             .map(|m| m.file_type().is_dir())
             .unwrap_or(false)
         {
-            return Err(directory_in_the_way(git_dir, branch_ref, &path));
+            return Err(directory_in_the_way(git_dir, branch_s, &path));
         }
         if let Some(parent) = path.parent() {
             crate::git_dir::io_error::io_with_git_path(
@@ -3995,8 +4221,8 @@ impl BranchCommitRefLock {
             ),
         })?;
 
-        let current = read_loose_or_packed_oid(git_dir, branch_ref)?;
-        verify_branch_cas(expected_old, current, branch_ref)?;
+        let current = read_loose_or_packed_oid(git_dir, branch_s)?;
+        verify_branch_cas(expected_old, current, branch_s)?;
 
         Ok(Self {
             lock: Some(lock),
@@ -4073,10 +4299,10 @@ fn write_branch_commit_reflogs(
     config: &ConfigSet,
 ) -> Result<()> {
     let mut branch_reflog_written = false;
-    if should_autocreate_reflog_with_config(config, git_dir, update.branch_ref) {
+    if should_autocreate_reflog_with_config(config, git_dir, update.branch_ref.as_str()) {
         match append_reflog_with_config(
             git_dir,
-            update.branch_ref,
+            update.branch_ref.as_str(),
             reflog_old,
             &update.new_oid,
             update.identity,
@@ -4104,7 +4330,8 @@ fn write_branch_commit_reflogs(
             Some(config),
         ) {
             if branch_reflog_written {
-                let _ = crate::reflog::truncate_last_reflog_line(git_dir, update.branch_ref);
+                let _ =
+                    crate::reflog::truncate_last_reflog_line(git_dir, update.branch_ref.as_str());
             }
             drop(lock.lock.take());
             return Err(err);
@@ -4121,16 +4348,15 @@ fn finish_branch_commit_ref_lock_files(
 ) -> Result<()> {
     test_branch_ref_pause_before_commit();
 
-    let storage_dir = ref_storage_dir(git_dir, update.branch_ref);
-    let stor = crate::ref_namespace::storage_ref_name(update.branch_ref);
+    let storage_dir = ref_storage_dir(git_dir, update.branch_ref.as_str());
+    let stor = crate::ref_namespace::storage_ref_name(update.branch_ref.as_str());
     let path = storage_dir.join(&stor);
     let content = format!("{}\n", update.new_oid);
     use crate::lockfile::LockError;
     use std::io::Write as _;
-    let mut file_lock = lock
-        .lock
-        .take()
-        .ok_or_else(|| Error::Message("branch ref lock already released".into()))?;
+    let mut file_lock = lock.lock.take().ok_or_else(|| RefError::LockReleased {
+        refname: update.branch_ref.to_string(),
+    })?;
     crate::git_dir::io_error::io_with_git_path(
         git_dir,
         &path,
@@ -4180,8 +4406,7 @@ pub(crate) fn update_branch_for_commit_files_with_reference_transaction_hooks(
         return lock.commit(git_dir, update, reflog_old, config);
     }
     let stdin = stdin_from_lines(lines);
-    ctx.run_reference_transaction(ReferenceTransactionPhase::Prepared, &stdin)
-        .map_err(Error::Hook)?;
+    ctx.run_reference_transaction(ReferenceTransactionPhase::Prepared, &stdin)?;
     match lock.commit(git_dir, update, reflog_old, config) {
         Ok(()) => {
             let _ = ctx.run_reference_transaction(ReferenceTransactionPhase::Committed, &stdin);
@@ -4236,10 +4461,9 @@ impl DetachedHeadRefLock {
         let content = format!("{new_oid}\n");
         use crate::lockfile::LockError;
         use std::io::Write as _;
-        let mut file_lock = self
-            .lock
-            .take()
-            .ok_or_else(|| Error::Message("HEAD ref lock already released".into()))?;
+        let mut file_lock = self.lock.take().ok_or_else(|| RefError::LockReleased {
+            refname: "HEAD".to_owned(),
+        })?;
         crate::git_dir::io_error::io_with_git_path(
             git_dir,
             &path,
@@ -4311,8 +4535,7 @@ pub(crate) fn update_detached_head_for_commit_files_with_reference_transaction_h
         );
     }
     let stdin = stdin_from_lines(lines);
-    ctx.run_reference_transaction(ReferenceTransactionPhase::Prepared, &stdin)
-        .map_err(Error::Hook)?;
+    ctx.run_reference_transaction(ReferenceTransactionPhase::Prepared, &stdin)?;
     let reflog_old = expected_old.unwrap_or_else(|| ctx.null_oid());
     match lock.commit(
         git_dir,
@@ -4336,15 +4559,22 @@ pub(crate) fn update_detached_head_for_commit_files_with_reference_transaction_h
 /// Apply [`BranchCommitRefUpdate`]: branch CAS, ref write, branch + `HEAD` reflogs.
 ///
 /// Opens a fresh on-disk ref store for `git_dir` (object-checked open used internally)
-/// and bypasses [`crate::repo::Repository::refs`] and any injected
+/// and bypasses [`crate::repo::Repository::ref_store`] and any injected
 /// [`crate::refs::store::RefStore`]. Prefer [`update_branch_for_commit_on_store`] with
-/// [`crate::repo::Repository::refs`] when you already have a
+/// [`crate::repo::Repository::ref_store`] when you already have a
 /// [`crate::repo::Repository`].
-pub fn update_branch_for_commit(git_dir: &Path, update: &BranchCommitRefUpdate<'_>) -> Result<()> {
+#[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
+pub(crate) fn update_branch_for_commit(
+    git_dir: &Path,
+    update: &BranchCommitRefUpdate<'_>,
+) -> Result<()> {
     let config = ConfigSet::load(
         &crate::environment::Environment::empty(),
         Some(git_dir),
-        true,
+        &crate::config::LoadConfigOptions::standard(
+            &crate::environment::Environment::empty(),
+            Some(git_dir),
+        ),
     )
     .unwrap_or_default();
     update_branch_for_commit_with_config(git_dir, update, &config)
@@ -4353,12 +4583,13 @@ pub fn update_branch_for_commit(git_dir: &Path, update: &BranchCommitRefUpdate<'
 /// Like [`update_branch_for_commit`], using a repository config snapshot for reflog policy.
 ///
 /// Opens a fresh on-disk ref store for `git_dir` (object-checked open used internally)
-/// and bypasses [`crate::repo::Repository::refs`] and any injected
+/// and bypasses [`crate::repo::Repository::ref_store`] and any injected
 /// [`crate::refs::store::RefStore`]. Prefer [`update_branch_for_commit_on_store`] with
-/// [`crate::repo::Repository::refs`] when you already have a
+/// [`crate::repo::Repository::ref_store`] when you already have a
 /// [`crate::repo::Repository`]. Checked against that repository's objects like
 /// [`write_ref`]; see [`update_branch_for_commit_on_store`].
-pub fn update_branch_for_commit_with_config(
+#[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
+pub(crate) fn update_branch_for_commit_with_config(
     git_dir: &Path,
     update: &BranchCommitRefUpdate<'_>,
     config: &ConfigSet,
@@ -4405,7 +4636,8 @@ pub(crate) fn update_detached_head_for_commit_files(
 /// `commondir` link (linked worktrees / `git clone --shared` member repos); `HEAD` stays under
 /// `git_dir`.
 #[must_use]
-pub fn reflog_file_path(git_dir: &Path, refname: &str) -> PathBuf {
+pub(crate) fn reflog_file_path(git_dir: &Path, refname: impl AsRef<RefNameRef>) -> PathBuf {
+    let refname = refname.as_ref().as_str();
     let (store, stor_name) = crate::worktree_ref::resolve_ref_storage(git_dir, refname);
     store.join("logs").join(stor_name)
 }
@@ -4453,23 +4685,51 @@ pub(crate) fn packed_ref_peel(odb: &crate::odb::Odb, oid: ObjectId) -> Option<Ob
 /// # Errors
 ///
 /// Returns ref-store, packed-ref parsing, lock, and filesystem errors.
-pub fn pack_remote_tracking_refs_for_clone(git_dir: &Path, remote: &str) -> Result<()> {
-    pack_imported_refs_for_clone(git_dir, Some(remote))
-}
-
-/// Bare clones import tags without creating remote-tracking refs.
-pub(crate) fn pack_imported_refs_for_clone(git_dir: &Path, remote: Option<&str>) -> Result<()> {
+#[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
+pub(crate) fn pack_remote_tracking_refs_for_clone(git_dir: &Path, remote: &str) -> Result<()> {
     if open_ref_store(git_dir)?.format() != RefStorageFormat::Files {
         return Ok(());
     }
-    let prefix = remote.map(|name| format!("refs/remotes/{name}/"));
     let storage_git_dir = common_dir(git_dir).unwrap_or_else(|| git_dir.to_path_buf());
     let odb = crate::odb::Odb::new(&storage_git_dir.join("objects"))
         .with_config_git_dir(git_dir.to_path_buf());
+    let config = crate::config::ConfigSet::load(
+        &crate::environment::Environment::empty(),
+        Some(git_dir),
+        &crate::config::LoadConfigOptions::standard(
+            &crate::environment::Environment::empty(),
+            Some(git_dir),
+        ),
+    )
+    .ok();
+    pack_imported_refs(git_dir, &odb, config.as_ref(), Some(remote))
+}
+
+/// [`pack_remote_tracking_refs_for_clone`] for `repo`, peeling tags through its object store.
+/// Bare clones (`remote` is `None`) import tags without creating remote-tracking refs.
+pub(crate) fn pack_imported_refs_for_clone(
+    repo: &crate::repo::Repository,
+    remote: Option<&str>,
+) -> Result<()> {
+    if repo.ref_store().format() != RefStorageFormat::Files {
+        return Ok(());
+    }
+    let config = repo.config().snapshot().ok();
+    pack_imported_refs(repo.git_dir(), repo.odb(), config.as_deref(), remote)
+}
+
+fn pack_imported_refs(
+    git_dir: &Path,
+    odb: &crate::odb::Odb,
+    config: Option<&crate::config::ConfigSet>,
+    remote: Option<&str>,
+) -> Result<()> {
+    let prefix = remote.map(|name| format!("refs/remotes/{name}/"));
     odb.with_pack_read_context(|| {
         pack_refs_files_matching(
             git_dir,
-            &odb,
+            odb,
+            config,
             |name| {
                 name.starts_with("refs/tags/")
                     || prefix
@@ -4484,37 +4744,17 @@ pub(crate) fn pack_imported_refs_for_clone(git_dir: &Path, remote: Option<&str>)
     Ok(())
 }
 
-/// Rewrite `packed-refs` under the packed-refs lock (tempfile + rename).
-fn atomic_rewrite_packed_refs(git_dir: &Path, body: &str) -> Result<()> {
-    let packed_path = store::paths::packed_refs_path(git_dir);
-    let lock = lock_path_for_ref(&packed_path);
-    let abs_lock = git_dir
-        .canonicalize_simplified()
-        .map(|d| d.join("packed-refs.lock"))
-        .unwrap_or_else(|_| lock.clone());
-    let _packed_lock = acquire_packed_refs_lock(git_dir, &lock, &abs_lock)?;
-
-    let tmp = packed_path.with_extension("new");
-    let mut created_tmp = false;
-    let write_result = (|| -> Result<()> {
-        // Staged packed-refs body (not a lock file); exclusive create avoids clobber.
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)
-            .map_err(Error::Io)?;
-        created_tmp = true;
-        use std::io::Write as _;
-        file.write_all(body.as_bytes()).map_err(Error::Io)?;
-        drop(file);
-        fs::rename(&tmp, &packed_path).map_err(Error::Io)?;
-        created_tmp = false;
-        Ok(())
-    })();
-    if write_result.is_err() && created_tmp {
-        let _ = fs::remove_file(&tmp);
+/// Append one `packed-refs` record line, and its `^` peel line when `peel` is set.
+fn push_packed_record(body: &mut String, name: &str, oid: &ObjectId, peel: Option<&ObjectId>) {
+    oid.push_hex_to(body);
+    body.push(' ');
+    body.push_str(name);
+    body.push('\n');
+    if let Some(peel) = peel {
+        body.push('^');
+        peel.push_hex_to(body);
+        body.push('\n');
     }
-    write_result
 }
 
 /// One reference line (and optional peel) for [`write_packed_refs_file`].
@@ -4536,26 +4776,20 @@ pub struct PackedRefRecord {
 ///
 /// # Errors
 ///
-/// Returns [`Error::InvalidRef`] for unsafe ref names, or [`Error::Io`] on failure.
-pub fn write_packed_refs_file(git_dir: &Path, records: &[PackedRefRecord]) -> Result<()> {
+/// Returns [`crate::error::RefError::Invalid`] for unsafe ref names, or [`Error::Io`] on failure.
+#[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
+pub(crate) fn write_packed_refs_file(git_dir: &Path, records: &[PackedRefRecord]) -> Result<()> {
     let mut sorted: Vec<&PackedRefRecord> = records.iter().collect();
     sorted.sort_by(|a, b| a.refname.cmp(&b.refname));
     for rec in &sorted {
         ensure_refname_safe_for_storage(&rec.refname)?;
     }
-    let mut body = String::from("# pack-refs with: peeled fully-peeled sorted\n");
+    let mut body = String::from(PACKED_REFS_HEADER);
     for rec in &sorted {
-        body.push_str(&rec.oid.to_hex());
-        body.push(' ');
-        body.push_str(&rec.refname);
-        body.push('\n');
-        if let Some(peeled) = rec.peeled {
-            body.push('^');
-            body.push_str(&peeled.to_hex());
-            body.push('\n');
-        }
+        push_packed_record(&mut body, &rec.refname, &rec.oid, rec.peeled.as_ref());
     }
-    atomic_rewrite_packed_refs(git_dir, &body)?;
+    let packed_path = store::paths::packed_refs_path(git_dir);
+    replace_packed_refs_file(git_dir, &packed_path, &body, false)?;
     for rec in &sorted {
         let storage_dir = ref_storage_dir(git_dir, &rec.refname);
         let stor = crate::ref_namespace::storage_ref_name(&rec.refname);
@@ -4580,7 +4814,7 @@ pub fn write_packed_refs_file(git_dir: &Path, records: &[PackedRefRecord]) -> Re
 ///
 /// Returns [`Error::Io`] on directory traversal errors.
 /// List refs under `prefix` using the given repository's ref store.
-pub fn list_refs_for_repository(
+pub(crate) fn list_refs_for_repository(
     repo: &crate::repo::Repository,
     prefix: &str,
 ) -> Result<Vec<(String, ObjectId)>> {
@@ -4594,7 +4828,7 @@ fn list_store_refs_with_name_prefix(
     prefix: &str,
 ) -> Result<Vec<(String, ObjectId)>> {
     let git_dir = repo.git_dir();
-    let mut results = collect_resolved_refs(repo.refs(), prefix)?;
+    let mut results = collect_resolved_refs(repo.ref_store(), prefix)?;
     if crate::worktree_ref::is_linked_worktree_git_dir(git_dir) {
         results.retain(|(name, _)| crate::worktree_ref::ref_visible_from_worktree(git_dir, name));
     }
@@ -4657,10 +4891,15 @@ pub(crate) fn list_refs_glob_in(
 /// List resolved refs under `git_dir` whose full names start with `prefix`.
 ///
 /// Opens a fresh on-disk ref store via [`crate::refs::store::open_ref_store`] and
-/// bypasses [`crate::repo::Repository::refs`] and any injected
+/// bypasses [`crate::repo::Repository::ref_store`] and any injected
 /// [`crate::refs::store::RefStore`]. Prefer [`list_refs_for_repository`] or
 /// [`crate::refs::References::list`] when you already have a
 /// [`crate::repo::Repository`].
+///
+/// Each returned object id is the ref's stored value: symbolic refs are followed
+/// to their target oid. For direct refs (including annotated tags in
+/// `packed-refs`), that is the ref line's object id, not the optional `^` peel
+/// to a commit (peel metadata is for listing decoration and upload-pack only).
 ///
 /// Uses the on-disk ref backend (files or reftable) and applies linked-worktree
 /// visibility rules when `git_dir` is a linked worktree git directory.
@@ -4668,9 +4907,13 @@ pub(crate) fn list_refs_glob_in(
 /// # Errors
 ///
 /// Propagates ref-store open/read failures.
-pub fn list_refs(git_dir: &Path, prefix: &str) -> Result<Vec<(String, ObjectId)>> {
-    let prefix_norm = normalize_list_refs_prefix(git_dir, prefix);
-    let prefix = prefix_norm.as_str();
+pub(crate) fn list_refs(git_dir: &Path, prefix: &str) -> Result<Vec<(String, ObjectId)>> {
+    list_refs_with_name_prefix(git_dir, &normalize_list_refs_prefix(git_dir, prefix))
+}
+
+/// Refs under `git_dir` whose names start with `prefix`, taken literally (no directory
+/// normalization), sorted by name.
+fn list_refs_with_name_prefix(git_dir: &Path, prefix: &str) -> Result<Vec<(String, ObjectId)>> {
     let store = open_ref_store(git_dir)?;
     if store.format() != RefStorageFormat::Files {
         return crate::reftable::reftable_list_refs(git_dir, prefix);
@@ -4713,27 +4956,17 @@ pub(crate) fn list_refs_filtering_packed(
     Ok(results)
 }
 
-/// Resolve a ref using Git DWIM rules (`expand_ref` / `repo_dwim_ref`).
-///
-/// Opens a fresh on-disk ref store via [`crate::refs::store::open_ref_store`] and
-/// bypasses [`crate::repo::Repository::refs`] and any injected
-/// [`crate::refs::store::RefStore`]. Prefer [`crate::worktree_ref::resolve_ref_dwim`]
-/// with a closure over [`crate::repo::Repository::refs`] when you already have a
-/// [`crate::repo::Repository`].
-pub fn resolve_ref_dwim(git_dir: &Path, spec: &str) -> (usize, Option<ObjectId>) {
-    crate::worktree_ref::resolve_ref_dwim(|candidate| resolve_ref(git_dir, candidate).ok(), spec)
-}
-
 /// List refs under `prefix` using **literal** on-disk paths (ignores `GIT_NAMESPACE`).
 ///
 /// Opens a fresh on-disk ref store via [`crate::refs::store::open_ref_store`] and
-/// bypasses [`crate::repo::Repository::refs`] and any injected
+/// bypasses [`crate::repo::Repository::ref_store`] and any injected
 /// [`crate::refs::store::RefStore`]. There is no injected-store equivalent; use
 /// [`list_refs_for_repository`] when you need the repository's ref backend.
 ///
 /// Used by `receive-pack` when advertising: the server must see every physical ref so refs outside
 /// the active namespace can be offered as `.have` lines (matches Git `show_ref_cb`).
-pub fn list_refs_physical(git_dir: &Path, prefix: &str) -> Result<Vec<(String, ObjectId)>> {
+#[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
+pub(crate) fn list_refs_physical(git_dir: &Path, prefix: &str) -> Result<Vec<(String, ObjectId)>> {
     if open_ref_store(git_dir)?.format() != RefStorageFormat::Files {
         return crate::reftable::reftable_list_refs(git_dir, prefix);
     }
@@ -4783,11 +5016,15 @@ pub fn list_refs_physical(git_dir: &Path, prefix: &str) -> Result<Vec<(String, O
 /// [`list_refs`] under each configured prefix (or all of `refs/` when no
 /// prefixes are set). Duplicate OIDs are skipped while preserving first-seen
 /// order.
-pub fn collect_alternate_ref_oids(receiving_git_dir: &Path) -> Result<Vec<ObjectId>> {
+#[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
+pub(crate) fn collect_alternate_ref_oids(receiving_git_dir: &Path) -> Result<Vec<ObjectId>> {
     let config = ConfigSet::load(
         &crate::environment::Environment::empty(),
         Some(receiving_git_dir),
-        true,
+        &crate::config::LoadConfigOptions::standard(
+            &crate::environment::Environment::empty(),
+            Some(receiving_git_dir),
+        ),
     )?;
     let objects_dir = receiving_git_dir.join("objects");
     let alternates = pack::read_alternates_recursive(&objects_dir).unwrap_or_default();
@@ -4800,10 +5037,7 @@ pub fn collect_alternate_ref_oids(receiving_git_dir: &Path) -> Result<Vec<Object
         if !alt_git_dir.join("refs").is_dir() {
             continue;
         }
-        if let Some(prefixes) = config
-            .get("core.alternaterefsprefixes")
-            .or_else(|| config.get("core.alternateRefsPrefixes"))
-        {
+        if let Some(prefixes) = config.value("core.alternateRefsPrefixes") {
             for part in prefixes.split_whitespace() {
                 if let Ok(oid) = resolve_ref(&alt_git_dir, part) {
                     if seen.insert(oid) {
@@ -4829,7 +5063,7 @@ pub fn collect_alternate_ref_oids(receiving_git_dir: &Path) -> Result<Vec<Object
 }
 
 /// List refs matching a glob pattern (e.g. `refs/heads/topic/*`) using `repo`'s ref store.
-pub fn list_refs_glob_for_repository(
+pub(crate) fn list_refs_glob_for_repository(
     repo: &crate::repo::Repository,
     pattern: &str,
 ) -> Result<Vec<(String, ObjectId)>> {
@@ -4855,24 +5089,22 @@ pub fn list_refs_glob_for_repository(
 /// List refs matching a glob pattern (e.g. `refs/heads/topic/*`).
 ///
 /// Opens a fresh on-disk ref store via [`crate::refs::store::open_ref_store`] and
-/// bypasses [`crate::repo::Repository::refs`] and any injected
-/// [`crate::refs::store::RefStore`]. Prefer [`list_refs_glob_for_repository`] when you
+/// bypasses [`crate::repo::Repository::ref_store`] and any injected
+/// [`crate::refs::store::RefStore`]. Prefer `list_refs_glob_for_repository` when you
 /// already have a [`crate::repo::Repository`].
-pub fn list_refs_glob(git_dir: &Path, pattern: &str) -> Result<Vec<(String, ObjectId)>> {
-    let glob_pos = pattern.find(['*', '?', '[']);
-    let prefix_owned: String = match glob_pos {
-        // Literal segment before the first wildcard (e.g. `refs/heads/b05*` → `refs/heads/b05`).
-        Some(pos) => pattern[..pos].to_owned(),
+pub(crate) fn list_refs_glob(git_dir: &Path, pattern: &str) -> Result<Vec<(String, ObjectId)>> {
+    // The text before a wildcard is a name prefix, not a directory (`refs/tags/v*` must list
+    // `refs/tags/v1.0`), so it skips the directory normalization of [`list_refs`].
+    let all = match pattern.find(['*', '?', '[']) {
+        Some(pos) => list_refs_with_name_prefix(git_dir, &pattern[..pos])?,
         None => {
-            let mut p = pattern.trim_end_matches('/').to_owned();
-            if !p.is_empty() {
-                p.push('/');
+            let mut dir = pattern.trim_end_matches('/').to_owned();
+            if !dir.is_empty() {
+                dir.push('/');
             }
-            p
+            list_refs(git_dir, &dir)?
         }
     };
-    let prefix = prefix_owned.as_str();
-    let all = list_refs(git_dir, prefix)?;
     let mut results = Vec::new();
     for (refname, oid) in all {
         if ref_matches_glob(&refname, pattern) {
@@ -4885,7 +5117,8 @@ pub fn list_refs_glob(git_dir: &Path, pattern: &str) -> Result<Vec<(String, Obje
 /// Check whether a ref name matches a glob pattern.
 ///
 /// Supports `*`, `?`, and `[…]` wildcards. An exact string match is also accepted.
-pub fn ref_matches_glob(refname: &str, pattern: &str) -> bool {
+pub fn ref_matches_glob(refname: impl AsRef<RefNameRef>, pattern: &str) -> bool {
+    let refname = refname.as_ref().as_str();
     // For exact matches (no glob characters), check suffix match
     if !pattern.contains('*') && !pattern.contains('?') && !pattern.contains('[') {
         return refname == pattern
@@ -4923,6 +5156,7 @@ fn glob_match(pattern: &str, text: &str) -> bool {
 }
 
 /// OID stored directly in a loose ref file (40 hex), ignoring symbolic targets.
+#[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
 fn loose_ref_file_direct_oid(path: &Path) -> Option<ObjectId> {
     let content = fs::read_to_string(path).ok()?;
     let content = content.trim_end_matches('\n').trim();
@@ -4933,6 +5167,7 @@ fn loose_ref_file_direct_oid(path: &Path) -> Option<ObjectId> {
     }
 }
 
+#[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
 fn collect_loose_refs_into_map(
     dir: &Path,
     prefix: &str,
@@ -5004,22 +5239,31 @@ fn collect_loose_refs_into_map(
 /// Resolve `@{-N}` syntax to the branch name (not an OID).
 ///
 /// Opens a fresh on-disk ref store via [`crate::refs::store::open_ref_store`] and
-/// bypasses [`crate::repo::Repository::refs`] and any injected
+/// bypasses [`crate::repo::Repository::ref_store`] and any injected
 /// [`crate::refs::store::RefStore`]. Prefer resolving through a [`crate::repo::Repository`]
 /// and its ref store when the checkout stack lives there.
 ///
 /// Returns the branch name of the Nth previously checked out branch.
-pub fn resolve_at_n_branch(git_dir: &Path, spec: &str) -> Result<String> {
+#[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
+pub(crate) fn resolve_at_n_branch(git_dir: &Path, spec: &str) -> Result<String> {
     // Parse the N from @{-N}
     let inner = spec
         .strip_prefix("@{-")
         .and_then(|s| s.strip_suffix('}'))
-        .ok_or_else(|| Error::InvalidRef(format!("not an @{{-N}} ref: {spec}")))?;
-    let n: usize = inner
-        .parse()
-        .map_err(|_| Error::InvalidRef(format!("invalid N in {spec}")))?;
+        .ok_or_else(|| {
+            Error::Ref(RefError::Invalid {
+                detail: format!("not an @{{-N}} ref: {spec}"),
+            })
+        })?;
+    let n: usize = inner.parse().map_err(|_| {
+        Error::Ref(RefError::Invalid {
+            detail: format!("invalid N in {spec}"),
+        })
+    })?;
     if n == 0 {
-        return Err(Error::InvalidRef("@{-0} is not valid".to_string()));
+        return Err(Error::Ref(RefError::Invalid {
+            detail: "@{-0} is not valid".to_string(),
+        }));
     }
     let entries = crate::reflog::read_reflog(git_dir, "HEAD")?;
     let mut count = 0usize;
@@ -5034,9 +5278,9 @@ pub fn resolve_at_n_branch(git_dir: &Path, spec: &str) -> Result<String> {
             }
         }
     }
-    Err(Error::InvalidRef(format!(
-        "{spec}: only {count} checkout(s) in reflog"
-    )))
+    Err(Error::Ref(RefError::Invalid {
+        detail: format!("{spec}: only {count} checkout(s) in reflog"),
+    }))
 }
 
 fn ref_name_matches_list_prefix(refname: &str, prefix: &str) -> bool {
@@ -5084,6 +5328,7 @@ pub(crate) fn loose_ref_list_walk_root(git_dir: &Path, prefix: &str) -> (PathBuf
     (git_dir.to_path_buf(), String::new())
 }
 
+#[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
 fn collect_packed_refs_into_map(
     git_dir: &Path,
     prefix: &str,
@@ -5107,7 +5352,6 @@ mod update_branch_for_commit_tests {
     use super::*;
     use crate::reflog::read_reflog;
     use crate::repo::init_repository;
-    use std::sync::{Arc, Condvar, Mutex};
     use std::thread;
     use tempfile::TempDir;
 
@@ -5117,7 +5361,7 @@ mod update_branch_for_commit_tests {
 
     #[test]
     fn update_branch_for_commit_holds_lock_until_ref_commit() {
-        let _pause_serial = super::test_pause_injection_serial_guard();
+        let _pause_serial = super::inject::pause_injection_test_scope();
         let tmp = TempDir::new().unwrap();
         let repo = init_repository(
             tmp.path(),
@@ -5133,18 +5377,15 @@ mod update_branch_for_commit_tests {
         let oid3 = test_commit(&git_dir, "three");
         write_ref(&git_dir, "refs/heads/main", &oid1).unwrap();
 
-        let gate = Arc::new(branch_ref_pause_inject::PauseGate {
-            wait: Mutex::new(false),
-            cv: Condvar::new(),
-        });
-        set_test_inject_branch_ref_pause_before_commit(Some(gate.clone()));
+        let gate = super::inject::branch_ref_pause_gate();
+        super::inject::set_branch_ref_pause_before_commit(Some(gate.clone()));
 
         let git_dir_thread = git_dir.clone();
         let handle = thread::spawn(move || {
             update_branch_for_commit(
                 &git_dir_thread,
                 &BranchCommitRefUpdate {
-                    branch_ref: "refs/heads/main",
+                    branch_ref: RefNameRef::from_trusted("refs/heads/main"),
                     expected_old: Some(oid1),
                     new_oid: oid2,
                     identity: "T <t@e.com> 1 +0000",
@@ -5167,7 +5408,7 @@ mod update_branch_for_commit_tests {
         gate.cv.notify_all();
         drop(wait);
         handle.join().unwrap().unwrap();
-        set_test_inject_branch_ref_pause_before_commit(None);
+        super::inject::set_branch_ref_pause_before_commit(None);
 
         assert_eq!(resolve_ref(&git_dir, "refs/heads/main").unwrap(), oid2);
     }
@@ -5186,11 +5427,11 @@ mod update_branch_for_commit_tests {
         let git_dir = repo.git_dir().to_path_buf();
         let new_oid = sample_oid("3333333333333333333333333333333333333333");
 
-        crate::reftable::set_test_inject_reftable_transaction_fail(true);
+        crate::reftable::inject::set_reftable_transaction_fail(true);
         let err = update_branch_for_commit(
             &git_dir,
             &BranchCommitRefUpdate {
-                branch_ref: "refs/heads/main",
+                branch_ref: RefNameRef::from_trusted("refs/heads/main"),
                 expected_old: None,
                 new_oid,
                 identity: "T <t@e.com> 1 +0000",
@@ -5198,8 +5439,8 @@ mod update_branch_for_commit_tests {
             },
         )
         .unwrap_err();
-        crate::reftable::set_test_inject_reftable_transaction_fail(false);
-        assert!(!matches!(err, Error::Message(_)));
+        crate::reftable::inject::set_reftable_transaction_fail(false);
+        assert!(matches!(err, Error::Ref(_)), "{err:?}");
 
         assert!(resolve_ref(&git_dir, "refs/heads/main").is_err());
         assert!(read_reflog(&git_dir, "refs/heads/main").unwrap().is_empty());
@@ -5259,8 +5500,8 @@ mod refname_available_tests {
             "refs/1l/d".to_string(),
         ]);
         let skip = HashSet::new();
-        let err = verify_refname_available_for_create(git_dir, "refs/1l/c/x", &extras, &skip)
-            .unwrap_err();
+        let err =
+            verify_ref_available_for_create(git_dir, "refs/1l/c/x", &extras, &skip).unwrap_err();
         assert!(matches!(
             err,
             RefnameUnavailable::AncestorExists { ref blocking, .. } if blocking == "refs/1l/c"
@@ -5279,8 +5520,8 @@ mod refname_available_tests {
         .unwrap();
         let skip = HashSet::new();
         let extras = BTreeSet::new();
-        let err = verify_refname_available_for_create(&git_dir, "refs/1l/c/x", &extras, &skip)
-            .unwrap_err();
+        let err =
+            verify_ref_available_for_create(&git_dir, "refs/1l/c/x", &extras, &skip).unwrap_err();
         assert!(matches!(
             err,
             RefnameUnavailable::AncestorExists { ref blocking, .. } if blocking == "refs/1l/c"
@@ -5365,7 +5606,7 @@ mod refname_available_tests {
         let extras = BTreeSet::from(["refs/ns/p".to_string()]);
         let skip = HashSet::new();
         let err =
-            verify_refname_available_for_create(git_dir, "refs/ns/p", &extras, &skip).unwrap_err();
+            verify_ref_available_for_create(git_dir, "refs/ns/p", &extras, &skip).unwrap_err();
         assert!(matches!(
             err,
             RefnameUnavailable::DescendantExists { ref blocking, .. }
@@ -5386,7 +5627,7 @@ mod refname_available_tests {
              67bf698f3ab735e92fb011a99cff3497c44d30c1 refs/ns/q/x\n",
         )
         .unwrap();
-        let err = verify_refname_available_for_create(
+        let err = verify_ref_available_for_create(
             git_dir,
             "refs/ns/q",
             &BTreeSet::new(),
@@ -5412,7 +5653,7 @@ mod refname_available_tests {
             )
             .unwrap();
         }
-        verify_refname_available_for_create(
+        verify_ref_available_for_create(
             git_dir,
             "refs/tags/v1.0",
             &BTreeSet::new(),
@@ -5434,7 +5675,7 @@ mod refname_available_tests {
         let extras = BTreeSet::from(["refs/3l/c".to_string()]);
         let skip = HashSet::new();
         let err =
-            verify_refname_available_for_create(git_dir, "refs/3l/c", &extras, &skip).unwrap_err();
+            verify_ref_available_for_create(git_dir, "refs/3l/c", &extras, &skip).unwrap_err();
         assert!(matches!(
             err,
             RefnameUnavailable::DescendantExists { ref blocking, .. }
@@ -5458,7 +5699,7 @@ mod refname_available_tests {
         );
         let extras = BTreeSet::from(["refs/ns/newchild".to_string()]);
         let skip = HashSet::new();
-        verify_refname_available_for_create(git_dir, "refs/ns/newchild", &extras, &skip).unwrap();
+        verify_ref_available_for_create(git_dir, "refs/ns/newchild", &extras, &skip).unwrap();
     }
 }
 
@@ -5487,7 +5728,7 @@ mod ref_storage_traversal_guard_tests {
     }
 
     fn assert_invalid_ref_preserves_config(git_dir: &Path, result: Result<()>) {
-        assert!(matches!(result, Err(Error::InvalidRef(_))));
+        assert!(matches!(result, Err(Error::Ref(RefError::Invalid { .. }))));
         assert!(
             git_dir.join("config").is_file(),
             "repository config must not be touched"
@@ -5798,7 +6039,7 @@ mod packed_refs_parse_tests {
         let data = fs::read(&path).unwrap();
         assert!(matches!(
             parse_packed_refs_to_map(&path, &data),
-            Err(Error::PackedRefsUnexpectedLine { .. })
+            Err(Error::Ref(RefError::PackedRefsUnexpectedLine { .. }))
         ));
     }
 
@@ -5815,7 +6056,7 @@ mod packed_refs_parse_tests {
         let data = fs::read(&path).unwrap();
         assert!(matches!(
             parse_packed_refs_to_map(&path, &data),
-            Err(Error::PackedRefsUnexpectedLine { .. })
+            Err(Error::Ref(RefError::PackedRefsUnexpectedLine { .. }))
         ));
     }
 
@@ -5849,7 +6090,7 @@ mod packed_refs_parse_tests {
         let data = fs::read(&path).unwrap();
         assert!(matches!(
             parse_packed_refs_to_map(&path, &data),
-            Err(Error::PackedRefsUnexpectedLine { .. })
+            Err(Error::Ref(RefError::PackedRefsUnexpectedLine { .. }))
         ));
 
         fs::write(
@@ -5861,7 +6102,7 @@ mod packed_refs_parse_tests {
         let data = fs::read(&path).unwrap();
         assert!(matches!(
             parse_packed_refs_to_map(&path, &data),
-            Err(Error::PackedRefsUnexpectedLine { .. })
+            Err(Error::Ref(RefError::PackedRefsUnexpectedLine { .. }))
         ));
     }
 
@@ -5948,7 +6189,7 @@ mod packed_refs_parse_tests {
         let view = PackedRefsFileView::from_bytes(&path, bad.into_bytes(), HashAlgo::Sha1).unwrap();
         assert!(matches!(
             view.map_for_prefix_filtered(&path, None, Some(&|_: &str, _: &ObjectId, _| false)),
-            Err(Error::PackedRefsUnexpectedLine { .. })
+            Err(Error::Ref(RefError::PackedRefsUnexpectedLine { .. }))
         ));
     }
 
@@ -6045,7 +6286,7 @@ mod packed_refs_parse_tests {
         .unwrap();
         assert!(matches!(
             bad_peel_on_branch.map_for_prefix(&path, Some("refs/heads")),
-            Err(Error::PackedRefsUnexpectedLine { .. })
+            Err(Error::Ref(RefError::PackedRefsUnexpectedLine { .. }))
         ));
         let tags = bad_peel_on_branch
             .map_for_prefix(&path, Some("refs/tags"))
@@ -6101,7 +6342,7 @@ mod packed_refs_parse_tests {
         assert_eq!(heads.keys().collect::<Vec<_>>(), ["refs/heads/main"]);
         assert!(matches!(
             view.map_for_prefix(&path, Some("refs/tags")),
-            Err(Error::PackedRefsUnexpectedLine { .. })
+            Err(Error::Ref(RefError::PackedRefsUnexpectedLine { .. }))
         ));
         assert!(view.map_for_prefix(&path, None).is_err());
 
@@ -6109,7 +6350,7 @@ mod packed_refs_parse_tests {
         bad_header.extend_from_slice(format!("{oid} refs/heads/main\n").as_bytes());
         assert!(matches!(
             PackedRefsFileView::from_bytes(&path, bad_header, HashAlgo::Sha1),
-            Err(Error::PackedRefsUnexpectedLine { .. })
+            Err(Error::Ref(RefError::PackedRefsUnexpectedLine { .. }))
         ));
     }
 
@@ -6128,7 +6369,7 @@ mod packed_refs_parse_tests {
         for prefix in [None, Some("refs/heads")] {
             assert!(matches!(
                 view.map_for_prefix(&path, prefix),
-                Err(Error::PackedRefsUnexpectedLine { .. })
+                Err(Error::Ref(RefError::PackedRefsUnexpectedLine { .. }))
             ));
         }
         let header_only = PackedRefsFileView::from_bytes(
@@ -6173,7 +6414,7 @@ mod packed_refs_parse_tests {
             assert!(
                 matches!(
                     view(body.clone(), algo),
-                    Err(Error::PackedRefsUnexpectedLine { .. })
+                    Err(Error::Ref(RefError::PackedRefsUnexpectedLine { .. }))
                 ),
                 "{algo:?}: {body:?}"
             );
@@ -6229,7 +6470,7 @@ mod packed_refs_parse_tests {
         ));
         assert!(matches!(
             garbage_after_first_branch.map_for_prefix(&path, Some("refs/heads")),
-            Err(Error::PackedRefsUnexpectedLine { .. })
+            Err(Error::Ref(RefError::PackedRefsUnexpectedLine { .. }))
         ));
         let tags = garbage_after_first_branch
             .map_for_prefix(&path, Some("refs/tags"))
@@ -6321,6 +6562,190 @@ mod packed_refs_parse_tests {
     }
 
     #[test]
+    fn garbage_between_sorted_records_rejects_listing() {
+        let dir = tempdir().unwrap();
+        let git_dir = dir.path();
+        fs::create_dir_all(git_dir.join("refs/heads")).unwrap();
+        let oid = "1111111111111111111111111111111111111111";
+        fs::write(
+            store::paths::packed_refs_path(git_dir),
+            format!(
+                "# pack-refs with: sorted\n{oid} refs/heads/a\nthis is not a valid packed-refs line\n{oid} refs/heads/b\n"
+            ),
+        )
+        .unwrap();
+        assert!(matches!(
+            list_refs(git_dir, "refs/"),
+            Err(Error::Ref(RefError::PackedRefsUnexpectedLine { .. }))
+        ));
+    }
+
+    #[test]
+    fn for_each_record_streaming_matches_map_and_stops_early() {
+        let dir = tempdir().unwrap();
+        let path = store::paths::packed_refs_path(dir.path());
+        let oid = "1111111111111111111111111111111111111111";
+        let header = "# pack-refs with: peeled fully-peeled sorted\n";
+        let body = format!("{header}{oid} refs/heads/a\n{oid} refs/heads/b\n{oid} refs/tags/t\n");
+        let view =
+            PackedRefsFileView::from_bytes(&path, body.into_bytes(), HashAlgo::Sha1).unwrap();
+        let mut streamed = Vec::new();
+        let _ = view
+            .for_each_record(&path, Some("refs/heads"), None, |name, _, _| {
+                streamed.push(name.to_owned());
+                ControlFlow::Continue(())
+            })
+            .unwrap();
+        assert_eq!(
+            streamed,
+            sorted_names(view.map_for_prefix(&path, Some("refs/heads")).unwrap())
+        );
+        let mut count = 0;
+        assert!(view
+            .for_each_record(&path, Some("refs/heads"), None, |_, _, _| {
+                count += 1;
+                ControlFlow::Break(())
+            })
+            .unwrap()
+            .is_break());
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn for_each_record_break_before_corrupt_tail_ok_while_full_scan_errors() {
+        let dir = tempdir().unwrap();
+        let path = store::paths::packed_refs_path(dir.path());
+        let oid = "1111111111111111111111111111111111111111";
+        let good_only = format!(
+            "# pack-refs with: peeled fully-peeled sorted\n{oid} refs/heads/good\n{oid} refs/heads/good2\n"
+        );
+        let with_corrupt_tail = format!(
+            "# pack-refs with: peeled fully-peeled sorted\n{oid} refs/heads/good\n{oid} refs/heads/good2\n{oid} refs/heads/bad..name\n"
+        );
+        let view =
+            PackedRefsFileView::from_bytes(&path, good_only.into_bytes(), HashAlgo::Sha1).unwrap();
+        assert!(view
+            .for_each_record(&path, None, None, |_, _, _| ControlFlow::Break(()))
+            .unwrap()
+            .is_break());
+        let view =
+            PackedRefsFileView::from_bytes(&path, with_corrupt_tail.into_bytes(), HashAlgo::Sha1)
+                .unwrap();
+        assert!(view
+            .for_each_record(&path, None, None, |_, _, _| ControlFlow::Continue(()))
+            .is_err());
+    }
+
+    fn collect_records(
+        view: &PackedRefsFileView,
+        path: &Path,
+        keep: Option<PackedRecordFilter<'_>>,
+    ) -> Result<Vec<(String, ObjectId, PackedPeel)>> {
+        let mut out = Vec::new();
+        view.for_each_record(path, None, keep, |name, oid, peel| {
+            out.push((name.to_owned(), oid, peel));
+            ControlFlow::Continue(())
+        })?;
+        Ok(out)
+    }
+
+    #[test]
+    fn filtered_record_walk_emits_the_unfiltered_walk_minus_rejected_records() {
+        let dir = tempdir().unwrap();
+        let path = store::paths::packed_refs_path(dir.path());
+        let one = "1111111111111111111111111111111111111111";
+        let two = "2222222222222222222222222222222222222222";
+        let tag = "3333333333333333333333333333333333333333";
+        let body = format!(
+            "# pack-refs with: peeled fully-peeled sorted\n\
+             {one} refs/heads/a\n{two} refs/heads/b\n{tag} refs/tags/v1\n^{one}\n{two} refs/tags/v2\n"
+        );
+        let view =
+            PackedRefsFileView::from_bytes(&path, body.into_bytes(), HashAlgo::Sha1).unwrap();
+        let target: ObjectId = one.parse().unwrap();
+        let keep = |_: &str, oid: &ObjectId, peel: PackedPeel| match peel {
+            PackedPeel::Peeled(peeled) => peeled == target,
+            PackedPeel::NotTag | PackedPeel::Unknown => *oid == target,
+        };
+
+        let all = collect_records(&view, &path, None).unwrap();
+        let expected: Vec<_> = all
+            .into_iter()
+            .filter(|(name, oid, peel)| keep(name, oid, *peel))
+            .collect();
+        let kept = collect_records(&view, &path, Some(&keep)).unwrap();
+        assert_eq!(kept, expected);
+        let names: Vec<&str> = kept.iter().map(|(name, _, _)| name.as_str()).collect();
+        assert_eq!(names, ["refs/heads/a", "refs/tags/v1"]);
+        assert_eq!(kept[1].2, PackedPeel::Peeled(target));
+    }
+
+    #[test]
+    fn filtered_record_walk_emits_nothing_before_a_corrupt_line() {
+        let dir = tempdir().unwrap();
+        let path = store::paths::packed_refs_path(dir.path());
+        let oid = "1111111111111111111111111111111111111111";
+        let body = format!(
+            "# pack-refs with: peeled fully-peeled sorted\n\
+             {oid} refs/heads/good\n{oid} refs/heads/good2\n{oid} refs/heads/bad..name\n"
+        );
+        let view =
+            PackedRefsFileView::from_bytes(&path, body.into_bytes(), HashAlgo::Sha1).unwrap();
+        let keep_all = |_: &str, _: &ObjectId, _: PackedPeel| true;
+        let mut emitted = 0;
+        let result = view.for_each_record(&path, None, Some(&keep_all), |_, _, _| {
+            emitted += 1;
+            ControlFlow::Continue(())
+        });
+        assert!(matches!(
+            result,
+            Err(Error::Ref(RefError::PackedRefsUnexpectedLine { .. }))
+        ));
+        assert_eq!(emitted, 0);
+    }
+
+    #[test]
+    fn filtered_record_walk_stops_when_the_visitor_breaks() {
+        let dir = tempdir().unwrap();
+        let path = store::paths::packed_refs_path(dir.path());
+        let oid = "1111111111111111111111111111111111111111";
+        let body = format!(
+            "# pack-refs with: peeled fully-peeled sorted\n\
+             {oid} refs/heads/a\n{oid} refs/heads/b\n{oid} refs/heads/c\n"
+        );
+        let view =
+            PackedRefsFileView::from_bytes(&path, body.into_bytes(), HashAlgo::Sha1).unwrap();
+        let keep_all = |_: &str, _: &ObjectId, _: PackedPeel| true;
+        let mut seen = Vec::new();
+        let flow = view
+            .for_each_record(&path, None, Some(&keep_all), |name, _, _| {
+                seen.push(name.to_owned());
+                if seen.len() == 2 {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            })
+            .unwrap();
+        assert!(flow.is_break());
+        assert_eq!(seen, ["refs/heads/a", "refs/heads/b"]);
+    }
+
+    #[test]
+    fn filtered_record_walk_of_a_lying_sorted_file_returns_every_kept_ref() {
+        let dir = tempdir().unwrap();
+        let path = store::paths::packed_refs_path(dir.path());
+        let (lying, _) = lying_and_unsorted_views(&path);
+        let keep_all = |_: &str, _: &ObjectId, _: PackedPeel| true;
+        let names: Vec<String> = collect_records(&lying, &path, Some(&keep_all))
+            .unwrap()
+            .into_iter()
+            .map(|(name, _, _)| name)
+            .collect();
+        assert_eq!(names, ["refs/heads/a", "refs/heads/b", "refs/tags/t"]);
+    }
+
+    #[test]
     fn prefix_scan_over_an_out_of_order_range_falls_back_to_the_whole_file() {
         let dir = tempdir().unwrap();
         let path = store::paths::packed_refs_path(dir.path());
@@ -6378,7 +6803,7 @@ mod packed_refs_parse_tests {
         .unwrap();
         assert!(matches!(
             corrupt.map_for_prefix(&path, Some("refs/heads")),
-            Err(Error::PackedRefsUnexpectedLine { .. })
+            Err(Error::Ref(RefError::PackedRefsUnexpectedLine { .. }))
         ));
     }
 
@@ -6436,7 +6861,7 @@ mod packed_refs_parse_tests {
                 assert!(
                     matches!(
                         view.map_for_prefix(&path, Some("refs/heads/m")),
-                        Err(Error::PackedRefsUnexpectedLine { .. })
+                        Err(Error::Ref(RefError::PackedRefsUnexpectedLine { .. }))
                     ),
                     "{records}"
                 );
@@ -6498,7 +6923,7 @@ mod packed_refs_parse_tests {
         let data = fs::read(&path).unwrap();
         assert!(matches!(
             parse_packed_refs_to_map(&path, &data),
-            Err(Error::PackedRefsUnexpectedLine { .. })
+            Err(Error::Ref(RefError::PackedRefsUnexpectedLine { .. }))
         ));
 
         fs::write(
@@ -6510,7 +6935,7 @@ mod packed_refs_parse_tests {
         let data = fs::read(&path).unwrap();
         assert!(matches!(
             parse_packed_refs_to_map(&path, &data),
-            Err(Error::PackedRefsUnexpectedLine { .. })
+            Err(Error::Ref(RefError::PackedRefsUnexpectedLine { .. }))
         ));
     }
 }
@@ -6564,7 +6989,7 @@ mod pack_refs_tests {
         })));
 
         let (_path, packed, pruned) =
-            pack_refs_files(&git_dir, repo.odb(), true, false).expect("pack");
+            pack_refs_files(&git_dir, repo.odb(), None, true, false).expect("pack");
         pack_refs_test_hooks::set_before_prune(None);
         assert!(packed >= 1);
         assert_eq!(pruned, 0, "stale CAS must not delete the updated loose ref");
@@ -6682,7 +7107,7 @@ mod pack_refs_tests {
             .expect("outer tag");
         write_ref(repo.git_dir(), "refs/tags/outer", &outer).expect("tag ref");
 
-        pack_refs_files(repo.git_dir(), repo.odb(), false, false).expect("pack");
+        pack_refs_files(repo.git_dir(), repo.odb(), None, false, false).expect("pack");
         let body =
             fs::read_to_string(store::paths::packed_refs_path(repo.git_dir())).expect("packed");
         let mut lines = body.lines();
@@ -6719,7 +7144,7 @@ mod pack_refs_tests {
             .expect("tag");
         write_ref(repo.git_dir(), "refs/tags/tree-tag", &tag).expect("tag ref");
 
-        pack_refs_files(repo.git_dir(), repo.odb(), true, false).expect("pack");
+        pack_refs_files(repo.git_dir(), repo.odb(), None, true, false).expect("pack");
         let body =
             fs::read_to_string(store::paths::packed_refs_path(repo.git_dir())).expect("packed");
         assert!(body.contains("refs/tags/tree-tag"));
@@ -6727,6 +7152,239 @@ mod pack_refs_tests {
             body.contains(&format!("^{}", tree.to_hex())),
             "expected peel to tree: {body}"
         );
+    }
+
+    fn packed_entry<'a>(name: &'a str, hex: &str, peel: Option<&str>) -> PackedEntry<'a> {
+        PackedEntry {
+            name,
+            oid: ObjectId::from_hex(hex).expect("oid"),
+            peel: peel.map(|p| ObjectId::from_hex(p).expect("peel")),
+        }
+    }
+
+    const OID_A: &str = "1111111111111111111111111111111111111111";
+    const OID_B: &str = "2222222222222222222222222222222222222222";
+    const OID_C: &str = "3333333333333333333333333333333333333333";
+
+    #[test]
+    fn merged_packed_refs_body_interleaves_loose_and_replaces_by_name() {
+        let existing = vec![
+            packed_entry("refs/tags/b", OID_A, Some(OID_B)),
+            packed_entry("refs/tags/d", OID_A, None),
+        ];
+        let loose = vec![
+            (
+                "refs/tags/a".to_owned(),
+                ObjectId::from_hex(OID_C).unwrap(),
+                None,
+            ),
+            (
+                "refs/tags/b".to_owned(),
+                ObjectId::from_hex(OID_C).unwrap(),
+                None,
+            ),
+            (
+                "refs/tags/c".to_owned(),
+                ObjectId::from_hex(OID_B).unwrap(),
+                Some(ObjectId::from_hex(OID_A).unwrap()),
+            ),
+            (
+                "refs/tags/e".to_owned(),
+                ObjectId::from_hex(OID_A).unwrap(),
+                None,
+            ),
+        ];
+        let body = merged_packed_refs_body(existing, &loose);
+        assert_eq!(
+            body,
+            format!(
+                "{PACKED_REFS_HEADER}\
+                 {OID_C} refs/tags/a\n\
+                 {OID_C} refs/tags/b\n\
+                 {OID_B} refs/tags/c\n^{OID_A}\n\
+                 {OID_A} refs/tags/d\n\
+                 {OID_A} refs/tags/e\n"
+            ),
+            "a loose ref replaces the packed record and its old peel line"
+        );
+    }
+
+    #[test]
+    fn merged_packed_refs_body_sorts_unsorted_input_and_keeps_last_duplicate() {
+        let existing = vec![
+            packed_entry("refs/tags/z", OID_A, None),
+            packed_entry("refs/tags/m", OID_A, Some(OID_C)),
+            packed_entry("refs/tags/m", OID_B, None),
+        ];
+        let loose = vec![(
+            "refs/tags/n".to_owned(),
+            ObjectId::from_hex(OID_C).unwrap(),
+            None,
+        )];
+        let body = merged_packed_refs_body(existing, &loose);
+        assert_eq!(
+            body,
+            format!(
+                "{PACKED_REFS_HEADER}\
+                 {OID_B} refs/tags/m\n\
+                 {OID_C} refs/tags/n\n\
+                 {OID_A} refs/tags/z\n"
+            )
+        );
+    }
+
+    #[test]
+    fn packed_entries_with_peel_attaches_peels_and_rejects_orphans() {
+        let path = Path::new("packed-refs");
+        let upper = OID_A.to_ascii_uppercase();
+        let data = format!(
+            "# pack-refs with: peeled fully-peeled sorted \n\
+             {upper} refs/tags/a\n^{OID_B}\n{OID_C} refs/tags/b\n"
+        );
+        let entries = packed_entries_with_peel(path, data.as_bytes()).expect("parse");
+        let got: Vec<_> = entries.iter().map(|e| (e.name, e.oid, e.peel)).collect();
+        assert_eq!(
+            got,
+            vec![
+                (
+                    "refs/tags/a",
+                    ObjectId::from_hex(OID_A).unwrap(),
+                    Some(ObjectId::from_hex(OID_B).unwrap())
+                ),
+                ("refs/tags/b", ObjectId::from_hex(OID_C).unwrap(), None),
+            ]
+        );
+        let body = merged_packed_refs_body(entries, &[]);
+        assert!(
+            body.contains(&format!("{OID_A} refs/tags/a\n")),
+            "ids are rewritten in lowercase: {body}"
+        );
+
+        let orphan = format!("^{OID_B}\n{OID_C} refs/tags/b\n");
+        assert!(matches!(
+            packed_entries_with_peel(path, orphan.as_bytes()),
+            Err(Error::Ref(RefError::PackedRefsUnexpectedLine { .. }))
+        ));
+    }
+
+    fn files_repo() -> (tempfile::TempDir, crate::repo::Repository) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = init_repository(
+            dir.path(),
+            false,
+            "main",
+            None,
+            crate::RefStorageFormat::Files,
+        )
+        .expect("init");
+        (dir, repo)
+    }
+
+    #[test]
+    fn pack_refs_merges_loose_tags_into_existing_packed_refs() {
+        let (_dir, repo) = files_repo();
+        let git_dir = repo.git_dir().to_path_buf();
+        let c1 = write_commit(&repo, vec![]);
+        let c2 = write_commit(&repo, vec![c1]);
+        let tag = repo
+            .odb()
+            .write(
+                ObjectKind::Tag,
+                format!("object {c1}\ntype commit\ntag v2\n\nv2\n").as_bytes(),
+            )
+            .expect("tag object");
+        fs::write(
+            store::paths::packed_refs_path(&git_dir),
+            format!(
+                "{PACKED_REFS_HEADER}{c1} refs/heads/old\n{c1} refs/tags/v1\n{c1} refs/tags/v3\n"
+            ),
+        )
+        .expect("seed packed-refs");
+        write_ref(&git_dir, "refs/tags/v1", &c2).expect("replace v1");
+        write_ref(&git_dir, "refs/tags/v2", &tag).expect("v2");
+        write_ref(&git_dir, "refs/heads/main", &c2).expect("branch");
+
+        let (path, packed, pruned) =
+            pack_refs_files(&git_dir, repo.odb(), None, false, false).expect("pack");
+        assert_eq!((packed, pruned), (2, 2));
+        assert_eq!(
+            fs::read_to_string(path).expect("packed-refs"),
+            format!(
+                "{PACKED_REFS_HEADER}{c1} refs/heads/old\n{c2} refs/tags/v1\n\
+                 {tag} refs/tags/v2\n^{c1}\n{c1} refs/tags/v3\n"
+            )
+        );
+        assert!(!git_dir.join("refs/tags/v1").exists());
+        assert!(!git_dir.join("refs/tags/v2").exists());
+        assert!(git_dir.join("refs/heads/main").exists(), "tags-only pack");
+        assert_eq!(resolve_ref(&git_dir, "refs/tags/v1").expect("v1"), c2);
+    }
+
+    #[test]
+    fn pack_refs_dry_run_and_noop_leave_packed_refs_untouched() {
+        let (_dir, repo) = files_repo();
+        let git_dir = repo.git_dir().to_path_buf();
+        let c1 = write_commit(&repo, vec![]);
+        let packed_path = store::paths::packed_refs_path(&git_dir);
+        let seed = format!("# hand written\n{c1} refs/tags/v1\n");
+        fs::write(&packed_path, &seed).expect("seed");
+
+        assert_eq!(
+            pack_refs_files(&git_dir, repo.odb(), None, false, false)
+                .expect("noop")
+                .1,
+            0
+        );
+        write_ref(&git_dir, "refs/tags/v2", &c1).expect("v2");
+        let (_, packed, pruned) =
+            pack_refs_files(&git_dir, repo.odb(), None, false, true).expect("dry run");
+        assert_eq!((packed, pruned), (1, 1));
+        assert_eq!(fs::read_to_string(&packed_path).expect("read"), seed);
+        assert!(git_dir.join("refs/tags/v2").exists());
+
+        fs::write(&packed_path, format!("^{c1}\n")).expect("corrupt");
+        assert!(matches!(
+            pack_refs_files(&git_dir, repo.odb(), None, false, true),
+            Err(Error::Ref(RefError::PackedRefsUnexpectedLine { .. }))
+        ));
+    }
+
+    #[test]
+    fn pack_refs_reports_held_packed_refs_lock_and_keeps_loose_refs() {
+        let (_dir, repo) = files_repo();
+        let git_dir = repo.git_dir().to_path_buf();
+        let c1 = write_commit(&repo, vec![]);
+        write_ref(&git_dir, "refs/tags/v1", &c1).expect("v1");
+        fs::write(
+            git_dir.join("config"),
+            "[core]\n\trepositoryformatversion = 0\n\tpackedRefsTimeout = 0\n",
+        )
+        .expect("config");
+        let lock = git_dir.join("packed-refs.lock");
+        fs::write(&lock, b"").expect("foreign lock");
+        let config = crate::config::ConfigSet::load(
+            &crate::environment::Environment::empty(),
+            Some(&git_dir),
+            &crate::config::LoadConfigOptions::standard(
+                &crate::environment::Environment::empty(),
+                Some(&git_dir),
+            ),
+        )
+        .expect("config");
+
+        let err = pack_refs_files(&git_dir, repo.odb(), Some(&config), false, false)
+            .expect_err("lock held");
+        assert!(
+            matches!(
+                &err,
+                Error::Ref(RefError::Lock(RefLockError::PackedRefsLockHeld { lock_path }))
+                    if lock_path.ends_with("packed-refs.lock")
+            ),
+            "{err:?}"
+        );
+        assert!(lock.exists(), "a foreign lock is never removed");
+        assert!(git_dir.join("refs/tags/v1").exists());
+        assert!(!store::paths::packed_refs_path(&git_dir).exists());
     }
 
     #[test]
@@ -6839,7 +7497,7 @@ mod pack_refs_tests {
         let blob = repo.odb().write(ObjectKind::Blob, b"x").expect("blob");
         write_ref(repo.git_dir(), "refs/stash", &blob).expect("stash");
         let refs = repo.git_dir().join("refs");
-        pack_refs_files(repo.git_dir(), repo.odb(), true, false).expect("pack");
+        pack_refs_files(repo.git_dir(), repo.odb(), None, true, false).expect("pack");
         assert!(!refs.join("stash").exists());
         assert!(refs.is_dir(), "refs/ must remain");
     }

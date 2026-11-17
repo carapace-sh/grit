@@ -13,12 +13,11 @@ use std::time::{Duration, Instant};
 use grit_lib::config::ConfigSet;
 use grit_lib::objects::promisor::DefaultPromisorFetcher;
 use grit_lib::objects::promisor_remote::PromisorRejection;
-use grit_lib::progress::NeverCancel;
+use grit_lib::progress::CancelToken;
 use grit_lib::remote::clone::{clone, CloneOptions, CloneOutcome};
-use grit_lib::remote::fetch::NoProgress;
 use grit_lib::remote::partial_clone::ObjectFilterSpec;
 use grit_lib::remote::transport::http::HttpClient;
-use grit_lib::remote::{HttpClientFactory, RemoteError, RemoteResult};
+use grit_lib::remote::{HttpClientFactory, RemoteError};
 use grit_test_support::{git_at_least, git_cmd};
 
 fn git(dir: &Path, args: &[&str]) -> String {
@@ -42,11 +41,11 @@ fn skip_old_git() -> bool {
 struct NoHttp;
 
 impl HttpClientFactory for NoHttp {
-    fn create(&self, _: &ConfigSet) -> RemoteResult<Box<dyn HttpClient>> {
+    fn create(&self, _: &ConfigSet) -> grit_lib::error::Result<Box<dyn HttpClient>> {
         Err(RemoteError::UnsupportedScheme)
     }
 
-    fn create_for_probe(&self, _: &ConfigSet) -> RemoteResult<Box<dyn HttpClient>> {
+    fn create_for_preflight(&self, _: &ConfigSet) -> grit_lib::error::Result<Box<dyn HttpClient>> {
         Err(RemoteError::UnsupportedScheme)
     }
 }
@@ -211,7 +210,7 @@ impl Lop {
             .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
             .collect();
         opts.promisor_fetcher = fetcher();
-        clone(opts, &mut NoProgress, &NeverCancel, None).expect("clone")
+        clone(opts, &mut NoProgress, &CancelToken::never(), None).expect("clone")
     }
 }
 
@@ -312,7 +311,7 @@ fn auto_filter_uses_the_filter_git_advertises() {
         ("promisor.acceptFromServer".into(), "knownUrl".into()),
     ];
     opts.promisor_fetcher = fetcher();
-    let outcome = clone(opts, &mut NoProgress, &NeverCancel, None).expect("clone");
+    let outcome = clone(opts, &mut NoProgress, &CancelToken::never(), None).expect("clone");
     assert_eq!(outcome.filter, Some(ObjectFilterSpec::BlobLimit(5 * 1024)));
     assert_eq!(
         git(&dest, &["config", "remote.origin.partialclonefilter"]).trim(),

@@ -1,8 +1,7 @@
 //! RecordingRunner coverage for hooks and shell filters.
 
 use grit_lib::command_runner::hooks::{
-    run_commit_hook_checked, run_hook, run_hook_opts, CommitHookEnv, HookError, HookOutput,
-    HookResult, HookStdio, RunHookOptions,
+    run_hook_opts, CommitHookEnv, HookError, HookOutput, HookResult, HookStdio, RunHookOptions,
 };
 use grit_lib::command_runner::{
     CommandEnvironment, CommandExit, CommandRunner, CommandSpec, CommandStdin, CommandStdio,
@@ -10,7 +9,7 @@ use grit_lib::command_runner::{
 };
 use grit_lib::config::environment::{Environment, RepositoryOptions};
 use grit_lib::error::{Error, FilterError};
-use grit_lib::porcelain::commit::{commit_worktree, CommitRequest};
+use grit_lib::porcelain::commit::CommitRequest;
 use grit_lib::progress::NullProgress;
 use grit_lib::repo::Repository;
 use grit_lib::worktree::crlf::run_filter;
@@ -65,19 +64,22 @@ fn process_options(dir: &Path) -> RepositoryOptions {
 
 fn commit_second(repo: &Repository) -> grit_lib::error::Result<grit_lib::objects::ObjectId> {
     let id = "T <t@e.x> 1700000000 +0000".to_string();
-    let req = CommitRequest {
-        message: "second".into(),
-        author: Some(id.parse().expect("signature")),
-        committer: Some(id.parse().expect("signature")),
-        ..Default::default()
+    let req = {
+        let mut req = CommitRequest::new("second");
+        req.author = Some(id.parse().expect("signature"));
+        req.committer = Some(id.parse().expect("signature"));
+        req
     };
-    commit_worktree(
-        repo,
-        &req,
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .map(|o| o.oid)
+    repo.commits()
+        .create(
+            &grit_lib::commits::CommitOptions::new(
+                req.clone(),
+                grit_lib::porcelain::commit::CommitScope::AutoStage,
+            ),
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .map(|o| o.oid)
 }
 
 fn expect_hook_failure(result: grit_lib::error::Result<grit_lib::objects::ObjectId>) -> HookError {
@@ -267,7 +269,10 @@ fn inherited_pre_push_keeps_stdout_separate() {
             .with_hook_stdio(HookStdio::Inherit),
     );
 
-    let result = run_hook(&repo, "pre-push", &["origin", "url"], None).expect("pre-push");
+    let result = repo
+        .hooks()
+        .run("pre-push", &["origin", "url"], None)
+        .expect("pre-push");
     assert!(result.is_ok());
     let spec = runner.specs().into_iter().next().expect("pre-push spawned");
     assert_eq!(spec.stdout, CommandStdio::Inherit);
@@ -288,7 +293,10 @@ fn successful_hook_output_is_returned_in_the_result() {
     }
     let repo = open_repo(tmp.path(), process_options(tmp.path()));
 
-    let result = run_hook(&repo, "post-checkout", &["a", "b", "1"], None).expect("hook");
+    let result = repo
+        .hooks()
+        .run("post-checkout", &["a", "b", "1"], None)
+        .expect("hook");
     assert_eq!(
         result,
         HookResult::Success {
@@ -318,7 +326,7 @@ fn configured_and_script_hooks_append_output_in_run_order() {
             .with_command_runner(runner.clone()),
     );
 
-    let result = run_hook(&repo, "pre-commit", &[], None).expect("hooks");
+    let result = repo.hooks().run("pre-commit", &[], None).expect("hooks");
     assert_eq!(
         runner.specs().len(),
         2,
@@ -360,14 +368,16 @@ fn recording_runner_pre_commit_hook_argv_and_failure() {
     let repo =
         Repository::open(&git_dir, &&opts.clone().with_work_tree(tmp.path())).expect("open repo");
 
-    let err = run_commit_hook_checked(&repo, "pre-commit", &[], None, &CommitHookEnv::default())
+    let err = repo
+        .hooks()
+        .run_commit_checked("pre-commit", &[], None, &CommitHookEnv::default())
         .expect_err("hook should fail");
     match err {
-        HookError::Failed {
+        grit_lib::error::Error::Hook(HookError::Failed {
             hook_name,
             status,
             output,
-        } => {
+        }) => {
             assert_eq!(hook_name, "pre-commit");
             assert_eq!(status, 42);
             assert!(output.is_empty(), "the recording produced no output");
@@ -414,7 +424,7 @@ fn hook_environment_exports_repository_snapshot_not_process() {
     )
     .expect("open");
 
-    let config = repo.config().expect("config");
+    let config = repo.config().snapshot().expect("config");
     run_hook_opts(
         Some(&repo),
         "pre-commit",

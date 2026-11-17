@@ -3,6 +3,7 @@
 #![cfg(feature = "http-ureq")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use grit_lib::error::ObjectError;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -13,21 +14,18 @@ use std::thread;
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::config::ConfigFile;
 use grit_lib::config::ConfigScope;
-use grit_lib::diff::{
-    build_file_diffs, diff_commits_with_renames_and_policy, DiffDetail, DiffOptions,
-};
+use grit_lib::diff::{DiffDetail, DiffOptions, RenameDetection, TreeDiffOptions};
 use grit_lib::error::Error;
-use grit_lib::objects::pack::clear_pack_cache;
 use grit_lib::objects::promisor::{DefaultPromisorFetcher, PromisorFetcher};
 use grit_lib::objects::{parse_commit, ObjectId};
 use grit_lib::parallel::ThreadPolicy;
-use grit_lib::porcelain::checkout::checkout_between_trees;
-use grit_lib::progress::NeverCancel;
+use grit_lib::progress::CancelToken;
 use grit_lib::remote::clone::{clone, CloneOptions};
 use grit_lib::remote::fetch::NoProgress;
 use grit_lib::remote::partial_clone::ObjectFilterSpec;
 use grit_lib::remote::DefaultHttpClientFactory;
 use grit_lib::repo::Repository;
+use grit_lib::test_support::objects_pack::clear_pack_cache;
 use grit_test_support::git_cmd;
 use tempfile::TempDir;
 
@@ -102,7 +100,7 @@ fn grit_blobless_clone(
             ..CloneOptions::new(url, dest.to_path_buf())
         },
         &mut NoProgress,
-        &NeverCancel,
+        &CancelToken::never(),
         None,
     )
     .expect("clone");
@@ -225,7 +223,12 @@ fn tree_diff_entries_between_commits(
         .expect("parse new")
         .tree;
     repo.diff()
-        .tree_to_tree(Some(&old_tree), Some(&new_tree))
+        .tree_to_tree(
+            Some(&old_tree),
+            Some(&new_tree),
+            &TreeDiffOptions::default(),
+        )
+        .map(|r| r.entries)
         .expect("tree diff")
 }
 
@@ -281,7 +284,7 @@ fn no_fetcher_returns_typed_promised_missing() {
     let oid = ObjectId::from_hex(blob_hex.trim()).expect("oid");
     let err = repo.odb().read(&oid).unwrap_err();
     assert!(
-        matches!(err, Error::PromisedObjectMissing(_)),
+        matches!(err, Error::Object(ObjectError::PromisedMissing { .. })),
         "expected PromisedObjectMissing, got {err:?}"
     );
 }
@@ -301,28 +304,27 @@ fn rename_detection_prefetch_batched_past_rename_limit() {
 
     let objects = repo.git_dir().join("objects");
     let packs_before = pack_file_count(&objects);
-    let config = repo.config().expect("config");
-    let thread_policy = ThreadPolicy::default();
-    let entries = diff_commits_with_renames_and_policy(
-        repo.odb(),
-        &revision(&repo, "HEAD~1"),
-        &revision(&repo, "HEAD"),
-        50,
-        config.as_ref(),
-        &thread_policy,
-    )
-    .expect("commit diff with renames");
+    let renames = TreeDiffOptions::default()
+        .with_renames(RenameDetection::Similarity(50))
+        .with_threads(Some(ThreadPolicy::default()));
+    let entries = repo
+        .diff()
+        .commits(
+            &revision(&repo, "HEAD~1"),
+            &revision(&repo, "HEAD"),
+            &renames,
+        )
+        .expect("commit diff with renames")
+        .entries;
     assert_eq!(entries.len(), file_count);
 
-    build_file_diffs(
-        repo.odb(),
-        entries,
-        DiffDetail::Stat,
-        DiffOptions::default(),
-        config.as_ref(),
-        &thread_policy,
-    )
-    .expect("stat");
+    repo.diff()
+        .files_for_entries(
+            entries,
+            DiffDetail::Stat,
+            &DiffOptions::default().with_renames(RenameDetection::Off),
+        )
+        .expect("stat");
     assert_eq!(
         calls.load(Ordering::SeqCst),
         1,
@@ -346,28 +348,27 @@ fn tree_diff_prefetch_batched_past_rename_limit() {
 
     let objects = repo.git_dir().join("objects");
     let packs_before = pack_file_count(&objects);
-    let config = repo.config().expect("config");
-    let thread_policy = ThreadPolicy::default();
-    let entries = diff_commits_with_renames_and_policy(
-        repo.odb(),
-        &revision(&repo, "HEAD~1"),
-        &revision(&repo, "HEAD"),
-        50,
-        config.as_ref(),
-        &thread_policy,
-    )
-    .expect("commit diff with renames");
+    let renames = TreeDiffOptions::default()
+        .with_renames(RenameDetection::Similarity(50))
+        .with_threads(Some(ThreadPolicy::default()));
+    let entries = repo
+        .diff()
+        .commits(
+            &revision(&repo, "HEAD~1"),
+            &revision(&repo, "HEAD"),
+            &renames,
+        )
+        .expect("commit diff with renames")
+        .entries;
     assert_eq!(entries.len(), file_count);
 
-    build_file_diffs(
-        repo.odb(),
-        entries,
-        DiffDetail::Stat,
-        DiffOptions::default(),
-        config.as_ref(),
-        &thread_policy,
-    )
-    .expect("stat");
+    repo.diff()
+        .files_for_entries(
+            entries,
+            DiffDetail::Stat,
+            &DiffOptions::default().with_renames(RenameDetection::Off),
+        )
+        .expect("stat");
     assert_eq!(
         calls.load(Ordering::SeqCst),
         1,
@@ -403,33 +404,23 @@ fn tree_diff_prefetch_uses_single_request() {
     let packs_before = pack_file_count(&objects);
     let entries = tree_diff_entries_between_commits(&repo, "HEAD~1", "HEAD");
     assert_eq!(entries.len(), file_count);
-    let config = repo.config().expect("config");
-    let thread_policy = ThreadPolicy::default();
 
-    build_file_diffs(
-        repo.odb(),
-        entries.clone(),
-        DiffDetail::NameOnly,
-        DiffOptions::default(),
-        config.as_ref(),
-        &thread_policy,
-    )
-    .expect("name-only");
+    repo.diff()
+        .files_for_entries(
+            entries.clone(),
+            DiffDetail::NameOnly,
+            &DiffOptions::default().with_renames(RenameDetection::Off),
+        )
+        .expect("name-only");
     assert_eq!(
         calls.load(Ordering::SeqCst),
         0,
         "name-only must not promisor-fetch blobs"
     );
 
-    build_file_diffs(
-        repo.odb(),
-        entries.clone(),
-        DiffDetail::Stat,
-        DiffOptions::default(),
-        config.as_ref(),
-        &thread_policy,
-    )
-    .expect("stat");
+    repo.diff()
+        .files_for_entries(entries.clone(), DiffDetail::Stat, &DiffOptions::default())
+        .expect("stat");
     assert_eq!(
         calls.load(Ordering::SeqCst),
         1,
@@ -437,15 +428,9 @@ fn tree_diff_prefetch_uses_single_request() {
     );
     assert_eq!(pack_file_count(&objects), packs_before + 1);
 
-    build_file_diffs(
-        repo.odb(),
-        entries,
-        DiffDetail::Patch,
-        DiffOptions::default(),
-        config.as_ref(),
-        &thread_policy,
-    )
-    .expect("patch");
+    repo.diff()
+        .files_for_entries(entries, DiffDetail::Patch, &DiffOptions::default())
+        .expect("patch");
     assert_eq!(
         calls.load(Ordering::SeqCst),
         1,
@@ -475,7 +460,14 @@ fn checkout_prefetch_uses_single_request() {
         .expect("parse head")
         .tree;
 
-    checkout_between_trees(&repo, Some(&empty), &head_tree).expect("checkout");
+    repo.checkout()
+        .checkout(
+            Some(&empty),
+            &head_tree,
+            &mut grit_lib::progress::NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("checkout");
     assert_eq!(
         calls.load(Ordering::SeqCst),
         1,
@@ -507,7 +499,7 @@ fn lazy_fetch_opt_out_config() {
     let oid = ObjectId::from_hex(blob_hex.trim()).expect("oid");
     let err = repo.odb().read(&oid).unwrap_err();
     assert!(
-        matches!(err, Error::PromisedObjectMissing(_)),
+        matches!(err, Error::Object(ObjectError::PromisedMissing { .. })),
         "opt-out must not fetch; got {err:?}"
     );
 }
@@ -543,7 +535,9 @@ fn blobless_clone_checkout_matches_git() {
     let head_tree = parse_commit(&repo.odb().read(&head_commit).expect("head commit").data)
         .expect("parse head")
         .tree;
-    checkout_between_trees(&repo, None, &head_tree).expect("checkout");
+    repo.checkout()
+        .checkout(None, &head_tree)
+        .expect("checkout");
 
     for name in ["a.txt", "b.txt", "c.txt", "d.txt"] {
         let git_bytes = fs::read(git_dest.path().join(name)).expect("git file");
@@ -603,7 +597,7 @@ fn lazy_fetch_no_materialization_errors() {
     let oid = ObjectId::from_hex(blob_hex.trim()).expect("oid");
     let err = repo.odb().read(&oid).unwrap_err();
     assert!(
-        matches!(err, Error::Message(_)),
+        matches!(err, Error::Verbatim(_)),
         "expected materialization failure, got {err:?}"
     );
 }
@@ -659,9 +653,23 @@ fn repeated_checkout_does_not_refetch_promisor_blobs() {
         .tree;
     let empty = ObjectId::from_hex("4b825dc642cb6eb9a060e54bf8d69288fbee4904").expect("empty");
 
-    checkout_between_trees(&repo, Some(&empty), &head_tree).expect("first checkout");
+    repo.checkout()
+        .checkout(
+            Some(&empty),
+            &head_tree,
+            &mut grit_lib::progress::NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("first checkout");
     assert_eq!(calls.load(Ordering::SeqCst), 1);
-    checkout_between_trees(&repo, Some(&empty), &head_tree).expect("second checkout");
+    repo.checkout()
+        .checkout(
+            Some(&empty),
+            &head_tree,
+            &mut grit_lib::progress::NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("second checkout");
     assert_eq!(
         calls.load(Ordering::SeqCst),
         1,
@@ -742,20 +750,20 @@ fn revision(repo: &Repository, rev: &str) -> ObjectId {
 
 fn hard_reset(repo: &Repository, target: ObjectId) -> grit_lib::error::Result<()> {
     use grit_lib::ident::Signature;
-    use grit_lib::porcelain::reset::{reset_to_commit, ResetMode, ResetOptions};
+    use grit_lib::porcelain::reset::{ResetMode, ResetOptions};
     let identity = Signature::new(
         "T",
         "t@example.com",
         time::OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap(),
     )
     .unwrap();
-    reset_to_commit(
-        repo,
-        &ResetOptions::new(target, ResetMode::Hard, identity, "reset"),
-        &mut grit_lib::progress::NullProgress,
-        &NeverCancel,
-    )
-    .map(|_| ())
+    repo.checkout()
+        .reset(
+            &ResetOptions::new(target, ResetMode::Hard, identity, "reset"),
+            &mut grit_lib::progress::NullProgress,
+            &CancelToken::never(),
+        )
+        .map(|_| ())
 }
 
 #[derive(Default)]
@@ -772,7 +780,10 @@ impl PromisorFetcher for ResetFetcher {
 }
 
 fn assert_clean_index_and_worktree(repo: &Repository, source: &Path, count: usize) {
-    let index = repo.index_handle().load().unwrap();
+    let index = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .unwrap();
     assert_eq!(index.entries().len(), count);
     for entry in index.entries() {
         assert_eq!(entry.stage(), 0);
@@ -937,8 +948,8 @@ fn hard_reset_prefetch_respects_sparse_scope_and_gitlinks() {
         assert!(!repo.odb().exists_local(&oid));
         assert!(!dest.path().join(path).exists());
         assert!(repo
-            .index_handle()
-            .load()
+            .index()
+            .load(&grit_lib::index::IndexLoadOptions::default())
             .unwrap()
             .get(path.as_bytes(), 0)
             .unwrap()
@@ -977,7 +988,7 @@ fn hard_reset_preserves_lazy_fetch_opt_outs_and_missing_fetcher_errors() {
         let repo = Repository::open(repo.git_dir(), &opts).unwrap();
         let err = hard_reset(&repo, revision(&repo, "HEAD")).unwrap_err();
         assert!(
-            matches!(err, Error::PromisedObjectMissing(_)),
+            matches!(err, Error::Object(ObjectError::PromisedMissing { .. })),
             "{disable}: {err:?}"
         );
         assert!(fetcher.requests.lock().unwrap().is_empty());
@@ -1018,7 +1029,9 @@ fn hard_reset_keeps_stat_clean_files_without_fetching_their_missing_blobs() {
         );
     }
     index.sort();
-    repo.index_handle().write(&mut index).unwrap();
+    repo.index()
+        .write(&mut index, &grit_lib::index::IndexWriteOptions::default())
+        .unwrap();
     hard_reset(&repo, revision(&repo, "HEAD")).unwrap();
     assert!(fetcher.requests.lock().unwrap().is_empty());
     assert!(!repo.odb().exists_local(&revision(&repo, "HEAD:a.txt")));
@@ -1067,7 +1080,10 @@ fn hard_reset_with_every_path_sparse_skipped_does_not_fetch_attributes() {
     hard_reset(&repo, revision(&repo, "HEAD")).unwrap();
     assert!(fetcher.requests.lock().unwrap().is_empty());
     assert_eq!(promisor_sidecar_count(&repo.git_dir().join("objects")), 1);
-    let index = repo.index_handle().load().unwrap();
+    let index = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .unwrap();
     assert_eq!(index.entries().len(), 5);
     assert!(index.entries().iter().all(|entry| entry.skip_worktree()));
     for entry in index.entries() {
@@ -1078,4 +1094,89 @@ fn hard_reset_with_every_path_sparse_skipped_does_not_fetch_attributes() {
             .exists());
     }
     git_in(dest.path(), &["fsck", "--strict"]);
+}
+
+/// A hard reset in a blobless clone with no checkout writes every file in chunks; reading the
+/// `.gitattributes` blobs for its checkout rules must not lazily fetch them one at a time
+/// ahead of the batched prefetch.
+#[test]
+fn chunked_hard_reset_fetches_attribute_blobs_with_the_batch() {
+    use grit_lib::porcelain::reset::{ResetMode, ResetOptions};
+    use grit_lib::progress::NullProgress;
+
+    let layout = TempDir::new().expect("layout");
+    let upstream = layout.path().join("upstream");
+    git_in(layout.path(), &["init", "-q", "-b", "main", "upstream"]);
+    git_in(&upstream, &["config", "user.email", "t@t"]);
+    fs::create_dir_all(upstream.join("docs")).expect("docs dir");
+    fs::write(upstream.join(".gitattributes"), "*.bin binary\n").expect("attrs");
+    fs::write(upstream.join("docs/.gitattributes"), "*.txt text\n").expect("nested attrs");
+    for i in 0..2100 {
+        fs::write(
+            upstream.join(format!("docs/f{i:04}.txt")),
+            format!("file {i}\n"),
+        )
+        .expect("write");
+    }
+    git_in(&upstream, &["add", "."]);
+    git_in(&upstream, &["commit", "-m", "base", "-q"]);
+    let bare = layout.path().join("remote.git");
+    git_in(
+        layout.path(),
+        &[
+            "clone",
+            "-q",
+            "--bare",
+            upstream.to_str().unwrap(),
+            "remote.git",
+        ],
+    );
+    git_in(&bare, &["config", "uploadpack.allowFilter", "true"]);
+
+    let url = format!("file://{}", bare.canonicalize().unwrap().display());
+    let dest = TempDir::new().expect("dest");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let fetcher = Arc::new(CountingFetcher {
+        calls: Arc::clone(&calls),
+        inner: DefaultPromisorFetcher::new(Arc::new(DefaultHttpClientFactory::new())),
+    });
+    let repo = grit_blobless_clone(&url, dest.path(), Some(fetcher));
+    let packs_after_clone = pack_file_count(&repo.git_dir().join("objects"));
+    let head = git_cmd(&["rev-parse", "HEAD"])
+        .in_dir(dest.path())
+        .exec()
+        .stdout;
+    let head = ObjectId::from_hex(head.trim()).expect("head");
+
+    repo.checkout()
+        .reset(
+            &ResetOptions::new(
+                head,
+                ResetMode::Hard,
+                "T <t@t> 0 +0000".parse().expect("sig"),
+                "reset",
+            ),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("hard reset");
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "attribute blobs must come with the one batched checkout fetch"
+    );
+    assert_eq!(
+        pack_file_count(&repo.git_dir().join("objects")),
+        packs_after_clone + 1
+    );
+    assert_eq!(
+        fs::read_to_string(dest.path().join("docs/f0042.txt")).expect("checked out"),
+        "file 42\n"
+    );
+    let status = git_cmd(&["status", "--porcelain"])
+        .in_dir(dest.path())
+        .exec()
+        .stdout;
+    assert!(status.is_empty(), "{status}");
 }

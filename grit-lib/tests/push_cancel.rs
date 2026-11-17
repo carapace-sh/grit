@@ -1,5 +1,5 @@
 //! Cancelling a push: a local (`file://`) push and a smart-HTTP push stop on the
-//! caller's [`Cancel`] while the pack is built, streamed or waited on, leave the
+//! caller's [`CancelToken`] while the pack is built, streamed or waited on, leave the
 //! remote without new refs or stray files, and a retry still lands the push.
 //!
 //! Repositories are built with the library only; the smart-HTTP server is an
@@ -16,16 +16,14 @@ use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::config::ConfigSet;
 use grit_lib::error::{Error, Result};
 use grit_lib::objects::{parse_commit, serialize_tree, ObjectId, ObjectKind, TreeEntry};
-use grit_lib::progress::{Cancel, FlagCancel, NeverCancel};
-use grit_lib::refs::resolve_ref;
+use grit_lib::progress::CancelToken;
 use grit_lib::remote::fetch::NoProgress;
 use grit_lib::remote::pkt_line;
-use grit_lib::remote::push::push_http;
 use grit_lib::remote::push_report::PushRefStatus;
-use grit_lib::remote::serve::{receive_pack, ReceivePolicy, ServeOptions};
+use grit_lib::remote::serve::{ReceivePack, ReceivePolicy, ServeOptions};
 use grit_lib::remote::transfer::{PushOptions, PushRefSpec};
 use grit_lib::remote::transport::http::HttpClient;
-use grit_lib::remote::Remote;
+use grit_lib::remote::{Remote, RemoteError};
 use grit_lib::repo::{InitOptions, Repository};
 
 /// Deterministic incompressible bytes, so blobs keep the pack large.
@@ -115,41 +113,22 @@ fn main_spec(tip: ObjectId) -> PushRefSpec {
 }
 
 fn remote_main(git_dir: &Path) -> Option<ObjectId> {
-    resolve_ref(git_dir, "refs/heads/main").ok()
+    grit_test_support::refs::at(git_dir)
+        .references()
+        .resolve("refs/heads/main")
+        .ok()
 }
 
-/// Fires on its `limit`-th check (counting from zero) and stays fired. Not backed
-/// by a shared flag, so worker threads only see it through the calling thread.
-struct CancelAfter {
-    checks: AtomicUsize,
-    limit: usize,
-}
-
-impl CancelAfter {
-    fn new(limit: usize) -> Self {
-        Self {
-            checks: AtomicUsize::new(0),
-            limit,
-        }
-    }
-
-    fn checks(&self) -> usize {
-        self.checks.load(Ordering::Relaxed)
-    }
-}
-
-impl Cancel for CancelAfter {
-    fn is_cancelled(&self) -> bool {
-        self.checks.fetch_add(1, Ordering::Relaxed) >= self.limit
-    }
+fn cancel_after_checks(limit: usize) -> CancelToken {
+    CancelToken::after_polls(limit.saturating_add(1) as u64)
 }
 
 fn push_file(
     local: &Repository,
     remote_dir: &Path,
     tip: ObjectId,
-    cancel: &dyn Cancel,
-) -> std::result::Result<Vec<PushRefStatus>, grit_lib::remote::RemoteError> {
+    cancel: &CancelToken,
+) -> grit_lib::error::Result<Vec<PushRefStatus>> {
     let remote = Remote::from_url(&format!("file://{}", remote_dir.display())).expect("url");
     remote
         .push(
@@ -172,7 +151,7 @@ fn local_push_with_a_fired_cancel_writes_nothing() {
     init_bare(&remote_dir);
     let before = object_files(&remote_dir);
 
-    let cancel = FlagCancel::new();
+    let cancel = CancelToken::new();
     cancel.cancel();
     let err = push_file(&local, &remote_dir, tip, &cancel).expect_err("cancelled");
     assert!(err.is_cancelled(), "{err:?}");
@@ -191,7 +170,7 @@ fn local_push_publishes_a_pack_as_readable_as_its_index() {
     let remote_dir = tmp.path().join("remote.git");
     init_bare(&remote_dir);
     assert_eq!(
-        push_file(&local, &remote_dir, tip, &NeverCancel).expect("push"),
+        push_file(&local, &remote_dir, tip, &CancelToken::never()).expect("push"),
         vec![PushRefStatus::Ok]
     );
 
@@ -227,12 +206,12 @@ fn local_push_stops_wherever_the_cancel_lands_and_a_retry_succeeds() {
     // the pack build and the indexing each check many times.
     let probe_dir = tmp.path().join("probe.git");
     init_bare(&probe_dir);
-    let counting = CancelAfter::new(usize::MAX);
+    let (counting, checks) = CancelToken::with_check_counter();
     assert_eq!(
         push_file(&local, &probe_dir, tip, &counting).expect("uncancelled push"),
         vec![PushRefStatus::Ok]
     );
-    let total = counting.checks();
+    let total = checks.load(Ordering::Relaxed);
     let (commits, trees, blobs) = (120, 120, 12 + 119);
     assert!(
         total >= commits + trees + (commits + trees + blobs),
@@ -244,7 +223,7 @@ fn local_push_stops_wherever_the_cancel_lands_and_a_retry_succeeds() {
     init_bare(&remote_dir);
     let before = object_files(&remote_dir);
     for limit in [1, total / 8, total / 4, total / 2] {
-        let cancel = CancelAfter::new(limit);
+        let cancel = cancel_after_checks(limit);
         let err = push_file(&local, &remote_dir, tip, &cancel).expect_err("cancelled");
         assert!(err.is_cancelled(), "cancel at check {limit}: {err:?}");
         assert_eq!(remote_main(&remote_dir), None, "cancel at check {limit}");
@@ -256,7 +235,7 @@ fn local_push_stops_wherever_the_cancel_lands_and_a_retry_succeeds() {
     }
 
     assert_eq!(
-        push_file(&local, &remote_dir, tip, &NeverCancel).expect("retry"),
+        push_file(&local, &remote_dir, tip, &CancelToken::never()).expect("retry"),
         vec![PushRefStatus::Ok]
     );
     assert_eq!(remote_main(&remote_dir), Some(tip));
@@ -290,7 +269,7 @@ fn local_push_returns_promptly_when_cancelled_from_another_thread() {
     let remote_dir = tmp.path().join("remote.git");
     init_bare(&remote_dir);
 
-    let cancel = FlagCancel::new();
+    let cancel = CancelToken::new();
     let flip = cancel.clone();
     let flipper = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(5));
@@ -340,7 +319,7 @@ impl InProcessServer {
         Repository::open(&self.repo_dir, &RepositoryOptions::empty())
     }
 
-    fn serve(&self, body: &[u8]) -> Result<Vec<u8>> {
+    fn serve(&self, body: &[u8]) -> grit_lib::error::Result<Vec<u8>> {
         let probe = body == b"0000";
         let hold = (!probe)
             .then(|| self.hold.lock().unwrap_or_else(|e| e.into_inner()).take())
@@ -354,36 +333,32 @@ impl InProcessServer {
             stateless_rpc: true,
             ..Default::default()
         };
-        receive_pack(
+        ReceivePack::new(
             &self.repo()?,
-            &mut Cursor::new(body),
-            &mut out,
             &opts,
             &ReceivePolicy::from_config(&ConfigSet::new()),
         )
-        .map_err(|e| Error::Message(e.to_string()))?;
+        .run(&mut Cursor::new(body), &mut out)?;
         Ok(out)
     }
 }
 
 impl HttpClient for InProcessServer {
-    fn get(&self, _url: &str, _git_protocol: Option<&str>) -> Result<Vec<u8>> {
+    fn get(&self, _url: &str, _git_protocol: Option<&str>) -> grit_lib::error::Result<Vec<u8>> {
         let mut out = Vec::new();
-        pkt_line::write_line_to_vec(&mut out, "# service=git-receive-pack")?;
+        pkt_line::write_line_to_vec(&mut out, "# service=git-receive-pack").map_err(Error::from)?;
         out.extend_from_slice(b"0000");
         let opts = ServeOptions {
             stateless_rpc: true,
             advertise_refs: true,
             ..Default::default()
         };
-        receive_pack(
+        ReceivePack::new(
             &self.repo()?,
-            &mut std::io::empty(),
-            &mut out,
             &opts,
             &ReceivePolicy::from_config(&ConfigSet::new()),
         )
-        .map_err(|e| Error::Message(e.to_string()))?;
+        .run(&mut std::io::empty(), &mut out)?;
         Ok(out)
     }
 
@@ -394,7 +369,7 @@ impl HttpClient for InProcessServer {
         _accept: &str,
         body: &[u8],
         _git_protocol: Option<&str>,
-    ) -> Result<Vec<u8>> {
+    ) -> grit_lib::error::Result<Vec<u8>> {
         self.serve(body)
     }
 
@@ -405,7 +380,7 @@ impl HttpClient for InProcessServer {
         _accept: &str,
         body: &mut dyn Read,
         _git_protocol: Option<&str>,
-    ) -> Result<Box<dyn Read + Send>> {
+    ) -> grit_lib::error::Result<Box<dyn Read + Send>> {
         let mut got = Vec::new();
         let mut buf = vec![0u8; 64 * 1024];
         let end = loop {
@@ -429,7 +404,9 @@ impl HttpClient for InProcessServer {
             let _ = tx.send(end);
         }
         if failed {
-            return Err(Error::Message("request body did not finish".to_owned()));
+            return Err(Error::Io(std::io::Error::other(
+                "request body did not finish",
+            )));
         }
         Ok(Box::new(Cursor::new(self.serve(&got)?)))
     }
@@ -449,12 +426,19 @@ fn push_over_http(
     server: Arc<InProcessServer>,
     local_dir: &Path,
     tip: ObjectId,
-    cancel: &dyn Cancel,
+    cancel: &CancelToken,
 ) -> Result<Vec<PushRefStatus>> {
-    push_http(
-        server,
+    grit_lib::repo::Repository::open(
         local_dir,
-        "http://in-process.invalid/remote.git",
+        &grit_lib::config::environment::RepositoryOptions::empty(),
+    )
+    .expect("open push source")
+    .remotes()
+    .push_to(
+        grit_lib::remote::transfer::TransferEndpoint::Http {
+            client: server,
+            url: "http://in-process.invalid/remote.git",
+        },
         &[main_spec(tip)],
         &PushOptions::default(),
         &mut NoProgress,
@@ -474,7 +458,7 @@ fn http_push_cancelled_mid_body_abandons_the_request_and_a_retry_lands() {
     let body_read = Arc::clone(&server.body_read);
     let server = Arc::new(server);
 
-    let cancel = FlagCancel::new();
+    let cancel = CancelToken::new();
     let flip = cancel.clone();
     let flipper = std::thread::spawn(move || {
         while body_read.load(Ordering::SeqCst) < 512 * 1024 {
@@ -503,7 +487,7 @@ fn http_push_cancelled_mid_body_abandons_the_request_and_a_retry_lands() {
 
     let retry = Arc::new(InProcessServer::new(&remote_dir));
     assert_eq!(
-        push_over_http(retry, &local_dir, tip, &NeverCancel).expect("retry"),
+        push_over_http(retry, &local_dir, tip, &CancelToken::never()).expect("retry"),
         vec![PushRefStatus::Ok]
     );
     assert_eq!(remote_main(&remote_dir), Some(tip));
@@ -519,7 +503,7 @@ fn http_push_cancelled_while_the_server_is_silent_returns_at_once() {
     let held = Arc::clone(&server.held);
     let server = Arc::new(server);
 
-    let cancel = FlagCancel::new();
+    let cancel = CancelToken::new();
     let flip = cancel.clone();
     let flipper = std::thread::spawn(move || {
         while !held.load(Ordering::SeqCst) {
@@ -540,4 +524,53 @@ fn http_push_cancelled_while_the_server_is_silent_returns_at_once() {
     // The whole request was sent, so the server may still apply it once it
     // answers; the cancelled push just stopped waiting for that answer.
     drop(release);
+}
+
+#[test]
+fn local_push_cancelled_while_streaming_one_large_blob_drops_quarantine() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let local = init_bare(&tmp.path().join("local.git"));
+    let data = noise(42, 3 * 1024 * 1024);
+    let blob = local.odb().write(ObjectKind::Blob, &data).expect("blob");
+    let tree = local
+        .odb()
+        .write(
+            ObjectKind::Tree,
+            &serialize_tree(&[TreeEntry {
+                mode: 0o100644,
+                name: b"blob.bin".to_vec(),
+                oid: blob,
+            }]),
+        )
+        .expect("tree");
+    let body = format!(
+        "tree {tree}\nauthor A <a@example.com> 1 +0000\ncommitter A <a@example.com> 1 +0000\n\nbig\n"
+    );
+    let tip = local
+        .odb()
+        .write(ObjectKind::Commit, body.as_bytes())
+        .expect("commit");
+
+    let remote_dir = tmp.path().join("remote.git");
+    init_bare(&remote_dir);
+    let before = object_files(&remote_dir);
+
+    let cancel = CancelToken::new();
+    let flip = cancel.clone();
+    let flipper = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(5));
+        flip.cancel();
+        Instant::now()
+    });
+    let err = push_file(&local, &remote_dir, tip, &cancel).expect_err("cancelled mid-stream");
+    let returned = Instant::now();
+    let flipped = flipper.join().expect("flipper");
+    assert!(err.is_cancelled(), "{err:?}");
+    assert!(
+        returned.saturating_duration_since(flipped) < Duration::from_secs(2),
+        "push kept running {:?} after cancel during large-blob deflate",
+        returned.saturating_duration_since(flipped)
+    );
+    assert_eq!(remote_main(&remote_dir), None);
+    assert_eq!(object_files(&remote_dir), before);
 }

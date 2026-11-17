@@ -6,9 +6,9 @@ use std::fs;
 use std::path::Path;
 use std::process::{Command, Output};
 
+use grit_lib::progress::CancelToken;
 use grit_lib::revwalk::history::{
-    apply_rewrite, plan_rewrite, ApplyOptions, CommitEdit, EmptyPolicy, HistoryEdits, RefScope,
-    RewriteOptions,
+    ApplyOptions, CommitEdit, EmptyPolicy, HistoryEdits, RefScope, RewriteOptions,
 };
 use grit_test_support::configure_git_env;
 
@@ -95,34 +95,35 @@ fn interrupted_rewrite_repo() -> (tempfile::TempDir, String) {
             parents: None,
         },
     );
-    let plan = plan_rewrite(
-        &repo,
-        &edits,
-        &RewriteOptions {
-            scope: RefScope::Branches,
-            empty: EmptyPolicy::Drop,
-            committer: "A <a@b.c> 1 +0000".parse().expect("signature"),
-            preserve_committer: false,
-            sign: false,
-        },
-    )
-    .expect("plan");
+    let plan = repo
+        .history()
+        .plan_rewrite(
+            &edits,
+            &RewriteOptions {
+                scope: RefScope::Branches,
+                empty: EmptyPolicy::Drop,
+                committer: "A <a@b.c> 1 +0000".parse().expect("signature"),
+                preserve_committer: false,
+                sign: false,
+            },
+        )
+        .expect("plan");
     let new_tip = plan.ref_updates[0].new.to_hex();
-    grit_lib::repo::set_test_inject_rewrite_apply_abort_after_refs(true);
-    apply_rewrite(
-        &repo,
-        &plan,
-        &ApplyOptions {
-            identity: grit_lib::ident::parse_signature("A <a@b.c> 1 +0000").expect("ident"),
-            reflog_message: "rewrite".into(),
-            record_operation: None,
-            hooks: grit_lib::PostOperationHooks::Skip,
-        },
-        &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect_err("injected abort after refs");
-    grit_lib::repo::set_test_inject_rewrite_apply_abort_after_refs(false);
+    grit_lib::test_support::inject::set_test_inject_rewrite_apply_abort_after_refs(true);
+    repo.history()
+        .apply(
+            &plan,
+            &ApplyOptions {
+                identity: grit_lib::ident::parse_signature("A <a@b.c> 1 +0000").expect("ident"),
+                reflog_message: "rewrite".into(),
+                record_operation: None,
+                hooks: grit_lib::command_runner::hooks::PostOperationHooks::Skip,
+            },
+            &mut grit_lib::progress::NullProgress,
+            &CancelToken::never(),
+        )
+        .expect_err("injected abort after refs");
+    grit_lib::test_support::inject::set_test_inject_rewrite_apply_abort_after_refs(false);
     fs::write(wt.join("a.txt"), "new con").expect("half-written checkout");
     (tmp, new_tip)
 }

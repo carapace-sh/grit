@@ -1,7 +1,7 @@
 //! Group walked commits for summary views (author shortlog-style reports).
 
+use crate::error::ObjectError;
 use std::collections::{HashMap, HashSet};
-use std::hash::Hasher;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -18,7 +18,7 @@ use crate::revwalk::queries::{
     positive_specs_for_walk, rev_list_commits_for_author_group, rev_list_options_from_walk,
     MergeFilter, RevWalkParsedSpecs,
 };
-use crate::revwalk::RevWalkListOptions;
+use crate::revwalk::{RevWalk, RevWalkListOptions};
 
 /// One author's commits after grouping a walk result.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -33,23 +33,72 @@ pub struct AuthorGroup {
     pub commits: Vec<ObjectId>,
 }
 
-/// Options for [`group_commits_by_author`].
+/// Options for [`RevWalk::group_by_author`] and [`RevWalk::group_by_author_in_walk`].
 #[derive(Clone, Copy, Debug, Default)]
 pub struct GroupByAuthorOptions {
     /// When true, omit per-commit oid lists (counts only; faster for `--count`).
     pub count_only: bool,
 }
 
-/// Group `oids` by mapped author identity, sorted like `git shortlog -sne`.
-///
-/// When `mailmap` is `None`, authors are taken from each commit header unchanged.
-/// Sort order is descending commit count, then ascending `Name <email>` string
-/// (matching Git's `compareAuthors`).
-///
-/// # Errors
-///
-/// Returns ODB and commit parse errors when an oid is missing or corrupt.
-pub fn group_commits_by_author(
+impl RevWalk<'_> {
+    /// Group `oids` by mapped author identity, sorted like `git shortlog -sne`.
+    ///
+    /// When `mailmap` is `None`, authors are taken from each commit header unchanged.
+    /// Sort order is descending commit count, then ascending `Name <email>` string
+    /// (matching Git's `compareAuthors`).
+    ///
+    /// # Errors
+    ///
+    /// Returns ODB and commit parse errors when an oid is missing or corrupt.
+    pub fn group_by_author(
+        &self,
+        oids: &[ObjectId],
+        mailmap: Option<&MailmapTable>,
+        options: GroupByAuthorOptions,
+    ) -> Result<Vec<AuthorGroup>> {
+        group_commits_by_author(self.repository(), oids, mailmap, options)
+    }
+
+    /// Walk `tokens` and group the commits by author, like [`Self::group_by_author`] on the
+    /// result of [`Self::commits`].
+    ///
+    /// With [`GroupByAuthorOptions::count_only`] the walk uses pack bitmaps and pack-order
+    /// reads when it can.
+    ///
+    /// # Errors
+    ///
+    /// Propagates rev-parse, rev-list, ODB, and commit header errors.
+    pub fn group_by_author_in_walk(
+        &self,
+        tokens: &[&str],
+        walk_options: &RevWalkListOptions,
+        mailmap: Option<&MailmapTable>,
+        options: GroupByAuthorOptions,
+    ) -> Result<Vec<AuthorGroup>> {
+        let repo = self.repository();
+        if options.count_only {
+            return count_authors_from_rev_walk(repo, tokens, walk_options, mailmap);
+        }
+        let oids = self.commits(tokens, walk_options)?;
+        group_commits_by_author(repo, &oids, mailmap, options)
+    }
+
+    /// The repository's mailmap for grouping when `use_mailmap` is true (the same sources as
+    /// `log.mailmap`), or [`None`] when it is false or the mailmap is empty.
+    ///
+    /// # Errors
+    ///
+    /// Propagates mailmap load errors from the repository.
+    pub fn mailmap_for_grouping(&self, use_mailmap: bool) -> Result<Option<MailmapTable>> {
+        if !use_mailmap {
+            return Ok(None);
+        }
+        let table = load_mailmap_table(self.repository())?;
+        Ok((!table.is_empty()).then_some(table))
+    }
+}
+
+fn group_commits_by_author(
     repo: &Repository,
     oids: &[ObjectId],
     mailmap: Option<&MailmapTable>,
@@ -80,41 +129,9 @@ pub fn group_commits_by_author(
     Ok(groups)
 }
 
-/// Resolve `tokens` and group by author (`--count` uses bitmap rev-list + pack-order reads).
-///
-/// # Errors
-///
-/// Propagates rev-parse, rev-list, ODB, and commit header errors.
-pub fn group_commits_by_author_from_rev(
-    repo: &Repository,
-    tokens: &[&str],
-    walk_options: &RevWalkListOptions,
-    mailmap: Option<&MailmapTable>,
-    options: GroupByAuthorOptions,
-) -> Result<Vec<AuthorGroup>> {
-    if options.count_only {
-        return count_authors_from_rev_walk(repo, tokens, walk_options, mailmap);
-    }
-    let oids = repo.rev_walk().commits(tokens, walk_options)?;
-    group_commits_by_author(repo, &oids, mailmap, options)
-}
-
-/// Load `.mailmap` when `use_mailmap` is true (same sources as `log.mailmap`).
-///
-/// # Errors
-///
-/// Propagates mailmap load errors from the repository.
-pub fn mailmap_for_grouping(repo: &Repository, use_mailmap: bool) -> Result<Option<MailmapTable>> {
-    if !use_mailmap {
-        return Ok(None);
-    }
-    let table = load_mailmap_table(repo)?;
-    Ok((!table.is_empty()).then_some(table))
-}
-
 struct AuthorCounter {
     entries: Vec<(String, String, usize)>,
-    index: HashMap<u128, usize>,
+    index: HashMap<(String, String), usize>,
 }
 
 impl AuthorCounter {
@@ -127,7 +144,7 @@ impl AuthorCounter {
 
     fn absorb(&mut self, other: Self) {
         for (name, email, count) in other.entries {
-            let key = author_identity_key(&name, &email);
+            let key = (name.clone(), email.clone());
             if let Some(&idx) = self.index.get(&key) {
                 self.entries[idx].2 += count;
             } else {
@@ -153,13 +170,13 @@ impl AuthorCounter {
     }
 
     fn add_borrowed(&mut self, name: &str, email: &str) {
-        let key = author_identity_key(name, email);
+        let key = (name.to_owned(), email.to_owned());
         if let Some(&idx) = self.index.get(&key) {
             self.entries[idx].2 += 1;
             return;
         }
         let idx = self.entries.len();
-        self.entries.push((name.to_owned(), email.to_owned(), 1));
+        self.entries.push((key.0.clone(), key.1.clone(), 1));
         self.index.insert(key, idx);
     }
 
@@ -248,17 +265,23 @@ fn try_count_authors_via_bitmap(
     all_refs: bool,
     mailmap: Option<&MailmapTable>,
 ) -> Result<Option<Vec<AuthorGroup>>> {
-    let mut opts = rev_list_options_from_walk(repo, walk_options, parsed, all_refs, false)?;
+    // Bitmaps index the files primary's packs; a custom store's commits are not in them.
+    let Some(objects_dir) = repo.odb().files_objects_dir() else {
+        return Ok(None);
+    };
+    let (mut opts, _context) =
+        rev_list_options_from_walk(repo, walk_options, parsed, all_refs, false)?;
     opts.use_bitmap_index = true;
-    let objects_dir = repo.odb().objects_dir();
     repo.odb().with_pack_read_context(|| {
         if let Some((index, reachable)) =
             try_bitmap_reachable_commit_set_for_specs(repo, positive, negative, &opts)?
         {
             if let Some(pack_idx) = index.backing_pack_index() {
-                let positions = reachable
-                    .reachable_commit_bitmap_positions()
-                    .map_err(|e| Error::CorruptObject(format!("pack bitmap: {e}")))?;
+                let positions = reachable.reachable_commit_bitmap_positions().map_err(|e| {
+                    Error::Object(ObjectError::Corrupt {
+                        detail: format!("pack bitmap: {e}"),
+                    })
+                })?;
                 let mut counter = count_authors_at_pack_rows(
                     repo,
                     objects_dir,
@@ -272,7 +295,7 @@ fn try_count_authors_via_bitmap(
                         let mut pack_reader = None;
                         accumulate_author_for_oid(
                             repo,
-                            objects_dir,
+                            Some(objects_dir),
                             &mut pack_reader,
                             *oid,
                             mailmap,
@@ -295,7 +318,7 @@ fn try_count_authors_via_bitmap(
             |oid| {
                 accumulate_author_for_oid(
                     repo,
-                    objects_dir,
+                    Some(objects_dir),
                     &mut pack_reader,
                     oid,
                     mailmap,
@@ -346,14 +369,21 @@ fn count_authors_at_pack_rows(
         return Ok(AuthorCounter::new());
     }
 
-    let threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
+    let config = repo.config().snapshot()?;
+    let threads = repo
+        .thread_policy()
+        .resolve(crate::parallel::ParallelOp::DiffContent, config.as_ref())
+        .threads
+        .get()
         .clamp(1, 8);
     if entries.len() < PARALLEL_AUTHOR_COUNT_MIN || threads <= 1 {
         let mut reader =
             SingleLocalPackReader::open_for_pack_index(objects_dir, Arc::clone(pack_idx))?
-                .ok_or_else(|| Error::CorruptObject("missing pack reader".into()))?;
+                .ok_or_else(|| {
+                    Error::Object(ObjectError::Corrupt {
+                        detail: "missing pack reader".into(),
+                    })
+                })?;
         let mut counter = AuthorCounter::new();
         count_authors_at_pack_rows_serial(
             repo,
@@ -377,7 +407,11 @@ fn count_authors_at_pack_rows(
             handles.push(scope.spawn(move || -> Result<AuthorCounter> {
                 let mut reader =
                     SingleLocalPackReader::open_for_pack_index(objects_dir, Arc::clone(&pack_idx))?
-                        .ok_or_else(|| Error::CorruptObject("missing pack reader".into()))?;
+                        .ok_or_else(|| {
+                            Error::Object(ObjectError::Corrupt {
+                                detail: "missing pack reader".into(),
+                            })
+                        })?;
                 let mut counter = AuthorCounter::new();
                 count_authors_at_pack_rows_serial(
                     repo,
@@ -392,11 +426,11 @@ fn count_authors_at_pack_rows(
         }
         let mut merged = AuthorCounter::new();
         for handle in handles {
-            merged.absorb(
-                handle
-                    .join()
-                    .map_err(|_| Error::CorruptObject("author count worker panicked".into()))??,
-            );
+            merged.absorb(handle.join().map_err(|_| {
+                Error::Object(ObjectError::Corrupt {
+                    detail: "author count worker panicked".into(),
+                })
+            })??);
         }
         Ok(merged)
     })
@@ -431,13 +465,20 @@ fn count_authors_at_pack_rows_serial(
     Ok(())
 }
 
+/// Whether history walks have a commit-graph: graph files under a files primary's
+/// `objects/info`, or a graph attached to a custom store.
 fn commit_graph_available(repo: &Repository) -> bool {
-    let objects = repo.odb().objects_dir();
-    objects.join("info/commit-graph").is_file() || objects.join("info/commit-graphs").is_dir()
+    match repo.odb().files_objects_dir() {
+        Some(objects) => {
+            objects.join("info/commit-graph").is_file()
+                || objects.join("info/commit-graphs").is_dir()
+        }
+        None => repo.odb().commit_graph_chain().is_some(),
+    }
 }
 
 fn shortlog_stack_walk_compatible(walk: &RevWalkListOptions, parsed: &RevWalkParsedSpecs) -> bool {
-    walk.paths.is_empty()
+    walk.pathspec.is_entire_tree()
         && walk.since.is_none()
         && walk.until.is_none()
         && walk.merges == MergeFilter::Any
@@ -449,15 +490,25 @@ fn shortlog_stack_walk_compatible(walk: &RevWalkListOptions, parsed: &RevWalkPar
         && parsed.symmetric_right.is_none()
 }
 
-fn load_commit_bytes_and_count_author(
+/// Count the author of commit `oid`, returning the whole commit when it was read in full
+/// (otherwise its header prefix is left in `pack_reader`).
+///
+/// `files_objects_dir` is the files primary's `objects/` directory, whose packs are read
+/// for just the header; `None` for a custom primary, read through the object database.
+fn load_commit_prefix_and_count_author(
     repo: &Repository,
-    objects_dir: &Path,
+    files_objects_dir: Option<&Path>,
     pack_reader: &mut Option<SingleLocalPackReader>,
     oid: ObjectId,
     mailmap: Option<&MailmapTable>,
     counter: &mut AuthorCounter,
     monotonic_pack_probe: bool,
-) -> Result<Vec<u8>> {
+) -> Result<Option<Vec<u8>>> {
+    let Some(objects_dir) = files_objects_dir else {
+        let obj = repo.odb().read(&oid)?;
+        accumulate_author_count(&obj.data, mailmap, counter)?;
+        return Ok(Some(obj.data));
+    };
     for _ in 0..3 {
         if pack_reader.is_none() {
             *pack_reader = SingleLocalPackReader::open_allow_loose_for_commits(objects_dir, &oid)?;
@@ -473,7 +524,7 @@ fn load_commit_bytes_and_count_author(
         };
         if let Some(prefix) = prefix {
             if accumulate_author_count(prefix, mailmap, counter).is_ok() {
-                return Ok(prefix.to_vec());
+                return Ok(None);
             }
             reader.clear_commit_header_prefix();
         } else if !reader.contains_oid(&oid)? {
@@ -487,9 +538,9 @@ fn load_commit_bytes_and_count_author(
             Ok(obj) => {
                 reader.clear_commit_header_prefix();
                 accumulate_author_count(&obj.data, mailmap, counter)?;
-                return Ok(obj.data);
+                return Ok(Some(obj.data));
             }
-            Err(Error::ObjectNotFound(_)) => {
+            Err(Error::Object(ObjectError::NotFound { .. })) => {
                 reader.clear_commit_header_prefix();
                 *pack_reader = None;
                 continue;
@@ -503,21 +554,21 @@ fn load_commit_bytes_and_count_author(
     *pack_reader = None;
     let obj = repo.odb().read(&oid)?;
     accumulate_author_count(&obj.data, mailmap, counter)?;
-    Ok(obj.data)
+    Ok(Some(obj.data))
 }
 
 fn accumulate_author_for_oid(
     repo: &Repository,
-    objects_dir: &Path,
+    files_objects_dir: Option<&Path>,
     pack_reader: &mut Option<SingleLocalPackReader>,
     oid: ObjectId,
     mailmap: Option<&MailmapTable>,
     counter: &mut AuthorCounter,
     monotonic_pack_probe: bool,
 ) -> Result<()> {
-    load_commit_bytes_and_count_author(
+    load_commit_prefix_and_count_author(
         repo,
-        objects_dir,
+        files_objects_dir,
         pack_reader,
         oid,
         mailmap,
@@ -538,14 +589,14 @@ fn count_authors_stack_walk(
     if tips.is_empty() {
         return Ok(Vec::new());
     }
-    let objects_dir = repo.odb().objects_dir();
-    let excluded: HashSet<ObjectId> = if exclude.is_empty() {
-        HashSet::new()
-    } else {
-        let mut graph =
-            crate::rev_list::CommitGraph::with_commit_graph(repo, false, use_commit_graph);
-        crate::rev_list::walk_closure(&mut graph, exclude)?
-    };
+    let files_objects_dir = repo.odb().files_objects_dir();
+    let excluded = crate::merge_base::RangeWalkHide::for_range_walk(
+        repo,
+        tips,
+        exclude,
+        use_commit_graph,
+        first_parent,
+    )?;
     let mut graph = use_commit_graph
         .then(|| crate::rev_list::CommitGraph::with_commit_graph(repo, first_parent, true));
     let mut pack_reader: Option<SingleLocalPackReader> = None;
@@ -553,12 +604,12 @@ fn count_authors_stack_walk(
     let mut stack: Vec<ObjectId> = tips.to_vec();
     let mut seen = HashSet::new();
     while let Some(oid) = stack.pop() {
-        if excluded.contains(&oid) || !seen.insert(oid) {
+        if excluded.is_hidden(oid) || !seen.insert(oid) {
             continue;
         }
-        let commit_bytes = load_commit_bytes_and_count_author(
+        let full_commit = load_commit_prefix_and_count_author(
             repo,
-            objects_dir,
+            files_objects_dir,
             &mut pack_reader,
             oid,
             mailmap,
@@ -568,7 +619,20 @@ fn count_authors_stack_walk(
         let parents = if let Some(graph) = graph.as_mut() {
             graph.parents_of(oid)?
         } else {
-            parent_oids_from_commit_bytes(&commit_bytes, first_parent)?
+            let prefix = full_commit
+                .as_deref()
+                .or_else(|| {
+                    pack_reader
+                        .as_ref()
+                        .filter(|r| !r.commit_header_prefix().is_empty())
+                        .map(SingleLocalPackReader::commit_header_prefix)
+                })
+                .ok_or_else(|| {
+                    Error::Object(ObjectError::Corrupt {
+                        detail: "commit missing parent header after author count".into(),
+                    })
+                })?;
+            parent_oids_from_commit_bytes(prefix, first_parent)?
         };
         stack.extend(parents);
     }
@@ -582,8 +646,11 @@ fn parent_oids_from_commit_bytes(data: &[u8], first_parent: bool) -> Result<Vec<
             break;
         }
         if line.starts_with(b"parent ") {
-            let hex = std::str::from_utf8(&line[7..])
-                .map_err(|_| Error::CorruptObject("commit parent is not UTF-8".into()))?;
+            let hex = std::str::from_utf8(&line[7..]).map_err(|_| {
+                Error::Object(ObjectError::Corrupt {
+                    detail: "commit parent is not UTF-8".into(),
+                })
+            })?;
             parents.push(ObjectId::from_hex(hex.trim())?);
             if first_parent {
                 break;
@@ -600,17 +667,17 @@ fn count_authors_from_commit_oids(
     oids: &[ObjectId],
     mailmap: Option<&MailmapTable>,
 ) -> Result<Vec<AuthorGroup>> {
-    let objects_dir = repo.odb().objects_dir();
+    let files_objects_dir = repo.odb().files_objects_dir();
     let mut counter = AuthorCounter::new();
     repo.odb().with_pack_read_context(|| {
-        count_authors_single_pack(repo, objects_dir, oids, mailmap, &mut counter)
+        count_authors_single_pack(repo, files_objects_dir, oids, mailmap, &mut counter)
     })?;
     Ok(counter.into_sorted_groups())
 }
 
 fn count_authors_single_pack(
     repo: &Repository,
-    objects_dir: &Path,
+    files_objects_dir: Option<&Path>,
     oids: &[ObjectId],
     mailmap: Option<&MailmapTable>,
     counter: &mut AuthorCounter,
@@ -619,7 +686,7 @@ fn count_authors_single_pack(
     for oid in oids {
         accumulate_author_for_oid(
             repo,
-            objects_dir,
+            files_objects_dir,
             &mut pack_reader,
             *oid,
             mailmap,
@@ -628,24 +695,6 @@ fn count_authors_single_pack(
         )?;
     }
     Ok(())
-}
-
-fn author_identity_key(name: &str, email: &str) -> u128 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    hash_ascii_insensitive(name, &mut hasher);
-    hash_ascii_insensitive(email, &mut hasher);
-    let lo = hasher.finish();
-    hasher = std::collections::hash_map::DefaultHasher::new();
-    hash_ascii_insensitive(email, &mut hasher);
-    hash_ascii_insensitive(name, &mut hasher);
-    let hi = hasher.finish();
-    ((hi as u128) << 64) | lo as u128
-}
-
-fn hash_ascii_insensitive(s: &str, hasher: &mut impl Hasher) {
-    for b in s.bytes() {
-        hasher.write(&[b.to_ascii_lowercase()]);
-    }
 }
 
 fn sort_author_groups(groups: &mut [AuthorGroup]) {
@@ -680,10 +729,16 @@ fn accumulate_author_count(
 }
 
 fn author_slices_from_commit_bytes(data: &[u8]) -> Result<(&str, &str)> {
-    let author_bytes = scan_author_line_borrowed(data)
-        .ok_or_else(|| crate::error::Error::CorruptObject("commit missing author header".into()))?;
-    let line = std::str::from_utf8(author_bytes)
-        .map_err(|_| crate::error::Error::CorruptObject("commit author is not UTF-8".into()))?;
+    let author_bytes = scan_author_line_borrowed(data).ok_or_else(|| {
+        crate::error::Error::Object(ObjectError::Corrupt {
+            detail: "commit missing author header".into(),
+        })
+    })?;
+    let line = std::str::from_utf8(author_bytes).map_err(|_| {
+        crate::error::Error::Object(ObjectError::Corrupt {
+            detail: "commit author is not UTF-8".into(),
+        })
+    })?;
     Ok(parse_contact_fields(strip_author_timestamp(line.trim())))
 }
 
@@ -722,8 +777,11 @@ fn author_from_commit_bytes(
     data: &[u8],
     mailmap: Option<&MailmapTable>,
 ) -> Result<(String, String)> {
-    let (author_raw, encoding) = scan_author_raw_and_encoding(data)
-        .ok_or_else(|| crate::error::Error::CorruptObject("commit missing author header".into()))?;
+    let (author_raw, encoding) = scan_author_raw_and_encoding(data).ok_or_else(|| {
+        crate::error::Error::Object(ObjectError::Corrupt {
+            detail: "commit missing author header".into(),
+        })
+    })?;
     let author_bytes = author_raw.as_bytes();
     if encoding.is_none() {
         if let Ok(line) = std::str::from_utf8(author_bytes) {
@@ -857,5 +915,69 @@ fn author_sort_key(group: &AuthorGroup) -> String {
         format!("<{}>", group.email)
     } else {
         format!("{} <{}>", group.name, group.email)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::objects::{serialize_commit, CommitData, ObjectId, ObjectKind};
+    use crate::repo::{InitOptions, Repository};
+
+    fn write_commit(
+        repo: &Repository,
+        name: &str,
+        email: &str,
+        tree: ObjectId,
+        parents: Vec<ObjectId>,
+    ) -> ObjectId {
+        let ident = format!("{name} <{email}> 1 +0000");
+        let commit = CommitData {
+            tree,
+            parents,
+            author: ident.clone(),
+            committer: ident,
+            author_raw: Vec::new(),
+            committer_raw: Vec::new(),
+            encoding: None,
+            message: "msg".into(),
+            raw_message: None,
+            extra_headers: Vec::new(),
+        };
+        let data = serialize_commit(&commit);
+        repo.odb()
+            .write(ObjectKind::Commit, &data)
+            .expect("write commit")
+    }
+
+    #[test]
+    fn count_only_groups_preserve_ascii_case_distinct_identities() -> Result<()> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (repo, _) = Repository::init(dir.path(), &InitOptions::default())?;
+        let tree = ObjectId::from_hex("4b825dc642cb6eb9a060e54bf8d69288fbee4904")?;
+        let o1 = write_commit(&repo, "Case", "a@example.com", tree, vec![]);
+        let o2 = write_commit(&repo, "CASE", "A@example.com", tree, vec![o1]);
+        let oids = [o1, o2];
+
+        let full = group_commits_by_author(
+            &repo,
+            &oids,
+            None,
+            GroupByAuthorOptions { count_only: false },
+        )?;
+        let counts = group_commits_by_author(
+            &repo,
+            &oids,
+            None,
+            GroupByAuthorOptions { count_only: true },
+        )?;
+
+        assert_eq!(full.len(), 2);
+        assert_eq!(counts.len(), 2);
+        assert_eq!(
+            full.iter().map(|g| g.count).collect::<Vec<_>>(),
+            counts.iter().map(|g| g.count).collect::<Vec<_>>()
+        );
+        Ok(())
     }
 }

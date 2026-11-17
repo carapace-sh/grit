@@ -4,15 +4,14 @@
 
 use crate::support;
 
-use grit_lib::config::environment::RepositoryOptions;
+use grit_lib::config::environment::{Environment, RepositoryOptions};
 use grit_lib::config::ConfigSet;
 use grit_lib::objects::ObjectId;
+use grit_lib::refs::ref_storage::RefStorageFormat;
 use grit_lib::refs::refs_fsck::{format_refs_fsck_line, refs_fsck, RefsFsckIssue};
-use grit_lib::refs::store::{Expected, RawRef, RefTransaction, RefUpdate, RefUpdateFlags};
-use grit_lib::refs::write_ref;
+use grit_lib::refs::store::{Expected, RawRef, RefName, RefTransaction, RefUpdate, RefUpdateFlags};
 use grit_lib::repo::{InitOptions, Repository};
-use grit_lib::worktree::{add_linked_worktree, AddLinkedWorktreeOptions, WorktreeBranch};
-use grit_lib::RefStorageFormat;
+use grit_lib::worktree::{AddLinkedWorktreeOptions, WorktreeBranch};
 use tempfile::tempdir;
 
 #[test]
@@ -22,7 +21,7 @@ fn refs_fsck_reports_bad_symref_and_formats_line() {
         dir.path(),
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
-            .with_ref_storage(grit_lib::RefStorageFormat::Files),
+            .with_ref_storage(grit_lib::refs::ref_storage::RefStorageFormat::Files),
     )
     .expect("init");
     let git_dir = dir.path().join(".git");
@@ -32,7 +31,12 @@ fn refs_fsck_reports_bad_symref_and_formats_line() {
         &RepositoryOptions::empty().with_work_tree(dir.path()),
     )
     .expect("open");
-    let config = ConfigSet::load_repo_local_only(&git_dir).expect("config");
+    let config = ConfigSet::load(
+        &Environment::empty(),
+        Some(&git_dir),
+        &crate::config::LoadConfigOptions::repo_local_only(&git_dir),
+    )
+    .expect("config");
     let odb = repo.odb().clone();
 
     std::fs::write(
@@ -41,10 +45,15 @@ fn refs_fsck_reports_bad_symref_and_formats_line() {
     )
     .expect("symref");
 
-    write_ref(&git_dir, "refs/heads/good", &oid(1)).expect("good ref");
+    grit_test_support::refs::set_ref(
+        &grit_test_support::refs::at(&git_dir),
+        "refs/heads/good",
+        &oid(1),
+    )
+    .expect("good ref");
     let dangling = RefTransaction::new()
         .update(RefUpdate {
-            name: "refs/heads/dangling".to_owned(),
+            name: RefName::from_trusted("refs/heads/dangling"),
             new_value: Some(RawRef::Direct(ObjectId::from_bytes(&[1; 20]).expect("oid"))),
             expected: Expected::Missing,
             reflog: None,
@@ -54,12 +63,12 @@ fn refs_fsck_reports_bad_symref_and_formats_line() {
             },
         })
         .expect("txn");
-    repo.refs()
+    repo.ref_store()
         .prepare(dangling)
         .and_then(|prepared| prepared.commit())
         .expect("deliberately dangling ref");
 
-    let issues = refs_fsck(&repo, &odb, &config, false).expect("fsck");
+    let issues = refs_fsck(&repo, &odb, false).expect("fsck");
     assert!(
         issues
             .iter()
@@ -90,7 +99,7 @@ fn refs_fsck_reports_packed_refs_out_of_order_under_sorted_header() {
         dir.path(),
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
-            .with_ref_storage(grit_lib::RefStorageFormat::Files),
+            .with_ref_storage(grit_lib::refs::ref_storage::RefStorageFormat::Files),
     )
     .expect("init");
     let git_dir = dir.path().join(".git");
@@ -99,7 +108,12 @@ fn refs_fsck_reports_packed_refs_out_of_order_under_sorted_header() {
         &RepositoryOptions::empty().with_work_tree(dir.path()),
     )
     .expect("open");
-    let config = ConfigSet::load_repo_local_only(&git_dir).expect("config");
+    let config = ConfigSet::load(
+        &Environment::empty(),
+        Some(&git_dir),
+        &crate::config::LoadConfigOptions::repo_local_only(&git_dir),
+    )
+    .expect("config");
     let odb = repo.odb().clone();
     let blob = odb
         .write(grit_lib::objects::ObjectKind::Blob, b"target\n")
@@ -111,7 +125,7 @@ fn refs_fsck_reports_packed_refs_out_of_order_under_sorted_header() {
             body.push_str(&format!("{blob} {name}\n"));
         }
         std::fs::write(git_dir.join("packed-refs"), body).expect("packed-refs");
-        refs_fsck(&repo, &odb, &config, false)
+        refs_fsck(&repo, &odb, false)
             .expect("fsck")
             .into_iter()
             .filter(|i| i.msg_id == "packedRefUnsorted")
@@ -150,13 +164,23 @@ fn refs_fsck_accepts_reftable_placeholder_files_after_commit() {
         &RepositoryOptions::empty().with_work_tree(dir.path()),
     )
     .expect("open");
-    let config = ConfigSet::load_repo_local_only(&git_dir).expect("config");
+    let config = ConfigSet::load(
+        &Environment::empty(),
+        Some(&git_dir),
+        &crate::config::LoadConfigOptions::repo_local_only(&git_dir),
+    )
+    .expect("config");
     let odb = repo.odb().clone();
 
     let oid = support::stored_commit(&git_dir, 1);
-    write_ref(&git_dir, "refs/heads/main", &oid).expect("main");
+    grit_test_support::refs::set_ref(
+        &grit_test_support::refs::at(&git_dir),
+        "refs/heads/main",
+        &oid,
+    )
+    .expect("main");
 
-    let issues = refs_fsck(&repo, &odb, &config, false).expect("fsck");
+    let issues = refs_fsck(&repo, &odb, false).expect("fsck");
     assert!(issues.is_empty(), "{issues:?}");
 }
 
@@ -177,12 +201,17 @@ fn refs_fsck_reftable_linked_worktree_placeholders_and_missing_object() {
     )
     .expect("open");
     let oid = support::stored_commit(&git_dir, 1);
-    write_ref(&git_dir, "refs/heads/main", &oid).expect("main");
+    grit_test_support::refs::set_ref(
+        &grit_test_support::refs::at(&git_dir),
+        "refs/heads/main",
+        &oid,
+    )
+    .expect("main");
 
     let wt_path = dir.path().join("linked");
-    let entry = add_linked_worktree(
-        &repo,
-        &AddLinkedWorktreeOptions {
+    let entry = repo
+        .worktrees()
+        .add(&AddLinkedWorktreeOptions {
             path: wt_path.clone(),
             branch: Some(WorktreeBranch::Create("linked".into())),
             start_point: Some("HEAD".into()),
@@ -190,22 +219,26 @@ fn refs_fsck_reftable_linked_worktree_placeholders_and_missing_object() {
             lock: None,
             no_checkout: false,
             track: false,
-        },
-    )
-    .expect("worktree");
+        })
+        .expect("worktree");
     assert_eq!(
         std::fs::read(entry.admin_dir.join("refs/heads")).expect("stub"),
         b"this repository uses the reftable format\n"
     );
 
-    let config = ConfigSet::load_repo_local_only(&git_dir).expect("config");
+    let config = ConfigSet::load(
+        &Environment::empty(),
+        Some(&git_dir),
+        &crate::config::LoadConfigOptions::repo_local_only(&git_dir),
+    )
+    .expect("config");
     let odb = repo.odb().clone();
-    let healthy = refs_fsck(&repo, &odb, &config, false).expect("fsck");
+    let healthy = refs_fsck(&repo, &odb, false).expect("fsck");
     assert!(healthy.is_empty(), "{healthy:?}");
 
     let dangling = RefTransaction::new()
         .update(RefUpdate {
-            name: "refs/heads/dangling".to_owned(),
+            name: RefName::from_trusted("refs/heads/dangling"),
             new_value: Some(RawRef::Direct(ObjectId::from_bytes(&[2; 20]).expect("oid"))),
             expected: Expected::Missing,
             reflog: None,
@@ -215,12 +248,12 @@ fn refs_fsck_reftable_linked_worktree_placeholders_and_missing_object() {
             },
         })
         .expect("txn");
-    repo.refs()
+    repo.ref_store()
         .prepare(dangling)
         .and_then(|prepared| prepared.commit())
         .expect("dangling ref");
 
-    let with_missing = refs_fsck(&repo, &odb, &config, false).expect("fsck");
+    let with_missing = refs_fsck(&repo, &odb, false).expect("fsck");
     assert!(
         with_missing
             .iter()
@@ -229,7 +262,7 @@ fn refs_fsck_reftable_linked_worktree_placeholders_and_missing_object() {
     );
 
     std::fs::write(git_dir.join("refs/heads"), "not the reftable sentinel\n").expect("bad stub");
-    let bad_stub = refs_fsck(&repo, &odb, &config, false).expect("fsck");
+    let bad_stub = refs_fsck(&repo, &odb, false).expect("fsck");
     assert!(
         bad_stub
             .iter()
@@ -238,7 +271,7 @@ fn refs_fsck_reftable_linked_worktree_placeholders_and_missing_object() {
     );
 
     std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/bad..name\n").expect("bad head");
-    let bad_head = refs_fsck(&repo, &odb, &config, false).expect("fsck");
+    let bad_head = refs_fsck(&repo, &odb, false).expect("fsck");
     assert!(
         bad_head
             .iter()
@@ -264,12 +297,17 @@ fn refs_fsck_reftable_worktree_local_stack_and_head_sentinel_bytes() {
     )
     .expect("open");
     let oid = support::stored_commit(&git_dir, 1);
-    write_ref(&git_dir, "refs/heads/main", &oid).expect("main");
+    grit_test_support::refs::set_ref(
+        &grit_test_support::refs::at(&git_dir),
+        "refs/heads/main",
+        &oid,
+    )
+    .expect("main");
 
     let wt_path = dir.path().join("linked");
-    let entry = add_linked_worktree(
-        &repo,
-        &AddLinkedWorktreeOptions {
+    let entry = repo
+        .worktrees()
+        .add(&AddLinkedWorktreeOptions {
             path: wt_path.clone(),
             branch: Some(WorktreeBranch::Create("linked".into())),
             start_point: Some("HEAD".into()),
@@ -277,9 +315,8 @@ fn refs_fsck_reftable_worktree_local_stack_and_head_sentinel_bytes() {
             lock: None,
             no_checkout: false,
             track: false,
-        },
-    )
-    .expect("worktree");
+        })
+        .expect("worktree");
     let wt_id = entry
         .admin_dir
         .file_name()
@@ -293,7 +330,7 @@ fn refs_fsck_reftable_worktree_local_stack_and_head_sentinel_bytes() {
 
     let wt_dangling = RefTransaction::new()
         .update(RefUpdate {
-            name: "refs/worktree/dangling".to_owned(),
+            name: RefName::from_trusted("refs/worktree/dangling"),
             new_value: Some(RawRef::Direct(ObjectId::from_bytes(&[3; 20]).expect("oid"))),
             expected: Expected::Missing,
             reflog: None,
@@ -304,14 +341,19 @@ fn refs_fsck_reftable_worktree_local_stack_and_head_sentinel_bytes() {
         })
         .expect("txn");
     wt_repo
-        .refs()
+        .ref_store()
         .prepare(wt_dangling)
         .and_then(|prepared| prepared.commit())
         .expect("worktree-local ref");
 
-    let config = ConfigSet::load_repo_local_only(&git_dir).expect("config");
+    let config = ConfigSet::load(
+        &Environment::empty(),
+        Some(&git_dir),
+        &crate::config::LoadConfigOptions::repo_local_only(&git_dir),
+    )
+    .expect("config");
     let odb = repo.odb().clone();
-    let issues = refs_fsck(&repo, &odb, &config, false).expect("fsck");
+    let issues = refs_fsck(&repo, &odb, false).expect("fsck");
     let wt_path = format!("worktrees/{wt_id}/refs/worktree/dangling");
     assert!(
         issues
@@ -322,7 +364,7 @@ fn refs_fsck_reftable_worktree_local_stack_and_head_sentinel_bytes() {
 
     let common_dangling = RefTransaction::new()
         .update(RefUpdate {
-            name: "refs/heads/common-dangling".to_owned(),
+            name: RefName::from_trusted("refs/heads/common-dangling"),
             new_value: Some(RawRef::Direct(ObjectId::from_bytes(&[4; 20]).expect("oid"))),
             expected: Expected::Missing,
             reflog: None,
@@ -332,12 +374,12 @@ fn refs_fsck_reftable_worktree_local_stack_and_head_sentinel_bytes() {
             },
         })
         .expect("txn");
-    repo.refs()
+    repo.ref_store()
         .prepare(common_dangling)
         .and_then(|prepared| prepared.commit())
         .expect("common dangling");
 
-    let dup_check = refs_fsck(&repo, &odb, &config, false).expect("fsck");
+    let dup_check = refs_fsck(&repo, &odb, false).expect("fsck");
     assert_eq!(
         dup_check
             .iter()
@@ -352,7 +394,7 @@ fn refs_fsck_reftable_worktree_local_stack_and_head_sentinel_bytes() {
         b"ref: refs/heads/.invalid\n\r",
     )
     .expect("malformed head stub");
-    let bad_sentinel = refs_fsck(&repo, &odb, &config, false).expect("fsck");
+    let bad_sentinel = refs_fsck(&repo, &odb, false).expect("fsck");
     assert!(
         bad_sentinel.iter().any(|i| {
             i.path.ends_with("HEAD")

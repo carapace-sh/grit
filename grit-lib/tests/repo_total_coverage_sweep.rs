@@ -3,6 +3,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use grit_lib::config::environment::RepositoryOptions;
+use grit_lib::diff::TreeDiffOptions;
 use grit_lib::objects::ObjectKind;
 use grit_lib::repo::{InitOptions, Repository};
 use std::fs;
@@ -11,7 +12,7 @@ use tempfile::tempdir;
 #[test]
 fn repository_handles_and_discovery_sweep() -> grit_lib::error::Result<()> {
     let dir = tempdir().map_err(grit_lib::error::Error::Io)?;
-    let mut repo = Repository::init(dir.path(), &InitOptions::default())?;
+    let (mut repo, _) = Repository::init(dir.path(), &InitOptions::default())?;
     fs::write(dir.path().join("probe.txt"), b"x\n").map_err(grit_lib::error::Error::Io)?;
 
     let _ = repo.is_bare();
@@ -22,14 +23,16 @@ fn repository_handles_and_discovery_sweep() -> grit_lib::error::Result<()> {
     let _ = repo.environment();
     let _ = repo.reference_unix_time();
     let _ = repo.wall_clock_epoch();
-    let _ = repo.config()?;
+    let _ = repo.config().snapshot()?;
     repo.reload_config()?;
-    let _ = repo.refs();
+    let _ = repo.ref_store();
     let _ = repo.objects();
     let _ = repo.references();
-    let _ = repo.index_handle().load()?;
-    let _ = repo.config_handle();
-    let _ = repo.rev_walk();
+    let _ = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())?;
+    let _ = repo.config();
+    let _ = repo.revwalk();
     let _ = repo.diff();
     let _ = repo.remotes();
     let _ = repo.worktrees();
@@ -68,12 +71,14 @@ fn repository_init_variants_and_handle_exercise() -> grit_lib::error::Result<()>
     let mut opts = RepositoryOptions::empty();
     opts.work_tree = Some(wt.path().to_path_buf());
     let repo = Repository::open(&separate, &opts)?;
-    let _ = repo.index_handle().load()?;
     let _ = repo
-        .rev_walk()
-        .walk("HEAD", &RevListOptions::default())
-        .ok();
-    let _ = repo.diff().tree_to_tree(None, None)?;
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())?;
+    let _ = repo.revwalk().walk("HEAD", &RevListOptions::default()).ok();
+    let _ = repo
+        .diff()
+        .tree_to_tree(None, None, &TreeDiffOptions::default())
+        .map(|r| r.entries)?;
 
     let bare = tempdir().map_err(grit_lib::error::Error::Io)?;
     Repository::init(

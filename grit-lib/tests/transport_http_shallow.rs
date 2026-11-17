@@ -28,10 +28,10 @@ use std::time::{Duration, Instant};
 
 use grit_lib::objects::odb::Odb;
 use grit_lib::objects::ObjectId;
-use grit_lib::remote::fetch::NoProgress;
+use grit_lib::progress::NullProgress;
 use grit_lib::remote::transfer::{FetchDepth, FetchOptions};
+use grit_lib::remote::transport::http::http_client_arc;
 use grit_lib::remote::transport::http::ureq_client::UreqHttpClient;
-use grit_lib::remote::transport::http::{http_client_arc, http_fetch};
 
 fn open_odb(git_dir: &Path) -> Odb {
     Odb::new(&git_dir.join("objects")).with_config_git_dir(git_dir.to_path_buf())
@@ -160,17 +160,25 @@ fn shallow_depth1_then_unshallow_over_smart_http_v1() {
     let client = http_client_arc(UreqHttpClient::new());
 
     // 1. Shallow depth=1 fetch.
-    let mut shallow_opts = FetchOptions {
-        refspecs: vec!["+refs/heads/main:refs/remotes/origin/main".to_owned()],
-        fetch_depth: FetchDepth::depth(1),
-        ..Default::default()
-    };
-    let outcome = match http_fetch(
-        client.clone(),
+    let mut shallow_opts = FetchOptions::new();
+    shallow_opts.refspecs = vec!["+refs/heads/main:refs/remotes/origin/main".to_owned()];
+    shallow_opts.fetch_depth = FetchDepth::depth(1);
+    let outcome = match grit_lib::repo::Repository::open(
         &local_git,
-        &url,
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&mut shallow_opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Http {
+            client: client.clone(),
+            url: &url,
+        },
         &mut shallow_opts,
-        &mut NoProgress,
+        &mut NullProgress,
+        grit_lib::progress::CancelToken::never_ref(),
     ) {
         Ok(o) => o,
         Err(e) => {
@@ -247,17 +255,25 @@ fn shallow_depth1_then_unshallow_over_smart_http_v1() {
     }
 
     // 2. Deepen to full with `--unshallow`.
-    let mut unshallow_opts = FetchOptions {
-        refspecs: vec!["+refs/heads/main:refs/remotes/origin/main".to_owned()],
-        fetch_depth: Some(FetchDepth::Unshallow),
-        ..Default::default()
-    };
-    let outcome = http_fetch(
-        client.clone(),
+    let mut unshallow_opts = FetchOptions::new();
+    unshallow_opts.refspecs = vec!["+refs/heads/main:refs/remotes/origin/main".to_owned()];
+    unshallow_opts.fetch_depth = Some(FetchDepth::Unshallow);
+    let outcome = grit_lib::repo::Repository::open(
         &local_git,
-        &url,
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&mut unshallow_opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Http {
+            client: client.clone(),
+            url: &url,
+        },
         &mut unshallow_opts,
-        &mut NoProgress,
+        &mut NullProgress,
+        grit_lib::progress::CancelToken::never_ref(),
     )
     .expect("unshallow http_fetch");
 

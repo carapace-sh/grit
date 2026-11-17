@@ -2,19 +2,27 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use grit_lib::error::ObjectError;
+use grit_lib::progress::NullProgress;
 use std::fs;
 use std::process::Command;
+use std::sync::Arc;
 
+use grit_lib::config::environment::RepositoryOptions;
+use grit_lib::ident::Signature;
 use grit_lib::index::Index;
 use grit_lib::maintenance::repository_fsck::{self as fsck, FsckIssue, FsckOptions};
-use grit_lib::objects::pack::{
-    read_pack_index, verify_pack_and_collect, write_v2_pack_index_with_trailer, PackedType,
+use grit_lib::objects::odb::store::MemoryStore;
+use grit_lib::objects::{HashAlgo, NewCommit, ObjectId, ObjectKind};
+use grit_lib::porcelain::commit::CommitRequest;
+use grit_lib::progress::NullProgress;
+use grit_lib::refs::store::{
+    Expected, MemoryRefStore, RawRef, RefTransaction, RefUpdate, ReflogUpdate,
 };
-use grit_lib::objects::{ObjectId, ObjectKind};
-use grit_lib::porcelain::add::stage_for_commit;
-use grit_lib::porcelain::commit::{create_commit, CommitRequest};
-use grit_lib::progress::{NeverCancel, NullProgress};
-use grit_lib::repo::{InitOptions, Repository};
+use grit_lib::repo::{InitOptions, Repository, RepositoryBuilder};
+use grit_lib::test_support::objects_pack::{
+    read_pack_index, verify_pack_and_collect, write_v2_pack_index_from_trailer, PackedType,
+};
 use grit_test_support::objects::{
     write_pack_and_index, DeltaOps, IndexPackOptions, ObjectKind as PackKind, PackBuilder,
     PackBuilt,
@@ -23,6 +31,7 @@ use grit_test_support::{
     git_fsck, git_hash_object_literally, write_loose_object, HashAlgo as FixtureAlgo,
 };
 use tempfile::TempDir;
+use time::OffsetDateTime;
 
 fn git(dir: &std::path::Path, args: &[&str]) -> String {
     let out = Command::new("git")
@@ -103,36 +112,40 @@ fn write_ref_loose(dir: &std::path::Path, ref_name: &str, oid: ObjectId) {
 
 fn init_repo() -> (TempDir, Repository) {
     let dir = TempDir::new().expect("tempdir");
-    let repo = Repository::init(dir.path(), &InitOptions::default()).expect("init");
+    let (repo, _) = Repository::init(dir.path(), &InitOptions::default()).expect("init");
     (dir, repo)
 }
 
 fn one_commit(repo: &Repository) -> ObjectId {
     let wt = repo.work_tree().expect("wt");
     std::fs::write(wt.join("f.txt"), b"hello\n").expect("write");
-    stage_for_commit(repo, &mut NullProgress, &NeverCancel).expect("stage");
+    repo.index()
+        .stage_for_commit(&mut NullProgress, &CancelToken::never())
+        .expect("stage");
     let ident = "T <t@example.com> 1 +0000".to_string();
-    create_commit(
-        repo,
-        &CommitRequest {
-            message: "c1".into(),
-            author: Some(ident.parse().expect("signature")),
-            committer: Some(ident.parse().expect("signature")),
-            allow_empty: false,
-            sign_override: None,
-            amend: false,
-            assume_worktree_synced: false,
-            ..Default::default()
-        },
-        &mut NullProgress,
-        &NeverCancel,
-    )
-    .expect("commit")
-    .oid
+    repo.commits()
+        .create_staged(
+            &{
+                let mut req = CommitRequest::new("c1");
+                req.author = Some(ident.parse().expect("signature"));
+                req.committer = Some(ident.parse().expect("signature"));
+                req.allow_empty = false;
+                req.sign_override = None;
+                req.amend = false;
+                req.assume_worktree_synced = false;
+                req
+            },
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("commit")
+        .oid
 }
 
 fn grit_fsck(repo: &Repository, opts: &FsckOptions) -> fsck::FsckReport {
-    fsck::fsck(repo, opts, &mut NullProgress, &NeverCancel).expect("grit fsck")
+    repo.maintenance()
+        .fsck(opts, &mut NullProgress, &CancelToken::never())
+        .expect("grit fsck")
 }
 
 fn git_dangling_set(root: &std::path::Path) -> Vec<(ObjectKind, ObjectId)> {
@@ -211,7 +224,7 @@ fn clean_repo_has_no_issues_and_git_agrees() {
     one_commit(&repo);
     let git_out = git_fsck(dir.path(), true);
     assert!(git_out.msg_ids.is_empty(), "{:?}", git_out.msg_ids);
-    let config = repo.config().expect("config");
+    let config = repo.config().snapshot().expect("config");
     let report = grit_fsck(&repo, &FsckOptions::full_repository(true));
     assert!(report.ok(&config, &FsckOptions::full_repository(true)));
     assert!(report.issues.is_empty());
@@ -266,7 +279,7 @@ fn legacy_tree_mode_100664_blob_still_reachable_like_git() {
         "git fsck --full should accept legacy 100664 trees"
     );
 
-    let config = repo.config().expect("config");
+    let config = repo.config().snapshot().expect("config");
     let opts = FsckOptions::full_repository(false);
     let report = grit_fsck(&repo, &opts);
     assert!(
@@ -345,7 +358,7 @@ fn legacy_tree_mode_100664_in_pack_still_reachable() {
         "legacy tree must exist only in pack"
     );
 
-    let config = repo.config().expect("config");
+    let config = repo.config().snapshot().expect("config");
     let opts = FsckOptions::full_repository(false);
     let report = grit_fsck(&repo, &opts);
     assert!(
@@ -378,24 +391,26 @@ fn fsck_passes_on_deltified_pack_after_many_commits() {
     for i in 0..50 {
         let wt = repo.work_tree().expect("wt");
         std::fs::write(wt.join(format!("file-{i}.txt")), format!("payload {i}\n")).expect("write");
-        stage_for_commit(&repo, &mut NullProgress, &NeverCancel).expect("stage");
+        repo.index()
+            .stage_for_commit(&mut NullProgress, &CancelToken::never())
+            .expect("stage");
         let ident = "T <t@example.com> 1 +0000".to_string();
-        create_commit(
-            &repo,
-            &CommitRequest {
-                message: format!("commit {i}"),
-                author: Some(ident.parse().expect("signature")),
-                committer: Some(ident.parse().expect("signature")),
-                allow_empty: false,
-                sign_override: None,
-                amend: false,
-                assume_worktree_synced: false,
-                ..Default::default()
-            },
-            &mut NullProgress,
-            &NeverCancel,
-        )
-        .expect("commit");
+        repo.commits()
+            .create_staged(
+                &{
+                    let mut req = CommitRequest::new(format!("commit {i}"));
+                    req.author = Some(ident.parse().expect("signature"));
+                    req.committer = Some(ident.parse().expect("signature"));
+                    req.allow_empty = false;
+                    req.sign_override = None;
+                    req.amend = false;
+                    req.assume_worktree_synced = false;
+                    req
+                },
+                &mut NullProgress,
+                &CancelToken::never(),
+            )
+            .expect("commit");
     }
     git(dir.path(), &["repack", "-adf"]);
     let git_out = git_fsck(dir.path(), false);
@@ -404,7 +419,7 @@ fn fsck_passes_on_deltified_pack_after_many_commits() {
         "git fsck must pass on deltified pack: {:?}",
         git_out.msg_ids
     );
-    let config = repo.config().expect("config");
+    let config = repo.config().snapshot().expect("config");
     let opts = FsckOptions::full_repository(false);
     let report = grit_fsck(&repo, &opts);
     assert!(
@@ -430,24 +445,26 @@ fn fsck_reports_corrupt_deltified_object_and_still_checks_pack() {
     for i in 0..50 {
         let wt = repo.work_tree().expect("wt");
         std::fs::write(wt.join(format!("file-{i}.txt")), format!("payload {i}\n")).expect("write");
-        stage_for_commit(&repo, &mut NullProgress, &NeverCancel).expect("stage");
+        repo.index()
+            .stage_for_commit(&mut NullProgress, &CancelToken::never())
+            .expect("stage");
         let ident = "T <t@example.com> 1 +0000".to_string();
-        create_commit(
-            &repo,
-            &CommitRequest {
-                message: format!("commit {i}"),
-                author: Some(ident.parse().expect("signature")),
-                committer: Some(ident.parse().expect("signature")),
-                allow_empty: false,
-                sign_override: None,
-                amend: false,
-                assume_worktree_synced: false,
-                ..Default::default()
-            },
-            &mut NullProgress,
-            &NeverCancel,
-        )
-        .expect("commit");
+        repo.commits()
+            .create_staged(
+                &{
+                    let mut req = CommitRequest::new(format!("commit {i}"));
+                    req.author = Some(ident.parse().expect("signature"));
+                    req.committer = Some(ident.parse().expect("signature"));
+                    req.allow_empty = false;
+                    req.sign_override = None;
+                    req.amend = false;
+                    req.assume_worktree_synced = false;
+                    req
+                },
+                &mut NullProgress,
+                &CancelToken::never(),
+            )
+            .expect("commit");
     }
     git(dir.path(), &["repack", "-adf"]);
 
@@ -514,7 +531,7 @@ fn nested_annotated_tags_pass_fsck_with_cached_links() {
     let git_out = git_fsck(dir.path(), false);
     assert!(git_out.msg_ids.is_empty(), "{:?}", git_out.msg_ids);
     let opts = FsckOptions::full_repository(false).with_check_dangling(false);
-    let config = repo.config().expect("config");
+    let config = repo.config().snapshot().expect("config");
     let report = grit_fsck(&repo, &opts);
     assert!(
         report.ok(&config, &opts),
@@ -576,7 +593,9 @@ fn missing_blob_reported_as_missing_object() {
     one_commit(&repo);
     let wt = repo.work_tree().expect("wt");
     std::fs::write(wt.join("orphan.txt"), b"x").expect("write");
-    stage_for_commit(&repo, &mut NullProgress, &NeverCancel).expect("stage");
+    repo.index()
+        .stage_for_commit(&mut NullProgress, &CancelToken::never())
+        .expect("stage");
     let index = Index::load(&repo.git_dir().join("index")).expect("index");
     let staged = index
         .entries()
@@ -606,6 +625,13 @@ fn missing_blob_reported_as_missing_object() {
         .filter(|i| fsck::issue_msg_id(i) == "missingObject")
         .count();
     assert_eq!(missing_count, 1, "{:?}", report.issues);
+
+    let conn = grit_fsck(&repo, &FsckOptions::connectivity_and_refs(false));
+    assert!(
+        has_msg_id(&conn, "missingObject"),
+        "connectivity-only must still report missing blob: {:?}",
+        conn.issues
+    );
 }
 
 #[test]
@@ -640,7 +666,7 @@ fn gitmodules_invalid_path_matches_git() {
         "{:?}",
         git_out.msg_ids
     );
-    let config = repo.config().expect("config");
+    let config = repo.config().snapshot().expect("config");
     let report = grit_fsck(&repo, &FsckOptions::full_repository(false));
     assert!(has_msg_id(&report, "gitmodulesPath"), "{:?}", report.issues);
     assert!(!report.ok(&config, &FsckOptions::full_repository(false)));
@@ -805,7 +831,7 @@ fn idx_oid_content_mismatch_returns_fsck_report_not_error() {
         perms.set_readonly(false);
         fs::set_permissions(path, perms).expect("chmod");
     }
-    write_v2_pack_index_with_trailer(&idx_path, &rows, trailer, 20, None).expect("rewrite idx");
+    write_v2_pack_index_from_trailer(&idx_path, &rows, trailer, 20, None).expect("rewrite idx");
     repo.odb().invalidate_packs();
 
     let git_text = git(dir.path(), &["fsck", "--no-dangling"]);
@@ -903,7 +929,7 @@ fn corrupt_idx_trailer_is_idx_mismatch() {
     );
     assert!(matches!(
         read_pack_index(&idx),
-        Err(grit_lib::error::Error::PackIndexChecksumMismatch { ref path, .. }) if *path == idx
+        Err(grit_lib::error::Error::Object(ObjectError::PackIndexChecksumMismatch { ref path, .. })) if *path == idx
     ));
     let report = grit_fsck(&repo, &FsckOptions::full_repository(false));
     assert!(
@@ -931,7 +957,7 @@ fn bad_pack_signature_is_pack_issue_regardless_of_path() {
     let tmp = TempDir::new().expect("tempdir");
     let root = tmp.path().join("index-checksum-repo");
     fs::create_dir(&root).expect("mkdir");
-    let repo = Repository::init(&root, &InitOptions::default()).expect("init");
+    let (repo, _) = Repository::init(&root, &InitOptions::default()).expect("init");
     one_commit(&repo);
     let (_idx, pack) = git_repack_single_pack(&root);
     let mut bytes = fs::read(&pack).expect("read pack");
@@ -1002,6 +1028,154 @@ fn dangling_commit_and_blob() {
     assert_eq!(
         grit_set, git_set,
         "dangling mismatch git={git_set:?} grit={grit_set:?}"
+    );
+}
+
+fn empty_tree_oid(dir: &std::path::Path) -> ObjectId {
+    let out = Command::new("git")
+        .current_dir(dir)
+        .args(["hash-object", "-w", "-t", "tree", "--stdin"])
+        .stdin(std::process::Stdio::from(
+            std::fs::File::open("/dev/null").expect("open /dev/null"),
+        ))
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .output()
+        .expect("empty tree");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    ObjectId::from_hex(String::from_utf8_lossy(&out.stdout).trim()).expect("tree oid")
+}
+
+fn bad_parent_reachable_commit_body(dir: &std::path::Path) -> Vec<u8> {
+    format!("tree {}\nparent zzzz\n", empty_tree_oid(dir).to_hex()).into_bytes()
+}
+
+#[test]
+fn malformed_reachable_commit_bad_parent_does_not_panic() {
+    let (dir, repo) = init_repo();
+    one_commit(&repo);
+    let bad_hex = git_hash_object_literally(
+        dir.path(),
+        FixtureAlgo::Sha1,
+        "commit",
+        &bad_parent_reachable_commit_body(dir.path()),
+    )
+    .expect("literally write commit");
+    let bad = ObjectId::from_hex(bad_hex.trim()).expect("parse oid");
+    write_ref_loose(dir.path(), "refs/heads/bad", bad);
+    let git_out = Command::new("git")
+        .current_dir(dir.path())
+        .args(["fsck"])
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .output()
+        .expect("git fsck");
+    assert!(
+        !git_out.status.success(),
+        "git fsck must fail on bad parent"
+    );
+    let report = grit_fsck(&repo, &FsckOptions::full_repository(false));
+    assert!(
+        !report.ok(
+            &repo.config().snapshot().expect("config"),
+            &FsckOptions::full_repository(false)
+        ),
+        "fsck must not pass with bad parent commit"
+    );
+    assert!(
+        report.issues.iter().any(|i| {
+            matches!(
+                i,
+                FsckIssue::BadObject { oid, error }
+                    if oid == &bad && error.id == "badParentSha1"
+            )
+        }),
+        "bad parent commit must surface as badParentSha1: {:?}",
+        report.issues
+    );
+}
+
+#[test]
+fn malformed_reachable_commit_truncated_parent_header_does_not_panic() {
+    let (dir, repo) = init_repo();
+    one_commit(&repo);
+    let tree = empty_tree_oid(dir.path());
+    let body = format!("tree {}\nparent ", tree.to_hex());
+    assert_eq!(body.len(), 53, "truncation point for parent header");
+    let bad_hex =
+        git_hash_object_literally(dir.path(), FixtureAlgo::Sha1, "commit", body.as_bytes())
+            .expect("literally write commit");
+    let bad = ObjectId::from_hex(bad_hex.trim()).expect("parse oid");
+    write_ref_loose(dir.path(), "refs/heads/bad", bad);
+    let report = grit_fsck(&repo, &FsckOptions::full_repository(false));
+    assert!(
+        report.issues.iter().any(|i| {
+            matches!(
+                i,
+                FsckIssue::BadObject { oid, error }
+                    if oid == &bad && error.id == "unterminatedHeader"
+            )
+        }),
+        "truncated parent header must surface as unterminatedHeader: {:?}",
+        report.issues
+    );
+}
+
+#[test]
+fn malformed_unreachable_commit_bad_parent_is_bad_object() {
+    let (dir, repo) = init_repo();
+    one_commit(&repo);
+    let bad_hex = git_hash_object_literally(
+        dir.path(),
+        FixtureAlgo::Sha1,
+        "commit",
+        &bad_parent_reachable_commit_body(dir.path()),
+    )
+    .expect("literally write commit");
+    let bad = ObjectId::from_hex(bad_hex.trim()).expect("parse oid");
+    let report = grit_fsck(&repo, &FsckOptions::full_repository(false));
+    assert!(
+        report.issues.iter().any(|i| {
+            matches!(
+                i,
+                FsckIssue::BadObject { oid, error }
+                    if oid == &bad && error.id == "badParentSha1"
+            )
+        }),
+        "unreachable bad parent commit must be reported: {:?}",
+        report.issues
+    );
+}
+
+#[test]
+fn malformed_unreachable_commit_bad_parent_in_pack_does_not_panic() {
+    let (dir, repo) = init_repo();
+    one_commit(&repo);
+    let bad_hex = git_hash_object_literally(
+        dir.path(),
+        FixtureAlgo::Sha1,
+        "commit",
+        &bad_parent_reachable_commit_body(dir.path()),
+    )
+    .expect("literally write commit");
+    let bad = ObjectId::from_hex(bad_hex.trim()).expect("parse oid");
+    pack_loose_object_and_remove_loose(dir.path(), bad);
+    repo.odb().invalidate_packs();
+    let report = grit_fsck(&repo, &FsckOptions::full_repository(false));
+    assert!(
+        report.issues.iter().any(|i| {
+            matches!(
+                i,
+                FsckIssue::BadObject { oid, error }
+                    if oid == &bad && error.id == "badParentSha1"
+            )
+        }),
+        "packed bad parent commit must be reported: {:?}",
+        report.issues
     );
 }
 
@@ -1256,6 +1430,18 @@ fn commit_tree_wrong_kind_matches_git() {
         "wrong tree kind must be reported: {:?}",
         report.issues
     );
+
+    let conn = grit_fsck(&repo, &FsckOptions::connectivity_and_refs(false));
+    assert!(
+        conn.issues.iter().any(|i| {
+            matches!(
+                i,
+                FsckIssue::BrokenLink { target, .. } if target == &blob
+            )
+        }),
+        "connectivity-only must report wrong tree kind: {:?}",
+        conn.issues
+    );
 }
 
 #[test]
@@ -1327,7 +1513,9 @@ fn reflog_and_index_roots_are_not_dangling() {
     git(dir.path(), &["commit", "--allow-empty", "-m", "e2"]);
     git(dir.path(), &["reset", "--hard", "HEAD~1"]);
     std::fs::write(repo.work_tree().expect("wt").join("idx-only"), b"z").expect("write");
-    stage_for_commit(&repo, &mut NullProgress, &NeverCancel).expect("stage");
+    repo.index()
+        .stage_for_commit(&mut NullProgress, &CancelToken::never())
+        .expect("stage");
 
     let git_set = git_dangling_set(dir.path());
     let report = grit_fsck(
@@ -1356,6 +1544,146 @@ fn reflog_and_index_roots_are_not_dangling() {
     }
     let grit_set = grit_dangling_set(&report);
     assert_eq!(grit_set, git_set);
+}
+
+/// Regression for issue #2396: injected ref stores must contribute reflog reachability roots.
+#[test]
+fn injected_ref_store_reflog_roots_are_not_dangling() {
+    fn scenario(label: &str, repo: &Repository) -> ObjectId {
+        let sig = Signature::new(
+            "T",
+            "t@example.com",
+            OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("time"),
+        )
+        .expect("sig");
+        let tree = repo.odb().write(ObjectKind::Tree, &[]).expect("tree");
+        let c1 = repo
+            .objects()
+            .write_commit(&NewCommit::new(
+                tree,
+                sig.clone(),
+                sig.clone(),
+                "c1".to_string(),
+            ))
+            .expect("c1");
+        let c2 = repo
+            .objects()
+            .write_commit(&NewCommit::new(
+                tree,
+                sig.clone(),
+                sig.clone(),
+                "c2".to_string(),
+            ))
+            .expect("c2");
+        let side = repo
+            .objects()
+            .write_commit(&NewCommit::new(
+                tree,
+                sig.clone(),
+                sig.clone(),
+                "side".to_string(),
+            ))
+            .expect("side");
+        let ts = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("time");
+        let identity = "T <t@example.com>";
+        let mut update = |new, exp, msg: &str| {
+            let txn = RefTransaction::new()
+                .update(RefUpdate {
+                    name: "refs/heads/main".into(),
+                    new_value: Some(RawRef::Direct(new)),
+                    expected: exp,
+                    flags: Default::default(),
+                    reflog: Some(ReflogUpdate {
+                        identity: identity.into(),
+                        message: msg.into(),
+                        time: ts,
+                        old_oid: None,
+                        new_oid: None,
+                    }),
+                })
+                .expect("txn");
+            repo.ref_store()
+                .prepare(txn)
+                .expect("prepare")
+                .commit()
+                .expect("commit");
+        };
+        update(c1, Expected::Missing, "branch: Created");
+        update(c2, Expected::Oid(c1), "reset: moving to c2");
+        let side_txn = RefTransaction::new()
+            .update(RefUpdate {
+                name: "refs/heads/feature".into(),
+                new_value: Some(RawRef::Direct(side)),
+                expected: Expected::Missing,
+                flags: Default::default(),
+                reflog: Some(ReflogUpdate {
+                    identity: identity.into(),
+                    message: "branch: Created".into(),
+                    time: ts,
+                    old_oid: None,
+                    new_oid: None,
+                }),
+            })
+            .expect("side txn");
+        repo.ref_store()
+            .prepare(side_txn)
+            .expect("prepare side")
+            .commit()
+            .expect("commit side");
+
+        let roots = repo.maintenance().reachability_roots().expect("roots");
+        assert!(
+            roots.contains(&c1),
+            "{label}: reflog-only commit must be a root"
+        );
+        assert!(
+            roots.contains(&side),
+            "{label}: side branch tip must be a root"
+        );
+
+        let report = grit_fsck(
+            repo,
+            &FsckOptions::full_repository(false).with_check_dangling(true),
+        );
+        assert!(
+            !report.dangling.iter().any(|(_, oid)| *oid == c1),
+            "{label}: c1 must not be dangling: {:?}",
+            report.dangling
+        );
+        assert!(
+            !report.dangling.iter().any(|(_, oid)| *oid == side),
+            "{label}: side branch must not be dangling: {:?}",
+            report.dangling
+        );
+        c1
+    }
+
+    let files_dir = TempDir::new().expect("tempdir");
+    let (files_repo, _) = Repository::init(
+        files_dir.path(),
+        &InitOptions::new().with_initial_branch("main"),
+    )
+    .expect("init files");
+    let c1_files = scenario("files backend", &files_repo);
+
+    let mem_root = TempDir::new().expect("mem tempdir");
+    let gd = mem_root.path().join("mem.git");
+    fs::create_dir_all(&gd).expect("git dir");
+    let mem_repo = Repository::open(
+        &gd,
+        &(RepositoryOptions::empty()
+            .with_object_store(Arc::new(MemoryStore::new(HashAlgo::Sha1)))
+            .with_ref_store(Arc::new(MemoryRefStore::new()))
+            .with_initial_branch("main")),
+    )
+    .expect("memory repo");
+    scenario("MemoryStore + MemoryRefStore", &mem_repo);
+
+    let git_text = git(files_dir.path(), &["fsck"]);
+    assert!(
+        !git_text.contains(&c1_files.to_hex()),
+        "system git must not report reflog-only commit as dangling: {git_text}"
+    );
 }
 
 #[test]
@@ -1432,24 +1760,26 @@ fn fsck_commit_with_multibyte_name_at_byte_six() {
     let (dir, repo) = init_repo();
     let wt = repo.work_tree().expect("wt");
     std::fs::write(wt.join("abcde日.txt"), b"x\n").expect("write");
-    stage_for_commit(&repo, &mut NullProgress, &NeverCancel).expect("stage");
+    repo.index()
+        .stage_for_commit(&mut NullProgress, &CancelToken::never())
+        .expect("stage");
     let ident = "T <t@example.com> 1 +0000".to_string();
-    create_commit(
-        &repo,
-        &CommitRequest {
-            message: "one".into(),
-            author: Some(ident.parse().expect("signature")),
-            committer: Some(ident.parse().expect("signature")),
-            allow_empty: false,
-            sign_override: None,
-            amend: false,
-            assume_worktree_synced: false,
-            ..Default::default()
-        },
-        &mut NullProgress,
-        &NeverCancel,
-    )
-    .expect("commit");
+    repo.commits()
+        .create_staged(
+            &{
+                let mut req = CommitRequest::new("one");
+                req.author = Some(ident.parse().expect("signature"));
+                req.committer = Some(ident.parse().expect("signature"));
+                req.allow_empty = false;
+                req.sign_override = None;
+                req.amend = false;
+                req.assume_worktree_synced = false;
+                req
+            },
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("commit");
 
     let git_out = git_fsck(dir.path(), true);
     assert!(
@@ -1591,7 +1921,7 @@ fn fsck_resolves_deep_ofs_chain_and_in_pack_ref_delta() {
         "git fsck: {:?}",
         git_out.msg_ids
     );
-    let config = repo.config().expect("config");
+    let config = repo.config().snapshot().expect("config");
     let opts = FsckOptions::full_repository(true);
     let report = grit_fsck(&repo, &opts);
     assert!(report.issues.is_empty(), "{:?}", report.issues);
@@ -1681,7 +2011,7 @@ fn diagnostic_summary_matches_git_for_grit_objects_and_git_tag() {
     let tag = git_hash_object_literally(dir.path(), FixtureAlgo::Sha1, "tag", tag_body.as_bytes())
         .expect("Git writes tag without tagger");
     git(dir.path(), &["update-ref", "refs/tags/summary-probe", &tag]);
-    let config = repo.config().expect("config");
+    let config = repo.config().snapshot().expect("config");
     for strict in [false, true] {
         let options = FsckOptions::full_repository(strict);
         let report = grit_fsck(&repo, &options);
@@ -1713,7 +2043,7 @@ fn diagnostic_summary_matches_git_for_grit_objects_and_git_tag() {
     }
 
     git(dir.path(), &["config", "fsck.missingTaggerEntry", "error"]);
-    let config = repo.config().expect("updated config");
+    let config = repo.config().snapshot().expect("updated config");
     let options = FsckOptions::full_repository(false);
     let report = grit_fsck(&repo, &options);
     let summary = report.summary(&config, &options, false);
@@ -1728,4 +2058,235 @@ fn diagnostic_summary_matches_git_for_grit_objects_and_git_tag() {
         .expect("promoted tag diagnostic");
     assert_eq!(diagnostic.severity, fsck::FsckSeverity::Error);
     assert!(diagnostic.visible);
+}
+
+#[test]
+fn connectivity_only_dangling_excludes_reachable_blobs_in_bare_repo() {
+    let dir = TempDir::new().expect("tempdir");
+    let (repo, _) = Repository::init(
+        dir.path(),
+        &InitOptions::new()
+            .with_bare(true)
+            .with_initial_branch("main"),
+    )
+    .expect("init bare");
+    assert!(repo.work_tree().is_none());
+
+    let blob = repo
+        .odb()
+        .write(ObjectKind::Blob, b"hello\n")
+        .expect("blob");
+    let mut tree_body = b"100644 f.txt\0".to_vec();
+    tree_body.extend_from_slice(blob.as_bytes());
+    let tree = repo
+        .odb()
+        .write(ObjectKind::Tree, &tree_body)
+        .expect("tree");
+    let commit_body = format!(
+        "tree {}\nauthor T <t@example.com> 1 +0000\ncommitter T <t@example.com> 1 +0000\n\nm\n",
+        tree.to_hex()
+    );
+    let commit = repo
+        .odb()
+        .write(ObjectKind::Commit, commit_body.as_bytes())
+        .expect("commit");
+
+    let tag_body = format!(
+        "object {}\ntype blob\ntag v1.0\ntagger T <t@example.com> 1 +0000\n\nannotated\n",
+        blob.to_hex()
+    );
+    let tag = repo
+        .odb()
+        .write(ObjectKind::Tag, tag_body.as_bytes())
+        .expect("tag");
+
+    let ts = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("time");
+    let identity = "T <t@example.com>";
+    for (name, oid) in [("refs/heads/main", commit), ("refs/tags/v1.0", tag)] {
+        repo.ref_store()
+            .prepare(
+                RefTransaction::new()
+                    .update(RefUpdate {
+                        name: name.into(),
+                        new_value: Some(RawRef::Direct(oid)),
+                        expected: Expected::Missing,
+                        flags: Default::default(),
+                        reflog: Some(ReflogUpdate {
+                            identity: identity.into(),
+                            message: "test".into(),
+                            time: ts,
+                            old_oid: None,
+                            new_oid: None,
+                        }),
+                    })
+                    .expect("txn"),
+            )
+            .expect("prepare")
+            .commit()
+            .expect("commit ref");
+    }
+
+    let opts = FsckOptions::connectivity_and_refs(false).with_check_dangling(true);
+    let report = grit_fsck(&repo, &opts);
+    assert!(
+        report.dangling.is_empty(),
+        "reachable blobs must not be listed as dangling: {:?}",
+        report.dangling
+    );
+
+    let git_text = git(dir.path(), &["fsck", "--connectivity-only", "--dangling"]);
+    assert!(
+        !git_text.contains("dangling blob"),
+        "git baseline should not report reachable blob as dangling: {git_text}"
+    );
+}
+
+#[test]
+fn connectivity_only_does_not_inflate_reachable_blob_bodies() {
+    use std::ops::ControlFlow;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use grit_lib::objects::odb::{ObjectStore, WritableObjectStore, WriteOptions};
+    use grit_lib::objects::{Object, ObjectInfo};
+
+    #[derive(Debug)]
+    struct BlobReadCounter {
+        inner: MemoryStore,
+        blob_payload_reads: AtomicUsize,
+    }
+
+    impl BlobReadCounter {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                inner: MemoryStore::new(HashAlgo::Sha1),
+                blob_payload_reads: AtomicUsize::new(0),
+            })
+        }
+
+        fn note_payload(&self, kind: Option<ObjectKind>) {
+            if kind == Some(ObjectKind::Blob) {
+                self.blob_payload_reads.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    impl ObjectStore for BlobReadCounter {
+        fn hash_algo(&self) -> HashAlgo {
+            self.inner.hash_algo()
+        }
+
+        fn read(&self, oid: &ObjectId) -> grit_lib::error::Result<Option<Object>> {
+            let obj = self.inner.read(oid)?;
+            self.note_payload(obj.as_ref().map(|o| o.kind));
+            Ok(obj)
+        }
+
+        fn read_into(
+            &self,
+            oid: &ObjectId,
+            buf: &mut Vec<u8>,
+        ) -> grit_lib::error::Result<Option<ObjectKind>> {
+            let kind = self.inner.read_into(oid, buf)?;
+            self.note_payload(kind);
+            Ok(kind)
+        }
+
+        fn read_info(&self, oid: &ObjectId) -> grit_lib::error::Result<Option<ObjectInfo>> {
+            self.inner.read_info(oid)
+        }
+
+        fn for_each_object(
+            &self,
+            f: &mut dyn FnMut(&ObjectId) -> ControlFlow<()>,
+        ) -> grit_lib::error::Result<()> {
+            self.inner.for_each_object(f)
+        }
+    }
+
+    impl WritableObjectStore for BlobReadCounter {
+        fn write(
+            &self,
+            kind: ObjectKind,
+            data: &[u8],
+            options: WriteOptions,
+        ) -> grit_lib::error::Result<ObjectId> {
+            self.inner.write(kind, data, options)
+        }
+
+        fn freshen(&self, oid: &ObjectId) -> grit_lib::error::Result<bool> {
+            self.inner.freshen(oid)
+        }
+    }
+
+    let tmp = TempDir::new().expect("tempdir");
+    let gd = tmp.path().join("repo.git");
+    fs::create_dir_all(&gd).expect("git dir");
+    let store = BlobReadCounter::new();
+    let mut tree_body = Vec::new();
+    for i in 0..32 {
+        let payload = format!("payload-{i}\n");
+        let blob = store
+            .write(
+                ObjectKind::Blob,
+                payload.as_bytes(),
+                WriteOptions::default(),
+            )
+            .expect("blob");
+        tree_body.extend_from_slice(format!("100644 f{i}.txt\0").as_bytes());
+        tree_body.extend_from_slice(blob.as_bytes());
+    }
+    let tree = store
+        .write(ObjectKind::Tree, &tree_body, WriteOptions::default())
+        .expect("tree");
+    let commit_body = format!(
+        "tree {}\nauthor T <t@example.com> 1 +0000\ncommitter T <t@example.com> 1 +0000\n\ninit\n",
+        tree.to_hex()
+    );
+    let commit = store
+        .write(
+            ObjectKind::Commit,
+            commit_body.as_bytes(),
+            WriteOptions::default(),
+        )
+        .expect("commit");
+
+    let repo = Repository::open(
+        &gd,
+        &(RepositoryOptions::empty()
+            .with_object_store(store.clone())
+            .with_ref_store(Arc::new(MemoryRefStore::new()))
+            .with_initial_branch("main")),
+    )
+    .expect("open");
+
+    let ts = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("time");
+    repo.ref_store()
+        .prepare(
+            RefTransaction::new()
+                .update(RefUpdate {
+                    name: "refs/heads/main".into(),
+                    new_value: Some(RawRef::Direct(commit)),
+                    expected: Expected::Missing,
+                    flags: Default::default(),
+                    reflog: Some(ReflogUpdate {
+                        identity: "T <t@example.com>".into(),
+                        message: "init".into(),
+                        time: ts,
+                        old_oid: None,
+                        new_oid: None,
+                    }),
+                })
+                .expect("txn"),
+        )
+        .expect("prepare")
+        .commit()
+        .expect("commit ref");
+
+    let report = grit_fsck(&repo, &FsckOptions::connectivity_and_refs(false));
+    assert!(report.issues.is_empty(), "{:?}", report.issues);
+    assert_eq!(
+        store.blob_payload_reads.load(Ordering::Relaxed),
+        0,
+        "connectivity-only must not load blob bodies during the walk"
+    );
 }

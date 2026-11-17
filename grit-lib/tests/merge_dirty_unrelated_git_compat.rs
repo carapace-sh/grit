@@ -1,13 +1,17 @@
 //! Issue #1321: merge allows uncommitted edits on paths the merge does not touch.
 
+use grit_lib::worktree::WorktreeError;
 use std::process::Command;
 
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::error::{Error, OverwriteReason};
+use grit_lib::merge::IntegrateBranchOutcome;
 use grit_lib::objects::ObjectId;
-use grit_lib::porcelain::merge::{integrate_branch, IntegrateBranchOutcome};
+use grit_lib::progress::{CancelToken, NullProgress};
 use grit_lib::repo::Repository;
 use grit_test_support::git;
+use grit_test_support::integrate_branch;
+use grit_test_support::integrate_branch;
 
 fn grit_repo(tmp: &tempfile::TempDir) -> Repository {
     Repository::discover(Some(tmp.path()), &RepositoryOptions::empty()).expect("open grit repo")
@@ -71,7 +75,7 @@ fn merge_fast_forward_preserves_dirty_unrelated_path() {
         side_oid,
         "side",
         &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("merge");
     assert!(matches!(
@@ -124,15 +128,15 @@ fn merge_refuses_dirty_overlapping_path() {
         side_oid,
         "side",
         &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect_err("merge must refuse overlapping dirty path");
     match err {
-        Error::WouldOverwrite {
+        Error::Worktree(WorktreeError::WouldOverwrite {
             reason: OverwriteReason::LocalChanges,
             paths,
             ..
-        } => {
+        }) => {
             assert_eq!(paths, vec!["a.txt".to_owned()]);
         }
         other => panic!("unexpected error: {other:?}"),
@@ -185,15 +189,15 @@ fn merge_refuses_dirty_overlapping_paths_sorted() {
         side_oid,
         "side",
         &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect_err("merge must refuse overlapping dirty paths");
     match err {
-        Error::WouldOverwrite {
+        Error::Worktree(WorktreeError::WouldOverwrite {
             reason: OverwriteReason::LocalChanges,
             paths,
             ..
-        } => {
+        }) => {
             assert_eq!(paths, vec!["a.txt".to_owned(), "b.txt".to_owned()]);
         }
         other => panic!("unexpected error: {other:?}"),
@@ -236,7 +240,7 @@ fn merge_fast_forward_allows_worktree_deleted_unrelated_tracked_file() {
         side_oid,
         "side",
         &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("merge");
     assert!(

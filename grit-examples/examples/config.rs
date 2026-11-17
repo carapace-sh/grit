@@ -13,8 +13,9 @@ fn main() -> grit_lib::error::Result<()> {
 
     println!(
         "user.name = {}",
-        config.get("user.name").unwrap_or_default()
+        config.get("user.name")?.unwrap_or_default()
     );
-    println!("core.bare = {:?}", config.get_bool("core.bare"));
+    let bare = config.get_bool("core.bare")?;
+    println!("core.bare = {bare:?}");
     Ok(())
 }

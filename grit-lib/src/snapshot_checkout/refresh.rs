@@ -15,11 +15,12 @@ use crate::diff::{build_file_diffs, diff_trees, DiffDetail, DiffOptions, DiffTot
 use crate::fetch::Progress;
 use crate::merge_base::is_ancestor;
 use crate::objects::ObjectId;
+use crate::porcelain::branch_error::BranchError;
 use crate::porcelain::checkout_reflog::checkout_reflog_identity;
 use crate::porcelain::pull::{
     pull, FetchedUpstream, PullError, PullMode, PullOptions, PullOutcome,
 };
-use crate::progress::Cancel;
+use crate::progress::CancelToken;
 use crate::remote::HttpClientFactory;
 use crate::repo::Repository;
 use crate::state::{detect_in_progress, resolve_head_for_repository, HeadState};
@@ -27,9 +28,10 @@ use crate::transfer::TransferStats;
 
 use super::landing::{landed_base, prune_landed};
 use super::refs::{swap_ref_as, Swap};
+use super::transfer::fetch_snapshot;
 use super::{
-    branches_with_work, fetch_snapshot, give_change_ids, upstream_ref, CheckoutError, CheckoutInfo,
-    CheckoutMarker, Result, SnapshotRoot,
+    branches_with_work, give_change_ids, upstream_ref, CheckoutError, CheckoutInfo, CheckoutMarker,
+    Result, SnapshotRoot,
 };
 
 /// What a refresh did with `HEAD`.
@@ -104,70 +106,22 @@ pub struct RefreshOutcome {
     pub gave_change_ids: usize,
 }
 
-/// Refuse to refresh a checkout that is in the middle of an operation, such
-/// as a refresh's rebase that stopped on a conflict: that has to be
-/// continued or aborted first. Check this before asking the server for a new
-/// snapshot.
-///
-/// # Errors
-///
-/// [`CheckoutError::OperationInProgress`] naming the operation.
-pub fn ensure_refreshable(repo: &Repository) -> Result<()> {
+/// [`RepositorySnapshotCheckouts::ensure_refreshable`](crate::repo_handles::RepositorySnapshotCheckouts::ensure_refreshable) for `repo`.
+pub(crate) fn ensure_refreshable(repo: &Repository) -> Result<()> {
     match detect_in_progress(repo.git_dir()).into_iter().next() {
-        Some(operation) => Err(CheckoutError::OperationInProgress(operation)),
+        Some(operation) => Err(CheckoutError::OperationInProgress(operation).into()),
         None => Ok(()),
     }
 }
 
-/// Bring the checkout onto `info`, the snapshot the server answered
-/// [`super::CheckoutClient::update`] with.
-///
-/// 0. With `HEAD` on a branch, gives that branch's commits made with plain
-///    Git a change id ([`give_change_ids`]; not with `options.check`), so the
-///    rebase below keeps a key the server can match them by. Those moves are
-///    logged at the time of the repository handle's clock
-///    ([`Repository::identity_now`]), as the rebase's commits and reflog
-///    entries are.
-/// 1. Fetches the snapshot from the marker's URL into [`upstream_ref`] and
-///    records it in the marker ([`fetch_snapshot`]).
-/// 2. With `HEAD` on a branch, integrates the snapshot as [`pull`] does with
-///    `options` (a rebase unless `options.mode` says otherwise). A rebase that
-///    conflicts stops in a resumable rebase session
-///    ([`PullOptions::stop_on_conflict`]). Commits up to a tip that landed in
-///    the target ([`CheckoutMarker::landed`]) are not replayed: a branch with
-///    nothing above one moves to the snapshot keeping uncommitted changes
-///    ([`crate::porcelain::pull::PullResult::Landed`]), and one with commits
-///    above it rebases only those ([`FetchedUpstream::landed`]). With `HEAD`
-///    detached, nothing else moves.
-/// 3. Moves `refs/heads/<target>`, when it is not the current branch and has
-///    no commits of its own, to the new snapshot, and every other branch but
-///    the current one whose commits all landed (not with `options.check`).
-/// 4. Lists the other branches with work that still build on an older
-///    snapshot, and forgets landed tips no branch builds on any more (not
-///    with `options.check`).
-///
-/// # Parameters
-///
-/// - `repo`: the checkout.
-/// - `marker`: its marker as it is now.
-/// - `info`: the checkout as the server has it after the update.
-/// - `options`: how to integrate (mode, autostash, check) and the fetch's
-///   environment and threads; its remote, branch, fetch refspecs and
-///   upstream are replaced.
-/// - `progress`, `cancel`, `http_factory`: as for [`pull`].
-///
-/// # Errors
-///
-/// [`CheckoutError::OperationInProgress`] before anything is fetched, the
-/// errors of [`fetch_snapshot`], and [`CheckoutError::Pull`] when the branch
-/// could not be integrated (the new snapshot is fetched and recorded by then).
-pub fn refresh<P: Progress>(
+/// [`RepositorySnapshotCheckouts::refresh`](crate::repo_handles::RepositorySnapshotCheckouts::refresh) for `repo`.
+pub(crate) fn refresh<P: Progress>(
     repo: &Repository,
     marker: &CheckoutMarker,
     info: &CheckoutInfo,
     options: &PullOptions,
     progress: &mut P,
-    cancel: &dyn Cancel,
+    cancel: &CancelToken,
     http_factory: Option<&dyn HttpClientFactory>,
 ) -> Result<RefreshOutcome> {
     ensure_refreshable(repo)?;
@@ -341,8 +295,8 @@ fn follow_landed_branches(
         // A branch another worktree has checked out moves only with that worktree.
         match crate::worktree::ensure_branch_not_checked_out_in_any_worktree(repo, &name) {
             Ok(()) => {}
-            Err(crate::error::Error::BranchCheckedOutInWorktree { .. }) => continue,
-            Err(e) => return Err(e.into()),
+            Err(crate::error::Error::Branch(BranchError::CheckedOut { .. })) => continue,
+            Err(e) => return Err(e),
         }
         let refname = format!("refs/heads/{name}");
         let swapped = swap_ref_as(
@@ -398,7 +352,7 @@ fn snapshot_changes(
     let old_tree = odb.commit_tree(&previous)?;
     let new_tree = odb.commit_tree(&current)?;
     let entries = diff_trees(odb, Some(&old_tree), Some(&new_tree), "")?;
-    let config = repo.config()?;
+    let config = repo.config().snapshot()?;
     let files = build_file_diffs(
         odb,
         entries,
@@ -414,12 +368,12 @@ fn snapshot_changes(
 mod tests {
     use super::*;
     use crate::porcelain::pull::PullResult;
-    use crate::progress::NeverCancel;
     use crate::remote::fetch::NoProgress;
+    use crate::snapshot_checkout::landing::{move_off_landed_branch, record_landed, MovedOff};
     use crate::snapshot_checkout::testing::*;
     use crate::snapshot_checkout::{
-        land_integration, move_off_landed_branch, push_for_checkin, record_landed, target_ref,
-        CheckoutClient, IntegrateResponse, IntegrateStatus, Landing, MovedOff,
+        land_integration, push_for_checkin, target_ref, CheckoutClient, IntegrateResponse,
+        IntegrateStatus, Landing,
     };
     use crate::state::InProgressOperation;
 
@@ -430,7 +384,7 @@ mod tests {
             info,
             &PullOptions::default(),
             &mut NoProgress,
-            &NeverCancel,
+            &CancelToken::never(),
             None,
         )
     }
@@ -502,7 +456,7 @@ mod tests {
             &marker(&repo),
             &[("work".to_owned(), tip)],
             &mut NoProgress,
-            &NeverCancel,
+            &CancelToken::never(),
             None,
         )
         .expect("push");
@@ -639,13 +593,15 @@ mod tests {
         assert_eq!(marker(&repo).roots, info.roots);
         assert!(matches!(
             refreshed(&repo, &info),
-            Err(CheckoutError::OperationInProgress(
-                InProgressOperation::Rebase
+            Err(crate::error::Error::Remote(
+                crate::remote::RemoteError::Snapshot(CheckoutError::OperationInProgress(
+                    InProgressOperation::Rebase
+                ))
             ))
         ));
 
         let identity = "T <t@example.com> 0 +0000".parse().expect("signature");
-        crate::revwalk::history::abort_rebase(&repo, &identity).expect("abort");
+        repo.history().abort_rebase(&identity).expect("abort");
         assert!(ensure_refreshable(&repo).is_ok());
         assert_eq!(git(&co, &["rev-parse", "HEAD"]), given.to_hex());
     }
@@ -678,7 +634,9 @@ mod tests {
         .expect("rewind");
         assert!(matches!(
             refreshed(&repo, &later),
-            Err(CheckoutError::SnapshotMoved { .. })
+            Err(crate::error::Error::Remote(
+                crate::remote::RemoteError::Snapshot(CheckoutError::SnapshotMoved { .. })
+            ))
         ));
         assert_eq!(marker(&repo).roots, info.roots);
     }
@@ -691,9 +649,11 @@ mod tests {
 
     impl crate::transport::http::HttpClient for WorkNames {
         fn get(&self, url: &str, _: Option<&str>) -> crate::error::Result<Vec<u8>> {
-            Err(crate::error::Error::Message(format!(
-                "unexpected GET {url}"
-            )))
+            Err(crate::error::Error::from(
+                crate::remote::RemoteError::Http {
+                    detail: format!("unexpected GET {url}"),
+                },
+            ))
         }
 
         fn post(
@@ -704,9 +664,11 @@ mod tests {
             _: &[u8],
             _: Option<&str>,
         ) -> crate::error::Result<Vec<u8>> {
-            Err(crate::error::Error::Message(format!(
-                "unexpected POST {url}"
-            )))
+            Err(crate::error::Error::from(
+                crate::remote::RemoteError::Http {
+                    detail: format!("unexpected POST {url}"),
+                },
+            ))
         }
 
         fn send(
@@ -846,7 +808,11 @@ mod tests {
 
     impl crate::transport::http::HttpClient for Unreachable {
         fn get(&self, url: &str, _: Option<&str>) -> crate::error::Result<Vec<u8>> {
-            Err(crate::error::Error::Message(format!("{url}: unreachable")))
+            Err(crate::error::Error::from(
+                crate::remote::RemoteError::Http {
+                    detail: format!("{url}: unreachable"),
+                },
+            ))
         }
 
         fn post(
@@ -857,7 +823,11 @@ mod tests {
             _: &[u8],
             _: Option<&str>,
         ) -> crate::error::Result<Vec<u8>> {
-            Err(crate::error::Error::Message(format!("{url}: unreachable")))
+            Err(crate::error::Error::from(
+                crate::remote::RemoteError::Http {
+                    detail: format!("{url}: unreachable"),
+                },
+            ))
         }
     }
 

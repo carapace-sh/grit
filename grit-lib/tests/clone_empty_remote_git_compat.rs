@@ -2,9 +2,8 @@
 
 use std::process::Command;
 
-use grit_lib::progress::NeverCancel;
+use grit_lib::progress::CancelToken;
 use grit_lib::remote::clone::{clone, CloneOptions};
-use grit_lib::remote::fetch::NoProgress;
 
 fn git(cwd: &std::path::Path, args: &[&str]) {
     let out = Command::new("git")
@@ -35,7 +34,7 @@ fn clone_empty_bare_matches_git_fsck_and_config() {
     clone(
         CloneOptions::new(bare.to_string_lossy(), grit_dest.clone()),
         &mut NoProgress,
-        &NeverCancel,
+        &CancelToken::never(),
         None,
     )
     .expect("grit clone");
@@ -124,7 +123,7 @@ fn clone_unborn_advertised_trunk_with_populated_feature_matches_git() {
     clone(
         CloneOptions::new(bare.to_string_lossy(), grit_dest.clone()),
         &mut NoProgress,
-        &NeverCancel,
+        &CancelToken::never(),
         None,
     )
     .expect("grit clone");

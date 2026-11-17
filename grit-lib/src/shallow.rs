@@ -4,9 +4,11 @@ use crate::error::{Error, Result};
 use crate::objects::{parse_commit, ObjectId, ObjectKind};
 use crate::odb::Odb;
 use crate::pkt_line;
+use crate::repo::Repository;
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 /// A sentinel `deepen` depth requesting *complete* history, used to drive an
@@ -21,6 +23,47 @@ pub const INFINITE_DEPTH: u32 = 0x7fff_ffff;
 #[must_use]
 pub fn shallow_file_path(git_dir: &Path) -> PathBuf {
     crate::repo::common_git_dir_for_config(git_dir).join("shallow")
+}
+
+/// Cached shallow boundaries and graft parents for one repository operation.
+///
+/// Commits listed in `.git/shallow` behave as roots unless `.git/info/grafts`
+/// replaces their parents (same rules as revision walks).
+#[derive(Debug, Clone, Default)]
+pub struct EffectiveCommitParents {
+    shallow: HashSet<ObjectId>,
+    grafts: HashMap<ObjectId, Vec<ObjectId>>,
+}
+
+impl EffectiveCommitParents {
+    /// Load `.git/shallow` and `.git/info/grafts` once for a walk or diff batch.
+    #[must_use]
+    pub fn load(repo: &Repository) -> Self {
+        Self {
+            shallow: load_shallow_boundaries(repo.git_dir()),
+            grafts: crate::rev_parse::load_graft_parents(repo.git_dir()),
+        }
+    }
+
+    /// Parent OIDs to follow for history, diffs, and blame.
+    ///
+    /// Grafts override shallow cuts; object parents are used otherwise.
+    #[must_use]
+    pub fn for_commit(&self, commit_oid: ObjectId, object_parents: &[ObjectId]) -> Vec<ObjectId> {
+        if let Some(grafted) = self.grafts.get(&commit_oid) {
+            return grafted.clone();
+        }
+        if self.shallow.contains(&commit_oid) {
+            return Vec::new();
+        }
+        object_parents.to_vec()
+    }
+
+    /// Whether `commit_oid` has no effective parents (real root or shallow boundary).
+    #[must_use]
+    pub fn is_history_root(&self, commit_oid: ObjectId, object_parents: &[ObjectId]) -> bool {
+        self.for_commit(commit_oid, object_parents).is_empty()
+    }
 }
 
 /// Returns the set of commit OIDs recorded as shallow boundaries in `.git/shallow`.
@@ -50,7 +93,7 @@ pub fn load_shallow_boundaries(git_dir: &Path) -> HashSet<ObjectId> {
 
 /// Drop duplicate OIDs while preserving first-seen order.
 #[must_use]
-pub fn dedupe_shallow_list(ids: Vec<ObjectId>) -> Vec<ObjectId> {
+pub(crate) fn dedupe_shallow_list(ids: Vec<ObjectId>) -> Vec<ObjectId> {
     let mut seen = HashSet::new();
     ids.into_iter().filter(|oid| seen.insert(*oid)).collect()
 }
@@ -63,7 +106,7 @@ pub fn dedupe_shallow_list(ids: Vec<ObjectId>) -> Vec<ObjectId> {
 ///
 /// # Errors
 /// Returns an error if the `.git/shallow` file cannot be written.
-pub fn add_shallow_boundaries(
+pub(crate) fn add_shallow_boundaries(
     git_dir: &Path,
     new_boundaries: &HashSet<ObjectId>,
 ) -> std::io::Result<()> {
@@ -77,6 +120,43 @@ pub fn add_shallow_boundaries(
     let mut body = hexes.join("\n");
     body.push('\n');
     fs::write(shallow_file_path(git_dir), body)
+}
+
+/// Write the union of `receiver_grafts` and `client` to a temporary shallow file next to
+/// the repository's own, for hook scripts via `GIT_SHALLOW_FILE`.
+pub(crate) fn temporary_push_shallow_file(
+    git_dir: &Path,
+    receiver_grafts: &HashSet<ObjectId>,
+    client: &[ObjectId],
+) -> Result<tempfile::NamedTempFile> {
+    let mut hexes: Vec<String> = receiver_grafts
+        .iter()
+        .chain(client)
+        .map(ObjectId::to_hex)
+        .collect();
+    hexes.sort_unstable();
+    hexes.dedup();
+    let dir = shallow_file_path(git_dir)
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| git_dir.to_path_buf());
+    let mut file = tempfile::Builder::new()
+        .prefix("shallow_")
+        .tempfile_in(dir)?;
+    for hex in hexes {
+        writeln!(file, "{hex}")?;
+    }
+    file.flush()?;
+    Ok(file)
+}
+
+/// Environment entries that point hook scripts at a shallow-boundary file.
+pub(crate) fn git_shallow_hook_env(file: &Path) -> Result<Vec<(String, String)>> {
+    let path = std::path::absolute(file)?;
+    Ok(vec![(
+        "GIT_SHALLOW_FILE".to_owned(),
+        path.to_string_lossy().into_owned(),
+    )])
 }
 
 /// The shallow boundaries a pushing client announced with `shallow <oid>` lines, classified
@@ -269,7 +349,7 @@ pub fn load_shallow_oids(git_dir: &Path) -> Result<Vec<ObjectId>> {
 ///
 /// # Errors
 /// Returns an error if the `shallow` file cannot be read or written.
-pub fn apply_shallow_updates(
+pub(crate) fn apply_shallow_updates(
     git_dir: &Path,
     shallow: &[ObjectId],
     unshallow: &[ObjectId],
@@ -328,10 +408,7 @@ pub(crate) fn v2_primary_line_from_pkt(
             String::from_utf8_lossy(&bytes[1..]).trim_end().to_owned(),
         )),
         2 => Ok(None),
-        3 => Err(Error::Message(format!(
-            "remote error: {}",
-            String::from_utf8_lossy(&bytes[1..]).trim_end()
-        ))),
+        3 => Err(pkt_line::sideband_fatal(&bytes[1..])),
         _ => Ok(Some(payload.trim_end().to_owned())),
     }
 }
@@ -357,12 +434,14 @@ pub(crate) fn read_v2_fetch_primary_line(
 }
 
 /// `read_shallow_info_section` function.
-pub fn read_shallow_info_section(r: &mut dyn Read) -> Result<(Vec<ObjectId>, Vec<ObjectId>)> {
+pub(crate) fn read_shallow_info_section(
+    r: &mut dyn Read,
+) -> Result<(Vec<ObjectId>, Vec<ObjectId>)> {
     read_shallow_info_section_sideband(r, false)
 }
 
 /// Like [`read_shallow_info_section`], demuxing `sideband-all` section lines when `sideband_all`.
-pub fn read_shallow_info_section_sideband(
+pub(crate) fn read_shallow_info_section_sideband(
     r: &mut dyn Read,
     sideband_all: bool,
 ) -> Result<(Vec<ObjectId>, Vec<ObjectId>)> {
@@ -373,12 +452,10 @@ pub fn read_shallow_info_section_sideband(
             continue;
         }
         if let Some(rest) = line.strip_prefix("shallow ") {
-            let oid = ObjectId::from_hex(rest.trim())
-                .map_err(|_| Error::Message(format!("parse shallow oid {}", rest.trim())))?;
+            let oid = ObjectId::from_hex(rest.trim())?;
             shallow.push(oid);
         } else if let Some(rest) = line.strip_prefix("unshallow ") {
-            let oid = ObjectId::from_hex(rest.trim())
-                .map_err(|_| Error::Message(format!("parse unshallow oid {}", rest.trim())))?;
+            let oid = ObjectId::from_hex(rest.trim())?;
             unshallow.push(oid);
         }
     }
@@ -395,7 +472,7 @@ pub fn read_shallow_info_section_sideband(
 /// that already parses as a bare integer is passed through. Lifted from the CLI's
 /// `deepen_since_wire_value`.
 #[must_use]
-pub fn deepen_since_wire_value(since: &str) -> String {
+pub(crate) fn deepen_since_wire_value(since: &str) -> String {
     let since = since.trim();
     if since.parse::<u64>().is_ok() {
         return since.to_owned();
@@ -694,6 +771,32 @@ mod tests {
         apply_shallow_updates(git_dir, &[], &[b]).unwrap();
         assert!(!git_dir.join("shallow").exists());
         assert!(load_shallow_oids(git_dir).unwrap().is_empty());
+    }
+
+    #[test]
+    fn effective_parents_clear_shallow_and_honor_grafts() {
+        let dir = tempdir().unwrap();
+        let git_dir = dir.path();
+        let parent = oid(0x01);
+        let child = oid(0x02);
+        std::fs::write(git_dir.join("shallow"), format!("{}\n", child.to_hex())).unwrap();
+        let shallow_only = EffectiveCommitParents {
+            shallow: load_shallow_boundaries(git_dir),
+            grafts: HashMap::new(),
+        };
+        assert!(shallow_only.for_commit(child, &[parent]).is_empty());
+
+        std::fs::create_dir_all(git_dir.join("info")).unwrap();
+        std::fs::write(
+            git_dir.join("info/grafts"),
+            format!("{} {}\n", child.to_hex(), parent.to_hex()),
+        )
+        .unwrap();
+        let ctx = EffectiveCommitParents {
+            shallow: load_shallow_boundaries(git_dir),
+            grafts: crate::rev_parse::load_graft_parents(git_dir),
+        };
+        assert_eq!(ctx.for_commit(child, &[parent]), vec![parent]);
     }
 
     #[test]

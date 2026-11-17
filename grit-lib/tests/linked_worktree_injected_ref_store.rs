@@ -8,19 +8,19 @@ use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use grit_lib::command_runner::hooks::PostOperationHooks;
 use grit_lib::config::environment::{Environment, RepositoryOptions};
 use grit_lib::objects::odb::store::MemoryStore;
-use grit_lib::objects::odb::OdbBuilder;
 use grit_lib::objects::{HashAlgo, ObjectId};
-use grit_lib::porcelain::add::{stage, StageOptions};
-use grit_lib::porcelain::commit::{commit_with_scope, CommitScope};
-use grit_lib::porcelain::switch::{switch_repository, SwitchMode, SwitchOptions};
-use grit_lib::progress::{NeverCancel, NullProgress};
-use grit_lib::refs::store::{MemoryRefStore, RawRef, RefStore};
-use grit_lib::repo::{Repository, RepositoryBuilder};
-use grit_lib::state::{resolve_head_for_repository, HeadState};
+use grit_lib::porcelain::add::StageOptions;
+use grit_lib::porcelain::commit::CommitScope;
+use grit_lib::porcelain::switch::{SwitchMode, SwitchOptions};
+use grit_lib::progress::CancelToken;
+use grit_lib::progress::NullProgress;
+use grit_lib::refs::store::{MemoryRefStore, RawRef, RefNameRef, RefStore};
+use grit_lib::repo::Repository;
+use grit_lib::state::HeadState;
 use grit_lib::worktree::{AddLinkedWorktreeOptions, WorktreeBranch};
-use grit_lib::PostOperationHooks;
 
 const IDENT_TS: &str = "T <t@e.x> 1700000000 +0000";
 const USER_CONFIG: &str = "[user]\n\tname = T\n\temail = t@e.x\n";
@@ -60,36 +60,37 @@ fn open_on(
     refs: &Arc<MemoryRefStore>,
     odb: &Arc<MemoryStore>,
 ) -> Repository {
-    RepositoryBuilder::new(options())
-        .odb_builder(
-            OdbBuilder::files(common.join("objects"))
-                .primary(odb.clone())
-                .alternates(false),
-        )
-        .ref_store(refs.clone())
-        .initial_branch("main")
-        .open(git_dir, Some(work_tree))
-        .expect("open over injected stores")
+    Repository::open(
+        git_dir,
+        &(options()
+            .with_object_store(odb.clone())
+            .with_ref_store(refs.clone())
+            .with_initial_branch("main")
+            .with_work_tree(work_tree)),
+    )
+    .expect("open over injected stores")
 }
 
 fn commit_change(repo: &Repository, file: &Path, message: &str) -> ObjectId {
     fs::write(file, message).expect("write");
-    stage(
-        repo,
-        &StageOptions::default(),
-        &mut NullProgress,
-        &NeverCancel,
-    )
-    .expect("stage");
-    commit_with_scope(
-        repo,
-        &grit_test_support::commit_request(message, IDENT_TS),
-        CommitScope::Staged,
-        &mut NullProgress,
-        &NeverCancel,
-    )
-    .expect("commit")
-    .oid
+    repo.index()
+        .stage(
+            &StageOptions::default(),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("stage");
+    repo.commits()
+        .create(
+            &grit_lib::commits::CommitOptions::new(
+                grit_test_support::commit_request(message, IDENT_TS),
+                CommitScope::Staged,
+            ),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("commit")
+        .oid
 }
 
 /// Main worktree with one commit on `main` and a linked worktree on a new branch `feat`.
@@ -134,12 +135,12 @@ fn two_worktrees() -> Fixture {
 }
 
 fn stored(refs: &MemoryRefStore, name: &str) -> Option<RawRef> {
-    refs.read_raw(name).expect("read")
+    refs.read_raw(RefNameRef::from_trusted(name)).expect("read")
 }
 
 fn shared_head_reflog(refs: &MemoryRefStore) -> Vec<(ObjectId, ObjectId)> {
     let mut entries = Vec::new();
-    refs.for_each_reflog_entry("HEAD", false, &mut |entry| {
+    refs.for_each_reflog_entry(RefNameRef::from_trusted("HEAD"), false, &mut |entry| {
         entries.push((entry.old_oid, entry.new_oid));
         ControlFlow::Continue(())
     })
@@ -196,7 +197,7 @@ fn assert_commits_land_on_feat(fixture: &Fixture, linked: &Repository) {
         "ref: refs/heads/feat\n"
     );
     assert_eq!(
-        resolve_head_for_repository(linked).expect("linked HEAD"),
+        linked.references().head().expect("linked HEAD"),
         HeadState::Branch {
             refname: "refs/heads/feat".into(),
             short_name: "feat".into(),
@@ -219,10 +220,7 @@ fn builder_open_on_the_admin_dir_commits_onto_the_linked_branch() {
 #[test]
 fn open_linked_worktree_shares_the_injected_stores() {
     let fixture = two_worktrees();
-    let linked = fixture
-        .main
-        .open_linked_worktree(&fixture.admin, &fixture.linked)
-        .expect("open linked worktree");
+    let linked = open_handle(&fixture, &fixture.admin, &fixture.linked);
     assert_commits_land_on_feat(&fixture, &linked);
 }
 
@@ -266,17 +264,17 @@ fn the_main_git_dir_on_the_same_store_still_commits_onto_main() {
 }
 
 fn switch(repo: &Repository, mode: SwitchMode) {
-    switch_repository(
-        repo,
-        &SwitchOptions {
-            mode,
-            dry_run: false,
-            hooks: PostOperationHooks::Skip,
-        },
-        &mut NullProgress,
-        &NeverCancel,
-    )
-    .expect("switch");
+    repo.checkout()
+        .switch(
+            &SwitchOptions {
+                mode,
+                dry_run: false,
+                hooks: PostOperationHooks::Skip,
+            },
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("switch");
 }
 
 #[test]
@@ -298,7 +296,7 @@ fn detaching_and_switching_in_the_linked_worktree_leave_the_shared_head_alone() 
     );
     let detached = commit_change(&linked, &fixture.linked.join("c.txt"), "detached work");
     assert_eq!(
-        resolve_head_for_repository(&linked).expect("linked HEAD"),
+        linked.references().head().expect("linked HEAD"),
         HeadState::Detached { oid: detached }
     );
     assert_eq!(

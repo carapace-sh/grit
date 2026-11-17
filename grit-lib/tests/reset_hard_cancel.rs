@@ -3,16 +3,16 @@
 use crate::support;
 
 use grit_lib::index::write_tree::{write_tree_update_index, WriteTreeFlags};
+use grit_lib::objects;
 use grit_lib::objects::ObjectId;
-use grit_lib::porcelain::reset::{reset_to_commit, ResetMode, ResetOptions};
-use grit_lib::progress::{Cancel, FlagCancel, ProgressPhase, ProgressSink};
-use grit_lib::refs;
+use grit_lib::porcelain::reset::{ResetMode, ResetOptions};
+use grit_lib::progress::{CancelToken, ProgressPhase, ProgressSink};
+use grit_lib::refs::ref_storage::RefStorageFormat;
 use grit_lib::repo::{InitOptions, Repository};
-use grit_lib::{objects, RefStorageFormat};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 struct CancelHardResetOnFiles {
-    flag: FlagCancel,
+    flag: CancelToken,
     checkout_incs: AtomicU64,
     limit: u64,
     in_checkout: AtomicBool,
@@ -21,7 +21,7 @@ struct CancelHardResetOnFiles {
 impl CancelHardResetOnFiles {
     fn new(limit: u64) -> Self {
         Self {
-            flag: FlagCancel::new(),
+            flag: CancelToken::new(),
             checkout_incs: AtomicU64::new(0),
             limit,
             in_checkout: AtomicBool::new(false),
@@ -45,16 +45,6 @@ impl ProgressSink for CancelHardResetOnFiles {
             self.flag.cancel();
         }
     }
-
-    fn should_cancel(&self) -> bool {
-        self.flag.is_cancelled()
-    }
-}
-
-impl Cancel for CancelHardResetOnFiles {
-    fn is_cancelled(&self) -> bool {
-        self.flag.is_cancelled()
-    }
 }
 
 fn reset_identity() -> grit_lib::ident::Signature {
@@ -73,7 +63,10 @@ fn commit_file(
 ) -> ObjectId {
     let wt = repo.work_tree().expect("wt");
     std::fs::write(wt.join(path), contents).expect("write");
-    let mut index = repo.index_handle().load().expect("index");
+    let mut index = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("index");
     let oid = repo
         .odb()
         .write(objects::ObjectKind::Blob, contents.as_bytes())
@@ -89,7 +82,9 @@ fn commit_file(
     index.sort();
     let tree = write_tree_update_index(repo.odb(), &mut index, "", WriteTreeFlags::silent())
         .expect("tree");
-    repo.index_handle().write(&mut index).expect("write index");
+    repo.index()
+        .write(&mut index, &grit_lib::index::IndexWriteOptions::default())
+        .expect("write index");
     let commit = objects::CommitData {
         tree,
         parents: parent.into_iter().collect(),
@@ -109,8 +104,10 @@ fn commit_file(
             &objects::serialize_commit(&commit),
         )
         .expect("commit");
-    refs::write_ref(repo.git_dir(), "refs/heads/main", &co).expect("branch");
-    refs::write_symbolic_ref(repo.git_dir(), "HEAD", "refs/heads/main").expect("symhead");
+    grit_test_support::refs::set_ref(&repo, "refs/heads/main", &co).expect("branch");
+    repo.references()
+        .update_symbolic("HEAD", "refs/heads/main")
+        .expect("symhead");
     co
 }
 
@@ -120,8 +117,7 @@ fn ref_and_index(repo: &Repository) -> (Vec<u8>, Vec<u8>) {
     (read("refs/heads/main"), read("index"))
 }
 
-/// The system `git` sees no staged, unstaged or untracked change.
-fn assert_git_status_clean(repo: &Repository) {
+fn git_status_porcelain(repo: &Repository) -> String {
     let out = std::process::Command::new("git")
         .args(["status", "--porcelain", "--untracked-files=all"])
         .current_dir(repo.work_tree().expect("work tree"))
@@ -131,7 +127,12 @@ fn assert_git_status_clean(repo: &Repository) {
         .output()
         .expect("git status");
     assert!(out.status.success());
-    let status = String::from_utf8_lossy(&out.stdout);
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// The system `git` sees no staged, unstaged or untracked change.
+fn assert_git_status_clean(repo: &Repository) {
+    let status = git_status_porcelain(repo);
     assert!(
         status.is_empty(),
         "git status after cancelled reset:\n{status}"
@@ -167,7 +168,7 @@ fn seed_many_file_repo(repo: &Repository, files: usize) -> ObjectId {
 fn hard_reset_returns_cancelled_and_stops_checkout_early() {
     const FILES: usize = 120;
     let tmp = tempfile::tempdir().expect("tempdir");
-    let repo = Repository::init(
+    let (repo, _) = Repository::init(
         tmp.path(),
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
@@ -176,29 +177,35 @@ fn hard_reset_returns_cancelled_and_stops_checkout_early() {
     .expect("init");
     let head = seed_many_file_repo(&repo, FILES);
 
-    let first = grit_lib::revwalk::rev_parse::resolve_revision_as_commit_without_index_dwim(
-        &repo, "HEAD~119",
-    )
-    .expect("first commit");
+    let first = repo
+        .revwalk()
+        .resolve(
+            "HEAD~119",
+            &grit_lib::revwalk::ResolveOptions::default()
+                .with_peel(grit_lib::revwalk::Peel::Commit)
+                .with_index_dwim(grit_lib::revwalk::IndexDwim::Off),
+        )
+        .expect("first commit");
 
-    reset_to_commit(
-        &repo,
-        &ResetOptions::new(first, ResetMode::Hard, reset_identity(), "reset"),
-        &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("reset to first");
+    repo.checkout()
+        .reset(
+            &ResetOptions::new(first, ResetMode::Hard, reset_identity(), "reset"),
+            &mut grit_lib::progress::NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("reset to first");
 
     let before = ref_and_index(&repo);
     let mut progress = CancelHardResetOnFiles::new(5);
     let cancel = progress.flag.clone();
-    let err = reset_to_commit(
-        &repo,
-        &ResetOptions::new(head, ResetMode::Hard, reset_identity(), "reset"),
-        &mut progress,
-        &cancel,
-    )
-    .expect_err("cancel during hard reset checkout");
+    let err = repo
+        .checkout()
+        .reset(
+            &ResetOptions::new(head, ResetMode::Hard, reset_identity(), "reset"),
+            &mut progress,
+            &cancel,
+        )
+        .expect_err("cancel during hard reset checkout");
     assert!(
         matches!(err, grit_lib::error::Error::Cancelled),
         "expected cancelled reset, got {err:?}"
@@ -225,7 +232,7 @@ fn hard_reset_returns_cancelled_and_stops_checkout_early() {
 fn hard_reset_backward_returns_cancelled_and_stops_deletes_early() {
     const FILES: usize = 120;
     let tmp = tempfile::tempdir().expect("tempdir");
-    let repo = Repository::init(
+    let (repo, _) = Repository::init(
         tmp.path(),
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
@@ -233,21 +240,27 @@ fn hard_reset_backward_returns_cancelled_and_stops_deletes_early() {
     )
     .expect("init");
     let head = seed_many_file_repo(&repo, FILES);
-    let first = grit_lib::revwalk::rev_parse::resolve_revision_as_commit_without_index_dwim(
-        &repo, "HEAD~119",
-    )
-    .expect("first commit");
+    let first = repo
+        .revwalk()
+        .resolve(
+            "HEAD~119",
+            &grit_lib::revwalk::ResolveOptions::default()
+                .with_peel(grit_lib::revwalk::Peel::Commit)
+                .with_index_dwim(grit_lib::revwalk::IndexDwim::Off),
+        )
+        .expect("first commit");
 
     let before = ref_and_index(&repo);
     let mut progress = CancelHardResetOnFiles::new(5);
     let cancel = progress.flag.clone();
-    let err = reset_to_commit(
-        &repo,
-        &ResetOptions::new(first, ResetMode::Hard, reset_identity(), "reset"),
-        &mut progress,
-        &cancel,
-    )
-    .expect_err("cancel during backward hard reset deletes");
+    let err = repo
+        .checkout()
+        .reset(
+            &ResetOptions::new(first, ResetMode::Hard, reset_identity(), "reset"),
+            &mut progress,
+            &cancel,
+        )
+        .expect_err("cancel during backward hard reset deletes");
     assert!(
         matches!(err, grit_lib::error::Error::Cancelled),
         "expected cancelled reset, got {err:?}"
@@ -265,7 +278,7 @@ fn hard_reset_backward_returns_cancelled_and_stops_deletes_early() {
         "cancelled reset moved the branch or index"
     );
     assert_eq!(
-        refs::resolve_ref(repo.git_dir(), "HEAD").expect("HEAD"),
+        repo.references().resolve("HEAD").expect("HEAD"),
         head,
         "cancelled reset must not move HEAD"
     );
@@ -276,4 +289,142 @@ fn hard_reset_backward_returns_cancelled_and_stops_deletes_early() {
         "cancelled reset must restore every file it deleted"
     );
     assert_git_status_clean(&repo);
+}
+
+fn commit_tree(repo: &Repository, updates: &[(&str, &str)], parent: Option<ObjectId>) -> ObjectId {
+    let wt = repo.work_tree().expect("wt");
+    let mut index = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("index");
+    for (path, contents) in updates {
+        let abs = wt.join(path);
+        if let Some(parent) = abs.parent() {
+            std::fs::create_dir_all(parent).expect("mkdir");
+        }
+        std::fs::write(&abs, contents).expect("write");
+        let oid = repo
+            .odb()
+            .write(objects::ObjectKind::Blob, contents.as_bytes())
+            .expect("blob");
+        let entry = grit_lib::index::entry_from_stat(
+            &abs,
+            path.as_bytes(),
+            oid,
+            grit_lib::index::MODE_REGULAR,
+        )
+        .expect("entry");
+        index.add_or_replace(entry);
+    }
+    index.sort();
+    let tree = write_tree_update_index(repo.odb(), &mut index, "", WriteTreeFlags::silent())
+        .expect("tree");
+    repo.index()
+        .write(&mut index, &grit_lib::index::IndexWriteOptions::default())
+        .expect("write index");
+    let commit = objects::CommitData {
+        tree,
+        parents: parent.into_iter().collect(),
+        author: identity_line(),
+        committer: identity_line(),
+        author_raw: vec![],
+        committer_raw: vec![],
+        encoding: None,
+        message: "c\n".into(),
+        raw_message: None,
+        extra_headers: Vec::new(),
+    };
+    let co = repo
+        .odb()
+        .write(
+            objects::ObjectKind::Commit,
+            &objects::serialize_commit(&commit),
+        )
+        .expect("commit");
+    grit_test_support::refs::set_ref(&repo, "refs/heads/main", &co).expect("branch");
+    repo.references()
+        .update_symbolic("HEAD", "refs/heads/main")
+        .expect("symhead");
+    co
+}
+
+/// Cancel during coalesced wholesale removal of a tracked directory must roll back every file.
+#[test]
+fn hard_reset_cancel_restores_coalesced_directory_delete() {
+    const FILES_IN_D: usize = 600;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (repo, _) = Repository::init(
+        tmp.path(),
+        &InitOptions::new()
+            .with_initial_branch("main".to_owned())
+            .with_ref_storage(RefStorageFormat::Files),
+    )
+    .expect("init");
+    let wt = repo.work_tree().expect("work tree");
+    let commit_a = commit_tree(&repo, &[("base.txt", "base\n")], None);
+    let mut paths_and_contents: Vec<(String, String)> = Vec::new();
+    for i in 1..=FILES_IN_D {
+        paths_and_contents.push((format!("d/f{i}.txt"), format!("{i}\n")));
+    }
+    let updates: Vec<(&str, &str)> = paths_and_contents
+        .iter()
+        .map(|(p, c)| (p.as_str(), c.as_str()))
+        .collect();
+    let mut commit_b_updates: Vec<(&str, &str)> = updates;
+    commit_b_updates.push(("d/dirty.txt", "tracked baseline\n"));
+    let commit_b = commit_tree(&repo, &commit_b_updates, Some(commit_a));
+
+    let dirty_path = "d/dirty.txt";
+    let dirty_bytes = "unstaged local edit\n";
+    std::fs::write(wt.join(dirty_path), dirty_bytes).expect("dirty write");
+    let git_status_before = git_status_porcelain(&repo);
+
+    struct CancelOnAnyCheckoutInc {
+        flag: CancelToken,
+    }
+    impl ProgressSink for CancelOnAnyCheckoutInc {
+        fn inc(&mut self, _: u64) {
+            self.flag.cancel();
+        }
+    }
+
+    let before = ref_and_index(&repo);
+    let flag = CancelToken::new();
+    let mut progress = CancelOnAnyCheckoutInc { flag: flag.clone() };
+    let err = repo
+        .checkout()
+        .reset(
+            &ResetOptions::new(commit_a, ResetMode::Hard, reset_identity(), "reset"),
+            &mut progress,
+            &flag,
+        )
+        .expect_err("cancel during coalesced directory delete");
+    assert!(
+        matches!(err, grit_lib::error::Error::Cancelled),
+        "expected cancelled reset, got {err:?}"
+    );
+    assert_eq!(
+        ref_and_index(&repo),
+        before,
+        "cancelled reset moved the branch or index"
+    );
+    assert_eq!(
+        repo.references().resolve("HEAD").expect("HEAD"),
+        commit_b,
+        "cancelled reset must not move HEAD"
+    );
+    for i in 1..=FILES_IN_D {
+        let contents = std::fs::read_to_string(wt.join(format!("d/f{i}.txt"))).unwrap_or_default();
+        assert_eq!(contents, format!("{i}\n"), "d/f{i}.txt must be restored");
+    }
+    assert_eq!(
+        std::fs::read_to_string(wt.join(dirty_path)).expect("dirty"),
+        dirty_bytes,
+        "unstaged bytes under a coalesced delete must survive cancel"
+    );
+    assert_eq!(
+        git_status_porcelain(&repo),
+        git_status_before,
+        "cancelled reset must leave git status unchanged"
+    );
 }

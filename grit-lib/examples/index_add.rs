@@ -8,11 +8,11 @@ use grit_lib::repo::{InitOptions, Repository};
 
 fn main() -> grit_lib::error::Result<()> {
     let root = tempfile::tempdir()?;
-    let repo = Repository::init(
+    let (repo, _) = Repository::init(
         root.path(),
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
-            .with_ref_storage(grit_lib::RefStorageFormat::Files),
+            .with_ref_storage(grit_lib::refs::ref_storage::RefStorageFormat::Files),
     )?;
 
     let blob_oid = repo.odb().write(ObjectKind::Blob, b"staged content\n")?;
@@ -38,9 +38,12 @@ fn main() -> grit_lib::error::Result<()> {
 
     let mut index = Index::new();
     index.add_or_replace(entry);
-    repo.index_handle().write(&mut index)?;
+    repo.index()
+        .write(&mut index, &grit_lib::index::IndexWriteOptions::default())?;
 
-    let round_trip = repo.index_handle().load()?;
+    let round_trip = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())?;
     println!("index entries: {}", round_trip.entries().len());
     let first = &round_trip.entries()[0];
     println!(

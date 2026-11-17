@@ -1,21 +1,21 @@
-//! Public custom [`Odb`](grit_lib::objects::odb::Odb) backends via [`OdbBuilder`](grit_lib::objects::odb::OdbBuilder).
+//! Public custom [`Odb`](grit_lib::objects::odb::Odb) backends via
+//! [`RepositoryOptions::with_object_store`].
 
+use grit_lib::diff::TreeDiffOptions;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 
 use grit_lib::config::environment::RepositoryOptions;
-use grit_lib::diff::diff_trees;
 use grit_lib::error::Error;
 use grit_lib::objects::odb::store::{MemoryStore, ObjectStore};
-use grit_lib::objects::odb::OdbBuilder;
 use grit_lib::objects::{serialize_tag, TagData};
 use grit_lib::objects::{serialize_tree, ObjectKind, TreeEntry};
 use grit_lib::refs::gc::prune_loose_unreachable;
-use grit_lib::refs::write_ref;
-use grit_lib::repo::{InitOptions, Repository, RepositoryBuilder};
-use grit_lib::revwalk::rev_list::{rev_list, RevListOptions};
-use grit_lib::revwalk::rev_parse::{abbreviate_object_id, resolve_revision};
+use grit_lib::repo::error::FilesOnlyOperation;
+use grit_lib::repo::{InitOptions, Repository, RepositoryError};
+use grit_lib::revwalk::rev_list::RevListOptions;
+
 use std::process::Command;
 
 fn canonical_store_bytes(kind: ObjectKind, data: &[u8]) -> Vec<u8> {
@@ -71,19 +71,18 @@ fn memory_repo() -> (tempfile::TempDir, Repository, Arc<MemoryStore>) {
         dir.path(),
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
-            .with_ref_storage(grit_lib::RefStorageFormat::Files),
+            .with_ref_storage(grit_lib::refs::ref_storage::RefStorageFormat::Files),
     )
     .expect("init");
     let git_dir = dir.path().join(".git");
-    let objects = git_dir.join("objects");
     let store = Arc::new(MemoryStore::new(grit_lib::objects::HashAlgo::Sha1));
-    let builder = OdbBuilder::files(&objects)
-        .primary(store.clone())
-        .alternates(false);
-    let repo = RepositoryBuilder::new(RepositoryOptions::empty())
-        .odb_builder(builder)
-        .open(&git_dir, Some(dir.path()))
-        .expect("open");
+    let repo = Repository::open(
+        &git_dir,
+        &(RepositoryOptions::empty()
+            .with_object_store(store.clone())
+            .with_work_tree(dir.path())),
+    )
+    .expect("open");
     (dir, repo, store)
 }
 
@@ -105,12 +104,12 @@ fn open_with_memory_primary(
     options: RepositoryOptions,
     git_dir: &Path,
     work_tree: &Path,
-    objects: &Path,
 ) -> grit_lib::error::Result<Repository> {
     let store = Arc::new(MemoryStore::new(grit_lib::objects::HashAlgo::Sha1));
-    RepositoryBuilder::new(options)
-        .odb_builder(OdbBuilder::files(objects).primary(store).alternates(false))
-        .open(git_dir, Some(work_tree))
+    Repository::open(
+        git_dir,
+        &(options.with_object_store(store).with_work_tree(work_tree)),
+    )
 }
 
 #[cfg(unix)]
@@ -125,13 +124,8 @@ fn assert_blob_round_trip(repo: &Repository) {
 fn custom_primary_accepts_objects_dir_through_symlink() {
     let (_tmp, real, link) = symlinked_repo();
     let git_dir = link.join(".git");
-    let repo = open_with_memory_primary(
-        RepositoryOptions::empty(),
-        &git_dir,
-        &link,
-        &git_dir.join("objects"),
-    )
-    .expect("open through symlink");
+    let repo = open_with_memory_primary(RepositoryOptions::empty(), &git_dir, &link)
+        .expect("open through symlink");
     let canonical_objects = real.join(".git/objects").canonicalize().expect("canon");
     assert_eq!(repo.odb().objects_dir(), canonical_objects);
     assert_eq!(repo.odb().objects_dir(), repo.git_dir().join("objects"));
@@ -148,35 +142,24 @@ fn custom_primary_accepts_symlinked_objects_dir() {
     std::os::unix::fs::symlink(&backing, git_dir.join("objects")).expect("symlink objects");
     let canonical_backing = backing.canonicalize().expect("canon");
 
-    for objects in [git_dir.join("objects"), backing.clone()] {
-        let repo = open_with_memory_primary(RepositoryOptions::empty(), &git_dir, &real, &objects)
-            .unwrap_or_else(|e| panic!("open with {}: {e:?}", objects.display()));
-        assert_eq!(repo.odb().objects_dir(), canonical_backing);
-        assert_blob_round_trip(&repo);
-    }
+    let repo = open_with_memory_primary(RepositoryOptions::empty(), &git_dir, &real)
+        .expect("open with symlinked objects dir");
+    assert_eq!(repo.odb().objects_dir(), canonical_backing);
+    assert_blob_round_trip(&repo);
 }
 
 #[cfg(unix)]
 #[test]
 fn custom_primary_accepts_mixed_symlink_and_real_paths() {
     let (_tmp, real, link) = symlinked_repo();
-    let repo = open_with_memory_primary(
-        RepositoryOptions::empty(),
-        &link.join(".git"),
-        &link,
-        &real.join(".git/objects"),
-    )
-    .expect("git dir via symlink, objects via real path");
-    assert_blob_round_trip(&repo);
+    let via_link = open_with_memory_primary(RepositoryOptions::empty(), &link.join(".git"), &real)
+        .expect("git dir via symlink, work tree via real path");
+    assert_blob_round_trip(&via_link);
 
-    let repo = open_with_memory_primary(
-        RepositoryOptions::empty(),
-        &real.join(".git"),
-        &real,
-        &link.join(".git/objects"),
-    )
-    .expect("git dir via real path, objects via symlink");
-    assert_blob_round_trip(&repo);
+    let via_real = open_with_memory_primary(RepositoryOptions::empty(), &real.join(".git"), &link)
+        .expect("git dir via real path, work tree via symlink");
+    assert_blob_round_trip(&via_real);
+    assert_eq!(via_link.odb().objects_dir(), via_real.odb().objects_dir());
 }
 
 #[cfg(unix)]
@@ -189,7 +172,6 @@ fn custom_primary_resolves_relative_paths_against_discovery_cwd() {
         RepositoryOptions::with_environment(environment),
         Path::new(".git"),
         Path::new("."),
-        Path::new(".git/objects"),
     )
     .expect("relative paths resolve against the environment cwd");
     let canonical_real = real.canonicalize().expect("canon");
@@ -201,46 +183,35 @@ fn custom_primary_resolves_relative_paths_against_discovery_cwd() {
     assert_blob_round_trip(&repo);
 }
 
-#[cfg(unix)]
+/// The repository resolves its own `objects/` directory; a custom primary neither needs it
+/// to exist nor creates it.
 #[test]
-fn custom_primary_rejects_a_different_objects_dir() {
-    let (tmp, _real, link) = symlinked_repo();
-    let other = tmp.path().join("other");
-    fs::create_dir_all(other.join("objects")).expect("mkdir other");
-    let err = open_with_memory_primary(
-        RepositoryOptions::empty(),
-        &link.join(".git"),
-        &link,
-        &other.join("objects"),
+fn custom_primary_opens_without_objects_dir() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    Repository::init(dir.path(), &InitOptions::default()).expect("init");
+    let git_dir = dir.path().join(".git");
+    fs::remove_dir_all(git_dir.join("objects")).expect("remove objects");
+    let store = Arc::new(MemoryStore::new(grit_lib::objects::HashAlgo::Sha1));
+    let repo = Repository::open(
+        &git_dir,
+        &(RepositoryOptions::empty()
+            .with_object_store(store.clone())
+            .with_work_tree(dir.path())),
     )
-    .err()
-    .expect("different objects dir must be rejected");
-    match err {
-        Error::OdbObjectsDirMismatch {
-            builder,
-            repository,
-        } => {
-            assert_eq!(
-                builder,
-                other.join("objects").canonicalize().expect("canon")
-            );
-            assert_eq!(repository, repository.canonicalize().expect("canon"));
-            assert_ne!(builder, repository);
-        }
-        other => panic!("unexpected error: {other:?}"),
-    }
+    .expect("open without objects/");
+    let oid = repo.odb().write(ObjectKind::Blob, b"hello").expect("write");
+    assert!(store.contains(&oid).expect("contains"));
+    assert!(!git_dir.join("objects").exists());
+    assert_eq!(repo.odb().files_objects_dir(), None);
 
-    let missing = tmp.path().join("missing/objects");
-    let err = open_with_memory_primary(
-        RepositoryOptions::empty(),
-        &link.join(".git"),
-        &link,
-        &missing,
+    let err = Repository::open(
+        &git_dir,
+        &RepositoryOptions::empty().with_work_tree(dir.path()),
     )
     .err()
-    .expect("missing objects dir must be rejected");
+    .expect("files primary still needs objects/");
     assert!(
-        matches!(err, Error::OdbObjectsDirMismatch { ref builder, .. } if builder == &missing),
+        matches!(err, Error::Repository(RepositoryError::NotARepository(_))),
         "unexpected error: {err:?}"
     );
 }
@@ -271,7 +242,7 @@ fn memory_primary_revwalk_diff_without_loose_objects() {
         .write(ObjectKind::Commit, commit_body.as_bytes())
         .expect("commit");
     grit_lib::refs::update_direct_ref_on_store(
-        repo.refs(),
+        repo.ref_store(),
         repo.git_dir(),
         "refs/heads/main",
         &commit,
@@ -279,8 +250,10 @@ fn memory_primary_revwalk_diff_without_loose_objects() {
     .expect("ref");
 
     let tip = commit.to_hex();
-    let listed =
-        rev_list(&repo, &[tip.clone()], &[], &RevListOptions::default()).expect("rev-list");
+    let listed = repo
+        .revwalk()
+        .rev_list(&[tip.clone()], &[], &RevListOptions::default())
+        .expect("rev-list");
     assert_eq!(listed.commits.len(), 1);
     assert_eq!(listed.commits[0], commit);
 
@@ -297,7 +270,11 @@ fn memory_primary_revwalk_diff_without_loose_objects() {
         .odb()
         .write(ObjectKind::Tree, &tree2_body)
         .expect("tree2");
-    let diff = diff_trees(repo.odb(), Some(&tree2), Some(&tree), "").expect("diff");
+    let diff = repo
+        .diff()
+        .tree_to_tree(Some(&tree2), Some(&tree), &TreeDiffOptions::default())
+        .map(|r| r.entries)
+        .expect("diff");
     assert!(!diff.is_empty());
 
     assert_eq!(
@@ -315,7 +292,10 @@ fn memory_primary_resolve_abbrev_via_lookup_prefix() {
         .write(ObjectKind::Blob, b"abbrev-test\n")
         .expect("blob");
     let prefix = &blob.to_hex()[..8];
-    let resolved = resolve_revision(&repo, prefix).expect("abbrev");
+    let resolved = repo
+        .revwalk()
+        .resolve(prefix, &grit_lib::revwalk::ResolveOptions::default())
+        .expect("abbrev");
     assert_eq!(resolved, blob);
 }
 
@@ -326,7 +306,7 @@ fn memory_primary_write_raw_ignores_seeded_loose_on_disk() {
         dir.path(),
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
-            .with_ref_storage(grit_lib::RefStorageFormat::Files),
+            .with_ref_storage(grit_lib::refs::ref_storage::RefStorageFormat::Files),
     )
     .expect("init");
     let git_dir = dir.path().join(".git");
@@ -344,14 +324,13 @@ fn memory_primary_write_raw_ignores_seeded_loose_on_disk() {
     fs::write(&loose, b"placeholder").expect("seed loose");
 
     let store = Arc::new(MemoryStore::new(grit_lib::objects::HashAlgo::Sha1));
-    let repo = RepositoryBuilder::new(RepositoryOptions::empty())
-        .odb_builder(
-            OdbBuilder::files(&objects)
-                .primary(store.clone())
-                .alternates(false),
-        )
-        .open(&git_dir, Some(dir.path()))
-        .expect("open");
+    let repo = Repository::open(
+        &git_dir,
+        &(RepositoryOptions::empty()
+            .with_object_store(store.clone())
+            .with_work_tree(dir.path())),
+    )
+    .expect("open");
 
     assert!(!store.contains(&oid).expect("contains"));
     repo.odb().write_raw(&store_bytes).expect("write_raw");
@@ -361,11 +340,11 @@ fn memory_primary_write_raw_ignores_seeded_loose_on_disk() {
 #[test]
 fn files_primary_gc_prunes_unreachable_loose() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let repo = Repository::init(
+    let (repo, _) = Repository::init(
         dir.path(),
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
-            .with_ref_storage(grit_lib::RefStorageFormat::Files),
+            .with_ref_storage(grit_lib::refs::ref_storage::RefStorageFormat::Files),
     )
     .expect("init");
     let kept_blob = repo.odb().write(ObjectKind::Blob, b"keep\n").expect("keep");
@@ -386,7 +365,7 @@ fn files_primary_gc_prunes_unreachable_loose() {
         .write(ObjectKind::Commit, commit_body.as_bytes())
         .expect("commit");
     grit_lib::refs::update_direct_ref_on_store(
-        repo.refs(),
+        repo.ref_store(),
         repo.git_dir(),
         "refs/heads/main",
         &commit,
@@ -438,7 +417,10 @@ fn memory_primary_abbrev_unique_prefix_considers_store_collisions() {
     let (first, second) = pair.expect("find blob pair with shared 4-char prefix");
     assert_ne!(first, second);
     assert_eq!(first.to_hex()[..4], second.to_hex()[..4]);
-    let abbrev = abbreviate_object_id(&repo, first, 4).expect("abbrev");
+    let abbrev = repo
+        .revwalk()
+        .abbreviate(first, grit_lib::revwalk::AbbrevLength::AtLeast(4))
+        .expect("abbrev");
     assert_ne!(
         abbrev.len(),
         4,
@@ -450,11 +432,11 @@ fn memory_primary_abbrev_unique_prefix_considers_store_collisions() {
 #[test]
 fn gc_keeps_blob_tree_and_annotated_tag_ref_targets() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let repo = Repository::init(
+    let (repo, _) = Repository::init(
         dir.path(),
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
-            .with_ref_storage(grit_lib::RefStorageFormat::Files),
+            .with_ref_storage(grit_lib::refs::ref_storage::RefStorageFormat::Files),
     )
     .expect("init");
 
@@ -462,7 +444,7 @@ fn gc_keeps_blob_tree_and_annotated_tag_ref_targets() {
         .odb()
         .write(ObjectKind::Blob, b"tagged-blob\n")
         .expect("blob");
-    write_ref(repo.git_dir(), "refs/tags/blob-tip", &blob).expect("blob ref");
+    grit_test_support::refs::set_ref(&repo, "refs/tags/blob-tip", &blob).expect("blob ref");
 
     let tree_body = serialize_tree(&[TreeEntry {
         mode: 0o100644,
@@ -473,7 +455,7 @@ fn gc_keeps_blob_tree_and_annotated_tag_ref_targets() {
         .odb()
         .write(ObjectKind::Tree, &tree_body)
         .expect("tree");
-    write_ref(repo.git_dir(), "refs/tags/tree-tip", &tree).expect("tree ref");
+    grit_test_support::refs::set_ref(&repo, "refs/tags/tree-tip", &tree).expect("tree ref");
 
     let tag_bytes = serialize_tag(&TagData {
         object: blob,
@@ -482,12 +464,13 @@ fn gc_keeps_blob_tree_and_annotated_tag_ref_targets() {
         tagger: Some("T <t@example.com> 1 +0000".into()),
         extra_headers: Vec::new(),
         message: "annotated\n".into(),
+        raw_message: None,
     });
     let tag_oid = repo
         .odb()
         .write(ObjectKind::Tag, &tag_bytes)
         .expect("tag object");
-    write_ref(repo.git_dir(), "refs/tags/annotated", &tag_oid).expect("tag ref");
+    grit_test_support::refs::set_ref(&repo, "refs/tags/annotated", &tag_oid).expect("tag ref");
 
     repo.odb().gc().expect("gc");
 
@@ -498,16 +481,20 @@ fn gc_keeps_blob_tree_and_annotated_tag_ref_targets() {
 }
 
 #[test]
-fn memory_primary_rejects_filesystem_gc_and_commit_graph() {
-    let (_dir, repo, _store) = memory_repo();
-    assert!(matches!(
-        repo.odb().gc(),
-        Err(Error::UnsupportedObjectStore { operation: "gc" })
-    ));
+fn memory_primary_gc_prunes_but_commit_graph_write_refuses() {
+    let (_dir, repo, store) = memory_repo();
+    let orphan = repo
+        .odb()
+        .write(ObjectKind::Blob, b"orphan\n")
+        .expect("orphan");
+    repo.odb()
+        .gc()
+        .expect("gc prunes through MemoryStore's capability");
+    assert!(!store.contains(&orphan).expect("contains"));
     assert!(matches!(
         repo.odb().write_commit_graph(),
-        Err(Error::UnsupportedObjectStore {
-            operation: "commit-graph write"
-        })
+        Err(Error::Repository(RepositoryError::UnsupportedObjectStore {
+            operation: FilesOnlyOperation::CommitGraphWrite,
+        }))
     ));
 }

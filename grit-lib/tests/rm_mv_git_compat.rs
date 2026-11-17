@@ -1,5 +1,6 @@
 //! `remove_paths` / `move_path` compatibility with the system `git` binary.
 
+use grit_lib::worktree::WorktreeError;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -8,7 +9,7 @@ use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::index::write_tree::{
     cache_tree_fully_valid, write_tree_update_index, WriteTreeFlags,
 };
-use grit_lib::porcelain::paths::{move_path, remove_paths, RemoveBlockReason, RemoveOptions};
+use grit_lib::porcelain::paths::{move_path, RemoveBlockReason, RemoveOptions};
 use grit_lib::repo::Repository;
 use grit_test_support::git;
 
@@ -77,8 +78,26 @@ fn worktree_has_exact_dir_entry(parent: &Path, name: &str) -> bool {
         .any(|entry| entry.file_name().to_string_lossy() == name)
 }
 
+fn is_case_insensitive(dir: &Path) -> bool {
+    for attempt in 0..128_u32 {
+        let name = format!(".grit-icase-test-probe-{attempt:05}");
+        let lower = dir.join(&name);
+        if lower.exists() {
+            continue;
+        }
+        if std::fs::write(&lower, b"").is_err() {
+            return false;
+        }
+        let upper: String = name.chars().map(|c| c.to_ascii_uppercase()).collect();
+        let folded = dir.join(upper).exists();
+        let _ = std::fs::remove_file(&lower);
+        return folded;
+    }
+    false
+}
+
 fn hold_index_lock(repo: &Repository) -> std::fs::File {
-    let lock_path = repo.index_handle().path().with_extension("lock");
+    let lock_path = repo.index().path().with_extension("lock");
     std::fs::OpenOptions::new()
         .create_new(true)
         .write(true)
@@ -96,17 +115,19 @@ fn rm_leaves_worktree_when_index_lock_held() {
 
     let repo = grit_repo(repo_dir);
     let _lock = hold_index_lock(&repo);
-    let err = remove_paths(
-        &repo,
-        &RemoveOptions {
-            pathspecs: vec!["a".into()],
-            pathspec_sources: vec!["a".into()],
-            ..Default::default()
-        },
-    )
-    .expect_err("rm with index.lock");
+    let err = repo
+        .checkout()
+        .remove_paths(
+            &RemoveOptions {
+                pathspecs: vec!["a".into()],
+                pathspec_sources: vec!["a".into()],
+                ..Default::default()
+            },
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect_err("rm with index.lock");
     assert!(
-        matches!(&err, grit_lib::error::Error::LockHeld { path, .. } if path.ends_with(".git/index.lock")),
+        matches!(&err, grit_lib::error::Error::LockHeld(lock) if lock.path.ends_with(".git/index.lock")),
         "expected index lock failure, got {err:?}"
     );
 
@@ -127,9 +148,16 @@ fn mv_leaves_worktree_when_index_lock_held() {
 
     let repo = grit_repo(repo_dir);
     let _lock = hold_index_lock(&repo);
-    let err = move_path(&repo, "a", "b", false).expect_err("mv with index.lock");
+    let err = move_path(
+        &repo,
+        "a",
+        "b",
+        false,
+        &grit_lib::progress::CancelToken::never(),
+    )
+    .expect_err("mv with index.lock");
     assert!(
-        matches!(&err, grit_lib::error::Error::LockHeld { path, .. } if path.ends_with(".git/index.lock")),
+        matches!(&err, grit_lib::error::Error::LockHeld(lock) if lock.path.ends_with(".git/index.lock")),
         "expected index lock failure, got {err:?}"
     );
 
@@ -151,15 +179,16 @@ fn rm_clean_file_staged_deletion() {
     commit_all(repo_dir, "init");
 
     let repo = grit_repo(repo_dir);
-    remove_paths(
-        &repo,
-        &RemoveOptions {
-            pathspecs: vec!["gone.txt".into()],
-            pathspec_sources: vec!["gone.txt".into()],
-            ..Default::default()
-        },
-    )
-    .expect("rm");
+    repo.checkout()
+        .remove_paths(
+            &RemoveOptions {
+                pathspecs: vec!["gone.txt".into()],
+                pathspec_sources: vec!["gone.txt".into()],
+                ..Default::default()
+            },
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("rm");
 
     assert!(!repo_dir.join("gone.txt").exists());
     let status = git_porcelain(repo_dir);
@@ -167,6 +196,36 @@ fn rm_clean_file_staged_deletion() {
         status.contains("D  gone.txt") || status.contains("D gone.txt"),
         "expected staged deletion, got:\n{status}"
     );
+}
+
+#[test]
+fn rm_cached_attr_pathspec_unstages_only_matching() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo_dir = tmp.path();
+    git(repo_dir, &["init", "-q", "-b", "main"]);
+    fs::write(repo_dir.join(".gitattributes"), "*.rs vendored\n").unwrap();
+    fs::create_dir_all(repo_dir.join("src")).unwrap();
+    fs::write(repo_dir.join("src/a.rs"), "1\n").unwrap();
+    fs::write(repo_dir.join("src/b.txt"), "1\n").unwrap();
+    commit_all(repo_dir, "init");
+
+    let repo = grit_repo(repo_dir);
+    repo.checkout()
+        .remove_paths(
+            &RemoveOptions {
+                pathspecs: vec![":(attr:vendored)src".into()],
+                pathspec_sources: vec![":(attr:vendored)src".into()],
+                cached: true,
+                ..Default::default()
+            },
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("rm --cached attr");
+
+    let ls = git(repo_dir, &["ls-files"]);
+    assert!(ls.contains("src/b.txt"));
+    assert!(!ls.contains("src/a.rs"));
+    assert!(repo_dir.join("src/a.rs").is_file());
 }
 
 #[test]
@@ -178,16 +237,17 @@ fn rm_cached_leaves_untracked_file() {
     commit_all(repo_dir, "init");
 
     let repo = grit_repo(repo_dir);
-    remove_paths(
-        &repo,
-        &RemoveOptions {
-            pathspecs: vec!["stay.txt".into()],
-            pathspec_sources: vec!["stay.txt".into()],
-            cached: true,
-            ..Default::default()
-        },
-    )
-    .expect("rm --cached");
+    repo.checkout()
+        .remove_paths(
+            &RemoveOptions {
+                pathspecs: vec!["stay.txt".into()],
+                pathspec_sources: vec!["stay.txt".into()],
+                cached: true,
+                ..Default::default()
+            },
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("rm --cached");
 
     assert!(repo_dir.join("stay.txt").is_file());
     let status = git_porcelain(repo_dir);
@@ -207,16 +267,21 @@ fn rm_modified_refused_without_force() {
     std::fs::write(repo_dir.join("dirty.txt"), "v2\n").unwrap();
 
     let repo = grit_repo(repo_dir);
-    let err = remove_paths(
-        &repo,
-        &RemoveOptions {
-            pathspecs: vec!["dirty.txt".into()],
-            pathspec_sources: vec!["dirty.txt".into()],
-            ..Default::default()
-        },
-    )
-    .expect_err("rm should refuse");
-    assert!(matches!(err, grit_lib::error::Error::RemoveBlocked { .. }));
+    let err = repo
+        .checkout()
+        .remove_paths(
+            &RemoveOptions {
+                pathspecs: vec!["dirty.txt".into()],
+                pathspec_sources: vec!["dirty.txt".into()],
+                ..Default::default()
+            },
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect_err("rm should refuse");
+    assert!(matches!(
+        err,
+        grit_lib::error::Error::Worktree(WorktreeError::RemoveBlocked { .. })
+    ));
 }
 
 #[test]
@@ -230,21 +295,113 @@ fn rm_recursive_directory() {
     commit_all(repo_dir, "init");
 
     let repo = grit_repo(repo_dir);
-    remove_paths(
-        &repo,
-        &RemoveOptions {
-            pathspecs: vec!["tree".into()],
-            pathspec_sources: vec!["tree/".into()],
-            recursive: true,
-            ..Default::default()
-        },
-    )
-    .expect("rm -r");
+    repo.checkout()
+        .remove_paths(
+            &RemoveOptions {
+                pathspecs: vec!["tree".into()],
+                pathspec_sources: vec!["tree/".into()],
+                recursive: true,
+                ..Default::default()
+            },
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("rm -r");
 
     assert!(!repo_dir.join("tree").exists());
     let status = git_porcelain(repo_dir);
     assert!(status.contains("D  tree/sub/a.txt") || status.contains("D tree/sub/a.txt"));
     assert!(status.contains("tree/sub/b.txt"));
+}
+
+#[test]
+fn mv_into_existing_directory_with_trailing_slash_matches_without() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo_dir = tmp.path();
+    git(repo_dir, &["init", "-q", "-b", "main"]);
+    std::fs::create_dir_all(repo_dir.join("dir")).unwrap();
+    std::fs::write(repo_dir.join("c"), "c\n").unwrap();
+    std::fs::write(repo_dir.join("dir/d"), "d\n").unwrap();
+    commit_all(repo_dir, "base");
+
+    let repo = grit_repo(repo_dir);
+    move_path(
+        &repo,
+        "c",
+        "dir/",
+        false,
+        &grit_lib::progress::CancelToken::never(),
+    )
+    .expect("mv with trailing slash");
+    assert!(repo_dir.join("dir/c").is_file());
+    assert!(!repo_dir.join("c").exists());
+    fsck_strict(repo_dir);
+
+    let tmp2 = tempfile::tempdir().expect("tempdir");
+    let repo_dir2 = tmp2.path();
+    git(repo_dir2, &["init", "-q", "-b", "main"]);
+    std::fs::create_dir_all(repo_dir2.join("dir")).unwrap();
+    std::fs::write(repo_dir2.join("c"), "c\n").unwrap();
+    std::fs::write(repo_dir2.join("dir/d"), "d\n").unwrap();
+    commit_all(repo_dir2, "base");
+    let repo2 = grit_repo(repo_dir2);
+    move_path(
+        &repo2,
+        "c",
+        "dir",
+        false,
+        &grit_lib::progress::CancelToken::never(),
+    )
+    .expect("mv without trailing slash");
+    assert!(repo_dir2.join("dir/c").is_file());
+    fsck_strict(repo_dir2);
+}
+
+#[test]
+fn mv_file_to_missing_directory_with_trailing_slash_refused() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo_dir = tmp.path();
+    git(repo_dir, &["init", "-q", "-b", "main"]);
+    std::fs::write(repo_dir.join("c"), "c\n").unwrap();
+    commit_all(repo_dir, "init");
+
+    let repo = grit_repo(repo_dir);
+    let err = move_path(
+        &repo,
+        "c",
+        "missing/",
+        false,
+        &grit_lib::progress::CancelToken::never(),
+    )
+    .expect_err("mv file missing/");
+    assert!(matches!(
+        err,
+        grit_lib::error::Error::Worktree(WorktreeError::MoveDestinationNotDirectory { .. })
+    ));
+    assert!(repo_dir.join("c").is_file());
+    assert!(git_porcelain(repo_dir).trim().is_empty());
+}
+
+#[test]
+fn mv_directory_to_missing_directory_with_trailing_slash_renames() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo_dir = tmp.path();
+    git(repo_dir, &["init", "-q", "-b", "main"]);
+    std::fs::create_dir_all(repo_dir.join("src/nested")).unwrap();
+    std::fs::write(repo_dir.join("src/nested/file"), "x\n").unwrap();
+    commit_all(repo_dir, "init");
+
+    let repo = grit_repo(repo_dir);
+    move_path(
+        &repo,
+        "src",
+        "dest/",
+        false,
+        &grit_lib::progress::CancelToken::never(),
+    )
+    .expect("mv directory to dest/");
+    assert!(repo_dir.join("dest/nested/file").is_file());
+    assert!(!repo_dir.join("src").exists());
+    fsck_strict(repo_dir);
 }
 
 #[test]
@@ -256,7 +413,14 @@ fn mv_file_detected_as_rename_by_git() {
     commit_all(repo_dir, "init");
 
     let repo = grit_repo(repo_dir);
-    move_path(&repo, "old.txt", "new.txt", false).expect("mv");
+    move_path(
+        &repo,
+        "old.txt",
+        "new.txt",
+        false,
+        &grit_lib::progress::CancelToken::never(),
+    )
+    .expect("mv");
 
     let status = git_porcelain(repo_dir);
     assert!(
@@ -269,6 +433,89 @@ fn mv_file_detected_as_rename_by_git() {
 }
 
 #[test]
+fn mv_leaves_empty_source_directories() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo_dir = tmp.path();
+    git(repo_dir, &["init", "-q", "-b", "main"]);
+    fs::create_dir_all(repo_dir.join("a/b")).unwrap();
+    fs::write(repo_dir.join("a/b/y"), "3\n").unwrap();
+    fs::create_dir_all(repo_dir.join("d")).unwrap();
+    fs::write(repo_dir.join("d/q"), "4\n").unwrap();
+    commit_all(repo_dir, "init");
+
+    let git_dir = tempfile::tempdir().expect("git twin");
+    let git_repo_dir = git_dir.path();
+    git(git_repo_dir, &["init", "-q", "-b", "main"]);
+    fs::create_dir_all(git_repo_dir.join("a/b")).unwrap();
+    fs::write(git_repo_dir.join("a/b/y"), "3\n").unwrap();
+    fs::create_dir_all(git_repo_dir.join("d")).unwrap();
+    fs::write(git_repo_dir.join("d/q"), "4\n").unwrap();
+    commit_all(git_repo_dir, "init");
+
+    let repo = grit_repo(repo_dir);
+    move_path(
+        &repo,
+        "a/b/y",
+        "a/y2",
+        false,
+        &grit_lib::progress::CancelToken::never(),
+    )
+    .expect("mv a/b/y -> a/y2");
+    move_path(
+        &repo,
+        "d/q",
+        "a/q",
+        false,
+        &grit_lib::progress::CancelToken::never(),
+    )
+    .expect("mv d/q -> a/q");
+
+    git(git_repo_dir, &["mv", "a/b/y", "a/y2"]);
+    git(git_repo_dir, &["mv", "d/q", "a/q"]);
+
+    assert!(
+        repo_dir.join("a/b").is_dir(),
+        "emptied a/b must remain after moving its only file"
+    );
+    assert!(
+        repo_dir.join("d").is_dir(),
+        "emptied d must remain after moving its only file"
+    );
+    assert_eq!(
+        fs::read_to_string(repo_dir.join("a/y2")).unwrap(),
+        "3\n",
+        "moved file contents"
+    );
+    assert_eq!(
+        fs::read_to_string(repo_dir.join("a/q")).unwrap(),
+        "4\n",
+        "moved file contents"
+    );
+    assert_eq!(
+        git_porcelain(repo_dir),
+        git_porcelain(git_repo_dir),
+        "staged status must match git mv twin"
+    );
+
+    fs::create_dir_all(repo_dir.join("src/lib")).unwrap();
+    fs::write(repo_dir.join("src/lib/mod.rs"), "mod\n").unwrap();
+    commit_all(repo_dir, "add src tree");
+    move_path(
+        &repo,
+        "src/lib",
+        "vendor/lib",
+        false,
+        &grit_lib::progress::CancelToken::never(),
+    )
+    .expect("mv src/lib -> vendor/lib");
+    assert!(
+        repo_dir.join("src").is_dir(),
+        "src must remain when only src/lib was moved out"
+    );
+    assert!(repo_dir.join("vendor/lib/mod.rs").is_file());
+}
+
+#[test]
 fn mv_directory_tree() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let repo_dir = tmp.path();
@@ -278,7 +525,14 @@ fn mv_directory_tree() {
     commit_all(repo_dir, "init");
 
     let repo = grit_repo(repo_dir);
-    move_path(&repo, "src", "vendor/src", false).expect("mv dir");
+    move_path(
+        &repo,
+        "src",
+        "vendor/src",
+        false,
+        &grit_lib::progress::CancelToken::never(),
+    )
+    .expect("mv dir");
 
     assert!(repo_dir.join("vendor/src/lib/mod.rs").is_file());
     assert!(!repo_dir.join("src").exists());
@@ -293,8 +547,18 @@ fn mv_self_move_with_force_is_non_destructive() {
     commit_all(repo_dir, "init");
 
     let repo = grit_repo(repo_dir);
-    let err = move_path(&repo, "a", "a", true).expect_err("self mv");
-    assert!(matches!(err, grit_lib::error::Error::MoveIntoSelf { .. }));
+    let err = move_path(
+        &repo,
+        "a",
+        "a",
+        true,
+        &grit_lib::progress::CancelToken::never(),
+    )
+    .expect_err("self mv");
+    assert!(matches!(
+        err,
+        grit_lib::error::Error::Worktree(WorktreeError::MoveIntoSelf { .. })
+    ));
 
     assert!(repo_dir.join("a").is_file(), "worktree file must remain");
     let status = git_porcelain(repo_dir);
@@ -316,8 +580,18 @@ fn mv_directory_refuses_missing_tracked_child() {
     std::fs::remove_file(repo_dir.join("d/b")).unwrap();
 
     let repo = grit_repo(repo_dir);
-    let err = move_path(&repo, "d", "e", false).expect_err("mv missing child");
-    assert!(matches!(err, grit_lib::error::Error::MoveBadSource { .. }));
+    let err = move_path(
+        &repo,
+        "d",
+        "e",
+        false,
+        &grit_lib::progress::CancelToken::never(),
+    )
+    .expect_err("mv missing child");
+    assert!(matches!(
+        err,
+        grit_lib::error::Error::Worktree(WorktreeError::MoveBadSource { .. })
+    ));
 
     assert!(repo_dir.join("d/a").is_file());
     assert!(!repo_dir.join("d/b").exists());
@@ -340,19 +614,21 @@ fn rm_directory_pathspec_refused_without_recursive() {
     std::fs::rename(repo_dir.join("dir"), repo_dir.join("dir_hidden")).unwrap();
 
     let repo = grit_repo(repo_dir);
-    let err = remove_paths(
-        &repo,
-        &RemoveOptions {
-            pathspecs: vec!["dir".into()],
-            pathspec_sources: vec!["dir".into()],
-            recursive: false,
-            ..Default::default()
-        },
-    )
-    .expect_err("rm dir without -r");
+    let err = repo
+        .checkout()
+        .remove_paths(
+            &RemoveOptions {
+                pathspecs: vec!["dir".into()],
+                pathspec_sources: vec!["dir".into()],
+                recursive: false,
+                ..Default::default()
+            },
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect_err("rm dir without -r");
     assert!(matches!(
         err,
-        grit_lib::error::Error::NotRemovingRecursively(_)
+        grit_lib::error::Error::Worktree(WorktreeError::NotRemovingRecursively { .. })
     ));
     assert!(repo_dir.join("dir_hidden/file").is_file());
 }
@@ -366,10 +642,29 @@ fn mv_rejects_destination_outside_work_tree() {
     commit_all(repo_dir, "init");
 
     let repo = grit_repo(repo_dir);
-    let err = move_path(&repo, "tracked", "../escaped", false).expect_err("mv outside repo");
-    assert!(matches!(err, grit_lib::error::Error::InvalidPath(_)));
+    let err = move_path(
+        &repo,
+        "tracked",
+        "../escaped",
+        false,
+        &grit_lib::progress::CancelToken::never(),
+    )
+    .expect_err("mv outside repo");
+    assert!(matches!(
+        err,
+        grit_lib::error::Error::Worktree(WorktreeError::OutsideRepo(_))
+    ));
+    let msg = err.to_string();
+    assert!(
+        msg.contains("'../escaped' is outside repository at '"),
+        "{msg}"
+    );
+    assert!(!msg.contains("invalid path"), "{msg}");
     assert!(repo_dir.join("tracked").is_file());
-    let index = repo.index_handle().load().expect("index");
+    let index = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("index");
     assert!(index.get("tracked".as_bytes(), 0).is_some());
 }
 
@@ -389,10 +684,20 @@ fn mv_refused_when_index_lock_held_externally() {
         .expect("pre-create index.lock");
 
     let repo = grit_repo(repo_dir);
-    let index_before = repo.index_handle().load().expect("index before");
-    let err = move_path(&repo, "tracked", "moved", false).expect_err("mv with held lock");
+    let index_before = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("index before");
+    let err = move_path(
+        &repo,
+        "tracked",
+        "moved",
+        false,
+        &grit_lib::progress::CancelToken::never(),
+    )
+    .expect_err("mv with held lock");
     assert!(
-        matches!(&err, grit_lib::error::Error::LockHeld { path, .. } if path.ends_with(".git/index.lock")),
+        matches!(&err, grit_lib::error::Error::LockHeld(lock) if lock.path.ends_with(".git/index.lock")),
         "expected index lock failure, got {err:?}"
     );
     assert!(repo_dir.join("tracked").is_file());
@@ -400,7 +705,10 @@ fn mv_refused_when_index_lock_held_externally() {
     assert!(git_porcelain(repo_dir).is_empty());
     assert_eq!(
         index_before.entries(),
-        repo.index_handle().load().expect("index after").entries()
+        repo.index()
+            .load(&grit_lib::index::IndexLoadOptions::default())
+            .expect("index after")
+            .entries()
     );
 }
 
@@ -414,14 +722,30 @@ fn mv_worktree_failure_leaves_index_unchanged() {
     commit_all(repo_dir, "init");
 
     let repo = grit_repo(repo_dir);
-    let index_before = repo.index_handle().load().expect("index before");
-    let err = move_path(&repo, "tracked", "blocked/child", false).expect_err("mv into file");
-    assert!(matches!(err, grit_lib::error::Error::PathError(_)));
+    let index_before = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("index before");
+    let err = move_path(
+        &repo,
+        "tracked",
+        "blocked/child",
+        false,
+        &grit_lib::progress::CancelToken::never(),
+    )
+    .expect_err("mv into file");
+    assert!(matches!(
+        err,
+        grit_lib::error::Error::Worktree(WorktreeError::Path { .. })
+    ));
     assert!(repo_dir.join("tracked").is_file());
     assert!(repo_dir.join("blocked").is_file());
     assert_eq!(
         index_before.entries(),
-        repo.index_handle().load().expect("index after").entries()
+        repo.index()
+            .load(&grit_lib::index::IndexLoadOptions::default())
+            .expect("index after")
+            .entries()
     );
 }
 
@@ -442,10 +766,20 @@ fn mv_force_refused_when_index_lock_held_externally() {
         .expect("pre-create index.lock");
 
     let repo = grit_repo(repo_dir);
-    let index_before = repo.index_handle().load().expect("index before");
-    let err = move_path(&repo, "source", "destination", true).expect_err("force mv with lock");
+    let index_before = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("index before");
+    let err = move_path(
+        &repo,
+        "source",
+        "destination",
+        true,
+        &grit_lib::progress::CancelToken::never(),
+    )
+    .expect_err("force mv with lock");
     assert!(
-        matches!(&err, grit_lib::error::Error::LockHeld { path, .. } if path.ends_with(".git/index.lock")),
+        matches!(&err, grit_lib::error::Error::LockHeld(lock) if lock.path.ends_with(".git/index.lock")),
         "expected index lock failure, got {err:?}"
     );
     assert!(repo_dir.join("source").is_file());
@@ -455,7 +789,10 @@ fn mv_force_refused_when_index_lock_held_externally() {
         status.is_empty(),
         "force mv must not delete destination when lock is held:\n{status}"
     );
-    let index_after = repo.index_handle().load().expect("index after");
+    let index_after = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("index after");
     assert_eq!(index_before.entries(), index_after.entries());
     assert!(index_after.get("source".as_bytes(), 0).is_some());
     assert!(index_after.get("destination".as_bytes(), 0).is_some());
@@ -472,9 +809,18 @@ fn mv_rejects_in_repo_absolute_destination() {
 
     let repo = grit_repo(repo_dir);
     let abs_dst = repo_dir.join("destination");
-    let err = move_path(&repo, "source", abs_dst.to_str().expect("utf8 path"), false)
-        .expect_err("absolute destination");
-    assert!(matches!(err, grit_lib::error::Error::InvalidPath(_)));
+    let err = move_path(
+        &repo,
+        "source",
+        abs_dst.to_str().expect("utf8 path"),
+        false,
+        &grit_lib::progress::CancelToken::never(),
+    )
+    .expect_err("absolute destination");
+    assert!(matches!(
+        err,
+        grit_lib::error::Error::Worktree(WorktreeError::InvalidPath { .. })
+    ));
 
     assert!(repo_dir.join("source").is_file());
     assert!(repo_dir.join("destination").is_file());
@@ -495,8 +841,18 @@ fn mv_rejects_parent_component_in_source() {
     commit_all(repo_dir, "init");
 
     let repo = grit_repo(repo_dir);
-    let err = move_path(&repo, "dir/../source", "moved", false).expect_err(".. source");
-    assert!(matches!(err, grit_lib::error::Error::InvalidPath(_)));
+    let err = move_path(
+        &repo,
+        "dir/../source",
+        "moved",
+        false,
+        &grit_lib::progress::CancelToken::never(),
+    )
+    .expect_err(".. source");
+    assert!(matches!(
+        err,
+        grit_lib::error::Error::Worktree(WorktreeError::OutsideRepo(_))
+    ));
 
     assert!(repo_dir.join("source").is_file());
     assert!(!repo_dir.join("moved").exists());
@@ -527,9 +883,19 @@ fn mv_force_failure_restores_destination_and_index() {
     std::fs::set_permissions(repo_dir.join("locked"), perms).expect("chmod locked");
 
     let repo = grit_repo(repo_dir);
-    let err = move_path(&repo, "locked/source", "destination", true).expect_err("forced mv");
+    let err = move_path(
+        &repo,
+        "locked/source",
+        "destination",
+        true,
+        &grit_lib::progress::CancelToken::never(),
+    )
+    .expect_err("forced mv");
     assert!(
-        matches!(err, grit_lib::error::Error::PathError(_)),
+        matches!(
+            err,
+            grit_lib::error::Error::Worktree(WorktreeError::Path { .. })
+        ),
         "unexpected error: {err:?}"
     );
 
@@ -571,7 +937,14 @@ fn mv_force_failure_restores_executable_destination_mode() {
     std::fs::set_permissions(repo_dir.join("locked"), locked_mode).expect("chmod locked");
 
     let repo = grit_repo(repo_dir);
-    move_path(&repo, "locked/source", "destination", true).expect_err("forced mv");
+    move_path(
+        &repo,
+        "locked/source",
+        "destination",
+        true,
+        &grit_lib::progress::CancelToken::never(),
+    )
+    .expect_err("forced mv");
 
     let mode = std::fs::metadata(repo_dir.join("destination"))
         .expect("destination meta")
@@ -610,7 +983,14 @@ fn mv_force_partial_destination_cleanup_restores_removed_files() {
         .expect("chmod locked");
 
     let repo = grit_repo(repo_dir);
-    move_path(&repo, "source", "target", true).expect_err("forced mv into occupied tree");
+    move_path(
+        &repo,
+        "source",
+        "target",
+        true,
+        &grit_lib::progress::CancelToken::never(),
+    )
+    .expect_err("forced mv into occupied tree");
 
     assert!(repo_dir.join("target/source/a").is_file());
     assert!(repo_dir.join("target/source/locked/b").is_file());
@@ -634,13 +1014,23 @@ fn mv_case_only_does_not_clobber_predictable_temp_pattern_file() {
     commit_all(repo_dir, "init");
 
     let repo = grit_repo(repo_dir);
-    move_path(&repo, "README.md", "readme.md", false).expect("case-only mv");
+    move_path(
+        &repo,
+        "README.md",
+        "readme.md",
+        false,
+        &grit_lib::progress::CancelToken::never(),
+    )
+    .expect("case-only mv");
 
     assert!(
         repo_dir.join(&decoy).is_file(),
         "unrelated file matching the old temp pattern must survive case-only mv"
     );
-    let index = repo.index_handle().load().expect("index");
+    let index = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("index");
     assert!(
         index.get(decoy.as_bytes(), 0).is_some(),
         "index entry for decoy must remain"
@@ -659,13 +1049,23 @@ fn mv_case_only_directory_with_ignorecase() {
     commit_all(repo_dir, "init");
 
     let repo = grit_repo(repo_dir);
-    move_path(&repo, "Docs", "docs", false).expect("case-only directory mv");
+    move_path(
+        &repo,
+        "Docs",
+        "docs",
+        false,
+        &grit_lib::progress::CancelToken::never(),
+    )
+    .expect("case-only directory mv");
 
     assert!(worktree_has_exact_dir_entry(repo_dir, "docs"));
     assert!(!worktree_has_exact_dir_entry(repo_dir, "Docs"));
     assert!(repo_dir.join("docs/a.txt").is_file());
 
-    let index = repo.index_handle().load().expect("index");
+    let index = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("index");
     let entry = index
         .get(b"docs/a.txt", 0)
         .expect("index tracks renamed tree path");
@@ -684,6 +1084,106 @@ fn mv_case_only_directory_with_ignorecase() {
     }
 }
 
+/// Tracked and untracked symlinks that resolve to the same directory must not be treated
+/// as a case-only directory dentry rename (would overwrite `dir` without `--force`).
+#[cfg(unix)]
+#[test]
+fn mv_ignorecase_symlink_pair_not_case_only_directory() {
+    if is_case_insensitive(std::env::temp_dir().as_path()) {
+        return;
+    }
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo_dir = tmp.path();
+    git(repo_dir, &["init", "-q", "-b", "main"]);
+    git(repo_dir, &["config", "core.ignorecase", "true"]);
+    fs::create_dir(repo_dir.join("target")).unwrap();
+    std::os::unix::fs::symlink("target", repo_dir.join("Dir")).unwrap();
+    std::os::unix::fs::symlink("./target", repo_dir.join("dir")).unwrap();
+    git(repo_dir, &["add", "Dir"]);
+    git(repo_dir, &["commit", "-q", "-m", "one"]);
+
+    let repo = grit_repo(repo_dir);
+    let err = move_path(
+        &repo,
+        "Dir",
+        "dir",
+        false,
+        &grit_lib::progress::CancelToken::never(),
+    )
+    .expect_err("must not clobber untracked dir");
+    assert!(
+        matches!(
+            err,
+            grit_lib::error::Error::Worktree(WorktreeError::MoveDestinationExists { .. })
+                | grit_lib::error::Error::Worktree(WorktreeError::MoveIntoSubdirectory { .. })
+        ),
+        "unexpected error: {err:?}"
+    );
+    assert!(
+        std::fs::read_link(repo_dir.join("dir"))
+            .expect("dir symlink")
+            .to_string_lossy()
+            == "./target",
+        "untracked dir symlink must be unchanged"
+    );
+}
+
+/// Issue #2376: on a folding volume `Dir` and `dir` are the same dentry; grit must not
+/// plan `dir/Dir`.
+#[test]
+fn mv_case_only_directory_on_folding_volume() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    if !is_case_insensitive(tmp.path()) {
+        return;
+    }
+    let repo_dir = tmp.path();
+    git(repo_dir, &["init", "-q", "-b", "main"]);
+    git(repo_dir, &["config", "core.ignorecase", "true"]);
+    fs::create_dir(repo_dir.join("Dir")).unwrap();
+    fs::write(repo_dir.join("Dir/x.txt"), "d\n").unwrap();
+    commit_all(repo_dir, "one");
+
+    let repo = grit_repo(repo_dir);
+    move_path(
+        &repo,
+        "Dir",
+        "dir",
+        false,
+        &grit_lib::progress::CancelToken::never(),
+    )
+    .expect("case-only directory mv on folding volume");
+
+    assert!(worktree_has_exact_dir_entry(repo_dir, "dir"));
+    assert!(!worktree_has_exact_dir_entry(repo_dir, "Dir"));
+    assert!(repo_dir.join("dir/x.txt").is_file());
+
+    let index = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("index");
+    let entry = index
+        .get(b"dir/x.txt", 0)
+        .expect("index tracks renamed tree path");
+    assert_eq!(String::from_utf8_lossy(&entry.path), "dir/x.txt");
+
+    if Command::new("git").output().is_ok() {
+        let ls = Command::new("git")
+            .current_dir(repo_dir)
+            .args(["ls-files"])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .expect("git ls-files");
+        assert!(ls.status.success());
+        assert_eq!(String::from_utf8_lossy(&ls.stdout).trim(), "dir/x.txt");
+        assert!(
+            git_diff_cached_rename(repo_dir),
+            "git diff --cached -M should detect the staged rename"
+        );
+        fsck_strict(repo_dir);
+    }
+}
+
 #[test]
 fn mv_case_only_rename_with_ignorecase() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -694,12 +1194,22 @@ fn mv_case_only_rename_with_ignorecase() {
     commit_all(repo_dir, "init");
 
     let repo = grit_repo(repo_dir);
-    move_path(&repo, "README.md", "readme.md", false).expect("case-only mv");
+    move_path(
+        &repo,
+        "README.md",
+        "readme.md",
+        false,
+        &grit_lib::progress::CancelToken::never(),
+    )
+    .expect("case-only mv");
 
     assert!(worktree_has_exact_dir_entry(repo_dir, "readme.md"));
     assert!(!worktree_has_exact_dir_entry(repo_dir, "README.md"));
 
-    let index = repo.index_handle().load().expect("index");
+    let index = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("index");
     let entry = index
         .get(b"readme.md", 0)
         .expect("index tracks destination spelling");
@@ -733,10 +1243,17 @@ fn mv_destination_exists_refused() {
     commit_all(repo_dir, "init");
 
     let repo = grit_repo(repo_dir);
-    let err = move_path(&repo, "a.txt", "b.txt", false).expect_err("mv");
+    let err = move_path(
+        &repo,
+        "a.txt",
+        "b.txt",
+        false,
+        &grit_lib::progress::CancelToken::never(),
+    )
+    .expect_err("mv");
     assert!(matches!(
         err,
-        grit_lib::error::Error::MoveDestinationExists { .. }
+        grit_lib::error::Error::Worktree(WorktreeError::MoveDestinationExists { .. })
     ));
 }
 
@@ -750,16 +1267,28 @@ fn cache_tree_valid_after_mv_commit() {
     commit_all(repo_dir, "init");
 
     let repo = grit_repo(repo_dir);
-    move_path(&repo, "one.txt", "three.txt", false).expect("mv");
+    move_path(
+        &repo,
+        "one.txt",
+        "three.txt",
+        false,
+        &grit_lib::progress::CancelToken::never(),
+    )
+    .expect("mv");
 
-    let mut index = repo.index_handle().load().expect("index");
+    let mut index = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("index");
     let _tree = write_tree_update_index(repo.odb(), &mut index, "", WriteTreeFlags::default())
         .expect("write-tree");
     assert!(cache_tree_fully_valid(
         repo.odb(),
         index.cache_tree.as_ref()
     ));
-    repo.index_handle().write(&mut index).expect("write index");
+    repo.index()
+        .write(&mut index, &grit_lib::index::IndexWriteOptions::default())
+        .expect("write index");
 
     git(repo_dir, &["commit", "-q", "-m", "rename"]);
     fsck_strict(repo_dir);
@@ -775,16 +1304,17 @@ fn grit_rm_after_git_staged_rename() {
     git(repo_dir, &["mv", "tracked.txt", "renamed.txt"]);
 
     let repo = grit_repo(repo_dir);
-    remove_paths(
-        &repo,
-        &RemoveOptions {
-            pathspecs: vec!["renamed.txt".into()],
-            pathspec_sources: vec!["renamed.txt".into()],
-            force: true,
-            ..Default::default()
-        },
-    )
-    .expect("grit rm -f after git mv");
+    repo.checkout()
+        .remove_paths(
+            &RemoveOptions {
+                pathspecs: vec!["renamed.txt".into()],
+                pathspec_sources: vec!["renamed.txt".into()],
+                force: true,
+                ..Default::default()
+            },
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("grit rm -f after git mv");
 
     assert!(!repo_dir.join("renamed.txt").exists());
     let status = git_porcelain(repo_dir);
@@ -805,7 +1335,7 @@ fn rm_opts(path: &str, cached: bool) -> RemoveOptions {
 
 fn blocked_reasons(err: grit_lib::error::Error) -> Vec<(String, RemoveBlockReason)> {
     match err {
-        grit_lib::error::Error::RemoveBlocked { paths } => {
+        grit_lib::error::Error::Worktree(WorktreeError::RemoveBlocked { paths }) => {
             paths.into_iter().map(|b| (b.path, b.reason)).collect()
         }
         other => panic!("expected RemoveBlocked, got {other:?}"),
@@ -822,7 +1352,13 @@ fn rm_cached_keeps_committed_file_edited_since() {
     fs::write(repo_dir.join(".env"), "secret\nmore\n").unwrap();
 
     let repo = grit_repo(repo_dir);
-    let outcome = remove_paths(&repo, &rm_opts(".env", true)).expect("rm --cached");
+    let outcome = repo
+        .checkout()
+        .remove_paths(
+            &rm_opts(".env", true),
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("rm --cached");
     assert_eq!(outcome.removed, vec![".env".to_string()]);
 
     assert_eq!(
@@ -851,14 +1387,26 @@ fn rm_cached_refuses_staged_then_edited_file() {
     let status_before = git_porcelain(repo_dir);
 
     let repo = grit_repo(repo_dir);
-    let err = remove_paths(&repo, &rm_opts("f.txt", true)).expect_err("must refuse");
+    let err = repo
+        .checkout()
+        .remove_paths(
+            &rm_opts("f.txt", true),
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect_err("must refuse");
     assert_eq!(
         blocked_reasons(err),
         vec![("f.txt".to_string(), RemoveBlockReason::StagedAndLocal)]
     );
     assert_eq!(git_porcelain(repo_dir), status_before, "index untouched");
 
-    let err = remove_paths(&repo, &rm_opts("f.txt", false)).expect_err("must refuse");
+    let err = repo
+        .checkout()
+        .remove_paths(
+            &rm_opts("f.txt", false),
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect_err("must refuse");
     assert_eq!(
         blocked_reasons(err),
         vec![("f.txt".to_string(), RemoveBlockReason::StagedAndLocal)]
@@ -876,13 +1424,24 @@ fn rm_cached_untracks_freshly_added_file() {
     git(repo_dir, &["add", "new.txt"]);
 
     let repo = grit_repo(repo_dir);
-    let err = remove_paths(&repo, &rm_opts("new.txt", false)).expect_err("staged, no --cached");
+    let err = repo
+        .checkout()
+        .remove_paths(
+            &rm_opts("new.txt", false),
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect_err("staged, no --cached");
     assert_eq!(
         blocked_reasons(err),
         vec![("new.txt".to_string(), RemoveBlockReason::StagedChanges)]
     );
 
-    remove_paths(&repo, &rm_opts("new.txt", true)).expect("rm --cached fresh file");
+    repo.checkout()
+        .remove_paths(
+            &rm_opts("new.txt", true),
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("rm --cached fresh file");
     assert!(repo_dir.join("new.txt").is_file());
     assert_eq!(git_porcelain(repo_dir), "?? new.txt\n");
 }
@@ -896,12 +1455,23 @@ fn rm_cached_untracks_file_before_first_commit() {
     git(repo_dir, &["add", "a.txt"]);
 
     let repo = grit_repo(repo_dir);
-    let err = remove_paths(&repo, &rm_opts("a.txt", false)).expect_err("unborn HEAD");
+    let err = repo
+        .checkout()
+        .remove_paths(
+            &rm_opts("a.txt", false),
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect_err("unborn HEAD");
     assert_eq!(
         blocked_reasons(err),
         vec![("a.txt".to_string(), RemoveBlockReason::StagedChanges)]
     );
-    remove_paths(&repo, &rm_opts("a.txt", true)).expect("rm --cached unborn");
+    repo.checkout()
+        .remove_paths(
+            &rm_opts("a.txt", true),
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("rm --cached unborn");
     assert!(repo_dir.join("a.txt").is_file());
     assert_eq!(git_porcelain(repo_dir), "?? a.txt\n");
 }
@@ -917,14 +1487,25 @@ fn rm_staged_change_refused_without_cached() {
     git(repo_dir, &["add", "s.txt"]);
 
     let repo = grit_repo(repo_dir);
-    let err = remove_paths(&repo, &rm_opts("s.txt", false)).expect_err("staged change");
+    let err = repo
+        .checkout()
+        .remove_paths(
+            &rm_opts("s.txt", false),
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect_err("staged change");
     assert_eq!(
         blocked_reasons(err),
         vec![("s.txt".to_string(), RemoveBlockReason::StagedChanges)]
     );
     assert!(repo_dir.join("s.txt").is_file());
 
-    remove_paths(&repo, &rm_opts("s.txt", true)).expect("index matches worktree");
+    repo.checkout()
+        .remove_paths(
+            &rm_opts("s.txt", true),
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("index matches worktree");
     assert_eq!(fs::read_to_string(repo_dir.join("s.txt")).unwrap(), "v2\n");
     let status = git_porcelain(repo_dir);
     assert!(
@@ -943,7 +1524,13 @@ fn rm_modified_reports_local_modifications() {
     fs::write(repo_dir.join("dirty.txt"), "v2\n").unwrap();
 
     let repo = grit_repo(repo_dir);
-    let err = remove_paths(&repo, &rm_opts("dirty.txt", false)).expect_err("refuse");
+    let err = repo
+        .checkout()
+        .remove_paths(
+            &rm_opts("dirty.txt", false),
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect_err("refuse");
     assert_eq!(
         blocked_reasons(err),
         vec![(
@@ -970,7 +1557,12 @@ fn rm_file_already_deleted_from_worktree() {
     let mut opts = rm_opts("gone.txt", false);
     opts.pathspecs.push("staged.txt".into());
     opts.pathspec_sources.push("staged.txt".into());
-    let outcome = remove_paths(&repo, &opts).expect("nothing left on disk to lose");
+    let outcome = repo
+        .checkout()
+        .opts
+        .checkout()
+        .remove_paths(&grit_lib::progress::CancelToken::never())
+        .expect("nothing left on disk to lose");
     assert_eq!(outcome.removed, vec!["gone.txt", "staged.txt"]);
     assert_eq!(git_porcelain(repo_dir), "D  gone.txt\nD  staged.txt\n");
     fsck_strict(repo_dir);
@@ -997,7 +1589,12 @@ fn rm_refusal_lists_every_blocked_path_with_its_reason() {
         opts.pathspecs.push(name.into());
         opts.pathspec_sources.push(name.into());
     }
-    let err = remove_paths(&repo, &opts).expect_err("refuse");
+    let err = repo
+        .checkout()
+        .opts
+        .checkout()
+        .remove_paths(&grit_lib::progress::CancelToken::never())
+        .expect_err("refuse");
     assert_eq!(
         blocked_reasons(err),
         vec![
@@ -1008,14 +1605,24 @@ fn rm_refusal_lists_every_blocked_path_with_its_reason() {
     );
 
     opts.cached = true;
-    let err = remove_paths(&repo, &opts).expect_err("both still refused with --cached");
+    let err = repo
+        .checkout()
+        .opts
+        .checkout()
+        .remove_paths(&grit_lib::progress::CancelToken::never())
+        .expect_err("both still refused with --cached");
     assert_eq!(
         blocked_reasons(err),
         vec![("both".to_string(), RemoveBlockReason::StagedAndLocal)]
     );
 
     opts.force = true;
-    let outcome = remove_paths(&repo, &opts).expect("--cached --force");
+    let outcome = repo
+        .checkout()
+        .opts
+        .checkout()
+        .remove_paths(&grit_lib::progress::CancelToken::never())
+        .expect("--cached --force");
     assert_eq!(outcome.removed.len(), 4);
     for name in ["clean", "local", "staged", "both"] {
         assert!(repo_dir.join(name).is_file(), "{name} kept on disk");

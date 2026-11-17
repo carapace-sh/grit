@@ -1,0 +1,364 @@
+//! `RevWalk::describe` distance matches `git rev-list --count tag..rev`.
+
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
+use grit_lib::config::environment::RepositoryOptions;
+use grit_lib::ident::Signature;
+use grit_lib::objects::{serialize_tag, ObjectId, ObjectKind, TagData};
+use grit_lib::refs::store::RefName;
+use grit_lib::repo::{InitOptions, Repository};
+use grit_lib::revwalk::DescribeOptions;
+
+mod support;
+use support::{git, git_interop_available, Backend};
+
+#[test]
+fn describe_distance_matches_git_rev_list_count() {
+    if !git_interop_available(Backend::Files) {
+        return;
+    }
+    let root = tempfile::tempdir().expect("tempdir");
+    let wt = root.path();
+    git(wt, &["init", "-q"]);
+    git(wt, &["commit", "--allow-empty", "-q", "-m", "one"]);
+    git(wt, &["commit", "--allow-empty", "-q", "-m", "two"]);
+    git(wt, &["commit", "--allow-empty", "-q", "-m", "three"]);
+    git(wt, &["tag", "-a", "v0", "-m", "t", "HEAD~2"]);
+    git(wt, &["tag", "-a", "v1", "-m", "t", "HEAD~1"]);
+
+    let repo = Repository::open(
+        &wt.join(".git"),
+        &RepositoryOptions::empty().with_work_tree(wt),
+    )
+    .expect("open");
+    let described = repo
+        .revwalk()
+        .describe(
+            "HEAD",
+            &DescribeOptions {
+                tags: true,
+                ..Default::default()
+            },
+        )
+        .expect("describe")
+        .expect("some tag");
+    let tag_short = described
+        .tag
+        .as_str()
+        .strip_prefix("refs/tags/")
+        .unwrap_or(described.tag.as_str());
+    let git_count = git(wt, &["rev-list", "--count", &format!("{tag_short}..HEAD")])
+        .trim()
+        .parse::<usize>()
+        .expect("count");
+    assert_eq!(described.distance, git_count);
+}
+
+#[test]
+fn describe_clock_skew_fixture_matches_git_rev_list_count() {
+    if !git_interop_available(Backend::Files) {
+        return;
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    let wt = dir.path();
+    let (repo, _) = Repository::init(wt, &InitOptions::default()).expect("init");
+    let odb = repo.odb();
+    let base = write_commit_at(odb, &[], "base", 3129).expect("base");
+    let tagged = write_commit_at(odb, &[base], "tagged", 2598).expect("tagged");
+    let side = write_commit_at(odb, &[tagged], "side", 4411).expect("side");
+    let merge = write_commit_at(odb, &[base, side], "merge", 5000).expect("merge");
+    grit_test_support::refs::set_ref(&repo, "refs/heads/main", &merge).expect("ref");
+    tag_annotated(&repo, "t20", tagged, "m");
+
+    let described = repo
+        .revwalk()
+        .describe("main", &DescribeOptions::default())
+        .expect("describe")
+        .expect("tag");
+    let git_count = git(wt, &["rev-list", "--count", "refs/tags/t20..main"])
+        .trim()
+        .parse::<usize>()
+        .expect("count");
+    assert_eq!(described.distance, git_count);
+    assert_eq!(described.distance, 2);
+}
+
+fn init_merge_ladder_repo(wt: &std::path::Path) {
+    git(wt, &["init", "-q", "-b", "main"]);
+    git(wt, &["commit", "--allow-empty", "-q", "-m", "root"]);
+    for i in 0..4 {
+        git(wt, &["checkout", "-q", "-b", &format!("feat_{i}")]);
+        git(
+            wt,
+            &[
+                "commit",
+                "--allow-empty",
+                "-q",
+                "-m",
+                &format!("feat {i} work"),
+            ],
+        );
+        git(wt, &["checkout", "-q", "main"]);
+        git(
+            wt,
+            &[
+                "merge",
+                "-q",
+                "--no-ff",
+                &format!("feat_{i}"),
+                "-m",
+                &format!("merge feat {i}"),
+            ],
+        );
+    }
+    git(wt, &["tag", "-a", "t1", "-m", "t1", "main~2"]);
+    git(wt, &["checkout", "-q", "feat_0"]);
+    git(wt, &["commit", "--allow-empty", "-q", "-m", "side a"]);
+    git(wt, &["commit", "--allow-empty", "-q", "-m", "side b"]);
+    git(wt, &["tag", "-a", "ss", "-m", "ss", "HEAD~2"]);
+    git(wt, &["tag", "light-main", "main"]);
+}
+
+fn assert_describe_matches_git_rev_list(
+    wt: &std::path::Path,
+    repo: &Repository,
+    rev: &str,
+    opts: &DescribeOptions,
+) {
+    let described = repo
+        .revwalk()
+        .describe(rev, opts)
+        .expect("describe")
+        .expect("tag expected");
+    let tag_short = described
+        .tag
+        .as_str()
+        .strip_prefix("refs/tags/")
+        .unwrap_or(described.tag.as_str());
+    let git_count = git(wt, &["rev-list", "--count", &format!("{tag_short}..{rev}")])
+        .trim()
+        .parse::<usize>()
+        .expect("count");
+    assert_eq!(described.distance, git_count, "rev {rev}");
+}
+
+/// Issue #6613: four no-ff feature merges, annotated tag on mainline, side-branch tag.
+#[test]
+fn describe_merge_ladder_matches_git() {
+    if !git_interop_available(Backend::Files) {
+        return;
+    }
+    let root = tempfile::tempdir().expect("tempdir");
+    let wt = root.path();
+    init_merge_ladder_repo(wt);
+
+    let repo = Repository::open(
+        &wt.join(".git"),
+        &RepositoryOptions::empty().with_work_tree(wt),
+    )
+    .expect("open");
+
+    let cases: [(&str, &str, Option<&str>); 3] = [
+        ("main", "t1", Some("t1")),
+        ("main~1", "t1", Some("t1")),
+        ("feat_0", "ss", Some("ss")),
+    ];
+    for (rev, match_glob, expect_tag) in cases {
+        let opts = DescribeOptions {
+            match_glob: Some(format!("{match_glob}*")),
+            ..DescribeOptions::default()
+        };
+        let git_desc = git(wt, &["describe", &format!("--match={match_glob}*"), rev])
+            .trim()
+            .to_owned();
+        let described = repo
+            .revwalk()
+            .describe(rev, &opts)
+            .expect("describe")
+            .expect("tag expected");
+        let tag_short = described
+            .tag
+            .as_str()
+            .strip_prefix("refs/tags/")
+            .unwrap_or(described.tag.as_str());
+        assert_eq!(expect_tag, Some(tag_short), "rev {rev}");
+        let git_count = git(wt, &["rev-list", "--count", &format!("{tag_short}..{rev}")])
+            .trim()
+            .parse::<usize>()
+            .expect("count");
+        assert_eq!(described.distance, git_count, "rev {rev}");
+        assert!(
+            git_desc.starts_with(&format!("{tag_short}-{}-", described.distance)),
+            "git {git_desc}, grit distance {}",
+            described.distance
+        );
+        assert!(
+            git_desc.ends_with(&described.abbrev),
+            "git abbrev in {git_desc}, grit {}",
+            described.abbrev
+        );
+    }
+    assert_eq!(
+        repo.revwalk()
+            .describe(
+                "main",
+                &DescribeOptions {
+                    match_glob: Some("t1*".into()),
+                    ..Default::default()
+                },
+            )
+            .expect("describe")
+            .expect("tag")
+            .distance,
+        4
+    );
+    assert_eq!(
+        repo.revwalk()
+            .describe(
+                "main~1",
+                &DescribeOptions {
+                    match_glob: Some("t1*".into()),
+                    ..Default::default()
+                }
+            )
+            .expect("describe")
+            .expect("tag")
+            .distance,
+        2
+    );
+    assert_eq!(
+        repo.revwalk()
+            .describe(
+                "feat_0",
+                &DescribeOptions {
+                    match_glob: Some("ss*".into()),
+                    ..Default::default()
+                },
+            )
+            .expect("describe")
+            .expect("tag")
+            .distance,
+        2
+    );
+}
+
+#[test]
+fn describe_merge_ladder_commit_graph_and_tag_modes() {
+    if !git_interop_available(Backend::Files) {
+        return;
+    }
+    use grit_lib::maintenance::CommitGraphOptions;
+
+    let root = tempfile::tempdir().expect("tempdir");
+    let wt = root.path();
+    init_merge_ladder_repo(wt);
+    let repo = Repository::open(
+        &wt.join(".git"),
+        &RepositoryOptions::empty().with_work_tree(wt),
+    )
+    .expect("open");
+
+    let annotated = DescribeOptions::default();
+    assert_describe_matches_git_rev_list(wt, &repo, "main", &annotated);
+
+    repo.maintenance()
+        .write_commit_graph(&CommitGraphOptions::default())
+        .expect("commit-graph");
+    assert_describe_matches_git_rev_list(wt, &repo, "main", &annotated);
+
+    let graph_path = wt.join(".git/objects/info/commit-graph");
+    if graph_path.exists() {
+        std::fs::remove_file(&graph_path).expect("remove commit-graph");
+    }
+    assert_describe_matches_git_rev_list(wt, &repo, "main", &annotated);
+
+    let with_light = DescribeOptions {
+        tags: true,
+        match_glob: Some("light-*".into()),
+        ..Default::default()
+    };
+    assert_describe_matches_git_rev_list(wt, &repo, "main", &with_light);
+}
+
+/// Issue #2479: tag peel is merge first parent and side-branch root (two path depths).
+#[test]
+fn describe_diamond_merge_matches_git() {
+    if !git_interop_available(Backend::Files) {
+        return;
+    }
+    let root = tempfile::tempdir().expect("tempdir");
+    let wt = root.path();
+    git(wt, &["init", "-q", "-b", "main"]);
+    git(wt, &["commit", "--allow-empty", "-q", "-m", "base"]);
+    git(wt, &["tag", "-a", "v1", "-m", "v1"]);
+    git(wt, &["checkout", "-q", "-b", "side"]);
+    git(wt, &["commit", "--allow-empty", "-q", "-m", "s1"]);
+    git(wt, &["commit", "--allow-empty", "-q", "-m", "s2"]);
+    git(wt, &["checkout", "-q", "main"]);
+    git(wt, &["merge", "-q", "--no-ff", "side", "-m", "merge"]);
+
+    let git_desc = git(wt, &["describe"]).trim().to_owned();
+    let git_count = git(wt, &["rev-list", "--count", "v1..HEAD"])
+        .trim()
+        .parse::<usize>()
+        .expect("count");
+
+    let repo = Repository::open(
+        &wt.join(".git"),
+        &RepositoryOptions::empty().with_work_tree(wt),
+    )
+    .expect("open");
+    let described = repo
+        .revwalk()
+        .describe("HEAD", &DescribeOptions::default())
+        .expect("describe")
+        .expect("some tag");
+    let tag_short = described
+        .tag
+        .as_str()
+        .strip_prefix("refs/tags/")
+        .unwrap_or(described.tag.as_str());
+    assert_eq!(tag_short, "v1");
+    assert_eq!(described.distance, git_count);
+    assert_eq!(described.distance, 3);
+    assert!(
+        git_desc.starts_with("v1-3-g"),
+        "git describe {git_desc}, grit distance {}",
+        described.distance
+    );
+}
+
+fn write_commit_at(
+    odb: &grit_lib::objects::odb::Odb,
+    parents: &[ObjectId],
+    msg: &str,
+    time: i64,
+) -> grit_lib::error::Result<ObjectId> {
+    let tree = odb.write_loose_materialize(ObjectKind::Tree, b"")?;
+    let mut body = format!("tree {tree}\n");
+    for p in parents {
+        body.push_str(&format!("parent {p}\n"));
+    }
+    body.push_str(&format!(
+        "author T <t@e.com> {time} +0000\ncommitter T <t@e.com> {time} +0000\n\n{msg}\n"
+    ));
+    odb.write_loose_materialize(ObjectKind::Commit, body.as_bytes())
+}
+
+fn tag_annotated(repo: &Repository, name: &str, target: ObjectId, msg: &str) {
+    let tagger = Signature::new("T", "t@e.com", repo.identity_now()).expect("tagger");
+    let data = TagData {
+        object: target,
+        object_type: "commit".into(),
+        tag: name.to_owned(),
+        tagger: Some(tagger.header_line()),
+        extra_headers: Vec::new(),
+        message: format!("{msg}\n"),
+        raw_message: None,
+    };
+    let bytes = serialize_tag(&data);
+    let oid = repo.odb().write(ObjectKind::Tag, &bytes).expect("write");
+    let full = format!("refs/tags/{name}");
+    let name = RefName::try_from(full.as_str()).expect("name");
+    repo.references().update(&name, &oid).expect("update");
+}

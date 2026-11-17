@@ -48,7 +48,7 @@ impl LockWait {
     #[must_use]
     pub fn parse_files_ref_lock_timeout_ms(config: Option<&ConfigSet>) -> i64 {
         config
-            .and_then(|cfg| cfg.get("core.filesreflocktimeout"))
+            .and_then(|cfg| cfg.value("core.filesreflocktimeout"))
             .and_then(|v| v.trim().parse::<i64>().ok())
             .unwrap_or(100)
     }
@@ -79,20 +79,30 @@ impl LockWait {
     /// Load repository config from `git_dir` and return [`Self::files_ref_lock`].
     #[must_use]
     pub fn files_ref_lock_for_git_dir(git_dir: &Path) -> Self {
-        let config = ConfigSet::load(&Environment::empty(), Some(git_dir), true).ok();
+        let config = ConfigSet::load(
+            &Environment::empty(),
+            Some(git_dir),
+            &crate::config::LoadConfigOptions::standard(&Environment::empty(), Some(git_dir)),
+        )
+        .ok();
         Self::files_ref_lock(config.as_ref())
     }
 
     /// Load repository config from `git_dir` and return [`Self::packed_refs`].
     #[must_use]
     pub fn packed_refs_for_git_dir(git_dir: &Path) -> Self {
-        let config = ConfigSet::load(&Environment::empty(), Some(git_dir), true).ok();
+        let config = ConfigSet::load(
+            &Environment::empty(),
+            Some(git_dir),
+            &crate::config::LoadConfigOptions::standard(&Environment::empty(), Some(git_dir)),
+        )
+        .ok();
         Self::packed_refs(config.as_ref())
     }
 
     fn from_milliseconds_config(config: Option<&ConfigSet>, key: &str, default_ms: u64) -> Self {
         let ms = config
-            .and_then(|cfg| cfg.get(key))
+            .and_then(|cfg| cfg.value(key))
             .and_then(|v| v.trim().parse::<i64>().ok())
             .map(|v| v.max(0) as u64)
             .unwrap_or(default_ms);
@@ -103,6 +113,30 @@ impl LockWait {
                 budget: Duration::from_millis(ms),
             }
         }
+    }
+
+    /// Remaining wait budget after `elapsed` time since the outer wait started.
+    #[must_use]
+    pub fn remaining_after(self, elapsed: Duration) -> Self {
+        match self {
+            Self::Immediately => Self::Immediately,
+            Self::Indefinitely => Self::Indefinitely,
+            Self::Backoff { budget } => {
+                if elapsed >= budget {
+                    Self::Immediately
+                } else {
+                    Self::Backoff {
+                        budget: budget - elapsed,
+                    }
+                }
+            }
+        }
+    }
+
+    /// Remaining wait budget given `start` and `now`.
+    #[must_use]
+    pub fn remaining_from(self, start: Instant, now: Instant) -> Self {
+        self.remaining_after(now.saturating_duration_since(start))
     }
 }
 
@@ -469,7 +503,7 @@ pub(crate) fn retry_while_held<T, E>(
     }
 }
 
-fn backoff_delay(lock_path: &Path, attempt: u32, jitter: &dyn LockJitter) -> Duration {
+pub(crate) fn backoff_delay(lock_path: &Path, attempt: u32, jitter: &dyn LockJitter) -> Duration {
     const INITIAL_MS: u64 = 1;
     const CAP_MS: u64 = 50;
     let shift = attempt.min(16);
@@ -554,16 +588,17 @@ impl LockHolder {
 #[must_use]
 pub fn grit_lockfile_pid_enabled(config: Option<&ConfigSet>, git_dir: Option<&Path>) -> bool {
     fn from_config(cfg: &ConfigSet) -> bool {
-        match cfg.get_bool("core.lockfilepid") {
-            Some(Ok(false)) => false,
-            Some(Ok(true)) | Some(Err(_)) | None => true,
-        }
+        cfg.bool_with_default("core.lockfilepid", true)
     }
     if let Some(cfg) = config {
         return from_config(cfg);
     }
     if let Some(dir) = git_dir {
-        if let Ok(cfg) = ConfigSet::load(&Environment::empty(), Some(dir), true) {
+        if let Ok(cfg) = ConfigSet::load(
+            &Environment::empty(),
+            Some(dir),
+            &crate::config::LoadConfigOptions::standard(&Environment::empty(), Some(dir)),
+        ) {
             return from_config(&cfg);
         }
     }
@@ -779,7 +814,7 @@ mod tests {
             .err()
             .expect("held");
         match crate::error::Error::from(err) {
-            crate::error::Error::LockHeld { path, holder } => {
+            crate::error::Error::LockHeld(crate::error::LockHeldError { path, holder }) => {
                 assert_eq!(path, lock_path);
                 assert_eq!(
                     holder,

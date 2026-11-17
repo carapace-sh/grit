@@ -29,9 +29,8 @@ expect_used = "deny"
 anyhow.workspace = true
 base64.workspace = true
 clap.workspace = true
-carapace-rs.workspace = true
-carapace-rs-clap.workspace = true
-grit-lib = { version = "0.5", path = "../grit-lib", features = ["http-ureq", "tracing"] }
+clap_complete.workspace = true
+grit-lib = { version = "0.5", path = "../grit-lib", features = ["http-ureq", "tracing", "hot-text-layout"] }
 grit-http-server = { version = "0.5", path = "../grit-http-server" }
 grit-protocol = { version = "0.5", path = "../grit-protocol" }
 tracing-core = { version = "0.1", default-features = false }
@@ -43,19 +42,26 @@ schemars.workspace = true
 jaq-core = "3.1"
 jaq-json = "2.0"
 jaq-std = "3.0"
+bytes = "1"
+foldhash = "0.1"
+itoa = "1"
+ryu = "1"
 terminal_size.workspace = true
 libc.workspace = true
 rpassword = "7"
+shell-words.workspace = true
+unicode-width.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
-grit-lib = { version = "0.5", path = "../grit-lib", features = ["http-ureq", "http-ureq-native-tls", "tracing"] }
+grit-lib = { version = "0.5", path = "../grit-lib", features = ["http-ureq", "http-ureq-native-tls", "tracing", "hot-text-layout"] }
 
 # Process-creation flags and std-handle inheritance for detaching background `grit gc --auto`.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_Threading"] }
 
 [dev-dependencies]
-grit-lib = { path = "../grit-lib", features = ["http-ureq"] }
+unicode-width.workspace = true
+grit-lib = { path = "../grit-lib", features = ["http-ureq", "test-support"] }
 grit-test-support = { path = "../grit-test-support" }
 insta = { version = "1.42", features = ["json", "filters"] }
 serde_json.workspace = true

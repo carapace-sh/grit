@@ -1,12 +1,14 @@
 //! Anonymous URL/path fetch must not rewrite configured `refs/remotes/origin/*`.
 
-use grit_lib::refs::resolve_ref;
-use grit_lib::remote::transfer::{fetch_local, FetchOptions, TagMode};
+use grit_lib::remote::transfer::{FetchOptions, TagMode};
 use grit_lib::remote::Remote;
 use grit_test_support::git;
 
 fn origin_tip(path: &std::path::Path) -> grit_lib::objects::ObjectId {
-    resolve_ref(&path.join(".git"), "refs/remotes/origin/main").expect("origin/main")
+    grit_test_support::refs::at(&path.join(".git"))
+        .references()
+        .resolve("refs/remotes/origin/main")
+        .expect("origin/main")
 }
 
 #[test]
@@ -33,24 +35,38 @@ fn fetch_literal_path_leaves_origin_tracking_refs_unchanged() {
     );
     let local_git = clone.join(".git");
     let origin_before = origin_tip(&clone);
-    let o1_main = resolve_ref(&o1.join(".git"), "refs/heads/main").expect("o1 main");
+    let o1_main = grit_test_support::refs::at(&o1.join(".git"))
+        .references()
+        .resolve("refs/heads/main")
+        .expect("o1 main");
 
-    fetch_local(
+    let mut fetch_opts = FetchOptions::new();
+    fetch_opts.refspecs = vec![Remote::ANONYMOUS_FETCH_REFSPEC.to_owned()];
+    fetch_opts.tags = TagMode::None;
+    fetch_opts.fetch_source = Some(o2.to_str().unwrap().to_owned());
+    grit_lib::repo::Repository::open(
         &local_git,
-        &o2.join(".git"),
-        &FetchOptions {
-            refspecs: vec![Remote::ANONYMOUS_FETCH_REFSPEC.to_owned()],
-            tags: TagMode::None,
-            fetch_source: Some(o2.to_str().unwrap().to_owned()),
-            ..Default::default()
-        },
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&fetch_opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Local(&o2.join(".git")),
+        &mut fetch_opts.clone(),
+        &mut grit_lib::remote::fetch::NoProgress,
+        grit_lib::progress::CancelToken::never_ref(),
     )
     .expect("fetch o2");
 
     assert_eq!(origin_tip(&clone), origin_before);
     assert_eq!(origin_tip(&clone), o1_main);
     assert!(
-        resolve_ref(&local_git, "refs/remotes/origin/otherbr").is_err(),
+        grit_test_support::refs::at(&local_git)
+            .references()
+            .resolve("refs/remotes/origin/otherbr")
+            .is_err(),
         "must not create origin/otherbr from foreign repo"
     );
 
@@ -61,7 +77,10 @@ fn fetch_literal_path_leaves_origin_tracking_refs_unchanged() {
         .next()
         .expect("oid field")
         .trim();
-    let o2_main = resolve_ref(&o2.join(".git"), "refs/heads/main").expect("o2 main");
+    let o2_main = grit_test_support::refs::at(&o2.join(".git"))
+        .references()
+        .resolve("refs/heads/main")
+        .expect("o2 main");
     assert_eq!(grit_oid, o2_main.to_hex());
 
     let git_fetch = tmp.path().join("git-c");
@@ -116,20 +135,34 @@ fn explicit_url_refspec_fetch_head_records_fetched_branch_not_default() {
     let local_git = clone.join(".git");
     let o2_path = o2.to_str().unwrap();
 
-    fetch_local(
+    let mut fetch_opts = FetchOptions::new();
+    fetch_opts.refspecs = vec![format!("refs/heads/otherbr:refs/remotes/foreign/otherbr")];
+    fetch_opts.tags = TagMode::None;
+    fetch_opts.fetch_source = Some(o2_path.to_owned());
+    grit_lib::repo::Repository::open(
         &local_git,
-        &o2.join(".git"),
-        &FetchOptions {
-            refspecs: vec![format!("refs/heads/otherbr:refs/remotes/foreign/otherbr")],
-            tags: TagMode::None,
-            fetch_source: Some(o2_path.to_owned()),
-            ..Default::default()
-        },
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&fetch_opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Local(&o2.join(".git")),
+        &mut fetch_opts.clone(),
+        &mut grit_lib::remote::fetch::NoProgress,
+        grit_lib::progress::CancelToken::never_ref(),
     )
     .expect("fetch otherbr");
 
-    let other_tip = resolve_ref(&o2.join(".git"), "refs/heads/otherbr").expect("otherbr tip");
-    let main_tip = resolve_ref(&o2.join(".git"), "refs/heads/main").expect("main tip");
+    let other_tip = grit_test_support::refs::at(&o2.join(".git"))
+        .references()
+        .resolve("refs/heads/otherbr")
+        .expect("otherbr tip");
+    let main_tip = grit_test_support::refs::at(&o2.join(".git"))
+        .references()
+        .resolve("refs/heads/main")
+        .expect("main tip");
     assert_ne!(other_tip, main_tip);
 
     let grit_fetch_head =

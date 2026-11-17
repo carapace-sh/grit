@@ -1,7 +1,8 @@
 use grit_lib::config::environment::RepositoryOptions;
-use grit_lib::diff::{commit_diff_files, DiffDetail, DiffMerges, DiffOptions};
+use grit_lib::diff::{DiffDetail, DiffMerges, DiffOptions};
 use grit_lib::objects::ObjectId;
 use grit_lib::repo::Repository;
+use grit_lib::worktree::pathspec::{Pathspec, PathspecGlobalFlags};
 use grit_test_support::git;
 
 fn empty_parent_merge_with_blob(dir: &std::path::Path, blob: &[u8], name: &str) -> ObjectId {
@@ -48,17 +49,16 @@ fn combined_merge_show_includes_added_file() {
         &RepositoryOptions::empty().with_work_tree(dir.path()),
     )
     .unwrap();
-    let out = commit_diff_files(
-        &repo,
-        &merge,
-        DiffMerges::Combined,
-        DiffDetail::Patch,
-        &DiffOptions::default(),
-        &[],
-        repo.config().unwrap().as_ref(),
-        &repo.thread_policy(),
-    )
-    .unwrap();
+    let out = repo
+        .diff()
+        .commit_files(
+            &merge,
+            DiffMerges::Combined,
+            DiffDetail::Patch,
+            &DiffOptions::default(),
+            &Pathspec::entire_tree(PathspecGlobalFlags::default()),
+        )
+        .unwrap();
     assert!(
         !out.files.is_empty(),
         "expected combined diff files, got {:?}",
@@ -78,17 +78,16 @@ fn combined_merge_binary_addition_is_binary_not_text() {
         &RepositoryOptions::empty().with_work_tree(dir.path()),
     )
     .unwrap();
-    let out = commit_diff_files(
-        &repo,
-        &merge,
-        DiffMerges::Combined,
-        DiffDetail::Patch,
-        &DiffOptions::default(),
-        &[],
-        repo.config().unwrap().as_ref(),
-        &repo.thread_policy(),
-    )
-    .unwrap();
+    let out = repo
+        .diff()
+        .commit_files(
+            &merge,
+            DiffMerges::Combined,
+            DiffDetail::Patch,
+            &DiffOptions::default(),
+            &Pathspec::entire_tree(PathspecGlobalFlags::default()),
+        )
+        .unwrap();
     let file = out
         .files
         .iter()

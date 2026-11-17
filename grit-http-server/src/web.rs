@@ -28,10 +28,9 @@ use axum::{
     response::{Html, IntoResponse, Redirect},
 };
 use grit_lib::objects::{parse_commit, HashAlgo, ObjectKind};
-use grit_lib::porcelain::branch::list_branches;
 use grit_lib::remote::grit_server_auth::AUTHORIZE_PATH;
 use grit_lib::repo::Repository;
-use grit_lib::state::{resolve_head_for_repository, HeadState};
+use grit_lib::state::HeadState;
 use grit_protocol::RepositoryOptions;
 use time::OffsetDateTime;
 
@@ -865,23 +864,20 @@ pub(crate) async fn repository_page(
     page(&repo.name, Some(&viewer), &body)
 }
 
-fn short_hex(oid: &grit_lib::objects::ObjectId) -> String {
-    let hex = oid.to_hex();
-    hex.get(..7).unwrap_or(&hex).to_owned()
-}
-
 /// Read the branches and the first-parent history of `HEAD`.
 fn summarize(
     path: &Path,
     options: &RepositoryOptions,
 ) -> grit_lib::error::Result<RepositorySummary> {
     let repo = Repository::open(path, &options.clone().for_serving())?;
-    let branches = list_branches(&repo)?
+    let branches = repo
+        .branches()
+        .list_simple()?
         .branches
         .into_iter()
-        .map(|b| (b.name, short_hex(&b.oid), b.current))
+        .map(|b| (b.name, b.oid.to_short_hex(), b.current))
         .collect();
-    let (head, mut next) = match resolve_head_for_repository(&repo)? {
+    let (head, mut next) = match repo.references().head()? {
         HeadState::Branch {
             short_name, oid, ..
         } => (Some(short_name), oid),
@@ -900,7 +896,7 @@ fn summarize(
         let commit = parse_commit(&object.data)?;
         let (author, date) = split_signature(&commit.author);
         commits.push(CommitLine {
-            oid: short_hex(&oid),
+            oid: oid.to_short_hex(),
             subject: commit.message.lines().next().unwrap_or_default().to_owned(),
             author,
             date,

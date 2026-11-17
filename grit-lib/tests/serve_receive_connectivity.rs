@@ -10,15 +10,14 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use grit_lib::config::environment::{Environment, RepositoryOptions};
-use grit_lib::maintenance::{offload_blobs, OffloadOptions};
-use grit_lib::objects::pack::clear_pack_cache;
+use grit_lib::maintenance::OffloadOptions;
 use grit_lib::objects::{HashAlgo, ObjectId};
-use grit_lib::refs::resolve_ref;
 use grit_lib::remote::partial_clone::ObjectFilterSpec;
 use grit_lib::remote::serve::{
-    receive_pack, ProtocolVersion, ReceiveOutcome, ReceivePolicy, RefUpdateRefusal, ServeOptions,
+    ProtocolVersion, ReceiveOutcome, ReceivePack, ReceivePolicy, RefUpdateRefusal, ServeOptions,
 };
 use grit_lib::repo::Repository;
+use grit_lib::test_support::objects_pack::clear_pack_cache;
 
 fn git_cmd(dir: &Path, args: &[&str]) -> Command {
     let mut cmd = Command::new("git");
@@ -88,16 +87,11 @@ fn serve_push(repo_dir: &Path, body: &[u8]) -> (ReceiveOutcome, String) {
         agent: "grit-test".to_owned(),
         ..ServeOptions::default()
     };
-    let policy = ReceivePolicy::from_config(&repo.config().unwrap());
+    let policy = ReceivePolicy::from_config(&repo.config().snapshot().unwrap());
     let mut output = Vec::new();
-    let outcome = receive_pack(
-        &repo,
-        &mut std::io::Cursor::new(body),
-        &mut output,
-        &opts,
-        &policy,
-    )
-    .unwrap();
+    let outcome = ReceivePack::new(&repo, &opts, &policy)
+        .run(&mut std::io::Cursor::new(body), &mut output)
+        .unwrap();
     (outcome, String::from_utf8_lossy(&output).into_owned())
 }
 
@@ -162,7 +156,10 @@ fn a_large_push_missing_an_object_is_refused_like_git() {
             referrer: oid(&git(&work, &["rev-parse", "HEAD^{tree}"])),
         })
     );
-    assert!(resolve_ref(&grit_dir, "refs/heads/main").is_err());
+    assert!(grit_test_support::refs::at(&grit_dir)
+        .references()
+        .resolve("refs/heads/main")
+        .is_err());
     let line = "ng refs/heads/main missing necessary objects";
     assert!(report.contains(line), "{report}");
     let from_git = git_receive(&git_dir, &body);
@@ -198,7 +195,13 @@ fn a_large_complete_push_is_accepted() {
     let (outcome, report) = serve_push(&server, &push_body(Some(base), tip, &pack));
     assert!(outcome.unpack_error.is_none(), "{report}");
     assert_eq!(outcome.updates[0].error, None, "{report}");
-    assert_eq!(resolve_ref(&server, "refs/heads/main").unwrap(), tip);
+    assert_eq!(
+        grit_test_support::refs::at(&server)
+            .references()
+            .resolve("refs/heads/main")
+            .unwrap(),
+        tip
+    );
     git(&server, &["fsck", "--no-dangling"]);
 }
 
@@ -228,7 +231,13 @@ fn a_large_push_naming_an_offloaded_blob_is_accepted() {
         let repo = Repository::open(&server, &RepositoryOptions::empty()).unwrap();
         let mut opts = OffloadOptions::new("lop", 4_000_000_000);
         opts.filter = Some(ObjectFilterSpec::BlobLimit(10 * 1024));
-        assert_eq!(offload_blobs(&repo, &opts).unwrap().dropped_from_main, 1);
+        assert_eq!(
+            repo.maintenance()
+                .offload_blobs(&opts)
+                .unwrap()
+                .dropped_from_main,
+            1
+        );
         clear_pack_cache();
     }
 
@@ -249,7 +258,13 @@ fn a_large_push_naming_an_offloaded_blob_is_accepted() {
     let (outcome, report) = serve_push(&server, &push_body(Some(base), tip, &pack));
     assert!(outcome.unpack_error.is_none(), "{report}");
     assert_eq!(outcome.updates[0].error, None, "{report}");
-    assert_eq!(resolve_ref(&server, "refs/heads/main").unwrap(), tip);
+    assert_eq!(
+        grit_test_support::refs::at(&server)
+            .references()
+            .resolve("refs/heads/main")
+            .unwrap(),
+        tip
+    );
     git(&server, &["fsck", "--no-dangling"]);
 }
 
@@ -334,5 +349,8 @@ fn a_tip_left_by_a_refused_push_is_refused_again_like_git() {
         outcome.updates[0].error,
         Some(RefUpdateRefusal::Unconnected { missing, .. }) if missing == gone
     ));
-    assert!(resolve_ref(&grit_dir, "refs/heads/bad").is_err());
+    assert!(grit_test_support::refs::at(&grit_dir)
+        .references()
+        .resolve("refs/heads/bad")
+        .is_err());
 }

@@ -9,21 +9,18 @@ use std::process::Command;
 use std::str::FromStr;
 
 use grit_lib::config::environment::RepositoryOptions;
-use grit_lib::diff::hunk_id::{hunk_ids_with_duplicate_peers, DiffSide, HunkId};
 use grit_lib::diff::DiffStatus;
+use grit_lib::diff::{hunk_ids, DiffSide, HunkId};
 use grit_lib::objects::{parse_commit, ObjectId};
-use grit_lib::porcelain::hunk_select::{
-    unstaged_file_diffs, HunkSelectError, HunkSelection, LineRange,
-};
-use grit_lib::porcelain::status::{status, StatusOptions};
-use grit_lib::progress::NeverCancel;
+use grit_lib::porcelain::hunk_select::{HunkSelectError, HunkSelection, LineRange};
+use grit_lib::porcelain::status::StatusOptions;
 use grit_lib::progress::NullProgress;
 use grit_lib::repo::Repository;
 use grit_lib::revwalk::history::{
-    apply_fixup_hunk_selection, apply_fixup_rewrite, fixup, staged_fixup_paths, ApplyOptions,
-    EmptyPolicy, FixupOptions, HistoryError, RefScope, RewriteOptions,
+    ApplyOptions, EmptyPolicy, FixupOptions, HistoryError, RefScope, RewriteOptions,
 };
 
+use grit_lib::progress::CancelToken;
 use support::{
     assert_fixup_tip_matches_git_oracle, assert_fixup_tip_structure_matches, commit_file,
     disable_grit_change_ids_for_git_oracle, git, git_fsck_strict, git_history_fixup_legacy_oracle,
@@ -76,14 +73,21 @@ fn apply_opts() -> ApplyOptions {
         identity: support::reflog_signature("Fixup <f@grit.test>"),
         reflog_message: "history fixup".into(),
         record_operation: None,
-        hooks: grit_lib::PostOperationHooks::Run,
+        hooks: grit_lib::command_runner::hooks::PostOperationHooks::Run,
     }
 }
 
 fn plan_and_apply(grit: &Repository, wt: &std::path::Path, target: ObjectId, opts: &FixupOptions) {
-    let staged = staged_fixup_paths(grit).expect("staged paths");
-    let plan = fixup(grit, target, opts).expect("plan");
-    apply_fixup_rewrite(grit, &plan, &apply_opts(), &staged).expect("apply");
+    let staged = grit.history().staged_paths().expect("staged paths");
+    let plan = grit.history().fixup(target, opts).expect("plan");
+    grit.history()
+        .apply_fixup(
+            &plan,
+            &apply_opts(),
+            &staged,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("apply");
     git_fsck_strict(wt);
 }
 
@@ -129,12 +133,10 @@ fn fixup_preserves_message_and_author() {
     fs::write(wt.join("file.txt"), "content\nfix\n").expect("write");
     git(wt, &["add", "file.txt"]);
     let grit = open_grit(wt);
-    let plan = fixup(
-        &grit,
-        target,
-        &fixup_opts(RefScope::Head, EmptyPolicy::Drop),
-    )
-    .expect("plan");
+    let plan = grit
+        .history()
+        .fixup(target, &fixup_opts(RefScope::Head, EmptyPolicy::Drop))
+        .expect("plan");
     let new_oid = plan
         .commits
         .iter()
@@ -156,7 +158,7 @@ fn fixup_replaces_message_when_given() {
     let grit = open_grit(wt);
     let mut opts = fixup_opts(RefScope::Head, EmptyPolicy::Drop);
     opts.message = Some("replacement subject\n".into());
-    let plan = fixup(&grit, target, &opts).expect("plan");
+    let plan = grit.history().fixup(target, &opts).expect("plan");
     let new_oid = plan
         .commits
         .iter()
@@ -177,13 +179,11 @@ fn fixup_empty_policy_drop_keep_abort() {
     commit_file(wt, "third.t", "3\n", "third");
     git(wt, &["rm", "second.t"]);
     let grit = open_grit(wt);
-    let staged = staged_fixup_paths(&grit).expect("staged");
-    let plan = fixup(
-        &grit,
-        target,
-        &fixup_opts(RefScope::Head, EmptyPolicy::Drop),
-    )
-    .expect("drop plan");
+    let staged = grit.history().staged_paths().expect("staged");
+    let plan = grit
+        .history()
+        .fixup(target, &fixup_opts(RefScope::Head, EmptyPolicy::Drop))
+        .expect("drop plan");
     let row = plan
         .commits
         .iter()
@@ -193,7 +193,14 @@ fn fixup_empty_policy_drop_keep_abort() {
         row.new.is_none(),
         "drop should omit the empty target commit"
     );
-    apply_fixup_rewrite(&grit, &plan, &apply_opts(), &staged).expect("drop apply");
+    grit.history()
+        .apply_fixup(
+            &plan,
+            &apply_opts(),
+            &staged,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("drop apply");
     let log = git(wt, &["log", "--format=%s"]);
     assert!(!log.contains("second"));
     assert!(log.contains("third"));
@@ -206,12 +213,10 @@ fn fixup_empty_policy_drop_keep_abort() {
     commit_file(wt2, "third.t", "3\n", "third");
     git(wt2, &["rm", "second.t"]);
     let grit2 = open_grit(wt2);
-    let err = fixup(
-        &grit2,
-        target2,
-        &fixup_opts(RefScope::Head, EmptyPolicy::Abort),
-    )
-    .unwrap_err();
+    let err = grit2
+        .history()
+        .fixup(target2, &fixup_opts(RefScope::Head, EmptyPolicy::Abort))
+        .unwrap_err();
     assert!(matches!(err, HistoryError::FixupMakesTargetEmpty { .. }));
 
     let repo3 = HistoryRepo::init();
@@ -222,13 +227,11 @@ fn fixup_empty_policy_drop_keep_abort() {
     commit_file(wt3, "third.t", "3\n", "third");
     git(wt3, &["rm", "second.t"]);
     let grit3 = open_grit(wt3);
-    let staged3 = staged_fixup_paths(&grit3).expect("staged");
-    let plan3 = fixup(
-        &grit3,
-        target3,
-        &fixup_opts(RefScope::Head, EmptyPolicy::Keep),
-    )
-    .expect("keep plan");
+    let staged3 = grit3.history().staged_paths().expect("staged");
+    let plan3 = grit3
+        .history()
+        .fixup(target3, &fixup_opts(RefScope::Head, EmptyPolicy::Keep))
+        .expect("keep plan");
     let row = plan3
         .commits
         .iter()
@@ -238,7 +241,15 @@ fn fixup_empty_policy_drop_keep_abort() {
         row.new.is_some(),
         "keep should retain an empty target commit"
     );
-    apply_fixup_rewrite(&grit3, &plan3, &apply_opts(), &staged3).expect("keep apply");
+    grit3
+        .history()
+        .apply_fixup(
+            &plan3,
+            &apply_opts(),
+            &staged3,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("keep apply");
 }
 
 #[test]
@@ -256,12 +267,10 @@ fn fixup_conflict_changes_nothing() {
     let before = git_rev_parse(wt, "HEAD").expect("before");
     let grit = open_grit(wt);
     let target = git_rev_parse(wt, "HEAD~1").expect("target");
-    let err = fixup(
-        &grit,
-        target,
-        &fixup_opts(RefScope::Head, EmptyPolicy::Drop),
-    )
-    .unwrap_err();
+    let err = grit
+        .history()
+        .fixup(target, &fixup_opts(RefScope::Head, EmptyPolicy::Drop))
+        .unwrap_err();
     assert!(matches!(err, HistoryError::Conflict { .. }));
     assert_eq!(git_rev_parse(wt, "HEAD"), Some(before));
 }
@@ -287,13 +296,14 @@ fn fixup_preserves_unstaged_deletion_after_partial_staging() {
         !wt.join("file.txt").exists(),
         "worktree file must stay deleted"
     );
-    let st = status(
-        &grit,
-        &StatusOptions::default(),
-        &mut NullProgress,
-        &NeverCancel,
-    )
-    .expect("status");
+    let st = grit
+        .status()
+        .run(
+            &StatusOptions::default(),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("status");
     assert_eq!(st.staged.len(), 0, "staging consumed by fixup");
     assert_eq!(st.unstaged.len(), 1);
     assert_eq!(st.unstaged[0].status, DiffStatus::Deleted);
@@ -358,13 +368,14 @@ fn fixup_preserves_unstaged_modification_after_partial_staging() {
         fs::read_to_string(wt.join("file.txt")).expect("read"),
         "one\nunstaged edit\nthree\n"
     );
-    let st = status(
-        &grit,
-        &StatusOptions::default(),
-        &mut NullProgress,
-        &NeverCancel,
-    )
-    .expect("status");
+    let st = grit
+        .status()
+        .run(
+            &StatusOptions::default(),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("status");
     assert_eq!(st.staged.len(), 0);
     assert_eq!(st.unstaged.len(), 1);
 }
@@ -390,13 +401,14 @@ fn fixup_preserves_unstaged_insertion_on_partially_staged_path() {
         fs::read_to_string(wt.join("file.txt")).expect("read"),
         "one\nstaged B\nunstaged C\nthree\n"
     );
-    let st = status(
-        &grit,
-        &StatusOptions::default(),
-        &mut NullProgress,
-        &NeverCancel,
-    )
-    .expect("status");
+    let st = grit
+        .status()
+        .run(
+            &StatusOptions::default(),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("status");
     assert_eq!(st.staged.len(), 0);
     assert_eq!(st.unstaged.len(), 1);
 }
@@ -446,13 +458,14 @@ fn fixup_preserves_unstaged_changes() {
         fs::read_to_string(wt.join("b")).expect("read"),
         "unstaged\n"
     );
-    let st = status(
-        &grit,
-        &StatusOptions::default(),
-        &mut NullProgress,
-        &NeverCancel,
-    )
-    .expect("status");
+    let st = grit
+        .status()
+        .run(
+            &StatusOptions::default(),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("status");
     assert_eq!(st.staged.len(), 0);
     assert_eq!(st.unstaged.len(), 1);
 }
@@ -463,12 +476,13 @@ fn fixup_nothing_staged_errors() {
     let wt = repo.worktree();
     commit_file(wt, "only.t", "x\n", "only");
     let grit = open_grit(wt);
-    let err = fixup(
-        &grit,
-        git_rev_parse(wt, "HEAD").expect("head"),
-        &fixup_opts(RefScope::Head, EmptyPolicy::Drop),
-    )
-    .unwrap_err();
+    let err = grit
+        .history()
+        .fixup(
+            git_rev_parse(wt, "HEAD").expect("head"),
+            &fixup_opts(RefScope::Head, EmptyPolicy::Drop),
+        )
+        .unwrap_err();
     assert!(matches!(err, HistoryError::NothingStaged));
 }
 
@@ -480,12 +494,13 @@ fn fixup_rejects_bare_repository() {
         &["init", "--bare", "-b", "main", tmp.path().to_str().unwrap()],
     );
     let grit = Repository::discover(Some(tmp.path()), &RepositoryOptions::empty()).expect("bare");
-    let err = fixup(
-        &grit,
-        ObjectId::null(grit.odb().hash_algo()),
-        &fixup_opts(RefScope::Head, EmptyPolicy::Drop),
-    )
-    .unwrap_err();
+    let err = grit
+        .history()
+        .fixup(
+            ObjectId::null(grit.odb().hash_algo()),
+            &fixup_opts(RefScope::Head, EmptyPolicy::Drop),
+        )
+        .unwrap_err();
     assert!(matches!(err, HistoryError::BareRepository));
 }
 
@@ -594,10 +609,10 @@ fn two_hunk_edited_file() -> (String, String) {
 }
 
 fn unstaged_hunk_ids(repo: &Repository) -> Vec<HunkId> {
-    let files = unstaged_file_diffs(repo, &[]).expect("diff");
+    let files = repo.index().unstaged_file_diffs(&[]).expect("diff");
     assert_eq!(files.len(), 1);
     let (file, peer) = &files[0];
-    hunk_ids_with_duplicate_peers(DiffSide::Unstaged, &file.path, &file.hunks, peer)
+    hunk_ids(DiffSide::Unstaged, &file.path, &file.hunks, peer)
 }
 
 fn fixup_opts_with_selection(
@@ -627,8 +642,15 @@ fn plan_and_apply_hunks(
     opts: &FixupOptions,
 ) {
     let selection = opts.selection.clone().expect("selection");
-    let plan = fixup(grit, target, opts).expect("plan");
-    apply_fixup_hunk_selection(grit, &plan, &apply_opts(), &selection, &opts.pathspecs)
+    let plan = grit.history().fixup(target, opts).expect("plan");
+    grit.history()
+        .apply_fixup_hunks(
+            &plan,
+            &apply_opts(),
+            &selection,
+            &opts.pathspecs,
+            &grit_lib::progress::CancelToken::never(),
+        )
         .expect("apply");
     git_fsck_strict(wt);
 }
@@ -716,18 +738,19 @@ fn fixup_hunks_preserves_preexisting_staged_on_same_path() {
     let grit = open_grit(wt);
     let ids = unstaged_hunk_ids(&grit);
     assert!(ids.len() >= 2);
-    grit_lib::porcelain::hunk_select::stage_hunks(
-        &grit,
-        DiffSide::Unstaged,
-        &HunkSelection {
-            ids: vec![ids[0].clone()],
-            ranges: Vec::new(),
-        },
-        &[],
-        grit_lib::diff::DiffOptions::default(),
-        false,
-    )
-    .expect("stage first hunk");
+    grit.index()
+        .stage_hunks(
+            DiffSide::Unstaged,
+            &HunkSelection {
+                ids: vec![ids[0].clone()],
+                ranges: Vec::new(),
+            },
+            &[],
+            grit_lib::diff::DiffOptions::default(),
+            false,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("stage first hunk");
     let staged_before = Command::new("git")
         .current_dir(wt)
         .args(["diff", "--cached", "f.txt"])
@@ -798,18 +821,19 @@ fn fixup_lines_preserves_preexisting_staged_and_consumes_selected_line() {
     let grit = open_grit(wt);
     let ids = unstaged_hunk_ids(&grit);
     assert!(ids.len() >= 2);
-    grit_lib::porcelain::hunk_select::stage_hunks(
-        &grit,
-        DiffSide::Unstaged,
-        &HunkSelection {
-            ids: vec![ids[0].clone()],
-            ranges: Vec::new(),
-        },
-        &[],
-        grit_lib::diff::DiffOptions::default(),
-        false,
-    )
-    .expect("stage line-5 hunk");
+    grit.index()
+        .stage_hunks(
+            DiffSide::Unstaged,
+            &HunkSelection {
+                ids: vec![ids[0].clone()],
+                ranges: Vec::new(),
+            },
+            &[],
+            grit_lib::diff::DiffOptions::default(),
+            false,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("stage line-5 hunk");
     let selection = HunkSelection {
         ids: Vec::new(),
         ranges: vec![LineRange {
@@ -875,22 +899,23 @@ fn fixup_lines_same_structured_hunk_preserves_unselected_and_staged() {
     edited = edited.replacen("line18\n", "LINE18\n", 1);
     fs::write(wt.join("f.txt"), &edited).expect("write");
     let grit = open_grit(wt);
-    grit_lib::porcelain::hunk_select::stage_hunks(
-        &grit,
-        DiffSide::Unstaged,
-        &HunkSelection {
-            ids: Vec::new(),
-            ranges: vec![LineRange {
-                path: "f.txt".into(),
-                start: 19,
-                end: 19,
-            }],
-        },
-        &[],
-        grit_lib::diff::DiffOptions::default(),
-        false,
-    )
-    .expect("stage line-18 only");
+    grit.index()
+        .stage_hunks(
+            DiffSide::Unstaged,
+            &HunkSelection {
+                ids: Vec::new(),
+                ranges: vec![LineRange {
+                    path: "f.txt".into(),
+                    start: 19,
+                    end: 19,
+                }],
+            },
+            &[],
+            grit_lib::diff::DiffOptions::default(),
+            false,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("stage line-18 only");
     let selection = HunkSelection {
         ids: Vec::new(),
         ranges: vec![LineRange {
@@ -965,22 +990,23 @@ fn fixup_lines_pre_staged_same_hunk_preserves_unselected_and_staged() {
     edited = edited.replacen("line9\n", "LINE9\n", 1);
     fs::write(wt.join("f.txt"), &edited).expect("write");
     let grit = open_grit(wt);
-    grit_lib::porcelain::hunk_select::stage_hunks(
-        &grit,
-        DiffSide::Unstaged,
-        &HunkSelection {
-            ids: Vec::new(),
-            ranges: vec![LineRange {
-                path: "f.txt".into(),
-                start: 6,
-                end: 6,
-            }],
-        },
-        &[],
-        grit_lib::diff::DiffOptions::default(),
-        false,
-    )
-    .expect("stage line-5 only");
+    grit.index()
+        .stage_hunks(
+            DiffSide::Unstaged,
+            &HunkSelection {
+                ids: Vec::new(),
+                ranges: vec![LineRange {
+                    path: "f.txt".into(),
+                    start: 6,
+                    end: 6,
+                }],
+            },
+            &[],
+            grit_lib::diff::DiffOptions::default(),
+            false,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("stage line-5 only");
     let selection = HunkSelection {
         ids: Vec::new(),
         ranges: vec![LineRange {
@@ -1052,12 +1078,13 @@ fn fixup_hunks_stale_id_no_rewrite() {
         ids: vec![HunkId::from_str("000000000001").expect("id")],
         ranges: Vec::new(),
     };
-    let err = fixup(
-        &grit,
-        target,
-        &fixup_opts_with_selection(RefScope::Head, EmptyPolicy::Drop, selection),
-    )
-    .expect_err("stale");
+    let err = grit
+        .history()
+        .fixup(
+            target,
+            &fixup_opts_with_selection(RefScope::Head, EmptyPolicy::Drop, selection),
+        )
+        .expect_err("stale");
     assert!(matches!(
         err,
         HistoryError::HunkSelect(HunkSelectError::StaleId { .. })
@@ -1138,22 +1165,23 @@ fn fixup_lines_insertion_with_pre_staged_restores_shifted_unselected_below() {
     edited = edited.replacen("line22\n", "KEEP22\n", 1);
     fs::write(wt.join("f.txt"), &edited).expect("write");
     let grit = open_grit(wt);
-    grit_lib::porcelain::hunk_select::stage_hunks(
-        &grit,
-        DiffSide::Unstaged,
-        &HunkSelection {
-            ids: Vec::new(),
-            ranges: vec![LineRange {
-                path: "f.txt".into(),
-                start: 4,
-                end: 4,
-            }],
-        },
-        &[],
-        grit_lib::diff::DiffOptions::default(),
-        false,
-    )
-    .expect("stage line-3");
+    grit.index()
+        .stage_hunks(
+            DiffSide::Unstaged,
+            &HunkSelection {
+                ids: Vec::new(),
+                ranges: vec![LineRange {
+                    path: "f.txt".into(),
+                    start: 4,
+                    end: 4,
+                }],
+            },
+            &[],
+            grit_lib::diff::DiffOptions::default(),
+            false,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("stage line-3");
     let selection = HunkSelection {
         ids: Vec::new(),
         ranges: vec![LineRange {
@@ -1189,21 +1217,21 @@ fn fixup_hunk_selection_plans_against_index_worktree_base_non_head_target() {
     edited = edited.replacen("line25\n", "KEEP25\n", 1);
     fs::write(wt.join("f.txt"), &edited).expect("write");
     let grit = open_grit(wt);
-    let files = unstaged_file_diffs(&grit, &[]).expect("diff");
+    let files = grit.index().unstaged_file_diffs(&[]).expect("diff");
     let (file, peer) = &files[0];
-    let ids = hunk_ids_with_duplicate_peers(DiffSide::Unstaged, &file.path, &file.hunks, peer);
+    let ids = hunk_ids(DiffSide::Unstaged, &file.path, &file.hunks, peer);
     let selection = HunkSelection {
         ids: vec![ids[0].clone()],
         ranges: Vec::new(),
     };
-    grit_lib::porcelain::hunk_select::resolve_selection(
-        &grit,
-        DiffSide::Unstaged,
-        &selection,
-        &[],
-        grit_lib::diff::DiffOptions::default(),
-    )
-    .expect("resolve");
+    grit.index()
+        .resolve_hunk_selection(
+            DiffSide::Unstaged,
+            &selection,
+            &[],
+            grit_lib::diff::DiffOptions::default(),
+        )
+        .expect("resolve");
     plan_and_apply_hunks(
         &grit,
         wt,

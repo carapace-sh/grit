@@ -21,7 +21,7 @@ grit pull origin <branch>          # the same
 
 ## Description
 
-Runs [`grit fetch`](../fetch/) (same shared fetch flags: tags, prune, dry-run, quiet), then merges the fetched upstream into the **current** branch, as [`grit merge`](../merge/) would: a fast-forward when you have no new commits of your own, and a merge commit when both sides do. On a branch with no commits yet, it simply takes the remote's.
+Runs [`grit fetch`](../fetch/) (same shared fetch flags: tags, prune, dry-run, quiet), then merges the fetched upstream into the **current** branch, as [`grit merge`](../merge/) would: a fast-forward when you have no new commits of your own, and a merge commit when both sides do. Pathnames in human, stderr conflict lines, and `--markdown` output use the same quoting rules as [`grit status`](../status/) (see **Description** there). On a branch with no commits yet, it simply takes the remote's.
 
 Positional arguments follow [`grit fetch`](../fetch/): an optional remote (configured name, URL, or path), then optional refspecs. With `grit pull origin feature`, grit fetches that branch and integrates the tip recorded in `FETCH_HEAD`, even when no remote-tracking ref exists yet — the same model as `git pull origin feature`.
 
@@ -33,13 +33,13 @@ Like `grit merge`, `grit pull` uses the same scoped local-change rules as [`grit
 
 The fetch step uses the same terminal progress as [`grit fetch`](../fetch/) and [`grit clone`](../clone/): a `Pulling <remote> <url>` line, then live stderr progress with an overall bar on a TTY in human mode, silent when stderr is piped or when you pass `--json` or `--markdown`. When the fetch received objects, the result line is followed by the same `time`, `data` and `objects` summary rows as `grit fetch`. When you need an explicit fetch refspec or fetch-only flags (`--depth`, `--deepen`, `--unshallow`, `--tags`, `--no-tags`, `--prune`, `--no-prune`, `--dry-run`, `-q`), run [`grit fetch`](../fetch/) first, then integrate with `grit merge` or the pull integration flags below.
 
-Integration mode follows Git's `pull.ff`, `pull.rebase`, and `branch.<name>.rebase` unless overridden on the command line. With rebase, local commits replay onto the fetched upstream tip via the history engine, exactly as [`grit rebase`](../rebase/) does. When a commit conflicts, the rebase stops (exit **1**) with conflict markers, unmerged paths and Git-compatible `.git/rebase-merge/` state; the branch still points at its old tip until the rebase finishes. Resolve, `grit add`, then `grit rebase --continue`, or run `grit rebase --skip` / `grit rebase --abort` (`git rebase --continue` / `--abort` work on the same state). The rebase only stops when it can do so without losing work: if staged or unstaged changes exist, or an untracked file sits where the stop would check out a path, the pull refuses with `kind: dirty_worktree` (or the overwrite error) and nothing changes. Use `--autostash` or commit first. `pull.rebase=interactive` is rejected. For a standalone rebase without fetching, use [`grit rebase`](rebase.md).
+Integration mode follows Git's `pull.ff`, `pull.rebase`, and `branch.<name>.rebase` unless overridden on the command line. With rebase, local commits replay onto the fetched upstream tip via the history engine, exactly as [`grit rebase`](../rebase/) does. Rebasing uses the upstream tracking ref's reflog fork point (as `git pull --rebase` does), so commits a teammate dropped with a force-push are not replayed from your older view of the branch. When a commit conflicts, the rebase stops (exit **1**) with conflict markers, unmerged paths and Git-compatible `.git/rebase-merge/` state; the branch still points at its old tip until the rebase finishes. Resolve, `grit add`, then `grit rebase --continue`, or run `grit rebase --skip` / `grit rebase --abort` (`git rebase --continue` / `--abort` work on the same state). The rebase only stops when it can do so without losing work: if staged or unstaged changes exist, or an untracked file sits where the stop would check out a path, the pull refuses with `kind: dirty_worktree` (or the overwrite error) and nothing changes. Use `--autostash` or commit first. `pull.rebase=interactive` is rejected. For a standalone rebase without fetching, use [`grit rebase`](rebase.md).
 
 The integration step records the branch's pre-pull tip in `ORIG_HEAD`, the way [`grit merge`](../merge/) and [`grit rebase`](../rebase/) do, so `grit reset --hard ORIG_HEAD` undoes a pull. A branch with no commits yet has no previous tip, so the first pull onto it leaves `ORIG_HEAD` alone.
 
 Integration runs the same hooks as `git pull`: `post-merge 0` after a fast-forward or merge commit (in rebase mode too, when the branch is only behind and simply fast-forwards), and `post-checkout <old tip> <upstream> 1` plus `post-rewrite rebase` after a rebase (see [`grit hooks`](../hooks/)). Before anything is recorded it also runs `pre-merge-commit`, `prepare-commit-msg` and `commit-msg` for a merge commit (as [`grit merge`](../merge/) does), and `pre-rebase <commit>` before a rebase replays commits; a hook that exits non-zero stops the pull.
 
-`--autostash` stashes dirty index/worktree changes (including untracked files) before integrating, then re-applies them afterward. Config `merge.autoStash` / `rebase.autoStash` enables the same behavior by default for merge and rebase pulls respectively. If re-applying the stash conflicts, the pull integration is kept, the stash entry remains on `refs/stash`, and the result is `autostash_conflict` (exit **1**). When a rebase pull stops on conflicts, the stash is not applied over the conflict markers: it stays on `refs/stash` (reported as `autostash`) so you can `grit stash pop` once the rebase is finished or aborted. When a hook refuses the merge commit, the merge stays in progress and the stash waits in `MERGE_AUTOSTASH`, as with Git: your edits stay out of the merge, and `grit merge --continue` (or `grit commit`) or `grit merge --abort` puts them back.
+`--autostash` stashes dirty index/worktree changes (including untracked files) before integrating, then re-applies them afterward. Config `merge.autoStash` / `rebase.autoStash` enables the same behavior by default for merge and rebase pulls respectively. On a branch with no commits yet, autostash is skipped and the upstream tip is checked out instead (same as Git). If re-applying the stash conflicts, the pull integration is kept, the stash entry remains on `refs/stash`, and the result is `autostash_conflict` (exit **1**). When a rebase pull stops on conflicts, the stash is not applied over the conflict markers: it stays on `refs/stash` (reported as `autostash`) so you can `grit stash pop` once the rebase is finished or aborted. When a hook refuses the merge commit, the merge stays in progress and the stash waits in `MERGE_AUTOSTASH`, as with Git: your edits stay out of the merge, and `grit merge --continue` (or `grit commit`) or `grit merge --abort` puts them back.
 
 ### In a snapshot checkout
 
@@ -187,6 +187,17 @@ While a rebase is paused (for example after a conflict), `grit pull` refuses wit
 $ grit pull
 error: cannot pull while a rebase is in progress; finish it with `grit rebase --continue` or cancel it with `grit rebase --abort`
 ```
+
+When local edits on a path the pull would update would be overwritten (fast-forward, merge, or rebase):
+
+```console
+$ grit pull
+error: local changes would be overwritten by merge
+  f
+hint: commit them with `grit commit`, or set them aside with `grit stash`, then try again
+```
+
+On overwrite refusal with `--json`, stdout is a single object with `kind` `would_overwrite` and `would_overwrite.reason` (`local_changes` or `untracked`) plus a sorted `paths` array, and a `hint` — the same shape as [`grit merge`](../merge/) and [`grit switch`](../switch/). For example `{"error":"local changes would be overwritten by merge","hint":"…","kind":"would_overwrite","would_overwrite":{"paths":["f"],"reason":"local_changes"}}`. See the [error schema](/schemas/error/v1.json).
 
 With `--json` that is `{"error":"no upstream configured for branch main","hint":"…","kind":"branch_no_upstream"}`. A missing remote is `kind` `remote_not_found` and an authentication failure `auth_required` or `auth_rejected`, each with a `hint` (see [Exit codes](../exit-codes/)).
 

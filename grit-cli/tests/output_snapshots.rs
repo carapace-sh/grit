@@ -5,6 +5,7 @@
 use std::fs;
 use std::path::Path;
 
+use grit_lib::progress::CancelToken;
 use grit_test_support::{CliFixture, SnapshotExitCodes};
 
 fn snapshot_dir() -> &'static Path {
@@ -30,6 +31,98 @@ fn snapshot_status() {
 }
 
 #[test]
+fn snapshot_status_merge_in_progress() {
+    CliFixture::snapshot_fresh_all_modes(
+        "status_merge_in_progress",
+        &["status"],
+        snapshot_dir(),
+        || {
+            let fixture = CliFixture::empty();
+            prepare_merge_conflict(&fixture);
+            let out = fixture.run(&["merge", "side"]);
+            assert_ne!(out.status, Some(0), "merge should stop on conflicts");
+            fixture
+        },
+    );
+}
+
+#[test]
+fn snapshot_status_no_ahead_behind() {
+    snapshot_all_modes("status_no_ahead_behind", &["status", "--no-ahead-behind"]);
+}
+
+fn prepare_status_ignored(fixture: &CliFixture) {
+    write_file(fixture.path(), ".gitignore", "*.ignored\n");
+    write_file(fixture.path(), "noise.ignored", "ignored payload\n");
+}
+
+#[test]
+fn snapshot_status_ignored() {
+    snapshot_fresh(
+        "status_ignored",
+        &["status", "--ignored"],
+        prepare_status_ignored,
+    );
+}
+
+fn prepare_status_upstream(fixture: &CliFixture) {
+    let parent = fixture.path().parent().expect("parent");
+    let bare = parent.join("status-upstream.git");
+    if bare.exists() {
+        fs::remove_dir_all(&bare).expect("remove old bare");
+    }
+    let bare_utf8 = bare.to_str().expect("bare utf8");
+    grit_test_support::git(parent, &["init", "--bare", "-b", "main", bare_utf8]);
+    fixture
+        .run(&["remote", "add", "origin", bare_utf8])
+        .expect_success("remote add");
+    fixture
+        .run(&["push", "-u", "origin", "main"])
+        .expect_success("push main");
+    fixture.write_repo_file("ahead-on-main.txt", "ahead\n");
+    fixture
+        .run(&["commit", "-am", "ahead of origin"])
+        .expect_success("local ahead commit");
+}
+
+#[test]
+fn snapshot_status_upstream() {
+    snapshot_fresh("status_upstream", &["status"], prepare_status_upstream);
+}
+
+fn prepare_status_workspace(fixture: &CliFixture) {
+    for (name, commits) in [("one", 2usize), ("two", 1usize)] {
+        fixture
+            .run(&["switch", "--create", name, "main"])
+            .expect_success("branch");
+        for i in 0..commits {
+            fixture.write_repo_file(&format!("{name}-{i}.txt"), "payload\n");
+            fixture.run(&["add", "."]).expect_success("add");
+            fixture
+                .run(&["commit", "-m", &format!("{name} commit {i}")])
+                .expect_success("commit");
+        }
+    }
+    fixture
+        .run(&["switch", "--create", "gitbutler/workspace", "one"])
+        .expect_success("workspace branch");
+    fixture
+        .run(&[
+            "merge",
+            "--no-ff",
+            "two",
+            "-m",
+            "GitButler Workspace Commit\n\nmanaged by GitButler",
+        ])
+        .expect_success("workspace merge");
+}
+
+#[test]
+fn snapshot_status_workspace() {
+    snapshot_fresh("status_workspace", &["status"], prepare_status_workspace);
+}
+
+#[test]
 fn snapshot_skill() {
     snapshot_all_modes("skill", &["skill"]);
 }
@@ -43,14 +136,14 @@ fn snapshot_fsck() {
 fn snapshot_fsck_missing_blob() {
     snapshot_fresh("fsck_missing_blob", &["fsck"], |fixture| {
         use grit_lib::index::Index;
-        use grit_lib::porcelain::add::stage_for_commit;
         use grit_lib::progress::NullProgress;
         use grit_lib::repo::{InitOptions, Repository};
         use std::fs;
 
-        let repo = Repository::init(fixture.path(), &InitOptions::default()).expect("init");
+        let (repo, _) = Repository::init(fixture.path(), &InitOptions::default()).expect("init");
         fs::write(repo.work_tree().unwrap().join("orphan.txt"), b"data\n").unwrap();
-        stage_for_commit(&repo, &mut NullProgress, &grit_lib::progress::NeverCancel)
+        repo.index()
+            .stage_for_commit(&mut NullProgress, &grit_lib::progress::CancelToken::never())
             .expect("stage");
         let index = Index::load(&repo.git_dir().join("index")).expect("index");
         let oid = index.entries()[0].oid;
@@ -360,6 +453,13 @@ fn snapshot_revs_head() {
 #[test]
 fn snapshot_revs_count() {
     snapshot_all_modes("revs_count", &["revs", "--count", "HEAD"]);
+}
+
+#[test]
+fn snapshot_describe() {
+    snapshot_fresh("describe", &["describe"], |fixture| {
+        fixture.run_ok(&["tag", "-m", "release", "v0.1", "HEAD~1"]);
+    });
 }
 
 #[test]
@@ -835,6 +935,25 @@ fn prepare_stash(fixture: &CliFixture) {
         .expect_success("stash push");
 }
 
+fn prepare_stash_list_multiple(fixture: &CliFixture) {
+    fixture
+        .run(&["stash", "push", "-m", "first stash"])
+        .expect_success("first stash");
+    fixture.write_repo_file("stash-round2.txt", "round two\n");
+    fixture
+        .run(&["stash", "push", "-m", "second stash"])
+        .expect_success("second stash");
+}
+
+#[test]
+fn snapshot_stash_list_multiple() {
+    snapshot_fresh(
+        "stash_list_multiple",
+        &["stash", "list"],
+        prepare_stash_list_multiple,
+    );
+}
+
 const LINKED_WT: &str = "linked-wt";
 
 fn prepare_ignore_check(fixture: &CliFixture) {
@@ -940,6 +1059,18 @@ fn snapshot_worktree_list() {
         fixture
             .run(&["worktree", "add", LINKED_WT, "-b", "wt|branch"])
             .expect_success("worktree add");
+    });
+}
+
+#[test]
+fn snapshot_worktree_list_multiple() {
+    snapshot_fresh("worktree_list_multiple", &["worktree", "list"], |fixture| {
+        fixture
+            .run(&["worktree", "add", "wt-alpha", "-b", "wt-alpha"])
+            .expect_success("worktree alpha");
+        fixture
+            .run(&["worktree", "add", "wt-beta", "-b", "wt-beta"])
+            .expect_success("worktree beta");
     });
 }
 
@@ -1268,6 +1399,17 @@ fn prepare_history_conflict(fixture: &CliFixture) {
 fn snapshot_error_usage() {
     let fixture = CliFixture::new();
     fixture.snapshot_all_modes_expect("error_usage", &["branch", "--delete"], snapshot_dir(), 2);
+}
+
+#[test]
+fn snapshot_error_clap_habit() {
+    let fixture = CliFixture::new();
+    fixture.snapshot_all_modes_exits(
+        "error_clap_habit",
+        &["checkout", "-b", "feature"],
+        snapshot_dir(),
+        SnapshotExitCodes::all(2),
+    );
 }
 
 #[test]

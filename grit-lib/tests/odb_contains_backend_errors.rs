@@ -9,16 +9,15 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use grit_lib::config::environment::RepositoryOptions;
+use grit_lib::config::environment::{Environment, RepositoryOptions};
 use grit_lib::config::ConfigSet;
 use grit_lib::error::{Error, Result};
 use grit_lib::objects::odb::store::{MemoryStore, ObjectStore, WritableObjectStore};
 use grit_lib::objects::odb::{OdbBuilder, WriteOptions};
 use grit_lib::objects::{HashAlgo, Object, ObjectId, ObjectInfo, ObjectKind};
 use grit_lib::refs::refs_fsck::refs_fsck;
-use grit_lib::refs::store::RefName;
-use grit_lib::repo::{InitOptions, Repository, RepositoryBuilder};
-use grit_lib::revwalk::rev_parse::abbreviate_object_id;
+use grit_lib::refs::store::{MemoryRefStore, RefName};
+use grit_lib::repo::{InitOptions, Repository};
 
 #[derive(Debug)]
 struct Flaky {
@@ -86,7 +85,7 @@ fn flaky_repo(dir: &Path) -> (Repository, Arc<Flaky>, ObjectId) {
         dir,
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
-            .with_ref_storage(grit_lib::RefStorageFormat::Files),
+            .with_ref_storage(grit_lib::refs::ref_storage::RefStorageFormat::Files),
     )
     .expect("init");
     let git_dir = dir.join(".git").canonicalize().expect("canonical git dir");
@@ -94,14 +93,13 @@ fn flaky_repo(dir: &Path) -> (Repository, Arc<Flaky>, ObjectId) {
         inner: MemoryStore::new(HashAlgo::Sha1),
         fail: AtomicBool::new(false),
     });
-    let repo = RepositoryBuilder::new(RepositoryOptions::empty())
-        .odb_builder(
-            OdbBuilder::files(git_dir.join("objects"))
-                .primary(flaky.clone())
-                .alternates(false),
-        )
-        .open(&git_dir, Some(dir))
-        .expect("open");
+    let repo = Repository::open(
+        &git_dir,
+        &(RepositoryOptions::empty()
+            .with_object_store(flaky.clone())
+            .with_work_tree(dir)),
+    )
+    .expect("open");
     let tree = repo.odb().write(ObjectKind::Tree, b"").expect("tree");
     let commit = repo
         .odb()
@@ -154,11 +152,15 @@ fn contains_reports_primary_failure_even_when_extra_source_has_object() {
     let oid = extra
         .write(ObjectKind::Blob, b"only here", WriteOptions::default())
         .unwrap();
-    let odb = OdbBuilder::files(dir.path().join("objects"))
-        .primary(flaky)
-        .push_read_source(extra)
-        .alternates(false)
-        .build();
+    let repo = Repository::open(
+        &dir.path().join("g.git"),
+        &(RepositoryOptions::empty()
+            .with_object_store(flaky)
+            .with_odb_builder(OdbBuilder::new().push_read_source(extra))
+            .with_ref_store(Arc::new(MemoryRefStore::new()))),
+    )
+    .expect("open");
+    let odb = repo.odb();
     assert!(is_backend_down(&odb.read(&oid).unwrap_err()));
     assert!(is_backend_down(&odb.contains(&oid).unwrap_err()));
 }
@@ -167,15 +169,20 @@ fn contains_reports_primary_failure_even_when_extra_source_has_object() {
 fn refs_fsck_reports_backend_failure_not_missing_object() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (repo, flaky, _commit) = flaky_repo(dir.path());
-    let config = ConfigSet::load_repo_local_only(repo.git_dir()).expect("config");
-    let issues = refs_fsck(&repo, repo.odb(), &config, false).expect("healthy fsck");
+    let config = ConfigSet::load(
+        &Environment::empty(),
+        Some(repo.git_dir()),
+        &crate::config::LoadConfigOptions::repo_local_only(repo.git_dir()),
+    )
+    .expect("config");
+    let issues = refs_fsck(&repo, repo.odb(), false).expect("healthy fsck");
     assert!(
         issues.iter().all(|i| i.msg_id != "missingObject"),
         "{issues:?}"
     );
 
     flaky.fail.store(true, Ordering::Relaxed);
-    let err = refs_fsck(&repo, repo.odb(), &config, false).unwrap_err();
+    let err = refs_fsck(&repo, repo.odb(), false).unwrap_err();
     assert!(is_backend_down(&err), "{err:?}");
 }
 
@@ -183,9 +190,15 @@ fn refs_fsck_reports_backend_failure_not_missing_object() {
 fn abbreviate_object_id_reports_backend_failure() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (repo, flaky, commit) = flaky_repo(dir.path());
-    assert!(abbreviate_object_id(&repo, commit, 7).is_ok());
+    assert!(repo
+        .revwalk()
+        .abbreviate(commit, grit_lib::revwalk::AbbrevLength::AtLeast(7))
+        .is_ok());
 
     flaky.fail.store(true, Ordering::Relaxed);
-    let err = abbreviate_object_id(&repo, commit, 7).unwrap_err();
+    let err = repo
+        .revwalk()
+        .abbreviate(commit, grit_lib::revwalk::AbbrevLength::AtLeast(7))
+        .unwrap_err();
     assert!(is_backend_down(&err), "{err:?}");
 }

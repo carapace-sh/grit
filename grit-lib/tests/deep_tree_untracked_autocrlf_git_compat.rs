@@ -1,14 +1,16 @@
 //! Deep-chain untracked siblings and autocrlf staging (issue #959 review).
 
+use grit_lib::progress::CancelToken;
+use grit_lib::progress::NullProgress;
 use std::fs;
 use std::process::Command;
 
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::objects::ObjectId;
-use grit_lib::porcelain::add::{stage, stage_for_commit, StageMode, StageOptions};
-use grit_lib::porcelain::commit::{create_commit, CommitRequest};
-use grit_lib::porcelain::status::{status, StatusOptions};
-use grit_lib::progress::NeverCancel;
+use grit_lib::porcelain::add::{StageMode, StageOptions};
+use grit_lib::porcelain::commit::CommitRequest;
+use grit_lib::porcelain::status::StatusOptions;
+use grit_lib::progress::CancelToken;
 use grit_lib::progress::NullProgress;
 use grit_lib::repo::Repository;
 use grit_test_support::git;
@@ -36,34 +38,39 @@ fn status_and_add_see_interior_untracked_on_indexed_chain() {
         &RepositoryOptions::empty().with_work_tree(root),
     )
     .expect("open");
-    let model = status(
-        &repo,
-        &StatusOptions::default(),
-        &mut NullProgress,
-        &NeverCancel,
-    )
-    .expect("status");
+    let model = repo
+        .status()
+        .run(
+            &StatusOptions::default(),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("status");
     assert!(
         model.untracked.iter().any(|p| p == "a/b/untracked.txt"),
         "status must list interior untracked sibling, got {:?}",
         model.untracked
     );
 
-    let outcome = stage(
-        &repo,
-        &StageOptions {
-            pathspecs: Vec::new(),
-            pathspec_sources: Vec::new(),
-            mode: StageMode::All,
-            ..StageOptions::default()
-        },
-        &mut NullProgress,
-        &NeverCancel,
-    )
-    .expect("add all");
+    let outcome = repo
+        .index()
+        .stage(
+            &StageOptions {
+                pathspecs: Vec::new(),
+                pathspec_sources: Vec::new(),
+                mode: StageMode::All,
+                ..StageOptions::default()
+            },
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("add all");
     assert!(outcome.total() >= 1, "add must stage untracked sibling");
 
-    let index = repo.index_handle().load().expect("index");
+    let index = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("index");
     assert!(
         index.get(b"a/b/untracked.txt", 0).is_some(),
         "index must contain staged untracked sibling"
@@ -94,22 +101,22 @@ fn full_tree_add_and_commit_store_lf_with_autocrlf() {
         &RepositoryOptions::empty().with_work_tree(root),
     )
     .expect("open");
-    stage(
-        &repo,
-        &StageOptions {
-            pathspecs: Vec::new(),
-            pathspec_sources: Vec::new(),
-            mode: StageMode::All,
-            ..StageOptions::default()
-        },
-        &mut NullProgress,
-        &NeverCancel,
-    )
-    .expect("grit add all");
+    repo.index()
+        .stage(
+            &StageOptions {
+                pathspecs: Vec::new(),
+                pathspec_sources: Vec::new(),
+                mode: StageMode::All,
+                ..StageOptions::default()
+            },
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("grit add all");
 
     let grit_staged_oid = repo
-        .index_handle()
-        .load()
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
         .expect("idx")
         .get(b"f.txt", 0)
         .expect("f.txt staged")
@@ -128,23 +135,24 @@ fn full_tree_add_and_commit_store_lf_with_autocrlf() {
         git_blob.data, grit_blob.data,
         "grit staged blob must match system git index for same worktree"
     );
-
-    stage_for_commit(&repo, &mut NullProgress, &NeverCancel).expect("grit commit staging");
+    repo.index()
+        .stage_for_commit(&mut NullProgress, &CancelToken::never())
+        .expect("grit commit staging");
     let ident = "Test <t@example.com> 1 +0000".to_string();
-    create_commit(
-        &repo,
-        &CommitRequest {
-            message: "edit".into(),
-            author: Some(ident.parse().expect("signature")),
-            committer: Some(ident.parse().expect("signature")),
-            allow_empty: false,
-            sign_override: None,
-            amend: false,
-            assume_worktree_synced: false,
-            ..Default::default()
-        },
-        &mut NullProgress,
-        &NeverCancel,
-    )
-    .expect("grit commit");
+    repo.commits()
+        .create_staged(
+            &{
+                let mut req = CommitRequest::new("edit");
+                req.author = Some(ident.parse().expect("signature"));
+                req.committer = Some(ident.parse().expect("signature"));
+                req.allow_empty = false;
+                req.sign_override = None;
+                req.amend = false;
+                req.assume_worktree_synced = false;
+                req
+            },
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("grit commit");
 }

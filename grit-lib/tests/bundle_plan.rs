@@ -4,12 +4,11 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
 
-use grit_lib::bundle::bundle_remote::{
-    plan_create_with_options, resolve_bundle_spec, BundleCreateOptions,
-};
-use grit_lib::bundle::{plan_bundle_create, Bundle, BundleSpec};
+use grit_lib::bundle::bundle_remote::{resolve_bundle_spec, BundleCreateOptions};
+use grit_lib::bundle::{Bundle, BundleSpec};
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::maintenance::{CommitGraphOptions, MidxOptions, PackRefsOptions, PruneOptions};
+use grit_lib::progress::{CancelToken, NullProgress};
 use grit_lib::repo::Repository;
 
 fn git_ok(dir: &Path, args: &[&str]) {
@@ -99,12 +98,17 @@ fn bundle_plan_create_matches_written_bundle() {
     };
     let plan = repo
         .bundles()
-        .plan_create_with_options(&options)
+        .plan_create_from_revs(&options)
         .expect("plan");
     let spec = resolve_bundle_spec(&repo, &options).expect("spec");
     let bundle_path = src.join("out.bundle");
     repo.bundles()
-        .create(&spec, &bundle_path)
+        .write(
+            &spec,
+            &bundle_path,
+            &mut grit_lib::progress::NullProgress,
+            grit_lib::progress::CancelToken::never_ref(),
+        )
         .expect("write bundle");
 
     git_ok(src, &["bundle", "verify", bundle_path.to_str().unwrap()]);
@@ -179,23 +183,28 @@ fn bundle_and_maintenance_dry_run_public_apis_smoke() {
     };
     let spec = resolve_bundle_spec(&repo, &options).expect("spec");
     let _ = repo.bundles().plan_create(&spec).expect("plan_create");
-    let _ = plan_create_with_options(&repo, &options).expect("plan_create_with_options");
-    let _ = plan_bundle_create(
-        &repo,
-        &BundleSpec {
+    let _ = repo
+        .bundles()
+        .plan_create_from_revs(&options)
+        .expect("plan_create_from_revs");
+    let _ = repo
+        .bundles()
+        .plan_create(&BundleSpec {
             include: spec.include,
             ..Default::default()
-        },
-    )
-    .expect("plan_bundle_create");
+        })
+        .expect("plan_bundle_create");
 
     let _ = CommitGraphOptions::with_dry_run(true);
     let _ = MidxOptions::with_dry_run(true);
     let _ = PackRefsOptions::with_dry_run(true);
     let mut prune = PruneOptions::default();
     prune.dry_run = true;
-    let _ = grit_lib::maintenance::prune_loose_objects(&repo, &prune).expect("prune dry-run");
-    let roots = grit_lib::maintenance::collect_maintenance_object_roots(&repo).expect("roots");
+    let _ = repo
+        .maintenance()
+        .prune_loose_objects(&prune)
+        .expect("prune dry-run");
+    let roots = repo.maintenance().reachability_roots().expect("roots");
     let _ =
         grit_lib::refs::gc::prune_loose_unreachable_with_dry_run(repo.odb(), &roots, None, true)
             .expect("prune_loose dry-run");

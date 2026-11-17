@@ -9,7 +9,7 @@
 //! use grit_lib::repo::{InitOptions, Repository};
 //! # fn main() -> grit_lib::error::Result<()> {
 //! let dir = tempfile::tempdir()?;
-//! let _repo = Repository::init(dir.path(), &InitOptions::default())?;
+//! let (_repo, _) = Repository::init(dir.path(), &InitOptions::default())?;
 //! let _odb = _repo.odb();
 //!
 //! # Ok(())
@@ -19,7 +19,7 @@
 mod commit_ref;
 mod core;
 mod extra_headers;
-pub mod handle;
+pub(crate) mod handle;
 mod oid_hashtable;
 mod write;
 
@@ -33,62 +33,73 @@ pub use extra_headers::{
 pub use handle::Objects;
 pub use oid_hashtable::{
     empty_object_id_hash_set, empty_oid_byte_filter_map, empty_oid_set, oid_hash_map,
-    oid_hash_map_from, oid_hash_map_with_capacity, oid_hash_set, oid_hash_set_from,
-    oid_hash_set_with_capacity, OidBuildHasher, OidHashMap, OidHashSet, OidHasher,
+    oid_hash_map_from, oid_hash_set, oid_hash_set_from, OidBuildHasher, OidHashMap, OidHashSet,
+    OidHasher,
 };
+pub(crate) use oid_hashtable::{oid_hash_map_with_capacity, oid_hash_set_with_capacity};
 pub use write::{NewCommit, TreeEntryError, WriteTreeOptions};
-
-pub use crate::change_id::{
-    change_id, find_commits_by_change_id_prefix, is_change_id_spec_token,
-    resolve_commit_by_change_id_prefix, resolved_change_id, set_change_id, ChangeId, ChangeIdError,
-    ChangeIdGenerator, ChangeIdMatch, ChangeIdPolicy, OsChangeIdGenerator, ResolvedChangeId,
-};
 
 pub mod odb {
     //! Object database backends and loose/packed storage.
-    pub use crate::odb::builder;
+    pub use crate::odb::builder::OdbBuilder;
     pub use crate::odb::store;
-    pub use crate::odb::*;
+    pub use crate::odb::store::{ObjectStore, WritableObjectStore};
+    pub use crate::odb::{
+        ObjectStream, Odb, WriteOptions, BULK_NEW_LOOSE_WRITE, BULK_TRACKED_RESTAGE_LOOSE_WRITE,
+    };
 }
 
 pub mod pack {
     //! Pack files, indexes, and packfile I/O.
-    pub use crate::pack::*;
+    pub use crate::pack::{
+        clear_pack_cache, hash_object_bytes, oid_bytes_to_hex, read_alternates_recursive,
+        read_idx_object_ids, read_local_pack_indexes, read_object_from_pack_at_offset,
+        read_object_from_packs, read_pack_index, read_pack_index_cached,
+        read_packed_delta_dependency, skip_one_pack_object, write_v2_pack_index,
+        write_v2_pack_index_from_trailer, PackIndex, PackIndexEntryRef, SingleLocalPackReader,
+        DEFAULT_PACK_DEPTH,
+    };
     pub use crate::pack_reuse_root::*;
 }
 
-pub mod bench_fixture {
-    //! Synthetic repository fixtures for benchmarks and tests.
-    pub use crate::bench_fixture_root::*;
-}
-pub mod pack_reuse {
-    //! Verbatim pack reuse for upload-pack.
+pub(crate) mod pack_reuse {
     pub use crate::pack_reuse_root::*;
 }
-pub mod pack_write {
-    //! Pack and index installation helpers.
+
+#[allow(unused_imports)]
+pub(crate) mod pack_write {
     pub use crate::pack_write_root::*;
 }
 
 pub mod midx {
     //! Multi-pack-index (MIDX) read and write.
-    pub use crate::midx::*;
+    pub use crate::midx::{
+        clear_pack_midx_state, midx_lookup_pack_and_offset, read_midx_btmp_ranges,
+        read_midx_objects, try_read_info_via_midx, try_read_object_via_midx,
+        write_multi_pack_index, MidxBitmapWriteOutcome, WriteMultiPackIndexOptions,
+    };
 }
 
 pub mod hash {
     //! Object-id hashing, file checksums, and hash algorithm selection.
-    pub use crate::hash::*;
+    pub use crate::hash::{
+        backend, hash_object, hash_objects_parallel, par_hash_with, parallel_hash_worthwhile,
+        try_par_hash_forced, try_par_hash_with, verify_trailer, Backend, ChecksumHasher,
+        HashingWriter, ObjectHasher, ParallelHashError, Parallelism, PAR_HASH_MIN_ITEMS,
+        PAR_HASH_MIN_TOTAL_BYTES,
+    };
 }
 
 pub mod commit_graph {
     //! Commit-graph files for reachability and generation numbers.
-    pub use crate::commit_graph_file::*;
-    pub use crate::commit_graph_write::*;
+    pub use crate::commit_graph_file::BloomWalkStatsHandle;
 }
 
 pub mod bitmap {
     //! Pack and commit reachability bitmaps.
-    pub use crate::bitmap_walk::*;
+    pub use crate::bitmap_walk::{
+        BitmapWalkError, BitmapWalkUnsupported, ReachabilityQuery, ReachableSet,
+    };
     pub use crate::pack_bitmap::{
         BitmapError, BitmapIndex, BitmapIndexCache, CommitReachabilityBitmap, MidxBitmapWriter,
         PackBitmapWriteError, PackBitmapWriteOptions, PackBitmapWriter, TypeBitmap,
@@ -97,67 +108,74 @@ pub mod bitmap {
 
 pub mod delta_encode {
     //! Delta compression encoding for pack streams.
-    pub use crate::delta_encode::*;
+    pub use crate::delta_encode::{encode_delta, encode_lcp_delta, DeltaIndex};
 }
-pub mod delta_islands {
-    //! Delta island boundaries for pack reuse.
-    pub use crate::delta_islands::*;
-}
+
+pub(crate) mod delta_islands {}
+
 pub mod index_pack {
     //! Index-pack and thin-pack handling.
-    pub use crate::index_pack::*;
+    pub use crate::index_pack::{
+        build_pack_index_records, ingest_received_pack, ingest_received_pack_path,
+        install_pack_bytes, install_pack_path, IngestPackOptions, IngestedPack, ObjectKindCounts,
+    };
 }
-pub mod pack_name_hash {
-    //! Name-hash tables for delta base selection.
-    pub use crate::pack_name_hash::*;
-}
-pub mod pack_rev {
-    //! Reverse indexes for pack lookups.
-    pub use crate::pack_rev::*;
-}
+
+pub(crate) mod pack_name_hash {}
+
+pub(crate) mod pack_rev {}
+
 pub mod pack_store {
     //! Pack-backed object store implementation.
-    pub use crate::pack_store::*;
+    pub use crate::pack_store::PackStore;
 }
+
 pub mod unpack_objects {
     //! Unpack loose objects from pack streams.
-    pub use crate::unpack_objects::*;
+    pub use crate::unpack_objects::{
+        apply_delta, apply_delta_into, ingest_pack_into, pack_index_records, UnpackOptions,
+    };
 }
-pub mod prune_packed {
-    //! Prune unreachable packed objects.
-    pub use crate::prune_packed::*;
-}
+
+pub(crate) mod prune_packed {}
+
 pub mod promisor {
     //! promisor API (re-exported at this path).
-    pub use crate::promisor::*;
+    pub use crate::promisor::{repo_treats_promisor_packs, PROMISOR_MISSING_FILE};
     pub use crate::promisor_fetch::{
         DefaultPromisorFetcher, PromisorFetcher, PROMISOR_LAZY_FETCH_CONFIG,
     };
 }
+
 pub mod promisor_remote {
     //! Promisor remote configuration for partial clones.
-    pub use crate::promisor_remote::*;
-}
-pub mod pack_objects {
-    //! Pack-objects negotiation and encoding.
-    pub use crate::pack_objects::*;
-}
-pub mod pack_object_select {
-    //! Object selection heuristics for packing.
-    pub use crate::pack_object_select::*;
-}
-pub mod pack_receive {
-    //! Receive-pack side pack ingestion.
-    pub use crate::pack_receive::*;
-}
-pub mod pack_stream_scan {
-    //! Count a pack's objects while its bytes are still arriving.
-    pub use crate::pack_stream_scan::*;
+    pub use crate::promisor_remote::{
+        configured_promisor_remotes, lazy_fetch_order, PromisorAcceptPolicy, PromisorAdvertisement,
+        PromisorConfigWarning, PromisorDecision, PromisorField, PromisorHandshake,
+        PromisorHandshakeOptions, PromisorRejection, PromisorReplyError,
+    };
 }
 
-#[cfg(feature = "unstable-bench-helpers")]
-#[allow(missing_docs)]
-pub mod ewah_bench {
-    //! Criterion fixtures for EWAH bitmap hot paths (`benches/ewah.rs` only).
-    include!("../ewah_bench_api.rs");
+pub mod pack_objects {
+    //! Pack-objects negotiation and encoding.
+    pub use crate::pack_objects::{
+        build_pack, build_pack_from_send_list, write_pack_for_push, PackBuildOptions, PackObjects,
+        PackObjectsOptions, PackStats, UploadPackStream, SERVE_WINDOW_MEMORY,
+    };
+}
+
+pub mod pack_object_select {
+    //! Object selection heuristics for packing.
+    pub use crate::pack_object_select::{
+        enumerate_pack_objects, HaveBoundary, PackEnumerateOptions,
+    };
+}
+
+#[allow(unused_imports)]
+pub(crate) mod pack_receive {
+    pub use crate::pack_receive::*;
+}
+
+pub(crate) mod pack_stream_scan {
+    pub use crate::pack_stream_scan::*;
 }

@@ -24,6 +24,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use grit_lib::bundle::BundleSpec;
+use grit_lib::config::environment::Environment;
 use grit_lib::objects::{HashAlgo, ObjectId};
 use grit_lib::remote::bundle_uri::{BundleList, BundleListEntry, BundleListMode};
 use grit_lib::repo::Repository;
@@ -133,7 +134,12 @@ pub fn served_file(repo_path: &Path, file: &str) -> Option<PathBuf> {
 fn bundle_refs(repo: &Repository) -> Result<Vec<(String, ObjectId)>, BundleBuildError> {
     let mut refs = Vec::new();
     for prefix in ["refs/heads/", "refs/tags/"] {
-        refs.extend(grit_lib::refs::list_refs(repo.git_dir(), prefix)?);
+        refs.extend(
+            repo.references()
+                .list(prefix)?
+                .into_iter()
+                .map(|(name, oid)| (name.into(), oid)),
+        );
     }
     refs.sort();
     Ok(refs)
@@ -182,9 +188,12 @@ pub fn needs_bundle(
 /// Whether the repository has promisor remotes, so some of its objects may be
 /// stored elsewhere (see the module documentation).
 fn has_promisor_remotes(repo: &Repository) -> bool {
-    grit_lib::config::ConfigSet::load_repo_local_only(repo.git_dir()).is_ok_and(|cfg| {
-        grit_lib::objects::promisor::repo_treats_promisor_packs(repo.git_dir(), &cfg)
-    })
+    grit_lib::config::ConfigSet::load(
+        &Environment::empty(),
+        Some(repo.git_dir()),
+        &grit_lib::config::LoadConfigOptions::repo_local_only(repo.git_dir()),
+    )
+    .is_ok_and(|cfg| grit_lib::objects::promisor::repo_treats_promisor_packs(&cfg))
 }
 
 /// Remove every bundle and the manifest, so nothing is offered any more.
@@ -246,7 +255,12 @@ pub fn build(
     };
     {
         let mut out = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
-        grit_lib::bundle::write_bundle(&repo, &spec, &mut out)?;
+        repo.bundles().write_to(
+            &spec,
+            &mut out,
+            &mut grit_lib::progress::NullProgress,
+            grit_lib::progress::CancelToken::never_ref(),
+        )?;
         out.into_inner().map_err(|e| e.into_error())?.sync_all()?;
     }
     std::fs::rename(&tmp, dir.join(&file))?;
@@ -419,7 +433,7 @@ mod tests {
         let init = grit_lib::repo::InitOptions::new()
             .with_bare(true)
             .with_initial_branch("main");
-        let repo = match Repository::init(dir.path(), &init) {
+        let (repo, _) = match Repository::init(dir.path(), &init) {
             Ok(r) => r,
             Err(e) => panic!("init: {e}"),
         };

@@ -6,9 +6,8 @@
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::index::write_tree::{cache_tree_extension_valid, cache_tree_fully_valid};
 use grit_lib::index::Index;
-use grit_lib::progress::NeverCancel;
+use grit_lib::progress::CancelToken;
 use grit_lib::remote::clone::{clone as clone_repo, CloneOptions};
-use grit_lib::remote::fetch::NoProgress;
 use grit_lib::repo::Repository;
 use grit_test_support::git;
 
@@ -44,7 +43,7 @@ fn grit_clone_index_has_cache_tree_matching_head() {
             grit_dest.path().to_path_buf(),
         ),
         &mut NoProgress,
-        &NeverCancel,
+        &CancelToken::never(),
         None,
     )
     .expect("grit clone");
@@ -54,7 +53,7 @@ fn grit_clone_index_has_cache_tree_matching_head() {
         &RepositoryOptions::empty().with_work_tree(grit_dest.path()),
     )
     .expect("open grit clone");
-    let index = Index::load(&repo.index_handle().path()).expect("load index");
+    let index = Index::load(&repo.index().path()).expect("load index");
     let head_tree = head_tree_oid(grit_dest.path());
 
     assert!(
@@ -86,12 +85,20 @@ fn populated_checkout_writes_cache_tree() {
     .expect("open repo");
 
     let mut index = Index::new();
-    repo.index_handle().write(&mut index).expect("clear index");
+    repo.index()
+        .write(&mut index, &grit_lib::index::IndexWriteOptions::default())
+        .expect("clear index");
 
-    grit_lib::porcelain::checkout::checkout_between_trees(&repo, None, &tree)
+    repo.checkout()
+        .checkout(
+            None,
+            &tree,
+            &mut grit_lib::progress::NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
         .expect("populated checkout");
 
-    let index = Index::load(&repo.index_handle().path()).expect("load index");
+    let index = Index::load(&repo.index().path()).expect("load index");
     assert!(
         index.cache_tree.is_some(),
         "populated checkout must write cache-tree"

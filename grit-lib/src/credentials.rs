@@ -15,6 +15,8 @@
 //!   configured `credential.helper` / `credential.<url>.helper` programs
 //!   (shell `!cmd`, the built-in `store`/`cache` helpers, and external
 //!   `git-credential-*` binaries), then falls back to an askpass program.
+//! - [`helper_config_value`] — formats a program path and arguments as a
+//!   `credential.helper` value that both Git and grit run directly.
 //!
 //! ## Askpass, never a terminal
 //!
@@ -28,7 +30,7 @@
 //!
 //! The provider **never** prompts on a TTY. Without an askpass program, or
 //! when it is disabled, [`fill`](CredentialProvider::fill) returns the typed
-//! [`Error::CredentialsUnavailable`] (displayed as [`NON_INTERACTIVE_MESSAGE`],
+//! [`RemoteError::CredentialsUnavailable`](crate::remote::RemoteError::CredentialsUnavailable) (displayed as [`NON_INTERACTIVE_MESSAGE`],
 //! listing the helpers that were asked) rather than blocking on `/dev/tty`.
 //! Callers that want a person to supply a username and password store it up
 //! front with [`CredentialProvider::approve`], as `grit auth <url> --username
@@ -46,8 +48,15 @@ use crate::command_runner::{
 use crate::config::{parse_bool, parse_path, ConfigSet};
 use crate::environment::Environment;
 use crate::error::{Error, Result};
+use crate::remote::RemoteError;
 
-/// How [`Error::CredentialsUnavailable`] displays: credentials are required but
+fn credential_err(message: impl Into<String>) -> Error {
+    Error::Remote(RemoteError::Credential {
+        detail: message.into(),
+    })
+}
+
+/// How [`RemoteError::CredentialsUnavailable`](crate::remote::RemoteError::CredentialsUnavailable) displays: credentials are required but
 /// no configured helper could supply a complete username/password and no
 /// askpass program is available to ask for them.
 pub const NON_INTERACTIVE_MESSAGE: &str = "credentials required but unavailable (non-interactive)";
@@ -71,12 +80,13 @@ pub const NON_INTERACTIVE_MESSAGE: &str = "credentials required but unavailable 
 /// The program to pass to [`HelperCredentialProvider::with_askpass`], or
 /// `None` when askpass is not configured.
 #[must_use]
-pub fn askpass_program(env: &Environment, config: &ConfigSet) -> Option<PathBuf> {
+#[cfg_attr(not(feature = "http-ureq"), allow(dead_code))]
+pub(crate) fn askpass_program(env: &Environment, config: &ConfigSet) -> Option<PathBuf> {
     let program = env
         .var_os("GIT_ASKPASS")
         .or_else(|| {
             config
-                .get("core.askPass")
+                .value("core.askPass")
                 .map(|value| parse_path(env, &value).into())
         })
         .or_else(|| env.var_os("SSH_ASKPASS"))?;
@@ -405,7 +415,7 @@ pub trait CredentialProvider {
 /// If no helper yields a complete credential, [`fill`](CredentialProvider::fill)
 /// asks the [askpass program](HelperCredentialProvider::with_askpass) for the
 /// missing username and password. It never prompts on a terminal: without an
-/// askpass program it returns [`Error::CredentialsUnavailable`] with the
+/// askpass program it returns [`RemoteError::CredentialsUnavailable`](crate::remote::RemoteError::CredentialsUnavailable) with the
 /// helpers it asked.
 pub struct HelperCredentialProvider {
     config: ConfigSet,
@@ -487,7 +497,7 @@ impl HelperCredentialProvider {
     /// False when `credential.interactive` is `false` or `never`.
     fn prompts_allowed(&self) -> bool {
         self.config
-            .get("credential.interactive")
+            .value("credential.interactive")
             .is_none_or(|value| value != "never" && parse_bool(&value).unwrap_or(true))
     }
 
@@ -558,7 +568,7 @@ impl CredentialProvider for HelperCredentialProvider {
                 &self.exec_path_candidates(),
             )?;
             if response.wants_quit() {
-                return Err(Error::Message(format!(
+                return Err(credential_err(format!(
                     "credential helper '{helper}' told us to quit"
                 )));
             }
@@ -568,9 +578,10 @@ impl CredentialProvider for HelperCredentialProvider {
             }
         }
         let Some(askpass) = self.askpass.as_deref().filter(|_| self.prompts_allowed()) else {
-            return Err(Error::CredentialsUnavailable {
+            return Err(RemoteError::CredentialsUnavailable {
                 helpers: helper_list,
-            });
+            }
+            .into());
         };
         let sanitize =
             credential_config_value(&self.config, target_url.as_deref(), "sanitizePrompt")
@@ -735,7 +746,7 @@ fn strip_url_scheme(url: &str) -> &str {
 /// (no scheme). Userinfo is stripped only from the URL authority (the part
 /// before the first `/`, `?`, or `#`); `@` in paths, queries, and fragments is
 /// preserved. The result is safe to show in errors and logs.
-pub fn url_without_userinfo(url: &str) -> String {
+pub(crate) fn url_without_userinfo(url: &str) -> String {
     let Some((scheme, rest)) = url.split_once("://") else {
         let (authority, suffix) = split_authority_suffix(url);
         let authority = strip_userinfo_from_authority(authority);
@@ -762,7 +773,8 @@ fn strip_userinfo_from_authority(authority: &str) -> &str {
 }
 
 /// Redact credentials from URL-like `http://` / `https://` substrings in `message`.
-pub fn redact_embedded_url_credentials(message: &str) -> String {
+#[cfg_attr(not(feature = "http-ureq"), allow(dead_code))]
+pub(crate) fn redact_embedded_url_credentials(message: &str) -> String {
     let mut out = String::with_capacity(message.len());
     let mut rest = message;
     while let Some(scheme_sep) = rest.find("://") {
@@ -1011,7 +1023,7 @@ fn invoke_helper(
     exec_path_candidates: &[PathBuf],
 ) -> Result<Credential> {
     let helper_words = shell_words::split(helper)
-        .map_err(|e| Error::Message(format!("invalid credential.helper '{helper}': {e}")))?;
+        .map_err(|e| credential_err(format!("invalid credential.helper '{helper}': {e}")))?;
     let (first_word, extra_args) = match helper_words.split_first() {
         Some((first, rest)) => (first.as_str(), rest),
         None => ("", &[][..]),
@@ -1063,17 +1075,136 @@ fn invoke_helper(
 
     let output = runner
         .spawn(&spec)
-        .map_err(|e| Error::Message(format!("failed to run credential helper '{helper}': {e}")))?
+        .map_err(|e| credential_err(format!("failed to run credential helper '{helper}': {e}")))?
         .wait_with_output()
-        .map_err(|e| Error::Message(format!("credential helper '{helper}' failed: {e}")))?;
+        .map_err(|e| credential_err(format!("credential helper '{helper}' failed: {e}")))?;
     if !output.status.success {
-        return Err(Error::Message(format!(
+        return Err(credential_err(format!(
             "credential helper '{helper}' exited with status {}",
             output.status.code.unwrap_or(-1)
         )));
     }
 
     Ok(Credential::parse_bytes(&output.stdout))
+}
+
+/// Why [`helper_config_value`] cannot express a helper command as a
+/// `credential.helper` value.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum HelperValueError {
+    /// The program path is relative. Git expands a value that does not start
+    /// with an absolute path to `git credential-<value>`.
+    #[error("credential helper program `{}` is not an absolute path", path.display())]
+    RelativeProgram {
+        /// The program path that was passed.
+        path: PathBuf,
+    },
+    /// The program path is not valid Unicode, so it cannot be stored in config.
+    #[error("credential helper program `{}` is not valid Unicode", path.display())]
+    NonUnicodeProgram {
+        /// The program path that was passed.
+        path: PathBuf,
+    },
+    /// A word contains a line feed, which an escaped config value cannot carry
+    /// through shell word splitting.
+    #[error("credential helper word {word:?} contains a line break")]
+    LineBreak {
+        /// The program path or argument containing the line feed.
+        word: String,
+    },
+}
+
+/// Format `program` and `args` as a `credential.helper` value that Git and grit
+/// both run directly, without the value being taken as a helper name.
+///
+/// Git treats a helper value as a command only when it starts with `!` (run
+/// through `sh -c`) or with an absolute path; anything else becomes
+/// `git credential-<value>`. A value that wraps the path in quotes therefore
+/// fails, and a leading `!` needs a POSIX shell, which grit's own helper
+/// invocation avoids. This keeps the absolute path first and backslash-escapes
+/// every shell metacharacter instead, so Git's shell and grit's word splitting
+/// both recover exactly `[program, args...]`.
+///
+/// On Windows, `\` separators in `program` are written as `/`, which Git and
+/// Windows both accept, so the value starts with a drive prefix like `C:/`.
+///
+/// # Parameters
+///
+/// - `program`: absolute path of the helper executable.
+/// - `args`: arguments placed before the action (`get`, `store`, `erase`) that
+///   Git and grit append.
+///
+/// # Returns
+///
+/// The value to store under `credential.helper`.
+///
+/// # Errors
+///
+/// - [`HelperValueError::RelativeProgram`] when `program` is not absolute.
+/// - [`HelperValueError::NonUnicodeProgram`] when `program` is not valid Unicode.
+/// - [`HelperValueError::LineBreak`] when `program` or an argument contains `\n`.
+///
+/// # Examples
+///
+/// ```
+/// # #[cfg(unix)] {
+/// use std::path::Path;
+/// use grit_lib::remote::credentials::helper_config_value;
+///
+/// let value = helper_config_value(Path::new("/opt/my tools/grit"), &["manager"])?;
+/// assert_eq!(value, r"/opt/my\ tools/grit manager");
+/// # }
+/// # Ok::<(), grit_lib::remote::credentials::HelperValueError>(())
+/// ```
+pub fn helper_config_value(
+    program: &Path,
+    args: &[&str],
+) -> std::result::Result<String, HelperValueError> {
+    if !program.is_absolute() {
+        return Err(HelperValueError::RelativeProgram {
+            path: program.to_path_buf(),
+        });
+    }
+    let program_str = program
+        .to_str()
+        .ok_or_else(|| HelperValueError::NonUnicodeProgram {
+            path: program.to_path_buf(),
+        })?;
+    let program_str: std::borrow::Cow<'_, str> = if cfg!(windows) {
+        program_str.replace('\\', "/").into()
+    } else {
+        program_str.into()
+    };
+
+    let mut value = String::with_capacity(program_str.len() + 16);
+    for (i, word) in std::iter::once(program_str.as_ref())
+        .chain(args.iter().copied())
+        .enumerate()
+    {
+        if word.contains('\n') {
+            return Err(HelperValueError::LineBreak {
+                word: word.to_owned(),
+            });
+        }
+        if i > 0 {
+            value.push(' ');
+        }
+        if word.is_empty() {
+            value.push_str("''");
+            continue;
+        }
+        for ch in word.chars() {
+            let plain = !ch.is_ascii()
+                || ch.is_ascii_alphanumeric()
+                || matches!(ch, '/' | '.' | '_' | '-' | ':' | '+' | ',' | '@' | '%');
+            if !plain {
+                value.push('\\');
+            }
+            value.push(ch);
+        }
+    }
+    Ok(value)
 }
 
 /// Run the askpass `program` with `prompt` as its argument and return its
@@ -1093,13 +1224,13 @@ fn run_askpass(runner: &dyn CommandRunner, program: &Path, prompt: &str) -> Resu
         .spawn(&spec)
         .and_then(|child| child.wait_with_output())
         .map_err(|e| {
-            Error::Message(format!(
+            credential_err(format!(
                 "could not run askpass program '{}': {e}",
                 program.display()
             ))
         })?;
     if !output.status.success {
-        return Err(Error::Message(format!(
+        return Err(credential_err(format!(
             "askpass program '{}' exited with status {}",
             program.display(),
             output.status.code.unwrap_or(-1)
@@ -1188,8 +1319,8 @@ pub mod windows_store {
         CRED_TYPE_GENERIC,
     };
 
-    use super::Credential;
-    use crate::error::{Error, Result};
+    use super::{credential_err, Credential};
+    use crate::error::Result;
 
     /// The Credential Manager target name a credential is stored under.
     fn target_name(cred: &Credential) -> Result<String> {
@@ -1197,12 +1328,12 @@ pub mod windows_store {
             .protocol
             .as_deref()
             .filter(|p| !p.is_empty())
-            .ok_or_else(|| Error::Message("credential is missing its protocol".to_owned()))?;
+            .ok_or_else(|| credential_err("credential is missing its protocol".to_owned()))?;
         let host = cred
             .host
             .as_deref()
             .filter(|h| !h.is_empty())
-            .ok_or_else(|| Error::Message("credential is missing its host".to_owned()))?;
+            .ok_or_else(|| credential_err("credential is missing its host".to_owned()))?;
         Ok(format!("git:{protocol}://{host}"))
     }
 
@@ -1243,7 +1374,7 @@ pub mod windows_store {
             if err == ERROR_NOT_FOUND {
                 return Ok(None);
             }
-            return Err(Error::Message(format!(
+            return Err(credential_err(format!(
                 "reading from the Windows Credential Manager failed (error {err})"
             )));
         }
@@ -1301,7 +1432,7 @@ pub mod windows_store {
         if ok == 0 {
             // SAFETY: always safe after a failed Win32 call.
             let err = unsafe { GetLastError() };
-            return Err(Error::Message(format!(
+            return Err(credential_err(format!(
                 "writing to the Windows Credential Manager failed (error {err})"
             )));
         }
@@ -1317,7 +1448,7 @@ pub mod windows_store {
             // SAFETY: always safe after a failed Win32 call.
             let err = unsafe { GetLastError() };
             if err != ERROR_NOT_FOUND {
-                return Err(Error::Message(format!(
+                return Err(credential_err(format!(
                     "deleting from the Windows Credential Manager failed (error {err})"
                 )));
             }
@@ -1353,6 +1484,112 @@ mod tests {
             helper_request(&url_only).serialize(),
             "url=https://example.com/\n"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn helper_config_value_escapes_metacharacters_and_splits_back() {
+        let cases: &[(&str, &[&str], &str)] = &[
+            ("/usr/bin/grit", &["manager"], "/usr/bin/grit manager"),
+            (
+                "/home/a b/bin/grit",
+                &["manager"],
+                r"/home/a\ b/bin/grit manager",
+            ),
+            ("/opt/R&D/grit", &[], r"/opt/R\&D/grit"),
+            (
+                r#"/tmp/it's "quoted"/grit"#,
+                &["manager"],
+                r#"/tmp/it\'s\ \"quoted\"/grit manager"#,
+            ),
+            ("/tmp/#1;$x/grit", &["a b"], r"/tmp/\#1\;\$x/grit a\ b"),
+            ("/tmp/back\\slash/grit", &[""], r"/tmp/back\\slash/grit ''"),
+            ("/tmp/caf\u{e9}/grit", &[], "/tmp/caf\u{e9}/grit"),
+        ];
+        for (program, args, expected) in cases {
+            let value = helper_config_value(Path::new(program), args).expect("formats");
+            assert_eq!(&value, expected, "{program} {args:?}");
+            assert!(
+                value.starts_with('/'),
+                "Git only runs a value as a command when it starts with an absolute path: {value}"
+            );
+            let mut words = vec![(*program).to_owned()];
+            words.extend(args.iter().map(|a| (*a).to_owned()));
+            assert_eq!(shell_words::split(&value).expect("splits"), words);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn helper_config_value_writes_forward_slashes_after_the_drive() {
+        let value = helper_config_value(Path::new(r"C:\Users\Jane Doe\bin\grit.exe"), &["manager"])
+            .expect("formats");
+        assert_eq!(value, r"C:/Users/Jane\ Doe/bin/grit.exe manager");
+        assert_eq!(
+            shell_words::split(&value).expect("splits"),
+            ["C:/Users/Jane Doe/bin/grit.exe", "manager"]
+        );
+    }
+
+    #[test]
+    fn helper_config_value_rejects_what_it_cannot_express() {
+        assert_eq!(
+            helper_config_value(Path::new("bin/grit"), &["manager"]),
+            Err(HelperValueError::RelativeProgram {
+                path: PathBuf::from("bin/grit")
+            })
+        );
+        let absolute = std::env::temp_dir().join("grit");
+        assert_eq!(
+            helper_config_value(&absolute, &["a\nb"]),
+            Err(HelperValueError::LineBreak {
+                word: "a\nb".into()
+            })
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn helper_config_value_non_unicode_program_is_rejected() {
+        use std::os::unix::ffi::OsStrExt;
+        let path = PathBuf::from(std::ffi::OsStr::from_bytes(b"/tmp/\xff/grit"));
+        assert_eq!(
+            helper_config_value(&path, &[]),
+            Err(HelperValueError::NonUnicodeProgram { path })
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn formatted_helper_value_runs_the_program_directly() {
+        let value =
+            helper_config_value(Path::new("/opt/my tools/grit"), &["manager"]).expect("formats");
+        let runner = RecordingRunner::default();
+        runner.push_response(RecordedResponse::Output {
+            stdout: b"username=u\npassword=p\n".to_vec(),
+            code: 0,
+        });
+        let filled = invoke_helper(
+            &runner,
+            &value,
+            "get",
+            &Credential {
+                protocol: Some("https".into()),
+                host: Some("example.com".into()),
+                ..Default::default()
+            },
+            &[],
+        )
+        .expect("helper runs");
+        assert_eq!(filled.password.as_deref(), Some("p"));
+        let specs = runner.specs();
+        assert_eq!(specs.len(), 1);
+        assert!(
+            specs[0].shell.is_none(),
+            "no shell between grit and the helper"
+        );
+        assert_eq!(specs[0].program, PathBuf::from("/opt/my tools/grit"));
+        assert_eq!(specs[0].args, [OsString::from("manager"), "get".into()]);
     }
 
     #[cfg(unix)]
@@ -1786,7 +2023,10 @@ mod tests {
             .fill(&input)
             .expect_err("no helper");
         assert!(
-            matches!(&err, Error::CredentialsUnavailable { helpers } if helpers.is_empty()),
+            matches!(
+                &err,
+                Error::Remote(RemoteError::CredentialsUnavailable { helpers }) if helpers.is_empty()
+            ),
             "{err:?}"
         );
 
@@ -1813,8 +2053,7 @@ mod tests {
             }
         );
 
-        let other =
-            crate::error::AuthFailure::from_fill_error(Error::Message("helper crashed".into()));
+        let other = crate::error::AuthFailure::from_fill_error(credential_err("helper crashed"));
         assert!(matches!(
             other,
             crate::error::AuthFailure::CredentialsUnavailable { detail, helpers }

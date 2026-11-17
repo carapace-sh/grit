@@ -1,6 +1,6 @@
 //! Remove untracked (and optionally ignored) paths from the work tree.
 //!
-//! [`clean_untracked`] reuses the same untracked/ignored walk as [`super::status`]
+//! [`Checkout::clean`](crate::repo_handles::Checkout::clean) reuses the same untracked/ignored walk as [`super::status`]
 //! ([`super::status::collect_untracked_and_ignored_with_rules_and_cancel`]) so results stay aligned with
 //! `grit status` and system `git status`.
 
@@ -8,17 +8,19 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 
-use crate::error::{Error, Result};
+use crate::error::{Error, PathIoError, Result, WorktreePathOperation};
 use crate::index::{Index, MODE_GITLINK};
 use crate::porcelain::stash::remove_empty_dirs;
 use crate::porcelain::status::{
     collect_untracked_and_ignored_inner, IgnoredMode, UntrackedCacheMissAction, UntrackedScan,
 };
-use crate::progress::ProgressSink;
+use crate::progress::{poll_cancel, CancelToken, ProgressSink};
 use crate::repo::Repository;
+use crate::repo::RepositoryError;
+use crate::worktree::WorktreeError;
 use crate::worktree_rules::WorktreeRules;
 
-/// Which untracked/ignored paths [`clean_untracked`] may remove.
+/// Which untracked/ignored paths [`Checkout::clean`](crate::repo_handles::Checkout::clean) may remove.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum CleanScope {
     /// Untracked non-ignored paths only (default `git clean` without `-x`/`-X`).
@@ -30,7 +32,7 @@ pub enum CleanScope {
     OnlyIgnored,
 }
 
-/// Inputs for [`clean_untracked`].
+/// Inputs for [`Checkout::clean`](crate::repo_handles::Checkout::clean).
 #[derive(Debug, Clone, Default)]
 pub struct CleanOptions {
     /// Limit removal to paths matching these pathspecs (empty = entire tree).
@@ -58,7 +60,7 @@ fn clean_scope_includes_ignored(scope: CleanScope) -> bool {
     )
 }
 
-/// Result of [`clean_untracked`].
+/// Result of [`Checkout::clean`](crate::repo_handles::Checkout::clean).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CleanOutcome {
     /// Repository-relative paths removed (or that would be removed when `dry_run`).
@@ -69,14 +71,17 @@ pub struct CleanOutcome {
 ///
 /// Nested repositories and submodule checkouts (directories containing `.git`) are
 /// never entered or removed.
-pub fn clean_untracked(
+///
+/// Stops between path removals when `cancel` is set.
+///
+/// Paths removed before cancellation stay removed; there is no index lock to restore.
+pub(crate) fn clean_untracked_with_cancel(
     repo: &Repository,
     opts: &CleanOptions,
-    _progress: &mut dyn ProgressSink,
+    progress: &mut dyn ProgressSink,
+    cancel: &CancelToken,
 ) -> Result<CleanOutcome> {
-    let work_tree = repo
-        .work_tree()
-        .ok_or_else(|| Error::Message("clean requires a working tree".into()))?;
+    let work_tree = repo.work_tree().ok_or(RepositoryError::RequiresWorkTree)?;
 
     let mut index = repo.load_index()?;
     let rules = WorktreeRules::from_repository(repo, &index)?;
@@ -102,6 +107,7 @@ pub fn clean_untracked(
         use_untracked_cache: false,
         cache_miss: UntrackedCacheMissAction::RefreshFull,
         clean_unit_dirs: Some(std::sync::Arc::clone(&clean_unit_dirs)),
+        listing_cache: None,
     };
 
     let (untracked, ignored, collect_meta) = collect_untracked_and_ignored_inner(
@@ -109,6 +115,7 @@ pub fn clean_untracked(
         &mut index,
         work_tree,
         &opts.pathspecs,
+        None,
         scan,
         &rules,
         None,
@@ -145,7 +152,7 @@ pub fn clean_untracked(
         }
         let paths_to_add = if rel.ends_with('/') {
             let trimmed = rel.trim_end_matches('/');
-            let abs = work_tree.join(trimmed);
+            let abs = crate::repo_relpath::worktree_abs(work_tree, trimmed);
             if collect_meta.clean_collapsed_unit.contains(&rel) {
                 vec![rel]
             } else if nested_git_worktree_descendant_under(&abs)
@@ -185,9 +192,10 @@ pub fn clean_untracked(
                 path.trim_end_matches('/'),
                 repo.environment(),
             ) {
-                return Err(Error::Message(format!(
-                    "refusing to remove '{path}' because it contains the current directory"
-                )));
+                return Err(WorktreeError::RemoveContainsCurrentDirectory {
+                    path: path.trim_end_matches('/').to_owned(),
+                }
+                .into());
             }
             removed.push(path);
         }
@@ -202,6 +210,7 @@ pub fn clean_untracked(
     let mut actually_removed = Vec::new();
     let environment = repo.environment();
     for rel in removal_order(&removed) {
+        poll_cancel(progress, cancel)?;
         if remove_one_path(work_tree, &rel, remove_directories, environment)? {
             actually_removed.push(rel);
         }
@@ -221,9 +230,7 @@ fn empty_untracked_directories(
     scope: CleanScope,
     already_listed: &[String],
 ) -> Result<Vec<String>> {
-    let work_tree = repo
-        .work_tree()
-        .ok_or_else(|| Error::Message("clean requires a working tree".into()))?;
+    let work_tree = repo.work_tree().ok_or(RepositoryError::RequiresWorkTree)?;
     let listed: BTreeSet<String> = already_listed
         .iter()
         .map(|p| p.trim_end_matches('/').to_owned())
@@ -234,16 +241,25 @@ fn empty_untracked_directories(
         .filter_map(|e| e.ok())
         .collect();
     for entry in entries {
-        let name = entry.file_name().to_string_lossy().to_string();
-        if name == ".git" {
+        let name = dir_entry_name_bytes(&entry);
+        if name == b".git" {
             continue;
         }
         let child_abs = entry.path();
         if !child_abs.is_dir() {
             continue;
         }
+        let stored_rel = crate::repo_relpath::strip_worktree_prefix_stored(&child_abs, work_tree)
+            .unwrap_or_else(|| crate::repo_relpath::storage_string(&name));
         if let Some(path) = highest_empty_untracked_dir(
-            repo, index, &child_abs, &name, pathspecs, rules, scope, &listed,
+            repo,
+            index,
+            &child_abs,
+            &stored_rel,
+            pathspecs,
+            rules,
+            scope,
+            &listed,
         )? {
             found.push(path);
         }
@@ -321,12 +337,13 @@ fn walk_dir_has_excluded_descendant(
         Err(_) => return false,
     };
     for entry in entries {
-        let name = entry.file_name().to_string_lossy().to_string();
-        if name == ".git" {
+        let name = dir_entry_name_bytes(&entry);
+        if name == b".git" {
             continue;
         }
         let path = entry.path();
-        let rel = crate::git_path::strip_worktree_prefix(&path, work_tree).unwrap_or(name);
+        let rel = crate::repo_relpath::strip_worktree_prefix_stored(&path, work_tree)
+            .unwrap_or_else(|| crate::repo_relpath::storage_string(&name));
         if path.is_dir() {
             if path_matches_clean_exclude(&format!("{rel}/"), excludes, ctx)
                 || path_matches_clean_exclude(&rel, excludes, ctx)
@@ -358,7 +375,7 @@ fn highest_empty_untracked_dir(
     if !rel.is_empty() && is_nested_git_worktree(abs) {
         return Ok(None);
     }
-    if !rel.is_empty() && has_tracked_under_index(index, rel) {
+    if !rel.is_empty() && has_stage0_descendant_under_stored(index, rel) {
         return Ok(None);
     }
     if !rel.is_empty() && index_gitlink_at(index, rel) {
@@ -372,17 +389,17 @@ fn highest_empty_untracked_dir(
 
     let mut child_dirs = Vec::new();
     for entry in entries {
-        let name = entry.file_name().to_string_lossy().to_string();
-        if name == ".git" {
+        let name = dir_entry_name_bytes(&entry);
+        if name == b".git" {
             continue;
         }
         let child_abs = entry.path();
         if child_abs.is_dir() {
-            let child_rel = if rel.is_empty() {
-                name.clone()
-            } else {
-                format!("{rel}/{name}")
-            };
+            let parent_bytes = crate::repo_relpath::storage_bytes(rel);
+            let child_rel = crate::repo_relpath::storage_string(&crate::repo_relpath::join_rel(
+                &parent_bytes,
+                &name,
+            ));
             child_dirs.push((child_rel, child_abs));
         } else if !rel.is_empty() {
             return Ok(None);
@@ -452,17 +469,18 @@ fn walk_dir_preserves_ignored(
         Err(_) => return Ok(false),
     };
     for entry in entries {
-        let name = entry.file_name().to_string_lossy().to_string();
-        if name == ".git" {
+        let name = dir_entry_name_bytes(&entry);
+        if name == b".git" {
             continue;
         }
         let path = entry.path();
         let is_dir = crate::read_dir_kind::entry_is_dir(&entry).unwrap_or(false);
+        let rel = crate::repo_relpath::strip_worktree_prefix_stored(&path, work_tree)
+            .unwrap_or_else(|| crate::repo_relpath::storage_string(&name));
         if is_dir {
             if is_nested_git_worktree(&path) {
                 continue;
             }
-            let rel = crate::git_path::strip_worktree_prefix(&path, work_tree).unwrap_or(name);
             let (ignored, _) = rules
                 .ignore_mut()
                 .check_path(repo, Some(index), &rel, true)?;
@@ -473,7 +491,6 @@ fn walk_dir_preserves_ignored(
                 return Ok(true);
             }
         } else {
-            let rel = crate::git_path::strip_worktree_prefix(&path, work_tree).unwrap_or(name);
             let (ignored, _) = rules
                 .ignore_mut()
                 .check_path(repo, Some(index), &rel, false)?;
@@ -514,16 +531,14 @@ fn expand_collapsed_dir_paths(
     scope: CleanScope,
     dir_rel: &str,
 ) -> Result<Vec<String>> {
-    let work_tree = repo
-        .work_tree()
-        .ok_or_else(|| Error::Message("clean requires a working tree".into()))?;
+    let work_tree = repo.work_tree().ok_or(RepositoryError::RequiresWorkTree)?;
     let mut paths = Vec::new();
     walk_expand_collapsed_dir(
         repo,
         index,
         rules,
         scope,
-        &work_tree.join(dir_rel),
+        &crate::repo_relpath::worktree_abs(work_tree, dir_rel),
         dir_rel,
         &mut paths,
     )?;
@@ -552,16 +567,16 @@ fn walk_expand_collapsed_dir(
 
     let mut child_dirs = Vec::new();
     for entry in entries {
-        let name = entry.file_name().to_string_lossy().to_string();
-        if name == ".git" {
+        let name = dir_entry_name_bytes(&entry);
+        if name == b".git" {
             continue;
         }
         let child_abs = entry.path();
-        let child_rel = if rel.is_empty() {
-            name.clone()
-        } else {
-            format!("{rel}/{name}")
-        };
+        let parent_bytes = crate::repo_relpath::storage_bytes(rel);
+        let child_rel = crate::repo_relpath::storage_string(&crate::repo_relpath::join_rel(
+            &parent_bytes,
+            &name,
+        ));
         if crate::read_dir_kind::entry_is_dir(&entry).unwrap_or(false) {
             child_dirs.push((child_rel, child_abs));
         } else if removable_untracked_path(repo, index, rules, scope, &child_rel)? {
@@ -617,18 +632,28 @@ fn removable_untracked_path(
     Ok(!ignored)
 }
 
-fn has_tracked_under_index(index: &Index, rel_dir: &str) -> bool {
-    let prefix = format!("{rel_dir}/");
+fn index_gitlink_at(index: &Index, stored: &str) -> bool {
+    let rel = crate::repo_relpath::storage_bytes(stored);
     index
-        .entries
-        .iter()
-        .any(|e| e.stage() == 0 && String::from_utf8_lossy(&e.path).starts_with(&prefix))
+        .find_entry_pos(&rel, 0)
+        .is_some_and(|pos| index.entries()[pos].mode == MODE_GITLINK)
 }
 
-fn index_gitlink_at(index: &Index, rel: &str) -> bool {
-    index.entries.iter().any(|e| {
-        e.stage() == 0 && e.mode == MODE_GITLINK && String::from_utf8_lossy(&e.path) == rel
-    })
+fn has_stage0_descendant_under_stored(index: &Index, stored: &str) -> bool {
+    let dir = crate::repo_relpath::storage_bytes(stored);
+    if dir.is_empty() {
+        return index.has_stage0_descendant_under("");
+    }
+    if std::str::from_utf8(&dir).is_ok() && !stored.starts_with(crate::repo_relpath::STORAGE_PREFIX)
+    {
+        return index.has_stage0_descendant_under(stored);
+    }
+    let mut prefix = dir.into_owned();
+    prefix.push(b'/');
+    index
+        .entries()
+        .iter()
+        .any(|e| e.stage() == 0 && e.path.starts_with(&prefix))
 }
 
 /// True when `abs` is a directory containing a nested `.git` (embedded repository).
@@ -639,20 +664,56 @@ pub(crate) fn is_nested_git_worktree(abs: &Path) -> bool {
 /// True when `rel` names a nested repository root or a path inside one (matches `git clean` / `git stash -u`).
 pub(crate) fn path_in_nested_git_worktree(work_tree: &Path, rel: &str) -> bool {
     let trimmed = rel.trim_end_matches('/');
-    if is_nested_git_worktree(&work_tree.join(trimmed)) {
+    if is_nested_git_worktree(&crate::repo_relpath::worktree_abs(work_tree, trimmed)) {
         return true;
     }
-    let mut prefix = String::new();
-    for part in trimmed.split('/') {
-        if !prefix.is_empty() {
-            prefix.push('/');
+    let bytes = crate::repo_relpath::storage_bytes(trimmed);
+    for (i, &byte) in bytes.iter().enumerate() {
+        if byte != b'/' {
+            continue;
         }
-        prefix.push_str(part);
-        if is_nested_git_worktree(&work_tree.join(&prefix)) {
+        let prefix = crate::repo_relpath::storage_string(&bytes[..i]);
+        if is_nested_git_worktree(&crate::repo_relpath::worktree_abs(work_tree, &prefix)) {
             return true;
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::Path;
+
+    fn stub_nested_git(dir: &Path) {
+        let git = dir.join(".git");
+        fs::create_dir_all(git.join("objects")).unwrap();
+        fs::create_dir_all(git.join("refs/heads")).unwrap();
+        fs::write(git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        fs::write(
+            git.join("config"),
+            "[core]\n\trepositoryformatversion = 0\n\tbare = false\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn path_in_nested_git_worktree_uses_cumulative_byte_prefixes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let work_tree = tmp.path();
+        fs::create_dir_all(work_tree.join("container/nested")).unwrap();
+        stub_nested_git(&work_tree.join("container/nested"));
+
+        assert!(
+            path_in_nested_git_worktree(work_tree, "container/nested/tracked.txt"),
+            "paths under a multi-segment nested repo prefix must be recognized"
+        );
+        assert!(
+            !path_in_nested_git_worktree(work_tree, "container/loose.txt"),
+            "sibling paths outside the nested repo must not match"
+        );
+    }
 }
 
 fn should_skip_nested_git(work_tree: &Path, rel: &str) -> bool {
@@ -675,9 +736,15 @@ fn remove_one_path(
     remove_empty_parent_dirs: bool,
     environment: &crate::environment::Environment,
 ) -> Result<bool> {
-    let abs = work_tree.join(rel.trim_end_matches('/'));
+    let stored = rel.trim_end_matches('/');
+    let abs = crate::repo_relpath::worktree_abs(work_tree, stored);
     if !abs.exists() && abs.symlink_metadata().is_err() {
-        return Ok(false);
+        return Err(PathIoError::worktree(
+            stored,
+            WorktreePathOperation::Remove,
+            std::io::ErrorKind::NotFound.into(),
+        )
+        .into());
     }
     if rel.ends_with('/') || abs.is_dir() {
         if is_nested_git_worktree(&abs) {
@@ -693,4 +760,19 @@ fn remove_one_path(
         }
     }
     Ok(true)
+}
+
+#[cfg(unix)]
+fn dir_entry_name_bytes(entry: &fs::DirEntry) -> Vec<u8> {
+    use std::os::unix::ffi::OsStringExt;
+    entry.file_name().into_vec()
+}
+
+#[cfg(not(unix))]
+fn dir_entry_name_bytes(entry: &fs::DirEntry) -> Vec<u8> {
+    entry
+        .file_name()
+        .to_string_lossy()
+        .into_owned()
+        .into_bytes()
 }

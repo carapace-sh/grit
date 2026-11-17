@@ -1,5 +1,7 @@
 //! Regression for issue #1962: SHA-256 repos from git must fsck/gc/clone cleanly.
 
+use grit_lib::progress::CancelToken;
+use grit_lib::progress::NullProgress;
 use grit_test_support::{free_port, git};
 use std::net::TcpStream;
 use std::path::Path;
@@ -8,13 +10,11 @@ use std::time::{Duration, Instant};
 
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::maintenance::repository_fsck::FsckOptions;
-use grit_lib::maintenance::{gc, GcOptions};
+use grit_lib::maintenance::GcOptions;
 use grit_lib::objects::HashAlgo;
-use grit_lib::progress::{NeverCancel, NullProgress};
-use grit_lib::refs::reflog::all_reflog_oids;
 use grit_lib::remote::clone::{clone, CloneOptions};
-use grit_lib::remote::fetch::NoProgress;
 use grit_lib::repo::Repository;
+use grit_lib::test_support::refs::all_reflog_oids;
 use grit_test_support::git_supports_sha256;
 use tempfile::TempDir;
 
@@ -45,7 +45,12 @@ fn git_sha256_repo_reflog_null_oid_excluded_from_fsck_and_gc() {
     );
 
     let report = repo
-        .fsck(&FsckOptions::default(), &mut NullProgress, &NeverCancel)
+        .maintenance()
+        .fsck(
+            &FsckOptions::default(),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
         .expect("fsck");
     assert!(
         report.issues.is_empty(),
@@ -53,7 +58,13 @@ fn git_sha256_repo_reflog_null_oid_excluded_from_fsck_and_gc() {
         report.issues
     );
 
-    gc(&repo, &GcOptions::default()).expect("gc");
+    repo.maintenance()
+        .gc(
+            &GcOptions::default(),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("gc");
 }
 
 #[test]
@@ -77,7 +88,7 @@ fn grit_clone_local_git_sha256_repo() {
             ..CloneOptions::new(source.to_string_lossy().into_owned(), dest.clone())
         },
         &mut NoProgress,
-        &NeverCancel,
+        &CancelToken::never(),
         None,
     )
     .expect("clone");
@@ -191,7 +202,7 @@ fn grit_clone_git_daemon_sha256_repo_after_sha1_init() {
     let outcome = clone(
         CloneOptions::new(url, dest.clone()),
         &mut NoProgress,
-        &NeverCancel,
+        &CancelToken::never(),
         None,
     )
     .expect("git:// clone of sha256 repo");

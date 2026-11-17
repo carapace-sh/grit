@@ -1,21 +1,14 @@
 //! List flags for `grit branch` (ref-query filters and sort).
 
-use carapace_rs_clap::completer;
 use clap::Args;
 
-use crate::completions::grit;
 use crate::limit_args::LimitArgs;
 
 /// Flags that apply when listing branches (no positional `NAME`).
 #[derive(Args, Debug, Default, Clone)]
 pub struct BranchListArgs {
     /// Include only branches whose short name matches `GLOB` (repeatable).
-    #[arg(
-        long = "list",
-        value_name = "GLOB",
-        action = clap::ArgAction::Append,
-        add = completer!(grit::action_local_branches())
-    )]
+    #[arg(long = "list", value_name = "GLOB", action = clap::ArgAction::Append)]
     pub patterns: Vec<String>,
     /// List remote-tracking branches under `refs/remotes/`.
     #[arg(short = 'r', long = "remotes")]
@@ -28,8 +21,7 @@ pub struct BranchListArgs {
         long = "merged",
         value_name = "REV",
         num_args = 0..=1,
-        default_missing_value = "HEAD",
-        add = completer!(grit::action_revisions())
+        default_missing_value = "HEAD"
     )]
     pub merged: Option<String>,
     /// List branches not merged into `REV` (defaults to `HEAD` when omitted).
@@ -37,8 +29,7 @@ pub struct BranchListArgs {
         long = "no-merged",
         value_name = "REV",
         num_args = 0..=1,
-        default_missing_value = "HEAD",
-        add = completer!(grit::action_revisions())
+        default_missing_value = "HEAD"
     )]
     pub no_merged: Option<String>,
     /// List branches whose tip contains `REV` (defaults to `HEAD` when omitted).
@@ -46,16 +37,11 @@ pub struct BranchListArgs {
         long = "contains",
         value_name = "REV",
         num_args = 0..=1,
-        default_missing_value = "HEAD",
-        add = completer!(grit::action_revisions())
+        default_missing_value = "HEAD"
     )]
     pub contains: Option<String>,
     /// Sort key: `name`, `version`, or `date`.
-    #[arg(
-        long = "sort",
-        value_name = "KEY",
-        add = completer!(grit::action_sort_keys())
-    )]
+    #[arg(long = "sort", value_name = "KEY")]
     pub sort: Option<String>,
     /// Reverse sort order.
     #[arg(long = "reverse")]

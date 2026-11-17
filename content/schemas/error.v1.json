@@ -314,9 +314,93 @@
           "type": "string"
         },
         {
+          "description": "Not inside a Git repository (or any parent directory is one).",
+          "enum": [
+            "not_a_repository"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "`grit commit` without `-m`, `-F`, amend/reuse, or a pending merge message.",
+          "enum": [
+            "commit_message_required"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Commit or tag message empty after trim (including `-m ''` / empty `-F`).",
+          "enum": [
+            "empty_commit_message"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Author or committer identity could not be resolved (`hint` names `grit config`).",
+          "enum": [
+            "identity_unknown"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Annotated or lightweight tag name already exists.",
+          "enum": [
+            "tag_already_exists"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "`refs/tags/<name>` does not exist.",
+          "enum": [
+            "tag_not_found"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "`merge --abort`, `rebase --continue`, `pick --continue`, or similar with nothing paused.",
+          "enum": [
+            "no_operation_in_progress"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Pathspec matched no tracked or known files.",
+          "enum": [
+            "pathspec_no_match"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "No stash entry at the requested index (including an empty stash list).",
+          "enum": [
+            "stash_not_found"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Path not present in the named revision (and not on disk where required).",
+          "enum": [
+            "path_not_found"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Nested git checkout has no commit on its current branch (`paths`).",
+          "enum": [
+            "embedded_repo_without_commit"
+          ],
+          "type": "string"
+        },
+        {
           "description": "`HEAD` is on a GitButler workspace, which GitButler rewrites; commit with `but commit`.",
           "enum": [
             "gitbutler_workspace"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The repository's primary object store is not the files backend, and the operation needs the on-disk `objects/` layout (`operation`).",
+          "enum": [
+            "unsupported_object_store"
           ],
           "type": "string"
         }
@@ -487,6 +571,13 @@
         },
         "oid": {
           "description": "Plain SHA-1 digest for colliding input, when `kind == \"hash_collision\"`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "operation": {
+          "description": "The refused operation's stable snake_case name (`gc`, `commit_graph_write`, …), when `kind == \"unsupported_object_store\"`.",
           "type": [
             "string",
             "null"

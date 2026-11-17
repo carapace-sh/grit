@@ -6,12 +6,12 @@ use std::fs;
 
 use std::sync::Arc;
 
-use grit_lib::diff::{format_raw, DiffEntry};
+use grit_lib::diff::{format_raw, DiffEntry, SubmoduleIgnoreMode, TreeDiffOptions};
 use grit_lib::objects::ObjectKind;
-use grit_lib::refs::store::{MemoryRefStore, RefName, RefStorageFormat};
+use grit_lib::refs::store::{MemoryRefStore, RefName, RefNameRef, RefStorageFormat};
 use grit_lib::repo::Repository;
 use grit_lib::revwalk::rev_list::RevListOptions;
-use grit_lib::worktree::{add_linked_worktree, AddLinkedWorktreeOptions, WorktreeBranch};
+use grit_lib::worktree::{AddLinkedWorktreeOptions, WorktreeBranch};
 
 use crate::support;
 
@@ -107,12 +107,17 @@ fn index_handle_load_write_matches_git_ls_files() {
     fs::write(wt.join("tracked.txt"), "index handle\n").expect("write file");
     git(wt, &["add", "tracked.txt"]);
 
-    let mut idx = repo.index_handle().load().expect("load index");
+    let mut idx = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("load index");
     assert!(idx
         .entries()
         .iter()
         .any(|e| e.path.as_slice() == b"tracked.txt"));
-    repo.index_handle().write(&mut idx).expect("write index");
+    repo.index()
+        .write(&mut idx, &grit_lib::index::IndexWriteOptions::default())
+        .expect("write index");
 
     let git_stages = git(wt, &["ls-files", "-s"]);
     assert!(git_stages.contains("tracked.txt"));
@@ -123,15 +128,17 @@ fn config_handle_get_set_matches_git_config() {
     let (test, repo) = seeded_files_repo();
     let wt = test.worktree();
 
-    repo.config_handle()
-        .set_local("user.name", "Handle Tester")
+    repo.config()
+        .set(
+            grit_lib::config::ConfigScope::Local,
+            "user.name",
+            "Handle Tester",
+            &grit_lib::config::ConfigWriteOptions::new(),
+        )
         .expect("set local");
     assert_eq!(git(wt, &["config", "user.name"]).trim(), "Handle Tester");
     assert_eq!(
-        repo.config_handle()
-            .get("user.name")
-            .expect("get")
-            .as_deref(),
+        repo.config().get("user.name").expect("get").as_deref(),
         Some("Handle Tester")
     );
 }
@@ -142,7 +149,10 @@ fn rev_walk_resolve_and_list_match_git() {
     let repo = open_grit_repo(history.worktree());
     let wt = history.worktree();
 
-    let head = repo.rev_walk().resolve("HEAD").expect("resolve HEAD");
+    let head = repo
+        .revwalk()
+        .resolve("HEAD", &grit_lib::revwalk::ResolveOptions::default())
+        .expect("resolve HEAD");
     let git_head = git(wt, &["rev-parse", "HEAD"]).trim().to_owned();
     assert_eq!(head.to_hex(), git_head);
 
@@ -150,7 +160,7 @@ fn rev_walk_resolve_and_list_match_git() {
         reverse: false,
         ..RevListOptions::default()
     };
-    let result = repo.rev_walk().walk("HEAD", &opts).expect("rev-list");
+    let result = repo.revwalk().walk("HEAD", &opts).expect("rev-list");
     let grit_hex: Vec<String> = result.commits.iter().map(|c| c.to_hex()).collect();
 
     let git_list = git(wt, &["rev-list", "HEAD"]);
@@ -169,15 +179,26 @@ fn diff_tree_to_tree_matches_git_diff_raw() {
     let repo = open_grit_repo(history.worktree());
     let wt = history.worktree();
 
-    let head = repo.rev_walk().resolve("HEAD").expect("head");
-    let parent = repo.rev_walk().resolve("HEAD~1").expect("parent");
+    let head = repo
+        .revwalk()
+        .resolve("HEAD", &grit_lib::revwalk::ResolveOptions::default())
+        .expect("head");
+    let parent = repo
+        .revwalk()
+        .resolve("HEAD~1", &grit_lib::revwalk::ResolveOptions::default())
+        .expect("parent");
 
     let head_tree = grit_lib::diff::tree_oid_of_commit(repo.odb(), &head).expect("head tree");
     let parent_tree = grit_lib::diff::tree_oid_of_commit(repo.odb(), &parent).expect("parent tree");
 
     let entries = repo
         .diff()
-        .tree_to_tree(Some(&parent_tree), Some(&head_tree))
+        .tree_to_tree(
+            Some(&parent_tree),
+            Some(&head_tree),
+            &TreeDiffOptions::default(),
+        )
+        .map(|r| r.entries)
         .expect("tree diff");
     let grit_raw = entries_raw(&entries);
 
@@ -203,16 +224,20 @@ fn diff_index_to_tree_matches_git_diff_cached_raw() {
     fs::write(wt.join("staged.txt"), "cached\n").expect("write");
     git(wt, &["add", "staged.txt"]);
 
-    let idx = repo.index_handle().load().expect("load");
+    let idx = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("load");
     let head_tree = repo
-        .rev_walk()
-        .resolve("HEAD")
+        .revwalk()
+        .resolve("HEAD", &grit_lib::revwalk::ResolveOptions::default())
         .ok()
         .and_then(|oid| grit_lib::diff::tree_oid_of_commit(repo.odb(), &oid).ok());
 
     let entries = repo
         .diff()
-        .index_to_tree(&idx, head_tree.as_ref(), false)
+        .index_to_tree(&idx, head_tree.as_ref(), &TreeDiffOptions::default())
+        .map(|r| r.entries)
         .expect("index diff");
     let grit_raw = entries_raw(&entries);
 
@@ -239,10 +264,17 @@ fn diff_worktree_to_index_matches_git_diff_raw() {
     git(wt, &["add", "dirty.txt"]);
     fs::write(wt.join("dirty.txt"), "dirty\n").expect("modify");
 
-    let mut idx = repo.index_handle().load().expect("load");
+    let mut idx = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("load");
     let entries = repo
         .diff()
-        .worktree_to_index(&mut idx, true, false)
+        .index_to_worktree(
+            &mut idx,
+            &TreeDiffOptions::default().with_submodules(SubmoduleIgnoreMode::Untracked),
+        )
+        .map(|r| r.entries)
         .expect("worktree diff");
     let grit_raw = entries_raw(&entries);
 
@@ -282,7 +314,7 @@ fn references_update_uses_injected_ref_store() {
     repo.references().update(&name, &oid).expect("update");
     assert_eq!(repo.references().resolve(&name).expect("resolve"), oid);
     assert!(
-        repo.refs().format() == RefStorageFormat::Memory,
+        repo.ref_store().format() == RefStorageFormat::Memory,
         "update must not fall back to on-disk files store"
     );
     assert!(
@@ -299,9 +331,9 @@ fn config_handle_set_local_linked_worktree_matches_git() {
 
     let linked_holder = tempfile::tempdir_in(main.parent().expect("parent")).expect("linked dir");
     let linked = linked_holder.path().to_path_buf();
-    add_linked_worktree(
-        &open_grit_repo(main),
-        &AddLinkedWorktreeOptions {
+    open_grit_repo(main)
+        .worktrees()
+        .add(&AddLinkedWorktreeOptions {
             path: linked.clone(),
             branch: Some(WorktreeBranch::Create("linked".into())),
             start_point: Some("HEAD".into()),
@@ -309,19 +341,23 @@ fn config_handle_set_local_linked_worktree_matches_git() {
             lock: None,
             no_checkout: false,
             track: false,
-        },
-    )
-    .expect("add linked worktree");
+        })
+        .expect("add linked worktree");
 
     let linked_repo = open_grit_repo(&linked);
     linked_repo
-        .config_handle()
-        .set_local("grit.handle.probe", "linked-value")
+        .config()
+        .set(
+            grit_lib::config::ConfigScope::Local,
+            "grit.handle.probe",
+            "linked-value",
+            &grit_lib::config::ConfigWriteOptions::new(),
+        )
         .expect("set local from linked wt");
 
     assert_eq!(
         linked_repo
-            .config_handle()
+            .config()
             .get("grit.handle.probe")
             .expect("get")
             .as_deref(),

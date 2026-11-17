@@ -9,13 +9,14 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use grit_lib::error::ObjectError;
 use std::path::Path;
 
 use grit_lib::error::Error;
-use grit_lib::maintenance::{offload_blobs, OffloadError, OffloadOptions};
-use grit_lib::objects::pack::clear_pack_cache;
+use grit_lib::maintenance::{OffloadError, OffloadOptions};
 use grit_lib::remote::partial_clone::ObjectFilterSpec;
 use grit_lib::repo::Repository;
+use grit_lib::test_support::objects_pack::clear_pack_cache;
 use grit_test_support::{git_cmd, Output};
 
 const NOW: i64 = 4_000_000_000;
@@ -85,7 +86,7 @@ fn offloaded_and_pushed(root: &Path) -> std::path::PathBuf {
     let main = Repository::open(&main_dir, &Default::default()).unwrap();
     let mut opts = OffloadOptions::new("lop", NOW);
     opts.filter = Some(ObjectFilterSpec::BlobLimit(100 * 1024));
-    let report = offload_blobs(&main, &opts).unwrap();
+    let report = main.maintenance().offload_blobs(&opts).unwrap();
     assert_eq!(report.dropped_from_main, 1);
     drop(main);
     clear_pack_cache();
@@ -123,7 +124,7 @@ fn git_maintenance_keeps_every_blob_offload_leaves_in_main() {
         let main = Repository::open(&main_dir, &Default::default()).unwrap();
         let mut opts = OffloadOptions::new("lop", NOW);
         opts.filter = Some(ObjectFilterSpec::BlobLimit(100 * 1024));
-        offload_blobs(&main, &opts).unwrap();
+        main.maintenance().offload_blobs(&opts).unwrap();
         drop(main);
         clear_pack_cache();
         git(&main_dir, maintenance);
@@ -165,7 +166,7 @@ fn git_cannot_write_a_bitmap_once_an_offloaded_repository_takes_a_push() {
     // And it lost nothing: both versions of the small file are still in main, the
     // large one in the LOP.
     assert_stored(
-        &tmp.path().join("work"),
+        tmp.path().join("work"),
         &main_dir,
         &["HEAD:small.txt", "HEAD~1:small.txt"],
         &tmp.path().join("lop.git"),
@@ -216,7 +217,7 @@ fn git_maintenance_keeps_objects_of_a_kept_pack_the_promisor_pack_names() {
     opts.filter = Some(ObjectFilterSpec::BlobLimit(100 * 1024));
     let offload = |opts: &OffloadOptions| {
         let main = Repository::open(&main_dir, &Default::default()).unwrap();
-        let result = offload_blobs(&main, opts);
+        let result = main.maintenance().offload_blobs(opts);
         drop(main);
         clear_pack_cache();
         result
@@ -224,7 +225,10 @@ fn git_maintenance_keeps_objects_of_a_kept_pack_the_promisor_pack_names() {
 
     // The pushed commit and tree name the kept commit and blob.
     match offload(&opts) {
-        Err(Error::Offload(OffloadError::KeptPackObjectPromised { pack, .. })) => {
+        Err(Error::Object(ObjectError::Offload(OffloadError::KeptPackObjectPromised {
+            pack,
+            ..
+        }))) => {
             assert_eq!(pack.file_name(), kept_pack.file_name());
         }
         other => panic!("expected a refusal, got {other:?}"),

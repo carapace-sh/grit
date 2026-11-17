@@ -2,6 +2,7 @@
 //! way Git does, so `reset --hard ORIG_HEAD` undoes them. Checked with the system `git`.
 
 use crate::support;
+use grit_lib::worktree::WorktreeError;
 
 use std::path::Path;
 
@@ -9,23 +10,21 @@ use grit_lib::command_runner::{system_command_runner, RecordingRunner};
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::error::Error;
 use grit_lib::index::write_tree::{write_tree_update_index, WriteTreeFlags};
+use grit_lib::merge::{FastForwardPolicy, IntegrateBranchOutcome, MergeCommitMode, MergeOptions};
 use grit_lib::objects::{serialize_commit, CommitData, ObjectId, ObjectKind};
-use grit_lib::porcelain::merge::{
-    integrate_branch_with, plan_branch_merge, FastForwardPolicy, IntegrateBranchOutcome,
-    MergeCommitMode, MergeOptions,
-};
-use grit_lib::porcelain::reset::{reset_to_commit, ResetMode, ResetOptions};
-use grit_lib::progress::{NeverCancel, NullProgress};
+use grit_lib::porcelain::reset::{ResetMode, ResetOptions};
+use grit_lib::porcelain::MergeError;
+use grit_lib::progress::CancelToken;
+use grit_lib::progress::NullProgress;
+use grit_lib::refs;
+use grit_lib::refs::ref_storage::RefStorageFormat;
 use grit_lib::repo::{InitOptions, Repository};
 use grit_lib::revwalk::history::{
-    abort_rebase, continue_rebase, start_rebase, start_rebase_with_exec, ApplyOptions, EmptyPolicy,
-    ExecSpec, HistoryError, PreRebase, RebaseOntoOptions, RebaseOutcome, RebaseRequest,
-    RebaseSessionError, RefScope, RewriteOptions, StartRebaseOptions,
+    ApplyOptions, EmptyPolicy, ExecSpec, HistoryError, PreRebase, RebaseOntoOptions, RebaseOutcome,
+    RebaseRequest, RebaseSessionError, RefScope, RewriteOptions, StartRebaseOptions,
 };
-use grit_lib::revwalk::rev_parse::resolve_revision;
-use grit_lib::state::{read_orig_head_for_repository, write_orig_head};
-use grit_lib::{refs, RefStorageFormat};
-use grit_test_support::{git, git_cmd};
+use grit_test_support::{abort_branch_merge, git, git_cmd};
+use grit_test_support::{integrate_branch_with, plan_branch_merge};
 use tempfile::TempDir;
 
 const IDENT: &str = "T <t@e.c> 1700000000 +0000";
@@ -81,13 +80,13 @@ fn set_stale_orig_head(dir: &Path) -> ObjectId {
 }
 
 fn reset(repo: &Repository, target: ObjectId, mode: ResetMode) -> Result<(), Error> {
-    reset_to_commit(
-        repo,
-        &ResetOptions::new(target, mode, ident(), "reset: moving"),
-        &mut NullProgress,
-        &NeverCancel,
-    )
-    .map(|_| ())
+    repo.checkout()
+        .reset(
+            &ResetOptions::new(target, mode, ident(), "reset: moving"),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .map(|_| ())
 }
 
 fn merge(
@@ -104,7 +103,7 @@ fn merge(
         "topic",
         options,
         &mut NullProgress,
-        &NeverCancel,
+        &CancelToken::never(),
     )
 }
 
@@ -121,7 +120,7 @@ fn assert_orig_head_undoes(dir: &Path, before: ObjectId) {
     let repo = open(dir);
     assert_eq!(git_orig_head(dir), Some(before), "git reads ORIG_HEAD");
     assert_eq!(
-        read_orig_head_for_repository(&repo).expect("read"),
+        repo.operation().state().map(|s| s.orig_head).expect("read"),
         Some(before)
     );
     assert!(
@@ -129,7 +128,10 @@ fn assert_orig_head_undoes(dir: &Path, before: ObjectId) {
         "ORIG_HEAD has no reflog"
     );
     git(dir, &["fsck", "--strict"]);
-    let target = resolve_revision(&repo, "ORIG_HEAD").expect("ORIG_HEAD resolves");
+    let target = repo
+        .revwalk()
+        .resolve("ORIG_HEAD", &grit_lib::revwalk::ResolveOptions::default())
+        .expect("ORIG_HEAD resolves");
     assert_eq!(target, before);
     reset(&repo, target, ResetMode::Hard).expect("reset --hard ORIG_HEAD");
     assert_eq!(rev(dir, "HEAD"), before);
@@ -183,7 +185,9 @@ fn dry_run_and_refused_resets_leave_orig_head_alone() {
     let target = rev(dir, "HEAD~1");
     let mut opts = ResetOptions::new(target, ResetMode::Hard, ident(), "reset");
     opts.dry_run = true;
-    reset_to_commit(&repo, &opts, &mut NullProgress, &NeverCancel).expect("dry run");
+    repo.checkout()
+        .reset(&opts, &mut NullProgress, &CancelToken::never())
+        .expect("dry run");
     assert_eq!(
         git_orig_head(dir),
         None,
@@ -193,7 +197,10 @@ fn dry_run_and_refused_resets_leave_orig_head_alone() {
     let stale = set_stale_orig_head(dir);
     std::fs::write(dir.join("f3"), "local edit\n").expect("edit");
     let err = reset(&repo, target, ResetMode::Keep).expect_err("keep refuses");
-    assert!(matches!(err, Error::WouldOverwrite { .. }), "{err:?}");
+    assert!(
+        matches!(err, Error::Worktree(WorktreeError::WouldOverwrite { .. })),
+        "{err:?}"
+    );
     assert_eq!(git_orig_head(dir), Some(stale));
 }
 
@@ -260,7 +267,13 @@ fn refused_ff_only_merge_still_records_orig_head_like_git() {
         ..merge_options()
     };
     let err = merge(&open(dir), main, topic, &only).expect_err("not a fast-forward");
-    assert!(matches!(err, Error::NotFastForward), "{err:?}");
+    assert!(
+        matches!(
+            err,
+            grit_lib::error::Error::Merge(MergeError::NotFastForward)
+        ),
+        "{err:?}"
+    );
     assert_eq!(git_orig_head(dir), Some(main));
     assert_eq!(rev(dir, "HEAD"), main);
 }
@@ -281,7 +294,7 @@ fn conflicted_merge_records_orig_head_and_abort_keeps_it() {
         "{outcome:?}"
     );
     assert_eq!(git_orig_head(dir), Some(main));
-    grit_lib::porcelain::merge::abort_branch_merge(&repo).expect("abort");
+    abort_branch_merge(&repo).expect("abort");
     assert_eq!(git_orig_head(dir), Some(main));
     assert_eq!(rev(dir, "HEAD"), main);
 }
@@ -303,6 +316,7 @@ fn rebase_opts(upstream: ObjectId, tip: ObjectId) -> StartRebaseOptions {
             branch_tip: tip,
         },
         rebase: RebaseOntoOptions {
+            pre_rebase: PreRebase::Skip,
             rewrite: RewriteOptions {
                 scope: RefScope::Head,
                 empty: EmptyPolicy::Drop,
@@ -319,20 +333,22 @@ fn rebase_opts(upstream: ObjectId, tip: ObjectId) -> StartRebaseOptions {
             identity: ident(),
             reflog_message: "rebase".into(),
             record_operation: None,
-            hooks: grit_lib::PostOperationHooks::Skip,
+            hooks: grit_lib::command_runner::hooks::PostOperationHooks::Skip,
         },
-        pre_rebase: PreRebase::Skip,
+        exec: None,
     }
 }
 
 fn rebase(dir: &Path, upstream: ObjectId, tip: ObjectId) -> RebaseOutcome {
-    start_rebase(
-        &open(dir),
-        &rebase_opts(upstream, tip),
-        &mut NullProgress,
-        &NeverCancel,
-    )
-    .expect("start rebase")
+    open(dir)
+        .history()
+        .start_rebase(
+            &rebase_opts(upstream, tip),
+            open(dir).command_runner().as_ref(),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("start rebase")
 }
 
 #[test]
@@ -370,17 +386,20 @@ fn up_to_date_rebase_with_exec_runs_at_each_commit_without_rewriting_tip() {
     let tip_before = rev(dir, "HEAD");
     let upstream = rev(dir, "HEAD~2");
     let runner = RecordingRunner::always_success();
-    let outcome = start_rebase_with_exec(
-        &open(dir),
-        &rebase_opts(upstream, tip_before),
-        &ExecSpec {
-            commands: vec!["true".into()],
-        },
-        runner.as_ref(),
-        &mut NullProgress,
-        &NeverCancel,
-    )
-    .expect("exec rebase");
+    let outcome = open(dir)
+        .history()
+        .start_rebase(
+            &StartRebaseOptions {
+                exec: Some(grit_lib::revwalk::history::ExecSpec::clone(&ExecSpec {
+                    commands: vec!["true".into()],
+                })),
+                ..rebase_opts(upstream, tip_before)
+            },
+            runner.as_ref(),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("exec rebase");
     assert!(
         matches!(outcome, RebaseOutcome::ExecDone { .. }),
         "{outcome:?}"
@@ -408,17 +427,20 @@ fn up_to_date_rebase_with_exec_amend_moves_stacked_branch() {
     let amend = "env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null \
         GIT_AUTHOR_NAME=T GIT_AUTHOR_EMAIL=t@e.c GIT_COMMITTER_NAME=T GIT_COMMITTER_EMAIL=t@e.c \
         git commit -q --amend -m amended";
-    let outcome = start_rebase_with_exec(
-        &open(dir),
-        &opts,
-        &ExecSpec {
-            commands: vec![amend.into()],
-        },
-        system_command_runner().as_ref(),
-        &mut NullProgress,
-        &NeverCancel,
-    )
-    .expect("exec rebase");
+    let outcome = open(dir)
+        .history()
+        .start_rebase(
+            &StartRebaseOptions {
+                exec: Some(grit_lib::revwalk::history::ExecSpec::clone(&ExecSpec {
+                    commands: vec![amend.into()],
+                })),
+                ..opts.clone()
+            },
+            system_command_runner().as_ref(),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("exec rebase");
     assert!(
         matches!(outcome, RebaseOutcome::ExecDone { .. }),
         "{outcome:?}"
@@ -455,17 +477,20 @@ fn up_to_date_rebase_with_exec_on_empty_range_runs_nothing() {
     let dir = tmp.path();
     let tip = rev(dir, "HEAD");
     let runner = RecordingRunner::always_success();
-    let outcome = start_rebase_with_exec(
-        &open(dir),
-        &rebase_opts(tip, tip),
-        &ExecSpec {
-            commands: vec!["true".into()],
-        },
-        runner.as_ref(),
-        &mut NullProgress,
-        &NeverCancel,
-    )
-    .expect("exec");
+    let outcome = open(dir)
+        .history()
+        .start_rebase(
+            &StartRebaseOptions {
+                exec: Some(grit_lib::revwalk::history::ExecSpec::clone(&ExecSpec {
+                    commands: vec!["true".into()],
+                })),
+                ..rebase_opts(tip, tip)
+            },
+            runner.as_ref(),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("exec");
     assert!(matches!(outcome, RebaseOutcome::Done { .. }), "{outcome:?}");
     assert!(runner.specs().is_empty());
 }
@@ -475,16 +500,17 @@ fn rebase_with_exec(
     upstream: ObjectId,
     tip: ObjectId,
     command: &str,
-) -> Result<RebaseOutcome, RebaseSessionError> {
-    start_rebase_with_exec(
-        &open(dir),
-        &rebase_opts(upstream, tip),
-        &ExecSpec {
-            commands: vec![command.to_owned()],
+) -> grit_lib::error::Result<RebaseOutcome> {
+    open(dir).history().start_rebase(
+        &StartRebaseOptions {
+            exec: Some(grit_lib::revwalk::history::ExecSpec::clone(&ExecSpec {
+                commands: vec![command.to_owned()],
+            })),
+            ..rebase_opts(upstream, tip)
         },
         system_command_runner().as_ref(),
         &mut NullProgress,
-        &NeverCancel,
+        &CancelToken::never(),
     )
 }
 
@@ -538,7 +564,7 @@ fn exec_rebase_stop_records_orig_head_and_failure_leaves_it_alone() {
         "{err:?}"
     );
     assert_eq!(git_orig_head(dir), Some(topic), "exec stop");
-    abort_rebase(&open(dir), &ident()).expect("abort");
+    open(dir).history().abort_rebase(&ident()).expect("abort");
     assert_eq!(rev(dir, "HEAD"), topic);
     assert_eq!(git_orig_head(dir), Some(topic), "after abort");
     git(dir, &["fsck", "--strict"]);
@@ -568,8 +594,15 @@ fn favored_rebase_records_orig_head_like_git() {
     set_stale_orig_head(dir);
     let mut opts = rebase_opts(main, topic);
     opts.rebase.favor = grit_lib::diff::merge_file::MergeFavor::Ours;
-    let outcome =
-        start_rebase(&open(dir), &opts, &mut NullProgress, &NeverCancel).expect("favored rebase");
+    let outcome = open(dir)
+        .history()
+        .start_rebase(
+            &opts,
+            open(dir).command_runner().as_ref(),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("favored rebase");
     assert!(matches!(outcome, RebaseOutcome::Done { .. }), "{outcome:?}");
     assert_eq!(
         git(dir, &["show", "HEAD:f1"]),
@@ -620,11 +653,22 @@ fn favored_rebase_stops_on_unresolvable_conflict_and_continue_keeps_the_favor() 
     let mut opts = rebase_opts(main, topic);
     opts.rebase.favor = grit_lib::diff::merge_file::MergeFavor::Ours;
     let repo = open(dir);
-    let outcome = start_rebase(&repo, &opts, &mut NullProgress, &NeverCancel).expect("start");
+    let outcome = repo
+        .history()
+        .start_rebase(
+            &opts,
+            repo.command_runner().as_ref(),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("start");
     assert!(matches!(outcome, RebaseOutcome::Stopped(_)), "{outcome:?}");
     assert_eq!(git_orig_head(dir), Some(topic));
     git(dir, &["rm", "-q", "f1"]);
-    let done = continue_rebase(&repo, &opts, &mut NullProgress, &NeverCancel).expect("continue");
+    let done = repo
+        .history()
+        .continue_rebase(&opts, &mut NullProgress, &CancelToken::never())
+        .expect("continue");
     assert!(matches!(done, RebaseOutcome::Done { .. }), "{done:?}");
     assert_eq!(
         git(dir, &["show", "HEAD:g"]),
@@ -650,16 +694,17 @@ fn stopped_rebase_keeps_orig_head_through_continue_and_abort() {
         if finish == "continue" {
             std::fs::write(dir.join("f2"), "resolved\n").expect("resolve");
             git(dir, &["add", "f2"]);
-            let done = continue_rebase(
-                &repo,
-                &rebase_opts(main, tip),
-                &mut NullProgress,
-                &NeverCancel,
-            )
-            .expect("continue");
+            let done = repo
+                .history()
+                .continue_rebase(
+                    &rebase_opts(main, tip),
+                    &mut NullProgress,
+                    &CancelToken::never(),
+                )
+                .expect("continue");
             assert!(matches!(done, RebaseOutcome::Done { .. }), "{done:?}");
         } else {
-            abort_rebase(&repo, &ident()).expect("abort");
+            repo.history().abort_rebase(&ident()).expect("abort");
             assert_eq!(rev(dir, "HEAD"), tip);
         }
         assert_eq!(git_orig_head(dir), Some(tip), "after {finish}");
@@ -675,7 +720,10 @@ fn commit_on_main(repo: &Repository, contents: &str, parent: Option<ObjectId>) -
         .odb()
         .write(ObjectKind::Blob, contents.as_bytes())
         .expect("blob");
-    let mut index = repo.index_handle().load().expect("index");
+    let mut index = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("index");
     index.add_or_replace(
         grit_lib::index::entry_from_stat(&wt.join("f"), b"f", blob, grit_lib::index::MODE_REGULAR)
             .expect("entry"),
@@ -683,7 +731,9 @@ fn commit_on_main(repo: &Repository, contents: &str, parent: Option<ObjectId>) -
     index.sort();
     let tree = write_tree_update_index(repo.odb(), &mut index, "", WriteTreeFlags::silent())
         .expect("tree");
-    repo.index_handle().write(&mut index).expect("write index");
+    repo.index()
+        .write(&mut index, &grit_lib::index::IndexWriteOptions::default())
+        .expect("write index");
     let commit = CommitData {
         tree,
         parents: parent.into_iter().collect(),
@@ -700,7 +750,7 @@ fn commit_on_main(repo: &Repository, contents: &str, parent: Option<ObjectId>) -
         .odb()
         .write(ObjectKind::Commit, &serialize_commit(&commit))
         .expect("commit");
-    refs::update_direct_ref_on_store(repo.refs(), repo.git_dir(), "refs/heads/main", &oid)
+    refs::update_direct_ref_on_store(repo.ref_store(), repo.git_dir(), "refs/heads/main", &oid)
         .expect("branch");
     oid
 }
@@ -708,7 +758,7 @@ fn commit_on_main(repo: &Repository, contents: &str, parent: Option<ObjectId>) -
 #[test]
 fn reftable_reset_stores_orig_head_in_the_ref_store() {
     let tmp = TempDir::new().expect("tempdir");
-    let repo = Repository::init(
+    let (repo, _) = Repository::init(
         tmp.path(),
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
@@ -723,10 +773,15 @@ fn reftable_reset_stores_orig_head_in_the_ref_store() {
         "reftable keeps ORIG_HEAD in the stack, not a loose file"
     );
     assert_eq!(
-        read_orig_head_for_repository(&repo).expect("read"),
+        repo.operation().state().map(|s| s.orig_head).expect("read"),
         Some(second)
     );
-    assert_eq!(resolve_revision(&repo, "ORIG_HEAD").expect("rev"), second);
+    assert_eq!(
+        repo.revwalk()
+            .resolve("ORIG_HEAD", &grit_lib::revwalk::ResolveOptions::default())
+            .expect("rev"),
+        second
+    );
     if support::git_supports_reftable() {
         assert_eq!(git_orig_head(tmp.path()), Some(second));
         git(tmp.path(), &["fsck", "--strict"]);
@@ -738,13 +793,20 @@ fn write_orig_head_overwrites_and_git_reads_it() {
     let (tmp, main, topic) = issue_repo();
     let dir = tmp.path();
     let repo = open(dir);
-    assert_eq!(read_orig_head_for_repository(&repo).expect("read"), None);
-    write_orig_head(&repo, topic).expect("write");
+    assert_eq!(
+        repo.operation().state().map(|s| s.orig_head).expect("read"),
+        None
+    );
+    repo.references()
+        .update_direct("ORIG_HEAD", &topic)
+        .expect("write");
     assert_eq!(git_orig_head(dir), Some(topic));
-    write_orig_head(&repo, main).expect("overwrite");
+    repo.references()
+        .update_direct("ORIG_HEAD", &main)
+        .expect("overwrite");
     assert_eq!(git_orig_head(dir), Some(main));
     assert_eq!(
-        read_orig_head_for_repository(&repo).expect("read"),
+        repo.operation().state().map(|s| s.orig_head).expect("read"),
         Some(main)
     );
     assert_eq!(

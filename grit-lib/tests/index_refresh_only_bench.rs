@@ -34,12 +34,18 @@ fn refresh_index_stat_only_timing() {
         &RepositoryOptions::empty().with_work_tree(root),
     )
     .expect("open");
-    let mut index = repo.index_handle().load().expect("index");
+    let mut index = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("index");
     let index_mtime = index.source_mtime;
     let config = grit_lib::config::ConfigSet::load(
         &grit_lib::config::environment::Environment::capture_process(),
         Some(repo.git_dir()),
-        true,
+        &crate::config::LoadConfigOptions::standard(
+            &grit_lib::config::environment::Environment::capture_process(),
+            Some(repo.git_dir()),
+        ),
     )
     .unwrap_or_default();
     let start = Instant::now();

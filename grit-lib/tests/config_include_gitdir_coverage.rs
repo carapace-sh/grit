@@ -21,7 +21,7 @@ fn relative_gitdir_include_from_disk_file() {
         &repo,
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
-            .with_ref_storage(grit_lib::RefStorageFormat::Files),
+            .with_ref_storage(grit_lib::refs::ref_storage::RefStorageFormat::Files),
     )
     .expect("init");
     let git_dir = repo.join(".git");
@@ -45,9 +45,12 @@ fn relative_gitdir_include_from_disk_file() {
         .expect("read")
         .expect("exists");
     let mut set = ConfigSet::new();
-    set.merge_file_with_includes(&file, true, &ctx)
-        .expect("merge includes");
-    assert_eq!(set.get("hit.k").as_deref(), Some("yes"));
+    set.merge_file(
+        &file,
+        &grit_lib::config::IncludeOptions::default().with_context(ctx.clone()),
+    )
+    .expect("merge includes");
+    assert_eq!(set.get("hit.k").unwrap().as_deref(), Some("yes"));
 }
 
 #[test]
@@ -96,10 +99,7 @@ fn inline_section_key_parse_and_negotiation_errors() {
         "[fetch]\n\tnegotiationAlgorithm\n",
         ConfigScope::Local,
     );
-    assert!(matches!(
-        err,
-        Err(Error::Message(_)) | Err(Error::Config(_))
-    ));
+    assert!(matches!(err, Err(Error::Config(_))));
 
     let inline = ConfigFile::parse(
         Path::new("c"),

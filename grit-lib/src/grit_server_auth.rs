@@ -31,8 +31,9 @@ use thiserror::Error;
 
 use crate::config::ConfigSet;
 use crate::credentials::{Credential, CredentialProvider};
-use crate::error::{Error, RemoteUnreadableReason, Result};
+use crate::error::{Error, ErrorSummary, RemoteUnreadableReason, Result};
 use crate::github_auth::PollClock;
+use crate::remote::RemoteError;
 use crate::transport::http::HttpClient;
 
 /// Path, relative to the server root, of the endpoint that names the user a
@@ -74,21 +75,30 @@ pub struct ServerIdentity {
 #[non_exhaustive]
 pub enum ServerAuthError {
     /// The URL could not be parsed, or has no host.
-    #[error("not a server URL: {0}")]
-    InvalidUrl(String),
+    #[error("not a server URL: {url}")]
+    InvalidUrl {
+        /// The URL as given.
+        url: String,
+    },
     /// The URL's scheme is not `http` or `https`.
-    #[error("unsupported URL scheme {0:?}; use http:// or https://")]
-    UnsupportedScheme(String),
+    #[error("unsupported URL scheme {scheme:?}; use http:// or https://")]
+    UnsupportedScheme {
+        /// The scheme as given.
+        scheme: String,
+    },
     /// The server refused the token (`401`).
     #[error("the server rejected the token")]
     TokenRejected,
     /// The request failed (connection, TLS, or an HTTP error status).
-    #[error(transparent)]
-    Http(Error),
+    #[error("{0}")]
+    Http(ErrorSummary),
     /// The server answered, but not like a `grit serve` host: a client error
     /// status from a `.grit/` endpoint, or a body that is not grit's JSON.
-    #[error("{0} did not answer like a grit server")]
-    NotGritServer(String),
+    #[error("{url} did not answer like a grit server")]
+    NotGritServer {
+        /// Root URL of the host that answered.
+        url: String,
+    },
     /// The user declined the login code in the browser.
     #[error("the sign-in was declined")]
     LoginDenied,
@@ -172,16 +182,20 @@ impl ServerUrl {
     /// `http` and `https`.
     pub fn parse(url: &str) -> std::result::Result<Self, ServerAuthError> {
         let trimmed = url.trim();
-        let parsed = url::Url::parse(&with_default_scheme(trimmed))
-            .map_err(|_| ServerAuthError::InvalidUrl(trimmed.to_owned()))?;
+        let parsed = url::Url::parse(&with_default_scheme(trimmed)).map_err(|_| {
+            ServerAuthError::InvalidUrl {
+                url: trimmed.to_owned(),
+            }
+        })?;
         let protocol = parsed.scheme().to_owned();
         if protocol != "http" && protocol != "https" {
-            return Err(ServerAuthError::UnsupportedScheme(protocol));
+            return Err(ServerAuthError::UnsupportedScheme { scheme: protocol });
         }
-        let host = parsed
-            .host_str()
-            .filter(|h| !h.is_empty())
-            .ok_or_else(|| ServerAuthError::InvalidUrl(trimmed.to_owned()))?;
+        let host = parsed.host_str().filter(|h| !h.is_empty()).ok_or_else(|| {
+            ServerAuthError::InvalidUrl {
+                url: trimmed.to_owned(),
+            }
+        })?;
         let host = match parsed.port() {
             Some(port) => format!("{host}:{port}"),
             None => host.to_owned(),
@@ -272,8 +286,12 @@ pub fn credential_for_url(
 ) -> std::result::Result<Credential, ServerAuthError> {
     ServerUrl::parse(url)?;
     let trimmed = url.trim();
-    let mut credential = Credential::from_url(&with_default_scheme(trimmed), config)
-        .ok_or_else(|| ServerAuthError::InvalidUrl(trimmed.to_owned()))?;
+    let mut credential =
+        Credential::from_url(&with_default_scheme(trimmed), config).ok_or_else(|| {
+            ServerAuthError::InvalidUrl {
+                url: trimmed.to_owned(),
+            }
+        })?;
     credential.username = Some(username.to_owned());
     credential.password = Some(token.to_owned());
     Ok(credential)
@@ -340,22 +358,26 @@ pub fn fetch_identity(
 ) -> std::result::Result<ServerIdentity, ServerAuthError> {
     let url = server.identity_url();
     let body = http.get(&url, None).map_err(|e| match e {
-        Error::Auth { .. } => ServerAuthError::TokenRejected,
+        crate::error::Error::Remote(RemoteError::Auth { .. }) => ServerAuthError::TokenRejected,
         other => not_grit_server_or_http(server, other),
     })?;
-    serde_json::from_slice(&body).map_err(|_| ServerAuthError::NotGritServer(server.root_url()))
+    serde_json::from_slice(&body).map_err(|_| ServerAuthError::NotGritServer {
+        url: server.root_url(),
+    })
 }
 
 /// [`ServerAuthError::NotGritServer`] when `err` is a client-error status (`404`,
 /// `405`, `422`, …) from one of the `.grit/` endpoints, which every `grit serve`
 /// host answers; otherwise [`ServerAuthError::Http`].
-fn not_grit_server_or_http(server: &ServerUrl, err: Error) -> ServerAuthError {
+pub(crate) fn not_grit_server_or_http(server: &ServerUrl, err: Error) -> ServerAuthError {
     match err {
-        Error::RemoteUnreadable {
+        Error::Remote(RemoteError::Unreadable {
             reason: RemoteUnreadableReason::HttpStatus { status },
             ..
-        } if (400..500).contains(&status) => ServerAuthError::NotGritServer(server.root_url()),
-        other => ServerAuthError::Http(other),
+        }) if (400..500).contains(&status) => ServerAuthError::NotGritServer {
+            url: server.root_url(),
+        },
+        other => ServerAuthError::Http(ErrorSummary::from(other)),
     }
 }
 
@@ -387,11 +409,16 @@ impl<'a> LoginFlow<'a> {
             .http
             .post(&url, JSON_CONTENT_TYPE, JSON_CONTENT_TYPE, b"{}", None)
             .map_err(|e| match e {
-                Error::Auth { .. } => ServerAuthError::NotGritServer(self.server.root_url()),
+                crate::error::Error::Remote(RemoteError::Auth { .. }) => {
+                    ServerAuthError::NotGritServer {
+                        url: self.server.root_url(),
+                    }
+                }
                 other => not_grit_server_or_http(self.server, other),
             })?;
-        serde_json::from_slice(&body)
-            .map_err(|_| ServerAuthError::NotGritServer(self.server.root_url()))
+        serde_json::from_slice(&body).map_err(|_| ServerAuthError::NotGritServer {
+            url: self.server.root_url(),
+        })
     }
 
     /// Ask once whether the user has approved `login`.
@@ -406,13 +433,16 @@ impl<'a> LoginFlow<'a> {
         let request = serde_json::to_vec(&LoginPollRequest {
             device_code: login.device_code.clone(),
         })
-        .map_err(|_| ServerAuthError::NotGritServer(self.server.root_url()))?;
+        .map_err(|_| ServerAuthError::NotGritServer {
+            url: self.server.root_url(),
+        })?;
         let body = self
             .http
             .post(&url, JSON_CONTENT_TYPE, JSON_CONTENT_TYPE, &request, None)
-            .map_err(ServerAuthError::Http)?;
-        serde_json::from_slice(&body)
-            .map_err(|_| ServerAuthError::NotGritServer(self.server.root_url()))
+            .map_err(|e| ServerAuthError::Http(ErrorSummary::from(e)))?;
+        serde_json::from_slice(&body).map_err(|_| ServerAuthError::NotGritServer {
+            url: self.server.root_url(),
+        })
     }
 
     /// Poll until the user approves `login`, and return the token.
@@ -475,11 +505,11 @@ mod tests {
     fn other_schemes_and_hostless_urls_are_refused() {
         assert!(matches!(
             ServerUrl::parse("ssh://git.example.com/app.git"),
-            Err(ServerAuthError::UnsupportedScheme(s)) if s == "ssh"
+            Err(ServerAuthError::UnsupportedScheme { scheme: s }) if s == "ssh"
         ));
         assert!(matches!(
             ServerUrl::parse("http://"),
-            Err(ServerAuthError::InvalidUrl(_))
+            Err(ServerAuthError::InvalidUrl { .. })
         ));
     }
 
@@ -539,7 +569,7 @@ mod tests {
 
         assert!(matches!(
             credential_for_url("ssh://example.com/app.git", &config, "a", "b"),
-            Err(ServerAuthError::UnsupportedScheme(_))
+            Err(ServerAuthError::UnsupportedScheme { .. })
         ));
     }
 
@@ -559,7 +589,7 @@ mod tests {
     }
 
     impl HttpClient for Canned {
-        fn get(&self, url: &str, _git_protocol: Option<&str>) -> Result<Vec<u8>> {
+        fn get(&self, url: &str, _git_protocol: Option<&str>) -> crate::error::Result<Vec<u8>> {
             self.seen.lock().unwrap().push(url.to_owned());
             self.answer.lock().unwrap().take().unwrap()
         }
@@ -571,7 +601,7 @@ mod tests {
             _accept: &str,
             _body: &[u8],
             _git_protocol: Option<&str>,
-        ) -> Result<Vec<u8>> {
+        ) -> crate::error::Result<Vec<u8>> {
             unreachable!("identity lookups only GET")
         }
     }
@@ -598,16 +628,16 @@ mod tests {
     fn identity_failures_are_typed() {
         let server = ServerUrl::parse("http://127.0.0.1:8080").unwrap();
 
-        let rejected = Canned::new(Err(Error::Auth {
+        let rejected = Canned::new(Err(Error::Remote(RemoteError::Auth {
             url: "http://127.0.0.1:8080".to_owned(),
             reason: crate::error::AuthFailure::Rejected,
-        }));
+        })));
         assert!(matches!(
             fetch_identity(&rejected, &server),
             Err(ServerAuthError::TokenRejected)
         ));
 
-        let down = Canned::new(Err(Error::Message("HTTP 404".to_owned())));
+        let down = Canned::new(Err(Error::Io(std::io::Error::other("HTTP 404"))));
         assert!(matches!(
             fetch_identity(&down, &server),
             Err(ServerAuthError::Http(_))
@@ -616,7 +646,7 @@ mod tests {
         let html = Canned::new(Ok(b"<html>hello</html>".to_vec()));
         assert!(matches!(
             fetch_identity(&html, &server),
-            Err(ServerAuthError::NotGritServer(_))
+            Err(ServerAuthError::NotGritServer { .. })
         ));
     }
 
@@ -636,7 +666,7 @@ mod tests {
     }
 
     impl HttpClient for Scripted {
-        fn get(&self, _url: &str, _git_protocol: Option<&str>) -> Result<Vec<u8>> {
+        fn get(&self, _url: &str, _git_protocol: Option<&str>) -> crate::error::Result<Vec<u8>> {
             unreachable!("the login flow only POSTs")
         }
 
@@ -647,7 +677,7 @@ mod tests {
             _accept: &str,
             body: &[u8],
             _git_protocol: Option<&str>,
-        ) -> Result<Vec<u8>> {
+        ) -> crate::error::Result<Vec<u8>> {
             assert_eq!(content_type, "application/json");
             self.seen
                 .lock()
@@ -753,10 +783,10 @@ mod tests {
         ));
         assert!(matches!(
             wait(b"<html>"),
-            Err(ServerAuthError::NotGritServer(_))
+            Err(ServerAuthError::NotGritServer { .. })
         ));
 
-        let http = Scripted::new(vec![Err(Error::Message("HTTP 404".to_owned()))]);
+        let http = Scripted::new(vec![Err(Error::Io(std::io::Error::other("HTTP 404")))]);
         assert!(matches!(
             LoginFlow::new(&http, &server).start(),
             Err(ServerAuthError::Http(_))
@@ -778,7 +808,7 @@ mod tests {
             assert!(
                 matches!(
                     LoginFlow::new(&http, &server).start(),
-                    Err(ServerAuthError::NotGritServer(root)) if root == "https://gitlab.example.com/"
+                    Err(ServerAuthError::NotGritServer { url: root }) if root == "https://gitlab.example.com/"
                 ),
                 "{code}"
             );
@@ -786,19 +816,19 @@ mod tests {
             assert!(
                 matches!(
                     fetch_identity(&http, &server),
-                    Err(ServerAuthError::NotGritServer(_))
+                    Err(ServerAuthError::NotGritServer { .. })
                 ),
                 "{code}"
             );
         }
 
-        let challenged = Scripted::new(vec![Err(Error::Auth {
+        let challenged = Scripted::new(vec![Err(Error::Remote(RemoteError::Auth {
             url: "https://gitlab.example.com".to_owned(),
             reason: crate::error::AuthFailure::NoCredentialProvider,
-        })]);
+        }))]);
         assert!(matches!(
             LoginFlow::new(&challenged, &server).start(),
-            Err(ServerAuthError::NotGritServer(_))
+            Err(ServerAuthError::NotGritServer { .. })
         ));
 
         let failing = Scripted::new(vec![Err(status(503))]);

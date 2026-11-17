@@ -1,14 +1,17 @@
 //! Fetch and remote helpers for on-disk bundle files (clone / `grit fetch` from a `.bundle`).
 
+#![allow(dead_code)]
+
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
-use crate::bundle::{plan_bundle_create, Bundle, BundleCreatePlan, BundleError, BundleSpec};
+use crate::bundle::{Bundle, BundleError, BundleSpec};
 use crate::error::{Error, Result};
-use crate::fetch::{NoProgress, Progress};
 use crate::objects::ObjectId;
+use crate::progress::ProgressSink;
+use crate::remote::RemoteError;
 use crate::repo::Repository;
 use crate::transfer::{
     apply_tag_mode, classify_update, prune_tracking_refs, FetchOptions, FetchOutcome, RefUpdate,
@@ -27,7 +30,8 @@ pub fn is_bundle_path(path: &Path) -> bool {
     bytes.starts_with(V2_SIGNATURE) || bytes.starts_with(V3_SIGNATURE)
 }
 
-/// Ref tips and revision tokens for [`write_bundle_with_options`].
+/// Ref tips and revision tokens for
+/// [`RepositoryBundles::write_from_revs`](crate::repo_handles::RepositoryBundles::write_from_revs).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BundleCreateOptions {
     /// When true, list `HEAD` and every ref under `refs/` in the bundle header (like `git bundle create --all`).
@@ -47,23 +51,6 @@ impl BundleCreateOptions {
     }
 }
 
-/// Write a bundle file from revision arguments (supports `A..B` ranges like `git bundle create`).
-///
-/// # Errors
-///
-/// Propagates rev-list, ref resolution, and bundle write failures.
-pub fn write_bundle_from_rev_specs(
-    repo: &Repository,
-    path: &Path,
-    rev_tokens: &[String],
-) -> Result<usize> {
-    write_bundle_with_options(
-        repo,
-        path,
-        &BundleCreateOptions::from_rev_tokens(rev_tokens.to_vec()),
-    )
-}
-
 /// Resolve [`BundleSpec`] from create options without writing a file.
 ///
 /// When [`BundleCreateOptions::all_refs`] is true (or `--all` appears among `rev_tokens`), the bundle
@@ -80,7 +67,21 @@ pub fn resolve_bundle_spec(repo: &Repository, options: &BundleCreateOptions) -> 
     let (positive_specs, negative_specs) = split_revision_specs_for_bundle(&rev_tokens);
 
     if positive_specs.is_empty() && !all_refs {
-        return Err(Error::Message("at least one revision is required".into()));
+        return Err(BundleError::NoRevisions.into());
+    }
+
+    // With nothing excluded there is no boundary, so every ref is a tip and the pack
+    // writer's object walk is the only history walk needed.
+    if all_refs && positive_specs.is_empty() && negative_specs.is_empty() {
+        let include = refs_for_bundle_header(repo)?;
+        if include.is_empty() {
+            return Err(map_bundle_err(BundleError::EmptyRefs));
+        }
+        return Ok(BundleSpec {
+            include,
+            exclude: Vec::new(),
+            filter: None,
+        });
     }
 
     let rev_opts = crate::rev_list::RevListOptions {
@@ -107,34 +108,39 @@ pub fn resolve_bundle_spec(repo: &Repository, options: &BundleCreateOptions) -> 
     })
 }
 
-/// Plan bundle creation from revision options without writing a file.
+/// Write `spec` to `path`, replacing any existing file only after a successful pack stream.
+///
+/// On failure or cancel, removes the temporary `*.bundle.part` file and leaves an existing
+/// destination byte-for-byte unchanged. A panic during the write also removes the part file;
+/// SIGKILL may leave only the part file.
 ///
 /// # Errors
 ///
-/// Same as [`resolve_bundle_spec`] and [`plan_bundle_create`].
-pub fn plan_create_with_options(
+/// Propagates [`BundleError`] from header/pack generation, including [`BundleError::ObjectNotFound`].
+pub(crate) fn write_bundle_spec_to_path(
     repo: &Repository,
-    options: &BundleCreateOptions,
-) -> Result<BundleCreatePlan> {
-    let spec = resolve_bundle_spec(repo, options)?;
-    plan_bundle_create(repo, &spec).map_err(map_bundle_err)
-}
-
-/// Write a bundle file using ref-set flags and revision tokens.
-///
-/// # Errors
-///
-/// Propagates rev-list, ref resolution, and bundle write failures.
-pub fn write_bundle_with_options(
-    repo: &Repository,
+    spec: &BundleSpec,
     path: &Path,
-    options: &BundleCreateOptions,
-) -> Result<usize> {
-    let spec = resolve_bundle_spec(repo, options)?;
-    let file = File::create(path).map_err(Error::Io)?;
+    progress: &mut dyn ProgressSink,
+    cancel: &crate::progress::CancelToken,
+) -> std::result::Result<usize, BundleError> {
+    let temp = path.with_extension("bundle.part");
+    if temp.exists() {
+        std::fs::remove_file(&temp).map_err(BundleError::from)?;
+    }
+    struct PartCleanup<'a>(&'a Path);
+    impl Drop for PartCleanup<'_> {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(self.0);
+        }
+    }
+    let _cleanup = PartCleanup(&temp);
+    let file = File::create(&temp).map_err(BundleError::from)?;
     let mut out = BufWriter::new(file);
-    crate::bundle::write_bundle(repo, &spec, &mut out).map_err(map_bundle_err)?;
-    out.flush().map_err(Error::Io)?;
+    crate::bundle::write_bundle(repo, spec, &mut out, progress, cancel)?;
+    out.flush().map_err(BundleError::from)?;
+    crate::atomic_replace::replace_file(&temp, path).map_err(BundleError::from)?;
+    std::mem::forget(_cleanup);
     Ok(spec.include.len())
 }
 
@@ -226,50 +232,18 @@ pub fn split_revision_specs_for_bundle(tokens: &[String]) -> (Vec<String>, Vec<S
     (positive, negative)
 }
 
-/// Fetch from a bundle file into an existing repository (like `git fetch` from a bundle).
-///
-/// # Errors
-///
-/// Propagates bundle verification, pack ingest, refspec, and ref update failures.
-pub fn fetch_from_bundle(
-    local_git_dir: &Path,
-    bundle_path: &Path,
-    opts: &FetchOptions,
-) -> Result<FetchOutcome> {
-    fetch_from_bundle_with_progress(
-        local_git_dir,
-        bundle_path,
-        opts,
-        &mut NoProgress,
-        &crate::progress::NeverCancel,
-    )
-}
-
-/// Like [`fetch_from_bundle`], reporting bundle receive and index-pack progress.
-///
-/// The local repository is opened with [`FetchOptions::environment`], so objects land in its
-/// `GIT_OBJECT_DIRECTORY` when that is set.
-pub fn fetch_from_bundle_with_progress(
-    local_git_dir: &Path,
-    bundle_path: &Path,
-    opts: &FetchOptions,
-    progress: &mut dyn Progress,
-    cancel: &dyn crate::progress::Cancel,
-) -> Result<FetchOutcome> {
-    let repo = crate::fetch::open_fetch_target(local_git_dir, opts)?;
-    fetch_from_bundle_into(&repo, bundle_path, opts, progress, cancel)
-}
-
-/// Like [`fetch_from_bundle_with_progress`], unbundling into `repo`'s object store.
+/// Fetch from the bundle at `bundle_path` into `repo` (like `git fetch` from a bundle),
+/// unbundling into `repo`'s object store.
 pub(crate) fn fetch_from_bundle_into(
     repo: &Repository,
     bundle_path: &Path,
     opts: &FetchOptions,
-    progress: &mut dyn Progress,
-    cancel: &dyn crate::progress::Cancel,
+    progress: &mut dyn crate::progress::ProgressSink,
+    cancel: &crate::progress::CancelToken,
 ) -> Result<FetchOutcome> {
     crate::progress::poll_cancel(progress, cancel)?;
     let bundle = Bundle::open(bundle_path).map_err(map_bundle_err)?;
+    preflight_bundle_fetch_refspecs(&bundle, opts)?;
     bundle
         .verify(repo)
         .map_err(map_bundle_err)?
@@ -281,7 +255,7 @@ pub(crate) fn fetch_from_bundle_into(
     } else {
         crate::progress::poll_cancel(progress, cancel)?;
         let unbundled = bundle
-            .unbundle_with_progress(repo, progress, cancel)
+            .unbundle(repo, progress, cancel)
             .map_err(map_bundle_err)?;
         crate::progress::poll_cancel(progress, cancel)?;
         (unbundled.transfer, unbundled.pack_object_ids)
@@ -289,7 +263,7 @@ pub(crate) fn fetch_from_bundle_into(
 
     let header = bundle.header();
     let remote_refs = header.refs.clone();
-    let init_default_branch = repo.config().ok().and_then(|cfg| {
+    let init_default_branch = repo.config().snapshot().ok().and_then(|cfg| {
         cfg.get_last_entry("init.defaultBranch")
             .and_then(|e| e.value.clone())
             .filter(|s| !s.is_empty())
@@ -398,7 +372,7 @@ fn complete_bundle_fetch(
     tag_shallow.extend(remote_shallow.iter().copied());
 
     let tags_present = if opts.tags == TagMode::Following {
-        crate::fetch::tags_already_local(local.refs(), remote_refs)
+        crate::fetch::tags_already_local(local.ref_store(), remote_refs)
     } else {
         HashSet::new()
     };
@@ -490,6 +464,10 @@ fn complete_bundle_fetch(
     }
 
     if !opts.dry_run && !store_batch.is_empty() {
+        let fetch_reflog = crate::fetch::prepare_fetch_apply_reflog(local, opts)?;
+        let fetch_reflog_ctx = fetch_reflog
+            .as_ref()
+            .map(crate::fetch::PreparedFetchReflog::context);
         crate::transfer::apply_fetch_ref_updates(
             local,
             store_batch,
@@ -501,6 +479,7 @@ fn complete_bundle_fetch(
                 remote_name: opts.remote_name.as_deref(),
             },
             opts.initial_remote_fetch,
+            fetch_reflog_ctx.as_ref(),
         )?;
     }
 
@@ -529,20 +508,58 @@ fn complete_bundle_fetch(
     })
 }
 
-fn map_bundle_err(e: BundleError) -> Error {
-    match e {
-        BundleError::Cancelled => Error::Cancelled,
-        BundleError::MissingPrerequisite { .. } | BundleError::PrerequisitesNotConnected => {
-            Error::BundleMissingPrerequisites
+/// Resolve fetch refspecs against the bundle header before ingesting objects.
+fn preflight_bundle_fetch_refspecs(bundle: &Bundle, opts: &FetchOptions) -> Result<()> {
+    use crate::fetch_request::FetchRefspecError;
+    use crate::remote::Remote;
+
+    let header_refs = &bundle.header().refs;
+    let effective = if opts.refspecs.is_empty() {
+        &opts.configured_refspecs
+    } else {
+        &opts.refspecs
+    };
+
+    let implicit_head_fetch = effective.is_empty()
+        || (effective.len() == 1
+            && effective[0].trim_start_matches('+') == Remote::ANONYMOUS_FETCH_REFSPEC);
+
+    if implicit_head_fetch {
+        if crate::transfer::remote_head_oid_from_advertised(header_refs).is_none() {
+            return Err(
+                RemoteError::FetchRefspec(FetchRefspecError::SourceNotFound {
+                    ref_name: "HEAD".to_owned(),
+                    spec: "HEAD".to_owned(),
+                })
+                .into(),
+            );
         }
-        other => Error::Message(other.to_string()),
+        return Ok(());
     }
+
+    let remote_head_oid = crate::transfer::remote_head_oid_from_advertised(header_refs);
+    let filtered_remote_refs: Vec<(String, ObjectId)> = header_refs
+        .iter()
+        .filter(|(name, _)| {
+            name != "HEAD"
+                && !name.ends_with("^{}")
+                && crate::refs::is_valid_fetch_advertised_ref(name)
+        })
+        .cloned()
+        .collect();
+    crate::transfer::build_fetch_matched_set(opts, &filtered_remote_refs, remote_head_oid)?;
+    Ok(())
+}
+
+fn map_bundle_err(e: BundleError) -> Error {
+    Error::from(e)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::environment::RepositoryOptions;
+    use crate::progress::NullProgress;
 
     #[test]
     fn default_branch_follows_bundle_head_not_first_branch_line() {
@@ -572,7 +589,7 @@ mod tests {
         ignore = "starts system git or is heavy; run with --features full-tests"
     )]
     #[test]
-    fn write_bundle_from_rev_specs_records_tag_dwim_as_refs_tags() {
+    fn write_from_revs_records_tag_dwim_as_refs_tags() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let dir = tmp.path();
         std::process::Command::new("git")
@@ -618,7 +635,13 @@ mod tests {
 
         let repo = Repository::discover(Some(dir), &RepositoryOptions::empty()).expect("open repo");
         let bundle_path = dir.join("t1.bundle");
-        write_bundle_from_rev_specs(&repo, &bundle_path, &["lite".to_owned(), "main".to_owned()])
+        repo.bundles()
+            .write_from_revs(
+                &BundleCreateOptions::from_rev_tokens(vec!["lite".to_owned(), "main".to_owned()]),
+                &bundle_path,
+                &mut NullProgress,
+                crate::progress::CancelToken::never_ref(),
+            )
             .expect("write bundle");
 
         let header = crate::bundle::Bundle::open(&bundle_path)

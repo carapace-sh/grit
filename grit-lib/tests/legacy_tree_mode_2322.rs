@@ -2,21 +2,27 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use grit_lib::progress::NullProgress;
+use grit_lib::worktree::WorktreeError;
 use std::io::Write;
 use std::path::Path;
 use std::process::Command;
 
+use grit_lib::command_runner::hooks::PostOperationHooks;
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::diff::{Diff, RenameDetection, UncommittedDiff};
-use grit_lib::error::Error;
+use grit_lib::error::{Error, OverwriteReason};
 use grit_lib::objects::{parse_tree, ObjectId, ObjectKind};
 use grit_lib::porcelain::checkout::checkout_between_trees;
-use grit_lib::porcelain::commit::{create_commit, CommitRequest};
+use grit_lib::porcelain::commit::CommitRequest;
 use grit_lib::porcelain::reset::{reset_to_commit, ResetMode, ResetOptions};
-use grit_lib::porcelain::status::{status, StatusOptions};
+use grit_lib::porcelain::status::StatusOptions;
+use grit_lib::porcelain::switch::{switch_repository, SwitchMode, SwitchOptions};
 use grit_lib::progress::NullProgress;
 use grit_lib::repo::Repository;
-use grit_test_support::{git_hash_object_literally, HashAlgo as FixtureAlgo};
+use grit_test_support::{
+    git_hash_object_literally, integrate_detached_head, HashAlgo as FixtureAlgo,
+};
 
 const IDENT: &str = "Test User <t@example.com> 1700000000 +0000";
 
@@ -59,6 +65,41 @@ fn write_blob(root: &Path, data: &[u8]) -> ObjectId {
     let out = child.wait_with_output().expect("hash-object wait");
     assert!(out.status.success());
     ObjectId::from_hex(String::from_utf8_lossy(&out.stdout).trim()).expect("blob oid")
+}
+
+fn write_legacy_blob_tree(root: &Path, blob: &ObjectId, entry_name: &str) -> ObjectId {
+    let mut tree_body = format!("100664 {entry_name}\0").into_bytes();
+    tree_body.extend_from_slice(blob.as_bytes());
+    let tree_hex =
+        git_hash_object_literally(root, FixtureAlgo::Sha1, "tree", &tree_body).expect("tree");
+    ObjectId::from_hex(tree_hex.trim()).expect("tree oid")
+}
+
+/// Two commits on `main`: same legacy 100664 path `f`, different blob contents (issue #2372 repro).
+fn init_legacy_mode_switch_repo(root: &Path) -> (ObjectId, ObjectId) {
+    git(root, &["init", "-q", "-b", "main", "."]);
+    git(root, &["config", "user.email", "t@e.x"]);
+    git(root, &["config", "user.name", "t"]);
+
+    let b1 = write_blob(root, b"one");
+    let b2 = write_blob(root, b"two");
+    let t1 = write_legacy_blob_tree(root, &b1, "f");
+    let t2 = write_legacy_blob_tree(root, &b2, "f");
+
+    let t1_hex = t1.to_hex();
+    let t2_hex = t2.to_hex();
+    let c1 = git(root, &["commit-tree", &t1_hex, "-m", "one"])
+        .trim()
+        .to_string();
+    let c2 = git(root, &["commit-tree", &t2_hex, "-p", &c1, "-m", "two"])
+        .trim()
+        .to_string();
+    git(root, &["update-ref", "refs/heads/main", &c2]);
+
+    (
+        ObjectId::from_hex(&c1).expect("c1"),
+        ObjectId::from_hex(&c2).expect("c2"),
+    )
 }
 
 fn init_legacy_mode_repo(root: &Path) -> ObjectId {
@@ -123,13 +164,14 @@ fn legacy_tree_modes_status_and_commit_clean_after_git_checkout() {
     let head_before = git(root.path(), &["rev-parse", "HEAD"]).trim().to_string();
 
     let repo = open_repo(root.path());
-    let model = status(
-        &repo,
-        &StatusOptions::default(),
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("status");
+    let model = repo
+        .status()
+        .run(
+            &StatusOptions::default(),
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("status");
     assert!(
         model.is_clean(),
         "expected clean status, got staged={:?} unstaged={:?}",
@@ -137,21 +179,25 @@ fn legacy_tree_modes_status_and_commit_clean_after_git_checkout() {
         model.unstaged
     );
 
-    let req = CommitRequest {
-        message: "nochange".to_owned(),
-        author: Some(IDENT.parse().expect("author")),
-        committer: Some(IDENT.parse().expect("committer")),
-        ..Default::default()
+    let req = {
+        let mut req = CommitRequest::new("nochange".to_owned());
+        req.author = Some(IDENT.parse().expect("author"));
+        req.committer = Some(IDENT.parse().expect("committer"));
+        req
     };
-    let err = create_commit(
-        &repo,
-        &req,
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect_err("commit");
+    let err = repo
+        .commits()
+        .create_staged(
+            &req,
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect_err("commit");
     assert!(
-        matches!(err, Error::NothingToCommit),
+        matches!(
+            err,
+            grit_lib::error::Error::Commit(CommitError::NothingToCommit)
+        ),
         "expected NothingToCommit, got {err}"
     );
 
@@ -167,7 +213,10 @@ fn legacy_tree_modes_worktree_diff_empty_after_git_checkout() {
 
     let head = repo.head_commit().expect("head commit");
     let head_tree = repo.odb().commit_tree(&head).expect("commit tree");
-    let mut index = repo.index_handle().load().expect("index");
+    let mut index = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("index");
     // Force tree↔worktree diff (not index↔worktree fast path) so legacy tree modes are tested.
     index.cache_tree_root = None;
     index.cache_tree = None;
@@ -187,7 +236,14 @@ fn grit_checkout_writes_canonical_index_modes() {
     let tree = init_legacy_mode_repo(root.path());
     let repo = open_repo(root.path());
 
-    checkout_between_trees(&repo, None, &tree).expect("checkout");
+    repo.checkout()
+        .checkout(
+            None,
+            &tree,
+            &mut grit_lib::progress::NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("checkout");
 
     let ls = git(root.path(), &["ls-files", "-s"]);
     assert!(
@@ -207,13 +263,14 @@ fn grit_checkout_writes_canonical_index_modes() {
 
     assert_index_modes_canonical(root.path());
 
-    let model = status(
-        &repo,
-        &StatusOptions::default(),
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("status");
+    let model = repo
+        .status()
+        .run(
+            &StatusOptions::default(),
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("status");
     assert!(model.is_clean(), "grit status must be clean");
 
     let obj = repo.odb().read(&tree).expect("read tree");
@@ -234,18 +291,18 @@ fn hard_reset_to_head_keeps_canonical_index_modes() {
     let repo = open_repo(root.path());
 
     let head = repo.head_commit().expect("head commit");
-    reset_to_commit(
-        &repo,
-        &ResetOptions::new(
-            head,
-            ResetMode::Hard,
-            IDENT.parse().expect("identity"),
-            "reset: test",
-        ),
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("hard reset HEAD");
+    repo.checkout()
+        .reset(
+            &ResetOptions::new(
+                head,
+                ResetMode::Hard,
+                IDENT.parse().expect("identity"),
+                "reset: test",
+            ),
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("hard reset HEAD");
 
     assert_index_modes_canonical(root.path());
 
@@ -255,4 +312,106 @@ fn hard_reset_to_head_keeps_canonical_index_modes() {
         .worktree_entries(Some(&head_tree), RenameDetection::Off)
         .expect("worktree diff");
     assert!(entries.is_empty(), "diff after hard reset must be empty");
+}
+
+#[test]
+fn legacy_tree_modes_switch_and_merge_on_clean_tree() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let (c1, c2) = init_legacy_mode_switch_repo(root.path());
+    git(root.path(), &["switch", "-q", "--detach", &c1.to_hex()]);
+    assert_index_modes_canonical(root.path());
+
+    let repo = open_repo(root.path());
+    let model = repo
+        .status()
+        .run(
+            &StatusOptions::default(),
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("status");
+    assert!(model.is_clean(), "grit status must be clean before switch");
+
+    repo.checkout()
+        .switch(
+            &SwitchOptions {
+                mode: SwitchMode::Existing {
+                    branch: "main".into(),
+                    oid: c2,
+                },
+                dry_run: false,
+                hooks: PostOperationHooks::Skip,
+            },
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("switch to main");
+
+    assert_eq!(
+        std::fs::read(root.path().join("f")).expect("read f"),
+        b"two"
+    );
+    assert_index_modes_canonical(root.path());
+    assert!(
+        git(root.path(), &["status", "--porcelain"])
+            .trim()
+            .is_empty(),
+        "git status must be clean after grit switch"
+    );
+
+    git(root.path(), &["switch", "-q", "--detach", &c1.to_hex()]);
+    let repo = open_repo(root.path());
+    integrate_detached_head(
+        &repo,
+        c1,
+        c2,
+        "main",
+        &mut NullProgress,
+        &grit_lib::progress::CancelToken::never(),
+    )
+    .expect("merge main into detached HEAD");
+    assert_eq!(
+        std::fs::read(root.path().join("f")).expect("read f after merge"),
+        b"two"
+    );
+    assert_index_modes_canonical(root.path());
+}
+
+#[test]
+fn legacy_tree_modes_switch_still_blocks_real_worktree_edit() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let (c1, c2) = init_legacy_mode_switch_repo(root.path());
+    git(root.path(), &["switch", "-q", "--detach", &c1.to_hex()]);
+    std::fs::write(root.path().join("f"), b"dirty").expect("write f");
+
+    let repo = open_repo(root.path());
+    let err = repo
+        .checkout()
+        .switch(
+            &SwitchOptions {
+                mode: SwitchMode::Existing {
+                    branch: "main".into(),
+                    oid: c2,
+                },
+                dry_run: false,
+                hooks: PostOperationHooks::Skip,
+            },
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect_err("switch must refuse dirty worktree");
+    assert!(
+        matches!(
+            err,
+            Error::Worktree(WorktreeError::WouldOverwrite {
+                reason: OverwriteReason::LocalChanges,
+                ..
+            })
+        ),
+        "expected local-changes overwrite, got {err}"
+    );
+    assert_eq!(
+        std::fs::read(root.path().join("f")).expect("worktree unchanged"),
+        b"dirty"
+    );
 }

@@ -11,6 +11,10 @@ agents, or services without shelling out to the `git` binary.
 Crate-level documentation (architecture, features, and a compiling example) lives
 in the [rustdoc](https://docs.rs/grit-lib) for `grit_lib`.
 
+Public API conventions, stability policy, and a checklist for new items are in
+[`API.md`](API.md) in this directory (also on
+[GitHub](https://github.com/gitbutlerapp/grit/blob/main/grit-lib/API.md)).
+
 ## Toolchain
 
 **MSRV:** Rust **1.95** or newer. Cargo reports this via the crate's
@@ -63,26 +67,26 @@ Add the dependency:
 
 ```toml
 [dependencies]
-grit-lib = "0.1"
+grit-lib = "0.5"
 ```
 
 For smart-HTTP remotes:
 
 ```toml
-grit-lib = { version = "0.1", features = ["http-ureq"] }
+grit-lib = { version = "0.5", features = ["http-ureq"] }
 ```
 
 ### Open a repository and read HEAD
 
 ```rust
-use grit_lib::repo::{init_repository, Repository};
-use grit_lib::state::resolve_head;
-use grit_lib::RefStorageFormat;
+use grit_lib::config::environment::RepositoryOptions;
+use grit_lib::repo::{InitOptions, Repository};
 
 let dir = tempfile::tempdir()?;
-let repo = init_repository(dir.path(), false, "main", None, RefStorageFormat::Files)?;
-let head = resolve_head(&repo.git_dir)?;
-let _again = Repository::open(&repo.git_dir, repo.work_tree.as_deref())?;
+let (repo, _) = Repository::init(dir.path(), &InitOptions::default())?;
+let head = repo.references().head()?;
+assert!(head.is_unborn());
+let _again = Repository::discover(Some(dir.path()), &RepositoryOptions::default())?;
 # Ok::<(), grit_lib::error::Error>(())
 ```
 
@@ -102,11 +106,12 @@ for oid in &result.oids {
 ### Diff two trees
 
 ```rust
-use grit_lib::diff::{diff_trees, DiffEntry};
+use grit_lib::diff::{RenameDetection, TreeDiffOptions};
 
-let entries: Vec<DiffEntry> = diff_trees(&repo.odb, Some(old_tree), Some(new_tree))?;
-for e in &entries {
-    println!("{} {}", e.status, e.new_path.as_deref().or(e.old_path.as_deref()).unwrap());
+let options = TreeDiffOptions::default().with_renames(RenameDetection::Similarity(50));
+let result = repo.diff().tree_to_tree(Some(&old_tree), Some(&new_tree), &options)?;
+for e in &result.entries {
+    println!("{} {}", e.status.letter(), e.path());
 }
 ```
 

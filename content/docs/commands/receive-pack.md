@@ -23,7 +23,7 @@ Every ref update is checked before it's applied, and the client is told which up
 | --- | --- |
 | `receive.denyNonFastForwards` | Refuse updates that would discard commits from a branch (`refs/heads/*`). Fast-forwards are accepted, and other refs, such as tags, are not checked. |
 | `receive.denyDeletes` | Refuse to delete refs. |
-| `receive.denyCurrentBranch` | Refuse to update the branch checked out in a non-bare repository. On by default; set it to `ignore` or `warn` to allow it. |
+| `receive.denyCurrentBranch` | What to do when a push updates the branch checked out in a non-bare worktree. `refuse` or unset (default) rejects the update. `ignore` and `false` move the ref without touching the worktree. `warn` does the same and may log a warning. `updateInstead` moves the ref and runs the `push-to-checkout` hook when present, otherwise checks that the worktree is clean and checks out the new commit's tree into the index and working tree (without moving `HEAD`). A dirty worktree or a failed checkout refuses the push with the same messages as Git. |
 | `receive.denyDeleteCurrent` | Refuse to delete the branch `HEAD` points at, in a bare repository too. On by default; set it to `ignore` or `warn` to allow it. |
 | `receive.hideRefs`, `transfer.hideRefs` | Hide refs from pushing clients and refuse updates to them. |
 | `receive.maxInputSize` | Refuse pushes whose pack is larger than this many bytes. Unlimited by default. |
@@ -44,7 +44,7 @@ In a repository with [snapshot checkouts](../checkout/) (once [`grit serve`](../
 
 Pushes from a shallow clone work, such as a CI job that cloned with `--depth 1` and pushes a new branch back. Git sends the clone's shallow boundaries along with the push. When this repository already has the history below them, the push is applied as usual and the repository stays complete.
 
-Pushes that ask for an atomic update are applied all or nothing. The served repository's `pre-receive`, `update`, `post-receive` and `post-update` hooks run as they do under Git: from the repository directory with `GIT_DIR=.`, with the quarantine variables during `pre-receive`, and with push options in `GIT_PUSH_OPTION_*`. Under `receive.shallowUpdate`, a push from a shallow clone also sets `GIT_SHALLOW_FILE` to a file listing the client's boundaries, so hooks can walk the pushed history.
+Pushes that ask for an atomic update are applied all or nothing. The served repository's `pre-receive`, `update`, `post-receive` and `post-update` hooks run as they do under Git: from the repository directory with `GIT_DIR=.`, with the quarantine variables during `pre-receive`, and with push options in `GIT_PUSH_OPTION_*`. Under `receive.shallowUpdate`, a push from a shallow clone also sets `GIT_SHALLOW_FILE` to a file listing the client's boundaries, so hooks can walk the pushed history. A hook may exit without reading its stdin (for example a CI notifier); the push still succeeds and `grit serve` keeps running.
 
 Pushed objects are checked as strictly as `git receive-pack` checks them: problems a local `git fsck` only warns about, such as zero-padded file modes or `.git` tree entries, refuse the push unless `receive.fsck.<msg-id>` says otherwise. Problems that are only informational, such as `badFilemode`, are accepted.
 

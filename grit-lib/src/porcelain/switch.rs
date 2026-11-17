@@ -1,9 +1,12 @@
 //! Switch branches or detach `HEAD` at a commit, updating the working tree when needed.
 
+use crate::error::ObjectError;
+use crate::error::RefError;
+use crate::error::RevisionError;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::branch_tracking::write_branch_upstream_config;
-use crate::check_ref_format::validate_branch_short_name;
+use crate::check_ref_format::RefName;
 use crate::diff::{DiffEntry, DiffStatus};
 use crate::error::{Error, OverwriteReason, Result};
 use crate::hooks::{run_post_checkout, HookName, PostOperationHooks};
@@ -29,10 +32,13 @@ use crate::porcelain::worktree_guard::{
     load_worktree_snapshot, untracked_would_be_overwritten_by_tree_changes, TreeSwitchPlan,
     WorktreeSnapshot,
 };
+use crate::porcelain::MergeError;
 use crate::refs;
 use crate::repo::Repository;
 use crate::rev_parse::expand_at_minus_to_branch_name;
+use crate::rev_parse_error::RevParseError;
 
+use crate::repo::RepositoryError;
 use crate::rev_parse::{peel_to_commit_for_merge_base, resolve_revision};
 use crate::state::{resolve_head_for_repository, HeadState};
 
@@ -154,16 +160,24 @@ impl SwitchOutcome {
 }
 
 fn switch_path_collisions(repo: &Repository, index: &Index) -> Result<Vec<String>> {
-    let config = repo.config()?;
-    let ignorecase = config
-        .get_bool("core.ignorecase")
-        .and_then(|r| r.ok())
-        .unwrap_or(false);
-    Ok(if ignorecase {
+    Ok(if ignores_case(repo)? {
         crate::path_icase::icase_checkout_collision_paths(index, true)
     } else {
         Vec::new()
     })
+}
+
+/// [`switch_path_collisions`] of the index on disk, read (and sparse-expanded) only when the
+/// repository ignores case.
+fn switch_path_collisions_on_disk(repo: &Repository) -> Result<Vec<String>> {
+    if !ignores_case(repo)? {
+        return Ok(Vec::new());
+    }
+    switch_path_collisions(repo, &repo.load_index()?)
+}
+
+fn ignores_case(repo: &Repository) -> Result<bool> {
+    Ok(repo.config().snapshot()?.ignore_case())
 }
 
 pub(crate) struct PreparedSwitch {
@@ -205,7 +219,7 @@ impl PreparedSwitch {
         self.wholesale_safety_precomputed
     }
 
-    pub(crate) fn index(&self) -> &crate::index::Index {
+    pub fn index(&self) -> &crate::index::Index {
         &self.index
     }
 
@@ -215,34 +229,60 @@ impl PreparedSwitch {
 }
 
 /// Resolve `-c <branch> [<start-point>]`.
-pub fn resolve_create_branch(
+///
+/// When `start_point` names a remote-tracking branch, `track` controls whether
+/// [`SwitchMode::Create`] carries upstream config to write after checkout (same rules as
+/// [`crate::porcelain::branch::create_branch`]).
+///
+/// # Errors
+///
+/// Returns [`Error::Branch`] when the name is invalid, the branch already exists, or there are no
+/// commits to branch from. A `start_point` that does not resolve or does not name a commit fails
+/// like [`resolve_revision_spec`]. [`TrackMode::Always`] fails when no upstream can be derived.
+pub(crate) fn resolve_create_branch(
     repo: &Repository,
     branch: &str,
     start_point: Option<&str>,
+    track: TrackMode,
 ) -> Result<SwitchMode> {
-    validate_branch_short_name(branch)
-        .map_err(|e| Error::Message(format!("invalid branch name '{branch}': {e}")))?;
+    RefName::branch(branch).map_err(|reason| {
+        Error::Branch(BranchError::InvalidName {
+            name: branch.to_owned(),
+            reason: reason.to_string(),
+        })
+    })?;
     let branch_ref = format!("refs/heads/{branch}");
     if repo.resolve_ref_oid(&branch_ref).is_ok() {
-        return Err(Error::Message(format!("branch '{branch}' already exists")));
+        return Err(Error::Branch(BranchError::AlreadyExists {
+            name: branch.to_owned(),
+        }));
     }
     let start_oid = match start_point {
         Some(spec) => resolve_revision_spec(repo, spec)?,
         None => resolve_head_for_repository(repo)?
             .oid()
             .copied()
-            .ok_or_else(|| Error::Message("no commits yet to create a branch from".into()))?,
+            .ok_or(Error::Branch(BranchError::NoCommits))?,
     };
+    let create_source_label = switch_create_reflog_source_label(start_point);
+    let track_upstream =
+        resolve_create_tracking(repo, branch, &create_source_label, start_oid, track)?;
     Ok(SwitchMode::Create {
         branch: branch.to_owned(),
         start_oid,
-        create_source_label: switch_create_reflog_source_label(start_point),
-        track_upstream: None,
+        create_source_label,
+        track_upstream,
     })
 }
 
 /// Resolve a branch name, remote-tracking branch, or revision for `grit switch`.
-pub fn resolve_switch_target(repo: &Repository, spec: &str) -> Result<SwitchMode> {
+///
+/// # Errors
+///
+/// Returns [`Error::Branch`] for invalid local branch names, missing branches, and `@{-1}` with no
+/// previous branch; tag names that would attach `HEAD` to a tag return
+/// [`BranchError::IsTag`].
+pub(crate) fn resolve_switch_target(repo: &Repository, spec: &str) -> Result<SwitchMode> {
     let spec = normalize_switch_spec(spec);
     if is_at_minus_branch_spec(spec) {
         let branch = match expand_at_minus_to_branch_name(repo, spec) {
@@ -267,8 +307,12 @@ pub fn resolve_switch_target(repo: &Repository, spec: &str) -> Result<SwitchMode
     ] {
         if let Ok(oid) = repo.resolve_ref_oid(&candidate) {
             let short = spec.strip_prefix("origin/").unwrap_or(spec).to_owned();
-            validate_branch_short_name(&short)
-                .map_err(|e| Error::Message(format!("invalid branch name '{short}': {e}")))?;
+            RefName::branch(&short).map_err(|reason| {
+                Error::Branch(BranchError::InvalidName {
+                    name: short.clone(),
+                    reason: reason.to_string(),
+                })
+            })?;
             let local = format!("refs/heads/{short}");
             if let Ok(local_oid) = repo.resolve_ref_oid(&local) {
                 return Ok(SwitchMode::Existing {
@@ -315,7 +359,7 @@ fn is_at_minus_branch_spec(spec: &str) -> bool {
 }
 
 fn map_at_minus_switch_error(spec: &str, err: Error) -> Error {
-    if is_at_minus_branch_spec(spec) && matches!(err, Error::InvalidRef(_)) {
+    if is_at_minus_branch_spec(spec) && matches!(err, Error::Ref(RefError::Invalid { .. })) {
         return Error::Branch(BranchError::NoPreviousBranch);
     }
     err
@@ -350,21 +394,43 @@ fn resolve_unique_dwim_switch(repo: &Repository, spec: &str) -> Result<Option<Sw
         }));
     }
     if refname.starts_with("refs/tags/") {
-        return Err(Error::Message(format!(
-            "cannot switch to tag '{spec}' on a branch — use `grit switch --detach {spec}`"
-        )));
+        return Err(BranchError::IsTag {
+            name: spec.to_owned(),
+        }
+        .into());
     }
     Ok(None)
 }
 
 /// Resolve a revision expression for `--detach` or `-c` start points.
-pub fn resolve_revision_spec(repo: &Repository, spec: &str) -> Result<ObjectId> {
-    let oid = resolve_revision(repo, spec)
-        .map_err(|_| Error::Message(format!("invalid revision '{spec}'")))?;
-    peel_to_commit_for_merge_base(repo, oid).map_err(|e| match e {
-        Error::InvalidRef(msg) => Error::Message(msg),
+///
+/// # Errors
+///
+/// Returns [`crate::error::RevisionError::NotFound`] when `spec` does not resolve; [`crate::error::RefError::Invalid`] when the
+/// resolved object is not a commit; other object database errors propagate.
+pub(crate) fn resolve_revision_spec(repo: &Repository, spec: &str) -> Result<ObjectId> {
+    if crate::rev_parse::is_top_level_range(spec) {
+        return Err(Error::Revision(RevisionError::NotFound {
+            spec: spec.to_owned(),
+        }));
+    }
+    let oid = resolve_revision(repo, spec).map_err(|err| map_revision_spec_error(spec, err))?;
+    peel_to_commit_for_merge_base(repo, oid)
+}
+
+fn map_revision_spec_error(spec: &str, err: Error) -> Error {
+    match err {
+        Error::Object(ObjectError::NotFound { .. })
+        | Error::Revision(RevisionError::Parse(
+            RevParseError::InvalidObjectName { .. }
+            | RevParseError::RevisionOutOfRange { .. }
+            | RevParseError::AmbiguousArgument { .. }
+            | RevParseError::NoSuchBranch { .. },
+        )) => Error::Revision(RevisionError::NotFound {
+            spec: spec.to_owned(),
+        }),
         other => other,
-    })
+    }
 }
 
 /// Perform a branch switch or detached checkout.
@@ -386,21 +452,22 @@ pub fn resolve_revision_spec(repo: &Repository, spec: &str) -> Result<ObjectId> 
 ///
 /// # Errors
 ///
-/// Returns [`Error::OperationInProgress`] (also for [`SwitchOptions::dry_run`]) while a merge,
+/// Returns [`MergeError::OperationInProgress`] (also for [`SwitchOptions::dry_run`]) while a merge,
 /// rebase, am, cherry-pick or revert is paused, whichever tool started it;
 /// [`Error::LockHeld`] when another process holds `index.lock`, with the work tree, index,
 /// `HEAD` and branch refs unchanged; overwrite refusals and ref/object failures otherwise;
 /// [`Error::Cancelled`] when `cancel` or `progress` asked to stop;
-/// [`Error::CheckoutRollbackIncomplete`] (wrapping the cause) when some work-tree paths could
+/// [`crate::worktree::WorktreeError::CheckoutRollbackIncomplete`] (wrapping the cause) when some work-tree paths could
 /// not be put back. On error the hook does not run.
-pub fn switch_repository(
+pub(crate) fn switch_repository(
     repo: &Repository,
     opts: &SwitchOptions,
     progress: &mut dyn crate::progress::ProgressSink,
-    cancel: &dyn crate::progress::Cancel,
+    cancel: &crate::progress::CancelToken,
 ) -> Result<SwitchOutcome> {
+    crate::progress::poll_cancel(progress, cancel)?;
     if let Some(op) = crate::state::operation_blocking_switch(repo.git_dir())? {
-        return Err(Error::OperationInProgress(op));
+        return Err(MergeError::OperationInProgress(op).into());
     }
     let run_hooks = opts.hooks.enabled() && !opts.dry_run;
     let old_head = if run_hooks {
@@ -421,7 +488,7 @@ fn switch_without_hooks(
     repo: &Repository,
     opts: &SwitchOptions,
     progress: &mut dyn crate::progress::ProgressSink,
-    cancel: &dyn crate::progress::Cancel,
+    cancel: &crate::progress::CancelToken,
 ) -> Result<SwitchOutcome> {
     let (
         target_oid,
@@ -525,6 +592,8 @@ fn switch_without_hooks(
         .with_path_collisions(collisions));
     }
 
+    crate::progress::poll_cancel(progress, cancel)?;
+
     // A real switch reads the index under `index.lock`, so a held lock refuses it before any
     // work-tree change; a dry run never locks.
     let mut lock = (!opts.dry_run).then(|| repo.lock_index()).transpose()?;
@@ -568,7 +637,7 @@ fn switch_to_target(
     reflog_to_label: &str,
     dry_run: bool,
     progress: &mut dyn crate::progress::ProgressSink,
-    cancel: &dyn crate::progress::Cancel,
+    cancel: &crate::progress::CancelToken,
 ) -> Result<SwitchOutcome> {
     let head_before = resolve_head_for_repository(repo)?;
     let checkout_head = if needs_initial_checkout(&index) {
@@ -589,23 +658,34 @@ fn switch_to_target(
                 (target.join(), head.join())
             });
             (
-                target_res
-                    .map_err(|_| Error::Message("parallel commit tree read failed".into()))??,
-                Some(
-                    head_res
-                        .map_err(|_| Error::Message("parallel commit tree read failed".into()))??,
-                ),
+                target_res.unwrap_or_else(|panic| std::panic::resume_unwind(panic))?,
+                Some(head_res.unwrap_or_else(|panic| std::panic::resume_unwind(panic))?),
             )
         }
     };
-    crate::porcelain::index_from_tree::prepare_index_for_tree_transition(
-        repo,
-        &target_tree,
-        &mut index,
-    )?;
+    match head_tree.as_ref() {
+        Some(head) => crate::porcelain::index_from_tree::prepare_index_for_head_transition(
+            repo,
+            head,
+            &target_tree,
+            &mut index,
+        )?,
+        None => crate::porcelain::index_from_tree::prepare_index_for_tree_transition(
+            repo,
+            &target_tree,
+            &mut index,
+        )?,
+    }
     let snapshot = WorktreeSnapshot { index, head_tree };
 
-    let prepared = prepare_tree_switch_allow_local_with_snapshot(repo, &target_tree, snapshot)?;
+    let cancel_signal = crate::progress::CancelSignal::new(cancel);
+    cancel_signal.poll()?;
+    let prepared = prepare_tree_switch_allow_local_with_snapshot(
+        repo,
+        &target_tree,
+        snapshot,
+        &cancel_signal,
+    )?;
     let changed_paths = count_unique_tree_change_paths(&prepared.plan.tree_changes);
     let stranded = stranded_by_leaving_detached_head(repo, &head_before, target_oid)?;
     let dry_run_collisions = switch_path_collisions(repo, &prepared.index)?;
@@ -621,6 +701,7 @@ fn switch_to_target(
         .with_stranded(stranded)
         .with_path_collisions(dry_run_collisions));
     }
+    cancel_signal.poll()?;
     checkout_prepared_tree_transition(repo, prepared, index_lock, progress, cancel)?;
 
     if let Some(from_label) = checkout_reflog_from_label(&head_before) {
@@ -643,9 +724,19 @@ fn switch_to_target(
             )?;
         }
         if detached {
-            refs::update_direct_ref_on_store(repo.refs(), repo.git_dir(), "HEAD", &target_oid)?;
+            refs::update_direct_ref_on_store(
+                repo.ref_store(),
+                repo.git_dir(),
+                "HEAD",
+                &target_oid,
+            )?;
         } else {
-            refs::write_symbolic_ref_on_store(repo.refs(), repo.git_dir(), "HEAD", branch_ref)?;
+            refs::write_symbolic_ref_on_store(
+                repo.ref_store(),
+                repo.git_dir(),
+                "HEAD",
+                branch_ref,
+            )?;
         }
     }
 
@@ -655,8 +746,7 @@ fn switch_to_target(
         }
     }
 
-    let index = repo.load_index()?;
-    let path_collisions = switch_path_collisions(repo, &index)?;
+    let path_collisions = switch_path_collisions_on_disk(repo)?;
     Ok(
         SwitchOutcome::new(branch_label, created, detached, target_oid, false, 0)
             .with_stranded(stranded)
@@ -675,7 +765,7 @@ fn stranded_by_leaving_detached_head(
     let HeadState::Detached { oid: previous } = head else {
         return Ok(OrphanComputation::default());
     };
-    compute_orphan_info(repo, head, *previous, target, DEFAULT_ORPHAN_LIMIT)
+    compute_orphan_info(repo, head, *previous, target, DEFAULT_ORPHAN_LIMIT, None)
 }
 
 fn count_unique_tree_change_paths(tree_changes: &[DiffEntry]) -> usize {
@@ -696,6 +786,7 @@ fn prepare_tree_switch_allow_local_with_snapshot(
     repo: &Repository,
     to_tree: &ObjectId,
     snapshot: WorktreeSnapshot,
+    cancel: &crate::progress::CancelSignal<'_>,
 ) -> Result<PreparedSwitch> {
     let prepared = prepare_tree_transition_allow_local_with_snapshot(
         repo,
@@ -703,6 +794,7 @@ fn prepare_tree_switch_allow_local_with_snapshot(
         to_tree,
         snapshot,
         &HashSet::new(),
+        Some(cancel),
     )
     .map_err(map_switch_tree_transition_prepare_error)?;
     verify_prepared_switch_no_untracked_overwrite(&prepared.plan)?;
@@ -770,6 +862,7 @@ pub(crate) fn prepare_tree_transition_allow_local(
         to_tree,
         snapshot,
         force_preserve_worktree,
+        None,
     )
 }
 
@@ -803,7 +896,9 @@ fn plan_allow_local_tree_transition_core(
     to_tree: &ObjectId,
     mut snapshot: WorktreeSnapshot,
     force_preserve_worktree: &HashSet<String>,
+    cancel: Option<&crate::progress::CancelSignal<'_>>,
 ) -> std::result::Result<AllowLocalTreeTransitionCore, TreeTransitionPrepareError> {
+    let cancel_watch = cancel.map(|signal| signal.watch_arc());
     let from_tree_oid = from_tree.copied().or(snapshot.head_tree);
     snapshot.head_tree = from_tree_oid;
     let trust_index_for_old_tree =
@@ -811,6 +906,21 @@ fn plan_allow_local_tree_transition_core(
     let from_tree_ref = from_tree_oid.as_ref();
     let tree_changes = if from_tree_ref == Some(to_tree) {
         Vec::new()
+    } else if snapshot.index.has_sparse_directory_placeholders() {
+        // Only switch keeps sparse-directory rows here, and its preparation leaves each one
+        // recording the target subtree, so nothing inside them changes.
+        let config = repo.config().snapshot()?;
+        let index_sparse = config.bool_with_default("index.sparse", false);
+        let sparse = crate::sparse_checkout::SparseCheckout::load(repo)?;
+        crate::diff::diff_trees_outside_sparse_directories(
+            repo.odb(),
+            &snapshot.index,
+            from_tree_ref,
+            Some(to_tree),
+            sparse.as_ref(),
+            index_sparse,
+            cancel_watch.clone(),
+        )?
     } else if trust_index_for_old_tree {
         crate::diff::diff_trees_with_index(
             repo.odb(),
@@ -819,10 +929,18 @@ fn plan_allow_local_tree_transition_core(
             Some(to_tree),
             "",
             true,
+            cancel_watch.clone(),
         )?
     } else {
-        crate::diff::diff_trees(repo.odb(), from_tree_ref, Some(to_tree), "")?
+        crate::diff::diff_trees_with_cancel(
+            repo.odb(),
+            from_tree_ref,
+            Some(to_tree),
+            "",
+            cancel_watch.clone(),
+        )?
     };
+    cancel.as_ref().map(|signal| signal.poll()).transpose()?;
     let (staged, unstaged, _index_changed) =
         crate::porcelain::worktree_guard::local_change_diffs_for_tree_changes(
             repo,
@@ -831,9 +949,10 @@ fn plan_allow_local_tree_transition_core(
             &tree_changes,
             None,
         )?;
-    let work_tree = repo
-        .work_tree()
-        .ok_or(TreeTransitionPrepareError::Failed(Error::RequiresWorkTree))?;
+    cancel.as_ref().map(|signal| signal.poll()).transpose()?;
+    let work_tree = repo.work_tree().ok_or(TreeTransitionPrepareError::Failed(
+        RepositoryError::RequiresWorkTree.into(),
+    ))?;
     let (local_blocked_paths, preserve_worktree_paths) =
         match ensure_local_changes_compatible_with_switch(
             work_tree,
@@ -848,9 +967,9 @@ fn plan_allow_local_tree_transition_core(
         };
     let ignorecase = repo
         .config()
+        .snapshot()
         .ok()
-        .and_then(|c| c.get_bool("core.ignorecase").and_then(|r| r.ok()))
-        .unwrap_or(false);
+        .is_some_and(|c| c.ignore_case());
     let delete_paths_set: HashSet<String> = tree_changes
         .iter()
         .filter(|c| c.status == DiffStatus::Deleted)
@@ -864,6 +983,7 @@ fn plan_allow_local_tree_transition_core(
             &tree_changes,
             Some(&delete_paths_set),
         )?;
+    cancel.as_ref().map(|signal| signal.poll()).transpose()?;
     let delete_paths: Vec<String> = delete_paths_set.into_iter().collect();
     let gitlink_deletes: HashSet<String> = tree_changes
         .iter()
@@ -908,6 +1028,7 @@ fn plan_allow_local_tree_transition_core(
             true,
         )
     };
+    cancel.as_ref().map(|signal| signal.poll()).transpose()?;
     Ok(AllowLocalTreeTransitionCore {
         tree_changes,
         untracked,
@@ -926,6 +1047,7 @@ pub(crate) fn prepare_tree_transition_allow_local_with_snapshot(
     to_tree: &ObjectId,
     snapshot: WorktreeSnapshot,
     force_preserve_worktree: &HashSet<String>,
+    cancel: Option<&crate::progress::CancelSignal<'_>>,
 ) -> std::result::Result<PreparedSwitch, TreeTransitionPrepareError> {
     let core = plan_allow_local_tree_transition_core(
         repo,
@@ -933,6 +1055,7 @@ pub(crate) fn prepare_tree_transition_allow_local_with_snapshot(
         to_tree,
         snapshot,
         force_preserve_worktree,
+        cancel,
     )?;
     if !core.local_blocked_paths.is_empty() {
         return Err(TreeTransitionPrepareError::OverwritePaths(
@@ -960,14 +1083,20 @@ pub(crate) fn keep_style_transition_would_block_paths_for_preview(
     to_tree: &ObjectId,
 ) -> Result<Vec<String>> {
     let snapshot = load_worktree_snapshot(repo)?;
-    let core =
-        plan_allow_local_tree_transition_core(repo, from_tree, to_tree, snapshot, &HashSet::new())
-            .map_err(|err| match err {
-                TreeTransitionPrepareError::Failed(err) => err,
-                TreeTransitionPrepareError::OverwritePaths(_) => {
-                    Error::Message("keep preview planning should not fail on local paths".into())
-                }
-            })?;
+    let core = plan_allow_local_tree_transition_core(
+        repo,
+        from_tree,
+        to_tree,
+        snapshot,
+        &HashSet::new(),
+        None,
+    )
+    .map_err(|err| match err {
+        TreeTransitionPrepareError::Failed(err) => err,
+        TreeTransitionPrepareError::OverwritePaths(paths) => {
+            Error::would_overwrite(crate::error::OverwriteReason::LocalChanges, paths)
+        }
+    })?;
     Ok(merge_keep_style_block_paths(&core))
 }
 
@@ -1002,8 +1131,11 @@ fn index_matches_target_tree_entry(
     target: TargetTreeEntry,
 ) -> bool {
     index
-        .get(path.as_bytes(), 0)
-        .is_some_and(|entry| entry.oid == target.oid && entry.mode == target.mode)
+        .get(crate::repo_relpath::storage_bytes(path).as_ref(), 0)
+        .is_some_and(|entry| {
+            entry.oid == target.oid
+                && crate::index::canon_mode(entry.mode) == crate::index::canon_mode(target.mode)
+        })
 }
 
 /// True when `entry` is a submodule directory that drifted from its index gitlink (another
@@ -1062,9 +1194,9 @@ pub(crate) fn verify_tree_transition_allow_local(
             None,
         )
         .map_err(TreeTransitionVerifyError::Failed)?;
-    let work_tree = repo
-        .work_tree()
-        .ok_or(TreeTransitionVerifyError::Failed(Error::RequiresWorkTree))?;
+    let work_tree = repo.work_tree().ok_or(TreeTransitionVerifyError::Failed(
+        RepositoryError::RequiresWorkTree.into(),
+    ))?;
     ensure_local_changes_compatible_with_switch(
         work_tree,
         &prepared.index,
@@ -1090,17 +1222,17 @@ pub(crate) fn checkout_tree_transition_allow_local(
         &HashSet::new(),
         None,
         &mut crate::progress::NullProgress,
-        &crate::progress::NeverCancel,
+        &crate::progress::CancelToken::never(),
     )
 }
 
-/// Like [`checkout_tree_transition_allow_local`], but local-overwrite paths become [`Error::WouldOverwrite`].
+/// Like [`checkout_tree_transition_allow_local`], but local-overwrite paths become [`crate::worktree::WorktreeError::WouldOverwrite`].
 pub(crate) fn checkout_tree_transition_allow_local_reset(
     repo: &Repository,
     from_tree: Option<&ObjectId>,
     to_tree: &ObjectId,
     progress: &mut dyn crate::progress::ProgressSink,
-    cancel: &dyn crate::progress::Cancel,
+    cancel: &crate::progress::CancelToken,
 ) -> Result<()> {
     let prepared = prepare_tree_transition_allow_local(repo, from_tree, to_tree, &HashSet::new())
         .map_err(map_switch_tree_transition_prepare_error)?;
@@ -1119,7 +1251,7 @@ pub(crate) fn checkout_tree_transition_allow_local_with_preserved(
     force_preserve_worktree: &HashSet<String>,
     index_lock: Option<&mut IndexLock>,
     progress: &mut dyn crate::progress::ProgressSink,
-    cancel: &dyn crate::progress::Cancel,
+    cancel: &crate::progress::CancelToken,
 ) -> Result<()> {
     let prepared =
         prepare_tree_transition_allow_local(repo, from_tree, to_tree, force_preserve_worktree)
@@ -1132,7 +1264,7 @@ pub(crate) fn checkout_prepared_tree_transition_for_merge(
     repo: &Repository,
     prepared: PreparedSwitch,
     progress: &mut dyn crate::progress::ProgressSink,
-    cancel: &dyn crate::progress::Cancel,
+    cancel: &crate::progress::CancelToken,
 ) -> Result<()> {
     checkout_prepared_tree_transition(repo, prepared, None, progress, cancel)
 }
@@ -1144,7 +1276,7 @@ fn checkout_prepared_tree_transition(
     mut prepared: PreparedSwitch,
     index_lock: Option<&mut IndexLock>,
     progress: &mut dyn crate::progress::ProgressSink,
-    cancel: &dyn crate::progress::Cancel,
+    cancel: &crate::progress::CancelToken,
 ) -> Result<()> {
     let mut owned_lock = None;
     let index_lock = match index_lock {
@@ -1272,7 +1404,7 @@ pub(crate) fn ensure_local_changes_compatible_with_switch(
             });
             if scheduled.is_some_and(|change| {
                 index
-                    .get(path.as_bytes(), 0)
+                    .get(crate::repo_relpath::storage_bytes(path).as_ref(), 0)
                     .is_some_and(|ie| ie.oid == change.old_oid)
                     && crate::porcelain::worktree_guard::worktree_path_absent_for_trusted_delete(
                         work_tree, path,
@@ -1307,10 +1439,11 @@ mod tests {
     use super::*;
     use crate::objects::{serialize_commit, serialize_tag, CommitData, ObjectKind, TagData};
     use crate::porcelain::status::{status, StatusOptions};
-    use crate::progress::{NeverCancel, NullProgress};
+    use crate::progress::{CancelToken, NullProgress};
     use crate::repo::{init_repository, Repository};
     use crate::state::resolve_head_for_repository;
     use crate::state::HeadState;
+    use crate::worktree::WorktreeError;
     use crate::write_tree::{write_tree_update_index, WriteTreeFlags};
     use crate::RefStorageFormat;
     use tempfile::TempDir;
@@ -1536,15 +1669,15 @@ mod tests {
                 hooks: crate::hooks::PostOperationHooks::Run,
             },
             &mut crate::progress::NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .expect_err("must refuse overwrite");
         assert!(matches!(
             err,
-            Error::WouldOverwrite {
+            Error::Worktree(WorktreeError::WouldOverwrite {
                 reason: OverwriteReason::LocalChanges,
                 ..
-            }
+            })
         ));
 
         let head_after = resolve_head_for_repository(&repo).expect("head");
@@ -1679,15 +1812,15 @@ mod tests {
                 hooks: crate::hooks::PostOperationHooks::Run,
             },
             &mut crate::progress::NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .expect_err("local changes should block switch");
         assert!(matches!(
             err,
-            Error::WouldOverwrite {
+            Error::Worktree(WorktreeError::WouldOverwrite {
                 reason: OverwriteReason::LocalChanges,
                 ..
-            }
+            })
         ));
     }
 
@@ -1720,7 +1853,7 @@ mod tests {
                 hooks: crate::hooks::PostOperationHooks::Run,
             },
             &mut crate::progress::NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .expect("switch");
 
@@ -1729,7 +1862,7 @@ mod tests {
             &repo,
             &StatusOptions::default(),
             &mut NullProgress,
-            &NeverCancel,
+            &CancelToken::never(),
         )
         .expect("status");
         assert_eq!(st.unstaged.len(), 1);
@@ -1768,17 +1901,105 @@ mod tests {
                 hooks: crate::hooks::PostOperationHooks::Run,
             },
             &mut crate::progress::NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .expect_err("conflict");
         assert!(matches!(
             err,
-            Error::WouldOverwrite {
+            Error::Worktree(WorktreeError::WouldOverwrite {
                 reason: OverwriteReason::LocalChanges,
+                ..
+            })
+        ));
+        assert!(refs::resolve_ref(repo.git_dir(), "refs/heads/leaked").is_err());
+    }
+
+    #[test]
+    fn resolve_create_branch_from_remote_start_point_tracks_by_default() {
+        let (_dir, repo) = init_repo();
+        let tip = commit_on_branch(&repo, "main", "f", "1\n", None);
+        refs::write_ref(repo.git_dir(), "refs/remotes/origin/main", &tip).expect("remote");
+
+        let mode = resolve_create_branch(&repo, "work", Some("origin/main"), TrackMode::Auto)
+            .expect("resolve");
+        match &mode {
+            SwitchMode::Create {
+                branch,
+                track_upstream,
+                ..
+            } => {
+                assert_eq!(branch, "work");
+                assert_eq!(
+                    track_upstream.as_ref(),
+                    Some(&("origin".to_owned(), "refs/heads/main".to_owned()))
+                );
+            }
+            other => panic!("expected create, got {other:?}"),
+        }
+
+        switch_repository(
+            &repo,
+            &SwitchOptions {
+                mode,
+                dry_run: false,
+                hooks: crate::hooks::PostOperationHooks::Run,
+            },
+            &mut crate::progress::NullProgress,
+            &crate::progress::CancelToken::never(),
+        )
+        .expect("switch");
+        let config = repo.config().snapshot().expect("config");
+        assert_eq!(
+            config.value("branch.work.remote").as_deref(),
+            Some("origin")
+        );
+        assert_eq!(
+            config.value("branch.work.merge").as_deref(),
+            Some("refs/heads/main")
+        );
+    }
+
+    #[test]
+    fn resolve_create_branch_auto_respects_auto_setup_merge_false() {
+        let (_dir, repo) = init_repo();
+        let tip = commit_on_branch(&repo, "main", "f", "1\n", None);
+        refs::write_ref(repo.git_dir(), "refs/remotes/origin/main", &tip).expect("remote");
+        repo.config()
+            .set(
+                crate::config::ConfigScope::Local,
+                "branch.autoSetupMerge",
+                "false",
+                &crate::config::ConfigWriteOptions::new(),
+            )
+            .map(|_| ())
+            .expect("config");
+
+        let mode = resolve_create_branch(&repo, "work", Some("origin/main"), TrackMode::Auto)
+            .expect("resolve");
+        assert!(matches!(
+            mode,
+            SwitchMode::Create {
+                track_upstream: None,
                 ..
             }
         ));
-        assert!(refs::resolve_ref(repo.git_dir(), "refs/heads/leaked").is_err());
+    }
+
+    #[test]
+    fn resolve_create_branch_never_skips_upstream_config() {
+        let (_dir, repo) = init_repo();
+        let tip = commit_on_branch(&repo, "main", "f", "1\n", None);
+        refs::write_ref(repo.git_dir(), "refs/remotes/origin/main", &tip).expect("remote");
+
+        let mode = resolve_create_branch(&repo, "work", Some("origin/main"), TrackMode::Never)
+            .expect("resolve");
+        assert!(matches!(
+            mode,
+            SwitchMode::Create {
+                track_upstream: None,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1811,13 +2032,16 @@ mod tests {
                 hooks: crate::hooks::PostOperationHooks::Run,
             },
             &mut crate::progress::NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .expect("switch");
-        let config = repo.config().expect("config");
-        assert_eq!(config.get("branch.topic.remote").as_deref(), Some("origin"));
+        let config = repo.config().snapshot().expect("config");
         assert_eq!(
-            config.get("branch.topic.merge").as_deref(),
+            config.value("branch.topic.remote").as_deref(),
+            Some("origin")
+        );
+        assert_eq!(
+            config.value("branch.topic.merge").as_deref(),
             Some("refs/heads/topic")
         );
     }
@@ -1850,6 +2074,7 @@ mod tests {
             tagger: Some("T <t@t> 0 +0000".into()),
             extra_headers: Vec::new(),
             message: "annotated\n".into(),
+            raw_message: None,
         });
         let tag_oid = repo
             .odb()
@@ -1871,7 +2096,7 @@ mod tests {
                 hooks: crate::hooks::PostOperationHooks::Run,
             },
             &mut crate::progress::NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .expect("detach at annotated tag");
 
@@ -1895,7 +2120,7 @@ mod tests {
                 hooks: crate::hooks::PostOperationHooks::Run,
             },
             &mut crate::progress::NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .expect("detach");
         assert_eq!(detached.branch, None);
@@ -1913,7 +2138,7 @@ mod tests {
                 hooks: crate::hooks::PostOperationHooks::Run,
             },
             &mut crate::progress::NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .expect("preview");
         assert_eq!(preview.branch.as_deref(), Some("main"));
@@ -1922,12 +2147,13 @@ mod tests {
         let attached = switch_repository(
             &repo,
             &SwitchOptions {
-                mode: resolve_create_branch(&repo, "topic", None).expect("create mode"),
+                mode: resolve_create_branch(&repo, "topic", None, TrackMode::Auto)
+                    .expect("create mode"),
                 dry_run: false,
                 hooks: crate::hooks::PostOperationHooks::Run,
             },
             &mut crate::progress::NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .expect("create");
         assert_eq!(attached.branch.as_deref(), Some("topic"));
@@ -1946,6 +2172,7 @@ mod tests {
             tagger: Some("T <t@t> 0 +0000".into()),
             extra_headers: Vec::new(),
             message: "annotated\n".into(),
+            raw_message: None,
         });
         let tag_oid = repo
             .odb()
@@ -1953,7 +2180,8 @@ mod tests {
             .expect("tag object");
         refs::write_ref(repo.git_dir(), "refs/tags/v1", &tag_oid).expect("tag ref");
 
-        let mode = resolve_create_branch(&repo, "from-tag", Some("v1")).expect("create mode");
+        let mode = resolve_create_branch(&repo, "from-tag", Some("v1"), TrackMode::Auto)
+            .expect("create mode");
         match mode {
             SwitchMode::Create { start_oid, .. } => assert_eq!(start_oid, tip),
             other => panic!("expected create, got {other:?}"),
@@ -1967,14 +2195,71 @@ mod tests {
         refs::write_ref(repo.git_dir(), "refs/tags/rel1", &tip).expect("tag");
 
         let err = resolve_switch_target(&repo, "rel1").expect_err("tag");
-        assert!(matches!(err, Error::Message(_)));
-        assert!(err.to_string().contains("--detach"));
+        assert!(matches!(err, Error::Branch(BranchError::IsTag { ref name }) if name == "rel1"));
+    }
+
+    #[test]
+    fn resolve_create_branch_returns_typed_branch_errors() {
+        let (_dir, repo) = init_repo();
+        let tip = commit_on_branch(&repo, "main", "f", "x\n", None);
+        switch_to(
+            &repo,
+            resolve_create_branch(&repo, "side", None, TrackMode::Auto).expect("create mode"),
+            false,
+        );
+
+        let dup =
+            resolve_create_branch(&repo, "side", None, TrackMode::Auto).expect_err("duplicate");
+        assert!(matches!(
+            dup,
+            Error::Branch(BranchError::AlreadyExists { ref name }) if name == "side"
+        ));
+        assert!(dup.to_string().contains("already exists"));
+
+        let bad =
+            resolve_create_branch(&repo, "bad name", None, TrackMode::Auto).expect_err("bad name");
+        assert!(matches!(
+            bad,
+            Error::Branch(BranchError::InvalidName { ref name, .. }) if name == "bad name"
+        ));
+
+        let (_empty_dir, empty) = init_repo();
+        let none =
+            resolve_create_branch(&empty, "topic", None, TrackMode::Auto).expect_err("no commits");
+        assert!(matches!(none, Error::Branch(BranchError::NoCommits)));
+
+        let missing =
+            resolve_create_branch(&repo, "from-missing", Some("nosuchrev"), TrackMode::Auto)
+                .expect_err("missing start");
+        assert!(matches!(
+            missing,
+            Error::Revision(RevisionError::NotFound { spec }) if spec == "nosuchrev"
+        ));
+
+        let tree_oid = repo.odb().write(ObjectKind::Tree, b"").expect("empty tree");
+        let tree_spec = tree_oid.to_hex();
+        let not_commit =
+            resolve_create_branch(&repo, "from-tree", Some(&tree_spec), TrackMode::Auto)
+                .expect_err("tree start");
+        assert!(matches!(not_commit, Error::Ref(RefError::Invalid { .. })));
+        let _ = tip;
+    }
+
+    #[test]
+    fn resolve_revision_spec_unknown_revision_is_typed() {
+        let (_dir, repo) = init_repo();
+        let _tip = commit_on_branch(&repo, "main", "f", "x\n", None);
+        let err = resolve_revision_spec(&repo, "nosuchrev").expect_err("missing");
+        assert!(matches!(
+            err,
+            Error::Revision(RevisionError::NotFound { spec }) if spec == "nosuchrev"
+        ));
     }
 
     /// Commit on top of `parent` with `HEAD` detached at the new commit and no ref holding it.
     fn commit_on_detached_head(repo: &Repository, contents: &str, parent: ObjectId) -> ObjectId {
         let oid = commit_on_branch(repo, "scratch", "f", contents, Some(parent));
-        refs::update_direct_ref_on_store(repo.refs(), repo.git_dir(), "HEAD", &oid)
+        refs::update_direct_ref_on_store(repo.ref_store(), repo.git_dir(), "HEAD", &oid)
             .expect("detach");
         refs::delete_ref(repo.git_dir(), "refs/heads/scratch").expect("drop scratch");
         oid
@@ -1989,7 +2274,7 @@ mod tests {
                 hooks: Default::default(),
             },
             &mut crate::progress::NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .expect("switch")
     }
@@ -2123,7 +2408,7 @@ mod tests {
             filler = commit_dated(&repo, tree, filler, 500 + i);
         }
         refs::write_ref(repo.git_dir(), "refs/heads/filler", &filler).expect("ref");
-        refs::update_direct_ref_on_store(repo.refs(), repo.git_dir(), "HEAD", &old_tip)
+        refs::update_direct_ref_on_store(repo.ref_store(), repo.git_dir(), "HEAD", &old_tip)
             .expect("detach");
 
         let outcome = switch_to(

@@ -1,24 +1,26 @@
 //! Typed revision-range parsing and high-level rev-walk queries on [`super::RevWalk`].
+use crate::error::RevisionError;
 use crate::error::{Error, Result};
 use crate::git_date::parse::DateParseError;
 use crate::git_date::parse_date_cutoff;
 use crate::merge_base::{
-    count_commits_reachable_excluding_ancestors_of, is_ancestor as merge_base_is_ancestor,
-    merge_bases_all, merge_bases_first_vs_rest, ReachableCountFilter,
+    count_commits_reachable_excluding_ancestors_of, merge_bases_all, ReachableCountFilter,
 };
 use crate::objects::ObjectId;
 use crate::refs::{list_refs_for_repository, list_refs_glob_for_repository};
 use crate::repo::Repository;
 use std::sync::Arc;
 
+use crate::pathspec::{Pathspec, PathspecGlobalFlags};
 use crate::rev_list::{
-    rev_list, split_revision_token, OrderingMode, RevListOptions, RevListResult,
+    empty_rev_list_result, open_commit_stream, rev_list_with_context, split_revision_token,
+    CommitExtent, CommitStream, CommitStreamParams, OrderingMode, RevListOptions, RevListResult,
+    RevListWalkContext,
 };
 use crate::rev_list_error::RevListError;
 use crate::rev_parse::{
-    is_top_level_range, peel_to_commit_for_merge_base, resolve_revision,
-    resolve_revision_for_range_end, resolve_walk_range_end, split_top_level_triple_dot_range,
-    try_peel_to_commit_for_merge_base,
+    is_top_level_range, peel_to_commit_for_merge_base, resolve_revision_for_range_end,
+    resolve_walk_range_end, split_top_level_triple_dot_range, try_peel_to_commit_for_merge_base,
 };
 use crate::revwalk::filter::CommitFilter;
 
@@ -37,6 +39,10 @@ pub enum MergeFilter {
 }
 
 /// Positive ref tips to include in a rev walk (Git `--all`, `--branches`, `--tags`, `--remotes`).
+///
+/// When combined with empty revision tokens and without [`RefSelection::All`], these selections
+/// replace any implicit default tip (for example `HEAD`); they do not add to it. If a selection
+/// matches nothing, the walk is empty (count `0`, no commits), not an error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RefSelection {
     /// All refs, including `HEAD` when it points at a commit (`--all`).
@@ -81,9 +87,9 @@ pub struct RevWalkCommitIterOptions {
 /// This is the high-level, token-based API: pass these to [`RevWalk::commits`],
 /// [`RevWalk::rev_list_result`], or [`RevWalk::count`] together with revision tokens
 /// (`main`, `^v1.0`, `A..B`, `A...B`). Ref selections ([`Self::refs`]) and path limits
-/// ([`Self::paths`]) live here rather than in the tokens. The low-level engine options are
-/// [`RevListOptions`], used by [`rev_list`] and [`RevWalk::walk`] (one spec string).
-#[derive(Debug, Clone, Default)]
+/// ([`Self::pathspec`]) live here rather than in the tokens. The low-level engine options are
+/// [`RevListOptions`], used by [`crate::rev_list::rev_list`] and [`RevWalk::walk`] (one spec string).
+#[derive(Debug, Clone)]
 pub struct RevWalkListOptions {
     /// Maximum number of commits to return (matches `rev-list --max-count` / `-n`).
     pub limit: Option<usize>,
@@ -103,7 +109,12 @@ pub struct RevWalkListOptions {
     /// (`^A`, the left side of `A..B`) still hide everything they reach through every parent.
     pub first_parent: bool,
     /// Limit history to commits that touch these paths (same rules as `rev-list --`).
-    pub paths: Vec<String>,
+    pub pathspec: Pathspec,
+    /// Follow renames for a single literal file path (Git `log --follow`). History is still
+    /// walked when the path is absent at the start commit (for example after a rename away).
+    pub follow: bool,
+    /// Include merge commits on the followed path (`log --follow --full-history`).
+    pub full_history: bool,
     /// Author/committer/grep filter (same semantics as `git rev-list` / `git log`).
     pub commit_filter: Option<Arc<CommitFilter>>,
     /// Pickaxe filter (`-S` / `-G`).
@@ -113,6 +124,10 @@ pub struct RevWalkListOptions {
     /// Return the commits the walk parses in [`RevListResult::commit_data`] (see
     /// [`RevListOptions::retain_commit_data`]), for callers that render the listed commits.
     pub retain_commit_data: bool,
+    /// How much of each commit [`RevWalk::commits_stream`] reads and keeps for
+    /// [`Self::retain_commit_data`]. [`CommitExtent::ThroughSubject`] suits one-line listings
+    /// and skips inflating message bodies; other walks always keep whole commits.
+    pub retained_commit_extent: CommitExtent,
     /// Classify each listed commit as left or right of the symmetric range (`--left-right`)
     /// in [`RevListResult::left_right_map`]. Requires exactly one `A...B` token.
     pub left_right: bool,
@@ -122,9 +137,34 @@ pub struct RevWalkListOptions {
     pub cherry_mark: bool,
 }
 
+impl Default for RevWalkListOptions {
+    fn default() -> Self {
+        Self {
+            limit: None,
+            skip: 0,
+            since: None,
+            until: None,
+            merges: MergeFilter::default(),
+            reverse: false,
+            refs: Vec::new(),
+            first_parent: false,
+            pathspec: Pathspec::entire_tree(PathspecGlobalFlags::default()),
+            follow: false,
+            full_history: false,
+            commit_filter: None,
+            pickaxe: None,
+            graph: false,
+            retain_commit_data: false,
+            retained_commit_extent: CommitExtent::Whole,
+            left_right: false,
+            cherry_mark: false,
+        }
+    }
+}
+
 /// Positive and negative revision specs produced by [`parse_rev_walk_tokens`].
 ///
-/// Feed `positive` / `negative` to [`rev_list`] and copy `symmetric_left` / `symmetric_right`
+/// Feed `positive` / `negative` to [`crate::rev_list::rev_list`] and copy `symmetric_left` / `symmetric_right`
 /// into the matching [`RevListOptions`] fields. [`RevWalk::commits`] and [`RevWalk::walk`] do
 /// this for you.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -139,7 +179,7 @@ pub struct RevWalkParsedSpecs {
     pub symmetric_right: Option<ObjectId>,
 }
 
-/// Parse user revision tokens into positive/negative specs for [`rev_list`].
+/// Parse user revision tokens into positive/negative specs for [`crate::rev_list::rev_list`].
 ///
 /// Supports plain tips, `A..B`, `A...B`, and `^X` exclusions across multiple tokens. An empty
 /// side of a range defaults to `HEAD`. `A...B` expands to both tips as positive specs and all
@@ -150,7 +190,10 @@ pub struct RevWalkParsedSpecs {
 /// # Errors
 ///
 /// Returns rev-parse and merge-base errors from symmetric-diff expansion.
-pub fn parse_rev_walk_tokens(repo: &Repository, tokens: &[&str]) -> Result<RevWalkParsedSpecs> {
+pub(crate) fn parse_rev_walk_tokens(
+    repo: &Repository,
+    tokens: &[&str],
+) -> Result<RevWalkParsedSpecs> {
     let mut positive = Vec::new();
     let mut negative = Vec::new();
     let mut symmetric_left = None;
@@ -243,17 +286,36 @@ fn merge_filter_to_parent_bounds(merges: MergeFilter) -> (Option<usize>, Option<
     }
 }
 
+/// Validate [`RevWalkListOptions::follow`] path constraints before walking.
+///
+/// # Errors
+///
+/// Returns [`RevListError::FollowRequiresSinglePath`] or [`RevListError::FollowRequiresLiteralPath`].
+pub(crate) fn validate_follow_pathspecs(paths: &[String]) -> Result<()> {
+    if paths.len() != 1 {
+        return Err(crate::rev_list_error::RevListError::FollowRequiresSinglePath.into());
+    }
+    use crate::pathspec::{exact_literal_pathspec_set, PathspecMatchContext};
+    if exact_literal_pathspec_set(paths, PathspecMatchContext::default()).is_none() {
+        return Err(crate::rev_list_error::RevListError::FollowRequiresLiteralPath.into());
+    }
+    Ok(())
+}
+
 pub(crate) fn rev_list_options_from_walk(
     repo: &Repository,
     walk: &RevWalkListOptions,
     parsed: &RevWalkParsedSpecs,
     all_refs: bool,
     count: bool,
-) -> Result<RevListOptions> {
-    let paths = repo.resolve_rev_walk_pathspecs(&walk.paths)?;
+) -> Result<(RevListOptions, RevListWalkContext)> {
+    if walk.follow {
+        validate_follow_pathspecs(walk.pathspec.specs())?;
+    }
+    let paths = repo.resolve_rev_walk_pathspecs(&walk.pathspec)?;
     let (min_parents, max_parents) = merge_filter_to_parent_bounds(walk.merges);
     let graph = walk.graph;
-    Ok(RevListOptions {
+    let opts = RevListOptions {
         first_parent: walk.first_parent,
         max_count: walk.limit,
         skip: walk.skip,
@@ -272,10 +334,10 @@ pub(crate) fn rev_list_options_from_walk(
         },
         preserve_simplify_merges_graph_merges: graph,
         path_graph_reorder: graph,
-        parent_rewrite: graph && !walk.paths.is_empty(),
+        parent_rewrite: graph && !walk.pathspec.is_entire_tree(),
         use_commit_graph: true,
-        use_commit_graph_bloom: !walk.paths.is_empty(),
-        paths_resolved_from_argv: !walk.paths.is_empty(),
+        use_commit_graph_bloom: !walk.pathspec.is_entire_tree(),
+        paths_resolved_from_argv: !walk.pathspec.is_entire_tree(),
         symmetric_left: parsed.symmetric_left,
         symmetric_right: parsed.symmetric_right,
         commit_filter: walk.commit_filter.clone(),
@@ -283,8 +345,14 @@ pub(crate) fn rev_list_options_from_walk(
         retain_commit_data: walk.retain_commit_data,
         left_right: walk.left_right || walk.cherry_mark,
         cherry_mark: walk.cherry_mark,
+        follow: walk.follow,
+        full_history: walk.full_history,
         ..RevListOptions::default()
-    })
+    };
+    let context = RevListWalkContext {
+        retained_commit_extent: walk.retained_commit_extent,
+    };
+    Ok((opts, context))
 }
 
 /// Parse a user date string into a Unix committer cutoff (Git `--since` / `--until`).
@@ -293,7 +361,7 @@ pub(crate) fn rev_list_options_from_walk(
 ///
 /// # Errors
 ///
-/// Returns [`Error::Message`] when the string cannot be parsed.
+/// Returns [`DateParseError`] when the string cannot be parsed.
 pub fn committer_cutoff_from_date(
     date: &str,
     now_sec: i64,
@@ -308,7 +376,7 @@ pub fn committer_cutoff_from_date(
 /// # Errors
 ///
 /// Propagates rev-parse errors from resolving revision tokens and ref globs.
-pub fn resolve_log_walk_tips_and_hide(
+pub(crate) fn resolve_log_walk_tips_and_hide(
     repo: &Repository,
     tokens: &[&str],
     walk: &RevWalkListOptions,
@@ -329,15 +397,18 @@ pub fn resolve_log_walk_tips_and_hide(
 /// # Errors
 ///
 /// Propagates rev-parse and rev-list errors.
-pub fn rev_list_commits_for_author_group(
+pub(crate) fn rev_list_commits_for_author_group(
     repo: &Repository,
     tokens: &[&str],
     walk: &RevWalkListOptions,
 ) -> Result<Vec<ObjectId>> {
+    if ref_walk_is_empty_ref_selection(repo, tokens, walk)? {
+        return Ok(Vec::new());
+    }
     let (parsed, positive, all_refs) = positive_specs_for_walk(repo, tokens, walk)?;
-    let mut opts = rev_list_options_from_walk(repo, walk, &parsed, all_refs, false)?;
+    let (mut opts, context) = rev_list_options_from_walk(repo, walk, &parsed, all_refs, false)?;
     opts.use_bitmap_index = true;
-    let result = rev_list(repo, &positive, &parsed.negative, &opts)?;
+    let result = rev_list_with_context(repo, &positive, &parsed.negative, &opts, context)?;
     Ok(result.commits)
 }
 
@@ -352,13 +423,31 @@ pub(crate) fn positive_specs_for_walk(
     Ok((parsed, positive, all_refs))
 }
 
+fn ref_walk_is_empty_ref_selection(
+    repo: &Repository,
+    tokens: &[&str],
+    walk: &RevWalkListOptions,
+) -> Result<bool> {
+    if walk.refs.is_empty() {
+        return Ok(false);
+    }
+    let parsed = parse_rev_walk_tokens(repo, tokens)?;
+    if !parsed.negative.is_empty() || !parsed.positive.is_empty() {
+        return Ok(false);
+    }
+    let (all_refs, ref_positive) = expand_ref_selections(repo, &walk.refs)?;
+    Ok(!all_refs && ref_positive.is_empty())
+}
+
 fn single_symmetric_range(
     tokens: &[&str],
     parsed: &RevWalkParsedSpecs,
 ) -> Result<(ObjectId, ObjectId)> {
     match (tokens, parsed.symmetric_left, parsed.symmetric_right) {
         ([_], Some(left), Some(right)) => Ok((left, right)),
-        _ => Err(Error::RevList(RevListError::SymmetricRangeRequired)),
+        _ => Err(Error::Revision(RevisionError::List(
+            RevListError::SymmetricRangeRequired,
+        ))),
     }
 }
 
@@ -372,7 +461,7 @@ fn walk_list_is_single_positive_bounded_page(walk: &RevWalkListOptions) -> bool 
         && !walk.reverse
         && walk.merges == MergeFilter::Any
         && !walk.first_parent
-        && walk.paths.is_empty()
+        && walk.pathspec.is_entire_tree()
         && walk.refs.is_empty()
         && walk.since.is_none()
         && walk.until.is_none()
@@ -416,16 +505,114 @@ fn try_single_positive_bounded_page(
             commit_tip,
             max_fetch,
             walk.retain_commit_data,
+            RevListWalkContext {
+                retained_commit_extent: walk.retained_commit_extent,
+            },
         )?,
     ))
 }
 
+/// Whether [`RevWalk::commits_stream`] can serve `walk` instead of a full [`RevWalk::rev_list_result`].
+///
+/// Returns false for path limits, ordering tweaks, filters, symmetric diff markers, and other
+/// options that need the full rev-list engine.
+#[must_use]
+pub fn rev_walk_list_supports_stream(walk: &RevWalkListOptions) -> bool {
+    !walk.graph
+        && walk.pathspec.is_entire_tree()
+        && !walk.reverse
+        && !walk.first_parent
+        && walk.merges == MergeFilter::Any
+        && walk.commit_filter.as_ref().is_none_or(|f| !f.is_active())
+        && walk.pickaxe.is_none()
+        && !walk.left_right
+        && !walk.cherry_mark
+}
+
+/// One commit from [`RevWalk::commits_stream`].
+#[derive(Debug, Clone)]
+pub struct RevWalkCommitStreamItem {
+    /// Listed commit id.
+    pub oid: ObjectId,
+    /// Raw commit object bytes when the walk retained them.
+    pub commit_bytes: Option<Vec<u8>>,
+}
+
+/// Lazy commit walk over the same tokens and [`RevWalkListOptions`] as [`RevWalk::rev_list_result`],
+/// for plain default-order reachable history.
+pub struct RevWalkCommitStream<'repo>(pub(crate) CommitStream<'repo>);
+
+impl Iterator for RevWalkCommitStream<'_> {
+    type Item = Result<RevWalkCommitStreamItem>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0.next().map(|item| {
+            item.map(|row| RevWalkCommitStreamItem {
+                oid: row.oid,
+                commit_bytes: row.commit_bytes,
+            })
+        })
+    }
+}
+
 impl<'repo> RevWalk<'repo> {
+    /// Lazy commit walk for plain default-order history (same tokens and [`RevWalkListOptions`] as
+    /// [`Self::rev_list_result`], without object/cherry side tables).
+    ///
+    /// Returns [`None`] when [`rev_walk_list_supports_stream`] is false; use [`Self::rev_list_result`]
+    /// for path limits, `--reverse`, filters, `--graph`, and symmetric diff markers.
+    ///
+    /// # Errors
+    ///
+    /// Propagates rev-parse and walk setup errors.
+    pub fn commits_stream(
+        &self,
+        tokens: &[&str],
+        walk: &RevWalkListOptions,
+    ) -> Result<Option<RevWalkCommitStream<'repo>>> {
+        if !rev_walk_list_supports_stream(walk) {
+            return Ok(None);
+        }
+        if ref_walk_is_empty_ref_selection(self.repository(), tokens, walk)? {
+            let params = CommitStreamParams {
+                skip: walk.skip,
+                limit: walk.limit,
+                since: walk.since,
+                until: walk.until,
+                first_parent: walk.first_parent,
+                retain_commit_bytes: walk.retain_commit_data,
+                retained_commit_extent: walk.retained_commit_extent,
+            };
+            return Ok(Some(RevWalkCommitStream(open_commit_stream(
+                self.repository(),
+                &[],
+                &[],
+                &params,
+            )?)));
+        }
+        let (tips, hide) = resolve_log_walk_tips_and_hide(self.repository(), tokens, walk)?;
+        let params = CommitStreamParams {
+            skip: walk.skip,
+            limit: walk.limit,
+            since: walk.since,
+            until: walk.until,
+            first_parent: walk.first_parent,
+            retain_commit_bytes: walk.retain_commit_data,
+            retained_commit_extent: walk.retained_commit_extent,
+        };
+        Ok(Some(RevWalkCommitStream(open_commit_stream(
+            self.repository(),
+            &tips,
+            &hide,
+            &params,
+        )?)))
+    }
+
     /// List commit object ids reachable from `tokens` in default `rev-list` order.
     ///
     /// Each token is a plain tip, `^tip`, `A..B`, or `A...B` (see [`parse_rev_walk_tokens`]);
     /// put ref selections in [`RevWalkListOptions::refs`] and path limits in
-    /// [`RevWalkListOptions::paths`]. For a single spec with the full engine options, see
+    /// [`RevWalkListOptions::pathspec`]. For a single spec with the full engine options, see
     /// [`RevWalk::walk`].
     ///
     /// # Errors
@@ -456,28 +643,38 @@ impl<'repo> RevWalk<'repo> {
                 return Ok(result);
             }
         }
+        if ref_walk_is_empty_ref_selection(repo, tokens, options)? {
+            return Ok(empty_rev_list_result());
+        }
         let (parsed, positive, all_refs) = positive_specs_for_walk(repo, tokens, options)?;
         if sides {
             single_symmetric_range(tokens, &parsed)?;
         }
-        let opts = rev_list_options_from_walk(repo, options, &parsed, all_refs, false)?;
-        rev_list(repo, &positive, &parsed.negative, &opts)
+        let (opts, context) = rev_list_options_from_walk(repo, options, &parsed, all_refs, false)?;
+        rev_list_with_context(repo, &positive, &parsed.negative, &opts, context)
     }
 
     /// Count reachable commits without collecting them, using the commit-graph when loaded.
+    ///
+    /// When `tokens` is empty, [`RevWalkListOptions::refs`] selects only ref tips (no implicit
+    /// `HEAD`), and every selection matches nothing, this returns `0` (same as `git rev-list
+    /// --count` with only `--remotes` in a repository with no remote-tracking refs).
     ///
     /// # Errors
     ///
     /// Propagates rev-parse and rev-list errors.
     pub fn count(&self, tokens: &[&str], options: &RevWalkListOptions) -> Result<usize> {
         let repo = self.repository();
+        if ref_walk_is_empty_ref_selection(repo, tokens, options)? {
+            return Ok(0);
+        }
         let (parsed, positive, all_refs) = positive_specs_for_walk(repo, tokens, options)?;
         if parsed.negative.is_empty()
             && positive.len() == 1
             && options.skip == 0
             && options.limit.is_some()
             && (options.since.is_some() || options.until.is_some())
-            && options.paths.is_empty()
+            && options.pathspec.is_entire_tree()
             && options.refs.is_empty()
             && !options.reverse
             && options.merges == MergeFilter::Any
@@ -496,14 +693,14 @@ impl<'repo> RevWalk<'repo> {
                 until: options.until,
             };
             if let Some(list) =
-                crate::merge_base::try_linear_chain_commits_with_cutoffs(repo, tip, need, cutoffs)?
+                crate::merge_base::try_linear_chain_commits(repo, tip, need, cutoffs)?
             {
                 return Ok(list.len());
             }
         }
         if !parsed.negative.is_empty()
             && parsed.symmetric_left.is_none()
-            && options.paths.is_empty()
+            && options.pathspec.is_entire_tree()
             && options.refs.is_empty()
             && options.skip == 0
             && options.limit.is_none()
@@ -528,8 +725,8 @@ impl<'repo> RevWalk<'repo> {
                 repo, &include, &exclude, filter,
             );
         }
-        let opts = rev_list_options_from_walk(repo, options, &parsed, all_refs, true)?;
-        let result = rev_list(repo, &positive, &parsed.negative, &opts)?;
+        let (opts, context) = rev_list_options_from_walk(repo, options, &parsed, all_refs, true)?;
+        let result = rev_list_with_context(repo, &positive, &parsed.negative, &opts, context)?;
         commit_count_from_result(result)
     }
 
@@ -545,7 +742,9 @@ impl<'repo> RevWalk<'repo> {
     /// range, or rev-parse / merge-base errors from resolving the tips.
     pub fn symmetric_range_tips(&self, tokens: &[&str]) -> Result<(ObjectId, ObjectId)> {
         if tokens.len() != 1 {
-            return Err(Error::RevList(RevListError::SymmetricRangeRequired));
+            return Err(Error::Revision(RevisionError::List(
+                RevListError::SymmetricRangeRequired,
+            )));
         }
         let parsed = parse_rev_walk_tokens(self.repository(), tokens)?;
         single_symmetric_range(tokens, &parsed)
@@ -568,7 +767,7 @@ impl<'repo> RevWalk<'repo> {
         let (parsed, positive, all_refs) = positive_specs_for_walk(repo, tokens, options)?;
         let (left, right) = single_symmetric_range(tokens, &parsed)?;
 
-        if options.paths.is_empty()
+        if options.pathspec.is_entire_tree()
             && options.refs.is_empty()
             && options.skip == 0
             && options.limit.is_none()
@@ -597,7 +796,7 @@ impl<'repo> RevWalk<'repo> {
             });
         }
 
-        let mut opts = rev_list_options_from_walk(repo, options, &parsed, all_refs, true)?;
+        let (mut opts, ctx) = rev_list_options_from_walk(repo, options, &parsed, all_refs, true)?;
         // `--count` must not apply `-n`/`--max-count` per side; Git counts the full
         // left and right sets even when a list limit is also set.
         opts.max_count = None;
@@ -605,53 +804,40 @@ impl<'repo> RevWalk<'repo> {
         let left_count = {
             let mut left_opts = opts.clone();
             left_opts.left_only = true;
-            rev_list(repo, &positive, &parsed.negative, &left_opts)?.commit_count()
+            rev_list_with_context(repo, &positive, &parsed.negative, &left_opts, ctx)?
+                .commit_count()
         };
         let mut right_opts = opts;
         right_opts.right_only = true;
-        let right_count = rev_list(repo, &positive, &parsed.negative, &right_opts)?.commit_count();
+        let right_count =
+            rev_list_with_context(repo, &positive, &parsed.negative, &right_opts, ctx)?
+                .commit_count();
         Ok(LeftRightCounts {
             left: left_count,
             right: right_count,
         })
     }
 
-    /// Merge bases of two revisions (`git merge-base`, or `--all` when `all` is true).
+    /// Split user revision `tokens` into positive and negative specs for [`Self::rev_list`].
+    ///
+    /// Supports plain tips, `A..B`, `A...B`, and `^X` exclusions across several tokens. An
+    /// empty side of a range defaults to `HEAD`. `A...B` expands to both tips as positive
+    /// specs and all of their merge bases as negative specs. Dots inside `{…}` selectors or
+    /// after a `:` are literal, so `:/fix...up`, `main^{/fix...up}` and `HEAD:a...b` stay
+    /// single revisions, as in Git.
     ///
     /// # Errors
     ///
-    /// Propagates rev-parse, peel, and merge-base errors.
-    pub fn merge_bases(&self, a: &str, b: &str, all: bool) -> Result<Vec<ObjectId>> {
-        let repo = self.repository();
-        let a_tip = resolve_revision(repo, a)?;
-        let b_tip = resolve_revision(repo, b)?;
-        let a_commit = peel_to_commit_for_merge_base(repo, a_tip)?;
-        let b_commit = peel_to_commit_for_merge_base(repo, b_tip)?;
-        if all {
-            merge_bases_all(repo, &[a_commit, b_commit])
-        } else {
-            merge_bases_first_vs_rest(repo, a_commit, &[b_commit])
-        }
-    }
-
-    /// Whether `ancestor` is reachable from `descendant` (`git merge-base --is-ancestor`).
-    ///
-    /// # Errors
-    ///
-    /// Propagates rev-parse, peel, and merge-base errors.
-    pub fn is_ancestor(&self, ancestor: &str, descendant: &str) -> Result<bool> {
-        let repo = self.repository();
-        let ancestor_tip = resolve_revision(repo, ancestor)?;
-        let descendant_tip = resolve_revision(repo, descendant)?;
-        let ancestor_commit = peel_to_commit_for_merge_base(repo, ancestor_tip)?;
-        let descendant_commit = peel_to_commit_for_merge_base(repo, descendant_tip)?;
-        merge_base_is_ancestor(repo, ancestor_commit, descendant_commit)
+    /// Returns rev-parse and merge-base errors from symmetric-diff expansion.
+    pub fn parse_tokens(&self, tokens: &[&str]) -> Result<RevWalkParsedSpecs> {
+        parse_rev_walk_tokens(self.repository(), tokens)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::RefError;
 
     #[test]
     fn split_double_dot_token_without_repo() {
@@ -670,5 +856,134 @@ mod tests {
             merge_filter_to_parent_bounds(MergeFilter::NoMerges),
             (None, Some(1))
         );
+    }
+
+    #[test]
+    fn count_with_empty_tokens_and_no_ref_selection_still_errors() {
+        let (_dir, repo) = repo_with_commits(1);
+        let walk = RevWalkListOptions::default();
+        let err = repo.revwalk().count(&[], &walk).expect_err("no revisions");
+        assert!(
+            matches!(err, Error::Ref(RefError::Invalid { detail: ref m }) if m == "no revisions specified"),
+            "{err:?}"
+        );
+    }
+
+    fn repo_with_commits(count: usize) -> (tempfile::TempDir, Repository) {
+        use crate::ident::Signature;
+        use crate::porcelain::commit::{create_commit, CommitRequest};
+        use crate::progress::{CancelToken, NullProgress};
+        use crate::repo::{InitOptions, Repository};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (repo, _) = Repository::init(dir.path(), &InitOptions::default()).expect("init");
+        for i in 0..count {
+            let mut req = CommitRequest::new(format!("commit {i}"));
+            req.allow_empty = true;
+            req.author =
+                Some(Signature::new("A", "a@example.com", repo.identity_now()).expect("author"));
+            req.committer =
+                Some(Signature::new("C", "c@example.com", repo.identity_now()).expect("committer"));
+            create_commit(&repo, &req, &mut NullProgress, &CancelToken::never()).expect("commit");
+        }
+        (dir, repo)
+    }
+
+    #[test]
+    fn commits_stream_matches_rev_list_for_all_refs() {
+        let (_dir, repo) = repo_with_commits(4);
+        let walk = RevWalkListOptions {
+            refs: vec![RefSelection::All],
+            ..RevWalkListOptions::default()
+        };
+        let tokens = ["HEAD"];
+        let listed = repo
+            .revwalk()
+            .rev_list_result(&tokens, &walk)
+            .expect("list")
+            .commits;
+        let streamed: Vec<_> = repo
+            .revwalk()
+            .commits_stream(&tokens, &walk)
+            .expect("stream")
+            .expect("some")
+            .map(|item| item.expect("walk").oid)
+            .collect();
+        assert_eq!(streamed, listed);
+    }
+
+    #[test]
+    fn commits_stream_keeps_commits_through_their_subjects() {
+        use crate::ident::Signature;
+        use crate::porcelain::commit::{create_commit, CommitRequest};
+        use crate::progress::{CancelToken, NullProgress};
+        use crate::repo::InitOptions;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (repo, _) = Repository::init(dir.path(), &InitOptions::default()).expect("init");
+        for i in 0..4 {
+            let mut req =
+                CommitRequest::new(format!("subject {i}\n\n{}", "body line\n".repeat(50)));
+            req.allow_empty = true;
+            req.author =
+                Some(Signature::new("A", "a@example.com", repo.identity_now()).expect("author"));
+            req.committer =
+                Some(Signature::new("C", "c@example.com", repo.identity_now()).expect("committer"));
+            create_commit(&repo, &req, &mut NullProgress, &CancelToken::never()).expect("commit");
+        }
+        let stream = |extent| -> Vec<(ObjectId, Vec<u8>)> {
+            let walk = RevWalkListOptions {
+                retain_commit_data: true,
+                retained_commit_extent: extent,
+                ..RevWalkListOptions::default()
+            };
+            repo.revwalk()
+                .commits_stream(&["HEAD"], &walk)
+                .expect("stream")
+                .expect("some")
+                .map(|item| {
+                    let item = item.expect("walk");
+                    (item.oid, item.commit_bytes.expect("kept bytes"))
+                })
+                .collect()
+        };
+        let whole = stream(CommitExtent::Whole);
+        let short = stream(CommitExtent::ThroughSubject);
+        assert_eq!(whole.len(), 4);
+        for ((oid, full), (short_oid, prefix)) in whole.iter().zip(&short) {
+            assert_eq!(oid, short_oid);
+            assert_eq!(*full, repo.odb().read(oid).expect("read").data);
+            assert!(prefix.len() < full.len() && full.starts_with(prefix));
+            assert_eq!(
+                *prefix,
+                repo.odb().read_commit_through_subject(oid).expect("prefix")
+            );
+            assert!(!prefix.windows(9).any(|w| w == b"body line"));
+            assert_eq!(
+                crate::objects::read_commit_subject_line(prefix).expect("subject"),
+                crate::objects::read_commit_subject_line(full).expect("subject")
+            );
+        }
+    }
+
+    #[test]
+    fn commits_stream_honors_limit_without_full_walk() {
+        let (_dir, repo) = repo_with_commits(5);
+        let walk = RevWalkListOptions {
+            limit: Some(2),
+            ..RevWalkListOptions::default()
+        };
+        let mut stream = repo
+            .revwalk()
+            .commits_stream(&["HEAD"], &walk)
+            .expect("stream")
+            .expect("some");
+        let collected: Vec<_> = stream.by_ref().take(2).map(|r| r.unwrap().oid).collect();
+        assert_eq!(collected.len(), 2);
+        drop(stream);
+        let all = repo
+            .revwalk()
+            .rev_list_result(&["HEAD"], &RevWalkListOptions::default())
+            .expect("list")
+            .commits;
+        assert_eq!(all.len(), 5);
     }
 }

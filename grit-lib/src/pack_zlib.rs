@@ -1,5 +1,8 @@
 //! Pack zlib helpers for index-pack (parallel inflate path).
 
+#![allow(dead_code)]
+
+use crate::error::ObjectError;
 use std::io::Read;
 
 use flate2::read::ZlibDecoder;
@@ -15,20 +18,22 @@ const SKIP_BUF_LEN: usize = 64 * 1024;
 /// Returns the number of compressed bytes consumed from `pack` starting at `offset`.
 pub(crate) fn skip_zlib_at(pack: &[u8], offset: usize, expected_size: usize) -> Result<usize> {
     let slice = pack.get(offset..).ok_or_else(|| {
-        Error::CorruptObject(format!(
-            "pack stream truncated: need zlib at offset {offset}"
-        ))
+        Error::Object(ObjectError::Corrupt {
+            detail: format!("pack stream truncated: need zlib at offset {offset}"),
+        })
     })?;
     if expected_size == 0 {
         let mut decoder = ZlibDecoder::new(slice);
         let mut out = Vec::new();
-        decoder
-            .read_to_end(&mut out)
-            .map_err(|e| Error::Zlib(e.to_string()))?;
+        decoder.read_to_end(&mut out).map_err(|e| {
+            Error::Object(ObjectError::Zlib {
+                detail: e.to_string(),
+            })
+        })?;
         if !out.is_empty() {
-            return Err(Error::CorruptObject(
-                "0-byte packed object inflated to non-empty output".to_owned(),
-            ));
+            return Err(Error::Object(ObjectError::Corrupt {
+                detail: "0-byte packed object inflated to non-empty output".to_owned(),
+            }));
         }
         return Ok(decoder.total_in() as usize);
     }
@@ -36,25 +41,29 @@ pub(crate) fn skip_zlib_at(pack: &[u8], offset: usize, expected_size: usize) -> 
     let mut scratch = [0u8; SKIP_BUF_LEN];
     let mut produced = 0usize;
     while produced < expected_size {
-        let n = decoder
-            .read(&mut scratch)
-            .map_err(|e| Error::Zlib(e.to_string()))?;
+        let n = decoder.read(&mut scratch).map_err(|e| {
+            Error::Object(ObjectError::Zlib {
+                detail: e.to_string(),
+            })
+        })?;
         if n == 0 {
             break;
         }
         produced += n;
     }
     if produced != expected_size {
-        return Err(Error::CorruptObject(format!(
-            "decompressed {produced} bytes but expected {expected_size}"
-        )));
+        return Err(Error::Object(ObjectError::Corrupt {
+            detail: format!("decompressed {produced} bytes but expected {expected_size}"),
+        }));
     }
     // Consume the zlib trailer (Adler-32) so `total_in` spans the full member, matching Git's
     // pack index CRC and object boundaries.
     loop {
-        let n = decoder
-            .read(&mut scratch)
-            .map_err(|e| Error::Zlib(e.to_string()))?;
+        let n = decoder.read(&mut scratch).map_err(|e| {
+            Error::Object(ObjectError::Zlib {
+                detail: e.to_string(),
+            })
+        })?;
         if n == 0 {
             break;
         }
@@ -86,6 +95,47 @@ pub(crate) fn flate2_compression_for_pack_level(level: i32) -> Compression {
     }
 }
 
+/// Payloads at least this large are sampled by [`compression_for_payload`].
+const SAMPLE_PAYLOADS_FROM: usize = 1 << 20;
+/// Size of each sample [`compression_for_payload`] deflates.
+const SAMPLE_LEN: usize = 32 * 1024;
+/// Number of evenly spaced samples [`compression_for_payload`] deflates.
+const SAMPLES: usize = 4;
+
+/// The level to deflate `data` at: `configured`, or stored blocks
+/// ([`Compression::none`]) for a large payload that deflate cannot shrink.
+///
+/// Already-compressed content (archives, media, encrypted files) comes out of
+/// deflate no smaller than it went in, at a cost of tens of milliseconds per
+/// megabyte; stored blocks give the same size at copy speed. A few evenly spaced
+/// samples decide, so a payload that compresses anywhere it was sampled keeps the
+/// configured level.
+pub(crate) fn compression_for_payload(data: &[u8], configured: Compression) -> Compression {
+    if configured.level() == 0 || data.len() < SAMPLE_PAYLOADS_FROM {
+        return configured;
+    }
+    let mut zlib = flate2::Compress::new(configured, false);
+    let mut out = vec![0u8; SAMPLE_LEN + SAMPLE_LEN / 8 + 64];
+    let stride = (data.len() - SAMPLE_LEN) / (SAMPLES - 1);
+    for sample in 0..SAMPLES {
+        let start = sample * stride;
+        zlib.reset();
+        let status = zlib.compress(
+            &data[start..start + SAMPLE_LEN],
+            &mut out,
+            flate2::FlushCompress::Finish,
+        );
+        if !matches!(status, Ok(flate2::Status::StreamEnd)) {
+            return configured;
+        }
+        // Saving at least 2% anywhere is worth the configured level.
+        if zlib.total_out() * 50 < zlib.total_in() * 49 {
+            return configured;
+        }
+    }
+    Compression::none()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -95,9 +145,16 @@ mod tests {
 
     fn zlib_compress_pack_payload(data: &[u8], level: i32) -> Result<Vec<u8>> {
         let mut enc = ZlibEncoder::new(Vec::new(), flate2_compression_for_pack_level(level));
-        enc.write_all(data)
-            .map_err(|e| Error::Zlib(e.to_string()))?;
-        enc.finish().map_err(|e| Error::Zlib(e.to_string()))
+        enc.write_all(data).map_err(|e| {
+            Error::Object(ObjectError::Zlib {
+                detail: e.to_string(),
+            })
+        })?;
+        enc.finish().map_err(|e| {
+            Error::Object(ObjectError::Zlib {
+                detail: e.to_string(),
+            })
+        })
     }
 
     #[test]
@@ -161,5 +218,34 @@ mod tests {
             consumed > 0,
             "zlib wrapper must be consumed for 0-byte object"
         );
+    }
+
+    #[test]
+    fn incompressible_payloads_are_stored() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let noise: Vec<u8> = (0..(2 << 20))
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed as u8
+            })
+            .collect();
+        let level = Compression::default();
+        assert_eq!(compression_for_payload(&noise, level).level(), 0);
+        let stored = zlib_compress_pack_payload(&noise, 0).expect("stored");
+        assert!(stored.len() < noise.len() + noise.len() / 1000);
+
+        // Text, small payloads and an explicit level 0 keep the configured level.
+        let text = b"fn main() { println!(\"hello\"); }\n".repeat(64 * 1024);
+        assert_eq!(compression_for_payload(&text, level), level);
+        assert_eq!(compression_for_payload(&noise[..4096], level), level);
+        let none = Compression::none();
+        assert_eq!(compression_for_payload(&noise, none), none);
+
+        // Compressible anywhere sampled keeps the level, even if the rest is noise.
+        let mut mixed = noise.clone();
+        mixed[..64 * 1024].copy_from_slice(&text[..64 * 1024]);
+        assert_eq!(compression_for_payload(&mixed, level), level);
     }
 }

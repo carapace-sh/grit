@@ -17,7 +17,7 @@ grit st
 
 The status screen is your home base. It shows, from top to bottom:
 
-- **Where you are.** The current branch and how it compares with its target branch: ahead and behind counts, followed by ahead commits (up to ten). A branch with no commits says `no commits yet`, and a detached HEAD shows the commit it's on.
+- **Where you are.** The current branch and how it compares with its target branch: ahead and behind counts, followed by ahead commits (up to ten). A branch with no commits says `no commits yet`, and a detached HEAD shows the commit it's on (short id follows `core.abbrev` and always resolves).
 - **Staged** changes, which are ready to commit.
 - **Changed (not staged)** files, which have been modified since they were last staged.
 - **Untracked** files, which `grit` isn't tracking yet.
@@ -25,9 +25,9 @@ The status screen is your home base. It shows, from top to bottom:
 
 Each change has a label: `new`, `modified`, `deleted`, `renamed`, `copied`, `type changed` or `conflict`. `type changed` (`type_changed` in `--json`, Git's `T`) means the path switched between a regular file, a symlink and a submodule; a permission-only change such as `chmod +x` is `modified`.
 
-**Submodules:** grit records gitlinks in the index but does not fetch nested repositories ([`grit clone`](../clone/) leaves an empty directory and prints a note). An **uninitialized** submodule directory (no embedded `.git`) is ignored the same way Git ignores it: stray files you create inside that placeholder are not listed as modified or untracked, and `grit commit` agrees with a clean `git status`. A **checked-out** submodule with its own `.git` directory is compared by its HEAD commit and inner worktree dirtiness.
+**Submodules:** grit records gitlinks in the index but does not fetch nested repositories ([`grit clone`](../clone/) leaves an empty directory and prints a note). An **uninitialized** submodule directory (no embedded `.git`) is ignored the same way Git ignores it: stray files you create inside that placeholder are not listed as modified or untracked, and `grit commit` agrees with a clean `git status`. A **checked-out** submodule with its own `.git` directory is compared by its HEAD commit and inner worktree dirtiness. Short status uses lowercase `m` when the recorded gitlink commit still matches the checkout but tracked content inside the submodule is dirty; uppercase `M` means the submodule HEAD moved. Git's `diff.ignoreSubmodules`, `submodule.<name>.ignore`, and the `ignore` key in `.gitmodules` apply to unstaged gitlink reporting the same way they do in Git (`none`, `untracked`, `dirty`, `all`; per-submodule settings override the global default). Staged gitlink updates (index commit differs from `HEAD`) stay visible even when ignore is `all`. In default untracked listing, a directory that contains an embedded repository (with or without sibling untracked files) is reported once as `?? parent/` (Git collapses the nested checkout the same way). With `--untracked all`, grit lists the embedded repository directory and any sibling files under the parent, but never files inside the nested checkout.
 
-A tracked file that grit cannot open to compare its content (another program holds it open without sharing, or it has no read permission) is listed as `modified`, like Git does, and the rest of the status is reported as usual. Commands that need the file's bytes, such as `grit add` of that path or a patch from `grit diff`, still fail with [`worktree_path_io`](../exit-codes/), and `grit switch` refuses a branch that would change it.
+A tracked file that grit cannot open to compare its content (another program holds it open without sharing, or it has no read permission) is listed as `modified`, like Git does, and the rest of the status is reported as usual. When a **directory** on the path cannot be opened (for example `chmod 000` on a parent of a tracked file or an untracked tree), grit prints a `warning:` on stderr naming the path, skips that subtree, and continues — the rest of status is unchanged and exit status stays `0`. With `--json`, those warnings appear in the `warnings` array alongside the normal status fields. Commands that need the file's bytes, such as `grit add` of that path or a patch from `grit diff`, still fail with [`worktree_path_io`](../exit-codes/), and `grit switch` refuses a branch that would change it.
 
 **Index refresh:** after stat data in the work tree no longer matches `.git/index`, grit re-verifies content and normally writes the refreshed stat cache back to the index (like `git status`). If another command updates the index after status loaded it (for example a concurrent commit), grit skips the write and keeps the on-disk index that command wrote. Use [`--no-optional-locks`](../global-options/) or `GIT_OPTIONAL_LOCKS=0` when a background status must not touch the index file; grit still refreshes stat data in memory so the report matches a full run. Library callers set [`StatusOptions::write_index`](rustdoc:grit_lib::porcelain::status::StatusOptions::write_index) to `false` for the same read-only behavior without changing the process environment.
 
@@ -110,7 +110,7 @@ $ grit config target.branch origin/develop
 
 When the current branch has a configured upstream (`branch.<name>.remote` and `branch.<name>.merge`) that differs from the target, human output adds a second line (`↑n ↓m origin/topic`) and JSON includes an `upstream` object with the same counts relative to that tracking ref. When upstream and target resolve to the same ref, `upstream` is `null`.
 
-On Unix, explicit path operands must be valid UTF-8. An operand containing invalid UTF-8 bytes is rejected before the command runs, with exit status **2** and no changes to the repository. Human output reports the usage error on stderr; `--json` writes an error object with `kind: "usage"` on stdout, and `--markdown` writes `**Error:**` on stdout. The argument is never replaced with a similar Unicode filename. Without a path filter, status still reports non-UTF-8 filenames using reversible `grit+pathhex:` encoding in JSON path fields.
+On Unix, explicit path operands must be valid UTF-8. An operand containing invalid UTF-8 bytes is rejected before the command runs, with exit status **2** and no changes to the repository. Human output reports the usage error on stderr; `--json` writes an error object with `kind: "usage"` on stdout, and `--markdown` writes `**Error:**` on stdout. The argument is never replaced with a similar Unicode filename. Without a path filter, status still reports non-UTF-8 filenames using reversible `grit+pathhex:` encoding in JSON path fields, including untracked paths discovered via the index UNTR cache walk.
 
 ## Options
 
@@ -123,6 +123,8 @@ On Unix, explicit path operands must be valid UTF-8. An operand containing inval
 | `--pathspec-file-nul` | `--pathspec-from-file` entries are NUL-separated (requires `--pathspec-from-file`). |
 | `--ignored` | List ignored paths (traditional mode; same `!!` set as `git status --ignored --porcelain`). |
 | `-s`, `--short` | Compact one-line-per-path output for humans only (two-letter staged/unstaged codes; JSON unchanged). |
+
+From a subdirectory, short status uses cwd-relative paths; untracked directories keep a trailing slash (for example `?? ./` inside an untracked folder, or `?? ../other/` for a sibling directory).
 
 Rename detection is on by default (Git’s `status.renames` / `diff.renames`; disable with `status.renames=false`). Human output shows renames as `old → new`; `--json` adds `old_path` on rename and copy entries.
 
@@ -282,8 +284,9 @@ Pass `--json` for stable, scripting-friendly output:
 | `upstream` | object or null | When upstream tracking differs from `target`: `{ "ref", "ahead", "behind" }` (counts may be `null` when skipped). Always present; `null` when there is no separate upstream. |
 | `commits` | array | Newest of those commits, up to ten, each using the shared [`CommitJson`](../README.md#commit-json-object-commitjson) shape (including `change_id` and `change_id_stored`). |
 | `staged` | array | Staged changes with `path`, `status`, and optional `old_path` (renames/copies). |
-| `unstaged` | array | Unstaged changes with `path`, `status`, and optional `old_path` (renames/copies). |
+| `unstaged` | array | Unstaged changes with `path`, `status`, optional `old_path` (renames/copies), and optional `submodule` (`new_commits`, `modified`, `untracked`) on gitlink worktree changes. |
 | `untracked` | array | Untracked paths (raw UTF-8; JSON escapes control characters). With default `--untracked normal`, wholly untracked directories appear once (often with a trailing `/`); with `--untracked all`, every file path is listed. |
+| `embedded_repositories` | array | Untracked nested repositories that would be recorded as gitlinks if staged. Omitted when empty. Human and `--markdown` output print a one-line **note** on stderr for each path. A symlink (including one pointing at a repository directory) is an ordinary `120000` entry and is not listed here. |
 | `clean` | boolean | `true` when there is nothing to commit and nothing untracked. |
 | `merging` | boolean | **Deprecated.** Prefer `operation`. `true` when a merge is in progress (`MERGE_HEAD` exists). |
 | `in_progress` | array | **Deprecated.** Prefer `operation`. Stable operation ids while work is paused (for example `merge`, `rebase`). Omitted when empty. |
@@ -293,6 +296,8 @@ Pass `--json` for stable, scripting-friendly output:
 | `stash_count` | number | Entries on the stash reflog (`0` when empty). |
 | `interrupted_rewrite` | string | Recovery of a rebase or history edit that was killed after moving refs: `finished_checkout` (the rewrite stands), `rolled_back` (it was undone) or `pending` (another process holds `.git/index.lock`). Omitted when nothing was pending. |
 | `gitbutler_workspace` | object | Only on a [GitButler workspace](#gitbutler-workspaces): `commit` (the workspace commit, which `head` names and `commits` and `ahead` leave out) and `heads`, the merged branch tips in the workspace's parent order, each with `commit`, `branches` (local branches pointing there, sorted; empty when none), `subject` and `ahead` (commits not on `target`, or `null` when counts were skipped). Omitted otherwise. |
+| `warnings` | array | Non-fatal worktree access problems while scanning. Each item is `{ "kind", "message" }` (for example `worktree_access_failed` when a directory could not be opened). Omitted when empty. |
+| `shared` | object | Only on a [shared](../share/) branch: `remote` (where the other members' heads were fetched from) and `heads`, the other members' heads, each with `user`, `tip`, `relation` to your branch (`same`, `ahead`, `behind`, `diverged` or `unknown`), and for a head that diverged from yours `divergence`: `scenario` (a stable code such as `amended_both_conflicting`; see [Divergence scenarios](../share/#divergence-scenarios)), `summary`, `needs_decision`, `base`, `changes` (each commit's `change`, `subject`, and what `you` and `them` did to it), `conflicts` and `also`. Human output lists them under the branch line (`shared with bob, carol`); `--markdown` as a table. Omitted otherwise. |
 
 Example:
 

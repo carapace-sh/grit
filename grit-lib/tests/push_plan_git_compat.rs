@@ -7,13 +7,11 @@ use grit_lib::config::environment::Environment;
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::config::ConfigSet;
 use grit_lib::objects::ObjectId;
-use grit_lib::progress::NeverCancel;
 use grit_lib::remote::fetch::NoProgress;
 use grit_lib::remote::push_plan::{
-    load_push_plan_context, open_push_destination, resolve_push, resolve_push_invocation,
-    PushPlanContext, PushRequest,
+    open_push_destination, resolve_push_invocation, PushPlanContext, PushPlanError, PushRequest,
 };
-use grit_lib::remote::transfer::{push_local, PushOptions, PushRefSpec};
+use grit_lib::remote::transfer::{PushOptions, PushRefSpec};
 use grit_lib::repo::Repository;
 use grit_test_support::{git, git_cmd};
 use std::collections::HashSet;
@@ -56,7 +54,12 @@ fn open_repo(path: &Path) -> Repository {
 }
 
 fn load_config(repo: &Repository) -> ConfigSet {
-    ConfigSet::load(&Environment::empty(), Some(repo.git_dir()), true).expect("config")
+    ConfigSet::load(
+        &Environment::empty(),
+        Some(repo.git_dir()),
+        &crate::config::LoadConfigOptions::standard(&Environment::empty(), Some(repo.git_dir())),
+    )
+    .expect("config")
 }
 
 fn git_porcelain_dry_run(cwd: &Path, args: &[&str]) -> Vec<PorcelainLine> {
@@ -98,21 +101,28 @@ fn plan_specs(
     request: PushRequest,
     ctx: &PushPlanContext,
 ) -> Vec<PushRefSpec> {
-    resolve_push(repo, config, &request, ctx)
+    repo.remotes()
+        .resolve_push(&request, ctx)
         .expect("resolve_push")
         .specs
 }
 
 fn dry_run_push_local(local_git: &Path, bare: &Path, specs: &[PushRefSpec]) {
-    let _ = push_local(
+    let _ = grit_lib::repo::Repository::open(
         local_git,
-        bare,
+        &grit_lib::config::environment::RepositoryOptions::empty(),
+    )
+    .expect("open push source")
+    .remotes()
+    .push_to(
+        grit_lib::remote::transfer::TransferEndpoint::Local(bare),
         specs,
         &PushOptions {
             dry_run: true,
             ..Default::default()
         },
-        &grit_lib::progress::NeverCancel,
+        &mut grit_lib::remote::fetch::NoProgress,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("push_local dry-run");
 }
@@ -151,7 +161,10 @@ fn literal_path_remote_context_guesses_short_dst_like_git() {
     let repo = open_repo(&fx.local);
     let config = load_config(&repo);
     let bare = fx.bare.to_str().expect("utf-8 path").to_owned();
-    let ctx = load_push_plan_context(&repo, &config, Some(&bare), None).expect("context");
+    let ctx = repo
+        .remotes()
+        .push_plan_context(Some(&bare), None)
+        .expect("context");
     let mut advertised = ctx.remote_ref_names.clone();
     advertised.remove("HEAD");
     assert_eq!(advertised, push_plan_context(&fx.bare).remote_ref_names);
@@ -225,7 +238,10 @@ fn plan_context_lists_pushurl_not_fetch_url() {
     );
     let repo = open_repo(&fx.local);
     let config = load_config(&repo);
-    let ctx = load_push_plan_context(&repo, &config, Some("origin"), None).expect("context");
+    let ctx = repo
+        .remotes()
+        .push_plan_context(Some("origin"), None)
+        .expect("context");
     assert_eq!(
         ctx.remote_ref_names,
         push_plan_context(&push_bare).remote_ref_names
@@ -245,24 +261,27 @@ fn push_with_planning_tips_sends_missing_objects_to_literal_remote() {
     let repo = open_repo(&fx.local);
     let config = load_config(&repo);
     let bare = fx.bare.to_str().expect("utf-8 path").to_owned();
-    let ctx = load_push_plan_context(&repo, &config, Some(&bare), None).expect("context");
+    let ctx = repo
+        .remotes()
+        .push_plan_context(Some(&bare), None)
+        .expect("context");
     let main_tip = git_cmd(&["rev-parse", "main"]).in_dir(&fx.local).exec();
     let main_tip = ObjectId::from_hex(main_tip.stdout.trim()).expect("main oid");
     assert!(ctx
         .remote_tips
         .as_ref()
         .is_some_and(|t| t.contains(&main_tip)));
-    let plan = resolve_push(
-        &repo,
-        &config,
-        &PushRequest {
-            remote: Some(bare.clone()),
-            refspecs: vec!["feature".into()],
-            ..Default::default()
-        },
-        &ctx,
-    )
-    .expect("plan");
+    let plan = repo
+        .remotes()
+        .resolve_push(
+            &PushRequest {
+                remote: Some(bare.clone()),
+                refspecs: vec!["feature".into()],
+                ..Default::default()
+            },
+            &ctx,
+        )
+        .expect("plan");
     open_push_destination(&config, &plan.remote)
         .expect("remote")
         .push(
@@ -273,7 +292,7 @@ fn push_with_planning_tips_sends_missing_objects_to_literal_remote() {
                 ..Default::default()
             },
             &mut NoProgress,
-            &NeverCancel,
+            &CancelToken::never(),
             None,
         )
         .expect("push");
@@ -405,18 +424,26 @@ fn matching_push_config_only_existing_remote_heads() {
     assert!(specs[0].src_ref.as_deref() == Some("refs/heads/main"));
 }
 
+fn porcelain_push_dst(spec: &str) -> &str {
+    spec.rsplit_once(':')
+        .map(|(_, dst)| dst)
+        .unwrap_or(spec)
+        .trim_start_matches('+')
+}
+
 fn compare_with_git(local: &Path, git_args: &[&str], specs: &[PushRefSpec], bare: &Path) {
-    let git_lines = git_porcelain_dry_run(local, git_args);
-    dry_run_push_local(&local.join(".git"), bare, specs);
-    assert_eq!(git_lines.len(), specs.len(), "ref count");
-    for (g, s) in git_lines.iter().zip(specs.iter()) {
-        let (gs, gd) = g.spec.split_once(':').expect("git spec");
-        assert_eq!(gd, s.dst);
+    let mut git_lines = git_porcelain_dry_run(local, git_args);
+    git_lines.sort_by(|a, b| porcelain_push_dst(&a.spec).cmp(porcelain_push_dst(&b.spec)));
+    let mut specs_sorted = specs.to_vec();
+    specs_sorted.sort_by(|a, b| a.dst.cmp(&b.dst));
+    dry_run_push_local(&local.join(".git"), bare, &specs_sorted);
+    assert_eq!(git_lines.len(), specs_sorted.len(), "ref count");
+    for (g, s) in git_lines.iter().zip(specs_sorted.iter()) {
+        assert_eq!(porcelain_push_dst(&g.spec), s.dst.as_str());
         // Git porcelain dry-run often uses a space flag even when the refspec had `+`.
         if g.forced {
             assert!(s.force, "git marked forced but spec did not");
         }
-        let _ = gs;
     }
 }
 
@@ -524,13 +551,10 @@ fn push_remote_precedence() {
     git(&fx.local, &["checkout", "-q", "feature"]);
     let repo = open_repo(&fx.local);
     let config = load_config(&repo);
-    let resolved = resolve_push(
-        &repo,
-        &config,
-        &PushRequest::default(),
-        &PushPlanContext::default(),
-    )
-    .expect("plan");
+    let resolved = repo
+        .remotes()
+        .resolve_push(&PushRequest::default(), &PushPlanContext::default())
+        .expect("plan");
     assert_eq!(resolved.remote, "upstream");
 }
 
@@ -560,13 +584,10 @@ fn detached_head_without_refspec_errors() {
     git(&fx.local, &["checkout", "-q", "--detach", "HEAD"]);
     let repo = open_repo(&fx.local);
     let config = load_config(&repo);
-    let err = resolve_push(
-        &repo,
-        &config,
-        &PushRequest::default(),
-        &PushPlanContext::default(),
-    )
-    .unwrap_err();
+    let err = repo
+        .remotes()
+        .resolve_push(&PushRequest::default(), &PushPlanContext::default())
+        .unwrap_err();
     assert!(err.to_string().contains("detached"));
 }
 
@@ -587,12 +608,18 @@ fn real_push_matches_git_file_remote() {
         },
         &PushPlanContext::default(),
     );
-    push_local(
+    grit_lib::repo::Repository::open(
         &fx.local_git,
-        &fx.bare,
+        &grit_lib::config::environment::RepositoryOptions::empty(),
+    )
+    .expect("open push source")
+    .remotes()
+    .push_to(
+        grit_lib::remote::transfer::TransferEndpoint::Local(&fx.bare),
         &specs,
         &PushOptions::default(),
-        &grit_lib::progress::NeverCancel,
+        &mut grit_lib::remote::fetch::NoProgress,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("grit push");
     let grit_oid = git(&fx.bare, &["rev-parse", "refs/heads/feature"]);
@@ -626,15 +653,21 @@ fn dry_run_leaves_bare_refs_unchanged() {
         },
         &PushPlanContext::default(),
     );
-    push_local(
+    grit_lib::repo::Repository::open(
         &fx.local_git,
-        &fx.bare,
+        &grit_lib::config::environment::RepositoryOptions::empty(),
+    )
+    .expect("open push source")
+    .remotes()
+    .push_to(
+        grit_lib::remote::transfer::TransferEndpoint::Local(&fx.bare),
         &specs,
         &PushOptions {
             dry_run: true,
             ..Default::default()
         },
-        &grit_lib::progress::NeverCancel,
+        &mut grit_lib::remote::fetch::NoProgress,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("dry-run");
     let after = list_remote_refs(&fx.bare);
@@ -651,7 +684,10 @@ fn loaded_plan_context_matches_git_for_each_ref() {
     );
     let repo = open_repo(&fx.local);
     let config = load_config(&repo);
-    let mut ctx = load_push_plan_context(&repo, &config, None, None).expect("context");
+    let mut ctx = repo
+        .remotes()
+        .push_plan_context(None, None)
+        .expect("context");
     ctx.remote_ref_names.remove("HEAD");
     let expected = push_plan_context(&fx.bare);
     assert_eq!(ctx.remote_ref_names, expected.remote_ref_names);
@@ -666,19 +702,21 @@ fn push_from_positionals_is_readable_by_git() {
     let positionals = vec!["origin".to_owned(), "feature".to_owned()];
     let invocation = resolve_push_invocation(&config, None, &positionals).expect("invocation");
     assert_eq!(invocation.remote.as_deref(), Some("origin"));
-    let ctx = load_push_plan_context(&repo, &config, invocation.remote.as_deref(), None)
+    let ctx = repo
+        .remotes()
+        .push_plan_context(invocation.remote.as_deref(), None)
         .expect("context");
-    let plan = resolve_push(
-        &repo,
-        &config,
-        &PushRequest {
-            remote: invocation.remote,
-            refspecs: invocation.refspecs,
-            ..Default::default()
-        },
-        &ctx,
-    )
-    .expect("plan");
+    let plan = repo
+        .remotes()
+        .resolve_push(
+            &PushRequest {
+                remote: invocation.remote,
+                refspecs: invocation.refspecs,
+                ..Default::default()
+            },
+            &ctx,
+        )
+        .expect("plan");
     open_push_destination(&config, &plan.remote)
         .expect("remote")
         .push(
@@ -686,7 +724,7 @@ fn push_from_positionals_is_readable_by_git() {
             &plan.specs,
             PushOptions::default(),
             &mut NoProgress,
-            &NeverCancel,
+            &CancelToken::never(),
             None,
         )
         .expect("push");
@@ -715,24 +753,24 @@ fn push_to_literal_path_remote_is_readable_by_git() {
     assert_eq!(invocation.remote.as_deref(), Some(bare.as_str()));
     let remote = open_push_destination(&config, &bare).expect("literal remote");
     assert_eq!(remote.name, None);
-    let plan = resolve_push(
-        &repo,
-        &config,
-        &PushRequest {
-            remote: invocation.remote,
-            refspecs: invocation.refspecs,
-            ..Default::default()
-        },
-        &PushPlanContext::default(),
-    )
-    .expect("plan");
+    let plan = repo
+        .remotes()
+        .resolve_push(
+            &PushRequest {
+                remote: invocation.remote,
+                refspecs: invocation.refspecs,
+                ..Default::default()
+            },
+            &PushPlanContext::default(),
+        )
+        .expect("plan");
     remote
         .push(
             &repo,
             &plan.specs,
             PushOptions::default(),
             &mut NoProgress,
-            &NeverCancel,
+            &CancelToken::never(),
             None,
         )
         .expect("push");
@@ -740,6 +778,395 @@ fn push_to_literal_path_remote_is_readable_by_git() {
         .in_dir(&fx.bare)
         .exec();
     assert!(out.ok(), "rev-parse: {}", out.stderr);
+}
+
+#[test]
+fn push_to_relative_path_remote_is_readable_by_git() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let work = tmp.path().join("work");
+    let bare = tmp.path().join("srv");
+    std::fs::create_dir_all(&work).unwrap();
+    git(&work, &["init", "-q", "-b", "main"]);
+    std::fs::write(work.join("f"), "1\n").unwrap();
+    git(&work, &["add", "f"]);
+    git(&work, &["commit", "-q", "-m", "c1"]);
+    std::fs::create_dir_all(&bare).expect("bare dir");
+    git(&bare, &["init", "-q", "--bare", "-b", "main", "."]);
+
+    let repo = open_repo(&work);
+    let config = load_config(&repo);
+    let remote_path = "../srv".to_owned();
+    let invocation =
+        resolve_push_invocation(&config, None, &[remote_path.clone(), "main".to_owned()])
+            .expect("invocation");
+    assert_eq!(invocation.remote.as_deref(), Some(remote_path.as_str()));
+    let remote = open_push_destination(&config, &remote_path).expect("literal remote");
+    let plan = repo
+        .remotes()
+        .resolve_push(
+            &PushRequest {
+                remote: invocation.remote,
+                refspecs: invocation.refspecs,
+                ..Default::default()
+            },
+            &PushPlanContext::default(),
+        )
+        .expect("plan");
+    remote
+        .push(
+            &repo,
+            &plan.specs,
+            PushOptions::default(),
+            &mut NoProgress,
+            &CancelToken::never(),
+            None,
+        )
+        .expect("push");
+    let out = git_cmd(&["rev-parse", "--verify", "refs/heads/main"])
+        .in_dir(&bare)
+        .exec();
+    assert!(out.ok(), "rev-parse: {}", out.stderr);
+    let fsck = git_cmd(&["fsck", "--strict"]).in_dir(&bare).exec();
+    assert!(fsck.ok(), "git fsck: {}", fsck.stderr);
+}
+
+#[test]
+fn cli_wildcard_heads_refspec_matches_configured_push() {
+    let fx = setup_feature_and_main();
+    git(
+        &fx.local,
+        &["config", "remote.origin.push", "refs/heads/*:refs/heads/*"],
+    );
+    let repo = open_repo(&fx.local);
+    let config = load_config(&repo);
+    let ctx = push_plan_context(&fx.bare);
+    let configured = plan_specs(&repo, &config, PushRequest::default(), &ctx);
+    let cli = plan_specs(
+        &repo,
+        &config,
+        PushRequest {
+            refspecs: vec!["refs/heads/*:refs/heads/*".into()],
+            remote: Some("origin".into()),
+            ..Default::default()
+        },
+        &ctx,
+    );
+    assert_eq!(configured.len(), cli.len());
+    compare_with_git(
+        &fx.local,
+        &["origin", "refs/heads/*:refs/heads/*"],
+        &cli,
+        &fx.bare,
+    );
+}
+
+#[test]
+fn push_all_includes_branches_not_on_empty_remote() {
+    let fx = setup_feature_and_main();
+    let repo = open_repo(&fx.local);
+    let config = load_config(&repo);
+    let ctx = push_plan_context(&fx.bare);
+    let specs = plan_specs(
+        &repo,
+        &config,
+        PushRequest {
+            all: true,
+            remote: Some("origin".into()),
+            ..Default::default()
+        },
+        &ctx,
+    );
+    assert!(specs.iter().any(|s| s.dst == "refs/heads/feature"));
+    assert!(specs.iter().any(|s| s.dst == "refs/heads/main"));
+    compare_with_git(&fx.local, &["origin", "--all"], &specs, &fx.bare);
+}
+
+#[test]
+fn mirror_push_plans_delete_for_remote_only_ref() {
+    let fx = setup_feature_and_main();
+    git(&fx.local, &["push", "-q", "origin", "main"]);
+    let main_oid = git(&fx.bare, &["rev-parse", "refs/heads/main"])
+        .trim()
+        .to_owned();
+    git_cmd(&["update-ref", "refs/heads/orphan", &main_oid])
+        .in_dir(&fx.bare)
+        .exec();
+    let repo = open_repo(&fx.local);
+    let config = load_config(&repo);
+    let ctx = push_plan_context(&fx.bare);
+    let specs = plan_specs(
+        &repo,
+        &config,
+        PushRequest {
+            mirror: true,
+            remote: Some("origin".into()),
+            ..Default::default()
+        },
+        &ctx,
+    );
+    assert!(
+        specs
+            .iter()
+            .any(|s| s.delete && s.dst == "refs/heads/orphan"),
+        "mirror must plan deletion of remote-only branch"
+    );
+    compare_with_git(&fx.local, &["origin", "--mirror"], &specs, &fx.bare);
+}
+
+#[test]
+fn cli_negative_refspec_excludes_matched_branch() {
+    let fx = setup_feature_and_main();
+    let repo = open_repo(&fx.local);
+    let config = load_config(&repo);
+    let ctx = push_plan_context(&fx.bare);
+    let specs = plan_specs(
+        &repo,
+        &config,
+        PushRequest {
+            refspecs: vec![
+                "refs/heads/*:refs/heads/*".into(),
+                "^refs/heads/feature".into(),
+            ],
+            remote: Some("origin".into()),
+            ..Default::default()
+        },
+        &ctx,
+    );
+    assert!(
+        !specs.iter().any(|s| s.dst == "refs/heads/feature"),
+        "negative refspec should drop feature"
+    );
+    assert!(specs.iter().any(|s| s.dst == "refs/heads/main"));
+}
+
+#[test]
+fn wildcard_zero_match_errors() {
+    let fx = setup_feature_and_main();
+    let repo = open_repo(&fx.local);
+    let config = load_config(&repo);
+    let err = repo
+        .remotes()
+        .resolve_push(
+            &PushRequest {
+                refspecs: vec!["refs/heads/nope/*:refs/heads/nope/*".into()],
+                remote: Some("origin".into()),
+                ..Default::default()
+            },
+            &PushPlanContext::default(),
+        )
+        .unwrap_err();
+    assert!(matches!(err, PushPlanError::SrcRefspecNoMatch { .. }));
+}
+
+#[test]
+fn remotes_wildcard_to_heads_seeds_new_remote() {
+    let fx = setup_feature_and_main();
+    git(&fx.local, &["push", "-q", "origin", "main", "feature"]);
+    let dest = fx.local.parent().unwrap().join("dest.git");
+    std::fs::create_dir_all(&dest).unwrap();
+    git(&dest, &["init", "-q", "--bare", "-b", "main", "."]);
+    git(
+        &fx.local,
+        &["remote", "add", "dest", dest.to_str().unwrap()],
+    );
+    let repo = open_repo(&fx.local);
+    let config = load_config(&repo);
+    let ctx = push_plan_context(&dest);
+    let specs = plan_specs(
+        &repo,
+        &config,
+        PushRequest {
+            refspecs: vec!["refs/remotes/origin/*:refs/heads/*".into()],
+            remote: Some("dest".into()),
+            ..Default::default()
+        },
+        &ctx,
+    );
+    assert!(specs.iter().any(|s| s.dst == "refs/heads/main"));
+    assert!(specs.iter().any(|s| s.dst == "refs/heads/feature"));
+    compare_with_git(
+        &fx.local,
+        &["dest", "refs/remotes/origin/*:refs/heads/*"],
+        &specs,
+        &dest,
+    );
+}
+
+#[test]
+fn glob_push_roundtrip_fsck_with_git() {
+    let fx = setup_feature_and_main();
+    git(
+        &fx.local,
+        &["remote", "add", "nb", fx.bare.to_str().unwrap()],
+    );
+    let repo = open_repo(&fx.local);
+    let config = load_config(&repo);
+    let specs = plan_specs(
+        &repo,
+        &config,
+        PushRequest {
+            refspecs: vec!["refs/heads/*:refs/heads/*".into()],
+            remote: Some("nb".into()),
+            ..Default::default()
+        },
+        &PushPlanContext::default(),
+    );
+    grit_lib::repo::Repository::open(
+        &fx.local_git,
+        &grit_lib::config::environment::RepositoryOptions::empty(),
+    )
+    .expect("open push source")
+    .remotes()
+    .push_to(
+        grit_lib::remote::transfer::TransferEndpoint::Local(&fx.bare),
+        &specs,
+        &PushOptions::default(),
+        &mut grit_lib::remote::fetch::NoProgress,
+        &CancelToken::never(),
+    )
+    .expect("push");
+    let refs = git(&fx.bare, &["for-each-ref", "--format=%(refname)"]);
+    assert!(refs.contains("refs/heads/main"));
+    assert!(refs.contains("refs/heads/feature"));
+    let fsck = git_cmd(&["fsck", "--strict"]).in_dir(&fx.bare).exec();
+    assert!(fsck.ok(), "git fsck: {}", fsck.stderr);
+}
+
+#[test]
+fn prune_negative_refspec_preserves_excluded_remote_branch() {
+    let fx = setup_feature_and_main();
+    git(&fx.local, &["push", "-q", "origin", "main", "feature"]);
+    let repo = open_repo(&fx.local);
+    let config = load_config(&repo);
+    let ctx = push_plan_context(&fx.bare);
+    let specs = plan_specs(
+        &repo,
+        &config,
+        PushRequest {
+            refspecs: vec![
+                "refs/heads/*:refs/heads/*".into(),
+                "^refs/heads/feature".into(),
+            ],
+            remote: Some("origin".into()),
+            prune: true,
+            ..Default::default()
+        },
+        &ctx,
+    );
+    assert!(
+        !specs
+            .iter()
+            .any(|s| s.delete && s.dst == "refs/heads/feature"),
+        "negative refspec must keep remote feature out of prune deletes"
+    );
+    compare_with_git(
+        &fx.local,
+        &[
+            "origin",
+            "--prune",
+            "refs/heads/*:refs/heads/*",
+            "^refs/heads/feature",
+        ],
+        &specs,
+        &fx.bare,
+    );
+}
+
+#[test]
+fn configured_negative_with_prune_does_not_delete_excluded_remote() {
+    for negative_first in [false, true] {
+        let fx = setup_main_and_private_with_negative_push_config(negative_first);
+        let repo = open_repo(&fx.local);
+        let config = load_config(&repo);
+        let ctx = push_plan_context(&fx.bare);
+        let specs = plan_specs(
+            &repo,
+            &config,
+            PushRequest {
+                remote: Some("origin".into()),
+                prune: true,
+                ..Default::default()
+            },
+            &ctx,
+        );
+        assert!(
+            !specs
+                .iter()
+                .any(|s| s.delete && s.dst == "refs/heads/private"),
+            "configured ^ must exclude private from prune (negative_first={negative_first})"
+        );
+        compare_with_git(&fx.local, &["origin", "--prune"], &specs, &fx.bare);
+    }
+}
+
+#[test]
+fn prune_single_branch_push_does_not_delete_sibling_remote() {
+    let fx = setup_feature_and_main();
+    git(&fx.local, &["push", "-q", "origin", "main", "feature"]);
+    git(&fx.local, &["checkout", "-q", "main"]);
+    git(&fx.local, &["branch", "-D", "feature"]);
+    let repo = open_repo(&fx.local);
+    let config = load_config(&repo);
+    let ctx = push_plan_context(&fx.bare);
+    let specs = plan_specs(
+        &repo,
+        &config,
+        PushRequest {
+            refspecs: vec!["main".into()],
+            remote: Some("origin".into()),
+            prune: true,
+            ..Default::default()
+        },
+        &ctx,
+    );
+    assert!(
+        !specs.iter().any(|s| s.delete),
+        "single-ref push must not plan prune deletes: {specs:?}"
+    );
+    compare_with_git(&fx.local, &["origin", "--prune", "main"], &specs, &fx.bare);
+}
+
+#[test]
+fn prune_custom_wildcard_destination_namespace() {
+    let fx = setup_feature_and_main();
+    git(
+        &fx.local,
+        &["push", "-q", "origin", "refs/heads/*:refs/tmp/*"],
+    );
+    git(&fx.local, &["checkout", "-q", "main"]);
+    git(&fx.local, &["branch", "-D", "feature"]);
+    let repo = open_repo(&fx.local);
+    let config = load_config(&repo);
+    let ctx = push_plan_context(&fx.bare);
+    let specs = plan_specs(
+        &repo,
+        &config,
+        PushRequest {
+            refspecs: vec!["refs/heads/*:refs/tmp/*".into()],
+            remote: Some("origin".into()),
+            prune: true,
+            ..Default::default()
+        },
+        &ctx,
+    );
+    assert!(
+        specs
+            .iter()
+            .any(|s| s.delete && s.dst == "refs/tmp/feature"),
+        "stale refs/tmp/feature should be pruned"
+    );
+    assert!(
+        !specs
+            .iter()
+            .any(|s| s.delete && s.dst.starts_with("refs/heads/")),
+        "must not prune refs/heads when dst namespace is refs/tmp/*"
+    );
+    compare_with_git(
+        &fx.local,
+        &["origin", "--prune", "refs/heads/*:refs/tmp/*"],
+        &specs,
+        &fx.bare,
+    );
 }
 
 fn list_remote_refs(bare: &Path) -> HashSet<String> {

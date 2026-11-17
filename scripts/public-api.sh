@@ -15,10 +15,12 @@ SNAPSHOT="${REPO}/grit-lib/public-api.txt"
 
 usage() {
 	cat <<EOF
-Usage: $(basename "$0") <generate|check|ensure-deps>
+Usage: $(basename "$0") <generate|check|check-test-items|ensure-deps>
 
   generate     Write ${SNAPSHOT#"$REPO"/} from cargo public-api
   check        Regenerate to a temp file and diff against the committed snapshot
+  check-api-migration  Verify 0.5.31→0.6 migration map and doc table
+  check-test-items  Ratchet test/bench/fixture/probe names in public + hidden API
   ensure-deps              Install pinned nightly + cargo-public-api (for tests)
   ensure-toolchain         Install pinned nightly only (rustdoc JSON / coverage gate)
   ensure-cargo-public-api  Install or replace cargo-public-api when version mismatches
@@ -62,7 +64,7 @@ write_snapshot() {
 	ensure_cargo_public_api
 	cd "${REPO}"
 	# Document the supported embedder surface only (`http-ureq` optional). Internal
-	# bench helpers (`unstable-bench-helpers`) stay out of the committed snapshot.
+	# `test-support` hooks stay out of the committed snapshot (default features only).
 	cargo "+${PUBLIC_API_TOOLCHAIN}" public-api -p grit-lib --features http-ureq --simplified >"${dest}"
 }
 
@@ -112,6 +114,21 @@ check)
 		diff_text="$(python3 "${REPO}/scripts/public_api.py" diff "${SNAPSHOT}" "${tmp}")"
 		printf '%s\n' "${diff_text}"
 		write_step_summary "${diff_text}"
+		exit 1
+	fi
+	;;
+	check-api-migration)
+	python3 "${REPO}/scripts/api_migration.py" check
+	;;
+	check-test-items)
+	ensure_toolchain
+	# `check` runs cargo-public-api first, which writes target/doc/grit_lib.json.
+	# check-test-items uses its own JSON under target/public-api-test-items-doc/;
+	# remove it so hidden-item rustdoc is always rebuilt after a snapshot check.
+	rm -f "${REPO}/target/public-api-test-items-doc/grit_lib.json"
+	if python3 "${REPO}/scripts/public_api.py" check-test-items; then
+		echo "public-api test-item ratchet passed (zero offenders)."
+	else
 		exit 1
 	fi
 	;;

@@ -1,19 +1,25 @@
 //! Typed errors for common embedder failures (issue #1685).
 
 use grit_lib::blame::{self, compute_blame, BlameDiffAlgorithm};
+use grit_lib::diff::TreeDiffOptions;
 use grit_lib::error::Error;
+use grit_lib::error::RevisionError;
 use grit_lib::objects::ObjectId;
 use grit_lib::parallel::ThreadPolicy;
-use grit_lib::porcelain::commit::{create_commit, CommitRequest};
-use grit_lib::porcelain::staging::stage_worktree_changes;
-use grit_lib::porcelain::status::{status, StatusOptions};
-use grit_lib::progress::{NeverCancel, NullProgress};
-use grit_lib::repo::{InitOptions, Repository};
+use grit_lib::porcelain::commit::CommitRequest;
+use grit_lib::porcelain::status::StatusOptions;
+use grit_lib::porcelain::CommitError;
+use grit_lib::progress::CancelToken;
+use grit_lib::progress::NullProgress;
+use grit_lib::repo::{InitOptions, Repository, RepositoryError};
 use grit_lib::revwalk::rev_parse_error::RevParseError;
 use std::collections::{HashMap, HashSet};
 fn assert_requires_work_tree(result: Result<(), Error>) {
     assert!(
-        matches!(result, Err(Error::RequiresWorkTree)),
+        matches!(
+            result,
+            Err(Error::Repository(RepositoryError::RequiresWorkTree))
+        ),
         "expected RequiresWorkTree, got {result:?}"
     );
 }
@@ -21,42 +27,49 @@ fn assert_requires_work_tree(result: Result<(), Error>) {
 #[test]
 fn bare_repo_common_failures_use_requires_work_tree() {
     let base = tempfile::tempdir().expect("tempdir");
-    let bare = Repository::init(
+    let (bare, _) = Repository::init(
         &base.path().join("bare"),
         &InitOptions::default().with_bare(true),
     )
     .expect("init bare");
 
     assert_requires_work_tree(
-        status(
-            &bare,
-            &StatusOptions::default(),
-            &mut NullProgress,
-            &NeverCancel,
-        )
-        .map(|_| ()),
+        bare.status()
+            .run(
+                &StatusOptions::default(),
+                &mut NullProgress,
+                &CancelToken::never(),
+            )
+            .map(|_| ()),
     );
-    assert_requires_work_tree(stage_worktree_changes(&bare, &[]).map(|_| ()));
+    assert_requires_work_tree(bare.index().stage_worktree_paths(&[]).map(|_| ()));
 
-    let mut idx = bare.index_handle().load().expect("index");
+    let mut idx = bare
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("index");
     assert_requires_work_tree(
         bare.diff()
-            .worktree_to_index(&mut idx, false, false)
+            .index_to_worktree(&mut idx, &TreeDiffOptions::default())
+            .map(|r| r.entries)
             .map(|_| ()),
     );
 }
 
 fn repo_with_one_commit() -> (tempfile::TempDir, Repository, ObjectId) {
     let base = tempfile::tempdir().expect("tempdir");
-    let repo = Repository::init(
+    let (repo, _) = Repository::init(
         &base.path().join("w"),
         &InitOptions::default().with_initial_branch("main"),
     )
     .expect("init");
     std::fs::write(base.path().join("w/a"), "x\n").expect("write");
-    stage_worktree_changes(&repo, &[]).expect("stage");
+    &repo.index().stage_worktree_paths(&[]).expect("stage");
     let req = grit_test_support::commit_request("m\n", "A <a@b> 0 +0000");
-    let outcome = create_commit(&repo, &req, &mut NullProgress, &NeverCancel).expect("commit");
+    let outcome = repo
+        .commits()
+        .create_staged(&req, &mut NullProgress, &CancelToken::never())
+        .expect("commit");
     (base, repo, outcome.oid)
 }
 
@@ -64,7 +77,7 @@ fn assert_blame_path_not_in_revision(err: Error, expected_path: &str, expected_r
     assert!(
         matches!(
             err,
-            Error::RevParse(RevParseError::PathNotInRevision { ref path, ref revision, .. })
+            Error::Revision(RevisionError::Parse(RevParseError::PathNotInRevision { ref path, ref revision, .. }))
                 if path == expected_path && revision == expected_revision
         ),
         "got {err:?}"
@@ -74,7 +87,10 @@ fn assert_blame_path_not_in_revision(err: Error, expected_path: &str, expected_r
 #[test]
 fn blame_file_missing_path_is_path_not_in_revision() {
     let (_base, repo, _head) = repo_with_one_commit();
-    let err = blame::blame_file(&repo, "nope.txt", &Default::default()).unwrap_err();
+    let err = repo
+        .diff()
+        .blame("nope.txt", &Default::default())
+        .unwrap_err();
     assert_blame_path_not_in_revision(err, "nope.txt", "HEAD");
 }
 
@@ -91,6 +107,7 @@ fn compute_blame_missing_path_is_path_not_in_revision() {
         false,
         0,
         false,
+        false,
         &HashMap::new(),
         false,
         None,
@@ -104,21 +121,26 @@ fn compute_blame_missing_path_is_path_not_in_revision() {
 #[test]
 fn deep_parent_navigation_is_revision_out_of_range() {
     let base = tempfile::tempdir().expect("tempdir");
-    let repo = Repository::init(
+    let (repo, _) = Repository::init(
         &base.path().join("w"),
         &InitOptions::default().with_initial_branch("main"),
     )
     .expect("init");
     std::fs::write(base.path().join("w/a"), "x\n").expect("write");
-    stage_worktree_changes(&repo, &[]).expect("stage");
+    &repo.index().stage_worktree_paths(&[]).expect("stage");
     let req = grit_test_support::commit_request("m\n", "A <a@b> 0 +0000");
-    create_commit(&repo, &req, &mut NullProgress, &NeverCancel).expect("commit");
+    repo.commits()
+        .create_staged(&req, &mut NullProgress, &CancelToken::never())
+        .expect("commit");
 
-    let err = repo.rev_walk().resolve("main~99").unwrap_err();
+    let err = repo
+        .revwalk()
+        .resolve("main~99", &grit_lib::revwalk::ResolveOptions::default())
+        .unwrap_err();
     assert!(
         matches!(
             err,
-            Error::RevParse(RevParseError::RevisionOutOfRange { ref spec, .. }) if spec == "main~99"
+            Error::Revision(RevisionError::Parse(RevParseError::RevisionOutOfRange { ref spec, .. })) if spec == "main~99"
         ),
         "got {err:?}"
     );
@@ -127,18 +149,26 @@ fn deep_parent_navigation_is_revision_out_of_range() {
 #[test]
 fn empty_commit_message_is_typed() {
     let base = tempfile::tempdir().expect("tempdir");
-    let repo = Repository::init(
+    let (repo, _) = Repository::init(
         &base.path().join("w"),
         &InitOptions::default().with_initial_branch("main"),
     )
     .expect("init");
     std::fs::write(base.path().join("w/a"), "x\n").expect("write");
-    stage_worktree_changes(&repo, &[]).expect("stage");
+    &repo.index().stage_worktree_paths(&[]).expect("stage");
     let req = grit_test_support::commit_request("m\n", "A <a@b> 0 +0000");
-    create_commit(&repo, &req, &mut NullProgress, &NeverCancel).expect("commit");
+    repo.commits()
+        .create_staged(&req, &mut NullProgress, &CancelToken::never())
+        .expect("commit");
 
     let mut empty = CommitRequest::new("");
     empty.allow_empty = true;
-    let err = create_commit(&repo, &empty, &mut NullProgress, &NeverCancel).unwrap_err();
-    assert!(matches!(err, Error::EmptyCommitMessage), "got {err:?}");
+    let err = repo
+        .commits()
+        .create_staged(&empty, &mut NullProgress, &CancelToken::never())
+        .unwrap_err();
+    assert!(
+        matches!(err, Error::Commit(CommitError::EmptyCommitMessage)),
+        "got {err:?}"
+    );
 }

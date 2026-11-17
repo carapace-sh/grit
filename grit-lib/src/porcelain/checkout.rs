@@ -12,10 +12,12 @@
 //! These functions compute and apply worktree changes from index/object data
 //! and make no presentation decisions — no colour, pager, tty, or stdout.
 
+use crate::error::ObjectError;
+use crate::worktree::WorktreeError;
 use std::borrow::Cow;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -33,11 +35,11 @@ use crate::objects::FileMode;
 use crate::objects::{Object, ObjectId, TreeEntry};
 use crate::odb::{BoundedRead, Odb};
 use crate::parallel::{try_par_map, ParallelHashError, ParallelOp, ParallelOptions};
-use crate::path_icase::paths_equal;
+use crate::path_icase::ScheduledDeletePathLookup;
 use crate::path_population::{validate_tree_walk_entry, validate_worktree_path};
 use crate::path_validate::ProtectOptions;
 use crate::progress::{
-    Cancel, CancelProgress, NeverCancel, NullProgress, ProgressPhase, ProgressSink, ProgressUnit,
+    CancelProgress, CancelToken, NullProgress, ProgressPhase, ProgressSink, ProgressUnit,
 };
 use crate::repo::Repository;
 use crate::sparse_checkout::SparseCheckout;
@@ -48,30 +50,39 @@ use crate::worktree_rules::WorktreeRules;
 mod checkout_journal;
 #[path = "checkout_parallel.rs"]
 mod checkout_parallel;
-pub(crate) use checkout_journal::create_symlink_at;
 pub(crate) use checkout_journal::CheckoutJournal;
 use checkout_journal::SharedCheckoutDeleteRollback;
 pub(crate) use checkout_parallel::is_eligible_for_parallel_checkout;
 use checkout_parallel::{
-    cancellable_chunks, execute_write_jobs, execute_write_jobs_unrecorded,
-    paths_needing_serial_checkout_str, CheckoutPlanSlot, CheckoutWriteJob, WriteJobOutcome,
+    cancellable_chunks, cancellable_chunks_cancel_friendly, execute_write_jobs,
+    execute_write_jobs_unrecorded, paths_needing_serial_checkout_str, CheckoutPlanSlot,
+    CheckoutWriteJob, WriteJobOutcome,
 };
 
 const PARALLEL_PER_FILE_DELETE_MIN: usize = 32;
 const POPULATED_TREE_CHECKOUT_CHUNK: usize = 2048;
+/// Above this many racily clean tree-diff files, they are spooled for rollback unread instead of
+/// hashed. Up to it, parallel hashing is cheaper than moving every file aside and deleting it
+/// again (back-to-back checkouts leave every written file racy); wider sets avoid reading the
+/// whole diff back.
+const RACY_TREE_DIFF_CONTENT_VERIFY_MAX: usize = 1024;
+/// Racily clean tree-diff files totalling more bytes than this are spooled unread, however few.
+const RACY_TREE_DIFF_CONTENT_VERIFY_MAX_BYTES: u64 = 32 * 1024 * 1024;
 
 fn remove_checkout_files_parallel_cancellable(
     work_tree: &Path,
     paths: &[String],
     options: ParallelOptions,
     progress: &mut dyn ProgressSink,
-    cancel: &dyn Cancel,
+    cancel: &CancelToken,
     delete_rollback: SharedCheckoutDeleteRollback,
 ) -> Result<(HashSet<String>, Vec<PathBuf>)> {
     let mut parallel_deleted_paths = HashSet::new();
     let mut deleted_abs_paths = Vec::new();
     let wt = work_tree.to_path_buf();
     let (chunks, options) = cancellable_chunks(paths, options);
+    // Removing files contends in the kernel: lease workers from the filesystem budget.
+    let _filesystem = crate::parallel::FilesystemWork::enter();
     for chunk in chunks {
         crate::progress::poll_cancel(progress, cancel)?;
         let rollback = delete_rollback.clone_handle();
@@ -123,7 +134,7 @@ pub(crate) fn remove_created_checkout_paths(
         }
         return (removed_abs, failed);
     }
-    let Ok(config) = repo.config() else {
+    let Ok(config) = repo.config().snapshot() else {
         for rel in paths {
             match remove_one(rel) {
                 Ok(abs) => removed_abs.push(abs),
@@ -136,6 +147,8 @@ pub(crate) fn remove_created_checkout_paths(
         .thread_policy()
         .resolve(ParallelOp::Checkout, config.as_ref());
     let (chunks, options) = cancellable_chunks(paths, options);
+    // Removing files contends in the kernel: lease workers from the filesystem budget.
+    let _filesystem = crate::parallel::FilesystemWork::enter();
     for chunk in chunks {
         match try_par_map(chunk, options, 0, |rel| remove_one(rel)) {
             Ok(abs_paths) => removed_abs.extend(abs_paths),
@@ -162,7 +175,7 @@ pub(crate) fn restore_checkout_rollback_paths(
     if targets.is_empty() {
         return Vec::new();
     }
-    let Ok(config) = repo.config() else {
+    let Ok(config) = repo.config().snapshot() else {
         return targets.iter().map(|t| t.path.clone()).collect();
     };
     let config = Arc::new(config);
@@ -175,10 +188,7 @@ pub(crate) fn restore_checkout_rollback_paths(
         return targets.iter().map(|t| t.path.clone()).collect();
     };
     let conv = rules.conversion().clone();
-    let ignorecase = config
-        .get_bool("core.ignorecase")
-        .and_then(|r| r.ok())
-        .unwrap_or(false);
+    let ignorecase = config.ignore_case();
     let precompose = repo.pathspec_precompose_enabled();
 
     let mut changes: Vec<DiffEntry> = Vec::with_capacity(targets.len());
@@ -264,7 +274,7 @@ fn restore_checkout_rollback_chunk(
         })
         .map(|(i, _)| i)
         .collect();
-    let mut dir_cache = LeadingDirCache::with_protect(ProtectOptions::from_config(config.as_ref()));
+    let mut dir_cache = LeadingDirCache::for_config(config.as_ref());
     if write_jobs.len() >= BULK_ADD_CHECKOUT_MIN {
         precreate_checkout_parent_dirs(work_tree, &write_jobs, &mut dir_cache);
     } else {
@@ -275,7 +285,7 @@ fn restore_checkout_rollback_chunk(
         }
     }
     let mut delayed = DelayedProcessCheckout::default();
-    let mut progress = CancelProgress::new(progress, &NeverCancel);
+    let mut progress = CancelProgress::new(progress, CancelToken::never_ref());
     let execute_result = execute_write_jobs_unrecorded(
         repo,
         rules,
@@ -290,7 +300,7 @@ fn restore_checkout_rollback_chunk(
         None,
         true,
         &mut progress,
-        &NeverCancel,
+        CancelToken::never_ref(),
     );
     match execute_result {
         Ok(outcomes) => {
@@ -485,7 +495,7 @@ fn remove_wholesale_dirs_parallel_cancellable(
     dirs: &[String],
     options: ParallelOptions,
     progress: &mut dyn ProgressSink,
-    cancel: &dyn Cancel,
+    cancel: &CancelToken,
     journal: &mut CheckoutJournal,
 ) -> Result<Vec<(String, PathBuf)>> {
     let mut removed = Vec::new();
@@ -504,7 +514,9 @@ fn remove_wholesale_dirs_parallel_cancellable(
         return Ok(removed);
     }
     let wt = work_tree.to_path_buf();
-    let (chunks, options) = cancellable_chunks(dirs, options);
+    let (chunks, options) = cancellable_chunks_cancel_friendly(dirs, options);
+    // Removing files contends in the kernel: lease workers from the filesystem budget.
+    let _filesystem = crate::parallel::FilesystemWork::enter();
     for chunk in chunks {
         crate::progress::poll_cancel(progress, cancel)?;
         for dir in chunk {
@@ -515,9 +527,9 @@ fn remove_wholesale_dirs_parallel_cancellable(
             Ok(remove_wholesale_dir(&abs).then_some((dir.clone(), abs)))
         })
         .map_err(|e: ParallelHashError<()>| match e {
-            ParallelHashError::Task(()) => {
-                Error::PathError("parallel wholesale directory removal failed".into())
-            }
+            ParallelHashError::Task(()) => Error::Worktree(WorktreeError::Path {
+                detail: "parallel wholesale directory removal failed".into(),
+            }),
         })?;
         removed.extend(removed_chunk.into_iter().flatten());
     }
@@ -545,11 +557,20 @@ struct PopulatedTreeWalk<'a> {
 
 impl<'a> PopulatedTreeWalk<'a> {
     fn new(odb: &'a Odb, tree_oid: &ObjectId, protect: ProtectOptions) -> Result<Self> {
+        Self::new_at_prefix(odb, tree_oid, String::new(), protect)
+    }
+
+    fn new_at_prefix(
+        odb: &'a Odb,
+        tree_oid: &ObjectId,
+        prefix: String,
+        protect: ProtectOptions,
+    ) -> Result<Self> {
         let entries = (*odb.cached_tree_entries(tree_oid)?).clone();
         Ok(Self {
             odb,
             stack: vec![PopulatedTreeWalkFrame {
-                prefix: String::new(),
+                prefix,
                 entries,
                 index: 0,
             }],
@@ -669,11 +690,13 @@ fn checkout_populated_tree(
     repo: &Repository,
     tree_oid: &ObjectId,
     progress: &mut dyn ProgressSink,
-    cancel: &dyn Cancel,
+    cancel: &CancelToken,
 ) -> Result<CheckoutOutcome> {
-    let work_tree = repo
-        .work_tree()
-        .ok_or_else(|| Error::PathError("cannot update a bare repository's working tree".into()))?;
+    let work_tree = repo.work_tree().ok_or_else(|| {
+        Error::Worktree(WorktreeError::Path {
+            detail: "cannot update a bare repository's working tree".into(),
+        })
+    })?;
     let (mut lock, mut loaded_index) = repo.lock_and_load_index()?;
     let total = diff_tree_path_change_count(repo.odb(), None, Some(tree_oid), "")?;
     progress.start(
@@ -706,20 +729,19 @@ fn checkout_populated_tree_journaled(
     repo: &Repository,
     tree_oid: &ObjectId,
     progress: &mut dyn ProgressSink,
-    cancel: &dyn Cancel,
+    cancel: &CancelToken,
     index_mut: &mut Index,
     lock: &mut IndexLock,
     journal: &mut CheckoutJournal,
 ) -> Result<bool> {
-    let work_tree = repo
-        .work_tree()
-        .ok_or_else(|| Error::PathError("cannot update a bare repository's working tree".into()))?;
-    let config = repo.config()?;
+    let work_tree = repo.work_tree().ok_or_else(|| {
+        Error::Worktree(WorktreeError::Path {
+            detail: "cannot update a bare repository's working tree".into(),
+        })
+    })?;
+    let config = repo.config().snapshot()?;
     let protect = ProtectOptions::from_config(config.as_ref());
-    let ignorecase = config
-        .get_bool("core.ignorecase")
-        .and_then(|r| r.ok())
-        .unwrap_or(false);
+    let ignorecase = config.ignore_case();
     let precompose = repo.pathspec_precompose_enabled();
 
     let rules = Rc::new(
@@ -729,7 +751,7 @@ fn checkout_populated_tree_journaled(
                 prospective.add_or_replace(entry);
             }
             prospective.sort();
-            WorktreeRules::from_checkout_prospective_index(repo, &prospective, config.clone())?
+            WorktreeRules::from_checkout_prospective_index(repo, &prospective)?
         } else {
             checkout_worktree_rules(repo, index_mut, &[], config.clone())?
         },
@@ -821,7 +843,7 @@ pub(crate) fn checkout_between_trees_locked(
     index: Option<&mut Index>,
     index_write: CheckoutIndexWrite<'_>,
     progress: &mut dyn ProgressSink,
-    cancel: &dyn Cancel,
+    cancel: &CancelToken,
 ) -> Result<()> {
     let changes = diff_trees(repo.odb(), Some(from), Some(to), "")?;
     let apply = CheckoutApplyOptions {
@@ -859,12 +881,18 @@ pub(crate) fn checkout_between_trees_locked(
 ///
 /// Returns [`Error::LockHeld`] without touching the work tree or index when another process
 /// holds `index.lock`, and propagates object, checkout I/O and index write failures.
-pub fn checkout_between_trees(
+pub(crate) fn checkout_between_trees(
     repo: &Repository,
     from: Option<&ObjectId>,
     to: &ObjectId,
 ) -> Result<()> {
-    checkout_between_trees_with_progress(repo, from, to, &mut NullProgress, &NeverCancel)?;
+    checkout_between_trees_with_progress(
+        repo,
+        from,
+        to,
+        &mut NullProgress,
+        CancelToken::never_ref(),
+    )?;
     Ok(())
 }
 
@@ -881,14 +909,14 @@ pub fn checkout_between_trees(
 /// # Errors
 ///
 /// Same as [`checkout_between_trees`], plus [`Error::Cancelled`] when `cancel` or `progress`
-/// asked to stop, and [`Error::CheckoutRollbackIncomplete`] (wrapping the cause) when some
+/// asked to stop, and [`crate::worktree::WorktreeError::CheckoutRollbackIncomplete`] (wrapping the cause) when some
 /// paths could not be put back.
-pub fn checkout_between_trees_with_progress(
+pub(crate) fn checkout_between_trees_with_progress(
     repo: &Repository,
     from: Option<&ObjectId>,
     to: &ObjectId,
     progress: &mut dyn ProgressSink,
-    cancel: &dyn Cancel,
+    cancel: &CancelToken,
 ) -> Result<CheckoutOutcome> {
     let Some(from) = from else {
         return checkout_populated_tree(repo, to, progress, cancel);
@@ -915,8 +943,9 @@ pub fn checkout_between_trees_with_progress(
 /// rewritten. Missing promised blobs needed for writes and verification (including
 /// attribute dependencies) are fetched together before content reads. Sparse-excluded
 /// paths and gitlinks do not request blob content; lazy-fetch opt-outs still apply.
-/// Tracked paths absent from `target_tree` are removed and the index is
-/// rebuilt without unmerged stages.
+/// Tracked paths absent from `target_tree` are removed, worktree files that
+/// existed only for unmerged index entries absent from `target_tree` are
+/// removed as well, and the index is rebuilt without unmerged stages.
 ///
 /// `index.lock` is taken before the index is read and held until the rebuilt index
 /// replaces it, so no file is touched when the lock is unavailable.
@@ -930,17 +959,19 @@ pub fn checkout_between_trees_with_progress(
 /// Returns [`Error::LockHeld`] without touching the work tree or index when another process
 /// holds `index.lock`, and an error when the repository has no work tree, required promised
 /// objects cannot be fetched, or checkout I/O fails; [`Error::Cancelled`] when `cancel`
-/// fires; and [`Error::CheckoutRollbackIncomplete`] when some paths could not be put back.
-pub fn checkout_hard_to_tree_from_head_tree(
+/// fires; and [`crate::worktree::WorktreeError::CheckoutRollbackIncomplete`] when some paths could not be put back.
+pub(crate) fn checkout_hard_to_tree_from_head_tree(
     repo: &Repository,
     head_tree: &ObjectId,
     target_tree: &ObjectId,
     progress: &mut dyn ProgressSink,
-    cancel: &dyn Cancel,
+    cancel: &CancelToken,
 ) -> Result<()> {
-    let work_tree = repo
-        .work_tree()
-        .ok_or_else(|| Error::PathError("cannot update a bare repository's working tree".into()))?;
+    let work_tree = repo.work_tree().ok_or_else(|| {
+        Error::Worktree(WorktreeError::Path {
+            detail: "cannot update a bare repository's working tree".into(),
+        })
+    })?;
     let mut lock = repo.lock_index()?;
     let mut journal = CheckoutJournal::new(work_tree)?;
     let result = checkout_hard_to_tree_journaled(
@@ -963,69 +994,166 @@ fn checkout_hard_to_tree_journaled(
     head_tree: &ObjectId,
     target_tree: &ObjectId,
     progress: &mut dyn ProgressSink,
-    cancel: &dyn Cancel,
+    cancel: &CancelToken,
     lock: &mut IndexLock,
     journal: &mut CheckoutJournal,
 ) -> Result<()> {
-    let mut index =
-        crate::porcelain::index_from_tree::load_index_for_hard_reset(repo, target_tree)?;
+    let mut index = repo.load_index_preserving_sparse()?;
+    let skip_worktree_snapshot: BTreeMap<Vec<u8>, ObjectId> = index
+        .entries
+        .iter()
+        .filter(|entry| entry.stage() == 0 && entry.skip_worktree())
+        .map(|entry| (entry.path.clone(), entry.oid))
+        .collect();
+    let assume_unchanged_snapshot = hard_reset_assume_unchanged_snapshot(&index);
+    let pre_reset_index_mtime = crate::diff::index_mtime_for_diff(&index, None);
+    let config = repo.config().snapshot()?;
+    let index_sparse = config.bool_with_default("index.sparse", false);
+    let sparse = SparseCheckout::load(repo)?;
     let trees_differ = head_tree != target_tree;
     // Sparse-directory rows left by the load already record the target subtree.
     let changes = if trees_differ {
-        crate::diff::diff_trees_outside_sparse_directories(
+        crate::diff::diff_trees_coalesced_for_checkout(
             repo.odb(),
             &index,
             Some(head_tree),
             Some(target_tree),
+            sparse.as_ref(),
+            index_sparse,
         )?
     } else {
         Vec::new()
     };
+    let tree_diff_touched = CoalescedSubtreeDiffPaths::from_changes(&changes);
+    let unstaged_tree_stable_paths = if trees_differ && !index.has_sparse_directory_placeholders() {
+        hard_reset_unstaged_tree_stable_paths(
+            repo,
+            work_tree,
+            &mut index,
+            pre_reset_index_mtime,
+            &tree_diff_touched,
+            config.as_ref(),
+        )?
+    } else {
+        BTreeSet::new()
+    };
+    crate::porcelain::index_from_tree::prepare_index_for_hard_reset(repo, target_tree, &mut index)?;
     crate::porcelain::index_from_tree::expand_sparse_for_tree_changes(repo, &mut index, &changes)?;
-    // Raciness is judged against the index as it was before the reset: the tree-diff checkout
-    // below rewrites the index, which would make racily clean entries look settled.
-    let pre_reset_index_mtime = crate::diff::index_mtime_for_diff(&index, None);
     let tree_deleted: HashSet<Vec<u8>> = changes
         .iter()
         .filter(|change| change.status == DiffStatus::Deleted)
+        .filter(|change| !crate::index::is_tree_mode(change.old_mode.bits()))
         .filter_map(|change| change.old_path.as_deref())
         .map(checkout_stored_index_path_bytes)
         .collect();
+    let tree_deleted_prefixes = tree_diff_touched.deleted_prefixes.clone();
+    let unmerged_paths: BTreeSet<Vec<u8>> = index
+        .entries
+        .iter()
+        .filter(|entry| entry.stage() > 0)
+        .map(|entry| entry.path.clone())
+        .collect();
     hard_reset_drop_unmerged_and_intent(&mut index);
+    let stat_policy = crate::index::StatMatchPolicy::from_config(Some(config.as_ref()));
+    let trust_filemode = config.file_mode();
+    let stat_check = HardResetStatCheck {
+        policy: stat_policy,
+        trust_filemode,
+        index_mtime: pre_reset_index_mtime,
+    };
+    let mut tree_diff_unrecorded: Option<Vec<String>> = None;
+    if trees_differ && !changes.is_empty() {
+        tree_diff_unrecorded = Some(hard_reset_unrecorded_tree_diff_paths(
+            repo,
+            work_tree,
+            &index,
+            &config,
+            &changes,
+            sparse.as_ref(),
+            stat_check,
+        )?);
+    }
     let mut deleted_abs_paths = Vec::new();
     let mut staged_index_changes: Vec<DiffEntry> = Vec::new();
+    let mut index_only_removed_paths: HashSet<Vec<u8>> = HashSet::new();
+    let mut index_align_touched: BTreeSet<Vec<u8>> = BTreeSet::new();
     if trees_differ || !index_hard_reset_cache_matches_tree(&index, target_tree) {
-        let align_plan = crate::diff::plan_hard_reset_index_align(repo.odb(), &index, target_tree)?;
+        let align_plan = crate::diff::plan_hard_reset_index_align(
+            repo.odb(),
+            &index,
+            target_tree,
+            sparse.as_ref(),
+            index_sparse,
+        )?;
+        for path in &align_plan.remove_paths {
+            index_align_touched.insert(path.clone());
+        }
+        for (path, _, _) in &align_plan.updates {
+            index_align_touched.insert(path.clone());
+        }
+        for entry in &align_plan.insert_entries {
+            index_align_touched.insert(entry.path.clone());
+        }
         if !trees_differ {
             staged_index_changes = hard_reset_align_plan_diff_entries(&index, &align_plan);
         }
         let index_only_removals: Vec<(Vec<u8>, u32)> = align_plan
             .remove_paths
             .iter()
-            .filter(|path| !tree_deleted.contains(*path))
+            .filter(|path| {
+                !tree_deleted.contains(*path)
+                    && !CoalescedSubtreeDiffPaths::path_under_any_prefix(
+                        path,
+                        &tree_deleted_prefixes,
+                    )
+            })
             .filter_map(|path| index.get(path, 0).map(|entry| (path.clone(), entry.mode)))
             .collect();
+        index_only_removed_paths = index_only_removals
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect();
         crate::diff::apply_hard_reset_index_plan(&mut index, align_plan);
+        if !skip_worktree_snapshot.is_empty() {
+            hard_reset_abort_if_skip_worktree_dirty(
+                repo,
+                work_tree,
+                &skip_worktree_snapshot,
+                &index,
+                sparse.as_ref(),
+                &config,
+            )?;
+        }
         deleted_abs_paths =
             hard_reset_journal_index_only_removals(work_tree, &index_only_removals, journal)?;
     }
+    let sparse = SparseCheckout::load(repo)?;
+    deleted_abs_paths.extend(hard_reset_journal_conflict_only_unmerged_paths(
+        work_tree,
+        &unmerged_paths,
+        &index,
+        &tree_deleted,
+        &index_only_removed_paths,
+        sparse.as_ref(),
+        journal,
+    )?);
 
     let mut written_by_tree_diff: BTreeSet<Vec<u8>> = BTreeSet::new();
+    let written_tree_prefixes = tree_diff_touched.added_prefixes.clone();
     for change in &changes {
         if change.status == DiffStatus::Deleted {
+            continue;
+        }
+        if crate::index::is_tree_mode(change.new_mode.bits()) {
             continue;
         }
         if let Some(path) = &change.new_path {
             written_by_tree_diff.insert(crate::repo_relpath::storage_bytes(path).into_owned());
         }
     }
-    let config = repo.config()?;
     let sparse = SparseCheckout::load(repo)?;
     let stat_policy = crate::index::StatMatchPolicy::from_config(Some(config.as_ref()));
-    let trust_filemode = config
-        .get_bool("core.filemode")
-        .and_then(|r| r.ok())
-        .unwrap_or(true);
+    let trust_filemode = config.file_mode();
     // Hard reset reapplies the sparse definition. Tracked files that caused skip-worktree
     // to be cleared are removed again; paths still marked skip-worktree (including the
     // expectFilesOutsideOfPatterns opt-out) and untracked files are left alone. Only retain
@@ -1047,6 +1175,7 @@ fn checkout_hard_to_tree_journaled(
     let hard_reset_checkout_apply = CheckoutApplyOptions {
         parallel_prepare_blobs: false,
         checkout_parallel_threshold: None,
+        checkout_result_tree: Some(*target_tree),
         ..CheckoutApplyOptions::default()
     };
     if trees_differ && !changes.is_empty() {
@@ -1057,11 +1186,9 @@ fn checkout_hard_to_tree_journaled(
             cancel,
             &mut index,
             &changes,
-            sparse.as_ref(),
-            HardResetStatCheck {
-                policy: stat_policy,
-                trust_filemode,
-                index_mtime: pre_reset_index_mtime,
+            match tree_diff_unrecorded.take() {
+                Some(paths) => UnrecordedPaths::Known(paths),
+                None => UnrecordedPaths::Compute(sparse.as_ref(), stat_check),
             },
             hard_reset_checkout_apply.clone(),
             lock,
@@ -1076,12 +1203,7 @@ fn checkout_hard_to_tree_journaled(
             cancel,
             &mut index,
             &staged_index_changes,
-            sparse.as_ref(),
-            HardResetStatCheck {
-                policy: stat_policy,
-                trust_filemode,
-                index_mtime: pre_reset_index_mtime,
-            },
+            UnrecordedPaths::Compute(sparse.as_ref(), stat_check),
             hard_reset_checkout_apply,
             lock,
             journal,
@@ -1096,11 +1218,59 @@ fn checkout_hard_to_tree_journaled(
         }
     }
 
+    let skip_post_tree_diff_pass = trees_differ
+        && hard_reset_tree_diff_filled_all_entries(
+            &index,
+            &written_by_tree_diff,
+            &written_tree_prefixes,
+            sparse.as_ref(),
+        );
+    if skip_post_tree_diff_pass {
+        let mut sparse_parent_symlinks = crate::diff::SymlinkDirCache::default();
+        for (path, mode) in sparse_removals {
+            crate::progress::poll_cancel(progress, cancel)?;
+            if sparse_parent_symlinks.has_symlink_in_path_bytes(work_tree, &path, false, false) {
+                continue;
+            }
+            let rel = crate::repo_relpath::storage_string(&path);
+            let abs = if mode == MODE_GITLINK {
+                journal.remove_uninitialized_gitlink(&rel)
+            } else {
+                journal.spool_remove(&rel)?;
+                crate::index::worktree_path_from_index_rel(work_tree, &path)
+            };
+            remove_empty_parent_dirs_batch(work_tree, &[abs]);
+        }
+        index.source_mtime = pre_reset_index_mtime;
+        remove_empty_parent_dirs_batch(work_tree, &deleted_abs_paths);
+        progress.finish();
+        index.sort();
+        index.sparse_directories = index.has_sparse_directory_placeholders();
+        hard_reset_finish_cache_tree(repo, &mut index, target_tree);
+        if let Ok(config) = repo.config().snapshot() {
+            let _ = crate::path_icase::smudge_ignorecase_collision_stat_mismatches(
+                repo.odb(),
+                work_tree,
+                &mut index,
+                config.as_ref(),
+                None,
+            );
+        }
+        hard_reset_apply_skip_worktree_snapshot(&mut index, &skip_worktree_snapshot);
+        hard_reset_apply_assume_unchanged_snapshot(&mut index, &assume_unchanged_snapshot);
+        let mtime_hint = Some(crate::index::stage0_mtime_max(&index.entries));
+        crate::progress::poll_cancel(progress, cancel)?;
+        write_checkout_index(repo, &mut index, lock, true, mtime_hint, journal)?;
+        return Ok(());
+    }
+
     let plan_positions = hard_reset_stage0_entry_positions(&index);
     let stat_positions = hard_reset_stat_probe_positions(
         &index,
         trees_differ,
         &written_by_tree_diff,
+        &written_tree_prefixes,
+        &tree_diff_touched,
         sparse.as_ref(),
     );
     let worktree_stats = scan_index_blob_stats_for_hard_reset(
@@ -1115,6 +1285,28 @@ fn checkout_hard_to_tree_journaled(
         .map(|&pos| {
             let path = &index.entries[pos].path;
             let te = &index.entries[pos];
+            if let Some(&before_oid) = skip_worktree_snapshot.get(path.as_slice()) {
+                if sparse
+                    .as_ref()
+                    .is_some_and(|sparse| !sparse.includes_index_path(path))
+                {
+                    return HardResetEntryAction::SkipWorktree;
+                }
+                if !trees_differ {
+                    return HardResetEntryAction::SkipWorktree;
+                }
+                let after_oid = index.get(path.as_slice(), 0).map(|entry| entry.oid);
+                if after_oid == Some(before_oid)
+                    && !tree_diff_touched.contains_path(path)
+                    && !index_align_touched.contains(path)
+                {
+                    return HardResetEntryAction::SkipWorktree;
+                }
+                if after_oid != Some(before_oid) {
+                    return HardResetEntryAction::Write;
+                }
+                return HardResetEntryAction::SkipWorktree;
+            }
             if sparse
                 .as_ref()
                 .is_some_and(|sparse| !sparse.includes_index_path(path))
@@ -1124,11 +1316,26 @@ fn checkout_hard_to_tree_journaled(
             if te.mode == MODE_GITLINK {
                 return HardResetEntryAction::Gitlink;
             }
-            if trees_differ && written_by_tree_diff.contains(path) {
+            if trees_differ
+                && (written_by_tree_diff.contains(path)
+                    || CoalescedSubtreeDiffPaths::path_under_any_prefix(
+                        path,
+                        &written_tree_prefixes,
+                    ))
+            {
                 return HardResetEntryAction::Written(None);
             }
+            if trees_differ && !tree_diff_touched.contains_path(path) {
+                if unstaged_tree_stable_paths.contains(path) || index_align_touched.contains(path) {
+                    return HardResetEntryAction::Write;
+                }
+                return HardResetEntryAction::Keep;
+            }
             let existing = &index.entries[pos];
-            match worktree_stats.get(&pos).copied() {
+            match worktree_stats.get(pos) {
+                Some(stat) if hard_reset_entry_size_changed(existing, &stat) => {
+                    HardResetEntryAction::Write
+                }
                 Some(stat)
                     if hard_reset_entry_stat_clean(
                         existing,
@@ -1138,8 +1345,10 @@ fn checkout_hard_to_tree_journaled(
                         pre_reset_index_mtime,
                     ) =>
                 {
-                    if trees_differ {
+                    if trees_differ && !index_align_touched.contains(path) {
                         HardResetEntryAction::Keep
+                    } else if trees_differ {
+                        HardResetEntryAction::Verify
                     } else if crate::diff::entry_is_racy_with_policy(
                         existing,
                         pre_reset_index_mtime,
@@ -1207,18 +1416,13 @@ fn checkout_hard_to_tree_journaled(
     let mut delayed = DelayedProcessCheckout::default();
     let mut pending_delayed: Vec<DelayedCheckoutTarget> = Vec::new();
     let mut delayed_entries: Vec<IndexEntry> = Vec::new();
-    let protect = ProtectOptions::from_config(config.as_ref());
-    let mut dir_cache = LeadingDirCache::with_protect(protect);
+    let mut dir_cache = LeadingDirCache::for_config(config.as_ref());
 
     if trees_differ {
         for (&pos, action) in plan_positions.iter().zip(&mut actions) {
-            let path = &index.entries[pos].path;
             match action {
                 HardResetEntryAction::Keep | HardResetEntryAction::Written(_) => {
-                    let resolved = index.find_entry_pos(path, 0).filter(|&p| {
-                        let existing = &index.entries[p];
-                        !existing.stat_cache_unset()
-                    });
+                    let resolved = Some(pos).filter(|&p| !index.entries[p].stat_cache_unset());
                     *action = if matches!(action, HardResetEntryAction::Written(_)) {
                         HardResetEntryAction::Written(resolved)
                     } else if resolved.is_some() {
@@ -1234,7 +1438,7 @@ fn checkout_hard_to_tree_journaled(
     let mut rules = actions
         .iter()
         .any(|action| matches!(action, HardResetEntryAction::Verify))
-        .then(|| WorktreeRules::from_parts(repo, &index, config.clone()))
+        .then(|| WorktreeRules::from_parts_with_config(repo, &index, config.clone()))
         .transpose()?;
     if let Some(rules) = &rules {
         verify_hard_reset_candidates(
@@ -1253,7 +1457,9 @@ fn checkout_hard_to_tree_journaled(
     );
     for (pos, action) in plan_positions.into_iter().zip(actions) {
         crate::progress::poll_cancel(progress, cancel)?;
-        let path = &index.entries[pos].path;
+        let path_bytes = index.entries[pos].path.clone();
+        let preserve_skip = skip_worktree_snapshot.contains_key(path_bytes.as_slice());
+        let path = &path_bytes;
         let (oid, mode) = {
             let entry = &index.entries[pos];
             (entry.oid, entry.mode)
@@ -1266,16 +1472,23 @@ fn checkout_hard_to_tree_journaled(
                 continue;
             }
             HardResetEntryAction::Keep => {
-                index.entries[pos] = index_entry_with_recorded_stat(&index.entries[pos]);
+                index.entries[pos] = hard_reset_keep_index_row(
+                    &index.entries[pos],
+                    skip_worktree_snapshot.contains_key(path),
+                );
                 continue;
             }
             HardResetEntryAction::Written(Some(keep_pos)) => {
-                index.entries[keep_pos] = index_entry_with_recorded_stat(&index.entries[keep_pos]);
+                let keep_path = index.entries[keep_pos].path.clone();
+                index.entries[keep_pos] = hard_reset_keep_index_row(
+                    &index.entries[keep_pos],
+                    skip_worktree_snapshot.contains_key(keep_path.as_slice()),
+                );
                 continue;
             }
             HardResetEntryAction::Written(None) | HardResetEntryAction::VerifiedUpToDate => {
                 let meta = fs::symlink_metadata(&abs).map_err(Error::Io)?;
-                index.entries[pos] = entry_from_metadata(&meta, path.as_slice(), oid, mode);
+                index.entries[pos] = checked_out_entry(&meta, path.as_slice(), oid, mode, None);
                 continue;
             }
             HardResetEntryAction::Gitlink
@@ -1312,7 +1525,11 @@ fn checkout_hard_to_tree_journaled(
 
         let rules = match &mut rules {
             Some(rules) => rules,
-            empty => empty.insert(WorktreeRules::from_parts(repo, &index, config.clone())?),
+            empty => empty.insert(WorktreeRules::from_parts_with_config(
+                repo,
+                &index,
+                config.clone(),
+            )?),
         };
         let rel = crate::repo_relpath::storage_string(path);
         journal.preserve_before_write(&rel)?;
@@ -1326,8 +1543,17 @@ fn checkout_hard_to_tree_journaled(
             true,
         )?
         else {
-            index.entries[pos] =
-                stream_checkout_entry(repo, work_tree, &rel, mode, &change, &mut dir_cache, oid)?;
+            index.entries[pos] = stream_checkout_entry(
+                repo,
+                work_tree,
+                &rel,
+                mode,
+                &change,
+                &mut dir_cache,
+                oid,
+                rules.conversion(),
+                &rules.file_attrs(&rel, false),
+            )?;
             continue;
         };
         let worktree_bytes = worktree_bytes_from_index_blob(
@@ -1358,6 +1584,9 @@ fn checkout_hard_to_tree_journaled(
             &mut dir_cache,
             oid,
         )?;
+        if preserve_skip {
+            index.entries[pos].set_skip_worktree(true);
+        }
         progress.inc(1);
     }
 
@@ -1384,7 +1613,7 @@ fn checkout_hard_to_tree_journaled(
     index.sort();
     index.sparse_directories = index.has_sparse_directory_placeholders();
     hard_reset_finish_cache_tree(repo, &mut index, target_tree);
-    if let Ok(config) = repo.config() {
+    if let Ok(config) = repo.config().snapshot() {
         let _ = crate::path_icase::smudge_ignorecase_collision_stat_mismatches(
             repo.odb(),
             work_tree,
@@ -1393,6 +1622,8 @@ fn checkout_hard_to_tree_journaled(
             None,
         );
     }
+    hard_reset_apply_skip_worktree_snapshot(&mut index, &skip_worktree_snapshot);
+    hard_reset_apply_assume_unchanged_snapshot(&mut index, &assume_unchanged_snapshot);
     let mtime_hint = Some(crate::index::stage0_mtime_max(&index.entries));
     crate::progress::poll_cancel(progress, cancel)?;
     if trees_differ && !written_by_tree_diff.is_empty() {
@@ -1436,7 +1667,7 @@ pub(crate) fn checkout_diff_align_index_to_tree(
     index: &Index,
     target_tree: &ObjectId,
 ) -> Result<Vec<DiffEntry>> {
-    let plan = crate::diff::plan_hard_reset_index_align(odb, index, target_tree)?;
+    let plan = crate::diff::plan_hard_reset_index_align(odb, index, target_tree, None, false)?;
     Ok(hard_reset_align_plan_diff_entries(index, &plan))
 }
 
@@ -1502,34 +1733,56 @@ fn hard_reset_align_plan_diff_entries(
     changes
 }
 
+/// Untracked paths a hard-reset tree-diff checkout must not overwrite.
+enum UnrecordedPaths<'a> {
+    /// Already computed against the pre-reset index.
+    Known(Vec<String>),
+    /// Compute them from the current index with these sparse rules and stat policy.
+    Compute(Option<&'a SparseCheckout>, HardResetStatCheck),
+}
+
 #[allow(clippy::too_many_arguments)]
 fn hard_reset_apply_tree_diff_checkout(
     repo: &Repository,
     work_tree: &Path,
     progress: &mut dyn ProgressSink,
-    cancel: &dyn Cancel,
+    cancel: &CancelToken,
     index: &mut Index,
     changes: &[DiffEntry],
-    sparse: Option<&SparseCheckout>,
-    stat_check: HardResetStatCheck,
+    unrecorded: UnrecordedPaths<'_>,
     apply: CheckoutApplyOptions,
     lock: &mut IndexLock,
     journal: &mut CheckoutJournal,
 ) -> Result<()> {
-    for rel in hard_reset_unrecorded_tree_diff_paths(
-        repo,
-        work_tree,
-        index,
-        &repo.config()?,
-        changes,
-        sparse,
-        stat_check,
-    )? {
+    let unrecorded = match unrecorded {
+        UnrecordedPaths::Known(paths) => paths,
+        UnrecordedPaths::Compute(sparse, stat_check) => hard_reset_unrecorded_tree_diff_paths(
+            repo,
+            work_tree,
+            index,
+            &repo.config().snapshot()?,
+            changes,
+            sparse,
+            stat_check,
+        )?,
+    };
+    for rel in unrecorded {
         journal.spool_remove(&rel)?;
     }
+    let leaf_changes = checkout_coalesced_subtree_changes(
+        repo,
+        work_tree,
+        changes,
+        progress,
+        cancel,
+        index,
+        apply.clone(),
+        CheckoutIndexWrite::Defer(lock),
+        journal,
+    )?;
     apply_tree_changes_in_chunks(
         repo,
-        changes,
+        &leaf_changes,
         progress,
         cancel,
         index,
@@ -1540,11 +1793,107 @@ fn hard_reset_apply_tree_diff_checkout(
     )
 }
 
+/// True when bulk tree-diff checkout updated every dense stage-0 row and recorded stat data.
+fn hard_reset_tree_diff_filled_all_entries(
+    index: &Index,
+    written_by_tree_diff: &BTreeSet<Vec<u8>>,
+    written_tree_prefixes: &[Vec<u8>],
+    sparse: Option<&SparseCheckout>,
+) -> bool {
+    if written_by_tree_diff.is_empty() && written_tree_prefixes.is_empty() {
+        return false;
+    }
+    index.entries.iter().all(|entry| {
+        if entry.stage() != 0 || entry.intent_to_add() {
+            return true;
+        }
+        if entry.is_sparse_directory_placeholder() || entry.skip_worktree() {
+            return true;
+        }
+        if entry.mode == MODE_GITLINK {
+            return true;
+        }
+        if sparse.is_some_and(|sparse| !sparse.includes_index_path(&entry.path)) {
+            return true;
+        }
+        (written_by_tree_diff.contains(&entry.path)
+            || CoalescedSubtreeDiffPaths::path_under_any_prefix(&entry.path, written_tree_prefixes))
+            && !entry.stat_cache_unset()
+    })
+}
+
+/// Dirty tracked paths among tree-stable rows, using one restricted index-to-worktree diff.
+fn hard_reset_unstaged_tree_stable_paths(
+    repo: &Repository,
+    work_tree: &Path,
+    index: &mut Index,
+    index_mtime: Option<(u32, u32)>,
+    tree_diff_touched: &CoalescedSubtreeDiffPaths,
+    config: &ConfigSet,
+) -> Result<BTreeSet<Vec<u8>>> {
+    let stable_count = index
+        .entries
+        .iter()
+        .filter(|e| e.stage() == 0 && !tree_diff_touched.contains_path(&e.path))
+        .count();
+    if stable_count == 0 {
+        return Ok(BTreeSet::new());
+    }
+    let tree_diff = Arc::new(tree_diff_touched.clone());
+    let skip = {
+        let tree_diff = Arc::clone(&tree_diff);
+        Arc::new(move |path: &[u8]| tree_diff.contains_path(path))
+            as crate::diff::IndexPathSkipPredicate
+    };
+    let (entries, _) = crate::diff::diff_index_to_worktree_with_options(
+        repo.odb(),
+        index,
+        work_tree,
+        crate::diff::DiffIndexToWorktreeOptions {
+            index_mtime,
+            for_status: true,
+            refresh_index_stat_in_pass: false,
+            refresh_fsmonitor: false,
+            repository_git_dir: Some(repo.git_dir().to_path_buf()),
+            config: Some(Arc::new(config.clone())),
+            skip_index_path: Some(skip),
+            stat_parallel_threads: hard_reset_stat_parallel_threads(repo, config, stable_count),
+            thread_policy: Some(repo.thread_policy()),
+            simplify_gitlinks: true,
+            ignore_submodule_untracked: true,
+            ..crate::diff::DiffIndexToWorktreeOptions::default()
+        },
+    )?;
+    Ok(entries
+        .into_iter()
+        .filter_map(|entry| entry.old_path)
+        .map(|path| crate::repo_relpath::storage_bytes(&path).into_owned())
+        .collect())
+}
+
+fn hard_reset_stat_parallel_threads(
+    repo: &Repository,
+    config: &ConfigSet,
+    path_count: usize,
+) -> Option<usize> {
+    if path_count < 32 {
+        return None;
+    }
+    Some(
+        repo.thread_policy()
+            .resolve(ParallelOp::IndexRefresh, config)
+            .threads
+            .get(),
+    )
+}
+
 /// Index positions that need a worktree stat before hard reset can choose keep vs verify.
 fn hard_reset_stat_probe_positions(
     index: &Index,
     trees_differ: bool,
     written_by_tree_diff: &BTreeSet<Vec<u8>>,
+    written_tree_prefixes: &[Vec<u8>],
+    tree_diff_touched: &CoalescedSubtreeDiffPaths,
     sparse: Option<&SparseCheckout>,
 ) -> Vec<usize> {
     let mut positions = Vec::new();
@@ -1560,7 +1909,16 @@ fn hard_reset_stat_probe_positions(
         if entry.mode == MODE_GITLINK {
             continue;
         }
-        if trees_differ && written_by_tree_diff.contains(&entry.path) {
+        if trees_differ
+            && (written_by_tree_diff.contains(&entry.path)
+                || CoalescedSubtreeDiffPaths::path_under_any_prefix(
+                    &entry.path,
+                    written_tree_prefixes,
+                ))
+        {
+            continue;
+        }
+        if trees_differ && !tree_diff_touched.contains_path(&entry.path) {
             continue;
         }
         positions.push(pos);
@@ -1568,57 +1926,75 @@ fn hard_reset_stat_probe_positions(
     positions
 }
 
-/// Stat pass for hard reset: one worker and no index preload to keep peak RSS down on wide trees.
+/// Stat pass for hard reset: parallel workers (same policy as index refresh) without preloading
+/// the index into memory, so peak RSS stays near switch on wide trees.
+///
+/// Paths are joined to the work tree verbatim, so on Linux files are stat-ed relative to a
+/// handle on their directory instead of walking the full absolute path once per file.
 fn scan_index_blob_stats_for_hard_reset(
     repo: &Repository,
     work_tree: &Path,
     index: &Index,
     config: &ConfigSet,
     positions: &[usize],
-) -> Result<HashMap<usize, crate::worktree_scan::BlobDiskStat>> {
+) -> Result<HardResetWorktreeStats> {
     use crate::worktree_scan::{
-        collect_blob_lookup_batches, plan_blob_entries_by_dir_for_positions, BlobDiskLookup,
-        BlobScanSparseMode, WorktreeBlobScanOptions,
+        collect_blob_lookup_batches_with_literal_paths, plan_blob_entries_by_dir_for_positions,
+        BlobDiskLookup, BlobScanSparseMode, WorktreeBlobScanOptions,
     };
 
-    let mut stats = HashMap::new();
     if positions.is_empty() {
-        return Ok(stats);
+        return Ok(HardResetWorktreeStats::default());
     }
     let plan = plan_blob_entries_by_dir_for_positions(index, positions, false);
     if plan.is_empty() {
-        return Ok(stats);
+        return Ok(HardResetWorktreeStats::default());
     }
-    let stat_workers = repo
-        .thread_policy()
-        .resolve(ParallelOp::IndexRefresh, config)
-        .threads
-        .get();
     let dir_root = work_tree.to_path_buf();
     let file_root = work_tree.to_path_buf();
-    let batches = collect_blob_lookup_batches(
+    let batches = collect_blob_lookup_batches_with_literal_paths(
         index,
         &plan,
         WorktreeBlobScanOptions {
             preload_index: false,
-            stat_parallel_threads: Some(stat_workers),
+            stat_parallel_threads: hard_reset_stat_parallel_threads(repo, config, positions.len()),
+            parallel_stat_without_preload: true,
+            ..WorktreeBlobScanOptions::default()
         },
         &repo.thread_policy(),
         config,
         move |dir: &[u8]| crate::index::worktree_path_from_index_rel(&dir_root, dir),
         move |rel: &[u8]| crate::index::worktree_path_from_index_rel(&file_root, rel),
+        true,
         crate::worktree_scan::no_symlink_probe,
         BlobScanSparseMode::Dense,
+        None,
+        None,
     )?;
-    for (plan_index, lookup) in batches.into_iter().flatten() {
-        let Some(&orig) = plan.indices.get(plan_index) else {
-            continue;
-        };
-        if let BlobDiskLookup::Present(stat) = lookup {
-            stats.insert(orig, stat);
-        }
+    let mut stats: Vec<_> = batches
+        .into_iter()
+        .flatten()
+        .filter_map(|(entry_index, lookup)| match lookup {
+            BlobDiskLookup::Present(stat) => Some((entry_index, stat)),
+            _ => None,
+        })
+        .collect();
+    stats.sort_unstable_by_key(|&(pos, _)| pos);
+    Ok(HardResetWorktreeStats(stats))
+}
+
+/// Work-tree stats from [`scan_index_blob_stats_for_hard_reset`], sorted by index position.
+#[derive(Default)]
+struct HardResetWorktreeStats(Vec<(usize, crate::worktree_scan::BlobDiskStat)>);
+
+impl HardResetWorktreeStats {
+    /// The stat for index position `pos`, or `None` when the path was missing on disk.
+    fn get(&self, pos: usize) -> Option<crate::worktree_scan::BlobDiskStat> {
+        self.0
+            .binary_search_by_key(&pos, |&(p, _)| p)
+            .ok()
+            .map(|i| self.0[i].1)
     }
-    Ok(stats)
 }
 
 fn hard_reset_journal_index_only_removals(
@@ -1653,10 +2029,161 @@ fn hard_reset_drop_unmerged_and_intent(index: &mut Index) {
     }
 }
 
+/// Remove worktree files that existed only for unmerged index rows dropped by
+/// [`hard_reset_drop_unmerged_and_intent`] and are absent from the hard-reset target.
+fn hard_reset_journal_conflict_only_unmerged_paths(
+    work_tree: &Path,
+    unmerged_paths: &BTreeSet<Vec<u8>>,
+    index: &Index,
+    tree_deleted: &HashSet<Vec<u8>>,
+    index_only_removed: &HashSet<Vec<u8>>,
+    sparse: Option<&SparseCheckout>,
+    journal: &mut CheckoutJournal,
+) -> Result<Vec<PathBuf>> {
+    let mut removed = Vec::new();
+    let mut parent_symlinks = crate::diff::SymlinkDirCache::default();
+    for path in unmerged_paths {
+        if tree_deleted.contains(path) || index_only_removed.contains(path) {
+            continue;
+        }
+        if index.get(path, 0).is_some() {
+            continue;
+        }
+        if sparse.is_some_and(|sparse| !sparse.includes_index_path(path)) {
+            continue;
+        }
+        if parent_symlinks.has_symlink_in_path_bytes(work_tree, path, false, false) {
+            continue;
+        }
+        let abs = crate::index::worktree_path_from_index_rel(work_tree, path);
+        let meta = match fs::symlink_metadata(&abs) {
+            Ok(meta) => meta,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(Error::Io(err)),
+        };
+        if meta.is_dir() {
+            continue;
+        }
+        let rel = crate::repo_relpath::storage_string(path);
+        journal.spool_remove(&rel)?;
+        removed.push(abs);
+    }
+    Ok(removed)
+}
+
 fn hard_reset_normalize_index_row(entry: &mut IndexEntry) {
     entry.flags = entry.path.len().min(0xFFF) as u16;
     entry.flags_extended = None;
     entry.base_index_pos = 0;
+}
+
+/// Reapply skip-worktree for paths that had the bit before hard reset began.
+fn hard_reset_apply_skip_worktree_snapshot(
+    index: &mut Index,
+    snapshot: &BTreeMap<Vec<u8>, ObjectId>,
+) {
+    if snapshot.is_empty() {
+        return;
+    }
+    for entry in index.entries.iter_mut().filter(|e| e.stage() == 0) {
+        if snapshot.contains_key(entry.path.as_slice()) {
+            entry.set_skip_worktree(true);
+        }
+    }
+}
+
+type AssumeUnchangedSnapshot = BTreeMap<Vec<u8>, (ObjectId, u32)>;
+
+fn hard_reset_assume_unchanged_snapshot(index: &Index) -> AssumeUnchangedSnapshot {
+    index
+        .entries
+        .iter()
+        .filter(|entry| entry.stage() == 0 && entry.assume_unchanged())
+        .map(|entry| (entry.path.clone(), (entry.oid, entry.mode)))
+        .collect()
+}
+
+/// Reapply assume-unchanged when the stage-0 row still has the same blob and mode.
+fn hard_reset_apply_assume_unchanged_snapshot(
+    index: &mut Index,
+    snapshot: &AssumeUnchangedSnapshot,
+) {
+    if snapshot.is_empty() {
+        return;
+    }
+    for entry in index.entries.iter_mut().filter(|e| e.stage() == 0) {
+        let Some(&(oid, mode)) = snapshot.get(entry.path.as_slice()) else {
+            continue;
+        };
+        if entry.oid == oid && entry.mode == mode {
+            entry.set_assume_unchanged(true);
+        }
+    }
+}
+
+/// Stage-0 row after hard reset when the worktree file is left unchanged.
+fn hard_reset_keep_index_row(entry: &IndexEntry, preserve_skip_worktree: bool) -> IndexEntry {
+    let mut row = index_entry_with_recorded_stat(entry);
+    if preserve_skip_worktree {
+        row.set_skip_worktree(true);
+    }
+    row
+}
+
+/// Abort when a skip-worktree path's worktree edit would be lost to a target-tree blob change.
+fn hard_reset_abort_if_skip_worktree_dirty(
+    repo: &Repository,
+    work_tree: &Path,
+    snapshot: &BTreeMap<Vec<u8>, ObjectId>,
+    index: &Index,
+    sparse: Option<&SparseCheckout>,
+    config: &Arc<ConfigSet>,
+) -> Result<()> {
+    use crate::error::OverwriteReason;
+    let rules = WorktreeRules::from_parts_with_config(repo, index, Arc::clone(config))?;
+    let mut blocked = Vec::new();
+    for (path, &index_oid) in snapshot {
+        if sparse.is_some_and(|s| !s.includes_index_path(path)) {
+            continue;
+        }
+        let rel = crate::repo_relpath::storage_string(path);
+        let target_changed = match index.get(path, 0) {
+            None => true,
+            Some(current) => current.oid != index_oid,
+        };
+        if !target_changed {
+            continue;
+        }
+        let abs = crate::index::worktree_path_from_index_rel(work_tree, path);
+        let Ok(meta) = fs::symlink_metadata(&abs) else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let attrs = rules.file_attrs(&rel, false);
+        let worktree_oid = crate::diff::hash_worktree_file(
+            repo.odb(),
+            &abs,
+            &meta,
+            rules.conversion(),
+            &attrs,
+            &rel,
+            None,
+            Some(rules.filter_process()),
+        )?;
+        if worktree_oid != index_oid {
+            blocked.push(rel);
+        }
+    }
+    if blocked.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::would_overwrite(
+            OverwriteReason::LocalChanges,
+            blocked,
+        ))
+    }
 }
 
 fn hard_reset_finish_cache_tree(repo: &Repository, index: &mut Index, target_tree: &ObjectId) {
@@ -1708,7 +2235,9 @@ struct HardResetStatCheck {
 /// Rollback rebuilds tree-diff paths from the index, which is only right for clean files, so
 /// the reset spools these first. Paths sparse checkout leaves alone and gitlinks are skipped.
 /// A stat match proves nothing for a racy entry, so those are compared by content, in
-/// parallel, as status does.
+/// parallel, as status does, unless there are more than [`RACY_TREE_DIFF_CONTENT_VERIFY_MAX`]
+/// of them or they exceed [`RACY_TREE_DIFF_CONTENT_VERIFY_MAX_BYTES`]; then they are spooled
+/// unread.
 #[allow(clippy::too_many_arguments)]
 fn hard_reset_unrecorded_tree_diff_paths(
     repo: &Repository,
@@ -1720,9 +2249,33 @@ fn hard_reset_unrecorded_tree_diff_paths(
     check: HardResetStatCheck,
 ) -> Result<Vec<String>> {
     let mut unrecorded = Vec::new();
-    let mut probes: Vec<(usize, &str)> = Vec::new();
+    let mut probes: Vec<(usize, String)> = Vec::new();
     for change in changes {
         if change.status == DiffStatus::Added || change.old_mode.bits() == MODE_GITLINK {
+            continue;
+        }
+        if crate::index::is_tree_mode(change.old_mode.bits()) {
+            if change.status != DiffStatus::Deleted {
+                continue;
+            }
+            let Some(dir) = change.old_path.as_deref() else {
+                continue;
+            };
+            if sparse.is_some_and(|sparse| sparse.checkout_skips(index, dir)) {
+                continue;
+            }
+            // Only paths tracked in the deleted subtree (HEAD), not nested untracked extras.
+            for path in coalesced_delete_scheduled_paths(repo.odb(), change)? {
+                if sparse.is_some_and(|sparse| sparse.checkout_skips(index, &path)) {
+                    continue;
+                }
+                let key = checkout_stored_index_path_bytes(&path);
+                match index.find_entry_pos(&key, 0) {
+                    Some(pos) if index.entries[pos].skip_worktree() => {}
+                    Some(pos) => probes.push((pos, path)),
+                    None => unrecorded.push(path),
+                }
+            }
             continue;
         }
         let Some(path) = change.old_path.as_deref() else {
@@ -1734,16 +2287,16 @@ fn hard_reset_unrecorded_tree_diff_paths(
         let key = checkout_stored_index_path_bytes(path);
         match index.find_entry_pos(&key, 0) {
             Some(pos) if index.entries[pos].skip_worktree() => {}
-            Some(pos) => probes.push((pos, path)),
+            Some(pos) => probes.push((pos, path.to_owned())),
             None => unrecorded.push(path.to_owned()),
         }
     }
-    let mut racy: Vec<(usize, &str, PathBuf, fs::Metadata)> = Vec::new();
+    let mut racy: Vec<(usize, String, PathBuf, fs::Metadata)> = Vec::new();
     for (pos, path) in probes {
         let entry = &index.entries[pos];
-        let abs = checkout_stored_worktree_abs(work_tree, path);
+        let abs = checkout_stored_worktree_abs(work_tree, &path);
         let Ok(meta) = fs::symlink_metadata(&abs) else {
-            unrecorded.push(path.to_owned());
+            unrecorded.push(path);
             continue;
         };
         let stat_clean = hard_reset_entry_stat_clean(
@@ -1754,7 +2307,7 @@ fn hard_reset_unrecorded_tree_diff_paths(
             None,
         );
         if !stat_clean {
-            unrecorded.push(path.to_owned());
+            unrecorded.push(path);
         } else if crate::diff::entry_is_racy_with_policy(entry, check.index_mtime, check.policy) {
             racy.push((pos, path, abs, meta));
         }
@@ -1762,7 +2315,14 @@ fn hard_reset_unrecorded_tree_diff_paths(
     if racy.is_empty() {
         return Ok(unrecorded);
     }
-    let rules = WorktreeRules::from_parts(repo, index, config.clone())?;
+    let racy_bytes: u64 = racy.iter().map(|(_, _, _, meta)| meta.len()).sum();
+    if racy.len() > RACY_TREE_DIFF_CONTENT_VERIFY_MAX
+        || racy_bytes > RACY_TREE_DIFF_CONTENT_VERIFY_MAX_BYTES
+    {
+        unrecorded.extend(racy.iter().map(|(_, path, _, _)| path.clone()));
+        return Ok(unrecorded);
+    }
+    let rules = WorktreeRules::from_parts_with_config(repo, index, config.clone())?;
     let attrs: Vec<crlf::FileAttrs> = racy
         .iter()
         .map(|(_, path, _, _)| rules.file_attrs(path, false))
@@ -1794,7 +2354,7 @@ fn hard_reset_unrecorded_tree_diff_paths(
         racy.iter()
             .zip(unchanged)
             .filter(|(_, unchanged)| !unchanged)
-            .map(|((_, path, _, _), _)| (*path).to_owned()),
+            .map(|((_, path, _, _), _)| path.clone()),
     );
     Ok(unrecorded)
 }
@@ -1848,6 +2408,23 @@ fn hard_reset_entry_stat_clean(
         && !crate::diff::entry_is_racy_with_policy(existing, index_mtime, stat_policy)
 }
 
+/// Whether a regular file's on-disk size differs from the size the index recorded for it.
+///
+/// The recorded size is that of the work-tree bytes last seen matching the blob, so a
+/// different size means those bytes changed: the file is rewritten without hashing it first.
+/// A clean filter may still map the new bytes to the same blob, but hard reset leaves the
+/// checked-out form either way.
+fn hard_reset_entry_size_changed(
+    existing: &IndexEntry,
+    stat: &crate::worktree_scan::BlobDiskStat,
+) -> bool {
+    is_regular_git_mode(existing.mode)
+        && !existing.stat_cache_unset()
+        && !stat.is_dir
+        && is_regular_git_mode(stat.git_mode)
+        && stat.worktree_size() != existing.size
+}
+
 /// Resolve [`HardResetEntryAction::Verify`] entries by comparing worktree content with the
 /// index blob, in parallel. Unlike ordinary checkout skip logic, this never trusts a stat match
 /// without reading bytes: hard reset at HEAD uses verify for every stat-clean row.
@@ -1868,7 +2445,7 @@ fn verify_hard_reset_candidates(
     if candidates.is_empty() {
         return Ok(());
     }
-    let config = repo.config()?;
+    let config = repo.config().snapshot()?;
     let mut options = repo
         .thread_policy()
         .resolve(ParallelOp::IndexRefresh, config.as_ref());
@@ -1933,8 +2510,8 @@ fn verify_hard_reset_candidates(
 ///
 /// Returns [`Error::LockHeld`] without touching the work tree or index when another process
 /// holds `index.lock`, and propagates object, checkout I/O and index write failures.
-pub fn checkout_tree_changes(repo: &Repository, changes: &[DiffEntry]) -> Result<()> {
-    checkout_tree_changes_reporting(repo, changes, &mut NullProgress, &NeverCancel)
+pub(crate) fn checkout_tree_changes(repo: &Repository, changes: &[DiffEntry]) -> Result<()> {
+    checkout_tree_changes_reporting(repo, changes, &mut NullProgress, CancelToken::never_ref())
 }
 
 /// Like [`checkout_tree_changes`], reporting [`ProgressPhase::CheckingOutFiles`] and stopping
@@ -1943,7 +2520,7 @@ pub(crate) fn checkout_tree_changes_reporting(
     repo: &Repository,
     changes: &[DiffEntry],
     progress: &mut dyn ProgressSink,
-    cancel: &dyn Cancel,
+    cancel: &CancelToken,
 ) -> Result<()> {
     let mut lock = repo.lock_index()?;
     checkout_tree_changes_with_progress(
@@ -2024,7 +2601,7 @@ pub(crate) fn checkout_tree_changes_with_index_opts(
     changes: &[DiffEntry],
     index: &mut Index,
     progress: &mut dyn ProgressSink,
-    cancel: &dyn Cancel,
+    cancel: &CancelToken,
     apply: CheckoutApplyOptions,
     attribute_changes: Option<&[DiffEntry]>,
     index_write: CheckoutIndexWrite<'_>,
@@ -2050,24 +2627,26 @@ pub(crate) fn checkout_tree_changes_with_index_deferred(
     changes: &[DiffEntry],
     index: &mut Index,
     progress: &mut dyn ProgressSink,
-    cancel: &dyn Cancel,
+    cancel: &CancelToken,
     apply: CheckoutApplyOptions,
     attribute_changes: Option<&[DiffEntry]>,
     lock: &IndexLock,
 ) -> Result<CheckoutJournal> {
-    let work_tree = repo
-        .work_tree()
-        .ok_or_else(|| Error::PathError("cannot update a bare repository's working tree".into()))?;
+    let work_tree = repo.work_tree().ok_or_else(|| {
+        Error::Worktree(WorktreeError::Path {
+            detail: "cannot update a bare repository's working tree".into(),
+        })
+    })?;
     let mut journal = CheckoutJournal::new(work_tree)?;
-    let result = apply_tree_changes_in_chunks(
+    let result = checkout_tree_changes_into_deferred_journal(
         repo,
         changes,
+        index,
         progress,
         cancel,
-        index,
         apply,
         attribute_changes,
-        CheckoutIndexWrite::Defer(lock),
+        lock,
         &mut journal,
     );
     match result {
@@ -2076,6 +2655,325 @@ pub(crate) fn checkout_tree_changes_with_index_deferred(
             .finish(repo, Err::<(), _>(err))
             .map(|_| unreachable!()),
     }
+}
+
+/// Apply tree diff work to `journal` without committing it; the caller rolls back or commits.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn checkout_tree_changes_into_deferred_journal(
+    repo: &Repository,
+    changes: &[DiffEntry],
+    index: &mut Index,
+    progress: &mut dyn ProgressSink,
+    cancel: &CancelToken,
+    apply: CheckoutApplyOptions,
+    attribute_changes: Option<&[DiffEntry]>,
+    lock: &IndexLock,
+    journal: &mut CheckoutJournal,
+) -> Result<()> {
+    apply_tree_changes_in_chunks(
+        repo,
+        changes,
+        progress,
+        cancel,
+        index,
+        apply,
+        attribute_changes,
+        CheckoutIndexWrite::Defer(lock),
+        journal,
+    )
+}
+
+/// Paths touched by a coalesced tree diff (whole subtrees as one entry each).
+#[derive(Clone, Default)]
+struct CoalescedSubtreeDiffPaths {
+    deleted_prefixes: Vec<Vec<u8>>,
+    added_prefixes: Vec<Vec<u8>>,
+    leaf_paths: HashSet<Vec<u8>>,
+}
+
+impl CoalescedSubtreeDiffPaths {
+    fn from_changes(changes: &[DiffEntry]) -> Self {
+        let mut out = Self::default();
+        for change in changes {
+            match change.status {
+                DiffStatus::Deleted if crate::index::is_tree_mode(change.old_mode.bits()) => {
+                    if let Some(path) = &change.old_path {
+                        out.deleted_prefixes
+                            .push(crate::repo_relpath::storage_bytes(path).into_owned());
+                    }
+                }
+                DiffStatus::Added if crate::index::is_tree_mode(change.new_mode.bits()) => {
+                    if let Some(path) = &change.new_path {
+                        out.added_prefixes
+                            .push(crate::repo_relpath::storage_bytes(path).into_owned());
+                    }
+                }
+                _ => {
+                    if let Some(path) = change.old_path.as_deref().or(change.new_path.as_deref()) {
+                        out.leaf_paths
+                            .insert(crate::repo_relpath::storage_bytes(path).into_owned());
+                    }
+                }
+            }
+        }
+        out.deleted_prefixes.sort_unstable();
+        out.added_prefixes.sort_unstable();
+        out
+    }
+
+    fn contains_path(&self, path: &[u8]) -> bool {
+        if self.leaf_paths.contains(path) {
+            return true;
+        }
+        Self::path_under_any_prefix(path, &self.deleted_prefixes)
+            || Self::path_under_any_prefix(path, &self.added_prefixes)
+    }
+
+    fn path_under_any_prefix(path: &[u8], prefixes: &[Vec<u8>]) -> bool {
+        prefixes.iter().any(|prefix| {
+            path.starts_with(prefix)
+                && (path.len() == prefix.len() || path.get(prefix.len()) == Some(&b'/'))
+        })
+    }
+}
+
+fn diff_entry_is_coalesced_subtree(change: &DiffEntry) -> bool {
+    matches!(change.status, DiffStatus::Deleted if crate::index::is_tree_mode(change.old_mode.bits()))
+        || matches!(change.status, DiffStatus::Added if crate::index::is_tree_mode(change.new_mode.bits()))
+}
+
+/// Worktree paths scheduled for removal by a coalesced tree delete (from the old subtree OID).
+fn coalesced_delete_scheduled_paths(odb: &Odb, change: &DiffEntry) -> Result<Vec<String>> {
+    let Some(root) = change.old_path.as_deref() else {
+        return Ok(Vec::new());
+    };
+    if !crate::index::is_tree_mode(change.old_mode.bits()) {
+        return Ok(vec![root.to_owned()]);
+    }
+    if change.old_oid.is_zero() {
+        return Ok(Vec::new());
+    }
+    let blobs = crate::diff::flatten_tree_entries(odb, &change.old_oid)?;
+    Ok(blobs
+        .into_iter()
+        .map(|(rel, _, _)| crate::repo_relpath::format_path_stored(root, rel.as_ref()))
+        .collect())
+}
+
+/// Whether every file under `dir` on disk is tracked in the coalesced delete subtree `old_oid`.
+///
+/// Avoids flattening the old tree into memory when deciding wholesale directory removal.
+fn coalesced_subtree_wholesale_delete_safe(
+    odb: &Odb,
+    work_tree: &Path,
+    dir: &str,
+    old_oid: &ObjectId,
+    _ignorecase: bool,
+) -> Result<bool> {
+    let abs_dir = work_tree.join(dir);
+    let mut stack = vec![abs_dir];
+    let mut cache = crate::merge_trees::MergeTreeCache::default();
+    let dir_stored = crate::repo_relpath::storage_bytes(dir).into_owned();
+    let mut dir_prefix = dir_stored.clone();
+    dir_prefix.push(b'/');
+    while let Some(current) = stack.pop() {
+        let read_dir = match fs::read_dir(&current) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return Ok(false),
+        };
+        for entry in read_dir.flatten() {
+            let path = entry.path();
+            let file_type = match entry.file_type() {
+                Ok(t) => t,
+                Err(_) => return Ok(false),
+            };
+            if file_type.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !file_type.is_file() && !file_type.is_symlink() {
+                return Ok(false);
+            }
+            let Ok(rel) = path.strip_prefix(work_tree) else {
+                return Ok(false);
+            };
+            let rel_stored =
+                crate::repo_relpath::storage_bytes(&rel.to_string_lossy()).into_owned();
+            let within = if rel_stored.as_slice() == dir_stored.as_slice() {
+                continue;
+            } else if rel_stored.starts_with(dir_prefix.as_slice()) {
+                &rel_stored[dir_prefix.len()..]
+            } else {
+                return Ok(false);
+            };
+            if within.is_empty() {
+                return Ok(false);
+            }
+            let Some(entry) = crate::merge_trees::lookup_index_entry_at_path_cached(
+                &mut cache, odb, old_oid, within,
+            )?
+            else {
+                return Ok(false);
+            };
+            if entry.mode == MODE_TREE {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+/// Apply coalesced subtree add/delete entries; returns leaf-level diff rows for the rest.
+#[allow(clippy::too_many_arguments)]
+fn checkout_coalesced_subtree_changes(
+    repo: &Repository,
+    work_tree: &Path,
+    changes: &[DiffEntry],
+    progress: &mut dyn ProgressSink,
+    cancel: &CancelToken,
+    index_mut: &mut Index,
+    apply: CheckoutApplyOptions,
+    index_write: CheckoutIndexWrite<'_>,
+    journal: &mut CheckoutJournal,
+) -> Result<Vec<DiffEntry>> {
+    let mut coalesced = Vec::new();
+    let mut leaf = Vec::new();
+    for change in changes {
+        if diff_entry_is_coalesced_subtree(change) {
+            coalesced.push(change);
+        } else {
+            leaf.push(change.clone());
+        }
+    }
+    if coalesced.is_empty() {
+        return Ok(leaf);
+    }
+
+    let config = repo.config().snapshot()?;
+    let protect = ProtectOptions::from_config(config.as_ref());
+    let ignorecase = config.ignore_case();
+    let precompose = repo.pathspec_precompose_enabled();
+    let rules = if let Some(ref precomputed) = apply.precomputed_worktree_rules {
+        Rc::clone(precomputed)
+    } else {
+        Rc::new(checkout_worktree_rules(
+            repo,
+            index_mut,
+            changes,
+            config.clone(),
+        )?)
+    };
+    let conv = rules.conversion().clone();
+
+    let mut wholesale_dirs = BTreeSet::new();
+    let mut paths_to_remove_index = Vec::new();
+    let mut deleted_abs_paths = Vec::new();
+    for change in coalesced.iter().filter(|c| c.status == DiffStatus::Deleted) {
+        crate::progress::poll_cancel(progress, cancel)?;
+        let Some(dir) = &change.old_path else {
+            continue;
+        };
+        let wholesale_safe = if crate::index::is_tree_mode(change.old_mode.bits())
+            && !change.old_oid.is_zero()
+        {
+            if ignorecase {
+                let tracked = coalesced_delete_scheduled_paths(repo.odb(), change)?;
+                let delete_set: HashSet<String> = tracked.iter().cloned().collect();
+                !tracked.is_empty()
+                    && wholesale_directory_safe_to_remove(work_tree, dir, &delete_set, ignorecase)
+            } else {
+                coalesced_subtree_wholesale_delete_safe(
+                    repo.odb(),
+                    work_tree,
+                    dir,
+                    &change.old_oid,
+                    ignorecase,
+                )?
+            }
+        } else {
+            false
+        };
+        if wholesale_safe {
+            wholesale_dirs.insert(dir.clone());
+            journal.record_removed_dir(dir);
+            let abs = work_tree.join(dir);
+            if abs.is_dir() && remove_wholesale_dir(&abs) {
+                deleted_abs_paths.push(abs);
+            }
+            progress.inc(1);
+            continue;
+        }
+        let tracked = coalesced_delete_scheduled_paths(repo.odb(), change)?;
+        for rel in tracked {
+            crate::progress::poll_cancel(progress, cancel)?;
+            journal.spool_remove(&rel)?;
+            deleted_abs_paths.push(checkout_stored_worktree_abs(work_tree, &rel));
+            paths_to_remove_index.push(checkout_stored_index_path_bytes(&rel));
+            progress.inc(1);
+        }
+    }
+    remove_empty_parent_dirs_batch(work_tree, &deleted_abs_paths);
+
+    let sparse = SparseCheckout::load(repo)?;
+    let mut new_entries = Vec::new();
+    for change in coalesced.iter().filter(|c| c.status == DiffStatus::Added) {
+        crate::progress::poll_cancel(progress, cancel)?;
+        let Some(path) = &change.new_path else {
+            continue;
+        };
+        let mut walk =
+            PopulatedTreeWalk::new_at_prefix(repo.odb(), &change.new_oid, path.clone(), protect)?;
+        let mut chunk = Vec::with_capacity(POPULATED_TREE_CHECKOUT_CHUNK);
+        let mut apply_chunk = apply.clone();
+        apply_chunk.precomputed_worktree_rules = Some(Rc::clone(&rules));
+        apply_chunk.skip_promisor_prefetch = true;
+        while walk.fill_chunk(&mut chunk)? {
+            crate::progress::poll_cancel(progress, cancel)?;
+            let chunk_changes: Vec<DiffEntry> =
+                chunk.iter().map(populated_blob_to_added_diff).collect();
+            let worktree_changes = split_sparse_tree_changes(
+                sparse.as_ref(),
+                work_tree,
+                index_mut,
+                &chunk_changes,
+                &mut apply_chunk,
+            );
+            let chunk_refs: Vec<&DiffEntry> = worktree_changes.iter().collect();
+            let (_, entries) = execute_checkout_write_changes_chunk(
+                repo,
+                work_tree,
+                &chunk_refs,
+                rules.as_ref(),
+                &config,
+                &conv,
+                &apply_chunk,
+                precompose,
+                ignorecase,
+                &None,
+                &mut LeadingDirCache::for_config(config.as_ref()),
+                &mut DelayedProcessCheckout::default(),
+                true,
+                progress,
+                cancel,
+                journal,
+            )?;
+            new_entries.extend(entries);
+        }
+    }
+
+    checkout_commit_index_update(
+        repo,
+        index_mut,
+        &wholesale_dirs,
+        paths_to_remove_index,
+        new_entries,
+        true,
+        &apply,
+        index_write,
+        journal,
+    )?;
+    Ok(leaf)
 }
 
 /// Top-level directories whose tracked files are entirely removed by `delete_paths`.
@@ -2098,6 +2996,7 @@ pub(crate) fn wholesale_deleted_directories(
         return BTreeSet::new();
     }
     let delete_set: HashSet<String> = delete_paths.iter().cloned().collect();
+    let delete_lookup = ScheduledDeletePathLookup::new(&delete_set, false);
     let mut wholesale = BTreeSet::new();
     if index.entries_sorted {
         for (dir, del_count) in &deleted_under {
@@ -2123,7 +3022,7 @@ pub(crate) fn wholesale_deleted_directories(
                     all_scheduled = false;
                     break;
                 };
-                if !delete_path_is_scheduled(path, &delete_set, false) {
+                if !delete_path_is_scheduled(path, &delete_lookup) {
                     all_scheduled = false;
                     break;
                 }
@@ -2150,7 +3049,7 @@ pub(crate) fn wholesale_deleted_directories(
             continue;
         }
         *indexed_under.entry(dir.to_owned()).or_default() += 1;
-        if !delete_path_is_scheduled(path, &delete_set, false) {
+        if !delete_path_is_scheduled(path, &delete_lookup) {
             blocked.insert(dir.to_owned());
         }
     }
@@ -2178,6 +3077,8 @@ pub(crate) fn wholesale_blocked_top_level_directories(changes: &[DiffEntry]) -> 
         };
         if let Some((dir, _rest)) = path.split_once('/') {
             blocked.insert(dir.to_owned());
+        } else {
+            blocked.insert(path.to_owned());
         }
     }
     blocked
@@ -2207,14 +3108,8 @@ fn resolve_wholesale_blocked_dirs(
 }
 
 /// True when every file under `work_tree`/`dir` is listed in `delete_paths` (Git keeps untracked/ignored extras).
-fn delete_path_is_scheduled(rel: &str, delete_paths: &HashSet<String>, ignorecase: bool) -> bool {
-    if ignorecase {
-        delete_paths
-            .iter()
-            .any(|del| paths_equal(rel.as_bytes(), del.as_bytes(), true))
-    } else {
-        delete_paths.contains(rel)
-    }
+fn delete_path_is_scheduled(rel: &str, delete_paths: &ScheduledDeletePathLookup<'_>) -> bool {
+    delete_paths.contains(rel)
 }
 
 /// Untracked and ignored paths collected under wholesale delete trees before switch checkout.
@@ -2255,6 +3150,7 @@ pub(crate) fn wholesale_directory_safe_to_remove(
     delete_paths: &HashSet<String>,
     ignorecase: bool,
 ) -> bool {
+    let delete_lookup = ScheduledDeletePathLookup::new(delete_paths, ignorecase);
     let abs_dir = work_tree.join(dir);
     let mut stack = vec![abs_dir];
     while let Some(current) = stack.pop() {
@@ -2283,7 +3179,7 @@ pub(crate) fn wholesale_directory_safe_to_remove(
                 return false;
             };
             let rel = rel.to_string_lossy();
-            if !delete_path_is_scheduled(rel.as_ref(), delete_paths, ignorecase) {
+            if !delete_path_is_scheduled(rel.as_ref(), &delete_lookup) {
                 return false;
             }
         }
@@ -2321,7 +3217,7 @@ pub(crate) fn precompute_wholesale_safe_directories(
     let delete_set: HashSet<String> = delete_paths.iter().cloned().collect();
     let needs_walk: Vec<String> = candidates.into_iter().collect();
     let default_cfg = ConfigSet::new();
-    let config = repo.config().ok();
+    let config = repo.config().snapshot().ok();
     let cfg = config.as_deref().unwrap_or(&default_cfg);
     let options = repo.thread_policy().resolve(ParallelOp::Checkout, cfg);
     let safe: BTreeSet<String> = if needs_walk.len() >= 2 && options.threads.get() > 1 {
@@ -2395,7 +3291,7 @@ fn wholesale_deleted_directories_on_disk(
     if needs_walk.is_empty() {
         return trusted;
     }
-    let config = repo.config().ok();
+    let config = repo.config().snapshot().ok();
     let default_cfg = ConfigSet::new();
     let cfg = config.as_deref().unwrap_or(&default_cfg);
     let options = repo.thread_policy().resolve(ParallelOp::Checkout, cfg);
@@ -2453,6 +3349,13 @@ fn checkout_stored_index_path_bytes(stored_path: &str) -> Vec<u8> {
     crate::repo_relpath::storage_bytes(stored_path).into_owned()
 }
 
+fn sparse_directory_index_path_bytes(stored_path: &str) -> Vec<u8> {
+    crate::repo_relpath::storage_bytes(&crate::repo_relpath::sparse_directory_stored_path(
+        stored_path,
+    ))
+    .into_owned()
+}
+
 const BULK_ADD_CHECKOUT_MIN: usize = 32;
 /// Change count from which a checkout's index write skips the pre-write housekeeping.
 const BULK_INDEX_REWRITE_MIN: usize = 64;
@@ -2467,44 +3370,25 @@ fn remove_wholesale_dir(abs: &Path) -> bool {
     }
 }
 
-fn remove_wholesale_directories_on_disk(
+fn remove_wholesale_directories_cancellable(
     repo: &Repository,
     work_tree: &Path,
     wholesale_index_prefixes: &BTreeSet<String>,
     config: &std::sync::Arc<ConfigSet>,
+    progress: &mut dyn ProgressSink,
+    cancel: &CancelToken,
     journal: &mut CheckoutJournal,
 ) -> Result<BTreeSet<String>> {
-    let mut wholesale_dirs_removed = BTreeSet::new();
     if wholesale_index_prefixes.is_empty() {
-        return Ok(wholesale_dirs_removed);
+        return Ok(BTreeSet::new());
     }
-    for dir in wholesale_index_prefixes {
-        journal.record_removed_dir(dir);
-    }
-    if wholesale_index_prefixes.len() >= 2 {
-        let policy = repo.thread_policy();
-        let options = policy.resolve(ParallelOp::Checkout, config.as_ref());
-        let wt = work_tree.to_path_buf();
-        let dirs: Vec<String> = wholesale_index_prefixes.iter().cloned().collect();
-        let removed = try_par_map(&dirs, options, 0, |dir| {
-            let abs = wt.join(dir);
-            Ok(remove_wholesale_dir(&abs).then_some(dir.clone()))
-        })
-        .map_err(|e: ParallelHashError<()>| match e {
-            ParallelHashError::Task(()) => {
-                Error::PathError("parallel wholesale directory removal failed".into())
-            }
-        })?;
-        wholesale_dirs_removed.extend(removed.into_iter().flatten());
-    } else {
-        for dir in wholesale_index_prefixes {
-            let abs = work_tree.join(dir);
-            if remove_wholesale_dir(&abs) {
-                wholesale_dirs_removed.insert(dir.clone());
-            }
-        }
-    }
-    Ok(wholesale_dirs_removed)
+    let policy = repo.thread_policy();
+    let options = policy.resolve(ParallelOp::Checkout, config.as_ref());
+    let dirs: Vec<String> = wholesale_index_prefixes.iter().cloned().collect();
+    let removed = remove_wholesale_dirs_parallel_cancellable(
+        work_tree, &dirs, options, progress, cancel, journal,
+    )?;
+    Ok(removed.into_iter().map(|(dir, _)| dir).collect())
 }
 
 /// Merge one checkout pass into `index_mut` and, unless the caller defers it, write the index
@@ -2580,7 +3464,7 @@ fn checkout_commit_index_update(
         attach_checkout_result_cache_tree(repo, index_mut, &tree)?;
     }
     index_mut.defer_untracked_cache_invalidation = false;
-    if let (Some(work_tree), Ok(config)) = (repo.work_tree(), repo.config()) {
+    if let (Some(work_tree), Ok(config)) = (repo.work_tree(), repo.config().snapshot()) {
         let _ = crate::path_icase::smudge_ignorecase_collision_stat_mismatches(
             repo.odb(),
             work_tree,
@@ -2605,18 +3489,26 @@ fn checkout_commit_index_update(
     }
 }
 
-/// Record that `index_mut` now matches `tree`: keep a still-valid cache tree and point its
-/// root at `tree`, or build one from `tree` when the entry counts agree.
+/// Record that `index_mut` now matches `tree`: keep a cache tree and point its root at `tree`
+/// (a sparse index's only when its root is valid), or build one from `tree` when the entry
+/// counts agree.
 fn attach_checkout_result_cache_tree(
     repo: &Repository,
     index_mut: &mut Index,
     tree: &ObjectId,
 ) -> Result<()> {
-    if index_mut.cache_tree.is_some() {
+    let sparse = index_mut.has_sparse_directory_placeholders();
+    // A retargeted sparse-directory row leaves an invalid root behind; rebuilding it reuses every
+    // valid node and reads no excluded subtree.
+    if index_mut
+        .cache_tree
+        .as_ref()
+        .is_some_and(|root| !sparse || root.entry_count >= 0)
+    {
         index_mut.cache_tree_root = Some(*tree);
         return Ok(());
     }
-    if index_mut.has_sparse_directory_placeholders() {
+    if sparse {
         let target = crate::porcelain::index_from_tree::index_from_tree_reusing_cache_tree(
             repo, tree, index_mut,
         )?;
@@ -2689,6 +3581,20 @@ fn split_sparse_tree_changes<'a>(
             }
             _ => None,
         }?;
+        if matches!(
+            change.status,
+            DiffStatus::Added | DiffStatus::Modified | DiffStatus::TypeChanged
+        ) && crate::index::is_tree_mode(change.new_mode.bits())
+        {
+            let lookup = path.strip_suffix('/').unwrap_or(path);
+            let mut dir = crate::repo_relpath::storage_bytes(lookup).into_owned();
+            if !dir.ends_with(b"/") {
+                dir.push(b'/');
+            }
+            if sparse.excludes_directory(&dir) {
+                return Some(path);
+            }
+        }
         sparse.checkout_skips(index, path).then_some(path)
     };
     let skipped: Vec<Option<&str>> = changes.iter().map(skipped_path).collect();
@@ -2707,10 +3613,17 @@ fn split_sparse_tree_changes<'a>(
                 .push(checkout_stored_index_path_bytes(path));
             continue;
         }
-        let mut entry = prospective_index_entry(path, change.new_oid, change.new_mode.bits());
-        entry.path = checkout_stored_index_path_bytes(path);
+        let mode = change.new_mode.bits();
+        let mut entry = prospective_index_entry(path, change.new_oid, mode);
+        entry.path = if crate::index::is_tree_mode(mode) {
+            sparse_directory_index_path_bytes(path)
+        } else {
+            checkout_stored_index_path_bytes(path)
+        };
+        entry.flags = entry.path.len().min(0xFFF) as u16;
+        let worktree_path = path.strip_suffix('/').unwrap_or(path);
         let untracked_file_present = index.get(&entry.path, 0).is_none()
-            && fs::symlink_metadata(checkout_stored_worktree_abs(work_tree, path)).is_ok();
+            && fs::symlink_metadata(checkout_stored_worktree_abs(work_tree, worktree_path)).is_ok();
         entry.set_skip_worktree(!untracked_file_present);
         apply.skip_worktree_rows.push(entry);
     }
@@ -2737,6 +3650,106 @@ fn tree_changes_are_bulk_mod_add_delete(changes: &[DiffEntry]) -> bool {
                 DiffStatus::Modified | DiffStatus::Deleted | DiffStatus::Added
             )
         })
+}
+
+fn checkout_change_is_strict_descendant(path: &str, prefix: &str) -> bool {
+    path.strip_prefix(prefix)
+        .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// Top-level or nested paths that become regular files while the diff removes strict descendants.
+fn checkout_dir_to_file_replacement_roots(changes: &[DiffEntry]) -> HashSet<String> {
+    let mut deleted_paths: HashSet<String> = HashSet::new();
+    for change in changes {
+        if change.status == DiffStatus::Deleted {
+            if let Some(path) = &change.old_path {
+                deleted_paths.insert(path.clone());
+            }
+        }
+    }
+    let mut roots = HashSet::new();
+    for change in changes {
+        if matches!(change.status, DiffStatus::Deleted | DiffStatus::Unmerged) {
+            continue;
+        }
+        let Some(path) = change.new_path.as_deref().or(change.old_path.as_deref()) else {
+            continue;
+        };
+        let mode = change.new_mode.bits();
+        if mode == MODE_TREE || mode == MODE_GITLINK {
+            continue;
+        }
+        if deleted_paths
+            .iter()
+            .any(|deleted| checkout_change_is_strict_descendant(deleted, path))
+        {
+            roots.insert(path.to_owned());
+        }
+    }
+    roots
+}
+
+fn checkout_change_atomic_group_key(
+    change: &DiffEntry,
+    roots: &HashSet<String>,
+    index: usize,
+) -> String {
+    if let Some(path) = change.old_path.as_deref() {
+        if change.status == DiffStatus::Deleted {
+            for root in roots {
+                if checkout_change_is_strict_descendant(path, root) {
+                    return format!("replace:{root}");
+                }
+            }
+        }
+    }
+    if let Some(path) = change.new_path.as_deref().or(change.old_path.as_deref()) {
+        if roots.contains(path) {
+            return format!("replace:{path}");
+        }
+    }
+    format!("singleton:{index}")
+}
+
+/// Pack tree diffs into bounded chunks without splitting a directory-to-file replacement group.
+fn partition_checkout_changes_for_chunking(
+    changes: &[DiffEntry],
+    max_chunk: usize,
+) -> Vec<Vec<DiffEntry>> {
+    if changes.len() <= max_chunk {
+        return vec![changes.to_vec()];
+    }
+    let roots = checkout_dir_to_file_replacement_roots(changes);
+    if roots.is_empty() {
+        return changes
+            .chunks(max_chunk)
+            .map(<[DiffEntry]>::to_vec)
+            .collect();
+    }
+
+    let mut grouped: HashMap<String, Vec<DiffEntry>> = HashMap::new();
+    let mut group_first: HashMap<String, usize> = HashMap::new();
+    for (index, change) in changes.iter().enumerate() {
+        let key = checkout_change_atomic_group_key(change, &roots, index);
+        group_first.entry(key.clone()).or_insert(index);
+        grouped.entry(key).or_default().push(change.clone());
+    }
+    let mut ordered_groups: Vec<String> = grouped.keys().cloned().collect();
+    ordered_groups.sort_by_key(|key| group_first[key]);
+
+    let mut chunks: Vec<Vec<DiffEntry>> = Vec::new();
+    let mut current: Vec<DiffEntry> = Vec::new();
+    for key in ordered_groups {
+        let batch = grouped.remove(&key).unwrap_or_default();
+        if !current.is_empty() && current.len() + batch.len() > max_chunk {
+            chunks.push(std::mem::take(&mut current));
+        }
+        current.extend(batch);
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
 }
 
 fn bulk_write_checkout_eligible(changes: &[DiffEntry], rules: &WorktreeRules) -> bool {
@@ -2785,7 +3798,6 @@ fn execute_checkout_write_changes_chunk(
     repo: &Repository,
     work_tree: &Path,
     changes: &[&DiffEntry],
-    index_mut: &mut Index,
     rules: &WorktreeRules,
     config: &Arc<ConfigSet>,
     conv: &ConversionConfig,
@@ -2797,11 +3809,11 @@ fn execute_checkout_write_changes_chunk(
     delayed: &mut DelayedProcessCheckout,
     skip_parallel_write_ramp: bool,
     progress: &mut dyn ProgressSink,
-    cancel: &dyn Cancel,
+    cancel: &CancelToken,
     journal: &mut CheckoutJournal,
-) -> Result<Vec<DelayedCheckoutTarget>> {
+) -> Result<(Vec<DelayedCheckoutTarget>, Vec<IndexEntry>)> {
     if changes.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
     let mut write_jobs: Vec<CheckoutWriteJob<'_>> = Vec::with_capacity(changes.len());
     for change in changes {
@@ -2862,8 +3874,7 @@ fn execute_checkout_write_changes_chunk(
             WriteJobOutcome::Delayed(target) => delayed_targets.push(*target),
         }
     }
-    index_mut.overwrite_stage0_entries(entries);
-    Ok(delayed_targets)
+    Ok((delayed_targets, entries))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2879,22 +3890,22 @@ fn checkout_bulk_added_tree_changes(
     precompose: bool,
     ignorecase: bool,
     progress: &mut dyn ProgressSink,
-    cancel: &dyn Cancel,
+    cancel: &CancelToken,
     index_write: CheckoutIndexWrite<'_>,
     journal: &mut CheckoutJournal,
 ) -> Result<()> {
-    let mut dir_cache = LeadingDirCache::with_protect(ProtectOptions::from_config(config.as_ref()));
+    let mut dir_cache = LeadingDirCache::for_config(config.as_ref());
     let mut delayed = DelayedProcessCheckout::default();
     let mut pending_delayed = Vec::new();
+    let mut new_entries = Vec::new();
     let mut skip_ramp = apply.skip_parallel_write_ramp;
     let smudge_context = None;
     for chunk in changes.chunks(POPULATED_TREE_CHECKOUT_CHUNK) {
         let chunk_refs: Vec<&DiffEntry> = chunk.iter().collect();
-        pending_delayed.extend(execute_checkout_write_changes_chunk(
+        let (delayed_targets, entries) = execute_checkout_write_changes_chunk(
             repo,
             work_tree,
             &chunk_refs,
-            index_mut,
             rules,
             config,
             conv,
@@ -2908,10 +3919,11 @@ fn checkout_bulk_added_tree_changes(
             progress,
             cancel,
             journal,
-        )?);
+        )?;
+        pending_delayed.extend(delayed_targets);
+        new_entries.extend(entries);
         skip_ramp = true;
     }
-    let mut new_entries = Vec::new();
     finish_delayed_checkouts(
         repo,
         rules,
@@ -2927,11 +3939,13 @@ fn checkout_bulk_added_tree_changes(
         &wholesale_blocked,
     );
     if apply.wholesale_safety_precomputed {
-        let _ = remove_wholesale_directories_on_disk(
+        let _ = remove_wholesale_directories_cancellable(
             repo,
             work_tree,
             &wholesale_dirs,
             config,
+            progress,
+            cancel,
             journal,
         )?;
     }
@@ -2964,7 +3978,7 @@ fn checkout_bulk_mod_delete_tree_changes(
     precompose: bool,
     ignorecase: bool,
     progress: &mut dyn ProgressSink,
-    cancel: &dyn Cancel,
+    cancel: &CancelToken,
     index_write: CheckoutIndexWrite<'_>,
     journal: &mut CheckoutJournal,
 ) -> Result<()> {
@@ -3007,14 +4021,16 @@ fn checkout_bulk_mod_delete_tree_changes(
         .iter()
         .filter(|c| matches!(c.status, DiffStatus::Modified | DiffStatus::Added))
         .collect();
-    let mut dir_cache = LeadingDirCache::with_protect(ProtectOptions::from_config(config.as_ref()));
+    let mut dir_cache = LeadingDirCache::for_config(config.as_ref());
     let smudge_context = None;
 
-    let wholesale_dirs_removed = remove_wholesale_directories_on_disk(
+    let wholesale_dirs_removed = remove_wholesale_directories_cancellable(
         repo,
         work_tree,
         &wholesale_index_prefixes,
         config,
+        progress,
+        cancel,
         journal,
     )?;
     let mut deleted_abs_paths: Vec<PathBuf> = wholesale_dirs_removed
@@ -3077,13 +4093,13 @@ fn checkout_bulk_mod_delete_tree_changes(
 
     let mut delayed = DelayedProcessCheckout::default();
     let mut pending_delayed = Vec::new();
+    let mut new_entries = Vec::new();
     let mut skip_ramp = apply.skip_parallel_write_ramp;
     for chunk in write_changes.chunks(POPULATED_TREE_CHECKOUT_CHUNK) {
-        pending_delayed.extend(execute_checkout_write_changes_chunk(
+        let (delayed_targets, entries) = execute_checkout_write_changes_chunk(
             repo,
             work_tree,
             chunk,
-            index_mut,
             rules,
             config,
             conv,
@@ -3097,10 +4113,11 @@ fn checkout_bulk_mod_delete_tree_changes(
             progress,
             cancel,
             journal,
-        )?);
+        )?;
+        pending_delayed.extend(delayed_targets);
+        new_entries.extend(entries);
         skip_ramp = true;
     }
-    let mut new_entries = Vec::new();
     finish_delayed_checkouts(
         repo,
         rules,
@@ -3137,7 +4154,7 @@ fn checkout_bulk_deleted_tree_changes(
     wholesale_dirs_removed: &BTreeSet<String>,
     deleted_abs_paths: &mut Vec<PathBuf>,
     progress: &mut dyn ProgressSink,
-    cancel: &dyn Cancel,
+    cancel: &CancelToken,
     apply: &CheckoutApplyOptions,
     index_write: CheckoutIndexWrite<'_>,
     journal: &mut CheckoutJournal,
@@ -3161,7 +4178,7 @@ fn checkout_bulk_deleted_tree_changes(
         per_file_deletes.push(path.clone());
     }
     if per_file_deletes.len() >= PARALLEL_PER_FILE_DELETE_MIN {
-        let config = repo.config()?;
+        let config = repo.config().snapshot()?;
         let policy = repo.thread_policy();
         let options = policy.resolve(ParallelOp::Checkout, config.as_ref());
         let (parallel_set, abs_paths) = remove_checkout_files_parallel_cancellable(
@@ -3228,14 +4245,45 @@ thread_local! {
 fn prefetch_promisor_blobs_for_checkout(repo: &Repository, changes: &[DiffEntry]) -> Result<()> {
     #[cfg(test)]
     PREFETCH_PROMISOR_FOR_CHECKOUT_CALLS.with(|c| *c.borrow_mut() += 1);
-    let oids = changes.iter().filter_map(|change| {
+    prefetch_promisor_blobs(repo, checkout_written_blobs(changes))
+}
+
+/// Blob ids a checkout of `changes` writes to the work tree.
+fn checkout_written_blobs(changes: &[DiffEntry]) -> impl Iterator<Item = ObjectId> + '_ {
+    changes.iter().filter_map(|change| {
         if change.status == DiffStatus::Deleted {
             return None;
         }
         let mode = change.new_mode.bits();
         matches!(mode, MODE_REGULAR | MODE_EXECUTABLE | MODE_SYMLINK).then_some(change.new_oid)
-    });
-    prefetch_promisor_blobs(repo, oids)
+    })
+}
+
+/// Before checkout rules are built from the `.gitattributes` blobs in `index`, fetch the missing
+/// ones in one batch with every blob `changes` writes, instead of one lazy fetch per attributes
+/// file ahead of the checkout's own batch; later passes then skip their prefetch.
+///
+/// A sparse checkout keeps the per-pass prefetch, which only fetches the paths it writes.
+fn prefetch_promisor_blobs_before_checkout_rules(
+    repo: &Repository,
+    index: &Index,
+    changes: &[DiffEntry],
+    apply: &mut CheckoutApplyOptions,
+) -> Result<()> {
+    if apply.skip_promisor_prefetch || SparseCheckout::load(repo)?.is_some() {
+        return Ok(());
+    }
+    #[cfg(test)]
+    PREFETCH_PROMISOR_FOR_CHECKOUT_CALLS.with(|c| *c.borrow_mut() += 1);
+    let attribute_blobs = index
+        .entries
+        .iter()
+        .filter(|entry| entry.stage() == 0 && entry.mode == MODE_REGULAR)
+        .filter(|entry| entry.path.rsplit(|&b| b == b'/').next() == Some(b".gitattributes"))
+        .map(|entry| entry.oid);
+    prefetch_promisor_blobs(repo, attribute_blobs.chain(checkout_written_blobs(changes)))?;
+    apply.skip_promisor_prefetch = true;
+    Ok(())
 }
 
 /// Prefetch only missing, distinct blobs, retaining lazy-read behavior when disabled.
@@ -3255,15 +4303,17 @@ fn checkout_tree_changes_with_progress(
     repo: &Repository,
     changes: &[DiffEntry],
     progress: &mut dyn ProgressSink,
-    cancel: &dyn Cancel,
+    cancel: &CancelToken,
     reuse_index: Option<&mut Index>,
     apply: CheckoutApplyOptions,
     attribute_changes: Option<&[DiffEntry]>,
     index_write: CheckoutIndexWrite<'_>,
 ) -> Result<()> {
-    let work_tree = repo
-        .work_tree()
-        .ok_or_else(|| Error::PathError("cannot update a bare repository's working tree".into()))?;
+    let work_tree = repo.work_tree().ok_or_else(|| {
+        Error::Worktree(WorktreeError::Path {
+            detail: "cannot update a bare repository's working tree".into(),
+        })
+    })?;
     let mut loaded_index;
     let index_mut: &mut Index = if let Some(index) = reuse_index {
         index
@@ -3292,7 +4342,7 @@ fn apply_tree_changes_in_chunks(
     repo: &Repository,
     changes: &[DiffEntry],
     progress: &mut dyn ProgressSink,
-    cancel: &dyn Cancel,
+    cancel: &CancelToken,
     index_mut: &mut Index,
     mut apply: CheckoutApplyOptions,
     attribute_changes: Option<&[DiffEntry]>,
@@ -3318,14 +4368,17 @@ fn apply_tree_changes_in_chunks(
         );
     }
 
-    let config = repo.config()?;
+    let config = repo.config().snapshot()?;
     let attr_source = attribute_changes.unwrap_or(changes);
     if apply.precomputed_worktree_rules.is_none() {
+        prefetch_promisor_blobs_before_checkout_rules(repo, index_mut, changes, &mut apply)?;
         let rules = checkout_worktree_rules(repo, index_mut, attr_source, config.clone())?;
         apply.precomputed_worktree_rules = Some(Rc::new(rules));
     }
     let rules = apply.precomputed_worktree_rules.as_ref().ok_or_else(|| {
-        Error::PathError("internal error: missing precomputed checkout rules".into())
+        Error::Worktree(WorktreeError::Path {
+            detail: "internal error: missing precomputed checkout rules".into(),
+        })
     })?;
 
     if !apply.skip_bulk_checkout_fast_path {
@@ -3375,15 +4428,19 @@ fn apply_tree_changes_in_chunks(
 
     let saved_result_tree = apply.checkout_result_tree.take();
     apply.defer_chunk_index_finalize = true;
+    if !apply.skip_promisor_prefetch {
+        prefetch_promisor_blobs_for_checkout(repo, changes)?;
+    }
     apply.skip_promisor_prefetch = true;
-    prefetch_promisor_blobs_for_checkout(repo, changes)?;
     if let Some(extra) = attribute_changes {
         let protect = ProtectOptions::from_config(config.as_ref());
         validate_diff_changes_for_worktree(extra, protect)?;
     }
 
+    let checkout_chunks =
+        partition_checkout_changes_for_chunking(changes, POPULATED_TREE_CHECKOUT_CHUNK);
     let mut apply_slices = |lock: &IndexLock| -> Result<()> {
-        for (i, chunk) in changes.chunks(POPULATED_TREE_CHECKOUT_CHUNK).enumerate() {
+        for (i, chunk) in checkout_chunks.iter().enumerate() {
             if i > 0 {
                 apply.skip_parallel_write_ramp = true;
             }
@@ -3434,7 +4491,7 @@ fn apply_tree_changes(
     repo: &Repository,
     changes: &[DiffEntry],
     progress: &mut dyn ProgressSink,
-    cancel: &dyn Cancel,
+    cancel: &CancelToken,
     index_mut: &mut Index,
     apply: CheckoutApplyOptions,
     attribute_changes: Option<&[DiffEntry]>,
@@ -3442,11 +4499,13 @@ fn apply_tree_changes(
     journal: &mut CheckoutJournal,
 ) -> Result<()> {
     let mut progress = CancelProgress::new(progress, cancel);
-    let work_tree = repo
-        .work_tree()
-        .ok_or_else(|| Error::PathError("cannot update a bare repository's working tree".into()))?;
+    let work_tree = repo.work_tree().ok_or_else(|| {
+        Error::Worktree(WorktreeError::Path {
+            detail: "cannot update a bare repository's working tree".into(),
+        })
+    })?;
     let delete_rollback = journal.shared();
-    let config = repo.config()?;
+    let config = repo.config().snapshot()?;
     let protect = ProtectOptions::from_config(config.as_ref());
     validate_diff_changes_for_worktree(changes, protect)?;
     let mut apply = apply;
@@ -3466,10 +4525,7 @@ fn apply_tree_changes(
     if let Some(extra) = attribute_changes {
         validate_diff_changes_for_worktree(extra, protect)?;
     }
-    let ignorecase = config
-        .get_bool("core.ignorecase")
-        .and_then(|r| r.ok())
-        .unwrap_or(false);
+    let ignorecase = config.ignore_case();
     let precompose = repo.pathspec_precompose_enabled();
     let attr_changes = attribute_changes.unwrap_or(changes);
 
@@ -3601,7 +4657,7 @@ fn apply_tree_changes(
     let mut smudge_context: Option<Arc<FilterSmudgeMeta>> = None;
     let mut paths_to_remove: Vec<Vec<u8>> = Vec::with_capacity(changes.len() / 8);
     let mut deleted_abs_paths: Vec<PathBuf> = Vec::with_capacity(changes.len() / 8);
-    let mut dir_cache = LeadingDirCache::with_protect(protect);
+    let mut dir_cache = LeadingDirCache::with_protect_config(protect, Some(config.as_ref()));
     let mut plan: Vec<CheckoutPlanSlot> = Vec::with_capacity(changes.len());
     let mut write_jobs: Vec<CheckoutWriteJob<'_>> = Vec::new();
     let mut rules: Option<Rc<WorktreeRules>> =
@@ -3734,7 +4790,9 @@ fn apply_tree_changes(
                 )?));
             }
             let rules = rules.as_deref().ok_or_else(|| {
-                Error::PathError("internal error: missing checkout rules for write".into())
+                Error::Worktree(WorktreeError::Path {
+                    detail: "internal error: missing checkout rules for write".into(),
+                })
             })?;
             if conv.is_none() {
                 conv = Some(rules.conversion().clone());
@@ -3821,6 +4879,8 @@ fn apply_tree_changes(
         }
     }
 
+    remove_empty_parent_dirs_batch(work_tree, &deleted_abs_paths);
+
     let path_refs: Vec<&str> = write_jobs.iter().map(|j| j.path.as_str()).collect();
     let serial_indices = paths_needing_serial_checkout_str(&path_refs, ignorecase, precompose);
     let parallel_indices: HashSet<usize> = write_jobs
@@ -3845,10 +4905,14 @@ fn apply_tree_changes(
         Vec::new()
     } else {
         let rules = rules.as_ref().ok_or_else(|| {
-            Error::PathError("internal error: missing checkout rules for write jobs".into())
+            Error::Worktree(WorktreeError::Path {
+                detail: "internal error: missing checkout rules for write jobs".into(),
+            })
         })?;
         let conv = conv.as_ref().ok_or_else(|| {
-            Error::PathError("internal error: missing conversion config for write jobs".into())
+            Error::Worktree(WorktreeError::Path {
+                detail: "internal error: missing conversion config for write jobs".into(),
+            })
         })?;
         crate::trace::trace_span!("grit.checkout.write");
         execute_write_jobs(
@@ -3877,7 +4941,9 @@ fn apply_tree_changes(
             CheckoutPlanSlot::Ready(entry) => new_entries.push(entry),
             CheckoutPlanSlot::Write => {
                 match write_iter.next().ok_or_else(|| {
-                    Error::PathError("internal error: missing parallel checkout outcome".into())
+                    Error::Worktree(WorktreeError::Path {
+                        detail: "internal error: missing parallel checkout outcome".into(),
+                    })
                 })? {
                     WriteJobOutcome::Index(entry) => {
                         new_entries.push(entry);
@@ -3892,7 +4958,9 @@ fn apply_tree_changes(
 
     if !pending_delayed.is_empty() {
         let rules = rules.as_ref().ok_or_else(|| {
-            Error::PathError("internal error: missing checkout rules for delayed writes".into())
+            Error::Worktree(WorktreeError::Path {
+                detail: "internal error: missing checkout rules for delayed writes".into(),
+            })
         })?;
         finish_delayed_checkouts(
             repo,
@@ -3905,7 +4973,6 @@ fn apply_tree_changes(
         )?;
     }
 
-    remove_empty_parent_dirs_batch(work_tree, &deleted_abs_paths);
     drop(rules);
     let bulk_index_rewrite = changes.len() >= BULK_INDEX_REWRITE_MIN;
     crate::progress::poll_cancel(&mut progress, cancel)?;
@@ -3941,7 +5008,7 @@ fn checkout_worktree_rules(
 ) -> Result<WorktreeRules> {
     if tree_changes_touch_gitattributes(attr_changes) {
         let prospective_index = prospective_index_for_checkout(index, attr_changes);
-        WorktreeRules::from_checkout_prospective_index(repo, &prospective_index, config)
+        WorktreeRules::from_checkout_prospective_index(repo, &prospective_index)
     } else {
         WorktreeRules::from_parts_index_attributes_only(repo, index, config)
     }
@@ -3961,12 +5028,12 @@ pub(crate) fn tree_changes_touch_gitattributes(changes: &[DiffEntry]) -> bool {
 /// Index after applying `changes`, used to resolve destination `.gitattributes` before writes land.
 fn prospective_index_for_checkout(index: &Index, changes: &[DiffEntry]) -> Index {
     let mut idx = index.clone();
-    let mut paths_to_remove: Vec<&[u8]> = Vec::with_capacity(changes.len());
+    let mut paths_to_remove: Vec<Vec<u8>> = Vec::with_capacity(changes.len());
     let mut replacements: Vec<IndexEntry> = Vec::new();
     for change in changes {
         if change.status == DiffStatus::Deleted {
             if let Some(path) = &change.old_path {
-                paths_to_remove.push(path.as_bytes());
+                paths_to_remove.push(checkout_stored_index_path_bytes(path));
             }
             continue;
         }
@@ -3975,13 +5042,13 @@ fn prospective_index_for_checkout(index: &Index, changes: &[DiffEntry]) -> Index
         };
         if let Some(old) = &change.old_path {
             if old != path {
-                paths_to_remove.push(old.as_bytes());
+                paths_to_remove.push(checkout_stored_index_path_bytes(old));
             }
         }
         let mode = change.new_mode.bits();
         replacements.push(prospective_index_entry(path, change.new_oid, mode));
     }
-    idx.remove_paths_and_insert(paths_to_remove, replacements);
+    idx.remove_paths_and_insert(paths_to_remove.iter().map(|p| p.as_slice()), replacements);
     idx
 }
 
@@ -4000,7 +5067,7 @@ fn prospective_index_entry(path: &str, oid: ObjectId, mode: u32) -> IndexEntry {
         oid,
         flags: path.len().min(0xFFF) as u16,
         flags_extended: None,
-        path: path.as_bytes().to_vec(),
+        path: checkout_stored_index_path_bytes(path),
         base_index_pos: 0,
     }
 }
@@ -4027,9 +5094,9 @@ pub(crate) fn smudge_bytes_for_worktree_path(
     }
     match worktree_bytes_from_index_blob(repo, rules, rel_path, mode, blob, oid, None, None)? {
         Some(bytes) => Ok(bytes),
-        None => Err(Error::PathError(format!(
-            "delayed filter checkout is not supported for '{rel_path}'"
-        ))),
+        None => Err(Error::Worktree(WorktreeError::Path {
+            detail: format!("delayed filter checkout is not supported for '{rel_path}'"),
+        })),
     }
 }
 
@@ -4042,19 +5109,13 @@ pub(crate) fn write_smudged_blob_to_worktree(
     oid: &ObjectId,
     mode: u32,
 ) -> Result<()> {
-    let written = write_blob_to_worktree(
-        repo,
-        rules,
-        work_tree,
-        rel_path,
-        oid,
-        mode,
-        &mut LeadingDirCache::new(),
-    )?;
+    let mut dir_cache = LeadingDirCache::for_config(rules.config());
+    let written =
+        write_blob_to_worktree(repo, rules, work_tree, rel_path, oid, mode, &mut dir_cache)?;
     if written.is_none() {
-        return Err(Error::PathError(format!(
-            "delayed filter checkout is not supported for '{rel_path}'"
-        )));
+        return Err(Error::Worktree(WorktreeError::Path {
+            detail: format!("delayed filter checkout is not supported for '{rel_path}'"),
+        }));
     }
     Ok(())
 }
@@ -4153,9 +5214,11 @@ fn finish_delayed_checkouts(
                 })
                 .collect::<Vec<_>>()
                 .join("; ");
-            Err(Error::PathError(msg))
+            Err(Error::Worktree(WorktreeError::Path { detail: msg }))
         }
-        Err(DelayedCheckoutError::Transport(msg)) => Err(Error::PathError(msg)),
+        Err(DelayedCheckoutError::Transport(msg)) => {
+            Err(Error::Worktree(WorktreeError::Path { detail: msg }))
+        }
     }
 }
 
@@ -4221,6 +5284,9 @@ fn validate_diff_changes_for_worktree(
         let Some(path) = &change.new_path else {
             continue;
         };
+        if path.ends_with('/') {
+            continue;
+        }
         let mode = change.new_mode.bits();
         validate_worktree_path(path.as_bytes(), mode, protect)?;
     }
@@ -4310,8 +5376,11 @@ pub(crate) fn materialize_gitlink_worktree(
             }
         }
     }
-    fs::create_dir_all(&file_path)
-        .map_err(|e| Error::PathError(format!("creating gitlink directory '{rel_path}': {e}")))?;
+    fs::create_dir_all(&file_path).map_err(|e| {
+        Error::Worktree(WorktreeError::Path {
+            detail: format!("creating gitlink directory '{rel_path}': {e}"),
+        })
+    })?;
     Ok(())
 }
 
@@ -4336,18 +5405,71 @@ const STREAMED_CHECKOUT_COPY_BUF: usize = 256 * 1024;
 pub(crate) enum WorktreeFileContent<'a> {
     /// Bytes already in memory, after any checkout conversion.
     Bytes(&'a [u8]),
-    /// A blob payload copied verbatim from an object-database stream (regular files only).
+    /// A blob payload streamed from the object database (regular files only).
     ///
     /// The stream is spooled to a temporary file next to the destination, which is renamed
     /// into place only once the reader has reached its validated end: a corrupt or truncated
     /// object fails the checkout without leaving a partial file or disturbing the old one.
-    Stream(&'a mut dyn Read),
+    Stream {
+        reader: &'a mut dyn Read,
+        smudge: Option<(&'a crlf::ConversionConfig, &'a crlf::FileAttrs)>,
+    },
 }
 
 /// Copy `reader` into a new temporary file in `dir`, created with the checkout mode for `mode`.
 ///
 /// The temporary file is removed again when reading or writing fails, including when the
 /// reader reports a corrupt or truncated object at its end.
+#[allow(clippy::too_many_arguments)]
+fn spool_checkout_blob_with_smudge(
+    dir: &Path,
+    rel_path: &str,
+    reader: &mut dyn Read,
+    mode: u32,
+    conv: &crlf::ConversionConfig,
+    attrs: &crlf::FileAttrs,
+) -> Result<tempfile::NamedTempFile> {
+    const PROBE_MAX: usize = 8000;
+    let mut tmp = spool_stream_to_temp(dir, rel_path, reader, mode)?;
+    let mut probe = Vec::new();
+    {
+        use std::io::Read;
+        let file = tmp.as_file_mut();
+        file.rewind().map_err(Error::Io)?;
+        let mut buf = vec![0u8; PROBE_MAX.min(STREAMED_CHECKOUT_COPY_BUF)];
+        let n = file.read(&mut buf).map_err(Error::Io)?;
+        probe.extend_from_slice(&buf[..n]);
+        file.rewind().map_err(Error::Io)?;
+    }
+    if crlf::probe_is_binary_prefix(&probe) {
+        return Ok(tmp);
+    }
+    if !crlf::checkout_needs_lf_to_crlf_smudge(tmp.as_file_mut(), conv, attrs).map_err(Error::Io)? {
+        tmp.as_file_mut().rewind().map_err(Error::Io)?;
+        return Ok(tmp);
+    }
+    let raw = tmp.as_file_mut();
+    raw.rewind().map_err(Error::Io)?;
+    let write_error = |e: std::io::Error| {
+        crate::worktree::map_worktree_io(rel_path, WorktreePathOperation::Replace, e)
+    };
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(".grit-checkout-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(fs::Permissions::from_mode(git_create_mode_for_index_mode(
+            mode,
+        )));
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
+    let mut out = builder.tempfile_in(dir).map_err(write_error)?;
+    crlf::stream_lf_to_crlf(raw, out.as_file_mut()).map_err(Error::Io)?;
+    drop(tmp);
+    Ok(out)
+}
+
 fn spool_stream_to_temp(
     dir: &Path,
     rel_path: &str,
@@ -4386,8 +5508,9 @@ fn spool_stream_to_temp(
 /// Read blob `oid` for checkout, or return `None` when it should be streamed instead.
 ///
 /// A regular file whose checkout conversion is the identity
-/// ([`crlf::worktree_conversion_is_identity`]) and whose blob is larger than
-/// [`STREAMED_CHECKOUT_LIMIT`] is left for [`stream_checkout_entry`]; everything else is read
+/// ([`crlf::worktree_conversion_is_identity`]) or only needs content-dependent CRLF smudge
+/// ([`crlf::worktree_checkout_may_stream_crlf`]), and whose blob is larger than
+/// [`STREAMED_CHECKOUT_LIMIT`], is left for [`stream_checkout_entry`]; everything else is read
 /// whole. Objects within the limit are read in that one lookup; a streamed object is opened
 /// again by [`stream_checkout_entry`]. Bulk callers enable `cache_small` to reuse
 /// small loose objects between planning and materialization; direct writes bypass it.
@@ -4399,7 +5522,12 @@ pub(crate) fn read_blob_unless_streamed(
     oid: &ObjectId,
     cache_small: bool,
 ) -> Result<Option<Object>> {
-    if !is_regular_git_mode(mode) || !crlf::worktree_conversion_is_identity(conv, attrs) {
+    if !is_regular_git_mode(mode) {
+        return repo.odb().read(oid).map(Some);
+    }
+    let may_stream = crlf::worktree_conversion_is_identity(conv, attrs)
+        || crlf::worktree_checkout_may_stream_crlf(conv, attrs);
+    if !may_stream {
         return repo.odb().read(oid).map(Some);
     }
     match repo
@@ -4417,8 +5545,9 @@ pub(crate) fn read_blob_unless_streamed(
 ///
 /// # Errors
 ///
-/// [`Error::ObjectNotFound`] when the object is missing, [`Error::Io`] when its stream is
+/// [`crate::error::ObjectError::NotFound`] when the object is missing, [`Error::Io`] when its stream is
 /// corrupt, and the usual work-tree write errors.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn stream_checkout_entry(
     repo: &Repository,
     work_tree: &Path,
@@ -4427,6 +5556,8 @@ pub(crate) fn stream_checkout_entry(
     change: &DiffEntry,
     dir_cache: &mut LeadingDirCache,
     oid: ObjectId,
+    conv: &crlf::ConversionConfig,
+    attrs: &crlf::FileAttrs,
 ) -> Result<IndexEntry> {
     repo.odb()
         .with_stream(&oid, |stream| {
@@ -4434,14 +5565,18 @@ pub(crate) fn stream_checkout_entry(
             write_checkout_entry(
                 work_tree,
                 rel_path,
-                WorktreeFileContent::Stream(&mut *reader),
+                WorktreeFileContent::Stream {
+                    reader: &mut *reader,
+                    smudge: crlf::worktree_checkout_may_stream_crlf(conv, attrs)
+                        .then_some((conv, attrs)),
+                },
                 mode,
                 change,
                 dir_cache,
                 oid,
             )
         })?
-        .ok_or_else(|| Error::ObjectNotFound(oid.to_hex()))
+        .ok_or_else(|| Error::Object(ObjectError::NotFound { name: oid.to_hex() }))
 }
 
 /// Write blob `oid` to `rel_path` with checkout conversion, replacing whatever is there.
@@ -4458,6 +5593,7 @@ pub(crate) fn write_blob_to_worktree(
     mode: u32,
     dir_cache: &mut LeadingDirCache,
 ) -> Result<Option<fs::Metadata>> {
+    let has_symlinks = dir_cache.has_symlinks();
     let attrs = rules.file_attrs(rel_path, false);
     let Some(blob) = read_blob_unless_streamed(repo, rules.conversion(), &attrs, mode, oid, false)?
     else {
@@ -4468,12 +5604,17 @@ pub(crate) fn write_blob_to_worktree(
                 write_worktree_content(
                     work_tree,
                     rel_path,
-                    WorktreeFileContent::Stream(&mut *reader),
+                    WorktreeFileContent::Stream {
+                        reader: &mut *reader,
+                        smudge: crlf::worktree_checkout_may_stream_crlf(rules.conversion(), &attrs)
+                            .then_some((rules.conversion(), &attrs)),
+                    },
                     mode,
                     dir_cache,
+                    has_symlinks,
                 )
             })?
-            .ok_or_else(|| Error::ObjectNotFound(oid.to_hex()))
+            .ok_or_else(|| Error::Object(ObjectError::NotFound { name: oid.to_hex() }))
             .map(Some);
     };
     let Some(bytes) =
@@ -4481,7 +5622,8 @@ pub(crate) fn write_blob_to_worktree(
     else {
         return Ok(None);
     };
-    write_to_worktree_cached(work_tree, rel_path, &bytes, mode, dir_cache).map(Some)
+    let has_symlinks = dir_cache.has_symlinks();
+    write_to_worktree_cached(work_tree, rel_path, &bytes, mode, dir_cache, has_symlinks).map(Some)
 }
 
 fn write_checkout_entry(
@@ -4511,18 +5653,68 @@ fn write_checkout_entry(
             .open(&abs_path)
         {
             file.write_all(data).map_err(|e| {
-                Error::PathError(format!("writing '{rel_path}' during checkout: {e}"))
+                Error::Worktree(WorktreeError::Path {
+                    detail: format!("writing '{rel_path}' during checkout: {e}"),
+                })
             })?;
             drop(file);
             let old_mode = change.old_mode.bits();
             apply_in_place_git_mode_transition_at_path(&abs_path, old_mode, mode)?;
             let meta = written_file_symlink_metadata(&abs_path)?;
-            return Ok(entry_from_metadata(&meta, &index_path, oid, mode));
+            return Ok(checked_out_entry(&meta, &index_path, oid, mode, None));
         }
     }
 
-    let meta = write_worktree_content(work_tree, rel_path, content, mode, dir_cache)?;
-    Ok(entry_from_metadata(&meta, &index_path, oid, mode))
+    let symlink_target_len = (mode == MODE_SYMLINK).then_some(match &content {
+        WorktreeFileContent::Bytes(data) => data.len(),
+        WorktreeFileContent::Stream { .. } => 0,
+    });
+    let has_symlinks = dir_cache.has_symlinks();
+    let meta = write_worktree_content(work_tree, rel_path, content, mode, dir_cache, has_symlinks)?;
+    Ok(checked_out_entry(
+        &meta,
+        &index_path,
+        oid,
+        mode,
+        symlink_target_len,
+    ))
+}
+
+/// Index row after writing a path to the worktree (checkout, restore, merge checkout).
+pub(crate) fn index_entry_from_worktree_write(
+    meta: &fs::Metadata,
+    index_path: &[u8],
+    oid: ObjectId,
+    mode: u32,
+    symlink_target_len: Option<usize>,
+) -> IndexEntry {
+    checked_out_entry(meta, index_path, oid, mode, symlink_target_len)
+}
+
+/// Index row for a file checkout just wrote from blob `oid`.
+///
+/// A regular file is marked content-verified: its bytes are known to be the blob's, so the
+/// racy-entry pass at index write need not read them back, even when the write landed in the
+/// same timestamp tick as the previous index.
+fn checked_out_entry(
+    meta: &fs::Metadata,
+    index_path: &[u8],
+    oid: ObjectId,
+    mode: u32,
+    #[cfg_attr(not(windows), allow(unused_variables))] symlink_target_len: Option<usize>,
+) -> IndexEntry {
+    let mut entry = entry_from_metadata(meta, index_path, oid, mode);
+    if mode == MODE_SYMLINK {
+        #[cfg(windows)]
+        if let Some(len) = symlink_target_len.filter(|len| *len > 0) {
+            if entry.size == 0 {
+                entry.size = crate::index::munge_index_size(u64::try_from(len).unwrap_or(0));
+            }
+        }
+    } else if meta.is_file() {
+        entry.mark_content_verified();
+    }
+    entry
 }
 
 /// Adjust only the executable bit for an in-place overwrite, preserving umask-driven permissions.
@@ -4565,6 +5757,7 @@ fn apply_in_place_git_mode_transition_at_path(
 pub(crate) struct LeadingDirCache {
     ready: HashSet<PathBuf>,
     protect: ProtectOptions,
+    has_symlinks: bool,
 }
 
 fn precreate_checkout_parent_dirs(
@@ -4592,15 +5785,35 @@ fn precreate_checkout_parent_dirs(
 }
 
 impl LeadingDirCache {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self::with_protect(ProtectOptions::default())
     }
 
     pub(crate) fn with_protect(protect: ProtectOptions) -> Self {
+        Self::with_protect_config(protect, None)
+    }
+
+    /// Like [`Self::with_protect`], honouring `core.symlinks` from `config` when provided.
+    pub(crate) fn with_protect_config(protect: ProtectOptions, config: Option<&ConfigSet>) -> Self {
+        let has_symlinks = config
+            .map(crate::index::WorktreeModePolicy::from_config)
+            .unwrap_or_default()
+            .has_symlinks;
         Self {
             ready: HashSet::new(),
             protect,
+            has_symlinks,
         }
+    }
+
+    #[must_use]
+    pub(crate) fn has_symlinks(&self) -> bool {
+        self.has_symlinks
+    }
+
+    /// Cache for one checkout pass using `core.symlinks` and path protection from `config`.
+    pub(crate) fn for_config(config: &ConfigSet) -> Self {
+        Self::with_protect_config(ProtectOptions::from_config(config), Some(config))
     }
 
     /// Share parent-directory state from planning so workers do not re-stat prepared paths.
@@ -4608,6 +5821,7 @@ impl LeadingDirCache {
         Self {
             ready: source.ready.clone(),
             protect: source.protect,
+            has_symlinks: source.has_symlinks,
         }
     }
 
@@ -4644,8 +5858,10 @@ impl LeadingDirCache {
         #[cfg(not(unix))]
         {
             use std::path::Component;
-            let parent_str = std::str::from_utf8(&parent)
-                .map_err(|_| Error::Message("non-UTF-8 parent path during checkout".into()))?;
+            let parent_str =
+                std::str::from_utf8(&parent).map_err(|_| WorktreeError::NonUtf8Path {
+                    path: String::from_utf8_lossy(&parent).into_owned(),
+                })?;
             let path = Path::new(parent_str);
             let mut cur = work_tree.to_path_buf();
             for comp in path.components() {
@@ -4767,6 +5983,7 @@ pub(crate) fn write_to_worktree_cached(
     data: &[u8],
     mode: u32,
     dir_cache: &mut LeadingDirCache,
+    has_symlinks: bool,
 ) -> Result<fs::Metadata> {
     write_worktree_content(
         work_tree,
@@ -4774,6 +5991,7 @@ pub(crate) fn write_to_worktree_cached(
         WorktreeFileContent::Bytes(data),
         mode,
         dir_cache,
+        has_symlinks,
     )
 }
 
@@ -4784,6 +6002,7 @@ fn write_worktree_content(
     content: WorktreeFileContent<'_>,
     mode: u32,
     dir_cache: &mut LeadingDirCache,
+    has_symlinks: bool,
 ) -> Result<fs::Metadata> {
     let rel_bytes = crate::repo_relpath::storage_bytes(rel_path);
     validate_worktree_path(&rel_bytes, mode, dir_cache.protect)?;
@@ -4807,14 +6026,18 @@ fn write_worktree_content(
     }
     let ready = match content {
         WorktreeFileContent::Bytes(data) => Ready::Bytes(data),
-        WorktreeFileContent::Stream(_) if mode == MODE_SYMLINK => {
-            return Err(Error::PathError(format!(
-                "symlink target for '{rel_path}' must be in memory"
-            )));
+        WorktreeFileContent::Stream { .. } if mode == MODE_SYMLINK => {
+            return Err(Error::Worktree(WorktreeError::Path {
+                detail: format!("symlink target for '{rel_path}' must be in memory"),
+            }));
         }
-        WorktreeFileContent::Stream(reader) => {
+        WorktreeFileContent::Stream { reader, smudge } => {
             let dir = abs_path.parent().unwrap_or(work_tree);
-            Ready::Spooled(spool_stream_to_temp(dir, rel_path, reader, mode)?)
+            Ready::Spooled(if let Some((conv, attrs)) = smudge {
+                spool_checkout_blob_with_smudge(dir, rel_path, reader, mode, conv, attrs)?
+            } else {
+                spool_stream_to_temp(dir, rel_path, reader, mode)?
+            })
         }
     };
 
@@ -4853,34 +6076,15 @@ fn write_worktree_content(
     };
     if mode == MODE_SYMLINK {
         let target = std::str::from_utf8(data).map_err(|_| {
-            Error::PathError(format!("symlink target for '{rel_path}' is not UTF-8"))
+            Error::Worktree(WorktreeError::Path {
+                detail: format!("symlink target for '{rel_path}' is not UTF-8"),
+            })
         })?;
-        #[cfg(unix)]
         io_with_path(
             rel_path,
             WorktreePathOperation::Create,
-            std::os::unix::fs::symlink(target, &abs_path),
+            crate::worktree::write_index_symlink_to_worktree(&abs_path, target, has_symlinks),
         )?;
-        // Windows lacks unprivileged symlink creation; materialise the link as a
-        // regular file containing the target path so the worktree stays populated.
-        #[cfg(not(unix))]
-        {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&abs_path)
-                .map_err(|e| {
-                    crate::worktree::map_worktree_io(rel_path, WorktreePathOperation::Replace, e)
-                })?;
-            io_with_path(
-                rel_path,
-                WorktreePathOperation::Replace,
-                file.write_all(target.as_bytes()),
-            )?;
-            return written_file_metadata(file, &abs_path);
-        }
-        #[cfg(unix)]
         return written_file_symlink_metadata(&abs_path);
     }
     write_fresh_worktree_blob(&abs_path, rel_path, data, mode)
@@ -4891,7 +6095,7 @@ pub fn remove_empty_parent_dirs(work_tree: &Path, path: &Path) {
     remove_empty_parent_dirs_batch(work_tree, &[path.to_path_buf()]);
 }
 
-fn remove_empty_parent_dirs_batch(work_tree: &Path, deleted_paths: &[PathBuf]) {
+pub(crate) fn remove_empty_parent_dirs_batch(work_tree: &Path, deleted_paths: &[PathBuf]) {
     let cwd = Some(crate::environment::Environment::empty().cwd.clone());
     let mut dirs: BTreeSet<PathBuf> = BTreeSet::new();
     for path in deleted_paths {
@@ -4977,6 +6181,53 @@ mod tests {
     use crate::repo::init_repository;
     use crate::write_tree::{write_tree_update_index, WriteTreeFlags};
     use tempfile::TempDir;
+
+    #[test]
+    fn checked_out_entry_marks_only_regular_files_content_verified() {
+        let tmp = TempDir::new().expect("tempdir");
+        let file = tmp.path().join("f");
+        fs::write(&file, b"data").expect("write");
+        let oid = ObjectId::zero();
+        let meta = fs::symlink_metadata(&file).expect("stat");
+        let mut entry = checked_out_entry(&meta, b"f", oid, MODE_REGULAR, None);
+        assert_eq!(entry.size, 4);
+        assert!(entry.take_content_verified());
+
+        #[cfg(unix)]
+        {
+            let link = tmp.path().join("l");
+            std::os::unix::fs::symlink("f", &link).expect("symlink");
+            let meta = fs::symlink_metadata(&link).expect("lstat");
+            let mut entry = checked_out_entry(&meta, b"l", oid, MODE_SYMLINK, None);
+            assert!(!entry.take_content_verified());
+        }
+    }
+
+    #[test]
+    fn hard_reset_size_change_needs_a_recorded_size() {
+        let tmp = TempDir::new().expect("tempdir");
+        let file = tmp.path().join("f");
+        fs::write(&file, b"four").expect("write");
+        let meta = fs::symlink_metadata(&file).expect("stat");
+        let stat = crate::worktree_scan::BlobDiskStat::from_metadata(&meta);
+        let recorded = entry_from_metadata(&meta, b"f", ObjectId::zero(), MODE_REGULAR);
+        assert!(!hard_reset_entry_size_changed(&recorded, &stat));
+
+        let mut resized = recorded.clone();
+        resized.size = 5;
+        assert!(hard_reset_entry_size_changed(&resized, &stat));
+
+        let mut unset = recorded.clone();
+        unset.size = 0;
+        unset.mtime_sec = 0;
+        unset.mtime_nsec = 0;
+        assert!(unset.stat_cache_unset());
+        assert!(!hard_reset_entry_size_changed(&unset, &stat));
+
+        let mut link = resized;
+        link.mode = MODE_SYMLINK;
+        assert!(!hard_reset_entry_size_changed(&link, &stat));
+    }
 
     #[derive(Default)]
     struct CheckoutProgressRecorder {
@@ -5148,7 +6399,7 @@ mod tests {
             crate::RefStorageFormat::Files,
         )
         .expect("init");
-        let config = repo.config().expect("config");
+        let config = repo.config().snapshot().expect("config");
         let index = repo.load_index().expect("index");
         let rules = WorktreeRules::from_parts_index_attributes_only(&repo, &index, config.clone())
             .expect("rules");
@@ -5191,7 +6442,7 @@ mod tests {
             crate::RefStorageFormat::Files,
         )
         .expect("init");
-        let config = repo.config().expect("config");
+        let config = repo.config().snapshot().expect("config");
         let index = repo.load_index().expect("index");
         let rules = WorktreeRules::from_parts_index_attributes_only(&repo, &index, config.clone())
             .expect("rules");
@@ -5233,6 +6484,34 @@ mod tests {
             });
         }
         assert!(bulk_mod_delete_checkout_eligible(&changes, &rules));
+    }
+
+    #[test]
+    fn wholesale_blocked_top_level_directories_blocks_dir_to_file_replacement() {
+        let changes = vec![
+            DiffEntry {
+                status: DiffStatus::Deleted,
+                old_path: Some("d1/sub/f".into()),
+                new_path: None,
+                old_mode: FileMode::REGULAR,
+                new_mode: FileMode::ABSENT,
+                old_oid: ObjectId::zero(),
+                new_oid: ObjectId::zero(),
+                score: None,
+            },
+            DiffEntry {
+                status: DiffStatus::Added,
+                old_path: None,
+                new_path: Some("d1".into()),
+                old_mode: FileMode::ABSENT,
+                new_mode: FileMode::REGULAR,
+                old_oid: ObjectId::zero(),
+                new_oid: ObjectId::zero(),
+                score: None,
+            },
+        ];
+        let blocked = super::wholesale_blocked_top_level_directories(&changes);
+        assert_eq!(blocked, BTreeSet::from(["d1".to_owned()]));
     }
 
     #[test]
@@ -5347,6 +6626,102 @@ mod tests {
     }
 
     #[test]
+    fn wholesale_directory_safe_to_remove_ignorecase_matches_disk_spelling() {
+        let tmp = TempDir::new().expect("tempdir");
+        let repo = init_repository(
+            tmp.path(),
+            false,
+            "main",
+            None,
+            crate::RefStorageFormat::Files,
+        )
+        .expect("init");
+        let wt = repo.work_tree().expect("wt");
+        std::fs::create_dir_all(wt.join("d")).expect("mkdir");
+        let mut delete_paths = Vec::new();
+        for i in 0..4 {
+            let scheduled = format!("d/file{i}.txt");
+            let disk = format!("d/File{i}.txt");
+            let abs = wt.join(&disk);
+            std::fs::write(&abs, format!("v{i}\n")).expect("write");
+            delete_paths.push(scheduled);
+        }
+        let delete_set: HashSet<String> = delete_paths.iter().cloned().collect();
+        assert!(super::wholesale_directory_safe_to_remove(
+            wt,
+            "d",
+            &delete_set,
+            true
+        ));
+    }
+
+    #[test]
+    fn wholesale_directory_safe_to_remove_ignorecase_rejects_extra_file() {
+        let tmp = TempDir::new().expect("tempdir");
+        let repo = init_repository(
+            tmp.path(),
+            false,
+            "main",
+            None,
+            crate::RefStorageFormat::Files,
+        )
+        .expect("init");
+        let wt = repo.work_tree().expect("wt");
+        std::fs::create_dir_all(wt.join("d")).expect("mkdir");
+        let mut delete_paths = Vec::new();
+        for i in 0..4 {
+            let rel = format!("d/f{i}.txt");
+            std::fs::write(wt.join(&rel), format!("v{i}\n")).expect("write");
+            delete_paths.push(rel);
+        }
+        std::fs::write(wt.join("d/extra.txt"), b"x\n").expect("extra");
+        let delete_set: HashSet<String> = delete_paths.iter().cloned().collect();
+        assert!(!super::wholesale_directory_safe_to_remove(
+            wt,
+            "d",
+            &delete_set,
+            true
+        ));
+    }
+
+    #[test]
+    fn wholesale_directory_safe_to_remove_ignorecase_scales_linearly() {
+        use std::time::{Duration, Instant};
+
+        let tmp = TempDir::new().expect("tempdir");
+        let repo = init_repository(
+            tmp.path(),
+            false,
+            "main",
+            None,
+            crate::RefStorageFormat::Files,
+        )
+        .expect("init");
+        let wt = repo.work_tree().expect("wt");
+        std::fs::create_dir_all(wt.join("big")).expect("mkdir");
+        let file_count = 4000usize;
+        let mut delete_paths = Vec::with_capacity(file_count);
+        for i in 0..file_count {
+            let rel = format!("big/f{i}.txt");
+            std::fs::write(wt.join(&rel), b"x\n").expect("write");
+            delete_paths.push(rel);
+        }
+        let delete_set: HashSet<String> = delete_paths.iter().cloned().collect();
+        let start = Instant::now();
+        assert!(super::wholesale_directory_safe_to_remove(
+            wt,
+            "big",
+            &delete_set,
+            true
+        ));
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "ignorecase wholesale safety walk took {elapsed:?}; expected O(n), not O(n²)"
+        );
+    }
+
+    #[test]
     fn checkout_deletes_gitlink_directory() {
         let tmp = TempDir::new().expect("tempdir");
         let wt = tmp.path().join("wt");
@@ -5402,8 +6777,14 @@ mod tests {
         repo.write_index(&mut index).expect("empty index");
 
         let mut rec = CheckoutProgressRecorder::default();
-        checkout_between_trees_with_progress(&repo, None, &tree, &mut rec, &NeverCancel)
-            .expect("checkout");
+        checkout_between_trees_with_progress(
+            &repo,
+            None,
+            &tree,
+            &mut rec,
+            CancelToken::never_ref(),
+        )
+        .expect("checkout");
 
         let index = repo.load_index().expect("index after");
         assert_eq!(
@@ -5442,8 +6823,14 @@ mod tests {
         let changes = diff_trees(repo.odb(), Some(&head), Some(&to_tree), "").expect("diff");
 
         let mut rec = CheckoutProgressRecorder::default();
-        checkout_between_trees_with_progress(&repo, Some(&head), &to_tree, &mut rec, &NeverCancel)
-            .expect("checkout");
+        checkout_between_trees_with_progress(
+            &repo,
+            Some(&head),
+            &to_tree,
+            &mut rec,
+            CancelToken::never_ref(),
+        )
+        .expect("checkout");
 
         assert_eq!(rec.started.len(), 1);
         assert_eq!(rec.started[0].0, ProgressPhase::CheckingOutFiles);
@@ -5508,6 +6895,67 @@ mod tests {
     }
 
     #[test]
+    fn case_only_directory_rename_removes_old_directory_before_add() {
+        use crate::diff::{DiffEntry, DiffStatus};
+        use crate::objects::FileMode;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let repo = init_repository(
+            tmp.path(),
+            false,
+            "main",
+            None,
+            crate::RefStorageFormat::Files,
+        )
+        .expect("init");
+        let wt = repo.work_tree().expect("wt");
+        fs::create_dir_all(wt.join("Foo")).expect("mkdir Foo");
+        fs::write(wt.join("Foo/a.txt"), "1\n").expect("write");
+        let blob = fs::read(wt.join("Foo/a.txt")).expect("read");
+        let oid = repo.odb().write(ObjectKind::Blob, &blob).expect("blob");
+        let mut index = repo.load_index().expect("index");
+        index.add_or_replace(
+            entry_from_stat(&wt.join("Foo/a.txt"), b"Foo/a.txt", oid, MODE_REGULAR).expect("entry"),
+        );
+        index.sort();
+        repo.write_index(&mut index).expect("write index");
+
+        let changes = vec![
+            DiffEntry {
+                status: DiffStatus::Deleted,
+                old_path: Some("Foo/a.txt".into()),
+                new_path: None,
+                old_mode: FileMode::REGULAR,
+                new_mode: FileMode::ABSENT,
+                old_oid: oid,
+                new_oid: ObjectId::zero(),
+                score: None,
+            },
+            DiffEntry {
+                status: DiffStatus::Added,
+                old_path: None,
+                new_path: Some("foo/a.txt".into()),
+                old_mode: FileMode::ABSENT,
+                new_mode: FileMode::REGULAR,
+                old_oid: ObjectId::zero(),
+                new_oid: oid,
+                score: None,
+            },
+        ];
+        checkout_tree_changes(&repo, &changes).expect("apply delete+add");
+
+        assert!(
+            !wt.join("Foo").exists(),
+            "emptied old-case directory must be removed before creating the new spelling"
+        );
+        assert!(
+            wt.join("foo").is_dir(),
+            "target directory spelling must exist"
+        );
+        assert!(wt.join("foo/a.txt").is_file());
+    }
+
+    #[test]
     fn bulk_added_checkout_applies_preverified_wholesale_removals() {
         let tmp = TempDir::new().expect("tempdir");
         let repo = init_repository(
@@ -5557,7 +7005,7 @@ mod tests {
             &changes,
             &mut index,
             &mut NullProgress,
-            &NeverCancel,
+            CancelToken::never_ref(),
             CheckoutApplyOptions {
                 parallel_prepare_blobs: true,
                 checkout_parallel_threshold: Some(0),
@@ -5640,7 +7088,7 @@ mod tests {
             &changes,
             &mut index,
             &mut NullProgress,
-            &NeverCancel,
+            CancelToken::never_ref(),
             CheckoutApplyOptions {
                 parallel_prepare_blobs: true,
                 checkout_parallel_threshold: Some(0),
@@ -5685,7 +7133,7 @@ mod tests {
         }
         let tree = commit_all(&repo, "many");
         let mut index = crate::index::Index::new();
-        repo.index_handle().write(&mut index).expect("clear index");
+        repo.write_index(&mut index).expect("clear index");
         for i in 0..=POPULATED_TREE_CHECKOUT_CHUNK {
             std::fs::remove_file(wt.join(format!("f{i:05}.txt"))).expect("remove");
         }
@@ -5716,7 +7164,7 @@ mod tests {
         }
         let tree = commit_all(&repo, "many");
         let mut index = Index::new();
-        repo.index_handle().write(&mut index).expect("clear index");
+        repo.write_index(&mut index).expect("clear index");
         for i in 0..count {
             fs::remove_file(wt.join(format!("f{i:05}.txt"))).expect("remove");
         }
@@ -5905,7 +7353,7 @@ mod tests {
             assert_eq!(a.oid, b.oid);
             assert_eq!(a.mode, b.mode);
         }
-        let config = repo.config().expect("config");
+        let config = repo.config().snapshot().expect("config");
         checkout_worktree_rules(&repo, &index, &changes, config).expect("rules with attrs");
     }
 }
@@ -6064,7 +7512,7 @@ mod checkout_rollback_delay_filter_tests {
         let rules = WorktreeRules::from_parts_index_attributes_only(
             &repo,
             &index,
-            repo.config().expect("config"),
+            repo.config().snapshot().expect("config"),
         )
         .expect("rules");
         let key = crate::repo_relpath::storage_bytes("a.txt");

@@ -5,7 +5,7 @@
 use grit_lib::error::Error;
 use grit_lib::objects::ObjectId;
 use grit_lib::remote::push_report::PushRefStatus;
-use grit_lib::remote::transfer::{push_local, PushOptions, PushOutcome, PushRefSpec};
+use grit_lib::remote::transfer::{PushOptions, PushOutcome, PushRefSpec};
 use grit_test_support::{git, git_cmd};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -71,12 +71,18 @@ fn push(
         push_options: push_options.iter().map(|o| (*o).to_owned()).collect(),
         ..Default::default()
     };
-    push_local(
+    grit_lib::repo::Repository::open(
         &setup.local.join(".git"),
-        &setup.remote,
+        &grit_lib::config::environment::RepositoryOptions::empty(),
+    )
+    .expect("open push source")
+    .remotes()
+    .push_to(
+        grit_lib::remote::transfer::TransferEndpoint::Local(&setup.remote),
         &specs,
         &opts,
-        &grit_lib::progress::NeverCancel,
+        &mut grit_lib::remote::fetch::NoProgress,
+        &grit_lib::progress::CancelToken::never(),
     )
 }
 

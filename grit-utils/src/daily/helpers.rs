@@ -167,7 +167,7 @@ pub fn finish_git_git_matrix_ctx(headline: &mut DailyHeadlineContext, git: &Path
     let commit = git_rev_parse(git, &headline.repo, "HEAD~1000")?;
     let oid = grit_lib::objects::ObjectId::from_hex(commit.trim())?;
     headline.change_id_bench_prefix = Some(
-        grit_lib::objects::ChangeId::derived_from_commit_id(&oid)
+        grit_lib::change_id::ChangeId::derived_from_commit_id(&oid)
             .short(12)
             .to_owned(),
     );
@@ -222,7 +222,7 @@ pub fn setup_git_git_loose_tags(setup: &DailySetup<'_>) -> Result<DailyHeadlineC
         }
     }
     // Identical loose and packed tag records would otherwise hide the object-read cost.
-    grit_lib::refs::write_packed_refs_file(&git_dir, &packed)?;
+    grit_lib::test_support::refs::write_packed_refs_file(&git_dir, &packed)?;
     Ok(headline)
 }
 
@@ -761,6 +761,14 @@ pub fn log_all_bench(ctx: &DailyHeadlineContext) -> (BenchArgv, BenchArgv) {
     (
         sh_devnull(&ctx.grit, &["log", "--limit", cap]),
         sh_devnull(&ctx.git, &["log", "--oneline", &format!("-{cap}")]),
+    )
+}
+
+/// Author counts for all reachable commits: grit log --group-by author vs git shortlog -sne.
+pub fn log_group_by_author_bench(ctx: &DailyHeadlineContext) -> (BenchArgv, BenchArgv) {
+    (
+        sh_devnull(&ctx.grit, &["log", "--group-by", "author"]),
+        sh_devnull(&ctx.git, &["shortlog", "-sne", "HEAD"]),
     )
 }
 

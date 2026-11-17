@@ -19,9 +19,9 @@ use crate::diff::merge_diff::{
 };
 use crate::diff::{DiffEntry, DiffOptions, DiffStatus};
 use crate::error::Result;
-use crate::objects::pack_store::PackReadContextGuard;
-use crate::objects::{parse_commit, ObjectId};
+use crate::objects::ObjectId;
 use crate::odb::Odb;
+use crate::pack_store::PackReadContextGuard;
 use crate::parallel::{try_par_map_with_local, ParallelHashError, ParallelOp, ThreadPolicy};
 use crate::repo::Repository;
 use std::sync::Arc;
@@ -38,18 +38,14 @@ pub enum DiffMerges {
 }
 
 impl DiffMerges {
-    /// Parse `first-parent` or `combined` (Git `--diff-merges` spelling).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when `value` is not a known mode name.
-    pub fn parse(value: &str) -> std::result::Result<Self, String> {
+    /// Parse `first-parent` or `combined` (Git `--diff-merges` spelling); `None` for any other
+    /// name.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
         match value {
-            "first-parent" | "first_parent" => Ok(Self::FirstParent),
-            "combined" | "dense-combined" | "dense_combined" => Ok(Self::Combined),
-            other => Err(format!(
-                "unknown --diff-merges mode '{other}' (expected first-parent or combined)"
-            )),
+            "first-parent" | "first_parent" => Some(Self::FirstParent),
+            "combined" | "dense-combined" | "dense_combined" => Some(Self::Combined),
+            _ => None,
         }
     }
 }
@@ -74,6 +70,8 @@ fn file_diff_from_combined_path(path: CombinedDiffPath) -> FileDiff {
         old_mode: None,
         new_mode: None,
         binary: false,
+        old_size: 0,
+        new_size: 0,
         similarity: None,
         stat: None,
         structured: None,
@@ -98,29 +96,32 @@ fn filter_combined_paths(paths: Vec<String>, pathspecs: &[String]) -> Vec<String
 ///
 /// Propagates object read, tree walk, and diff errors.
 #[allow(clippy::too_many_arguments)]
-pub fn commit_diff_files(
+pub(crate) fn commit_diff_files(
     repo: &Repository,
     commit_oid: &ObjectId,
     merges: DiffMerges,
     detail: DiffDetail,
     options: &DiffOptions,
-    pathspecs: &[String],
-    config: &ConfigSet,
+    pathspec: &crate::pathspec::Pathspec,
     thread_policy: &ThreadPolicy,
 ) -> Result<DiffFilesOutput> {
-    let data = repo.odb().read(commit_oid)?.data;
-    let commit = parse_commit(&data)?;
-    if commit.parents.len() < 2 || merges == DiffMerges::FirstParent {
-        let old_tree = match commit.parents.first() {
-            Some(parent) => Some(repo.odb().commit_tree(parent)?),
+    let pathspecs = pathspec.specs();
+    let config = repo.config().snapshot()?;
+    let commit = repo.read_commit_with_replace(commit_oid)?;
+    let parent_ctx = crate::shallow::EffectiveCommitParents::load(repo);
+    let effective_parents = parent_ctx.for_commit(*commit_oid, &commit.parents);
+    if effective_parents.len() < 2 || merges == DiffMerges::FirstParent {
+        let old_tree = match effective_parents.first() {
+            Some(parent) => Some(repo.read_commit_with_replace(parent)?.tree),
             None => None,
         };
         let entries = tree_diff_entries(
-            repo.odb(),
+            repo,
             old_tree.as_ref(),
             Some(&commit.tree),
             "",
-            config,
+            pathspecs,
+            config.as_ref(),
             thread_policy,
         )?;
         let filtered = filter_entries(repo, entries, pathspecs)?;
@@ -128,8 +129,10 @@ pub fn commit_diff_files(
             repo.odb(),
             filtered,
             detail,
-            options.clone(),
-            config,
+            options
+                .clone()
+                .with_renames(crate::diff::RenameDetection::Off),
+            config.as_ref(),
             thread_policy,
         )?;
         out.files.sort_by(|a, b| a.path.cmp(&b.path));
@@ -139,11 +142,11 @@ pub fn commit_diff_files(
     combined_commit_diff_files(
         repo,
         &commit.tree,
-        &commit.parents,
+        &effective_parents,
         detail,
         options,
         pathspecs,
-        config,
+        config.as_ref(),
         thread_policy,
     )
 }
@@ -177,21 +180,25 @@ fn filter_entries(
 /// Propagates ODB and diff errors.
 pub(crate) fn commit_first_parent_diff_entries(
     repo: &Repository,
+    commit_oid: &ObjectId,
     commit: &crate::objects::CommitData,
     pathspecs: &[String],
     config: &ConfigSet,
     thread_policy: &ThreadPolicy,
 ) -> Result<Vec<DiffEntry>> {
     let odb = repo.odb();
-    let old_tree = match commit.parents.first() {
+    let parent_ctx = crate::shallow::EffectiveCommitParents::load(repo);
+    let effective_parents = parent_ctx.for_commit(*commit_oid, &commit.parents);
+    let old_tree = match effective_parents.first() {
         Some(parent) => Some(odb.commit_tree(parent)?),
         None => None,
     };
     let entries = tree_diff_entries(
-        odb,
+        repo,
         old_tree.as_ref(),
         Some(&commit.tree),
         "",
+        pathspecs,
         config,
         thread_policy,
     )?;
@@ -199,21 +206,29 @@ pub(crate) fn commit_first_parent_diff_entries(
 }
 
 fn tree_diff_entries(
-    odb: &Odb,
+    repo: &Repository,
     old_tree: Option<&ObjectId>,
     new_tree: Option<&ObjectId>,
     prefix: &str,
+    pathspecs: &[String],
     config: &ConfigSet,
     thread_policy: &ThreadPolicy,
 ) -> Result<Vec<DiffEntry>> {
     let threshold = crate::diff::renames_from_config(config)
         .threshold_percent()
-        .unwrap_or(100);
-    crate::diff::diff_trees_with_renames_and_policy(
-        odb,
+        .unwrap_or(crate::diff::RENAME_DETECTION_DISABLED);
+    let pathspec_matcher = if pathspecs.is_empty() {
+        None
+    } else {
+        Some(repo.pathspec_matcher(pathspecs)?)
+    };
+    crate::diff::core::diff_trees_with_renames_for_pathspecs_and_policy(
+        repo.odb(),
         old_tree,
         new_tree,
         prefix,
+        pathspecs,
+        pathspec_matcher.as_ref(),
         threshold,
         config,
         thread_policy,
@@ -258,6 +273,8 @@ fn combined_commit_diff_files(
                 old_mode: None,
                 new_mode: None,
                 binary: false,
+                old_size: 0,
+                new_size: 0,
                 similarity: None,
                 stat: None,
                 structured: None,
@@ -268,6 +285,7 @@ fn combined_commit_diff_files(
         return Ok(DiffFilesOutput {
             files,
             totals: None,
+            inexact_rename_skipped: None,
         });
     }
     if detail == DiffDetail::NameStatus {
@@ -278,6 +296,7 @@ fn combined_commit_diff_files(
         return Ok(DiffFilesOutput {
             files,
             totals: None,
+            inexact_rename_skipped: None,
         });
     }
 
@@ -322,7 +341,11 @@ fn combined_commit_diff_files(
     } else {
         None
     };
-    Ok(DiffFilesOutput { files, totals })
+    Ok(DiffFilesOutput {
+        files,
+        totals,
+        inexact_rename_skipped: None,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -350,6 +373,8 @@ fn combined_path_file_diff(
                 old_mode: None,
                 new_mode: None,
                 binary: true,
+                old_size: 0,
+                new_size: 0,
                 similarity: None,
                 stat: if detail == DiffDetail::Stat {
                     Some(LineStat::default())
@@ -387,6 +412,8 @@ fn combined_path_file_diff(
             old_mode: None,
             new_mode: None,
             binary: false,
+            old_size: 0,
+            new_size: 0,
             similarity: None,
             stat,
             structured: None,

@@ -4,7 +4,6 @@ use crate::support;
 
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::index::Index;
-use grit_lib::porcelain::checkout::checkout_between_trees;
 use grit_lib::repo::Repository;
 
 use support::{git, populate_flat_files};
@@ -34,7 +33,9 @@ fn populated_tree_checkout_matches_git_for_many_files() {
     let repo =
         Repository::discover(Some(root.path()), &RepositoryOptions::empty()).expect("open repo");
     let mut index = Index::new();
-    repo.index_handle().write(&mut index).expect("clear index");
+    repo.index()
+        .write(&mut index, &grit_lib::index::IndexWriteOptions::default())
+        .expect("clear index");
     for i in 0..COUNT {
         let path = root
             .path()
@@ -42,7 +43,9 @@ fn populated_tree_checkout_matches_git_for_many_files() {
         std::fs::remove_file(path).expect("remove worktree file");
     }
 
-    checkout_between_trees(&repo, None, &tree).expect("repopulate tree");
+    repo.checkout()
+        .checkout(None, &tree)
+        .expect("repopulate tree");
 
     let status = git(root.path(), &["status", "--porcelain"]);
     assert!(

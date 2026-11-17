@@ -93,7 +93,7 @@ impl<'a> PromisorObjects<'a> {
     /// # Errors
     ///
     /// Pack directory listing or index parse failures.
-    pub(crate) fn new(repo: &'a Repository) -> crate::error::Result<Self> {
+    pub fn new(repo: &'a Repository) -> crate::error::Result<Self> {
         let promisor_indexes = if repo.odb().uses_files_primary() {
             repo.odb()
                 .local_pack_indexes()?
@@ -189,7 +189,10 @@ pub(crate) fn plan_pack(
             let promised = PromisorObjects::new(repo)?;
             for blob in &missing {
                 if !promised.is_promised(&blob.oid, blob.referrer.as_ref())? {
-                    return Err(missing_error(blob.oid, MissingObjectReason::NotPromised));
+                    return Err(crate::error::Error::from(missing_error(
+                        blob.oid,
+                        MissingObjectReason::NotPromised,
+                    )));
                 }
             }
         }
@@ -201,7 +204,7 @@ pub(crate) fn plan_pack(
             } else {
                 MissingObjectReason::NotPromised
             };
-            return Err(missing_error(first.oid, reason));
+            return Err(crate::error::Error::from(missing_error(first.oid, reason)));
         }
         MissingObjects::LazyFetch => {
             let oids: Vec<ObjectId> = missing.iter().map(|b| b.oid).collect();
@@ -219,10 +222,10 @@ pub(crate) fn plan_pack(
                 pack_opts,
             )?;
             if let Some(blob) = still_missing.first() {
-                return Err(missing_error(
+                return Err(crate::error::Error::from(missing_error(
                     blob.oid,
                     MissingObjectReason::LazyFetchFailed,
-                ));
+                )));
             }
             selection = replanned;
         }
@@ -260,7 +263,10 @@ pub(crate) fn resolve_missing_wants(
             continue;
         }
         if mode == MissingObjects::Error {
-            return Err(missing_error(oid, MissingObjectReason::Promised));
+            return Err(crate::error::Error::from(missing_error(
+                oid,
+                MissingObjectReason::Promised,
+            )));
         }
         omit.insert(oid);
     }
@@ -271,14 +277,20 @@ pub(crate) fn resolve_missing_wants(
 /// Fetch `oids` through the repository's promisor fetcher and check they arrived.
 fn fetch_from_promisor_remotes(repo: &Repository, oids: &[ObjectId]) -> Result<()> {
     let Some(fetcher) = repo.caches().promisor_fetcher() else {
-        return Err(missing_error(oids[0], MissingObjectReason::NoFetcher));
+        return Err(crate::error::Error::from(missing_error(
+            oids[0],
+            MissingObjectReason::NoFetcher,
+        )));
     };
     fetcher.fetch_missing(repo, oids)?;
     let odb = repo.odb();
     odb.reprepare_local_packs();
     odb.invalidate_packs();
     if let Some(oid) = odb.missing_oids(oids.iter().copied())?.first() {
-        return Err(missing_error(*oid, MissingObjectReason::LazyFetchFailed));
+        return Err(crate::error::Error::from(missing_error(
+            *oid,
+            MissingObjectReason::LazyFetchFailed,
+        )));
     }
     Ok(())
 }
@@ -356,7 +368,7 @@ mod tests {
     #[test]
     fn referrer_in_a_promisor_pack_settles_it_without_a_scan() {
         let dir = tempfile::tempdir().unwrap();
-        let repo = Repository::init(dir.path(), &InitOptions::new().with_bare(true)).unwrap();
+        let (repo, _) = Repository::init(dir.path(), &InitOptions::new().with_bare(true)).unwrap();
         let blob = ObjectId::from_hex("0123456789abcdef0123456789abcdef01234567").unwrap();
         let tree = packed_tree(&repo, blob, true);
         let repo = Repository::open(dir.path(), &RepositoryOptions::empty()).unwrap();
@@ -374,7 +386,7 @@ mod tests {
     #[test]
     fn blob_named_only_by_ordinary_packs_is_not_promised() {
         let dir = tempfile::tempdir().unwrap();
-        let repo = Repository::init(dir.path(), &InitOptions::new().with_bare(true)).unwrap();
+        let (repo, _) = Repository::init(dir.path(), &InitOptions::new().with_bare(true)).unwrap();
         let blob = ObjectId::from_hex("0123456789abcdef0123456789abcdef01234567").unwrap();
         let tree = packed_tree(&repo, blob, false);
         let repo = Repository::open(dir.path(), &RepositoryOptions::empty()).unwrap();
@@ -409,7 +421,7 @@ mod tests {
     #[test]
     fn promise_does_not_reach_past_the_objects_promisor_packs_name() {
         let dir = tempfile::tempdir().unwrap();
-        let repo = Repository::init(dir.path(), &InitOptions::new().with_bare(true)).unwrap();
+        let (repo, _) = Repository::init(dir.path(), &InitOptions::new().with_bare(true)).unwrap();
         let odb = repo.odb();
         let tree = |blob: ObjectId| {
             let mut body = b"100644 f\0".to_vec();

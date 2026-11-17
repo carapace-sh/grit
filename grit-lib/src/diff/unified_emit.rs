@@ -21,50 +21,79 @@ pub struct SourceLine<'a> {
     pub ending: LineEnding,
 }
 
+impl<'a> SourceLine<'a> {
+    /// The line held by `record`, a line with its `\n` when it has one.
+    fn from_record(record: &'a str) -> Self {
+        match record.strip_suffix('\n') {
+            Some(body) => Self {
+                body,
+                ending: if body.ends_with('\r') {
+                    LineEnding::CrLf
+                } else {
+                    LineEnding::Lf
+                },
+            },
+            None => Self {
+                body: record,
+                ending: LineEnding::Missing,
+            },
+        }
+    }
+}
+
 /// All logical lines of one file version, borrowed from its text.
+///
+/// Each line is kept as its record: the body followed by the `\n` that ends it, if any. Git
+/// compares whole records, so they double as compare keys without a second table.
 #[derive(Clone, Debug)]
 pub struct LineSide<'a> {
-    pub lines: Vec<SourceLine<'a>>,
+    records: Vec<&'a str>,
 }
 
 impl<'a> LineSide<'a> {
     /// Split `text` into lines, preserving `\r` in bodies and final incomplete lines.
     #[must_use]
     pub fn from_text(text: &'a str) -> Self {
-        let mut lines = Vec::with_capacity(memchr::memchr_iter(b'\n', text.as_bytes()).count() + 1);
+        let bytes = text.as_bytes();
+        let mut records = Vec::with_capacity(memchr::memchr_iter(b'\n', bytes).count() + 1);
         let mut start = 0usize;
-        for i in memchr::memchr_iter(b'\n', text.as_bytes()) {
-            lines.push(parse_line_segment(&text[start..i], true));
+        for i in memchr::memchr_iter(b'\n', bytes) {
+            records.push(&text[start..=i]);
             start = i + 1;
         }
         if start < text.len() {
-            lines.push(parse_line_segment(&text[start..], false));
+            records.push(&text[start..]);
         }
-        Self { lines }
+        Self { records }
     }
 
     #[must_use]
     pub fn len(&self) -> usize {
-        self.lines.len()
+        self.records.len()
     }
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.lines.is_empty()
+        self.records.is_empty()
     }
 
-    pub fn line(&self, index: usize) -> &SourceLine<'a> {
-        &self.lines[index]
-    }
-
-    /// Index of the last line that lacks a trailing line separator, if any.
     #[must_use]
-    pub fn incomplete_last_line_index(&self) -> Option<usize> {
-        if self.lines.is_empty() {
-            return None;
-        }
-        let last = self.lines.len() - 1;
-        (self.lines[last].ending == LineEnding::Missing).then_some(last)
+    pub fn line(&self, index: usize) -> SourceLine<'a> {
+        SourceLine::from_record(self.records[index])
+    }
+
+    /// Every line in order.
+    pub fn lines(&self) -> impl ExactSizeIterator<Item = SourceLine<'a>> + '_ {
+        self.records
+            .iter()
+            .map(|record| SourceLine::from_record(record))
+    }
+
+    /// Every line with its `\n`, when it has one: the bytes Git compares lines by, so a line
+    /// ending in a newline never matches the same body at EOF without one.
+    #[must_use]
+    pub fn records(&self) -> &[&'a str] {
+        &self.records
     }
 }
 
@@ -85,17 +114,6 @@ pub(crate) fn line_diff_token(line: &SourceLine) -> String {
             s
         }
     }
-}
-
-fn parse_line_segment(raw: &str, had_line_break: bool) -> SourceLine<'_> {
-    let ending = if !had_line_break {
-        LineEnding::Missing
-    } else if raw.ends_with('\r') {
-        LineEnding::CrLf
-    } else {
-        LineEnding::Lf
-    };
-    SourceLine { body: raw, ending }
 }
 
 /// When line-based diff finds no edits but the raw texts differ, Git still emits
@@ -163,7 +181,6 @@ fn format_hunk_side(start0: i64, count: i64) -> String {
 }
 
 /// Emit unified hunk bodies for precomputed edit spans (Myers / xdiff ops path).
-#[allow(clippy::too_many_arguments)]
 pub fn emit_unified_body_from_edits(
     before: &LineSide,
     after: &LineSide,
@@ -184,10 +201,10 @@ pub fn emit_unified_body_from_edits(
     let max_ignorable = ctxlen;
 
     let before_body = |i: i64| -> &str {
-        if i < 0 || i as usize >= before.lines.len() {
+        if i < 0 || i as usize >= before.len() {
             return "";
         }
-        before.lines[i as usize].body
+        before.line(i as usize).body
     };
     let next_hunk = |start: usize| -> Option<(usize, usize)> {
         let mut scr = start;
@@ -240,58 +257,114 @@ pub fn emit_unified_body_from_edits(
         Some((scr, lx))
     };
 
+    let is_func = |body: &str| is_func_line(body, funcname_matcher);
+    // Nearest function line of the old side from `start` toward `limit` (exclusive).
+    let func_line_toward = |start: i64, limit: i64| -> Option<i64> {
+        let step = if start > limit { -1 } else { 1 };
+        let mut l = start;
+        while l != limit && (0..before_len).contains(&l) {
+            if is_func(before_body(l)) {
+                return Some(l);
+            }
+            l += step;
+        }
+        None
+    };
+    let is_blank = |body: &str| body.bytes().all(|b| b.is_ascii_whitespace() || b == 0x0b);
+
     let mut out = String::new();
     let mut cursor = 0usize;
     while cursor < edits.len() {
-        let Some((first_idx, last_idx)) = next_hunk(cursor) else {
+        let Some((mut first_idx, mut last_idx)) = next_hunk(cursor) else {
             break;
         };
-        let first = &edits[first_idx];
-        let last = &edits[last_idx];
 
-        let mut b_start = (first.before_start - ctxlen).max(0);
-        let mut a_start = (first.after_start - ctxlen).max(0);
-        let mut post = ctxlen;
-        post = post.min(before_len - (last.before_start + last.before_len));
-        post = post.min(after_len - (last.after_start + last.after_len));
-        let mut b_end = last.before_start + last.before_len + post;
-        let mut a_end = last.after_start + last.after_len + post;
-
-        if options.function_context {
-            let mut func_start = first.before_start;
-            while func_start >= 0 && !is_func_line(before_body(func_start), funcname_matcher) {
-                func_start -= 1;
+        let (mut b_start, mut a_start);
+        let mut rewind_from = cursor;
+        loop {
+            let first = &edits[first_idx];
+            b_start = (first.before_start - ctxlen).max(0);
+            a_start = (first.after_start - ctxlen).max(0);
+            if !options.function_context {
+                break;
             }
+            let mut anchor = first.before_start;
+            if anchor >= before_len {
+                // An appended block that brings its own function needs no earlier context.
+                let adds_function =
+                    (first.after_start..after_len).any(|i| is_func(after.line(i as usize).body));
+                if adds_function {
+                    break;
+                }
+                anchor = before_len - 1;
+            }
+            let mut func_start = func_line_toward(anchor, -1).unwrap_or(-1);
             while func_start > 0
-                && !before_body(func_start - 1).trim().is_empty()
-                && !is_func_line(before_body(func_start - 1), funcname_matcher)
+                && !is_blank(before_body(func_start - 1))
+                && !is_func(before_body(func_start - 1))
             {
                 func_start -= 1;
             }
-            if func_start < 0 {
-                func_start = 0;
+            let func_start = func_start.max(0);
+            if func_start >= b_start {
+                break;
             }
-            if func_start < b_start {
-                a_start = (a_start - (b_start - func_start)).max(0);
-                b_start = func_start;
+            a_start = (a_start - (b_start - func_start)).max(0);
+            b_start = func_start;
+            // Show ignorable changes that the widened context now reaches into.
+            let reached = (rewind_from..first_idx).find(|&i| {
+                let e = &edits[i];
+                e.before_start + e.before_len > b_start || e.after_start + e.after_len > a_start
+            });
+            match reached {
+                Some(i) => {
+                    first_idx = i;
+                    rewind_from = i;
+                }
+                None => break,
             }
+        }
 
-            let end_before = last.before_start + last.before_len;
-            let mut func_end = end_before;
-            while func_end < before_len && !is_func_line(before_body(func_end), funcname_matcher) {
-                func_end += 1;
+        let (mut b_end, mut a_end);
+        loop {
+            let last = &edits[last_idx];
+            let last_before_end = last.before_start + last.before_len;
+            let last_after_end = last.after_start + last.after_len;
+            let post = ctxlen
+                .min(before_len - last_before_end)
+                .min(after_len - last_after_end);
+            b_end = last_before_end + post;
+            a_end = last_after_end + post;
+            if !options.function_context {
+                break;
             }
-            while func_end > 0 && before_body(func_end - 1).trim().is_empty() {
-                func_end -= 1;
-            }
-            if func_end > before_len {
-                func_end = before_len;
-            }
+            let func_end = match func_line_toward(last_before_end, before_len) {
+                Some(mut end) => {
+                    while end > 0 && is_blank(before_body(end - 1)) {
+                        end -= 1;
+                    }
+                    end
+                }
+                None => before_len,
+            };
             if func_end > b_end {
                 a_end = (a_end + (func_end - b_end)).min(after_len);
                 b_end = func_end;
             }
+            // Pull the next change in when it starts inside the widened hunk or within the same
+            // function.
+            let Some(next) = edits.get(last_idx + 1) else {
+                break;
+            };
+            let next_start = next.before_start.min(before_len - 1);
+            if next_start - ctxlen <= b_end || func_line_toward(next_start, b_end).is_none() {
+                last_idx += 1;
+                continue;
+            }
+            break;
         }
+        let first = &edits[first_idx];
+        let last = &edits[last_idx];
 
         let _ = writeln!(
             out,
@@ -302,7 +375,7 @@ pub fn emit_unified_body_from_edits(
 
         let mut a_cur = a_start;
         while a_cur < first.after_start {
-            write_patch_line(&mut out, ' ', after.line(a_cur as usize));
+            write_patch_line(&mut out, ' ', &after.line(a_cur as usize));
             a_cur += 1;
         }
 
@@ -312,18 +385,18 @@ pub fn emit_unified_body_from_edits(
         loop {
             let e = &edits[k];
             while b_cur < e.before_start && a_cur < e.after_start {
-                write_patch_line(&mut out, ' ', after.line(a_cur as usize));
+                write_patch_line(&mut out, ' ', &after.line(a_cur as usize));
                 b_cur += 1;
                 a_cur += 1;
             }
             let mut r = e.before_start;
             while r < e.before_start + e.before_len {
-                write_patch_line(&mut out, '-', before.line(r as usize));
+                write_patch_line(&mut out, '-', &before.line(r as usize));
                 r += 1;
             }
             let mut a = e.after_start;
             while a < e.after_start + e.after_len {
-                write_patch_line(&mut out, '+', after.line(a as usize));
+                write_patch_line(&mut out, '+', &after.line(a as usize));
                 a += 1;
             }
             if k == last_idx {
@@ -336,7 +409,7 @@ pub fn emit_unified_body_from_edits(
 
         let mut a_tail = last.after_start + last.after_len;
         while a_tail < a_end {
-            write_patch_line(&mut out, ' ', after.line(a_tail as usize));
+            write_patch_line(&mut out, ' ', &after.line(a_tail as usize));
             a_tail += 1;
         }
 
@@ -353,11 +426,12 @@ mod tests {
     #[test]
     fn split_preserves_crlf_in_body() {
         let side = LineSide::from_text("a\r\nb");
-        assert_eq!(side.lines.len(), 2);
-        assert_eq!(side.lines[0].body, "a\r");
-        assert_eq!(side.lines[0].ending, LineEnding::CrLf);
-        assert_eq!(side.lines[1].body, "b");
-        assert_eq!(side.lines[1].ending, LineEnding::Missing);
+        assert_eq!(side.len(), 2);
+        assert_eq!(side.line(0).body, "a\r");
+        assert_eq!(side.line(0).ending, LineEnding::CrLf);
+        assert_eq!(side.line(1).body, "b");
+        assert_eq!(side.line(1).ending, LineEnding::Missing);
+        assert_eq!(side.records(), ["a\r\n", "b"]);
     }
 
     #[test]
@@ -398,8 +472,8 @@ mod tests {
         let no_nl = LineSide::from_text("a\nb");
         let with_nl = LineSide::from_text("a\nb\n");
         assert_ne!(
-            line_diff_token(no_nl.line(1)),
-            line_diff_token(with_nl.line(1))
+            line_diff_token(&no_nl.line(1)),
+            line_diff_token(&with_nl.line(1))
         );
     }
 }

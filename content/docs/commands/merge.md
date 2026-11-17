@@ -18,12 +18,12 @@ grit merge [--ff-only | --no-ff] [--squash | --no-commit] [-X ours|theirs] [--co
 
 ## Description
 
-Brings the commits from `<rev>` into the current branch:
+Brings the commits from `<rev>` into the current branch. Pathnames in human, stderr conflict lines, and `--markdown` output use the same quoting rules as [`grit status`](../status/) (see **Description** there).
 
 - If the current branch already has everything, nothing changes.
 - If the current branch has no commits of its own since they diverged, it's moved forward to `<rev>` (a fast-forward). No new commit is made.
 - Otherwise both sides are merged. When there are no overlapping edits, a merge commit is recorded with the message `Merge <rev>`, using `<rev>` as you typed it. That commit gets a new `change-id` header like [`grit commit`](../commit/). When `commit.gpgsign` is enabled, that merge commit is signed like [`grit commit`](../commit/).
-- When the same lines were changed on both sides, `grit merge` stops with conflicts: it updates the index and working tree, writes conflict markers around each conflicting hunk, records merge-in-progress state (`MERGE_HEAD`, `ORIG_HEAD`, `MERGE_MSG`), and leaves the branch ref unchanged. Fix conflicts, then run `grit merge --continue` to create the two-parent merge commit (message from `MERGE_MSG` with comment lines stripped, or `-m` to override). When `commit.autoStage` is true (the default), `--continue` stages resolved paths from the work tree the same way [`grit commit`](../commit/) does, so you do not need `grit add` after editing away conflict markers. With `commit.autoStage=false`, stage resolved paths with `grit add` before `--continue`. [`grit commit`](../commit/) can also finish a resolved merge. Run `grit merge --abort` to discard the in-progress merge and restore the pre-merge branch, index, and working tree.
+- When the same lines were changed on both sides, `grit merge` stops with conflicts: it updates the index and working tree, writes conflict markers around each conflicting hunk, records merge-in-progress state (`MERGE_HEAD`, `ORIG_HEAD`, `MERGE_MSG`), and leaves the branch ref unchanged. When `rerere.enabled` is true (or `.git/rr-cache/` already exists), grit replays resolutions Git recorded in `.git/rr-cache/` and records new preimages and postimages in Git's format on conflict stops and when you `--continue` or [`grit commit`](../commit/) after resolving. Replayed files stay unstaged unless `rerere.autoupdate` is set; `--abort` drops unresolved rerere state like Git. Fix conflicts, then run `grit merge --continue` to create the two-parent merge commit (message from `MERGE_MSG` with comment lines stripped, or `-m` to override). When `commit.autoStage` is true (the default), `--continue` stages resolved paths from the work tree the same way [`grit commit`](../commit/) does, so you do not need `grit add` after editing away conflict markers. With `commit.autoStage=false`, stage resolved paths with `grit add` before `--continue`. [`grit commit`](../commit/) can also finish a resolved merge. Run `grit merge --abort` to discard the in-progress merge and restore the pre-merge branch, index, and working tree.
 - After a merge with `--no-commit` (when supported), run `grit merge --continue` to record the merge commit without re-running the three-way merge.
 
 Before a clean merge records its commit, grit runs the same hooks as Git, in Git's order: `pre-merge-commit` (no arguments), then `prepare-commit-msg .git/MERGE_MSG merge` and `commit-msg .git/MERGE_MSG`, which see `MERGE_HEAD` and may rewrite the message (the commit records what they leave). Files a `pre-merge-commit` hook stages go into the merge commit. When one of them exits non-zero, the merge stops with exit **1** and a `hook_failed` error (as for [`grit commit`](../commit/)): the merged files stay in the work tree and index, `MERGE_HEAD`, `ORIG_HEAD` and `MERGE_MSG` are recorded, and the branch does not move. Finish with `grit merge --continue` (which runs `pre-commit` like `grit commit`, as Git does) or cancel with `grit merge --abort`; edits a [`grit pull --autostash`](../pull/) stashed come back either way. `--no-verify` skips `pre-merge-commit` and `commit-msg`; `prepare-commit-msg` and `post-merge` still run. None of these run for a fast-forward, `--squash`, `--no-commit`, conflicts, `--check` or `--dry-run`.
@@ -78,9 +78,11 @@ With a **detached `HEAD`**, grit merges into `HEAD` like Git: a fast-forward or 
 
 `-m` / `-F` / `--message-file` override the default merge commit message and the text stored in `MERGE_MSG` on conflicts or `--no-commit`.
 
-**`-X ours|theirs`** — When both sides edited the same region, prefer the current branch (`ours`) or the branch being merged (`theirs`) instead of leaving conflict markers. Matches Git's merge strategy options (union is not exposed).
+**`-X ours|theirs`** — When both sides edited the same region, prefer the current branch (`ours`) or the branch being merged (`theirs`) instead of leaving conflict markers. Matches Git's merge strategy options (union is not exposed). `--check` and `--dry-run` honor the same option when predicting the outcome.
 
 **`--conflict diff3|zdiff3|merge`** — Conflict marker style in the worktree. When omitted, grit reads `merge.conflictStyle` (default `merge`).
+
+Textual merges during a three-way tree merge use the histogram diff algorithm, matching Git's merge-ort strategy (distinct from `git merge-file`, which uses Myers).
 
 **`--allow-unrelated-histories`** — Merge branches that share no commits, using the empty tree as the merge base (Git-compatible). Without this flag, grit refuses unrelated histories.
 
@@ -112,7 +114,7 @@ Merged theirs into the current branch (06e1c12)
 | Option | Description |
 | --- | --- |
 | `<rev>` | The branch, tag or commit to merge into the current one. |
-| `--check` | Predict whether the merge would succeed without changing refs, the index, or the working tree. Exit **0** when it would fast-forward, already be up to date, or merge cleanly; exit **1** when it would conflict. Other failures use the usual error exit. |
+| `--check` | Predict whether the merge would succeed without changing refs, the index, or the working tree. Exit **0** when it would fast-forward, already be up to date, or merge cleanly; exit **1** when it would conflict. Uses the same `-X ours\|theirs` as the merge it predicts. Other failures use the usual error exit. |
 | `--dry-run` | Report the planned merge outcome (up to date, fast-forward, merge commit with parents, or conflicts) without changing refs, the index, or the working tree. Exit **0** unless the merge would be refused (for example `--ff-only` when a fast-forward is not possible, exit **128**). Conflicts are reported in the JSON but do not fail the command. Mutually exclusive with `--check`. |
 | `--continue` | Finish an in-progress merge after conflicts are resolved (or after `--no-commit`). Auto-stages resolved paths when `commit.autoStage` is true (default). Conflicts with `<rev>`, `--check`, and `--abort`. |
 | `-m`, `--message` | Commit message for `--continue` only (overrides `MERGE_MSG`). |
@@ -171,6 +173,8 @@ CONFLICT (deleted_by_us): f deleted on the current branch and modified in feat; 
 
 Automatic merge failed; fix conflicts and run `grit merge --continue`, or run `grit merge --abort`.
 ```
+
+When one branch deleted a file and the other renamed it, grit reports the same `deleted_by_us` conflict at the **new** path (the rename target), with unmerged stages in the index and the renamed side's content in the work tree. `grit merge --check` exits **1** for this case, as it does for modify/delete.
 
 When both branches renamed the same file to different names, grit cannot pick a name, so it stops (like Git) and keeps both names in the work tree. Each one holds the merged content. The old name stays unmerged in the index next to the two new names. To keep one name, remove the old name and the other new name with `grit rm`, then run `grit merge --continue`. `grit merge --check` exits **1** for this case.
 
@@ -275,6 +279,7 @@ Pass `--json` for stable, scripting-friendly output:
 | `parents` | array or null | For `--dry-run` with `result: merged`, the two parent commit ids of the merge commit that would be recorded. |
 | `change_id` | string or null | Stored `change-id` on `oid` when present (merge commit or fast-forward tip). |
 | `conflicts` | array or null | When `result` is `conflicts`, each item has `path`, a [conflict `kind`](../status/#conflict-kinds) (the same names `grit status` uses, plus `rename_rename` and the `directory_rename_*` kinds), and optional `summary` text for `deleted_by_us`, `deleted_by_them`, `rename_rename` and directory rename conflicts. A `rename_rename` conflict lists all three paths (the old name and both new names); the `summary` is on the old name's item. |
+| `rerere` | array | When rerere is active on `conflicts` or after a successful `merged` from `--continue`, each item has `path` and `kind`: `resolved_from_previous`, `staged_from_previous`, `recorded_preimage`, or `recorded_resolution`. Omitted when empty. |
 | `next_steps` | array or null | Ordered follow-up commands when `result` is `conflicts` (for example `grit diff`, `grit add .`), or suggested commands when `result` is `squashed` or `stopped`. |
 | `alternatives` | array or null | Mutually exclusive options such as `grit merge --abort` (not part of the ordered sequence). |
 

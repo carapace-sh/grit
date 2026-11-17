@@ -1,7 +1,7 @@
 //! Clone honours cancellation during the post-fetch checkout phase.
 
 use grit_lib::error::Error;
-use grit_lib::progress::{Cancel, FlagCancel, ProgressPhase, ProgressSink};
+use grit_lib::progress::{CancelToken, ProgressPhase, ProgressSink};
 use grit_lib::remote::clone::{cleanup_failed_clone, clone, CloneError, CloneOptions};
 use grit_lib::remote::fetch::Progress;
 use std::path::Path;
@@ -9,7 +9,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 struct CancelCheckoutOnFiles {
-    flag: FlagCancel,
+    flag: CancelToken,
     checkout_incs: AtomicU64,
     limit: u64,
     in_checkout: AtomicBool,
@@ -18,7 +18,7 @@ struct CancelCheckoutOnFiles {
 impl CancelCheckoutOnFiles {
     fn new(limit: u64) -> Self {
         Self {
-            flag: FlagCancel::new(),
+            flag: CancelToken::new(),
             checkout_incs: AtomicU64::new(0),
             limit,
             in_checkout: AtomicBool::new(false),
@@ -44,10 +44,6 @@ impl ProgressSink for CancelCheckoutOnFiles {
         if prev + units >= self.limit {
             self.flag.cancel();
         }
-    }
-
-    fn should_cancel(&self) -> bool {
-        self.flag.is_cancelled()
     }
 }
 
@@ -123,7 +119,7 @@ fn clone_returns_cancelled_when_checkout_progress_requests_abort() {
     )
     .expect_err("cancel during checkout");
     assert!(
-        matches!(err, CloneError::Library(Error::Cancelled)),
+        matches!(err, CloneError::Nested(e) if matches!(e.as_ref(), Error::Cancelled)),
         "expected cancelled clone, got {err:?}"
     );
     let checkout_incs = progress.checkout_incs.load(Ordering::Relaxed);

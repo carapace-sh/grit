@@ -5,8 +5,8 @@
 
 use crate::command_runner::{
     git_for_windows_tool_dirs, prepend_to_child_path, system_command_runner, CommandEnvironment,
-    CommandRunner, CommandSpec, CommandStdin, CommandStdio, RunningCommand, ScriptInterpreter,
-    ShellInvocation,
+    CommandRunner, CommandSpec, CommandStdin, CommandStdio, ConcurrentStdinFeed, RunningCommand,
+    ScriptInterpreter, ShellInvocation,
 };
 use crate::config::{parse_path, ConfigSet};
 use crate::environment::Environment;
@@ -22,7 +22,10 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 use thiserror::Error;
+
+use crate::progress::CancelToken;
 
 /// Whether `err` means the OS would not execute the file as a program, so it must be run
 /// through a shell (`ENOEXEC` on Unix, `ERROR_BAD_EXE_FORMAT` on Windows).
@@ -84,6 +87,7 @@ impl HookOutput {
 
 /// Hook subprocess failure (non-zero exit or spawn error).
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum HookError {
     /// A hook ran and returned a non-zero exit status.
     ///
@@ -112,25 +116,25 @@ pub enum HookError {
         /// under [`HookStdio::Inherit`].
         output: HookOutput,
     },
-    /// Configuration or internal error while resolving hooks.
-    #[error("{0}")]
-    Internal(String),
+
+    /// A configured hook event references `hook.<name>` without `hook.<name>.command`.
+    #[error(
+        "'hook.{hook_name}.command' must be configured or 'hook.{hook_name}.event' must be removed; aborting."
+    )]
+    MissingHookCommand {
+        /// Configured hook name (`hook.<name>.*`).
+        hook_name: String,
+    },
 }
 
 impl HookError {
-    /// Hook output captured before the failure, or `None` for [`HookError::Internal`].
+    /// Hook output captured before the failure, or `None` for configuration and repository errors.
     #[must_use]
     pub fn output(&self) -> Option<&HookOutput> {
         match self {
             HookError::Failed { output, .. } | HookError::Spawn { output, .. } => Some(output),
-            HookError::Internal(_) => None,
+            HookError::MissingHookCommand { .. } => None,
         }
-    }
-}
-
-impl From<String> for HookError {
-    fn from(value: String) -> Self {
-        Self::Internal(value)
     }
 }
 
@@ -309,7 +313,7 @@ impl HookConfigTables {
     /// Configured hooks for `event`, in order, excluding disabled entries without a command.
     ///
     /// Returns `Err` if a non-disabled hook lacks `hook.<name>.command` (Git dies here).
-    fn hooks_for_event(&self, event: &str) -> Result<Vec<(String, String)>, String> {
+    fn hooks_for_event(&self, event: &str) -> crate::error::Result<Vec<(String, String)>> {
         let Some(names) = self.event_hooks.get(event) else {
             return Ok(Vec::new());
         };
@@ -319,9 +323,10 @@ impl HookConfigTables {
                 continue;
             }
             let Some(cmd) = self.commands.get(name) else {
-                return Err(format!(
-                    "'hook.{name}.command' must be configured or 'hook.{name}.event' must be removed; aborting."
-                ));
+                return Err(HookError::MissingHookCommand {
+                    hook_name: name.clone(),
+                }
+                .into());
             };
             out.push((name.clone(), cmd.clone()));
         }
@@ -344,12 +349,12 @@ enum ResolvedHook {
 ///
 /// Never carries a Windows `\\?\` prefix, so the path can be shown to users and handed to
 /// hook interpreters such as Git for Windows' `sh`.
-pub fn resolve_hooks_dir(repo: &Repository) -> PathBuf {
-    resolve_hooks_dir_for_config(repo, repo.config().ok().as_deref())
+pub(crate) fn resolve_hooks_dir(repo: &Repository) -> PathBuf {
+    resolve_hooks_dir_for_config(repo, repo.config().snapshot().ok().as_deref())
 }
 
 fn resolve_hooks_dir_for_config(repo: &Repository, config: Option<&ConfigSet>) -> PathBuf {
-    let dir = match config.and_then(|cfg| cfg.get("core.hooksPath")) {
+    let dir = match config.and_then(|cfg| cfg.value("core.hooksPath")) {
         Some(hooks_path) => {
             let p = PathBuf::from(parse_path(repo.environment(), &hooks_path));
             if p.is_absolute() {
@@ -417,10 +422,10 @@ fn traditional_hook_candidate(
     let meta = fs::metadata(&path).ok()?;
     #[cfg(unix)]
     if meta.permissions().mode() & 0o111 == 0 {
-        let config = repo.config().ok();
+        let config = repo.config().snapshot().ok();
         let show_warning = config
             .as_deref()
-            .and_then(|c| c.get("advice.ignoredHook"))
+            .and_then(|c| c.value("advice.ignoredHook"))
             .map(|v| !matches!(v.to_lowercase().as_str(), "false" | "no" | "off" | "0"))
             .unwrap_or(true);
         if show_warning {
@@ -438,7 +443,7 @@ fn traditional_hook_candidate(
 fn resolve_configured_hooks_only(
     hook_name: &str,
     config: &ConfigSet,
-) -> Result<Vec<ResolvedHook>, String> {
+) -> crate::error::Result<Vec<ResolvedHook>> {
     let tables = HookConfigTables::from_config(config);
     let mut seq = Vec::new();
     for (_friendly, command) in tables.hooks_for_event(hook_name)? {
@@ -452,7 +457,7 @@ fn resolve_hook_sequence(
     repo: &Repository,
     hook_name: &str,
     config: &ConfigSet,
-) -> Result<Vec<ResolvedHook>, String> {
+) -> crate::error::Result<Vec<ResolvedHook>> {
     let tables = HookConfigTables::from_config(config);
     let mut seq = Vec::new();
     for (_friendly, command) in tables.hooks_for_event(hook_name)? {
@@ -529,6 +534,7 @@ struct HookSpawnContext<'a> {
     stdin_piped: bool,
     stdout: CommandStdio,
     stderr: CommandStdio,
+    server_receive_hook: bool,
 }
 
 impl HookSpawnContext<'_> {
@@ -568,13 +574,18 @@ impl HookSpawnContext<'_> {
         spec
     }
 
-    fn spawn(&self, spec: &CommandSpec, hook_name: &str) -> Result<RunningCommand, HookError> {
-        self.runner.spawn(spec).map_err(|source| HookError::Spawn {
+    fn spawn(&self, spec: &CommandSpec, hook_name: &str) -> crate::error::Result<RunningCommand> {
+        let spawn = if self.server_receive_hook {
+            self.runner.spawn_server_receive_hook(spec)
+        } else {
+            self.runner.spawn(spec)
+        };
+        Ok(spawn.map_err(|source| HookError::Spawn {
             hook_name: hook_name.to_owned(),
             path: spec.program.clone(),
             source,
             output: HookOutput::default(),
-        })
+        })?)
     }
 
     /// Run `script` (spelled `argv0` for the child) directly, or through a shell when the OS
@@ -587,7 +598,7 @@ impl HookSpawnContext<'_> {
         script: &Path,
         argv0: &Path,
         args: &[&str],
-    ) -> Result<RunningCommand, HookError> {
+    ) -> crate::error::Result<RunningCommand> {
         let argv0 = path_without_verbatim_prefix(argv0);
         let via_shell = |shell: ScriptInterpreter| {
             let invocation = ShellInvocation::ScriptPath {
@@ -601,17 +612,13 @@ impl HookSpawnContext<'_> {
             return self.spawn(&via_shell(interpreter), hook_name);
         }
         let direct = self.spec(argv0.to_path_buf(), None, args);
-        match self.runner.spawn(&direct) {
-            Err(e) if is_not_an_executable(&e) => {
+        match self.spawn(&direct, hook_name) {
+            Err(crate::error::Error::Hook(HookError::Spawn { source, .. }))
+                if is_not_an_executable(&source) =>
+            {
                 self.spawn(&via_shell(hook_shell(self.env)), hook_name)
             }
-            Err(source) => Err(HookError::Spawn {
-                hook_name: hook_name.to_owned(),
-                path: direct.program,
-                source,
-                output: HookOutput::default(),
-            }),
-            Ok(child) => Ok(child),
+            other => other,
         }
     }
 
@@ -621,7 +628,7 @@ impl HookSpawnContext<'_> {
         hook_name: &str,
         command: &str,
         args: &[&str],
-    ) -> Result<RunningCommand, HookError> {
+    ) -> crate::error::Result<RunningCommand> {
         let invocation = ShellInvocation::DashC {
             script: command.to_owned(),
             argv0: Some("hook".to_owned()),
@@ -769,7 +776,7 @@ pub(crate) fn run_advisory_hook(
 /// Returns whether a hook ran (a non-zero exit still counts). The hook's outcome is never an
 /// error: a hook that cannot be started is reported as
 /// [`Warning::HookNotRun`](crate::diagnostics::Warning::HookNotRun) and returns `false`.
-pub fn run_post_checkout(
+pub(crate) fn run_post_checkout(
     repo: &Repository,
     old: Option<ObjectId>,
     new: ObjectId,
@@ -793,7 +800,7 @@ pub fn run_post_checkout(
 /// `1` for a squash merge and `0` otherwise.
 ///
 /// Returns whether a hook ran; failures never become errors (see [`run_post_checkout`]).
-pub fn run_post_merge(repo: &Repository, squash: bool) -> bool {
+pub(crate) fn run_post_merge(repo: &Repository, squash: bool) -> bool {
     run_advisory_hook(
         repo,
         HookName::PostMerge,
@@ -815,8 +822,12 @@ pub fn run_post_merge(repo: &Repository, squash: bool) -> bool {
 /// # Errors
 ///
 /// [`HookError::Failed`] when the hook exits non-zero, which refuses the rebase;
-/// [`HookError::Spawn`] / [`HookError::Internal`] as for [`run_hook`].
-pub fn run_pre_rebase(repo: &Repository, upstream: Option<&str>) -> Result<bool, HookError> {
+/// [`HookError::Spawn`], repository errors, or [`HookError::MissingHookCommand`] as for
+/// [`run_hook`].
+pub(crate) fn run_pre_rebase(
+    repo: &Repository,
+    upstream: Option<&str>,
+) -> crate::error::Result<bool> {
     let configured;
     let upstream_arg = match upstream {
         Some(arg) => arg,
@@ -853,7 +864,7 @@ pub fn post_rewrite_stdin(pairs: &[(ObjectId, ObjectId)]) -> Vec<u8> {
 ///
 /// Nothing runs when `pairs` is empty. Returns whether a hook ran; failures never become errors
 /// (see [`run_post_checkout`]).
-pub fn run_post_rewrite(
+pub(crate) fn run_post_rewrite(
     repo: &Repository,
     kind: RewriteKind,
     pairs: &[(ObjectId, ObjectId)],
@@ -928,7 +939,7 @@ impl HookResult {
     /// # Errors
     ///
     /// [`HookError::Failed`] carrying the status and captured output when a hook exited non-zero.
-    pub fn check(self, hook_name: &str) -> Result<bool, HookError> {
+    pub fn check(self, hook_name: &str) -> crate::error::Result<bool> {
         match self {
             HookResult::Success { .. } => Ok(true),
             HookResult::NotFound => Ok(false),
@@ -936,7 +947,8 @@ impl HookResult {
                 hook_name: hook_name.to_owned(),
                 status,
                 output,
-            }),
+            }
+            .into()),
         }
     }
 }
@@ -972,18 +984,178 @@ pub struct RunHookOptions<'a> {
 /// [`HookOutput`], or written by the child straight to this process's stderr. The library
 /// never re-emits what a hook (or an injected [`CommandRunner`]) produced.
 ///
+const HOOK_WAIT_POLL: Duration = Duration::from_millis(50);
+
+fn kill_pid_sigkill(pid: u32, kill_process_group: bool) {
+    crate::command_runner::force_kill_process_pid(pid, kill_process_group);
+}
+
+fn wait_hook_command(
+    child: RunningCommand,
+    capture: bool,
+    cancel: &CancelToken,
+    output: &mut HookOutput,
+) -> crate::error::Result<crate::command_runner::CommandExit> {
+    use crate::command_runner::CommandOutput;
+
+    if cancel.is_cancelled() {
+        return stop_hook_child(child, capture, output);
+    }
+
+    if child.child_pid().is_none() {
+        return finish_hook_wait(child, capture, output);
+    }
+
+    let pid = child.child_pid();
+    let kill_process_group = child.kill_process_group();
+    let shared = std::sync::Arc::new(std::sync::Mutex::new(Some(child)));
+    let shared_wait = std::sync::Arc::clone(&shared);
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let child = shared_wait.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let Some(child) = child else {
+            return;
+        };
+        let result = if capture {
+            child.wait_with_output()
+        } else {
+            child.wait().map(|status| CommandOutput {
+                status,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            })
+        };
+        let _ = tx.send(result);
+    });
+
+    loop {
+        if cancel.is_cancelled() {
+            if let Some(mut child) = shared.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                let _ = child.kill();
+                if capture {
+                    if let Ok(out) = child.wait_with_output() {
+                        output.stdout.extend_from_slice(&out.stdout);
+                        output.stderr.extend_from_slice(&out.stderr);
+                    }
+                } else {
+                    let _ = child.wait();
+                }
+            }
+            if let Some(pid) = pid {
+                kill_pid_sigkill(pid, kill_process_group);
+            }
+            if let Ok(Ok(out)) = rx.recv_timeout(HOOK_WAIT_POLL.saturating_mul(20)) {
+                if capture {
+                    output.stdout.extend_from_slice(&out.stdout);
+                    output.stderr.extend_from_slice(&out.stderr);
+                }
+            }
+            return Err(crate::error::Error::Cancelled);
+        }
+        match rx.try_recv() {
+            Ok(Ok(out)) => {
+                if capture {
+                    output.stdout.extend_from_slice(&out.stdout);
+                    output.stderr.extend_from_slice(&out.stderr);
+                }
+                return Ok(out.status);
+            }
+            Ok(Err(_)) => {
+                return Ok(crate::command_runner::CommandExit {
+                    success: false,
+                    code: Some(1),
+                });
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                std::thread::sleep(HOOK_WAIT_POLL);
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                return Ok(crate::command_runner::CommandExit {
+                    success: false,
+                    code: Some(1),
+                });
+            }
+        }
+    }
+}
+
+fn stop_hook_child(
+    child: RunningCommand,
+    capture: bool,
+    output: &mut HookOutput,
+) -> crate::error::Result<crate::command_runner::CommandExit> {
+    let pid = child.child_pid();
+    let kill_process_group = child.kill_process_group();
+    let mut child = child;
+    let _ = child.kill();
+    let _ = finish_hook_wait(child, capture, output);
+    if let Some(pid) = pid {
+        kill_pid_sigkill(pid, kill_process_group);
+    }
+    Err(crate::error::Error::Cancelled)
+}
+
+fn finish_hook_wait(
+    child: RunningCommand,
+    capture: bool,
+    output: &mut HookOutput,
+) -> crate::error::Result<crate::command_runner::CommandExit> {
+    if capture {
+        match child.wait_with_output() {
+            Ok(out) => {
+                output.stdout.extend_from_slice(&out.stdout);
+                output.stderr.extend_from_slice(&out.stderr);
+                Ok(out.status)
+            }
+            Err(_) => Ok(crate::command_runner::CommandExit {
+                success: false,
+                code: Some(1),
+            }),
+        }
+    } else {
+        match child.wait() {
+            Ok(status) => Ok(status),
+            Err(_) => Ok(crate::command_runner::CommandExit {
+                success: false,
+                code: Some(1),
+            }),
+        }
+    }
+}
+
 /// # Errors
 ///
 /// [`HookError::Spawn`] when a hook (or the shell that runs it) cannot be started, carrying the
-/// output earlier hooks for the event already wrote, and [`HookError::Internal`] for invalid
-/// `hook.*` configuration. A hook that runs and exits non-zero is `Ok(HookResult::Failed { .. })`.
-pub fn run_hook_opts(
+/// output earlier hooks for the event already wrote, and [`HookError::MissingHookCommand`] for an
+/// incomplete `hook.*` configuration. A hook that runs and exits non-zero is
+/// `Ok(HookResult::Failed { .. })`.
+pub(crate) fn run_hook_opts(
     repo: Option<&Repository>,
     hook_name: &str,
     args: &[&str],
     config: &ConfigSet,
     opts: RunHookOptions<'_>,
-) -> Result<HookResult, HookError> {
+) -> crate::error::Result<HookResult> {
+    run_hook_opts_with_cancel(
+        repo,
+        hook_name,
+        args,
+        config,
+        opts,
+        &CancelToken::never(),
+        false,
+    )
+}
+
+fn run_hook_opts_with_cancel(
+    repo: Option<&Repository>,
+    hook_name: &str,
+    args: &[&str],
+    config: &ConfigSet,
+    opts: RunHookOptions<'_>,
+    cancel: &CancelToken,
+    server_receive_hook: bool,
+) -> crate::error::Result<HookResult> {
     let seq = match repo {
         Some(r) => resolve_hook_sequence(r, hook_name, config)?,
         None => resolve_configured_hooks_only(hook_name, config)?,
@@ -1048,6 +1220,7 @@ pub fn run_hook_opts(
             stdin_piped,
             stdout,
             stderr,
+            server_receive_hook,
         };
         let spawned = match h {
             ResolvedHook::Traditional { path, argv0 } => {
@@ -1064,54 +1237,85 @@ pub fn run_hook_opts(
         };
         let mut child = match spawned {
             Ok(child) => child,
-            Err(HookError::Spawn {
+            Err(crate::error::Error::Hook(HookError::Spawn {
                 hook_name,
                 path,
                 source,
                 ..
-            }) => {
+            })) => {
                 return Err(HookError::Spawn {
                     hook_name,
                     path,
                     source,
                     output,
-                })
+                }
+                .into())
             }
             Err(other) => return Err(other),
         };
 
-        if let Some(ref path) = stdin_file {
-            let file = match fs::File::open(path) {
-                Ok(f) => f,
-                Err(_e) => {
-                    return Ok(HookResult::Failed { status: 1, output });
+        let exit = if capture && stdin_piped && (stdin_file.is_some() || opts.stdin_data.is_some())
+        {
+            if cancel.is_cancelled() {
+                let pid = child.child_pid();
+                let kill_process_group = child.kill_process_group();
+                let mut child = child;
+                let _ = child.kill();
+                if let Some(pid) = pid {
+                    kill_pid_sigkill(pid, kill_process_group);
                 }
+                return Err(crate::error::Error::Cancelled);
+            }
+            let output_result = if let Some(ref path) = stdin_file {
+                let file = match fs::File::open(path) {
+                    Ok(f) => f,
+                    Err(_e) => {
+                        return Ok(HookResult::Failed { status: 1, output });
+                    }
+                };
+                child.feed_stdin_and_wait_with_output(Some(ConcurrentStdinFeed::File(file)))
+            } else if let Some(data) = opts.stdin_data {
+                child.feed_stdin_and_wait_with_output(Some(ConcurrentStdinFeed::Bytes(data)))
+            } else {
+                child.close_stdin();
+                child.wait_with_output()
             };
-            if let Some(stdin) = child.stdin_mut() {
-                let mut file = file;
-                let _ = std::io::copy(&mut file, stdin);
+            match output_result {
+                Ok(o) => {
+                    output.stdout.extend_from_slice(&o.stdout);
+                    output.stderr.extend_from_slice(&o.stderr);
+                    o.status
+                }
+                Err(_) => crate::command_runner::CommandExit {
+                    success: false,
+                    code: Some(1),
+                },
             }
-        } else if let Some(data) = opts.stdin_data {
-            if let Some(stdin) = child.stdin_mut() {
-                let _ = stdin.write_all(data);
-            }
-        }
-        if stdin_piped {
-            child.close_stdin();
-        }
-
-        let waited = if capture {
-            child.wait_with_output().map(|o| {
-                output.stdout.extend_from_slice(&o.stdout);
-                output.stderr.extend_from_slice(&o.stderr);
-                o.status
-            })
         } else {
-            child.wait()
-        };
-        let exit = match waited {
-            Ok(exit) => exit,
-            Err(_) => return Ok(HookResult::Failed { status: 1, output }),
+            if let Some(ref path) = stdin_file {
+                let file = match fs::File::open(path) {
+                    Ok(f) => f,
+                    Err(_e) => {
+                        return Ok(HookResult::Failed { status: 1, output });
+                    }
+                };
+                if let Some(stdin) = child.stdin_mut() {
+                    let mut file = file;
+                    let _ = crate::sigpipe::copy(&mut file, stdin);
+                }
+            } else if let Some(data) = opts.stdin_data {
+                if let Some(stdin) = child.stdin_mut() {
+                    let _ = crate::sigpipe::write_all(stdin, data);
+                }
+            }
+            if stdin_piped {
+                child.close_stdin();
+            }
+            match wait_hook_command(child, capture, cancel, &mut output) {
+                Ok(exit) => exit,
+                Err(crate::error::Error::Cancelled) => return Err(crate::error::Error::Cancelled),
+                Err(other) => return Err(other),
+            }
         };
 
         if !exit.success {
@@ -1138,13 +1342,13 @@ pub fn run_hook_opts(
 ///
 /// [`HookError::Failed`] with the hook's exit status and captured output, or any error from
 /// [`run_commit_hook`].
-pub fn run_commit_hook_checked(
+pub(crate) fn run_commit_hook_checked(
     repo: &Repository,
     hook_name: &str,
     args: &[&str],
     stdin_data: Option<&[u8]>,
     commit_env: &CommitHookEnv<'_>,
-) -> Result<(), HookError> {
+) -> crate::error::Result<()> {
     run_commit_hook(repo, hook_name, args, stdin_data, commit_env)?
         .check(hook_name)
         .map(drop)
@@ -1156,19 +1360,37 @@ pub fn run_commit_hook_checked(
 ///
 /// # Errors
 ///
-/// [`HookError::Spawn`] when a hook cannot be started, [`HookError::Internal`] when the
-/// repository config cannot be loaded or `hook.*` entries are invalid.
-pub fn run_commit_hook(
+/// [`HookError::Spawn`] when a hook cannot be started, repository errors when repository
+/// config cannot be loaded, or [`HookError::MissingHookCommand`] when a configured hook has no
+/// command.
+pub(crate) fn run_commit_hook(
     repo: &Repository,
     hook_name: &str,
     args: &[&str],
     stdin_data: Option<&[u8]>,
     commit_env: &CommitHookEnv<'_>,
-) -> Result<HookResult, HookError> {
-    let config = repo
-        .config()
-        .map_err(|e| HookError::Internal(e.to_string()))?;
-    run_hook_opts(
+) -> crate::error::Result<HookResult> {
+    run_commit_hook_with_cancel(
+        repo,
+        hook_name,
+        args,
+        stdin_data,
+        commit_env,
+        &CancelToken::never(),
+    )
+}
+
+/// Like [`run_commit_hook`] but honours [`Cancel`] while hook subprocesses run.
+pub(crate) fn run_commit_hook_with_cancel(
+    repo: &Repository,
+    hook_name: &str,
+    args: &[&str],
+    stdin_data: Option<&[u8]>,
+    commit_env: &CommitHookEnv<'_>,
+    cancel: &CancelToken,
+) -> crate::error::Result<HookResult> {
+    let config = repo.config().snapshot()?;
+    run_hook_opts_with_cancel(
         Some(repo),
         hook_name,
         args,
@@ -1178,6 +1400,8 @@ pub fn run_commit_hook(
             commit_env: Some(commit_env),
             ..repo_hook_options(repo, hook_name)
         },
+        cancel,
+        false,
     )
 }
 
@@ -1198,17 +1422,16 @@ fn repo_hook_options<'a>(repo: &Repository, hook_name: &str) -> RunHookOptions<'
 ///
 /// # Errors
 ///
-/// [`HookError::Spawn`] when a hook cannot be started, [`HookError::Internal`] when the
-/// repository config cannot be loaded or `hook.*` entries are invalid.
-pub fn run_hook(
+/// [`HookError::Spawn`] when a hook cannot be started, repository errors when repository
+/// config cannot be loaded, or [`HookError::MissingHookCommand`] when a configured hook has no
+/// command.
+pub(crate) fn run_hook(
     repo: &Repository,
     hook_name: &str,
     args: &[&str],
     stdin_data: Option<&[u8]>,
-) -> Result<HookResult, HookError> {
-    let config = repo
-        .config()
-        .map_err(|e| HookError::Internal(e.to_string()))?;
+) -> crate::error::Result<HookResult> {
+    let config = repo.config().snapshot()?;
     run_hook_opts(
         Some(repo),
         hook_name,
@@ -1229,24 +1452,49 @@ pub fn run_hook(
 /// Output is always captured, whatever [`Repository::hook_stdio`] says, because the server
 /// relays it to the client over the sideband. A hook that cannot be resolved or started is
 /// reported as `Failed { status: 1 }` so the push is declined.
-pub fn run_hook_in_git_dir(
+pub(crate) fn run_hook_in_git_dir(
     repo: &Repository,
     hook_name: &str,
     args: &[&str],
     stdin_data: Option<&[u8]>,
     env_vars: &[(&str, &str)],
 ) -> HookResult {
-    let declined = || HookResult::Failed {
+    run_hook_in_git_dir_with_cancel(
+        repo,
+        hook_name,
+        args,
+        stdin_data,
+        env_vars,
+        &CancelToken::never(),
+    )
+    .unwrap_or_else(|_| hook_declined())
+}
+
+fn hook_declined() -> HookResult {
+    HookResult::Failed {
         status: 1,
         output: HookOutput::default(),
-    };
+    }
+}
+
+/// Like [`run_hook_in_git_dir`], but honours [`CancelToken`](crate::progress::CancelToken) and can terminate the hook process group.
+///
+/// # Errors
+///
+/// [`Error::Cancelled`](crate::error::Error::Cancelled) when `cancel` is set while a hook subprocess runs.
+pub(crate) fn run_hook_in_git_dir_with_cancel(
+    repo: &Repository,
+    hook_name: &str,
+    args: &[&str],
+    stdin_data: Option<&[u8]>,
+    env_vars: &[(&str, &str)],
+    cancel: &CancelToken,
+) -> crate::error::Result<HookResult> {
     let env_vars: Vec<(&str, &str)> = std::iter::once(("GIT_DIR", "."))
         .chain(env_vars.iter().copied())
         .collect();
-    let Some(config) = repo.config().ok() else {
-        return declined();
-    };
-    run_hook_opts(
+    let config = repo.config().snapshot()?;
+    run_hook_opts_with_cancel(
         Some(repo),
         hook_name,
         args,
@@ -1259,8 +1507,9 @@ pub fn run_hook_in_git_dir(
             cwd: Some(repo.git_dir()),
             ..RunHookOptions::default()
         },
+        cancel,
+        true,
     )
-    .unwrap_or_else(|_| declined())
 }
 
 /// One ref update a push is about to make, as reported to the `pre-push` hook.
@@ -1313,17 +1562,15 @@ impl PrePushRef {
 /// # Errors
 ///
 /// [`HookError::Failed`] when the hook exits non-zero (the push must not proceed),
-/// [`HookError::Spawn`] when it cannot be started, and [`HookError::Internal`] when the
-/// configuration cannot be loaded or `hook.*` entries are invalid.
-pub fn run_pre_push_hook(
+/// [`HookError::Spawn`] when it cannot be started, repository errors when configuration
+/// cannot be loaded, and [`HookError::MissingHookCommand`] when a configured hook has no command.
+pub(crate) fn run_pre_push_hook(
     repo: &Repository,
     remote: &str,
     url: &str,
     refs: &[PrePushRef],
-) -> Result<HookOutput, HookError> {
-    let config = repo
-        .config()
-        .map_err(|e| HookError::Internal(e.to_string()))?;
+) -> crate::error::Result<HookOutput> {
+    let config = repo.config().snapshot()?;
     let algo = repo.odb().hash_algo();
     let stdin: String = refs.iter().map(|r| r.stdin_line(algo)).collect();
     let result = run_hook_opts(
@@ -1418,10 +1665,13 @@ impl RefHookContext {
         self.work_tree.as_deref().unwrap_or(&self.git_dir)
     }
 
-    fn load_config(&self) -> Result<Arc<crate::config::ConfigSet>, HookError> {
-        crate::config::ConfigSet::load(&self.environment, Some(&self.git_dir), true)
-            .map(Arc::new)
-            .map_err(|e| HookError::Internal(e.to_string()))
+    fn load_config(&self) -> crate::error::Result<Arc<crate::config::ConfigSet>> {
+        crate::config::ConfigSet::load(
+            &self.environment,
+            Some(&self.git_dir),
+            &crate::config::LoadConfigOptions::standard(&self.environment, Some(&self.git_dir)),
+        )
+        .map(Arc::new)
     }
 
     /// Run the `reference-transaction` hook for one phase and stdin payload.
@@ -1432,7 +1682,7 @@ impl RefHookContext {
         &self,
         phase: ReferenceTransactionPhase,
         stdin: &[u8],
-    ) -> Result<(), HookError> {
+    ) -> crate::error::Result<()> {
         if stdin.is_empty() {
             return Ok(());
         }
@@ -1448,6 +1698,7 @@ impl RefHookContext {
                 stdio: self.hook_stdio,
                 ..RunHookOptions::default()
             },
+            &CancelToken::never(),
         )?;
         if phase == ReferenceTransactionPhase::Prepared {
             result.check("reference-transaction")?;
@@ -1457,7 +1708,7 @@ impl RefHookContext {
 }
 
 fn resolve_hooks_dir_for_ref(ctx: &RefHookContext, config: &ConfigSet) -> PathBuf {
-    let dir = match config.get("core.hooksPath") {
+    let dir = match config.value("core.hooksPath") {
         Some(hooks_path) => {
             let p = PathBuf::from(parse_path(ctx.environment.as_ref(), &hooks_path));
             if p.is_absolute() {
@@ -1495,7 +1746,7 @@ fn resolve_hook_sequence_for_ref(
     ctx: &RefHookContext,
     hook_name: &str,
     config: &ConfigSet,
-) -> Result<Vec<ResolvedHook>, String> {
+) -> crate::error::Result<Vec<ResolvedHook>> {
     let tables = HookConfigTables::from_config(config);
     let mut seq = Vec::new();
     for (_friendly, command) in tables.hooks_for_event(hook_name)? {
@@ -1525,7 +1776,7 @@ fn traditional_hook_candidate_for_ref(
         let show_warning = ctx
             .load_config()
             .ok()
-            .and_then(|c| c.get("advice.ignoredHook"))
+            .and_then(|c| c.value("advice.ignoredHook"))
             .map(|v| !matches!(v.to_lowercase().as_str(), "false" | "no" | "off" | "0"))
             .unwrap_or(true);
         if show_warning {
@@ -1546,7 +1797,8 @@ fn run_hook_opts_for_ref_context(
     args: &[&str],
     config: &ConfigSet,
     opts: RunHookOptions<'_>,
-) -> Result<HookResult, HookError> {
+    cancel: &CancelToken,
+) -> crate::error::Result<HookResult> {
     let seq = resolve_hook_sequence_for_ref(ctx, hook_name, config)?;
     if seq.is_empty() {
         return Ok(HookResult::NotFound);
@@ -1598,6 +1850,7 @@ fn run_hook_opts_for_ref_context(
             stdin_piped,
             stdout,
             stderr,
+            server_receive_hook: false,
         };
         let spawned = match h {
             ResolvedHook::Traditional { path, argv0 } => {
@@ -1613,54 +1866,85 @@ fn run_hook_opts_for_ref_context(
         };
         let mut child = match spawned {
             Ok(child) => child,
-            Err(HookError::Spawn {
+            Err(crate::error::Error::Hook(HookError::Spawn {
                 hook_name,
                 path,
                 source,
                 ..
-            }) => {
+            })) => {
                 return Err(HookError::Spawn {
                     hook_name,
                     path,
                     source,
                     output,
-                })
+                }
+                .into())
             }
             Err(other) => return Err(other),
         };
 
-        if let Some(ref path) = stdin_file {
-            let file = match fs::File::open(path) {
-                Ok(f) => f,
-                Err(_e) => {
-                    return Ok(HookResult::Failed { status: 1, output });
+        let exit = if capture && stdin_piped && (stdin_file.is_some() || opts.stdin_data.is_some())
+        {
+            if cancel.is_cancelled() {
+                let pid = child.child_pid();
+                let kill_process_group = child.kill_process_group();
+                let mut child = child;
+                let _ = child.kill();
+                if let Some(pid) = pid {
+                    kill_pid_sigkill(pid, kill_process_group);
                 }
+                return Err(crate::error::Error::Cancelled);
+            }
+            let output_result = if let Some(ref path) = stdin_file {
+                let file = match fs::File::open(path) {
+                    Ok(f) => f,
+                    Err(_e) => {
+                        return Ok(HookResult::Failed { status: 1, output });
+                    }
+                };
+                child.feed_stdin_and_wait_with_output(Some(ConcurrentStdinFeed::File(file)))
+            } else if let Some(data) = opts.stdin_data {
+                child.feed_stdin_and_wait_with_output(Some(ConcurrentStdinFeed::Bytes(data)))
+            } else {
+                child.close_stdin();
+                child.wait_with_output()
             };
-            if let Some(stdin) = child.stdin_mut() {
-                let mut file = file;
-                let _ = std::io::copy(&mut file, stdin);
+            match output_result {
+                Ok(o) => {
+                    output.stdout.extend_from_slice(&o.stdout);
+                    output.stderr.extend_from_slice(&o.stderr);
+                    o.status
+                }
+                Err(_) => crate::command_runner::CommandExit {
+                    success: false,
+                    code: Some(1),
+                },
             }
-        } else if let Some(data) = opts.stdin_data {
-            if let Some(stdin) = child.stdin_mut() {
-                let _ = stdin.write_all(data);
-            }
-        }
-        if stdin_piped {
-            child.close_stdin();
-        }
-
-        let waited = if capture {
-            child.wait_with_output().map(|o| {
-                output.stdout.extend_from_slice(&o.stdout);
-                output.stderr.extend_from_slice(&o.stderr);
-                o.status
-            })
         } else {
-            child.wait()
-        };
-        let exit = match waited {
-            Ok(exit) => exit,
-            Err(_) => return Ok(HookResult::Failed { status: 1, output }),
+            if let Some(ref path) = stdin_file {
+                let file = match fs::File::open(path) {
+                    Ok(f) => f,
+                    Err(_e) => {
+                        return Ok(HookResult::Failed { status: 1, output });
+                    }
+                };
+                if let Some(stdin) = child.stdin_mut() {
+                    let mut file = file;
+                    let _ = crate::sigpipe::copy(&mut file, stdin);
+                }
+            } else if let Some(data) = opts.stdin_data {
+                if let Some(stdin) = child.stdin_mut() {
+                    let _ = crate::sigpipe::write_all(stdin, data);
+                }
+            }
+            if stdin_piped {
+                child.close_stdin();
+            }
+            match wait_hook_command(child, capture, cancel, &mut output) {
+                Ok(exit) => exit,
+                Err(crate::error::Error::Cancelled) => return Err(crate::error::Error::Cancelled),
+                Err(other) => return Err(other),
+            }
         };
 
         if !exit.success {
@@ -1695,7 +1979,13 @@ mod tests {
         };
         assert!(!output.is_empty());
         assert!(HookOutput::default().is_empty());
-        assert_eq!(HookError::Internal("bad".into()).output(), None);
+        assert_eq!(
+            HookError::MissingHookCommand {
+                hook_name: "x".into()
+            }
+            .output(),
+            None
+        );
         assert_eq!(
             format!("{output:?}"),
             r#"HookOutput { stdout: "out", stderr: "err" }"#
@@ -1721,13 +2011,13 @@ mod tests {
         assert!(!failed.is_ok() && failed.was_executed());
         assert_eq!(failed.status(), Some(3));
         match failed.check("commit-msg") {
-            Err(err @ HookError::Failed { .. }) => {
+            Err(err @ crate::error::Error::Hook(HookError::Failed { .. })) => {
                 assert_eq!(err.to_string(), "hook commit-msg failed with exit status 3");
-                let HookError::Failed {
+                let crate::error::Error::Hook(HookError::Failed {
                     hook_name,
                     status,
                     output: got,
-                } = err
+                }) = err
                 else {
                     unreachable!()
                 };
@@ -1840,6 +2130,7 @@ mod tests {
             stdin_piped: false,
             stdout: CommandStdio::Inherit,
             stderr: CommandStdio::Inherit,
+            server_receive_hook: false,
         };
         let dash_c = || ShellInvocation::DashC {
             script: "true".into(),
@@ -1904,6 +2195,46 @@ mod tests {
             OsString::from(r"C:\repo\.git\objects")
         );
         assert_eq!(value("GIT_PREFIX"), OsString::from(r"\\?\kept"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_hook_in_git_dir_drains_stderr_while_reading_large_stdin() {
+        use crate::repo::{InitOptions, Repository};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (repo, _) = Repository::init(dir.path(), &InitOptions::default()).expect("init");
+        let hook = repo.git_dir().join("hooks").join("pre-receive");
+        fs::write(
+            &hook,
+            b"#!/bin/sh\nwhile read old new ref; do echo \"checking $ref\" >&2; done\nexit 0\n",
+        )
+        .expect("write hook");
+        let mut perms = fs::metadata(&hook).expect("meta").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&hook, perms).expect("chmod");
+
+        let stdin: Vec<u8> = (1..=3000)
+            .map(|i| {
+                format!(
+                    "1111111111111111111111111111111111111111 \
+                     2222222222222222222222222222222222222222 refs/heads/b{i}\n"
+                )
+            })
+            .collect::<String>()
+            .into_bytes();
+
+        let started = std::time::Instant::now();
+        let result = run_hook_in_git_dir(&repo, "pre-receive", &[], Some(&stdin), &[]);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "pre-receive hook I/O took {:?}",
+            started.elapsed()
+        );
+        assert!(result.is_ok());
+        let output = result.output().expect("hook output");
+        assert!(output.stderr.len() > 64 * 1024);
+        assert!(output.stderr.starts_with(b"checking "));
     }
 
     #[test]

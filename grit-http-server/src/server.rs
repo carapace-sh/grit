@@ -1,7 +1,7 @@
 //! The multi-repository server behind `grit serve`.
 //!
 //! [`Server::bind`] opens the [`AuthStore`] and finds the repositories to
-//! serve; [`Server::run`] answers requests until the process stops.
+//! serve; [`Server::run`] answers requests until graceful shutdown.
 //!
 //! Git requests carry an access token from the store, either as the password
 //! of HTTP basic auth (what Git sends from a credential helper or a
@@ -51,6 +51,7 @@ use grit_protocol::RepositoryOptions;
 
 use crate::bundles::{BundleScheduler, BundleSettings};
 use crate::checkout_locks::CheckoutLocks;
+use crate::limits;
 use crate::login::{LoginError, PendingLogins, PollOutcome};
 use crate::smart_http::{self, Service};
 use crate::store::{
@@ -172,6 +173,8 @@ pub fn default_database_path(root: &Path) -> PathBuf {
     root.join(DATABASE_FILE_NAME)
 }
 
+pub use crate::limits::ServeLimits;
+
 /// What [`Server::bind`] needs.
 #[derive(Debug, Clone)]
 pub struct ServeConfig {
@@ -179,6 +182,8 @@ pub struct ServeConfig {
     pub root: PathBuf,
     /// The user database (see [`default_database_path`]).
     pub database: PathBuf,
+    /// Header, body idle and Git concurrency limits.
+    pub limits: ServeLimits,
     /// Environment used to load global and system config for each repository.
     ///
     /// A [`RepositoryOptions::promisor_fetcher`] here is given only to upload-pack
@@ -194,8 +199,11 @@ pub struct ServeConfig {
 
 pub(crate) struct ServerState {
     pub(crate) repositories: Repositories,
+    pub(crate) rpc_cancels: Arc<crate::rpc_cancel::RpcCancelRegistry>,
     store: Mutex<AuthStore>,
     logins: Mutex<PendingLogins>,
+    pub(crate) limits: ServeLimits,
+    git_slots: Arc<tokio::sync::Semaphore>,
     /// [`ServeConfig::repository_options`] without the promisor fetcher.
     pub(crate) options: RepositoryOptions,
     /// [`ServeConfig::repository_options`] as given, for smart-protocol and
@@ -216,6 +224,8 @@ pub struct Server {
     listener: std::net::TcpListener,
     state: Arc<ServerState>,
 }
+
+pub use crate::shutdown::Shutdown;
 
 impl Server {
     /// Open the database, find the repositories and bind `address`.
@@ -238,12 +248,17 @@ impl Server {
         let listener = std::net::TcpListener::bind(address)?;
         listener.set_nonblocking(true)?;
         let stand_in_password = HashedPassword::new(Token::generate()?.secret())?;
+        let limits = config.limits.clone();
+        let git_slots = limits.git_semaphore();
         Ok(Self {
             listener,
             state: Arc::new(ServerState {
                 repositories: Repositories::at(&config.root),
+                rpc_cancels: Arc::new(crate::rpc_cancel::RpcCancelRegistry::default()),
                 store: Mutex::new(store),
                 logins: Mutex::new(PendingLogins::default()),
+                limits,
+                git_slots,
                 options: config
                     .repository_options
                     .clone()
@@ -273,20 +288,32 @@ impl Server {
         self.state.repositories.list()
     }
 
-    /// Serve requests until the process stops. Blocks the calling thread.
+    /// Serve requests until shutdown. Blocks the calling thread.
+    ///
+    /// Shutdown starts on SIGTERM, SIGINT or SIGHUP (Ctrl+C on Windows), or when
+    /// [`Shutdown::triggered`] fires in tests. See [`Shutdown::grace`].
     ///
     /// # Errors
     ///
     /// [`ServerError::Io`] when the async runtime cannot start or the
     /// listener fails.
-    pub fn run(self) -> Result<(), ServerError> {
+    pub fn run(self, mut shutdown: Shutdown) -> Result<(), ServerError> {
+        if shutdown.on_force_exit.is_none() {
+            let cancels = self.state.rpc_cancels.clone();
+            shutdown.on_force_exit = Some(Arc::new(move || cancels.cancel_all()));
+        }
         self.start_bundles();
+        let state = self.state.clone();
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?;
+        let limits = self.state.limits.clone();
         runtime.block_on(async move {
             let listener = tokio::net::TcpListener::from_std(self.listener)?;
-            axum::serve(listener, router(self.state)).await
+            limits::serve_with_shutdown(router(self.state), listener, limits, shutdown, move || {
+                *state.scheduler.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            })
+            .await
         })?;
         Ok(())
     }
@@ -524,6 +551,21 @@ pub struct Authorized {
     pub email: String,
 }
 
+/// Repository options for one authenticated push, with hook identity exported.
+#[must_use]
+pub(crate) fn repository_options_for_pusher(
+    base: &grit_protocol::RepositoryOptions,
+    email: &str,
+) -> grit_protocol::RepositoryOptions {
+    let mut options = base.clone();
+    options.environment = options
+        .environment
+        .clone()
+        .with_var("REMOTE_USER", email)
+        .with_var("GRIT_USER", email);
+    options
+}
+
 /// `scheme://host` the client used to reach the server, from `Host` (or the
 /// `X-Forwarded-*` headers a reverse proxy adds).
 fn request_base_url(headers: &HeaderMap) -> Option<String> {
@@ -552,6 +594,18 @@ fn needed_access(service: Service) -> Access {
     }
 }
 
+fn try_git_slot(state: &Arc<ServerState>) -> Result<tokio::sync::OwnedSemaphorePermit, Rejection> {
+    state.git_slots.clone().try_acquire_owned().map_err(|_| {
+        Box::new(
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "too many concurrent git requests\n",
+            )
+                .into_response(),
+        )
+    })
+}
+
 async fn get_dispatch(
     State(state): State<Arc<ServerState>>,
     UrlPath(path): UrlPath<String>,
@@ -573,12 +627,19 @@ async fn get_dispatch(
     };
     let protocol_version = smart_http::protocol_version_from_headers(&headers);
     let extensions = state.extensions(&repo, service, &headers);
-    smart_http::info_refs(
+    let idle = state.limits.idle_timeout;
+    let slot = match try_git_slot(&state) {
+        Ok(slot) => slot,
+        Err(resp) => return *resp,
+    };
+    smart_http::info_refs_holding(
         repo.path,
         service,
         protocol_version,
         state.smart_options.clone(),
         extensions,
+        idle,
+        slot,
     )
     .await
 }
@@ -622,6 +683,11 @@ fn upload_target(
     state.authorize(headers, name, Access::Write)
 }
 
+async fn finish_with_discarded_body(body: Body, response: Response<Body>) -> Response<Body> {
+    let outcome = crate::request_body::discard_request_body(body).await;
+    crate::request_body::apply_discard_outcome(response, outcome)
+}
+
 async fn head_dispatch(
     State(state): State<Arc<ServerState>>,
     UrlPath(path): UrlPath<String>,
@@ -643,7 +709,11 @@ async fn patch_dispatch(
     body: Body,
 ) -> Response<Body> {
     let Some((name, UploadPath::Upload(id))) = crate::uploads::parse_path(&path) else {
-        return (StatusCode::NOT_FOUND, "not found\n").into_response();
+        return finish_with_discarded_body(
+            body,
+            (StatusCode::NOT_FOUND, "not found\n").into_response(),
+        )
+        .await;
     };
     match upload_target(&state, &headers, name) {
         Ok(found) => {
@@ -657,7 +727,7 @@ async fn patch_dispatch(
             )
             .await
         }
-        Err(resp) => *resp,
+        Err(resp) => finish_with_discarded_body(body, *resp).await,
     }
 }
 
@@ -677,7 +747,7 @@ async fn post_dispatch(
     if let Some((name, upload)) = crate::uploads::parse_path(&path) {
         let found = match upload_target(&state, &headers, name) {
             Ok(found) => found,
-            Err(resp) => return *resp,
+            Err(resp) => return finish_with_discarded_body(body, *resp).await,
         };
         return match upload {
             UploadPath::Endpoint => {
@@ -685,13 +755,20 @@ async fn post_dispatch(
                     .await
             }
             UploadPath::Receive(id) => {
+                let options = repository_options_for_pusher(&state.smart_options, &found.email);
+                let slot = match try_git_slot(&state) {
+                    Ok(slot) => slot,
+                    Err(resp) => return finish_with_discarded_body(body, *resp).await,
+                };
                 crate::uploads::receive(
                     found.repo.path,
                     id,
                     found.user_id,
                     &state.uploads,
                     body,
-                    state.options.clone(),
+                    options,
+                    slot,
+                    &state.rpc_cancels,
                     || state.pushed(),
                 )
                 .await
@@ -702,22 +779,45 @@ async fn post_dispatch(
         };
     }
     let Some((name, service)) = Service::strip_rpc_suffix(&path) else {
-        return (StatusCode::NOT_FOUND, "not found\n").into_response();
+        return finish_with_discarded_body(
+            body,
+            (StatusCode::NOT_FOUND, "not found\n").into_response(),
+        )
+        .await;
     };
-    let repo = match state.authorize(&headers, name, needed_access(service)) {
-        Ok(found) => found.repo,
-        Err(resp) => return *resp,
+    let found = match state.authorize(&headers, name, needed_access(service)) {
+        Ok(found) => found,
+        Err(resp) => return finish_with_discarded_body(body, *resp).await,
     };
     let protocol_version = smart_http::protocol_version_from_headers(&headers);
-    let extensions = state.extensions(&repo, service, &headers);
-    let response = smart_http::rpc(
-        repo.path,
+    let extensions = state.extensions(&found.repo, service, &headers);
+    let options = if service == Service::ReceivePack {
+        repository_options_for_pusher(&state.smart_options, &found.email)
+    } else {
+        state.smart_options.clone()
+    };
+    let idle = state.limits.idle_timeout;
+    let slot = match try_git_slot(&state) {
+        Ok(slot) => slot,
+        Err(resp) => return finish_with_discarded_body(body, *resp).await,
+    };
+    let (cancel, guard) = state.rpc_cancels.register();
+    let session = grit_protocol::ServeSession {
+        cancel: Some(cancel),
+        ..grit_protocol::ServeSession::none()
+    };
+    let (response, _follow_up) = smart_http::rpc_holding_with_cancel(
+        found.repo.path,
         service,
         protocol_version,
         &headers,
         body,
-        state.smart_options.clone(),
+        options,
         extensions,
+        session,
+        idle,
+        slot,
+        Some(guard),
     )
     .await;
     if service == Service::ReceivePack && response.status().is_success() {

@@ -1,9 +1,9 @@
 //! Cancellation during local fetch.
 
 use grit_lib::error::Error;
-use grit_lib::progress::FlagCancel;
+use grit_lib::progress::CancelToken;
 use grit_lib::remote::fetch::NoProgress;
-use grit_lib::remote::transfer::{fetch_local_with_progress, FetchOptions, TagMode};
+use grit_lib::remote::transfer::{FetchOptions, TagMode};
 use grit_test_support::git;
 
 #[test]
@@ -21,15 +21,26 @@ fn fetch_local_returns_cancelled_when_signalled_before_start() {
     );
     git(&local, &["commit", "-q", "--allow-empty", "-m", "c1"]);
 
-    let flag = FlagCancel::new();
+    let flag = CancelToken::new();
     flag.cancel();
 
-    let opts = FetchOptions {
-        refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()],
-        tags: TagMode::Following,
-        ..Default::default()
-    };
-    let err = fetch_local_with_progress(&local.join(".git"), &bare, &opts, &mut NoProgress, &flag)
-        .expect_err("cancelled before fetch");
+    let mut opts = FetchOptions::new();
+    opts.refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()];
+    opts.tags = TagMode::Following;
+    let err = grit_lib::repo::Repository::open(
+        &local.join(".git"),
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Local(&bare),
+        &mut opts.clone(),
+        &mut NoProgress,
+        &flag,
+    )
+    .expect_err("cancelled before fetch");
     assert!(matches!(err, Error::Cancelled));
 }

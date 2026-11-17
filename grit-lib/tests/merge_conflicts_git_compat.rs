@@ -1,15 +1,19 @@
 //! Issue #960: grit merge leaves merge-in-progress state with conflict markers.
 
+use grit_lib::progress::NullProgress;
 use std::fs;
 use std::process::Command;
 
 use grit_lib::config::environment::RepositoryOptions;
+use grit_lib::merge::IntegrateBranchOutcome;
+use grit_lib::merge::{ReplayOptions, ReplaySequenceRequest, SequenceOutcome};
 use grit_lib::objects::{parse_commit, ObjectId};
-use grit_lib::porcelain::commit::{create_commit, CommitRequest};
-use grit_lib::porcelain::merge::{abort_branch_merge, integrate_branch, IntegrateBranchOutcome};
-use grit_lib::progress::NullProgress;
+use grit_lib::porcelain::commit::CommitRequest;
+use grit_lib::porcelain::replay::ReplayDirection;
 use grit_lib::repo::Repository;
 use grit_test_support::git;
+use grit_test_support::start_replay_sequence;
+use grit_test_support::{abort_branch_merge, integrate_branch};
 
 fn ident() -> String {
     "Merge Test <merge@example.com> 1700000000 +0000".to_owned()
@@ -17,15 +21,15 @@ fn ident() -> String {
 
 fn commit_req(message: &str) -> CommitRequest {
     let id = ident();
-    CommitRequest {
-        message: message.to_owned(),
-        author: Some(id.parse().expect("signature")),
-        committer: Some(id.parse().expect("signature")),
-        allow_empty: false,
-        sign_override: None,
-        amend: false,
-        assume_worktree_synced: false,
-        ..Default::default()
+    {
+        let mut req = CommitRequest::new(message.to_owned());
+        req.author = Some(id.parse().expect("signature"));
+        req.committer = Some(id.parse().expect("signature"));
+        req.allow_empty = false;
+        req.sign_override = None;
+        req.amend = false;
+        req.assume_worktree_synced = false;
+        req
     }
 }
 
@@ -98,7 +102,7 @@ fn grit_merge_leaves_conflict_markers_and_clean_side_files() {
         feature_oid,
         "feature-x",
         &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("integrate");
     assert!(
@@ -110,7 +114,10 @@ fn grit_merge_leaves_conflict_markers_and_clean_side_files() {
     assert!(repo.git_dir().join("ORIG_HEAD").exists());
     assert!(repo.git_dir().join("MERGE_MSG").exists());
 
-    let index = repo.index_handle().load().expect("index");
+    let index = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("index");
     assert!(index.has_unmerged_entries());
 
     let a_body = fs::read_to_string(root.join("a.txt")).expect("a.txt");
@@ -193,7 +200,7 @@ fn resolve_and_commit_matches_git_merge() {
         feature_oid,
         "feature-x",
         &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("integrate");
 
@@ -211,13 +218,14 @@ fn resolve_and_commit_matches_git_merge() {
     fs::write(root.join("a.txt"), format!("{resolved}\n")).expect("write resolved");
 
     git(root, &["add", "a.txt"]);
-    let outcome = create_commit(
-        &repo,
-        &commit_req("Merge feature-x"),
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("merge commit");
+    let outcome = repo
+        .commits()
+        .create_staged(
+            &commit_req("Merge feature-x"),
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("merge commit");
 
     let side_tip = ObjectId::from_hex(&git_out(root, &["rev-parse", "feature-x"])).expect("side");
     let commit_obj = repo.odb().read(&outcome.oid).expect("commit");
@@ -266,7 +274,7 @@ fn grit_merge_keeps_identical_non_conflict_files() {
         side_oid,
         "side",
         &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("integrate");
     assert!(
@@ -283,7 +291,10 @@ fn grit_merge_keeps_identical_non_conflict_files() {
         "hi\n"
     );
 
-    let index = repo.index_handle().load().expect("index");
+    let index = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("index");
     assert!(
         index.get(b"b.txt", 0).is_some(),
         "b.txt must stay at stage 0 in the index"
@@ -327,19 +338,20 @@ fn issue_1090_resolve_commit_keeps_non_conflict_files() {
         side_oid,
         "side",
         &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("integrate");
 
     fs::write(root.join("a.txt"), "resolved\n").expect("resolve a.txt");
     git(root, &["add", "a.txt"]);
-    let outcome = create_commit(
-        &repo,
-        &commit_req("resolved"),
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("merge commit");
+    let outcome = repo
+        .commits()
+        .create_staged(
+            &commit_req("resolved"),
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("merge commit");
 
     let tree_paths = git_out(
         root,
@@ -402,6 +414,128 @@ fn issue_1090_resolve_commit_keeps_non_conflict_files() {
     );
 }
 
+/// Issue #2381: sibling directories `a/` and `a0/` must not blow the stack during merge.
+#[test]
+fn merge_sibling_dirs_a_and_a0_reports_conflicts() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    git(root, &["init", "-q"]);
+    git(root, &["config", "user.email", "a@b"]);
+    git(root, &["config", "user.name", "t"]);
+    fs::create_dir_all(root.join("a")).expect("a");
+    fs::create_dir_all(root.join("a0")).expect("a0");
+    fs::write(root.join("a/f"), "base\n").expect("a/f");
+    fs::write(root.join("a0/f"), "base\n").expect("a0/f");
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-qm", "base"]);
+    git(root, &["branch", "-m", "main"]);
+
+    git(root, &["switch", "-q", "-c", "one"]);
+    fs::write(root.join("a/f"), "one\n").expect("one a");
+    fs::write(root.join("a0/f"), "one\n").expect("one a0");
+    git(root, &["commit", "-qam", "one"]);
+
+    git(root, &["switch", "-q", "main"]);
+    git(root, &["switch", "-q", "-c", "two"]);
+    fs::write(root.join("a/f"), "two\n").expect("two a");
+    fs::write(root.join("a0/f"), "two\n").expect("two a0");
+    git(root, &["commit", "-qam", "two"]);
+
+    git(root, &["switch", "-q", "one"]);
+    let repo = Repository::discover(Some(root), &RepositoryOptions::empty()).expect("open repo");
+    let one_oid = ObjectId::from_hex(&git_out(root, &["rev-parse", "HEAD"])).expect("one");
+    let two_oid = ObjectId::from_hex(&git_out(root, &["rev-parse", "two"])).expect("two");
+
+    let outcome = integrate_branch(
+        &repo,
+        "refs/heads/one",
+        one_oid,
+        two_oid,
+        "two",
+        &mut NullProgress,
+        &grit_lib::progress::CancelToken::never(),
+    )
+    .expect("integrate merge two into one");
+    assert!(
+        matches!(outcome, IntegrateBranchOutcome::Conflicts { .. }),
+        "expected conflicts merging two into one, got {outcome:?}"
+    );
+
+    assert!(repo.git_dir().join("MERGE_HEAD").exists());
+    let index = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("index");
+    assert!(index.get(b"a/f", 1).is_some());
+    assert!(index.get(b"a/f", 2).is_some());
+    assert!(index.get(b"a/f", 3).is_some());
+    assert!(index.get(b"a0/f", 1).is_some());
+    assert!(index.get(b"a0/f", 2).is_some());
+    assert!(index.get(b"a0/f", 3).is_some());
+
+    let fsck = Command::new("git")
+        .current_dir(root)
+        .args(["fsck", "--strict"])
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .output()
+        .expect("fsck");
+    assert!(
+        fsck.status.success(),
+        "git fsck: {}",
+        String::from_utf8_lossy(&fsck.stderr)
+    );
+}
+
+#[test]
+fn pick_sibling_dirs_a_and_a0_reports_conflicts() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    git(root, &["init", "-q"]);
+    git(root, &["config", "user.email", "a@b"]);
+    git(root, &["config", "user.name", "t"]);
+    fs::create_dir_all(root.join("a")).expect("a");
+    fs::create_dir_all(root.join("a0")).expect("a0");
+    fs::write(root.join("a/f"), "base\n").expect("a/f");
+    fs::write(root.join("a0/f"), "base\n").expect("a0/f");
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-qm", "base"]);
+    git(root, &["branch", "-m", "main"]);
+
+    git(root, &["switch", "-q", "-c", "one"]);
+    fs::write(root.join("a/f"), "one\n").expect("one a");
+    fs::write(root.join("a0/f"), "one\n").expect("one a0");
+    git(root, &["commit", "-qam", "one"]);
+
+    git(root, &["switch", "-q", "main"]);
+    git(root, &["switch", "-q", "-c", "two"]);
+    fs::write(root.join("a/f"), "two\n").expect("two a");
+    fs::write(root.join("a0/f"), "two\n").expect("two a0");
+    git(root, &["commit", "-qam", "two"]);
+    let pick_oid = ObjectId::from_hex(&git_out(root, &["rev-parse", "two"])).expect("two tip");
+
+    git(root, &["switch", "-q", "one"]);
+    let repo = Repository::discover(Some(root), &RepositoryOptions::empty()).expect("open repo");
+
+    let outcome = start_replay_sequence(
+        &repo,
+        &ReplaySequenceRequest {
+            commits: vec![pick_oid],
+            direction: ReplayDirection::Pick,
+            committer: ident().parse().expect("committer"),
+            options: ReplayOptions::default(),
+        },
+        &mut NullProgress,
+        &grit_lib::progress::CancelToken::never(),
+    )
+    .expect("pick two onto one");
+    assert!(
+        matches!(outcome, SequenceOutcome::Conflicts { .. }),
+        "expected pick conflicts, got {outcome:?}"
+    );
+    assert!(repo.git_dir().join("CHERRY_PICK_HEAD").exists());
+}
+
 #[test]
 fn merge_abort_restores_pre_merge_state() {
     let (_tmp, repo) = issue_960_repo();
@@ -423,7 +557,7 @@ fn merge_abort_restores_pre_merge_state() {
         feature_oid,
         "feature-x",
         &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("integrate");
 
@@ -438,7 +572,10 @@ fn merge_abort_restores_pre_merge_state() {
     assert_eq!(fs::read_to_string(root.join("a.txt")).expect("a"), a_before);
     assert_eq!(fs::read_to_string(root.join("b.txt")).expect("b"), b_before);
     assert!(!root.join("x.txt").exists());
-    let index = repo.index_handle().load().expect("index after abort");
+    let index = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("index after abort");
     let b_index = index.get(b"b.txt", 0).expect("b.txt tracked");
     assert!(
         !b_index.stat_cache_unset(),

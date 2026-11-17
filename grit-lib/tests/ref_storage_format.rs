@@ -7,7 +7,7 @@ use grit_lib::error::Error;
 use std::str::FromStr;
 
 use grit_lib::refs::ref_storage::RefStorageFormat;
-use grit_lib::repo::{validate_repo_format, InitOptions, Repository};
+use grit_lib::repo::{validate_repo_format, InitOptions, Repository, RepositoryError};
 use tempfile::TempDir;
 
 static ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -35,7 +35,10 @@ fn parses_files_and_reftable() {
 #[test]
 fn rejects_unknown() {
     let err = RefStorageFormat::from_str("not-a-backend").unwrap_err();
-    assert!(matches!(err, Error::InvalidRefStorageFormat { .. }));
+    assert!(matches!(
+        err,
+        Error::Repository(RepositoryError::InvalidRefStorageFormat { .. })
+    ));
 }
 
 #[test]
@@ -99,7 +102,10 @@ fn detect_rejects_v0_reftable_extension() {
     )
     .unwrap();
     let err = RefStorageFormat::detect(&git_dir).unwrap_err();
-    assert!(matches!(err, Error::Message(_)));
+    assert!(matches!(
+        err,
+        Error::Repository(RepositoryError::V1OnlyExtensionsInFormatZero { .. })
+    ));
     assert!(validate_repo_format(&git_dir).is_err());
 }
 
@@ -114,7 +120,10 @@ fn detect_rejects_unsupported_repository_version() {
     )
     .unwrap();
     let err = RefStorageFormat::detect(&git_dir).unwrap_err();
-    assert!(matches!(err, Error::UnsupportedRepositoryFormatVersion(2)));
+    assert!(matches!(
+        err,
+        Error::Repository(RepositoryError::UnsupportedRepositoryFormatVersion { version: 2 })
+    ));
 }
 
 #[test]

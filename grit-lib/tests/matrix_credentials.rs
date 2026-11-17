@@ -36,6 +36,8 @@
 
 #![cfg(unix)]
 
+pub use grit_lib::config;
+
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -100,7 +102,10 @@ fn load_config(dir: &Path) -> ConfigSet {
     ConfigSet::load(
         &grit_lib::config::environment::Environment::capture_process(),
         Some(&git_dir),
-        false,
+        &crate::config::LoadConfigOptions::standard(
+            &grit_lib::config::environment::Environment::capture_process(),
+            Some(&git_dir),
+        ),
     )
     .expect("load config")
 }
@@ -767,11 +772,10 @@ mod http_401 {
     use std::time::Instant;
 
     use grit_lib::error::Error;
-    use grit_lib::refs::resolve_ref;
-    use grit_lib::remote::fetch::NoProgress;
+    use grit_lib::progress::NullProgress;
     use grit_lib::remote::transfer::{FetchOptions, TagMode};
+    use grit_lib::remote::transport::http::http_client_arc;
     use grit_lib::remote::transport::http::ureq_client::UreqHttpClient;
-    use grit_lib::remote::transport::http::{http_client_arc, http_fetch};
 
     const USER: &str = "alice";
     const PASS: &str = "s3cr3t";
@@ -950,11 +954,9 @@ mod http_401 {
         }
         let url = format!("http://127.0.0.1:{port}/repo.git");
 
-        let mut opts = FetchOptions {
-            refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()],
-            tags: TagMode::None,
-            ..Default::default()
-        };
+        let mut opts = FetchOptions::new();
+        opts.refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()];
+        opts.tags = TagMode::None;
 
         // --- Wrong credentials: the helper supplies a bad password; the 401 ->
         // fill -> Basic retry still fails, surfacing the typed Error::Auth. ------
@@ -972,12 +974,22 @@ mod http_401 {
 
             let client =
                 UreqHttpClient::with_credentials(Box::new(provider)).with_git_protocol("version=2");
-            let err = http_fetch(
-                http_client_arc(client),
+            let err = grit_lib::repo::Repository::open(
                 &local_git,
-                &url,
+                &grit_lib::config::environment::RepositoryOptions::with_environment(
+                    (&mut opts).environment.clone(),
+                ),
+            )
+            .expect("open fetch target")
+            .remotes()
+            .fetch_from(
+                grit_lib::remote::transfer::TransferEndpoint::Http {
+                    client: http_client_arc(client),
+                    url: &url,
+                },
                 &mut opts,
-                &mut NoProgress,
+                &mut NullProgress,
+                grit_lib::progress::CancelToken::never_ref(),
             )
             .expect_err("wrong creds from helper must fail typed, not hang");
             assert!(
@@ -1013,12 +1025,22 @@ mod http_401 {
 
         let client =
             UreqHttpClient::with_credentials(Box::new(provider)).with_git_protocol("version=2");
-        http_fetch(
-            http_client_arc(client),
+        grit_lib::repo::Repository::open(
             &local_git,
-            &url,
+            &grit_lib::config::environment::RepositoryOptions::with_environment(
+                (&mut opts).environment.clone(),
+            ),
+        )
+        .expect("open fetch target")
+        .remotes()
+        .fetch_from(
+            grit_lib::remote::transfer::TransferEndpoint::Http {
+                client: http_client_arc(client),
+                url: &url,
+            },
             &mut opts,
-            &mut NoProgress,
+            &mut NullProgress,
+            grit_lib::progress::CancelToken::never_ref(),
         )
         .expect("authed fetch via helper-filled Basic creds must succeed");
 
@@ -1030,7 +1052,9 @@ mod http_401 {
         );
 
         // The fetched ref matches the source tip (cross-check vs system git).
-        let fetched = resolve_ref(&local_git, "refs/remotes/origin/main")
+        let fetched = grit_test_support::refs::at(&local_git)
+            .references()
+            .resolve("refs/remotes/origin/main")
             .expect("origin/main landed after authed fetch");
         assert_eq!(fetched.to_hex(), main_hex, "fetched tip must match source");
 

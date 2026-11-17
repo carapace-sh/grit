@@ -13,14 +13,15 @@ grit restore [--staged] [--worktree] [--hunks <id,...>] [--lines <path:start-end
 
 ## Description
 
-Discards local changes for tracked paths you name. By default, `grit restore` resets the **working tree** to match the **index** (the same idea as unstaging worktree edits while keeping the index as-is).
+Discards local changes for tracked paths you name. Pathnames in human and `--markdown` output use the same quoting rules as [`grit status`](../status/) (see **Description** there). By default, `grit restore` resets the **working tree** to match the **index** (the same idea as unstaging worktree edits while keeping the index as-is).
 
 - `--staged` resets the **index** from `HEAD` (or from `--source` when you pass it). On an unborn branch, staged paths are removed from the index.
 - `--worktree` resets the **working tree**. When you omit both flags, only the worktree is restored.
-- `--hunks` and `--lines` reverse-apply only the selected diff hunks instead of whole files. Unstaged ids come from `grit diff --unstaged --json`; with `--staged`, ids come from `grit diff --staged --json`. Line ranges use new-side line numbers from `grit diff --json` (`lines[].new`), same as `grit add --lines`. Cannot be combined with `--source`, `--ours`, `--theirs`, or `--merge`. A worktree hunk restore rewrites `.git/index` only when it updates a path's cached stat data (for example once every hunk of a file is restored); while the file still differs from the index, the index file is left as it was, like `git apply -R`.
+- `--hunks` and `--lines` reverse-apply only the selected diff hunks instead of whole files. Unstaged ids come from `grit diff --unstaged --json`; with `--staged`, ids come from `grit diff --staged --json`. Line ranges use new-side line numbers from `grit diff --json` (`lines[].new`), same as `grit add --lines`. Cannot be combined with `--source`, `--ours`, `--theirs`, or `--merge`. A worktree hunk restore rewrites `.git/index` only when it updates a path's cached stat data, which it checks once the selected ids cover every remaining hunk of a file; while the file still differs from the index (or when `--lines` brought it back), the index file is left as it was, like `git apply -R`, and the next `grit status` re-reads the file.
 - `--dry-run` with `--hunks` or `--lines` validates selection and reports paths without writing the worktree or index.
 - `--source=<rev>` reads content from a commit or tree instead of the usual default (`HEAD` for `--staged`, the index for the worktree).
 - Paths that are missing in the source are removed from the target. Untracked files are never touched.
+- Index entries with the skip-worktree bit (for example after `git update-index --skip-worktree`) are left out of restore, the same as Git: `grit restore .` does not rewrite them or clear the flag.
 - During a merge conflict, `--ours` and `--theirs` write index stage 2 or 3 into the worktree (filters and line endings apply) and leave the index unmerged. `--merge` rebuilds conflict markers from stages 1–3; `--conflict` picks the marker style and implies `--merge`. These options cannot be combined with `--staged` or `--source`.
 - A plain worktree restore (no `--staged`, no `--source`) refuses paths that are still unmerged, for example after a conflicted `grit merge` or `grit stash pop`: there is no single index version to restore. It fails before writing anything, even when other matched paths could be restored (`grit restore .` included), and tells you to pick `--ours`, `--theirs` or `--merge`. Exclude the conflicted path (`-- . ':!f.txt'`) to restore the rest. `--staged` on its own refuses unmerged paths the same way (Git would drop the conflict stages and leave the markers in the file, and grit's auto-staging commit would then record them); to resolve, edit out the markers and `grit add` the file. `--staged --worktree` resets both the index and the file to `HEAD`, and `--source` without `--staged` writes only the worktree and leaves the conflict stages in place.
 
@@ -28,7 +29,7 @@ Discards local changes for tracked paths you name. By default, `grit restore` re
 
 | Option | Description |
 | --- | --- |
-| `<path>…` | One or more pathspecs (required for full-file restore unless `--pathspec-from-file` is set). Optional with `--hunks` / `--lines` to narrow the diff scan. |
+| `<path>…` | One or more pathspecs (required for full-file restore unless `--pathspec-from-file` is set). Optional with `--hunks` / `--lines` to narrow the diff scan. Attribute pathspecs such as `:(attr:myattr)` use the same `.gitattributes` stack as [`grit log`](log.md). |
 | `--pathspec-from-file` | Read pathspecs from a file, or `-` for stdin (same rules as Git). |
 | `--pathspec-file-nul` | With `--pathspec-from-file`, entries are NUL-separated instead of line-based. |
 | `-S`, `--staged` | Restore the index (or unstage selected hunks with `--hunks` / `--lines`). |
@@ -100,8 +101,8 @@ Pass `--json` for scripting:
 
 | Field | Type | Meaning |
 | ----- | ---- | ------- |
-| `restored` | array of strings | Paths created or updated. |
-| `removed` | array of strings | Paths removed because the source had no entry. |
+| `restored` | array of strings | Paths created or updated (non-UTF-8 names use reversible `grit+pathhex:` encoding, same as [`grit status`](status.md)). |
+| `removed` | array of strings | Paths removed because the source had no entry (same encoding as `restored`). |
 | `restored_hunks` | object | When `--hunks` was used: map of path → hunk id strings. |
 | `restored_lines` | object | When `--lines` was used: map of path → range strings (`start` or `start-end`). |
 | `dry_run` | boolean | True when `--dry-run` was passed with hunk/line selection. |

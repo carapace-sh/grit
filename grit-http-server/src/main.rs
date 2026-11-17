@@ -19,6 +19,7 @@ use axum::{
     Router,
 };
 use clap::Parser;
+use grit_http_server::limits::{parse_duration, serve_with_shutdown, ServeLimits};
 use grit_http_server::smart_http::{self, Service};
 
 #[derive(Parser)]
@@ -52,11 +53,34 @@ struct Args {
     /// the client's `http.saveCookies` persistence path end-to-end.
     #[arg(long, value_name = "NAME=VALUE")]
     set_cookie: Option<String>,
+
+    /// Maximum time to wait for complete request headers.
+    #[arg(
+        long,
+        value_name = "DURATION",
+        default_value = "30s",
+        value_parser = parse_duration
+    )]
+    header_timeout: std::time::Duration,
+
+    /// Close connections that stop sending request body chunks for this long.
+    #[arg(
+        long,
+        value_name = "DURATION",
+        default_value = "60s",
+        value_parser = parse_duration
+    )]
+    idle_timeout: std::time::Duration,
+
+    /// Concurrent smart-HTTP Git requests before new ones get HTTP 503.
+    #[arg(long, value_name = "N", default_value = "128")]
+    max_git_requests: usize,
 }
 
 #[derive(Clone)]
 struct AppState {
     root: PathBuf,
+    idle_timeout: std::time::Duration,
     /// Repository open/config options captured from the server process at startup.
     repository_options: grit_protocol::RepositoryOptions,
     /// The expected `Authorization: Basic …` header value when basic auth is
@@ -66,9 +90,22 @@ struct AppState {
     log_headers: Option<PathBuf>,
     /// A `Set-Cookie` value to emit on every response (`--set-cookie`), if set.
     set_cookie: Option<String>,
+    git_slots: Arc<tokio::sync::Semaphore>,
 }
 
 impl AppState {
+    fn try_git_slot(&self) -> Result<tokio::sync::OwnedSemaphorePermit, Box<Response>> {
+        self.git_slots.clone().try_acquire_owned().map_err(|_| {
+            Box::new(
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "too many concurrent git requests\n",
+                )
+                    .into_response(),
+            )
+        })
+    }
+
     /// Append a request's headers to the `--log-headers` file (if configured),
     /// one `name: value` line per header, terminated by a blank line. Best-effort:
     /// any I/O error is ignored so logging never affects the served response.
@@ -183,12 +220,15 @@ async fn main() -> Result<()> {
     }
 
     let repository_options = grit_protocol::repository_options_from_process();
+    let git_slots = Arc::new(tokio::sync::Semaphore::new(args.max_git_requests));
     let state = Arc::new(AppState {
         root,
+        idle_timeout: args.idle_timeout,
         repository_options,
         expected_auth,
         log_headers: args.log_headers,
         set_cookie: args.set_cookie,
+        git_slots,
     });
 
     let app = Router::new()
@@ -197,7 +237,19 @@ async fn main() -> Result<()> {
 
     let listener = tokio::net::TcpListener::bind(&args.bind).await?;
     eprintln!("Listening on {}", args.bind);
-    axum::serve(listener, app).await?;
+    let limits = ServeLimits {
+        header_timeout: args.header_timeout,
+        idle_timeout: args.idle_timeout,
+        max_git_requests: args.max_git_requests,
+    };
+    serve_with_shutdown(
+        app,
+        listener,
+        limits,
+        grit_http_server::server::Shutdown::default(),
+        || {},
+    )
+    .await?;
 
     Ok(())
 }
@@ -227,12 +279,18 @@ async fn info_refs_dispatch(
         Err(e) => return *e,
     };
     let protocol_version = smart_http::protocol_version_from_headers(&headers);
-    let response = smart_http::info_refs(
+    let slot = match state.try_git_slot() {
+        Ok(slot) => slot,
+        Err(resp) => return *resp,
+    };
+    let response = smart_http::info_refs_holding(
         repo_path,
         service,
         protocol_version,
         state.repository_options.clone(),
         grit_protocol::Extensions::default(),
+        state.idle_timeout,
+        slot,
     )
     .await;
     state.with_cookie(response)
@@ -249,20 +307,32 @@ async fn rpc_dispatch(
 ) -> Response {
     state.log_request_headers(&headers);
     if let Err(resp) = state.check_auth(&headers) {
-        return *resp;
+        return finish_with_discarded_body(body, *resp).await;
     }
     let Some((repo, service)) = Service::strip_rpc_suffix(&full_path) else {
-        return (StatusCode::NOT_FOUND, "not found").into_response();
+        return finish_with_discarded_body(
+            body,
+            (StatusCode::NOT_FOUND, "not found").into_response(),
+        )
+        .await;
     };
     if repo.is_empty() {
-        return (StatusCode::BAD_REQUEST, "missing repository").into_response();
+        return finish_with_discarded_body(
+            body,
+            (StatusCode::BAD_REQUEST, "missing repository").into_response(),
+        )
+        .await;
     }
     let repo_path = match state.repo_path(repo) {
         Ok(p) => p,
-        Err(e) => return *e,
+        Err(e) => return finish_with_discarded_body(body, *e).await,
     };
     let protocol_version = smart_http::protocol_version_from_headers(&headers);
-    let response = smart_http::rpc(
+    let slot = match state.try_git_slot() {
+        Ok(slot) => slot,
+        Err(resp) => return finish_with_discarded_body(body, *resp).await,
+    };
+    let (response, _follow_up) = smart_http::rpc_holding(
         repo_path,
         service,
         protocol_version,
@@ -270,7 +340,15 @@ async fn rpc_dispatch(
         body,
         state.repository_options.clone(),
         grit_protocol::Extensions::default(),
+        grit_protocol::ServeSession::none(),
+        state.idle_timeout,
+        slot,
     )
     .await;
     state.with_cookie(response)
+}
+
+async fn finish_with_discarded_body(body: Body, response: Response) -> Response {
+    let outcome = grit_http_server::request_body::discard_request_body(body).await;
+    grit_http_server::request_body::apply_discard_outcome(response, outcome)
 }

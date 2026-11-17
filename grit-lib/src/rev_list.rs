@@ -1,13 +1,13 @@
 //! Commit traversal and output planning for `rev-list`.
 //!
-//! This module implements a focused `rev-list` subset used by the v2 test
-//! wave: revision ranges, `--all`, `--stdin` argument ingestion, commit walk
-//! limits, ordering (`--topo-order`, `--date-order`, `--reverse`), and basic
-//! output shaping (`--count`, `--parents`, `--format`).
+//! Revision ranges, `--all`, `--stdin` revision lines, commit walk limits,
+//! ordering (`--topo-order`, `--date-order`, `--reverse`), path simplification,
+//! object walks with `--filter`, and counting (`--count`).
 
+use crate::error::ObjectError;
+use crate::error::RefError;
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
-use std::fs;
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -17,39 +17,80 @@ use crate::commit_graph_file::{BloomPrecheck, BloomWalkStatsHandle, CommitGraphC
 use crate::config::ConfigSet;
 use crate::diff::pickaxe::PickaxeRenames;
 use crate::diff::zero_oid;
+use crate::diff::{detect_renames, diff_trees, diff_trees_for_pathspecs, DiffStatus};
 use crate::error::{Error, Result};
-use crate::ident::{committer_unix_seconds_for_ordering, parse_signature_times};
+use crate::ident::committer_unix_seconds_for_ordering;
 use crate::ignore::{parse_sparse_patterns_from_blob, ParsedSparsePatterns};
 use crate::index::{CacheTreeNode, Index, MODE_GITLINK, MODE_TREE};
+use crate::log_walk::WalkedCommits;
 use crate::merge_base::{
-    commits_reachable_excluding_ancestors_of_with_graph, ReachableWalkCommitterCutoffs,
+    commits_reachable_excluding_ancestors_of_with_graph, RangeWalkHide,
+    ReachableWalkCommitterCutoffs,
 };
+
+/// Excluded commits for a rev walk: either an explicit set (promisor, first-parent frontier)
+/// or a painted range hide predicate.
+#[derive(Clone, Default)]
+struct WalkExclude {
+    set: HashSet<ObjectId>,
+    paint: Option<RangeWalkHide>,
+}
+
+impl WalkExclude {
+    fn is_excluded(&self, oid: ObjectId) -> bool {
+        self.set.contains(&oid) || self.paint.as_ref().is_some_and(|hide| hide.is_hidden(oid))
+    }
+
+    fn is_excluded_with_hide_cache(
+        &self,
+        cache: &mut Option<crate::merge_base::CommitGraphCache<'_>>,
+        oid: ObjectId,
+    ) -> Result<bool> {
+        if self.set.contains(&oid) {
+            return Ok(true);
+        }
+        if let Some(hide) = &self.paint {
+            return hide.is_hidden_with_cache(cache, oid);
+        }
+        Ok(false)
+    }
+}
 use crate::objects::{
-    oid_hash_map, oid_hash_set, parse_commit, parse_tag, parse_tree, CommitData, CommitRef,
-    ObjectId, ObjectKind, OidHashMap, OidHashSet, TreeEntry, TreeRefIter,
+    commit_through_subject_len, oid_hash_map, oid_hash_set, parse_commit, parse_tag, parse_tree,
+    read_commit_subject_line, CommitRef, ObjectId, ObjectKind, OidHashMap, OidHashSet, TreeEntry,
+    TreeRefIter,
 };
 use crate::odb::store::ObjectStore;
 use crate::pack_bitmap::BitmapIndex;
 use crate::patch_ids::{compute_patch_id, compute_patch_id_for_paths};
-use crate::pathspec::pathspec_entry_is_relevant;
-use crate::progress::poll_watch;
-use crate::ref_exclusions::{git_namespace_prefix, strip_git_namespace, RefExclusions};
-use crate::reflog::{list_reflog_refs, read_reflog};
+use crate::pathspec::{pathspec_has_attr_magic, PathspecMatcher};
+use crate::progress::{poll_watch, CancelToken};
+
+fn cancel_watch_for_walk(cancel: &Option<CancelToken>) -> Option<Arc<AtomicBool>> {
+    cancel.as_ref().map(CancelToken::watch_arc)
+}
+use crate::reflog::{read_reflog_on_store, reflog_refs_on_store};
 use crate::refs;
 use crate::repo::Repository;
 use crate::rev_list_error::RevListError;
 use crate::rev_parse::{resolve_revision_for_range_end, resolve_treeish_path, split_treeish_spec};
 use crate::revwalk::filter::CommitFilter;
 
-/// User-facing output mode for `rev-list`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum OutputMode {
-    /// Print only object IDs.
-    OidOnly,
-    /// Print object ID followed by all parent IDs.
-    Parents,
-    /// Print a custom `%` placeholder format.
-    Format(String),
+/// Private per-invocation state threaded through [`rev_list_with_context`] (not part of public
+/// [`RevListOptions`]). Carries [`crate::revwalk::RevWalkListOptions::retained_commit_extent`]
+/// from high-level rev-walk entry points.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RevListWalkContext {
+    /// How much of each listed commit to retain as raw object bytes in [`RevListResult::commit_data`].
+    pub retained_commit_extent: CommitExtent,
+}
+
+impl Default for RevListWalkContext {
+    fn default() -> Self {
+        Self {
+            retained_commit_extent: CommitExtent::Whole,
+        }
+    }
 }
 
 /// Behavior when reachable objects are missing.
@@ -120,36 +161,78 @@ pub enum ObjectFilter {
     Combine(Vec<ObjectFilter>),
 }
 
+/// Why a `--filter=<spec>` value could not be parsed ([`ObjectFilter::parse`]).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum ObjectFilterError {
+    /// `blob:limit=` is not followed by a size (digits with an optional `k`/`m`/`g` suffix).
+    #[error("invalid blob:limit value: {value}")]
+    InvalidBlobLimit {
+        /// The text after `blob:limit=`.
+        value: String,
+    },
+    /// `tree:` is not followed by a non-negative depth.
+    #[error("invalid tree depth: {value}")]
+    InvalidTreeDepth {
+        /// The text after `tree:`.
+        value: String,
+    },
+    /// `object:type=` names something other than `blob`, `tree`, `commit` or `tag`.
+    #[error("invalid object type: {value}")]
+    InvalidObjectType {
+        /// The text after `object:type=`.
+        value: String,
+    },
+    /// `sparse:oid=` has no value.
+    #[error("invalid sparse:oid value: empty")]
+    EmptySparseOid,
+    /// `combine:` lists no sub-filters.
+    #[error("expected something after combine:")]
+    EmptyCombine,
+    /// A `combine:` sub-filter contains a reserved character that must be percent-encoded.
+    #[error("must escape char in sub-filter-spec: '{ch}'")]
+    UnescapedSubfilterChar {
+        /// The reserved character.
+        ch: char,
+    },
+    /// The spec is not one of the filter kinds Git defines.
+    #[error("invalid filter-spec '{spec}'")]
+    Unknown {
+        /// The spec as given.
+        spec: String,
+    },
+}
+
 impl ObjectFilter {
     /// Parse a `--filter=<spec>` value.
-    pub fn parse(spec: &str) -> std::result::Result<Self, String> {
-        Self::parse_inner(spec.trim(), false)
+    ///
+    /// # Errors
+    ///
+    /// [`ObjectFilterError`] when `spec` is not a filter Git accepts.
+    pub fn parse(spec: &str) -> std::result::Result<Self, ObjectFilterError> {
+        Self::parse_inner(spec.trim())
     }
 
-    fn parse_inner(spec: &str, from_combine_subfilter: bool) -> std::result::Result<Self, String> {
+    fn parse_inner(spec: &str) -> std::result::Result<Self, ObjectFilterError> {
         if spec == "blob:none" {
             return Ok(ObjectFilter::BlobNone);
         }
         if let Some(rest) = spec.strip_prefix("blob:limit=") {
-            let bytes = parse_size_suffix(rest)
-                .ok_or_else(|| format!("invalid blob:limit value: {rest}"))?;
+            let bytes =
+                parse_size_suffix(rest).ok_or_else(|| ObjectFilterError::InvalidBlobLimit {
+                    value: rest.to_owned(),
+                })?;
             return Ok(ObjectFilter::BlobLimit(bytes));
         }
         if let Some(rest) = spec.strip_prefix("tree:") {
-            if rest.is_empty() || !rest.chars().all(|c| c.is_ascii_digit()) {
-                return Err(if from_combine_subfilter {
-                    "expected 'tree:<depth>'.".to_owned()
-                } else {
-                    format!("invalid tree depth: {rest}")
-                });
-            }
-            let depth: u64 = rest.parse().map_err(|_| {
-                if from_combine_subfilter {
-                    "expected 'tree:<depth>'.".to_owned()
-                } else {
-                    format!("invalid tree depth: {rest}")
-                }
-            })?;
+            let depth = rest
+                .chars()
+                .all(|c| c.is_ascii_digit())
+                .then(|| rest.parse::<u64>().ok())
+                .flatten()
+                .ok_or_else(|| ObjectFilterError::InvalidTreeDepth {
+                    value: rest.to_owned(),
+                })?;
             return Ok(ObjectFilter::TreeDepth(depth));
         }
         if let Some(rest) = spec.strip_prefix("object:type=") {
@@ -158,40 +241,41 @@ impl ObjectFilter {
                 "tree" => FilterObjectKind::Tree,
                 "commit" => FilterObjectKind::Commit,
                 "tag" => FilterObjectKind::Tag,
-                "" => return Err("invalid object type".to_owned()),
-                _ => return Err(format!("invalid object type: {rest}")),
+                _ => {
+                    return Err(ObjectFilterError::InvalidObjectType {
+                        value: rest.to_owned(),
+                    })
+                }
             };
             return Ok(ObjectFilter::ObjectType(kind));
         }
         if let Some(rest) = spec.strip_prefix("sparse:oid=") {
             if rest.is_empty() {
-                return Err("invalid sparse:oid value: ".to_owned());
+                return Err(ObjectFilterError::EmptySparseOid);
             }
             return Ok(ObjectFilter::SparseOid(rest.to_owned()));
         }
         if let Some(rest) = spec.strip_prefix("combine:") {
-            if rest.is_empty() {
-                return Err("expected something after combine:".to_owned());
-            }
             let parts = split_combine_raw_parts(rest);
-            if parts.is_empty() {
-                return Err("expected something after combine:".to_owned());
+            if rest.is_empty() || parts.is_empty() {
+                return Err(ObjectFilterError::EmptyCombine);
             }
-            let mut filters = Vec::new();
-            for part in parts {
-                filters.push(Self::parse_from_combine_subfilter(part)?);
-            }
+            let filters = parts
+                .into_iter()
+                .map(Self::parse_from_combine_subfilter)
+                .collect::<std::result::Result<Vec<_>, _>>()?;
             return Ok(ObjectFilter::Combine(filters));
         }
-        Err(format!("invalid filter-spec '{spec}'"))
+        Err(ObjectFilterError::Unknown {
+            spec: spec.to_owned(),
+        })
     }
 
-    fn parse_from_combine_subfilter(encoded: &str) -> std::result::Result<Self, String> {
+    fn parse_from_combine_subfilter(encoded: &str) -> std::result::Result<Self, ObjectFilterError> {
         if let Some(ch) = combine_subfilter_has_reserved(encoded) {
-            return Err(format!("must escape char in sub-filter-spec: '{ch}'"));
+            return Err(ObjectFilterError::UnescapedSubfilterChar { ch });
         }
-        let decoded = url_decode(encoded);
-        Self::parse_inner(&decoded, true)
+        Self::parse_inner(&url_decode(encoded))
     }
 
     /// Merge another `--filter` argument (Git joins multiple filters with AND).
@@ -216,7 +300,8 @@ impl ObjectFilter {
     }
 
     /// Check if a blob should be included given its size.
-    pub fn includes_blob(&self, size: u64) -> bool {
+    #[allow(dead_code)]
+    fn includes_blob(&self, size: u64) -> bool {
         match self {
             ObjectFilter::BlobNone => false,
             ObjectFilter::BlobLimit(limit) => size < *limit,
@@ -234,7 +319,7 @@ impl ObjectFilter {
     /// For `tree:<n>` filters, Git assigns blobs the traversal depth after entering the parent tree,
     /// which matches `parent_tree_depth + 1` in our walk where the commit root tree is depth `0`.
     #[must_use]
-    pub fn includes_blob_under_tree(&self, size: u64, parent_tree_depth: u64) -> bool {
+    pub(crate) fn includes_blob_under_tree(&self, size: u64, parent_tree_depth: u64) -> bool {
         match self {
             ObjectFilter::BlobNone => false,
             ObjectFilter::BlobLimit(limit) => size < *limit,
@@ -248,7 +333,7 @@ impl ObjectFilter {
     }
 
     /// Check if a tree at given depth should be included.
-    pub fn includes_tree(&self, depth: u64) -> bool {
+    pub(crate) fn includes_tree(&self, depth: u64) -> bool {
         match self {
             ObjectFilter::BlobNone => true,
             ObjectFilter::BlobLimit(_) => true,
@@ -294,7 +379,7 @@ impl ObjectFilter {
     }
 
     /// Whether a commit or tag object should appear in a flat object scan (e.g. `cat-file --batch-all-objects`).
-    pub fn includes_commit_or_tag_object(&self, kind: ObjectKind) -> bool {
+    pub(crate) fn includes_commit_or_tag_object(&self, kind: ObjectKind) -> bool {
         let expected = match kind {
             ObjectKind::Commit => Some(FilterObjectKind::Commit),
             ObjectKind::Tag => Some(FilterObjectKind::Tag),
@@ -312,51 +397,14 @@ impl ObjectFilter {
     }
 
     /// True if `kind` / `size` pass this filter when enumerating a single object (no tree path).
-    pub fn includes_loose_object(&self, kind: ObjectKind, size: u64) -> bool {
+    #[allow(dead_code)]
+    fn includes_loose_object(&self, kind: ObjectKind, size: u64) -> bool {
         match kind {
             ObjectKind::Blob => self.includes_blob(size),
             ObjectKind::Tree => self.includes_tree(0),
             ObjectKind::Commit | ObjectKind::Tag => self.includes_commit_or_tag_object(kind),
         }
     }
-}
-
-/// Reachable object IDs enumerated the same way as `git rev-list --objects --no-object-names --all`,
-/// optionally with `--filter` and `--filter-provided-objects` (used by `git cat-file --batch-all-objects`).
-pub fn reachable_object_ids_for_cat_file(
-    repo: &Repository,
-    filter: Option<&ObjectFilter>,
-    filter_provided_objects: bool,
-) -> Result<Vec<ObjectId>> {
-    let opts = RevListOptions {
-        all_refs: true,
-        objects: true,
-        no_object_names: true,
-        quiet: true,
-        filter: filter.cloned(),
-        filter_provided_objects,
-        ..Default::default()
-    };
-    let result = rev_list(repo, &[], &[], &opts)?;
-    let mut set = BTreeSet::new();
-    for (i, oid) in result.commits.iter().enumerate() {
-        if result.objects_print_commit.get(i).copied().unwrap_or(true) {
-            set.insert(*oid);
-        }
-    }
-    for (oid, _) in &result.objects {
-        set.insert(*oid);
-    }
-    Ok(set.into_iter().collect())
-}
-
-/// Objects matching `filter`, for `cat-file --batch-all-objects --filter` (same set as
-/// `rev-list --objects --all --filter --filter-provided-objects`).
-pub fn object_ids_for_cat_file_filtered(
-    repo: &Repository,
-    filter: &ObjectFilter,
-) -> Result<Vec<ObjectId>> {
-    reachable_object_ids_for_cat_file(repo, Some(filter), true)
 }
 
 /// Parse a size with optional k/m/g suffix.
@@ -396,7 +444,13 @@ fn combine_subfilter_has_reserved(encoded: &str) -> Option<char> {
 }
 
 /// Expand a user filter for protocol lines (`blob:limit=1k` → `blob:limit=1024`).
-pub fn expand_object_filter_for_protocol(spec: &str) -> std::result::Result<String, String> {
+///
+/// # Errors
+///
+/// [`ObjectFilterError`] when `spec` is not a filter Git accepts.
+pub fn expand_object_filter_for_protocol(
+    spec: &str,
+) -> std::result::Result<String, ObjectFilterError> {
     let f = ObjectFilter::parse(spec)?;
     match f {
         ObjectFilter::BlobLimit(n) => Ok(format!("blob:limit={n}")),
@@ -445,7 +499,10 @@ fn url_decode(s: &str) -> String {
 /// Ordering mode for commit output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OrderingMode {
-    /// Reverse-chronological by committer date (default `rev-list` / `log` when no ordering flags).
+    /// Ungated committer-date priority queue (default `rev-list` / `log` when no ordering flags).
+    ///
+    /// Matches `git rev-list` without `--date-order`: newest committer date first, equal dates
+    /// broken by tip insertion order, without deferring parents until all children are shown.
     Default,
     /// Commit-date heap walk (`--date-order` without `--topo-order`; matches Git for `t6012`).
     DateOrderWalk,
@@ -486,8 +543,6 @@ pub struct RevListOptions {
     /// `log.excludeDecoration`, and the default hidden-ref behavior), matching Git's
     /// `load_ref_decorations(NULL, ...)` set used by `rev_compare_tree`.
     pub simplify_by_decoration_oids: HashSet<ObjectId>,
-    /// Commit output mode.
-    pub output_mode: OutputMode,
     /// Suppress commit output.
     pub quiet: bool,
     /// Print only final count.
@@ -532,7 +587,8 @@ pub struct RevListOptions {
     pub paths: Vec<String>,
     /// Show full history (don't simplify) for path-limited walks.
     pub full_history: bool,
-    /// Parent rewriting was requested (`--parents`, `--children`, or `%P`/`%p` output).
+    /// Parent rewriting was requested (Git `--parents` / `--children`): path-limited walks
+    /// keep the TREESAME merges that parent rewriting needs.
     pub parent_rewrite: bool,
     /// Sparse mode: don't prune non-matching commits.
     pub sparse: bool,
@@ -608,9 +664,12 @@ pub struct RevListOptions {
     /// Keep the commits a walk parses anyway in [`RevListResult::commit_data`], so callers that
     /// render the listed commits do not read and inflate them a second time.
     pub retain_commit_data: bool,
-    /// When set, filtered object walks poll this flag and stop with [`Error::Cancelled`].
+    /// Follow renames when history is limited to a single literal file path (Git `log --follow`).
+    /// Requires exactly one plain file pathspec in [`Self::paths`].
+    pub follow: bool,
+    /// When set, filtered object walks stop with [`Error::Cancelled`] once cancelled.
     #[doc(hidden)]
-    pub cancel_watch: Option<Arc<AtomicBool>>,
+    pub cancel: Option<crate::progress::CancelToken>,
 }
 
 impl RevListOptions {
@@ -620,9 +679,9 @@ impl RevListOptions {
     /// Bloom filters for path-limited walks when the chain supports them. [`rev_list`] calls
     /// this automatically; with [`RevListOptions::default`], `-n` / `--count` use the same
     /// early-stop and commit-graph paths as the CLI.
-    pub fn normalize_for_walk(&mut self, repo: &Repository, cfg: &ConfigSet) {
+    pub(crate) fn normalize_for_walk(&mut self, cfg: &ConfigSet) {
         if self.use_commit_graph {
-            self.use_commit_graph = repo_commit_graph_enabled(repo, cfg);
+            self.use_commit_graph = repo_commit_graph_enabled(cfg);
         }
         if self.use_commit_graph
             && !self.paths.is_empty()
@@ -630,27 +689,6 @@ impl RevListOptions {
             && crate::pathspec::pathspecs_allow_bloom(&self.paths)
         {
             self.use_commit_graph_bloom = true;
-        }
-    }
-
-    /// Whether path-limited walks should keep TREESAME merges for parent rewriting.
-    ///
-    /// Matches Git when `--parents` is set or the output format includes `%P` / `%p`.
-    #[must_use]
-    pub fn wants_parent_rewrite(&self) -> bool {
-        if self.parent_rewrite {
-            return true;
-        }
-        match &self.output_mode {
-            OutputMode::Parents => true,
-            OutputMode::Format(fmt) => {
-                let raw = fmt
-                    .strip_prefix("format:")
-                    .or_else(|| fmt.strip_prefix("tformat:"))
-                    .unwrap_or(fmt.as_str());
-                raw.contains("%P") || raw.contains("%p")
-            }
-            OutputMode::OidOnly => false,
         }
     }
 }
@@ -664,7 +702,6 @@ impl Default for RevListOptions {
             ancestry_path_bottoms: Vec::new(),
             simplify_by_decoration: false,
             simplify_by_decoration_oids: HashSet::new(),
-            output_mode: OutputMode::OidOnly,
             quiet: false,
             count: false,
             skip: 0,
@@ -720,7 +757,8 @@ impl Default for RevListOptions {
             commit_filter: None,
             pickaxe: None,
             retain_commit_data: false,
-            cancel_watch: None,
+            follow: false,
+            cancel: None,
         }
     }
 }
@@ -783,12 +821,13 @@ pub struct RevListResult {
     pub tip_annotated_tag_by_commit: HashMap<ObjectId, Vec<ObjectId>>,
     /// Populated by bounded topological walks for `log --graph` (avoids a second linkage pass).
     pub log_graph_linkage: Option<LogGraphLinkage>,
-    /// Parsed listed commits, keyed by id, when [`RevListOptions::retain_commit_data`] is set.
+    /// Listed commits kept as raw object bytes when [`RevListOptions::retain_commit_data`] is set.
     ///
-    /// Only walks that parse commit objects fill this, and only for commits they parsed, so
-    /// it may cover some, all, or none of [`Self::commits`]. Bounded identity/message filters
-    /// retain selected matches even with a commit-graph, since filtering reads their objects.
-    pub commit_data: OidHashMap<CommitData>,
+    /// Payloads are stored contiguously (see [`WalkedCommits`]) and parsed on demand via
+    /// [`crate::porcelain::log::CommitReuse`]. Extent is controlled by the private
+    /// [`RevListWalkContext::retained_commit_extent`] threaded from high-level rev-walk APIs
+    /// (typically [`CommitExtent::ThroughSubject`] for one-line log output).
+    pub commit_data: WalkedCommits,
 }
 
 impl RevListResult {
@@ -893,29 +932,52 @@ where
     T: Send,
     F: Fn(&ObjectId) -> T + Sync,
 {
+    map_commit_chunks_in_parallel(commits, PARALLEL_COMMIT_MAP_MIN_PER_THREAD, |part| {
+        part.iter().map(&f).collect()
+    })
+}
+
+/// Split `commits` into one contiguous chunk per worker thread (each at least
+/// `min_per_thread` long) and concatenate what `f` returns for each, in order.
+///
+/// For per-commit work with a per-call setup cost worth sharing across a chunk. `f` must
+/// return one result per commit of its chunk.
+pub(crate) fn map_commit_chunks_in_parallel<T, F>(
+    commits: &[ObjectId],
+    min_per_thread: usize,
+    f: F,
+) -> Vec<T>
+where
+    T: Send,
+    F: Fn(&[ObjectId]) -> Vec<T> + Sync,
+{
     let threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
         .clamp(1, 8)
-        .min(commits.len() / PARALLEL_COMMIT_MAP_MIN_PER_THREAD);
+        .min(commits.len() / min_per_thread.max(1));
     if threads <= 1 {
-        return commits.iter().map(f).collect();
+        return f(commits);
     }
     let chunk = commits.len().div_ceil(threads);
+    // The calling thread takes the first chunk: starting a thread costs about as much as a
+    // chunk of the short work this is used for, so it would otherwise sit idle meanwhile.
+    let (first, rest) = commits.split_at(chunk);
     let f = &f;
     std::thread::scope(|scope| {
-        let handles: Vec<_> = commits
+        let handles: Vec<_> = rest
             .chunks(chunk)
-            .map(|part| scope.spawn(move || part.iter().map(f).collect::<Vec<T>>()))
+            .map(|part| scope.spawn(move || f(part)))
             .collect();
-        handles
-            .into_iter()
-            .flat_map(|handle| {
+        let mut out = f(first);
+        for handle in handles {
+            out.extend(
                 handle
                     .join()
-                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
-            })
-            .collect()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+            );
+        }
+        out
     })
 }
 
@@ -974,109 +1036,6 @@ fn cherry_patch_groups(
         .collect()
 }
 
-/// Per-commit bisection score for `rev-list --bisect*` output.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BisectEntry {
-    /// Candidate commit object ID.
-    pub oid: ObjectId,
-    /// Number of candidate commits reachable from `oid`, including `oid`.
-    pub reaches: usize,
-    /// Git's bisection distance, `min(reaches, all - reaches)`.
-    pub distance: usize,
-}
-
-/// Bisection analysis result for a selected revision set.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BisectSelection {
-    /// Best midpoint candidate, if the selected set is non-empty.
-    pub best: Option<BisectEntry>,
-    /// All candidates sorted as `--bisect-all` requires.
-    pub all: Vec<BisectEntry>,
-    /// Total number of commits in the bisection set.
-    pub total: usize,
-}
-
-/// Rank rev-list commits for Git-compatible bisection helpers.
-///
-/// # Parameters
-///
-/// - `repo` - repository used for parent lookup.
-/// - `commits` - selected commit set from a normal `rev-list` traversal.
-/// - `first_parent` - when true, follow only first parents while counting reachability.
-///
-/// # Returns
-///
-/// A [`BisectSelection`] containing the best midpoint plus the complete sorted candidate list.
-///
-/// # Errors
-///
-/// Returns repository/object errors when parent commits cannot be loaded.
-pub fn select_bisect_commits(
-    repo: &Repository,
-    commits: &[ObjectId],
-    first_parent: bool,
-) -> Result<BisectSelection> {
-    let total = commits.len();
-    if total == 0 {
-        return Ok(BisectSelection {
-            best: None,
-            all: Vec::new(),
-            total: 0,
-        });
-    }
-
-    let candidates: HashSet<ObjectId> = commits.iter().copied().collect();
-    let mut graph = CommitGraph::new(repo, first_parent);
-    let mut entries = Vec::with_capacity(commits.len());
-    for &oid in commits {
-        let reaches = count_reachable_candidates(&mut graph, oid, &candidates)?;
-        let distance = reaches.min(total.saturating_sub(reaches));
-        entries.push(BisectEntry {
-            oid,
-            reaches,
-            distance,
-        });
-    }
-
-    let mut sorted = entries.clone();
-    sorted.sort_by(|a, b| b.distance.cmp(&a.distance).then_with(|| a.oid.cmp(&b.oid)));
-
-    let mut best = None;
-    for entry in &entries {
-        if best
-            .as_ref()
-            .is_none_or(|current: &BisectEntry| entry.distance > current.distance)
-        {
-            best = Some(entry.clone());
-        }
-    }
-    Ok(BisectSelection {
-        best,
-        all: sorted,
-        total,
-    })
-}
-
-fn count_reachable_candidates(
-    graph: &mut CommitGraph<'_>,
-    oid: ObjectId,
-    candidates: &HashSet<ObjectId>,
-) -> Result<usize> {
-    let mut stack = vec![oid];
-    let mut seen = HashSet::new();
-    while let Some(current) = stack.pop() {
-        if !seen.insert(current) {
-            continue;
-        }
-        for parent in graph.parents_of(current)? {
-            if candidates.contains(&parent) {
-                stack.push(parent);
-            }
-        }
-    }
-    Ok(seen.len())
-}
-
 fn retain_maximal_commits(
     graph: &mut CommitGraph<'_>,
     candidates: &mut HashSet<ObjectId>,
@@ -1121,14 +1080,30 @@ fn retain_maximal_commits(
 ///
 /// # Errors
 ///
-/// Returns [`Error::ObjectNotFound`] / [`Error::InvalidRef`] for bad revision
+/// Returns [`crate::error::ObjectError::NotFound`] / [`crate::error::RefError::Invalid`] for bad revision
 /// specs, [`RevListError::UnexpandedSymmetricRange`] for a raw `A...B` spec, and
-/// [`Error::CorruptObject`] for non-commit or malformed commit data.
-pub fn rev_list(
+/// [`crate::error::ObjectError::Corrupt`] for non-commit or malformed commit data.
+pub(crate) fn rev_list(
     repo: &Repository,
     positive_specs: &[String],
     negative_specs: &[String],
     options: &RevListOptions,
+) -> Result<RevListResult> {
+    rev_list_with_context(
+        repo,
+        positive_specs,
+        negative_specs,
+        options,
+        RevListWalkContext::default(),
+    )
+}
+
+pub(crate) fn rev_list_with_context(
+    repo: &Repository,
+    positive_specs: &[String],
+    negative_specs: &[String],
+    options: &RevListOptions,
+    context: RevListWalkContext,
 ) -> Result<RevListResult> {
     crate::trace::trace_span!("grit.revwalk.setup");
     if let Some(spec) = positive_specs
@@ -1140,9 +1115,13 @@ pub fn rev_list(
     }
     let repo_config = repo
         .config()
+        .snapshot()
         .unwrap_or_else(|_| std::sync::Arc::new(ConfigSet::new()));
     let mut walk_options = options.clone();
-    walk_options.normalize_for_walk(repo, repo_config.as_ref());
+    walk_options.normalize_for_walk(repo_config.as_ref());
+    if walk_options.follow {
+        crate::revwalk::queries::validate_follow_pathspecs(&walk_options.paths)?;
+    }
     let options = &walk_options;
 
     let (mut include, mut object_roots, tip_annotated_tag_by_commit) = if options.objects {
@@ -1176,12 +1155,11 @@ pub fn rev_list(
 
     if options.all_refs {
         if options.objects {
-            let (tips, roots) =
-                all_ref_commit_tips_and_object_roots(repo, &RefExclusions::default())?;
+            let (tips, roots) = all_ref_commit_tips_and_object_roots(repo)?;
             include.extend(tips);
             object_roots.extend(roots);
         } else {
-            include.extend(all_ref_tips(repo, &RefExclusions::default())?);
+            include.extend(all_ref_tips(repo)?);
         }
     }
 
@@ -1233,10 +1211,12 @@ pub fn rev_list(
                 reachable_non_commit_object_count: None,
                 tip_annotated_tag_by_commit: HashMap::new(),
                 log_graph_linkage: None,
-                commit_data: OidHashMap::default(),
+                commit_data: WalkedCommits::default(),
             });
         }
-        return Err(Error::InvalidRef("no revisions specified".to_owned()));
+        return Err(Error::Ref(RefError::Invalid {
+            detail: "no revisions specified".to_owned(),
+        }));
     }
 
     if let Some(result) = try_rev_list_accelerated(
@@ -1256,6 +1236,12 @@ pub fn rev_list(
         return Ok(result);
     }
 
+    if let Some(count) = try_unfiltered_count_only(repo, &include, &exclude, options)? {
+        let mut result = rev_list_result_from_commits(Vec::new());
+        result.reachable_commit_count = Some(count);
+        return Ok(result);
+    }
+
     let object_walk_tip_commits: Vec<ObjectId> = if options.objects {
         include.clone()
     } else {
@@ -1268,17 +1254,24 @@ pub fn rev_list(
         HashSet::new()
     };
 
+    if let Some(result) = try_bounded_commit_filter_limit_list(
+        repo,
+        &include,
+        &exclude,
+        options,
+        &repo_config,
+        context,
+    )? {
+        return Ok(result);
+    }
+
     if let Some(result) =
-        try_bounded_commit_filter_limit_list(repo, &include, &exclude, options, &repo_config)?
+        try_bounded_parent_filter_limit_list(repo, &include, &exclude, options, context)?
     {
         return Ok(result);
     }
 
-    if let Some(result) = try_bounded_parent_filter_limit_list(repo, &include, &exclude, options)? {
-        return Ok(result);
-    }
-
-    if let Some(result) = try_bounded_limit_list(repo, &include, &exclude, options)? {
+    if let Some(result) = try_bounded_limit_list(repo, &include, &exclude, options, context)? {
         return Ok(result);
     }
 
@@ -1301,7 +1294,7 @@ pub fn rev_list(
         CommitGraph::with_commit_graph(repo, options.first_parent, options.use_commit_graph);
 
     let use_dense_path_limit = !options.paths.is_empty()
-        && !options.full_history
+        && (!options.full_history || options.follow)
         && !options.ancestry_path
         && !options.simplify_merges;
 
@@ -1355,28 +1348,60 @@ pub fn rev_list(
     } else {
         &mut graph
     };
-    let excluded = if exclude.is_empty() {
-        HashSet::new()
+    let walk_exclude = if exclude.is_empty() {
+        WalkExclude::default()
     } else if let Some(frontier) = painted_hidden_frontier {
-        frontier
+        WalkExclude {
+            set: frontier,
+            paint: None,
+        }
     } else if options.exclude_promisor_objects {
-        walk_closure_ordered_excluding(exclude_graph, &exclude, &excluded_promisor)?.0
+        WalkExclude {
+            set: walk_closure_ordered_excluding(exclude_graph, &exclude, &excluded_promisor)?.0,
+            paint: None,
+        }
     } else if options.exclude_first_parent_only {
-        walk_closure_first_parent_only(exclude_graph, &exclude)?
+        WalkExclude {
+            set: walk_closure_first_parent_only(exclude_graph, &exclude)?,
+            paint: None,
+        }
     } else if options.missing_action != MissingAction::Error {
-        walk_closure_ordered_with_missing(
-            exclude_graph,
-            &exclude,
-            &HashSet::new(),
-            options.missing_action,
-            &mut traversal_missing,
-            &mut traversal_missing_seen,
-        )?
-        .0
+        WalkExclude {
+            set: walk_closure_ordered_with_missing(
+                exclude_graph,
+                &exclude,
+                &HashSet::new(),
+                options.missing_action,
+                &mut traversal_missing,
+                &mut traversal_missing_seen,
+            )?
+            .0,
+            paint: None,
+        }
+    } else if use_dense_path_limit {
+        WalkExclude {
+            set: HashSet::new(),
+            paint: Some(RangeWalkHide::try_for_dense_path_hide(
+                repo,
+                &include,
+                &exclude,
+                options.use_commit_graph,
+                options.first_parent && !options.exclude_first_parent_only,
+            )?),
+        }
     } else {
-        walk_closure(exclude_graph, &exclude)?
+        WalkExclude {
+            set: HashSet::new(),
+            paint: Some(RangeWalkHide::for_range_walk(
+                repo,
+                &include,
+                &exclude,
+                options.use_commit_graph,
+                options.first_parent && !options.exclude_first_parent_only,
+            )?),
+        }
     };
-    included.retain(|oid| !excluded.contains(oid));
+    included.retain(|oid| !walk_exclude.is_excluded(*oid));
 
     // Default dense path limiting is not just a post-walk filter: when a merge is TREESAME to a
     // parent for the pathspec, Git follows only that parent and never walks the other sides.
@@ -1396,13 +1421,13 @@ pub fn rev_list(
     // commits like the latest layer's empty filters.
     let (bloom_chain, bloom_read_changed, bloom_version, bloom_cwd) = if !options.paths.is_empty() {
         let cfg = repo_config.as_ref();
-        let core_cg = repo_commit_graph_enabled(repo, cfg);
+        let core_cg = repo_commit_graph_enabled(cfg);
         let read_paths = cfg
-            .get("commitgraph.readchangedpaths")
+            .value("commitgraph.readchangedpaths")
             .and_then(|v| crate::config::parse_bool(&v).ok())
             .unwrap_or(true);
         let version = cfg
-            .get("commitgraph.changedpathsversion")
+            .value("commitgraph.changedpathsversion")
             .and_then(|s| s.parse::<i32>().ok())
             .unwrap_or(-1);
         let use_bloom = core_cg
@@ -1429,6 +1454,12 @@ pub fn rev_list(
         (None, false, -1, None)
     };
 
+    let follow_threshold = if options.follow {
+        log_follow_rename_threshold(repo_config.as_ref())
+    } else {
+        100
+    };
+
     let mut dense_path_limited = false;
     let dense_traversable: HashSet<ObjectId> = if use_dense_path_limit {
         let bloom_ctx = DenseBloomCtx {
@@ -1438,16 +1469,28 @@ pub fn rev_list(
             stats: options.bloom_stats.as_ref(),
             cwd: bloom_cwd.as_deref(),
         };
+        let paths = RevPathspecCheck::build(repo, &options.paths)?;
+        let mut hide_cache = walk_exclude.paint.as_ref().and_then(|hide| {
+            hide.uses_lazy_hide().then(|| {
+                crate::merge_base::CommitGraphCache::with_commit_graph(
+                    repo,
+                    options.use_commit_graph,
+                )
+            })
+        });
         let (selected, walked, walk_order) = repo.odb().with_pack_read_context(|| {
             walk_dense_path_limited_closure(
                 repo,
                 &mut graph,
                 &include,
-                &excluded,
-                &options.paths,
+                &walk_exclude,
+                &mut hide_cache,
+                &paths,
                 options.sparse,
                 options.show_pulls,
                 Some(&bloom_ctx),
+                options.follow,
+                follow_threshold,
             )
         })?;
         included = selected;
@@ -1465,7 +1508,7 @@ pub fn rev_list(
         // `rev-list --simplify-by-decoration` with no CLI-computed decoration filter): keep
         // commits pointed at by a ref tip. Proper parent-rewriting simplification (below,
         // after ordering) runs when `simplify_by_decoration_oids` is populated.
-        let decorated = all_ref_tips(repo, &RefExclusions::default())?;
+        let decorated = all_ref_tips(repo)?;
         included.retain(|oid| decorated.contains(oid));
     }
 
@@ -1476,9 +1519,9 @@ pub fn rev_list(
             bottoms.extend(exclude.iter().copied());
         }
         if bottoms.is_empty() {
-            return Err(Error::InvalidRef(
-                "--ancestry-path requires a range with excluded tips".to_owned(),
-            ));
+            return Err(Error::Ref(RefError::Invalid {
+                detail: "--ancestry-path requires a range with excluded tips".to_owned(),
+            }));
         }
         limit_to_ancestry(&mut graph, &mut included, &bottoms)?;
         effective_ancestry_path_bottoms = bottoms;
@@ -1564,12 +1607,33 @@ pub fn rev_list(
             reachable_non_commit_object_count: None,
             tip_annotated_tag_by_commit: HashMap::new(),
             log_graph_linkage: None,
-            commit_data: OidHashMap::default(),
+            commit_data: WalkedCommits::default(),
         });
     }
 
     let mut ordered = match options.ordering {
-        OrderingMode::Default | OrderingMode::DateOrderWalk | OrderingMode::AuthorDateWalk => {
+        OrderingMode::Default => {
+            if output_filter_active {
+                date_order_walk_through_dropped(
+                    &mut graph,
+                    &include,
+                    &traversable,
+                    &included,
+                    false,
+                )?
+            } else if dense_path_limited && !include.is_empty() {
+                date_order_walk_through_dropped(
+                    &mut graph,
+                    &include,
+                    &dense_traversable,
+                    &included,
+                    false,
+                )?
+            } else {
+                date_order_walk_through_dropped(&mut graph, &include, &included, &included, false)?
+            }
+        }
+        OrderingMode::DateOrderWalk | OrderingMode::AuthorDateWalk => {
             let author_dates = options.ordering == OrderingMode::AuthorDateWalk;
             if output_filter_active {
                 // When parent-count filters (`--max-parents=1` / `--no-merges`, …) drop a commit
@@ -1606,9 +1670,10 @@ pub fn rev_list(
 
     // The dense walk has already selected visible commits, including every walked commit
     // in sparse mode. Filtering again would discard sparse merges with a TREESAME parent.
-    let dense_path_retain_done = dense_path_limited && !path_effective_full;
+    let dense_path_retain_done = (dense_path_limited && !path_effective_full)
+        || (options.follow && !options.paths.is_empty());
     if !options.paths.is_empty() && !dense_path_retain_done {
-        let paths = &options.paths;
+        let paths = RevPathspecCheck::build(repo, &options.paths)?;
         // The dense path-limited walk above already performed the first-parent Bloom precheck and
         // recorded its `GIT_TRACE2_PERF` statistics for every visited commit (matching Git's single
         // `limit_list` pass). Re-running the precheck here would double-count those counters, so
@@ -1625,16 +1690,16 @@ pub fn rev_list(
                 repo,
                 &mut graph,
                 *oid,
-                paths,
+                &paths,
                 path_effective_full,
                 options.sparse,
                 options.simplify_merges,
                 options.preserve_simplify_merges_graph_merges,
                 options.show_pulls,
-                options.wants_parent_rewrite(),
+                options.parent_rewrite,
                 options.ancestry_path,
                 &effective_ancestry_path_bottoms,
-                &excluded,
+                &walk_exclude,
                 bloom_chain.as_ref(),
                 bloom_read_changed,
                 bloom_version,
@@ -1646,12 +1711,13 @@ pub fn rev_list(
     }
 
     if !options.paths.is_empty() && options.simplify_merges && !ordered.is_empty() {
+        let paths = RevPathspecCheck::build(repo, &options.paths)?;
         ordered = simplify_merges_commit_list(
             repo,
             &ordered,
             &include,
-            &options.paths,
-            &excluded,
+            &paths,
+            &walk_exclude,
             &effective_ancestry_path_bottoms,
             options.ordering,
             options.show_pulls,
@@ -1674,7 +1740,8 @@ pub fn rev_list(
             let mut dense_opts = options.clone();
             dense_opts.sparse = false;
             dense_opts.path_graph_reorder = false;
-            let dense_result = rev_list(repo, positive_specs, negative_specs, &dense_opts)?;
+            let dense_result =
+                rev_list_with_context(repo, positive_specs, negative_specs, &dense_opts, context)?;
             let dense_ordered = reorder_path_limited_graph_commits(
                 repo,
                 &dense_result.commits,
@@ -1832,9 +1899,9 @@ pub fn rev_list(
         let output_set: HashSet<ObjectId> = ordered.iter().copied().collect();
         let mut boundary = Vec::new();
         let mut boundary_seen = HashSet::new();
-        let use_path_parent_rewrite = options.wants_parent_rewrite() && !options.paths.is_empty();
+        let use_path_parent_rewrite = options.parent_rewrite && !options.paths.is_empty();
         let omitted_but_selected = |parent: ObjectId| {
-            excluded.contains(&parent)
+            walk_exclude.is_excluded(parent)
                 || selected_before_limit.contains(&parent)
                 || omitted_by_date_filter.contains(&parent)
         };
@@ -1845,7 +1912,7 @@ pub fn rev_list(
                     oid,
                     &output_set,
                     &selected_before_limit,
-                    &excluded,
+                    &walk_exclude,
                     options.first_parent,
                     &omitted_by_date_filter,
                 )?
@@ -1914,7 +1981,7 @@ pub fn rev_list(
     let sparse_patterns = sparse_oid_lines_from_filter(repo, options.filter.as_ref())?;
     let skip_trees = skip_tree_descent_for_object_type_filter(options.filter.as_ref());
     let walk_cfg = repo_config.as_ref().clone();
-    let promisor_repo = crate::promisor::repo_treats_promisor_packs(repo.git_dir(), &walk_cfg);
+    let promisor_repo = crate::promisor::repo_treats_promisor_packs(&walk_cfg);
     let object_walk_missing_action = if options.objects
         && options.missing_action == MissingAction::Error
         && (promisor_repo || options.exclude_promisor_objects)
@@ -1945,7 +2012,7 @@ pub fn rev_list(
                     skip_trees,
                     omit_object_paths,
                     collect_tree_omits,
-                    options.cancel_watch.clone(),
+                    cancel_watch_for_walk(&options.cancel),
                 )?;
                 let filter_provided = options.filter_provided_objects;
                 let (mut objs, mut omit, mut miss, mut counts, mut segments) =
@@ -1964,7 +2031,7 @@ pub fn rev_list(
                             omit_object_paths,
                             packed_set.as_ref(),
                             collect_tree_omits,
-                            options.cancel_watch.clone(),
+                            cancel_watch_for_walk(&options.cancel),
                         )?;
                         (o, om, mi, c, Vec::<Vec<(ObjectId, String)>>::new())
                     } else {
@@ -1982,7 +2049,7 @@ pub fn rev_list(
                             omit_object_paths,
                             packed_set.as_ref(),
                             collect_tree_omits,
-                            options.cancel_watch.clone(),
+                            cancel_watch_for_walk(&options.cancel),
                         )?;
                         (o, om, mi, Vec::new(), segments)
                     };
@@ -2015,18 +2082,19 @@ pub fn rev_list(
                     }
                 }
                 if !options.paths.is_empty() && !omit_object_paths {
-                    retain_objects_matching_pathspecs(&mut objs, &options.paths);
+                    let paths = RevPathspecCheck::build(repo, &options.paths)?;
+                    retain_objects_matching_pathspecs(&mut objs, &paths);
                     let mut seen_oids: HashSet<ObjectId> =
                         objs.iter().map(|(oid, _)| *oid).collect();
                     for (oid, path) in
-                        collect_pathspec_matching_tree_objects(repo, &ordered, &options.paths)?
+                        collect_pathspec_matching_tree_objects(repo, &ordered, &paths)?
                     {
                         if seen_oids.insert(oid) {
                             objs.push((oid, path));
                         }
                     }
                     for segment in &mut segments {
-                        retain_objects_matching_pathspecs(segment, &options.paths);
+                        retain_objects_matching_pathspecs(segment, &paths);
                     }
                     if !counts.is_empty() {
                         counts = segments.iter().map(Vec::len).collect();
@@ -2067,6 +2135,29 @@ pub fn rev_list(
         None
     };
 
+    let log_graph_linkage = if options.preserve_simplify_merges_graph_merges
+        && !options.objects
+        && !options.count
+        && !options.boundary
+    {
+        let mut linkage = LogGraphLinkage::default();
+        let cap = ordered.len();
+        linkage.parents.reserve(cap);
+        linkage.subjects.reserve(cap);
+        for &oid in &ordered {
+            linkage.parents.insert(oid, graph.parents_of(oid)?);
+            if graph.subject_of(oid).is_none() {
+                graph.cache_commit_subject(oid)?;
+            }
+            if let Some(subject) = graph.subject_of(oid) {
+                linkage.subjects.insert(oid, subject.to_owned());
+            }
+        }
+        Some(linkage)
+    } else {
+        None
+    };
+
     Ok(RevListResult {
         commits: ordered,
         objects,
@@ -2084,8 +2175,8 @@ pub fn rev_list(
         reachable_commit_count,
         reachable_non_commit_object_count: None,
         tip_annotated_tag_by_commit,
-        log_graph_linkage: None,
-        commit_data: OidHashMap::default(),
+        log_graph_linkage,
+        commit_data: WalkedCommits::default(),
     })
 }
 
@@ -2126,1058 +2217,6 @@ pub fn split_revision_token(token: &str) -> (Vec<String>, Vec<String>) {
 /// are literal text, so those specs are left to normal revision resolution.
 fn is_unexpanded_symmetric_range(spec: &str) -> bool {
     crate::rev_parse::split_top_level_triple_dot_range(spec).is_some()
-}
-
-fn ansi_color_from_name(name: &str) -> String {
-    match name {
-        "red" => "\x1b[31m".to_owned(),
-        "green" => "\x1b[32m".to_owned(),
-        "yellow" => "\x1b[33m".to_owned(),
-        "blue" => "\x1b[34m".to_owned(),
-        "magenta" => "\x1b[35m".to_owned(),
-        "cyan" => "\x1b[36m".to_owned(),
-        "white" => "\x1b[37m".to_owned(),
-        "bold" => "\x1b[1m".to_owned(),
-        "dim" => "\x1b[2m".to_owned(),
-        "ul" | "underline" => "\x1b[4m".to_owned(),
-        "blink" => "\x1b[5m".to_owned(),
-        "reverse" => "\x1b[7m".to_owned(),
-        "reset" => "\x1b[m".to_owned(),
-        _ => String::new(),
-    }
-}
-
-fn color_name_to_code(name: &str) -> Option<u8> {
-    match name {
-        "black" => Some(0),
-        "red" => Some(1),
-        "green" => Some(2),
-        "yellow" => Some(3),
-        "blue" => Some(4),
-        "magenta" => Some(5),
-        "cyan" => Some(6),
-        "white" => Some(7),
-        "default" => Some(9),
-        _ => None,
-    }
-}
-
-fn ansi_color_from_spec(spec: &str) -> String {
-    if spec == "reset" {
-        return "\x1b[m".to_owned();
-    }
-    let mut attrs = Vec::new();
-    let mut fg = None;
-    let mut bg = None;
-    for part in spec.split_whitespace() {
-        match part {
-            "bold" => attrs.push("1".to_owned()),
-            "dim" => attrs.push("2".to_owned()),
-            "italic" => attrs.push("3".to_owned()),
-            "ul" | "underline" => attrs.push("4".to_owned()),
-            "blink" => attrs.push("5".to_owned()),
-            "reverse" => attrs.push("7".to_owned()),
-            "strike" => attrs.push("9".to_owned()),
-            "nobold" | "nodim" => attrs.push("22".to_owned()),
-            "noitalic" => attrs.push("23".to_owned()),
-            "noul" | "nounderline" => attrs.push("24".to_owned()),
-            "noblink" => attrs.push("25".to_owned()),
-            "noreverse" => attrs.push("27".to_owned()),
-            "nostrike" => attrs.push("29".to_owned()),
-            _ => {
-                if let Some(code) = color_name_to_code(part) {
-                    if fg.is_none() {
-                        fg = Some(format!("{}", 30 + code));
-                    } else {
-                        bg = Some(format!("{}", 40 + code));
-                    }
-                }
-            }
-        }
-    }
-    let mut codes = attrs;
-    if let Some(code) = fg {
-        codes.push(code);
-    }
-    if let Some(code) = bg {
-        codes.push(code);
-    }
-    if codes.is_empty() {
-        String::new()
-    } else {
-        format!("\x1b[{}m", codes.join(";"))
-    }
-}
-
-fn format_relative_date(diff: i64) -> String {
-    if diff < 0 {
-        "in the future".to_owned()
-    } else if diff < 60 {
-        format!("{} seconds ago", diff)
-    } else if diff < 3600 {
-        let m = diff / 60;
-        if m == 1 {
-            "1 minute ago".to_owned()
-        } else {
-            format!("{m} minutes ago")
-        }
-    } else if diff < 86400 {
-        let h = diff / 3600;
-        if h == 1 {
-            "1 hour ago".to_owned()
-        } else {
-            format!("{h} hours ago")
-        }
-    } else if diff < 86400 * 30 {
-        let d = diff / 86400;
-        if d == 1 {
-            "1 day ago".to_owned()
-        } else {
-            format!("{d} days ago")
-        }
-    } else if diff < 86400 * 365 {
-        let months = diff / (86400 * 30);
-        if months == 1 {
-            "1 month ago".to_owned()
-        } else {
-            format!("{months} months ago")
-        }
-    } else {
-        let years = diff / (86400 * 365);
-        if years == 1 {
-            "1 year ago".to_owned()
-        } else {
-            format!("{years} years ago")
-        }
-    }
-}
-
-/// Render one commit according to the selected output mode.
-///
-/// # Errors
-///
-/// Returns object decode errors when commit metadata is required.
-pub fn render_commit(
-    repo: &Repository,
-    oid: ObjectId,
-    mode: &OutputMode,
-    abbrev_len: usize,
-) -> Result<String> {
-    render_commit_with_color(repo, oid, mode, abbrev_len, false)
-}
-
-/// Render one commit, optionally with ANSI color for `%C` placeholders.
-pub fn render_commit_with_color(
-    repo: &Repository,
-    oid: ObjectId,
-    mode: &OutputMode,
-    abbrev_len: usize,
-    use_color: bool,
-) -> Result<String> {
-    match mode {
-        OutputMode::OidOnly => Ok(format!("{oid}")),
-        OutputMode::Parents => {
-            let mut out = format!("{oid}");
-            let commit = load_commit(repo, oid)?;
-            for parent in commit.parents {
-                out.push(' ');
-                out.push_str(&parent.to_hex());
-            }
-            Ok(out)
-        }
-        OutputMode::Format(fmt) => {
-            let commit = load_commit(repo, oid)?;
-            let wall_now = repo.wall_clock_epoch();
-            let subject = commit.message.lines().next().unwrap_or_default();
-            let hex = oid.to_hex();
-
-            // Handle named pretty formats
-            match fmt.as_str() {
-                "oneline" => {
-                    return Ok(format!("{} {}", hex, subject));
-                }
-                "short" => {
-                    fn fmt_ident(ident: &str) -> String {
-                        let name = if let Some(bracket) = ident.find('<') {
-                            ident[..bracket].trim()
-                        } else {
-                            ident.trim()
-                        };
-                        let email = if let Some(start) = ident.find('<') {
-                            if let Some(end) = ident.find('>') {
-                                &ident[start..=end]
-                            } else {
-                                ""
-                            }
-                        } else {
-                            ""
-                        };
-                        format!("{} {}", name, email)
-                    }
-                    let mut out = String::new();
-                    out.push_str(&format!("Author: {}\n", fmt_ident(&commit.author)));
-                    out.push('\n');
-                    out.push_str(&format!("    {}\n", subject));
-                    out.push('\n');
-                    return Ok(out);
-                }
-                "medium" => {
-                    fn extract_ident_display(ident: &str) -> String {
-                        let name = if let Some(bracket) = ident.find('<') {
-                            ident[..bracket].trim()
-                        } else {
-                            ident.trim()
-                        };
-                        let email = if let Some(start) = ident.find('<') {
-                            if let Some(end) = ident.find('>') {
-                                &ident[start..=end]
-                            } else {
-                                ""
-                            }
-                        } else {
-                            ""
-                        };
-                        format!("{} {}", name, email)
-                    }
-                    fn format_default_date(ident: &str) -> String {
-                        let parts: Vec<&str> = ident.rsplitn(3, ' ').collect();
-                        if parts.len() < 2 {
-                            return String::new();
-                        }
-                        let ts_str = parts[1];
-                        let offset_str = parts[0];
-                        let ts: i64 = match ts_str.parse() {
-                            Ok(v) => v,
-                            Err(_) => return format!("{ts_str} {offset_str}"),
-                        };
-                        let tz_bytes = offset_str.as_bytes();
-                        let tz_secs: i64 = if tz_bytes.len() >= 5 {
-                            let sign = if tz_bytes[0] == b'-' { -1i64 } else { 1i64 };
-                            let h: i64 = offset_str[1..3].parse().unwrap_or(0);
-                            let m: i64 = offset_str[3..5].parse().unwrap_or(0);
-                            sign * (h * 3600 + m * 60)
-                        } else {
-                            0
-                        };
-                        let adjusted = ts + tz_secs;
-                        let dt = time::OffsetDateTime::from_unix_timestamp(adjusted)
-                            .unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
-                        let weekday = match dt.weekday() {
-                            time::Weekday::Monday => "Mon",
-                            time::Weekday::Tuesday => "Tue",
-                            time::Weekday::Wednesday => "Wed",
-                            time::Weekday::Thursday => "Thu",
-                            time::Weekday::Friday => "Fri",
-                            time::Weekday::Saturday => "Sat",
-                            time::Weekday::Sunday => "Sun",
-                        };
-                        let month = match u8::from(dt.month()) {
-                            1 => "Jan",
-                            2 => "Feb",
-                            3 => "Mar",
-                            4 => "Apr",
-                            5 => "May",
-                            6 => "Jun",
-                            7 => "Jul",
-                            8 => "Aug",
-                            9 => "Sep",
-                            10 => "Oct",
-                            11 => "Nov",
-                            12 => "Dec",
-                            _ => "???",
-                        };
-                        format!(
-                            "{} {} {} {:02}:{:02}:{:02} {} {}",
-                            weekday,
-                            month,
-                            dt.day(),
-                            dt.hour(),
-                            dt.minute(),
-                            dt.second(),
-                            dt.year(),
-                            offset_str
-                        )
-                    }
-                    let mut out = String::new();
-                    out.push_str(&format!(
-                        "Author: {}\n",
-                        extract_ident_display(&commit.author)
-                    ));
-                    out.push_str(&format!(
-                        "Date:   {}\n",
-                        format_default_date(&commit.author)
-                    ));
-                    out.push('\n');
-                    for line in commit.message.lines() {
-                        out.push_str(&format!("    {}\n", line));
-                    }
-                    return Ok(out);
-                }
-                _ => {}
-            }
-
-            let raw_fmt = if let Some(t) = fmt.strip_prefix("format:") {
-                t
-            } else if let Some(t) = fmt.strip_prefix("tformat:") {
-                t
-            } else {
-                fmt.as_str()
-            };
-
-            // Verify the commit signature only when a `%G` placeholder is present
-            // in the format (matches git's lazy `%G?`/`%GS` evaluation).
-            let signature: Option<crate::signing::SignatureCheck> = if raw_fmt.contains("%G") {
-                repo.odb().read(&oid).ok().map(|obj| {
-                    let config = repo.config().map(|c| (*c).clone()).unwrap_or_default();
-                    match crate::signing::GpgConfig::from_config(&config) {
-                        Ok(cfg) => crate::signing::verify_commit(&cfg, &obj.data)
-                            .unwrap_or_else(|_| crate::signing::SignatureCheck::default_none()),
-                        Err(_) => crate::signing::SignatureCheck::default_none(),
-                    }
-                })
-            } else {
-                None
-            };
-            // Body: everything after the first line (skip blank separator line)
-            let body = {
-                let mut lines = commit.message.lines();
-                lines.next(); // skip subject
-                              // Skip optional blank line after subject
-                if let Some(blank) = lines.next() {
-                    if blank.is_empty() {
-                        lines.collect::<Vec<_>>().join("\n")
-                    } else {
-                        std::iter::once(blank)
-                            .chain(lines)
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    }
-                } else {
-                    String::new()
-                }
-            };
-            let tree_hex = commit.tree.to_hex();
-            let parent_hexes: Vec<String> = commit.parents.iter().map(|p| p.to_hex()).collect();
-            let parent_abbrevs: Vec<String> = commit
-                .parents
-                .iter()
-                .map(|p| {
-                    let hex = p.to_hex();
-                    let n = abbrev_len.clamp(4, 40).min(hex.len());
-                    hex[..n].to_string()
-                })
-                .collect();
-
-            // Extract name/email components from ident strings
-            fn extract_name(ident: &str) -> &str {
-                if let Some(bracket) = ident.find('<') {
-                    ident[..bracket].trim()
-                } else {
-                    ident.trim()
-                }
-            }
-            fn extract_email(ident: &str) -> &str {
-                if let Some(start) = ident.find('<') {
-                    if let Some(end) = ident.find('>') {
-                        return &ident[start + 1..end];
-                    }
-                }
-                ""
-            }
-            fn extract_timestamp(ident: &str) -> String {
-                match parse_signature_times(ident) {
-                    Some(p) => p.unix_seconds.to_string(),
-                    None => String::new(),
-                }
-            }
-            fn weekday_str(dt: &time::OffsetDateTime) -> &'static str {
-                match dt.weekday() {
-                    time::Weekday::Monday => "Mon",
-                    time::Weekday::Tuesday => "Tue",
-                    time::Weekday::Wednesday => "Wed",
-                    time::Weekday::Thursday => "Thu",
-                    time::Weekday::Friday => "Fri",
-                    time::Weekday::Saturday => "Sat",
-                    time::Weekday::Sunday => "Sun",
-                }
-            }
-            fn month_str(dt: &time::OffsetDateTime) -> &'static str {
-                match u8::from(dt.month()) {
-                    1 => "Jan",
-                    2 => "Feb",
-                    3 => "Mar",
-                    4 => "Apr",
-                    5 => "May",
-                    6 => "Jun",
-                    7 => "Jul",
-                    8 => "Aug",
-                    9 => "Sep",
-                    10 => "Oct",
-                    11 => "Nov",
-                    12 => "Dec",
-                    _ => "???",
-                }
-            }
-            fn extract_email_local(ident: &str) -> &str {
-                let email = extract_email(ident);
-                if let Some(at) = email.find('@') {
-                    &email[..at]
-                } else {
-                    email
-                }
-            }
-            fn extract_date_default(ident: &str) -> String {
-                let Some(p) = parse_signature_times(ident) else {
-                    return String::new();
-                };
-                let offset_str = ident.get(p.tz_hhmm_range.clone()).unwrap_or("+0000");
-                let adjusted = p.unix_seconds + p.tz_offset_secs;
-                let dt = time::OffsetDateTime::from_unix_timestamp(adjusted)
-                    .unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
-                format!(
-                    "{} {} {} {:02}:{:02}:{:02} {} {}",
-                    weekday_str(&dt),
-                    month_str(&dt),
-                    dt.day(),
-                    dt.hour(),
-                    dt.minute(),
-                    dt.second(),
-                    dt.year(),
-                    offset_str
-                )
-            }
-            fn extract_date_rfc2822(ident: &str) -> String {
-                let Some(p) = parse_signature_times(ident) else {
-                    return String::new();
-                };
-                let offset_str = ident.get(p.tz_hhmm_range.clone()).unwrap_or("+0000");
-                let adjusted = p.unix_seconds + p.tz_offset_secs;
-                let dt = time::OffsetDateTime::from_unix_timestamp(adjusted)
-                    .unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
-                format!(
-                    "{}, {} {} {} {:02}:{:02}:{:02} {}",
-                    weekday_str(&dt),
-                    dt.day(),
-                    month_str(&dt),
-                    dt.year(),
-                    dt.hour(),
-                    dt.minute(),
-                    dt.second(),
-                    offset_str
-                )
-            }
-            fn extract_date_short(ident: &str) -> String {
-                let Some(p) = parse_signature_times(ident) else {
-                    return String::new();
-                };
-                let adjusted = p.unix_seconds + p.tz_offset_secs;
-                let dt = time::OffsetDateTime::from_unix_timestamp(adjusted)
-                    .unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
-                format!("{:04}-{:02}-{:02}", dt.year(), dt.month() as u8, dt.day())
-            }
-            fn extract_date_iso(ident: &str) -> String {
-                let Some(p) = parse_signature_times(ident) else {
-                    return String::new();
-                };
-                let offset_str = ident.get(p.tz_hhmm_range.clone()).unwrap_or("+0000");
-                let adjusted = p.unix_seconds + p.tz_offset_secs;
-                let dt = time::OffsetDateTime::from_unix_timestamp(adjusted)
-                    .unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
-                format!(
-                    "{:04}-{:02}-{:02} {:02}:{:02}:{:02} {}",
-                    dt.year(),
-                    dt.month() as u8,
-                    dt.day(),
-                    dt.hour(),
-                    dt.minute(),
-                    dt.second(),
-                    offset_str
-                )
-            }
-
-            // Alignment/truncation state for %<(N), %>(N), %><(N) directives
-            #[derive(Clone, Copy)]
-            enum Align {
-                Left,
-                Right,
-                Center,
-            }
-            #[derive(Clone, Copy)]
-            enum ColTruncate {
-                None,
-                End,
-                Start,
-                Middle,
-            }
-            struct ColSpec {
-                width: usize,
-                align: Align,
-                trunc: ColTruncate,
-            }
-            fn apply_col(spec: &ColSpec, s: &str) -> String {
-                let char_len = s.chars().count();
-                if char_len > spec.width {
-                    match spec.trunc {
-                        ColTruncate::None => s.to_owned(),
-                        ColTruncate::End => {
-                            let mut out: String =
-                                s.chars().take(spec.width.saturating_sub(2)).collect();
-                            out.push_str("..");
-                            out
-                        }
-                        ColTruncate::Start => {
-                            let skip = char_len - spec.width + 2;
-                            let mut out = String::from("..");
-                            out.extend(s.chars().skip(skip));
-                            out
-                        }
-                        ColTruncate::Middle => {
-                            let keep = spec.width.saturating_sub(2);
-                            let left_half = keep / 2;
-                            let right_half = keep - left_half;
-                            let mut out: String = s.chars().take(left_half).collect();
-                            out.push_str("..");
-                            out.extend(s.chars().skip(char_len - right_half));
-                            out
-                        }
-                    }
-                } else {
-                    let pad = spec.width - char_len;
-                    match spec.align {
-                        Align::Left => {
-                            let mut out = s.to_owned();
-                            for _ in 0..pad {
-                                out.push(' ');
-                            }
-                            out
-                        }
-                        Align::Right => {
-                            let mut out = String::new();
-                            for _ in 0..pad {
-                                out.push(' ');
-                            }
-                            out.push_str(s);
-                            out
-                        }
-                        Align::Center => {
-                            let left = pad / 2;
-                            let right = pad - left;
-                            let mut out = String::new();
-                            for _ in 0..left {
-                                out.push(' ');
-                            }
-                            out.push_str(s);
-                            for _ in 0..right {
-                                out.push(' ');
-                            }
-                            out
-                        }
-                    }
-                }
-            }
-            fn parse_col_spec(
-                chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
-                align: Align,
-            ) -> Option<ColSpec> {
-                // Consume '('
-                if chars.peek() != Some(&'(') {
-                    return None;
-                }
-                chars.next();
-                let mut num_str = String::new();
-                while let Some(&c) = chars.peek() {
-                    if c.is_ascii_digit() {
-                        num_str.push(c);
-                        chars.next();
-                    } else {
-                        break;
-                    }
-                }
-                let width: usize = num_str.parse().ok()?;
-                let trunc = if chars.peek() == Some(&',') {
-                    chars.next(); // consume comma
-                    let mut mode = String::new();
-                    while let Some(&c) = chars.peek() {
-                        if c == ')' {
-                            break;
-                        }
-                        mode.push(c);
-                        chars.next();
-                    }
-                    match mode.as_str() {
-                        "trunc" => ColTruncate::End,
-                        "ltrunc" => ColTruncate::Start,
-                        "mtrunc" => ColTruncate::Middle,
-                        _ => ColTruncate::None,
-                    }
-                } else {
-                    ColTruncate::None
-                };
-                // Consume ')'
-                if chars.peek() == Some(&')') {
-                    chars.next();
-                }
-                Some(ColSpec {
-                    width,
-                    align,
-                    trunc,
-                })
-            }
-
-            let mut pending_col: Option<ColSpec> = None;
-            let mut rendered = String::new();
-            let mut chars = raw_fmt.chars().peekable();
-            while let Some(ch) = chars.next() {
-                if ch != '%' {
-                    rendered.push(ch);
-                    continue;
-                }
-                // Check for alignment directives: %<(...), %>(...), %><(...)
-                if chars.peek() == Some(&'<') {
-                    chars.next();
-                    if let Some(spec) = parse_col_spec(&mut chars, Align::Left) {
-                        pending_col = Some(spec);
-                    }
-                    continue;
-                }
-                if chars.peek() == Some(&'>') {
-                    chars.next();
-                    if chars.peek() == Some(&'<') {
-                        chars.next(); // %><(...)
-                        if let Some(spec) = parse_col_spec(&mut chars, Align::Center) {
-                            pending_col = Some(spec);
-                        }
-                    } else if chars.peek() == Some(&'>') {
-                        chars.next(); // %>>(...)
-                        if let Some(spec) = parse_col_spec(&mut chars, Align::Right) {
-                            pending_col = Some(spec);
-                        }
-                    } else if let Some(spec) = parse_col_spec(&mut chars, Align::Right) {
-                        pending_col = Some(spec);
-                    }
-                    continue;
-                }
-
-                // Helper macro-like: expand the placeholder, then apply pending_col
-                let mut expanded = String::new();
-                let target = if pending_col.is_some() {
-                    &mut expanded
-                } else {
-                    &mut rendered
-                };
-                match chars.peek() {
-                    Some('%') => {
-                        chars.next();
-                        target.push('%');
-                    }
-                    Some('H') => {
-                        chars.next();
-                        target.push_str(&oid.to_hex());
-                    }
-                    Some('h') => {
-                        chars.next();
-                        let hex = oid.to_hex();
-                        let n = abbrev_len.clamp(4, 40).min(hex.len());
-                        target.push_str(&hex[..n]);
-                    }
-                    Some('T') => {
-                        chars.next();
-                        target.push_str(&tree_hex);
-                    }
-                    Some('t') => {
-                        chars.next();
-                        let n = abbrev_len.clamp(4, 40).min(tree_hex.len());
-                        target.push_str(&tree_hex[..n]);
-                    }
-                    Some('P') => {
-                        chars.next();
-                        target.push_str(&parent_hexes.join(" "));
-                    }
-                    Some('p') => {
-                        chars.next();
-                        target.push_str(&parent_abbrevs.join(" "));
-                    }
-                    Some('n') => {
-                        chars.next();
-                        target.push('\n');
-                    }
-                    Some('s') => {
-                        chars.next();
-                        target.push_str(subject);
-                    }
-                    Some('b') => {
-                        chars.next();
-                        target.push_str(&body);
-                        if !body.is_empty() {
-                            target.push('\n');
-                        }
-                    }
-                    Some('B') => {
-                        chars.next();
-                        target.push_str(&commit.message);
-                    }
-                    Some('a') => {
-                        chars.next();
-                        match chars.next() {
-                            Some('n') => target.push_str(extract_name(&commit.author)),
-                            Some('N') => target.push_str(extract_name(&commit.author)),
-                            Some('e') => target.push_str(extract_email(&commit.author)),
-                            Some('E') => target.push_str(extract_email(&commit.author)),
-                            Some('l') => target.push_str(extract_email_local(&commit.author)),
-                            Some('d') => target.push_str(&extract_date_default(&commit.author)),
-                            Some('D') => target.push_str(&extract_date_rfc2822(&commit.author)),
-                            Some('t') => target.push_str(&extract_timestamp(&commit.author)),
-                            Some('s') => target.push_str(&extract_date_short(&commit.author)),
-                            Some('i') => target.push_str(&extract_date_iso(&commit.author)),
-                            Some('I') => {
-                                let Some(p) = parse_signature_times(&commit.author) else {
-                                    break;
-                                };
-                                let adjusted = p.unix_seconds + p.tz_offset_secs;
-                                let dt = time::OffsetDateTime::from_unix_timestamp(adjusted)
-                                    .unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
-                                let sign_ch = if p.tz_offset_secs >= 0 { '+' } else { '-' };
-                                let abs_off = p.tz_offset_secs.unsigned_abs();
-                                target.push_str(&format!(
-                                    "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}{}{:02}:{:02}",
-                                    dt.year(),
-                                    dt.month() as u8,
-                                    dt.day(),
-                                    dt.hour(),
-                                    dt.minute(),
-                                    dt.second(),
-                                    sign_ch,
-                                    abs_off / 3600,
-                                    (abs_off % 3600) / 60
-                                ));
-                            }
-                            Some('r') => {
-                                let Some(p) = parse_signature_times(&commit.author) else {
-                                    break;
-                                };
-                                target.push_str(&format_relative_date(wall_now - p.unix_seconds));
-                            }
-                            Some(other) => {
-                                target.push('%');
-                                target.push('a');
-                                target.push(other);
-                            }
-                            None => {
-                                target.push('%');
-                                target.push('a');
-                            }
-                        }
-                    }
-                    Some('c') => {
-                        chars.next();
-                        match chars.next() {
-                            Some('n') => target.push_str(extract_name(&commit.committer)),
-                            Some('N') => target.push_str(extract_name(&commit.committer)),
-                            Some('e') => target.push_str(extract_email(&commit.committer)),
-                            Some('E') => target.push_str(extract_email(&commit.committer)),
-                            Some('l') => target.push_str(extract_email_local(&commit.committer)),
-                            Some('d') => target.push_str(&extract_date_default(&commit.committer)),
-                            Some('D') => target.push_str(&extract_date_rfc2822(&commit.committer)),
-                            Some('t') => target.push_str(&extract_timestamp(&commit.committer)),
-                            Some('s') => target.push_str(&extract_date_short(&commit.committer)),
-                            Some('i') => target.push_str(&extract_date_iso(&commit.committer)),
-                            Some('I') => {
-                                let Some(p) = parse_signature_times(&commit.committer) else {
-                                    break;
-                                };
-                                let adjusted = p.unix_seconds + p.tz_offset_secs;
-                                let dt = time::OffsetDateTime::from_unix_timestamp(adjusted)
-                                    .unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
-                                let sign_ch = if p.tz_offset_secs >= 0 { '+' } else { '-' };
-                                let abs_off = p.tz_offset_secs.unsigned_abs();
-                                target.push_str(&format!(
-                                    "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}{}{:02}:{:02}",
-                                    dt.year(),
-                                    dt.month() as u8,
-                                    dt.day(),
-                                    dt.hour(),
-                                    dt.minute(),
-                                    dt.second(),
-                                    sign_ch,
-                                    abs_off / 3600,
-                                    (abs_off % 3600) / 60
-                                ));
-                            }
-                            Some('r') => {
-                                let Some(p) = parse_signature_times(&commit.committer) else {
-                                    break;
-                                };
-                                target.push_str(&format_relative_date(wall_now - p.unix_seconds));
-                            }
-                            Some(other) => {
-                                target.push('%');
-                                target.push('c');
-                                target.push(other);
-                            }
-                            None => {
-                                target.push('%');
-                                target.push('c');
-                            }
-                        }
-                    }
-                    Some('x') => {
-                        // Hex escape: %xNN
-                        chars.next();
-                        let mut hex_str = String::new();
-                        if let Some(&c1) = chars.peek() {
-                            if c1.is_ascii_hexdigit() {
-                                hex_str.push(c1);
-                                chars.next();
-                            }
-                        }
-                        if let Some(&c2) = chars.peek() {
-                            if c2.is_ascii_hexdigit() {
-                                hex_str.push(c2);
-                                chars.next();
-                            }
-                        }
-                        if let Ok(byte) = u8::from_str_radix(&hex_str, 16) {
-                            target.push(byte as char);
-                        }
-                    }
-                    Some('C') => {
-                        chars.next();
-                        if chars.peek() == Some(&'(') {
-                            chars.next();
-                            let mut spec = String::new();
-                            for c in chars.by_ref() {
-                                if c == ')' {
-                                    break;
-                                }
-                                spec.push(c);
-                            }
-                            let (force, color_spec) =
-                                if let Some(rest) = spec.strip_prefix("always,") {
-                                    (true, rest)
-                                } else if let Some(rest) = spec.strip_prefix("auto,") {
-                                    (false, rest)
-                                } else if spec == "auto" {
-                                    if use_color {
-                                        target.push_str("\x1b[m");
-                                    }
-                                    continue;
-                                } else {
-                                    (false, spec.as_str())
-                                };
-                            if use_color || force {
-                                target.push_str(&ansi_color_from_spec(color_spec));
-                            }
-                        } else {
-                            // Named colors: %Cred, %Cgreen, %Cblue, %Creset, %Cbold
-                            // Must match known names only, not consume trailing text
-                            let remaining: String = chars.clone().collect();
-                            let known = [
-                                "reset", "red", "green", "blue", "yellow", "magenta", "cyan",
-                                "white", "bold", "dim", "ul",
-                            ];
-                            let mut matched = false;
-                            for name in &known {
-                                if remaining.starts_with(name) {
-                                    for _ in 0..name.len() {
-                                        chars.next();
-                                    }
-                                    if use_color {
-                                        target.push_str(&ansi_color_from_name(name));
-                                    }
-                                    matched = true;
-                                    break;
-                                }
-                            }
-                            if !matched {
-                                // Unknown color name — consume alphanumerics
-                                while let Some(&c) = chars.peek() {
-                                    if c.is_alphanumeric() {
-                                        chars.next();
-                                    } else {
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Some('w') => {
-                        // %w(...) — wrapping directive, consume and ignore for now
-                        chars.next();
-                        if chars.peek() == Some(&'(') {
-                            chars.next();
-                            for c in chars.by_ref() {
-                                if c == ')' {
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    Some('+') => {
-                        // %+x — conditional newline: if next placeholder is non-empty, prepend newline
-                        chars.next();
-                        // Expand the following placeholder
-                        if chars.peek() == Some(&'%') {
-                            // The %+ applies to the NEXT expanded value
-                            // For simplicity, treat %+x as: if %x is non-empty, emit '\n' + value
-                            // This needs the *next* placeholder's value
-                        }
-                        // Simple: consume the next char as a format code; prepend \n if non-empty
-                        let mut sub = String::new();
-                        if let Some(&nc) = chars.peek() {
-                            match nc {
-                                'b' => {
-                                    chars.next();
-                                    sub.push_str(&body);
-                                    if !body.is_empty() {
-                                        sub.push('\n');
-                                    }
-                                }
-                                's' => {
-                                    chars.next();
-                                    sub.push_str(subject);
-                                }
-                                _ => {
-                                    chars.next();
-                                    sub.push('%');
-                                    sub.push('+');
-                                    sub.push(nc);
-                                }
-                            }
-                        }
-                        if !sub.is_empty() {
-                            target.push('\n');
-                            target.push_str(&sub);
-                        }
-                    }
-                    Some('-') => {
-                        // %-x — conditional: suppress newline before placeholder if empty
-                        chars.next();
-                        // Consume the next format code
-                        if let Some(&nc) = chars.peek() {
-                            match nc {
-                                'b' => {
-                                    chars.next();
-                                    if !body.is_empty() {
-                                        target.push_str(&body);
-                                        target.push('\n');
-                                    }
-                                }
-                                's' => {
-                                    chars.next();
-                                    target.push_str(subject);
-                                }
-                                _ => {
-                                    chars.next();
-                                    target.push('%');
-                                    target.push('-');
-                                    target.push(nc);
-                                }
-                            }
-                        }
-                    }
-                    Some('d') => {
-                        // Decorations — output empty for now
-                        chars.next();
-                    }
-                    Some('D') => {
-                        // Decorations without parens — output empty for now
-                        chars.next();
-                    }
-                    Some('e') => {
-                        // Encoding
-                        chars.next();
-                        if let Some(encoding) = &commit.encoding {
-                            target.push_str(encoding);
-                        }
-                    }
-                    Some('g') => {
-                        // Reflog placeholders: %gD, %gd, %gs, %gn, %ge, etc.
-                        chars.next();
-                        if let Some(&_nc) = chars.peek() {
-                            chars.next(); // consume the sub-specifier
-                                          // For non-reflog commits, these expand to empty
-                        }
-                    }
-                    Some('G') => {
-                        // Signature placeholders (%G?, %GS, %GK, %GF, %GP, %GT, %GG).
-                        // Unknown `%G<x>` (and a bare trailing `%G`) pass through
-                        // literally, mirroring git's pretty.c `return 0`.
-                        use crate::signing::{SignatureCheck, TrustLevel};
-                        let default_sig;
-                        let sig: &SignatureCheck = match &signature {
-                            Some(s) => s,
-                            None => {
-                                default_sig = SignatureCheck::default_none();
-                                &default_sig
-                            }
-                        };
-                        let mut lookahead = chars.clone();
-                        lookahead.next(); // consume 'G'
-                        let sub = lookahead.peek().copied();
-                        let handled = match sub {
-                            Some('?') => {
-                                let ch = if sig.result == 'G'
-                                    && matches!(
-                                        sig.trust_level,
-                                        TrustLevel::Undefined | TrustLevel::Never
-                                    ) {
-                                    'U'
-                                } else {
-                                    sig.result
-                                };
-                                target.push(ch);
-                                true
-                            }
-                            Some('S') => {
-                                target.push_str(sig.signer.as_deref().unwrap_or(""));
-                                true
-                            }
-                            Some('K') => {
-                                target.push_str(sig.key.as_deref().unwrap_or(""));
-                                true
-                            }
-                            Some('F') => {
-                                target.push_str(sig.fingerprint.as_deref().unwrap_or(""));
-                                true
-                            }
-                            Some('P') => {
-                                target
-                                    .push_str(sig.primary_key_fingerprint.as_deref().unwrap_or(""));
-                                true
-                            }
-                            Some('T') => {
-                                target.push_str(sig.trust_level.display_key());
-                                true
-                            }
-                            Some('G') => {
-                                target.push_str(&sig.output);
-                                true
-                            }
-                            _ => false,
-                        };
-                        if handled {
-                            chars.next(); // consume 'G'
-                            chars.next(); // consume sub-char
-                        } else {
-                            target.push('%');
-                        }
-                    }
-                    Some(&other) => {
-                        chars.next();
-                        target.push('%');
-                        target.push(other);
-                    }
-                    None => target.push('%'),
-                }
-                // Apply pending column formatting
-                if let Some(spec) = pending_col.take() {
-                    let formatted = apply_col(&spec, &expanded);
-                    rendered.push_str(&formatted);
-                }
-            }
-            Ok(rendered)
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3226,17 +2265,6 @@ impl ExpectedObjectKind {
             Self::Tag => "tag",
         }
     }
-}
-
-/// Non-commit root from revision arguments (`tag`, `rev:path`, raw tree/blob OID), for object walks.
-#[derive(Clone, Debug)]
-pub struct ObjectWalkRoot {
-    /// Object id of the peeled non-commit (tree or blob) or tag target.
-    pub oid: ObjectId,
-    /// `input` field.
-    pub input: String,
-    /// Path within the tree for `rev:path` blob roots.
-    pub root_path: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -3469,7 +2497,9 @@ fn resolve_specs_with_options(
     for spec in specs {
         let oid = match resolve_revision_for_range_end(repo, spec) {
             Ok(oid) => oid,
-            Err(Error::ObjectNotFound(_) | Error::InvalidRef(_)) if ignore_missing => continue,
+            Err(
+                Error::Object(ObjectError::NotFound { .. }) | Error::Ref(RefError::Invalid { .. }),
+            ) if ignore_missing => continue,
             Err(err) => return Err(err),
         };
         match repo.odb().peel_to_commit(oid) {
@@ -3481,7 +2511,9 @@ fn resolve_specs_with_options(
             // (e.g. submodule-change detection over a remote carrying a tag-of-blob, t5516
             // "refuse fetch to current branch of worktree") do not abort.
             Ok(None) => {}
-            Err(Error::ObjectNotFound(_) | Error::InvalidRef(_)) if ignore_missing => {}
+            Err(
+                Error::Object(ObjectError::NotFound { .. }) | Error::Ref(RefError::Invalid { .. }),
+            ) if ignore_missing => {}
             Err(err) => return Err(err),
         }
     }
@@ -3490,19 +2522,11 @@ fn resolve_specs_with_options(
 
 /// Resolve revision tokens for [`open_commit_stream`] /
 /// [`RevWalk::commits_iter`](crate::revwalk::handle::RevWalk::commits_iter).
-pub fn resolve_specs_for_commit_stream(
+pub(crate) fn resolve_specs_for_commit_stream(
     repo: &Repository,
     specs: &[String],
 ) -> Result<Vec<ObjectId>> {
     resolve_specs_with_options(repo, specs, false)
-}
-
-/// Resolve revision strings to commit tips and non-commit roots (tags, trees, blobs, `rev:path`).
-///
-/// Used by `test-tool path-walk` and similar object walks that mirror `git` revision parsing.
-/// Resolve revision strings to commit OIDs (for negative specs / exclusions).
-pub fn resolve_revision_commits(repo: &Repository, specs: &[String]) -> Result<Vec<ObjectId>> {
-    resolve_specs(repo, specs)
 }
 
 /// Resolve revision argument strings to commit OIDs for history walks (`log`, `rev-list`).
@@ -3510,7 +2534,7 @@ pub fn resolve_revision_commits(repo: &Repository, specs: &[String]) -> Result<V
 /// Each spec is interpreted like Git's `handle_revision_arg` for a plain commit tip: ranges
 /// (`A..B`), exclusions (`^rev`), and revision expressions are supported via
 /// [`split_revision_token`] and [`resolve_revision_for_range_end`].
-pub fn resolve_revision_specs_to_commits(
+pub(crate) fn resolve_revision_specs_to_commits(
     repo: &Repository,
     specs: &[String],
 ) -> Result<Vec<ObjectId>> {
@@ -3522,34 +2546,8 @@ pub fn resolve_revision_specs_to_commits(
 /// # Errors
 ///
 /// Propagates ref listing and peel errors.
-pub fn all_ref_commit_tips_for_walk(repo: &Repository) -> Result<Vec<ObjectId>> {
-    all_ref_tips(repo, &RefExclusions::default())
-}
-
-/// `resolve_object_walk_roots` function.
-pub fn resolve_object_walk_roots(
-    repo: &Repository,
-    specs: &[String],
-) -> Result<(Vec<ObjectId>, Vec<ObjectWalkRoot>)> {
-    let (commits, roots, _tip_annotated_tag_by_commit) = resolve_specs_for_objects(repo, specs)?;
-    Ok((
-        commits,
-        roots
-            .into_iter()
-            .map(|r| ObjectWalkRoot {
-                oid: r.oid,
-                input: r.input,
-                root_path: r.root_path,
-            })
-            .collect(),
-    ))
-}
-
-fn resolve_specs_for_objects(
-    repo: &Repository,
-    specs: &[String],
-) -> Result<ResolvedSpecsWithTagMap> {
-    resolve_specs_for_objects_with_options(repo, specs, false, MissingAction::Error)
+pub(crate) fn all_ref_commit_tips_for_walk(repo: &Repository) -> Result<Vec<ObjectId>> {
+    all_ref_tips(repo)
 }
 
 fn resolve_specs_for_objects_with_options(
@@ -3566,10 +2564,11 @@ fn resolve_specs_for_objects_with_options(
         if let Ok(raw_oid) = spec.parse::<ObjectId>() {
             let raw_object = match repo.odb().read(&raw_oid) {
                 Ok(obj) => obj,
-                Err(Error::ObjectNotFound(_)) if ignore_missing => continue,
-                Err(Error::ObjectNotFound(_) | Error::PromisedObjectMissing(_))
-                    if missing_action != MissingAction::Error =>
-                {
+                Err(Error::Object(ObjectError::NotFound { .. })) if ignore_missing => continue,
+                Err(
+                    Error::Object(ObjectError::NotFound { .. })
+                    | Error::Object(ObjectError::PromisedMissing { .. }),
+                ) if missing_action != MissingAction::Error => {
                     roots.push(RootObject {
                         oid: raw_oid,
                         input: spec.clone(),
@@ -3589,10 +2588,12 @@ fn resolve_specs_for_objects_with_options(
                     let tag = parse_tag(&raw_object.data)?;
                     let expected_kind = ExpectedObjectKind::from_tag_type(&tag.object_type)
                         .ok_or_else(|| {
-                            Error::CorruptObject(format!(
-                                "object {spec} has unsupported tag type '{}'",
-                                tag.object_type
-                            ))
+                            Error::Object(ObjectError::Corrupt {
+                                detail: format!(
+                                    "object {spec} has unsupported tag type '{}'",
+                                    tag.object_type
+                                ),
+                            })
                         })?;
                     if expected_kind == ExpectedObjectKind::Commit {
                         // A tag whose target peels to a commit becomes a normal commit walk tip
@@ -3627,26 +2628,31 @@ fn resolve_specs_for_objects_with_options(
             if !path.is_empty() {
                 let treeish_oid = match resolve_revision_for_range_end(repo, treeish) {
                     Ok(oid) => oid,
-                    Err(Error::ObjectNotFound(_) | Error::InvalidRef(_)) if ignore_missing => {
+                    Err(
+                        Error::Object(ObjectError::NotFound { .. })
+                        | Error::Ref(RefError::Invalid { .. }),
+                    ) if ignore_missing => {
                         continue;
                     }
                     Err(err) => return Err(err),
                 };
                 let object_oid = match resolve_treeish_path(repo, treeish_oid, path) {
                     Ok(oid) => oid,
-                    Err(Error::ObjectNotFound(_) | Error::InvalidRef(_)) if ignore_missing => {
+                    Err(
+                        Error::Object(ObjectError::NotFound { .. })
+                        | Error::Ref(RefError::Invalid { .. }),
+                    ) if ignore_missing => {
                         continue;
                     }
                     Err(err) => return Err(err),
                 };
                 let expected_kind = match repo.odb().read_info(&object_oid) {
                     Ok(info) => ExpectedObjectKind::from_object_kind(info.kind),
-                    Err(Error::ObjectNotFound(_) | Error::PromisedObjectMissing(_))
-                        if missing_action != MissingAction::Error =>
-                    {
-                        None
-                    }
-                    Err(Error::ObjectNotFound(_)) if ignore_missing => continue,
+                    Err(
+                        Error::Object(ObjectError::NotFound { .. })
+                        | Error::Object(ObjectError::PromisedMissing { .. }),
+                    ) if missing_action != MissingAction::Error => None,
+                    Err(Error::Object(ObjectError::NotFound { .. })) if ignore_missing => continue,
                     Err(err) => return Err(err),
                 };
                 roots.push(RootObject {
@@ -3662,7 +2668,9 @@ fn resolve_specs_for_objects_with_options(
 
         let oid = match resolve_revision_for_range_end(repo, spec) {
             Ok(oid) => oid,
-            Err(Error::ObjectNotFound(_) | Error::InvalidRef(_)) if ignore_missing => continue,
+            Err(
+                Error::Object(ObjectError::NotFound { .. }) | Error::Ref(RefError::Invalid { .. }),
+            ) if ignore_missing => continue,
             Err(err) => return Err(err),
         };
         match repo.odb().peel_to_commit(oid) {
@@ -3673,17 +2681,22 @@ fn resolve_specs_for_objects_with_options(
                 }
                 commits.push(commit_oid);
             }
-            Ok(None) | Err(Error::CorruptObject(_) | Error::ObjectNotFound(_))
-                if ignore_missing => {}
-            Ok(None) | Err(Error::CorruptObject(_) | Error::ObjectNotFound(_)) => {
-                roots.push(RootObject {
-                    oid,
-                    input: spec.clone(),
-                    expected_kind: None,
-                    root_path: None,
-                    wrap_with_tag: None,
-                })
-            }
+            Ok(None)
+            | Err(
+                Error::Object(ObjectError::Corrupt { .. })
+                | Error::Object(ObjectError::NotFound { .. }),
+            ) if ignore_missing => {}
+            Ok(None)
+            | Err(
+                Error::Object(ObjectError::Corrupt { .. })
+                | Error::Object(ObjectError::NotFound { .. }),
+            ) => roots.push(RootObject {
+                oid,
+                input: spec.clone(),
+                expected_kind: None,
+                root_path: None,
+                wrap_with_tag: None,
+            }),
             Err(err) => return Err(err),
         }
     }
@@ -3724,9 +2737,9 @@ fn reflog_commit_tips(repo: &Repository) -> Result<Vec<ObjectId>> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     let mut peeled_raw = HashSet::new();
-    for refname in list_reflog_refs(repo.git_dir())? {
-        let entries = read_reflog(repo.git_dir(), &refname)?;
-        for e in entries {
+    let store = repo.ref_store();
+    for refname in reflog_refs_on_store(store)? {
+        for e in read_reflog_on_store(store, &refname)? {
             for oid in [e.old_oid, e.new_oid] {
                 if oid == z || !peeled_raw.insert(oid) {
                     continue;
@@ -3765,7 +2778,7 @@ fn walk_closure_first_parent_only(
         if !seen.insert(oid) {
             continue;
         }
-        let parents = graph.parents_of(oid)?;
+        let parents = graph.parents_of_ref(oid)?;
         if let Some(&p) = parents.first() {
             queue.push_back(p);
         }
@@ -3800,7 +2813,7 @@ fn walk_closure_ordered_excluding(
             continue;
         }
         order.push(oid);
-        for parent in graph.parents_of(oid)? {
+        for &parent in graph.parents_of_ref(oid)? {
             queue.push_back(parent);
         }
     }
@@ -3825,11 +2838,12 @@ fn walk_closure_ordered_with_missing(
         if excluded.contains(&oid) || seen.contains(&oid) {
             continue;
         }
-        let parents = match graph.parents_of(oid) {
-            Ok(parents) => parents,
-            Err(Error::ObjectNotFound(_) | Error::PromisedObjectMissing(_))
-                if missing_action != MissingAction::Error =>
-            {
+        let parents = match graph.parents_of_ref(oid) {
+            Ok(p) => p,
+            Err(
+                Error::Object(ObjectError::NotFound { .. })
+                | Error::Object(ObjectError::PromisedMissing { .. }),
+            ) if missing_action != MissingAction::Error => {
                 if missing_action.reports_missing() && missing_seen.insert(oid) {
                     missing.push(oid);
                 }
@@ -3839,7 +2853,7 @@ fn walk_closure_ordered_with_missing(
         };
         seen.insert(oid);
         order.push(oid);
-        for parent in parents {
+        for &parent in parents {
             queue.push_back(parent);
         }
     }
@@ -3881,7 +2895,8 @@ fn date_order_walk_through_dropped(
         if emit.contains(&item.oid) && emitted.insert(item.oid) {
             out.push(item.oid);
         }
-        for parent in graph.parents_of(item.oid)? {
+        let parents = graph.parents_of(item.oid)?;
+        for parent in parents {
             if !traversable.contains(&parent) {
                 continue;
             }
@@ -3899,12 +2914,12 @@ fn date_order_walk_through_dropped(
     Ok(out)
 }
 
-/// Git-style default ordering: among commits ready to print, pick the one with the
-/// greatest committer timestamp; a parent becomes ready only after all of its
-/// children that remain in the walk have been emitted.
+/// Topologically gated date ordering used for `--date-order` / `--author-date-order`
+/// (without `--topo-order`): a parent is emitted only after every selected child has
+/// been shown, with committer- or author-date priority among ready commits.
 ///
-/// This matches `git rev-list` behavior (and differs from sorting the whole set by
-/// date, which can surface ancestors before descendants when dates are skewed).
+/// Default `rev-list` order uses the ungated heap in [`streaming_date_walk`] and
+/// [`date_order_walk_through_dropped`] instead (see [`OrderingMode::Default`]).
 pub(crate) fn date_order_walk(
     graph: &mut CommitGraph<'_>,
     selected: &HashSet<ObjectId>,
@@ -3914,7 +2929,7 @@ pub(crate) fn date_order_walk(
     let mut unfinished_children: HashMap<ObjectId, usize> =
         selected.iter().map(|&oid| (oid, 0usize)).collect();
     for &child in selected {
-        for parent in graph.parents_of(child)? {
+        for &parent in graph.parents_of_ref(child)? {
             if selected.contains(&parent) {
                 if let Some(count) = unfinished_children.get_mut(&parent) {
                     *count += 1;
@@ -3969,7 +2984,8 @@ pub(crate) fn date_order_walk(
             continue;
         }
         out.push(item.oid);
-        for parent in graph.parents_of(item.oid)? {
+        let parents: Vec<ObjectId> = graph.parents_of(item.oid)?;
+        for parent in parents {
             if !selected.contains(&parent) {
                 continue;
             }
@@ -4002,7 +3018,7 @@ fn topo_sort(
     let mut child_count: HashMap<ObjectId, usize> = selected.iter().map(|&oid| (oid, 0)).collect();
 
     for &oid in selected {
-        for parent in graph.parents_of(oid)? {
+        for &parent in graph.parents_of_ref(oid)? {
             if !selected.contains(&parent) {
                 continue;
             }
@@ -4030,7 +3046,8 @@ fn topo_sort(
     while let Some(Reverse(item)) = ready.pop() {
         let oid = item.oid;
         out.push(oid);
-        for parent in graph.parents_of(oid)? {
+        let parents: Vec<ObjectId> = graph.parents_of(oid)?;
+        for parent in parents {
             if !selected.contains(&parent) {
                 continue;
             }
@@ -4084,7 +3101,7 @@ fn graph_order_topo_sort(
     let mut child_count: HashMap<ObjectId, usize> = selected.iter().map(|&oid| (oid, 0)).collect();
 
     for &oid in selected {
-        for parent in graph.parents_of(oid)? {
+        for &parent in graph.parents_of_ref(oid)? {
             if !selected.contains(&parent) {
                 continue;
             }
@@ -4122,7 +3139,8 @@ fn graph_order_topo_sort(
     let mut out = Vec::with_capacity(selected.len());
     while let Some(oid) = ready.pop() {
         out.push(oid);
-        for parent in graph.parents_of(oid)? {
+        let parents: Vec<ObjectId> = graph.parents_of(oid)?;
+        for parent in parents {
             if !selected.contains(&parent) {
                 continue;
             }
@@ -4159,7 +3177,7 @@ fn reorder_adjacent_merge_parent_blocks(
     ordered: &mut [ObjectId],
 ) -> Result<()> {
     for index in 0..ordered.len() {
-        let parents = graph.parents_of(ordered[index])?;
+        let parents = graph.parents_of_ref(ordered[index])?;
         if parents.len() <= 1 || index + parents.len() >= ordered.len() {
             continue;
         }
@@ -4253,7 +3271,7 @@ fn first_parent_spines_for_positive_tips(
 fn commit_path_treesame_to_relevant_parents(
     repo: &Repository,
     oid: ObjectId,
-    paths: &[String],
+    paths: &RevPathspecCheck<'_>,
     parents: &[ObjectId],
     selected: &HashSet<ObjectId>,
 ) -> Result<bool> {
@@ -4309,10 +3327,10 @@ fn remove_duplicate_parents(parents: &mut Vec<ObjectId>) {
 fn remove_path_treesame_root_parents(
     repo: &Repository,
     oid: ObjectId,
-    paths: &[String],
+    paths: &RevPathspecCheck<'_>,
     parents: &mut Vec<ObjectId>,
 ) -> Result<()> {
-    if paths.is_empty() {
+    if paths.specs().is_empty() {
         return Ok(());
     }
     parents.retain(|parent| {
@@ -4332,7 +3350,7 @@ fn remove_path_treesame_root_parents(
 fn leave_one_path_treesame_parent(
     repo: &Repository,
     oid: ObjectId,
-    paths: &[String],
+    paths: &RevPathspecCheck<'_>,
     parents: &mut Vec<ObjectId>,
 ) -> Result<()> {
     if parents.len() <= 1 {
@@ -4372,8 +3390,8 @@ fn simplify_one_merge_for_paths(
     selected: &HashSet<ObjectId>,
     simplified: &HashMap<ObjectId, ObjectId>,
     first_parent_spine: &HashSet<ObjectId>,
-    paths: &[String],
-    excluded: &HashSet<ObjectId>,
+    paths: &RevPathspecCheck<'_>,
+    excluded: &WalkExclude,
     ancestry_path_bottoms: &[ObjectId],
     show_pulls: bool,
     preserve_graph_merges: bool,
@@ -4456,8 +3474,8 @@ fn simplify_merges_commit_list(
     repo: &Repository,
     commits: &[ObjectId],
     positive_tips: &[ObjectId],
-    paths: &[String],
-    excluded: &HashSet<ObjectId>,
+    paths: &RevPathspecCheck<'_>,
+    excluded: &WalkExclude,
     ancestry_path_bottoms: &[ObjectId],
     ordering: OrderingMode,
     show_pulls: bool,
@@ -4582,11 +3600,11 @@ fn simplify_merges_author_date_order(
 fn path_merge_survives_simplify(
     repo: &Repository,
     oid: ObjectId,
-    paths: &[String],
-    excluded: &HashSet<ObjectId>,
+    paths: &RevPathspecCheck<'_>,
+    excluded: &WalkExclude,
     ancestry_path_bottoms: &[ObjectId],
 ) -> Result<bool> {
-    if paths.is_empty() {
+    if paths.specs().is_empty() {
         return Ok(false);
     }
     let mut tree_buf = Vec::new();
@@ -4614,7 +3632,7 @@ fn path_merge_survives_simplify(
             if nth == 0 {
                 first_parent_differs = true;
             }
-            if excluded.contains(parent_oid) {
+            if excluded.is_excluded(*parent_oid) {
                 differing_parent_is_excluded = true;
             }
         } else {
@@ -4664,11 +3682,11 @@ fn graph_simplify_parent_list_lib(
 fn path_treesame_parents(
     repo: &Repository,
     oid: ObjectId,
-    paths: &[String],
+    paths: &RevPathspecCheck<'_>,
     parents: &[ObjectId],
 ) -> Result<HashSet<ObjectId>> {
     let mut treesame = HashSet::new();
-    if paths.is_empty() || parents.is_empty() {
+    if paths.specs().is_empty() || parents.is_empty() {
         return Ok(treesame);
     }
 
@@ -4821,7 +3839,7 @@ fn path_limited_rewrite_parents_for_boundary(
     oid: ObjectId,
     output_set: &HashSet<ObjectId>,
     selected_set: &HashSet<ObjectId>,
-    excluded: &HashSet<ObjectId>,
+    excluded: &WalkExclude,
     first_parent_only: bool,
     omitted_by_date_filter: &HashSet<ObjectId>,
 ) -> Result<Vec<ObjectId>> {
@@ -4844,7 +3862,7 @@ fn path_limited_rewrite_parents_for_boundary(
                 }
                 break;
             }
-            if excluded.contains(&cur) {
+            if excluded.is_excluded(cur) {
                 if seen.insert(cur) {
                     out.push(cur);
                 }
@@ -5056,7 +4074,7 @@ fn commit_touches_paths(
     repo: &Repository,
     graph: &mut CommitGraph<'_>,
     oid: ObjectId,
-    paths: &[String],
+    paths: &RevPathspecCheck<'_>,
     full_history: bool,
     sparse: bool,
     simplify_merges: bool,
@@ -5065,7 +4083,7 @@ fn commit_touches_paths(
     parent_rewrite: bool,
     ancestry_path: bool,
     ancestry_path_bottoms: &[ObjectId],
-    excluded: &HashSet<ObjectId>,
+    excluded: &WalkExclude,
     bloom_chain: Option<&CommitGraphChain>,
     read_changed_paths: bool,
     changed_paths_version: i32,
@@ -5207,7 +4225,7 @@ fn commit_touches_paths(
             return Ok(first_parent_differs
                 || differing_parent_oids
                     .iter()
-                    .any(|parent| excluded.contains(parent)));
+                    .any(|parent| excluded.is_excluded(*parent)));
         }
         return Ok(differs_any || sparse);
     }
@@ -5366,7 +4384,9 @@ impl DenseWalkCache {
             .odb()
             .read_into_caching_delta_bases(&tree, &mut self.tree_read_buf)?;
         if kind != ObjectKind::Tree {
-            return Err(Error::CorruptObject(format!("object {tree} is not a tree")));
+            return Err(Error::Object(ObjectError::Corrupt {
+                detail: format!("object {tree} is not a tree"),
+            }));
         }
         let resolved = match crate::objects::find_tree_entry_by_name_dir_or_file_in_data(
             &self.tree_read_buf,
@@ -5497,7 +4517,6 @@ fn normalized_plain_literal_treesame_path(repo: &Repository, raw_spec: &str) -> 
 fn dense_path_limited_count_only_compatible(options: &RevListOptions) -> bool {
     options.count
         && !options.objects
-        && options.output_mode == OutputMode::OidOnly
         && matches!(options.ordering, OrderingMode::Default)
         && !options.left_right
         && !options.left_only
@@ -5516,7 +4535,7 @@ fn dense_path_limited_count_only_compatible(options: &RevListOptions) -> bool {
         && options.filter.is_none()
         && !options.filter_print_omitted
         && options.missing_action == MissingAction::Error
-        && !options.wants_parent_rewrite()
+        && !options.parent_rewrite
 }
 
 fn dense_path_limited_count_from_included(
@@ -5554,39 +4573,282 @@ fn dense_path_limited_count_from_included(
     Ok(included.len())
 }
 
+const LOG_FOLLOW_RENAME_THRESHOLD_DEFAULT: u32 = 50;
+
+fn log_follow_rename_threshold(cfg: &ConfigSet) -> u32 {
+    let Some(raw) = cfg.value("diff.renames") else {
+        return LOG_FOLLOW_RENAME_THRESHOLD_DEFAULT;
+    };
+    let v = raw.trim();
+    if v.eq_ignore_ascii_case("false")
+        || v.eq_ignore_ascii_case("no")
+        || v.eq_ignore_ascii_case("off")
+        || v == "0"
+    {
+        return LOG_FOLLOW_RENAME_THRESHOLD_DEFAULT;
+    }
+    // Git treats any truthy `diff.renames` (including numeric values) as enabling renames for
+    // `--follow`; the similarity cutoff stays the default `-M` threshold, not the config number.
+    if v.parse::<u32>().is_ok() || crate::diff::parse_diff_rename_threshold_percent(v).is_some() {
+        return LOG_FOLLOW_RENAME_THRESHOLD_DEFAULT;
+    }
+    LOG_FOLLOW_RENAME_THRESHOLD_DEFAULT
+}
+
+/// Blob (or symlink) at a plain literal path in `tree`, using [`DenseWalkCache`] for tree reads.
+fn literal_path_leaf_at_tree(
+    repo: &Repository,
+    tree: ObjectId,
+    literal_path: &str,
+    cache: &mut DenseWalkCache,
+) -> Result<Option<(ObjectId, u32)>> {
+    let path_trimmed = literal_path.trim_end_matches('/');
+    let parts: Vec<&str> = path_trimmed.split('/').filter(|p| !p.is_empty()).collect();
+    if parts.is_empty() {
+        return Ok(None);
+    }
+    let (dir, leaf) = parts.split_at(parts.len().saturating_sub(1));
+    let leaf = leaf[0];
+    let (dir_oid, _) = tree_oids_at_literal_prefix_pair(repo, Some(tree), None, dir, cache)?;
+    let Some(dir_oid) = dir_oid else {
+        return Ok(None);
+    };
+    match cache.lookup_tree_component(repo, dir_oid, leaf)? {
+        CachedTreeChild::Found { oid, mode } if !is_tree_mode(mode) => Ok(Some((oid, mode))),
+        _ => Ok(None),
+    }
+}
+
+/// Path to use in `parent_tree` when walking `--follow` history from `commit_tree` at `follow_path`.
+///
+/// Returns `None` when this parent does not carry the followed file (side branch).
+fn follow_path_into_parent(
+    repo: &Repository,
+    parent_tree: ObjectId,
+    commit_tree: ObjectId,
+    _argv_path: &str,
+    follow_path: &str,
+    threshold: u32,
+    cache: &mut DenseWalkCache,
+) -> Result<Option<String>> {
+    if let Some(literal) = normalized_plain_literal_treesame_path(repo, follow_path) {
+        let in_child = literal_path_leaf_at_tree(repo, commit_tree, &literal, cache)?.is_some();
+        let in_parent = literal_path_leaf_at_tree(repo, parent_tree, &literal, cache)?.is_some();
+        if in_child && in_parent {
+            return Ok(Some(follow_path.to_owned()));
+        }
+        if !in_child && in_parent {
+            return Ok(Some(follow_path.to_owned()));
+        }
+        if !in_child {
+            // Path missing from both trees (e.g. HEAD after rename): keep walking with the same
+            // follow path so we reach the commit that removed/renamed it.
+            return Ok(Some(follow_path.to_owned()));
+        }
+        if threshold < 100 {
+            let odb = repo.odb();
+            let entries = diff_trees(odb, Some(&parent_tree), Some(&commit_tree), "")?;
+            let entries = detect_renames(odb, None, entries, threshold);
+            if let Some(old_path) = entries.into_iter().find_map(|e| {
+                if e.status == DiffStatus::Renamed && e.new_path.as_deref() == Some(follow_path) {
+                    e.old_path
+                } else {
+                    None
+                }
+            }) {
+                return Ok(Some(old_path));
+            }
+        }
+        return Ok(Some(follow_path.to_owned()));
+    }
+    let path_specs = [follow_path.to_owned()];
+    let path_check = RevPathspecCheck {
+        specs: &path_specs,
+        attr: None,
+    };
+    let in_child = tree_has_pathspec_match(repo, commit_tree, "", &path_check)?;
+    let in_parent = tree_has_pathspec_match(repo, parent_tree, "", &path_check)?;
+    if in_child && in_parent {
+        return Ok(Some(follow_path.to_owned()));
+    }
+    if !in_child && in_parent {
+        return Ok(Some(follow_path.to_owned()));
+    }
+    if !in_child {
+        // Path missing from both trees (e.g. HEAD after rename): keep walking with the same
+        // follow path so we reach the commit that removed/renamed it.
+        return Ok(Some(follow_path.to_owned()));
+    }
+    if threshold < 100 {
+        let odb = repo.odb();
+        let entries = diff_trees(odb, Some(&parent_tree), Some(&commit_tree), "")?;
+        let entries = detect_renames(odb, None, entries, threshold);
+        if let Some(old_path) = entries.into_iter().find_map(|e| {
+            if e.status == DiffStatus::Renamed && e.new_path.as_deref() == Some(follow_path) {
+                e.old_path
+            } else {
+                None
+            }
+        }) {
+            return Ok(Some(old_path));
+        }
+    }
+    Ok(Some(follow_path.to_owned()))
+}
+
+fn follow_path_into_parent_at_merge(
+    repo: &Repository,
+    parent_tree: ObjectId,
+    commit_tree: ObjectId,
+    _argv_path: &str,
+    follow_path: &str,
+    threshold: u32,
+    cache: &mut DenseWalkCache,
+) -> Result<Option<String>> {
+    if let Some(literal) = normalized_plain_literal_treesame_path(repo, follow_path) {
+        if !literal_path_leaf_at_tree(repo, commit_tree, &literal, cache)?.is_some() {
+            return Ok(None);
+        }
+        if literal_path_leaf_at_tree(repo, parent_tree, &literal, cache)?.is_some() {
+            return Ok(Some(follow_path.to_owned()));
+        }
+    } else {
+        let path_specs = [follow_path.to_owned()];
+        let path_check = RevPathspecCheck {
+            specs: &path_specs,
+            attr: None,
+        };
+        if !tree_has_pathspec_match(repo, commit_tree, "", &path_check)? {
+            return Ok(None);
+        }
+        if tree_has_pathspec_match(repo, parent_tree, "", &path_check)? {
+            return Ok(Some(follow_path.to_owned()));
+        }
+    }
+    let path_specs = [follow_path.to_owned()];
+    let odb = repo.odb();
+    let pathspec_matcher = repo.pathspec_matcher(&path_specs)?;
+    let entries = diff_trees_for_pathspecs(
+        odb,
+        Some(&parent_tree),
+        Some(&commit_tree),
+        &path_specs,
+        Some(&pathspec_matcher),
+    )?;
+    let entries = if threshold >= 100 {
+        entries
+    } else {
+        detect_renames(odb, None, entries, threshold)
+    };
+    if let Some(old) = entries
+        .iter()
+        .find(|e| e.status == DiffStatus::Renamed && e.new_path.as_deref() == Some(follow_path))
+        .and_then(|e| e.old_path.clone())
+    {
+        return Ok(Some(old));
+    }
+    if let Some(literal) = normalized_plain_literal_treesame_path(repo, follow_path) {
+        if literal_path_leaf_at_tree(repo, parent_tree, &literal, cache)?.is_some() {
+            return Ok(Some(follow_path.to_owned()));
+        }
+        return Ok(None);
+    }
+    let path_check = RevPathspecCheck {
+        specs: &path_specs,
+        attr: None,
+    };
+    if tree_has_pathspec_match(repo, parent_tree, "", &path_check)? {
+        return Ok(Some(follow_path.to_owned()));
+    }
+    Ok(None)
+}
+
+fn bloom_for_follow_path<'a>(
+    bloom: Option<&'a DenseBloomCtx<'_>>,
+    argv_path: &str,
+    follow_path: Option<&str>,
+) -> Option<&'a DenseBloomCtx<'a>> {
+    match follow_path {
+        Some(p) if p != argv_path => None,
+        _ => bloom,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn walk_dense_path_limited_closure(
     repo: &Repository,
     graph: &mut CommitGraph<'_>,
     tips: &[ObjectId],
-    excluded: &HashSet<ObjectId>,
-    paths: &[String],
+    excluded: &WalkExclude,
+    hide_cache: &mut Option<crate::merge_base::CommitGraphCache<'_>>,
+    paths: &RevPathspecCheck<'_>,
     sparse: bool,
     show_pulls: bool,
     bloom: Option<&DenseBloomCtx<'_>>,
+    follow: bool,
+    follow_rename_threshold: u32,
 ) -> Result<(HashSet<ObjectId>, HashSet<ObjectId>, Vec<ObjectId>)> {
     let mut walked = HashSet::new();
     let mut selected = HashSet::new();
     let mut walk_order = Vec::new();
-    let mut queue: VecDeque<ObjectId> = tips.iter().copied().collect();
     let mut cache = DenseWalkCache::default();
 
-    while let Some(oid) = queue.pop_front() {
-        if excluded.contains(&oid) || !walked.insert(oid) {
-            continue;
+    if follow {
+        let initial = paths.specs()[0].clone();
+        let argv_path = initial.as_str();
+        let mut queue: VecDeque<(ObjectId, String)> =
+            tips.iter().map(|t| (*t, initial.clone())).collect();
+        while let Some((oid, follow_path)) = queue.pop_front() {
+            if excluded.is_excluded_with_hide_cache(hide_cache, oid)? || !walked.insert(oid) {
+                continue;
+            }
+            walk_order.push(oid);
+            let bloom_use = bloom_for_follow_path(bloom, argv_path, Some(follow_path.as_str()));
+            let action = dense_path_limited_action(
+                repo,
+                graph,
+                oid,
+                paths,
+                sparse,
+                show_pulls,
+                bloom_use,
+                &mut cache,
+                Some(follow_path.as_str()),
+                follow_rename_threshold,
+            )?;
+            if action.visible {
+                selected.insert(oid);
+            }
+            if let Some(next_paths) = action.next_follow_paths.as_ref() {
+                for (parent, next_path) in action.parents_to_walk.iter().zip(next_paths.iter()) {
+                    if excluded.is_excluded(*parent) || walked.contains(parent) {
+                        continue;
+                    }
+                    queue.push_back((*parent, next_path.clone()));
+                }
+            }
         }
-        walk_order.push(oid);
+    } else {
+        let mut queue: VecDeque<ObjectId> = tips.iter().copied().collect();
+        while let Some(oid) = queue.pop_front() {
+            if excluded.is_excluded_with_hide_cache(hide_cache, oid)? || !walked.insert(oid) {
+                continue;
+            }
+            walk_order.push(oid);
 
-        let action = dense_path_limited_action(
-            repo, graph, oid, paths, sparse, show_pulls, bloom, &mut cache,
-        )?;
-        if action.visible {
-            selected.insert(oid);
-        }
+            let action = dense_path_limited_action(
+                repo, graph, oid, paths, sparse, show_pulls, bloom, &mut cache, None, 100,
+            )?;
+            if action.visible {
+                selected.insert(oid);
+            }
 
-        for parent in action.parents_to_walk {
-            if !excluded.contains(&parent) && !walked.contains(&parent) {
-                queue.push_back(parent);
+            for parent in action.parents_to_walk {
+                if !excluded.is_excluded_with_hide_cache(hide_cache, parent)?
+                    && !walked.contains(&parent)
+                {
+                    queue.push_back(parent);
+                }
             }
         }
     }
@@ -5597,6 +4859,8 @@ fn walk_dense_path_limited_closure(
 struct DensePathAction {
     visible: bool,
     parents_to_walk: Vec<ObjectId>,
+    /// Next `--follow` path for each parent in `parents_to_walk` (follow walks only).
+    next_follow_paths: Option<Vec<String>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5604,20 +4868,238 @@ fn dense_path_limited_action(
     repo: &Repository,
     graph: &mut CommitGraph<'_>,
     oid: ObjectId,
-    paths: &[String],
+    paths: &RevPathspecCheck<'_>,
     sparse: bool,
     show_pulls: bool,
     bloom: Option<&DenseBloomCtx<'_>>,
     cache: &mut DenseWalkCache,
+    follow_path: Option<&str>,
+    follow_rename_threshold: u32,
 ) -> Result<DensePathAction> {
+    let mut follow_spec_storage = String::new();
+    let owned_follow_check;
+    let check_paths = if let Some(fp) = follow_path {
+        follow_spec_storage.clear();
+        follow_spec_storage.push_str(fp);
+        owned_follow_check = RevPathspecCheck {
+            specs: std::slice::from_ref(&follow_spec_storage),
+            attr: None,
+        };
+        &owned_follow_check
+    } else {
+        paths
+    };
     let commit_tree = graph.commit_tree(oid)?;
     let parents = graph.parents_of(oid)?;
 
     if parents.is_empty() {
-        let visible = sparse || tree_has_pathspec_match(repo, commit_tree, "", paths)?;
+        let visible = sparse || tree_has_pathspec_match(repo, commit_tree, "", check_paths)?;
         return Ok(DensePathAction {
             visible,
             parents_to_walk: Vec::new(),
+            next_follow_paths: None,
+        });
+    }
+
+    if let Some(follow_path) = follow_path {
+        let argv_path = paths
+            .specs()
+            .first()
+            .map(String::as_str)
+            .unwrap_or(follow_path);
+        let mut lineage: Vec<(ObjectId, bool, String)> = Vec::new();
+        let merge = parents.len() > 1;
+        for (nth, parent_oid) in parents.iter().enumerate() {
+            let parent_tree = graph.commit_tree(*parent_oid)?;
+            if !merge && nth == 0 && follow_path == argv_path && commit_tree != parent_tree {
+                let mut bloom_definitely_unchanged = false;
+                if let Some(ctx) = bloom {
+                    if let Some(chain) = ctx.chain {
+                        let bloom_ret = chain.bloom_precheck_for_paths(
+                            repo.odb(),
+                            oid,
+                            paths.specs(),
+                            ctx.cwd,
+                            ctx.changed_paths_version,
+                            ctx.read_changed_paths,
+                        )?;
+                        if let Some(stats) = ctx.stats {
+                            if let Ok(mut g) = stats.lock() {
+                                g.record_precheck(bloom_ret);
+                            }
+                        }
+                        bloom_definitely_unchanged = bloom_ret == BloomPrecheck::DefinitelyNot;
+                    }
+                }
+                if bloom_definitely_unchanged {
+                    lineage.push((*parent_oid, false, follow_path.to_owned()));
+                    continue;
+                }
+            }
+            let propagate = if merge && nth > 0 {
+                follow_path_into_parent_at_merge(
+                    repo,
+                    parent_tree,
+                    commit_tree,
+                    argv_path,
+                    follow_path,
+                    follow_rename_threshold,
+                    cache,
+                )?
+            } else {
+                follow_path_into_parent(
+                    repo,
+                    parent_tree,
+                    commit_tree,
+                    argv_path,
+                    follow_path,
+                    follow_rename_threshold,
+                    cache,
+                )?
+            };
+            let Some(parent_follow_path) = propagate else {
+                continue;
+            };
+            let parent_spec = [parent_follow_path.clone()];
+            let parent_check = RevPathspecCheck {
+                specs: &parent_spec,
+                attr: None,
+            };
+            let differs = if commit_tree == parent_tree {
+                false
+            } else if !merge
+                && nth == 0
+                && follow_path == argv_path
+                && parent_follow_path == follow_path
+            {
+                trees_differ_for_pathspecs_with_bloom(
+                    repo,
+                    commit_tree,
+                    parent_tree,
+                    "",
+                    paths,
+                    true,
+                    bloom,
+                    oid,
+                    Some(cache),
+                )?
+            } else {
+                trees_differ_for_pathspecs_with_bloom(
+                    repo,
+                    commit_tree,
+                    parent_tree,
+                    "",
+                    &parent_check,
+                    nth == 0,
+                    bloom,
+                    oid,
+                    Some(cache),
+                )?
+            };
+            lineage.push((*parent_oid, differs, parent_follow_path));
+        }
+
+        let parents_to_walk: Vec<ObjectId> = if merge {
+            let mut treesame_parent = None;
+            for parent_oid in &parents {
+                let Some((_, differs, _)) = lineage.iter().find(|(p, _, _)| p == parent_oid) else {
+                    continue;
+                };
+                if !*differs {
+                    treesame_parent = Some(*parent_oid);
+                    break;
+                }
+            }
+            if let Some(parent) = treesame_parent {
+                vec![parent]
+            } else {
+                let mut filtered: Vec<ObjectId> = lineage
+                    .iter()
+                    .filter(|(_, _, parent_follow_path)| parent_follow_path == follow_path)
+                    .map(|(p, _, _)| *p)
+                    .collect();
+                if filtered.is_empty() {
+                    if let Some((parent_oid, _, _)) = lineage
+                        .iter()
+                        .find(|(p, _, _)| parents.first().is_some_and(|first| p == first))
+                    {
+                        filtered.push(*parent_oid);
+                    } else {
+                        filtered.extend(lineage.iter().map(|(p, _, _)| *p));
+                    }
+                }
+                filtered
+            }
+        } else {
+            lineage.iter().map(|(p, _, _)| *p).collect()
+        };
+
+        // Git `log --follow` walks through merges but does not list merge commits.
+        let visible = if sparse {
+            true
+        } else if parents.len() > 1 {
+            false
+        } else if follow_path
+            == paths
+                .specs()
+                .first()
+                .map(String::as_str)
+                .unwrap_or(follow_path)
+        {
+            lineage.first().is_some_and(|(_, differs, _)| *differs)
+        } else {
+            let argv = paths
+                .specs()
+                .first()
+                .map(String::as_str)
+                .unwrap_or(follow_path);
+            let argv_specs = [argv.to_owned()];
+            let argv_check = RevPathspecCheck {
+                specs: &argv_specs,
+                attr: None,
+            };
+            let parent_tree = graph.commit_tree(parents[0])?;
+            let argv_differs = trees_differ_for_pathspecs_optional(
+                repo,
+                Some(commit_tree),
+                Some(parent_tree),
+                "",
+                &argv_check,
+                Some(cache),
+            )?;
+            let argv_unchanged = tree_has_pathspec_match(repo, commit_tree, "", &argv_check)?
+                && tree_has_pathspec_match(repo, parent_tree, "", &argv_check)?
+                && !argv_differs;
+            let follow_specs = [follow_path.to_owned()];
+            let follow_check = RevPathspecCheck {
+                specs: &follow_specs,
+                attr: None,
+            };
+            let follow_differs = trees_differ_for_pathspecs_optional(
+                repo,
+                Some(commit_tree),
+                Some(parent_tree),
+                "",
+                &follow_check,
+                Some(cache),
+            )?;
+            follow_differs && !argv_unchanged
+        };
+
+        let next_follow_paths: Vec<String> = parents_to_walk
+            .iter()
+            .filter_map(|parent_oid| {
+                lineage
+                    .iter()
+                    .find(|(p, _, _)| p == parent_oid)
+                    .map(|(_, _, path)| path.clone())
+            })
+            .collect();
+
+        return Ok(DensePathAction {
+            visible,
+            parents_to_walk,
+            next_follow_paths: Some(next_follow_paths),
         });
     }
 
@@ -5637,7 +5119,7 @@ fn dense_path_limited_action(
             commit_tree,
             parent_tree,
             "",
-            paths,
+            check_paths,
             nth == 0,
             bloom,
             oid,
@@ -5670,54 +5152,8 @@ fn dense_path_limited_action(
     Ok(DensePathAction {
         visible,
         parents_to_walk,
+        next_follow_paths: None,
     })
-}
-
-/// Whether `oid` would be included in a dense path-limited history walk for `paths`.
-///
-/// Matches the non-Bloom parts of the internal `commit_touches_paths` helper with `full_history = false` and
-/// `sparse = false`: single-parent commits require a tree change on `paths` vs their parent;
-/// merge commits are omitted when exactly one parent is tree-same on `paths` (Git `TREESAME`
-/// simplification). Used by `log -g -- <path>` to align with Git's reflog path filtering.
-pub fn commit_visible_for_dense_pathspecs(
-    repo: &Repository,
-    oid: ObjectId,
-    paths: &[String],
-) -> Result<bool> {
-    if paths.is_empty() {
-        return Ok(true);
-    }
-    let commit = load_commit(repo, oid)?;
-    let parents = commit.parents.clone();
-
-    if parents.is_empty() {
-        return tree_has_pathspec_match(repo, commit.tree, "", paths);
-    }
-
-    if parents.len() == 1 {
-        let parent = load_commit(repo, parents[0])?;
-        return trees_differ_for_pathspecs(repo, commit.tree, parent.tree, "", paths);
-    }
-
-    let mut treesame_parents = 0usize;
-    let mut differs_any = false;
-    for parent_oid in &parents {
-        let parent = load_commit(repo, *parent_oid)?;
-        let differs = trees_differ_for_pathspecs(repo, commit.tree, parent.tree, "", paths)?;
-        if differs {
-            differs_any = true;
-        } else {
-            treesame_parents += 1;
-        }
-    }
-
-    if treesame_parents == 1 {
-        return Ok(false);
-    }
-    if differs_any {
-        return Ok(true);
-    }
-    Ok(false)
 }
 
 fn compute_cherry_patch_id(
@@ -5726,33 +5162,82 @@ fn compute_cherry_patch_id(
     paths: &[String],
 ) -> Result<Option<ObjectId>> {
     let algo = repo.odb().hash_algo();
-    if paths.is_empty() {
+    let pathspec = if paths.is_empty() {
+        crate::pathspec::Pathspec::entire_tree(crate::pathspec::PathspecGlobalFlags::default())
+    } else {
+        crate::pathspec::Pathspec::scoped(
+            paths.iter().cloned(),
+            crate::pathspec::PathspecGlobalFlags::default(),
+        )
+    };
+    if pathspec.is_entire_tree() {
         compute_patch_id(algo, repo.odb(), oid, crate::patch_ids::PatchIdMode::Stable)
     } else {
         compute_patch_id_for_paths(
             algo,
             repo.odb(),
             oid,
-            paths,
+            &pathspec,
             crate::patch_ids::PatchIdMode::Stable,
         )
+    }
+}
+
+/// Path-limited history matching, including `:(attr:...)` via [`Repository::pathspec_matcher`].
+struct RevPathspecCheck<'a> {
+    specs: &'a [String],
+    attr: Option<PathspecMatcher<'a>>,
+}
+
+impl<'a> RevPathspecCheck<'a> {
+    fn build(repo: &Repository, specs: &'a [String]) -> Result<Self> {
+        let attr = if specs.iter().any(|s| pathspec_has_attr_magic(s)) {
+            Some(repo.pathspec_matcher(specs)?)
+        } else {
+            None
+        };
+        Ok(Self { specs, attr })
+    }
+
+    fn specs(&self) -> &[String] {
+        self.specs
+    }
+
+    fn path_matches(&self, path: &str, mode: u32) -> bool {
+        if let Some(m) = &self.attr {
+            m.matches_entry(path, mode)
+        } else {
+            crate::pathspec::matches_pathspec_list(path, self.specs)
+        }
+    }
+
+    fn entry_is_relevant(&self, path: &str, is_tree: bool, mode: u32) -> bool {
+        if !is_tree && self.path_matches(path, mode) {
+            return true;
+        }
+        is_tree && crate::pathspec::pathspec_wants_descent_for_rev_tree(path, self.specs)
     }
 }
 
 fn path_differs_for_specs(
     current: &HashMap<String, (ObjectId, u32)>,
     parent: &HashMap<String, (ObjectId, u32)>,
-    specs: &[String],
+    paths: &RevPathspecCheck<'_>,
 ) -> bool {
-    let mut paths = std::collections::BTreeSet::new();
-    paths.extend(current.keys().cloned());
-    paths.extend(parent.keys().cloned());
+    let mut union = std::collections::BTreeSet::new();
+    union.extend(current.keys().cloned());
+    union.extend(parent.keys().cloned());
 
-    for path in &paths {
-        if !crate::pathspec::matches_pathspec_list(path, specs) {
+    for path in union {
+        let mode = current
+            .get(&path)
+            .or_else(|| parent.get(&path))
+            .map(|(_, m)| *m)
+            .unwrap_or(0o100644);
+        if !paths.path_matches(&path, mode) {
             continue;
         }
-        if current.get(path) != parent.get(path) {
+        if current.get(&path) != parent.get(&path) {
             return true;
         }
     }
@@ -5766,9 +5251,9 @@ fn is_tree_mode(mode: u32) -> bool {
 fn read_parsed_tree(repo: &Repository, tree_oid: ObjectId) -> Result<Vec<TreeEntry>> {
     let object = repo.odb().read(&tree_oid)?;
     if object.kind != ObjectKind::Tree {
-        return Err(Error::CorruptObject(format!(
-            "object {tree_oid} is not a tree"
-        )));
+        return Err(Error::Object(ObjectError::Corrupt {
+            detail: format!("object {tree_oid} is not a tree"),
+        }));
     }
     parse_tree(&object.data)
 }
@@ -5778,16 +5263,16 @@ fn tree_has_pathspec_match(
     repo: &Repository,
     tree_oid: ObjectId,
     prefix: &str,
-    pathspecs: &[String],
+    paths: &RevPathspecCheck<'_>,
 ) -> Result<bool> {
-    tree_has_pathspec_match_cached(repo, tree_oid, prefix, pathspecs, None)
+    tree_has_pathspec_match_cached(repo, tree_oid, prefix, paths, None)
 }
 
 fn tree_has_pathspec_match_cached(
     repo: &Repository,
     tree_oid: ObjectId,
     prefix: &str,
-    pathspecs: &[String],
+    paths: &RevPathspecCheck<'_>,
     cache: Option<&mut DenseWalkCache>,
 ) -> Result<bool> {
     let mut fallback_buf = Vec::new();
@@ -5799,9 +5284,9 @@ fn tree_has_pathspec_match_cached(
     };
     let kind = repo.odb().read_into(&tree_oid, buf)?;
     if kind != ObjectKind::Tree {
-        return Err(Error::CorruptObject(format!(
-            "object {tree_oid} is not a tree"
-        )));
+        return Err(Error::Object(ObjectError::Corrupt {
+            detail: format!("object {tree_oid} is not a tree"),
+        }));
     }
     let oid_len = repo.odb().hash_algo().len();
     for entry in TreeRefIter::with_oid_len(buf.as_slice(), oid_len) {
@@ -5813,12 +5298,12 @@ fn tree_has_pathspec_match_cached(
             format!("{prefix}/{name}")
         };
         let is_tree = is_tree_mode(entry.mode);
-        if !is_tree && crate::pathspec::matches_pathspec_list(&path, pathspecs) {
+        if !is_tree && paths.path_matches(&path, entry.mode) {
             return Ok(true);
         }
         if is_tree
-            && crate::pathspec::pathspec_wants_descent_for_rev_tree(&path, pathspecs)
-            && tree_has_pathspec_match_cached(repo, entry.oid, &path, pathspecs, None)?
+            && crate::pathspec::pathspec_wants_descent_for_rev_tree(&path, paths.specs())
+            && tree_has_pathspec_match_cached(repo, entry.oid, &path, paths, None)?
         {
             return Ok(true);
         }
@@ -5829,33 +5314,16 @@ fn tree_has_pathspec_match_cached(
 /// Pathspec-scoped tree comparison (Git `rev_compare_tree` / tree-diff pruning).
 ///
 /// Walks only directories that pathspecs may match instead of flattening whole trees.
-fn trees_differ_for_pathspecs(
-    repo: &Repository,
-    old_tree: ObjectId,
-    new_tree: ObjectId,
-    prefix: &str,
-    pathspecs: &[String],
-) -> Result<bool> {
-    trees_differ_for_pathspecs_optional(
-        repo,
-        Some(old_tree),
-        Some(new_tree),
-        prefix,
-        pathspecs,
-        None,
-    )
-}
-
 fn trees_differ_for_pathspecs_optional(
     repo: &Repository,
     old_tree: Option<ObjectId>,
     new_tree: Option<ObjectId>,
     prefix: &str,
-    pathspecs: &[String],
+    paths: &RevPathspecCheck<'_>,
     cache: Option<&mut DenseWalkCache>,
 ) -> Result<bool> {
-    if prefix.is_empty() && pathspecs.len() == 1 {
-        if let Some(literal) = normalized_plain_literal_treesame_path(repo, &pathspecs[0]) {
+    if prefix.is_empty() && paths.specs().len() == 1 {
+        if let Some(literal) = normalized_plain_literal_treesame_path(repo, &paths.specs()[0]) {
             let mut local = DenseWalkCache::default();
             let walk_cache = match cache {
                 Some(c) => c,
@@ -5876,7 +5344,7 @@ fn trees_differ_for_pathspecs_optional(
                 Some(oid) => read_parsed_tree(repo, oid)?,
                 None => Vec::new(),
             };
-            trees_differ_tree_entries(repo, &old_entries, &new_entries, prefix, pathspecs)
+            trees_differ_tree_entries(repo, &old_entries, &new_entries, prefix, paths)
         }
     }
 }
@@ -5886,14 +5354,14 @@ fn trees_differ_tree_entries(
     old: &[crate::objects::TreeEntry],
     new: &[crate::objects::TreeEntry],
     prefix: &str,
-    pathspecs: &[String],
+    paths: &RevPathspecCheck<'_>,
 ) -> Result<bool> {
     let mut oi = 0usize;
     let mut ni = 0usize;
     while oi < old.len() || ni < new.len() {
         match (old.get(oi), new.get(ni)) {
             (Some(o), Some(n)) => {
-                let cmp = crate::objects::tree_entry_cmp(
+                let cmp = crate::objects::tree_name_cmp(
                     &o.name,
                     is_tree_mode(o.mode),
                     &n.name,
@@ -5903,11 +5371,10 @@ fn trees_differ_tree_entries(
                     Ordering::Less => {
                         let name = String::from_utf8_lossy(&o.name);
                         let path = format_path_for_tree_diff(prefix, &name);
-                        if pathspec_entry_is_relevant(&path, is_tree_mode(o.mode), pathspecs) {
+                        if paths.entry_is_relevant(&path, is_tree_mode(o.mode), o.mode) {
                             if is_tree_mode(o.mode) {
-                                if tree_has_pathspec_match_cached(
-                                    repo, o.oid, &path, pathspecs, None,
-                                )? {
+                                if tree_has_pathspec_match_cached(repo, o.oid, &path, paths, None)?
+                                {
                                     return Ok(true);
                                 }
                             } else {
@@ -5919,11 +5386,10 @@ fn trees_differ_tree_entries(
                     Ordering::Greater => {
                         let name = String::from_utf8_lossy(&n.name);
                         let path = format_path_for_tree_diff(prefix, &name);
-                        if pathspec_entry_is_relevant(&path, is_tree_mode(n.mode), pathspecs) {
+                        if paths.entry_is_relevant(&path, is_tree_mode(n.mode), n.mode) {
                             if is_tree_mode(n.mode) {
-                                if tree_has_pathspec_match_cached(
-                                    repo, n.oid, &path, pathspecs, None,
-                                )? {
+                                if tree_has_pathspec_match_cached(repo, n.oid, &path, paths, None)?
+                                {
                                     return Ok(true);
                                 }
                             } else {
@@ -5937,8 +5403,8 @@ fn trees_differ_tree_entries(
                         let path = format_path_for_tree_diff(prefix, &name);
                         let o_is_tree = is_tree_mode(o.mode);
                         let n_is_tree = is_tree_mode(n.mode);
-                        let relevant =
-                            pathspec_entry_is_relevant(&path, o_is_tree || n_is_tree, pathspecs);
+                        let mode = if o_is_tree { o.mode } else { n.mode };
+                        let relevant = paths.entry_is_relevant(&path, o_is_tree || n_is_tree, mode);
                         if relevant {
                             if o.oid != n.oid
                                 || crate::index::canon_mode(o.mode)
@@ -5950,7 +5416,7 @@ fn trees_differ_tree_entries(
                                         Some(o.oid),
                                         Some(n.oid),
                                         &path,
-                                        pathspecs,
+                                        paths,
                                         None,
                                     )? {
                                         return Ok(true);
@@ -5961,14 +5427,15 @@ fn trees_differ_tree_entries(
                             } else if o_is_tree
                                 && n_is_tree
                                 && crate::pathspec::pathspec_wants_descent_for_rev_tree(
-                                    &path, pathspecs,
+                                    &path,
+                                    paths.specs(),
                                 )
                                 && trees_differ_for_pathspecs_optional(
                                     repo,
                                     Some(o.oid),
                                     Some(n.oid),
                                     &path,
-                                    pathspecs,
+                                    paths,
                                     None,
                                 )?
                             {
@@ -5983,9 +5450,9 @@ fn trees_differ_tree_entries(
             (Some(o), None) => {
                 let name = String::from_utf8_lossy(&o.name);
                 let path = format_path_for_tree_diff(prefix, &name);
-                if pathspec_entry_is_relevant(&path, is_tree_mode(o.mode), pathspecs) {
+                if paths.entry_is_relevant(&path, is_tree_mode(o.mode), o.mode) {
                     if is_tree_mode(o.mode) {
-                        if tree_has_pathspec_match_cached(repo, o.oid, &path, pathspecs, None)? {
+                        if tree_has_pathspec_match_cached(repo, o.oid, &path, paths, None)? {
                             return Ok(true);
                         }
                     } else {
@@ -5997,9 +5464,9 @@ fn trees_differ_tree_entries(
             (None, Some(n)) => {
                 let name = String::from_utf8_lossy(&n.name);
                 let path = format_path_for_tree_diff(prefix, &name);
-                if pathspec_entry_is_relevant(&path, is_tree_mode(n.mode), pathspecs) {
+                if paths.entry_is_relevant(&path, is_tree_mode(n.mode), n.mode) {
                     if is_tree_mode(n.mode) {
-                        if tree_has_pathspec_match_cached(repo, n.oid, &path, pathspecs, None)? {
+                        if tree_has_pathspec_match_cached(repo, n.oid, &path, paths, None)? {
                             return Ok(true);
                         }
                     } else {
@@ -6129,7 +5596,7 @@ fn trees_differ_for_pathspecs_with_bloom(
     commit_tree: ObjectId,
     parent_tree: ObjectId,
     prefix: &str,
-    pathspecs: &[String],
+    paths: &RevPathspecCheck<'_>,
     first_parent: bool,
     bloom: Option<&DenseBloomCtx<'_>>,
     commit_oid: ObjectId,
@@ -6142,7 +5609,7 @@ fn trees_differ_for_pathspecs_with_bloom(
                 bloom_ret = chain.bloom_precheck_for_paths(
                     repo.odb(),
                     commit_oid,
-                    pathspecs,
+                    paths.specs(),
                     ctx.cwd,
                     ctx.changed_paths_version,
                     ctx.read_changed_paths,
@@ -6163,7 +5630,7 @@ fn trees_differ_for_pathspecs_with_bloom(
         Some(commit_tree),
         Some(parent_tree),
         prefix,
-        pathspecs,
+        paths,
         cache,
     )?;
     if first_parent && bloom_ret == BloomPrecheck::Maybe && !differs {
@@ -6187,30 +5654,9 @@ fn rev_list_unexpected_kind(oid: ObjectId, expected: &'static str) -> Error {
 }
 
 fn load_commit(repo: &Repository, oid: ObjectId) -> Result<crate::objects::CommitData> {
-    let object = repo.odb().read(&oid)?;
-    if object.kind != ObjectKind::Commit {
-        return Err(rev_list_unexpected_kind(oid, "commit"));
-    }
     #[cfg(test)]
     repo.odb().hot_path_metrics().record_commit_parse();
-    parse_commit(&object.data)
-}
-
-/// Like [`load_commit`], inflating into the reusable `buf` instead of a fresh object.
-///
-/// For walks that keep the parsed commit and never read the object again, so it skips the
-/// ODB's per-session object copy.
-fn load_commit_into(
-    repo: &Repository,
-    oid: ObjectId,
-    buf: &mut Vec<u8>,
-) -> Result<crate::objects::CommitData> {
-    if repo.odb().read_into(&oid, buf)? != ObjectKind::Commit {
-        return Err(rev_list_unexpected_kind(oid, "commit"));
-    }
-    #[cfg(test)]
-    repo.odb().hot_path_metrics().record_commit_parse();
-    parse_commit(buf)
+    repo.read_commit_with_replace(&oid)
 }
 
 fn rev_list_result_from_commits(commits: Vec<ObjectId>) -> RevListResult {
@@ -6239,8 +5685,12 @@ fn rev_list_result_from_commits_with_linkage(
         reachable_non_commit_object_count: None,
         tip_annotated_tag_by_commit: HashMap::new(),
         log_graph_linkage,
-        commit_data: OidHashMap::default(),
+        commit_data: WalkedCommits::default(),
     }
+}
+
+pub(crate) fn empty_rev_list_result() -> RevListResult {
+    rev_list_result_from_commits(Vec::new())
 }
 
 fn rev_list_acceleration_compatible(options: &RevListOptions) -> bool {
@@ -6286,7 +5736,6 @@ fn rev_list_acceleration_compatible(options: &RevListOptions) -> bool {
         && !options.include_reflog_entries
         && !options.include_indexed_objects
         && !options.exclude_indexed_objects
-        && options.output_mode == OutputMode::OidOnly
         && !options.no_object_names
 }
 
@@ -6397,6 +5846,113 @@ fn try_filtered_count_only(
     })
 }
 
+/// Count every commit reachable from `include` when nothing filters, limits, orders or hides
+/// the walk, and neither a bitmap nor the commit-graph answered it.
+///
+/// Counting needs only each commit's parent list. A commit-graph that lists a commit supplies
+/// it without a read (the graph count declines as soon as one tip is newer than the graph);
+/// commits the single local pack stores whole inflate into one reused buffer with their zlib
+/// checksum verified, and anything else is read through the object database. Replacement refs rewrite commits behind the object ids this walk reads,
+/// so their presence defers to the full walk.
+fn try_unfiltered_count_only(
+    repo: &Repository,
+    include: &[ObjectId],
+    exclude: &[ObjectId],
+    options: &RevListOptions,
+) -> Result<Option<usize>> {
+    if !options.count
+        || options.objects
+        || options.filter.is_some()
+        || !exclude.is_empty()
+        || !rev_list_acceleration_compatible(options)
+        || has_replace_refs(repo)?
+    {
+        return Ok(None);
+    }
+    let shallow: OidHashSet = crate::shallow::load_shallow_boundaries(repo.git_dir())
+        .into_iter()
+        .collect();
+    let grafts = crate::rev_parse::load_graft_parents(repo.git_dir());
+    let hex_len = repo.odb().hash_algo().hex_len();
+    let graph_chain = if options.use_commit_graph {
+        repo.odb().commit_graph_chain()
+    } else {
+        None
+    };
+    repo.odb().with_pack_read_context(|| {
+        let objects_dir = repo.odb().objects_dir();
+        let mut pack = if repo.odb().uses_files_primary()
+            && crate::pack_store::PackStore::read_context_matches_objects_dir(objects_dir)
+        {
+            crate::pack::SingleLocalPackReader::open_allow_loose(objects_dir)?
+        } else {
+            None
+        };
+        let mut visited = oid_hash_set();
+        let mut stack = include.to_vec();
+        let mut buf = Vec::new();
+        while let Some(oid) = stack.pop() {
+            if !visited.insert(oid) {
+                continue;
+            }
+            let graph_parents = graph_chain
+                .as_ref()
+                .and_then(|chain| chain.graph_commit(&oid))
+                .map(|(parents, _)| parents);
+            let parents = match graph_parents {
+                Some(parents) => parents,
+                None => match pack
+                    .as_mut()
+                    .map(|reader| reader.read_commit_parents(&oid, hex_len))
+                    .transpose()?
+                    .flatten()
+                {
+                    Some(parents) => parents,
+                    None => whole_commit_parents(repo, oid, hex_len, &mut buf)?,
+                },
+            };
+            if let Some(grafted) = grafts.get(&oid) {
+                stack.extend(grafted.iter().filter(|p| !visited.contains(*p)));
+            } else if !shallow.contains(&oid) {
+                stack.extend(parents.into_iter().filter(|p| !visited.contains(p)));
+            }
+        }
+        Ok(Some(visited.len()))
+    })
+}
+
+/// Parents of commit `oid`, read whole from the object database through `buf`.
+fn whole_commit_parents(
+    repo: &Repository,
+    oid: ObjectId,
+    hex_len: usize,
+    buf: &mut Vec<u8>,
+) -> Result<Vec<ObjectId>> {
+    if repo.odb().read_into_caching_delta_bases(&oid, buf)? != ObjectKind::Commit {
+        return Err(rev_list_unexpected_kind(oid, "commit"));
+    }
+    crate::objects::parse_commit_tree_and_parents_lenient(buf, hex_len)
+        .map(|(_, parents)| parents)
+        .ok_or_else(|| {
+            Error::Object(ObjectError::Corrupt {
+                detail: format!("commit {oid} has no valid tree header"),
+            })
+        })
+}
+
+/// Whether any replacement ref applies to object reads in `repo`.
+fn has_replace_refs(repo: &Repository) -> Result<bool> {
+    let Some(prefix) = repo.replace_ref_base_if_enabled() else {
+        return Ok(false);
+    };
+    let mut found = false;
+    repo.ref_store().for_each_ref(&prefix, &mut |_| {
+        found = true;
+        std::ops::ControlFlow::Break(())
+    })?;
+    Ok(found)
+}
+
 fn try_commit_graph_count_only(
     repo: &Repository,
     include: &[ObjectId],
@@ -6464,7 +6020,9 @@ fn try_rev_list_accelerated(
             return try_commit_graph_count_only(repo, include, exclude, options);
         }
         Err(e) => {
-            return Err(Error::CorruptObject(format!("pack bitmap: {e}")));
+            return Err(Error::Object(ObjectError::Corrupt {
+                detail: format!("pack bitmap: {e}"),
+            }));
         }
     };
     let (peeled_wants, filter_want_tips) = peeled_wants_from_rev_list_inputs(include, object_roots);
@@ -6477,13 +6035,15 @@ fn try_rev_list_accelerated(
         &filter_want_tips,
     ) {
         Ok(set) => set,
-        Err(BitmapWalkError::Unsupported(_)) => {
+        Err(Error::Object(ObjectError::BitmapWalk(BitmapWalkError::Unsupported(_)))) => {
             return try_commit_graph_count_only(repo, include, exclude, options);
         }
-        Err(BitmapWalkError::Bitmap(e)) => {
-            return Err(Error::CorruptObject(format!("pack bitmap: {e}")));
+        Err(Error::Object(ObjectError::BitmapWalk(BitmapWalkError::Bitmap(e)))) => {
+            return Err(Error::Object(ObjectError::Corrupt {
+                detail: format!("pack bitmap: {e}"),
+            }));
         }
-        Err(BitmapWalkError::Repository(e)) => return Err(e),
+        Err(e) => return Err(e),
     };
 
     let skip_trees = skip_tree_descent_for_object_type_filter(options.filter.as_ref());
@@ -6499,9 +6059,11 @@ fn try_rev_list_accelerated(
     )?;
 
     let (commit_count, non_commit_count) = if excluded_object_ids.is_empty() {
-        let commit_count = reachable
-            .count_by_kind(ObjectKind::Commit)
-            .map_err(|e| Error::CorruptObject(format!("pack bitmap: {e}")))?;
+        let commit_count = reachable.count_by_kind(ObjectKind::Commit).map_err(|e| {
+            Error::Object(ObjectError::Corrupt {
+                detail: format!("pack bitmap: {e}"),
+            })
+        })?;
         let total = reachable.count();
         (commit_count, total.saturating_sub(commit_count))
     } else {
@@ -6560,7 +6122,7 @@ fn try_rev_list_accelerated(
             .then_some(non_commit_count),
         tip_annotated_tag_by_commit: HashMap::new(),
         log_graph_linkage: None,
-        commit_data: OidHashMap::default(),
+        commit_data: WalkedCommits::default(),
     }))
 }
 
@@ -6595,7 +6157,11 @@ where
     {
         Ok(Some(index)) => index,
         Ok(None) => return Ok(false),
-        Err(e) => return Err(Error::CorruptObject(format!("pack bitmap: {e}"))),
+        Err(e) => {
+            return Err(Error::Object(ObjectError::Corrupt {
+                detail: format!("pack bitmap: {e}"),
+            }))
+        }
     };
     let (peeled_wants, filter_want_tips) = peeled_wants_from_rev_list_inputs(include, &[]);
     let reachable = match index.reachability_with_peeled_wants(
@@ -6607,11 +6173,15 @@ where
         &filter_want_tips,
     ) {
         Ok(set) => set,
-        Err(BitmapWalkError::Unsupported(_)) => return Ok(false),
-        Err(BitmapWalkError::Bitmap(e)) => {
-            return Err(Error::CorruptObject(format!("pack bitmap: {e}")));
+        Err(Error::Object(ObjectError::BitmapWalk(BitmapWalkError::Unsupported(_)))) => {
+            return Ok(false)
         }
-        Err(BitmapWalkError::Repository(e)) => return Err(e),
+        Err(Error::Object(ObjectError::BitmapWalk(BitmapWalkError::Bitmap(e)))) => {
+            return Err(Error::Object(ObjectError::Corrupt {
+                detail: format!("pack bitmap: {e}"),
+            }));
+        }
+        Err(e) => return Err(e),
     };
 
     let skip_trees = skip_tree_descent_for_object_type_filter(options.filter.as_ref());
@@ -6653,7 +6223,7 @@ where
     let mut include = resolve_specs_with_options(repo, positive_specs, options.ignore_missing)?;
     let exclude = resolve_specs_with_options(repo, negative_specs, options.ignore_missing)?;
     if options.all_refs {
-        include.extend(all_ref_tips(repo, &RefExclusions::default())?);
+        include.extend(all_ref_tips(repo)?);
     }
     if include.is_empty() {
         return Ok(true);
@@ -6680,7 +6250,7 @@ pub(crate) fn try_bitmap_reachable_commit_set_for_specs(
     let mut include = resolve_specs_with_options(repo, positive_specs, options.ignore_missing)?;
     let exclude = resolve_specs_with_options(repo, negative_specs, options.ignore_missing)?;
     if options.all_refs {
-        include.extend(all_ref_tips(repo, &RefExclusions::default())?);
+        include.extend(all_ref_tips(repo)?);
     }
     if include.is_empty() {
         return Ok(None);
@@ -6689,7 +6259,11 @@ pub(crate) fn try_bitmap_reachable_commit_set_for_specs(
     let index = match BitmapIndex::open(repo) {
         Ok(Some(index)) => index,
         Ok(None) => return Ok(None),
-        Err(e) => return Err(Error::CorruptObject(format!("pack bitmap: {e}"))),
+        Err(e) => {
+            return Err(Error::Object(ObjectError::Corrupt {
+                detail: format!("pack bitmap: {e}"),
+            }))
+        }
     };
     if index.backing_pack_index().is_none() {
         return Ok(None);
@@ -6720,11 +6294,15 @@ pub(crate) fn try_bitmap_reachable_commit_set_for_specs(
         &filter_want_tips,
     ) {
         Ok(set) => set,
-        Err(BitmapWalkError::Unsupported(_)) => return Ok(None),
-        Err(BitmapWalkError::Bitmap(e)) => {
-            return Err(Error::CorruptObject(format!("pack bitmap: {e}")));
+        Err(Error::Object(ObjectError::BitmapWalk(BitmapWalkError::Unsupported(_)))) => {
+            return Ok(None)
         }
-        Err(BitmapWalkError::Repository(e)) => return Err(e),
+        Err(Error::Object(ObjectError::BitmapWalk(BitmapWalkError::Bitmap(e)))) => {
+            return Err(Error::Object(ObjectError::Corrupt {
+                detail: format!("pack bitmap: {e}"),
+            }));
+        }
+        Err(e) => return Err(e),
     };
     Ok(Some((index, reachable)))
 }
@@ -6755,6 +6333,15 @@ fn can_stream_default_order(exclude: &[ObjectId], options: &RevListOptions) -> b
         && options.until_cutoff.is_none()
 }
 
+/// Default-order walk with a `--since` frontier and no `-n`: same heap stop as
+/// [`streaming_date_walk`], with `--until` applied only when emitting.
+fn can_stream_since_cutoff_order(exclude: &[ObjectId], options: &RevListOptions) -> bool {
+    exclude.is_empty()
+        && options.ordering == OrderingMode::Default
+        && options.since_cutoff.is_some()
+        && plain_commit_walk(options, false)
+}
+
 /// Whether a [`streaming_date_walk`] visitor wants more commits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WalkControl {
@@ -6778,10 +6365,66 @@ fn date_heap_past_since_frontier(heap: &BinaryHeap<CommitDateKey>, since: i64) -
 /// When `since_cutoff` is set and the heap uses committer dates (`author_dates` is false),
 /// the walk stops once every queued commit is older than the cutoff, matching Git's
 /// `--since` frontier after parents of the last in-window commit are enqueued.
+///
+/// Bytes to retain for `grit log` / `--format` reuse: one contiguous copy per listed commit.
+fn retain_commit_payload_for_list(
+    repo: &Repository,
+    graph: &mut CommitGraph<'_>,
+    oid: ObjectId,
+    retain_extent: CommitExtent,
+) -> Result<Vec<u8>> {
+    match retain_extent {
+        CommitExtent::Whole => read_commit_bytes(repo, oid),
+        CommitExtent::ThroughSubject => {
+            if let Some(bytes) = graph.drain_unreleased_commit_bytes(oid) {
+                if commit_through_subject_len(&bytes).is_some() {
+                    return Ok(bytes);
+                }
+                let effective = repo.object_id_after_replace(&oid);
+                let mut b = repo.odb().read_commit_through_subject(&effective)?;
+                if commit_through_subject_len(&b).is_none() {
+                    b = read_commit_bytes(repo, oid)?;
+                }
+                return Ok(b);
+            }
+            let bytes = graph.commit_bytes(oid)?;
+            if commit_through_subject_len(bytes).is_some() {
+                Ok(bytes.to_vec())
+            } else {
+                let effective = repo.object_id_after_replace(&oid);
+                let mut b = repo.odb().read_commit_through_subject(&effective)?;
+                if commit_through_subject_len(&b).is_none() {
+                    b = read_commit_bytes(repo, oid)?;
+                }
+                Ok(b)
+            }
+        }
+    }
+}
+
+/// Payload bytes for [`RevListResult::commit_data`] when no [`CommitGraph`] is available.
+fn retain_commit_payload_standalone(
+    repo: &Repository,
+    oid: ObjectId,
+    retain_extent: CommitExtent,
+) -> Result<Vec<u8>> {
+    match retain_extent {
+        CommitExtent::Whole => read_commit_bytes(repo, oid),
+        CommitExtent::ThroughSubject => {
+            let effective = repo.object_id_after_replace(&oid);
+            let mut b = repo.odb().read_commit_through_subject(&effective)?;
+            if commit_through_subject_len(&b).is_none() {
+                b = read_commit_bytes(repo, oid)?;
+            }
+            Ok(b)
+        }
+    }
+}
+
 fn streaming_date_walk<'r>(
     graph: &mut CommitGraph<'r>,
     include: &[ObjectId],
-    excluded: &HashSet<ObjectId>,
+    excluded: &RangeWalkHide,
     author_dates: bool,
     since_cutoff: Option<i64>,
     mut visit: impl FnMut(&mut CommitGraph<'r>, ObjectId) -> Result<WalkControl>,
@@ -6790,7 +6433,7 @@ fn streaming_date_walk<'r>(
     let mut queued = oid_hash_set();
     let mut next_seq = 0u64;
     for &tip in include {
-        if excluded.contains(&tip) || !queued.insert(tip) {
+        if excluded.is_hidden(tip) || !queued.insert(tip) {
             continue;
         }
         heap.push(CommitDateKey {
@@ -6804,8 +6447,15 @@ fn streaming_date_walk<'r>(
         if visit(graph, oid)? == WalkControl::Stop {
             break;
         }
+        if !author_dates {
+            if let Some(since) = since_cutoff {
+                if date < since && date_heap_past_since_frontier(&heap, since) {
+                    break;
+                }
+            }
+        }
         for parent in graph.parents_of(oid)? {
-            if excluded.contains(&parent) || !queued.insert(parent) {
+            if excluded.is_hidden(parent) || !queued.insert(parent) {
                 continue;
             }
             heap.push(CommitDateKey {
@@ -6815,20 +6465,13 @@ fn streaming_date_walk<'r>(
             });
             next_seq += 1;
         }
-        if !author_dates {
-            if let Some(since) = since_cutoff {
-                if date < since && date_heap_past_since_frontier(&heap, since) {
-                    break;
-                }
-            }
-        }
     }
     Ok(())
 }
 
 /// Parameters for [`open_commit_stream`].
 #[derive(Debug, Clone, Default)]
-pub struct CommitStreamParams {
+pub(crate) struct CommitStreamParams {
     /// Skip this many matching commits before yielding.
     pub skip: usize,
     /// Maximum commits to yield (`None` = unbounded).
@@ -6839,19 +6482,46 @@ pub struct CommitStreamParams {
     pub until: Option<i64>,
     /// Follow only the first parent at merges when walking history.
     pub first_parent: bool,
+    /// Keep raw commit object bytes for each yielded commit when the walk already read them.
+    pub retain_commit_bytes: bool,
+    /// How much of each commit [`Self::retain_commit_bytes`] keeps.
+    pub retained_commit_extent: CommitExtent,
+}
+
+/// How much of each commit object a walk reads and hands back to its caller.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CommitExtent {
+    /// The whole commit object payload.
+    #[default]
+    Whole,
+    /// Every header and the message through its first non-blank line, as
+    /// [`Odb::read_commit_through_subject`](crate::odb::Odb::read_commit_through_subject)
+    /// returns: enough for one-line listings (author, dates, change id, subject), and much
+    /// cheaper to read than a commit with a long message body.
+    ThroughSubject,
+}
+
+/// One commit from [`CommitStream`]: its id and optional bytes read during the walk.
+#[derive(Debug, Clone)]
+pub(crate) struct CommitStreamItem {
+    /// Listed commit id.
+    pub oid: ObjectId,
+    /// Raw commit object bytes when [`CommitStreamParams::retain_commit_bytes`] was set.
+    pub commit_bytes: Option<Vec<u8>>,
 }
 
 /// Lazy commit-only walk in default date order (no object/cherry side tables).
-pub struct CommitStream<'repo> {
+pub(crate) struct CommitStream<'repo> {
     graph: CommitGraph<'repo>,
     heap: BinaryHeap<CommitDateKey>,
-    excluded: HashSet<ObjectId>,
+    excluded: RangeWalkHide,
     queued: OidHashSet,
     next_seq: u64,
     skip: usize,
     limit: Option<usize>,
     since: Option<i64>,
     until: Option<i64>,
+    retain_commit_bytes: bool,
     seen: usize,
     emitted: usize,
     errored: Option<Error>,
@@ -6860,7 +6530,7 @@ pub struct CommitStream<'repo> {
 
 impl<'repo> CommitStream<'repo> {
     fn push_tip(&mut self, tip: ObjectId) {
-        if self.excluded.contains(&tip) || !self.queued.insert(tip) {
+        if self.excluded.is_hidden(tip) || !self.queued.insert(tip) {
             return;
         }
         let date = self.graph.sort_key(tip, false);
@@ -6887,7 +6557,7 @@ impl<'repo> CommitStream<'repo> {
 }
 
 impl Iterator for CommitStream<'_> {
-    type Item = Result<ObjectId>;
+    type Item = Result<CommitStreamItem>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(err) = self.errored.take() {
@@ -6913,15 +6583,30 @@ impl Iterator for CommitStream<'_> {
             }
             self.seen += 1;
             if self.seen <= self.skip {
+                self.graph.release_commit_bytes(oid);
                 self.enqueue_parents(oid);
                 continue;
             }
             if self.limit.is_some_and(|limit| self.emitted >= limit) {
+                self.graph.release_commit_bytes(oid);
                 return None;
             }
             self.emitted += 1;
+            let commit_bytes = if self.retain_commit_bytes {
+                if let Err(err) = self.graph.ensure_unreleased_commit_bytes(oid) {
+                    self.errored = Some(err);
+                    return None;
+                }
+                self.graph
+                    .unreleased_bytes
+                    .as_mut()
+                    .and_then(|m| m.remove(&oid))
+            } else {
+                None
+            };
+            self.graph.release_commit_bytes(oid);
             self.enqueue_parents(oid);
-            return Some(Ok(oid));
+            return Some(Ok(CommitStreamItem { oid, commit_bytes }));
         }
     }
 }
@@ -6931,19 +6616,37 @@ impl Iterator for CommitStream<'_> {
 /// # Errors
 ///
 /// Propagates rev-list setup errors (for example invalid tips).
-pub fn open_commit_stream<'repo>(
+pub(crate) fn open_commit_stream<'repo>(
     repo: &'repo Repository,
     include: &[ObjectId],
     exclude: &[ObjectId],
     params: &CommitStreamParams,
 ) -> Result<CommitStream<'repo>> {
+    if include.is_empty() {
+        return Ok(CommitStream {
+            graph: CommitGraph::with_commit_graph(repo, params.first_parent, true),
+            heap: BinaryHeap::new(),
+            excluded: RangeWalkHide::empty(),
+            queued: oid_hash_set(),
+            next_seq: 0,
+            skip: params.skip,
+            limit: params.limit,
+            since: params.since,
+            until: params.until,
+            retain_commit_bytes: params.retain_commit_bytes,
+            seen: 0,
+            emitted: 0,
+            errored: None,
+            _pack: repo.odb().pack_read_context_guard(),
+        });
+    }
     let pack = repo.odb().pack_read_context_guard();
     let mut graph = CommitGraph::with_commit_graph(repo, params.first_parent, true);
-    let excluded = if exclude.is_empty() {
-        HashSet::new()
-    } else {
-        walk_closure(&mut graph, exclude)?
-    };
+    if params.retain_commit_bytes {
+        graph.keep_unreleased_commit_bytes(params.retained_commit_extent);
+    }
+    let excluded =
+        RangeWalkHide::for_range_walk(repo, include, exclude, true, params.first_parent)?;
     let mut stream = CommitStream {
         graph,
         heap: BinaryHeap::new(),
@@ -6954,6 +6657,7 @@ pub fn open_commit_stream<'repo>(
         limit: params.limit,
         since: params.since,
         until: params.until,
+        retain_commit_bytes: params.retain_commit_bytes,
         seen: 0,
         emitted: 0,
         errored: None,
@@ -6971,20 +6675,14 @@ fn can_use_bounded_commit_filter_list(options: &RevListOptions) -> bool {
         .as_ref()
         .is_some_and(|f| f.is_active())
         || options.pickaxe.is_some();
+    let stripped = RevListOptions {
+        commit_filter: None,
+        pickaxe: None,
+        ..options.clone()
+    };
     output_filter
-        && (options.max_count.is_some()
-            || options.skip > 0
-            || options.count
-            || options.since_cutoff.is_some())
         && options.ordering == OrderingMode::Default
-        && plain_commit_walk(
-            &RevListOptions {
-                commit_filter: None,
-                pickaxe: None,
-                ..options.clone()
-            },
-            false,
-        )
+        && plain_commit_walk(&stripped, false)
 }
 
 fn try_bounded_commit_filter_limit_list(
@@ -6993,6 +6691,7 @@ fn try_bounded_commit_filter_limit_list(
     exclude: &[ObjectId],
     options: &RevListOptions,
     repo_config: &ConfigSet,
+    context: RevListWalkContext,
 ) -> Result<Option<RevListResult>> {
     let filter = options.commit_filter.as_ref().filter(|f| f.is_active());
     let pickaxe = options.pickaxe.as_ref();
@@ -7001,13 +6700,6 @@ fn try_bounded_commit_filter_limit_list(
         return Ok(None);
     }
     if include.is_empty() || !can_use_bounded_commit_filter_list(options) {
-        return Ok(None);
-    }
-    if !options.count
-        && options.max_count.is_none()
-        && options.skip == 0
-        && options.since_cutoff.is_none()
-    {
         return Ok(None);
     }
     let max_count = options.max_count;
@@ -7021,9 +6713,9 @@ fn try_bounded_commit_filter_limit_list(
     }
 
     let mut commit_data = if options.retain_commit_data {
-        crate::objects::oid_hash_map_with_capacity(max_count.unwrap_or(64).min(64))
+        WalkedCommits::with_capacity(max_count.unwrap_or(64).min(64))
     } else {
-        oid_hash_map()
+        WalkedCommits::default()
     };
     let (mut ordered, filtered_count) =
         repo.odb()
@@ -7033,14 +6725,23 @@ fn try_bounded_commit_filter_limit_list(
                     options.first_parent,
                     options.use_commit_graph,
                 );
-                let excluded = if exclude.is_empty() {
-                    HashSet::new()
-                } else {
-                    walk_closure(&mut graph, exclude)?
-                };
+                let excluded = RangeWalkHide::for_range_walk(
+                    repo,
+                    include,
+                    exclude,
+                    options.use_commit_graph,
+                    options.first_parent,
+                )?;
                 // Reuse traversal bytes for filters and output, without keeping every
                 // nonmatching commit when a selective filter scans a long history.
-                graph.keep_unreleased_commit_bytes();
+                let walk_extent = context.retained_commit_extent;
+                let traverse_extent =
+                    if pickaxe.is_some() || filter.is_some_and(|f| f.needs_full_commit_bytes()) {
+                        CommitExtent::Whole
+                    } else {
+                        walk_extent
+                    };
+                graph.keep_unreleased_commit_bytes(traverse_extent);
 
                 let author_dates = options.ordering == OrderingMode::AuthorDateWalk;
                 let mut matched_seen = 0usize;
@@ -7091,10 +6792,13 @@ fn try_bounded_commit_filter_limit_list(
                                     } else if max_count.is_none_or(|m| ordered.len() < m) {
                                         ordered.push(oid);
                                         if options.retain_commit_data {
-                                            commit_data.insert(
+                                            let payload = retain_commit_payload_for_list(
+                                                repo,
+                                                graph,
                                                 oid,
-                                                parse_commit(graph.commit_bytes(oid)?)?,
-                                            );
+                                                walk_extent,
+                                            )?;
+                                            commit_data.insert(oid, &payload);
                                         }
                                     }
                                 }
@@ -7154,6 +6858,7 @@ fn can_use_bounded_parent_filter_limit_list(options: &RevListOptions) -> bool {
     }
     let stripped = rev_list_options_without_parent_selectors(options);
     options.ordering == OrderingMode::Default
+        && stripped.since_cutoff.is_none()
         && bounded_limit_list_common_inner(&stripped, false)
         && plain_commit_walk(&stripped, false)
 }
@@ -7163,6 +6868,7 @@ fn try_bounded_parent_filter_limit_list(
     include: &[ObjectId],
     exclude: &[ObjectId],
     options: &RevListOptions,
+    context: RevListWalkContext,
 ) -> Result<Option<RevListResult>> {
     if include.is_empty() || !can_use_bounded_parent_filter_limit_list(options) {
         return Ok(None);
@@ -7179,21 +6885,19 @@ fn try_bounded_parent_filter_limit_list(
     let max_p = options.max_parents.unwrap_or(usize::MAX);
 
     let mut ordered = Vec::with_capacity(max_count.unwrap_or(64).min(64));
-    let mut commit_data = oid_hash_map();
+    let mut commit_data = WalkedCommits::default();
     repo.odb().with_pack_read_context(|| -> Result<()> {
         let mut graph =
             CommitGraph::with_commit_graph(repo, options.first_parent, options.use_commit_graph);
-        let excluded = if exclude.is_empty() {
-            HashSet::new()
-        } else {
-            walk_closure(&mut graph, exclude)?
-        };
-        if options.retain_commit_data {
-            graph.retain_parsed_commits(expected_parsed_commits(
-                options.skip.saturating_add(max_count.unwrap_or(64)),
-            ));
-        }
-
+        let excluded = RangeWalkHide::for_range_walk(
+            repo,
+            include,
+            exclude,
+            options.use_commit_graph,
+            options.first_parent,
+        )?;
+        let walk_extent = context.retained_commit_extent;
+        graph.keep_unreleased_commit_bytes(walk_extent);
         let mut matched_seen = 0usize;
         streaming_date_walk(&mut graph, include, &excluded, false, None, |graph, oid| {
             let parent_count = graph.parent_count_for_filter(oid)?;
@@ -7201,15 +6905,20 @@ fn try_bounded_parent_filter_limit_list(
                 matched_seen += 1;
                 if matched_seen > options.skip && max_count.is_none_or(|m| ordered.len() < m) {
                     ordered.push(oid);
+                    if options.retain_commit_data {
+                        let payload =
+                            retain_commit_payload_for_list(repo, graph, oid, walk_extent)?;
+                        commit_data.insert(oid, &payload);
+                    }
                 }
             }
+            graph.release_commit_bytes(oid);
             Ok(if max_count.is_some_and(|m| ordered.len() >= m) {
                 WalkControl::Stop
             } else {
                 WalkControl::Continue
             })
         })?;
-        commit_data = graph.take_retained_commits(&ordered);
         Ok(())
     })?;
 
@@ -7244,7 +6953,14 @@ fn bounded_limit_list_common(options: &RevListOptions) -> bool {
 }
 
 fn bounded_limit_list_common_inner(options: &RevListOptions, graph_topo: bool) -> bool {
-    (options.max_count.is_some() || options.skip > 0) && plain_commit_walk(options, graph_topo)
+    let has_cutoff =
+        options.max_count.is_some() || options.skip > 0 || options.since_cutoff.is_some();
+    let plain_unlimited_default = !options.count
+        && options.max_count.is_none()
+        && options.skip == 0
+        && options.since_cutoff.is_none()
+        && options.ordering == OrderingMode::Default;
+    (has_cutoff || plain_unlimited_default) && plain_commit_walk(options, graph_topo)
 }
 
 /// Whether the walk only needs commits in date order, with nothing that forces the full
@@ -7256,12 +6972,12 @@ fn bounded_limit_list_common_inner(options: &RevListOptions, graph_topo: bool) -
 /// it walks like any other range. The topo walk cannot take one: Git lists the right side
 /// first there, which only the full sort reproduces.
 fn plain_commit_walk(options: &RevListOptions, graph_topo: bool) -> bool {
-    options
-        .commit_filter
-        .as_ref()
-        .is_none_or(|f| !f.is_active())
+    options.filter.is_none()
+        && options
+            .commit_filter
+            .as_ref()
+            .is_none_or(|f| !f.is_active())
         && options.pickaxe.is_none()
-        && !options.all_refs
         && !options.first_parent
         && !options.objects
         && options.paths.is_empty()
@@ -7308,17 +7024,19 @@ fn try_bounded_topo_limit_list(
 
     let mut graph =
         CommitGraph::with_commit_graph(repo, options.first_parent, options.use_commit_graph);
-    let excluded = if exclude.is_empty() {
-        HashSet::new()
-    } else {
-        walk_closure(&mut graph, exclude)?
-    };
+    let excluded = RangeWalkHide::for_range_walk(
+        repo,
+        include,
+        exclude,
+        options.use_commit_graph,
+        options.first_parent,
+    )?;
 
     let mut discover_heap = BinaryHeap::new();
     let mut queued: HashSet<ObjectId> = HashSet::new();
     let mut next_seq = 0u64;
     for &tip in include {
-        if excluded.contains(&tip) || !queued.insert(tip) {
+        if excluded.is_hidden(tip) || !queued.insert(tip) {
             continue;
         }
         discover_heap.push(CommitDateKey {
@@ -7352,7 +7070,7 @@ fn try_bounded_topo_limit_list(
             }
             let parents = graph.parents_of(oid)?;
             for parent in parents {
-                if excluded.contains(&parent) {
+                if excluded.is_hidden(parent) {
                     continue;
                 }
                 let count = unemitted_children.entry(parent).or_insert(0);
@@ -7369,14 +7087,14 @@ fn try_bounded_topo_limit_list(
             break;
         };
         let oid = item.oid;
-        if excluded.contains(&oid) || !selected.insert(oid) {
+        if excluded.is_hidden(oid) || !selected.insert(oid) {
             continue;
         }
         discovery_order.push(oid);
         unemitted_children.entry(oid).or_insert(0);
         let parents = graph.parents_of(oid)?;
         for parent in parents {
-            if excluded.contains(&parent) {
+            if excluded.is_hidden(parent) {
                 continue;
             }
             *unemitted_children.entry(parent).or_insert(0) += 1;
@@ -7413,22 +7131,15 @@ fn try_bounded_topo_limit_list(
     Ok(Some((out, linkage)))
 }
 
-/// One commit from a single positive tip with `-n 1` (matches `git rev-list -n 1 <tip>`).
-pub(crate) fn single_tip_bounded_page(
-    repo: &Repository,
-    tip: ObjectId,
-    retain_commit_data: bool,
-) -> Result<RevListResult> {
-    single_tip_bounded_page_with_parent_probe(repo, tip, 1, retain_commit_data)
-}
-
-/// Like [`single_tip_bounded_page`], optionally including the first parent when `max_fetch >= 2`
-/// so callers can detect truncation without a full date-order walk.
+/// One commit from a single positive tip with `-n 1` (matches `git rev-list -n 1 <tip>`), with an
+/// optional extra parent when `max_fetch >= 2` so callers can detect truncation without a full
+/// date-order walk.
 pub(crate) fn single_tip_bounded_page_with_parent_probe(
     repo: &Repository,
     tip: ObjectId,
     max_fetch: usize,
     retain_commit_data: bool,
+    context: RevListWalkContext,
 ) -> Result<RevListResult> {
     let mut commits = vec![tip];
     if max_fetch >= 2 {
@@ -7442,8 +7153,8 @@ pub(crate) fn single_tip_bounded_page_with_parent_probe(
     commits.truncate(max_fetch);
     let mut result = rev_list_result_from_commits(commits);
     if retain_commit_data {
-        let commit = load_commit(repo, tip)?;
-        result.commit_data.insert(tip, commit);
+        let payload = retain_commit_payload_standalone(repo, tip, context.retained_commit_extent)?;
+        result.commit_data.insert(tip, &payload);
     }
     Ok(result)
 }
@@ -7453,6 +7164,7 @@ fn try_bounded_limit_list(
     include: &[ObjectId],
     exclude: &[ObjectId],
     options: &RevListOptions,
+    context: RevListWalkContext,
 ) -> Result<Option<RevListResult>> {
     // Excluded tips bound the walk on their own: painting the hide side stops at the merge-base
     // frontier, so even an unlimited `A..B` only visits the range instead of both closures.
@@ -7468,14 +7180,19 @@ fn try_bounded_limit_list(
         && options.max_count == Some(1)
         && can_stream_default_order(exclude, options)
     {
-        return Ok(Some(single_tip_bounded_page(
+        return Ok(Some(single_tip_bounded_page_with_parent_probe(
             repo,
             include[0],
+            1,
             options.retain_commit_data,
+            context,
         )?));
     }
     if can_stream_default_order(exclude, options) {
-        return streaming_default_order_list(repo, include, options).map(Some);
+        return streaming_default_order_list(repo, include, options, context).map(Some);
+    }
+    if can_stream_since_cutoff_order(exclude, options) {
+        return streaming_since_cutoff_bounded_list(repo, include, options, context).map(Some);
     }
     let need = options
         .skip
@@ -7489,9 +7206,15 @@ fn try_bounded_limit_list(
         && options.ordering == OrderingMode::Default
         && (options.since_cutoff.is_some() || options.until_cutoff.is_some())
     {
-        match crate::merge_base::try_linear_chain_commits_with_cutoffs(
-            repo, include[0], need, cutoffs,
-        )? {
+        // `--since` needs Git's date-priority heap and frontier stop; the linear-chain fast
+        // path walks first-parent order and would keep scanning after an old commit even when
+        // every queued commit is still older than the cutoff (clock-skewed histories).
+        let linear = if options.since_cutoff.is_none() {
+            crate::merge_base::try_linear_chain_commits(repo, include[0], need, cutoffs)?
+        } else {
+            None
+        };
+        match linear {
             Some(list) => list,
             None => commits_reachable_excluding_ancestors_of_with_graph(
                 repo,
@@ -7521,18 +7244,14 @@ fn try_bounded_limit_list(
     if options.reverse {
         ordered.reverse();
     }
-    Ok(Some(rev_list_result_from_commits(ordered)))
-}
-
-/// How many commits a date walk listing `listed` commits is likely to parse.
-///
-/// Besides the listed commits, the walk parses the queued frontier (parents of merges not yet
-/// emitted), about a quarter more on merge-heavy histories. Overshooting costs memory, since the
-/// tables round up to the next power of two; a larger frontier just grows the maps once. The cap
-/// keeps an unbounded `--max-count` from reserving a huge table up front.
-fn expected_parsed_commits(listed: usize) -> usize {
-    const CAP: usize = 1 << 16;
-    listed.saturating_add(listed / 4).min(CAP)
+    let result = if options.count {
+        let mut result = rev_list_result_from_commits(Vec::new());
+        result.reachable_commit_count = Some(ordered.len());
+        result
+    } else {
+        rev_list_result_from_commits(ordered)
+    };
+    Ok(Some(result))
 }
 
 /// `--max-count` / `--skip` list in Git's default order, stopping as soon as the page is full.
@@ -7540,30 +7259,36 @@ fn streaming_default_order_list(
     repo: &Repository,
     include: &[ObjectId],
     options: &RevListOptions,
+    context: RevListWalkContext,
 ) -> Result<RevListResult> {
     let max_count = options.max_count.unwrap_or(usize::MAX);
     let mut ordered = Vec::with_capacity(max_count.min(4096));
-    let mut commit_data = OidHashMap::default();
+    let mut commit_data = WalkedCommits::default();
     if max_count > 0 {
         repo.odb().with_pack_read_context(|| -> Result<()> {
             let mut graph = CommitGraph::with_commit_graph(repo, false, options.use_commit_graph);
+            let retain_extent = context.retained_commit_extent;
             if options.retain_commit_data {
-                graph.retain_parsed_commits(expected_parsed_commits(
-                    options.skip.saturating_add(max_count),
-                ));
+                graph.keep_unreleased_commit_bytes(retain_extent);
             }
             let mut seen = 0usize;
             streaming_date_walk(
                 &mut graph,
                 include,
-                &HashSet::new(),
+                &RangeWalkHide::empty(),
                 false,
                 None,
-                |_, oid| {
+                |g, oid| {
                     seen += 1;
                     if seen > options.skip {
                         ordered.push(oid);
+                        if options.retain_commit_data {
+                            let payload =
+                                retain_commit_payload_for_list(repo, g, oid, retain_extent)?;
+                            commit_data.insert(oid, &payload);
+                        }
                     }
+                    g.release_commit_bytes(oid);
                     Ok(if ordered.len() >= max_count {
                         WalkControl::Stop
                     } else {
@@ -7571,7 +7296,6 @@ fn streaming_default_order_list(
                     })
                 },
             )?;
-            commit_data = graph.take_retained_commits(&ordered);
             Ok(())
         })?;
     }
@@ -7583,17 +7307,102 @@ fn streaming_default_order_list(
     Ok(result)
 }
 
+/// List or count commits in default date order with a `--since` frontier stop.
+fn streaming_since_cutoff_bounded_list(
+    repo: &Repository,
+    include: &[ObjectId],
+    options: &RevListOptions,
+    context: RevListWalkContext,
+) -> Result<RevListResult> {
+    let max_count = options.max_count;
+    let mut ordered = Vec::with_capacity(max_count.unwrap_or(64).min(4096));
+    let (match_count, commit_data) =
+        repo.odb()
+            .with_pack_read_context(|| -> Result<(usize, WalkedCommits)> {
+                let mut graph =
+                    CommitGraph::with_commit_graph(repo, false, options.use_commit_graph);
+                let retain_extent = context.retained_commit_extent;
+                if options.retain_commit_data && !options.count {
+                    graph.keep_unreleased_commit_bytes(retain_extent);
+                }
+                let mut commit_data = WalkedCommits::default();
+                let since = options.since_cutoff;
+                let until = options.until_cutoff;
+                let mut matched_seen = 0usize;
+                let mut match_count = 0usize;
+                streaming_date_walk(
+                    &mut graph,
+                    include,
+                    &RangeWalkHide::empty(),
+                    false,
+                    since,
+                    |g, oid| {
+                        let ts = g.committer_time(oid);
+                        let in_window =
+                            !until.is_some_and(|u| ts > u) && !since.is_some_and(|s| ts < s);
+                        if in_window {
+                            matched_seen += 1;
+                            if matched_seen > options.skip {
+                                if options.count {
+                                    match_count += 1;
+                                } else if max_count.is_none_or(|m| ordered.len() < m) {
+                                    ordered.push(oid);
+                                    if options.retain_commit_data {
+                                        let payload = retain_commit_payload_for_list(
+                                            repo,
+                                            g,
+                                            oid,
+                                            retain_extent,
+                                        )?;
+                                        commit_data.insert(oid, &payload);
+                                    }
+                                }
+                            }
+                        }
+                        g.release_commit_bytes(oid);
+                        Ok(if options.count {
+                            if max_count.is_some_and(|m| match_count >= m) {
+                                WalkControl::Stop
+                            } else {
+                                WalkControl::Continue
+                            }
+                        } else if max_count.is_some_and(|m| ordered.len() >= m) {
+                            WalkControl::Stop
+                        } else {
+                            WalkControl::Continue
+                        })
+                    },
+                )?;
+                Ok((match_count, commit_data))
+            })?;
+    if options.reverse {
+        ordered.reverse();
+    }
+    let mut result = if options.count {
+        let mut result = rev_list_result_from_commits(Vec::new());
+        result.reachable_commit_count = Some(match_count);
+        result
+    } else {
+        rev_list_result_from_commits(ordered)
+    };
+    result.commit_data = commit_data;
+    Ok(result)
+}
+
+fn path_limit_plain_walk_options(options: &RevListOptions) -> RevListOptions {
+    RevListOptions {
+        paths: Vec::new(),
+        pickaxe: None,
+        commit_filter: None,
+        ..options.clone()
+    }
+}
+
 fn can_use_bounded_path_limit_list(options: &RevListOptions) -> bool {
+    let plain = path_limit_plain_walk_options(options);
     let since_date_bounded = options.since_cutoff.is_some()
         && options.ordering == OrderingMode::Default
-        && plain_commit_walk(
-            &RevListOptions {
-                paths: Vec::new(),
-                pickaxe: None,
-                ..options.clone()
-            },
-            false,
-        );
+        && plain_commit_walk(&plain, false);
     (options.max_count.is_some() || since_date_bounded)
         && !options.paths.is_empty()
         && !options.full_history
@@ -7601,22 +7410,11 @@ fn can_use_bounded_path_limit_list(options: &RevListOptions) -> bool {
         && !options.simplify_merges
         && !options.sparse
         && !options.count
-        && (can_use_bounded_limit_list(&RevListOptions {
-            paths: Vec::new(),
-            pickaxe: None,
-            ..options.clone()
-        }) || since_date_bounded)
+        && (can_use_bounded_limit_list(&plain) || since_date_bounded)
 }
 
-fn repo_commit_graph_enabled(repo: &Repository, cfg: &ConfigSet) -> bool {
-    let mut core_cg = match cfg.get_bool("core.commitgraph") {
-        Some(Ok(b)) => b,
-        _ => true,
-    };
-    if repo.environment().var("GIT_TEST_COMMIT_GRAPH").as_deref() == Some("0") {
-        core_cg = false;
-    }
-    core_cg
+fn repo_commit_graph_enabled(cfg: &ConfigSet) -> bool {
+    cfg.bool_with_default("core.commitGraph", true)
 }
 
 fn dense_bloom_context_for_paths(
@@ -7624,13 +7422,13 @@ fn dense_bloom_context_for_paths(
     repo_config: &ConfigSet,
     options: &RevListOptions,
 ) -> (Option<Arc<CommitGraphChain>>, bool, i32, Option<String>) {
-    let core_cg = repo_commit_graph_enabled(repo, repo_config);
+    let core_cg = repo_commit_graph_enabled(repo_config);
     let read_paths = repo_config
-        .get("commitgraph.readchangedpaths")
+        .value("commitgraph.readchangedpaths")
         .and_then(|v| crate::config::parse_bool(&v).ok())
         .unwrap_or(true);
     let version = repo_config
-        .get("commitgraph.changedpathsversion")
+        .value("commitgraph.changedpathsversion")
         .and_then(|s| s.parse::<i32>().ok())
         .unwrap_or(-1);
     let use_bloom = core_cg
@@ -7675,11 +7473,16 @@ fn try_bounded_path_limit_list(
     };
     let mut graph =
         CommitGraph::with_commit_graph(repo, options.first_parent, options.use_commit_graph);
-    let excluded = if exclude.is_empty() {
-        HashSet::new()
-    } else {
-        walk_closure(&mut graph, exclude)?
-    };
+    let excluded = RangeWalkHide::try_for_dense_path_hide(
+        repo,
+        include,
+        exclude,
+        options.use_commit_graph,
+        options.first_parent,
+    )?;
+    let mut hide_cache = excluded.uses_lazy_hide().then(|| {
+        crate::merge_base::CommitGraphCache::with_commit_graph(repo, options.use_commit_graph)
+    });
 
     let (bloom_chain, bloom_read_changed, bloom_version, bloom_cwd) =
         dense_bloom_context_for_paths(repo, repo_config, options);
@@ -7697,12 +7500,26 @@ fn try_bounded_path_limit_list(
     } else {
         options.since_cutoff
     };
-    let paths = &options.paths;
+    let path_check = RevPathspecCheck::build(repo, &options.paths)?;
+    let follow = options.follow;
+    let follow_threshold = if follow {
+        log_follow_rename_threshold(repo_config)
+    } else {
+        100
+    };
+    let argv_path = options.paths.first().map(String::as_str).unwrap_or("");
+    let mut follow_paths: HashMap<ObjectId, String> = HashMap::new();
+    if follow {
+        let initial = options.paths[0].clone();
+        for &tip in include {
+            follow_paths.insert(tip, initial.clone());
+        }
+    }
     let mut heap = BinaryHeap::new();
     let mut queued = HashSet::new();
     let mut next_seq = 0u64;
     for &tip in include {
-        if excluded.contains(&tip) || !queued.insert(tip) {
+        if excluded.is_hidden_with_cache(&mut hide_cache, tip)? || !queued.insert(tip) {
             continue;
         }
         heap.push(CommitDateKey {
@@ -7720,19 +7537,28 @@ fn try_bounded_path_limit_list(
     let mut ordered = Vec::with_capacity(max_count.min(64));
     while let Some(item) = heap.pop() {
         let oid = item.oid;
-        if excluded.contains(&oid) {
+        if excluded.is_hidden_with_cache(&mut hide_cache, oid)? {
             continue;
         }
 
+        let follow_path = follow.then(|| {
+            follow_paths
+                .get(&oid)
+                .cloned()
+                .unwrap_or_else(|| options.paths[0].clone())
+        });
+        let bloom_use = bloom_for_follow_path(Some(&bloom_ctx), argv_path, follow_path.as_deref());
         let action = dense_path_limited_action(
             repo,
             &mut graph,
             oid,
-            paths,
+            &path_check,
             options.sparse,
             options.show_pulls,
-            Some(&bloom_ctx),
+            bloom_use,
             &mut cache,
+            follow_path.as_deref(),
+            follow_threshold,
         )?;
 
         let filter_ok = options
@@ -7748,13 +7574,22 @@ fn try_bounded_path_limit_list(
                 &mut graph,
                 pickaxe,
                 oid,
-                paths,
+                &options.paths,
                 pickaxe_renames,
                 &mut pickaxe_blob_cache,
             )?,
             _ => true,
         };
-        if action.visible && filter_ok && pickaxe_ok {
+        let mut list_commit = action.visible && filter_ok && pickaxe_ok;
+        if list_commit && (options.since_cutoff.is_some() || options.until_cutoff.is_some()) {
+            let ts = graph.committer_time(oid);
+            if options.until_cutoff.is_some_and(|u| ts > u)
+                || options.since_cutoff.is_some_and(|s| ts < s)
+            {
+                list_commit = false;
+            }
+        }
+        if list_commit {
             visible_seen += 1;
             if visible_seen > options.skip && ordered.len() < max_count {
                 ordered.push(oid);
@@ -7765,13 +7600,18 @@ fn try_bounded_path_limit_list(
             break;
         }
 
-        for parent in action.parents_to_walk {
-            if excluded.contains(&parent) || !queued.insert(parent) {
+        let next_paths = action.next_follow_paths.as_ref();
+        for (idx, parent) in action.parents_to_walk.iter().enumerate() {
+            if excluded.is_hidden(*parent) || !queued.insert(*parent) {
                 continue;
             }
+            if let (Some(fp), Some(paths)) = (follow_path.as_ref(), next_paths) {
+                let next = paths.get(idx).cloned().unwrap_or_else(|| fp.clone());
+                follow_paths.insert(*parent, next);
+            }
             heap.push(CommitDateKey {
-                oid: parent,
-                date: graph.sort_key(parent, author_dates),
+                oid: *parent,
+                date: graph.sort_key(*parent, author_dates),
                 seq: next_seq,
             });
             next_seq += 1;
@@ -7965,23 +7805,16 @@ fn parse_revision_stdin_lines(repo: &Repository, lines: &[String]) -> Result<Std
     Ok((positive, negative, stdin_all_refs, Vec::new()))
 }
 
-/// Read `--stdin` revision lines from the process stdin stream.
-fn read_revisions_from_stdin_lines(repo: &Repository) -> Result<StdinRevisionSpecs> {
-    let stdin = std::io::read_to_string(std::io::stdin()).map_err(Error::Io)?;
-    let lines: Vec<String> = stdin.lines().map(std::borrow::ToOwned::to_owned).collect();
-    parse_revision_stdin_lines(repo, &lines)
-}
-
-/// Merge command-line revision strings with explicit `--stdin` lines (tests and embedders).
+/// Merge command-line revision strings with explicit `--stdin` lines.
 ///
-/// Same behavior as [`collect_revision_specs_with_stdin`] when stdin contains `lines`.
-/// Ref pseudo-options (`--all`, `--branches[=<glob>]`, `--tags`, `--remotes`, `--glob`) list
-/// refs through [`Repository::refs`], so an injected ref store is honoured.
+/// Returns `(positive_specs, negative_specs, stdin_saw_all, stdin_pathspecs)`. Stdin lines use
+/// their own `--not` toggle, independent of the command line. Ref pseudo-options (`--all`, `--branches[=<glob>]`, `--tags`, `--remotes`, `--glob`) list
+/// refs through [`Repository::ref_store`], so an injected ref store is honoured.
 ///
 /// # Errors
 ///
 /// Propagates [`RevListError`] for invalid stdin pseudo-options and ref store failures.
-pub fn collect_revision_specs_from_stdin_lines(
+pub(crate) fn collect_revision_specs_from_stdin_lines(
     repo: &Repository,
     args_specs: &[String],
     lines: &[&str],
@@ -8003,47 +7836,12 @@ pub fn collect_revision_specs_from_stdin_lines(
     Ok((positive, negative, stdin_all_refs, stdin_paths))
 }
 
-/// Merge command-line revision strings with `--stdin` lines (and optional stdin pathspecs).
-///
-/// Returns `(positive_specs, negative_specs, stdin_saw_all, stdin_pathspecs)`.
-///
-/// Command-line `--not` is applied while building `args_specs` (see `rev-list`); stdin uses an
-/// independent `--not` toggle, matching Git.
-///
-/// # Errors
-///
-/// Returns [`Error::Message`] for Git-compatible `fatal:` stderr lines from stdin mode.
-pub fn collect_revision_specs_with_stdin(
-    repo: &Repository,
-    args_specs: &[String],
-    read_stdin: bool,
-) -> Result<StdinRevisionSpecs> {
-    let mut positive = Vec::new();
-    let mut negative = Vec::new();
-
-    for spec in args_specs {
-        let (pos, neg) = split_revision_token(spec);
-        positive.extend(pos);
-        negative.extend(neg);
-    }
-
-    if !read_stdin {
-        return Ok((positive, negative, false, Vec::new()));
-    }
-
-    let (s_pos, s_neg, stdin_all_refs, stdin_paths) = read_revisions_from_stdin_lines(repo)?;
-    positive.extend(s_pos);
-    negative.extend(s_neg);
-
-    Ok((positive, negative, stdin_all_refs, stdin_paths))
-}
-
-/// Object ids every tag under `refs/tags/` points at, read through [`Repository::refs`].
+/// Object ids every tag under `refs/tags/` points at, read through [`Repository::ref_store`].
 ///
 /// # Errors
 ///
 /// Propagates ref store failures.
-pub fn tag_targets(repo: &Repository) -> Result<HashSet<ObjectId>> {
+pub(crate) fn tag_targets(repo: &Repository) -> Result<HashSet<ObjectId>> {
     Ok(refs::list_refs_in(repo, "refs/tags/")?
         .into_iter()
         .map(|(_, oid)| oid)
@@ -8063,12 +7861,7 @@ pub(crate) struct CommitGraph<'r> {
     subjects: HashMap<ObjectId, String>,
     /// Full parent count before [`Self::first_parent_only`] truncation, when that mode is on.
     full_parent_counts: OidHashMap<usize>,
-    /// Parsed commits kept for the caller once [`Self::retain_parsed_commits`] is called.
-    ///
-    /// Retained commits are the only record of their tree and author time; those side maps
-    /// stay empty for them.
-    retained: Option<OidHashMap<CommitData>>,
-    /// Scratch buffer for retained commit loads and [`Self::commit_bytes`] reads.
+    /// Scratch buffer for [`Self::commit_bytes`] reads.
     read_buf: Vec<u8>,
     /// Raw commits traversal read but that are not yet released, once
     /// [`Self::keep_unreleased_commit_bytes`] is called.
@@ -8077,6 +7870,8 @@ pub(crate) struct CommitGraph<'r> {
     /// bytes until the visit lets filters and output reuse them instead of inflating again.
     /// Only the queued frontier is held, not every visited commit.
     unreleased_bytes: Option<OidHashMap<Vec<u8>>>,
+    /// How much of each commit [`Self::unreleased_bytes`] holds.
+    unreleased_extent: CommitExtent,
     /// Commit whose bytes [`Self::commit_bytes`] last read into `read_buf`.
     read_buf_oid: Option<ObjectId>,
 }
@@ -8086,15 +7881,17 @@ pub(crate) struct CommitGraph<'r> {
 /// Goes through [`crate::odb::Odb::read`] so loose commits land in the ODB's session cache
 /// and resolved pack delta bases stay cached, as for every other commit read in a walk.
 fn read_commit_bytes(repo: &Repository, oid: ObjectId) -> Result<Vec<u8>> {
-    let object = repo.odb().read(&oid)?;
-    if object.kind != ObjectKind::Commit {
-        return Err(rev_list_unexpected_kind(oid, "commit"));
+    match repo.read_commit_bytes_with_replace(&oid) {
+        Ok(bytes) => Ok(bytes),
+        Err(Error::Object(ObjectError::UnexpectedKind { .. })) => {
+            Err(rev_list_unexpected_kind(oid, "commit"))
+        }
+        Err(other) => Err(other),
     }
-    Ok(object.data)
 }
 
 impl<'r> CommitGraph<'r> {
-    pub(crate) fn new(repo: &'r Repository, first_parent_only: bool) -> Self {
+    pub fn new(repo: &'r Repository, first_parent_only: bool) -> Self {
         Self::with_commit_graph(repo, first_parent_only, false)
     }
 
@@ -8128,40 +7925,11 @@ impl<'r> CommitGraph<'r> {
             graft_parents,
             subjects: HashMap::new(),
             full_parent_counts: oid_hash_map(),
-            retained: None,
             read_buf: Vec::new(),
             unreleased_bytes: None,
+            unreleased_extent: CommitExtent::Whole,
             read_buf_oid: None,
         }
-    }
-
-    /// Keep every commit object parsed from here on, for [`Self::take_retained_commits`].
-    ///
-    /// `expected` is how many commits the caller expects to parse; the per-commit maps are
-    /// sized for it up front so a bounded walk does not rehash while it runs.
-    ///
-    /// Retained commits stand in for the per-commit subject cache, so [`Self::subject_of`] is
-    /// `None` for them.
-    pub(crate) fn retain_parsed_commits(&mut self, expected: usize) {
-        self.parents.reserve(expected);
-        self.committer_time.reserve(expected);
-        self.retained
-            .get_or_insert_with(oid_hash_map)
-            .reserve(expected);
-    }
-
-    fn retained_commit(&self, oid: &ObjectId) -> Option<&CommitData> {
-        self.retained.as_ref()?.get(oid)
-    }
-
-    /// Parsed commits among `listed`, moved out of the retained set.
-    pub(crate) fn take_retained_commits(&mut self, listed: &[ObjectId]) -> OidHashMap<CommitData> {
-        let Some(mut retained) = self.retained.take() else {
-            return OidHashMap::default();
-        };
-        let listed: OidHashSet = listed.iter().copied().collect();
-        retained.retain(|oid, _| listed.contains(oid));
-        retained
     }
 
     pub(crate) fn subject_of(&self, oid: ObjectId) -> Option<&str> {
@@ -8182,9 +7950,6 @@ impl<'r> CommitGraph<'r> {
         if let Some(tree) = self.commit_trees.get(&oid).copied() {
             return Ok(tree);
         }
-        if let Some(commit) = self.retained_commit(&oid) {
-            return Ok(commit.tree);
-        }
         let commit = load_commit(self.repo, oid)?;
         self.commit_trees.insert(oid, commit.tree);
         Ok(commit.tree)
@@ -8202,6 +7967,15 @@ impl<'r> CommitGraph<'r> {
     pub(crate) fn parents_of(&mut self, oid: ObjectId) -> Result<Vec<ObjectId>> {
         self.populate(oid)?;
         Ok(self.parents.get(&oid).cloned().unwrap_or_default())
+    }
+
+    /// Cached parent list for `oid` without cloning.
+    ///
+    /// The slice is tied to this graph and remains valid until the next mutation of the same
+    /// graph (any `populate` / walk that can insert into `parents`).
+    pub(crate) fn parents_of_ref(&mut self, oid: ObjectId) -> Result<&[ObjectId]> {
+        self.populate(oid)?;
+        Ok(self.parents.get(&oid).map(Vec::as_slice).unwrap_or(&[]))
     }
 
     /// Parent count for `--merges` / `--no-merges` output filtering.
@@ -8232,9 +8006,6 @@ impl<'r> CommitGraph<'r> {
         if self.populate(oid).is_err() {
             return 0;
         }
-        if let Some(commit) = self.retained_commit(&oid) {
-            return committer_unix_seconds_for_ordering(&commit.author);
-        }
         if !self.author_time.contains_key(&oid) {
             self.fill_author_time_from_object(oid);
         }
@@ -8260,20 +8031,22 @@ impl<'r> CommitGraph<'r> {
         if self.subjects.contains_key(&oid) {
             return Ok(());
         }
-        let object = self.repo.odb().read(&oid)?;
-        if object.kind != ObjectKind::Commit {
-            return Ok(());
-        }
-        if let Ok(subject) = crate::objects::read_commit_subject_line(&object.data) {
+        let bytes = match self.repo.read_commit_bytes_with_replace(&oid) {
+            Ok(bytes) => bytes,
+            Err(_) => return Ok(()),
+        };
+        if let Ok(subject) = crate::objects::read_commit_subject_line(&bytes) {
             self.subjects.insert(oid, subject);
         }
         Ok(())
     }
 
-    /// Keep raw commits that traversal reads from here on until [`Self::release_commit_bytes`].
-    fn keep_unreleased_commit_bytes(&mut self) {
+    /// Keep `extent` of the raw commits that traversal reads from here on until
+    /// [`Self::release_commit_bytes`].
+    fn keep_unreleased_commit_bytes(&mut self, extent: CommitExtent) {
         self.unreleased_bytes
             .get_or_insert_with(|| crate::objects::oid_hash_map_with_capacity(16));
+        self.unreleased_extent = extent;
     }
 
     /// Raw bytes of commit `oid`.
@@ -8295,15 +8068,49 @@ impl<'r> CommitGraph<'r> {
     }
 
     /// Read commit `oid` for traversal and keep its bytes until it is released.
+    /// When [`Self::keep_unreleased_commit_bytes`] is active, ensure `oid`'s bytes are cached.
+    ///
+    /// Commit-graph parent loading can populate a commit without reading its object; listing
+    /// walks still need the payload once for output reuse.
+    fn ensure_unreleased_commit_bytes(&mut self, oid: ObjectId) -> Result<()> {
+        if self.unreleased_bytes.is_none() {
+            return Ok(());
+        }
+        if self
+            .unreleased_bytes
+            .as_ref()
+            .is_some_and(|m| m.contains_key(&oid))
+        {
+            return Ok(());
+        }
+        let _ = self.read_and_keep_commit_bytes(oid)?;
+        Ok(())
+    }
+
     fn read_and_keep_commit_bytes(&mut self, oid: ObjectId) -> Result<&[u8]> {
         let repo = self.repo;
+        let extent = self.unreleased_extent;
         let unreleased = self
             .unreleased_bytes
             .get_or_insert_with(crate::objects::oid_hash_map);
         match unreleased.entry(oid) {
             hashbrown::hash_map::Entry::Occupied(entry) => Ok(entry.into_mut()),
             hashbrown::hash_map::Entry::Vacant(entry) => {
-                Ok(entry.insert(read_commit_bytes(repo, oid)?))
+                let bytes = match extent {
+                    CommitExtent::Whole => read_commit_bytes(repo, oid)?,
+                    CommitExtent::ThroughSubject => {
+                        let effective = repo.object_id_after_replace(&oid);
+                        repo.odb().read_commit_through_subject(&effective).map_err(
+                            |err| match err {
+                                Error::Object(ObjectError::UnexpectedKind { .. }) => {
+                                    rev_list_unexpected_kind(oid, "commit")
+                                }
+                                other => other,
+                            },
+                        )?
+                    }
+                };
+                Ok(entry.insert(bytes))
             }
         }
     }
@@ -8315,55 +8122,36 @@ impl<'r> CommitGraph<'r> {
         }
     }
 
+    /// Move traversal-kept bytes for `oid` out of the unreleased map, if present.
+    fn drain_unreleased_commit_bytes(&mut self, oid: ObjectId) -> Option<Vec<u8>> {
+        self.unreleased_bytes.as_mut()?.remove(&oid)
+    }
+
     fn populate(&mut self, oid: ObjectId) -> Result<()> {
         if self.parents.contains_key(&oid) {
             return Ok(());
         }
-        if let Some(chain) = &self.graph_chain {
-            if let Some((mut parents, ctime)) = chain.graph_commit(&oid) {
-                if self.shallow_boundaries.contains(&oid) {
-                    parents.clear();
-                }
-                if let Some(graft_parents) = self.graft_parents.get(&oid) {
-                    parents = graft_parents.clone();
-                }
-                if self.first_parent_only {
-                    self.full_parent_counts.insert(oid, parents.len());
-                    if parents.len() > 1 {
-                        parents.truncate(1);
+        if self.repo.object_id_after_replace(&oid) == oid {
+            if let Some(chain) = &self.graph_chain {
+                if let Some((mut parents, ctime)) = chain.graph_commit(&oid) {
+                    if self.shallow_boundaries.contains(&oid) {
+                        parents.clear();
                     }
-                }
-                self.committer_time.insert(oid, ctime);
-                self.parents.insert(oid, parents);
-                return Ok(());
-            }
-        }
-        if self.retained.is_some() {
-            self.read_buf_oid = None;
-            let commit = load_commit_into(self.repo, oid, &mut self.read_buf)?;
-            let mut parents = if self.shallow_boundaries.contains(&oid) {
-                Vec::new()
-            } else {
-                commit.parents.clone()
-            };
-            if let Some(graft_parents) = self.graft_parents.get(&oid) {
-                parents = graft_parents.clone();
-            }
-            if self.first_parent_only {
-                self.full_parent_counts.insert(oid, parents.len());
-                if parents.len() > 1 {
-                    parents.truncate(1);
+                    if let Some(graft_parents) = self.graft_parents.get(&oid) {
+                        parents = graft_parents.clone();
+                    }
+                    if self.first_parent_only {
+                        self.full_parent_counts.insert(oid, parents.len());
+                        if parents.len() > 1 {
+                            parents.truncate(1);
+                        }
+                    }
+                    self.committer_time.insert(oid, ctime);
+                    self.parents.insert(oid, parents);
+                    return Ok(());
                 }
             }
-            self.committer_time
-                .insert(oid, committer_unix_seconds_for_ordering(&commit.committer));
-            self.parents.insert(oid, parents);
-            if let Some(retained) = self.retained.as_mut() {
-                retained.insert(oid, commit);
-            }
-            return Ok(());
         }
-
         let (mut parents, ctime, atime, tree, subject) = if self.unreleased_bytes.is_some() {
             let commit = CommitRef::parse(self.read_and_keep_commit_bytes(oid)?)?;
             (
@@ -8374,13 +8162,15 @@ impl<'r> CommitGraph<'r> {
                 None,
             )
         } else {
-            let mut commit = load_commit(self.repo, oid)?;
+            let bytes = read_commit_bytes(self.repo, oid)?;
+            let commit = CommitRef::parse(&bytes)?;
+            let subject = read_commit_subject_line(&bytes).ok();
             (
-                std::mem::take(&mut commit.parents),
-                committer_unix_seconds_for_ordering(&commit.committer),
-                committer_unix_seconds_for_ordering(&commit.author),
-                commit.tree,
-                Some(subject_line_from_commit_message(&commit.message)),
+                commit.parents().to_vec(),
+                commit.committer_unix_seconds_for_ordering(),
+                commit.author_unix_seconds_for_ordering(),
+                commit.tree(),
+                subject,
             )
         };
         if self.shallow_boundaries.contains(&oid) {
@@ -8404,31 +8194,6 @@ impl<'r> CommitGraph<'r> {
         }
         Ok(())
     }
-}
-
-fn subject_line_from_commit_message(message: &str) -> String {
-    message
-        .lines()
-        .find(|line| !line.trim().is_empty())
-        .map(str::trim)
-        .unwrap_or("(no subject)")
-        .to_owned()
-}
-
-fn commit_tips_from_ref_pairs(
-    repo: &Repository,
-    pairs: &[(String, ObjectId)],
-    exclusions: &RefExclusions,
-) -> Result<Vec<ObjectId>> {
-    let namespace_prefix = git_namespace_prefix();
-    let mut raw = Vec::new();
-    for (refname, oid) in pairs {
-        if exclusions.ref_excluded(strip_git_namespace(refname, &namespace_prefix), refname) {
-            continue;
-        }
-        raw.push(*oid);
-    }
-    peel_ref_oids_to_unique_commits(repo, raw)
 }
 
 fn peel_ref_oids_to_unique_commits(repo: &Repository, raw: Vec<ObjectId>) -> Result<Vec<ObjectId>> {
@@ -8585,25 +8350,23 @@ fn ref_pairs_for_all(repo: &Repository) -> Result<Vec<(String, ObjectId)>> {
     Ok(pairs)
 }
 
-fn all_ref_tips(repo: &Repository, exclusions: &RefExclusions) -> Result<Vec<ObjectId>> {
-    let pairs = ref_pairs_for_all(repo)?;
-    commit_tips_from_ref_pairs(repo, &pairs, exclusions)
+fn all_ref_tips(repo: &Repository) -> Result<Vec<ObjectId>> {
+    let raw = ref_pairs_for_all(repo)?
+        .into_iter()
+        .map(|(_, oid)| oid)
+        .collect();
+    peel_ref_oids_to_unique_commits(repo, raw)
 }
 
 /// One pass over `--all` refs: unique commit tips plus object roots for `--objects`.
 fn all_ref_commit_tips_and_object_roots(
     repo: &Repository,
-    exclusions: &RefExclusions,
 ) -> Result<(Vec<ObjectId>, Vec<RootObject>)> {
-    let namespace_prefix = git_namespace_prefix();
     let pairs = ref_pairs_for_all(repo)?;
     let mut commits = HashSet::new();
     let mut roots = Vec::new();
     let mut seen_roots = HashSet::new();
     for (refname, oid) in pairs {
-        if exclusions.ref_excluded(strip_git_namespace(&refname, &namespace_prefix), &refname) {
-            continue;
-        }
         let Ok(object) = repo.odb().read(&oid) else {
             continue;
         };
@@ -8660,21 +8423,12 @@ fn all_ref_commit_tips_and_object_roots(
     Ok((tips, roots))
 }
 
-/// Expand named refs to peeled unique commit tips, applying `--exclude` / `--exclude-hidden` rules.
-pub fn commit_tips_from_named_refs(
-    repo: &Repository,
-    pairs: &[(String, ObjectId)],
-    exclusions: &RefExclusions,
-) -> Result<Vec<ObjectId>> {
-    commit_tips_from_ref_pairs(repo, pairs, exclusions)
-}
-
 /// Commit OIDs listed in `.git/shallow` (shallow clone boundaries).
 ///
 /// At each boundary commit, history is cut: parents are omitted from the object store and must
 /// not be traversed for connectivity checks (`git fsck`, `pack-objects` reachability, etc.).
 #[must_use]
-pub fn shallow_boundary_oids(git_dir: &Path) -> HashSet<ObjectId> {
+pub(crate) fn shallow_boundary_oids(git_dir: &Path) -> HashSet<ObjectId> {
     crate::shallow::load_shallow_boundaries(git_dir)
 }
 
@@ -8685,7 +8439,7 @@ pub fn shallow_boundary_oids(git_dir: &Path) -> HashSet<ObjectId> {
 /// commits (for protocol v2 `shallow-info` and `pack-objects --shallow`). Annotated tag wants are
 /// walked from the commit they name.
 #[must_use]
-pub fn shallow_borders_reachable_from_wants(
+pub(crate) fn shallow_borders_reachable_from_wants(
     repo: &Repository,
     wants: &[ObjectId],
 ) -> Vec<ObjectId> {
@@ -8715,79 +8469,111 @@ pub fn shallow_borders_reachable_from_wants(
     out
 }
 
-/// Compute new shallow boundary commits for `upload-pack` when the client sends `deepen <n>`.
-///
-/// Absolute depth from wanted tips (`fetch --depth N`, wire `deepen N` without
-/// `deepen-relative`). Returns shallow border commits for `shallow` lines and
-/// `pack-objects --shallow`. Relative deepen first computes an absolute target
-/// depth, then uses [`shallow_grafts_for_upload_pack_target_depth`].
-///
-/// # Parameters
-///
-/// - `wants` — wanted OIDs (usually remote `HEAD` / ref tips). Annotated tags are peeled to the
-///   commit they name; wants that do not peel to a commit are ignored, so only commits are ever
-///   returned.
-/// - `client_shallow` — OIDs the client advertised with `shallow <oid>` before `deepen`.
-/// - `deepen` — positive integer from the `deepen` pkt-line (`deepen 2` → `2`).
-#[must_use]
-pub fn shallow_grafts_for_upload_pack_deepen(
-    repo: &Repository,
-    wants: &[ObjectId],
-    client_shallow: &[ObjectId],
-    deepen: usize,
-) -> Vec<ObjectId> {
-    let wants = peel_to_commit_tips(repo, wants);
-    if deepen == 0 || wants.is_empty() {
-        return Vec::new();
-    }
-    let wants = wants.as_slice();
-
-    shallow_grafts_for_upload_pack_target_depth(repo, wants, client_shallow, deepen)
+/// Shallow/unshallow classification for absolute `deepen <n>` (Git `get_shallows_or_depth`).
+#[derive(Debug, Default)]
+pub(crate) struct UploadPackDepthShallowState {
+    /// Commits at the depth cut (`SHALLOW`); parents are not walked past these.
+    pub border_commits: Vec<ObjectId>,
+    /// Commits strictly inside the depth window (`NOT_SHALLOW`).
+    pub interior_commits: HashSet<ObjectId>,
 }
 
-/// Shallow borders when the client sent `deepen-relative` and the caller already computed
-/// the absolute target depth (Git `get_shallow_commits` after `deepen_relative` adjustment).
+/// Compute shallow borders and interior commits for upload-pack absolute depth.
 ///
-/// Wants are peeled like in [`shallow_grafts_for_upload_pack_deepen`].
-#[must_use]
-pub fn shallow_grafts_for_upload_pack_target_depth(
+/// Generation is counted from each want tip (each want restarts at generation 1).
+/// Borders sit at generation `depth`; interior commits have generation `< depth`.
+/// Server-side shallow boundaries stop parent walks like Git shallow grafts.
+pub(crate) fn upload_pack_shallow_depth_state(
     repo: &Repository,
     wants: &[ObjectId],
-    client_shallow: &[ObjectId],
-    target_depth: usize,
-) -> Vec<ObjectId> {
-    shallow_grafts_for_upload_pack_target_depth_with_policy(
-        repo,
-        wants,
-        client_shallow,
-        target_depth,
-        true,
-    )
+    depth: usize,
+    server_shallow: &HashSet<ObjectId>,
+) -> UploadPackDepthShallowState {
+    let mut out = UploadPackDepthShallowState::default();
+    if depth == 0 || wants.is_empty() {
+        return out;
+    }
+
+    let enter_depth = min_enter_depths_from_wants(repo, wants, depth, server_shallow);
+
+    let mut border_set = HashSet::new();
+    for (&oid, &enter) in &enter_depth {
+        let cur_depth = enter.saturating_add(1);
+
+        if cur_depth >= depth || server_shallow.contains(&oid) {
+            if border_set.insert(oid) {
+                out.border_commits.push(oid);
+            }
+        } else {
+            out.interior_commits.insert(oid);
+        }
+    }
+
+    out.border_commits.sort();
+    out
 }
 
-/// Like [`shallow_grafts_for_upload_pack_target_depth`], but can treat commits the
-/// client already marked shallow as borders (for absolute `fetch --depth` retention).
-pub(crate) fn shallow_grafts_for_upload_pack_target_depth_with_policy(
+/// Minimum parent-side enter depth per commit (Git `get_shallows_or_depth` depth map).
+fn min_enter_depths_from_wants(
     repo: &Repository,
     wants: &[ObjectId],
-    client_shallow: &[ObjectId],
-    target_depth: usize,
-    omit_existing_client_shallows: bool,
-) -> Vec<ObjectId> {
-    let wants = peel_to_commit_tips(repo, wants);
-    if target_depth == 0 || wants.is_empty() {
-        return Vec::new();
+    depth: usize,
+    server_shallow: &HashSet<ObjectId>,
+) -> HashMap<ObjectId, usize> {
+    let mut enter_depth: HashMap<ObjectId, usize> = HashMap::new();
+    let mut stack: Vec<ObjectId> = Vec::new();
+    let mut head_idx = 0usize;
+    let mut current: Option<ObjectId> = None;
+
+    while current.is_some() || head_idx < wants.len() || !stack.is_empty() {
+        if current.is_none() {
+            if head_idx < wants.len() {
+                let head = wants[head_idx];
+                head_idx += 1;
+                enter_depth.insert(head, 0);
+                current = Some(head);
+            } else {
+                current = stack.pop();
+            }
+        }
+
+        let Some(oid) = current.take() else {
+            continue;
+        };
+
+        let Some(&enter) = enter_depth.get(&oid) else {
+            continue;
+        };
+        let cur_depth = enter.saturating_add(1);
+
+        if cur_depth >= depth || server_shallow.contains(&oid) {
+            continue;
+        }
+
+        let parents = commit_parent_ids(repo, oid);
+        let mut parent_iter = parents.iter();
+        let Some(first_parent) = parent_iter.next() else {
+            continue;
+        };
+
+        for p in parent_iter {
+            let parent = *p;
+            let prev = enter_depth.get(&parent).copied();
+            if prev.is_none_or(|old| cur_depth < old) {
+                enter_depth.insert(parent, cur_depth);
+                stack.push(parent);
+            }
+        }
+
+        let parent = *first_parent;
+        let prev = enter_depth.get(&parent).copied();
+        if prev.is_none_or(|old| cur_depth < old) {
+            enter_depth.insert(parent, cur_depth);
+            current = Some(parent);
+        }
     }
-    let server_shallow = shallow_boundary_oids(repo.git_dir());
-    let client_set: HashSet<ObjectId> = client_shallow.iter().copied().collect();
-    let included_depths = commits_within_parent_depth(repo, &wants, target_depth, &server_shallow);
-    border_commits_for_depth_fetch(
-        repo,
-        &included_depths,
-        target_depth,
-        &client_set,
-        omit_existing_client_shallows,
-    )
+
+    enter_depth
 }
 
 /// Peel `wants` through annotated tags and keep the distinct commits, in order.
@@ -8819,84 +8605,10 @@ fn commit_parent_ids(repo: &Repository, oid: ObjectId) -> Vec<ObjectId> {
         .unwrap_or_default()
 }
 
-fn commits_within_parent_depth(
-    repo: &Repository,
-    wants: &[ObjectId],
-    max_depth: usize,
-    server_shallow: &HashSet<ObjectId>,
-) -> HashMap<ObjectId, usize> {
-    let mut best_depth: HashMap<ObjectId, usize> = HashMap::new();
-    let mut q: VecDeque<(ObjectId, usize)> = VecDeque::new();
-    for &w in wants {
-        best_depth.insert(w, 1);
-        q.push_back((w, 1));
-    }
-    while let Some((oid, depth)) = q.pop_front() {
-        if depth > max_depth {
-            continue;
-        }
-        if best_depth.get(&oid).copied() != Some(depth) {
-            continue;
-        }
-        if depth == max_depth {
-            continue;
-        }
-        if server_shallow.contains(&oid) {
-            continue;
-        }
-        for p in commit_parent_ids(repo, oid) {
-            let nd = depth.saturating_add(1);
-            if nd > max_depth {
-                continue;
-            }
-            let prev = best_depth.get(&p).copied().unwrap_or(usize::MAX);
-            if nd < prev {
-                best_depth.insert(p, nd);
-                q.push_back((p, nd));
-            }
-        }
-    }
-    best_depth
-}
-
-/// Borders for `deepen N` when some included commit has a parent outside the set.
-fn border_commits_for_depth_fetch(
-    repo: &Repository,
-    included_depths: &HashMap<ObjectId, usize>,
-    target_depth: usize,
-    client_shallow: &HashSet<ObjectId>,
-    omit_existing_client_shallows: bool,
-) -> Vec<ObjectId> {
-    let included: HashSet<ObjectId> = included_depths.keys().copied().collect();
-    let mut out = Vec::new();
-    let mut seen_out = HashSet::new();
-    for &c in included.iter() {
-        if omit_existing_client_shallows && client_shallow.contains(&c) {
-            continue;
-        }
-        let parents = commit_parent_ids(repo, c);
-        let at_depth_limit = included_depths.get(&c).copied() == Some(target_depth);
-        let is_border =
-            parents.iter().any(|p| !included.contains(p)) || (parents.is_empty() && at_depth_limit);
-        if is_border && seen_out.insert(c) {
-            out.push(c);
-        }
-    }
-    out.sort();
-    out
-}
-
-fn border_commits_not_in_client_shallow(
-    repo: &Repository,
-    included: &HashSet<ObjectId>,
-    client_shallow: &HashSet<ObjectId>,
-) -> Vec<ObjectId> {
+fn border_commits_for_included(repo: &Repository, included: &HashSet<ObjectId>) -> Vec<ObjectId> {
     let mut out = Vec::new();
     let mut seen_out = HashSet::new();
     for &c in included {
-        if client_shallow.contains(&c) {
-            continue;
-        }
         let parents = commit_parent_ids(repo, c);
         let is_border = parents.iter().any(|p| !included.contains(p));
         if is_border && seen_out.insert(c) {
@@ -8912,16 +8624,16 @@ fn border_commits_not_in_client_shallow(
 ///
 /// Returns commit OIDs to advertise as `shallow` lines and pass to `pack-objects --shallow`.
 /// Wants are peeled like in [`shallow_grafts_for_upload_pack_deepen`].
-pub fn shallow_grafts_for_upload_pack_rev_list(
+/// Shallow borders and interior commits for `deepen-since` / `deepen-not`.
+pub(crate) fn upload_pack_shallow_rev_list_state(
     repo: &Repository,
     wants: &[ObjectId],
-    client_shallow: &[ObjectId],
     deepen_since: Option<i64>,
     deepen_not: &[ObjectId],
-) -> Result<Vec<ObjectId>> {
+) -> Result<UploadPackDepthShallowState> {
     let wants = peel_to_commit_tips(repo, wants);
     if wants.is_empty() || (deepen_since.is_none() && deepen_not.is_empty()) {
-        return Ok(Vec::new());
+        return Ok(UploadPackDepthShallowState::default());
     }
 
     let positive: Vec<String> = wants.iter().map(|o| o.to_hex()).collect();
@@ -8935,12 +8647,17 @@ pub fn shallow_grafts_for_upload_pack_rev_list(
 
     let res = rev_list(repo, &positive, &negative, &options)?;
     let included: HashSet<ObjectId> = res.commits.iter().copied().collect();
-    let client_set: HashSet<ObjectId> = client_shallow.iter().copied().collect();
-    Ok(border_commits_not_in_client_shallow(
-        repo,
-        &included,
-        &client_set,
-    ))
+    let border_commits = border_commits_for_included(repo, &included);
+    let border_set: HashSet<ObjectId> = border_commits.iter().copied().collect();
+    let interior_commits = included
+        .iter()
+        .copied()
+        .filter(|c| !border_set.contains(c))
+        .collect();
+    Ok(UploadPackDepthShallowState {
+        border_commits,
+        interior_commits,
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -8974,30 +8691,6 @@ impl PartialOrd for CommitDateKey {
     }
 }
 
-/// Read every line from a newline-delimited file.
-///
-/// # Errors
-///
-/// Returns [`Error::Io`] when the file cannot be read.
-pub fn read_lines(path: &Path) -> Result<Vec<String>> {
-    let content = fs::read_to_string(path)?;
-    Ok(content.lines().map(|line| line.to_owned()).collect())
-}
-
-/// Check if a token uses the symmetric diff `...` notation.
-#[must_use]
-pub fn is_symmetric_diff(token: &str) -> bool {
-    token.contains("...") && !token.contains("....")
-}
-
-/// Split a symmetric diff token into (lhs, rhs).
-#[must_use]
-pub fn split_symmetric_diff(token: &str) -> Option<(String, String)> {
-    token
-        .split_once("...")
-        .map(|(l, r)| (l.to_owned(), r.to_owned()))
-}
-
 fn commit_parent_trees(
     repo: &Repository,
     parents: &[ObjectId],
@@ -9009,9 +8702,10 @@ fn commit_parent_trees(
     for &parent in parents {
         let commit = match load_commit(repo, parent) {
             Ok(commit) => commit,
-            Err(Error::ObjectNotFound(_) | Error::PromisedObjectMissing(_))
-                if missing_action != MissingAction::Error =>
-            {
+            Err(
+                Error::Object(ObjectError::NotFound { .. })
+                | Error::Object(ObjectError::PromisedMissing { .. }),
+            ) if missing_action != MissingAction::Error => {
                 if missing_action.reports_missing() && missing_seen.insert(parent) {
                     missing.push(parent);
                 }
@@ -9264,11 +8958,15 @@ fn excluded_object_root_ids(
     Ok(objects.into_iter().map(|(oid, _)| oid).collect())
 }
 
-fn retain_objects_matching_pathspecs(objects: &mut Vec<(ObjectId, String)>, pathspecs: &[String]) {
+fn retain_objects_matching_pathspecs(
+    objects: &mut Vec<(ObjectId, String)>,
+    paths: &RevPathspecCheck<'_>,
+) {
     objects.retain(|(_, path)| {
         path.is_empty()
-            || crate::pathspec::matches_pathspec_list(path, pathspecs)
-            || pathspecs
+            || paths.path_matches(path, 0o100644)
+            || paths
+                .specs()
                 .iter()
                 .any(|spec| crate::pathspec::pathspec_wants_descent_into_tree(spec, path))
     });
@@ -9277,7 +8975,7 @@ fn retain_objects_matching_pathspecs(objects: &mut Vec<(ObjectId, String)>, path
 fn collect_pathspec_matching_tree_objects(
     repo: &Repository,
     commits: &[ObjectId],
-    pathspecs: &[String],
+    paths: &RevPathspecCheck<'_>,
 ) -> Result<Vec<(ObjectId, String)>> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
@@ -9287,7 +8985,7 @@ fn collect_pathspec_matching_tree_objects(
             repo,
             commit.tree,
             "",
-            pathspecs,
+            paths,
             &mut seen,
             &mut out,
         )?;
@@ -9299,15 +8997,15 @@ fn collect_pathspec_matching_tree_objects_inner(
     repo: &Repository,
     tree_oid: ObjectId,
     prefix: &str,
-    pathspecs: &[String],
+    paths: &RevPathspecCheck<'_>,
     seen: &mut HashSet<ObjectId>,
     out: &mut Vec<(ObjectId, String)>,
 ) -> Result<()> {
     let object = repo.odb().read(&tree_oid)?;
     if object.kind != ObjectKind::Tree {
-        return Err(Error::CorruptObject(format!(
-            "object {tree_oid} is not a tree"
-        )));
+        return Err(Error::Object(ObjectError::Corrupt {
+            detail: format!("object {tree_oid} is not a tree"),
+        }));
     }
     let oid_len = repo.odb().hash_algo().len();
     for entry in TreeRefIter::with_oid_len(&object.data, oid_len) {
@@ -9322,17 +9020,16 @@ fn collect_pathspec_matching_tree_objects_inner(
             format!("{prefix}/{name}")
         };
         let is_tree = entry.mode == 0o040000;
-        let matches = crate::pathspec::matches_pathspec_list(&path, pathspecs);
-        let wants_descent = pathspecs
+        let matches = paths.path_matches(&path, entry.mode);
+        let wants_descent = paths
+            .specs()
             .iter()
             .any(|spec| crate::pathspec::pathspec_wants_descent_into_tree(spec, &path));
         if (matches || (is_tree && wants_descent)) && seen.insert(entry.oid) {
             out.push((entry.oid, path.clone()));
         }
         if is_tree && wants_descent {
-            collect_pathspec_matching_tree_objects_inner(
-                repo, entry.oid, &path, pathspecs, seen, out,
-            )?;
+            collect_pathspec_matching_tree_objects_inner(repo, entry.oid, &path, paths, seen, out)?;
         }
     }
     Ok(())
@@ -9376,9 +9073,10 @@ fn collect_reachable_objects_segmented(
         let start = result.len();
         let commit_tree = match graph.commit_tree(commit_oid) {
             Ok(tree) => tree,
-            Err(Error::ObjectNotFound(_) | Error::PromisedObjectMissing(_))
-                if missing_action != MissingAction::Error =>
-            {
+            Err(
+                Error::Object(ObjectError::NotFound { .. })
+                | Error::Object(ObjectError::PromisedMissing { .. }),
+            ) if missing_action != MissingAction::Error => {
                 if missing_action.reports_missing() && missing_seen.insert(commit_oid) {
                     missing.push(commit_oid);
                 }
@@ -9805,9 +9503,10 @@ fn collect_tree_objects_filtered(
     }
     let tree_blob = match tree_state.tree_blob(repo, tree_oid) {
         Ok(blob) => blob,
-        Err(Error::ObjectNotFound(_) | Error::PromisedObjectMissing(_))
-            if missing_action != MissingAction::Error =>
-        {
+        Err(
+            Error::Object(ObjectError::NotFound { .. })
+            | Error::Object(ObjectError::PromisedMissing { .. }),
+        ) if missing_action != MissingAction::Error => {
             if missing_action.reports_missing() && missing_seen.insert(tree_oid) {
                 missing.push(tree_oid);
             }
@@ -9905,9 +9604,10 @@ fn collect_tree_objects_filtered(
             if needs_child_read_info {
                 let child_info = match repo.odb().read_info(&entry.oid) {
                     Ok(info) => info,
-                    Err(Error::ObjectNotFound(_) | Error::PromisedObjectMissing(_))
-                        if missing_action != MissingAction::Error =>
-                    {
+                    Err(
+                        Error::Object(ObjectError::NotFound { .. })
+                        | Error::Object(ObjectError::PromisedMissing { .. }),
+                    ) if missing_action != MissingAction::Error => {
                         if missing_action.reports_missing() && missing_seen.insert(entry.oid) {
                             missing.push(entry.oid);
                         }
@@ -9979,9 +9679,10 @@ fn collect_tree_objects_filtered(
             if needs_child_read_info {
                 let child_info = match repo.odb().read_info(&entry.oid) {
                     Ok(info) => info,
-                    Err(Error::ObjectNotFound(_) | Error::PromisedObjectMissing(_))
-                        if missing_action != MissingAction::Error =>
-                    {
+                    Err(
+                        Error::Object(ObjectError::NotFound { .. })
+                        | Error::Object(ObjectError::PromisedMissing { .. }),
+                    ) if missing_action != MissingAction::Error => {
                         if missing_action.reports_missing() && missing_seen.insert(entry.oid) {
                             missing.push(entry.oid);
                         }
@@ -10054,9 +9755,10 @@ fn collect_tree_objects_filtered(
             } else {
                 let child_info = match repo.odb().read_info(&entry.oid) {
                     Ok(info) => info,
-                    Err(Error::ObjectNotFound(_) | Error::PromisedObjectMissing(_))
-                        if missing_action != MissingAction::Error =>
-                    {
+                    Err(
+                        Error::Object(ObjectError::NotFound { .. })
+                        | Error::Object(ObjectError::PromisedMissing { .. }),
+                    ) if missing_action != MissingAction::Error => {
                         if missing_action.reports_missing() && missing_seen.insert(entry.oid) {
                             missing.push(entry.oid);
                         }
@@ -10147,9 +9849,10 @@ fn collect_root_object(
 
     let object = match repo.odb().read(&root.oid) {
         Ok(object) => object,
-        Err(Error::ObjectNotFound(_) | Error::PromisedObjectMissing(_))
-            if missing_action != MissingAction::Error =>
-        {
+        Err(
+            Error::Object(ObjectError::NotFound { .. })
+            | Error::Object(ObjectError::PromisedMissing { .. }),
+        ) if missing_action != MissingAction::Error => {
             if missing_action.reports_missing() && missing_seen.insert(root.oid) {
                 missing.push(root.oid);
             }
@@ -10316,10 +10019,12 @@ fn collect_root_object(
             let tag = parse_tag(&object.data)?;
             let expected_kind =
                 ExpectedObjectKind::from_tag_type(&tag.object_type).ok_or_else(|| {
-                    Error::CorruptObject(format!(
-                        "object {} has unsupported tag type '{}'",
-                        root.input, tag.object_type
-                    ))
+                    Error::Object(ObjectError::Corrupt {
+                        detail: format!(
+                            "object {} has unsupported tag type '{}'",
+                            root.input, tag.object_type
+                        ),
+                    })
                 })?;
             let nested = RootObject {
                 oid: tag.object,
@@ -10388,9 +10093,10 @@ fn collect_reachable_objects_in_commit_order(
     for &commit_oid in commits {
         let commit = match load_commit(repo, commit_oid) {
             Ok(commit) => commit,
-            Err(Error::ObjectNotFound(_) | Error::PromisedObjectMissing(_))
-                if missing_action != MissingAction::Error =>
-            {
+            Err(
+                Error::Object(ObjectError::NotFound { .. })
+                | Error::Object(ObjectError::PromisedMissing { .. }),
+            ) if missing_action != MissingAction::Error => {
                 if missing_action.reports_missing() && missing_seen.insert(commit_oid) {
                     missing.push(commit_oid);
                 }
@@ -10500,7 +10206,7 @@ fn flatten_tree_with_mode(
         };
         let child_info = match repo.odb().read_info(&entry.oid) {
             Ok(info) => info,
-            Err(Error::ObjectNotFound(_)) => continue,
+            Err(Error::Object(ObjectError::NotFound { .. })) => continue,
             Err(err) => return Err(err),
         };
         if child_info.kind == ObjectKind::Tree {
@@ -10515,51 +10221,37 @@ fn flatten_tree_with_mode(
     Ok(result)
 }
 
-/// Compute merge bases between two commits.
-pub fn merge_bases(
-    repo: &Repository,
-    a: ObjectId,
-    b: ObjectId,
-    first_parent_only: bool,
-) -> Result<Vec<ObjectId>> {
-    let mut graph = CommitGraph::new(repo, first_parent_only);
-    let ancestors_a = walk_closure(&mut graph, &[a])?;
-    let ancestors_b = walk_closure(&mut graph, &[b])?;
-    let common: HashSet<ObjectId> = ancestors_a.intersection(&ancestors_b).copied().collect();
-    if common.is_empty() {
-        return Ok(Vec::new());
-    }
-    // Merge bases: common ancestors not dominated by other common ancestors
-    let mut bases = Vec::new();
-    for &c in &common {
-        let is_dominated = common.iter().any(|&other| {
-            if other == c {
-                return false;
-            }
-            let other_anc = walk_closure(&mut graph, &[other]).unwrap_or_default();
-            other_anc.contains(&c)
-        });
-        if !is_dominated {
-            bases.push(c);
-        }
-    }
-    if bases.is_empty() {
-        let mut sorted: Vec<_> = common.into_iter().collect();
-        sorted.sort_by_key(|b| std::cmp::Reverse(graph.committer_time(*b)));
-        bases.push(sorted[0]);
-    }
-    Ok(bases)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::environment::RepositoryOptions;
+    use crate::error::RevisionError;
     use crate::objects::ObjectKind;
 
     use crate::repo::{InitOptions, Repository};
 
     use tempfile::{tempdir, TempDir};
+
+    #[test]
+    fn map_commit_chunks_in_parallel_keeps_commit_order() {
+        let commits: Vec<ObjectId> = (0..=255u8)
+            .map(|b| ObjectId::from_bytes(&[b; 20]).expect("oid"))
+            .collect();
+        for min_per_thread in [1, 16, 100, 1000] {
+            let chunk_lens = std::sync::Mutex::new(Vec::new());
+            let mapped = map_commit_chunks_in_parallel(&commits, min_per_thread, |part| {
+                chunk_lens
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(part.len());
+                part.to_vec()
+            });
+            assert_eq!(mapped, commits, "min_per_thread {min_per_thread}");
+            let chunk_lens = chunk_lens.into_inner().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(chunk_lens.iter().sum::<usize>(), commits.len());
+            assert!(chunk_lens.len() <= (commits.len() / min_per_thread).max(1));
+        }
+    }
 
     #[test]
     fn object_filter_parse_success_variants() {
@@ -10591,6 +10283,24 @@ mod tests {
     }
 
     #[test]
+    fn plain_commit_walk_rejects_object_filter_for_streaming() {
+        let base = RevListOptions::default();
+        assert!(plain_commit_walk(&base, false));
+        assert!(can_use_bounded_limit_list(&base));
+
+        let mut with_sparse = RevListOptions::default();
+        with_sparse.filter = Some(ObjectFilter::SparseOid("deadbeef:path".into()));
+        assert!(
+            !plain_commit_walk(&with_sparse, false),
+            "object filters need the full rev-list engine"
+        );
+        assert!(
+            !can_use_bounded_limit_list(&with_sparse),
+            "unlimited default must not stream when --filter is set"
+        );
+    }
+
+    #[test]
     fn object_filter_merge_and_includes() {
         let a = ObjectFilter::BlobNone;
         let b = ObjectFilter::TreeDepth(2);
@@ -10618,14 +10328,10 @@ mod tests {
     }
 
     #[test]
-    fn split_revision_token_and_symmetric_diff() {
+    fn split_revision_token_two_dot_range() {
         let (pos, neg) = split_revision_token("main..feature");
         assert_eq!(pos, vec!["feature".to_owned()]);
         assert_eq!(neg, vec!["main".to_owned()]);
-        assert!(is_symmetric_diff("a...b"));
-        let pair = split_symmetric_diff("left...right").expect("sym");
-        assert_eq!(pair.0, "left");
-        assert_eq!(pair.1, "right");
     }
 
     fn minimal_repo() -> (TempDir, Repository) {
@@ -10640,6 +10346,43 @@ mod tests {
         .expect("init");
         let repo = Repository::open(tmp.path(), &RepositoryOptions::empty()).expect("open");
         (tmp, repo)
+    }
+
+    #[test]
+    fn graph_walk_populates_log_graph_linkage() -> Result<()> {
+        let (_tmp, repo) = minimal_repo();
+        let blob = repo.odb().write(ObjectKind::Blob, b"p\n")?;
+        let mut tree_bytes = format!("100644 f\0").into_bytes();
+        tree_bytes.extend_from_slice(blob.as_bytes());
+        let tree = repo.odb().write(ObjectKind::Tree, &tree_bytes)?;
+        let ident = "A <a@b> 1 +0000";
+        let root_commit = repo.odb().write(
+            ObjectKind::Commit,
+            format!("tree {tree}\nauthor {ident}\ncommitter {ident}\n\nroot\n").as_bytes(),
+        )?;
+        let tip = repo.odb().write(
+            ObjectKind::Commit,
+            format!(
+                "tree {tree}\nparent {root_commit}\nauthor {ident}\ncommitter {ident}\n\ntip\n"
+            )
+            .as_bytes(),
+        )?;
+        std::fs::write(repo.git_dir().join("refs/heads/main"), format!("{tip}\n"))?;
+        let opts = RevListOptions {
+            ordering: OrderingMode::Topo,
+            preserve_simplify_merges_graph_merges: true,
+            ..RevListOptions::default()
+        };
+        let out = rev_list(&repo, &[String::from("main")], &[], &opts)?;
+        let linkage = out.log_graph_linkage.expect("linkage");
+        assert_eq!(out.commits.len(), 2);
+        for oid in &out.commits {
+            assert!(linkage.parents.contains_key(oid));
+            assert!(linkage.subjects.contains_key(oid));
+        }
+        assert_eq!(linkage.parents[&tip], vec![root_commit]);
+        assert_eq!(linkage.parents[&root_commit], Vec::<ObjectId>::new());
+        Ok(())
     }
 
     #[test]
@@ -10661,13 +10404,13 @@ mod tests {
             .expect_err("no-walk");
         assert!(matches!(
             err,
-            Error::RevList(RevListError::InvalidNoWalkArgument)
+            Error::Revision(RevisionError::List(RevListError::InvalidNoWalkArgument))
         ));
         let err = collect_revision_specs_from_stdin_lines(&repo, &[], &["--not-a-real-flag"])
             .expect_err("bad opt");
         assert!(matches!(
             err,
-            Error::RevList(RevListError::InvalidStdinOption { .. })
+            Error::Revision(RevisionError::List(RevListError::InvalidStdinOption { .. }))
         ));
     }
 
@@ -10685,28 +10428,6 @@ mod tests {
         assert!(ObjectFilter::parse("combine:tree:+1").is_err());
         let merged = ObjectFilter::BlobNone.merge_with(ObjectFilter::TreeDepth(1));
         assert!(matches!(merged, ObjectFilter::Combine(_)));
-    }
-
-    #[test]
-    fn symmetric_diff_helpers() {
-        assert!(!is_symmetric_diff("a..b"));
-        assert!(is_symmetric_diff("a...b"));
-        assert!(split_symmetric_diff("not-symmetric").is_none());
-    }
-
-    #[test]
-    fn wants_parent_rewrite_from_output_mode() {
-        let parents = RevListOptions {
-            output_mode: OutputMode::Parents,
-            ..RevListOptions::default()
-        };
-        assert!(parents.wants_parent_rewrite());
-        let format_p = RevListOptions {
-            output_mode: OutputMode::Format("format:%h %P".to_owned()),
-            ..RevListOptions::default()
-        };
-        assert!(format_p.wants_parent_rewrite());
-        assert!(!RevListOptions::default().wants_parent_rewrite());
     }
 
     #[test]
@@ -10743,15 +10464,6 @@ mod tests {
         ] {
             assert!(!is_unexpanded_symmetric_range(spec), "{spec}");
         }
-    }
-
-    #[test]
-    fn symmetric_diff_token_detection() {
-        assert!(is_symmetric_diff("main...feature"));
-        assert!(!is_symmetric_diff("main..feature"));
-        let (l, r) = split_symmetric_diff("a...b").expect("split");
-        assert_eq!(l, "a");
-        assert_eq!(r, "b");
     }
 
     #[test]
@@ -10821,6 +10533,33 @@ mod tests {
         );
     }
 
+    /// Commits and objects `rev_list --objects --all [--filter]` reports, as a sorted set.
+    fn reachable_object_ids(
+        repo: &Repository,
+        filter: Option<&ObjectFilter>,
+        filter_provided_objects: bool,
+    ) -> Result<Vec<ObjectId>> {
+        let opts = RevListOptions {
+            all_refs: true,
+            objects: true,
+            no_object_names: true,
+            quiet: true,
+            filter: filter.cloned(),
+            filter_provided_objects,
+            ..Default::default()
+        };
+        let result = rev_list(repo, &[], &[], &opts)?;
+        let mut set: BTreeSet<ObjectId> = result
+            .commits
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| result.objects_print_commit.get(*i).copied().unwrap_or(true))
+            .map(|(_, oid)| *oid)
+            .collect();
+        set.extend(result.objects.iter().map(|(oid, _)| *oid));
+        Ok(set.into_iter().collect())
+    }
+
     #[test]
     fn reachable_object_ids_respects_blob_none_filter() {
         let dir = tempdir().expect("tempdir");
@@ -10848,8 +10587,8 @@ mod tests {
             .expect("commit");
         crate::refs::write_ref(&repo.git_dir(), "refs/heads/main", &commit).expect("ref");
         let _ = blob;
-        let ids = reachable_object_ids_for_cat_file(&repo, Some(&ObjectFilter::BlobNone), false)
-            .expect("reachable");
+        let ids =
+            reachable_object_ids(&repo, Some(&ObjectFilter::BlobNone), false).expect("reachable");
         assert!(ids.contains(&commit));
         assert!(ids.contains(&tree));
         assert!(!ids.iter().any(|id| *id == blob));
@@ -10938,7 +10677,7 @@ mod tests {
             .expect("commit");
         crate::refs::write_ref(&repo.git_dir(), "refs/heads/main", &commit).expect("ref");
         let filter = ObjectFilter::BlobNone;
-        let ids = object_ids_for_cat_file_filtered(&repo, &filter).expect("filtered");
+        let ids = reachable_object_ids(&repo, Some(&filter), true).expect("filtered");
         assert!(ids.contains(&commit));
         assert!(!ids.contains(&blob));
     }
@@ -10998,113 +10737,6 @@ mod tests {
     }
 
     #[test]
-    fn render_commit_output_modes() {
-        let (_dir, repo, _base, tip) = unit_test_repo_with_merge();
-        let oid_line = render_commit(&repo, tip, &OutputMode::OidOnly, 7).expect("oid");
-        assert_eq!(oid_line, tip.to_hex());
-        let parents = render_commit(&repo, tip, &OutputMode::Parents, 7).expect("parents");
-        assert!(parents.starts_with(&tip.to_hex()));
-        assert_eq!(parents.matches(' ').count(), 2);
-
-        for fmt in ["oneline", "short", "medium"] {
-            let out = render_commit(&repo, tip, &OutputMode::Format(fmt.to_owned()), 7).expect(fmt);
-            assert!(!out.is_empty());
-        }
-
-        let custom = render_commit_with_color(
-            &repo,
-            tip,
-            &OutputMode::Format("format:%<(10,trunc)h %s".to_owned()),
-            7,
-            false,
-        )
-        .expect("custom");
-        assert!(custom.contains("merge") || custom.contains(".."));
-
-        let placeholders = render_commit(
-            &repo,
-            tip,
-            &OutputMode::Format(
-                "format:%H%n%h%n%T%n%t%n%P%n%p%n%an %ae%n%at%n%cn%n%s%n%b".to_owned(),
-            ),
-            12,
-        )
-        .expect("placeholders");
-        assert!(placeholders.lines().count() >= 5);
-
-        let dates = render_commit(
-            &repo,
-            tip,
-            &OutputMode::Format("format:%ad %cd %as %cs %ai %ci %ar %cr %x0a".to_owned()),
-            12,
-        )
-        .expect("dates");
-        assert!(!dates.is_empty());
-
-        let colored = render_commit_with_color(
-            &repo,
-            tip,
-            &OutputMode::Format("format:%Cred%h%Creset %<(8)%s".to_owned()),
-            7,
-            true,
-        )
-        .expect("color");
-        assert!(colored.contains('\x1b') || colored.contains(&tip.to_hex()[..7]));
-
-        let mega = render_commit_with_color(
-            &repo,
-            tip,
-            &OutputMode::Format(
-                "tformat:%w(78,9)%+s%-b%G?%GS%GK%GF%GP%GT%GG%d%D%e%gD%>(10,trunc)h%><(15,mtrunc)s %aI %cI %x20"
-                    .to_owned(),
-            ),
-            10,
-            true,
-        )
-        .expect("mega format");
-        assert!(!mega.is_empty());
-    }
-
-    #[test]
-    fn select_bisect_commits_ranks_linear_history() {
-        let dir = tempdir().expect("tempdir");
-        Repository::init(
-            dir.path(),
-            &InitOptions {
-                bare: true,
-
-                ref_storage: crate::RefStorageFormat::Files,
-                ..InitOptions::default()
-            },
-        )
-        .expect("init");
-        let repo = Repository::open(dir.path(), &RepositoryOptions::empty()).expect("open");
-        let ident = "T <t@e.com> 1 +0000";
-        let tree = repo.odb().write(ObjectKind::Tree, b"").expect("tree");
-        let mut parent: Option<ObjectId> = None;
-        let mut tips = Vec::new();
-        for i in 0..5 {
-            let mut body = format!("tree {tree}\n");
-            if let Some(p) = parent {
-                body.push_str(&format!("parent {p}\n"));
-            }
-            body.push_str(&format!("author {ident}\ncommitter {ident}\n\nc{i}\n"));
-            let oid = repo
-                .odb()
-                .write(ObjectKind::Commit, body.as_bytes())
-                .expect("c");
-            parent = Some(oid);
-            tips.push(oid);
-        }
-        let empty = select_bisect_commits(&repo, &[], false).expect("empty");
-        assert!(empty.best.is_none());
-        let sel = select_bisect_commits(&repo, &tips, false).expect("bisect");
-        assert_eq!(sel.total, tips.len());
-        assert!(sel.best.is_some());
-        assert_eq!(sel.all.len(), tips.len());
-    }
-
-    #[test]
     fn rev_list_maximal_simplify_merges_and_parents() {
         let (_dir, repo, base, tip) = unit_test_repo_with_merge();
         let all = rev_list(
@@ -11146,7 +10778,6 @@ mod tests {
             &[String::from("main")],
             &[],
             &RevListOptions {
-                output_mode: OutputMode::Parents,
                 parent_rewrite: true,
                 ..RevListOptions::default()
             },
@@ -11158,7 +10789,8 @@ mod tests {
     #[test]
     fn resolve_revision_commits_and_split_tokens() {
         let (_dir, repo, _, tip) = unit_test_repo_with_merge();
-        let resolved = resolve_revision_commits(&repo, &[String::from("main")]).expect("resolve");
+        let resolved =
+            resolve_revision_specs_to_commits(&repo, &[String::from("main")]).expect("resolve");
         assert!(resolved.contains(&tip));
         let (pos, neg) = split_revision_token("HEAD^..HEAD");
         assert!(!pos.is_empty());
@@ -11193,7 +10825,7 @@ mod tests {
         crate::refs::write_ref(&repo.git_dir(), "refs/heads/main", &commit).expect("ref");
         let _ = blob;
         let filter = ObjectFilter::parse("combine:blob%3Alimit%3D5+tree%3A1").expect("combine");
-        let ids = object_ids_for_cat_file_filtered(&repo, &filter).expect("ids");
+        let ids = reachable_object_ids(&repo, Some(&filter), true).expect("ids");
         assert!(!ids.is_empty());
         let _ = commit;
         assert_eq!(
@@ -11201,11 +10833,552 @@ mod tests {
             format!("blob:limit={}", 1024 * 1024)
         );
     }
+
+    fn write_commit_on_tree(
+        repo: &Repository,
+        parent: Option<ObjectId>,
+        tree: ObjectId,
+        msg: &str,
+        time: i64,
+    ) -> Result<ObjectId> {
+        let mut body = format!("tree {tree}\n");
+        if let Some(p) = parent {
+            body.push_str(&format!("parent {p}\n"));
+        }
+        body.push_str(&format!(
+            "author T <t@e.com> {time} +0000\ncommitter T <t@e.com> {time} +0000\n\n{msg}\n"
+        ));
+        repo.odb()
+            .write_loose_materialize(ObjectKind::Commit, body.as_bytes())
+    }
+
+    /// Long history below the hide tip, short range above it, path only on HEAD.
+    fn seed_hide_chain_range_path_repo(
+        hidden_depth: usize,
+        range_depth: usize,
+    ) -> Result<(TempDir, Repository, ObjectId, ObjectId)> {
+        let dir = tempdir()?;
+        let (repo, _) = Repository::init(
+            dir.path(),
+            &InitOptions {
+                bare: true,
+                ..InitOptions::default()
+            },
+        )?;
+        let repo = Repository::open(dir.path(), &RepositoryOptions::empty())?;
+        let blob = repo
+            .odb()
+            .write_loose_materialize(ObjectKind::Blob, b"x\n")?;
+        let mut tree_body = format!("100644 tracked.txt\0").into_bytes();
+        tree_body.extend_from_slice(blob.as_bytes());
+        let path_tree = repo
+            .odb()
+            .write_loose_materialize(ObjectKind::Tree, &tree_body)?;
+        let empty_tree = repo.odb().write_loose_materialize(ObjectKind::Tree, b"")?;
+        let mut parent = None;
+        let mut t = 100i64;
+        for i in 0..hidden_depth {
+            parent = Some(write_commit_on_tree(
+                &repo,
+                parent,
+                empty_tree,
+                &format!("hidden {i}"),
+                t,
+            )?);
+            t += 1;
+        }
+        let hide = parent.expect("hide tip");
+        for i in 0..range_depth {
+            parent = Some(write_commit_on_tree(
+                &repo,
+                parent,
+                empty_tree,
+                &format!("range {i}"),
+                t,
+            )?);
+            t += 1;
+        }
+        let tip = write_commit_on_tree(&repo, parent, path_tree, "touch path", t)?;
+        crate::refs::write_ref(repo.git_dir(), "refs/heads/main", &tip)?;
+        Ok((dir, repo, hide, tip))
+    }
+
+    fn git_rev_list(repo_dir: &std::path::Path, args: &[&str]) -> Vec<ObjectId> {
+        let mut cmd = std::process::Command::new("git");
+        cmd.arg("-C").arg(repo_dir).arg("rev-list");
+        cmd.args(args);
+        let out = cmd.output().expect("git rev-list");
+        assert!(
+            out.status.success(),
+            "git rev-list failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(|line| line.parse().expect("oid"))
+            .collect()
+    }
+
+    /// Divergent `A..B` with a commit-graph: hide-side lazy paint must not treat the include
+    /// tip as hidden when it is not hide-reachable (Git oracle).
+    #[test]
+    fn bounded_range_path_limit_divergent_range_matches_git_with_commit_graph() -> Result<()> {
+        use crate::maintenance::{write_commit_graph, CommitGraphOptions};
+
+        let dir = tempdir()?;
+        let (repo, _) = Repository::init(
+            dir.path(),
+            &InitOptions {
+                bare: true,
+                ..InitOptions::default()
+            },
+        )?;
+        let repo = Repository::open(dir.path(), &RepositoryOptions::empty())?;
+        let empty = repo.odb().write_loose_materialize(ObjectKind::Tree, b"")?;
+        let root = write_commit_on_tree(&repo, None, empty, "root", 100)?;
+        let mut parent = root;
+        for i in 0..12 {
+            parent = write_commit_on_tree(
+                &repo,
+                Some(parent),
+                empty,
+                &format!("branch-a {i}"),
+                200 + i,
+            )?;
+        }
+        let hide = parent;
+        let blob = repo
+            .odb()
+            .write_loose_materialize(ObjectKind::Blob, b"watched\n")?;
+        let mut tree_body = b"100644 watched.txt\0".to_vec();
+        tree_body.extend_from_slice(blob.as_bytes());
+        let path_tree = repo
+            .odb()
+            .write_loose_materialize(ObjectKind::Tree, &tree_body)?;
+        let tip = write_commit_on_tree(&repo, Some(root), path_tree, "branch-b touch", 500)?;
+        crate::refs::write_ref(repo.git_dir(), "refs/heads/branch-a", &hide)?;
+        crate::refs::write_ref(repo.git_dir(), "refs/heads/branch-b", &tip)?;
+
+        let mut git_cg = std::process::Command::new("git");
+        git_cg.arg("-C").arg(dir.path()).args([
+            "commit-graph",
+            "write",
+            "--reachable",
+            "--changed-paths",
+        ]);
+        let cg_out = git_cg.output().expect("git commit-graph write");
+        assert!(
+            cg_out.status.success(),
+            "git commit-graph write: {}",
+            String::from_utf8_lossy(&cg_out.stderr)
+        );
+        write_commit_graph(&repo, &CommitGraphOptions::default())?;
+        let repo = Repository::open(dir.path(), &RepositoryOptions::empty())?;
+        let hide_predicate =
+            RangeWalkHide::try_for_dense_path_hide(&repo, &[tip], &[hide], true, false)?;
+        assert!(
+            hide_predicate.uses_lazy_hide(),
+            "commit-graph must rank commits reachable from refs"
+        );
+
+        let hide_hex = hide.to_hex();
+        let tip_hex = tip.to_hex();
+        let range = format!("{hide_hex}..{tip_hex}");
+        let expected = git_rev_list(
+            dir.path(),
+            &["-n", "1", range.as_str(), "--", "watched.txt"],
+        );
+        assert_eq!(expected, vec![tip], "git oracle");
+
+        let opts = RevListOptions {
+            max_count: Some(1),
+            paths: vec!["watched.txt".to_owned()],
+            use_commit_graph: true,
+            use_commit_graph_bloom: true,
+            commit_graph_read_changed_paths: true,
+            ..Default::default()
+        };
+        let result = rev_list(&repo, &[tip_hex], &[hide_hex], &opts)?;
+        assert_eq!(result.commits, expected);
+        Ok(())
+    }
+
+    /// Ranked merge `A..B` with unchanged `watched.txt`: Git emits nothing; grit must not
+    /// resurrect the excluded shared root after lazy hide expansion stops by generation.
+    #[test]
+    fn bounded_range_path_limit_merge_range_empty_matches_git_with_commit_graph() -> Result<()> {
+        use crate::maintenance::{write_commit_graph, CommitGraphOptions};
+
+        let dir = tempdir()?;
+        let (repo, _) = Repository::init(
+            dir.path(),
+            &InitOptions {
+                bare: true,
+                ..InitOptions::default()
+            },
+        )?;
+        let repo = Repository::open(dir.path(), &RepositoryOptions::empty())?;
+        let blob = repo
+            .odb()
+            .write_loose_materialize(ObjectKind::Blob, b"watched\n")?;
+        let mut tree_body = b"100644 watched.txt\0".to_vec();
+        tree_body.extend_from_slice(blob.as_bytes());
+        let path_tree = repo
+            .odb()
+            .write_loose_materialize(ObjectKind::Tree, &tree_body)?;
+        let root = write_commit_on_tree(&repo, None, path_tree, "root", 100)?;
+        let mut a_chain = vec![root];
+        for i in 0..12 {
+            let parent = *a_chain.last().expect("a chain");
+            let c = write_commit_on_tree(
+                &repo,
+                Some(parent),
+                path_tree,
+                &format!("branch-a {i}"),
+                200 + i,
+            )?;
+            a_chain.push(c);
+        }
+        let hide = *a_chain.last().expect("hide tip");
+        let mut c_tip = root;
+        for i in 0..11 {
+            c_tip = write_commit_on_tree(
+                &repo,
+                Some(c_tip),
+                path_tree,
+                &format!("branch-c {i}"),
+                300 + i,
+            )?;
+        }
+        let a_merge_parent = a_chain[a_chain.len() - 8];
+        let mut merge_body = format!("tree {path_tree}\nparent {c_tip}\nparent {a_merge_parent}\n");
+        merge_body.push_str(
+            "author T <t@e.com> 500 +0000\ncommitter T <t@e.com> 500 +0000\n\nmerge tip\n",
+        );
+        let tip = repo
+            .odb()
+            .write_loose_materialize(ObjectKind::Commit, merge_body.as_bytes())?;
+
+        crate::refs::write_ref(repo.git_dir(), "refs/heads/branch-a", &hide)?;
+        crate::refs::write_ref(repo.git_dir(), "refs/heads/branch-c", &c_tip)?;
+        crate::refs::write_ref(repo.git_dir(), "refs/heads/branch-b", &tip)?;
+
+        let mut git_cg = std::process::Command::new("git");
+        git_cg.arg("-C").arg(dir.path()).args([
+            "commit-graph",
+            "write",
+            "--reachable",
+            "--changed-paths",
+        ]);
+        let cg_out = git_cg.output().expect("git commit-graph write");
+        assert!(
+            cg_out.status.success(),
+            "git commit-graph write: {}",
+            String::from_utf8_lossy(&cg_out.stderr)
+        );
+        write_commit_graph(&repo, &CommitGraphOptions::default())?;
+        let repo = Repository::open(dir.path(), &RepositoryOptions::empty())?;
+        assert!(
+            RangeWalkHide::try_for_dense_path_hide(&repo, &[tip], &[hide], true, false)?
+                .uses_lazy_hide()
+        );
+
+        let hide_hex = hide.to_hex();
+        let tip_hex = tip.to_hex();
+        let range = format!("{hide_hex}..{tip_hex}");
+        let expected = git_rev_list(
+            dir.path(),
+            &["-n", "1", range.as_str(), "--", "watched.txt"],
+        );
+        assert!(
+            expected.is_empty(),
+            "git oracle should emit no path-visible commit in this merge range"
+        );
+
+        let opts = RevListOptions {
+            max_count: Some(1),
+            paths: vec!["watched.txt".to_owned()],
+            use_commit_graph: true,
+            use_commit_graph_bloom: true,
+            commit_graph_read_changed_paths: true,
+            ..Default::default()
+        };
+        let result = rev_list(&repo, &[tip_hex], &[hide_hex], &opts)?;
+        assert_eq!(result.commits, expected);
+        assert!(
+            !result.commits.contains(&root),
+            "excluded shared root must stay hidden"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_range_path_limit_lazy_hide_with_commit_graph() -> Result<()> {
+        use crate::maintenance::{write_commit_graph, CommitGraphOptions};
+
+        let (dir, repo, hide, tip) = seed_hide_chain_range_path_repo(300, 8)?;
+        write_commit_graph(&repo, &CommitGraphOptions::default())?;
+        let repo = Repository::open(dir.path(), &RepositoryOptions::empty())?;
+        let hide_predicate =
+            RangeWalkHide::try_for_dense_path_hide(&repo, &[tip], &[hide], true, false)?;
+        assert!(hide_predicate.uses_lazy_hide());
+        let opts = RevListOptions {
+            max_count: Some(1),
+            paths: vec!["tracked.txt".to_owned()],
+            use_commit_graph: true,
+            ..Default::default()
+        };
+        let result = rev_list(&repo, &[tip.to_hex()], &[hide.to_hex()], &opts)?;
+        assert_eq!(result.commits, vec![tip]);
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_range_path_limit_parent_lookups_stay_in_range() -> Result<()> {
+        use crate::maintenance::{write_commit_graph, CommitGraphOptions};
+        use crate::merge_base::intersect_walk_test_hooks::{
+            commit_parent_lookups, reset_commit_parent_lookups,
+        };
+
+        let (dir, repo, hide, tip) = seed_hide_chain_range_path_repo(300, 8)?;
+        write_commit_graph(&repo, &CommitGraphOptions::default())?;
+        let repo = Repository::open(dir.path(), &RepositoryOptions::empty())?;
+        let opts = RevListOptions {
+            max_count: Some(1),
+            paths: vec!["tracked.txt".to_owned()],
+            use_commit_graph: true,
+            ..Default::default()
+        };
+        reset_commit_parent_lookups();
+        let result = rev_list(&repo, &[tip.to_hex()], &[hide.to_hex()], &opts)?;
+        let lookups = commit_parent_lookups();
+        assert_eq!(result.commits, vec![tip]);
+        assert!(
+            lookups <= 96,
+            "bounded range+path walk did {lookups} parent lookups; expected on the order of the range, not the hidden chain"
+        );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod since_cutoff_frontier_tests {
+    use super::*;
+    use crate::merge_base::intersect_walk_test_hooks::{
+        commit_parent_lookups, reset_commit_parent_lookups,
+    };
+    use crate::objects::ObjectKind;
+    use crate::repo::{InitOptions, Repository};
+    use crate::RefStorageFormat;
+    use std::fs;
+    use tempfile::tempdir;
+
+    fn write_dated_chain(repo: &Repository, depth: usize) -> ObjectId {
+        const HOUR: i64 = 3_600;
+        let blob = repo.odb().write(ObjectKind::Blob, b"x\n").expect("blob");
+        let tree_body = format!("100644 f {}\0", blob.to_hex());
+        let tree = repo
+            .odb()
+            .write(ObjectKind::Tree, tree_body.as_bytes())
+            .expect("tree");
+        let mut parent: Option<ObjectId> = None;
+        let mut tip = None::<ObjectId>;
+        for i in 0..depth {
+            let t = 1_700_000_000 + i as i64 * HOUR;
+            let ident = format!("T <t@e.com> {t} +0000");
+            let mut body = format!("tree {tree}\n");
+            if let Some(p) = parent {
+                body.push_str(&format!("parent {p}\n"));
+            }
+            body.push_str(&format!("author {ident}\ncommitter {ident}\n\nc{i}\n"));
+            let oid = repo
+                .odb()
+                .write(ObjectKind::Commit, body.as_bytes())
+                .expect("commit");
+            tip = Some(oid);
+            parent = Some(oid);
+        }
+        tip.expect("chain tip")
+    }
+
+    #[test]
+    fn since_without_limit_stops_at_frontier_not_full_chain() -> Result<()> {
+        const DEPTH: usize = 800;
+        let dir = tempdir().map_err(Error::Io)?;
+        Repository::init(
+            dir.path(),
+            &InitOptions {
+                bare: true,
+                ref_storage: RefStorageFormat::Files,
+                ..InitOptions::default()
+            },
+        )
+        .expect("init");
+        let repo = Repository::open(dir.path(), &crate::environment::RepositoryOptions::empty())?;
+        let tip = write_dated_chain(&repo, DEPTH);
+        fs::write(repo.git_dir().join("refs/heads/main"), format!("{tip}\n"))?;
+
+        let since = 1_700_000_000 + (DEPTH as i64 - 1) * 3_600;
+        let opts = RevListOptions {
+            since_cutoff: Some(since),
+            count: true,
+            use_commit_graph: false,
+            ..RevListOptions::default()
+        };
+
+        reset_commit_parent_lookups();
+        let result = rev_list(&repo, &[String::from("main")], &[], &opts)?;
+        assert_eq!(result.commit_count(), 1);
+        let lookups = commit_parent_lookups();
+        assert!(
+            lookups < 64,
+            "expected frontier stop near tip, not full chain ({lookups} parent lookups for depth {DEPTH})"
+        );
+
+        reset_commit_parent_lookups();
+        let list_opts = RevListOptions {
+            since_cutoff: Some(since),
+            use_commit_graph: false,
+            ..RevListOptions::default()
+        };
+        let listed = rev_list(&repo, &[String::from("main")], &[], &list_opts)?;
+        assert_eq!(listed.commits.len(), 1);
+        assert_eq!(listed.commits[0], tip);
+        assert!(
+            commit_parent_lookups() < 64,
+            "list path should also stop at the since frontier"
+        );
+        Ok(())
+    }
+
+    fn git_rev_list_count(repo_dir: &std::path::Path, args: &[&str]) -> usize {
+        let mut cmd = std::process::Command::new("git");
+        cmd.arg("-C").arg(repo_dir).arg("rev-list").arg("--count");
+        cmd.args(args);
+        let out = cmd.output().expect("git rev-list --count");
+        assert!(
+            out.status.success(),
+            "git failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        std::str::from_utf8(&out.stdout)
+            .expect("utf8")
+            .trim()
+            .parse()
+            .expect("count")
+    }
+
+    fn write_dated_commit(
+        repo: &Repository,
+        parents: &[ObjectId],
+        msg: &str,
+        time: i64,
+    ) -> ObjectId {
+        let blob = repo.odb().write(ObjectKind::Blob, b"x\n").expect("blob");
+        let tree_body = format!("100644 f {}\0", blob.to_hex());
+        let tree = repo
+            .odb()
+            .write(ObjectKind::Tree, tree_body.as_bytes())
+            .expect("tree");
+        let ident = format!("T <t@e.com> {time} +0000");
+        let mut body = format!("tree {tree}\n");
+        for p in parents {
+            body.push_str(&format!("parent {p}\n"));
+        }
+        body.push_str(&format!("author {ident}\ncommitter {ident}\n\n{msg}\n"));
+        repo.odb()
+            .write(ObjectKind::Commit, body.as_bytes())
+            .expect("commit")
+    }
+
+    #[test]
+    fn since_with_parent_filters_and_skip_count_match_git() -> Result<()> {
+        let dir = tempdir().map_err(Error::Io)?;
+        Repository::init(
+            dir.path(),
+            &InitOptions {
+                bare: true,
+                ref_storage: RefStorageFormat::Files,
+                ..InitOptions::default()
+            },
+        )
+        .expect("init");
+        let repo = Repository::open(dir.path(), &crate::environment::RepositoryOptions::empty())?;
+        let root = write_dated_commit(&repo, &[], "root", 1_000_000_000);
+        let b = write_dated_commit(&repo, &[root], "b", 1_000_000_000);
+        let c = write_dated_commit(&repo, &[b], "c", 1_000_000_000);
+        let side = write_dated_commit(&repo, &[b], "side", 1_000_000_000);
+        let merge = write_dated_commit(&repo, &[c, side], "merge", 1_000_000_000);
+        let tip = write_dated_commit(&repo, &[merge], "tip", 2_000_000_000);
+        fs::write(repo.git_dir().join("refs/heads/main"), format!("{tip}\n"))?;
+
+        let since = 1_500_000_000i64;
+        let since_arg = format!("--since={since}");
+        for (git_args, opts) in [
+            (
+                vec!["--first-parent", since_arg.as_str(), "main"],
+                RevListOptions {
+                    first_parent: true,
+                    since_cutoff: Some(since),
+                    count: true,
+                    use_commit_graph: false,
+                    ..RevListOptions::default()
+                },
+            ),
+            (
+                vec!["--merges", since_arg.as_str(), "main"],
+                RevListOptions {
+                    min_parents: Some(2),
+                    since_cutoff: Some(since),
+                    count: true,
+                    use_commit_graph: false,
+                    ..RevListOptions::default()
+                },
+            ),
+        ] {
+            let expected = git_rev_list_count(dir.path(), &git_args);
+            let actual = rev_list(&repo, &[String::from("main")], &[], &opts)?.commit_count();
+            assert_eq!(actual, expected, "git args {git_args:?}");
+        }
+
+        let mut parent = root;
+        let mut chain_tip = root;
+        for i in 0..12 {
+            let t = 1_600_000_000 + i * 3_600;
+            chain_tip = write_dated_commit(&repo, &[parent], &format!("c{i}"), t);
+            parent = chain_tip;
+        }
+        fs::write(
+            repo.git_dir().join("refs/heads/main"),
+            format!("{chain_tip}\n"),
+        )?;
+        let chain_since = 1_590_000_000i64;
+        let chain_since_arg = format!("--since={chain_since}");
+        let expected =
+            git_rev_list_count(dir.path(), &["--skip=5", chain_since_arg.as_str(), "main"]);
+        let actual = rev_list(
+            &repo,
+            &[String::from("main")],
+            &[],
+            &RevListOptions {
+                skip: 5,
+                since_cutoff: Some(chain_since),
+                count: true,
+                use_commit_graph: false,
+                ..RevListOptions::default()
+            },
+        )?
+        .commit_count();
+        assert_eq!(actual, expected, "count with --skip and --since");
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod line_coverage_tests {
     use super::*;
+    use crate::error::RevisionError;
     use crate::objects::{serialize_commit, CommitData, ObjectKind};
     use crate::repo::{InitOptions, Repository};
     use crate::RefStorageFormat;
@@ -11316,15 +11489,8 @@ mod line_coverage_tests {
             OrderingMode::AuthorDateWalk,
             OrderingMode::AuthorDateTopo,
         ];
-        let output_modes = [
-            OutputMode::OidOnly,
-            OutputMode::Parents,
-            OutputMode::Format(String::from("oneline")),
-            OutputMode::Format(String::from("format:%H %P %s %ad %cd %D %d %gD")),
-            OutputMode::Format(String::from("tformat:%<(10,trunc)%h %<(20,mtrunc)%s")),
-        ];
         for ordering in orderings {
-            for output_mode in &output_modes {
+            for parent_rewrite in [false, true] {
                 for (full, simplify, sparse, fp) in
                     [(false, false, false, false), (true, true, true, true)]
                 {
@@ -11332,7 +11498,7 @@ mod line_coverage_tests {
                     deco.insert(tip);
                     let opts = RevListOptions {
                         ordering,
-                        output_mode: output_mode.clone(),
+                        parent_rewrite,
                         paths: vec!["tracked.txt".to_owned()],
                         full_history: full,
                         simplify_merges: simplify,
@@ -11378,8 +11544,8 @@ mod line_coverage_tests {
     }
 
     #[test]
-    fn shallow_graft_and_stdin_helpers() -> Result<()> {
-        let (_dir, repo, tip) = seed_repo(6, false);
+    fn shallow_boundary_and_stdin_helpers() -> Result<()> {
+        let (_dir, repo, _tip) = seed_repo(6, false);
         let commits = rev_list(
             &repo,
             &[String::from("main")],
@@ -11392,19 +11558,6 @@ mod line_coverage_tests {
         fs::write(repo.git_dir().join("shallow"), format!("{mid}\n")).expect("shallow");
         let borders = shallow_boundary_oids(&repo.git_dir());
         assert!(borders.contains(&mid));
-        let grafts = shallow_grafts_for_upload_pack_deepen(&repo, &[tip], &[], 2);
-        assert!(!grafts.is_empty() || commits.len() <= 2);
-        let grafts2 = shallow_grafts_for_upload_pack_deepen(&repo, &[tip], &[mid], 1);
-        let _ = grafts2;
-        let target = shallow_grafts_for_upload_pack_target_depth(&repo, &[tip], &[], 3);
-        let _ = target;
-        let since_grafts =
-            shallow_grafts_for_upload_pack_rev_list(&repo, &[tip], &[], Some(50), &[])?;
-        let _ = since_grafts;
-        let list_path = repo.git_dir().join("rev-list-input.txt");
-        fs::write(&list_path, format!("main\n^{}\n", commits[0].to_hex())).expect("list");
-        let lines = read_lines(&list_path)?;
-        assert_eq!(lines.len(), 2);
         let (_specs, _neg, _all, paths) = collect_revision_specs_from_stdin_lines(
             &repo,
             &[String::from("HEAD")],
@@ -11415,7 +11568,7 @@ mod line_coverage_tests {
     }
 
     #[test]
-    fn merge_bases_render_and_resolve_specs() -> Result<()> {
+    fn merge_bases_and_resolve_specs() -> Result<()> {
         let (_dir, repo, tip) = seed_repo(8, true);
         let all = rev_list(
             &repo,
@@ -11425,9 +11578,8 @@ mod line_coverage_tests {
         )?
         .commits;
         let base = all[all.len() / 2];
-        let bases = merge_bases(&repo, tip, base, false)?;
+        let bases = crate::merge_base::merge_bases_all(&repo, &[tip, base])?;
         assert!(!bases.is_empty());
-        let _ = merge_bases(&repo, tip, base, true)?;
         let resolved =
             resolve_revision_specs_to_commits(&repo, &["main".to_owned(), "side".to_owned()])?;
         assert!(!resolved.is_empty());
@@ -11442,33 +11594,15 @@ mod line_coverage_tests {
             },
         )?;
         assert!(quiet.reachable_commit_count.is_some() || !all.is_empty());
-        for mode in [
-            OutputMode::Format(String::from("format:%H%n%P%n%T%n%t")),
-            OutputMode::Format(String::from("format:%h %s %D")),
-        ] {
-            let _ = render_commit_with_color(&repo, tip, &mode, 12, true)?;
-        }
         Ok(())
     }
 
     #[test]
-    fn deep_linear_render_and_rev_list_objects() -> Result<()> {
-        let (_dir, repo, tip) = seed_repo(120, true);
-        let format_specs = [
-            "format:%H %h %T %t %P %p %an %ae %at %cn %ce %ct %s %b %N %G? %GS %GK %GF %GP %GT %GG %d %D %gD",
-            "format:%ad %cd %as %cs %ai %ci %ar %cr %aI %cI %aD %cD",
-            "tformat:%w(78,9)%+s%-b%>(10,trunc)h%><(15,mtrunc)s",
-            "format:%<(10,trunc)h %<(10,trunc)s",
-            "format:%C(auto)%h %C(bold)%s",
-        ];
-        for spec in format_specs {
-            let mode = OutputMode::Format(spec.to_owned());
-            let _ = render_commit(&repo, tip, &mode, 12)?;
-            let _ = render_commit_with_color(&repo, tip, &mode, 12, true)?;
-        }
+    fn deep_linear_resolve_and_rev_list_objects() -> Result<()> {
+        let (_dir, repo, _tip) = seed_repo(120, true);
         for n in 0..32 {
             let spec = format!("HEAD~{n}");
-            let _ = resolve_revision_commits(&repo, &[spec])?;
+            let _ = resolve_revision_specs_to_commits(&repo, &[spec])?;
         }
         for objects in [false, true] {
             for filter in [
@@ -11498,54 +11632,31 @@ mod line_coverage_tests {
     }
 
     #[test]
-    fn bisect_filters_and_cat_file_helpers() -> Result<()> {
-        use crate::ref_exclusions::RefExclusions;
+    fn filters_and_ref_helpers() -> Result<()> {
         let (_dir, repo, tip) = seed_repo(40, true);
-        let default_out = rev_list(
+        let err = rev_list(
             &repo,
-            &[String::from("main")],
+            &[String::from("main...side")],
             &[],
-            &RevListOptions::default(),
-        )?;
-        let _ = select_bisect_commits(&repo, &default_out.commits, false)?;
-        let _ = select_bisect_commits(&repo, &default_out.commits, true)?;
-        assert!(is_symmetric_diff("main...side"));
-        if let Some((left, right)) = split_symmetric_diff("main...side") {
-            let err = rev_list(
-                &repo,
-                &[format!("{left}...{right}")],
-                &[],
-                &RevListOptions {
-                    left_right: true,
-                    ..RevListOptions::default()
-                },
-            )
-            .expect_err("raw symmetric range");
-            assert!(matches!(
-                err,
-                Error::RevList(RevListError::UnexpandedSymmetricRange { ref spec }) if spec == "main...side"
-            ));
-        }
-        let _ = expand_object_filter_for_protocol("blob:limit=1k")
-            .map_err(|msg| Error::Message(msg))?;
+            &RevListOptions {
+                left_right: true,
+                ..RevListOptions::default()
+            },
+        )
+        .expect_err("raw symmetric range");
+        assert!(matches!(
+            err,
+            Error::Revision(RevisionError::List(RevListError::UnexpandedSymmetricRange { ref spec })) if spec == "main...side"
+        ));
+        assert_eq!(
+            expand_object_filter_for_protocol("blob:limit=1k").expect("valid filter"),
+            "blob:limit=1024"
+        );
         let _ = url_encode_object_filter_subspec("path:src/");
         let (pos, neg) = split_revision_token("main ^main~2 -- tracked.txt");
         assert!(!pos.is_empty());
         let _ = neg;
-        for oid in &default_out.commits {
-            let _ = commit_visible_for_dense_pathspecs(&repo, *oid, &["tracked.txt".to_owned()])?;
-        }
-        let filter = ObjectFilter::BlobLimit(512);
-        let _ = reachable_object_ids_for_cat_file(&repo, Some(&filter), true)?;
-        let _ = object_ids_for_cat_file_filtered(&repo, &filter)?;
         let _ = tag_targets(&repo)?;
-        let pairs = vec![
-            (String::from("refs/heads/main"), tip),
-            (String::from("refs/heads/side"), tip),
-        ];
-        let _ = commit_tips_from_named_refs(&repo, &pairs, &RefExclusions::default())?;
-        let (_pos, _neg, _all, _paths) =
-            collect_revision_specs_with_stdin(&repo, &[String::from("main")], false)?;
         let borders = shallow_borders_reachable_from_wants(&repo, &[tip]);
         let _ = borders;
         Ok(())
@@ -11639,7 +11750,6 @@ mod line_coverage_tests {
                     show_pulls: true,
                     exclude_first_parent_only: true,
                     parent_rewrite: true,
-                    output_mode: OutputMode::Parents,
                     paths: vec!["tracked.txt".to_owned()],
                     full_history: true,
                     sparse: true,
@@ -11692,26 +11802,16 @@ mod line_coverage_tests {
     }
 
     #[test]
-    fn deep_history_format_and_parent_rewrite() -> Result<()> {
-        let (_dir, repo, tip) = seed_repo(160, true);
-        let formats = [
-            "format:%H %P %T %t %p %s %D %d %gD %N %G? %GS %GK %GF %GP %GT %GG",
-            "format:%an %ae %at %cn %ce %ct %ad %cd %as %cs %ai %ci %ar %cr",
-            "tformat:%<(12,trunc)%h %<(30,mtrunc)%s %>(8,trunc)%an",
-        ];
-        for fmt in formats {
-            let mode = OutputMode::Format(fmt.to_owned());
-            let opts = RevListOptions {
-                output_mode: mode.clone(),
-                parent_rewrite: true,
-                objects: true,
-                ordering: OrderingMode::AuthorDateTopo,
-                ..RevListOptions::default()
-            };
-            let out = rev_list(&repo, &[String::from("main")], &[], &opts)?;
-            let _ = render_commit_with_color(&repo, tip, &mode, 12, true)?;
-            assert!(!out.commits.is_empty());
-        }
+    fn deep_history_parent_rewrite() -> Result<()> {
+        let (_dir, repo, _tip) = seed_repo(160, true);
+        let opts = RevListOptions {
+            parent_rewrite: true,
+            objects: true,
+            ordering: OrderingMode::AuthorDateTopo,
+            ..RevListOptions::default()
+        };
+        let out = rev_list(&repo, &[String::from("main")], &[], &opts)?;
+        assert!(!out.commits.is_empty());
         Ok(())
     }
 
@@ -11793,13 +11893,15 @@ mod line_coverage_tests {
             .expect("tag");
         fs::write(repo.git_dir().join("refs/heads/main"), format!("{tip}\n")).expect("main");
         fs::write(repo.git_dir().join("refs/tags/v1"), format!("{tag}\n")).expect("tag ref");
-        let _ = resolve_object_walk_roots(
+        let _ = resolve_specs_for_objects_with_options(
             &repo,
             &[
                 String::from("main^{tree}"),
                 String::from("refs/tags/v1"),
                 String::from("main^{commit}"),
             ],
+            false,
+            MissingAction::Error,
         )?;
         let opts = RevListOptions {
             objects: true,
@@ -12237,7 +12339,12 @@ mod line_coverage_tests {
             let _ = rev_list(&repo, &[String::from("main")], &[], &opts)?;
         }
 
-        repack_all(&repo, &RepackOptions::default())?;
+        repack_all(
+            &repo,
+            &RepackOptions::default(),
+            &mut crate::progress::NullProgress,
+            &crate::progress::CancelToken::never(),
+        )?;
         let pack_dir = repo.git_dir().join("objects/pack");
         if let Ok(read) = fs::read_dir(&pack_dir) {
             for entry in read.flatten() {
@@ -12351,7 +12458,7 @@ mod line_coverage_tests {
             },
         )
         .expect_err("unsupported tag type");
-        assert!(matches!(err, Error::CorruptObject(_)));
+        assert!(matches!(err, Error::Object(ObjectError::Corrupt { .. })));
 
         Ok(())
     }
@@ -12437,56 +12544,6 @@ mod line_coverage_tests {
     }
 
     #[test]
-    fn expected_parsed_commits_adds_frontier_and_caps() {
-        assert_eq!(expected_parsed_commits(0), 0);
-        assert_eq!(expected_parsed_commits(101), 126);
-        assert_eq!(expected_parsed_commits(1 << 20), 1 << 16);
-        assert_eq!(expected_parsed_commits(usize::MAX), 1 << 16);
-    }
-
-    #[test]
-    fn retained_commits_answer_tree_and_author_time_without_reparsing() -> Result<()> {
-        use crate::hot_path_test_metrics::HotPathMetricsScope;
-
-        let (_dir, repo, tip) = seed_repo(6, true);
-        let metrics = repo.odb().hot_path_metrics_arc();
-        metrics.reset_commit_parse_calls();
-        metrics.set_commit_parse_counting(true);
-        let _scope = HotPathMetricsScope::install(metrics);
-
-        let mut graph = CommitGraph::new(&repo, false);
-        graph.retain_parsed_commits(4);
-        let parents = graph.parents_of(tip)?;
-        assert_eq!(parents.len(), 2, "seeded tip is a merge");
-        for &parent in &parents {
-            graph.parents_of(parent)?;
-        }
-        let parsed = repo.odb().hot_path_metrics().commit_parse_calls();
-        assert_eq!(parsed, 3, "tip and both parents are parsed once each");
-
-        let expected = load_commit(&repo, tip)?;
-        assert_eq!(graph.commit_tree(tip)?, expected.tree);
-        assert_eq!(
-            graph.author_time(tip),
-            committer_unix_seconds_for_ordering(&expected.author)
-        );
-        assert_eq!(
-            graph.committer_time(tip),
-            committer_unix_seconds_for_ordering(&expected.committer)
-        );
-        assert_eq!(
-            repo.odb().hot_path_metrics().commit_parse_calls(),
-            parsed + 1,
-            "only the reference load above parses again"
-        );
-
-        let retained = graph.take_retained_commits(&[tip]);
-        assert_eq!(retained.len(), 1);
-        assert_eq!(retained.get(&tip), Some(&expected));
-        Ok(())
-    }
-
-    #[test]
     fn bounded_filter_keeps_traversal_bytes_until_released() -> Result<()> {
         let (_dir, repo, tip) = seed_repo(4, false);
         let metrics = repo.odb().hot_path_metrics_arc();
@@ -12495,7 +12552,7 @@ mod line_coverage_tests {
         let _scope = crate::hot_path_test_metrics::HotPathMetricsScope::install(metrics.clone());
 
         let mut graph = CommitGraph::new(&repo, false);
-        graph.keep_unreleased_commit_bytes();
+        graph.keep_unreleased_commit_bytes(CommitExtent::Whole);
         let parents = graph.parents_of(tip)?;
         let opens = metrics.loose_path_open_attempts();
         assert!(opens > 0, "traversal must read the loose commit");
@@ -12540,7 +12597,10 @@ mod line_coverage_tests {
         let blob = repo
             .odb()
             .write_loose_materialize(ObjectKind::Blob, b"not a commit")?;
-        assert!(matches!(graph.commit_bytes(blob), Err(Error::RevList(_))));
+        assert!(matches!(
+            graph.commit_bytes(blob),
+            Err(Error::Revision(RevisionError::List(_)))
+        ));
         let unreleased = graph.unreleased_bytes.as_ref().expect("kept bytes");
         assert!(!unreleased.contains_key(&blob), "failed reads keep nothing");
         assert_eq!(graph.commit_bytes(tip)?, tip_bytes);
@@ -12774,7 +12834,9 @@ mod line_coverage_tests {
                 ..RevListOptions::default()
             },
         );
-        assert!(matches!(result, Err(Error::ObjectNotFound(oid)) if oid == missing.to_hex()));
+        assert!(
+            matches!(result, Err(Error::Object(ObjectError::NotFound { name: oid })) if oid == missing.to_hex())
+        );
         Ok(())
     }
 
@@ -12910,7 +12972,7 @@ mod line_coverage_tests {
         use crate::commit::encoding;
 
         let dir = tempdir().expect("tempdir");
-        let repo = Repository::init(
+        let (repo, _) = Repository::init(
             dir.path(),
             &InitOptions {
                 bare: true,

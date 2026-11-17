@@ -8,17 +8,16 @@ mod refs_harness;
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use grit_lib::remote::transfer::{fetch_local, FetchOptions, TagMode, UpdateMode};
+use grit_lib::remote::transfer::{FetchOptions, TagMode, UpdateMode};
 use grit_test_support::git;
 
 fn options(tags: TagMode) -> FetchOptions {
-    FetchOptions {
-        refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".into()],
-        tags,
-        remote_name: Some("origin".into()),
-        fetch_source: Some("fixture".into()),
-        ..Default::default()
-    }
+    let mut opts = FetchOptions::new();
+    opts.refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".into()];
+    opts.tags = tags;
+    opts.remote_name = Some("origin".into());
+    opts.fetch_source = Some("fixture".into());
+    opts
 }
 
 fn refs(repo: &Path, prefix: &str) -> BTreeMap<String, String> {
@@ -47,7 +46,21 @@ fn assert_parity(remote: &Path, client: &Path) {
 }
 
 fn assert_noop(remote: &Path, client: &Path, opts: &FetchOptions, heads: usize) {
-    let outcome = fetch_local(&client.join(".git"), remote, opts).unwrap();
+    let outcome = grit_lib::repo::Repository::open(
+        &client.join(".git"),
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Local(remote),
+        &mut opts.clone(),
+        &mut grit_lib::remote::fetch::NoProgress,
+        grit_lib::progress::CancelToken::never_ref(),
+    )
+    .unwrap();
     assert_eq!(outcome.transfer.objects, 0);
     assert_eq!(outcome.transfer.bytes, 0);
     assert_eq!(outcome.default_branch.as_deref(), Some("main"));
@@ -85,10 +98,8 @@ fn repeated_many_ref_fetches_preserve_refs_and_transfer_nothing() {
         &["update-ref", "--no-deref", "-d", "refs/remotes/origin/HEAD"],
     );
     std::fs::write(git_dir.join("FETCH_HEAD"), "stale\n").unwrap();
-    let explicit = FetchOptions {
-        refspecs: vec!["+refs/heads/main:refs/remotes/origin/main".into()],
-        ..options(TagMode::Following)
-    };
+    let mut explicit = options(TagMode::Following);
+    explicit.refspecs = vec!["+refs/heads/main:refs/remotes/origin/main".into()];
     assert_noop(&remote, &client, &explicit, 1);
     let fetch_head = std::fs::read_to_string(git_dir.join("FETCH_HEAD")).unwrap();
     assert!(fetch_head.contains(git(&remote, &["rev-parse", "HEAD"]).trim()));
@@ -114,8 +125,22 @@ fn repeated_many_ref_fetches_preserve_refs_and_transfer_nothing() {
             "refs/remotes/origin/team/0000",
         ],
     );
-    let opts = options(TagMode::All);
-    let outcome = fetch_local(&client.join(".git"), &remote, &opts).unwrap();
+    let mut opts = options(TagMode::All);
+    let outcome = grit_lib::repo::Repository::open(
+        &client.join(".git"),
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Local(&remote),
+        &mut opts.clone(),
+        &mut grit_lib::remote::fetch::NoProgress,
+        grit_lib::progress::CancelToken::never_ref(),
+    )
+    .unwrap();
     let symbolic = outcome
         .updates
         .iter()
@@ -139,7 +164,21 @@ fn repeated_many_ref_fetches_preserve_refs_and_transfer_nothing() {
     std::fs::write(seed.join("f"), "changed\n").unwrap();
     git(&seed, &["commit", "-qam", "change"]);
     git(&seed, &["push", "-q", "../remote.git", "main"]);
-    let outcome = fetch_local(&client.join(".git"), &remote, &opts).unwrap();
+    let outcome = grit_lib::repo::Repository::open(
+        &client.join(".git"),
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Local(&remote),
+        &mut opts.clone(),
+        &mut grit_lib::remote::fetch::NoProgress,
+        grit_lib::progress::CancelToken::never_ref(),
+    )
+    .unwrap();
     assert!(outcome.transfer.objects > 0);
     assert!(outcome
         .updates
@@ -148,12 +187,23 @@ fn repeated_many_ref_fetches_preserve_refs_and_transfer_nothing() {
     assert_noop(&remote, &client, &opts, 3001);
 
     git(&remote, &["update-ref", "-d", "refs/heads/team/2999"]);
-    let opts = FetchOptions {
-        prune: true,
-        tags: TagMode::Following,
-        ..opts
-    };
-    let outcome = fetch_local(&client.join(".git"), &remote, &opts).unwrap();
+    opts.prune = true;
+    opts.tags = TagMode::Following;
+    let outcome = grit_lib::repo::Repository::open(
+        &client.join(".git"),
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Local(&remote),
+        &mut opts.clone(),
+        &mut grit_lib::remote::fetch::NoProgress,
+        grit_lib::progress::CancelToken::never_ref(),
+    )
+    .unwrap();
     assert_eq!(
         outcome
             .updates
@@ -173,12 +223,24 @@ fn reftable_local_fetch_remains_fresh_after_prune() {
     }
     let tmp = tempfile::tempdir().unwrap();
     let (remote, client) = fixture::fixture(tmp.path(), 30, 20, true);
-    let opts = FetchOptions {
-        prune: true,
-        ..options(TagMode::All)
-    };
+    let mut opts = options(TagMode::All);
+    opts.prune = true;
     for _ in 0..2 {
-        let outcome = fetch_local(&client.join(".git"), &remote, &opts).unwrap();
+        let outcome = grit_lib::repo::Repository::open(
+            &client.join(".git"),
+            &grit_lib::config::environment::RepositoryOptions::with_environment(
+                (&opts).environment.clone(),
+            ),
+        )
+        .expect("open fetch target")
+        .remotes()
+        .fetch_from(
+            grit_lib::remote::transfer::TransferEndpoint::Local(&remote),
+            &mut opts.clone(),
+            &mut grit_lib::remote::fetch::NoProgress,
+            grit_lib::progress::CancelToken::never_ref(),
+        )
+        .unwrap();
         assert_eq!(outcome.transfer.objects, 0);
         assert!(outcome
             .updates
@@ -186,12 +248,40 @@ fn reftable_local_fetch_remains_fresh_after_prune() {
             .all(|u| u.mode == UpdateMode::UpToDate));
     }
     git(&remote, &["update-ref", "-d", "refs/heads/team/0029"]);
-    let outcome = fetch_local(&client.join(".git"), &remote, &opts).unwrap();
+    let outcome = grit_lib::repo::Repository::open(
+        &client.join(".git"),
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Local(&remote),
+        &mut opts.clone(),
+        &mut grit_lib::remote::fetch::NoProgress,
+        grit_lib::progress::CancelToken::never_ref(),
+    )
+    .unwrap();
     assert!(outcome
         .updates
         .iter()
         .any(|u| u.mode == UpdateMode::DeletedMissing));
-    let outcome = fetch_local(&client.join(".git"), &remote, &opts).unwrap();
+    let outcome = grit_lib::repo::Repository::open(
+        &client.join(".git"),
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Local(&remote),
+        &mut opts.clone(),
+        &mut grit_lib::remote::fetch::NoProgress,
+        grit_lib::progress::CancelToken::never_ref(),
+    )
+    .unwrap();
     assert!(outcome
         .updates
         .iter()
@@ -210,7 +300,21 @@ fn linked_worktree_fetch_resolves_shared_tracking_refs() {
     let linked = tmp.path().join("linked");
     let git_dir = git(&linked, &["rev-parse", "--absolute-git-dir"]);
     for tags in [TagMode::Following, TagMode::None, TagMode::All] {
-        let outcome = fetch_local(Path::new(git_dir.trim()), &remote, &options(tags)).unwrap();
+        let outcome = grit_lib::repo::Repository::open(
+            Path::new(git_dir.trim()),
+            &grit_lib::config::environment::RepositoryOptions::with_environment(
+                (&options(tags)).environment.clone(),
+            ),
+        )
+        .expect("open fetch target")
+        .remotes()
+        .fetch_from(
+            grit_lib::remote::transfer::TransferEndpoint::Local(&remote),
+            &mut options(tags).clone(),
+            &mut grit_lib::remote::fetch::NoProgress,
+            grit_lib::progress::CancelToken::never_ref(),
+        )
+        .unwrap();
         assert_eq!(outcome.transfer.objects, 0);
         assert!(outcome
             .updates

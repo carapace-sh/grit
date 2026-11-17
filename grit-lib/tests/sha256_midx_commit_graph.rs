@@ -4,19 +4,18 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use grit_lib::diff::bloom::BloomFilterSettings;
+use grit_lib::objects::commit_graph::BloomFilterSettings;
 use grit_lib::objects::commit_graph::CommitGraphChain;
 use grit_lib::objects::commit_graph::{
     build_commit_graph_bytes, collect_reachable_commit_oids, load_commit_graph_commit_info,
 };
 use grit_lib::objects::midx::{
-    read_midx_objects, try_read_object_via_midx, write_multi_pack_index_with_options,
-    WriteMultiPackIndexOptions,
+    read_midx_objects, try_read_object_via_midx, write_multi_pack_index, WriteMultiPackIndexOptions,
 };
 use grit_lib::objects::odb::{hash_algo_for_git_dir, hash_algo_for_objects_dir, Odb};
-use grit_lib::objects::pack::read_idx_object_ids;
 use grit_lib::objects::pack_rev::hashfile_checksum_valid;
 use grit_lib::objects::{HashAlgo, ObjectId, ObjectKind};
+use grit_lib::test_support::objects_pack::read_idx_object_ids;
 
 fn git(dir: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
@@ -137,7 +136,7 @@ fn grit_write_midx_with_rev(pack_dir: &Path) {
         version: Some(1),
         ..WriteMultiPackIndexOptions::default()
     };
-    write_multi_pack_index_with_options(pack_dir, &opts).expect("grit write MIDX");
+    write_multi_pack_index(pack_dir, &opts).expect("grit write MIDX");
 }
 
 #[test]
@@ -370,7 +369,7 @@ fn sha256_incremental_midx_read_objects() {
         version: Some(1),
         ..WriteMultiPackIndexOptions::default()
     };
-    write_multi_pack_index_with_options(&pack_dir, &opts).expect("incremental MIDX write");
+    write_multi_pack_index(&pack_dir, &opts).expect("incremental MIDX write");
     assert!(
         !pack_dir.join("multi-pack-index").exists(),
         "incremental write removes root MIDX"

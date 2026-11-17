@@ -35,11 +35,10 @@ use std::time::{Duration, Instant};
 
 use grit_lib::config::ConfigSet;
 use grit_lib::objects::ObjectId;
-use grit_lib::refs::resolve_ref;
-use grit_lib::remote::fetch::NoProgress;
+use grit_lib::progress::NullProgress;
 use grit_lib::remote::transfer::{FetchOptions, TagMode};
+use grit_lib::remote::transport::http::http_client_arc;
 use grit_lib::remote::transport::http::ureq_client::UreqHttpClient;
-use grit_lib::remote::transport::http::{http_client_arc, http_fetch};
 
 fn build_source(dir: &Path) {
     git(dir, &["init", "-q", "-b", "main", "."]);
@@ -160,11 +159,10 @@ fn setup(log_headers: Option<&Path>, set_cookie: Option<&str>) -> Option<Fixture
 }
 
 fn fetch_opts() -> FetchOptions {
-    FetchOptions {
-        refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()],
-        tags: TagMode::None,
-        ..Default::default()
-    }
+    let mut opts = FetchOptions::new();
+    opts.refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()];
+    opts.tags = TagMode::None;
+    opts
 }
 
 /// Read the server's `--log-headers` sink and return all logged lines.
@@ -206,15 +204,28 @@ fn cookie_file_sends_cookie_header_to_server() {
     let mut cfg = ConfigSet::new();
     cfg.add_command_override("http.cookieFile", cookie_file.to_str().unwrap())
         .unwrap();
-    let client = http_client_arc(UreqHttpClient::from_config(&cfg).expect("from_config"));
+    let client = http_client_arc(
+        UreqHttpClient::from_config(&cfg, &grit_lib::config::environment::Environment::empty())
+            .expect("from_config"),
+    );
 
     let mut opts = fetch_opts();
-    let outcome = http_fetch(
-        client.clone(),
+    let outcome = grit_lib::repo::Repository::open(
         &fx.local_git,
-        &fx.url,
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&mut opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Http {
+            client: client.clone(),
+            url: &fx.url,
+        },
         &mut opts,
-        &mut NoProgress,
+        &mut NullProgress,
+        grit_lib::progress::CancelToken::never_ref(),
     )
     .expect("http_fetch with cookie file");
     // The fetch really happened (ref landed) — so the headers we logged are from a
@@ -226,7 +237,10 @@ fn cookie_file_sends_cookie_header_to_server() {
             .any(|u| u.remote_ref == "refs/heads/main" && u.new_oid == Some(fx.main_oid)),
         "cookie fetch did not land origin/main"
     );
-    let got_main = resolve_ref(&fx.local_git, "refs/remotes/origin/main").expect("origin/main");
+    let got_main = grit_test_support::refs::at(&fx.local_git)
+        .references()
+        .resolve("refs/remotes/origin/main")
+        .expect("origin/main");
     assert_eq!(got_main, fx.main_oid);
 
     let logged = read_logged_headers(&log_path);
@@ -255,15 +269,28 @@ fn save_cookies_persists_set_cookie_to_file() {
         .unwrap();
     cfg.add_command_override("http.saveCookies", "true")
         .unwrap();
-    let client = http_client_arc(UreqHttpClient::from_config(&cfg).expect("from_config"));
+    let client = http_client_arc(
+        UreqHttpClient::from_config(&cfg, &grit_lib::config::environment::Environment::empty())
+            .expect("from_config"),
+    );
 
     let mut opts = fetch_opts();
-    http_fetch(
-        client.clone(),
+    grit_lib::repo::Repository::open(
         &fx.local_git,
-        &fx.url,
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&mut opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Http {
+            client: client.clone(),
+            url: &fx.url,
+        },
         &mut opts,
-        &mut NoProgress,
+        &mut NullProgress,
+        grit_lib::progress::CancelToken::never_ref(),
     )
     .expect("http_fetch with saveCookies");
 
@@ -287,15 +314,28 @@ fn extra_header_reaches_server() {
     let mut cfg = ConfigSet::new();
     cfg.add_command_override("http.extraHeader", "X-Grit-Test: wirevalue42")
         .unwrap();
-    let client = http_client_arc(UreqHttpClient::from_config(&cfg).expect("from_config"));
+    let client = http_client_arc(
+        UreqHttpClient::from_config(&cfg, &grit_lib::config::environment::Environment::empty())
+            .expect("from_config"),
+    );
 
     let mut opts = fetch_opts();
-    http_fetch(
-        client.clone(),
+    grit_lib::repo::Repository::open(
         &fx.local_git,
-        &fx.url,
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&mut opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Http {
+            client: client.clone(),
+            url: &fx.url,
+        },
         &mut opts,
-        &mut NoProgress,
+        &mut NullProgress,
+        grit_lib::progress::CancelToken::never_ref(),
     )
     .expect("http_fetch with extraHeader");
 
@@ -395,16 +435,28 @@ fn http_proxy_routes_fetch_through_proxy() {
     let mut cfg = ConfigSet::new();
     cfg.add_command_override("http.proxy", &format!("http://127.0.0.1:{proxy_port}"))
         .unwrap();
-    let client =
-        http_client_arc(UreqHttpClient::from_config(&cfg).expect("from_config with proxy"));
+    let client = http_client_arc(
+        UreqHttpClient::from_config(&cfg, &grit_lib::config::environment::Environment::empty())
+            .expect("from_config with proxy"),
+    );
 
     let mut opts = fetch_opts();
-    let outcome = match http_fetch(
-        client.clone(),
+    let outcome = match grit_lib::repo::Repository::open(
         &fx.local_git,
-        &fx.url,
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&mut opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Http {
+            client: client.clone(),
+            url: &fx.url,
+        },
         &mut opts,
-        &mut NoProgress,
+        &mut NullProgress,
+        grit_lib::progress::CancelToken::never_ref(),
     ) {
         Ok(o) => o,
         Err(e) => {
@@ -412,7 +464,10 @@ fn http_proxy_routes_fetch_through_proxy() {
             return;
         }
     };
-    let got_main = resolve_ref(&fx.local_git, "refs/remotes/origin/main").expect("origin/main");
+    let got_main = grit_test_support::refs::at(&fx.local_git)
+        .references()
+        .resolve("refs/remotes/origin/main")
+        .expect("origin/main");
     assert_eq!(got_main, fx.main_oid, "proxied fetch did not land the ref");
     assert!(
         outcome

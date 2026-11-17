@@ -4,10 +4,8 @@ use grit_test_support::rev_parse;
 use std::path::Path;
 use std::process::Command;
 
-use grit_lib::bundle::bundle_remote::{
-    write_bundle_from_rev_specs, write_bundle_with_options, BundleCreateOptions,
-};
-use grit_lib::bundle::{read_header, write_bundle, Bundle, BundleError, BundleSpec, FilterSpec};
+use grit_lib::bundle::bundle_remote::BundleCreateOptions;
+use grit_lib::bundle::{read_header, Bundle, BundleError, BundleSpec, FilterSpec};
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::objects::index_pack::{install_pack_bytes, IngestPackOptions};
 use grit_lib::objects::ObjectId;
@@ -71,15 +69,17 @@ fn grit_bundle_full_and_incremental_git_verify_clone_fsck() {
     let full_path = src.join("full.bundle");
     {
         let mut f = std::fs::File::create(&full_path).expect("create");
-        write_bundle(
-            &repo,
-            &BundleSpec {
-                include: vec![(c2, "refs/heads/main".to_owned())],
-                ..Default::default()
-            },
-            &mut f,
-        )
-        .expect("write full bundle");
+        repo.bundles()
+            .write_to(
+                &BundleSpec {
+                    include: vec![(c2, "refs/heads/main".to_owned())],
+                    ..Default::default()
+                },
+                &mut f,
+                &mut grit_lib::progress::NullProgress,
+                grit_lib::progress::CancelToken::never_ref(),
+            )
+            .expect("write full bundle");
     }
     git_ok(src, &["bundle", "verify", full_path.to_str().unwrap()]);
     let heads = git(src, &["bundle", "list-heads", full_path.to_str().unwrap()]);
@@ -100,16 +100,18 @@ fn grit_bundle_full_and_incremental_git_verify_clone_fsck() {
     let inc_path = src.join("inc.bundle");
     {
         let mut f = std::fs::File::create(&inc_path).expect("create");
-        write_bundle(
-            &repo,
-            &BundleSpec {
-                include: vec![(c2, "refs/heads/main".to_owned())],
-                exclude: vec![c1],
-                ..Default::default()
-            },
-            &mut f,
-        )
-        .expect("write incremental bundle");
+        repo.bundles()
+            .write_to(
+                &BundleSpec {
+                    include: vec![(c2, "refs/heads/main".to_owned())],
+                    exclude: vec![c1],
+                    ..Default::default()
+                },
+                &mut f,
+                &mut grit_lib::progress::NullProgress,
+                grit_lib::progress::CancelToken::never_ref(),
+            )
+            .expect("write incremental bundle");
     }
     git_ok(src, &["bundle", "verify", inc_path.to_str().unwrap()]);
     let heads_inc = git(src, &["bundle", "list-heads", inc_path.to_str().unwrap()]);
@@ -163,7 +165,14 @@ fn git_created_bundles_parse_verify_unbundle_fsck() {
     let bundle = Bundle::open(&full).expect("open git bundle");
     let report = bundle.verify(&bare).expect("verify");
     assert!(report.is_ok(), "full bundle should need no prerequisites");
-    let refs = bundle.unbundle(&bare).expect("unbundle");
+    let refs = bundle
+        .unbundle(
+            &bare,
+            &mut grit_lib::progress::NullProgress,
+            grit_lib::progress::CancelToken::never_ref(),
+        )
+        .map(|o| o.refs)
+        .expect("unbundle");
     for r in &refs {
         git_ok(consumer, &["update-ref", &r.name, &r.oid.to_hex()]);
     }
@@ -197,14 +206,43 @@ fn git_created_bundles_parse_verify_unbundle_fsck() {
     let err = report.into_result().unwrap_err();
     assert!(matches!(
         err,
-        BundleError::MissingPrerequisite { oid, .. } if oid == c1
+        BundleError::MissingPrerequisites { commits } if commits.iter().any(|(oid, _)| *oid == c1)
     ));
+
+    let bundle = Bundle::open(&inc).expect("open inc for unbundle");
+    let err = bundle
+        .unbundle(
+            &empty,
+            &mut grit_lib::progress::NullProgress,
+            grit_lib::progress::CancelToken::never_ref(),
+        )
+        .map(|o| o.refs)
+        .expect_err("unbundle without prerequisites");
+    assert!(matches!(
+        err,
+        BundleError::MissingPrerequisites { commits } if commits.iter().any(|(oid, _)| *oid == c1)
+    ));
+    let pack_dir = empty_git.path().join("objects/pack");
+    assert!(
+        !pack_dir.exists()
+            || std::fs::read_dir(&pack_dir)
+                .map(|mut d| d.next().is_none())
+                .unwrap_or(true),
+        "unbundle must not install pack files when prerequisites are missing"
+    );
 
     // Consumer already has the full object graph from the first unbundle; c1 is
     // reachable via refs/heads/main, so incremental verify/unbundle should succeed.
     let bundle = Bundle::open(&inc).expect("reopen");
     assert!(bundle.verify(&bare).expect("verify").is_ok());
-    let refs = bundle.unbundle(&bare).expect("unbundle");
+    let refs = bundle
+        .unbundle(
+            &bare,
+            &mut grit_lib::progress::NullProgress,
+            grit_lib::progress::CancelToken::never_ref(),
+        )
+        .map(|o| o.refs)
+        .expect("unbundle");
     assert!(refs.iter().any(|r| r.name == "refs/heads/main"));
     fsck_strict(consumer);
 }
@@ -229,7 +267,14 @@ fn git_full_bundle_unbundle_rejects_corrupt_pack_trailer() {
     );
     let bare = grit_repo(consumer.path());
     let bundle = Bundle::open(&corrupt).expect("open corrupt bundle");
-    let err = bundle.unbundle(&bare).expect_err("corrupt pack trailer");
+    let err = bundle
+        .unbundle(
+            &bare,
+            &mut grit_lib::progress::NullProgress,
+            grit_lib::progress::CancelToken::never_ref(),
+        )
+        .map(|o| o.refs)
+        .expect_err("corrupt pack trailer");
     let msg = err.to_string();
     assert!(
         msg.contains("checksum") || msg.contains("mismatch") || msg.contains("corrupt"),
@@ -279,7 +324,14 @@ fn git_v3_sha256_bundle_round_trips_when_supported() {
         grit_lib::objects::HashAlgo::Sha256
     );
     assert!(bundle.verify(&repo).expect("verify").is_ok());
-    let refs = bundle.unbundle(&repo).expect("unbundle");
+    let refs = bundle
+        .unbundle(
+            &repo,
+            &mut grit_lib::progress::NullProgress,
+            grit_lib::progress::CancelToken::never_ref(),
+        )
+        .map(|o| o.refs)
+        .expect("unbundle");
     for r in &refs {
         git_ok(consumer.path(), &["update-ref", &r.name, &r.oid.to_hex()]);
     }
@@ -321,7 +373,14 @@ fn git_v3_filter_bundle_unbundles_with_promisor_marker() {
     let repo = grit_repo(consumer.path());
     let bundle = Bundle::open(&bundle_path).expect("open");
     assert!(bundle.header().filter.is_some());
-    let refs = bundle.unbundle(&repo).expect("unbundle");
+    let refs = bundle
+        .unbundle(
+            &repo,
+            &mut grit_lib::progress::NullProgress,
+            grit_lib::progress::CancelToken::never_ref(),
+        )
+        .map(|o| o.refs)
+        .expect("unbundle");
     for r in &refs {
         git_ok(consumer.path(), &["update-ref", &r.name, &r.oid.to_hex()]);
     }
@@ -377,6 +436,279 @@ fn verify_prerequisites_not_connected_when_dangling() {
         report.into_result().unwrap_err(),
         BundleError::PrerequisitesNotConnected
     );
+
+    let git_verify = Command::new("git")
+        .current_dir(consumer.path())
+        .args(["bundle", "verify", inc.to_str().unwrap()])
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .output()
+        .expect("git bundle verify");
+    assert!(
+        !git_verify.status.success(),
+        "git should reject a lone commit prerequisite without its tree: {}",
+        String::from_utf8_lossy(&git_verify.stderr)
+    );
+}
+
+#[test]
+fn shallow_prerequisite_still_needs_complete_tree_git_parity() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let src = tmp.path();
+    let (c1, c2) = init_repo_with_two_commits(src);
+    let inc = src.join("inc.bundle");
+    git_ok(
+        src,
+        &[
+            "bundle",
+            "create",
+            inc.to_str().unwrap(),
+            &format!("{c1}..{c2}"),
+            "main",
+        ],
+    );
+
+    let consumer = tempfile::tempdir().expect("consumer");
+    git_ok(
+        consumer.path(),
+        &["init", "-q", "--bare", "-b", "main", "."],
+    );
+    let obj_path = src
+        .join(".git/objects")
+        .join(&c1.to_hex()[..2])
+        .join(&c1.to_hex()[2..]);
+    let dest_dir = consumer.path().join("objects").join(&c1.to_hex()[..2]);
+    std::fs::create_dir_all(&dest_dir).expect("dest dir");
+    std::fs::copy(&obj_path, dest_dir.join(&c1.to_hex()[2..])).expect("copy loose");
+    std::fs::write(
+        consumer.path().join("shallow"),
+        format!("{}\n", c1.to_hex()),
+    )
+    .expect("shallow");
+
+    let git_verify = Command::new("git")
+        .current_dir(consumer.path())
+        .args(["bundle", "verify", inc.to_str().unwrap()])
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .output()
+        .expect("git bundle verify");
+    assert!(
+        !git_verify.status.success(),
+        "git must reject incomplete prerequisite even when listed in shallow: {}",
+        String::from_utf8_lossy(&git_verify.stderr)
+    );
+
+    let repo = grit_repo(consumer.path());
+    let report = Bundle::open(&inc)
+        .expect("open")
+        .verify(&repo)
+        .expect("verify");
+    assert!(
+        report.prerequisites_not_connected,
+        "shallow must not bypass tree validation: {report:?}"
+    );
+    assert!(!report.is_ok());
+}
+
+fn copy_loose_object(src_git: &Path, dest_objects: &Path, oid: &ObjectId) {
+    let hex = oid.to_hex();
+    let obj_path = src_git.join("objects").join(&hex[..2]).join(&hex[2..]);
+    let dest_dir = dest_objects.join(&hex[..2]);
+    std::fs::create_dir_all(&dest_dir).expect("dest dir");
+    std::fs::copy(&obj_path, dest_dir.join(&hex[2..])).expect("copy loose");
+}
+
+fn commit_tree_oid(dir: &Path, commit: &ObjectId) -> ObjectId {
+    let out = git(dir, &["cat-file", "commit", "-p", &commit.to_hex()]);
+    let tree_hex = out
+        .lines()
+        .next()
+        .expect("commit header")
+        .strip_prefix("tree ")
+        .expect("tree line");
+    ObjectId::from_hex(tree_hex).expect("tree oid")
+}
+
+#[test]
+fn shallow_parent_of_prerequisite_needs_complete_tree_git_parity() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let src = tmp.path();
+    let (c1, c2) = init_repo_with_two_commits(src);
+    std::fs::write(src.join("c.txt"), b"three\n").unwrap();
+    git_ok(src, &["add", "c.txt"]);
+    git_ok(src, &["commit", "-q", "-m", "third"]);
+    let c3 = rev_parse(src, "HEAD");
+    let inc = src.join("inc.bundle");
+    git_ok(
+        src,
+        &[
+            "bundle",
+            "create",
+            inc.to_str().unwrap(),
+            &format!("{}..{}", c2.to_hex(), c3.to_hex()),
+        ],
+    );
+
+    let consumer = tempfile::tempdir().expect("consumer");
+    git_ok(
+        consumer.path(),
+        &["init", "-q", "--bare", "-b", "main", "."],
+    );
+    let c1_tree = commit_tree_oid(src, &c1);
+    let src_git = src.join(".git");
+    let dest_objects = consumer.path().join("objects");
+    for line in git(src, &["rev-list", "--objects", &c2.to_hex()]).lines() {
+        let hex = line.split_whitespace().next().expect("oid");
+        let oid = ObjectId::from_hex(hex).expect("parse oid");
+        if oid == c1_tree {
+            continue;
+        }
+        copy_loose_object(&src_git, &dest_objects, &oid);
+    }
+    std::fs::write(
+        consumer.path().join("shallow"),
+        format!("{}\n", c1.to_hex()),
+    )
+    .expect("shallow");
+
+    let git_verify = Command::new("git")
+        .current_dir(consumer.path())
+        .args(["bundle", "verify", inc.to_str().unwrap()])
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .output()
+        .expect("git bundle verify");
+    assert!(
+        !git_verify.status.success(),
+        "git must reject missing shallow-parent tree: {}",
+        String::from_utf8_lossy(&git_verify.stderr)
+    );
+
+    let repo = grit_repo(consumer.path());
+    let report = Bundle::open(&inc)
+        .expect("open")
+        .verify(&repo)
+        .expect("verify");
+    assert!(
+        report.prerequisites_not_connected,
+        "shallow parent with missing tree must fail: {report:?}"
+    );
+    assert!(!report.is_ok());
+}
+
+#[test]
+fn incremental_bundle_after_refless_full_unbundle() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let src = tmp.path();
+    let (c1, c2) = init_repo_with_two_commits(src);
+    let full = src.join("full.bundle");
+    git_ok(src, &["bundle", "create", full.to_str().unwrap(), "--all"]);
+    std::fs::write(src.join("c.txt"), b"three\n").unwrap();
+    git_ok(src, &["add", "c.txt"]);
+    git_ok(src, &["commit", "-q", "-m", "third"]);
+    let c3 = rev_parse(src, "HEAD");
+    git_ok(src, &["tag", "-a", "v1.1", "-m", "v1.1"]);
+    let inc = src.join("incr.bundle");
+    git_ok(
+        src,
+        &[
+            "bundle",
+            "create",
+            inc.to_str().unwrap(),
+            &format!("{c1}..{}", c3.to_hex()),
+            "main",
+        ],
+    );
+
+    let empty = tempfile::tempdir().expect("empty");
+    git_ok(empty.path(), &["init", "-q", "."]);
+    let repo = grit_repo(empty.path());
+    Bundle::open(&full)
+        .expect("open full")
+        .unbundle(
+            &repo,
+            &mut grit_lib::progress::NullProgress,
+            grit_lib::progress::CancelToken::never_ref(),
+        )
+        .expect("unbundle full");
+    assert!(
+        repo.odb().read(&c3).is_err(),
+        "full bundle must not include the third commit; incremental unbundle should add it"
+    );
+
+    git_ok(empty.path(), &["bundle", "verify", inc.to_str().unwrap()]);
+    let inc_bundle = Bundle::open(&inc).expect("open incr");
+    let report = inc_bundle.verify(&repo).expect("verify incr");
+    assert!(
+        report.is_ok(),
+        "dangling prerequisite graph should verify: {report:?}"
+    );
+    inc_bundle
+        .unbundle(
+            &repo,
+            &mut grit_lib::progress::NullProgress,
+            grit_lib::progress::CancelToken::never_ref(),
+        )
+        .expect("unbundle incr");
+    assert!(repo.odb().read(&c3).is_ok(), "new tip readable after incr");
+    git_ok(empty.path(), &["bundle", "verify", inc.to_str().unwrap()]);
+    git_ok(empty.path(), &["bundle", "unbundle", inc.to_str().unwrap()]);
+}
+
+#[test]
+fn prerequisites_reachable_from_any_ref_are_connected() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let src = tmp.path();
+    let (c1, c2) = init_repo_with_two_commits(src);
+    let inc = src.join("inc.bundle");
+    git_ok(
+        src,
+        &[
+            "bundle",
+            "create",
+            inc.to_str().unwrap(),
+            &format!("{c1}..{c2}"),
+            "main",
+        ],
+    );
+    git_ok(src, &["branch", "old", &c1.to_hex()]);
+
+    // The prerequisite is reachable only from a ref outside heads, tags
+    // and remotes, as `git bundle verify` accepts (it walks `--all`).
+    let consumer = tempfile::tempdir().expect("consumer");
+    git_ok(
+        consumer.path(),
+        &["init", "-q", "--bare", "-b", "main", "."],
+    );
+    git_ok(
+        consumer.path(),
+        &[
+            "fetch",
+            "-q",
+            src.to_str().unwrap(),
+            "refs/heads/old:refs/pull/1/head",
+        ],
+    );
+    git_ok(
+        consumer.path(),
+        &["bundle", "verify", inc.to_str().unwrap()],
+    );
+
+    let repo = grit_repo(consumer.path());
+    let bundle = Bundle::open(&inc).expect("open");
+    let report = bundle.verify(&repo).expect("verify");
+    assert!(report.is_ok(), "{report:?}");
+    let refs = bundle
+        .unbundle(
+            &repo,
+            &mut grit_lib::progress::NullProgress,
+            grit_lib::progress::CancelToken::never_ref(),
+        )
+        .map(|o| o.refs)
+        .expect("unbundle");
+    assert_eq!(refs.len(), 1);
+    assert_eq!(refs[0].oid, c2);
 }
 
 #[test]
@@ -416,16 +748,19 @@ fn unbundle_promisor_marks_installed_pack_not_preexisting() {
     let filtered = src.join("filtered.bundle");
     {
         let mut f = std::fs::File::create(&filtered).expect("create");
-        write_bundle(
-            &grit_repo(src),
-            &BundleSpec {
-                include: vec![(tip, "refs/heads/main".to_owned())],
-                filter: Some(FilterSpec::parse("blob:none").expect("filter")),
-                ..Default::default()
-            },
-            &mut f,
-        )
-        .expect("write filtered bundle");
+        grit_repo(src)
+            .bundles()
+            .write_to(
+                &BundleSpec {
+                    include: vec![(tip, "refs/heads/main".to_owned())],
+                    filter: Some(FilterSpec::parse("blob:none").expect("filter")),
+                    ..Default::default()
+                },
+                &mut f,
+                &mut grit_lib::progress::NullProgress,
+                grit_lib::progress::CancelToken::never_ref(),
+            )
+            .expect("write filtered bundle");
     }
 
     let before: std::collections::HashSet<_> =
@@ -439,7 +774,12 @@ fn unbundle_promisor_marks_installed_pack_not_preexisting() {
 
     Bundle::open(&filtered)
         .expect("open")
-        .unbundle(&bare)
+        .unbundle(
+            &bare,
+            &mut grit_lib::progress::NullProgress,
+            grit_lib::progress::CancelToken::never_ref(),
+        )
+        .map(|o| o.refs)
         .expect("unbundle");
 
     let packs: Vec<_> = std::fs::read_dir(consumer.path().join("objects/pack"))
@@ -472,16 +812,19 @@ fn grit_write_filtered_bundle_omits_blobs_from_pack() {
     let bundle_path = src.join("filtered-write.bundle");
     {
         let mut f = std::fs::File::create(&bundle_path).expect("create");
-        write_bundle(
-            &grit_repo(src),
-            &BundleSpec {
-                include: vec![(tip, "refs/heads/main".to_owned())],
-                filter: Some(FilterSpec::parse("blob:none").expect("filter")),
-                ..Default::default()
-            },
-            &mut f,
-        )
-        .expect("write");
+        grit_repo(src)
+            .bundles()
+            .write_to(
+                &BundleSpec {
+                    include: vec![(tip, "refs/heads/main".to_owned())],
+                    filter: Some(FilterSpec::parse("blob:none").expect("filter")),
+                    ..Default::default()
+                },
+                &mut f,
+                &mut grit_lib::progress::NullProgress,
+                grit_lib::progress::CancelToken::never_ref(),
+            )
+            .expect("write");
     }
     let bundle = Bundle::open(&bundle_path).expect("open");
     assert!(bundle.header().filter.is_some());
@@ -531,16 +874,19 @@ fn grit_write_filtered_bundle_with_prerequisites_holds_only_new_small_objects() 
     let bundle_path = src.join("incremental.bundle");
     {
         let mut f = std::fs::File::create(&bundle_path).expect("create");
-        write_bundle(
-            &grit_repo(src),
-            &BundleSpec {
-                include: vec![(tip, "refs/heads/main".to_owned())],
-                exclude: vec![base],
-                filter: Some(FilterSpec::parse("blob:limit=1024").expect("filter")),
-            },
-            &mut f,
-        )
-        .expect("write filtered bundle with a prerequisite");
+        grit_repo(src)
+            .bundles()
+            .write_to(
+                &BundleSpec {
+                    include: vec![(tip, "refs/heads/main".to_owned())],
+                    exclude: vec![base],
+                    filter: Some(FilterSpec::parse("blob:limit=1024").expect("filter")),
+                },
+                &mut f,
+                &mut grit_lib::progress::NullProgress,
+                grit_lib::progress::CancelToken::never_ref(),
+            )
+            .expect("write filtered bundle with a prerequisite");
     }
     let bundle = Bundle::open(&bundle_path).expect("open");
     assert!(bundle.header().filter.is_some());
@@ -606,16 +952,18 @@ fn grit_write_filtered_bundle_in_partial_clone_skips_promised_blobs() {
     let bundle_path = tmp.path().join("partial.bundle");
     {
         let mut f = std::fs::File::create(&bundle_path).expect("create");
-        write_bundle(
-            &repo,
-            &BundleSpec {
-                include: vec![(tip, "refs/heads/main".to_owned())],
-                filter: Some(FilterSpec::parse("blob:limit=1024").expect("filter")),
-                ..Default::default()
-            },
-            &mut f,
-        )
-        .expect("a filtered bundle needs no promised blob");
+        repo.bundles()
+            .write_to(
+                &BundleSpec {
+                    include: vec![(tip, "refs/heads/main".to_owned())],
+                    filter: Some(FilterSpec::parse("blob:limit=1024").expect("filter")),
+                    ..Default::default()
+                },
+                &mut f,
+                &mut grit_lib::progress::NullProgress,
+                grit_lib::progress::CancelToken::never_ref(),
+            )
+            .expect("a filtered bundle needs no promised blob");
     }
     let bundle = Bundle::open(&bundle_path).expect("open");
     let bytes = std::fs::read(&bundle_path).expect("read");
@@ -648,15 +996,18 @@ fn bundle_create_all_matches_git_list_heads() {
     git_ok(src, &["switch", "-q", "main"]);
 
     let grit_bundle = src.join("grit-all.bundle");
-    write_bundle_with_options(
-        &grit_repo(src),
-        &grit_bundle,
-        &BundleCreateOptions {
-            all_refs: true,
-            rev_tokens: Vec::new(),
-        },
-    )
-    .expect("grit bundle --all");
+    grit_repo(src)
+        .bundles()
+        .write_from_revs(
+            &BundleCreateOptions {
+                all_refs: true,
+                rev_tokens: Vec::new(),
+            },
+            &grit_bundle,
+            &mut grit_lib::progress::NullProgress,
+            grit_lib::progress::CancelToken::never_ref(),
+        )
+        .expect("grit bundle --all");
 
     let git_bundle = src.join("git-all.bundle");
     git_ok(
@@ -687,12 +1038,15 @@ fn bundle_create_short_tag_name_matches_git_list_heads() {
 
     let grit_bundle = src.join("grit.bundle");
     let git_bundle = src.join("git.bundle");
-    write_bundle_from_rev_specs(
-        &grit_repo(src),
-        &grit_bundle,
-        &["lite".to_owned(), "main".to_owned()],
-    )
-    .expect("grit bundle");
+    grit_repo(src)
+        .bundles()
+        .write_from_revs(
+            &BundleCreateOptions::from_rev_tokens(vec!["lite".to_owned(), "main".to_owned()]),
+            &grit_bundle,
+            &mut grit_lib::progress::NullProgress,
+            grit_lib::progress::CancelToken::never_ref(),
+        )
+        .expect("grit bundle");
     git_ok(
         src,
         &[
@@ -821,15 +1175,18 @@ fn assert_packed_all_bundle_keeps_deltas_and_round_trips(object_format: &str) {
         .count();
 
     let bundle_path = tmp.path().join("all.bundle");
-    write_bundle_with_options(
-        &grit_repo(&src),
-        &bundle_path,
-        &BundleCreateOptions {
-            all_refs: true,
-            rev_tokens: Vec::new(),
-        },
-    )
-    .expect("grit bundle --all");
+    grit_repo(&src)
+        .bundles()
+        .write_from_revs(
+            &BundleCreateOptions {
+                all_refs: true,
+                rev_tokens: Vec::new(),
+            },
+            &bundle_path,
+            &mut grit_lib::progress::NullProgress,
+            grit_lib::progress::CancelToken::never_ref(),
+        )
+        .expect("grit bundle --all");
 
     git_ok(&src, &["bundle", "verify", bundle_path.to_str().unwrap()]);
     let bundle = Bundle::open(&bundle_path).expect("open bundle");
@@ -915,15 +1272,17 @@ fn write_bundle_streams_pack_into_writer() {
     let repo = grit_repo(src);
     let tip = rev_parse(src, "main");
     let mut out = WriteRecorder::default();
-    write_bundle(
-        &repo,
-        &BundleSpec {
-            include: vec![(tip, "refs/heads/main".to_owned())],
-            ..Default::default()
-        },
-        &mut out,
-    )
-    .expect("write bundle");
+    repo.bundles()
+        .write_to(
+            &BundleSpec {
+                include: vec![(tip, "refs/heads/main".to_owned())],
+                ..Default::default()
+            },
+            &mut out,
+            &mut grit_lib::progress::NullProgress,
+            grit_lib::progress::CancelToken::never_ref(),
+        )
+        .expect("write bundle");
     let pack_start = out
         .bytes
         .windows(4)
@@ -952,15 +1311,18 @@ fn bundle_all_with_packed_and_loose_objects_round_trips_with_git() {
     git_ok(&src, &["commit", "-q", "-m", "loose"]);
 
     let bundle_path = tmp.path().join("mixed.bundle");
-    write_bundle_with_options(
-        &grit_repo(&src),
-        &bundle_path,
-        &BundleCreateOptions {
-            all_refs: true,
-            rev_tokens: Vec::new(),
-        },
-    )
-    .expect("grit bundle --all");
+    grit_repo(&src)
+        .bundles()
+        .write_from_revs(
+            &BundleCreateOptions {
+                all_refs: true,
+                rev_tokens: Vec::new(),
+            },
+            &bundle_path,
+            &mut grit_lib::progress::NullProgress,
+            grit_lib::progress::CancelToken::never_ref(),
+        )
+        .expect("grit bundle --all");
     git_ok(&src, &["bundle", "verify", bundle_path.to_str().unwrap()]);
     let clone = tmp.path().join("clone");
     git_ok(
@@ -1017,16 +1379,19 @@ fn incremental_bundle_reuses_delta_against_prerequisite_blob() {
     let bundle_path = tmp.path().join("inc.bundle");
     {
         let mut out = std::io::BufWriter::new(std::fs::File::create(&bundle_path).unwrap());
-        write_bundle(
-            &grit_repo(&src),
-            &BundleSpec {
-                include: vec![(tip, "refs/heads/main".to_owned())],
-                exclude: vec![base],
-                ..Default::default()
-            },
-            &mut out,
-        )
-        .expect("write incremental bundle");
+        grit_repo(&src)
+            .bundles()
+            .write_to(
+                &BundleSpec {
+                    include: vec![(tip, "refs/heads/main".to_owned())],
+                    exclude: vec![base],
+                    ..Default::default()
+                },
+                &mut out,
+                &mut grit_lib::progress::NullProgress,
+                grit_lib::progress::CancelToken::never_ref(),
+            )
+            .expect("write incremental bundle");
     }
     let bundle_len = std::fs::metadata(&bundle_path).unwrap().len();
     assert!(
@@ -1079,7 +1444,15 @@ fn bundle_keeps_annotated_tag_tip_whose_commit_is_a_prerequisite() {
         .collect();
 
     let grit_bundle = tmp.path().join("grit.bundle");
-    write_bundle_from_rev_specs(&grit_repo(&src), &grit_bundle, &tokens).expect("grit bundle");
+    grit_repo(&src)
+        .bundles()
+        .write_from_revs(
+            &BundleCreateOptions::from_rev_tokens(tokens.clone()),
+            &grit_bundle,
+            &mut grit_lib::progress::NullProgress,
+            grit_lib::progress::CancelToken::never_ref(),
+        )
+        .expect("grit bundle");
     let git_bundle = tmp.path().join("git.bundle");
     let mut args = vec!["bundle", "create", git_bundle.to_str().unwrap()];
     args.extend(tokens.iter().map(String::as_str));
@@ -1128,10 +1501,11 @@ fn bundle_keeps_annotated_tag_tip_whose_commit_is_a_prerequisite() {
         git(&src, &["rev-parse", "v1"])
     );
 
-    let excluded = write_bundle_from_rev_specs(
-        &grit_repo(&src),
+    let excluded = grit_repo(&src).bundles().write_from_revs(
+        &BundleCreateOptions::from_rev_tokens(vec!["v1".to_owned(), "^v1".to_owned()]),
         &tmp.path().join("empty.bundle"),
-        &["v1".to_owned(), "^v1".to_owned()],
+        &mut grit_lib::progress::NullProgress,
+        grit_lib::progress::CancelToken::never_ref(),
     );
     assert!(
         excluded.is_err(),
@@ -1146,6 +1520,121 @@ fn single_pack_idx(dir: &Path) -> std::path::PathBuf {
         .map(|e| e.path())
         .find(|p| p.extension().is_some_and(|x| x == "idx"))
         .expect("pack index")
+}
+
+#[test]
+fn bundles_create_failure_preserves_existing_bundle_and_object_not_found_error() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let src = tmp.path();
+    let (_, c2) = init_repo_with_two_commits(src);
+    let repo = grit_repo(src);
+    let bundle_path = src.join("precious.bundle");
+    repo.bundles()
+        .write(
+            &BundleSpec {
+                include: vec![(c2, "refs/heads/main".to_owned())],
+                ..Default::default()
+            },
+            &bundle_path,
+            &mut grit_lib::progress::NullProgress,
+            grit_lib::progress::CancelToken::never_ref(),
+        )
+        .expect("good bundle");
+    let before = std::fs::read(&bundle_path).expect("read bundle");
+    assert!(before.len() > 256, "expected non-trivial bundle");
+
+    let bad: ObjectId = "1111111111111111111111111111111111111111"
+        .parse()
+        .expect("parse oid");
+    let err = repo
+        .bundles()
+        .write(
+            &BundleSpec {
+                include: vec![(bad, "refs/heads/nope".into())],
+                ..Default::default()
+            },
+            &bundle_path,
+            &mut grit_lib::progress::NullProgress,
+            grit_lib::progress::CancelToken::never_ref(),
+        )
+        .expect_err("missing object");
+    assert!(
+        matches!(err, BundleError::ObjectNotFound { .. }),
+        "expected ObjectNotFound, got {err:?}"
+    );
+    assert_eq!(
+        std::fs::read(&bundle_path).expect("read after failure"),
+        before
+    );
+    git_ok(
+        src,
+        &["bundle", "verify", bundle_path.to_str().expect("utf8")],
+    );
+}
+
+#[test]
+fn bundles_create_replaces_existing_destination_on_success() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let src = tmp.path();
+    let (_, c2) = init_repo_with_two_commits(src);
+    let repo = grit_repo(src);
+    let bundle_path = src.join("replace.bundle");
+    const SENTINEL: &[u8] = b"pre-existing bundle placeholder\n";
+    std::fs::write(&bundle_path, SENTINEL).expect("seed");
+
+    repo.bundles()
+        .write(
+            &BundleSpec {
+                include: vec![(c2, "refs/heads/main".to_owned())],
+                ..Default::default()
+            },
+            &bundle_path,
+            &mut grit_lib::progress::NullProgress,
+            grit_lib::progress::CancelToken::never_ref(),
+        )
+        .expect("replace existing file");
+
+    let after = std::fs::read(&bundle_path).expect("read replaced bundle");
+    assert_ne!(after, SENTINEL);
+    assert!(after.starts_with(b"# v2 git bundle\n") || after.starts_with(b"# v3 git bundle\n"));
+    git_ok(
+        src,
+        &["bundle", "verify", bundle_path.to_str().expect("utf8")],
+    );
+}
+
+#[test]
+fn bundles_create_cancelled_preserves_destination_and_removes_part_file() {
+    use grit_lib::progress::{CancelToken, NullProgress};
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let src = tmp.path();
+    let (_, c2) = init_repo_with_two_commits(src);
+    let repo = grit_repo(src);
+    let bundle_path = src.join("existing.bundle");
+    const SENTINEL: &[u8] = b"pre-existing bundle sentinel\n";
+    std::fs::write(&bundle_path, SENTINEL).expect("seed");
+
+    let flag = CancelToken::new();
+    flag.cancel();
+    let err = repo
+        .bundles()
+        .write(
+            &BundleSpec {
+                include: vec![(c2, "refs/heads/main".to_owned())],
+                ..Default::default()
+            },
+            &bundle_path,
+            &mut NullProgress,
+            &flag,
+        )
+        .expect_err("cancelled");
+    assert!(err.is_cancelled(), "expected cancelled, got {err:?}");
+    assert_eq!(std::fs::read(&bundle_path).expect("sentinel"), SENTINEL);
+    assert!(
+        !bundle_path.with_extension("bundle.part").exists(),
+        "part file left behind"
+    );
 }
 
 fn normalize_bundle_heads(s: &str) -> Vec<String> {
@@ -1173,7 +1662,7 @@ fn malformed_header_errors() {
     let mut cur = std::io::Cursor::new(truncated.into_bytes());
     assert!(matches!(
         read_header(&mut cur).unwrap_err(),
-        BundleError::MalformedLine(_)
+        BundleError::MalformedLine { .. }
     ));
 
     let cap = b"# v3 git bundle\n@object-format=sha256\n@filter=blob:none\n\nPACK";

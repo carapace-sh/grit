@@ -7,6 +7,7 @@
 //! file is still the indexed blob does not block remove, while a real change does.
 //! On Windows, an additional test exercises the real post-commit path.
 
+use grit_lib::progress::NullProgress;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -17,35 +18,34 @@ use grit_lib::diff::{refresh_index_stat_content_verified_with_rules, stat_matche
 use grit_lib::index::write_tree::{write_tree_update_index, WriteTreeFlags};
 use grit_lib::index::IndexEntry;
 use grit_lib::objects::{serialize_commit, CommitData, ObjectKind};
-use grit_lib::porcelain::add::{stage, StageOptions};
-use grit_lib::porcelain::commit::{create_commit, CommitRequest};
+use grit_lib::porcelain::add::StageOptions;
+use grit_lib::porcelain::commit::CommitRequest;
 use grit_lib::progress::NullProgress;
+use grit_lib::refs::store::RefNameRef;
 use grit_lib::refs::{update_branch_for_commit_with_config, BranchCommitRefUpdate};
 use grit_lib::repo::Repository;
 use grit_lib::worktree::worktree_rules::WorktreeRules;
-use grit_lib::worktree::{
-    add_linked_worktree, remove_linked_worktree, AddLinkedWorktreeOptions, WorktreeBranch,
-};
+use grit_lib::worktree::{AddLinkedWorktreeOptions, WorktreeBranch};
 use grit_test_support::git;
 
 fn commit_request(message: &str) -> CommitRequest {
-    CommitRequest {
-        message: message.to_owned(),
-        author: Some(
+    {
+        let mut req = CommitRequest::new(message.to_owned());
+        req.author = Some(
             "Test <t@example.com> 1000000000 +0000"
                 .parse()
                 .expect("signature"),
-        ),
-        committer: Some(
+        );
+        req.committer = Some(
             "Test <t@example.com> 1000000000 +0000"
                 .parse()
                 .expect("signature"),
-        ),
-        allow_empty: false,
-        sign_override: None,
-        amend: false,
-        assume_worktree_synced: false,
-        ..Default::default()
+        );
+        req.allow_empty = false;
+        req.sign_override = None;
+        req.amend = false;
+        req.assume_worktree_synced = false;
+        req
     }
 }
 
@@ -67,9 +67,9 @@ fn linked_worktree_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, Repository
     let main_repo =
         Repository::discover(Some(main.as_path()), &RepositoryOptions::empty()).expect("main");
     let linked = tmp.path().join("linked");
-    add_linked_worktree(
-        &main_repo,
-        &AddLinkedWorktreeOptions {
+    main_repo
+        .worktrees()
+        .add(&AddLinkedWorktreeOptions {
             path: linked.clone(),
             branch: Some(WorktreeBranch::Create("linked".to_owned())),
             start_point: Some("HEAD".to_owned()),
@@ -77,9 +77,8 @@ fn linked_worktree_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, Repository
             lock: None,
             no_checkout: false,
             track: false,
-        },
-    )
-    .expect("add linked");
+        })
+        .expect("add linked");
     (tmp, main, linked, main_repo)
 }
 
@@ -95,7 +94,10 @@ fn git_diff_files_quiet(worktree: &Path) -> bool {
 /// Issue #1001 on Windows: index OID matches the worktree but cached stat size is stale
 /// after write-tree commit persistence. Force the same shape on every platform.
 fn apply_stale_index_stat_size_mismatch(repo: &Repository, rel_path: &str, wrong_size: u32) {
-    let mut index = repo.index_handle().load().expect("load index");
+    let mut index = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("load index");
     let path_bytes = rel_path.as_bytes();
     let mut found = false;
     for entry in index.entries_mut() {
@@ -107,17 +109,20 @@ fn apply_stale_index_stat_size_mismatch(repo: &Repository, rel_path: &str, wrong
         }
     }
     assert!(found, "missing index entry for {rel_path}");
-    repo.index_handle()
-        .write(&mut index)
+    repo.index()
+        .write(&mut index, &grit_lib::index::IndexWriteOptions::default())
         .expect("write stale index");
 }
 
 fn refresh_index_stat_on_disk(repo: &Repository) {
     let work_tree = repo.work_tree().expect("work tree");
-    let mut index = repo.index_handle().load().expect("load index");
+    let mut index = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("load index");
     let rules = WorktreeRules::from_repository(repo, &index).ok();
     let rules_arc = rules.map(|r| Arc::new(Mutex::new(r)));
-    let config = repo.config().ok();
+    let config = repo.config().snapshot().ok();
     refresh_index_stat_content_verified_with_rules(
         repo.odb(),
         repo.git_dir(),
@@ -129,8 +134,8 @@ fn refresh_index_stat_on_disk(repo: &Repository) {
         rules_arc.as_ref(),
     )
     .expect("refresh index stat");
-    repo.index_handle()
-        .write(&mut index)
+    repo.index()
+        .write(&mut index, &grit_lib::index::IndexWriteOptions::default())
         .expect("write refreshed index");
 }
 
@@ -139,7 +144,7 @@ fn commit_staged_without_index_stat_refresh(
     repo: &Repository,
     message: &str,
 ) -> grit_lib::objects::ObjectId {
-    let head = grit_lib::state::resolve_head(repo.git_dir()).expect("head");
+    let head = repo.references().head().expect("head");
     let (refname, _short, parent) = match head {
         grit_lib::state::HeadState::Branch {
             refname,
@@ -148,7 +153,10 @@ fn commit_staged_without_index_stat_refresh(
         } => (refname, short_name, oid),
         _ => panic!("expected branch head"),
     };
-    let mut index = repo.index_handle().load().expect("index");
+    let mut index = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("index");
     let tree = write_tree_update_index(repo.odb(), &mut index, "", WriteTreeFlags::silent())
         .expect("write tree");
     let commit_data = CommitData {
@@ -168,12 +176,14 @@ fn commit_staged_without_index_stat_refresh(
         .odb()
         .write(ObjectKind::Commit, &bytes)
         .expect("write commit");
-    repo.index_handle().write(&mut index).expect("write index");
-    let config = repo.config().expect("config");
+    repo.index()
+        .write(&mut index, &grit_lib::index::IndexWriteOptions::default())
+        .expect("write index");
+    let config = repo.config().snapshot().expect("config");
     update_branch_for_commit_with_config(
         repo.git_dir(),
         &BranchCommitRefUpdate {
-            branch_ref: &refname,
+            branch_ref: RefNameRef::from_trusted(refname.as_str()),
             expected_old: parent,
             new_oid: oid,
             identity: &commit_data.committer,
@@ -186,7 +196,10 @@ fn commit_staged_without_index_stat_refresh(
 }
 
 fn index_entry(repo: &Repository, rel_path: &str) -> IndexEntry {
-    let index = repo.index_handle().load().expect("index");
+    let index = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("index");
     let path_bytes = rel_path.as_bytes();
     index
         .entries()
@@ -202,13 +215,14 @@ fn stale_index_stat_fixture() -> (tempfile::TempDir, PathBuf, Repository, Reposi
     let linked_repo =
         Repository::discover(Some(linked.as_path()), &RepositoryOptions::empty()).expect("linked");
     fs::write(linked.join("new.txt"), "new\n").expect("new file");
-    stage(
-        &linked_repo,
-        &StageOptions::default(),
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("stage");
+    linked_repo
+        .index()
+        .stage(
+            &StageOptions::default(),
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("stage");
     commit_staged_without_index_stat_refresh(&linked_repo, "no refresh");
 
     let entry = index_entry(&linked_repo, "new.txt");
@@ -224,7 +238,9 @@ fn stale_index_stat_fixture() -> (tempfile::TempDir, PathBuf, Repository, Reposi
 #[test]
 fn stale_index_stat_with_identical_content_allows_worktree_remove() {
     let (_tmp, linked, _linked_repo, main_repo) = stale_index_stat_fixture();
-    remove_linked_worktree(&main_repo, &linked, false)
+    main_repo
+        .worktrees()
+        .remove(&linked, false)
         .expect("a stale size whose cleaned content is the indexed blob loses no data");
     assert!(!linked.exists(), "linked worktree directory removed");
 }
@@ -237,7 +253,10 @@ fn stale_index_stat_refresh_clears_git_diff_files_before_remove() {
         git_diff_files_quiet(&linked),
         "refresh must align index stat with worktree for git diff-files"
     );
-    remove_linked_worktree(&main_repo, &linked, false).expect("remove after refresh");
+    main_repo
+        .worktrees()
+        .remove(&linked, false)
+        .expect("remove after refresh");
 }
 
 #[test]
@@ -249,7 +268,7 @@ fn stale_index_stat_with_changed_content_blocks_worktree_remove() {
         "git diff-files must report the edit"
     );
     assert!(
-        remove_linked_worktree(&main_repo, &linked, false).is_err(),
+        main_repo.worktrees().remove(&linked, false).is_err(),
         "remove must refuse a worktree whose content changed under core.autocrlf"
     );
     assert!(
@@ -264,24 +283,26 @@ fn create_commit_refreshes_index_stat_for_worktree_remove() {
     let linked_repo =
         Repository::discover(Some(linked.as_path()), &RepositoryOptions::empty()).expect("linked");
     fs::write(linked.join("new.txt"), "new\n").expect("new file");
-    stage(
-        &linked_repo,
-        &StageOptions::default(),
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("stage");
+    linked_repo
+        .index()
+        .stage(
+            &StageOptions::default(),
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("stage");
     // Bump mtime after staging so write-tree without stat refresh would persist stale stat.
     let new_path = linked.join("new.txt");
     let bumped = filetime::FileTime::from_unix_time(1_700_000_000, 0);
     filetime::set_file_mtime(&new_path, bumped).expect("touch new.txt");
-    create_commit(
-        &linked_repo,
-        &commit_request("with refresh"),
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("create_commit");
+    linked_repo
+        .commits()
+        .create_staged(
+            &commit_request("with refresh"),
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("create_commit");
 
     let work_tree = linked_repo.work_tree().expect("work tree");
     let entry = index_entry(&linked_repo, "new.txt");
@@ -294,7 +315,10 @@ fn create_commit_refreshes_index_stat_for_worktree_remove() {
         git_diff_files_quiet(&linked),
         "git diff-files must be clean after create_commit"
     );
-    remove_linked_worktree(&main_repo, &linked, false).expect("remove after create_commit");
+    main_repo
+        .worktrees()
+        .remove(&linked, false)
+        .expect("remove after create_commit");
 }
 
 #[cfg(windows)]
@@ -304,16 +328,20 @@ fn create_commit_in_linked_worktree_allows_remove_on_windows() {
     let linked_repo =
         Repository::discover(Some(linked.as_path()), &RepositoryOptions::empty()).expect("linked");
     fs::write(linked.join("new.txt"), "new\n").expect("new file");
-    stage(&linked_repo, &StageOptions::default(), &mut NullProgress).expect("stage");
-    create_commit(
-        &linked_repo,
-        &commit_request("windows path"),
-        &mut NullProgress,
-    )
-    .expect("create_commit");
+    linked_repo
+        .index()
+        .stage(&StageOptions::default(), &mut NullProgress)
+        .expect("stage");
+    linked_repo
+        .commits()
+        .create_staged(&commit_request("windows path"), &mut NullProgress)
+        .expect("create_commit");
     assert!(
         git_diff_files_quiet(&linked),
         "Windows repro: git diff-files must be clean without update-index --refresh"
     );
-    remove_linked_worktree(&main_repo, &linked, false).expect("remove without prior status");
+    main_repo
+        .worktrees()
+        .remove(&linked, false)
+        .expect("remove without prior status");
 }

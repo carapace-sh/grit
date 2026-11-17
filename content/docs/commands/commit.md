@@ -25,7 +25,7 @@ grit commit --patch-file <file|-> -m <message>
 
 ## Description
 
-By default, `grit commit` **auto-stages** every change in the working tree (modified, deleted and untracked files) and records a new commit on the current branch. With `core.ignorecase=true` on a case-folding volume, auto-staging keeps indexed path spellings (same as [`grit add`](add.md)) and does not rewrite either spelling of a case-colliding path when the shared on-disk file already matches one of the indexed blobs (including directory-name collisions such as `Docs/` vs `docs/`); use [`grit mv`](mv.md) to change a path's case on purpose.
+By default, `grit commit` **auto-stages** every change in the working tree (modified, deleted and untracked files) and records a new commit on the current branch. When `status.showUntrackedFiles` is `no` (or a Git boolean false synonym such as `false` or `0`), auto-staging matches `git commit -a`: only tracked modifications and deletions are staged, and untracked paths hidden from [`grit status`](status.md) are not added. `normal`, `all`, and the default when the key is unset still auto-stage untracked files. `-a` / `--all` follows the same rule. Auto-staging refuses an embedded git repository that has no commit checked out (same rule as [`grit add`](add.md)); the commit is not created and the index is left unchanged. When auto-staging newly records a nested repository as a gitlink, grit prints the same **warning** as [`grit add`](add.md) on stderr (human and `--markdown`); `--json` includes `embedded_gitlinks` for paths introduced in that staging pass only (not when the gitlink was already in the index). Paths it cannot access because a directory is unreadable are left as-is in the index (with a `warning:` on stderr, same as [`grit status`](status.md)); other staged changes still commit. With `core.ignorecase=true` on a case-folding volume, auto-staging keeps indexed path spellings (same as [`grit add`](add.md)) and does not rewrite either spelling of a case-colliding path when the shared on-disk file already matches one of the indexed blobs (including directory-name collisions such as `Docs/` vs `docs/`); use [`grit mv`](mv.md) to change a path's case on purpose.
 
 On a [GitButler workspace](../status/#gitbutler-workspaces), `grit commit` refuses (exit **1**, `kind: "gitbutler_workspace"`) and changes nothing, because GitButler rewrites the `gitbutler/workspace` branch and would lose the commit. Commit with `but commit`, or switch to a branch first.
 
@@ -37,7 +37,7 @@ Use **`--hunks`** with stable ids from [`grit diff --json`](../diff/) to stage a
 
 The message can be given as an argument, with `-m`, or with `-F` / `--message-file` (`-` reads stdin). Messages may start with `-` when quoted on the shell (for example `grit commit -m "-fix typo"`) or passed via `--message=-fix typo`. A positional message that starts with `-` must contain whitespace (`grit commit "-fix typo"`): a single hyphen-leading word such as `-q`, `--bogus` or `--opt=value` is treated as an unknown flag and rejected with exit status `2` before anything is staged or committed, so a misspelled or unsupported flag never becomes the commit message. Pass such a message with `-m` (`grit commit -m --bogus`). Message text is normalized with Git-style stripspace before hooks run (leading/trailing blank lines collapse; a trailing newline is added). A message with several lines is recorded as is after normalization; its first line is the subject that [`grit log`](../log/) shows. A normal commit needs a message: without one, `grit commit` stops with an error and does not change the index or working tree. You cannot combine `-m`, a positional message, and `--message-file`.
 
-Use **`--dry-run`** to preview what would be committed: path list, parents, and author, without writing objects, updating refs, running hooks, or changing the index on disk. The preview includes executable-bit-only changes the same way the commit does. Dry-run returns the same errors as a real commit for nothing-to-commit and unmerged index.
+Use **`--dry-run`** to preview what would be committed: path list, parents, and author, without writing objects, updating refs, running hooks, or changing the index on disk. The preview includes executable-bit-only changes the same way the commit does, and lists modified or deleted files whose names are not valid UTF-8 under the same stored paths as the commit's `files`. Dry-run returns the same errors as a real commit for nothing-to-commit and unmerged index.
 
 A commit either completes or changes nothing. Pressing Ctrl+C, or sending `SIGTERM` or `SIGHUP` on Unix, while the index is being updated or files are being checked out stops the commit with `error: operation cancelled`; `HEAD`, the index and the work tree are left as they were before the command started, no `.git/index.lock` is left behind, and the same commit can simply be run again. This works the same in a Windows console, where Ctrl+Break counts as Ctrl+C. A second interrupt terminates grit at once, without that cleanup; only `SIGKILL` skips rollback. Auto-staging may leave unreachable loose blobs in the object database if you interrupt mid-write; they are harmless. In the rare case that a path cannot be put back during checkout rollback, the error has kind `checkout_incomplete` and lists those paths in `paths`.
 
@@ -116,7 +116,7 @@ On an interactive terminal (human output, not `--json`, `--markdown` or `-q`), a
 | `--pathspec-from-file`, `--pathspec-file-nul` | Same as on [`grit add`](../add/): read pathspecs from a file; combine with trailing `PATH` arguments. |
 | `--amend` | Replace the tip commit on the current branch. |
 | `--allow-empty` | Record a commit even when staged content matches the parent tree (empty tree change). |
-| `--dry-run` | Compute the commit tree and file list without writing objects, updating refs, or running hooks. |
+| `--dry-run` | Stage in memory and list the files the commit would change, without writing objects, the index or refs, or running hooks. |
 | `-F`, `--message-file <path>` | Read the commit message from a file; use `-` for stdin (same body rules as `-m`). |
 | `--author <author>` | Override the author line (`Name <email>`); committer identity is unchanged unless you also set `GIT_COMMITTER_*`. |
 | `--no-verify` | Skip `pre-commit` and `commit-msg` hooks; `prepare-commit-msg` and `post-commit` still run on a real commit. |
@@ -199,11 +199,12 @@ Pass `--json` for stable, scripting-friendly output:
 | `dry_run` | boolean | `true` when `--dry-run` was used |
 | `scope` | string | `auto_stage`, `staged`, `paths`, or `patch` — how the index was prepared |
 | `dry_run` | boolean | `true` when `--dry-run` was passed |
-| `files` | array | Path-level changes (`path`, `status`, optional `old_path` for renames) |
+| `files` | array | Path-level changes (`path`, `status`, optional `old_path` for renames). Each `path` uses the same stored encoding as [`grit status`](status.md) JSON (UTF-8 when valid, else `grit+pathhex:`). |
 | `change_id` | string or null | Stored `change-id` header on the new commit, or null when absent or dry-run (see [Change ids](../library/change-ids/)) |
 | `parents` | array of strings | Parent commit OIDs that would be stored |
 | `author` | object | `name`, `email`, and `date` (RFC 3339, same shape as [`grit log`](../log/) / [`grit show`](../show/)) |
 | `hooks_run` | array of strings | Hook names that ran, in order (`pre-commit`, `prepare-commit-msg`, `commit-msg`, `post-commit`, and `post-rewrite` after `--amend`); empty on dry-run |
+| `embedded_gitlinks` | array | Nested repositories newly recorded as gitlinks during auto-staging for this commit. Omitted when empty. |
 
 Example:
 

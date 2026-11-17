@@ -12,8 +12,8 @@ use grit_lib::config::ident_resolve::{
 };
 use grit_lib::config::ConfigSet;
 use grit_lib::objects::{parse_commit, ObjectKind};
-use grit_lib::porcelain::add::{stage, StageOptions};
-use grit_lib::porcelain::commit::{create_commit, CommitRequest};
+use grit_lib::porcelain::add::StageOptions;
+use grit_lib::porcelain::commit::CommitRequest;
 use grit_lib::progress::NullProgress;
 use grit_lib::repo::{InitOptions, Repository};
 
@@ -54,7 +54,7 @@ fn create_commit_bytes_match_git_with_explicit_environment_identity() {
 
     let saved_tz = std::env::var("TZ").ok();
     std::env::set_var("TZ", "UTC");
-    grit_lib::config::git_date::tm::refresh_process_tz();
+    grit_lib::config::git_date::refresh_process_tz();
 
     let td = tempfile::TempDir::new().expect("tempdir");
     let root = td.path();
@@ -62,7 +62,7 @@ fn create_commit_bytes_match_git_with_explicit_environment_identity() {
         root,
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
-            .with_ref_storage(grit_lib::RefStorageFormat::Files),
+            .with_ref_storage(grit_lib::refs::ref_storage::RefStorageFormat::Files),
     )
     .expect("init");
 
@@ -97,17 +97,17 @@ fn create_commit_bytes_match_git_with_explicit_environment_identity() {
 
     let repo = Repository::discover(Some(root), &options).expect("discover with environment");
     fs::write(root.join("f"), b"x\n").expect("worktree file");
-    stage(
-        &repo,
-        &StageOptions {
-            pathspecs: vec![".".to_owned()],
-            ..StageOptions::default()
-        },
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("stage");
-    let config = repo.config().expect("config");
+    repo.index()
+        .stage(
+            &StageOptions {
+                pathspecs: vec![".".to_owned()],
+                ..StageOptions::default()
+            },
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("stage");
+    let config = repo.config().snapshot().expect("config");
     let now = repo.identity_now();
     assert_eq!(
         now,
@@ -119,22 +119,23 @@ fn create_commit_bytes_match_git_with_explicit_environment_identity() {
     let committer = resolve_identity_with(&env, config.as_ref(), IdentRole::Committer, now)
         .expect("committer identity");
 
-    let outcome = create_commit(
-        &repo,
-        &CommitRequest {
-            message: "subject".to_owned(),
-            author: Some(author.parse().expect("signature")),
-            committer: Some(committer.parse().expect("signature")),
-            allow_empty: false,
-            sign_override: None,
-            amend: false,
-            assume_worktree_synced: false,
-            ..Default::default()
-        },
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("create_commit");
+    let outcome = repo
+        .commits()
+        .create_staged(
+            &{
+                let mut req = CommitRequest::new("subject".to_owned());
+                req.author = Some(author.parse().expect("signature"));
+                req.committer = Some(committer.parse().expect("signature"));
+                req.allow_empty = false;
+                req.sign_override = None;
+                req.amend = false;
+                req.assume_worktree_synced = false;
+                req
+            },
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("create_commit");
     let grit_oid = outcome.oid;
 
     let commit_obj = repo.odb().read(&grit_oid).expect("read commit");
@@ -178,5 +179,5 @@ fn create_commit_bytes_match_git_with_explicit_environment_identity() {
         Some(v) => std::env::set_var("TZ", v),
         None => std::env::remove_var("TZ"),
     }
-    grit_lib::config::git_date::tm::refresh_process_tz();
+    grit_lib::config::git_date::refresh_process_tz();
 }

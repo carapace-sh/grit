@@ -8,7 +8,6 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use grit_lib::refs::ref_storage::RefStorageFormat;
-use grit_lib::refs::resolve_ref;
 use grit_lib::remote::transfer::{FetchOptions, TagMode};
 use grit_lib::repo::{InitOptions, Repository};
 
@@ -22,11 +21,21 @@ fn fetch_updates_refs_in_one_transaction_reftable() {
         }
         let remote_git = remote_repo.git_dir();
         let (_, c2) = two_commit_oids(&remote_repo);
-        grit_lib::refs::write_ref(&remote_git, "refs/heads/branch-a", &c2).expect("remote a");
-        grit_lib::refs::write_ref(&remote_git, "refs/heads/branch-b", &c2).expect("remote b");
+        grit_test_support::refs::set_ref(
+            &grit_test_support::refs::at(&remote_git),
+            "refs/heads/branch-a",
+            &c2,
+        )
+        .expect("remote a");
+        grit_test_support::refs::set_ref(
+            &grit_test_support::refs::at(&remote_git),
+            "refs/heads/branch-b",
+            &c2,
+        )
+        .expect("remote b");
 
         let local_root = tempfile::tempdir().expect("local tempdir");
-        let local = Repository::init(
+        let (local, _) = Repository::init(
             local_root.path(),
             &InitOptions::new()
                 .with_initial_branch("main".to_owned())
@@ -36,17 +45,34 @@ fn fetch_updates_refs_in_one_transaction_reftable() {
         let local_git = local.git_dir();
         let (_, count_before) = reftable_tables_snapshot(&local_git);
 
-        let opts = FetchOptions {
-            refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()],
-            tags: TagMode::None,
-            initial_remote_fetch: false,
-            remote_name: Some("origin".to_owned()),
-            ..Default::default()
-        };
-        grit_lib::remote::transfer::fetch_local(&local_git, &remote_git, &opts).expect("fetch");
+        let mut opts = FetchOptions::new().initial_remote_fetch(false);
+        opts.refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()];
+        opts.tags = TagMode::None;
+        opts.remote_name = Some("origin".to_owned());
+        grit_lib::repo::Repository::open(
+            &local_git,
+            &grit_lib::config::environment::RepositoryOptions::with_environment(
+                (&opts).environment.clone(),
+            ),
+        )
+        .expect("open fetch target")
+        .remotes()
+        .fetch_from(
+            grit_lib::remote::transfer::TransferEndpoint::Local(&remote_git),
+            &mut opts.clone(),
+            &mut grit_lib::remote::fetch::NoProgress,
+            grit_lib::progress::CancelToken::never_ref(),
+        )
+        .expect("fetch");
 
-        assert!(resolve_ref(&local_git, "refs/remotes/origin/branch-a").is_ok());
-        assert!(resolve_ref(&local_git, "refs/remotes/origin/branch-b").is_ok());
+        assert!(grit_test_support::refs::at(&local_git)
+            .references()
+            .resolve("refs/remotes/origin/branch-a")
+            .is_ok());
+        assert!(grit_test_support::refs::at(&local_git)
+            .references()
+            .resolve("refs/remotes/origin/branch-b")
+            .is_ok());
         let (_, count_after) = reftable_tables_snapshot(&local_git);
         assert_eq!(
             count_after,
@@ -69,7 +95,6 @@ fn push_tracking_remote_refs_one_reftable_transaction() {
             "[remote \"origin\"]\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n",
         );
 
-        use grit_lib::refs::branch_tracking::apply_push_remote_tracking_updates;
         use grit_lib::remote::push_report::{PushRefResult, PushRefStatus};
 
         let results = vec![
@@ -96,13 +121,21 @@ fn push_tracking_remote_refs_one_reftable_transaction() {
         ];
 
         let (_, count_before) = reftable_tables_snapshot(&git_dir);
-        apply_push_remote_tracking_updates(&git_dir, "origin", &results).expect("tracking batch");
+        repo.branches()
+            .apply_push_remote_tracking_updates("origin", &results)
+            .expect("tracking batch");
         assert_eq!(
-            resolve_ref(&git_dir, "refs/remotes/origin/alpha").ok(),
+            grit_test_support::refs::at(&git_dir)
+                .references()
+                .resolve("refs/remotes/origin/alpha")
+                .ok(),
             Some(c1)
         );
         assert_eq!(
-            resolve_ref(&git_dir, "refs/remotes/origin/beta").ok(),
+            grit_test_support::refs::at(&git_dir)
+                .references()
+                .resolve("refs/remotes/origin/beta")
+                .ok(),
             Some(c2)
         );
         let (_, count_after) = reftable_tables_snapshot(&git_dir);
@@ -116,7 +149,6 @@ fn push_tracking_remote_refs_one_reftable_transaction() {
 
 #[test]
 fn non_atomic_multi_ref_create_one_reftable_transaction() {
-    use grit_lib::refs::commit_ref_updates_non_atomic;
     use grit_lib::refs::store::{Expected, RawRef, RefUpdate, RefUpdateFlags};
 
     each_backend(|backend, repo| {
@@ -135,10 +167,16 @@ fn non_atomic_multi_ref_create_one_reftable_transaction() {
             })
             .collect();
         let (_, count_before) = reftable_tables_snapshot(&git_dir);
-        commit_ref_updates_non_atomic(&git_dir, updates).expect("non-atomic batch");
+        grit_test_support::refs::at(&git_dir)
+            .references()
+            .apply_each(updates)
+            .expect("non-atomic batch");
         for i in 0..40 {
             assert_eq!(
-                resolve_ref(&git_dir, &format!("refs/heads/batch-{i}")).ok(),
+                grit_test_support::refs::at(&git_dir)
+                    .references()
+                    .resolve(&format!("refs/heads/batch-{i}"))
+                    .ok(),
                 Some(tip)
             );
         }
@@ -204,7 +242,10 @@ fn atomic_push_over_grit_http(_ref_format: RefStorageFormat) {
         ],
     );
     assert_eq!(
-        resolve_ref(&bare, "refs/heads/main").expect("bare main"),
+        grit_test_support::refs::at(&bare)
+            .references()
+            .resolve("refs/heads/main")
+            .expect("bare main"),
         graph.ff
     );
 
@@ -252,12 +293,18 @@ fn atomic_push_over_grit_http(_ref_format: RefStorageFormat) {
         String::from_utf8_lossy(&push.stderr)
     );
     assert_eq!(
-        resolve_ref(&bare, "refs/heads/main").expect("main"),
+        grit_test_support::refs::at(&bare)
+            .references()
+            .resolve("refs/heads/main")
+            .expect("main"),
         graph.ff,
         "atomic abort must leave main unchanged"
     );
     assert!(
-        resolve_ref(&bare, "refs/heads/atomic-ok").is_err(),
+        grit_test_support::refs::at(&bare)
+            .references()
+            .resolve("refs/heads/atomic-ok")
+            .is_err(),
         "atomic abort must not create the otherwise-valid ref"
     );
 }

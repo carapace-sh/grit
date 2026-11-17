@@ -30,15 +30,38 @@ run_stage() {
 echo "Pre-integration gate (CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS})"
 
 run_stage "fmt" cargo fmt --all --check
+run_stage "check (default features)" bash -c 'cargo check -p grit-lib && cargo check -p grit-cli'
 run_stage "clippy" cargo clippy --workspace -- -D warnings
 run_stage "rustdoc" env RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
 run_stage "public module doctests" cargo test -p grit-lib --test public_module_doctests
-if cargo nextest --version >/dev/null 2>&1; then
-	run_stage "test" cargo nextest run --workspace
-	run_stage "doctests" cargo test --workspace --doc
+PUBLIC_API_NIGHTLY_DATE="$(grep 'PUBLIC_API_NIGHTLY_DATE=' scripts/public-api.sh | cut -d'"' -f2)"
+if rustup toolchain list | grep -q "^nightly-${PUBLIC_API_NIGHTLY_DATE}"; then
+	run_stage "api-ratchet" make api-ratchet-check
 else
-	run_stage "test" cargo test --workspace
+	echo ""
+	echo "==> api-ratchet skipped (pinned nightly-${PUBLIC_API_NIGHTLY_DATE} not installed)"
 fi
+if git diff --name-only origin/main...HEAD 2>/dev/null | grep -qE '^grit-lib/'; then
+	SEMVER_CHECKS_VERSION="$(grep 'CARGO_SEMVER_CHECKS_VERSION=' scripts/semver-check.sh | cut -d'"' -f2)"
+	if command -v cargo >/dev/null 2>&1 && cargo semver-checks --version 2>/dev/null | grep -qF "${SEMVER_CHECKS_VERSION}"; then
+		run_stage "semver-check" make semver-check
+	else
+		echo ""
+		echo "==> semver-check skipped (cargo-semver-checks ${SEMVER_CHECKS_VERSION} not installed)"
+	fi
+else
+	echo ""
+	echo "==> semver-check skipped (no grit-lib/ changes vs origin/main)"
+fi
+WORKSPACE_TEST_FEATURES=(--features grit-lib/test-support)
+if cargo nextest --version >/dev/null 2>&1; then
+	run_stage "test" cargo nextest run --workspace "${WORKSPACE_TEST_FEATURES[@]}"
+	run_stage "doctests" cargo test --workspace --doc "${WORKSPACE_TEST_FEATURES[@]}"
+else
+	run_stage "test" cargo test --workspace "${WORKSPACE_TEST_FEATURES[@]}"
+fi
+
+run_stage "cli-layer-ratchet" make cli-layer-ratchet-check
 
 echo ""
 echo "Gate passed."

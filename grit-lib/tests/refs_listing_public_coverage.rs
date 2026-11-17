@@ -3,13 +3,12 @@
 #![allow(clippy::unwrap_used)]
 
 use grit_lib::objects::{ObjectId, ObjectKind};
-use grit_lib::porcelain::commit::create_commit;
-use grit_lib::porcelain::tag::{create_tag, CreateTagRequest};
+use grit_lib::porcelain::tag::CreateTagRequest;
 use grit_lib::progress::NullProgress;
 use grit_lib::refs::listing::query_listings_on_store;
 use grit_lib::refs::listing::{
     compare_version_names, creator_date_from_bytes, epoch_from_identity,
-    pattern_matches_short_name, query_listings_from_pairs, query_refs, ref_kind_from_name,
+    pattern_matches_short_name, query_listings_from_pairs, ref_kind_from_name,
     short_name_in_namespace, RefKind, RefNamespace, RefQuery, RefQueryOptions, RefSort, SortKey,
 };
 use grit_lib::refs::store::{MemoryRefStore, RawRef};
@@ -83,19 +82,19 @@ fn query_listings_from_pairs_and_store() {
 #[test]
 fn references_query_peels_annotated_tags() {
     let dir = tempfile::tempdir().unwrap();
-    let repo = Repository::init(dir.path(), &InitOptions::default()).unwrap();
+    let (repo, _) = Repository::init(dir.path(), &InitOptions::default()).unwrap();
     let ident = "T <t@example.com> 1700000000 +0000".to_owned();
-    let commit = create_commit(
-        &repo,
-        &grit_test_support::empty_commit_request("c", &ident),
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .unwrap()
-    .oid;
-    create_tag(
-        &repo,
-        &CreateTagRequest {
+    let commit = repo
+        .commits()
+        .create_staged(
+            &grit_test_support::empty_commit_request("c", &ident),
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .unwrap()
+        .oid;
+    repo.tags()
+        .create(&CreateTagRequest {
             name: "v1".into(),
             target: commit,
             message: Some("note".into()),
@@ -105,9 +104,8 @@ fn references_query_peels_annotated_tags() {
             tree_sha256: None,
             force: false,
             dry_run: false,
-        },
-    )
-    .unwrap();
+        })
+        .unwrap();
 
     let query = RefQuery {
         namespaces: vec![RefNamespace::Tags],
@@ -128,11 +126,10 @@ fn references_query_peels_annotated_tags() {
 #[test]
 fn references_query_peels_annotated_tag_to_non_commit() {
     let dir = tempfile::tempdir().unwrap();
-    let repo = Repository::init(dir.path(), &InitOptions::default()).unwrap();
+    let (repo, _) = Repository::init(dir.path(), &InitOptions::default()).unwrap();
     let blob: ObjectId = repo.odb().write(ObjectKind::Blob, b"payload").unwrap();
-    create_tag(
-        &repo,
-        &CreateTagRequest {
+    repo.tags()
+        .create(&CreateTagRequest {
             name: "of-blob".into(),
             target: blob,
             message: Some("annotated".into()),
@@ -142,9 +139,8 @@ fn references_query_peels_annotated_tag_to_non_commit() {
             tree_sha256: None,
             force: false,
             dry_run: false,
-        },
-    )
-    .unwrap();
+        })
+        .unwrap();
 
     let rows = repo
         .references()
@@ -164,19 +160,19 @@ fn references_query_peels_annotated_tag_to_non_commit() {
 #[test]
 fn references_query_lightweight_commit_tag_has_no_peel() {
     let dir = tempfile::tempdir().unwrap();
-    let repo = Repository::init(dir.path(), &InitOptions::default()).unwrap();
+    let (repo, _) = Repository::init(dir.path(), &InitOptions::default()).unwrap();
     let ident = "T <t@example.com> 1700000000 +0000".to_owned();
-    let commit = create_commit(
-        &repo,
-        &grit_test_support::empty_commit_request("c", &ident),
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .unwrap()
-    .oid;
-    create_tag(
-        &repo,
-        &CreateTagRequest {
+    let commit = repo
+        .commits()
+        .create_staged(
+            &grit_test_support::empty_commit_request("c", &ident),
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .unwrap()
+        .oid;
+    repo.tags()
+        .create(&CreateTagRequest {
             name: "light".into(),
             target: commit,
             message: None,
@@ -186,9 +182,8 @@ fn references_query_lightweight_commit_tag_has_no_peel() {
             tree_sha256: None,
             force: false,
             dry_run: false,
-        },
-    )
-    .unwrap();
+        })
+        .unwrap();
 
     let rows = repo
         .references()
@@ -208,19 +203,19 @@ fn references_query_lightweight_commit_tag_has_no_peel() {
 #[test]
 fn overlapping_namespaces_deduplicate_by_full_name() {
     let dir = tempfile::tempdir().unwrap();
-    let repo = Repository::init(dir.path(), &InitOptions::default()).unwrap();
+    let (repo, _) = Repository::init(dir.path(), &InitOptions::default()).unwrap();
     let ident = "T <t@example.com> 1700000000 +0000".to_owned();
-    let commit = create_commit(
-        &repo,
-        &grit_test_support::empty_commit_request("c", &ident),
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .unwrap()
-    .oid;
-    create_tag(
-        &repo,
-        &CreateTagRequest {
+    let commit = repo
+        .commits()
+        .create_staged(
+            &grit_test_support::empty_commit_request("c", &ident),
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .unwrap()
+        .oid;
+    repo.tags()
+        .create(&CreateTagRequest {
             name: "t".into(),
             target: commit,
             message: None,
@@ -230,9 +225,8 @@ fn overlapping_namespaces_deduplicate_by_full_name() {
             tree_sha256: None,
             force: false,
             dry_run: false,
-        },
-    )
-    .unwrap();
+        })
+        .unwrap();
 
     let query = RefQuery {
         namespaces: vec![
@@ -241,7 +235,10 @@ fn overlapping_namespaces_deduplicate_by_full_name() {
         ],
         ..RefQuery::default()
     };
-    let rows = query_refs(&repo, &query, &RefQueryOptions::default()).unwrap();
+    let rows = repo
+        .references()
+        .query(&query, &RefQueryOptions::default())
+        .unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].full_name, "refs/tags/t");
 }
@@ -281,16 +278,17 @@ fn symbolic_ref_listing_does_not_leak_resolved_peel() {
 #[test]
 fn date_sort_keeps_refs_with_missing_objects() {
     let dir = tempfile::tempdir().unwrap();
-    let repo = Repository::init(dir.path(), &InitOptions::default()).unwrap();
+    let (repo, _) = Repository::init(dir.path(), &InitOptions::default()).unwrap();
     let ident = "T <t@example.com> 1700000000 +0000".to_owned();
-    let commit = create_commit(
-        &repo,
-        &grit_test_support::empty_commit_request("c", &ident),
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .unwrap()
-    .oid;
+    let commit = repo
+        .commits()
+        .create_staged(
+            &grit_test_support::empty_commit_request("c", &ident),
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .unwrap()
+        .oid;
     let store = MemoryRefStore::new();
     store
         .set_ref("refs/tags/good", RawRef::Direct(commit))

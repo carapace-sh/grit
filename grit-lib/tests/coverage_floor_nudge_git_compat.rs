@@ -2,18 +2,15 @@
 
 use crate::support;
 
-use grit_lib::blame::{blame_file, BlameOptions};
+use grit_lib::blame::BlameOptions;
 use grit_lib::config::ConfigSet;
-use grit_lib::diff::{
-    diff_commits_with_renames, diff_index_to_tree, diff_trees_with_renames,
-    postprocess_diff_entries, DiffPostprocessOptions,
-};
+use grit_lib::diff::{CopyDetection, RenameDetection, TreeDiffOptions};
 use grit_lib::index::write_tree::write_tree_from_index;
 use grit_lib::index::{Index, IndexEntry, MODE_REGULAR};
 use grit_lib::objects::{parse_commit, ObjectKind};
 use grit_lib::parallel::ThreadPolicy;
-use grit_lib::revwalk::merge_base::{merge_bases_all, merge_bases_octopus};
-use grit_lib::revwalk::rev_list::{rev_list, ObjectFilter, OrderingMode, RevListOptions};
+
+use grit_lib::revwalk::rev_list::{ObjectFilter, OrderingMode, RevListOptions};
 use support::{commit_file, git, open_grit_repo, HistoryRepo};
 
 #[test]
@@ -93,8 +90,7 @@ fn deep_history_revwalk_blame_and_merge_bases_nudge() -> grit_lib::error::Result
                 max_count: Some(128),
                 ..RevListOptions::default()
             };
-            let _ = rev_list(
-                &repo,
+            let _ = repo.revwalk().rev_list(
                 &[String::from("HEAD")],
                 &[String::from("HEAD~15")],
                 &opts,
@@ -102,12 +98,11 @@ fn deep_history_revwalk_blame_and_merge_bases_nudge() -> grit_lib::error::Result
         }
     }
 
-    let _ = merge_bases_all(
-        &repo,
+    let _ = repo.revwalk().merge_bases(
         &[tip.parse().expect("tip"), mid.parse().expect("mid")],
+        grit_lib::revwalk::MergeBaseMode::All,
     )?;
-    let _ = merge_bases_octopus(
-        &repo,
+    let _ = repo.revwalk().merge_bases(
         &[
             tip.parse().expect("tip"),
             mid.parse().expect("mid"),
@@ -116,12 +111,12 @@ fn deep_history_revwalk_blame_and_merge_bases_nudge() -> grit_lib::error::Result
                 .parse()
                 .expect("fork tip"),
         ],
+        grit_lib::revwalk::MergeBaseMode::Octopus,
     )?;
 
     for start in [None, Some(tip.parse().expect("tip"))] {
         for path in ["deep/layer40.txt", "wide/w40.txt", "fork/f5.txt"] {
-            let blame = blame_file(
-                &repo,
+            let blame = repo.diff().blame(
                 path,
                 &BlameOptions {
                     start,
@@ -157,7 +152,9 @@ fn deep_history_revwalk_blame_and_merge_bases_nudge() -> grit_lib::error::Result
             max_count: Some(96),
             ..RevListOptions::default()
         };
-        let _ = rev_list(&repo, &[String::from("HEAD")], &[], &opts)?;
+        let _ = repo
+            .revwalk()
+            .rev_list(&[String::from("HEAD")], &[], &opts)?;
     }
 
     let merge_tip = repo.odb().read(&tip.parse().expect("tip"))?;
@@ -165,25 +162,30 @@ fn deep_history_revwalk_blame_and_merge_bases_nudge() -> grit_lib::error::Result
     if parsed.parents.len() >= 2 {
         let cfg = ConfigSet::new();
         let policy = ThreadPolicy::default();
-        let post_opts = DiffPostprocessOptions {
-            rename_threshold: 50,
-            copy_threshold: Some(50),
-            find_copies_harder: true,
-            ..DiffPostprocessOptions::default()
-        };
+        let post_opts = TreeDiffOptions::default()
+            .with_renames(RenameDetection::Similarity(50))
+            .with_copies(CopyDetection::FindHarder(50));
         for (p1, p2) in parsed.parents.iter().zip(parsed.parents.iter().skip(1)) {
-            let raw = diff_commits_with_renames(repo.odb(), p1, p2, 50)?;
-            let _ = postprocess_diff_entries(
-                repo.odb(),
-                raw,
-                None,
-                None,
-                None,
-                &cfg,
-                &policy,
-                &post_opts,
-            )?;
-            let _ = diff_trees_with_renames(repo.odb(), None, Some(&parsed.tree), "", 50)?;
+            let raw = repo
+                .diff()
+                .commits(
+                    p1,
+                    p2,
+                    &TreeDiffOptions::default().with_renames(RenameDetection::Similarity(50)),
+                )
+                .map(|r| r.entries)?;
+            let _ = repo
+                .diff()
+                .detect_renames(raw, None, &post_opts)
+                .map(|r| r.entries)?;
+            let _ = repo
+                .diff()
+                .tree_to_tree(
+                    None,
+                    Some(&parsed.tree),
+                    &TreeDiffOptions::default().with_renames(RenameDetection::Similarity(50)),
+                )
+                .map(|r| r.entries)?;
         }
         let mut index = Index::new();
         let blob = repo.odb().write(ObjectKind::Blob, b"idx\n")?;
@@ -205,7 +207,10 @@ fn deep_history_revwalk_blame_and_merge_bases_nudge() -> grit_lib::error::Result
             base_index_pos: 0,
         });
         let idx_tree = write_tree_from_index(repo.odb(), &index, "")?;
-        let _ = diff_index_to_tree(repo.odb(), &index, Some(&idx_tree), false)?;
+        let _ = repo
+            .diff()
+            .index_to_tree(&index, Some(&idx_tree), &TreeDiffOptions::default())
+            .map(|r| r.entries)?;
     }
 
     Ok(())

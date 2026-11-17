@@ -5,6 +5,7 @@
 //! under every [`grit_lib::objects::index_pack::IngestPackOptions`] variant, and cross-checks installed
 //! packs with `git verify-pack -v` and `git fsck --strict`.
 
+use grit_lib::error::ObjectError;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -16,9 +17,6 @@ use grit_lib::index::MODE_REGULAR;
 use grit_lib::objects::hash::Parallelism;
 use grit_lib::objects::index_pack::{ingest_received_pack, install_pack_bytes, IngestPackOptions};
 use grit_lib::objects::odb::Odb;
-use grit_lib::objects::pack::{
-    read_pack_bytes_cached, read_pack_index, write_v2_pack_index, write_v2_pack_index_with_trailer,
-};
 use grit_lib::objects::pack_rev::{
     append_hashfile_checksum, build_pack_rev_bytes, build_pack_rev_bytes_from_index_order_offsets,
     build_pack_rev_bytes_from_index_order_offsets_and_checksum, hashfile_checksum_valid,
@@ -27,11 +25,14 @@ use grit_lib::objects::pack_rev::{
     RIDX_HASH_ID_SHA1, RIDX_HASH_ID_SHA256, RIDX_SIGNATURE, RIDX_VERSION,
 };
 use grit_lib::objects::unpack_objects::{
-    pack_index_records_with_threads, pack_is_thin, strict_verify_packed_references, unpack_objects,
+    pack_index_records, pack_is_thin, strict_verify_packed_references, unpack_objects,
     UnpackOptions,
 };
 use grit_lib::objects::{serialize_tree, HashAlgo, ObjectId, ObjectKind, TreeEntry};
 use grit_lib::remote::transfer::{build_pack, PackBuildOptions};
+use grit_lib::test_support::objects_pack::{
+    read_pack_bytes_cached, read_pack_index, write_v2_pack_index, write_v2_pack_index_from_trailer,
+};
 use grit_test_support::git;
 
 const GIT_ENV: &[(&str, &str)] = &[
@@ -561,7 +562,7 @@ fn grit_idx_rev_bytes(
     use_write_v2_pack_index: bool,
 ) -> (Vec<u8>, Vec<u8>) {
     let parallelism = Parallelism::resolve(Some(threads));
-    let records = pack_index_records_with_threads(pack, odb, parallelism).expect("index records");
+    let records = pack_index_records(pack, odb, parallelism).expect("index records");
     let hb = odb.hash_algo().len();
     let trailer = &pack[pack.len() - hb..];
     let entries: Vec<_> = records.iter().map(|r| (r.oid, r.offset, r.crc32)).collect();
@@ -572,7 +573,7 @@ fn grit_idx_rev_bytes(
     if use_write_v2_pack_index {
         write_v2_pack_index(&idx_path, &pack_path, &entries, hb).expect("write_v2_pack_index");
     } else {
-        write_v2_pack_index_with_trailer(&idx_path, &entries, trailer, hb, Some(threads))
+        write_v2_pack_index_from_trailer(&idx_path, &entries, trailer, hb, Some(threads))
             .expect("write idx");
     }
     let idx_bytes = std::fs::read(&idx_path).expect("read idx");
@@ -727,7 +728,7 @@ fn install_rejects_corrupt_trailer_with_skip_post_index_verify() {
 fn idx_and_rev_match_git_for_all_pack_shapes_sha1() {
     for shape in ALL_PACK_SHAPES {
         let fx = shared_pack(shape, HashAlgo::Sha1).expect("fixture");
-        assert_idx_rev_matches_git(&fx.bytes, fx.algo, shape);
+        assert_idx_rev_matches_git(fx.bytes, fx.algo, shape);
     }
 }
 
@@ -739,7 +740,7 @@ fn delta_pack_fixtures_contain_delta_entries() {
             shape.expects_delta_entries(),
             "test matrix mislabeled {shape:?}"
         );
-        assert_pack_contains_deltas(&fx.bytes, fx.algo, shape.label());
+        assert_pack_contains_deltas(fx.bytes, fx.algo, shape.label());
         git_verify_pack_reports_deltas(&fx.bytes, fx.algo);
     }
 }
@@ -751,7 +752,7 @@ fn idx_and_rev_match_git_for_all_pack_shapes_sha256() {
             eprintln!("skip: sha256 object format unavailable ({})", shape.label());
             continue;
         };
-        assert_idx_rev_matches_git(&fx.bytes, fx.algo, shape);
+        assert_idx_rev_matches_git(fx.bytes, fx.algo, shape);
     }
 }
 
@@ -768,10 +769,8 @@ fn pack_index_records_mixed_size_whole_objects_preserve_pack_order() {
     let pack = pb.build().bytes;
     let tmp = tempfile::tempdir().expect("odb");
     let odb = Odb::new(tmp.path());
-    let one = pack_index_records_with_threads(&pack, &odb, Parallelism::resolve(Some(1)))
-        .expect("threads=1");
-    let four = pack_index_records_with_threads(&pack, &odb, Parallelism::resolve(Some(4)))
-        .expect("threads=4");
+    let one = pack_index_records(&pack, &odb, Parallelism::resolve(Some(1))).expect("threads=1");
+    let four = pack_index_records(&pack, &odb, Parallelism::resolve(Some(4))).expect("threads=4");
     assert_eq!(one.len(), four.len());
     for (a, b) in one.iter().zip(&four) {
         assert_eq!(a.oid, b.oid, "oid at offset {}", a.offset);
@@ -800,9 +799,8 @@ fn pack_index_records_tiny_pack_many_threads_completes() {
     let tmp = tempfile::tempdir().expect("odb");
     let odb = Odb::new(tmp.path());
     for threads in [1_usize, 8, 32] {
-        let records =
-            pack_index_records_with_threads(&pack, &odb, Parallelism::resolve(Some(threads)))
-                .unwrap_or_else(|e| panic!("threads={threads}: {e}"));
+        let records = pack_index_records(&pack, &odb, Parallelism::resolve(Some(threads)))
+            .unwrap_or_else(|e| panic!("threads={threads}: {e}"));
         assert_eq!(records.len(), 2, "threads={threads}");
     }
 }
@@ -812,10 +810,10 @@ fn pack_index_records_with_threads_matches_single_thread() {
     let fx = shared_pack(PackShape::GitDelta, HashAlgo::Sha1).expect("fixture");
     let tmp = tempfile::tempdir().expect("odb");
     let odb = Odb::new(tmp.path());
-    let one = pack_index_records_with_threads(&fx.bytes, &odb, Parallelism::resolve(Some(1)))
-        .expect("threads=1");
-    let eight = pack_index_records_with_threads(&fx.bytes, &odb, Parallelism::resolve(Some(8)))
-        .expect("threads=8");
+    let one =
+        pack_index_records(&fx.bytes, &odb, Parallelism::resolve(Some(1))).expect("threads=1");
+    let eight =
+        pack_index_records(&fx.bytes, &odb, Parallelism::resolve(Some(8))).expect("threads=8");
     assert_eq!(one.len(), eight.len());
     for (a, b) in one.iter().zip(&eight) {
         assert_eq!(a.oid, b.oid);
@@ -1184,7 +1182,10 @@ fn unpack_strict_rejects_missing_tree_reference() {
     )
     .expect_err("strict unpack must fail");
     assert!(
-        matches!(err, grit_lib::error::Error::CorruptObject(_)),
+        matches!(
+            err,
+            grit_lib::error::Error::Object(ObjectError::Corrupt { .. })
+        ),
         "expected corrupt object, got {err:?}"
     );
 
@@ -1282,12 +1283,8 @@ fn pack_index_build_errors_and_thin_pack_with_odb_base() {
     let odb = Odb::new(tmp.path());
     let mut corrupt = fx.bytes.clone();
     corrupt.truncate(corrupt.len().saturating_sub(8));
-    assert!(
-        pack_index_records_with_threads(&corrupt, &odb, Parallelism::resolve(Some(1))).is_err()
-    );
-    assert!(
-        pack_index_records_with_threads(&corrupt, &odb, Parallelism::resolve(Some(4))).is_err()
-    );
+    assert!(pack_index_records(&corrupt, &odb, Parallelism::resolve(Some(1))).is_err());
+    assert!(pack_index_records(&corrupt, &odb, Parallelism::resolve(Some(4))).is_err());
 
     let repo = tempfile::tempdir().expect("repo");
     init_repo(repo.path(), false);
@@ -1315,8 +1312,8 @@ fn pack_index_build_errors_and_thin_pack_with_odb_base() {
     )
     .expect("thin");
     assert!(pack_is_thin(&thin, HashAlgo::Sha1));
-    let records = pack_index_records_with_threads(&thin, &odb, Parallelism::resolve(Some(4)))
-        .expect("thin index");
+    let records =
+        pack_index_records(&thin, &odb, Parallelism::resolve(Some(4))).expect("thin index");
     assert!(!records.is_empty());
     let thin_count = pack_object_count(&thin);
     let installed = install_pack_bytes(
@@ -1330,7 +1327,7 @@ fn pack_index_build_errors_and_thin_pack_with_odb_base() {
     )
     .expect("fix thin install");
     assert_installed_pack_consistent(
-        &installed.pack_path.as_deref().expect("installed pack"),
+        installed.pack_path.as_deref().expect("installed pack"),
         HashAlgo::Sha1,
     );
     let installed_count = pack_object_count(
@@ -1467,7 +1464,7 @@ fn fetched_thin_pack_installs_with_matching_idx_and_name() {
             "thin completion must append the base ({thin_count} -> {installed_count})"
         );
         assert_installed_pack_consistent(
-            &installed.pack_path.as_deref().expect("installed pack"),
+            installed.pack_path.as_deref().expect("installed pack"),
             HashAlgo::Sha1,
         );
         assert!(
@@ -1583,7 +1580,7 @@ fn fix_thin_install_rewrites_pack_and_index_that_git_accepts() {
 #[test]
 #[ignore = "manual RSS harness (set GRIT_PACK_IDX)"]
 fn rss_harness_verify_pack_only() {
-    use grit_lib::objects::pack::verify_pack_and_collect;
+    use grit_lib::test_support::objects_pack::verify_pack_and_collect;
     use std::path::Path;
     let idx = std::env::var("GRIT_PACK_IDX").expect("GRIT_PACK_IDX");
     verify_pack_and_collect(Path::new(&idx)).expect("verify");
@@ -1594,8 +1591,8 @@ fn rss_harness_verify_pack_only() {
 #[ignore = "manual RSS harness (GRIT_CARGO_PACK + GRIT_PACK_IDX)"]
 fn rss_harness_index_then_verify() {
     use grit_lib::objects::hash::Parallelism;
-    use grit_lib::objects::pack::verify_pack_and_collect;
-    use grit_lib::objects::unpack_objects::pack_index_records_with_threads;
+    use grit_lib::objects::unpack_objects::pack_index_records;
+    use grit_lib::test_support::objects_pack::verify_pack_and_collect;
     use std::path::Path;
     let pack = std::env::var("GRIT_CARGO_PACK").expect("GRIT_CARGO_PACK");
     let idx = std::env::var("GRIT_PACK_IDX").expect("GRIT_PACK_IDX");
@@ -1605,8 +1602,7 @@ fn rss_harness_index_then_verify() {
     let threads = std::env::var("GRIT_THREADS")
         .ok()
         .and_then(|s| s.parse().ok());
-    let _records =
-        pack_index_records_with_threads(&data, &odb, Parallelism::resolve(threads)).expect("index");
+    let _records = pack_index_records(&data, &odb, Parallelism::resolve(threads)).expect("index");
     verify_pack_and_collect(Path::new(&idx)).expect("verify");
 }
 
@@ -1615,7 +1611,7 @@ fn rss_harness_index_then_verify() {
 #[ignore = "manual RSS harness (set GRIT_CARGO_PACK)"]
 fn rss_harness_build_index_records_only() {
     use grit_lib::objects::hash::Parallelism;
-    use grit_lib::objects::unpack_objects::pack_index_records_with_threads;
+    use grit_lib::objects::unpack_objects::pack_index_records;
     use std::path::Path;
     let pack = std::env::var("GRIT_CARGO_PACK").expect("GRIT_CARGO_PACK");
     let data = std::fs::read(Path::new(&pack)).expect("read pack");
@@ -1624,8 +1620,8 @@ fn rss_harness_build_index_records_only() {
     let threads = std::env::var("GRIT_THREADS")
         .ok()
         .and_then(|s| s.parse().ok());
-    let _records = pack_index_records_with_threads(&data, &odb, Parallelism::resolve(threads))
-        .expect("index records");
+    let _records =
+        pack_index_records(&data, &odb, Parallelism::resolve(threads)).expect("index records");
 }
 
 /// Manual RSS harness: `GRIT_CARGO_PACK=/path/to.pack cargo test --release rss_harness_install_pack_path -- --ignored --exact`
@@ -1653,6 +1649,8 @@ fn rss_harness_install_pack_path() {
             skip_post_index_verify: skip_verify,
             ..Default::default()
         },
+        &mut grit_lib::progress::NullProgress,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("install pack");
 }
@@ -1672,9 +1670,9 @@ fn pack_index_build_sha256_delta_pack_threads() {
     )
     .expect("config");
     let odb = Odb::new(git_dir.join("objects").as_path()).with_config_git_dir(git_dir);
-    let one = pack_index_records_with_threads(&fx.bytes, &odb, Parallelism::resolve(Some(1)))
+    let one = pack_index_records(&fx.bytes, &odb, Parallelism::resolve(Some(1)))
         .expect("sha256 index t=1");
-    let eight = pack_index_records_with_threads(&fx.bytes, &odb, Parallelism::resolve(Some(8)))
+    let eight = pack_index_records(&fx.bytes, &odb, Parallelism::resolve(Some(8)))
         .expect("sha256 index t=8");
     assert_eq!(one.len(), eight.len());
     for (a, b) in one.iter().zip(&eight) {
@@ -1766,5 +1764,5 @@ fn read_pack_bytes_cached_serves_installed_delta_pack() {
     let cached = read_pack_bytes_cached(&pack_path).expect("read_pack_bytes_cached");
     assert_eq!(&cached[..], fx.bytes.as_slice());
     assert_pack_contains_deltas(&cached, fx.algo, "cached installed delta pack");
-    grit_lib::objects::pack::clear_pack_cache();
+    grit_lib::test_support::objects_pack::clear_pack_cache();
 }

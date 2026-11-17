@@ -25,14 +25,13 @@
 //!   the server reserved ([`CheckoutClient::reserve_work_branch`]); the
 //!   landed branch is gone here and stays on the server.
 
+use super::{CheckoutClient, CheckoutError, CheckoutMarker, IntegrateResponse, Result};
 use crate::merge_base::{is_ancestor, merge_bases_first_vs_rest};
 use crate::objects::ObjectId;
-use crate::porcelain::branch::{rename_branch, RenameBranchOptions};
+use crate::porcelain::branch::{rename_branch, BranchRenameOptions};
 use crate::porcelain::branch_error::BranchError;
 use crate::repo::Repository;
 use crate::state::{resolve_head_for_repository, HeadState};
-
-use super::{CheckoutClient, CheckoutError, CheckoutMarker, IntegrateResponse, Result};
 
 /// How many names [`move_off_landed_branch`] asks the server for before
 /// giving up on finding one that is free here.
@@ -119,7 +118,7 @@ impl CheckoutMarker {
     /// # Returns
     ///
     /// Whether it was not noted already.
-    pub fn record_landed(&mut self, tip: ObjectId) -> bool {
+    pub(crate) fn record_landed(&mut self, tip: ObjectId) -> bool {
         let hex = tip.to_hex();
         if self.landed.contains(&hex) {
             return false;
@@ -163,7 +162,7 @@ impl CheckoutMarker {
 /// # Errors
 ///
 /// Marker write failures.
-pub fn record_landed(
+pub(crate) fn record_landed(
     repo: &Repository,
     marker: &CheckoutMarker,
     tip: ObjectId,
@@ -175,36 +174,8 @@ pub fn record_landed(
     Ok(current)
 }
 
-/// Decide what the integration the server answered with `response`
-/// ([`CheckoutClient::integrate`]) means for the checkout `repo`, and record
-/// what landed. Call it right after the integration, then refresh the
-/// checkout ([`super::refresh`]), then call [`Landing::move_off`].
-///
-/// The work landed here when the branch the server merged into
-/// ([`IntegrateResponse::target`]) is exactly the one the checkout snapshots
-/// ([`CheckoutMarker::branch`]); a case variant may be another branch on the
-/// server, and treating it as this one would drop the branch's commits from
-/// the next snapshot. A merge and an answer that the target already had the
-/// branch both mean the tip this integration checked in, `checked_in`, is in
-/// the target, so it is recorded as landed ([`record_landed`]): later
-/// refreshes never replay its commits. Otherwise nothing is recorded.
-///
-/// # Parameters
-///
-/// - `repo`: the checkout.
-/// - `marker`: its marker, used when the one on disk can't be read.
-/// - `response`: the server's answer to the integration.
-/// - `checked_in`: the tip of the integrated branch this integration checked
-///   in first (its raw, local commit), if any.
-///
-/// # Returns
-///
-/// [`Landing::Here`] or [`Landing::Elsewhere`].
-///
-/// # Errors
-///
-/// Marker write failures.
-pub fn land_integration(
+/// [`RepositorySnapshotCheckouts::land_integration`](crate::repo_handles::RepositorySnapshotCheckouts::land_integration) for `repo`.
+pub(crate) fn land_integration(
     repo: &Repository,
     marker: &CheckoutMarker,
     response: &IntegrateResponse,
@@ -352,7 +323,7 @@ fn builds_on(
 ///
 /// The server's refusal, [`CheckoutError::WorkBranchTaken`] when every name
 /// it reserved is a branch here already, and ref and config failures.
-pub fn move_off_landed_branch(
+pub(crate) fn move_off_landed_branch(
     repo: &Repository,
     client: &CheckoutClient<'_>,
     branch: &str,
@@ -379,7 +350,7 @@ pub fn move_off_landed_branch(
         let name = client.reserve_work_branch(&marker.id, wanted)?;
         let renamed = rename_branch(
             repo,
-            &RenameBranchOptions {
+            &BranchRenameOptions {
                 old: branch.to_owned(),
                 new: name.clone(),
                 force: false,
@@ -395,10 +366,10 @@ pub fn move_off_landed_branch(
                 }))
             }
             Err(crate::error::Error::Branch(BranchError::AlreadyExists { .. })) => last = name,
-            Err(e) => return Err(e.into()),
+            Err(e) => return Err(e),
         }
     }
-    Err(CheckoutError::WorkBranchTaken { name: last })
+    Err(CheckoutError::WorkBranchTaken { name: last }.into())
 }
 
 #[cfg(test)]
@@ -453,7 +424,7 @@ mod tests {
     #[test]
     fn only_work_merged_into_the_branch_the_checkout_snapshots_lands() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let repo = Repository::init(dir.path(), &InitOptions::default()).expect("init");
+        let (repo, _) = Repository::init(dir.path(), &InitOptions::default()).expect("init");
         marker().write(repo.git_dir()).expect("marker");
         let tip = ObjectId::from_hex("1111111111111111111111111111111111111111").expect("oid");
 

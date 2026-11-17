@@ -7,6 +7,8 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
+use std::os::unix::ffi::OsStringExt;
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 
 use crate::config::{parse_path, ConfigSet};
@@ -14,8 +16,12 @@ use crate::error::{Error, Result};
 use crate::ewah_bitmap::EwahBitmap;
 use crate::ignore::IgnoreMatcher;
 use crate::index::{Index, MODE_GITLINK};
+use crate::index::{IndexCorrupt, IndexCorruptReason, IndexError};
 use crate::objects::{HashAlgo, ObjectId, ObjectKind};
 use crate::repo::Repository;
+use crate::repo_relpath::{
+    self, directory_marker_stored, format_path_stored, storage_bytes, storage_string, worktree_abs,
+};
 
 /// `DIR_SHOW_OTHER_DIRECTORIES` constant.
 pub const DIR_SHOW_OTHER_DIRECTORIES: u32 = 1 << 1;
@@ -28,11 +34,11 @@ pub const AUTO_UNTRACKED_CACHE_MIN_ENTRIES: usize = 4096;
 
 /// Whether status may refresh and read the index UNTR extension for this repository.
 #[must_use]
-pub fn untracked_cache_enabled_for_status(config: &ConfigSet, index: &Index) -> bool {
+pub(crate) fn untracked_cache_enabled_for_status(config: &ConfigSet, index: &Index) -> bool {
     if index.untracked_cache.is_none() {
         return false;
     }
-    match config.get_bool("core.untrackedCache").and_then(|r| r.ok()) {
+    match config.get_bool("core.untrackedCache").ok().flatten() {
         Some(false) => false,
         Some(true) => true,
         None => index.entries.len() >= AUTO_UNTRACKED_CACHE_MIN_ENTRIES,
@@ -40,11 +46,15 @@ pub fn untracked_cache_enabled_for_status(config: &ConfigSet, index: &Index) -> 
 }
 
 /// Ensure a UNTR shell exists on large indices so the next status can populate it.
-pub fn ensure_untracked_cache_shell(index: &mut Index, work_tree: &Path, config: &ConfigSet) {
+pub(crate) fn ensure_untracked_cache_shell(
+    index: &mut Index,
+    work_tree: &Path,
+    config: &ConfigSet,
+) {
     if index.untracked_cache.is_some() {
         return;
     }
-    if config.get_bool("core.untrackedCache").and_then(|r| r.ok()) == Some(false) {
+    if !config.bool_with_default("core.untrackedCache", true) {
         return;
     }
     if index.entries.len() < AUTO_UNTRACKED_CACHE_MIN_ENTRIES {
@@ -322,11 +332,11 @@ fn write_one_dir(ucd: &UntrackedCacheDir, wd: &mut WriteDirCtx<'_>) {
     let recurse_count = ucd.dirs.iter().filter(|d| d.recurse).count() as u64;
     encode_varint(recurse_count, &mut wd.out);
 
-    wd.out.extend_from_slice(ucd.name.as_bytes());
+    wd.out.extend_from_slice(&storage_bytes(&ucd.name));
     wd.out.push(0);
 
     for n in &ucd.untracked {
-        wd.out.extend_from_slice(n.as_bytes());
+        wd.out.extend_from_slice(&storage_bytes(n));
         wd.out.push(0);
     }
 
@@ -392,10 +402,21 @@ pub fn write_untracked_extension(uc: &UntrackedCache) -> Vec<u8> {
 }
 
 /// Parse UNTR body (after 4-byte signature + 4-byte size).
-pub fn parse_untracked_extension(data: &[u8]) -> Option<UntrackedCache> {
+pub(crate) fn parse_untracked_extension(data: &[u8]) -> crate::error::Result<UntrackedCache> {
     if data.len() <= 1 || data[data.len() - 1] != 0 {
-        return None;
+        return Err(IndexError::corrupt_at(
+            None,
+            data.len().checked_sub(1),
+            IndexCorruptReason::UntrackedCacheMissingNul,
+        )
+        .into());
     }
+    Ok(parse_untracked_extension_body(data).ok_or_else(|| {
+        IndexError::corrupt_at(None, None, IndexCorruptReason::UntrackedCacheDirCorrupt)
+    })?)
+}
+
+fn parse_untracked_extension_body(data: &[u8]) -> Option<UntrackedCache> {
     let end = data.len() - 1;
     let data = &data[..end];
 
@@ -466,14 +487,14 @@ pub fn parse_untracked_extension(data: &[u8]) -> Option<UntrackedCache> {
 
         let name_start = *pos;
         let name_end = name_start + data[name_start..].iter().position(|&b| b == 0)?;
-        let name = String::from_utf8(data[name_start..name_end].to_vec()).ok()?;
+        let name = storage_string(&data[name_start..name_end]);
         *pos = name_end + 1;
 
         let mut untracked = Vec::with_capacity(untracked_nr);
         for _ in 0..untracked_nr {
             let s = *pos;
             let e = s + data[s..].iter().position(|&b| b == 0)?;
-            untracked.push(String::from_utf8(data[s..e].to_vec()).ok()?);
+            untracked.push(storage_string(&data[s..e]));
             *pos = e + 1;
         }
 
@@ -577,7 +598,7 @@ pub fn parse_untracked_extension(data: &[u8]) -> Option<UntrackedCache> {
 /// work tree path normalized like `git rev-parse --show-toplevel` (`user_display_path`: no
 /// `\\?\` prefix, forward slashes, no trailing slash). The system name is `uname().sysname`
 /// on Unix and `Windows` on Windows (Git's own uname, not MSYS `MINGW64_NT-…`).
-pub fn untracked_cache_ident(work_tree: &Path) -> Vec<u8> {
+pub(crate) fn untracked_cache_ident(work_tree: &Path) -> Vec<u8> {
     #[cfg(unix)]
     let sysname = match nix::sys::utsname::uname() {
         Ok(uts) => uts.sysname().to_string_lossy().into_owned(),
@@ -598,10 +619,9 @@ pub fn untracked_cache_ident(work_tree: &Path) -> Vec<u8> {
 }
 
 /// `dir_flags_from_config` function.
-pub fn dir_flags_from_config(config: &ConfigSet) -> u32 {
+pub(crate) fn dir_flags_from_config(config: &ConfigSet) -> u32 {
     if config
-        .get("status.showUntrackedFiles")
-        .or_else(|| config.get("status.showuntrackedfiles"))
+        .value("status.showUntrackedFiles")
         .is_some_and(|v| v.eq_ignore_ascii_case("all"))
     {
         0
@@ -612,10 +632,7 @@ pub fn dir_flags_from_config(config: &ConfigSet) -> u32 {
 
 fn global_excludes_path(repo: &Repository, config: &ConfigSet) -> Option<PathBuf> {
     let env = repo.environment();
-    if let Some(raw) = config
-        .get("core.excludesFile")
-        .or_else(|| config.get("core.excludesfile"))
-    {
+    if let Some(raw) = config.value("core.excludesFile") {
         let expanded = parse_path(env, &raw);
         let p = Path::new(&expanded);
         if p.is_absolute() {
@@ -697,7 +714,7 @@ fn invalidate_one_directory_for_path(uc: &mut UntrackedCache, dir: &mut Untracke
 }
 
 /// `invalidate_path` function.
-pub fn invalidate_path(uc: &mut UntrackedCache, path: &str) {
+pub(crate) fn invalidate_path(uc: &mut UntrackedCache, path: &str) {
     let Some(mut root) = uc.root.take() else {
         return;
     };
@@ -728,23 +745,118 @@ fn invalidate_one_component(
     }
 }
 
-fn has_tracked_under(
-    tracked: &BTreeSet<String>,
-    gitlinks: &BTreeSet<String>,
-    rel_dir: &str,
-) -> bool {
-    let prefix = if rel_dir.is_empty() {
-        String::new()
-    } else {
-        format!("{rel_dir}/")
-    };
-    tracked
-        .range::<String, _>(prefix.clone()..)
-        .next()
-        .is_some_and(|t| t.starts_with(&prefix))
-        || gitlinks.iter().any(|g| {
-            g.as_str() == rel_dir || (!rel_dir.is_empty() && g.starts_with(&format!("{rel_dir}/")))
+/// Whether `path` lies strictly under directory `dir` (`dir/…`), using raw index path bytes.
+fn index_path_is_strictly_under_dir(path: &[u8], dir: &[u8]) -> bool {
+    path.len() > dir.len() && path.starts_with(dir) && path[dir.len()] == b'/'
+}
+
+/// Indexed probe for index entries at or under a stored directory during UNTR refresh.
+///
+/// Uses binary search on sorted path bytes; descendant detection may scan the matching
+/// index run (same as [`Index::sorted_entries_under`] on sorted indexes).
+struct TrackedUnderLookup<'a> {
+    index: &'a Index,
+    unsorted_paths: Option<Vec<Vec<u8>>>,
+    gitlink_paths: Vec<Vec<u8>>,
+}
+
+impl<'a> TrackedUnderLookup<'a> {
+    fn new(index: &'a Index) -> Self {
+        let mut gitlink_paths: Vec<Vec<u8>> = index
+            .entries
+            .iter()
+            .filter(|e| e.mode == MODE_GITLINK)
+            .map(|e| e.path.clone())
+            .collect();
+        gitlink_paths.sort();
+        gitlink_paths.dedup();
+        let unsorted_paths = if index.entries_sorted {
+            None
+        } else {
+            let mut paths: Vec<Vec<u8>> = index.entries.iter().map(|e| e.path.to_vec()).collect();
+            paths.sort();
+            Some(paths)
+        };
+        Self {
+            index,
+            unsorted_paths,
+            gitlink_paths,
+        }
+    }
+
+    fn has_gitlink_at_dir(&self, dir: &[u8]) -> bool {
+        if self.index.entries_sorted {
+            return self.index.has_gitlink_at(dir);
+        }
+        self.gitlink_paths
+            .binary_search_by(|p| tracked_under_path_cmp(p.as_slice(), dir))
+            .is_ok()
+    }
+
+    fn has_strict_descendant_under(&self, dir: &[u8]) -> bool {
+        if self.index.entries_sorted {
+            return self
+                .index
+                .sorted_entries_under(dir)
+                .is_some_and(|run| !run.is_empty());
+        }
+        let Some(paths) = self.unsorted_paths.as_ref() else {
+            return false;
+        };
+        let mut prefix = dir.to_vec();
+        prefix.push(b'/');
+        let start = paths
+            .partition_point(|p| tracked_under_path_cmp(p.as_slice(), prefix.as_slice()).is_lt());
+        start < paths.len() && index_path_is_strictly_under_dir(&paths[start], dir)
+    }
+
+    fn has_tracked_under(&self, rel_dir: &str) -> bool {
+        let dir = storage_bytes(rel_dir);
+        if dir.is_empty() {
+            return !self.index.entries.is_empty();
+        }
+        let dir_ref = dir.as_ref();
+        if self.has_gitlink_at_dir(dir_ref) {
+            return true;
+        }
+        self.has_strict_descendant_under(dir_ref)
+    }
+}
+
+#[cfg(test)]
+fn tracked_under_path_cmp(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+    tracked_under_path_cmp_counter::bump();
+    a.cmp(b)
+}
+
+#[cfg(not(test))]
+fn tracked_under_path_cmp(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+    a.cmp(b)
+}
+
+#[cfg(test)]
+mod tracked_under_path_cmp_counter {
+    use std::cell::Cell;
+
+    thread_local! {
+        static COUNT: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub fn reset() {
+        COUNT.with(|c| c.set(0));
+    }
+
+    pub fn take() -> usize {
+        COUNT.with(|c| {
+            let n = c.get();
+            c.set(0);
+            n
         })
+    }
+
+    pub fn bump() {
+        COUNT.with(|c| c.set(c.get() + 1));
+    }
 }
 
 fn has_hidden_untracked_file_or_dir(
@@ -767,8 +879,8 @@ fn has_hidden_untracked_file_or_dir(
     let mut sorted: Vec<_> = entries.filter_map(|e| e.ok()).collect();
     sorted.sort_by_key(|e| e.file_name());
     for entry in sorted {
-        let name = entry.file_name().to_string_lossy().to_string();
-        if name == ".git" {
+        let name = dir_entry_name_bytes(&entry);
+        if name == b".git" {
             continue;
         }
         let path = entry.path();
@@ -788,7 +900,7 @@ fn has_hidden_untracked_file_or_dir(
             }
         } else if !crate::read_dir_kind::entry_is_git_ignored_special(&entry).unwrap_or(true) {
             let is_ign = matcher.is_path_ignored(repo, Some(index), &child_rel, false)?;
-            if !is_ign && name.starts_with('.') {
+            if !is_ign && name.first() == Some(&b'.') {
                 return Ok(true);
             }
         }
@@ -815,8 +927,8 @@ fn has_ignored_entry_or_dir(
     let mut sorted: Vec<_> = entries.filter_map(|e| e.ok()).collect();
     sorted.sort_by_key(|e| e.file_name());
     for entry in sorted {
-        let name = entry.file_name().to_string_lossy().to_string();
-        if name == ".git" {
+        let name = dir_entry_name_bytes(&entry);
+        if name == b".git" {
             continue;
         }
         let path = entry.path();
@@ -843,12 +955,47 @@ fn has_ignored_entry_or_dir(
     Ok(false)
 }
 
-fn relative_path(parent: &str, name: &str) -> String {
-    if parent.is_empty() {
-        name.to_string()
-    } else {
-        format!("{parent}/{name}")
-    }
+#[cfg(unix)]
+fn dir_entry_name_bytes(entry: &std::fs::DirEntry) -> Vec<u8> {
+    entry.file_name().into_vec()
+}
+
+#[cfg(not(unix))]
+fn dir_entry_name_bytes(entry: &std::fs::DirEntry) -> Vec<u8> {
+    entry
+        .file_name()
+        .to_string_lossy()
+        .into_owned()
+        .into_bytes()
+}
+
+fn relative_path(parent: &str, name: &[u8]) -> String {
+    format_path_stored(parent, name)
+}
+
+fn join_stored_paths(parent: &str, child: &str) -> String {
+    let parent_bytes = storage_bytes(parent);
+    let child_bytes = storage_bytes(child);
+    storage_string(&repo_relpath::join_rel(&parent_bytes, &child_bytes))
+}
+
+fn stored_dir_name(rel: &str) -> String {
+    let bytes = storage_bytes(rel);
+    storage_string(repo_relpath::file_name(&bytes))
+}
+
+#[cfg(unix)]
+fn append_stored_component(abs: &Path, comp: &str) -> PathBuf {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    let mut child = abs.to_path_buf();
+    child.push(OsStr::from_bytes(&storage_bytes(comp)));
+    child
+}
+
+#[cfg(not(unix))]
+fn append_stored_component(abs: &Path, comp: &str) -> PathBuf {
+    abs.join(std::str::from_utf8(&storage_bytes(comp)).unwrap_or(comp))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -968,10 +1115,17 @@ enum DirSource {
         child_dirs: Vec<UntrackedCacheDir>,
         child_files: Vec<String>,
     },
+    #[cfg(windows)]
+    WinListing {
+        listing: std::sync::Arc<crate::windows_dir_listing::WindowsDirListing>,
+        names: Vec<Vec<u8>>,
+        idx: usize,
+        abs_parent: PathBuf,
+    },
 }
 
 /// When the UNTR root still matches the work tree, return cached untracked paths without rescanning.
-pub fn try_untracked_from_valid_cache(
+pub(crate) fn try_untracked_from_valid_cache(
     repo: &Repository,
     work_tree: &Path,
     config: &ConfigSet,
@@ -1002,7 +1156,7 @@ pub fn try_untracked_from_valid_cache(
 }
 
 /// Refresh untracked cache tree and counters (for `git status`).
-pub fn refresh_untracked_cache_for_status(
+pub(crate) fn refresh_untracked_cache_for_status(
     repo: &Repository,
     index: &Index,
     work_tree: &Path,
@@ -1010,7 +1164,8 @@ pub fn refresh_untracked_cache_for_status(
     uc: &mut UntrackedCache,
     show_all_untracked: bool,
     ignored_mode: UntrackedIgnoredMode,
-    cancel_watch: Option<&std::sync::atomic::AtomicBool>,
+    cancel: Option<&crate::progress::CancelToken>,
+    listing_cache: Option<&crate::windows_dir_listing::WorktreeListingCache>,
 ) -> Result<()> {
     uc.reset_stats();
     let requested_flags = if show_all_untracked {
@@ -1034,24 +1189,26 @@ pub fn refresh_untracked_cache_for_status(
     let tracked: BTreeSet<String> = index
         .entries
         .iter()
-        .map(|e| String::from_utf8_lossy(&e.path).into_owned())
+        .map(|e| storage_string(&e.path))
         .collect();
     let gitlinks: BTreeSet<String> = index
         .entries
         .iter()
         .filter(|e| e.stage() == 0 && e.mode == MODE_GITLINK)
-        .map(|e| String::from_utf8_lossy(&e.path).into_owned())
+        .map(|e| storage_string(&e.path))
         .collect();
 
     let mut matcher = IgnoreMatcher::from_repository(repo)?;
+    let tracked_under = TrackedUnderLookup::new(index);
 
     if uc.root.is_none() {
         uc.root = Some(UntrackedCacheDir::new(String::new()));
     }
-    let mut root = uc
-        .root
-        .take()
-        .ok_or_else(|| Error::IndexError("no uc root".into()))?;
+    let mut root = uc.root.take().ok_or_else(|| {
+        Error::from(IndexError::corrupt(IndexCorrupt::new(
+            IndexCorruptReason::UntrackedCacheNoRoot,
+        )))
+    })?;
 
     read_directory_recursive(
         repo,
@@ -1059,6 +1216,7 @@ pub fn refresh_untracked_cache_for_status(
         work_tree,
         &tracked,
         &gitlinks,
+        &tracked_under,
         &mut matcher,
         ignored_mode,
         show_all_untracked,
@@ -1067,7 +1225,8 @@ pub fn refresh_untracked_cache_for_status(
         "",
         work_tree,
         uc,
-        cancel_watch,
+        cancel,
+        listing_cache,
     )?;
 
     collapse_tracked_only_untr_subtree(&mut root);
@@ -1107,7 +1266,7 @@ fn collapse_tracked_only_untr_subtree(dir: &mut UntrackedCacheDir) {
 /// [`refresh_untracked_cache_for_status`], including collapsed `dir/` entries in
 /// normal untracked mode and fully expanded file paths in `-uall` mode.
 #[must_use]
-pub fn collect_untracked_from_cache(uc: &UntrackedCache) -> Vec<String> {
+pub(crate) fn collect_untracked_from_cache(uc: &UntrackedCache) -> Vec<String> {
     fn walk(dir: &UntrackedCacheDir, rel: &str, out: &mut Vec<String>) {
         if dir.check_only {
             return;
@@ -1116,7 +1275,7 @@ pub fn collect_untracked_from_cache(uc: &UntrackedCache) -> Vec<String> {
             if rel.is_empty() {
                 out.push(name.clone());
             } else {
-                out.push(format!("{rel}/{name}"));
+                out.push(join_stored_paths(rel, name));
             }
         }
         let mut children: Vec<&UntrackedCacheDir> = dir
@@ -1129,7 +1288,7 @@ pub fn collect_untracked_from_cache(uc: &UntrackedCache) -> Vec<String> {
             let child_rel = if rel.is_empty() {
                 child.name.clone()
             } else {
-                format!("{rel}/{}", child.name)
+                join_stored_paths(rel, &child.name)
             };
             walk(child, &child_rel, out);
         }
@@ -1149,6 +1308,7 @@ fn read_directory_recursive(
     work_tree: &Path,
     tracked: &BTreeSet<String>,
     gitlinks: &BTreeSet<String>,
+    tracked_under: &TrackedUnderLookup<'_>,
     matcher: &mut IgnoreMatcher,
     ignored_mode: UntrackedIgnoredMode,
     show_all: bool,
@@ -1157,14 +1317,15 @@ fn read_directory_recursive(
     rel: &str,
     abs: &Path,
     uc: &mut UntrackedCache,
-    cancel_watch: Option<&std::sync::atomic::AtomicBool>,
+    cancel: Option<&crate::progress::CancelToken>,
+    listing_cache: Option<&crate::windows_dir_listing::WorktreeListingCache>,
 ) -> Result<()> {
     let parent_exclude_rel = if rel.is_empty() {
         ".gitignore".to_string()
     } else {
-        format!("{rel}/.gitignore")
+        join_stored_paths(rel, ".gitignore")
     };
-    let parent_exclude_path = work_tree.join(&parent_exclude_rel);
+    let parent_exclude_path = worktree_abs(work_tree, &parent_exclude_rel);
     let tracked_ignore_oid = tracked_ignore_blob_oid(index, &parent_exclude_rel);
     let parent_exclude_oid = match fs::metadata(&parent_exclude_path) {
         Ok(_) => {
@@ -1194,7 +1355,28 @@ fn read_directory_recursive(
         } else {
             abs.to_path_buf()
         };
-        DirSource::Disk(fs::read_dir(&p).map_err(Error::Io)?)
+        #[cfg(windows)]
+        if let Some(cache) = listing_cache {
+            if let Ok(listing) = cache.listing(&p, 0) {
+                let mut names: Vec<_> = listing.by_name.keys().cloned().collect();
+                names.sort();
+                DirSource::WinListing {
+                    listing,
+                    names,
+                    idx: 0,
+                    abs_parent: p,
+                }
+            } else {
+                DirSource::Disk(fs::read_dir(&p).map_err(Error::Io)?)
+            }
+        } else {
+            DirSource::Disk(fs::read_dir(&p).map_err(Error::Io)?)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = listing_cache;
+            DirSource::Disk(fs::read_dir(&p).map_err(Error::Io)?)
+        }
     } else {
         let mut child_dirs: Vec<_> = ucd
             .dirs
@@ -1216,24 +1398,48 @@ fn read_directory_recursive(
     ucd.check_only = check_only;
 
     loop {
-        if let Some(watch) = cancel_watch {
-            crate::progress::poll_watch(watch)?;
+        if let Some(token) = cancel {
+            token.poll_result()?;
         }
         let next = match &mut src {
             DirSource::Disk(rd) => {
                 let Some(Ok(entry)) = rd.next() else {
                     break;
                 };
-                let name = entry.file_name().to_string_lossy().into_owned();
-                if name == ".git" {
+                let name_bytes = dir_entry_name_bytes(&entry);
+                if name_bytes == b".git" {
                     continue;
                 }
+                let stored_name = storage_string(&name_bytes);
                 let path = entry.path();
                 let is_dir = crate::read_dir_kind::entry_is_dir(&entry)?;
                 if !is_dir && crate::read_dir_kind::entry_is_git_ignored_special(&entry)? {
                     continue;
                 }
-                Some((name, path, is_dir))
+                Some((stored_name, name_bytes, path, is_dir))
+            }
+            #[cfg(windows)]
+            DirSource::WinListing {
+                listing,
+                names,
+                idx,
+                abs_parent,
+            } => {
+                if *idx >= names.len() {
+                    break;
+                }
+                let name_bytes = names[*idx].clone();
+                *idx += 1;
+                if name_bytes == b".git" {
+                    continue;
+                }
+                let Some(entry) = listing.by_name.get(&name_bytes) else {
+                    continue;
+                };
+                let stored_name = storage_string(&name_bytes);
+                let path = abs_parent.join(String::from_utf8_lossy(&name_bytes).into_owned());
+                let is_dir = entry.stat.is_dir;
+                Some((stored_name, name_bytes, path, is_dir))
             }
             DirSource::Cache {
                 dir_idx,
@@ -1247,12 +1453,18 @@ fn read_directory_recursive(
                 if *dir_idx < child_dirs.len() {
                     let d = &child_dirs[*dir_idx];
                     *dir_idx += 1;
-                    let child_abs = if rel.is_empty() {
-                        work_tree.join(&d.name)
+                    let child_rel = if rel.is_empty() {
+                        d.name.clone()
                     } else {
-                        work_tree.join(rel).join(&d.name)
+                        join_stored_paths(rel, &d.name)
                     };
-                    Some((d.name.clone(), child_abs, true))
+                    let child_abs = worktree_abs(work_tree, &child_rel);
+                    Some((
+                        d.name.clone(),
+                        storage_bytes(&d.name).into_owned(),
+                        child_abs,
+                        true,
+                    ))
                 } else if *file_idx < child_files.len() {
                     let n = child_files[*file_idx].clone();
                     *file_idx += 1;
@@ -1265,26 +1477,22 @@ fn read_directory_recursive(
                     let child_rel = if rel.is_empty() {
                         n.clone()
                     } else {
-                        format!("{rel}/{n}")
+                        join_stored_paths(rel, &n)
                     };
-                    let child_abs = work_tree.join(&child_rel);
+                    let child_abs = worktree_abs(work_tree, &child_rel);
                     let is_dir = child_abs.is_dir();
-                    let base = Path::new(&n)
-                        .file_name()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or(&n)
-                        .to_string();
-                    Some((base, child_abs, is_dir))
+                    let name_bytes = storage_bytes(&n).into_owned();
+                    Some((n, name_bytes, child_abs, is_dir))
                 } else {
                     break;
                 }
             }
         };
 
-        let Some((name, path, is_dir)) = next else {
+        let Some((stored_name, name_bytes, path, is_dir)) = next else {
             continue;
         };
-        let child_rel = relative_path(rel, &name);
+        let child_rel = relative_path(rel, &name_bytes);
 
         if is_dir && gitlinks.contains(&child_rel) {
             continue;
@@ -1300,6 +1508,7 @@ fn read_directory_recursive(
                 work_tree,
                 tracked,
                 gitlinks,
+                tracked_under,
                 matcher,
                 ignored_mode,
                 show_all,
@@ -1307,7 +1516,8 @@ fn read_directory_recursive(
                 &child_rel,
                 &path,
                 uc,
-                cancel_watch,
+                cancel,
+                listing_cache,
             )?;
         } else {
             let is_ign = matcher.is_path_ignored(repo, Some(index), &child_rel, false)?;
@@ -1315,7 +1525,7 @@ fn read_directory_recursive(
                 continue;
             }
             if use_disk {
-                ucd.untracked.push(name);
+                ucd.untracked.push(stored_name);
             }
         }
     }
@@ -1348,6 +1558,7 @@ fn visit_untracked_directory_uc(
     work_tree: &Path,
     tracked: &BTreeSet<String>,
     gitlinks: &BTreeSet<String>,
+    tracked_under: &TrackedUnderLookup<'_>,
     matcher: &mut IgnoreMatcher,
     ignored_mode: UntrackedIgnoredMode,
     show_all: bool,
@@ -1355,18 +1566,15 @@ fn visit_untracked_directory_uc(
     rel: &str,
     abs: &Path,
     uc: &mut UntrackedCache,
-    cancel_watch: Option<&std::sync::atomic::AtomicBool>,
+    cancel: Option<&crate::progress::CancelToken>,
+    listing_cache: Option<&crate::windows_dir_listing::WorktreeListingCache>,
 ) -> Result<()> {
-    if let Some(watch) = cancel_watch {
-        crate::progress::poll_watch(watch)?;
+    if let Some(token) = cancel {
+        token.poll_result()?;
     }
-    let name = Path::new(rel)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or(rel)
-        .to_string();
+    let name = stored_dir_name(rel);
 
-    if has_tracked_under(tracked, gitlinks, rel) {
+    if tracked_under.has_tracked_under(rel) {
         let child = lookup_or_create_child(parent_ucd, &name, uc);
         return read_directory_recursive(
             repo,
@@ -1374,6 +1582,7 @@ fn visit_untracked_directory_uc(
             work_tree,
             tracked,
             gitlinks,
+            tracked_under,
             matcher,
             ignored_mode,
             show_all,
@@ -1382,7 +1591,8 @@ fn visit_untracked_directory_uc(
             rel,
             abs,
             uc,
-            cancel_watch,
+            cancel,
+            listing_cache,
         );
     }
 
@@ -1421,6 +1631,7 @@ fn visit_untracked_directory_uc(
             work_tree,
             tracked,
             gitlinks,
+            tracked_under,
             matcher,
             ignored_mode,
             true,
@@ -1429,7 +1640,8 @@ fn visit_untracked_directory_uc(
             rel,
             abs,
             uc,
-            cancel_watch,
+            cancel,
+            listing_cache,
         );
     }
 
@@ -1446,7 +1658,7 @@ fn visit_untracked_directory_uc(
                 check_only_tree_has_visible_untracked(repo, index, matcher, rel, candidate)?;
             parent_ucd.dirs[idx].recurse = true;
             if has_visible {
-                let collapsed = format!("{name}/");
+                let collapsed = directory_marker_stored(rel);
                 if !parent_ucd.untracked.iter().any(|u| u == &collapsed) {
                     parent_ucd.untracked.push(collapsed);
                 }
@@ -1465,6 +1677,7 @@ fn visit_untracked_directory_uc(
         work_tree,
         tracked,
         gitlinks,
+        tracked_under,
         matcher,
         ignored_mode,
         true,
@@ -1483,6 +1696,7 @@ fn visit_untracked_directory_uc(
             work_tree,
             tracked,
             gitlinks,
+            tracked_under,
             matcher,
             ignored_mode,
             true,
@@ -1491,7 +1705,8 @@ fn visit_untracked_directory_uc(
             rel,
             abs,
             uc,
-            cancel_watch,
+            cancel,
+            listing_cache,
         );
     }
 
@@ -1570,7 +1785,7 @@ fn visit_untracked_directory_uc(
         // reopening directories and overcounting `opendir` trace stats.
         let child = lookup_or_create_child(parent_ucd, &name, uc);
         populate_check_only_subtree(child, rel, abs, &sub_untracked, uc);
-        let collapsed = format!("{name}/");
+        let collapsed = directory_marker_stored(rel);
         if !parent_ucd.untracked.iter().any(|u| u == &collapsed) {
             parent_ucd.untracked.push(collapsed);
         }
@@ -1602,7 +1817,7 @@ fn populate_check_only_subtree(
     let prefix = if rel.is_empty() {
         String::new()
     } else {
-        format!("{rel}/")
+        directory_marker_stored(rel)
     };
     for full in sub_untracked {
         let rest = if prefix.is_empty() {
@@ -1619,7 +1834,7 @@ fn populate_check_only_subtree(
         if parts.is_empty() {
             continue;
         }
-        insert_check_only_path(root, abs, &parts, uc);
+        insert_check_only_path(root, abs, rel, &parts, uc);
     }
     sort_untracked_tree(root);
 }
@@ -1627,6 +1842,7 @@ fn populate_check_only_subtree(
 fn insert_check_only_path(
     dir: &mut UntrackedCacheDir,
     dir_abs: &Path,
+    dir_stored: &str,
     parts: &[&str],
     uc: &mut UntrackedCache,
 ) {
@@ -1642,11 +1858,12 @@ fn insert_check_only_path(
     }
 
     let comp = parts[0];
-    let collapsed = format!("{comp}/");
+    let collapsed = directory_marker_stored(comp);
     if !dir.untracked.iter().any(|u| u == &collapsed) {
         dir.untracked.push(collapsed);
     }
-    let child_abs = dir_abs.join(comp);
+    let child_stored = join_stored_paths(dir_stored, comp);
+    let child_abs = append_stored_component(dir_abs, comp);
     let child = lookup_or_create_child(dir, comp, uc);
     child.recurse = true;
     child.check_only = true;
@@ -1655,7 +1872,7 @@ fn insert_check_only_path(
     if let Ok(meta) = fs::symlink_metadata(&child_abs) {
         child.stat_data = stat_data_from_meta(&meta);
     }
-    insert_check_only_path(child, &child_abs, &parts[1..], uc);
+    insert_check_only_path(child, &child_abs, &child_stored, &parts[1..], uc);
 }
 
 fn sort_untracked_tree(dir: &mut UntrackedCacheDir) {
@@ -1674,14 +1891,12 @@ fn check_only_tree_has_visible_untracked(
     rel: &str,
     dir: &UntrackedCacheDir,
 ) -> Result<bool> {
-    let prefix = if rel.is_empty() {
-        String::new()
-    } else {
-        format!("{rel}/")
-    };
-
     for file in &dir.untracked {
-        let path = format!("{prefix}{file}");
+        let path = if rel.is_empty() {
+            file.clone()
+        } else {
+            join_stored_paths(rel, file)
+        };
         let (is_ignored, _) = matcher.check_path(repo, Some(index), &path, false)?;
         if !is_ignored {
             return Ok(true);
@@ -1692,7 +1907,7 @@ fn check_only_tree_has_visible_untracked(
         let child_rel = if rel.is_empty() {
             child.name.clone()
         } else {
-            format!("{rel}/{}", child.name)
+            join_stored_paths(rel, &child.name)
         };
         if check_only_tree_has_visible_untracked(repo, index, matcher, &child_rel, child)? {
             return Ok(true);
@@ -1708,6 +1923,7 @@ fn visit_untracked_node_full(
     work_tree: &Path,
     tracked: &BTreeSet<String>,
     gitlinks: &BTreeSet<String>,
+    tracked_under: &TrackedUnderLookup<'_>,
     matcher: &mut IgnoreMatcher,
     ignored_mode: UntrackedIgnoredMode,
     show_all: bool,
@@ -1728,8 +1944,8 @@ fn visit_untracked_node_full(
     sorted.sort_by_key(|e| e.file_name());
 
     for entry in sorted {
-        let name = entry.file_name().to_string_lossy().to_string();
-        if name == ".git" {
+        let name = dir_entry_name_bytes(&entry);
+        if name == b".git" {
             continue;
         }
         let path = entry.path();
@@ -1750,6 +1966,7 @@ fn visit_untracked_node_full(
                 work_tree,
                 tracked,
                 gitlinks,
+                tracked_under,
                 matcher,
                 ignored_mode,
                 show_all,
@@ -1779,6 +1996,7 @@ fn visit_untracked_directory_collect(
     work_tree: &Path,
     tracked: &BTreeSet<String>,
     gitlinks: &BTreeSet<String>,
+    tracked_under: &TrackedUnderLookup<'_>,
     matcher: &mut IgnoreMatcher,
     ignored_mode: UntrackedIgnoredMode,
     show_all: bool,
@@ -1788,13 +2006,14 @@ fn visit_untracked_directory_collect(
     ignored_out: &mut Vec<String>,
     uc: &mut UntrackedCache,
 ) -> Result<()> {
-    if has_tracked_under(tracked, gitlinks, rel) {
+    if tracked_under.has_tracked_under(rel) {
         return visit_untracked_node_full(
             repo,
             index,
             work_tree,
             tracked,
             gitlinks,
+            tracked_under,
             matcher,
             ignored_mode,
             show_all,
@@ -1821,7 +2040,7 @@ fn visit_untracked_directory_collect(
         && !rel.is_empty()
         && matcher.is_path_ignored(repo, Some(index), rel, true)?
     {
-        ignored_out.push(format!("{rel}/"));
+        ignored_out.push(directory_marker_stored(rel));
         return Ok(());
     }
 
@@ -1842,6 +2061,7 @@ fn visit_untracked_directory_collect(
         work_tree,
         tracked,
         gitlinks,
+        tracked_under,
         matcher,
         ignored_mode,
         show_all,
@@ -1869,7 +2089,7 @@ fn visit_untracked_directory_collect(
         let collapse_matching = ignored_mode == UntrackedIgnoredMode::Matching && dir_excluded;
         let collapse_traditional = ignored_mode == UntrackedIgnoredMode::Traditional;
         if collapse_matching || collapse_traditional {
-            ignored_out.push(format!("{rel}/"));
+            ignored_out.push(directory_marker_stored(rel));
         } else {
             ignored_out.append(&mut sub_i);
         }
@@ -1880,7 +2100,7 @@ fn visit_untracked_directory_collect(
         if rel.is_empty() {
             untracked_out.append(&mut sub_u);
         } else {
-            untracked_out.push(format!("{rel}/"));
+            untracked_out.push(directory_marker_stored(rel));
         }
     }
 
@@ -1911,8 +2131,8 @@ fn traditional_normal_directory_only(
         let mut sorted: Vec<_> = entries.filter_map(|e| e.ok()).collect();
         sorted.sort_by_key(|e| e.file_name());
         for entry in sorted {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name == ".git" {
+            let name = dir_entry_name_bytes(&entry);
+            if name == b".git" {
                 continue;
             }
             let path = entry.path();
@@ -1920,8 +2140,8 @@ fn traditional_normal_directory_only(
             let rel_child = if dir == *abs {
                 relative_path(rel, &name)
             } else {
-                let suffix = path.strip_prefix(work_tree).unwrap_or(&path);
-                suffix.to_string_lossy().replace('\\', "/")
+                repo_relpath::strip_worktree_prefix_stored(&path, work_tree)
+                    .unwrap_or_else(|| relative_path("", &name))
             };
             if is_dir && gitlinks.contains(&rel_child) {
                 continue;
@@ -1941,7 +2161,7 @@ fn traditional_normal_directory_only(
         }
     }
     if any_file {
-        Ok(Some(format!("{rel}/")))
+        Ok(Some(directory_marker_stored(rel)))
     } else {
         Ok(None)
     }
@@ -1950,6 +2170,7 @@ fn traditional_normal_directory_only(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index::IndexEntry;
 
     #[test]
     fn collapse_tracked_only_never_marks_root_check_only() {
@@ -2027,10 +2248,10 @@ mod tests {
     #[test]
     fn untracked_extension_truncated_and_corrupt_no_panic() {
         let raw = write_untracked_extension(&UntrackedCache::new_shell(0, b"x\x00".to_vec()));
-        assert!(parse_untracked_extension(&raw[..raw.len().saturating_sub(5)]).is_none());
+        assert!(parse_untracked_extension(&raw[..raw.len().saturating_sub(5)]).is_err());
         let mut no_nul = raw;
         no_nul.pop();
-        assert!(parse_untracked_extension(&no_nul).is_none());
+        assert!(parse_untracked_extension(&no_nul).is_err());
     }
 
     #[test]
@@ -2043,7 +2264,12 @@ mod tests {
             "[status]\n\tshowUntrackedFiles = all\n",
         )
         .expect("write");
-        let cfg = ConfigSet::load(&Environment::empty(), Some(dir.path()), true).expect("load");
+        let cfg = ConfigSet::load(
+            &Environment::empty(),
+            Some(dir.path()),
+            &crate::config::LoadConfigOptions::standard(&Environment::empty(), Some(dir.path())),
+        )
+        .expect("load");
         assert_eq!(dir_flags_from_config(&cfg), 0);
     }
 
@@ -2112,6 +2338,157 @@ mod tests {
         let back = parse_untracked_extension(&raw).expect("parse");
         let child = &back.root.as_ref().expect("root").dirs[0];
         assert!(child.untracked.is_empty());
+    }
+
+    fn test_index_with_paths(paths: &[&[u8]]) -> Index {
+        let mut index = Index::empty(2);
+        for path in paths {
+            index.push_entry_unsorted(IndexEntry {
+                ctime_sec: 0,
+                ctime_nsec: 0,
+                mtime_sec: 0,
+                mtime_nsec: 0,
+                dev: 0,
+                ino: 0,
+                mode: crate::index::MODE_REGULAR,
+                uid: 0,
+                gid: 0,
+                size: 0,
+                oid: ObjectId::from_bytes(&[0u8; 20]).expect("oid"),
+                flags: path.len().min(0xFFF) as u16,
+                flags_extended: None,
+                path: path.to_vec(),
+                base_index_pos: 0,
+            });
+        }
+        index.sort();
+        index
+    }
+
+    fn tracked_under_oracle(index: &Index, rel_dir: &str) -> bool {
+        let gitlinks: BTreeSet<String> = index
+            .entries
+            .iter()
+            .filter(|e| e.stage() == 0 && e.mode == MODE_GITLINK)
+            .map(|e| storage_string(&e.path))
+            .collect();
+        let tracked: BTreeSet<String> = index
+            .entries
+            .iter()
+            .map(|e| storage_string(&e.path))
+            .collect();
+        let dir_bytes = storage_bytes(rel_dir);
+        tracked.iter().any(|t| {
+            let path_bytes = storage_bytes(t);
+            if dir_bytes.is_empty() {
+                return !path_bytes.is_empty();
+            }
+            path_bytes.len() > dir_bytes.len()
+                && path_bytes.starts_with(dir_bytes.as_ref())
+                && path_bytes[dir_bytes.len()] == b'/'
+        }) || gitlinks.iter().any(|g| {
+            g.as_str() == rel_dir || {
+                let g_bytes = storage_bytes(g);
+                dir_bytes.len() < g_bytes.len()
+                    && g_bytes.starts_with(dir_bytes.as_ref())
+                    && g_bytes[dir_bytes.len()] == b'/'
+            }
+        })
+    }
+
+    #[test]
+    fn tracked_under_lookup_matches_linear_oracle() {
+        let fe_dir = storage_string(b"\xfe");
+        let fe_file = storage_string(b"\xfe/child.txt");
+        let index = test_index_with_paths(&[
+            b"a/x",
+            b"ab/y",
+            b"dir",
+            b"dir/file",
+            b"dir2/other",
+            fe_file.as_bytes(),
+        ]);
+        let lookup = TrackedUnderLookup::new(&index);
+        assert!(
+            !TrackedUnderLookup::new(&test_index_with_paths(&[b"dir"])).has_tracked_under("dir"),
+            "tracked blob at exact path dir must not count as having tracked descendants"
+        );
+        assert!(
+            lookup.has_tracked_under("dir"),
+            "dir/file must still match directory dir"
+        );
+        for rel in ["", "a", "ab", "dir2", "missing", &fe_dir] {
+            assert_eq!(
+                lookup.has_tracked_under(rel),
+                tracked_under_oracle(&index, rel),
+                "rel={rel:?}"
+            );
+        }
+        assert!(
+            !lookup.has_tracked_under("d"),
+            "prefix dir must not match unrelated paths"
+        );
+        assert!(lookup.has_tracked_under("dir2"));
+        assert!(!lookup.has_tracked_under("dirX"));
+        let under_fe = test_index_with_paths(&[b"\xfe/under.c"]);
+        let fe_lookup = TrackedUnderLookup::new(&under_fe);
+        assert!(fe_lookup.has_tracked_under(&fe_dir));
+        assert!(!fe_lookup.has_tracked_under(&storage_string(b"\xfe2")));
+    }
+
+    #[test]
+    fn tracked_under_lookup_unsorted_index_snapshot() {
+        let mut index = test_index_with_paths(&[b"parent/one", b"parent/two", b"sibling"]);
+        index.mark_entries_unsorted();
+        let lookup = TrackedUnderLookup::new(&index);
+        assert!(lookup.has_tracked_under("parent"));
+        assert!(!lookup.has_tracked_under("parent/extra"));
+        assert_eq!(
+            lookup.has_tracked_under("parent"),
+            tracked_under_oracle(&index, "parent")
+        );
+    }
+
+    #[test]
+    fn tracked_under_lookup_unsorted_many_probes_stay_logarithmic() {
+        use crate::index::MODE_REGULAR;
+
+        const N: usize = 100_000;
+        const M: usize = 1_000;
+        let mut index = Index::empty(2);
+        for i in 0..N {
+            index.push_entry_unsorted(IndexEntry {
+                ctime_sec: 0,
+                ctime_nsec: 0,
+                mtime_sec: 0,
+                mtime_nsec: 0,
+                dev: 0,
+                ino: 0,
+                mode: MODE_REGULAR,
+                uid: 0,
+                gid: 0,
+                size: 0,
+                oid: ObjectId::from_bytes(&[0u8; 20]).expect("oid"),
+                flags: 0,
+                flags_extended: None,
+                path: format!("tracked/{i:06}.txt").into_bytes(),
+                base_index_pos: 0,
+            });
+        }
+        index.mark_entries_unsorted();
+        let lookup = TrackedUnderLookup::new(&index);
+        tracked_under_path_cmp_counter::reset();
+        for i in 0..M {
+            let rel = format!("missing/{i:06}");
+            assert!(!lookup.has_tracked_under(&rel));
+        }
+        let cmps = tracked_under_path_cmp_counter::take();
+        let log_n = (N as f64).log2().ceil() as usize;
+        let bound = 32 * M * log_n;
+        assert!(
+            cmps < bound,
+            "unsorted tracked-under path comparisons {cmps} should stay under {bound} (N={N}, M={M})"
+        );
     }
 
     #[test]

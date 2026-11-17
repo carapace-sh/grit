@@ -6,14 +6,12 @@ use std::sync::Arc;
 
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::objects::odb::store::{MemoryStore, ObjectStore};
-use grit_lib::objects::odb::OdbBuilder;
 use grit_lib::objects::HashAlgo;
-use grit_lib::progress::NeverCancel;
-use grit_lib::refs::resolve_ref;
-use grit_lib::refs::store::{MemoryRefStore, RawRef, RefStore};
+use grit_lib::progress::CancelToken;
+use grit_lib::refs::store::{MemoryRefStore, RawRef, RefNameRef, RefStore};
 use grit_lib::remote::clone::{clone_into, CloneCheckout, CloneIntoOptions};
 use grit_lib::remote::fetch::NoProgress;
-use grit_lib::repo::{InitOptions, Repository, RepositoryBuilder};
+use grit_lib::repo::{InitOptions, Repository};
 use grit_test_support::{git, rev_parse};
 
 fn git_upstream() -> tempfile::TempDir {
@@ -33,7 +31,7 @@ fn init_files_repo(dir: &Path) {
         dir,
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
-            .with_ref_storage(grit_lib::RefStorageFormat::Files),
+            .with_ref_storage(grit_lib::refs::ref_storage::RefStorageFormat::Files),
     )
     .expect("init");
 }
@@ -43,14 +41,13 @@ fn memory_primary_repo() -> (tempfile::TempDir, Repository, Arc<MemoryStore>) {
     init_files_repo(dir.path());
     let git_dir = dir.path().join(".git");
     let store = Arc::new(MemoryStore::new(HashAlgo::Sha1));
-    let repo = RepositoryBuilder::new(RepositoryOptions::empty())
-        .odb_builder(
-            OdbBuilder::files(git_dir.join("objects"))
-                .primary(store.clone())
-                .alternates(false),
-        )
-        .open(&git_dir, Some(dir.path()))
-        .expect("open");
+    let repo = Repository::open(
+        &git_dir,
+        &(RepositoryOptions::empty()
+            .with_object_store(store.clone())
+            .with_work_tree(dir.path())),
+    )
+    .expect("open");
     (dir, repo, store)
 }
 
@@ -65,15 +62,14 @@ fn memory_primary_and_ref_repo() -> (
     let git_dir = dir.path().join(".git");
     let store = Arc::new(MemoryStore::new(HashAlgo::Sha1));
     let ref_store = Arc::new(MemoryRefStore::new());
-    let repo = RepositoryBuilder::new(RepositoryOptions::empty())
-        .odb_builder(
-            OdbBuilder::files(git_dir.join("objects"))
-                .primary(store.clone())
-                .alternates(false),
-        )
-        .ref_store(ref_store.clone())
-        .open(&git_dir, Some(dir.path()))
-        .expect("open");
+    let repo = Repository::open(
+        &git_dir,
+        &(RepositoryOptions::empty()
+            .with_object_store(store.clone())
+            .with_ref_store(ref_store.clone())
+            .with_work_tree(dir.path())),
+    )
+    .expect("open");
     (dir, repo, store, ref_store)
 }
 
@@ -87,7 +83,7 @@ fn clone_into_custom_primary_fetches_and_checks_out() {
         repo,
         CloneIntoOptions::new(url),
         &mut NoProgress,
-        &NeverCancel,
+        &CancelToken::never(),
         None,
     )
     .expect("clone_into with MemoryStore primary");
@@ -99,7 +95,10 @@ fn clone_into_custom_primary_fetches_and_checks_out() {
     assert!(dir.path().join("a.txt").is_file());
     assert!(dir.path().join("b.txt").is_file());
     assert_eq!(
-        resolve_ref(&dir.path().join(".git"), "refs/heads/main").expect("main"),
+        grit_test_support::refs::at(&dir.path().join(".git"))
+            .references()
+            .resolve("refs/heads/main")
+            .expect("main"),
         tip
     );
     git(upstream.path(), &["fsck", "--full"]);
@@ -118,7 +117,7 @@ fn clone_into_custom_primary_skips_checkout_when_disabled() {
             ..CloneIntoOptions::new(url)
         },
         &mut NoProgress,
-        &NeverCancel,
+        &CancelToken::never(),
         None,
     )
     .expect("clone_into no checkout");
@@ -141,7 +140,7 @@ fn clone_into_memory_store_and_memory_ref_store_checks_out() {
         repo,
         CloneIntoOptions::new(url),
         &mut NoProgress,
-        &NeverCancel,
+        &CancelToken::never(),
         None,
     )
     .expect("clone_into with MemoryStore + MemoryRefStore");
@@ -152,7 +151,7 @@ fn clone_into_memory_store_and_memory_ref_store_checks_out() {
     );
     assert_eq!(
         ref_store
-            .read_raw("refs/remotes/origin/main")
+            .read_raw(RefNameRef::from_trusted("refs/remotes/origin/main"))
             .expect("read tracking"),
         Some(RawRef::Direct(tip)),
         "fetch must keep origin/main in the injected ref store"
@@ -161,12 +160,14 @@ fn clone_into_memory_store_and_memory_ref_store_checks_out() {
     assert!(matches!(outcome.checkout, CloneCheckout::CheckedOut(_)));
     assert_eq!(
         ref_store
-            .read_raw("refs/heads/main")
+            .read_raw(RefNameRef::from_trusted("refs/heads/main"))
             .expect("read local branch"),
         Some(RawRef::Direct(tip))
     );
     assert_eq!(
-        ref_store.read_raw("HEAD").expect("HEAD"),
+        ref_store
+            .read_raw(RefNameRef::from_trusted("HEAD"))
+            .expect("HEAD"),
         Some(RawRef::Symbolic("refs/heads/main".to_owned()))
     );
     assert!(store.contains(&tip).expect("contains"));

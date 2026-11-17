@@ -84,8 +84,9 @@ pub enum FetchRefspecPlan {
 
 /// Errors while resolving fetch refspecs before transfer.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FetchRefspecError {
-    /// A refspec string failed [`parse_fetch_refspec`].
+    /// A refspec string failed `parse_fetch_refspec`.
     #[error("invalid refspec '{spec}': {message}")]
     InvalidRefspec {
         /// Original refspec string.
@@ -114,7 +115,7 @@ pub enum FetchRefspecError {
 impl From<RefspecError> for FetchRefspecError {
     fn from(e: RefspecError) -> Self {
         match e {
-            RefspecError::Invalid(s) => Self::InvalidRefspec {
+            RefspecError::Invalid { spec: s } => Self::InvalidRefspec {
                 spec: s.clone(),
                 message: s,
             },
@@ -154,20 +155,23 @@ pub struct FetchInvocation {
 pub fn resolve_remote_argument(
     config: &ConfigSet,
     remote_or_url: &str,
-) -> Result<Remote, RemoteError> {
+) -> crate::error::Result<Remote> {
     if has_remote_section(config, remote_or_url) {
         return Remote::from_config(config, remote_or_url);
     }
     if looks_like_path_or_url(remote_or_url) || remote_or_url.contains(':') {
         return Remote::from_url(remote_or_url);
     }
-    Err(RemoteError::UnknownRemote(remote_or_url.to_owned()))
+    Err(RemoteError::UnknownRemote {
+        name: remote_or_url.to_owned(),
+    }
+    .into())
 }
 
 /// `branch.<branch>.remote`, trimmed; `None` when unset, blank, or `branch` is `None`.
 fn branch_remote(config: &ConfigSet, branch: Option<&str>) -> Option<String> {
     branch
-        .and_then(|name| config.get(&format!("branch.{name}.remote")))
+        .and_then(|name| config.value(&format!("branch.{name}.remote")))
         .map(|remote| remote.trim().to_owned())
         .filter(|remote| !remote.is_empty())
 }
@@ -201,7 +205,7 @@ pub fn configured_remote_for_pull(config: &ConfigSet, branch: Option<&str>) -> S
 ///
 /// A remote name; never `.`.
 #[must_use]
-pub fn configured_remote_for_fetch(config: &ConfigSet, branch: Option<&str>) -> String {
+pub(crate) fn configured_remote_for_fetch(config: &ConfigSet, branch: Option<&str>) -> String {
     branch_remote(config, branch)
         .filter(|remote| remote != ".")
         .unwrap_or_else(|| DEFAULT_REMOTE.to_owned())
@@ -804,7 +808,8 @@ pub(crate) fn fetch_head_description(remote_ref: &str, is_tag: bool, source: &st
 
 /// Score for [`refname_match_fetch_dwim`] (higher = preferred).
 #[must_use]
-pub fn refname_match_fetch_dwim(abbrev: &str, full: &str) -> u32 {
+#[allow(dead_code)]
+pub(crate) fn refname_match_fetch_dwim(abbrev: &str, full: &str) -> u32 {
     if abbrev == full {
         return 100;
     }
@@ -1194,10 +1199,12 @@ mod tests {
 
         assert!(matches!(
             resolve_remote_argument(&config, "nourl"),
-            Err(RemoteError::NoUrl { remote: Some(name) }) if name == "nourl"
+            Err(crate::error::Error::Remote(RemoteError::NoUrl { remote: Some(name) })) if name == "nourl"
         ));
         let err = resolve_remote_argument(&config, "nosuch").expect_err("unknown");
-        assert!(matches!(&err, RemoteError::UnknownRemote(name) if name == "nosuch"));
+        assert!(
+            matches!(&err, crate::error::Error::Remote(RemoteError::UnknownRemote { name }) if name == "nosuch")
+        );
         assert_eq!(err.to_string(), "unknown remote 'nosuch'");
     }
 
@@ -1226,7 +1233,7 @@ mod tests {
         );
         assert!(matches!(
             resolve_remote_argument(&config, &invocation.remote),
-            Err(RemoteError::NoUrl { remote: Some(name) }) if name == "half"
+            Err(crate::error::Error::Remote(RemoteError::NoUrl { remote: Some(name) })) if name == "half"
         ));
     }
 

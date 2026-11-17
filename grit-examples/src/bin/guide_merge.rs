@@ -2,15 +2,17 @@
 //!
 //! Source for the library guide "Merge" page (included in the docs site).
 
+use anyhow::Result;
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::ident::Signature;
+use grit_lib::merge::MergePredictionOptions;
 use grit_lib::objects::{NewCommit, ObjectId};
-use grit_lib::porcelain::merge::{write_merge_tree, MergePredictionOptions};
 use grit_lib::repo::Repository;
+use grit_lib::revwalk::ResolveOptions;
 use std::path::{Path, PathBuf};
 use time::OffsetDateTime;
 
-fn open_repo(root: &Path) -> Result<Repository, grit_lib::error::Error> {
+fn open_repo(root: &Path) -> Result<Repository> {
     let git_dir = if root.join(".git").is_dir() {
         root.join(".git")
     } else {
@@ -25,22 +27,26 @@ fn open_repo(root: &Path) -> Result<Repository, grit_lib::error::Error> {
     if let Some(wt) = work_tree {
         opts = opts.with_work_tree(wt);
     }
-    Repository::open(&git_dir, &opts)
+    Ok(Repository::open(&git_dir, &opts)?)
 }
 
-fn main() -> Result<(), grit_lib::error::Error> {
+fn main() -> Result<()> {
     let root = std::env::args()
         .nth(1)
         .map(PathBuf::from)
         .or_else(|| std::env::current_dir().ok())
-        .ok_or_else(|| grit_lib::error::Error::Message("missing repository path".into()))?;
+        .ok_or_else(|| anyhow::anyhow!("missing repository path"))?;
     let repo = open_repo(&root)?;
 
-    let ours: ObjectId = repo.rev_walk().resolve("ours")?;
-    let theirs: ObjectId = repo.rev_walk().resolve("theirs")?;
+    let ours: ObjectId = repo.revwalk().resolve("ours", &ResolveOptions::default())?;
+    let theirs: ObjectId = repo
+        .revwalk()
+        .resolve("theirs", &ResolveOptions::default())?;
 
     // Merges over the first merge base and stores the result, like `git merge-tree --write-tree`.
-    let merged = write_merge_tree(&repo, ours, theirs, &MergePredictionOptions::default())?;
+    let merged = repo
+        .merge()
+        .write_tree(ours, theirs, &MergePredictionOptions::default())?;
 
     println!("merged_tree={}", merged.tree.to_hex());
     println!("conflicted_paths={}", merged.conflicts.len());
@@ -48,8 +54,7 @@ fn main() -> Result<(), grit_lib::error::Error> {
         let committer = Signature::new(
             "Guide",
             "guide@example.com",
-            OffsetDateTime::from_unix_timestamp(1_700_000_000)
-                .map_err(|e| grit_lib::error::Error::Message(e.to_string()))?,
+            OffsetDateTime::from_unix_timestamp(1_700_000_000)?,
         )?;
         let commit = repo.objects().write_commit(
             &NewCommit::new(

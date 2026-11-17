@@ -16,21 +16,22 @@
 //! in an ordinary pack beside it would be deleted, with nothing to fetch it back
 //! from. The price is that a blob in a promisor pack no longer proves the promisor
 //! can supply it, so offload records the LOP's directory in `grit.lopGitDir`, and
-//! [`crate::maintenance::drop_promised_blobs`] drops a blob only once a promisor
+//! [`Maintenance::drop_promised_blobs`](crate::maintenance::Maintenance::drop_promised_blobs) drops a blob only once a promisor
 //! it can read is seen to hold it.
 //!
-//! [`offload_blobs`] moves the blobs a filter leaves out (`blob:limit=<n>`: every
+//! [`Maintenance::offload_blobs`](crate::maintenance::Maintenance::offload_blobs) moves the blobs a filter leaves out (`blob:limit=<n>`: every
 //! blob of `n` bytes or more) from the main repository to the LOP. It never removes
 //! anything from the main repository before the LOP holds it, and blobs any checkout
 //! of the main repository needs stay where they are. Running it again offloads blobs
 //! pushed since, and folds the main repository's packs back into one promisor pack.
 
+use crate::error::ObjectError;
 use std::path::{Path, PathBuf};
 
 use crate::config::{ConfigFile, ConfigScope, ConfigSet};
 use crate::environment::RepositoryOptions;
 use crate::error::{Error, Result};
-use crate::index_pack::{install_pack_path, IngestPackOptions};
+use crate::index_pack::{install_pack_path_with_progress, IngestPackOptions};
 use crate::maintenance::{GcLock, GcLockAttempt, GcLockHolder, RepackOptions};
 use crate::objects::{
     oid_hash_set, CommitRef, HashAlgo, ObjectId, ObjectKind, OidHashMap, OidHashSet, TreeRefIter,
@@ -39,21 +40,22 @@ use crate::odb::Odb;
 use crate::pack_index::PackIndex;
 use crate::pack_objects::PackBuildOptions;
 use crate::partial_clone::{stored_remote_filter, ObjectFilterSpec};
+use crate::repo::error::FilesOnlyOperation;
 use crate::repo::Repository;
 
 /// Message written into the `.keep` marker of every pack offload adds to a LOP.
 pub const LOP_KEEP_MESSAGE: &str = "grit offload: large-object promisor pack";
 
-/// Multi-valued config key [`offload_blobs`] adds to the main repository: the
+/// Multi-valued config key [`Maintenance::offload_blobs`](crate::maintenance::Maintenance::offload_blobs) adds to the main repository: the
 /// absolute git directory of each LOP it moved blobs to.
 ///
 /// Its presence marks a repository whose promisor pack holds blobs only it has, so
-/// [`crate::maintenance::drop_promised_blobs`] drops a blob there only after seeing
+/// [`Maintenance::drop_promised_blobs`](crate::maintenance::Maintenance::drop_promised_blobs) drops a blob there only after seeing
 /// it in a promisor it can read (one of these directories, or a promisor remote
 /// with a local URL).
 pub const LOP_GIT_DIR_KEY: &str = "grit.lopGitDir";
 
-/// Options for [`offload_blobs`].
+/// Options for [`Maintenance::offload_blobs`](crate::maintenance::Maintenance::offload_blobs).
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct OffloadOptions {
@@ -96,7 +98,7 @@ impl OffloadOptions {
     }
 }
 
-/// Why [`offload_blobs`] refused to run.
+/// Why [`Maintenance::offload_blobs`](crate::maintenance::Maintenance::offload_blobs) refused to run.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum OffloadError {
@@ -189,7 +191,7 @@ pub enum OffloadRepo {
     Lop,
 }
 
-/// One config value [`offload_blobs`] set.
+/// One config value [`Maintenance::offload_blobs`](crate::maintenance::Maintenance::offload_blobs) set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct OffloadConfigChange {
@@ -219,7 +221,7 @@ impl LopReadiness {
     }
 
     fn from_config(config: &ConfigSet) -> Self {
-        let flag = |key: &str| config.get_bool(key).and_then(|v| v.ok()).unwrap_or(false);
+        let flag = |key: &str| config.bool_with_default(key, false);
         Self {
             allow_filter: flag("uploadpack.allowfilter"),
             allow_any_sha1_in_want: flag("uploadpack.allowanysha1inwant"),
@@ -227,7 +229,7 @@ impl LopReadiness {
     }
 }
 
-/// What [`offload_blobs`] did (or, with [`OffloadOptions::dry_run`], would do).
+/// What [`Maintenance::offload_blobs`](crate::maintenance::Maintenance::offload_blobs) did (or, with [`OffloadOptions::dry_run`], would do).
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct OffloadReport {
@@ -285,7 +287,7 @@ impl OffloadReport {
     }
 }
 
-/// Which of the packs [`offload_blobs`] writes an [`OffloadPack`] is.
+/// Which of the packs [`Maintenance::offload_blobs`](crate::maintenance::Maintenance::offload_blobs) writes an [`OffloadPack`] is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum OffloadPackRole {
@@ -295,7 +297,7 @@ pub enum OffloadPackRole {
     MainPromisor,
 }
 
-/// A pack [`offload_blobs`] wrote.
+/// A pack [`Maintenance::offload_blobs`](crate::maintenance::Maintenance::offload_blobs) wrote.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct OffloadPack {
@@ -370,15 +372,16 @@ impl OffloadPack {
 ///
 /// # Errors
 ///
-/// [`Error::Offload`] for the [`OffloadError`] cases, [`Error::UnsupportedObjectStore`]
+/// [`crate::error::ObjectError::Offload`] for the [`OffloadError`] cases, [`RepositoryError::UnsupportedObjectStore`](crate::repo::RepositoryError::UnsupportedObjectStore)
 /// without a files-backed object store, and read, write and config failures.
-pub fn offload_blobs(repo: &Repository, opts: &OffloadOptions) -> Result<OffloadReport> {
+pub(crate) fn offload_blobs(repo: &Repository, opts: &OffloadOptions) -> Result<OffloadReport> {
     let odb = repo.odb();
-    odb.require_files_primary("offload")?;
-    let config = repo.config()?;
+    odb.primary_store()
+        .require_files_primary(FilesOnlyOperation::Offload)?;
+    let config = repo.config().snapshot()?;
     let remote = opts.remote.as_str();
     let url = config
-        .get(&format!("remote.{remote}.url"))
+        .value(&format!("remote.{remote}.url"))
         .filter(|u| !u.trim().is_empty())
         .ok_or_else(|| OffloadError::RemoteNotConfigured {
             remote: remote.to_owned(),
@@ -433,10 +436,7 @@ pub fn offload_blobs(repo: &Repository, opts: &OffloadOptions) -> Result<Offload
         main_bytes_after: main_bytes_before,
         config_changes: Vec::new(),
         lop_ready: LopReadiness::from_config(&lop_config(&lop)?),
-        advertised: config
-            .get_bool("promisor.advertise")
-            .and_then(|v| v.ok())
-            .unwrap_or(false),
+        advertised: config.bool_with_default("promisor.advertise", false),
     };
     if opts.dry_run {
         return Ok(report);
@@ -460,18 +460,18 @@ pub fn offload_blobs(repo: &Repository, opts: &OffloadOptions) -> Result<Offload
 
     let mut wanted: Vec<(String, String)> = Vec::new();
     let promisor_key = format!("remote.{remote}.promisor");
-    if config.get_bool(&promisor_key).and_then(|v| v.ok()) != Some(true) {
+    if !config.bool_with_default(&promisor_key, false) {
         wanted.push((promisor_key, "true".to_owned()));
     }
     let filter_key = format!("remote.{remote}.partialCloneFilter");
-    if opts.filter.is_some() && config.get(&filter_key).is_none() {
+    if opts.filter.is_some() && config.value(&filter_key).is_none() {
         wanted.push((filter_key, filter.to_config_value()));
     }
     // No pack or multi-pack-index holds the offloaded blobs, so no bitmap can have
     // full closure; once a push lands outside the promisor pack, Git's `gc` fails
     // trying (bitmaps are on by default in bare repositories).
     let bitmaps_key = "repack.writeBitmaps";
-    if config.get_bool(bitmaps_key).and_then(|v| v.ok()) != Some(false) {
+    if config.bool_with_default(bitmaps_key, true) {
         wanted.push((bitmaps_key.to_owned(), "false".to_owned()));
     }
     // The promisor pack is about to hold blobs the LOP does not have; record where
@@ -479,7 +479,7 @@ pub fn offload_blobs(repo: &Repository, opts: &OffloadOptions) -> Result<Offload
     let mut added: Vec<(String, String)> = Vec::new();
     let lop_dir = lop_dir_value(lop.git_dir());
     if !config
-        .get_all(LOP_GIT_DIR_KEY)
+        .values_all(LOP_GIT_DIR_KEY)
         .iter()
         .any(|v| same_dir(Path::new(v), lop.git_dir()))
     {
@@ -585,13 +585,19 @@ fn open_lop(repo: &Repository, opts: &OffloadOptions, url: &str) -> Result<Repos
         }
         .into());
     }
-    lop.odb().require_files_primary("offload")?;
+    lop.odb()
+        .primary_store()
+        .require_files_primary(FilesOnlyOperation::Offload)?;
     Ok(lop)
 }
 
 /// The LOP's own config (system and global included, as its upload-pack sees it).
 fn lop_config(lop: &Repository) -> Result<ConfigSet> {
-    ConfigSet::load(lop.environment(), Some(lop.git_dir()), true)
+    ConfigSet::load(
+        lop.environment(),
+        Some(lop.git_dir()),
+        &crate::config::LoadConfigOptions::standard(lop.environment(), Some(lop.git_dir())),
+    )
 }
 
 /// Blobs chosen by [`select_candidates`], with their sizes.
@@ -750,7 +756,7 @@ fn kept_object_the_promisor_pack_names(
         }
         let kind = match odb.read_info_without_fetch(&referrer) {
             Ok(info) => info.kind,
-            Err(Error::ObjectNotFound(_)) => continue,
+            Err(Error::Object(ObjectError::NotFound { .. })) => continue,
             Err(err) => return Err(err),
         };
         if kind == ObjectKind::Blob {
@@ -793,7 +799,7 @@ fn selected_blob_size(odb: &Odb, filter: ObjectFilterSpec, oid: &ObjectId) -> Re
     }
     let info = match odb.read_info_without_fetch(oid) {
         Ok(info) => info,
-        Err(Error::ObjectNotFound(_)) => return Ok(None),
+        Err(Error::Object(ObjectError::NotFound { .. })) => return Ok(None),
         Err(err) => return Err(err),
     };
     if info.kind != ObjectKind::Blob {
@@ -818,7 +824,7 @@ fn copy_to_lop(
     blobs: &[ObjectId],
     opts: &OffloadOptions,
 ) -> Result<Option<(PathBuf, usize)>> {
-    let cfg = repo.config().ok();
+    let cfg = repo.config().snapshot().ok();
     let pack_opts = PackBuildOptions {
         delta: false,
         window: 0,
@@ -843,7 +849,7 @@ fn copy_to_lop(
         return Ok(None);
     };
     let trusted_rows = (!built.index_rows.is_empty()).then_some(built.index_rows);
-    let ingested = install_pack_path(
+    let ingested = install_pack_path_with_progress(
         staging,
         lop.odb(),
         &IngestPackOptions {
@@ -854,6 +860,8 @@ fn copy_to_lop(
             keep_message: Some(LOP_KEEP_MESSAGE.to_owned()),
             ..IngestPackOptions::default()
         },
+        None,
+        None,
     )?;
     let objects = ingested.object_ids.len();
     Ok(ingested.pack_path.map(|path| (path, objects)))
@@ -997,8 +1005,10 @@ mod tests {
             let init = InitOptions::new()
                 .with_bare(true)
                 .with_initial_branch("main");
-            let main = Repository::init(&dir.path().join("main.git"), &init).unwrap();
-            Repository::init(&dir.path().join("lop.git"), &init).unwrap();
+            let (main, _) = Repository::init(&dir.path().join("main.git"), &init).unwrap();
+            Repository::init(&dir.path().join("lop.git"), &init)
+                .unwrap()
+                .0;
             let odb = main.odb();
             let blobs: Vec<ObjectId> = sizes
                 .iter()
@@ -1177,14 +1187,14 @@ mod tests {
         );
         assert!(report.lop_ready.is_ready());
         assert!(!report.advertised);
-        let config = fx.main().config().unwrap();
-        assert_eq!(config.get("remote.lop.promisor").as_deref(), Some("true"));
-        assert!(config.get("extensions.partialclone").is_none());
+        let config = fx.main().config().snapshot().unwrap();
+        assert_eq!(config.value("remote.lop.promisor").as_deref(), Some("true"));
+        assert!(config.value("extensions.partialclone").is_none());
         assert_eq!(
             crate::partial_clone::stored_remote_filter(&config, "lop"),
             Some(ObjectFilterSpec::BlobLimit(1024))
         );
-        assert_eq!(config.get_all(LOP_GIT_DIR_KEY), [lop_dir.clone()]);
+        assert_eq!(config.values_all(LOP_GIT_DIR_KEY), [lop_dir.clone()]);
 
         // The LOP is recorded once, however often offload runs.
         let again = offload_blobs(&fx.main(), &opts).unwrap();
@@ -1194,8 +1204,13 @@ mod tests {
             again.config_changes
         );
         assert_eq!(
-            fx.main().config().unwrap().get_all(LOP_GIT_DIR_KEY),
-            [lop_dir]
+            fx.main()
+                .config()
+                .snapshot()
+                .unwrap()
+                .get_all(LOP_GIT_DIR_KEY)
+                .unwrap(),
+            vec![lop_dir]
         );
     }
 
@@ -1528,7 +1543,7 @@ mod tests {
     fn blobs_a_checkout_needs_stay() {
         let dir = tempfile::tempdir().unwrap();
         let work = dir.path().join("work");
-        let repo =
+        let (repo, _) =
             Repository::init(&work, &InitOptions::new().with_initial_branch("main")).unwrap();
         Repository::init(
             &dir.path().join("lop.git"),
@@ -1539,7 +1554,7 @@ mod tests {
         crate::porcelain::add::stage_for_commit(
             &repo,
             &mut crate::progress::NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         let ident = "T <t@example.com> 1 +0000".to_string();
@@ -1551,7 +1566,7 @@ mod tests {
             &repo,
             &req,
             &mut crate::progress::NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
         let config = repo.git_dir().join("config");
@@ -1571,7 +1586,7 @@ mod tests {
 
     fn offload_err(fx: &Fixture, opts: &OffloadOptions) -> OffloadError {
         match offload_blobs(&fx.main(), opts) {
-            Err(Error::Offload(err)) => err,
+            Err(Error::Object(ObjectError::Offload(err))) => err,
             other => panic!("expected an offload error, got {other:?}"),
         }
     }

@@ -2,9 +2,11 @@
 
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::error::Error;
-use grit_lib::notes::{read_notes_tree, resolve_configured_notes_ref, NotesRef};
+use grit_lib::error::NotesError;
+use grit_lib::error::ObjectError;
+use grit_lib::notes::{resolve_configured_notes_ref, NotesRef};
 use grit_lib::objects::ObjectId;
-use grit_lib::porcelain::commit::{create_commit, CommitRequest};
+use grit_lib::porcelain::commit::CommitRequest;
 use grit_lib::progress::NullProgress;
 use grit_lib::refs::ref_storage::RefStorageFormat;
 use grit_lib::refs::store::RefName;
@@ -132,7 +134,10 @@ fn fanout_notes_tree_read_and_update() {
     assert_fsck_strict(dir.path());
 
     let repo = open_grit(dir.path());
-    let entries = read_notes_tree(&repo, "refs/notes/commits").expect("read fanout");
+    let entries = repo
+        .notes()
+        .read_tree("refs/notes/commits")
+        .expect("read fanout");
     assert!(
         entries.iter().any(|e| e.path.iter().any(|b| *b == b'/')),
         "git must use fanout paths with 320 notes"
@@ -210,7 +215,7 @@ fn add_existing_without_force_is_typed_error() {
         )
         .expect_err("must reject duplicate note");
     assert!(
-        matches!(err, Error::NoteAlreadyExists { .. }),
+        matches!(err, Error::Notes(NotesError::AlreadyExists { .. })),
         "expected typed NoteAlreadyExists, got {err:?}"
     );
 }
@@ -218,7 +223,7 @@ fn add_existing_without_force_is_typed_error() {
 #[test]
 fn padded_git_notes_ref_is_invalid() {
     let err = NotesRef::from_full(" refs/notes/spaced ").expect_err("padded ref");
-    assert!(matches!(err, Error::InvalidNotesRef(_)));
+    assert!(matches!(err, Error::Notes(NotesError::InvalidRef { .. })));
 
     let dir = tempfile::tempdir().expect("tempdir");
     init_repo(dir.path());
@@ -238,7 +243,7 @@ fn padded_git_notes_ref_is_invalid() {
 #[test]
 fn trailing_space_notes_ref_is_invalid() {
     let err = NotesRef::from_full("refs/notes/spaced ").expect_err("trailing space");
-    assert!(matches!(err, Error::InvalidNotesRef(_)));
+    assert!(matches!(err, Error::Notes(NotesError::InvalidRef { .. })));
 }
 
 #[test]
@@ -250,11 +255,13 @@ fn padded_core_notes_ref_is_invalid() {
         &["config", "core.notesRef", " refs/notes/spaced "],
     );
     let repo = open_grit(dir.path());
-    let err =
-        resolve_configured_notes_ref(repo.environment(), repo.config().expect("config").as_ref())
-            .expect_err("padded core.notesRef");
+    let err = resolve_configured_notes_ref(
+        repo.environment(),
+        repo.config().snapshot().expect("config").as_ref(),
+    )
+    .expect_err("padded core.notesRef");
     assert!(
-        matches!(err, Error::InvalidNotesRef(_)),
+        matches!(err, Error::Notes(NotesError::InvalidRef { .. })),
         "expected InvalidNotesRef, got {err:?}"
     );
 }
@@ -265,11 +272,13 @@ fn empty_core_notes_ref_is_invalid() {
     init_repo(dir.path());
     git_cmd(dir.path(), &["config", "core.notesRef", ""]);
     let repo = open_grit(dir.path());
-    let err =
-        resolve_configured_notes_ref(repo.environment(), repo.config().expect("config").as_ref())
-            .expect_err("empty config ref");
+    let err = resolve_configured_notes_ref(
+        repo.environment(),
+        repo.config().snapshot().expect("config").as_ref(),
+    )
+    .expect_err("empty config ref");
     assert!(
-        matches!(err, Error::InvalidNotesRef(_)),
+        matches!(err, Error::Notes(NotesError::InvalidRef { .. })),
         "expected InvalidNotesRef, got {err:?}"
     );
 }
@@ -285,9 +294,11 @@ fn custom_notes_ref() {
     let commit = seed_commit(dir.path(), "f", "x\n", "init");
 
     let repo = open_grit(dir.path());
-    let notes_ref =
-        resolve_configured_notes_ref(repo.environment(), repo.config().expect("config").as_ref())
-            .expect("resolve");
+    let notes_ref = resolve_configured_notes_ref(
+        repo.environment(),
+        repo.config().snapshot().expect("config").as_ref(),
+    )
+    .expect("resolve");
     assert_eq!(notes_ref.as_str(), "refs/notes/custom");
 
     repo.notes()
@@ -391,7 +402,7 @@ fn list_with_bodies_reports_missing_note_blob() {
         .list_with_bodies(&NotesRef::commits(), None)
         .expect_err("a missing note blob must not read as an empty note");
     assert!(
-        matches!(err, Error::ObjectNotFound(_)),
+        matches!(err, Error::Object(ObjectError::NotFound { .. })),
         "expected ObjectNotFound for the note blob, got {err:?}"
     );
 }
@@ -457,30 +468,31 @@ fn add_reports_added_then_replaced_and_logs_like_git() {
 #[test]
 fn notes_on_reftable_repository_use_the_ref_store() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let repo = Repository::init(
+    let (repo, _) = Repository::init(
         dir.path(),
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
             .with_ref_storage(RefStorageFormat::Reftable),
     )
     .expect("init reftable");
-    let commit = create_commit(
-        &repo,
-        &CommitRequest {
-            message: "init".into(),
-            author: Some(IDENT.parse().expect("signature")),
-            committer: Some(IDENT.parse().expect("signature")),
-            allow_empty: true,
-            sign_override: None,
-            amend: false,
-            assume_worktree_synced: false,
-            ..Default::default()
-        },
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("commit")
-    .oid;
+    let commit = repo
+        .commits()
+        .create_staged(
+            &{
+                let mut req = CommitRequest::new("init");
+                req.author = Some(IDENT.parse().expect("signature"));
+                req.committer = Some(IDENT.parse().expect("signature"));
+                req.allow_empty = true;
+                req.sign_override = None;
+                req.amend = false;
+                req.assume_worktree_synced = false;
+                req
+            },
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("commit")
+        .oid;
 
     let notes_ref = NotesRef::parse("review");
     let notes = repo.notes();

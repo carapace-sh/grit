@@ -9,11 +9,14 @@ use std::process::Command;
 use crate::bundle::{write_bundle, BundleSpec};
 use crate::config::environment::RepositoryOptions;
 use crate::objects::ObjectId;
-use crate::progress::NeverCancel;
 use crate::remote::fetch::NoProgress;
 use crate::repo::Repository;
 
-use super::{make_snapshot, materialize, target_ref, CheckoutInfo, CheckoutMarker, SnapshotRoot};
+use super::{
+    make_snapshot, materialize, target_ref, CheckoutInfo, CheckoutMarker, MaterializeRequest,
+    SnapshotRoot,
+};
+use crate::progress::CancelToken;
 
 pub(crate) const ID: &str = "0123456789abcdef0123";
 
@@ -37,7 +40,7 @@ pub(crate) fn git(dir: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_owned()
 }
 
-pub(crate) fn open(dir: &Path) -> Repository {
+pub fn open(dir: &Path) -> Repository {
     Repository::discover(Some(dir), &RepositoryOptions::empty()).expect("open")
 }
 
@@ -45,7 +48,7 @@ pub(crate) fn oid(hex: &str) -> ObjectId {
     ObjectId::from_hex(hex).expect("oid")
 }
 
-pub(crate) fn commit(dir: &Path, path: &str, text: &str, message: &str) -> ObjectId {
+pub fn commit(dir: &Path, path: &str, text: &str, message: &str) -> ObjectId {
     let file = dir.join(path);
     std::fs::create_dir_all(file.parent().expect("parent")).expect("mkdir");
     std::fs::write(file, text).expect("write");
@@ -63,7 +66,7 @@ pub(crate) struct Served {
 }
 
 impl Served {
-    pub(crate) fn new(root: &Path) -> Self {
+    pub fn new(root: &Path) -> Self {
         let dir = root.join("served");
         std::fs::create_dir_all(&dir).expect("mkdir");
         git(&dir, &["init", "-q", "-b", "main"]);
@@ -173,17 +176,21 @@ pub(crate) fn check_out(served: &mut Served, at: &Path) -> (PathBuf, Repository)
             filter: None,
         },
         &mut out,
+        &mut crate::progress::NullProgress,
+        CancelToken::never_ref(),
     )
     .expect("bundle");
     let dest = at.join("co");
     let made = materialize(
-        &dest,
-        &info,
-        &bundle,
-        &served.url(),
-        "work",
+        &MaterializeRequest {
+            dest: &dest,
+            info: &info,
+            bundle: &bundle,
+            repo_url: &served.url(),
+            work: "work",
+        },
         &mut NoProgress,
-        &NeverCancel,
+        &CancelToken::never(),
     )
     .expect("materialize");
     git(&dest, &["config", "user.name", "T"]);

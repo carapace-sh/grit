@@ -1,31 +1,14 @@
 //! `grit slice` — named sets of paths to check out together, kept on the
 //! server's target branch.
 
-use std::io::Write;
-
+pub use crate::render::slice::*;
 use anyhow::{bail, Context, Result};
 use grit_lib::config::ConfigSet;
 use grit_lib::remote::snapshot_checkout::{
     CheckoutClient, CheckoutMarker, Ident, Slice, SliceChange, SliceDeleteRequest, SliceRequest,
     SLICES_PATH,
 };
-use grit_lib::remote::HttpClientFactory;
-use schemars::JsonSchema;
-use serde::Serialize;
-
-use crate::output::{outln, HumanRender, MarkdownRender, RenderContext};
-
-/// A slice as `grit slice` reports it.
-#[derive(Debug, Clone, Serialize, JsonSchema)]
-pub struct SliceJson {
-    /// The slice's name.
-    pub name: String,
-    /// What it is for.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    /// Its paths.
-    pub paths: Vec<String>,
-}
+use grit_lib::remote::{redact_url_for_display, HttpClientFactory};
 
 impl From<Slice> for SliceJson {
     fn from(s: Slice) -> Self {
@@ -34,128 +17,6 @@ impl From<Slice> for SliceJson {
             description: s.description,
             paths: s.paths,
         }
-    }
-}
-
-/// Result of `grit slice list`.
-#[derive(Debug, Clone, Serialize, JsonSchema)]
-pub struct SliceListOutcome {
-    /// The server repository.
-    pub url: String,
-    /// The target branch the slices are on.
-    pub target: String,
-    /// Where it is.
-    pub head: String,
-    /// The slices.
-    pub slices: Vec<SliceJson>,
-}
-
-impl HumanRender for SliceListOutcome {
-    fn render_human(&self, w: &mut dyn Write, _ctx: &RenderContext) -> Result<()> {
-        if self.slices.is_empty() {
-            outln!(
-                w,
-                "{} has no slices yet; make one with `grit slice new <name> --path <dir>`.",
-                self.target
-            );
-            return Ok(());
-        }
-        let width = self.slices.iter().map(|s| s.name.len()).max().unwrap_or(0);
-        for s in &self.slices {
-            outln!(w, "{:<width$}  {}", s.name, s.paths.join(", "));
-            if let Some(d) = &s.description {
-                outln!(w, "{:<width$}  {d}", "");
-            }
-        }
-        Ok(())
-    }
-}
-
-impl MarkdownRender for SliceListOutcome {
-    fn render_markdown(&self, w: &mut dyn Write, _ctx: &RenderContext) -> Result<()> {
-        outln!(w, "## Slices on `{}`", self.target);
-        outln!(w);
-        if self.slices.is_empty() {
-            outln!(w, "No slices.");
-            return Ok(());
-        }
-        outln!(w, "| Slice | Paths | Description |");
-        outln!(w, "| --- | --- | --- |");
-        for s in &self.slices {
-            let paths: Vec<String> = s.paths.iter().map(|p| format!("`{p}`")).collect();
-            outln!(
-                w,
-                "| `{}` | {} | {} |",
-                s.name,
-                paths.join(", "),
-                s.description.as_deref().unwrap_or_default()
-            );
-        }
-        Ok(())
-    }
-}
-
-/// Result of `grit slice new`, `edit` and `delete`.
-#[derive(Debug, Clone, Serialize, JsonSchema)]
-pub struct SliceChangeOutcome {
-    /// `new`, `edit` or `delete`.
-    pub action: String,
-    /// The slice's name.
-    pub name: String,
-    /// The slice as it is now; omitted once deleted.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub slice: Option<SliceJson>,
-    /// The target branch.
-    pub target: String,
-    /// Where it was.
-    pub previous: String,
-    /// Where it is: the server's commit changing the slices file.
-    pub head: String,
-}
-
-impl HumanRender for SliceChangeOutcome {
-    fn render_human(&self, w: &mut dyn Write, _ctx: &RenderContext) -> Result<()> {
-        let verb = match self.action.as_str() {
-            "new" => "Added",
-            "edit" => "Changed",
-            _ => "Removed",
-        };
-        let short = |s: &str| s.get(..7).unwrap_or(s).to_owned();
-        if self.previous == self.head {
-            outln!(w, "· slice {} is unchanged", self.name);
-        } else {
-            outln!(
-                w,
-                "✓ {verb} slice {} on {}: {} → {}",
-                self.name,
-                self.target,
-                short(&self.previous),
-                short(&self.head)
-            );
-        }
-        if let Some(s) = &self.slice {
-            outln!(w, "  {}", s.paths.join(", "));
-        }
-        Ok(())
-    }
-}
-
-impl MarkdownRender for SliceChangeOutcome {
-    fn render_markdown(&self, w: &mut dyn Write, _ctx: &RenderContext) -> Result<()> {
-        outln!(w, "## Slice `{}` ({})", self.name, self.action);
-        outln!(w);
-        outln!(
-            w,
-            "- **target**: `{}` `{}` → `{}`",
-            self.target,
-            self.previous,
-            self.head
-        );
-        if let Some(s) = &self.slice {
-            let paths: Vec<String> = s.paths.iter().map(|p| format!("`{p}`")).collect();
-            outln!(w, "- **paths**: {}", paths.join(", "));
-        }
-        Ok(())
     }
 }
 
@@ -180,8 +41,15 @@ impl Target {
                 bail!("not in a snapshot checkout; pass --url <repository> to name the server")
             }
         };
-        let config = ConfigSet::load(&env, repo.as_ref().map(|r| r.git_dir()), true)
-            .context("could not load config")?;
+        let config = ConfigSet::load(
+            &env,
+            repo.as_ref().map(|r| r.git_dir()),
+            &grit_lib::config::LoadConfigOptions::standard(
+                &env,
+                repo.as_ref().map(|r| r.git_dir()),
+            ),
+        )
+        .context("could not load config")?;
         let http = crate::context::http_client_factory()
             .create(&config)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -203,7 +71,7 @@ pub fn list(url: Option<&str>) -> Result<SliceListOutcome> {
     let client = target.client()?;
     let slices = client.slices()?;
     Ok(SliceListOutcome {
-        url: client.url().repo_url.clone(),
+        url: redact_url_for_display(&client.url().repo_url),
         target: slices.target,
         head: slices.head,
         slices: slices.slices.into_iter().map(SliceJson::from).collect(),
@@ -286,4 +154,47 @@ pub fn delete(url: Option<&str>, name: &str) -> Result<SliceChangeOutcome> {
         },
     )?;
     Ok(changed("delete", name, change))
+}
+
+/// Dispatch parsed CLI args for `Slice`.
+pub fn dispatch(
+    args: crate::args::SliceArgs,
+    env: crate::dispatch::CommandEnv<'_>,
+) -> anyhow::Result<crate::exit_status::ExitStatus> {
+    use crate::args::*;
+    use crate::commands;
+
+    use crate::dispatch::{emit_success, CommandEnv};
+
+    let CommandEnv {
+        opts,
+        ctx,
+        process_env: _,
+    } = env;
+    let SliceArgs { action, url } = args;
+    match action {
+        SliceAction::List => emit_success(commands::slice::list(url.as_deref())?, opts, ctx),
+        SliceAction::New {
+            name,
+            paths,
+            description,
+        } => emit_success(
+            commands::slice::new(url.as_deref(), &name, &paths, description.as_deref())?,
+            opts,
+            ctx,
+        ),
+        SliceAction::Edit {
+            name,
+            add,
+            remove,
+            description,
+        } => emit_success(
+            commands::slice::edit(url.as_deref(), &name, &add, &remove, description.as_deref())?,
+            opts,
+            ctx,
+        ),
+        SliceAction::Delete { name } => {
+            emit_success(commands::slice::delete(url.as_deref(), &name)?, opts, ctx)
+        }
+    }
 }

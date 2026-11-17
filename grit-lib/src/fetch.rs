@@ -1,21 +1,22 @@
 //! Wire-protocol fetch orchestration over a live transport connection.
 //!
-//! [`fetch_remote`] drives `git-upload-pack` negotiation: match refspecs against
+//! [`fetch_remote_into`] drives `git-upload-pack` negotiation: match refspecs against
 //! advertised refs, run `want`/`have`/`done`, demultiplex the side-band pack,
 //! ingest it, and classify ref updates into a shared fetch outcome. Protocol v2
 //! over streaming transports runs `ls-refs` before `fetch` when the connection
 //! advertises no refs on connect.
 
+use crate::error::ObjectError;
 use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::path::Path;
 
-use crate::environment::RepositoryOptions;
 use crate::error::{Error, Result};
 use crate::fetch_negotiator::SkippingNegotiator;
 use crate::objects::ObjectId;
 use crate::pkt_line;
 use crate::protocol_v2;
+use crate::refs::store::RefNameRef;
 use crate::refspec::RefspecItem;
 use crate::repo::Repository;
 
@@ -25,12 +26,22 @@ type LsRefsAdvertised = (
     std::collections::HashMap<String, ObjectId>,
     Option<ObjectId>,
 );
-use crate::progress::{poll_cancel, Cancel, ProgressSink};
+use crate::progress::{poll_cancel, CancelToken, ProgressSink};
+use crate::remote::RemoteError;
+use crate::repo::error::FilesOnlyOperation;
+use crate::repo::RepositoryError;
 use crate::transfer::{
     classify_update, prune_tracking_refs, ref_excluded, validate_fetch_depth_local,
     validate_fetch_depth_server, FetchOptions, FetchOutcome, RefUpdate, UpdateMode,
 };
 use crate::transport::Connection;
+
+fn http_writer_flush(conn: &mut dyn Connection, cancel: &CancelToken) -> Result<()> {
+    conn.mirror_http_cancel(cancel);
+    conn.writer().flush()?;
+    conn.drain_pending_http(cancel)?;
+    Ok(())
+}
 
 /// Sink for wire transport progress: typed phases via [`ProgressSink`] plus
 /// raw side-band channel 2 bytes from the remote.
@@ -68,6 +79,33 @@ pub trait Progress: ProgressSink {
     /// Progress of a resumable bundle download (clone with `bundle-uri`) or
     /// upload (push to a `pushBundle` endpoint).
     fn resumable_transfer(&mut self, _event: &crate::resumable::ResumableEvent) {}
+
+    /// The fetch conversation with a remote reached `milestone`.
+    ///
+    /// Reported once per milestone per connection, in [`FetchMilestone`]
+    /// order, before the pack's first byte starts the
+    /// [`ReceivingObjects`](crate::progress::ProgressPhase::ReceivingObjects)
+    /// phase. A sink that timestamps these can split the wait before the pack
+    /// into the transport handshake, ref listing and negotiation, and the
+    /// remote preparing the pack. Local copies and bundles report none.
+    fn milestone(&mut self, _milestone: FetchMilestone) {}
+}
+
+/// A point reached in a wire fetch, reported through [`Progress::milestone`].
+///
+/// New variants may be added; match with a wildcard arm outside this crate.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FetchMilestone {
+    /// The connection is open and the remote's advertisement has been read:
+    /// the capabilities for protocol v2, the capabilities and refs for v0/v1.
+    /// Time before this is the transport handshake (TCP, TLS or SSH, and
+    /// starting the remote's `upload-pack`).
+    Connected,
+    /// Ref listing and `want`/`have` negotiation are over and the client has
+    /// sent its final request. Time from here to the first pack byte is the
+    /// remote preparing the pack (counting, compressing).
+    PackRequested,
 }
 
 /// A [`Progress`] / [`ProgressSink`] that discards everything.
@@ -76,6 +114,8 @@ pub struct NoProgress;
 impl Progress for NoProgress {}
 
 impl ProgressSink for NoProgress {}
+
+impl Progress for crate::progress::NullProgress {}
 
 // --- Negotiation flush schedule (mirrors fetch-pack.c) --------------------
 
@@ -136,10 +176,24 @@ fn parse_ack(line: &str) -> Option<(ObjectId, AckKind)> {
     Some((oid, kind))
 }
 
+/// What one v0/v1 ACK round told the client.
+#[derive(Default)]
+struct AckRound {
+    /// Commits acknowledged as `common` that were not common before, in order.
+    /// A stateless client must restate them as `have`s on every later request.
+    new_common: Vec<ObjectId>,
+    /// The server answered `ACK <oid> ready`: more haves would not shrink the pack.
+    ready: bool,
+}
+
 /// Read one ACK round, feeding `common`/`continue`/`ready` acks to the
-/// negotiator. Lifted from `read_ack_round_with_negotiator`.
-fn read_ack_round(reader: &mut dyn Read, negotiator: &mut SkippingNegotiator<'_>) -> Result<()> {
+/// negotiator.
+fn read_ack_round(
+    reader: &mut dyn Read,
+    negotiator: &mut SkippingNegotiator<'_>,
+) -> Result<AckRound> {
     let mut reader = reader;
+    let mut round = AckRound::default();
     while let Some(pkt) = pkt_line::read_packet(&mut reader)? {
         match pkt {
             pkt_line::Packet::Flush => break,
@@ -156,9 +210,88 @@ fn read_ack_round(reader: &mut dyn Read, negotiator: &mut SkippingNegotiator<'_>
                 if kind == AckKind::Bare {
                     break;
                 }
-                let _ = negotiator.ack(ack_oid)?;
+                let was_common = negotiator.ack(ack_oid)?;
+                match kind {
+                    AckKind::Common if !was_common => round.new_common.push(ack_oid),
+                    AckKind::Ready => round.ready = true,
+                    _ => {}
+                }
             }
             _ => {}
+        }
+    }
+    Ok(round)
+}
+
+/// Read the server's answer to `done`: `NAK` when nothing was common, else the
+/// final bare `ACK <oid>`, after any `ACK <oid> common`/`ready` lines for the
+/// haves sent along with `done` (or restated on a stateless request).
+fn read_final_ack(reader: &mut dyn Read) -> Result<()> {
+    let mut reader = reader;
+    loop {
+        match pkt_line::read_packet(&mut reader)? {
+            None => {
+                return Err(Error::Object(ObjectError::Corrupt {
+                    detail: "unexpected EOF after done".to_owned(),
+                }))
+            }
+            Some(pkt_line::Packet::Flush) => {
+                return Err(Error::Object(ObjectError::Corrupt {
+                    detail: "unexpected flush after done".to_owned(),
+                }))
+            }
+            Some(pkt_line::Packet::Data(ln)) => {
+                let ln = ln.trim_end();
+                if ln == "NAK" {
+                    return Ok(());
+                }
+                match parse_ack(ln) {
+                    Some((_, AckKind::Bare)) => return Ok(()),
+                    Some(_) => {}
+                    None => {
+                        pkt_line::reject_err_line(ln)?;
+                        return Ok(());
+                    }
+                }
+            }
+            Some(_) => return Ok(()),
+        }
+    }
+}
+
+/// True when the space-separated v0/v1 capability string `caps` lists `name`
+/// (bare or as `name=<value>`).
+fn server_caps_has(caps: &str, name: &str) -> bool {
+    caps.split_ascii_whitespace()
+        .any(|cap| cap == name || cap.strip_prefix(name).is_some_and(|v| v.starts_with('=')))
+}
+
+/// Mark advertised refs that we already track at the same peeled commit as
+/// `known_common`, excluding `wants`.
+///
+/// Unchanged refs avoid walking parent chains for every server tip during an
+/// incremental fetch; moved refs are discovered via `have`s.
+fn seed_known_common(
+    negotiator: &mut SkippingNegotiator<'_>,
+    advertised: &[(String, ObjectId)],
+    wants: &HashSet<ObjectId>,
+) -> Result<()> {
+    let local = negotiator.repo();
+    let mut local_by_name: std::collections::HashMap<String, ObjectId> =
+        std::collections::HashMap::new();
+    for prefix in ["refs/heads/", "refs/tags/"] {
+        if let Ok(entries) = crate::refs::list_refs_in(local, prefix) {
+            for (name, oid) in entries {
+                local_by_name.insert(name, oid);
+            }
+        }
+    }
+    for (name, oid) in advertised {
+        if wants.contains(oid) || local_by_name.get(name) != Some(oid) {
+            continue;
+        }
+        if let Ok(Some(c)) = local.odb().peel_to_commit(*oid) {
+            negotiator.known_common(c)?;
         }
     }
     Ok(())
@@ -172,13 +305,13 @@ fn read_sideband_pack(
     r: &mut dyn Read,
     target: &mut crate::pack_receive::PackReceiveTarget<'_>,
     progress: &mut dyn Progress,
-    cancel: &dyn Cancel,
+    cancel: &CancelToken,
 ) -> Result<()> {
     crate::pack_receive::read_sideband_pack_to(r, target, progress, cancel)
 }
 
 /// New shallow boundaries the server reported during a fetch, captured from the
-/// `shallow-info` section so [`fetch_remote`] (and the HTTP fetch paths) can
+/// `shallow-info` section so [`fetch_remote_into`] (and the HTTP fetch paths) can
 /// update the local `shallow` file and surface them in [`FetchOutcome`].
 #[derive(Default)]
 pub(crate) struct ShallowUpdate {
@@ -210,19 +343,18 @@ fn append_shallow_request_v0(
             .is_some_and(|s| !s.trim().is_empty())
         || opts.deepen_not.iter().any(|s| !s.trim().is_empty());
     if sends_shallow && !server_caps.contains("shallow") {
-        return Err(Error::FetchShallowUnsupported);
+        return Err(RemoteError::FetchShallowUnsupported.into());
     }
     for oid in local_shallow {
         pkt_line::write_line_to_vec(req, &format!("shallow {}", oid.to_hex()))?;
     }
+    // v0/v1 carry `deepen-relative` only as a capability on the first `want`
+    // line; Git's upload-pack rejects it as a standalone request line.
     if let Some((depth, relative)) = opts.wire_deepen() {
         if relative && !server_caps.contains("deepen-relative") {
-            return Err(Error::FetchDeepenRelativeUnsupported);
+            return Err(RemoteError::FetchDeepenRelativeUnsupported.into());
         }
         pkt_line::write_line_to_vec(req, &format!("deepen {depth}"))?;
-        if relative {
-            pkt_line::write_line_to_vec(req, "deepen-relative")?;
-        }
     }
     if let Some(since) = opts
         .deepen_since
@@ -250,14 +382,17 @@ fn append_shallow_request_v0(
 /// the server reported (`shallow`/`unshallow`).
 ///
 /// Drives the [`SkippingNegotiator`] over the connection: sends `want` lines
-/// (with v0/v1 capabilities) and the advertised refs as `known_common`, batches
-/// local `have`s with flushes (reading interleaved ACK rounds), sends `done`,
-/// consumes the final ACK/NAK, then demuxes the side-band pack.
+/// (with v0/v1 capabilities), seeds the advertised refs we already have as
+/// `known_common`, batches local `have`s with flushes (reading interleaved ACK
+/// rounds until the server is ready), sends `done`, consumes the final ACK/NAK,
+/// then demuxes the side-band pack. Over stateless RPC every request restates
+/// the want block and the haves acknowledged as common so far.
 ///
 /// When `opts` requests a deepen (or the repo is already shallow), the `want`
 /// block carries the client's `shallow <oid>` grafts and the `deepen*` args, and
-/// the server precedes the pack with a `shallow-info` section that this reads
-/// into the returned [`ShallowUpdate`].
+/// the server precedes its replies with a `shallow-info` section that this reads
+/// into the returned [`ShallowUpdate`]. Such a request still offers haves (the
+/// wanted tips included), but seeds no `known_common`.
 #[allow(clippy::too_many_arguments)]
 fn negotiate_pack(
     local: &Repository,
@@ -267,7 +402,7 @@ fn negotiate_pack(
     local_shallow: &[ObjectId],
     wire_filter: Option<&str>,
     progress: &mut dyn Progress,
-    cancel: &dyn Cancel,
+    cancel: &CancelToken,
     skip_local_haves: bool,
 ) -> Result<(Option<std::path::PathBuf>, ShallowUpdate)> {
     crate::trace::trace_span!("grit.fetch.negotiate");
@@ -277,12 +412,14 @@ fn negotiate_pack(
         return Ok((None, ShallowUpdate::default()));
     };
 
-    // A deepen/shallow request changes the negotiation: the server precedes the
-    // pack with a `shallow-info` section, and the client's local history is not a
-    // usable negotiation base (its objects bottom out at grafts), so we skip
-    // offering `have`s. Mirrors `fetch-pack.c`'s shallow handling.
+    // A deepen/shallow request makes the server precede its replies with a
+    // `shallow-info` section, but it still negotiates: the walk stops at local
+    // shallow commits and the server bounds the haves by our `shallow` lines, so
+    // a deepen only ships history the client lacks. Its wants are usually local
+    // already (the tips being deepened) and are offered as haves too, and
+    // advertised tips are not pre-marked common, as in Git.
     let shallow_request = opts.has_deepen_request() || !local_shallow.is_empty();
-    let skip_haves = shallow_request || skip_local_haves;
+    let stateless = conn.stateless_rpc();
 
     // Capture the advertised refs before borrowing the writer (avoids aliasing
     // the connection's reader/writer with its accessors). v0/v1 shallow servers
@@ -302,12 +439,20 @@ fn negotiate_pack(
     };
     if opts.wire_deepen().is_some_and(|(_, relative)| relative) {
         if !server_caps.contains("deepen-relative") {
-            return Err(Error::FetchDeepenRelativeUnsupported);
+            return Err(RemoteError::FetchDeepenRelativeUnsupported.into());
         }
         caps.push_str(" deepen-relative");
     }
     if wire_filter.is_some() {
         caps.push_str(" filter");
+    }
+    // Over stateless RPC a `no-done` server sends the pack right after its
+    // `ready`, saving the request that would only carry `done`.
+    let no_done = stateless
+        && server_caps_has(&server_caps, "multi_ack_detailed")
+        && server_caps_has(&server_caps, "no-done");
+    if no_done {
+        caps.push_str(" no-done");
     }
 
     let mut req: Vec<u8> = Vec::new();
@@ -319,7 +464,7 @@ fn negotiate_pack(
     // Match `git fetch-pack`: with a single unique OID, repeat the bare want.
     // git-daemon expects this. (Not done for shallow requests, which append
     // shallow/deepen lines instead.)
-    if wants.len() == 1 && !skip_haves {
+    if wants.len() == 1 && !shallow_request && !skip_local_haves {
         pkt_line::write_line_to_vec(&mut req, &format!("want {}", first_want.to_hex()))?;
     }
     if let Some(spec) = wire_filter {
@@ -327,40 +472,32 @@ fn negotiate_pack(
     }
     append_shallow_request_v0(&mut req, &server_caps, local_shallow, opts)?;
     req.extend_from_slice(b"0000");
-    conn.writer().write_all(&req)?;
-    conn.writer().flush()?;
+
+    // A stateless server keeps nothing between POSTs, so every request restates
+    // the want block followed by each have it has acknowledged as common. A
+    // duplex stream sends the want block once. Stateless requests without a
+    // deepen carry the want block in the first have round instead of a POST of
+    // their own; a deepen posts it alone first to learn the new shallow list.
+    let mut state = req;
+    if !stateless || shallow_request {
+        conn.mirror_http_cancel(cancel);
+        conn.writer().write_all(&state)?;
+        http_writer_flush(conn, cancel)?;
+    }
+    if !stateless {
+        state.clear();
+    }
 
     // Build the negotiator from local ref tips (heads, tags, HEAD), peeled to
-    // commits, excluding the wants. Advertised tips we already have become
-    // `known_common`.
+    // commits, excluding the wants unless deepening. Advertised tips we already
+    // have become `known_common` for a plain fetch.
     let mut negotiator = SkippingNegotiator::new(local);
-    if !skip_haves {
-        add_negotiation_tips(&mut negotiator, &want_set)?;
-        // Seed `known_common` only for advertised refs we already track at the same
-        // peeled commit. Unchanged refs avoid walking parent chains for every server
-        // tip during incremental fetch; moved refs are discovered via `have`s.
-        let mut local_by_name: std::collections::HashMap<String, ObjectId> =
-            std::collections::HashMap::new();
-        for prefix in ["refs/heads/", "refs/tags/"] {
-            if let Ok(entries) = crate::refs::list_refs_in(local, prefix) {
-                for (name, oid) in entries {
-                    local_by_name.insert(name, oid);
-                }
-            }
-        }
-        for (name, oid) in &advertised {
-            if want_set.contains(oid) {
-                continue;
-            }
-            let Some(local_oid) = local_by_name.get(name) else {
-                continue;
-            };
-            if local_oid != oid {
-                continue;
-            }
-            if let Ok(Some(c)) = negotiator.repo().odb().peel_to_commit(*oid) {
-                negotiator.known_common(c)?;
-            }
+    if !skip_local_haves {
+        if shallow_request {
+            add_negotiation_tips(&mut negotiator, &HashSet::new())?;
+        } else {
+            add_negotiation_tips(&mut negotiator, &want_set)?;
+            seed_known_common(&mut negotiator, &advertised, &want_set)?;
         }
     }
 
@@ -373,84 +510,84 @@ fn negotiate_pack(
         let (sh, unsh) = crate::shallow::read_shallow_info_section(&mut conn.reader())?;
         shallow_update.shallow = sh;
         shallow_update.unshallow = unsh;
-    } else if skip_local_haves && conn.stateless_rpc() {
-        read_ack_round(conn.reader(), &mut negotiator)?;
-    } else if conn.stateless_rpc() {
-        // Stateless HTTP completes a POST for the want block; consume its response
-        // before the first have round posts again (otherwise the next POST drains it).
-        read_ack_round(conn.reader(), &mut negotiator)?;
     }
 
-    // Have/ACK exchange: batch haves, flush, read interleaved ACK rounds.
+    // Have/ACK exchange: batch haves, flush, read interleaved ACK rounds, and
+    // stop once the server says it is ready to send the pack.
     let mut count: usize = 0;
     let mut flush_at: usize = INITIAL_FLUSH;
     let mut pending: Vec<u8> = Vec::new();
     let mut flushes: i32 = 0;
-    if !skip_haves {
+    let mut got_ready = false;
+    if !skip_local_haves {
         while let Some(oid) = negotiator.next_have()? {
+            conn.mirror_http_cancel(cancel);
             poll_cancel(progress, cancel)?;
             pkt_line::write_line_to_vec(&mut pending, &format!("have {}", oid.to_hex()))?;
             count += 1;
-            if flush_at <= count {
-                pending.extend_from_slice(b"0000");
+            if count < flush_at {
+                continue;
+            }
+            pending.extend_from_slice(b"0000");
+            if stateless {
+                let mut body = state.clone();
+                body.extend_from_slice(&pending);
+                conn.writer().write_all(&body)?;
+                flush_at = next_v2_flush_count(count);
+            } else {
                 conn.writer().write_all(&pending)?;
-                conn.writer().flush()?;
-                pending.clear();
                 flush_at = next_flush_count(count);
-                flushes += 1;
-                // Duplex: keep one window ahead. Stateless: every POST must be read
-                // before the next POST replaces the response.
-                if count == INITIAL_FLUSH && !conn.stateless_rpc() {
-                    continue;
+            }
+            http_writer_flush(conn, cancel)?;
+            pending.clear();
+            flushes += 1;
+            // Duplex: keep one window ahead. Stateless: every POST must be read
+            // before the next POST replaces the response.
+            if count == INITIAL_FLUSH && !stateless {
+                continue;
+            }
+            if stateless && shallow_request {
+                // Every stateless reply to a deepen repeats the shallow list.
+                crate::shallow::read_shallow_info_section(&mut conn.reader())?;
+            }
+            let round = read_ack_round(conn.reader(), &mut negotiator)?;
+            flushes -= 1;
+            if stateless {
+                for oid in round.new_common {
+                    pkt_line::write_line_to_vec(&mut state, &format!("have {}", oid.to_hex()))?;
                 }
-                read_ack_round(conn.reader(), &mut negotiator)?;
-                flushes -= 1;
+            }
+            if round.ready {
+                got_ready = true;
+                break;
             }
         }
-    }
-    if !pending.is_empty() {
-        pending.extend_from_slice(b"0000");
-        conn.writer().write_all(&pending)?;
-        conn.writer().flush()?;
-        flushes += 1;
     }
     while flushes > 0 {
         read_ack_round(conn.reader(), &mut negotiator)?;
         flushes -= 1;
     }
 
-    // Send `done` (single pkt-line, no trailing flush) and read the ACK/NAK.
-    let mut tail = Vec::new();
-    pkt_line::write_line_to_vec(&mut tail, "done")?;
-    conn.writer().write_all(&tail)?;
-    conn.writer().flush()?;
+    if !(got_ready && no_done) {
+        // Haves not yet flushed go out with `done` (single pkt-line, no trailing
+        // flush); a stateless request restates the want block and common haves.
+        let mut tail = state;
+        tail.extend_from_slice(&pending);
+        pkt_line::write_line_to_vec(&mut tail, "done")?;
+        conn.mirror_http_cancel(cancel);
+        conn.writer().write_all(&tail)?;
+        http_writer_flush(conn, cancel)?;
 
-    // Stateless v0 repeats shallow/unshallow lines after `done` before NAK/pack.
-    if shallow_request && conn.stateless_rpc() {
-        let (sh, unsh) = crate::shallow::read_shallow_info_section(&mut conn.reader())?;
-        shallow_update.shallow.extend(sh);
-        shallow_update.unshallow.extend(unsh);
+        // Stateless v0 repeats shallow/unshallow lines after `done` before NAK/pack.
+        if shallow_request && stateless {
+            let (sh, unsh) = crate::shallow::read_shallow_info_section(&mut conn.reader())?;
+            shallow_update.shallow.extend(sh);
+            shallow_update.unshallow.extend(unsh);
+        }
     }
 
-    match pkt_line::read_packet(&mut conn.reader())? {
-        None => return Err(Error::Message("unexpected EOF after done".to_owned())),
-        Some(pkt_line::Packet::Flush) => {
-            return Err(Error::Message("unexpected flush after done".to_owned()))
-        }
-        Some(pkt_line::Packet::Data(ln)) => {
-            let ln = ln.trim_end();
-            if ln != "NAK" {
-                if let Some((ack_oid, kind)) = parse_ack(ln) {
-                    if kind != AckKind::Bare {
-                        let _ = negotiator.ack(ack_oid)?;
-                    }
-                } else if let Some(msg) = ln.strip_prefix("ERR ") {
-                    return Err(Error::Message(format!("remote error: {}", msg.trim_end())));
-                }
-            }
-        }
-        Some(_) => {}
-    }
+    progress.milestone(FetchMilestone::PackRequested);
+    read_final_ack(conn.reader())?;
 
     let mut pack_receive = crate::pack_receive::TempPackReceive::create(local.odb().objects_dir())?;
     pack_receive.read_sideband(conn.reader(), progress, cancel)?;
@@ -729,9 +866,7 @@ pub(crate) fn parse_v2_ls_refs_response(reader: &mut dyn Read) -> Result<LsRefsA
             Some(pkt_line::Packet::ResponseEnd) => break,
             Some(pkt_line::Packet::Data(line)) => {
                 let line = line.trim_end_matches('\n');
-                if let Some(msg) = line.strip_prefix("ERR ") {
-                    return Err(Error::Message(format!("remote error: {}", msg.trim_end())));
-                }
+                pkt_line::reject_err_line(line)?;
                 if let Some(t) = parse_v2_ls_refs_unborn_head_symref(line) {
                     head_symref = Some(t);
                     continue;
@@ -916,8 +1051,13 @@ fn v2_promisor_handshake(
             .remote_name
             .as_deref()
             .is_some_and(|name| crate::promisor_remote::is_promisor_remote(local_cfg, name));
-    let mut handshake =
-        PromisorHandshake::evaluate(local_cfg, &advertisement, partial_fetch, auto_filter);
+    let mut handshake = PromisorHandshake::evaluate(
+        local_cfg,
+        &advertisement,
+        &crate::promisor_remote::PromisorHandshakeOptions::default()
+            .with_partial_fetch(partial_fetch)
+            .with_auto_filter(auto_filter),
+    );
     if !opts.dry_run {
         handshake.store_fields(local.git_dir(), local_cfg)?;
     }
@@ -957,7 +1097,7 @@ fn negotiate_pack_v2(
     deepen: &V2DeepenArgs,
     wire_filter: Option<&str>,
     progress: &mut dyn Progress,
-    cancel: &dyn Cancel,
+    cancel: &CancelToken,
     mode: V2FetchMode<'_>,
 ) -> Result<(Option<std::path::PathBuf>, ShallowUpdate)> {
     if wants.is_empty() {
@@ -998,6 +1138,7 @@ fn negotiate_pack_v2(
     let mut seen_ack = false;
     let mut round_haves: Vec<ObjectId> = Vec::new();
     loop {
+        poll_cancel(progress, cancel)?;
         round_haves.clear();
         round_haves.extend_from_slice(&common);
         let added = match haves.as_mut() {
@@ -1048,6 +1189,7 @@ fn negotiate_pack_v2(
             _ => break,
         }
     }
+    progress.milestone(FetchMilestone::PackRequested);
     read_v2_fetch_pack_response(
         conn.reader(),
         &mut Vec::new(),
@@ -1226,9 +1368,7 @@ pub(crate) fn read_v2_acknowledgments(
         }
     };
     let hdr = hdr.as_str();
-    if let Some(msg) = hdr.strip_prefix("ERR ") {
-        return Err(Error::Message(format!("remote error: {}", msg.trim_end())));
-    }
+    pkt_line::reject_err_line(hdr)?;
     if hdr != "acknowledgments" {
         // The server started a non-acknowledgments section; the pack reader,
         // called next, re-dispatches on this header. We cannot push it back, so
@@ -1239,9 +1379,9 @@ pub(crate) fn read_v2_acknowledgments(
         // would be lost; for the streaming fetch we only reach here after a
         // first round of haves, where servers always emit `acknowledgments`
         // first. Reaching a different header is therefore unexpected.
-        return Err(Error::Message(format!(
-            "unexpected v2 fetch section before acknowledgments: {hdr}"
-        )));
+        return Err(Error::Object(ObjectError::Corrupt {
+            detail: format!("unexpected v2 fetch section before acknowledgments: {hdr}"),
+        }));
     }
     let mut ready = false;
     let mut common = Vec::new();
@@ -1259,7 +1399,9 @@ pub(crate) fn read_v2_acknowledgments(
                 }
                 if let Some(hex) = ln.strip_prefix("ACK ") {
                     let oid = ObjectId::from_hex(hex.trim()).map_err(|_| {
-                        Error::Message(format!("unexpected acknowledgment line: '{ln}'"))
+                        Error::Object(ObjectError::Corrupt {
+                            detail: format!("unexpected acknowledgment line: '{ln}'"),
+                        })
                     })?;
                     common.push(oid);
                     continue;
@@ -1268,9 +1410,9 @@ pub(crate) fn read_v2_acknowledgments(
                     ready = true;
                     continue;
                 }
-                return Err(Error::Message(format!(
-                    "unexpected acknowledgment line: '{ln}'"
-                )));
+                return Err(Error::Object(ObjectError::Corrupt {
+                    detail: format!("unexpected acknowledgment line: '{ln}'"),
+                }));
             }
         }
     }
@@ -1304,7 +1446,7 @@ pub(crate) fn read_v2_fetch_pack_response(
     pack_sink: Option<&mut crate::pack_receive::TempPackReceive>,
     shallow_out: &mut ShallowUpdate,
     progress: &mut dyn Progress,
-    cancel: &dyn Cancel,
+    cancel: &CancelToken,
     sideband_all: bool,
 ) -> Result<()> {
     loop {
@@ -1321,23 +1463,22 @@ pub(crate) fn read_v2_fetch_pack_response(
                 // A response to a request with wants ends with the packfile section;
                 // a stream that just stops was cut short (a server that died, say).
                 None => {
-                    return Err(Error::RemoteUnreadable {
+                    return Err(RemoteError::Unreadable {
                         url: None,
                         reason: crate::error::RemoteUnreadableReason::ResponseTruncated,
-                    })
+                    }
+                    .into())
                 }
                 Some(pkt_line::Packet::Delim) => continue,
                 Some(other) => {
-                    return Err(Error::Message(format!(
-                        "unexpected v2 fetch response: {other:?}"
-                    )))
+                    return Err(Error::Object(ObjectError::Corrupt {
+                        detail: format!("unexpected v2 fetch response: {other:?}"),
+                    }))
                 }
             }
         };
         let hdr = hdr.as_str();
-        if let Some(msg) = hdr.strip_prefix("ERR ") {
-            return Err(Error::Message(format!("remote error: {}", msg.trim_end())));
-        }
+        pkt_line::reject_err_line(hdr)?;
         match hdr {
             h if h == crate::protocol_v2::FetchResponseSection::ShallowInfo.header() => {
                 // Capture the shallow/unshallow boundary updates. The section is
@@ -1369,9 +1510,9 @@ pub(crate) fn read_v2_fetch_pack_response(
                 // `wanted-refs` payload line (some servers omit the section header).
             }
             other => {
-                return Err(Error::Message(format!(
-                    "unexpected v2 fetch section: {other}"
-                )))
+                return Err(Error::Object(ObjectError::Corrupt {
+                    detail: format!("unexpected v2 fetch section: {other}"),
+                }))
             }
         }
     }
@@ -1425,68 +1566,27 @@ impl FetchDryRunIngest {
                 objects_dir,
                 pack,
                 read,
-            } => crate::odb::OdbBuilder::files(objects_dir)
-                .primary(pack.clone())
+            } => crate::odb::OdbBuilder::new()
                 .push_read_source(read.clone())
-                .alternates(false)
-                .build(),
+                .build(objects_dir, Some(pack.clone())),
         }
     }
 }
 
-/// Fetch from a remote over a live [`Connection`], driving the upload-pack
-/// negotiation and writing the resulting tracking-ref updates into
-/// `local_git_dir`.
-///
-/// The flow mirrors local fetch, but the remote ref list comes from the
-/// connection's advertisement, objects arrive over the wire as a negotiated pack,
-/// and the local repo is opened to classify ancestry. Reuses refspec matching,
-/// tag-mode, prune, and classification helpers shared with other fetch paths.
-///
-/// Handles protocol v0, v1, and v2. For a v2 connection the ref map is recovered
-/// via a `command=ls-refs` round (no refs are advertised on connect) and the
-/// pack is negotiated with `command=fetch`; v0/v1 use the connect-time
-/// advertisement and the classic `want`/`have`/`done` exchange.
-///
-/// # Errors
-///
-/// The local repository is opened with [`FetchOptions::environment`], so objects land in its
-/// `GIT_OBJECT_DIRECTORY` when that is set.
-///
-/// Returns an error if `local_git_dir` is not a repository, if a refspec is invalid, if the
-/// negotiation or pack ingest fails, or on ref/odb I/O failure.
-pub fn fetch_remote(
-    local_git_dir: &Path,
-    conn: &mut dyn Connection,
-    opts: &mut FetchOptions,
-    progress: &mut dyn Progress,
-    cancel: &dyn Cancel,
-) -> Result<FetchOutcome> {
-    let local = open_fetch_target(local_git_dir, opts)?;
-    fetch_remote_into(&local, conn, opts, progress, cancel)
-}
-
-/// Open the repository a git-dir based fetch writes into, honouring the fetch's environment.
-pub(crate) fn open_fetch_target(local_git_dir: &Path, opts: &FetchOptions) -> Result<Repository> {
-    Repository::open(
-        local_git_dir,
-        &RepositoryOptions::with_environment(opts.environment.clone()),
-    )
-}
-
-/// Like [`fetch_remote`], reading and writing objects through `local`'s object store.
+/// Fetch from a remote over a live [`Connection`] into `local`, reading and writing objects
+/// through `local`'s object store.
 ///
 /// Received packs are ingested into `local`'s primary backend, including a custom
-/// [`OdbBuilder::primary`](crate::odb::OdbBuilder::primary) store. Set
-/// [`FetchOptions::pack_spool_only`](crate::transfer::FetchOptions::pack_spool_only) to keep the
+/// [`RepositoryOptions::with_object_store`](crate::environment::RepositoryOptions::with_object_store) store. Set
+/// test_support fetch pack-spool-only knob (test-support feature) to keep the
 /// negotiated pack on disk and ingest it with [`crate::index_pack::ingest_received_pack_path`]
 /// or [`crate::unpack_objects::ingest_pack_into`].
-pub fn fetch_remote_into(
+pub(crate) fn fetch_remote_into(
     local: &Repository,
     conn: &mut dyn Connection,
     opts: &mut FetchOptions,
     progress: &mut dyn Progress,
-    cancel: &dyn Cancel,
+    cancel: &CancelToken,
 ) -> Result<FetchOutcome> {
     use crate::net_trace::net_trace;
     let local_git_dir = local.git_dir();
@@ -1502,8 +1602,16 @@ pub fn fetch_remote_into(
         opts.tags,
         opts.fetch_depth
     );
+    // Every transport reads the remote's advertisement while connecting, so
+    // the handshake is over by the time a connection reaches this point.
+    progress.milestone(FetchMilestone::Connected);
     validate_fetch_depth_local(local_git_dir, opts)?;
-    let local_cfg = crate::config::ConfigSet::load(&opts.environment, Some(local_git_dir), true)?;
+    conn.mirror_http_cancel(cancel);
+    let local_cfg = crate::config::ConfigSet::load(
+        &opts.environment,
+        Some(local_git_dir),
+        &crate::config::LoadConfigOptions::standard(&opts.environment, Some(local_git_dir)),
+    )?;
     if opts.filter.is_none() {
         if let Some(remote) = opts.remote_name.as_deref() {
             opts.filter = crate::partial_clone::stored_remote_filter(&local_cfg, remote);
@@ -1581,10 +1689,11 @@ pub fn fetch_remote_into(
         && remote_refs.is_empty()
         && !crate::transport::connection_handshake_complete(conn)
     {
-        return Err(Error::RemoteUnreadable {
+        return Err(RemoteError::Unreadable {
             url: None,
             reason: crate::error::RemoteUnreadableReason::NoHandshake,
-        });
+        }
+        .into());
     }
 
     let conn_caps: Vec<String> = conn.capabilities().to_vec();
@@ -1600,9 +1709,10 @@ pub fn fetch_remote_into(
     let local_git_dir = local.git_dir();
     let local_odb = local.odb();
     if opts.filter.is_some() && !local_odb.uses_files_primary() {
-        return Err(Error::UnsupportedObjectStore {
-            operation: "partial fetch",
-        });
+        return Err(RepositoryError::UnsupportedObjectStore {
+            operation: FilesOnlyOperation::PartialFetch,
+        }
+        .into());
     }
 
     let crate::transfer::FetchMatchSet {
@@ -1629,7 +1739,7 @@ pub fn fetch_remote_into(
     // wanting the tag itself would drag down its (otherwise unreachable) target
     // and incorrectly keep the tag. They are pruned by `retain_following_tags`.
     let tags_present = if opts.tags == crate::transfer::TagMode::Following {
-        tags_already_local(local.refs(), &remote_refs)
+        tags_already_local(local.ref_store(), &remote_refs)
     } else {
         HashSet::new()
     };
@@ -1801,8 +1911,11 @@ pub fn fetch_remote_into(
                     promisor: promisor_handshake,
                 });
             }
-            let pack_config =
-                crate::config::ConfigSet::load(&opts.environment, Some(local_git_dir), true)?;
+            let pack_config = crate::config::ConfigSet::load(
+                &opts.environment,
+                Some(local_git_dir),
+                &crate::config::LoadConfigOptions::standard(&opts.environment, Some(local_git_dir)),
+            )?;
             let index_threads = crate::parallel::index_pack_threads_for_ingest(
                 opts.thread_policy,
                 &pack_config,
@@ -2011,6 +2124,8 @@ pub fn fetch_remote_into(
 
     if !opts.dry_run && !store_batch.is_empty() {
         let t = std::time::Instant::now();
+        let fetch_reflog = prepare_fetch_apply_reflog(local, opts)?;
+        let fetch_reflog_ctx = fetch_reflog.as_ref().map(PreparedFetchReflog::context);
         crate::transfer::apply_fetch_ref_updates(
             local,
             store_batch,
@@ -2022,6 +2137,7 @@ pub fn fetch_remote_into(
                 remote_name: opts.remote_name.as_deref(),
             },
             opts.initial_remote_fetch,
+            fetch_reflog_ctx.as_ref(),
         )?;
         d_write += t.elapsed();
     }
@@ -2082,7 +2198,7 @@ fn fetch_remote_object_wants(
     conn: &mut dyn Connection,
     opts: &mut FetchOptions,
     progress: &mut dyn Progress,
-    cancel: &dyn Cancel,
+    cancel: &CancelToken,
 ) -> Result<FetchOutcome> {
     use crate::net_trace::net_trace;
 
@@ -2162,8 +2278,11 @@ fn fetch_remote_object_wants(
         )?
     };
     if let Some(path) = pack_path {
-        let pack_config =
-            crate::config::ConfigSet::load(&opts.environment, Some(local_git_dir), true)?;
+        let pack_config = crate::config::ConfigSet::load(
+            &opts.environment,
+            Some(local_git_dir),
+            &crate::config::LoadConfigOptions::standard(&opts.environment, Some(local_git_dir)),
+        )?;
         let index_threads = crate::parallel::index_pack_threads_for_ingest(
             opts.thread_policy,
             &pack_config,
@@ -2211,20 +2330,59 @@ fn fetch_remote_object_wants(
     })
 }
 
+/// Formatted identity and action for [`crate::transfer::apply_fetch_ref_updates`] reflog lines.
+pub(crate) struct PreparedFetchReflog {
+    identity: String,
+    action: &'static str,
+}
+
+impl PreparedFetchReflog {
+    pub(crate) fn context(&self) -> crate::transfer::FetchApplyReflog<'_> {
+        crate::transfer::FetchApplyReflog {
+            action: self.action,
+            identity: &self.identity,
+        }
+    }
+}
+
+/// Build fetch reflog metadata when this fetch should log tracking-ref updates.
+///
+/// Returns `None` on the initial clone fetch (branch logs are omitted; see
+/// [`finish_initial_remote_fetch_layout`] for `refs/remotes/{remote}/HEAD`).
+pub(crate) fn prepare_fetch_apply_reflog(
+    local: &Repository,
+    opts: &FetchOptions,
+) -> Result<Option<PreparedFetchReflog>> {
+    if opts.initial_remote_fetch {
+        return Ok(None);
+    }
+    let sig = fetch_operation_identity(&opts.environment, local.git_dir())?;
+    let identity = crate::refs::store::format_reflog_identity(&sig.reflog_name_email(), sig.time);
+    Ok(Some(PreparedFetchReflog {
+        identity,
+        action: opts.reflog_action,
+    }))
+}
+
 /// Committer identity for fetch/clone reflog entries.
-pub fn fetch_operation_identity(
+pub(crate) fn fetch_operation_identity(
     env: &crate::environment::Environment,
     git_dir: &Path,
 ) -> Result<crate::ident::Signature> {
     use crate::ident_config::ident_default_name;
-    let cfg = crate::config::ConfigSet::load(env, Some(git_dir), true)?;
+    let cfg = crate::config::ConfigSet::load(
+        env,
+        Some(git_dir),
+        &crate::config::LoadConfigOptions::standard(env, Some(git_dir)),
+    )?;
     let name = ident_default_name(&cfg, env);
     let email = cfg
-        .get("user.email")
+        .value("user.email")
         .filter(|e| !e.trim().is_empty())
         .unwrap_or_else(|| "unknown".to_owned());
     let now = time::OffsetDateTime::now_utc();
-    crate::ident::Signature::new(name, email, now).map_err(crate::error::Error::InvalidSignature)
+    crate::ident::Signature::new(name, email, now)
+        .map_err(|e| crate::error::Error::Object(ObjectError::InvalidSignature(e)))
 }
 
 /// Ensure `refs/remotes/<remote>/HEAD` exists in `local`'s ref store when the remote default
@@ -2249,7 +2407,7 @@ pub(crate) fn ensure_remote_tracking_head_symref(
     if crate::refs::resolve_ref_in(local, &target).is_err() {
         return Ok(());
     }
-    crate::refs::write_symbolic_ref_on_store(local.refs(), local.git_dir(), &head_ref, &target)
+    crate::refs::write_symbolic_ref_on_store(local.ref_store(), local.git_dir(), &head_ref, &target)
 }
 
 /// Clone-only ref layout after the first fetch into `local`: pack the imported refs (files
@@ -2265,7 +2423,7 @@ pub(crate) fn finish_initial_remote_fetch_layout(
     }
     let git_dir = local.git_dir();
     if local.refs_on_disk() {
-        crate::refs::pack_imported_refs_for_clone(git_dir, opts.remote_name.as_deref())?;
+        crate::refs::pack_imported_refs_for_clone(local, opts.remote_name.as_deref())?;
     }
     let Some(remote) = opts.remote_name.as_deref() else {
         return Ok(());
@@ -2278,32 +2436,21 @@ pub(crate) fn finish_initial_remote_fetch_layout(
     let Ok(tip) = crate::refs::resolve_ref_in(local, &target) else {
         return Ok(());
     };
-    crate::refs::write_symbolic_ref_on_store(local.refs(), git_dir, &head_ref, &target)?;
+    crate::refs::write_symbolic_ref_on_store(local.ref_store(), git_dir, &head_ref, &target)?;
     let Some(ref log) = opts.clone_reflog else {
         return Ok(());
     };
     let null = ObjectId::null(local.odb().hash_algo());
-    if local.refs_on_disk() {
-        return crate::refs::append_reflog_with_signature(
-            git_dir,
-            &head_ref,
-            &null,
-            &tip,
-            &log.identity,
-            &log.message,
-            true,
-        );
-    }
     log.identity
         .validate()
-        .map_err(crate::error::Error::InvalidSignature)?;
+        .map_err(|e| crate::error::Error::Object(ObjectError::InvalidSignature(e)))?;
     let identity = crate::refs::store::format_reflog_identity(
         &log.identity.reflog_name_email(),
         log.identity.time,
     );
-    let config = local.config()?;
+    let config = local.config().snapshot()?;
     crate::refs::append_reflog_on_store(
-        local.refs(),
+        local.ref_store(),
         &head_ref,
         &null,
         &tip,
@@ -2617,7 +2764,10 @@ pub(crate) fn tags_already_local(
 ) -> HashSet<String> {
     remote_refs
         .iter()
-        .filter(|(name, _)| name.starts_with("refs/tags/") && local_refs.resolve(name).is_ok())
+        .filter(|(name, _)| {
+            name.starts_with("refs/tags/")
+                && local_refs.resolve(RefNameRef::from_trusted(name)).is_ok()
+        })
         .map(|(name, _)| name.clone())
         .collect()
 }
@@ -2703,6 +2853,7 @@ pub(crate) fn reachable_commits(
 #[cfg(test)]
 mod fetch_advertised_ref_tests {
     use super::*;
+    use crate::environment::RepositoryOptions;
     use crate::objects::ObjectId;
     use std::io::Cursor;
 
@@ -2841,17 +2992,17 @@ mod fetch_advertised_ref_tests {
             None,
             &mut super::ShallowUpdate::default(),
             &mut crate::fetch::NoProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
             false,
         )
         .unwrap_err();
         assert!(
             matches!(
                 err,
-                Error::RemoteUnreadable {
+                Error::Remote(RemoteError::Unreadable {
                     reason: crate::error::RemoteUnreadableReason::ResponseTruncated,
                     ..
-                }
+                })
             ),
             "{err:?}"
         );
@@ -3459,10 +3610,55 @@ mod fetch_advertised_ref_tests {
 }
 
 #[cfg(test)]
+mod v0_negotiation_tests {
+    use super::*;
+
+    #[test]
+    fn server_caps_has_matches_whole_capability_names() {
+        let caps = "multi_ack_detailed no-done side-band-64k agent=git/2.43.0";
+        assert!(server_caps_has(caps, "no-done"));
+        assert!(server_caps_has(caps, "multi_ack_detailed"));
+        assert!(server_caps_has(caps, "agent"));
+        assert!(!server_caps_has(caps, "multi_ack"));
+        assert!(!server_caps_has(caps, "side-band"));
+        assert!(!server_caps_has("", "no-done"));
+    }
+
+    #[test]
+    fn final_ack_reads_past_common_acks_to_the_bare_ack() {
+        let oid = "777489f9e09c8d0dd6b12f9d90de6376330577a2";
+        let mut reply = Vec::new();
+        for line in [
+            format!("ACK {oid} common"),
+            format!("ACK {oid} ready"),
+            format!("ACK {oid}"),
+        ] {
+            pkt_line::write_line_to_vec(&mut reply, &line).unwrap();
+        }
+        reply.extend_from_slice(b"PACK");
+        let mut cursor = std::io::Cursor::new(reply);
+        read_final_ack(&mut cursor).unwrap();
+        let mut rest = Vec::new();
+        cursor.read_to_end(&mut rest).unwrap();
+        assert_eq!(rest, b"PACK");
+    }
+
+    #[test]
+    fn final_ack_accepts_nak_and_reports_eof_and_err() {
+        let mut nak = Vec::new();
+        pkt_line::write_line_to_vec(&mut nak, "NAK").unwrap();
+        read_final_ack(&mut std::io::Cursor::new(nak)).unwrap();
+        assert!(read_final_ack(&mut std::io::Cursor::new(Vec::new())).is_err());
+        let mut err = Vec::new();
+        pkt_line::write_line_to_vec(&mut err, "ERR upload-pack: not our ref").unwrap();
+        assert!(read_final_ack(&mut std::io::Cursor::new(err)).is_err());
+    }
+}
+
+#[cfg(test)]
 mod v2_negotiation_tests {
     use super::*;
     use crate::objects::ObjectKind;
-    use crate::progress::NeverCancel;
     use crate::repo::{InitOptions, Repository};
     use std::io::Cursor;
 
@@ -3550,7 +3746,7 @@ mod v2_negotiation_tests {
     fn replayed_acks_do_not_postpone_the_in_vain_cutoff() {
         const TIPS: usize = 2000;
         let tmp = tempfile::tempdir().unwrap();
-        let repo = Repository::init(tmp.path(), &InitOptions::default()).unwrap();
+        let (repo, _) = Repository::init(tmp.path(), &InitOptions::default()).unwrap();
         let git_dir = repo.git_dir().to_path_buf();
         let tree = repo.odb().write(ObjectKind::Tree, &[]).unwrap();
         // Unrelated root commits: each one is a have of its own, so the
@@ -3585,7 +3781,7 @@ mod v2_negotiation_tests {
             &V2DeepenArgs::default(),
             None,
             &mut NoProgress,
-            &NeverCancel,
+            &CancelToken::never(),
             V2FetchMode::Refs {
                 promisor_reply: None,
             },
@@ -3607,5 +3803,216 @@ mod v2_negotiation_tests {
         // common commit): 480 vain haves, so the cutoff fires with that round.
         assert_eq!(distinct.len(), 16 + 32 + 64 + 128 + 256);
         assert!(distinct.len() < TIPS, "cutoff never fired");
+    }
+
+    /// Records milestones and phase starts in arrival order.
+    #[derive(Default)]
+    struct MilestoneRecorder {
+        events: Vec<String>,
+    }
+
+    impl ProgressSink for MilestoneRecorder {
+        fn start_with_unit(
+            &mut self,
+            phase: crate::progress::ProgressPhase,
+            _unit: crate::progress::ProgressUnit,
+            _total: Option<u64>,
+        ) {
+            self.events.push(format!("start {phase:?}"));
+        }
+    }
+
+    impl Progress for MilestoneRecorder {
+        fn milestone(&mut self, milestone: FetchMilestone) {
+            self.events.push(format!("{milestone:?}"));
+        }
+    }
+
+    fn milestones_over_local_upload_pack(protocol_version: u8) -> Vec<String> {
+        let tmp = tempfile::tempdir().unwrap();
+        let (src, _) = Repository::init(&tmp.path().join("src"), &InitOptions::default()).unwrap();
+        let tree = src.odb().write(ObjectKind::Tree, &[]).unwrap();
+        let body = format!(
+            "tree {tree}\nauthor T <t@example.com> 1600000000 +0000\n\
+             committer T <t@example.com> 1600000000 +0000\n\nroot\n"
+        );
+        let commit = src
+            .odb()
+            .write(ObjectKind::Commit, body.as_bytes())
+            .unwrap();
+        crate::refs::write_ref(src.git_dir(), "refs/heads/main", &commit).unwrap();
+
+        let (dst, _) = Repository::init(&tmp.path().join("dst"), &InitOptions::default()).unwrap();
+        let mut conn = crate::transport::connect_local_upload_pack(
+            src.git_dir(),
+            crate::transport::Service::UploadPack,
+            &crate::transport::ConnectOptions {
+                protocol_version,
+                ..Default::default()
+            },
+            dst.environment(),
+            None,
+        )
+        .unwrap();
+        let mut opts = FetchOptions {
+            refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()],
+            ..FetchOptions::default()
+        };
+        let mut recorder = MilestoneRecorder::default();
+        dst.remotes()
+            .fetch_from(
+                crate::transfer::TransferEndpoint::Connection(&mut *conn),
+                &mut opts,
+                &mut recorder,
+                &CancelToken::never(),
+            )
+            .unwrap();
+        conn.finish().unwrap();
+        recorder.events
+    }
+
+    #[test]
+    fn wire_fetch_reports_milestones_in_order_before_the_pack() {
+        for protocol_version in [0, 2] {
+            let events = milestones_over_local_upload_pack(protocol_version);
+            let at = |name: &str| {
+                let hits: Vec<usize> = events
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, e)| e.as_str() == name)
+                    .map(|(i, _)| i)
+                    .collect();
+                assert_eq!(hits.len(), 1, "v{protocol_version}: {name} in {events:?}");
+                hits[0]
+            };
+            let connected = at("Connected");
+            let requested = at("PackRequested");
+            let receiving = at("start ReceivingObjects");
+            assert!(
+                connected < requested && requested < receiving,
+                "v{protocol_version}: {events:?}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod remote_fatal_fetch_tests {
+    use super::*;
+    use crate::objects::ObjectId;
+    use crate::refs::resolve_ref;
+    use crate::repo::{InitOptions, Repository};
+    use crate::transfer::{FetchOptions, TagMode};
+    use crate::transport::Connection;
+    use std::io::{Cursor, Read, Write};
+    use std::path::{Path, PathBuf};
+
+    struct ScriptedConn {
+        reader: Cursor<Vec<u8>>,
+        sink: Vec<u8>,
+        refs: Vec<(String, ObjectId)>,
+        caps: Vec<String>,
+    }
+
+    impl ScriptedConn {
+        fn new(server_script: Vec<u8>, tip: ObjectId) -> Self {
+            Self {
+                reader: Cursor::new(server_script),
+                sink: Vec::new(),
+                refs: vec![("refs/heads/main".to_owned(), tip)],
+                caps: ["side-band-64k", "multi_ack_detailed", "ofs-delta"]
+                    .map(str::to_owned)
+                    .to_vec(),
+            }
+        }
+    }
+
+    impl Connection for ScriptedConn {
+        fn reader(&mut self) -> &mut dyn Read {
+            &mut self.reader
+        }
+        fn writer(&mut self) -> &mut dyn Write {
+            &mut self.sink
+        }
+        fn advertised_refs(&self) -> &[(String, ObjectId)] {
+            &self.refs
+        }
+        fn capabilities(&self) -> &[String] {
+            &self.caps
+        }
+        fn head_symref(&self) -> Option<&str> {
+            None
+        }
+        fn protocol_version(&self) -> u8 {
+            0
+        }
+    }
+
+    fn empty_local(root: &Path) -> PathBuf {
+        let (repo, _) =
+            Repository::init(root, &InitOptions::new().with_initial_branch("main")).expect("init");
+        repo.git_dir().to_path_buf()
+    }
+
+    fn absent_oid() -> ObjectId {
+        ObjectId::from_hex(&"b".repeat(40)).expect("oid")
+    }
+
+    fn line(text: &str) -> Vec<u8> {
+        let mut buf = Vec::new();
+        pkt_line::write_line_to_vec(&mut buf, text).expect("pkt-line");
+        buf
+    }
+
+    fn remote_fatal_message(err: crate::error::Error) -> String {
+        match err {
+            crate::error::Error::Remote(crate::remote::RemoteError::Fatal { message }) => message,
+            other => panic!("expected RemoteError::Fatal, got {other:?}"),
+        }
+    }
+
+    fn fetch_err(server_script: Vec<u8>) -> (crate::error::Error, PathBuf, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let local_git = empty_local(&tmp.path().join("local"));
+        let mut conn = ScriptedConn::new(server_script, absent_oid());
+        let mut opts = FetchOptions::new();
+        opts.refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()];
+        opts.tags = TagMode::None;
+        let err = crate::repo::Repository::open(
+            &local_git,
+            &crate::environment::RepositoryOptions::with_environment(
+                (&mut opts).environment.clone(),
+            ),
+        )
+        .expect("open fetch target")
+        .remotes()
+        .fetch_from(
+            crate::transfer::TransferEndpoint::Connection(&mut conn),
+            &mut opts,
+            &mut NoProgress,
+            &CancelToken::never(),
+        )
+        .expect_err("the server aborted the fetch");
+        (err, local_git, tmp)
+    }
+
+    #[test]
+    fn fetch_err_after_done_is_remote_fatal() {
+        let (err, local_git, _tmp) = fetch_err(line("ERR upload-pack: not our ref bbbb"));
+        assert_eq!(remote_fatal_message(err), "upload-pack: not our ref bbbb");
+        assert!(resolve_ref(&local_git, "refs/remotes/origin/main").is_err());
+    }
+
+    #[test]
+    fn fetch_sideband_channel3_is_remote_fatal() {
+        let mut script = line("NAK");
+        pkt_line::write_packet_raw(&mut script, b"\x03fatal: the requested object is corrupt\n")
+            .expect("band 3");
+        let (err, local_git, _tmp) = fetch_err(script);
+        assert_eq!(
+            remote_fatal_message(err),
+            "fatal: the requested object is corrupt"
+        );
+        assert!(resolve_ref(&local_git, "refs/remotes/origin/main").is_err());
     }
 }

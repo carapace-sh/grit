@@ -16,6 +16,7 @@
 //! The target is the branch the served repository's `HEAD` names
 //! ([`target_branch`]).
 
+use crate::worktree::WorktreeError;
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
@@ -43,18 +44,9 @@ pub const SLICES_PATH: &str = ".grit/slices.toml";
 /// that moved under them before refusing with [`TargetRefusal::Moved`].
 const ATTEMPTS: usize = 16;
 
-/// The target branch of a served repository: the branch its `HEAD` names,
-/// without `refs/heads/`, or `main` when `HEAD` names no branch.
-///
-/// # Parameters
-///
-/// - `repo`: the served repository.
-///
-/// # Returns
-///
-/// The branch name; the branch itself may not exist yet.
+/// [`RepositorySnapshotCheckouts::target_branch`](crate::repo_handles::RepositorySnapshotCheckouts::target_branch) for `repo`.
 #[must_use]
-pub fn target_branch(repo: &Repository) -> String {
+pub(crate) fn target_branch(repo: &Repository) -> String {
     crate::refs::read_symbolic_ref(repo.git_dir(), "HEAD")
         .ok()
         .flatten()
@@ -313,41 +305,18 @@ fn keep_worktree(repo: &Repository, from: ObjectId, to: ObjectId) -> Result<Opti
         Some(&from),
         &to,
         &mut crate::progress::NullProgress,
-        &crate::progress::NeverCancel,
+        &crate::progress::CancelToken::never(),
     ) {
         Ok(()) => Ok(None),
-        Err(crate::error::Error::WouldOverwrite { paths, .. }) => Ok(Some(paths)),
-        Err(e) => Err(e.into()),
+        Err(crate::error::Error::Worktree(WorktreeError::WouldOverwrite { paths, .. })) => {
+            Ok(Some(paths))
+        }
+        Err(e) => Err(e),
     }
 }
 
-/// Merge branch `name` into the target branch `target_ref` with a merge
-/// commit by `who`, when the merge is clean.
-///
-/// The name must be a valid branch name other than the target's (in any
-/// case); `refs/heads/<name>` is read from the repository. A branch the
-/// target already has is left alone, and one that shares no history with
-/// the target is refused rather than merged against an empty tree. When the
-/// target moves while the merge is made, the merge is made again on its new
-/// tip. The move is logged as `integrate: <merge message>` where the
-/// repository keeps a reflog for the target, and a worktree that has the
-/// target checked out moves with it.
-///
-/// # Parameters
-///
-/// - `repo`: the served repository.
-/// - `target_ref`: the target branch's full ref (`refs/heads/<target>`).
-/// - `name`: the branch to merge, without `refs/heads/`.
-/// - `who`: author and committer of the merge commit.
-///
-/// # Returns
-///
-/// What happened, or `Ok(Err(..))` with why the target was left alone.
-///
-/// # Errors
-///
-/// Object, ref, index and worktree failures.
-pub fn integrate(
+/// [`RepositorySnapshotCheckouts::integrate`](crate::repo_handles::RepositorySnapshotCheckouts::integrate) for `repo`.
+pub(crate) fn integrate(
     repo: &Repository,
     target_ref: &str,
     name: &str,
@@ -474,7 +443,7 @@ struct SliceEntry {
 /// # Errors
 ///
 /// [`CheckoutError::Protocol`] for text that is not a valid slices file.
-pub fn parse_slices(text: &str) -> Result<Vec<Slice>> {
+pub(crate) fn parse_slices(text: &str) -> Result<Vec<Slice>> {
     let file: SlicesFile = toml::from_str(text).map_err(|e| CheckoutError::Protocol {
         url: SLICES_PATH.to_owned(),
         detail: e.to_string(),
@@ -492,7 +461,7 @@ pub fn parse_slices(text: &str) -> Result<Vec<Slice>> {
 
 /// Write the slices file's text.
 #[must_use]
-pub fn render_slices(slices: &[Slice]) -> String {
+pub(crate) fn render_slices(slices: &[Slice]) -> String {
     let file = SlicesFile {
         slices: slices
             .iter()
@@ -511,12 +480,8 @@ pub fn render_slices(slices: &[Slice]) -> String {
     format!("# Named sets of paths to check out together (`grit slice`).\n\n{body}")
 }
 
-/// The slices at `commit` (none when it has no slices file).
-///
-/// # Errors
-///
-/// Object read failures and a malformed slices file.
-pub fn read_slices(repo: &Repository, commit: ObjectId) -> Result<Vec<Slice>> {
+/// [`RepositorySnapshotCheckouts::read_slices`](crate::repo_handles::RepositorySnapshotCheckouts::read_slices) for `repo`.
+pub(crate) fn read_slices(repo: &Repository, commit: ObjectId) -> Result<Vec<Slice>> {
     let odb = repo.odb();
     let tree = odb.commit_tree(&commit)?;
     match lookup(odb, tree, SLICES_PATH.as_bytes())? {
@@ -528,7 +493,7 @@ pub fn read_slices(repo: &Repository, commit: ObjectId) -> Result<Vec<Slice>> {
 /// Whether `name` can name a slice: letters, digits, `-`, `_` and `.`, not
 /// starting with `.` or `-`.
 #[must_use]
-pub fn valid_slice_name(name: &str) -> bool {
+pub(crate) fn valid_slice_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64
         && !name.starts_with(['.', '-'])
@@ -542,7 +507,11 @@ pub fn valid_slice_name(name: &str) -> bool {
 /// # Errors
 ///
 /// Object read failures.
-pub fn missing_paths(repo: &Repository, commit: ObjectId, paths: &[String]) -> Result<Vec<String>> {
+pub(crate) fn missing_paths(
+    repo: &Repository,
+    commit: ObjectId,
+    paths: &[String],
+) -> Result<Vec<String>> {
     let odb = repo.odb();
     let tree = odb.commit_tree(&commit)?;
     let mut missing = Vec::new();
@@ -642,34 +611,8 @@ fn apply_slice_edit(
     }))
 }
 
-/// Change the slices file on the target branch `target_ref` with a commit by
-/// `who`, as `edit` says.
-///
-/// The edit is checked against the slices and the tree at the target's tip:
-/// a new slice's name must be free, a changed or removed one must exist, and
-/// every path of a slice must be in the tree. When the target moves while
-/// the commit is made, the edit is checked and applied again on its new tip.
-/// The move is logged as `slice: <message>` where the repository keeps a
-/// reflog for the target, and a worktree that has the target checked out
-/// moves with it.
-///
-/// # Parameters
-///
-/// - `repo`: the served repository.
-/// - `target_ref`: the target branch's full ref (`refs/heads/<target>`).
-/// - `edit`: the change; slice paths are taken as given (see
-///   [`super::normalize_paths`]).
-/// - `who`: author and committer of the commit.
-///
-/// # Returns
-///
-/// What happened, with the target unchanged when the file came out the
-/// same, or `Ok(Err(..))` with why the target was left alone.
-///
-/// # Errors
-///
-/// Object, ref, index and worktree failures, and a malformed slices file.
-pub fn edit_slices(
+/// [`RepositorySnapshotCheckouts::edit_slices`](crate::repo_handles::RepositorySnapshotCheckouts::edit_slices) for `repo`.
+pub(crate) fn edit_slices(
     repo: &Repository,
     target_ref: &str,
     edit: &SliceEdit,
@@ -763,11 +706,11 @@ fn edit_tree(
     tree: ObjectId,
     entry: Option<(u32, ObjectId)>,
 ) -> Result<ObjectId> {
-    Ok(edit(
+    edit(
         repo.odb(),
         Some(tree),
         &[(SLICES_PATH.as_bytes().to_vec(), entry)],
-    )?)
+    )
 }
 
 #[cfg(test)]
@@ -800,7 +743,7 @@ mod tests {
     impl Fixture {
         fn new(bare: bool) -> Self {
             let dir = tempfile::tempdir().expect("tempdir");
-            let repo = Repository::init(
+            let (repo, _) = Repository::init(
                 dir.path(),
                 &InitOptions {
                     bare,
@@ -906,7 +849,7 @@ mod tests {
     #[test]
     fn the_target_is_heads_branch_and_names_compare_without_case() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let repo = Repository::init(
+        let (repo, _) = Repository::init(
             dir.path(),
             &crate::repo::InitOptions {
                 initial_branch: Some("trunk".to_owned()),

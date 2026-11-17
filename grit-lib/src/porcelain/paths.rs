@@ -1,22 +1,29 @@
 //! Remove and rename paths in the working tree and index (`git rm` / `git mv` semantics).
 
+use crate::diff::{
+    diff_index_to_tree, diff_index_to_worktree_with_options, DiffIndexToWorktreeOptions, DiffStatus,
+};
+use crate::error::{Error, ErrorSummary, PathOutsideRepoError, Result};
+use crate::git_path::CanonicalizeExt;
+use crate::index::{index_file_mtime, Index, IndexEntry, MODE_GITLINK, MODE_TREE};
+use crate::objects::ObjectId;
+use crate::path_icase::{paths_equal, worktree_filesystem_case_insensitive};
+use crate::path_validate::{validate_path, EntryMode, PathValidationKind, ProtectOptions};
+use crate::pathspec::{
+    is_plain_literal_pathspec, literal_spec_for_lookup, matches_pathspec_list_with_context,
+    pathspec_is_exclude, PathspecMatchContext,
+};
+use crate::porcelain::checkout::remove_empty_parent_dirs_batch;
+use crate::porcelain::pathspec_match::{
+    index_stage0_path_modes, RepositoryPathspecFilter, REGULAR_FILE_MODE,
+};
+use crate::progress::{poll_cancel, CancelToken, NullProgress};
+use crate::repo::{Repository, RepositoryError};
+use crate::worktree::WorktreeError;
 use std::collections::{BTreeSet, HashSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
-
-use crate::diff::{
-    diff_index_to_tree, diff_index_to_worktree_with_options, DiffIndexToWorktreeOptions, DiffStatus,
-};
-use crate::error::{Error, Result};
-use crate::index::{index_file_mtime, Index, IndexEntry, MODE_GITLINK, MODE_TREE};
-use crate::objects::{parse_commit, ObjectId};
-use crate::path_icase::paths_equal;
-use crate::path_validate::{validate_path, EntryMode, PathValidationKind, ProtectOptions};
-use crate::pathspec::pathspec_is_exclude;
-use crate::porcelain::checkout::remove_empty_parent_dirs;
-use crate::repo::Repository;
-use crate::state::{resolve_head_for_repository, HeadState};
 
 /// Options for [`remove_paths`].
 #[derive(Debug, Clone, Default)]
@@ -42,7 +49,7 @@ impl RemoveOptions {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::RequiresWorkTree`] when the repository has no work tree.
+    /// Returns [`RepositoryError::RequiresWorkTree`] when the repository has no work tree.
     pub fn resolve_recursive(&mut self, repo: &Repository) -> Result<()> {
         if self.recursive {
             return Ok(());
@@ -113,7 +120,7 @@ impl std::fmt::Display for RemoveBlockReason {
     }
 }
 
-/// A path [`remove_paths`] refused to remove, carried by [`Error::RemoveBlocked`].
+/// A path [`remove_paths`] refused to remove, carried by [`crate::worktree::WorktreeError::RemoveBlocked`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockedRemoval {
     /// Repository-relative path that was not removed.
@@ -173,27 +180,30 @@ pub struct MoveOutcome {
 ///
 /// Directory prefixes require `recursive`. Empty parent directories are removed after
 /// deleting files. Cache-tree entries for touched paths are invalidated before the index
-/// is written atomically after the index lock is acquired ([`IndexHandle::begin_update`](crate::index::IndexHandle::begin_update)).
+/// is written atomically after the index lock is acquired ([`IndexFile::begin_update`](crate::index::IndexFile::begin_update)).
 ///
 /// # Errors
 ///
-/// Returns [`Error::PathspecNoMatch`], [`Error::RemoveBlocked`],
-/// [`Error::NotRemovingRecursively`], or I/O / object-store failures.
-pub fn remove_paths(repo: &Repository, opts: &RemoveOptions) -> Result<RemoveOutcome> {
-    let work_tree = repo.work_tree().ok_or(Error::RequiresWorkTree)?;
+/// Returns [`crate::worktree::WorktreeError::PathspecNoMatch`], [`crate::worktree::WorktreeError::RemoveBlocked`],
+/// [`crate::worktree::WorktreeError::NotRemovingRecursively`], or I/O / object-store failures.
+pub(crate) fn remove_paths(
+    repo: &Repository,
+    opts: &RemoveOptions,
+    cancel: &CancelToken,
+) -> Result<RemoveOutcome> {
+    let work_tree = repo.work_tree().ok_or(RepositoryError::RequiresWorkTree)?;
 
     if opts.pathspecs.is_empty() {
-        return Err(Error::RemovePathsRequired);
+        return Err(Error::Worktree(WorktreeError::RemovePathsRequired));
     }
 
     let mut opts = opts.clone();
     opts.resolve_recursive(repo)?;
 
     let mut index = repo.load_index()?;
-    let head_tree = resolve_head_tree(repo)?;
-    let tracked_paths = tracked_index_paths(&index);
+    let head_tree = repo.head_tree()?;
 
-    let to_remove = collect_removal_paths(repo, &tracked_paths, work_tree, &opts)?;
+    let to_remove = collect_removal_paths(repo, &index, work_tree, &opts)?;
 
     if !opts.force {
         let blocked = blocked_removals(
@@ -205,7 +215,9 @@ pub fn remove_paths(repo: &Repository, opts: &RemoveOptions) -> Result<RemoveOut
             opts.cached,
         )?;
         if !blocked.is_empty() {
-            return Err(Error::RemoveBlocked { paths: blocked });
+            return Err(Error::Worktree(WorktreeError::RemoveBlocked {
+                paths: blocked,
+            }));
         }
     }
 
@@ -214,24 +226,50 @@ pub fn remove_paths(repo: &Repository, opts: &RemoveOptions) -> Result<RemoveOut
     }
 
     let mut lock = repo.begin_index_update()?;
+    poll_cancel(&mut NullProgress, cancel)?;
     index = repo.load_index()?;
     let path_bytes: Vec<&[u8]> = to_remove.iter().map(|p| p.as_bytes()).collect();
-    index.remove_paths(path_bytes);
-    repo.commit_index_update(&mut lock, &mut index, !opts.cached)?;
 
+    let mut worktree_backups: Vec<WorktreePathBackup> = Vec::new();
     if !opts.cached {
-        let mut removed_worktree: Vec<PathBuf> = Vec::new();
         for path in &to_remove {
-            let abs = work_tree.join(path);
-            if abs.is_file() || abs.is_symlink() {
-                fs::remove_file(&abs)
-                    .map_err(|e| Error::PathError(format!("removing '{}': {e}", path)))?;
-                removed_worktree.push(abs);
+            poll_remove_cancel(work_tree, &worktree_backups, cancel)?;
+            match snapshot_worktree_path(work_tree, path) {
+                Ok(Some(backup)) => {
+                    if let Err(err) = remove_backed_up_worktree_path(work_tree, &backup) {
+                        return Err(abort_failed_remove_worktree(
+                            work_tree,
+                            &worktree_backups,
+                            err,
+                        ));
+                    }
+                    worktree_backups.push(backup);
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    return Err(abort_failed_remove_worktree(
+                        work_tree,
+                        &worktree_backups,
+                        err,
+                    ));
+                }
             }
         }
-        for abs in removed_worktree {
-            remove_empty_parent_dirs(work_tree, &abs);
-        }
+        let removed_abs: Vec<PathBuf> = worktree_backups
+            .iter()
+            .map(|backup| work_tree.join(backup.rel()))
+            .collect();
+        remove_empty_parent_dirs_batch(work_tree, &removed_abs);
+    }
+
+    index.remove_paths(path_bytes);
+    poll_remove_cancel(work_tree, &worktree_backups, cancel)?;
+    if let Err(err) = repo.commit_index_update(&mut lock, &mut index, !opts.cached) {
+        return Err(abort_failed_remove_worktree(
+            work_tree,
+            &worktree_backups,
+            err,
+        ));
     }
 
     Ok(RemoveOutcome { removed: to_remove })
@@ -244,7 +282,13 @@ pub fn remove_paths(repo: &Repository, opts: &RemoveOptions) -> Result<RemoveOut
 /// # Errors
 ///
 /// Same as [`move_paths`].
-pub fn move_path(repo: &Repository, src: &str, dst: &str, force: bool) -> Result<MoveOutcome> {
+pub(crate) fn move_path(
+    repo: &Repository,
+    src: &str,
+    dst: &str,
+    force: bool,
+    cancel: &CancelToken,
+) -> Result<MoveOutcome> {
     move_paths(
         repo,
         &MoveOptions {
@@ -253,34 +297,43 @@ pub fn move_path(repo: &Repository, src: &str, dst: &str, force: bool) -> Result
             force,
             dry_run: false,
         },
+        cancel,
     )
 }
 
 /// Move one or more tracked sources into `opts.destination`, updating the index once.
 ///
 /// When multiple sources are given, `destination` must name an existing directory; each
-/// source is moved under that directory using its final path component. With `dry_run`,
-/// every validation runs but the index and work tree are left unchanged.
+/// source is moved under that directory using its final path component. On
+/// case-insensitive volumes with `core.ignorecase=true`, renaming a tracked directory
+/// to a case-only spelling (for example `Dir` to `dir`) renames every indexed path
+/// under that tree and updates the worktree dentry spelling. With `dry_run`, every
+/// validation runs but the index and work tree are left unchanged.
 ///
 /// # Errors
 ///
-/// Returns [`Error::InvalidPath`], [`Error::MoveSourceNotTracked`], [`Error::MoveDestinationExists`],
+/// Returns [`crate::worktree::WorktreeError::InvalidPath`], [`crate::worktree::WorktreeError::MoveSourceNotTracked`], [`crate::worktree::WorktreeError::MoveDestinationExists`],
 /// and related move errors, or I/O failures.
-pub fn move_paths(repo: &Repository, opts: &MoveOptions) -> Result<MoveOutcome> {
-    let work_tree = repo.work_tree().ok_or(Error::RequiresWorkTree)?;
+pub(crate) fn move_paths(
+    repo: &Repository,
+    opts: &MoveOptions,
+    cancel: &CancelToken,
+) -> Result<MoveOutcome> {
+    let work_tree = repo.work_tree().ok_or(RepositoryError::RequiresWorkTree)?;
     if opts.sources.is_empty() {
-        return Err(Error::MoveNothingToMove {
+        return Err(Error::Worktree(WorktreeError::MoveNothingToMove {
             src: opts.destination.clone(),
-        });
+        }));
     }
 
     let ignorecase = repo
         .config()
+        .snapshot()
         .ok()
-        .and_then(|cfg| cfg.get_bool("core.ignorecase").and_then(|r| r.ok()))
-        .unwrap_or(false);
+        .is_some_and(|cfg| cfg.ignore_case());
 
     let mut index = repo.load_index()?;
+    let dst_had_trailing_slash = destination_had_trailing_separator(&opts.destination);
     let dst = normalize_and_validate_repo_relative(repo, work_tree, &opts.destination)?;
 
     let mut planned: Vec<SingleMovePlan> = Vec::new();
@@ -294,6 +347,7 @@ pub fn move_paths(repo: &Repository, opts: &MoveOptions) -> Result<MoveOutcome> 
             index: &simulated,
             src: &src,
             dst: &dst,
+            dst_had_trailing_slash,
             multi_source: opts.sources.len() > 1,
             force: opts.force,
             ignorecase,
@@ -319,6 +373,7 @@ pub fn move_paths(repo: &Repository, opts: &MoveOptions) -> Result<MoveOutcome> 
     }
 
     let mut lock = repo.begin_index_update()?;
+    poll_cancel(&mut NullProgress, cancel)?;
     index = repo.load_index()?;
 
     let mut force_clear_worktree: Vec<String> = Vec::new();
@@ -342,6 +397,15 @@ pub fn move_paths(repo: &Repository, opts: &MoveOptions) -> Result<MoveOutcome> 
 
     let mut completed_worktree_renames: Vec<(String, String)> = Vec::new();
     for plan in &planned {
+        if cancel.poll().is_err() {
+            return Err(abort_failed_move_worktree(
+                work_tree,
+                &completed_worktree_renames,
+                &cleared_backup,
+                ignorecase,
+                Error::Cancelled,
+            ));
+        }
         if opts.force {
             clear_destination_index(&mut index, &plan.final_dst);
         }
@@ -377,19 +441,84 @@ pub fn move_paths(repo: &Repository, opts: &MoveOptions) -> Result<MoveOutcome> 
         ));
     }
 
+    if let Err(err) = poll_cancel(&mut NullProgress, cancel) {
+        return Err(abort_failed_move_worktree(
+            work_tree,
+            &completed_worktree_renames,
+            &cleared_backup,
+            ignorecase,
+            err,
+        ));
+    }
+
     repo.flush_index_update(&mut lock, &mut index)?;
+    if let Err(err) = poll_cancel(&mut NullProgress, cancel) {
+        return Err(abort_failed_move_worktree(
+            work_tree,
+            &completed_worktree_renames,
+            &cleared_backup,
+            ignorecase,
+            err,
+        ));
+    }
     repo.finish_index_update(&mut lock, true)?;
 
     Ok(MoveOutcome { moves })
+}
+
+fn poll_remove_cancel(
+    work_tree: &Path,
+    backups: &[WorktreePathBackup],
+    cancel: &CancelToken,
+) -> Result<()> {
+    if let Err(err) = poll_cancel(&mut NullProgress, cancel) {
+        return Err(abort_failed_remove_worktree(work_tree, backups, err));
+    }
+    Ok(())
+}
+
+/// Put work-tree files back after a failed [`remove_paths`] once some paths were deleted.
+fn abort_failed_remove_worktree(
+    work_tree: &Path,
+    backups: &[WorktreePathBackup],
+    original: Error,
+) -> Error {
+    if backups.is_empty() {
+        return original;
+    }
+    let unrestored = restore_worktree_backups_best_effort(work_tree, backups);
+    if unrestored.is_empty() {
+        original
+    } else {
+        Error::Worktree(WorktreeError::CheckoutRollbackIncomplete {
+            source: ErrorSummary::from(original),
+            unrestored,
+        })
+    }
+}
+
+fn restore_worktree_backups_best_effort(
+    work_tree: &Path,
+    backups: &[WorktreePathBackup],
+) -> Vec<String> {
+    let mut unrestored = Vec::new();
+    for backup in backups {
+        if restore_worktree_backups(work_tree, std::slice::from_ref(backup)).is_err() {
+            unrestored.push(backup.rel().to_string());
+        }
+    }
+    unrestored.sort_unstable();
+    unrestored.dedup();
+    unrestored
 }
 
 fn validate_unique_move_destinations(moves: &[PathMove]) -> Result<()> {
     let mut seen = HashSet::new();
     for mv in moves {
         if !seen.insert(mv.to.clone()) {
-            return Err(Error::MoveDuplicateDestination {
+            return Err(Error::Worktree(WorktreeError::MoveDuplicateDestination {
                 destination: mv.to.clone(),
-            });
+            }));
         }
     }
     Ok(())
@@ -427,17 +556,22 @@ fn reverse_worktree_rename(work_tree: &Path, from: &str, to: &str, ignorecase: b
     let from_abs = work_tree.join(from);
     let to_abs = work_tree.join(to);
     if !to_abs.exists() {
-        return Err(Error::PathError(format!(
-            "rollback skipped missing destination '{to}'"
-        )));
+        return Err(Error::Worktree(WorktreeError::Path {
+            detail: format!("rollback skipped missing destination '{to}'"),
+        }));
     }
     if let Some(parent) = from_abs.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| Error::PathError(format!("creating parent for rollback '{from}': {e}")))?;
+        fs::create_dir_all(parent).map_err(|e| {
+            Error::Worktree(WorktreeError::Path {
+                detail: format!("creating parent for rollback '{from}': {e}"),
+            })
+        })?;
     }
-    rename_worktree_entry(&to_abs, &from_abs, ignorecase)
-        .map_err(|e| Error::PathError(format!("rolling back rename '{to}' -> '{from}': {e}")))?;
-    remove_empty_parent_dirs(work_tree, &to_abs);
+    rename_worktree_entry(&to_abs, &from_abs, ignorecase).map_err(|e| {
+        Error::Worktree(WorktreeError::Path {
+            detail: format!("rolling back rename '{to}' -> '{from}': {e}"),
+        })
+    })?;
     Ok(())
 }
 
@@ -478,19 +612,12 @@ fn abort_failed_move_worktree(
         return original;
     }
 
-    let mut parts = vec![original.to_string()];
-    if !rollback.failures.is_empty() {
-        parts.push(format!(
-            "incomplete worktree rollback ({} rename(s) could not be reversed)",
-            rollback.failures.len()
-        ));
+    WorktreeError::MoveRollbackIncomplete {
+        source: ErrorSummary::from(original),
+        unreversed: rollback.failures.len(),
+        backup_restore: restore_err.map(ErrorSummary::from),
     }
-    if let Some(err) = restore_err {
-        parts.push(format!(
-            "restoring forced-destination backups failed: {err}"
-        ));
-    }
-    Error::Message(parts.join("; "))
+    .into()
 }
 
 struct SingleMovePlan {
@@ -505,6 +632,7 @@ struct PlanSingleMoveParams<'a> {
     index: &'a Index,
     src: &'a str,
     dst: &'a str,
+    dst_had_trailing_slash: bool,
     multi_source: bool,
     force: bool,
     ignorecase: bool,
@@ -517,53 +645,63 @@ fn plan_single_move(params: PlanSingleMoveParams<'_>) -> Result<SingleMovePlan> 
         index,
         src,
         dst,
+        dst_had_trailing_slash,
         multi_source,
         force,
         ignorecase,
     } = params;
     let src_entries = index_paths_under(index, src, true);
     if src_entries.is_empty() {
-        return Err(Error::MoveSourceNotTracked {
+        return Err(Error::Worktree(WorktreeError::MoveSourceNotTracked {
             src: src.to_owned(),
-        });
+        }));
     }
 
-    let (final_dst, dst_is_dir_target) = resolve_move_destination(work_tree, index, src, dst)?;
+    let (final_dst, dst_is_dir_target) = resolve_move_destination(
+        work_tree,
+        index,
+        src,
+        dst,
+        dst_had_trailing_slash,
+        !multi_source,
+        ignorecase,
+    )?;
     let final_dst = normalize_and_validate_repo_relative(repo, work_tree, &final_dst)?;
 
     if multi_source && !dst_is_dir_target {
         let dest_exists =
             work_tree.join(&final_dst).exists() || index.get(final_dst.as_bytes(), 0).is_some();
         if dest_exists {
-            return Err(Error::MoveDestinationExists {
+            return Err(Error::Worktree(WorktreeError::MoveDestinationExists {
                 src: src.to_owned(),
                 destination: final_dst,
-            });
+            }));
         }
-        return Err(Error::Message(format!(
-            "destination '{final_dst}' is not a directory"
-        )));
+        return Err(WorktreeError::MoveDestinationNotDirectory {
+            destination: final_dst,
+        }
+        .into());
     }
 
-    if is_subdirectory(&final_dst, src) {
-        return Err(Error::MoveIntoSubdirectory {
+    if is_subdirectory(&final_dst, src, ignorecase) {
+        return Err(Error::Worktree(WorktreeError::MoveIntoSubdirectory {
             src: src.to_owned(),
             destination: final_dst,
-        });
+        }));
     }
 
     if final_dst == *src {
-        return Err(Error::MoveIntoSelf {
+        return Err(Error::Worktree(WorktreeError::MoveIntoSelf {
             src: src.to_owned(),
             destination: final_dst,
-        });
+        }));
     }
 
     let renames = plan_index_renames(index, src, &final_dst)?;
     if renames.is_empty() {
-        return Err(Error::MoveNothingToMove {
+        return Err(Error::Worktree(WorktreeError::MoveNothingToMove {
             src: src.to_owned(),
-        });
+        }));
     }
 
     ensure_worktree_move_sources_exist(work_tree, &renames)?;
@@ -578,10 +716,10 @@ fn plan_single_move(params: PlanSingleMoveParams<'_>) -> Result<SingleMovePlan> 
             &renames,
         )
     {
-        return Err(Error::MoveDestinationExists {
+        return Err(Error::Worktree(WorktreeError::MoveDestinationExists {
             src: src.to_owned(),
             destination: final_dst,
-        });
+        }));
     }
 
     Ok(SingleMovePlan {
@@ -601,9 +739,9 @@ fn apply_renames_to_index(index: &mut Index, renames: &[(String, String)]) -> Re
         .collect();
     let mut new_entries = Vec::with_capacity(renames.len());
     for (from, to) in renames {
-        let old = index
-            .get(from.as_bytes(), 0)
-            .ok_or_else(|| Error::MoveMissingIndexEntry { path: from.clone() })?;
+        let old = index.get(from.as_bytes(), 0).ok_or_else(|| {
+            Error::Worktree(WorktreeError::MoveMissingIndexEntry { path: from.clone() })
+        })?;
         new_entries.push(entry_with_relpath(old.clone(), to));
     }
     let old_refs: Vec<&[u8]> = old_paths.iter().map(|p| p.as_slice()).collect();
@@ -612,7 +750,7 @@ fn apply_renames_to_index(index: &mut Index, renames: &[(String, String)]) -> Re
 }
 
 fn infer_remove_recursive(repo: &Repository, sources: &[String], specs: &[String]) -> Result<bool> {
-    let work_tree = repo.work_tree().ok_or(Error::RequiresWorkTree)?;
+    let work_tree = repo.work_tree().ok_or(RepositoryError::RequiresWorkTree)?;
     let source_labels = if sources.is_empty() { specs } else { sources };
     for (sel, spec) in source_labels.iter().zip(specs.iter()) {
         if sel.ends_with('/') || sel.ends_with('\\') {
@@ -625,34 +763,14 @@ fn infer_remove_recursive(repo: &Repository, sources: &[String], specs: &[String
     Ok(false)
 }
 
-fn resolve_head_tree(repo: &Repository) -> Result<Option<ObjectId>> {
-    match resolve_head_for_repository(repo)? {
-        HeadState::Branch { oid: Some(oid), .. } | HeadState::Detached { oid } => {
-            let obj = repo.odb().read(&oid)?;
-            let commit = parse_commit(&obj.data)?;
-            Ok(Some(commit.tree))
-        }
-        HeadState::Branch { .. } => Ok(None),
-        HeadState::Invalid => Err(Error::Message("HEAD is in an unknown state".into())),
-    }
-}
-
-/// Stage-0 paths plus any path that appears in the index at any merge stage.
-fn tracked_index_paths(index: &Index) -> BTreeSet<String> {
-    index
-        .entries
-        .iter()
-        .map(|e| String::from_utf8_lossy(&e.path).into_owned())
-        .collect()
-}
-
 fn collect_removal_paths(
     repo: &Repository,
-    tracked: &BTreeSet<String>,
+    index: &Index,
     _work_tree: &Path,
     opts: &RemoveOptions,
 ) -> Result<Vec<String>> {
     let pathspec_ctx = repo.pathspec_match_context();
+    let path_modes = index_stage0_path_modes(index);
     let sources = if opts.pathspec_sources.is_empty() {
         &opts.pathspecs
     } else {
@@ -664,59 +782,27 @@ fn collect_removal_paths(
         if pathspec_is_exclude(label) {
             continue;
         }
-        let spec = resolved.trim_end_matches('/');
-        let matches: Vec<String> = tracked
-            .iter()
-            .filter(|path| {
-                crate::pathspec::matches_pathspec_list_with_context(
-                    path,
-                    std::slice::from_ref(resolved),
-                    pathspec_ctx,
-                )
-            })
-            .cloned()
-            .collect();
-
-        if matches.is_empty() {
-            let prefix = format!("{spec}/");
-            let under: Vec<String> = tracked
-                .iter()
-                .filter(|path| path.starts_with(&prefix))
-                .cloned()
-                .collect();
-            if under.is_empty() {
-                if opts.ignore_unmatch {
-                    continue;
-                }
-                return Err(Error::PathspecNoMatch {
-                    spec: label.clone(),
-                });
+        let matched = if is_plain_literal_pathspec(resolved, pathspec_ctx) && index.entries_sorted {
+            collect_plain_literal_removal(index, resolved, pathspec_ctx, opts, &mut selected)?
+        } else {
+            let filter = RepositoryPathspecFilter::try_new(repo, std::slice::from_ref(resolved))?;
+            collect_pathspec_matched_removal(
+                index,
+                &filter,
+                pathspec_ctx,
+                resolved,
+                &path_modes,
+                opts,
+                &mut selected,
+            )?
+        };
+        if !matched {
+            if opts.ignore_unmatch {
+                continue;
             }
-            if !opts.recursive {
-                return Err(Error::NotRemovingRecursively(resolved.clone()));
-            }
-            selected.extend(under);
-            continue;
-        }
-
-        if !opts.recursive && has_child_paths(spec, tracked) {
-            let prefix = format!("{spec}/");
-            if matches.iter().any(|path| path.starts_with(&prefix)) {
-                return Err(Error::NotRemovingRecursively(resolved.clone()));
-            }
-        }
-
-        for path in matches {
-            if has_child_paths(&path, tracked) && !opts.recursive {
-                return Err(Error::NotRemovingRecursively(path.clone()));
-            }
-            selected.insert(path.clone());
-            if opts.recursive {
-                let prefix = format!("{path}/");
-                for child in tracked.iter().filter(|p| p.starts_with(&prefix)) {
-                    selected.insert((*child).clone());
-                }
-            }
+            return Err(Error::Worktree(WorktreeError::PathspecNoMatch {
+                spec: label.clone(),
+            }));
         }
     }
 
@@ -725,11 +811,207 @@ fn collect_removal_paths(
     Ok(out)
 }
 
-fn has_child_paths(prefix: &str, tracked: &BTreeSet<String>) -> bool {
-    let plen = prefix.len();
-    tracked
-        .iter()
-        .any(|p| p.len() > plen && p.starts_with(prefix) && p.as_bytes()[plen] == b'/')
+/// Collect removals for one plain literal pathspec using sorted-index range queries.
+fn collect_plain_literal_removal(
+    index: &Index,
+    resolved: &str,
+    ctx: PathspecMatchContext,
+    opts: &RemoveOptions,
+    selected: &mut BTreeSet<String>,
+) -> Result<bool> {
+    let spec = resolved.trim_end_matches('/');
+    let spec_lookup = literal_spec_for_lookup(spec, ctx);
+    let spec_bytes = spec_lookup.as_ref().as_bytes();
+    let mut matches: Vec<String> = Vec::new();
+
+    if index.sorted_contains_path(spec_bytes).unwrap_or(false) {
+        if let Some(stored) = sorted_index_exact_stored_path(index, spec_bytes) {
+            matches.push(stored);
+        }
+    }
+
+    let under = index.sorted_entries_under(spec_bytes).unwrap_or(&[]);
+
+    if matches.is_empty() && under.is_empty() && ctx.precompose_paths {
+        push_precompose_literal_alternate_matches(index, resolved, ctx, &mut matches);
+    }
+
+    if matches.is_empty() && under.is_empty() {
+        return Ok(false);
+    }
+
+    if matches.is_empty() {
+        if !opts.recursive {
+            return Err(Error::Worktree(WorktreeError::NotRemovingRecursively {
+                path: resolved.to_string(),
+            }));
+        }
+        for entry in under {
+            selected.insert(String::from_utf8_lossy(&entry.path).into_owned());
+        }
+        return Ok(true);
+    }
+
+    if !opts.recursive && index.has_stage0_descendant_under(spec_lookup.as_ref()) {
+        let prefix = format!("{}/", spec_lookup.as_ref());
+        if matches.iter().any(|path| path.starts_with(&prefix)) {
+            return Err(Error::Worktree(WorktreeError::NotRemovingRecursively {
+                path: resolved.to_string(),
+            }));
+        }
+    }
+
+    for path in matches {
+        insert_match_and_descendants(index, &path, opts, selected)?;
+    }
+    Ok(true)
+}
+
+fn sorted_index_exact_stored_path(index: &Index, path_bytes: &[u8]) -> Option<String> {
+    if !index.entries_sorted {
+        return None;
+    }
+    let at = index
+        .entries
+        .partition_point(|e| e.path.as_slice() < path_bytes);
+    index.entries.get(at).and_then(|e| {
+        (e.path.as_slice() == path_bytes).then(|| String::from_utf8_lossy(&e.path).into_owned())
+    })
+}
+
+/// Paths stored in a non-NFC spelling that still match a plain literal under precompose rules.
+fn push_precompose_literal_alternate_matches(
+    index: &Index,
+    resolved: &str,
+    ctx: PathspecMatchContext,
+    matches: &mut Vec<String>,
+) {
+    let spec_list = [resolved.to_string()];
+    let mut last_path: Option<Vec<u8>> = None;
+    for entry in &index.entries {
+        if last_path.as_deref() == Some(entry.path.as_slice()) {
+            continue;
+        }
+        last_path = Some(entry.path.clone());
+        let path = String::from_utf8_lossy(&entry.path);
+        if path.is_ascii() {
+            continue;
+        }
+        if matches_pathspec_list_with_context(path.as_ref(), &spec_list, ctx) {
+            matches.push(path.into_owned());
+        }
+    }
+}
+
+/// Collect removals for one pathspec by scanning the index once with a prepared filter.
+fn collect_pathspec_matched_removal(
+    index: &Index,
+    filter: &RepositoryPathspecFilter<'_>,
+    pathspec_ctx: PathspecMatchContext,
+    resolved: &str,
+    path_modes: &std::collections::HashMap<String, u32>,
+    opts: &RemoveOptions,
+    selected: &mut BTreeSet<String>,
+) -> Result<bool> {
+    let spec = resolved.trim_end_matches('/');
+    let mut matches: Vec<String> = Vec::new();
+    let mut last_path: Option<Vec<u8>> = None;
+    for entry in &index.entries {
+        if last_path.as_deref() == Some(entry.path.as_slice()) {
+            continue;
+        }
+        last_path = Some(entry.path.clone());
+        let path = String::from_utf8_lossy(&entry.path);
+        let mode = path_modes
+            .get(path.as_ref())
+            .copied()
+            .unwrap_or(REGULAR_FILE_MODE);
+        if filter.matches_entry(path.as_ref(), mode) {
+            matches.push(path.into_owned());
+        }
+    }
+
+    if matches.is_empty() {
+        let prefix = format!("{spec}/");
+        if index.entries_sorted {
+            let spec_lookup = literal_spec_for_lookup(spec, pathspec_ctx);
+            if let Some(under) = index.sorted_entries_under(spec_lookup.as_ref().as_bytes()) {
+                if under.is_empty() {
+                    return Ok(false);
+                }
+                if !opts.recursive {
+                    return Err(Error::Worktree(WorktreeError::NotRemovingRecursively {
+                        path: resolved.to_string(),
+                    }));
+                }
+                for entry in under {
+                    selected.insert(String::from_utf8_lossy(&entry.path).into_owned());
+                }
+                return Ok(true);
+            }
+        }
+        let mut under_prefix = false;
+        for entry in &index.entries {
+            let path = String::from_utf8_lossy(&entry.path);
+            if path.starts_with(&prefix) {
+                under_prefix = true;
+                if !opts.recursive {
+                    return Err(Error::Worktree(WorktreeError::NotRemovingRecursively {
+                        path: resolved.to_string(),
+                    }));
+                }
+                selected.insert(path.into_owned());
+            }
+        }
+        return Ok(under_prefix);
+    }
+
+    if !opts.recursive && index.has_stage0_descendant_under(spec) {
+        let prefix = format!("{spec}/");
+        if matches.iter().any(|path| path.starts_with(&prefix)) {
+            return Err(Error::Worktree(WorktreeError::NotRemovingRecursively {
+                path: resolved.to_string(),
+            }));
+        }
+    }
+
+    for path in matches {
+        insert_match_and_descendants(index, &path, opts, selected)?;
+    }
+    Ok(true)
+}
+
+fn insert_match_and_descendants(
+    index: &Index,
+    path: &str,
+    opts: &RemoveOptions,
+    selected: &mut BTreeSet<String>,
+) -> Result<()> {
+    if !opts.recursive && index.has_stage0_descendant_under(path) {
+        return Err(Error::Worktree(WorktreeError::NotRemovingRecursively {
+            path: path.to_string(),
+        }));
+    }
+    selected.insert(path.to_string());
+    if !opts.recursive {
+        return Ok(());
+    }
+    if index.entries_sorted {
+        if let Some(run) = index.sorted_entries_under(path.as_bytes()) {
+            for entry in run {
+                selected.insert(String::from_utf8_lossy(&entry.path).into_owned());
+            }
+        }
+        return Ok(());
+    }
+    let prefix = format!("{path}/");
+    for entry in &index.entries {
+        let p = String::from_utf8_lossy(&entry.path);
+        if p.starts_with(&prefix) {
+            selected.insert(p.into_owned());
+        }
+    }
+    Ok(())
 }
 
 /// Classify every path in `to_remove` and return the ones removal must refuse.
@@ -800,7 +1082,7 @@ fn paths_differing_from_worktree(
         index_mtime,
         repository_git_dir: Some(repo.git_dir().to_path_buf()),
         refresh_index_stat_in_pass: true,
-        config: repo.config().ok(),
+        config: repo.config().snapshot().ok(),
         worktree_rules: Some(Arc::clone(&rules_arc)),
         command_runner: Some(repo.command_runner()),
         restrict_to_paths: Some(Arc::new(paths)),
@@ -840,21 +1122,31 @@ impl WorktreePathBackup {
 fn snapshot_worktree_path(work_tree: &Path, path: &str) -> Result<Option<WorktreePathBackup>> {
     let abs = work_tree.join(path);
     if abs.is_symlink() {
-        let target = fs::read_link(&abs)
-            .map_err(|e| Error::PathError(format!("reading symlink '{path}': {e}")))?;
+        let target = fs::read_link(&abs).map_err(|e| {
+            Error::Worktree(WorktreeError::Path {
+                detail: format!("reading symlink '{path}': {e}"),
+            })
+        })?;
         return Ok(Some(WorktreePathBackup::Symlink {
             rel: path.to_string(),
             target,
         }));
     }
     if abs.is_file() {
-        let bytes =
-            fs::read(&abs).map_err(|e| Error::PathError(format!("reading '{path}': {e}")))?;
+        let bytes = fs::read(&abs).map_err(|e| {
+            Error::Worktree(WorktreeError::Path {
+                detail: format!("reading '{path}': {e}"),
+            })
+        })?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let mode = fs::metadata(&abs)
-                .map_err(|e| Error::PathError(format!("reading metadata for '{path}': {e}")))?
+                .map_err(|e| {
+                    Error::Worktree(WorktreeError::Path {
+                        detail: format!("reading metadata for '{path}': {e}"),
+                    })
+                })?
                 .permissions()
                 .mode()
                 & 0o7777;
@@ -878,8 +1170,11 @@ fn snapshot_worktree_path(work_tree: &Path, path: &str) -> Result<Option<Worktre
 fn remove_backed_up_worktree_path(work_tree: &Path, backup: &WorktreePathBackup) -> Result<()> {
     let path = backup.rel();
     let abs = work_tree.join(path);
-    fs::remove_file(&abs).map_err(|e| Error::PathError(format!("removing '{path}': {e}")))?;
-    remove_empty_parent_dirs(work_tree, &abs);
+    fs::remove_file(&abs).map_err(|e| {
+        Error::Worktree(WorktreeError::Path {
+            detail: format!("removing '{path}': {e}"),
+        })
+    })?;
     Ok(())
 }
 
@@ -919,22 +1214,31 @@ fn restore_worktree_backups(work_tree: &Path, backups: &[WorktreePathBackup]) ->
                 let abs = work_tree.join(rel);
                 if let Some(parent) = abs.parent() {
                     fs::create_dir_all(parent).map_err(|e| {
-                        Error::PathError(format!("creating parent for '{rel}': {e}"))
+                        Error::Worktree(WorktreeError::Path {
+                            detail: format!("creating parent for '{rel}': {e}"),
+                        })
                     })?;
                 }
-                fs::write(&abs, bytes)
-                    .map_err(|e| Error::PathError(format!("restoring '{rel}': {e}")))?;
+                fs::write(&abs, bytes).map_err(|e| {
+                    Error::Worktree(WorktreeError::Path {
+                        detail: format!("restoring '{rel}': {e}"),
+                    })
+                })?;
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
                     let mut perms = fs::metadata(&abs)
                         .map_err(|e| {
-                            Error::PathError(format!("reading metadata for '{rel}': {e}"))
+                            Error::Worktree(WorktreeError::Path {
+                                detail: format!("reading metadata for '{rel}': {e}"),
+                            })
                         })?
                         .permissions();
                     perms.set_mode(*mode);
                     fs::set_permissions(&abs, perms).map_err(|e| {
-                        Error::PathError(format!("restoring mode for '{rel}': {e}"))
+                        Error::Worktree(WorktreeError::Path {
+                            detail: format!("restoring mode for '{rel}': {e}"),
+                        })
                     })?;
                 }
             }
@@ -942,22 +1246,16 @@ fn restore_worktree_backups(work_tree: &Path, backups: &[WorktreePathBackup]) ->
                 let abs = work_tree.join(rel);
                 if let Some(parent) = abs.parent() {
                     fs::create_dir_all(parent).map_err(|e| {
-                        Error::PathError(format!("creating parent for '{rel}': {e}"))
+                        Error::Worktree(WorktreeError::Path {
+                            detail: format!("creating parent for '{rel}': {e}"),
+                        })
                     })?;
                 }
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::symlink;
-                    symlink(target, &abs)
-                        .map_err(|e| Error::PathError(format!("restoring symlink '{rel}': {e}")))?;
-                }
-                #[cfg(not(unix))]
-                {
-                    let _ = target;
-                    return Err(Error::Message(format!(
-                        "cannot restore symlink '{rel}' on this platform"
-                    )));
-                }
+                crate::worktree::create_worktree_symlink(&abs, target.as_ref()).map_err(|e| {
+                    Error::Worktree(WorktreeError::Path {
+                        detail: format!("restoring symlink '{rel}': {e}"),
+                    })
+                })?;
             }
         }
     }
@@ -971,46 +1269,75 @@ fn restore_worktree_backups(work_tree: &Path, backups: &[WorktreePathBackup]) ->
 ///
 /// # Errors
 ///
-/// Returns [`Error::InvalidPath`] when `path` is empty, absolute, or contains `..`.
+/// Returns [`crate::worktree::WorktreeError::InvalidPath`] when `path` is empty, absolute, or contains `..`.
+fn destination_had_trailing_separator(path: &str) -> bool {
+    let trimmed = path.trim_end_matches([' ', '\t']);
+    trimmed.ends_with('/') || trimmed.ends_with('\\')
+}
+
+fn normalize_repo_relative_slashes(raw: &str) -> String {
+    let with_slashes = raw.replace('\\', "/");
+    let trimmed = with_slashes.trim_start_matches("./");
+    trimmed
+        .split('/')
+        .filter(|component| !component.is_empty())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn path_outside_work_tree(path: &str, work_tree: &Path) -> Error {
+    let repo_root = work_tree
+        .canonicalize_simplified()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| work_tree.display().to_string());
+    Error::Worktree(WorktreeError::OutsideRepo(
+        PathOutsideRepoError::OutsideRepository {
+            path: path.to_owned(),
+            subpath: path.to_owned(),
+            repo_root,
+        },
+    ))
+}
+
 fn normalize_and_validate_repo_relative(
     repo: &Repository,
-    _work_tree: &Path,
+    work_tree: &Path,
     path: &str,
 ) -> Result<String> {
     if path.is_empty() {
-        return Err(Error::InvalidPath("empty path".into()));
+        return Err(Error::Worktree(WorktreeError::InvalidPath {
+            path: "empty path".into(),
+        }));
     }
     if Path::new(path).is_absolute() {
-        return Err(Error::InvalidPath(format!(
-            "'{path}' is outside repository"
-        )));
+        return Err(Error::Worktree(WorktreeError::InvalidPath {
+            path: format!("'{path}' is outside repository"),
+        }));
     }
     let with_slashes = path.replace('\\', "/");
     if with_slashes.starts_with('/') {
-        return Err(Error::InvalidPath(format!(
-            "'{path}' is outside repository"
-        )));
+        return Err(path_outside_work_tree(path, work_tree));
     }
     for component in Path::new(&with_slashes).components() {
         if matches!(component, Component::ParentDir) {
-            return Err(Error::InvalidPath(format!(
-                "'{path}' is outside repository"
-            )));
+            return Err(path_outside_work_tree(path, work_tree));
         }
     }
-    let rel = with_slashes.trim_start_matches("./");
+    let rel = normalize_repo_relative_slashes(path);
     if rel.is_empty() {
-        return Err(Error::InvalidPath("empty path".into()));
+        return Err(Error::Worktree(WorktreeError::InvalidPath {
+            path: "empty path".into(),
+        }));
     }
-    let opts = ProtectOptions::from_config(&*repo.config()?);
+    let opts = ProtectOptions::from_config(&*repo.config().snapshot()?);
     validate_path(
         rel.as_bytes(),
         EntryMode::new(0o100644),
         opts,
         PathValidationKind::Worktree,
     )
-    .map_err(|reason| Error::invalid_path_component(rel, reason))?;
-    Ok(rel.to_string())
+    .map_err(|reason| Error::invalid_path_component(rel.clone(), reason))?;
+    Ok(rel)
 }
 
 fn index_paths_under(index: &Index, prefix: &str, include_exact: bool) -> Vec<String> {
@@ -1040,25 +1367,105 @@ fn resolve_move_destination(
     index: &Index,
     src: &str,
     dst: &str,
+    dst_had_trailing_slash: bool,
+    single_source: bool,
+    _ignorecase: bool,
 ) -> Result<(String, bool)> {
-    let dst_abs = work_tree.join(dst);
-    let dst_is_dir = dst_abs.is_dir()
-        || index_paths_under(index, dst, false)
-            .iter()
-            .any(|p| p.starts_with(dst))
+    let src_is_dir = worktree_dentry_is_directory(work_tree, src)
         || index
-            .get(dst.as_bytes(), 0)
-            .is_some_and(|e| e.mode == MODE_TREE);
+            .get(src.as_bytes(), 0)
+            .is_some_and(|e| e.mode == MODE_TREE)
+        || !index_paths_under(index, src, false).is_empty();
 
+    let same_case_directory = src_is_dir
+        && src != dst
+        && paths_equal(src.as_bytes(), dst.as_bytes(), true)
+        && (worktree_filesystem_case_insensitive(work_tree)
+            || worktree_paths_same_identity(work_tree, src, dst));
+
+    let dst_abs = work_tree.join(dst);
+    let dst_is_dir = !same_case_directory
+        && (dst_abs.is_dir()
+            || index_has_paths_under(index, dst, false)
+            || index
+                .get(dst.as_bytes(), 0)
+                .is_some_and(|e| e.mode == MODE_TREE));
+
+    if dst_had_trailing_slash && !dst_is_dir {
+        if single_source && src_is_dir {
+            return Ok((dst.to_string(), false));
+        }
+        return Err(Error::Worktree(
+            WorktreeError::MoveDestinationNotDirectory {
+                destination: dst.to_owned(),
+            },
+        ));
+    }
+
+    Ok(resolve_move_destination_path(
+        src,
+        dst,
+        dst_is_dir,
+        same_case_directory,
+    ))
+}
+
+/// Pure destination resolution for a single tracked source (unit-tested on all platforms).
+#[must_use]
+fn resolve_move_destination_path(
+    src: &str,
+    dst: &str,
+    dst_is_dir: bool,
+    same_case_directory: bool,
+) -> (String, bool) {
+    if same_case_directory {
+        return (dst.to_string(), false);
+    }
     if dst_is_dir {
         let base = Path::new(src)
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or(src);
-        Ok((format!("{dst}/{base}"), true))
+        (format!("{dst}/{base}"), true)
     } else {
-        Ok((dst.to_string(), false))
+        (dst.to_string(), false)
     }
+}
+
+fn index_has_paths_under(index: &Index, prefix: &str, ignorecase: bool) -> bool {
+    if ignorecase {
+        return index.entries.iter().filter(|e| e.stage() == 0).any(|e| {
+            let path = String::from_utf8_lossy(&e.path);
+            index_path_at_destination(&path, prefix, true) && path != prefix
+        });
+    }
+    !index_paths_under(index, prefix, false).is_empty()
+}
+
+fn worktree_dentry_is_directory(work_tree: &Path, rel: &str) -> bool {
+    fs::symlink_metadata(work_tree.join(rel))
+        .map(|meta| meta.is_dir())
+        .unwrap_or(false)
+}
+
+#[cfg(unix)]
+fn worktree_paths_same_identity(work_tree: &Path, a: &str, b: &str) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    let a_abs = work_tree.join(a);
+    let b_abs = work_tree.join(b);
+    let (Ok(ma), Ok(mb)) = (fs::symlink_metadata(&a_abs), fs::symlink_metadata(&b_abs)) else {
+        return false;
+    };
+    if !ma.is_dir() || !mb.is_dir() {
+        return false;
+    }
+    ma.dev() == mb.dev() && ma.ino() == mb.ino()
+}
+
+#[cfg(not(unix))]
+fn worktree_paths_same_identity(_work_tree: &Path, _a: &str, _b: &str) -> bool {
+    false
 }
 
 fn destination_exists(
@@ -1069,13 +1476,18 @@ fn destination_exists(
     ignorecase: bool,
     renames: &[(String, String)],
 ) -> bool {
-    if ignorecase && case_only_rename_to(renames, dst) {
+    if ignorecase
+        && (case_only_rename_to(renames, dst) || renames_are_case_only_tree_to(renames, dst))
+    {
         return index_has_unrelated_entries(index, dst, ignorecase, renames);
     }
 
     let abs = work_tree.join(dst);
     if abs.exists() {
-        if ignorecase && rename_sources_cover_path(renames, dst) {
+        if ignorecase
+            && (rename_sources_cover_path(renames, dst)
+                || renames_are_case_only_tree_to(renames, dst))
+        {
             return index_has_unrelated_entries(index, dst, ignorecase, renames);
         }
         return true;
@@ -1088,6 +1500,32 @@ fn case_only_rename_to(renames: &[(String, String)], dst: &str) -> bool {
     renames.iter().any(|(from, to)| {
         to == dst && from != to && paths_equal(from.as_bytes(), to.as_bytes(), true)
     })
+}
+
+fn renames_are_case_only_tree_to(renames: &[(String, String)], dst: &str) -> bool {
+    !renames.is_empty()
+        && renames
+            .iter()
+            .all(|(from, to)| case_only_rename_under_dst(from, to, dst))
+}
+
+fn case_only_rename_under_dst(from: &str, to: &str, dst: &str) -> bool {
+    if from == to || !paths_equal(from.as_bytes(), to.as_bytes(), true) {
+        return false;
+    }
+    if to == dst {
+        return paths_equal(from.as_bytes(), dst.as_bytes(), true);
+    }
+    let plen = dst.len();
+    if to.len() <= plen || to.as_bytes().get(plen) != Some(&b'/') {
+        return false;
+    }
+    if !paths_equal(&to.as_bytes()[..plen], dst.as_bytes(), true) {
+        return false;
+    }
+    from.len() > plen
+        && from.as_bytes().get(plen) == Some(&b'/')
+        && paths_equal(&from.as_bytes()[..plen], &to.as_bytes()[..plen], true)
 }
 
 fn rename_sources_cover_path(renames: &[(String, String)], path: &str) -> bool {
@@ -1107,7 +1545,7 @@ fn index_has_unrelated_entries(
     if ignorecase {
         return index.entries.iter().filter(|e| e.stage() == 0).any(|e| {
             let path = String::from_utf8_lossy(&e.path);
-            if !index_path_at_destination(&path, dst) {
+            if !index_path_at_destination(&path, dst, true) {
                 return false;
             }
             !rename_from.contains(path.as_ref())
@@ -1121,15 +1559,23 @@ fn index_has_unrelated_entries(
     paths.iter().any(|p| !rename_from.contains(p.as_str()))
 }
 
-fn index_path_at_destination(path: &str, dst: &str) -> bool {
-    if paths_equal(path.as_bytes(), dst.as_bytes(), true) {
+fn index_path_at_destination(path: &str, dst: &str, ignorecase: bool) -> bool {
+    if paths_equal(path.as_bytes(), dst.as_bytes(), ignorecase) {
         return true;
     }
-    if path == dst {
+    if !ignorecase && path == dst {
         return true;
     }
     let plen = dst.len();
-    path.len() > plen && path.starts_with(dst) && path.as_bytes()[plen] == b'/'
+    if path.len() <= plen || path.as_bytes().get(plen) != Some(&b'/') {
+        return false;
+    }
+    let prefix = &path[..plen];
+    if ignorecase {
+        paths_equal(prefix.as_bytes(), dst.as_bytes(), true)
+    } else {
+        prefix == dst
+    }
 }
 
 fn worktree_paths_to_clear(work_tree: &Path, index: &Index, dst: &str) -> Vec<String> {
@@ -1152,12 +1598,20 @@ fn clear_destination_index(index: &mut Index, dst: &str) {
     }
 }
 
-fn is_subdirectory(candidate: &str, parent_dir: &str) -> bool {
-    if candidate == parent_dir {
+fn is_subdirectory(candidate: &str, parent_dir: &str, ignorecase: bool) -> bool {
+    if paths_equal(candidate.as_bytes(), parent_dir.as_bytes(), ignorecase) {
         return false;
     }
     let plen = parent_dir.len();
-    candidate.starts_with(parent_dir) && candidate.as_bytes().get(plen) == Some(&b'/')
+    if candidate.len() <= plen || candidate.as_bytes().get(plen) != Some(&b'/') {
+        return false;
+    }
+    let prefix = &candidate[..plen];
+    if ignorecase {
+        paths_equal(prefix.as_bytes(), parent_dir.as_bytes(), true)
+    } else {
+        prefix == parent_dir
+    }
 }
 
 fn ensure_worktree_move_sources_exist(
@@ -1172,10 +1626,10 @@ fn ensure_worktree_move_sources_exist(
         if abs.is_dir() {
             continue;
         }
-        return Err(Error::MoveBadSource {
+        return Err(Error::Worktree(WorktreeError::MoveBadSource {
             src: from.clone(),
             destination: to.clone(),
-        });
+        }));
     }
     Ok(())
 }
@@ -1193,7 +1647,7 @@ fn rename_worktree_entry(from: &Path, to: &Path, ignorecase: bool) -> std::io::R
     }
 }
 
-fn case_only_worktree_rename(from: &Path, to: &Path) -> std::io::Result<()> {
+pub(crate) fn case_only_worktree_rename(from: &Path, to: &Path) -> std::io::Result<()> {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static CASE_MV_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -1265,16 +1719,16 @@ fn rename_worktree_paths(
         let to = work_tree.join(&renames[0].1);
         if let Some(parent) = to.parent() {
             fs::create_dir_all(parent).map_err(|e| {
-                Error::PathError(format!("creating parent for '{}': {e}", renames[0].1))
+                Error::Worktree(WorktreeError::Path {
+                    detail: format!("creating parent for '{}': {e}", renames[0].1),
+                })
             })?;
         }
         rename_worktree_entry(&from, &to, ignorecase).map_err(|e| {
-            Error::PathError(format!(
-                "renaming '{}' -> '{}': {e}",
-                renames[0].0, renames[0].1
-            ))
+            Error::Worktree(WorktreeError::Path {
+                detail: format!("renaming '{}' -> '{}': {e}", renames[0].0, renames[0].1),
+            })
         })?;
-        remove_empty_parent_dirs(work_tree, &from);
         return Ok(());
     }
 
@@ -1282,13 +1736,17 @@ fn rename_worktree_paths(
     let dst_abs = work_tree.join(final_dst);
     if src_abs.is_dir() {
         if let Some(parent) = dst_abs.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| Error::PathError(format!("creating parent for '{final_dst}': {e}")))?;
+            fs::create_dir_all(parent).map_err(|e| {
+                Error::Worktree(WorktreeError::Path {
+                    detail: format!("creating parent for '{final_dst}': {e}"),
+                })
+            })?;
         }
         rename_worktree_entry(&src_abs, &dst_abs, ignorecase).map_err(|e| {
-            Error::PathError(format!("renaming directory '{src}' -> '{final_dst}': {e}"))
+            Error::Worktree(WorktreeError::Path {
+                detail: format!("renaming directory '{src}' -> '{final_dst}': {e}"),
+            })
         })?;
-        remove_empty_parent_dirs(work_tree, &src_abs);
         return Ok(());
     }
 
@@ -1296,13 +1754,18 @@ fn rename_worktree_paths(
         let from_abs = work_tree.join(from);
         let to_abs = work_tree.join(to);
         if let Some(parent) = to_abs.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| Error::PathError(format!("creating parent for '{to}': {e}")))?;
+            fs::create_dir_all(parent).map_err(|e| {
+                Error::Worktree(WorktreeError::Path {
+                    detail: format!("creating parent for '{to}': {e}"),
+                })
+            })?;
         }
         if from_abs.exists() {
-            rename_worktree_entry(&from_abs, &to_abs, ignorecase)
-                .map_err(|e| Error::PathError(format!("renaming '{from}' -> '{to}': {e}")))?;
-            remove_empty_parent_dirs(work_tree, &from_abs);
+            rename_worktree_entry(&from_abs, &to_abs, ignorecase).map_err(|e| {
+                Error::Worktree(WorktreeError::Path {
+                    detail: format!("renaming '{from}' -> '{to}': {e}"),
+                })
+            })?;
         }
     }
     Ok(())
@@ -1390,14 +1853,286 @@ mod remove_block_reason_tests {
 }
 
 #[cfg(test)]
+mod collect_removal_paths_tests {
+    use std::fs;
+
+    use crate::porcelain::add::{stage, StageOptions};
+    use crate::progress::{CancelToken, NullProgress};
+    use crate::repo::{init_repository, Repository};
+
+    use crate::index::Index;
+    use crate::pathspec::{matches_pathspec_list_with_context, PathspecMatchContext};
+
+    use super::{remove_paths, RemoveOptions};
+
+    fn init_repo(root: &std::path::Path) -> Repository {
+        init_repository(root, false, "main", None, Default::default()).expect("init")
+    }
+
+    fn rm_collect(repo: &Repository, specs: &[&str], recursive: bool) -> Vec<String> {
+        remove_paths(
+            repo,
+            &RemoveOptions {
+                pathspecs: specs.iter().map(|s| (*s).to_string()).collect(),
+                pathspec_sources: specs.iter().map(|s| (*s).to_string()).collect(),
+                recursive,
+                dry_run: true,
+                force: true,
+                ..Default::default()
+            },
+            &crate::progress::CancelToken::never(),
+        )
+        .expect("dry-run rm")
+        .removed
+    }
+
+    #[test]
+    fn literal_directory_removal_selects_all_tracked_descendants() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let repo = init_repo(root);
+        fs::create_dir_all(root.join("d000/s00")).unwrap();
+        fs::write(root.join("d000/s00/a.txt"), b"a\n").unwrap();
+        fs::write(root.join("d000/s00/b.txt"), b"b\n").unwrap();
+        fs::create_dir_all(root.join("d001")).unwrap();
+        fs::write(root.join("d001/x.txt"), b"x\n").unwrap();
+        stage(
+            &repo,
+            &StageOptions::default(),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .unwrap();
+
+        let mut removed = rm_collect(&repo, &["d000"], true);
+        removed.sort();
+        assert_eq!(
+            removed,
+            vec!["d000/s00/a.txt".to_string(), "d000/s00/b.txt".to_string()]
+        );
+    }
+
+    #[test]
+    fn literal_file_does_not_remove_prefix_collision_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let repo = init_repo(root);
+        fs::write(root.join("file"), b"1\n").unwrap();
+        fs::write(root.join("file2.txt"), b"2\n").unwrap();
+        stage(
+            &repo,
+            &StageOptions::default(),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .unwrap();
+
+        let removed = rm_collect(&repo, &["file"], false);
+        assert_eq!(removed, vec!["file".to_string()]);
+    }
+
+    #[test]
+    fn glob_pathspec_selects_matching_paths() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let repo = init_repo(root);
+        fs::write(root.join("a.txt"), b"a\n").unwrap();
+        fs::write(root.join("b.rs"), b"b\n").unwrap();
+        fs::write(root.join("c.rs"), b"c\n").unwrap();
+        stage(
+            &repo,
+            &StageOptions::default(),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .unwrap();
+
+        let mut removed = rm_collect(&repo, &["*.rs"], false);
+        removed.sort();
+        assert_eq!(removed, vec!["b.rs".to_string(), "c.rs".to_string()]);
+    }
+
+    #[test]
+    fn ignore_unmatch_skips_unknown_spec() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let repo = init_repo(root);
+        fs::write(root.join("keep.txt"), b"k\n").unwrap();
+        stage(
+            &repo,
+            &StageOptions::default(),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .unwrap();
+
+        let outcome = remove_paths(
+            &repo,
+            &RemoveOptions {
+                pathspecs: vec!["keep.txt".into(), "missing.txt".into()],
+                pathspec_sources: vec!["keep.txt".into(), "missing.txt".into()],
+                dry_run: true,
+                force: true,
+                ignore_unmatch: true,
+                ..Default::default()
+            },
+            &crate::progress::CancelToken::never(),
+        )
+        .expect("ignore unmatch");
+        assert_eq!(outcome.removed, vec!["keep.txt".to_string()]);
+    }
+
+    fn bruteforce_literal_dir_removal(
+        index: &Index,
+        spec: &str,
+        ctx: PathspecMatchContext,
+        recursive: bool,
+    ) -> Vec<String> {
+        let mut tracked: std::collections::BTreeSet<String> = index
+            .entries
+            .iter()
+            .map(|e| String::from_utf8_lossy(&e.path).into_owned())
+            .collect();
+        let resolved = spec.to_string();
+        let spec_trim = resolved.trim_end_matches('/');
+        let matches: Vec<String> = tracked
+            .iter()
+            .filter(|path| {
+                matches_pathspec_list_with_context(path, std::slice::from_ref(&resolved), ctx)
+            })
+            .cloned()
+            .collect();
+        let mut selected: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        if matches.is_empty() {
+            let prefix = format!("{spec_trim}/");
+            let under: Vec<String> = tracked
+                .iter()
+                .filter(|path| path.starts_with(&prefix))
+                .cloned()
+                .collect();
+            assert!(!under.is_empty());
+            assert!(recursive);
+            selected.extend(under);
+        } else {
+            for path in matches {
+                selected.insert(path.clone());
+                if recursive {
+                    let prefix = format!("{path}/");
+                    for child in tracked.iter().filter(|p| p.starts_with(&prefix)) {
+                        selected.insert((*child).clone());
+                    }
+                }
+            }
+        }
+        let mut out: Vec<String> = selected.into_iter().collect();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn literal_directory_removal_matches_bruteforce_on_large_index() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let repo = init_repo(root);
+        for d in 0..100 {
+            fs::create_dir_all(root.join(format!("d{d:03}"))).unwrap();
+            for f in 0..50 {
+                let rel = format!("d{d:03}/f{f:02}.txt");
+                fs::write(root.join(&rel), b"x\n").unwrap();
+            }
+        }
+        stage(
+            &repo,
+            &StageOptions::default(),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .unwrap();
+
+        let index = repo.load_index().expect("index");
+        let ctx = repo.pathspec_match_context();
+        let removed = rm_collect(&repo, &["d000"], true);
+        let expected = bruteforce_literal_dir_removal(&index, "d000", ctx, true);
+        assert_eq!(removed, expected);
+        assert_eq!(removed.len(), 50);
+        assert_eq!(index.entries.len(), 5000);
+    }
+
+    #[test]
+    fn precomposed_nfc_literal_removes_nfc_index_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let repo = init_repo(root);
+        repo.force_pathspec_precompose_for_test();
+        let nfd = "cafe\u{301}.txt";
+        let nfc = "caf\u{e9}.txt";
+        fs::write(root.join(nfd), b"x\n").unwrap();
+        stage(
+            &repo,
+            &StageOptions::default(),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .unwrap();
+
+        let index = repo.load_index().expect("index");
+        let stored = String::from_utf8_lossy(
+            &index
+                .entries
+                .iter()
+                .find(|e| e.stage() == 0)
+                .expect("stage-0 entry")
+                .path,
+        )
+        .into_owned();
+
+        let removed = rm_collect(&repo, &[nfc], false);
+        assert_eq!(removed, vec![stored]);
+    }
+
+    #[test]
+    fn exclude_pathspec_label_does_not_select_paths() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let repo = init_repo(root);
+        fs::write(root.join("a.txt"), b"a\n").unwrap();
+        fs::write(root.join("b.txt"), b"b\n").unwrap();
+        stage(
+            &repo,
+            &StageOptions::default(),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .unwrap();
+
+        let outcome = remove_paths(
+            &repo,
+            &RemoveOptions {
+                pathspecs: vec!["*.txt".into(), ":(exclude)a.txt".into()],
+                pathspec_sources: vec!["*.txt".into(), ":(exclude)a.txt".into()],
+                dry_run: true,
+                force: true,
+                ..Default::default()
+            },
+            &crate::progress::CancelToken::never(),
+        )
+        .expect("dry-run rm");
+        assert_eq!(outcome.removed.len(), 2);
+        assert!(outcome.removed.contains(&"a.txt".to_string()));
+        assert!(outcome.removed.contains(&"b.txt".to_string()));
+    }
+}
+
+#[cfg(test)]
 mod path_validation_tests {
     use super::normalize_and_validate_repo_relative;
     use crate::error::Error;
     use crate::repo::{InitOptions, Repository};
+    use crate::worktree::WorktreeError;
 
     fn test_repo() -> (tempfile::TempDir, Repository) {
         let dir = tempfile::tempdir().expect("tempdir");
-        let repo = Repository::init(dir.path(), &InitOptions::default()).expect("init");
+        let (repo, _) = Repository::init(dir.path(), &InitOptions::default()).expect("init");
         (dir, repo)
     }
 
@@ -1407,7 +2142,10 @@ mod path_validation_tests {
         let wt = repo.work_tree().expect("worktree");
         let err = normalize_and_validate_repo_relative(&repo, wt, "/tmp/repo/destination")
             .expect_err("abs");
-        assert!(matches!(err, Error::InvalidPath(_)));
+        assert!(matches!(
+            err,
+            Error::Worktree(WorktreeError::InvalidPath { .. })
+        ));
     }
 
     #[test]
@@ -1415,7 +2153,10 @@ mod path_validation_tests {
         let (_dir, repo) = test_repo();
         let wt = repo.work_tree().expect("worktree");
         let err = normalize_and_validate_repo_relative(&repo, wt, "dir/../source").expect_err("..");
-        assert!(matches!(err, Error::InvalidPath(_)));
+        assert!(matches!(
+            err,
+            Error::Worktree(WorktreeError::OutsideRepo(_))
+        ));
     }
 
     #[test]
@@ -1427,13 +2168,100 @@ mod path_validation_tests {
             "nested/file.txt"
         );
     }
+
+    #[test]
+    fn strips_trailing_directory_separators_before_validation() {
+        let (_dir, repo) = test_repo();
+        let wt = repo.work_tree().expect("worktree");
+        for path in ["dir/", "dir//", "./dir/"] {
+            assert_eq!(
+                normalize_and_validate_repo_relative(&repo, wt, path).expect("ok"),
+                "dir",
+                "path {path}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod is_subdirectory_tests {
+    use super::is_subdirectory;
+
+    #[test]
+    fn ignorecase_rejects_move_into_case_folded_subdirectory() {
+        assert!(is_subdirectory("dir/nested", "Dir", true));
+        assert!(!is_subdirectory("dir/nested", "Dir", false));
+    }
+}
+
+#[cfg(test)]
+mod index_has_paths_under_tests {
+    use super::index_has_paths_under;
+
+    use crate::index::{Index, IndexEntry};
+    use crate::objects::ObjectId;
+
+    fn dummy_entry(path: &str) -> IndexEntry {
+        IndexEntry {
+            ctime_sec: 0,
+            ctime_nsec: 0,
+            mtime_sec: 0,
+            mtime_nsec: 0,
+            dev: 0,
+            ino: 0,
+            mode: 0o100644,
+            uid: 0,
+            gid: 0,
+            size: 0,
+            oid: ObjectId::from_bytes(&[0u8; 20]).unwrap(),
+            flags: 0,
+            flags_extended: None,
+            path: path.as_bytes().to_vec(),
+            base_index_pos: 0,
+        }
+    }
+
+    #[test]
+    fn ignorecase_prefix_for_collision_not_destination_directory() {
+        let mut index = Index::new();
+        index.push_entry_unsorted(dummy_entry("Docs/a.txt"));
+        assert!(
+            index_has_paths_under(&index, "docs", true),
+            "icase prefix match is for collision detection"
+        );
+        assert!(
+            !index_has_paths_under(&index, "docs", false),
+            "destination-directory classification stays case-sensitive"
+        );
+    }
+}
+
+#[cfg(test)]
+mod resolve_move_destination_tests {
+    use super::resolve_move_destination_path;
+
+    #[test]
+    fn case_only_directory_rename_uses_destination_spelling() {
+        assert_eq!(
+            resolve_move_destination_path("Dir", "dir", true, true),
+            ("dir".into(), false)
+        );
+    }
+
+    #[test]
+    fn real_directory_destination_appends_basename() {
+        assert_eq!(
+            resolve_move_destination_path("Dir", "other", true, false),
+            ("other/Dir".into(), true)
+        );
+    }
 }
 
 #[cfg(test)]
 mod destination_exists_tests {
     use super::{
-        case_only_rename_to, destination_exists, index_has_unrelated_entries,
-        rename_sources_cover_path,
+        case_only_rename_to, case_only_rename_under_dst, destination_exists,
+        index_has_unrelated_entries, rename_sources_cover_path, renames_are_case_only_tree_to,
     };
     use crate::index::Index;
     use crate::index::IndexEntry;
@@ -1496,10 +2324,55 @@ mod destination_exists_tests {
             "distinct index spellings at the same icase path must block"
         );
     }
+
+    #[test]
+    fn case_only_tree_rename_helpers() {
+        let renames = vec![
+            ("Dir/x.txt".into(), "dir/x.txt".into()),
+            ("Dir/y.txt".into(), "dir/y.txt".into()),
+        ];
+        assert!(renames_are_case_only_tree_to(&renames, "dir"));
+        assert!(case_only_rename_under_dst("Dir/x.txt", "dir/x.txt", "dir"));
+        assert!(!renames_are_case_only_tree_to(&renames, "other"));
+    }
+
+    #[test]
+    fn ignorecase_tree_collision_allows_case_only_destination() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let wt = tmp.path();
+        std::fs::create_dir_all(wt.join("Dir")).unwrap();
+        std::fs::write(wt.join("Dir/x.txt"), b"x\n").unwrap();
+        let mut index = Index::new();
+        index.push_entry_unsorted(dummy_entry("Dir/x.txt"));
+        let renames = vec![("Dir/x.txt".into(), "dir/x.txt".into())];
+        assert!(
+            !destination_exists(wt, &index, "dir", false, true, &renames),
+            "case-only directory tree must not collide with itself on a folding volume"
+        );
+    }
+
+    #[test]
+    fn ignorecase_tree_blocks_distinct_destination_directory() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let wt = tmp.path();
+        std::fs::create_dir_all(wt.join("Dir")).unwrap();
+        std::fs::create_dir_all(wt.join("dir")).unwrap();
+        std::fs::write(wt.join("Dir/x.txt"), b"x\n").unwrap();
+        std::fs::write(wt.join("dir/extra.txt"), b"y\n").unwrap();
+        let mut index = Index::new();
+        index.push_entry_unsorted(dummy_entry("Dir/x.txt"));
+        index.push_entry_unsorted(dummy_entry("dir/extra.txt"));
+        let renames = vec![("Dir/x.txt".into(), "dir/x.txt".into())];
+        assert!(
+            destination_exists(wt, &index, "dir", false, true, &renames),
+            "unrelated tracked paths under the destination must still block"
+        );
+    }
 }
 
 #[cfg(test)]
 mod move_rollback_tests {
+    use crate::worktree::WorktreeError;
     use std::fs;
 
     use crate::error::Error;
@@ -1521,7 +2394,9 @@ mod move_rollback_tests {
             .expect("backup bytes");
         fs::write(wt.join("dest/a.txt"), b"from-source\n").expect("simulated completed rename");
         let completed = vec![("src/a.txt".to_string(), "dest/a.txt".to_string())];
-        let original = crate::error::Error::PathError("simulated rename failure".into());
+        let original = crate::error::Error::Worktree(WorktreeError::Path {
+            detail: "simulated rename failure".into(),
+        });
 
         let _ = abort_failed_move_worktree(
             wt,
@@ -1578,7 +2453,9 @@ mod move_rollback_tests {
             &completed,
             &backups,
             false,
-            crate::error::Error::PathError("simulated later rename failure".into()),
+            crate::error::Error::Worktree(WorktreeError::Path {
+                detail: "simulated later rename failure".into(),
+            }),
         );
         assert_eq!(fs::read(wt.join("src/f0.txt")).unwrap(), b"source0\n");
         assert_eq!(fs::read(wt.join("src/f1.txt")).unwrap(), b"source1\n");
@@ -1619,13 +2496,16 @@ mod move_rollback_tests {
             &applied,
             &cleared,
             false,
-            Error::MoveBadSource {
+            Error::Worktree(WorktreeError::MoveBadSource {
                 src: "src/f0001".to_owned(),
                 destination: "dest/f0001".to_owned(),
-            },
+            }),
         );
         assert!(
-            matches!(err, Error::Message(_)),
+            matches!(
+                err,
+                Error::Worktree(WorktreeError::MoveRollbackIncomplete { unreversed: 1, .. })
+            ),
             "expected aggregated incomplete rollback error, got {err:?}"
         );
         assert_eq!(
@@ -1664,13 +2544,16 @@ mod move_rollback_tests {
             &applied,
             &cleared,
             false,
-            Error::MoveBadSource {
+            Error::Worktree(WorktreeError::MoveBadSource {
                 src: "srcdir/missing".to_owned(),
                 destination: "dest/srcdir/missing".to_owned(),
-            },
+            }),
         );
         assert!(
-            matches!(err, Error::Message(_)),
+            matches!(
+                err,
+                Error::Worktree(WorktreeError::MoveRollbackIncomplete { .. })
+            ),
             "unexpected error: {err:?}"
         );
         assert_eq!(
@@ -1682,12 +2565,155 @@ mod move_rollback_tests {
 }
 
 #[cfg(test)]
+mod cancel_regression_tests {
+    use crate::error::Error;
+    use crate::porcelain::add::{stage, StageOptions};
+    use crate::progress::CancelToken;
+    use crate::progress::NullProgress;
+    use crate::repo::{init_repository, Repository};
+    use std::fs;
+
+    use super::{move_path, remove_paths, RemoveOptions};
+
+    fn init_repo(root: &std::path::Path) -> Repository {
+        init_repository(root, false, "main", None, Default::default()).expect("init")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_paths_worktree_failure_on_second_path_restores_first_and_index() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let repo = init_repo(root);
+        fs::create_dir_all(root.join("locked")).unwrap();
+        fs::write(root.join("a.txt"), b"a\n").unwrap();
+        fs::write(root.join("locked/b.txt"), b"b\n").unwrap();
+        stage(
+            &repo,
+            &StageOptions::default(),
+            &mut NullProgress,
+            &crate::progress::CancelToken::never(),
+        )
+        .unwrap();
+        fs::set_permissions(root.join("locked"), fs::Permissions::from_mode(0o555)).unwrap();
+        let index_before = fs::read(repo.index_path()).expect("read index");
+
+        let err = remove_paths(
+            &repo,
+            &RemoveOptions {
+                pathspecs: vec!["a.txt".into(), "locked/b.txt".into()],
+                force: true,
+                ..RemoveOptions::default()
+            },
+            &crate::progress::CancelToken::never(),
+        )
+        .expect_err("unlink under read-only directory must fail");
+
+        assert!(
+            !matches!(err, Error::Cancelled),
+            "unexpected cancel: {err:?}"
+        );
+        assert_eq!(
+            fs::read(repo.index_path()).expect("read index"),
+            index_before,
+            "index must still list every path"
+        );
+        assert!(root.join("a.txt").is_file(), "first path must be restored");
+        assert!(
+            root.join("locked/b.txt").is_file(),
+            "second path must remain"
+        );
+        assert!(
+            repo.load_index()
+                .expect("load index")
+                .get(b"a.txt", 0)
+                .is_some(),
+            "index must still track a.txt"
+        );
+        assert!(
+            repo.load_index()
+                .expect("load index")
+                .get(b"locked/b.txt", 0)
+                .is_some(),
+            "index must still track locked/b.txt"
+        );
+    }
+
+    #[test]
+    fn remove_paths_cancel_during_worktree_removal_restores_files_and_index() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let repo = init_repo(root);
+        fs::write(root.join("a.txt"), b"a\n").unwrap();
+        fs::write(root.join("b.txt"), b"b\n").unwrap();
+        stage(
+            &repo,
+            &StageOptions::default(),
+            &mut NullProgress,
+            &crate::progress::CancelToken::never(),
+        )
+        .unwrap();
+        let index_before = fs::read(repo.index_path()).expect("read index");
+
+        // After lock poll, cancel while removing the second worktree file.
+        let cancel = CancelToken::after_polls(4);
+        let err = remove_paths(
+            &repo,
+            &RemoveOptions {
+                pathspecs: vec!["a.txt".into(), "b.txt".into()],
+                force: true,
+                ..RemoveOptions::default()
+            },
+            &cancel,
+        )
+        .expect_err("cancelled rm");
+        assert!(matches!(err, Error::Cancelled));
+        assert_eq!(
+            fs::read(repo.index_path()).expect("read index"),
+            index_before
+        );
+        assert!(root.join("a.txt").is_file());
+        assert!(root.join("b.txt").is_file());
+    }
+
+    #[test]
+    fn move_paths_cancel_after_worktree_rename_rolls_back() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let repo = init_repo(root);
+        fs::write(root.join("a.txt"), b"a\n").unwrap();
+        stage(
+            &repo,
+            &StageOptions::default(),
+            &mut NullProgress,
+            &crate::progress::CancelToken::never(),
+        )
+        .unwrap();
+        let index_before = fs::read(repo.index_path()).expect("read index");
+
+        // After lock poll and loop guard, cancel at the final pre-commit poll.
+        let cancel = CancelToken::after_polls(3);
+        let err = move_path(&repo, "a.txt", "b.txt", false, &cancel).expect_err("cancelled mv");
+        assert!(matches!(err, Error::Cancelled));
+        assert_eq!(
+            fs::read(repo.index_path()).expect("read index"),
+            index_before
+        );
+        assert!(root.join("a.txt").is_file());
+        assert!(!root.join("b.txt").exists());
+    }
+}
+
+#[cfg(test)]
 mod index_lock_transaction_tests {
     use std::fs;
 
     use crate::porcelain::add::{stage, StageOptions};
     use crate::progress::NullProgress;
-    use crate::repo::{init_repository, set_test_inject_index_write_fail, Repository};
+    use crate::repo::{init_repository, Repository};
+    use crate::test_support::inject::set_test_inject_index_write_fail;
 
     use super::{move_path, remove_paths, RemoveOptions};
 
@@ -1705,7 +2731,7 @@ mod index_lock_transaction_tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
 
@@ -1718,10 +2744,16 @@ mod index_lock_transaction_tests {
                 force: true,
                 ..Default::default()
             },
+            &crate::progress::CancelToken::never(),
         )
         .expect_err("injected write failure");
         set_test_inject_index_write_fail(false);
-        assert!(matches!(err, crate::error::Error::Io(_)));
+        assert!(matches!(
+            err,
+            crate::error::Error::Io(_)
+                | crate::error::Error::Repository(crate::repo::RepositoryError::GitDirPathIo(_))
+                | crate::error::Error::Index(_)
+        ));
         assert!(root.join("a.txt").is_file());
     }
 
@@ -1735,15 +2767,116 @@ mod index_lock_transaction_tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .unwrap();
 
         set_test_inject_index_write_fail(true);
-        let err = move_path(&repo, "a.txt", "b.txt", false).expect_err("injected write failure");
+        let err = move_path(
+            &repo,
+            "a.txt",
+            "b.txt",
+            false,
+            &crate::progress::CancelToken::never(),
+        )
+        .expect_err("injected write failure");
         set_test_inject_index_write_fail(false);
-        assert!(matches!(err, crate::error::Error::Io(_)));
+        assert!(matches!(
+            err,
+            crate::error::Error::Io(_)
+                | crate::error::Error::Repository(crate::repo::RepositoryError::GitDirPathIo(_))
+                | crate::error::Error::Index(_)
+        ));
         assert!(root.join("a.txt").is_file());
         assert!(!root.join("b.txt").exists());
+    }
+}
+
+#[cfg(test)]
+mod trailing_slash_move_tests {
+    use crate::worktree::WorktreeError;
+    use std::fs;
+
+    use crate::error::Error;
+    use crate::porcelain::add::{stage, StageOptions};
+    use crate::progress::NullProgress;
+    use crate::repo::{init_repository, Repository};
+
+    use super::move_path;
+
+    fn init_repo(root: &std::path::Path) -> Repository {
+        init_repository(root, false, "main", None, Default::default()).expect("init")
+    }
+
+    fn stage_all(repo: &Repository) {
+        stage(
+            repo,
+            &StageOptions::default(),
+            &mut NullProgress,
+            &crate::progress::CancelToken::never(),
+        )
+        .expect("stage");
+    }
+
+    #[test]
+    fn move_file_into_existing_directory_with_trailing_slash() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let repo = init_repo(root);
+        fs::create_dir_all(root.join("dir")).unwrap();
+        fs::write(root.join("c"), b"c\n").unwrap();
+        stage_all(&repo);
+        move_path(
+            &repo,
+            "c",
+            "dir/",
+            false,
+            &crate::progress::CancelToken::never(),
+        )
+        .expect("mv");
+        assert!(root.join("dir/c").is_file());
+        assert!(!root.join("c").exists());
+    }
+
+    #[test]
+    fn move_file_to_missing_directory_with_trailing_slash_refused() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let repo = init_repo(root);
+        fs::write(root.join("c"), b"c\n").unwrap();
+        stage_all(&repo);
+        let err = move_path(
+            &repo,
+            "c",
+            "missing/",
+            false,
+            &crate::progress::CancelToken::never(),
+        )
+        .expect_err("mv");
+        assert!(matches!(
+            err,
+            Error::Worktree(WorktreeError::MoveDestinationNotDirectory { .. })
+        ));
+        assert!(root.join("c").is_file());
+    }
+
+    #[test]
+    fn move_directory_to_missing_directory_with_trailing_slash_renames() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let repo = init_repo(root);
+        fs::create_dir_all(root.join("src/nested")).unwrap();
+        fs::write(root.join("src/nested/file"), b"x\n").unwrap();
+        stage_all(&repo);
+        move_path(
+            &repo,
+            "src",
+            "dest/",
+            false,
+            &crate::progress::CancelToken::never(),
+        )
+        .expect("mv");
+        assert!(root.join("dest/nested/file").is_file());
+        assert!(!root.join("src").exists());
     }
 }

@@ -6,8 +6,8 @@ use std::process::Command;
 
 use grit_lib::config::environment::{Environment, RepositoryOptions};
 use grit_lib::config::{
-    global_config_write_path, set_config_value, unset_config_value, ConfigLocation, ConfigScope,
-    ConfigSet,
+    global_config_write_path, ConfigEditor, ConfigLocation, ConfigScope, ConfigSet,
+    ConfigWriteOptions,
 };
 use grit_lib::error::{ConfigError, Error};
 use grit_lib::repo::Repository;
@@ -104,9 +104,14 @@ fn config_get_with_origin_matches_git_show_origin_show_scope() {
     let repo = Repository::discover(Some(&repo_path), &RepositoryOptions::empty()).expect("open");
     let git_dir = repo.git_dir();
 
-    let merged = ConfigSet::load(&env, Some(git_dir), true).expect("load merged");
+    let merged = ConfigSet::load(
+        &env,
+        Some(git_dir),
+        &crate::config::LoadConfigOptions::standard(&env, Some(git_dir)),
+    )
+    .expect("load merged");
     let origin = merged
-        .get_with_origin("user.name")
+        .origin_of("user.name")
         .expect("valid key")
         .expect("set");
     assert_eq!(origin.value.as_deref(), Some("Command Name"));
@@ -128,7 +133,7 @@ fn config_get_with_origin_matches_git_show_origin_show_scope() {
     assert_eq!(git_origin.2, "Command Name");
 
     let email = merged
-        .get_with_origin("user.email")
+        .origin_of("user.email")
         .expect("valid")
         .expect("local email");
     assert_eq!(email.scope, ConfigScope::Local);
@@ -138,7 +143,7 @@ fn config_get_with_origin_matches_git_show_origin_show_scope() {
         .load_single(&env, Some(git_dir))
         .expect("global load");
     let g_origin = global_only
-        .get_with_origin("user.name")
+        .origin_of("user.name")
         .expect("valid")
         .expect("global name");
     assert_eq!(g_origin.value.as_deref(), Some("Global Name"));
@@ -148,7 +153,7 @@ fn config_get_with_origin_matches_git_show_origin_show_scope() {
         .load_single(&env, None)
         .expect("system load");
     let s_origin = system_only
-        .get_with_origin("user.name")
+        .origin_of("user.name")
         .expect("valid")
         .expect("system name");
     assert_eq!(s_origin.value.as_deref(), Some("System User"));
@@ -160,7 +165,7 @@ fn config_get_with_origin_matches_git_show_origin_show_scope() {
         .load_single(&Environment::empty(), None)
         .expect("file load");
     let f_origin = file_set
-        .get_with_origin("demo.value")
+        .origin_of("demo.value")
         .expect("valid")
         .expect("file value");
     assert_eq!(f_origin.scope, ConfigScope::Command);
@@ -198,15 +203,9 @@ fn config_set_file_location_then_git_reads_it() {
     let cfg_path = tmp.path().join("standalone.cfg");
     let env = Environment::empty();
 
-    set_config_value(
-        ConfigLocation::File(cfg_path.clone()),
-        &env,
-        None,
-        "grit.testKey",
-        "hello",
-        false,
-    )
-    .expect("set");
+    ConfigEditor::open(&env, cfg_path.clone(), ConfigScope::Local)
+        .set("grit.testKey", "hello", &ConfigWriteOptions::new())
+        .expect("set");
 
     let out = Command::new("git")
         .args([
@@ -229,14 +228,9 @@ fn config_unset_missing_key_is_typed_error() {
     fs::write(&cfg_path, "[section]\n").expect("write");
     let env = Environment::empty();
 
-    let err = unset_config_value(
-        ConfigLocation::File(cfg_path),
-        &env,
-        None,
-        "missing.key",
-        false,
-    )
-    .expect_err("missing key");
+    let err = ConfigEditor::open(&env, cfg_path, ConfigScope::Local)
+        .unset("missing.key", &ConfigWriteOptions::new())
+        .expect_err("missing key");
     match err {
         Error::Config(ConfigError::KeyNotSet { key }) => assert_eq!(key, "missing.key"),
         other => panic!("expected KeyNotSet, got {other:?}"),

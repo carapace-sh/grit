@@ -5,6 +5,7 @@
 //! directory, and (in the mixed fixture) change symlinks, executables and gitlinks. The cancel is
 //! raised at many points of the apply, from the first file to the last.
 
+use grit_lib::worktree::WorktreeError;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -12,17 +13,15 @@ use std::process::Command;
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::error::Error;
 use grit_lib::objects::ObjectId;
-use grit_lib::porcelain::checkout::checkout_between_trees_with_progress;
-use grit_lib::porcelain::reset::{reset_to_commit, ResetMode, ResetOptions};
-use grit_lib::porcelain::switch::{switch_repository, SwitchMode, SwitchOptions};
-use grit_lib::progress::{
-    Cancel, FlagCancel, NeverCancel, NullProgress, ProgressPhase, ProgressSink,
-};
+use grit_lib::porcelain::reset::{ResetMode, ResetOptions};
+use grit_lib::porcelain::switch::{SwitchMode, SwitchOptions};
+use grit_lib::progress::{CancelToken, NullProgress};
+use grit_lib::progress::{CancelToken, NullProgress, ProgressPhase, ProgressSink};
 use grit_lib::repo::Repository;
 
 /// Raises `cancel` on the `limit`-th checkout progress increment, after running `at_cancel`.
 struct CancelAfter<F: FnMut()> {
-    cancel: FlagCancel,
+    cancel: CancelToken,
     limit: u64,
     seen: u64,
     in_checkout: bool,
@@ -314,13 +313,10 @@ fn full_switch_incs(fx: &Fixture) -> u64 {
         .expect("cp");
     assert!(status.success());
     let mut count = CountIncs::default();
-    switch_repository(
-        &open(copy.path()),
-        &detach_to(fx.next),
-        &mut count,
-        &NeverCancel,
-    )
-    .expect("full switch on the copy");
+    open(copy.path())
+        .checkout()
+        .switch(&detach_to(fx.next), &mut count, &CancelToken::never())
+        .expect("full switch on the copy");
     count.seen
 }
 
@@ -352,7 +348,7 @@ fn cancelled_switch_rolls_back(shape: Shape) {
     for limit in cut_points(total) {
         let context = format!("{shape:?} cancel at {limit}/{total}");
         let before = repository_state(&fx.root);
-        let cancel = FlagCancel::new();
+        let cancel = CancelToken::new();
         let mut progress = CancelAfter {
             cancel: cancel.clone(),
             limit,
@@ -360,7 +356,9 @@ fn cancelled_switch_rolls_back(shape: Shape) {
             in_checkout: false,
             at_cancel: || {},
         };
-        let err = switch_repository(&open(&fx.root), &detach_to(fx.next), &mut progress, &cancel)
+        let err = open(&fx.root)
+            .checkout()
+            .switch(&detach_to(fx.next), &mut progress, &cancel)
             .expect_err(&context);
         assert!(matches!(err, Error::Cancelled), "{context}: {err:?}");
         assert!(progress.seen >= limit, "{context}: cancel never fired");
@@ -369,23 +367,24 @@ fn cancelled_switch_rolls_back(shape: Shape) {
             before,
             "{context}: HEAD or index moved"
         );
-        assert_main_layout(&fx.root, shape, &context);
-        assert_clean(&fx.root, &context);
+        assert_main_layout(fx.root, shape, &context);
+        assert_clean(fx.root, &context);
     }
 
-    let outcome = switch_repository(
-        &open(&fx.root),
-        &detach_to(fx.next),
-        &mut NullProgress,
-        &NeverCancel,
-    )
-    .expect("retry after cancelled switches");
+    let outcome = open(&fx.root)
+        .checkout()
+        .switch(
+            &detach_to(fx.next),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("retry after cancelled switches");
     assert_eq!(outcome.commit, fx.next);
     assert_eq!(
         git(&fx.root, &["rev-parse", "HEAD"]).trim(),
         fx.next.to_hex()
     );
-    assert_clean(&fx.root, &format!("{shape:?} retry"));
+    assert_clean(fx.root, &format!("{shape:?} retry"));
     assert_eq!(
         fs::read_to_string(fx.root.join("new/deep/n00.txt"))
             .ok()
@@ -420,7 +419,7 @@ fn cancelled_tree_to_tree_checkout_leaves_repository_unchanged() {
     for limit in [1, 10, 40, 120] {
         let context = format!("checkout_between_trees cancel at {limit}");
         let before = repository_state(&fx.root);
-        let cancel = FlagCancel::new();
+        let cancel = CancelToken::new();
         let mut progress = CancelAfter {
             cancel: cancel.clone(),
             limit,
@@ -428,18 +427,14 @@ fn cancelled_tree_to_tree_checkout_leaves_repository_unchanged() {
             in_checkout: false,
             at_cancel: || {},
         };
-        let err = checkout_between_trees_with_progress(
-            &open(&fx.root),
-            Some(&from),
-            &to,
-            &mut progress,
-            &cancel,
-        )
-        .expect_err(&context);
+        let err = open(&fx.root)
+            .checkout()
+            .checkout(Some(&from), &to, &mut progress, &cancel)
+            .expect_err(&context);
         assert!(matches!(err, Error::Cancelled), "{context}: {err:?}");
         assert_eq!(repository_state(&fx.root), before, "{context}");
-        assert_main_layout(&fx.root, Shape::Mixed, &context);
-        assert_clean(&fx.root, &context);
+        assert_main_layout(fx.root, Shape::Mixed, &context);
+        assert_clean(fx.root, &context);
     }
 }
 
@@ -459,7 +454,7 @@ fn cancelled_initial_checkout_leaves_work_tree_empty() {
         ],
     );
     let tree = tree_of(&target, "HEAD");
-    let cancel = FlagCancel::new();
+    let cancel = CancelToken::new();
     let mut progress = CancelAfter {
         cancel: cancel.clone(),
         limit: 30,
@@ -467,9 +462,10 @@ fn cancelled_initial_checkout_leaves_work_tree_empty() {
         in_checkout: false,
         at_cancel: || {},
     };
-    let err =
-        checkout_between_trees_with_progress(&open(&target), None, &tree, &mut progress, &cancel)
-            .expect_err("cancelled initial checkout");
+    let err = open(&target)
+        .checkout()
+        .checkout(None, &tree, &mut progress, &cancel)
+        .expect_err("cancelled initial checkout");
     assert!(matches!(err, Error::Cancelled), "{err:?}");
     let left: Vec<_> = fs::read_dir(&target)
         .expect("read clone")
@@ -479,14 +475,10 @@ fn cancelled_initial_checkout_leaves_work_tree_empty() {
     assert!(left.is_empty(), "initial checkout left {left:?}");
     assert!(!target.join(".git/index").exists(), "index written");
 
-    checkout_between_trees_with_progress(
-        &open(&target),
-        None,
-        &tree,
-        &mut NullProgress,
-        &NeverCancel,
-    )
-    .expect("retry");
+    open(&target)
+        .checkout()
+        .checkout(None, &tree, &mut NullProgress, &CancelToken::never())
+        .expect("retry");
     let status = git(&target, &["status", "--porcelain", "--untracked-files=all"]);
     assert!(status.is_empty(), "after retry:\n{status}");
 }
@@ -512,7 +504,7 @@ fn rollback_that_cannot_remove_a_created_file_reports_it() {
     let limit = full_switch_incs(&fx) - 2;
     let locked = fx.root.join("new/deep");
     let before = repository_state(&fx.root);
-    let cancel = FlagCancel::new();
+    let cancel = CancelToken::new();
     let mut progress = CancelAfter {
         cancel: cancel.clone(),
         limit,
@@ -524,12 +516,15 @@ fn rollback_that_cannot_remove_a_created_file_reports_it() {
             }
         },
     };
-    let err = switch_repository(&open(&fx.root), &detach_to(fx.next), &mut progress, &cancel)
+    let err = open(&fx.root)
+        .checkout()
+        .switch(&detach_to(fx.next), &mut progress, &cancel)
         .expect_err("cancelled switch");
     if locked.is_dir() {
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).expect("unlock");
     }
-    let Error::CheckoutRollbackIncomplete { source, unrestored } = &err else {
+    let Error::Worktree(WorktreeError::CheckoutRollbackIncomplete { source, unrestored }) = &err
+    else {
         panic!("expected an incomplete rollback, got {err:?}");
     };
     assert!(matches!(**source, Error::Cancelled), "{source:?}");
@@ -580,7 +575,7 @@ fn cancelled_hard_reset_keeps_dirty_and_index_only_files() {
     );
     let before = repository_state(&fx.root);
 
-    let cancel = FlagCancel::new();
+    let cancel = CancelToken::new();
     let mut progress = CancelAfter {
         cancel: cancel.clone(),
         limit: 5,
@@ -652,7 +647,7 @@ fn cancelled_cross_tree_hard_reset_keeps_dirty_tree_diff_paths() {
     for limit in [1, 5, 40, 100] {
         let context = format!("cross-tree reset cancel at {limit}");
         let before = repository_state(&fx.root);
-        let cancel = FlagCancel::new();
+        let cancel = CancelToken::new();
         let mut progress = CancelAfter {
             cancel: cancel.clone(),
             limit,
@@ -700,10 +695,10 @@ fn cancelled_cross_tree_hard_reset_keeps_dirty_tree_diff_paths() {
         &open(&fx.root),
         &ResetOptions::new(fx.next, ResetMode::Hard, signature, "reset"),
         &mut NullProgress,
-        &NeverCancel,
+        &CancelToken::never(),
     )
     .expect("uncancelled reset");
-    assert_clean(&fx.root, "after reset --hard next");
+    assert_clean(fx.root, "after reset --hard next");
     assert_eq!(
         git(&fx.root, &["rev-parse", "HEAD"]).trim(),
         fx.next.to_hex()
@@ -756,7 +751,7 @@ fn cancelled_hard_reset_keeps_same_size_edits_behind_racy_stat_matches() {
     for limit in [5, 100] {
         let context = format!("racy same-size reset cancel at {limit}");
         let before = repository_state(&fx.root);
-        let cancel = FlagCancel::new();
+        let cancel = CancelToken::new();
         let mut progress = CancelAfter {
             cancel: cancel.clone(),
             limit,
@@ -799,4 +794,126 @@ fn cancelled_hard_reset_keeps_same_size_edits_behind_racy_stat_matches() {
             "{context}"
         );
     }
+}
+
+fn wholesale_rename_fixture(file_count: usize) -> (tempfile::TempDir, PathBuf, ObjectId, ObjectId) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().to_path_buf();
+    git(&root, &["init", "-q", "-b", "main"]);
+    git(&root, &["config", "user.email", "t@example.com"]);
+    git(&root, &["config", "user.name", "Test"]);
+    for dir_name in ["olda", "oldb"] {
+        for i in 0..file_count {
+            write(
+                &root,
+                &format!("{dir_name}/f{i:03}.txt"),
+                &format!("{dir_name} {i}\n"),
+            );
+        }
+    }
+    git(&root, &["add", "-A"]);
+    git(&root, &["commit", "-q", "-m", "main"]);
+    let main_oid = ObjectId::from_hex(git(&root, &["rev-parse", "HEAD"]).trim()).expect("main");
+    git(&root, &["branch", "ren"]);
+    git(&root, &["checkout", "-q", "ren"]);
+    for dir_name in ["olda", "oldb"] {
+        for i in 0..file_count {
+            let path = root.join(format!("{dir_name}/f{i:03}.txt"));
+            fs::remove_file(&path).expect("remove");
+        }
+        fs::remove_dir(root.join(dir_name)).expect("rmdir");
+    }
+    for dir_name in ["newa", "newb"] {
+        for i in 0..file_count {
+            write(
+                &root,
+                &format!("{dir_name}/f{i:03}.txt"),
+                &format!("{dir_name} {i}\n"),
+            );
+        }
+    }
+    git(&root, &["add", "-A"]);
+    git(&root, &["commit", "-q", "-m", "ren"]);
+    let ren_oid =
+        ObjectId::from_hex(git(&root, &["rev-parse", "refs/heads/ren"]).trim()).expect("ren");
+    git(&root, &["checkout", "-q", "main"]);
+    assert!(root.join("olda").is_dir(), "fixture: main should have olda");
+    assert!(root.join("oldb").is_dir(), "fixture: main should have oldb");
+    (dir, root, main_oid, ren_oid)
+}
+
+#[test]
+fn preset_cancel_switch_returns_before_wholesale_delete() {
+    use std::time::{Duration, Instant};
+
+    let (_dir, root, _main, ren) = wholesale_rename_fixture(40);
+    let before = repository_state(&root);
+    let cancel = CancelToken::new();
+    cancel.cancel();
+    let start = Instant::now();
+    let err = open(&root)
+        .checkout()
+        .switch(
+            &SwitchOptions {
+                mode: SwitchMode::Detached {
+                    commit: ren,
+                    reflog_to_label: "ren".into(),
+                },
+                dry_run: false,
+                hooks: grit_lib::command_runner::hooks::PostOperationHooks::Skip,
+            },
+            &mut NullProgress,
+            &cancel,
+        )
+        .expect_err("pre-set cancel");
+    let elapsed = start.elapsed();
+    assert!(matches!(err, Error::Cancelled), "{err:?}");
+    assert!(
+        elapsed < Duration::from_millis(800),
+        "pre-set cancel took {elapsed:?}"
+    );
+    assert_eq!(repository_state(&root), before);
+    assert!(root.join("olda").is_dir(), "olda removed");
+    assert!(root.join("oldb").is_dir(), "oldb removed");
+    assert!(!root.join("newa").exists(), "partial apply");
+    assert!(!root.join(".git/index.lock").exists(), "index.lock left");
+}
+
+#[test]
+fn delayed_cancel_switch_during_wholesale_delete_leaves_some_dirs() {
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::Duration;
+
+    let (_dir, root, _main, ren) = wholesale_rename_fixture(120);
+    let before = repository_state(&root);
+    let cancel = Arc::new(CancelToken::new());
+    let flip = cancel.clone();
+    let sleeper = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(2));
+        flip.cancel();
+    });
+    let err = open(&root)
+        .checkout()
+        .switch(
+            &SwitchOptions {
+                mode: SwitchMode::Detached {
+                    commit: ren,
+                    reflog_to_label: "ren".into(),
+                },
+                dry_run: false,
+                hooks: grit_lib::command_runner::hooks::PostOperationHooks::Skip,
+            },
+            &mut NullProgress,
+            cancel.as_ref(),
+        )
+        .expect_err("delayed cancel");
+    sleeper.join().expect("join");
+    assert!(matches!(err, Error::Cancelled), "{err:?}");
+    assert_eq!(repository_state(&root), before);
+    assert!(
+        root.join("olda").is_dir() || root.join("oldb").is_dir(),
+        "both wholesale dirs removed before cancel"
+    );
+    assert!(!root.join(".git/index.lock").exists());
 }

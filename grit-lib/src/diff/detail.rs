@@ -9,7 +9,11 @@ use super::{count_line_changes_with_options, DiffEntry, DiffStatus};
 /// Does not allocate hunk structures (used for `--stat` / `--numstat`). Counts follow the
 /// same compacted line alignment as structured patches for the same [`DiffOptions`].
 #[must_use]
-pub fn line_change_counts(old_content: &str, new_content: &str, options: &DiffOptions) -> LineStat {
+pub(crate) fn line_stat_for_options(
+    old_content: &str,
+    new_content: &str,
+    options: &DiffOptions,
+) -> LineStat {
     let (insertions, deletions) =
         count_line_changes_with_options(old_content, new_content, options);
     LineStat {
@@ -66,7 +70,10 @@ impl DiffTotals {
     }
 }
 
-/// One changed file with optional patch body or line counts.
+/// One changed file with optional patch body or line counts (returned by [`Diff::files_for_entries`](crate::diff::Diff::files_for_entries)).
+///
+/// Re-exported at the crate root as [`ListedFileDiff`](crate::diff::ListedFileDiff). Use
+/// [`crate::diff::targets::FileDiff`] when you need structured hunks from [`Diff::files`](crate::diff::Diff::files).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileDiff {
     /// Display path (new side, or old for deletions).
@@ -81,6 +88,10 @@ pub struct FileDiff {
     pub new_mode: Option<String>,
     /// Either side looks like a binary blob.
     pub binary: bool,
+    /// Old-side byte length (for binary `--stat` and JSON).
+    pub old_size: u64,
+    /// New-side byte length (for binary `--stat` and JSON).
+    pub new_size: u64,
     /// Rename/copy similarity (0–100), when applicable.
     pub similarity: Option<u32>,
     /// Line counts when [`DiffDetail::Stat`] was requested.
@@ -185,7 +196,7 @@ mod tests {
         ];
         for old in texts {
             for new in texts {
-                let grit = line_change_counts(old, new, &options);
+                let grit = line_stat_for_options(old, new, &options);
                 let patch = patch_oracle_stat(old, new, &options);
                 assert_eq!(grit, patch, "patch oracle: old={old:?}, new={new:?}");
                 if !old.contains('\r') && !new.contains('\r') {
@@ -219,7 +230,7 @@ mod tests {
             let prefix = "unchanged\n".repeat(120);
             let old = format!("{prefix}{old}{prefix}");
             let new = format!("{prefix}{new}{prefix}");
-            let grit = line_change_counts(&old, &new, &options);
+            let grit = line_stat_for_options(&old, &new, &options);
             let patch = patch_oracle_stat(&old, &new, &options);
             assert_eq!(grit, patch, "random iteration {iteration}");
         }
@@ -232,7 +243,7 @@ mod tests {
         let suffix = "unchanged suffix\n".repeat(10_000);
         let old = format!("{prefix}old\n{suffix}");
         let new = format!("{prefix}new\nextra\n{suffix}");
-        let grit = line_change_counts(&old, &new, &options);
+        let grit = line_stat_for_options(&old, &new, &options);
         assert_eq!(
             grit,
             LineStat {
@@ -253,7 +264,7 @@ mod tests {
         let mut new = repeated;
         new.push_str("msgid \"added-a\"\nmsgstr \"one\"\n");
         new.push_str("msgid \"added-b\"\nmsgstr \"two\"\n");
-        let grit = line_change_counts(&old, &new, &options);
+        let grit = line_stat_for_options(&old, &new, &options);
         let git = git_numstat(&old, &new, DiffAlgorithm::Myers);
         assert_eq!(grit, git, "repetitive .po-like numstat vs git");
         assert_eq!(grit, patch_oracle_stat(&old, &new, &options));
@@ -279,7 +290,7 @@ mod tests {
             let options = DiffOptions::default()
                 .with_algorithm(algorithm)
                 .with_indent_heuristic(true);
-            let grit = line_change_counts(&old, &new, &options);
+            let grit = line_stat_for_options(&old, &new, &options);
             let git = git_numstat(&old, &new, algorithm);
             assert_eq!(grit, git, "{algorithm:?} numstat vs git");
         }

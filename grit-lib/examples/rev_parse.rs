@@ -6,15 +6,14 @@ use grit_lib::index::write_tree::write_tree_from_index;
 use grit_lib::objects::{serialize_commit, CommitData, ObjectKind};
 use grit_lib::refs;
 use grit_lib::repo::{InitOptions, Repository};
-use grit_lib::revwalk::rev_parse::resolve_revision;
 
 fn main() -> grit_lib::error::Result<()> {
     let root = tempfile::tempdir()?;
-    let repo = Repository::init(
+    let (repo, _) = Repository::init(
         root.path(),
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
-            .with_ref_storage(grit_lib::RefStorageFormat::Files),
+            .with_ref_storage(grit_lib::refs::ref_storage::RefStorageFormat::Files),
     )?;
 
     use grit_lib::index::{Index, IndexEntry, MODE_REGULAR};
@@ -39,8 +38,11 @@ fn main() -> grit_lib::error::Result<()> {
     };
     let mut index = Index::new();
     index.add_or_replace(entry);
-    repo.index_handle().write(&mut index)?;
-    let index = repo.index_handle().load()?;
+    repo.index()
+        .write(&mut index, &grit_lib::index::IndexWriteOptions::default())?;
+    let index = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())?;
     let tree_oid = write_tree_from_index(repo.odb(), &index, "")?;
     let commit = CommitData {
         tree: tree_oid,
@@ -57,10 +59,14 @@ fn main() -> grit_lib::error::Result<()> {
     let oid = repo
         .odb()
         .write(ObjectKind::Commit, &serialize_commit(&commit))?;
-    refs::write_ref(repo.git_dir(), "refs/heads/main", &oid)?;
+    repo.references().update("refs/heads/main", &oid)?;
 
-    let head = resolve_revision(&repo, "HEAD")?;
-    let full = resolve_revision(&repo, &oid.to_hex())?;
+    let head = repo
+        .revwalk()
+        .resolve("HEAD", &grit_lib::revwalk::ResolveOptions::default())?;
+    let full = repo
+        .revwalk()
+        .resolve(&oid.to_hex(), &grit_lib::revwalk::ResolveOptions::default())?;
     println!("HEAD resolves to {head}");
     println!("full hex resolves to {full}");
     assert_eq!(head, full);

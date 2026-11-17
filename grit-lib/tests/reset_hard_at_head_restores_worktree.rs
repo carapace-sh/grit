@@ -5,22 +5,25 @@ use crate::support;
 
 use grit_lib::index::write_tree::{write_tree_update_index, WriteTreeFlags};
 use grit_lib::objects::{serialize_commit, CommitData, ObjectKind};
-use grit_lib::porcelain::reset::{reset_to_commit, ResetMode, ResetOptions};
-use grit_lib::refs;
+use grit_lib::porcelain::reset::{ResetMode, ResetOptions};
+use grit_lib::progress::{CancelToken, NullProgress};
 use grit_lib::repo::{InitOptions, Repository};
 use grit_test_support::git;
 use tempfile::TempDir;
 
 fn init_repo() -> (TempDir, Repository) {
     let dir = TempDir::new().expect("tempdir");
-    let repo = Repository::init(dir.path(), &InitOptions::default()).expect("init");
+    let (repo, _) = Repository::init(dir.path(), &InitOptions::default()).expect("init");
     (dir, repo)
 }
 
 fn commit_file(repo: &Repository, path: &str, contents: &str) -> grit_lib::objects::ObjectId {
     let work_tree = repo.work_tree().expect("wt");
     std::fs::write(work_tree.join(path), contents).expect("write");
-    let mut index = repo.index_handle().load().expect("index");
+    let mut index = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("index");
     let oid = repo
         .odb()
         .write(ObjectKind::Blob, contents.as_bytes())
@@ -36,7 +39,9 @@ fn commit_file(repo: &Repository, path: &str, contents: &str) -> grit_lib::objec
     index.sort();
     let tree = write_tree_update_index(repo.odb(), &mut index, "", WriteTreeFlags::silent())
         .expect("tree");
-    repo.index_handle().write(&mut index).expect("write index");
+    repo.index()
+        .write(&mut index, &grit_lib::index::IndexWriteOptions::default())
+        .expect("write index");
     let commit = CommitData {
         tree,
         parents: vec![],
@@ -53,8 +58,10 @@ fn commit_file(repo: &Repository, path: &str, contents: &str) -> grit_lib::objec
         .odb()
         .write(ObjectKind::Commit, &serialize_commit(&commit))
         .expect("commit");
-    refs::write_ref(repo.git_dir(), "refs/heads/main", &co).expect("branch");
-    refs::write_symbolic_ref(repo.git_dir(), "HEAD", "refs/heads/main").expect("symhead");
+    grit_test_support::refs::set_ref(&repo, "refs/heads/main", &co).expect("branch");
+    repo.references()
+        .update_symbolic("HEAD", "refs/heads/main")
+        .expect("symhead");
     co
 }
 
@@ -68,13 +75,13 @@ fn reset_opts(target: grit_lib::objects::ObjectId, mode: ResetMode) -> ResetOpti
 }
 
 fn hard_reset_at_head(repo: &Repository, head: grit_lib::objects::ObjectId) {
-    reset_to_commit(
-        repo,
-        &reset_opts(head, ResetMode::Hard),
-        &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("hard reset at HEAD");
+    repo.checkout()
+        .reset(
+            &reset_opts(head, ResetMode::Hard),
+            &mut grit_lib::progress::NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("hard reset at HEAD");
 }
 
 #[test]
@@ -137,7 +144,10 @@ fn hard_reset_at_head_restores_chmod_only_change() {
     perms.set_mode(0o100755);
     std::fs::set_permissions(&path, perms).expect("chmod exec");
     let head = {
-        let mut index = repo.index_handle().load().expect("index");
+        let mut index = repo
+            .index()
+            .load(&grit_lib::index::IndexLoadOptions::default())
+            .expect("index");
         let oid = repo
             .odb()
             .write(ObjectKind::Blob, b"#!/bin/sh\n")
@@ -153,7 +163,9 @@ fn hard_reset_at_head_restores_chmod_only_change() {
         index.sort();
         let tree = write_tree_update_index(repo.odb(), &mut index, "", WriteTreeFlags::silent())
             .expect("tree");
-        repo.index_handle().write(&mut index).expect("write index");
+        repo.index()
+            .write(&mut index, &grit_lib::index::IndexWriteOptions::default())
+            .expect("write index");
         let commit = CommitData {
             tree,
             parents: vec![],
@@ -170,8 +182,10 @@ fn hard_reset_at_head_restores_chmod_only_change() {
             .write(ObjectKind::Commit, &serialize_commit(&commit))
             .expect("commit")
     };
-    refs::write_ref(repo.git_dir(), "refs/heads/main", &head).expect("branch");
-    refs::write_symbolic_ref(repo.git_dir(), "HEAD", "refs/heads/main").expect("symhead");
+    grit_test_support::refs::set_ref(&repo, "refs/heads/main", &head).expect("branch");
+    repo.references()
+        .update_symbolic("HEAD", "refs/heads/main")
+        .expect("symhead");
     let mut perms = std::fs::metadata(&path).expect("meta").permissions();
     perms.set_mode(0o100644);
     std::fs::set_permissions(&path, perms).expect("chmod");
@@ -184,5 +198,85 @@ fn hard_reset_at_head_restores_chmod_only_change() {
     assert!(
         porcelain.trim().is_empty(),
         "repo must be clean: {porcelain}"
+    );
+}
+
+#[test]
+fn reset_hard_preserves_nested_untracked_under_coalesced_deleted_directory() {
+    let dir = TempDir::new().expect("tempdir");
+    git(dir.path(), &["init", "-b", "main"]);
+    git(dir.path(), &["config", "user.email", "t@t.com"]);
+    git(dir.path(), &["config", "user.name", "T"]);
+    std::fs::create_dir_all(dir.path().join("tracked-dir")).expect("mkdir");
+    std::fs::write(dir.path().join("tracked-dir/tracked.txt"), b"tracked\n").expect("write");
+    git(dir.path(), &["add", "tracked-dir/tracked.txt"]);
+    git(dir.path(), &["commit", "-m", "add dir"]);
+    git(dir.path(), &["rm", "-r", "tracked-dir"]);
+    git(dir.path(), &["commit", "-m", "drop dir"]);
+    let drop_oid_hex = git(dir.path(), &["rev-parse", "HEAD"]).trim().to_owned();
+    git(dir.path(), &["reset", "--hard", "HEAD~1"]);
+    std::fs::create_dir_all(dir.path().join("tracked-dir/nested")).expect("nested");
+    std::fs::write(
+        dir.path().join("tracked-dir/nested/untracked.txt"),
+        b"precious\n",
+    )
+    .expect("untracked");
+
+    git(dir.path(), &["reset", "--hard", &drop_oid_hex]);
+    assert!(
+        !dir.path().join("tracked-dir/tracked.txt").exists(),
+        "git must remove tracked.txt on hard reset to deletion commit"
+    );
+    assert!(
+        std::fs::read(dir.path().join("tracked-dir/nested/untracked.txt")).is_ok(),
+        "system git must keep nested untracked under coalesced-deleted directory"
+    );
+    let git_status_baseline = git(dir.path(), &["status", "--porcelain"]);
+    assert!(
+        git_status_baseline.contains("tracked-dir/nested/untracked.txt")
+            || git_status_baseline.contains("?? tracked-dir/"),
+        "git should report preserved untracked: {git_status_baseline}"
+    );
+
+    git(dir.path(), &["reset", "--hard", "HEAD~1"]);
+    std::fs::create_dir_all(dir.path().join("tracked-dir/nested")).expect("nested again");
+    std::fs::write(
+        dir.path().join("tracked-dir/nested/untracked.txt"),
+        b"precious\n",
+    )
+    .expect("untracked again");
+
+    let repo = crate::support::open_grit_repo(dir.path());
+    let drop_oid = grit_lib::objects::ObjectId::from_hex(&drop_oid_hex).expect("drop oid");
+    repo.checkout()
+        .reset(
+            &ResetOptions::new(
+                drop_oid,
+                ResetMode::Hard,
+                support::parse_reflog_signature("T <t@t.com> 0 +0000"),
+                "reset",
+            ),
+            &mut grit_lib::progress::NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("grit hard reset");
+    assert!(
+        !dir.path().join("tracked-dir/tracked.txt").exists(),
+        "grit must remove tracked.txt like git"
+    );
+    assert!(
+        std::fs::read(dir.path().join("tracked-dir/nested/untracked.txt")).is_ok(),
+        "grit must preserve nested untracked like git"
+    );
+    let porcelain = git(dir.path(), &["status", "--porcelain"]);
+    assert_eq!(
+        porcelain.trim(),
+        git_status_baseline.trim(),
+        "grit reset must match git status after the same hard reset"
+    );
+    assert!(
+        porcelain.contains("tracked-dir/nested/untracked.txt")
+            || porcelain.contains("?? tracked-dir/"),
+        "status after grit reset must report untracked: {porcelain}"
     );
 }

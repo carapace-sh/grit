@@ -13,12 +13,10 @@ use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::Path;
 
 use grit_lib::config::environment::RepositoryOptions;
-use grit_lib::diff::{
-    diff_index_to_tree, diff_index_to_worktree_with_options, diff_tree_to_worktree, diff_trees,
-    format_raw, DiffEntry, DiffIndexToWorktreeOptions, DiffOptions, DiffStatus, DiffTarget,
-};
+use grit_lib::diff::{format_raw, DiffEntry, DiffOptions, DiffStatus, DiffTarget, TreeDiffOptions};
 use grit_lib::objects::ObjectId;
 use grit_lib::repo::Repository;
+use grit_lib::worktree::pathspec::{Pathspec, PathspecGlobalFlags};
 use grit_test_support::git;
 use tempfile::TempDir;
 
@@ -67,7 +65,11 @@ fn grit_raw(repo: &Repository, target: &DiffTarget) -> Vec<String> {
     let mut opts = DiffOptions::default();
     opts.word_level_inline = false;
     repo.diff()
-        .files(target, &[], &opts)
+        .files(
+            target,
+            &Pathspec::entire_tree(PathspecGlobalFlags::default()),
+            &opts,
+        )
         .expect("files")
         .into_iter()
         .map(|f| {
@@ -136,33 +138,31 @@ fn assert_all_modes(dir: &Path, path: &str, expected: DiffStatus) {
         "work tree vs HEAD"
     );
 
-    let mut index = repo.index_handle().load().expect("index");
-    let (entries, _) = diff_index_to_worktree_with_options(
-        repo.odb(),
-        &mut index,
-        dir,
-        DiffIndexToWorktreeOptions {
-            repository_git_dir: Some(repo.git_dir().to_path_buf()),
-            ..DiffIndexToWorktreeOptions::default()
-        },
-    )
-    .expect("index vs worktree");
+    let mut index = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("index");
+    let (entries, _) = repo
+        .diff()
+        .index_to_worktree(&mut index, &TreeDiffOptions::default())
+        .map(|r| (r.entries, r.index_stat_refreshed))
+        .expect("index vs worktree");
     assert_eq!(statuses(&entries), single(path, expected));
-    let entries = diff_index_to_worktree_with_options(
-        repo.odb(),
-        &mut index,
-        dir,
-        DiffIndexToWorktreeOptions {
-            repository_git_dir: Some(repo.git_dir().to_path_buf()),
-            for_status: true,
-            ..DiffIndexToWorktreeOptions::default()
-        },
-    )
-    .expect("index vs worktree for status")
-    .0;
+    let entries = repo
+        .diff()
+        .index_to_worktree(
+            &mut index,
+            &TreeDiffOptions::default().with_for_status(true),
+        )
+        .map(|r| (r.entries, r.index_stat_refreshed))
+        .expect("index vs worktree for status")
+        .0;
     assert_eq!(statuses(&entries), single(path, expected));
-    let entries =
-        diff_tree_to_worktree(repo.odb(), Some(&base_tree), dir, &index).expect("tree vs wt");
+    let entries = repo
+        .diff()
+        .tree_to_worktree(Some(&base_tree), &index, &TreeDiffOptions::default())
+        .map(|r| r.entries)
+        .expect("tree vs wt");
     assert_eq!(statuses(&entries), single(path, expected));
 
     git(dir, &["add", "-A"]);
@@ -176,11 +176,21 @@ fn assert_all_modes(dir: &Path, path: &str, expected: DiffStatus) {
         without_worktree_oid(git_raw(dir, &["HEAD"])),
         "staged: work tree vs HEAD"
     );
-    let index = repo.index_handle().load().expect("index");
-    let entries = diff_index_to_tree(repo.odb(), &index, Some(&base_tree), false).expect("i vs t");
+    let index = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("index");
+    let entries = repo
+        .diff()
+        .index_to_tree(&index, Some(&base_tree), &TreeDiffOptions::default())
+        .map(|r| r.entries)
+        .expect("i vs t");
     assert_eq!(statuses(&entries), single(path, expected));
-    let entries =
-        diff_tree_to_worktree(repo.odb(), Some(&base_tree), dir, &index).expect("tree vs wt");
+    let entries = repo
+        .diff()
+        .tree_to_worktree(Some(&base_tree), &index, &TreeDiffOptions::default())
+        .map(|r| r.entries)
+        .expect("tree vs wt");
     assert_eq!(statuses(&entries), single(path, expected));
 
     let tip = commit_all(dir, "change");
@@ -199,7 +209,15 @@ fn assert_all_modes(dir: &Path, path: &str, expected: DiffStatus) {
         "same raw line for staged and committed change"
     );
     let tip_tree = head_tree(dir, "HEAD");
-    let entries = diff_trees(repo.odb(), Some(&base_tree), Some(&tip_tree), "").expect("trees");
+    let entries = repo
+        .diff()
+        .tree_to_tree(
+            Some(&base_tree),
+            Some(&tip_tree),
+            &TreeDiffOptions::default(),
+        )
+        .map(|r| r.entries)
+        .expect("trees");
     assert_eq!(statuses(&entries), single(path, expected));
 }
 
@@ -288,10 +306,16 @@ fn assert_mixed_state(dir: &Path, path: &str, expected_vs_head: DiffStatus) {
         without_worktree_oid(git_raw(dir, &["HEAD"])),
         "work tree vs HEAD"
     );
-    let index = repo.index_handle().load().expect("index");
+    let index = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("index");
     let base_tree = head_tree(dir, "HEAD");
-    let entries =
-        diff_tree_to_worktree(repo.odb(), Some(&base_tree), dir, &index).expect("tree vs wt");
+    let entries = repo
+        .diff()
+        .tree_to_worktree(Some(&base_tree), &index, &TreeDiffOptions::default())
+        .map(|r| r.entries)
+        .expect("tree vs wt");
     assert_eq!(statuses(&entries), single(path, expected_vs_head));
     assert_eq!(entries[0].old_mode, entries[0].new_mode, "{entries:?}");
 

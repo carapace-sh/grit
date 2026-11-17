@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::diff::stat_matches;
-use grit_lib::porcelain::status::{status, StatusOptions};
-use grit_lib::progress::NeverCancel;
+use grit_lib::porcelain::status::StatusOptions;
+use grit_lib::progress::CancelToken;
 use grit_lib::progress::NullProgress;
 use grit_lib::repo::Repository;
 use grit_test_support::git;
@@ -72,19 +72,20 @@ fn git_clone_index_stats_match_worktree_with_autocrlf() {
         &RepositoryOptions::empty().with_work_tree(&clone_root),
     )
     .expect("open grit repo");
-    let index_path = grit_repo.index_handle().path();
+    let index_path = grit_repo.index().path();
     let index_mtime_before = fs::metadata(&index_path)
         .expect("index metadata")
         .modified()
         .expect("index mtime");
 
-    let model = status(
-        &grit_repo,
-        &StatusOptions::default(),
-        &mut NullProgress,
-        &NeverCancel,
-    )
-    .expect("first status after git clone");
+    let model = grit_repo
+        .status()
+        .run(
+            &StatusOptions::default(),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("first status after git clone");
     assert!(
         model.unstaged.is_empty() && model.untracked.is_empty(),
         "fresh git clone must be clean in grit status"
@@ -138,13 +139,14 @@ fn first_status_after_git_clone_is_bounded_with_autocrlf() {
     .expect("open grit repo");
 
     let start = Instant::now();
-    let model = status(
-        &grit_repo,
-        &StatusOptions::default(),
-        &mut NullProgress,
-        &NeverCancel,
-    )
-    .expect("first status after git clone");
+    let model = grit_repo
+        .status()
+        .run(
+            &StatusOptions::default(),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("first status after git clone");
     let elapsed = start.elapsed();
     assert!(model.unstaged.is_empty() && model.untracked.is_empty());
 

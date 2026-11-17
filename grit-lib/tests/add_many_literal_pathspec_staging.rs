@@ -2,7 +2,7 @@
 
 use grit_lib::index::Index;
 use grit_lib::objects::ObjectId;
-use grit_lib::porcelain::add::{stage, StageMode, StageOptions};
+use grit_lib::porcelain::add::{StageMode, StageOptions};
 use grit_lib::prelude::RepositoryOptions;
 use grit_lib::progress::NullProgress;
 use grit_lib::repo::Repository;
@@ -63,7 +63,7 @@ fn stage_hundred_literal_paths_only_updates_those_files() {
         !subset.contains(&untouched.to_owned()),
         "fixture must include a dirty path outside the pathspec list"
     );
-    let index_path = repo.index_handle().path();
+    let index_path = repo.index().path();
     let oid_before = index_oid(&Index::load(&index_path).expect("load index"), untouched);
 
     let opts = StageOptions {
@@ -72,13 +72,14 @@ fn stage_hundred_literal_paths_only_updates_those_files() {
         mode: StageMode::All,
         ..StageOptions::default()
     };
-    let outcome = stage(
-        &repo,
-        &opts,
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("stage subset");
+    let outcome = repo
+        .index()
+        .stage(
+            &opts,
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("stage subset");
     assert_eq!(
         outcome.modified.len(),
         TOUCH,

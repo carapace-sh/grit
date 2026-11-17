@@ -3,12 +3,13 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use crate::midx_support;
+use grit_lib::error::ObjectError;
 
 use std::fs;
 
 use grit_lib::objects::midx::{try_read_object_via_midx, verify_midx, WriteMultiPackIndexOptions};
-use grit_lib::objects::pack::clear_pack_cache;
 use grit_lib::objects::ObjectId;
+use grit_lib::test_support::objects_pack::clear_pack_cache;
 use grit_test_support::objects::HashAlgo;
 
 use grit_test_support::objects::RepoFixture;
@@ -153,9 +154,9 @@ fn verify_hash_version_mismatch() {
     });
     assert_verify_reports(&objects, "hash version");
     match try_read_object_via_midx(&objects, &oid) {
-        Err(grit_lib::error::Error::Midx(grit_lib::error::MidxError::HashVersionMismatch {
-            ..
-        })) => {}
+        Err(grit_lib::error::Error::Object(ObjectError::Midx(
+            grit_lib::error::MidxError::HashVersionMismatch { .. },
+        ))) => {}
         other => panic!("expected hash-version MIDX error, got {other:?}"),
     }
     assert_read_fallback_via_odb(&repo, &objects, &oid);
@@ -307,7 +308,7 @@ fn verify_v1_pack_names_out_of_order() {
         return;
     };
     let pack_dir = objects.join("pack");
-    grit_lib::objects::midx::write_multi_pack_index_with_options(
+    grit_lib::objects::midx::write_multi_pack_index(
         &pack_dir,
         &WriteMultiPackIndexOptions {
             version: Some(1),
@@ -423,7 +424,7 @@ fn read_with_corrupt_pack_index_still_resolves_other_objects() {
         fs::write(&victim, &idx_bytes).expect("write corrupt idx");
     }
     grit_lib::objects::midx::evict_midx_read_cache_for_pack_dir(&pack_dir);
-    grit_lib::objects::pack::clear_pack_cache();
+    grit_lib::test_support::objects_pack::clear_pack_cache();
     let _ = try_read_object_via_midx(&objects, &oid);
     assert_read_fallback_via_odb(&repo, &objects, &oid);
 }
@@ -553,7 +554,7 @@ fn load_reuse_tables_rejects_bad_ridx_entry() {
         return;
     };
     let pack_dir = objects.join("pack");
-    grit_lib::objects::midx::write_multi_pack_index_with_options(
+    grit_lib::objects::midx::write_multi_pack_index(
         &pack_dir,
         &WriteMultiPackIndexOptions {
             write_bitmap: true,
@@ -597,6 +598,6 @@ fn pack_names_reject_out_of_bounds_pnam_without_panicking() {
     clear_pack_cache();
     assert!(matches!(
         read_midx_pack_idx_names(&objects),
-        Err(grit_lib::error::Error::CorruptObject(_))
+        Err(grit_lib::error::Error::Object(ObjectError::Corrupt { .. }))
     ));
 }

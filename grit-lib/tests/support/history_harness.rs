@@ -14,9 +14,9 @@ use grit_lib::error::Result;
 use grit_lib::objects::ObjectId;
 use grit_lib::repo::Repository;
 use grit_lib::revwalk::rev_list::{
-    rev_list, split_revision_token, ObjectFilter, OrderingMode, RevListOptions,
+    split_revision_token, ObjectFilter, OrderingMode, RevListOptions,
 };
-use grit_lib::revwalk::{parse_rev_walk_tokens, RevWalkParsedSpecs};
+use grit_lib::revwalk::RevWalkParsedSpecs;
 
 use super::refs_harness::{git as refs_git, null_device_for_tests, AUTHOR_EMAIL, AUTHOR_NAME};
 
@@ -563,7 +563,10 @@ pub fn grit_rev_list_commits_in_repo(
     negative: &[String],
     options: &RevListOptions,
 ) -> Result<Vec<ObjectId>> {
-    Ok(rev_list(repo, positive, negative, options)?.commits)
+    Ok(repo
+        .revwalk()
+        .rev_list(positive, negative, options)?
+        .commits)
 }
 
 /// Assert grit commit order matches `git rev-list` with the same argv tail (after `rev-list`).
@@ -608,7 +611,10 @@ pub fn grit_rev_list_object_set(
         filter,
         ..RevListOptions::default()
     };
-    let result = rev_list(&repo, positive, negative, &opts).expect("rev-list objects");
+    let result = repo
+        .revwalk()
+        .rev_list(positive, negative, &opts)
+        .expect("rev-list objects");
     let mut set = HashSet::new();
     for oid in result.commits {
         set.insert(oid);
@@ -774,6 +780,65 @@ pub fn commit_labeled_with_dates(
     commit.parse().expect("commit oid")
 }
 
+/// Like [`commit_labeled_with_dates`], but uses `message` as the commit message body.
+pub fn commit_labeled_with_dates_and_message(
+    worktree: &Path,
+    label: &str,
+    parents: &[ObjectId],
+    author_date: &str,
+    committer_date: &str,
+    message: &str,
+) -> ObjectId {
+    let tree = git(worktree, &["mktree"]).trim().to_string();
+    let mut args: Vec<String> = vec![
+        "commit-tree".to_owned(),
+        tree,
+        "-m".to_owned(),
+        message.to_owned(),
+    ];
+    for parent in parents {
+        args.push("-p".to_owned());
+        args.push(parent.to_hex());
+    }
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let out = Command::new("git")
+        .current_dir(worktree)
+        .args(&arg_refs)
+        .env("GIT_AUTHOR_NAME", AUTHOR_NAME)
+        .env("GIT_AUTHOR_EMAIL", AUTHOR_EMAIL)
+        .env("GIT_COMMITTER_NAME", AUTHOR_NAME)
+        .env("GIT_COMMITTER_EMAIL", AUTHOR_EMAIL)
+        .env(
+            "GIT_AUTHOR_DATE",
+            if author_date.starts_with('@') {
+                author_date.to_owned()
+            } else {
+                format!("@{author_date}")
+            },
+        )
+        .env(
+            "GIT_COMMITTER_DATE",
+            if committer_date.starts_with('@') {
+                committer_date.to_owned()
+            } else {
+                format!("@{committer_date}")
+            },
+        )
+        .env("GIT_CONFIG_GLOBAL", null_device_for_tests())
+        .env("GIT_CONFIG_SYSTEM", null_device_for_tests())
+        .output()
+        .expect("spawn git commit-tree");
+    assert!(
+        out.status.success(),
+        "commit-tree: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let commit = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let refname = format!("refs/history/{label}");
+    git(worktree, &["update-ref", &refname, &commit]);
+    commit.parse().expect("commit oid")
+}
+
 /// Split CLI revision tokens into positive/negative specs (`A..B`, `^rev`, plain tips).
 #[must_use]
 pub fn expand_revision_tokens(tokens: &[&str]) -> (Vec<String>, Vec<String>) {
@@ -798,7 +863,7 @@ pub fn expand_token_for_rev_list(
         negative,
         symmetric_left,
         symmetric_right,
-    } = parse_rev_walk_tokens(repo, &[token])?;
+    } = repo.revwalk().parse_tokens(&[token])?;
     opts.symmetric_left = symmetric_left;
     opts.symmetric_right = symmetric_right;
     Ok((positive, negative))

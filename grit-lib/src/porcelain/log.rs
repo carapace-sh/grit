@@ -190,34 +190,54 @@ fn prepend_decoration(items: &mut Vec<DecorationItem>, item: DecorationItem) {
     items.insert(0, item);
 }
 
-/// Collect ref decorations from the repository (heads, tags, remotes, stash, replace refs, HEAD).
+/// Which refs [`RevWalk::decorations`](crate::revwalk::RevWalk::decorations) collects and how
+/// it names them.
 ///
-/// Order matches Git's `refs_for_each_ref` walk: each ref is **prepended** in ascending ref-name
-/// order, so the final per-commit list matches upstream (e.g. `tag: A1` before `other/main` before
-/// `other/HEAD`).
-pub fn collect_decorations(repo: &Repository, full: bool) -> Result<DecorationMap> {
-    collect_decorations_inner(repo, full, false, &DecorationFilter::default())
+/// The default decorates every commit with short ref names under Git's default ref filter.
+#[derive(Clone, Default)]
+#[non_exhaustive]
+pub struct DecorationOptions {
+    /// Full ref names (`refs/heads/main`, `--decorate=full`) instead of short ones.
+    pub full_ref_names: bool,
+    /// Drop the default ref filter so refs that are normally hidden (such as `refs/notes/*`)
+    /// also decorate (`--clear-decorations`).
+    pub clear_decorations: bool,
+    /// `--decorate-refs` / `--decorate-refs-exclude` / `log.excludeDecoration` patterns.
+    pub filter: DecorationFilter,
+    /// Only decorate these commits. Refs whose `packed-refs` peel line names one of them
+    /// need no object reads, and refs pointing elsewhere are skipped instead of peeled, so a
+    /// command that shows a few commits does not pay for every tag in the repository.
+    pub commits: Option<Vec<ObjectId>>,
 }
 
-/// Load commit metadata for `oids`, attaching decorations from a pre-built [`DecorationMap`].
-///
-/// Reads each commit object at most once. Call [`collect_decorations`] once per command
-/// and reuse the map across all rows.
-///
-/// # Errors
-///
-/// Returns ODB and commit-parse errors when an oid is missing or corrupt.
-pub fn load_commits_with_decorations(
-    repo: &Repository,
-    oids: &[ObjectId],
-    decorations: &DecorationMap,
-) -> Result<Vec<LoadedCommit>> {
-    load_commits_with_decorations_reusing(
-        repo,
-        oids,
-        decorations,
-        &mut OidHashMap::<CommitData>::default(),
-    )
+impl DecorationOptions {
+    /// Sets [`full_ref_names`](Self::full_ref_names).
+    #[must_use]
+    pub fn with_full_ref_names(mut self, full_ref_names: bool) -> Self {
+        self.full_ref_names = full_ref_names;
+        self
+    }
+
+    /// Sets [`clear_decorations`](Self::clear_decorations).
+    #[must_use]
+    pub fn with_clear_decorations(mut self, clear_decorations: bool) -> Self {
+        self.clear_decorations = clear_decorations;
+        self
+    }
+
+    /// Sets [`filter`](Self::filter).
+    #[must_use]
+    pub fn with_filter(mut self, filter: DecorationFilter) -> Self {
+        self.filter = filter;
+        self
+    }
+
+    /// Sets [`commits`](Self::commits).
+    #[must_use]
+    pub fn with_commits(mut self, commits: Option<Vec<ObjectId>>) -> Self {
+        self.commits = commits;
+        self
+    }
 }
 
 /// Commits a caller already holds, handed out once each so loaders skip the object read.
@@ -245,6 +265,25 @@ impl CommitReuse for OidHashMap<CommitData> {
     fn take_commit(&mut self, oid: &ObjectId) -> Option<Result<CommitData>> {
         self.remove(oid).map(Ok)
     }
+
+    fn cached_subject_line(&self, oid: &ObjectId) -> Option<Result<String>> {
+        self.get(oid).map(|data| {
+            Ok(data
+                .message
+                .lines()
+                .find(|line| !line.trim().is_empty())
+                .map(str::trim)
+                .unwrap_or("(no subject)")
+                .to_owned())
+        })
+    }
+}
+
+/// Holds nothing: every commit is read from the object database.
+impl CommitReuse for () {
+    fn take_commit(&mut self, _oid: &ObjectId) -> Option<Result<CommitData>> {
+        None
+    }
 }
 
 impl<T: CommitReuse + ?Sized> CommitReuse for &mut T {
@@ -253,33 +292,18 @@ impl<T: CommitReuse + ?Sized> CommitReuse for &mut T {
     }
 }
 
-/// Like [`load_commits_with_decorations`], but takes commits the caller already holds (for
-/// example [`crate::revwalk::rev_list::RevListResult::commit_data`] or
-/// [`crate::revwalk::log_walk::LogWalkPage::commit_data`]) out of `parsed` instead of reading
-/// them again. Commits missing from `parsed` are read from the object database.
-///
-/// # Parameters
-///
-/// - `repo` - repository to read commits missing from `parsed` from.
-/// - `oids` - commits to load, in output order.
-/// - `decorations` - ref labels from [`collect_decorations`].
-/// - `parsed` - commits by id; entries for `oids` are moved out.
-///
-/// # Errors
-///
-/// Returns ODB and commit-parse errors when an oid is missing or corrupt.
-pub fn load_commits_with_decorations_reusing(
+/// [`RevWalk::load_commits`](crate::revwalk::RevWalk::load_commits).
+pub(crate) fn load_commits(
     repo: &Repository,
     oids: &[ObjectId],
     decorations: &DecorationMap,
     parsed: &mut impl CommitReuse,
 ) -> Result<Vec<LoadedCommit>> {
-    let odb = repo.odb();
     let mut out = Vec::with_capacity(oids.len());
     for oid in oids {
         let data = match parsed.take_commit(oid) {
             Some(data) => data?,
-            None => odb.read_commit(oid)?,
+            None => repo.read_commit_with_replace(oid)?,
         };
         let resolved = resolved_change_id(oid, &data);
         let hex = oid.to_hex();
@@ -309,50 +333,25 @@ pub fn load_commits_with_decorations_reusing(
     Ok(out)
 }
 
-/// Like [`collect_decorations`], but only for the given commits.
-///
-/// The result equals [`collect_decorations`] restricted to the keys of `commits`. Refs
-/// whose `packed-refs` peel line names one of them need no object reads, and refs
-/// pointing elsewhere are skipped instead of peeled, so a command that shows a few
-/// commits does not pay for every tag in the repository.
-///
-/// # Parameters
-///
-/// - `full`: show full ref names (`refs/heads/main`) instead of short ones.
-/// - `commits`: commit ids whose decorations are wanted.
-///
-/// # Errors
-///
-/// Returns ref listing, `HEAD` resolution, and object read errors, like
-/// [`collect_decorations`].
-pub fn collect_decorations_for_commits(
+/// [`RevWalk::decorations`](crate::revwalk::RevWalk::decorations).
+pub(crate) fn collect_decorations(
     repo: &Repository,
-    full: bool,
-    commits: &[ObjectId],
+    options: &DecorationOptions,
 ) -> Result<DecorationMap> {
-    let targets: OidHashSet = commits.iter().copied().collect();
+    let targets: Option<OidHashSet> = options
+        .commits
+        .as_ref()
+        .map(|commits| commits.iter().copied().collect());
     collect_decorations_impl(
         repo,
-        full,
-        false,
-        &DecorationFilter::default(),
-        Some(&targets),
+        options.full_ref_names,
+        options.clear_decorations,
+        &options.filter,
+        targets.as_ref(),
     )
 }
 
-/// Like [`collect_decorations`], but `clear_decorations` removes the default ref
-/// filter so refs that are normally hidden (e.g. `refs/notes/*`) also get
-/// decorated (matches `git log --clear-decorations`).
-pub fn collect_decorations_inner(
-    repo: &Repository,
-    full: bool,
-    clear_decorations: bool,
-    filter: &DecorationFilter,
-) -> Result<DecorationMap> {
-    collect_decorations_impl(repo, full, clear_decorations, filter, None)
-}
-
-/// Shared body of the decoration collectors; `targets` limits the result to those commits.
+/// Shared body of [`collect_decorations`]; `targets` limits the result to those commits.
 fn collect_decorations_impl(
     repo: &Repository,
     full: bool,
@@ -366,8 +365,9 @@ fn collect_decorations_impl(
     let head = resolve_head_for_repository(repo)?;
     let hide_remote_update_noise = repo
         .config()
+        .snapshot()
         .unwrap_or_else(|_| std::sync::Arc::new(ConfigSet::new()))
-        .get("grit.submoduleUpdateRemoteDecorations")
+        .value("grit.submoduleUpdateRemoteDecorations")
         .as_deref()
         .and_then(|value| parse_bool(value).ok())
         .unwrap_or(false);
@@ -605,7 +605,7 @@ struct RefTipPeeler<'a> {
 impl<'a> RefTipPeeler<'a> {
     fn new(repo: &'a Repository, targets: Option<&'a OidHashSet>) -> Self {
         // A malformed `packed-refs` only loses the shortcut; peeling falls back to the objects.
-        let packed = PackedRefPeels::for_store(repo.refs(), repo.git_dir()).ok();
+        let packed = PackedRefPeels::for_store(repo.ref_store(), repo.git_dir()).ok();
         Self {
             repo,
             packed,

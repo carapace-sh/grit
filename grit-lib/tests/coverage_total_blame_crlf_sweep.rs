@@ -3,7 +3,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use grit_lib::apply::parse_patch;
-use grit_lib::blame::{blame_file, BlameOptions};
+use grit_lib::blame::BlameOptions;
 use grit_lib::objects::ObjectKind;
 use grit_lib::repo::{InitOptions, Repository};
 use grit_lib::worktree::crlf::{
@@ -11,15 +11,13 @@ use grit_lib::worktree::crlf::{
     has_crlf_in_index_blob, has_lone_lf, is_all_crlf, is_all_lf, is_binary, lf_to_crlf,
     load_gitattributes, ConversionConfig, FileAttrs,
 };
-use grit_lib::worktree::pathspec::{
-    matches_pathspec_list, parse_pathspecs_from_source, pathspec_matches,
-};
+use grit_lib::worktree::pathspec::{parse_pathspecs_from_source, Pathspec, PathspecGlobalFlags};
 use std::fs;
 use tempfile::tempdir;
 
 fn seed_blame_repo(depth: usize) -> (tempfile::TempDir, Repository, grit_lib::objects::ObjectId) {
     let dir = tempdir().expect("tempdir");
-    let repo = Repository::init(dir.path(), &InitOptions::default()).expect("init");
+    let (repo, _) = Repository::init(dir.path(), &InitOptions::default()).expect("init");
     let mut parent: Option<grit_lib::objects::ObjectId> = None;
     let mut tip = repo.odb().write(ObjectKind::Blob, b"l0\n").expect("blob");
     for i in 0..depth {
@@ -65,8 +63,7 @@ fn blame_crlf_apply_and_pathspec_deep_sweep() -> grit_lib::error::Result<()> {
             Some(2usize..=3usize),
             Some(1usize..=1usize),
         ] {
-            let blame = blame_file(
-                &repo,
+            let blame = repo.diff().blame(
                 "file.txt",
                 &BlameOptions {
                     start,
@@ -84,7 +81,7 @@ fn blame_crlf_apply_and_pathspec_deep_sweep() -> grit_lib::error::Result<()> {
     )
     .map_err(grit_lib::error::Error::Io)?;
     repo.reload_config()?;
-    let cfg_blob = (*repo.config()?).clone();
+    let cfg_blob = (*repo.config().snapshot()?).clone();
     let crlf = ConversionConfig::from_config(&cfg_blob);
     let attrs = FileAttrs::default();
     let samples: &[&[u8]] = &[b"a\r\nb\r\n", b"a\nb\n", b"\x00bin", b"all\nlf\n"];
@@ -117,9 +114,10 @@ fn blame_crlf_apply_and_pathspec_deep_sweep() -> grit_lib::error::Result<()> {
     assert!(files.len() >= 10);
 
     let specs = parse_pathspecs_from_source(b"*.txt\0:(exclude)skip/\0dir/\0", true)?;
+    let ps = Pathspec::scoped(specs.clone(), PathspecGlobalFlags::default());
     for path in ["f0.txt", "dir/x.txt", "skip/y.txt", "other.md"] {
-        let _ = matches_pathspec_list(path, &specs);
-        let _ = pathspec_matches("*.txt", path);
+        let _ = ps.matches_path(path);
+        let _ = Pathspec::scoped(["*.txt"], PathspecGlobalFlags::default()).matches_path(path);
     }
 
     Ok(())

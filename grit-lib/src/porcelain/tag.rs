@@ -21,19 +21,21 @@
 use std::cell::OnceCell;
 use std::sync::Arc;
 
-use crate::check_ref_format::validate_tag_short_name;
+use crate::check_ref_format::RefName;
 use crate::commit_graph_file::CommitGraphChain;
 use crate::commit_pretty::message_subject;
 use crate::diff_rename_parallel::parallel_map_indices;
 use crate::error::{Error, Result};
 use crate::hash::hash_object;
 use crate::ident::signature_timestamp_for_pretty;
+#[cfg(feature = "serde-models")]
+use crate::ident::Signature;
 use crate::objects::{parse_tag, serialize_tag, ObjectId, ObjectKind, TagData};
 use crate::parallel::ParallelOp;
 use crate::refs;
 use crate::refs::listing::{
     creator_date as listing_creator_date, epoch_from_identity, query_refs,
-    ref_query_options_for_repo, RefListing, RefNamespace, RefQuery, RefQueryError,
+    ref_query_options_for_repo, RefListing, RefNamespace, RefQuery,
 };
 use crate::refs::PackedRefPeels;
 use crate::repo::Repository;
@@ -46,8 +48,9 @@ use std::time::Instant;
 
 const TAGS_PREFIX: &str = "refs/tags/";
 
-/// Tag create/delete validation failures.
+/// Tag create, delete, and verification failures.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum TagError {
     /// `refs/tags/<name>` already exists and `force` was not set.
     #[error("tag '{name}' already exists")]
@@ -77,10 +80,76 @@ pub enum TagError {
         /// Short tag name.
         name: String,
     },
+    /// An annotated tag was requested without a tagger identity.
+    #[error("annotated tag requires a tagger identity")]
+    MissingTagger,
+    /// Parsing a [`crate::tree_sha256::TreeSha256`] from hex failed (expected 64 hex digits).
+    #[error("invalid tree-sha256 hex")]
+    TreeSha256InvalidHex,
+    /// A revision passed to [`crate::tree_sha256::tree_sha256`] did not peel to a commit or tree.
+    #[error("tree-sha256: revision resolves to {found:?}, not a commit or tree")]
+    TreeSha256InvalidRevision {
+        /// Object kind after peeling annotated tags.
+        found: ObjectKind,
+    },
+    /// One or more submodules required for [`crate::tree_sha256::tree_sha256`] are missing.
+    #[error("tree-sha256: missing submodules")]
+    TreeSha256MissingSubmodules {
+        /// The submodules whose commits are not available locally.
+        submodules: Vec<crate::tree_sha256::MissingSubmodule>,
+    },
+    /// `--tree-sha256` was requested with signing explicitly disabled.
+    #[error("tree-sha256 requires a signed tag")]
+    TreeSha256RequiresSigning,
+    /// Annotated tag `tree-sha256` header parsing failed.
+    #[error(transparent)]
+    TreeSha256Claim(#[from] crate::tree_sha256::TreeSha256ClaimError),
+    /// [`crate::tree_sha256::verify_tag`] was given an object that is not an annotated tag.
+    #[error("verify-tag: object {oid} is a {found:?}, not an annotated tag")]
+    VerifyNotTag {
+        /// Object id passed to verification.
+        oid: ObjectId,
+        /// Kind stored in the object database.
+        found: ObjectKind,
+    },
+    /// Annotated tag header block has no `object` line.
+    #[error("verify-tag: tag has no object header")]
+    VerifyMissingObjectHeader,
+    /// Annotated tag carries more than one `tree-sha256` header line.
+    #[error("verify-tag: tag has more than one tree-sha256 header")]
+    VerifyDuplicateTreeSha256Header,
+}
+
+impl TagError {
+    /// Stable snake_case slug for this failure.
+    ///
+    /// Verification failures keep their former umbrella slugs; create and delete failures
+    /// report `tag`.
+    #[must_use]
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            Self::AlreadyExists { .. }
+            | Self::InvalidName { .. }
+            | Self::NotFound { .. }
+            | Self::EmptyMessage
+            | Self::Lightweight { .. }
+            | Self::MissingTagger => "tag",
+            Self::TreeSha256InvalidHex => "tree_sha256_invalid_hex",
+            Self::TreeSha256InvalidRevision { .. } => "tree_sha256_invalid_revision",
+            Self::TreeSha256MissingSubmodules { .. } => "tree_sha256_missing_submodules",
+            Self::TreeSha256RequiresSigning => "tree_sha256_requires_signing",
+            Self::TreeSha256Claim(..) => "tree_sha256_claim",
+            Self::VerifyNotTag { .. } => "tag_verify_not_tag",
+            Self::VerifyMissingObjectHeader => "tag_verify_missing_object_header",
+            Self::VerifyDuplicateTreeSha256Header => "tag_verify_duplicate_tree_sha256_header",
+        }
+    }
 }
 
 /// Whether a `refs/tags/*` ref is lightweight or an annotated tag object.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde-models", derive(serde::Serialize))]
+#[cfg_attr(feature = "serde-models", serde(rename_all = "snake_case"))]
 pub enum TagKind {
     /// The ref points directly at a commit (or other object).
     Lightweight,
@@ -114,6 +183,7 @@ pub struct TagAnnotation {
 
 /// One tag in the result of [`list_tags`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde-models", derive(serde::Serialize))]
 pub struct TagSummary {
     /// Short tag name (without `refs/tags/`).
     pub name: String,
@@ -129,9 +199,22 @@ pub struct TagSummary {
     pub annotation: Option<TagAnnotation>,
 }
 
-/// Deprecated alias for [`TagSummary`].
-#[deprecated(note = "use TagSummary instead")]
-pub type TagInfo = TagSummary;
+#[cfg(feature = "serde-models")]
+impl serde::Serialize for TagAnnotation {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+
+        let tagger = Signature::from_header_lossy(&self.tagger_ident);
+        let mut out = serializer.serialize_struct("TagAnnotation", 3)?;
+        out.serialize_field("subject", &self.subject)?;
+        out.serialize_field("message", &self.message)?;
+        out.serialize_field("tagger", &tagger)?;
+        out.end()
+    }
+}
 
 /// Amount of tag metadata requested from [`list_tags`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -147,11 +230,33 @@ pub enum TagDetail {
 
 /// Result rows returned by [`list_tags`] for the requested [`TagDetail`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde-models", derive(serde::Serialize))]
+#[cfg_attr(feature = "serde-models", serde(rename_all = "snake_case"))]
 pub enum TagList {
     /// Short tag names requested with [`TagDetail::Names`].
     Names(Vec<String>),
     /// Classified summaries requested with [`TagDetail::Kind`] or [`TagDetail::Annotation`].
     Summaries(Vec<TagSummary>),
+}
+
+impl TagList {
+    /// Extract summary rows when `list` used [`TagDetail::Annotation`] or [`TagDetail::Kind`].
+    #[must_use]
+    pub fn into_summaries(self) -> Option<Vec<TagSummary>> {
+        match self {
+            Self::Summaries(rows) => Some(rows),
+            Self::Names(_) => None,
+        }
+    }
+
+    /// Whether this listing contains no rows (names or summaries).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Self::Names(names) => names.is_empty(),
+            Self::Summaries(rows) => rows.is_empty(),
+        }
+    }
 }
 
 /// Inputs for [`create_tag`].
@@ -204,8 +309,8 @@ pub struct CreateTagOutcome {
 ///
 /// Returns [`TagError`] when the name is invalid, the tag exists without `force`,
 /// or the message is empty after cleanup. Propagates object-store and signing errors.
-pub fn create_tag(repo: &Repository, req: &CreateTagRequest) -> Result<CreateTagOutcome> {
-    validate_tag_short_name(&req.name).map_err(|e| {
+pub(crate) fn create_tag(repo: &Repository, req: &CreateTagRequest) -> Result<CreateTagOutcome> {
+    RefName::tag(&req.name).map_err(|e| {
         Error::Tag(TagError::InvalidName {
             detail: e.to_string(),
         })
@@ -234,10 +339,10 @@ pub fn create_tag(repo: &Repository, req: &CreateTagRequest) -> Result<CreateTag
     let target_kind = repo.odb().read_info(&req.target)?.kind;
     let peeled = repo.odb().peel_to_commit(req.target).ok().flatten();
 
-    let config = repo.config()?;
+    let config = repo.config().snapshot()?;
     let tree_opts = req.tree_sha256.clone();
     if tree_opts.is_some() && req.sign == Some(false) {
-        return Err(Error::TreeSha256RequiresSigning);
+        return Err(Error::Tag(TagError::TreeSha256RequiresSigning));
     }
     let mut sign = should_sign_tag(config.as_ref(), req.sign)?;
     if tree_opts.is_some() {
@@ -247,10 +352,7 @@ pub fn create_tag(repo: &Repository, req: &CreateTagRequest) -> Result<CreateTag
     let mut signed = false;
     let mut tree_sha256_outcome = None;
     let (ref_oid, kind) = if wants_annotated {
-        let tagger = req
-            .tagger
-            .as_ref()
-            .ok_or_else(|| Error::Message("annotated tag requires a tagger identity".into()))?;
+        let tagger = req.tagger.as_ref().ok_or(TagError::MissingTagger)?;
         let message = req
             .message
             .as_deref()
@@ -275,6 +377,7 @@ pub fn create_tag(repo: &Repository, req: &CreateTagRequest) -> Result<CreateTag
                 tagger: Some(tagger.clone()),
                 extra_headers: Vec::new(),
                 message,
+                raw_message: None,
             };
             claim.apply_to_tag(&mut tag);
             tree_sha256_outcome = Some(TagTreeSha256Outcome {
@@ -296,6 +399,7 @@ pub fn create_tag(repo: &Repository, req: &CreateTagRequest) -> Result<CreateTag
                 tagger: Some(tagger.clone()),
                 extra_headers: Vec::new(),
                 message,
+                raw_message: None,
             };
             let unsigned = serialize_tag(&tag);
             let bytes = if sign {
@@ -313,7 +417,8 @@ pub fn create_tag(repo: &Repository, req: &CreateTagRequest) -> Result<CreateTag
     };
 
     if !req.dry_run {
-        refs::update_direct_ref_on_store(repo.refs(), repo.git_dir(), &tag_ref, &ref_oid)?;
+        repo.odb().flush_for_publish()?;
+        refs::update_direct_ref_on_store(repo.ref_store(), repo.git_dir(), &tag_ref, &ref_oid)?;
     }
 
     Ok(CreateTagOutcome {
@@ -330,7 +435,10 @@ pub fn create_tag(repo: &Repository, req: &CreateTagRequest) -> Result<CreateTag
 
 /// Classify a tag ref target and peel to a commit when possible.
 #[must_use]
-pub fn tag_ref_metadata(repo: &Repository, ref_oid: &ObjectId) -> (TagKind, Option<ObjectId>) {
+pub(crate) fn tag_ref_metadata(
+    repo: &Repository,
+    ref_oid: &ObjectId,
+) -> (TagKind, Option<ObjectId>) {
     let Ok(info) = repo.odb().read_info(ref_oid) else {
         return (TagKind::Lightweight, None);
     };
@@ -352,14 +460,31 @@ pub fn tag_ref_metadata(repo: &Repository, ref_oid: &ObjectId) -> (TagKind, Opti
 /// # Errors
 ///
 /// Propagates ref-query, config, and object read failures.
-pub fn list_tags(repo: &Repository, query: &RefQuery) -> Result<Vec<TagSummary>> {
-    let TagList::Summaries(tags) = list_tags_with_detail(repo, query, TagDetail::Annotation)?
-    else {
-        return Err(Error::Message(
-            "annotation detail returned tag names without summaries".into(),
-        ));
-    };
-    Ok(tags)
+pub(crate) fn list_tags(repo: &Repository, query: &RefQuery) -> Result<Vec<TagSummary>> {
+    annotated_tag_summaries(repo, &tag_listings(repo, query)?)
+}
+
+fn tag_listings(repo: &Repository, query: &RefQuery) -> Result<Vec<RefListing>> {
+    let mut query = query.clone();
+    query.namespaces = vec![RefNamespace::Tags];
+    let options = ref_query_options_for_repo(repo)?;
+    query_refs(repo, &query, &options)
+}
+
+fn annotated_tag_summaries(repo: &Repository, listings: &[RefListing]) -> Result<Vec<TagSummary>> {
+    if listings.is_empty() {
+        return Ok(Vec::new());
+    }
+    let config = repo.config().snapshot()?;
+    let par = repo
+        .thread_policy()
+        .resolve(ParallelOp::DiffContent, config.as_ref());
+    let odb = repo.odb();
+    odb.with_pack_read_context(|| {
+        parallel_map_indices(odb, listings.len(), par, listings.len() * 512, |i| {
+            summarize_listing(repo, &listings[i])
+        })
+    })
 }
 
 /// List tags matching `query` (always scoped to [`RefNamespace::Tags`]).
@@ -373,15 +498,12 @@ pub fn list_tags(repo: &Repository, query: &RefQuery) -> Result<Vec<TagSummary>>
 /// # Errors
 ///
 /// Propagates ref-query, config, and object read failures.
-pub fn list_tags_with_detail(
+pub(crate) fn list_tags_with_detail(
     repo: &Repository,
     query: &RefQuery,
     detail: TagDetail,
 ) -> Result<TagList> {
-    let mut query = query.clone();
-    query.namespaces = vec![RefNamespace::Tags];
-    let options = ref_query_options_for_repo(repo)?;
-    let listings = query_refs(repo, &query, &options).map_err(ref_query_to_error)?;
+    let listings = tag_listings(repo, query)?;
     if listings.is_empty() {
         return Ok(match detail {
             TagDetail::Names => TagList::Names(Vec::new()),
@@ -401,30 +523,9 @@ pub fn list_tags_with_detail(
                     .collect(),
             ))
         }
-        TagDetail::Annotation => {
-            let config = repo.config()?;
-            let par = repo
-                .thread_policy()
-                .resolve(ParallelOp::DiffContent, config.as_ref());
-            let odb = repo.odb();
-            odb.with_pack_read_context(|| {
-                parallel_map_indices(odb, listings.len(), par, listings.len() * 512, |i| {
-                    summarize_listing(repo, &listings[i])
-                })
-                .map(TagList::Summaries)
-            })
-        }
-    }
-}
-
-fn ref_query_to_error(err: RefQueryError) -> Error {
-    match err {
-        RefQueryError::Store(e) => e,
-        RefQueryError::MissingObjectDatabase => {
-            Error::Message("ref query requires an object database".into())
-        }
-        RefQueryError::MissingObject(oid) => Error::Message(format!("object {oid} not found")),
-        RefQueryError::NotCommit(oid) => Error::Message(format!("object {oid} is not a commit")),
+        TagDetail::Annotation => Ok(TagList::Summaries(annotated_tag_summaries(
+            repo, &listings,
+        )?)),
     }
 }
 
@@ -556,7 +657,7 @@ impl<'a> TagClassifier<'a> {
     fn new(repo: &'a Repository) -> Self {
         // A malformed `packed-refs` only loses the shortcut; classification falls back to
         // the objects.
-        let packed = PackedRefPeels::for_store(repo.refs(), repo.git_dir()).ok();
+        let packed = PackedRefPeels::for_store(repo.ref_store(), repo.git_dir()).ok();
         Self {
             repo,
             packed,
@@ -645,7 +746,7 @@ impl<'a> TagClassifier<'a> {
 ///
 /// Returns [`TagError::NotFound`] when the tag does not exist, and propagates ref
 /// store failures.
-pub fn delete_tag(repo: &Repository, name: &str, dry_run: bool) -> Result<ObjectId> {
+pub(crate) fn delete_tag(repo: &Repository, name: &str, dry_run: bool) -> Result<ObjectId> {
     let tag_ref = format!("{TAGS_PREFIX}{name}");
     let existing = repo.references().read_existing(&tag_ref)?.ok_or_else(|| {
         Error::Tag(TagError::NotFound {
@@ -684,12 +785,12 @@ pub struct VerifiedTag {
 /// [`TagError::NotFound`] when the tag ref does not exist, and
 /// [`TagError::Lightweight`] when the ref points at a non-tag object. Propagates
 /// ref-store, object-read, tag-header parse and signing errors.
-pub fn verify_tag_by_name(
+pub(crate) fn verify_tag_by_name(
     repo: &Repository,
     name: &str,
     options: &TagVerifyOptions,
 ) -> Result<VerifiedTag> {
-    validate_tag_short_name(name).map_err(|e| {
+    RefName::tag(name).map_err(|e| {
         Error::Tag(TagError::InvalidName {
             detail: e.to_string(),
         })
@@ -724,7 +825,7 @@ pub fn verify_tag_by_name(
 /// (which point directly at a commit), this is the committer date.
 /// Returns 0 if the date cannot be determined.
 #[must_use]
-pub fn creator_date(repo: &Repository, oid: &ObjectId) -> i64 {
+pub(crate) fn creator_date(repo: &Repository, oid: &ObjectId) -> i64 {
     listing_creator_date(repo.odb(), oid).unwrap_or(0)
 }
 
@@ -768,8 +869,8 @@ pub fn strip_comments(s: &str) -> String {
 ///
 /// # Errors
 ///
-/// Returns [`Error::Message`] when the body is empty after cleanup (same as
-/// [`crate::porcelain::commit::normalize_commit_message`]).
+/// Returns the same errors as [`crate::porcelain::commit::normalize_commit_message`] when the
+/// body is empty after cleanup.
 pub fn normalize_tag_message(raw: &str) -> Result<String> {
     let stripped = strip_comments(raw);
     crate::porcelain::commit::normalize_commit_message(&stripped)
@@ -787,7 +888,7 @@ mod tests {
 
     fn repo_with_commit() -> (tempfile::TempDir, Repository, ObjectId) {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let repo = Repository::init(tmp.path(), &InitOptions::default()).expect("init");
+        let (repo, _) = Repository::init(tmp.path(), &InitOptions::default()).expect("init");
         let ident = "T <t@example.com> 1 +0000".to_string();
         let sig: crate::ident::Signature = ident.parse().expect("signature");
         let mut req = CommitRequest::new("one");
@@ -798,7 +899,7 @@ mod tests {
             &repo,
             &req,
             &mut NullProgress,
-            &crate::progress::NeverCancel,
+            &crate::progress::CancelToken::never(),
         )
         .expect("commit")
         .oid;

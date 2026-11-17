@@ -23,8 +23,9 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::fetch::Progress;
-use crate::progress::{Cancel, ProgressPhase, ProgressUnit};
+use crate::progress::{CancelToken, ProgressPhase, ProgressUnit};
 use crate::transport::http::{HttpClient, HttpMethod, HttpRequest, HttpResponse};
+use crate::transport_path::redact_url_for_display;
 
 /// TUS protocol version this client and `grit serve` speak.
 pub const TUS_VERSION: &str = "1.0.0";
@@ -89,11 +90,30 @@ pub enum ResumableEvent {
     },
 }
 
+fn resumable_status_message(url: &str, status: u16) -> String {
+    format!("HTTP {status} from {}", redact_url_for_display(url))
+}
+
+fn resumable_protocol_message(url: &str, detail: &str) -> String {
+    format!(
+        "unexpected response from {}: {detail}",
+        redact_url_for_display(url)
+    )
+}
+
+fn resumable_exhausted_message(url: &str, attempts: u32, last: &str) -> String {
+    format!(
+        "the transfer of {} kept failing after {attempts} attempts: {last}",
+        redact_url_for_display(url)
+    )
+}
+
 /// Why a resumable transfer failed.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ResumableError {
     /// The server answered with a status the transfer cannot continue from.
-    #[error("HTTP {status} from {url}")]
+    #[error("{}", resumable_status_message(.url, *status))]
     Status {
         /// The request URL.
         url: String,
@@ -101,7 +121,7 @@ pub enum ResumableError {
         status: u16,
     },
     /// The server's answer did not follow the protocol.
-    #[error("unexpected response from {url}: {detail}")]
+    #[error("{}", resumable_protocol_message(.url, .detail))]
     Protocol {
         /// The request URL.
         url: String,
@@ -109,7 +129,7 @@ pub enum ResumableError {
         detail: String,
     },
     /// The connection kept dropping.
-    #[error("the transfer of {url} kept failing after {attempts} attempts: {last}")]
+    #[error("{}", resumable_exhausted_message(.url, *attempts, .last))]
     Exhausted {
         /// The URL being transferred.
         url: String,
@@ -118,26 +138,15 @@ pub enum ResumableError {
         /// The last failure.
         last: String,
     },
-    /// The HTTP client failed (transport or authentication).
-    #[error(transparent)]
-    Http(Box<crate::error::Error>),
-    /// Reading or writing the local file failed.
-    #[error(transparent)]
-    Io(#[from] std::io::Error),
-    /// [`Cancel`] asked the download to stop. The partial file is kept, so
-    /// the next call resumes it.
-    #[error("operation cancelled")]
-    Cancelled,
 }
 
-impl From<crate::error::Error> for ResumableError {
-    fn from(e: crate::error::Error) -> Self {
-        Self::Http(Box::new(e))
+impl From<ResumableError> for crate::error::Error {
+    fn from(err: ResumableError) -> Self {
+        Self::Remote(crate::remote::RemoteError::Resumable(Box::new(err)))
     }
 }
 
-/// Result alias for resumable transfers.
-pub type Result<T> = std::result::Result<T, ResumableError>;
+use crate::error::Result;
 
 /// What [`download_resumable`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -186,6 +195,70 @@ fn save_state(path: &Path, state: &DownloadState) -> Result<()> {
     Ok(())
 }
 
+/// Where to download when several processes share one resumable cache slot.
+#[derive(Debug)]
+pub enum ResumableDownloadDest {
+    /// The shared `dest`; hold `lock` until [`discard_download`] on it finishes.
+    Shared {
+        /// Path passed to [`download_resumable`].
+        dest: PathBuf,
+        /// Exclusive lock on the sibling `.lock` file for `dest`.
+        lock: File,
+    },
+    /// A one-off path in the cache directory; safe to use without locking.
+    Private(PathBuf),
+}
+
+/// Pick a resumable download path under a shared bundle cache.
+///
+/// Creates `cache_dir` when missing, then tries an exclusive lock on a sibling
+/// `.lock` file next to `shared_dest`. While that lock is held, only this
+/// process may use `shared_dest` and its `.part`/`.json` sidecars. When another
+/// process already holds the lock, returns a unique private path in `cache_dir`
+/// so parallel clones do not clobber the shared partial download.
+///
+/// # Errors
+///
+/// I/O errors opening or locking the lock file, or creating `cache_dir`.
+pub fn claim_resumable_download(
+    cache_dir: &Path,
+    shared_dest: &Path,
+) -> std::io::Result<ResumableDownloadDest> {
+    std::fs::create_dir_all(cache_dir)?;
+    let lock_path = shared_download_lock_path(shared_dest);
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)?;
+    match file.try_lock() {
+        Ok(()) => Ok(ResumableDownloadDest::Shared {
+            dest: shared_dest.to_path_buf(),
+            lock: file,
+        }),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(ResumableDownloadDest::Private(
+            private_resumable_download_dest(cache_dir, shared_dest),
+        )),
+        Err(std::fs::TryLockError::Error(e)) => Err(e),
+    }
+}
+
+fn shared_download_lock_path(dest: &Path) -> PathBuf {
+    dest.with_extension("lock")
+}
+
+fn private_resumable_download_dest(cache_dir: &Path, shared_dest: &Path) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SUFFIX: AtomicU64 = AtomicU64::new(0);
+    let stem = shared_dest
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("bundle");
+    let n = SUFFIX.fetch_add(1, Ordering::Relaxed);
+    cache_dir.join(format!("{stem}.{}.{n}.private.bundle", std::process::id()))
+}
+
 /// Remove `dest` and everything [`download_resumable`] keeps for it.
 ///
 /// # Errors
@@ -217,7 +290,10 @@ pub fn discard_download(dest: &Path) -> std::io::Result<()> {
 ///
 /// - `client`: sends the requests ([`HttpClient::send`]).
 /// - `url`: what to download.
-/// - `dest`: where the finished file goes; its directory must exist.
+/// - `dest`: where the finished file goes; its directory must exist. When
+///   several processes share a cache directory, callers must use
+///   [`claim_resumable_download`] first so only one process uses a given
+///   `dest` at a time.
 /// - `progress`: receives [`ResumableEvent`]s.
 /// - `cancel`: checked before each request and between body chunks.
 ///
@@ -225,14 +301,14 @@ pub fn discard_download(dest: &Path) -> std::io::Result<()> {
 ///
 /// [`ResumableError::Status`] when the server refuses the download,
 /// [`ResumableError::Exhausted`] when the connection keeps dropping,
-/// [`ResumableError::Cancelled`] when `cancel` fires, and I/O errors from the
+/// [`crate::error::Error::Cancelled`] when `cancel` fires, and I/O errors from the
 /// local files. The partial file is kept so a later call can resume.
 pub fn download_resumable(
     client: &dyn HttpClient,
     url: &str,
     dest: &Path,
     progress: &mut dyn Progress,
-    cancel: &dyn Cancel,
+    cancel: &CancelToken,
 ) -> Result<DownloadOutcome> {
     let (part, state_path) = download_paths(dest);
     let mut state = load_state(&state_path).unwrap_or_default();
@@ -265,7 +341,7 @@ pub fn download_resumable(
     let mut last_failure = String::new();
     loop {
         if cancel.is_cancelled() {
-            return Err(ResumableError::Cancelled);
+            return Err(crate::error::Error::Cancelled);
         }
         if attempt > 0 {
             let done = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
@@ -274,7 +350,8 @@ pub fn download_resumable(
                     url: url.to_owned(),
                     attempts: attempt,
                     last: last_failure,
-                });
+                }
+                .into());
             }
             progress.resumable_transfer(&ResumableEvent::Reconnecting { done, attempt });
         }
@@ -350,7 +427,7 @@ fn download_attempt(
     state: &mut DownloadState,
     state_path: &Path,
     progress: &mut dyn Progress,
-    cancel: &dyn Cancel,
+    cancel: &CancelToken,
     mut on_start: impl FnMut(&mut dyn Progress, &AttemptStart),
 ) -> Result<AttemptOutcome> {
     let have = std::fs::metadata(part).map(|m| m.len()).unwrap_or(0);
@@ -363,6 +440,14 @@ fn download_attempt(
     }
     let response = match client.send(&request) {
         Ok(r) => r,
+        Err(e)
+            if matches!(
+                e,
+                crate::error::Error::Remote(crate::remote::RemoteError::Auth { .. })
+            ) =>
+        {
+            return Err(e);
+        }
         Err(e) => return Ok(AttemptOutcome::Dropped(e.to_string())),
     };
     let (mut offset, total) =
@@ -377,7 +462,8 @@ fn download_attempt(
                     return Err(ResumableError::Protocol {
                         url: url.to_owned(),
                         detail: format!("asked for bytes from {have}, got bytes from {start}"),
-                    });
+                    }
+                    .into());
                 }
                 (have, total)
             }
@@ -409,7 +495,8 @@ fn download_attempt(
                 return Err(ResumableError::Status {
                     url: url.to_owned(),
                     status,
-                })
+                }
+                .into())
             }
         };
     state.total = total;
@@ -433,7 +520,7 @@ fn download_attempt(
     loop {
         if cancel.is_cancelled() {
             file.flush()?;
-            return Err(ResumableError::Cancelled);
+            return Err(crate::error::Error::Cancelled);
         }
         let n = match body.read(&mut buf) {
             Ok(0) => break,
@@ -491,7 +578,7 @@ fn parse_content_range(value: Option<&str>) -> Option<(u64, Option<u64>)> {
 /// at whatever offset the server already has, so calling it again after an
 /// interruption (with the same upload URL) only sends the rest.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TusUpload {
+pub(crate) struct TusUpload {
     /// Absolute URL of the upload.
     pub url: String,
     /// Total bytes of the upload.
@@ -515,7 +602,8 @@ impl TusUpload {
             return Err(ResumableError::Status {
                 url: endpoint.to_owned(),
                 status: response.status,
-            });
+            }
+            .into());
         }
         let location = response
             .header("location")
@@ -547,7 +635,8 @@ impl TusUpload {
             status => Err(ResumableError::Status {
                 url: self.url.clone(),
                 status,
-            }),
+            }
+            .into()),
         }
     }
 
@@ -608,10 +697,22 @@ impl TusUpload {
                     });
                     continue;
                 }
-                Ok(r) if r.status == 404 || r.status == 410 => return Err(gone(r.status)),
+                Ok(r) if r.status == 404 || r.status == 410 => {
+                    return Err(crate::error::Error::from(gone(r.status)))
+                }
                 Ok(r) if r.status == 409 => format!("offset {offset} was out of date"),
-                Ok(r) if (400..500).contains(&r.status) => return Err(gone(r.status)),
+                Ok(r) if (400..500).contains(&r.status) => {
+                    return Err(crate::error::Error::from(gone(r.status)))
+                }
                 Ok(r) => format!("HTTP {}", r.status),
+                Err(e)
+                    if matches!(
+                        e,
+                        crate::error::Error::Remote(crate::remote::RemoteError::Auth { .. })
+                    ) =>
+                {
+                    return Err(e);
+                }
                 Err(e) => e.to_string(),
             };
             failures += 1;
@@ -620,7 +721,8 @@ impl TusUpload {
                     url: self.url.clone(),
                     attempts: failures,
                     last: failure,
-                });
+                }
+                .into());
             }
             progress.resumable_transfer(&ResumableEvent::Reconnecting {
                 done: offset,
@@ -642,18 +744,18 @@ impl TusUpload {
 }
 
 fn upload_offset(response: &HttpResponse, url: &str) -> Result<u64> {
-    response
+    Ok(response
         .header("upload-offset")
         .and_then(|v| v.trim().parse().ok())
         .ok_or_else(|| ResumableError::Protocol {
             url: url.to_owned(),
             detail: "no Upload-Offset".to_owned(),
-        })
+        })?)
 }
 
 /// Resolve `reference` (absolute, or relative to `base`) to an absolute URL.
 #[must_use]
-pub fn resolve_url(base: &str, reference: &str) -> Option<String> {
+pub(crate) fn resolve_url(base: &str, reference: &str) -> Option<String> {
     if let Ok(absolute) = url::Url::parse(reference) {
         return Some(absolute.to_string());
     }
@@ -668,7 +770,8 @@ pub fn resolve_url(base: &str, reference: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::fetch::NoProgress;
-    use crate::progress::{FlagCancel, NeverCancel};
+    use crate::progress::CancelToken;
+    use crate::remote::RemoteError;
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
@@ -805,7 +908,13 @@ mod tests {
         let dest = dir.path().join("clone.bundle");
         let srv = server(&[70_000, 10_000]);
         let mut events = Events::default();
-        let outcome = download_resumable(&srv, "http://h/b", &dest, &mut events, &NeverCancel);
+        let outcome = download_resumable(
+            &srv,
+            "http://h/b",
+            &dest,
+            &mut events,
+            &CancelToken::never(),
+        );
         assert_eq!(
             outcome.ok(),
             Some(DownloadOutcome {
@@ -854,14 +963,27 @@ mod tests {
         // The first run's connection keeps dropping until it gives up.
         let failing = server(&[50_000, 0, 0, 0, 0, 0]);
         assert!(matches!(
-            download_resumable(&failing, "http://h/b", &dest, &mut NoProgress, &NeverCancel),
-            Err(ResumableError::Exhausted { .. })
+            download_resumable(
+                &failing,
+                "http://h/b",
+                &dest,
+                &mut NoProgress,
+                &CancelToken::never()
+            ),
+            Err(crate::error::Error::Remote(crate::remote::RemoteError::Resumable(ref r)))
+                if matches!(**r, ResumableError::Exhausted { .. })
         ));
         assert!(!dest.exists());
 
         let srv = server(&[]);
         let mut events = Events::default();
-        let outcome = download_resumable(&srv, "http://h/b", &dest, &mut events, &NeverCancel);
+        let outcome = download_resumable(
+            &srv,
+            "http://h/b",
+            &dest,
+            &mut events,
+            &CancelToken::never(),
+        );
         assert_eq!(outcome.ok().map(|o| o.resumed_from), Some(50_000));
         assert_eq!(std::fs::read(&dest).ok(), Some(srv.data.clone()));
         assert!(matches!(
@@ -874,8 +996,13 @@ mod tests {
 
         // Complete already: nothing is requested.
         let again = server(&[]);
-        let outcome =
-            download_resumable(&again, "http://h/b", &dest, &mut NoProgress, &NeverCancel);
+        let outcome = download_resumable(
+            &again,
+            "http://h/b",
+            &dest,
+            &mut NoProgress,
+            &CancelToken::never(),
+        );
         assert_eq!(outcome.ok().map(|o| o.resumed_from), Some(200_000));
         assert!(again
             .ranges
@@ -889,12 +1016,23 @@ mod tests {
         let dir = tempdir();
         let dest = dir.path().join("clone.bundle");
         let failing = server(&[50_000, 0, 0, 0, 0, 0]);
-        let _ = download_resumable(&failing, "http://h/b", &dest, &mut NoProgress, &NeverCancel);
+        let _ = download_resumable(
+            &failing,
+            "http://h/b",
+            &dest,
+            &mut NoProgress,
+            &CancelToken::never(),
+        );
 
         let mut changed = server(&[]);
         changed.etag = "\"v2\"".to_owned();
-        let outcome =
-            download_resumable(&changed, "http://h/b", &dest, &mut NoProgress, &NeverCancel);
+        let outcome = download_resumable(
+            &changed,
+            "http://h/b",
+            &dest,
+            &mut NoProgress,
+            &CancelToken::never(),
+        );
         assert_eq!(outcome.ok().map(|o| o.bytes), Some(200_000));
         assert_eq!(std::fs::read(&dest).ok(), Some(changed.data.clone()));
 
@@ -904,7 +1042,7 @@ mod tests {
             "http://h/other",
             &dest,
             &mut NoProgress,
-            &NeverCancel,
+            &CancelToken::never(),
         );
         assert_eq!(outcome.ok().map(|o| o.resumed_from), Some(0));
         assert_eq!(
@@ -919,7 +1057,7 @@ mod tests {
 
     /// Cancels once `after` bytes of the download are on disk.
     struct CancelAfter {
-        flag: FlagCancel,
+        flag: CancelToken,
         after: u64,
     }
     impl crate::progress::ProgressSink for CancelAfter {}
@@ -938,14 +1076,14 @@ mod tests {
         let dir = tempdir();
         let dest = dir.path().join("clone.bundle");
         let srv = server(&[]);
-        let flag = FlagCancel::new();
+        let flag = CancelToken::new();
         let mut progress = CancelAfter {
             flag: flag.clone(),
             after: 1,
         };
         assert!(matches!(
             download_resumable(&srv, "http://h/b", &dest, &mut progress, &flag),
-            Err(ResumableError::Cancelled)
+            Err(crate::error::Error::Cancelled)
         ));
         assert!(!dest.exists());
         let (part, _) = download_paths(&dest);
@@ -955,9 +1093,94 @@ mod tests {
             "one chunk is kept, got {kept} bytes"
         );
 
-        let outcome = download_resumable(&srv, "http://h/b", &dest, &mut NoProgress, &NeverCancel);
+        let outcome = download_resumable(
+            &srv,
+            "http://h/b",
+            &dest,
+            &mut NoProgress,
+            &CancelToken::never(),
+        );
         assert_eq!(outcome.ok().map(|o| o.resumed_from), Some(kept));
         assert_eq!(std::fs::read(&dest).ok(), Some(srv.data.clone()));
+    }
+
+    #[test]
+    fn claim_resumable_download_serializes_the_shared_slot() {
+        let dir = tempdir();
+        let shared = dir.path().join("abc.bundle");
+        let first = claim_resumable_download(dir.path(), &shared).expect("first claim");
+        let (first_dest, first_lock) = match first {
+            ResumableDownloadDest::Shared { dest, lock } => (dest, lock),
+            ResumableDownloadDest::Private(_) => panic!("first claim should be shared"),
+        };
+        assert_eq!(first_dest, shared);
+        let second = claim_resumable_download(dir.path(), &shared).expect("second claim");
+        assert!(
+            matches!(second, ResumableDownloadDest::Private(_)),
+            "second claim must not touch the shared partial files"
+        );
+        let other = std::fs::File::open(shared_download_lock_path(&shared)).expect("lock file");
+        assert!(
+            matches!(other.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
+            "lock file stays held until the first guard drops"
+        );
+        drop(first_lock);
+    }
+
+    #[test]
+    fn auth_failure_does_not_retry_the_download() {
+        use crate::error::AuthFailure;
+
+        struct AuthClient;
+        impl HttpClient for AuthClient {
+            fn get(&self, _: &str, _: Option<&str>) -> crate::error::Result<Vec<u8>> {
+                unreachable!()
+            }
+            fn post(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+                _: &[u8],
+                _: Option<&str>,
+            ) -> crate::error::Result<Vec<u8>> {
+                unreachable!()
+            }
+            fn send(&self, _: &HttpRequest<'_>) -> crate::error::Result<HttpResponse> {
+                Err(RemoteError::Auth {
+                    url: "http://h/b".to_owned(),
+                    reason: AuthFailure::Rejected,
+                }
+                .into())
+            }
+        }
+
+        let dir = tempdir();
+        let dest = dir.path().join("clone.bundle");
+        let outcome = download_resumable(
+            &AuthClient,
+            "http://h/b",
+            &dest,
+            &mut NoProgress,
+            &CancelToken::never(),
+        );
+        assert!(
+            matches!(
+                outcome,
+                Err(crate::error::Error::Remote(
+                    crate::remote::RemoteError::Auth { .. }
+                ))
+            ),
+            "auth errors must fail immediately: {outcome:?}"
+        );
+        assert!(
+            !matches!(
+                &outcome,
+                Err(crate::error::Error::Remote(crate::remote::RemoteError::Resumable(r)))
+                    if matches!(**r, ResumableError::Exhausted { .. })
+            ),
+            "auth must not be retried like a dropped connection"
+        );
     }
 
     #[test]
@@ -965,11 +1188,11 @@ mod tests {
         let dir = tempdir();
         let dest = dir.path().join("clone.bundle");
         let srv = server(&[]);
-        let flag = FlagCancel::new();
+        let flag = CancelToken::new();
         flag.cancel();
         assert!(matches!(
             download_resumable(&srv, "http://h/b", &dest, &mut NoProgress, &flag),
-            Err(ResumableError::Cancelled)
+            Err(crate::error::Error::Cancelled)
         ));
         assert!(srv
             .ranges
@@ -1063,7 +1286,12 @@ mod tests {
                     match cut {
                         Some(keep) => {
                             stored.extend_from_slice(&request.body[..keep]);
-                            return Err(crate::error::Error::Message("reset".to_owned()));
+                            return Err(crate::error::Error::from(
+                                crate::remote::RemoteError::Transport {
+                                    url: None,
+                                    detail: "reset".to_owned(),
+                                },
+                            ));
                         }
                         None => {
                             stored.extend_from_slice(request.body);
@@ -1074,6 +1302,44 @@ mod tests {
                 HttpMethod::Get | HttpMethod::Put | HttpMethod::Delete => reply(405, vec![]),
             })
         }
+    }
+
+    #[test]
+    fn resumable_error_display_redacts_url_credentials() {
+        const TOKEN: &str = "grit_bundle_download_secret";
+        let url = format!("http://user:{TOKEN}@127.0.0.1:8080/.grit/checkouts/demo/bundle");
+        for text in [
+            ResumableError::Status {
+                url: url.clone(),
+                status: 404,
+            }
+            .to_string(),
+            ResumableError::Protocol {
+                url: url.clone(),
+                detail: "no length".to_owned(),
+            }
+            .to_string(),
+            ResumableError::Exhausted {
+                url: url.clone(),
+                attempts: 3,
+                last: "connection reset".to_owned(),
+            }
+            .to_string(),
+        ] {
+            assert!(!text.contains(TOKEN), "token leaked: {text}");
+            assert!(!text.contains("user:"), "user leaked: {text}");
+            assert!(text.contains("127.0.0.1:8080"), "host missing: {text}");
+        }
+        assert!(
+            ResumableError::Exhausted {
+                url: "http://h/b".to_owned(),
+                attempts: 1,
+                last: "x".to_owned(),
+            }
+            .to_string()
+            .contains("http://h/b"),
+            "URLs without credentials stay unchanged"
+        );
     }
 
     #[test]

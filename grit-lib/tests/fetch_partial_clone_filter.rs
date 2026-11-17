@@ -2,23 +2,23 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use grit_lib::progress::CancelToken;
+use grit_lib::progress::NullProgress;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::config::ConfigSet;
-use grit_lib::maintenance::repository_fsck::{fsck, FsckOptions, FsckReport};
-use grit_lib::objects::pack::clear_pack_cache;
+use grit_lib::maintenance::repository_fsck::{FsckOptions, FsckReport};
 use grit_lib::objects::promisor::repo_treats_promisor_packs;
 use grit_lib::objects::ObjectId;
-use grit_lib::progress::{NeverCancel, NullProgress};
 use grit_lib::remote::clone::{clone, CloneOptions};
-use grit_lib::remote::fetch::NoProgress;
 use grit_lib::remote::partial_clone::ObjectFilterSpec;
 use grit_lib::remote::transfer::{FetchOptions, TagMode};
 use grit_lib::remote::Remote;
 use grit_lib::repo::Repository;
+use grit_lib::test_support::objects_pack::clear_pack_cache;
 use grit_test_support::git_cmd;
 
 fn git_in(dir: &Path, args: &[&str]) {
@@ -110,10 +110,13 @@ fn git_config_value(git_dir: &Path, key: &str) -> Option<String> {
     let cfg = ConfigSet::load(
         &grit_lib::config::environment::Environment::capture_process(),
         Some(git_dir),
-        true,
+        &crate::config::LoadConfigOptions::standard(
+            &grit_lib::config::environment::Environment::capture_process(),
+            Some(git_dir),
+        ),
     )
     .expect("config");
-    cfg.get(key)
+    cfg.get(key).unwrap()
 }
 
 /// `git clone --no-checkout --filter=<filter>`: the clone installs no promisor
@@ -133,7 +136,7 @@ fn grit_clone_filtered(
             ..CloneOptions::new(url, dest.to_path_buf())
         },
         &mut NoProgress,
-        &NeverCancel,
+        &CancelToken::never(),
         None,
     )
     .expect("clone");
@@ -285,18 +288,25 @@ fn refetch_reapplies_stored_filter() {
     let config = ConfigSet::load(
         &grit_lib::config::environment::Environment::capture_process(),
         Some(&git_dir),
-        true,
+        &crate::config::LoadConfigOptions::standard(
+            &grit_lib::config::environment::Environment::capture_process(),
+            Some(&git_dir),
+        ),
     )
     .expect("cfg");
     let remote = Remote::from_config(&config, "origin").expect("remote");
-    let fetch_opts = FetchOptions {
-        refspecs: vec!["+refs/heads/main:refs/remotes/origin/main".to_owned()],
-        tags: TagMode::Following,
-        remote_name: Some("origin".to_owned()),
-        ..Default::default()
-    };
+    let mut fetch_opts = FetchOptions::new();
+    fetch_opts.refspecs = vec!["+refs/heads/main:refs/remotes/origin/main".to_owned()];
+    fetch_opts.tags = TagMode::Following;
+    fetch_opts.remote_name = Some("origin".to_owned());
     remote
-        .fetch(&repo, fetch_opts, &mut NoProgress, &NeverCancel, None)
+        .fetch(
+            &repo,
+            fetch_opts,
+            &mut NoProgress,
+            &CancelToken::never(),
+            None,
+        )
         .expect("refetch");
     clear_pack_cache();
     let objects = git_dir.join("objects");
@@ -309,8 +319,11 @@ fn refetch_reapplies_stored_filter() {
 /// Object store, connectivity and refs, like `git fsck --no-dangling`.
 fn grit_fsck(repo: &Repository) -> (FsckReport, bool) {
     let opts = FsckOptions::full_repository(false).with_check_dangling(false);
-    let report = fsck(repo, &opts, &mut NullProgress, &NeverCancel).expect("grit fsck");
-    let ok = report.ok(&repo.config().expect("config"), &opts);
+    let report = repo
+        .maintenance()
+        .fsck(&opts, &mut NullProgress, &CancelToken::never())
+        .expect("grit fsck");
+    let ok = report.ok(&repo.config().snapshot().expect("config"), &opts);
     (report, ok)
 }
 
@@ -327,8 +340,7 @@ fn fsck_accepts_promised_missing_blobs() {
     )
     .expect("open");
     assert!(repo_treats_promisor_packs(
-        &git_dir,
-        &repo.config().expect("cfg")
+        &repo.config().snapshot().expect("cfg")
     ));
     let (report, ok) = grit_fsck(&repo);
     assert!(ok, "{:?}", report.issues);
@@ -360,7 +372,10 @@ fn fsck_accepts_promised_missing_blobs_in_index_after_reset() {
         &RepositoryOptions::empty().with_work_tree(dest.path()),
     )
     .expect("open");
-    let index = repo.index_handle().load().expect("index");
+    let index = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("index");
     assert!(
         index
             .entries()
@@ -459,7 +474,7 @@ mod http_v2 {
                 ..CloneOptions::new(&url, dest.path().to_path_buf())
             },
             &mut NoProgress,
-            &NeverCancel,
+            &CancelToken::never(),
             Some(&grit_lib::remote::DefaultHttpClientFactory::new()),
         )
         .expect("http clone");

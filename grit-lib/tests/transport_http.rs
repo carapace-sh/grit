@@ -29,13 +29,12 @@ use std::time::{Duration, Instant};
 use grit_lib::config::ConfigSet;
 use grit_lib::error::{Error, Result as GritResult};
 use grit_lib::objects::odb::Odb;
-use grit_lib::refs::resolve_ref;
+use grit_lib::progress::NullProgress;
 use grit_lib::remote::fetch::NoProgress;
-use grit_lib::remote::push::push_http;
 use grit_lib::remote::push_report::PushRefStatus;
 use grit_lib::remote::transfer::{FetchOptions, PushOptions, PushRefSpec, TagMode, UpdateMode};
 use grit_lib::remote::transport::http::{http_client_arc, ureq_client::UreqHttpClient};
-use grit_lib::remote::transport::http::{http_fetch, HttpClient, SmartHttpTransport};
+use grit_lib::remote::transport::http::{HttpClient, SmartHttpTransport};
 use grit_lib::remote::transport::{ConnectOptions, Service, Transport};
 
 fn open_odb(git_dir: &Path) -> Odb {
@@ -206,13 +205,27 @@ fn fetch_over_smart_http_lands_refs_and_objects() {
 
     // 2. Fetch via http_fetch over a recording client (no Git-Protocol header).
     let client = Arc::new(RecordingClient::new_default());
-    let mut opts = FetchOptions {
-        refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()],
-        tags: TagMode::All,
-        ..Default::default()
-    };
-    let outcome = http_fetch(client.clone(), &local_git, &url, &mut opts, &mut NoProgress)
-        .expect("http_fetch over grit-http-server");
+    let mut opts = FetchOptions::new();
+    opts.refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()];
+    opts.tags = TagMode::All;
+    let outcome = grit_lib::repo::Repository::open(
+        &local_git,
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&mut opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Http {
+            client: client.clone(),
+            url: &url,
+        },
+        &mut opts,
+        &mut NullProgress,
+        grit_lib::progress::CancelToken::never_ref(),
+    )
+    .expect("http_fetch over grit-http-server");
 
     // PROVE this is genuinely the v0/v1 stateless RPC (not a silent v2 upgrade):
     // the POST bodies carry a bare `want <oid>` line and NEVER `command=ls-refs`
@@ -235,13 +248,22 @@ fn fetch_over_smart_http_lands_refs_and_objects() {
     );
 
     // Tracking refs written.
-    let got_main = resolve_ref(&local_git, "refs/remotes/origin/main").expect("origin/main");
-    let got_topic = resolve_ref(&local_git, "refs/remotes/origin/topic").expect("origin/topic");
+    let got_main = grit_test_support::refs::at(&local_git)
+        .references()
+        .resolve("refs/remotes/origin/main")
+        .expect("origin/main");
+    let got_topic = grit_test_support::refs::at(&local_git)
+        .references()
+        .resolve("refs/remotes/origin/topic")
+        .expect("origin/topic");
     assert_eq!(got_main, main_oid, "origin/main oid mismatch vs source");
     assert_eq!(got_topic, topic_oid, "origin/topic oid mismatch vs source");
 
     // Annotated tag arrived (TagMode::All).
-    let got_tag = resolve_ref(&local_git, "refs/tags/v1").expect("tag v1 written");
+    let got_tag = grit_test_support::refs::at(&local_git)
+        .references()
+        .resolve("refs/tags/v1")
+        .expect("tag v1 written");
     assert_eq!(got_tag, tag_oid, "tag v1 oid mismatch vs source");
 
     // Objects landed in the local odb.
@@ -324,7 +346,10 @@ impl RecordingClient {
 
     /// Client built like grit-cli (`UreqHttpClient::from_config` on default config).
     fn from_default_config() -> GritResult<Self> {
-        let inner = UreqHttpClient::from_config(&ConfigSet::new())?;
+        let inner = UreqHttpClient::from_config(
+            &ConfigSet::new(),
+            &grit_lib::config::environment::Environment::empty(),
+        )?;
         Ok(Self::from_inner(inner))
     }
 
@@ -445,7 +470,7 @@ impl RecordingClient {
 }
 
 impl HttpClient for RecordingClient {
-    fn get(&self, url: &str, git_protocol: Option<&str>) -> GritResult<Vec<u8>> {
+    fn get(&self, url: &str, git_protocol: Option<&str>) -> grit_lib::error::Result<Vec<u8>> {
         let gp = git_protocol.or_else(|| self.inner.git_protocol_header());
         self.git_protocols
             .lock()
@@ -461,7 +486,7 @@ impl HttpClient for RecordingClient {
         accept: &str,
         body: &[u8],
         git_protocol: Option<&str>,
-    ) -> GritResult<Vec<u8>> {
+    ) -> grit_lib::error::Result<Vec<u8>> {
         let gp = git_protocol.or_else(|| self.inner.git_protocol_header());
         self.git_protocols
             .lock()
@@ -498,7 +523,7 @@ struct IoFailUploadPackClient<C> {
 }
 
 impl<C: HttpClient> HttpClient for IoFailUploadPackClient<C> {
-    fn get(&self, url: &str, git_protocol: Option<&str>) -> GritResult<Vec<u8>> {
+    fn get(&self, url: &str, git_protocol: Option<&str>) -> grit_lib::error::Result<Vec<u8>> {
         self.inner.get(url, git_protocol)
     }
 
@@ -509,9 +534,9 @@ impl<C: HttpClient> HttpClient for IoFailUploadPackClient<C> {
         accept: &str,
         body: &[u8],
         git_protocol: Option<&str>,
-    ) -> GritResult<Vec<u8>> {
+    ) -> grit_lib::error::Result<Vec<u8>> {
         if url.contains("git-upload-pack") {
-            return Err(Error::Io(std::io::Error::new(
+            return Err(grit_lib::remote::RemoteError::from_io(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 "failed to fill whole buffer",
             )));
@@ -609,10 +634,7 @@ fn fetch_over_smart_http_v2_lands_refs_and_objects() {
     // block (no refs on connect; protocol_version == 2).
     let recording = Arc::new(RecordingClient::new("version=2"));
     let transport = SmartHttpTransport::new(Arc::clone(&recording));
-    let opts_v2 = ConnectOptions {
-        protocol_version: 2,
-        ..Default::default()
-    };
+    let opts_v2 = ConnectOptions::with_protocol_version(2);
     let conn = match transport.connect(&url, Service::UploadPack, &opts_v2) {
         Ok(c) => c,
         Err(e) => {
@@ -640,17 +662,25 @@ fn fetch_over_smart_http_v2_lands_refs_and_objects() {
     drop(conn);
 
     // 2. Fetch over v2 via http_fetch with the recording client.
-    let mut opts = FetchOptions {
-        refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()],
-        tags: TagMode::All,
-        ..Default::default()
-    };
-    let outcome = http_fetch(
-        recording.clone(),
+    let mut opts = FetchOptions::new();
+    opts.refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()];
+    opts.tags = TagMode::All;
+    let outcome = grit_lib::repo::Repository::open(
         &local_git,
-        &url,
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&mut opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Http {
+            client: recording.clone(),
+            url: &url,
+        },
         &mut opts,
-        &mut NoProgress,
+        &mut NullProgress,
+        grit_lib::progress::CancelToken::never_ref(),
     )
     .expect("v2 http_fetch over grit-http-server");
 
@@ -697,13 +727,22 @@ fn fetch_over_smart_http_v2_lands_refs_and_objects() {
     );
 
     // Tracking refs written.
-    let got_main = resolve_ref(&local_git, "refs/remotes/origin/main").expect("origin/main");
-    let got_topic = resolve_ref(&local_git, "refs/remotes/origin/topic").expect("origin/topic");
+    let got_main = grit_test_support::refs::at(&local_git)
+        .references()
+        .resolve("refs/remotes/origin/main")
+        .expect("origin/main");
+    let got_topic = grit_test_support::refs::at(&local_git)
+        .references()
+        .resolve("refs/remotes/origin/topic")
+        .expect("origin/topic");
     assert_eq!(got_main, main_oid, "origin/main oid mismatch vs source");
     assert_eq!(got_topic, topic_oid, "origin/topic oid mismatch vs source");
 
     // Annotated tag arrived (TagMode::All).
-    let got_tag = resolve_ref(&local_git, "refs/tags/v1").expect("tag v1 written");
+    let got_tag = grit_test_support::refs::at(&local_git)
+        .references()
+        .resolve("refs/tags/v1")
+        .expect("tag v1 written");
     assert_eq!(got_tag, tag_oid, "tag v1 oid mismatch vs source");
 
     // Objects landed in the local odb.
@@ -763,12 +802,22 @@ fn fetch_over_smart_http_v2_lands_refs_and_objects() {
     assert_ne!(new_main_oid, main_oid, "source main should have advanced");
 
     let recording2 = Arc::new(RecordingClient::new("version=2"));
-    let outcome2 = http_fetch(
-        recording2.clone(),
+    let outcome2 = grit_lib::repo::Repository::open(
         &local_git,
-        &url,
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&mut opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Http {
+            client: recording2.clone(),
+            url: &url,
+        },
         &mut opts,
-        &mut NoProgress,
+        &mut NullProgress,
+        grit_lib::progress::CancelToken::never_ref(),
     )
     .expect("incremental v2 http_fetch");
     let commands2 = recording2.post_commands.lock().unwrap().clone();
@@ -780,7 +829,10 @@ fn fetch_over_smart_http_v2_lands_refs_and_objects() {
         commands2.iter().any(|c| c == "command=fetch"),
         "incremental fetch missing command=fetch; saw {commands2:?}"
     );
-    let got_main2 = resolve_ref(&local_git, "refs/remotes/origin/main").expect("origin/main");
+    let got_main2 = grit_test_support::refs::at(&local_git)
+        .references()
+        .resolve("refs/remotes/origin/main")
+        .expect("origin/main");
     assert_eq!(
         got_main2, new_main_oid,
         "incremental v2 fetch did not advance origin/main"
@@ -905,17 +957,25 @@ fn fetch_from_config_client_v2_many_refs_and_large_pack() {
         "sanity: bare new() must not imply v2 — regression targets from_config"
     );
 
-    let mut opts = FetchOptions {
-        refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()],
-        tags: TagMode::All,
-        ..Default::default()
-    };
-    let outcome = http_fetch(
-        recording.clone(),
+    let mut opts = FetchOptions::new();
+    opts.refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()];
+    opts.tags = TagMode::All;
+    let outcome = grit_lib::repo::Repository::open(
         &local_git,
-        &url,
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&mut opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Http {
+            client: recording.clone(),
+            url: &url,
+        },
         &mut opts,
-        &mut NoProgress,
+        &mut NullProgress,
+        grit_lib::progress::CancelToken::never_ref(),
     )
     .expect("from_config v2 http_fetch over many-ref repo");
 
@@ -940,7 +1000,10 @@ fn fetch_from_config_client_v2_many_refs_and_large_pack() {
 
     let main_oid = rev_parse(&source, "refs/heads/main");
     assert_eq!(
-        resolve_ref(&local_git, "refs/remotes/origin/main").expect("origin/main"),
+        grit_test_support::refs::at(&local_git)
+            .references()
+            .resolve("refs/remotes/origin/main")
+            .expect("origin/main"),
         main_oid
     );
     let fsck = Command::new("git")
@@ -1002,14 +1065,33 @@ fn http_fetch_surfaces_io_error_from_upload_pack_read_failure() {
     git(&local, &["init", "-q", "-b", "main", "."]);
     let local_git = local.join(".git");
 
-    let inner = UreqHttpClient::from_config(&ConfigSet::new()).expect("from_config");
+    let inner = UreqHttpClient::from_config(
+        &ConfigSet::new(),
+        &grit_lib::config::environment::Environment::empty(),
+    )
+    .expect("from_config");
     let client = http_client_arc(IoFailUploadPackClient { inner });
-    let mut opts = FetchOptions {
-        refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()],
-        tags: TagMode::None,
-        ..Default::default()
-    };
-    let err = http_fetch(client, &local_git, &url, &mut opts, &mut NoProgress).expect_err("I/O");
+    let mut opts = FetchOptions::new();
+    opts.refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()];
+    opts.tags = TagMode::None;
+    let err = grit_lib::repo::Repository::open(
+        &local_git,
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&mut opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Http {
+            client: client,
+            url: &url,
+        },
+        &mut opts,
+        &mut NullProgress,
+        grit_lib::progress::CancelToken::never_ref(),
+    )
+    .expect_err("I/O");
     assert!(
         matches!(err, Error::Io(_)),
         "truncated upload-pack read must surface as Io error, got {err:?}"
@@ -1115,14 +1197,21 @@ fn push_over_smart_http_initial_pack_is_delta_compressed() {
         expect_absent: false,
         ..Default::default()
     };
-    let outcome = push_http(
-        client,
+    let outcome = grit_lib::repo::Repository::open(
         &local_git,
-        &url,
+        &grit_lib::config::environment::RepositoryOptions::empty(),
+    )
+    .expect("open push source")
+    .remotes()
+    .push_to(
+        grit_lib::remote::transfer::TransferEndpoint::Http {
+            client: client,
+            url: &url,
+        },
         &[spec],
         &PushOptions::default(),
         &mut NoProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("push_http initial deep history");
     assert_eq!(outcome.results[0].status, PushRefStatus::Ok);
@@ -1202,14 +1291,21 @@ fn push_over_smart_http_lands_ref_and_objects_and_reports_rejection() {
         expect_absent: false,
         ..Default::default()
     };
-    let outcome = push_http(
-        client.clone(),
+    let outcome = grit_lib::repo::Repository::open(
         &local_git,
-        &url,
+        &grit_lib::config::environment::RepositoryOptions::empty(),
+    )
+    .expect("open push source")
+    .remotes()
+    .push_to(
+        grit_lib::remote::transfer::TransferEndpoint::Http {
+            client: client.clone(),
+            url: &url,
+        },
         &[spec],
         &PushOptions::default(),
         &mut NoProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("push_http over grit-http-server");
 
@@ -1226,7 +1322,10 @@ fn push_over_smart_http_lands_ref_and_objects_and_reports_rejection() {
     assert!(r.old_oid.is_none(), "new ref has no old value");
 
     // The remote ref now points at our main, and the objects are present.
-    let remote_main = resolve_ref(&bare, "refs/heads/main").expect("remote main written");
+    let remote_main = grit_test_support::refs::at(&bare)
+        .references()
+        .resolve("refs/heads/main")
+        .expect("remote main written");
     assert_eq!(
         remote_main, main_oid,
         "remote main oid mismatch after http push"
@@ -1283,18 +1382,28 @@ fn push_over_smart_http_lands_ref_and_objects_and_reports_rejection() {
         expect_absent: false,
         ..Default::default()
     };
-    let outcome_topic = push_http(
-        client.clone(),
+    let outcome_topic = grit_lib::repo::Repository::open(
         &local_git,
-        &url,
+        &grit_lib::config::environment::RepositoryOptions::empty(),
+    )
+    .expect("open push source")
+    .remotes()
+    .push_to(
+        grit_lib::remote::transfer::TransferEndpoint::Http {
+            client: client.clone(),
+            url: &url,
+        },
         &[spec_topic],
         &PushOptions::default(),
         &mut NoProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("push_http topic over grit-http-server");
     assert_eq!(outcome_topic.results[0].status, PushRefStatus::Ok);
-    let remote_topic = resolve_ref(&bare, "refs/heads/feature").expect("remote feature written");
+    let remote_topic = grit_test_support::refs::at(&bare)
+        .references()
+        .resolve("refs/heads/feature")
+        .expect("remote feature written");
     assert_eq!(remote_topic, topic_oid);
     let fsck_topic = Command::new("git")
         .current_dir(&bare)
@@ -1328,14 +1437,21 @@ fn push_over_smart_http_lands_ref_and_objects_and_reports_rejection() {
         expect_absent: false,
         ..Default::default()
     };
-    let outcome2 = push_http(
-        client.clone(),
+    let outcome2 = grit_lib::repo::Repository::open(
         &local_git,
-        &url,
+        &grit_lib::config::environment::RepositoryOptions::empty(),
+    )
+    .expect("open push source")
+    .remotes()
+    .push_to(
+        grit_lib::remote::transfer::TransferEndpoint::Http {
+            client: client.clone(),
+            url: &url,
+        },
         &[nonff],
         &PushOptions::default(),
         &mut NoProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("non-ff push_http completes");
     assert_eq!(outcome2.results.len(), 1);
@@ -1348,7 +1464,9 @@ fn push_over_smart_http_lands_ref_and_objects_and_reports_rejection() {
     assert!(
         matches!(
             r2.status,
-            PushRefStatus::RejectNonFastForward | PushRefStatus::RemoteRejected
+            PushRefStatus::RejectNonFastForward
+                | PushRefStatus::RejectNeedsForce
+                | PushRefStatus::RemoteRejected
         ),
         "expected non-ff/remote rejection, got {:?} ({:?})",
         r2.status,
@@ -1356,7 +1474,10 @@ fn push_over_smart_http_lands_ref_and_objects_and_reports_rejection() {
     );
 
     // The remote ref must be unchanged by the rejected push.
-    let remote_main_after = resolve_ref(&bare, "refs/heads/main").expect("remote main still set");
+    let remote_main_after = grit_test_support::refs::at(&bare)
+        .references()
+        .resolve("refs/heads/main")
+        .expect("remote main still set");
     assert_eq!(
         remote_main_after, main_oid,
         "rejected non-ff push must not move the remote ref"
@@ -1373,14 +1494,21 @@ fn push_over_smart_http_lands_ref_and_objects_and_reports_rejection() {
         expect_absent: false,
         ..Default::default()
     };
-    let outcome3 = push_http(
-        client.clone(),
+    let outcome3 = grit_lib::repo::Repository::open(
         &local_git,
-        &url,
+        &grit_lib::config::environment::RepositoryOptions::empty(),
+    )
+    .expect("open push source")
+    .remotes()
+    .push_to(
+        grit_lib::remote::transfer::TransferEndpoint::Http {
+            client: client.clone(),
+            url: &url,
+        },
         &[forced],
         &PushOptions::default(),
         &mut NoProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("forced push_http completes");
     assert_eq!(
@@ -1389,7 +1517,10 @@ fn push_over_smart_http_lands_ref_and_objects_and_reports_rejection() {
         "forced non-ff push should be accepted: {:?}",
         outcome3.results[0].message
     );
-    let remote_main_forced = resolve_ref(&bare, "refs/heads/main").expect("remote main moved");
+    let remote_main_forced = grit_test_support::refs::at(&bare)
+        .references()
+        .resolve("refs/heads/main")
+        .expect("remote main moved");
     assert_eq!(
         remote_main_forced, diverged,
         "forced push should move the remote ref to the divergent tip"
@@ -1492,14 +1623,21 @@ fn push_then_fetch_roundtrip_and_server_side_rejection_over_http() {
             ..Default::default()
         },
     ];
-    let push_outcome = push_http(
-        client.clone(),
+    let push_outcome = grit_lib::repo::Repository::open(
         &local_git,
-        &url,
+        &grit_lib::config::environment::RepositoryOptions::empty(),
+    )
+    .expect("open push source")
+    .remotes()
+    .push_to(
+        grit_lib::remote::transfer::TransferEndpoint::Http {
+            client: client.clone(),
+            url: &url,
+        },
         &specs,
         &PushOptions::default(),
         &mut NoProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("push_http main+topic over grit-http-server");
     for r in &push_outcome.results {
@@ -1513,12 +1651,18 @@ fn push_then_fetch_roundtrip_and_server_side_rejection_over_http() {
         );
     }
     assert_eq!(
-        resolve_ref(&bare, "refs/heads/main").unwrap(),
+        grit_test_support::refs::at(&bare)
+            .references()
+            .resolve("refs/heads/main")
+            .unwrap(),
         main_oid,
         "remote main mismatch after push"
     );
     assert_eq!(
-        resolve_ref(&bare, "refs/heads/topic").unwrap(),
+        grit_test_support::refs::at(&bare)
+            .references()
+            .resolve("refs/heads/topic")
+            .unwrap(),
         topic_oid,
         "remote topic mismatch after push"
     );
@@ -1529,29 +1673,43 @@ fn push_then_fetch_roundtrip_and_server_side_rejection_over_http() {
     git(&back, &["init", "-q", "-b", "main", "."]);
     let back_git = back.join(".git");
 
-    let mut fetch_opts = FetchOptions {
-        refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()],
-        tags: TagMode::None,
-        ..Default::default()
-    };
+    let mut fetch_opts = FetchOptions::new();
+    fetch_opts.refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()];
+    fetch_opts.tags = TagMode::None;
     let client2 = http_client_arc(UreqHttpClient::new());
-    let fetch_outcome = http_fetch(
-        client2.clone(),
+    let fetch_outcome = grit_lib::repo::Repository::open(
         &back_git,
-        &url,
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&mut fetch_opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Http {
+            client: client2.clone(),
+            url: &url,
+        },
         &mut fetch_opts,
-        &mut NoProgress,
+        &mut NullProgress,
+        grit_lib::progress::CancelToken::never_ref(),
     )
     .expect("http_fetch back the just-pushed repo");
 
     // The round-tripped refs equal what we pushed (byte-for-byte oid equality).
     assert_eq!(
-        resolve_ref(&back_git, "refs/remotes/origin/main").unwrap(),
+        grit_test_support::refs::at(&back_git)
+            .references()
+            .resolve("refs/remotes/origin/main")
+            .unwrap(),
         main_oid,
         "round-trip: fetched origin/main != pushed main"
     );
     assert_eq!(
-        resolve_ref(&back_git, "refs/remotes/origin/topic").unwrap(),
+        grit_test_support::refs::at(&back_git)
+            .references()
+            .resolve("refs/remotes/origin/topic")
+            .unwrap(),
         topic_oid,
         "round-trip: fetched origin/topic != pushed topic"
     );
@@ -1620,14 +1778,21 @@ fn push_then_fetch_roundtrip_and_server_side_rejection_over_http() {
         expect_absent: false,
         ..Default::default()
     };
-    let reject_outcome = push_http(
-        client.clone(),
+    let reject_outcome = grit_lib::repo::Repository::open(
         &local_git,
-        &url,
+        &grit_lib::config::environment::RepositoryOptions::empty(),
+    )
+    .expect("open push source")
+    .remotes()
+    .push_to(
+        grit_lib::remote::transfer::TransferEndpoint::Http {
+            client: client.clone(),
+            url: &url,
+        },
         &[forced_spec],
         &PushOptions::default(),
         &mut NoProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("forced push against denyNonFastForwards completes");
     assert_eq!(reject_outcome.results.len(), 1);
@@ -1641,7 +1806,10 @@ fn push_then_fetch_roundtrip_and_server_side_rejection_over_http() {
     );
     // The remote ref must be unchanged by the server-rejected push.
     assert_eq!(
-        resolve_ref(&bare, "refs/heads/main").unwrap(),
+        grit_test_support::refs::at(&bare)
+            .references()
+            .resolve("refs/heads/main")
+            .unwrap(),
         main_oid,
         "server-rejected push must not move the remote ref"
     );
@@ -1660,16 +1828,32 @@ fn http_fetch_rss_child_process() {
     std::fs::create_dir_all(&work).expect("work dir");
     git(&work, &["init", "-q", "-b", "main", "."]);
     let git_dir = work.join(".git");
-    let mut opts = FetchOptions {
-        refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()],
-        initial_remote_fetch: true,
-        remote_name: Some("origin".to_owned()),
-        index_pack_threads: index_threads.or(Some(1)),
-        pack_spool_only: true,
-        ..Default::default()
-    };
+    let mut opts = grit_lib::test_support::knobs::fetch_options_pack_spool_only(
+        FetchOptions::new().initial_remote_fetch(true),
+        true,
+    );
+    opts.refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".to_owned()];
+    opts.remote_name = Some("origin".to_owned());
+    opts.index_pack_threads = index_threads.or(Some(1));
     let client = http_client_arc(UreqHttpClient::new());
-    http_fetch(client, &git_dir, &url, &mut opts, &mut NoProgress).expect("http_fetch");
+    grit_lib::repo::Repository::open(
+        &git_dir,
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&mut opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Http {
+            client: client,
+            url: &url,
+        },
+        &mut opts,
+        &mut NullProgress,
+        grit_lib::progress::CancelToken::never_ref(),
+    )
+    .expect("http_fetch");
 }
 
 /// Streaming HTTP fetch must not hold the full pack in memory (peak RSS well below pack size).
@@ -1883,17 +2067,34 @@ fn fetch_over_git_http_backend_cgi() {
         "upload-pack body should start with a pkt-line, got {:?}",
         &post_body[..post_body.len().min(24)]
     );
-    let mut progress = NoProgress;
-    let mut fetch_opts = FetchOptions {
-        refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".into()],
-        tags: TagMode::Following,
-        ..Default::default()
-    };
-    http_fetch(client.clone(), &local, &url, &mut fetch_opts, &mut progress)
-        .expect("http_fetch over git http-backend CGI wrapper");
+    let mut progress = NullProgress;
+    let mut fetch_opts = FetchOptions::new();
+    fetch_opts.refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".into()];
+    fetch_opts.tags = TagMode::Following;
+    grit_lib::repo::Repository::open(
+        &local,
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&mut fetch_opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Http {
+            client: client.clone(),
+            url: &url,
+        },
+        &mut fetch_opts,
+        &mut progress,
+        grit_lib::progress::CancelToken::never_ref(),
+    )
+    .expect("http_fetch over git http-backend CGI wrapper");
 
     assert_eq!(
-        resolve_ref(&local, "refs/remotes/origin/main").unwrap(),
+        grit_test_support::refs::at(&local)
+            .references()
+            .resolve("refs/remotes/origin/main")
+            .unwrap(),
         main_oid
     );
 }

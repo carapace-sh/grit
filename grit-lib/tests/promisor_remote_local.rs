@@ -8,28 +8,28 @@ use std::sync::Arc;
 
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::config::ConfigSet;
-use grit_lib::objects::pack::clear_pack_cache;
 use grit_lib::objects::promisor::{DefaultPromisorFetcher, PromisorFetcher};
 use grit_lib::objects::{ObjectId, ObjectKind};
-use grit_lib::progress::NeverCancel;
+use grit_lib::progress::{CancelToken, NullProgress};
 use grit_lib::refs::ref_storage::RefStorageFormat;
 use grit_lib::remote::clone::{clone, CloneError, CloneOptions};
 use grit_lib::remote::fetch::NoProgress;
 use grit_lib::remote::partial_clone::ObjectFilterSpec;
 use grit_lib::remote::transport::http::HttpClient;
-use grit_lib::remote::{HttpClientFactory, RemoteError, RemoteResult};
+use grit_lib::remote::{HttpClientFactory, RemoteError};
 use grit_lib::repo::{InitOptions, Repository};
+use grit_lib::test_support::objects_pack::clear_pack_cache;
 
 /// Only local remotes here, so no HTTP client is ever made.
 struct NoHttp;
 
 impl HttpClientFactory for NoHttp {
-    fn create(&self, _: &ConfigSet) -> RemoteResult<Box<dyn HttpClient>> {
-        Err(RemoteError::UnsupportedScheme)
+    fn create(&self, _: &ConfigSet) -> grit_lib::error::Result<Box<dyn HttpClient>> {
+        Err(grit_lib::error::Error::from(RemoteError::UnsupportedScheme))
     }
 
-    fn create_for_probe(&self, _: &ConfigSet) -> RemoteResult<Box<dyn HttpClient>> {
-        Err(RemoteError::UnsupportedScheme)
+    fn create_for_preflight(&self, _: &ConfigSet) -> grit_lib::error::Result<Box<dyn HttpClient>> {
+        Err(grit_lib::error::Error::from(RemoteError::UnsupportedScheme))
     }
 }
 
@@ -42,7 +42,7 @@ fn append_config(git_dir: &Path, text: &str) {
 
 /// A bare repository whose `main` holds a small blob and a 20 KiB one.
 fn bare_with_big_blob(git_dir: &Path) -> ObjectId {
-    let repo = Repository::init(
+    let (repo, _) = Repository::init(
         git_dir,
         &InitOptions::new()
             .with_bare(true)
@@ -105,7 +105,7 @@ fn omitted_blob_comes_from_the_lop_when_the_server_is_gone() {
         ("remote.lop.promisor".into(), "true".into()),
         ("promisor.acceptFromServer".into(), "knownUrl".into()),
     ];
-    let outcome = clone(opts, &mut NoProgress, &NeverCancel, None).expect("clone");
+    let outcome = clone(opts, &mut NullProgress, &CancelToken::never(), None).expect("clone");
     assert_eq!(outcome.filter, Some(ObjectFilterSpec::BlobLimit(5 * 1024)));
     assert_eq!(
         outcome.promisor.as_ref().unwrap().decision.accepted_names(),
@@ -140,7 +140,7 @@ fn local_filtered_clone_is_served_in_process() {
     let mut opts = CloneOptions::new(format!("file://{}", server.display()), dest);
     opts.filter = Some(ObjectFilterSpec::BlobNone);
     opts.checkout = false;
-    let outcome = clone(opts, &mut NoProgress, &NeverCancel, None).expect("clone");
+    let outcome = clone(opts, &mut NullProgress, &CancelToken::never(), None).expect("clone");
     assert!(outcome.transfer.objects >= 2);
     assert!(!outcome.repo.odb().contains(&big).unwrap());
 }
@@ -177,7 +177,7 @@ fn local_filtered_clone_sees_the_global_upload_pack_config() {
     opts.environment = env;
     opts.filter = Some(ObjectFilterSpec::BlobNone);
     opts.checkout = false;
-    let outcome = clone(opts, &mut NoProgress, &NeverCancel, None).expect("clone");
+    let outcome = clone(opts, &mut NullProgress, &CancelToken::never(), None).expect("clone");
     assert!(!outcome.repo.odb().contains(&big).unwrap());
 }
 
@@ -192,7 +192,7 @@ fn filter_the_server_does_not_support_is_reported_as_ignored() {
     opts.environment = env;
     opts.filter = Some(ObjectFilterSpec::BlobNone);
     opts.checkout = false;
-    let outcome = clone(opts, &mut NoProgress, &NeverCancel, None).expect("clone");
+    let outcome = clone(opts, &mut NullProgress, &CancelToken::never(), None).expect("clone");
     assert!(outcome.filter_ignored());
     assert!(!outcome.filter_sent);
     assert!(outcome.repo.odb().contains(&big).unwrap());
@@ -213,7 +213,7 @@ fn a_failing_local_server_reports_its_own_error() {
     opts.environment = env_with_global_config(&tmp.path().join("home"), "");
     opts.filter = Some(ObjectFilterSpec::BlobLimit(10 * 1024));
     opts.checkout = false;
-    let err = match clone(opts, &mut NoProgress, &NeverCancel, None) {
+    let err = match clone(opts, &mut NullProgress, &CancelToken::never(), None) {
         Ok(_) => panic!("clone of a broken server succeeded"),
         Err(err) => err,
     };
@@ -231,7 +231,7 @@ fn blobless_checkout_takes_each_blob_from_the_remote_that_has_it() {
     let server = tmp.path().join("server.git");
     let big = bare_with_big_blob(&server);
     let lop = tmp.path().join("lop.git");
-    let lop_repo = Repository::init(
+    let (lop_repo, _) = Repository::init(
         &lop,
         &InitOptions::new()
             .with_bare(true)
@@ -272,7 +272,7 @@ fn blobless_checkout_takes_each_blob_from_the_remote_that_has_it() {
     ];
     let fetcher: Arc<dyn PromisorFetcher> = Arc::new(DefaultPromisorFetcher::new(Arc::new(NoHttp)));
     opts.promisor_fetcher = Some(fetcher);
-    let outcome = clone(opts, &mut NoProgress, &NeverCancel, None).expect("clone");
+    let outcome = clone(opts, &mut NullProgress, &CancelToken::never(), None).expect("clone");
     assert_eq!(outcome.files, 2);
     assert_eq!(std::fs::read(dest.join("small")).unwrap(), b"small\n");
     assert_eq!(std::fs::read(dest.join("big")).unwrap().len(), 20 * 1024);
@@ -287,7 +287,7 @@ fn a_checkout_whose_blobs_cannot_be_fetched_keeps_the_clone() {
     let server = tmp.path().join("server.git");
     let big = bare_with_big_blob(&server);
     let lop = tmp.path().join("lop.git");
-    let lop_repo = Repository::init(
+    let (lop_repo, _) = Repository::init(
         &lop,
         &InitOptions::new()
             .with_bare(true)
@@ -316,22 +316,36 @@ fn a_checkout_whose_blobs_cannot_be_fetched_keeps_the_clone() {
     ];
     let fetcher: Arc<dyn PromisorFetcher> = Arc::new(DefaultPromisorFetcher::new(Arc::new(NoHttp)));
     opts.promisor_fetcher = Some(Arc::clone(&fetcher));
-    let err = match clone(opts, &mut NoProgress, &NeverCancel, None) {
+    let err = match clone(opts, &mut NullProgress, &CancelToken::never(), None) {
         Ok(_) => panic!("checkout of an unavailable blob succeeded"),
         Err(err) => err,
     };
-    assert!(matches!(err, CloneError::CheckoutFailed { .. }), "{err:?}");
-    assert!(!err.should_cleanup_failed_clone());
+    assert!(
+        matches!(
+            &err,
+            grit_lib::error::Error::Remote(grit_lib::remote::RemoteError::Clone(clone))
+                if matches!(**clone, CloneError::CheckoutFailed { .. })
+        ),
+        "{err:?}"
+    );
+    assert!(!grit_lib::remote::clone::should_cleanup_failed_clone(&err));
     assert!(!err.is_cancelled());
-    assert_eq!(err.kept_repository(), Some(dest.as_path()));
-    assert_eq!(err.missing_promised_object(), Some(big));
-    let remotes: Vec<&str> = err
+    let grit_lib::error::Error::Remote(RemoteError::Clone(clone_err)) = &err else {
+        unreachable!()
+    };
+    assert_eq!(clone_err.kept_repository(), Some(dest.as_path()));
+    assert_eq!(clone_err.missing_promised_object(), Some(big));
+    let remotes: Vec<&str> = clone_err
         .failed_promisor_remotes()
         .iter()
-        .map(|(name, _)| name.as_str())
+        .map(|failure| failure.remote.as_str())
         .collect();
     assert_eq!(remotes, ["lop", "origin"]);
-    let CloneError::CheckoutFailed { commit, .. } = err else {
+    let grit_lib::error::Error::Remote(grit_lib::remote::RemoteError::Clone(clone_err)) = err
+    else {
+        unreachable!()
+    };
+    let CloneError::CheckoutFailed { commit, .. } = *clone_err else {
         unreachable!()
     };
     clear_pack_cache();
@@ -345,10 +359,7 @@ fn a_checkout_whose_blobs_cannot_be_fetched_keeps_the_clone() {
             .with_promisor_fetcher(Some(fetcher)),
     )
     .unwrap();
-    assert_eq!(
-        grit_lib::state::resolve_head(repo.git_dir()).unwrap().oid(),
-        Some(&commit)
-    );
+    assert_eq!(repo.references().head().unwrap().oid(), Some(&commit));
     assert!(!dest.join("big").exists());
     lop_repo
         .odb()
@@ -357,7 +368,14 @@ fn a_checkout_whose_blobs_cannot_be_fetched_keeps_the_clone() {
     let tree = grit_lib::objects::parse_commit(&repo.odb().read(&commit).unwrap().data)
         .unwrap()
         .tree;
-    grit_lib::porcelain::checkout::checkout_between_trees(&repo, None, &tree).unwrap();
+    repo.checkout()
+        .checkout(
+            None,
+            &tree,
+            &mut grit_lib::progress::NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .unwrap();
     assert_eq!(std::fs::read(dest.join("big")).unwrap().len(), 20 * 1024);
     assert_eq!(std::fs::read(dest.join("small")).unwrap(), b"small\n");
 }

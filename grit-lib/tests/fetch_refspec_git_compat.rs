@@ -6,10 +6,8 @@ use std::process::Command;
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::error::Error;
 use grit_lib::objects::ObjectId;
-use grit_lib::progress::NeverCancel;
-use grit_lib::refs::resolve_ref;
-use grit_lib::remote::fetch::NoProgress;
-use grit_lib::remote::transfer::{fetch_local, FetchOptions, TagMode};
+use grit_lib::progress::CancelToken;
+use grit_lib::remote::transfer::{FetchOptions, TagMode};
 use grit_lib::remote::Remote;
 use grit_lib::repo::Repository;
 
@@ -66,7 +64,10 @@ fn read_fetch_head(git_dir: &Path) -> String {
 }
 
 fn tracking_tip(git_dir: &Path, name: &str) -> Option<ObjectId> {
-    resolve_ref(git_dir, name).ok()
+    grit_test_support::refs::at(git_dir)
+        .references()
+        .resolve(name)
+        .ok()
 }
 
 struct BareRemote {
@@ -148,21 +149,33 @@ fn grit_fetch_file(
     refspecs: &[&str],
     configured: &[&str],
 ) -> grit_lib::remote::transfer::FetchOutcome {
-    let opts = FetchOptions {
-        refspecs: refspecs.iter().map(|s| (*s).to_owned()).collect(),
-        configured_refspecs: configured.iter().map(|s| (*s).to_owned()).collect(),
-        tags: TagMode::None,
-        remote_name: Some("origin".into()),
-        fetch_source: Some({
-            let mut s = remote_git.to_string_lossy().into_owned();
-            if s.ends_with(".git") {
-                s.truncate(s.len() - 4);
-            }
-            s
-        }),
-        ..Default::default()
-    };
-    fetch_local(&local.join(".git"), remote_git, &opts).expect("grit fetch_local")
+    let mut opts = FetchOptions::new();
+    opts.refspecs = refspecs.iter().map(|s| (*s).to_owned()).collect();
+    opts.configured_refspecs = configured.iter().map(|s| (*s).to_owned()).collect();
+    opts.tags = TagMode::None;
+    opts.remote_name = Some("origin".into());
+    opts.fetch_source = Some({
+        let mut s = remote_git.to_string_lossy().into_owned();
+        if s.ends_with(".git") {
+            s.truncate(s.len() - 4);
+        }
+        s
+    });
+    grit_lib::repo::Repository::open(
+        &local.join(".git"),
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Local(remote_git),
+        &mut opts.clone(),
+        &mut grit_lib::remote::fetch::NoProgress,
+        grit_lib::progress::CancelToken::never_ref(),
+    )
+    .expect("grit fetch_local")
 }
 
 fn git_fetch(local: &Path, remote: &Path, refspecs: &[&str]) {
@@ -225,24 +238,26 @@ fn named_remote_explicit_refspec_writes_fetch_head_via_remote_fetch() {
         &RepositoryOptions::empty().with_work_tree(&grit_c),
     )
     .expect("open repo");
-    let config = repo.config().expect("config");
+    let config = repo.config().snapshot().expect("config");
     let origin = Remote::from_config(&config, "origin").expect("origin remote");
+    let mut fetch_opts = FetchOptions::new();
+    fetch_opts.refspecs = vec!["main".into()];
+    fetch_opts.tags = TagMode::None;
     origin
         .fetch(
             &repo,
-            FetchOptions {
-                refspecs: vec!["main".into()],
-                tags: TagMode::None,
-                ..Default::default()
-            },
+            fetch_opts,
             &mut NoProgress,
-            &NeverCancel,
+            &CancelToken::never(),
             None,
         )
         .expect("Remote::fetch explicit main");
 
     let fetch_head = read_fetch_head(&git_dir);
-    let expected = resolve_ref(&remote.git_dir(), "refs/heads/main").expect("remote main");
+    let expected = grit_test_support::refs::at(remote.git_dir())
+        .references()
+        .resolve("refs/heads/main")
+        .expect("remote main");
     let got_oid = fetch_head
         .lines()
         .next()
@@ -366,16 +381,24 @@ fn missing_source_ref_typed_error_file() {
     remote.commit_empty("only");
 
     let grit_c = clone_consumer(tmp.path(), &remote, "grit-c");
-    let err = fetch_local(
+    let mut fetch_opts = FetchOptions::new();
+    fetch_opts.refspecs = vec!["no-such-branch".into()];
+    fetch_opts.configured_refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".into()];
+    fetch_opts.tags = TagMode::None;
+    fetch_opts.remote_name = Some("origin".into());
+    let err = grit_lib::repo::Repository::open(
         &grit_c.join(".git"),
-        &remote.git_dir(),
-        &FetchOptions {
-            refspecs: vec!["no-such-branch".into()],
-            configured_refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".into()],
-            tags: TagMode::None,
-            remote_name: Some("origin".into()),
-            ..Default::default()
-        },
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&fetch_opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Local(&remote.git_dir()),
+        &mut fetch_opts.clone(),
+        &mut grit_lib::remote::fetch::NoProgress,
+        grit_lib::progress::CancelToken::never_ref(),
     )
     .unwrap_err();
     assert!(
@@ -400,16 +423,24 @@ fn branch_to_tag_clobber_rejected_like_git() {
     let spec = "refs/heads/main:refs/tags/local-tag";
     let cfg = ["+refs/heads/*:refs/remotes/origin/*"];
 
-    let grit_outcome = fetch_local(
+    let mut fetch_opts = FetchOptions::new();
+    fetch_opts.refspecs = vec![spec.into()];
+    fetch_opts.configured_refspecs = cfg.iter().map(|s| (*s).into()).collect();
+    fetch_opts.tags = TagMode::None;
+    fetch_opts.remote_name = Some("origin".into());
+    let grit_outcome = grit_lib::repo::Repository::open(
         &grit_c.join(".git"),
-        &remote.git_dir(),
-        &FetchOptions {
-            refspecs: vec![spec.into()],
-            configured_refspecs: cfg.iter().map(|s| (*s).into()).collect(),
-            tags: TagMode::None,
-            remote_name: Some("origin".into()),
-            ..Default::default()
-        },
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&fetch_opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Local(&remote.git_dir()),
+        &mut fetch_opts.clone(),
+        &mut grit_lib::remote::fetch::NoProgress,
+        grit_lib::progress::CancelToken::never_ref(),
     )
     .expect("grit fetch");
     assert!(
@@ -456,16 +487,24 @@ fn tag_to_branch_rejected_when_tag_would_clobber_branch() {
     run_git(remote.path(), &["tag", "v1", &main1]);
 
     let spec = "refs/tags/v1:refs/heads/from-tag";
-    let outcome = fetch_local(
+    let mut fetch_opts = FetchOptions::new();
+    fetch_opts.refspecs = vec![spec.into()];
+    fetch_opts.configured_refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".into()];
+    fetch_opts.tags = TagMode::None;
+    fetch_opts.remote_name = Some("origin".into());
+    let outcome = grit_lib::repo::Repository::open(
         &grit_c.join(".git"),
-        &remote.git_dir(),
-        &FetchOptions {
-            refspecs: vec![spec.into()],
-            configured_refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".into()],
-            tags: TagMode::None,
-            remote_name: Some("origin".into()),
-            ..Default::default()
-        },
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&fetch_opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Local(&remote.git_dir()),
+        &mut fetch_opts.clone(),
+        &mut grit_lib::remote::fetch::NoProgress,
+        grit_lib::progress::CancelToken::never_ref(),
     )
     .expect("fetch");
     assert!(
@@ -508,17 +547,25 @@ fn dry_run_classifies_fast_forward_without_writing() {
     let probe_before = tracking_tip(&grit_c.join(".git"), "refs/heads/probe");
     remote.commit_empty("r2");
 
-    let outcome = fetch_local(
+    let mut fetch_opts = FetchOptions::new();
+    fetch_opts.refspecs = vec!["refs/heads/main:refs/heads/probe".into()];
+    fetch_opts.configured_refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".into()];
+    fetch_opts.tags = TagMode::None;
+    fetch_opts.remote_name = Some("origin".into());
+    fetch_opts.dry_run = true;
+    let outcome = grit_lib::repo::Repository::open(
         &grit_c.join(".git"),
-        &remote.git_dir(),
-        &FetchOptions {
-            refspecs: vec!["refs/heads/main:refs/heads/probe".into()],
-            configured_refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".into()],
-            tags: TagMode::None,
-            remote_name: Some("origin".into()),
-            dry_run: true,
-            ..Default::default()
-        },
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&fetch_opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Local(&remote.git_dir()),
+        &mut fetch_opts.clone(),
+        &mut grit_lib::remote::fetch::NoProgress,
+        grit_lib::progress::CancelToken::never_ref(),
     )
     .expect("dry-run fetch");
     let update = outcome
@@ -549,16 +596,24 @@ fn non_fast_forward_local_branch_rejected_file() {
     run_git(&grit_c, &["checkout", "-q", "main"]);
     remote.commit_empty("r3");
 
-    let outcome = fetch_local(
+    let mut fetch_opts = FetchOptions::new();
+    fetch_opts.refspecs = vec![format!("refs/heads/main:refs/heads/forceme")];
+    fetch_opts.configured_refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".into()];
+    fetch_opts.tags = TagMode::None;
+    fetch_opts.remote_name = Some("origin".into());
+    let outcome = grit_lib::repo::Repository::open(
         &grit_c.join(".git"),
-        &remote.git_dir(),
-        &FetchOptions {
-            refspecs: vec![format!("refs/heads/main:refs/heads/forceme")],
-            configured_refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".into()],
-            tags: TagMode::None,
-            remote_name: Some("origin".into()),
-            ..Default::default()
-        },
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&fetch_opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Local(&remote.git_dir()),
+        &mut fetch_opts.clone(),
+        &mut grit_lib::remote::fetch::NoProgress,
+        grit_lib::progress::CancelToken::never_ref(),
     )
     .expect("fetch");
     let rejected = outcome
@@ -583,16 +638,24 @@ fn checked_out_branch_update_refused_file() {
     let grit_c = clone_consumer(tmp.path(), &remote, "grit-c");
     remote.commit_empty("two");
 
-    let err = fetch_local(
+    let mut fetch_opts = FetchOptions::new();
+    fetch_opts.refspecs = vec!["refs/heads/main:refs/heads/main".into()];
+    fetch_opts.configured_refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".into()];
+    fetch_opts.tags = TagMode::None;
+    fetch_opts.remote_name = Some("origin".into());
+    let err = grit_lib::repo::Repository::open(
         &grit_c.join(".git"),
-        &remote.git_dir(),
-        &FetchOptions {
-            refspecs: vec!["refs/heads/main:refs/heads/main".into()],
-            configured_refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".into()],
-            tags: TagMode::None,
-            remote_name: Some("origin".into()),
-            ..Default::default()
-        },
+        &grit_lib::config::environment::RepositoryOptions::with_environment(
+            (&fetch_opts).environment.clone(),
+        ),
+    )
+    .expect("open fetch target")
+    .remotes()
+    .fetch_from(
+        grit_lib::remote::transfer::TransferEndpoint::Local(&remote.git_dir()),
+        &mut fetch_opts.clone(),
+        &mut grit_lib::remote::fetch::NoProgress,
+        grit_lib::progress::CancelToken::never_ref(),
     )
     .unwrap_err();
     assert!(
@@ -629,9 +692,9 @@ fn force_update_non_fast_forward_file() {
 #[cfg(unix)]
 mod http {
     use super::*;
-    use grit_lib::remote::fetch::NoProgress;
+    use grit_lib::progress::NullProgress;
+    use grit_lib::remote::transport::http::http_client_arc;
     use grit_lib::remote::transport::http::ureq_client::UreqHttpClient;
-    use grit_lib::remote::transport::http::{http_client_arc, http_fetch};
     use std::net::{TcpListener, TcpStream};
     use std::process::{Child, Command, Stdio};
     use std::sync::Arc;
@@ -749,22 +812,35 @@ mod http {
     }
 
     fn grit_fetch_http(local: &Path, url: &str, refspecs: &[&str], configured: &[&str]) {
-        let client =
-            Arc::new(UreqHttpClient::from_config(&Default::default()).expect("ureq client"));
-        let mut opts = FetchOptions {
-            refspecs: refspecs.iter().map(|s| (*s).to_owned()).collect(),
-            configured_refspecs: configured.iter().map(|s| (*s).to_owned()).collect(),
-            tags: TagMode::None,
-            remote_name: Some("origin".into()),
-            fetch_source: Some(url.to_owned()),
-            ..Default::default()
-        };
-        http_fetch(
-            http_client_arc(client),
+        let client = Arc::new(
+            UreqHttpClient::from_config(
+                &Default::default(),
+                &grit_lib::config::environment::Environment::empty(),
+            )
+            .expect("ureq client"),
+        );
+        let mut opts = FetchOptions::new();
+        opts.refspecs = refspecs.iter().map(|s| (*s).to_owned()).collect();
+        opts.configured_refspecs = configured.iter().map(|s| (*s).to_owned()).collect();
+        opts.tags = TagMode::None;
+        opts.remote_name = Some("origin".into());
+        opts.fetch_source = Some(url.to_owned());
+        grit_lib::repo::Repository::open(
             &local.join(".git"),
-            url,
+            &grit_lib::config::environment::RepositoryOptions::with_environment(
+                (&mut opts).environment.clone(),
+            ),
+        )
+        .expect("open fetch target")
+        .remotes()
+        .fetch_from(
+            grit_lib::remote::transfer::TransferEndpoint::Http {
+                client: http_client_arc(client),
+                url: url,
+            },
             &mut opts,
-            &mut NoProgress,
+            &mut NullProgress,
+            grit_lib::progress::CancelToken::never_ref(),
         )
         .expect("http fetch");
     }
@@ -867,22 +943,35 @@ mod http {
         let server = start_http_server(remote.path());
         let grit_c = clone_consumer(tmp.path(), &remote, "grit-c");
         run_git(&grit_c, &["remote", "set-url", "origin", &server.url]);
-        let client =
-            Arc::new(UreqHttpClient::from_config(&Default::default()).expect("ureq client"));
-        let mut opts = FetchOptions {
-            refspecs: vec!["no-such-branch".into()],
-            configured_refspecs: vec!["+refs/heads/*:refs/remotes/origin/*".into()],
-            tags: TagMode::None,
-            remote_name: Some("origin".into()),
-            fetch_source: Some(server.url.clone()),
-            ..Default::default()
-        };
-        let err = http_fetch(
-            http_client_arc(client),
+        let client = Arc::new(
+            UreqHttpClient::from_config(
+                &Default::default(),
+                &grit_lib::config::environment::Environment::empty(),
+            )
+            .expect("ureq client"),
+        );
+        let mut opts = FetchOptions::new();
+        opts.refspecs = vec!["no-such-branch".into()];
+        opts.configured_refspecs = vec!["+refs/heads/*:refs/remotes/origin/*".into()];
+        opts.tags = TagMode::None;
+        opts.remote_name = Some("origin".into());
+        opts.fetch_source = Some(server.url.clone());
+        let err = grit_lib::repo::Repository::open(
             &grit_c.join(".git"),
-            &server.url,
+            &grit_lib::config::environment::RepositoryOptions::with_environment(
+                (&mut opts).environment.clone(),
+            ),
+        )
+        .expect("open fetch target")
+        .remotes()
+        .fetch_from(
+            grit_lib::remote::transfer::TransferEndpoint::Http {
+                client: http_client_arc(client),
+                url: &server.url,
+            },
             &mut opts,
-            &mut NoProgress,
+            &mut NullProgress,
+            grit_lib::progress::CancelToken::never_ref(),
         )
         .unwrap_err();
         assert!(

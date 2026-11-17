@@ -6,13 +6,13 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 use grit_lib::config::environment::RepositoryOptions;
-use grit_lib::objects::pack::packed_full_object_slice;
 use grit_lib::objects::pack_objects::{
-    write_upload_pack_stream, PackBuildOptions, PackProgress, PackStats,
+    PackBuildOptions, PackProgress, PackStats, UploadPackStream,
 };
 use grit_lib::objects::ObjectId;
-use grit_lib::remote::serve::{upload_pack, ProtocolVersion, ServeOptions};
+use grit_lib::remote::serve::{ProtocolVersion, ServeOptions, UploadPack};
 use grit_lib::repo::Repository;
+use grit_lib::test_support::objects_pack::packed_full_object_slice;
 use grit_test_support::{HashAlgo, RepoFixture};
 
 fn git_ok(repo: &RepoFixture, args: &[&str]) {
@@ -133,19 +133,13 @@ fn stream_clone_pack(
     opts: &PackBuildOptions,
 ) -> (Vec<u8>, PackStats) {
     let mut buf = Vec::new();
-    let mut progress = |_ev: PackProgress| {};
-    let stats = write_upload_pack_stream(
-        repo,
-        wants,
-        haves,
-        &HashSet::new(),
-        &HashSet::new(),
-        None,
-        opts,
-        &mut progress,
-        &mut buf,
-    )
-    .expect("stream pack");
+    let mut progress = grit_lib::progress::NullProgress;
+    let stats = UploadPackStream::new(wants, *opts)
+        .with_haves(haves)
+        .with_source_shallow(&HashSet::new())
+        .with_have_shallow(&HashSet::new())
+        .write(repo, &mut grit_lib::progress::NullProgress, &mut buf)
+        .expect("stream pack");
     (buf, stats)
 }
 
@@ -343,15 +337,12 @@ fn reuse_skips_when_have_shallow_grafts_present() {
     };
     let mut buf = Vec::new();
     let mut progress = |_ev: PackProgress| {};
-    let out = grit_lib::objects::pack::try_write_streaming_pack(
+    let out = grit_lib::test_support::objects_pack::try_write_streaming_pack(
         &repo,
-        &[tip],
-        &[parent],
-        &HashSet::new(),
-        &have_shallow,
-        None,
-        &opts,
-        &mut progress,
+        &UploadPackStream::new(&[tip], opts)
+            .with_haves(&[parent])
+            .with_have_shallow(&have_shallow),
+        &mut grit_lib::progress::NullProgress,
         &mut buf,
     )
     .expect("try reuse");
@@ -378,19 +369,12 @@ fn thin_pack_bitmap_reuse_index_pack_strict_ok() {
         ..PackBuildOptions::default()
     };
     let mut buf = Vec::new();
-    let mut progress = |_ev: PackProgress| {};
-    write_upload_pack_stream(
-        &repo,
-        &[tip],
-        &[parent],
-        &HashSet::new(),
-        &HashSet::new(),
-        None,
-        &opts,
-        &mut progress,
-        &mut buf,
-    )
-    .expect("thin pack with bitmap ofs reuse");
+    UploadPackStream::new(&[tip], opts)
+        .with_haves(&[parent])
+        .with_source_shallow(&HashSet::new())
+        .with_have_shallow(&HashSet::new())
+        .write(&repo, &mut grit_lib::progress::NullProgress, &mut buf)
+        .expect("thin pack with bitmap ofs reuse");
     git_index_pack_strict(&buf, HashAlgo::Sha1, true, Some(fx.path()));
 }
 
@@ -466,19 +450,13 @@ fn thin_pack_ref_delta_conversion() {
         ..PackBuildOptions::default()
     };
     let mut buf = Vec::new();
-    let mut progress = |_ev: PackProgress| {};
-    let stats = write_upload_pack_stream(
-        &repo,
-        &[tip],
-        &[parent],
-        &HashSet::new(),
-        &HashSet::new(),
-        None,
-        &opts,
-        &mut progress,
-        &mut buf,
-    )
-    .expect("thin pack");
+    let mut progress = grit_lib::progress::NullProgress;
+    let stats = UploadPackStream::new(&[tip], opts)
+        .with_haves(&[parent])
+        .with_source_shallow(&HashSet::new())
+        .with_have_shallow(&HashSet::new())
+        .write(&repo, &mut grit_lib::progress::NullProgress, &mut buf)
+        .expect("thin pack");
     git_index_pack_strict(&buf, HashAlgo::Sha1, true, Some(fx.path()));
     assert!(
         stats.pack_ref_from_ofs_objects > 0 || stats.verbatim_reuse_bytes > 0,
@@ -663,13 +641,9 @@ fn upload_pack_full_clone(repo: &Repository, tip: &ObjectId, protocol: ProtocolV
         hidden_refs: Vec::new(),
         ..ServeOptions::default()
     };
-    upload_pack(
-        repo,
-        &mut std::io::Cursor::new(body),
-        &mut out,
-        &mut serve_opts,
-    )
-    .expect("upload-pack");
+    UploadPack::new(repo, &mut serve_opts)
+        .run(&mut std::io::Cursor::new(body), &mut out)
+        .expect("upload-pack");
     sideband_pack(&out)
 }
 
@@ -685,19 +659,12 @@ fn full_clone_without_bitmap_streams_verbatim_pack_entries() {
         ..PackBuildOptions::default()
     };
     let mut writer = RecordingWriter::default();
-    let mut progress = |_ev: PackProgress| {};
-    let stats = write_upload_pack_stream(
-        &repo,
-        &[tip],
-        &[],
-        &HashSet::new(),
-        &HashSet::new(),
-        None,
-        &opts,
-        &mut progress,
-        &mut writer,
-    )
-    .expect("stream pack");
+    let stats = UploadPackStream::new(&[tip], opts)
+        .with_haves(&[])
+        .with_source_shallow(&HashSet::new())
+        .with_have_shallow(&HashSet::new())
+        .write(&repo, &mut grit_lib::progress::NullProgress, &mut writer)
+        .expect("stream pack");
 
     let expected_objects = fx
         .git(&["rev-list", "--objects", "--all"])
@@ -1053,18 +1020,12 @@ fn upload_pack_propagates_verbatim_reuse_io_error_without_fallback() {
         fail_after: 100,
         armed: true,
     };
-    let err = write_upload_pack_stream(
-        &repo,
-        &[blob],
-        &[],
-        &HashSet::new(),
-        &HashSet::new(),
-        None,
-        &opts,
-        &mut |_p: PackProgress| {},
-        &mut writer,
-    )
-    .expect_err("broken pipe must abort the pack");
+    let err = UploadPackStream::new(&[blob], opts)
+        .with_haves(&[])
+        .with_source_shallow(&HashSet::new())
+        .with_have_shallow(&HashSet::new())
+        .write(&repo, &mut grit_lib::progress::NullProgress, &mut writer)
+        .expect_err("broken pipe must abort the pack");
     assert!(
         matches!(err, grit_lib::error::Error::Io(_)),
         "expected Io error, got {err:?}"

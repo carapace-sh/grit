@@ -5,9 +5,9 @@
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::operation::ConflictKind;
 use grit_lib::porcelain::status::{
-    status, ConflictGroup, StatusAction, StatusGuidance, StatusModel, StatusOptions,
+    ConflictGroup, StatusAction, StatusGuidance, StatusModel, StatusOptions,
 };
-use grit_lib::progress::{NeverCancel, NullProgress};
+use grit_lib::progress::{CancelToken, NullProgress};
 use grit_lib::refs::branch_tracking::{BranchStanding, StandingOptions};
 use grit_lib::repo::Repository;
 use grit_lib::state::{InProgressOperation, NextStep};
@@ -30,13 +30,14 @@ fn open(root: &Path) -> Repository {
 }
 
 fn model_and_standing(repo: &Repository) -> (StatusModel, BranchStanding) {
-    let model = status(
-        repo,
-        &StatusOptions::default(),
-        &mut NullProgress,
-        &NeverCancel,
-    )
-    .expect("status");
+    let model = repo
+        .status()
+        .run(
+            &StatusOptions::default(),
+            &mut NullProgress,
+            &CancelToken::never(),
+        )
+        .expect("status");
     let standing = BranchStanding::compute(
         repo,
         &model.head,

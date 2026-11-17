@@ -29,20 +29,25 @@ bare_urls = "deny"
 [features]
 # Tests that start the system `git` or build heavy fixtures run only with this
 # feature (`make test-full`, the nightly CI job); see TESTING.md.
-full-tests = []
+full-tests = ["test-support"]
 # Provides the default `ureq`-backed `HttpClient` for the smart-HTTP transport
 # (`transport::http::ureq_client`). Off by default so embedders can bring their
 # own HTTP stack.
 http-ureq = ["dep:ureq", "dep:base64", "ureq?/rustls"]
 # Use the platform TLS stack (Secure Transport on macOS) instead of rustls.
 http-ureq-native-tls = ["http-ureq", "ureq?/native-tls"]
-# Internal helpers for Criterion benches (EWAH); omitted from the public API snapshot.
-unstable-bench-helpers = []
+# Unstable test hooks for the workspace; outside semver — dev-dependencies and internal crates only.
+test-support = []
 # Forward `trace_span!` to the `tracing` crate (zero cost when disabled).
 tracing = ["dep:tracing"]
-# Derive `serde::Serialize` on result models (`StatusModel`, `DiffEntry`, `LoadedCommit`,
-# commit/switch/reset/fetch/push/stash/rebase outcomes, `Signature`, `Error`, …).
+# Derive or implement `serde::Serialize` on result models (`StatusModel`, `DiffEntry`,
+# `LoadedCommit`, commit/switch/reset/fetch/push/stash/rebase outcomes, blame/describe/tag/worktree
+# results, `Signature`, `Error`, …).
 serde-models = []
+# Lay out grit-lib's hot code path (hot-text.ld) contiguously in every binary that links the
+# library, so short operations fault in fewer code pages. x86_64 Linux GNU (LLD) only; a
+# no-op elsewhere. See build.rs.
+hot-text-layout = []
 
 [dependencies]
 tracing = { version = "0.1", optional = true, default-features = false, features = ["std"] }
@@ -97,6 +102,10 @@ name = "environment"
 harness = false
 
 [[bench]]
+name = "repository_open"
+harness = false
+
+[[bench]]
 name = "config_parse"
 harness = false
 
@@ -135,7 +144,7 @@ harness = false
 [[bench]]
 name = "history_plan_rebase"
 harness = false
-required-features = ["unstable-bench-helpers"]
+required-features = ["test-support"]
 
 [[bench]]
 name = "fsck"
@@ -152,7 +161,7 @@ harness = false
 [[bench]]
 name = "pack_sideband"
 harness = false
-required-features = ["unstable-bench-helpers"]
+required-features = ["test-support"]
 
 [[bench]]
 name = "repack"
@@ -160,6 +169,10 @@ harness = false
 
 [[bench]]
 name = "merge_content"
+harness = false
+
+[[bench]]
+name = "merge_exact_renames"
 harness = false
 
 [[bench]]
@@ -217,7 +230,7 @@ harness = false
 [[bench]]
 name = "ewah"
 harness = false
-required-features = ["unstable-bench-helpers"]
+required-features = ["test-support"]
 
 [[bench]]
 name = "change_id_resolve"
@@ -267,7 +280,12 @@ harness = false
 name = "fetch_local_many_refs"
 harness = false
 
+[[bench]]
+name = "push_resolve_many_refs"
+harness = false
+
 [dev-dependencies]
+bincode.workspace = true
 criterion.workspace = true
 grit-test-support = { path = "../grit-test-support" }
 serde = { workspace = true, features = ["derive"] }
@@ -281,6 +299,22 @@ tracing-subscriber = { version = "0.3", features = ["fmt"] }
 [[test]]
 name = "integration"
 path = "tests/integration.rs"
+required-features = ["test-support"]
+
+[[test]]
+name = "status_staging_commit_handles"
+path = "tests/status_staging_commit_handles.rs"
+required-features = ["test-support"]
+
+[[test]]
+name = "rebase_head_reflog_2560"
+path = "tests/rebase_head_reflog_2560.rs"
+required-features = ["full-tests"]
+
+[[test]]
+name = "clone_reflog_injected_ref_store"
+path = "tests/clone_reflog_injected_ref_store.rs"
+required-features = ["full-tests"]
 
 [[test]]
 name = "add_bulk_memory"
@@ -328,16 +362,41 @@ path = "tests/filter_process_repo_scope.rs"
 required-features = ["full-tests"]
 
 [[test]]
+name = "git_index_file_write_git_compat"
+path = "tests/git_index_file_write_git_compat.rs"
+required-features = ["full-tests"]
+
+[[test]]
+name = "index_error_variants"
+path = "tests/index_error_variants.rs"
+required-features = ["full-tests"]
+
+[[test]]
+name = "index_error_kind_names"
+path = "tests/index_error_kind_names.rs"
+
+[[test]]
 name = "hygiene"
 path = "tests/hygiene.rs"
 
 [[test]]
+name = "issue_2403_no_dangling_after_rebase_or_merge_abort"
+path = "tests/issue_2403_no_dangling_after_rebase_or_merge_abort.rs"
+required-features = ["full-tests"]
+
+[[test]]
 name = "init_filesystem_capabilities"
 path = "tests/init_filesystem_capabilities.rs"
+required-features = ["full-tests"]
 
 [[test]]
 name = "matrix_credentials"
 path = "tests/matrix_credentials.rs"
+required-features = ["full-tests"]
+
+[[test]]
+name = "mailmap_issue_2551_group_by_author_git_compat"
+path = "tests/mailmap_issue_2551_group_by_author_git_compat.rs"
 required-features = ["full-tests"]
 
 [[test]]
@@ -352,6 +411,11 @@ path = "tests/public_module_doctests.rs"
 [[test]]
 name = "ref_storage_format"
 path = "tests/ref_storage_format.rs"
+
+[[test]]
+name = "references_update_head_2497"
+path = "tests/references_update_head_2497.rs"
+required-features = ["full-tests"]
 
 [[test]]
 name = "remote_dispatch"
@@ -393,6 +457,11 @@ path = "tests/sparse_index_readonly_porcelain_git_compat.rs"
 required-features = ["full-tests"]
 
 [[test]]
+name = "fsmonitor_valid_status"
+path = "tests/fsmonitor_valid_status.rs"
+required-features = ["full-tests"]
+
+[[test]]
 name = "status_optional_locks_git_compat"
 path = "tests/status_optional_locks_git_compat.rs"
 required-features = ["full-tests"]
@@ -415,6 +484,11 @@ required-features = ["full-tests"]
 [[test]]
 name = "diff_tree_metadata_memory"
 path = "tests/diff_tree_metadata_memory.rs"
+required-features = ["full-tests"]
+
+[[test]]
+name = "odb_primary_read_allocations"
+path = "tests/odb_primary_read_allocations.rs"
 required-features = ["full-tests"]
 
 # Asserts an absolute peak-RSS budget in a re-executed child, so the measured
@@ -442,6 +516,11 @@ required-features = ["full-tests"]
 [[test]]
 name = "checkout_wide_tree_rss"
 path = "tests/checkout_wide_tree_rss.rs"
+required-features = ["full-tests"]
+
+[[test]]
+name = "history_rebase_bin"
+path = "tests/history_rebase_bin.rs"
 required-features = ["full-tests"]
 
 [[bench]]

@@ -7,6 +7,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::objects::ObjectId;
+use grit_lib::refs::check_ref_format::{RefName, RefNamePolicy};
 use grit_lib::repo::Repository;
 
 /// Capabilities on the first `want` line for clone-style serve benchmarks.
@@ -85,12 +86,16 @@ fn serve_clone_capability_string(repo: &Repository) -> String {
 
 /// Collect ref tips in the same order Git uses for a full-clone want list.
 fn ref_want_oids(repo: &Repository) -> Result<Vec<ObjectId>> {
-    let mut refs = grit_lib::refs::list_refs(repo.git_dir(), "refs/")?;
+    let mut refs = repo.references().list("refs/").map(|refs| {
+        refs.into_iter()
+            .map(|(n, o)| (String::from(n), o))
+            .collect::<Vec<_>>()
+    })?;
     refs.sort_by(|a, b| a.0.cmp(&b.0));
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     for (name, oid) in refs {
-        if !grit_lib::refs::is_valid_fetch_advertised_ref(&name) {
+        if RefName::parse(&name, &RefNamePolicy::default().advertised_fetch()).is_err() {
             continue;
         }
         if seen.insert(oid) {

@@ -3,6 +3,7 @@
 //! block the new name (ancestors and descendants, loose or packed) are still reported.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use grit_lib::error::RefError;
 use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;
@@ -10,7 +11,7 @@ use std::path::Path;
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::error::Error;
 use grit_lib::objects::ObjectId;
-use grit_lib::porcelain::branch::{create_branch, CreateBranchOptions, TrackMode};
+use grit_lib::porcelain::branch::{BranchCreateOptions, TrackMode};
 use grit_lib::refs::store::RefStoreError;
 use grit_lib::refs::RefnameUnavailable;
 use grit_lib::repo::Repository;
@@ -23,7 +24,7 @@ fn open(dir: &Path) -> Repository {
 fn create(dir: &Path, name: &str) -> grit_lib::error::Result<()> {
     create_branch(
         &open(dir),
-        &CreateBranchOptions {
+        &BranchCreateOptions {
             name: name.into(),
             start: None,
             force: false,
@@ -73,7 +74,7 @@ fn lock_files(dir: &Path) -> Vec<String> {
 
 fn name_unavailable(err: Error) -> RefnameUnavailable {
     match err {
-        Error::RefStore(RefStoreError::NameUnavailable { reason }) => reason,
+        Error::Ref(RefError::Store(RefStoreError::NameUnavailable { reason })) => reason,
         other => panic!("expected a refname conflict, got {other:?}"),
     }
 }

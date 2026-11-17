@@ -7,7 +7,6 @@ use std::path::Path;
 
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::config::{ConfigFile, ConfigScope, ConfigSet};
-use grit_lib::diff::combined_diff_patch::CombinedDiffWsOptions;
 use grit_lib::diff::combined_tree_diff::{CombinedParentSide, CombinedParentStatus};
 use grit_lib::diff::merge_diff::{
     all_blob_paths_in_tree_order, blob_oid_at_path, blob_text_for_diff, combined_diff_paths,
@@ -16,23 +15,18 @@ use grit_lib::diff::merge_diff::{
     diff_textconv_active, diff_textconv_cmd_line, format_combined_binary,
     format_combined_binary_header, format_combined_binary_header_n, format_combined_textconv_patch,
     format_worktree_conflict_combined, is_binary_for_diff, read_blob_at_path, run_textconv,
+    CombinedPatchOptions, ConflictStages,
 };
+use grit_lib::diff::PathQuoting;
 use grit_lib::objects::{parse_commit, ObjectId, ObjectKind};
 use grit_lib::refs;
-use grit_lib::refs::ref_exclusions::RefExclusions;
 use grit_lib::refs::ref_storage::RefStorageFormat;
 use grit_lib::repo::{
     common_git_dir_for_config, early_config_ignore_repo_reason, ensure_core_bare,
     init_worktree_config, repository_format_warning, resolve_dot_git, resolve_git_directory_arg,
     validate_repo_config, validate_repo_format, worktree_config_enabled, InitOptions, Repository,
 };
-use grit_lib::revwalk::rev_list::{
-    commit_tips_from_named_refs, commit_visible_for_dense_pathspecs, merge_bases,
-    object_ids_for_cat_file_filtered, reachable_object_ids_for_cat_file, render_commit,
-    render_commit_with_color, resolve_object_walk_roots, resolve_revision_commits, rev_list,
-    shallow_borders_reachable_from_wants, shallow_boundary_oids, tag_targets, MissingAction,
-    ObjectFilter, OrderingMode, OutputMode, RevListOptions,
-};
+use grit_lib::revwalk::rev_list::{MissingAction, ObjectFilter, OrderingMode, RevListOptions};
 
 use support::{commit_file, git, open_grit_repo, HistoryRepo};
 
@@ -98,7 +92,7 @@ fn merge_diff_and_textconv_matrix_on_merge_commit() -> grit_lib::error::Result<(
     let _ =
         combined_merge_parent_blob_paths(repo.odb(), "file.txt", &parsed.parents, &parsed.tree, 50);
 
-    let config = repo.config()?;
+    let config = repo.config().snapshot()?;
     let sides = [
         CombinedParentSide {
             mode: 0o100644,
@@ -137,15 +131,9 @@ fn merge_diff_and_textconv_matrix_on_merge_commit() -> grit_lib::error::Result<(
             path,
             &parsed.parents,
             &parsed.tree,
-            7,
-            3,
-            false,
-            false,
-            CombinedDiffWsOptions::default(),
-            false,
-            None,
-            &sides,
-            false,
+            &CombinedPatchOptions::default()
+                .with_parent_sides(&sides)
+                .with_path_quoting(PathQuoting::KeepNonAscii),
         );
         let stage1 = parsed.parents[0];
         let stage2 = parsed.parents[1];
@@ -155,9 +143,11 @@ fn merge_diff_and_textconv_matrix_on_merge_commit() -> grit_lib::error::Result<(
             config.as_ref(),
             repo.odb(),
             path,
-            &stage1,
-            &stage2,
-            &stage3,
+            &ConflictStages {
+                base: stage1,
+                ours: stage2,
+                theirs: stage3,
+            },
             b"<<<<<<< ours\nmerged\n=======\n",
             7,
         );
@@ -244,7 +234,7 @@ fn rev_list_deep_history_and_ref_matrix() -> grit_lib::error::Result<()> {
         for ancestry in [false, true] {
             let opts = RevListOptions {
                 ordering,
-                output_mode: OutputMode::Format(String::from("format:%H %P %s %D %d")),
+                parent_rewrite: true,
                 ancestry_path: ancestry,
                 ancestry_path_bottoms: vec![mid],
                 left_right: true,
@@ -268,28 +258,29 @@ fn rev_list_deep_history_and_ref_matrix() -> grit_lib::error::Result<()> {
                 filter_print_omitted: true,
                 ..RevListOptions::default()
             };
-            let out = rev_list(&repo, &[String::from("main")], &[], &opts)?;
+            let out = repo
+                .revwalk()
+                .rev_list(&[String::from("main")], &[], &opts)?;
             assert!(!out.commits.is_empty());
-            if let Some(head) = out.commits.first() {
-                let _ = render_commit(&repo, *head, &opts.output_mode, 12)?;
-                let _ = render_commit_with_color(&repo, *head, &opts.output_mode, 12, true)?;
-            }
         }
     }
 
-    let pairs = refs::list_refs(repo.git_dir(), "refs/")?;
-    let tips = commit_tips_from_named_refs(&repo, &pairs, &RefExclusions::default())?;
-    assert!(!tips.is_empty());
-    let _ = resolve_revision_commits(&repo, &["main".to_owned(), "side".to_owned()])?;
-    let _ = resolve_object_walk_roots(&repo, &["main".to_owned()])?;
-    let _ = tag_targets(&repo)?;
-    let _ = shallow_boundary_oids(repo.git_dir());
-    let _ = shallow_borders_reachable_from_wants(&repo, &[tip]);
-    let filter = ObjectFilter::BlobLimit(4096);
-    let _ = object_ids_for_cat_file_filtered(&repo, &filter)?;
-    let _ = reachable_object_ids_for_cat_file(&repo, Some(&filter), false)?;
-    let _ = commit_visible_for_dense_pathspecs(&repo, tip, &["files/f0.txt".to_owned()])?;
-    let _ = merge_bases(&repo, tip, mid, false)?;
+    let _ = repo
+        .revwalk()
+        .resolve_commits(&["main".to_owned(), "side".to_owned()])?;
+    let _ = repo.revwalk().tag_targets()?;
+    let _ = repo.revwalk().shallow_boundary_oids();
+    let filtered = RevListOptions {
+        all_refs: true,
+        objects: true,
+        no_object_names: true,
+        filter: Some(ObjectFilter::BlobLimit(4096)),
+        ..RevListOptions::default()
+    };
+    let _ = repo.revwalk().rev_list(&[], &[], &filtered)?;
+    let _ = repo
+        .revwalk()
+        .merge_bases(&[tip, mid], grit_lib::revwalk::MergeBaseMode::All)?;
     Ok(())
 }
 

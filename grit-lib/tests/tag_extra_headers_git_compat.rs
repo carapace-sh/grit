@@ -4,11 +4,11 @@ use std::io::Write;
 use std::process::Command;
 
 use grit_lib::config::environment::RepositoryOptions;
-use grit_lib::maintenance::repository_fsck::{fsck, FsckOptions};
+use grit_lib::maintenance::repository_fsck::FsckOptions;
 use grit_lib::objects::{
     extra_header_values, parse_tag, serialize_tag, set_extra_header, ObjectKind, TagData,
 };
-use grit_lib::progress::{NeverCancel, NullProgress};
+use grit_lib::progress::{CancelToken, NullProgress};
 use grit_lib::repo::Repository;
 use grit_test_support::git;
 
@@ -146,6 +146,7 @@ fn grit_written_tag_extra_headers_pass_git_fsck_strict() {
         tagger: Some("T <t@example.com> 1 +0000".into()),
         extra_headers: Vec::new(),
         message: "tag body\n".into(),
+        raw_message: None,
     };
     set_extra_header(
         &mut tag.extra_headers,
@@ -184,6 +185,7 @@ fn grit_fsck_ignores_tag_extra_headers() {
             b"tree-sha256 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n"
                 .to_vec(),
         message: "body\n".into(),
+        raw_message: None,
     };
     let bytes = serialize_tag(&tag);
     let tag_oid = repo
@@ -196,8 +198,11 @@ fn grit_fsck_ignores_tag_extra_headers() {
     );
 
     let opts = FsckOptions::full_repository(false).with_check_dangling(false);
-    let report = fsck(&repo, &opts, &mut NullProgress, &NeverCancel).expect("grit fsck");
-    let config = repo.config().expect("config");
+    let report = repo
+        .maintenance()
+        .fsck(&opts, &mut NullProgress, &CancelToken::never())
+        .expect("grit fsck");
+    let config = repo.config().snapshot().expect("config");
     assert!(
         report.ok(&config, &opts),
         "expected fsck ok; issues: {:?}",

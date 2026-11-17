@@ -3,15 +3,11 @@
 use std::path::{Path, PathBuf};
 
 use grit_lib::config::environment::{Environment, RepositoryOptions};
-use grit_lib::progress::NeverCancel;
-use grit_lib::refs;
-use grit_lib::remote::fetch::NoProgress;
 use grit_lib::remote::push_plan::{
-    load_push_plan_context, open_push_destination, resolve_push, PushPlanError, PushPlanKind,
-    PushRequest,
+    open_push_destination, PushPlanError, PushPlanKind, PushRequest,
 };
 use grit_lib::remote::push_report::PushRefStatus;
-use grit_lib::remote::transfer::{push_local, PushOptions, PushRefSpec};
+use grit_lib::remote::transfer::{PushOptions, PushRefSpec};
 use grit_lib::repo::Repository;
 use grit_test_support::{git, git_cmd};
 
@@ -69,9 +65,14 @@ fn delete_request(remote: &str, names: &[&str]) -> PushRequest {
 fn delete_push_removes_every_named_ref_like_git() {
     let (_tmp, work) = two_remote_fixture();
     let repo = open_repo(&work);
-    let config = repo.config().expect("config");
-    let ctx = load_push_plan_context(&repo, &config, Some("grit"), None).expect("context");
-    let plan = resolve_push(&repo, &config, &delete_request("grit", &["a", "b"]), &ctx)
+    let config = repo.config().snapshot().expect("config");
+    let ctx = repo
+        .remotes()
+        .push_plan_context(Some("grit"), None)
+        .expect("context");
+    let plan = repo
+        .remotes()
+        .resolve_push(&delete_request("grit", &["a", "b"]), &ctx)
         .expect("resolve delete push");
     assert_eq!(plan.kind, PushPlanKind::Delete);
     let outcome = open_push_destination(&config, &plan.remote)
@@ -81,7 +82,7 @@ fn delete_push_removes_every_named_ref_like_git() {
             &plan.specs,
             PushOptions::default(),
             &mut NoProgress,
-            &NeverCancel,
+            &CancelToken::never(),
             None,
         )
         .expect("push");
@@ -109,16 +110,19 @@ fn delete_push_removes_every_named_ref_like_git() {
 fn delete_push_with_refspec_leaves_remote_unchanged_like_git() {
     let (_tmp, work) = two_remote_fixture();
     let repo = open_repo(&work);
-    let config = repo.config().expect("config");
+    let config = repo.config().snapshot().expect("config");
     let before = remote_refs(&work, "grit");
-    let ctx = load_push_plan_context(&repo, &config, Some("grit"), None).expect("context");
-    let err = resolve_push(
-        &repo,
-        &config,
-        &delete_request("grit", &["HEAD:refs/heads/release", "b"]),
-        &ctx,
-    )
-    .expect_err("refspec next to --delete");
+    let ctx = repo
+        .remotes()
+        .push_plan_context(Some("grit"), None)
+        .expect("context");
+    let err = repo
+        .remotes()
+        .resolve_push(
+            &delete_request("grit", &["HEAD:refs/heads/release", "b"]),
+            &ctx,
+        )
+        .expect_err("refspec next to --delete");
     assert_eq!(
         err,
         PushPlanError::DeleteNotPlainName {
@@ -175,10 +179,18 @@ fn push_delete_tag_on_local_remote() {
         .unwrap();
 
     let local_git = local.join(".git");
-    let tag_oid = refs::resolve_ref(&local_git, "refs/tags/v1").unwrap();
-    push_local(
+    let tag_oid = grit_test_support::refs::at(&local_git)
+        .references()
+        .resolve("refs/tags/v1")
+        .unwrap();
+    grit_lib::repo::Repository::open(
         &local_git,
-        &origin,
+        &grit_lib::config::environment::RepositoryOptions::empty(),
+    )
+    .expect("open push source")
+    .remotes()
+    .push_to(
+        grit_lib::remote::transfer::TransferEndpoint::Local(&origin),
         &[PushRefSpec {
             src: Some(tag_oid),
             src_ref: None,
@@ -190,14 +202,23 @@ fn push_delete_tag_on_local_remote() {
             ..Default::default()
         }],
         &PushOptions::default(),
-        &grit_lib::progress::NeverCancel,
+        &mut grit_lib::remote::fetch::NoProgress,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("push tag");
-    assert!(refs::resolve_ref(&origin, "refs/tags/v1").is_ok());
+    assert!(grit_test_support::refs::at(&origin)
+        .references()
+        .resolve("refs/tags/v1")
+        .is_ok());
 
-    push_local(
+    grit_lib::repo::Repository::open(
         &local_git,
-        &origin,
+        &grit_lib::config::environment::RepositoryOptions::empty(),
+    )
+    .expect("open push source")
+    .remotes()
+    .push_to(
+        grit_lib::remote::transfer::TransferEndpoint::Local(&origin),
         &[PushRefSpec {
             src: None,
             src_ref: None,
@@ -209,8 +230,12 @@ fn push_delete_tag_on_local_remote() {
             ..Default::default()
         }],
         &PushOptions::default(),
-        &grit_lib::progress::NeverCancel,
+        &mut grit_lib::remote::fetch::NoProgress,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("delete tag");
-    assert!(refs::resolve_ref(&origin, "refs/tags/v1").is_err());
+    assert!(grit_test_support::refs::at(&origin)
+        .references()
+        .resolve("refs/tags/v1")
+        .is_err());
 }

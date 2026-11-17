@@ -8,17 +8,17 @@ use std::process::Command;
 
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::error::Error;
-use grit_lib::porcelain::commit::{commit_with_scope, CommitRequest, CommitScope};
+use grit_lib::porcelain::commit::{CommitRequest, CommitScope};
 use grit_lib::progress::NullProgress;
 use grit_lib::repo::Repository;
 
 fn commit_req(message: &str) -> CommitRequest {
     let id = "AutoStage <auto@example.com> 1700000000 +0000";
-    CommitRequest {
-        message: message.to_owned(),
-        author: Some(id.parse().expect("signature")),
-        committer: Some(id.parse().expect("signature")),
-        ..Default::default()
+    {
+        let mut req = CommitRequest::new(message.to_owned());
+        req.author = Some(id.parse().expect("signature"));
+        req.committer = Some(id.parse().expect("signature"));
+        req
     }
 }
 
@@ -64,15 +64,21 @@ fn repo_with_initial_commit() -> tempfile::TempDir {
 
 fn assert_nothing_to_commit(root: &Path, req: &CommitRequest) {
     let head_before = git_out(root, &["rev-parse", "HEAD"]);
-    let err = commit_with_scope(
-        &open_grit(root),
-        req,
-        CommitScope::AutoStage,
-        &mut NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect_err("nothing to commit");
-    assert!(matches!(err, Error::NothingToCommit), "got {err:?}");
+    let err = open_grit(root)
+        .commits()
+        .create(
+            &grit_lib::commits::CommitOptions::new(req.clone(), CommitScope::AutoStage),
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect_err("nothing to commit");
+    assert!(
+        matches!(
+            err,
+            grit_lib::error::Error::Commit(CommitError::NothingToCommit)
+        ),
+        "got {err:?}"
+    );
     assert_eq!(git_out(root, &["rev-parse", "HEAD"]), head_before);
 }
 

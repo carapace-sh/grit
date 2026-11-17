@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use crate::change_id::ChangeId;
 use crate::ident::Signature;
 use crate::objects::ObjectId;
+use crate::refs::store::RefName;
 
 /// Description of a new commit to insert immediately before an existing one.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,7 +67,7 @@ pub enum CommitEdit {
 /// Pathspec strings passed to history helpers (same syntax as `git` pathspecs on the CLI).
 pub type Pathspec<'a> = &'a [String];
 
-/// Options for [`super::split`](crate::history::split).
+/// Options for [`History::split`](super::History::split).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SplitOptions {
     /// When set, replaces the remaining commit's message after the split.
@@ -103,7 +104,7 @@ pub enum EmptyPolicy {
     Abort,
 }
 
-/// Inputs for [`super::plan_rewrite`](crate::history::plan_rewrite).
+/// Inputs for [`History::plan_rewrite`](super::History::plan_rewrite) and the other history edits.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RewriteOptions {
     /// Which refs to consider when collecting tips and ref updates.
@@ -124,10 +125,8 @@ pub struct RewriteOptions {
 
 impl RewriteOptions {
     /// The validated header line for [`Self::committer`], checked before any object is written.
-    pub(crate) fn committer_line(&self) -> Result<String, super::HistoryError> {
-        self.committer.validate().map_err(|err| {
-            super::HistoryError::Library(Box::new(crate::error::Error::InvalidSignature(err)))
-        })?;
+    pub(crate) fn committer_line(&self) -> crate::error::Result<String> {
+        self.committer.validate()?;
         Ok(self.committer.header_line())
     }
 }
@@ -150,12 +149,12 @@ pub struct RewrittenCommit {
     pub reused: bool,
 }
 
-/// Planned movement of one ref (refs, index, and worktree are not updated by [`super::plan_rewrite`](crate::history::plan_rewrite)).
+/// Planned movement of one ref (refs, index, and worktree are not updated by [`History::plan_rewrite`](super::History::plan_rewrite)).
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde-models", derive(serde::Serialize))]
 pub struct PlannedRefUpdate {
     /// Full ref name (for example `refs/heads/main`).
-    pub name: String,
+    pub name: RefName,
     /// Previous tip OID.
     pub old: ObjectId,
     /// New tip OID after rewrite.
@@ -182,7 +181,7 @@ pub struct HeadEffect {
     pub checkout_onto: Option<ObjectId>,
 }
 
-/// Result of [`super::plan_rewrite`](crate::history::plan_rewrite): new objects are already in the ODB.
+/// Result of [`History::plan_rewrite`](super::History::plan_rewrite): new objects are already in the ODB.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde-models", derive(serde::Serialize))]
 pub struct RewritePlan {
@@ -208,25 +207,9 @@ impl RewritePlan {
             .collect()
     }
 
-    /// Subject line for each row in [`Self::commits`], in the same order.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`super::HistoryError`] when a subject must be loaded from the object database and
-    /// the commit is missing or corrupt.
-    pub fn subjects(
-        &self,
-        repo: &crate::repo::Repository,
-    ) -> Result<Vec<Option<String>>, super::HistoryError> {
-        self.commits
-            .iter()
-            .map(|row| super::subject::rewritten_row_subject(repo, row))
-            .collect()
-    }
-
     /// Tip OID after rewrite when a ref update moves `old_tip`, if any.
     #[must_use]
-    pub fn mapped_tip(&self, old_tip: ObjectId) -> Option<ObjectId> {
+    pub(crate) fn mapped_tip(&self, old_tip: ObjectId) -> Option<ObjectId> {
         self.ref_updates
             .iter()
             .find(|u| u.old == old_tip)
@@ -261,18 +244,9 @@ impl RewritePlan {
             .unwrap_or(old);
         Some((old, new))
     }
-
-    /// `update <ref> <new> <old>` lines accepted by `git update-ref --stdin`.
-    #[must_use]
-    pub fn ref_update_lines(&self) -> Vec<String> {
-        self.ref_updates
-            .iter()
-            .map(|u| format!("update {} {} {}", u.name, u.new.to_hex(), u.old.to_hex()))
-            .collect()
-    }
 }
 
-/// Identity and reflog text recorded when [`super::apply_rewrite`](crate::history::apply_rewrite) moves refs.
+/// Identity and reflog text recorded when [`History::apply`](super::History::apply) moves refs.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ApplyOptions {
     /// Committer identity for reflog entries (timestamp is taken from the signature).
@@ -292,7 +266,18 @@ pub struct ApplyOptions {
     pub hooks: crate::hooks::PostOperationHooks,
 }
 
-/// Result of [`super::undo::undo_last_rewrite`](crate::history::undo::undo_last_rewrite).
+/// Whether [`History::undo_last`](super::History::undo_last) moves refs or only reports what it
+/// would do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UndoMode {
+    /// Undo the last rewrite: move refs and update the index and work tree.
+    #[default]
+    Apply,
+    /// Check that the undo can run and report its effect without changing anything.
+    DryRun,
+}
+
+/// Result of [`History::undo_last`](super::History::undo_last).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UndoOutcome {
     /// Ref updates that were applied or would be applied (`--dry-run`).
@@ -312,7 +297,7 @@ pub struct UndoOutcome {
     pub dry_run: bool,
 }
 
-/// Result of [`super::apply_rewrite`](crate::history::apply_rewrite).
+/// Result of [`History::apply`](super::History::apply) and the fixup and absorb applies.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde-models", derive(serde::Serialize))]
 pub struct AppliedRewrite {
@@ -355,7 +340,7 @@ mod tests {
             ref_updates: ref_updates
                 .iter()
                 .map(|&(old, new)| PlannedRefUpdate {
-                    name: "refs/heads/main".into(),
+                    name: RefName::from_trusted("refs/heads/main"),
                     old: oid(old),
                     new: oid(new),
                 })

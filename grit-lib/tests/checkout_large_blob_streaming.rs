@@ -1,6 +1,8 @@
 //! Large blobs are streamed into the work tree by restore, switch and hard reset, from loose
 //! objects, a single pack and several packs; the system `git` must see the result as clean
-//! and the repository must pass `git fsck`. Converted paths (autocrlf) are not streamed.
+//! and the repository must pass `git fsck`. Content-dependent CRLF (`core.autocrlf`) streams
+//! when the blob is binary or needs no smudge; lone-LF text still smudges without loading
+//! the blob whole.
 
 use crate::support;
 
@@ -11,9 +13,10 @@ use std::process::Command;
 
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::objects::ObjectId;
-use grit_lib::porcelain::reset::{reset_to_commit, ResetMode, ResetOptions};
-use grit_lib::porcelain::restore::{restore_paths, RestoreOptions, RestoreSource};
-use grit_lib::porcelain::switch::{switch_repository, SwitchMode, SwitchOptions};
+use grit_lib::porcelain::reset::{ResetMode, ResetOptions};
+use grit_lib::porcelain::restore::{RestoreOptions, RestoreSource};
+use grit_lib::porcelain::switch::{SwitchMode, SwitchOptions};
+use grit_lib::progress::CancelToken;
 use grit_lib::repo::Repository;
 
 /// Above the library's 1 MiB streaming limit.
@@ -21,14 +24,13 @@ const BIG: usize = 3 * 1024 * 1024 + 123;
 
 #[test]
 fn streamed_files_keep_cancellation_bounded_after_checkout_chunks_grow() {
-    use grit_lib::porcelain::checkout::checkout_between_trees_with_progress;
-    use grit_lib::progress::{FlagCancel, ProgressSink};
+    use grit_lib::progress::{CancelToken, ProgressSink};
 
     /// Cancels on the ninth file and records how many files were on disk at that moment (the
     /// checkout rolls them back before it returns).
     struct StopAfterNine<'a> {
         completed: u64,
-        cancel: FlagCancel,
+        cancel: CancelToken,
         root: &'a Path,
         written_at_cancel: Option<usize>,
     }
@@ -64,14 +66,16 @@ fn streamed_files_keep_cancellation_bounded_after_checkout_chunks_grow() {
     let tree = ObjectId::from_hex(git(root, &["rev-parse", "HEAD^{tree}"]).trim()).expect("tree");
     git(root, &["rm", "-qr", "--", "."]);
     let repo = open(root);
-    let cancel = FlagCancel::new();
+    let cancel = CancelToken::new();
     let mut progress = StopAfterNine {
         completed: 0,
         cancel: cancel.clone(),
         root,
         written_at_cancel: None,
     };
-    let err = checkout_between_trees_with_progress(&repo, None, &tree, &mut progress, &cancel)
+    let err = repo
+        .checkout()
+        .checkout(None, &tree, &mut progress, &cancel)
         .expect_err("cancel after the initial eight-file chunk");
     assert!(matches!(err, grit_lib::error::Error::Cancelled), "{err:?}");
     assert_eq!(progress.completed, 9);
@@ -228,38 +232,38 @@ fn assert_git_clean(fx: &Fixture, context: &str) {
 }
 
 fn restore_from_index(repo: &Repository, paths: &[&str]) {
-    restore_paths(
-        repo,
-        &RestoreOptions {
-            pathspecs: paths.iter().map(|p| (*p).to_owned()).collect(),
-            pathspec_sources: paths.iter().map(|p| (*p).to_owned()).collect(),
-            source: RestoreSource::Index,
-            staged: false,
-            worktree: true,
-            stage: None,
-            remerge: None,
-        },
-        &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("restore");
+    repo.checkout()
+        .restore(
+            &RestoreOptions {
+                pathspecs: paths.iter().map(|p| (*p).to_owned()).collect(),
+                pathspec_sources: paths.iter().map(|p| (*p).to_owned()).collect(),
+                source: RestoreSource::Index,
+                staged: false,
+                worktree: true,
+                stage: None,
+                remerge: None,
+            },
+            &mut grit_lib::progress::NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("restore");
 }
 
 fn switch_to(repo: &Repository, branch: &str, oid: ObjectId) {
-    switch_repository(
-        repo,
-        &SwitchOptions {
-            mode: SwitchMode::Existing {
-                branch: branch.into(),
-                oid,
+    repo.checkout()
+        .switch(
+            &SwitchOptions {
+                mode: SwitchMode::Existing {
+                    branch: branch.into(),
+                    oid,
+                },
+                dry_run: false,
+                hooks: grit_lib::command_runner::hooks::PostOperationHooks::Run,
             },
-            dry_run: false,
-            hooks: grit_lib::PostOperationHooks::Run,
-        },
-        &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("switch");
+            &mut grit_lib::progress::NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("switch");
 }
 
 fn exercise(storage: Storage) {
@@ -278,18 +282,18 @@ fn exercise(storage: Storage) {
 
     fs::write(fx.root.join("assets/big.dat"), b"scribbled over\n").expect("modify");
     fs::remove_file(fx.root.join("tool.sh")).expect("rm exec");
-    reset_to_commit(
-        &repo,
-        &ResetOptions::new(
-            fx.main,
-            ResetMode::Hard,
-            support::parse_reflog_signature("T <t@example.com>"),
-            "reset: test",
-        ),
-        &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("reset --hard");
+    repo.checkout()
+        .reset(
+            &ResetOptions::new(
+                fx.main,
+                ResetMode::Hard,
+                support::parse_reflog_signature("T <t@example.com>"),
+                "reset: test",
+            ),
+            &mut grit_lib::progress::NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("reset --hard");
     assert_git_clean(&fx, &format!("{storage:?} reset --hard"));
 }
 
@@ -329,8 +333,7 @@ fn corrupt_large_blob_never_leaves_a_partial_file() {
     let repo = open(&fx.root);
 
     fs::remove_file(fx.root.join("assets/big.dat")).expect("rm big");
-    let err = restore_paths(
-        &repo,
+    let err = repo.checkout().restore(
         &RestoreOptions {
             pathspecs: vec!["assets/big.dat".into()],
             pathspec_sources: vec!["assets/big.dat".into()],
@@ -341,7 +344,7 @@ fn corrupt_large_blob_never_leaves_a_partial_file() {
             remerge: None,
         },
         &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     );
     assert!(err.is_err(), "restore of a truncated blob must fail");
     assert!(
@@ -350,8 +353,7 @@ fn corrupt_large_blob_never_leaves_a_partial_file() {
     );
 
     fs::write(fx.root.join("assets/big.dat"), b"local edit\n").expect("modify");
-    let err = reset_to_commit(
-        &repo,
+    let err = repo.checkout().reset(
         &ResetOptions::new(
             fx.main,
             ResetMode::Hard,
@@ -359,7 +361,7 @@ fn corrupt_large_blob_never_leaves_a_partial_file() {
             "reset: test",
         ),
         &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
+        &grit_lib::progress::CancelToken::never(),
     );
     assert!(err.is_err(), "reset --hard to a truncated blob must fail");
     assert_eq!(
@@ -376,6 +378,91 @@ fn corrupt_large_blob_never_leaves_a_partial_file() {
     assert!(
         leftovers.is_empty(),
         "temporary files left behind: {leftovers:?}"
+    );
+}
+
+#[test]
+fn large_binary_blob_under_autocrlf_streams_via_spool() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    git(root, &["init", "-q", "-b", "main"]);
+    git(root, &["config", "user.email", "t@example.com"]);
+    git(root, &["config", "user.name", "Test"]);
+    let mut blob = vec![0u8; BIG];
+    blob[0] = 0;
+    fs::write(root.join("big_zero.bin"), &blob).expect("write");
+    git(root, &["add", "big_zero.bin"]);
+    git(root, &["commit", "-qm", "binary"]);
+    git(root, &["config", "core.autocrlf", "true"]);
+
+    fs::remove_file(root.join("big_zero.bin")).expect("rm");
+    let repo = open(root);
+    repo.checkout()
+        .restore(
+            &RestoreOptions {
+                pathspecs: vec!["big_zero.bin".into()],
+                pathspec_sources: vec!["big_zero.bin".into()],
+                source: RestoreSource::Index,
+                staged: false,
+                worktree: true,
+                stage: None,
+                remerge: None,
+            },
+            &mut grit_lib::progress::NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("restore");
+    let restored = fs::read(root.join("big_zero.bin")).expect("read restored");
+    assert_eq!(restored, blob);
+    let status = git(root, &["status", "--porcelain"]);
+    assert!(
+        status.trim().is_empty(),
+        "git status after autocrlf binary restore:\n{status}"
+    );
+}
+
+#[test]
+fn large_lf_text_under_autocrlf_smudges_to_crlf() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    git(root, &["init", "-q", "-b", "main"]);
+    git(root, &["config", "user.email", "t@example.com"]);
+    git(root, &["config", "user.name", "Test"]);
+    let mut text = vec![b'a'; BIG];
+    for i in (0..text.len()).step_by(64) {
+        text[i] = b'\n';
+    }
+    fs::write(root.join("lines.txt"), &text).expect("write");
+    git(root, &["add", "lines.txt"]);
+    git(root, &["commit", "-qm", "lf lines"]);
+    git(root, &["config", "core.autocrlf", "true"]);
+
+    fs::remove_file(root.join("lines.txt")).expect("rm");
+    let repo = open(root);
+    repo.checkout()
+        .restore(
+            &RestoreOptions {
+                pathspecs: vec!["lines.txt".into()],
+                pathspec_sources: vec!["lines.txt".into()],
+                source: RestoreSource::Index,
+                staged: false,
+                worktree: true,
+                stage: None,
+                remerge: None,
+            },
+            &mut grit_lib::progress::NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("restore");
+
+    let restored = fs::read(root.join("lines.txt")).expect("read");
+    let crlf_count = restored.windows(2).filter(|w| *w == b"\r\n").count();
+    assert!(crlf_count > 0, "expected CRLF smudge");
+    assert!(restored.len() > text.len(), "smudge should grow the file");
+    let status = git(root, &["status", "--porcelain"]);
+    assert!(
+        status.trim().is_empty(),
+        "git status after autocrlf LF smudge:\n{status}"
     );
 }
 
@@ -398,21 +485,21 @@ fn large_text_blob_under_autocrlf_is_converted_not_copied() {
 
     fs::remove_file(root.join("big.txt")).expect("rm");
     let repo = open(root);
-    restore_paths(
-        &repo,
-        &RestoreOptions {
-            pathspecs: vec!["big.txt".into()],
-            pathspec_sources: vec!["big.txt".into()],
-            source: RestoreSource::Index,
-            staged: false,
-            worktree: true,
-            stage: None,
-            remerge: None,
-        },
-        &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
-    )
-    .expect("restore");
+    repo.checkout()
+        .restore(
+            &RestoreOptions {
+                pathspecs: vec!["big.txt".into()],
+                pathspec_sources: vec!["big.txt".into()],
+                source: RestoreSource::Index,
+                staged: false,
+                worktree: true,
+                stage: None,
+                remerge: None,
+            },
+            &mut grit_lib::progress::NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("restore");
 
     let restored = fs::read(root.join("big.txt")).expect("read");
     assert_eq!(restored.len(), text.len() + lines, "every LF becomes CRLF");

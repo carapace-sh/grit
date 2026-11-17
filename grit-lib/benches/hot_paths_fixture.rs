@@ -2,6 +2,7 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use grit_lib::progress::NullProgress;
 use std::path::Path;
 use std::sync::OnceLock;
 
@@ -9,7 +10,7 @@ use grit_lib::diff::merge_file::MergeFavor;
 use grit_lib::diff::merge_trees::{
     merge_trees_three_way, TreeMergeConflictPresentation, WhitespaceMergeOptions,
 };
-use grit_lib::diff::{diff_index_to_worktree_with_options, DiffIndexToWorktreeOptions};
+use grit_lib::diff::TreeDiffOptions;
 use grit_lib::error::Result;
 use grit_lib::index::write_tree::{write_tree_update_index, WriteTreeFlags};
 use grit_lib::index::{entry_from_stat, Index, IndexEntry, MODE_REGULAR};
@@ -19,8 +20,6 @@ use grit_lib::porcelain::reset::{reset_to_commit, ResetMode, ResetOptions};
 use grit_lib::porcelain::staging::stage_worktree_changes;
 use grit_lib::porcelain::status::{status, StatusOptions};
 use grit_lib::porcelain::switch::{switch_repository, SwitchMode, SwitchOptions};
-use grit_lib::progress::NeverCancel;
-use grit_lib::progress::NullProgress;
 use grit_lib::refs;
 use grit_lib::repo::{InitOptions, Repository};
 use grit_lib::stash::{StashApplyOptions, StashMode, StashPushOptions};
@@ -55,17 +54,17 @@ pub struct HotPathsFixture {
 impl HotPathsFixture {
     fn build(file_count: usize, dir_count: usize) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
-        let repo = Repository::init(
+        let (repo, _) = Repository::init(
             dir.path(),
             &InitOptions::new()
                 .with_initial_branch("main".to_owned())
-                .with_ref_storage(grit_lib::RefStorageFormat::Files),
+                .with_ref_storage(grit_lib::refs::ref_storage::RefStorageFormat::Files),
         )
         .expect("init hot-path bench repo");
         populate_worktree(dir.path(), file_count, dir_count);
         let file_paths = list_txt_paths(dir.path());
         let head_tree = commit_all(&repo, "initial").expect("initial commit");
-        let main_head_oid = refs::resolve_ref(repo.git_dir(), "HEAD").expect("HEAD");
+        let main_head_oid = repo.references().resolve("HEAD").expect("HEAD");
         let wide_switch_tip = prepare_wide_switch_tip(&repo, &file_paths, head_tree, main_head_oid);
         hard_reset_to_main(&repo, main_head_oid);
         let index_mutate_plan = build_index_mutate_plan(&repo);
@@ -95,7 +94,11 @@ impl HotPathsFixture {
         let n = ((self.file_paths.len() as f64) * fraction).round() as usize;
         let n = n.max(1);
         let work_tree = self.repo.work_tree().expect("work tree");
-        let mut index = self.repo.index_handle().load().expect("load index");
+        let mut index = self
+            .repo
+            .index()
+            .load(&grit_lib::index::IndexLoadOptions::default())
+            .expect("load index");
         for path in self.file_paths.iter().take(n) {
             let abs = work_tree.join(path);
             std::fs::write(&abs, format!("changed-{path}\n")).expect("write");
@@ -160,25 +163,20 @@ impl HotPathsFixture {
     /// Clean tracked tree: index stat cache matches the worktree (for status/diff benches).
     pub fn ensure_clean_stat_cache(&self) {
         self.reset_worktree_to_head();
-        let mut index = self.repo.index_handle().load().expect("load index");
-        let work_tree = self.repo.work_tree().expect("work tree");
-        let diff_index_mtime = grit_lib::diff::index_mtime_for_diff(&index, index.source_mtime);
-        let _ = diff_index_to_worktree_with_options(
-            self.repo.odb(),
-            &mut index,
-            work_tree,
-            DiffIndexToWorktreeOptions {
-                index_mtime: diff_index_mtime,
-                refresh_index_stat_in_pass: true,
-                for_status: true,
-                repository_git_dir: Some(self.repo.git_dir().to_path_buf()),
-                config: self.repo.config().ok(),
-                thread_policy: Some(self.repo.thread_policy()),
-                ..DiffIndexToWorktreeOptions::default()
-            },
-        )
-        .expect("refresh index stat cache");
-        let path = self.repo.index_handle().path();
+        let mut index = self
+            .repo
+            .index()
+            .load(&grit_lib::index::IndexLoadOptions::default())
+            .expect("load index");
+        let options = TreeDiffOptions::default()
+            .with_refresh_index_stat(true)
+            .with_for_status(true);
+        let _ = self
+            .repo
+            .diff()
+            .index_to_worktree(&mut index, &options)
+            .expect("refresh index stat cache");
+        let path = self.repo.index().path();
         index.write(&path).expect("write refreshed index");
     }
 
@@ -188,35 +186,36 @@ impl HotPathsFixture {
             ahead_behind: false,
             ..StatusOptions::default()
         };
-        let _ = status(&self.repo, &opts, &mut NullProgress, &NeverCancel).expect("status clean");
+        let _ = status(
+            &self.repo,
+            &opts,
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
+        .expect("status clean");
     }
 
     pub fn bench_diff_worktree_clean(&self) {
-        let work_tree = self.repo.work_tree().expect("work tree");
-        let mut index = self.repo.index_handle().load().expect("load index");
-        let index_mtime = grit_lib::diff::index_mtime_for_diff(&index, index.source_mtime);
-        let _ = diff_index_to_worktree_with_options(
-            self.repo.odb(),
-            &mut index,
-            work_tree,
-            DiffIndexToWorktreeOptions {
-                index_mtime,
-                refresh_index_stat_in_pass: false,
-                for_status: true,
-                repository_git_dir: Some(self.repo.git_dir().to_path_buf()),
-                config: self.repo.config().ok(),
-                thread_policy: Some(self.repo.thread_policy()),
-                ..DiffIndexToWorktreeOptions::default()
-            },
-        )
-        .expect("diff index worktree clean");
+        let mut index = self
+            .repo
+            .index()
+            .load(&grit_lib::index::IndexLoadOptions::default())
+            .expect("load index");
+        let _ = self
+            .repo
+            .diff()
+            .index_to_worktree(
+                &mut index,
+                &TreeDiffOptions::default().with_for_status(true),
+            )
+            .expect("diff index worktree clean");
     }
 
     /// Stash commit whose worktree parent differs on `fraction` of tracked paths (index matches HEAD).
     pub fn build_stash_touching_fraction(&self, fraction: f64) -> ObjectId {
         self.reset_worktree_to_head();
         let stash_tree = self.tree_with_fraction_changed(fraction);
-        let head_oid = refs::resolve_ref(self.repo.git_dir(), "HEAD").expect("head");
+        let head_oid = self.repo.references().resolve("HEAD").expect("head");
         let index_parent = write_tree_commit(
             &self.repo,
             self.head_tree,
@@ -235,7 +234,7 @@ impl HotPathsFixture {
     pub fn pick_three_trees(&self, path_count: usize) -> (ObjectId, ObjectId, ObjectId) {
         self.reset_worktree_to_head();
         let head_tree = self.head_tree;
-        let head_oid = refs::resolve_ref(self.repo.git_dir(), "HEAD").expect("head");
+        let head_oid = self.repo.references().resolve("HEAD").expect("head");
         let source_tree = self.tree_with_path_count_changed(path_count);
         let _source_commit = write_tree_commit(&self.repo, source_tree, &[head_oid], "pick source");
         (head_tree, head_tree, source_tree)
@@ -244,7 +243,11 @@ impl HotPathsFixture {
     fn tree_with_path_count_changed(&self, path_count: usize) -> ObjectId {
         let n = path_count.min(self.file_paths.len()).max(1);
         let work_tree = self.repo.work_tree().expect("work tree");
-        let mut index = self.repo.index_handle().load().expect("load index");
+        let mut index = self
+            .repo
+            .index()
+            .load(&grit_lib::index::IndexLoadOptions::default())
+            .expect("load index");
         for path in self.file_paths.iter().take(n) {
             let abs = work_tree.join(path);
             std::fs::write(&abs, format!("pick-{path}\n")).expect("write");
@@ -266,8 +269,8 @@ impl HotPathsFixture {
 fn build_index_mutate_plan(repo: &Repository) -> IndexMutatePlan {
     const REPLACEMENT: &[u8] = b"bench-index-replacement\n";
     let baseline = repo
-        .index_handle()
-        .load()
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
         .expect("load index for mutate plan");
     let n = ((baseline.entries().len() as f64) * 0.10).round() as usize;
     let n = n.max(1);
@@ -338,7 +341,9 @@ fn walk_txt(base: &Path, dir: &Path, out: &mut Vec<String>) {
 
 fn commit_all(repo: &Repository, message: &str) -> Result<ObjectId> {
     let work_tree = repo.work_tree().expect("work tree");
-    let mut index = repo.index_handle().load()?;
+    let mut index = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())?;
     for rel in list_txt_paths(work_tree) {
         let abs = work_tree.join(&rel);
         let data = std::fs::read(&abs)?;
@@ -348,8 +353,9 @@ fn commit_all(repo: &Repository, message: &str) -> Result<ObjectId> {
     }
     index.sort();
     let tree = write_tree_update_index(repo.odb(), &mut index, "", WriteTreeFlags::silent())?;
-    repo.index_handle().write(&mut index)?;
-    let parent = refs::resolve_ref(repo.git_dir(), "HEAD").ok();
+    repo.index()
+        .write(&mut index, &grit_lib::index::IndexWriteOptions::default())?;
+    let parent = repo.references().resolve("HEAD").ok();
     let commit_data = CommitData {
         tree,
         parents: parent.into_iter().collect(),
@@ -364,8 +370,9 @@ fn commit_all(repo: &Repository, message: &str) -> Result<ObjectId> {
     };
     let bytes = serialize_commit(&commit_data);
     let oid = repo.odb().write(ObjectKind::Commit, &bytes)?;
-    refs::write_ref(repo.git_dir(), "refs/heads/main", &oid)?;
-    refs::write_symbolic_ref(repo.git_dir(), "HEAD", "refs/heads/main")?;
+    grit_test_support::refs::set_ref(&repo, "refs/heads/main", &oid)?;
+    repo.references()
+        .update_symbolic("HEAD", "refs/heads/main")?;
     Ok(tree)
 }
 
@@ -382,8 +389,8 @@ fn hard_reset_to_main(repo: &Repository, main_head_oid: ObjectId) {
             BENCH_IDENT.parse().expect("signature"),
             "bench: reset to main",
         ),
-        &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
+        &mut NullProgress,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("hard reset to main");
 }
@@ -397,7 +404,8 @@ fn prepare_wide_switch_tip(
     let wide_tree = wide_tree_from_fraction(repo, file_paths, 0.10);
     checkout_between_trees(repo, Some(&head_tree), &wide_tree).expect("apply wide tree");
     let tip = write_tree_commit(repo, wide_tree, &[main_head_oid], "bench-wide switch");
-    refs::write_ref(repo.git_dir(), "refs/heads/bench-wide", &tip).expect("wide branch ref");
+    grit_test_support::refs::set_ref(&repo, "refs/heads/bench-wide", &tip)
+        .expect("wide branch ref");
     hard_reset_to_main(repo, main_head_oid);
     tip
 }
@@ -405,7 +413,10 @@ fn prepare_wide_switch_tip(
 fn wide_tree_from_fraction(repo: &Repository, file_paths: &[String], fraction: f64) -> ObjectId {
     let n = ((file_paths.len() as f64) * fraction).round() as usize;
     let n = n.max(1);
-    let mut index = repo.index_handle().load().expect("load index");
+    let mut index = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("load index");
     for path in file_paths.iter().take(n) {
         let data = format!("changed-{path}\n");
         let oid = repo
@@ -432,10 +443,10 @@ pub fn bench_switch_wide(fx: &HotPathsFixture) {
                 oid: fx.wide_switch_tip,
             },
             dry_run: false,
-            hooks: grit_lib::PostOperationHooks::Run,
+            hooks: grit_lib::command_runner::hooks::PostOperationHooks::Run,
         },
-        &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
+        &mut NullProgress,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("switch wide");
     switch_repository(
@@ -446,10 +457,10 @@ pub fn bench_switch_wide(fx: &HotPathsFixture) {
                 oid: fx.main_head_oid,
             },
             dry_run: false,
-            hooks: grit_lib::PostOperationHooks::Run,
+            hooks: grit_lib::command_runner::hooks::PostOperationHooks::Run,
         },
-        &mut grit_lib::progress::NullProgress,
-        &grit_lib::progress::NeverCancel,
+        &mut NullProgress,
+        &grit_lib::progress::CancelToken::never(),
     )
     .expect("switch main");
 }
@@ -496,7 +507,11 @@ pub fn bench_push_stash(fx: &HotPathsFixture) {
     let _ = fx
         .repo
         .stash()
-        .push(&options, &mut NullProgress, &NeverCancel)
+        .push(
+            &options,
+            &mut NullProgress,
+            &grit_lib::progress::CancelToken::never(),
+        )
         .expect("push_stash");
 }
 
@@ -508,7 +523,7 @@ pub fn bench_apply_stash(fx: &HotPathsFixture, stash_oid: &ObjectId) {
             stash_oid,
             &StashApplyOptions::default(),
             &mut NullProgress,
-            &NeverCancel,
+            &grit_lib::progress::CancelToken::never(),
         )
         .expect("apply_stash");
 }
@@ -528,10 +543,14 @@ pub fn bench_pick_path(fx: &HotPathsFixture, path_count: usize) {
     )
     .expect("merge");
     let new_tree = merged.result_tree;
-    let index_handle = fx.repo.index_handle();
-    let mut index = index_handle.load().expect("index");
+    let index_handle = fx.repo.index();
+    let mut index = index_handle
+        .load(&grit_lib::index::IndexLoadOptions::default())
+        .expect("index");
     grit_lib::diff::merge_trees::apply_tree_merge_output_to_index(&mut index, &merged);
-    index_handle.write(&mut index).expect("write index");
+    index_handle
+        .write(&mut index, &grit_lib::index::IndexWriteOptions::default())
+        .expect("write index");
     checkout_between_trees(&fx.repo, Some(&head), &new_tree).expect("checkout");
 }
 

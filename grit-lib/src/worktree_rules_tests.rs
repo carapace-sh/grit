@@ -16,7 +16,7 @@ mod tests {
     use crate::index::{entry_from_stat, MODE_REGULAR};
     use crate::porcelain::add::{stage, StageOptions};
     use crate::porcelain::status::{status, StatusOptions};
-    use crate::progress::{NeverCancel, NullProgress};
+    use crate::progress::{CancelToken, NullProgress};
     use crate::repo::{init_repository, Repository};
     use crate::worktree_rules::file_load_counters;
     use crate::write_tree::write_tree_from_index;
@@ -58,7 +58,7 @@ mod tests {
             &repo,
             &StatusOptions::default(),
             &mut NullProgress,
-            &NeverCancel,
+            &CancelToken::never(),
         )
         .unwrap();
         assert!(
@@ -72,7 +72,7 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &NeverCancel,
+            &CancelToken::never(),
         )
         .unwrap();
         assert!(
@@ -112,11 +112,14 @@ mod tests {
         status(
             &probe_repo,
             &StatusOptions {
-                pathspecs: vec![":(attr:probe)".to_string()],
+                pathspec: crate::pathspec::Pathspec::scoped(
+                    vec![":(attr:probe)".to_string()],
+                    crate::pathspec::PathspecGlobalFlags::default(),
+                ),
                 ..StatusOptions::default()
             },
             &mut NullProgress,
-            &NeverCancel,
+            &CancelToken::never(),
         )
         .unwrap();
         assert!(
@@ -158,7 +161,7 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &NeverCancel,
+            &CancelToken::never(),
         )
         .unwrap();
         let mut index = repo.load_index().unwrap();
@@ -231,7 +234,7 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &NeverCancel,
+            &CancelToken::never(),
         )
         .unwrap();
         let index = repo.load_index().unwrap();
@@ -296,7 +299,7 @@ mod tests {
             &repo,
             &StageOptions::default(),
             &mut NullProgress,
-            &NeverCancel,
+            &CancelToken::never(),
         )
         .unwrap();
 
@@ -358,5 +361,87 @@ mod tests {
             "git diff-files should be empty after grit stage: {:?}",
             String::from_utf8_lossy(&diff_files.stdout)
         );
+    }
+
+    /// Lookups that leave a directory chain and come back, or jump between subtrees, resolve
+    /// the same attributes as a fresh context per path, and still read each file once.
+    #[test]
+    fn file_attrs_match_fresh_rules_in_any_lookup_order() {
+        let tmp = TempDir::new().unwrap();
+        let repo = init_repo(tmp.path());
+        let wt = repo.work_tree().unwrap();
+        fs::write(wt.join(".gitattributes"), "*.bin binary\n").unwrap();
+        fs::create_dir_all(wt.join("a/b/c")).unwrap();
+        fs::create_dir_all(wt.join("a/plain/deeper")).unwrap();
+        fs::create_dir_all(wt.join("x/y")).unwrap();
+        fs::write(wt.join("a/.gitattributes"), "*.txt text eol=crlf\n").unwrap();
+        fs::write(
+            wt.join("a/b/.gitattributes"),
+            "*.txt -text\nkeep.txt eol=lf\n",
+        )
+        .unwrap();
+        fs::write(wt.join("x/y/.gitattributes"), "*.txt diff=custom\n").unwrap();
+        fs::write(
+            repo.git_dir().join("info/attributes"),
+            "*.md text eol=crlf\n",
+        )
+        .unwrap();
+        let index = repo.load_index().unwrap();
+        let paths = [
+            "a/b/c/one.txt",
+            "a/b/keep.txt",
+            "top.txt",
+            "a/plain/deeper/two.txt",
+            "a/b/c/one.txt",
+            "x/y/three.txt",
+            "a/four.txt",
+            "x/notes.md",
+            "a/b/five.bin",
+            "x/y/three.txt",
+            "a/b/c/one.txt",
+            "a/b/keep.txt",
+        ];
+
+        file_load_counters::reset();
+        let shared = crate::worktree_rules::WorktreeRules::from_repository(&repo, &index).unwrap();
+        let got: Vec<_> = paths.iter().map(|p| shared.file_attrs(p, false)).collect();
+        assert!(
+            file_load_counters::max_reads_per_file() <= 1,
+            "each attributes file read at most once (max={})",
+            file_load_counters::max_reads_per_file()
+        );
+        for (path, attrs) in paths.iter().zip(&got) {
+            let fresh = crate::worktree_rules::WorktreeRules::from_repository(&repo, &index)
+                .unwrap()
+                .file_attrs(path, false);
+            assert_eq!(attrs, &fresh, "{path}");
+        }
+        assert_eq!(got[0].text, crate::crlf::TextAttr::Unset, "a/b overrides a");
+        assert_eq!(
+            got[3].eol,
+            crate::crlf::EolAttr::Crlf,
+            "a applies below a/plain"
+        );
+        assert_eq!(
+            got[5].diff_attr,
+            crate::crlf::DiffAttr::Driver("custom".into())
+        );
+        assert_eq!(got[7].eol, crate::crlf::EolAttr::Crlf, "info/attributes");
+        assert_eq!(
+            got[8].diff_attr,
+            crate::crlf::DiffAttr::Unset,
+            "binary macro"
+        );
+        assert_eq!(
+            shared.attribute_rules_for_path("a/b/c/one.txt").len(),
+            got_rule_count(&repo, &index, "a/b/c/one.txt")
+        );
+    }
+
+    fn got_rule_count(repo: &Repository, index: &crate::index::Index, path: &str) -> usize {
+        crate::worktree_rules::WorktreeRules::from_repository(repo, index)
+            .unwrap()
+            .attribute_rules_for_path(path)
+            .len()
     }
 }

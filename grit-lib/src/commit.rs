@@ -19,7 +19,7 @@
 //! use grit_lib::repo::{InitOptions, Repository};
 //! # fn main() -> grit_lib::error::Result<()> {
 //! let dir = tempfile::tempdir()?;
-//! let _repo = Repository::init(dir.path(), &InitOptions::default())?;
+//! let (_repo, _) = Repository::init(dir.path(), &InitOptions::default())?;
 //! # Ok(())
 //! # }
 //! ```
@@ -29,15 +29,17 @@ use time::OffsetDateTime;
 
 use crate::git_date::parse::{parse_date, DateParseError};
 
+pub use crate::commit_pretty::resolve_core_abbrev_len;
+
 /// Normalise a date string into Git's stored `<epoch> <offset>` timestamp.
 ///
 /// Accepts the forms Git's `commit`/`--date` path understands: RFC 3339 / ISO
 /// 8601 (with or without an explicit zone, in which case UTC is assumed),
 /// `YYYY-MM-DD HH:MM:SS <tz>`, `@<epoch> <tz>`, and the looser
-/// approxidate-style strings handled by [`parse_date`]. Returns `None` when the
+/// approxidate-style strings handled by `parse_date`. Returns `None` when the
 /// input is already in `<epoch> <offset>` form (nothing to convert) or cannot
 /// be parsed; callers then fall back to using the raw string.
-pub fn parse_date_to_git_timestamp(date_str: &str) -> Option<String> {
+pub(crate) fn parse_date_to_git_timestamp(date_str: &str) -> Option<String> {
     let trimmed = date_str.trim();
 
     // ISO 8601 / RFC 3339, including forms Git accepts without an explicit offset
@@ -179,7 +181,7 @@ pub fn parse_trailer_command_line_arg(raw: &str) -> Result<(String, String), Tra
 ///
 /// # Errors
 ///
-/// Returns [`DateParseError`] when the string cannot be interpreted as any date Git accepts.
+/// Returns `DateParseError` when the string cannot be interpreted as any date Git accepts.
 pub fn normalize_commit_date_override(raw: &str) -> Result<String, DateParseError> {
     let trimmed = raw.trim();
     if is_canonical_epoch_numeric_tz(trimmed) {
@@ -211,7 +213,7 @@ pub fn format_git_timestamp(dt: OffsetDateTime) -> String {
 /// [`parse_date_to_git_timestamp`] and used verbatim if parsing fails (matching
 /// Git's lenient behavior). When `None`, `now` is formatted instead.
 #[must_use]
-pub fn assemble_identity(
+pub(crate) fn assemble_identity(
     name: &str,
     email: &str,
     date_override: Option<&str>,

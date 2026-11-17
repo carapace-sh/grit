@@ -7,7 +7,6 @@ use grit_lib::index::MODE_TREE;
 use grit_lib::objects::{parse_tree, serialize_commit, CommitData, ObjectKind};
 use grit_lib::refs;
 use grit_lib::repo::{InitOptions, Repository};
-use grit_lib::revwalk::rev_parse::resolve_revision;
 
 fn walk_tree(
     repo: &grit_lib::repo::Repository,
@@ -35,11 +34,11 @@ fn walk_tree(
 
 fn main() -> grit_lib::error::Result<()> {
     let root = tempfile::tempdir()?;
-    let repo = Repository::init(
+    let (repo, _) = Repository::init(
         root.path(),
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
-            .with_ref_storage(grit_lib::RefStorageFormat::Files),
+            .with_ref_storage(grit_lib::refs::ref_storage::RefStorageFormat::Files),
     )?;
 
     use grit_lib::index::{Index, IndexEntry, MODE_REGULAR};
@@ -71,8 +70,11 @@ fn main() -> grit_lib::error::Result<()> {
         };
         index.add_or_replace(entry);
     }
-    repo.index_handle().write(&mut index)?;
-    let index = repo.index_handle().load()?;
+    repo.index()
+        .write(&mut index, &grit_lib::index::IndexWriteOptions::default())?;
+    let index = repo
+        .index()
+        .load(&grit_lib::index::IndexLoadOptions::default())?;
     let tree_oid = write_tree_from_index(repo.odb(), &index, "")?;
 
     let commit = CommitData {
@@ -90,9 +92,11 @@ fn main() -> grit_lib::error::Result<()> {
     let commit_oid = repo
         .odb()
         .write(ObjectKind::Commit, &serialize_commit(&commit))?;
-    refs::write_ref(repo.git_dir(), "refs/heads/main", &commit_oid)?;
+    repo.references().update("refs/heads/main", &commit_oid)?;
 
-    let head_commit = resolve_revision(&repo, "HEAD")?;
+    let head_commit = repo
+        .revwalk()
+        .resolve("HEAD", &grit_lib::revwalk::ResolveOptions::default())?;
     let commit_obj = repo.odb().read(&head_commit)?;
     let parsed = grit_lib::objects::parse_commit(&commit_obj.data)?;
     println!("walking tree at {}", parsed.tree);

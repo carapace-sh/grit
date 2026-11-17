@@ -87,11 +87,11 @@ fn entry_for_path(repo: &Repository, path: &str, stage: u8, payload: &[u8]) -> I
 #[test]
 fn grit_index_batch_remove_replace_matches_git_ls_files_and_fsck() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let repo = Repository::init(
+    let (repo, _) = Repository::init(
         tmp.path(),
         &InitOptions::new()
             .with_initial_branch("main".to_owned())
-            .with_ref_storage(grit_lib::RefStorageFormat::Files),
+            .with_ref_storage(grit_lib::refs::ref_storage::RefStorageFormat::Files),
     )
     .expect("init");
     let payload = b"index-compat-payload\n";
@@ -139,7 +139,9 @@ fn grit_index_batch_remove_replace_matches_git_ls_files_and_fsck() {
         .collect();
     index.remove_paths_and_insert(remove_paths.iter().map(|p| p.as_slice()), replacements);
 
-    repo.index_handle().write(&mut index).expect("write index");
+    repo.index()
+        .write(&mut index, &grit_lib::index::IndexWriteOptions::default())
+        .expect("write index");
 
     let git_lines = ls_files_stage_lines(tmp.path());
     let expected = expected_ls_files_lines(index.entries());

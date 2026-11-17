@@ -3,8 +3,8 @@
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::config::ConfigSet;
 use grit_lib::error::Error;
+use grit_lib::error::ObjectError;
 use grit_lib::objects::odb::Odb;
-use grit_lib::objects::pack::clear_pack_cache;
 use grit_lib::objects::promisor::{
     promisor_expanded_object_ids, promisor_pack_and_tag_targets, promisor_pack_object_ids,
     promisor_pack_peeled_tag_targets, read_promisor_missing_oids, repo_treats_promisor_packs,
@@ -12,6 +12,7 @@ use grit_lib::objects::promisor::{
 };
 use grit_lib::objects::ObjectId;
 use grit_lib::repo::Repository;
+use grit_lib::test_support::objects_pack::clear_pack_cache;
 use grit_test_support::git_cmd;
 use std::collections::HashSet;
 use std::fs;
@@ -113,11 +114,14 @@ fn promisor_partial_clone_pack_markers_and_config() {
     let cfg = ConfigSet::load(
         &grit_lib::config::environment::Environment::capture_process(),
         Some(&git_dir),
-        true,
+        &crate::config::LoadConfigOptions::standard(
+            &grit_lib::config::environment::Environment::capture_process(),
+            Some(&git_dir),
+        ),
     )
     .expect("config");
 
-    let treats = repo_treats_promisor_packs(&git_dir, &cfg);
+    let treats = repo_treats_promisor_packs(&cfg);
     assert!(
         treats,
         "partial clone should enable promisor semantics via extensions.partialclone or remote.promisor"
@@ -167,7 +171,7 @@ fn promisor_partial_clone_pack_markers_and_config() {
     }
     let err = repo.odb().read(&missing_blob).unwrap_err();
     assert!(
-        matches!(err, Error::PromisedObjectMissing(_)),
+        matches!(err, Error::Object(ObjectError::PromisedMissing { .. })),
         "missing filtered blob without fetcher must be PromisedObjectMissing: {err:?}"
     );
 }
@@ -203,10 +207,13 @@ fn promisor_remote_dot_promisor_config_enables_treatment() {
     let cfg = ConfigSet::load(
         &grit_lib::config::environment::Environment::capture_process(),
         Some(&git_dir),
-        true,
+        &crate::config::LoadConfigOptions::standard(
+            &grit_lib::config::environment::Environment::capture_process(),
+            Some(&git_dir),
+        ),
     )
     .expect("load");
-    assert!(repo_treats_promisor_packs(&git_dir, &cfg));
+    assert!(repo_treats_promisor_packs(&cfg));
 }
 
 #[test]

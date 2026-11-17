@@ -2,12 +2,10 @@
 
 use grit_lib::config::environment::RepositoryOptions;
 use grit_lib::error::Error;
-use grit_lib::porcelain::status::{status, StatusOptions, UntrackedMode};
-use grit_lib::progress::{FlagCancel, NeverCancel, NullProgress, ProgressSink};
+use grit_lib::porcelain::status::{StatusOptions, UntrackedMode};
+use grit_lib::progress::{CancelToken, NullProgress, ProgressSink};
 use grit_lib::repo::Repository;
 use grit_test_support::git;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -49,7 +47,7 @@ fn status_returns_cancelled_when_signalled_during_untracked_walk() {
     }
 
     let repo = Repository::discover(Some(root), &RepositoryOptions::empty()).expect("open");
-    let flag = FlagCancel::new();
+    let flag = CancelToken::new();
     let flag_for_thread = flag.clone();
     let sleeper = thread::spawn(move || {
         thread::sleep(Duration::from_millis(5));
@@ -58,12 +56,17 @@ fn status_returns_cancelled_when_signalled_during_untracked_walk() {
 
     let mut opts = StatusOptions::default();
     opts.untracked = UntrackedMode::All;
-    let err =
-        status(&repo, &opts, &mut NullProgress, &flag).expect_err("cancel during untracked walk");
+    let err = repo
+        .status()
+        .run(&opts, &mut NullProgress, &flag)
+        .expect_err("cancel during untracked walk");
     sleeper.join().expect("join");
     assert!(matches!(err, Error::Cancelled));
 
-    let model = status(&repo, &opts, &mut NullProgress, &NeverCancel).expect("full scan");
+    let model = repo
+        .status()
+        .run(&opts, &mut NullProgress, &CancelToken::never())
+        .expect("full scan");
     assert_eq!(
         model.untracked.len(),
         800,
@@ -77,14 +80,17 @@ fn status_returns_cancelled_during_tracked_stat_scan_with_flag_cancel() {
     let opts = status_opts();
 
     let baseline = Instant::now();
-    status(&repo, &opts, &mut NullProgress, &NeverCancel).expect("baseline status");
+    &repo
+        .status()
+        .run(&opts, &mut NullProgress, &CancelToken::never())
+        .expect("baseline status");
     let baseline_elapsed = baseline.elapsed();
     assert!(
         baseline_elapsed > Duration::from_millis(150),
         "fixture should spend measurable time in stat scan (got {baseline_elapsed:?})"
     );
 
-    let flag = FlagCancel::new();
+    let flag = CancelToken::new();
     let flag_for_thread = flag.clone();
     let sleeper = thread::spawn(move || {
         thread::sleep(Duration::from_millis(50));
@@ -92,7 +98,10 @@ fn status_returns_cancelled_during_tracked_stat_scan_with_flag_cancel() {
     });
 
     let started = Instant::now();
-    let err = status(&repo, &opts, &mut NullProgress, &flag).expect_err("cancel mid stat scan");
+    let err = repo
+        .status()
+        .run(&opts, &mut NullProgress, &flag)
+        .expect_err("cancel mid stat scan");
     sleeper.join().expect("join");
     assert!(matches!(err, Error::Cancelled));
     let elapsed = started.elapsed();
@@ -105,12 +114,17 @@ fn status_returns_cancelled_during_tracked_stat_scan_with_flag_cancel() {
 #[test]
 fn status_returns_cancelled_during_tracked_stat_scan_with_progress_sink() {
     struct CancelSink {
-        requested: Arc<AtomicBool>,
+        token: CancelToken,
+        trigger_after: u64,
+        seen: u64,
     }
 
     impl ProgressSink for CancelSink {
-        fn should_cancel(&self) -> bool {
-            self.requested.load(Ordering::Relaxed)
+        fn inc(&mut self, units: u64) {
+            self.seen += units;
+            if self.seen >= self.trigger_after {
+                self.token.cancel();
+            }
         }
     }
 
@@ -118,31 +132,33 @@ fn status_returns_cancelled_during_tracked_stat_scan_with_progress_sink() {
     let opts = status_opts();
 
     let baseline = Instant::now();
-    status(&repo, &opts, &mut NullProgress, &NeverCancel).expect("baseline status");
+    &repo
+        .status()
+        .run(&opts, &mut NullProgress, &CancelToken::never())
+        .expect("baseline status");
     let baseline_elapsed = baseline.elapsed();
     assert!(
         baseline_elapsed > Duration::from_millis(150),
         "fixture should spend measurable time in stat scan (got {baseline_elapsed:?})"
     );
 
-    let requested = Arc::new(AtomicBool::new(false));
     let mut sink = CancelSink {
-        requested: Arc::clone(&requested),
+        token: CancelToken::new(),
+        trigger_after: 1,
+        seen: 0,
     };
-    let trigger = Arc::clone(&requested);
-    let sleeper = thread::spawn(move || {
-        thread::sleep(Duration::from_millis(50));
-        trigger.store(true, Ordering::Relaxed);
-    });
+    let cancel = sink.token.clone();
 
     let started = Instant::now();
-    let err = status(&repo, &opts, &mut sink, &NeverCancel).expect_err("sink cancel mid stat scan");
-    sleeper.join().expect("join");
+    let err = repo
+        .status()
+        .run(&opts, &mut sink, &cancel)
+        .expect_err("sink cancel mid stat scan");
     assert!(matches!(err, Error::Cancelled));
     let elapsed = started.elapsed();
     assert!(
         elapsed < baseline_elapsed / 2,
-        "sink cancel at 50 ms should finish well before a full scan ({elapsed:?} vs baseline {baseline_elapsed:?})"
+        "progress-driven cancel should finish well before a full scan ({elapsed:?} vs baseline {baseline_elapsed:?})"
     );
 }
 
@@ -150,7 +166,10 @@ fn status_returns_cancelled_during_tracked_stat_scan_with_progress_sink() {
 fn status_without_cancel_still_scans_every_tracked_path() {
     let (_tmp, repo) = repo_with_many_tracked_files();
     let opts = status_opts();
-    let model = status(&repo, &opts, &mut NullProgress, &NeverCancel).expect("full status");
+    let model = repo
+        .status()
+        .run(&opts, &mut NullProgress, &CancelToken::never())
+        .expect("full status");
     assert!(
         model.staged.is_empty() && model.unstaged.is_empty() && model.untracked.is_empty(),
         "clean tree with untracked disabled"

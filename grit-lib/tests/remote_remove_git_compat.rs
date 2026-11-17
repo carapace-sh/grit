@@ -1,4 +1,4 @@
-//! `RepositoryRemotes::remove` matches `git remote remove` on twin repositories.
+//! `Remotes::remove` matches `git remote remove` on twin repositories.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use crate::support;
@@ -280,7 +280,7 @@ fn remove_unknown_remote_typed_error() {
         .remotes()
         .remove("nosuch", RemoveOptions::default())
         .expect_err("unknown");
-    assert!(matches!(err, RemoteError::UnknownRemote(name) if name == "nosuch"));
+    assert!(matches!(err, RemoteError::UnknownRemote { name } if name == "nosuch"));
 }
 
 #[test]

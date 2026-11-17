@@ -14,27 +14,21 @@ use super::reword::normalize_rewrite_message;
 use super::types::{
     CommitEdit, HistoryEdits, NewCommit, Pathspec, RewriteOptions, RewritePlan, SplitOptions,
 };
+use super::PlanningError;
 
 /// Plan a pathspec-limited split of `commit`: matching changes move into a new parent commit.
 ///
-/// The target commit keeps its tree (and message unless [`SplitOptions::rest_message`] is set).
-/// Descendants replay with parent-only updates when their trees are unchanged.
-///
-/// # Errors
-///
-/// Returns [`HistoryError::SplitSelectsNothing`], [`HistoryError::SplitSelectsEverything`],
-/// [`HistoryError::InsertBeforeOnMerge`], [`HistoryError::EmptyMessage`], or errors from
-/// [`plan_rewrite`].
-pub fn split(
+/// See [`History::split`](super::History::split).
+pub(crate) fn split(
     repo: &Repository,
     commit: ObjectId,
     pathspec: Pathspec<'_>,
     split_message: String,
     opts: &SplitOptions,
     rewrite_opts: &RewriteOptions,
-) -> Result<RewritePlan, HistoryError> {
+) -> crate::error::Result<RewritePlan> {
     if pathspec.is_empty() {
-        return Err(HistoryError::SplitSelectsNothing);
+        return Err(HistoryError::SplitSelectsNothing.into());
     }
 
     let split_message = normalize_rewrite_message(&split_message)?;
@@ -47,7 +41,7 @@ pub fn split(
     let parsed = repo.odb().read_commit(&commit)?;
 
     if parsed.parents.len() > 1 {
-        return Err(HistoryError::InsertBeforeOnMerge { commit });
+        return Err(HistoryError::InsertBeforeOnMerge { commit }.into());
     }
 
     let parent_tree = if parsed.parents.is_empty() {
@@ -81,12 +75,12 @@ fn build_split_tree(
     commit_tree: ObjectId,
     pathspec: Pathspec<'_>,
     ctx: PathspecMatchContext,
-) -> Result<ObjectId, HistoryError> {
+) -> crate::error::Result<ObjectId> {
     let odb = repo.odb();
     let diff = diff_trees_with_renames(odb, Some(&parent_tree), Some(&commit_tree), "", 50)?;
 
     if diff.is_empty() {
-        return Err(HistoryError::SplitSelectsNothing);
+        return Err(HistoryError::SplitSelectsNothing.into());
     }
 
     let mut selected = Vec::new();
@@ -102,17 +96,17 @@ fn build_split_tree(
     }
 
     if selected.is_empty() {
-        return Err(HistoryError::SplitSelectsNothing);
+        return Err(HistoryError::SplitSelectsNothing.into());
     }
     if selects_every_change {
-        return Err(HistoryError::SplitSelectsEverything);
+        return Err(HistoryError::SplitSelectsEverything.into());
     }
 
     let mut index = index_from_tree(repo, &parent_tree)?;
     for (entry, sides) in &selected {
         apply_diff_entry_to_index(&mut index, entry, *sides)?;
     }
-    write_tree_from_index(odb, &index, "").map_err(HistoryError::from)
+    write_tree_from_index(odb, &index, "")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -182,16 +176,15 @@ fn apply_diff_entry_to_index(
     index: &mut Index,
     entry: &DiffEntry,
     sides: PathspecSides,
-) -> Result<(), HistoryError> {
+) -> crate::error::Result<()> {
     match entry.status {
         DiffStatus::Added | DiffStatus::Copied => {
             if !sides.new {
                 return Ok(());
             }
-            let path = entry
-                .new_path
-                .as_deref()
-                .ok_or_else(|| planning_err("added diff entry missing new path"))?;
+            let path = entry.new_path.as_deref().ok_or_else(|| {
+                HistoryError::Planning(PlanningError::SplitAddedDiffMissingNewPath)
+            })?;
             let mode = entry.new_mode.bits();
             add_index_blob(index, path, mode, entry.new_oid);
         }
@@ -199,10 +192,9 @@ fn apply_diff_entry_to_index(
             if !sides.old {
                 return Ok(());
             }
-            let path = entry
-                .old_path
-                .as_deref()
-                .ok_or_else(|| planning_err("deleted diff entry missing old path"))?;
+            let path = entry.old_path.as_deref().ok_or_else(|| {
+                HistoryError::Planning(PlanningError::SplitDeletedDiffMissingOldPath)
+            })?;
             index.remove_paths([path.as_bytes()]);
         }
         DiffStatus::Modified | DiffStatus::TypeChanged => {
@@ -213,7 +205,9 @@ fn apply_diff_entry_to_index(
                 .new_path
                 .as_deref()
                 .or(entry.old_path.as_deref())
-                .ok_or_else(|| planning_err("modified diff entry missing path"))?;
+                .ok_or_else(|| {
+                    HistoryError::Planning(PlanningError::SplitModifiedDiffMissingPath)
+                })?;
             let mode = entry.new_mode.bits();
             add_index_blob(index, path, mode, entry.new_oid);
         }
@@ -222,29 +216,26 @@ fn apply_diff_entry_to_index(
                 if let Some(old) = &entry.old_path {
                     index.remove_paths([old.as_bytes()]);
                 }
-                let path = entry
-                    .new_path
-                    .as_deref()
-                    .ok_or_else(|| planning_err("rename diff entry missing new path"))?;
+                let path = entry.new_path.as_deref().ok_or_else(|| {
+                    HistoryError::Planning(PlanningError::SplitRenameMissingNewPath)
+                })?;
                 let mode = entry.new_mode.bits();
                 add_index_blob(index, path, mode, entry.new_oid);
             } else if sides.new {
-                let path = entry
-                    .new_path
-                    .as_deref()
-                    .ok_or_else(|| planning_err("rename diff entry missing new path"))?;
+                let path = entry.new_path.as_deref().ok_or_else(|| {
+                    HistoryError::Planning(PlanningError::SplitRenameMissingNewPath)
+                })?;
                 let mode = entry.new_mode.bits();
                 add_index_blob(index, path, mode, entry.new_oid);
             } else if sides.old {
-                let path = entry
-                    .old_path
-                    .as_deref()
-                    .ok_or_else(|| planning_err("rename diff entry missing old path"))?;
+                let path = entry.old_path.as_deref().ok_or_else(|| {
+                    HistoryError::Planning(PlanningError::SplitRenameMissingOldPath)
+                })?;
                 index.remove_paths([path.as_bytes()]);
             }
         }
         DiffStatus::Unmerged => {
-            return Err(planning_err("unexpected unmerged diff entry in split"));
+            return Err(HistoryError::Planning(PlanningError::SplitUnexpectedUnmergedDiff).into());
         }
     }
     Ok(())
@@ -268,11 +259,5 @@ fn index_entry(path: &str, mode: u32, oid: ObjectId) -> IndexEntry {
         flags_extended: None,
         path: path_bytes,
         base_index_pos: 0,
-    }
-}
-
-fn planning_err(message: impl Into<String>) -> HistoryError {
-    HistoryError::Planning {
-        message: message.into(),
     }
 }
