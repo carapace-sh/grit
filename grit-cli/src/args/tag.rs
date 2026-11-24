@@ -1,17 +1,20 @@
 //! Clap arguments for `grit tag`.
 
+use carapace_rs_clap::completer;
+use clap::Args;
+
+use crate::completions::grit;
 use crate::limit_args;
 use crate::message_input;
-use clap::Args;
 
 /// List tags, or create / delete one.
 #[derive(Debug, Args)]
 pub(crate) struct TagArgs {
     /// Name of the tag to create. Omit to list tags.
-    #[arg(value_name = "NAME", conflicts_with = "verify")]
+    #[arg(value_name = "NAME", conflicts_with = "verify", add = completer!(grit::action_tags()))]
     pub(crate) name: Option<String>,
     /// Revision to tag (default `HEAD`).
-    #[arg(value_name = "TARGET", conflicts_with_all = ["object", "verify"])]
+    #[arg(value_name = "TARGET", conflicts_with_all = ["object", "verify"], add = completer!(grit::action_revisions()))]
     pub(crate) target: Option<String>,
     /// List tags matching `PATTERN` (repeatable). Omit `PATTERN` to list all tags.
     #[arg(
@@ -30,10 +33,10 @@ pub(crate) struct TagArgs {
     #[arg(long = "reverse")]
     pub(crate) reverse: bool,
     /// Only tags whose peeled commit contains this revision (`HEAD` when omitted).
-    #[arg(long = "contains", value_name = "REV", default_missing_value = "HEAD", num_args = 0..=1)]
+    #[arg(long = "contains", value_name = "REV", default_missing_value = "HEAD", num_args = 0..=1, add = completer!(grit::action_revisions()))]
     pub(crate) contains: Option<String>,
     /// Only tags pointing at this object (repeatable).
-    #[arg(long = "points-at", value_name = "REV")]
+    #[arg(long = "points-at", value_name = "REV", add = completer!(grit::action_revisions()))]
     pub(crate) points_at: Vec<String>,
     #[command(flatten)]
     pub(crate) limit: limit_args::LimitArgs,
@@ -63,7 +66,8 @@ pub(crate) struct TagArgs {
         long = "object",
         value_name = "REV",
         hide = true,
-        conflicts_with = "target"
+        conflicts_with = "target",
+        add = completer!(grit::action_revisions())
     )]
     pub(crate) object: Option<String>,
     /// Replace an existing tag with the same name.

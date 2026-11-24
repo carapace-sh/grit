@@ -1,6 +1,9 @@
 //! Clap arguments for `grit manager`.
 
+use carapace_rs_clap::completer;
 use clap::Args;
+
+use crate::completions::grit;
 
 /// Git credential helper backed by the Windows Credential Manager.
 ///
@@ -9,5 +12,6 @@ use clap::Args;
 #[derive(Debug, Args)]
 pub(crate) struct ManagerArgs {
     /// The credential operation: get, store, or erase.
+    #[arg(add = completer!(grit::action_credential_operations()))]
     pub(crate) operation: String,
 }

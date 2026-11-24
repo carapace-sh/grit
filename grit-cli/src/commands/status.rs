@@ -402,7 +402,7 @@ pub struct StatusCliArgs {
     /// How untracked paths are listed: `normal` (default) collapses wholly untracked
     /// directories; `all` lists every file; `no` omits untracked paths. When omitted,
     /// uses `status.showUntrackedFiles` from config.
-    #[arg(long = "untracked", value_name = "MODE")]
+    #[arg(long = "untracked", value_name = "MODE", add = carapace_rs_clap::completer!(crate::completions::grit::action_untracked_modes()))]
     pub untracked: Option<UntrackedListing>,
     /// Skip ahead/behind rev-list walks (also when `status.aheadBehind=false`).
     #[arg(long = "no-ahead-behind")]

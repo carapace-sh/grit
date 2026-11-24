@@ -1,7 +1,10 @@
 //! Clap arguments for `grit push`.
 
-use crate::quiet_args;
+use carapace_rs_clap::completer;
 use clap::Args;
+
+use crate::completions::grit;
+use crate::quiet_args;
 
 /// Publish refs to a remote.
 #[derive(Debug, Args)]
@@ -32,7 +35,7 @@ pub(crate) struct PushArgs {
     #[arg(long = "prune", conflicts_with = "mirror")]
     pub(crate) prune: bool,
     /// Remote to push to (defaults to the current branch's remote or `origin`).
-    #[arg(long, hide = true)]
+    #[arg(long, hide = true, add = completer!(grit::action_remotes()))]
     pub(crate) remote: Option<String>,
     /// Contact the remote but do not update refs or send objects.
     #[arg(long = "dry-run")]
@@ -68,9 +71,9 @@ pub(crate) struct PushArgs {
     #[command(flatten)]
     pub(crate) quiet: quiet_args::QuietArgs,
     /// Remote name (when not using `--remote`).
-    #[arg(value_name = "REMOTE")]
+    #[arg(value_name = "REMOTE", add = completer!(grit::action_remotes()))]
     pub(crate) remote_name: Option<String>,
     /// Refspec (`src`, `src:dst`, `:dst`, …).
-    #[arg(value_name = "REFSPEC")]
+    #[arg(value_name = "REFSPEC", add = completer!(grit::action_local_branches()))]
     pub(crate) refspecs: Vec<String>,
 }

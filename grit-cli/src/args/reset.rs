@@ -1,12 +1,15 @@
 //! Clap arguments for `grit reset`.
 
+use carapace_rs_clap::completer;
 use clap::Args;
+
+use crate::completions::grit;
 
 /// Move the branch tip and optionally reset the index or worktree.
 #[derive(Debug, Args)]
 pub(crate) struct ResetArgs {
     /// Commit to reset to (defaults to `HEAD`).
-    #[arg(value_name = "REV")]
+    #[arg(value_name = "REV", add = completer!(grit::action_revisions()))]
     pub(crate) rev: Option<String>,
     /// Keep the index and worktree; move the branch tip only.
     #[arg(long, conflicts_with_all = ["hard", "mixed", "keep"])]

@@ -26,7 +26,7 @@ const LOG_CURSOR_PREFIX: &str = "lw1.";
 #[derive(Debug, Args, Clone)]
 pub struct RevSelectArgs {
     /// Revision tips and ranges (`A..B`, `A...B`, `^tip`, plain tips).
-    #[arg(value_name = "REV")]
+    #[arg(value_name = "REV", add = carapace_rs_clap::completer!(crate::completions::grit::action_revision_ranges()))]
     pub revs: Vec<String>,
 
     #[command(flatten)]

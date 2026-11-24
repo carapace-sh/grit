@@ -45,6 +45,12 @@ pub(crate) enum RemoteAction {
         dry_run: bool,
     },
     /// Set or delete `refs/remotes/<name>/HEAD`.
+    ///
+    /// The branch completes scoped to the remote named before it.
+    #[command(add = carapace_rs_clap::PositionalCompleter(vec![
+        crate::completions::grit::action_remotes(),
+        crate::completions::grit::action_remote_branch_names(),
+    ]))]
     SetHead {
         /// Configured remote name.
         name: String,
@@ -92,7 +98,7 @@ pub(crate) enum RemoteAction {
         #[arg(long)]
         tags: bool,
         /// Sort refs by `name` or `version` (`git ls-remote --sort=version:refname`).
-        #[arg(long = "sort", value_name = "KEY", default_value = "name")]
+        #[arg(long = "sort", value_name = "KEY", default_value = "name", add = carapace_rs_clap::completer!(crate::completions::grit::action_sort_keys()))]
         sort: RemoteRefSortArg,
         /// Reverse sort order (`git ls-remote --sort=-…`).
         #[arg(long)]

@@ -1,6 +1,9 @@
 //! Clap arguments for `grit reflog`.
 
+use carapace_rs_clap::completer;
 use clap::{Args, Subcommand};
+
+use crate::completions::grit;
 
 /// Subcommands of `grit reflog`.
 #[derive(Debug, Subcommand)]
@@ -8,7 +11,7 @@ pub(crate) enum ReflogAction {
     /// Remove one or more reflog entries (`ref@{n}`).
     Delete {
         /// Reflog selectors (`main@{1}`, `HEAD@{0}`, …).
-        #[arg(required = true, value_name = "REF@{N}")]
+        #[arg(required = true, value_name = "REF@{N}", add = completer!(grit::action_reflog_selectors()))]
         specs: Vec<String>,
     },
     /// Drop reflog entries older than configured or explicit cutoffs.
@@ -38,7 +41,7 @@ pub(crate) enum ReflogAction {
 #[derive(Debug, Args)]
 pub(crate) struct ReflogArgs {
     /// Ref to show (defaults to `HEAD`).
-    #[arg(value_name = "REF")]
+    #[arg(value_name = "REF", add = completer!(grit::action_revisions()))]
     pub(crate) reference: Option<String>,
     /// Show at most this many entries (newest first).
     #[arg(short = 'n', long = "max-count", alias = "limit", value_name = "N")]

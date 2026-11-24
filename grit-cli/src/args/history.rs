@@ -1,7 +1,10 @@
 //! Clap arguments for `grit history`.
 
-use crate::message_input;
+use carapace_rs_clap::completer;
 use clap::{Args, Subcommand};
+
+use crate::completions::grit;
+use crate::message_input;
 
 /// Subcommands of `grit history`.
 #[derive(Debug, Subcommand)]
@@ -65,10 +68,10 @@ pub(crate) enum HistoryAction {
     /// Replay local commits onto a new base (same as top-level `grit rebase`).
     Rebase {
         /// Commits to replay are those reachable from `HEAD` but not from this revision (defaults to `@{upstream}`).
-        #[arg(value_name = "UPSTREAM")]
+        #[arg(value_name = "UPSTREAM", add = completer!(grit::action_revisions()))]
         upstream: Option<String>,
         /// Replay onto this commit instead of `UPSTREAM`.
-        #[arg(long = "onto", value_name = "REV")]
+        #[arg(long = "onto", value_name = "REV", add = completer!(grit::action_revisions()))]
         onto: Option<String>,
         /// Finish a rebase stopped on conflicts after resolving and staging paths.
         #[arg(long = "continue", conflicts_with_all = ["abort", "skip", "upstream", "onto", "check"])]

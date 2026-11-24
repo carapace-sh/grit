@@ -1,8 +1,11 @@
 //! Clap arguments for `grit merge`.
 
+use carapace_rs_clap::completer;
+use clap::Args;
+
+use crate::completions::grit;
 use crate::merge_strategy_args;
 use crate::message_input;
-use clap::Args;
 
 /// Merge another branch, tag or commit into the current branch.
 #[derive(Debug, Args)]
@@ -11,7 +14,8 @@ pub(crate) struct MergeArgs {
     #[arg(
             value_name = "REV",
             required_unless_present_any = ["abort", "continue_merge"],
-            conflicts_with = "continue_merge"
+            conflicts_with = "continue_merge",
+            add = completer!(grit::action_revisions())
         )]
     pub(crate) branch: Option<String>,
     /// Cancel an in-progress merge and restore the pre-merge state.

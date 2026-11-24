@@ -12,7 +12,7 @@ pub(crate) struct InitArgs {
     #[arg(long, conflicts_with = "separate_git_dir")]
     pub(crate) bare: bool,
     /// Ref storage backend for the new repository.
-    #[arg(long, value_name = "FORMAT", default_value = "files")]
+    #[arg(long, value_name = "FORMAT", default_value = "files", add = carapace_rs_clap::completer!(crate::completions::grit::action_ref_formats()))]
     pub(crate) ref_format: grit_lib::refs::ref_storage::RefStorageFormat,
     /// Initial branch name (overrides `init.defaultBranch` from config).
     #[arg(short = 'b', long = "initial-branch", value_name = "NAME")]
@@ -24,7 +24,8 @@ pub(crate) struct InitArgs {
     #[arg(
             long = "object-format",
             value_name = "ALGO",
-            value_parser = parse_init_object_format
+            value_parser = parse_init_object_format,
+            add = carapace_rs_clap::completer!(crate::completions::grit::action_object_formats())
         )]
     pub(crate) object_format: Option<grit_lib::objects::HashAlgo>,
 }

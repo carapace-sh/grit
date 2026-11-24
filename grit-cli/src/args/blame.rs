@@ -1,5 +1,6 @@
 //! Clap arguments for `grit blame`.
 
+use carapace_rs_clap::completer;
 use clap::Args;
 
 /// Show who last modified each line of a file.
@@ -47,6 +48,6 @@ pub(crate) struct BlameArgs {
     pub(crate) move_detection: bool,
     /// Blame this file's content (`-` for stdin) instead of the working tree, on top of
     /// the revision (default `HEAD`); lines not in the revision show as uncommitted.
-    #[arg(long, value_name = "FILE")]
+    #[arg(long, value_name = "FILE", add = completer!(carapace_rs::Action::files([])))]
     pub(crate) contents: Option<String>,
 }

@@ -1,15 +1,18 @@
 //! Clap arguments for `grit rebase`.
 
+use carapace_rs_clap::completer;
 use clap::Args;
+
+use crate::completions::grit;
 
 /// Replay local commits onto a new base (atomic ref update).
 #[derive(Debug, Args)]
 pub(crate) struct RebaseArgs {
     /// Commits to replay are those reachable from `HEAD` but not from this revision (defaults to `@{upstream}`).
-    #[arg(value_name = "UPSTREAM")]
+    #[arg(value_name = "UPSTREAM", add = completer!(grit::action_revisions()))]
     pub(crate) upstream: Option<String>,
     /// Replay onto this commit instead of `UPSTREAM`.
-    #[arg(long = "onto", value_name = "REV")]
+    #[arg(long = "onto", value_name = "REV", add = completer!(grit::action_revisions()))]
     pub(crate) onto: Option<String>,
     /// Finish a rebase stopped on conflicts after resolving and staging paths.
     #[arg(long = "continue", conflicts_with_all = ["abort", "skip", "upstream", "onto", "check"])]

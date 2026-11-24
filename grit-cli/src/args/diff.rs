@@ -28,7 +28,7 @@ pub(crate) struct DiffArgs {
     #[arg(long = "quiet")]
     pub(crate) quiet: bool,
     /// One commit (that commit's patch), two commits (tree diff), or a range `A..B` / `A...B`.
-    #[arg(value_name = "COMMIT")]
+    #[arg(value_name = "COMMIT", add = carapace_rs_clap::completer!(crate::completions::grit::action_revision_ranges()))]
     pub(crate) commits: Vec<String>,
     #[command(flatten)]
     pub(crate) pathspecs: pathspec_args::TrailingPathspecArgs,

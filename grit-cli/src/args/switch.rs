@@ -1,14 +1,18 @@
 //! Clap arguments for `grit switch`.
 
+use carapace_rs_clap::completer;
 use clap::Args;
+
+use crate::completions::grit;
 
 /// Switch to another branch, remote branch, or detached commit.
 #[derive(Debug, Args)]
 pub(crate) struct SwitchArgs {
     /// Branch to switch to, revision with `--detach`, or new branch name with `-c`.
-    #[arg(value_name = "NAME", required_unless_present = "detach")]
+    #[arg(value_name = "NAME", required_unless_present = "detach", add = completer!(grit::action_branch_targets()))]
     pub(crate) branch: Option<String>,
     /// With `-c`, the commit to start the branch from (defaults to `HEAD`).
+    #[arg(add = completer!(grit::action_revisions()))]
     pub(crate) start_point: Option<String>,
     /// Create the branch first, then switch to it.
     #[arg(short = 'c', long = "create")]

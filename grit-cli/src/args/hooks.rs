@@ -14,6 +14,7 @@ pub(crate) enum HooksAction {
     /// Run a hook by name (passes `--` arguments through to the script).
     Run {
         /// Hook basename (e.g. `pre-commit`).
+        #[arg(add = carapace_rs_clap::completer!(crate::completions::grit::action_hooks()))]
         name: String,
         /// Arguments forwarded to the hook after `--`.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]

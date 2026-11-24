@@ -1,6 +1,9 @@
 //! Clap arguments for `grit stash`.
 
+use carapace_rs_clap::completer;
 use clap::{Args, Subcommand};
+
+use crate::completions::grit;
 
 /// Subcommands of `grit stash`.
 #[derive(Debug, Subcommand)]
@@ -58,6 +61,7 @@ pub(crate) enum StashAction {
     /// Show the summary or patch for a stash entry.
     Show {
         /// Stash index (`0` is newest) or `stash@{n}`.
+        #[arg(add = completer!(grit::action_stashes()))]
         index: Option<String>,
         /// Show a diffstat summary (default).
         #[arg(long = "stat")]
@@ -74,6 +78,7 @@ pub(crate) enum StashAction {
         /// New branch name.
         name: String,
         /// Stash index (`0` is newest) or `stash@{n}`.
+        #[arg(add = completer!(grit::action_stashes()))]
         index: Option<String>,
     },
     /// Remove every stash entry.
@@ -88,6 +93,7 @@ pub(crate) enum StashAction {
     /// Apply a stash entry without removing it.
     Apply {
         /// Stash index (`0` is newest) or `stash@{n}`.
+        #[arg(add = completer!(grit::action_stashes()))]
         index: Option<String>,
         /// Restore the stashed index as well as the worktree.
         #[arg(long = "index")]
@@ -96,6 +102,7 @@ pub(crate) enum StashAction {
     /// Apply a stash entry and remove it when there are no conflicts.
     Pop {
         /// Stash index (`0` is newest) or `stash@{n}`.
+        #[arg(add = completer!(grit::action_stashes()))]
         index: Option<String>,
         /// Restore the stashed index as well as the worktree.
         #[arg(long = "index")]
@@ -104,6 +111,7 @@ pub(crate) enum StashAction {
     /// Remove a stash entry without applying it.
     Drop {
         /// Stash index (`0` is newest) or `stash@{n}`.
+        #[arg(add = completer!(grit::action_stashes()))]
         index: Option<String>,
     },
 }

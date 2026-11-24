@@ -27,7 +27,7 @@ pub(crate) struct CommitArgs {
     #[arg(long = "date")]
     pub(crate) author_date: Option<String>,
     /// Append a commit trailer (`key=value` or `key: value`); repeat for multiple trailers.
-    #[arg(long = "trailer", value_name = "KEY=VALUE", allow_hyphen_values = true)]
+    #[arg(long = "trailer", value_name = "KEY=VALUE", allow_hyphen_values = true, add = carapace_rs_clap::completer!(crate::completions::grit::action_trailers()))]
     pub(crate) trailers: Vec<String>,
     /// Append a `Signed-off-by` trailer for the committer.
     #[arg(short = 's', long = "signoff")]

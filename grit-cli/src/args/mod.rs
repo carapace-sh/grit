@@ -414,6 +414,12 @@ pub(crate) enum Command {
         args: RestoreArgs,
     },
     /// Download refs and objects from a remote.
+    ///
+    /// The refspecs complete scoped to the remote named before them.
+    #[command(add = carapace_rs_clap::PositionalCompleter(vec![
+        crate::completions::grit::action_remotes(),
+        crate::completions::grit::action_fetch_refspecs(),
+    ]))]
     Fetch {
         #[command(flatten)]
         args: FetchArgs,
@@ -423,6 +429,12 @@ pub(crate) enum Command {
     /// In a snapshot checkout, refresh it onto the server's newest snapshot;
     /// `grit pull <branch>` brings `<branch>` onto the server's branch of that
     /// name, as the checkout sees it.
+    ///
+    /// The refspecs complete scoped to the remote named before them.
+    #[command(add = carapace_rs_clap::PositionalCompleter(vec![
+        crate::completions::grit::action_remotes(),
+        crate::completions::grit::action_fetch_refspecs(),
+    ]))]
     Pull {
         #[command(flatten)]
         args: PullArgs,
@@ -479,6 +491,12 @@ pub(crate) enum Command {
         args: CompletionsArgs,
     },
     /// Read, set, or list configuration values.
+    ///
+    /// Values complete for the key typed before them.
+    #[command(add = carapace_rs_clap::PositionalCompleter(vec![
+        crate::completions::grit::action_config_keys(),
+        carapace_rs::Action::callback(|context| crate::completions::grit::action_config_values(&context.args[0])),
+    ]))]
     Config {
         #[command(flatten)]
         args: ConfigArgs,

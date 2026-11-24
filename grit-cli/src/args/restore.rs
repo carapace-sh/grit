@@ -1,6 +1,9 @@
 //! Clap arguments for `grit restore`.
 
 use crate::pathspec_args;
+use carapace_rs_clap::completer;
+
+use crate::completions::grit;
 use clap::Args;
 
 /// Restore working tree and/or index paths.
@@ -30,10 +33,10 @@ pub(crate) struct RestoreArgs {
     #[arg(long = "conflict", value_enum, conflicts_with_all = ["ours", "theirs"])]
     pub(crate) conflict_style: Option<crate::conflict_style::ConflictStyleArg>,
     /// Discard only the listed unstaged hunk ids (`grit diff --unstaged --json`) or unstage staged ids (`--staged`).
-    #[arg(long = "hunks", value_name = "ID,...", action = clap::ArgAction::Append)]
+    #[arg(long = "hunks", value_name = "ID,...", action = clap::ArgAction::Append, add = completer!(grit::action_hunks()))]
     pub(crate) hunks: Vec<String>,
     /// Discard or unstage only new-side line ranges (`path:start-end` from `grit diff --json`).
-    #[arg(long = "lines", value_name = "PATH:START-END", action = clap::ArgAction::Append)]
+    #[arg(long = "lines", value_name = "PATH:START-END", action = clap::ArgAction::Append, add = completer!(grit::action_line_ranges()))]
     pub(crate) lines: Vec<String>,
     /// Report paths that would change without writing the worktree or index.
     #[arg(long = "dry-run")]

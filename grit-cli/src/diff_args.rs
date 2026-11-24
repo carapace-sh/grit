@@ -27,7 +27,7 @@ pub struct DiffCompareArgs {
     #[arg(long = "no-renames", conflicts_with = "find_renames")]
     no_renames: bool,
     /// Line diff algorithm (overrides `diff.algorithm`).
-    #[arg(long = "diff-algorithm", value_name = "ALGO")]
+    #[arg(long = "diff-algorithm", value_name = "ALGO", add = carapace_rs_clap::completer!(crate::completions::grit::action_diff_algorithms()))]
     diff_algorithm: Option<String>,
     /// Limit output to these change types (Git letter syntax: `ADMR…`).
     #[arg(long = "diff-filter", value_name = "LETTERS")]

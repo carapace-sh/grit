@@ -1,6 +1,10 @@
 //! Clap arguments for `grit worktree`.
 
+use carapace_rs::Action;
+use carapace_rs_clap::completer;
 use clap::{Args, Subcommand};
+
+use crate::completions::grit;
 
 /// Subcommands of `grit worktree`.
 #[derive(Debug, Subcommand)]
@@ -10,9 +14,10 @@ pub(crate) enum WorktreeAction {
     /// Create a linked worktree at `path`.
     Add {
         /// Directory for the new working tree.
+        #[arg(add = completer!(Action::directories()))]
         path: std::path::PathBuf,
         /// Commit or branch to check out (defaults to `HEAD`).
-        #[arg(value_name = "REV")]
+        #[arg(value_name = "REV", add = completer!(grit::action_revisions()))]
         start_point: Option<String>,
         /// Create and check out a new branch.
         #[arg(short = 'b', long = "branch", value_name = "NAME", conflicts_with_all = ["force_branch", "detach"])]
@@ -42,6 +47,7 @@ pub(crate) enum WorktreeAction {
     /// Remove a linked worktree.
     Remove {
         /// Path to the worktree to remove.
+        #[arg(add = completer!(grit::action_worktrees()))]
         path: std::path::PathBuf,
         /// Remove even when the worktree has local changes or is locked.
         #[arg(short, long)]
@@ -56,6 +62,7 @@ pub(crate) enum WorktreeAction {
     /// Mark a linked worktree as locked (prevents accidental removal).
     Lock {
         /// Path to the linked worktree.
+        #[arg(add = completer!(grit::action_worktrees()))]
         path: std::path::PathBuf,
         /// Optional reason stored in the lock file.
         #[arg(long)]
@@ -64,13 +71,16 @@ pub(crate) enum WorktreeAction {
     /// Clear the lock on a linked worktree.
     Unlock {
         /// Path to the linked worktree.
+        #[arg(add = completer!(grit::action_worktrees()))]
         path: std::path::PathBuf,
     },
     /// Move a linked worktree to a new directory.
     Move {
         /// Current worktree path.
+        #[arg(add = completer!(grit::action_worktrees()))]
         worktree: std::path::PathBuf,
         /// New path for the working tree.
+        #[arg(add = completer!(Action::directories()))]
         new_path: std::path::PathBuf,
         /// Allow move when the worktree is locked.
         #[arg(short, long)]
